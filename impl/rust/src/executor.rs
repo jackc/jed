@@ -4338,7 +4338,9 @@ impl Database {
                 }
                 self.fold_uncorrelated_in_rexpr(els, bound, cost)
             }
-            RExpr::ScalarFunc { args, .. } | RExpr::ArrayFunc { args, .. } => {
+            RExpr::ScalarFunc { args, .. }
+            | RExpr::ArrayFunc { args, .. }
+            | RExpr::Variadic { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, cost)?;
                 }
@@ -4946,6 +4948,19 @@ enum ArrayFunc {
     Overlaps,
 }
 
+/// The VARIADIC argument-counting functions (spec/design/array-functions.md §12). Distinct from
+/// [`ScalarFunc`] because they are non-strict (`null = "none"`, like [`ArrayFunc`]) and take either
+/// a spread of arguments or a single array via the `VARIADIC` keyword — the call form is carried on
+/// the [`RExpr::Variadic`] node. Both return `int32`.
+enum VariadicFunc {
+    /// num_nulls(VARIADIC "any") → int32 — the count of NULL arguments (spread form), or of NULL
+    /// flattened elements (VARIADIC-array form; a NULL whole-array operand → NULL). Never NULL in
+    /// spread form.
+    NumNulls,
+    /// num_nonnulls(VARIADIC "any") → int32 — the mirror: the count of non-NULL arguments/elements.
+    NumNonnulls,
+}
+
 /// One resolved subscript spec in an [`RExpr::Subscript`] (spec/design/array.md §6): a single
 /// index `a[i]`, or a slice `a[m:n]` whose bounds may be omitted (`a[:n]`, `a[m:]`, `a[:]`).
 enum RSubscript {
@@ -5089,6 +5104,17 @@ enum RExpr {
     ArrayFunc {
         func: ArrayFunc,
         args: Vec<RExpr>,
+    },
+    /// A VARIADIC argument-counting call (spec/design/array-functions.md §12 — num_nulls/
+    /// num_nonnulls). Non-strict (`null = "none"`): the kernel inspects null-ness itself, so there
+    /// is no blanket NULL short-circuit. `array_form` records the call shape: `false` = the SPREAD
+    /// form (count `args`' null-ness directly, never NULL); `true` = the VARIADIC-array form (one
+    /// `args` operand — a NULL array → NULL, else count its flattened elements' null-ness). Result
+    /// is always int32.
+    Variadic {
+        func: VariadicFunc,
+        args: Vec<RExpr>,
+        array_form: bool,
     },
     /// A correlated column reference (spec/design/grammar.md §26): the column `index` of the
     /// enclosing-query row `level` hops out (1 = immediate parent). A **leaf** — charges no
@@ -6446,9 +6472,9 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
                 .any(|(c, r)| rexpr_references_outer(c, depth) || rexpr_references_outer(r, depth))
                 || rexpr_references_outer(els, depth)
         }
-        RExpr::ScalarFunc { args, .. } | RExpr::ArrayFunc { args, .. } => {
-            args.iter().any(|a| rexpr_references_outer(a, depth))
-        }
+        RExpr::ScalarFunc { args, .. }
+        | RExpr::ArrayFunc { args, .. }
+        | RExpr::Variadic { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
         }
@@ -6545,7 +6571,9 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             }
             collect_touched(els, depth, touched);
         }
-        RExpr::ScalarFunc { args, .. } | RExpr::ArrayFunc { args, .. } => {
+        RExpr::ScalarFunc { args, .. }
+        | RExpr::ArrayFunc { args, .. }
+        | RExpr::Variadic { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);
             }
@@ -6701,6 +6729,15 @@ fn is_scalar_func_name(name: &str) -> bool {
         .any(|o| o.kind == "function" && o.name.eq_ignore_ascii_case(name))
 }
 
+/// Whether `name` (case-insensitive) is a VARIADIC scalar function (array-functions.md §12) — a
+/// `kind="function"` row with `variadic = true` (`num_nulls`/`num_nonnulls`). Data-driven, so
+/// adding a variadic row to the catalog wires it here without touching this gate.
+fn is_variadic_func_name(name: &str) -> bool {
+    OPERATORS
+        .iter()
+        .any(|o| o.kind == "function" && o.variadic && o.name.eq_ignore_ascii_case(name))
+}
+
 /// The matched scalar-function overload row for `name` over the resolved argument types: the
 /// `kind="function"` catalog row whose `arg_families` agree by arity + per-slot family. `None`
 /// ⇒ no overload (42883). `make_interval` resolves on its own named/defaulted path (§11).
@@ -6743,6 +6780,17 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "now" => ScalarFunc::Now,
         "clock_timestamp" => ScalarFunc::ClockTimestamp,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
+    }
+}
+
+/// The kernel id for VARIADIC function `name` (array-functions.md §12). Total over the catalog's
+/// variadic-function names (`is_variadic_func_name` gates the call; `registry_covers_catalog` proves
+/// coverage).
+fn variadic_func_id(name: &str) -> VariadicFunc {
+    match name {
+        "num_nulls" => VariadicFunc::NumNulls,
+        "num_nonnulls" => VariadicFunc::NumNonnulls,
+        _ => unreachable!("variadic_func_id: {name} is not a catalog variadic function"),
     }
 }
 
@@ -7152,10 +7200,22 @@ fn resolve_func_call(
     args: &[Expr],
     arg_names: Option<&[Option<String>]>,
     star: bool,
+    variadic: bool,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     let lname = name.to_ascii_lowercase();
+    // The VARIADIC keyword is only valid on a VARIADIC function (array-functions.md §12). It
+    // cannot decorate make_interval / an aggregate / an ordinary scalar function (PG: "VARIADIC
+    // argument must be an array" arises only on a variadic function; a non-variadic function with
+    // VARIADIC is 42883 — no such overload). Caught here before the per-kind dispatch.
+    if variadic && !is_variadic_func_name(&lname) {
+        return Err(no_func_overload(&lname));
+    }
+    if is_variadic_func_name(&lname) {
+        reject_named(&lname, arg_names)?;
+        return resolve_variadic_func(scope, &lname, args, star, variadic, agg, params);
+    }
     // make_interval is the one named/defaulted function — it keeps its own resolver (§11).
     if lname == "make_interval" {
         return resolve_make_interval(scope, args, arg_names, star, agg, params);
@@ -7408,6 +7468,98 @@ fn resolve_scalar_func(
             func,
             args: rargs,
             result,
+        },
+        resolved_type_of(result),
+    ))
+}
+
+/// The 42804 raised when a `VARIADIC` operand is not an array (array-functions.md §12 / §7).
+fn variadic_not_array() -> EngineError {
+    EngineError::new(
+        SqlState::DatatypeMismatch,
+        "VARIADIC argument must be an array",
+    )
+}
+
+/// Resolve a VARIADIC scalar-function call (num_nulls / num_nonnulls — array-functions.md §12).
+/// The lone catalog row's last parameter is variadic; the call is EITHER a spread of trailing
+/// arguments OR (with the `VARIADIC` keyword) a single array passed directly. Non-strict
+/// (`null = "none"`): the resolved node carries no blanket NULL short-circuit. Builds an
+/// `RExpr::Variadic` node; the result type is the catalog `result` (int32 here), independent of
+/// the arguments.
+fn resolve_variadic_func(
+    scope: &Scope,
+    name: &str, // already lowercased
+    args: &[Expr],
+    star: bool,
+    variadic: bool,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if star {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "* is only valid as the argument of COUNT",
+        ));
+    }
+    let desc = scalar_func_desc(name).expect("a variadic function is in the catalog");
+    let k = desc.arity as usize; // declared parameter count (the last is variadic)
+    let var_family = desc.arg_families[k - 1]; // the variadic element family (last slot)
+    let func = variadic_func_id(name);
+
+    let mut rargs = Vec::with_capacity(args.len());
+    if variadic {
+        // VARIADIC-array form: exactly `k` args (the fixed params + the one array). The fixed
+        // params match their concrete families; the last operand MUST be an array (else 42804).
+        if args.len() != k {
+            return Err(no_func_overload(name));
+        }
+        for (i, a) in args.iter().enumerate() {
+            let (r, t) = resolve(scope, a, None, agg, params)?;
+            if i + 1 == k {
+                // the variadic (array) operand
+                match &t {
+                    ResolvedType::Array(elem) => {
+                        // "any" accepts any element type; a concrete variadic family must match.
+                        if var_family != "any" && !family_matches(var_family, elem) {
+                            return Err(no_func_overload(name));
+                        }
+                    }
+                    // A non-array operand (incl. a bare untyped NULL) is 42804 — PG's exact code.
+                    _ => return Err(variadic_not_array()),
+                }
+            } else if !family_matches(desc.arg_families[i], &t) {
+                return Err(no_func_overload(name));
+            }
+            rargs.push(r);
+        }
+    } else {
+        // Spread form: at least `k` args (so a variadic function needs ≥1 variadic arg —
+        // num_nulls() is 42883). The fixed params match their concrete families; every argument
+        // from the variadic slot onward matches the variadic element family ("any" ⇒ all).
+        if args.len() < k {
+            return Err(no_func_overload(name));
+        }
+        for (i, a) in args.iter().enumerate() {
+            let (r, t) = resolve(scope, a, None, agg, params)?;
+            let slot = if i < k - 1 {
+                desc.arg_families[i]
+            } else {
+                var_family
+            };
+            if !family_matches(slot, &t) {
+                return Err(no_func_overload(name));
+            }
+            rargs.push(r);
+        }
+    }
+
+    let result = scalar_result_type(desc.result, &[]);
+    Ok((
+        RExpr::Variadic {
+            func,
+            args: rargs,
+            array_form: variadic,
         },
         resolved_type_of(result),
     ))
@@ -8016,9 +8168,10 @@ fn resolve(
             args,
             arg_names,
             star,
+            variadic,
         } => {
             let names = arg_names.as_deref().map(Vec::as_slice);
-            resolve_func_call(scope, name, args, names, *star, agg, params)
+            resolve_func_call(scope, name, args, names, *star, *variadic, agg, params)
         }
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),
         Expr::Literal(Literal::Bool(b)) => Ok((RExpr::ConstBool(*b), ResolvedType::Bool)),
@@ -9462,6 +9615,14 @@ impl Bound {
             _ => None,
         }
     }
+}
+
+/// Count the NULL (when `want_nulls`) or non-NULL values in `vals` — the shared kernel of
+/// num_nulls / num_nonnulls (spec/design/array-functions.md §12), over either the spread arguments
+/// or a VARIADIC array's flattened elements.
+fn count_nulls<'a>(vals: impl Iterator<Item = &'a Value>, want_nulls: bool) -> usize {
+    vals.filter(|v| matches!(v, Value::Null) == want_nulls)
+        .count()
 }
 
 /// Evaluate an array function over its already-evaluated argument values
@@ -11742,6 +11903,34 @@ impl RExpr {
                 }
                 eval_array_func(func, &vals)
             }
+            // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One
+            // operator_eval (the per-element/arg count walk is unmetered, like the array
+            // introspectors §3.3); arguments charge their own evaluation. Non-strict — no blanket
+            // NULL short-circuit. The two forms differ: the spread form counts the args' null-ness
+            // (never NULL); the VARIADIC-array form returns NULL on a NULL whole-array, else counts
+            // the array's flattened elements' null-ness.
+            RExpr::Variadic {
+                func,
+                args,
+                array_form,
+            } => {
+                m.charge(COSTS.operator_eval);
+                let want_nulls = matches!(func, VariadicFunc::NumNulls);
+                let count = if *array_form {
+                    match args[0].eval(row, env, m)? {
+                        Value::Null => return Ok(Value::Null),
+                        Value::Array(a) => count_nulls(a.elements.iter(), want_nulls),
+                        _ => unreachable!("resolver restricts a VARIADIC operand to an array"),
+                    }
+                } else {
+                    let mut vals = Vec::with_capacity(args.len());
+                    for a in args {
+                        vals.push(a.eval(row, env, m)?);
+                    }
+                    count_nulls(vals.iter(), want_nulls)
+                };
+                Ok(Value::Int(count as i64))
+            }
             // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
             // Push the current row onto the outer-row stack, run the inner plan against it, fold
             // its accrued cost into this meter, plus one operator_eval for the node. (Uncorrelated
@@ -12522,6 +12711,18 @@ mod registry_tests {
                         || concrete_array
                         || ScalarType::from_name(o.result).is_some(),
                     "array function {} has unhandled result code {}",
+                    o.name,
+                    o.result
+                );
+                continue;
+            }
+            if is_variadic_func_name(o.name) {
+                // A VARIADIC function (array-functions.md §12): its kernel id comes from
+                // `variadic_func_id` and its result is a concrete scalar id.
+                let _ = variadic_func_id(o.name);
+                assert!(
+                    ScalarType::from_name(o.result).is_some(),
+                    "variadic function {} has unhandled result code {}",
                     o.name,
                     o.result
                 );

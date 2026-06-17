@@ -78,9 +78,13 @@ def rust_entry(op)
     "        arg_names: #{rust_slice(op['arg_names'] || [])},",
     "        arg_defaults: #{rust_slice(op['arg_defaults'] || [])},",
     "        volatility: #{rust_str(op['volatility'] || 'immutable')},",
+    "        variadic: #{op['variadic'] ? 'true' : 'false'},",
     "    },",
   ].join("\n")
 end
+
+# A Go/TS boolean literal for an optional catalog flag (absent ⇒ false).
+def variadic_bool(op) = op["variadic"] ? "true" : "false"
 
 def rust_agg_entry(ag)
   [
@@ -141,6 +145,9 @@ def rust_file(ops, aggs, srfs)
         /// Value-stability class (functions.md §12): "immutable" | "stable" | "volatile".
         /// Default "immutable"; marks a call non-foldable (advisory today).
         pub volatility: &'static str,
+        /// VARIADIC flag (array-functions.md §12): the last parameter collects a spread of
+        /// trailing args, or a single array via the VARIADIC keyword. Default false.
+        pub variadic: bool,
     }
 
     /// Every operator in the catalog, in catalog order.
@@ -214,6 +221,7 @@ def go_entry(op)
     ["ArgNames",      go_slice(op["arg_names"] || [])],
     ["ArgDefaults",   go_slice(op["arg_defaults"] || [])],
     ["Volatility",    go_str(op["volatility"] || "immutable")],
+    ["Variadic",      variadic_bool(op)],
   ]
   w = fields.map { |k, _| k.length }.max
   lines = fields.map { |k, v| "\t\t#{k}:#{' ' * (w - k.length + 1)}#{v}," }
@@ -283,6 +291,9 @@ def go_file(ops, aggs, srfs)
     \t// Volatility is the value-stability class (functions.md §12): "immutable" | "stable" |
     \t// "volatile". Default "immutable"; marks a call non-foldable (advisory today).
     \tVolatility string
+    \t// Variadic marks the last parameter VARIADIC (array-functions.md §12): a spread of trailing
+    \t// args, or a single array via the VARIADIC keyword. Default false.
+    \tVariadic bool
     }
 
     // Operators lists every operator in the catalog, in catalog order.
@@ -353,6 +364,7 @@ def ts_entry(op)
   lines << "    argNames: #{ts_arr(op['arg_names'] || [])},"
   lines << "    argDefaults: #{ts_arr(op['arg_defaults'] || [])},"
   lines << "    volatility: #{ts_str(op['volatility'] || 'immutable')},"
+  lines << "    variadic: #{variadic_bool(op)},"
   lines << "  },"
   lines.join("\n")
 end
@@ -414,6 +426,9 @@ def ts_file(ops, aggs, srfs)
       // Value-stability class (functions.md §12): "immutable" | "stable" | "volatile".
       // Default "immutable"; marks a call non-foldable (advisory today).
       volatility: string;
+      // VARIADIC flag (array-functions.md §12): the last parameter collects a spread of trailing
+      // args, or a single array via the VARIADIC keyword. Default false.
+      variadic: boolean;
     }
 
     // Every operator in the catalog, in catalog order.

@@ -219,6 +219,20 @@ def main
       fail!("operator #{id}: volatility #{op['volatility'].inspect} not in (#{VOLATILITIES.to_a.join('|')})") unless VOLATILITIES.include?(op["volatility"])
     end
 
+    # (15) optional VARIADIC flag (array-functions.md §12); absent ⇒ false. A boolean; true is
+    # valid only on a scalar function (kind = "function") with a non-empty arg_families (the last
+    # entry is the variadic element family) and no arg_defaults (defaults + variadic are not
+    # modeled — PG allows a default on the variadic param, but jed has no such built-in).
+    if op.key?("variadic")
+      v = op["variadic"]
+      fail!("operator #{id}: variadic #{v.inspect} must be a boolean") unless [true, false].include?(v)
+      if v
+        fail!("operator #{id}: variadic is valid only on a scalar function (kind = \"function\")") unless kind == "function"
+        fail!("operator #{id}: variadic function needs a non-empty arg_families") if args.empty?
+        fail!("operator #{id}: variadic + arg_defaults is not supported") if op.key?("arg_defaults")
+      end
+    end
+
     # (9) collect for uniqueness — keyed by operand-family signature, so an operator
     # overloaded across families (one row per arg_families) is allowed; a true
     # duplicate (same name AND same operand families) is still rejected.

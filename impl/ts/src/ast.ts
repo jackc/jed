@@ -113,7 +113,10 @@ export type Expr =
   // carries PostgreSQL named notation (name => value, grammar.md §17): empty ⇒ every argument
   // positional (the common case); otherwise it is parallel to `args`, with a string for a named
   // slot and null for a positional one. The parser rejects a positional arg after a named one.
-  | { kind: "funcCall"; name: string; args: Expr[]; argNames: (string | null)[]; star: boolean }
+  // `variadic` is true when the final argument was prefixed with the VARIADIC keyword
+  // (num_nulls(VARIADIC arr), array-functions.md §12): the array is passed directly to a variadic
+  // parameter rather than spreading individual arguments. false for every ordinary call.
+  | { kind: "funcCall"; name: string; args: Expr[]; argNames: (string | null)[]; star: boolean; variadic: boolean }
   // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26). resolve
   // plans it once against the scope chain; an uncorrelated one is then folded to a constant, a
   // correlated one is re-executed per outer row. A `$N` inside is a 0A000.

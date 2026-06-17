@@ -5343,6 +5343,12 @@ const (
 	// its builders return an array; NULL handling is per-kernel (the introspectors propagate, the
 	// builders are non-strict), so there is no blanket NULL short-circuit at eval.
 	reArrayFunc
+	// reVariadic is a VARIADIC argument-counting call (spec/design/array-functions.md §12 —
+	// num_nulls/num_nonnulls). Non-strict (null = "none"): no blanket NULL short-circuit. Its
+	// argument nodes reuse `sargs`; `variadicArray` records the call shape (false = the spread form,
+	// counting sargs' null-ness directly; true = the VARIADIC-array form, one sargs operand whose
+	// flattened elements are counted, a NULL whole-array → NULL). Result is always int32.
+	reVariadic
 	// reOuterColumn is a correlated column reference (spec/design/grammar.md §26): the column
 	// `index` of the enclosing row `level` hops out (1 = immediate parent). A leaf.
 	reOuterColumn
@@ -5457,6 +5463,15 @@ const (
 	afOverlaps                     // a && b (anyarray, anyarray) → boolean; do a and b share an element; strict eq (§10)
 )
 
+// variadicFunc selects a VARIADIC argument-counting function (spec/design/array-functions.md §12).
+// Both return int32; the call form (spread vs VARIADIC-array) lives on the rExpr node.
+type variadicFunc int
+
+const (
+	vfNumNulls    variadicFunc = iota // num_nulls(VARIADIC "any") → int32 — count of NULL args/elements
+	vfNumNonnulls                     // num_nonnulls(VARIADIC "any") → int32 — count of non-NULL args/elements
+)
+
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
 // row. Arithmetic/neg nodes carry their (promotion-tower) result type in `result` so the
 // computed value can be range-checked against it.
@@ -5493,6 +5508,10 @@ type rExpr struct {
 	// type lives in the surrounding resolvedType (carried out of resolve), not on the node — the
 	// kernel produces the result value from the operands (an array value is self-describing).
 	afunc arrayFunc
+	// reVariadic: the VARIADIC counting function and its call shape. Argument nodes reuse `sargs`;
+	// `variadicArray` true ⇒ the VARIADIC-array form (one array operand), false ⇒ the spread form.
+	vfunc         variadicFunc
+	variadicArray bool
 
 	// reArray: `nested` marks a multidim-stacking constructor (its element nodes evaluate to
 	// arrays, stacked into one higher dimension — spec/design/array.md §4).
@@ -6417,6 +6436,31 @@ func isScalarFuncName(name string) bool {
 	return false
 }
 
+// isVariadicFuncName reports whether name (lowercased) is a VARIADIC scalar function
+// (array-functions.md §12) — a Kind=="function" row with Variadic set (num_nulls/num_nonnulls).
+// Data-driven, so adding a variadic row to the catalog wires it here without touching this gate.
+func isVariadicFuncName(name string) bool {
+	for i := range Operators {
+		if Operators[i].Kind == "function" && Operators[i].Variadic && Operators[i].Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// variadicFuncID maps a VARIADIC function name to its kernel id (array-functions.md §12). Total
+// over the catalog's variadic-function names (isVariadicFuncName gates the call).
+func variadicFuncID(name string) variadicFunc {
+	switch name {
+	case "num_nulls":
+		return vfNumNulls
+	case "num_nonnulls":
+		return vfNumNonnulls
+	default:
+		panic("variadicFuncID: " + name + " is not a catalog variadic function")
+	}
+}
+
 // lookupScalarOverload returns the matched scalar-function overload row for name over the resolved
 // argument types: the Kind=="function" catalog row whose ArgFamilies agree by arity + per-slot
 // family. nil ⇒ no overload (42883). make_interval resolves on its own named/defaulted path (§11).
@@ -7113,6 +7157,17 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 // that declares parameter names (make_interval); on every other function it is 42883.
 func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	name := toLowerASCII(fc.Name)
+	// The VARIADIC keyword is valid only on a VARIADIC function (array-functions.md §12); on any
+	// other (non-variadic) name it is 42883 (no such overload). Caught before the per-kind dispatch.
+	if fc.Variadic && !isVariadicFuncName(name) {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	if isVariadicFuncName(name) {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return resolveVariadicFunc(s, fc, ag, params)
+	}
 	// make_interval is the one named/defaulted function — it keeps its own resolver (§11).
 	if name == "make_interval" {
 		return resolveMakeInterval(s, fc, ag, params)
@@ -7333,6 +7388,81 @@ func resolveScalarFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 	result := scalarResultType(desc.Result, tys)
 	rt := resolvedTypeOf(result)
 	return &rExpr{kind: reScalarFunc, sfunc: fn, sargs: rargs, result: result}, rt, nil
+}
+
+// variadicNotArray is the 42804 raised when a VARIADIC operand is not an array (array-functions.md
+// §12 / §7).
+func variadicNotArray() error {
+	return NewError(DatatypeMismatch, "VARIADIC argument must be an array")
+}
+
+// resolveVariadicFunc resolves a VARIADIC scalar-function call (num_nulls/num_nonnulls —
+// array-functions.md §12). The lone catalog row's last parameter is variadic; the call is EITHER a
+// spread of trailing arguments OR (with the VARIADIC keyword) a single array passed directly.
+// Non-strict (null = "none"): the node carries no blanket NULL short-circuit. The result type is
+// the catalog Result (int32 here), independent of the arguments.
+func resolveVariadicFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if fc.Star {
+		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+	}
+	name := toLowerASCII(fc.Name)
+	desc := scalarFuncDesc(name)
+	k := desc.Arity                    // declared parameter count (the last is variadic)
+	varFamily := desc.ArgFamilies[k-1] // the variadic element family (last slot)
+	fn := variadicFuncID(name)
+	rargs := make([]*rExpr, 0, len(fc.Args))
+
+	if fc.Variadic {
+		// VARIADIC-array form: exactly k args (fixed params + the one array). The fixed params
+		// match their concrete families; the last operand MUST be an array (else 42804).
+		if len(fc.Args) != k {
+			return nil, resolvedType{}, noFuncOverload(name)
+		}
+		for i, a := range fc.Args {
+			r, t, err := resolve(s, *a, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if i+1 == k {
+				// the variadic (array) operand
+				if t.kind != rtArray {
+					// A non-array operand (incl. a bare untyped NULL) is 42804 — PG's exact code.
+					return nil, resolvedType{}, variadicNotArray()
+				}
+				// "any" accepts any element type; a concrete variadic family must match.
+				if varFamily != "any" && !familyMatches(varFamily, *t.elem) {
+					return nil, resolvedType{}, noFuncOverload(name)
+				}
+			} else if !familyMatches(desc.ArgFamilies[i], t) {
+				return nil, resolvedType{}, noFuncOverload(name)
+			}
+			rargs = append(rargs, r)
+		}
+	} else {
+		// Spread form: at least k args (so a variadic function needs ≥1 variadic arg — num_nulls()
+		// is 42883). The fixed params match their concrete families; every argument from the
+		// variadic slot onward matches the variadic element family ("any" ⇒ all).
+		if len(fc.Args) < k {
+			return nil, resolvedType{}, noFuncOverload(name)
+		}
+		for i, a := range fc.Args {
+			r, t, err := resolve(s, *a, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			slot := varFamily
+			if i < k-1 {
+				slot = desc.ArgFamilies[i]
+			}
+			if !familyMatches(slot, t) {
+				return nil, resolvedType{}, noFuncOverload(name)
+			}
+			rargs = append(rargs, r)
+		}
+	}
+
+	result := scalarResultType(desc.Result, nil)
+	return &rExpr{kind: reVariadic, vfunc: fn, sargs: rargs, variadicArray: fc.Variadic}, resolvedTypeOf(result), nil
 }
 
 // groupingErrorColumn is the 42803 for a non-aggregated column not in GROUP BY.
@@ -9324,6 +9454,19 @@ func buildNestedArray(subs []Value) (Value, error) {
 	return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elements}), nil
 }
 
+// countNulls counts the NULL (when wantNulls) or non-NULL values in vals — the shared kernel of
+// num_nulls / num_nonnulls (spec/design/array-functions.md §12), over either the spread arguments
+// or a VARIADIC array's flattened elements.
+func countNulls(vals []Value, wantNulls bool) int {
+	n := 0
+	for _, v := range vals {
+		if v.IsNull() == wantNulls {
+			n++
+		}
+	}
+	return n
+}
+
 // evalArrayFunc evaluates an array function over its already-evaluated argument values
 // (spec/design/array-functions.md §3). The introspectors propagate NULL and return NULL for an
 // out-of-shape request; the builders are non-strict (a NULL array argument is the identity/empty,
@@ -10468,6 +10611,33 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			vals[i] = v
 		}
 		return evalArrayFunc(e.afunc, vals)
+	case reVariadic:
+		// A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval
+		// (the per-element/arg count walk is unmetered, like the array introspectors §3.3);
+		// arguments charge their own. Non-strict — no blanket NULL short-circuit. The two forms
+		// differ: the spread form counts the args' null-ness (never NULL); the VARIADIC-array form
+		// returns NULL on a NULL whole-array, else counts the array's flattened elements' null-ness.
+		m.Charge(Costs.OperatorEval)
+		wantNulls := e.vfunc == vfNumNulls
+		if e.variadicArray {
+			v, err := e.sargs[0].eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			if v.IsNull() {
+				return NullValue(), nil
+			}
+			return IntValue(int64(countNulls(v.Array.Elements, wantNulls))), nil
+		}
+		vals := make([]Value, len(e.sargs))
+		for i, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			vals[i] = v
+		}
+		return IntValue(int64(countNulls(vals, wantNulls))), nil
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
 		// Push the current row onto the outer-row stack, run the inner plan, fold its accrued

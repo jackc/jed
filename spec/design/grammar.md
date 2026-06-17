@@ -686,6 +686,27 @@ the three cores** (another §8 determinism surface, like the one-token call look
    carries the per-argument optional name to resolve; an all-positional call carries none (so
    it is byte-identical to a pre-named-notation parse).
 
+**The `VARIADIC` keyword (passing an array to a variadic parameter).** The **last** argument of
+a call may be prefixed with the `VARIADIC` keyword — `num_nulls(VARIADIC arr)`, which passes the
+array `arr` directly to a variadic parameter instead of spreading individual arguments
+([array-functions.md](array-functions.md) §12, the AF6 slice). Parser rules, again byte-identical
+across the three cores:
+
+1. **Last-argument only.** `VARIADIC` may mark only the final argument; a `VARIADIC`-marked
+   argument followed by another (`f(VARIADIC a, b)`) is `42601` (PostgreSQL's rule). It does
+   **not** combine with named notation (the keyword is consumed before any `name =>` peek, so
+   `f(VARIADIC n => v)` parses `n` as the array expression and then errs on `=>`). `VARIADIC` is
+   recognized as a keyword **only at the start of a call argument** — it is not a globally reserved
+   word (a column or table may be named `variadic` elsewhere), but it cannot be the bare leading
+   identifier of a call argument (PostgreSQL, where `VARIADIC` is fully reserved, agrees).
+2. **A flag on the call node.** The parser records a single `variadic` boolean on the `FuncCall`
+   node (whether the last argument was `VARIADIC`-marked); an ordinary call carries `false` and
+   parses byte-identically to before. The flag travels to resolve.
+3. **Resolve-time meaning.** Whether the called function is *actually* variadic, the spread vs.
+   array-operand semantics, and the errors for a `VARIADIC` non-array operand (`42804`) or a
+   too-short spread (`42883`) are resolve-time concerns driven by the catalog's `variadic` flag —
+   see [array-functions.md](array-functions.md) §12.
+
 ## 18. `GROUP BY`
 
 `group_by ::= "GROUP" "BY" column_ref ("," column_ref)*` slots between `WHERE` and

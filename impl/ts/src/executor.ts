@@ -3183,6 +3183,7 @@ export class Database {
         return e;
       case "scalarFunc":
       case "arrayFunc":
+      case "variadic":
         e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, cost));
         return e;
       case "row":
@@ -3671,6 +3672,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       );
     case "scalarFunc":
     case "arrayFunc":
+    case "variadic":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
       return e.fields.some((f) => rexprReferencesOuter(f, depth));
@@ -3749,6 +3751,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       return;
     case "scalarFunc":
     case "arrayFunc":
+    case "variadic":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
     case "row":
@@ -4017,6 +4020,12 @@ type RExpr =
   // node. NULL handling is per-kernel (the introspectors propagate, the builders are non-strict), so
   // — unlike "scalarFunc" — there is no blanket NULL short-circuit at eval.
   | { kind: "arrayFunc"; func: ArrayFuncName; args: RExpr[] }
+  // A VARIADIC argument-counting call (spec/design/array-functions.md §12 — num_nulls/num_nonnulls).
+  // Non-strict (null = "none"), like "arrayFunc": no blanket NULL short-circuit. `arrayForm` records
+  // the call shape — false = the spread form (count `args`' null-ness directly, never NULL); true =
+  // the VARIADIC-array form (one `args` operand — a NULL array → NULL, else count its flattened
+  // elements' null-ness). Result is always int32.
+  | { kind: "variadic"; func: VariadicFuncName; args: RExpr[]; arrayForm: boolean }
   // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
   // row `level` hops out (1 = immediate parent). A leaf — reads from the outer-row environment.
   | { kind: "outerColumn"; level: number; index: number }
@@ -4092,6 +4101,10 @@ type ArrayFuncName =
   | "contains"
   | "contained_by"
   | "overlaps";
+
+// VariadicFuncName is the internal identity of a VARIADIC counting-function node
+// (spec/design/array-functions.md §12). Both return int32; the call form lives on the node.
+type VariadicFuncName = "num_nulls" | "num_nonnulls";
 
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
@@ -4840,6 +4853,12 @@ function isScalarFuncName(name: string): boolean {
   return OPERATORS.some((o) => o.kind === "function" && o.name === name);
 }
 
+// isVariadicFuncName reports whether name (lowercased) is a VARIADIC scalar function
+// (array-functions.md §12) — a kind === "function" row with `variadic` set (num_nulls/num_nonnulls).
+function isVariadicFuncName(name: string): boolean {
+  return OPERATORS.some((o) => o.kind === "function" && o.variadic && o.name === name);
+}
+
 // lookupScalarOverload returns the matched scalar-function overload row for name over the resolved
 // argument types: the kind === "function" catalog row whose argFamilies agree by arity + per-slot
 // family. undefined ⇒ no overload (42883). make_interval resolves on its own path (§11).
@@ -4933,11 +4952,18 @@ function aggregatePlan(
 // declares parameter names (make_interval); on every other function it is 42883.
 function resolveFuncCall(
   scope: Scope,
-  e: { name: string; args: Expr[]; argNames: (string | null)[]; star: boolean },
+  e: { name: string; args: Expr[]; argNames: (string | null)[]; star: boolean; variadic: boolean },
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   const lname = e.name.toLowerCase();
+  // The VARIADIC keyword is valid only on a VARIADIC function (array-functions.md §12); on any
+  // other (non-variadic) name it is 42883 (no such overload). Caught before the per-kind dispatch.
+  if (e.variadic && !isVariadicFuncName(lname)) throw noFuncOverload(lname);
+  if (isVariadicFuncName(lname)) {
+    rejectNamed(lname, e.argNames);
+    return resolveVariadicFunc(scope, e, ag, params);
+  }
   // make_interval is the one named/defaulted function — it keeps its own resolver (§11).
   if (lname === "make_interval") return resolveMakeInterval(scope, e, ag, params);
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
@@ -5130,6 +5156,60 @@ function scalarFuncNode(
   argWidth: ScalarType | undefined,
 ): { node: RExpr; type: ResolvedType } {
   return { node: { kind: "scalarFunc", func, args, result, argWidth }, type: resolvedTypeOf(result) };
+}
+
+// resolveVariadicFunc resolves a VARIADIC scalar-function call (num_nulls/num_nonnulls —
+// array-functions.md §12). The lone catalog row's last parameter is variadic; the call is EITHER a
+// spread of trailing arguments OR (with the VARIADIC keyword) a single array passed directly.
+// Non-strict (null = "none"): the node carries no blanket NULL short-circuit. The result type is the
+// catalog `result` (int32 here), independent of the arguments.
+function resolveVariadicFunc(
+  scope: Scope,
+  e: { name: string; args: Expr[]; star: boolean; variadic: boolean },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  const name = e.name.toLowerCase() as VariadicFuncName;
+  const desc = scalarFuncDesc(name)!;
+  const k = desc.arity; // declared parameter count (the last is variadic)
+  const varFamily = desc.argFamilies[k - 1]!; // the variadic element family (last slot)
+  const rargs: RExpr[] = [];
+
+  if (e.variadic) {
+    // VARIADIC-array form: exactly k args (fixed params + the one array). The fixed params match
+    // their concrete families; the last operand MUST be an array (else 42804).
+    if (e.args.length !== k) throw noFuncOverload(name);
+    for (let i = 0; i < e.args.length; i++) {
+      const r = resolve(scope, e.args[i]!, null, ag, params);
+      if (i + 1 === k) {
+        // the variadic (array) operand
+        if (r.type.kind !== "array") {
+          // A non-array operand (incl. a bare untyped NULL) is 42804 — PG's exact code.
+          throw engineError("datatype_mismatch", "VARIADIC argument must be an array");
+        }
+        // "any" accepts any element type; a concrete variadic family must match.
+        if (varFamily !== "any" && !familyMatches(varFamily, r.type.elem)) throw noFuncOverload(name);
+      } else if (!familyMatches(desc.argFamilies[i]!, r.type)) {
+        throw noFuncOverload(name);
+      }
+      rargs.push(r.node);
+    }
+  } else {
+    // Spread form: at least k args (so a variadic function needs ≥1 variadic arg — num_nulls() is
+    // 42883). The fixed params match their concrete families; every argument from the variadic slot
+    // onward matches the variadic element family ("any" ⇒ all).
+    if (e.args.length < k) throw noFuncOverload(name);
+    for (let i = 0; i < e.args.length; i++) {
+      const r = resolve(scope, e.args[i]!, null, ag, params);
+      const slot = i < k - 1 ? desc.argFamilies[i]! : varFamily;
+      if (!familyMatches(slot, r.type)) throw noFuncOverload(name);
+      rargs.push(r.node);
+    }
+  }
+
+  const result = scalarResultType(desc.result, []);
+  return { node: { kind: "variadic", func: name, args: rargs, arrayForm: e.variadic }, type: resolvedTypeOf(result) };
 }
 
 // === Polymorphic array-function resolution (spec/design/array-functions.md §2) ======
@@ -7290,6 +7370,15 @@ function arraySubscriptErr(detail: string): Error {
   return engineError("array_subscript_error", detail);
 }
 
+// countNulls counts the NULL (when wantNulls) or non-NULL values in vals — the shared kernel of
+// num_nulls / num_nonnulls (spec/design/array-functions.md §12), over either the spread arguments or
+// a VARIADIC array's flattened elements.
+function countNulls(vals: Value[], wantNulls: boolean): number {
+  let n = 0;
+  for (const v of vals) if ((v.kind === "null") === wantNulls) n++;
+  return n;
+}
+
 // evalArrayFunc evaluates an array function over its already-evaluated argument values
 // (spec/design/array-functions.md §3). The introspectors propagate NULL and return NULL for an
 // out-of-shape request; the builders are non-strict (a NULL array argument is the identity/empty, NOT
@@ -8568,6 +8657,24 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const vals: Value[] = [];
       for (const a of e.args) vals.push(evalExpr(a, row, env, m));
       return evalArrayFunc(e.func, vals);
+    }
+    case "variadic": {
+      // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval
+      // (the per-element/arg count walk is unmetered, like the array introspectors §3.3); arguments
+      // charge their own. Non-strict — no blanket NULL short-circuit. The two forms differ: the
+      // spread form counts the args' null-ness (never NULL); the VARIADIC-array form returns NULL on
+      // a NULL whole-array, else counts the array's flattened elements' null-ness.
+      m.charge(COSTS.operatorEval);
+      const wantNulls = e.func === "num_nulls";
+      if (e.arrayForm) {
+        const v = evalExpr(e.args[0]!, row, env, m);
+        if (v.kind === "null") return nullValue();
+        if (v.kind !== "array") throw new Error("resolver restricts a VARIADIC operand to an array");
+        return intValue(BigInt(countNulls(v.elements, wantNulls)));
+      }
+      const vals: Value[] = [];
+      for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+      return intValue(BigInt(countNulls(vals, wantNulls)));
     }
     case "subquery": {
       // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row. Push

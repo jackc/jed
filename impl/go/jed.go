@@ -42,6 +42,9 @@ var SupportedCapabilities = []string{
 	// Array function surface AF5 (array-functions.md §11): the ANY/ALL/SOME quantified array
 	// comparisons (x = ANY(arr), x op ALL(arr)) — the array spelling of IN, three-valued.
 	"func.array_quantified",
+	// Array function surface AF6 (array-functions.md §12): the VARIADIC call syntax + variadic
+	// overload resolution — the num_nulls/num_nonnulls built-ins (spread or VARIADIC-array form).
+	"func.variadic",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
 	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

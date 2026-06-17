@@ -607,9 +607,13 @@ case_expr      ::= "CASE" expr? ( "WHEN" expr "THEN" expr )+ ( "ELSE" expr )? "E
  * the only spelling; legacy ":=" is rejected, ../design/grammar.md §17). A positional argument
  * may NOT follow a named one (parser-enforced, 42601). The argument list may be EMPTY (a
  * function whose parameters all DEFAULT — e.g. make_interval()). Named notation is valid only
- * for a function that declares parameter names (make_interval); elsewhere it is 42883. */
-function_call  ::= identifier "(" ( "*" | function_arg ( "," function_arg )* )? ")"
+ * for a function that declares parameter names (make_interval); elsewhere it is 42883. The
+ * final argument may be prefixed with the VARIADIC keyword (passing an array directly to a
+ * variadic parameter — num_nulls(VARIADIC arr), ../design/array-functions.md §12); VARIADIC may
+ * mark ONLY the last argument and does not combine with a name (parser-enforced, 42601). */
+function_call  ::= identifier "(" ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? | variadic_arg )? ")"
 function_arg   ::= ( identifier "=>" )? expr
+variadic_arg   ::= "VARIADIC" expr
 
 /* A column reference is a bare column ("col") or a qualified column ("rel.col") where
  * `rel` is a relation's LABEL in the FROM clause (its alias, else its table name). A bare

@@ -2405,6 +2405,25 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 	default:
 		var names []*string
 		for {
+			// The final argument may be `VARIADIC expr` (grammar.md §17, array-functions.md §12):
+			// the array is passed directly to a variadic parameter. VARIADIC is a plain keyword
+			// (not reserved) recognized only at the start of an argument; once seen, no further
+			// argument may follow (42601) and it does not combine with a name.
+			if p.peekKeyword() == "variadic" {
+				p.advance()
+				fc.Variadic = true
+				arg, err := p.parseExpr()
+				if err != nil {
+					return Expr{}, err
+				}
+				fc.Args = append(fc.Args, &arg)
+				names = append(names, nil)
+				// A VARIADIC argument must be the last (PostgreSQL, 42601).
+				if p.peek().Kind == TokComma {
+					return Expr{}, NewError(SyntaxError, "VARIADIC argument must be the last argument")
+				}
+				break
+			}
 			// A named argument is `identifier "=>" expr` (grammar.md §17); a two-token lookahead
 			// (word then "=>") distinguishes it from a bare expr that starts with an identifier.
 			var argName *string

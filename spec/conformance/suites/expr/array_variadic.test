@@ -1,0 +1,143 @@
+# Array function/operator surface AF6 (spec/design/array-functions.md §12): the VARIADIC call syntax
+# + variadic overload resolution, spent on the engine's first VARIADIC built-ins num_nulls /
+# num_nonnulls (count the NULL / non-NULL arguments → int32). A variadic parameter takes EITHER a
+# SPREAD of trailing arguments — num_nulls(1, NULL, 3) — OR a single array via the VARIADIC keyword —
+# num_nulls(VARIADIC ARRAY[1,NULL,3]). NON-STRICT (null = "none"): the spread form NEVER returns NULL
+# (num_nulls(NULL) is 1), while the VARIADIC-array form returns NULL on a NULL whole-array operand.
+# A VARIADIC keyword on a non-array (or a bare untyped NULL) operand is 42804; a spread of zero args
+# (num_nulls()) is 42883. PostgreSQL-oracle-verified (postgres:18).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.array, types.array_multidim, types.int32, types.text, types.boolean, func.variadic, resource.cost_metering
+
+# --- spread form: count the NULL / non-NULL arguments (heterogeneous; the "any" element family) ---
+# num_nulls(NULL) is 1, NOT NULL — the non-strict discipline (the kernel counts, never short-circuits).
+query I nosort
+SELECT num_nulls(1, NULL, 3)
+----
+1
+
+query I nosort
+SELECT num_nonnulls(1, NULL, 3)
+----
+2
+
+query I nosort
+SELECT num_nulls(NULL)
+----
+1
+
+query I nosort
+SELECT num_nonnulls(NULL)
+----
+0
+
+# Heterogeneous arguments — each matches the VARIADIC "any" element family (int + text + boolean).
+query I nosort
+SELECT num_nulls(1, 'a', true, NULL)
+----
+1
+
+query I nosort
+SELECT num_nonnulls(1, 'a', true, NULL)
+----
+3
+
+# A single NON-VARIADIC array argument is ONE value (the array itself is non-NULL).
+query I nosort
+SELECT num_nulls(ARRAY[1, NULL, 3])
+----
+0
+
+query I nosort
+SELECT num_nonnulls(ARRAY[1, NULL, 3])
+----
+1
+
+# --- VARIADIC-array form: the array's flattened elements are the arguments -------------------------
+# Cost: 1 (the ARRAY[…] constructor node) + 1 (the num_nulls node) + 1 (the produced row) = 3 — the
+# per-element count walk is UNMETERED (like the array introspectors, §3.3), byte-identical cross-core.
+# cost: 3
+query I nosort
+SELECT num_nulls(VARIADIC ARRAY[1, NULL, 3])
+----
+1
+
+query I nosort
+SELECT num_nonnulls(VARIADIC ARRAY[1, NULL, 3])
+----
+2
+
+# The empty array → 0; a multidimensional array flattens (row-major).
+query I nosort
+SELECT num_nulls(VARIADIC '{}'::int32[])
+----
+0
+
+query I nosort
+SELECT num_nulls(VARIADIC '{{1,2},{NULL,4}}'::int32[])
+----
+1
+
+# A NULL whole-array operand → NULL (both functions) — distinct from the spread form's never-NULL.
+query I nosort
+SELECT num_nulls(VARIADIC NULL::int32[])
+----
+NULL
+
+query I nosort
+SELECT num_nonnulls(VARIADIC NULL::int32[])
+----
+NULL
+
+# --- both forms agree, and compose over a column --------------------------------------------------
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])
+
+statement ok
+INSERT INTO t VALUES (1, ARRAY[1, NULL, 3]), (2, '{}'), (3, NULL)
+
+# Row 1: one NULL element → 1. Row 2: empty → 0. Row 3: NULL array → NULL.
+query II nosort
+SELECT id, num_nulls(VARIADIC xs) FROM t ORDER BY id
+----
+1
+1
+2
+0
+3
+NULL
+
+# num_nonnulls over the same column: row 1 has two non-NULL elements, row 2 zero, row 3 NULL.
+query II nosort
+SELECT id, num_nonnulls(VARIADIC xs) FROM t ORDER BY id
+----
+1
+2
+2
+0
+3
+NULL
+
+# --- errors ---------------------------------------------------------------------------------------
+# A VARIADIC keyword on a non-array operand is 42804 ("VARIADIC argument must be an array").
+statement error 42804
+SELECT num_nulls(VARIADIC 5)
+
+# A VARIADIC keyword on a bare untyped NULL is 42804 too (not the polymorphic 42P18).
+statement error 42804
+SELECT num_nulls(VARIADIC NULL)
+
+# The spread form needs ≥1 argument — num_nulls() has no overload (42883).
+statement error 42883
+SELECT num_nulls()
+
+# The VARIADIC keyword on a non-variadic function is 42883 (no such overload).
+statement error 42883
+SELECT abs(VARIADIC ARRAY[1])
+
+# Named notation on num_nulls (which has no parameter names) is 42883.
+statement error 42883
+SELECT num_nulls(x => 1)
+
+# A VARIADIC argument must be the last — a trailing argument after it is 42601.
+statement error 42601
+SELECT num_nulls(VARIADIC ARRAY[1], 2)

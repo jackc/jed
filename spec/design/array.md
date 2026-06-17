@@ -411,14 +411,15 @@ each passing `rake ci`, mirroring composite's S0–S6:
 `array_append`/`array_prepend`/`array_cat`), **AF2** (the `||` concatenation operator + the
 search/edit functions `array_remove`/`array_replace`/`array_position`/`array_positions`), **AF3**
 (the `unnest(anyarray)` set-returning function, §9), **AF4** (the containment/overlap operators
-`@>`/`<@`/`&&`), and **AF5** (the `ANY`/`ALL`/`SOME` quantified comparisons `x = ANY(arr)` /
-`x op ALL(arr)`, §11) are implemented across all three cores, oracle-checked
+`@>`/`<@`/`&&`), **AF5** (the `ANY`/`ALL`/`SOME` quantified comparisons `x = ANY(arr)` /
+`x op ALL(arr)`, §11), and **AF6** (the `VARIADIC` call syntax + variadic resolution — the
+`num_nulls`/`num_nonnulls` built-ins, §12) are implemented across all three cores, oracle-checked
 (`suites/expr/array_functions.test`, `suites/expr/array_concat_search.test`, `suites/query/unnest.test`,
-`suites/expr/array_containment.test`, `suites/expr/array_quantified.test`, capabilities `func.array` +
-`func.unnest` + `func.array_containment` + `func.array_quantified`). The remaining slice — `VARIADIC` —
-is sequenced there (§6).
+`suites/expr/array_containment.test`, `suites/expr/array_quantified.test`, `suites/expr/array_variadic.test`,
+capabilities `func.array` + `func.unnest` + `func.array_containment` + `func.array_quantified` +
+`func.variadic`). The array function/operator surface is **complete**.
 
 **Still deferred (each its own follow-on):** **array-of-composite** elements (a fast-follow —
-composite already composes); arrays-in-keys (`0A000`, encoding authored §8); the **remaining** array
-operator surface (`VARIADIC`, and the subquery quantifier form `op ANY(SELECT …)` — array-functions.md
-§6/§11); runtime text→array, `array::text`, and element-wise array→array casts.
+composite already composes); arrays-in-keys (`0A000`, encoding authored §8); the subquery quantifier
+form `op ANY(SELECT …)` (array-functions.md §11); runtime text→array, `array::text`, and element-wise
+array→array casts.

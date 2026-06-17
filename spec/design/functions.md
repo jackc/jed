@@ -26,7 +26,7 @@ The catalog now lists:
 | `comparison` (NULL-safe) | `IS DISTINCT FROM`, `IS NOT DISTINCT FROM` | `boolean` |
 | `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` |
 | `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` |
-| `function` (scalar) | `abs` `round` (§9), `make_interval` (§11), `uuid_extract_version`/`uuid_extract_timestamp`, `uuidv4`/`uuidv7`, `now`/`clock_timestamp` (§12) | per-function |
+| `function` (scalar) | `abs` `round` (§9), `make_interval` (§11), `uuid_extract_version`/`uuid_extract_timestamp`, `uuidv4`/`uuidv7`, `now`/`clock_timestamp` (§12), `num_nulls`/`num_nonnulls` (VARIADIC, array-functions.md §12) | per-function |
 | `aggregate` | `COUNT` `SUM` `MIN` `MAX` `AVG` | `int64` / `decimal` / widened (§8) |
 | `set_returning` | `generate_series`, `unnest` (§10, array-functions.md §9) | a row **set** (§10) |
 
@@ -215,8 +215,8 @@ result codes `anyarray`/`anyelement` (a type variable `ELEM`, bound by structura
 read back into the result). The dispatch (the unification + the kernels) is hand-written per core;
 `verify.rb` admits the tokens as a small allowlist. The full design — the resolution algorithm,
 the literal-adaptation rule, and the per-function semantics — lives in
-[array-functions.md](array-functions.md); the remaining surface (`||`/`unnest`/`@>`/`&&`/`ANY`/`ALL`/
-`VARIADIC`) is sequenced there (§6).
+[array-functions.md](array-functions.md). That surface is now **complete**: `||`/`unnest`/`@>`/`&&`/
+`ANY`/`ALL` and finally **`VARIADIC`** (AF6, §12 — the `num_nulls`/`num_nonnulls` built-ins) all landed.
 
 **Aggregates are authored (`kind = "aggregate"`).** `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` landed
 in a **separate `[[aggregate]]` array**, not as `[[operator]]` rows, because they do not fit
@@ -445,8 +445,11 @@ arguments' own costs), asserted in the corpus (`# cost:`).
 literals and user-defined functions are not built (jed has no UDFs; built-ins use overloads or
 `make_interval`-style 0-defaults). The sibling constructors `make_timestamp` /
 `make_timestamptz` reuse this exact mold (their `sec` is also `float64`). **`VARIADIC`** was blocked
-on the `array` type; that has since landed (array.md), so `VARIADIC` is now **unblocked** and
-sequenced as **AF6** in the array function surface ([array-functions.md §6](array-functions.md)).
+on the `array` type; that has since landed (array.md), so `VARIADIC` **landed** as **AF6** in the
+array function surface ([array-functions.md §12](array-functions.md)) — a `VARIADIC` keyword before a
+call's final argument plus variadic overload resolution, spent on the engine's first VARIADIC
+built-ins `num_nulls`/`num_nonnulls` (a parameter marked `variadic` accepts either a spread of trailing
+arguments or a single array via the keyword).
 
 ## 12. UUID functions — extractors now, generators on the entropy+clock seam
 

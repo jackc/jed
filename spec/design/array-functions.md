@@ -10,21 +10,23 @@
 > `postgres:18` oracle — several array-function NULL/shape rules are subtle (§3) and must be
 > oracle-checked, not guessed.
 >
-> **Status: AF1 + AF2 + AF3 + AF4 + AF5 landed.** AF1 — the **polymorphic resolution machinery** (§2)
-> plus the *scalar-function-shaped* surface: introspection (`array_ndims`, `array_length`, `array_lower`,
-> `array_upper`, `cardinality`, `array_dims`) and builders (`array_append`, `array_prepend`,
-> `array_cat`). AF2 (§8) — the **`||` concatenation operator** and the **search/edit functions**
-> (`array_remove`, `array_replace`, `array_position`, `array_positions`). AF3 (§9) — the
-> **`unnest(anyarray)` set-returning function**, the engine's second FROM-clause SRF: it expands an
-> array into one row per element at the bound element type. AF4 (§10) — the **containment/overlap
-> operators** `@>` (contains), `<@` (contained by), `&&` (overlaps), three polymorphic
-> `anyarray <op> anyarray → boolean` operators. AF5 (§11) — the **`ANY`/`ALL`/`SOME` quantified array
-> comparisons** (`x = ANY(arr)`, `x op ALL(arr)`), the array spelling of `IN`/its universal dual,
-> three-valued over the array's elements. All five are implemented across all three cores,
-> oracle-checked (`suites/expr/array_functions.test`, `suites/expr/array_concat_search.test`,
-> `suites/query/unnest.test`, `suites/expr/array_containment.test`, `suites/expr/array_quantified.test`),
-> capabilities `func.array` + `func.unnest` + `func.array_containment` + `func.array_quantified`. The
-> remaining slice (§6) — `VARIADIC` — is a sequenced follow-on, its own vertical slice.
+> **Status: AF1 + AF2 + AF3 + AF4 + AF5 + AF6 landed — the surface is complete.** AF1 — the
+> **polymorphic resolution machinery** (§2) plus the *scalar-function-shaped* surface: introspection
+> (`array_ndims`, `array_length`, `array_lower`, `array_upper`, `cardinality`, `array_dims`) and builders
+> (`array_append`, `array_prepend`, `array_cat`). AF2 (§8) — the **`||` concatenation operator** and the
+> **search/edit functions** (`array_remove`, `array_replace`, `array_position`, `array_positions`). AF3
+> (§9) — the **`unnest(anyarray)` set-returning function**, the engine's second FROM-clause SRF: it
+> expands an array into one row per element at the bound element type. AF4 (§10) — the
+> **containment/overlap operators** `@>` (contains), `<@` (contained by), `&&` (overlaps), three
+> polymorphic `anyarray <op> anyarray → boolean` operators. AF5 (§11) — the **`ANY`/`ALL`/`SOME`
+> quantified array comparisons** (`x = ANY(arr)`, `x op ALL(arr)`), the array spelling of `IN`/its
+> universal dual, three-valued over the array's elements. AF6 (§12) — the **`VARIADIC` call syntax +
+> variadic overload resolution**, spent on the engine's first VARIADIC built-ins
+> `num_nulls`/`num_nonnulls`. All six are implemented across all three cores, oracle-checked
+> (`suites/expr/array_functions.test`, `suites/expr/array_concat_search.test`, `suites/query/unnest.test`,
+> `suites/expr/array_containment.test`, `suites/expr/array_quantified.test`, `suites/expr/array_variadic.test`),
+> capabilities `func.array` + `func.unnest` + `func.array_containment` + `func.array_quantified` +
+> `func.variadic`.
 
 ## 1. Why a new layer
 
@@ -281,8 +283,11 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
   `x IN (the elements)`), generalized to all five comparison operators and both quantifiers. All
   three cores + `func.array_quantified` + `suites/expr/array_quantified.test`. (Array operand only;
   the `op ANY(SELECT …)` subquery form is a separate deferred `0A000` Phase-4 item.)
-- **AF6** — **`VARIADIC`** call syntax + variadic overload resolution (the `make_interval`-era
-  follow-on, [functions.md §11](functions.md), unblocked by the array type).
+- **AF6 ✅** (§12) — the **`VARIADIC` call syntax + variadic overload resolution** (the
+  `make_interval`-era follow-on, [functions.md §11](functions.md), unblocked by the array type), spent
+  on the engine's first VARIADIC built-ins `num_nulls`/`num_nonnulls`. One grammar change (a `VARIADIC`
+  keyword before the final call argument); all three cores + `func.variadic` +
+  `suites/expr/array_variadic.test`.
 
 ## 7. Errors
 
@@ -294,14 +299,16 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
 | `array_remove`/`array_position`/`array_positions` on a multidimensional array (AF2) | `0A000` feature_not_supported |
 | `array_position(a, e, start)` with a NULL `start` (AF2) | `22004` null_value_not_allowed |
 | `unnest` of a non-array, or with the wrong arity (AF3) | `42883` undefined_function |
+| `f(VARIADIC x)` where `x` is not an array (incl. a bare untyped `NULL`) (AF6) | `42804` datatype_mismatch |
+| `f(…)` of a variadic built-in with too few args (spread `< arity`, e.g. `num_nulls()`) (AF6) | `42883` undefined_function |
 | `x op ANY/ALL(<non-array>)` — a non-array right side (AF5) | `42809` wrong_object_type |
 | `x op ANY/ALL(arr)` where `x` and the element type are not comparable (AF5) | `42883` undefined_function |
 | `op ANY/ALL(SELECT …)` — the subquery quantifier form (AF5, deferred) | `0A000` feature_not_supported |
 | Polymorphic type undeterminable (all polymorphic args untyped `NULL`, incl. bare `unnest(NULL)` and a bare `x op ANY(NULL)` array operand) | `42P18` indeterminate_datatype |
 
 `22000` (`data_exception`) is registered in [../errors/registry.toml](../errors/registry.toml)
-(added with AF1); `22004` (`null_value_not_allowed`) was added with AF2; `0A000`, `2202E`, `42809`,
-`42883`, `42P18` already existed.
+(added with AF1); `22004` (`null_value_not_allowed`) was added with AF2; `0A000`, `2202E`, `42804`,
+`42809`, `42883`, `42P18` already existed (`42804` `datatype_mismatch` is reused by AF6).
 
 ## 8. AF2 — the `||` operator and the search/edit functions
 
@@ -603,3 +610,118 @@ with `# cost:` in the corpus.
     `NULL` operand is `42P18`** — the first two match PostgreSQL's codes and messages exactly; the
     third is jed's untyped-`NULL` strictness (PG defaults the array's element type), a degenerate case
     out of the oracle corpus, consistent with `unnest(NULL)` (§5 #6).
+
+## 12. AF6 — the `VARIADIC` call syntax + variadic resolution
+
+AF6 closes the array surface with the feature the array *type* unblocked: **`VARIADIC`**. A variadic
+parameter is, at bottom, **an array** — PostgreSQL collects a call's trailing arguments into an array
+of the parameter's element type and passes that one array to the function, and the `VARIADIC` keyword
+lets a caller pass the array *directly* instead. So `VARIADIC` could not land until the array type and
+value existed (array.md); now it can. This is the `make_interval`-era follow-on
+([functions.md §11](functions.md)): a **resolution + one grammar token** slice — the executor's value
+model is untouched beyond the two new kernels.
+
+jed has **no UDFs**, so the driver must be a built-in, and it must be oracle-checkable
+(CLAUDE.md §1/§7). PostgreSQL's core variadic built-ins are almost all `VARIADIC "any"` (the rest are
+`text`/`json`-typed, which jed has no surface for yet — `concat`/`format` need text I/O, §5 #9). The two
+that need **nothing** jed lacks are **`num_nulls`** and **`num_nonnulls`** — they count the NULL /
+non-NULL arguments, so they are pure, deterministic, type-agnostic, and exercise *both* call forms.
+They are the AF6 driver. Every rule below is oracle-pinned (`postgres:18`).
+
+### 12.1 The two call forms
+
+`num_nulls(VARIADIC "any") → int4` and `num_nonnulls(VARIADIC "any") → int4` each declare **one**
+parameter, the variadic one (the catalog row carries `variadic = true`, `arity = 1`,
+`arg_families = ["any"]`, `result = "int32"`, `null = "none"`). A call takes one of two shapes:
+
+- **Spread form** `num_nulls(a, b, c)` — the trailing arguments (here all of them, since the only
+  parameter is variadic) are the values to count. They are **heterogeneous** — each matches the
+  variadic element family `"any"`, so `num_nulls(1, 'x', true, NULL)` is legal and counts `1` (the one
+  NULL). **At least one** argument is required: `num_nulls()` is `42883` (PG agrees — a `VARIADIC`
+  function's spread form needs ≥ `arity` args, and `arity` counts the variadic slot as one). The result
+  is **never** NULL — `num_nulls(NULL)` is `1`, not NULL (the `null = "none"` non-strict discipline,
+  §4: the kernel counts, it does not short-circuit).
+- **VARIADIC-array form** `num_nulls(VARIADIC arr)` — `arr` must be an **array**; its **flattened
+  elements** (row-major, any dimensionality — `num_nulls(VARIADIC ARRAY[[1,2],[NULL,4]])` is `1`) are
+  the values to count. A **NULL whole-array** argument (`num_nulls(VARIADIC NULL::int32[])`) yields
+  **NULL** (both functions), and the **empty** array yields `0`. A bare untyped `NULL`
+  (`num_nulls(VARIADIC NULL)`) or any **non-array** (`num_nulls(VARIADIC 5)`) is **`42804`**
+  (*"VARIADIC argument must be an array"*, PG's exact code + message) — *not* `42P18`, because the
+  failure is "the VARIADIC operand is not an array", settled before any polymorphic binding.
+
+The two forms are observably the same function: `num_nulls(VARIADIC ARRAY[1,NULL,3])` and
+`num_nulls(1, NULL, 3)` both return `1`. A **single non-VARIADIC array** argument is just one value:
+`num_nulls(ARRAY[1,NULL,3])` is `0` (the array itself is non-NULL) and `num_nonnulls(ARRAY[1,NULL,3])`
+is `1`.
+
+### 12.2 Grammar & AST
+
+One grammar change: a function argument may be prefixed with the **`VARIADIC` keyword**, and only the
+**last** argument may be (`grammar.ebnf` `function_arg`). `VARIADIC` is a plain keyword (no new token,
+no reserved word — a column may still be named `variadic`); the parser recognizes it at the start of
+the final argument. It does **not** combine with named notation (`VARIADIC name => v` is rejected at
+parse) and a `VARIADIC`-marked argument may **not** be followed by another argument (`f(VARIADIC a, b)`
+is a `42601` syntax error, matching PG). The `FuncCall` AST node gains a `variadic: bool` flag (`false`
+for every existing call — the all-positional fast path is byte-identical); the flag travels to the
+resolver, which alone knows whether the called function is actually variadic.
+
+### 12.3 Resolution
+
+A variadic built-in is intercepted **before** the generic scalar path (like the array functions, §2 /
+[functions.md §9](functions.md)) — `is_variadic_func_name` is data-driven over the catalog
+(`kind = "function"` ∧ `variadic`). `resolve_variadic_func` then, for the lone catalog row of that name:
+
+1. **rejects named notation** (`num_nulls` has no `arg_names`, so `name => v` is `42883`, PG's
+   behavior) and **`*`** (`42601`, like every non-aggregate);
+2. lets `k = arity` (the declared parameter count; `1` here) and `f = k − 1` (the fixed-parameter
+   count; `0` here — `num_nulls` is all-variadic);
+3. **VARIADIC-array form** (`variadic` flag set): the call must have exactly `k` arguments; the fixed
+   `0..f` resolve against their concrete families; the **last** argument resolves with no hint and must
+   be an **array** type `E[]` — a non-array or bare untyped `NULL` is **`42804`**. (The variadic
+   element family `"any"` accepts any `E`; a *concrete* variadic family would additionally require
+   `E`'s family to match — not exercised by `num_nulls`.)
+4. **Spread form** (flag clear): the call must have **≥ `k`** arguments (`< k` → `42883`, so
+   `num_nulls()` fails); the fixed `0..f` resolve against their concrete families; every argument from
+   `f` onward resolves with no hint and must match the variadic element family (`"any"` ⇒ everything,
+   arrays included).
+5. the **result** is the catalog `result` code (`int32`), independent of the arguments.
+
+The resolved node is `RExpr::Variadic { func, args, array_form }` — `func` ∈ {`NumNulls`,
+`NumNonnulls`} (the kernel id by name, §5 / extensibility.md), `args` the resolved argument vector, and
+`array_form` recording which shape was used (the eval needs it: the array form flattens one operand, the
+spread form counts the operands). Like `RExpr::ArrayFunc` (the `none` discipline, §4) it carries **no
+blanket NULL short-circuit** — the kernel sees raw (possibly NULL) values.
+
+### 12.4 Evaluation, cost & the node
+
+The kernel charges **one** `operator_eval` for the call (the arguments charge their own evaluation cost
+recursively); the per-argument / per-element count walk is **unmetered**, exactly as the array
+introspectors' shape walks are (§3.3, AF4 §10.3). This bounds an untrusted query: the spread form's
+arg count is syntactic, and the VARIADIC array was already materialized (its construction metered), so
+`max_cost` already bounds the work that produced the operand. Deterministic and cross-core-identical
+(CLAUDE.md §13), asserted with `# cost:` in the corpus.
+
+The two kernels:
+
+- **spread form** (`array_form` clear): count the arguments whose value is NULL (`num_nulls`) / non-NULL
+  (`num_nonnulls`); return `int32`. Never NULL.
+- **VARIADIC-array form** (`array_form` set): evaluate the single operand; if it is NULL return NULL;
+  otherwise count its **flattened elements'** null-ness; return `int32`.
+
+### 12.5 Ratified decisions & deliberate divergences
+
+16. **`num_nulls`/`num_nonnulls` are the AF6 driver, over `VARIADIC "any"`** — the only core PG
+    variadic built-ins that need nothing jed lacks (every other is `text`/`json`-typed, §5 #9). The
+    `"any"` variadic is heterogeneous (each spread argument keeps its own type; the VARIADIC array may
+    have any element type), modeled with jed's existing `"any"` family token — no element-type
+    unification (contrast the `anyarray` builders, §2).
+17. **A `VARIADIC` keyword on a non-array (or bare untyped `NULL`) operand is `42804`** — *"VARIADIC
+    argument must be an array"*, PG's exact code + message, settled at resolve before any type binding.
+    This is **not** the `42P18` of the indeterminate-polymorphic cases (§5 #6) — the operand's family
+    *is* determinable (it is simply not an array). The minimum-one-argument spread rule
+    (`num_nulls()` → `42883`) likewise matches PG.
+18. **`null = "none"` (non-strict), and the asymmetry between the forms** — the spread form **never**
+    returns NULL (it counts NULL arguments, so `num_nulls(NULL)` is `1`), while the VARIADIC-array form
+    returns NULL on a **NULL whole-array** operand. Both are oracle-pinned PG behavior, and both fall
+    out of the `none` discipline (the kernel inspects null-ness itself) plus the array form's
+    "evaluate-the-array-first" short-circuit.

@@ -630,11 +630,16 @@ type IsDistinctExpr struct {
 // argument positional (the common case); otherwise it is parallel to Args, with a non-nil
 // *string for a named slot and nil for a positional one. The parser rejects a positional arg
 // after a named one.
+// Variadic is true when the final argument was prefixed with the VARIADIC keyword
+// (num_nulls(VARIADIC arr), array-functions.md §12 / grammar.md §17): the array is passed
+// directly to a variadic parameter rather than spreading individual arguments. false for every
+// ordinary call (the all-positional/spread fast path).
 type FuncCallExpr struct {
 	Name     string
 	Args     []*Expr
 	ArgNames []*string
 	Star     bool
+	Variadic bool
 }
 
 // InExpr is `Lhs IN (List)` / `Lhs NOT IN (List)` — membership over a non-empty value list

@@ -548,6 +548,11 @@ pub enum Expr {
         args: Vec<Expr>,
         arg_names: Option<Box<Vec<Option<String>>>>,
         star: bool,
+        /// `true` when the final argument was prefixed with the `VARIADIC` keyword
+        /// (`num_nulls(VARIADIC arr)`, array-functions.md §12 / grammar.md §17): the array is
+        /// passed directly to a variadic parameter rather than spreading individual arguments.
+        /// `false` for every ordinary call (the all-positional/spread fast path).
+        variadic: bool,
     },
     /// A scalar subquery `( query_expr )` in expression position (grammar.md §26). `resolve`
     /// plans it once against the scope chain; an uncorrelated one is then folded to a constant,

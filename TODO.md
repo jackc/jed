@@ -261,10 +261,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         item. All three cores + per-core unit test, oracle-checked
         (`suites/expr/array_quantified.test`), capability `func.array_quantified`, `/web` select-page
         live example + e2e. → [array-functions.md §11](spec/design/array-functions.md)
+  - [x] **AF6 — the `VARIADIC` call syntax + variadic overload resolution** — the `make_interval`-era
+        follow-on unblocked by the array type, spent on the engine's first VARIADIC built-ins
+        `num_nulls`/`num_nonnulls` (count the NULL / non-NULL arguments → int32). A new catalog field
+        `variadic=true` marks the last parameter VARIADIC: a call takes EITHER a spread of ≥1 trailing
+        args (`num_nulls(1,NULL,3)`, heterogeneous — the variadic element family is `"any"`; zero args
+        is `42883`) OR a single array via the `VARIADIC` keyword (`num_nulls(VARIADIC ARRAY[1,NULL,3])`,
+        flattened any-dim). One grammar change (the `VARIADIC` keyword before a call's final argument
+        only; a non-final/named VARIADIC is `42601`), a `variadic` flag on the FuncCall node, and a new
+        `RExpr::Variadic` resolved node. NON-STRICT (`null="none"`): the spread form never returns NULL
+        (`num_nulls(NULL)`=1), the VARIADIC-array form returns NULL on a NULL whole-array. A VARIADIC
+        non-array / bare-NULL operand is `42804`. One `operator_eval` per call (the count walk
+        unmetered, like the introspectors). All three cores + Ruby N/A (no format change), oracle-checked
+        (`suites/expr/array_variadic.test`), capability `func.variadic`, `/web` select-page live example
+        + e2e. → [array-functions.md §12](spec/design/array-functions.md)
   - [ ] _follow-ons (each its own slice + obligations; sequenced in array-functions.md §6):_
-        **AF6** `VARIADIC`. Plus: array-of-composite elements; arrays-in-keys (`0A000`, encoding
-        authored §8); the subquery quantifier form `op ANY(SELECT …)`; runtime text→array,
-        `array::text`, and element-wise array→array casts.
+        array-of-composite elements; arrays-in-keys (`0A000`, encoding authored §8); the subquery
+        quantifier form `op ANY(SELECT …)`; runtime text→array, `array::text`, and element-wise
+        array→array casts.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis**, sibling to `array` and sharing ~80% of its foundation, so sequence
       the two together. **The headline implication: this turns the *closed* type enum into an *open*,

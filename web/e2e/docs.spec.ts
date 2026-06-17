@@ -44,6 +44,14 @@ test('the select page runs the ANY/ALL quantified comparisons live', async ({ pa
 	await expect(panel.getByTestId('result-rows')).toContainText('false');
 });
 
+test('the select page runs the VARIADIC num_nulls demo live', async ({ page }) => {
+	await page.goto('/docs/sql/select/');
+	// Sixth LiveSql panel = the num_nulls demo: spread 1, variadic 1, non_nulls 2 (both forms agree).
+	const panel = page.getByTestId('live-sql').nth(5);
+	await expect(panel.getByTestId('result-rows')).toContainText('1');
+	await expect(panel.getByTestId('result-rows')).toContainText('2');
+});
+
 test('the reference pages are generated from the spec', async ({ page }) => {
 	await page.goto('/docs/reference/errors/');
 	// 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.

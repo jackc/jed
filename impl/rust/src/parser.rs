@@ -1922,6 +1922,7 @@ impl Parser {
                     args: Vec::new(),
                     arg_names: None,
                     star: false,
+                    variadic: false,
                 })
             }
             Token::Str(_) => {
@@ -1977,6 +1978,7 @@ impl Parser {
         let mut args = Vec::new();
         let mut arg_names: Vec<Option<String>> = Vec::new();
         let mut any_named = false;
+        let mut variadic = false;
         let star = if matches!(self.peek(), Token::Star) {
             self.advance();
             true
@@ -1985,6 +1987,21 @@ impl Parser {
             false
         } else {
             loop {
+                // The final argument may be `VARIADIC expr` (grammar.md §17, array-functions.md
+                // §12): the array is passed directly to a variadic parameter. VARIADIC is a plain
+                // keyword (not reserved) recognized only at the start of an argument; once seen, no
+                // further argument may follow (42601) and it does not combine with a name.
+                if self.peek_keyword().as_deref() == Some("variadic") {
+                    self.advance();
+                    variadic = true;
+                    args.push(self.parse_expr()?);
+                    arg_names.push(None);
+                    // A VARIADIC argument must be the last (PostgreSQL, 42601).
+                    if matches!(self.peek(), Token::Comma) {
+                        return Err(syntax("VARIADIC argument must be the last argument"));
+                    }
+                    break;
+                }
                 // A named argument is `identifier "=>" expr` (grammar.md §17); a two-token
                 // lookahead (Word then `=>`) distinguishes it from a bare expr that starts with
                 // an identifier (a column reference).
@@ -2023,6 +2040,7 @@ impl Parser {
             args,
             arg_names,
             star,
+            variadic,
         })
     }
 

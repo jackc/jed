@@ -74,6 +74,15 @@ schema_version = 2
 #                 differ on every call (uuidv4/uuidv7 — the entropy+clock seam, ../design/
 #                 entropy.md). Marks a call non-foldable for a future constant-folding/CSE pass;
 #                 ADVISORY today (no such pass exists yet — the reserved-`cost`-field posture).
+# variadic        OPTIONAL boolean (scalar functions only — ../design/array-functions.md §12),
+#                 absent ⇒ false. true marks the LAST parameter as VARIADIC (PostgreSQL): the call
+#                 accepts EITHER a SPREAD of trailing arguments — f(a, b, c), each matching the
+#                 variadic element family (the last arg_families entry) — OR a single array passed
+#                 with the VARIADIC keyword — f(VARIADIC arr), whose element type matches that
+#                 family. The variadic element family is the last arg_families entry; with "any"
+#                 the spread is heterogeneous and the VARIADIC array may have any element type
+#                 (num_nulls/num_nonnulls). A VARIADIC keyword on a non-array argument is 42804; a
+#                 spread with fewer than `arity` args has no overload (42883). Hand-written per core.
 # -----------------------------------------------------------------------------
 
 # --- logical connectives -----------------------------------------------------
@@ -1950,6 +1959,45 @@ result         = "timestamptz"
 null           = "propagates"
 errors         = []
 volatility     = "volatile"
+
+# --- argument-counting functions (num_nulls/num_nonnulls — the VARIADIC surface) ---
+# PostgreSQL's NULL-counting functions, and the engine's FIRST VARIADIC functions
+# (../design/array-functions.md §12). Each declares ONE parameter, the VARIADIC "any" (variadic =
+# true, the last arg_families entry the variadic element family), so a call takes EITHER a SPREAD
+# of ≥1 heterogeneous arguments — num_nulls(1, 'x', NULL) — OR a single array via the VARIADIC
+# keyword — num_nulls(VARIADIC ARRAY[1,NULL,3]). num_nulls returns the count of NULL arguments;
+# num_nonnulls the count of non-NULL ones; result is always int32 (PG integer). NON-STRICT (null =
+# "none"): the kernel inspects null-ness itself rather than short-circuiting, so the spread form
+# NEVER returns NULL (num_nulls(NULL) is 1, not NULL). The VARIADIC array form flattens the array's
+# elements (row-major, any dimensionality) and counts their null-ness — but a NULL whole-array
+# argument (num_nulls(VARIADIC NULL::int[])) yields NULL. A VARIADIC keyword on a non-array (or a
+# bare untyped NULL) is 42804 ("VARIADIC argument must be an array"); a spread of zero args
+# (num_nulls()) has no overload (42883). The VARIADIC surface was blocked on the array type (now
+# landed). volatility = "immutable" (pure functions of the argument values). Oracle-checked
+# (postgres:18). These names have no parameter names, so named notation on them is 42883.
+[[operator]]
+name           = "num_nulls"
+kind           = "function"
+arity          = 1
+arg_families   = ["any"]
+variadic       = true
+arg_resolution = "none"
+result         = "int32"
+null           = "none"
+errors         = ["42804"]
+volatility     = "immutable"
+
+[[operator]]
+name           = "num_nonnulls"
+kind           = "function"
+arity          = 1
+arg_families   = ["any"]
+variadic       = true
+arg_resolution = "none"
+result         = "int32"
+null           = "none"
+errors         = ["42804"]
+volatility     = "immutable"
 
 # --- array functions (AF1: the polymorphic surface) --------------------------
 # The scalar-function-shaped array surface (../design/array-functions.md). These are the

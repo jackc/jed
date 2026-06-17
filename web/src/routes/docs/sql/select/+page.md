@@ -34,6 +34,10 @@ ORDER BY u;`;
 	const quantifiedExample = `SELECT 2 = ANY(ARRAY[1, 2, 3])  AS any_match,
        5 > ALL(ARRAY[1, 2, 3])  AS all_greater,
        9 = ANY(ARRAY[1, 2, 3])  AS no_match;`;
+
+	const variadicExample = `SELECT num_nulls(1, NULL, 3)                AS spread,
+       num_nulls(VARIADIC ARRAY[1, NULL, 3]) AS variadic,
+       num_nonnulls(1, NULL, 3)              AS non_nulls;`;
 </script>
 
 <svelte:head>
@@ -83,6 +87,15 @@ exactly like `IN`: a `NULL` element (or a `NULL` `x`) makes the result `NULL` wh
 it, an empty array makes `ANY` false and `ALL` true, and a `NULL` whole array yields `NULL`:
 
 <LiveSql query={quantifiedExample} rows={2} />
+
+## Variadic functions (`VARIADIC`)
+
+A variadic function takes a variable number of trailing arguments. `num_nulls` and `num_nonnulls`
+count the `NULL` / non-`NULL` arguments — either as a spread of values, or, with the `VARIADIC`
+keyword, by passing one array whose elements are the arguments. The two forms agree, and the spread
+form never returns `NULL` (it counts), while `VARIADIC` over a `NULL` array yields `NULL`:
+
+<LiveSql query={variadicExample} rows={2} />
 
 ## Cost
 

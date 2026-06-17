@@ -1661,7 +1661,7 @@ class Parser {
       // `(` (a precision typmod, deferred) so that form resolves normally (42883).
       if (w === "current_timestamp" && this.tokens[this.pos + 1]?.kind !== "lparen") {
         this.advance();
-        return { kind: "funcCall", name: "now", args: [], argNames: [], star: false };
+        return { kind: "funcCall", name: "now", args: [], argNames: [], star: false, variadic: false };
       }
       // Function call: a BARE identifier IMMEDIATELY followed by "(" is a call (the engine's
       // first call syntax — grammar.md §17). The one-token lookahead keeps function names
@@ -1697,12 +1697,28 @@ class Parser {
     const names: (string | null)[] = [];
     let star = false;
     let anyNamed = false;
+    let variadic = false;
     if (this.peek().kind === "star") {
       this.advance();
       star = true;
     } else if (this.peek().kind !== "rparen") {
       // Empty parens (make_interval()) fall through with empty args.
       for (;;) {
+        // The final argument may be `VARIADIC expr` (grammar.md §17, array-functions.md §12): the
+        // array is passed directly to a variadic parameter. VARIADIC is a plain keyword (not
+        // reserved) recognized only at the start of an argument; once seen, no further argument may
+        // follow (42601) and it does not combine with a name.
+        if (this.peekKeyword() === "variadic") {
+          this.advance();
+          variadic = true;
+          args.push(this.parseExpr());
+          names.push(null);
+          // A VARIADIC argument must be the last (PostgreSQL, 42601).
+          if (this.peek().kind === "comma") {
+            throw engineError("syntax_error", "VARIADIC argument must be the last argument");
+          }
+          break;
+        }
         // A named argument is `identifier "=>" expr` (grammar.md §17); a two-token lookahead
         // (word then "=>") distinguishes it from a bare expr that starts with an identifier.
         let argName: string | null = null;
@@ -1723,7 +1739,7 @@ class Parser {
     this.expect("rparen");
     // Keep argNames empty unless a name appeared (the all-positional sentinel — §8).
     const argNames = anyNamed ? names : [];
-    return { kind: "funcCall", name, args, argNames, star };
+    return { kind: "funcCall", name, args, argNames, star, variadic };
   }
 
   // --- cursor helpers ---

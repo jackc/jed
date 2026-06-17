@@ -27,6 +27,9 @@ type OperatorDesc struct {
 	// Volatility is the value-stability class (functions.md §12): "immutable" | "stable" |
 	// "volatile". Default "immutable"; marks a call non-foldable (advisory today).
 	Volatility string
+	// Variadic marks the last parameter VARIADIC (array-functions.md §12): a spread of trailing
+	// args, or a single array via the VARIADIC keyword. Default false.
+	Variadic bool
 }
 
 // Operators lists every operator in the catalog, in catalog order.
@@ -45,6 +48,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "and",
@@ -60,6 +64,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "not",
@@ -75,6 +80,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "eq",
@@ -90,6 +96,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "lt",
@@ -105,6 +112,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "gt",
@@ -120,6 +128,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "le",
@@ -135,6 +144,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ge",
@@ -150,6 +160,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -165,6 +176,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -180,6 +192,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "eq",
@@ -195,6 +208,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "lt",
@@ -210,6 +224,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "gt",
@@ -225,6 +240,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "le",
@@ -240,6 +256,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ge",
@@ -255,6 +272,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -270,6 +288,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -285,6 +304,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "like",
@@ -300,6 +320,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "eq",
@@ -315,6 +336,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "lt",
@@ -330,6 +352,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "gt",
@@ -345,6 +368,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "le",
@@ -360,6 +384,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ge",
@@ -375,6 +400,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -390,6 +416,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -405,6 +432,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "eq",
@@ -420,6 +448,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "lt",
@@ -435,6 +464,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "gt",
@@ -450,6 +480,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "le",
@@ -465,6 +496,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ge",
@@ -480,6 +512,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -495,6 +528,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -510,6 +544,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "eq",
@@ -525,6 +560,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "lt",
@@ -540,6 +576,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "gt",
@@ -555,6 +592,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "le",
@@ -570,6 +608,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ge",
@@ -585,6 +624,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -600,6 +640,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -615,6 +656,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "eq",
@@ -630,6 +672,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "lt",
@@ -645,6 +688,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "gt",
@@ -660,6 +704,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "le",
@@ -675,6 +720,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ge",
@@ -690,6 +736,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -705,6 +752,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -720,6 +768,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "eq",
@@ -735,6 +784,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "lt",
@@ -750,6 +800,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "gt",
@@ -765,6 +816,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "le",
@@ -780,6 +832,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ge",
@@ -795,6 +848,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -810,6 +864,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -825,6 +880,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "eq",
@@ -840,6 +896,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "lt",
@@ -855,6 +912,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "gt",
@@ -870,6 +928,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "le",
@@ -885,6 +944,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ge",
@@ -900,6 +960,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -915,6 +976,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -930,6 +992,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "eq",
@@ -945,6 +1008,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "lt",
@@ -960,6 +1024,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "gt",
@@ -975,6 +1040,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "le",
@@ -990,6 +1056,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ge",
@@ -1005,6 +1072,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -1020,6 +1088,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -1035,6 +1104,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "eq",
@@ -1050,6 +1120,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "lt",
@@ -1065,6 +1136,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "gt",
@@ -1080,6 +1152,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "le",
@@ -1095,6 +1168,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ge",
@@ -1110,6 +1184,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_distinct_from",
@@ -1125,6 +1200,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_distinct_from",
@@ -1140,6 +1216,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_null",
@@ -1155,6 +1232,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "is_not_null",
@@ -1170,6 +1248,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "add",
@@ -1185,6 +1264,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "sub",
@@ -1200,6 +1280,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "mul",
@@ -1215,6 +1296,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "div",
@@ -1230,6 +1312,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "mod",
@@ -1245,6 +1328,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "neg",
@@ -1260,6 +1344,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "add",
@@ -1275,6 +1360,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "sub",
@@ -1290,6 +1376,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "mul",
@@ -1305,6 +1392,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "div",
@@ -1320,6 +1408,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "mod",
@@ -1335,6 +1424,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "neg",
@@ -1350,6 +1440,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "add",
@@ -1365,6 +1456,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "sub",
@@ -1380,6 +1472,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "neg",
@@ -1395,6 +1488,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "add",
@@ -1410,6 +1504,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "add",
@@ -1425,6 +1520,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "sub",
@@ -1440,6 +1536,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "add",
@@ -1455,6 +1552,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "add",
@@ -1470,6 +1568,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "sub",
@@ -1485,6 +1584,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "sub",
@@ -1500,6 +1600,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "sub",
@@ -1515,6 +1616,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "mul",
@@ -1530,6 +1632,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "mul",
@@ -1545,6 +1648,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "mul",
@@ -1560,6 +1664,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "mul",
@@ -1575,6 +1680,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "div",
@@ -1590,6 +1696,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "div",
@@ -1605,6 +1712,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "add",
@@ -1620,6 +1728,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "sub",
@@ -1635,6 +1744,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "mul",
@@ -1650,6 +1760,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "div",
@@ -1665,6 +1776,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "mod",
@@ -1680,6 +1792,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "neg",
@@ -1695,6 +1808,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "abs",
@@ -1710,6 +1824,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "abs",
@@ -1725,6 +1840,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "round",
@@ -1740,6 +1856,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "round",
@@ -1755,6 +1872,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "round",
@@ -1770,6 +1888,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "round",
@@ -1785,6 +1904,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "abs",
@@ -1800,6 +1920,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ceil",
@@ -1815,6 +1936,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "floor",
@@ -1830,6 +1952,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "trunc",
@@ -1845,6 +1968,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "round",
@@ -1860,6 +1984,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "round",
@@ -1875,6 +2000,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "sqrt",
@@ -1890,6 +2016,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "exp",
@@ -1905,6 +2032,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "ln",
@@ -1920,6 +2048,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "log10",
@@ -1935,6 +2064,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "pow",
@@ -1950,6 +2080,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "sin",
@@ -1965,6 +2096,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "cos",
@@ -1980,6 +2112,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "tan",
@@ -1995,6 +2128,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "make_interval",
@@ -2010,6 +2144,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{"years", "months", "weeks", "days", "hours", "mins", "secs"},
 		ArgDefaults:   []string{"0", "0", "0", "0", "0", "0", "0"},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "uuid_extract_version",
@@ -2025,6 +2160,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "uuid_extract_timestamp",
@@ -2040,6 +2176,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "uuidv4",
@@ -2055,6 +2192,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "volatile",
+		Variadic:      false,
 	},
 	{
 		Name:          "uuidv7",
@@ -2070,6 +2208,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "volatile",
+		Variadic:      false,
 	},
 	{
 		Name:          "uuidv7",
@@ -2085,6 +2224,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "volatile",
+		Variadic:      false,
 	},
 	{
 		Name:          "now",
@@ -2100,6 +2240,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "stable",
+		Variadic:      false,
 	},
 	{
 		Name:          "clock_timestamp",
@@ -2115,6 +2256,39 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "volatile",
+		Variadic:      false,
+	},
+	{
+		Name:          "num_nulls",
+		Symbol:        "",
+		Kind:          "function",
+		Arity:         1,
+		ArgFamilies:   []string{"any"},
+		ArgResolution: "none",
+		Result:        "int32",
+		Null:          "none",
+		Precedence:    0,
+		Errors:        []string{"42804"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
+		Volatility:    "immutable",
+		Variadic:      true,
+	},
+	{
+		Name:          "num_nonnulls",
+		Symbol:        "",
+		Kind:          "function",
+		Arity:         1,
+		ArgFamilies:   []string{"any"},
+		ArgResolution: "none",
+		Result:        "int32",
+		Null:          "none",
+		Precedence:    0,
+		Errors:        []string{"42804"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
+		Volatility:    "immutable",
+		Variadic:      true,
 	},
 	{
 		Name:          "array_ndims",
@@ -2130,6 +2304,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_length",
@@ -2145,6 +2320,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_lower",
@@ -2160,6 +2336,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_upper",
@@ -2175,6 +2352,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "cardinality",
@@ -2190,6 +2368,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_dims",
@@ -2205,6 +2384,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_append",
@@ -2220,6 +2400,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_prepend",
@@ -2235,6 +2416,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_cat",
@@ -2250,6 +2432,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_remove",
@@ -2265,6 +2448,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_replace",
@@ -2280,6 +2464,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_position",
@@ -2295,6 +2480,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_position",
@@ -2310,6 +2496,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "array_positions",
@@ -2325,6 +2512,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "concat",
@@ -2340,6 +2528,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "concat",
@@ -2355,6 +2544,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "concat",
@@ -2370,6 +2560,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "contains",
@@ -2385,6 +2576,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "contained_by",
@@ -2400,6 +2592,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 	{
 		Name:          "overlaps",
@@ -2415,6 +2608,7 @@ var Operators = []OperatorDesc{
 		ArgNames:      []string{},
 		ArgDefaults:   []string{},
 		Volatility:    "immutable",
+		Variadic:      false,
 	},
 }
 
