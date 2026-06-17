@@ -34,6 +34,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "types.array_multidim",
   // Array slices a[m:n] (array.md §6) — sub-array reads, renumbered to lower bound 1.
   "expr.array_slice",
+  // Array-of-composite element types (array.md §12 AC1) — a composite is a first-class array
+  // element type (addr[]); the per-element compare routes through the composite total order.
+  "types.array_composite",
   // Array function/operator surface AF1 (array-functions.md): the polymorphic anyarray/anyelement
   // resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
   // (array_append/prepend/cat).

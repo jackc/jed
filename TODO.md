@@ -275,10 +275,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         unmetered, like the introspectors). All three cores + Ruby N/A (no format change), oracle-checked
         (`suites/expr/array_variadic.test`), capability `func.variadic`, `/web` select-page live example
         + e2e. → [array-functions.md §12](spec/design/array-functions.md)
-  - [ ] _follow-ons (each its own slice + obligations; sequenced in array-functions.md §6):_
-        array-of-composite elements; arrays-in-keys (`0A000`, encoding authored §8); the subquery
-        quantifier form `op ANY(SELECT …)`; runtime text→array, `array::text`, and element-wise
-        array→array casts.
+  - [x] **AC1 — array-of-composite elements** — a composite type is now a first-class array element
+        type (`items addr[]`): the catalog already framed it (`element_type_code = 14`, array.md §3)
+        and the codec/comparison/text-I/O already recursed, so **no `format_version` bump** (still 10).
+        Lifts the three `0A000` gates (the `addr[]` column declaration, the `'{…}'::addr[]` literal
+        cast, `array_in`'s composite-element coercion) and **fixes the comparison subtlety** the
+        feature exposes (array.md §5: a composite element's per-element compare routes through the
+        composite *total order* — NULLs-last, definite — not the composite 3VL; so
+        `ARRAY[ROW(1,NULL)::addr] = ARRAY[ROW(1,NULL)::addr]` is TRUE and equal-with-NULL arrays sort
+        together). Construct (`ARRAY[ROW(…)::addr,…]` / `'{…}'::addr[]`), store/load, `array_out`/
+        `array_in` (the two quoting layers nest, array.md §7), compare/`ORDER BY`/`DISTINCT`/`GROUP BY`,
+        subscript→`addr`, slice→`addr[]`, `(items[i]).zip`, multidim. New golden
+        `array_composite_table.jed` (`rust == go == ts == ruby`); all three cores + Ruby; oracle-checked
+        `types/array_composite.test`; capability `types.array_composite`. → [array.md §12](spec/design/array.md)
+  - [ ] _remaining follow-ons (each its own slice + obligations):_ a composite type with an
+        **array-typed field** (`CREATE TYPE t AS (xs int32[])` — the mirror nesting); `unnest(composite[])`
+        and the polymorphic array **function** surface over composite elements; arrays-in-keys
+        (`0A000`, encoding authored §8); the subquery quantifier form `op ANY(SELECT …)`; runtime
+        text→array, `array::text`, and element-wise array→array casts.
 - [x] **PostgreSQL composite types** (`CREATE TYPE name AS (…)`) — ✅ **COMPLETE (S0–S6).** The
       **second container axis**, sibling to `array` and sharing ~80% of its foundation, so sequence
       the two together. **The headline implication: this turns the *closed* type enum into an *open*,

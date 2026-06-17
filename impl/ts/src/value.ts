@@ -902,11 +902,11 @@ function numArrEqual(a: number[], b: number[]): boolean {
 function arrayEqual(a: ArrayShape, b: ArrayShape): boolean {
   if (!numArrEqual(a.dims, b.dims) || !numArrEqual(a.lbounds, b.lbounds)) return false;
   for (let i = 0; i < a.elements.length; i++) {
-    const an = a.elements[i]!.kind === "null";
-    const bn = b.elements[i]!.kind === "null";
-    if (an !== bn) return false;
-    if (an) continue; // both NULL → equal
-    if (eq3(a.elements[i]!, b.elements[i]!) !== "true") return false;
+    // btree NULL semantics: an element pair is equal iff its total order is 0 — NULL elements are
+    // comparable and mutually equal, and a composite element recurses through the composite total
+    // order (NULLs-last per field), NOT the 3VL eq3 (which is UNKNOWN for a NULL field). This is the
+    // array-of-composite fix (spec/design/array.md §5).
+    if (elemTotalCmp(a.elements[i]!, b.elements[i]!) !== 0) return false;
   }
   return true;
 }
@@ -931,15 +931,35 @@ function arrayTotalCmp(a: ArrayShape, b: ArrayShape): number {
 }
 
 // elemTotalCmp is a total order over two array elements with NULL the largest value (NULLs-last)
-// and two NULLs equal. Present elements use their own definite eq3/lt3 (scalar comparators).
+// and two NULLs equal. A composite element recurses through the composite total order (NULLs-last
+// per field) and a nested array through arrayTotalCmp — NOT the composite 3VL eq3/lt3, which can be
+// UNKNOWN for a NULL field and would break array comparison's "always a definite boolean" guarantee
+// (spec/design/array.md §5 — the array-of-composite subtlety; this must agree with valueCmp, the
+// ORDER BY path). A present scalar element uses its definite eq3/lt3.
 function elemTotalCmp(x: Value, y: Value): number {
   const xn = x.kind === "null";
   const yn = y.kind === "null";
   if (xn && yn) return 0;
   if (xn) return 1; // NULL sorts last
   if (yn) return -1;
+  if (x.kind === "composite" && y.kind === "composite") return compositeTotalCmp(x.fields, y.fields);
+  if (x.kind === "array" && y.kind === "array") return arrayTotalCmp(x, y);
   if (eq3(x, y) === "true") return 0;
   return lt3(x, y) === "true" ? -1 : 1;
+}
+
+// compositeTotalCmp is the total order over two composite values of the same type: lexicographic
+// over fields, each compared by elemTotalCmp (so a NULL field sorts last and two NULL fields are
+// equal — the composite sort key, NOT the 3VL row comparison), with a field-count tiebreak for
+// totality. Kept identical to the composite ORDER BY key (valueCmp's composite arm) so the array
+// `<` operator and ORDER BY never disagree (spec/design/array.md §5).
+function compositeTotalCmp(a: Value[], b: Value[]): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    const c = elemTotalCmp(a[i]!, b[i]!);
+    if (c !== 0) return c;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
 }
 
 // compositeOrder3 is three-valued lexicographic row ordering (PG row comparison,

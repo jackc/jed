@@ -438,6 +438,23 @@ func compositeTypeTableDB(t *testing.T) *Database {
 	return db
 }
 
+// arrayCompositeTableDB has a composite type used as an array ELEMENT type (array-of-composite,
+// array.md §12 AC1): the catalog array-column entry carries a composite element descriptor
+// (element_type_code 14 + "addr") and the value body recurses (an array body whose elements are
+// composite bodies). Row 2's element has a NULL `zip` field (the composite null-bitmap inside an
+// element); row 3 mixes a present composite element with a NULL element (the array HAS_NULLS bitmap).
+func arrayCompositeTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TYPE addr AS (street text NOT NULL, zip int32)")
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])")
+	run(t, db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`)
+	run(t, db, `INSERT INTO t VALUES (2, '{"(Oak,)"}')`)
+	run(t, db, `INSERT INTO t VALUES (3, '{"(A,1)",NULL}')`)
+	run(t, db, "INSERT INTO t VALUES (4, '{}')")
+	run(t, db, "INSERT INTO t VALUES (5, NULL)")
+	return db
+}
+
 // nestedCompositeTableDB has nested composite types (a field whose type is another composite, by
 // name) used by a column with a stored nested value (S3). point is created first (a referenced type
 // must exist), but the on-disk order is name-sorted (line, point) — line sorts BEFORE the point it
@@ -484,6 +501,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"nested_composite_table.jed", nestedCompositeTableDB},
 		{"array_table.jed", arrayTableDB},
+		{"array_composite_table.jed", arrayCompositeTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -530,6 +548,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},
 		{"array_table.jed", arrayTableDB, "t"},
+		{"array_composite_table.jed", arrayCompositeTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

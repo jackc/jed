@@ -43,6 +43,19 @@ ORDER BY u;`;
 	const variadicExample = `SELECT num_nulls(1, NULL, 3)                AS spread,
        num_nulls(VARIADIC ARRAY[1, NULL, 3]) AS variadic,
        num_nonnulls(1, NULL, 3)              AS non_nulls;`;
+
+	const arrayCompositeSeed = `CREATE TYPE addr AS (street text, zip int32);
+CREATE TABLE person (id int32 PRIMARY KEY, places addr[]);
+INSERT INTO person VALUES
+  (1, ARRAY[ROW('Main', 90210), ROW('Side', 5)]),
+  (2, '{"(Oak,)"}');`;
+
+	const arrayCompositeExample = `SELECT id,
+       places[1]            AS first,
+       (places[1]).street   AS first_street,
+       (places[1]).zip      AS first_zip
+FROM person
+ORDER BY id;`;
 </script>
 
 <svelte:head>
@@ -114,6 +127,17 @@ keyword, by passing one array whose elements are the arguments. The two forms ag
 form never returns `NULL` (it counts), while `VARIADIC` over a `NULL` array yields `NULL`:
 
 <LiveSql query={variadicExample} rows={2} />
+
+## Arrays of composite types
+
+An array's element type can be a composite type, so a column holds a list of rows: `addr[]` is an
+array of `addr`. Build one with the `ARRAY[ROW(…)]` constructor or the `'{…}'::addr[]` text literal,
+subscript it to read an element (`places[1]`), and reach into a field with `(places[1]).street`.
+Comparison, `ORDER BY`, `DISTINCT`, and `GROUP BY` all work — a `NULL` field inside a composite
+element is comparable (so two arrays with matching `NULL` fields are equal and sort together), unlike
+a bare row comparison:
+
+<LiveSql seed={arrayCompositeSeed} query={arrayCompositeExample} rows={2} />
 
 ## Cost
 

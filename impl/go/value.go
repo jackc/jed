@@ -548,14 +548,11 @@ func arrayEqual(a, b *ArrayVal) bool {
 		return false
 	}
 	for i := range a.Elements {
-		an, bn := a.Elements[i].Kind == ValNull, b.Elements[i].Kind == ValNull
-		if an != bn {
-			return false
-		}
-		if an {
-			continue // both NULL → equal
-		}
-		if a.Elements[i].Eq3(b.Elements[i]) != True {
+		// btree NULL semantics: an element pair is equal iff its total order is 0 — NULL elements
+		// are comparable and mutually equal, and a composite element recurses through the composite
+		// total order (NULLs-last per field), NOT the 3VL Eq3 (which is UNKNOWN for a NULL field).
+		// This is the array-of-composite fix (spec/design/array.md §5).
+		if elemTotalCmp(a.Elements[i], b.Elements[i]) != 0 {
 			return false
 		}
 	}
@@ -978,7 +975,11 @@ func cmpInt(a, b int) int {
 }
 
 // elemTotalCmp is a total order over two array elements with NULL the largest value (NULLs-last)
-// and two NULLs equal. Present elements use their own definite Eq3/Lt3 (scalar comparators).
+// and two NULLs equal. A composite element recurses through the composite total order (NULLs-last
+// per field) and a nested array through arrayTotalCmp — NOT the composite 3VL Eq3/Lt3, which can be
+// UNKNOWN for a NULL field and would break array comparison's "always a definite boolean" guarantee
+// (spec/design/array.md §5 — the array-of-composite subtlety; this must agree with valueCmp, the
+// ORDER BY path). A present scalar element uses its definite Eq3/Lt3.
 func elemTotalCmp(x, y Value) int {
 	xn, yn := x.Kind == ValNull, y.Kind == ValNull
 	switch {
@@ -988,6 +989,10 @@ func elemTotalCmp(x, y Value) int {
 		return 1
 	case yn:
 		return -1
+	case x.Kind == ValComposite && y.Kind == ValComposite:
+		return compositeTotalCmp(*x.Comp, *y.Comp)
+	case x.Kind == ValArray && y.Kind == ValArray:
+		return arrayTotalCmp(x.Array, y.Array)
 	}
 	if x.Eq3(y) == True {
 		return 0
@@ -996,6 +1001,20 @@ func elemTotalCmp(x, y Value) int {
 		return -1
 	}
 	return 1
+}
+
+// compositeTotalCmp is the total order over two composite values of the same type: lexicographic
+// over fields, each compared by elemTotalCmp (so a NULL field sorts last and two NULL fields are
+// equal — the composite sort key, NOT the 3VL row comparison), with a field-count tiebreak for
+// totality. Kept identical to the composite ORDER BY key (valueCmp's composite arm) so the array
+// `<` operator and ORDER BY never disagree (spec/design/array.md §5).
+func compositeTotalCmp(a, b []Value) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if c := elemTotalCmp(a[i], b[i]); c != 0 {
+			return c
+		}
+	}
+	return cmpInt(len(a), len(b))
 }
 
 // arrayOut renders an array's elements as PG array_out (spec/design/array.md §7): `{e1,e2,…}`. A

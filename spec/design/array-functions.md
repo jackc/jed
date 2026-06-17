@@ -401,9 +401,11 @@ the SRF analogue of the `anyelement` code (§2). Resolution (hand-written per co
    "function unnest(unknown) is not unique" because it ships several `unnest` overloads; jed has one,
    so the indeterminate case is the honest answer and is **out of the oracle corpus**). A **typed**
    NULL array (`NULL::int32[]`) resolves and yields zero rows at exec.
-3. arrays hold **scalar** elements this slice (array-of-composite is the deferred fast-follow,
-   [array.md §12](array.md)), so `ELEM` is always a scalar; the synthetic column carries it
-   (`int32[]` → an `int32` column, `text[]` → `text`, …).
+3. `unnest`'s `ELEM` is constrained to a **scalar** element this slice; the synthetic column carries
+   it (`int32[]` → an `int32` column, `text[]` → `text`, …). Even though a composite *can* now be an
+   array element (array-of-composite landed, [array.md §12](array.md) AC1), `unnest` over a composite
+   array (a composite-typed SRF output column) is a **deferred** function-surface follow-on — a
+   composite-element array argument is `0A000` at `unnest` resolution, not silently mis-typed.
 
 **The generator** (`unnest_rows`/`unnestRows`) evaluates the single array argument **once** against
 the params/outer environment (non-LATERAL, exactly like `generate_series`'s args — a `$N` or a
@@ -441,7 +443,8 @@ into each core's `SET_RETURNING` table by `gen_catalog.rb`; the resolve/generate
 hand-written per core. **Deferred** (each its own follow-on, §6): the SELECT-list SRF position
 (`SELECT unnest(…)` is `42883`, like `generate_series`), `LATERAL` (so the natural "explode a column"
 `FROM t, unnest(t.xs)` is reached only via a correlated subquery this slice), `WITH ORDINALITY`, the
-multi-array `unnest(a, b, …)` form, and array-of-composite elements.
+multi-array `unnest(a, b, …)` form, and `unnest` over a composite-element array (array-of-composite
+the *type* landed in array.md §12 AC1; `unnest`'s composite-typed output column is the deferred piece).
 
 ## 10. AF4 — the containment / overlap operators (`@>` / `<@` / `&&`)
 

@@ -472,6 +472,28 @@ ARRAY_TABLE = {
           { dims: [2], lbounds: [2], elements: %w[x y] }]]
 }.freeze
 
+# A composite type used as an ARRAY ELEMENT type (v10 — array-of-composite, spec/design/array.md §12
+# AC1): pins the catalog array-column entry with a COMPOSITE element descriptor (type_code 15, then
+# the element descriptor element_type_code 14 + name "addr", §3) AND the recursive value body — an
+# array body (ndim/flags/dims) whose element bodies are composite bodies (null-bitmap + present
+# fields, §4). No format_version bump (still 10); the composite-type entry is identical to
+# composite_type_table's. Row 1: two full composite elements. Row 2: one element with a NULL `zip`
+# FIELD (the composite null-bitmap branch, inside an array element). Row 3: a present composite
+# element AND a NULL ELEMENT (the array HAS_NULLS bitmap). Row 4: the empty array (ndim 0). Row 5: a
+# whole-value NULL array (the lone 0x01 tag). The cores build this via
+#   CREATE TYPE addr AS (street text NOT NULL, zip int32)
+#   CREATE TABLE t (id int32 PRIMARY KEY, items addr[])
+#   INSERT (1, '{"(Main,90210)","(Side,5)"}'); (2, '{"(Oak,)"}'); (3, '{"(A,1)",NULL}'); (4, '{}'); (5, NULL)
+ARRAY_COMPOSITE_TABLE = {
+  types: [ctype("addr", [field("street", "text", not_null: true), field("zip", "int32")])],
+  tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("items", "addr[]")],
+             rows: [[1, [["Main", 90210], ["Side", 5]]],
+                    [2, [["Oak", nil]]],
+                    [3, [["A", 1], nil]],
+                    [4, []],
+                    [5, nil]] }]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -502,6 +524,8 @@ FIXTURES = [
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
     types: COMPOSITE_TYPE_TABLE[:types], tables: COMPOSITE_TYPE_TABLE[:tables] },
+  { file: "array_composite_table.jed", page_size: 256,
+    types: ARRAY_COMPOSITE_TABLE[:types], tables: ARRAY_COMPOSITE_TABLE[:tables] },
   { file: "nested_composite_table.jed", page_size: 256,
     types: NESTED_COMPOSITE_TABLE[:types], tables: NESTED_COMPOSITE_TABLE[:tables] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },

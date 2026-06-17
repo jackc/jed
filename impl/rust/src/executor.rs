@@ -927,58 +927,63 @@ impl Database {
             // carries no typmod (the composite's fields carry their own); a type modifier written on
             // a composite column is rejected (0A000). A composite column is storable but never
             // keyable — the PK gate below rejects it 0A000 (§6).
-            let (ty, decimal): (Type, Option<DecimalTypmod>) = if let Some(base) =
-                def.type_name.strip_suffix("[]")
-            {
-                // An array column (spec/design/array.md §3). v1 element types are scalars; a
-                // typmod on the array (`numeric(p,s)[]`) and a composite/nested-array element
-                // are deferred (0A000).
-                if def.type_mod.is_some() {
-                    return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        "a type modifier on an array type is not supported yet".to_string(),
-                    ));
-                }
-                match ScalarType::from_name(base) {
-                    Some(s) => (Type::Array(Box::new(Type::Scalar(s))), None),
-                    None => {
-                        if self.read_snap().composite_type(base).is_some() {
-                            return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                format!("an array of composite type {base} is not supported yet"),
-                            ));
-                        }
+            let (ty, decimal): (Type, Option<DecimalTypmod>) =
+                if let Some(base) = def.type_name.strip_suffix("[]") {
+                    // An array column (spec/design/array.md §3). The element type is a scalar or a
+                    // previously-defined composite (array-of-composite, §12 AC1 — `element_type_code`
+                    // 14 + name); a nested-array element and an array typmod (`numeric(p,s)[]`) stay
+                    // deferred (0A000).
+                    if def.type_mod.is_some() {
                         return Err(EngineError::new(
-                            SqlState::UndefinedObject,
-                            format!("type does not exist: {base}"),
+                            SqlState::FeatureNotSupported,
+                            "a type modifier on an array type is not supported yet".to_string(),
                         ));
                     }
-                }
-            } else if ScalarType::from_name(&def.type_name).is_some() {
-                let (s, d) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
-                (Type::Scalar(s), d)
-            } else if let Some(ctype) = self.read_snap().composite_type(&def.type_name) {
-                if def.type_mod.is_some() {
+                    match ScalarType::from_name(base) {
+                        Some(s) => (Type::Array(Box::new(Type::Scalar(s))), None),
+                        None => {
+                            if let Some(ctype) = self.read_snap().composite_type(base) {
+                                (
+                                    Type::Array(Box::new(Type::Composite(
+                                        crate::types::CompositeRef {
+                                            name: ctype.name.clone(),
+                                        },
+                                    ))),
+                                    None,
+                                )
+                            } else {
+                                return Err(EngineError::new(
+                                    SqlState::UndefinedObject,
+                                    format!("type does not exist: {base}"),
+                                ));
+                            }
+                        }
+                    }
+                } else if ScalarType::from_name(&def.type_name).is_some() {
+                    let (s, d) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
+                    (Type::Scalar(s), d)
+                } else if let Some(ctype) = self.read_snap().composite_type(&def.type_name) {
+                    if def.type_mod.is_some() {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            format!(
+                                "a type modifier is not supported for composite type {}",
+                                def.type_name
+                            ),
+                        ));
+                    }
+                    (
+                        Type::Composite(crate::types::CompositeRef {
+                            name: ctype.name.clone(),
+                        }),
+                        None,
+                    )
+                } else {
                     return Err(EngineError::new(
-                        SqlState::FeatureNotSupported,
-                        format!(
-                            "a type modifier is not supported for composite type {}",
-                            def.type_name
-                        ),
+                        SqlState::UndefinedObject,
+                        format!("type does not exist: {}", def.type_name),
                     ));
-                }
-                (
-                    Type::Composite(crate::types::CompositeRef {
-                        name: ctype.name.clone(),
-                    }),
-                    None,
-                )
-            } else {
-                return Err(EngineError::new(
-                    SqlState::UndefinedObject,
-                    format!("type does not exist: {}", def.type_name),
-                ));
-            };
+                };
             if def.primary_key {
                 // Integers, boolean, and uuid may be a key. uuid is the first non-integer key
                 // type (fixed `uuid-raw16`, spec/design/encoding.md §2.7) and boolean the second
@@ -8692,6 +8697,7 @@ fn resolve(
             // An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the
             // string-literal form `'{…}'::T[]` and a bare NULL; every other array cast (runtime
             // text→array, array→text, element-wise array→array) is a documented 0A000 narrowing.
+            // The element is a scalar or a previously-defined composite (array-of-composite, §12 AC1).
             if let Some(base) = type_name.strip_suffix("[]") {
                 if type_mod.is_some() {
                     return Err(EngineError::new(
@@ -8699,24 +8705,28 @@ fn resolve(
                         "a type modifier on an array type is not supported yet".to_string(),
                     ));
                 }
-                let elem_scalar = match ScalarType::from_name(base) {
-                    Some(s) => s,
-                    None => {
-                        if scope.catalog.composite_type(base).is_some() {
+                let (elem_col, elem_rt): (ColType, ResolvedType) = match ScalarType::from_name(base)
+                {
+                    Some(s) => (ColType::Scalar(s), resolved_type_of(s)),
+                    None => match scope.catalog.composite_type(base) {
+                        Some(ct) => {
+                            let cty = Type::Composite(crate::types::CompositeRef {
+                                name: ct.name.clone(),
+                            });
+                            let col = resolve_col_type(&cty, &scope.catalog.read_snap().types);
+                            let rt = resolved_type_of_col(&cty, scope.catalog);
+                            (col, rt)
+                        }
+                        None => {
                             return Err(EngineError::new(
-                                SqlState::FeatureNotSupported,
-                                format!("an array of composite type {base} is not supported yet"),
+                                SqlState::UndefinedObject,
+                                format!("type does not exist: {base}"),
                             ));
                         }
-                        return Err(EngineError::new(
-                            SqlState::UndefinedObject,
-                            format!("type does not exist: {base}"),
-                        ));
-                    }
+                    },
                 };
-                let elem_rt = resolved_type_of(elem_scalar);
                 if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
-                    let val = coerce_string_to_array(s, &ColType::Scalar(elem_scalar))?;
+                    let val = coerce_string_to_array(s, &elem_col)?;
                     return Ok((value_to_rexpr(&val), ResolvedType::Array(Box::new(elem_rt))));
                 }
                 if let Expr::Literal(Literal::Null) = inner.as_ref() {
@@ -11650,25 +11660,13 @@ fn coerce_string_to_array(s: &str, elem: &ColType) -> Result<Value> {
             array_subscript_err("upper bound cannot be less than lower bound")
         }
     })?;
-    let elem_scalar = match elem {
-        ColType::Scalar(s) => *s,
-        _ => {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "array literal of a non-scalar element type is not supported".to_string(),
-            ));
-        }
-    };
     let mut elements = Vec::with_capacity(parsed.tokens.len());
     for tok in parsed.tokens {
         match tok {
             None => elements.push(Value::Null),
-            Some(t) => {
-                // Coerce the token to the element scalar via the same string-literal coercion the
-                // type's typed-literal path uses (22P02 / 22003 on bad input).
-                let (node, _) = coerce_string_literal(&t, elem_scalar, None)?;
-                elements.push(rexpr_const_to_value(&node)?);
-            }
+            // Coerce the token to the element type (a scalar via the string-literal coercion, a
+            // composite via record_in — array-of-composite, spec/design/array.md §12 AC1).
+            Some(t) => elements.push(coerce_array_element_text(&t, elem)?),
         }
     }
     Ok(Value::Array(ArrayVal {
@@ -11676,6 +11674,62 @@ fn coerce_string_to_array(s: &str, elem: &ColType) -> Result<Value> {
         lbounds: parsed.lbounds,
         elements,
     }))
+}
+
+/// Coerce one array-element text token to a `Value` against the element `ColType` (the `array_in`
+/// per-element step, spec/design/array.md §7): a scalar via the same string-literal coercion the
+/// scalar typed-literal path uses; a **composite** element via `record_in` (recursive — the
+/// array-of-composite quoting nests, §12 AC1 / §7). Self-contained over the resolved `ColType`, so
+/// no catalog re-walk (the [`ColType`] design intent). A nested-array element token would recurse,
+/// but array-of-array is not a jed type, so it is unreachable in v1.
+fn coerce_array_element_text(tok: &str, elem: &ColType) -> Result<Value> {
+    match elem {
+        ColType::Scalar(s) => {
+            let (node, _) = coerce_string_literal(tok, *s, None)?;
+            rexpr_const_to_value(&node)
+        }
+        ColType::Composite { name, fields } => coerce_record_text(tok, name, fields),
+        ColType::Array(inner) => coerce_string_to_array(tok, inner),
+    }
+}
+
+/// `record_in` over a self-contained composite `ColType` (the inverse of `record_out`): the token is
+/// the composite's own `(f1,f2,…)` text, tokenized by the shared `value::parse_record_tokens` and
+/// recursively coerced per field. Mirrors [`coerce_string_to_composite`] but produces a `Value`
+/// directly and walks `ColType` (so it needs no `Database`). A bad shape / field count is `22P02`.
+fn coerce_record_text(
+    text: &str,
+    name: &str,
+    fields: &[crate::catalog::ColField],
+) -> Result<Value> {
+    let malformed = || {
+        EngineError::new(
+            SqlState::InvalidTextRepresentation,
+            format!("malformed record literal: \"{text}\" for type {name}"),
+        )
+    };
+    let tokens = crate::value::parse_record_tokens(text).ok_or_else(malformed)?;
+    if tokens.len() != fields.len() {
+        return Err(malformed());
+    }
+    let mut vals = Vec::with_capacity(tokens.len());
+    for (tok, f) in tokens.into_iter().zip(fields.iter()) {
+        match tok {
+            None => vals.push(Value::Null),
+            Some(s) => vals.push(match &f.ty {
+                ColType::Scalar(sc) => {
+                    let (node, _) = coerce_string_literal(&s, *sc, f.typmod)?;
+                    rexpr_const_to_value(&node)?
+                }
+                ColType::Composite {
+                    name: n2,
+                    fields: f2,
+                } => coerce_record_text(&s, n2, f2)?,
+                ColType::Array(inner) => coerce_string_to_array(&s, inner)?,
+            }),
+        }
+    }
+    Ok(Value::Composite(vals))
 }
 
 /// Extract the `Value` from a constant `RExpr` (the const nodes `coerce_string_literal` produces).

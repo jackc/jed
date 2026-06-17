@@ -221,13 +221,36 @@ oracle (the composite `IS NULL` rule was oracle-corrected — expect the same sc
   lower bound. This is a **total** order, so DISTINCT/GROUP BY/ORDER BY over array columns are
   well-defined, and equal-including-NULLs-and-shape arrays group together. The recursion bottoms out
   in the per-element scalar comparators (so the TS UTF-8 text-ordering trap recurses correctly for
-  `text[]`). (Caveat: PostgreSQL's *single-array-column* `ORDER BY` can disagree with its own `<`
+  `text[]`) — **or, for a composite element type, in the composite *total-order* comparator** (see the
+  composite-element rule below). (Caveat: PostgreSQL's *single-array-column* `ORDER BY` can disagree with its own `<`
   operator on the lower-bound tiebreak — an abbreviated-key artifact; jed implements the consistent
   `array_cmp` order, so it matches PG's `=`/`<` operators and avoids that inconsistency.)
 - **`IS NULL` / `IS NOT NULL` — whole-value only, NOT element-wise** (the contrast with composite's
   all-fields rule): `arr IS NULL` is TRUE iff the array value is SQL-NULL; a non-NULL array
   containing NULL elements (`{1,NULL}`) is `IS NULL` → **FALSE**, `IS NOT NULL` → **TRUE**. An empty
   array is non-NULL → `IS NULL` FALSE. (PG; oracle-pinned.)
+
+**Composite element types — the btree rule recurses through the composite *total order*, NOT the
+composite 3VL** (oracle-pinned; the load-bearing subtlety of array-of-composite). When the element
+type is a composite ([composite.md](composite.md)), the array's btree comparison bottoms out in the
+composite **sort-key total order** (lexicographic over fields, NULLs-last per field, NULLs mutually
+equal — composite.md §5), **never** the composite row-comparison 3VL (which would make an element
+pair UNKNOWN and break the "always a definite boolean" guarantee). So a NULL *field* inside a
+composite element is comparable exactly like a NULL *element* is: two composite elements with equal
+non-NULL fields and matching NULL fields are **equal**, and a NULL field sorts after any non-NULL
+field. This keeps `=` / `array_cmp` / `ORDER BY` / `DISTINCT` / `GROUP BY` mutually consistent for
+`addr[]`. Oracle-pinned (`addr AS (street text, zip int32)`):
+
+- `ARRAY[ROW(1,NULL)::addr] = ARRAY[ROW(1,NULL)::addr]` → **TRUE** (the NULL field is comparable —
+  contrast the bare `ROW(1,NULL) = ROW(1,NULL)`, which is UNKNOWN under composite 3VL).
+- `ARRAY[ROW('a',NULL)::addr] = ARRAY[ROW('a',2)::addr]` → **FALSE** (a NULL field ≠ a present field,
+  definite).
+- `ORDER BY` over `addr[]`: `{(a,1)} < {(a,2)} < {(a,)}` — the NULL `zip` sorts last.
+- `SELECT DISTINCT` collapses two `ARRAY[ROW(1,NULL)::addr]` to one row.
+
+Implementers must route the per-element compare through the *same* total order `ORDER BY` over a bare
+composite column uses (the composite sort key), not the boolean `=`/`<` operators — these paths must
+agree (a `<` operator that disagreed with `ORDER BY` is exactly the divergence CLAUDE.md §8 forbids).
 
 ## 6. Subscripting and element access
 
@@ -268,8 +291,15 @@ bytea/uuid/composite; [conformance.md §1](conformance.md)) — **no new tag**.
   **NULL element** renders as the unquoted token `NULL` (the contrast with `record_out`, where a
   NULL field is the empty string). The empty array renders `{}`. A **multidimensional** value renders
   with **nested braces** (`{{1,2},{3,4}}`), and a value with **any lower bound ≠ 1** is prefixed with
-  a `[l1:u1][l2:u2]…=` bound spec (`[2:4]={1,2,3}`) — PG emits the prefix only then. Recurses for
-  composite elements.
+  a `[l1:u1][l2:u2]…=` bound spec (`[2:4]={1,2,3}`) — PG emits the prefix only then. **Recurses for
+  composite elements** — and the two quoting layers nest exactly as PG does (oracle-pinned): the
+  element's own `record_out` runs first (PG-*doubling* `"`→`""`, `\`→`\\`), then `array_out`'s quoting
+  wraps the result (PG-*backslash-escaping*), so a composite element is double-quoted by `array_out`
+  (it contains parens/commas) and any `"`/`\` `record_out` already emitted is backslash-escaped again.
+  `ARRAY[ROW('Main',90210)::addr, ROW('Other, Ln',12)::addr]` → `{"(Main,90210)","(\"Other, Ln\",12)"}`;
+  `ARRAY[ROW('',5)::addr, ROW('a"b\c',6)::addr]` → `{"(\"\",5)","(\"a\"\"b\\\\c\",6)"}`; a whole-element
+  `NULL::addr` is the unquoted `NULL` and a NULL *field* is the empty inter-delimiter string
+  (`ROW('Main',NULL)::addr` → `"(Main,)"`).
 - **`array_in`** parses an optional dimension prefix `[l1:u1][l2:u2]…=`, then a (possibly nested)
   brace structure `{…}` into elements (top-level commas, respecting quotes/escapes/braces) and
   coerces each token to the element type — an **unquoted** `NULL` (any case) is a NULL element,
@@ -354,6 +384,14 @@ corpus lands.
    token.
 9. **Array-as-key deferred `0A000`** — encoding authored, not exercised (§8); the
    text/decimal/bytea/composite-PK precedent.
+10. **Composite element types are supported; their array comparison recurses through the composite
+    *total order*, not 3VL** (§5) — `addr[]` is a first-class column/value type (declare, construct,
+    store, render, compare, `ORDER BY`/`DISTINCT`/`GROUP BY`, subscript→`addr`, slice→`addr[]`, field
+    access `(a[i]).f`). A composite element keeps array btree NULL-comparable semantics (decision 5)
+    by bottoming the per-element compare out in the composite sort key, so an array comparison stays a
+    definite boolean even when a composite element has a NULL field. Oracle-pinned. The mirror nesting
+    — a composite type with an **array-typed field** (`CREATE TYPE t AS (xs int32[])`) — and
+    `unnest`/the polymorphic array **function** surface over composite elements stay deferred (§12).
 
 ## 11. Errors
 
@@ -419,7 +457,26 @@ search/edit functions `array_remove`/`array_replace`/`array_position`/`array_pos
 capabilities `func.array` + `func.unnest` + `func.array_containment` + `func.array_quantified` +
 `func.variadic`). The array function/operator surface is **complete**.
 
-**Still deferred (each its own follow-on):** **array-of-composite** elements (a fast-follow —
-composite already composes); arrays-in-keys (`0A000`, encoding authored §8); the subquery quantifier
-form `op ANY(SELECT …)` (array-functions.md §11); runtime text→array, `array::text`, and element-wise
-array→array casts.
+- **AC1 ✅** — **array-of-composite elements**: a composite type is now a first-class array element
+  type (`CREATE TABLE t (id int32 PRIMARY KEY, items addr[])`). The catalog already framed it
+  (`element_type_code = 14` + name, §3) and the value codec/comparison/text-I/O already recursed, so
+  **no `format_version` bump** (still 10) — this slice **lifts the three `0A000` gates** (the `addr[]`
+  column declaration, the `'{…}'::addr[]` literal cast, and `array_in`'s composite-element coercion)
+  and **fixes the comparison subtlety** (§5: the per-element compare for a composite element routes
+  through the composite *total order*, NULLs-last, not the composite 3VL — the bug array-of-composite
+  exposes, since a scalar element never reaches that path). Construct via `ARRAY[ROW(…)::addr,…]` or
+  `'{…}'::addr[]`; store/load round-trip; `array_out`/`array_in` nest the two quoting layers (§7);
+  `=`/`<>`/`< <= > >=`/`ORDER BY`/`DISTINCT`/`GROUP BY`; subscript `items[i]`→`addr`, slice
+  `items[m:n]`→`addr[]`, field access `(items[i]).zip`; multidimensional `addr[]` values. A **new
+  golden** (`array_composite_table.jed`, `rust == go == ts == ruby`) pins the on-disk bytes; all three
+  cores + the Ruby reference; oracle-checked `types/array_composite.test`; capability
+  `types.array_composite`.
+
+**Still deferred (each its own follow-on):** a composite type with an **array-typed field**
+(`CREATE TYPE t AS (xs int32[])` — the mirror nesting; touches the composite-type catalog
+serialization, not the array column path); `unnest(composite[])` and the polymorphic array
+**function/operator** surface over composite elements (`array_append`/`array_cat`/`||`, `@>`/`<@`/`&&`,
+`ANY`/`ALL`, the search/edit functions — AF1–AF6 are scalar-element-tested; composite-element
+behavior is unverified and out of this slice); arrays-in-keys (`0A000`, encoding authored §8); the
+subquery quantifier form `op ANY(SELECT …)` (array-functions.md §11); runtime text→array,
+`array::text`, and element-wise array→array casts.

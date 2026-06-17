@@ -602,6 +602,13 @@ export class Database {
     return this.readSnap().compositeType(name);
   }
 
+  // colTypeOf resolves a catalog Type into a self-contained ColType against the visible snapshot's
+  // composite definitions (the codec/coercion tree — spec/design/composite.md §4). Used to coerce a
+  // composite-element array literal (array-of-composite, array.md §12 AC1).
+  colTypeOf(ty: Type): ColType {
+    return resolveColType(ty, this.readSnap().types);
+  }
+
   // tableNames is the canonical name of every table in the visible snapshot, sorted ascending
   // by lowercased name (the catalog's standing order — no map-iteration order may leak,
   // CLAUDE.md §8; keys are ASCII, so code-unit sort == byte sort). Secondary indexes are not
@@ -848,20 +855,22 @@ export class Database {
       let decimal: DecimalTypmod | null;
       const ctype = this.compositeType(def.typeName);
       if (def.typeName.endsWith("[]")) {
-        // An array column (spec/design/array.md §3). v1 element types are scalars; a typmod on the
-        // array (numeric(p,s)[]) and a composite/nested-array element are deferred (0A000).
+        // An array column (spec/design/array.md §3). The element type is a scalar or a
+        // previously-defined composite (array-of-composite, §12 AC1 — element_type_code 14 + name);
+        // a nested-array element and an array typmod (numeric(p,s)[]) stay deferred (0A000).
         const base = def.typeName.slice(0, -2);
         if (def.typeMod !== null) {
           throw engineError("feature_not_supported", "a type modifier on an array type is not supported yet");
         }
         const elemScalar = scalarTypeFromName(base);
-        if (elemScalar === undefined) {
-          if (this.compositeType(base) !== undefined) {
-            throw engineError("feature_not_supported", "an array of composite type " + base + " is not supported yet");
-          }
+        const baseComposite = this.compositeType(base);
+        if (elemScalar !== undefined) {
+          colType = arrayT(scalarT(elemScalar));
+        } else if (baseComposite !== undefined) {
+          colType = arrayT(compositeT(baseComposite.name));
+        } else {
           throw engineError("undefined_object", "type does not exist: " + base);
         }
-        colType = arrayT(scalarT(elemScalar));
         decimal = null;
       } else if (scalarTypeFromName(def.typeName) !== undefined) {
         const [s, d] = resolveTypeAndTypmod(def.typeName, def.typeMod);
@@ -6480,15 +6489,21 @@ function resolve(
           throw engineError("feature_not_supported", "a type modifier on an array type is not supported yet");
         }
         const elemScalar = scalarTypeFromName(base);
-        if (elemScalar === undefined) {
-          if (scope.catalog.compositeType(base) !== undefined) {
-            throw engineError("feature_not_supported", "an array of composite type " + base + " is not supported yet");
-          }
+        const baseComposite = scope.catalog.compositeType(base);
+        let elemCol: ColType;
+        let elemRt: ResolvedType;
+        if (elemScalar !== undefined) {
+          elemCol = { kind: "scalar", scalar: elemScalar };
+          elemRt = resolvedTypeOf(elemScalar);
+        } else if (baseComposite !== undefined) {
+          const elemTy = compositeT(baseComposite.name);
+          elemCol = scope.catalog.colTypeOf(elemTy);
+          elemRt = resolvedTypeOfCol(elemTy, scope.catalog);
+        } else {
           throw engineError("undefined_object", "type does not exist: " + base);
         }
-        const elemRt = resolvedTypeOf(elemScalar);
         if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-          const val = coerceStringToArray(e.inner.literal.text, { kind: "scalar", scalar: elemScalar });
+          const val = coerceStringToArray(e.inner.literal.text, elemCol);
           return { node: valueToRExpr(val), type: { kind: "array", elem: elemRt } };
         }
         if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
@@ -8467,17 +8482,46 @@ function coerceStringToArray(s: string, elem: ColType): Value {
     if (parsed.err === "boundflip") throw arraySubscriptErr("upper bound cannot be less than lower bound");
     throw engineError("invalid_text_representation", "malformed array literal");
   }
-  if (elem.kind !== "scalar") {
-    throw engineError("feature_not_supported", "array literal of a non-scalar element type is not supported");
-  }
-  const elemScalar = elem.scalar;
   const vals = parsed.value.tokens.map((tok) => {
     if (tok === null) return nullValue();
-    // Coerce the token to the element scalar via the typed-literal coercion, then read off its value.
-    const { node } = coerceStringLiteral(tok, elemScalar, null);
-    return rexprConstToValue(node);
+    // Coerce the token to the element type (a scalar via the string-literal coercion, a composite
+    // via record_in — array-of-composite, spec/design/array.md §12 AC1 / §7).
+    return coerceArrayElementText(tok, elem);
   });
   return { kind: "array", dims: parsed.value.dims, lbounds: parsed.value.lbounds, elements: vals };
+}
+
+// coerceArrayElementText coerces one array-element token to a Value against the element ColType (the
+// array_in per-element step, spec/design/array.md §7): a scalar via the string-literal coercion, a
+// composite via record_in (recursive — the array-of-composite quoting nests, §12 AC1). Self-contained
+// over the resolved ColType (no catalog re-walk). A nested-array element would recurse, but
+// array-of-array is not a jed type, so it is unreachable in v1.
+function coerceArrayElementText(tok: string, elem: ColType): Value {
+  if (elem.kind === "composite") return coerceRecordTextToValue(tok, elem);
+  if (elem.kind === "array") return coerceStringToArray(tok, elem.elem);
+  const { node } = coerceStringLiteral(tok, elem.scalar, null);
+  return rexprConstToValue(node);
+}
+
+// coerceRecordTextToValue is record_in over a self-contained composite ColType (the inverse of
+// record_out): the token is the composite's own `(f1,f2,…)` text, tokenized by the shared
+// parseRecordTokens and recursively coerced per field (a scalar field respects its decimal typmod).
+// Mirrors coerceStringToComposite but produces a Value directly and walks ColType (no Database). A
+// bad shape / field count is 22P02.
+function coerceRecordTextToValue(text: string, ct: { kind: "composite"; name: string; fields: ColField[] }): Value {
+  const tokens = parseRecordTokens(text);
+  if (tokens === null || tokens.length !== ct.fields.length) {
+    throw engineError("invalid_text_representation", `malformed record literal: "${text}" for type ${ct.name}`);
+  }
+  const vals = tokens.map((tok, i) => {
+    if (tok === null) return nullValue();
+    const f = ct.fields[i]!;
+    if (f.type.kind === "composite") return coerceRecordTextToValue(tok, f.type);
+    if (f.type.kind === "array") return coerceStringToArray(tok, f.type.elem);
+    const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod);
+    return rexprConstToValue(node);
+  });
+  return compositeValue(vals);
 }
 
 // rexprConstToValue extracts the Value from a constant RExpr (the const nodes coerceStringLiteral

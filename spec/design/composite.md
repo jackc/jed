@@ -294,6 +294,13 @@ string-literal→composite) + the oracle check — `rake corpus:check` regenerat
 byte-identically from live PG (two documented comparison-error-code overrides); no format change.
 **The composite-types feature is complete (S0–S6).**
 
+**A composite type as an array element** (`addr[]`) landed in [array.md §12](array.md) AC1 — a
+composite is a first-class array element type (the recursive codec/comparator/text-I/O composed for
+free; the per-element array comparison routes through the composite *total order*, not 3VL —
+array.md §5). The **mirror** nesting — a composite type with an **array-typed field**
+(`CREATE TYPE t AS (xs int32[])`) — remains a deferred `0A000` (it touches the composite-type
+*catalog* serialization, a distinct on-disk concern from the array-column path).
+
 **Still narrowed (relaxed in a later slice):** `INSERT … SELECT` into a composite column and
 `UPDATE` of a composite column remain `0A000`; a composite `PRIMARY KEY` / index / `UNIQUE` stays
 `0A000` (§6); `DEFAULT` on a composite column is `0A000`; the runtime (non-literal) text→composite

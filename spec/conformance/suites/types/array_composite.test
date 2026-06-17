@@ -1,0 +1,158 @@
+# Array-of-composite element types (spec/design/array.md §12 AC1): a previously-defined composite
+# type is a first-class array element type (items addr[]). No format_version bump — the catalog
+# already framed element_type_code 14 (§3) and the codec/comparison/text-I/O recurse. This corpus
+# constructs via the '{…}'::addr[] text literal (array_in coerces each element through record_in —
+# the PG-portable path; the ARRAY[ROW(…)] constructor with composite context is a documented jed
+# extension covered by per-core unit tests, not this PG-oracle corpus, like composite.test's nested
+# ROW). It pins: array_out nesting the two quoting layers (record_out doubling inside array_out
+# backslash-escaping, §7); the whole-value IS NULL rule; element-wise comparison / ORDER BY / DISTINCT
+# / GROUP BY where a composite element's per-element compare routes through the composite TOTAL ORDER
+# (NULLs-last, definite), NOT the composite 3VL — so ARRAY[ROW(1,NULL)::addr] = ARRAY[ROW(1,NULL)::addr]
+# is TRUE and equal-with-NULL-field arrays sort/group together (§5, oracle-pinned); subscript → the
+# composite element, slice → addr[], field access (items[i]).field; multidimensional addr[] values.
+# array_out / record_out match PostgreSQL byte-for-byte. Type name avoids PG's geometric builtins.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.group_by, query.aggregates, types.array_composite, types.composite, types.array, types.array_multidim, expr.array_subscript, expr.array_slice, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TYPE addr AS (street text, zip int32)
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, items addr[])
+
+# Construct a composite-element array from the text literal: array_in tokenizes the outer braces,
+# then routes each quoted element through record_in to build the composite value.
+statement ok
+INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')
+
+# An element whose composite field contains a comma is record_out-quoted, then array_out wraps it
+# and backslash-escapes the inner quotes.
+statement ok
+INSERT INTO t VALUES (2, '{"(\"Other, Ln\",12)"}')
+
+# A NULL composite field renders as the empty inter-delimiter string; a whole-element NULL::addr is
+# the unquoted token NULL.
+statement ok
+INSERT INTO t VALUES (3, '{"(Main,)",NULL}')
+
+# The empty array {} and a NULL array are distinct.
+statement ok
+INSERT INTO t VALUES (4, '{}')
+
+statement ok
+INSERT INTO t VALUES (5, NULL)
+
+# The gnarliest nesting: an empty-string field ("") and a field with embedded "/\ — record_out
+# DOUBLES "→"" and \→\\, then array_out BACKSLASH-escapes the result.
+statement ok
+INSERT INTO t VALUES (6, '{"(\"\",5)","(\"a\"\"b\\\\c\",6)"}')
+
+# array_out round-trip: every value renders exactly as PostgreSQL does, byte-for-byte.
+query IT nosort
+SELECT id, items FROM t ORDER BY id
+----
+1
+{"(Main,90210)","(Side,5)"}
+2
+{"(\"Other, Ln\",12)"}
+3
+{"(Main,)",NULL}
+4
+{}
+5
+NULL
+6
+{"(\"\",5)","(\"a\"\"b\\\\c\",6)"}
+
+# Whole-value IS NULL: only the SQL-NULL array (id 5) is NULL — the empty array and an array with a
+# NULL element are NOT NULL.
+query I nosort
+SELECT id FROM t WHERE items IS NULL ORDER BY id
+----
+5
+
+# Subscript yields the composite element (rendered by record_out, NOT array_out — no outer braces).
+query T nosort
+SELECT items[1] FROM t WHERE id = 1
+----
+(Main,90210)
+
+# Field access on a subscripted composite element: (items[i]).field.
+query TI nosort
+SELECT (items[1]).street, (items[2]).zip FROM t WHERE id = 1
+----
+Main
+5
+
+# A slice yields a sub-array (addr[]), renumbered to lower bound 1.
+query T nosort
+SELECT items[1:1] FROM t WHERE id = 1
+----
+{"(Main,90210)"}
+
+# Whole-array equality is element-wise with btree NULL semantics — an exact match.
+query I nosort
+SELECT id FROM t WHERE items = '{"(Main,90210)","(Side,5)"}'::addr[] ORDER BY id
+----
+1
+
+# A NULL composite FIELD is comparable (btree), so an array comparison is always a definite boolean:
+# equal NULL fields → TRUE, a NULL field vs a present field → FALSE (never UNKNOWN).
+query BB nosort
+SELECT '{"(1,)"}'::addr[] = '{"(1,)"}'::addr[], '{"(a,)"}'::addr[] = '{"(a,2)"}'::addr[]
+----
+true
+false
+
+statement ok
+CREATE TABLE t2 (id int32 PRIMARY KEY, items addr[])
+
+statement ok
+INSERT INTO t2 VALUES (1, '{"(a,2)"}'), (2, '{"(a,)"}'), (3, '{"(a,1)"}'), (4, '{"(a,1)"}')
+
+# ORDER BY over addr[]: the composite total order decides element-by-element; a NULL zip field sorts
+# AFTER any present zip ({(a,1)} < {(a,2)} < {(a,)}).
+query IT nosort
+SELECT id, items FROM t2 ORDER BY items, id
+----
+3
+{"(a,1)"}
+4
+{"(a,1)"}
+1
+{"(a,2)"}
+2
+{"(a,)"}
+
+# DISTINCT collapses arrays that are equal including a matching NULL field (the two {(a,1)} rows).
+query T nosort
+SELECT DISTINCT items FROM t2 ORDER BY items
+----
+{"(a,1)"}
+{"(a,2)"}
+{"(a,)"}
+
+# GROUP BY uses the same total-order key — the equal {(a,1)} rows group together.
+query TI nosort
+SELECT items, count(*) FROM t2 GROUP BY items ORDER BY items
+----
+{"(a,1)"}
+2
+{"(a,2)"}
+1
+{"(a,)"}
+1
+
+# A shorter array sorts before a longer one that extends it (the array_cmp element-count tiebreak),
+# recursing through composite elements.
+query B nosort
+SELECT '{"(a,1)"}'::addr[] < '{"(a,1)","(a,1)"}'::addr[]
+----
+true
+
+# Multidimensional addr[] values: nested braces render (the codec ndim/dims header recurses over
+# composite element bodies).
+query T nosort
+SELECT '{{"(a,1)","(b,2)"},{"(c,3)","(d,4)"}}'::addr[]
+----
+{{"(a,1)","(b,2)"},{"(c,3)","(d,4)"}}

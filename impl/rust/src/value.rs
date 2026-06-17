@@ -745,13 +745,20 @@ fn array_total_cmp(a: &ArrayVal, b: &ArrayVal) -> std::cmp::Ordering {
 }
 
 /// Total order over two array elements, with NULL the largest value (NULLs-last) and two NULLs
-/// equal. Present (non-NULL) elements use their own definite `eq3`/`lt3` (scalar comparators).
+/// equal. A **composite** element recurses through the composite *total order* (NULLs-last per
+/// field), and a nested array through [`array_total_cmp`] — **NOT** the composite 3VL `eq3`/`lt3`,
+/// which can be UNKNOWN for a NULL field and would break array comparison's "always a definite
+/// boolean" guarantee (spec/design/array.md §5 — the array-of-composite subtlety; this must agree
+/// with `executor::value_cmp`, the ORDER BY path). A present scalar element uses its definite
+/// `eq3`/`lt3`.
 fn elem_total_cmp(x: &Value, y: &Value) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     match (x, y) {
         (Value::Null, Value::Null) => Ordering::Equal,
         (Value::Null, _) => Ordering::Greater, // NULL sorts last
         (_, Value::Null) => Ordering::Less,
+        (Value::Composite(a), Value::Composite(b)) => composite_total_cmp(a, b),
+        (Value::Array(a), Value::Array(b)) => array_total_cmp(a, b),
         _ => {
             if x.eq3(y) == ThreeValued::True {
                 Ordering::Equal
@@ -762,6 +769,21 @@ fn elem_total_cmp(x: &Value, y: &Value) -> std::cmp::Ordering {
             }
         }
     }
+}
+
+/// Total order over two composite values of the same type: lexicographic over fields, each compared
+/// by [`elem_total_cmp`] (so a NULL field sorts last and two NULL fields are equal — the composite
+/// *sort key*, NOT the 3VL row comparison), with a field-count tiebreak for totality. This is the
+/// order an array of composites uses for a composite element, kept identical to the composite ORDER
+/// BY key (`executor::value_cmp`'s composite arm) so `<` and `ORDER BY` never disagree.
+fn composite_total_cmp(a: &[Value], b: &[Value]) -> std::cmp::Ordering {
+    for (x, y) in a.iter().zip(b.iter()) {
+        let o = elem_total_cmp(x, y);
+        if o != std::cmp::Ordering::Equal {
+            return o;
+        }
+    }
+    a.len().cmp(&b.len())
 }
 
 /// PostgreSQL `array_out` (spec/design/array.md §7): render an array as `{e1,e2,…}`, with nested

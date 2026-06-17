@@ -805,21 +805,20 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		isComposite := false
 		isArray := false
 		if base, ok := strings.CutSuffix(def.TypeName, "[]"); ok {
-			// An array column (spec/design/array.md §3). v1 element types are scalars; a typmod on
-			// the array (numeric(p,s)[]) and a composite/nested-array element are deferred (0A000).
+			// An array column (spec/design/array.md §3). The element type is a scalar or a
+			// previously-defined composite (array-of-composite, §12 AC1 — element_type_code 14 +
+			// name); a nested-array element and an array typmod (numeric(p,s)[]) stay deferred (0A000).
 			if def.TypeMod != nil {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a type modifier on an array type is not supported yet")
 			}
-			elemScalar, scalarOK := ScalarTypeFromName(base)
-			if !scalarOK {
-				if db.readSnap().compositeType(base) != nil {
-					return Outcome{}, NewError(FeatureNotSupported,
-						"an array of composite type "+base+" is not supported yet")
-				}
+			if elemScalar, scalarOK := ScalarTypeFromName(base); scalarOK {
+				colType = ArrayT(ScalarT(elemScalar))
+			} else if ctype := db.readSnap().compositeType(base); ctype != nil {
+				colType = ArrayT(CompositeT(ctype.Name))
+			} else {
 				return Outcome{}, NewError(UndefinedObject, "type does not exist: "+base)
 			}
-			colType = ArrayT(ScalarT(elemScalar))
 			isArray = true
 		} else if _, ok := ScalarTypeFromName(def.TypeName); ok {
 			ty, d, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
@@ -8640,17 +8639,21 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				return nil, resolvedType{}, NewError(FeatureNotSupported,
 					"a type modifier on an array type is not supported yet")
 			}
-			elemScalar, scalarOK := ScalarTypeFromName(base)
-			if !scalarOK {
-				if s.catalog.readSnap().compositeType(base) != nil {
-					return nil, resolvedType{}, NewError(FeatureNotSupported,
-						"an array of composite type "+base+" is not supported yet")
-				}
+			snap := s.catalog.readSnap()
+			var elemCol ColType
+			var elemRT resolvedType
+			if elemScalar, scalarOK := ScalarTypeFromName(base); scalarOK {
+				elemCol = ScalarColType(elemScalar)
+				elemRT = resolvedTypeOf(elemScalar)
+			} else if ctype := snap.compositeType(base); ctype != nil {
+				elemTy := CompositeT(ctype.Name)
+				elemCol = ResolveColType(elemTy, snap.types)
+				elemRT = resolvedTypeOfCol(elemTy, snap)
+			} else {
 				return nil, resolvedType{}, NewError(UndefinedObject, "type does not exist: "+base)
 			}
-			elemRT := resolvedTypeOf(elemScalar)
 			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralText {
-				val, err := coerceStringToArray(in.Literal.Str, ScalarColType(elemScalar))
+				val, err := coerceStringToArray(in.Literal.Str, elemCol)
 				if err != nil {
 					return nil, resolvedType{}, err
 				}
@@ -11873,23 +11876,78 @@ func coerceStringToArray(s string, elem ColType) (Value, error) {
 	case arrayBoundFlip:
 		return Value{}, arraySubscriptErr("upper bound cannot be less than lower bound")
 	}
-	if elem.Composite || elem.Elem != nil {
-		return Value{}, NewError(FeatureNotSupported,
-			"array literal of a non-scalar element type is not supported")
-	}
 	vals := make([]Value, len(parsed.Tokens))
 	for i, tok := range parsed.Tokens {
 		if tok == nil {
 			vals[i] = NullValue()
 			continue
 		}
-		ev, err := coerceStringLiteralToValue(*tok, elem.Scalar)
+		ev, err := coerceArrayElementText(*tok, elem)
 		if err != nil {
 			return Value{}, err
 		}
 		vals[i] = ev
 	}
 	return ArrayValueOf(&ArrayVal{Dims: parsed.Dims, Lbounds: parsed.Lbounds, Elements: vals}), nil
+}
+
+// coerceArrayElementText coerces one array-element token to a Value against the element ColType (the
+// array_in per-element step, spec/design/array.md §7): a scalar via the string-literal coercion, a
+// composite via record_in (recursive — the array-of-composite quoting nests, §12 AC1 / §7).
+// Self-contained over the resolved ColType, so no catalog re-walk. A nested-array element token
+// would recurse, but array-of-array is not a jed type, so it is unreachable in v1.
+func coerceArrayElementText(tok string, elem ColType) (Value, error) {
+	switch {
+	case elem.Composite:
+		return coerceRecordTextToValue(tok, elem)
+	case elem.Elem != nil:
+		return coerceStringToArray(tok, *elem.Elem)
+	default:
+		return coerceStringLiteralToValue(tok, elem.Scalar)
+	}
+}
+
+// coerceRecordTextToValue is record_in over a self-contained composite ColType (the inverse of
+// record_out): the token is the composite's own (f1,f2,…) text, tokenized by the shared
+// parseRecordTokens and recursively coerced per field (a scalar field respects its decimal typmod).
+// Mirrors coerceStringToComposite but produces a Value directly and walks ColType (no Database). A
+// bad shape / field count is 22P02.
+func coerceRecordTextToValue(text string, ct ColType) (Value, error) {
+	malformed := func() error {
+		return NewError(InvalidTextRepresentation,
+			fmt.Sprintf("malformed record literal: %q for type %s", text, ct.Name))
+	}
+	tokens, ok := parseRecordTokens(text)
+	if !ok || len(tokens) != len(ct.Fields) {
+		return Value{}, malformed()
+	}
+	vals := make([]Value, len(tokens))
+	for i := range tokens {
+		f := ct.Fields[i]
+		if tokens[i] == nil {
+			vals[i] = NullValue()
+			continue
+		}
+		var v Value
+		var err error
+		switch {
+		case f.Type.Composite:
+			v, err = coerceRecordTextToValue(*tokens[i], f.Type)
+		case f.Type.Elem != nil:
+			v, err = coerceStringToArray(*tokens[i], *f.Type.Elem)
+		default:
+			var node *rExpr
+			node, _, err = coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Typmod)
+			if err == nil {
+				v, err = rExprConstToValue(node)
+			}
+		}
+		if err != nil {
+			return Value{}, err
+		}
+		vals[i] = v
+	}
+	return CompositeValue(vals), nil
 }
 
 // coerceStringLiteralToValue coerces an array-element token string to a runtime Value of the

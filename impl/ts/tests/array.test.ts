@@ -159,3 +159,66 @@ test("subscript with expression index and constructor base", () => {
   assert.deepStrictEqual(query(db, "SELECT xs[1 + 1] FROM t"), [["20"]]);
   assert.deepStrictEqual(query(db, "SELECT (ARRAY[100, 200, 300])[3] FROM t"), [["300"]]);
 });
+
+// --- AC1: array-of-composite element types (spec/design/array.md §12) -----------------------------
+
+test("AC1: composite-element array round-trips literal + ARRAY[ROW(…)] constructor; access works", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE addr AS (street text, zip int32)");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])");
+  // The text-literal construction path (array_in → record_in per element).
+  run(db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`);
+  // The ARRAY[ROW(…)] constructor with composite element context (no ::addr cast — a jed extension).
+  run(db, "INSERT INTO t VALUES (2, ARRAY[ROW('Other, Ln', 12)])");
+  run(db, `INSERT INTO t VALUES (3, '{"(Main,)",NULL}')`);
+  assert.deepStrictEqual(query(db, "SELECT id, items FROM t ORDER BY id"), [
+    ["1", `{"(Main,90210)","(Side,5)"}`],
+    ["2", `{"(\\"Other, Ln\\",12)"}`],
+    ["3", `{"(Main,)",NULL}`],
+  ]);
+  // Subscript → the composite element (record_out, no braces); field access; slice → addr[].
+  assert.deepStrictEqual(query(db, "SELECT items[1] FROM t WHERE id = 1"), [["(Main,90210)"]]);
+  assert.deepStrictEqual(query(db, "SELECT (items[2]).street FROM t WHERE id = 1"), [["Side"]]);
+  assert.deepStrictEqual(query(db, "SELECT items[1:1] FROM t WHERE id = 1"), [[`{"(Main,90210)"}`]]);
+});
+
+test("AC1: an addr[] column survives a whole-image round-trip", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE addr AS (street text, zip int32)");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])");
+  run(db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`);
+  run(db, `INSERT INTO t VALUES (2, '{"(Main,)",NULL}')`);
+  run(db, "INSERT INTO t VALUES (3, NULL)");
+  const loaded = loadDatabase(toImage(db, 4096, 1n));
+  assert.deepStrictEqual(query(loaded, "SELECT id, items FROM t ORDER BY id"), [
+    ["1", `{"(Main,90210)","(Side,5)"}`],
+    ["2", `{"(Main,)",NULL}`],
+    ["3", "NULL"],
+  ]);
+});
+
+test("AC1: composite element NULL-field ordering operators are definite (the total-order fix)", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE addr AS (street text, zip int32)");
+  // Equal arrays with a NULL composite field: definite, never UNKNOWN.
+  assert.deepStrictEqual(
+    query(
+      db,
+      `SELECT '{"(1,)"}'::addr[] <= '{"(1,)"}'::addr[], ` +
+        `'{"(1,)"}'::addr[] >= '{"(1,)"}'::addr[], ` +
+        `'{"(1,)"}'::addr[] < '{"(1,)"}'::addr[]`,
+    ),
+    [["true", "true", "false"]],
+  );
+  // A NULL field sorts after a present field.
+  assert.deepStrictEqual(
+    query(db, `SELECT '{"(a,)"}'::addr[] > '{"(a,1)"}'::addr[], '{"(a,1)"}'::addr[] < '{"(a,)"}'::addr[]`),
+    [["true", "true"]],
+  );
+});
+
+test("AC1: a composite-element array is still never keyable (0A000)", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE addr AS (street text, zip int32)");
+  assert.strictEqual(errCode(() => run(db, "CREATE TABLE t (items addr[] PRIMARY KEY)")), "0A000");
+});

@@ -316,3 +316,123 @@ fn subscript_expression_index_and_constructor_base() {
         vec![vec!["300"]]
     );
 }
+
+// --- AC1: array-of-composite element types (spec/design/array.md §12) -----------------------------
+
+/// AC1: a composite type is a first-class array element type. Construct via the `'{…}'::addr[]`
+/// literal (array_in → record_in per element) AND via the `ARRAY[ROW(…)]` constructor with the
+/// column's composite element context (the jed extension PG needs `::addr` casts for — covered here,
+/// not in the PG-oracle corpus). `array_out` nests the two quoting layers; subscript yields the
+/// composite, field access reads into it, a slice yields `addr[]`.
+#[test]
+fn array_of_composite_roundtrip_and_access() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])",
+    );
+    // The text-literal construction path.
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, '{\"(Main,90210)\",\"(Side,5)\"}')",
+    );
+    // The ARRAY[ROW(…)] constructor with composite element context (no `::addr` cast needed).
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (2, ARRAY[ROW('Other, Ln', 12)])",
+    );
+    run(&mut db, "INSERT INTO t VALUES (3, '{\"(Main,)\",NULL}')");
+    assert_eq!(
+        query(&mut db, "SELECT id, items FROM t ORDER BY id"),
+        vec![
+            vec!["1", "{\"(Main,90210)\",\"(Side,5)\"}"],
+            vec!["2", "{\"(\\\"Other, Ln\\\",12)\"}"],
+            vec!["3", "{\"(Main,)\",NULL}"],
+        ]
+    );
+    // Subscript → the composite element (record_out, no braces); field access reads a field; a slice
+    // stays addr[].
+    assert_eq!(
+        query(&mut db, "SELECT items[1] FROM t WHERE id = 1"),
+        vec![vec!["(Main,90210)"]]
+    );
+    assert_eq!(
+        query(&mut db, "SELECT (items[2]).street FROM t WHERE id = 1"),
+        vec![vec!["Side"]]
+    );
+    assert_eq!(
+        query(&mut db, "SELECT items[1:1] FROM t WHERE id = 1"),
+        vec![vec!["{\"(Main,90210)\"}"]]
+    );
+}
+
+/// AC1: an `addr[]` column survives the on-disk image round-trip byte-for-byte (the recursive value
+/// codec — composite element bodies inside the array body; complements the cross-core golden).
+#[test]
+fn array_of_composite_image_roundtrip() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, '{\"(Main,90210)\",\"(Side,5)\"}')",
+    );
+    run(&mut db, "INSERT INTO t VALUES (2, '{\"(Main,)\",NULL}')");
+    run(&mut db, "INSERT INTO t VALUES (3, NULL)");
+    let image = db.to_image(4096, 1).expect("serialize image");
+    let mut loaded = Database::from_image(&image).expect("load image");
+    assert_eq!(
+        query(&mut loaded, "SELECT id, items FROM t ORDER BY id"),
+        vec![
+            vec!["1", "{\"(Main,90210)\",\"(Side,5)\"}"],
+            vec!["2", "{\"(Main,)\",NULL}"],
+            vec!["3", "NULL"],
+        ]
+    );
+}
+
+/// AC1, the load-bearing comparison fix: a composite element's per-element compare routes through
+/// the composite TOTAL ORDER (NULLs-last, definite), NOT the 3VL — so the ordering operators
+/// `< <= > >=` are consistent for arrays whose composite elements have NULL fields (the bug the
+/// scalar element path never reached). Equal-with-NULL-field arrays compare `<=` AND `>=` TRUE and
+/// `<` FALSE; a NULL field sorts AFTER a present field (spec/design/array.md §5, oracle-pinned).
+#[test]
+fn array_of_composite_null_field_ordering_operators() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    // Equal arrays with a NULL composite field: definite, never UNKNOWN.
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT '{\"(1,)\"}'::addr[] <= '{\"(1,)\"}'::addr[], \
+                    '{\"(1,)\"}'::addr[] >= '{\"(1,)\"}'::addr[], \
+                    '{\"(1,)\"}'::addr[] <  '{\"(1,)\"}'::addr[]"
+        ),
+        vec![vec!["true", "true", "false"]]
+    );
+    // A NULL field sorts after a present field: {(a,)} > {(a,1)} and {(a,1)} < {(a,)}.
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT '{\"(a,)\"}'::addr[] > '{\"(a,1)\"}'::addr[], \
+                    '{\"(a,1)\"}'::addr[] < '{\"(a,)\"}'::addr[]"
+        ),
+        vec![vec!["true", "true"]]
+    );
+}
+
+/// AC1: a composite `PRIMARY KEY` element array stays `0A000` (arrays are never keyable this slice,
+/// §8) — the new element type does not relax the key gate.
+#[test]
+fn array_of_composite_primary_key_is_0a000() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    assert_eq!(
+        err(&mut db, "CREATE TABLE t (items addr[] PRIMARY KEY)"),
+        "0A000"
+    );
+}

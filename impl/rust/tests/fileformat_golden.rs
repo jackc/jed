@@ -524,6 +524,32 @@ fn composite_type_table_db() -> Database {
     db
 }
 
+/// A composite type used as an array ELEMENT type (array-of-composite, array.md §12 AC1): the
+/// catalog array-column entry carries a composite element descriptor (`element_type_code` 14 +
+/// "addr") and the value body recurses (an array body whose elements are composite bodies). Row 2's
+/// element has a NULL `zip` field (the composite null-bitmap inside an element); row 3 mixes a
+/// present composite element with a NULL element (the array HAS_NULLS bitmap).
+fn array_composite_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TYPE addr AS (street text NOT NULL, zip int32)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, '{\"(Main,90210)\",\"(Side,5)\"}')",
+    );
+    run(&mut db, "INSERT INTO t VALUES (2, '{\"(Oak,)\"}')");
+    run(&mut db, "INSERT INTO t VALUES (3, '{\"(A,1)\",NULL}')");
+    run(&mut db, "INSERT INTO t VALUES (4, '{}')");
+    run(&mut db, "INSERT INTO t VALUES (5, NULL)");
+    db
+}
+
 /// Nested composite types (a field whose type is another composite, by name) used by a column
 /// with a stored nested value (S3). `point` is created first (a referenced type must exist), but
 /// the on-disk order is name-sorted (`line`, `point`) — `line` sorts BEFORE the `point` it
@@ -574,6 +600,7 @@ fn write_matches_goldens() {
         ("composite_type_table.jed", composite_type_table_db),
         ("nested_composite_table.jed", nested_composite_table_db),
         ("array_table.jed", array_table_db),
+        ("array_composite_table.jed", array_composite_table_db),
         ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
@@ -612,6 +639,7 @@ fn read_goldens_reproduces_rows() {
         ("composite_type_table.jed", composite_type_table_db, "t"),
         ("nested_composite_table.jed", nested_composite_table_db, "t"),
         ("array_table.jed", array_table_db, "t"),
+        ("array_composite_table.jed", array_composite_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),
