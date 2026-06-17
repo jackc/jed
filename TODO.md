@@ -288,8 +288,19 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         subscript→`addr`, slice→`addr[]`, `(items[i]).zip`, multidim. New golden
         `array_composite_table.jed` (`rust == go == ts == ruby`); all three cores + Ruby; oracle-checked
         `types/array_composite.test`; capability `types.array_composite`. → [array.md §12](spec/design/array.md)
-  - [ ] _remaining follow-ons (each its own slice + obligations):_ a composite type with an
-        **array-typed field** (`CREATE TYPE t AS (xs int32[])` — the mirror nesting); `unnest(composite[])`
+  - [x] **CMP-ARR-FIELD — a composite type with an array-typed field** (`CREATE TYPE poly AS (name
+        text, pts int32[])` — the mirror of AC1): the composite-type catalog entry gains a
+        `field_type_code = 15` array field carrying the inline element descriptor (no
+        `format_version` bump — still 10; before the field flags byte, where a nested-composite name
+        sits), and the value codec / comparison / `record_out` / `record_in` recurse for free (an
+        array field's `record_in` token is coerced through `array_in`). The element may itself be a
+        composite (the doubly-nested `addr[]` field). `DROP TYPE` dependency tracking + two-pass-load
+        validation look through one array level (so an `addr[]` field/column is a `2BP01` dependent).
+        Build via `ROW(name, '{…}')` / `ROW(name, ARRAY[…])`; the PG-portable `'(name,"{…}")'::poly`
+        cast parses through `record_in`/`array_in`. All three cores + Ruby; new golden
+        `composite_array_field_table.jed`; oracle-checked `types/composite_array_field.test`;
+        capability `types.composite_array_field`. → [array.md §12](spec/design/array.md), [composite.md §12](spec/design/composite.md)
+  - [ ] _remaining follow-ons (each its own slice + obligations):_ `unnest(composite[])`
         and the polymorphic array **function** surface over composite elements; arrays-in-keys
         (`0A000`, encoding authored §8); the subquery quantifier form `op ANY(SELECT …)`; runtime
         text→array, `array::text`, and element-wise array→array casts.

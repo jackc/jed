@@ -1615,6 +1615,12 @@ func compositeTypeEntryBytes(ct *CompositeType) []byte {
 			out = append(out, 14)
 			out = appendU16(out, uint16(len(f.Type.Comp.Name)))
 			out = append(out, f.Type.Comp.Name...)
+		} else if f.Type.Array != nil {
+			// An array-typed field (spec/design/array.md §12): type_code 15, then the same inline
+			// element-type descriptor an array column uses (§3), before the flags byte — mirroring
+			// where a nested-composite field's name sits.
+			out = append(out, 15)
+			out = pushArrayElementType(out, *f.Type.Array)
 		} else {
 			out = append(out, typeCodeForScalar(f.Type.ScalarTy()))
 		}
@@ -1666,6 +1672,14 @@ func decodeCompositeTypeEntry(buf []byte, pos *int) (*CompositeType, error) {
 				return nil, err
 			}
 			fty = CompositeT(tn)
+		} else if tc == 15 {
+			// An array-typed field (spec/design/array.md §12): the element-type descriptor, then
+			// (below) the flags byte — the inverse of the array arm in compositeTypeEntryBytes.
+			elem, err := readArrayElementType(buf, pos)
+			if err != nil {
+				return nil, err
+			}
+			fty = ArrayT(elem)
 		} else {
 			s, ok := scalarForTypeCode(tc)
 			if !ok {

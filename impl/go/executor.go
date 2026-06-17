@@ -165,10 +165,12 @@ func (s *Snapshot) compositeDependent(name string) (string, bool) {
 		tableKeys = append(tableKeys, k)
 	}
 	sort.Strings(tableKeys)
+	// CompositeRefOf looks through one array level, so an addr[] column / field counts as a
+	// dependent of addr exactly as a bare addr one does (spec/design/array.md §12).
 	for _, tk := range tableKeys {
 		t := s.tables[tk]
 		for _, c := range t.Columns {
-			if c.Type.Comp != nil && strings.EqualFold(c.Type.Comp.Name, key) {
+			if r := c.Type.CompositeRefOf(); r != nil && strings.EqualFold(r.Name, key) {
 				return "column " + c.Name + " of table " + t.Name, true
 			}
 		}
@@ -181,7 +183,7 @@ func (s *Snapshot) compositeDependent(name string) (string, bool) {
 	for _, ck := range typeKeys {
 		ct := s.types[ck]
 		for _, f := range ct.Fields {
-			if f.Type.Comp != nil && strings.EqualFold(f.Type.Comp.Name, key) {
+			if r := f.Type.CompositeRefOf(); r != nil && strings.EqualFold(r.Name, key) {
 				return "field " + f.Name + " of type " + ct.Name, true
 			}
 		}
@@ -204,9 +206,11 @@ func (s *Snapshot) validateCompositeTypes() error {
 	for _, k := range keys {
 		ct := s.types[k]
 		for _, f := range ct.Fields {
-			if f.Type.Comp != nil && s.compositeType(f.Type.Comp.Name) == nil {
+			// CompositeRefOf looks through one array level, so an array-of-composite field
+			// (`addr[]`) is validated like a bare `addr` one (spec/design/array.md §12).
+			if r := f.Type.CompositeRefOf(); r != nil && s.compositeType(r.Name) == nil {
 				return NewError(DataCorrupted,
-					"composite type "+ct.Name+" references unknown type "+f.Type.Comp.Name)
+					"composite type "+ct.Name+" references unknown type "+r.Name)
 			}
 		}
 	}
@@ -217,14 +221,15 @@ func (s *Snapshot) validateCompositeTypes() error {
 		color[key] = 1
 		if ct, ok := s.types[key]; ok {
 			for _, f := range ct.Fields {
-				if f.Type.Comp == nil {
+				r := f.Type.CompositeRefOf()
+				if r == nil {
 					continue
 				}
-				ck := strings.ToLower(f.Type.Comp.Name)
+				ck := strings.ToLower(r.Name)
 				switch color[ck] {
 				case 1:
 					return NewError(DataCorrupted,
-						"composite type definition cycle through "+f.Type.Comp.Name)
+						"composite type definition cycle through "+r.Name)
 				case 2:
 				default:
 					if err := visit(ck); err != nil {
@@ -1417,7 +1422,23 @@ func (db *Database) executeCreateType(ct *CreateType) (Outcome, error) {
 		}
 		var fty Type
 		var fdecimal *DecimalTypmod
-		if _, ok := ScalarTypeFromName(f.TypeName); ok {
+		if base, ok := strings.CutSuffix(f.TypeName, "[]"); ok {
+			// An array-typed field (spec/design/array.md §12 — the mirror of an array-of-composite
+			// element). The element is a scalar or a previously-defined composite (element_type_code
+			// 14 + name on disk); a nested-array element and an array typmod stay deferred (0A000),
+			// exactly as for an array column.
+			if f.TypeMod != nil {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a type modifier on an array type is not supported yet")
+			}
+			if elemScalar, scalarOK := ScalarTypeFromName(base); scalarOK {
+				fty = ArrayT(ScalarT(elemScalar))
+			} else if ctype := db.readSnap().compositeType(base); ctype != nil {
+				fty = ArrayT(CompositeT(ctype.Name))
+			} else {
+				return Outcome{}, NewError(UndefinedObject, "type does not exist: "+base)
+			}
+		} else if _, ok := ScalarTypeFromName(f.TypeName); ok {
 			s, d, err := resolveTypeAndTypmod(f.TypeName, f.TypeMod)
 			if err != nil {
 				return Outcome{}, err
@@ -9362,6 +9383,17 @@ func coerceStringToComposite(text string, ct *CompositeType, catalog *Database) 
 			}
 			nodes[i] = node
 			fields[i] = compositeRField{name: f.Name, ty: ty}
+		case f.Type.Array != nil:
+			// An array-typed field (spec/design/array.md §12): the token is an array text literal,
+			// coerced through array_in against the element type — the same path a bare `'{…}'::T[]`
+			// cast uses, one level down. Folds to a constant array.
+			elemCol := ResolveColType(*f.Type.Array, snap.types)
+			val, err := coerceStringToArray(*tokens[i], elemCol)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			nodes[i] = valueToRExpr(val)
+			fields[i] = compositeRField{name: f.Name, ty: resolvedTypeOfCol(f.Type, snap)}
 		default:
 			node, ty, err := coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Decimal)
 			if err != nil {

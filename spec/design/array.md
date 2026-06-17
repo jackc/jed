@@ -472,9 +472,21 @@ capabilities `func.array` + `func.unnest` + `func.array_containment` + `func.arr
   cores + the Ruby reference; oracle-checked `types/array_composite.test`; capability
   `types.array_composite`.
 
-**Still deferred (each its own follow-on):** a composite type with an **array-typed field**
-(`CREATE TYPE t AS (xs int32[])` — the mirror nesting; touches the composite-type catalog
-serialization, not the array column path); `unnest(composite[])` and the polymorphic array
+**The mirror nesting landed (`CMP-ARR-FIELD`)** — a composite type with an **array-typed field**
+(`CREATE TYPE poly AS (name text, pts int32[])`; capability `types.composite_array_field`). It
+touches the composite-type *catalog* serialization (a `field_type_code = 15` array field carrying
+the inline element descriptor, §3 — before the field flags byte, no `format_version` bump, still
+10), not the array-column path; the value codec / comparison / `record_out` / `record_in` recurse
+for free (an array field's `record_in` token is an array text literal coerced through `array_in`,
+one level down). The element may itself be a composite (the doubly-nested `addr[]` field). Build via
+`ROW(name, '{…}')` / `ROW(name, ARRAY[…])` (the array field as a text literal or `ARRAY[…]` — the
+forms a composite column already takes); the PG-portable `'(name,"{…}")'::poly` cast parses it
+through `record_in`/`array_in`. `DROP TYPE addr` is `2BP01` while an `addr[]` field (or column)
+references it — the dependency check + two-pass-load validation look through one array level. New
+golden `composite_array_field_table.jed` (`rust == go == ts == ruby`); oracle-checked
+`types/composite_array_field.test`. See [composite.md §12](composite.md).
+
+**Still deferred (each its own follow-on):** `unnest(composite[])` and the polymorphic array
 **function/operator** surface over composite elements (`array_append`/`array_cat`/`||`, `@>`/`<@`/`&&`,
 `ANY`/`ALL`, the search/edit functions — AF1–AF6 are scalar-element-tested; composite-element
 behavior is unverified and out of this slice); arrays-in-keys (`0A000`, encoding authored §8); the

@@ -6,7 +6,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Database, execute, loadDatabase, toImage } from "../src/lib.ts";
-import { compositeT, scalarT } from "../src/types.ts";
+import { arrayT, compositeT, scalarT } from "../src/types.ts";
 import { errCode, query } from "./util.ts";
 
 function run(db: Database, sql: string): void {
@@ -372,4 +372,101 @@ test("composite comparison type errors", () => {
   assert.equal(errCode(() => run(db, "SELECT r = 1 FROM p")), "42804");
   // Different row sizes.
   assert.equal(errCode(() => run(db, "SELECT ROW(1, 2) = ROW(1, 2, 3)")), "42804");
+});
+
+// --- a composite type with an array-typed field (spec/design/array.md §12 — the mirror of an
+// array-of-composite element). The catalog persists the array field as type_code 15 + the inline
+// element descriptor; the value codec / comparison / text-I/O all recurse. Mirrors the Rust tests. ---
+
+test("CREATE TYPE with an array field registers it", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE poly AS (name text, pts int32[])");
+  const ct = db.compositeType("poly");
+  assert.ok(ct);
+  assert.equal(ct!.fields.length, 2);
+  assert.equal(ct!.fields[1]!.name, "pts");
+  assert.deepStrictEqual(ct!.fields[1]!.type, arrayT(scalarT("int32")));
+});
+
+test("composite with an array field round-trips (INSERT/SELECT, record_in, field access)", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE poly AS (name text, pts int32[])");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+  run(db, "INSERT INTO t VALUES (1, ROW('a', '{1,2,3}'))");
+  run(db, "INSERT INTO t VALUES (2, ROW('b', ARRAY[4, 5]))");
+  run(db, "INSERT INTO t VALUES (3, ROW('c', '{}'))");
+  run(db, "INSERT INTO t VALUES (4, ROW('d', NULL))");
+  assert.deepStrictEqual(query(db, "SELECT id, p FROM t ORDER BY id"), [
+    ["1", `(a,"{1,2,3}")`],
+    ["2", `(b,"{4,5}")`],
+    ["3", "(c,{})"],
+    ["4", "(d,)"],
+  ]);
+  assert.deepStrictEqual(query(db, `SELECT '(z,"{7,8}")'::poly`), [[`(z,"{7,8}")`]]);
+  assert.deepStrictEqual(query(db, "SELECT (p).pts FROM t WHERE id = 1"), [["{1,2,3}"]]);
+  assert.deepStrictEqual(query(db, "SELECT (p).pts[2] FROM t WHERE id = 1"), [["2"]]);
+});
+
+test("composite with an array field persists through the on-disk image", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE poly AS (name text, pts int32[])");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+  run(db, "INSERT INTO t VALUES (1, ROW('a', ARRAY[1, 2, 3]))");
+  run(db, "INSERT INTO t VALUES (2, ROW('b', NULL))");
+  const image = toImage(db, 256, 1n);
+  const loaded = loadDatabase(image);
+  const ct = loaded.compositeType("poly");
+  assert.ok(ct);
+  assert.deepStrictEqual(ct!.fields[1]!.type, arrayT(scalarT("int32")));
+  assert.deepStrictEqual(query(loaded, "SELECT id, p FROM t ORDER BY id"), [
+    ["1", `(a,"{1,2,3}")`],
+    ["2", "(b,)"],
+  ]);
+});
+
+test("composite with an array field: comparison and ordering", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE poly AS (name text, pts int32[])");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+  run(db, "INSERT INTO t VALUES (1, ROW('a', ARRAY[1, 2]))");
+  run(db, "INSERT INTO t VALUES (2, ROW('a', ARRAY[1, 3]))");
+  run(db, "INSERT INTO t VALUES (3, ROW('a', ARRAY[1]))");
+  assert.deepStrictEqual(query(db, "SELECT id FROM t ORDER BY p"), [["3"], ["1"], ["2"]]);
+  assert.deepStrictEqual(
+    query(db, "SELECT ROW('a', ARRAY[1,2]) = ROW('a', ARRAY[1,2]), ROW('a', ARRAY[1,2]) = ROW('a', ARRAY[1,3])"),
+    [["true", "false"]],
+  );
+});
+
+test("composite with an array-of-composite field (homes addr[])", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE addr AS (street text, zip int32)");
+  run(db, "CREATE TYPE person AS (name text, homes addr[])");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, who person)");
+  run(db, `INSERT INTO t VALUES (1, ROW('jo', '{"(Main,1)","(Oak,2)"}'))`);
+  const image = toImage(db, 256, 1n);
+  const loaded = loadDatabase(image);
+  assert.deepStrictEqual(query(loaded, "SELECT (who).homes[1] FROM t WHERE id = 1"), [["(Main,1)"]]);
+});
+
+test("DROP TYPE is blocked by an array-typed field dependent", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE addr AS (street text, zip int32)");
+  run(db, "CREATE TYPE person AS (name text, homes addr[])");
+  assert.equal(errCode(() => run(db, "DROP TYPE addr")), "2BP01");
+  run(db, "DROP TYPE person");
+  run(db, "DROP TYPE addr");
+});
+
+test("DROP TYPE is blocked by an array-typed column dependent", () => {
+  const db = new Database();
+  run(db, "CREATE TYPE addr AS (street text, zip int32)");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])");
+  assert.equal(errCode(() => run(db, "DROP TYPE addr")), "2BP01");
+});
+
+test("array field errors: typmod 0A000, unknown element 42704", () => {
+  const db = new Database();
+  assert.equal(errCode(() => run(db, "CREATE TYPE t AS (xs decimal(10,2)[])")), "0A000");
+  assert.equal(errCode(() => run(db, "CREATE TYPE t2 AS (xs nope[])")), "42704");
 });

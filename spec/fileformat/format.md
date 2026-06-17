@@ -360,16 +360,22 @@ A composite-type entry records a `CREATE TYPE name AS (field type, …)` definit
 | per field (×`field_count`): | |
 | &nbsp;&nbsp;`field_name_len` | u16 |
 | &nbsp;&nbsp;`field_name` | UTF-8 (original case) |
-| &nbsp;&nbsp;`field_type_code` | u8 (the *Stable type codes* table; `14` = a nested composite) |
+| &nbsp;&nbsp;`field_type_code` | u8 (the *Stable type codes* table; `14` = a nested composite, `15` = an array-typed field) |
 | &nbsp;&nbsp;`field_type_name_len` | u16 — **only when `field_type_code == 14`** |
 | &nbsp;&nbsp;`field_type_name` | UTF-8 — **only when `field_type_code == 14`**: the referenced composite type's name |
+| &nbsp;&nbsp;`field_element_descriptor` | **only when `field_type_code == 15`**: the array element-type descriptor (a `u8 element_type_code`, then `14` + `u16 name_len` + name for a composite element) — the same descriptor an array *column* uses (the *Each catalog entry* table), one level down |
 | &nbsp;&nbsp;`field_flags` | u8 — bit0 `not_null` (declared `NOT NULL`); bits 1–7 reserved, written 0 (a set reserved bit is `XX001`) |
 | &nbsp;&nbsp;`precision` | u16 — **only when `field_type_code == 6` (decimal)**; `0` = unconstrained |
 | &nbsp;&nbsp;`scale` | u16 — **only when `field_type_code == 6` (decimal)** |
 
 Fields are emitted in **declaration order** (the order they appear in `CREATE TYPE`). A field
-type code of `14` references another composite **by name** (nested composites); the loader's
-two-pass validation rejects a dangling reference or a definition cycle (`XX001`).
+type code of `14` references another composite **by name** (nested composites); a field type code
+of `15` is an **array-typed field** (`xs int32[]`, [../design/array.md §12](../design/array.md) —
+the mirror of an array-of-composite element), carrying the inline element descriptor **before** the
+flags byte (where a nested-composite name sits) so the element type is self-describing. The
+loader's two-pass validation rejects a dangling reference or a definition cycle — including a
+composite reached **through an array field** — as `XX001` (a v10 additive extension; no
+`format_version` bump, since an array element descriptor is already a v10 shape).
 
 ### Check-expression text
 

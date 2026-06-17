@@ -1,0 +1,135 @@
+# A composite type with an ARRAY-typed field (spec/design/array.md §12 — the mirror of the
+# array-of-composite element type, types/array_composite.test). CREATE TYPE poly AS (name text,
+# pts int32[]) declares a composite whose field is a structural T[]. No format_version bump (still
+# 10): the catalog composite-type entry gains a field_type_code 15 + the inline element descriptor
+# (§3); the value codec / comparison / record_out / record_in all recurse for free through the array
+# field. This corpus constructs via ROW(name, '{…}') / ROW(name, ARRAY[…]) — the array field as a
+# text literal coerced through array_in, or the ARRAY[…] constructor — exactly the INSERT forms a
+# composite column already takes (a bare string into a composite column needs ROW(…), like
+# composite.test). It pins: record_out rendering the array field via array_out (the two quoting
+# layers nest); the '(…)'::poly cast parsing it through record_in/array_in; field access (p).pts +
+# subscript (p).pts[i]; whole-value comparison / ORDER BY using the composite 3VL fold over the
+# array field's btree (always-definite) comparison; the whole-value IS NULL rule; and the
+# doubly-nested array-of-composite field (homes addr[]). record_out / array_out match PostgreSQL
+# byte-for-byte. Type name avoids PG's geometric builtins.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, types.composite_array_field, types.composite, types.array, types.array_composite, expr.array_subscript, types.int32, types.text, resource.cost_metering
+
+statement ok
+CREATE TYPE poly AS (name text, pts int32[])
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, p poly)
+
+# The array field as a text literal (array_in coerces "{10,20,30}" to int32[]).
+statement ok
+INSERT INTO t VALUES (1, ROW('a', '{10,20,30}'))
+
+# The array field via the ARRAY[…] constructor.
+statement ok
+INSERT INTO t VALUES (2, ROW('b', ARRAY[4, 5]))
+
+# An empty array field {} and a NULL array field are distinct.
+statement ok
+INSERT INTO t VALUES (3, ROW('c', '{}'))
+
+statement ok
+INSERT INTO t VALUES (4, ROW('d', NULL))
+
+# A whole-value NULL composite (column omitted → NULL; a bare NULL into a composite column needs
+# ROW(…) or column omission, like composite.test).
+statement ok
+INSERT INTO t (id) VALUES (5)
+
+# record_out renders the array field via array_out, then quotes it (it contains braces/commas). The
+# NULL array field is the empty inter-delimiter string; the empty array field is {}.
+query IT nosort
+SELECT id, p FROM t ORDER BY id
+----
+1
+(a,"{10,20,30}")
+2
+(b,"{4,5}")
+3
+(c,{})
+4
+(d,)
+5
+NULL
+
+# The PG-portable record_in cast: a '(…)'::poly literal whose array field is written in array_in form.
+query T nosort
+SELECT '(z,"{7,8}")'::poly
+----
+(z,"{7,8}")
+
+# Field access reads the whole array field; subscripting it reads an element (1-based).
+query T nosort
+SELECT (p).pts FROM t WHERE id = 1
+----
+{10,20,30}
+
+query I nosort
+SELECT (p).pts[2] FROM t WHERE id = 1
+----
+20
+
+# Whole-value IS NULL tests only the SQL-NULL composite (id 5); a composite with an empty / NULL
+# array field is NOT NULL (the array field is a non-NULL value, or the field is one immediate NULL
+# among present ones — PG's all-fields rule).
+query I nosort
+SELECT id FROM t WHERE p IS NULL ORDER BY id
+----
+5
+
+# Comparison and ordering: the composite 3VL fold uses the array field's btree (always-definite)
+# comparison; the lexicographic sort uses the array total order ({1} < {1,2} < {1,3}).
+statement ok
+CREATE TABLE t2 (id int32 PRIMARY KEY, p poly)
+
+statement ok
+INSERT INTO t2 VALUES (1, ROW('a', ARRAY[1, 2])), (2, ROW('a', ARRAY[1, 3])), (3, ROW('a', ARRAY[1]))
+
+query I nosort
+SELECT id FROM t2 ORDER BY p
+----
+3
+1
+2
+
+query BB nosort
+SELECT ROW('a', ARRAY[1,2]) = ROW('a', ARRAY[1,2]), ROW('a', ARRAY[1,2]) = ROW('a', ARRAY[1,3])
+----
+true
+false
+
+query BB nosort
+SELECT ROW('a', ARRAY[1,2]) < ROW('a', ARRAY[1,3]), ROW('a', ARRAY[1]) < ROW('a', ARRAY[1,2])
+----
+true
+true
+
+# The doubly-nested case: a composite type with an array-of-composite field (homes addr[]). The
+# catalog field carries element code 14 + name; the value codec nests array-over-composite, and the
+# record_in / array_in / record_out quoting layers all nest.
+statement ok
+CREATE TYPE addr AS (street text, zip int32)
+
+statement ok
+CREATE TYPE person AS (name text, homes addr[])
+
+statement ok
+CREATE TABLE p2 (id int32 PRIMARY KEY, who person)
+
+statement ok
+INSERT INTO p2 VALUES (1, ROW('jo', '{"(Main,1)","(Oak,2)"}'))
+
+query T nosort
+SELECT (who).homes[1] FROM p2 WHERE id = 1
+----
+(Main,1)
+
+query T nosort
+SELECT who FROM p2 WHERE id = 1
+----
+(jo,"{""(Main,1)"",""(Oak,2)""}")

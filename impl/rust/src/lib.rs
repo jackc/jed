@@ -88,6 +88,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Array-of-composite element types (array.md §12 AC1) — a composite is a first-class array
     // element type (addr[]); the per-element compare routes through the composite total order.
     "types.array_composite",
+    // A composite type with an array-typed field (array.md §12 — the mirror nesting) — the catalog
+    // composite-type entry gains a code-15 array field; the codec/comparison/text-I/O recurse.
+    "types.composite_array_field",
     // Array function/operator surface AF1 (array-functions.md): the polymorphic anyarray/anyelement
     // resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
     // (array_append/prepend/cat).

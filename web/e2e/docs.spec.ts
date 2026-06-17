@@ -64,6 +64,18 @@ test('the select page runs the array-of-composite demo live (field access into a
 	await expect(panel.getByTestId('result-rows')).toContainText('90210');
 });
 
+test('the select page runs the composite-with-array-field demo live (field access + subscript)', async ({
+	page,
+}) => {
+	await page.goto('/docs/sql/select/');
+	// Ninth LiveSql panel = the poly(name, pts int32[]) demo: row 1 renders its array field
+	// {10,20,30}, (p).pts reads the whole array, and (p).pts[1] reads the first element 10 —
+	// a composite type with an array-typed field (array.md §12, the mirror of array-of-composite).
+	const panel = page.getByTestId('live-sql').nth(8);
+	await expect(panel.getByTestId('result-rows')).toContainText('{10,20,30}');
+	await expect(panel.getByTestId('result-rows')).toContainText('10');
+});
+
 test('the reference pages are generated from the spec', async ({ page }) => {
 	await page.goto('/docs/reference/errors/');
 	// 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.

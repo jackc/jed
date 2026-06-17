@@ -70,6 +70,7 @@ import {
   type Type,
   canonicalName,
   arrayT,
+  compositeRefName,
   compositeT,
   isCompositeType,
   inRange,
@@ -276,16 +277,20 @@ export class Snapshot {
   // Returns the first dependent's description for the error detail, or null if there are none.
   compositeDependent(name: string): string | null {
     const key = name.toLowerCase();
+    // compositeRefName looks through one array level, so an addr[] column / field counts as a
+    // dependent of addr exactly as a bare addr one does (spec/design/array.md §12).
     for (const t of this.tables.values()) {
       for (const c of t.columns) {
-        if (c.type.kind === "composite" && c.type.name.toLowerCase() === key) {
+        const r = compositeRefName(c.type);
+        if (r !== null && r.toLowerCase() === key) {
           return `column ${c.name} of table ${t.name}`;
         }
       }
     }
     for (const ct of this.types.values()) {
       for (const f of ct.fields) {
-        if (f.type.kind === "composite" && f.type.name.toLowerCase() === key) {
+        const r = compositeRefName(f.type);
+        if (r !== null && r.toLowerCase() === key) {
           return `field ${f.name} of type ${ct.name}`;
         }
       }
@@ -298,13 +303,15 @@ export class Snapshot {
   // graph must be acyclic. A dangling or cyclic reference is a malformed file (XX001). Called once
   // after the whole catalog is read.
   validateCompositeTypes(): void {
-    // Existence: every nested-composite field names a registered type.
+    // Existence: every composite a field references (directly, or as an array element —
+    // compositeRefName looks through one array level) names a registered type.
     for (const ct of this.types.values()) {
       for (const f of ct.fields) {
-        if (f.type.kind === "composite" && this.compositeType(f.type.name) === undefined) {
+        const r = compositeRefName(f.type);
+        if (r !== null && this.compositeType(r) === undefined) {
           throw engineError(
             "data_corrupted",
-            `composite type ${ct.name} references unknown type ${f.type.name}`,
+            `composite type ${ct.name} references unknown type ${r}`,
           );
         }
       }
@@ -316,13 +323,14 @@ export class Snapshot {
       const ct = this.types.get(key);
       if (ct) {
         for (const f of ct.fields) {
-          if (f.type.kind === "composite") {
-            const ck = f.type.name.toLowerCase();
+          const r = compositeRefName(f.type);
+          if (r !== null) {
+            const ck = r.toLowerCase();
             const c = color.get(ck) ?? 0;
             if (c === 1) {
               throw engineError(
                 "data_corrupted",
-                `composite type definition cycle through ${f.type.name}`,
+                `composite type definition cycle through ${r}`,
               );
             }
             if (c === 0) visit(ck);
@@ -1391,7 +1399,25 @@ export class Database {
       }
       let fty: Type;
       let fdecimal: DecimalTypmod | null = null;
-      if (scalarTypeFromName(f.typeName) !== undefined) {
+      if (f.typeName.endsWith("[]")) {
+        // An array-typed field (spec/design/array.md §12 — the mirror of an array-of-composite
+        // element). The element is a scalar or a previously-defined composite (element_type_code
+        // 14 + name on disk); a nested-array element and an array typmod stay deferred (0A000),
+        // exactly as for an array column.
+        const base = f.typeName.slice(0, -2);
+        if (f.typeMod !== null) {
+          throw engineError("feature_not_supported", "a type modifier on an array type is not supported yet");
+        }
+        const elemScalar = scalarTypeFromName(base);
+        const baseComposite = this.compositeType(base);
+        if (elemScalar !== undefined) {
+          fty = arrayT(scalarT(elemScalar));
+        } else if (baseComposite !== undefined) {
+          fty = arrayT(compositeT(baseComposite.name));
+        } else {
+          throw engineError("undefined_object", "type does not exist: " + base);
+        }
+      } else if (scalarTypeFromName(f.typeName) !== undefined) {
         const [s, d] = resolveTypeAndTypmod(f.typeName, f.typeMod);
         fty = scalarT(s);
         fdecimal = d;
@@ -7323,7 +7349,13 @@ function coerceStringToComposite(
       nodes.push(node);
       fieldTypes.push({ name: f.name, type });
     } else if (f.type.kind === "array") {
-      throw new Error("composite field of array type is not supported this slice");
+      // An array-typed field (spec/design/array.md §12): the token is an array text literal,
+      // coerced through array_in against the element type — the same path a bare `'{…}'::T[]` cast
+      // uses, one level down. Folds to a constant array.
+      const elemCol = db.colTypeOf(f.type.elem);
+      const val = coerceStringToArray(tok, elemCol);
+      nodes.push(valueToRExpr(val));
+      fieldTypes.push({ name: f.name, type: resolvedTypeOfCol(f.type, db) });
     } else {
       const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal);
       nodes.push(node);

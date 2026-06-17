@@ -363,6 +363,17 @@ export function isArrayType(t: Type): boolean {
   return t.kind === "array";
 }
 
+// compositeRefName returns the composite type this type references, looking through one array level —
+// the name for both `addr` and `addr[]`, null for a scalar or a `scalar[]`. There is at most one
+// (arrays are over a single element; composites are referenced by name, never inlined), so the
+// dependency-tracking (DROP TYPE) and two-pass-load validation paths use this to find a composite
+// reference whether it is direct or wrapped in an array field/column (spec/design/array.md §12).
+export function compositeRefName(t: Type): string | null {
+  if (t.kind === "composite") return t.name;
+  if (t.kind === "array") return compositeRefName(t.elem);
+  return null;
+}
+
 // typeScalar returns the inner scalar type. Scalar-only paths (the integer codec, the scalar value
 // codec, the scalar resolver) call this; a composite column reaches those paths only after the
 // caller has branched on isCompositeType, so a composite here is an engine-invariant violation —

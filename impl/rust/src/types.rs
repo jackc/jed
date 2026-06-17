@@ -366,6 +366,20 @@ impl Type {
         }
     }
 
+    /// The composite type this type references, looking through **one** array level — `addr` for
+    /// both `addr` and `addr[]`, `None` for a scalar or a `scalar[]`. There can be at most one
+    /// (arrays are over a single element; composites are referenced by name, never inlined), so the
+    /// dependency-tracking (`DROP TYPE`) and two-pass-load validation paths use this to find a
+    /// composite reference whether it is direct or wrapped in an array field/column
+    /// (spec/design/array.md §12 — the array-of-composite nesting).
+    pub fn composite_ref(&self) -> Option<&CompositeRef> {
+        match self {
+            Type::Composite(r) => Some(r),
+            Type::Array(elem) => elem.composite_ref(),
+            Type::Scalar(_) => None,
+        }
+    }
+
     /// This type's canonical name for output / error messages — the scalar's canonical name, the
     /// composite's name, or `<elem>[]` for an array. Owned because an array name is computed
     /// structurally (spec/design/array.md §1: one canonical name per type, dimension-agnostic).

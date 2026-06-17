@@ -494,6 +494,25 @@ ARRAY_COMPOSITE_TABLE = {
                     [5, nil]] }]
 }.freeze
 
+# A composite type with an ARRAY-typed field (v10 — spec/design/array.md §12, the mirror of
+# array-of-composite AC1): pins the catalog composite-type entry with a code-15 array field
+# (field_type_code 15 + the inline element descriptor element_type_code 2 = int32, format.md
+# *Composite-type entry*) AND the recursive value body — a composite body (null-bitmap + present
+# fields, §4) whose `pts` field is an array body (ndim/flags/dims + element bodies). No
+# format_version bump (still 10). Row 1: both fields present (a text name + a 3-element int32[]).
+# Row 2: an EMPTY array field {} (ndim 0). Row 3: a NULL array field (the composite null-bitmap
+# marks field 1 NULL — distinct from an empty array). The cores build this via
+#   CREATE TYPE poly AS (name text, pts int32[])
+#   CREATE TABLE t (id int32 PRIMARY KEY, p poly)
+#   INSERT (1, ROW('a', '{10,20,30}')); (2, ROW('b', '{}')); (3, ROW('c', NULL))
+COMPOSITE_ARRAY_FIELD_TABLE = {
+  types: [ctype("poly", [field("name", "text"), field("pts", "int32[]")])],
+  tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("p", "poly")],
+             rows: [[1, ["a", [10, 20, 30]]],
+                    [2, ["b", []]],
+                    [3, ["c", nil]]] }]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -526,6 +545,8 @@ FIXTURES = [
     types: COMPOSITE_TYPE_TABLE[:types], tables: COMPOSITE_TYPE_TABLE[:tables] },
   { file: "array_composite_table.jed", page_size: 256,
     types: ARRAY_COMPOSITE_TABLE[:types], tables: ARRAY_COMPOSITE_TABLE[:tables] },
+  { file: "composite_array_field_table.jed", page_size: 256,
+    types: COMPOSITE_ARRAY_FIELD_TABLE[:types], tables: COMPOSITE_ARRAY_FIELD_TABLE[:tables] },
   { file: "nested_composite_table.jed", page_size: 256,
     types: NESTED_COMPOSITE_TABLE[:types], tables: NESTED_COMPOSITE_TABLE[:tables] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
@@ -858,7 +879,12 @@ def composite_type_entry_bytes(ct)
   out << u16(ct[:fields].size)
   ct[:fields].each do |f|
     out << u16(f[:name].bytesize) << f[:name].b
-    if TYPECODE.key?(f[:type])
+    if (elem = array_elem(f[:type]))
+      # An array-typed field (spec/design/array.md §12): type_code 15 + the inline element-type
+      # descriptor (§3), before the flags byte — mirroring where a nested-composite name sits.
+      out << [15].pack("C")
+      push_array_element_type(out, elem)
+    elsif TYPECODE.key?(f[:type])
       out << [TYPECODE.fetch(f[:type])].pack("C")
     else
       out << [14].pack("C") << u16(f[:type].bytesize) << f[:type].b # nested composite, by name
@@ -1308,6 +1334,11 @@ def decode_composite_type_entry(buf, pos)
       tnl, pos = take(buf, pos, 2)
       tname, pos = take(buf, pos, tnl.unpack1("n"))
       type = tname
+    elsif code == 15
+      # An array-typed field (spec/design/array.md §12): the element-type descriptor (inverse of
+      # the code-15 branch above), then (below) the flags byte. The type string carries the "[]".
+      elem, pos = read_array_element_type(buf, pos)
+      type = "#{elem}[]"
     else
       type = CODETYPE.fetch(code)
     end

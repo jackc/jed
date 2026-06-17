@@ -414,6 +414,21 @@ function arrayCompositeTableDB(): Database {
   return db;
 }
 
+// compositeArrayFieldTableDB: a composite type with an array-typed FIELD (array.md §12 — the mirror
+// of array-of-composite). The catalog composite-type entry carries a code-15 array field
+// (element_type_code 2 = int32) and the value body recurses (a composite body whose `pts` field is an
+// array body). Row 2 has an empty array field {} (ndim 0); row 3 a NULL array field (the composite
+// null-bitmap).
+function compositeArrayFieldTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TYPE poly AS (name text, pts int32[])");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+  run(db, "INSERT INTO t VALUES (1, ROW('a', '{10,20,30}'))");
+  run(db, "INSERT INTO t VALUES (2, ROW('b', '{}'))");
+  run(db, "INSERT INTO t VALUES (3, ROW('c', NULL))");
+  return db;
+}
+
 // nestedCompositeTableDB: nested composite types (a field whose type is another composite, by name)
 // used by a column with a stored nested value (S3). `point` is created first (a referenced type must
 // exist), but the on-disk order is name-sorted (`line`, `point`) — `line` sorts BEFORE the `point` it
@@ -458,6 +473,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB },
     { name: "array_table.jed", build: arrayTableDB },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB },
+    { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
   ];
   for (const c of cases) {
@@ -500,6 +516,7 @@ test("read goldens reproduces rows", () => {
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB, table: "t" },
     { name: "array_table.jed", build: arrayTableDB, table: "t" },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB, table: "t" },
+    { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },

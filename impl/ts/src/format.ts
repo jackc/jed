@@ -869,7 +869,11 @@ function compositeTypeEntryBytes(ct: CompositeType): Uint8Array {
       w.u16(tn.length);
       w.bytes(tn);
     } else if (f.type.kind === "array") {
-      throw new Error("composite field of array type is not supported this slice");
+      // An array-typed field (spec/design/array.md §12): type_code 15, then the same inline
+      // element-type descriptor an array column uses (§3), before the flags byte — mirroring where
+      // a nested-composite field's name sits.
+      w.u8(15);
+      pushArrayElementType(w, f.type.elem);
     } else {
       w.u8(typeCodeForScalar(f.type.scalar));
     }
@@ -898,6 +902,10 @@ function decodeCompositeTypeEntry(buf: Uint8Array, cur: Cursor): CompositeType {
     if (tc === 14) {
       const tn = readString(buf, cur);
       fty = compositeT(tn);
+    } else if (tc === 15) {
+      // An array-typed field (spec/design/array.md §12): the element-type descriptor, then (below)
+      // the flags byte — the inverse of the array arm in compositeTypeEntryBytes.
+      fty = arrayT(readArrayElementType(buf, cur));
     } else {
       const s = scalarForTypeCode(tc);
       if (s === undefined) throw engineError("data_corrupted", "unknown field type code");

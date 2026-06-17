@@ -686,6 +686,15 @@ func (p *Parser) parseCreateType() (*CreateType, error) {
 		if err != nil {
 			return nil, err
 		}
+		// An array-typed field (`xs int32[]`) — the same `[]` suffix a column type takes
+		// (spec/design/array.md §12); the canonical spelling carries the brackets.
+		isArray, err := p.consumeArrayBrackets()
+		if err != nil {
+			return nil, err
+		}
+		if isArray {
+			typeName += "[]"
+		}
 		notNull := false
 		if p.peekKeyword() == "not" {
 			p.advance()

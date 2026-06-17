@@ -550,6 +550,20 @@ fn array_composite_table_db() -> Database {
     db
 }
 
+/// A composite type with an array-typed FIELD (array.md §12 — the mirror of array-of-composite):
+/// the catalog composite-type entry carries a code-15 array field (`element_type_code` 2 = int32)
+/// and the value body recurses (a composite body whose `pts` field is an array body). Row 2 has an
+/// empty array field `{}` (ndim 0); row 3 a NULL array field (the composite null-bitmap).
+fn composite_array_field_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TYPE poly AS (name text, pts int32[])");
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+    run(&mut db, "INSERT INTO t VALUES (1, ROW('a', '{10,20,30}'))");
+    run(&mut db, "INSERT INTO t VALUES (2, ROW('b', '{}'))");
+    run(&mut db, "INSERT INTO t VALUES (3, ROW('c', NULL))");
+    db
+}
+
 /// Nested composite types (a field whose type is another composite, by name) used by a column
 /// with a stored nested value (S3). `point` is created first (a referenced type must exist), but
 /// the on-disk order is name-sorted (`line`, `point`) — `line` sorts BEFORE the `point` it
@@ -601,6 +615,10 @@ fn write_matches_goldens() {
         ("nested_composite_table.jed", nested_composite_table_db),
         ("array_table.jed", array_table_db),
         ("array_composite_table.jed", array_composite_table_db),
+        (
+            "composite_array_field_table.jed",
+            composite_array_field_table_db,
+        ),
         ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
@@ -640,6 +658,11 @@ fn read_goldens_reproduces_rows() {
         ("nested_composite_table.jed", nested_composite_table_db, "t"),
         ("array_table.jed", array_table_db, "t"),
         ("array_composite_table.jed", array_composite_table_db, "t"),
+        (
+            "composite_array_field_table.jed",
+            composite_array_field_table_db,
+            "t",
+        ),
         ("tall_tree.jed", tall_tree_db, "t"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),

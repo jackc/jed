@@ -56,6 +56,19 @@ INSERT INTO person VALUES
        (places[1]).zip      AS first_zip
 FROM person
 ORDER BY id;`;
+
+	const compositeArrayFieldSeed = `CREATE TYPE poly AS (name text, pts int32[]);
+CREATE TABLE shapes (id int32 PRIMARY KEY, p poly);
+INSERT INTO shapes VALUES
+  (1, ROW('a', ARRAY[10, 20, 30])),
+  (2, ROW('b', ARRAY[5]));`;
+
+	const compositeArrayFieldExample = `SELECT id,
+       p,
+       (p).pts      AS points,
+       (p).pts[1]   AS first_point
+FROM shapes
+ORDER BY p;`;
 </script>
 
 <svelte:head>
@@ -138,6 +151,16 @@ element is comparable (so two arrays with matching `NULL` fields are equal and s
 a bare row comparison:
 
 <LiveSql seed={arrayCompositeSeed} query={arrayCompositeExample} rows={2} />
+
+## Composite types with array fields
+
+The nesting works the other way too: a composite type can have an **array-typed field**, so one
+row holds a list — `CREATE TYPE poly AS (name text, pts int32[])`. Build a value with `ROW(name,
+ARRAY[…])` (or write the field as a text literal, `ROW(name, '{10,20,30}')`), read the whole array
+with `(p).pts`, and subscript it with `(p).pts[1]`. Comparison and `ORDER BY` follow the row order
+field-by-field, using the array's element-wise order for the array field:
+
+<LiveSql seed={compositeArrayFieldSeed} query={compositeArrayFieldExample} rows={2} />
 
 ## Cost
 

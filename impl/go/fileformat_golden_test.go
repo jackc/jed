@@ -455,6 +455,21 @@ func arrayCompositeTableDB(t *testing.T) *Database {
 	return db
 }
 
+// compositeArrayFieldTableDB has a composite type with an array-typed FIELD (array.md §12 — the
+// mirror of array-of-composite): the catalog composite-type entry carries a code-15 array field
+// (element_type_code 2 = int32) and the value body recurses (a composite body whose pts field is an
+// array body). Row 2 has an empty array field {} (ndim 0); row 3 a NULL array field (the composite
+// null-bitmap).
+func compositeArrayFieldTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TYPE poly AS (name text, pts int32[])")
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)")
+	run(t, db, "INSERT INTO t VALUES (1, ROW('a', '{10,20,30}'))")
+	run(t, db, "INSERT INTO t VALUES (2, ROW('b', '{}'))")
+	run(t, db, "INSERT INTO t VALUES (3, ROW('c', NULL))")
+	return db
+}
+
 // nestedCompositeTableDB has nested composite types (a field whose type is another composite, by
 // name) used by a column with a stored nested value (S3). point is created first (a referenced type
 // must exist), but the on-disk order is name-sorted (line, point) — line sorts BEFORE the point it
@@ -502,6 +517,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"nested_composite_table.jed", nestedCompositeTableDB},
 		{"array_table.jed", arrayTableDB},
 		{"array_composite_table.jed", arrayCompositeTableDB},
+		{"composite_array_field_table.jed", compositeArrayFieldTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -549,6 +565,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},
 		{"array_table.jed", arrayTableDB, "t"},
 		{"array_composite_table.jed", arrayCompositeTableDB, "t"},
+		{"composite_array_field_table.jed", compositeArrayFieldTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

@@ -563,3 +563,178 @@ fn types_persist_through_image() {
     // The table and its row survive too.
     assert_eq!(loaded.table("t").unwrap().columns.len(), 2);
 }
+
+// --- a composite type with an array-typed field (spec/design/array.md §12 — the mirror of an
+// array-of-composite element). The catalog persists the array field as type_code 15 + the inline
+// element descriptor; the value codec / comparison / text-I/O all recurse for free. ---
+
+/// `CREATE TYPE t AS (xs int32[])` registers an array-typed field.
+#[test]
+fn create_type_with_array_field_registers() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE poly AS (name text, pts int32[])");
+    let ct = db.composite_type("poly").expect("type poly");
+    assert_eq!(ct.fields.len(), 2);
+    assert_eq!(ct.fields[1].name, "pts");
+    assert_eq!(
+        ct.fields[1].ty,
+        Type::Array(Box::new(Type::Scalar(jed::types::ScalarType::Int32)))
+    );
+}
+
+/// A composite with an array field round-trips through INSERT/SELECT via the `'(…)'::type` text
+/// literal (the array field is written in `array_in` / `record_in` nested-quoting form) and the
+/// `ROW(ARRAY[…])` constructor; `record_out` renders the array field via `array_out`.
+#[test]
+fn composite_with_array_field_value_roundtrip() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE poly AS (name text, pts int32[])");
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+    // The ROW(…) constructor with the array field as a text literal (coerced through array_in).
+    run(&mut db, "INSERT INTO t VALUES (1, ROW('a', '{1,2,3}'))");
+    // The ROW(ARRAY[…]) constructor with the field's array context.
+    run(&mut db, "INSERT INTO t VALUES (2, ROW('b', ARRAY[4, 5]))");
+    // An empty array field and a NULL array field are distinct.
+    run(&mut db, "INSERT INTO t VALUES (3, ROW('c', '{}'))");
+    run(&mut db, "INSERT INTO t VALUES (4, ROW('d', NULL))");
+    assert_eq!(
+        query(&mut db, "SELECT id, p FROM t ORDER BY id"),
+        vec![
+            vec!["1", "(a,\"{1,2,3}\")"],
+            vec!["2", "(b,\"{4,5}\")"],
+            vec!["3", "(c,{})"],
+            vec!["4", "(d,)"],
+        ]
+    );
+    // The PG-portable record_in cast: a `'(…)'::poly` literal with the array field in array_in form.
+    assert_eq!(
+        query(&mut db, "SELECT '(z,\"{7,8}\")'::poly"),
+        vec![vec!["(z,\"{7,8}\")"]]
+    );
+    // Field access reads the array field; subscripting it reads an element.
+    assert_eq!(
+        query(&mut db, "SELECT (p).pts FROM t WHERE id = 1"),
+        vec![vec!["{1,2,3}"]]
+    );
+    assert_eq!(
+        query(&mut db, "SELECT (p).pts[2] FROM t WHERE id = 1"),
+        vec![vec!["2"]]
+    );
+}
+
+/// The array field survives the on-disk image round-trip byte-for-byte (the catalog code-15 field
+/// entry + the recursive value codec); the in-memory type is rebuilt as an array.
+#[test]
+fn composite_with_array_field_image_roundtrip() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE poly AS (name text, pts int32[])");
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, ROW('a', ARRAY[1, 2, 3]))",
+    );
+    run(&mut db, "INSERT INTO t VALUES (2, ROW('b', NULL))");
+    let image = db.to_image(256, 1).unwrap();
+    let mut loaded = Database::from_image(&image).expect("reload");
+    let ct = loaded.composite_type("poly").expect("poly persists");
+    assert_eq!(
+        ct.fields[1].ty,
+        Type::Array(Box::new(Type::Scalar(jed::types::ScalarType::Int32)))
+    );
+    assert_eq!(
+        query(&mut loaded, "SELECT id, p FROM t ORDER BY id"),
+        vec![vec!["1", "(a,\"{1,2,3}\")"], vec!["2", "(b,)"]]
+    );
+}
+
+/// A composite with an array field compares / orders correctly: the composite 3VL fold uses the
+/// array field's btree comparison (always definite), and the lexicographic sort uses the array
+/// total order.
+#[test]
+fn composite_with_array_field_comparison_and_order() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE poly AS (name text, pts int32[])");
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+    run(&mut db, "INSERT INTO t VALUES (1, ROW('a', ARRAY[1, 2]))");
+    run(&mut db, "INSERT INTO t VALUES (2, ROW('a', ARRAY[1, 3]))");
+    run(&mut db, "INSERT INTO t VALUES (3, ROW('a', ARRAY[1]))");
+    // Lexicographic: name ties, then the array total order ({1} < {1,2} < {1,3}).
+    assert_eq!(
+        query(&mut db, "SELECT id FROM t ORDER BY p"),
+        vec![vec!["3"], vec!["1"], vec!["2"]]
+    );
+    // Equality through the array field is definite (the bare ROW(…) comparison form).
+    assert_eq!(
+        query(
+            &mut db,
+            "SELECT ROW('a', ARRAY[1,2]) = ROW('a', ARRAY[1,2]), \
+                    ROW('a', ARRAY[1,2]) = ROW('a', ARRAY[1,3])"
+        ),
+        vec![vec!["true", "false"]]
+    );
+}
+
+/// An array-of-composite field (`CREATE TYPE t AS (homes addr[])` — the doubly-nested case): the
+/// catalog field carries element code 14 + name, the value codec nests array-over-composite.
+#[test]
+fn composite_with_array_of_composite_field() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(&mut db, "CREATE TYPE person AS (name text, homes addr[])");
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, who person)");
+    // The array-of-composite field as a text literal: array_in tokenizes the braces, then routes
+    // each quoted element through record_in to build the addr value.
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, ROW('jo', '{\"(Main,1)\",\"(Oak,2)\"}'))",
+    );
+    let image = db.to_image(256, 1).unwrap();
+    let mut loaded = Database::from_image(&image).expect("reload");
+    // The persisted array-of-composite field re-resolves and the value round-trips.
+    assert_eq!(
+        query(&mut loaded, "SELECT (who).homes[1] FROM t WHERE id = 1"),
+        vec![vec!["(Main,1)"]]
+    );
+}
+
+/// `DROP TYPE addr` is blocked (2BP01) while a composite type has an `addr[]` field — the
+/// dependency check looks through the array level (spec/design/array.md §12).
+#[test]
+fn drop_type_blocked_by_array_field_dependent() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(&mut db, "CREATE TYPE person AS (name text, homes addr[])");
+    assert_eq!(err(&mut db, "DROP TYPE addr"), "2BP01");
+    // Dropping the dependent first frees it.
+    run(&mut db, "DROP TYPE person");
+    run(&mut db, "DROP TYPE addr");
+}
+
+/// `DROP TYPE addr` is blocked while a *table column* is `addr[]` too (the same look-through).
+#[test]
+fn drop_type_blocked_by_array_column_dependent() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(
+        &mut db,
+        "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])",
+    );
+    assert_eq!(err(&mut db, "DROP TYPE addr"), "2BP01");
+}
+
+/// A type modifier on an array field is rejected (0A000), like an array column's.
+#[test]
+fn array_field_type_modifier_is_0a000() {
+    let mut db = Database::new();
+    assert_eq!(
+        err(&mut db, "CREATE TYPE t AS (xs decimal(10,2)[])"),
+        "0A000"
+    );
+}
+
+/// An unknown element type in an array field is 42704.
+#[test]
+fn array_field_unknown_element_is_42704() {
+    let mut db = Database::new();
+    assert_eq!(err(&mut db, "CREATE TYPE t AS (xs nope[])"), "42704");
+}

@@ -101,9 +101,12 @@ layout in [../fileformat/format.md](../fileformat/format.md)):
   chain, no meta-page change.
 - **Composite-type entry:** `entry_kind = 1`, `name_len u16` + name, `field_count u16`, then per
   field — `field_name_len u16` + name, `field_type_code u8`, then (only when the field's code is
-  `14`) `field_type_name_len u16` + the referenced composite type's name, `field_flags u8`
+  `14`) `field_type_name_len u16` + the referenced composite type's name **or** (only when the
+  field's code is `15` — an **array-typed field**, [array.md §12](array.md)) the inline array
+  element-type descriptor (the same descriptor an array column uses, array.md §3), `field_flags u8`
   (bit 0 = NOT NULL), and (only when the field's code is `6`) the decimal typmod (`precision u16`,
-  `scale u16`). Reuses the existing stable scalar type codes.
+  `scale u16`). Reuses the existing stable scalar type codes. The array field descriptor sits
+  **before** the flags byte, exactly where a nested-composite name does.
 - **Composite columns reference their type by NAME** — a composite column in a table entry stores
   `type_code = 14` followed by `type_name_len u16` + the composite type's name, occupying the slot
   a decimal column uses for its typmod. By-name (not a numeric id) is the boring, explicit choice
@@ -298,8 +301,14 @@ byte-identically from live PG (two documented comparison-error-code overrides); 
 composite is a first-class array element type (the recursive codec/comparator/text-I/O composed for
 free; the per-element array comparison routes through the composite *total order*, not 3VL —
 array.md §5). The **mirror** nesting — a composite type with an **array-typed field**
-(`CREATE TYPE t AS (xs int32[])`) — remains a deferred `0A000` (it touches the composite-type
-*catalog* serialization, a distinct on-disk concern from the array-column path).
+(`CREATE TYPE poly AS (name text, pts int32[])`) — **landed** ([array.md §12](array.md), capability
+`types.composite_array_field`): the composite-type catalog entry gains a `field_type_code = 15`
+array field carrying the inline element descriptor (§3, no `format_version` bump — still 10), and
+the value codec / comparison / `record_out` / `record_in` recurse through the array field for free
+(an array field's `record_in` token is an array text literal coerced through `array_in`, one level
+down). The element may itself be a composite (the doubly-nested `addr[]` field, `element_type_code
+14` + name). `DROP TYPE` dependency tracking and the two-pass-load existence/acyclicity validation
+look through one array level, so an `addr[]` field (or column) is a `2BP01` dependent of `addr`.
 
 **Still narrowed (relaxed in a later slice):** `INSERT … SELECT` into a composite column and
 `UPDATE` of a composite column remain `0A000`; a composite `PRIMARY KEY` / index / `UNIQUE` stays

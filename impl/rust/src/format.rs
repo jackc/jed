@@ -1975,8 +1975,12 @@ fn composite_type_entry_bytes(ct: &CompositeType) -> Vec<u8> {
                 out.extend_from_slice(tn);
             }
             Type::Scalar(s) => out.push(type_code_for_scalar(*s)),
-            Type::Array(_) => {
-                unreachable!("composite field of array type is not supported this slice")
+            // An array-typed field (spec/design/array.md §12): type_code 15, then the same
+            // inline element-type descriptor an array column uses (§3), placed before the flags
+            // byte — mirroring where a nested-composite field's name sits.
+            Type::Array(elem) => {
+                out.push(15);
+                push_array_element_type(&mut out, elem);
             }
         }
         out.push(if f.not_null { 0b1 } else { 0 });
@@ -2010,6 +2014,11 @@ fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeT
                 Type::Composite(crate::types::CompositeRef { name: tn }),
                 None,
             )
+        } else if tc == 15 {
+            // An array-typed field (spec/design/array.md §12): the element-type descriptor, then
+            // (below) the flags byte — the inverse of the `Type::Array` arm above.
+            let elem = read_array_element_type(buf, pos)?;
+            (Type::Array(Box::new(elem)), None)
         } else {
             let s = scalar_for_type_code(tc).ok_or_else(|| corrupt("unknown field type code"))?;
             (Type::Scalar(s), None)

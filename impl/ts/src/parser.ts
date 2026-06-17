@@ -521,8 +521,11 @@ class Parser {
     const fields: TypeFieldDef[] = [];
     for (;;) {
       const fname = this.expectIdentifier();
-      const typeName = this.expectIdentifier();
+      const baseType = this.expectIdentifier();
       const typeMod = this.parseTypeMod();
+      // An array-typed field (`xs int32[]`) — the same `[]` suffix a column type takes
+      // (spec/design/array.md §12); the canonical spelling carries the brackets.
+      const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
       let notNull = false;
       if (this.peekKeyword() === "not") {
         this.advance();

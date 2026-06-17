@@ -567,3 +567,151 @@ func TestCompositeComparisonTypeErrors(t *testing.T) {
 		t.Errorf("row size mismatch: got %q, want 42804", got)
 	}
 }
+
+// --- a composite type with an array-typed field (spec/design/array.md §12 — the mirror of an
+// array-of-composite element). The catalog persists the array field as type_code 15 + the inline
+// element descriptor; the value codec / comparison / text-I/O all recurse. Mirrors the Rust tests. ---
+
+// TestCreateTypeWithArrayFieldRegisters: `CREATE TYPE t AS (xs int32[])` registers an array field.
+func TestCreateTypeWithArrayFieldRegisters(t *testing.T) {
+	db := NewDatabase()
+	runComposite(t, db, "CREATE TYPE poly AS (name text, pts int32[])")
+	ct := db.CompositeType("poly")
+	if ct == nil || len(ct.Fields) != 2 {
+		t.Fatalf("poly wrong: %+v", ct)
+	}
+	if ct.Fields[1].Name != "pts" || ct.Fields[1].Type.Array == nil ||
+		ct.Fields[1].Type.Array.ScalarTy() != Int32 {
+		t.Errorf("field 1 should be int32[], got %+v", ct.Fields[1].Type)
+	}
+}
+
+// TestCompositeWithArrayFieldValueRoundtrip: a composite with an array field round-trips through
+// INSERT (ROW with the array field as a text literal / ARRAY[…]) and SELECT; record_out renders the
+// array field via array_out; the PG-portable `'(…)'::poly` cast parses it via record_in/array_in.
+func TestCompositeWithArrayFieldValueRoundtrip(t *testing.T) {
+	db := NewDatabase()
+	runComposite(t, db, "CREATE TYPE poly AS (name text, pts int32[])")
+	runComposite(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)")
+	runComposite(t, db, "INSERT INTO t VALUES (1, ROW('a', '{1,2,3}'))")
+	runComposite(t, db, "INSERT INTO t VALUES (2, ROW('b', ARRAY[4, 5]))")
+	runComposite(t, db, "INSERT INTO t VALUES (3, ROW('c', '{}'))")
+	runComposite(t, db, "INSERT INTO t VALUES (4, ROW('d', NULL))")
+	got := queryRendered(t, db, "SELECT id, p FROM t ORDER BY id")
+	want := [][]string{
+		{"1", `(a,"{1,2,3}")`}, {"2", `(b,"{4,5}")`}, {"3", "(c,{})"}, {"4", "(d,)"},
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("rows = %v, want %v", got, want)
+	}
+	if got, want := queryRendered(t, db, `SELECT '(z,"{7,8}")'::poly`), [][]string{{`(z,"{7,8}")`}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("record_in cast: got %v, want %v", got, want)
+	}
+	if got, want := queryRendered(t, db, "SELECT (p).pts FROM t WHERE id = 1"), [][]string{{"{1,2,3}"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("field access: got %v, want %v", got, want)
+	}
+	if got, want := queryRendered(t, db, "SELECT (p).pts[2] FROM t WHERE id = 1"), [][]string{{"2"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("subscript: got %v, want %v", got, want)
+	}
+}
+
+// TestCompositeWithArrayFieldImageRoundtrip: the array field survives the on-disk image round-trip
+// (the catalog code-15 field entry + the recursive value codec).
+func TestCompositeWithArrayFieldImageRoundtrip(t *testing.T) {
+	db := NewDatabase()
+	runComposite(t, db, "CREATE TYPE poly AS (name text, pts int32[])")
+	runComposite(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)")
+	runComposite(t, db, "INSERT INTO t VALUES (1, ROW('a', ARRAY[1, 2, 3]))")
+	runComposite(t, db, "INSERT INTO t VALUES (2, ROW('b', NULL))")
+	image, err := db.ToImage(256, 1)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	loaded, err := LoadDatabase(image)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	ct := loaded.CompositeType("poly")
+	if ct == nil || ct.Fields[1].Type.Array == nil || ct.Fields[1].Type.Array.ScalarTy() != Int32 {
+		t.Fatalf("poly array field did not persist: %+v", ct)
+	}
+	got := queryRendered(t, loaded, "SELECT id, p FROM t ORDER BY id")
+	want := [][]string{{"1", `(a,"{1,2,3}")`}, {"2", "(b,)"}}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("rows = %v, want %v", got, want)
+	}
+}
+
+// TestCompositeWithArrayFieldComparisonAndOrder: the composite 3VL fold uses the array field's
+// btree comparison (always definite); the lexicographic sort uses the array total order.
+func TestCompositeWithArrayFieldComparisonAndOrder(t *testing.T) {
+	db := NewDatabase()
+	runComposite(t, db, "CREATE TYPE poly AS (name text, pts int32[])")
+	runComposite(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)")
+	runComposite(t, db, "INSERT INTO t VALUES (1, ROW('a', ARRAY[1, 2]))")
+	runComposite(t, db, "INSERT INTO t VALUES (2, ROW('a', ARRAY[1, 3]))")
+	runComposite(t, db, "INSERT INTO t VALUES (3, ROW('a', ARRAY[1]))")
+	if got, want := queryRendered(t, db, "SELECT id FROM t ORDER BY p"), [][]string{{"3"}, {"1"}, {"2"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("order: got %v, want %v", got, want)
+	}
+	got := queryRendered(t, db, "SELECT ROW('a', ARRAY[1,2]) = ROW('a', ARRAY[1,2]), ROW('a', ARRAY[1,2]) = ROW('a', ARRAY[1,3])")
+	if want := [][]string{{"true", "false"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("equality: got %v, want %v", got, want)
+	}
+}
+
+// TestCompositeWithArrayOfCompositeField: the doubly-nested case (homes addr[]) — the field carries
+// element code 14 + name; the value codec nests array-over-composite; it survives the image round-trip.
+func TestCompositeWithArrayOfCompositeField(t *testing.T) {
+	db := NewDatabase()
+	runComposite(t, db, "CREATE TYPE addr AS (street text, zip int32)")
+	runComposite(t, db, "CREATE TYPE person AS (name text, homes addr[])")
+	runComposite(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, who person)")
+	runComposite(t, db, `INSERT INTO t VALUES (1, ROW('jo', '{"(Main,1)","(Oak,2)"}'))`)
+	image, err := db.ToImage(256, 1)
+	if err != nil {
+		t.Fatalf("serialize: %v", err)
+	}
+	loaded, err := LoadDatabase(image)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got, want := queryRendered(t, loaded, "SELECT (who).homes[1] FROM t WHERE id = 1"), [][]string{{"(Main,1)"}}; !reflect.DeepEqual(got, want) {
+		t.Errorf("array-of-composite field access: got %v, want %v", got, want)
+	}
+}
+
+// TestDropTypeBlockedByArrayFieldDependent: DROP TYPE addr is 2BP01 while a composite type has an
+// addr[] field; dropping the dependent first frees it.
+func TestDropTypeBlockedByArrayFieldDependent(t *testing.T) {
+	db := NewDatabase()
+	runComposite(t, db, "CREATE TYPE addr AS (street text, zip int32)")
+	runComposite(t, db, "CREATE TYPE person AS (name text, homes addr[])")
+	if got := errComposite(t, db, "DROP TYPE addr"); got != "2BP01" {
+		t.Errorf("DROP TYPE addr: got %q, want 2BP01", got)
+	}
+	runComposite(t, db, "DROP TYPE person")
+	runComposite(t, db, "DROP TYPE addr")
+}
+
+// TestDropTypeBlockedByArrayColumnDependent: DROP TYPE addr is 2BP01 while a table column is addr[].
+func TestDropTypeBlockedByArrayColumnDependent(t *testing.T) {
+	db := NewDatabase()
+	runComposite(t, db, "CREATE TYPE addr AS (street text, zip int32)")
+	runComposite(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])")
+	if got := errComposite(t, db, "DROP TYPE addr"); got != "2BP01" {
+		t.Errorf("DROP TYPE addr: got %q, want 2BP01", got)
+	}
+}
+
+// TestArrayFieldTypeModifierIs0A000 / unknown element 42704: the array field's element gates match
+// an array column's.
+func TestArrayFieldErrors(t *testing.T) {
+	db := NewDatabase()
+	if got := errComposite(t, db, "CREATE TYPE t AS (xs decimal(10,2)[])"); got != "0A000" {
+		t.Errorf("array field typmod: got %q, want 0A000", got)
+	}
+	if got := errComposite(t, db, "CREATE TYPE t2 AS (xs nope[])"); got != "42704" {
+		t.Errorf("unknown array element: got %q, want 42704", got)
+	}
+}

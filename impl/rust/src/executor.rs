@@ -159,16 +159,24 @@ impl Snapshot {
     /// the first dependent's description for the error detail, or `None` if there are no dependents.
     pub(crate) fn composite_dependent(&self, name: &str) -> Option<String> {
         let key = name.to_ascii_lowercase();
+        // `composite_ref` looks through one array level, so an `addr[]` column / field counts as a
+        // dependent of `addr` exactly as a bare `addr` one does (spec/design/array.md §12).
         for t in self.tables.values() {
             for c in &t.columns {
-                if matches!(&c.ty, Type::Composite(r) if r.name.eq_ignore_ascii_case(&key)) {
+                if c.ty
+                    .composite_ref()
+                    .is_some_and(|r| r.name.eq_ignore_ascii_case(&key))
+                {
                     return Some(format!("column {} of table {}", c.name, t.name));
                 }
             }
         }
         for ct in self.types.values() {
             for f in &ct.fields {
-                if matches!(&f.ty, Type::Composite(r) if r.name.eq_ignore_ascii_case(&key)) {
+                if f.ty
+                    .composite_ref()
+                    .is_some_and(|r| r.name.eq_ignore_ascii_case(&key))
+                {
                     return Some(format!("field {} of type {}", f.name, ct.name));
                 }
             }
@@ -181,10 +189,11 @@ impl Snapshot {
     /// reference graph must be acyclic. A dangling or cyclic reference is a malformed file
     /// (`XX001`). Called once after the whole catalog is read.
     pub(crate) fn validate_composite_types(&self) -> Result<()> {
-        // Existence: every nested-composite field names a registered type.
+        // Existence: every composite a field references (directly, or as an array element —
+        // `composite_ref` looks through one array level) names a registered type.
         for ct in self.types.values() {
             for f in &ct.fields {
-                if let Type::Composite(r) = &f.ty {
+                if let Some(r) = f.ty.composite_ref() {
                     if self.composite_type(&r.name).is_none() {
                         return Err(EngineError::new(
                             SqlState::DataCorrupted,
@@ -202,7 +211,7 @@ impl Snapshot {
             color.insert(key.to_string(), 1);
             if let Some(ct) = snap.types.get(key) {
                 for f in &ct.fields {
-                    if let Type::Composite(r) = &f.ty {
+                    if let Some(r) = f.ty.composite_ref() {
                         let ck = r.name.to_ascii_lowercase();
                         match color.get(&ck).copied().unwrap_or(0) {
                             1 => {
@@ -1673,7 +1682,32 @@ impl Database {
                 ));
             }
             let (fty, fdecimal): (Type, Option<DecimalTypmod>) =
-                if ScalarType::from_name(&f.type_name).is_some() {
+                if let Some(base) = f.type_name.strip_suffix("[]") {
+                    // An array-typed field (spec/design/array.md §12 — the mirror of an
+                    // array-of-composite element). The element is a scalar or a *previously-defined*
+                    // composite (`element_type_code` 14 + name on disk); a nested-array element and
+                    // an array typmod (`numeric(p,s)[]`) stay deferred (0A000), exactly as for an
+                    // array column.
+                    if f.type_mod.is_some() {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "a type modifier on an array type is not supported yet".to_string(),
+                        ));
+                    }
+                    let elem = if let Some(s) = ScalarType::from_name(base) {
+                        Type::Scalar(s)
+                    } else if let Some(ctype) = self.read_snap().composite_type(base) {
+                        Type::Composite(crate::types::CompositeRef {
+                            name: ctype.name.clone(),
+                        })
+                    } else {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedObject,
+                            format!("type does not exist: {base}"),
+                        ));
+                    };
+                    (Type::Array(Box::new(elem)), None)
+                } else if ScalarType::from_name(&f.type_name).is_some() {
                     let (s, d) = resolve_type_and_typmod(&f.type_name, &f.type_mod)?;
                     (Type::Scalar(s), d)
                 } else if self.read_snap().composite_type(&f.type_name).is_some() {
@@ -10953,8 +10987,14 @@ fn coerce_string_to_composite(
                         coerce_string_to_composite(&s, nested, catalog)?
                     }
                     Type::Scalar(scalar) => coerce_string_literal(&s, *scalar, f.decimal)?,
-                    Type::Array(_) => {
-                        unreachable!("composite field of array type is not supported this slice")
+                    // An array-typed field (spec/design/array.md §12): the token is an array text
+                    // literal, coerced through `array_in` against the element type — the same path a
+                    // bare `'{…}'::T[]` cast uses, one level down. Folds to a constant array.
+                    Type::Array(elem_ty) => {
+                        let elem_col = resolve_col_type(elem_ty, &catalog.read_snap().types);
+                        let val = coerce_string_to_array(&s, &elem_col)?;
+                        let rt = resolved_type_of_col(&f.ty, catalog);
+                        (value_to_rexpr(&val), rt)
                     }
                 };
                 nodes.push(node);

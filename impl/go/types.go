@@ -331,6 +331,21 @@ func (t Type) IsComposite() bool { return t.Comp != nil }
 // IsArray reports whether this is an array type.
 func (t Type) IsArray() bool { return t.Array != nil }
 
+// CompositeRefOf returns the composite type this type references, looking through one array level —
+// the ref for both `addr` and `addr[]`, nil for a scalar or a `scalar[]`. There is at most one
+// (arrays are over a single element; composites are referenced by name, never inlined), so the
+// dependency-tracking (DROP TYPE) and two-pass-load validation paths use this to find a composite
+// reference whether it is direct or wrapped in an array field/column (spec/design/array.md §12).
+func (t Type) CompositeRefOf() *CompositeRef {
+	if t.Comp != nil {
+		return t.Comp
+	}
+	if t.Array != nil {
+		return t.Array.CompositeRefOf()
+	}
+	return nil
+}
+
 // CanonicalName is this type's canonical name for output / error messages — the scalar's
 // canonical name, the composite's name, or `<elem>[]` for an array.
 func (t Type) CanonicalName() string {

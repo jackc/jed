@@ -506,8 +506,9 @@ impl Parser {
 
     /// `CREATE TYPE <name> AS ( <field> <type> [NOT NULL] [, …] )` — a composite (row) type
     /// (spec/design/composite.md, grammar.md). At least one field (an empty list is a syntax
-    /// error); each field's type is a bare type name (built-in or a composite), resolved at
-    /// execution (42704 if unknown).
+    /// error); each field's type is a bare type name (built-in or a composite), optionally with a
+    /// trailing `[]` for an array-typed field (spec/design/array.md §12), resolved at execution
+    /// (42704 if unknown).
     fn parse_create_type(&mut self) -> Result<CreateType> {
         self.expect_keyword("create")?;
         self.expect_keyword("type")?;
@@ -517,8 +518,15 @@ impl Parser {
         let mut fields = Vec::new();
         loop {
             let fname = self.expect_identifier()?;
-            let type_name = self.expect_identifier()?;
+            let base_type = self.expect_identifier()?;
             let type_mod = self.parse_type_mod()?;
+            // An array-typed field (`xs int32[]`) — the same `[]` suffix a column type takes
+            // (spec/design/array.md §1); the canonical spelling carries the brackets.
+            let type_name = if self.consume_array_brackets()? {
+                format!("{base_type}[]")
+            } else {
+                base_type
+            };
             let mut not_null = false;
             if self.peek_keyword().as_deref() == Some("not") {
                 self.advance();
