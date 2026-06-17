@@ -400,6 +400,8 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.OperatorEval
 		case "aggregate_accumulate":
 			return Costs.AggregateAccumulate
+		case "cte_scan_row":
+			return Costs.CteScanRow
 		case "generated_row":
 			return Costs.GeneratedRow
 		default:

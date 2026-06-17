@@ -17,6 +17,7 @@ type CostSchedule struct {
 	RowProduced         int64
 	OperatorEval        int64
 	AggregateAccumulate int64
+	CteScanRow          int64
 	GeneratedRow        int64
 }
 
@@ -30,5 +31,6 @@ var Costs = CostSchedule{
 	RowProduced:         1,
 	OperatorEval:        1,
 	AggregateAccumulate: 1,
+	CteScanRow:          1,
 	GeneratedRow:        1,
 }

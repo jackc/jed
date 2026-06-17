@@ -47,7 +47,7 @@ sql_statement  ::= create_table
                  | create_index
                  | drop_index
                  | insert
-                 | query_expr
+                 | query_statement
                  | update
                  | delete
                  | begin
@@ -266,6 +266,32 @@ rollback       ::= "ROLLBACK" ("TRANSACTION" | "WORK")?
  * operands may NOT be parenthesized "(SELECT ...)". UNION / INTERSECT / EXCEPT / ALL / DISTINCT
  * are NOT reserved (§3), disambiguated positionally. */
 query_expr     ::= set_expr order_by? limit_offset?
+
+/* A query STATEMENT is a top-level query_expr optionally prefixed by a WITH clause defining one or
+ * more common table expressions (../design/cte.md). A CTE is a named, statement-local relation the
+ * FROM clause references like a table; the engine evaluates it by PostgreSQL's hybrid rule —
+ * INLINE a single-reference CTE (its body runs in place, like a derived table), MATERIALIZE a
+ * multi-reference one (body runs once, rows buffered, each reference scans the buffer), with
+ * "[NOT] MATERIALIZED" as the explicit override (../design/cost.md §3).
+ *   Each cte is a name, an OPTIONAL parenthesized column-rename list ("(a, b)" — renames the body's
+ * output columns; a count mismatch is 42P10), the keyword AS, an OPTIONAL "[NOT] MATERIALIZED"
+ * hint, and a parenthesized body "( query_expr )". A CTE is visible to LATER CTEs in the same list
+ * and to the main query and its nested subqueries — never to itself or earlier CTEs (a self/forward
+ * reference resolves no relation: 42P01). A CTE name SHADOWS a catalog table of the same name in
+ * the statement, EXCEPT inside its own body (the body resolves a same-named base table normally). A
+ * duplicate CTE name in one list is 42712. A CTE body is an INDEPENDENT query — not correlated to
+ * where it is referenced.
+ *   The WITH prefix attaches only at the STATEMENT top level this slice: a WITH inside a
+ * parenthesized subquery or another CTE body is a documented narrowing (the body production is the
+ * WITH-less query_expr). RECURSIVE (WITH RECURSIVE), data-modifying CTEs (WITH x AS (INSERT ...
+ * RETURNING ...)), and WITH on UPDATE/DELETE are deferred follow-ons (RECURSIVE → 0A000). WITH /
+ * MATERIALIZED are NOT reserved (§3). */
+query_statement ::= with_clause? query_expr
+
+with_clause    ::= "WITH" cte ("," cte)*
+
+cte            ::= identifier ("(" identifier ("," identifier)* ")")?
+                   "AS" ("NOT"? "MATERIALIZED")? "(" query_expr ")"
 
 set_expr       ::= intersect_expr (("UNION" | "EXCEPT") ("ALL" | "DISTINCT")? intersect_expr)*
 

@@ -288,3 +288,14 @@ reason = "jed: a composite compared with a non-composite is 42804 (datatype_mism
 file = "types/composite.test"
 sql = "SELECT ROW(1, 2) = ROW(1, 2, 3)"
 reason = "jed: comparing rows of different sizes is 42804 (datatype_mismatch — the comparison gate, composite.md §5). PostgreSQL raises 42601 (\"unequal number of entries in row expressions\"). A code-only divergence; both reject."
+
+# --- CTEs: two deferred narrowings jed rejects but PostgreSQL accepts (spec/design/cte.md §6).
+[[override]]
+file = "cte/errors.test"
+sql = "WITH RECURSIVE c AS (SELECT id FROM t) SELECT id FROM c"
+reason = "jed: WITH RECURSIVE is deferred this slice (0A000 — cte.md §6). PostgreSQL supports recursive CTEs and runs this (returning t's ids). A documented feature narrowing, not a behavior difference."
+
+[[override]]
+file = "cte/errors.test"
+sql = "WITH a AS (WITH b AS (SELECT id FROM t) SELECT id FROM b) SELECT id FROM a"
+reason = "jed: a WITH attaches only at the statement top level this slice, so a nested WITH inside a CTE body is a 42601 syntax error (cte.md §1/§6 — the body is the WITH-less query_expr). PostgreSQL accepts a nested WITH and runs it. A documented surface narrowing."

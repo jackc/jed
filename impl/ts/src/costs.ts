@@ -16,6 +16,7 @@ export interface CostSchedule {
   rowProduced: bigint;
   operatorEval: bigint;
   aggregateAccumulate: bigint;
+  cteScanRow: bigint;
   generatedRow: bigint;
 }
 
@@ -29,5 +30,6 @@ export const COSTS: CostSchedule = {
   rowProduced: 1n,
   operatorEval: 1n,
   aggregateAccumulate: 1n,
+  cteScanRow: 1n,
   generatedRow: 1n,
 };

@@ -1,0 +1,41 @@
+# Error surface of non-recursive common table expressions (spec/design/cte.md §4). Codes verified
+# against the live PostgreSQL 18 oracle, except the two deliberate jed narrowings recorded in
+# oracle_overrides.toml (WITH RECURSIVE and a nested WITH, both of which PostgreSQL accepts).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.cte, types.int32
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, n int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+# A duplicate CTE name in one WITH list is 42712 (duplicate_alias).
+statement error 42712
+WITH c AS (SELECT id FROM t), c AS (SELECT id FROM t) SELECT id FROM c
+
+# A self-reference is not in scope for itself (non-recursive) and no base table `c` exists: 42P01.
+statement error 42P01
+WITH c AS (SELECT id FROM c) SELECT id FROM c
+
+# A forward reference to a LATER CTE is not visible: 42P01.
+statement error 42P01
+WITH c AS (SELECT id FROM d), d AS (SELECT id FROM t) SELECT id FROM c
+
+# A column-rename list with too MANY names is 42P10 (invalid_column_reference). Too FEW is allowed
+# (a partial rename — see basic.test), matching PostgreSQL.
+statement error 42P10
+WITH c (a, b, x) AS (SELECT id, n FROM t) SELECT * FROM c
+
+# A CTE body resolves only its own scope — an unknown column is the ordinary 42703 (the body is an
+# independent query, not correlated to the reference site).
+statement error 42703
+WITH c AS (SELECT missing FROM t) SELECT id FROM c
+
+# WITH RECURSIVE is deferred this slice: 0A000 (a documented divergence — PostgreSQL runs it).
+statement error 0A000
+WITH RECURSIVE c AS (SELECT id FROM t) SELECT id FROM c
+
+# A nested WITH (inside a CTE body) is the top-level-only narrowing: the body is the WITH-less
+# query_expr, so the inner WITH is a 42601 syntax error (a documented divergence — PG accepts it).
+statement error 42601
+WITH a AS (WITH b AS (SELECT id FROM t) SELECT id FROM b) SELECT id FROM a

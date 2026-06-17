@@ -6,6 +6,7 @@ import type {
   Assignment,
   BinaryOp,
   CheckDef,
+  Cte,
   DefaultDef,
   UniqueDef,
   ColumnDef,
@@ -173,6 +174,10 @@ class Parser {
         return this.parseInsert();
       case "select":
         return this.parseQueryExpr();
+      // `WITH …` at statement start can only begin a query with common table expressions
+      // (spec/design/cte.md). `with` is non-reserved but unambiguous here.
+      case "with":
+        return this.parseWithStatement();
       case "update":
         return this.parseUpdate();
       case "delete":
@@ -709,11 +714,77 @@ class Parser {
   // applying to the whole result. A lone query (no set operator) folds the trailing clauses back
   // onto the single Select, leaving the plain-query path untouched; otherwise a SetOp is returned.
   private parseQueryExpr(): Statement {
+    return this.parseQueryExprNode();
+  }
+
+  // parseQueryExprNode parses a top-level query_expr as a QueryExpr node — a set expression plus an
+  // optional trailing ORDER BY / LIMIT / OFFSET folded onto it. The shared core of parseQueryExpr
+  // (which returns it as a Statement) and a WITH clause's main body. Unlike parseSubquery it opens
+  // no new nesting level — the body is at the statement top level.
+  private parseQueryExprNode(): QueryExpr {
     const node = this.parseSetExpr();
     const orderBy = this.parseOrderBy();
     const { limit, offset } = this.parseLimitOffsetClauses();
     // Both Select and SetOp carry orderBy/limit/offset; the spread keeps the `kind` discriminant.
     return { ...node, orderBy, limit, offset };
+  }
+
+  // parseWithStatement parses `query_statement ::= with_clause? query_expr` — a top-level query
+  // prefixed by a WITH clause defining common table expressions (spec/design/cte.md). WITH RECURSIVE
+  // is deferred (0A000); the CTE bodies and the main body are WITH-less query_exprs (the
+  // top-level-only narrowing — a nested WITH surfaces as 42601 because a body must begin with
+  // SELECT).
+  private parseWithStatement(): Statement {
+    this.expectKeyword("with");
+    // `WITH RECURSIVE …` is deferred this slice. RECURSIVE in this position is the keyword (PG
+    // reserves it), so a CTE may not be named `recursive` — a documented narrowing (cte.md §6).
+    if (this.peekKeyword() === "recursive") {
+      throw engineError("feature_not_supported", "WITH RECURSIVE is not supported yet");
+    }
+    const ctes: Cte[] = [];
+    for (;;) {
+      ctes.push(this.parseCte());
+      if (this.peek().kind === "comma") {
+        this.advance();
+      } else {
+        break;
+      }
+    }
+    const body = this.parseQueryExprNode();
+    return { kind: "with", ctes, body };
+  }
+
+  // parseCte parses one CTE: `identifier ("(" ident ("," ident)* ")")? "AS" ("NOT"? "MATERIALIZED")?
+  // "(" query_expr ")"` (spec/design/cte.md). The optional column list renames the body's output
+  // columns; [NOT] MATERIALIZED is the explicit evaluation hint. The body reuses parseSubquery (one
+  // nesting level, trailing clauses allowed) between its parens.
+  private parseCte(): Cte {
+    const name = this.expectIdentifier();
+    let columns: string[] | null = null;
+    if (this.peek().kind === "lparen") {
+      this.advance();
+      const cols = [this.expectIdentifier()];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        cols.push(this.expectIdentifier());
+      }
+      this.expect("rparen");
+      columns = cols;
+    }
+    this.expectKeyword("as");
+    let materialized: boolean | null = null;
+    if (this.peekKeyword() === "materialized") {
+      this.advance();
+      materialized = true;
+    } else if (this.peekKeyword() === "not" && this.peekKeywordAt(1) === "materialized") {
+      this.advance();
+      this.advance();
+      materialized = false;
+    }
+    this.expect("lparen");
+    const query = this.parseSubquery();
+    this.expect("rparen");
+    return { name, columns, materialized, query };
   }
 
   // parseSubquery parses a parenthesized subquery's inner query_expr (grammar.md §26): a full

@@ -379,16 +379,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       multiset semantics, trailing ORDER BY by output-column name. → [grammar.md §25](spec/design/grammar.md)
   - [ ] _follow-on:_ parenthesized operands `(SELECT …) UNION …`; ORDER BY/LIMIT inside an operand;
         ORDER BY ordinals; a set op in an `INSERT … SELECT` source.
-- [ ] **Common table expressions (`WITH`)** — `WITH name [(cols)] AS (SELECT …) [, …] SELECT …`:
-      named subqueries visible as relations in the statement's FROM (and to later CTEs in the
-      same WITH list). A CTE is essentially a **named derived table**, so it builds on the
-      derived-tables seam (the subqueries follow-on above): the scope machinery must serve
-      relations that aren't catalog tables. Decide the evaluation rule as a deterministic cost
-      contract (PG ≥12 inlines a single-reference CTE and materializes a multi-reference /
-      `MATERIALIZED` one — jed needs one defined rule, recorded in cost.md §3). Follow-on slices,
-      not this item: **`WITH RECURSIVE`** (the iterate-to-fixpoint executor + a termination story —
-      the `54P01` cost ceiling does real work there) and **data-modifying CTEs**
-      (`WITH x AS (INSERT … RETURNING …)`). _(size: L; +L for RECURSIVE; deps: derived tables)_
+- [x] **Common table expressions (`WITH`)** — `WITH name [(cols)] AS [NOT] MATERIALIZED (query)
+      [, …] <query>`: named subqueries visible as relations in the statement's FROM (and to later
+      CTEs in the same WITH list — forward-only). A CTE is a **named derived table**: the scope
+      machinery now serves relations that aren't catalog tables (the synthetic-relation seam the
+      SRF path opened, generalized to a planned body), so the inline path also lands the
+      derived-table executor internally. Evaluation follows **PostgreSQL's hybrid rule** — INLINE a
+      single-reference CTE, MATERIALIZE a multi-reference / `MATERIALIZED` one, the new
+      `cte_scan_row` cost unit metering a buffer scan (the deterministic cost contract, cost.md §3).
+      A CTE name shadows a same-named catalog table except inside its own body; a duplicate name is
+      `42712`, a self/forward reference `42P01`, too many rename aliases `42P10`, `WITH RECURSIVE`
+      `0A000`. → [cte.md](spec/design/cte.md)
+  - [ ] _follow-on:_ **`WITH RECURSIVE`** (the iterate-to-fixpoint executor + a termination story —
+        the `54P01` cost ceiling does real work there); **data-modifying CTEs**
+        (`WITH x AS (INSERT … RETURNING …)`); **`WITH` on UPDATE/DELETE**; a **nested `WITH`** inside
+        a subquery or CTE body (top-level only this slice); and the inline derived-table **syntax**
+        `FROM (SELECT …) AS t` (the executor seam landed; only the parser surface remains).
 - [x] **Set-returning functions** — `generate_series(start, stop [, step])` in FROM position, a
       synthetic one-column relation, a new `generated_row` cost unit; integer variants (timestamp
       waits on interval composition). → [functions.md §10](spec/design/functions.md)

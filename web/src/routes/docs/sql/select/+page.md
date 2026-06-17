@@ -23,6 +23,11 @@ FROM product
 WHERE price > 4
 ORDER BY price DESC;`;
 
+	const cte = `WITH kitchen AS (
+  SELECT name, price FROM product WHERE category = 'kitchen'
+)
+SELECT name, price FROM kitchen ORDER BY price DESC;`;
+
 	const unnestExample = `SELECT u AS tag
 FROM unnest(ARRAY['red', 'green', 'blue']) AS u
 ORDER BY u;`;
@@ -48,7 +53,8 @@ ORDER BY u;`;
 # Querying
 
 `SELECT` supports the usual shape: `WHERE`, `ORDER BY`, `LIMIT` / `OFFSET`, `DISTINCT`, joins,
-`GROUP BY` with `HAVING`, set operations, and subqueries. Aggregates use PostgreSQL-style widening
+`GROUP BY` with `HAVING`, set operations, subqueries, and `WITH` (common table expressions).
+Aggregates use PostgreSQL-style widening
 (for example, `sum` over `numeric` returns `numeric`, exact).
 
 Grouping and aggregation:
@@ -58,6 +64,18 @@ Grouping and aggregation:
 Filtering and ordering — edit the `WHERE` and `ORDER BY` and re-run:
 
 <LiveSql {seed} query={filtered} rows={6} />
+
+## Common table expressions (`WITH`)
+
+A `WITH` clause names a query and exposes it to the `FROM` clause like a table. Define one or more —
+each is visible to later ones and to the main query:
+
+<LiveSql {seed} query={cte} rows={4} />
+
+CTEs follow PostgreSQL's evaluation rule: a CTE referenced once is **inlined**, one referenced
+several times (or marked `MATERIALIZED`) runs once and its rows are **buffered** and reused. Add an
+optional column-rename list (`WITH t (a, b) AS (…)`). `WITH RECURSIVE` and data-modifying CTEs are
+not yet supported.
 
 ## Set-returning functions in `FROM`
 

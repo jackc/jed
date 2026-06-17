@@ -110,3 +110,14 @@ start = 1
 gen = "int_uniform"
 min = 0
 max = 99999
+
+[[bench]]
+name = "cte_materialized"
+description = "Multi-reference materialized CTE: a per-customer order-count aggregate (~100k rows) buffered once and scanned by two references (spec/design/cte.md, cost.md §3 cte_scan_row)"
+dataset = "large"
+kind = "query"
+sql = "WITH cust AS (SELECT customer_id, count(*) AS n FROM orders GROUP BY customer_id) SELECT (SELECT count(*) FROM cust WHERE n > 5) AS many, (SELECT count(*) FROM cust WHERE n <= 5) AS few"
+warmup = 3
+iterations = 20
+seed = 4207
+expect_rows_per_iter = 1

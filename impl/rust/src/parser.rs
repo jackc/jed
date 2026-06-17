@@ -5,10 +5,11 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, CreateType, DefaultDef,
-    Delete, DropIndex, DropTable, DropType, Expr, Insert, InsertSource, InsertValue, JoinClause,
-    JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItem, SelectItems, SetOp, SetOpKind,
-    Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update,
+    Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, CreateType, Cte,
+    DefaultDef, Delete, DropIndex, DropTable, DropType, Expr, Insert, InsertSource, InsertValue,
+    JoinClause, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItem, SelectItems, SetOp,
+    SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
+    Update, WithQuery,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -103,6 +104,9 @@ impl Parser {
             Some("drop") => Ok(Statement::DropTable(self.parse_drop_table()?)),
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("select") => self.parse_query_expr(),
+            // `WITH …` at statement start can only begin a query with common table expressions
+            // (spec/design/cte.md). `with` is non-reserved but unambiguous here.
+            Some("with") => self.parse_with_statement(),
             Some("update") => Ok(Statement::Update(self.parse_update()?)),
             Some("delete") => Ok(Statement::Delete(self.parse_delete()?)),
             Some("begin") | Some("start") => self.parse_begin(),
@@ -755,23 +759,103 @@ impl Parser {
     /// clauses back onto the single `Select` and is returned as `Statement::Select`, leaving the
     /// plain-query path untouched; otherwise it is a `Statement::SetOp`.
     fn parse_query_expr(&mut self) -> Result<Statement> {
+        Ok(match self.parse_query_expr_node()? {
+            QueryExpr::Select(sel) => Statement::Select(*sel),
+            QueryExpr::SetOp(so) => Statement::SetOp(*so),
+        })
+    }
+
+    /// Parse a top-level `query_expr` as a `QueryExpr` node — a set expression plus an optional
+    /// trailing `ORDER BY` / `LIMIT` / `OFFSET` folded onto it. The shared core of
+    /// `parse_query_expr` (which wraps it in a `Statement`) and a `WITH` clause's main body. Unlike
+    /// `parse_subquery` it opens no new nesting level — the body is at the statement top level.
+    fn parse_query_expr_node(&mut self) -> Result<QueryExpr> {
         let node = self.parse_set_expr()?;
         let order_by = self.parse_order_by()?;
         let (limit, offset) = self.parse_limit_offset()?;
-        match node {
+        Ok(match node {
             QueryExpr::Select(mut sel) => {
                 sel.order_by = order_by;
                 sel.limit = limit;
                 sel.offset = offset;
-                Ok(Statement::Select(*sel))
+                QueryExpr::Select(sel)
             }
             QueryExpr::SetOp(mut so) => {
                 so.order_by = order_by;
                 so.limit = limit;
                 so.offset = offset;
-                Ok(Statement::SetOp(*so))
+                QueryExpr::SetOp(so)
+            }
+        })
+    }
+
+    /// `query_statement ::= with_clause? query_expr` — a top-level query prefixed by a `WITH`
+    /// clause defining common table expressions (spec/design/cte.md). `WITH RECURSIVE` is deferred
+    /// (0A000); the CTE bodies and the main body are WITH-less `query_expr`s (the top-level-only
+    /// narrowing — a nested `WITH` surfaces as 42601 because a body must begin with `SELECT`).
+    fn parse_with_statement(&mut self) -> Result<Statement> {
+        self.expect_keyword("with")?;
+        // `WITH RECURSIVE …` is deferred this slice. RECURSIVE in this position is the keyword (PG
+        // reserves it), so a CTE may not be named `recursive` — a documented narrowing (cte.md §6).
+        if self.peek_keyword().as_deref() == Some("recursive") {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "WITH RECURSIVE is not supported yet",
+            ));
+        }
+        let mut ctes = Vec::new();
+        loop {
+            ctes.push(self.parse_cte()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
             }
         }
+        let body = self.parse_query_expr_node()?;
+        Ok(Statement::With(WithQuery { ctes, body }))
+    }
+
+    /// `cte ::= identifier ("(" ident ("," ident)* ")")? "AS" ("NOT"? "MATERIALIZED")? "("
+    /// query_expr ")"` (spec/design/cte.md). The optional column list renames the body's output
+    /// columns; `[NOT] MATERIALIZED` is the explicit evaluation hint. The body reuses
+    /// `parse_subquery` (one nesting level, trailing clauses allowed) between its parens.
+    fn parse_cte(&mut self) -> Result<Cte> {
+        let name = self.expect_identifier()?;
+        let columns = if matches!(self.peek(), Token::LParen) {
+            self.advance();
+            let mut cols = vec![self.expect_identifier()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                cols.push(self.expect_identifier()?);
+            }
+            self.expect(&Token::RParen)?;
+            Some(cols)
+        } else {
+            None
+        };
+        self.expect_keyword("as")?;
+        let materialized = match self.peek_keyword().as_deref() {
+            Some("materialized") => {
+                self.advance();
+                Some(true)
+            }
+            Some("not") if self.peek_keyword_at(1).as_deref() == Some("materialized") => {
+                self.advance();
+                self.advance();
+                Some(false)
+            }
+            _ => None,
+        };
+        self.expect(&Token::LParen)?;
+        let query = self.parse_subquery()?;
+        self.expect(&Token::RParen)?;
+        Ok(Cte {
+            name,
+            columns,
+            materialized,
+            query,
+        })
     }
 
     /// Parse a parenthesized subquery's inner `query_expr` (grammar.md §26): a full set-expression

@@ -1,0 +1,20 @@
+# CTE name shadowing (spec/design/cte.md §2): a CTE name shadows a same-named catalog table in the
+# statement, EXCEPT inside its own body (the binding is not yet in scope for itself, so the body
+# resolves the base table — matching PostgreSQL). Rows verified against the live PostgreSQL 18 oracle.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.column_alias, query.order_by, query.cte, expr.arithmetic, types.int32
+
+statement ok
+CREATE TABLE s (id int32 PRIMARY KEY)
+
+statement ok
+INSERT INTO s VALUES (1), (2)
+
+# The CTE `s` body `SELECT id + 100 ...` reads the BASE table s (ids 1, 2 → 101, 102); the outer
+# `FROM s` reads the CTE. If shadowing leaked into the body it would recurse/error; if the outer
+# read the base table the result would be 1, 2. The 101, 102 proves both rules.
+# names: id
+query I nosort
+WITH s AS (SELECT id + 100 AS id FROM s) SELECT id FROM s ORDER BY id
+----
+101
+102

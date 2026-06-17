@@ -240,6 +240,8 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.aggregateAccumulate;
       case "generated_row":
         return COSTS.generatedRow;
+      case "cte_scan_row":
+        return COSTS.cteScanRow;
       default:
         throw new Error(`cost unit ${id} has no COSTS field — update this cross-check`);
     }

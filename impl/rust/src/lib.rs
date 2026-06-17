@@ -180,6 +180,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.subquery_in",
     "query.subquery_exists",
     "query.subquery_correlated",
+    // Non-recursive common table expressions — WITH name [(cols)] AS [NOT] MATERIALIZED (query)
+    // [, ...] <query> (spec/design/cte.md).
+    "query.cte",
     // Scalar functions abs / round (per-row, valid anywhere an expression is) —
     // spec/design/functions.md §9.
     "func.abs",

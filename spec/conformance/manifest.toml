@@ -233,6 +233,10 @@ id = "query.subquery_correlated"
 description = "Correlated scalar / IN / EXISTS — the subquery references a column of an enclosing query, resolved via a scope chain (inner FROM first, then outward; nearest scope shadows). Planned once (type/structure errors raised even over an empty outer) and re-executed per outer row. Any correlation depth (parent, grandparent, ...); outer refs allowed inside an aggregate arg/select-list/HAVING as a per-row constant. A $N inside is allowed, typed by an inner context (uninferable -> 42P18). Narrowing: a correlated GROUP BY / ORDER BY key is 0A000 (degenerate) (spec/design/grammar.md §26)"
 
 [[capability]]
+id = "query.cte"
+description = "Non-recursive common table expressions — WITH name [(cols)] AS [NOT] MATERIALIZED (query) [, ...] <query> (spec/design/cte.md). A CTE is a named, statement-local relation the FROM clause references like a table; a list defines one or more, each visible to LATER CTEs in the list and to the main query + its nested subqueries (forward-only: a self/forward reference is 42P01). A CTE name shadows a same-named catalog table in the statement, except inside its own body (which resolves the base table). A body is an INDEPENDENT query — not correlated to the reference site (an outer column inside a body is 42703/42P01). Bodies may be JOINs, aggregates, or set operations. The optional column-rename list renames the body's output columns (a count mismatch is 42P10). Evaluation follows PostgreSQL's hybrid rule: a single-reference CTE is INLINED (body runs in place, like a derived table — a volatile body re-evaluates), a multi-reference or MATERIALIZED one is MATERIALIZED (body runs once, rows buffered, each reference charges cte_scan_row per buffered row; an unreferenced CTE is planned but not executed); [NOT] MATERIALIZED overrides the choice (spec/design/cost.md §3). A duplicate CTE name in one list is 42712. Narrowings: WITH attaches only at the statement top level (a nested WITH is 42601); RECURSIVE, data-modifying CTEs, and WITH on UPDATE/DELETE are deferred"
+
+[[capability]]
 id = "types.int16"
 description = "int16 / smallint scalar type"
 
@@ -663,4 +667,16 @@ capabilities = [
   "query.subquery_in",
   "query.subquery_exists",
   "query.subquery_correlated",
+]
+
+[[profile]]
+id = "cte"
+title = "subqueries + set operations + non-recursive common table expressions: WITH name [(cols)] AS [NOT] MATERIALIZED (query) [, ...] <query>, forward-only visibility, PG's hybrid inline-single / materialize-multi rule (Phase 4, spec/design/cte.md)"
+includes = "subqueries"
+capabilities = [
+  "query.cross_join",
+  "query.union",
+  "query.intersect",
+  "query.except",
+  "query.cte",
 ]

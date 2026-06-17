@@ -121,6 +121,24 @@ event  = "one aggregate accumulator update — one (input row x aggregate) folde
 # are UNMETERED, like the ORDER BY sort and the DISTINCT dedup (../design/cost.md §3).
 
 [[unit]]
+id     = "cte_scan_row"
+weight = 1
+event  = "one row read from a MATERIALIZED common-table-expression buffer at a reference site"
+# Landed with non-recursive CTEs (../design/cte.md, ../design/cost.md §3 "cte_scan_row"). A CTE
+# evaluated under PostgreSQL's hybrid rule is MATERIALIZED when referenced two or more times (or
+# marked MATERIALIZED): its body runs ONCE — accruing its own intrinsic cost (page_read /
+# storage_row_read / operator_eval / generated_row / row_produced), like any query — into a row
+# buffer, and EACH reference then scans that buffer. The buffer is a computed source, not a table
+# store (no B-tree, no node count), so a buffer scan charges neither page_read nor storage_row_read;
+# instead this unit fires once per buffered row per reference, guarded so a runaway scan still
+# aborts 54P01 deterministically. A CTE referenced exactly ONCE (and not MATERIALIZED) is INLINED
+# instead — its body runs in place at the FROM position and charges only its intrinsic cost, never
+# this unit. An unreferenced CTE is planned but not executed (no cost). DISTINCT from row_produced
+# (one per row emitted into the FINAL result): a buffered row a WHERE filters out still charges
+# cte_scan_row but not row_produced. Charged at the identical per-row point in every core
+# (CLAUDE.md §8/§13).
+
+[[unit]]
 id     = "generated_row"
 weight = 1
 event  = "one row produced by a set-returning function (e.g. generate_series) in the FROM clause"

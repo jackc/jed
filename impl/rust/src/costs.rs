@@ -15,6 +15,7 @@ pub struct CostSchedule {
     pub row_produced: i64,
     pub operator_eval: i64,
     pub aggregate_accumulate: i64,
+    pub cte_scan_row: i64,
     pub generated_row: i64,
 }
 
@@ -28,5 +29,6 @@ pub const COSTS: CostSchedule = CostSchedule {
     row_produced: 1,
     operator_eval: 1,
     aggregate_accumulate: 1,
+    cte_scan_row: 1,
     generated_row: 1,
 };

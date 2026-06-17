@@ -529,6 +529,56 @@ A correlated SRF argument (`generate_series(1, o.n)` inside a subquery) re-evalu
 and re-generates per outer row, exactly like a correlated subquery's inner re-scan (the Subqueries
 subsection) — so the generated rows accrue per outer row.
 
+### `cte_scan_row` — a materialized CTE's buffered rows, and the inline path
+
+A common table expression ([cte.md](cte.md)) is a named, statement-local relation backed by a
+planned query. jed evaluates it by PostgreSQL's **hybrid rule**, and the rule *is* the cost
+contract: it decides whether a CTE's body runs once-and-is-buffered or runs in place.
+
+- **Inlined** (referenced exactly once, not `MATERIALIZED`): the body runs **in place** at the
+  FROM position, like a derived table. It charges exactly its **intrinsic** cost — the
+  `page_read` / `storage_row_read` / `operator_eval` / `generated_row` / `row_produced` its plan
+  accrues — once per scan of that relation. Under a correlated subquery it re-runs per outer row
+  (the body re-executes), exactly like an inlined subquery's inner re-scan. No new unit; a single
+  reference costs the same as writing the body inline.
+- **Materialized** (referenced ≥ 2 times, or `MATERIALIZED`): the body runs **once**, accruing its
+  full intrinsic cost into a row buffer, and **each reference** charges one **`cte_scan_row`** per
+  buffered row — accrued **at the source** (before the row enters the join/WHERE pipeline) with a
+  `guard()` first, so a runaway scan aborts `54P01` deterministically. The buffer is a computed
+  source, not a table store, so a buffer scan charges **no** `page_read` and **no**
+  `storage_row_read` — the `generated_row` precedent: stored tables charge page+row, computed
+  sources charge their own per-row unit.
+
+`cte_scan_row` meters a **buffer read**; `row_produced` meters **emission** into the final result —
+distinct and divergent under `WHERE`/`LIMIT`, like `generated_row`. The whole formula:
+
+> `cost(WITH … main) = Σ_referenced cost(body, once) + Σ_each_materialized_reference (|buffer| ×
+> cte_scan_row) + cost(main pipeline)`
+
+A CTE **body is a query** — it runs through the ordinary query pipeline, so its result rows charge
+`row_produced` exactly as a scalar subquery's folded result does (the Subqueries subsection: a
+`(SELECT max(k) …)` charges `row_produced` for its one result row). The outer query then charges
+`row_produced` again for **its** final rows. This layering is deliberate and deterministic — an
+inlined CTE costs *more* than the same query written without the `WITH`, by the body's
+`row_produced`; jed's cost is its own cross-core contract, not PG's. An **unreferenced** CTE is
+planned and type-checked but **not executed** — it adds **0** exec cost. A CTE referenced *k* times
+(materialized) charges its body cost **once** but `k × |buffer|` `cte_scan_row`. Worked examples
+(asserted in the corpus), over a 3-row `t` whose B-tree is a single node:
+
+- `WITH c AS (SELECT * FROM t) SELECT * FROM c` — **inlined** (one reference): body = `page_read`
+  (1) + 3 `storage_row_read` + 3 `row_produced` = **7**; the outer scans the computed relation `c`
+  (no store, no `cte_scan_row`) and emits 3 rows = 3 `row_produced`. Total **10**.
+- `WITH c AS (SELECT * FROM t) SELECT * FROM c a CROSS JOIN c b` — **materialized** (two
+  references): body once = **7**, then `3 + 3 = 6` `cte_scan_row` for the two buffer scans, then 9
+  `row_produced` for the 3×3 product. Total **22**.
+- `WITH c AS (SELECT * FROM t) SELECT 1` — `c` unreferenced: **0** cost for `c`; only the
+  FROM-less `SELECT 1` (1 `row_produced`). Total **1**.
+
+The materialization runs **between plan and exec**, accruing into the **running statement cost** (a
+seed carried forward, the same accrued-seed mechanism set operations use below) — never a per-CTE
+meter that resets the ceiling, so the `54P01` abort point during materialization is cross-core
+identical (CLAUDE.md §8/§13).
+
 ### Set operations — `lhs + rhs`, the combine unmetered
 
 A set operation ([grammar.md](grammar.md) §25) — `UNION`/`INTERSECT`/`EXCEPT`, each with an

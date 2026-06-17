@@ -153,6 +153,10 @@ func (p *Parser) parseStatement() (Statement, error) {
 		return Statement{Insert: ins}, nil
 	case "select":
 		return p.parseQueryExpr()
+	// `WITH …` at statement start can only begin a query with common table expressions
+	// (spec/design/cte.md). `with` is non-reserved but unambiguous here.
+	case "with":
+		return p.parseWithStatement()
 	case "update":
 		upd, err := p.parseUpdate()
 		if err != nil {
@@ -964,31 +968,137 @@ func (p *Parser) parseLiteral() (Literal, error) {
 // the single Select and is returned as Statement{Select}, leaving the plain-query path untouched;
 // otherwise it is Statement{SetOp}.
 func (p *Parser) parseQueryExpr() (Statement, error) {
-	node, err := p.parseSetExpr()
+	node, err := p.parseQueryExprNode()
 	if err != nil {
 		return Statement{}, err
+	}
+	if node.Select != nil {
+		return Statement{Select: node.Select}, nil
+	}
+	return Statement{SetOp: node.SetOp}, nil
+}
+
+// parseQueryExprNode parses a top-level query_expr as a QueryExpr node — a set expression plus an
+// optional trailing ORDER BY / LIMIT / OFFSET folded onto it. The shared core of parseQueryExpr
+// (which wraps it in a Statement) and a WITH clause's main body. Unlike parseSubquery it opens no
+// new nesting level — the body is at the statement top level.
+func (p *Parser) parseQueryExprNode() (QueryExpr, error) {
+	node, err := p.parseSetExpr()
+	if err != nil {
+		return QueryExpr{}, err
 	}
 	// Trailing ORDER BY / LIMIT / OFFSET parse once, onto a scratch Select, then move onto the
 	// outermost node (the lone Select, or the outermost SetOp).
 	var trailing Select
 	if err := p.parseOrderBy(&trailing); err != nil {
-		return Statement{}, err
+		return QueryExpr{}, err
 	}
 	if err := p.parseLimitOffset(&trailing); err != nil {
-		return Statement{}, err
+		return QueryExpr{}, err
 	}
 	if node.Select != nil {
-		sel := node.Select
-		sel.OrderBy = trailing.OrderBy
-		sel.Limit = trailing.Limit
-		sel.Offset = trailing.Offset
-		return Statement{Select: sel}, nil
+		node.Select.OrderBy = trailing.OrderBy
+		node.Select.Limit = trailing.Limit
+		node.Select.Offset = trailing.Offset
+	} else {
+		node.SetOp.OrderBy = trailing.OrderBy
+		node.SetOp.Limit = trailing.Limit
+		node.SetOp.Offset = trailing.Offset
 	}
-	so := node.SetOp
-	so.OrderBy = trailing.OrderBy
-	so.Limit = trailing.Limit
-	so.Offset = trailing.Offset
-	return Statement{SetOp: so}, nil
+	return node, nil
+}
+
+// parseWithStatement parses `query_statement ::= with_clause? query_expr` — a top-level query
+// prefixed by a WITH clause defining common table expressions (spec/design/cte.md). WITH RECURSIVE
+// is deferred (0A000); the CTE bodies and the main body are WITH-less query_exprs (the
+// top-level-only narrowing — a nested WITH surfaces as 42601 because a body must begin with SELECT).
+func (p *Parser) parseWithStatement() (Statement, error) {
+	if err := p.expectKeyword("with"); err != nil {
+		return Statement{}, err
+	}
+	// `WITH RECURSIVE …` is deferred this slice. RECURSIVE in this position is the keyword (PG
+	// reserves it), so a CTE may not be named `recursive` — a documented narrowing (cte.md §6).
+	if p.peekKeyword() == "recursive" {
+		return Statement{}, NewError(FeatureNotSupported, "WITH RECURSIVE is not supported yet")
+	}
+	var ctes []Cte
+	for {
+		cte, err := p.parseCte()
+		if err != nil {
+			return Statement{}, err
+		}
+		ctes = append(ctes, cte)
+		if p.peek().Kind == TokComma {
+			p.advance()
+		} else {
+			break
+		}
+	}
+	body, err := p.parseQueryExprNode()
+	if err != nil {
+		return Statement{}, err
+	}
+	return Statement{With: &WithQuery{Ctes: ctes, Body: body}}, nil
+}
+
+// parseCte parses one common table expression
+// `cte ::= identifier ("(" ident ("," ident)* ")")? "AS" ("NOT"? "MATERIALIZED")? "(" query_expr
+// ")"` (spec/design/cte.md). The optional column list renames the body's output columns; [NOT]
+// MATERIALIZED is the explicit evaluation hint. The body reuses parseSubquery (one nesting level,
+// trailing clauses allowed) between its parens.
+func (p *Parser) parseCte() (Cte, error) {
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return Cte{}, err
+	}
+	var columns []string
+	if p.peek().Kind == TokLParen {
+		p.advance()
+		col, err := p.expectIdentifier()
+		if err != nil {
+			return Cte{}, err
+		}
+		columns = []string{col}
+		for p.peek().Kind == TokComma {
+			p.advance()
+			col, err := p.expectIdentifier()
+			if err != nil {
+				return Cte{}, err
+			}
+			columns = append(columns, col)
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Cte{}, err
+		}
+	}
+	if err := p.expectKeyword("as"); err != nil {
+		return Cte{}, err
+	}
+	var materialized *bool
+	switch p.peekKeyword() {
+	case "materialized":
+		p.advance()
+		t := true
+		materialized = &t
+	case "not":
+		if p.peekKeywordAt(1) == "materialized" {
+			p.advance()
+			p.advance()
+			f := false
+			materialized = &f
+		}
+	}
+	if err := p.expect(TokLParen); err != nil {
+		return Cte{}, err
+	}
+	query, err := p.parseSubquery()
+	if err != nil {
+		return Cte{}, err
+	}
+	if err := p.expect(TokRParen); err != nil {
+		return Cte{}, err
+	}
+	return Cte{Name: name, Columns: columns, Materialized: materialized, Query: query}, nil
 }
 
 // parseSubquery parses a parenthesized subquery's inner query_expr (grammar.md §26): a full

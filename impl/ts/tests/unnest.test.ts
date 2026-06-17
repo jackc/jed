@@ -19,15 +19,23 @@ function rows1(ns: number[]): string[][] {
   return ns.map((n) => [String(n)]);
 }
 
+// qOut runs a query and narrows the result to the query Outcome (so columnNames / columnTypes
+// are accessible without a union-member error).
+function qOut(db: Database, sql: string) {
+  const o = execute(db, sql);
+  if (o.kind !== "query") throw new Error(`expected a query result for ${sql}`);
+  return o;
+}
+
 test("unnest names its column at the bound element type", () => {
   const db = new Database();
   // An untyped ARRAY[…] literal is int64[] (jed's literal typing).
-  const out = execute(db, "SELECT * FROM unnest(ARRAY[10,20,30])");
+  const out = qOut(db, "SELECT * FROM unnest(ARRAY[10,20,30])");
   assert.deepStrictEqual(out.columnNames, ["unnest"]);
   assert.deepStrictEqual(out.columnTypes, ["int64"]);
   // A typed '{…}'::int32[] literal pins the element type; a text[] argument → a text column.
-  assert.deepStrictEqual(execute(db, "SELECT * FROM unnest('{1,2,3}'::int32[])").columnTypes, ["int32"]);
-  assert.deepStrictEqual(execute(db, "SELECT * FROM unnest(ARRAY['a','b'])").columnTypes, ["text"]);
+  assert.deepStrictEqual(qOut(db, "SELECT * FROM unnest('{1,2,3}'::int32[])").columnTypes, ["int32"]);
+  assert.deepStrictEqual(qOut(db, "SELECT * FROM unnest(ARRAY['a','b'])").columnTypes, ["text"]);
 });
 
 test("unnest produces a NULL element as a NULL row", () => {

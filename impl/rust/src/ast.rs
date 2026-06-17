@@ -19,6 +19,10 @@ pub enum Statement {
     /// appears only when at least one set operator is present, so the plain-query path and the
     /// host API are untouched.
     SetOp(SetOp),
+    /// A query prefixed by a `WITH` clause defining one or more common table expressions
+    /// (spec/design/cte.md). Appears only when a `WITH` is present; a plain query stays
+    /// `Select`/`SetOp`, so the host API and the no-CTE paths are untouched.
+    With(WithQuery),
     Update(Update),
     Delete(Delete),
     /// `BEGIN [TRANSACTION|WORK] [READ ONLY|READ WRITE]` / `START TRANSACTION [...]` — open an
@@ -370,6 +374,30 @@ pub struct SetOp {
     pub order_by: Vec<OrderKey>,
     pub limit: Option<i64>,
     pub offset: Option<i64>,
+}
+
+/// One common table expression in a `WITH` list (spec/design/cte.md). A named, statement-local
+/// relation backed by a query. `columns` is the optional column-rename list (renames the body's
+/// output columns left to right; a count mismatch is 42P10). `materialized` is the explicit
+/// evaluation hint: `Some(true)` = `MATERIALIZED`, `Some(false)` = `NOT MATERIALIZED`, `None` =
+/// PostgreSQL's default (inline a single-reference CTE, materialize a multi-reference one —
+/// cost.md §3). The body is any `query_expr` (a SELECT or a set operation).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct Cte {
+    pub name: String,
+    pub columns: Option<Vec<String>>,
+    pub materialized: Option<bool>,
+    pub query: QueryExpr,
+}
+
+/// A top-level query prefixed by a `WITH` clause (spec/design/cte.md). `ctes` is the non-empty
+/// list of common table expressions (each visible to later CTEs and to `body`); `body` is the
+/// main query expression. Built only when a `WITH` is present — a plain query stays
+/// `Statement::Select`/`Statement::SetOp`, so those paths are untouched (the `SetOp` precedent).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct WithQuery {
+    pub ctes: Vec<Cte>,
+    pub body: QueryExpr,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

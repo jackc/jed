@@ -28,6 +28,7 @@ import type {
   SubscriptSpec,
   TypeMod,
   Update,
+  WithQuery,
 } from "./ast.ts";
 import {
   type CheckConstraint,
@@ -793,6 +794,8 @@ export class Database {
         return this.executeSelect(stmt, params);
       case "setOp":
         return this.executeSetOp(stmt, params);
+      case "with":
+        return this.executeWith(stmt, params);
       case "update":
         return this.executeUpdate(stmt, params);
       case "delete":
@@ -1204,9 +1207,10 @@ export class Database {
     const env: EvalEnv = {
       params: [],
       outer: [],
-      runSubquery: (p, o) => this.execQueryPlan(p, o, []),
+      runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
       seam: this.seam,
       rng,
+      ctes: EMPTY_CTE_CTX,
     };
     return evalExpr(defaultRExpr, [], env, meter);
   }
@@ -1539,19 +1543,19 @@ export class Database {
       // §5). The source returns OWNED rows, so a self-insert (INSERT INTO t SELECT ... FROM
       // t) reads the pre-insert snapshot, then writes.
       const ptypes = new ParamTypes();
-      const plan = this.planQuery(ins.source.select, null, ptypes);
+      const plan = this.planQuery(ins.source.select, null, [], ptypes);
       const ret = ins.returning !== null ? this.resolveReturning(table, ins.returning, false, ptypes) : null;
       const bound = bindParams(params, ptypes.finalize());
       const meter = new Meter(this.maxCost);
       const foldCost = { value: 0n };
-      this.foldUncorrelatedInPlan(plan, bound, foldCost);
+      this.foldUncorrelatedInPlan(plan, bound, EMPTY_CTE_CTX, foldCost);
       // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
       // pre-statement snapshot (grammar.md §32).
       if (ret !== null) {
-        ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, foldCost));
+        ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost));
       }
       meter.charge(foldCost.value);
-      const q = this.execQueryPlan(plan, [], bound);
+      const q = this.execQueryPlan(plan, [], bound, EMPTY_CTE_CTX);
       // Arity: the SELECT's output column count must match the target — checked before any row is
       // produced, so it fires even when the source returns zero rows.
       if (q.columnNames.length !== arity) {
@@ -1663,7 +1667,7 @@ export class Database {
     // pre-statement snapshot (grammar.md §32).
     if (ret !== null) {
       const foldCost = { value: 0n };
-      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, foldCost));
+      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost));
       meter.charge(foldCost.value);
     }
     const returned = this.insertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, rows, ret?.nodes ?? null, bound, meter);
@@ -1730,9 +1734,10 @@ export class Database {
         const env: EvalEnv = {
           params: [],
           outer: [],
-          runSubquery: (p, o) => this.execQueryPlan(p, o, []),
+          runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
           seam: this.seam,
           rng,
+          ctes: EMPTY_CTE_CTX,
         };
         evalChecks(checks, table.name, row, env, meter);
       }
@@ -1886,7 +1891,7 @@ export class Database {
     params: Value[],
     meter: Meter,
   ): Value[][] {
-    const env: EvalEnv = { params, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, params), seam: this.seam, rng: new StmtRng() };
+    const env: EvalEnv = { params, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, params, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX };
     const out: Value[][] = [];
     rows.forEach((row, i) => {
       meter.guard();
@@ -1922,17 +1927,17 @@ export class Database {
     const meter = new Meter(this.maxCost);
     if (filter !== null) {
       const cost = { value: 0n };
-      filter = this.foldUncorrelatedInRExpr(filter, bound, cost);
+      filter = this.foldUncorrelatedInRExpr(filter, bound, EMPTY_CTE_CTX, cost);
       meter.charge(cost.value);
     }
     // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
     // pre-statement snapshot (grammar.md §32).
     if (ret !== null) {
       const cost = { value: 0n };
-      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, cost));
+      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, cost));
       meter.charge(cost.value);
     }
-    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound), seam: this.seam, rng: new StmtRng() };
+    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX };
     const store = this.working().store(del.table);
     // matched collects (key, row) pairs before mutating; the rows feed phase 2's
     // index-entry removal (indexed columns are fixed-width and always resident).
@@ -2067,13 +2072,13 @@ export class Database {
     // the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
     const meter = new Meter(this.maxCost);
     const foldCost = { value: 0n };
-    for (const p of plans) p.source = this.foldUncorrelatedInRExpr(p.source, bound, foldCost);
-    if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, foldCost);
+    for (const p of plans) p.source = this.foldUncorrelatedInRExpr(p.source, bound, EMPTY_CTE_CTX, foldCost);
+    if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, EMPTY_CTE_CTX, foldCost);
     if (ret !== null) {
-      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, foldCost));
+      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost));
     }
     meter.charge(foldCost.value);
-    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound), seam: this.seam, rng: new StmtRng() };
+    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX };
     const store = this.working().store(upd.table);
     // Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
     const updates: { key: Uint8Array; row: Row; oldRow: Row }[] = [];
@@ -2234,11 +2239,11 @@ export class Database {
   // the fold are re-executed per outer row by the evaluator.
   private runQueryExpr(qe: QueryExpr, params: Value[]): SelectResult {
     const ptypes = new ParamTypes();
-    const plan = this.planQuery(qe, null, ptypes);
+    const plan = this.planQuery(qe, null, [], ptypes);
     const bound = bindParams(params, ptypes.finalize());
     const subqueryCost = { value: 0n };
-    this.foldUncorrelatedInPlan(plan, bound, subqueryCost);
-    const r = this.execQueryPlan(plan, [], bound);
+    this.foldUncorrelatedInPlan(plan, bound, EMPTY_CTE_CTX, subqueryCost);
+    const r = this.execQueryPlan(plan, [], bound, EMPTY_CTE_CTX);
     return { ...r, cost: r.cost + subqueryCost.value };
   }
 
@@ -2252,29 +2257,101 @@ export class Database {
     return this.runQueryExpr(so, params);
   }
 
+  // executeWith runs a WITH query (spec/design/cte.md) as a top-level statement: runWith, then wrap
+  // as a query Outcome.
+  private executeWith(wq: WithQuery, params: Value[]): Outcome {
+    const r = this.runWith(wq, params);
+    return { kind: "query", columnNames: r.columnNames, columnTypes: typeNames(r.columnTypes), rows: r.rows, cost: r.cost };
+  }
+
+  // runWith runs a WITH query (spec/design/cte.md). The CTE orchestrator:
+  // (1) PLAN each CTE body in order against the prefix of earlier bindings (parent = null — a body
+  //     is an independent query, NOT correlated to a reference site), deriving each binding's
+  //     synthetic relation;
+  // (2) plan the main body with all bindings visible, threading the one ParamTypes so $N infers
+  //     statement-wide;
+  // (3) decide each CTE's mode from its reference count + [NOT] MATERIALIZED hint;
+  // (4) MATERIALIZE each referenced materialized CTE once, in list order, accruing its cost (a later
+  //     body sees the earlier buffers);
+  // (5) fold + EXECUTE the main body with the CTE context.
+  // Cost composes like set operations — a sum of the parts.
+  private runWith(wq: WithQuery, params: Value[]): SelectResult {
+    const ptypes = new ParamTypes();
+    // (1) Plan each CTE body against the already-built prefix; build its synthetic relation.
+    const bindings: CteBinding[] = [];
+    for (const cte of wq.ctes) {
+      const lname = cte.name.toLowerCase();
+      if (bindings.some((b) => b.name === lname)) {
+        throw engineError("duplicate_alias", `WITH query name ${lname} specified more than once`);
+      }
+      const plan = this.planQuery(cte.query, null, bindings, ptypes);
+      const table = cteSyntheticTable(lname, plan, cte.columns);
+      bindings.push({ name: lname, table, plan, hint: cte.materialized, refs: 0 });
+    }
+    // (2) Plan the main body with all bindings visible.
+    const plan = this.planQuery(wq.body, null, bindings, ptypes);
+    const bound = bindParams(params, ptypes.finalize());
+
+    // (3) Per-CTE evaluation mode: MATERIALIZED hint or >=2 references -> materialize, else inline
+    //     (cost.md §3). An unreferenced CTE is planned (errors surfaced) but not run.
+    const modes: CteMode[] = bindings.map((b) => {
+      if (b.hint === true) return "materialize";
+      if (b.hint === false) return "inline";
+      return b.refs >= 2 ? "materialize" : "inline";
+    });
+    const plans: QueryPlan[] = bindings.map((b) => b.plan);
+
+    // (4) Materialize each referenced materialized CTE once, in list order, accruing cost. A later
+    //     body's inline/materialized reference to an earlier CTE sees the prefix context.
+    let totalCost = 0n;
+    const buffers: Row[][] = [];
+    for (let i = 0; i < plans.length; i++) {
+      if (modes[i] === "materialize") {
+        // Earlier-only context (the prefix): a CTE body sees EARLIER CTEs, never itself or a later
+        // one (forward-only visibility — cte.md §2).
+        const ctx: CteCtx = { modes: modes.slice(0, i), plans: plans.slice(0, i), buffers };
+        const r = this.execQueryPlan(plans[i]!, [], bound, ctx);
+        totalCost += r.cost;
+        buffers.push(r.rows);
+      } else {
+        buffers.push([]);
+      }
+    }
+
+    // (5) Fold + execute the main body against the full CTE context.
+    const ctx: CteCtx = { modes, plans, buffers };
+    const subqueryCost = { value: 0n };
+    this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
+    const r = this.execQueryPlan(plan, [], bound, ctx);
+    return { ...r, cost: r.cost + subqueryCost.value + totalCost };
+  }
+
   // planQuery resolves a query expression into an owned QueryPlan against the scope chain (parent =
-  // the enclosing query's scope, null at top level). A subquery is planned here, once (§26).
+  // the enclosing query's scope, null at top level). A subquery is planned here, once (§26). `ctes`
+  // is the statement's CTE bindings visible here (spec/design/cte.md §2) — inherited into every
+  // nested scope, never via the parent chain.
   // Not private: the free function planSubquery calls it through scope.catalog (an internal seam).
-  planQuery(qe: QueryExpr, parent: Scope | null, ptypes: ParamTypes): QueryPlan {
+  planQuery(qe: QueryExpr, parent: Scope | null, ctes: CteBinding[], ptypes: ParamTypes): QueryPlan {
     return qe.kind === "select"
-      ? this.planSelect(qe, parent, ptypes)
-      : this.planSetOp(qe, parent, ptypes);
+      ? this.planSelect(qe, parent, ctes, ptypes)
+      : this.planSetOp(qe, parent, ctes, ptypes);
   }
 
   // execQueryPlan executes a resolved plan against an outer-row environment (outer = the enclosing
-  // rows, innermost last; empty at top level) and the bound parameters.
-  private execQueryPlan(plan: QueryPlan, outer: Row[], params: Value[]): SelectResult {
+  // rows, innermost last; empty at top level), the bound parameters, and the CTE context (a FROM
+  // reference at any depth delivers a CTE's rows — spec/design/cte.md §5).
+  private execQueryPlan(plan: QueryPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
     return plan.kind === "select"
-      ? this.execSelectPlan(plan, outer, params)
-      : this.execSetOpPlan(plan, outer, params);
+      ? this.execSelectPlan(plan, outer, params, ctes)
+      : this.execSetOpPlan(plan, outer, params, ctes);
   }
 
   // planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
   // parent scope, check arity + unify column types up front (so the 42601/42804 fire even over
   // empty operands), and resolve the trailing ORDER BY by output column name.
-  private planSetOp(so: SetOp, parent: Scope | null, ptypes: ParamTypes): SetOpPlan {
-    const lhs = this.planQuery(so.lhs, parent, ptypes);
-    const rhs = this.planQuery(so.rhs, parent, ptypes);
+  private planSetOp(so: SetOp, parent: Scope | null, ctes: CteBinding[], ptypes: ParamTypes): SetOpPlan {
+    const lhs = this.planQuery(so.lhs, parent, ctes, ptypes);
+    const rhs = this.planQuery(so.rhs, parent, ctes, ptypes);
 
     if (lhs.columnTypes.length !== rhs.columnTypes.length) {
       throw engineError(
@@ -2306,9 +2383,9 @@ export class Database {
   // execSetOpPlan executes a resolved set operation: run both operands against the outer
   // environment, coerce to the unified types, combine, then sort + window. Cost is lhs.cost +
   // rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
-  private execSetOpPlan(plan: SetOpPlan, outer: Row[], params: Value[]): SelectResult {
-    const left = this.execQueryPlan(plan.lhs, outer, params);
-    const right = this.execQueryPlan(plan.rhs, outer, params);
+  private execSetOpPlan(plan: SetOpPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
+    const left = this.execQueryPlan(plan.lhs, outer, params, ctes);
+    const right = this.execQueryPlan(plan.rhs, outer, params, ctes);
 
     coerceSetopRows(left.rows, left.columnTypes, plan.columnTypes);
     coerceSetopRows(right.rows, right.columnTypes, plan.columnTypes);
@@ -2343,7 +2420,7 @@ export class Database {
   // query's scope, for correlated references — grammar.md §26). The resolve half of the old
   // runSelect: build the FROM scope, resolve every clause, infer $N types into ptypes. No row is
   // touched and no parameter is bound here (runQueryExpr binds once, after the whole tree is planned).
-  private planSelect(sel: Select, parent: Scope | null, ptypes: ParamTypes): SelectPlan {
+  private planSelect(sel: Select, parent: Scope | null, ctes: CteBinding[], ptypes: ParamTypes): SelectPlan {
     // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
     // relation's flat column offset in FROM order, and reject a duplicate label — a self-join
     // without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less SELECT
@@ -2363,25 +2440,37 @@ export class Database {
     for (const tref of tableRefs) {
       let t: Table;
       let srf: SrfPlan | undefined;
+      let cteIdx: number | undefined;
       if (tref.args !== null) {
-        const r = this.resolveSRF(tref.name, tref.args, tref.alias, parent, ptypes);
+        const r = this.resolveSRF(tref.name, tref.args, tref.alias, parent, ctes, ptypes);
         t = r.table;
         srf = r.srf;
       } else {
-        const tbl = this.table(tref.name);
-        if (!tbl) throw engineError("undefined_table", "table does not exist: " + tref.name);
-        t = tbl;
+        // A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog table of
+        // the same name (cte.md §2); lookup is case-insensitive. A hit bumps the binding's reference
+        // count (the inline-vs-materialize decision — cost.md §3).
+        const lname = tref.name.toLowerCase();
+        const ci = ctes.findIndex((b) => b.name === lname);
+        if (ci >= 0) {
+          ctes[ci]!.refs += 1;
+          t = ctes[ci]!.table;
+          cteIdx = ci;
+        } else {
+          const tbl = this.table(tref.name);
+          if (!tbl) throw engineError("undefined_table", "table does not exist: " + tref.name);
+          t = tbl;
+        }
       }
       const label = (tref.alias ?? t.name).toLowerCase();
       if (seenLabels.has(label)) {
         throw engineError("duplicate_alias", "table name " + label + " specified more than once");
       }
       seenLabels.add(label);
-      rels.push({ label, table: t, offset });
+      rels.push({ label, table: t, offset, cte: cteIdx });
       srfPlans.push(srf);
       offset += t.columns.length;
     }
-    const scope = new Scope(rels, this, parent, true);
+    const scope = new Scope(rels, this, parent, true, ctes);
 
     // Resolve GROUP BY keys to flat row indices (a key is a bare/qualified column — grammar.md
     // §18). An unknown column is 42703, an ambiguous bare key 42702. An outer (correlated) key —
@@ -2480,7 +2569,7 @@ export class Database {
     // same parent chain, so a correlated reference in an ON predicate resolves outward (§26).
     const joins: PlanJoin[] = sel.joins.map((j, k) => {
       if (j.on === null) return { kind: j.kind, on: null };
-      const partial = new Scope(scope.rels.slice(0, k + 2), this, parent, true);
+      const partial = new Scope(scope.rels.slice(0, k + 2), this, parent, true, ctes);
       return { kind: j.kind, on: resolveBooleanFilter(partial, j.on, ptypes) };
     });
 
@@ -2493,9 +2582,12 @@ export class Database {
     // joins too: a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows, so
     // bounding it cannot drop a surviving row. A no-PK relation gets null (full scan).
     // A set-returning relation is a computed row source with no PK/index — it never bounds
-    // (functions.md §10), so skip detection for it.
+    // (functions.md §10), so skip detection for it. A CTE reference is likewise a computed/buffered
+    // source with no store PK (cte.md §5), so skip it too.
     const relBounds: (ScanBound | null)[] = rels.map((rel, i) =>
-      filter === null || srfPlans[i] !== undefined ? null : detectScanBound(filter, rel),
+      filter === null || srfPlans[i] !== undefined || rel.cte !== undefined
+        ? null
+        : detectScanBound(filter, rel),
     );
 
     // Assemble the owned plan (table NAMES + offsets/widths replace the scope's tables, so the
@@ -2505,6 +2597,7 @@ export class Database {
       offset: rel.offset,
       colCount: rel.table.columns.length,
       srf: srfPlans[i],
+      cte: rel.cte,
     }));
     // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
     // columns this query statically references, collected depth-aware so a correlated
@@ -2554,9 +2647,10 @@ export class Database {
   // integer type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows
   // PostgreSQL's single-column function-alias rule: the table alias when one is given
   // (generate_series(1,5) AS g ⇒ column g), else the function name generate_series.
-  private resolveSRF(name: string, args: Expr[], alias: string | null, parent: Scope | null, ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
-    // The args see only params/outer — never sibling FROM tables (non-LATERAL).
-    const argScope = new Scope([], this, parent, true);
+  private resolveSRF(name: string, args: Expr[], alias: string | null, parent: Scope | null, ctes: CteBinding[], ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
+    // The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
+    // inherited so an arg subquery can reference a CTE (cte.md §2).
+    const argScope = new Scope([], this, parent, true, ctes);
     const lname = name.toLowerCase();
     if (lname === "generate_series") return this.resolveGenerateSeries(args, alias, argScope, ptypes);
     if (lname === "unnest") return this.resolveUnnest(args, alias, argScope, ptypes);
@@ -2804,13 +2898,16 @@ export class Database {
     return new Sorter(compare, this.workMem, this.spillSink);
   }
 
-  private execSelectPlan(plan: SelectPlan, outer: Row[], params: Value[]): SelectResult {
+  private execSelectPlan(plan: SelectPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
     const env: EvalEnv = {
       params,
       outer,
-      runSubquery: (p, o) => this.execQueryPlan(p, o, params),
+      // A subquery inherits the same CTE context (a CTE reference works at any nesting depth —
+      // cte.md §2/§5).
+      runSubquery: (p, o) => this.execQueryPlan(p, o, params, ctes),
       seam: this.seam,
       rng: new StmtRng(),
+      ctes,
     };
     const meter = new Meter(this.maxCost);
 
@@ -2831,7 +2928,10 @@ export class Database {
       plan.relBounds[0]?.kind !== "index" &&
       // A set-returning relation is generated, not scanned — it takes the eager path
       // (functions.md §10); the streaming reader assumes a table store.
-      plan.rels[0]!.srf === undefined
+      plan.rels[0]!.srf === undefined &&
+      // A CTE reference is a computed/buffered source, not a table store — the eager path
+      // (cte.md §5) delivers its rows; the streaming reader assumes a store.
+      plan.rels[0]!.cte === undefined
     ) {
       return this.execStreamingLimit(plan, env, meter, params);
     }
@@ -2850,7 +2950,9 @@ export class Database {
       !plan.distinct &&
       plan.relBounds[0]?.kind !== "index" &&
       // A set-returning relation takes the eager path (functions.md §10).
-      plan.rels[0]!.srf === undefined
+      plan.rels[0]!.srf === undefined &&
+      // A CTE reference takes the eager path (cte.md §5).
+      plan.rels[0]!.cte === undefined
     ) {
       return this.execStreamingSort(plan, env, meter, params);
     }
@@ -2867,6 +2969,28 @@ export class Database {
         return rel.srf.kind === "unnest"
           ? this.unnestRows(rel.srf, env, meter)
           : this.generateSeriesRows(rel.srf, env, meter);
+      }
+      // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
+      // MATERIALIZED CTE reads its buffer, charging cte_scan_row per row (guarded so a runaway scan
+      // still aborts 54P01); an INLINE CTE runs its body in place (re-evaluating per outer row under
+      // correlation), charging the body's intrinsic cost into this meter.
+      if (rel.cte !== undefined) {
+        const ci = rel.cte;
+        if (env.ctes.modes[ci] === "materialize") {
+          const buf = env.ctes.buffers[ci]!;
+          for (let i = 0; i < buf.length; i++) {
+            meter.guard();
+            meter.charge(COSTS.cteScanRow);
+          }
+          // A multi-reference CTE reads the SAME buffer at each reference; return a fresh array so a
+          // downstream in-place mutation cannot corrupt the shared buffer (re-iterable — cte.md §5).
+          return buf.slice();
+        }
+        // Inline: the body is an independent query (parent = null at plan time), so it reads no
+        // outer row; it may reference an EARLIER CTE, so pass the same context.
+        const r = this.execQueryPlan(env.ctes.plans[ci]!, [], params, env.ctes);
+        meter.charge(r.cost);
+        return r.rows;
       }
       const store = this.readSnap().store(rel.tableName);
       let rows: Row[];
@@ -3104,44 +3228,44 @@ export class Database {
   // committed once-only cost — cost.md §3). A CORRELATED subquery is left in place; the evaluator
   // re-executes it per outer row. So after this pass the only surviving "subquery" nodes are correlated.
 
-  private foldUncorrelatedInPlan(plan: QueryPlan, bound: Value[], cost: { value: bigint }): void {
+  private foldUncorrelatedInPlan(plan: QueryPlan, bound: Value[], ctes: CteCtx, cost: { value: bigint }): void {
     if (plan.kind === "select") {
-      this.foldUncorrelatedInSelect(plan, bound, cost);
+      this.foldUncorrelatedInSelect(plan, bound, ctes, cost);
       return;
     }
-    this.foldUncorrelatedInPlan(plan.lhs, bound, cost);
-    this.foldUncorrelatedInPlan(plan.rhs, bound, cost);
+    this.foldUncorrelatedInPlan(plan.lhs, bound, ctes, cost);
+    this.foldUncorrelatedInPlan(plan.rhs, bound, ctes, cost);
   }
 
-  private foldUncorrelatedInSelect(sp: SelectPlan, bound: Value[], cost: { value: bigint }): void {
-    for (const j of sp.joins) if (j.on !== null) j.on = this.foldUncorrelatedInRExpr(j.on, bound, cost);
-    if (sp.filter !== null) sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, cost);
-    if (sp.having !== null) sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, cost);
+  private foldUncorrelatedInSelect(sp: SelectPlan, bound: Value[], ctes: CteCtx, cost: { value: bigint }): void {
+    for (const j of sp.joins) if (j.on !== null) j.on = this.foldUncorrelatedInRExpr(j.on, bound, ctes, cost);
+    if (sp.filter !== null) sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost);
+    if (sp.having !== null) sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost);
     for (const s of sp.aggSpecs) {
-      if (s.operand !== null) s.operand = this.foldUncorrelatedInRExpr(s.operand, bound, cost);
+      if (s.operand !== null) s.operand = this.foldUncorrelatedInRExpr(s.operand, bound, ctes, cost);
     }
-    sp.projections = sp.projections.map((p) => this.foldUncorrelatedInRExpr(p, bound, cost));
+    sp.projections = sp.projections.map((p) => this.foldUncorrelatedInRExpr(p, bound, ctes, cost));
     // A set-returning relation's arguments may themselves contain an (uncorrelated) subquery to
     // fold once before the generator runs (functions.md §10).
     for (const rel of sp.rels) {
       if (rel.srf !== undefined) {
-        rel.srf.args = rel.srf.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, cost));
+        rel.srf.args = rel.srf.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
       }
     }
   }
 
   // foldUncorrelatedInRExpr folds this node if it is an uncorrelated "subquery", else recurses into
   // its children. It RETURNS the (possibly replaced) node; the caller reassigns the field.
-  private foldUncorrelatedInRExpr(e: RExpr, bound: Value[], cost: { value: bigint }): RExpr {
+  private foldUncorrelatedInRExpr(e: RExpr, bound: Value[], ctes: CteCtx, cost: { value: bigint }): RExpr {
     switch (e.kind) {
       case "subquery": {
         // Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
         // globally-uncorrelated subquery nested inside it is already a constant before we run it.
-        if (e.lhs !== null) e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
-        this.foldUncorrelatedInPlan(e.plan, bound, cost);
+        if (e.lhs !== null) e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
+        this.foldUncorrelatedInPlan(e.plan, bound, ctes, cost);
         if (queryPlanReferencesOuter(e.plan, 0)) return e; // correlated — re-run per outer row
         // Uncorrelated: execute ONCE and fold to a constant / inValues.
-        const r = this.execQueryPlan(e.plan, [], bound);
+        const r = this.execQueryPlan(e.plan, [], bound, ctes);
         cost.value += r.cost;
         if (e.subKind === "scalar") {
           if (r.rows.length > 1) {
@@ -3163,7 +3287,7 @@ export class Database {
       case "neg":
       case "not":
       case "isNull":
-        e.operand = this.foldUncorrelatedInRExpr(e.operand, bound, cost);
+        e.operand = this.foldUncorrelatedInRExpr(e.operand, bound, ctes, cost);
         return e;
       case "arith":
       case "compare":
@@ -3171,48 +3295,48 @@ export class Database {
       case "or":
       case "distinct":
       case "like":
-        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
-        e.rhs = this.foldUncorrelatedInRExpr(e.rhs, bound, cost);
+        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
+        e.rhs = this.foldUncorrelatedInRExpr(e.rhs, bound, ctes, cost);
         return e;
       case "case":
         e.arms = e.arms.map((arm) => ({
-          cond: this.foldUncorrelatedInRExpr(arm.cond, bound, cost),
-          result: this.foldUncorrelatedInRExpr(arm.result, bound, cost),
+          cond: this.foldUncorrelatedInRExpr(arm.cond, bound, ctes, cost),
+          result: this.foldUncorrelatedInRExpr(arm.result, bound, ctes, cost),
         }));
-        e.els = this.foldUncorrelatedInRExpr(e.els, bound, cost);
+        e.els = this.foldUncorrelatedInRExpr(e.els, bound, ctes, cost);
         return e;
       case "scalarFunc":
       case "arrayFunc":
       case "variadic":
-        e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, cost));
+        e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
         return e;
       case "row":
-        e.fields = e.fields.map((f) => this.foldUncorrelatedInRExpr(f, bound, cost));
+        e.fields = e.fields.map((f) => this.foldUncorrelatedInRExpr(f, bound, ctes, cost));
         return e;
       case "array":
-        e.elements = e.elements.map((el) => this.foldUncorrelatedInRExpr(el, bound, cost));
+        e.elements = e.elements.map((el) => this.foldUncorrelatedInRExpr(el, bound, ctes, cost));
         return e;
       case "field":
-        e.base = this.foldUncorrelatedInRExpr(e.base, bound, cost);
+        e.base = this.foldUncorrelatedInRExpr(e.base, bound, ctes, cost);
         return e;
       case "subscript":
-        e.base = this.foldUncorrelatedInRExpr(e.base, bound, cost);
+        e.base = this.foldUncorrelatedInRExpr(e.base, bound, ctes, cost);
         e.subscripts = e.subscripts.map((s) =>
           s.isSlice
             ? {
                 isSlice: true,
-                lower: s.lower === null ? null : this.foldUncorrelatedInRExpr(s.lower, bound, cost),
-                upper: s.upper === null ? null : this.foldUncorrelatedInRExpr(s.upper, bound, cost),
+                lower: s.lower === null ? null : this.foldUncorrelatedInRExpr(s.lower, bound, ctes, cost),
+                upper: s.upper === null ? null : this.foldUncorrelatedInRExpr(s.upper, bound, ctes, cost),
               }
-            : { isSlice: false, index: this.foldUncorrelatedInRExpr(s.index, bound, cost) },
+            : { isSlice: false, index: this.foldUncorrelatedInRExpr(s.index, bound, ctes, cost) },
         );
         return e;
       case "inValues":
-        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
+        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
         return e;
       case "quantified":
-        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, cost);
-        e.array = this.foldUncorrelatedInRExpr(e.array, bound, cost);
+        e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
+        e.array = this.foldUncorrelatedInRExpr(e.array, bound, ctes, cost);
         return e;
       default:
         return e; // leaves: column, outerColumn, param, const*
@@ -4119,7 +4243,11 @@ type VariadicFuncName = "num_nulls" | "num_nonnulls";
 // relation is a COMPUTED set-returning function (generate_series) rather than a base table:
 // tableName is then the function name (never looked up in the store) and the executor generates
 // the rows instead of scanning (spec/design/functions.md §10).
-type PlanRel = { tableName: string; offset: number; colCount: number; srf?: SrfPlan };
+// When `cte` is set, the relation is a reference to common-table-expression `cte` (the index into
+// the statement's CTE list — spec/design/cte.md), not a base table: `tableName` is then the CTE
+// name (never looked up in the store) and the executor delivers its rows from the per-statement
+// CteCtx (a materialized buffer, or the inlined body run in place).
+type PlanRel = { tableName: string; offset: number; colCount: number; srf?: SrfPlan; cte?: number };
 
 // SrfKind selects which set-returning function an SrfPlan is, picking the row generator at exec
 // (spec/design/functions.md §10, array-functions.md §9). The dispatch is hand-written per core.
@@ -4206,6 +4334,39 @@ type SetOpPlan = {
 // QueryPlan is a resolved query expression: a SELECT plan or a set-op plan (mirrors QueryExpr).
 type QueryPlan = SelectPlan | SetOpPlan;
 
+// CteMode is how a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE
+// from its reference count and [NOT] MATERIALIZED hint: a single-reference CTE is "inline", a
+// multi-reference (or MATERIALIZED) one is "materialize".
+//   "inline":      run the body in place at each reference (re-evaluates per outer row under
+//                  correlation, matching PostgreSQL); charges the body's intrinsic cost, no
+//                  cte_scan_row.
+//   "materialize": run the body once, buffer the rows; each reference scans the buffer, charging
+//                  cte_scan_row per buffered row.
+type CteMode = "inline" | "materialize";
+
+// CteBinding is a planned common table expression (spec/design/cte.md), built by runWith for the
+// whole statement so the scopes that reference its synthetic `table` can see it. `name` is
+// lowercased for case-insensitive FROM matching; `table` is the synthetic relation exposing the
+// body's output columns; `plan` is the planned body; `hint` is the [NOT] MATERIALIZED override
+// (true/false/null); `refs` counts the FROM references resolved to it during planning (the
+// inline-vs-materialize decision — cost.md §3).
+type CteBinding = {
+  name: string;
+  table: Table;
+  plan: QueryPlan;
+  hint: boolean | null;
+  refs: number;
+};
+
+// CteCtx is the per-statement CTE execution context, threaded through exec_* and EvalEnv so a FROM
+// reference (any nesting depth) can deliver a CTE's rows (spec/design/cte.md §5). `modes` and
+// `plans` are fixed after planning; `buffers` is filled before the main query runs — one slot per
+// CTE in list order, holding the materialized rows of a "materialize" CTE (an empty placeholder for
+// an "inline" one, whose body is run in place from `plans` instead). EMPTY_CTE_CTX is the empty
+// context for every non-WITH execution path.
+type CteCtx = { modes: CteMode[]; plans: QueryPlan[]; buffers: Row[][] };
+const EMPTY_CTE_CTX: CteCtx = { modes: [], plans: [], buffers: [] };
+
 // EvalEnv is the environment threaded into the per-row evaluator (spec/design/grammar.md §26): the
 // bound parameters, the stack of enclosing rows (innermost LAST) a correlated reference reads, and
 // a runSubquery callback (a correlated subquery re-runs its inner plan against the pushed stack).
@@ -4219,6 +4380,9 @@ type EvalEnv = {
   // uuidv7 counter + once-resolved clock. Only the volatile uuid generators touch either.
   seam: Seam;
   rng: StmtRng;
+  // The statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at any
+  // nesting depth delivers a CTE's rows. EMPTY_CTE_CTX for every non-WITH statement.
+  ctes: CteCtx;
 };
 
 // ============================================================================
@@ -5418,7 +5582,10 @@ function groupingErrorColumn(name: string): EngineError {
 // qualifierOnly relation is visible ONLY to qualified references — the RETURNING old/new
 // row-version pseudo-relations (grammar.md §32): bare-column resolution skips it (no new
 // ambiguity), every other statement never builds one.
-type ScopeRel = { label: string; table: Table; offset: number; qualifierOnly?: boolean };
+// `cte` is set (to the CTE list index) when this relation is a reference to a CTE
+// (spec/design/cte.md) rather than a base table — its `table` is the binding's synthetic relation
+// and exec delivers its rows from the CteCtx. Undefined for a base table / SRF / pseudo-relation.
+type ScopeRel = { label: string; table: Table; offset: number; qualifierOnly?: boolean; cte?: number };
 
 // Resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
 // §26): level === 0 is a LOCAL column of this query (a flat index into the joined row); level >= 1
@@ -5440,11 +5607,22 @@ class Scope {
   // allowSubquery is true inside a SELECT (and its nested subqueries), false for UPDATE/DELETE
   // (a subquery there is 0A000 this slice).
   allowSubquery: boolean;
-  constructor(rels: ScopeRel[], catalog: Database, parent: Scope | null, allowSubquery: boolean) {
+  // The statement's CTE bindings visible here (spec/design/cte.md §2). Inherited DIRECTLY down into
+  // nested scopes (a subquery sees the same `ctes`), NOT via the `parent` chain — so CTE lookup
+  // never counts as a correlation level. Empty for every non-WITH statement.
+  ctes: CteBinding[];
+  constructor(
+    rels: ScopeRel[],
+    catalog: Database,
+    parent: Scope | null,
+    allowSubquery: boolean,
+    ctes: CteBinding[] = [],
+  ) {
     this.rels = rels;
     this.catalog = catalog;
     this.parent = parent;
     this.allowSubquery = allowSubquery;
+    this.ctes = ctes;
   }
 
   // single builds a one-relation scope with no parent (the single-table UPDATE / DELETE case).
@@ -5687,6 +5865,76 @@ function rtName(t: ResolvedType): string {
       return rtName(t.elem) + "[]";
     case "null":
       return "unknown";
+  }
+}
+
+// cteSyntheticTable builds the synthetic relation a CTE reference resolves against
+// (spec/design/cte.md §2): one column per body output, named by the rename list (a count mismatch
+// with MORE aliases is 42P10) or the body's own output names, typed from the planned body. The
+// relation has no primary key / constraints — it is read-only and its rows come from the CTE
+// context, never a store.
+function cteSyntheticTable(name: string, plan: QueryPlan, rename: string[] | null): Table {
+  const bodyTypes = plan.columnTypes;
+  const bodyNames = plan.columnNames;
+  let colNames: string[];
+  if (rename !== null) {
+    // PostgreSQL allows FEWER aliases than the body has columns — the first `rename.length` columns
+    // take the aliases, the rest keep their body output names (a partial rename). Only MORE aliases
+    // than columns is an error (42P10).
+    if (rename.length > bodyTypes.length) {
+      throw engineError(
+        "invalid_column_reference",
+        `WITH query "${name}" has ${bodyTypes.length} columns available but ${rename.length} columns specified`,
+      );
+    }
+    colNames = bodyTypes.map((_t, i) => rename[i] ?? bodyNames[i]!);
+  } else {
+    colNames = bodyNames.slice();
+  }
+  const columns: Column[] = colNames.map((n, i) => ({
+    name: n,
+    type: typeFromResolved(bodyTypes[i]!),
+    decimal: null,
+    primaryKey: false,
+    notNull: false,
+    default: null,
+    defaultExpr: null,
+  }));
+  return { name, columns, pk: [], checks: [], indexes: [] };
+}
+
+// typeFromResolved is the catalog Type that round-trips a column's ResolvedType — used to give a
+// CTE's synthetic columns a Type (spec/design/cte.md). An untyped NULL column maps to text
+// (PostgreSQL's unknown -> text rule). A decimal's per-column typmod is irrelevant for a read-only
+// CTE column (values flow through unchanged), so it is dropped. An anonymous ROW(...) composite has
+// no catalog type to name — deferred (0A000), a corner not reached by the corpus.
+function typeFromResolved(rt: ResolvedType): Type {
+  switch (rt.kind) {
+    case "int":
+    case "float":
+      return scalarT(rt.ty);
+    case "bool":
+      return scalarT("boolean");
+    case "text":
+    case "null":
+      return scalarT("text");
+    case "decimal":
+      return scalarT("decimal");
+    case "bytea":
+      return scalarT("bytea");
+    case "uuid":
+      return scalarT("uuid");
+    case "timestamp":
+      return scalarT("timestamp");
+    case "timestamptz":
+      return scalarT("timestamptz");
+    case "interval":
+      return scalarT("interval");
+    case "composite":
+      if (rt.name !== null) return compositeT(rt.name);
+      throw engineError("feature_not_supported", "an anonymous composite column in a CTE is not supported yet");
+    case "array":
+      return arrayT(typeFromResolved(rt.elem));
   }
 }
 
@@ -5979,7 +6227,9 @@ function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): Query
   if (!scope.allowSubquery) {
     throw engineError("feature_not_supported", "subqueries are only supported in a SELECT statement");
   }
-  return scope.catalog.planQuery(inner, scope, params);
+  // The subquery inherits the enclosing scope's CTE bindings directly (cte.md §2) — visible at any
+  // nesting depth without counting as a correlation level.
+  return scope.catalog.planQuery(inner, scope, scope.ctes, params);
 }
 
 // resolve resolves one Expr into an RExpr plus its static type. ctx (non-null) is the

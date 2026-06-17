@@ -748,6 +748,8 @@ func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error
 		return db.executeSelect(stmt.Select, params)
 	case stmt.SetOp != nil:
 		return db.executeSetOp(stmt.SetOp, params)
+	case stmt.With != nil:
+		return db.executeWith(stmt.With, params)
 	case stmt.Update != nil:
 		return db.executeUpdate(stmt.Update, params)
 	case stmt.Delete != nil:
@@ -1596,7 +1598,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		// §5). The source returns OWNED rows, so a self-insert (INSERT INTO t SELECT ... FROM
 		// t) reads the pre-insert snapshot, then writes.
 		ptypes := &paramTypes{}
-		plan, err := db.planQuery(QueryExpr{Select: ins.Select}, nil, ptypes)
+		plan, err := db.planQuery(QueryExpr{Select: ins.Select}, nil, nil, ptypes)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -1617,17 +1619,17 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 		meter := NewMeterWithLimit(db.maxCost)
-		if err := db.foldUncorrelatedInPlan(&plan, bound, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInPlan(&plan, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 		// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
 		// pre-statement snapshot (grammar.md §32).
 		for _, node := range retNodes {
-			if err := db.foldUncorrelatedInRExpr(node, bound, &meter.Accrued); err != nil {
+			if err := db.foldUncorrelatedInRExpr(node, bound, cteCtx{}, &meter.Accrued); err != nil {
 				return Outcome{}, err
 			}
 		}
-		q, err := db.execQueryPlan(&plan, nil, bound)
+		q, err := db.execQueryPlan(&plan, nil, bound, cteCtx{})
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -1766,7 +1768,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
 	// pre-statement snapshot (grammar.md §32).
 	for _, node := range retNodes {
-		if err := db.foldUncorrelatedInRExpr(node, bound, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(node, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -2101,14 +2103,14 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
 	meter := NewMeterWithLimit(db.maxCost)
 	if filter != nil {
-		if err := db.foldUncorrelatedInRExpr(filter, bound, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(filter, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
 	// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
 	// pre-statement snapshot (grammar.md §32).
 	for _, node := range retNodes {
-		if err := db.foldUncorrelatedInRExpr(node, bound, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(node, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -2317,17 +2319,17 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	// the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
 	meter := NewMeterWithLimit(db.maxCost)
 	for i := range plans {
-		if err := db.foldUncorrelatedInRExpr(plans[i].source, bound, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(plans[i].source, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
 	if filter != nil {
-		if err := db.foldUncorrelatedInRExpr(filter, bound, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(filter, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
 	for _, node := range retNodes {
-		if err := db.foldUncorrelatedInRExpr(node, bound, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(node, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -2612,6 +2614,204 @@ func (db *Database) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
 	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
 }
 
+// executeWith runs a WITH query (spec/design/cte.md) — the host-API entry point; runWith does the
+// CTE orchestration.
+func (db *Database) executeWith(wq *WithQuery, params []Value) (Outcome, error) {
+	r, err := db.runWith(wq, params)
+	if err != nil {
+		return Outcome{}, err
+	}
+	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
+}
+
+// runWith runs a WITH query (spec/design/cte.md). The CTE orchestrator:
+// (1) PLAN each CTE body in order against the prefix of earlier bindings (parent = nil — a body is
+// an independent query, NOT correlated to a reference site), deriving each binding's synthetic
+// relation; (2) plan the main body with all bindings visible, threading the one paramTypes so $N
+// infers statement-wide; (3) decide each CTE's mode from its reference count + [NOT] MATERIALIZED
+// hint; (4) MATERIALIZE each referenced materialized CTE once, in list order, accruing its cost (a
+// later body sees the earlier buffers); (5) fold + EXECUTE the main body with the CTE context. Cost
+// composes like set operations — a sum of the parts.
+func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error) {
+	ptypes := &paramTypes{}
+	// (1) Plan each CTE body against the already-built prefix; build its synthetic relation.
+	bindings := make([]*cteBinding, 0, len(wq.Ctes))
+	for i := range wq.Ctes {
+		cte := &wq.Ctes[i]
+		lname := strings.ToLower(cte.Name)
+		for _, b := range bindings {
+			if b.name == lname {
+				return selectResult{}, NewError(DuplicateAlias,
+					"WITH query name "+lname+" specified more than once")
+			}
+		}
+		plan, err := db.planQuery(cte.Query, nil, bindings, ptypes)
+		if err != nil {
+			return selectResult{}, err
+		}
+		table, err := cteSyntheticTable(lname, &plan, cte.Columns)
+		if err != nil {
+			return selectResult{}, err
+		}
+		bindings = append(bindings, &cteBinding{
+			name:  lname,
+			table: table,
+			plan:  plan,
+			hint:  cte.Materialized,
+			refs:  0,
+		})
+	}
+	// (2) Plan the main body with all bindings visible.
+	plan, err := db.planQuery(wq.Body, nil, bindings, ptypes)
+	if err != nil {
+		return selectResult{}, err
+	}
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return selectResult{}, err
+	}
+	bound, err := bindParams(params, ptys)
+	if err != nil {
+		return selectResult{}, err
+	}
+
+	// (3) Per-CTE evaluation mode: MATERIALIZED hint or >=2 references -> Materialize, else Inline
+	//     (cost.md §3). An unreferenced CTE is planned (errors surfaced) but not run.
+	modes := make([]cteMode, len(bindings))
+	plans := make([]queryPlan, len(bindings))
+	for i, b := range bindings {
+		switch {
+		case b.hint != nil && *b.hint:
+			modes[i] = cteMaterialize
+		case b.hint != nil && !*b.hint:
+			modes[i] = cteInline
+		case b.refs >= 2:
+			modes[i] = cteMaterialize
+		default:
+			modes[i] = cteInline
+		}
+		plans[i] = b.plan
+	}
+
+	// (4) Materialize each referenced materialized CTE once, in list order, accruing cost. A later
+	//     body's inline/materialized reference to an earlier CTE sees the prefix context.
+	var totalCost int64
+	buffers := make([][]Row, 0, len(plans))
+	for i := range plans {
+		var buf []Row
+		if modes[i] == cteMaterialize {
+			ctx := cteCtx{modes: modes[:i], plans: plans[:i], buffers: buffers}
+			cplan := plans[i]
+			r, err := db.execQueryPlan(&cplan, nil, bound, ctx)
+			if err != nil {
+				return selectResult{}, err
+			}
+			totalCost += r.cost
+			buf = rowsFromValues(r.rows)
+		}
+		buffers = append(buffers, buf)
+	}
+
+	// (5) Fold + execute the main body against the full CTE context.
+	ctx := cteCtx{modes: modes, plans: plans, buffers: buffers}
+	var subqueryCost int64
+	if err := db.foldUncorrelatedInPlan(&plan, bound, ctx, &subqueryCost); err != nil {
+		return selectResult{}, err
+	}
+	r, err := db.execQueryPlan(&plan, nil, bound, ctx)
+	if err != nil {
+		return selectResult{}, err
+	}
+	r.cost += subqueryCost + totalCost
+	return r, nil
+}
+
+// cteSyntheticTable builds the synthetic relation a CTE reference resolves against
+// (spec/design/cte.md §2): one column per body output, named by the rename list (a count mismatch is
+// 42P10) or the body's own output names, typed from the planned body. The relation has no primary
+// key / constraints — it is read-only and its rows come from the CTE context, never a store.
+func cteSyntheticTable(name string, plan *queryPlan, rename []string) (*Table, error) {
+	bodyTypes := plan.columnTypes()
+	bodyNames := plan.columnNames()
+	var colNames []string
+	if rename != nil {
+		// PostgreSQL allows FEWER aliases than the body has columns — the first len(rename) columns
+		// take the aliases, the rest keep their body output names (a partial rename). Only MORE
+		// aliases than columns is an error (42P10).
+		if len(rename) > len(bodyTypes) {
+			return nil, NewError(InvalidColumnReference, fmt.Sprintf(
+				"WITH query \"%s\" has %d columns available but %d columns specified",
+				name, len(bodyTypes), len(rename),
+			))
+		}
+		colNames = make([]string, len(bodyTypes))
+		for i := range bodyTypes {
+			if i < len(rename) {
+				colNames[i] = rename[i]
+			} else {
+				colNames[i] = bodyNames[i]
+			}
+		}
+	} else {
+		colNames = append([]string(nil), bodyNames...)
+	}
+	columns := make([]Column, len(colNames))
+	for i, n := range colNames {
+		ty, err := typeFromResolved(bodyTypes[i])
+		if err != nil {
+			return nil, err
+		}
+		columns[i] = Column{Name: n, Type: ty}
+	}
+	return &Table{Name: name, Columns: columns}, nil
+}
+
+// typeFromResolved is the catalog Type for a resolved expression type — used to give a CTE's
+// synthetic columns a Type (spec/design/cte.md). An untyped NULL column maps to text (PostgreSQL's
+// unknown -> text rule). A decimal's per-column typmod is irrelevant for a read-only CTE column
+// (values flow through unchanged), so it is dropped. An anonymous ROW(...) composite has no catalog
+// type to name — deferred (0A000), a corner not reached by the corpus.
+func typeFromResolved(rt resolvedType) (Type, error) {
+	switch rt.kind {
+	case rtInt:
+		return ScalarT(rt.intTy), nil
+	case rtFloat32:
+		return ScalarT(Float32), nil
+	case rtFloat64:
+		return ScalarT(Float64), nil
+	case rtBool:
+		return ScalarT(Bool), nil
+	case rtText, rtNull:
+		return ScalarT(Text), nil
+	case rtDecimal:
+		return ScalarT(DecimalType), nil
+	case rtBytea:
+		return ScalarT(Bytea), nil
+	case rtUuid:
+		return ScalarT(Uuid), nil
+	case rtTimestamp:
+		return ScalarT(Timestamp), nil
+	case rtTimestamptz:
+		return ScalarT(Timestamptz), nil
+	case rtInterval:
+		return ScalarT(IntervalType), nil
+	case rtComposite:
+		if rt.comp != nil && rt.comp.named {
+			return CompositeT(rt.comp.name), nil
+		}
+		return Type{}, NewError(FeatureNotSupported,
+			"an anonymous composite column in a CTE is not supported yet")
+	case rtArray:
+		elem, err := typeFromResolved(*rt.elem)
+		if err != nil {
+			return Type{}, err
+		}
+		return ArrayT(elem), nil
+	default:
+		return Type{}, NewError(FeatureNotSupported, "unsupported CTE column type")
+	}
+}
+
 // runQueryExpr runs a query expression to a selectResult — a lone SELECT via runSelect, or a set
 // operation via runSetOp (recursively, so a chain `a UNION b INTERSECT c` evaluates as the parsed
 // precedence tree).
@@ -2623,7 +2823,7 @@ func (db *Database) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
 // the fold are re-executed per outer row by the evaluator.
 func (db *Database) runQueryExpr(qe QueryExpr, params []Value) (selectResult, error) {
 	ptypes := &paramTypes{}
-	plan, err := db.planQuery(qe, nil, ptypes)
+	plan, err := db.planQuery(qe, nil, nil, ptypes)
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -2636,10 +2836,10 @@ func (db *Database) runQueryExpr(qe QueryExpr, params []Value) (selectResult, er
 		return selectResult{}, err
 	}
 	var subqueryCost int64
-	if err := db.foldUncorrelatedInPlan(&plan, bound, &subqueryCost); err != nil {
+	if err := db.foldUncorrelatedInPlan(&plan, bound, cteCtx{}, &subqueryCost); err != nil {
 		return selectResult{}, err
 	}
-	r, err := db.execQueryPlan(&plan, nil, bound)
+	r, err := db.execQueryPlan(&plan, nil, bound, cteCtx{})
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -2658,16 +2858,18 @@ func (db *Database) runSetOp(so *SetOp, params []Value) (selectResult, error) {
 }
 
 // planQuery resolves a query expression into an owned queryPlan against the scope chain (parent
-// = the enclosing query's scope, nil at top level). A subquery is planned here, once (§26).
-func (db *Database) planQuery(qe QueryExpr, parent *scope, ptypes *paramTypes) (queryPlan, error) {
+// = the enclosing query's scope, nil at top level). ctes are the statement's CTE bindings visible
+// here (spec/design/cte.md §2), empty for a non-WITH statement. A subquery is planned here, once
+// (§26).
+func (db *Database) planQuery(qe QueryExpr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (queryPlan, error) {
 	if qe.Select != nil {
-		sp, err := db.planSelect(qe.Select, parent, ptypes)
+		sp, err := db.planSelect(qe.Select, parent, ctes, ptypes)
 		if err != nil {
 			return queryPlan{}, err
 		}
 		return queryPlan{sel: sp}, nil
 	}
-	sop, err := db.planSetOp(qe.SetOp, parent, ptypes)
+	sop, err := db.planSetOp(qe.SetOp, parent, ctes, ptypes)
 	if err != nil {
 		return queryPlan{}, err
 	}
@@ -2675,23 +2877,24 @@ func (db *Database) planQuery(qe QueryExpr, parent *scope, ptypes *paramTypes) (
 }
 
 // execQueryPlan executes a resolved plan against an outer-row environment (outer = the enclosing
-// rows, innermost last; nil at top level) and the bound parameters.
-func (db *Database) execQueryPlan(plan *queryPlan, outer []Row, params []Value) (selectResult, error) {
+// rows, innermost last; nil at top level) and the bound parameters. ctes is the per-statement CTE
+// execution context (spec/design/cte.md §5), the zero cteCtx for a non-WITH statement.
+func (db *Database) execQueryPlan(plan *queryPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
 	if plan.sel != nil {
-		return db.execSelectPlan(plan.sel, outer, params)
+		return db.execSelectPlan(plan.sel, outer, params, ctes)
 	}
-	return db.execSetOpPlan(plan.setop, outer, params)
+	return db.execSetOpPlan(plan.setop, outer, params, ctes)
 }
 
 // planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
 // parent scope, check arity + unify column types up front (so the 42601/42804 fire even over
 // empty operands), and resolve the trailing ORDER BY by output column name.
-func (db *Database) planSetOp(so *SetOp, parent *scope, ptypes *paramTypes) (*setOpPlan, error) {
-	lhs, err := db.planQuery(so.Lhs, parent, ptypes)
+func (db *Database) planSetOp(so *SetOp, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*setOpPlan, error) {
+	lhs, err := db.planQuery(so.Lhs, parent, ctes, ptypes)
 	if err != nil {
 		return nil, err
 	}
-	rhs, err := db.planQuery(so.Rhs, parent, ptypes)
+	rhs, err := db.planQuery(so.Rhs, parent, ctes, ptypes)
 	if err != nil {
 		return nil, err
 	}
@@ -2736,12 +2939,12 @@ func (db *Database) planSetOp(so *SetOp, parent *scope, ptypes *paramTypes) (*se
 // execSetOpPlan executes a resolved set operation: run both operands against the outer
 // environment, coerce to the unified types, combine, then sort + window. Cost is lhs.cost +
 // rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
-func (db *Database) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value) (selectResult, error) {
-	left, err := db.execQueryPlan(&plan.lhs, outer, params)
+func (db *Database) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+	left, err := db.execQueryPlan(&plan.lhs, outer, params, ctes)
 	if err != nil {
 		return selectResult{}, err
 	}
-	right, err := db.execQueryPlan(&plan.rhs, outer, params)
+	right, err := db.execQueryPlan(&plan.rhs, outer, params, ctes)
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -2950,7 +3153,7 @@ func resolveSetopOrderKey(key *OrderKey, names []string) (int, error) {
 // query's scope, for correlated references — grammar.md §26). The resolve half of the old
 // runSelect: build the FROM scope, resolve every clause, infer $N types into ptypes. No row is
 // touched and no parameter is bound here (runQueryExpr binds once, after the whole tree is planned).
-func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (*selectPlan, error) {
+func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*selectPlan, error) {
 	// Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
 	// relation's flat column offset in FROM order, and reject a duplicate label — a self-join
 	// without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less SELECT
@@ -2975,19 +3178,38 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 	offset := 0
 	for i, tref := range tableRefs {
 		var t *Table
+		var cteIdx *int
 		if tref.IsFunc {
-			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, parent, ptypes)
+			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, parent, ctes, ptypes)
 			if serr != nil {
 				return nil, serr
 			}
 			t = tbl
 			srfPlans[i] = sp
 		} else {
-			tbl, ok := db.Table(tref.Name)
-			if !ok {
-				return nil, NewError(UndefinedTable, "table does not exist: "+tref.Name)
+			// A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog
+			// table of the same name (cte.md §2); lookup is case-insensitive. A hit bumps the
+			// binding's reference count (the inline-vs-materialize decision — cost.md §3).
+			lname := strings.ToLower(tref.Name)
+			ci := -1
+			for j, b := range ctes {
+				if b.name == lname {
+					ci = j
+					break
+				}
 			}
-			t = tbl
+			if ci >= 0 {
+				ctes[ci].refs++
+				idx := ci
+				cteIdx = &idx
+				t = ctes[ci].table
+			} else {
+				tbl, ok := db.Table(tref.Name)
+				if !ok {
+					return nil, NewError(UndefinedTable, "table does not exist: "+tref.Name)
+				}
+				t = tbl
+			}
 		}
 		label := strings.ToLower(t.Name)
 		if tref.Alias != nil {
@@ -2997,10 +3219,10 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 			return nil, NewError(DuplicateAlias, "table name "+label+" specified more than once")
 		}
 		seenLabels[label] = true
-		rels = append(rels, scopeRel{label: label, table: t, offset: offset})
+		rels = append(rels, scopeRel{label: label, table: t, offset: offset, cte: cteIdx})
 		offset += len(t.Columns)
 	}
-	s := &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true}
+	s := &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
 
 	// Resolve projections (paired with output names — §8), the optional WHERE (must be
 	// boolean), and the ORDER BY keys against the full scope. A bare key ambiguous across
@@ -3158,7 +3380,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 	for k, j := range sel.Joins {
 		var on *rExpr
 		if j.On != nil {
-			partial := &scope{rels: s.rels[:k+2], parent: parent, catalog: db, allowSubquery: true}
+			partial := &scope{rels: s.rels[:k+2], parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
 			on, err = resolveBooleanFilter(partial, j.On, ptypes)
 			if err != nil {
 				return nil, err
@@ -3171,7 +3393,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 	// plan outlives the scope and a correlated subquery can re-execute it per row).
 	planRels := make([]planRel, len(s.rels))
 	for i, rel := range s.rels {
-		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i]}
+		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i], cte: rel.cte}
 	}
 	// The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
 	// columns this query statically references, collected depth-aware so a correlated
@@ -3224,9 +3446,10 @@ func (db *Database) planSelect(sel *Select, parent *scope, ptypes *paramTypes) (
 // type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows PostgreSQL's
 // single-column function-alias rule: the table alias when one is given (generate_series(1,5) AS g
 // ⇒ column g), else the function name generate_series.
-func (db *Database) resolveSRF(name string, args []*Expr, alias *string, parent *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
-	// The args see only params/outer — never sibling FROM tables (non-LATERAL).
-	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true}
+func (db *Database) resolveSRF(name string, args []*Expr, alias *string, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*Table, *srfPlan, error) {
+	// The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
+	// inherited so an arg subquery can reference a CTE (cte.md §2).
+	argScope := &scope{rels: nil, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
 	switch {
 	case strings.EqualFold(name, "generate_series"):
 		return db.resolveGenerateSeries(args, alias, argScope, ptypes)
@@ -4069,8 +4292,19 @@ func (db *Database) newSorterFor(order []orderSlot) *sorter {
 	return newSorter(order, db.workMem, spillDir)
 }
 
-func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value) (selectResult, error) {
-	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng()}
+// rowsFromValues reinterprets a result-row slice ([][]Value) as a join-feed buffer ([]Row). Row is
+// []Value, so each element converts directly; used where a CTE body's selectResult rows feed the
+// join pipeline (spec/design/cte.md §5).
+func rowsFromValues(in [][]Value) []Row {
+	out := make([]Row, len(in))
+	for i, r := range in {
+		out[i] = Row(r)
+	}
+	return out
+}
+
+func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
 	meter := NewMeterWithLimit(db.maxCost)
 
 	// LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
@@ -4086,7 +4320,10 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	if plan.limit != nil && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.distinct && len(plan.order) == 0 &&
 		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) &&
-		plan.rels[0].srf == nil {
+		plan.rels[0].srf == nil &&
+		// A CTE reference is a computed/buffered source, not a table store — the eager path
+		// (cte.md §5) delivers its rows; the streaming reader assumes a store.
+		plan.rels[0].cte == nil {
 		return db.execStreamingLimit(plan, env, meter, params)
 	}
 
@@ -4099,7 +4336,9 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	if len(plan.order) > 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.distinct &&
 		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) &&
-		plan.rels[0].srf == nil {
+		plan.rels[0].srf == nil &&
+		// A CTE reference takes the eager path (cte.md §5).
+		plan.rels[0].cte == nil {
 		return db.execStreamingSort(plan, env, meter, params)
 	}
 
@@ -4124,6 +4363,37 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 				return selectResult{}, err
 			}
 			materialized[ri] = tableRows
+			continue
+		}
+		// A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
+		// MATERIALIZED CTE reads its buffer, charging cte_scan_row per row (guarded so a runaway
+		// scan still aborts 54P01); an INLINE CTE runs its body in place (re-evaluating per outer
+		// row under correlation), charging the body's intrinsic cost into this meter.
+		if rel.cte != nil {
+			ci := *rel.cte
+			var rows []Row
+			switch env.ctes.modes[ci] {
+			case cteMaterialize:
+				buf := env.ctes.buffers[ci]
+				for range buf {
+					if err := meter.Guard(); err != nil {
+						return selectResult{}, err
+					}
+					meter.Charge(Costs.CteScanRow)
+				}
+				rows = append([]Row(nil), buf...)
+			case cteInline:
+				// The body is an independent query (parent = nil at plan time), so it reads no
+				// outer row; it may reference an EARLIER CTE, so pass the same context.
+				cplan := env.ctes.plans[ci]
+				r, err := db.execQueryPlan(&cplan, nil, params, env.ctes)
+				if err != nil {
+					return selectResult{}, err
+				}
+				meter.Charge(r.cost)
+				rows = rowsFromValues(r.rows)
+			}
+			materialized[ri] = rows
 			continue
 		}
 		store := db.readSnap().store(rel.tableName)
@@ -4504,43 +4774,43 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 // once-only cost — cost.md §3). A CORRELATED subquery is left in place; the evaluator re-executes
 // it per outer row. So after this pass the only surviving reSubquery nodes are correlated.
 
-func (db *Database) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, cost *int64) error {
+func (db *Database) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes cteCtx, cost *int64) error {
 	if plan.sel != nil {
-		return db.foldUncorrelatedInSelect(plan.sel, bound, cost)
+		return db.foldUncorrelatedInSelect(plan.sel, bound, ctes, cost)
 	}
-	if err := db.foldUncorrelatedInPlan(&plan.setop.lhs, bound, cost); err != nil {
+	if err := db.foldUncorrelatedInPlan(&plan.setop.lhs, bound, ctes, cost); err != nil {
 		return err
 	}
-	return db.foldUncorrelatedInPlan(&plan.setop.rhs, bound, cost)
+	return db.foldUncorrelatedInPlan(&plan.setop.rhs, bound, ctes, cost)
 }
 
-func (db *Database) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, cost *int64) error {
+func (db *Database) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, ctes cteCtx, cost *int64) error {
 	for k := range sp.joins {
 		if sp.joins[k].on != nil {
-			if err := db.foldUncorrelatedInRExpr(sp.joins[k].on, bound, cost); err != nil {
+			if err := db.foldUncorrelatedInRExpr(sp.joins[k].on, bound, ctes, cost); err != nil {
 				return err
 			}
 		}
 	}
 	if sp.filter != nil {
-		if err := db.foldUncorrelatedInRExpr(sp.filter, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost); err != nil {
 			return err
 		}
 	}
 	if sp.having != nil {
-		if err := db.foldUncorrelatedInRExpr(sp.having, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost); err != nil {
 			return err
 		}
 	}
 	for i := range sp.aggSpecs {
 		if sp.aggSpecs[i].operand != nil {
-			if err := db.foldUncorrelatedInRExpr(sp.aggSpecs[i].operand, bound, cost); err != nil {
+			if err := db.foldUncorrelatedInRExpr(sp.aggSpecs[i].operand, bound, ctes, cost); err != nil {
 				return err
 			}
 		}
 	}
 	for _, p := range sp.projections {
-		if err := db.foldUncorrelatedInRExpr(p, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInRExpr(p, bound, ctes, cost); err != nil {
 			return err
 		}
 	}
@@ -4549,7 +4819,7 @@ func (db *Database) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, cost
 	for i := range sp.rels {
 		if sp.rels[i].srf != nil {
 			for _, a := range sp.rels[i].srf.args {
-				if err := db.foldUncorrelatedInRExpr(a, bound, cost); err != nil {
+				if err := db.foldUncorrelatedInRExpr(a, bound, ctes, cost); err != nil {
 					return err
 				}
 			}
@@ -4560,23 +4830,23 @@ func (db *Database) foldUncorrelatedInSelect(sp *selectPlan, bound []Value, cost
 
 // foldUncorrelatedInRExpr folds this node if it is an uncorrelated reSubquery, else recurses into
 // its children. A reSubquery is mutated IN PLACE (*e = ...) so every pointer to it sees the fold.
-func (db *Database) foldUncorrelatedInRExpr(e *rExpr, bound []Value, cost *int64) error {
+func (db *Database) foldUncorrelatedInRExpr(e *rExpr, bound []Value, ctes cteCtx, cost *int64) error {
 	if e.kind == reSubquery {
 		// Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
 		// globally-uncorrelated subquery nested inside it is already a constant before we run it.
 		if e.lhs != nil {
-			if err := db.foldUncorrelatedInRExpr(e.lhs, bound, cost); err != nil {
+			if err := db.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost); err != nil {
 				return err
 			}
 		}
-		if err := db.foldUncorrelatedInPlan(e.subPlan, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInPlan(e.subPlan, bound, ctes, cost); err != nil {
 			return err
 		}
 		if queryPlanReferencesOuter(e.subPlan, 0) {
 			return nil // correlated — re-executed per outer row at eval
 		}
 		// Uncorrelated: execute ONCE and fold to a constant / reInValues.
-		r, err := db.execQueryPlan(e.subPlan, nil, bound)
+		r, err := db.execQueryPlan(e.subPlan, nil, bound, ctes)
 		if err != nil {
 			return err
 		}
@@ -4605,35 +4875,35 @@ func (db *Database) foldUncorrelatedInRExpr(e *rExpr, bound []Value, cost *int64
 	// Recurse into the children of every other node (a subquery may nest anywhere). The fields
 	// are only set for the relevant node kinds, so this is exhaustive without a per-kind switch.
 	if e.operand != nil {
-		if err := db.foldUncorrelatedInRExpr(e.operand, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInRExpr(e.operand, bound, ctes, cost); err != nil {
 			return err
 		}
 	}
 	if e.lhs != nil {
-		if err := db.foldUncorrelatedInRExpr(e.lhs, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost); err != nil {
 			return err
 		}
 	}
 	if e.rhs != nil {
-		if err := db.foldUncorrelatedInRExpr(e.rhs, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInRExpr(e.rhs, bound, ctes, cost); err != nil {
 			return err
 		}
 	}
 	for _, arm := range e.caseArms {
-		if err := db.foldUncorrelatedInRExpr(arm.cond, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInRExpr(arm.cond, bound, ctes, cost); err != nil {
 			return err
 		}
-		if err := db.foldUncorrelatedInRExpr(arm.result, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInRExpr(arm.result, bound, ctes, cost); err != nil {
 			return err
 		}
 	}
 	if e.caseEls != nil {
-		if err := db.foldUncorrelatedInRExpr(e.caseEls, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInRExpr(e.caseEls, bound, ctes, cost); err != nil {
 			return err
 		}
 	}
 	for _, a := range e.sargs {
-		if err := db.foldUncorrelatedInRExpr(a, bound, cost); err != nil {
+		if err := db.foldUncorrelatedInRExpr(a, bound, ctes, cost); err != nil {
 			return err
 		}
 	}
@@ -5569,6 +5839,54 @@ func (p *queryPlan) columnTypes() []resolvedType {
 	return p.setop.columnTypes
 }
 
+// columnNames returns the plan's output column names — the basis for a CTE's synthetic relation
+// when there is no column-rename list (spec/design/cte.md §1).
+func (p *queryPlan) columnNames() []string {
+	if p.sel != nil {
+		return p.sel.columnNames
+	}
+	return p.setop.columnNames
+}
+
+// cteMode is how a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE
+// from its reference count and [NOT] MATERIALIZED hint: a single-reference CTE is cteInline, a
+// multi-reference (or MATERIALIZED) one is cteMaterialize.
+type cteMode int
+
+const (
+	// cteInline runs the body in place at each reference (re-evaluates per outer row under
+	// correlation, matching PostgreSQL); charges the body's intrinsic cost, no cte_scan_row.
+	cteInline cteMode = iota
+	// cteMaterialize runs the body once, buffers the rows; each reference scans the buffer,
+	// charging cte_scan_row per buffered row.
+	cteMaterialize
+)
+
+// cteBinding is a planned common table expression, owned by runWith for the whole statement
+// (spec/design/cte.md). name is lowercased for case-insensitive FROM matching; table is the
+// synthetic relation exposing the body's output columns; plan is the planned body; hint is the
+// [NOT] MATERIALIZED override (nil = default); refs counts the FROM references resolved to it during
+// planning (the inline-vs-materialize decision — cost.md §3).
+type cteBinding struct {
+	name  string
+	table *Table
+	plan  queryPlan
+	hint  *bool
+	refs  int
+}
+
+// cteCtx is the per-statement CTE execution context, threaded through exec* and evalEnv so a FROM
+// reference (any nesting depth) can deliver a CTE's rows (spec/design/cte.md §5). modes and plans
+// are fixed after planning; buffers is filled before the main query runs — one slot per CTE in list
+// order, holding the materialized rows of a cteMaterialize CTE (an empty placeholder for a cteInline
+// one, whose body is run in place from plans instead). The zero value (all nil) is the empty
+// context — no CTEs in scope (every non-WITH execution path).
+type cteCtx struct {
+	modes   []cteMode
+	plans   []queryPlan
+	buffers [][]Row
+}
+
 // planRel is one relation in a SELECT plan: the table name (looked up in the store at exec), the
 // flat offset of its first column, and its column count (for NULL-padding).
 type planRel struct {
@@ -5579,6 +5897,11 @@ type planRel struct {
 	// rather than a base table: tableName is then the function name (never looked up in the
 	// store) and the executor generates the rows instead of scanning (functions.md §10).
 	srf *srfPlan
+	// cte is non-nil (pointing to the index into the statement's CTE list — spec/design/cte.md)
+	// when this relation is a reference to a common-table expression rather than a base table:
+	// tableName is then the CTE name (never looked up in the store) and the executor delivers its
+	// rows from the per-statement cteCtx (a materialized buffer, or the inlined body run in place).
+	cte *int
 }
 
 // srfKind selects which set-returning function a srfPlan is, picking the row generator at exec
@@ -5675,6 +5998,9 @@ type evalEnv struct {
 	// + the once-resolved statement clock. The injected random/clock functions live on exec.seam
 	// (handle-scoped); only the volatile uuid generators touch any of this.
 	rng *StmtRng
+	// ctes is the statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at
+	// any nesting depth delivers a CTE's rows. The zero cteCtx for every non-WITH statement.
+	ctes cteCtx
 }
 
 // rCaseArm is one resolved (condition, result) branch of a reCase node (spec/design/grammar.md
@@ -7511,6 +7837,11 @@ type scopeRel struct {
 	table         *Table
 	offset        int
 	qualifierOnly bool
+	// cte is non-nil (pointing to the index into the statement's CTE list — spec/design/cte.md)
+	// when this relation is a reference to a CTE rather than a base table: its table is the
+	// binding's synthetic relation and exec delivers its rows from the cteCtx. nil for a base
+	// table / SRF / pseudo-relation.
+	cte *int
 }
 
 // resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
@@ -7533,6 +7864,10 @@ type scope struct {
 	// allowSubquery is true inside a SELECT (and its nested subqueries), false for UPDATE/DELETE
 	// (a subquery there is 0A000 this slice).
 	allowSubquery bool
+	// ctes is the statement's CTE bindings visible here (spec/design/cte.md §2). Inherited
+	// DIRECTLY down into nested scopes (a subquery sees the same ctes), NOT via the parent chain —
+	// so CTE lookup never counts as a correlation level. Empty for every non-WITH statement.
+	ctes []*cteBinding
 }
 
 // singleScope is a one-relation scope with no parent (the single-table UPDATE / DELETE case).
@@ -7975,7 +8310,9 @@ func planSubquery(s *scope, inner QueryExpr, params *paramTypes) (queryPlan, err
 	if !s.allowSubquery {
 		return queryPlan{}, NewError(FeatureNotSupported, "subqueries are only supported in a SELECT statement")
 	}
-	return s.catalog.planQuery(inner, s, params)
+	// A subquery inherits the enclosing scope's CTE bindings directly (cte.md §2): a CTE is
+	// visible inside a nested subquery without counting as a correlation level.
+	return s.catalog.planQuery(inner, s, s.ctes, params)
 }
 
 // resolveSubscriptInt resolves one array-subscript bound to an integer rExpr (a literal adapts to
@@ -10646,7 +10983,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		child := make([]Row, len(env.outer)+1)
 		copy(child, env.outer)
 		child[len(env.outer)] = row
-		r, err := env.exec.execQueryPlan(e.subPlan, child, env.params)
+		r, err := env.exec.execQueryPlan(e.subPlan, child, env.params, env.ctes)
 		if err != nil {
 			return Value{}, err
 		}

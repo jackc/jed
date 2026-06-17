@@ -445,8 +445,32 @@ export type SetOp = {
   offset: bigint | null;
 };
 
+// Cte is one common table expression in a WITH list (spec/design/cte.md). A named, statement-local
+// relation backed by a query. `columns` is the optional column-rename list (renames the body's
+// output columns left to right; a count mismatch with MORE aliases is 42P10). `materialized` is the
+// explicit evaluation hint: true = MATERIALIZED, false = NOT MATERIALIZED, null = PostgreSQL's
+// default (inline a single-reference CTE, materialize a multi-reference one — cost.md §3). The body
+// is any query_expr (a SELECT or a set operation).
+export type Cte = {
+  name: string;
+  columns: string[] | null;
+  materialized: boolean | null;
+  query: QueryExpr;
+};
+
+// WithQuery is a top-level query prefixed by a WITH clause (spec/design/cte.md). `ctes` is the
+// non-empty list of common table expressions (each visible to later CTEs and to `body`); `body` is
+// the main query expression. Built only when a WITH is present — a plain query stays `Select`/
+// `SetOp`, so those paths are untouched (the SetOp precedent).
+export type WithQuery = {
+  kind: "with";
+  ctes: Cte[];
+  body: QueryExpr;
+};
+
 // Statement is a parsed top-level statement. A lone SELECT stays `Select`; `SetOp` appears only
-// when at least one set operator is present, so the plain-query path and host API are untouched.
+// when at least one set operator is present, and `With` only when a WITH prefix is present, so the
+// plain-query path and host API are untouched.
 export type Statement =
   | CreateTable
   | DropTable
@@ -457,6 +481,7 @@ export type Statement =
   | Insert
   | Select
   | SetOp
+  | WithQuery
   | Update
   | Delete
   | Begin

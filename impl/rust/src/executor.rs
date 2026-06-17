@@ -7,7 +7,7 @@
 use crate::ast::{
     BinaryOp, CreateIndex, CreateTable, CreateType, Delete, DropIndex, DropTable, DropType, Expr,
     Insert, InsertSource, InsertValue, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItems,
-    SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update,
+    SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -879,6 +879,7 @@ impl Database {
             Statement::Insert(ins) => self.execute_insert(ins, params),
             Statement::Select(sel) => self.execute_select(sel, params),
             Statement::SetOp(so) => self.execute_set_op(so, params),
+            Statement::With(wq) => self.execute_with(wq, params),
             Statement::Update(upd) => self.execute_update(upd, params),
             Statement::Delete(del) => self.execute_delete(del, params),
             // Transaction control is handled by `execute_stmt_params` before dispatch.
@@ -1453,6 +1454,7 @@ impl Database {
                     params: &[],
                     outer: &[],
                     rng,
+                    ctes: CteCtx::empty(),
                 };
                 rx.eval(&[], &env, meter)
             }
@@ -1911,7 +1913,12 @@ impl Database {
                     // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3),
                     // reading the pre-statement snapshot (grammar.md §32).
                     for node in nodes {
-                        self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
+                        self.fold_uncorrelated_in_rexpr(
+                            node,
+                            &bound,
+                            CteCtx::empty(),
+                            &mut meter.accrued,
+                        )?;
                     }
                 }
                 let inserted = rows.len() as i64;
@@ -1949,7 +1956,7 @@ impl Database {
                 // before phase 2 mutates the store (a self-insert reads the pre-insert
                 // snapshot — §24).
                 let mut ptypes = ParamTypes::default();
-                let mut plan = self.plan_query(&QueryExpr::Select(sel), None, &mut ptypes)?;
+                let mut plan = self.plan_query(&QueryExpr::Select(sel), None, &[], &mut ptypes)?;
                 let ret = match &returning {
                     Some(items) => {
                         Some(self.resolve_returning(&table, items, false, &mut ptypes)?)
@@ -1958,14 +1965,24 @@ impl Database {
                 };
                 let bound = bind_params(params, &ptypes.finalize()?)?;
                 let mut meter = Meter::with_limit(self.max_cost);
-                self.fold_uncorrelated_in_plan(&mut plan, &bound, &mut meter.accrued)?;
+                self.fold_uncorrelated_in_plan(
+                    &mut plan,
+                    &bound,
+                    CteCtx::empty(),
+                    &mut meter.accrued,
+                )?;
                 let mut ret_nodes = ret;
                 if let Some((nodes, _, _)) = &mut ret_nodes {
                     for node in nodes {
-                        self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
+                        self.fold_uncorrelated_in_rexpr(
+                            node,
+                            &bound,
+                            CteCtx::empty(),
+                            &mut meter.accrued,
+                        )?;
                     }
                 }
-                let q = self.exec_query_plan(&plan, &[], &bound)?;
+                let q = self.exec_query_plan(&plan, &[], &bound, CteCtx::empty())?;
 
                 // Arity: the SELECT's output column count must match the target — checked before
                 // any row is produced, so it fires even when the source returns zero rows.
@@ -2142,6 +2159,7 @@ impl Database {
                     params: &[],
                     outer: &[],
                     rng,
+                    ctes: CteCtx::empty(),
                 };
                 for (name, rexpr) in checks {
                     if matches!(rexpr.eval(&row, &env, meter)?, Value::Bool(false)) {
@@ -2345,6 +2363,7 @@ impl Database {
             params,
             outer: &[],
             rng: &stmt_rng,
+            ctes: CteCtx::empty(),
         };
         let mut out = Vec::with_capacity(rows.len());
         for (i, &row) in rows.iter().enumerate() {
@@ -2418,11 +2437,11 @@ impl Database {
         // mutating), matching PostgreSQL.
         let mut meter = Meter::with_limit(self.max_cost);
         if let Some(f) = &mut filter {
-            self.fold_uncorrelated_in_rexpr(f, &bound, &mut meter.accrued)?;
+            self.fold_uncorrelated_in_rexpr(f, &bound, CteCtx::empty(), &mut meter.accrued)?;
         }
         if let Some((nodes, _, _)) = &mut ret {
             for node in nodes {
-                self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
+                self.fold_uncorrelated_in_rexpr(node, &bound, CteCtx::empty(), &mut meter.accrued)?;
             }
         }
 
@@ -2442,6 +2461,7 @@ impl Database {
             params: &bound,
             outer: &[],
             rng: &stmt_rng,
+            ctes: CteCtx::empty(),
         };
         // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
         // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
@@ -2654,14 +2674,19 @@ impl Database {
         // pre-UPDATE snapshot (phase 1 only reads; phase 2 writes), matching PostgreSQL.
         let mut meter = Meter::with_limit(self.max_cost);
         for plan in &mut plans {
-            self.fold_uncorrelated_in_rexpr(&mut plan.source, &bound, &mut meter.accrued)?;
+            self.fold_uncorrelated_in_rexpr(
+                &mut plan.source,
+                &bound,
+                CteCtx::empty(),
+                &mut meter.accrued,
+            )?;
         }
         if let Some(f) = &mut filter {
-            self.fold_uncorrelated_in_rexpr(f, &bound, &mut meter.accrued)?;
+            self.fold_uncorrelated_in_rexpr(f, &bound, CteCtx::empty(), &mut meter.accrued)?;
         }
         if let Some((nodes, _, _)) = &mut ret {
             for node in nodes {
-                self.fold_uncorrelated_in_rexpr(node, &bound, &mut meter.accrued)?;
+                self.fold_uncorrelated_in_rexpr(node, &bound, CteCtx::empty(), &mut meter.accrued)?;
             }
         }
 
@@ -2679,6 +2704,7 @@ impl Database {
             params: &bound,
             outer: &[],
             rng: &stmt_rng,
+            ctes: CteCtx::empty(),
         };
         // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
         // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
@@ -2897,6 +2923,18 @@ impl Database {
         })
     }
 
+    /// Execute a `WITH` query (spec/design/cte.md) — the host-API entry point; `run_with` does the
+    /// CTE orchestration.
+    fn execute_with(&mut self, wq: WithQuery, params: &[Value]) -> Result<Outcome> {
+        let r = self.run_with(wq, params)?;
+        Ok(Outcome::Query {
+            column_names: r.column_names,
+            column_types: type_names(&r.column_types),
+            rows: r.rows,
+            cost: r.cost,
+        })
+    }
+
     /// Run a query expression to a `SelectResult`. The top-level orchestrator (CLAUDE.md §2):
     /// (1) PLAN the whole expression tree once against an empty scope chain, threading one
     /// `ParamTypes` so `$N` inference is statement-wide; (2) finalize + bind the parameters;
@@ -2906,12 +2944,92 @@ impl Database {
     /// survive the fold are re-executed per outer row by the evaluator (grammar.md §26).
     fn run_query_expr(&self, qe: QueryExpr, params: &[Value]) -> Result<SelectResult> {
         let mut ptypes = ParamTypes::default();
-        let mut plan = self.plan_query(&qe, None, &mut ptypes)?;
+        let mut plan = self.plan_query(&qe, None, &[], &mut ptypes)?;
         let bound = bind_params(params, &ptypes.finalize()?)?;
         let mut subquery_cost: i64 = 0;
-        self.fold_uncorrelated_in_plan(&mut plan, &bound, &mut subquery_cost)?;
-        let mut r = self.exec_query_plan(&plan, &[], &bound)?;
+        self.fold_uncorrelated_in_plan(&mut plan, &bound, CteCtx::empty(), &mut subquery_cost)?;
+        let mut r = self.exec_query_plan(&plan, &[], &bound, CteCtx::empty())?;
         r.cost += subquery_cost;
+        Ok(r)
+    }
+
+    /// Run a `WITH` query (spec/design/cte.md). The CTE orchestrator (the critique's `plan_with`):
+    /// (1) PLAN each CTE body in order against the prefix of earlier bindings (parent = None — a
+    /// body is an independent query, NOT correlated to a reference site), deriving each binding's
+    /// synthetic relation; (2) plan the main body with all bindings visible, threading the one
+    /// `ParamTypes` so `$N` infers statement-wide; (3) decide each CTE's mode from its reference
+    /// count + `[NOT] MATERIALIZED` hint; (4) MATERIALIZE each referenced materialized CTE once, in
+    /// list order, accruing its cost (a later body sees the earlier buffers); (5) fold + EXECUTE the
+    /// main body with the CTE context. Cost composes like set operations — a sum of the parts.
+    fn run_with(&self, wq: WithQuery, params: &[Value]) -> Result<SelectResult> {
+        let mut ptypes = ParamTypes::default();
+        // (1) Plan each CTE body against the already-built prefix; build its synthetic relation.
+        let mut bindings: Vec<CteBinding> = Vec::with_capacity(wq.ctes.len());
+        for cte in &wq.ctes {
+            let lname = cte.name.to_ascii_lowercase();
+            if bindings.iter().any(|b| b.name == lname) {
+                return Err(EngineError::new(
+                    SqlState::DuplicateAlias,
+                    format!("WITH query name {lname} specified more than once"),
+                ));
+            }
+            let plan = self.plan_query(&cte.query, None, &bindings, &mut ptypes)?;
+            let table = cte_synthetic_table(&lname, &plan, cte.columns.as_deref())?;
+            bindings.push(CteBinding {
+                name: lname,
+                table,
+                plan,
+                hint: cte.materialized,
+                refs: std::cell::Cell::new(0),
+            });
+        }
+        // (2) Plan the main body with all bindings visible.
+        let mut plan = self.plan_query(&wq.body, None, &bindings, &mut ptypes)?;
+        let bound = bind_params(params, &ptypes.finalize()?)?;
+
+        // (3) Per-CTE evaluation mode: MATERIALIZED hint or >=2 references -> Materialize, else
+        //     Inline (cost.md §3). An unreferenced CTE is planned (errors surfaced) but not run.
+        let modes: Vec<CteMode> = bindings
+            .iter()
+            .map(|b| match b.hint {
+                Some(true) => CteMode::Materialize,
+                Some(false) => CteMode::Inline,
+                None if b.refs.get() >= 2 => CteMode::Materialize,
+                None => CteMode::Inline,
+            })
+            .collect();
+        let plans: Vec<QueryPlan> = bindings.into_iter().map(|b| b.plan).collect();
+
+        // (4) Materialize each referenced materialized CTE once, in list order, accruing cost. A
+        //     later body's inline/materialized reference to an earlier CTE sees the prefix context.
+        let mut total_cost: i64 = 0;
+        let mut buffers: Vec<Vec<Row>> = Vec::with_capacity(plans.len());
+        for (i, p) in plans.iter().enumerate() {
+            let buf = if modes[i] == CteMode::Materialize {
+                let ctx = CteCtx {
+                    modes: &modes[..i],
+                    plans: &plans[..i],
+                    buffers: &buffers,
+                };
+                let r = self.exec_query_plan(p, &[], &bound, ctx)?;
+                total_cost += r.cost;
+                r.rows
+            } else {
+                Vec::new()
+            };
+            buffers.push(buf);
+        }
+
+        // (5) Fold + execute the main body against the full CTE context.
+        let ctx = CteCtx {
+            modes: &modes,
+            plans: &plans,
+            buffers: &buffers,
+        };
+        let mut subquery_cost: i64 = 0;
+        self.fold_uncorrelated_in_plan(&mut plan, &bound, ctx, &mut subquery_cost)?;
+        let mut r = self.exec_query_plan(&plan, &[], &bound, ctx)?;
+        r.cost += subquery_cost + total_cost;
         Ok(r)
     }
 
@@ -2928,16 +3046,19 @@ impl Database {
     /// Resolve a query expression into an owned `QueryPlan` against the scope chain (`parent` =
     /// the enclosing query's scope, `None` at top level). A subquery is planned here, once
     /// (spec/design/grammar.md §26).
-    fn plan_query(
-        &self,
+    fn plan_query<'a>(
+        &'a self,
         qe: &QueryExpr,
-        parent: Option<&Scope>,
+        parent: Option<&Scope<'a>>,
+        ctes: &'a [CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<QueryPlan> {
         match qe {
-            QueryExpr::Select(sel) => Ok(QueryPlan::Select(self.plan_select(sel, parent, ptypes)?)),
+            QueryExpr::Select(sel) => Ok(QueryPlan::Select(
+                self.plan_select(sel, parent, ctes, ptypes)?,
+            )),
             QueryExpr::SetOp(so) => Ok(QueryPlan::SetOp(Box::new(
-                self.plan_set_op(so, parent, ptypes)?,
+                self.plan_set_op(so, parent, ctes, ptypes)?,
             ))),
         }
     }
@@ -2949,24 +3070,26 @@ impl Database {
         plan: &QueryPlan,
         outer: &[&[Value]],
         params: &[Value],
+        ctes: CteCtx,
     ) -> Result<SelectResult> {
         match plan {
-            QueryPlan::Select(sp) => self.exec_select_plan(sp, outer, params),
-            QueryPlan::SetOp(sop) => self.exec_set_op_plan(sop, outer, params),
+            QueryPlan::Select(sp) => self.exec_select_plan(sp, outer, params, ctes),
+            QueryPlan::SetOp(sop) => self.exec_set_op_plan(sop, outer, params, ctes),
         }
     }
 
     /// Plan a set operation (spec/design/grammar.md §25): plan both operands with the same
     /// parent scope, check arity + unify column types up front (so the 42601/42804 fire even
     /// over empty operands), and resolve the trailing ORDER BY by output column name.
-    fn plan_set_op(
-        &self,
+    fn plan_set_op<'a>(
+        &'a self,
         so: &SetOp,
-        parent: Option<&Scope>,
+        parent: Option<&Scope<'a>>,
+        ctes: &'a [CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<SetOpPlan> {
-        let lhs = self.plan_query(&so.lhs, parent, ptypes)?;
-        let rhs = self.plan_query(&so.rhs, parent, ptypes)?;
+        let lhs = self.plan_query(&so.lhs, parent, ctes, ptypes)?;
+        let rhs = self.plan_query(&so.rhs, parent, ctes, ptypes)?;
 
         // Arity: both operands must produce the same number of columns. PostgreSQL uses 42601.
         if lhs.column_types().len() != rhs.column_types().len() {
@@ -3021,9 +3144,10 @@ impl Database {
         plan: &SetOpPlan,
         outer: &[&[Value]],
         params: &[Value],
+        ctes: CteCtx,
     ) -> Result<SelectResult> {
-        let left = self.exec_query_plan(&plan.lhs, outer, params)?;
-        let right = self.exec_query_plan(&plan.rhs, outer, params)?;
+        let left = self.exec_query_plan(&plan.lhs, outer, params, ctes)?;
+        let right = self.exec_query_plan(&plan.rhs, outer, params, ctes)?;
 
         // Convert each operand's values to the unified column types BEFORE matching — the only
         // runtime conversion is integer -> decimal (so an int value and a decimal value compare
@@ -3080,10 +3204,11 @@ impl Database {
     /// `run_select`: build the FROM scope, resolve every clause to `RExpr`, infer `$N` types
     /// into `ptypes`. No row is touched and no parameter is bound here (the top-level
     /// `run_query_expr` binds once, after the whole tree is planned).
-    fn plan_select(
-        &self,
+    fn plan_select<'a>(
+        &'a self,
         sel: &Select,
-        parent: Option<&Scope>,
+        parent: Option<&Scope<'a>>,
+        ctes: &'a [CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<SelectPlan> {
         // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
@@ -3115,8 +3240,14 @@ impl Database {
             match &tref.args {
                 None => srf_meta.push(None),
                 Some(args) => {
-                    let (table, rargs, kind) =
-                        self.resolve_srf(&tref.name, args, tref.alias.as_deref(), parent, ptypes)?;
+                    let (table, rargs, kind) = self.resolve_srf(
+                        &tref.name,
+                        args,
+                        tref.alias.as_deref(),
+                        parent,
+                        ctes,
+                        ptypes,
+                    )?;
                     synthetic.push(table);
                     srf_meta.push(Some((synthetic.len() - 1, rargs, kind)));
                 }
@@ -3127,14 +3258,30 @@ impl Database {
         let mut seen_labels: HashSet<String> = HashSet::new();
         let mut offset = 0usize;
         for (tref, meta) in from_items.iter().zip(srf_meta.iter()) {
-            let table: &Table = match meta {
-                None => self.table(&tref.name).ok_or_else(|| {
-                    EngineError::new(
-                        SqlState::UndefinedTable,
-                        format!("table does not exist: {}", tref.name),
-                    )
-                })?,
-                Some((si, _, _)) => &synthetic[*si],
+            // A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog
+            // table of the same name (cte.md §2); lookup is case-insensitive. A hit bumps the
+            // binding's reference count (the inline-vs-materialize decision — cost.md §3).
+            let lname = tref.name.to_ascii_lowercase();
+            let cte_idx = if meta.is_none() {
+                ctes.iter().position(|b| b.name == lname)
+            } else {
+                None
+            };
+            let (table, cte): (&Table, Option<usize>) = match (meta, cte_idx) {
+                (Some((si, _, _)), _) => (&synthetic[*si], None),
+                (None, Some(i)) => {
+                    ctes[i].refs.set(ctes[i].refs.get() + 1);
+                    (&*ctes[i].table, Some(i))
+                }
+                (None, None) => (
+                    self.table(&tref.name).ok_or_else(|| {
+                        EngineError::new(
+                            SqlState::UndefinedTable,
+                            format!("table does not exist: {}", tref.name),
+                        )
+                    })?,
+                    None,
+                ),
             };
             let label = tref
                 .alias
@@ -3152,6 +3299,7 @@ impl Database {
                 table,
                 offset,
                 qualifier_only: false,
+                cte,
             });
             offset += table.columns.len();
         }
@@ -3160,6 +3308,7 @@ impl Database {
             parent,
             catalog: self,
             allow_subquery: true,
+            ctes,
         };
 
         // Resolve GROUP BY keys to flat row indices (a key is a bare/qualified column —
@@ -3339,6 +3488,7 @@ impl Database {
                         parent,
                         catalog: self,
                         allow_subquery: true,
+                        ctes,
                     };
                     Some(resolve_boolean_filter(&partial, on_expr, ptypes)?)
                 }
@@ -3361,6 +3511,7 @@ impl Database {
                 offset: r.offset,
                 col_count: r.table.columns.len(),
                 srf: srf_plans[i].take(),
+                cte: r.cte,
             })
             .collect();
         // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14):
@@ -3430,20 +3581,23 @@ impl Database {
     /// does not (42703/42P01). The produced column's NAME follows PostgreSQL's single-column
     /// function-alias rule: the table alias when one is given (`unnest(xs) AS g` ⇒ column `g`),
     /// else the function name. Returns `(synthetic table, resolved args, kind)`.
-    fn resolve_srf(
-        &self,
+    fn resolve_srf<'a>(
+        &'a self,
         name: &str,
         args: &[Expr],
         alias: Option<&str>,
-        parent: Option<&Scope>,
+        parent: Option<&Scope<'a>>,
+        ctes: &'a [CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
-        // The args see only params/outer — never sibling FROM tables (non-LATERAL).
+        // The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings
+        // are inherited so an arg subquery can reference a CTE (cte.md §2).
         let arg_scope = Scope {
             rels: Vec::new(),
             parent,
             catalog: self,
             allow_subquery: true,
+            ctes,
         };
         if name.eq_ignore_ascii_case("generate_series") {
             return self.resolve_generate_series(args, alias, &arg_scope, ptypes);
@@ -3819,6 +3973,7 @@ impl Database {
         plan: &SelectPlan,
         outer: &[&[Value]],
         params: &[Value],
+        ctes: CteCtx,
     ) -> Result<SelectResult> {
         let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
         let env = EvalEnv {
@@ -3826,6 +3981,7 @@ impl Database {
             params,
             outer,
             rng: &stmt_rng,
+            ctes,
         };
         let mut meter = Meter::with_limit(self.max_cost);
 
@@ -3846,6 +4002,9 @@ impl Database {
             // A set-returning relation is generated, not scanned — it takes the eager path
             // (functions.md §10); the streaming reader assumes a table store.
             && plan.rels[0].srf.is_none()
+            // A CTE reference is a computed/buffered source, not a table store — the eager path
+            // (cte.md §5) delivers its rows; the streaming reader assumes a store.
+            && plan.rels[0].cte.is_none()
         {
             return self.exec_streaming_limit(plan, &env, &mut meter, params);
         }
@@ -3864,6 +4023,8 @@ impl Database {
             && !matches!(plan.rel_bounds[0], Some(ScanBound::Index(_)))
             // A set-returning relation takes the eager path (functions.md §10).
             && plan.rels[0].srf.is_none()
+            // A CTE reference takes the eager path (cte.md §5).
+            && plan.rels[0].cte.is_none()
         {
             return self.exec_streaming_sort(plan, &env, &mut meter, params);
         }
@@ -3882,6 +4043,31 @@ impl Database {
                     SrfKind::Unnest => self.unnest_rows(srf, &env, &mut meter)?,
                 };
                 materialized.push(table_rows);
+                continue;
+            }
+            // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
+            // MATERIALIZED CTE reads its buffer, charging cte_scan_row per row (guarded so a runaway
+            // scan still aborts 54P01); an INLINE CTE runs its body in place (re-evaluating per
+            // outer row under correlation), charging the body's intrinsic cost into this meter.
+            if let Some(ci) = rel.cte {
+                let rows = match env.ctes.modes[ci] {
+                    CteMode::Materialize => {
+                        let buf = &env.ctes.buffers[ci];
+                        for _ in buf {
+                            meter.guard()?;
+                            meter.charge(COSTS.cte_scan_row);
+                        }
+                        buf.clone()
+                    }
+                    CteMode::Inline => {
+                        // The body is an independent query (parent = None at plan time), so it reads
+                        // no outer row; it may reference an EARLIER CTE, so pass the same context.
+                        let r = self.exec_query_plan(&env.ctes.plans[ci], &[], params, env.ctes)?;
+                        meter.charge(r.cost);
+                        r.rows
+                    }
+                };
+                materialized.push(rows);
                 continue;
             }
             let store = self.store(&rel.table_name);
@@ -4201,13 +4387,14 @@ impl Database {
         &self,
         plan: &mut QueryPlan,
         bound: &[Value],
+        ctes: CteCtx,
         cost: &mut i64,
     ) -> Result<()> {
         match plan {
-            QueryPlan::Select(sp) => self.fold_uncorrelated_in_select(sp, bound, cost),
+            QueryPlan::Select(sp) => self.fold_uncorrelated_in_select(sp, bound, ctes, cost),
             QueryPlan::SetOp(sop) => {
-                self.fold_uncorrelated_in_plan(&mut sop.lhs, bound, cost)?;
-                self.fold_uncorrelated_in_plan(&mut sop.rhs, bound, cost)
+                self.fold_uncorrelated_in_plan(&mut sop.lhs, bound, ctes, cost)?;
+                self.fold_uncorrelated_in_plan(&mut sop.rhs, bound, ctes, cost)
             }
         }
     }
@@ -4216,33 +4403,34 @@ impl Database {
         &self,
         sp: &mut SelectPlan,
         bound: &[Value],
+        ctes: CteCtx,
         cost: &mut i64,
     ) -> Result<()> {
         for j in &mut sp.joins {
             if let Some(on) = &mut j.on {
-                self.fold_uncorrelated_in_rexpr(on, bound, cost)?;
+                self.fold_uncorrelated_in_rexpr(on, bound, ctes, cost)?;
             }
         }
         if let Some(f) = &mut sp.filter {
-            self.fold_uncorrelated_in_rexpr(f, bound, cost)?;
+            self.fold_uncorrelated_in_rexpr(f, bound, ctes, cost)?;
         }
         if let Some(h) = &mut sp.having {
-            self.fold_uncorrelated_in_rexpr(h, bound, cost)?;
+            self.fold_uncorrelated_in_rexpr(h, bound, ctes, cost)?;
         }
         for s in &mut sp.agg_specs {
             if let Some(op) = &mut s.operand {
-                self.fold_uncorrelated_in_rexpr(op, bound, cost)?;
+                self.fold_uncorrelated_in_rexpr(op, bound, ctes, cost)?;
             }
         }
         for p in &mut sp.projections {
-            self.fold_uncorrelated_in_rexpr(p, bound, cost)?;
+            self.fold_uncorrelated_in_rexpr(p, bound, ctes, cost)?;
         }
         // A set-returning relation's arguments may themselves contain an (uncorrelated) subquery
         // to fold once before the generator runs (functions.md §10).
         for r in &mut sp.rels {
             if let Some(srf) = &mut r.srf {
                 for a in &mut srf.args {
-                    self.fold_uncorrelated_in_rexpr(a, bound, cost)?;
+                    self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
                 }
             }
         }
@@ -4254,6 +4442,7 @@ impl Database {
         &self,
         e: &mut RExpr,
         bound: &[Value],
+        ctes: CteCtx,
         cost: &mut i64,
     ) -> Result<()> {
         if matches!(e, RExpr::Subquery { .. }) {
@@ -4262,9 +4451,9 @@ impl Database {
             // it. Then leave it untouched if it is correlated (re-run per outer row at eval).
             if let RExpr::Subquery { plan, lhs, .. } = e {
                 if let Some(l) = lhs {
-                    self.fold_uncorrelated_in_rexpr(l, bound, cost)?;
+                    self.fold_uncorrelated_in_rexpr(l, bound, ctes, cost)?;
                 }
-                self.fold_uncorrelated_in_plan(plan, bound, cost)?;
+                self.fold_uncorrelated_in_plan(plan, bound, ctes, cost)?;
                 if query_plan_references_outer(plan, 0) {
                     return Ok(());
                 }
@@ -4281,7 +4470,7 @@ impl Database {
             else {
                 unreachable!("guarded by matches! above")
             };
-            let r = self.exec_query_plan(&plan, &[], bound)?;
+            let r = self.exec_query_plan(&plan, &[], bound, ctes)?;
             *cost += r.cost;
             *e = match kind {
                 SubqueryKind::Scalar => {
@@ -4316,66 +4505,72 @@ impl Database {
             return Ok(());
         }
         match e {
-            RExpr::Cast { inner, .. } => self.fold_uncorrelated_in_rexpr(inner, bound, cost),
-            RExpr::Neg { operand, .. } => self.fold_uncorrelated_in_rexpr(operand, bound, cost),
-            RExpr::Not(x) => self.fold_uncorrelated_in_rexpr(x, bound, cost),
+            RExpr::Cast { inner, .. } => self.fold_uncorrelated_in_rexpr(inner, bound, ctes, cost),
+            RExpr::Neg { operand, .. } => {
+                self.fold_uncorrelated_in_rexpr(operand, bound, ctes, cost)
+            }
+            RExpr::Not(x) => self.fold_uncorrelated_in_rexpr(x, bound, ctes, cost),
             RExpr::Arith { lhs, rhs, .. }
             | RExpr::Compare { lhs, rhs, .. }
             | RExpr::Distinct { lhs, rhs, .. }
             | RExpr::Like { lhs, rhs, .. } => {
-                self.fold_uncorrelated_in_rexpr(lhs, bound, cost)?;
-                self.fold_uncorrelated_in_rexpr(rhs, bound, cost)
+                self.fold_uncorrelated_in_rexpr(lhs, bound, ctes, cost)?;
+                self.fold_uncorrelated_in_rexpr(rhs, bound, ctes, cost)
             }
             RExpr::And(l, r) | RExpr::Or(l, r) => {
-                self.fold_uncorrelated_in_rexpr(l, bound, cost)?;
-                self.fold_uncorrelated_in_rexpr(r, bound, cost)
+                self.fold_uncorrelated_in_rexpr(l, bound, ctes, cost)?;
+                self.fold_uncorrelated_in_rexpr(r, bound, ctes, cost)
             }
-            RExpr::IsNull { operand, .. } => self.fold_uncorrelated_in_rexpr(operand, bound, cost),
+            RExpr::IsNull { operand, .. } => {
+                self.fold_uncorrelated_in_rexpr(operand, bound, ctes, cost)
+            }
             RExpr::Case { arms, els, .. } => {
                 for (c, res) in arms {
-                    self.fold_uncorrelated_in_rexpr(c, bound, cost)?;
-                    self.fold_uncorrelated_in_rexpr(res, bound, cost)?;
+                    self.fold_uncorrelated_in_rexpr(c, bound, ctes, cost)?;
+                    self.fold_uncorrelated_in_rexpr(res, bound, ctes, cost)?;
                 }
-                self.fold_uncorrelated_in_rexpr(els, bound, cost)
+                self.fold_uncorrelated_in_rexpr(els, bound, ctes, cost)
             }
             RExpr::ScalarFunc { args, .. }
             | RExpr::ArrayFunc { args, .. }
             | RExpr::Variadic { args, .. } => {
                 for a in args {
-                    self.fold_uncorrelated_in_rexpr(a, bound, cost)?;
+                    self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
                 }
                 Ok(())
             }
             RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
                 for f in fields {
-                    self.fold_uncorrelated_in_rexpr(f, bound, cost)?;
+                    self.fold_uncorrelated_in_rexpr(f, bound, ctes, cost)?;
                 }
                 Ok(())
             }
-            RExpr::Field { base, .. } => self.fold_uncorrelated_in_rexpr(base, bound, cost),
+            RExpr::Field { base, .. } => self.fold_uncorrelated_in_rexpr(base, bound, ctes, cost),
             RExpr::Subscript {
                 base, subscripts, ..
             } => {
-                self.fold_uncorrelated_in_rexpr(base, bound, cost)?;
+                self.fold_uncorrelated_in_rexpr(base, bound, ctes, cost)?;
                 for s in subscripts {
                     match s {
-                        RSubscript::Index(i) => self.fold_uncorrelated_in_rexpr(i, bound, cost)?,
+                        RSubscript::Index(i) => {
+                            self.fold_uncorrelated_in_rexpr(i, bound, ctes, cost)?
+                        }
                         RSubscript::Slice { lower, upper } => {
                             if let Some(l) = lower {
-                                self.fold_uncorrelated_in_rexpr(l, bound, cost)?;
+                                self.fold_uncorrelated_in_rexpr(l, bound, ctes, cost)?;
                             }
                             if let Some(u) = upper {
-                                self.fold_uncorrelated_in_rexpr(u, bound, cost)?;
+                                self.fold_uncorrelated_in_rexpr(u, bound, ctes, cost)?;
                             }
                         }
                     }
                 }
                 Ok(())
             }
-            RExpr::InValues { lhs, .. } => self.fold_uncorrelated_in_rexpr(lhs, bound, cost),
+            RExpr::InValues { lhs, .. } => self.fold_uncorrelated_in_rexpr(lhs, bound, ctes, cost),
             RExpr::Quantified { lhs, array, .. } => {
-                self.fold_uncorrelated_in_rexpr(lhs, bound, cost)?;
-                self.fold_uncorrelated_in_rexpr(array, bound, cost)
+                self.fold_uncorrelated_in_rexpr(lhs, bound, ctes, cost)?;
+                self.fold_uncorrelated_in_rexpr(array, bound, ctes, cost)
             }
             // Leaves and the (already-handled) Subquery: nothing to recurse into.
             RExpr::Subquery { .. }
@@ -4527,6 +4722,23 @@ struct ScopeRel<'a> {
     table: &'a Table,
     offset: usize,
     qualifier_only: bool,
+    /// `Some(i)` when this relation is a reference to CTE `i` (spec/design/cte.md) rather than a
+    /// base table — its `table` is the binding's synthetic relation and exec delivers its rows from
+    /// the `CteCtx`. `None` for a base table / SRF / pseudo-relation.
+    cte: Option<usize>,
+}
+
+/// A planned common table expression, owned by `plan_with` for the whole statement (so the scopes
+/// that borrow its synthetic `table` outlive it — spec/design/cte.md §A.2). `name` is lowercased
+/// for case-insensitive FROM matching; `table` is the synthetic relation exposing the body's output
+/// columns; `plan` is the planned body; `hint` is the `[NOT] MATERIALIZED` override; `refs` counts
+/// the FROM references resolved to it during planning (a `Cell` — planning borrows `&self`).
+struct CteBinding {
+    name: String,
+    table: Box<Table>,
+    plan: QueryPlan,
+    hint: Option<bool>,
+    refs: std::cell::Cell<usize>,
 }
 
 /// How a column reference resolved against the scope CHAIN (spec/design/grammar.md §26).
@@ -4551,6 +4763,10 @@ struct Scope<'a> {
     /// Whether a subquery is allowed in this scope's expressions: true inside a SELECT (and
     /// its nested subqueries), false for UPDATE/DELETE (a subquery there is 0A000 this slice).
     allow_subquery: bool,
+    /// The statement's CTE bindings visible here (spec/design/cte.md §2). Inherited DIRECTLY down
+    /// into nested scopes (a subquery sees the same `ctes`), NOT via the `parent` chain — so CTE
+    /// lookup never counts as a correlation level. Empty for every non-`WITH` statement.
+    ctes: &'a [CteBinding],
 }
 
 impl<'a> Scope<'a> {
@@ -4565,10 +4781,12 @@ impl<'a> Scope<'a> {
                 table,
                 offset: 0,
                 qualifier_only: false,
+                cte: None,
             }],
             parent: None,
             catalog,
             allow_subquery: true,
+            ctes: &[],
         }
     }
 
@@ -4582,6 +4800,7 @@ impl<'a> Scope<'a> {
             parent: None,
             catalog,
             allow_subquery: false,
+            ctes: &[],
         }
     }
 
@@ -4603,6 +4822,7 @@ impl<'a> Scope<'a> {
             table,
             offset: 0,
             qualifier_only: false,
+            cte: None,
         }];
         for (pseudo, offset) in [("old", old_offset), ("new", new_offset)] {
             if label != pseudo {
@@ -4611,6 +4831,7 @@ impl<'a> Scope<'a> {
                     table,
                     offset,
                     qualifier_only: true,
+                    cte: None,
                 });
             }
         }
@@ -4619,6 +4840,7 @@ impl<'a> Scope<'a> {
             parent: None,
             catalog,
             allow_subquery: true,
+            ctes: &[],
         }
     }
 
@@ -5192,6 +5414,104 @@ impl QueryPlan {
             QueryPlan::SetOp(s) => &s.column_types,
         }
     }
+
+    /// The output column names — the basis for a CTE's synthetic relation when there is no
+    /// column-rename list (spec/design/cte.md §1).
+    fn column_names(&self) -> &[String] {
+        match self {
+            QueryPlan::Select(s) => &s.column_names,
+            QueryPlan::SetOp(s) => &s.column_names,
+        }
+    }
+}
+
+/// Build the synthetic relation a CTE reference resolves against (spec/design/cte.md §2): one
+/// column per body output, named by the rename list (a count mismatch is 42P10) or the body's own
+/// output names, typed from the planned body. The relation has no primary key / constraints — it is
+/// read-only and its rows come from the CTE context, never a store.
+fn cte_synthetic_table(
+    name: &str,
+    plan: &QueryPlan,
+    rename: Option<&[String]>,
+) -> Result<Box<Table>> {
+    let body_types = plan.column_types();
+    let body_names = plan.column_names();
+    let col_names: Vec<String> = match rename {
+        // PostgreSQL allows FEWER aliases than the body has columns — the first `cols.len()` columns
+        // take the aliases, the rest keep their body output names (a partial rename). Only MORE
+        // aliases than columns is an error (42P10).
+        Some(cols) => {
+            if cols.len() > body_types.len() {
+                return Err(EngineError::new(
+                    SqlState::InvalidColumnReference,
+                    format!(
+                        "WITH query \"{name}\" has {} columns available but {} columns specified",
+                        body_types.len(),
+                        cols.len()
+                    ),
+                ));
+            }
+            (0..body_types.len())
+                .map(|i| {
+                    cols.get(i)
+                        .cloned()
+                        .unwrap_or_else(|| body_names[i].clone())
+                })
+                .collect()
+        }
+        None => body_names.to_vec(),
+    };
+    let columns = col_names
+        .iter()
+        .zip(body_types.iter())
+        .map(|(n, t)| {
+            Ok(Column {
+                name: n.clone(),
+                ty: type_from_resolved(t)?,
+                decimal: None,
+                primary_key: false,
+                not_null: false,
+                default: None,
+                default_expr: None,
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(Box::new(Table {
+        name: name.to_string(),
+        columns,
+        pk: Vec::new(),
+        checks: Vec::new(),
+        indexes: Vec::new(),
+    }))
+}
+
+/// The catalog `Type` whose `resolved_type_of_col` round-trips to `rt` — used to give a CTE's
+/// synthetic columns a `Type` (spec/design/cte.md). An untyped NULL column maps to `text`
+/// (PostgreSQL's unknown -> text rule). A decimal's per-column typmod is irrelevant for a read-only
+/// CTE column (values flow through unchanged), so it is dropped. An anonymous `ROW(...)` composite
+/// has no catalog type to name — deferred (0A000), a corner not reached by the corpus.
+fn type_from_resolved(rt: &ResolvedType) -> Result<Type> {
+    Ok(match rt {
+        ResolvedType::Int(s) | ResolvedType::Float(s) => Type::Scalar(*s),
+        ResolvedType::Bool => Type::Scalar(ScalarType::Bool),
+        ResolvedType::Text | ResolvedType::Null => Type::Scalar(ScalarType::Text),
+        ResolvedType::Decimal => Type::Scalar(ScalarType::Decimal),
+        ResolvedType::Bytea => Type::Scalar(ScalarType::Bytea),
+        ResolvedType::Uuid => Type::Scalar(ScalarType::Uuid),
+        ResolvedType::Timestamp => Type::Scalar(ScalarType::Timestamp),
+        ResolvedType::Timestamptz => Type::Scalar(ScalarType::Timestamptz),
+        ResolvedType::Interval => Type::Scalar(ScalarType::Interval),
+        ResolvedType::Composite(r) => match &r.name {
+            Some(n) => Type::Composite(crate::types::CompositeRef { name: n.clone() }),
+            None => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "an anonymous composite column in a CTE is not supported yet",
+                ));
+            }
+        },
+        ResolvedType::Array(elem) => Type::Array(Box::new(type_from_resolved(elem)?)),
+    })
 }
 
 /// One relation in a SELECT plan: the table name (looked up in the store at exec), the flat
@@ -5204,6 +5524,47 @@ struct PlanRel {
     offset: usize,
     col_count: usize,
     srf: Option<SrfPlan>,
+    /// When `Some(i)`, this relation is a reference to common-table-expression `i` (the index into
+    /// the statement's CTE list — spec/design/cte.md), not a base table: `table_name` is then the
+    /// CTE name (never looked up in the store) and the executor delivers its rows from the
+    /// per-statement `CteCtx` (a materialized buffer, or the inlined body run in place).
+    cte: Option<usize>,
+}
+
+/// How a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE from its
+/// reference count and `[NOT] MATERIALIZED` hint: a single-reference CTE is `Inline`, a
+/// multi-reference (or `MATERIALIZED`) one is `Materialize`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CteMode {
+    /// Run the body in place at each reference (re-evaluates per outer row under correlation,
+    /// matching PostgreSQL); charges the body's intrinsic cost, no `cte_scan_row`.
+    Inline,
+    /// Run the body once, buffer the rows; each reference scans the buffer, charging `cte_scan_row`
+    /// per buffered row.
+    Materialize,
+}
+
+/// The per-statement CTE execution context, threaded through `exec_*` and `EvalEnv` so a FROM
+/// reference (any nesting depth) can deliver a CTE's rows (spec/design/cte.md §5). `modes` and
+/// `plans` are fixed after planning; `buffers` is filled before the main query runs — one slot per
+/// CTE in list order, holding the materialized rows of a `Materialize` CTE (an empty placeholder
+/// for an `Inline` one, whose body is run in place from `plans` instead).
+#[derive(Clone, Copy)]
+struct CteCtx<'a> {
+    modes: &'a [CteMode],
+    plans: &'a [QueryPlan],
+    buffers: &'a [Vec<Row>],
+}
+
+impl CteCtx<'_> {
+    /// The empty context — no CTEs in scope (every non-`WITH` execution path).
+    fn empty() -> CteCtx<'static> {
+        CteCtx {
+            modes: &[],
+            plans: &[],
+            buffers: &[],
+        }
+    }
 }
 
 /// Which set-returning function a [`SrfPlan`] is, selecting the row generator at exec
@@ -6367,6 +6728,9 @@ struct EvalEnv<'a> {
     /// is `&`-shared; the draw order is fixed by eval order). The injected random/clock functions
     /// live on `exec.seam` (handle-scoped); only the volatile uuid generators touch any of this.
     rng: &'a std::cell::Cell<crate::seam::StmtRng>,
+    /// The statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at any
+    /// nesting depth delivers a CTE's rows. `CteCtx::empty()` for every non-`WITH` statement.
+    ctes: CteCtx<'a>,
 }
 
 /// Build the constant `RExpr` for a folded uncorrelated-subquery value (§26). The static type
@@ -7846,7 +8210,7 @@ fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::Insert(_) => "INSERT",
         Statement::Update(_) => "UPDATE",
         Statement::Delete(_) => "DELETE",
-        Statement::Select(_) | Statement::SetOp(_) => "SELECT",
+        Statement::Select(_) | Statement::SetOp(_) | Statement::With(_) => "SELECT",
         Statement::Begin { .. } => "BEGIN",
         Statement::Commit => "COMMIT",
         Statement::Rollback => "ROLLBACK",
@@ -7984,7 +8348,9 @@ fn plan_subquery(scope: &Scope, inner: &QueryExpr, params: &mut ParamTypes) -> R
             "subqueries are only supported in a SELECT statement",
         ));
     }
-    scope.catalog.plan_query(inner, Some(scope), params)
+    scope
+        .catalog
+        .plan_query(inner, Some(scope), scope.ctes, params)
 }
 
 /// Resolve one array-subscript bound to an integer `RExpr` (a literal adapts to int4; a non-integer
@@ -11944,7 +12310,9 @@ impl RExpr {
                 m.charge(COSTS.operator_eval);
                 let mut child: Vec<&[Value]> = env.outer.to_vec();
                 child.push(row);
-                let r = env.exec.exec_query_plan(plan, &child, env.params)?;
+                let r = env
+                    .exec
+                    .exec_query_plan(plan, &child, env.params, env.ctes)?;
                 m.charge(r.cost);
                 match kind {
                     SubqueryKind::Scalar => {

@@ -80,6 +80,9 @@ TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row qu
              query.where_eq query.comparison_order query.order_by query.is_null
              query.logical_connectives query.union query.aggregates query.subquery_scalar
              expr.arithmetic expr.comparison_value types.int32 null.three_valued].freeze
+CTE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+             query.where_eq query.comparison_order query.order_by query.cte expr.arithmetic
+             expr.between expr.comparison_value types.int32].freeze
 
 # The default relation note describes the NoREC pair (an optimized form vs a non-optimizable
 # rewrite). TLP overrides it with its own partition-reconstruction note (it is not an opt pair).
@@ -428,6 +431,45 @@ def gen_tlp(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: CTE inline / materialize / direct equivalence ----------------------------------
+# A single-reference CTE is INLINED, a MATERIALIZED one runs once and is buffered (cte.md §3);
+# both must return the SAME rows as the equivalent query written without the WITH. The predicate
+# selects a by-construction subset, so the expected rows are known without an oracle.
+def gen_cte(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  rows = ids.map { |id| [id, rng.rand(-100..100)] }
+  block = ->(pred) { rows.select { |id, v| pred.call(id, v) }.flat_map { |id, v| [id.to_s, v.to_s] } }
+
+  lo, hi = ids.sample(2, random: rng).sort
+  k = rng.rand(-100..100)
+
+  out = header(seed, CTE_REQ, "CTE inline vs materialize vs direct (all equivalent)")
+  stmt(out, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v| "(#{id}, #{v})" }.join(', ')}")
+
+  # Three forms that MUST return identical rows: the direct query, a single-reference CTE (which
+  # inlines), and a MATERIALIZED CTE (which buffers). Cost differs; rows do not.
+  triple = lambda do |title, pred_sql, exp|
+    out << "# #{title} — direct"
+    q(out, "II", "SELECT id, v FROM t WHERE #{pred_sql} ORDER BY id", exp)
+    out << "# same, via a single-reference CTE (inlined) — MUST match"
+    q(out, "II", "WITH c AS (SELECT id, v FROM t WHERE #{pred_sql}) SELECT id, v FROM c ORDER BY id", exp)
+    out << "# same, via a MATERIALIZED CTE (buffered) — MUST match"
+    q(out, "II",
+      "WITH c AS MATERIALIZED (SELECT id, v FROM t WHERE #{pred_sql}) SELECT id, v FROM c ORDER BY id", exp)
+  end
+
+  triple.call("range #{lo}..#{hi}", "id BETWEEN #{lo} AND #{hi}",
+              block.call(->(id, _v) { id >= lo && id <= hi }))
+  triple.call("v > #{k} (full scan on a non-key column)", "v > #{k}",
+              block.call(->(_id, v) { v > k }))
+  triple.call("empty (id BETWEEN 41 AND 50)", "id BETWEEN 41 AND 50",
+              block.call(->(id, _v) { id >= 41 && id <= 50 }))
+
+  out.join("\n") + "\n"
+end
+
 SCENARIOS = {
   "pushdown" => method(:gen_pushdown),
   "limit" => method(:gen_limit),
@@ -435,6 +477,7 @@ SCENARIOS = {
   "correlated" => method(:gen_correlated),
   "index" => method(:gen_index),
   "tlp" => method(:gen_tlp),
+  "cte" => method(:gen_cte),
 }.freeze
 
 # Run one core's harness once; return {basename => "PASS"/"FAIL"/"SKIP"} and the detail line per

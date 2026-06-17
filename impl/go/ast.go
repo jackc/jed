@@ -16,7 +16,11 @@ type Statement struct {
 	// SetOp is a set operation (UNION/INTERSECT/EXCEPT) combining two query expressions
 	// (spec/design/grammar.md §25). Non-nil only when at least one set operator is present; a
 	// lone SELECT stays in Select, so the plain-query path and host API are untouched.
-	SetOp  *SetOp
+	SetOp *SetOp
+	// With is a query prefixed by a WITH clause defining one or more common table expressions
+	// (spec/design/cte.md). Non-nil only when a WITH is present; a plain query stays Select/SetOp,
+	// so the host API and the no-CTE paths are untouched (the SetOp precedent).
+	With   *WithQuery
 	Update *Update
 	Delete *Delete
 	// Begin/Commit/Rollback are the explicit transaction-control statements (grammar.md §27,
@@ -355,6 +359,28 @@ type SetOp struct {
 	OrderBy []OrderKey
 	Limit   *int64
 	Offset  *int64
+}
+
+// Cte is one common table expression in a WITH list (spec/design/cte.md). A named, statement-local
+// relation backed by a query. Columns is the optional column-rename list (renames the body's output
+// columns left to right; a count mismatch is 42P10). Materialized is the explicit evaluation hint:
+// a non-nil pointer to true is MATERIALIZED, to false is NOT MATERIALIZED, nil is PostgreSQL's
+// default (inline a single-reference CTE, materialize a multi-reference one — cost.md §3). Query is
+// any query_expr (a SELECT or a set operation).
+type Cte struct {
+	Name         string
+	Columns      []string
+	Materialized *bool
+	Query        QueryExpr
+}
+
+// WithQuery is a top-level query prefixed by a WITH clause (spec/design/cte.md). Ctes is the
+// non-empty list of common table expressions (each visible to later CTEs and to Body); Body is the
+// main query expression. Built only when a WITH is present — a plain query stays Statement{Select}
+// / Statement{SetOp}, so those paths are untouched (the SetOp precedent).
+type WithQuery struct {
+	Ctes []Cte
+	Body QueryExpr
 }
 
 // SelectItems is either all columns (*) or a list of projected expressions.
