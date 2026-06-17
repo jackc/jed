@@ -106,6 +106,15 @@ and traps both if the 64-bit operation itself overflows and if the in-range 64-b
 falls outside the declared result type. `division`/`modulo` by zero is a distinct defined
 trap, `22012` (`division_by_zero`), not a wrapped or platform-dependent value.
 
+One subtlety at the negative boundary: dividing the most-negative value by `-1`
+(`int64_min / -1`) **traps `22003`** — the true quotient is `-int64_min`, which has no
+positive counterpart in the type (the same overflow as negating `int64_min`). But the
+**modulo** counterpart `x % -1` is **`0` for every `x`** (the remainder is mathematically
+zero), so it **never traps** — even at `int64_min % -1`, where a naive 64-bit `IDIV` would
+fault. Each core special-cases divisor `-1` in modulo to yield `0`, matching PostgreSQL and
+keeping the three integer widths consistent (the `int16`/`int32` cases already compute `0`
+cleanly when widened to 64-bit).
+
 ## 4. Comparison, promotion, three-valued NULL
 
 See [../types/compare.toml](../types/compare.toml).

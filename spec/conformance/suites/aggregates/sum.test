@@ -83,3 +83,31 @@ query I nosort
 SELECT SUM(a) FROM e
 ----
 NULL
+
+# SUM(int32) widens to int64 (§3): a running sum that exceeds int32 max (2147483647) but
+# fits int64 does NOT trap — the boundary is the RESULT type, not the input width.
+# 2000000000 * 3 = 6000000000. The `# types:` directive pins the result as int64 (the three
+# integer widths are indistinguishable under the `I` render tag, so a core widening to the
+# wrong width would pass on rows alone — the §8 promotion hotspot, made assertable).
+statement ok
+CREATE TABLE t32w (id int32 PRIMARY KEY, a int32)
+
+statement ok
+INSERT INTO t32w VALUES (1, 2000000000), (2, 2000000000), (3, 2000000000)
+
+# names: sum
+# types: int64
+# cost: 8
+query I nosort
+SELECT SUM(a) FROM t32w
+----
+6000000000
+
+# SUM overflow trap (22003): the boundary is the RESULT type (§3, §9) — int64 for the
+# int16/int32 case, the decimal cap for the int64/decimal case — and is checked on the FINAL
+# result only, never an intermediate. It is pinned here ONLY by the non-trapping widening
+# cases above, because the trap itself is unreachable with practical corpus data: overflowing
+# the int64 accumulator needs ~4.3e9 int32 rows, and overflowing the decimal cap needs a
+# ~131072-digit value (max_int_digits, decimal.md §2). The per-value arithmetic overflow trap
+# is covered in expr/arithmetic.test; this note keeps the coverage boundary explicit, not
+# silent (CLAUDE.md §10).

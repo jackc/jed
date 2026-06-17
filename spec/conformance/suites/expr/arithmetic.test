@@ -4,7 +4,7 @@
 # division and modulo by zero are a defined trap, 22012. Integer division truncates
 # toward zero and the remainder takes the dividend's sign (spec/design/types.md §3,
 # spec/design/functions.md §7). Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.int32, types.int64, expr.arithmetic, expr.parens, expr.precedence, error.overflow_trap, error.division_by_zero
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.int16, types.int32, types.int64, cast.explicit, expr.arithmetic, expr.parens, expr.precedence, error.overflow_trap, error.division_by_zero
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
@@ -102,3 +102,42 @@ query I nosort
 SELECT CAST(a AS int64) + b FROM edge WHERE id = 1
 ----
 2147483648
+
+# --- INT_MIN / -1 overflow: the negation of the most-negative value has no positive ----
+# counterpart, so the division overflows at the result type and traps 22003 (matching PG,
+# which raises "out of range" — and the hardware IDIV trap a naive core would hit). Pinned
+# for all three widths; values staged via columns (the bare literal -9223372036854775808
+# cannot be written directly — it lexes as unary minus of an out-of-range magnitude).
+statement ok
+CREATE TABLE divmin (id int32 PRIMARY KEY, i16 int16, i32 int32, i64 int64, neg1 int64)
+
+statement ok
+INSERT INTO divmin VALUES (1, -32768, -2147483648, -9223372036854775808, -1)
+
+statement error 22003
+SELECT i16 / CAST(neg1 AS int16) FROM divmin WHERE id = 1
+
+statement error 22003
+SELECT i32 / CAST(neg1 AS int32) FROM divmin WHERE id = 1
+
+statement error 22003
+SELECT i64 / neg1 FROM divmin WHERE id = 1
+
+# --- INT_MIN % -1: the remainder is mathematically 0 for EVERY value, so it never traps —
+# unlike the division above. All three widths return 0, including int64_min % -1, where each
+# core special-cases divisor -1 rather than letting the 64-bit IDIV fault (types.md §3).
+# Matches PostgreSQL.
+query I nosort
+SELECT i16 % CAST(neg1 AS int16) FROM divmin WHERE id = 1
+----
+0
+
+query I nosort
+SELECT i32 % CAST(neg1 AS int32) FROM divmin WHERE id = 1
+----
+0
+
+query I nosort
+SELECT i64 % neg1 FROM divmin WHERE id = 1
+----
+0

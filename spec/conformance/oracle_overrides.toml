@@ -299,3 +299,56 @@ reason = "jed: WITH RECURSIVE is deferred this slice (0A000 — cte.md §6). Pos
 file = "cte/errors.test"
 sql = "WITH a AS (WITH b AS (SELECT id FROM t) SELECT id FROM b) SELECT id FROM a"
 reason = "jed: a WITH attaches only at the statement top level this slice, so a nested WITH inside a CTE body is a 42601 syntax error (cte.md §1/§6 — the body is the WITH-less query_expr). PostgreSQL accepts a nested WITH and runs it. A documented surface narrowing."
+
+# --- float math functions: argument resolution is `none` (catalog), so a bare integer or
+# decimal literal does NOT implicitly promote to the float family. PostgreSQL resolves these
+# by casting the argument to double precision and returns a value; jed rejects 42883. The
+# strict type system (§4): cross-family int/decimal -> float is explicit-only (float.md).
+[[override]]
+file = "expr/float_math.test"
+sql = "SELECT sqrt(4)"
+reason = "jed: sqrt takes the float family with arg_resolution = none (catalog), and an integer literal does not implicitly promote to float, so 42883. PostgreSQL casts int -> double precision and returns 2. The strict type system (§4): int<->float is explicit-cast-only (float.md)."
+
+[[override]]
+file = "expr/float_math.test"
+sql = "SELECT sqrt(4.0)"
+reason = "jed: sqrt takes the float family with arg_resolution = none (catalog), and a decimal literal does not implicitly promote to float, so 42883. PostgreSQL casts numeric -> double precision and returns 2. The strict type system (§4): decimal<->float is explicit-cast-only (float.md)."
+
+# --- float round() ties: jed rounds half-AWAY-from-zero (one deterministic mode engine-wide,
+# decimal.md §3 / CLAUDE.md §8), so round(2.5) = 3. PostgreSQL's float8 round uses the C library
+# rint() (round-half-to-EVEN, platform-dependent), returning 2. jed deliberately diverges to keep
+# float rounding deterministic and cross-core identical (§8 float-formatting bias, §10), rather than
+# inherit PG's platform-sensitive rounding. round(3.5) agrees (both 4) and needs no override.
+[[override]]
+file = "expr/float_math.test"
+sql = "SELECT round(x) FROM f WHERE id = 10"
+reason = "jed: float round() is half-away-from-zero (the engine-wide deterministic rounding mode, decimal.md §3), so round(2.5::float64) = 3. PostgreSQL's double-precision round is the platform rint() (half-to-even) and returns 2 — nondeterministic across platforms, which jed deliberately avoids for cross-core determinism (CLAUDE.md §8/§10)."
+
+# --- round(float64, n): jed defines a 2-argument round over the float family (catalog
+# round/2, result float64). PostgreSQL's 2-arg round is numeric-only — there is no
+# round(double precision, integer) — so PG cannot resolve this call. A deliberate jed surface
+# extension (the float-math family, float_math.test); the 1-arg float round is PG-comparable.
+[[override]]
+file = "expr/float_math.test"
+sql = "SELECT round(x, 1) FROM f WHERE id = 6"
+reason = "jed extension: a 2-argument round() over float64 (catalog round/2, result float64). PostgreSQL's 2-arg round is numeric-only (no round(double precision, integer)), so PG has no such overload. jed returns 1.5."
+
+# --- float domain-error codes: jed has a single numeric range/domain trap, 22003 (the registry
+# defines no granular 2201E/2201F), so every float math domain error collapses to 22003 — the
+# same engine-wide simplification float.test already uses. PostgreSQL distinguishes 2201E
+# (invalid_argument_for_logarithm) and 2201F (invalid_argument_for_power_function). The message
+# differs; the trap and its determinism are identical.
+[[override]]
+file = "expr/float_math.test"
+sql = "SELECT sqrt(x) FROM f WHERE id = 7"
+reason = "jed: sqrt of a negative traps 22003 (jed's single numeric range/domain code — no granular 2201F in the registry). PostgreSQL raises 2201F (invalid_argument_for_power_function). Engine-wide collapse to 22003 (errors/registry.toml), as in float.test."
+
+[[override]]
+file = "expr/float_math.test"
+sql = "SELECT ln(x) FROM f WHERE id = 3"
+reason = "jed: ln of zero traps 22003 (jed's single numeric range/domain code — no granular 2201E in the registry). PostgreSQL raises 2201E (invalid_argument_for_logarithm). Engine-wide collapse to 22003."
+
+[[override]]
+file = "expr/float_math.test"
+sql = "SELECT log10(x) FROM f WHERE id = 3"
+reason = "jed: log10 of zero traps 22003 (jed's single numeric range/domain code — no granular 2201E in the registry). PostgreSQL raises 2201E (invalid_argument_for_logarithm). Engine-wide collapse to 22003."

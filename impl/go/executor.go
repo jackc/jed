@@ -11148,9 +11148,9 @@ func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
 		if y == 0 {
 			return Value{}, NewError(DivisionByZero, "division by zero")
 		}
-		if x == math.MinInt64 && y == -1 {
-			return Value{}, overflowErr(result)
-		}
+		// `x % -1` is mathematically 0 for every x; Go computes it as 0 natively (no
+		// overflow). Unlike division, modulo by -1 has no out-of-range result, so it does
+		// NOT trap — matching PostgreSQL and the int16/int32 widths (spec/design/types.md §3).
 		v = x % y
 	}
 	if !result.InRange(v) {

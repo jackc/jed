@@ -12584,7 +12584,11 @@ fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> 
                     "division by zero",
                 ));
             }
-            x.checked_rem(y)
+            // `x % -1` is mathematically 0 for every x. Special-cased so i64::MIN % -1
+            // returns 0 instead of trapping on the i64 IDIV overflow (which `checked_rem`
+            // reports as None) — matching PostgreSQL and the int16/int32 widths, which
+            // already compute 0 cleanly in 64-bit (spec/design/types.md §3).
+            if y == -1 { Some(0) } else { x.checked_rem(y) }
         }
     };
     let v = computed.ok_or_else(|| overflow(result))?;

@@ -1,0 +1,170 @@
+# Float math functions (spec/functions/catalog.toml, kind = "function") over float64:
+# ceil / floor / trunc / round(1) / round(2), sqrt, exp, ln, log10, pow, sin / cos / tan.
+# Each takes the float family and returns float64 (the `R` render tag — compared by parsed
+# value at tolerance, conformance.md §1), charges one operator_eval per call, and propagates
+# NULL. The transcendental/root kernels trap 22003 (sqrt of a negative, ln/log10 of <=0, an
+# exp/pow result out of float64 range). Argument resolution is `none`: a bare integer/decimal
+# literal does NOT promote to float (an explicit float64 value is required) — so these
+# functions are exercised through float64 columns. round over float64 is half-away-from-zero
+# (round(2.5) = 3), matching jed's decimal round (decimal.md §3). PostgreSQL-oracle-checkable.
+# Gated by types.float64 (the float surface that already owns the sqrt kernel). Format:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.int32, types.float64, resource.cost_metering
+
+statement ok
+CREATE TABLE f (id int32 PRIMARY KEY, x float64)
+
+statement ok
+INSERT INTO f VALUES
+  (1, 4.0),
+  (2, 2.0),
+  (3, 0.0),
+  (4, 1.0),
+  (5, 100.0),
+  (6, 1.5),
+  (7, -1.5),
+  (8, -1.7),
+  (10, 2.5),
+  (11, 3.5),
+  (12, NULL)
+
+# --- sqrt: exact and irrational; NULL propagates --------------------------------------
+query R nosort
+SELECT sqrt(x) FROM f WHERE id = 1
+----
+2
+
+query R nosort
+SELECT sqrt(x) FROM f WHERE id = 2
+----
+1.4142135623730951
+
+# --- exp / ln / log10 at their identities ---------------------------------------------
+query R nosort
+SELECT exp(x) FROM f WHERE id = 3
+----
+1
+
+query R nosort
+SELECT ln(x) FROM f WHERE id = 4
+----
+0
+
+query R nosort
+SELECT log10(x) FROM f WHERE id = 5
+----
+2
+
+# --- ceil / floor / trunc: direction at a non-integer (incl. a negative) --------------
+query R nosort
+SELECT ceil(x) FROM f WHERE id = 6
+----
+2
+
+query R nosort
+SELECT floor(x) FROM f WHERE id = 7
+----
+-2
+
+query R nosort
+SELECT trunc(x) FROM f WHERE id = 8
+----
+-1
+
+# --- round over float64 is half-AWAY-from-zero (2.5 -> 3, 3.5 -> 4), like decimal -----
+query R nosort
+SELECT round(x) FROM f WHERE id = 10
+----
+3
+
+query R nosort
+SELECT round(x) FROM f WHERE id = 11
+----
+4
+
+# --- round(x, n): n places ------------------------------------------------------------
+query R nosort
+SELECT round(x, 1) FROM f WHERE id = 6
+----
+1.5
+
+# --- sin / cos / tan at 0 -------------------------------------------------------------
+query RRR nosort
+SELECT sin(x), cos(x), tan(x) FROM f WHERE id = 3
+----
+0
+1
+0
+
+# --- NULL propagates through every float function -------------------------------------
+query R nosort
+SELECT sqrt(x) FROM f WHERE id = 12
+----
+NULL
+
+# --- pow(base, exponent): 2^10 = 1024 -------------------------------------------------
+statement ok
+CREATE TABLE g (id int32 PRIMARY KEY, a float64, b float64)
+
+statement ok
+INSERT INTO g VALUES (1, 2.0, 10.0), (2, 10.0, 400.0)
+
+query R nosort
+SELECT pow(a, b) FROM g WHERE id = 1
+----
+1024
+
+# --- cost: one operator_eval per call. 3 scanned + 3 produced + ... = 10 (a clean -----
+# full scan; all-positive so no kernel traps) -----------------------------------------
+statement ok
+CREATE TABLE p (id int32 PRIMARY KEY, x float64)
+
+statement ok
+INSERT INTO p VALUES (1, 4.0), (2, 9.0), (3, 16.0)
+
+# cost: 10
+query R rowsort
+SELECT sqrt(x) FROM p
+----
+2
+3
+4
+
+# --- traps: sqrt of a negative, ln/log10 of <= 0, an out-of-range exp/pow → 22003 -----
+statement error 22003
+SELECT sqrt(x) FROM f WHERE id = 7
+
+statement error 22003
+SELECT ln(x) FROM f WHERE id = 3
+
+statement error 22003
+SELECT log10(x) FROM f WHERE id = 3
+
+# exp(710) overflows float64
+statement ok
+CREATE TABLE big (id int32 PRIMARY KEY, x float64)
+
+statement ok
+INSERT INTO big VALUES (1, 710.0)
+
+statement error 22003
+SELECT exp(x) FROM big
+
+# pow(10, 400) overflows float64
+statement error 22003
+SELECT pow(a, b) FROM g WHERE id = 2
+
+# --- argument resolution is `none`: a bare integer/decimal literal does NOT promote ---
+# to float (an explicit float64 is required), so there is no matching overload → 42883 -
+statement error 42883
+SELECT sqrt(4)
+
+statement error 42883
+SELECT sqrt(4.0)
+
+# --- wrong arity / unknown name → 42883 -----------------------------------------------
+statement error 42883
+SELECT sqrt(x, x) FROM f WHERE id = 1
+
+statement error 42883
+SELECT pow(a) FROM g WHERE id = 1

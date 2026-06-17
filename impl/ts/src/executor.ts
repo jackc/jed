@@ -9145,7 +9145,9 @@ function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Valu
       break;
     default: // "mod"
       if (y === 0n) throw engineError("division_by_zero", "division by zero");
-      if (x === I64_MIN && y === -1n) throw overflow(result);
+      // `x % -1` is mathematically 0 for every x; bigint computes it as 0n exactly (no
+      // overflow). Unlike division, modulo by -1 has no out-of-range result, so it does NOT
+      // trap — matching PostgreSQL and the int16/int32 widths (spec/design/types.md §3).
       v = x % y; // bigint remainder takes the dividend's sign
       break;
   }
