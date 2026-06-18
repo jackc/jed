@@ -5,7 +5,7 @@
 # shorter-prefix-first), and the whole-value IS NULL rule. v1 ships 1-D values of scalar elements;
 # arrays-in-keys, multidim values, slices, and the array function surface are deferred. array_out
 # matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, types.array, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, expr.not_equal, types.array, types.int32, types.text, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])
@@ -159,6 +159,20 @@ query B nosort
 SELECT xs = ARRAY[1,NULL] FROM cmpn WHERE id = 2
 ----
 true
+
+# <> is the negation of array =, and stays DEFINITE: {1,NULL} <> {1,3} differs at the 2nd element
+# -> TRUE, never UNKNOWN (the contrast with composite <>, which is 3VL — types/composite.test).
+query B nosort
+SELECT xs <> ARRAY[1,3] FROM cmpn WHERE id = 2
+----
+true
+
+# {1,NULL} != {1,NULL}: the elements are mutually equal, so = is TRUE and != is FALSE (the !=
+# alias folds to the same operator).
+query B nosort
+SELECT xs != ARRAY[1,NULL] FROM cmpn WHERE id = 2
+----
+false
 
 # --- array_out / array_in text I/O (array.md §7). An element is double-quoted when it is empty,
 # contains a delimiter/brace/quote/backslash, or equals the word NULL; `"` and `\` are

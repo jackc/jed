@@ -7,7 +7,7 @@
 # `box`/…), and the corpus uses the PG-compatible record_in literal for NESTED composites — the bare
 # nested `ROW(ROW(…),…)` constructor is a documented jed extension PG rejects, covered by the unit
 # tests, not this PG-oracle corpus. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.group_by, query.aggregates, types.composite, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.group_by, query.aggregates, expr.not_equal, types.composite, types.int32, types.text, resource.cost_metering
 
 statement ok
 CREATE TYPE addr AS (street text, zip int32)
@@ -138,6 +138,16 @@ SELECT ROW(1, 2) = ROW(1, 2), ROW(1, NULL) = ROW(1, 2), ROW(1, NULL) = ROW(2, 2)
 true
 NULL
 false
+
+# Not-equal (<>) is the 3VL negation of =: equal rows FALSE; a NULL deciding field UNKNOWN; a
+# FALSE field dominates → TRUE. Composite <> is 3VL (it can be NULL) — UNLIKE array <>, which is
+# always a definite boolean (types/array.test). The != alias folds to the same operator.
+query BBB nosort
+SELECT ROW(1, 2) <> ROW(1, 2), ROW(1, NULL) <> ROW(1, 2), ROW(1, NULL) != ROW(2, 2)
+----
+false
+NULL
+true
 
 # Lexicographic ordering: the first non-equal field decides.
 query BBB nosort
