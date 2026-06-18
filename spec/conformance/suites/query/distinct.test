@@ -183,8 +183,8 @@ SELECT DISTINCT a FROM t ORDER BY a LIMIT 1 OFFSET 1
 query B rowsort
 SELECT DISTINCT a = b FROM t
 ----
-false
 NULL
+false
 
 # An alias is just an output label: `ORDER BY a` references the underlying bare-projected
 # column `a` (the alias `x` is invisible to ORDER BY, §8), so this is allowed and names the

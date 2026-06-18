@@ -102,12 +102,12 @@ INSERT INTO log VALUES (30, 3), (10, 1), (20, 2)
 query II rowsort
 SELECT a, b FROM log
 ----
-30
-3
 10
 1
 20
 2
+30
+3
 
 # NULL into a nullable column is fine inside a multi-row batch
 statement ok
@@ -116,12 +116,12 @@ INSERT INTO log VALUES (40, NULL), (50, 5)
 query II rowsort
 SELECT a, b FROM log
 ----
-30
-3
 10
 1
 20
 2
+30
+3
 40
 NULL
 50

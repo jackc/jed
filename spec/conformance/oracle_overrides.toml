@@ -578,3 +578,299 @@ reason = "jed: grouping a subquery BY an enclosing-query column is a degenerate 
 file = "subquery/correlated.test"
 sql = "SELECT t1.id FROM t1 WHERE EXISTS (SELECT t2.v FROM t2 ORDER BY t1.v)"
 reason = "jed: ordering a subquery BY an enclosing-query column is a degenerate narrowing — 0A000 (grammar.md §26). PostgreSQL accepts it. A documented narrowing."
+
+# ================================================================================================
+# Corpus-wide ledger reconciliation 2026-06-18 — genuine jed-vs-PostgreSQL divergences in the
+# remaining untouched files (the larger cleanup beyond the P2-touched set above). Surfaced by a full
+# `corpus:check` sweep against a CLEAN oracle (the live `db` had leftover committed `t`/`u` tables
+# that masked the real picture). Each below is rooted in jed's strict static type system (§4), a
+# documented surface narrowing, the single defined `C`/byte collation (§8), or a jed extension PG
+# lacks. NOT ledgered here, by design (documented, but not PG-comparable divergences): the
+# cost-ceiling `54P01` + depth-limit `54001` records in resource/{cost_limit,depth_limit} and
+# query/{generate_series,unnest} — jed-only resource bounds (§13) the oracle cannot model; the
+# entropy/clock-seam DIFFs in expr/{clock_functions,uuid_generate} + ddl/column_default_expr —
+# deterministic-given-the-injected-seed and ledgered in determinism_exceptions.toml, so PG's live
+# clock/entropy regenerates different bytes every run; and transactions/* — txn-control replay
+# artifacts (a literal COMMIT in the prefix can't be faithfully replayed).
+# ================================================================================================
+
+# --- ddl/column_default.test: jed type-checks / range-checks a column DEFAULT constant EAGERLY at
+# CREATE TABLE, where PostgreSQL defers it.
+[[override]]
+file = "ddl/column_default.test"
+sql = "CREATE TABLE bad1 (id int32 PRIMARY KEY, s int16 DEFAULT 99999)"
+reason = "jed: a DEFAULT constant out of the column type's range is rejected at CREATE TABLE (22003) — the default is folded and range-checked eagerly (constraints.md §2). PostgreSQL accepts the CREATE and defers the range check to INSERT time, so it raises nothing here. A documented eager-validation divergence."
+
+[[override]]
+file = "ddl/column_default.test"
+sql = "CREATE TABLE bad2 (id int32 PRIMARY KEY, n int32 DEFAULT 'x')"
+reason = "jed: a cross-family DEFAULT is a 42804 datatype mismatch at CREATE TABLE — the strict type system (§4) has no implicit text->int32 coercion for the default 'x'. PostgreSQL coerces 'x'::integer and reports 22P02 (invalid_text_representation). Both reject; the code differs."
+
+# --- ddl/create_type.test: jed's CREATE TYPE field grammar accepts an optional per-field `NOT NULL`
+# (parser parseCreateType, composite.md) — a `statement ok` jed surface. PostgreSQL forbids attribute
+# constraints in a composite-type definition (42601, "syntax error at NOT"). The two `… NOT NULL`
+# CREATE TYPEs sit early in the file, so once PG rejects them they stay in the oracle replay PREFIX
+# and abort PG's transaction; every later record in the file then replays inside PG's failed
+# transaction (25P02) or re-hits that prefix syntax error. So the whole tail is ledgered: the two
+# roots below carry the real divergence, the rest mark the poisoned prefix (the create_index.test
+# `on`-block precedent).
+[[override]]
+file = "ddl/create_type.test"
+sql = "CREATE TYPE addr AS (street text NOT NULL, zip int32)"
+reason = "jed ROOT divergence: jed's CREATE TYPE field grammar accepts an optional per-field `NOT NULL` token (parser parseCreateType; composite.md), so this is `statement ok`. PostgreSQL forbids attribute constraints in a composite-type definition and raises 42601 (syntax error at or near NOT). Because this statement_ok stays in the oracle replay prefix, every later record in the file replays against PG's aborted transaction — the entries below mark that poisoned tail."
+
+[[override]]
+file = "ddl/create_type.test"
+sql = "CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)"
+reason = "jed ROOT divergence (2nd occurrence): a per-field `NOT NULL` in a composite-type definition is `statement ok` in jed (parseCreateType) but a 42601 syntax error in PostgreSQL. Like the `addr` root above, it poisons the rest of PG's replay prefix."
+
+[[override]]
+file = "ddl/create_type.test"
+sql = "CREATE TYPE addr AS (city text)"
+reason = "create_type.test poisoned-prefix tail: PG aborted at the earlier `CREATE TYPE addr … NOT NULL` (composite-field constraint, 42601), so this duplicate-type record replays inside PG's failed transaction (25P02) instead of jed's 42710 (duplicate_object). jed runs it as the intended duplicate-object error."
+
+[[override]]
+file = "ddl/create_type.test"
+sql = "CREATE TYPE bad AS (a nosuchtype)"
+reason = "create_type.test poisoned-prefix tail: PG's transaction is already aborted by the upstream `NOT NULL` composite-field divergence, so this replays as 25P02 rather than jed's 42704 (undefined field type). jed reports the intended 42704."
+
+[[override]]
+file = "ddl/create_type.test"
+sql = "CREATE TYPE bad AS (a int32, a int64)"
+reason = "create_type.test poisoned-prefix tail: PG returns 25P02 in the aborted transaction rather than jed's 42701 (duplicate field name). jed reports the intended 42701."
+
+[[override]]
+file = "ddl/create_type.test"
+sql = "DROP TYPE addr"
+reason = "create_type.test poisoned-prefix tail (covers both the statement-ok DROP and the follow-on `statement error 42704` of the same SQL): PG re-hits the prefix `NOT NULL` syntax error / runs in its aborted transaction (25P02), not jed's clean DROP / its 42704 missing-type error."
+
+[[override]]
+file = "ddl/create_type.test"
+sql = "DROP TYPE IF EXISTS addr"
+reason = "create_type.test poisoned-prefix tail: a clean no-op DROP in jed, but PG re-hits the prefix `NOT NULL` syntax error in its aborted-transaction replay."
+
+[[override]]
+file = "ddl/create_type.test"
+sql = "CREATE TYPE line AS (a point, b point)"
+reason = "create_type.test poisoned-prefix tail (covers both the `statement error 42704` forward-reference and the later `statement ok`): jed reports the intended 42704 (point not yet defined) / then creates it cleanly, but PG replays inside its aborted transaction (25P02) / re-hits the prefix syntax error."
+
+[[override]]
+file = "ddl/create_type.test"
+sql = "DROP TYPE point"
+reason = "create_type.test poisoned-prefix tail (covers the `statement error 2BP01` RESTRICT-refusal and the later `statement ok`): jed reports the intended 2BP01 (dependent type `line` exists) / then drops cleanly, but PG replays inside its aborted transaction (25P02) / re-hits the prefix syntax error."
+
+[[override]]
+file = "ddl/create_type.test"
+sql = "DROP TYPE line"
+reason = "create_type.test poisoned-prefix tail: a clean DROP in jed, but PG re-hits the prefix `NOT NULL` syntax error in its aborted-transaction replay."
+
+[[override]]
+file = "ddl/create_type.test"
+sql = "CREATE TYPE addr AS (street text, zip int32)"
+reason = "create_type.test poisoned-prefix tail: this no-constraint CREATE TYPE is accepted by BOTH engines on its own, but PG still re-hits the upstream `NOT NULL` prefix syntax error in its aborted-transaction replay. jed creates it cleanly. (The two records after it — the composite PRIMARY KEY and DROP TYPE … CASCADE narrowings — are already ledgered above.)"
+
+# --- dml/insert_column_list.test: jed's positional VALUES requires a value for EVERY column.
+[[override]]
+file = "dml/insert_column_list.test"
+sql = "INSERT INTO t VALUES (5, 1)"
+reason = "jed: the positional VALUES form (no column list) requires a value for every column, so too few values is 42601 (grammar.md §32). PostgreSQL fills the omitted trailing column(s) with their declared default (here NULL) and accepts the insert. A documented surface narrowing."
+
+# --- expr/is_distinct_from.test: `IS [NOT] DISTINCT FROM` inherits `=`'s strict-typing divergences.
+[[override]]
+file = "expr/is_distinct_from.test"
+sql = "SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM 1"
+reason = "jed: a boolean operand (a = b) IS NOT DISTINCT FROM an integer is 42804 (datatype_mismatch — the strict comparison gate, §4, like bool = int). PostgreSQL finds no boolean/integer comparison and raises 42883 (undefined_function). Both reject; the codes differ (the `=` precedent)."
+
+[[override]]
+file = "expr/is_distinct_from.test"
+sql = "SELECT id FROM w WHERE s IS NOT DISTINCT FROM 100000"
+reason = "jed: an untyped literal adapts to the sibling column's type, so 100000 against an int16 column overflows and traps 22003 at resolve, before any row is scanned (the literal range check, types.md §6). PostgreSQL types 100000 as int4, promotes the int2 column, and raises no error. A standing divergence (the `=`/`<>` precedent)."
+
+# --- expr/scalar_functions.test: jed's round(int) returns decimal; DISTINCT in a scalar fn.
+[[override]]
+file = "expr/scalar_functions.test"
+sql = "SELECT round(i32) FROM n WHERE id = 1"
+reason = "jed: round() over an integer argument returns decimal/numeric (the catalog round overloads — the `D` tag). PostgreSQL has no round(integer); it resolves the call to round(double precision) and returns double precision (the `R` tag). A documented result-type divergence; the rounded value is the integer itself, kept at jed's committed decimal rendering."
+
+[[override]]
+file = "expr/scalar_functions.test"
+sql = "SELECT abs(DISTINCT i32) FROM n"
+reason = "jed: DISTINCT inside a scalar (non-aggregate) function call is a 42601 parse error (DISTINCT is valid only in an aggregate). PostgreSQL parses it and reports 42809 (abs is not an aggregate function). Both reject; jed names it a syntax error, PG a wrong-object-type. A documented error-class divergence."
+
+# --- expr/type_errors.test: strict-typing on boolean expressions, and the deferred boolean casts.
+[[override]]
+file = "expr/type_errors.test"
+sql = "SELECT id FROM t WHERE (a = b) = 1"
+reason = "jed: a boolean (a = b) compared with an integer is 42804 (datatype_mismatch — the strict comparison gate, §4). PostgreSQL has no boolean/integer `=` operator and raises 42883 (undefined_function). Both reject; the codes differ (the bool = int precedent)."
+
+[[override]]
+file = "expr/type_errors.test"
+sql = "SELECT (a = b) + 1 FROM t WHERE id = 1"
+reason = "jed: arithmetic on a boolean is 42804 (datatype_mismatch — the strict type system, §4: no boolean + integer). PostgreSQL has no boolean/integer `+` operator and raises 42883 (undefined_function). Both reject; the codes differ."
+
+[[override]]
+file = "expr/type_errors.test"
+sql = "SELECT CAST(a AS boolean) FROM t WHERE id = 1"
+reason = "jed: casting TO boolean is deferred this slice (0A000 — types.md §9, the documented narrowing). PostgreSQL supports integer->boolean (0 -> false, nonzero -> true) and returns a value. A documented feature deferral."
+
+[[override]]
+file = "expr/type_errors.test"
+sql = "SELECT CAST(a = b AS int32) FROM t WHERE id = 1"
+reason = "jed: there is no boolean->integer cast (a forbidden pair in the strict type system, §4) — 42804. PostgreSQL supports boolean->integer (true -> 1, false -> 0) and returns a value. A documented strict-typing divergence."
+
+# --- joins/errors.test: jed dropped the comma (implicit) cross join.
+[[override]]
+file = "joins/errors.test"
+sql = "SELECT p.id FROM p, q"
+reason = "jed: comma-separated FROM (the old implicit cross join) is not supported — 42601; use CROSS JOIN (grammar.md). PostgreSQL accepts the comma cross join and returns the product. A documented surface narrowing."
+
+# --- mutation/update.test: PK-column assignment narrowing, and double-assignment code.
+[[override]]
+file = "mutation/update.test"
+sql = "UPDATE t SET id = 5 WHERE id = 2"
+reason = "jed: assigning a primary-key column is the documented 0A000 narrowing (the storage key never changes — constraints.md §3, CLAUDE.md §11 step 6). PostgreSQL allows PK updates and performs it. (The ddl/composite_pk.test precedent.)"
+
+[[override]]
+file = "mutation/update.test"
+sql = "UPDATE t SET a = 1, a = 2 WHERE id = 2"
+reason = "jed: assigning the same column twice in one UPDATE is 42701 (duplicate_column). PostgreSQL reports it as 42601 (syntax error — multiple assignments to same column). Both reject; the SQLSTATE differs. A documented error-class divergence."
+
+# --- subquery/errors.test: untyped `$N` placeholder surface (grammar.md §26) vs the live oracle.
+[[override]]
+file = "subquery/errors.test"
+sql = "SELECT id FROM a WHERE k = (SELECT $1 FROM b LIMIT 1)"
+reason = "jed: a `$N` in a select-list slot that cannot be typed from any context is 42P18 (indeterminate_datatype — grammar.md §26). PostgreSQL would default such a parameter to text; with no parameter supplied, the live oracle instead reports 42P02 (no parameter $1). A documented untyped-placeholder divergence; both reject."
+
+[[override]]
+file = "subquery/errors.test"
+sql = "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = $1)"
+reason = "jed: a `$N` typed by an inner context is inferred, so the statement expects one parameter; the no-parameter conformance harness supplies none -> 42601 (wrong parameter count). PostgreSQL reports 42P02 (no parameter $1). Both reject; the codes differ."
+
+# --- types/literals.test: untyped literal adapts to the compared column's type, then overflows.
+[[override]]
+file = "types/literals.test"
+sql = "SELECT id FROM t WHERE small = 100000"
+reason = "jed: an untyped literal adapts to the compared column's type, so 100000 overflows the int16 column and traps 22003 at resolve, before any row is scanned (types.md §6). PostgreSQL types 100000 as int4 and promotes the int2 column, raising no error. A standing strict-typing divergence."
+
+[[override]]
+file = "types/literals.test"
+sql = "SELECT id FROM t WHERE small < 100000"
+reason = "jed: the same int16 literal-overflow 22003 as the `=` case, here on an ordering comparison — the literal range check fires at resolve regardless of operator (types.md §6). PostgreSQL promotes the column to int4 and raises no error."
+
+[[override]]
+file = "types/literals.test"
+sql = "SELECT id FROM t WHERE small > 100000"
+reason = "jed: the same int16 literal-overflow 22003 (types.md §6). PostgreSQL promotes the column to int4 and raises no error."
+
+[[override]]
+file = "types/literals.test"
+sql = "SELECT id FROM t WHERE id = 5000000000"
+reason = "jed: the untyped literal adapts to the int32 column `id`, and 5000000000 fits int64 but not int32, so it traps 22003 at resolve (types.md §6). PostgreSQL types it as int8 and promotes the int4 column, returning an (empty) result with no error. A standing divergence."
+
+# --- types/text.test: the single defined `C`/byte collation (§8) vs the oracle's en_US.utf8, plus
+# the strict-typing / text-PK narrowings.
+[[override]]
+file = "types/text.test"
+sql = "SELECT id FROM t ORDER BY name"
+reason = "jed: text orders by the single defined `C` collation — UTF-8 byte / code-point order (types.md §11, CLAUDE.md §8), so '' < 'Zeta' < 'alice' < 'bob' (uppercase 0x5A before lowercase 0x61). The oracle `db` uses en_US.utf8, a locale collation that folds case and orders differently. A documented collation divergence; jed's committed byte-order rows are kept."
+
+[[override]]
+file = "types/text.test"
+sql = "SELECT id FROM w ORDER BY s"
+reason = "jed: `C`/byte collation orders 'Z'(0x5A) < 'a' < 'aa' < 'ab' < 'b' < '😀' (an astral char sorts after all BMP chars by UTF-8 bytes). The oracle's en_US.utf8 locale collation orders these differently. A documented collation divergence (types.md §11, CLAUDE.md §8)."
+
+[[override]]
+file = "types/text.test"
+sql = "SELECT s FROM astral ORDER BY s"
+reason = "jed: `C`/byte collation = UTF-8 code-point order, so 豈 (U+F900, bytes E8 BF 88) sorts before 😀 (U+1F600, bytes F0 9F 98 80). The oracle's en_US.utf8 collation orders them oppositely. This pins jed's UTF-8-not-UTF-16 ordering rule (types.md §11); a documented collation divergence."
+
+[[override]]
+file = "types/text.test"
+sql = "SELECT id FROM w WHERE s < 'b' ORDER BY id"
+reason = "jed: the ordering predicate `s < 'b'` uses the `C`/byte collation, so 'Z'(0x5A) < 'b' is TRUE (id 6 kept) and '😀' > 'b' (id 5 dropped) -> {2,3,4,6}. The oracle's en_US.utf8 collation orders uppercase 'Z' after 'b' and the emoji before it, so it returns {2,3,4,5}. A documented collation divergence (types.md §11, CLAUDE.md §8) — the set differs, not just the order."
+
+[[override]]
+file = "types/text.test"
+sql = "SELECT id FROM t WHERE name = 1"
+reason = "jed: text vs a non-text operand is 42804 (datatype_mismatch — strict typing, like bool = int). PostgreSQL finds no text/integer `=` operator and raises 42883 (undefined_function). Both reject; the codes differ."
+
+[[override]]
+file = "types/text.test"
+sql = "INSERT INTO t VALUES ('seven', 'g')"
+reason = "jed: a string literal into the int32 PRIMARY KEY column is 42804 (strict typing). PostgreSQL coerces 'seven'::integer and reports 22P02 (invalid_text_representation). Both reject; the code differs (the bytea/uuid precedent)."
+
+[[override]]
+file = "types/text.test"
+sql = "INSERT INTO t VALUES (7, 123)"
+reason = "jed: an integer literal into a text column is 42804 (strict typing — no implicit int->text assignment cast). PostgreSQL assignment-casts 123 -> '123' and accepts the insert. A standing strict-typing divergence."
+
+[[override]]
+file = "types/text.test"
+sql = "CREATE TABLE bad (k text PRIMARY KEY)"
+reason = "jed: a text PRIMARY KEY is rejected this slice (0A000), a documented narrowing (the text key encoding is authored but unexercised — types.md §11). PostgreSQL allows a text primary key."
+
+# --- types/boolean.test: bool-vs-int strict typing, the deferred CAST-to-boolean, and the
+# boolean / composite PRIMARY-KEY scan order (jed iterates in key order; PG in heap order).
+[[override]]
+file = "types/boolean.test"
+sql = "SELECT id FROM t WHERE flag = 1"
+reason = "jed: boolean vs a non-boolean operand is 42804 (datatype_mismatch — strict typing, like bool = int). PostgreSQL finds no boolean/integer `=` operator and raises 42883 (undefined_function). Both reject; the codes differ."
+
+[[override]]
+file = "types/boolean.test"
+sql = "SELECT CAST(id AS boolean) FROM t WHERE id = 1"
+reason = "jed: casting TO boolean is deferred this slice (0A000 — types.md §9, the documented narrowing). PostgreSQL supports integer->boolean and returns a value. A documented feature deferral."
+
+[[override]]
+file = "types/boolean.test"
+sql = "SELECT k, label FROM bk"
+reason = "jed: a full scan iterates in PRIMARY-KEY (byte) order — for a boolean PK, false (0x00) before true (0x01) — so the rows come back false/true (encoding.md §2.9). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order (true was inserted first), which differs. jed's committed PK-order rows are kept — the multiset is identical."
+
+[[override]]
+file = "types/boolean.test"
+sql = "SELECT a, b FROM ck"
+reason = "jed: a full scan iterates in composite-PRIMARY-KEY order — a ascending, then false<true within each a (encoding.md §2.9) — so (1,false),(1,true),(2,false). With no ORDER BY the order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order ((1,true) was inserted first), which differs. jed's committed PK-order rows are kept; the multiset is identical."
+
+# --- query/distinct.test: a DISTINCT+ORDER-BY tie-order, the alias/ORDER-BY 42P10 rule, and the
+# `distinct`-as-column-name extension (DISTINCT is non-reserved) that PG cannot parse — the latter
+# poisons PG's replay prefix for every record after it (the file places that `tk` block last, by
+# design). The one remaining rowsort block (`a = b`) is canonicalized in place, not ledgered.
+[[override]]
+file = "query/distinct.test"
+sql = "SELECT DISTINCT a, b FROM t ORDER BY a"
+reason = "jed: rows tied on the ORDER BY key keep the stable first-occurrence order (§10) — within a=10 the distinct pairs come back (10,5) [row 1] before (10,NULL) [row 4]. ORDER BY a alone does not pin the b tie order (unspecified — CLAUDE.md §8), and PostgreSQL's DISTINCT+sort orders the a=10 ties the other way ((10,NULL) first). jed's committed first-occurrence order is kept; the multiset is identical."
+
+[[override]]
+file = "query/distinct.test"
+sql = "SELECT DISTINCT a AS b FROM t ORDER BY b"
+reason = "jed: under DISTINCT, an ORDER BY key must be a bare-projected column; `a AS b` projects column `a` (aliased `b`), so `ORDER BY b` resolves to the real, unprojected column `b` -> 42P10 (grammar.md §11). PostgreSQL resolves `ORDER BY b` to the output ALIAS `b` (which is in the select list) and runs it. A documented alias-resolution divergence; both names exist, jed prefers the real column, PG the alias."
+
+[[override]]
+file = "query/distinct.test"
+sql = "CREATE TABLE tk (id int32 PRIMARY KEY, distinct int32)"
+reason = "jed ROOT divergence: DISTINCT is NOT reserved, so `distinct` is a legal column name (the two-token lookahead, grammar.md §11) — `statement ok`. PostgreSQL fully reserves DISTINCT and raises 42601 (syntax error at distinct). Because this statement_ok stays in the oracle replay prefix, every later `tk` record replays against PG's aborted transaction (the entries below). The file places this block LAST so only its own tail is poisoned."
+
+[[override]]
+file = "query/distinct.test"
+sql = "INSERT INTO tk VALUES (1, 100)"
+reason = "query/distinct.test poisoned-prefix tail: PG could not create `tk` (the `distinct` column name is a 42601 syntax error upstream), so this INSERT replays against PG's failed transaction / a non-existent relation. jed inserts normally."
+
+[[override]]
+file = "query/distinct.test"
+sql = "INSERT INTO tk VALUES (2, 100)"
+reason = "query/distinct.test poisoned-prefix tail: same as the `(1, 100)` INSERT — `tk` does not exist in PG (its CREATE was a 42601). jed inserts normally."
+
+[[override]]
+file = "query/distinct.test"
+sql = "INSERT INTO tk VALUES (3, 200)"
+reason = "query/distinct.test poisoned-prefix tail: same as the `(1, 100)` INSERT — `tk` does not exist in PG. jed inserts normally."
+
+[[override]]
+file = "query/distinct.test"
+sql = "SELECT distinct FROM tk"
+reason = "query/distinct.test poisoned-prefix tail: `distinct` before FROM is the COLUMN, not the modifier (jed's two-token lookahead), so jed returns all three rows. PostgreSQL cannot even parse the `tk` table (the reserved-word CREATE failed), so the oracle has no relation to describe. jed's committed rows are kept."
+
+[[override]]
+file = "query/distinct.test"
+sql = "SELECT DISTINCT distinct FROM tk"
+reason = "query/distinct.test poisoned-prefix tail: the first `distinct` is the modifier, the second the column (jed lookahead), so the 100s collapse. PostgreSQL cannot parse the `tk` table; the oracle has no relation to describe. jed's committed rows are kept."
