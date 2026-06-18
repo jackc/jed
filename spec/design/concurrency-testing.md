@@ -55,7 +55,8 @@ than exact transcripts.
 
 Layers 1–2 join the differential contract. Layer 3 belongs to the benchmarks family
 ([benchmarks.md](benchmarks.md)): nondeterministic schedule, deterministic *checked answer*.
-**Layer 1 has landed; 2 and 3 are specified here as follow-ons.**
+**Layer 1 has landed on all three cores** (stepped-sequential everywhere; the stepped-threaded mode
+on Go and Rust); **2 and 3 are specified here as follow-ons.**
 
 ## 4. Layer 1 — the deterministic schedule format
 
@@ -140,11 +141,13 @@ The same file runs two ways:
 
 - **stepped-sequential** (default, *every* core including single-threaded TS): walk the steps
   in order on one thread. This **defines** the canonical output.
-- **stepped-threaded** (opt-in, Rust/Go): give each session its own thread and enforce the
-  listed order with a turn token (a step signals its session's turn, the session executes,
-  signals done, the harness advances). Same schedule, same deterministic result — but it
-  drives the **real concurrent code paths under the race detector** (`go test -race`, Rust's
-  `Send`/`Sync` + a TSan run), catching memory races that sequential stepping cannot.
+- **stepped-threaded** (opt-in, Rust/Go — **landed**, run by `rake concurrency:race`): give each
+  session its own thread/goroutine and enforce the listed order with a turn token (the driver sends
+  a step to its session, waits for the reply — and, for an end step, joins the thread — then
+  advances; each session creates and ends its handle on its own thread). Same schedule, same
+  deterministic result — but it drives the **real concurrent code paths under the race detector**
+  (`go test -race`; Rust's `Send`/`Sync`, proven by moving `SharedDb` into each worker, + the
+  threaded run, with a TSan run optional), catching memory races that sequential stepping cannot.
 
 Layer 1 thus yields a deterministic cross-core result *and*, on the threaded cores, optional
 race-detector coverage of the actual concurrency implementation.
@@ -154,9 +157,11 @@ race-detector coverage of the actual concurrency implementation.
 A concurrency file `requires` `txn.shared` (and friends). A core that has not implemented the
 shared handle does not declare those capabilities, so its harness **skips** the file before
 parsing any record — the standard capability gate ([conformance.md](conformance.md) §3),
-verified to skip-before-parse in all three harnesses. This is what lets Layer 1 land Go-first
-without breaking Rust/TS: they skip until their runner exists. No silent pass — a skip is
-reported.
+verified to skip-before-parse in all three harnesses. This is what let Layer 1 land Go-first
+without breaking Rust/TS: each skipped until its runner existed. All three cores now declare these
+capabilities and run the schedule, so none skip today; the gate remains the mechanism by which any
+*future* core (or a core mid-port) skips — before parsing — until its runner exists. No silent pass
+— a skip is always reported.
 
 ## 5. Layer 2 — the write-gate `await` extension (follow-on)
 
@@ -282,10 +287,16 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
 
 ## 9. Status
 
-- **Layer 1 — landed (Go).** The format, the `concurrency/` suite, the `# format:
-  concurrency` dispatch, the three capabilities, and the stepped-sequential runner in
-  `impl/go/cmd/conformance`. Rust/TS skip via the capability gate until their runners land;
-  porting them (and the stepped-threaded mode) is the natural next step.
+- **Layer 1 — landed (all three cores).** The format, the `concurrency/` suite, the `# format:
+  concurrency` dispatch, and the three capabilities. **All three cores run the schedule
+  stepped-sequentially** inside their conformance harness (`impl/{go,rust,ts}` — the binary's
+  default; this *defines* the canonical, timing-free result). **Go and Rust additionally run the
+  stepped-threaded mode** — one goroutine/OS-thread per session under a turn token — driven under
+  the race detector by `rake concurrency:race` (`go test -race`; Rust `cargo test` proving
+  `Send`/`Sync` + the threaded run, a TSan run optional). TS is sequential-only (JS has no
+  shared-memory threads for live objects, §4.3). Two schedules so far: `snapshot_isolation.test`
+  (cross-handle visibility + the watermark) and `watermark_refcount.test` (reader refcounting + a
+  rolled-back writer).
 - **Layer 2 — specified (§5), not built.** Lands with the first `txn.gate_blocking` file.
 - **Layer 3 — specified (§6), not built.** Lands as `stress/` + `rake stress`, most valuable
   once file-backed sharing is wired.

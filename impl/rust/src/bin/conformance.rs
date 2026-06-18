@@ -15,10 +15,16 @@
 //! core is the writer; the Go/TS harnesses stay pure verifiers, so re-running them is the
 //! independent cross-core check that all cores agree on the new costs (CLAUDE.md §8).
 
-use jed::{Database, Outcome, SUPPORTED_CAPABILITIES, Value};
-use std::collections::BTreeSet;
+use jed::{Database, Outcome, ReadHandle, SUPPORTED_CAPABILITIES, SharedDb, Value, WriteHandle};
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+// The stepped-threaded mode (and its channel/thread machinery) is test-only — gate its imports so
+// the ordinary `cargo run --bin conformance` build (sequential mode) carries no unused imports.
+#[cfg(test)]
+use std::sync::mpsc::{self, Receiver, Sender};
+#[cfg(test)]
+use std::thread::{self, JoinHandle};
 
 fn main() -> ExitCode {
     let suites = suites_dir();
@@ -65,7 +71,17 @@ fn main() -> ExitCode {
             continue;
         }
 
-        match run_file(&text) {
+        // A `# format: concurrency` file is an explicit multi-session schedule run against a
+        // SharedDb (spec/design/concurrency-testing.md §4); everything else is the sequential
+        // single-handle runner. Both share the result grammar; only the driver differs. The binary
+        // always runs the canonical stepped-SEQUENTIAL mode; the stepped-threaded mode is exercised
+        // by `cargo test` (the concurrency_threaded_tests below).
+        let outcome = if is_concurrency_format(&text) {
+            run_concurrency_file(&text)
+        } else {
+            run_file(&text)
+        };
+        match outcome {
             Ok(()) => {
                 println!("PASS {rel}");
                 passed += 1;
@@ -378,6 +394,11 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
 /// database state. A `# cost:` that binds to a record producing no cost (a `statement error`)
 /// is consumed but left untouched, exactly as `run_file` would ignore it.
 fn rebaseline_file(text: &str) -> Option<String> {
+    // A `# format: concurrency` schedule carries no `# cost:` directives and is not an ordinary
+    // record stream — never rewrite it (its `open`/`on`/… directives would mis-parse as records).
+    if is_concurrency_format(text) {
+        return None;
+    }
     let mut out: Vec<String> = text.lines().map(str::to_string).collect();
     let mut db = Database::new();
     let mut pending_cost_line: Option<usize> = None;
@@ -614,5 +635,619 @@ fn apply_sort(mut flat: Vec<String>, cols: usize, sortmode: &str) -> Vec<String>
             rows.into_iter().flatten().collect()
         }
         _ => flat, // nosort (and unknown) keep order
+    }
+}
+
+// ============================================================================================
+// The concurrency schedule runner (spec/design/concurrency-testing.md §4).
+//
+// A `.test` file carrying a `# format: concurrency` header is an explicit total order over named
+// read/write SESSIONS opened on one SharedDb. Because jed read results depend only on the logical
+// order of commits and pin-points — never on timing (§2) — executing the listed order yields the
+// canonical, deterministic result every core must produce. Two execution modes share one parse:
+//   - stepped-SEQUENTIAL (the binary's default): walk the steps on one thread — defines canonical output.
+//   - stepped-THREADED (`cargo test`, opt-in): one OS thread per session, the listed order enforced
+//     with a turn token (signal turn → session executes → signal done → advance). Same schedule,
+//     same result, but it drives the real concurrent code paths under the race detector / TSan and
+//     proves SharedDb is `Send + Sync` (it is moved into each worker thread). §4.3.
+//
+// The result grammar (statement / query, sortmodes, the R float tag) is reused verbatim from the
+// sequential runner above — only the session control + state assertions are new.
+// ============================================================================================
+
+/// Report whether `text` opts into the schedule format via a `# format: concurrency` header line.
+/// Any other (or absent) format is the ordinary sequential runner.
+fn is_concurrency_format(text: &str) -> bool {
+    for line in text.lines() {
+        let t = line.trim();
+        if !t.starts_with('#') {
+            continue;
+        }
+        let rest = t.trim_start_matches('#').trim();
+        if let Some(v) = rest.strip_prefix("format:") {
+            return v.trim() == "concurrency";
+        }
+    }
+    false
+}
+
+/// One sqllogictest record body run via `on <sid>`. `Clone` so it can be sent to a worker thread.
+#[derive(Clone)]
+enum Record {
+    Statement {
+        expect: String,
+        code: String,
+        sql: String,
+    },
+    Query {
+        coltypes: String,
+        sortmode: String,
+        sql: String,
+        expected: Vec<String>,
+    },
+}
+
+/// One step of a schedule — the parsed form shared by both execution modes.
+enum Step {
+    Open { sid: String, mode: String },
+    On { sid: String, record: Record },
+    Commit(String),
+    Rollback(String),
+    Close(String),
+    ExpectVersion(u64),
+    ExpectOldestLive(u64),
+}
+
+/// Anything a session can run a statement/query against — a `ReadHandle` or a `WriteHandle`. Lets
+/// `run_record` be written once for both, and used the same way in the sequential map and on a
+/// worker thread.
+trait Exec {
+    fn exec(&mut self, sql: &str) -> jed::Result<Outcome>;
+}
+impl Exec for ReadHandle {
+    fn exec(&mut self, sql: &str) -> jed::Result<Outcome> {
+        // A write through a read handle is 25006 (rejected before dispatch, never poisoning it).
+        self.execute(sql, &[])
+    }
+}
+impl Exec for WriteHandle {
+    fn exec(&mut self, sql: &str) -> jed::Result<Outcome> {
+        self.execute(sql, &[])
+    }
+}
+
+/// One open handle in a schedule: exactly one of read/write. Used only by the sequential runner
+/// (the threaded runner keeps each handle on its own worker thread).
+enum Session {
+    Read(ReadHandle),
+    Write(WriteHandle),
+}
+impl Session {
+    fn as_exec(&mut self) -> &mut dyn Exec {
+        match self {
+            Session::Read(h) => h,
+            Session::Write(h) => h,
+        }
+    }
+}
+
+/// Run one `on <sid>` record against `ex`, returning the first mismatch as an error string.
+fn run_record(ex: &mut dyn Exec, sid: &str, record: &Record) -> Result<(), String> {
+    match record {
+        Record::Statement { expect, code, sql } => {
+            let result = ex.exec(sql);
+            match expect.as_str() {
+                "ok" => {
+                    if let Err(e) = result {
+                        return Err(format!(
+                            "[{sid}] statement expected ok, got error {}: {}\n  SQL: {sql}",
+                            e.code(),
+                            e.message
+                        ));
+                    }
+                }
+                "error" => match result {
+                    Ok(_) => {
+                        return Err(format!(
+                            "[{sid}] statement expected error {code}, but it succeeded\n  SQL: {sql}"
+                        ));
+                    }
+                    Err(e) if e.code() == code => {}
+                    Err(e) => {
+                        return Err(format!(
+                            "[{sid}] statement expected error {code}, got {}\n  SQL: {sql}",
+                            e.code()
+                        ));
+                    }
+                },
+                other => return Err(format!("[{sid}] unknown statement kind '{other}'")),
+            }
+        }
+        Record::Query {
+            coltypes,
+            sortmode,
+            sql,
+            expected,
+        } => {
+            let outcome = ex.exec(sql).map_err(|e| {
+                format!(
+                    "[{sid}] query failed with {}: {}\n  SQL: {sql}",
+                    e.code(),
+                    e.message
+                )
+            })?;
+            let cols = coltypes.len().max(1);
+            let actual = render_outcome(&outcome, cols, sortmode);
+            let exp = apply_sort(expected.clone(), cols, sortmode);
+            if !results_match(&exp, &actual, coltypes, cols, sortmode) {
+                return Err(format!(
+                    "[{sid}] query result mismatch\n  SQL: {sql}\n  expected: {exp:?}\n  actual:   {actual:?}"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Whether `line` ends the current record body: blank, a comment, or the next schedule directive.
+/// (A schedule does not separate records with blank lines, so a record runs until a boundary.)
+fn is_boundary(line: &str) -> bool {
+    let t = line.trim();
+    if t.is_empty() || t.starts_with('#') {
+        return true;
+    }
+    let first = t.split_whitespace().next().unwrap_or("");
+    matches!(
+        first,
+        "open" | "on" | "commit" | "rollback" | "close" | "expect"
+    )
+}
+
+/// Read a statement's SQL body: lines from `*i` up to the next record boundary.
+fn take_concurrency_sql(lines: &[&str], i: &mut usize) -> String {
+    let mut sql = Vec::new();
+    while *i < lines.len() && !is_boundary(lines[*i]) {
+        sql.push(lines[*i]);
+        *i += 1;
+    }
+    sql.join("\n")
+}
+
+/// Read a query body: SQL up to the `----` separator, then expected rows up to the next boundary.
+fn take_concurrency_query(lines: &[&str], i: &mut usize) -> (String, Vec<String>) {
+    let mut body = Vec::new();
+    while *i < lines.len() {
+        if lines[*i].trim() == "----" {
+            *i += 1;
+            break;
+        }
+        body.push(lines[*i]);
+        *i += 1;
+    }
+    let mut expected = Vec::new();
+    while *i < lines.len() && !is_boundary(lines[*i]) {
+        expected.push(lines[*i].trim().to_string());
+        *i += 1;
+    }
+    (body.join("\n"), expected)
+}
+
+/// Parse a `# format: concurrency` file into its schedule (the steps both modes execute).
+fn parse_schedule(text: &str) -> Result<Vec<Step>, String> {
+    let lines: Vec<&str> = text.lines().collect();
+    let mut steps = Vec::new();
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i].trim();
+        if line.is_empty() || line.starts_with('#') {
+            i += 1;
+            continue;
+        }
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        match fields[0] {
+            "open" => {
+                if fields.len() < 3 {
+                    return Err(format!("open needs `<sid> read|write`: {line:?}"));
+                }
+                steps.push(Step::Open {
+                    sid: fields[1].to_string(),
+                    mode: fields[2].to_string(),
+                });
+                i += 1;
+            }
+            "commit" | "rollback" | "close" => {
+                if fields.len() < 2 {
+                    return Err(format!("{} needs a session id: {line:?}", fields[0]));
+                }
+                let sid = fields[1].to_string();
+                steps.push(match fields[0] {
+                    "commit" => Step::Commit(sid),
+                    "rollback" => Step::Rollback(sid),
+                    _ => Step::Close(sid),
+                });
+                i += 1;
+            }
+            "expect" => {
+                if fields.len() < 3 {
+                    return Err(format!("expect needs `version|oldest_live <n>`: {line:?}"));
+                }
+                let n: u64 = fields[2]
+                    .parse()
+                    .map_err(|_| format!("expect value not a uint: {line:?}"))?;
+                steps.push(match fields[1] {
+                    "version" => Step::ExpectVersion(n),
+                    "oldest_live" => Step::ExpectOldestLive(n),
+                    other => {
+                        return Err(format!(
+                            "unknown expect kind '{other}' (want version|oldest_live)"
+                        ));
+                    }
+                });
+                i += 1;
+            }
+            "on" => {
+                if fields.len() < 3 {
+                    return Err(format!("on needs `<sid> <record>`: {line:?}"));
+                }
+                let sid = fields[1].to_string();
+                i += 1;
+                let record = parse_record(&fields[2..], &lines, &mut i)?;
+                steps.push(Step::On { sid, record });
+            }
+            other => return Err(format!("unknown concurrency directive '{other}'")),
+        }
+    }
+    Ok(steps)
+}
+
+/// Parse one `on <sid> <record>` body (the record kind + its SQL/expected rows), advancing `*i`.
+fn parse_record(rec: &[&str], lines: &[&str], i: &mut usize) -> Result<Record, String> {
+    match rec[0] {
+        "statement" => Ok(Record::Statement {
+            expect: rec.get(1).copied().unwrap_or("").to_string(),
+            code: rec.get(2).copied().unwrap_or("").to_string(),
+            sql: take_concurrency_sql(lines, i),
+        }),
+        "query" => {
+            let coltypes = rec.get(1).copied().unwrap_or("").to_string();
+            let sortmode = rec.get(2).copied().unwrap_or("nosort").to_string();
+            let (sql, expected) = take_concurrency_query(lines, i);
+            Ok(Record::Query {
+                coltypes,
+                sortmode,
+                sql,
+                expected,
+            })
+        }
+        other => Err(format!("unknown record kind '{other}'")),
+    }
+}
+
+/// End a session: commit/rollback a write session, close (drop) a read session.
+fn end_session(kind: &str, sess: Session) -> Result<(), String> {
+    let wrap = |e: jed::EngineError| format!("{}: {}", e.code(), e.message);
+    match (kind, sess) {
+        ("close", Session::Read(h)) => {
+            drop(h); // ReadHandle::drop deregisters, advancing the watermark
+            Ok(())
+        }
+        ("close", Session::Write(_)) => {
+            Err("close of a write session (use commit/rollback)".into())
+        }
+        ("commit", Session::Write(h)) => h.commit().map_err(wrap),
+        ("commit", Session::Read(_)) => Err("commit of a read session (use close)".into()),
+        ("rollback", Session::Write(h)) => h.rollback().map_err(wrap),
+        ("rollback", Session::Read(_)) => Err("rollback of a read session (use close)".into()),
+        _ => Ok(()),
+    }
+}
+
+/// Run one `# format: concurrency` file in the canonical stepped-SEQUENTIAL mode.
+fn run_concurrency_file(text: &str) -> Result<(), String> {
+    run_steps_sequential(&parse_schedule(text)?)
+}
+
+/// Run one `# format: concurrency` file in the stepped-THREADED mode (a turn token over per-session
+/// OS threads). Used by `cargo test` for real concurrent-path coverage under the race detector.
+#[cfg(test)]
+fn run_concurrency_file_threaded(text: &str) -> Result<(), String> {
+    run_steps_threaded(&parse_schedule(text)?)
+}
+
+/// Execute a schedule on a single thread: the canonical, deterministic transcript.
+fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
+    let db = SharedDb::new_in_memory();
+    let mut sessions: HashMap<String, Session> = HashMap::new();
+    for step in steps {
+        match step {
+            Step::Open { sid, mode } => {
+                if sessions.contains_key(sid) {
+                    return Err(format!("session '{sid}' already open"));
+                }
+                let s = match mode.as_str() {
+                    "read" => Session::Read(db.read()),
+                    "write" => Session::Write(db.write()),
+                    other => {
+                        return Err(format!("unknown session mode '{other}' (want read|write)"));
+                    }
+                };
+                sessions.insert(sid.clone(), s);
+            }
+            Step::On { sid, record } => {
+                let session = sessions
+                    .get_mut(sid)
+                    .ok_or_else(|| format!("on unknown session '{sid}'"))?;
+                run_record(session.as_exec(), sid, record)?;
+            }
+            Step::Commit(sid) | Step::Rollback(sid) | Step::Close(sid) => {
+                let kind = match step {
+                    Step::Commit(_) => "commit",
+                    Step::Rollback(_) => "rollback",
+                    _ => "close",
+                };
+                let sess = sessions
+                    .remove(sid)
+                    .ok_or_else(|| format!("{kind} of unknown session '{sid}'"))?;
+                end_session(kind, sess).map_err(|e| format!("{kind} {sid}: {e}"))?;
+            }
+            Step::ExpectVersion(n) => {
+                let got = db.version();
+                if got != *n {
+                    return Err(format!("expect version {n}, got {got}"));
+                }
+            }
+            Step::ExpectOldestLive(n) => {
+                let got = db.oldest_live_txid();
+                if got != *n {
+                    return Err(format!("expect oldest_live {n}, got {got}"));
+                }
+            }
+        }
+    }
+    if !sessions.is_empty() {
+        let mut open: Vec<&str> = sessions.keys().map(String::as_str).collect();
+        open.sort_unstable(); // deterministic message; map order must never leak (CLAUDE.md §8)
+        return Err(format!(
+            "file ended with sessions still open: {}",
+            open.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// A command sent from the driver to a session's worker thread.
+#[cfg(test)]
+enum Cmd {
+    Run(Record),
+    End(String), // "commit" | "rollback" | "close"
+}
+
+/// A spawned per-session worker: its command channel, its reply channel, and the join handle.
+#[cfg(test)]
+struct Worker {
+    cmd: Sender<Cmd>,
+    reply: Receiver<Result<(), String>>,
+    handle: JoinHandle<()>,
+}
+
+/// A read session's worker thread: pins a snapshot, runs records against it, and on `close` returns
+/// (dropping the handle, which deregisters → advances the watermark).
+#[cfg(test)]
+fn read_worker(db: SharedDb, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
+    let mut h = db.read();
+    let _ = tx.send(Ok(())); // ack the open: the snapshot is pinned + registered
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            Cmd::Run(rec) => {
+                let _ = tx.send(run_record(&mut h, &sid, &rec));
+            }
+            Cmd::End(kind) => {
+                let r = match kind.as_str() {
+                    "close" => Ok(()),
+                    other => Err(format!("{other} of a read session (use close)")),
+                };
+                let _ = tx.send(r);
+                return; // h dropped here → deregister
+            }
+        }
+    }
+}
+
+/// A write session's worker thread: acquires the writer gate, runs records against the working set,
+/// and on `commit`/`rollback` ends the transaction (publishing or discarding) then returns.
+#[cfg(test)]
+fn write_worker(db: SharedDb, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<(), String>>) {
+    let mut h = db.write();
+    let _ = tx.send(Ok(())); // ack the open: the writer gate is held, working set captured
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            Cmd::Run(rec) => {
+                let _ = tx.send(run_record(&mut h, &sid, &rec));
+            }
+            Cmd::End(kind) => {
+                let wrap = |e: jed::EngineError| format!("{}: {}", e.code(), e.message);
+                let r = match kind.as_str() {
+                    "commit" => h.commit().map_err(wrap),
+                    "rollback" => h.rollback().map_err(wrap),
+                    other => Err(format!("{other} of a write session (use commit/rollback)")),
+                };
+                let _ = tx.send(r);
+                return; // on the close-error arm, h drops here → rollback + gate release
+            }
+        }
+    }
+}
+
+/// Execute a schedule with one OS thread per session, the listed order enforced by a turn token:
+/// the driver sends a command and waits for the worker's reply (and, for an end step, joins the
+/// thread) before advancing — so exactly one session runs at a time, in the listed order, yet every
+/// operation runs on a real thread against the shared handle (race-detector / TSan coverage). The
+/// canonical result is identical to the sequential mode (concurrency-testing.md §2).
+#[cfg(test)]
+fn run_steps_threaded(steps: &[Step]) -> Result<(), String> {
+    let db = SharedDb::new_in_memory();
+    let mut workers: HashMap<String, Worker> = HashMap::new();
+    let mut result: Result<(), String> = Ok(());
+
+    for step in steps {
+        match step {
+            Step::Open { sid, mode } => {
+                if workers.contains_key(sid) {
+                    result = Err(format!("session '{sid}' already open"));
+                    break;
+                }
+                let (cmd_tx, cmd_rx) = mpsc::channel();
+                let (rep_tx, rep_rx) = mpsc::channel();
+                let dbc = db.clone(); // SharedDb is Send + Sync — proven by moving it into the thread
+                let sidc = sid.clone();
+                let handle = match mode.as_str() {
+                    "read" => thread::spawn(move || read_worker(dbc, sidc, cmd_rx, rep_tx)),
+                    "write" => thread::spawn(move || write_worker(dbc, sidc, cmd_rx, rep_tx)),
+                    other => {
+                        result = Err(format!("unknown session mode '{other}' (want read|write)"));
+                        break;
+                    }
+                };
+                // The turn token: wait for the open ack (handle acquired/pinned) before advancing.
+                if let Err(e) = recv_reply(&rep_rx) {
+                    result = Err(format!("open {sid}: {e}"));
+                    let _ = handle.join();
+                    break;
+                }
+                workers.insert(
+                    sid.clone(),
+                    Worker {
+                        cmd: cmd_tx,
+                        reply: rep_rx,
+                        handle,
+                    },
+                );
+            }
+            Step::On { sid, record } => {
+                let Some(w) = workers.get(sid) else {
+                    result = Err(format!("on unknown session '{sid}'"));
+                    break;
+                };
+                if w.cmd.send(Cmd::Run(record.clone())).is_err() {
+                    result = Err(format!("[{sid}] worker died before record"));
+                    break;
+                }
+                match recv_reply(&w.reply) {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        result = Err(e);
+                        break;
+                    }
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                }
+            }
+            Step::Commit(sid) | Step::Rollback(sid) | Step::Close(sid) => {
+                let kind = match step {
+                    Step::Commit(_) => "commit",
+                    Step::Rollback(_) => "rollback",
+                    _ => "close",
+                };
+                let Some(w) = workers.remove(sid) else {
+                    result = Err(format!("{kind} of unknown session '{sid}'"));
+                    break;
+                };
+                let _ = w.cmd.send(Cmd::End(kind.to_string()));
+                let reply = recv_reply(&w.reply);
+                // Join AFTER the reply so the handle's Drop (deregister / gate release) has run
+                // before the next step reads the watermark — the join is the happens-before edge.
+                let _ = w.handle.join();
+                match reply {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        result = Err(format!("{kind} {sid}: {e}"));
+                        break;
+                    }
+                    Err(e) => {
+                        result = Err(format!("{kind} {sid}: {e}"));
+                        break;
+                    }
+                }
+            }
+            Step::ExpectVersion(n) => {
+                let got = db.version();
+                if got != *n {
+                    result = Err(format!("expect version {n}, got {got}"));
+                    break;
+                }
+            }
+            Step::ExpectOldestLive(n) => {
+                let got = db.oldest_live_txid();
+                if got != *n {
+                    result = Err(format!("expect oldest_live {n}, got {got}"));
+                    break;
+                }
+            }
+        }
+    }
+
+    // Tear down any still-open workers: dropping the command sender ends the worker loop (a read
+    // handle deregisters; a write handle rolls back + releases the gate), then we join it.
+    let mut still_open: Vec<String> = workers.keys().cloned().collect();
+    still_open.sort_unstable(); // deterministic message; map order must never leak (CLAUDE.md §8)
+    for (_, w) in workers {
+        drop(w.cmd);
+        drop(w.reply);
+        let _ = w.handle.join();
+    }
+    if result.is_ok() && !still_open.is_empty() {
+        return Err(format!(
+            "file ended with sessions still open: {}",
+            still_open.join(", ")
+        ));
+    }
+    result
+}
+
+/// Receive one reply from a worker, mapping a closed channel (a panicked worker) to an error.
+#[cfg(test)]
+fn recv_reply(rx: &Receiver<Result<(), String>>) -> Result<Result<(), String>, String> {
+    rx.recv()
+        .map_err(|_| "worker thread terminated unexpectedly".to_string())
+}
+
+#[cfg(test)]
+mod concurrency_threaded_tests {
+    //! Run every `# format: concurrency` suite file in the stepped-THREADED mode (§4.3): one OS
+    //! thread per session, the schedule order enforced by a turn token. The point is `cargo test`
+    //! under the race detector / TSan — real concurrent-path coverage of SharedDb that the
+    //! single-threaded sequential walk cannot give. The asserted result is identical to sequential
+    //! (the schedule is timing-free, §2), so a divergence here is a genuine concurrency bug.
+
+    use super::*;
+
+    #[test]
+    fn schedules_run_threaded() {
+        let suites = suites_dir();
+        let mut files = Vec::new();
+        collect_tests(&suites, &mut files);
+        files.sort();
+        let supported: BTreeSet<&str> = SUPPORTED_CAPABILITIES.iter().copied().collect();
+
+        let mut ran = 0;
+        for file in &files {
+            let text = std::fs::read_to_string(file).expect("read .test file");
+            if !is_concurrency_format(&text) {
+                continue;
+            }
+            // Honor the same capability gate as the binary — skip a file needing a cap we lack.
+            if parse_requires(&text)
+                .iter()
+                .any(|c| !supported.contains(c.as_str()))
+            {
+                continue;
+            }
+            run_concurrency_file_threaded(&text)
+                .unwrap_or_else(|e| panic!("threaded {}: {e}", file.display()));
+            ran += 1;
+        }
+        assert!(ran > 0, "no runnable concurrency files found");
     }
 }

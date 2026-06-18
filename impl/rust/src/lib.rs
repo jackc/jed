@@ -294,6 +294,15 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "txn.explicit",
     "txn.read_only",
     "txn.failed_state",
+    // Shared-handle concurrency — the SharedDb schedule format (spec/design/concurrency-testing.md
+    // §4). Declared because this core implements SharedDb/ReadHandle/WriteHandle + the watermark
+    // (shared.rs); a core lacking them skips suites/concurrency files via the capability gate. This
+    // core runs the schedule stepped-sequentially (the canonical, timing-free result) and ALSO has
+    // an opt-in stepped-threaded mode — one OS thread per session under a turn token — exercised by
+    // the bin's `cargo test` suite under the race detector / TSan (§4.3).
+    "txn.shared",
+    "txn.read_handle",
+    "txn.watermark",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

@@ -243,6 +243,14 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "txn.explicit",
   "txn.read_only",
   "txn.failed_state",
+  // Shared-handle concurrency — the SharedDb schedule format (spec/design/concurrency-testing.md
+  // §4). Declared because this core implements SharedDb/ReadHandle/WriteHandle + the watermark
+  // (shared.ts); a core lacking them skips suites/concurrency files via the capability gate. This
+  // core runs the schedule stepped-sequentially only (JS has no shared-memory threads for live
+  // objects), which still defines + verifies the canonical, timing-free result (§4.3).
+  "txn.shared",
+  "txn.read_handle",
+  "txn.watermark",
 ];
 
 // execute parses and executes one SQL statement against db (no bind parameters).

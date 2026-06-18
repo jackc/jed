@@ -13,9 +13,13 @@ import {
   EngineError,
   execute,
   fixedClock,
+  type Outcome,
+  ReadHandle,
   render,
   seededRandomSource,
+  SharedDb,
   SUPPORTED_CAPABILITIES,
+  WriteHandle,
 } from "../lib.ts";
 
 function suitesDir(): string {
@@ -427,6 +431,216 @@ function runFile(text: string): void {
   }
 }
 
+// --- the concurrency schedule runner (spec/design/concurrency-testing.md §4) -----------------
+// A `.test` file carrying a `# format: concurrency` header is an explicit total order over named
+// read/write SESSIONS opened on one SharedDb. Because jed read results depend only on the logical
+// order of commits and pin-points — never on timing (§2) — executing the listed order on the single
+// JS thread yields the canonical, deterministic result every core must produce. This core has no
+// stepped-threaded mode (JS has no shared-memory threads for live objects, §4.3); it always runs the
+// stepped-sequential mode, which is what defines the canonical output the threaded cores reproduce.
+//
+// The result grammar (statement / query, sortmodes, the R float tag) is reused verbatim from the
+// sequential runner (runFile) — only the session control + state assertions are new.
+
+// isConcurrencyFormat reports whether text opts into the schedule format via a `# format:
+// concurrency` header line. Any other (or absent) format is the sequential runner.
+function isConcurrencyFormat(text: string): boolean {
+  for (const raw of text.split("\n")) {
+    const t = raw.trim();
+    if (!t.startsWith("#")) continue;
+    const rest = t.slice(1).trim();
+    if (rest.startsWith("format:")) return rest.slice("format:".length).trim() === "concurrency";
+  }
+  return false;
+}
+
+// CSession is one open handle in a schedule: exactly one of read/write is set.
+type CSession = { read?: ReadHandle; write?: WriteHandle };
+
+// sessionExecute runs sql against the session's handle, returning the outcome. A read session's
+// writes are rejected with 25006 by the handle itself (without poisoning it).
+function sessionExecute(s: CSession, sql: string): Outcome {
+  return s.write ? s.write.execute(sql) : s.read!.execute(sql);
+}
+
+// concurrencyDirectives are the line-leading keywords that bound a record body. Unlike the
+// sequential format, a schedule does not separate records with blank lines, so an `on` record's SQL
+// (and a query's expected rows) runs until the next directive, a blank line, or a comment.
+const concurrencyDirectives = new Set(["open", "on", "commit", "rollback", "close", "expect"]);
+
+// isBoundary reports whether line ends the current record body: blank, a comment, or the start of
+// the next schedule directive.
+function isBoundary(line: string): boolean {
+  const t = line.trim();
+  if (t === "" || t.startsWith("#")) return true;
+  const first = t.split(/\s+/)[0]!;
+  return concurrencyDirectives.has(first);
+}
+
+// takeConcurrencySQL reads a statement's SQL body: lines from c.i up to the next record boundary.
+function takeConcurrencySQL(lines: string[], c: Cursor): string {
+  const sql: string[] = [];
+  while (c.i < lines.length && !isBoundary(lines[c.i]!)) {
+    sql.push(lines[c.i]!);
+    c.i++;
+  }
+  return sql.join("\n");
+}
+
+// takeConcurrencyQuery reads a query body: SQL up to the `----` separator, then expected rows up to
+// the next record boundary.
+function takeConcurrencyQuery(lines: string[], c: Cursor): { sql: string; expected: string[] } {
+  const body: string[] = [];
+  while (c.i < lines.length) {
+    if (lines[c.i]!.trim() === "----") {
+      c.i++;
+      break;
+    }
+    body.push(lines[c.i]!);
+    c.i++;
+  }
+  const expected: string[] = [];
+  while (c.i < lines.length && !isBoundary(lines[c.i]!)) {
+    expected.push(lines[c.i]!.trim());
+    c.i++;
+  }
+  return { sql: body.join("\n"), expected };
+}
+
+// runConcurrencyRecord runs one `on <sid> <record>` body (a sqllogictest statement/query) against
+// session s, advancing c past the record's SQL and any expected rows.
+function runConcurrencyRecord(s: CSession, sid: string, rec: string[], lines: string[], c: Cursor): void {
+  if (rec[0] === "statement") {
+    const expect = rec[1] ?? "";
+    const sql = takeConcurrencySQL(lines, c);
+    let err: unknown = null;
+    try {
+      sessionExecute(s, sql);
+    } catch (e) {
+      err = e;
+    }
+    if (expect === "ok") {
+      if (err !== null) {
+        throw new Error(`[${sid}] statement expected ok, got error ${msgOf(err)}\n  SQL: ${sql}`);
+      }
+    } else if (expect === "error") {
+      const want = rec[2] ?? "";
+      if (err === null) {
+        throw new Error(`[${sid}] statement expected error ${want}, but it succeeded\n  SQL: ${sql}`);
+      }
+      const got = codeOf(err);
+      if (got !== want) {
+        throw new Error(`[${sid}] statement expected error ${want}, got ${got}\n  SQL: ${sql}`);
+      }
+    } else {
+      throw new Error(`[${sid}] unknown statement kind "${expect}"`);
+    }
+  } else if (rec[0] === "query") {
+    const coltypes = rec[1] ?? "";
+    const sortmode = rec[2] ?? "nosort";
+    const { sql, expected } = takeConcurrencyQuery(lines, c);
+    let outcome: Outcome;
+    try {
+      outcome = sessionExecute(s, sql);
+    } catch (e) {
+      throw new Error(`[${sid}] query failed with ${msgOf(e)}\n  SQL: ${sql}`);
+    }
+    const cols = coltypes.length === 0 ? 1 : coltypes.length;
+    const actual = renderOutcome(outcome, cols, sortmode);
+    const exp = applySort(expected, cols, sortmode);
+    const ok = coltypes.includes("R") ? rowsEqual(coltypes, cols, actual, exp) : arrEq(actual, exp);
+    if (!ok) {
+      throw new Error(
+        `[${sid}] query result mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(exp)}\n  actual:   ${JSON.stringify(actual)}`,
+      );
+    }
+  } else {
+    throw new Error(`[${sid}] unknown record kind "${rec[0]}"`);
+  }
+}
+
+// endSession ends a session: commit/rollback a write session, close a read session.
+function endSession(kind: string, s: CSession): void {
+  if (kind === "close") {
+    if (!s.read) throw new Error("close of a write session (use commit/rollback)");
+    s.read.close();
+  } else if (kind === "commit") {
+    if (!s.write) throw new Error("commit of a read session (use close)");
+    s.write.commit();
+  } else if (kind === "rollback") {
+    if (!s.write) throw new Error("rollback of a read session (use close)");
+    s.write.rollback();
+  }
+}
+
+// runConcurrencyFile runs one `# format: concurrency` file against a fresh SharedDb.
+function runConcurrencyFile(text: string): void {
+  const db = SharedDb.newInMemory();
+  const sessions = new Map<string, CSession>();
+  const lines = text.split("\n");
+  const c: Cursor = { i: 0 };
+  while (c.i < lines.length) {
+    const line = lines[c.i]!.trim();
+    if (line === "" || line.startsWith("#")) {
+      c.i++;
+      continue;
+    }
+    const fields = line.split(/\s+/);
+    switch (fields[0]) {
+      case "open": {
+        if (fields.length < 3) throw new Error(`open needs \`<sid> read|write\`: ${line}`);
+        const sid = fields[1]!;
+        const mode = fields[2]!;
+        if (sessions.has(sid)) throw new Error(`session "${sid}" already open`);
+        if (mode === "read") sessions.set(sid, { read: db.read() });
+        else if (mode === "write") sessions.set(sid, { write: db.write() });
+        else throw new Error(`unknown session mode "${mode}" (want read|write)`);
+        c.i++;
+        break;
+      }
+      case "commit":
+      case "rollback":
+      case "close": {
+        if (fields.length < 2) throw new Error(`${fields[0]} needs a session id: ${line}`);
+        const sid = fields[1]!;
+        const s = sessions.get(sid);
+        if (!s) throw new Error(`${fields[0]} of unknown session "${sid}"`);
+        endSession(fields[0]!, s);
+        sessions.delete(sid);
+        c.i++;
+        break;
+      }
+      case "expect": {
+        if (fields.length < 3) throw new Error(`expect needs \`version|oldest_live <n>\`: ${line}`);
+        const want = BigInt(fields[2]!);
+        let got: bigint;
+        if (fields[1] === "version") got = db.version;
+        else if (fields[1] === "oldest_live") got = db.oldestLiveTxid();
+        else throw new Error(`unknown expect kind "${fields[1]}" (want version|oldest_live)`);
+        if (got !== want) throw new Error(`expect ${fields[1]} ${want}, got ${got}`);
+        c.i++;
+        break;
+      }
+      case "on": {
+        if (fields.length < 3) throw new Error(`on needs \`<sid> <record>\`: ${line}`);
+        const sid = fields[1]!;
+        const s = sessions.get(sid);
+        if (!s) throw new Error(`on unknown session "${sid}"`);
+        c.i++;
+        runConcurrencyRecord(s, sid, fields.slice(2), lines, c);
+        break;
+      }
+      default:
+        throw new Error(`unknown concurrency directive "${fields[0]}"`);
+    }
+  }
+  if (sessions.size !== 0) {
+    // Deterministic message; Map iteration order is insertion order but we sort to never leak it.
+    const open = [...sessions.keys()].sort();
+    throw new Error(`file ended with sessions still open: ${open.join(", ")}`);
+  }
+}
+
 function main(): number {
   const suites = suitesDir();
   const files = readdirSync(suites, { recursive: true })
@@ -447,7 +661,11 @@ function main(): number {
       continue;
     }
     try {
-      runFile(text);
+      // A `# format: concurrency` file is an explicit multi-session schedule run against a SharedDb
+      // (spec/design/concurrency-testing.md §4); everything else is the sequential single-handle
+      // runner. Both share the result grammar; only the driver differs.
+      if (isConcurrencyFormat(text)) runConcurrencyFile(text);
+      else runFile(text);
       console.log(`PASS ${rel}`);
       passed++;
     } catch (e) {

@@ -268,6 +268,27 @@ namespace :cli do
   end
 end
 
+# concurrency — the stepped-THREADED concurrency conformance (spec/design/concurrency-testing.md
+# §4.3), run under the race detector. The binary harnesses already run every `# format: concurrency`
+# schedule stepped-SEQUENTIALLY inside the normal conformance walk (the canonical, timing-free result
+# every core must produce). This task drives the SAME schedules in the OPT-IN threaded mode — one
+# goroutine/thread per session under a turn token — against the real concurrent code paths, so the
+# race detector (Go `-race`; Rust `Send`/`Sync` + the threaded run) exercises the actual SharedDb
+# implementation. Deliberately NOT in `rake ci` (it needs the race-instrumented toolchains); run it
+# when touching the shared-handle concurrency model. TS has no threaded mode (JS has no shared-memory
+# threads for live objects), so it is sequential-only and not run here.
+namespace :concurrency do
+  desc "Run the stepped-threaded concurrency conformance under the race detector (Go + Rust)"
+  task :race do
+    puts "go:   go test -race (one goroutine per session, turn-token order)"
+    Dir.chdir(GO_DIR) do
+      sh "go", "test", "-race", "-run", "TestConcurrencySchedulesThreaded", "./cmd/conformance"
+    end
+    puts "rust: cargo test --bin conformance (Send/Sync + the turn-token threaded run)"
+    sh "cargo", "test", "--bin", "conformance", "--manifest-path", RUST_MANIFEST
+  end
+end
+
 # bench — the wall-clock benchmark subsystem (spec/design/benchmarks.md). Deliberately NOT part
 # of `rake ci`: timings are environment-relative and nondeterministic. Answers are still checked —
 # every result carries a cross-engine checksum and bench:report fails on any disagreement.

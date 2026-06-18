@@ -524,10 +524,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       one `SharedDb`; deterministic because jed read results depend only on commit order + pin-points, not
       timing. New caps `txn.shared`/`txn.read_handle`/`txn.watermark`; `suites/concurrency/snapshot_isolation.test`
       pins snapshot isolation, cross-handle visibility, 25006-no-poison, and the `oldest_live_txid` watermark.
-      **Go runner landed** in `cmd/conformance` (stepped-sequential); Rust/TS skip via the capability gate
-      until their runners land. → [concurrency-testing.md](spec/design/concurrency-testing.md)
-  - [ ] _follow-on:_ port the runner to Rust/TS (declare the three caps); add the **stepped-threaded**
-        mode (same schedule under `-race`/TSan) for real concurrent-path coverage.
+      **Runner landed in all three cores** (`impl/{go,rust,ts}` conformance harnesses, stepped-sequential =
+      the canonical result); **Go + Rust also run the stepped-threaded mode** (one goroutine/OS-thread per
+      session under a turn token) under the race detector via `rake concurrency:race`. Two schedules:
+      `snapshot_isolation.test` + `watermark_refcount.test` (reader refcount + a rolled-back writer).
+      → [concurrency-testing.md](spec/design/concurrency-testing.md)
   - [ ] _follow-on — Layer 2 (gate-blocking `await`):_ `open <sid> write blocks` + release; cap
         `txn.gate_blocking`. Canonical = equivalent serial order; threaded harness verifies real blocking.
         → [concurrency-testing.md §5](spec/design/concurrency-testing.md)

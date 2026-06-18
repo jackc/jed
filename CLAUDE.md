@@ -285,8 +285,10 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   same order under a race detector). It runs *inside* `rake ci` via the capability gate
   (`txn.shared`/`txn.read_handle`/`txn.watermark`). True-parallelism **stress** (random schedule,
   invariant-checked) is the separate bench-family Layer 3, *outside* `rake ci`. **Landed: Layer 1,
-  Go.** This is what pulls concurrency — previously per-core hand-mirrored tests — back into the
-  §2 differential net.
+  all three cores** (stepped-sequential everywhere = the canonical result; the opt-in
+  stepped-threaded mode on Go + Rust, one thread/goroutine per session under a turn token, run under
+  the race detector by `rake concurrency:race`). This is what pulls concurrency — previously per-core
+  hand-mirrored tests — back into the §2 differential net.
 - **Bootstrap the corpus via differential testing against PostgreSQL.** The real PG
   service is the **result oracle** (§1): run a supported-subset query against it, capture
   output, emit a corpus entry. Generates a large, *correct* corpus cheaply. Where our
