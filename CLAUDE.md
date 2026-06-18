@@ -630,7 +630,11 @@ containers. Provisioning a fresh container is a cheap `git worktree add`, not a 
 | `sqllogictest-rs` | `main` | MIT / Apache-2.0 | Reference Rust sqllogictest runner — useful for `impl/rust`'s harness (§7). |
 
 PostgreSQL also runs **live** as the `db` service (a queryable oracle), separate from this
-source checkout. **CockroachDB** is deliberately **excluded** despite being cited in §7/§8:
+source checkout. The oracle is reached over a **Unix-domain socket** shared into the devcontainer
+(`PGHOST=/var/run/postgresql`, trust auth) — the connection env is preconfigured, so just run bare
+`psql` or `rake corpus:check[<repo-root path>]` and **never override `PGHOST`** (the recurring
+foot-gun). The `db` service name also resolves over TCP, but the socket is the path we use.
+**CockroachDB** is deliberately **excluded** despite being cited in §7/§8:
 its core is BSL 1.1 (source-available, not OSI-free). For its key-encoding design, read it
 from `spec/encoding/` or an old Apache-2.0 tag rather than vendoring the BSL source.
 

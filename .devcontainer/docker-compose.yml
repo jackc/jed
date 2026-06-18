@@ -15,9 +15,11 @@ services:
     environment:
       # PostgreSQL connection settings for testing. PGHOST is the shared socket
       # directory (a leading '/' makes libpq use the Unix socket), so oracle
-      # queries skip the TCP stack entirely. The default initdb pg_hba.conf gives
+      # queries skip the TCP stack entirely — the fast path used for benchmarking
+      # jed against the PostgreSQL oracle. The default initdb pg_hba.conf gives
       # `local all all trust`, so any user connects without a password over the
-      # socket — pick the connecting user freely via PGUSER.
+      # socket — pick the connecting user freely via PGUSER. Connect over the
+      # socket (bare `psql` / `rake corpus:check`); never override PGHOST.
       PGHOST: /var/run/postgresql
       PGUSER: postgres
       PGDATABASE: postgres
@@ -30,7 +32,10 @@ services:
       - pg-sockets:/var/run/postgresql
     # Pin the socket directory to the shared volume so the app can reach it.
     command: postgres -c unix_socket_directories=/var/run/postgresql
-    network_mode: service:app
+    # On the DEFAULT compose network (no `network_mode: service:app`): the app connects over the
+    # shared pg-sockets volume (the Unix socket — PGHOST above). Sharing the app's netns instead
+    # bound PG onto the app's localhost and left the `db` service name unresolvable, which kept
+    # confusing oracle-connection attempts; the socket is the only path we use.
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
