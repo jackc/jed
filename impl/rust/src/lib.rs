@@ -303,6 +303,12 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "txn.shared",
     "txn.read_handle",
     "txn.watermark",
+    // Layer 2 — the write-gate `blocks` annotation (spec/design/concurrency-testing.md §5). Declared
+    // because this core defers a queued writer-open to the gate-releasing step in both modes, and the
+    // stepped-threaded mode additionally drives + verifies the *real* blocking acquire/condvar wakeup
+    // under the race detector (shared.rs `acquire_writer`/`release_writer`) — the one concurrency path
+    // the sequential walk never exercises.
+    "txn.gate_blocking",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

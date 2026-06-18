@@ -574,9 +574,19 @@ function endSession(kind: string, s: CSession): void {
 }
 
 // runConcurrencyFile runs one `# format: concurrency` file against a fresh SharedDb.
+//
+// The Layer 2 `blocks` annotation (concurrency-testing.md §5) is modeled here without ever truly
+// blocking — which this single-threaded core could not do anyway (write() while a writer is open
+// throws 25001, since one JS thread cannot block, shared.ts). A queued writer-open is NOT run when
+// it is seen, but recorded — and run at the gate-releasing step, the instant the holder commits/rolls
+// back: the equivalent serial order, identical to what a threaded run consistent with the schedule
+// must produce. `gateHolder` is the live writer's sid (the single-writer gate); `blocked` is the
+// at-most-one writer queued on it.
 function runConcurrencyFile(text: string): void {
   const db = SharedDb.newInMemory();
   const sessions = new Map<string, CSession>();
+  let gateHolder = ""; // the live writer holding the single-writer gate, "" if free
+  let blocked = ""; // a writer queued on the gate (Layer 2 `blocks`), "" if none
   const lines = text.split("\n");
   const c: Cursor = { i: 0 };
   while (c.i < lines.length) {
@@ -588,13 +598,42 @@ function runConcurrencyFile(text: string): void {
     const fields = line.split(/\s+/);
     switch (fields[0]) {
       case "open": {
-        if (fields.length < 3) throw new Error(`open needs \`<sid> read|write\`: ${line}`);
+        if (fields.length < 3) throw new Error(`open needs \`<sid> read|write [blocks]\`: ${line}`);
         const sid = fields[1]!;
         const mode = fields[2]!;
-        if (sessions.has(sid)) throw new Error(`session "${sid}" already open`);
-        if (mode === "read") sessions.set(sid, { read: db.read() });
-        else if (mode === "write") sessions.set(sid, { write: db.write() });
-        else throw new Error(`unknown session mode "${mode}" (want read|write)`);
+        // An optional 4th token is the Layer 2 `blocks` annotation (writer-open on a held gate).
+        let blocksAnn = false;
+        if (fields.length > 3) {
+          if (fields[3] !== "blocks") {
+            throw new Error(`unknown open annotation "${fields[3]}" (want \`blocks\`): ${line}`);
+          }
+          blocksAnn = true;
+        }
+        if (sessions.has(sid) || sid === blocked) throw new Error(`session "${sid}" already open`);
+        if (mode === "read") {
+          if (blocksAnn) throw new Error(`open ${sid}: \`blocks\` is only valid for a write session`);
+          sessions.set(sid, { read: db.read() }); // readers never take the gate
+        } else if (mode === "write") {
+          if (blocksAnn) {
+            // Layer 2: assert the gate is held, then QUEUE the open — calling write() now would throw
+            // 25001 (a writer is active). It opens at the releasing step below.
+            if (gateHolder === "") {
+              throw new Error(`open ${sid} write blocks: the writer gate is free (nothing to block on)`);
+            }
+            if (blocked !== "") {
+              throw new Error(`open ${sid} write blocks: writer "${blocked}" is already blocked (one at a time)`);
+            }
+            blocked = sid;
+          } else {
+            if (gateHolder !== "") {
+              throw new Error(`open ${sid} write: the gate is held by "${gateHolder}" — use \`blocks\``);
+            }
+            sessions.set(sid, { write: db.write() });
+            gateHolder = sid;
+          }
+        } else {
+          throw new Error(`unknown session mode "${mode}" (want read|write)`);
+        }
         c.i++;
         break;
       }
@@ -603,10 +642,24 @@ function runConcurrencyFile(text: string): void {
       case "close": {
         if (fields.length < 2) throw new Error(`${fields[0]} needs a session id: ${line}`);
         const sid = fields[1]!;
+        if (sid === blocked) {
+          throw new Error(`${fields[0]} of "${sid}" while it is blocked on the writer gate`);
+        }
         const s = sessions.get(sid);
         if (!s) throw new Error(`${fields[0]} of unknown session "${sid}"`);
         endSession(fields[0]!, s);
         sessions.delete(sid);
+        // If the ended session held the gate, release it — and let the queued writer (if any) acquire
+        // it now: it opens (write() no longer throws 25001) capturing the version just published, the
+        // equivalent serial order (§5).
+        if (sid === gateHolder) {
+          gateHolder = "";
+          if (blocked !== "") {
+            sessions.set(blocked, { write: db.write() });
+            gateHolder = blocked;
+            blocked = "";
+          }
+        }
         c.i++;
         break;
       }
@@ -624,6 +677,7 @@ function runConcurrencyFile(text: string): void {
       case "on": {
         if (fields.length < 3) throw new Error(`on needs \`<sid> <record>\`: ${line}`);
         const sid = fields[1]!;
+        if (sid === blocked) throw new Error(`on "${sid}" while it is blocked on the writer gate`);
         const s = sessions.get(sid);
         if (!s) throw new Error(`on unknown session "${sid}"`);
         c.i++;
@@ -634,10 +688,11 @@ function runConcurrencyFile(text: string): void {
         throw new Error(`unknown concurrency directive "${fields[0]}"`);
     }
   }
-  if (sessions.size !== 0) {
+  if (sessions.size !== 0 || blocked !== "") {
     // Deterministic message; Map iteration order is insertion order but we sort to never leak it.
-    const open = [...sessions.keys()].sort();
-    throw new Error(`file ended with sessions still open: ${open.join(", ")}`);
+    const open = [...sessions.keys()];
+    if (blocked !== "") open.push(blocked);
+    throw new Error(`file ended with sessions still open: ${open.sort().join(", ")}`);
   }
 }
 

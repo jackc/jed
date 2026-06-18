@@ -1,0 +1,75 @@
+# Write-gate blocking — the Layer 2 `blocks` annotation (spec/design/concurrency-testing.md §5,
+# transactions.md §10). The only blocking operation in jed's model is `open <sid> write` while
+# another writer holds the single-writer gate. `open <sid> write blocks` asserts the gate is
+# currently held, so the writer-open is QUEUED rather than run — calling write() now would block the
+# runner (Go/Rust really block on the gate; the TS core's write() throws 25001, since one JS thread
+# cannot block). The queued open logically completes the instant the holding writer ends: the
+# equivalent serial order (§5). Results are therefore deterministic and identical on every core — a
+# single-threaded core queues w2 until release, while Go/Rust additionally drive the REAL blocking
+# acquire under the race detector (`rake concurrency:race`), the one concurrency path the sequential
+# walk never exercises.
+#
+# What it pins, beyond snapshot_isolation.test / watermark_refcount.test:
+#   - a second writer-open blocks on the held gate and resumes the instant the holder commits;
+#   - the gate hand-off is atomic and ordered — the unblocked writer captures the version the holder
+#     just published (read-your-writes across the hand-off), never an earlier one;
+#   - a reader opened WHILE a writer is blocked is itself never blocked (readers never take the gate);
+#   - snapshot isolation holds throughout the block/hand-off (the pinned reader is undisturbed).
+#
+# A core without the gate-blocking annotation declares no txn.gate_blocking and SKIPS this file
+# before parsing any record (the capability gate, conformance.md §3).
+# format: concurrency
+# requires: txn.gate_blocking, txn.shared, txn.read_handle, txn.watermark, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.int32
+
+# --- seed one row, committed as version 1 -----------------------------------
+open w write
+on w statement ok
+CREATE TABLE t (id int32 PRIMARY KEY)
+on w statement ok
+INSERT INTO t VALUES (1)
+commit w
+expect version 1
+
+# --- w1 takes the gate and stages a row (uncommitted) -----------------------
+open w1 write
+on w1 statement ok
+INSERT INTO t VALUES (2)
+
+# --- w2's write-open BLOCKS on the held gate (it is queued, not run) ---------
+open w2 write blocks
+
+# a reader opened while w2 is blocked is NOT itself blocked (readers never take the
+# gate); it pins committed version 1 and is unaffected by either pending writer
+open r read
+on r query I rowsort
+SELECT id FROM t
+----
+1
+expect version 1            # neither w1 nor w2 has committed → still version 1
+expect oldest_live 1        # r pins v1; the writers don't register in the live set
+
+# --- w1 commits → version 2; that release unblocks w2's queued open ---------
+commit w1
+expect version 2
+
+# w2 acquired the gate the instant w1 released, capturing version 2 as its base —
+# it sees w1's row 2 (read-your-writes across the hand-off), never the older v1
+on w2 query I rowsort
+SELECT id FROM t
+----
+1
+2
+on w2 statement ok
+INSERT INTO t VALUES (3)
+commit w2
+expect version 3
+
+# the reader still sees ONLY its pinned snapshot (version 1: one row) — snapshot
+# isolation held across the entire block + hand-off
+on r query I rowsort
+SELECT id FROM t
+----
+1
+close r
+expect oldest_live 3        # reader gone → watermark advances to the committed version
+expect version 3

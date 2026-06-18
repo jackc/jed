@@ -689,8 +689,16 @@ enum Record {
 
 /// One step of a schedule — the parsed form shared by both execution modes.
 enum Step {
-    Open { sid: String, mode: String },
-    On { sid: String, record: Record },
+    Open {
+        sid: String,
+        mode: String,
+        /// The Layer 2 `blocks` annotation (a writer-open on a currently-held gate, §5).
+        blocks: bool,
+    },
+    On {
+        sid: String,
+        record: Record,
+    },
     Commit(String),
     Rollback(String),
     Close(String),
@@ -847,11 +855,22 @@ fn parse_schedule(text: &str) -> Result<Vec<Step>, String> {
         match fields[0] {
             "open" => {
                 if fields.len() < 3 {
-                    return Err(format!("open needs `<sid> read|write`: {line:?}"));
+                    return Err(format!("open needs `<sid> read|write [blocks]`: {line:?}"));
                 }
+                // An optional 4th token is the Layer 2 `blocks` annotation (writer-open, held gate).
+                let blocks = match fields.get(3) {
+                    None => false,
+                    Some(&"blocks") => true,
+                    Some(other) => {
+                        return Err(format!(
+                            "unknown open annotation '{other}' (want `blocks`): {line:?}"
+                        ));
+                    }
+                };
                 steps.push(Step::Open {
                     sid: fields[1].to_string(),
                     mode: fields[2].to_string(),
+                    blocks,
                 });
                 i += 1;
             }
@@ -955,25 +974,66 @@ fn run_concurrency_file_threaded(text: &str) -> Result<(), String> {
 }
 
 /// Execute a schedule on a single thread: the canonical, deterministic transcript.
+///
+/// The Layer 2 `blocks` annotation (concurrency-testing.md §5) is modeled here without ever truly
+/// blocking: a queued writer-open is NOT run when it is seen (calling `write()` now would block the
+/// single thread forever on the held gate), but recorded — and run at the gate-releasing step, the
+/// instant the holder commits/rolls back. That is the equivalent serial order, identical to what a
+/// threaded run consistent with the schedule must produce. `gate_holder` is the live writer's sid
+/// (the single-writer gate), and `blocked` is the at-most-one writer queued on it.
 fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
     let db = SharedDb::new_in_memory();
     let mut sessions: HashMap<String, Session> = HashMap::new();
+    let mut gate_holder: Option<String> = None; // the live writer holding the gate
+    let mut blocked: Option<String> = None; // a writer queued on the gate (Layer 2 `blocks`)
     for step in steps {
         match step {
-            Step::Open { sid, mode } => {
-                if sessions.contains_key(sid) {
+            Step::Open { sid, mode, blocks } => {
+                if sessions.contains_key(sid) || blocked.as_deref() == Some(sid.as_str()) {
                     return Err(format!("session '{sid}' already open"));
                 }
-                let s = match mode.as_str() {
-                    "read" => Session::Read(db.read()),
-                    "write" => Session::Write(db.write()),
+                match mode.as_str() {
+                    "read" => {
+                        if *blocks {
+                            return Err(format!(
+                                "open {sid}: `blocks` is only valid for a write session"
+                            ));
+                        }
+                        sessions.insert(sid.clone(), Session::Read(db.read())); // readers never gate
+                    }
+                    "write" if *blocks => {
+                        // Layer 2: assert the gate is held, then QUEUE the open — running `write()`
+                        // now would deadlock the single thread. It opens at the releasing step below.
+                        if gate_holder.is_none() {
+                            return Err(format!(
+                                "open {sid} write blocks: the writer gate is free (nothing to block on)"
+                            ));
+                        }
+                        if let Some(b) = &blocked {
+                            return Err(format!(
+                                "open {sid} write blocks: writer '{b}' is already blocked (one at a time)"
+                            ));
+                        }
+                        blocked = Some(sid.clone());
+                    }
+                    "write" => {
+                        if let Some(h) = &gate_holder {
+                            return Err(format!(
+                                "open {sid} write: the gate is held by '{h}' — use `blocks`"
+                            ));
+                        }
+                        sessions.insert(sid.clone(), Session::Write(db.write()));
+                        gate_holder = Some(sid.clone());
+                    }
                     other => {
                         return Err(format!("unknown session mode '{other}' (want read|write)"));
                     }
-                };
-                sessions.insert(sid.clone(), s);
+                }
             }
             Step::On { sid, record } => {
+                if blocked.as_deref() == Some(sid.as_str()) {
+                    return Err(format!("on '{sid}' while it is blocked on the writer gate"));
+                }
                 let session = sessions
                     .get_mut(sid)
                     .ok_or_else(|| format!("on unknown session '{sid}'"))?;
@@ -985,10 +1045,25 @@ fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
                     Step::Rollback(_) => "rollback",
                     _ => "close",
                 };
+                if blocked.as_deref() == Some(sid.as_str()) {
+                    return Err(format!(
+                        "{kind} of '{sid}' while it is blocked on the writer gate"
+                    ));
+                }
                 let sess = sessions
                     .remove(sid)
                     .ok_or_else(|| format!("{kind} of unknown session '{sid}'"))?;
                 end_session(kind, sess).map_err(|e| format!("{kind} {sid}: {e}"))?;
+                // If the ended session held the gate, release it — and let the queued writer (if any)
+                // acquire it now: it opens (`write()` no longer blocks) capturing the version just
+                // published, the equivalent serial order (§5).
+                if gate_holder.as_deref() == Some(sid.as_str()) {
+                    gate_holder = None;
+                    if let Some(b) = blocked.take() {
+                        sessions.insert(b.clone(), Session::Write(db.write()));
+                        gate_holder = Some(b);
+                    }
+                }
             }
             Step::ExpectVersion(n) => {
                 let got = db.version();
@@ -1004,8 +1079,11 @@ fn run_steps_sequential(steps: &[Step]) -> Result<(), String> {
             }
         }
     }
-    if !sessions.is_empty() {
+    if !sessions.is_empty() || blocked.is_some() {
         let mut open: Vec<&str> = sessions.keys().map(String::as_str).collect();
+        if let Some(b) = &blocked {
+            open.push(b.as_str());
+        }
         open.sort_unstable(); // deterministic message; map order must never leak (CLAUDE.md §8)
         return Err(format!(
             "file ended with sessions still open: {}",
@@ -1078,71 +1156,113 @@ fn write_worker(db: SharedDb, sid: String, rx: Receiver<Cmd>, tx: Sender<Result<
     }
 }
 
-/// Execute a schedule with one OS thread per session, the listed order enforced by a turn token:
-/// the driver sends a command and waits for the worker's reply (and, for an end step, joins the
-/// thread) before advancing — so exactly one session runs at a time, in the listed order, yet every
-/// operation runs on a real thread against the shared handle (race-detector / TSan coverage). The
-/// canonical result is identical to the sequential mode (concurrency-testing.md §2).
+/// The threaded-mode driver state: the live (open-acked) workers, the gate holder, and the
+/// at-most-one writer queued on the gate (Layer 2 `blocks`). A blocked writer's thread is parked
+/// inside `db.write()` on the held gate, so its open ack has NOT been received yet; it is drained at
+/// the gate-releasing step, when its `write()` returns and it sends the deferred ack.
 #[cfg(test)]
-fn run_steps_threaded(steps: &[Step]) -> Result<(), String> {
-    let db = SharedDb::new_in_memory();
-    let mut workers: HashMap<String, Worker> = HashMap::new();
-    let mut result: Result<(), String> = Ok(());
+struct Driver {
+    db: SharedDb,
+    workers: HashMap<String, Worker>,
+    gate_holder: Option<String>,
+    blocked: Option<(String, Worker)>,
+}
 
-    for step in steps {
+#[cfg(test)]
+impl Driver {
+    fn new() -> Self {
+        Driver {
+            db: SharedDb::new_in_memory(),
+            workers: HashMap::new(),
+            gate_holder: None,
+            blocked: None,
+        }
+    }
+
+    /// Spawn a per-session worker thread. `SharedDb` is `Send + Sync` — proven by moving a clone into
+    /// the thread, where the handle is created, used, and dropped (only the shared core crosses over).
+    fn spawn(&self, mode: &str, sid: &str) -> Result<Worker, String> {
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (rep_tx, rep_rx) = mpsc::channel();
+        let dbc = self.db.clone();
+        let sidc = sid.to_string();
+        let handle = match mode {
+            "read" => thread::spawn(move || read_worker(dbc, sidc, cmd_rx, rep_tx)),
+            "write" => thread::spawn(move || write_worker(dbc, sidc, cmd_rx, rep_tx)),
+            other => return Err(format!("unknown session mode '{other}' (want read|write)")),
+        };
+        Ok(Worker {
+            cmd: cmd_tx,
+            reply: rep_rx,
+            handle,
+        })
+    }
+
+    /// Run one schedule step (the turn token: dispatch, wait for the reply, advance).
+    fn step(&mut self, step: &Step) -> Result<(), String> {
         match step {
-            Step::Open { sid, mode } => {
-                if workers.contains_key(sid) {
-                    result = Err(format!("session '{sid}' already open"));
-                    break;
+            Step::Open { sid, mode, blocks } => {
+                if self.workers.contains_key(sid)
+                    || self.blocked.as_ref().is_some_and(|(s, _)| s == sid)
+                {
+                    return Err(format!("session '{sid}' already open"));
                 }
-                let (cmd_tx, cmd_rx) = mpsc::channel();
-                let (rep_tx, rep_rx) = mpsc::channel();
-                let dbc = db.clone(); // SharedDb is Send + Sync — proven by moving it into the thread
-                let sidc = sid.clone();
-                let handle = match mode.as_str() {
-                    "read" => thread::spawn(move || read_worker(dbc, sidc, cmd_rx, rep_tx)),
-                    "write" => thread::spawn(move || write_worker(dbc, sidc, cmd_rx, rep_tx)),
-                    other => {
-                        result = Err(format!("unknown session mode '{other}' (want read|write)"));
-                        break;
+                match mode.as_str() {
+                    "read" => {
+                        if *blocks {
+                            return Err(format!(
+                                "open {sid}: `blocks` is only valid for a write session"
+                            ));
+                        }
+                        let w = self.spawn("read", sid)?;
+                        self.ack_open(sid, w)
                     }
-                };
-                // The turn token: wait for the open ack (handle acquired/pinned) before advancing.
-                if let Err(e) = recv_reply(&rep_rx) {
-                    result = Err(format!("open {sid}: {e}"));
-                    let _ = handle.join();
-                    break;
+                    "write" if *blocks => {
+                        // Layer 2: validate BEFORE spawning (an unspawned error path leaves nothing
+                        // parked on the gate). The gate must be held; at most one writer may block.
+                        if self.gate_holder.is_none() {
+                            return Err(format!(
+                                "open {sid} write blocks: the writer gate is free (nothing to block on)"
+                            ));
+                        }
+                        if let Some((b, _)) = &self.blocked {
+                            return Err(format!(
+                                "open {sid} write blocks: writer '{b}' is already blocked (one at a time)"
+                            ));
+                        }
+                        let w = self.spawn("write", sid)?;
+                        // Do NOT receive the ack: the thread is parked inside `write()` on the held
+                        // gate. The ack arrives only when the holder releases it (drained below).
+                        self.blocked = Some((sid.clone(), w));
+                        Ok(())
+                    }
+                    "write" => {
+                        if let Some(h) = &self.gate_holder {
+                            // A non-blocking write-open on a held gate would park the thread in
+                            // `write()` and the ack recv would deadlock the driver — reject it.
+                            return Err(format!(
+                                "open {sid} write: the gate is held by '{h}' — use `blocks`"
+                            ));
+                        }
+                        let w = self.spawn("write", sid)?;
+                        self.ack_open(sid, w)?;
+                        self.gate_holder = Some(sid.clone());
+                        Ok(())
+                    }
+                    other => Err(format!("unknown session mode '{other}' (want read|write)")),
                 }
-                workers.insert(
-                    sid.clone(),
-                    Worker {
-                        cmd: cmd_tx,
-                        reply: rep_rx,
-                        handle,
-                    },
-                );
             }
             Step::On { sid, record } => {
-                let Some(w) = workers.get(sid) else {
-                    result = Err(format!("on unknown session '{sid}'"));
-                    break;
+                if self.blocked.as_ref().is_some_and(|(s, _)| s == sid) {
+                    return Err(format!("on '{sid}' while it is blocked on the writer gate"));
+                }
+                let Some(w) = self.workers.get(sid) else {
+                    return Err(format!("on unknown session '{sid}'"));
                 };
                 if w.cmd.send(Cmd::Run(record.clone())).is_err() {
-                    result = Err(format!("[{sid}] worker died before record"));
-                    break;
+                    return Err(format!("[{sid}] worker died before record"));
                 }
-                match recv_reply(&w.reply) {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        result = Err(e);
-                        break;
-                    }
-                    Err(e) => {
-                        result = Err(e);
-                        break;
-                    }
-                }
+                recv_reply(&w.reply)?
             }
             Step::Commit(sid) | Step::Rollback(sid) | Step::Close(sid) => {
                 let kind = match step {
@@ -1150,53 +1270,155 @@ fn run_steps_threaded(steps: &[Step]) -> Result<(), String> {
                     Step::Rollback(_) => "rollback",
                     _ => "close",
                 };
-                let Some(w) = workers.remove(sid) else {
-                    result = Err(format!("{kind} of unknown session '{sid}'"));
-                    break;
+                if self.blocked.as_ref().is_some_and(|(s, _)| s == sid) {
+                    return Err(format!(
+                        "{kind} of '{sid}' while it is blocked on the writer gate"
+                    ));
+                }
+                let releasing = self.gate_holder.as_deref() == Some(sid.as_str());
+                if releasing {
+                    if let Some((bsid, bw)) = &self.blocked {
+                        // Layer 2 real-blocking verification (§5): the queued writer must NOT have
+                        // acquired the gate yet — its ack must still be pending while the holder holds.
+                        match bw.reply.try_recv() {
+                            Err(mpsc::TryRecvError::Empty) => {} // still blocked — good
+                            Ok(_) => {
+                                return Err(format!(
+                                    "blocked writer '{bsid}' acquired the gate before '{sid}' released it"
+                                ));
+                            }
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                return Err(format!(
+                                    "blocked writer '{bsid}' worker terminated unexpectedly"
+                                ));
+                            }
+                        }
+                    }
+                }
+                let Some(w) = self.workers.remove(sid) else {
+                    return Err(format!("{kind} of unknown session '{sid}'"));
                 };
                 let _ = w.cmd.send(Cmd::End(kind.to_string()));
                 let reply = recv_reply(&w.reply);
-                // Join AFTER the reply so the handle's Drop (deregister / gate release) has run
-                // before the next step reads the watermark — the join is the happens-before edge.
+                // Join AFTER the reply so the handle's Drop (deregister / gate release) has run before
+                // the next step reads the watermark — the join is the happens-before edge.
                 let _ = w.handle.join();
-                match reply {
-                    Ok(Ok(())) => {}
-                    Ok(Err(e)) => {
-                        result = Err(format!("{kind} {sid}: {e}"));
-                        break;
-                    }
-                    Err(e) => {
-                        result = Err(format!("{kind} {sid}: {e}"));
-                        break;
+                let end = match reply {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(e)) => Err(format!("{kind} {sid}: {e}")),
+                    Err(e) => Err(format!("{kind} {sid}: {e}")),
+                };
+                if releasing {
+                    self.gate_holder = None;
+                    if end.is_ok() {
+                        if let Some((bsid, bw)) = self.blocked.take() {
+                            // The gate is free now: the queued writer's parked `write()` returns and
+                            // its thread sends the deferred ack. Receive it (the open logically
+                            // completes), promoting it to the live gate holder — capturing the version
+                            // the holder just published (§5).
+                            match recv_reply(&bw.reply) {
+                                Ok(Ok(())) => {
+                                    self.workers.insert(bsid.clone(), bw);
+                                    self.gate_holder = Some(bsid);
+                                }
+                                Ok(Err(e)) => {
+                                    let _ = bw.handle.join();
+                                    return Err(format!("open {bsid}: {e}"));
+                                }
+                                Err(e) => {
+                                    let _ = bw.handle.join();
+                                    return Err(format!("open {bsid}: {e}"));
+                                }
+                            }
+                        }
                     }
                 }
+                end
             }
             Step::ExpectVersion(n) => {
-                let got = db.version();
+                let got = self.db.version();
                 if got != *n {
-                    result = Err(format!("expect version {n}, got {got}"));
-                    break;
+                    return Err(format!("expect version {n}, got {got}"));
                 }
+                Ok(())
             }
             Step::ExpectOldestLive(n) => {
-                let got = db.oldest_live_txid();
+                let got = self.db.oldest_live_txid();
                 if got != *n {
-                    result = Err(format!("expect oldest_live {n}, got {got}"));
-                    break;
+                    return Err(format!("expect oldest_live {n}, got {got}"));
                 }
+                Ok(())
             }
         }
     }
 
-    // Tear down any still-open workers: dropping the command sender ends the worker loop (a read
-    // handle deregisters; a write handle rolls back + releases the gate), then we join it.
-    let mut still_open: Vec<String> = workers.keys().cloned().collect();
-    still_open.sort_unstable(); // deterministic message; map order must never leak (CLAUDE.md §8)
-    for (_, w) in workers {
-        drop(w.cmd);
-        drop(w.reply);
-        let _ = w.handle.join();
+    /// The turn token for a non-blocking open: wait for the open ack, registering the worker on
+    /// success and joining the (failed) thread on error.
+    fn ack_open(&mut self, sid: &str, w: Worker) -> Result<(), String> {
+        match recv_reply(&w.reply) {
+            Ok(Ok(())) => {
+                self.workers.insert(sid.to_string(), w);
+                Ok(())
+            }
+            Ok(Err(e)) => {
+                let _ = w.handle.join();
+                Err(format!("open {sid}: {e}"))
+            }
+            Err(e) => {
+                let _ = w.handle.join();
+                Err(format!("open {sid}: {e}"))
+            }
+        }
     }
+
+    /// End every still-open worker and return their ids (sorted, for a deterministic leftover
+    /// message). Live workers go FIRST — dropping a command sender ends the loop, and a never-ended
+    /// write handle's `Drop` releases the gate — so a still-parked blocked writer then unblocks: with
+    /// the gate freed its `write()` returns, the thread reaches the (now-closed) command loop, and its
+    /// handle drops → rollback. The deferred ack sits unread in the unbounded channel and is discarded
+    /// on drop (no rendezvous needed — unlike Go's unbuffered channels, an mpsc send never blocks).
+    fn teardown(&mut self) -> Vec<String> {
+        let mut leftover: Vec<String> = self.workers.keys().cloned().collect();
+        let blocked = self.blocked.take().map(|(sid, w)| {
+            leftover.push(sid);
+            w
+        });
+        for (_, w) in self.workers.drain() {
+            drop(w.cmd);
+            drop(w.reply);
+            let _ = w.handle.join();
+        }
+        // The blocked writer last: live workers are down, so the gate is free and its parked write()
+        // has returned. Dropping its command sender ends the loop → its handle rolls back and exits.
+        if let Some(w) = blocked {
+            drop(w.cmd);
+            drop(w.reply);
+            let _ = w.handle.join();
+        }
+        leftover.sort_unstable(); // deterministic message; map order must never leak (CLAUDE.md §8)
+        leftover
+    }
+}
+
+/// Execute a schedule with one OS thread per session, the listed order enforced by a turn token:
+/// the driver sends a command and waits for the worker's reply (and, for an end step, joins the
+/// thread) before advancing — so exactly one session runs at a time, in the listed order, yet every
+/// operation runs on a real thread against the shared handle (race-detector / TSan coverage). The
+/// canonical result is identical to the sequential mode (concurrency-testing.md §2). The Layer 2
+/// `blocks` annotation additionally drives the REAL blocking acquire: the queued writer's thread
+/// stays parked inside `write()` on the held gate (its open ack deferred) until the holder releases
+/// it, the one concurrency path the sequential walk never exercises (§5).
+#[cfg(test)]
+fn run_steps_threaded(steps: &[Step]) -> Result<(), String> {
+    let mut d = Driver::new();
+    let mut result: Result<(), String> = Ok(());
+    for step in steps {
+        if let Err(e) = d.step(step) {
+            result = Err(e);
+            break;
+        }
+    }
+    let still_open = d.teardown();
     if result.is_ok() && !still_open.is_empty() {
         return Err(format!(
             "file ended with sessions still open: {}",
@@ -1249,5 +1471,31 @@ mod concurrency_threaded_tests {
             ran += 1;
         }
         assert!(ran > 0, "no runnable concurrency files found");
+    }
+
+    /// A schedule left with a live holder AND a queued (blocked) writer must tear down without
+    /// hanging, reporting BOTH as still open. The Layer 2 teardown path the suite `.test` files never
+    /// reach (they always end every session): tearing down the holder releases the gate, so the
+    /// parked writer's `write()` returns and its thread can be joined (§5).
+    #[test]
+    fn teardown_unblocks_a_leftover_blocked_writer() {
+        let steps = vec![
+            Step::Open {
+                sid: "w1".into(),
+                mode: "write".into(),
+                blocks: false,
+            },
+            Step::Open {
+                sid: "w2".into(),
+                mode: "write".into(),
+                blocks: true,
+            },
+        ];
+        let err =
+            run_steps_threaded(&steps).expect_err("a leftover holder + blocked writer must error");
+        assert!(
+            err.contains("w1") && err.contains("w2"),
+            "want a leftover error naming w1 and w2, got: {err}"
+        );
     }
 }

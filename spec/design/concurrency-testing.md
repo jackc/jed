@@ -55,8 +55,8 @@ than exact transcripts.
 
 Layers 1–2 join the differential contract. Layer 3 belongs to the benchmarks family
 ([benchmarks.md](benchmarks.md)): nondeterministic schedule, deterministic *checked answer*.
-**Layer 1 has landed on all three cores** (stepped-sequential everywhere; the stepped-threaded mode
-on Go and Rust); **2 and 3 are specified here as follow-ons.**
+**Layers 1–2 have landed on all three cores** (stepped-sequential everywhere; the stepped-threaded
+mode on Go and Rust); **Layer 3 is specified here as a follow-on.**
 
 ## 4. Layer 1 — the deterministic schedule format
 
@@ -163,7 +163,7 @@ capabilities and run the schedule, so none skip today; the gate remains the mech
 *future* core (or a core mid-port) skips — before parsing — until its runner exists. No silent pass
 — a skip is always reported.
 
-## 5. Layer 2 — the write-gate `await` extension (follow-on)
+## 5. Layer 2 — the write-gate `await` extension (landed)
 
 The only blocking operation in the current model is `open <sid> write` while another writer
 holds the gate. One annotation expresses it:
@@ -184,9 +184,22 @@ block). A **threaded** harness MAY additionally verify real blocking (spawn the 
 it has not returned before the releasing step, then join) as a stronger check — confining all
 timing-sensitivity to that optional verification while the *result* contract stays timing-free.
 
+**How it lands.** A `blocks` open is **not run when it is seen** — calling `write()` then would
+block the runner forever on the held gate (Go/Rust), or throw `25001` (the TS core, which cannot
+block one thread). It is **recorded and run at the gate-releasing step**, the instant the holder
+commits/rolls back — so on every core the deferred `write()` finally executes against a *free* gate
+and succeeds uniformly, capturing the version the holder just published (read-your-writes across the
+hand-off). The single-writer model bounds this to **at most one blocked writer at a time** (a second
+`blocks` is a schedule error). The **stepped-threaded** cores (Go/Rust) do *not* defer: the queued
+writer's thread parks inside the real `write()` on the held gate (its open ack withheld) until the
+holder releases it — driving the actual blocking acquire/condvar-wakeup under the race detector (the
+one concurrency path the sequential walk never exercises), and the driver verifies the open had **not**
+returned before the release (the optional stronger check above). First file:
+`suites/concurrency/gate_blocking.test`.
+
 Forward-compatible: if the model ever grows row-level locks or multiple writers, `blocks` /
-release generalizes, and a release that never arrives becomes a deadlock assertion. Gated by
-a `txn.gate_blocking` capability (not yet defined — added with the first Layer-2 file).
+release generalizes (the one-blocked-writer bound lifts), and a release that never arrives becomes a
+deadlock assertion. Gated by the `txn.gate_blocking` capability.
 
 ## 6. Layer 3 — the parallelism stress format (follow-on)
 
@@ -270,20 +283,20 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
 
 ## 8. Placement, capabilities, CI
 
-- `spec/conformance/suites/concurrency/*.test` — Layer 1 (and later 2). New capabilities in
-  `manifest.toml`: `txn.shared`, `txn.read_handle`, `txn.watermark` (and later
-  `txn.gate_blocking`). Validated by `rake verify`; **in `rake ci`** for any core declaring
-  them.
+- `spec/conformance/suites/concurrency/*.test` — Layers 1 and 2. Capabilities in
+  `manifest.toml`: `txn.shared`, `txn.read_handle`, `txn.watermark`, `txn.gate_blocking`.
+  Validated by `rake verify`; **in `rake ci`** for any core declaring them.
 - `stress/*.stress.toml` + a `rake stress` task — Layer 3; **outside `rake ci`**, registered
   alongside the determinism ledger as timing-nondeterministic (like `bench/`).
 
-### Capabilities (Layer 1)
+### Capabilities (Layers 1–2)
 
 | id | meaning |
 |---|---|
 | `txn.shared` | the goroutine/thread-safe `SharedDb` handle — concurrent readers + a single writer (transactions.md §10) |
 | `txn.read_handle` | a `ReadHandle` pins a consistent committed snapshot for its life; a write through it is `25006`; `close` deregisters it |
 | `txn.watermark` | `oldest_live_txid` tracks the minimum version any live reader pins (the Phase-6 reclamation gate, transactions.md §8) |
+| `txn.gate_blocking` | the Layer 2 `open <sid> write blocks` annotation — a writer-open on the held single-writer gate, queued until the holder releases it (the equivalent serial order, §5) |
 
 ## 9. Status
 
@@ -294,9 +307,13 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
   stepped-threaded mode** — one goroutine/OS-thread per session under a turn token — driven under
   the race detector by `rake concurrency:race` (`go test -race`; Rust `cargo test` proving
   `Send`/`Sync` + the threaded run, a TSan run optional). TS is sequential-only (JS has no
-  shared-memory threads for live objects, §4.3). Two schedules so far: `snapshot_isolation.test`
-  (cross-handle visibility + the watermark) and `watermark_refcount.test` (reader refcounting + a
-  rolled-back writer).
-- **Layer 2 — specified (§5), not built.** Lands with the first `txn.gate_blocking` file.
+  shared-memory threads for live objects, §4.3). Three schedules so far: `snapshot_isolation.test`
+  (cross-handle visibility + the watermark), `watermark_refcount.test` (reader refcounting + a
+  rolled-back writer), and `gate_blocking.test` (the Layer 2 write-gate block + hand-off).
+- **Layer 2 — landed (all three cores).** The `open <sid> write blocks` annotation and the
+  `txn.gate_blocking` capability (§5). All three cores defer the queued open to the gate-releasing
+  step (the canonical, timing-free result); Go and Rust additionally park the queued writer's thread
+  inside the real `write()` on the held gate under the race detector (`rake concurrency:race`),
+  verifying the open had not returned before the release. First file: `gate_blocking.test`.
 - **Layer 3 — specified (§6), not built.** Lands as `stress/` + `rake stress`, most valuable
   once file-backed sharing is wired.

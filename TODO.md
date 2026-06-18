@@ -526,12 +526,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       pins snapshot isolation, cross-handle visibility, 25006-no-poison, and the `oldest_live_txid` watermark.
       **Runner landed in all three cores** (`impl/{go,rust,ts}` conformance harnesses, stepped-sequential =
       the canonical result); **Go + Rust also run the stepped-threaded mode** (one goroutine/OS-thread per
-      session under a turn token) under the race detector via `rake concurrency:race`. Two schedules:
-      `snapshot_isolation.test` + `watermark_refcount.test` (reader refcount + a rolled-back writer).
+      session under a turn token) under the race detector via `rake concurrency:race`.
       → [concurrency-testing.md](spec/design/concurrency-testing.md)
-  - [ ] _follow-on — Layer 2 (gate-blocking `await`):_ `open <sid> write blocks` + release; cap
-        `txn.gate_blocking`. Canonical = equivalent serial order; threaded harness verifies real blocking.
-        → [concurrency-testing.md §5](spec/design/concurrency-testing.md)
+- [x] **P5.4 (Layer 2) — the write-gate `blocks` annotation** — `open <sid> write blocks` asserts the
+      held single-writer gate, queuing the writer-open until the holder commits/rolls back (the
+      equivalent serial order). New cap `txn.gate_blocking`; `suites/concurrency/gate_blocking.test`.
+      **Landed in all three cores** — all defer the queued open to the gate-releasing step (the canonical,
+      timing-free result, so the TS core models the block without truly blocking); **Go + Rust additionally
+      park the queued writer's thread inside the real `write()` on the held gate under the race detector
+      (`rake concurrency:race`)**, verifying the open had not returned before the release — the one
+      concurrency path the sequential walk never exercises. At most one writer blocked at a time
+      (single-writer model). Three schedules now (`snapshot_isolation`/`watermark_refcount`/`gate_blocking`).
+      → [concurrency-testing.md §5](spec/design/concurrency-testing.md)
   - [ ] _follow-on — Layer 3 (parallel stress):_ `stress/*.stress.toml` + `rake stress`, bench-family
         (outside `rake ci`); per-snapshot invariants + confluent final-state cross-core checksum; seeded
         sequential fallback on single-thread cores. Highest payoff once file-backed sharing is wired.

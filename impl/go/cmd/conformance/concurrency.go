@@ -61,6 +61,7 @@ type cStep struct {
 	kind       string // "open" | "on" | "commit" | "rollback" | "close" | "expect"
 	sid        string
 	mode       string  // open: read | write
+	blocks     bool    // open write: the Layer 2 `blocks` annotation (the gate is currently held)
 	rec        cRecord // on
 	expectKind string  // expect: version | oldest_live
 	expectVal  uint64
@@ -175,9 +176,17 @@ func parseSchedule(text string) ([]cStep, error) {
 		switch fields[0] {
 		case "open":
 			if len(fields) < 3 {
-				return nil, fmt.Errorf("open needs `<sid> read|write`: %q", line)
+				return nil, fmt.Errorf("open needs `<sid> read|write [blocks]`: %q", line)
 			}
-			steps = append(steps, cStep{kind: "open", sid: fields[1], mode: fields[2]})
+			// An optional 4th token is the Layer 2 `blocks` annotation (a writer-open on a held gate).
+			blocks := false
+			if len(fields) > 3 {
+				if fields[3] != "blocks" {
+					return nil, fmt.Errorf("unknown open annotation %q (want `blocks`): %q", fields[3], line)
+				}
+				blocks = true
+			}
+			steps = append(steps, cStep{kind: "open", sid: fields[1], mode: fields[2], blocks: blocks})
 			i++
 		case "commit", "rollback", "close":
 			if len(fields) < 2 {
@@ -292,24 +301,55 @@ func runConcurrencyFile(text string) error {
 }
 
 // runScheduleSequential executes a schedule on a single goroutine: the canonical transcript.
+//
+// The Layer 2 `blocks` annotation (concurrency-testing.md §5) is modeled here without ever truly
+// blocking: a queued writer-open is NOT run when it is seen (calling Write() now would block the
+// single goroutine forever on the held gate), but recorded — and run at the gate-releasing step, the
+// instant the holder commits/rolls back. That is the equivalent serial order, identical to what a
+// threaded run consistent with the schedule must produce. `gateHolder` is the live writer's sid (the
+// single-writer gate), and `blockedSid` is the at-most-one writer queued on it.
 func runScheduleSequential(steps []cStep) error {
 	db := jed.NewSharedDB()
 	sessions := map[string]*cSession{}
+	gateHolder := "" // the live writer holding the single-writer gate, "" if free
+	blockedSid := "" // a writer queued on the gate (Layer 2 `blocks`), "" if none
 	for _, st := range steps {
 		switch st.kind {
 		case "open":
-			if _, dup := sessions[st.sid]; dup {
+			if _, dup := sessions[st.sid]; dup || st.sid == blockedSid {
 				return fmt.Errorf("session %q already open", st.sid)
 			}
 			switch st.mode {
 			case "read":
-				sessions[st.sid] = &cSession{read: db.Read()}
+				if st.blocks {
+					return fmt.Errorf("open %s: `blocks` is only valid for a write session", st.sid)
+				}
+				sessions[st.sid] = &cSession{read: db.Read()} // readers never take the gate
 			case "write":
-				sessions[st.sid] = &cSession{write: db.Write()}
+				if st.blocks {
+					// Layer 2: assert the gate is held, then QUEUE the open — running Write() now
+					// would deadlock the single goroutine. It opens at the releasing step below.
+					if gateHolder == "" {
+						return fmt.Errorf("open %s write blocks: the writer gate is free (nothing to block on)", st.sid)
+					}
+					if blockedSid != "" {
+						return fmt.Errorf("open %s write blocks: writer %q is already blocked (one at a time)", st.sid, blockedSid)
+					}
+					blockedSid = st.sid
+				} else {
+					if gateHolder != "" {
+						return fmt.Errorf("open %s write: the gate is held by %q — use `blocks`", st.sid, gateHolder)
+					}
+					sessions[st.sid] = &cSession{write: db.Write()}
+					gateHolder = st.sid
+				}
 			default:
 				return fmt.Errorf("unknown session mode %q (want read|write)", st.mode)
 			}
 		case "commit", "rollback", "close":
+			if st.sid == blockedSid {
+				return fmt.Errorf("%s of %q while it is blocked on the writer gate", st.kind, st.sid)
+			}
 			s, ok := sessions[st.sid]
 			if !ok {
 				return fmt.Errorf("%s of unknown session %q", st.kind, st.sid)
@@ -318,12 +358,26 @@ func runScheduleSequential(steps []cStep) error {
 				return fmt.Errorf("%s %s: %w", st.kind, st.sid, err)
 			}
 			delete(sessions, st.sid)
+			// If the ended session held the gate, release it — and let the queued writer (if any)
+			// acquire it now: it opens (Write() no longer blocks) capturing the version just
+			// published, the equivalent serial order (§5).
+			if st.sid == gateHolder {
+				gateHolder = ""
+				if blockedSid != "" {
+					sessions[blockedSid] = &cSession{write: db.Write()}
+					gateHolder = blockedSid
+					blockedSid = ""
+				}
+			}
 		case "expect":
 			got := expectValue(db, st.expectKind)
 			if got != st.expectVal {
 				return fmt.Errorf("expect %s %d, got %d", st.expectKind, st.expectVal, got)
 			}
 		case "on":
+			if st.sid == blockedSid {
+				return fmt.Errorf("on %q while it is blocked on the writer gate", st.sid)
+			}
 			s, ok := sessions[st.sid]
 			if !ok {
 				return fmt.Errorf("on unknown session %q", st.sid)
@@ -333,8 +387,8 @@ func runScheduleSequential(steps []cStep) error {
 			}
 		}
 	}
-	if len(sessions) != 0 {
-		return fmt.Errorf("file ended with sessions still open: %s", sortedKeys(sessions))
+	if len(sessions) != 0 || blockedSid != "" {
+		return fmt.Errorf("file ended with sessions still open: %s", leftoverList(sessions, blockedSid))
 	}
 	return nil
 }
@@ -347,12 +401,15 @@ func expectValue(db *jed.SharedDB, kind string) uint64 {
 	return db.Version() // "version"
 }
 
-// sortedKeys joins a session map's keys in sorted order — a deterministic message; map iteration
-// order must never leak (CLAUDE.md §8).
-func sortedKeys(sessions map[string]*cSession) string {
-	open := make([]string, 0, len(sessions))
+// leftoverList joins the still-open session ids (plus the queued-but-blocked writer, if any) in
+// sorted order — a deterministic message; map iteration order must never leak (CLAUDE.md §8).
+func leftoverList(sessions map[string]*cSession, blockedSid string) string {
+	open := make([]string, 0, len(sessions)+1)
 	for sid := range sessions {
 		open = append(open, sid)
+	}
+	if blockedSid != "" {
+		open = append(open, blockedSid)
 	}
 	sort.Strings(open)
 	return strings.Join(open, ", ")
@@ -422,88 +479,194 @@ func writeWorker(db *jed.SharedDB, sid string, cmd chan cCmd, reply chan error, 
 	_ = s.write.Rollback() // teardown: command channel closed without an explicit end (release gate)
 }
 
+// newCWorker mints the channels for a per-session worker goroutine.
+func newCWorker() *cWorker {
+	return &cWorker{cmd: make(chan cCmd), reply: make(chan error), done: make(chan struct{})}
+}
+
+// blockedWorker is a writer-open queued on the held gate (Layer 2 `blocks`): its goroutine is spawned
+// and stuck inside Write() on the single-writer gate, so its open ack is NOT yet received. It is
+// drained at the gate-releasing step, when its Write() returns and it sends the deferred ack.
+type blockedWorker struct {
+	sid string
+	w   *cWorker
+}
+
+// cDriver holds the threaded-mode state: the live (open-acked) workers, the gate holder, and the
+// at-most-one writer queued on the gate. Methods drive one step / tear the schedule down.
+type cDriver struct {
+	db         *jed.SharedDB
+	workers    map[string]*cWorker
+	gateHolder string         // the live writer holding the single-writer gate, "" if free
+	blocked    *blockedWorker // a writer queued on the gate (Layer 2), nil if none
+}
+
 // runScheduleThreaded executes a schedule with one goroutine per session, the listed order enforced
 // by a turn token: the driver sends a command and waits for the worker's reply (and, for an end
 // step, joins the goroutine) before advancing — so exactly one session runs at a time, in order, yet
 // every operation runs on a real goroutine against the shared handle (race-detector coverage). The
-// canonical result is identical to the sequential mode (concurrency-testing.md §2/§4.3).
+// canonical result is identical to the sequential mode (concurrency-testing.md §2/§4.3). The Layer 2
+// `blocks` annotation additionally drives the REAL blocking acquire: the queued writer's goroutine
+// stays parked inside Write() on the held gate (its open ack deferred) until the holder releases it,
+// the one concurrency path the sequential walk never exercises (§5).
 func runScheduleThreaded(steps []cStep) error {
-	db := jed.NewSharedDB()
-	workers := map[string]*cWorker{}
+	d := &cDriver{db: jed.NewSharedDB(), workers: map[string]*cWorker{}}
 	var result error
 	for _, st := range steps {
-		if err := threadedStep(db, workers, st); err != nil {
+		if err := d.step(st); err != nil {
 			result = err
 			break
 		}
 	}
-	// Tear down any still-open workers: closing the command channel ends the worker loop (a read
-	// handle deregisters; a write handle rolls back + releases the gate), then we join it.
-	open := make([]string, 0, len(workers))
-	for sid := range workers {
-		open = append(open, sid)
-	}
-	sort.Strings(open) // deterministic order; map iteration order must never leak (CLAUDE.md §8)
-	for _, sid := range open {
-		w := workers[sid]
-		close(w.cmd)
-		<-w.done
-	}
+	open := d.teardown()
 	if result == nil && len(open) != 0 {
 		return fmt.Errorf("file ended with sessions still open: %s", strings.Join(open, ", "))
 	}
 	return result
 }
 
-// threadedStep runs one schedule step in threaded mode (spawn/dispatch to the session's goroutine,
-// or read the SharedDb state for an `expect`).
-func threadedStep(db *jed.SharedDB, workers map[string]*cWorker, st cStep) error {
+// step runs one schedule step in threaded mode (spawn/dispatch to the session's goroutine, queue or
+// hand off a blocked writer, or read the SharedDb state for an `expect`).
+func (d *cDriver) step(st cStep) error {
 	switch st.kind {
 	case "open":
-		if _, dup := workers[st.sid]; dup {
+		if _, dup := d.workers[st.sid]; dup || (d.blocked != nil && d.blocked.sid == st.sid) {
 			return fmt.Errorf("session %q already open", st.sid)
 		}
-		w := &cWorker{cmd: make(chan cCmd), reply: make(chan error), done: make(chan struct{})}
 		switch st.mode {
 		case "read":
-			go readWorker(db, st.sid, w.cmd, w.reply, w.done)
+			if st.blocks {
+				return fmt.Errorf("open %s: `blocks` is only valid for a write session", st.sid)
+			}
+			w := newCWorker()
+			go readWorker(d.db, st.sid, w.cmd, w.reply, w.done)
+			if err := <-w.reply; err != nil { // turn token: wait for the open ack before advancing
+				<-w.done
+				return fmt.Errorf("open %s: %w", st.sid, err)
+			}
+			d.workers[st.sid] = w
+			return nil
 		case "write":
-			go writeWorker(db, st.sid, w.cmd, w.reply, w.done)
+			if st.blocks {
+				// Layer 2: validate BEFORE spawning (an unspawned error path leaves nothing parked on
+				// the gate to clean up). The gate must be held, and at most one writer may block.
+				if d.gateHolder == "" {
+					return fmt.Errorf("open %s write blocks: the writer gate is free (nothing to block on)", st.sid)
+				}
+				if d.blocked != nil {
+					return fmt.Errorf("open %s write blocks: writer %q is already blocked (one at a time)", st.sid, d.blocked.sid)
+				}
+				w := newCWorker()
+				go writeWorker(d.db, st.sid, w.cmd, w.reply, w.done)
+				// Do NOT receive the ack: the goroutine is parked inside Write() on the held gate. The
+				// ack arrives only when the holder releases it (drained at the releasing step).
+				d.blocked = &blockedWorker{sid: st.sid, w: w}
+				return nil
+			}
+			if d.gateHolder != "" {
+				// A non-blocking write-open on a held gate would park the goroutine in Write() and the
+				// turn-token recv below would deadlock the driver — reject it (the schedule wants `blocks`).
+				return fmt.Errorf("open %s write: the gate is held by %q — use `blocks`", st.sid, d.gateHolder)
+			}
+			w := newCWorker()
+			go writeWorker(d.db, st.sid, w.cmd, w.reply, w.done)
+			if err := <-w.reply; err != nil {
+				<-w.done
+				return fmt.Errorf("open %s: %w", st.sid, err)
+			}
+			d.workers[st.sid] = w
+			d.gateHolder = st.sid
+			return nil
 		default:
 			return fmt.Errorf("unknown session mode %q (want read|write)", st.mode)
 		}
-		if err := <-w.reply; err != nil { // the turn token: wait for the open ack before advancing
-			<-w.done
-			return fmt.Errorf("open %s: %w", st.sid, err)
-		}
-		workers[st.sid] = w
-		return nil
 	case "on":
-		w, ok := workers[st.sid]
+		if d.blocked != nil && d.blocked.sid == st.sid {
+			return fmt.Errorf("on %q while it is blocked on the writer gate", st.sid)
+		}
+		w, ok := d.workers[st.sid]
 		if !ok {
 			return fmt.Errorf("on unknown session %q", st.sid)
 		}
 		w.cmd <- cCmd{rec: st.rec}
 		return <-w.reply
 	case "commit", "rollback", "close":
-		w, ok := workers[st.sid]
+		if d.blocked != nil && d.blocked.sid == st.sid {
+			return fmt.Errorf("%s of %q while it is blocked on the writer gate", st.kind, st.sid)
+		}
+		w, ok := d.workers[st.sid]
 		if !ok {
 			return fmt.Errorf("%s of unknown session %q", st.kind, st.sid)
+		}
+		releasing := st.sid == d.gateHolder
+		if releasing && d.blocked != nil {
+			// Layer 2 real-blocking verification (§5): the queued writer must NOT have acquired the
+			// gate yet — its open ack must still be pending while the holder still holds the gate.
+			select {
+			case <-d.blocked.w.reply:
+				return fmt.Errorf("blocked writer %q acquired the gate before %q released it", d.blocked.sid, st.sid)
+			default:
+			}
 		}
 		w.cmd <- cCmd{end: true, kind: st.kind}
 		err := <-w.reply
 		<-w.done // join AFTER the reply, so the handle's deregister/gate-release has happened
-		delete(workers, st.sid)
+		delete(d.workers, st.sid)
 		if err != nil {
 			return fmt.Errorf("%s %s: %w", st.kind, st.sid, err)
 		}
+		if releasing {
+			d.gateHolder = ""
+			if d.blocked != nil {
+				// The gate is free now: the queued writer's parked Write() returns and the goroutine
+				// sends the deferred ack. Receive it (the open logically completes), promoting it to
+				// the live gate holder — capturing the version the holder just published (§5).
+				b := d.blocked
+				d.blocked = nil
+				if ackErr := <-b.w.reply; ackErr != nil {
+					<-b.w.done
+					return fmt.Errorf("open %s: %w", b.sid, ackErr)
+				}
+				d.workers[b.sid] = b.w
+				d.gateHolder = b.sid
+			}
+		}
 		return nil
 	case "expect":
-		got := expectValue(db, st.expectKind)
+		got := expectValue(d.db, st.expectKind)
 		if got != st.expectVal {
 			return fmt.Errorf("expect %s %d, got %d", st.expectKind, st.expectVal, got)
 		}
 		return nil
 	}
 	return fmt.Errorf("unknown concurrency directive %q", st.kind)
+}
+
+// teardown ends every still-open worker and returns their ids (sorted, for a deterministic leftover
+// message). Live workers go first — closing a command channel ends the loop (a read handle
+// deregisters; a write handle rolls back + releases the gate) — so a still-parked blocked writer can
+// then unblock: with the gate freed, its Write() returns, it sends the deferred ack (received here to
+// unblock the send), and closing its command channel rolls back its empty transaction.
+func (d *cDriver) teardown() []string {
+	leftover := make([]string, 0, len(d.workers)+1)
+	live := make([]string, 0, len(d.workers))
+	for sid := range d.workers {
+		live = append(live, sid)
+	}
+	sort.Strings(live) // deterministic order; map iteration order must never leak (CLAUDE.md §8)
+	for _, sid := range live {
+		w := d.workers[sid]
+		close(w.cmd)
+		<-w.done
+		leftover = append(leftover, sid)
+	}
+	if d.blocked != nil {
+		b := d.blocked
+		<-b.w.reply    // the gate is free now → its parked Write() returned; unblock the ack send
+		close(b.w.cmd) // end its (empty) transaction → the goroutine rolls back and exits
+		<-b.w.done
+		leftover = append(leftover, b.sid)
+	}
+	sort.Strings(leftover)
+	return leftover
 }

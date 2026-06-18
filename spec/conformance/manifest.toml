@@ -520,6 +520,10 @@ description = "A ReadHandle pins one committed snapshot at read() and serves eve
 id = "txn.watermark"
 description = "The reader-liveness watermark — oldest_live_txid is the minimum version any still-open reader pins, or the committed version when none is live (the Phase-6 free-list reclamation gate). A pinned reader holds it back; closing the reader lets it advance. spec/design/transactions.md §8"
 
+[[capability]]
+id = "txn.gate_blocking"
+description = "The write-gate `blocks` annotation (Layer 2) — `open <sid> write blocks` asserts the single-writer gate is currently held, so the writer-open is queued rather than run (calling write() now would block the runner) and logically completes the instant the holding writer commits/rolls back: the equivalent serial order. Deterministic on every core (a single-threaded core queues the open; it never needs to truly block); the threaded cores additionally verify real blocking under the race detector. At most one writer may be blocked at a time (the single-writer model). spec/design/concurrency-testing.md §5"
+
 # --- profiles ----------------------------------------------------------------
 # A named bundle of capabilities = a conformance level. `includes` (optional)
 # inherits another profile's capabilities transitively, so profiles are cumulative.

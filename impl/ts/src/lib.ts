@@ -251,6 +251,12 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "txn.shared",
   "txn.read_handle",
   "txn.watermark",
+  // Layer 2 — the write-gate `blocks` annotation (spec/design/concurrency-testing.md §5). Declared
+  // because this core defers a queued writer-open to the gate-releasing step (the canonical,
+  // timing-free result). It has no stepped-threaded mode (JS cannot block one thread — write() while
+  // a writer is open throws 25001, shared.ts), so it models the block by queuing rather than truly
+  // blocking, which still defines + verifies the canonical result the threaded cores reproduce.
+  "txn.gate_blocking",
 ];
 
 // execute parses and executes one SQL statement against db (no bind parameters).

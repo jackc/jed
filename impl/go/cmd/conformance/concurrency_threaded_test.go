@@ -17,6 +17,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"jed"
 )
@@ -69,5 +70,27 @@ func TestConcurrencySchedulesThreaded(t *testing.T) {
 	}
 	if ran == 0 {
 		t.Fatal("no runnable concurrency files found")
+	}
+}
+
+// TestThreadedTeardownWithBlockedWriter covers the Layer 2 teardown path the suite `.test` files
+// never reach (they always end every session): a schedule left with a live holder AND a queued
+// (blocked) writer must tear down without hanging, reporting BOTH as still open. Tearing down the
+// holder releases the gate, so the parked writer's Write() returns and its goroutine can be joined
+// (§5). The timeout turns a teardown deadlock into a failure instead of a hung test run.
+func TestThreadedTeardownWithBlockedWriter(t *testing.T) {
+	steps := []cStep{
+		{kind: "open", sid: "w1", mode: "write"},
+		{kind: "open", sid: "w2", mode: "write", blocks: true},
+	}
+	done := make(chan error, 1)
+	go func() { done <- runScheduleThreaded(steps) }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "w1") || !strings.Contains(err.Error(), "w2") {
+			t.Fatalf("want a leftover error naming w1 and w2, got %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("runScheduleThreaded hung tearing down a blocked writer")
 	}
 }
