@@ -36,6 +36,19 @@ SELECT num_nulls(1, 'a', true, NULL)
 ----
 1
 
+# G20 — an all-NULL spread: every argument is NULL, so num_nulls counts all three (the non-strict
+# kernel counts, never short-circuits).
+query I nosort
+SELECT num_nulls(NULL, NULL, NULL)
+----
+3
+
+# The VARIADIC-array form over a text[] array flattens its elements as the arguments: one NULL → 1.
+query I nosort
+SELECT num_nulls(VARIADIC ARRAY['a', NULL, 'c'])
+----
+1
+
 query I nosort
 SELECT num_nonnulls(1, 'a', true, NULL)
 ----

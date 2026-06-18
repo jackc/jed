@@ -257,6 +257,37 @@ SELECT 1 / c FROM t3 ORDER BY id LIMIT 1
 ----
 0
 
+# G12 — DISTINCT over an empty scanned table is zero rows at zero cost: nothing is scanned, so
+# nothing is projected for the dedup key and nothing is produced. (The ORDER BY / LIMIT
+# counterparts live in order_by.test.) No ORDER BY, so rowsort. Placed before the `tk` block
+# below, whose `distinct` column name is a deliberate jed extension PG cannot parse — it would
+# abort the oracle's replay transaction for any record after it.
+statement ok
+CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+
+# names: a
+# cost: 0
+query I rowsort
+SELECT DISTINCT a FROM e
+----
+
+# G30 — DISTINCT v LIMIT 1 with NO ORDER BY windows the DISTINCT set, whose order is unspecified.
+# Using an all-equal column makes the single surviving distinct value deterministic regardless of
+# order, so it is safely assertable under rowsort. 3 rows collapse to one distinct value (7); only
+# the one emitted row charges row_produced. 3 scanned + 1 produced + 1 page = 5.
+statement ok
+CREATE TABLE eq (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO eq VALUES (1, 7), (2, 7), (3, 7)
+
+# names: v
+# cost: 5
+query I rowsort
+SELECT DISTINCT v FROM eq LIMIT 1
+----
+7
+
 # Parser disambiguation: DISTINCT is not reserved. `distinct` is a legal column name.
 statement ok
 CREATE TABLE tk (id int32 PRIMARY KEY, distinct int32)

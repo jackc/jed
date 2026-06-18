@@ -59,3 +59,21 @@ query I nosort
 SELECT id FROM t ORDER BY id
 ----
 1
+
+# --- G28: in AUTOCOMMIT (no explicit block), a failed statement does NOT poison the next -------
+# Only an explicit BEGIN block enters the failed state; outside one, each statement is its own
+# autocommit transaction, so a duplicate-key 23505 aborts only ITSELF and the following INSERT
+# runs normally (no 25P02). This is the contrast that makes the poisoning above a property of the
+# explicit block, not of an error per se.
+statement error 23505
+INSERT INTO t VALUES (1)
+
+statement ok
+INSERT INTO t VALUES (2)
+
+# Both the pre-existing row 1 and the newly committed row 2 are present — no poisoning occurred.
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2

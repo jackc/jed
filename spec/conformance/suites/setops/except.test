@@ -54,6 +54,24 @@ SELECT k FROM l EXCEPT ALL SELECT k FROM r ORDER BY k
 1
 3
 
+# G25 — a trailing ORDER BY + LIMIT/OFFSET windows the whole EXCEPT ALL result ({1,1,3} ordered).
+# LIMIT/OFFSET are unmetered and the operands still scan fully, so the cost is unchanged at 16.
+# names: k
+# cost: 16
+query I nosort
+SELECT k FROM l EXCEPT ALL SELECT k FROM r ORDER BY k LIMIT 2
+----
+1
+1
+
+# names: k
+# cost: 16
+query I nosort
+SELECT k FROM l EXCEPT ALL SELECT k FROM r ORDER BY k LIMIT 2 OFFSET 1
+----
+1
+3
+
 # Right operand empty -> EXCEPT is just the left's distinct rows {1,2,3}. left = 2*5 = 10;
 # right = 2 scan + 2 compare + 0 produced = 4; total 14.
 # names: k

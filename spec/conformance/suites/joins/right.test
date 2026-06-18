@@ -85,3 +85,35 @@ NULL
 21
 NULL
 30
+
+# G14 — the ON-vs-WHERE outer-join trap. The same predicate on the NULLABLE (left) side behaves
+# very differently depending on where it sits. In the ON clause it is part of the match: a left row
+# that fails it simply does not match, so EVERY right row is still preserved (NULL-extended where it
+# found no qualifying left row). b(10) keeps its a(1) match (a.k=10 holds); b(20)/b(21)/b(30) match
+# no qualifying left row and are preserved with a NULL. All four b rows survive. 2 page + 8
+# materialize + 48 ON (16 candidate pairs x 3 ops: a.k=b.k, a.k=10, AND) + 4 produced = 62.
+# names: id, id
+# cost: 62
+query II nosort
+SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k AND a.k = 10 ORDER BY b.id
+----
+1
+10
+NULL
+20
+NULL
+21
+NULL
+30
+
+# Move the identical predicate to WHERE and it filters AFTER the join — the NULL-extended rows
+# (a.k is NULL on the preserved side) fail `a.k = 10` (NULL = 10 is UNKNOWN) and are dropped,
+# downgrading the RIGHT join to inner-join-like behavior: only the genuinely matched a(1)/b(10) row
+# survives. 2 page + 8 materialize + 16 ON + 4 WHERE (one per join-produced row) + 1 produced = 31.
+# names: id, id
+# cost: 31
+query II nosort
+SELECT a.id, b.id FROM a RIGHT JOIN b ON a.k = b.k WHERE a.k = 10 ORDER BY b.id
+----
+1
+10

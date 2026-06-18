@@ -80,3 +80,19 @@ query D nosort
 SELECT AVG(a) FROM e
 ----
 NULL
+
+# G29 — AVG over LARGE-coefficient decimals accrues the decimal_work cost unit (the per-digit-slab
+# arithmetic charge, cost.md §2): the running decimal sum + the final division over two ~17-digit
+# values cost more than a small-decimal AVG would, proving decimal_work is metered in this path.
+statement ok
+CREATE TABLE bd (id int32 PRIMARY KEY, d numeric)
+
+statement ok
+INSERT INTO bd VALUES (1, 123456789012345.67), (2, 987654321098765.43)
+
+# names: avg
+# cost: 14
+query D nosort
+SELECT AVG(d) FROM bd
+----
+555555555055555.5500

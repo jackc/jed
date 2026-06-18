@@ -5,7 +5,7 @@
 # through the FROM scope. Cost is the CROSS-CORE contract of cost.md §3 (JOIN): storage_row_read
 # once per row as each table is materialized (sum of cardinalities), ON operator_eval per
 # candidate combination, WHERE per surviving combined row, row_produced per emitted row.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.table_alias, query.qualified_column, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.table_alias, query.qualified_column, expr.arithmetic, types.int32, types.text, resource.cost_metering
 
 statement ok
 CREATE TABLE a (id int32 PRIMARY KEY, k int32)
@@ -71,6 +71,38 @@ SELECT a.id, b.id FROM a JOIN b ON a.k > 25 ORDER BY a.id, b.id
 21
 3
 30
+
+# G26 — a NON-equi ON comparing BOTH sides (`a.k > b.k`): each a row pairs with every b row whose
+# k is strictly smaller (a NULL on either side is UNKNOWN, never a match). a.k=20 beats b.k=10;
+# a.k=30 beats b.k=10/20/20. 8 materialize + 2 page + 16 ON (4x4 `>`) + 4 produced = 30.
+# names: id, id
+# cost: 30
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k > b.k ORDER BY a.id, b.id
+----
+2
+10
+3
+10
+3
+20
+3
+21
+
+# An EXPRESSION-keyed equi-join: `a.k = b.k + 10` evaluates the `b.k + 10` per candidate pair.
+# a.k=20 = b.k(10)+10 → (2,10); a.k=30 = b.k(20)+10 → (3,20),(3,21). 8 materialize + 2 page + 32 ON
+# (4x4 pairs x 2 ops: the Add and the `=`) + 3 produced = 45.
+# names: id, id
+# cost: 45
+query II nosort
+SELECT a.id, b.id FROM a JOIN b ON a.k = b.k + 10 ORDER BY a.id, b.id
+----
+2
+10
+3
+20
+3
+21
 
 # A join with no surviving pair yields the empty result. ON matches 3, WHERE `a.id = 999` drops all 3.
 # (The WHERE bounds a's scan to its PRIMARY KEY — a point-lookup miss, so a materializes 0 rows — but

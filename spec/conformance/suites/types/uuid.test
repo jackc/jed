@@ -47,6 +47,22 @@ SELECT id FROM t WHERE id = '{550e8400-e29b-41d4-a716-446655440000}'
 ----
 550e8400-e29b-41d4-a716-446655440000
 
+# G30 — uuid is an OPAQUE 16-byte value: jed does not validate or canonicalize the RFC-4122
+# version/variant nibbles, so an "off-variant" 32-hex value (version '0', variant '0' here) stores
+# as raw 16 bytes and renders as the canonical 8-4-4-4-12 form unchanged. Mixed-case input also
+# lowercases on output.
+statement ok
+CREATE TABLE ov (id int32 PRIMARY KEY, u uuid)
+
+statement ok
+INSERT INTO ov VALUES (1, '0123456789abcdef0123456789abcdef'), (2, '12345678123412341234123456789ABC')
+
+query T nosort
+SELECT u FROM ov ORDER BY id
+----
+01234567-89ab-cdef-0123-456789abcdef
+12345678-1234-1234-1234-123456789abc
+
 # braced + uppercase + hyphen-less, combined — still the same value
 query T nosort
 SELECT id FROM t WHERE id = '{550E8400E29B41D4A716446655440000}'

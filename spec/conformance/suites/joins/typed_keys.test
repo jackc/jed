@@ -7,7 +7,7 @@
 # LEFT JOIN case pins the 3VL ON rule: a NULL join key never matches, so its row is NULL-extended
 # like any other unmatched left row. Rows are asserted with `rowsort` (join output order is
 # unspecified — §8).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.table_alias, query.qualified_column, types.int32, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.table_alias, query.qualified_column, types.int16, types.int32, types.int64, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, resource.cost_metering
 
 # --- decimal: 1.5 matches 1.50 across stored scales (value-canonical, not lexical) -----------
 statement ok
@@ -136,3 +136,30 @@ SELECT a.id, b.k FROM la a LEFT JOIN lb b ON a.k = b.k
 NULL
 3
 NULL
+
+# --- G26: cross-width integer join key (the promotion tower at the join boundary) -------------
+# An int16 key joins an int64 key: the comparison promotes the int16 side to int64 before
+# matching (the promotion tower, compare.toml), so equal numeric values match across widths.
+statement ok
+CREATE TABLE s16 (id int32 PRIMARY KEY, k int16)
+
+statement ok
+INSERT INTO s16 VALUES (1, 100), (2, 200), (3, 300)
+
+statement ok
+CREATE TABLE s64 (id int32 PRIMARY KEY, k int64)
+
+statement ok
+INSERT INTO s64 VALUES (10, 100), (11, 300), (12, 5000000000)
+
+# 100=100 → (1,10); 300=300 → (3,11); 200 and the out-of-int16-range 5000000000 are unmatched.
+# 3 + 3 materialize + 2 page + 9 ON (3x3 `=`) + 2 produced = 19.
+# names: id, id
+# cost: 19
+query II rowsort
+SELECT s16.id, s64.id FROM s16 JOIN s64 ON s16.k = s64.k
+----
+1
+10
+3
+11

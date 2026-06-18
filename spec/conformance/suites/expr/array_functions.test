@@ -62,6 +62,14 @@ SELECT id, array_length(xs,2) FROM t WHERE id = 1
 1
 NULL
 
+# G20 — a non-positive dimension index is out of range, so array_length returns NULL for dim 0 and
+# for a negative dim (like the too-high dim above).
+query II nosort
+SELECT array_length(xs,0), array_length(xs,-1) FROM t WHERE id = 1
+----
+NULL
+NULL
+
 # --- builders: array_append / array_prepend (non-strict) ----------------------------------
 # Append/prepend grow the array; a NULL or empty array yields the 1-D singleton.
 query IT nosort
@@ -127,6 +135,20 @@ SELECT array_append(ARRAY[1,2], NULL), array_cat(ARRAY[ARRAY[1,2],ARRAY[3,4]], A
 ----
 {1,2,NULL}
 {{1,2},{3,4},{5,6}}
+
+# G20 — array_cat of two NULL arrays is NULL (each NULL operand is the identity, so the result is
+# the other operand — here also NULL).
+query T nosort
+SELECT array_cat(NULL::int32[], NULL::int32[]) FROM t WHERE id = 1
+----
+NULL
+
+# The N == M+1 dimension branch: a 1-D array concatenated with a 2-D array prepends as a leading
+# row (the mirror of the 2-D ‖ 1-D case above, which appends a trailing row).
+query T nosort
+SELECT array_cat(ARRAY[5,6], ARRAY[ARRAY[1,2],ARRAY[3,4]]) FROM t WHERE id = 1
+----
+{{5,6},{1,2},{3,4}}
 
 # text[] flows through the polymorphic builders unchanged.
 query TT nosort

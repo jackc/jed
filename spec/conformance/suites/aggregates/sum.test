@@ -47,6 +47,23 @@ SELECT SUM(d) FROM tdec
 ----
 3.75
 
+# G29 — SUM over LARGE-coefficient decimals accrues the decimal_work cost unit (the per-digit-slab
+# arithmetic charge, cost.md §2): the addition of two ~17-digit values costs more than the
+# 6 (1 page + 2 scan + 2 accumulate + 1 produced) a small decimal would — the extra 8 is
+# decimal_work, proving the unit is metered in the aggregate path.
+statement ok
+CREATE TABLE bd (id int32 PRIMARY KEY, d numeric)
+
+statement ok
+INSERT INTO bd VALUES (1, 123456789012345.67), (2, 987654321098765.43)
+
+# names: sum
+# cost: 14
+query D nosort
+SELECT SUM(d) FROM bd
+----
+1111111110111111.10
+
 # NULL inputs are skipped: SUM over the present rows only.
 statement ok
 CREATE TABLE tmix (id int32 PRIMARY KEY, a int32)

@@ -1,6 +1,6 @@
 # NULL storage and three-valued logic (CLAUDE.md §4).
 # Format + the `requires` directive: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.is_null, query.order_by, types.int16, types.int32, null.three_valued, expr.arithmetic, expr.unary_minus
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.is_null, query.order_by, types.int16, types.int32, types.int64, types.decimal, types.text, types.boolean_storable, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, null.three_valued, expr.arithmetic, expr.unary_minus, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, v int16)
@@ -89,3 +89,59 @@ SELECT id, v + 1 FROM t ORDER BY id
 11
 2
 NULL
+
+# G30 — IS NULL / IS NOT NULL behave identically across EVERY scalar type: a definite boolean (never
+# UNKNOWN), TRUE for a NULL value and FALSE for a present one. One consolidated table holds a column
+# of each shipped scalar; row 1 is fully populated (all IS NULL false), row 2 is all-NULL (all true).
+statement ok
+CREATE TABLE allt (id int32 PRIMARY KEY, a int16, b int64, c numeric, t text, bl boolean, by bytea, u uuid, ts timestamp, tz timestamptz, iv interval)
+
+statement ok
+INSERT INTO allt VALUES (1, 1, 2, 3.5, 'x', true, '\x01', '00000000-0000-0000-0000-000000000001', '2024-01-01 00:00:00', '2024-01-01 00:00:00+00', '1 day')
+
+statement ok
+INSERT INTO allt VALUES (2, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL)
+
+# IS NULL across all ten typed columns: false for the populated row, true for the all-NULL row.
+# 2 scan + 2x10 IsNull evals (20) + 2 produced + 1 page = 25.
+# cost: 25
+query IBBBBBBBBBB nosort
+SELECT id, a IS NULL, b IS NULL, c IS NULL, t IS NULL, bl IS NULL, by IS NULL, u IS NULL, ts IS NULL, tz IS NULL, iv IS NULL FROM allt ORDER BY id
+----
+1
+false
+false
+false
+false
+false
+false
+false
+false
+false
+false
+2
+true
+true
+true
+true
+true
+true
+true
+true
+true
+true
+
+# IS NOT NULL is the exact complement (a representative spread: int16, text, interval).
+# 2 scan + 2x3 IsNotNull evals (6) + 2 produced + 1 page = 11.
+# cost: 11
+query IBBB nosort
+SELECT id, a IS NOT NULL, t IS NOT NULL, iv IS NOT NULL FROM allt ORDER BY id
+----
+1
+true
+true
+true
+2
+false
+false
+false

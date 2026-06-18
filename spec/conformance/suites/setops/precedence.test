@@ -56,6 +56,33 @@ SELECT k FROM p UNION SELECT k FROM q UNION SELECT k FROM s ORDER BY k
 3
 4
 
+# G25 — a MIXED-multiplicity chain `q UNION ALL s UNION p` is `(q UNION ALL s) UNION p`
+# (left-assoc): the UNION ALL accumulates a multiset with a duplicate 3 (q has 3, s has 3), and the
+# trailing DISTINCT UNION then dedups the WHOLE accumulated multiset → {1,2,3,4}, 4 rows.
+# cost = 2*2 + 2*2 + 2*1 = 10 (+ 3 page reads) = 13.
+# names: k
+# cost: 13
+query I nosort
+SELECT k FROM q UNION ALL SELECT k FROM s UNION SELECT k FROM p ORDER BY k
+----
+1
+2
+3
+4
+
+# Contrast: the all-ALL chain `q UNION ALL s UNION ALL p` never dedups, so the duplicate 3
+# survives — 5 rows. This is what proves the trailing distinct UNION above did the dedup.
+# names: k
+# cost: 13
+query I nosort
+SELECT k FROM q UNION ALL SELECT k FROM s UNION ALL SELECT k FROM p ORDER BY k
+----
+1
+2
+3
+3
+4
+
 # --- chained type unification -----------------------------------------------------------------
 statement ok
 CREATE TABLE ci (id int32 PRIMARY KEY, n int16)

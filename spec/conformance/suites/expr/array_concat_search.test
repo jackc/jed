@@ -106,6 +106,50 @@ SELECT id, array_positions(xs, 20) FROM t ORDER BY id
 3
 NULL
 
+# --- G20: NULL-safe search/edit + boundary returns ----------------------------------------
+# A NULL search element is matched NULL-safely (IS NOT DISTINCT FROM, not three-valued `=`): over
+# {1,NULL,3} array_remove drops the NULL element (→ {1,3}), array_replace rewrites it (→ {1,99,3}),
+# and array_position returns its subscript (2).
+query T nosort
+SELECT array_remove(ARRAY[1,NULL,3], NULL) FROM t WHERE id = 1
+----
+{1,3}
+
+query T nosort
+SELECT array_replace(ARRAY[1,NULL,3], NULL, 99) FROM t WHERE id = 1
+----
+{1,99,3}
+
+query I nosort
+SELECT array_position(ARRAY[1,NULL,3], NULL) FROM t WHERE id = 1
+----
+2
+
+# array_replace works on ANY dimensionality and is SHAPE-PRESERVING: on a 2-D array it rewrites the
+# matching element in place, leaving the {{…},{…}} structure intact.
+query T nosort
+SELECT array_replace(ARRAY[ARRAY[1,2],ARRAY[3,4]], 2, 99) FROM t WHERE id = 1
+----
+{{1,99},{3,4}}
+
+# array_position with an optional start subscript PAST the end finds nothing → NULL.
+query I nosort
+SELECT array_position(ARRAY[10,20,30], 20, 5) FROM t WHERE id = 1
+----
+NULL
+
+# array_positions distinguishes "no match" from "no array": an absent value over a present array is
+# the EMPTY array {}, while a NULL array argument propagates to NULL.
+query T nosort
+SELECT array_positions(ARRAY[1,2,3], 99) FROM t WHERE id = 1
+----
+{}
+
+query T nosort
+SELECT array_positions(NULL::int32[], 1) FROM t WHERE id = 1
+----
+NULL
+
 # --- literal forms: precedence, associativity, multidim -----------------------------------
 # || binds tighter than `=`, so `a || b = c` is `(a || b) = c`.
 query B nosort

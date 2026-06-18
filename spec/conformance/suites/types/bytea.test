@@ -160,3 +160,18 @@ query I nosort
 SELECT id FROM w WHERE b = '\x61'
 ----
 4
+
+# G30 — an EMBEDDED leading 0x00 is a real byte, not a terminator: \x0061 (bytes 0x00, 0x61)
+# compares first-byte 0x00 < 0x61, so it sorts BEFORE the single-byte \x61. A core that treated
+# 0x00 as a C-string terminator would mis-order these.
+statement ok
+CREATE TABLE nul (id int32 PRIMARY KEY, b bytea)
+
+statement ok
+INSERT INTO nul VALUES (1, '\x0061'), (2, '\x61')
+
+query T nosort
+SELECT b FROM nul ORDER BY b
+----
+\x0061
+\x61

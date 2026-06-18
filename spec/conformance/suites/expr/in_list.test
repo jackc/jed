@@ -6,7 +6,7 @@
 # element is 42804). The empty list `IN ()` is a 42601 syntax error. Verified against the
 # live PostgreSQL 18 oracle.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, expr.in_list, expr.comparison_value, types.int16, types.int32, types.text, types.decimal, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, expr.in_list, expr.comparison_value, types.int16, types.int32, types.int64, types.text, types.decimal, null.three_valued, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, a int32)
@@ -41,6 +41,21 @@ SELECT a NOT IN (10, NULL) FROM t ORDER BY id
 false
 NULL
 NULL
+
+# G19 — a single-NULL list `a IN (NULL)` desugars to the lone `a = NULL`, which is UNKNOWN for
+# EVERY row (a present value compared to NULL, or a NULL `a`) — so the projection is all NULL.
+# names: ?column?
+query B nosort
+SELECT a IN (NULL) FROM t ORDER BY id
+----
+NULL
+NULL
+NULL
+
+# ...and in WHERE that UNKNOWN keeps no rows.
+query I nosort
+SELECT id FROM t WHERE a IN (NULL) ORDER BY id
+----
 
 # In WHERE, only rows whose predicate is TRUE survive: a=10 and a=20 match; a=NULL is dropped
 # (UNKNOWN). Cost: 3 scanned, the desugared `Or(Eq(a,10),Eq(a,20))` is 3 interior nodes per
@@ -88,6 +103,29 @@ query I nosort
 SELECT id FROM d WHERE n IN (1.5, 9.9) ORDER BY id
 ----
 1
+
+# G19 — cross-width IN: an int64 column against a list of untyped integer literals. Each element
+# adapts to the column's int64 type through the `=` operand contract (the promotion tower), so a
+# small-magnitude literal and one outside int32's range coexist in the same list. `v IN (10, 20)`
+# matches the two small rows; `v IN (5000000000, 99)` matches the row whose value exceeds int32.
+statement ok
+CREATE TABLE big (id int32 PRIMARY KEY, v int64)
+
+statement ok
+INSERT INTO big VALUES (1, 10), (2, 20), (3, 5000000000)
+
+# cost: 15
+query I nosort
+SELECT id FROM big WHERE v IN (10, 20) ORDER BY id
+----
+1
+2
+
+# cost: 14
+query I nosort
+SELECT id FROM big WHERE v IN (5000000000, 99) ORDER BY id
+----
+3
 
 # Empty list is a syntax error (the parser requires at least one element).
 statement error 42601

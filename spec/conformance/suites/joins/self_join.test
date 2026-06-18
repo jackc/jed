@@ -2,7 +2,7 @@
 # itself under two distinct aliases (each is its own scope relation, with its own column offset).
 # A 3-table chain mixes INNER and CROSS, left-deep. With NO ORDER BY the row order is
 # unspecified (CLAUDE.md §8) — multi-row results are compared rowsort; ORDER BY pins a sequence.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, query.join_inner, query.cross_join, query.table_alias, query.qualified_column, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, query.join_inner, query.join_left, query.cross_join, query.table_alias, query.qualified_column, types.int32, types.text, resource.cost_metering
 
 statement ok
 CREATE TABLE emp (id int32 PRIMARY KEY, name text, mgr int32)
@@ -43,6 +43,23 @@ SELECT e.id, m.id FROM emp AS e JOIN emp AS m ON e.mgr = m.id
 2
 4
 2
+
+# G26 — a self LEFT JOIN preserves the self-unmatched row: the CEO (e.mgr NULL) matches no manager
+# (3VL ON), but LEFT keeps it with the manager side NULL-extended. So all four employees appear,
+# the CEO carrying a NULL manager name. 8 materialize + 2 page + 16 ON + 4 produced = 30.
+# names: name, name
+# cost: 30
+query TT nosort
+SELECT e.name, m.name FROM emp AS e LEFT JOIN emp AS m ON e.mgr = m.id ORDER BY e.id
+----
+ceo
+NULL
+vp
+ceo
+eng
+vp
+eng2
+vp
 
 # 3-table chain: (emp e JOIN emp m ON e.mgr = m.id) CROSS JOIN region. The self-join yields 3
 # rows, CROSS region (2) gives 6. Materialize emp+emp+region = 4+4+2 = 10; ON on the first join

@@ -223,6 +223,41 @@ UPDATE t SET v = 1 WHERE id = 1 RETURNING old.nosuch
 statement error 42P01
 UPDATE t SET v = old.v + 1 WHERE id = 1
 
+# --- G18: multi-row UPDATE / DELETE RETURNING (every case above affects <=1 row) ---------
+
+statement ok
+CREATE TABLE m (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO m VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
+
+# A PK range bound (id >= 4) matches TWO rows, so RETURNING projects both — the old./new.
+# qualifiers span the pre-/post-assignment versions per row. Order is unspecified (rowsort).
+# page_read(1) + 2 storage_row_read + 2 filter + 2 assignment (v+1) + 2 row_produced = 9.
+# names: id, v, v
+# cost: 9
+query III rowsort
+UPDATE m SET v = v + 1 WHERE id >= 4 RETURNING id, old.v, new.v
+----
+4
+40
+41
+5
+50
+51
+
+# DELETE ... RETURNING * over the same two-row range returns each deleted OLD row (now v+1).
+# page_read(1) + 2 storage_row_read + 2 filter + 2 row_produced (bare columns, no eval) = 7.
+# names: id, v
+# cost: 7
+query II rowsort
+DELETE FROM m WHERE id >= 4 RETURNING *
+----
+4
+41
+5
+51
+
 # --- documented PG divergence (oracle-overridden; conformance.md §5) --------------------
 
 # jed reserves no words (§3): an explicit `AS returning` source alias parses, with the

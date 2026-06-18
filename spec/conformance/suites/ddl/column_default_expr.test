@@ -8,7 +8,7 @@
 # cross-core; this file is therefore NOT oracle-imported (PG's entropy differs), but the
 # structural-rejection codes/messages and the arithmetic defaults were verified by hand against
 # PostgreSQL 18 (all five SQLSTATEs + messages match: 0A000/0A000/42803/42P02/42804).
-# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default_expr, dml.insert, dml.insert_multi_row, dml.insert_column_list, query.select, query.order_by, query.is_null, types.int32, types.uuid, func.uuid_generate, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default_expr, dml.insert, dml.insert_multi_row, dml.insert_column_list, query.select, query.order_by, query.is_null, types.int16, types.int32, types.uuid, func.uuid_generate, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n int32 DEFAULT 1 + 1)
@@ -87,6 +87,15 @@ CREATE TABLE nn (id int32 PRIMARY KEY, v int32 NOT NULL DEFAULT CASE WHEN 1 = 2 
 
 statement error 23502
 INSERT INTO nn (id) VALUES (1)
+
+# G28 — an expression default that OVERFLOWS the column type. CREATE TABLE only type-checks the
+# default's RESULT TYPE (int16 here), not its value, so `30000 * 2` is accepted at CREATE and traps
+# 22003 per row only when the default is evaluated at INSERT (60000 > int16 max).
+statement ok
+CREATE TABLE ovf (id int32 PRIMARY KEY, x int16 DEFAULT 30000 * 2)
+
+statement error 22003
+INSERT INTO ovf (id) VALUES (1)
 
 # --- CREATE TABLE rejections (structural pre-walk + result type) ------------------------------
 # a column reference is not allowed in a DEFAULT expression (computed before the row exists)

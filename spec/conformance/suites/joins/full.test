@@ -126,3 +126,69 @@ NULL
 NULL
 200
 orphan
+
+# G14 — the FULL-join ON-vs-WHERE trap. A predicate in ON is part of the match, and a row that
+# fails it is simply unmatched — but FULL keeps unmatched rows from BOTH sides, so failing the
+# predicate moves a row from "matched pair" to "preserved on both sides". `a.k = 10` in ON leaves
+# only a(1)/b(10) matched; every other a row is left-preserved and every other b row is
+# right-preserved, so the cardinality GROWS to 7. 2 page + 8 materialize + 48 ON (16 pairs x 3 ops:
+# a.k=b.k, a.k=10, AND) + 7 produced = 65.
+# names: id, id
+# cost: 65
+query II nosort
+SELECT a.id, b.id FROM a FULL JOIN b ON a.k = b.k AND a.k = 10 ORDER BY a.id, b.id
+----
+1
+10
+2
+NULL
+3
+NULL
+4
+NULL
+NULL
+20
+NULL
+21
+NULL
+30
+
+# The same predicate in WHERE filters after the join: every NULL-extended row (from either side)
+# fails `a.k = 10` (NULL or a non-10 value), collapsing the FULL join to the single matched row.
+# 2 page + 8 materialize + 16 ON + 6 WHERE (one per plain-FULL-produced row) + 1 produced = 33.
+# names: id, id
+# cost: 33
+query II nosort
+SELECT a.id, b.id FROM a FULL JOIN b ON a.k = b.k WHERE a.k = 10 ORDER BY a.id, b.id
+----
+1
+10
+
+# G14 — FULL join over DISJOINT keys: no pair matches, so every left row is left-preserved and
+# every right row right-preserved — cardinality is exactly m+n (2+2=4), all NULL-extended. 2 page +
+# 4 materialize + 4 ON (2x2 pairs x 1 comparison) + 4 produced = 14.
+statement ok
+CREATE TABLE d1 (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE d2 (id int32 PRIMARY KEY, k int32)
+
+statement ok
+INSERT INTO d1 VALUES (1, 100), (2, 200)
+
+statement ok
+INSERT INTO d2 VALUES (10, 300), (20, 400)
+
+# names: id, id
+# cost: 14
+query II nosort
+SELECT d1.id, d2.id FROM d1 FULL JOIN d2 ON d1.k = d2.k ORDER BY d1.id, d2.id
+----
+1
+NULL
+2
+NULL
+NULL
+10
+NULL
+20

@@ -147,7 +147,9 @@ bodies are self-delimiting by width.
 An array **value body** (after the shared `0x00` present / `0x01` whole-value-NULL presence tag) is:
 
 ```
-ndim   u8        dimension count; 0 = empty array; ≤ 6 (PostgreSQL MAXDIM)
+ndim   u8        dimension count; 0 = empty array; ≤ 6 (PostgreSQL MAXDIM) — but see §12 (the
+                 limit is enforced on the '{…}' LITERAL path only; the ARRAY[…] constructor is
+                 not yet bounded — a known follow-on)
 flags  u8        bit 0 = HAS_NULLS; bits 1–7 reserved, must be 0
 per dimension d in [0, ndim):
    len_d  u32 BE    element count along dimension d (≥ 1)
@@ -498,3 +500,14 @@ column and the `ANY`/`ALL` per-element compare (which, like `array_eq`, uses the
 NOT the bare-`ROW` 3VL — §5). **Still deferred (each its own follow-on):** arrays-in-keys (`0A000`,
 encoding authored §8); the subquery quantifier form `op ANY(SELECT …)` (array-functions.md §11);
 runtime text→array, `array::text`, and element-wise array→array casts.
+
+**Known gap — the `MAXDIM = 6` bound is enforced only on the literal path.** A `'{{…}}'` **text
+literal** nested beyond 6 dimensions is rejected by `array_in` (`22P02`; pinned in
+`conformance/suites/types/array_multidim.test`, ledgered against PostgreSQL's `54000`), but the
+**`ARRAY[…]` constructor does NOT yet bound dimensionality** — a 7-D constructor currently *builds
+and stores* a 7-D value, in violation of the `ndim ≤ 6` invariant declared in §4. PostgreSQL
+rejects a >6-D constructor with `54000` (`program_limit_exceeded`). Bounding the constructor (and
+any other value-producing path: `array_cat` stacking, `array_append`/`array_prepend`) to `MAXDIM`
+is an open follow-on; until it lands, the on-disk codec's `ndim u8` field can hold `7`+, so a
+malicious or careless query can persist an over-dimension value. (Surfaced 2026-06-18 during the
+conformance test-gap remediation; the literal edge is the only one currently pinned.)

@@ -24,6 +24,23 @@ SELECT MIN(v), MAX(v) FROM md
 -3
 2.50
 
+# G29 — MIN/MAX(decimal) is VALUE-canonical: 1.5 and 1.50 are the SAME value, so MIN and MAX both
+# return that single value. jed keeps the FIRST-seen representation on a tie (the scale-1 `1.5`),
+# whereas PostgreSQL surfaces the scale-2 `1.50` — a documented representation divergence
+# (oracle_overrides ledger); both are the same numeric value, only the rendered scale differs.
+statement ok
+CREATE TABLE mcanon (id int32 PRIMARY KEY, v numeric)
+
+statement ok
+INSERT INTO mcanon VALUES (1, 1.5), (2, 1.50)
+
+# names: min, max
+query DD nosort
+SELECT MIN(v), MAX(v) FROM mcanon
+----
+1.5
+1.5
+
 # --- bytea: UNSIGNED byte order with the shorter-is-less prefix rule (encoding.md §2.6) -------
 statement ok
 CREATE TABLE mby (id int32 PRIMARY KEY, v bytea)

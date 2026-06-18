@@ -170,3 +170,24 @@ SELECT a FROM t ORDER BY a + 1
 # An ORDER BY key that names no column is an undefined-column error, reusing the existing path.
 statement error 42703
 SELECT a FROM t ORDER BY nope
+
+# G12 — empty scanned table. ORDER BY over zero rows yields zero rows at zero cost: nothing is
+# scanned (no storage_row_read), nothing is produced (no row_produced), and the sort is a no-op
+# over an empty input. LIMIT windows the same empty input to nothing. (The DISTINCT counterpart
+# lives in distinct.test.)
+statement ok
+CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+
+# names: a
+# cost: 0
+query I nosort
+SELECT a FROM e ORDER BY a
+----
+
+# LIMIT over an empty table: still zero rows, zero cost. No ORDER BY, so rowsort (the empty set
+# carries no order to assert).
+# names: a
+# cost: 0
+query I rowsort
+SELECT a FROM e LIMIT 5
+----

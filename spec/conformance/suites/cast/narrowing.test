@@ -46,3 +46,24 @@ query I nosort
 SELECT CAST(CAST(b AS int32) AS int16) FROM t WHERE id = 3
 ----
 1000
+
+# G13 — the exact int16 range boundary [-32768, 32767]. The two endpoints fit; one step past
+# either end traps 22003. -32769 is unary minus over the literal 32769 (itself out of int16
+# range), so the negation result is what is checked against the target.
+# types: int16
+query I nosort
+SELECT CAST(32767 AS int16) FROM t WHERE id = 3
+----
+32767
+
+statement error 22003
+SELECT CAST(32768 AS int16) FROM t WHERE id = 3
+
+# types: int16
+query I nosort
+SELECT CAST(-32768 AS int16) FROM t WHERE id = 3
+----
+-32768
+
+statement error 22003
+SELECT CAST(-32769 AS int16) FROM t WHERE id = 3

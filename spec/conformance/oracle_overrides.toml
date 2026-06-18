@@ -394,3 +394,187 @@ reason = "jed: an untyped literal adapts to the sibling column's type, so 100000
 file = "expr/not_equal.test"
 sql = "SELECT id FROM t WHERE a ! b"
 reason = "jed: a lone `!` (not part of `!=`) is not in jed's surface — the lexer raises 42601 (grammar.md §4). PostgreSQL lexes `!` as an operator name and reports operator-does-not-exist 42883. jed owns its operator surface; the codes differ."
+
+# --- IS NULL is non-associative in jed: `x IS NULL IS NULL` is a 42601 syntax error, whereas
+# PostgreSQL grammar makes the null-test left-associative (`a_expr IS NULL` is itself an
+# `a_expr`), so PG parses `(x IS NULL) IS NULL` and returns a boolean. A deliberate jed surface
+# narrowing — the null test does not chain (grammar precedence).
+[[override]]
+file = "expr/precedence.test"
+sql = "SELECT a IS NULL IS NULL FROM n"
+reason = "jed: IS NULL is non-associative — a trailing second `IS NULL` is 42601 (the null test does not chain). PostgreSQL parses it left-associatively as `(a IS NULL) IS NULL` and returns false. A documented jed surface narrowing."
+
+# --- >6-dimension array literal: jed rejects 7+ brace levels with its generic malformed-literal
+# code 22P02 (the value codec's ndim bound, array.md §4), whereas PostgreSQL raises 54000
+# (program_limit_exceeded — "number of array dimensions exceeds the maximum allowed (6)"). jed owns
+# its array-literal surface and collapses the over-dimension case to 22P02; the codes differ.
+[[override]]
+file = "types/array_multidim.test"
+sql = "SELECT '{{{{{{{1}}}}}}}'::int32[] FROM m WHERE id = 1"
+reason = "jed: a text literal beyond MAXDIM (6) is 22P02 invalid_text_representation (array_in's malformed-literal code). PostgreSQL raises 54000 program_limit_exceeded. jed owns its array-literal surface; a documented code divergence."
+
+# --- G24 timestamp/interval boundary divergences (jed owns its int64 range + engine-wide rounding) ---
+# jed's finite timestamp range is i64::MIN+1 .. i64::MAX-1 microseconds from the 1970 epoch
+# (timestamp.md §1); the extreme int64 values are the ±infinity sentinels, so a finite parse landing
+# exactly on i64::MAX traps 22008. PostgreSQL's calendar bound (to 294276 AD) is wider and accepts
+# this value as an ordinary finite timestamp.
+[[override]]
+file = "types/timestamp.test"
+sql = "INSERT INTO e VALUES (4, '294247-01-10 04:00:54.775807')"
+reason = "jed: i64::MAX microseconds is the +infinity sentinel, so a finite parse of it is out of range (22008). PostgreSQL accepts it as a finite timestamp (its calendar range reaches 294276 AD). jed owns its int64-µs range (timestamp.md §1); a documented divergence."
+
+# jed rounds sub-microsecond fractions half-AWAY from zero (its single engine-wide rounding mode);
+# PostgreSQL rounds half-to-EVEN. .1234565 → jed .123457 vs PG .123456.
+[[override]]
+file = "types/timestamp.test"
+sql = "SELECT ts FROM e WHERE id = 5"
+reason = "jed: sub-µs timestamp fractions round half-away from zero (engine-wide rounding, matching decimal.md §3) → .123457. PostgreSQL rounds half-to-even → .123456. A documented divergence."
+
+# jed reuses its datetime field-overflow code 22008 for an interval field overflow; PostgreSQL has a
+# dedicated interval_field_overflow code 22015.
+[[override]]
+file = "types/interval.test"
+sql = "SELECT INTERVAL '100000000000 years'"
+reason = "jed: an interval field overflow reuses jed's datetime field-overflow code 22008. PostgreSQL raises its dedicated 22015 interval_field_overflow. jed owns its error surface; a documented code divergence."
+
+# --- G29 MIN/MAX(decimal) tie representation: 1.5 and 1.50 are the same value, so MIN/MAX return
+# one of them. jed keeps the FIRST-seen representation (scale-1 `1.5`); PostgreSQL surfaces `1.50`.
+# Same numeric value, only the rendered scale differs — a documented representation divergence.
+[[override]]
+file = "aggregates/min_max_types.test"
+sql = "SELECT MIN(v), MAX(v) FROM mcanon"
+reason = "jed: MIN/MAX over equal-value different-scale decimals keep the first-seen representation (1.5); PostgreSQL surfaces 1.50. The numeric value is identical; only the display scale differs. A documented representation divergence."
+
+# --- G30 deferred SRF forms: jed defers the SELECT-list SRF position and WITH ORDINALITY this
+# slice (array-functions.md §6), so it rejects them; PostgreSQL supports both. Pinned as rejected so
+# an accidental future accept is caught by the corpus.
+[[override]]
+file = "query/unnest.test"
+sql = "SELECT unnest(ARRAY[1,2])"
+reason = "jed: a SELECT-list set-returning function is deferred (array-functions.md §6) — jed has no scalar `unnest`, so it is 42883 undefined_function. PostgreSQL allows a SELECT-list SRF and returns the rows. A documented deferral."
+
+[[override]]
+file = "query/unnest.test"
+sql = "SELECT * FROM unnest(ARRAY[1,2]) WITH ORDINALITY"
+reason = "jed: WITH ORDINALITY is deferred (array-functions.md §6) — the trailing keyword is a 42601 syntax error. PostgreSQL supports it. A documented deferral."
+
+# ============================================================================================
+# Ledger reconciliation 2026-06-18 — pre-existing strict-typing / surface-narrowing divergences
+# in the P2-touched files. These predate the P2 work (the records were already committed); they
+# are genuine jed-vs-PostgreSQL divergences rooted in jed's strict static type system (§4) or a
+# documented surface narrowing, registered now so `corpus:check` stays silent on them.
+# ============================================================================================
+
+# --- ORDER BY key must be a column identifier (grammar.md §10); PG accepts ordinal/expression keys.
+[[override]]
+file = "query/order_by.test"
+sql = "SELECT a FROM t ORDER BY 1"
+reason = "jed: ORDER BY keys are restricted to column identifiers (grammar.md §10), so an ordinal key is 42601. PostgreSQL accepts ORDER BY <ordinal>. A documented surface narrowing."
+
+[[override]]
+file = "query/order_by.test"
+sql = "SELECT a FROM t ORDER BY a + 1"
+reason = "jed: ORDER BY keys are restricted to column identifiers (grammar.md §10), so an expression key is 42601. PostgreSQL accepts ORDER BY <expression>. A documented surface narrowing."
+
+# --- the int64-magnitude literal boundary (grammar.md §4, types.md §6); PG types them as numeric.
+[[override]]
+file = "expr/unary_minus.test"
+sql = "SELECT 9223372036854775808 FROM t WHERE id = 1"
+reason = "jed: a bare 2^63 fits no signed integer type and traps 22003 at resolve (types.md §6). PostgreSQL types it as numeric and returns it. A standing literal-grammar divergence."
+
+[[override]]
+file = "expr/unary_minus.test"
+sql = "SELECT 9223372036854775809 FROM t WHERE id = 1"
+reason = "jed: a magnitude beyond 2^63 cannot be represented and is a lex-time 42601 (grammar.md §4). PostgreSQL types it as numeric and returns it. A standing literal-grammar divergence."
+
+# --- cross-family bound / too-wide literal in BETWEEN (strict typing; types.md §6).
+[[override]]
+file = "expr/between.test"
+sql = "SELECT id FROM t WHERE a BETWEEN 1 AND 'x'"
+reason = "jed: a cross-family BETWEEN bound is 42804 (strict typing — no implicit text->int coercion). PostgreSQL coerces 'x' to integer and reports 22P02 invalid input syntax. A standing strict-typing divergence."
+
+[[override]]
+file = "expr/between.test"
+sql = "SELECT id FROM s16 WHERE v BETWEEN 1 AND 100000"
+reason = "jed: an untyped literal bound adapts to the int16 column's type, so 100000 overflows and traps 22003 at resolve (types.md §6). PostgreSQL types 100000 as int4 and promotes the int2 column, raising no error. A standing divergence."
+
+# --- cross-family element / too-wide literal in IN (strict typing; mirror of BETWEEN).
+[[override]]
+file = "expr/in_list.test"
+sql = "SELECT id FROM t WHERE a IN (10, 'x')"
+reason = "jed: a cross-family IN element is 42804 (strict typing). PostgreSQL coerces 'x' to integer and reports 22P02. A standing strict-typing divergence."
+
+[[override]]
+file = "expr/in_list.test"
+sql = "SELECT id FROM s16 WHERE v IN (1, 100000)"
+reason = "jed: an untyped literal element adapts to the int16 column's type, so 100000 overflows and traps 22003 at resolve. PostgreSQL types it as int4 and promotes the column, raising no error. A standing divergence."
+
+# --- non-text LIKE operand (strict typing): jed 42804 vs PG's no-operator 42883.
+[[override]]
+file = "expr/like.test"
+sql = "SELECT 5 LIKE '5' FROM one"
+reason = "jed: a non-text LIKE operand is 42804 (strict typing). PostgreSQL finds no ~~(integer,text) operator and reports 42883. jed owns its operator surface; a standing divergence."
+
+# --- bytea: cross-type compare, string-into-int, malformed/escape-format input, bytea PK.
+[[override]]
+file = "types/bytea.test"
+sql = "SELECT id FROM t WHERE b = 1"
+reason = "jed: a cross-type bytea = integer comparison is 42804 (strict typing). PostgreSQL finds no =(bytea,integer) operator and reports 42883. A standing strict-typing divergence."
+
+[[override]]
+file = "types/bytea.test"
+sql = '''INSERT INTO t VALUES ('seven', '\x00')'''
+reason = "jed: a string into an int32 column is 42804 (strict typing). PostgreSQL coerces 'seven' to integer and reports 22P02 invalid input syntax. A standing divergence."
+
+[[override]]
+file = "types/bytea.test"
+sql = '''INSERT INTO t VALUES (7, '\xabc')'''
+reason = "jed: malformed bytea hex input (odd length) is 22P02. PostgreSQL reports 22023 invalid_parameter_value. jed owns its bytea-input error surface; a code divergence."
+
+[[override]]
+file = "types/bytea.test"
+sql = '''INSERT INTO t VALUES (8, '\xzz')'''
+reason = "jed: malformed bytea hex input (non-hex digit) is 22P02. PostgreSQL reports 22023 invalid_parameter_value. jed owns its bytea-input error surface; a code divergence."
+
+[[override]]
+file = "types/bytea.test"
+sql = "INSERT INTO t VALUES (9, 'deadbeef')"
+reason = "jed: bytea input requires the \\x prefix (the traditional escape format is not accepted this slice), so a bare 'deadbeef' is 22P02. PostgreSQL accepts the escape-format string. A documented input-surface narrowing."
+
+[[override]]
+file = "types/bytea.test"
+sql = '''SELECT id FROM t WHERE b = '\xgg' '''
+reason = "jed: malformed bytea hex input (non-hex digit) is 22P02. PostgreSQL reports 22023 invalid_parameter_value. jed owns its bytea-input error surface; a code divergence."
+
+[[override]]
+file = "types/bytea.test"
+sql = "CREATE TABLE bad (k bytea PRIMARY KEY)"
+reason = "jed: a bytea primary key is deferred this slice (0A000), like the text/decimal PK precedent. PostgreSQL allows a bytea primary key. A documented narrowing."
+
+# --- uuid: cross-type compare, string-into-int (strict typing).
+[[override]]
+file = "types/uuid.test"
+sql = "SELECT id FROM t WHERE id = 1"
+reason = "jed: a cross-type uuid = integer comparison is 42804 (strict typing). PostgreSQL finds no =(uuid,integer) operator and reports 42883. A standing strict-typing divergence."
+
+[[override]]
+file = "types/uuid.test"
+sql = "INSERT INTO txt VALUES ('550e8400-e29b-41d4-a716-446655440000', 'x')"
+reason = "jed: a string into an int32 column is 42804 (strict typing). PostgreSQL coerces the literal to integer and reports 22P02 invalid input syntax. A standing divergence."
+
+# --- DISTINCT inside an aggregate is deferred (42601); PG supports COUNT(DISTINCT …).
+[[override]]
+file = "aggregates/whole_table.test"
+sql = "SELECT COUNT(DISTINCT a) FROM t"
+reason = "jed: DISTINCT inside an aggregate is deferred — 42601 at parse time. PostgreSQL supports COUNT(DISTINCT …). A documented deferral."
+
+# --- grouping/ordering a subquery BY an enclosing-query column is 0A000 (grammar.md §26); PG accepts.
+[[override]]
+file = "subquery/correlated.test"
+sql = "SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 GROUP BY t1.v)"
+reason = "jed: grouping a subquery BY an enclosing-query column is a degenerate narrowing — 0A000 (grammar.md §26). PostgreSQL accepts it. A documented narrowing."
+
+[[override]]
+file = "subquery/correlated.test"
+sql = "SELECT t1.id FROM t1 WHERE EXISTS (SELECT t2.v FROM t2 ORDER BY t1.v)"
+reason = "jed: ordering a subquery BY an enclosing-query column is a degenerate narrowing — 0A000 (grammar.md §26). PostgreSQL accepts it. A documented narrowing."

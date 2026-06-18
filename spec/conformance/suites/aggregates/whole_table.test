@@ -2,7 +2,7 @@
 # with constants/operators, and the misplacement errors (spec/design/aggregates.md §4/§5/§6).
 # An aggregate in WHERE / nested in another aggregate / a non-aggregated column alongside an
 # aggregate are all 42803; an unknown function is 42883; DISTINCT in an aggregate is 42601.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.int32, types.decimal, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, a int32)
@@ -59,3 +59,40 @@ SELECT bogus(a) FROM t
 # DISTINCT inside an aggregate is deferred -> 42601 (parse-time).
 statement error 42601
 SELECT COUNT(DISTINCT a) FROM t
+
+# G29 — every aggregate over an EMPTY table yields ONE row: COUNT is 0 but SUM/AVG/MIN/MAX are all
+# NULL (count is the only aggregate with an identity element). Nothing is scanned; 1 produced = 1.
+statement ok
+CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+
+# names: count, sum, avg, min, max
+# cost: 1
+query IIDII nosort
+SELECT COUNT(*), SUM(a), AVG(a), MIN(a), MAX(a) FROM e
+----
+0
+NULL
+NULL
+NULL
+NULL
+
+# The COUNT(*)=n while everything-else-NULL contrast over an ALL-NULL column in one row: COUNT(*)
+# counts rows (3), COUNT(a) counts non-NULL values (0), and SUM/AVG/MIN/MAX skip the NULLs to NULL.
+# 1 page + 3 scan + 3x6 accumulate + 1 produced = 23.
+statement ok
+CREATE TABLE an (id int32 PRIMARY KEY, a int32)
+
+statement ok
+INSERT INTO an VALUES (1, NULL), (2, NULL), (3, NULL)
+
+# names: count, count, sum, avg, min, max
+# cost: 23
+query IIIDII nosort
+SELECT COUNT(*), COUNT(a), SUM(a), AVG(a), MIN(a), MAX(a) FROM an
+----
+3
+0
+NULL
+NULL
+NULL
+NULL

@@ -3,7 +3,7 @@
 # a non-aggregated SELECT/ORDER BY column not in GROUP BY is 42803. ORDER BY over a grouping
 # column sorts the group rows. Cost = rows scanned + rows x aggregates accumulated + 1 per
 # emitted group (the bucketing/sort is unmetered — cost.md §3).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.order_by, types.int32, types.decimal, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.order_by, query.limit, types.int32, types.decimal, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, g int32, a int32)
@@ -95,3 +95,37 @@ CREATE TABLE e (id int32 PRIMARY KEY, g int32)
 query II nosort
 SELECT g, COUNT(*) FROM e GROUP BY g ORDER BY g
 ----
+
+# G29 — COUNT(*) vs COUNT(col) per group: COUNT(*) counts rows, COUNT(a) counts non-NULL values,
+# so COUNT(a) < COUNT(*) in any group with a NULL. g=1 has one NULL (2 vs 1); g=2 has two (3 vs 1).
+# 5 scan + 5x2 accumulate + 2 produced + 1 page = 18.
+statement ok
+CREATE TABLE tg (id int32 PRIMARY KEY, g int32, a int32)
+
+statement ok
+INSERT INTO tg VALUES (1, 1, 10), (2, 1, NULL), (3, 2, NULL), (4, 2, NULL), (5, 2, 50)
+
+# names: g, count, count
+# cost: 18
+query III nosort
+SELECT g, COUNT(*), COUNT(a) FROM tg GROUP BY g ORDER BY g
+----
+1
+2
+1
+2
+3
+1
+
+# Post-aggregation window: ORDER BY g DESC orders the GROUP rows (the NULL group sorts FIRST under
+# DESC, the PG model), and LIMIT 2 keeps the top two — NULL then g=2. The operands still accumulate
+# every row; the sort/limit are unmetered. 6 scan + 6 accumulate + 2 produced + 1 page = 15.
+# names: g, count
+# cost: 15
+query II nosort
+SELECT g, COUNT(*) FROM t GROUP BY g ORDER BY g DESC LIMIT 2
+----
+NULL
+2
+2
+2

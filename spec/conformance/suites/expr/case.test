@@ -66,6 +66,34 @@ NULL
 NULL
 NULL
 
+# G19 — a nested CASE in a THEN arm. Only a=20 (id 3) takes the outer first branch and so reaches
+# the inner CASE (a>25 is false → inner ELSE 5); every other row takes the outer ELSE 1. Laziness
+# still holds: the inner CASE costs nothing for the rows that never reach it. Per row: 1 outer case
+# node + conditions tested + (for id 3) 1 inner case node + 1 inner condition. a=10:2, a=0:2,
+# a=20:4, a=NULL:2 = 10; + 4 scan + 4 produced + 1 page = 19.
+# names: ?column?
+# cost: 19
+query I nosort
+SELECT CASE WHEN a > 15 THEN CASE WHEN a > 25 THEN 9 ELSE 5 END ELSE 1 END FROM t ORDER BY id
+----
+1
+1
+5
+1
+
+# A CASE used as an arithmetic operand: `1 + CASE …`. Only a=20 (id 3) adds 10, the rest add 0.
+# Per row: 1 Add node + 1 case node + 1 condition (a>15). 4 rows x 3 = 12; + 4 scan + 4 produced +
+# 1 page = 21.
+# names: ?column?
+# cost: 21
+query I nosort
+SELECT 1 + CASE WHEN a > 15 THEN 10 ELSE 0 END FROM t ORDER BY id
+----
+1
+1
+11
+1
+
 # A one-row table to prove laziness directly: the first WHEN is TRUE, so neither the later WHEN
 # (whose `1/0` would trap 22012) nor the ELSE is evaluated — the query succeeds and the cost
 # reflects only the case node + the first (constant, leaf) condition = 1 per row.
@@ -81,6 +109,16 @@ query I nosort
 SELECT CASE WHEN true THEN 100 WHEN 1 / 0 = 0 THEN 200 ELSE 300 END FROM one
 ----
 100
+
+# G19 — simple-form CASE with a NULL scrutinee: `CASE NULL WHEN NULL THEN …` tests `NULL = NULL`,
+# which is UNKNOWN, NOT a match — so the scrutinee never matches any WHEN and the ELSE wins.
+# 1 case node + 1 condition (NULL = NULL) + 1 scan + 1 produced + 1 page = 5.
+# names: ?column?
+# cost: 5
+query T nosort
+SELECT CASE NULL WHEN NULL THEN 'matched' ELSE 'fellthrough' END FROM one
+----
+fellthrough
 
 # A searched WHEN that is not boolean is a type error (the column `a` is int32).
 statement error 42804

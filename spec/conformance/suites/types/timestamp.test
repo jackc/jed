@@ -225,3 +225,47 @@ query I nosort
 SELECT id FROM c WHERE ts = '2023-01-01 00:00:00'
 ----
 4
+
+# --- G24: time-of-day / fraction / range boundary edges (own table, leaves `t`/`c` intact) ----
+statement ok
+CREATE TABLE e (id int32 PRIMARY KEY, ts timestamp)
+
+# Hour 24:00:00 is the valid end-of-day, normalized to next-day midnight (PG behavior).
+statement ok
+INSERT INTO e VALUES (1, '2024-01-01 24:00:00')
+
+query T nosort
+SELECT ts FROM e WHERE id = 1
+----
+2024-01-02 00:00:00
+
+# One second past it (24:00:01) is out of range → 22008 (PG agrees).
+statement error 22008
+INSERT INTO e VALUES (2, '2024-01-01 24:00:01')
+
+# The LARGEST finite instant — i64::MAX-1 microseconds from the 1970 epoch — is accepted and
+# round-trips exactly.
+statement ok
+INSERT INTO e VALUES (3, '294247-01-10 04:00:54.775806')
+
+query T nosort
+SELECT ts FROM e WHERE id = 3
+----
+294247-01-10 04:00:54.775806
+
+# One microsecond more lands on the +infinity sentinel (i64::MAX); a FINITE parse of it traps
+# 22008. jed owns its int64-microsecond range (timestamp.md §1), narrower than PG's calendar bound,
+# so PG accepts this value as finite — a documented divergence (oracle_overrides ledger).
+statement error 22008
+INSERT INTO e VALUES (4, '294247-01-10 04:00:54.775807')
+
+# A 7-digit (sub-microsecond) fraction rounds half-AWAY to microseconds (jed's engine-wide rule):
+# .1234565 → .123457. PostgreSQL rounds half-to-EVEN and yields .123456 — a documented divergence
+# (oracle_overrides ledger). The INSERT itself succeeds on both; only the rounded value differs.
+statement ok
+INSERT INTO e VALUES (5, '2024-01-01 00:00:00.1234565')
+
+query T nosort
+SELECT ts FROM e WHERE id = 5
+----
+2024-01-01 00:00:00.123457

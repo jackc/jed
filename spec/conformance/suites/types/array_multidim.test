@@ -7,7 +7,7 @@
 # subscripts (a[i] on an N-D value with fewer is NULL); the index domain is the value's lb..ub.
 # array_eq considers dimensionality and lower bounds, so [2:4]={7,8,9} ≠ {7,8,9}. Values round-trip
 # through storage. array_out matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.int32, expr.array_subscript, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.int32, expr.array_subscript, func.array, resource.cost_metering
 
 statement ok
 CREATE TABLE m (id int32 PRIMARY KEY, g int32[])
@@ -82,6 +82,20 @@ query I nosort
 SELECT id FROM m WHERE g = '{1,2,3,4}'::int32[] ORDER BY id
 ----
 
+# G21 — a NEGATIVE/zero custom lower bound. '[-2:0]={7,8,9}' has indices -2,-1,0; it stores and
+# round-trips through the codec, the subscript domain shifts to -2..0 (g[-2] is the first element),
+# array_lower reports -2, array_dims renders the [-2:0] prefix, and array_out emits the [-2:0]= form.
+statement ok
+INSERT INTO m VALUES (10, '[-2:0]={7,8,9}')
+
+query IITT nosort
+SELECT g[-2], array_lower(g, 1), array_dims(g), g FROM m WHERE id = 10
+----
+7
+-2
+[-2:0]
+[-2:0]={7,8,9}
+
 # Non-rectangular construction → 2202E.
 statement error 2202E
 INSERT INTO m VALUES (5, ARRAY[ARRAY[1,2],ARRAY[3]])
@@ -101,3 +115,12 @@ INSERT INTO m VALUES (5, '[2:4]={1,2}')
 # An inverted [l:u] bound (u < l) → 2202E.
 statement error 2202E
 INSERT INTO m VALUES (5, '[3:1]={1}')
+
+# G21 — a text literal nested beyond MAXDIM (6) is rejected: 7 brace levels overflow the value
+# codec's ndim bound (array.md §4) and array_in reports 22P02. PostgreSQL also rejects >6 dims but
+# raises 54000 (program_limit_exceeded); jed collapses the over-dimension literal to its generic
+# malformed-literal code (oracle_overrides ledger). NOTE: the ARRAY[…] CONSTRUCTOR path does NOT yet
+# enforce this bound (a 7-D constructor currently builds and stores), so only the literal edge is
+# pinned here; bounding the constructor is a known follow-on.
+statement error 22P02
+SELECT '{{{{{{{1}}}}}}}'::int32[] FROM m WHERE id = 1

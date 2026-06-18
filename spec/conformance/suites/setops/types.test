@@ -7,7 +7,7 @@
 # of the SAME value (uuid case/braces, bytea hex case, timestamptz offset) must dedup to ONE row,
 # proving the set op compares the stored value, not the input text. Rows are asserted with
 # `rowsort` (order is not part of a set op's contract).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.intersect, query.except, types.int32, types.text, types.bytea, types.uuid, types.timestamp, types.timestamptz
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.union, query.intersect, query.except, expr.arithmetic, types.int32, types.text, types.bytea, types.uuid, types.timestamp, types.timestamptz
 
 # --- text: dedup / multiplicity / NULL-safe matching across all four operators ---------------
 statement ok
@@ -166,3 +166,25 @@ SELECT k FROM sa EXCEPT ALL SELECT k FROM sb
 ----
 2024-01-01 00:00:00
 2024-02-02 00:00:00
+
+# --- G25: output naming + all-NULL unification (grammar.md §8/§25) -----------------------------
+# Output column names come from the LEFT operand: a computed (un-aliased) left column is named the
+# canonical `?column?`, and that name carries through the whole set operation.
+# names: ?column?
+query I rowsort
+SELECT 1 + 1 UNION SELECT 3
+----
+2
+3
+
+# Two untyped-NULL columns: the dedup still yields a single NULL row named `?column?`, but the
+# resolved column type stays `unknown` — jed leaves an all-untyped-NULL column unresolved (the same
+# rule as a bare untyped NULL, conformance.md §1), where PostgreSQL would fall the union back to
+# `text`. The ROW is identical (one NULL) either way; only the resolved type differs (a `# types:`
+# assertion, which the oracle does not check), so no row-level ledger entry is needed.
+# names: ?column?
+# types: unknown
+query T rowsort
+SELECT NULL UNION SELECT NULL
+----
+NULL

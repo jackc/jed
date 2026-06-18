@@ -5,7 +5,7 @@
 # shorter-prefix-first), and the whole-value IS NULL rule. v1 ships 1-D values of scalar elements;
 # arrays-in-keys, multidim values, slices, and the array function surface are deferred. array_out
 # matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, expr.not_equal, types.array, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.aggregates, query.group_by, expr.not_equal, types.array, types.int32, types.text, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])
@@ -260,3 +260,26 @@ query I nosort
 SELECT id FROM tarr WHERE tags = ARRAY['apple','zebra']
 ----
 3
+
+# G22 — GROUP BY an array column. The whole array is the grouping key, compared with the same
+# btree-NULL semantics as equality (NULLs comparable + mutually equal), so duplicate arrays collapse
+# and two {1,NULL,3} rows group TOGETHER (the NULL element does not make the group key UNKNOWN, the
+# array-vs-composite distinction). ORDER BY xs uses the array_cmp total order (NULLs-last per
+# element): {1,2} < {1,NULL,3} < {3}. 5 scanned + 5 accumulate + 3 produced + 1 page = 14.
+statement ok
+CREATE TABLE ga (id int32 PRIMARY KEY, xs int32[])
+
+statement ok
+INSERT INTO ga VALUES (1, ARRAY[1,2]), (2, ARRAY[1,2]), (3, ARRAY[3]), (4, ARRAY[1,NULL,3]), (5, ARRAY[1,NULL,3])
+
+# names: xs, count
+# cost: 14
+query TI nosort
+SELECT xs, count(*) FROM ga GROUP BY xs ORDER BY xs
+----
+{1,2}
+2
+{1,NULL,3}
+2
+{3}
+1

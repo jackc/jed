@@ -109,9 +109,80 @@ SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE EXISTS (SELECT 1 FROM 
 1
 2
 
+# G27 — a subquery correlated to a JOINED outer. The outer is `t1 JOIN t3`, and the correlated
+# EXISTS references `t1.v` (one joined alias): id 1 (v=10) has a matching t2 row, id 2 (v=20) does
+# not.
+query I nosort
+SELECT t1.id FROM t1 JOIN t3 ON t1.id = t3.id WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.v = t1.v) ORDER BY t1.id
+----
+1
+
+# The correlated reference can resolve to the OTHER relation of the multi-relation outer: here the
+# scalar subquery correlates to `t3.v`, counting matching t2 rows per joined row.
+query II nosort
+SELECT t1.id, (SELECT count(*) FROM t2 WHERE t2.v = t3.v) FROM t1 JOIN t3 ON t1.id = t3.id ORDER BY t1.id
+----
+1
+1
+2
+0
+
+# An UNQUALIFIED correlated name that is present in MORE THAN ONE outer relation is ambiguous:
+# `v` is not a column of the inner FROM (inr), so it escapes to the outer scope, where both t1 and
+# t3 expose `v` → 42702.
+statement ok
+CREATE TABLE inr (id int32 PRIMARY KEY, x int32)
+
+statement ok
+INSERT INTO inr VALUES (1, 10)
+
+statement error 42702
+SELECT t1.id FROM t1 JOIN t3 ON t1.id = t3.id WHERE EXISTS (SELECT 1 FROM inr WHERE inr.x = v)
+
 # Degenerate narrowings: grouping or ordering a subquery BY an enclosing-query column is 0A000.
 statement error 0A000
 SELECT t1.id FROM t1 WHERE EXISTS (SELECT 1 FROM t2 GROUP BY t1.v)
 
 statement error 0A000
 SELECT t1.id FROM t1 WHERE EXISTS (SELECT t2.v FROM t2 ORDER BY t1.v)
+
+# G15 — a correlated scalar subquery used as an expression must return at most ONE row; more than
+# one is a cardinality violation (21000). This is a PER-OUTER-ROW check made at EXECUTION, not a
+# plan-time error: the same subquery shape returns one row for one outer row and two for another,
+# so the engine cannot know it will trip until it runs the subquery for the offending row.
+statement ok
+CREATE TABLE s1 (id int32 PRIMARY KEY, k int32)
+
+statement ok
+CREATE TABLE s2 (id int32 PRIMARY KEY, v int32)
+
+# s2 has two rows with v=5 and one with v=100. The correlated scalar (SELECT s2.v WHERE s2.v = s1.k)
+# returns one row when s1.k=100 (the single v=100) and two when s1.k=5 (the duplicated v=5).
+statement ok
+INSERT INTO s1 VALUES (1, 100), (2, 5)
+
+statement ok
+INSERT INTO s2 VALUES (1, 5), (2, 5), (3, 100)
+
+# Isolating the offending outer row (s1.id=2, k=5): the subquery returns two rows -> 21000.
+statement error 21000
+SELECT s1.id, (SELECT s2.v FROM s2 WHERE s2.v = s1.k) FROM s1 WHERE s1.id = 2
+
+# The other outer row (s1.id=1, k=100) is fine on its own — the same scalar subquery returns exactly
+# one row. This is the data baseline the variant below builds on. Outer point lookup: 1 page + 1
+# scanned + 1 filter (s1.id=1) + 1 subquery node; inner per-row run: 1 page + 3 scanned s2 + 3
+# `s2.v = s1.k` compares + 1 inner produced; + 1 outer produced = 13.
+# names: id, ?column?
+# cost: 13
+query II nosort
+SELECT s1.id, (SELECT s2.v FROM s2 WHERE s2.v = s1.k) FROM s1 WHERE s1.id = 1
+----
+1
+100
+
+# The "later outer row" variant: scanning the whole of s1, the FIRST outer row (id=1, k=100) yields
+# a valid single-row scalar, and only the LATER outer row (id=2, k=5) trips 21000 — proving the
+# violation is detected while executing that row, after an earlier row already succeeded, not up
+# front at plan time.
+statement error 21000
+SELECT s1.id, (SELECT s2.v FROM s2 WHERE s2.v = s1.k) FROM s1 ORDER BY s1.id

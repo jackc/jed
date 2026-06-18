@@ -38,6 +38,36 @@ true
 true
 NULL
 
+# G19 — REVERSED bounds. BETWEEN does NOT reorder its bounds: `a BETWEEN 20 AND 10` is
+# `a >= 20 AND a <= 10`, which no value can satisfy, so it is empty. 4 scanned + 3 interior nodes
+# per row (12) + 0 produced + 1 page = 17.
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE a BETWEEN 20 AND 10 ORDER BY id
+----
+
+# NOT BETWEEN over the same reversed range is TRUE for every PRESENT value (the inner BETWEEN is
+# always FALSE), while the NULL `a` row stays UNKNOWN and is dropped. The desugared
+# `Not(And(Ge,Le))` is 4 interior nodes per row. 4 scanned + 16 + 3 produced + 1 page = 24.
+# cost: 24
+query I nosort
+SELECT id FROM t WHERE a NOT BETWEEN 20 AND 10 ORDER BY id
+----
+1
+2
+3
+
+# Expression bounds: both endpoints are general expressions, evaluated per row. `a BETWEEN id AND
+# id + 20` keeps id 1 (5 in [1,21]) and id 2 (15 in [2,22]); id 3 (25 > 23) and the NULL row drop.
+# `And(Ge(a,id), Le(a, id+20))` is 4 interior nodes per row (the `id + 20` Add included). 4 scanned
+# + 16 + 2 produced + 1 page = 23.
+# cost: 23
+query I nosort
+SELECT id FROM t WHERE a BETWEEN id AND id + 20 ORDER BY id
+----
+1
+2
+
 # A one-row table to evaluate constant predicates: the headline Kleene-AND cases.
 statement ok
 CREATE TABLE one (id int32 PRIMARY KEY)

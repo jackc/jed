@@ -157,6 +157,18 @@ true
 false
 true
 
+# G23 — a NULL in the DECIDING field makes the ORDER comparison 3VL: ROW(1,NULL) < ROW(1,2) has its
+# first field equal, so the second field decides, and NULL < 2 is UNKNOWN → the whole `<` is NULL.
+# This is the deliberate contrast with ARRAY comparison (types/array.test G6), where a NULL element
+# still yields a DEFINITE boolean (btree semantics) — composite ordering is 3VL, array ordering is
+# not. A NULL in a NON-deciding field is harmless: ROW(1,NULL) < ROW(2,9) is TRUE because the first
+# field (1 < 2) already decides and the NULL is never examined.
+query BB nosort
+SELECT ROW(1, NULL) < ROW(1, 2), ROW(1, NULL) < ROW(2, 9)
+----
+NULL
+true
+
 # A composite column compares against another composite in WHERE (element-wise). The corpus uses
 # the record_in literal `'(Oak,10)'::loc` (PG-compatible): a bare `ROW('Oak', 10)` types its string
 # literal as PG `unknown`, which PG refuses to compare — the `ROW(…)` comparison form (jed types the

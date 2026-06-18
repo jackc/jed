@@ -103,6 +103,36 @@ SELECT k, v FROM u ORDER BY k
 statement ok
 UPDATE u SET v = v + 1
 
+# G28 — the per-row constraint precedence (NOT NULL before CHECK) holds on UPDATE too, not just
+# INSERT (the tn case above). On a NOT NULL CHECK column, a multi-row UPDATE whose first row goes
+# NULL (23502) and second row goes negative (23514) reports 23502: the two-phase pass validates in
+# PK order and the NOT NULL violation on the first row fires first.
+statement ok
+CREATE TABLE un (k int PRIMARY KEY, a int NOT NULL CHECK (a > 0))
+
+statement ok
+INSERT INTO un VALUES (1, 5), (2, 10)
+
+statement error 23502
+UPDATE un SET a = CASE WHEN k = 1 THEN NULL ELSE -1 END
+
+# Each constraint also fires on its own under UPDATE: a single NULL assignment is 23502, a single
+# out-of-range assignment is 23514. (Two-phase, so neither writes any row.)
+statement error 23502
+UPDATE un SET a = NULL WHERE k = 1
+
+statement error 23514
+UPDATE un SET a = -1 WHERE k = 2
+
+# Nothing changed — both rows hold their original values.
+query II nosort
+SELECT k, a FROM un ORDER BY k
+----
+1
+5
+2
+10
+
 # a runtime error inside a check propagates as itself
 statement ok
 CREATE TABLE dz (a int CHECK (10 / a > 0))

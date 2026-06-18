@@ -12,7 +12,7 @@
 # is the first DISALLOWED value: accrued *reaching* it (≥) aborts, so a ceiling equal to a query's
 # true cost aborts and one above it succeeds. The abort is an ordinary error, so an aborted DELETE /
 # UPDATE rolls back its (autocommit) transaction and leaves the table untouched.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.comparison_order, expr.arithmetic, types.int32, query.point_lookup, resource.cost_metering, resource.cost_limit
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, query.select, query.where_eq, query.comparison_order, expr.arithmetic, types.int32, query.point_lookup, resource.cost_metering, resource.cost_limit
 
 statement ok
 CREATE TABLE t (id int32 PRIMARY KEY, v int32)
@@ -132,6 +132,25 @@ statement error 54P01
 UPDATE t SET v = v + 1 WHERE v > 0
 
 # Proof the UPDATE wrote nothing: the values are the originals, not v+1.
+# cost: 11
+query I rowsort
+SELECT v FROM t
+----
+10
+20
+30
+40
+50
+
+# G28 — a ceiling that strikes mid-RETURNING aborts the whole statement (54P01); RETURNING is
+# all-or-nothing, so the DELETE rolls back and the table is left fully intact. The true cost of the
+# DELETE ... RETURNING is 1 page + 5 scan + 5 filter + 5 produced = 16; a ceiling of 5 stops it
+# partway.
+# max_cost: 5
+statement error 54P01
+DELETE FROM t WHERE v > 0 RETURNING id, v
+
+# The aborted RETURNING wrote nothing: all five rows survive with their original values.
 # cost: 11
 query I rowsort
 SELECT v FROM t

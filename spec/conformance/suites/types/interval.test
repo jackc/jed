@@ -139,6 +139,28 @@ SELECT INTERVAL 'not an interval'
 statement error 22007
 SELECT INTERVAL '1 m'
 
+# --- G24: mixed-sign render + field overflow ---
+
+# Mixed-sign output: when the independent fields carry OPPOSITE signs, PG `postgres` style renders
+# each with its own sign (the positive ones gaining a leading `+`). `-1 mon 2 days` → `-1 mons +2 days`.
+query T nosort
+SELECT INTERVAL '-1 mon 2 days'
+----
+-1 mons +2 days
+
+# A year+month input collapses into the single months field (1 year = 12 mons), so `-1 year 2 mons`
+# is -10 months → `-10 mons` (one field, one sign — NOT mixed).
+query T nosort
+SELECT INTERVAL '-1 year 2 mons'
+----
+-10 mons
+
+# A field whose magnitude overflows the canonical representation traps 22008. PostgreSQL raises its
+# dedicated interval_field_overflow code 22015 instead — a documented code divergence (jed reuses
+# its datetime field-overflow code, oracle_overrides ledger).
+statement error 22008
+SELECT INTERVAL '100000000000 years'
+
 # --- interval as a key is rejected (0A000); deliberate divergence from PG (kept LAST) ---
 
 statement error 0A000

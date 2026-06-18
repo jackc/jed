@@ -101,6 +101,49 @@ SELECT '' LIKE '%' FROM one
 ----
 true
 
+# G19 — an exact pattern with NO wildcard is a plain equality: it matches the identical string and
+# nothing longer or shorter.
+query B nosort
+SELECT 'ab' LIKE 'ab' FROM one
+----
+true
+
+query B nosort
+SELECT 'ab' LIKE 'abc' FROM one
+----
+false
+
+# Backtracking: `a%b%` must try multiple splits of the `%` runs to match. 'ab' matches with both
+# `%` runs empty.
+query B nosort
+SELECT 'ab' LIKE 'a%b%' FROM one
+----
+true
+
+# `_` counts EXACTLY one character each: 'abc' matches three underscores, not two.
+query B nosort
+SELECT 'abc' LIKE '___' FROM one
+----
+true
+
+query B nosort
+SELECT 'abc' LIKE '__' FROM one
+----
+false
+
+# Escaping the escape: `\\` is the escape character escaping itself, so it matches one LITERAL
+# backslash. The 3-char subject 'a\b' matches the pattern a + `\\` + b.
+query B nosort
+SELECT 'a\b' LIKE 'a\\b' FROM one
+----
+true
+
+# The wildcard `%` matches any run, including a literal percent sign.
+query B nosort
+SELECT '%' LIKE '%' FROM one
+----
+true
+
 # Trailing-escape error (22025) is raised LAZILY: this pattern's escape is reached while the
 # subject still has 'x' to match, so it traps.
 statement error 22025

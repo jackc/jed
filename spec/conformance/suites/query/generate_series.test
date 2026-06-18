@@ -10,7 +10,7 @@
 # §3) — distinct from a table scan's page_read/storage_row_read, of which an SRF charges none.
 # PostgreSQL-oracle-verified (postgres:18). The integer-literal args default to int64 (jed's
 # literal typing), so the column is int64 — value-identical to PG's int4/int8.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.set_returning, query.comparison_order, query.order_by, query.limit, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, expr.comparison_value, types.int32, types.int64, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.set_returning, query.comparison_order, query.order_by, query.limit, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, expr.comparison_value, types.int32, types.int64, resource.cost_metering, resource.cost_limit
 
 # --- the basic two-argument series: one int64 column named generate_series ---------------
 # 5 generated_row + 5 row_produced; the integer-literal args are leaves (no operator_eval).
@@ -53,6 +53,19 @@ SELECT * FROM generate_series(5, 1, -1)
 # cost: 0
 query I rowsort
 SELECT * FROM generate_series(5, 1)
+----
+
+# G30 — an EXPLICIT step whose sign disagrees with the start→stop direction yields zero rows:
+# generate_series(1, 5, -1) would have to count DOWN from 1 to reach 5 (it never does), and
+# generate_series(5, 1, 1) would have to count UP from 5 to reach 1. Both are empty.
+# cost: 0
+query I rowsort
+SELECT * FROM generate_series(1, 5, -1)
+----
+
+# cost: 0
+query I rowsort
+SELECT * FROM generate_series(5, 1, 1)
 ----
 
 # --- a single-element series ---------------------------------------------------------
@@ -155,3 +168,13 @@ SELECT (SELECT count(*) FROM generate_series(1, o.n)) FROM t o
 0
 2
 3
+
+# G16 — the §13 untrusted-SRF guarantee actually firing. A series that would generate a million
+# rows is bounded by the cost ceiling: each generated element charges one generated_row, so accrued
+# cost reaches the ceiling long before the series finishes and execution aborts deterministically
+# (54P01) rather than materializing 1,000,000 rows. The abort is mid-generation — the SRF is lazy,
+# so the meter strikes without first building the whole relation. (PG has no cost ceiling, so this
+# is a jed-only guarantee; it cannot be oracle-verified — corpus:check warns, like cost_limit.test.)
+# max_cost: 100
+statement error 54P01
+SELECT * FROM generate_series(1, 1000000)

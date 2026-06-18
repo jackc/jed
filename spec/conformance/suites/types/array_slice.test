@@ -71,6 +71,13 @@ SELECT a[NULL:2] FROM s WHERE id = 1
 ----
 NULL
 
+# G21 — the UPPER bound being NULL is just as poisoning as the lower: a[2:NULL] is NULL (a NULL on
+# either side of the slice range yields NULL, not the empty array).
+query T nosort
+SELECT a[2:NULL] FROM s WHERE id = 1
+----
+NULL
+
 # A slice of a constructed array.
 query T nosort
 SELECT (ARRAY[1,2,3,4,5])[2:4] FROM s WHERE id = 1

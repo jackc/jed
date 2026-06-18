@@ -56,6 +56,23 @@ SELECT k FROM l INTERSECT SELECT k FROM r ORDER BY k
 1
 2
 
+# G25 — a trailing ORDER BY + LIMIT/OFFSET windows the whole INTERSECT result (the matched set
+# {1,2} ordered). LIMIT/OFFSET are unmetered and the operands still scan fully, so the cost is
+# unchanged at 18.
+# names: k
+# cost: 18
+query I nosort
+SELECT k FROM l INTERSECT SELECT k FROM r ORDER BY k LIMIT 1
+----
+1
+
+# names: k
+# cost: 18
+query I nosort
+SELECT k FROM l INTERSECT SELECT k FROM r ORDER BY k LIMIT 1 OFFSET 1
+----
+2
+
 # Empty intersection: left filtered to nothing. left = 4 scan + 4 compare + 0 produced = 8;
 # right = 2*4 = 8; total 16. No rows.
 # names: k
