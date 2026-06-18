@@ -275,6 +275,18 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   hashing for large result sets). It was invented by SQLite precisely to run identical
   conformance tests across multiple independent engines — our exact problem. CockroachDB,
   DuckDB, and RisingWave use it for the same reason.
+- **Concurrency is in the contract too — the schedule format.** The sqllogictest corpus is
+  single-handle and sequential, so it cannot express the §3 concurrency model (concurrent
+  readers vs. a writer, the reader-liveness watermark). A sibling **`# format: concurrency`**
+  corpus (`suites/concurrency/`, `spec/design/concurrency-testing.md`) closes that: an explicit
+  **total order over named read/write sessions** on one shared handle, **deterministic** because
+  jed read results depend only on commit order + pin-points, never timing — so every core runs
+  the identical schedule (a single-threaded core sequentially; a threaded core may enforce the
+  same order under a race detector). It runs *inside* `rake ci` via the capability gate
+  (`txn.shared`/`txn.read_handle`/`txn.watermark`). True-parallelism **stress** (random schedule,
+  invariant-checked) is the separate bench-family Layer 3, *outside* `rake ci`. **Landed: Layer 1,
+  Go.** This is what pulls concurrency — previously per-core hand-mirrored tests — back into the
+  §2 differential net.
 - **Bootstrap the corpus via differential testing against PostgreSQL.** The real PG
   service is the **result oracle** (§1): run a supported-subset query against it, capture
   output, emit a corpus entry. Generates a large, *correct* corpus cheaply. Where our

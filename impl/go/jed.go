@@ -238,6 +238,12 @@ var SupportedCapabilities = []string{
 	"txn.explicit",
 	"txn.read_only",
 	"txn.failed_state",
+	// Shared-handle concurrency — the SharedDb schedule format (spec/design/concurrency-testing.md
+	// §4). Declared because this core implements SharedDb/ReadHandle/WriteHandle + the watermark
+	// (shared.go); a core lacking them skips suites/concurrency files via the capability gate.
+	"txn.shared",
+	"txn.read_handle",
+	"txn.watermark",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

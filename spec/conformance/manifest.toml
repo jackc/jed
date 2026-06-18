@@ -503,6 +503,23 @@ description = "Transaction access modes — BEGIN READ ONLY / READ WRITE (defaul
 id = "txn.failed_state"
 description = "Failed-block poisoning — a statement error inside an explicit block aborts the transaction; every later statement but ROLLBACK/COMMIT is 25P02 (in_failed_sql_transaction), and COMMIT of a failed block acts as ROLLBACK (PostgreSQL). The whole working set is discarded, including statements that succeeded before the error. spec/design/transactions.md §6"
 
+# Shared-handle concurrency (Phase 5 P5.3b, spec/design/transactions.md §8/§10). Tested by the
+# deterministic schedule format — a `# format: concurrency` .test file under suites/concurrency/,
+# an explicit total order over named read/write sessions (spec/design/concurrency-testing.md §4).
+# A core that has not implemented the shared handle declares none of these, so its harness skips
+# such files before parsing (the capability gate); the format never reaches the sequential runner.
+[[capability]]
+id = "txn.shared"
+description = "The thread/goroutine-safe SharedDb handle — concurrent readers running in parallel with a single writer, the writer publishing the committed snapshot atomically (CLAUDE.md §3, spec/design/transactions.md §10). The schedule format opens named read/write sessions over one SharedDb and runs a deterministic total order of operations against them (spec/design/concurrency-testing.md §4)."
+
+[[capability]]
+id = "txn.read_handle"
+description = "A ReadHandle pins one committed snapshot at read() and serves every read from it for the handle's life — snapshot isolation, never blocked by and never blocking a writer; a write through it is 25006 (without poisoning the handle); close() deregisters it. spec/design/transactions.md §10"
+
+[[capability]]
+id = "txn.watermark"
+description = "The reader-liveness watermark — oldest_live_txid is the minimum version any still-open reader pins, or the committed version when none is live (the Phase-6 free-list reclamation gate). A pinned reader holds it back; closing the reader lets it advance. spec/design/transactions.md §8"
+
 # --- profiles ----------------------------------------------------------------
 # A named bundle of capabilities = a conformance level. `includes` (optional)
 # inherits another profile's capabilities transitively, so profiles are cumulative.

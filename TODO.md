@@ -518,6 +518,23 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       live-reader registry (`oldest_live_txid`, the Phase-6 free-list gate) (P5.3b). Rust/Go give true
       OS-thread parallelism, TS snapshot isolation; tested per-core (Go under `-race`).
       → [transactions.md §8/§10](spec/design/transactions.md), [api.md §2.5](spec/design/api.md)
+- [x] **P5.4 — cross-core concurrency conformance, Layer 1 (the schedule format)** — closes the gap that
+      P5.3's concurrency was tested only by hand-mirrored per-core suites (outside the differential net).
+      A `# format: concurrency` `.test` file is an explicit total order over named read/write sessions on
+      one `SharedDb`; deterministic because jed read results depend only on commit order + pin-points, not
+      timing. New caps `txn.shared`/`txn.read_handle`/`txn.watermark`; `suites/concurrency/snapshot_isolation.test`
+      pins snapshot isolation, cross-handle visibility, 25006-no-poison, and the `oldest_live_txid` watermark.
+      **Go runner landed** in `cmd/conformance` (stepped-sequential); Rust/TS skip via the capability gate
+      until their runners land. → [concurrency-testing.md](spec/design/concurrency-testing.md)
+  - [ ] _follow-on:_ port the runner to Rust/TS (declare the three caps); add the **stepped-threaded**
+        mode (same schedule under `-race`/TSan) for real concurrent-path coverage.
+  - [ ] _follow-on — Layer 2 (gate-blocking `await`):_ `open <sid> write blocks` + release; cap
+        `txn.gate_blocking`. Canonical = equivalent serial order; threaded harness verifies real blocking.
+        → [concurrency-testing.md §5](spec/design/concurrency-testing.md)
+  - [ ] _follow-on — Layer 3 (parallel stress):_ `stress/*.stress.toml` + `rake stress`, bench-family
+        (outside `rake ci`); per-snapshot invariants + confluent final-state cross-core checksum; seeded
+        sequential fallback on single-thread cores. Highest payoff once file-backed sharing is wired.
+        → [concurrency-testing.md §6](spec/design/concurrency-testing.md)
 
 ---
 

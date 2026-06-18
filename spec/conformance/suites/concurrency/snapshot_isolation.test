@@ -1,0 +1,72 @@
+# Snapshot isolation + the reader-liveness watermark across a concurrent writer
+# (spec/design/concurrency-testing.md §4, transactions.md §5/§8/§10). This is a CONCURRENCY-format
+# file: `# format: concurrency` routes it to the schedule runner, which opens named read/write
+# sessions over one SharedDb and executes this explicit total order against them. Because jed read
+# results depend only on the logical order of commits and pin-points — never on timing (§2) — the
+# order below fully determines every output, so the file is deterministic on every core (a single-
+# threaded core runs it sequentially; a threaded core may enforce the same order under -race).
+#
+# What it pins, beyond what the single-handle suites/transactions files can express:
+#   - a ReadHandle pins one committed snapshot for its life and is unaffected by later commits;
+#   - a fresh reader opened after a commit sees the new version;
+#   - a write through a read handle is 25006 and does not poison the handle;
+#   - oldest_live_txid is held back by a live reader and advances when it closes (the §8 gate).
+#
+# A core without the shared handle declares none of txn.shared/read_handle/watermark and SKIPS this
+# file before parsing any record (the capability gate, conformance.md §3).
+# format: concurrency
+# requires: txn.shared, txn.read_handle, txn.watermark, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.int32
+
+# --- seed one row, committed as version 1 -----------------------------------
+open w write
+on w statement ok
+CREATE TABLE t (id int32 PRIMARY KEY)
+on w statement ok
+INSERT INTO t VALUES (1)
+commit w
+expect version 1
+
+# --- pin a reader at version 1; it holds the watermark there -----------------
+open r read
+expect oldest_live 1
+
+# --- a second writer commits version 2 while r stays pinned ------------------
+open w2 write
+on w2 statement ok
+INSERT INTO t VALUES (2)
+commit w2
+expect version 2
+expect oldest_live 1
+
+# the pinned reader still sees ONLY its snapshot (version 1: one row)
+on r query I rowsort
+SELECT id FROM t
+----
+1
+
+# a write through the read handle is rejected (25006) and does not poison it
+on r statement error 25006
+INSERT INTO t VALUES (99)
+
+# r is still usable after the rejected write — still the pinned snapshot
+on r query I rowsort
+SELECT id FROM t
+----
+1
+
+# a fresh reader sees both rows (version 2)
+open r2 read
+on r2 query I rowsort
+SELECT id FROM t
+----
+1
+2
+
+# --- closing the old reader lets the watermark advance ----------------------
+close r
+expect oldest_live 2
+close r2
+
+# with no live readers, the watermark is the committed version
+expect oldest_live 2
+expect version 2

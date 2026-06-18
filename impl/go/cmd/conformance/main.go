@@ -65,7 +65,14 @@ func run() int {
 			continue
 		}
 
-		if err := runFile(text); err != nil {
+		// A `# format: concurrency` file is an explicit multi-session schedule run against a
+		// SharedDb (spec/design/concurrency-testing.md §4); everything else is the sequential
+		// single-handle runner. Both share the result grammar; only the driver differs.
+		runErr := runFile
+		if isConcurrencyFormat(text) {
+			runErr = runConcurrencyFile
+		}
+		if err := runErr(text); err != nil {
 			fmt.Printf("FAIL %s: %v\n", rel, err)
 			failed++
 		} else {
