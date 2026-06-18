@@ -1,0 +1,174 @@
+# VALUES-body derived tables (spec/design/grammar.md §42): FROM (VALUES (e…),(e…)) [AS] v(c…) — a
+# parenthesized VALUES list used as a FROM relation, a computed relation of literal rows. The
+# FROM-position sibling of INSERT … VALUES, reusing the derived-table seam (an anonymous,
+# always-inlined single-reference CTE): the alias is OPTIONAL (PG 18), an optional column-rename
+# list AS v(a,b) renames the columns left-to-right (default names column1, column2, …), and the body
+# is non-LATERAL (parent=None). A value is a GENERAL constant expression (richer than the INSERT slot
+# — 1+1, a cast, CASE, …); each column's type unifies across rows like a set operation (42804 on a
+# mismatch). Rows verified against the live PostgreSQL 18 oracle; cost assertions are jed's
+# deterministic cross-core contract (spec/design/cost.md §3, the inline derived-table path:
+# row_produced per VALUES row + each value's operator_eval, then the outer scan/project).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.join_inner, query.table_alias, query.qualified_column, query.subquery_in, query.derived_table, query.values, expr.arithmetic, expr.case, cast.operator, types.int32, types.decimal, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, n int32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+# Basic VALUES body: one column, default name column1, one row per VALUES row.
+# names: column1
+# cost: 6
+query I nosort
+SELECT column1 FROM (VALUES (1), (2), (3)) AS v ORDER BY column1
+----
+1
+2
+3
+
+# SELECT * expands the VALUES relation's columns; two columns default to column1, column2.
+# names: column1, column2
+# cost: 6
+query IT nosort
+SELECT * FROM (VALUES (1, 'a'), (2, 'b'), (3, 'c')) AS v ORDER BY column1
+----
+1
+a
+2
+b
+3
+c
+
+# A column-rename list renames the columns left-to-right, qualified by the alias.
+# names: n, s
+# cost: 4
+query IT nosort
+SELECT v.n, v.s FROM (VALUES (1, 'a'), (2, 'b')) AS v (n, s) ORDER BY v.n
+----
+1
+a
+2
+b
+
+# A partial rename keeps the trailing body name (column2).
+# names: n, column2
+# cost: 2
+query IT nosort
+SELECT n, column2 FROM (VALUES (1, 'a')) AS v (n) ORDER BY n
+----
+1
+a
+
+# The alias is OPTIONAL (PG 18) — a bare column resolves against the unaliased relation.
+# names: column1
+# cost: 4
+query I nosort
+SELECT column1 FROM (VALUES (5), (6)) ORDER BY column1
+----
+5
+6
+
+# General constant expressions in a value slot (richer than INSERT … VALUES): arithmetic, a cast,
+# and a CASE expression — all folded per row.
+# names: column1
+# cost: 9
+query I nosort
+SELECT column1 FROM (VALUES (1 + 1), (2 * 3), (2.5 :: int32)) AS v ORDER BY column1
+----
+2
+3
+6
+
+# names: x
+# cost: 6
+query I nosort
+SELECT x FROM (VALUES (CASE WHEN 1 < 2 THEN 10 ELSE 20 END), (5)) AS v (x) ORDER BY x
+----
+5
+10
+
+# Per-column type unification across rows: int + decimal -> decimal (the int value coerces; the
+# rendered decimals keep their own scales).
+# names: column1
+# cost: 6
+query D nosort
+SELECT column1 FROM (VALUES (1), (2.5), (3) ) AS v ORDER BY column1
+----
+1
+2.5
+3
+
+# anything + NULL keeps the other type; a NULL row stays NULL (sorts last by default).
+# names: column1
+# cost: 6
+query I nosort
+SELECT column1 FROM (VALUES (1), (NULL), (2)) AS v ORDER BY column1
+----
+1
+2
+NULL
+
+# WHERE filters the VALUES relation.
+# names: column1
+# cost: 10
+query I nosort
+SELECT column1 FROM (VALUES (1), (2), (3), (4)) AS v WHERE column1 > 2 ORDER BY column1
+----
+3
+4
+
+# An aggregate over the VALUES relation.
+# names: hi
+# cost: 7
+query I nosort
+SELECT max(column1) AS hi FROM (VALUES (3), (1), (2)) AS v
+----
+3
+
+# A JOIN of a base table against a VALUES relation on the renamed column.
+# names: id, n
+# cost: 14
+query II nosort
+SELECT t.id, t.n FROM t JOIN (VALUES (1), (3)) AS v (id) ON t.id = v.id ORDER BY t.id
+----
+1
+10
+3
+30
+
+# A VALUES body inside an IN-subquery (reachable wherever a subquery is).
+# names: id
+# cost: 19
+query I nosort
+SELECT id FROM t WHERE id IN (SELECT column1 FROM (VALUES (1), (3)) AS v) ORDER BY id
+----
+1
+3
+
+# --- errors / narrowings ----------------------------------------------------------------------
+
+# Rows of differing arity -> 42601 (VALUES lists must all be the same length).
+statement error 42601
+SELECT * FROM (VALUES (1), (2, 3)) AS v
+
+# Columns whose row types do not unify -> 42804 (an explicit text cast; bare 'a' would be PG's
+# unknown-literal coercion path, a jed unit-test concern).
+statement error 42804
+SELECT * FROM (VALUES (1), ('a' :: text)) AS v
+
+# A column reference inside a value — the body is non-LATERAL (parent=None) -> 42703.
+statement error 42703
+SELECT * FROM (VALUES (id)) AS v
+
+# An aggregate inside a value -> 42803.
+statement error 42803
+SELECT * FROM (VALUES (sum(1))) AS v
+
+# More column-rename aliases than the body's columns -> 42P10.
+statement error 42P10
+SELECT * FROM (VALUES (1)) AS v (a, b)
+
+# A trailing ORDER BY on the VALUES body is a deferred narrowing -> 42601 (a documented PG
+# divergence; order the OUTER query instead).
+statement error 42601
+SELECT * FROM (VALUES (3), (1), (2) ORDER BY 1) AS v

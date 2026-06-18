@@ -33,6 +33,10 @@ FROM (SELECT category, max(price) AS top FROM product GROUP BY category) AS d
 WHERE top > 5
 ORDER BY category;`;
 
+	const valuesBody = `SELECT label, qty * 2 AS doubled
+FROM (VALUES ('a', 1), ('b', 2), ('c', 3)) AS v (label, qty)
+ORDER BY label;`;
+
 	const unnestExample = `SELECT u AS tag
 FROM unnest(ARRAY['red', 'green', 'blue']) AS u
 ORDER BY u;`;
@@ -135,8 +139,20 @@ column-rename list (`AS t (a, b)`):
 <LiveSql {seed} query={derived} rows={4} />
 
 The body is an independent query — it cannot see the enclosing query's other `FROM` relations
-(`LATERAL` is not yet supported). A parenthesized join (`FROM (a JOIN b …)`) and a `WITH`/`VALUES`
-body are likewise not yet supported.
+(`LATERAL` is not yet supported). A parenthesized join (`FROM (a JOIN b …)`) and a `WITH` body are
+likewise not yet supported.
+
+## `VALUES` lists in `FROM` (`FROM (VALUES …) AS v(x)`)
+
+A derived table's body may also be a `VALUES` list — a literal table of rows you write inline,
+without a base table. The columns default to `column1`, `column2`, … (overridable by the alias's
+column-rename list), and each column's type unifies across the rows the way `UNION` does. Each value
+is a general constant expression (`qty * 2` below):
+
+<LiveSql {seed} query={valuesBody} rows={3} />
+
+Order or limit the **outer** query (`FROM (VALUES …) v ORDER BY x`); a trailing `ORDER BY` / `LIMIT`
+inside the parentheses is not yet supported.
 
 ## Set-returning functions in `FROM`
 

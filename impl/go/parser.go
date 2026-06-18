@@ -1381,16 +1381,29 @@ func (p *Parser) parseTableRef() (TableRef, error) {
 // the relation has no qualifier (its bare columns still resolve). Name/Alias carry the alias (empty
 // when none).
 func (p *Parser) parseDerivedTable() (TableRef, error) {
-	// Consume the opening `(`. Only a leading SELECT is a derived table; otherwise reject (a
-	// parenthesized-join FROM `(a JOIN b ON …)` is a deferred narrowing).
+	// Consume the opening `(`. The body is EITHER a query_expr (a leading SELECT) OR a VALUES list
+	// (a leading VALUES) — FROM (VALUES (e…),(e…)), a computed relation of literal rows
+	// (spec/design/grammar.md §42); any other leading `(` is rejected (a parenthesized-join FROM
+	// `(a JOIN b ON …)` is a deferred narrowing).
 	p.advance()
-	if p.peekKeyword() != "select" {
+	var body *QueryExpr
+	var values [][]*Expr
+	switch p.peekKeyword() {
+	case "values":
+		v, err := p.parseValuesBody()
+		if err != nil {
+			return TableRef{}, err
+		}
+		values = v
+	case "select":
+		b, err := p.parseSubquery()
+		if err != nil {
+			return TableRef{}, err
+		}
+		body = &b
+	default:
 		return TableRef{}, NewError(SyntaxError,
-			"subquery in FROM must begin with SELECT (a parenthesized join is not supported)")
-	}
-	body, err := p.parseSubquery()
-	if err != nil {
-		return TableRef{}, err
+			"subquery in FROM must begin with SELECT or VALUES (a parenthesized join is not supported)")
 	}
 	if err := p.expect(TokRParen); err != nil {
 		return TableRef{}, err
@@ -1434,7 +1447,47 @@ func (p *Parser) parseDerivedTable() (TableRef, error) {
 	if alias != nil {
 		name = *alias
 	}
-	return TableRef{Name: name, Alias: alias, Subquery: &body, ColumnAliases: columnAliases}, nil
+	return TableRef{Name: name, Alias: alias, Subquery: body, Values: values, ColumnAliases: columnAliases}, nil
+}
+
+// parseValuesBody parses a VALUES-body's rows — VALUES "(" expr ("," expr)* ")" ("," …)*
+// (spec/design/grammar.md §42), the body of a FROM (VALUES …) derived table. The caller has
+// verified the next keyword is VALUES (here consumed). Each row is a parenthesized list of GENERAL
+// expressions (unlike the INSERT … VALUES slot, which is a literal/$N/DEFAULT); arity equality
+// across rows and per-column type unification are resolve-time concerns (the executor's planValues).
+// At least one row, each with at least one value. NO trailing ORDER BY / LIMIT is consumed — the
+// caller's `)` follows the last row.
+func (p *Parser) parseValuesBody() ([][]*Expr, error) {
+	if err := p.expectKeyword("values"); err != nil {
+		return nil, err
+	}
+	var rows [][]*Expr
+	for {
+		if err := p.expect(TokLParen); err != nil {
+			return nil, err
+		}
+		var row []*Expr
+		for {
+			e, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			row = append(row, &e)
+			if p.peek().Kind != TokComma {
+				break
+			}
+			p.advance()
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return nil, err
+		}
+		rows = append(rows, row)
+		if p.peek().Kind != TokComma {
+			break
+		}
+		p.advance()
+	}
+	return rows, nil
 }
 
 // parseJoinClause parses one join_clause if a join keyword begins here (returns ok=false to end

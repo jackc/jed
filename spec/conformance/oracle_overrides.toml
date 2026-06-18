@@ -365,6 +365,13 @@ file = "subquery/derived.test"
 sql = "SELECT * FROM (WITH c AS (SELECT 1 AS one) SELECT one FROM c) AS d"
 reason = "jed: a derived-table body is the WITH-less query_expr, so a nested WITH is 42601 (the top-level-only narrowing — grammar.md §42, cte.md §1; shared with the §26 subquery forms). PostgreSQL 18 accepts a WITH-prefixed subquery body and returns 1. A deliberate, documented narrowing."
 
+# --- VALUES-body derived table (grammar.md §42): a trailing ORDER BY / LIMIT on the VALUES body is a
+# deferred narrowing, relaxable later.
+[[override]]
+file = "subquery/values_body.test"
+sql = "SELECT * FROM (VALUES (3), (1), (2) ORDER BY 1) AS v"
+reason = "jed: a VALUES-body derived table takes NO trailing ORDER BY / LIMIT this slice — the ORDER BY surfaces as a leftover token, 42601 (grammar.md §42). PostgreSQL accepts a VALUES query's trailing ORDER BY and returns the sorted rows {1},{2},{3}. A deliberate, documented narrowing; order the OUTER query instead (FROM (VALUES …) v ORDER BY x)."
+
 # --- array.test PRE-EXISTING divergences (surfaced during the Batch 2 / G6–G9 work; predate it,
 # identical on the committed file). Both are intentional jed behavior, registered to keep the
 # ledger complete (conformance.md §5).

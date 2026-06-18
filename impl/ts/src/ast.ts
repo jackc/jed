@@ -358,11 +358,18 @@ export type InsertValue =
 // single-reference CTE (the planner reuses the CTE synthetic-relation seam). The alias is OPTIONAL
 // (PG 18): present, it is the label and `columnAliases` the optional column-rename list; absent,
 // `name` is "" / `alias` is null and the relation has no qualifier.
+// A `values` body instead marks a VALUES-body derived table — FROM (VALUES (e11,…),(e21,…)) AS
+// v(c1,…) (grammar.md §42): a parenthesized VALUES list used as a relation, a computed relation of
+// literal rows. It is the FROM-position alternative body to `subquery` (the two are mutually
+// exclusive — at most one is set on a derived table). Each value is a general constant expression
+// (resolved parent=null, non-LATERAL); the rows share arity and the columns' types unify across
+// rows like a set operation. The outer array is the rows, each inner array one row's values.
 export type TableRef = {
   name: string;
   alias: string | null;
   args: Expr[] | null;
   subquery?: QueryExpr;
+  values?: Expr[][];
   columnAliases?: string[];
 };
 

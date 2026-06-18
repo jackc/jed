@@ -1860,9 +1860,39 @@ must be **distinct** from the other FROM relations' labels: a collision is **`42
 **Disambiguation (a §8 cross-core determinism surface).** In `table_ref` position, a leading `(`
 followed by `SELECT` is a derived table — the *same* leading-`SELECT` lookahead scalar subqueries
 and IN-subqueries use (§26), so the three hand-written parsers stay byte-identical. A leading `(`
-**not** followed by `SELECT` is a **`42601`** this slice (a parenthesized join expression
-`FROM (a JOIN b ON …)` is a deferred narrowing, below). The base-table / SRF forms are unchanged: a
-`(` *after* a leading identifier is still the function form (§35).
+followed by `VALUES` is the **VALUES-body derived table** (below). A leading `(` followed by
+**neither** is a **`42601`** this slice (a parenthesized join expression `FROM (a JOIN b ON …)` is a
+deferred narrowing, below). The base-table / SRF forms are unchanged: a `(` *after* a leading
+identifier is still the function form (§35).
+
+**The VALUES body — `FROM (VALUES (1),(2)) AS v(x)`.** The derived-table body may be a `VALUES` list
+instead of a `query_expr`: a **computed relation of literal rows**, the FROM-position sibling of the
+`INSERT … VALUES` source (§12). It reuses the *same* derived-table seam — an anonymous,
+always-inlined single-reference CTE — so the alias rules, the column-rename list (`AS v(x)`), the
+`42712`/`42702`/`42P10` rules, the non-correlation rule, and the intrinsic-cost charging are all the
+**unchanged** derived-table behavior above; only the *body* differs.
+
+- **Values are general constant expressions (matching PostgreSQL).** Unlike `INSERT … VALUES` (whose
+  slot is a literal/`$N`/`DEFAULT`, §12/§16), a VALUES-body value is any expression — `(1+1)`,
+  `(upper('a'))`, `(now())`, a cast, `CASE`, `ROW(…)`, `ARRAY[…]`, an uncorrelated scalar subquery.
+  Each is resolved as a **constant**: the body is **non-`LATERAL`** (`parent = None`, like every
+  derived table), so it has no FROM row and no outer row — a **column reference** inside is therefore
+  unresolved (`42703`/`42P01`), an **aggregate** is `42803`, and a bind parameter with no inferable
+  local type is `42P18` (jed does not infer a bare `$N` from sibling rows — the documented `$N`
+  posture of §26; write `$1::int`). This is the one place a VALUES body is *richer* than
+  `INSERT … VALUES`: lifting general expressions into the INSERT slot too is a separate future slice.
+- **Shape and column typing.** Every row must have the **same arity** (`42601`,
+  `VALUES lists must all be the same length` — the §12 rule). The relation has one column per value;
+  its **default names are `column1`, `column2`, …** (PostgreSQL), overridable by the alias's
+  column-rename list. Each **column's type unifies across the rows** exactly like a set operation
+  (§25): `int`-widths widen, `int`+`decimal` → `decimal`, anything + `NULL` keeps the other, an
+  all-`NULL` column is `text` (unknown→text); an incompatible pair is **`42804`**
+  (`datatype_mismatch`). The unified column type then coerces each row's value (the only runtime
+  change is `int`→`decimal`, as for a set operation).
+- **No trailing `ORDER BY` / `LIMIT` on the body (a deferred narrowing).** `(VALUES … ORDER BY 1)` is
+  `42601` (a leftover token). Order/limit the *outer* query instead (`FROM (VALUES …) v ORDER BY x`).
+  A documented PG divergence (PG accepts a VALUES query's trailing clauses), recorded in the override
+  ledger alongside the no-parenthesized-join and no-`WITH`-body narrowings.
 
 **The body is NOT correlated (no `LATERAL`).** A derived-table body is planned as an **independent
 query** (`parent = None`), exactly like a non-recursive CTE body ([cte.md](cte.md) §2): it sees its
@@ -1893,8 +1923,12 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
 | Duplicate explicit FROM label (alias collides) | `42712` | `duplicate_alias`; the general FROM-label rule (§15). Unaliased derived tables have no label and never collide. |
 | Ambiguous bare reference to a duplicated body output column | `42702` | Within one relation or across two (cte.md §2). |
 | Outer / sibling column referenced inside the body | `42703` / `42P01` | The body is not correlated / not LATERAL. |
-| Leading `(` in FROM not followed by `SELECT` | `42601` | No parenthesized-join FROM this slice — a **documented divergence** (PG parses `(a JOIN b …)`; the override ledger records it). |
+| Leading `(` in FROM not followed by `SELECT` or `VALUES` | `42601` | No parenthesized-join FROM this slice — a **documented divergence** (PG parses `(a JOIN b …)`; the override ledger records it). |
 | Nested `WITH` inside the body | `42601` | Top-level-only narrowing (§26, cte.md §1); leftover token — a **documented divergence** (PG 18 accepts a `WITH` body). |
+| VALUES-body rows of differing arity | `42601` | `VALUES lists must all be the same length` (the §12 rule). |
+| VALUES-body columns whose row types do not unify | `42804` | `datatype_mismatch`, the set-operation unification rule (§25). |
+| Column reference / aggregate / no-context `$N` in a VALUES-body value | `42703` / `42803` / `42P18` | The body is a non-`LATERAL` constant relation (no FROM/outer row). |
+| Trailing `ORDER BY` / `LIMIT` on a VALUES body | `42601` | Leftover token — a deferred narrowing (PG accepts it on a VALUES query). |
 | Body nesting exceeds `MAX_EXPR_DEPTH` | `54001` | The parser depth gate (cost.md §7). |
 
 **Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
@@ -1903,7 +1937,9 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
   stays independent (`parent = None`) until this lands.
 - **Parenthesized join / table-reference FROM** — `FROM (a JOIN b ON …) c`. A leading `(` not
   starting a `SELECT` is `42601`.
-- **A `VALUES` body** — `FROM (VALUES (1),(2)) AS v(x)` — and a `WITH` *inside* the body (nested
-  `WITH`, `42601`). The body production is the WITH-less `query_expr` (`SELECT` / set op).
+- **A `WITH` *inside* the body** (nested `WITH`, `42601`) — the body production is the WITH-less
+  `query_expr` (`SELECT` / set op) or a `VALUES` list. *(The `VALUES` body itself has **landed** —
+  see "The VALUES body" above; its own residual narrowings are a trailing `ORDER BY`/`LIMIT` on the
+  body and general expressions in the `INSERT … VALUES` slot.)*
 - **Top-level `UPDATE`/`DELETE` FROM** stays single-table (§15) — a derived table reaches them only
   inside a subquery.

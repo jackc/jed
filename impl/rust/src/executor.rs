@@ -3114,6 +3114,7 @@ impl Database {
         match plan {
             QueryPlan::Select(sp) => self.exec_select_plan(sp, outer, params, ctes),
             QueryPlan::SetOp(sop) => self.exec_set_op_plan(sop, outer, params, ctes),
+            QueryPlan::Values(vp) => self.exec_values_plan(vp, outer, params, ctes),
         }
     }
 
@@ -3152,6 +3153,7 @@ impl Database {
         let column_names = match &lhs {
             QueryPlan::Select(s) => s.column_names.clone(),
             QueryPlan::SetOp(s) => s.column_names.clone(),
+            QueryPlan::Values(v) => v.column_names.clone(),
         };
 
         // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
@@ -3172,6 +3174,127 @@ impl Database {
             order,
             limit: so.limit,
             offset: so.offset,
+        })
+    }
+
+    /// Resolve a VALUES-body relation into a `ValuesPlan` (spec/design/grammar.md §42) — the body
+    /// of a `FROM (VALUES …)` derived table. Each value resolves as a CONSTANT against an EMPTY
+    /// scope with `parent = None`: the body is non-`LATERAL`, so a column reference is unresolved
+    /// (42703/42P01) and an aggregate is 42803; it still sees the statement's CTE bindings (an
+    /// uncorrelated subquery inside a value resolves like anywhere). Every row must have the same
+    /// arity (42601); the columns' types unify across rows like a set operation (42804 on a
+    /// mismatch). A bind parameter is then noted at its column's unified type (so `VALUES (1),($1)`
+    /// types `$1` as `int`); a column with no concrete type — all NULL/param — leaves its `$N`
+    /// untyped, surfacing 42P18 at `finalize` (jed's no-cross-context inference posture, §26).
+    fn plan_values<'a>(
+        &'a self,
+        rows: &[Vec<Expr>],
+        ctes: &'a [CteBinding],
+        ptypes: &mut ParamTypes,
+    ) -> Result<ValuesPlan> {
+        // The parser guarantees at least one row, each with at least one value.
+        let arity = rows[0].len();
+        // The non-`LATERAL` constant scope: no local relations and no parent, so any column
+        // reference (outer, sibling, or the body's own) is unresolved; CTE bindings stay visible
+        // and subqueries are allowed (an uncorrelated one folds before the rows run).
+        let scope = Scope {
+            rels: Vec::new(),
+            parent: None,
+            catalog: self,
+            allow_subquery: true,
+            ctes,
+        };
+        let mut resolved_rows: Vec<Vec<RExpr>> = Vec::with_capacity(rows.len());
+        let mut col_types: Vec<ResolvedType> = Vec::with_capacity(arity);
+        // Per column: the 0-based bind-parameter slots appearing in it, typed in a second pass from
+        // the unified column type (a $N takes its column's type, like a set-operation operand).
+        let mut col_params: Vec<Vec<usize>> = vec![Vec::new(); arity];
+        for (ri, row) in rows.iter().enumerate() {
+            if row.len() != arity {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    "VALUES lists must all be the same length",
+                ));
+            }
+            let mut resolved_row = Vec::with_capacity(arity);
+            for (ci, val) in row.iter().enumerate() {
+                // Aggregates are not allowed in a VALUES list (a stray one is 42803).
+                let mut agg = AggCtx::Forbidden;
+                let (node, ty) = resolve(&scope, val, None, &mut agg, ptypes)?;
+                if let RExpr::Param(idx0) = &node {
+                    col_params[ci].push(*idx0);
+                }
+                if ri == 0 {
+                    col_types.push(ty);
+                } else {
+                    col_types[ci] = unify_values_column(&col_types[ci], &ty)?;
+                }
+                resolved_row.push(node);
+            }
+            resolved_rows.push(resolved_row);
+        }
+        // Second pass: note each column's bind parameters at the unified column type. A column with
+        // no scalar type (all NULL/param) passes `None` — the parameter stays untyped (42P18).
+        for (ci, params_here) in col_params.iter().enumerate() {
+            let hint = scalar_for_param_hint(&col_types[ci]);
+            for &idx0 in params_here {
+                ptypes.note(idx0, hint)?;
+            }
+        }
+        // PostgreSQL names a VALUES relation's columns column1, column2, … ; the derived table's
+        // optional column-rename list overrides them at the synthetic relation (cte_synthetic_table).
+        let column_names = (1..=arity).map(|i| format!("column{i}")).collect();
+        Ok(ValuesPlan {
+            rows: resolved_rows,
+            column_types: col_types,
+            column_names,
+        })
+    }
+
+    /// Execute a resolved VALUES-body relation (spec/design/grammar.md §42): evaluate each row's
+    /// values as constants over an EMPTY environment (no local row, no outer row — non-`LATERAL`),
+    /// coerce each to the unified column type (the only runtime change is int → decimal, the
+    /// set-operation rule), and emit the rows. Charges `row_produced` per row plus each value's
+    /// `operator_eval` (the evaluator) — the derived table's intrinsic cost (cost.md §3), folded
+    /// into the caller's meter via `exec_query_plan`.
+    fn exec_values_plan(
+        &self,
+        plan: &ValuesPlan,
+        outer: &[&[Value]],
+        params: &[Value],
+        ctes: CteCtx,
+    ) -> Result<SelectResult> {
+        let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
+        let env = EvalEnv {
+            exec: self,
+            params,
+            outer,
+            rng: &stmt_rng,
+            ctes,
+        };
+        let mut meter = Meter::with_limit(self.max_cost);
+        let mut rows: Vec<Vec<Value>> = Vec::with_capacity(plan.rows.len());
+        for row in &plan.rows {
+            meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
+            meter.charge(COSTS.row_produced);
+            let mut out = Vec::with_capacity(plan.column_types.len());
+            for (ci, e) in row.iter().enumerate() {
+                let v = e.eval(&[], &env, &mut meter)?;
+                // Int → decimal where the column unified to decimal (the set-operation rule); every
+                // other unified type is a value no-op (int-width promotion is free — all ints are i64).
+                let v = match (&plan.column_types[ci], &v) {
+                    (ResolvedType::Decimal, Value::Int(n)) => Value::Decimal(Decimal::from_i64(*n)),
+                    _ => v,
+                };
+                out.push(v);
+            }
+            rows.push(out);
+        }
+        Ok(SelectResult {
+            column_names: plan.column_names.clone(),
+            column_types: plan.column_types.clone(),
+            rows,
+            cost: meter.accrued,
         })
     }
 
@@ -3282,14 +3405,21 @@ impl Database {
         // (distinguishes a derived table from a base table / CTE in the second pass).
         let mut derived_meta: Vec<Option<usize>> = Vec::with_capacity(from_items.len());
         for tref in &from_items {
-            if let Some(body) = &tref.subquery {
-                // A DERIVED TABLE — `FROM (SELECT …) AS t`. Plan the body as an INDEPENDENT query
-                // (`parent = None`: not correlated / not LATERAL — §42) that still inherits the
-                // statement's CTE bindings (cte.md §2), build its synthetic relation (the alias is
-                // the label; the optional column-rename list applies, 42P10 on overflow), and keep
-                // the plan for in-place execution. Like a single-reference CTE, it borrows a
-                // SYNTHETIC `Table` that must outlive the scope, so it joins `synthetic`.
-                let plan = self.plan_query(body, None, ctes, ptypes)?;
+            // A DERIVED TABLE — `FROM (SELECT …) AS t` (a `query_expr` body) or
+            // `FROM (VALUES …) AS v` (a VALUES-body relation — §42). Plan the body as an INDEPENDENT
+            // query (`parent = None`: not correlated / not LATERAL — §42) that still inherits the
+            // statement's CTE bindings (cte.md §2), build its synthetic relation (the alias is the
+            // label; the optional column-rename list applies, 42P10 on overflow), and keep the plan
+            // for in-place execution. Like a single-reference CTE, it borrows a SYNTHETIC `Table`
+            // that must outlive the scope, so it joins `synthetic`.
+            let derived_plan = match (&tref.subquery, &tref.values) {
+                (Some(body), _) => Some(self.plan_query(body, None, ctes, ptypes)?),
+                (None, Some(rows)) => {
+                    Some(QueryPlan::Values(self.plan_values(rows, ctes, ptypes)?))
+                }
+                (None, None) => None,
+            };
+            if let Some(plan) = derived_plan {
                 let label = tref.alias.clone().unwrap_or_default().to_ascii_lowercase();
                 let table = cte_synthetic_table(&label, &plan, tref.column_aliases.as_deref())?;
                 synthetic.push(table);
@@ -4484,6 +4614,16 @@ impl Database {
                 self.fold_uncorrelated_in_plan(&mut sop.lhs, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_plan(&mut sop.rhs, bound, ctes, cost)
             }
+            // A VALUES-body value may itself hold an (uncorrelated) scalar subquery to fold once
+            // before the rows are produced (grammar.md §42; the §26 fold).
+            QueryPlan::Values(vp) => {
+                for row in &mut vp.rows {
+                    for e in row {
+                        self.fold_uncorrelated_in_rexpr(e, bound, ctes, cost)?;
+                    }
+                }
+                Ok(())
+            }
         }
     }
 
@@ -5532,6 +5672,11 @@ enum SubqueryKind {
 enum QueryPlan {
     Select(SelectPlan),
     SetOp(Box<SetOpPlan>),
+    /// A VALUES-body relation — `FROM (VALUES …) AS v` (spec/design/grammar.md §42): a computed
+    /// relation of literal rows, the FROM-position sibling of `INSERT … VALUES`. Only ever produced
+    /// as a derived-table body (the parser admits `VALUES` solely there), so it never appears as a
+    /// set-op operand or a subquery operand.
+    Values(ValuesPlan),
 }
 
 impl QueryPlan {
@@ -5541,6 +5686,7 @@ impl QueryPlan {
         match self {
             QueryPlan::Select(s) => &s.column_types,
             QueryPlan::SetOp(s) => &s.column_types,
+            QueryPlan::Values(v) => &v.column_types,
         }
     }
 
@@ -5550,8 +5696,21 @@ impl QueryPlan {
         match self {
             QueryPlan::Select(s) => &s.column_names,
             QueryPlan::SetOp(s) => &s.column_names,
+            QueryPlan::Values(v) => &v.column_names,
         }
     }
+}
+
+/// A resolved VALUES-body relation (spec/design/grammar.md §42), executable to its literal rows.
+/// `rows` is the resolved value expressions — `rows[r][c]` is row `r`, column `c` — each resolved
+/// as a CONSTANT (the body is non-`LATERAL`, planned `parent = None`, so it reads no row).
+/// `column_types` is the per-column type unified across the rows like a set operation (§25), and
+/// `column_names` is `column1, column2, …` (PostgreSQL; the derived table's optional column-rename
+/// list overrides them at the synthetic relation). All rows have `column_types.len()` values.
+struct ValuesPlan {
+    rows: Vec<Vec<RExpr>>,
+    column_types: Vec<ResolvedType>,
+    column_names: Vec<String>,
 }
 
 /// Build the synthetic relation a CTE reference resolves against (spec/design/cte.md §2): one
@@ -6922,6 +7081,13 @@ fn query_plan_references_outer(plan: &QueryPlan, depth: usize) -> bool {
             query_plan_references_outer(&sop.lhs, depth)
                 || query_plan_references_outer(&sop.rhs, depth)
         }
+        // A VALUES body is planned `parent = None`, so its values hold no outer reference of their
+        // own; a folded-in subquery, however, may correlate to the target scope.
+        QueryPlan::Values(vp) => vp
+            .rows
+            .iter()
+            .flatten()
+            .any(|e| rexpr_references_outer(e, depth)),
     }
 }
 
@@ -7153,6 +7319,13 @@ fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut [bool]) {
         QueryPlan::SetOp(s) => {
             collect_touched_plan(&s.lhs, depth, touched);
             collect_touched_plan(&s.rhs, depth, touched);
+        }
+        QueryPlan::Values(vp) => {
+            for row in &vp.rows {
+                for e in row {
+                    collect_touched(e, depth, touched);
+                }
+            }
         }
     }
 }
@@ -10761,6 +10934,58 @@ fn setop_name(op: SetOpKind) -> &'static str {
 /// — PostgreSQL would call a top-level one `text`, but the type is never observed in output); a
 /// same-family non-numeric pair gives that type; anything else is 42804. The set of unifiable
 /// pairs mirrors the comparability matrix (compare.toml).
+/// Unify two row value types for the SAME VALUES-body column (spec/design/grammar.md §42), the
+/// set-operation rule (§25): integer widths widen, `int`+`decimal` → `decimal`, anything + `NULL`
+/// keeps the other, and a same-type scalar pair (`text`, `bool`, `bytea`, `uuid`, a `timestamp` /
+/// `timestamptz`, an `interval`, a same-width `float`) unifies to itself; any other pair — including
+/// a composite or array column across rows (a deferred edge) — is 42804. Enumerated EXPLICITLY (not
+/// a generic `a == b`) so all three cores compute byte-identical results (CLAUDE.md §8).
+fn unify_values_column(a: &ResolvedType, b: &ResolvedType) -> Result<ResolvedType> {
+    use ResolvedType::*;
+    Ok(match (a, b) {
+        (Null, Null) => Null,
+        (Null, x) | (x, Null) => x.clone(),
+        (Int(_), Int(_)) => Int(promote(a, b)),
+        (Decimal, Decimal) | (Int(_), Decimal) | (Decimal, Int(_)) => Decimal,
+        (Text, Text) => Text,
+        (Bool, Bool) => Bool,
+        (Bytea, Bytea) => Bytea,
+        (Uuid, Uuid) => Uuid,
+        (Timestamp, Timestamp) => Timestamp,
+        (Timestamptz, Timestamptz) => Timestamptz,
+        (Interval, Interval) => Interval,
+        (Float(x), Float(y)) if x == y => Float(*x),
+        _ => {
+            return Err(EngineError::new(
+                SqlState::DatatypeMismatch,
+                format!(
+                    "VALUES types {} and {} cannot be matched",
+                    a.type_name(),
+                    b.type_name()
+                ),
+            ));
+        }
+    })
+}
+
+/// The scalar type to note a bind parameter at, given its VALUES column's unified type
+/// (spec/design/grammar.md §42). A scalar type flows through; a NULL / composite / array column
+/// has no scalar parameter type, so the parameter stays untyped (42P18 at `finalize`).
+fn scalar_for_param_hint(rt: &ResolvedType) -> Option<ScalarType> {
+    match rt {
+        ResolvedType::Int(s) | ResolvedType::Float(s) => Some(*s),
+        ResolvedType::Bool => Some(ScalarType::Bool),
+        ResolvedType::Text => Some(ScalarType::Text),
+        ResolvedType::Decimal => Some(ScalarType::Decimal),
+        ResolvedType::Bytea => Some(ScalarType::Bytea),
+        ResolvedType::Uuid => Some(ScalarType::Uuid),
+        ResolvedType::Timestamp => Some(ScalarType::Timestamp),
+        ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
+        ResolvedType::Interval => Some(ScalarType::Interval),
+        ResolvedType::Null | ResolvedType::Composite(_) | ResolvedType::Array(_) => None,
+    }
+}
+
 fn unify_setop_column(a: &ResolvedType, b: &ResolvedType, op: SetOpKind) -> Result<ResolvedType> {
     use ResolvedType::*;
     let out = match (a, b) {

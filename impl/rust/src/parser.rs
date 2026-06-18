@@ -1134,28 +1134,39 @@ impl Parser {
             alias,
             args,
             subquery: None,
+            values: None,
             column_aliases: None,
         })
     }
 
-    /// Parse a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42). The caller has
-    /// verified the next token is `(`. A derived table is recognized only when a `SELECT` follows
-    /// the `(` (the §26 leading-`SELECT` lookahead, a §8 cross-core surface); any other leading `(`
-    /// is a 42601 (no parenthesized-join FROM this slice). The alias is OPTIONAL (PostgreSQL 18
-    /// relaxed the old mandatory-alias rule): present, it is the relation's label and may carry a
-    /// column-rename list `(c1, c2, …)`; absent, the relation has no qualifier (its bare columns
-    /// still resolve and can be ambiguous). `alias`/`name` carry the alias (empty when none).
+    /// Parse a DERIVED TABLE — `"(" (query_expr | values_body) ")" derived_alias?` (grammar.md §42).
+    /// The caller has verified the next token is `(`. A derived table is recognized when a `SELECT`
+    /// (a `query_expr` body) OR `VALUES` (a VALUES-body relation) follows the `(` — the §26
+    /// leading-`SELECT` lookahead, extended with `VALUES`, a §8 cross-core surface; any other
+    /// leading `(` is a 42601 (no parenthesized-join FROM this slice). The alias is OPTIONAL
+    /// (PostgreSQL 18 relaxed the old mandatory-alias rule): present, it is the relation's label and
+    /// may carry a column-rename list `(c1, c2, …)`; absent, the relation has no qualifier (its bare
+    /// columns still resolve and can be ambiguous). `alias`/`name` carry the alias (empty when none).
     fn parse_derived_table(&mut self) -> Result<TableRef> {
-        // Consume the opening `(`. Only a leading `SELECT` is a derived table; otherwise reject
-        // (a parenthesized-join FROM `(a JOIN b ON …)` is a deferred narrowing).
+        // Consume the opening `(`. A leading `SELECT` is a query-expr body; a leading `VALUES` is a
+        // VALUES-body relation; any other leading `(` is rejected (a parenthesized-join FROM
+        // `(a JOIN b ON …)` is a deferred narrowing).
         self.advance();
-        if self.peek_keyword().as_deref() != Some("select") {
+        // The body is EITHER a query_expr (a leading `SELECT`) OR a VALUES list (a leading
+        // `VALUES`) — `(VALUES (e…),(e…))`, a computed relation of literal rows (grammar.md §42).
+        // The VALUES body's values are GENERAL expressions (resolved as constants at plan time,
+        // parent = None) and it takes NO trailing ORDER BY / LIMIT (a deferred narrowing — that
+        // surfaces as a 42601 leftover token at the expected `)`).
+        let (subquery, values) = if self.peek_keyword().as_deref() == Some("values") {
+            (None, Some(self.parse_values_body()?))
+        } else if self.peek_keyword().as_deref() == Some("select") {
+            (Some(Box::new(self.parse_subquery()?)), None)
+        } else {
             return Err(EngineError::new(
                 SqlState::SyntaxError,
-                "subquery in FROM must begin with SELECT (a parenthesized join is not supported)",
+                "subquery in FROM must begin with SELECT or VALUES (a parenthesized join is not supported)",
             ));
-        }
-        let body = self.parse_subquery()?;
+        };
         self.expect(&Token::RParen)?;
         // The alias is optional, parsed exactly like a base table's: an explicit `AS` takes the
         // next identifier; an implicit alias is a word that is not a clause/join stop keyword.
@@ -1191,9 +1202,38 @@ impl Parser {
             name: alias.clone().unwrap_or_default(),
             alias,
             args: None,
-            subquery: Some(Box::new(body)),
+            subquery,
+            values,
             column_aliases,
         })
+    }
+
+    /// Parse a VALUES-body's rows — `VALUES "(" expr ("," expr)* ")" ("," …)*` (grammar.md §42),
+    /// the body of a `FROM (VALUES …)` derived table. The caller has verified the next keyword is
+    /// `VALUES` (here consumed). Each row is a parenthesized list of GENERAL expressions (unlike the
+    /// `INSERT … VALUES` slot, which is a literal/`$N`/`DEFAULT`); arity equality across rows and
+    /// per-column type unification are resolve-time concerns (the executor's `plan_values`). At
+    /// least one row, each with at least one value (an empty `()` is a 42601). NO trailing
+    /// ORDER BY / LIMIT is consumed — the caller's `)` follows the last row.
+    fn parse_values_body(&mut self) -> Result<Vec<Vec<Expr>>> {
+        self.expect_keyword("values")?;
+        let mut rows = Vec::new();
+        loop {
+            self.expect(&Token::LParen)?;
+            let mut row = vec![self.parse_expr()?];
+            while matches!(self.peek(), Token::Comma) {
+                self.advance();
+                row.push(self.parse_expr()?);
+            }
+            self.expect(&Token::RParen)?;
+            rows.push(row);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(rows)
     }
 
     /// Parse one `join_clause` if a join keyword begins here, else `None` (ending the FROM

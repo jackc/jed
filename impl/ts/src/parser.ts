@@ -1041,16 +1041,23 @@ class Parser {
   // list; absent, the relation has no qualifier (its bare columns still resolve). name/alias carry
   // the alias ("" / null when none).
   private parseDerivedTable(): TableRef {
-    // Consume the opening `(`. Only a leading SELECT is a derived table; otherwise reject (a
-    // parenthesized-join FROM `(a JOIN b ON …)` is a deferred narrowing).
+    // Consume the opening `(`. The body is EITHER a query_expr (a leading SELECT) OR a VALUES list
+    // (a leading VALUES) — FROM (VALUES (e…),(e…)), a computed relation of literal rows
+    // (grammar.md §42); any other leading `(` is rejected (a parenthesized-join FROM
+    // `(a JOIN b ON …)` is a deferred narrowing).
     this.advance();
-    if (this.peekKeyword() !== "select") {
+    let body: QueryExpr | undefined;
+    let values: Expr[][] | undefined;
+    if (this.peekKeyword() === "values") {
+      values = this.parseValuesBody();
+    } else if (this.peekKeyword() === "select") {
+      body = this.parseSubquery();
+    } else {
       throw engineError(
         "syntax_error",
-        "subquery in FROM must begin with SELECT (a parenthesized join is not supported)",
+        "subquery in FROM must begin with SELECT or VALUES (a parenthesized join is not supported)",
       );
     }
-    const body = this.parseSubquery();
     this.expect("rparen");
     // The alias is optional, parsed exactly like a base table's.
     let alias: string | null = null;
@@ -1077,7 +1084,32 @@ class Parser {
       }
       this.expect("rparen");
     }
-    return { name: alias ?? "", alias, args: null, subquery: body, columnAliases };
+    return { name: alias ?? "", alias, args: null, subquery: body, values, columnAliases };
+  }
+
+  // parseValuesBody parses a VALUES-body's rows — VALUES "(" expr ("," expr)* ")" ("," …)*
+  // (grammar.md §42), the body of a FROM (VALUES …) derived table. The caller has verified the next
+  // keyword is VALUES (here consumed). Each row is a parenthesized list of GENERAL expressions
+  // (unlike the INSERT … VALUES slot, which is a literal/$N/DEFAULT); arity equality across rows and
+  // per-column type unification are resolve-time concerns (the executor's planValues). At least one
+  // row, each with at least one value. NO trailing ORDER BY / LIMIT is consumed — the caller's `)`
+  // follows the last row.
+  private parseValuesBody(): Expr[][] {
+    this.expectKeyword("values");
+    const rows: Expr[][] = [];
+    for (;;) {
+      this.expect("lparen");
+      const row: Expr[] = [this.parseExpr()];
+      while (this.peek().kind === "comma") {
+        this.advance();
+        row.push(this.parseExpr());
+      }
+      this.expect("rparen");
+      rows.push(row);
+      if (this.peek().kind !== "comma") break;
+      this.advance();
+    }
+    return rows;
   }
 
   // parseJoinClause parses one join_clause if a join keyword begins here (returns null to end

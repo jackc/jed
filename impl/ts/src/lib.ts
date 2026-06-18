@@ -148,6 +148,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // parser surface over the CTE inline seam (an anonymous always-inlined single-ref CTE) —
   // spec/design/grammar.md §42.
   "query.derived_table",
+  // VALUES-body derived table — FROM (VALUES (e…),(e…)) [AS] v(c…): a parenthesized VALUES list as
+  // a FROM relation, a computed relation of literal rows (general constant expressions, per-column
+  // type unification across rows) — spec/design/grammar.md §42.
+  "query.values",
   // Scalar functions abs / round (per-row, valid anywhere an expression is) —
   // spec/design/functions.md §9.
   "func.abs",

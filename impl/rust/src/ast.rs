@@ -285,12 +285,21 @@ pub struct Delete {
 /// `column_aliases` is the optional column-rename list (`AS t (a, b)`). A derived table is
 /// mechanically an anonymous, always-inlined single-reference CTE — the planner reuses the CTE
 /// synthetic-relation seam.
+///
+/// `values` carries a **VALUES-body** derived table — `FROM (VALUES (e11,…),(e21,…)) AS v(c1,…)`
+/// (spec/design/grammar.md §42): a parenthesized `VALUES` list used as a relation, a computed
+/// relation of literal rows. It is the FROM-position alternative body to `subquery` (the two are
+/// mutually exclusive — at most one is `Some` on a derived table). Each value is a general
+/// constant expression (resolved `parent = None`, non-`LATERAL`); the rows share arity and the
+/// columns' types unify across rows like a set operation. The outer `Vec` is the rows, each inner
+/// `Vec` one row's values, left to right.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TableRef {
     pub name: String,
     pub alias: Option<String>,
     pub args: Option<Vec<Expr>>,
     pub subquery: Option<Box<QueryExpr>>,
+    pub values: Option<Vec<Vec<Expr>>>,
     pub column_aliases: Option<Vec<String>>,
 }
 

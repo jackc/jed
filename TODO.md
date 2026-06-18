@@ -422,8 +422,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         derived table has no qualifier), optional column-rename list (`42P10`), explicit-label
         collision `42712`, leading-`(`-not-`SELECT` `42601`, depth counts toward `54001`. New
         `query.derived_table` capability. → [grammar.md §42](spec/design/grammar.md)
+    - [x] **A `VALUES` body** (`FROM (VALUES (1),(2)) AS v(x)`) — a parenthesized `VALUES` list as a
+          FROM relation, a computed relation of literal rows reusing the derived-table seam. Values
+          are **general constant expressions** (richer than the literal-only `INSERT … VALUES` slot —
+          the maintainer's call, matching PG): non-`LATERAL` (`parent = None`), so a column ref is
+          `42703`, an aggregate `42803`, a bare `$N` `42P18`. Rows must share arity (`42601`); default
+          column names `column1…`; per-column type unification across rows like a set op (`42804`).
+          A leading `(` + `VALUES` selects it; a trailing `ORDER BY`/`LIMIT` on the body is `42601`
+          (deferred). New `query.values` capability. → [grammar.md §42](spec/design/grammar.md)
     - [ ] _follow-on:_ **`LATERAL`** (body sees earlier FROM relations); a **parenthesized-join
-          FROM** (`FROM (a JOIN b ON …)`); a **`VALUES` body** (`FROM (VALUES …) AS v(x)`).
+          FROM** (`FROM (a JOIN b ON …)`); a trailing **`ORDER BY`/`LIMIT` on a VALUES body**.
   - [x] **`ANY` / `ALL` over a subquery** — `x op ANY/ALL(SELECT …)`, the subquery spelling of `IN`;
         see the AF5 sub-item above and [array-functions.md §11.6](spec/design/array-functions.md).
   - [ ] **Subqueries — remaining seams:** subqueries in an **`INSERT ... VALUES`** slot (blocked on

@@ -2903,6 +2903,9 @@ func (db *Database) execQueryPlan(plan *queryPlan, outer []Row, params []Value, 
 	if plan.sel != nil {
 		return db.execSelectPlan(plan.sel, outer, params, ctes)
 	}
+	if plan.values != nil {
+		return db.execValuesPlan(plan.values, outer, params, ctes)
+	}
 	return db.execSetOpPlan(plan.setop, outer, params, ctes)
 }
 
@@ -3003,6 +3006,104 @@ func (db *Database) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value, 
 	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: rows, cost: cost}, nil
 }
 
+// planValues resolves a VALUES-body relation into a *valuesPlan (spec/design/grammar.md §42) — the
+// body of a FROM (VALUES …) derived table. Each value resolves as a CONSTANT against an EMPTY scope
+// with parent=nil: the body is non-LATERAL, so a column reference is unresolved (42703/42P01) and an
+// aggregate is 42803; it still sees the statement's CTE bindings (an uncorrelated subquery inside a
+// value resolves like anywhere). Every row must have the same arity (42601); the columns' types
+// unify across rows like a set operation (42804 on a mismatch). A bind parameter is then noted at
+// its column's unified type (so VALUES (1),($1) types $1 as int); a column with no concrete type —
+// all NULL/param — leaves its $N untyped, surfacing 42P18 at finalize (jed's no-cross-context
+// inference posture, §26).
+func (db *Database) planValues(rows [][]*Expr, ctes []*cteBinding, ptypes *paramTypes) (*valuesPlan, error) {
+	arity := len(rows[0]) // the parser guarantees at least one row, each with at least one value
+	// The non-LATERAL constant scope: no local relations and no parent, so any column reference
+	// (outer, sibling, or the body's own) is unresolved; CTE bindings stay visible and subqueries
+	// are allowed (an uncorrelated one folds before the rows run).
+	s := &scope{parent: nil, catalog: db, allowSubquery: true, ctes: ctes}
+	resolvedRows := make([][]*rExpr, len(rows))
+	colTypes := make([]resolvedType, arity)
+	// Per column: the 0-based bind-parameter slots appearing in it, typed in a second pass from the
+	// unified column type (a $N takes its column's type, like a set-operation operand).
+	colParams := make([][]int, arity)
+	for ri, row := range rows {
+		if len(row) != arity {
+			return nil, NewError(SyntaxError, "VALUES lists must all be the same length")
+		}
+		resolvedRow := make([]*rExpr, arity)
+		for ci, val := range row {
+			node, ty, err := resolve(s, *val, nil, &aggCtx{}, ptypes) // forbidden: an aggregate is 42803
+			if err != nil {
+				return nil, err
+			}
+			if node.kind == reParam {
+				colParams[ci] = append(colParams[ci], node.index)
+			}
+			if ri == 0 {
+				colTypes[ci] = ty
+			} else {
+				u, err := unifyValuesColumn(colTypes[ci], ty)
+				if err != nil {
+					return nil, err
+				}
+				colTypes[ci] = u
+			}
+			resolvedRow[ci] = node
+		}
+		resolvedRows[ri] = resolvedRow
+	}
+	// Second pass: note each column's bind parameters at the unified column type. A column with no
+	// scalar type (all NULL/param) passes nil — the parameter stays untyped (42P18).
+	for ci := range colParams {
+		hint := scalarForParamHint(colTypes[ci])
+		for _, idx0 := range colParams[ci] {
+			if err := ptypes.note(idx0, hint); err != nil {
+				return nil, err
+			}
+		}
+	}
+	// PostgreSQL names a VALUES relation's columns column1, column2, … ; the derived table's optional
+	// column-rename list overrides them at the synthetic relation (cteSyntheticTable).
+	colNames := make([]string, arity)
+	for i := range colNames {
+		colNames[i] = fmt.Sprintf("column%d", i+1)
+	}
+	return &valuesPlan{rows: resolvedRows, columnTypes: colTypes, columnNames: colNames}, nil
+}
+
+// execValuesPlan executes a resolved VALUES-body relation (spec/design/grammar.md §42): evaluate
+// each row's values as constants over an EMPTY environment (no local row, no outer row —
+// non-LATERAL), coerce each to the unified column type (the only runtime change is int -> decimal,
+// the set-operation rule), and emit the rows. Charges row_produced per row plus each value's
+// operator_eval (the evaluator) — the derived table's intrinsic cost (cost.md §3), folded into the
+// caller's meter via execQueryPlan.
+func (db *Database) execValuesPlan(plan *valuesPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
+	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
+	meter := NewMeterWithLimit(db.maxCost)
+	rows := make([][]Value, 0, len(plan.rows))
+	for _, row := range plan.rows {
+		if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
+			return selectResult{}, err
+		}
+		meter.Charge(Costs.RowProduced)
+		out := make([]Value, len(plan.columnTypes))
+		for ci, e := range row {
+			v, err := e.eval(nil, env, meter)
+			if err != nil {
+				return selectResult{}, err
+			}
+			// Int -> decimal where the column unified to decimal (the set-operation rule); every
+			// other unified type is a value no-op (int-width promotion is free — all ints are int64).
+			if plan.columnTypes[ci].kind == rtDecimal && v.Kind == ValInt {
+				v = DecimalValue(DecimalFromInt64(v.Int))
+			}
+			out[ci] = v
+		}
+		rows = append(rows, out)
+	}
+	return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: rows, cost: meter.Accrued}, nil
+}
+
 // setopName is the operator's name for an error message (PostgreSQL phrasing).
 func setopName(op SetOpKind) string {
 	switch op {
@@ -3040,6 +3141,86 @@ func unifySetopColumn(a, b resolvedType, op SetOpKind) (resolvedType, error) {
 		return resolvedType{}, NewError(DatatypeMismatch, fmt.Sprintf(
 			"%s types %s and %s cannot be matched", setopName(op), rtName(a), rtName(b),
 		))
+	}
+}
+
+// unifyValuesColumn unifies two row value types for the SAME VALUES-body column
+// (spec/design/grammar.md §42), the set-operation rule (§25): integer widths widen, int+decimal ->
+// decimal, anything + NULL keeps the other, and a same-type scalar pair (text, bool, bytea, uuid, a
+// timestamp / timestamptz, an interval, a same-width float) unifies to itself; any other pair —
+// including a composite or array column across rows (a deferred edge) — is 42804. Enumerated
+// EXPLICITLY (not a generic same-kind passthrough) so all three cores compute byte-identical
+// results (CLAUDE.md §8).
+func unifyValuesColumn(a, b resolvedType) (resolvedType, error) {
+	switch {
+	case a.kind == rtNull && b.kind == rtNull:
+		return resolvedType{kind: rtNull}, nil
+	case a.kind == rtNull:
+		return b, nil
+	case b.kind == rtNull:
+		return a, nil
+	case a.kind == rtInt && b.kind == rtInt:
+		return resolvedType{kind: rtInt, intTy: promote(a, b)}, nil
+	case (a.kind == rtInt || a.kind == rtDecimal) && (b.kind == rtInt || b.kind == rtDecimal):
+		return resolvedType{kind: rtDecimal}, nil
+	case a.kind == rtText && b.kind == rtText,
+		a.kind == rtBool && b.kind == rtBool,
+		a.kind == rtBytea && b.kind == rtBytea,
+		a.kind == rtUuid && b.kind == rtUuid,
+		a.kind == rtTimestamp && b.kind == rtTimestamp,
+		a.kind == rtTimestamptz && b.kind == rtTimestamptz,
+		a.kind == rtInterval && b.kind == rtInterval,
+		a.kind == rtFloat32 && b.kind == rtFloat32,
+		a.kind == rtFloat64 && b.kind == rtFloat64:
+		return a, nil
+	default:
+		return resolvedType{}, NewError(DatatypeMismatch, fmt.Sprintf(
+			"VALUES types %s and %s cannot be matched", rtName(a), rtName(b),
+		))
+	}
+}
+
+// scalarForParamHint is the scalar type to note a bind parameter at, given its VALUES column's
+// unified type (spec/design/grammar.md §42). A scalar type flows through; a NULL / composite / array
+// column has no scalar parameter type, so nil is returned and the parameter stays untyped (42P18 at
+// finalize).
+func scalarForParamHint(rt resolvedType) *ScalarType {
+	switch rt.kind {
+	case rtInt:
+		t := rt.intTy // rtInt carries its width in intTy
+		return &t
+	case rtFloat32:
+		t := Float32
+		return &t
+	case rtFloat64:
+		t := Float64
+		return &t
+	case rtBool:
+		t := Bool
+		return &t
+	case rtText:
+		t := Text
+		return &t
+	case rtDecimal:
+		t := DecimalType
+		return &t
+	case rtBytea:
+		t := Bytea
+		return &t
+	case rtUuid:
+		t := Uuid
+		return &t
+	case rtTimestamp:
+		t := Timestamp
+		return &t
+	case rtTimestamptz:
+		t := Timestamptz
+		return &t
+	case rtInterval:
+		t := IntervalType
+		return &t
+	default:
+		return nil
 	}
 }
 
@@ -3200,15 +3381,26 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	for i, tref := range tableRefs {
 		var t *Table
 		var cteIdx *int
-		if tref.Subquery != nil {
-			// A DERIVED TABLE — `FROM (SELECT …) [AS] t`. Plan the body as an INDEPENDENT query
-			// (parent=nil: not correlated / not LATERAL — §42) that still inherits the statement's
-			// CTE bindings (cte.md §2), build its synthetic relation (the alias is the label; the
-			// optional column-rename list applies, 42P10 on overflow), and keep the plan for
-			// in-place execution.
-			plan, perr := db.planQuery(*tref.Subquery, nil, ctes, ptypes)
-			if perr != nil {
-				return nil, perr
+		if tref.Subquery != nil || tref.Values != nil {
+			// A DERIVED TABLE — `FROM (SELECT …) [AS] t` (a query_expr body) or `FROM (VALUES …) [AS]
+			// v` (a VALUES-body relation — §42). Plan the body as an INDEPENDENT query (parent=nil:
+			// not correlated / not LATERAL — §42) that still inherits the statement's CTE bindings
+			// (cte.md §2), build its synthetic relation (the alias is the label; the optional
+			// column-rename list applies, 42P10 on overflow), and keep the plan for in-place
+			// execution.
+			var plan queryPlan
+			if tref.Subquery != nil {
+				p, perr := db.planQuery(*tref.Subquery, nil, ctes, ptypes)
+				if perr != nil {
+					return nil, perr
+				}
+				plan = p
+			} else {
+				vp, verr := db.planValues(tref.Values, ctes, ptypes)
+				if verr != nil {
+					return nil, verr
+				}
+				plan = queryPlan{values: vp}
 			}
 			label := ""
 			if tref.Alias != nil {
@@ -4844,6 +5036,18 @@ func (db *Database) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes 
 	if plan.sel != nil {
 		return db.foldUncorrelatedInSelect(plan.sel, bound, ctes, cost)
 	}
+	if plan.values != nil {
+		// A VALUES-body value may itself hold an (uncorrelated) scalar subquery to fold once before
+		// the rows are produced (grammar.md §42; the §26 fold).
+		for r := range plan.values.rows {
+			for c := range plan.values.rows[r] {
+				if err := db.foldUncorrelatedInRExpr(plan.values.rows[r][c], bound, ctes, cost); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	}
 	if err := db.foldUncorrelatedInPlan(&plan.setop.lhs, bound, ctes, cost); err != nil {
 		return err
 	}
@@ -4995,6 +5199,18 @@ func queryPlanReferencesOuter(plan *queryPlan, depth int) bool {
 	if plan.sel != nil {
 		return selectPlanReferencesOuter(plan.sel, depth)
 	}
+	if plan.values != nil {
+		// A VALUES body is planned parent=nil, so its values hold no outer reference of their own; a
+		// folded-in subquery, however, may correlate to the target scope.
+		for r := range plan.values.rows {
+			for c := range plan.values.rows[r] {
+				if rexprReferencesOuter(plan.values.rows[r][c], depth) {
+					return true
+				}
+			}
+		}
+		return false
+	}
 	return queryPlanReferencesOuter(&plan.setop.lhs, depth) || queryPlanReferencesOuter(&plan.setop.rhs, depth)
 }
 
@@ -5134,6 +5350,13 @@ func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
 		}
 		for _, p := range sp.projections {
 			collectTouched(p, depth, touched)
+		}
+	}
+	if plan.values != nil {
+		for r := range plan.values.rows {
+			for c := range plan.values.rows[r] {
+				collectTouched(plan.values.rows[r][c], depth, touched)
+			}
 		}
 	}
 	if plan.setop != nil {
@@ -5942,8 +6165,9 @@ type rSubscript struct {
 // queryPlan is a resolved query expression: a SELECT plan or a set-op plan (mirrors QueryExpr).
 // Exactly one of sel / setop is non-nil.
 type queryPlan struct {
-	sel   *selectPlan
-	setop *setOpPlan
+	sel    *selectPlan
+	setop  *setOpPlan
+	values *valuesPlan
 }
 
 // columnTypes returns the plan's output column types (for a subquery's plan-time column-count
@@ -5951,6 +6175,9 @@ type queryPlan struct {
 func (p *queryPlan) columnTypes() []resolvedType {
 	if p.sel != nil {
 		return p.sel.columnTypes
+	}
+	if p.values != nil {
+		return p.values.columnTypes
 	}
 	return p.setop.columnTypes
 }
@@ -5961,7 +6188,22 @@ func (p *queryPlan) columnNames() []string {
 	if p.sel != nil {
 		return p.sel.columnNames
 	}
+	if p.values != nil {
+		return p.values.columnNames
+	}
 	return p.setop.columnNames
+}
+
+// valuesPlan is a resolved VALUES-body relation (spec/design/grammar.md §42), executable to its
+// literal rows — the FROM-position sibling of INSERT … VALUES. rows[r][c] is row r, column c, each
+// resolved as a CONSTANT (the body is non-LATERAL, planned parent=nil, so it reads no row).
+// columnTypes is the per-column type unified across the rows like a set operation (§25), and
+// columnNames is column1, column2, … (PostgreSQL; the derived table's optional column-rename list
+// overrides them at the synthetic relation). All rows have len(columnTypes) values.
+type valuesPlan struct {
+	rows        [][]*rExpr
+	columnTypes []resolvedType
+	columnNames []string
 }
 
 // cteMode is how a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE

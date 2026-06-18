@@ -2376,9 +2376,9 @@ export class Database {
   // rows, innermost last; empty at top level), the bound parameters, and the CTE context (a FROM
   // reference at any depth delivers a CTE's rows — spec/design/cte.md §5).
   private execQueryPlan(plan: QueryPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
-    return plan.kind === "select"
-      ? this.execSelectPlan(plan, outer, params, ctes)
-      : this.execSetOpPlan(plan, outer, params, ctes);
+    if (plan.kind === "select") return this.execSelectPlan(plan, outer, params, ctes);
+    if (plan.kind === "values") return this.execValuesPlan(plan, outer, params, ctes);
+    return this.execSetOpPlan(plan, outer, params, ctes);
   }
 
   // planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
@@ -2446,6 +2446,88 @@ export class Database {
     return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows, cost };
   }
 
+  // planValues resolves a VALUES-body relation into a ValuesPlan (spec/design/grammar.md §42) — the
+  // body of a FROM (VALUES …) derived table. Each value resolves as a CONSTANT against an EMPTY
+  // scope with parent=null: the body is non-LATERAL, so a column reference is unresolved
+  // (42703/42P01) and an aggregate is 42803; it still sees the statement's CTE bindings (an
+  // uncorrelated subquery inside a value resolves like anywhere). Every row must have the same arity
+  // (42601); the columns' types unify across rows like a set operation (42804 on a mismatch). A bind
+  // parameter is then noted at its column's unified type (so VALUES (1),($1) types $1 as int); a
+  // column with no concrete type — all NULL/param — leaves its $N untyped, surfacing 42P18 at
+  // finalize (jed's no-cross-context inference posture, §26).
+  private planValues(rows: Expr[][], ctes: CteBinding[], ptypes: ParamTypes): ValuesPlan {
+    const arity = rows[0]!.length; // the parser guarantees at least one row, each with ≥1 value
+    // The non-LATERAL constant scope: no local relations and no parent, so any column reference
+    // (outer, sibling, or the body's own) is unresolved; CTE bindings stay visible and subqueries
+    // are allowed (an uncorrelated one folds before the rows run).
+    const scope = new Scope([], this, null, true, ctes);
+    const resolvedRows: RExpr[][] = [];
+    const colTypes: ResolvedType[] = [];
+    // Per column: the 0-based bind-parameter slots in it, typed in a second pass from the unified
+    // column type (a $N takes its column's type, like a set-operation operand).
+    const colParams: number[][] = Array.from({ length: arity }, () => []);
+    rows.forEach((row, ri) => {
+      if (row.length !== arity) {
+        throw engineError("syntax_error", "VALUES lists must all be the same length");
+      }
+      const resolvedRow: RExpr[] = [];
+      row.forEach((val, ci) => {
+        // Forbidden aggregate context: an aggregate inside a value is 42803.
+        const { node, type } = resolve(scope, val, null, { collecting: false, groupKeys: [], specs: [] }, ptypes);
+        if (node.kind === "param") colParams[ci]!.push(node.index);
+        if (ri === 0) colTypes.push(type);
+        else colTypes[ci] = unifyValuesColumn(colTypes[ci]!, type);
+        resolvedRow.push(node);
+      });
+      resolvedRows.push(resolvedRow);
+    });
+    // Second pass: note each column's bind parameters at the unified column type. A column with no
+    // scalar type (all NULL/param) passes null — the parameter stays untyped (42P18).
+    for (let ci = 0; ci < arity; ci++) {
+      const hint = scalarForParamHint(colTypes[ci]!);
+      for (const idx0 of colParams[ci]!) ptypes.note(idx0, hint);
+    }
+    // PostgreSQL names a VALUES relation's columns column1, column2, … ; the derived table's optional
+    // column-rename list overrides them at the synthetic relation (cteSyntheticTable).
+    const columnNames = Array.from({ length: arity }, (_, i) => `column${i + 1}`);
+    return { kind: "values", rows: resolvedRows, columnTypes: colTypes, columnNames };
+  }
+
+  // execValuesPlan executes a resolved VALUES-body relation (spec/design/grammar.md §42): evaluate
+  // each row's values as constants over an EMPTY environment (no local row, no outer row —
+  // non-LATERAL), coerce each to the unified column type (the only runtime change is int → decimal,
+  // the set-operation rule), and emit the rows. Charges rowProduced per row plus each value's
+  // operatorEval (the evaluator) — the derived table's intrinsic cost (cost.md §3), folded into the
+  // caller's meter via execQueryPlan.
+  private execValuesPlan(plan: ValuesPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
+    const env: EvalEnv = {
+      params,
+      outer,
+      runSubquery: (p, o) => this.execQueryPlan(p, o, params, ctes),
+      seam: this.seam,
+      rng: new StmtRng(),
+      ctes,
+    };
+    const meter = new Meter(this.maxCost);
+    const rows: Value[][] = [];
+    for (const row of plan.rows) {
+      meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
+      meter.charge(COSTS.rowProduced);
+      const out: Value[] = [];
+      for (let ci = 0; ci < plan.columnTypes.length; ci++) {
+        let v = evalExpr(row[ci]!, [], env, meter);
+        // int → decimal where the column unified to decimal (the set-operation rule); every other
+        // unified type is a value no-op (int-width promotion is free — all ints are bigint).
+        if (plan.columnTypes[ci]!.kind === "decimal" && v.kind === "int") {
+          v = decimalValue(Decimal.fromBigInt(v.int));
+        }
+        out.push(v);
+      }
+      rows.push(out);
+    }
+    return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows, cost: meter.accrued };
+  }
+
   // runSelect resolves projected columns and the WHERE/ORDER BY columns against the catalog,
   // scans in primary-key order, filters (three-valued — only TRUE keeps a row), optionally
   // re-sorts by ORDER BY, then projects. Returns the rows with each output column's NAME and
@@ -2478,12 +2560,16 @@ export class Database {
       let srf: SrfPlan | undefined;
       let cteIdx: number | undefined;
       let derived: QueryPlan | undefined;
-      if (tref.subquery !== undefined) {
-        // A DERIVED TABLE — `FROM (SELECT …) [AS] t`. Plan the body as an INDEPENDENT query
-        // (parent=null: not correlated / not LATERAL — §42) that still inherits the statement's CTE
-        // bindings (cte.md §2), build its synthetic relation (the alias is the label; the optional
-        // column-rename list applies, 42P10 on overflow), and keep the plan for in-place execution.
-        const plan = this.planQuery(tref.subquery, null, ctes, ptypes);
+      if (tref.subquery !== undefined || tref.values !== undefined) {
+        // A DERIVED TABLE — `FROM (SELECT …) [AS] t` (a query_expr body) or `FROM (VALUES …) [AS] v`
+        // (a VALUES-body relation — §42). Plan the body as an INDEPENDENT query (parent=null: not
+        // correlated / not LATERAL — §42) that still inherits the statement's CTE bindings (cte.md
+        // §2), build its synthetic relation (the alias is the label; the optional column-rename list
+        // applies, 42P10 on overflow), and keep the plan for in-place execution.
+        const plan =
+          tref.subquery !== undefined
+            ? this.planQuery(tref.subquery, null, ctes, ptypes)
+            : this.planValues(tref.values!, ctes, ptypes);
         const label = tref.alias === null ? "" : tref.alias.toLowerCase();
         t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
         derived = plan;
@@ -3300,6 +3386,16 @@ export class Database {
       this.foldUncorrelatedInSelect(plan, bound, ctes, cost);
       return;
     }
+    if (plan.kind === "values") {
+      // A VALUES-body value may itself hold an (uncorrelated) scalar subquery to fold once before
+      // the rows are produced (grammar.md §42; the §26 fold).
+      for (const row of plan.rows) {
+        for (let c = 0; c < row.length; c++) {
+          row[c] = this.foldUncorrelatedInRExpr(row[c]!, bound, ctes, cost);
+        }
+      }
+      return;
+    }
     this.foldUncorrelatedInPlan(plan.lhs, bound, ctes, cost);
     this.foldUncorrelatedInPlan(plan.rhs, bound, ctes, cost);
   }
@@ -3828,6 +3924,12 @@ function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
   if (plan.kind === "setOp") {
     return queryPlanReferencesOuter(plan.lhs, depth) || queryPlanReferencesOuter(plan.rhs, depth);
   }
+  if (plan.kind === "values") {
+    // A VALUES body is planned parent=null, so its values hold no outer reference of their own; a
+    // folded-in subquery, however, may correlate to the target scope.
+    for (const row of plan.rows) for (const e of row) if (rexprReferencesOuter(e, depth)) return true;
+    return false;
+  }
   for (const j of plan.joins) if (j.on !== null && rexprReferencesOuter(j.on, depth)) return true;
   if (plan.filter !== null && rexprReferencesOuter(plan.filter, depth)) return true;
   if (plan.having !== null && rexprReferencesOuter(plan.having, depth)) return true;
@@ -3985,6 +4087,8 @@ function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]):
     if (plan.having !== null) collectTouched(plan.having, depth, touched);
     for (const s of plan.aggSpecs) if (s.operand !== null) collectTouched(s.operand, depth, touched);
     for (const p of plan.projections) collectTouched(p, depth, touched);
+  } else if (plan.kind === "values") {
+    for (const row of plan.rows) for (const e of row) collectTouched(e, depth, touched);
   } else {
     collectTouchedPlan(plan.lhs, depth, touched);
     collectTouchedPlan(plan.rhs, depth, touched);
@@ -4426,8 +4530,22 @@ type SetOpPlan = {
   offset: bigint | null;
 };
 
-// QueryPlan is a resolved query expression: a SELECT plan or a set-op plan (mirrors QueryExpr).
-type QueryPlan = SelectPlan | SetOpPlan;
+// ValuesPlan is a resolved VALUES-body relation (spec/design/grammar.md §42), executable to its
+// literal rows — the FROM-position sibling of INSERT … VALUES. rows[r][c] is row r, column c, each
+// resolved as a CONSTANT (the body is non-LATERAL, planned parent=null, so it reads no row).
+// columnTypes is the per-column type unified across the rows like a set operation (§25), and
+// columnNames is column1, column2, … (PostgreSQL; the derived table's optional column-rename list
+// overrides them at the synthetic relation). All rows have columnTypes.length values.
+type ValuesPlan = {
+  kind: "values";
+  rows: RExpr[][];
+  columnTypes: ResolvedType[];
+  columnNames: string[];
+};
+
+// QueryPlan is a resolved query expression: a SELECT plan, a set-op plan, or a VALUES-body relation
+// (mirrors QueryExpr's bodies). A VALUES plan is only ever produced as a derived-table body.
+type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan;
 
 // CteMode is how a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE
 // from its reference count and [NOT] MATERIALIZED hint: a single-reference CTE is "inline", a
@@ -8185,6 +8303,67 @@ function setopName(op: SetOpKind): string {
 // — PostgreSQL would call a top-level one text, but the type is never observed in output); a
 // same-family non-numeric pair gives that type; anything else is 42804. The set of unifiable pairs
 // mirrors the comparability matrix (compare.toml).
+// unifyValuesColumn unifies two row value types for the SAME VALUES-body column
+// (spec/design/grammar.md §42), the set-operation rule (§25): integer widths widen, int+decimal ->
+// decimal, anything + NULL keeps the other, and a same-type scalar pair (text, boolean, bytea, uuid,
+// a timestamp / timestamptz, an interval, a same-width float) unifies to itself; any other pair —
+// including a composite or array column across rows (a deferred edge) — is 42804. Enumerated
+// EXPLICITLY (not a generic same-kind passthrough) so all three cores compute byte-identical
+// results (CLAUDE.md §8).
+function unifyValuesColumn(a: ResolvedType, b: ResolvedType): ResolvedType {
+  if (a.kind === "null" && b.kind === "null") return { kind: "null" };
+  if (a.kind === "null") return b;
+  if (b.kind === "null") return a;
+  if (a.kind === "int" && b.kind === "int") return { kind: "int", ty: promote(a, b) };
+  if ((a.kind === "int" || a.kind === "decimal") && (b.kind === "int" || b.kind === "decimal")) {
+    return { kind: "decimal" };
+  }
+  if (a.kind === "float" && b.kind === "float" && a.ty === b.ty) return a;
+  if (
+    a.kind === b.kind &&
+    (a.kind === "text" ||
+      a.kind === "bool" ||
+      a.kind === "bytea" ||
+      a.kind === "uuid" ||
+      a.kind === "timestamp" ||
+      a.kind === "timestamptz" ||
+      a.kind === "interval")
+  ) {
+    return a;
+  }
+  throw engineError("datatype_mismatch", `VALUES types ${rtName(a)} and ${rtName(b)} cannot be matched`);
+}
+
+// scalarForParamHint is the scalar type to note a bind parameter at, given its VALUES column's
+// unified type (spec/design/grammar.md §42). A scalar type flows through; a NULL / composite / array
+// column has no scalar parameter type, so null is returned and the parameter stays untyped (42P18 at
+// finalize).
+function scalarForParamHint(rt: ResolvedType): ScalarType | null {
+  switch (rt.kind) {
+    case "int":
+    case "float":
+      return rt.ty;
+    case "bool":
+      return "boolean";
+    case "text":
+      return "text";
+    case "decimal":
+      return "decimal";
+    case "bytea":
+      return "bytea";
+    case "uuid":
+      return "uuid";
+    case "timestamp":
+      return "timestamp";
+    case "timestamptz":
+      return "timestamptz";
+    case "interval":
+      return "interval";
+    default:
+      return null;
+  }
+}
+
 function unifySetopColumn(a: ResolvedType, b: ResolvedType, op: SetOpKind): ResolvedType {
   if (a.kind === "null" && b.kind === "null") return { kind: "null" };
   if (a.kind === "null") return b;

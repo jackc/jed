@@ -269,12 +269,20 @@ type Delete struct {
 // always-inlined single-reference CTE: the planner reuses the CTE synthetic-relation seam. Its alias
 // is OPTIONAL (PG 18); when present it is the label and ColumnAliases is the optional column-rename
 // list, when absent Name/Alias are empty and the relation has no qualifier.
+// Values carries a VALUES-body derived table — FROM (VALUES (e11,…),(e21,…)) AS v(c1,…)
+// (spec/design/grammar.md §42): a parenthesized VALUES list used as a relation, a computed
+// relation of literal rows. It is the FROM-position alternative body to Subquery (the two are
+// mutually exclusive — at most one is non-nil on a derived table). Each value is a general
+// constant expression (resolved parent=nil, non-LATERAL); the rows share arity and the columns'
+// types unify across rows like a set operation. The outer slice is the rows, each inner slice one
+// row's values, left to right.
 type TableRef struct {
 	Name          string
 	Alias         *string
 	IsFunc        bool
 	Args          []*Expr
 	Subquery      *QueryExpr
+	Values        [][]*Expr
 	ColumnAliases []string
 }
 
