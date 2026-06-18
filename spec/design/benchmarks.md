@@ -21,8 +21,11 @@ is thus also a small differential test.
 
 Non-goals: micro-benchmarks of internal functions (use `cargo bench`/`testing.B` ad hoc
 if needed), benchmarking the deterministic *cost* units (cost is asserted exactly in the
-conformance corpus — `spec/design/cost.md`), and load/concurrency testing (a backfill
-candidate once `SharedDb` is file-backed — §11).
+conformance corpus — `spec/design/cost.md`), and *wall-clock* load/concurrency testing
+(a backfill candidate once `SharedDb` is file-backed — §11). **Correctness**-under-concurrency
+*is* covered, by a sibling bench-family harness: the Layer 3 stress runner
+(`spec/design/concurrency-testing.md` §6) shares these modules' machinery (the splitmix64 PRNG,
+the FNV-1a answer checksum) via a `stress` binary per core, run by `rake stress` — see §2.
 
 ## 2. Layout
 
@@ -33,8 +36,11 @@ bench/
   go/                      # Go harness module (jed-bench) — own go.mod, never impl/go's
   rust/                    # Rust harness package (jed-bench) — own Cargo.toml, never impl/rust's
   ts/                      # TS harness package — own package.json, never impl/ts's
+  go/cmd/stress, rust/src/bin/stress.rs, ts/src/stress.ts   # Layer 3 concurrency-stress runner
+                           #   (concurrency-testing.md §6); reuses the PRNG + checksum below
   data/                    # GITIGNORED: generated {small,large}.{jed,sqlite} + *.fingerprint
-  results/                 # GITIGNORED: <UTC-stamp>/<lang>-<binary>.jsonl per run
+  results/                 # GITIGNORED: <UTC-stamp>/<lang>-<binary>.jsonl per run (+ stress/)
+stress/*.stress.toml       # Layer 3 stress workloads (run by `rake stress`)
 scripts/bench_report.rb    # aggregator (rake bench:report)
 ```
 

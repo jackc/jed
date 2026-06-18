@@ -26,3 +26,9 @@ path = "src/bin/bench_pg.rs"
 [[bin]]
 name = "bench-sqlite"
 path = "src/bin/bench_sqlite.rs"
+
+# Layer 3 concurrency-stress runner (spec/design/concurrency-testing.md §6). In the bench package
+# so it reuses the shared splitmix64 PRNG + FNV-1a answer checksum; run via `rake stress`.
+[[bin]]
+name = "stress"
+path = "src/bin/stress.rs"

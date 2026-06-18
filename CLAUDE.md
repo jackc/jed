@@ -285,14 +285,19 @@ This is the spine of the project. Treat it as the contract, not an afterthought.
   same order under a race detector). It runs *inside* `rake ci` via the capability gate
   (`txn.shared`/`txn.read_handle`/`txn.watermark`/`txn.gate_blocking`). True-parallelism **stress**
   (random schedule, invariant-checked) is the separate bench-family Layer 3, *outside* `rake ci`.
-  **Landed: Layers 1–2, all three cores** (stepped-sequential everywhere = the canonical result; the
-  opt-in stepped-threaded mode on Go + Rust, one thread/goroutine per session under a turn token, run
-  under the race detector by `rake concurrency:race`). Layer 2 adds the write-gate `open <sid> write
-  blocks` annotation: a writer-open on the held single-writer gate, deferred to the gate-releasing
-  step (the equivalent serial order) — and on Go/Rust the queued writer's thread parks inside the
-  real `write()` on the gate under the race detector, the one concurrency path the sequential walk
-  never exercises. This is what pulls concurrency — previously per-core hand-mirrored tests — back
-  into the §2 differential net.
+  **Landed: Layers 1–3, all three cores.** Layers 1–2 run *inside* `rake ci` (stepped-sequential
+  everywhere = the canonical result; the opt-in stepped-threaded mode on Go + Rust, one
+  thread/goroutine per session under a turn token, run under the race detector by `rake
+  concurrency:race`). Layer 2 adds the write-gate `open <sid> write blocks` annotation: a writer-open
+  on the held single-writer gate, deferred to the gate-releasing step (the equivalent serial order) —
+  and on Go/Rust the queued writer's thread parks inside the real `write()` on the gate under the race
+  detector, the one concurrency path the sequential walk never exercises. This is what pulls
+  concurrency — previously per-core hand-mirrored tests — back into the §2 differential net.
+  **Layer 3 (`rake stress`)** is the bench-family parallel-stress harness, *outside* `rake ci`:
+  `stress/*.stress.toml` workloads (concurrent writers + readers, no fixed order) run by one stress
+  binary per core in the `bench/` modules (reusing the splitmix64 PRNG + FNV answer checksum), checked
+  by per-snapshot invariants + a confluent final-state checksum that must agree across cores (Go under
+  `-race`, Rust over real threads, TS via a seeded-sequential interleaver).
 - **Bootstrap the corpus via differential testing against PostgreSQL.** The real PG
   service is the **result oracle** (§1): run a supported-subset query against it, capture
   output, emit a corpus entry. Generates a large, *correct* corpus cheaply. Where our

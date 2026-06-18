@@ -538,10 +538,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       concurrency path the sequential walk never exercises. At most one writer blocked at a time
       (single-writer model). Three schedules now (`snapshot_isolation`/`watermark_refcount`/`gate_blocking`).
       → [concurrency-testing.md §5](spec/design/concurrency-testing.md)
-  - [ ] _follow-on — Layer 3 (parallel stress):_ `stress/*.stress.toml` + `rake stress`, bench-family
-        (outside `rake ci`); per-snapshot invariants + confluent final-state cross-core checksum; seeded
-        sequential fallback on single-thread cores. Highest payoff once file-backed sharing is wired.
-        → [concurrency-testing.md §6](spec/design/concurrency-testing.md)
+- [x] **P5.4 (Layer 3) — the parallelism-stress format** — `stress/*.stress.toml` + `rake stress`,
+      bench-family (OUTSIDE `rake ci`, timing-nondeterministic but answer-checked). A workload of
+      concurrent writers + readers with NO fixed order; correctness by INVARIANTS, not a transcript:
+      a per-snapshot invariant (`sum(bal)==1000` on every reader snapshot — torn-read / isolation /
+      watermark bug → wrong sum), a confluent final state (exact rows + the lost-update check), and a
+      cross-core final-state checksum that must agree across cores regardless of mode. One stress
+      binary per core in the `bench/` modules (reusing the splitmix64 PRNG + FNV-1a answer checksum,
+      no new dependency): **Go under `-race`** (one goroutine per worker), **Rust over real OS
+      threads** (Send + Sync), **TS via a seeded-sequential interleaver** (the single-thread fallback —
+      deterministic given the seed, never truly blocks). First file: `stress/balance_transfer.stress.toml`;
+      all three cores agree on the checksum. Highest payoff once file-backed sharing is wired.
+      → [concurrency-testing.md §6](spec/design/concurrency-testing.md)
 
 ---
 

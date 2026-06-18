@@ -1,0 +1,40 @@
+# Layer 3 parallelism-stress corpus (spec/design/concurrency-testing.md §6). Unlike the Layer 1/2
+# `# format: concurrency` schedules, a stress file has NO explicit order: writers and readers run
+# concurrently (real threads on Go/Rust; a seeded sequential interleaver on TS), and correctness is
+# checked by INVARIANTS, not an exact transcript. This is bench-family (outside `rake ci`); run it
+# with `rake stress`.
+#
+# The classic non-oracle concurrency check: concurrent transfers between two accounts must keep the
+# total balance constant on EVERY reader snapshot (commit atomicity across handles + snapshot
+# isolation), and — the workload being confluent — the final state is schedule-independent, so the
+# final rows (and their cross-core checksum) are pinned exactly.
+
+[meta]
+name        = "balance-transfer-sum-invariant"
+description = "Concurrent transfers keep total balance constant on every snapshot"
+parallel    = "optional"   # optional → seeded-sequential fallback on the single-thread TS core
+seed        = 1234         # drives the fallback interleaver (a fixed-op workload has no other randomness)
+
+[setup]                    # run once, deterministically, before any worker starts
+sql = [
+  "CREATE TABLE acct (id int32 PRIMARY KEY, bal int64)",
+  "INSERT INTO acct VALUES (1, 1000), (2, 0)",
+]
+
+[[worker]]                 # four writers contend on the single-writer gate; 4 × 250 = 1000 transfers
+kind = "writer"
+count = 4
+iterations = 250
+op = "BEGIN; UPDATE acct SET bal = bal - 1 WHERE id = 1; UPDATE acct SET bal = bal + 1 WHERE id = 2; COMMIT;"
+
+[[worker]]                 # eight readers assert the sum invariant on every snapshot they pin
+kind = "reader"
+count = 8
+iterations = 500
+invariant_query  = "SELECT sum(bal) FROM acct"
+invariant_expect = "1000"  # must hold on every snapshot — torn read / isolation / watermark bug → wrong sum
+
+[final]                    # confluent workload → schedule-independent final state (also the lost-update check)
+query  = "SELECT id, bal FROM acct ORDER BY id"
+expect = [[1, 0], [2, 1000]]
+cross_core_checksum = true # the final committed image's answer checksum must match across all cores

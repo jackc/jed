@@ -55,8 +55,10 @@ than exact transcripts.
 
 Layers 1–2 join the differential contract. Layer 3 belongs to the benchmarks family
 ([benchmarks.md](benchmarks.md)): nondeterministic schedule, deterministic *checked answer*.
-**Layers 1–2 have landed on all three cores** (stepped-sequential everywhere; the stepped-threaded
-mode on Go and Rust); **Layer 3 is specified here as a follow-on.**
+**All three layers have landed.** Layers 1–2 run on all three cores (stepped-sequential everywhere;
+the stepped-threaded mode on Go and Rust). **Layer 3** (§6) lands as `stress/*.stress.toml` + `rake
+stress`, **outside `rake ci`** (bench-family), with real-threads workers on Go (under the race
+detector) and Rust and a seeded-sequential interleaver on TS.
 
 ## 4. Layer 1 — the deterministic schedule format
 
@@ -201,11 +203,12 @@ Forward-compatible: if the model ever grows row-level locks or multiple writers,
 release generalizes (the one-blocked-writer bound lifts), and a release that never arrives becomes a
 deadlock assertion. Gated by the `txn.gate_blocking` capability.
 
-## 6. Layer 3 — the parallelism stress format (follow-on)
+## 6. Layer 3 — the parallelism stress format (landed)
 
 Non-deterministic schedule, real threads on Rust/Go, **invariants** instead of exact
-transcripts. Belongs to the benchmarks family ([benchmarks.md](benchmarks.md)): outside `rake
-ci`, but its answers are still checked. TOML fits its programmatic shape:
+transcripts. Belongs to the benchmarks family ([benchmarks.md](benchmarks.md)): **outside `rake
+ci`** (registered as timing-nondeterministic, like `bench/` — §8), but its answers are still
+checked, loudly. TOML fits its programmatic shape; files live in `stress/*.stress.toml`:
 
 ```toml
 [meta]
@@ -214,7 +217,7 @@ description = "Concurrent transfers keep total balance constant on every snapsho
 parallel    = "optional"   # optional → seeded-sequential fallback on single-thread cores; required → skip
 seed        = 1234         # drives the fallback scheduler and any workload randomness
 
-[setup]                    # run once, deterministically
+[setup]                    # run once, deterministically (whole-image autocommit, before any worker)
 sql = [
   "CREATE TABLE acct (id int32 PRIMARY KEY, bal int64)",
   "INSERT INTO acct VALUES (1, 1000), (2, 0)",
@@ -239,6 +242,16 @@ expect = [[1, 0], [2, 1000]]
 cross_core_checksum = true  # final committed image byte-identical across cores
 ```
 
+A **writer** worker runs `iterations` transactions; each takes the single-writer gate
+(`SharedDb.write()` — which **blocks** on a held gate in Go/Rust, real contention), runs `op`,
+and commits. `op`'s `BEGIN`/`COMMIT` are the transaction *markers*: the runner maps them onto the
+handle's open/commit (it strips bare `BEGIN`/`COMMIT`/`ROLLBACK` and runs the inner statements in
+the one write transaction). A **reader** worker runs `iterations` snapshots; each opens a read
+handle (`SharedDb.read()` — never blocks), runs `invariant_query`, asserts it renders
+`invariant_expect`, and closes (advancing the watermark). Both kinds render integer columns
+(the value/checksum surface Layer 3 needs today; the bench FNV-1a answer checksum, benchmarks.md
+§6, folds them).
+
 Three checks, increasing in strength:
 
 1. **Per-snapshot invariant** — an answer known by construction (SQLancer-style, no oracle).
@@ -247,21 +260,52 @@ Three checks, increasing in strength:
    bug), which would surface here as a wrong sum.
 2. **Confluent final state** — when the author designs the workload so the result is
    order-independent (disjoint-id inserts, uniform increments), assert exact final rows *and*
-   cross-core byte-identity via the file-format checksum (the §10 benchmarks mechanism).
-   Non-confluent workloads drop to invariant-only.
-3. **In-process** — Rust/Go run it under the race detector; the harness flags any worker that
-   deadlocks (timeout) or any commit-count mismatch (lost update).
+   cross-core byte-identity via the answer checksum (the §10 benchmarks mechanism). Because the
+   workload is confluent, **every core agrees on the final checksum regardless of mode** (real
+   threads or the seeded interleaver) — `rake stress` cross-checks it and fails on any
+   disagreement. The exact `[final].expect` rows also encode the **lost-update** check: 1000
+   transfers must have moved 1000 from acct 1 to acct 2. Non-confluent workloads drop to
+   invariant-only (`final.expect` omitted).
+3. **In-process under the race detector** — Go runs it under `-race` (one goroutine per worker
+   over the shared handle), Rust over real OS threads (proving `Send`/`Sync`; TSan optional);
+   the harness flags any worker that deadlocks via a per-run **timeout watchdog**.
 
-**Fallback** (`parallel = "optional"`): a single-threaded core runs the same worker
-definitions through a **seeded pseudo-random sequential interleaver** (deterministic given
-`seed`) — reproducing the logical interleavings (so it still catches isolation/atomicity/
-visibility bugs) while honestly not exercising CPU parallelism or memory races (which a
-single-threaded Worker cannot have). `parallel = "required"` skips on such cores, reported as
-skipped (no silent cap — CLAUDE.md §8).
+### Execution modes
+
+Each core runs a stress file one of two ways, both driving the *same* worker definitions:
+
+- **threaded** (Go/Rust, `parallel != "skip"`) — spawn `count` real threads/goroutines per
+  worker block, all running concurrently; writers contend on the gate for real, readers pin
+  snapshots for real. The OS schedules the interleaving; the seed is unused (a fixed-`op`
+  workload has no per-iteration randomness yet). A watchdog times the whole fan-out out.
+- **seeded-sequential** (TS always; any core, on request) — a **deterministic interleaver**: the
+  workers are flattened to a fixed index order, each modeled as a program of atomic ops (writer:
+  `acquire · exec… · commit`; reader: `open · check · close`), and at each step the
+  shared splitmix64(`seed`) stream picks the next *runnable* worker (an `acquire` is runnable only
+  while the gate is free — single-writer — so the interleaver never needs to block, the property
+  that lets the single-threaded TS core run it at all). It reproduces the logical interleavings
+  (so it still catches isolation/atomicity/visibility bugs) while honestly **not** exercising CPU
+  parallelism or memory races (which a single-threaded Worker cannot have). It is deterministic
+  given `seed`, so a sequential run is reproducible. `parallel = "required"` **skips** on a
+  single-thread core, reported as skipped (no silent cap — CLAUDE.md §8).
+
+### Where it lives
+
+Layer 3 is bench-family, so its runner reuses the bench modules' machinery rather than the
+conformance harness: one stress binary per core (`bench/go/cmd/stress`,
+`bench/rust/src/bin/stress.rs`, `bench/ts/src/stress.ts`) over the shared splitmix64 PRNG, the
+FNV-1a answer checksum, and the TOML parser those modules already carry (no new dependency, no
+new module, no core-manifest change — benchmarks.md §7). Each binary parses `stress/*.stress.toml`,
+runs every file in its native mode, and emits one JSONL result line per file (name, lang, mode,
+status, invariant-check count, final-ok, checksum). `rake stress` builds + runs all three
+(Go under `-race`) and aggregates: any `fail` fails the task, and for a `cross_core_checksum`
+file the passing cores' checksums must all match.
 
 Layer 3's real payoff arrives once **file-backed sharing** lands (transactions.md §8 / the
 shared-handle persist wiring): today, in-memory, the free-list-reuse-vs-live-reader path does
-not run, and that contended path is exactly where a stress harness earns its keep.
+not run, and that contended path is exactly where a stress harness earns its keep. Until then it
+already exercises commit atomicity across handles, snapshot isolation under contention, and the
+watermark — the in-memory subset — across the real concurrent code paths.
 
 ## 7. The per-core harness interface
 
@@ -315,5 +359,11 @@ the "spec is the contract" net, Layer 3 inside the "checked-answer benchmarks" n
   step (the canonical, timing-free result); Go and Rust additionally park the queued writer's thread
   inside the real `write()` on the held gate under the race detector (`rake concurrency:race`),
   verifying the open had not returned before the release. First file: `gate_blocking.test`.
-- **Layer 3 — specified (§6), not built.** Lands as `stress/` + `rake stress`, most valuable
-  once file-backed sharing is wired.
+- **Layer 3 — landed (bench-family, outside `rake ci`).** The `stress/*.stress.toml` format, a
+  stress binary per core (`bench/{go,rust,ts}` — reusing the bench splitmix64 PRNG + FNV-1a answer
+  checksum + TOML parser, §6), and the `rake stress` task that cross-checks the confluent final
+  checksum across cores. Go runs under `-race` (one goroutine per worker), Rust over real OS
+  threads, TS via the seeded-sequential interleaver. First file:
+  `stress/balance_transfer.stress.toml` (the balance-transfer sum invariant + confluent final
+  state). Most valuable once file-backed sharing is wired (§6), but already exercises commit
+  atomicity, snapshot isolation under contention, and the watermark over the real concurrent paths.

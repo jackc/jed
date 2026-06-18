@@ -356,6 +356,67 @@ namespace :bench do
   end
 end
 
+# stress — Layer 3 of the concurrency contract (spec/design/concurrency-testing.md §6): the
+# parallelism-stress suite. Like `bench:*` it is bench-family — DELIBERATELY OUTSIDE `rake ci`
+# (timing-nondeterministic schedule), but its ANSWERS are still checked: every core runs each
+# `stress/*.stress.toml` and emits a confluent final-state checksum, and aggregate_stress fails on
+# any per-core failure OR any cross-core checksum disagreement. Go runs under `-race` (one goroutine
+# per worker over the shared handle), Rust over real OS threads, TS via the seeded interleaver.
+STRESS_DIR = File.join(__dir__, "stress")
+
+# aggregate_stress reads every core's JSONL result file, prints a per-file matrix, and aborts on a
+# failure or a cross-core checksum disagreement (the one thing no single core can catch on its own).
+def aggregate_stress(dir)
+  require "json"
+  results = Dir[File.join(dir, "*.jsonl")].sort.flat_map do |f|
+    File.readlines(f, chomp: true).reject(&:empty?).map { |l| JSON.parse(l) }
+  end
+  failures = []
+  results.group_by { |r| r["name"] }.sort.each do |name, rows|
+    puts "  #{name}"
+    rows.sort_by { |r| r["lang"] }.each do |r|
+      status = r["status"].upcase
+      detail = r["status"] == "pass" ? "checksum=#{r['checksum']} checks=#{r['invariant_checks']}" : r["error"].to_s
+      puts format("    %-6s %-12s %-12s %s", r["lang"], status, r["mode"], detail)
+      failures << "#{r['lang']}/#{name}: #{r['error']}" if r["status"] == "fail"
+    end
+    # Cross-core agreement: a confluent workload's final checksum must match across every passing
+    # core, regardless of mode (real threads vs. the interleaver) — concurrency-testing.md §6.
+    passed = rows.select { |r| r["status"] == "pass" && r["cross_core_checksum"] }
+    sums = passed.map { |r| r["checksum"] }.uniq
+    if sums.length > 1
+      detail = passed.map { |r| "#{r['lang']}=#{r['checksum']}" }.join(" ")
+      failures << "#{name}: CROSS-CORE CHECKSUM DISAGREEMENT (#{detail})"
+    end
+  end
+  abort "\nstress FAILED:\n  - #{failures.join("\n  - ")}" unless failures.empty?
+  puts "\nstress OK (all cores agree)"
+end
+
+desc "Layer 3 concurrency-stress suite on all three cores (bench-family, OUTSIDE rake ci)"
+task :stress, [:filter] do |_, args|
+  stamp = Time.now.utc.strftime("%Y%m%d-%H%M%S")
+  dir = File.join(__dir__, "bench/results/stress", stamp)
+  FileUtils.mkdir_p(dir)
+  filter = args[:filter] ? [args[:filter]] : []
+  # The brace block swallows a non-zero exit (a per-core FAIL exits 1) so aggregation still runs —
+  # every runner writes its JSONL before exiting, so the verdict survives in the result files.
+
+  puts "go:   go run -race ./cmd/stress (one goroutine per worker, under the race detector)"
+  sh({ "CGO_ENABLED" => "1" }, "go", "run", "-race", "./cmd/stress", STRESS_DIR, File.join(dir, "go.jsonl"), *filter, chdir: "bench/go") { |_ok, _res| }
+
+  puts "rust: cargo build --release --bin stress + run over real OS threads"
+  sh "cargo", "build", "--release", "--quiet", "--manifest-path", "bench/rust/Cargo.toml", "--bin", "stress"
+  sh("bench/rust/target/release/stress", STRESS_DIR, File.join(dir, "rust.jsonl"), *filter) { |_ok, _res| }
+
+  puts "ts:   node src/stress.ts (the seeded-sequential interleaver)"
+  sh "npm", "ci", "--silent", "--prefix", "bench/ts" unless File.directory?("bench/ts/node_modules")
+  sh("node", "bench/ts/src/stress.ts", STRESS_DIR, File.join(dir, "ts.jsonl"), *filter) { |_ok, _res| }
+
+  puts
+  aggregate_stress(dir)
+end
+
 # ci — the aggregate gate. Chains the toolchain-light spec checks, the formatter gate, the
 # CLI's tests, and the metamorphic sweep, so one command reproduces what CI enforces. Each
 # is `sh`/task-failure propagating, so `rake ci` exits non-zero on the first failure.
