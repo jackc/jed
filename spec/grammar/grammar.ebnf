@@ -97,10 +97,30 @@ table_element  ::= column_def | table_constraint
  * backing index is auto-named lowercased "<table>_<cols>_key" with the smallest free
  * suffix, or takes the explicit CONSTRAINT name (collisions: 42P07 against the relation
  * namespace, 42710 against the table's constraint names). The column-level "UNIQUE" is the
- * one-member form. */
+ * one-member form.
+ *
+ * "FOREIGN KEY (a, b, ...) REFERENCES parent (x, y, ...)" declares a referential constraint:
+ * the local columns must, in every row, match an existing key of the parent table — or be
+ * (partly) NULL, which is exempt (MATCH SIMPLE — ../design/constraints.md §6). The referenced
+ * columns must be exactly the parent's PRIMARY KEY or a UNIQUE constraint's column set (42830);
+ * omitting the "(x, y, ...)" list defaults them to the parent's primary key (42830 if it has
+ * none). Referencing and referenced column counts must agree (42830) and corresponding columns
+ * must be the SAME type (42804 — jed is stricter than PG, which allows comparable types). The
+ * parent may be the table being created (a self-reference). Enforced at every write
+ * (../design/constraints.md §6): a child INSERT/UPDATE whose key is absent in the parent, or a
+ * parent DELETE/UPDATE of a row still referenced by a child, traps 23503. The optional
+ * "ON DELETE"/"ON UPDATE" actions accept NO ACTION (default) and RESTRICT (identical in jed — no
+ * deferrable constraints); CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE
+ * TABLE (0A000, deferred). The column-level "REFERENCES" is the one-member form (its local column
+ * is the column being defined). The constraint name is auto-derived lowercased
+ * "<table>_<cols>_fkey" with the smallest free suffix, or takes the explicit CONSTRAINT name
+ * (collision against the table's constraint names is 42710 — the per-table constraint namespace
+ * shared with CHECK). */
 table_constraint ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
                  | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
                  | ["CONSTRAINT" identifier] "UNIQUE" "(" identifier ("," identifier)* ")"
+                 | ["CONSTRAINT" identifier] "FOREIGN" "KEY"
+                       "(" identifier ("," identifier)* ")" references_clause
 
 /* A column definition is a name, a type, and zero or more column constraints. The
  * constraints are order-free (the parsers accept them in any order, deduplicating —
@@ -114,7 +134,9 @@ table_constraint ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
  * reference, subquery, aggregate, or parameter in the expression is rejected.
  * "CHECK" declares a row predicate, identical in semantics to the table-level form
  * (../design/constraints.md §4) — its position only feeds the textual definition order.
- * The constraint keywords are NOT reserved (§3). */
+ * "REFERENCES parent (col)" is the one-member FOREIGN KEY (the local column is this column);
+ * the referenced-column list is optional (defaults to the parent's primary key). The
+ * constraint keywords are NOT reserved (§3). */
 column_def     ::= identifier type_name column_constraint*
 
 column_constraint ::= "PRIMARY" "KEY"
@@ -122,6 +144,16 @@ column_constraint ::= "PRIMARY" "KEY"
                  | "DEFAULT" expr
                  | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
                  | ["CONSTRAINT" identifier] "UNIQUE"
+                 | references_clause
+
+/* The REFERENCES clause shared by a column-level foreign key and a table-level FOREIGN KEY.
+ * The referenced-column list is optional (defaults to the parent's PRIMARY KEY). The ON
+ * DELETE / ON UPDATE actions may appear in either order and at most once each; NO ACTION and
+ * RESTRICT behave identically in jed, CASCADE / SET NULL / SET DEFAULT are rejected at CREATE
+ * TABLE (0A000). MATCH FULL / MATCH PARTIAL are not in the grammar (MATCH SIMPLE only). */
+references_clause  ::= "REFERENCES" identifier ("(" identifier ("," identifier)* ")")?
+                       ("ON" ("DELETE" | "UPDATE") referential_action)*
+referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "SET" "DEFAULT"
 
 /* DROP TABLE removes a table — its definition and all its rows — from the
  * catalog. The surface is deliberately minimal (../design/grammar.md §13): ONE

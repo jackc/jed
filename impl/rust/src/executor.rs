@@ -6,12 +6,13 @@
 
 use crate::ast::{
     BinaryOp, CreateIndex, CreateTable, CreateType, Delete, DropIndex, DropTable, DropType, Expr,
-    Insert, InsertSource, InsertValue, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItems,
-    SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
+    Insert, InsertSource, InsertValue, JoinKind, Literal, OrderKey, QueryExpr, RefAction, Select,
+    SelectItems, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update,
+    WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    IndexDef, Table, resolve_col_type,
+    FkAction, ForeignKeyConstraint, IndexDef, Table, resolve_col_type,
 };
 use crate::cost::Meter;
 use crate::costs::COSTS;
@@ -178,6 +179,29 @@ impl Snapshot {
                     .is_some_and(|r| r.name.eq_ignore_ascii_case(&key))
                 {
                     return Some(format!("field {} of type {}", f.name, ct.name));
+                }
+            }
+        }
+        None
+    }
+
+    /// Whether any OTHER table's FOREIGN KEY references the table `name` (case-insensitive) — the
+    /// `DROP TABLE` dependency check (2BP01 — spec/design/constraints.md §6.10). A self-reference
+    /// does NOT block the drop (a table's own FK on itself disappears with it). Returns the first
+    /// dependent's description, scanning in ascending lowercased table-name order for determinism
+    /// (within a table, `foreign_keys` is already in name order).
+    pub(crate) fn foreign_key_dependent(&self, name: &str) -> Option<String> {
+        let key = name.to_ascii_lowercase();
+        let mut tkeys: Vec<&String> = self.tables.keys().collect();
+        tkeys.sort();
+        for tk in tkeys {
+            let t = &self.tables[tk];
+            if t.name.eq_ignore_ascii_case(&key) {
+                continue; // a self-reference does not block the drop
+            }
+            for fk in &t.foreign_keys {
+                if fk.ref_table.eq_ignore_ascii_case(&key) {
+                    return Some(format!("constraint {} on table {}", fk.name, t.name));
                 }
             }
         }
@@ -1214,6 +1238,7 @@ impl Database {
             pk,
             checks: Vec::new(),
             indexes: Vec::new(),
+            foreign_keys: Vec::new(),
         };
         for def in &ct.checks {
             // Structural rejections first (a single pre-walk — a documented micro-order
@@ -1377,6 +1402,184 @@ impl Database {
             );
         }
 
+        // FOREIGN KEY constraints (constraints.md §6). Resolved AFTER the PK / UNIQUE / CHECK
+        // constraints (PG's order), each in textual definition order: resolve the local columns
+        // (42703/42701) against this table; look up the parent (42P01, or the table itself for a
+        // self-reference); resolve the referenced columns (default to the parent PK, 42830 if it
+        // has none); check the arity (42830); name the constraint (explicit collision 42710, else
+        // derive `<table>_<cols>_fkey` with a suffix walk through the constraint namespace);
+        // reject the unsupported write-actions (0A000); require the referenced columns to be the
+        // parent PK or a UNIQUE set (42830); and require same-type pairing (42804, stricter than
+        // PG). An FK owns no B-tree — enforcement probes the parent at every write (§6.4/§6.5).
+        let mut resolved_fks: Vec<ForeignKeyConstraint> = Vec::with_capacity(ct.foreign_keys.len());
+        for fk in &ct.foreign_keys {
+            // 1. Local (referencing) columns into this table.
+            let mut local: Vec<usize> = Vec::with_capacity(fk.columns.len());
+            for cname in &fk.columns {
+                let idx = table
+                    .columns
+                    .iter()
+                    .position(|c| c.name.eq_ignore_ascii_case(cname))
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            SqlState::UndefinedColumn,
+                            format!("column {cname} named in key does not exist"),
+                        )
+                    })?;
+                if local.contains(&idx) {
+                    return Err(EngineError::new(
+                        SqlState::DuplicateColumn,
+                        format!("column {cname} appears twice in foreign key constraint"),
+                    ));
+                }
+                local.push(idx);
+            }
+            // 2. Parent table — a self-reference resolves against the in-progress definition.
+            let self_ref = fk.ref_table.eq_ignore_ascii_case(&table.name);
+            let parent: &Table = if self_ref {
+                &table
+            } else {
+                self.table(&fk.ref_table).ok_or_else(|| {
+                    EngineError::new(
+                        SqlState::UndefinedTable,
+                        format!("table does not exist: {}", fk.ref_table),
+                    )
+                })?
+            };
+            // 3. Referenced columns into the parent (default to the parent's primary key).
+            let refs: Vec<usize> = match &fk.ref_columns {
+                None => {
+                    if parent.pk.is_empty() {
+                        // Omitting the referenced list defaults to the parent's PRIMARY KEY; a
+                        // parent without one is 42704 (PG's code here — undefined_object — even
+                        // when the parent has a UNIQUE), distinct from the explicit-no-match 42830.
+                        return Err(EngineError::new(
+                            SqlState::UndefinedObject,
+                            format!(
+                                "there is no primary key for referenced table {}",
+                                parent.name
+                            ),
+                        ));
+                    }
+                    parent.pk.clone()
+                }
+                Some(cols) => {
+                    let mut r: Vec<usize> = Vec::with_capacity(cols.len());
+                    for cname in cols {
+                        let idx = parent
+                            .columns
+                            .iter()
+                            .position(|c| c.name.eq_ignore_ascii_case(cname))
+                            .ok_or_else(|| {
+                                EngineError::new(
+                                    SqlState::UndefinedColumn,
+                                    format!("column {cname} named in key does not exist"),
+                                )
+                            })?;
+                        if r.contains(&idx) {
+                            return Err(EngineError::new(
+                                SqlState::DuplicateColumn,
+                                format!("column {cname} appears twice in foreign key constraint"),
+                            ));
+                        }
+                        r.push(idx);
+                    }
+                    r
+                }
+            };
+            // 4. Referencing/referenced count must agree.
+            if local.len() != refs.len() {
+                return Err(EngineError::new(
+                    SqlState::InvalidForeignKey,
+                    "number of referencing and referenced columns for foreign key disagree"
+                        .to_string(),
+                ));
+            }
+            // 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
+            let name = match &fk.name {
+                Some(n) => {
+                    if table.checks.iter().any(|c| c.name.eq_ignore_ascii_case(n))
+                        || resolved_fks.iter().any(|f| f.name.eq_ignore_ascii_case(n))
+                    {
+                        return Err(EngineError::new(
+                            SqlState::DuplicateObject,
+                            format!("constraint {n} for relation {} already exists", table.name),
+                        ));
+                    }
+                    n.clone()
+                }
+                None => {
+                    let mut base = table.name.to_ascii_lowercase();
+                    for &i in &local {
+                        base.push('_');
+                        base.push_str(&table.columns[i].name.to_ascii_lowercase());
+                    }
+                    base.push_str("_fkey");
+                    let mut candidate = base.clone();
+                    let mut suffix = 0u32;
+                    while table
+                        .checks
+                        .iter()
+                        .any(|c| c.name.eq_ignore_ascii_case(&candidate))
+                        || resolved_fks
+                            .iter()
+                            .any(|f| f.name.eq_ignore_ascii_case(&candidate))
+                    {
+                        suffix += 1;
+                        candidate = format!("{base}{suffix}");
+                    }
+                    candidate
+                }
+            };
+            // 6. Reject the unsupported write-actions (§6.6).
+            let on_delete = fk_action(fk.on_delete, "DELETE")?;
+            let on_update = fk_action(fk.on_update, "UPDATE")?;
+            // 7. The referenced columns must be the parent's PK or a UNIQUE set (§6.2).
+            let ref_set = sorted_unique(&refs);
+            let matches_unique = (!parent.pk.is_empty() && sorted_unique(&parent.pk) == ref_set)
+                || parent
+                    .indexes
+                    .iter()
+                    .any(|i| i.unique && sorted_unique(&i.columns) == ref_set);
+            if !matches_unique {
+                return Err(EngineError::new(
+                    SqlState::InvalidForeignKey,
+                    format!(
+                        "there is no unique constraint matching given keys for referenced table {}",
+                        parent.name
+                    ),
+                ));
+            }
+            // 8. Same-type pairing (§6.2). Because the referenced columns are a PK/UNIQUE key they
+            // are key-encodable, so a same-typed local column is key-encodable too — no separate
+            // 0A000 type gate is needed.
+            for (li, ri) in local.iter().zip(&refs) {
+                if table.columns[*li].ty != parent.columns[*ri].ty {
+                    return Err(EngineError::new(
+                        SqlState::DatatypeMismatch,
+                        format!(
+                            "foreign key constraint {name} cannot be implemented: key columns {} and {} are of incompatible types: {} and {}",
+                            table.columns[*li].name,
+                            parent.columns[*ri].name,
+                            table.columns[*li].ty.canonical_name(),
+                            parent.columns[*ri].ty.canonical_name(),
+                        ),
+                    ));
+                }
+            }
+            resolved_fks.push(ForeignKeyConstraint {
+                name,
+                columns: local,
+                ref_table: parent.name.clone(),
+                ref_columns: refs,
+                on_delete,
+                on_update,
+            });
+        }
+        // Held in ascending lowercased-name order (the catalog's on-disk + evaluation order, §6.9).
+        resolved_fks.sort_by_key(|f| f.name.to_ascii_lowercase());
+        table.foreign_keys = resolved_fks;
+
         let index_keys: Vec<String> = table
             .indexes
             .iter()
@@ -1494,6 +1697,19 @@ impl Database {
             return Err(EngineError::new(
                 SqlState::UndefinedTable,
                 format!("table does not exist: {}", dt.name),
+            ));
+        }
+        // A table referenced by ANOTHER table's FOREIGN KEY cannot be dropped (2BP01 — there is no
+        // DROP TABLE … CASCADE; a self-reference does not block — spec/design/constraints.md §6.10).
+        if let Some(detail) = self.read_snap().foreign_key_dependent(&dt.name) {
+            let canonical = self
+                .table(&dt.name)
+                .map_or(dt.name.clone(), |t| t.name.clone());
+            return Err(EngineError::new(
+                SqlState::DependentObjectsStillExist,
+                format!(
+                    "cannot drop table {canonical} because other objects depend on it: {detail}"
+                ),
             ));
         }
         let key = dt.name.to_ascii_lowercase();
@@ -2314,6 +2530,53 @@ impl Database {
             }
             prepared.push((key, row));
         }
+
+        // FOREIGN KEY existence (constraints.md §6.4) — after all candidate rows are prepared, so
+        // the check sees the statement's batch END STATE (a later row may supply an earlier row's
+        // parent key; a self-reference resolves within the batch — PG's end-of-statement
+        // semantics). Unmetered validation, like the PK/UNIQUE probes, and before any write
+        // (all-or-nothing). MATCH SIMPLE: a row with any NULL local column is exempt.
+        let fks: Vec<ForeignKeyConstraint> = self
+            .table(table)
+            .map(|t| t.foreign_keys.clone())
+            .unwrap_or_default();
+        for fk in &fks {
+            // The parent exists (validated at CREATE TABLE; DROP TABLE refuses to drop a
+            // referenced table — §6.10), so a consistent catalog always finds it.
+            let Some(parent) = self.table(&fk.ref_table) else {
+                continue;
+            };
+            // Only a self-reference can satisfy against this statement's batch (a different parent
+            // table is unchanged by this INSERT). Collect the parent keys the batch supplies.
+            let batch: HashSet<Vec<u8>> = if fk.ref_table.eq_ignore_ascii_case(&relation) {
+                prepared
+                    .iter()
+                    .filter_map(|(_, r)| {
+                        fk_probe(fk, parent, r, &fk.ref_columns).map(|p| p.bytes().to_vec())
+                    })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            for (_, row) in &prepared {
+                let Some(probe) = fk_probe(fk, parent, row, &fk.columns) else {
+                    continue; // a NULL local column → exempt (MATCH SIMPLE)
+                };
+                if batch.contains(probe.bytes()) {
+                    continue;
+                }
+                if !self.fk_probe_hits(&probe, &fk.ref_table)? {
+                    return Err(EngineError::new(
+                        SqlState::ForeignKeyViolation,
+                        format!(
+                            "insert or update on table {relation} violates foreign key constraint {}",
+                            fk.name
+                        ),
+                    ));
+                }
+            }
+        }
+
         // Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
         meter.charge(COSTS.value_compress * cunits);
         meter.guard()?;
@@ -2556,6 +2819,42 @@ impl Database {
             };
             if keep {
                 matched.push((k, row));
+            }
+        }
+
+        // FOREIGN KEY parent-side (constraints.md §6.5): a DELETE must not strand a child. For
+        // each inbound FK, every deleted row's referenced tuple disappears (the referenced columns
+        // are unique, so each is unique to its row); if a child still references it → 23503.
+        // Unmetered, before phase 2 (all-or-nothing). For a self-reference the child IS this table,
+        // whose end state excludes the rows being deleted.
+        let referencers = self.fk_referencers(&del.table);
+        if !referencers.is_empty() {
+            let parent = self
+                .table(&del.table)
+                .expect("delete target exists")
+                .clone();
+            let deleted_keys: HashSet<Vec<u8>> = matched.iter().map(|(k, _)| k.clone()).collect();
+            let empty: HashSet<Vec<u8>> = HashSet::new();
+            for (child_table, fk) in &referencers {
+                let exclude = if child_table.eq_ignore_ascii_case(&del.table) {
+                    &deleted_keys
+                } else {
+                    &empty
+                };
+                for (_, row) in &matched {
+                    let Some(probe) = fk_probe(fk, &parent, row, &fk.ref_columns) else {
+                        continue; // a NULL referenced value cannot be referenced (MATCH SIMPLE)
+                    };
+                    if self.fk_child_references(child_table, fk, &parent, probe.bytes(), exclude)? {
+                        return Err(EngineError::new(
+                            SqlState::ForeignKeyViolation,
+                            format!(
+                                "update or delete on table {} violates foreign key constraint {} on table {}",
+                                parent.name, fk.name, child_table
+                            ),
+                        ));
+                    }
+                }
             }
         }
 
@@ -2858,6 +3157,114 @@ impl Database {
                             format!(
                                 "duplicate key value violates unique constraint: {}",
                                 def.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // FOREIGN KEY child-side (constraints.md §6.4): re-validate an FK only when the statement
+        // assigns one of its local columns (an unchanged value stays valid). Each updated NEW row
+        // must reference an existing parent key — committed parent state, plus (for a
+        // self-reference) the updated rows' new referenced values, so a row may reference a value
+        // another updated row now supplies. Unmetered, phase 1, before any write.
+        let assigned: HashSet<usize> = plans.iter().map(|p| p.idx).collect();
+        let fks: Vec<ForeignKeyConstraint> = self
+            .table(&upd.table)
+            .map(|t| t.foreign_keys.clone())
+            .unwrap_or_default();
+        for fk in &fks {
+            if !fk.columns.iter().any(|c| assigned.contains(c)) {
+                continue; // this FK's local columns were not assigned
+            }
+            let Some(parent) = self.table(&fk.ref_table) else {
+                continue;
+            };
+            let batch: HashSet<Vec<u8>> = if fk.ref_table.eq_ignore_ascii_case(&relation) {
+                updates
+                    .iter()
+                    .filter_map(|(_, new_row, _)| {
+                        fk_probe(fk, parent, new_row, &fk.ref_columns).map(|p| p.bytes().to_vec())
+                    })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            for (_, new_row, _) in &updates {
+                let Some(probe) = fk_probe(fk, parent, new_row, &fk.columns) else {
+                    continue; // a NULL local column → exempt (MATCH SIMPLE)
+                };
+                if batch.contains(probe.bytes()) {
+                    continue;
+                }
+                if !self.fk_probe_hits(&probe, &fk.ref_table)? {
+                    return Err(EngineError::new(
+                        SqlState::ForeignKeyViolation,
+                        format!(
+                            "insert or update on table {relation} violates foreign key constraint {}",
+                            fk.name
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // FOREIGN KEY parent-side (constraints.md §6.5): an UPDATE of a referenced row must not
+        // strand a child. A referenced PRIMARY KEY column cannot change (PK assignment is 0A000),
+        // so only a referenced UNIQUE column is at risk. For each inbound FK, a referenced tuple
+        // DISAPPEARS when an updated row's old value is absent from the statement's new end state
+        // (`old − new` over the updated rows); if a child still references a disappearing tuple →
+        // 23503. Unmetered, phase 1. A self-reference's child IS this table, whose end state
+        // excludes the rows being updated (their new values are validated child-side above).
+        let referencers = self.fk_referencers(&upd.table);
+        if !referencers.is_empty() {
+            let parent = self
+                .table(&upd.table)
+                .expect("update target exists")
+                .clone();
+            let updated_keys: HashSet<Vec<u8>> =
+                updates.iter().map(|(k, _, _)| k.clone()).collect();
+            let empty: HashSet<Vec<u8>> = HashSet::new();
+            for (child_table, fk) in &referencers {
+                // The referenced tuples the updated rows now supply (so a swap re-supplies one).
+                let new_present: HashSet<Vec<u8>> = updates
+                    .iter()
+                    .filter_map(|(_, new_row, _)| {
+                        fk_probe(fk, &parent, new_row, &fk.ref_columns).map(|p| p.bytes().to_vec())
+                    })
+                    .collect();
+                let exclude = if child_table.eq_ignore_ascii_case(&upd.table) {
+                    &updated_keys
+                } else {
+                    &empty
+                };
+                for (_, new_row, old_row) in &updates {
+                    let Some(old_probe) = fk_probe(fk, &parent, old_row, &fk.ref_columns) else {
+                        continue; // a NULL old referenced value was referenced by nothing
+                    };
+                    // Unchanged tuples (incl. a NULL→ already skipped) do not disappear.
+                    if let Some(new_probe) = fk_probe(fk, &parent, new_row, &fk.ref_columns) {
+                        if new_probe.bytes() == old_probe.bytes() {
+                            continue;
+                        }
+                    }
+                    // Re-supplied by another updated row (e.g. a value swap) → not disappearing.
+                    if new_present.contains(old_probe.bytes()) {
+                        continue;
+                    }
+                    if self.fk_child_references(
+                        child_table,
+                        fk,
+                        &parent,
+                        old_probe.bytes(),
+                        exclude,
+                    )? {
+                        return Err(EngineError::new(
+                            SqlState::ForeignKeyViolation,
+                            format!(
+                                "update or delete on table {} violates foreign key constraint {} on table {}",
+                                parent.name, fk.name, child_table
                             ),
                         ));
                     }
@@ -4869,6 +5276,68 @@ impl Database {
         self.working_mut().index_store_mut(name_key)
     }
 
+    /// Whether the parent currently holds the key/prefix `probe` (committed + working state) — the
+    /// child-side foreign-key existence test (spec/design/constraints.md §6.4). `parent_table` is
+    /// the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
+    fn fk_probe_hits(&self, probe: &FkProbe, parent_table: &str) -> Result<bool> {
+        match probe {
+            FkProbe::Pk(key) => Ok(self.store(parent_table).get(key)?.is_some()),
+            FkProbe::Unique { index, prefix } => Ok(!self
+                .index_store(index)
+                .range_entries(&unique_probe_bound(prefix))?
+                .is_empty()),
+        }
+    }
+
+    /// Whether any row of `child_table` references the parent tuple `target` (the parent key bytes,
+    /// in the byte space [`fk_probe`] produces) via `fk` — the reverse of the child-side probe, a
+    /// full scan since child FK columns are not index-backed (spec/design/constraints.md §6.5).
+    /// MATCH SIMPLE: a child row with any NULL FK column references nothing. Rows whose storage key
+    /// is in `exclude` are skipped — the END STATE for a self-reference, whose child IS the table
+    /// being mutated (so its deleted/updated rows must not count). `parent` is the referenced
+    /// table's catalog. Unmetered validation.
+    fn fk_child_references(
+        &self,
+        child_table: &str,
+        fk: &ForeignKeyConstraint,
+        parent: &Table,
+        target: &[u8],
+        exclude: &HashSet<Vec<u8>>,
+    ) -> Result<bool> {
+        for (k, row) in self.store(child_table).iter_entries()? {
+            if exclude.contains(&k) {
+                continue;
+            }
+            if let Some(probe) = fk_probe(fk, parent, &row, &fk.columns) {
+                if probe.bytes() == target {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
+    /// Every (child table name, FK) pair in the visible snapshot whose FK references `parent_name`
+    /// (case-insensitive), including a self-reference — the inbound FKs a parent DELETE/UPDATE must
+    /// not strand (spec/design/constraints.md §6.5). Sorted by (lowercased child table, FK name) for
+    /// a deterministic report order; cloned so the caller can probe stores without a snapshot borrow.
+    fn fk_referencers(&self, parent_name: &str) -> Vec<(String, ForeignKeyConstraint)> {
+        let snap = self.read_snap();
+        let key = parent_name.to_ascii_lowercase();
+        let mut out: Vec<(String, ForeignKeyConstraint)> = Vec::new();
+        let mut tkeys: Vec<&String> = snap.tables.keys().collect();
+        tkeys.sort();
+        for tk in tkeys {
+            let t = &snap.tables[tk];
+            for fk in &t.foreign_keys {
+                if fk.ref_table.eq_ignore_ascii_case(&key) {
+                    out.push((t.name.clone(), fk.clone()));
+                }
+            }
+        }
+        out
+    }
+
     /// Find the table owning the named index in the visible snapshot (case-insensitive).
     fn find_index(&self, name: &str) -> Option<(&str, &IndexDef)> {
         self.read_snap().find_index(name)
@@ -5770,6 +6239,7 @@ fn cte_synthetic_table(
         pk: Vec::new(),
         checks: Vec::new(),
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     }))
 }
 
@@ -5888,6 +6358,37 @@ struct SrfPlan {
 /// NAME follows PostgreSQL's single-column function-alias rule — the table alias when one is given,
 /// else the function name — and its TYPE is `col_ty` (the promoted integer for `generate_series`,
 /// the bound element type for `unnest`).
+/// Map a parsed referential action to its persisted form, rejecting the unsupported write-actions
+/// (CASCADE / SET NULL / SET DEFAULT) as `0A000` (spec/design/constraints.md §6.6). `clause` is
+/// `"DELETE"` or `"UPDATE"` for the message.
+fn fk_action(a: RefAction, clause: &str) -> Result<FkAction> {
+    match a {
+        RefAction::NoAction => Ok(FkAction::NoAction),
+        RefAction::Restrict => Ok(FkAction::Restrict),
+        RefAction::Cascade => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            format!("ON {clause} CASCADE is not supported"),
+        )),
+        RefAction::SetNull => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            format!("ON {clause} SET NULL is not supported"),
+        )),
+        RefAction::SetDefault => Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            format!("ON {clause} SET DEFAULT is not supported"),
+        )),
+    }
+}
+
+/// A column-ordinal list as a sorted, deduplicated set (for the order-independent FK
+/// referenced-columns ⇄ PK/unique-key set comparison — spec/design/constraints.md §6.2).
+fn sorted_unique(v: &[usize]) -> Vec<usize> {
+    let mut s = v.to_vec();
+    s.sort_unstable();
+    s.dedup();
+    s
+}
+
 fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
     Box::new(Table {
         name: func_name.to_string(),
@@ -5903,6 +6404,7 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
         pk: Vec::new(),
         checks: Vec::new(),
         indexes: Vec::new(),
+        foreign_keys: Vec::new(),
     })
 }
 
@@ -6147,6 +6649,93 @@ fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
         }
     }
     None
+}
+
+/// The order-preserving key bytes for one keyable value (encoding.md §2), matching the PK / index
+/// encoders. `value` is non-NULL and of a keyable type (a foreign-key column always is — its type
+/// equals a PK/UNIQUE parent column, CREATE TABLE §6.2).
+fn encode_key_value(ty: ScalarType, value: &Value) -> Vec<u8> {
+    match value {
+        Value::Int(n) => encode_int(ty, *n),
+        Value::Bool(b) => encode_bool(*b),
+        Value::Uuid(u) => u.to_vec(),
+        Value::Timestamp(m) | Value::Timestamptz(m) => encode_int(ty, *m),
+        _ => unreachable!("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)"),
+    }
+}
+
+/// A built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look up in the
+/// parent, tagged with which physical tree to probe.
+enum FkProbe {
+    /// The parent's PK storage key (bare member encodings concatenated, in PK key order).
+    Pk(Vec<u8>),
+    /// A parent unique index's prefix (0x00-tagged slots, in index-key order) + the lowercased
+    /// index name.
+    Unique { index: String, prefix: Vec<u8> },
+}
+
+impl FkProbe {
+    /// The raw probe bytes — used to compare against this statement's batch end state (§6.4). Two
+    /// probes of one FK share the same byte space (a given FK always probes the PK or always a
+    /// fixed unique index), so byte equality is a valid set membership test.
+    fn bytes(&self) -> &[u8] {
+        match self {
+            FkProbe::Pk(b) => b,
+            FkProbe::Unique { prefix, .. } => prefix,
+        }
+    }
+}
+
+/// Build the parent-key probe for `fk` from `row`, taking each referenced parent column's value
+/// from `row[ordinals[i]]` where `ordinals[i]` supplies `fk.ref_columns[i]`. So the child side
+/// passes `ordinals = &fk.columns` (local columns), and a self-reference batch entry passes
+/// `ordinals = &fk.ref_columns` (the row viewed as a parent). Returns `None` when any supplied
+/// value is NULL (MATCH SIMPLE exempt — §6.3). The probe uses the parent's PK when the referenced
+/// set is the PK, else the matching unique index (re-derived deterministically — §6.8).
+fn fk_probe(
+    fk: &ForeignKeyConstraint,
+    parent: &Table,
+    row: &Row,
+    ordinals: &[usize],
+) -> Option<FkProbe> {
+    // MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
+    if ordinals.iter().any(|&o| matches!(row[o], Value::Null)) {
+        return None;
+    }
+    // The value supplying parent column `pcol` (the fk pairing: ref_columns[i] ⇄ ordinals[i]).
+    let value_for = |pcol: usize| -> &Value {
+        let i = fk
+            .ref_columns
+            .iter()
+            .position(|&r| r == pcol)
+            .expect("a parent key column is one of the FK's referenced columns");
+        &row[ordinals[i]]
+    };
+    let ref_set = sorted_unique(&fk.ref_columns);
+    if !parent.pk.is_empty() && sorted_unique(&parent.pk) == ref_set {
+        let mut k = Vec::new();
+        for &pcol in &parent.pk {
+            let ty = parent.columns[pcol].ty.scalar();
+            k.extend_from_slice(&encode_key_value(ty, value_for(pcol)));
+        }
+        Some(FkProbe::Pk(k))
+    } else {
+        let idx = parent
+            .indexes
+            .iter()
+            .find(|i| i.unique && sorted_unique(&i.columns) == ref_set)
+            .expect("referenced columns matched a unique key at CREATE TABLE §6.2");
+        let mut prefix = Vec::new();
+        for &pcol in &idx.columns {
+            prefix.push(0x00);
+            let ty = parent.columns[pcol].ty.scalar();
+            prefix.extend_from_slice(&encode_key_value(ty, value_for(pcol)));
+        }
+        Some(FkProbe::Unique {
+            index: idx.name.to_ascii_lowercase(),
+            prefix,
+        })
+    }
 }
 
 /// Flatten the WHERE's top-level AND-chain (an OR is never descended — a disjunction is not a

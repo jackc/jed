@@ -1943,3 +1943,39 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
   body and general expressions in the `INSERT … VALUES` slot.)*
 - **Top-level `UPDATE`/`DELETE` FROM** stays single-table (§15) — a derived table reaches them only
   inside a subquery.
+
+## 43. `FOREIGN KEY` constraints (`REFERENCES` / `FOREIGN KEY ( cols ) REFERENCES …`)
+
+Both constraint positions gain the referential form ([constraints.md §6](constraints.md)). A
+`column_constraint` may be a bare `references_clause` (the one-member form — the local column is the
+column being defined):
+
+```
+references_clause  ::= "REFERENCES" identifier ("(" identifier ("," identifier)* ")")?
+                       ("ON" ("DELETE" | "UPDATE") referential_action)*
+referential_action ::= "NO" "ACTION" | "RESTRICT" | "CASCADE" | "SET" "NULL" | "SET" "DEFAULT"
+```
+
+and a `table_constraint` may be
+`["CONSTRAINT" identifier] "FOREIGN" "KEY" "(" identifier ("," identifier)* ")" references_clause`
+(the local-column list reuses the `PRIMARY KEY` list shape — bare names, non-empty). The
+referenced-column list is optional and defaults to the parent's primary key.
+
+**Disambiguation.** `FOREIGN`, `KEY`, `REFERENCES`, `ON`, `DELETE`, `CASCADE`, `RESTRICT`, `ACTION`,
+`NO`, `SET` stay non-reserved (§3). A table element beginning with the two keywords `FOREIGN KEY`
+parses as a foreign-key table constraint — a column named `foreign` would need a type named `key`
+(none exists), so nothing is lost (the `PRIMARY KEY` precedent, §28). One beginning with `CONSTRAINT`
+dispatches on the keyword after the name: `CHECK` (§29), `UNIQUE` (§31), or `FOREIGN`. In
+column-constraint position the clause begins with `REFERENCES`; a column named `references` is
+followed by a *type name* (an identifier, never another identifier-then-clause), so the order-free
+constraint loop recognizes it positionally like `CHECK`. The `ON DELETE` / `ON UPDATE` actions may
+appear in either order and at most once each; a repeat is `42601`.
+
+**Where the errors fire.** The parser knows no catalog; CREATE TABLE's execution resolves the local
+columns (`42703`/`42701`), looks up the parent table (`42P01`), matches the referenced columns to the
+parent's PRIMARY KEY or a UNIQUE constraint (`42830` — none matching, or a referencing/referenced
+count mismatch), type-checks corresponding columns (`42804`), names the constraint (`42710` against
+the per-table constraint namespace), and rejects an unsupported `referential_action` (`0A000` —
+CASCADE / SET NULL / SET DEFAULT) ([constraints.md §6](constraints.md)). PostgreSQL *reserves*
+`FOREIGN` / `REFERENCES`, so the jed-only non-reserved surface carries oracle overrides like `on`'s
+(conformance.md §5). `MATCH FULL` / `MATCH PARTIAL` are not in the grammar (MATCH SIMPLE only).

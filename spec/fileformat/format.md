@@ -15,9 +15,22 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 10)
+## Version scope (`format_version` 11)
 
-The current on-disk version is **`format_version` 10** — **array (`T[]`) columns**
+The current on-disk version is **`format_version` 11** — **`FOREIGN KEY` constraints**
+([../design/constraints.md §6](../design/constraints.md)). A foreign key is referential metadata
+on the *referencing* table — it owns no B-tree and adds no value-codec change — so the only on-disk
+change is in the **table catalog entry**: after the index list and before the trailing root-page
+pointer, a new **foreign-key list** (`fk_count`, then per FK: the constraint name, the local-column
+ordinal list, the referenced table name, the referenced-column ordinal list into the parent, and a
+one-byte `on_delete`/`on_update` action field — *Foreign-key list* in the *Catalog* section below).
+The per-table data B-tree, the value codec, and the meta page are untouched. A file with no foreign
+keys still moves to v11 (the version byte + meta CRC change, and every table entry gains an
+`fk_count = 0`). Each version is a **clean break** — older versions are **not read** (we are pre-1.0
+and owe no on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only**
+version 11.
+
+`format_version` 10 was **array (`T[]`) columns**
 ([../design/array.md](../design/array.md)). An array is a **structural** type (no catalog object —
 the element type is carried inline), so the only on-disk change is in the **column entry**: a new
 **`type_code = 15`** (the *Stable type codes* table) followed by the **element-type descriptor**
@@ -25,10 +38,8 @@ the element type is carried inline), so the only on-disk change is in the **colu
 place of a scalar's typmod slot. A value is the compact **array body** (`ndim ‖ flags ‖ per-dim
 (len, lb) ‖ optional null bitmap ‖ element bodies` — *Value codec* below); a fixed-width element
 carries **no per-element length prefix**. The per-table data B-tree and the meta page are
-untouched. A file with no array columns still moves to v10 (only the version byte + meta CRC
-change). Each version is a **clean break** — older versions are **not read** (we are pre-1.0 and
-owe no on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only**
-version 10.
+untouched. A file with no array columns still moved to v10 (only the version byte + meta CRC
+change).
 
 `format_version` 9 was **composite (row) types**
 ([../design/composite.md](../design/composite.md)). A user-defined composite type
@@ -202,7 +213,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`10`** |
+| 4  | 2 | `format_version` (u16) — current = **`11`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -231,7 +242,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 10`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 11`,
 reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
 slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
 
@@ -321,6 +332,17 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`key_ordinal` ×`key_col_count` | u16 each — column ordinals in **index-key order**; each must be `< col_count` (duplicates allowed — indexes.md §1; else `XX001`) |
 | &nbsp;&nbsp;`index_flags` | u8 — bit0 `unique` (**new in v6** — indexes.md §8); bits 1–7 reserved, written 0 (a set reserved bit is `XX001`) |
 | &nbsp;&nbsp;`index_root_page` | u32 — the root B-tree node of this index, or 0 if the table has no rows |
+| `fk_count` | u16 — the table's `FOREIGN KEY` constraints (**new in v11**; `0` for a table with none) |
+| per foreign key (×`fk_count`): | |
+| &nbsp;&nbsp;`fk_name_len` | u16 |
+| &nbsp;&nbsp;`fk_name` | UTF-8 (original case) — the constraint name |
+| &nbsp;&nbsp;`fk_local_count` | u16 — ≥ 1, the referencing column count |
+| &nbsp;&nbsp;`fk_local_ordinal` ×`fk_local_count` | u16 each — referencing-column ordinals into **this** table, in declaration/list order; each `< col_count` (else `XX001`) |
+| &nbsp;&nbsp;`fk_ref_table_len` | u16 |
+| &nbsp;&nbsp;`fk_ref_table` | UTF-8 (original case) — the referenced (parent) table name |
+| &nbsp;&nbsp;`fk_ref_count` | u16 — the referenced column count; must equal `fk_local_count` (else `XX001`) |
+| &nbsp;&nbsp;`fk_ref_ordinal` ×`fk_ref_count` | u16 each — referenced-column ordinals into the **parent** table, in list order |
+| &nbsp;&nbsp;`fk_actions` | u8 — bits 0–1 `on_delete`, bits 2–3 `on_update` (`0` = NO ACTION, `1` = RESTRICT; `2`/`3` reserved for CASCADE/SET NULL/SET DEFAULT, not written this slice); bits 4–7 reserved, written 0 (a set reserved bit, or an unknown 2-bit action, is `XX001`) |
 | `root_data_page` | u32 — the **root B-tree node** of this table, or 0 if it has no rows |
 
 Columns are emitted in declaration order. Checks are emitted in their **evaluation order** —
@@ -328,7 +350,13 @@ ascending byte order of the lowercased `check_name` ([../design/constraints.md
 §4.4](../design/constraints.md)); a reader trusts that order (it never re-sorts). Indexes
 are emitted in **ascending byte order of the lowercased `index_name`** (the catalog's
 in-memory order and the planner's tie-break order — [../design/indexes.md
-§5/§6](../design/indexes.md)); a reader trusts that order too.
+§5/§6](../design/indexes.md)); a reader trusts that order too. Foreign keys are emitted in
+**ascending byte order of the lowercased `fk_name`** (the catalog's in-memory order and the
+§6.4 child-side evaluation order — [../design/constraints.md §6.9](../design/constraints.md));
+the reader trusts that order. A foreign key owns no B-tree, so it stores no root page; the
+referenced table/column ordinals are resolved by name against the loaded catalog, and a
+reference to a missing table or out-of-range parent column in an otherwise-valid file is
+`XX001`.
 
 A **composite column** (a column whose type is a user-defined composite — `type_code == 14`)
 appends, in the column entry's typmod slot (where a decimal appends precision/scale), a

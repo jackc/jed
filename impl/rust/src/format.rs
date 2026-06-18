@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    IndexDef, Table,
+    FkAction, ForeignKeyConstraint, IndexDef, Table,
 };
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
@@ -34,12 +34,14 @@ use crate::value::{ArrayVal, Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 10 = array (`T[]`) columns (type_code 15 + an element-type descriptor
-/// in the catalog, spec/design/array.md §3, and the compact array value body, §4). v9 = composite
-/// (row) types (kind-tagged catalog entries); v8 = a per-column expression-default flag; v7 added a
-/// per-page CRC-32 (header grew 12→16 bytes). The bump from 9 was atomic across the Rust/Go/TS cores
-/// + the Ruby golden reference (every `.jed` golden's version byte + CRC changed together).
-const FORMAT_VERSION: u16 = 10;
+/// On-disk format version — 11 = FOREIGN KEY constraints (a per-table catalog foreign-key list
+/// after the index list, spec/design/constraints.md §6). v10 = array (`T[]`) columns (type_code 15
+/// + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array
+/// value body, §4); v9 = composite (row) types (kind-tagged catalog entries); v8 = a per-column
+/// expression-default flag; v7 added a per-page CRC-32 (header grew 12→16 bytes). The bump from 10
+/// was atomic across the Rust/Go/TS cores + the Ruby golden reference (every `.jed` golden's version
+/// byte + CRC changed together).
+const FORMAT_VERSION: u16 = 11;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -1734,8 +1736,49 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
         out.push(if idx.unique { 1 } else { 0 });
         out.extend_from_slice(&root.to_be_bytes());
     }
+    // Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
+    // table, list order), the referenced table name, the referenced-column ordinals (into the
+    // PARENT, list order), and the actions byte (bits 0-1 on_delete, bits 2-3 on_update) — in the
+    // catalog's ascending lowercased-name order (spec/design/constraints.md §6.9). An FK owns no
+    // B-tree (no root page).
+    out.extend_from_slice(&(table.foreign_keys.len() as u16).to_be_bytes());
+    for fk in &table.foreign_keys {
+        let fnm = fk.name.as_bytes();
+        out.extend_from_slice(&(fnm.len() as u16).to_be_bytes());
+        out.extend_from_slice(fnm);
+        out.extend_from_slice(&(fk.columns.len() as u16).to_be_bytes());
+        for &c in &fk.columns {
+            out.extend_from_slice(&(c as u16).to_be_bytes());
+        }
+        let rt = fk.ref_table.as_bytes();
+        out.extend_from_slice(&(rt.len() as u16).to_be_bytes());
+        out.extend_from_slice(rt);
+        out.extend_from_slice(&(fk.ref_columns.len() as u16).to_be_bytes());
+        for &c in &fk.ref_columns {
+            out.extend_from_slice(&(c as u16).to_be_bytes());
+        }
+        out.push(fk_action_code(fk.on_delete) | (fk_action_code(fk.on_update) << 2));
+    }
     out.extend_from_slice(&root_data_page.to_be_bytes());
     out
+}
+
+/// The 2-bit on-disk code for a referential action (format.md): NO ACTION = 0, RESTRICT = 1.
+fn fk_action_code(a: FkAction) -> u8 {
+    match a {
+        FkAction::NoAction => 0,
+        FkAction::Restrict => 1,
+    }
+}
+
+/// Decode a 2-bit referential-action code; an unsupported code (2/3, reserved for the deferred
+/// write-actions) in an otherwise-valid file is `XX001`.
+fn fk_action_from_code(c: u8) -> Result<FkAction> {
+    match c {
+        0 => Ok(FkAction::NoAction),
+        1 => Ok(FkAction::Restrict),
+        _ => Err(corrupt("unsupported foreign-key action code")),
+    }
 }
 
 /// Greedily pack item sizes into pages of capacity `cap`, returning groups of item
@@ -2210,6 +2253,51 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             unique: iflags & 0b01 != 0,
         });
     }
+    // Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
+    // actions byte, in the catalog's (lowercased-name ascending) order — a reader trusts the
+    // order. The local ordinals index THIS table; the referenced ordinals index the PARENT (whose
+    // entry may be decoded later, so they are not cross-checked here — the writer keeps them
+    // valid; a structurally impossible FK is rejected below).
+    let fk_count = read_u16(buf, pos)? as usize;
+    let mut foreign_keys = Vec::with_capacity(fk_count);
+    for _ in 0..fk_count {
+        let fname = read_string(buf, pos)?;
+        let lc = read_u16(buf, pos)? as usize;
+        if lc == 0 {
+            return Err(corrupt("foreign key with no columns"));
+        }
+        let mut cols = Vec::with_capacity(lc);
+        for _ in 0..lc {
+            let ord = read_u16(buf, pos)? as usize;
+            if ord >= columns.len() {
+                return Err(corrupt("invalid foreign-key column ordinal"));
+            }
+            cols.push(ord);
+        }
+        let ref_table = read_string(buf, pos)?;
+        let rc = read_u16(buf, pos)? as usize;
+        if rc != lc {
+            return Err(corrupt(
+                "foreign-key referencing/referenced column count mismatch",
+            ));
+        }
+        let mut ref_cols = Vec::with_capacity(rc);
+        for _ in 0..rc {
+            ref_cols.push(read_u16(buf, pos)? as usize);
+        }
+        let actions = read_u8(buf, pos)?;
+        if actions & !0b1111 != 0 {
+            return Err(corrupt("reserved foreign-key action bit set"));
+        }
+        foreign_keys.push(ForeignKeyConstraint {
+            name: fname,
+            columns: cols,
+            ref_table,
+            ref_columns: ref_cols,
+            on_delete: fk_action_from_code(actions & 0b11)?,
+            on_update: fk_action_from_code((actions >> 2) & 0b11)?,
+        });
+    }
     let root_data_page = read_u32(buf, pos)?;
     Ok((
         Table {
@@ -2218,6 +2306,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             pk,
             checks,
             indexes,
+            foreign_keys,
         },
         root_data_page,
         index_roots,

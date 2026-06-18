@@ -62,6 +62,40 @@ pub struct CreateTable {
     /// resolution, the dedup/PK fold, and naming — spec/design/constraints.md §5). Each
     /// survivor becomes a unique secondary index (spec/design/indexes.md §8).
     pub uniques: Vec<UniqueDef>,
+    /// Every `FOREIGN KEY (cols) REFERENCES …` of the statement — the column-level
+    /// `REFERENCES` form collects as a one-member list — in **textual definition order** (it
+    /// drives resolution and naming — spec/design/constraints.md §6). CREATE TABLE's execution
+    /// resolves each (42703/42701/42P01/42830/42804), rejects unsupported actions (0A000), and
+    /// names the unnamed ones (42710).
+    pub foreign_keys: Vec<ForeignKeyDef>,
+}
+
+/// A referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md §6.6). Only
+/// `NoAction` (the default) and `Restrict` are supported — identical in jed (no deferrable
+/// constraints); the write-actions parse but are rejected `0A000` at CREATE TABLE.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RefAction {
+    NoAction,
+    Restrict,
+    Cascade,
+    SetNull,
+    SetDefault,
+}
+
+/// One parsed `FOREIGN KEY` / `REFERENCES` constraint (spec/design/grammar.md §43): the optional
+/// explicit `CONSTRAINT` name, the local (referencing) column names in list order, the referenced
+/// (parent) table name, the optional referenced column names (`None` = the parent's primary key),
+/// and the `ON DELETE` / `ON UPDATE` actions. Execution resolves it
+/// (42703/42701/42P01/42830/42804) and names the unnamed ones (42710) — spec/design/constraints.md
+/// §6.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ForeignKeyDef {
+    pub name: Option<String>,
+    pub columns: Vec<String>,
+    pub ref_table: String,
+    pub ref_columns: Option<Vec<String>>,
+    pub on_delete: RefAction,
+    pub on_update: RefAction,
 }
 
 /// One parsed `UNIQUE` constraint (spec/design/grammar.md §31): the optional explicit

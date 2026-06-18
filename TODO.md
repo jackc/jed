@@ -481,7 +481,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       INDEX`; a UNIQUE constraint **is** its backing unique index; NULLS-distinct enforcement;
       `format_version` 6 (per-index flags byte). Unlocks `ON CONFLICT`.
       → [constraints.md §5](spec/design/constraints.md), [indexes.md §8](spec/design/indexes.md)
-- [ ] **Constraints (remaining)** — `FOREIGN KEY`. Heavier. _(size: L)_
+- [x] **`FOREIGN KEY` constraints** — column-level `REFERENCES` + table-level `[CONSTRAINT name]
+      FOREIGN KEY (cols) REFERENCES parent (cols) [ON DELETE/UPDATE …]`; composite + self-reference;
+      referenced columns must be the parent PK or a UNIQUE set (`42830`), same-type pairing (`42804`,
+      stricter than PG); MATCH SIMPLE; enforced at four write sites (`23503`) in the two-phase pass,
+      batch-end-state-aware; `DROP TABLE` of a referenced table is `2BP01`; persisted under
+      `format_version` **11**. → [constraints.md §6](spec/design/constraints.md), [grammar.md §43](spec/design/grammar.md)
+  - [ ] _follow-on:_ the referential **actions** `ON DELETE/UPDATE CASCADE | SET NULL | SET DEFAULT`
+        (parse but `0A000` today — they write the child during a parent mutation); `MATCH FULL`;
+        a **backing index** on the child FK columns (the parent-side check full-scans children today);
+        FK type pairing relaxed to PG's comparable-types; `ALTER TABLE … ADD/DROP CONSTRAINT`.
 - [x] **Secondary indexes** (`CREATE INDEX` / `DROP INDEX`) — non-unique on-disk B-trees of
       empty-payload records, maintained in the two-phase pass; the planner index-bounds a SELECT
       base scan on a first-column equality; `format_version` 5 catalog reshape; DROP code `42809`.

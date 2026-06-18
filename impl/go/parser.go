@@ -274,6 +274,7 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	var tablePKs [][]string
 	var checks []CheckDef
 	var uniques []UniqueDef
+	var foreignKeys []ForeignKeyDef
 	for {
 		if p.peekKeyword() == "primary" && p.peekKeywordAt(1) == "key" {
 			p.advance()
@@ -295,8 +296,14 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 				return nil, err
 			}
 			uniques = append(uniques, u)
+		} else if p.atForeignKeyTableConstraint() {
+			fk, err := p.parseForeignKeyTableConstraint()
+			if err != nil {
+				return nil, err
+			}
+			foreignKeys = append(foreignKeys, fk)
 		} else {
-			col, err := p.parseColumnDef(&checks, &uniques)
+			col, err := p.parseColumnDef(&checks, &uniques, &foreignKeys)
 			if err != nil {
 				return nil, err
 			}
@@ -314,7 +321,144 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	if len(columns) == 0 {
 		return nil, NewError(SyntaxError, "a table must have at least one column")
 	}
-	return &CreateTable{Name: name, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques}, nil
+	return &CreateTable{Name: name, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys}, nil
+}
+
+// atForeignKeyTableConstraint reports whether the cursor sits on a table-level FOREIGN KEY
+// constraint: the two keywords FOREIGN KEY, or CONSTRAINT <ident> FOREIGN KEY
+// (spec/design/grammar.md §43). The keywords stay non-reserved — a column named "foreign"
+// would need a type named "key" (none exists), so the lookahead loses nothing (the PRIMARY
+// KEY precedent).
+func (p *Parser) atForeignKeyTableConstraint() bool {
+	if p.peekKeyword() == "foreign" && p.peekKeywordAt(1) == "key" {
+		return true
+	}
+	return p.peekKeyword() == "constraint" &&
+		p.peekKeywordAt(2) == "foreign" && p.peekKeywordAt(3) == "key"
+}
+
+// parseForeignKeyTableConstraint parses one table-level `[CONSTRAINT name] FOREIGN KEY ( col
+// [, col]* ) references_clause` (the cursor is verified by atForeignKeyTableConstraint). The
+// local-column list reuses the PRIMARY KEY list shape (spec/design/grammar.md §43).
+func (p *Parser) parseForeignKeyTableConstraint() (ForeignKeyDef, error) {
+	name := ""
+	if p.peekKeyword() == "constraint" {
+		p.advance()
+		n, err := p.expectIdentifier()
+		if err != nil {
+			return ForeignKeyDef{}, err
+		}
+		name = n
+	}
+	if err := p.expectKeyword("foreign"); err != nil {
+		return ForeignKeyDef{}, err
+	}
+	if err := p.expectKeyword("key"); err != nil {
+		return ForeignKeyDef{}, err
+	}
+	columns, err := p.parsePKColumnList()
+	if err != nil {
+		return ForeignKeyDef{}, err
+	}
+	refTable, refColumns, onDelete, onUpdate, err := p.parseReferencesClause()
+	if err != nil {
+		return ForeignKeyDef{}, err
+	}
+	return ForeignKeyDef{
+		Name:       name,
+		Columns:    columns,
+		RefTable:   refTable,
+		RefColumns: refColumns,
+		OnDelete:   onDelete,
+		OnUpdate:   onUpdate,
+	}, nil
+}
+
+// parseReferencesClause parses a references_clause from the REFERENCES keyword onward (shared
+// by the column-level and table-level forms — spec/design/grammar.md §43): the referenced
+// table, an optional referenced-column list (nil defaults to the parent's primary key), and
+// the ON DELETE / ON UPDATE actions (each at most once, either order; a repeat is 42601).
+func (p *Parser) parseReferencesClause() (string, []string, RefAction, RefAction, error) {
+	if err := p.expectKeyword("references"); err != nil {
+		return "", nil, 0, 0, err
+	}
+	refTable, err := p.expectIdentifier()
+	if err != nil {
+		return "", nil, 0, 0, err
+	}
+	var refColumns []string
+	if p.peek().Kind == TokLParen {
+		refColumns, err = p.parsePKColumnList()
+		if err != nil {
+			return "", nil, 0, 0, err
+		}
+	}
+	onDelete := RefNoAction
+	onUpdate := RefNoAction
+	seenDelete := false
+	seenUpdate := false
+	for p.peekKeyword() == "on" {
+		p.advance()
+		switch p.peekKeyword() {
+		case "delete":
+			p.advance()
+			if seenDelete {
+				return "", nil, 0, 0, NewError(SyntaxError, "ON DELETE specified more than once")
+			}
+			seenDelete = true
+			onDelete, err = p.parseReferentialAction()
+			if err != nil {
+				return "", nil, 0, 0, err
+			}
+		case "update":
+			p.advance()
+			if seenUpdate {
+				return "", nil, 0, 0, NewError(SyntaxError, "ON UPDATE specified more than once")
+			}
+			seenUpdate = true
+			onUpdate, err = p.parseReferentialAction()
+			if err != nil {
+				return "", nil, 0, 0, err
+			}
+		default:
+			return "", nil, 0, 0, NewError(SyntaxError, "expected DELETE or UPDATE after ON")
+		}
+	}
+	return refTable, refColumns, onDelete, onUpdate, nil
+}
+
+// parseReferentialAction parses one referential_action (spec/design/grammar.md §43). All five
+// PG actions parse; CASCADE / SET NULL / SET DEFAULT are rejected later at CREATE TABLE (0A000).
+func (p *Parser) parseReferentialAction() (RefAction, error) {
+	switch p.peekKeyword() {
+	case "no":
+		p.advance()
+		if err := p.expectKeyword("action"); err != nil {
+			return 0, err
+		}
+		return RefNoAction, nil
+	case "restrict":
+		p.advance()
+		return RefRestrict, nil
+	case "cascade":
+		p.advance()
+		return RefCascade, nil
+	case "set":
+		p.advance()
+		switch p.peekKeyword() {
+		case "null":
+			p.advance()
+			return RefSetNull, nil
+		case "default":
+			p.advance()
+			return RefSetDefault, nil
+		default:
+			return 0, NewError(SyntaxError, "expected NULL or DEFAULT after SET")
+		}
+	default:
+		return 0, NewError(SyntaxError,
+			"expected a referential action: NO ACTION / RESTRICT / CASCADE / SET NULL / SET DEFAULT")
+	}
 }
 
 // atCheckConstraint reports whether the cursor sits on a CHECK constraint: the keyword
@@ -422,7 +566,7 @@ func (p *Parser) parsePKColumnList() ([]string, error) {
 	}
 }
 
-func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef) (ColumnDef, error) {
+func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef, foreignKeys *[]ForeignKeyDef) (ColumnDef, error) {
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return ColumnDef{}, err
@@ -475,6 +619,27 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef) (Colum
 			*uniques = append(*uniques, UniqueDef{Name: cname, Columns: []string{name}})
 			continue
 		}
+		// CONSTRAINT <name> REFERENCES … in column position (the named one-member FK).
+		if p.peekKeyword() == "constraint" && p.peekKeywordAt(2) == "references" {
+			p.advance()
+			cname, err := p.expectIdentifier()
+			if err != nil {
+				return ColumnDef{}, err
+			}
+			refTable, refColumns, onDelete, onUpdate, err := p.parseReferencesClause()
+			if err != nil {
+				return ColumnDef{}, err
+			}
+			*foreignKeys = append(*foreignKeys, ForeignKeyDef{
+				Name:       cname,
+				Columns:    []string{name},
+				RefTable:   refTable,
+				RefColumns: refColumns,
+				OnDelete:   onDelete,
+				OnUpdate:   onUpdate,
+			})
+			continue
+		}
 		switch p.peekKeyword() {
 		case "primary":
 			p.advance()
@@ -504,6 +669,21 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef) (Colum
 		case "unique":
 			p.advance()
 			*uniques = append(*uniques, UniqueDef{Columns: []string{name}})
+		case "references":
+			// The column-level one-member FK: `REFERENCES parent [(col)] [actions]`.
+			// parseReferencesClause consumes the REFERENCES keyword itself.
+			refTable, refColumns, onDelete, onUpdate, err := p.parseReferencesClause()
+			if err != nil {
+				return ColumnDef{}, err
+			}
+			*foreignKeys = append(*foreignKeys, ForeignKeyDef{
+				Name:       "",
+				Columns:    []string{name},
+				RefTable:   refTable,
+				RefColumns: refColumns,
+				OnDelete:   onDelete,
+				OnUpdate:   onUpdate,
+			})
 		default:
 			return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def}, nil
 		}

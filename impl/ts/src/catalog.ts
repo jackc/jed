@@ -55,6 +55,33 @@ export type Table = {
   // The table's secondary indexes in ascending lowercased-name order (the catalog's
   // on-disk order and the planner's tie-break order — spec/design/indexes.md).
   indexes: IndexDef[];
+  // The table's FOREIGN KEY constraints in ascending lowercased-name order (the catalog's
+  // on-disk order and the child-side evaluation order — spec/design/constraints.md §6.9).
+  // Empty for a table with none.
+  fks: ForeignKey[];
+};
+
+// FkAction is the persisted referential action for a foreign key's `ON DELETE` / `ON UPDATE`
+// (spec/design/constraints.md §6.6). Only "noAction" (the default) and "restrict" are supported —
+// they are identical in jed (no deferrable constraints). The write-actions (CASCADE / SET NULL /
+// SET DEFAULT) are rejected 0A000 at CREATE TABLE, so never reach here; the on-disk encoding
+// reserves codes for them (format.md).
+export type FkAction = "noAction" | "restrict";
+
+// ForeignKey is one resolved FOREIGN KEY constraint of a table (spec/design/constraints.md §6):
+// its (per-table constraint-namespace) name, the referencing column ordinals into THIS table in
+// list order, the referenced (parent) table name, the referenced column ordinals into the PARENT
+// in list order (same length as columns), and the referential actions. An FK owns no B-tree;
+// enforcement probes the parent's PK store or a unique index (§6.4). Held in ascending
+// lowercased-name order on the table (the catalog's on-disk order and the child-side evaluation
+// order — §6.9).
+export type ForeignKey = {
+  name: string;
+  columns: number[];
+  refTable: string;
+  refColumns: number[];
+  onDelete: FkAction;
+  onUpdate: FkAction;
 };
 
 // IndexDef is one secondary index of a table (spec/design/indexes.md): its

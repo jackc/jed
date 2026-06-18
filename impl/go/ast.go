@@ -69,6 +69,46 @@ type CreateTable struct {
 	// spec/design/constraints.md §5). Each survivor becomes a unique secondary index
 	// (spec/design/indexes.md §8).
 	Uniques []UniqueDef
+	// ForeignKeys is every `FOREIGN KEY (cols) REFERENCES …` of the statement — the
+	// column-level `REFERENCES` form collects as a one-member list — in TEXTUAL DEFINITION
+	// ORDER (it drives resolution and naming — spec/design/constraints.md §6). CREATE TABLE's
+	// execution resolves each (42703/42701/42P01/42830/42804), rejects unsupported actions
+	// (0A000), and names the unnamed ones (42710).
+	ForeignKeys []ForeignKeyDef
+}
+
+// RefAction is a referential action for `ON DELETE` / `ON UPDATE`
+// (spec/design/constraints.md §6.6). Only NoAction (the default) and Restrict are
+// supported — identical in jed (no deferrable constraints); the write-actions parse but
+// are rejected 0A000 at CREATE TABLE.
+type RefAction int
+
+const (
+	// RefNoAction is the default NO ACTION.
+	RefNoAction RefAction = iota
+	// RefRestrict is RESTRICT.
+	RefRestrict
+	// RefCascade is CASCADE (parses; rejected 0A000).
+	RefCascade
+	// RefSetNull is SET NULL (parses; rejected 0A000).
+	RefSetNull
+	// RefSetDefault is SET DEFAULT (parses; rejected 0A000).
+	RefSetDefault
+)
+
+// ForeignKeyDef is one parsed `FOREIGN KEY` / `REFERENCES` constraint (spec/design/grammar.md
+// §43): the optional explicit CONSTRAINT name (empty = unnamed), the local (referencing)
+// column names in list order, the referenced (parent) table name, the optional referenced
+// column names (RefColumns nil = the parent's primary key), and the ON DELETE / ON UPDATE
+// actions. Execution resolves it (42703/42701/42P01/42830/42804) and names the unnamed ones
+// (42710) — spec/design/constraints.md §6.
+type ForeignKeyDef struct {
+	Name       string
+	Columns    []string
+	RefTable   string
+	RefColumns []string // nil = default to the parent's primary key
+	OnDelete   RefAction
+	OnUpdate   RefAction
 }
 
 // UniqueDef is one parsed UNIQUE constraint (spec/design/grammar.md §31): the optional

@@ -50,6 +50,10 @@ const (
 	// CheckViolation is 23514 — a candidate row falsified a CHECK expression at
 	// INSERT/UPDATE (spec/design/constraints.md §4).
 	CheckViolation
+	// ForeignKeyViolation is 23503 — a child INSERT/UPDATE whose key is absent in the parent,
+	// or a parent DELETE/UPDATE of a row still referenced by a child
+	// (spec/design/constraints.md §6).
+	ForeignKeyViolation
 	// ActiveSqlTransaction is 25001 — a BEGIN issued while a transaction is already open (no
 	// nesting — there is no SAVEPOINT this slice; spec/design/transactions.md §4.2).
 	ActiveSqlTransaction
@@ -75,6 +79,10 @@ const (
 	InvalidColumnReference
 	// DatatypeMismatch is 42804.
 	DatatypeMismatch
+	// InvalidForeignKey is 42830 — the referenced columns are not the parent's PRIMARY KEY or a
+	// UNIQUE constraint, or the referencing/referenced column counts disagree
+	// (spec/design/constraints.md §6.2). A type mismatch is DatatypeMismatch (42804) instead.
+	InvalidForeignKey
 	// DuplicateTable is 42P07 (CREATE TABLE of an existing name).
 	DuplicateTable
 	// DuplicateColumn is 42701 (two columns with the same name).
@@ -162,6 +170,8 @@ func (s SqlState) Code() string {
 		return "23505"
 	case CheckViolation:
 		return "23514"
+	case ForeignKeyViolation:
+		return "23503"
 	case ActiveSqlTransaction:
 		return "25001"
 	case ReadOnlySqlTransaction:
@@ -182,6 +192,8 @@ func (s SqlState) Code() string {
 		return "42P10"
 	case DatatypeMismatch:
 		return "42804"
+	case InvalidForeignKey:
+		return "42830"
 	case DuplicateTable:
 		return "42P07"
 	case DuplicateColumn:

@@ -69,6 +69,34 @@ pub struct IndexDef {
     pub unique: bool,
 }
 
+/// The persisted referential action for a foreign key's `ON DELETE` / `ON UPDATE`
+/// (spec/design/constraints.md §6.6). Only `NoAction` (the default) and `Restrict` are
+/// supported — they are identical in jed (no deferrable constraints). The write-actions
+/// (CASCADE / SET NULL / SET DEFAULT) are rejected `0A000` at CREATE TABLE, so never reach here;
+/// the on-disk encoding reserves codes for them (format.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FkAction {
+    NoAction,
+    Restrict,
+}
+
+/// One resolved `FOREIGN KEY` constraint of a table (spec/design/constraints.md §6): its
+/// (per-table constraint-namespace) name, the referencing column ordinals into **this** table in
+/// list order, the referenced (parent) table name, the referenced column ordinals into the
+/// **parent** in list order (same length as `columns`), and the referential actions. An FK owns no
+/// B-tree; enforcement probes the parent's PK store or a unique index (§6.4). Held in ascending
+/// lowercased-name order on the table (the catalog's on-disk order and the child-side evaluation
+/// order — §6.9).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ForeignKeyConstraint {
+    pub name: String,
+    pub columns: Vec<usize>,
+    pub ref_table: String,
+    pub ref_columns: Vec<usize>,
+    pub on_delete: FkAction,
+    pub on_update: FkAction,
+}
+
 /// A user-defined **composite (row) type** (spec/design/composite.md): a named, ordered list of
 /// typed fields, living in the database's type catalog (a database-level object, not per-table).
 /// Created by `CREATE TYPE name AS (field type, …)`, referenced by name from a column's `Type`.
@@ -110,6 +138,10 @@ pub struct Table {
     /// The table's secondary indexes in **ascending lowercased-name order** (the catalog's
     /// on-disk order and the planner's tie-break order — spec/design/indexes.md §5/§6).
     pub indexes: Vec<IndexDef>,
+    /// The table's FOREIGN KEY constraints in **ascending lowercased-name order** (the catalog's
+    /// on-disk order and the child-side evaluation order — spec/design/constraints.md §6.9).
+    /// Empty for a table with none.
+    pub foreign_keys: Vec<ForeignKeyConstraint>,
 }
 
 /// A fully-resolved storage/codec column type (spec/design/composite.md §4): a scalar, or a

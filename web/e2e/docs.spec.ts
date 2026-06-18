@@ -29,25 +29,46 @@ test('the tables page enforces a CHECK constraint live and resets to seed', asyn
 	await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 });
 
+test('the tables page enforces a FOREIGN KEY constraint live (23503) and resets to seed', async ({
+	page,
+}) => {
+	await page.goto('/docs/sql/tables/');
+	const panel = page.getByTestId('live-sql');
+	await expect(panel.getByTestId('result-rows')).toContainText('Ada');
+
+	// A child row referencing a non-existent account traps 23503.
+	await panel.getByTestId('sql-input').fill('INSERT INTO txn VALUES (3, 99, 5)');
+	await panel.getByTestId('run-button').click();
+	await expect(panel.getByTestId('error-code')).toHaveText('23503');
+
+	// The parent side: deleting an account still referenced by a txn also traps 23503.
+	await panel.getByTestId('sql-input').fill('DELETE FROM account WHERE id = 1');
+	await panel.getByTestId('run-button').click();
+	await expect(panel.getByTestId('error-code')).toHaveText('23503');
+
+	await panel.getByTestId('reset-button').click();
+	await expect(panel.getByTestId('result-rows')).toContainText('Ada');
+});
+
 test('the select page runs the array containment operators live (@> / <@ / &&)', async ({ page }) => {
 	await page.goto('/docs/sql/select/');
-	// Fifth LiveSql panel = the @>/<@/&& demo; every column is true (the array sets contain/overlap).
-	const panel = page.getByTestId('live-sql').nth(4);
+	// Seventh LiveSql panel = the @>/<@/&& demo; every column is true (the array sets contain/overlap).
+	const panel = page.getByTestId('live-sql').nth(6);
 	await expect(panel.getByTestId('result-rows')).toContainText('true');
 });
 
 test('the select page runs the ANY/ALL quantified comparisons live', async ({ page }) => {
 	await page.goto('/docs/sql/select/');
-	// Sixth LiveSql panel = the = ANY / > ALL demo: any_match true, all_greater true, no_match false.
-	const panel = page.getByTestId('live-sql').nth(5);
+	// Eighth LiveSql panel = the = ANY / > ALL demo: any_match true, all_greater true, no_match false.
+	const panel = page.getByTestId('live-sql').nth(7);
 	await expect(panel.getByTestId('result-rows')).toContainText('true');
 	await expect(panel.getByTestId('result-rows')).toContainText('false');
 });
 
 test('the select page runs the VARIADIC num_nulls demo live', async ({ page }) => {
 	await page.goto('/docs/sql/select/');
-	// Seventh LiveSql panel = the num_nulls demo: spread 1, variadic 1, non_nulls 2 (both forms agree).
-	const panel = page.getByTestId('live-sql').nth(6);
+	// Tenth LiveSql panel = the num_nulls demo: spread 1, variadic 1, non_nulls 2 (both forms agree).
+	const panel = page.getByTestId('live-sql').nth(9);
 	await expect(panel.getByTestId('result-rows')).toContainText('1');
 	await expect(panel.getByTestId('result-rows')).toContainText('2');
 });
@@ -56,9 +77,9 @@ test('the select page runs the array-of-composite demo live (field access into a
 	page,
 }) => {
 	await page.goto('/docs/sql/select/');
-	// Eighth LiveSql panel = the addr[] demo: row 1's first element renders (Main,90210), its street
+	// Eleventh LiveSql panel = the addr[] demo: row 1's first element renders (Main,90210), its street
 	// is Main and zip 90210 — array-of-composite construction, subscript, and field access (§12 AC1).
-	const panel = page.getByTestId('live-sql').nth(7);
+	const panel = page.getByTestId('live-sql').nth(10);
 	await expect(panel.getByTestId('result-rows')).toContainText('(Main,90210)');
 	await expect(panel.getByTestId('result-rows')).toContainText('Main');
 	await expect(panel.getByTestId('result-rows')).toContainText('90210');
@@ -68,10 +89,10 @@ test('the select page runs the composite-with-array-field demo live (field acces
 	page,
 }) => {
 	await page.goto('/docs/sql/select/');
-	// Ninth LiveSql panel = the poly(name, pts int32[]) demo: row 1 renders its array field
+	// Fourteenth LiveSql panel = the poly(name, pts int32[]) demo: row 1 renders its array field
 	// {10,20,30}, (p).pts reads the whole array, and (p).pts[1] reads the first element 10 —
 	// a composite type with an array-typed field (array.md §12, the mirror of array-of-composite).
-	const panel = page.getByTestId('live-sql').nth(8);
+	const panel = page.getByTestId('live-sql').nth(13);
 	await expect(panel.getByTestId('result-rows')).toContainText('{10,20,30}');
 	await expect(panel.getByTestId('result-rows')).toContainText('10');
 });

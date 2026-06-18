@@ -132,6 +132,24 @@ func uniqueTableDB(t *testing.T) *Database {
 	return db
 }
 
+// fkTableDB exercises FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): a child
+// table c with four FKs — a default-PK reference, a named UNIQUE reference, a composite UNIQUE
+// reference with ON DELETE RESTRICT, and a self-reference — pinning the catalog foreign-key list
+// (the name + local/ref ordinals + actions byte). Must match the Ruby reference's FK_TABLE
+// (spec/fileformat/verify.rb).
+func fkTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE p (pid int32 PRIMARY KEY, code int32 UNIQUE, a int32, b int32, UNIQUE (a, b))")
+	run(t, db, "INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)")
+	run(t, db, "CREATE TABLE c (id int32 PRIMARY KEY, pid int32, pcode int32, x int32, y int32, mgr int32, "+
+		"FOREIGN KEY (pid) REFERENCES p (pid), "+
+		"CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), "+
+		"FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT, "+
+		"FOREIGN KEY (mgr) REFERENCES c (id))")
+	run(t, db, "INSERT INTO c VALUES (10, 1, 100, 10, 20, NULL), (11, 2, 200, 30, 40, 10)")
+	return db
+}
+
 // arrayTableDB has ARRAY (T[]) columns (v10 — spec/design/array.md): pins the catalog array-column
 // entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). An
 // int32[] (fixed-width elements: no per-element length prefix) and a text[]; row 2 has an EMPTY
@@ -513,6 +531,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"check_table.jed", checkTableDB},
 		{"index_table.jed", indexTableDB},
 		{"unique_table.jed", uniqueTableDB},
+		{"fk_table.jed", fkTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"nested_composite_table.jed", nestedCompositeTableDB},
 		{"array_table.jed", arrayTableDB},
@@ -561,6 +580,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"check_table.jed", checkTableDB, "t"},
 		{"index_table.jed", indexTableDB, "t"},
 		{"unique_table.jed", uniqueTableDB, "t"},
+		{"fk_table.jed", fkTableDB, "c"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},
 		{"array_table.jed", arrayTableDB, "t"},

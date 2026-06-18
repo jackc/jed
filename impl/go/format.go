@@ -22,7 +22,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 10    // on-disk format version (10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4). 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 9 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion   uint16 = 11    // on-disk format version (11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6). 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 10 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -1828,8 +1828,53 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 		}
 		out = appendU32(out, indexRoots[k])
 	}
+	// Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
+	// table, list order), the referenced table name, the referenced-column ordinals (into the
+	// PARENT, list order), and the actions byte (bits 0-1 on_delete, bits 2-3 on_update) — in the
+	// catalog's ascending lowercased-name order (spec/design/constraints.md §6.9). An FK owns no
+	// B-tree (no root page).
+	out = appendU16(out, uint16(len(table.ForeignKeys)))
+	for _, fk := range table.ForeignKeys {
+		out = appendU16(out, uint16(len(fk.Name)))
+		out = append(out, fk.Name...)
+		out = appendU16(out, uint16(len(fk.Columns)))
+		for _, c := range fk.Columns {
+			out = appendU16(out, uint16(c))
+		}
+		out = appendU16(out, uint16(len(fk.RefTable)))
+		out = append(out, fk.RefTable...)
+		out = appendU16(out, uint16(len(fk.RefColumns)))
+		for _, c := range fk.RefColumns {
+			out = appendU16(out, uint16(c))
+		}
+		out = append(out, fkActionCode(fk.OnDelete)|(fkActionCode(fk.OnUpdate)<<2))
+	}
 	out = appendU32(out, rootDataPage)
 	return out
+}
+
+// fkActionCode is the 2-bit on-disk code for a referential action (format.md): NO ACTION = 0,
+// RESTRICT = 1.
+func fkActionCode(a FkAction) byte {
+	switch a {
+	case FkRestrict:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// fkActionFromCode decodes a 2-bit referential-action code; an unsupported code (2/3, reserved
+// for the deferred write-actions) in an otherwise-valid file is XX001.
+func fkActionFromCode(c byte) (FkAction, error) {
+	switch c {
+	case 0:
+		return FkNoAction, nil
+	case 1:
+		return FkRestrict, nil
+	default:
+		return 0, NewError(DataCorrupted, "unsupported foreign-key action code")
+	}
 }
 
 // pack greedily packs item sizes into pages of capacity cap, returning groups of
@@ -2277,11 +2322,87 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 		indexes = append(indexes, IndexDef{Name: iname, Columns: cols, Unique: iflags&0b01 != 0})
 		indexRoots = append(indexRoots, iroot)
 	}
+	// Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
+	// actions byte, in the catalog's (lowercased-name ascending) order — a reader trusts the
+	// order. The local ordinals index THIS table; the referenced ordinals index the PARENT (whose
+	// entry may be decoded later, so they are not cross-checked here — the writer keeps them
+	// valid; a structurally impossible FK is rejected below).
+	fkCount, err := readU16(buf, pos)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+	foreignKeys := make([]ForeignKey, 0, fkCount)
+	for i := uint16(0); i < fkCount; i++ {
+		fname, err := readString(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		lc, err := readU16(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if lc == 0 {
+			return nil, 0, nil, NewError(DataCorrupted, "foreign key with no columns")
+		}
+		cols := make([]int, 0, lc)
+		for j := uint16(0); j < lc; j++ {
+			ord, err := readU16(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			if int(ord) >= len(columns) {
+				return nil, 0, nil, NewError(DataCorrupted, "invalid foreign-key column ordinal")
+			}
+			cols = append(cols, int(ord))
+		}
+		refTable, err := readString(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		rc, err := readU16(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if rc != lc {
+			return nil, 0, nil, NewError(DataCorrupted, "foreign-key referencing/referenced column count mismatch")
+		}
+		refCols := make([]int, 0, rc)
+		for j := uint16(0); j < rc; j++ {
+			ord, err := readU16(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			refCols = append(refCols, int(ord))
+		}
+		actions, err := readU8(buf, pos)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		if actions&^byte(0b1111) != 0 {
+			return nil, 0, nil, NewError(DataCorrupted, "reserved foreign-key action bit set")
+		}
+		onDelete, err := fkActionFromCode(actions & 0b11)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		onUpdate, err := fkActionFromCode((actions >> 2) & 0b11)
+		if err != nil {
+			return nil, 0, nil, err
+		}
+		foreignKeys = append(foreignKeys, ForeignKey{
+			Name:       fname,
+			Columns:    cols,
+			RefTable:   refTable,
+			RefColumns: refCols,
+			OnDelete:   onDelete,
+			OnUpdate:   onUpdate,
+		})
+	}
 	root, err := readU32(buf, pos)
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	return &Table{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes}, root, indexRoots, nil
+	return &Table{Name: name, Columns: columns, PK: pk, Checks: checks, Indexes: indexes, ForeignKeys: foreignKeys}, root, indexRoots, nil
 }
 
 // readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL

@@ -113,6 +113,25 @@ function uniqueTableDB(): Database {
   return db;
 }
 
+// fkTableDB has FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog
+// foreign-key list. Parent `p` (a PK + two UNIQUE constraints, the FK targets); child `c` with
+// four FKs covering every shape — a named FK to the UNIQUE column (c_code_fk), a self-reference to
+// the PK (c_mgr_fkey), an auto-named FK to the PK (c_pid_fkey), and an auto-named COMPOSITE FK to
+// the two-column UNIQUE with ON DELETE RESTRICT (c_x_y_fkey, the lone non-zero actions byte). Must
+// match the Ruby reference's FK_TABLE (spec/fileformat/verify.rb).
+function fkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE p (pid int32 PRIMARY KEY, code int32 UNIQUE, a int32, b int32, UNIQUE (a, b))");
+  run(db, "INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)");
+  run(db, "CREATE TABLE c (id int32 PRIMARY KEY, pid int32, pcode int32, x int32, y int32, mgr int32, " +
+    "FOREIGN KEY (pid) REFERENCES p (pid), " +
+    "CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), " +
+    "FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT, " +
+    "FOREIGN KEY (mgr) REFERENCES c (id))");
+  run(db, "INSERT INTO c VALUES (10, 1, 100, 10, 20, NULL), (11, 2, 200, 30, 40, 10)");
+  return db;
+}
+
 // arrayTableDB has ARRAY (T[]) columns (v10 — spec/design/array.md): pins the catalog array-column
 // entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). An
 // int32[] (fixed-width elements: no per-element length prefix) and a text[]; row 2 has an EMPTY
@@ -469,6 +488,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "check_table.jed", build: checkTableDB },
     { name: "index_table.jed", build: indexTableDB },
     { name: "unique_table.jed", build: uniqueTableDB },
+    { name: "fk_table.jed", build: fkTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB },
     { name: "array_table.jed", build: arrayTableDB },
@@ -512,6 +532,7 @@ test("read goldens reproduces rows", () => {
     { name: "check_table.jed", build: checkTableDB, table: "t" },
     { name: "index_table.jed", build: indexTableDB, table: "t" },
     { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
+    { name: "fk_table.jed", build: fkTableDB, table: "c" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB, table: "t" },
     { name: "array_table.jed", build: arrayTableDB, table: "t" },

@@ -6,10 +6,10 @@
 
 use crate::ast::{
     Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, CreateType, Cte,
-    DefaultDef, Delete, DropIndex, DropTable, DropType, Expr, Insert, InsertSource, InsertValue,
-    JoinClause, JoinKind, Literal, OrderKey, QueryExpr, Select, SelectItem, SelectItems, SetOp,
-    SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
-    Update, WithQuery,
+    DefaultDef, Delete, DropIndex, DropTable, DropType, Expr, ForeignKeyDef, Insert, InsertSource,
+    InsertValue, JoinClause, JoinKind, Literal, OrderKey, QueryExpr, RefAction, Select, SelectItem,
+    SelectItems, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod,
+    UnaryOp, UniqueDef, Update, WithQuery,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -207,6 +207,7 @@ impl Parser {
         let mut table_pks = Vec::new();
         let mut checks = Vec::new();
         let mut uniques = Vec::new();
+        let mut foreign_keys = Vec::new();
         loop {
             if self.peek_keyword().as_deref() == Some("primary")
                 && self.peek_keyword_at(1).as_deref() == Some("key")
@@ -218,8 +219,14 @@ impl Parser {
                 checks.push(self.parse_check_constraint()?);
             } else if self.at_unique_table_constraint() {
                 uniques.push(self.parse_unique_table_constraint()?);
+            } else if self.at_foreign_key_table_constraint() {
+                foreign_keys.push(self.parse_foreign_key_table_constraint()?);
             } else {
-                columns.push(self.parse_column_def(&mut checks, &mut uniques)?);
+                columns.push(self.parse_column_def(
+                    &mut checks,
+                    &mut uniques,
+                    &mut foreign_keys,
+                )?);
             }
             match self.advance() {
                 Token::Comma => continue,
@@ -236,7 +243,124 @@ impl Parser {
             table_pks,
             checks,
             uniques,
+            foreign_keys,
         })
+    }
+
+    /// Whether the cursor sits on a table-level `FOREIGN KEY` constraint: the two keywords
+    /// `FOREIGN KEY`, or `CONSTRAINT <ident> FOREIGN KEY` (spec/design/grammar.md §43). The
+    /// keywords stay non-reserved — a column named `foreign` would need a type named `key`
+    /// (none exists), so the lookahead loses nothing (the `PRIMARY KEY` precedent).
+    fn at_foreign_key_table_constraint(&self) -> bool {
+        (self.peek_keyword().as_deref() == Some("foreign")
+            && self.peek_keyword_at(1).as_deref() == Some("key"))
+            || (self.peek_keyword().as_deref() == Some("constraint")
+                && self.peek_keyword_at(2).as_deref() == Some("foreign")
+                && self.peek_keyword_at(3).as_deref() == Some("key"))
+    }
+
+    /// Parse one table-level `[CONSTRAINT name] FOREIGN KEY ( col [, col]* ) references_clause`
+    /// (the cursor is verified by `at_foreign_key_table_constraint`). The local-column list
+    /// reuses the PRIMARY KEY list shape (spec/design/grammar.md §43).
+    fn parse_foreign_key_table_constraint(&mut self) -> Result<ForeignKeyDef> {
+        let name = if self.peek_keyword().as_deref() == Some("constraint") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
+        self.expect_keyword("foreign")?;
+        self.expect_keyword("key")?;
+        let columns = self.parse_pk_column_list()?;
+        let (ref_table, ref_columns, on_delete, on_update) = self.parse_references_clause()?;
+        Ok(ForeignKeyDef {
+            name,
+            columns,
+            ref_table,
+            ref_columns,
+            on_delete,
+            on_update,
+        })
+    }
+
+    /// Parse a `references_clause` from the `REFERENCES` keyword onward (shared by the
+    /// column-level and table-level forms — spec/design/grammar.md §43): the referenced table,
+    /// an optional referenced-column list (`None` defaults to the parent's primary key), and the
+    /// `ON DELETE` / `ON UPDATE` actions (each at most once, either order; a repeat is 42601).
+    fn parse_references_clause(
+        &mut self,
+    ) -> Result<(String, Option<Vec<String>>, RefAction, RefAction)> {
+        self.expect_keyword("references")?;
+        let ref_table = self.expect_identifier()?;
+        let ref_columns = if matches!(self.peek(), Token::LParen) {
+            Some(self.parse_pk_column_list()?)
+        } else {
+            None
+        };
+        let mut on_delete = RefAction::NoAction;
+        let mut on_update = RefAction::NoAction;
+        let mut seen_delete = false;
+        let mut seen_update = false;
+        while self.peek_keyword().as_deref() == Some("on") {
+            self.advance();
+            match self.peek_keyword().as_deref() {
+                Some("delete") => {
+                    self.advance();
+                    if seen_delete {
+                        return Err(syntax("ON DELETE specified more than once"));
+                    }
+                    seen_delete = true;
+                    on_delete = self.parse_referential_action()?;
+                }
+                Some("update") => {
+                    self.advance();
+                    if seen_update {
+                        return Err(syntax("ON UPDATE specified more than once"));
+                    }
+                    seen_update = true;
+                    on_update = self.parse_referential_action()?;
+                }
+                _ => return Err(syntax("expected DELETE or UPDATE after ON")),
+            }
+        }
+        Ok((ref_table, ref_columns, on_delete, on_update))
+    }
+
+    /// Parse one `referential_action` (spec/design/grammar.md §43). All five PG actions parse;
+    /// CASCADE / SET NULL / SET DEFAULT are rejected later at CREATE TABLE (0A000).
+    fn parse_referential_action(&mut self) -> Result<RefAction> {
+        match self.peek_keyword().as_deref() {
+            Some("no") => {
+                self.advance();
+                self.expect_keyword("action")?;
+                Ok(RefAction::NoAction)
+            }
+            Some("restrict") => {
+                self.advance();
+                Ok(RefAction::Restrict)
+            }
+            Some("cascade") => {
+                self.advance();
+                Ok(RefAction::Cascade)
+            }
+            Some("set") => {
+                self.advance();
+                match self.peek_keyword().as_deref() {
+                    Some("null") => {
+                        self.advance();
+                        Ok(RefAction::SetNull)
+                    }
+                    Some("default") => {
+                        self.advance();
+                        Ok(RefAction::SetDefault)
+                    }
+                    _ => Err(syntax("expected NULL or DEFAULT after SET")),
+                }
+            }
+            _ => Err(syntax(
+                "expected a referential action: NO ACTION / RESTRICT / CASCADE / SET NULL / SET DEFAULT",
+            )),
+        }
     }
 
     /// Whether the cursor sits on a `CHECK` constraint: the keyword `CHECK` followed by `(`,
@@ -316,6 +440,7 @@ impl Parser {
         &mut self,
         checks: &mut Vec<CheckDef>,
         uniques: &mut Vec<UniqueDef>,
+        foreign_keys: &mut Vec<ForeignKeyDef>,
     ) -> Result<ColumnDef> {
         let name = self.expect_identifier()?;
         let base_type = self.expect_identifier()?;
@@ -357,6 +482,24 @@ impl Parser {
                 });
                 continue;
             }
+            // `CONSTRAINT <name> REFERENCES …` in column position (the named one-member FK).
+            if self.peek_keyword().as_deref() == Some("constraint")
+                && self.peek_keyword_at(2).as_deref() == Some("references")
+            {
+                self.advance();
+                let cname = self.expect_identifier()?;
+                let (ref_table, ref_columns, on_delete, on_update) =
+                    self.parse_references_clause()?;
+                foreign_keys.push(ForeignKeyDef {
+                    name: Some(cname),
+                    columns: vec![name.clone()],
+                    ref_table,
+                    ref_columns,
+                    on_delete,
+                    on_update,
+                });
+                continue;
+            }
             match self.peek_keyword().as_deref() {
                 Some("primary") => {
                     self.advance();
@@ -384,6 +527,20 @@ impl Parser {
                     uniques.push(UniqueDef {
                         name: None,
                         columns: vec![name.clone()],
+                    });
+                }
+                Some("references") => {
+                    // The column-level one-member FK: `REFERENCES parent [(col)] [actions]`.
+                    // `parse_references_clause` consumes the `REFERENCES` keyword itself.
+                    let (ref_table, ref_columns, on_delete, on_update) =
+                        self.parse_references_clause()?;
+                    foreign_keys.push(ForeignKeyDef {
+                        name: None,
+                        columns: vec![name.clone()],
+                        ref_table,
+                        ref_columns,
+                        on_delete,
+                        on_update,
                     });
                 }
                 _ => break,

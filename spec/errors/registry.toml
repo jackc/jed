@@ -126,6 +126,18 @@ name = "check_violation"
 class = "integrity constraint violation"
 template = "new row for relation {table} violates check constraint {name}"
 
+[[error]]
+code = "23503"
+name = "foreign_key_violation"
+class = "integrity constraint violation"
+# Two enforcement directions (spec/design/constraints.md §6). Child side — an INSERT/UPDATE whose
+# foreign-key value is absent in the referenced (parent) table: "insert or update on table {table}
+# violates foreign key constraint {name}". Parent side — a DELETE/UPDATE of a referenced row still
+# referenced by a child: "update or delete on table {table} violates foreign key constraint {name}".
+# {table} is the table the write targets; {name} is the foreign-key constraint. (Unlike PostgreSQL,
+# jed carries no separate DETAIL line — house style, codes match.)
+template = "insert or update on table {table} violates foreign key constraint {name}"
+
 # --- invalid transaction state (class 25) -----------------------------------
 # Raised by the transaction-control surface (spec/design/transactions.md §4/§6):
 # BEGIN/COMMIT/ROLLBACK, the read-only access mode, and the failed-transaction
@@ -202,6 +214,17 @@ code = "42804"
 name = "datatype_mismatch"
 class = "syntax error or access rule violation"
 template = "datatype mismatch: {detail}"
+
+[[error]]
+code = "42830"
+name = "invalid_foreign_key"
+class = "syntax error or access rule violation"
+# At CREATE TABLE (spec/design/constraints.md §6), a FOREIGN KEY whose referenced columns are not the
+# parent's PRIMARY KEY or a UNIQUE constraint ("there is no unique constraint matching given keys for
+# referenced table {name}"), or whose referencing/referenced column counts disagree ("number of
+# referencing and referenced columns for foreign key disagree"). A referencing/referenced *type*
+# mismatch is 42804 instead (datatype_mismatch).
+template = "there is no unique constraint matching given keys for referenced table {name}"
 
 [[error]]
 code = "42701"

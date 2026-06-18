@@ -45,6 +45,10 @@ id = "ddl.check"
 description = "CHECK constraints — column-level and table-level [CONSTRAINT name] CHECK (expr): boolean row predicates enforced per candidate row at INSERT/UPDATE (23514; TRUE/NULL pass), evaluated in name order; PG auto-naming (t_col_check / t_check + suffixes); DDL rejections 42804/0A000/42803/42P02/42703/42710; persisted as expression text in the v4 catalog (spec/design/constraints.md §4, grammar.md §29)"
 
 [[capability]]
+id = "ddl.foreign_key"
+description = "FOREIGN KEY constraints — column-level REFERENCES and table-level [CONSTRAINT name] FOREIGN KEY (cols) REFERENCES parent (cols) [ON DELETE/UPDATE NO ACTION|RESTRICT]: referential integrity enforced at four write sites (child INSERT/UPDATE 23503 when the key is absent in the parent — batch end-state-aware; parent DELETE/UPDATE 23503 when a child still references the row), MATCH SIMPLE NULL exemption; referenced columns must be the parent PK or a UNIQUE set (42830), same-type pairing (42804, stricter than PG), PG auto-naming (t_col_fkey + suffixes), per-table constraint namespace 42710; CASCADE/SET NULL/SET DEFAULT and MATCH FULL are 0A000; DROP TABLE of a referenced table is 2BP01; persisted in the v11 catalog (spec/design/constraints.md §6, grammar.md §43)"
+
+[[capability]]
 id = "ddl.drop_table"
 description = "DROP TABLE — remove a table (definition + rows) from the catalog; missing table is 42P01 (grammar.md §13)"
 

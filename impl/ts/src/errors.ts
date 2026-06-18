@@ -21,6 +21,7 @@ export type SqlState =
   | "invalid_row_count_in_limit_clause" // 2201W — a negative LIMIT count
   | "invalid_row_count_in_offset_clause" // 2201X — a negative OFFSET count
   | "not_null_violation" // 23502
+  | "foreign_key_violation" // 23503 — a child INSERT/UPDATE whose key is absent in the parent, or a parent DELETE/UPDATE of a still-referenced row (constraints.md §6)
   | "unique_violation" // 23505 — primary-key uniqueness
   | "check_violation" // 23514 — a candidate row falsified a CHECK expression (constraints.md §4)
   | "active_sql_transaction" // 25001 — a nested BEGIN (no SAVEPOINT this slice; transactions.md §4.2)
@@ -33,6 +34,7 @@ export type SqlState =
   | "undefined_object" // 42704 — e.g. an unknown type name
   | "invalid_column_reference" // 42P10 — SELECT DISTINCT ORDER BY key not in select list
   | "datatype_mismatch" // 42804
+  | "invalid_foreign_key" // 42830 — referenced columns are not the parent's PK or a UNIQUE set, or the referencing/referenced column counts disagree (constraints.md §6.2)
   | "duplicate_table" // 42P07
   | "duplicate_column" // 42701
   | "duplicate_alias" // 42712 — two FROM relations share a label (a self-join needs aliases; §15)
@@ -67,6 +69,7 @@ const CODES: Record<SqlState, string> = {
   invalid_row_count_in_limit_clause: "2201W",
   invalid_row_count_in_offset_clause: "2201X",
   not_null_violation: "23502",
+  foreign_key_violation: "23503",
   unique_violation: "23505",
   check_violation: "23514",
   active_sql_transaction: "25001",
@@ -79,6 +82,7 @@ const CODES: Record<SqlState, string> = {
   undefined_object: "42704",
   invalid_column_reference: "42P10",
   datatype_mismatch: "42804",
+  invalid_foreign_key: "42830",
   duplicate_table: "42P07",
   duplicate_column: "42701",
   duplicate_alias: "42712",

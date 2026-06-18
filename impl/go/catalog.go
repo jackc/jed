@@ -55,6 +55,40 @@ type Table struct {
 	// Indexes is the table's secondary indexes in ascending lowercased-name order (the
 	// catalog's on-disk order and the planner's tie-break order — spec/design/indexes.md).
 	Indexes []IndexDef
+	// ForeignKeys is the table's FOREIGN KEY constraints in ascending lowercased-name order
+	// (the catalog's on-disk order and the child-side evaluation order —
+	// spec/design/constraints.md §6.9). Empty for a table with none.
+	ForeignKeys []ForeignKey
+}
+
+// FkAction is the persisted referential action for a foreign key's `ON DELETE` / `ON UPDATE`
+// (spec/design/constraints.md §6.6). Only FkNoAction (the default) and FkRestrict are
+// supported — they are identical in jed (no deferrable constraints). The write-actions
+// (CASCADE / SET NULL / SET DEFAULT) are rejected 0A000 at CREATE TABLE, so never reach here;
+// the on-disk encoding reserves codes for them (format.md).
+type FkAction int
+
+const (
+	// FkNoAction is NO ACTION (the default), on-disk code 0.
+	FkNoAction FkAction = iota
+	// FkRestrict is RESTRICT, on-disk code 1.
+	FkRestrict
+)
+
+// ForeignKey is one resolved FOREIGN KEY constraint of a table (spec/design/constraints.md §6):
+// its (per-table constraint-namespace) name, the referencing column ordinals into THIS table in
+// list order, the referenced (parent) table name, the referenced column ordinals into the PARENT
+// in list order (same length as Columns), and the referential actions. An FK owns no B-tree;
+// enforcement probes the parent's PK store or a unique index (§6.4). Held in ascending
+// lowercased-name order on the table (the catalog's on-disk order and the child-side evaluation
+// order — §6.9).
+type ForeignKey struct {
+	Name       string
+	Columns    []int
+	RefTable   string
+	RefColumns []int
+	OnDelete   FkAction
+	OnUpdate   FkAction
 }
 
 // IndexDef is one secondary index of a table (spec/design/indexes.md): its

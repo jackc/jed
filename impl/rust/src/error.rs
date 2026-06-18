@@ -50,6 +50,10 @@ pub enum SqlState {
     /// 23514 — check constraint violation: a candidate row falsified a CHECK
     /// expression at INSERT/UPDATE (spec/design/constraints.md §4).
     CheckViolation,
+    /// 23503 — foreign-key violation: a child INSERT/UPDATE whose key is absent in the parent,
+    /// or a parent DELETE/UPDATE of a row still referenced by a child
+    /// (spec/design/constraints.md §6).
+    ForeignKeyViolation,
     /// 25001 — a `BEGIN` issued while a transaction is already open (no nesting — there is no
     /// SAVEPOINT this slice; spec/design/transactions.md §4.2).
     ActiveSqlTransaction,
@@ -74,6 +78,10 @@ pub enum SqlState {
     InvalidColumnReference,
     /// 42804 — datatype mismatch (a value's type is wrong for its context).
     DatatypeMismatch,
+    /// 42830 — invalid foreign key: the referenced columns are not the parent's PRIMARY KEY or a
+    /// UNIQUE constraint, or the referencing/referenced column counts disagree
+    /// (spec/design/constraints.md §6.2). A type mismatch is `DatatypeMismatch` (42804) instead.
+    InvalidForeignKey,
     /// 42P07 — duplicate table/relation: CREATE TABLE or CREATE INDEX of a name already
     /// taken in the shared relation namespace (spec/design/indexes.md §2).
     DuplicateTable,
@@ -149,6 +157,7 @@ impl SqlState {
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
             SqlState::CheckViolation => "23514",
+            SqlState::ForeignKeyViolation => "23503",
             SqlState::ActiveSqlTransaction => "25001",
             SqlState::ReadOnlySqlTransaction => "25006",
             SqlState::InFailedSqlTransaction => "25P02",
@@ -159,6 +168,7 @@ impl SqlState {
             SqlState::UndefinedObject => "42704",
             SqlState::InvalidColumnReference => "42P10",
             SqlState::DatatypeMismatch => "42804",
+            SqlState::InvalidForeignKey => "42830",
             SqlState::DuplicateTable => "42P07",
             SqlState::DuplicateColumn => "42701",
             SqlState::DuplicateAlias => "42712",

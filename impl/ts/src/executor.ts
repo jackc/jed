@@ -20,6 +20,7 @@ import type {
   Literal,
   OrderKey,
   QueryExpr,
+  RefAction,
   Select,
   SelectItems,
   SetOp,
@@ -38,6 +39,8 @@ import {
   type CompositeField,
   type CompositeType,
   type DefaultExpr,
+  type FkAction,
+  type ForeignKey,
   type IndexDef,
   type Table,
   columnIndex,
@@ -292,6 +295,26 @@ export class Snapshot {
         const r = compositeRefName(f.type);
         if (r !== null && r.toLowerCase() === key) {
           return `field ${f.name} of type ${ct.name}`;
+        }
+      }
+    }
+    return null;
+  }
+
+  // fkDependent reports whether any OTHER table's FOREIGN KEY references the table `name`
+  // (case-insensitive) — the DROP TABLE dependency check (2BP01 — spec/design/constraints.md
+  // §6.10). A self-reference does NOT block the drop (a table's own FK on itself disappears with
+  // it). Returns the first dependent's description, scanning in ascending lowercased table-name
+  // order for determinism (within a table, fks is already in name order), or null.
+  fkDependent(name: string): string | null {
+    const key = name.toLowerCase();
+    const tkeys = [...this.tables.keys()].sort();
+    for (const tk of tkeys) {
+      const t = this.tables.get(tk)!;
+      if (t.name.toLowerCase() === key) continue; // a self-reference does not block the drop
+      for (const fk of t.fks) {
+        if (fk.refTable.toLowerCase() === key) {
+          return `constraint ${fk.name} on table ${t.name}`;
         }
       }
     }
@@ -1067,7 +1090,7 @@ export class Database {
     // oracle-probed); naming follows in a second pass, so a 42703 in a later check fires
     // before a 42710 between earlier ones. Resolution needs a catalog Table, so build it
     // now (checks attach below, before putTable).
-    const table: Table = { name: ct.name, columns, pk, checks: [], indexes: [] };
+    const table: Table = { name: ct.name, columns, pk, checks: [], indexes: [], fks: [] };
     for (const def of ct.checks) {
       // Structural rejections first (a single pre-walk — a documented micro-order
       // divergence from PG, which interleaves them with name/type resolution): subquery
@@ -1173,6 +1196,122 @@ export class Database {
       table.indexes.splice(pos, 0, { name, columns: ru.cols, unique: true });
     }
 
+    // FOREIGN KEY constraints (constraints.md §6). Resolved AFTER the PK / UNIQUE / CHECK
+    // constraints (PG's order), each in textual definition order: resolve the local columns
+    // (42703/42701) against this table; look up the parent (42P01, or the table itself for a
+    // self-reference); resolve the referenced columns (default to the parent PK, 42704 if it has
+    // none); check the arity (42830); name the constraint (explicit collision 42710, else derive
+    // `<table>_<cols>_fkey` with a suffix walk through the constraint namespace); reject the
+    // unsupported write-actions (0A000); require the referenced columns to be the parent PK or a
+    // UNIQUE set (42830); and require same-type pairing (42804, stricter than PG). An FK owns no
+    // B-tree — enforcement probes the parent at every write (§6.4/§6.5).
+    const resolvedFks: ForeignKey[] = [];
+    for (const fk of ct.fks) {
+      // 1. Local (referencing) columns into this table.
+      const local: number[] = [];
+      for (const cname of fk.columns) {
+        const idx = columnIndex(table, cname);
+        if (idx < 0) {
+          throw engineError("undefined_column", "column " + cname + " named in key does not exist");
+        }
+        if (local.includes(idx)) {
+          throw engineError("duplicate_column", "column " + cname + " appears twice in foreign key constraint");
+        }
+        local.push(idx);
+      }
+      // 2. Parent table — a self-reference resolves against the in-progress definition.
+      const selfRef = fk.refTable.toLowerCase() === table.name.toLowerCase();
+      let parent: Table;
+      if (selfRef) {
+        parent = table;
+      } else {
+        const found = this.table(fk.refTable);
+        if (found === undefined) {
+          throw engineError("undefined_table", "table does not exist: " + fk.refTable);
+        }
+        parent = found;
+      }
+      // 3. Referenced columns into the parent (default to the parent's primary key).
+      let refs: number[];
+      if (fk.refColumns === null) {
+        if (parent.pk.length === 0) {
+          // Omitting the referenced list defaults to the parent's PRIMARY KEY; a parent without
+          // one is 42704 (PG's code here — undefined_object — even when the parent has a UNIQUE),
+          // distinct from the explicit-no-match 42830.
+          throw engineError("undefined_object", "there is no primary key for referenced table " + parent.name);
+        }
+        refs = [...parent.pk];
+      } else {
+        refs = [];
+        for (const cname of fk.refColumns) {
+          const idx = columnIndex(parent, cname);
+          if (idx < 0) {
+            throw engineError("undefined_column", "column " + cname + " named in key does not exist");
+          }
+          if (refs.includes(idx)) {
+            throw engineError("duplicate_column", "column " + cname + " appears twice in foreign key constraint");
+          }
+          refs.push(idx);
+        }
+      }
+      // 4. Referencing/referenced count must agree.
+      if (local.length !== refs.length) {
+        throw engineError("invalid_foreign_key", "number of referencing and referenced columns for foreign key disagree");
+      }
+      // 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
+      const nameTakenFk = (n: string): boolean =>
+        table.checks.some((c) => c.name.toLowerCase() === n.toLowerCase()) ||
+        resolvedFks.some((f) => f.name.toLowerCase() === n.toLowerCase());
+      let fkName: string;
+      if (fk.name !== null) {
+        if (nameTakenFk(fk.name)) {
+          throw engineError("duplicate_object", "constraint " + fk.name + " for relation " + table.name + " already exists");
+        }
+        fkName = fk.name;
+      } else {
+        let base = table.name.toLowerCase();
+        for (const i of local) base += "_" + table.columns[i]!.name.toLowerCase();
+        base += "_fkey";
+        fkName = base;
+        for (let suffix = 1; nameTakenFk(fkName); suffix++) fkName = base + suffix.toString();
+      }
+      // 6. Reject the unsupported write-actions (§6.6).
+      const onDelete = fkAction(fk.onDelete, "DELETE");
+      const onUpdate = fkAction(fk.onUpdate, "UPDATE");
+      // 7. The referenced columns must be the parent's PK or a UNIQUE set (§6.2).
+      const refSet = sortedUnique(refs);
+      const matchesUnique =
+        (parent.pk.length > 0 && sameSet(sortedUnique(parent.pk), refSet)) ||
+        parent.indexes.some((i) => i.unique && sameSet(sortedUnique(i.columns), refSet));
+      if (!matchesUnique) {
+        throw engineError("invalid_foreign_key", "there is no unique constraint matching given keys for referenced table " + parent.name);
+      }
+      // 8. Same-type pairing (§6.2). Because the referenced columns are a PK/UNIQUE key they are
+      // key-encodable, so a same-typed local column is key-encodable too — no separate 0A000 type
+      // gate is needed.
+      for (let p = 0; p < local.length; p++) {
+        const li = local[p]!;
+        const ri = refs[p]!;
+        if (!fkTypesEqual(table.columns[li]!.type, parent.columns[ri]!.type)) {
+          throw engineError(
+            "datatype_mismatch",
+            "foreign key constraint " + fkName + " cannot be implemented: key columns " +
+              table.columns[li]!.name + " and " + parent.columns[ri]!.name +
+              " are of incompatible types: " + typeCanonicalName(table.columns[li]!.type) +
+              " and " + typeCanonicalName(parent.columns[ri]!.type),
+          );
+        }
+      }
+      resolvedFks.push({ name: fkName, columns: local, refTable: parent.name, refColumns: refs, onDelete, onUpdate });
+    }
+    // Held in ascending lowercased-name order (the catalog's on-disk + evaluation order, §6.9).
+    resolvedFks.sort((a, b) => {
+      const an = a.name.toLowerCase();
+      const bn = b.name.toLowerCase();
+      return an < bn ? -1 : an > bn ? 1 : 0;
+    });
+    table.fks = resolvedFks;
+
     this.putTable(table);
     // The table is brand new (no rows), so each backing index store starts empty.
     for (const ix of table.indexes) {
@@ -1246,6 +1385,16 @@ export class Database {
       }
       throw engineError("undefined_table", "table does not exist: " + dt.name);
     }
+    // A table referenced by ANOTHER table's FOREIGN KEY cannot be dropped (2BP01 — there is no
+    // DROP TABLE … CASCADE; a self-reference does not block — spec/design/constraints.md §6.10).
+    const detail = this.readSnap().fkDependent(dt.name);
+    if (detail !== null) {
+      const canonical = this.table(dt.name)?.name ?? dt.name;
+      throw engineError(
+        "dependent_objects_still_exist",
+        "cannot drop table " + canonical + " because other objects depend on it: " + detail,
+      );
+    }
     this.working().removeTable(dt.name.toLowerCase());
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
@@ -1260,6 +1409,57 @@ export class Database {
   // table OR an index — spec/design/indexes.md §2), case-insensitively.
   private relationExists(name: string): boolean {
     return this.table(name) !== undefined || this.findIndex(name) !== null;
+  }
+
+  // fkProbeHits reports whether the parent currently holds the key/prefix `probe` (committed +
+  // working state) — the child-side foreign-key existence test (spec/design/constraints.md §6.4).
+  // `parentTable` is the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
+  private fkProbeHits(probe: FkProbe, parentTable: string): boolean {
+    if (probe.kind === "pk") {
+      return this.readSnap().store(parentTable).get(probe.bytes) !== undefined;
+    }
+    return this.readSnap().indexStore(probe.index).rangeEntries(uniqueProbeBound(probe.prefix)).length > 0;
+  }
+
+  // fkChildReferences reports whether any row of `childTable` references the parent tuple `target`
+  // (the parent key bytes, in the byte space fkProbe produces) via `fk` — the reverse of the
+  // child-side probe, a full scan since child FK columns are not index-backed
+  // (spec/design/constraints.md §6.5). MATCH SIMPLE: a child row with any NULL FK column references
+  // nothing. Rows whose storage key is in `exclude` are skipped — the END STATE for a
+  // self-reference, whose child IS the table being mutated (so its deleted/updated rows must not
+  // count). `parent` is the referenced table's catalog. Unmetered validation.
+  private fkChildReferences(
+    childTable: string,
+    fk: ForeignKey,
+    parent: Table,
+    target: Uint8Array,
+    exclude: Set<string>,
+  ): boolean {
+    for (const e of this.readSnap().store(childTable).entriesInKeyOrder()) {
+      if (exclude.has(e.key.join(","))) continue;
+      const probe = fkProbe(fk, parent, e.row, fk.columns);
+      if (probe !== null && bytesEq(fkProbeBytes(probe), target)) return true;
+    }
+    return false;
+  }
+
+  // fkReferencers returns every (child table name, FK) pair in the visible snapshot whose FK
+  // references `parentName` (case-insensitive), including a self-reference — the inbound FKs a
+  // parent DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (lowercased
+  // child table, FK name) for a deterministic report order. The FK objects are the snapshot's
+  // (the caller probes stores without mutating the catalog).
+  private fkReferencers(parentName: string): { childTable: string; fk: ForeignKey }[] {
+    const snap = this.readSnap();
+    const key = parentName.toLowerCase();
+    const out: { childTable: string; fk: ForeignKey }[] = [];
+    const tkeys = [...snap.tables.keys()].sort();
+    for (const tk of tkeys) {
+      const t = snap.tables.get(tk)!;
+      for (const fk of t.fks) {
+        if (fk.refTable.toLowerCase() === key) out.push({ childTable: t.name, fk });
+      }
+    }
+    return out;
   }
 
   // executeCreateIndex analyzes and runs a CREATE INDEX (spec/design/indexes.md §2).
@@ -1849,6 +2049,41 @@ export class Database {
       cunits += BigInt(store.writeCompressUnits(key ?? new Uint8Array(8), row));
       prepared.push({ key, row });
     }
+
+    // FOREIGN KEY existence (constraints.md §6.4) — after all candidate rows are prepared, so the
+    // check sees the statement's batch END STATE (a later row may supply an earlier row's parent
+    // key; a self-reference resolves within the batch — PG's end-of-statement semantics). Unmetered
+    // validation, like the PK/UNIQUE probes, and before any write (all-or-nothing). MATCH SIMPLE: a
+    // row with any NULL local column is exempt.
+    const relation = table.name;
+    const fks = this.table(table.name)?.fks ?? [];
+    for (const fk of fks) {
+      // The parent exists (validated at CREATE TABLE; DROP TABLE refuses to drop a referenced
+      // table — §6.10), so a consistent catalog always finds it.
+      const parent = this.table(fk.refTable);
+      if (parent === undefined) continue;
+      // Only a self-reference can satisfy against this statement's batch (a different parent table
+      // is unchanged by this INSERT). Collect the parent keys the batch supplies.
+      const batch = new Set<string>();
+      if (fk.refTable.toLowerCase() === relation.toLowerCase()) {
+        for (const pr of prepared) {
+          const p = fkProbe(fk, parent, pr.row, fk.refColumns);
+          if (p !== null) batch.add(fkProbeBytes(p).join(","));
+        }
+      }
+      for (const pr of prepared) {
+        const probe = fkProbe(fk, parent, pr.row, fk.columns);
+        if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
+        if (batch.has(fkProbeBytes(probe).join(","))) continue;
+        if (!this.fkProbeHits(probe, fk.refTable)) {
+          throw engineError(
+            "foreign_key_violation",
+            "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
+          );
+        }
+      }
+    }
+
     // Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
@@ -2010,6 +2245,32 @@ export class Database {
         matched.push({ key: e.key, row });
       }
     }
+
+    // FOREIGN KEY parent-side (constraints.md §6.5): a DELETE must not strand a child. For each
+    // inbound FK, every deleted row's referenced tuple disappears (the referenced columns are
+    // unique, so each is unique to its row); if a child still references it → 23503. Unmetered,
+    // before phase 2 (all-or-nothing). For a self-reference the child IS this table, whose end
+    // state excludes the rows being deleted.
+    const delReferencers = this.fkReferencers(del.table);
+    if (delReferencers.length > 0) {
+      const parent = this.table(del.table)!;
+      const deletedKeys = new Set<string>(matched.map((m) => m.key.join(",")));
+      const empty = new Set<string>();
+      for (const { childTable, fk } of delReferencers) {
+        const exclude = childTable.toLowerCase() === del.table.toLowerCase() ? deletedKeys : empty;
+        for (const m of matched) {
+          const probe = fkProbe(fk, parent, m.row, fk.refColumns);
+          if (probe === null) continue; // a NULL referenced value cannot be referenced (MATCH SIMPLE)
+          if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(probe), exclude)) {
+            throw engineError(
+              "foreign_key_violation",
+              "update or delete on table " + parent.name + " violates foreign key constraint " + fk.name + " on table " + childTable,
+            );
+          }
+        }
+      }
+    }
+
     // The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched rows'
     // OLD values before anything is removed — subqueries in the list read the pre-statement
     // snapshot, and a 54P01 here deletes nothing (all-or-nothing).
@@ -2198,6 +2459,76 @@ export class Database {
             );
           }
           batch.add(k);
+        }
+      }
+    }
+
+    // FOREIGN KEY child-side (constraints.md §6.4): re-validate an FK only when the statement
+    // assigns one of its local columns (an unchanged value stays valid). Each updated NEW row must
+    // reference an existing parent key — committed parent state, plus (for a self-reference) the
+    // updated rows' new referenced values, so a row may reference a value another updated row now
+    // supplies. Unmetered, phase 1, before any write.
+    const relation = table.name;
+    const assigned = new Set<number>(plans.map((p) => p.idx));
+    const updFks = this.table(upd.table)?.fks ?? [];
+    for (const fk of updFks) {
+      if (!fk.columns.some((c) => assigned.has(c))) continue; // this FK's local columns were not assigned
+      const parent = this.table(fk.refTable);
+      if (parent === undefined) continue;
+      const batch = new Set<string>();
+      if (fk.refTable.toLowerCase() === relation.toLowerCase()) {
+        for (const u of updates) {
+          const p = fkProbe(fk, parent, u.row, fk.refColumns);
+          if (p !== null) batch.add(fkProbeBytes(p).join(","));
+        }
+      }
+      for (const u of updates) {
+        const probe = fkProbe(fk, parent, u.row, fk.columns);
+        if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
+        if (batch.has(fkProbeBytes(probe).join(","))) continue;
+        if (!this.fkProbeHits(probe, fk.refTable)) {
+          throw engineError(
+            "foreign_key_violation",
+            "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
+          );
+        }
+      }
+    }
+
+    // FOREIGN KEY parent-side (constraints.md §6.5): an UPDATE of a referenced row must not strand
+    // a child. A referenced PRIMARY KEY column cannot change (PK assignment is 0A000), so only a
+    // referenced UNIQUE column is at risk. For each inbound FK, a referenced tuple DISAPPEARS when
+    // an updated row's old value is absent from the statement's new end state (old − new over the
+    // updated rows); if a child still references a disappearing tuple → 23503. Unmetered, phase 1.
+    // A self-reference's child IS this table, whose end state excludes the rows being updated
+    // (their new values are validated child-side above).
+    const updReferencers = this.fkReferencers(upd.table);
+    if (updReferencers.length > 0) {
+      const parent = this.table(upd.table)!;
+      const updatedKeys = new Set<string>(updates.map((u) => u.key.join(",")));
+      const empty = new Set<string>();
+      for (const { childTable, fk } of updReferencers) {
+        // The referenced tuples the updated rows now supply (so a swap re-supplies one).
+        const newPresent = new Set<string>();
+        for (const u of updates) {
+          const p = fkProbe(fk, parent, u.row, fk.refColumns);
+          if (p !== null) newPresent.add(fkProbeBytes(p).join(","));
+        }
+        const exclude = childTable.toLowerCase() === upd.table.toLowerCase() ? updatedKeys : empty;
+        for (const u of updates) {
+          const oldProbe = fkProbe(fk, parent, u.oldRow, fk.refColumns);
+          if (oldProbe === null) continue; // a NULL old referenced value was referenced by nothing
+          // Unchanged tuples (incl. a NULL → already skipped) do not disappear.
+          const newProbe = fkProbe(fk, parent, u.row, fk.refColumns);
+          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))) continue;
+          // Re-supplied by another updated row (e.g. a value swap) → not disappearing.
+          if (newPresent.has(fkProbeBytes(oldProbe).join(","))) continue;
+          if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), exclude)) {
+            throw engineError(
+              "foreign_key_violation",
+              "update or delete on table " + parent.name + " violates foreign key constraint " + fk.name + " on table " + childTable,
+            );
+          }
         }
       }
     }
@@ -3670,6 +4001,118 @@ function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
   return compareBytes(a, b) === 0;
 }
 
+// encodeKeyValue is the order-preserving key bytes for one keyable value (encoding.md §2),
+// matching the PK / index encoders. `value` is non-NULL and of a keyable type (a foreign-key
+// column always is — its type equals a PK/UNIQUE parent column, CREATE TABLE §6.2).
+function encodeKeyValue(ty: ScalarType, value: Value): Uint8Array {
+  if (value.kind === "int") return encodeInt(ty, value.int);
+  if (value.kind === "bool") return encodeBool(value.value);
+  if (value.kind === "uuid") return value.bytes.slice();
+  if (value.kind === "timestamp" || value.kind === "timestamptz") return encodeInt(ty, value.micros);
+  throw new Error("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)");
+}
+
+// FkProbe is a built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look
+// up in the parent, tagged with which physical tree to probe — the parent's PK store (bare member
+// encodings concatenated, in PK key order) or a parent unique index's prefix (0x00-tagged slots,
+// in index-key order, plus the lowercased index name). A discriminated union (the TS idiom), with
+// fkProbeBytes returning the raw bytes for batch-membership comparison.
+type FkProbe =
+  | { kind: "pk"; bytes: Uint8Array }
+  | { kind: "unique"; index: string; prefix: Uint8Array };
+
+// fkProbeBytes returns the raw probe bytes — used to compare against this statement's batch end
+// state (§6.4). Two probes of one FK share the same byte space (a given FK always probes the PK or
+// always a fixed unique index), so byte equality is a valid set membership test.
+function fkProbeBytes(p: FkProbe): Uint8Array {
+  return p.kind === "pk" ? p.bytes : p.prefix;
+}
+
+// fkProbe builds the parent-key probe for `fk` from `row`, taking each referenced parent column's
+// value from `row[ordinals[i]]` where `ordinals[i]` supplies `fk.refColumns[i]`. So the child side
+// passes `ordinals = fk.columns` (local columns), and a self-reference batch entry passes
+// `ordinals = fk.refColumns` (the row viewed as a parent). Returns null when any supplied value is
+// NULL (MATCH SIMPLE exempt — §6.3). The probe uses the parent's PK when the referenced set is the
+// PK, else the matching unique index (re-derived deterministically — §6.8).
+function fkProbe(fk: ForeignKey, parent: Table, row: Row, ordinals: number[]): FkProbe | null {
+  // MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
+  for (const o of ordinals) {
+    if (row[o]!.kind === "null") return null;
+  }
+  // The value supplying parent column `pcol` (the fk pairing: refColumns[i] ⇄ ordinals[i]).
+  const valueFor = (pcol: number): Value => {
+    const i = fk.refColumns.indexOf(pcol);
+    return row[ordinals[i]!]!;
+  };
+  const refSet = sortedUnique(fk.refColumns);
+  const pkSet = sortedUnique(parent.pk);
+  if (parent.pk.length > 0 && sameSet(pkSet, refSet)) {
+    const parts: Uint8Array[] = [];
+    for (const pcol of parent.pk) {
+      const ty = typeScalar(parent.columns[pcol]!.type);
+      parts.push(encodeKeyValue(ty, valueFor(pcol)));
+    }
+    return { kind: "pk", bytes: concatBytes(parts) };
+  }
+  const idx = parent.indexes.find((i) => i.unique && sameSet(sortedUnique(i.columns), refSet))!;
+  const parts: Uint8Array[] = [];
+  for (const pcol of idx.columns) {
+    parts.push(Uint8Array.of(0x00));
+    const ty = typeScalar(parent.columns[pcol]!.type);
+    parts.push(encodeKeyValue(ty, valueFor(pcol)));
+  }
+  return { kind: "unique", index: idx.name.toLowerCase(), prefix: concatBytes(parts) };
+}
+
+// concatBytes concatenates a list of byte arrays into one (the key-build helper).
+function concatBytes(parts: Uint8Array[]): Uint8Array {
+  const total = parts.reduce((acc, b) => acc + b.length, 0);
+  const out = new Uint8Array(total);
+  let off = 0;
+  for (const b of parts) {
+    out.set(b, off);
+    off += b.length;
+  }
+  return out;
+}
+
+// sortedUnique returns a column-ordinal list as a sorted, deduplicated set (for the
+// order-independent FK referenced-columns ⇄ PK/unique-key set comparison —
+// spec/design/constraints.md §6.2).
+function sortedUnique(v: number[]): number[] {
+  const s = [...v].sort((a, b) => a - b);
+  const out: number[] = [];
+  for (const x of s) {
+    if (out.length === 0 || out[out.length - 1] !== x) out.push(x);
+  }
+  return out;
+}
+
+// sameSet reports whether two already-sorted-unique ordinal lists are equal.
+function sameSet(a: number[], b: number[]): boolean {
+  return a.length === b.length && a.every((v, i) => v === b[i]);
+}
+
+// fkTypesEqual reports structural equality of two catalog Types — the FK same-type pairing gate
+// (spec/design/constraints.md §6.2). An FK column is always a scalar (a key-encodable PK/UNIQUE
+// type), but the comparison is full structural for completeness, mirroring Rust's `ty == ty`.
+function fkTypesEqual(a: Type, b: Type): boolean {
+  if (a.kind === "scalar" && b.kind === "scalar") return a.scalar === b.scalar;
+  if (a.kind === "composite" && b.kind === "composite") return a.name === b.name;
+  if (a.kind === "array" && b.kind === "array") return fkTypesEqual(a.elem, b.elem);
+  return false;
+}
+
+// fkAction maps a parsed referential action to its persisted form, rejecting the unsupported
+// write-actions (CASCADE / SET NULL / SET DEFAULT) as 0A000 (spec/design/constraints.md §6.6).
+// `clause` is "DELETE" or "UPDATE" for the message.
+function fkAction(a: RefAction, clause: string): FkAction {
+  if (a === "noAction") return "noAction";
+  if (a === "restrict") return "restrict";
+  const word = a === "cascade" ? "CASCADE" : a === "setNull" ? "SET NULL" : "SET DEFAULT";
+  throw engineError("feature_not_supported", "ON " + clause + " " + word + " is not supported");
+}
+
 // prefixSuccessor is the byte-successor of a prefix: the smallest byte string greater
 // than every string that extends p. Increment the last non-0xFF byte and truncate after
 // it; an all-0xFF prefix has no successor (null ⇒ unbounded high end).
@@ -4473,6 +4916,7 @@ function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
     pk: [],
     checks: [],
     indexes: [],
+    fks: [],
   };
 }
 
@@ -6121,7 +6565,7 @@ function cteSyntheticTable(name: string, plan: QueryPlan, rename: string[] | nul
     default: null,
     defaultExpr: null,
   }));
-  return { name, columns, pk: [], checks: [], indexes: [] };
+  return { name, columns, pk: [], checks: [], indexes: [], fks: [] };
 }
 
 // typeFromResolved is the catalog Type that round-trips a column's ResolvedType — used to give a

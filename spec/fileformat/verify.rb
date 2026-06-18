@@ -14,7 +14,11 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 10 # format_version 10: array (T[]) columns — a column type can be an array (type_code 15
+VERSION = 11 # format_version 11: FOREIGN KEY constraints — the table catalog entry gains a
+# foreign-key list (fk_count + per FK: name, local ordinals, ref table, ref ordinals, actions byte)
+# after the index list, before root_data_page (spec/design/constraints.md §6, format.md). An FK owns
+# no B-tree (no root page); a file with no FKs still moves to v11 (every table entry gains fk_count=0).
+# v10 was array (T[]) columns — a column type can be an array (type_code 15
 # + an element-type descriptor in the catalog, spec/design/array.md §3), and a value is the compact
 # array body (§4). v9 was composite (row) types — the catalog became a chain of kind-tagged entries
 # (entry_kind u8: 0 table, 1 composite-type), composite-type entries first (name order); two-pass
@@ -513,6 +517,45 @@ COMPOSITE_ARRAY_FIELD_TABLE = {
                     [3, ["c", nil]]] }]
 }.freeze
 
+# FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog foreign-key list
+# (fk_count + per FK: name, local ordinals, ref table, ref ordinals, actions byte). Two tables —
+# parent `p` (a PK + two UNIQUE constraints, the FK targets) and child `c` carrying four FKs that
+# cover every shape: `c_code_fk` (named, references the UNIQUE column code), `c_mgr_fkey` (a
+# self-reference to c's own PK), `c_pid_fkey` (auto-named, references the PK), and `c_x_y_fkey`
+# (auto-named, COMPOSITE — references the two-column UNIQUE (a,b) — with ON DELETE RESTRICT, the lone
+# non-zero actions byte). FKs are emitted in ascending lowercased-name order; an FK owns no B-tree.
+# The cores build this via
+#   CREATE TABLE p (pid int32 PRIMARY KEY, code int32 UNIQUE, a int32, b int32, UNIQUE (a, b))
+#   INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)
+#   CREATE TABLE c (id int32 PRIMARY KEY, pid int32, pcode int32, x int32, y int32, mgr int32,
+#     FOREIGN KEY (pid) REFERENCES p (pid),
+#     CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code),
+#     FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT,
+#     FOREIGN KEY (mgr) REFERENCES c (id))
+#   INSERT INTO c VALUES (10, 1, 100, 10, 20, NULL), (11, 2, 200, 30, 40, 10)
+FK_TABLE = {
+  tables: [
+    { name: "p",
+      columns: [col("pid", "int32", pk: true), col("code", "int32"),
+                col("a", "int32"), col("b", "int32")],
+      indexes: [
+        { name: "p_a_b_key", cols: [2, 3], unique: true },
+        { name: "p_code_key", cols: [1], unique: true }
+      ],
+      rows: [[1, 100, 10, 20], [2, 200, 30, 40]] },
+    { name: "c",
+      columns: [col("id", "int32", pk: true), col("pid", "int32"), col("pcode", "int32"),
+                col("x", "int32"), col("y", "int32"), col("mgr", "int32")],
+      fks: [
+        { name: "c_code_fk", local: [2], ref_table: "p", ref: [1] },
+        { name: "c_mgr_fkey", local: [5], ref_table: "c", ref: [0] },
+        { name: "c_pid_fkey", local: [1], ref_table: "p", ref: [0] },
+        { name: "c_x_y_fkey", local: [3, 4], ref_table: "p", ref: [2, 3], actions: 1 }
+      ],
+      rows: [[10, 1, 100, 10, 20, nil], [11, 2, 200, 30, 40, 10]] }
+  ]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -540,6 +583,7 @@ FIXTURES = [
   { file: "check_table.jed", page_size: 256, tables: [CHECK_TABLE] },
   { file: "index_table.jed", page_size: 256, tables: [INDEX_TABLE] },
   { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
+  { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
     types: COMPOSITE_TYPE_TABLE[:types], tables: COMPOSITE_TYPE_TABLE[:tables] },
@@ -865,6 +909,22 @@ def table_entry_bytes(table, root_data_page, index_roots)
     ix[:cols].each { |i| out << u16(i) }
     out << [ix[:unique] ? 1 : 0].pack("C")
     out << u32(index_roots[k])
+  end
+  # Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS table,
+  # list order), the referenced table name, the referenced-column ordinals (into the PARENT
+  # table, list order), and the actions byte (bits 0-1 on_delete, bits 2-3 on_update; 0 = NO
+  # ACTION, 1 = RESTRICT). In ascending lowercased-name order (constraints.md §6.9). An FK owns
+  # no B-tree, so no root page.
+  fks = table[:fks] || []
+  out << u16(fks.size)
+  fks.each do |fk|
+    out << u16(fk[:name].bytesize) << fk[:name].b
+    out << u16(fk[:local].size)
+    fk[:local].each { |i| out << u16(i) }
+    out << u16(fk[:ref_table].bytesize) << fk[:ref_table].b
+    out << u16(fk[:ref].size)
+    fk[:ref].each { |i| out << u16(i) }
+    out << [fk[:actions] || 0].pack("C")
   end
   out << u32(root_data_page)
   out
@@ -1458,8 +1518,36 @@ def decode_table_entry(buf, pos)
     rb, pos = take(buf, pos, 4)
     indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0, root_page: rb.unpack1("N") }
   end
+  # Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
+  # actions byte, in name order. An FK owns no B-tree (no root page).
+  fks = []
+  fc, pos = take(buf, pos, 2)
+  fc.unpack1("n").times do
+    nl, pos = take(buf, pos, 2)
+    fname, pos = take(buf, pos, nl.unpack1("n"))
+    lc, pos = take(buf, pos, 2)
+    local = []
+    lc.unpack1("n").times do
+      ob, pos = take(buf, pos, 2)
+      local << ob.unpack1("n")
+    end
+    rtl, pos = take(buf, pos, 2)
+    rtable, pos = take(buf, pos, rtl.unpack1("n"))
+    rc, pos = take(buf, pos, 2)
+    ref = []
+    rc.unpack1("n").times do
+      ob, pos = take(buf, pos, 2)
+      ref << ob.unpack1("n")
+    end
+    raise "fk column count mismatch (local != ref)" if local.size != ref.size
+
+    ab, pos = take(buf, pos, 1)
+    raise "reserved fk action bits set / unsupported action (only NO ACTION/RESTRICT — v11)" \
+      if (ab.getbyte(0) & ~0b1111) != 0 || (ab.getbyte(0) & 0b11) > 1 || ((ab.getbyte(0) >> 2) & 0b11) > 1
+    fks << { name: fname, local: local, ref_table: rtable, ref: ref, actions: ab.getbyte(0) }
+  end
   root, pos = take(buf, pos, 4)
-  [{ name: name, columns: columns, pk: pk, checks: checks, indexes: indexes,
+  [{ name: name, columns: columns, pk: pk, checks: checks, indexes: indexes, fks: fks,
      root_data_page: root.unpack1("N") }, pos]
 end
 

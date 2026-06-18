@@ -68,6 +68,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "ddl.composite_primary_key",
     // CHECK constraints — row predicates enforced at INSERT/UPDATE, 23514 (constraints.md §4).
     "ddl.check",
+    // FOREIGN KEY constraints — referential integrity enforced at every write, 23503; referenced
+    // columns must be a parent PK/UNIQUE set (42830); persisted (format_version 11)
+    // (constraints.md §6, grammar.md §43).
+    "ddl.foreign_key",
     // DROP TABLE — remove a table (definition + rows) from the catalog (grammar.md §13).
     "ddl.drop_table",
     // CREATE INDEX / DROP INDEX — non-unique secondary indexes, maintained on every write

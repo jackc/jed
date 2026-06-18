@@ -191,6 +191,32 @@ func (s *Snapshot) compositeDependent(name string) (string, bool) {
 	return "", false
 }
 
+// foreignKeyDependent reports whether any OTHER table's FOREIGN KEY references the table name
+// (case-insensitive) — the DROP TABLE dependency check (2BP01 — spec/design/constraints.md
+// §6.10). A self-reference does NOT block the drop (a table's own FK on itself disappears with
+// it). Returns the first dependent's description, scanning in ascending lowercased table-name
+// order for determinism (within a table, ForeignKeys is already in name order).
+func (s *Snapshot) foreignKeyDependent(name string) (string, bool) {
+	key := strings.ToLower(name)
+	tableKeys := make([]string, 0, len(s.tables))
+	for k := range s.tables {
+		tableKeys = append(tableKeys, k)
+	}
+	sort.Strings(tableKeys)
+	for _, tk := range tableKeys {
+		t := s.tables[tk]
+		if strings.EqualFold(t.Name, key) {
+			continue // a self-reference does not block the drop
+		}
+		for _, fk := range t.ForeignKeys {
+			if strings.EqualFold(fk.RefTable, key) {
+				return "constraint " + fk.Name + " on table " + t.Name, true
+			}
+		}
+	}
+	return "", false
+}
+
 // validateCompositeTypes validates the loaded composite-type catalog (the on-disk two-pass load —
 // spec/design/composite.md §3): every composite a field references must exist, and the reference
 // graph must be acyclic. A dangling or cyclic reference is a malformed file (XX001). Called once
@@ -1155,6 +1181,189 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		table.Indexes = slices.Insert(table.Indexes, pos, def)
 	}
 
+	// FOREIGN KEY constraints (constraints.md §6). Resolved AFTER the PK / UNIQUE / CHECK
+	// constraints (PG's order), each in textual definition order: resolve the local columns
+	// (42703/42701) against this table; look up the parent (42P01, or the table itself for a
+	// self-reference); resolve the referenced columns (default to the parent PK, 42704 if it
+	// has none); check the arity (42830); name the constraint (explicit collision 42710, else
+	// derive `<table>_<cols>_fkey` with a suffix walk through the constraint namespace); reject
+	// the unsupported write-actions (0A000); require the referenced columns to be the parent PK
+	// or a UNIQUE set (42830); and require same-type pairing (42804, stricter than PG). An FK
+	// owns no B-tree — enforcement probes the parent at every write (§6.4/§6.5).
+	resolvedFks := make([]ForeignKey, 0, len(ct.ForeignKeys))
+	for _, fk := range ct.ForeignKeys {
+		// 1. Local (referencing) columns into this table.
+		local := make([]int, 0, len(fk.Columns))
+		for _, cname := range fk.Columns {
+			idx := -1
+			for i := range table.Columns {
+				if strings.EqualFold(table.Columns[i].Name, cname) {
+					idx = i
+					break
+				}
+			}
+			if idx < 0 {
+				return Outcome{}, NewError(UndefinedColumn,
+					"column "+cname+" named in key does not exist")
+			}
+			if slices.Contains(local, idx) {
+				return Outcome{}, NewError(DuplicateColumn,
+					"column "+cname+" appears twice in foreign key constraint")
+			}
+			local = append(local, idx)
+		}
+		// 2. Parent table — a self-reference resolves against the in-progress definition.
+		selfRef := strings.EqualFold(fk.RefTable, table.Name)
+		var parent *Table
+		if selfRef {
+			parent = table
+		} else {
+			p, ok := db.Table(fk.RefTable)
+			if !ok {
+				return Outcome{}, NewError(UndefinedTable, "table does not exist: "+fk.RefTable)
+			}
+			parent = p
+		}
+		// 3. Referenced columns into the parent (default to the parent's primary key).
+		var refs []int
+		if fk.RefColumns == nil {
+			if len(parent.PK) == 0 {
+				// Omitting the referenced list defaults to the parent's PRIMARY KEY; a parent
+				// without one is 42704 (PG's code here — undefined_object — even when the parent
+				// has a UNIQUE), distinct from the explicit-no-match 42830.
+				return Outcome{}, NewError(UndefinedObject,
+					"there is no primary key for referenced table "+parent.Name)
+			}
+			refs = append([]int(nil), parent.PK...)
+		} else {
+			refs = make([]int, 0, len(fk.RefColumns))
+			for _, cname := range fk.RefColumns {
+				idx := -1
+				for i := range parent.Columns {
+					if strings.EqualFold(parent.Columns[i].Name, cname) {
+						idx = i
+						break
+					}
+				}
+				if idx < 0 {
+					return Outcome{}, NewError(UndefinedColumn,
+						"column "+cname+" named in key does not exist")
+				}
+				if slices.Contains(refs, idx) {
+					return Outcome{}, NewError(DuplicateColumn,
+						"column "+cname+" appears twice in foreign key constraint")
+				}
+				refs = append(refs, idx)
+			}
+		}
+		// 4. Referencing/referenced count must agree.
+		if len(local) != len(refs) {
+			return Outcome{}, NewError(InvalidForeignKey,
+				"number of referencing and referenced columns for foreign key disagree")
+		}
+		// 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
+		var name string
+		if fk.Name != "" {
+			collide := false
+			for _, c := range table.Checks {
+				if strings.EqualFold(c.Name, fk.Name) {
+					collide = true
+					break
+				}
+			}
+			if !collide {
+				for _, f := range resolvedFks {
+					if strings.EqualFold(f.Name, fk.Name) {
+						collide = true
+						break
+					}
+				}
+			}
+			if collide {
+				return Outcome{}, NewError(DuplicateObject,
+					"constraint "+fk.Name+" for relation "+table.Name+" already exists")
+			}
+			name = fk.Name
+		} else {
+			base := strings.ToLower(table.Name)
+			for _, i := range local {
+				base += "_" + strings.ToLower(table.Columns[i].Name)
+			}
+			base += "_fkey"
+			fkNameTaken := func(candidate string) bool {
+				for _, c := range table.Checks {
+					if strings.EqualFold(c.Name, candidate) {
+						return true
+					}
+				}
+				for _, f := range resolvedFks {
+					if strings.EqualFold(f.Name, candidate) {
+						return true
+					}
+				}
+				return false
+			}
+			name = base
+			for suffix := 1; fkNameTaken(name); suffix++ {
+				name = base + strconv.Itoa(suffix)
+			}
+		}
+		// 6. Reject the unsupported write-actions (§6.6).
+		onDelete, err := fkAction(fk.OnDelete, "DELETE")
+		if err != nil {
+			return Outcome{}, err
+		}
+		onUpdate, err := fkAction(fk.OnUpdate, "UPDATE")
+		if err != nil {
+			return Outcome{}, err
+		}
+		// 7. The referenced columns must be the parent's PK or a UNIQUE set (§6.2).
+		refSet := sortedUnique(refs)
+		matchesUnique := len(parent.PK) > 0 && slices.Equal(sortedUnique(parent.PK), refSet)
+		if !matchesUnique {
+			for _, ix := range parent.Indexes {
+				if ix.Unique && slices.Equal(sortedUnique(ix.Columns), refSet) {
+					matchesUnique = true
+					break
+				}
+			}
+		}
+		if !matchesUnique {
+			return Outcome{}, NewError(InvalidForeignKey,
+				"there is no unique constraint matching given keys for referenced table "+parent.Name)
+		}
+		// 8. Same-type pairing (§6.2). Because the referenced columns are a PK/UNIQUE key they
+		// are key-encodable, so a same-typed local column is key-encodable too — no separate
+		// 0A000 type gate is needed.
+		for i := range local {
+			lt := table.Columns[local[i]].Type
+			rt := parent.Columns[refs[i]].Type
+			if !typesEqual(lt, rt) {
+				return Outcome{}, NewError(DatatypeMismatch, fmt.Sprintf(
+					"foreign key constraint %s cannot be implemented: key columns %s and %s are of incompatible types: %s and %s",
+					name,
+					table.Columns[local[i]].Name,
+					parent.Columns[refs[i]].Name,
+					lt.CanonicalName(),
+					rt.CanonicalName(),
+				))
+			}
+		}
+		resolvedFks = append(resolvedFks, ForeignKey{
+			Name:       name,
+			Columns:    local,
+			RefTable:   parent.Name,
+			RefColumns: refs,
+			OnDelete:   onDelete,
+			OnUpdate:   onUpdate,
+		})
+	}
+	// Held in ascending lowercased-name order (the catalog's on-disk + evaluation order, §6.9).
+	sort.SliceStable(resolvedFks, func(i, j int) bool {
+		return strings.ToLower(resolvedFks[i].Name) < strings.ToLower(resolvedFks[j].Name)
+	})
+	table.ForeignKeys = resolvedFks
+
 	db.putTable(table)
 	// The table is brand new (no rows), so each backing index store starts empty.
 	for _, ix := range table.Indexes {
@@ -1261,6 +1470,16 @@ func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
 			return Outcome{}, NewError(WrongObjectType, dt.Name+" is not a table")
 		}
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+dt.Name)
+	}
+	// A table referenced by ANOTHER table's FOREIGN KEY cannot be dropped (2BP01 — there is no
+	// DROP TABLE … CASCADE; a self-reference does not block — spec/design/constraints.md §6.10).
+	if detail, ok := db.readSnap().foreignKeyDependent(dt.Name); ok {
+		canonical := dt.Name
+		if t, ok := db.Table(dt.Name); ok {
+			canonical = t.Name
+		}
+		return Outcome{}, NewError(DependentObjectsStillExist,
+			"cannot drop table "+canonical+" because other objects depend on it: "+detail)
 	}
 	db.working().removeTable(strings.ToLower(dt.Name))
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
@@ -1940,6 +2159,50 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		cunits += int64(store.WriteCompressUnits(kb, row))
 		prepared = append(prepared, preparedRow{key: key, row: row})
 	}
+
+	// FOREIGN KEY existence (constraints.md §6.4) — after all candidate rows are prepared, so the
+	// check sees the statement's batch END STATE (a later row may supply an earlier row's parent
+	// key; a self-reference resolves within the batch — PG's end-of-statement semantics). Unmetered
+	// validation, like the PK/UNIQUE probes, and before any write (all-or-nothing). MATCH SIMPLE: a
+	// row with any NULL local column is exempt.
+	relation := table.Name
+	for fki := range table.ForeignKeys {
+		fk := &table.ForeignKeys[fki]
+		// The parent exists (validated at CREATE TABLE; DROP TABLE refuses to drop a referenced
+		// table — §6.10), so a consistent catalog always finds it.
+		parent, ok := db.Table(fk.RefTable)
+		if !ok {
+			continue
+		}
+		// Only a self-reference can satisfy against this statement's batch (a different parent
+		// table is unchanged by this INSERT). Collect the parent keys the batch supplies.
+		batch := make(map[string]struct{})
+		if strings.EqualFold(fk.RefTable, relation) {
+			for _, pr := range prepared {
+				if probe, ok := buildFkProbe(fk, parent, pr.row, fk.RefColumns); ok {
+					batch[string(probe.bytes)] = struct{}{}
+				}
+			}
+		}
+		for _, pr := range prepared {
+			probe, ok := buildFkProbe(fk, parent, pr.row, fk.Columns)
+			if !ok {
+				continue // a NULL local column → exempt (MATCH SIMPLE)
+			}
+			if _, inBatch := batch[string(probe.bytes)]; inBatch {
+				continue
+			}
+			hit, err := db.fkProbeHits(probe, fk.RefTable)
+			if err != nil {
+				return nil, err
+			}
+			if !hit {
+				return nil, NewError(ForeignKeyViolation,
+					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
+			}
+		}
+	}
+
 	// Charge + enforce the ceiling BEFORE phase 2 writes anything (all-or-nothing).
 	meter.Charge(Costs.ValueCompress * cunits)
 	if err := meter.Guard(); err != nil {
@@ -2204,6 +2467,43 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 			matched = append(matched, matchedRow{key: e.Key, row: row})
 		}
 	}
+
+	// FOREIGN KEY parent-side (constraints.md §6.5): a DELETE must not strand a child. For each
+	// inbound FK, every deleted row's referenced tuple disappears (the referenced columns are
+	// unique, so each is unique to its row); if a child still references it → 23503. Unmetered,
+	// before phase 2 (all-or-nothing). For a self-reference the child IS this table, whose end
+	// state excludes the rows being deleted.
+	referencers := db.fkReferencers(del.Table)
+	if len(referencers) > 0 {
+		parent, _ := db.Table(del.Table)
+		deletedKeys := make(map[string]struct{}, len(matched))
+		for _, m := range matched {
+			deletedKeys[string(m.key)] = struct{}{}
+		}
+		empty := map[string]struct{}{}
+		for ri := range referencers {
+			r := &referencers[ri]
+			exclude := empty
+			if strings.EqualFold(r.childTable, del.Table) {
+				exclude = deletedKeys
+			}
+			for _, m := range matched {
+				probe, ok := buildFkProbe(&r.fk, parent, m.row, r.fk.RefColumns)
+				if !ok {
+					continue // a NULL referenced value cannot be referenced (MATCH SIMPLE)
+				}
+				referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, probe.bytes, exclude)
+				if err != nil {
+					return Outcome{}, err
+				}
+				if referenced {
+					return Outcome{}, NewError(ForeignKeyViolation,
+						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
+				}
+			}
+		}
+	}
+
 	// The RETURNING projection (grammar.md §32, cost.md §3): evaluate over the matched rows'
 	// OLD values before anything is removed — subqueries in the list read the pre-statement
 	// snapshot, and a 54P01 here deletes nothing (all-or-nothing).
@@ -2505,6 +2805,114 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 						"duplicate key value violates unique constraint: "+def.Name)
 				}
 				batch[string(prefix)] = struct{}{}
+			}
+		}
+	}
+
+	// FOREIGN KEY child-side (constraints.md §6.4): re-validate an FK only when the statement
+	// assigns one of its local columns (an unchanged value stays valid). Each updated NEW row must
+	// reference an existing parent key — committed parent state, plus (for a self-reference) the
+	// updated rows' new referenced values, so a row may reference a value another updated row now
+	// supplies. Unmetered, phase 1, before any write.
+	relation := table.Name
+	assigned := make(map[int]struct{}, len(plans))
+	for _, p := range plans {
+		assigned[p.idx] = struct{}{}
+	}
+	for fki := range table.ForeignKeys {
+		fk := &table.ForeignKeys[fki]
+		touched := false
+		for _, c := range fk.Columns {
+			if _, ok := assigned[c]; ok {
+				touched = true
+				break
+			}
+		}
+		if !touched {
+			continue // this FK's local columns were not assigned
+		}
+		parent, ok := db.Table(fk.RefTable)
+		if !ok {
+			continue
+		}
+		batch := make(map[string]struct{})
+		if strings.EqualFold(fk.RefTable, relation) {
+			for _, u := range updates {
+				if probe, ok := buildFkProbe(fk, parent, u.row, fk.RefColumns); ok {
+					batch[string(probe.bytes)] = struct{}{}
+				}
+			}
+		}
+		for _, u := range updates {
+			probe, ok := buildFkProbe(fk, parent, u.row, fk.Columns)
+			if !ok {
+				continue // a NULL local column → exempt (MATCH SIMPLE)
+			}
+			if _, inBatch := batch[string(probe.bytes)]; inBatch {
+				continue
+			}
+			hit, err := db.fkProbeHits(probe, fk.RefTable)
+			if err != nil {
+				return Outcome{}, err
+			}
+			if !hit {
+				return Outcome{}, NewError(ForeignKeyViolation,
+					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
+			}
+		}
+	}
+
+	// FOREIGN KEY parent-side (constraints.md §6.5): an UPDATE of a referenced row must not strand
+	// a child. A referenced PRIMARY KEY column cannot change (PK assignment is 0A000), so only a
+	// referenced UNIQUE column is at risk. For each inbound FK, a referenced tuple DISAPPEARS when
+	// an updated row's old value is absent from the statement's new end state (old − new over the
+	// updated rows); if a child still references a disappearing tuple → 23503. Unmetered, phase 1.
+	// A self-reference's child IS this table, whose end state excludes the rows being updated
+	// (their new values are validated child-side above).
+	referencers := db.fkReferencers(upd.Table)
+	if len(referencers) > 0 {
+		parent, _ := db.Table(upd.Table)
+		updatedKeys := make(map[string]struct{}, len(updates))
+		for _, u := range updates {
+			updatedKeys[string(u.key)] = struct{}{}
+		}
+		empty := map[string]struct{}{}
+		for ri := range referencers {
+			r := &referencers[ri]
+			// The referenced tuples the updated rows now supply (so a swap re-supplies one).
+			newPresent := make(map[string]struct{})
+			for _, u := range updates {
+				if probe, ok := buildFkProbe(&r.fk, parent, u.row, r.fk.RefColumns); ok {
+					newPresent[string(probe.bytes)] = struct{}{}
+				}
+			}
+			exclude := empty
+			if strings.EqualFold(r.childTable, upd.Table) {
+				exclude = updatedKeys
+			}
+			for _, u := range updates {
+				oldProbe, ok := buildFkProbe(&r.fk, parent, u.oldRow, r.fk.RefColumns)
+				if !ok {
+					continue // a NULL old referenced value was referenced by nothing
+				}
+				// Unchanged tuples (incl. a NULL → already skipped) do not disappear.
+				if newProbe, ok := buildFkProbe(&r.fk, parent, u.row, r.fk.RefColumns); ok {
+					if bytes.Equal(newProbe.bytes, oldProbe.bytes) {
+						continue
+					}
+				}
+				// Re-supplied by another updated row (e.g. a value swap) → not disappearing.
+				if _, present := newPresent[string(oldProbe.bytes)]; present {
+					continue
+				}
+				referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, oldProbe.bytes, exclude)
+				if err != nil {
+					return Outcome{}, err
+				}
+				if referenced {
+					return Outcome{}, NewError(ForeignKeyViolation,
+						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
+				}
 			}
 		}
 	}
@@ -12429,4 +12837,212 @@ func rExprConstToValue(e *rExpr) (Value, error) {
 	default:
 		return Value{}, typeError("non-constant array element literal")
 	}
+}
+
+// fkAction maps a parsed referential action to its persisted form, rejecting the unsupported
+// write-actions (CASCADE / SET NULL / SET DEFAULT) as 0A000 (spec/design/constraints.md §6.6).
+// clause is "DELETE" or "UPDATE" for the message.
+func fkAction(a RefAction, clause string) (FkAction, error) {
+	switch a {
+	case RefNoAction:
+		return FkNoAction, nil
+	case RefRestrict:
+		return FkRestrict, nil
+	case RefCascade:
+		return 0, NewError(FeatureNotSupported, "ON "+clause+" CASCADE is not supported")
+	case RefSetNull:
+		return 0, NewError(FeatureNotSupported, "ON "+clause+" SET NULL is not supported")
+	case RefSetDefault:
+		return 0, NewError(FeatureNotSupported, "ON "+clause+" SET DEFAULT is not supported")
+	default:
+		return 0, NewError(FeatureNotSupported, "ON "+clause+" action is not supported")
+	}
+}
+
+// sortedUnique returns a column-ordinal list as a sorted, deduplicated set (for the
+// order-independent FK referenced-columns ⇄ PK/unique-key set comparison —
+// spec/design/constraints.md §6.2).
+func sortedUnique(v []int) []int {
+	s := append([]int(nil), v...)
+	sort.Ints(s)
+	return slices.Compact(s)
+}
+
+// typesEqual reports whether two column types are equal — the FK same-type pairing test
+// (spec/design/constraints.md §6.2), mirroring Rust's Type PartialEq. Two scalars are equal
+// when their scalar types match; a composite/array on either side (never a referenced PK/UNIQUE
+// column) differs from a scalar, so a mismatched local column correctly fails 42804.
+func typesEqual(a, b Type) bool {
+	if a.Comp != nil || a.Array != nil || b.Comp != nil || b.Array != nil {
+		// Composite/array equality is not reachable for an FK pairing (referenced columns are
+		// keyable scalars); treat any non-scalar pair as unequal unless structurally identical.
+		if (a.Comp != nil) != (b.Comp != nil) || (a.Array != nil) != (b.Array != nil) {
+			return false
+		}
+		if a.Comp != nil {
+			return strings.EqualFold(a.Comp.Name, b.Comp.Name)
+		}
+		if a.Array != nil {
+			return typesEqual(*a.Array, *b.Array)
+		}
+	}
+	return a.Scalar == b.Scalar
+}
+
+// encodeKeyValue is the order-preserving key bytes for one keyable value (encoding.md §2),
+// matching the PK / index encoders. value is non-NULL and of a keyable type (a foreign-key
+// column always is — its type equals a PK/UNIQUE parent column, CREATE TABLE §6.2).
+func encodeKeyValue(ty ScalarType, value Value) []byte {
+	switch value.Kind {
+	case ValInt:
+		return EncodeInt(ty, value.Int)
+	case ValBool:
+		return EncodeBool(value.Bool)
+	case ValUuid:
+		return []byte(value.Str)
+	case ValTimestamp, ValTimestamptz:
+		return EncodeInt(ty, value.Int)
+	default:
+		panic("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)")
+	}
+}
+
+// fkProbeKind tags which physical tree a built foreign-key probe addresses.
+type fkProbeKind int
+
+const (
+	// fkProbePk is the parent's PK storage key (bare member encodings concatenated, PK key order).
+	fkProbePk fkProbeKind = iota
+	// fkProbeUnique is a parent unique index's prefix (0x00-tagged slots, index-key order).
+	fkProbeUnique
+)
+
+// fkProbe is a built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look
+// up in the parent, tagged with which physical tree to probe. For fkProbeUnique, index holds the
+// lowercased index name.
+type fkProbe struct {
+	kind  fkProbeKind
+	bytes []byte
+	index string
+}
+
+// buildFkProbe builds the parent-key probe for fk from row, taking each referenced parent
+// column's value from row[ordinals[i]] where ordinals[i] supplies fk.RefColumns[i]. So the child
+// side passes ordinals = fk.Columns (local columns), and a self-reference batch entry passes
+// ordinals = fk.RefColumns (the row viewed as a parent). Returns ok=false when any supplied value
+// is NULL (MATCH SIMPLE exempt — §6.3). The probe uses the parent's PK when the referenced set is
+// the PK, else the matching unique index (re-derived deterministically — §6.8).
+func buildFkProbe(fk *ForeignKey, parent *Table, row Row, ordinals []int) (fkProbe, bool) {
+	// MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
+	for _, o := range ordinals {
+		if row[o].Kind == ValNull {
+			return fkProbe{}, false
+		}
+	}
+	// valueFor returns the value supplying parent column pcol (the fk pairing: RefColumns[i] ⇄
+	// ordinals[i]).
+	valueFor := func(pcol int) Value {
+		i := slices.Index(fk.RefColumns, pcol)
+		return row[ordinals[i]]
+	}
+	refSet := sortedUnique(fk.RefColumns)
+	if len(parent.PK) > 0 && slices.Equal(sortedUnique(parent.PK), refSet) {
+		var k []byte
+		for _, pcol := range parent.PK {
+			ty := parent.Columns[pcol].Type.ScalarTy()
+			k = append(k, encodeKeyValue(ty, valueFor(pcol))...)
+		}
+		return fkProbe{kind: fkProbePk, bytes: k}, true
+	}
+	var idx *IndexDef
+	for i := range parent.Indexes {
+		ix := &parent.Indexes[i]
+		if ix.Unique && slices.Equal(sortedUnique(ix.Columns), refSet) {
+			idx = ix
+			break
+		}
+	}
+	if idx == nil {
+		panic("referenced columns matched a unique key at CREATE TABLE §6.2")
+	}
+	var prefix []byte
+	for _, pcol := range idx.Columns {
+		prefix = append(prefix, 0x00)
+		ty := parent.Columns[pcol].Type.ScalarTy()
+		prefix = append(prefix, encodeKeyValue(ty, valueFor(pcol))...)
+	}
+	return fkProbe{kind: fkProbeUnique, bytes: prefix, index: strings.ToLower(idx.Name)}, true
+}
+
+// fkProbeHits reports whether the parent currently holds the key/prefix probe (committed +
+// working state) — the child-side foreign-key existence test (spec/design/constraints.md §6.4).
+// parentTable is the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
+func (db *Database) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
+	switch probe.kind {
+	case fkProbePk:
+		_, ok, err := db.readSnap().store(parentTable).Get(probe.bytes)
+		return ok, err
+	default: // fkProbeUnique
+		entries, err := db.readSnap().indexStore(probe.index).RangeEntries(uniqueProbeBound(probe.bytes))
+		if err != nil {
+			return false, err
+		}
+		return len(entries) > 0, nil
+	}
+}
+
+// fkChildReferences reports whether any row of childTable references the parent tuple target (the
+// parent key bytes, in the byte space buildFkProbe produces) via fk — the reverse of the
+// child-side probe, a full scan since child FK columns are not index-backed
+// (spec/design/constraints.md §6.5). MATCH SIMPLE: a child row with any NULL FK column references
+// nothing. Rows whose storage key is in exclude are skipped — the END STATE for a self-reference,
+// whose child IS the table being mutated (so its deleted/updated rows must not count). parent is
+// the referenced table's catalog. Unmetered validation.
+func (db *Database) fkChildReferences(childTable string, fk *ForeignKey, parent *Table, target []byte, exclude map[string]struct{}) (bool, error) {
+	entries, err := db.readSnap().store(childTable).EntriesInKeyOrder()
+	if err != nil {
+		return false, err
+	}
+	for _, e := range entries {
+		if _, skip := exclude[string(e.Key)]; skip {
+			continue
+		}
+		if probe, ok := buildFkProbe(fk, parent, e.Row, fk.Columns); ok {
+			if bytes.Equal(probe.bytes, target) {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
+}
+
+// fkReferencer is one (child table name, FK) inbound-reference pair.
+type fkReferencer struct {
+	childTable string
+	fk         ForeignKey
+}
+
+// fkReferencers returns every (child table name, FK) pair in the visible snapshot whose FK
+// references parentName (case-insensitive), including a self-reference — the inbound FKs a parent
+// DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (lowercased child
+// table, FK name) for a deterministic report order; the FK is copied so the caller can probe
+// stores without a snapshot borrow.
+func (db *Database) fkReferencers(parentName string) []fkReferencer {
+	snap := db.readSnap()
+	key := strings.ToLower(parentName)
+	tableKeys := make([]string, 0, len(snap.tables))
+	for k := range snap.tables {
+		tableKeys = append(tableKeys, k)
+	}
+	sort.Strings(tableKeys)
+	var out []fkReferencer
+	for _, tk := range tableKeys {
+		t := snap.tables[tk]
+		for _, fk := range t.ForeignKeys {
+			if strings.EqualFold(fk.RefTable, key) {
+				out = append(out, fkReferencer{childTable: t.Name, fk: fk})
+			}
+		}
+	}
+	return out
 }

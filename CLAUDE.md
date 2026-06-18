@@ -481,7 +481,14 @@ biases below are where an overriding reason *does* steer away from PG.
   `spec/fileformat/format.md` *Page header*, `spec/design/storage.md` §6), and **expression
   column DEFAULTs** (`format_version` 8 — a per-column flag marks a DEFAULT as a non-constant
   expression (`uuidv7()`, `1 + 1`) evaluated per row at INSERT through the per-statement seam,
-  rather than a constant folded at `CREATE TABLE`, `spec/design/constraints.md` §2). **Still deferred**
+  rather than a constant folded at `CREATE TABLE`, `spec/design/constraints.md` §2),
+  **composite (row) types** (`format_version` 9 — kind-tagged catalog entries + a composite-type
+  section + two-pass acyclic load, `spec/design/composite.md`), **array (`T[]`) columns**
+  (`format_version` 10 — `type_code 15` + an inline element-type descriptor + the compact array
+  value body, `spec/design/array.md`), and **`FOREIGN KEY` constraints** (`format_version` 11 — the
+  table catalog entry gains a per-table foreign-key list after the index list, referencing the
+  parent table/columns by name/ordinal with an `on_delete`/`on_update` action byte; an FK owns no
+  B-tree, so it adds no value-codec change, `spec/design/constraints.md` §6). **Still deferred**
   (later Phase-6, none foreclosed): continuous within-session reclamation + on-disk free-list
   persistence (the P6.2 follow-ons). The from-scratch whole-image serializer survives as
   `create`'s initial write and the golden generator.

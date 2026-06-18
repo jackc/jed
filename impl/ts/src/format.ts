@@ -11,7 +11,7 @@
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
 import type { Expr } from "./ast.ts";
-import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type IndexDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
+import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type FkAction, type ForeignKey, type IndexDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
@@ -58,7 +58,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 10; // on-disk format version (10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4). 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 9 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 11; // on-disk format version (11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6). 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 10 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -845,8 +845,41 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
     w.u8(idx.unique ? 1 : 0);
     w.u32(indexRoots[k]!);
   }
+  // Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
+  // table, list order), the referenced table name, the referenced-column ordinals (into the
+  // PARENT, list order), and the actions byte (bits 0-1 on_delete, bits 2-3 on_update) — in the
+  // catalog's ascending lowercased-name order (spec/design/constraints.md §6.9). An FK owns no
+  // B-tree (no root page).
+  w.u16(table.fks.length);
+  for (const fk of table.fks) {
+    const fnm = UTF8.encode(fk.name);
+    w.u16(fnm.length);
+    w.bytes(fnm);
+    w.u16(fk.columns.length);
+    for (const c of fk.columns) w.u16(c);
+    const rt = UTF8.encode(fk.refTable);
+    w.u16(rt.length);
+    w.bytes(rt);
+    w.u16(fk.refColumns.length);
+    for (const c of fk.refColumns) w.u16(c);
+    w.u8(fkActionCode(fk.onDelete) | (fkActionCode(fk.onUpdate) << 2));
+  }
   w.u32(rootDataPage);
   return w.toBytes();
+}
+
+// fkActionCode is the 2-bit on-disk code for a referential action (format.md): NO ACTION = 0,
+// RESTRICT = 1.
+function fkActionCode(a: FkAction): number {
+  return a === "restrict" ? 1 : 0;
+}
+
+// fkActionFromCode decodes a 2-bit referential-action code; an unsupported code (2/3, reserved
+// for the deferred write-actions) in an otherwise-valid file is XX001.
+function fkActionFromCode(c: number): FkAction {
+  if (c === 0) return "noAction";
+  if (c === 1) return "restrict";
+  throw engineError("data_corrupted", "unsupported foreign-key action code");
 }
 
 // compositeTypeEntryBytes serializes a composite-type catalog entry's BODY (after its
@@ -1970,8 +2003,47 @@ function decodeTableEntry(
     indexRoots.push(readU32(buf, cur));
     indexes.push({ name: iname, columns: cols, unique: (iflags & 0b01) !== 0 });
   }
+  // Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
+  // actions byte, in the catalog's (lowercased-name ascending) order — a reader trusts the
+  // order. The local ordinals index THIS table; the referenced ordinals index the PARENT (whose
+  // entry may be decoded later, so they are not cross-checked here — the writer keeps them
+  // valid; a structurally impossible FK is rejected below).
+  const fkCount = readU16(buf, cur);
+  const fks: ForeignKey[] = [];
+  for (let i = 0; i < fkCount; i++) {
+    const fname = readString(buf, cur);
+    const lc = readU16(buf, cur);
+    if (lc === 0) throw engineError("data_corrupted", "foreign key with no columns");
+    const cols: number[] = [];
+    for (let j = 0; j < lc; j++) {
+      const ord = readU16(buf, cur);
+      if (ord >= columns.length) {
+        throw engineError("data_corrupted", "invalid foreign-key column ordinal");
+      }
+      cols.push(ord);
+    }
+    const refTable = readString(buf, cur);
+    const rc = readU16(buf, cur);
+    if (rc !== lc) {
+      throw engineError("data_corrupted", "foreign-key referencing/referenced column count mismatch");
+    }
+    const refCols: number[] = [];
+    for (let j = 0; j < rc; j++) refCols.push(readU16(buf, cur));
+    const actions = readU8(buf, cur);
+    if ((actions & ~0b1111) !== 0) {
+      throw engineError("data_corrupted", "reserved foreign-key action bit set");
+    }
+    fks.push({
+      name: fname,
+      columns: cols,
+      refTable,
+      refColumns: refCols,
+      onDelete: fkActionFromCode(actions & 0b11),
+      onUpdate: fkActionFromCode((actions >> 2) & 0b11),
+    });
+  }
   const root = readU32(buf, cur);
-  return { table: { name, columns, pk, checks, indexes }, root, indexRoots };
+  return { table: { name, columns, pk, checks, indexes, fks }, root, indexRoots };
 }
 
 // readValueLazy reads one value lazily (spec/design/large-values.md §14): inline-plain and NULL

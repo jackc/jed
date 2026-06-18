@@ -8,6 +8,8 @@ import type {
   CheckDef,
   Cte,
   DefaultDef,
+  ForeignKeyDef,
+  RefAction,
   UniqueDef,
   ColumnDef,
   Delete,
@@ -270,6 +272,7 @@ class Parser {
     const tablePks: string[][] = [];
     const checks: CheckDef[] = [];
     const uniques: UniqueDef[] = [];
+    const fks: ForeignKeyDef[] = [];
     for (;;) {
       if (this.peekKeyword() === "primary" && this.peekKeywordAt(1) === "key") {
         this.advance();
@@ -279,8 +282,10 @@ class Parser {
         checks.push(this.parseCheckConstraint());
       } else if (this.atUniqueTableConstraint()) {
         uniques.push(this.parseUniqueTableConstraint());
+      } else if (this.atForeignKeyTableConstraint()) {
+        fks.push(this.parseForeignKeyTableConstraint());
       } else {
-        columns.push(this.parseColumnDef(checks, uniques));
+        columns.push(this.parseColumnDef(checks, uniques, fks));
       }
       const k = this.advance().kind;
       if (k === "comma") continue;
@@ -290,7 +295,111 @@ class Parser {
     if (columns.length === 0) {
       throw engineError("syntax_error", "a table must have at least one column");
     }
-    return { kind: "createTable", name, columns, tablePks, checks, uniques };
+    return { kind: "createTable", name, columns, tablePks, checks, uniques, fks };
+  }
+
+  // atForeignKeyTableConstraint reports whether the cursor sits on a table-level FOREIGN KEY
+  // constraint: the two keywords FOREIGN KEY, or CONSTRAINT <ident> FOREIGN KEY
+  // (spec/design/grammar.md §43). The keywords stay non-reserved — a column named "foreign"
+  // would need a type named "key" (none exists), so the lookahead loses nothing (the PRIMARY KEY
+  // precedent).
+  private atForeignKeyTableConstraint(): boolean {
+    if (this.peekKeyword() === "foreign" && this.peekKeywordAt(1) === "key") return true;
+    return (
+      this.peekKeyword() === "constraint" &&
+      this.peekKeywordAt(2) === "foreign" &&
+      this.peekKeywordAt(3) === "key"
+    );
+  }
+
+  // parseForeignKeyTableConstraint parses one table-level `[CONSTRAINT name] FOREIGN KEY
+  // ( col [, col]* ) references_clause` (the cursor is verified by
+  // atForeignKeyTableConstraint). The local-column list reuses the PRIMARY KEY list shape
+  // (spec/design/grammar.md §43).
+  private parseForeignKeyTableConstraint(): ForeignKeyDef {
+    let name: string | null = null;
+    if (this.peekKeyword() === "constraint") {
+      this.advance();
+      name = this.expectIdentifier();
+    }
+    this.expectKeyword("foreign");
+    this.expectKeyword("key");
+    const columns = this.parsePkColumnList();
+    const { refTable, refColumns, onDelete, onUpdate } = this.parseReferencesClause();
+    return { name, columns, refTable, refColumns, onDelete, onUpdate };
+  }
+
+  // parseReferencesClause parses a references_clause from the REFERENCES keyword onward (shared
+  // by the column-level and table-level forms — spec/design/grammar.md §43): the referenced
+  // table, an optional referenced-column list (null defaults to the parent's primary key), and
+  // the `ON DELETE` / `ON UPDATE` actions (each at most once, either order; a repeat is 42601).
+  private parseReferencesClause(): {
+    refTable: string;
+    refColumns: string[] | null;
+    onDelete: RefAction;
+    onUpdate: RefAction;
+  } {
+    this.expectKeyword("references");
+    const refTable = this.expectIdentifier();
+    const refColumns = this.peek().kind === "lparen" ? this.parsePkColumnList() : null;
+    let onDelete: RefAction = "noAction";
+    let onUpdate: RefAction = "noAction";
+    let seenDelete = false;
+    let seenUpdate = false;
+    while (this.peekKeyword() === "on") {
+      this.advance();
+      const kw = this.peekKeyword();
+      if (kw === "delete") {
+        this.advance();
+        if (seenDelete) throw engineError("syntax_error", "ON DELETE specified more than once");
+        seenDelete = true;
+        onDelete = this.parseReferentialAction();
+      } else if (kw === "update") {
+        this.advance();
+        if (seenUpdate) throw engineError("syntax_error", "ON UPDATE specified more than once");
+        seenUpdate = true;
+        onUpdate = this.parseReferentialAction();
+      } else {
+        throw engineError("syntax_error", "expected DELETE or UPDATE after ON");
+      }
+    }
+    return { refTable, refColumns, onDelete, onUpdate };
+  }
+
+  // parseReferentialAction parses one referential_action (spec/design/grammar.md §43). All five
+  // PG actions parse; CASCADE / SET NULL / SET DEFAULT are rejected later at CREATE TABLE (0A000).
+  private parseReferentialAction(): RefAction {
+    const kw = this.peekKeyword();
+    if (kw === "no") {
+      this.advance();
+      this.expectKeyword("action");
+      return "noAction";
+    }
+    if (kw === "restrict") {
+      this.advance();
+      return "restrict";
+    }
+    if (kw === "cascade") {
+      this.advance();
+      return "cascade";
+    }
+    if (kw === "set") {
+      this.advance();
+      const next = this.peekKeyword();
+      if (next === "null") {
+        this.advance();
+        return "setNull";
+      }
+      if (next === "default") {
+        this.advance();
+        return "setDefault";
+      }
+      throw engineError("syntax_error", "expected NULL or DEFAULT after SET");
+    }
+    throw engineError(
+      "syntax_error",
+      "expected a referential action: NO ACTION / RESTRICT / CASCADE / SET NULL / SET DEFAULT",
+    );
   }
 
   // atUniqueTableConstraint reports whether the cursor sits on a table-level UNIQUE
@@ -364,7 +473,7 @@ class Parser {
     }
   }
 
-  private parseColumnDef(checks: CheckDef[], uniques: UniqueDef[]): ColumnDef {
+  private parseColumnDef(checks: CheckDef[], uniques: UniqueDef[], fks: ForeignKeyDef[]): ColumnDef {
     const name = this.expectIdentifier();
     const baseType = this.expectIdentifier();
     const typeMod = this.parseTypeMod();
@@ -393,6 +502,14 @@ class Parser {
         uniques.push({ name: cname, columns: [name] });
         continue;
       }
+      // CONSTRAINT <name> REFERENCES … in column position (the named one-member FK).
+      if (this.peekKeyword() === "constraint" && this.peekKeywordAt(2) === "references") {
+        this.advance();
+        const cname = this.expectIdentifier();
+        const { refTable, refColumns, onDelete, onUpdate } = this.parseReferencesClause();
+        fks.push({ name: cname, columns: [name], refTable, refColumns, onDelete, onUpdate });
+        continue;
+      }
       const kw = this.peekKeyword();
       if (kw === "primary") {
         this.advance();
@@ -415,6 +532,11 @@ class Parser {
       } else if (kw === "unique") {
         this.advance();
         uniques.push({ name: null, columns: [name] });
+      } else if (kw === "references") {
+        // The column-level one-member FK: `REFERENCES parent [(col)] [actions]`.
+        // parseReferencesClause consumes the REFERENCES keyword itself.
+        const { refTable, refColumns, onDelete, onUpdate } = this.parseReferencesClause();
+        fks.push({ name: null, columns: [name], refTable, refColumns, onDelete, onUpdate });
       } else {
         break;
       }

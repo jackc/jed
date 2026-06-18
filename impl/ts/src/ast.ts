@@ -238,6 +238,32 @@ export type CreateTable = {
   // resolution, the dedup/PK fold, and naming — spec/design/constraints.md §5). Each
   // survivor becomes a unique secondary index (spec/design/indexes.md §8).
   uniques: UniqueDef[];
+  // Every `FOREIGN KEY (cols) REFERENCES …` of the statement — the column-level
+  // `REFERENCES` form collects as a one-member list — in TEXTUAL DEFINITION ORDER (it drives
+  // resolution and naming — spec/design/constraints.md §6). CREATE TABLE's execution resolves
+  // each (42703/42701/42P01/42830/42804), rejects unsupported actions (0A000), and names the
+  // unnamed ones (42710).
+  fks: ForeignKeyDef[];
+};
+
+// RefAction is a referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md
+// §6.6). Only "noAction" (the default) and "restrict" are supported — identical in jed (no
+// deferrable constraints); the write-actions parse but are rejected 0A000 at CREATE TABLE.
+export type RefAction = "noAction" | "restrict" | "cascade" | "setNull" | "setDefault";
+
+// ForeignKeyDef is one parsed `FOREIGN KEY` / `REFERENCES` constraint (spec/design/grammar.md
+// §43): the optional explicit CONSTRAINT name (null = unnamed), the local (referencing) column
+// names in list order, the referenced (parent) table name, the optional referenced column names
+// (null = the parent's primary key), and the `ON DELETE` / `ON UPDATE` actions. Execution
+// resolves it (42703/42701/42P01/42830/42804) and names the unnamed ones (42710) —
+// spec/design/constraints.md §6.
+export type ForeignKeyDef = {
+  name: string | null;
+  columns: string[];
+  refTable: string;
+  refColumns: string[] | null;
+  onDelete: RefAction;
+  onUpdate: RefAction;
 };
 
 // CheckDef is one parsed CHECK constraint (spec/design/grammar.md §29): the optional

@@ -135,6 +135,37 @@ fn unique_table_db() -> Database {
     db
 }
 
+/// Tables with FOREIGN KEY constraints (v11 — spec/design/constraints.md §6): pins the catalog
+/// foreign-key list. Parent `p` (a PK + two UNIQUE constraints, the FK targets); child `c` with
+/// four FKs covering every shape — a named FK to the UNIQUE column (`c_code_fk`), a self-reference
+/// to the PK (`c_mgr_fkey`), an auto-named FK to the PK (`c_pid_fkey`), and an auto-named COMPOSITE
+/// FK to the two-column UNIQUE with ON DELETE RESTRICT (`c_x_y_fkey`, the lone non-zero actions
+/// byte). Must match the Ruby reference's FK_TABLE (spec/fileformat/verify.rb).
+fn fk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE p (pid int32 PRIMARY KEY, code int32 UNIQUE, a int32, b int32, UNIQUE (a, b))",
+    );
+    run(
+        &mut db,
+        "INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)",
+    );
+    run(
+        &mut db,
+        "CREATE TABLE c (id int32 PRIMARY KEY, pid int32, pcode int32, x int32, y int32, mgr int32, \
+         FOREIGN KEY (pid) REFERENCES p (pid), \
+         CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), \
+         FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT, \
+         FOREIGN KEY (mgr) REFERENCES c (id))",
+    );
+    run(
+        &mut db,
+        "INSERT INTO c VALUES (10, 1, 100, 10, 20, NULL), (11, 2, 200, 30, 40, 10)",
+    );
+    db
+}
+
 /// A table with ARRAY (`T[]`) columns (v10 — spec/design/array.md): pins the catalog array-column
 /// entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). An
 /// `int32[]` (fixed-width elements: no per-element length prefix) and a `text[]`; row 2 has an EMPTY
@@ -611,6 +642,7 @@ fn write_matches_goldens() {
         ("check_table.jed", check_table_db),
         ("index_table.jed", index_table_db),
         ("unique_table.jed", unique_table_db),
+        ("fk_table.jed", fk_table_db),
         ("composite_type_table.jed", composite_type_table_db),
         ("nested_composite_table.jed", nested_composite_table_db),
         ("array_table.jed", array_table_db),
@@ -654,6 +686,7 @@ fn read_goldens_reproduces_rows() {
         ("check_table.jed", check_table_db, "t"),
         ("index_table.jed", index_table_db, "t"),
         ("unique_table.jed", unique_table_db, "t"),
+        ("fk_table.jed", fk_table_db, "c"),
         ("composite_type_table.jed", composite_type_table_db, "t"),
         ("nested_composite_table.jed", nested_composite_table_db, "t"),
         ("array_table.jed", array_table_db, "t"),
