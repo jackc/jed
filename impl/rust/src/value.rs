@@ -325,6 +325,17 @@ impl ThreeValued {
             _ => ThreeValued::False,
         }
     }
+
+    /// Three-valued NOT (Kleene logic): TRUE↔FALSE, UNKNOWN stays UNKNOWN. Used to build
+    /// `<>` as the negation of `=` so a NULL operand still yields UNKNOWN (`NULL <> NULL`),
+    /// not a wrong TRUE.
+    pub fn not(self) -> ThreeValued {
+        match self {
+            ThreeValued::True => ThreeValued::False,
+            ThreeValued::False => ThreeValued::True,
+            ThreeValued::Unknown => ThreeValued::Unknown,
+        }
+    }
 }
 
 impl Value {

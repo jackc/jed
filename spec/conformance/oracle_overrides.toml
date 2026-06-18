@@ -377,3 +377,20 @@ reason = "jed: comparing int32[] to text[] is a cross-type error 42804 (the stri
 file = "types/array.test"
 sql = "CREATE TABLE k (xs int32[] PRIMARY KEY)"
 reason = "jed: an array PRIMARY KEY is rejected 0A000 this slice (the order-preserving array key encoding is authored but unexercised — array.md §12). PostgreSQL allows an array primary key, so it does NOT raise. A documented narrowing."
+
+# --- not_equal.test: `<>` inherits `=`'s deliberate strict-typing divergences (the same three
+# the sibling is_distinct_from.test exhibits), registered to keep the ledger complete.
+[[override]]
+file = "expr/not_equal.test"
+sql = "SELECT id FROM t WHERE a <> 'x'"
+reason = "jed: int32 vs a text literal is not comparable (42804) — the strict type system (§4) rejects the cross-family comparison rather than coercing the literal. PostgreSQL coerces 'x' to integer and fails parsing it, raising 22P02. Both reject; the codes differ (the `=`/IS DISTINCT FROM precedent)."
+
+[[override]]
+file = "expr/not_equal.test"
+sql = "SELECT id FROM w WHERE s <> 100000"
+reason = "jed: an untyped literal adapts to the sibling column's type, so 100000 against an int16 column overflows and traps 22003 at resolve, before any row is scanned (the literal range check `=` performs — types.md §6). PostgreSQL types 100000 as int4, promotes the int2 column, and raises no error. A standing, documented divergence."
+
+[[override]]
+file = "expr/not_equal.test"
+sql = "SELECT id FROM t WHERE a ! b"
+reason = "jed: a lone `!` (not part of `!=`) is not in jed's surface — the lexer raises 42601 (grammar.md §4). PostgreSQL lexes `!` as an operator name and reports operator-does-not-exist 42883. jed owns its operator surface; the codes differ."

@@ -44,6 +44,9 @@ const (
 	TokPercent
 	// TokEq is "=".
 	TokEq
+	// TokNe is "<>" (or its "!=" alias) — the not-equal operator. The lexer folds both
+	// spellings to this one token (spec/design/grammar.md §4).
+	TokNe
 	// TokLt is "<".
 	TokLt
 	// TokGt is ">".

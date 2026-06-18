@@ -6923,6 +6923,7 @@ function resolveBinary(
       return { node: { kind: "arith", op, result, lhs: p.rl, rhs: p.rr }, type: { kind: "int", ty: result } };
     }
     case "eq":
+    case "ne":
     case "lt":
     case "gt":
     case "le":
@@ -7124,6 +7125,8 @@ function binaryOpSymbol(op: BinaryOp): string {
   switch (op) {
     case "eq":
       return "=";
+    case "ne":
+      return "<>";
     case "lt":
       return "<";
     case "gt":
@@ -8910,6 +8913,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       switch (e.op) {
         case "eq":
           return from3(eq3(a, b));
+        case "ne":
+          return from3(not3(eq3(a, b)));
         case "lt":
           return from3(lt3(a, b));
         case "gt":
@@ -9195,6 +9200,9 @@ function quantifiedCmp3(op: BinaryOp, x: Value, e: Value): ThreeValued {
       case "eq":
         matched = ord === 0;
         break;
+      case "ne":
+        matched = ord !== 0;
+        break;
       case "lt":
         matched = ord < 0;
         break;
@@ -9214,6 +9222,8 @@ function quantifiedCmp3(op: BinaryOp, x: Value, e: Value): ThreeValued {
   switch (op) {
     case "eq":
       return eq3(x, e);
+    case "ne":
+      return not3(eq3(x, e));
     case "lt":
       return lt3(x, e);
     case "gt":
@@ -9575,6 +9585,14 @@ function or3(a: "true" | "false" | "unknown", b: "true" | "false" | "unknown"): 
   if (a === "true" || b === "true") return "true";
   if (a === "unknown" || b === "unknown") return "unknown";
   return "false";
+}
+
+// not3 is three-valued NOT (Kleene): true<->false, unknown stays unknown. Used to build `<>`
+// as the negation of `=`, so a NULL operand still yields UNKNOWN (`NULL <> NULL`), not a wrong TRUE.
+function not3(a: ThreeValued): ThreeValued {
+  if (a === "true") return "false";
+  if (a === "false") return "true";
+  return "unknown";
 }
 
 // keyCmp is one ORDER BY key's total-order comparison, returning <0, 0, >0. NULL placement

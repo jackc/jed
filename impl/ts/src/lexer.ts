@@ -150,6 +150,11 @@ export function lex(sql: string): Token[] {
       if (i + 1 < n && sql[i + 1] === "=") {
         tokens.push({ kind: "le" });
         i += 2;
+      } else if (i + 1 < n && sql[i + 1] === ">") {
+        // `<>` is the not-equal operator (grammar.md §4), scanned greedily; its `!=` alias is
+        // handled in the `!` branch and folds to the same token.
+        tokens.push({ kind: "ne" });
+        i += 2;
       } else if (i + 1 < n && sql[i + 1] === "@") {
         // `<@` is the array contained-by operator (grammar.md §40), scanned greedily.
         tokens.push({ kind: "containedBy" });
@@ -157,6 +162,15 @@ export function lex(sql: string): Token[] {
       } else {
         tokens.push({ kind: "lt" });
         i++;
+      }
+    } else if (c === "!") {
+      // `!=` is the PostgreSQL alias for `<>` (grammar.md §4); both fold to the `ne` token. A
+      // lone `!` is not part of jed's surface (no factorial / boolean-not) — 42601.
+      if (i + 1 < n && sql[i + 1] === "=") {
+        tokens.push({ kind: "ne" });
+        i += 2;
+      } else {
+        throw engineError("syntax_error", "unexpected character '!'");
       }
     } else if (c === "@") {
       // `@>` is the array containment operator (grammar.md §40), scanned greedily as one token;

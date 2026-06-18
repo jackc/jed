@@ -220,6 +220,7 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "expr.parens",
   "expr.precedence",
   "expr.comparison_value",
+  "expr.not_equal",
   "query.logical_connectives",
   "query.is_distinct_from",
   "error.division_by_zero",

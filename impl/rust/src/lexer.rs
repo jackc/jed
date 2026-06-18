@@ -162,6 +162,11 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     tokens.push(Token::Le);
                     i += 2;
+                } else if bytes.get(i + 1) == Some(&b'>') {
+                    // `<>` is the not-equal operator (grammar.md §4), scanned greedily; its `!=`
+                    // alias is handled in the `!` arm and folds to the same token.
+                    tokens.push(Token::Ne);
+                    i += 2;
                 } else if bytes.get(i + 1) == Some(&b'@') {
                     // `<@` is the array contained-by operator (grammar.md §40), scanned greedily.
                     tokens.push(Token::ContainedBy);
@@ -169,6 +174,16 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 } else {
                     tokens.push(Token::Lt);
                     i += 1;
+                }
+            }
+            b'!' => {
+                // `!=` is the PostgreSQL alias for `<>` (grammar.md §4); both fold to `Token::Ne`.
+                // A lone `!` is not part of jed's surface (no factorial / boolean-not) — 42601.
+                if bytes.get(i + 1) == Some(&b'=') {
+                    tokens.push(Token::Ne);
+                    i += 2;
+                } else {
+                    return Err(syntax("unexpected character '!'".to_string()));
                 }
             }
             b'@' => {

@@ -124,8 +124,8 @@ CREATE TABLE k (xs int32[] PRIMARY KEY)
 
 # --- array comparison with NULL ELEMENTS yields a DEFINITE boolean (PG btree semantics, array.md
 # §5), NOT the composite 3VL rule: a NULL element sorts LAST (is the largest), every comparison is
-# TRUE or FALSE (never NULL/UNKNOWN), and NULL elements are mutually equal. (jed has no <> / !=
-# operator, so inequality is exercised via <, >, <=, >= — grammar.ebnf.)
+# TRUE or FALSE (never NULL/UNKNOWN), and NULL elements are mutually equal. (Inequality is
+# exercised below via <, >, <=, >=; whole-array `=`/`<>` are definite the same way — array.md §5.)
 statement ok
 CREATE TABLE cmpn (id int32 PRIMARY KEY, xs int32[])
 

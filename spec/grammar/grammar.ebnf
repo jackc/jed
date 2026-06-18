@@ -519,7 +519,7 @@ comparison     ::= concat ( compare_op ( ("ANY" | "SOME" | "ALL") "(" ( query_ex
                             | "NOT"? "BETWEEN" concat "AND" concat
                             | "NOT"? "LIKE" concat )?
 
-compare_op     ::= "=" | "<" | ">" | "<=" | ">="   /* no "<>" and no "!=" */
+compare_op     ::= "=" | "<" | ">" | "<=" | ">=" | "<>" | "!="   /* "<>" and "!=" are one not-equal operator; the lexer folds "!=" to "<>" */
 
 /* The "any other operator" rung (../design/array-functions.md §8/§10) — PostgreSQL's precedence
  * level shared by `||` and the array containment/overlap operators, all left-associative and

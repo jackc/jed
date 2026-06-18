@@ -5246,6 +5246,8 @@ func quantifiedCmp3(op BinaryOp, x, e Value) ThreeValued {
 		switch op {
 		case OpEq:
 			matched = ord == 0
+		case OpNe:
+			matched = ord != 0
 		case OpLt:
 			matched = ord < 0
 		case OpGt:
@@ -5268,6 +5270,8 @@ func quantifiedCmp3(op BinaryOp, x, e Value) ThreeValued {
 	switch op {
 	case OpEq:
 		return x.Eq3(e)
+	case OpNe:
+		return not3(x.Eq3(e))
 	case OpLt:
 		return x.Lt3(e)
 	case OpGt:
@@ -7521,6 +7525,8 @@ func binaryOpSymbol(op BinaryOp) string {
 	switch op {
 	case OpEq:
 		return "="
+	case OpNe:
+		return "<>"
 	case OpLt:
 		return "<"
 	case OpGt:
@@ -9168,7 +9174,7 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		result := promote(lt, rt)
 		return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: result},
 			resolvedType{kind: rtInt, intTy: result}, nil
-	case OpEq, OpLt, OpGt, OpLe, OpGe:
+	case OpEq, OpNe, OpLt, OpGt, OpLe, OpGe:
 		// Comparison is overloaded across families: integer×integer or text×text. Resolve
 		// the operands (a literal adapts to its sibling; text literals stay text), then
 		// require they be comparable — a mixed integer/text pair is 42804. The runtime
@@ -10900,6 +10906,8 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		switch e.op {
 		case OpEq:
 			return from3(a.Eq3(b)), nil
+		case OpNe:
+			return from3(not3(a.Eq3(b))), nil
 		case OpLt:
 			return from3(a.Lt3(b)), nil
 		case OpGt:
@@ -11486,6 +11494,19 @@ func or3(a, b ThreeValued) ThreeValued {
 		return Unknown
 	}
 	return False
+}
+
+// not3 is the Kleene NOT: True<->False, Unknown stays Unknown. Used to build `<>` as the
+// negation of `=`, so a NULL operand still yields UNKNOWN (`NULL <> NULL`), not a wrong True.
+func not3(a ThreeValued) ThreeValued {
+	switch a {
+	case True:
+		return False
+	case False:
+		return True
+	default: // Unknown
+		return Unknown
+	}
 }
 
 // keyCmp is one ORDER BY key's total-order comparison, returning <0, 0, >0. NULL placement

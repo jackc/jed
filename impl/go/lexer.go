@@ -153,6 +153,11 @@ func Lex(sql string) ([]Token, error) {
 			if i+1 < len(b) && b[i+1] == '=' {
 				tokens = append(tokens, Token{Kind: TokLe})
 				i += 2
+			} else if i+1 < len(b) && b[i+1] == '>' {
+				// `<>` is the not-equal operator (grammar.md §4), scanned greedily; its `!=`
+				// alias is handled in the `!` case and folds to the same token.
+				tokens = append(tokens, Token{Kind: TokNe})
+				i += 2
 			} else if i+1 < len(b) && b[i+1] == '@' {
 				// `<@` is the array contained-by operator (grammar.md §40), scanned greedily.
 				tokens = append(tokens, Token{Kind: TokContainedBy})
@@ -160,6 +165,15 @@ func Lex(sql string) ([]Token, error) {
 			} else {
 				tokens = append(tokens, Token{Kind: TokLt})
 				i++
+			}
+		case c == '!':
+			// `!=` is the PostgreSQL alias for `<>` (grammar.md §4); both fold to TokNe. A lone
+			// `!` is not part of jed's surface (no factorial / boolean-not) — 42601.
+			if i+1 < len(b) && b[i+1] == '=' {
+				tokens = append(tokens, Token{Kind: TokNe})
+				i += 2
+			} else {
+				return nil, NewError(SyntaxError, "unexpected character '!'")
 			}
 		case c == '@':
 			// `@>` is the array containment operator (grammar.md §40), scanned greedily as one

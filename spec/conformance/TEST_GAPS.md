@@ -100,8 +100,8 @@ Empirically derived via the Rust CLI, cross-checked on every core's harness.
   NULL LHS UNKNOWN.
 - **G6** — [suites/types/array.test](suites/types/array.test): array comparison with NULL
   *elements* yields a **definite** boolean (PG btree, not composite 3VL) — `<`/`>`/`<=`/`=` and
-  ORDER BY (`{1,NULL}` sorts last). (jed has no `<>`/`!=` — grammar.ebnf:499 — so inequality uses
-  `<`/`>`.)
+  ORDER BY (`{1,NULL}` sorts last). (Inequality is exercised via `<`/`>`; the scalar `<>`/`!=`
+  operator now exists and is covered by [expr/not_equal.test](suites/expr/not_equal.test).)
 - **G7** — [promotion.test](suites/compare/promotion.test) + [narrowing.test](suites/cast/narrowing.test):
   `# types:` pins the promoted width (`int16+int32→int32`, `int16/int32+int64→int64`) and CAST
   target (`int32`, chained `int16`) — invisible on rows since all integers render `I`.

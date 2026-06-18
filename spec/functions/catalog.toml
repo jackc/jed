@@ -135,10 +135,26 @@ errors         = []
 # arithmetic). `<=`/`>=` are primitive operators here; that they equal `< OR =` /
 # `> OR =` under Kleene logic is reasoning recorded in functions.md, not a data
 # field. They bind between NOT and additive (precedence 35), non-associatively.
+# `ne` (`<>`) is the not-equal operator — the 3VL negation of `=` (it propagates
+# NULL exactly as `=` does, so `NULL <> NULL` is unknown). Its canonical symbol is
+# the SQL-standard `<>`; the PostgreSQL spelling `!=` is a lexer-level alias for
+# the SAME operator (the parsers fold `!=` to `<>`), so it needs no catalog row.
 
 [[operator]]
 name           = "eq"
 symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ne"
+symbol         = "<>"
 kind           = "comparison"
 arity          = 2
 arg_families   = ["integer", "integer"]
@@ -244,6 +260,18 @@ errors         = []
 [[operator]]
 name           = "eq"
 symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ne"
+symbol         = "<>"
 kind           = "comparison"
 arity          = 2
 arg_families   = ["text", "text"]
@@ -370,6 +398,18 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+name           = "ne"
+symbol         = "<>"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["boolean", "boolean"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -451,6 +491,18 @@ errors         = []
 [[operator]]
 name           = "eq"
 symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ne"
+symbol         = "<>"
 kind           = "comparison"
 arity          = 2
 arg_families   = ["decimal", "decimal"]
@@ -543,6 +595,18 @@ errors         = []
 [[operator]]
 name           = "eq"
 symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["bytea", "bytea"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ne"
+symbol         = "<>"
 kind           = "comparison"
 arity          = 2
 arg_families   = ["bytea", "bytea"]
@@ -646,6 +710,18 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+name           = "ne"
+symbol         = "<>"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["uuid", "uuid"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -739,6 +815,18 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+name           = "ne"
+symbol         = "<>"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -811,6 +899,18 @@ errors         = []
 [[operator]]
 name           = "eq"
 symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ne"
+symbol         = "<>"
 kind           = "comparison"
 arity          = 2
 arg_families   = ["timestamptz", "timestamptz"]
@@ -912,6 +1012,18 @@ precedence     = 35
 errors         = []
 
 [[operator]]
+name           = "ne"
+symbol         = "<>"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["interval", "interval"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
 name           = "lt"
 symbol         = "<"
 kind           = "comparison"
@@ -993,6 +1105,18 @@ errors         = []
 [[operator]]
 name           = "eq"
 symbol         = "="
+kind           = "comparison"
+arity          = 2
+arg_families   = ["float", "float"]
+arg_resolution = "promote"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = []
+
+[[operator]]
+name           = "ne"
+symbol         = "<>"
 kind           = "comparison"
 arity          = 2
 arg_families   = ["float", "float"]

@@ -1627,6 +1627,7 @@ impl Parser {
         }
         let op = match self.peek() {
             Token::Eq => Some(BinaryOp::Eq),
+            Token::Ne => Some(BinaryOp::Ne),
             Token::Lt => Some(BinaryOp::Lt),
             Token::Gt => Some(BinaryOp::Gt),
             Token::Le => Some(BinaryOp::Le),
@@ -2346,6 +2347,7 @@ fn render_token(t: &Token) -> String {
         Token::Slash => "/".into(),
         Token::Percent => "%".into(),
         Token::Eq => "=".into(),
+        Token::Ne => "<>".into(),
         Token::Lt => "<".into(),
         Token::Gt => ">".into(),
         Token::Le => "<=".into(),

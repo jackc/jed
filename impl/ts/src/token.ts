@@ -18,6 +18,8 @@ export type TokenKind =
   | "slash" // /
   | "percent" // %
   | "eq" // =
+  | "ne" // <> (or its != alias) — the not-equal operator; the lexer folds both spellings to
+  //         this one token (spec/design/grammar.md §4)
   | "lt" // <
   | "gt" // >
   | "le" // <=

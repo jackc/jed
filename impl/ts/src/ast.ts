@@ -38,6 +38,8 @@ export type BinaryOp =
   | "div"
   | "mod"
   | "eq"
+  // ne is <> (alias !=): the 3VL negation of eq, propagating NULL like eq.
+  | "ne"
   | "lt"
   | "gt"
   | "le"

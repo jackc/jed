@@ -648,6 +648,8 @@ pub enum BinaryOp {
     Mod,
     // comparison (integer operands → boolean result)
     Eq,
+    // not-equal `<>` (alias `!=`): the 3VL negation of Eq, propagating NULL like Eq.
+    Ne,
     Lt,
     Gt,
     Le,

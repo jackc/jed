@@ -238,7 +238,7 @@ description = "Non-recursive common table expressions — WITH name [(cols)] AS 
 
 [[capability]]
 id = "query.subquery_quantified"
-description = "Quantified comparison over a subquery — x op ANY/SOME/ALL (SELECT …) (spec/design/array-functions.md §11.6), the subquery spelling of IN that bridges AF5 (the array quantifier) and the §26 subquery machinery. A leading SELECT after the quantifier's ( selects this form (the §26 lookahead); the body's single column (42601 if >1) folds through the SAME three-valued quantified_membership as the array form: ANY/SOME is the OR-fold (empty → FALSE), ALL the AND-fold (empty → TRUE), a NULL x or NULL row is the UNKNOWN element. No 21000 cardinality limit (any row count is a list). x = ANY(SELECT …) ≡ x IN (SELECT …); the five operators = < > <= >= generalize it (jed has no <>, so <> ALL / NOT IN is unreachable here). x and the body's column type must be comparable, else 42883 (operator does not exist, the §11.3 posture, not 42804). Uncorrelated → planned once and folded to a constant-array Quantified node (no per-row re-exec); correlated → re-executed per outer row, rows gathered into an array, same fold. SOME folds to ANY. Builds on query.subquery_correlated / func.array_quantified"
+description = "Quantified comparison over a subquery — x op ANY/SOME/ALL (SELECT …) (spec/design/array-functions.md §11.6), the subquery spelling of IN that bridges AF5 (the array quantifier) and the §26 subquery machinery. A leading SELECT after the quantifier's ( selects this form (the §26 lookahead); the body's single column (42601 if >1) folds through the SAME three-valued quantified_membership as the array form: ANY/SOME is the OR-fold (empty → FALSE), ALL the AND-fold (empty → TRUE), a NULL x or NULL row is the UNKNOWN element. No 21000 cardinality limit (any row count is a list). x = ANY(SELECT …) ≡ x IN (SELECT …); the six operators = <> < > <= >= generalize it (x <> ALL(SELECT …) is the quantified spelling of NOT IN). x and the body's column type must be comparable, else 42883 (operator does not exist, the §11.3 posture, not 42804). Uncorrelated → planned once and folded to a constant-array Quantified node (no per-row re-exec); correlated → re-executed per outer row, rows gathered into an array, same fold. SOME folds to ANY. Builds on query.subquery_correlated / func.array_quantified"
 
 [[capability]]
 id = "query.derived_table"
@@ -413,6 +413,10 @@ id = "expr.comparison_value"
 description = "Comparisons produce boolean values usable in the SELECT list and nested expressions"
 
 [[capability]]
+id = "expr.not_equal"
+description = "The not-equal operator `<>` (and its `!=` alias) — the 3VL negation of `=`: propagates NULL like `=` (`NULL <> NULL` is unknown), overloaded across every comparable family, and `!=` lexes to the same operator"
+
+[[capability]]
 id = "query.logical_connectives"
 description = "AND / OR / NOT with three-valued (Kleene) truth tables"
 
@@ -552,6 +556,7 @@ capabilities = [
   "expr.parens",
   "expr.precedence",
   "expr.comparison_value",
+  "expr.not_equal",
   "query.logical_connectives",
   "query.is_distinct_from",
   "error.division_by_zero",

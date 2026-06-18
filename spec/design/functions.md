@@ -22,7 +22,7 @@ The catalog now lists:
 | Kind | Operators | Result |
 |---|---|---|
 | `logical` | `AND` `OR` `NOT` | `boolean` |
-| `comparison` | `=` `<` `>` `<=` `>=` | `boolean` |
+| `comparison` | `=` `<>` (`!=`) `<` `>` `<=` `>=` | `boolean` |
 | `comparison` (NULL-safe) | `IS DISTINCT FROM`, `IS NOT DISTINCT FROM` | `boolean` |
 | `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` |
 | `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` |
@@ -33,9 +33,12 @@ The catalog now lists:
 The **aggregates** are not operators — they collapse a set of rows into one value, have no
 infix symbol or precedence, and widen their result type by the operand type — so they live
 in a **separate `[[aggregate]]` array** with their own field set, not as `[[operator]]`
-rows (§8, [aggregates.md](aggregates.md)). `<>` / `!=` are deliberately absent — they do
-not exist in the engine (see
-[grammar.md](grammar.md) §4). The catalog must stay descriptive: it must not list an
+rows (§8, [aggregates.md](aggregates.md)). The not-equal operator `<>` (name `ne`) is the
+3VL negation of `=`: it propagates NULL exactly as `=` does (`NULL <> NULL` is unknown), one
+catalog row per operand family like the other comparisons. `<>` is its canonical symbol; the
+PostgreSQL spelling `!=` is a **lexer-level alias** that folds to the same operator, so it gets
+no catalog row of its own (see [grammar.md](grammar.md) §4). The catalog must stay descriptive:
+it must not list an
 operator no core implements, nor omit one a core has — and a new operator is added here
 **first**, in the same change that adds its parser/executor code and conformance entries.
 

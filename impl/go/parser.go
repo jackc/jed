@@ -2009,6 +2009,8 @@ func (p *Parser) parseComparison() (Expr, error) {
 	switch p.peek().Kind {
 	case TokEq:
 		op = OpEq
+	case TokNe:
+		op = OpNe
 	case TokLt:
 		op = OpLt
 	case TokGt:
@@ -2836,6 +2838,8 @@ func renderToken(t Token) string {
 		return "%"
 	case TokEq:
 		return "="
+	case TokNe:
+		return "<>"
 	case TokLt:
 		return "<"
 	case TokGt:

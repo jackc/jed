@@ -1414,6 +1414,9 @@ class Parser {
       case "eq":
         op = "eq";
         break;
+      case "ne":
+        op = "ne";
+        break;
       case "lt":
         op = "lt";
         break;

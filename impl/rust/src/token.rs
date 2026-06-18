@@ -40,6 +40,9 @@ pub enum Token {
     Slash,
     Percent,
     Eq,
+    /// `<>` (or its `!=` alias) — the not-equal operator. The lexer folds both spellings to
+    /// this one token (spec/design/grammar.md §4), so they are indistinguishable past the lexer.
+    Ne,
     Lt,
     Gt,
     Le,

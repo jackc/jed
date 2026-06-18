@@ -5194,6 +5194,7 @@ enum ArithOp {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CmpOp {
     Eq,
+    Ne,
     Lt,
     Gt,
     Le,
@@ -6009,7 +6010,10 @@ fn collect_bound_terms(e: &RExpr, pk_idx: usize, pk_type: ScalarType, terms: &mu
             collect_bound_terms(l, pk_idx, pk_type, terms);
             collect_bound_terms(r, pk_idx, pk_type, terms);
         }
-        RExpr::Compare { op, lhs, rhs } => {
+        // `<>` is not a contiguous range, so it never seeds an index/PK bound — it stays in the
+        // residual filter (a full scan + filter). Skipping it here keeps the deterministic cost
+        // identical to Go/TS, where `asBoundTerm` excludes it the same way.
+        RExpr::Compare { op, lhs, rhs } if !matches!(op, CmpOp::Ne) => {
             let is_pk = |x: &RExpr| matches!(x, RExpr::Column(i) if *i == pk_idx);
             // The PK on either side (op flipped when it is on the right); the other side a
             // matching-type const-source. Anything else contributes no term.
@@ -6054,7 +6058,7 @@ fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
     }
 }
 
-/// Swap a comparison's sense (for `const <op> pk` ⇒ `pk <flipped> const`). Eq is symmetric.
+/// Swap a comparison's sense (for `const <op> pk` ⇒ `pk <flipped> const`). Eq and Ne are symmetric.
 fn flip_cmp(op: CmpOp) -> CmpOp {
     match op {
         CmpOp::Lt => CmpOp::Gt,
@@ -6062,6 +6066,7 @@ fn flip_cmp(op: CmpOp) -> CmpOp {
         CmpOp::Gt => CmpOp::Lt,
         CmpOp::Ge => CmpOp::Le,
         CmpOp::Eq => CmpOp::Eq,
+        CmpOp::Ne => CmpOp::Ne,
     }
 }
 
@@ -6087,6 +6092,10 @@ fn build_key_bound(bp: &PkBound, params: &[Value], outer: &[&[Value]]) -> Option
             CmpOp::Ge => intersect_lo(&mut b, &key, true),
             CmpOp::Lt => intersect_hi(&mut b, &key, false),
             CmpOp::Le => intersect_hi(&mut b, &key, true),
+            // `<>` never becomes a bound term (filtered in `collect_bound_terms`), so it never
+            // reaches here; it contributes no half-bound regardless (sound — the residual filter
+            // re-applies the whole WHERE).
+            CmpOp::Ne => {}
         }
     }
     if bound_empty(&b) { None } else { Some(b) }
@@ -9175,6 +9184,7 @@ fn resolve(
             })?;
             let cop = match op {
                 BinaryOp::Eq => CmpOp::Eq,
+                BinaryOp::Ne => CmpOp::Ne,
                 BinaryOp::Lt => CmpOp::Lt,
                 BinaryOp::Gt => CmpOp::Gt,
                 BinaryOp::Le => CmpOp::Le,
@@ -9427,7 +9437,7 @@ fn resolve_binary(
                 rty,
             ))
         }
-        BinaryOp::Eq | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
+        BinaryOp::Eq | BinaryOp::Ne | BinaryOp::Lt | BinaryOp::Gt | BinaryOp::Le | BinaryOp::Ge => {
             // Comparison is overloaded across families: integer×integer or text×text.
             // Resolve the operands (a literal adapts to its sibling; text literals stay
             // text), then require they be comparable — a mixed integer/text pair is 42804.
@@ -9444,6 +9454,7 @@ fn resolve_binary(
                 };
             let cop = match op {
                 BinaryOp::Eq => CmpOp::Eq,
+                BinaryOp::Ne => CmpOp::Ne,
                 BinaryOp::Lt => CmpOp::Lt,
                 BinaryOp::Gt => CmpOp::Gt,
                 BinaryOp::Le => CmpOp::Le,
@@ -9610,6 +9621,7 @@ fn resolve_quantified(
     })?;
     let cop = match op {
         BinaryOp::Eq => CmpOp::Eq,
+        BinaryOp::Ne => CmpOp::Ne,
         BinaryOp::Lt => CmpOp::Lt,
         BinaryOp::Gt => CmpOp::Gt,
         BinaryOp::Le => CmpOp::Le,
@@ -9632,6 +9644,7 @@ fn resolve_quantified(
 fn binary_op_symbol(op: BinaryOp) -> &'static str {
     match op {
         BinaryOp::Eq => "=",
+        BinaryOp::Ne => "<>",
         BinaryOp::Lt => "<",
         BinaryOp::Gt => ">",
         BinaryOp::Le => "<=",
@@ -12257,6 +12270,7 @@ impl RExpr {
                 m.guard()?;
                 let tv = match op {
                     CmpOp::Eq => a.eq3(&b),
+                    CmpOp::Ne => a.eq3(&b).not(),
                     CmpOp::Lt => a.lt3(&b),
                     CmpOp::Gt => a.gt3(&b),
                     CmpOp::Le => a.lt3(&b).or(a.eq3(&b)),
@@ -12709,6 +12723,7 @@ fn quantified_cmp3(op: CmpOp, x: &Value, e: &Value) -> ThreeValued {
         let ord = value_cmp(x, e);
         let matched = match op {
             CmpOp::Eq => ord == std::cmp::Ordering::Equal,
+            CmpOp::Ne => ord != std::cmp::Ordering::Equal,
             CmpOp::Lt => ord == std::cmp::Ordering::Less,
             CmpOp::Gt => ord == std::cmp::Ordering::Greater,
             CmpOp::Le => ord != std::cmp::Ordering::Greater,
@@ -12734,6 +12749,7 @@ fn quantified_cmp3(op: CmpOp, x: &Value, e: &Value) -> ThreeValued {
     };
     match op {
         CmpOp::Eq => a.eq3(b),
+        CmpOp::Ne => a.eq3(b).not(),
         CmpOp::Lt => a.lt3(b),
         CmpOp::Gt => a.gt3(b),
         CmpOp::Le => a.lt3(b).or(a.eq3(b)),

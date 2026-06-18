@@ -72,8 +72,10 @@ Two lexer facts are easy to get subtly wrong across cores, so the grammar pins t
     the operand of unary minus, where it folds to `-9223372036854775808` (`int64::MIN`); a
     bare `2^63` fits no signed integer type and traps `22003` at resolve time (deterministic,
     before any row is scanned).
-- **`<=` and `>=` are single tokens**, lexed greedily. The comparison operators are
-  `=`, `<`, `>`, `<=`, `>=`; **`<>` and `!=` still do not exist** in this surface. The
+- **`<=`, `>=`, and `<>` are single tokens**, lexed greedily. The comparison operators are
+  `=`, `<>` (not-equal), `<`, `>`, `<=`, `>=`. **`!=` is an alias for `<>`** (PostgreSQL's
+  alternate spelling): the lexer scans `!=` and folds it to the same not-equal token, so the two
+  spellings are indistinguishable past the lexer (a lone `!` is `42601`). The
   arithmetic operators `+ - * / %` are each single-character tokens; `*` is shared with the
   `SELECT *` glob and disambiguated by grammatical position (only the first select item).
 - **A `.` makes a `number` a decimal literal** (§14), *or* is the `Dot` token of a qualified

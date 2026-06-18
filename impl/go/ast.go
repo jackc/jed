@@ -541,6 +541,8 @@ const (
 	OpMod
 	// OpEq is =.
 	OpEq
+	// OpNe is <> (alias !=): the 3VL negation of OpEq, propagating NULL like OpEq.
+	OpNe
 	// OpLt is <.
 	OpLt
 	// OpGt is >.
