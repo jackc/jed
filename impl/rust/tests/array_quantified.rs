@@ -38,6 +38,9 @@ fn any_equality_is_in() {
     assert_eq!(val(&mut db, "SELECT 2 = SOME(ARRAY[1,2,3])"), "true");
     // The '{…}'::T[] literal operand resolves too.
     assert_eq!(val(&mut db, "SELECT 2 = ANY('{1,2,3}'::int64[])"), "true");
+    // The SUBQUERY operand form is the subquery spelling of IN: `x = ANY(SELECT …)` ≡
+    // `x IN (SELECT …)` (shipped; thorough coverage in suites/subquery/quantified.test).
+    assert_eq!(val(&mut db, "SELECT 1 = ANY(SELECT 1)"), "true");
 }
 
 #[test]
@@ -144,6 +147,4 @@ fn errors() {
     assert_eq!(err(&mut db, "SELECT 1 = ANY(ARRAY['a','b'])"), "42883");
     // A bare untyped NULL array operand is 42P18 (jed's indeterminate posture).
     assert_eq!(err(&mut db, "SELECT 1 = ANY(NULL)"), "42P18");
-    // The subquery quantifier form is a deferred 0A000.
-    assert_eq!(err(&mut db, "SELECT 1 = ANY(SELECT 1)"), "0A000");
 }

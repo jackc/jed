@@ -26,6 +26,9 @@ test("ANY equality is IN", () => {
     ["SELECT 5 = ANY(ARRAY[1,2,3])", "false"],
     ["SELECT 2 = SOME(ARRAY[1,2,3])", "true"], // SOME is the synonym for ANY
     ["SELECT 2 = ANY('{1,2,3}'::int64[])", "true"],
+    // The SUBQUERY operand form is the subquery spelling of IN: x = ANY(SELECT …) ≡
+    // x IN (SELECT …) (shipped; thorough coverage in suites/subquery/quantified.test).
+    ["SELECT 1 = ANY(SELECT 1)", "true"],
   ];
   for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
 });
@@ -94,6 +97,4 @@ test("errors", () => {
   assert.equal(errCode(() => execute(db, "SELECT 1 = ANY(ARRAY['a','b'])")), "42883");
   // A bare untyped NULL array operand is 42P18.
   assert.equal(errCode(() => execute(db, "SELECT 1 = ANY(NULL)")), "42P18");
-  // The subquery quantifier form is a deferred 0A000.
-  assert.equal(errCode(() => execute(db, "SELECT 1 = ANY(SELECT 1)")), "0A000");
 });
