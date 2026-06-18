@@ -1,0 +1,154 @@
+# Pure built-in surface — no escape hatch (CLAUDE.md §13 guarantee #2; spec/design/functions.md §13).
+# The THIRD untrusted-query safety pillar, alongside the two resource gates (cost_limit.test /
+# depth_limit.test). The first two BOUND a query (cost ceiling, nesting depth); this one bounds what a
+# query can REACH. The engine's built-in function/operator surface is pure and side-effect-free: it maps
+# input values to an output value and touches nothing else — no filesystem, no network, no process or
+# shell, no environment/session/config, and no nondeterminism outside the host-injected entropy/clock
+# seam (uuidv4/uuidv7, now()/clock_timestamp()). There is deliberately NO pg_read_file-style escape
+# hatch, no COPY ... TO/FROM the host, no dynamic-code DO / CREATE FUNCTION, no extension/module loader.
+#
+# This suite pins that guarantee as a REGRESSION GATE: the classic PostgreSQL escape hatches a malicious
+# query reaches for must stay absent. Because the surface is CURATED (an escape hatch is never added, not
+# merely gated), absence is enforced two ways, both checked here:
+#   - a host-reaching FUNCTION call is undefined        -> 42883 (undefined_function)
+#   - a host-reaching STATEMENT keyword is not grammar  -> 42601 (syntax_error)
+# If a future change ever introduced one of these, exactly one line here flips from error to ok and the
+# core fails — which is the point.
+#
+# jed-SPECIFIC and NOT oracle-checked: PostgreSQL PROVIDES many of these (pg_read_file, COPY, pg_sleep,
+# current_setting, ...), so the oracle would "succeed" where jed must reject. This is a documented
+# divergence (CLAUDE.md §1/§13). The positive controls at the end prove the suite tests
+# absence-of-DANGER, not absence-of-functions: ordinary pure expressions still evaluate.
+# requires: ddl.create_table, ddl.primary_key, query.select, expr.arithmetic, types.int32, types.text, resource.pure_builtins
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+
+# --- Filesystem reach: there is no way to read or write host files from a query (42883). ---
+
+statement error 42883
+SELECT pg_read_file('/etc/passwd')
+
+statement error 42883
+SELECT pg_read_binary_file('/etc/passwd')
+
+statement error 42883
+SELECT pg_ls_dir('/')
+
+statement error 42883
+SELECT lo_import('/etc/passwd')
+
+statement error 42883
+SELECT lo_export(1, '/tmp/leak')
+
+# --- Process / blocking: no sleep (a trivial DoS) and no backend control (42883). ---
+
+statement error 42883
+SELECT pg_sleep(10)
+
+statement error 42883
+SELECT pg_sleep_for('1 hour')
+
+statement error 42883
+SELECT pg_backend_pid()
+
+statement error 42883
+SELECT pg_terminate_backend(1)
+
+# --- Environment / session / config introspection: none of it is reachable (42883). ---
+
+statement error 42883
+SELECT current_setting('search_path')
+
+statement error 42883
+SELECT set_config('work_mem', '64MB', false)
+
+statement error 42883
+SELECT version()
+
+statement error 42883
+SELECT current_database()
+
+statement error 42883
+SELECT inet_server_addr()
+
+# --- Network / external data: no outbound connections (42883). ---
+
+statement error 42883
+SELECT dblink('host=evil', 'SELECT 1')
+
+statement error 42883
+SELECT dblink_exec('host=evil', 'DROP TABLE t')
+
+# --- Nondeterminism outside the sanctioned entropy/clock seam: absent (42883). There is no
+# general random()/txid()/PID built-in; the ONLY window is uuidv4/uuidv7/now() (entropy.md). ---
+
+statement error 42883
+SELECT random()
+
+statement error 42883
+SELECT txid_current()
+
+statement error 42883
+SELECT pg_stat_file('/etc/passwd')
+
+# --- Statement-level escape hatches: bulk host I/O, dynamic code, and module/extension loaders
+# are simply not in the grammar (42601). ---
+
+statement error 42601
+COPY t TO '/tmp/leak.csv'
+
+statement error 42601
+COPY t FROM '/etc/passwd'
+
+statement error 42601
+CREATE FUNCTION evil() RETURNS int32 AS 'x' LANGUAGE sql
+
+statement error 42601
+DO $$ BEGIN END $$
+
+statement error 42601
+LOAD 'mymodule'
+
+statement error 42601
+CREATE EXTENSION dblink
+
+statement error 42601
+CALL myproc()
+
+# --- Session config / privilege / maintenance statements are absent too. jed has no users or
+# roles (CLAUDE.md §3), so GRANT is just unknown grammar, not a permission check (42601). ---
+
+statement error 42601
+SET search_path = public
+
+statement error 42601
+SHOW search_path
+
+statement error 42601
+ALTER SYSTEM SET max_cost = 0
+
+statement error 42601
+GRANT SELECT ON t TO public
+
+statement error 42601
+TRUNCATE t
+
+statement error 42601
+VACUUM
+
+statement error 42601
+PREPARE p AS SELECT 1
+
+# --- Positive controls: the surface rejects DANGER, not unknown names broadly. Ordinary pure
+# expressions still evaluate normally — the engine is curated, not crippled. ---
+
+query I nosort
+SELECT 1 + 1
+----
+2
+
+query I nosort
+SELECT abs(-5) * 2
+----
+10

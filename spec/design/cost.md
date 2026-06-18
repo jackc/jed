@@ -808,7 +808,15 @@ It is now built:
   under a ceiling of N; an over-ceiling record is `statement error 54P01`, an under-ceiling
   record runs normally and may assert its `# cost:`.
   [../conformance/suites/resource/cost_limit.test](../conformance/suites/resource/cost_limit.test)
-  pins both directions cross-core, gated by the `resource.cost_limit` capability.
+  pins both directions cross-core, gated by the `resource.cost_limit` capability — the single-table
+  scan / point-lookup / DELETE / UPDATE / RETURNING cases plus the exact first-disallowed boundary.
+  [../conformance/suites/resource/dos_amplification.test](../conformance/suites/resource/dos_amplification.test)
+  extends it to the **work-amplifying shapes** an untrusted query reaches for — a cartesian product
+  (`row_produced` per emitted row, so N-way self-joins are bounded), a correlated subquery (the inner
+  relation re-scanned per outer row), and a big-decimal multiply (the `decimal_work` guard aborts
+  *before* the limb loop, §3) — each stopped by the same 54P01 abort. (The runaway set-returning
+  function — `generate_series` over a giant range — is pinned mid-generation in
+  [../conformance/suites/query/generate_series.test](../conformance/suites/query/generate_series.test).)
 
 Other items recorded against the seam:
 

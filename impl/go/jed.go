@@ -237,6 +237,10 @@ var SupportedCapabilities = []string{
 	// Nesting-depth limit — a fixed maxExprDepth checked in the parser aborts deeply-nested input
 	// with 54001 before it can overflow the native stack (CLAUDE.md §13; cost.md §7).
 	"resource.depth_limit",
+	// Pure built-in surface — no function/operator or statement reaches the host (filesystem,
+	// network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
+	// calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).
+	"resource.pure_builtins",
 	// Phase 5 — explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes,
 	// failed-block poisoning (spec/design/transactions.md §4, grammar.md §27).
 	"txn.explicit",

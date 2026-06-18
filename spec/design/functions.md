@@ -557,3 +557,13 @@ binds *built-ins only*. **Host/application-supplied functions are explicitly out
 the engine cannot know what host code does, so a host that registers a function and exposes it
 to untrusted queries owns that risk (CLAUDE.md §13); the meter's only structural defense is
 the host-function cost contract ([cost.md](cost.md) §6).
+
+This guarantee is pinned as a **conformance regression gate** —
+[../conformance/suites/resource/no_escape_hatch.test](../conformance/suites/resource/no_escape_hatch.test),
+gated by the `resource.pure_builtins` capability — asserting that the classic PostgreSQL escape
+hatches stay absent: a host-reaching function call (`pg_read_file`, `lo_import`, `pg_sleep`,
+`current_setting`, `dblink`, `random`, …) is `42883` (undefined_function) and a host-reaching
+statement (`COPY … TO/FROM`, `CREATE FUNCTION`, `DO`, `LOAD`, `CREATE EXTENSION`, `SET`, …) is
+`42601` (syntax_error). Because the surface is curated (an escape hatch is *never added*), the test
+is a tripwire: introducing any of them flips exactly one line from error to ok. It is jed-specific
+(PG provides these), so it is not oracle-checked.

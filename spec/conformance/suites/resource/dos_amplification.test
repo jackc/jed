@@ -1,0 +1,151 @@
+# Resource-exhaustion (DoS) amplification — the cost ceiling stops work-amplifying query shapes
+# (CLAUDE.md §13; spec/design/cost.md §3/§6). cost_limit.test pins the ceiling on a single-table scan;
+# this suite pins it on the shapes an attacker actually reaches for to turn a tiny query into a huge
+# amount of work: a CARTESIAN product (rows grow multiplicatively), a CORRELATED subquery (the inner
+# relation is re-scanned per outer row), and a BIG-DECIMAL operation (one multiply can be ~10^9 limb
+# operations). Each is bounded by the SAME deterministic, cross-core-identical `max_cost` abort (54P01).
+#
+# The pattern, per shape: pin the TRUE cost with `# cost:` (no ceiling) so the abort points are measured
+# against a known number; then show a ceiling at or below it aborts (54P01) while one above it completes
+# — the ceiling is the first DISALLOWED value (accrued *reaching* it aborts), exactly as in
+# cost_limit.test. The runaway-SRF vector (generate_series over a giant range) is pinned in
+# query/generate_series.test; this suite covers the join / correlation / decimal vectors.
+#
+# jed-SPECIFIC (PostgreSQL has no execution-cost ceiling — a documented divergence, CLAUDE.md §1/§13),
+# so the 54P01 records are NOT oracle-checked; the `# cost:` baselines are the cross-core contract.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, types.int32, types.decimal, expr.decimal_arithmetic, resource.cost_metering, resource.cost_limit
+
+statement ok
+CREATE TABLE s (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO s VALUES (1, 10), (2, 20)
+
+# === 1. Cartesian product — rows grow as N^k, and `row_produced` is charged per emitted row ===
+
+# A 3-way self CROSS JOIN over 2 rows emits 2^3 = 8 rows. True cost = 3 base-table scans
+# (each 1 page + 2 storage_row_read = 3) + 8 row_produced = 9 + 8 = 17. The product is what
+# explodes: the same join over a 1000-row table would emit 10^9 rows — the meter charges each.
+# cost: 17
+query I rowsort
+SELECT a.v FROM s a CROSS JOIN s b CROSS JOIN s c
+----
+10
+10
+10
+10
+20
+20
+20
+20
+
+# A ceiling below the true cost aborts the blowup deterministically before it materializes.
+# max_cost: 8
+statement error 54P01
+SELECT a.v FROM s a CROSS JOIN s b CROSS JOIN s c
+
+# Boundary: a ceiling EQUAL to the true cost (17) aborts (first disallowed value)...
+# max_cost: 17
+statement error 54P01
+SELECT a.v FROM s a CROSS JOIN s b CROSS JOIN s c
+
+# ...one above it (18) completes.
+# max_cost: 18
+# cost: 17
+query I rowsort
+SELECT a.v FROM s a CROSS JOIN s b CROSS JOIN s c
+----
+10
+10
+10
+10
+20
+20
+20
+20
+
+# The explosion is the point: scaling the table up makes the cube of produced rows dwarf the
+# scan, so a fixed ceiling that passes a keyed query aborts the product far below its full cost.
+statement ok
+CREATE TABLE wide (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO wide VALUES (1,1),(2,2),(3,3),(4,4),(5,5),(6,6)
+
+# 6^3 = 216 produced rows (true cost = 3*(1+6) + 216 = 237); a ceiling of 50 stops it early.
+# max_cost: 50
+statement error 54P01
+SELECT a.v FROM wide a CROSS JOIN wide b CROSS JOIN wide c
+
+# === 2. Correlated subquery — the inner relation is re-scanned once PER OUTER ROW ===
+
+statement ok
+CREATE TABLE o (id int32 PRIMARY KEY, v int32)
+
+statement ok
+INSERT INTO o VALUES (1, 10), (2, 20)
+
+# The inner `SELECT count(*) FROM s WHERE s.v = o.v` filters on a NON-key column, so it FULL-SCANS
+# s for every outer row of o — the re-scan accrues per outer row (cost.md "Subqueries"). True cost
+# over o(2) x s(2) = 21. With a 1000-row outer and 1000-row inner this is 10^6 inner row reads; the
+# meter accrues every one, so the ceiling bounds it.
+# cost: 21
+query I rowsort
+SELECT (SELECT count(*) FROM s WHERE s.v = o.v) FROM o
+----
+1
+1
+
+# A ceiling below the true cost aborts mid-evaluation (the inner scan runs under the same meter).
+# max_cost: 10
+statement error 54P01
+SELECT (SELECT count(*) FROM s WHERE s.v = o.v) FROM o
+
+# A ceiling at the true cost (21) lets it complete — for this shape the final charge has no
+# trailing guard, so the exact first-disallowed boundary differs from the scan case (cost_limit.test
+# pins that razor edge; here the point is that the re-scan is bounded at all).
+# max_cost: 21
+# cost: 21
+query I rowsort
+SELECT (SELECT count(*) FROM s WHERE s.v = o.v) FROM o
+----
+1
+1
+
+# === 3. Big-decimal arithmetic — one multiply can be ~10^9 limb ops, so it is size-metered ===
+
+# A bare 50-digit INTEGER literal is itself rejected at parse (42601) — the attacker cannot even
+# write a 10^50 integer to force giant arithmetic. They must route through ::decimal...
+statement error 42601
+SELECT 99999999999999999999999999999999999999999999999999
+
+# ...and there the size-scaled `decimal_work` unit bounds it. A 50-digit x 50-digit multiply
+# accrues decimal_work proportional to the operation's digit groups: W = q(50)*q(50) = 13*13 = 169,
+# charged as W-1 = 168, plus 1 (the multiply node) + 1 (row produced) = 170. (The ::decimal casts
+# fold at parse, so they add nothing.)
+# cost: 170
+query R nosort
+SELECT '99999999999999999999999999999999999999999999999999'::decimal * '99999999999999999999999999999999999999999999999999'::decimal
+----
+9999999999999999999999999999999999999999999999999800000000000000000000000000000000000000000000000001
+
+# The decimal_work charge is GUARDED before the limb loop runs (cost.md §3), so a tiny ceiling
+# aborts the multiply BEFORE doing the expensive work — not after burning the CPU. Even at a ceiling
+# of 3 (far below 170), this 100-digit product never executes — the guard catches it at the
+# decimal_work charge, well before the limb loop.
+# max_cost: 3
+statement error 54P01
+SELECT '99999999999999999999999999999999999999999999999999'::decimal * '99999999999999999999999999999999999999999999999999'::decimal
+
+# A ceiling at the decimal_work charge (169 = 1 multiply node + 168 decimal_work, guarded before
+# the limb loop) aborts; one above the full cost (171) completes and returns the product.
+# max_cost: 169
+statement error 54P01
+SELECT '99999999999999999999999999999999999999999999999999'::decimal * '99999999999999999999999999999999999999999999999999'::decimal
+
+# max_cost: 171
+# cost: 170
+query R nosort
+SELECT '99999999999999999999999999999999999999999999999999'::decimal * '99999999999999999999999999999999999999999999999999'::decimal
+----
+9999999999999999999999999999999999999999999999999800000000000000000000000000000000000000000000000001

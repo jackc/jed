@@ -492,6 +492,10 @@ description = "Caller-set execution-cost ceiling (`max_cost`) with a determinist
 id = "resource.depth_limit"
 description = "Fixed maximum expression / subquery / set-operation nesting depth (MAX_EXPR_DEPTH = 256), checked in the parser and aborting with 54001 (statement_too_complex) (CLAUDE.md §13; spec/design/cost.md §7). The SECOND untrusted-query safety gate: it guards the native call stack, which the cost ceiling cannot — deeply-nested input overflows the recursive parser/resolve/eval walks BEFORE any cost is metered. The limit is a deterministic, cross-core-identical constant (a documented divergence from PG's runtime stack probe), so the same statement is accepted or rejected identically in every core; not oracle-checked."
 
+[[capability]]
+id = "resource.pure_builtins"
+description = "The built-in function/operator surface is pure and side-effect-free, and the grammar exposes no host-reaching statement (CLAUDE.md §13 guarantee #2; spec/design/functions.md §13). The THIRD untrusted-query safety pillar: the first two BOUND a query (cost ceiling, nesting depth), this one bounds what it can REACH. No built-in touches the filesystem, network, process, or environment, and none adds nondeterminism outside the host-injected entropy/clock seam (uuidv4/uuidv7, now()/clock_timestamp()). Enforced as absence: a host-reaching function call is 42883 (undefined_function) and a host-reaching statement keyword is 42601 (syntax_error). A documented divergence from PostgreSQL (which provides pg_read_file/COPY/pg_sleep/current_setting/...), so not oracle-checked; pinned by suites/resource/no_escape_hatch.test."
+
 # Transaction control (Phase 5, spec/design/transactions.md §4). The SQL surface
 # BEGIN/COMMIT/ROLLBACK over the handle's single current transaction; tested by deterministic,
 # single-handle visibility sequences (the harness runs a whole .test file against one Database).
