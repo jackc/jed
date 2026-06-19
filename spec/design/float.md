@@ -126,13 +126,19 @@ decimal types:
 
 - a finite operation whose true result overflows the binary64 range traps **`22003`**
   (`numeric_value_out_of_range`) — e.g. `1e308 * 10`;
-- `x / 0` traps **`22012`** (`division_by_zero`).
+- `x / 0` (and `x % 0`) traps **`22012`** (`division_by_zero`) for **every numerator except
+  `NaN`**: `1/0`, `Inf/0`, and `0/0` all trap; **only `NaN / 0` escapes the trap and
+  propagates** (`NaN / 0 = NaN`). This matches PostgreSQL exactly — PG raises *division by
+  zero* for a finite or infinite numerator over a zero divisor and yields `NaN` only when the
+  numerator is already `NaN`. (The zero-divisor rule is the same for `/` and `%`.)
 
 So Inf/NaN enter **only** as input — a literal (`float 'Infinity'`, `float 'NaN'`), a text
 cast, or a stored value — and then **propagate** through arithmetic by IEEE rules (`Inf + 1 =
-Inf`, `Inf - Inf = NaN`, `NaN * 0 = NaN`). This keeps the *common* path (finite math) free of
-non-finite results while still modelling the values when a user supplies them, and it matches
-PG.
+Inf`, `Inf - Inf = NaN`, `NaN * 0 = NaN`). The **one** exception is a zero divisor: `Inf / 0`
+traps rather than propagating to `±Inf` (above), because PG treats *any* zero divisor with a
+non-`NaN` numerator as a division-by-zero error. This keeps the *common* path (finite math)
+free of non-finite results while still modelling the values when a user supplies them, and it
+matches PG.
 
 **Negative-zero canonicalization.** `-0.0` and `+0.0` are equal in value and **must produce
 identical key bytes and dedup to one bucket** (§10). The value codec stores the bits as given

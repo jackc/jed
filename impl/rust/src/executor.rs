@@ -13811,12 +13811,12 @@ fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> 
 /// Evaluate `float64 ⊕ float64` for one node (spec/design/float.md §5): the IEEE correctly-rounded
 /// op (round-ties-to-even — Rust's default). The PG TRAP model: a FINITE pair whose result
 /// overflows to ±Inf traps 22003 (finite arithmetic never PRODUCES non-finite values); `x / 0`
-/// (or `x % 0`) traps 22012. An operand already Inf/NaN PROPAGATES by IEEE (no trap).
+/// (or `x % 0`) traps 22012 for EVERY numerator except NaN (`Inf/0` and `0/0` trap; only `NaN/0`
+/// propagates to NaN — matching PG). An operand already Inf/NaN otherwise PROPAGATES (no trap).
 fn eval_float64_arith(op: ArithOp, x: f64, y: f64) -> Result<Value> {
-    // Division/modulus by zero traps 22012, BUT only when the dividend is finite — `Inf / 0`
-    // would be a propagating non-finite operand in PG terms; here the divisor is finite zero so
-    // it is a genuine division by zero regardless of the dividend's finiteness (matches PG).
-    if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0.0 {
+    // Division/modulus by a zero divisor traps 22012 for every numerator EXCEPT NaN, which
+    // propagates (NaN/0 = NaN, matching PG). `Inf/0` and `0/0` are genuine division by zero.
+    if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0.0 && !x.is_nan() {
         return Err(EngineError::new(
             SqlState::DivisionByZero,
             "division by zero",
@@ -13839,7 +13839,8 @@ fn eval_float64_arith(op: ArithOp, x: f64, y: f64) -> Result<Value> {
 /// As [`eval_float64_arith`], at binary32 (`float32`). Each op rounds to binary32 (native `f32`
 /// arithmetic), so a finite overflow to ±Inf at the float32 range traps 22003.
 fn eval_float32_arith(op: ArithOp, x: f32, y: f32) -> Result<Value> {
-    if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0.0 {
+    // Same zero-divisor rule as float64: traps for every numerator except NaN (Inf/0 traps).
+    if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0.0 && !x.is_nan() {
         return Err(EngineError::new(
             SqlState::DivisionByZero,
             "division by zero",

@@ -10079,9 +10079,10 @@ function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Valu
 }
 
 // evalFloatArith computes one IEEE float operation (float.md §5). The trap model (float.md §3):
-//   - x / 0 and x % 0 trap 22012 (division_by_zero) — even Inf/0 and NaN/0 (matching PG);
+//   - x / 0 and x % 0 trap 22012 (division_by_zero) for EVERY numerator except NaN — Inf/0 and 0/0
+//     trap, only NaN/0 propagates to NaN (matching PG);
 //   - a FINITE op whose true result overflows the float range to ±Inf traps 22003 (e.g. 1e308*10);
-//   - an Inf/NaN OPERAND propagates by IEEE (Inf+1=Inf, Inf-Inf=NaN, NaN*0=NaN) — no trap.
+//   - an Inf/NaN OPERAND otherwise propagates by IEEE (Inf+1=Inf, Inf-Inf=NaN, NaN*0=NaN) — no trap.
 // For float32 every result is Math.fround'd (true binary32 rounding — the TS-specific discipline);
 // the overflow check is then re-applied because fround can push a finite double past binary32 range.
 // `%` is IEEE remainder via JS `%` (which is fmod — truncated, dividend's sign), exact, never
@@ -10101,11 +10102,12 @@ function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType):
       r = x * y;
       break;
     case "div":
-      if (y === 0) throw engineError("division_by_zero", "division by zero");
+      // x / 0 traps for every numerator except NaN, which propagates (NaN/0 = NaN, matching PG).
+      if (y === 0 && !Number.isNaN(x)) throw engineError("division_by_zero", "division by zero");
       r = x / y;
       break;
     default: // "mod"
-      if (y === 0) throw engineError("division_by_zero", "division by zero");
+      if (y === 0 && !Number.isNaN(x)) throw engineError("division_by_zero", "division by zero");
       r = x % y; // JS % is fmod: truncated, takes the dividend's sign; exact, finite for finite x,y
       break;
   }

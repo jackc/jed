@@ -314,6 +314,32 @@ file = "expr/float_math.test"
 sql = "SELECT sqrt(4.0)"
 reason = "jed: sqrt takes the float family with arg_resolution = none (catalog), and a decimal literal does not implicitly promote to float, so 42883. PostgreSQL casts numeric -> double precision and returns 2. The strict type system (§4): decimal<->float is explicit-cast-only (float.md)."
 
+# --- the `%` (modulo) operator over floats is a jed extension (IEEE fmod, float.md §4).
+# PostgreSQL ships no `%` operator for double precision / real (only mod() over numeric/int), so
+# every `float % float` record diverges: PG cannot even plan the SELECT (no overload → \gdesc is
+# empty), and the zero-divisor records raise PG's "operator does not exist" (42883) where jed
+# applies fmod and traps 22012 on a finite-numerator zero divisor (exactly as `/` does). jed keeps
+# its committed answer; this is a documented surface extension, not a behavior divergence.
+[[override]]
+file = "expr/float_arithmetic.test"
+sql = "SELECT 7.5::float64 % 2.0::float64"
+reason = "jed extension: `%` over float64 is IEEE fmod (float.md §4), 7.5 fmod 2.0 = 1.5. PostgreSQL has no `%` operator for double precision (mod() is numeric/int only), so PG cannot plan the query. jed keeps its committed row."
+
+[[override]]
+file = "expr/float_arithmetic.test"
+sql = "SELECT 7.5::float32 % 2.0::float32"
+reason = "jed extension: `%` over float32 is IEEE fmod (float.md §4), 7.5 fmod 2.0 = 1.5. PostgreSQL has no `%` operator for real, so PG cannot plan the query. jed keeps its committed row."
+
+[[override]]
+file = "expr/float_arithmetic.test"
+sql = "SELECT 1.0::float64 % 0.0::float64"
+reason = "jed: `%` over float64 (IEEE fmod) traps 22012 on a finite-numerator zero divisor, like `/` (float.md §4). PostgreSQL has no float8 `%` operator, so it raises 42883 (operator does not exist) at parse, never reaching a zero-divisor check. A surface extension, not a behavior divergence."
+
+[[override]]
+file = "expr/float_arithmetic.test"
+sql = "SELECT 1.0::float32 % 0.0::float32"
+reason = "jed: `%` over float32 (IEEE fmod) traps 22012 on a finite-numerator zero divisor, like `/` (float.md §4). PostgreSQL has no real `%` operator, so it raises 42883 (operator does not exist) at parse. A surface extension, not a behavior divergence."
+
 # --- float round() ties: jed rounds half-AWAY-from-zero (one deterministic mode engine-wide,
 # decimal.md §3 / CLAUDE.md §8), so round(2.5) = 3. PostgreSQL's float8 round uses the C library
 # rint() (round-half-to-EVEN, platform-dependent), returning 2. jed deliberately diverges to keep

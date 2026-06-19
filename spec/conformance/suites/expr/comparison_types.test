@@ -1,0 +1,221 @@
+# Ordering comparison operators `< <= > >=` across every comparable scalar type
+# (spec/design/functions.md §1, types.md §11). The `=`/`<>` surface and ORDER BY are
+# covered elsewhere; this file pins the FOUR ordering operators as projected boolean
+# VALUES — the value-module Lt3/Gt3 kernels and the `<=`/`>=` (Lt3∨Eq3 / Gt3∨Eq3)
+# compositions — for each type family beyond the integer/decimal numeric path:
+# float64, float32, text, boolean, bytea, uuid, timestamp, timestamptz, interval, and
+# the decimal path itself. Each operator is three-valued: a NULL operand makes the
+# result UNKNOWN (NULL), never true/false (null.three_valued). PostgreSQL-oracle-checkable.
+# Format + `requires`: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, expr.comparison_value, cast.operator, cast.string_literal, types.int32, types.text, types.boolean, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, types.float64, types.float32, null.three_valued
+
+# Each section asserts a strictly-less pair (`a < b`) — which makes `< <=` true and `> >=`
+# false (the row `t t f f`) — and the equal pair (`a = a`) — `< >` false, `<= >=` true
+# (the row `f t f t`). Both rows execute the type's Lt3 AND Gt3 kernel regardless of the
+# boolean answer, so the four operators are all exercised per type.
+
+# --- text: C-collation (byte order) ---------------------------------------------------
+query BBBB nosort
+SELECT 'apple' < 'banana', 'apple' <= 'banana', 'apple' > 'banana', 'apple' >= 'banana'
+----
+true
+true
+false
+false
+
+query BBBB nosort
+SELECT 'cat' < 'cat', 'cat' <= 'cat', 'cat' > 'cat', 'cat' >= 'cat'
+----
+false
+true
+false
+true
+
+# --- boolean: false < true ------------------------------------------------------------
+query BBBB nosort
+SELECT false < true, false <= true, false > true, false >= true
+----
+true
+true
+false
+false
+
+query BBBB nosort
+SELECT true < true, true <= true, true > true, true >= true
+----
+false
+true
+false
+true
+
+# --- decimal: exact base-10 by value --------------------------------------------------
+query BBBB nosort
+SELECT 2.49::decimal < 2.5::decimal, 2.49::decimal <= 2.5::decimal, 2.49::decimal > 2.5::decimal, 2.49::decimal >= 2.5::decimal
+----
+true
+true
+false
+false
+
+# decimal compares by value, not by scale: 2.5 and 2.50 are equal.
+query BBBB nosort
+SELECT 2.5::decimal < 2.50::decimal, 2.5::decimal <= 2.50::decimal, 2.5::decimal > 2.50::decimal, 2.5::decimal >= 2.50::decimal
+----
+false
+true
+false
+true
+
+# --- float64: IEEE total order ------------------------------------------------------
+query BBBB nosort
+SELECT 1.5::float64 < 2.5::float64, 1.5::float64 <= 2.5::float64, 1.5::float64 > 2.5::float64, 1.5::float64 >= 2.5::float64
+----
+true
+true
+false
+false
+
+query BBBB nosort
+SELECT 2.5::float64 < 2.5::float64, 2.5::float64 <= 2.5::float64, 2.5::float64 > 2.5::float64, 2.5::float64 >= 2.5::float64
+----
+false
+true
+false
+true
+
+# float total order (float.md §9): -Infinity < finite < +Infinity < NaN, and NaN equals
+# itself (so `NaN > NaN` is false but `NaN >= NaN` is true — the btree order, not raw IEEE).
+query BBB nosort
+SELECT float64 '-Infinity' < 1.0::float64, float64 'Infinity' > 1.0::float64, float64 'NaN' > float64 'Infinity'
+----
+true
+true
+true
+
+query BBB nosort
+SELECT float64 'NaN' < float64 'NaN', float64 'NaN' > float64 'NaN', float64 'NaN' >= float64 'NaN'
+----
+false
+false
+true
+
+# --- float32: same total order at single precision ----------------------------------
+query BBBB nosort
+SELECT 1.5::float32 < 2.5::float32, 1.5::float32 <= 2.5::float32, 1.5::float32 > 2.5::float32, 1.5::float32 >= 2.5::float32
+----
+true
+true
+false
+false
+
+query BBBB nosort
+SELECT 2.5::float32 < 2.5::float32, 2.5::float32 <= 2.5::float32, 2.5::float32 > 2.5::float32, 2.5::float32 >= 2.5::float32
+----
+false
+true
+false
+true
+
+# --- bytea: unsigned-byte lexicographic, shorter prefix sorts first -------------------
+query BBBB nosort
+SELECT '\x01'::bytea < '\xff'::bytea, '\x01'::bytea <= '\xff'::bytea, '\x01'::bytea > '\xff'::bytea, '\x01'::bytea >= '\xff'::bytea
+----
+true
+true
+false
+false
+
+# a strict prefix is less than the longer value, and bytes are UNSIGNED (0xff > 0x01).
+query BB nosort
+SELECT '\x01'::bytea < '\x0102'::bytea, '\xff'::bytea > '\x01'::bytea
+----
+true
+true
+
+# --- uuid: unsigned-byte order over the 16 bytes ------------------------------------
+query BBBB nosort
+SELECT '00000000-0000-0000-0000-000000000001'::uuid < '00000000-0000-0000-0000-000000000002'::uuid, '00000000-0000-0000-0000-000000000001'::uuid <= '00000000-0000-0000-0000-000000000002'::uuid, '00000000-0000-0000-0000-000000000001'::uuid > '00000000-0000-0000-0000-000000000002'::uuid, '00000000-0000-0000-0000-000000000001'::uuid >= '00000000-0000-0000-0000-000000000002'::uuid
+----
+true
+true
+false
+false
+
+# the high byte is unsigned: 0xff… sorts after 0x00….
+query B nosort
+SELECT 'ff000000-0000-0000-0000-000000000000'::uuid > '00000000-0000-0000-0000-000000000000'::uuid
+----
+true
+
+# --- timestamp: by instant (int64 microseconds) -------------------------------------
+query BBBB nosort
+SELECT timestamp '2024-01-01 00:00:00' < timestamp '2024-06-01 12:00:00', timestamp '2024-01-01 00:00:00' <= timestamp '2024-06-01 12:00:00', timestamp '2024-01-01 00:00:00' > timestamp '2024-06-01 12:00:00', timestamp '2024-01-01 00:00:00' >= timestamp '2024-06-01 12:00:00'
+----
+true
+true
+false
+false
+
+# --- timestamptz: compared at the SAME instant after the offset is folded to UTC -----
+# `00:00:00+00` is earlier than `00:00:00-05` (which is 05:00:00 UTC).
+query BB nosort
+SELECT timestamptz '2024-01-01 00:00:00+00' < timestamptz '2024-01-01 00:00:00-05', timestamptz '2024-01-01 05:00:00+00' >= timestamptz '2024-01-01 00:00:00-05'
+----
+true
+true
+
+# --- interval: by the canonical span (1 day = 24h, 1 month = 30 days — PG's rule) ----
+query BBBB nosort
+SELECT interval '1 day' < interval '25 hours', interval '1 day' <= interval '25 hours', interval '1 day' > interval '25 hours', interval '1 day' >= interval '25 hours'
+----
+true
+true
+false
+false
+
+# 1 month canonicalizes to 30 days for comparison: > 29 days, not > 30 or 31 days.
+query BBB nosort
+SELECT interval '1 mon' > interval '29 days', interval '1 mon' > interval '30 days', interval '1 mon' > interval '31 days'
+----
+true
+false
+false
+
+# mixed-unit equality: 2 days and 48 hours are the same span.
+query BB nosort
+SELECT interval '2 days' >= interval '48 hours', interval '2 days' > interval '48 hours'
+----
+true
+false
+
+# --- three-valued NULL propagation: a NULL operand makes every ordering op UNKNOWN ----
+# Reached through columns (a typed NULL) so each type's Lt3/Gt3 hits its NULL guard.
+statement ok
+CREATE TABLE n (id int32 PRIMARY KEY, a text, b text)
+
+statement ok
+INSERT INTO n VALUES (1, 'x', 'y'), (2, 'x', NULL), (3, NULL, 'y'), (4, NULL, NULL)
+
+query IBBBB nosort
+SELECT id, a < b, a <= b, a > b, a >= b FROM n ORDER BY id
+----
+1
+true
+true
+false
+false
+2
+NULL
+NULL
+NULL
+NULL
+3
+NULL
+NULL
+NULL
+NULL
+4
+NULL
+NULL
+NULL
+NULL

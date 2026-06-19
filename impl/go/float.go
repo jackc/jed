@@ -143,8 +143,9 @@ func evalFloatArith(op BinaryOp, a, b Value, resultIs32 bool) (Value, error) {
 }
 
 // float64Op applies one IEEE binary op at binary64 width with the trap model (§3/§5): a finite
-// pair whose result overflows to ±Inf traps 22003; / or % by (finite) zero traps 22012; an
-// Inf/NaN operand (or a NaN/Inf result from non-finite inputs) propagates without trapping.
+// pair whose result overflows to ±Inf traps 22003; / or % by zero traps 22012 for EVERY numerator
+// except NaN (matching PG — `Inf/0` and `0/0` trap, only `NaN/0` propagates to NaN); an Inf/NaN
+// operand otherwise propagates without trapping.
 func float64Op(op BinaryOp, x, y float64) (float64, error) {
 	var r float64
 	switch op {
@@ -155,13 +156,14 @@ func float64Op(op BinaryOp, x, y float64) (float64, error) {
 	case OpMul:
 		r = x * y
 	case OpDiv:
-		// finite / 0 traps 22012 (PG), including 0/0 and (finite)/±0. Inf/0 and NaN/0 propagate.
-		if y == 0 && isFinite(x) {
+		// x / 0 traps 22012 (PG) for every numerator — finite, ±Inf, and 0/0 — EXCEPT NaN, which
+		// propagates (NaN/0 = NaN). The strict type system keeps the trap, not a silent ±Inf (§5).
+		if y == 0 && !math.IsNaN(x) {
 			return 0, NewError(DivisionByZero, "division by zero")
 		}
 		r = x / y
-	default: // OpMod — IEEE fmod
-		if y == 0 && !math.IsNaN(x) && !math.IsInf(x, 0) {
+	default: // OpMod — IEEE fmod; the zero divisor follows the SAME rule as division.
+		if y == 0 && !math.IsNaN(x) {
 			return 0, NewError(DivisionByZero, "division by zero")
 		}
 		r = math.Mod(x, y)
@@ -187,12 +189,13 @@ func float32Op(op BinaryOp, x, y float32) (float32, error) {
 	case OpMul:
 		r = x * y
 	case OpDiv:
-		if y == 0 && isFinite32(x) {
+		// Same zero-divisor rule as float64: traps for every numerator except NaN (Inf/0 traps).
+		if y == 0 && !math.IsNaN(float64(x)) {
 			return 0, NewError(DivisionByZero, "division by zero")
 		}
 		r = x / y
 	default: // OpMod
-		if y == 0 && isFinite32(x) {
+		if y == 0 && !math.IsNaN(float64(x)) {
 			return 0, NewError(DivisionByZero, "division by zero")
 		}
 		r = float32(math.Mod(float64(x), float64(y)))
