@@ -308,4 +308,3 @@ func TestFloatRenderSpellings(t *testing.T) {
 		}
 	}
 }
-
