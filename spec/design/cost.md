@@ -344,32 +344,36 @@ INSERT/UPDATE/DELETE is unmetered ("What is NOT metered" below).
 
 A **GIN index** ([gin.md](gin.md)) gives a third bound kind at the same per-relation seam (after
 the PK bound and the ordered-index equality bound). For a base relation of a **SELECT** scan whose
-WHERE has a conjunct `col @> Q` (contains) or `col && Q` (overlaps) where `col` is GIN-indexed and
-`Q` is a **constant** array, the scan gathers candidates from the index instead of full-scanning.
-Gated by the `query.gin_scan` capability, pinned cross-core in
-`spec/conformance/suites/query/gin_scan.test`.
+WHERE has a conjunct `col @> Q` (contains), `col && Q` (overlaps), `c = ANY(col)` (membership), or
+`col = Q` (exact array equality) where `col` is GIN-indexed and the query operand is a **constant**,
+the scan gathers candidates from the index instead of full-scanning. Gated by the `query.gin_scan`
+capability (with `query.gin_any_eq` for `= ANY` and `query.gin_array_eq` for array `=`), pinned
+cross-core in `spec/conformance/suites/query/gin_scan.test` (and `gin_any_eq.test` / `gin_array_eq.test`).
 
 A GIN-bounded scan accrues, in place of the full-scan block:
 
 - **`page_read` × the entry-tree nodes** overlapping each query term's prefix range — the same
-  overlap-node rule as the ordered index, applied **once per query term** (`@>` gathers all of
-  `Q`'s distinct elements, `&&` its distinct non-NULL elements — gin.md §2).
+  overlap-node rule as the ordered index, applied **once per query term** (`@>` and array `=`
+  gather all of `Q`'s distinct non-NULL elements, `&&` its distinct non-NULL elements, `= ANY` the
+  single scalar term — gin.md §2).
 - **`gin_entry` × the posting entries visited** across all term scans — the per-entry combine work
-  (intersection for `@>`, union for `&&`) that the per-node `page_read` under-meters when a posting
-  list is long.
+  (intersection for `@>` / array `=` / `= ANY`, union for `&&`) that the per-node `page_read`
+  under-meters when a posting list is long.
 - **Per candidate row** (post-combine, point-looked-up in storage-key order): `page_read` × the
   table-tree nodes on its descent + its touched-column `value_decompress` slabs +
   **`storage_row_read`** — each candidate fetch costs exactly a PK point lookup of that row.
-- **The residual filter** — the `@>`/`&&` predicate stays the residual WHERE filter, so one
-  `operator_eval` per candidate — and **`row_produced`**, unchanged.
+- **The residual filter** — the original `@>` / `&&` / `= ANY` / `=` predicate stays the residual
+  WHERE filter, so one `operator_eval` per candidate — and **`row_produced`**, unchanged.
 
-A **provably-empty** bound charges nothing — a NULL `Q`, an `@>` whose `Q` holds a NULL element
-(never TRUE under strict equality), or an `&&` whose `Q` has no non-NULL element. The one
-**full-scan fallback**, `@> '{}'` (every non-NULL array contains the empty array — not derivable
-from the index), charges the full scan. Deterministic and byte-identical across cores: the term
-extraction, the term encoding, the entry-tree shape, and the overlap rule are all §8 contracts
-(gin.md §8). **Narrowings this slice** (gin.md §6): constant `Q` only, `@>`/`&&` only, SELECT scans
-only, and no LIMIT-streaming combination. **DDL cost:** `CREATE INDEX … USING gin` charges its
+A **provably-empty** bound charges nothing — a NULL `Q` (or array-`=` against NULL), an `@>` whose
+`Q` holds a NULL element (never TRUE under strict equality), an `&&` whose `Q` has no non-NULL
+element, or a NULL `= ANY` scalar. Two **full-scan fallbacks** charge the full scan (rows the index
+cannot enumerate, having no terms): `@> '{}'` (every non-NULL array contains the empty array), and
+array `=` whose `Q` has no non-NULL element (`col = '{}'` / `col = ARRAY[NULL,…]`). Deterministic and
+byte-identical across cores: the term extraction, the term encoding, the entry-tree shape, and the
+overlap rule are all §8 contracts (gin.md §8). **Narrowings this slice** (gin.md §6): constant query
+operand only, `@>`/`&&`/`= ANY`/`=` only, SELECT scans only, and no LIMIT-streaming combination.
+**DDL cost:** `CREATE INDEX … USING gin` charges its
 build scan — `page_read` × the table's node count + `storage_row_read` per row, plus the array
 column's overflow-chain `page_read` / `value_decompress` if its values spilled (the build's touched
 set is the array column, which **can** be large — unlike the fixed-width ordered build); an empty

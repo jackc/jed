@@ -6424,16 +6424,17 @@ impl Database {
 
     /// Execute a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the constant
     /// query operand, extracts its terms + mode via the `array_ops` opclass (an array for `@>`/`&&`;
-    /// a single scalar term for `= ANY` — `Member`), gathers each term's posting list (a prefix
-    /// range scan of the GIN entry tree), combines them by mode (`@>` and `= ANY` → intersection,
-    /// `&&` → union) into the candidate storage-key set, and point-looks-up each candidate in
-    /// storage-key order. The original predicate stays the residual WHERE filter (re-applied
-    /// downstream), so the result is always correct — the bound only narrows which rows are fetched.
-    /// Returns the candidate rows + the scan's up-front units `(pages, slabs)` (entry-tree overlap
-    /// nodes per term + each candidate's table point-lookup); `gin_entry` (per posting entry
-    /// visited) is charged on `meter` directly. Degenerate constant queries (gin.md §6): a NULL `Q`,
-    /// an `@>` whose `Q` holds a NULL element, an `&&` with no non-NULL term, and a NULL `= ANY`
-    /// scalar are provably empty (read nothing); `@> '{}'` falls back to the full scan.
+    /// a single scalar term for `= ANY` — `Member`; the array's distinct non-NULL terms for `=` —
+    /// `Equal`), gathers each term's posting list (a prefix range scan of the GIN entry tree),
+    /// combines them by mode (`@>`, `= ANY`, and `=` → intersection, `&&` → union) into the
+    /// candidate storage-key set, and point-looks-up each candidate in storage-key order. The
+    /// original predicate stays the residual WHERE filter (re-applied downstream), so the result is
+    /// always correct — the bound only narrows which rows are fetched. Returns the candidate rows +
+    /// the scan's up-front units `(pages, slabs)` (entry-tree overlap nodes per term + each
+    /// candidate's table point-lookup); `gin_entry` (per posting entry visited) is charged on
+    /// `meter` directly. Degenerate constant queries (gin.md §6): a NULL `Q`, an `@>` whose `Q`
+    /// holds a NULL element, an `&&` with no non-NULL term, and a NULL `= ANY` scalar are provably
+    /// empty (read nothing); `@> '{}'` and array `=` with no non-NULL term fall back to the full scan.
     fn gin_bound_rows(
         &self,
         table_name: &str,
@@ -6496,6 +6497,16 @@ impl Database {
             }
             // `@>` a query containing a NULL element is never TRUE (strict element equality).
             GinStrategy::Contains if has_null => return Ok((Vec::new(), (0, 0))),
+            // `col = Q` with NO non-NULL term — `'{}'` (`is_empty`) or an all-NULL `Q` (`has_null`,
+            // no non-NULL element). The rows it matches (`{}`, `{NULL}`, …) carry NO index terms,
+            // so the index cannot enumerate them: fall back to the full scan and let the residual
+            // `=` keep them (gin.md §6). NOT a provably-empty bound — and a `Q` with ≥1 non-NULL
+            // element is NOT caught here (it gathers, even when it also has a NULL element).
+            GinStrategy::Equal if terms.is_empty() => {
+                let (entries, pages, slabs) = store.scan_with_units(mask)?;
+                let rows = entries.into_iter().map(|(_, v)| v).collect();
+                return Ok((rows, (pages, slabs)));
+            }
             // `&&` with no non-NULL term (empty or all-NULL `Q`) overlaps nothing.
             GinStrategy::Overlaps if terms.is_empty() => return Ok((Vec::new(), (0, 0))),
             _ => {}
@@ -6533,8 +6544,9 @@ impl Database {
         // exactly as a full scan would (gin.md §6/§8).
         let candidates: BTreeSet<Vec<u8>> = match gb.strategy {
             // `@>` ALL → intersection; `= ANY` (Member) is a single term, so its intersection is
-            // that lone posting list (gin.md §6).
-            GinStrategy::Contains | GinStrategy::Member => {
+            // that lone posting list; array `=` (Equal) gathers the same superset as `@>` over `Q`'s
+            // distinct non-NULL terms (the residual `=` makes it exact downstream) — gin.md §6.
+            GinStrategy::Contains | GinStrategy::Member | GinStrategy::Equal => {
                 let mut it = postings.into_iter();
                 let mut acc: BTreeSet<Vec<u8>> =
                     it.next().unwrap_or_default().into_iter().collect();
@@ -7751,6 +7763,12 @@ enum GinStrategy {
     /// `c = ANY(col)` — `c` is a constant SCALAR (not an array); its single term is gathered like
     /// a one-element `@>`. The query operand recovered by `gin_match` is the scalar `c`.
     Member,
+    /// `col = Q` — exact array equality. The query operand is the constant array `Q`; its distinct
+    /// non-NULL elements gather the SAME candidate superset as `@> Q` (equal arrays have identical
+    /// element multisets, so `col = Q` ⟹ `col @> Q`), and the residual `=` filter makes it exact.
+    /// Unlike `Contains`, a NULL ELEMENT of `Q` does not empty the bound; and a `Q` with no non-NULL
+    /// element (`'{}'`/all-NULL) falls back to the full scan, not a provably-empty bound (gin.md §6).
+    Equal,
 }
 
 /// The plan-time result of GIN analysis (spec/design/gin.md §6): the chosen GIN index (lowest
@@ -7859,12 +7877,14 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
 }
 
 /// Find the first WHERE AND-chain conjunct that a GIN index on `col_global` accelerates
-/// (spec/design/gin.md §6): `col @> Q` (contains) or `col && Q` (overlaps) where `Q` is a
-/// **constant** array (references no column / outer / subquery — re-evaluable per scan, not per
-/// row). `@>` is asymmetric (the indexed column must be the LEFT operand — `Q @> col` is the
-/// non-accelerated `<@`); `&&` is symmetric (the column may be either operand). Returns the
-/// strategy and a reference to `Q`. Used both at plan time (for the strategy) and exec time (to
-/// recover `Q` from `plan.filter`), so the two agree on the same conjunct by construction.
+/// (spec/design/gin.md §6): `col @> Q` (contains), `col && Q` (overlaps), `c = ANY(col)`
+/// (membership), or `col = Q` (exact array equality) where the query operand is a **constant**
+/// (references no column / outer / subquery — re-evaluable per scan, not per row). `@>` is
+/// asymmetric (the indexed column must be the LEFT operand — `Q @> col` is the non-accelerated
+/// `<@`); `&&` and array `=` are symmetric (the column may be either operand). Returns the
+/// strategy and a reference to the constant query operand. Used both at plan time (for the
+/// strategy) and exec time (to recover the operand from `plan.filter`), so the two agree on the
+/// same conjunct by construction.
 fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrategy, &RExpr)> {
     match filter {
         RExpr::And(l, r) => gin_match(l, col_global).or_else(|| gin_match(r, col_global)),
@@ -7881,6 +7901,24 @@ fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrategy, &RExpr)>
                 Some((GinStrategy::Overlaps, &args[1]))
             } else if is_column(&args[1], col_global) && rexpr_is_constant(&args[0]) {
                 Some((GinStrategy::Overlaps, &args[0]))
+            } else {
+                None
+            }
+        }
+        // `col = Q` — exact array equality (gin.md §6). Commutative: the column may be either
+        // operand, the constant array `Q` the other. Recovered query operand is `Q`; `gin_bound_rows`
+        // reads it via `Equal` (the @>-superset gather + the residual `=`). `<>` is NOT matched
+        // (only `CmpOp::Eq`). When the column is an array, the other constant operand is necessarily
+        // an array too (resolve rejects an array/scalar `=`), so `Q` is always an array here.
+        RExpr::Compare {
+            op: CmpOp::Eq,
+            lhs,
+            rhs,
+        } => {
+            if is_column(lhs, col_global) && rexpr_is_constant(rhs) {
+                Some((GinStrategy::Equal, rhs.as_ref()))
+            } else if is_column(rhs, col_global) && rexpr_is_constant(lhs) {
+                Some((GinStrategy::Equal, lhs.as_ref()))
             } else {
                 None
             }

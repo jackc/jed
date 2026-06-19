@@ -155,6 +155,15 @@ test('the indexes page runs the GIN = ANY membership scan live', async ({ page }
 	await expect(panel.getByTestId('result-rows')).not.toContainText('storage');
 });
 
+test('the indexes page runs the GIN = array-equality scan live', async ({ page }) => {
+	await page.goto('/docs/sql/indexes/');
+	// Fifth panel = the GIN equality scan: tags = ARRAY[10,20] → gin ONLY (its tags ARE {10,20});
+	// intro ({10,20,30}) merely contains them, so the residual = excludes it — stricter than @>.
+	const panel = page.getByTestId('live-sql').nth(4);
+	await expect(panel.getByTestId('result-rows')).toContainText('gin');
+	await expect(panel.getByTestId('result-rows')).not.toContainText('intro');
+});
+
 test('the reference pages are generated from the spec', async ({ page }) => {
 	await page.goto('/docs/reference/errors/');
 	// 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.

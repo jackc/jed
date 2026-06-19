@@ -209,3 +209,32 @@ seed = 4211
 gen = "int_uniform"
 min = 1
 max = 500
+
+# GIN-bounded array equality: `tags = ARRAY[$1,$2]` is exact array equality, which jed accelerates as
+# the SAME two-term `@>` candidate gather as gin_contains (col = Q ⟹ col @> Q) plus a residual `=`
+# that re-checks order/cardinality (spec/design/gin.md §6; query.gin_array_eq). Over the length-0..6
+# tags arrays, a random length-2 query matches few/no rows — so this measures the gather's selectivity
+# (a handful of candidates) + the residual rejection, the realistic equality workload. The
+# `$1::bigint` element casts are the form both engines accept (jed defers casting an ARRAY constructor
+# to a type; PG's array_ops GIN includes the `=` strategy too). The answer is index-independent, so
+# the cross-engine checksum holds.
+[[bench]]
+name = "gin_array_eq"
+description = "GIN = (array equality): rows whose tags array EXACTLY equals the query array — a two-posting-list intersection (the @> superset) + the residual = recheck over a 200k-row bigint[] column"
+dataset = "gin"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM docs WHERE tags = ARRAY[$1::bigint, $2::bigint] ORDER BY id"
+warmup = 500
+iterations = 5000
+seed = 4212
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500

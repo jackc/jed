@@ -38,6 +38,9 @@
 #   gin_any  — `c = ANY(tags)` over a GIN-indexed array column gathers c's single posting list
 #              (gin.md §6); the equivalent `'{c}' <@ tags` is NOT GIN-accelerated (full scan). Both
 #              must return identical rows (single-term gather oracle).
+#   gin_eq   — `tags = Q` over a GIN-indexed array column gathers candidates via the @>-superset
+#              bound + residual = (gin.md §6); the equivalent `NOT (tags <> Q)` is NOT GIN-accelerated
+#              (full scan). Both must return identical rows (exact-equality gather oracle).
 #
 # Determinism (CLAUDE.md §10): generation is SEEDED, so a discovered failure reduces to this exact
 # deterministic .test, which then joins the corpus. The fuzzer is dev-time discovery; the emitted
@@ -95,6 +98,9 @@ GIN_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan dml.i
 GIN_ANY_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_any_eq dml.insert
                  dml.insert_multi_row query.select query.order_by types.i32 types.array
                  func.array_quantified func.array_containment].freeze
+GIN_EQ_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_array_eq dml.insert
+                dml.insert_multi_row query.select query.order_by query.where_eq types.i32
+                types.array].freeze
 
 # The default relation note describes the NoREC pair (an optimized form vs a non-optimizable
 # rewrite). TLP overrides it with its own partition-reconstruction note (it is not an opt pair).
@@ -444,6 +450,59 @@ def gen_gin_any(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: GIN-bounded array equality (= via the GIN index vs NOT(<>) full scan) -----------
+# `col = Q` over a GIN-indexed array column gathers candidates via the @>-superset bound (Q's
+# distinct non-NULL elements, since col = Q ⟹ col @> Q) + the residual = (spec/design/gin.md §6;
+# query.gin_array_eq); the SEMANTICALLY IDENTICAL `NOT (col <> Q)` is NOT GIN-accelerated (gin_match
+# only matches `=`, never `<>`/`NOT`) and full scans. So the metamorphic pair is `tags = Q` vs
+# `NOT (tags <> Q)` — both mean "tags equals Q exactly", the bound taken on one side and not the
+# other; both must return identical rows (incl. the NULL-tags row, excluded by 3VL on both sides).
+# Expected rows are known by construction (a row matches iff its tags are non-NULL and EXACTLY equal
+# Q — ordered, same length/elements). No NULL ELEMENTS are generated, so the oracle is exact. This
+# catches a GIN equality gather/residual bug ALL cores might share, which differential testing alone
+# cannot. `'{…}'::i32[]` literals pin the element type (no bare-array adaptation).
+def gen_gin_eq(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  # (id, tags): a small int array from a small domain; one row is NULL and some are empty {}.
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+
+    [id, Array.new(rng.rand(0..3)) { rng.rand(0..4) }]
+  end
+  # The by-construction oracle: tags is non-NULL and EXACTLY equals q (ordered, same length/elements).
+  matches = ->(q) { rows.select { |_id, t| !t.nil? && t == q }.map { |id, _| id.to_s } }
+
+  # A present array — an existing non-NULL non-empty row's tags (≥1 match → the GIN bound gathers).
+  present = rows.filter_map { |_id, t| t }.reject(&:empty?).sample(random: rng) || [0]
+  # A miss: `present` reversed (the same term set still gathers, but the residual = rejects on order)
+  # when reversal differs; else `present` + an out-of-domain sentinel 9 (no row carries it → the
+  # gather intersects to empty). Either way matches.call returns the by-construction expected rows.
+  reordered = present.reverse == present ? present + [9] : present.reverse
+
+  arr = ->(q) { "'{#{q.join(',')}}'::i32[]" }
+
+  out = header(seed, GIN_EQ_REQ, "GIN-bounded array equality (= via the GIN index vs NOT(<>) full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, tags i32[])")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, t| "(#{id}, #{t.nil? ? 'NULL' : "'{#{t.join(',')}}'"})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_tags_gin ON t USING gin (tags)")
+
+  gpair = lambda do |title, qa, exp|
+    out << "# #{title}"
+    out << "# GIN bound (col = const -> @>-superset gather + residual =)"
+    q(out, "I", "SELECT id FROM t WHERE tags = #{arr.call(qa)} ORDER BY id", exp)
+    out << "# full scan (NOT(col <> const) is the same predicate, not GIN-accelerated) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE NOT (tags <> #{arr.call(qa)}) ORDER BY id", exp)
+  end
+
+  gpair.call("= {#{present.join(',')}} (present)", present, matches.call(present))
+  gpair.call("= {#{reordered.join(',')}} (miss)", reordered, matches.call(reordered))
+  gpair.call("= {} (empty -> full-scan fallback)", [], matches.call([]))
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: TLP (ternary-logic partitioning) -----------------------------------------------
 # Kleene 3-valued helpers: Ruby `nil` is SQL UNKNOWN. A comparison with a NULL operand is UNKNOWN;
 # AND/OR follow Kleene logic; NOT(UNKNOWN) is UNKNOWN. These mirror jed's PG-default 3VL exactly
@@ -594,6 +653,7 @@ SCENARIOS = {
   "index" => method(:gen_index),
   "gin" => method(:gen_gin),
   "gin_any" => method(:gen_gin_any),
+  "gin_eq" => method(:gen_gin_eq),
   "tlp" => method(:gen_tlp),
   "cte" => method(:gen_cte),
 }.freeze

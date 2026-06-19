@@ -547,12 +547,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         full-scans `= ANY(array)` and returns empty). All three cores + capability
         `query.gin_any_eq` + `suites/query/gin_any_eq.test` (cost-asserted, oracle-checked) + the
         `gin_any` NoREC scenario + `/web` Indexes page + e2e. → [gin.md §6](spec/design/gin.md)
+  - [x] _follow-on — array `=` acceleration:_ `gin_col = const` (exact array equality, commutative)
+        over a GIN-indexed array column bounds the scan via the **`@> distinct(const)` superset
+        gather + residual `=`** (equal arrays have identical element multisets, so `col = const` ⟹
+        `col @> const` — the `@>` intersection is a sound superset, made exact by the residual `=`):
+        a fourth `GinStrategy` (`Equal`). Two shapes part from `@>`: a NULL **element** does NOT empty
+        the bound (`col = ARRAY[1,NULL]` matches a `{1,NULL}` row via the `@> {1}` bound), and a
+        `const` with no non-NULL element (`'{}'`/all-NULL) **falls back to the full scan** (its
+        matching rows carry no index terms), not a provably-empty bound. **Matches PG** (its
+        `array_ops` GIN has the `=` strategy `GinEqualStrategy 4`, also lossy→recheck). All three
+        cores + capability `query.gin_array_eq` + `suites/query/gin_array_eq.test` (cost-asserted,
+        oracle-checked) + the `gin_eq` NoREC scenario (`= Q` vs `NOT(<> Q)`) + a `gin_array_eq`
+        bench + `/web` Indexes page + e2e. → [gin.md §6](spec/design/gin.md)
   - [ ] _follow-on (each its own slice):_ `<@` (contained-by, broad scan + recheck — blocked on the
-        index recording empty/NULL-array rows) / `IN` over a scalar list / array `=` acceleration;
-        non-integer element types (as their key encodings lift) + composite-element arrays;
-        multi-column GIN; correlated / array-column query operands; GIN for UPDATE/DELETE scans; the
-        LIMIT-streaming combination; posting-list run compression; the **`jsonb_ops`** opclass (the
-        lossy-recheck path the seam already seats) and a future object/document opclass.
+        index recording empty/NULL-array rows) / `IN` over a scalar list; non-integer element types
+        (as their key encodings lift) + composite-element arrays; multi-column GIN; correlated /
+        array-column query operands; GIN for UPDATE/DELETE scans; the LIMIT-streaming combination;
+        posting-list run compression; the **`jsonb_ops`** opclass (the lossy-recheck path the seam
+        already seats) and a future object/document opclass.
 - [x] **`RETURNING`** — `INSERT`/`UPDATE`/`DELETE … RETURNING <select_items>` projecting affected
       rows (INSERT stored / UPDATE new / DELETE old), evaluated after validation before any write;
       the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.

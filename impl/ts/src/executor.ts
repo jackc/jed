@@ -2333,15 +2333,16 @@ export class Database {
   }
 
   // ginBoundRows executes a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the
-  // constant query operand, extracts its terms + mode via the array_ops opclass (an array for @>/&&;
-  // a single scalar term for = ANY — "member"), gathers each term's posting list (a prefix range
-  // scan of the GIN entry tree), combines them by mode (@> and = ANY → intersection, && → union)
-  // into the candidate storage-key set, and point-looks-up each candidate in storage-key order. The
-  // original predicate stays the residual WHERE filter (re-applied downstream), so the result is
-  // always correct. Returns the candidate rows + the scan's up-front (pages, slabs); gin_entry (per
-  // posting entry visited) is charged on meter directly. Degenerate constant queries (gin.md §6): a
-  // NULL Q, an @> whose Q holds a NULL element, an && with no non-NULL term, and a NULL = ANY scalar
-  // are provably empty; @> '{}' falls back to the full scan.
+  // constant query operand, extracts its terms + mode via the array_ops opclass (an array for @>/&&/=;
+  // a single scalar term for = ANY — "member"; the array's distinct non-NULL terms for = — "equal"),
+  // gathers each term's posting list (a prefix range scan of the GIN entry tree), combines them by
+  // mode (@>, = ANY, and = → intersection, && → union) into the candidate storage-key set, and
+  // point-looks-up each candidate in storage-key order. The original predicate stays the residual
+  // WHERE filter (re-applied downstream), so the result is always correct. Returns the candidate rows
+  // + the scan's up-front (pages, slabs); gin_entry (per posting entry visited) is charged on meter
+  // directly. Degenerate constant queries (gin.md §6): a NULL Q, an @> whose Q holds a NULL element,
+  // an && with no non-NULL term, and a NULL = ANY scalar are provably empty; @> '{}' and array = with
+  // no non-NULL term fall back to the full scan.
   ginBoundRows(
     tableName: string,
     gb: GinBound,
@@ -2391,6 +2392,16 @@ export class Database {
         return { rows: u.entries.map((e) => e.row), pages: u.pages, slabs: u.slabs };
       }
       if (hasNull) return { rows: [], pages: 0, slabs: 0 }; // @> a query with a NULL element is never TRUE
+    } else if (gb.strategy === "equal") {
+      if (terms.length === 0) {
+        // col = Q with NO non-NULL term — '{}' (isEmpty) or an all-NULL Q (hasNull, no non-NULL
+        // element). The rows it matches ({}, {NULL}, …) carry NO index terms, so the index cannot
+        // enumerate them: fall back to the full scan and let the residual = keep them (gin.md §6).
+        // NOT a provably-empty bound — and a Q with ≥1 non-NULL element is NOT caught here (it
+        // gathers, even when it also has a NULL element).
+        const u = store.scanWithUnits(mask);
+        return { rows: u.entries.map((e) => e.row), pages: u.pages, slabs: u.slabs };
+      }
     } else if (gb.strategy === "overlaps") {
       if (terms.length === 0) return { rows: [], pages: 0, slabs: 0 }; // && with no non-NULL term
     }
@@ -2416,7 +2427,8 @@ export class Database {
     // Combine into the candidate storage keys, ascending byte (= storage-key) order, so the point
     // lookups and emitted rows follow storage order exactly as a full scan (gin.md §6/§8). @> ALL →
     // intersection; = ANY (member) is a single term, so its intersection is that lone posting list;
-    // && ANY → union.
+    // array = (equal) gathers the same superset as @> over Q's distinct non-NULL terms (the residual
+    // = makes it exact downstream); && ANY → union.
     const cand = gb.strategy === "overlaps" ? unionPostings(postings) : intersectPostings(postings);
 
     let slabs = 0;
@@ -4749,10 +4761,13 @@ type ScanBound =
   | { kind: "gin"; gin: GinBound };
 
 // GinStrategy is which array operator a GIN bound accelerates (spec/design/gin.md §6): @>
-// (contains, mode ALL → posting-list intersection), && (overlaps, mode ANY → union), or = ANY
+// (contains, mode ALL → posting-list intersection), && (overlaps, mode ANY → union), = ANY
 // ("member" — `c = ANY(col)`, the single-term @> reduction: one scalar term, its lone posting
-// list). For "member" the query operand recovered by ginMatch is the scalar c, not an array.
-type GinStrategy = "contains" | "overlaps" | "member";
+// list), or array = ("equal" — `col = Q`, the @>-superset gather + residual =). For "member" the
+// query operand recovered by ginMatch is the scalar c, not an array; for "equal" it is the array Q
+// whose distinct non-NULL elements gather the same superset as `@> Q` (equal arrays have identical
+// element multisets, so col = Q ⟹ col @> Q), made exact by the residual = filter.
+type GinStrategy = "contains" | "overlaps" | "member" | "equal";
 
 // GinBound is the plan-time result of GIN analysis (spec/design/gin.md §6): the chosen GIN
 // index (lowest lowercased name whose array column has a `col @> const` / `col && const`
@@ -4818,13 +4833,13 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
 }
 
 // ginMatch finds the first WHERE AND-chain conjunct a GIN index on colGlobal accelerates
-// (spec/design/gin.md §6): `col @> Q` (contains), `col && Q` (overlaps), or `c = ANY(col)`
-// (membership) where the query operand is a constant (references no column / outer / subquery).
-// @> is asymmetric (the indexed column must be the LEFT operand — `Q @> col` is the non-accelerated
-// <@); && is symmetric; = ANY requires the column be ANY's array operand and c the scalar. Returns
-// the strategy and the query operand (the scalar c for "member"). Used at plan time (strategy) and
-// exec time (recover the operand from plan.filter), so the two agree on the same conjunct by
-// construction.
+// (spec/design/gin.md §6): `col @> Q` (contains), `col && Q` (overlaps), `c = ANY(col)`
+// (membership), or `col = Q` (exact array equality) where the query operand is a constant
+// (references no column / outer / subquery). @> is asymmetric (the indexed column must be the LEFT
+// operand — `Q @> col` is the non-accelerated <@); && and array = are symmetric; = ANY requires the
+// column be ANY's array operand and c the scalar. Returns the strategy and the constant query
+// operand (the scalar c for "member", the array Q otherwise). Used at plan time (strategy) and exec
+// time (recover the operand from plan.filter), so the two agree on the same conjunct by construction.
 function ginMatch(filter: RExpr, colGlobal: number): { strategy: GinStrategy; query: RExpr } | null {
   if (filter.kind === "and") {
     return ginMatch(filter.lhs, colGlobal) ?? ginMatch(filter.rhs, colGlobal);
@@ -4838,6 +4853,14 @@ function ginMatch(filter: RExpr, colGlobal: number): { strategy: GinStrategy; qu
       if (isColumnRef(a, colGlobal) && rexprIsConstant(b)) return { strategy: "overlaps", query: b };
       if (isColumnRef(b, colGlobal) && rexprIsConstant(a)) return { strategy: "overlaps", query: a };
     }
+  }
+  // `col = Q` — exact array equality (gin.md §6). Commutative: the column may be either operand, the
+  // constant array Q the other. Recovered operand is Q; ginBoundRows reads it via "equal" (the
+  // @>-superset gather + the residual =). <> is NOT matched (only "eq"). When the column is an array,
+  // the other constant operand is necessarily an array too (resolve rejects an array/scalar =).
+  if (filter.kind === "compare" && filter.op === "eq") {
+    if (isColumnRef(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs)) return { strategy: "equal", query: filter.rhs };
+    if (isColumnRef(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs)) return { strategy: "equal", query: filter.lhs };
   }
   // `c = ANY(col)` — the array spelling of membership (gin.md §6): the GIN column must be ANY's
   // ARRAY operand and c (the scalar lhs) a constant. Only = ANY (not = ALL, not any other

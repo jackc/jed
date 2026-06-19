@@ -115,6 +115,9 @@ var SupportedCapabilities = []string{
 	// GIN-bounded `c = ANY(col)` membership — the single-term @> reduction over a GIN-indexed
 	// array column (spec/design/gin.md §6); same rows as the full scan, lower cost.
 	"query.gin_any_eq",
+	// GIN-bounded array equality `col = Q` — the `@> distinct(Q)` superset gather + residual = over
+	// a GIN-indexed array column (spec/design/gin.md §6); same rows as the full scan.
+	"query.gin_array_eq",
 	"query.is_null",
 	"query.order_by",
 	// Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

@@ -1,0 +1,98 @@
+# GIN-bounded array equality — `col = const` narrows a SELECT over a GIN-indexed array column
+# (spec/design/gin.md §6). Exact array equality `tags = Q` is the array spelling that a GIN index
+# accelerates as a `tags @> distinct(Q)` candidate gather (equal arrays have identical element
+# multisets, so `tags = Q` ⟹ `tags @> Q` — the @> intersection is a sound SUPERSET) plus the
+# original `=` as the residual WHERE filter, so the RESULT is identical to the full-scan answer —
+# this file pins that the index is transparent (correct rows with the index, incl. order-,
+# cardinality-, and multiset-sensitivity that the residual `=` enforces, and across DELETE
+# maintenance). PostgreSQL agrees (the rows do not depend on whether an index is used); PG's
+# array_ops GIN opclass DOES include the `=` strategy (GinEqualStrategy 4, also lossy→recheck), so
+# this MATCHES PG (gin.md §9). The array-equality semantics themselves are pinned in types/array.test.
+#
+# The `# cost:` assertions PIN that the GIN bound (not a full scan) is taken: page_read for each
+# distinct-element posting range + gin_entry per posting entry visited + per-candidate point lookup
+# (page_read + storage_row_read) + the residual `operator_eval` + row_produced (gin.md §6 /
+# cost.md §3). The two no-non-NULL-term shapes — `= '{}'` and a whole-NULL const — FALL BACK to the
+# full scan (their matching rows carry no index terms), charging the full scan, not 0. The costs are
+# cross-core identical (CLAUDE.md §8). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_array_eq, dml.insert, dml.insert_multi_row, dml.delete, query.select, query.order_by, query.where_eq, types.i32, types.i64, types.array, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, tags i32[])
+
+statement ok
+CREATE INDEX t_tags_gin ON t USING gin (tags)
+
+# shared / disjoint / duplicate-element / empty / NULL-array / NULL-element sets
+statement ok
+INSERT INTO t VALUES
+  (1, ARRAY[10,20,30]),
+  (2, ARRAY[20,40]),
+  (3, ARRAY[40,50]),
+  (4, ARRAY[10,10,20]),
+  (5, '{}'),
+  (6, NULL),
+  (7, ARRAY[10,NULL])
+
+# --- col = const: exact equality, gathered as @> distinct(const) + residual = ------------------
+# = {10,20,30} → row 1 only (the @>{10,20,30} gather is a superset; residual = confirms)
+# cost: 15
+query I nosort
+SELECT id FROM t WHERE tags = ARRAY[10,20,30] ORDER BY id
+----
+1
+
+# = {20,40} → row 2 only
+# cost: 12
+query I nosort
+SELECT id FROM t WHERE tags = ARRAY[20,40] ORDER BY id
+----
+2
+
+# = {10,10,20} → row 4 only (duplicate elements: distinct terms {10,20} gather rows 1 and 4;
+# residual = rejects row 1 {10,20,30} on cardinality/multiset)
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE tags = ARRAY[10,10,20] ORDER BY id
+----
+4
+
+# order-sensitive: = {20,10} → empty (gather @>{10,20} admits rows 1 and 4; residual = rejects
+# both — array `=` is ordered, {10,...} ≠ {20,...})
+# cost: 16
+query I nosort
+SELECT id FROM t WHERE tags = ARRAY[20,10] ORDER BY id
+----
+
+# miss: = {10,20,40} → empty (no row has all of 10,20,40 → empty candidate set, no residual work)
+# cost: 11
+query I nosort
+SELECT id FROM t WHERE tags = ARRAY[10,20,40] ORDER BY id
+----
+
+# NULL element: = {10,NULL} → row 7 (distinct NON-NULL term {10} gathers rows 1,4,7; residual =
+# confirms only {10,NULL}; a NULL element does NOT empty the bound — unlike @>)
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE tags = ARRAY[10,NULL] ORDER BY id
+----
+7
+
+# --- no-non-NULL-term shape: full-scan fallback (rows with no index terms — gin.md §6) ----------
+# = '{}' → row 5 (the empty-array row carries no terms; the bound cannot enumerate it, so this
+# falls back to the full scan and the residual = keeps row 5)
+# cost: 16
+query I nosort
+SELECT id FROM t WHERE tags = '{}'::i32[] ORDER BY id
+----
+5
+
+# --- the index is transparent under maintenance: results stay correct after DELETE -------------
+statement ok
+DELETE FROM t WHERE id = 1
+
+# row 1 is gone — = {10,20,30} now matches nothing
+# cost: 7
+query I nosort
+SELECT id FROM t WHERE tags = ARRAY[10,20,30] ORDER BY id
+----

@@ -40,11 +40,15 @@ ORDER BY id;`;
 	const memberQuery = `SELECT title FROM post
 WHERE 20 = ANY(tags)
 ORDER BY id;`;
+
+	const equalQuery = `SELECT title FROM post
+WHERE tags = ARRAY[10, 20]
+ORDER BY id;`;
 </script>
 
 <svelte:head>
 	<title>Indexes — jed</title>
-	<meta name="description" content="CREATE INDEX in jed — ordered B-tree indexes, and GIN inverted indexes that accelerate array containment, overlap, and membership, run live." />
+	<meta name="description" content="CREATE INDEX in jed — ordered B-tree indexes, and GIN inverted indexes that accelerate array containment, overlap, membership, and exact equality, run live." />
 </svelte:head>
 
 # Indexes
@@ -78,7 +82,7 @@ the whole table. Add one with `USING gin`:
 CREATE INDEX post_tags_gin ON post USING gin (tags)
 ```
 
-It accelerates the two array set operators and array membership:
+It accelerates the two array set operators, array membership, and exact equality:
 
 - **`tags @> ARRAY[10, 20]`** (contains) — rows whose `tags` contain **all** the query terms. jed
   gathers the rows for each term and **intersects** their lists.
@@ -86,6 +90,9 @@ It accelerates the two array set operators and array membership:
   the lists and takes their **union**.
 - **`20 = ANY(tags)`** (membership) — rows that have `20` among their `tags` (the array spelling of
   membership; equivalently `tags @> ARRAY[20]`). jed gathers that single term's rows.
+- **`tags = ARRAY[10, 20]`** (equality) — rows whose `tags` **exactly** equal the query array. Since
+  equal arrays contain the same elements, jed gathers the same candidates as `@>` and then the
+  residual `=` enforces order and length — **stricter** than containment.
 
 The original `WHERE` stays as the residual filter, so the answer is identical to the full-scan
 answer — the index is transparent. Containment (`intro` and `gin` both hold `{10, 20}`):
@@ -100,6 +107,11 @@ Membership (`intro`, `arrays`, and `gin` all hold `20`):
 
 <LiveSql seed={ginSeed} query={memberQuery} rows={6} />
 
+Equality is stricter than containment — `tags = ARRAY[10, 20]` keeps only `gin` (whose `tags`
+*are* `{10, 20}`), not `intro` (whose `{10, 20, 30}` merely *contains* them):
+
+<LiveSql seed={ginSeed} query={equalQuery} rows={6} />
+
 ### Current scope
 
 GIN this release covers a focused surface (it grows from here):
@@ -107,7 +119,7 @@ GIN this release covers a focused surface (it grows from here):
 - **One column, integer-element arrays** — `i16[]`, `i32[]`, or `i64[]`. A multi-column GIN, or an
   array of another element type (`text[]`, `numeric[]`, …), is rejected with `0A000` until its key
   encoding lands.
-- **`@>`, `&&`, and `= ANY` only** — `<@` (contained-by), `IN` over a scalar list, and array `=`
+- **`@>`, `&&`, `= ANY`, and array `=` only** — `<@` (contained-by) and `IN` over a scalar list
   still run, by full scan; they are not GIN-accelerated yet.
 - **No `UNIQUE`** — an inverted index has many entries per row, so `CREATE UNIQUE INDEX … USING gin`
   is rejected (`0A000`), matching PostgreSQL.
