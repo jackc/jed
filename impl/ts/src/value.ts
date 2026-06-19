@@ -12,6 +12,7 @@ import { Decimal } from "./decimal.ts";
 import { type Interval, intervalCmp, renderInterval } from "./interval.ts";
 import { renderTimestamp, renderTimestamptz } from "./timestamp.ts";
 import { renderDate } from "./date.ts";
+import { rangeOut } from "./range.ts";
 
 export type Value =
   | { kind: "null" }
@@ -67,6 +68,20 @@ export type Value =
   // uses PG btree semantics (NULLs comparable and mutually equal — NOT the composite 3VL rule, §5)
   // and, like array_eq/array_cmp, considers dims and lbounds (so [2:4]={1,2,3} ≠ {1,2,3}).
   | { kind: "array"; dims: number[]; lbounds: number[]; elements: Value[] }
+  // A range value (spec/design/ranges.md §2/§4) — the distinguished empty range or a non-empty
+  // range over a scalar element. `lower`/`upper` are element values; a null bound is
+  // unbounded/infinite on that side (and its inclusivity flag is then false). The element type comes
+  // from the value's *type*, not stored here (the array precedent). The stored form is CANONICAL
+  // (discrete ranges in `[)` form, the empty range normalized — §4), so structural equality on the
+  // stored form is the correct value-level equality.
+  | {
+      kind: "range";
+      empty: boolean;
+      lower: Value | null;
+      upper: Value | null;
+      lowerInc: boolean;
+      upperInc: boolean;
+    }
   // An UNFETCHED large-value reference (spec/design/large-values.md §14): a stored
   // external/compressed value loaded as its on-disk pointer instead of being materialized.
   // Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -198,6 +213,22 @@ export function arrayValue(elements: Value[]): Value {
 // emptyArray is the empty array `{}` (ndim 0).
 export function emptyArray(): Value {
   return { kind: "array", dims: [], lbounds: [], elements: [] };
+}
+
+// emptyRangeValue is the empty range (the canonical representation: no bounds, no inclusivity —
+// spec/design/ranges.md §4).
+export function emptyRangeValue(): Value {
+  return { kind: "range", empty: true, lower: null, upper: null, lowerInc: false, upperInc: false };
+}
+
+// rangeValue builds a non-empty range value from canonical bounds (a null bound is infinite).
+export function rangeValue(
+  lower: Value | null,
+  upper: Value | null,
+  lowerInc: boolean,
+  upperInc: boolean,
+): Value {
+  return { kind: "range", empty: false, lower, upper, lowerInc, upperInc };
 }
 
 // arrayNdim is the dimension count of an array value (0 = the empty array).
@@ -407,6 +438,11 @@ export function render(v: Value): string {
       // optional `[l:u]=` prefix when any lower bound ≠ 1), with per-element quoting and an unquoted
       // `NULL` for a null element (spec/design/array.md §7).
       return arrayOut(v);
+    case "range":
+      // A range renders as PG range_out: `empty`, or `[lo,hi)` with bracket/inclusivity, an omitted
+      // bound for infinite, and per-bound quoting where the element text has special chars (e.g. a
+      // tsrange bound's space — spec/design/ranges.md §5).
+      return rangeOut(v);
     case "unfetched":
       throw new Error("BUG: unfetched large value escaped the storage layer");
     default:

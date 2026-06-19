@@ -160,6 +160,7 @@ import {
   boolNot,
   arrayValue,
   emptyArray,
+  emptyRangeValue,
   arrayNdim,
   arrayUbound,
   boolOr,
@@ -196,6 +197,14 @@ import {
   intervalValue,
   dateValue,
 } from "./value.ts";
+import {
+  elementScalar,
+  finalizeRange,
+  parseRangeText,
+  rangeByName,
+  rangeNameForElement,
+} from "./range.ts";
+import type { RangeDesc } from "./ranges_gen.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
 // UPDATE, DELETE) or a query result set. cost is the deterministic execution cost accrued
@@ -1404,6 +1413,10 @@ export class Database {
           throw engineError("undefined_object", "type does not exist: " + base);
         }
         decimal = null;
+      } else if (rangeByName(def.typeName) !== undefined) {
+        // A range column is not storable yet (spec/design/ranges.md §8 — storage lands in R2). The
+        // range type name IS known, so this is 0A000 "not supported", not 42704 "type does not exist".
+        throw engineError("feature_not_supported", "a " + def.typeName + " column is not supported yet");
       } else if (scalarTypeFromName(def.typeName) !== undefined) {
         const [s, d] = resolveTypeAndTypmod(def.typeName, def.typeMod);
         colType = scalarT(s);
@@ -1542,9 +1555,10 @@ export class Database {
         def_defaultExpr = { exprText, expr: parseExpression(exprText) };
         if (def.identity !== null)
           identityKind = def.identity.always ? "always" : "byDefault";
-      } else if (colType.kind === "composite" || colType.kind === "array") {
-        // A DEFAULT on a composite- or array-typed column is not supported this slice
-        // (composite.md §12 / array.md §12).
+      } else if (colType.kind === "composite" || colType.kind === "array" || colType.kind === "range") {
+        // A DEFAULT on a composite-/array-typed column is not supported this slice (composite.md §12
+        // / array.md §12); a range column is not storable at all yet (ranges.md §8 — unreachable,
+        // CREATE TABLE rejects it).
         if (def.default !== null) {
           throw engineError(
             "feature_not_supported",
@@ -2980,6 +2994,10 @@ export class Database {
               " is not supported yet",
           );
         }
+        if (col.type.kind === "range") {
+          // Range columns are not storable yet (R2); CREATE TABLE rejects them, so this is unreachable.
+          throw new Error("range columns are not storable yet (R2); col.type is never a range");
+        }
         if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
           throw typeError(
             `column ${col.name} is of type ${typeCanonicalName(col.type)} but expression is of type ${rtName(q.columnTypes[p]!)}`,
@@ -3400,6 +3418,12 @@ export class Database {
         throw engineError(
           "feature_not_supported",
           "updating array column " + a.column + " is not supported yet",
+        );
+      }
+      if (col.type.kind === "range") {
+        throw engineError(
+          "feature_not_supported",
+          "updating range column " + a.column + " is not supported yet",
         );
       }
       const targetScalar = col.type.scalar;
@@ -4271,6 +4295,10 @@ export class Database {
           "feature_not_supported",
           "updating array column " + a.column + " is not supported yet",
         );
+      }
+      if (col.type.kind === "range") {
+        // Range columns are not storable yet (R2); CREATE TABLE rejects them, so this is unreachable.
+        throw new Error("range columns are not storable yet (R2); col.type is never a range");
       }
       const targetScalar = col.type.scalar;
       // The RHS is a general expression evaluated against the OLD row; a literal operand
@@ -7616,6 +7644,9 @@ function valueToRExpr(v: Value): RExpr {
     case "array":
       // A folded array constant — preserve its full shape (dims/lbounds) in a const node.
       return { kind: "constArray", value: v };
+    case "range":
+      // A folded range constant (already canonical).
+      return { kind: "constRange", value: v };
     default:
       return { kind: "constNull" };
   }
@@ -7753,6 +7784,9 @@ type ResolvedType =
   // comparable iff their element types are comparable; assignable to an array column of the same
   // element type.
   | { kind: "array"; elem: ResolvedType }
+  // A range type (spec/design/ranges.md §2), carrying its resolved element (subtype) type. Two
+  // ranges are comparable iff their elements are equal; the element is one of the six scalar subtypes.
+  | { kind: "range"; elem: ResolvedType }
   | { kind: "null" };
 
 // RSubscript is one resolved subscript spec in a "subscript" RExpr (spec/design/array.md §6): an
@@ -7792,6 +7826,8 @@ type RExpr =
   | { kind: "array"; elements: RExpr[]; nested: boolean }
   // A folded array constant (the valueToRExpr form), preserving its shape; evaluates to it directly.
   | { kind: "constArray"; value: Value }
+  // A folded range constant ('[1,5)'::i32range, already canonicalized); evaluates to it directly.
+  | { kind: "constRange"; value: Value }
   // Field selection `(composite).field` (spec/design/composite.md §S4): evaluate `base` to a
   // composite value and return its `index`-th field (the field ordinal, fixed at resolve). A
   // whole-value-NULL composite yields NULL for any field. One operator_eval per node.
@@ -8850,6 +8886,10 @@ function argFamily(t: ResolvedType): string | null {
     case "array":
       // No built-in function/aggregate argument family for arrays this slice.
       return null;
+    case "range":
+      // No concrete built-in argument family for ranges this slice (the polymorphic `anyrange`
+      // family is matched separately by the range resolver — RF1).
+      return null;
     case "null":
       return null;
   }
@@ -9764,6 +9804,7 @@ function resolvedTypeOfCol(ty: Type, db: Database): ResolvedType {
   if (ty.kind === "scalar") return resolvedTypeOf(ty.scalar);
   if (ty.kind === "array")
     return { kind: "array", elem: resolvedTypeOfCol(ty.elem, db) };
+  if (ty.kind === "range") return { kind: "range", elem: resolvedTypeOfCol(ty.elem, db) };
   const def = db.compositeType(ty.name);
   if (def === undefined)
     throw new Error("composite type reference resolved at load / CREATE TYPE");
@@ -9833,6 +9874,9 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
       return isDate(colTy);
     case "interval":
       return isInterval(colTy);
+    // A range source never assigns to a scalar column (a range column is not storable yet — R2).
+    case "range":
+      return false;
   }
 }
 
@@ -9874,8 +9918,37 @@ function rtName(t: ResolvedType): string {
       return t.name ?? "record";
     case "array":
       return rtName(t.elem) + "[]";
+    case "range": {
+      // A range names itself by its element subtype (i32 → i32range — spec/design/ranges.md).
+      const s = resolvedRangeElementScalar(t.elem);
+      if (s !== undefined) {
+        const name = rangeNameForElement(s);
+        if (name !== undefined) return name;
+      }
+      return `range<${rtName(t.elem)}>`;
+    }
     case "null":
       return "unknown";
+  }
+}
+
+// resolvedRangeElementScalar returns the scalar element type of a resolved range element. A range's
+// element is always one of the six scalar subtypes; undefined for anything else (never a valid
+// range). Used to name a range and to build its codec.
+function resolvedRangeElementScalar(elem: ResolvedType): ScalarType | undefined {
+  switch (elem.kind) {
+    case "int":
+      return elem.ty;
+    case "decimal":
+      return "decimal";
+    case "timestamp":
+      return "timestamp";
+    case "timestamptz":
+      return "timestamptz";
+    case "date":
+      return "date";
+    default:
+      return undefined;
   }
 }
 
@@ -9956,6 +10029,10 @@ function typeFromResolved(rt: ResolvedType): Type {
       );
     case "array":
       return arrayT(typeFromResolved(rt.elem));
+    case "range":
+      // A range-typed CTE column is deferred (range columns are not storable yet — R2); the value
+      // itself works in expression position, just not as a materialized column type.
+      throw engineError("feature_not_supported", "a range column in a CTE is not supported yet");
   }
 }
 
@@ -10819,6 +10896,10 @@ function resolve(
       const ct = scope.catalog.compositeType(e.typeName);
       if (ct !== undefined)
         return coerceStringToComposite(e.text, ct, scope.catalog);
+      // A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via range_in
+      // against the element type (spec/design/ranges.md §5) — the same primitive as the cast.
+      const rdesc = rangeByName(e.typeName);
+      if (rdesc !== undefined) return coerceStringToRangeExpr(e.text, rdesc);
       const [target] = resolveTypeAndTypmod(e.typeName, null);
       return coerceStringLiteral(e.text, target, null);
     }
@@ -11063,6 +11144,25 @@ function resolve(
           "feature_not_supported",
           "casting to an array type is only supported from a string literal this slice",
         );
+      }
+      // A range cast target (`'[1,5)'::i32range`, `…::int4range`). Like array, v1 supports the
+      // string-literal form and a bare NULL; every other range cast is a 0A000 narrowing
+      // (spec/design/ranges.md §1/§5).
+      {
+        const rdesc = rangeByName(e.typeName);
+        if (rdesc !== undefined) {
+          if (e.typeMod !== null) {
+            throw engineError("feature_not_supported", "a type modifier on a range type is not supported");
+          }
+          const elemRt = resolvedTypeOf(elementScalar(rdesc));
+          if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
+            return coerceStringToRangeExpr(e.inner.literal.text, rdesc);
+          }
+          if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
+            return { node: { kind: "constNull" }, type: { kind: "range", elem: elemRt } };
+          }
+          throw engineError("feature_not_supported", "casting to a range type is only supported from a string literal this slice");
+        }
       }
       // A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
       // (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
@@ -11893,6 +11993,14 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
       "cannot compare an interval value with a value of a different type",
     );
   }
+  // Range comparison is deferred to R3 (the range_cmp total order — spec/design/ranges.md §6); a
+  // range operand (range×range or range×anything) is a 42804 this slice. A range×NULL is allowed
+  // (the comparison is unknown), like every other family above.
+  const rangeL = lt.kind === "range";
+  const rangeR = rt.kind === "range";
+  if ((rangeL || rangeR) && lt.kind !== "null" && rt.kind !== "null") {
+    throw typeError("range comparison is not supported yet");
+  }
 }
 
 // isAdaptableOperand reports whether e is an adaptable operand — one that takes its type from its
@@ -11994,6 +12102,30 @@ function floatFromDecimalLiteral(
     node: { kind: "constFloat", ty, value: n },
     type: { kind: "float", ty },
   };
+}
+
+// coerceStringToRangeExpr coerces a range text literal to a constant range expression
+// ('[1,5)'::i32range / i32range '[1,5)'): parse, coerce each bound to the element type, then
+// canonicalize (spec/design/ranges.md §4/§5). Folds to a constRange. 22P02 malformed / 22000
+// lower>upper / 22003 canonicalize overflow.
+function coerceStringToRangeExpr(text: string, desc: RangeDesc): { node: RExpr; type: ResolvedType } {
+  const val = coerceStringToRange(text, desc);
+  const elemRt = resolvedTypeOf(elementScalar(desc));
+  return { node: { kind: "constRange", value: val }, type: { kind: "range", elem: elemRt } };
+}
+
+function coerceStringToRange(text: string, desc: RangeDesc): Value {
+  const parsed = parseRangeText(text);
+  if (parsed.empty) return emptyRangeValue();
+  const elem = elementScalar(desc);
+  const coerceBound = (b: string | null): Value | null => {
+    if (b === null) return null;
+    const { node } = coerceStringLiteral(b, elem, null);
+    return rexprConstToValue(node);
+  };
+  const lower = coerceBound(parsed.lower);
+  const upper = coerceBound(parsed.upper);
+  return finalizeRange(desc, lower, upper, parsed.lowerInc, parsed.upperInc);
 }
 
 // coerceStringLiteral coerces a string literal's content to the named scalar target at resolve —
@@ -12120,6 +12252,10 @@ function coerceStringToComposite(
       const val = coerceStringToArray(tok, elemCol);
       nodes.push(valueToRExpr(val));
       fieldTypes.push({ name: f.name, type: resolvedTypeOfCol(f.type, db) });
+    } else if (f.type.kind === "range") {
+      // A range field cannot occur: CREATE TYPE rejects a range field (range columns are not
+      // storable yet — R2).
+      throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
     } else {
       const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal);
       nodes.push(node);
@@ -12353,6 +12489,10 @@ function requireNumericOperand(t: ResolvedType): void {
     t.kind === "timestamptz" ||
     t.kind === "interval" ||
     t.kind === "date" ||
+    // A range/composite/array operand is non-numeric (range arithmetic + * - lands in RF4).
+    t.kind === "range" ||
+    t.kind === "composite" ||
+    t.kind === "array" ||
     // float is a strict island — it never mixes with int/decimal arithmetic (the both-float case
     // is handled before this; reaching here with a float means a cross-family int/decimal ⊕ float
     // pair → 42804, float.md §6).
@@ -12441,7 +12581,8 @@ function requireBool(t: ResolvedType, msg: string): void {
     t.kind === "timestamp" ||
     t.kind === "timestamptz" ||
     t.kind === "interval" ||
-    t.kind === "date"
+    t.kind === "date" ||
+    t.kind === "range"
   ) {
     throw typeError(msg);
   }
@@ -13896,6 +14037,9 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
     }
     case "constArray":
       // A folded array constant (shape preserved) — return it directly.
+      return e.value;
+    case "constRange":
+      // A folded range constant (already canonical) — return it directly.
       return e.value;
     case "field": {
       // Field selection — one operator_eval, then pull the resolved field ordinal out of the

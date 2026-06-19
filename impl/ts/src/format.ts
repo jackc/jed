@@ -181,6 +181,9 @@ function pushArrayElementType(w: ByteWriter, elem: Type): void {
     w.bytes(tn);
     return;
   }
+  if (elem.kind === "range") {
+    throw new Error("array-of-range is not storable yet (range columns land in R2)");
+  }
   w.u8(typeCodeForScalar(elem.scalar));
 }
 
@@ -932,6 +935,8 @@ function compositeTypeEntryBytes(ct: CompositeType): Uint8Array {
       // a nested-composite field's name sits.
       w.u8(15);
       pushArrayElementType(w, f.type.elem);
+    } else if (f.type.kind === "range") {
+      throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
     } else {
       w.u8(typeCodeForScalar(f.type.scalar));
     }

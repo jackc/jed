@@ -274,6 +274,11 @@ export type ColField = { name: string; type: ColType; typmod: DecimalTypmod | nu
 export function resolveColType(ty: Type, types: Map<string, CompositeType>): ColType {
   if (ty.kind === "scalar") return { kind: "scalar", scalar: ty.scalar };
   if (ty.kind === "array") return { kind: "array", elem: resolveColType(ty.elem, types) };
+  if (ty.kind === "range") {
+    // Range columns are not storable yet (spec/design/ranges.md §8 — R2 adds the codec). CREATE
+    // TABLE rejects a range column, so no range Type ever reaches a ColType this slice.
+    throw new Error("range columns are not storable yet (R2); resolveColType never sees a range");
+  }
   const def = types.get(ty.name.toLowerCase());
   if (def === undefined) {
     throw new Error("composite type reference resolved by validateCompositeTypes");

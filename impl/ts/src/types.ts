@@ -7,6 +7,8 @@
 // exceeds JS's safe-integer range, so every integer flows through bigint — uniform,
 // exact at all widths).
 
+import { RANGES } from "./ranges_gen.ts";
+
 export type ScalarType =
   | "i16"
   | "i32"
@@ -367,7 +369,8 @@ export function roundToWidth(ty: ScalarType, v: number): number {
 export type Type =
   | { kind: "scalar"; scalar: ScalarType }
   | { kind: "composite"; name: string }
-  | { kind: "array"; elem: Type };
+  | { kind: "array"; elem: Type }
+  | { kind: "range"; elem: Type };
 
 // scalarT wraps a ScalarType as a Type.
 export function scalarT(s: ScalarType): Type {
@@ -392,6 +395,16 @@ export function isArrayType(t: Type): boolean {
   return t.kind === "array";
 }
 
+// rangeT builds a structural range Type over a scalar element/subtype (spec/design/ranges.md §2).
+export function rangeT(elem: Type): Type {
+  return { kind: "range", elem };
+}
+
+// isRangeType reports whether this is a range type.
+export function isRangeType(t: Type): boolean {
+  return t.kind === "range";
+}
+
 // compositeRefName returns the composite type this type references, looking through one array level —
 // the name for both `addr` and `addr[]`, null for a scalar or a `scalar[]`. There is at most one
 // (arrays are over a single element; composites are referenced by name, never inlined), so the
@@ -414,6 +427,11 @@ export function typeScalar(t: Type): ScalarType {
       "array type used where a scalar was expected (spec/design/array.md)",
     );
   }
+  if (t.kind === "range") {
+    throw new Error(
+      "range type used where a scalar was expected (spec/design/ranges.md)",
+    );
+  }
   throw new Error(
     `composite type ${t.name} used where a scalar was expected; the composite path must branch before this point (spec/design/composite.md)`,
   );
@@ -434,6 +452,16 @@ export function isCompositeType(t: Type): boolean {
 export function typeCanonicalName(t: Type): string {
   if (t.kind === "scalar") return canonicalName(t.scalar);
   if (t.kind === "array") return typeCanonicalName(t.elem) + "[]";
+  if (t.kind === "range") {
+    // A range's canonical name comes from ranges.toml keyed by the element (i32 → i32range). The
+    // RANGES table is pure data (no import cycle), so the lookup lives here directly.
+    if (t.elem.kind === "scalar") {
+      const ename = canonicalName(t.elem.scalar);
+      const name = RANGES.find((r) => r.element === ename)?.id;
+      if (name !== undefined) return name;
+    }
+    return `range<${typeCanonicalName(t.elem)}>`;
+  }
   return t.name;
 }
 

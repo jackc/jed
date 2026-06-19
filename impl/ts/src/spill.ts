@@ -437,6 +437,10 @@ function writeValue(w: ByteWriter, v: Value): void {
       }
       for (const el of v.elements) writeValue(w, el);
       break;
+    case "range":
+      // A range value is never spilled this slice: range comparison / ORDER BY / DISTINCT land in
+      // R3 (which adds the spill tag), so a sort/dedup over a range cannot reach the spill codec.
+      throw new Error("range values are not spilled until R3 (no range ORDER BY)");
     case "unfetched":
       // An untouched large-value reference rides along to the output unread (spill.md §4); spill it
       // opaquely so it round-trips, never resolving it.
