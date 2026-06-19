@@ -132,6 +132,14 @@ func (p *Parser) parseStatement() (Statement, error) {
 			}
 			return Statement{CreateType: ct}, nil
 		}
+		// CREATE SEQUENCE — a 2-token lookahead keeps SEQUENCE non-reserved (sequences.md).
+		if p.peekKeywordAt(1) == "sequence" {
+			cs, err := p.parseCreateSequence()
+			if err != nil {
+				return Statement{}, err
+			}
+			return Statement{CreateSequence: cs}, nil
+		}
 		ct, err := p.parseCreateTable()
 		if err != nil {
 			return Statement{}, err
@@ -151,6 +159,13 @@ func (p *Parser) parseStatement() (Statement, error) {
 				return Statement{}, err
 			}
 			return Statement{DropType: dt}, nil
+		}
+		if p.peekKeywordAt(1) == "sequence" {
+			ds, err := p.parseDropSequence()
+			if err != nil {
+				return Statement{}, err
+			}
+			return Statement{DropSequence: ds}, nil
 		}
 		dt, err := p.parseDropTable()
 		if err != nil {
@@ -943,6 +958,217 @@ func (p *Parser) parseDropType() (*DropType, error) {
 		return nil, NewError(FeatureNotSupported, "DROP TYPE ... CASCADE is not supported")
 	}
 	return &DropType{Name: name, IfExists: ifExists}, nil
+}
+
+// parseCreateSequence parses `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]`
+// (spec/design/sequences.md). The options are order-free and each at most once (a repeat is
+// 42601); option values are signed integer literals. Validation of the resolved option set
+// (22023) and the namespace collision (42P07) are execution-time.
+func (p *Parser) parseCreateSequence() (*CreateSequence, error) {
+	if err := p.expectKeyword("create"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("sequence"); err != nil {
+		return nil, err
+	}
+	ifNotExists, err := p.parseIfNotExists()
+	if err != nil {
+		return nil, err
+	}
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	seq := &CreateSequence{Name: name, IfNotExists: ifNotExists}
+	// Order-free option loop: dispatch on the leading keyword, each option at most once.
+	for {
+		switch p.peekKeyword() {
+		case "increment":
+			if err := p.dupCheck(seq.Increment != nil, "INCREMENT"); err != nil {
+				return nil, err
+			}
+			p.advance()
+			p.consumeKeyword("by")
+			v, err := p.parseSignedIntLiteral()
+			if err != nil {
+				return nil, err
+			}
+			seq.Increment = &v
+		case "minvalue":
+			if err := p.dupCheck(seq.MinValue != nil, "MINVALUE"); err != nil {
+				return nil, err
+			}
+			p.advance()
+			v, err := p.parseSignedIntLiteral()
+			if err != nil {
+				return nil, err
+			}
+			seq.MinValue = &SeqBound{Value: v}
+		case "maxvalue":
+			if err := p.dupCheck(seq.MaxValue != nil, "MAXVALUE"); err != nil {
+				return nil, err
+			}
+			p.advance()
+			v, err := p.parseSignedIntLiteral()
+			if err != nil {
+				return nil, err
+			}
+			seq.MaxValue = &SeqBound{Value: v}
+		case "start":
+			if err := p.dupCheck(seq.Start != nil, "START"); err != nil {
+				return nil, err
+			}
+			p.advance()
+			p.consumeKeyword("with")
+			v, err := p.parseSignedIntLiteral()
+			if err != nil {
+				return nil, err
+			}
+			seq.Start = &v
+		case "cache":
+			if err := p.dupCheck(seq.Cache != nil, "CACHE"); err != nil {
+				return nil, err
+			}
+			p.advance()
+			v, err := p.parseSignedIntLiteral()
+			if err != nil {
+				return nil, err
+			}
+			seq.Cache = &v
+		case "cycle":
+			if err := p.dupCheck(seq.Cycle != nil, "CYCLE"); err != nil {
+				return nil, err
+			}
+			p.advance()
+			t := true
+			seq.Cycle = &t
+		case "no":
+			// `NO MINVALUE` / `NO MAXVALUE` / `NO CYCLE`.
+			p.advance()
+			switch p.peekKeyword() {
+			case "minvalue":
+				if err := p.dupCheck(seq.MinValue != nil, "MINVALUE"); err != nil {
+					return nil, err
+				}
+				p.advance()
+				seq.MinValue = &SeqBound{NoValue: true}
+			case "maxvalue":
+				if err := p.dupCheck(seq.MaxValue != nil, "MAXVALUE"); err != nil {
+					return nil, err
+				}
+				p.advance()
+				seq.MaxValue = &SeqBound{NoValue: true}
+			case "cycle":
+				if err := p.dupCheck(seq.Cycle != nil, "CYCLE"); err != nil {
+					return nil, err
+				}
+				p.advance()
+				f := false
+				seq.Cycle = &f
+			default:
+				return nil, NewError(SyntaxError,
+					fmt.Sprintf("expected MINVALUE, MAXVALUE, or CYCLE after NO, found %q", p.peekKeyword()))
+			}
+		default:
+			return seq, nil
+		}
+	}
+}
+
+// parseDropSequence parses `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT | CASCADE]`
+// (sequences.md §1). CASCADE is 0A000 at execution; a missing sequence (42P01) is
+// execution-time.
+func (p *Parser) parseDropSequence() (*DropSequence, error) {
+	if err := p.expectKeyword("drop"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("sequence"); err != nil {
+		return nil, err
+	}
+	ifExists := p.peekKeyword() == "if"
+	if ifExists {
+		p.advance()
+		if err := p.expectKeyword("exists"); err != nil {
+			return nil, err
+		}
+	}
+	first, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	names := []string{first}
+	for p.peek().Kind == TokComma {
+		p.advance()
+		n, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	cascade := false
+	switch p.peekKeyword() {
+	case "restrict":
+		p.advance()
+	case "cascade":
+		p.advance()
+		cascade = true
+	}
+	if cascade {
+		return nil, NewError(FeatureNotSupported, "DROP SEQUENCE ... CASCADE is not supported")
+	}
+	return &DropSequence{Names: names, IfExists: ifExists}, nil
+}
+
+// parseIfNotExists consumes an optional `IF NOT EXISTS` prefix, reporting whether it was present.
+func (p *Parser) parseIfNotExists() (bool, error) {
+	if p.peekKeyword() == "if" {
+		p.advance()
+		if err := p.expectKeyword("not"); err != nil {
+			return false, err
+		}
+		if err := p.expectKeyword("exists"); err != nil {
+			return false, err
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+// consumeKeyword consumes an optional noise keyword (e.g. the BY in INCREMENT BY, the WITH in
+// START WITH) when present.
+func (p *Parser) consumeKeyword(kw string) {
+	if p.peekKeyword() == kw {
+		p.advance()
+	}
+}
+
+// dupCheck reports 42601 when an option appeared twice.
+func (p *Parser) dupCheck(already bool, opt string) error {
+	if already {
+		return NewError(SyntaxError, fmt.Sprintf("%s specified more than once", opt))
+	}
+	return nil
+}
+
+// parseSignedIntLiteral parses a signed integer literal (`-? INT`) as an int64 — the
+// sequence-option value form. The lexer caps an Int magnitude at 2^63, so the only out-of-range
+// case is a bare positive 2^63 (22003 — numeric_value_out_of_range); a negated 2^63 is the
+// int64 minimum (valid).
+func (p *Parser) parseSignedIntLiteral() (int64, error) {
+	negate := false
+	if p.peek().Kind == TokMinus {
+		p.advance()
+		negate = true
+	}
+	t := p.advance()
+	if t.Kind != TokInt {
+		return 0, NewError(SyntaxError, fmt.Sprintf("expected an integer, found %v", t))
+	}
+	v, ok := foldInt(t.Int, negate)
+	if !ok {
+		return 0, NewError(NumericValueOutOfRange, "sequence parameter out of int64 range")
+	}
+	return v, nil
 }
 
 // parseInsert parses `INSERT INTO <table> [( <col> [, <col>]* )] VALUES <row> [, <row>]*`,

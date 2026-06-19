@@ -631,6 +631,24 @@ fn nested_composite_table_db() -> Database {
     db
 }
 
+/// Sequences (v12): two sequences — `s1` ascending, advanced 3 times (is_called, last_value 3),
+/// `s2` descending/fresh with non-default cache + cycle — plus a one-row table, pinning the
+/// sequence catalog entry (entry_kind 2) and the catalog emission order (sequences before tables).
+fn sequence_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE SEQUENCE s1");
+    run(&mut db, "SELECT nextval('s1')");
+    run(&mut db, "SELECT nextval('s1')");
+    run(&mut db, "SELECT nextval('s1')");
+    run(
+        &mut db,
+        "CREATE SEQUENCE s2 INCREMENT BY -2 MINVALUE -100 MAXVALUE -1 CACHE 5 CYCLE",
+    );
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+    run(&mut db, "INSERT INTO t VALUES (1, 10)");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -662,6 +680,7 @@ fn write_matches_goldens() {
         ("fk_table.jed", fk_table_db),
         ("composite_type_table.jed", composite_type_table_db),
         ("nested_composite_table.jed", nested_composite_table_db),
+        ("sequence_table.jed", sequence_table_db),
         ("array_table.jed", array_table_db),
         ("array_composite_table.jed", array_composite_table_db),
         (

@@ -518,6 +518,26 @@ func nestedCompositeTableDB(t *testing.T) *Database {
 	return db
 }
 
+// sequenceTableDB pins the v12 sequence catalog entries (entry_kind 2 + name + six i64 fields +
+// the flags byte) and the emission order — sequence entries before the table entry
+// (spec/design/sequences.md §3). s1 is an ascending default sequence advanced three times
+// (is_called true, last_value 3, the default MAXVALUE i64::MAX — a large positive i64); s2 is a
+// fresh descending sequence (is_called false, negative increment/min/max/start — negative two's-
+// complement i64 — plus CACHE 5 + CYCLE, exercising both flag bits and the cache field). A one-row
+// table t follows, proving sequences and tables coexist in catalog order. Must match the Ruby
+// reference's SEQUENCE_TABLE (spec/fileformat/verify.rb).
+func sequenceTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE SEQUENCE s1")
+	run(t, db, "SELECT nextval('s1')")
+	run(t, db, "SELECT nextval('s1')")
+	run(t, db, "SELECT nextval('s1')")
+	run(t, db, "CREATE SEQUENCE s2 INCREMENT BY -2 MINVALUE -100 MAXVALUE -1 CACHE 5 CYCLE")
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
+	run(t, db, "INSERT INTO t VALUES (1, 10)")
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -554,6 +574,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"array_table.jed", arrayTableDB},
 		{"array_composite_table.jed", arrayCompositeTableDB},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB},
+		{"sequence_table.jed", sequenceTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -604,6 +625,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"array_table.jed", arrayTableDB, "t"},
 		{"array_composite_table.jed", arrayCompositeTableDB, "t"},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB, "t"},
+		{"sequence_table.jed", sequenceTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

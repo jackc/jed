@@ -32,6 +32,9 @@ const (
 	DivisionByZero
 	// InvalidParameterValue is 22023 — a bad numeric typmod (e.g. numeric(0)).
 	InvalidParameterValue
+	// SequenceGeneratorLimitExceeded is 2200H — nextval advanced past a sequence's
+	// MAXVALUE/MINVALUE bound without CYCLE (spec/design/sequences.md §4).
+	SequenceGeneratorLimitExceeded
 	// ArraySubscriptError is 2202E — a multidimensional array built/parsed with non-matching
 	// sub-array dimensions, or an array literal with inverted [l:u] bounds (spec/design/array.md §11).
 	ArraySubscriptError
@@ -63,6 +66,9 @@ const (
 	// InFailedSqlTransaction is 25P02 — a statement (other than ROLLBACK/COMMIT) in a failed
 	// transaction block; it stays poisoned until the block ends (transactions.md §6).
 	InFailedSqlTransaction
+	// ObjectNotInPrerequisiteState is 55000 — currval/lastval before nextval has defined the
+	// value in this session (spec/design/sequences.md §6).
+	ObjectNotInPrerequisiteState
 	// SyntaxError is 42601.
 	SyntaxError
 	// UndefinedTable is 42P01.
@@ -166,6 +172,8 @@ func (s SqlState) Code() string {
 		return "22012"
 	case InvalidParameterValue:
 		return "22023"
+	case SequenceGeneratorLimitExceeded:
+		return "2200H"
 	case ArraySubscriptError:
 		return "2202E"
 	case InvalidTextRepresentation:
@@ -190,6 +198,8 @@ func (s SqlState) Code() string {
 		return "25006"
 	case InFailedSqlTransaction:
 		return "25P02"
+	case ObjectNotInPrerequisiteState:
+		return "55000"
 	case SyntaxError:
 		return "42601"
 	case UndefinedTable:

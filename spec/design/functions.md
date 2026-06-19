@@ -541,9 +541,17 @@ input values to an output value, and it touches **nothing else**:
   `lo_import` / `COPY … TO/FROM` analogue), opens a socket, spawns a process, reads the
   environment, or otherwise escapes the engine. The query surface is curated; an escape hatch
   is **never added**, not merely gated.
-- **No hidden state.** A built-in does not mutate engine state outside the value it returns.
-  Evaluation order among side-effect-free nodes is therefore unobservable (which is also what
-  lets the planner reorder freely).
+- **No hidden state, with one curated exception.** A built-in does not mutate engine state
+  outside the value it returns — so evaluation order among side-effect-free nodes is unobservable
+  (which is also what lets the planner reorder freely). The **lone exception** is the sequence
+  generators `nextval`/`setval` (§14, [sequences.md](sequences.md)), which mutate **in-database
+  sequence state** — never host state. They remain untrusted-safe by the §13 criteria: the mutation
+  is deterministic (transactional, no seam — sequences.md §5), cost-bounded (the `sequence_advance`
+  unit + `max_cost`), and gated to the write path (`25006` on a read-only handle), exactly like the
+  `INSERT`/`UPDATE` mutations a query surface already exposes. A query that calls `nextval` advances a
+  counter inside the database it is querying; it cannot reach outside it. So "side-effect-free" is
+  the rule for *value* functions; the sequence generators are *mutation* functions, curated and
+  bounded, not an escape hatch.
 - **No unsanctioned nondeterminism.** The **only** window onto the outside world is the
   host-injected **entropy/clock seam** (§12, [entropy.md](entropy.md)): `uuidv4`/`uuidv7` read
   entropy, `now()`/`clock_timestamp()` read the clock, and **nothing else** does. These are
@@ -568,3 +576,25 @@ statement (`COPY … TO/FROM`, `CREATE FUNCTION`, `DO`, `LOAD`, `CREATE EXTENSIO
 `42601` (syntax_error). Because the surface is curated (an escape hatch is *never added*), the test
 is a tripwire: introducing any of them flips exactly one line from error to ok. It is jed-specific
 (PG provides these), so it is not oracle-checked.
+
+## 14. Sequence value functions (`nextval` / `currval`) — the first stateful built-ins
+
+`nextval('s')` / `currval('s')` ([sequences.md](sequences.md)) are the first built-ins that (a)
+resolve a **text argument to a catalog object** and (b) reach beyond a pure value→value map —
+`nextval` **mutates** the sequence counter (§13's curated exception). Both are `kind = "function"`,
+`arg_families = ["text"]`, `result = "int64"`, `null = "propagates"`, `volatility = "volatile"`.
+
+- **`nextval('s')`** advances sequence `s` and returns the new int64 value (PG-exact: the first call
+  returns `START`, subsequent calls add `INCREMENT`, bounded by `MIN/MAXVALUE` → `2200H` or `CYCLE`
+  wrap). Because it mutates, a statement containing it runs on the **write path** (so `SELECT
+  nextval('s')` commits a new snapshot) and is `25006` in a read-only transaction. The advance is
+  **transactional** — it rolls back with its transaction, jed's documented divergence from PG's
+  non-transactional sequences (sequences.md §5, mandated by [determinism.md §5](determinism.md)).
+- **`currval('s')`** returns the value `nextval('s')` last produced **in this session** (a per-handle
+  state read, not a snapshot read), `55000` before the first `nextval` this session. It is pure-read
+  (no write path).
+- A missing sequence is `42P01`; a NULL name propagates NULL. The argument is the bare sequence name
+  (the PG `'s'::regclass` form, regclass implicit). `setval`/`lastval` land in S2.
+
+These stay within the §13 untrusted-query guarantee: no host reach, deterministic, and cost-bounded
+(the `sequence_advance` cost unit, [cost.md](cost.md)).

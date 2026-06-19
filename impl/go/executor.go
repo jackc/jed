@@ -95,6 +95,12 @@ type Snapshot struct {
 	// namespace, globally unique). Which table owns an index is recorded in that table's
 	// Indexes list.
 	indexStores map[string]*TableStore
+	// sequences holds sequences, keyed by lowercased name (spec/design/sequences.md). A
+	// database-level object set separate from tables/types; serialized into the catalog's
+	// sequence entries (spec/fileformat/format.md, entry_kind = 2). The mutable counter
+	// (LastValue/IsCalled) lives here, so nextval advances the working snapshot and rolls back
+	// with it (sequences.md §5).
+	sequences map[string]*SequenceDef
 }
 
 // newSnapshot builds an empty snapshot.
@@ -104,6 +110,7 @@ func newSnapshot() *Snapshot {
 		types:       make(map[string]*CompositeType),
 		stores:      make(map[string]*TableStore),
 		indexStores: make(map[string]*TableStore),
+		sequences:   make(map[string]*SequenceDef),
 	}
 }
 
@@ -128,7 +135,13 @@ func (s *Snapshot) clone() *Snapshot {
 	for k, v := range s.indexStores {
 		indexStores[k] = v.clone()
 	}
-	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores}
+	// Sequences, like Table/CompositeType, are never mutated in place — only added/removed/replaced
+	// (nextval inserts a fresh struct) — so the map copy is shallow (spec/design/sequences.md §2).
+	sequences := make(map[string]*SequenceDef, len(s.sequences))
+	for k, v := range s.sequences {
+		sequences[k] = v
+	}
+	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences}
 }
 
 // table looks up a table definition by name (case-insensitive).
@@ -168,6 +181,38 @@ func (s *Snapshot) compositeTypesSorted() []*CompositeType {
 	out := make([]*CompositeType, len(keys))
 	for i, k := range keys {
 		out[i] = s.types[k]
+	}
+	return out
+}
+
+// sequence looks up a sequence definition by name (case-insensitive); nil if absent.
+func (s *Snapshot) sequence(name string) *SequenceDef {
+	return s.sequences[strings.ToLower(name)]
+}
+
+// putSequence registers a sequence (CREATE SEQUENCE). The lower-cased name is the key. The caller
+// has already validated the option set and checked the relation namespace for a collision.
+func (s *Snapshot) putSequence(seq *SequenceDef) {
+	s.sequences[strings.ToLower(seq.Name)] = seq
+}
+
+// removeSequence removes a sequence (DROP SEQUENCE). The caller has checked it exists.
+func (s *Snapshot) removeSequence(key string) {
+	delete(s.sequences, key)
+}
+
+// sequencesSorted returns all sequences in ascending lowercased-name order — the on-disk emission
+// order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak
+// (CLAUDE.md §8).
+func (s *Snapshot) sequencesSorted() []*SequenceDef {
+	keys := make([]string, 0, len(s.sequences))
+	for k := range s.sequences {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]*SequenceDef, len(keys))
+	for i, k := range keys {
+		out[i] = s.sequences[k]
 	}
 	return out
 }
@@ -506,6 +551,19 @@ type Database struct {
 	// provided SeededRandomSource + FixedClock (the # seed: / # clock: directives) for exact
 	// cross-core output. A handle setting, not stored in the file.
 	seam Seam
+	// sessionSeq is the per-handle SESSION sequence state for currval (spec/design/sequences.md §6):
+	// the last value nextval produced IN THIS SESSION for each sequence (lowercased name). NOT part
+	// of the snapshot and NOT persisted — strictly session-local, as in PostgreSQL. Updated when a
+	// sequence-advancing statement succeeds (flushing pendingSeq); currval of an unlisted sequence
+	// this session is 55000.
+	sessionSeq map[string]int64
+	// pendingSeq is the per-STATEMENT running sequence advances (spec/design/sequences.md §4): a
+	// nextval records its advance here (seeded from the working snapshot on first touch), so later
+	// nextval/currval calls in the same statement see the running state. On statement success it is
+	// flushed into the working snapshot (so commit persists it) + sessionSeq; on error it is
+	// discarded (the transactional rollback of the advance, sequences.md §5). Cleared at the start
+	// of every statement.
+	pendingSeq map[string]*SequenceDef
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
@@ -698,6 +756,9 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 	case stmt.Rollback != nil:
 		return db.rollbackTx()
 	}
+	// Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
+	// populated — it is discarded, not flushed, on error; sequences.md §5).
+	db.pendingSeq = nil
 
 	// Inside an explicit block?
 	if db.tx != nil {
@@ -718,6 +779,9 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 			db.tx.failed = true
 			return Outcome{}, err
 		}
+		// Land any nextval advances into the block's working snapshot; COMMIT publishes them,
+		// ROLLBACK discards them with the rest of the working set (sequences.md §5).
+		db.flushPendingSequences()
 		return outcome, nil
 	}
 
@@ -741,6 +805,9 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 		db.tx = nil
 		return Outcome{}, err
 	}
+	// Persist any nextval advances into the working snapshot before publishing it (sequences.md
+	// §5); a non-sequence statement flushes nothing.
+	db.flushPendingSequences()
 	if _, cerr := db.commitTx(); cerr != nil {
 		return Outcome{}, cerr
 	}
@@ -805,14 +872,312 @@ func (db *Database) rollbackTx() (Outcome, error) {
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
+// seqNextval implements nextval('name') (spec/design/sequences.md §4): advance the named sequence
+// and return the new value. The running state lives in pendingSeq, seeded from the working
+// snapshot on first touch this statement, and is flushed into the working snapshot + sessionSeq on
+// statement success (flushPendingSequences). A missing sequence is 42P01; advancing past a bound
+// without CYCLE is 2200H.
+func (db *Database) seqNextval(name string) (int64, error) {
+	key := strings.ToLower(name)
+	var def SequenceDef
+	if db.pendingSeq != nil {
+		if d, ok := db.pendingSeq[key]; ok {
+			def = *d
+		} else if snapDef := db.readSnap().sequence(name); snapDef != nil {
+			def = *snapDef
+		} else {
+			return 0, NewError(UndefinedTable, "relation does not exist: "+name)
+		}
+	} else if snapDef := db.readSnap().sequence(name); snapDef != nil {
+		def = *snapDef
+	} else {
+		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
+	}
+	var result int64
+	if !def.IsCalled {
+		// The first nextval returns START (the current LastValue) without incrementing.
+		def.IsCalled = true
+		result = def.LastValue
+	} else {
+		// Advance by increment, treating an int64 overflow or a bound crossing identically.
+		next, overflow := checkedAddInt64(def.LastValue, def.Increment)
+		inRange := !overflow &&
+			((def.Increment > 0 && next <= def.MaxValue) ||
+				(def.Increment < 0 && next >= def.MinValue))
+		if !inRange {
+			if def.Cycle {
+				if def.Increment > 0 {
+					next = def.MinValue
+				} else {
+					next = def.MaxValue
+				}
+			} else {
+				kind := "maximum"
+				if def.Increment < 0 {
+					kind = "minimum"
+				}
+				return 0, NewError(SequenceGeneratorLimitExceeded,
+					"nextval: reached "+kind+" value of sequence "+name)
+			}
+		}
+		def.LastValue = next
+		result = next
+	}
+	if db.pendingSeq == nil {
+		db.pendingSeq = make(map[string]*SequenceDef)
+	}
+	d := def
+	db.pendingSeq[key] = &d
+	return result, nil
+}
+
+// seqCurrval implements currval('name') (spec/design/sequences.md §6): the value nextval last
+// produced for this sequence IN THIS SESSION. Resolves the name against the catalog first (42P01
+// if absent), then reads the running advance this statement (pendingSeq) else the session value
+// (sessionSeq); 55000 if nextval has not been called this session.
+func (db *Database) seqCurrval(name string) (int64, error) {
+	if db.readSnap().sequence(name) == nil {
+		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
+	}
+	key := strings.ToLower(name)
+	if db.pendingSeq != nil {
+		if d, ok := db.pendingSeq[key]; ok && d.IsCalled {
+			return d.LastValue, nil
+		}
+	}
+	if v, ok := db.sessionSeq[key]; ok {
+		return v, nil
+	}
+	return 0, NewError(ObjectNotInPrerequisiteState,
+		"currval of sequence "+name+" is not yet defined in this session")
+}
+
+// flushPendingSequences lands the statement's pending sequence advances into the working snapshot
+// (so a commit persists them) and into sessionSeq (so currval sees them). Called on the success of
+// a sequence-advancing statement, while a write transaction is open; a no-op when nothing advanced.
+// On statement error the pending map is instead discarded (cleared at the next statement), giving
+// the transactional rollback of the advance (sequences.md §5).
+func (db *Database) flushPendingSequences() {
+	if db.pendingSeq == nil {
+		return
+	}
+	if db.sessionSeq == nil {
+		db.sessionSeq = make(map[string]int64)
+	}
+	for key, def := range db.pendingSeq {
+		db.working().putSequence(def)
+		db.sessionSeq[key] = def.LastValue
+	}
+	db.pendingSeq = nil
+}
+
+// checkedAddInt64 adds a + b, reporting overflow=true (and an undefined sum) when the result does
+// not fit in an int64 — the overflow-safe sequence advance (sequences.md §4).
+func checkedAddInt64(a, b int64) (sum int64, overflow bool) {
+	sum = a + b
+	// Overflow iff the operands share a sign that the sum does not.
+	if (a > 0 && b > 0 && sum < 0) || (a < 0 && b < 0 && sum >= 0) {
+		return 0, true
+	}
+	return sum, false
+}
+
 // stmtIsWrite reports whether a statement mutates the database (so autocommit must capture +
 // durably persist it, and a READ ONLY transaction must reject it — transactions.md §4.1/§4.3).
 // Reads (SELECT, set operations) and transaction control run with no data mutation.
 func stmtIsWrite(stmt Statement) bool {
-	return stmt.CreateTable != nil || stmt.DropTable != nil ||
+	if stmt.CreateTable != nil || stmt.DropTable != nil ||
 		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
 		stmt.CreateType != nil || stmt.DropType != nil ||
-		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil
+		stmt.CreateSequence != nil || stmt.DropSequence != nil ||
+		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil {
+		return true
+	}
+	// A read-shaped statement that calls a sequence-mutating function (nextval) IS a write
+	// (spec/design/sequences.md §4): it must take the write gate, stage the advance, and commit
+	// (autocommit) — and is 25006 in a READ ONLY transaction, exactly like any other write.
+	return stmtCallsSeqMutator(stmt)
+}
+
+// stmtCallsSeqMutator reports whether stmt's expression trees contain a sequence-MUTATING function
+// call (nextval; in S2, setval) anywhere — which makes an otherwise read-shaped statement a write
+// (sequences.md §4). Only the read-shaped statements need checking: INSERT/UPDATE/DELETE/DDL are
+// already writes (stmtIsWrite short-circuits before this), and an INSERT VALUES slot is
+// literal-only (no function call). currval is a pure read and is NOT counted. The Expr walk is
+// exhaustive, so no expression position is missed.
+func stmtCallsSeqMutator(stmt Statement) bool {
+	switch {
+	case stmt.Select != nil:
+		return selectCallsSeqMutator(stmt.Select)
+	case stmt.SetOp != nil:
+		return setopCallsSeqMutator(stmt.SetOp)
+	case stmt.With != nil:
+		for i := range stmt.With.Ctes {
+			if queryCallsSeqMutator(&stmt.With.Ctes[i].Query) {
+				return true
+			}
+		}
+		return queryCallsSeqMutator(&stmt.With.Body)
+	default:
+		return false
+	}
+}
+
+func queryCallsSeqMutator(qe *QueryExpr) bool {
+	if qe.Select != nil {
+		return selectCallsSeqMutator(qe.Select)
+	}
+	if qe.SetOp != nil {
+		return setopCallsSeqMutator(qe.SetOp)
+	}
+	return false
+}
+
+func setopCallsSeqMutator(so *SetOp) bool {
+	return queryCallsSeqMutator(&so.Lhs) || queryCallsSeqMutator(&so.Rhs)
+}
+
+func selectCallsSeqMutator(s *Select) bool {
+	for i := range s.Items.Items {
+		if exprCallsSeqMutator(&s.Items.Items[i].Expr) {
+			return true
+		}
+	}
+	if s.From != nil && tableRefCallsSeqMutator(s.From) {
+		return true
+	}
+	for i := range s.Joins {
+		if tableRefCallsSeqMutator(&s.Joins[i].Table) {
+			return true
+		}
+		if s.Joins[i].On != nil && exprCallsSeqMutator(s.Joins[i].On) {
+			return true
+		}
+	}
+	if s.Filter != nil && exprCallsSeqMutator(s.Filter) {
+		return true
+	}
+	for i := range s.GroupBy {
+		if exprCallsSeqMutator(&s.GroupBy[i]) {
+			return true
+		}
+	}
+	if s.Having != nil && exprCallsSeqMutator(s.Having) {
+		return true
+	}
+	return false
+}
+
+func tableRefCallsSeqMutator(t *TableRef) bool {
+	for _, a := range t.Args {
+		if exprCallsSeqMutator(a) {
+			return true
+		}
+	}
+	if t.Subquery != nil && queryCallsSeqMutator(t.Subquery) {
+		return true
+	}
+	for _, row := range t.Values {
+		for _, e := range row {
+			if exprCallsSeqMutator(e) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// exprCallsSeqMutator is exhaustive over Expr: true iff the tree contains a nextval call.
+func exprCallsSeqMutator(e *Expr) bool {
+	switch e.Kind {
+	case ExprFuncCall:
+		if strings.EqualFold(e.FuncCall.Name, "nextval") {
+			return true
+		}
+		for _, a := range e.FuncCall.Args {
+			if exprCallsSeqMutator(a) {
+				return true
+			}
+		}
+		return false
+	case ExprColumn, ExprQualifiedColumn, ExprLiteral, ExprTypedLiteral, ExprParam:
+		return false
+	case ExprRow, ExprArray:
+		for i := range e.RowItems {
+			if exprCallsSeqMutator(&e.RowItems[i]) {
+				return true
+			}
+		}
+		return false
+	case ExprFieldAccess, ExprFieldStar:
+		return exprCallsSeqMutator(e.Base)
+	case ExprSubscript:
+		if exprCallsSeqMutator(e.Base) {
+			return true
+		}
+		for i := range e.Subscripts {
+			sub := &e.Subscripts[i]
+			if sub.Index != nil && exprCallsSeqMutator(sub.Index) {
+				return true
+			}
+			if sub.Lower != nil && exprCallsSeqMutator(sub.Lower) {
+				return true
+			}
+			if sub.Upper != nil && exprCallsSeqMutator(sub.Upper) {
+				return true
+			}
+		}
+		return false
+	case ExprCast:
+		return exprCallsSeqMutator(&e.Cast.Inner)
+	case ExprUnary:
+		return exprCallsSeqMutator(&e.Unary.Operand)
+	case ExprIsNull:
+		return exprCallsSeqMutator(&e.IsNullOf.Operand)
+	case ExprBinary:
+		return exprCallsSeqMutator(&e.Binary.Lhs) || exprCallsSeqMutator(&e.Binary.Rhs)
+	case ExprIsDistinct:
+		return exprCallsSeqMutator(&e.IsDistinct.Lhs) || exprCallsSeqMutator(&e.IsDistinct.Rhs)
+	case ExprLike:
+		return exprCallsSeqMutator(&e.Like.Lhs) || exprCallsSeqMutator(&e.Like.Rhs)
+	case ExprIn:
+		if exprCallsSeqMutator(&e.In.Lhs) {
+			return true
+		}
+		for i := range e.In.List {
+			if exprCallsSeqMutator(&e.In.List[i]) {
+				return true
+			}
+		}
+		return false
+	case ExprBetween:
+		return exprCallsSeqMutator(&e.Between.Lhs) ||
+			exprCallsSeqMutator(&e.Between.Lo) ||
+			exprCallsSeqMutator(&e.Between.Hi)
+	case ExprCase:
+		if e.Case.Operand != nil && exprCallsSeqMutator(e.Case.Operand) {
+			return true
+		}
+		for i := range e.Case.Whens {
+			if exprCallsSeqMutator(&e.Case.Whens[i].Cond) || exprCallsSeqMutator(&e.Case.Whens[i].Result) {
+				return true
+			}
+		}
+		if e.Case.Els != nil && exprCallsSeqMutator(e.Case.Els) {
+			return true
+		}
+		return false
+	case ExprScalarSubquery, ExprExists:
+		return queryCallsSeqMutator(e.Subquery)
+	case ExprInSubquery:
+		return exprCallsSeqMutator(&e.InSubquery.Lhs) || queryCallsSeqMutator(&e.InSubquery.Query)
+	case ExprQuantifiedSubquery:
+		return exprCallsSeqMutator(&e.QuantifiedSubquery.Lhs) || queryCallsSeqMutator(&e.QuantifiedSubquery.Query)
+	case ExprQuantified:
+		return exprCallsSeqMutator(&e.Quantified.Lhs) || exprCallsSeqMutator(&e.Quantified.Array)
+	default:
+		return false
+	}
 }
 
 // stmtKind is a short label for a statement kind, for the 25006 read-only-violation message (the
@@ -831,6 +1196,10 @@ func stmtKind(stmt Statement) string {
 		return "CREATE TYPE"
 	case stmt.DropType != nil:
 		return "DROP TYPE"
+	case stmt.CreateSequence != nil:
+		return "CREATE SEQUENCE"
+	case stmt.DropSequence != nil:
+		return "DROP SEQUENCE"
 	case stmt.Insert != nil:
 		return "INSERT"
 	case stmt.Update != nil:
@@ -876,6 +1245,16 @@ func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error
 			return Outcome{}, err
 		}
 		return db.executeDropType(stmt.DropType)
+	case stmt.CreateSequence != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return Outcome{}, err
+		}
+		return db.executeCreateSequence(stmt.CreateSequence)
+	case stmt.DropSequence != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return Outcome{}, err
+		}
+		return db.executeDropSequence(stmt.DropSequence)
 	case stmt.Insert != nil:
 		return db.executeInsert(stmt.Insert, params)
 	case stmt.Select != nil:
@@ -1600,8 +1979,10 @@ func (db *Database) relationExists(name string) bool {
 	if _, ok := db.Table(name); ok {
 		return true
 	}
-	_, _, ok := db.findIndex(name)
-	return ok
+	if _, _, ok := db.findIndex(name); ok {
+		return true
+	}
+	return db.readSnap().sequence(name) != nil
 }
 
 // executeCreateIndex analyzes and runs a CREATE INDEX (spec/design/indexes.md §2).
@@ -1814,6 +2195,96 @@ func (db *Database) executeDropType(dt *DropType) (Outcome, error) {
 			"cannot drop type "+dt.Name+" because other objects depend on it: "+dep)
 	}
 	db.working().removeType(strings.ToLower(dt.Name))
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// executeCreateSequence analyzes and runs a CREATE SEQUENCE (spec/design/sequences.md). Resolve
+// the option overrides against the INCREMENT sign's type defaults, validate the set (22023),
+// reject a relation-namespace collision (42P07 unless IF NOT EXISTS), and register the sequence.
+func (db *Database) executeCreateSequence(cs *CreateSequence) (Outcome, error) {
+	if db.relationExists(cs.Name) {
+		if cs.IfNotExists {
+			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+		}
+		return Outcome{}, NewError(DuplicateTable, "relation already exists: "+cs.Name)
+	}
+	increment := int64(1)
+	if cs.Increment != nil {
+		increment = *cs.Increment
+	}
+	if increment == 0 {
+		return Outcome{}, NewError(InvalidParameterValue, "INCREMENT must not be zero")
+	}
+	cache := int64(1)
+	if cs.Cache != nil {
+		cache = *cs.Cache
+	}
+	if cache < 1 {
+		return Outcome{}, NewError(InvalidParameterValue,
+			fmt.Sprintf("CACHE (%d) must be greater than zero", cache))
+	}
+	defMin, defMax := DefaultBounds(increment)
+	// A non-nil SeqBound with NoValue selects the default; with a value sets the explicit bound; a
+	// nil SeqBound means the option was unset → the default (the Rust Some(Some)/Some(None)/None).
+	minValue := defMin
+	if cs.MinValue != nil && !cs.MinValue.NoValue {
+		minValue = cs.MinValue.Value
+	}
+	maxValue := defMax
+	if cs.MaxValue != nil && !cs.MaxValue.NoValue {
+		maxValue = cs.MaxValue.Value
+	}
+	if minValue > maxValue {
+		return Outcome{}, NewError(InvalidParameterValue,
+			fmt.Sprintf("MINVALUE (%d) must be less than MAXVALUE (%d)", minValue, maxValue))
+	}
+	// START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
+	start := minValue
+	if increment < 0 {
+		start = maxValue
+	}
+	if cs.Start != nil {
+		start = *cs.Start
+	}
+	if start < minValue || start > maxValue {
+		if start < minValue {
+			return Outcome{}, NewError(InvalidParameterValue,
+				fmt.Sprintf("START value (%d) cannot be less than MINVALUE the %d value", start, minValue))
+		}
+		return Outcome{}, NewError(InvalidParameterValue,
+			fmt.Sprintf("START value (%d) cannot be greater than MAXVALUE the %d value", start, maxValue))
+	}
+	cycle := false
+	if cs.Cycle != nil {
+		cycle = *cs.Cycle
+	}
+	db.working().putSequence(&SequenceDef{
+		Name:      cs.Name,
+		Increment: increment,
+		MinValue:  minValue,
+		MaxValue:  maxValue,
+		Start:     start,
+		Cache:     cache,
+		Cycle:     cycle,
+		LastValue: start,
+		IsCalled:  false,
+	})
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// executeDropSequence analyzes and runs a DROP SEQUENCE (spec/design/sequences.md §1).
+// RESTRICT-only: a missing sequence is 42P01 unless IF EXISTS. No dependency tracking this slice
+// (a plain DEFAULT nextval('s') creates none — PG). Multiple names are dropped left to right.
+func (db *Database) executeDropSequence(ds *DropSequence) (Outcome, error) {
+	for _, name := range ds.Names {
+		if db.readSnap().sequence(name) == nil {
+			if ds.IfExists {
+				continue
+			}
+			return Outcome{}, NewError(UndefinedTable, "sequence does not exist: "+name)
+		}
+		db.working().removeSequence(strings.ToLower(name))
+	}
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
@@ -6694,6 +7165,12 @@ const (
 	// timestamptz, the clock seam read on EVERY call (VOLATILE).
 	sfNow
 	sfClockTimestamp
+	// sequence value functions (spec/design/sequences.md §4/§6): sfNextval(text) → int64 advances
+	// the named sequence and MUTATES the per-statement pending state (write path); sfCurrval(text)
+	// → int64 is a pure session-state read. Both resolve their text argument to a catalog sequence
+	// at eval.
+	sfNextval
+	sfCurrval
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -7885,6 +8362,12 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfNow
 	case "clock_timestamp":
 		return sfClockTimestamp
+	// Sequence value functions (sequences.md §4). nextval MUTATES (write path); both resolve their
+	// text argument to a catalog sequence at eval.
+	case "nextval":
+		return sfNextval
+	case "currval":
+		return sfCurrval
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -12036,6 +12519,23 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return TimestamptzValue(env.rng.statementClockMicros(&env.exec.seam)), nil
 		case sfClockTimestamp:
 			return TimestamptzValue(env.rng.clockNowMicros(&env.exec.seam)), nil
+		case sfNextval:
+			// Sequence value functions (spec/design/sequences.md §4/§6). nextval charges an
+			// additional sequence_advance unit (the catalog-tuple read+rewrite) and mutates the
+			// per-statement pending state; currval is a pure session-state read. The NULL-arg case
+			// is handled by the blanket propagation above.
+			m.Charge(Costs.SequenceAdvance)
+			n, err := env.exec.seqNextval(vals[0].Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntValue(n), nil
+		case sfCurrval:
+			n, err := env.exec.seqCurrval(vals[0].Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntValue(n), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; float64 for the rest, per the catalog).

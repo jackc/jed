@@ -1,0 +1,127 @@
+# nextval('s') / currval('s') — the sequence value functions (spec/design/sequences.md §4/§6,
+# functions.md §14). nextval advances the named sequence and returns the new int64 value (first
+# call returns START, then +INCREMENT, bounded by MIN/MAXVALUE → 2200H or CYCLE wrap); currval
+# returns the value nextval last produced IN THIS SESSION (55000 before the first nextval). nextval
+# makes the statement a write and charges one sequence_advance unit beyond its operator_eval.
+#
+# Corpus structure (oracle-reproducible): an advance whose effect a LATER statement observes is
+# written `statement ok SELECT nextval(...)` — a side-effecting statement the PostgreSQL oracle
+# harness replays in every row's prefix, matching jed's sequential execution — and the value is read
+# with a trailing `query` that is the sequence's LAST observation (a `query nextval` advances too, so
+# it must be terminal for that sequence). The transactional-rollback divergence (nextval rolls back —
+# sequences.md §5), the read-only 25006, and session-locality across handles are per-core unit tests.
+# requires: func.sequence, ddl.sequence, query.select, types.int64, resource.cost_metering
+
+statement ok
+CREATE SEQUENCE s
+
+# the first nextval returns START (1); the next adds INCREMENT (1). The advance to 1 is `statement
+# ok` (replayed) so the trailing `query` reads 2.
+statement ok
+SELECT nextval('s')
+
+# a single nextval charges 1 operator_eval + 1 sequence_advance, plus 1 row_produced
+# cost: 3
+query I nosort
+SELECT nextval('s')
+----
+2
+
+# currval returns the value nextval last produced this session (no advance of its own)
+statement ok
+CREATE SEQUENCE c
+
+statement ok
+SELECT nextval('c')
+
+query I nosort
+SELECT currval('c')
+----
+1
+
+# nextval and currval in one statement: currval sees the just-produced value
+statement ok
+CREATE SEQUENCE d
+
+statement ok
+SELECT nextval('d')
+
+query II nosort
+SELECT nextval('d'), currval('d')
+----
+2
+2
+
+# currval before any nextval THIS SESSION for a fresh sequence is 55000
+statement ok
+CREATE SEQUENCE fresh
+
+statement error 55000
+SELECT currval('fresh')
+
+# nextval/currval on a missing sequence is 42P01
+statement error 42P01
+SELECT nextval('nope')
+
+statement error 42P01
+SELECT currval('nope')
+
+# --- INCREMENT / START ------------------------------------------------------
+
+statement ok
+CREATE SEQUENCE step INCREMENT BY 10 START WITH 100
+
+statement ok
+SELECT nextval('step')
+
+query I nosort
+SELECT nextval('step')
+----
+110
+
+# --- bounds (2200H) and CYCLE -----------------------------------------------
+
+statement ok
+CREATE SEQUENCE cap MAXVALUE 2
+
+statement ok
+SELECT nextval('cap')
+
+statement ok
+SELECT nextval('cap')
+
+# past MAXVALUE without CYCLE is 2200H (sequence_generator_limit_exceeded)
+statement error 2200H
+SELECT nextval('cap')
+
+# with CYCLE, nextval wraps to MINVALUE at the bound
+statement ok
+CREATE SEQUENCE wrap MAXVALUE 2 CYCLE
+
+statement ok
+SELECT nextval('wrap')
+
+statement ok
+SELECT nextval('wrap')
+
+query I nosort
+SELECT nextval('wrap')
+----
+1
+
+# a descending sequence reaches MINVALUE then 2200H
+statement ok
+CREATE SEQUENCE down INCREMENT BY -1 MINVALUE -2 MAXVALUE -1
+
+statement ok
+SELECT nextval('down')
+
+statement ok
+SELECT nextval('down')
+
+statement error 2200H
+SELECT nextval('down')
+
+# clean up the live oracle (autocommit DDL persists across corpus:check files)
+statement ok
+DROP SEQUENCE s, c, d, fresh, step, cap, wrap, down

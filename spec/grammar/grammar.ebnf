@@ -46,6 +46,8 @@ sql_statement  ::= create_table
                  | drop_table
                  | create_index
                  | drop_index
+                 | create_sequence
+                 | drop_sequence
                  | insert
                  | query_statement
                  | update
@@ -188,6 +190,30 @@ drop_table     ::= "DROP" "TABLE" identifier
 create_index   ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" identifier
                    "(" identifier ("," identifier)* ")"
 drop_index     ::= "DROP" "INDEX" identifier
+
+/* CREATE SEQUENCE declares a named, persisted int64 generator (../design/sequences.md). The
+ * options may appear in any order, each at most once (a repeat is 42601). "INCREMENT" and
+ * "START" take an optional "BY"/"WITH"; option values are signed integer literals. "NO MINVALUE"
+ * / "NO MAXVALUE" select the type defaults; "CACHE" is parsed and stored but behaves as 1 (§7).
+ * The name shares the relation namespace (a collision with a table/index/sequence is 42P07
+ * unless IF NOT EXISTS). INCREMENT 0, CACHE < 1, or an inconsistent START/MIN/MAX is 22023.
+ * Deferred this slice (each simply absent from the grammar): "AS <type>" (bigint-only, 0A000),
+ * OWNED BY, ALTER SEQUENCE, CASCADE.
+ *
+ * DROP SEQUENCE removes one or more sequences by name: a missing sequence is 42P01 (the relation
+ * namespace) unless IF EXISTS; RESTRICT (the default and only mode this slice — CASCADE 0A000). */
+create_sequence ::= "CREATE" "SEQUENCE" ("IF" "NOT" "EXISTS")? identifier sequence_option*
+sequence_option ::= "INCREMENT" "BY"? signed_integer
+                  | "MINVALUE" signed_integer | "NO" "MINVALUE"
+                  | "MAXVALUE" signed_integer | "NO" "MAXVALUE"
+                  | "START" "WITH"? signed_integer
+                  | "CACHE" signed_integer
+                  | "CYCLE" | "NO" "CYCLE"
+signed_integer ::= "-"? integer
+drop_sequence  ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier)* "RESTRICT"?
+
+/* nextval('s') / currval('s') (../design/sequences.md §4) are ordinary function calls — no new
+ * production; they resolve their text argument to a sequence in the catalog at evaluation. */
 
 /* type_name is an identifier, optionally followed by a parenthesized type modifier
  * (precision, optional scale) — `decimal` is the FIRST parameterized type. The name is

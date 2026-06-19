@@ -121,6 +121,46 @@ export type CompositeField = {
   notNull: boolean;
 };
 
+// SequenceDef is a SEQUENCE (spec/design/sequences.md): a named, persisted, monotonic int64
+// generator — the third database-level catalog-object kind (after tables and composite types). The
+// definition fields (increment/minValue/maxValue/start/cache/cycle) are immutable; lastValue +
+// isCalled are the mutable counter state a nextval advances. The whole struct lives in the snapshot
+// catalog, so the counter is transactional by construction (sequences.md §5). The int64 fields are
+// bigint (the TS core's exact-int64 representation).
+export type SequenceDef = {
+  // The sequence name (original case; looked up case-insensitively).
+  name: string;
+  // The step per nextval (non-zero). Positive = ascending, negative = descending.
+  increment: bigint;
+  // The inclusive lower bound.
+  minValue: bigint;
+  // The inclusive upper bound.
+  maxValue: bigint;
+  // The first value nextval returns (on a fresh sequence, lastValue === start).
+  start: bigint;
+  // The PostgreSQL CACHE size — stored for fidelity but behaves as 1 (sequences.md §7).
+  cache: bigint;
+  // Whether nextval wraps at a bound (CYCLE) instead of raising 2200H.
+  cycle: boolean;
+  // The mutable counter: the most recent value produced (or start before the first call).
+  lastValue: bigint;
+  // Whether nextval has been called: false ⇒ the next call returns lastValue (= start) without
+  // incrementing; true ⇒ it adds increment (PostgreSQL's is_called).
+  isCalled: boolean;
+};
+
+// I64_MAX is the int64 maximum (2^63-1), the default ascending MAXVALUE / descending floor base.
+export const I64_MAX = 9223372036854775807n;
+
+// defaultSequenceBounds is the type defaults for an ascending (increment > 0) vs descending sequence,
+// before any explicit MIN/MAX/START override (PostgreSQL): ascending ⇒ [1, i64::MAX], start = MIN;
+// descending ⇒ [-(i64::MAX), -1], start = MAX. (i64::MIN is reserved out of the default descending
+// floor, matching PG's -9223372036854775807 default MINVALUE.) Returns [min, max].
+export function defaultSequenceBounds(increment: bigint): [bigint, bigint] {
+  if (increment < 0n) return [-I64_MAX, -1n];
+  return [1n, I64_MAX];
+}
+
 // ColType is a fully-resolved storage/codec column type (spec/design/composite.md §4): a scalar,
 // or a composite resolved to the codec/coercion tree of its fields. Built ONCE from a catalog
 // Type against the snapshot's composite-type definitions (resolveColType) and held by the

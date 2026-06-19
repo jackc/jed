@@ -1,6 +1,9 @@
 package jed
 
-import "strings"
+import (
+	"math"
+	"strings"
+)
 
 // Column is a column definition: name, declared type, nullability, primary-key flag.
 type Column struct {
@@ -101,6 +104,45 @@ type IndexDef struct {
 	Name    string
 	Columns []int
 	Unique  bool
+}
+
+// SequenceDef is a sequence (spec/design/sequences.md): a named, persisted, monotonic int64
+// generator — the third database-level catalog-object kind (after tables and composite types).
+// The definition fields (Increment/MinValue/MaxValue/Start/Cache/Cycle) are immutable; LastValue
+// + IsCalled are the mutable counter state a nextval advances. The whole struct lives in the
+// snapshot catalog, so the counter is transactional by construction (sequences.md §5).
+type SequenceDef struct {
+	// Name is the sequence name (original case; looked up case-insensitively).
+	Name string
+	// Increment is the step per nextval (non-zero). Positive = ascending, negative = descending.
+	Increment int64
+	// MinValue is the inclusive lower bound.
+	MinValue int64
+	// MaxValue is the inclusive upper bound.
+	MaxValue int64
+	// Start is the first value nextval returns (on a fresh sequence, LastValue == Start).
+	Start int64
+	// Cache is the PostgreSQL CACHE size — stored for fidelity but behaves as 1 (sequences.md §7).
+	Cache int64
+	// Cycle is whether nextval wraps at a bound (CYCLE) instead of raising 2200H.
+	Cycle bool
+	// LastValue is the mutable counter: the most recent value produced (or Start before the first
+	// call).
+	LastValue int64
+	// IsCalled is whether nextval has been called: false ⇒ the next call returns LastValue (=
+	// Start) without incrementing; true ⇒ it adds Increment (PostgreSQL's is_called).
+	IsCalled bool
+}
+
+// DefaultBounds returns the type defaults for an ascending (increment > 0) vs descending
+// sequence, before any explicit MIN/MAX/START override (PostgreSQL): ascending ⇒ [1, MaxInt64],
+// start = MIN; descending ⇒ [-MaxInt64, -1], start = MAX. (MinInt64 is reserved out of the
+// default descending floor, matching PG's -9223372036854775807 default MINVALUE.)
+func DefaultBounds(increment int64) (int64, int64) {
+	if increment < 0 {
+		return -math.MaxInt64, -1
+	}
+	return 1, math.MaxInt64
 }
 
 // CompositeType is a user-defined composite (row) type (spec/design/composite.md): a named,

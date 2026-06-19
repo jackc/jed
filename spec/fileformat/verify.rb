@@ -14,7 +14,12 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 11 # format_version 11: FOREIGN KEY constraints — the table catalog entry gains a
+VERSION = 12 # format_version 12: SEQUENCES — a third kind-tagged catalog entry (entry_kind u8: 2 =
+# sequence; joining 0 table, 1 composite-type). A sequence entry is name + six fixed i64 fields
+# (increment, min_value, max_value, start, cache, last_value; big-endian two's-complement, no
+# sign-flip) + a flags byte (bit0 cycle, bit1 is_called). Emission order: composites (1), sequences
+# (2), tables (0), each name-sorted. A sequence owns no B-tree (spec/design/sequences.md §3).
+# format_version 11 was FOREIGN KEY constraints — the table catalog entry gains a
 # foreign-key list (fk_count + per FK: name, local ordinals, ref table, ref ordinals, actions byte)
 # after the index list, before root_data_page (spec/design/constraints.md §6, format.md). An FK owns
 # no B-tree (no root page); a file with no FKs still moves to v11 (every table entry gains fk_count=0).
@@ -92,6 +97,17 @@ end
 
 # A composite (row) type definition (`CREATE TYPE name AS (...)`): a name + ordered field list.
 def ctype(name, fields) = { name: name, fields: fields }
+
+# A sequence definition (`CREATE SEQUENCE name ...`, spec/design/sequences.md §3). The six i64
+# fields + the cycle/is_called flags exactly as the cores persist them; `last_value` defaults to
+# `start` (a fresh sequence). The on-disk entry is fixed-width — every field present (format.md
+# *Sequence entry*).
+def seq(name, increment:, min_value:, max_value:, start:, cache: 1, cycle: false,
+        last_value: nil, is_called: false)
+  { name: name, increment: increment, min_value: min_value, max_value: max_value,
+    start: start, cache: cache, cycle: cycle,
+    last_value: last_value.nil? ? start : last_value, is_called: is_called }
+end
 
 # A composite type defined, persisted, AND used by a stored column (S3 — composite.md §4). The
 # value codec is pinned: row 1 has both fields present; row 2's `zip` is NULL (the bitmap's bit 1
@@ -568,6 +584,28 @@ FK_TABLE = {
   ]
 }.freeze
 
+# SEQUENCES (v12 — spec/design/sequences.md §3): pins the sequence catalog entry (entry_kind 2 +
+# name + six i64 fields + the flags byte) AND the emission order — sequence entries (kind 2) before
+# table entries (kind 0). Two sequences: `s1` is an ASCENDING default sequence advanced three times
+# (is_called true, last_value 3, default MAXVALUE i64::MAX — pins a large positive i64) and `s2` is a
+# DESCENDING fresh one (is_called false, NEGATIVE increment/min/max/start — pins negative two's-
+# complement i64 — plus a non-default CACHE 5 and CYCLE, so both flag bits and the cache field are
+# exercised). A one-row table `t` follows, proving sequences and tables coexist in catalog order. The
+# cores build this via
+#   CREATE SEQUENCE s1; SELECT nextval('s1') [×3];
+#   CREATE SEQUENCE s2 INCREMENT BY -2 MINVALUE -100 MAXVALUE -1 CACHE 5 CYCLE;
+#   CREATE TABLE t (id int32 PRIMARY KEY, v int32); INSERT INTO t VALUES (1, 10)
+SEQUENCE_TABLE = {
+  sequences: [
+    seq("s1", increment: 1, min_value: 1, max_value: 9_223_372_036_854_775_807, start: 1,
+        cache: 1, cycle: false, last_value: 3, is_called: true),
+    seq("s2", increment: -2, min_value: -100, max_value: -1, start: -1,
+        cache: 5, cycle: true, last_value: -1, is_called: false)
+  ],
+  tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("v", "int32")],
+             rows: [[1, 10]] }]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -606,6 +644,8 @@ FIXTURES = [
     types: COMPOSITE_ARRAY_FIELD_TABLE[:types], tables: COMPOSITE_ARRAY_FIELD_TABLE[:tables] },
   { file: "nested_composite_table.jed", page_size: 256,
     types: NESTED_COMPOSITE_TABLE[:types], tables: NESTED_COMPOSITE_TABLE[:tables] },
+  { file: "sequence_table.jed", page_size: 256,
+    sequences: SEQUENCE_TABLE[:sequences], tables: SEQUENCE_TABLE[:tables] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
@@ -968,6 +1008,26 @@ def composite_type_entry_bytes(ct)
   out
 end
 
+# Serialize a sequence catalog entry's BODY (after the entry_kind=2 byte), v12: name, then six fixed
+# i64 fields (big-endian two's-complement, no sign-flip — `q>`) and a flags byte (bit0 cycle, bit1
+# is_called). Fixed-width, every field present (spec/design/sequences.md §3, format.md *Sequence
+# entry*).
+def sequence_entry_bytes(s)
+  out = +"".b
+  out << u16(s[:name].bytesize) << s[:name].b
+  out << [s[:increment]].pack("q>")
+  out << [s[:min_value]].pack("q>")
+  out << [s[:max_value]].pack("q>")
+  out << [s[:start]].pack("q>")
+  out << [s[:cache]].pack("q>")
+  out << [s[:last_value]].pack("q>")
+  flags = 0
+  flags |= 0b1 if s[:cycle]
+  flags |= 0b10 if s[:is_called]
+  out << [flags].pack("C")
+  out
+end
+
 # (key, row) pairs in stored (encoded-key) order. PK tables key on the PK member columns —
 # the key is the CONCATENATION of the members' encodings in KEY order (a composite
 # PRIMARY KEY, ../design/encoding.md §2.3; a single-column key is the one-member case).
@@ -1285,13 +1345,14 @@ end
 # A from-scratch image (format.md "Allocation & incremental commit"): the special case where
 # every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
 # catalog chain, then both meta slots at txid 1.
-def build_image(types, tables, page_size)
+def build_image(types, sequences, tables, page_size)
   ps = page_size
   cap = ps - PAGE_HEADER
   # Composite types in scope for the recursive value codec, keyed by lowercased name (§4).
   $ctypes = types.to_h { |t| [t[:name].downcase, t[:fields]] }
   sorted = tables.sort_by { |t| t[:name].downcase }
   sorted_types = types.sort_by { |t| t[:name].downcase }
+  sorted_seqs = sequences.sort_by { |s| s[:name].downcase }
 
   data_pages = {} # index => [page_type, item_count, payload]
   root_data = Array.new(sorted.size, 0)
@@ -1311,11 +1372,12 @@ def build_image(types, tables, page_size)
     end
   end
 
-  # Catalog entries are kind-tagged (v9): composite-type entries (kind 1, name order) first, then
-  # table entries (kind 0) — format.md.
+  # Catalog entries are kind-tagged: composite-type entries (kind 1, name order) first, then
+  # sequence entries (kind 2, name order, v12), then table entries (kind 0) — format.md.
   cat_root = next_index
   cat_entries = []
   sorted_types.each { |ct| cat_entries << ("\x01".b + composite_type_entry_bytes(ct)) }
+  sorted_seqs.each { |s| cat_entries << ("\x02".b + sequence_entry_bytes(s)) }
   sorted.each_with_index { |t, ti| cat_entries << ("\x00".b + table_entry_bytes(t, root_data[ti], index_roots[ti])) }
   cat_groups = pack(cat_entries.map(&:bytesize), cap)
   page_count = cat_root + cat_groups.size
@@ -1338,7 +1400,7 @@ end
 
 # The bytes a fixture should contain (applying any torn-slot corruption).
 def fixture_image(fx)
-  image = build_image(fx[:types] || [], fx[:tables], fx[:page_size])
+  image = build_image(fx[:types] || [], fx[:sequences] || [], fx[:tables], fx[:page_size])
   if fx[:corrupt_slot]
     off = fx[:corrupt_slot] * fx[:page_size] + 35 # last CRC byte of that slot
     image.setbyte(off, image.getbyte(off) ^ 0xFF)
@@ -1843,6 +1905,7 @@ def decode_image(image)
   ps = image.byteslice(8, 4).unpack1("N")
   meta = select_meta(image, ps)
   types = []
+  sequences = []
   tables = []
   # Composite types in scope for the recursive value codec; populated as the (types-first) catalog
   # is read, so every composite a table row references is registered before its rows are decoded.
@@ -1854,12 +1917,17 @@ def decode_image(image)
 
     pos = 0
     pg[:item_count].times do
-      kb, pos = take(pg[:payload], pos, 1) # entry_kind (v9): 0 table, 1 composite type
+      kb, pos = take(pg[:payload], pos, 1) # entry_kind: 0 table, 1 composite type, 2 sequence (v12)
       kind = kb.getbyte(0)
       if kind == 1
         ct, pos = decode_composite_type_entry(pg[:payload], pos)
         types << ct
         $ctypes[ct[:name].downcase] = ct[:fields]
+        next
+      end
+      if kind == 2
+        s, pos = decode_sequence_entry(pg[:payload], pos)
+        sequences << s
         next
       end
       raise "unknown catalog entry kind #{kind}" unless kind.zero?
@@ -1875,7 +1943,32 @@ def decode_image(image)
     end
     cat = pg[:next_page]
   end
-  { types: types, tables: tables }
+  { types: types, sequences: sequences, tables: tables }
+end
+
+# Decode a sequence catalog entry's body (inverse of sequence_entry_bytes); the caller has consumed
+# the entry_kind byte. Six i64 fields (`q>`) + the flags byte (spec/design/sequences.md §3).
+def decode_sequence_entry(buf, pos)
+  nl, pos = take(buf, pos, 2)
+  name, pos = take(buf, pos, nl.unpack1("n"))
+  fields = {}
+  %i[increment min_value max_value start cache last_value].each do |f|
+    raw, pos = take(buf, pos, 8)
+    fields[f] = raw.unpack1("q>")
+  end
+  fb, pos = take(buf, pos, 1)
+  flags = fb.getbyte(0)
+  raise "reserved sequence flag set" if (flags & ~0b11) != 0
+
+  [{ name: name, increment: fields[:increment], min_value: fields[:min_value],
+     max_value: fields[:max_value], start: fields[:start], cache: fields[:cache],
+     cycle: (flags & 0b1) != 0, last_value: fields[:last_value],
+     is_called: (flags & 0b10) != 0 }, pos]
+end
+
+# The sequence content a fixture should decode to (name-sorted).
+def expected_sequences(fx)
+  (fx[:sequences] || []).sort_by { |s| s[:name].downcase }
 end
 
 # The composite-type content a fixture should decode to (name-sorted, normalized fields).
@@ -2028,6 +2121,13 @@ def verify
     decoded[:types].each_with_index do |t, i|
       unless content_equal?(t, want_types[i])
         fail!("#{fx[:file]}: type #{i} mismatch\n  got:  #{t.inspect}\n  want: #{want_types[i].inspect}")
+      end
+    end
+    want_seqs = expected_sequences(fx)
+    fail!("#{fx[:file]}: decoded #{decoded[:sequences].size} sequences, expected #{want_seqs.size}") unless decoded[:sequences].size == want_seqs.size
+    decoded[:sequences].each_with_index do |s, i|
+      unless content_equal?(s, want_seqs[i])
+        fail!("#{fx[:file]}: sequence #{i} mismatch\n  got:  #{s.inspect}\n  want: #{want_seqs[i].inspect}")
       end
     end
   end

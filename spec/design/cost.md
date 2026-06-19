@@ -525,6 +525,19 @@ but charges no `row_produced`. Worked examples (all asserted in the corpus):
   (`page_read` + 3 `storage_row_read`) **+ 3 `generated_row`** (the series is materialized once,
   like any join operand) + 9 `row_produced` for the product.
 
+### `sequence_advance` — a sequence mutation
+
+`nextval('s')` (and, from S2, `setval`) advances a sequence's catalog tuple, more than a pure
+value→value map, so it charges one **`sequence_advance`** unit **in addition** to the one
+`operator_eval` every function call rides ([sequences.md](sequences.md) §8). The catalog-tuple
+read+rewrite is schema-bounded (a fixed `SequenceDef`), so a flat per-call weight is a sound bound;
+it keeps a runaway `nextval` (e.g. `SELECT nextval('s') FROM generate_series(1, 10^18)`) bounded by
+`max_cost` — the `54P01` ceiling aborts deterministically. `currval('s')` reads only per-session
+state and charges nothing beyond its `operator_eval`. Worked example:
+
+- `SELECT nextval('s')` — 1 `operator_eval` (the call) + 1 `sequence_advance` = **2** (plus 1
+  `row_produced` for the result row).
+
 A correlated SRF argument (`generate_series(1, o.n)` inside a subquery) re-evaluates its arguments
 and re-generates per outer row, exactly like a correlated subquery's inner re-scan (the Subqueries
 subsection) — so the generated rows accrue per outer row.

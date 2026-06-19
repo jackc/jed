@@ -67,6 +67,13 @@ name = "division_by_zero"
 class = "data exception"
 template = "division by zero"
 
+# nextval past a sequence bound without CYCLE (../design/sequences.md §4/§9).
+[[error]]
+code = "2200H"
+name = "sequence_generator_limit_exceeded"
+class = "data exception"
+template = "nextval: reached {bound} value of sequence {sequence}"
+
 [[error]]
 code = "2201W"
 name = "invalid_row_count_in_limit_clause"
@@ -367,6 +374,15 @@ code = "54P01"
 name = "cost_limit_exceeded"
 class = "program limit exceeded"
 template = "query exceeded the cost limit of {limit} (accrued {cost})"
+
+# --- invalid object state (class 55) ----------------------------------------
+# currval/lastval before nextval has defined the value in this session
+# (../design/sequences.md §6).
+[[error]]
+code = "55000"
+name = "object_not_in_prerequisite_state"
+class = "object not in prerequisite state"
+template = "{detail}"
 
 # --- system error / host filesystem (class 58) ------------------------------
 # Raised by the host API's file layer (spec/design/api.md), never by the SQL

@@ -525,6 +525,29 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.
       → [grammar.md §32](spec/design/grammar.md)
   - [ ] _follow-on:_ the `WITH (OLD AS o, NEW AS n)` aliasing form; `old.*`/`new.*`.
+- [ ] **Sequences** (`CREATE SEQUENCE` / `nextval` / `currval`) — the PostgreSQL sequence object as
+      a third catalog-object kind (after tables + composite types): a named, persisted, monotonic
+      **int64** generator in `Snapshot.sequences`, advanced by `nextval('s')` and read by
+      `currval('s')` (session-local). **The defining decision — `nextval` is TRANSACTIONAL** (rolls
+      back with the txn), a deliberate PG divergence already mandated by
+      [determinism.md §5](spec/design/determinism.md) ("do not exempt" the counter): jed is
+      single-writer, so PG's non-transactional gap optimization is unneeded and would force a seam +
+      determinism-ledger exemption. New `entry_kind = 2` catalog entry, **`format_version` 12**, a
+      `sequence_advance` cost unit; `nextval`/`setval` make a statement a write (`25006` in a
+      read-only txn). → [sequences.md](spec/design/sequences.md) _(size: XL; §4/§8)_
+  - [x] **S0** — `spec/design/sequences.md` + the error registrations (`2200H`/`55000`) + the §5
+        transactional-divergence record + this TODO touch. Decisions ratified spec-first.
+  - [ ] **S1** — `CREATE`/`DROP SEQUENCE` (full option grammar) + the `sequences` catalog map +
+        `format_version` 12 + the `sequence_table.jed` golden (`rust == go == ts == ruby`) +
+        `nextval` + `currval` + the `sequence_advance` unit + write-path detection + read-only
+        `25006` + corpus (`ddl/sequence.test`, `expr/sequence_value.test`) + capabilities
+        `ddl.sequence`/`func.sequence`. The "it's alive" slice. _(size: L)_
+  - [ ] **S2** — `setval(s,n[,is_called])` + `lastval()` + `ALTER SEQUENCE … RESTART` + corpus
+        coverage of `CYCLE` wraparound and the `2200H` bound errors. _(size: M)_
+  - [ ] **S3** — `serial` / `bigserial` / `smallserial` pseudo-types (owned sequence + `DEFAULT
+        nextval(...)` + `OWNED BY` auto-drop; `2BP01` dependency tracking). _(size: M–L)_
+  - [ ] **S4** — `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` columns + `OVERRIDING … VALUE`.
+        _(size: L)_
 - [ ] **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE ✅, RETURNING ✅ — unblocked)_
 - [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
       `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).

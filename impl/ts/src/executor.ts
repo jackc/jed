@@ -7,10 +7,12 @@
 import type {
   BinaryOp,
   CreateIndex,
+  CreateSequence,
   CreateTable,
   CreateType,
   Delete,
   DropIndex,
+  DropSequence,
   DropTable,
   DropType,
   Expr,
@@ -27,6 +29,7 @@ import type {
   SetOpKind,
   Statement,
   SubscriptSpec,
+  TableRef,
   TypeMod,
   Update,
   WithQuery,
@@ -42,8 +45,10 @@ import {
   type FkAction,
   type ForeignKey,
   type IndexDef,
+  type SequenceDef,
   type Table,
   columnIndex,
+  defaultSequenceBounds,
   pkIndices,
   primaryKeyIndex,
   resolveColType,
@@ -252,6 +257,13 @@ export class Snapshot {
   // namespace, globally unique). Which table owns an index is recorded in that table's
   // indexes list.
   indexStores: Map<string, TableStore>;
+  // sequences holds the database-level sequences, keyed by lowercased name
+  // (spec/design/sequences.md). A separate object set from tables/types; serialized into the
+  // catalog's sequence entries (spec/fileformat/format.md, entry_kind = 2). The mutable counter
+  // (lastValue/isCalled) lives here, so nextval advances the working snapshot and rolls back with
+  // it (sequences.md §5). SequenceDef objects are never mutated in place (only replaced/removed),
+  // so the shallow Map copy in clone is safe.
+  sequences: Map<string, SequenceDef>;
 
   constructor(
     txid: bigint = 0n,
@@ -259,17 +271,19 @@ export class Snapshot {
     stores: Map<string, TableStore> = new Map(),
     indexStores: Map<string, TableStore> = new Map(),
     types: Map<string, CompositeType> = new Map(),
+    sequences: Map<string, SequenceDef> = new Map(),
   ) {
     this.txid = txid;
     this.tables = tables;
     this.stores = stores;
     this.indexStores = indexStores;
     this.types = types;
+    this.sequences = sequences;
   }
 
-  // clone returns an independent copy: the catalog maps are shallow (Table / CompositeType objects
-  // are never mutated in place — only added/removed) and each store is an O(1) persistent-map clone
-  // (pmap.ts).
+  // clone returns an independent copy: the catalog maps are shallow (Table / CompositeType /
+  // SequenceDef objects are never mutated in place — only added/removed) and each store is an O(1)
+  // persistent-map clone (pmap.ts).
   clone(): Snapshot {
     return new Snapshot(
       this.txid,
@@ -277,6 +291,7 @@ export class Snapshot {
       cloneStores(this.stores),
       cloneStores(this.indexStores),
       new Map(this.types),
+      new Map(this.sequences),
     );
   }
 
@@ -306,6 +321,28 @@ export class Snapshot {
   // (§8). Keys are ASCII (so code-unit sort == byte sort).
   compositeTypesSorted(): CompositeType[] {
     return [...this.types.keys()].sort().map((k) => this.types.get(k)!);
+  }
+
+  // sequence looks up a sequence by name (case-insensitive).
+  sequence(name: string): SequenceDef | undefined {
+    return this.sequences.get(name.toLowerCase());
+  }
+
+  // putSequence registers a sequence (CREATE SEQUENCE). Lower-cased name is the key. The caller has
+  // already validated the option set and checked the relation namespace for a collision.
+  putSequence(seq: SequenceDef): void {
+    this.sequences.set(seq.name.toLowerCase(), seq);
+  }
+
+  // removeSequence removes a sequence (DROP SEQUENCE). The caller has checked it exists.
+  removeSequence(key: string): void {
+    this.sequences.delete(key);
+  }
+
+  // sequencesSorted is all sequences in ascending lowercased-name order — the on-disk emission
+  // order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak (§8).
+  sequencesSorted(): SequenceDef[] {
+    return [...this.sequences.keys()].sort().map((k) => this.sequences.get(k)!);
   }
 
   // compositeDependent reports whether any table column or composite-type field still references the
@@ -619,6 +656,19 @@ export class Database {
   // provided seededRandomSource + fixedClock (the # seed: / # clock: directives) for exact
   // cross-core output. A handle setting, not stored in the file.
   seam: Seam;
+  // sessionSeq is per-handle SESSION sequence state for currval (spec/design/sequences.md §6): the
+  // last value nextval produced IN THIS SESSION for each sequence (lowercased name). NOT part of the
+  // snapshot and NOT persisted — strictly session-local, as in PostgreSQL. Updated when a
+  // sequence-advancing statement succeeds (flushing pendingSeq); currval of an unlisted sequence
+  // this session is 55000.
+  sessionSeq: Map<string, bigint>;
+  // pendingSeq is per-STATEMENT running sequence advances (spec/design/sequences.md §4): a nextval
+  // records its advance here (seeded from the working snapshot on first touch), and later
+  // nextval/currval calls in the same statement see the running state. On statement success it is
+  // flushed into the working snapshot (so commit persists it) + sessionSeq; on error it is discarded
+  // (the transactional rollback of the advance, sequences.md §5). Cleared at the start of every
+  // statement.
+  pendingSeq: Map<string, SequenceDef>;
 
   constructor() {
     this.committed = new Snapshot();
@@ -635,6 +685,8 @@ export class Database {
     this.workMem = DEFAULT_WORK_MEM;
     this.spillSink = null;
     this.seam = new Seam();
+    this.sessionSeq = new Map();
+    this.pendingSeq = new Map();
   }
 
   // setMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
@@ -719,6 +771,87 @@ export class Database {
   // runs with a transaction open (autocommit opens one implicitly), so tx is non-null here.
   private working(): Snapshot {
     return this.tx!.working;
+  }
+
+  // seqNextval is nextval('name') (spec/design/sequences.md §4): advance the named sequence and
+  // return the new value. The running state lives in pendingSeq, seeded from the working snapshot on
+  // first touch this statement, and is flushed into the working snapshot + sessionSeq on statement
+  // success (flushPendingSequences). A missing sequence is 42P01; advancing past a bound without
+  // CYCLE is 2200H.
+  seqNextval(name: string): bigint {
+    const key = name.toLowerCase();
+    let def = this.pendingSeq.get(key);
+    if (def === undefined) {
+      const committed = this.readSnap().sequence(name);
+      if (committed === undefined) {
+        throw engineError("undefined_table", `relation does not exist: ${name}`);
+      }
+      def = { ...committed };
+    } else {
+      def = { ...def };
+    }
+    let result: bigint;
+    if (!def.isCalled) {
+      // The first nextval returns START (the current lastValue) without incrementing.
+      def.isCalled = true;
+      result = def.lastValue;
+    } else {
+      // Advance by increment, treating an i64 overflow or a bound crossing identically (bigint never
+      // overflows, so a wrap is detected purely by the bound test).
+      const stepped = def.lastValue + def.increment;
+      let next: bigint;
+      if (def.increment > 0n && stepped <= def.maxValue) {
+        next = stepped;
+      } else if (def.increment < 0n && stepped >= def.minValue) {
+        next = stepped;
+      } else if (def.cycle) {
+        next = def.increment > 0n ? def.minValue : def.maxValue;
+      } else {
+        throw engineError(
+          "sequence_generator_limit_exceeded",
+          `nextval: reached ${def.increment > 0n ? "maximum" : "minimum"} value of sequence ${name}`,
+        );
+      }
+      def.lastValue = next;
+      result = next;
+    }
+    this.pendingSeq.set(key, def);
+    return result;
+  }
+
+  // seqCurrval is currval('name') (spec/design/sequences.md §6): the value nextval last produced for
+  // this sequence IN THIS SESSION. Resolves the name against the catalog first (42P01 if absent),
+  // then reads the running advance this statement (pendingSeq) else the session value (sessionSeq);
+  // 55000 if nextval has not been called this session.
+  seqCurrval(name: string): bigint {
+    if (this.readSnap().sequence(name) === undefined) {
+      throw engineError("undefined_table", `relation does not exist: ${name}`);
+    }
+    const key = name.toLowerCase();
+    const pending = this.pendingSeq.get(key);
+    if (pending !== undefined && pending.isCalled) {
+      return pending.lastValue;
+    }
+    const v = this.sessionSeq.get(key);
+    if (v !== undefined) return v;
+    throw engineError(
+      "object_not_in_prerequisite_state",
+      `currval of sequence ${name} is not yet defined in this session`,
+    );
+  }
+
+  // flushPendingSequences flushes the statement's pending sequence advances into the working
+  // snapshot (so a commit persists them) and into sessionSeq (so currval sees them). Called on the
+  // success of a sequence-advancing statement, while a write transaction is open; a no-op when
+  // nothing advanced. On statement error the pending map is instead discarded (cleared at the next
+  // statement), giving the transactional rollback of the advance (sequences.md §5).
+  private flushPendingSequences(): void {
+    if (this.pendingSeq.size === 0) return;
+    for (const [key, def] of this.pendingSeq) {
+      this.working().putSequence(def);
+      this.sessionSeq.set(key, def.lastValue);
+    }
+    this.pendingSeq.clear();
   }
 
   // The monotonic commit counter (spec/design/api.md §2): the committed snapshot's version.
@@ -806,6 +939,9 @@ export class Database {
       case "rollback":
         return this.rollbackTx();
     }
+    // Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
+    // populated — it is discarded, not flushed, on error; sequences.md §5).
+    this.pendingSeq.clear();
 
     // Inside an explicit block?
     const tx = this.tx;
@@ -824,7 +960,11 @@ export class Database {
             "cannot execute " + stmtKind(stmt) + " in a read-only transaction",
           );
         }
-        return this.dispatchStmt(stmt, params);
+        const outcome = this.dispatchStmt(stmt, params);
+        // Land any nextval advances into the block's working snapshot; COMMIT publishes them,
+        // ROLLBACK discards them with the rest of the working set (sequences.md §5).
+        this.flushPendingSequences();
+        return outcome;
       } catch (e) {
         tx.failed = true;
         throw e;
@@ -855,6 +995,9 @@ export class Database {
       this.tx = null;
       throw e;
     }
+    // Persist any nextval advances into the working snapshot before publishing it (sequences.md §5);
+    // a non-sequence statement flushes nothing.
+    this.flushPendingSequences();
     this.commitTx();
     return outcome;
   }
@@ -943,6 +1086,12 @@ export class Database {
       case "dropType":
         rejectParamsForDDL(params);
         return this.executeDropType(stmt);
+      case "createSequence":
+        rejectParamsForDDL(params);
+        return this.executeCreateSequence(stmt);
+      case "dropSequence":
+        rejectParamsForDDL(params);
+        return this.executeDropSequence(stmt);
       case "insert":
         return this.executeInsert(stmt, params);
       case "select":
@@ -1487,6 +1636,7 @@ export class Database {
       seam: this.seam,
       rng,
       ctes: EMPTY_CTE_CTX,
+      exec: this,
     };
     return evalExpr(defaultRExpr, [], env, meter);
   }
@@ -1526,9 +1676,14 @@ export class Database {
   }
 
   // relationExists reports whether name is taken in the shared relation namespace (a
-  // table OR an index — spec/design/indexes.md §2), case-insensitively.
+  // table OR an index OR a sequence — spec/design/indexes.md §2, sequences.md §2),
+  // case-insensitively.
   private relationExists(name: string): boolean {
-    return this.table(name) !== undefined || this.findIndex(name) !== null;
+    return (
+      this.table(name) !== undefined ||
+      this.findIndex(name) !== null ||
+      this.readSnap().sequence(name) !== undefined
+    );
   }
 
   // fkProbeHits reports whether the parent currently holds the key/prefix `probe` (committed +
@@ -1791,6 +1946,70 @@ export class Database {
       );
     }
     this.working().removeType(dt.name.toLowerCase());
+    return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // executeCreateSequence analyzes and runs a CREATE SEQUENCE (spec/design/sequences.md). Resolve
+  // the option overrides against the INCREMENT sign's type defaults, validate the set (22023),
+  // reject a relation-namespace collision (42P07 unless IF NOT EXISTS), and register the sequence.
+  private executeCreateSequence(cs: CreateSequence): Outcome {
+    if (this.relationExists(cs.name)) {
+      if (cs.ifNotExists) return { kind: "statement", cost: 0n, rowsAffected: null };
+      throw engineError("duplicate_table", `relation already exists: ${cs.name}`);
+    }
+    const increment = cs.increment ?? 1n;
+    if (increment === 0n) {
+      throw engineError("invalid_parameter_value", "INCREMENT must not be zero");
+    }
+    const cache = cs.cache ?? 1n;
+    if (cache < 1n) {
+      throw engineError("invalid_parameter_value", `CACHE (${cache}) must be greater than zero`);
+    }
+    const [defMin, defMax] = defaultSequenceBounds(increment);
+    // `{ value: v }` MINVALUE v / `{ value: null }` NO MINVALUE / outer null unset → the default.
+    const minValue = cs.minValue !== null && cs.minValue.value !== null ? cs.minValue.value : defMin;
+    const maxValue = cs.maxValue !== null && cs.maxValue.value !== null ? cs.maxValue.value : defMax;
+    if (minValue > maxValue) {
+      throw engineError(
+        "invalid_parameter_value",
+        `MINVALUE (${minValue}) must be less than MAXVALUE (${maxValue})`,
+      );
+    }
+    // START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
+    const start = cs.start ?? (increment < 0n ? maxValue : minValue);
+    if (start < minValue || start > maxValue) {
+      throw engineError(
+        "invalid_parameter_value",
+        `START value (${start}) cannot be ${
+          start < minValue ? `less than MINVALUE` : `greater than MAXVALUE`
+        } the ${start < minValue ? minValue : maxValue} value`,
+      );
+    }
+    this.working().putSequence({
+      name: cs.name,
+      increment,
+      minValue,
+      maxValue,
+      start,
+      cache,
+      cycle: cs.cycle ?? false,
+      lastValue: start,
+      isCalled: false,
+    });
+    return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // executeDropSequence analyzes and runs a DROP SEQUENCE (spec/design/sequences.md §1).
+  // RESTRICT-only: a missing sequence is 42P01 unless IF EXISTS. No dependency tracking this slice
+  // (a plain `DEFAULT nextval('s')` creates none — PG). Multiple names are dropped left to right.
+  private executeDropSequence(ds: DropSequence): Outcome {
+    for (const name of ds.names) {
+      if (this.readSnap().sequence(name) === undefined) {
+        if (ds.ifExists) continue;
+        throw engineError("undefined_table", `sequence does not exist: ${name}`);
+      }
+      this.working().removeSequence(name.toLowerCase());
+    }
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -2110,6 +2329,7 @@ export class Database {
           seam: this.seam,
           rng,
           ctes: EMPTY_CTE_CTX,
+          exec: this,
         };
         evalChecks(checks, table.name, row, env, meter);
       }
@@ -2301,7 +2521,7 @@ export class Database {
     params: Value[],
     meter: Meter,
   ): Value[][] {
-    const env: EvalEnv = { params, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, params, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX };
+    const env: EvalEnv = { params, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, params, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX, exec: this };
     const out: Value[][] = [];
     rows.forEach((row, i) => {
       meter.guard();
@@ -2347,7 +2567,7 @@ export class Database {
       ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, cost));
       meter.charge(cost.value);
     }
-    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX };
+    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX, exec: this };
     const store = this.working().store(del.table);
     // matched collects (key, row) pairs before mutating; the rows feed phase 2's
     // index-entry removal (indexed columns are fixed-width and always resident).
@@ -2514,7 +2734,7 @@ export class Database {
       ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost));
     }
     meter.charge(foldCost.value);
-    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX };
+    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX, exec: this };
     const store = this.working().store(upd.table);
     // Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
     const updates: { key: Uint8Array; row: Row; oldRow: Row }[] = [];
@@ -2979,6 +3199,7 @@ export class Database {
       seam: this.seam,
       rng: new StmtRng(),
       ctes,
+      exec: this,
     };
     const meter = new Meter(this.maxCost);
     const rows: Value[][] = [];
@@ -3636,6 +3857,7 @@ export class Database {
       seam: this.seam,
       rng: new StmtRng(),
       ctes,
+      exec: this,
     };
     const meter = new Meter(this.maxCost);
 
@@ -5051,7 +5273,12 @@ type ScalarFuncName =
   // ONCE and reused (STABLE; current_timestamp is parser sugar for it); clock_timestamp →
   // timestamptz, the clock seam read on EVERY call (VOLATILE).
   | "now"
-  | "clock_timestamp";
+  | "clock_timestamp"
+  // Sequence value functions (spec/design/sequences.md §4/§6). nextval → int64, advance the named
+  // sequence (VOLATILE; MUTATES the working snapshot via pendingSeq, so the statement is a write).
+  // currval → int64, the value nextval last produced for the named sequence IN THIS SESSION.
+  | "nextval"
+  | "currval";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -5258,6 +5485,10 @@ type EvalEnv = {
   // The statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at any
   // nesting depth delivers a CTE's rows. EMPTY_CTE_CTX for every non-WITH statement.
   ctes: CteCtx;
+  // The executing Database handle, so the sequence value functions (nextval/currval — sequences.md
+  // §4/§6) can resolve a name to a catalog sequence and advance/read it (mirrors Rust's env.exec —
+  // the same access the clock seam already uses). Only nextval/currval touch it.
+  exec: Database;
 };
 
 // ============================================================================
@@ -6899,7 +7130,8 @@ function rejectParamsForDDL(params: Value[]): void {
 
 // stmtIsWrite reports whether a statement mutates the database (so autocommit must capture +
 // durably persist it). Reads (SELECT, set operations) run with no transaction (transactions.md
-// §4.1).
+// §4.1) — UNLESS the read-shaped statement calls a sequence-mutating function (nextval), which
+// makes it a write (spec/design/sequences.md §4).
 export function stmtIsWrite(stmt: Statement): boolean {
   return (
     stmt.kind === "createTable" ||
@@ -6908,10 +7140,126 @@ export function stmtIsWrite(stmt: Statement): boolean {
     stmt.kind === "dropIndex" ||
     stmt.kind === "createType" ||
     stmt.kind === "dropType" ||
+    stmt.kind === "createSequence" ||
+    stmt.kind === "dropSequence" ||
     stmt.kind === "insert" ||
     stmt.kind === "update" ||
-    stmt.kind === "delete"
+    stmt.kind === "delete" ||
+    // A read-shaped statement that calls nextval IS a write (sequences.md §4): it must take the
+    // write gate, stage the advance, and commit (autocommit) — and is 25006 in a READ ONLY
+    // transaction, exactly like any other write.
+    stmtCallsSeqMutator(stmt)
   );
+}
+
+// stmtCallsSeqMutator reports whether stmt's expression trees contain a sequence-MUTATING function
+// call (nextval; in S2, setval) anywhere — which makes an otherwise read-shaped statement a write
+// (sequences.md §4). Only the read-shaped statements need checking: INSERT/UPDATE/DELETE/DDL are
+// already writes (stmtIsWrite short-circuits before this), and an INSERT VALUES slot is literal-only
+// (no function call). currval is a pure read and is NOT counted.
+function stmtCallsSeqMutator(stmt: Statement): boolean {
+  switch (stmt.kind) {
+    case "select":
+      return selectCallsSeqMutator(stmt);
+    case "setOp":
+      return setOpCallsSeqMutator(stmt);
+    case "with":
+      return stmt.ctes.some((c) => queryCallsSeqMutator(c.query)) || queryCallsSeqMutator(stmt.body);
+    default:
+      return false;
+  }
+}
+
+function queryCallsSeqMutator(qe: QueryExpr): boolean {
+  return qe.kind === "setOp" ? setOpCallsSeqMutator(qe) : selectCallsSeqMutator(qe);
+}
+
+function setOpCallsSeqMutator(so: SetOp): boolean {
+  return queryCallsSeqMutator(so.lhs) || queryCallsSeqMutator(so.rhs);
+}
+
+function selectCallsSeqMutator(s: Select): boolean {
+  const itemCalls =
+    s.items.kind === "list" && s.items.items.some((i) => exprCallsSeqMutator(i.expr));
+  return (
+    itemCalls ||
+    (s.from !== null && tableRefCallsSeqMutator(s.from)) ||
+    s.joins.some(
+      (j) => tableRefCallsSeqMutator(j.table) || (j.on !== null && exprCallsSeqMutator(j.on)),
+    ) ||
+    (s.filter !== null && exprCallsSeqMutator(s.filter)) ||
+    s.groupBy.some(exprCallsSeqMutator) ||
+    (s.having !== null && exprCallsSeqMutator(s.having))
+  );
+}
+
+function tableRefCallsSeqMutator(t: TableRef): boolean {
+  return (
+    (t.args !== null && t.args.some(exprCallsSeqMutator)) ||
+    (t.subquery !== undefined && queryCallsSeqMutator(t.subquery)) ||
+    (t.values !== undefined && t.values.some((row) => row.some(exprCallsSeqMutator)))
+  );
+}
+
+// exprCallsSeqMutator is exhaustive over Expr (every kind is matched): true iff the tree contains a
+// nextval call.
+function exprCallsSeqMutator(e: Expr): boolean {
+  switch (e.kind) {
+    case "funcCall":
+      return e.name.toLowerCase() === "nextval" || e.args.some(exprCallsSeqMutator);
+    case "column":
+    case "qualifiedColumn":
+    case "literal":
+    case "typedLiteral":
+    case "param":
+      return false;
+    case "row":
+      return e.fields.some(exprCallsSeqMutator);
+    case "array":
+      return e.elements.some(exprCallsSeqMutator);
+    case "fieldAccess":
+    case "fieldStar":
+      return exprCallsSeqMutator(e.base);
+    case "subscript":
+      return (
+        exprCallsSeqMutator(e.base) ||
+        e.subscripts.some((s) =>
+          s.isSlice
+            ? (s.lower !== null && exprCallsSeqMutator(s.lower)) ||
+              (s.upper !== null && exprCallsSeqMutator(s.upper))
+            : exprCallsSeqMutator(s.index),
+        )
+      );
+    case "cast":
+      return exprCallsSeqMutator(e.inner);
+    case "unary":
+    case "isNull":
+      return exprCallsSeqMutator(e.operand);
+    case "binary":
+    case "isDistinct":
+    case "like":
+      return exprCallsSeqMutator(e.lhs) || exprCallsSeqMutator(e.rhs);
+    case "in":
+      return exprCallsSeqMutator(e.lhs) || e.list.some(exprCallsSeqMutator);
+    case "between":
+      return (
+        exprCallsSeqMutator(e.lhs) || exprCallsSeqMutator(e.lo) || exprCallsSeqMutator(e.hi)
+      );
+    case "case":
+      return (
+        (e.operand !== null && exprCallsSeqMutator(e.operand)) ||
+        e.whens.some((w) => exprCallsSeqMutator(w.cond) || exprCallsSeqMutator(w.result)) ||
+        (e.els !== null && exprCallsSeqMutator(e.els))
+      );
+    case "scalarSubquery":
+    case "exists":
+      return queryCallsSeqMutator(e.query);
+    case "inSubquery":
+    case "quantifiedSubquery":
+      return exprCallsSeqMutator(e.lhs) || queryCallsSeqMutator(e.query);
+    case "quantified":
+      return exprCallsSeqMutator(e.lhs) || exprCallsSeqMutator(e.array);
+  }
 }
 
 // stmtKind is a short label for a statement kind, for the 25006 read-only-violation message (the
@@ -6930,6 +7278,10 @@ function stmtKind(stmt: Statement): string {
       return "CREATE TYPE";
     case "dropType":
       return "DROP TYPE";
+    case "createSequence":
+      return "CREATE SEQUENCE";
+    case "dropSequence":
+      return "DROP SEQUENCE";
     case "insert":
       return "INSERT";
     case "update":
@@ -9931,6 +10283,16 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       if (e.func === "clock_timestamp") {
         return timestamptzValue(env.rng.clockNowMicros(env.seam));
+      }
+      // Sequence value functions (spec/design/sequences.md §4/§6). nextval charges an additional
+      // sequence_advance unit (the catalog-tuple read+rewrite) and mutates the per-statement pending
+      // state; currval is a pure session-state read. The NULL-arg case is handled above (propagates).
+      if (e.func === "nextval") {
+        m.charge(COSTS.sequenceAdvance);
+        return intValue(env.exec.seqNextval((vals[0] as { text: string }).text));
+      }
+      if (e.func === "currval") {
+        return intValue(env.exec.seqCurrval((vals[0] as { text: string }).text));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

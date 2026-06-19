@@ -15,9 +15,24 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 11)
+## Version scope (`format_version` 12)
 
-The current on-disk version is **`format_version` 11** — **`FOREIGN KEY` constraints**
+The current on-disk version is **`format_version` 12** — **sequences**
+([../design/sequences.md](../design/sequences.md)). A sequence (`CREATE SEQUENCE s`) is a
+database-level catalog object — a named, persisted, monotonic int64 generator — that owns no B-tree
+and adds no value-codec change, so the only on-disk change is a **third kind of catalog entry**:
+`entry_kind = 2` (joining `0` = table, `1` = composite-type). A sequence entry carries the name, six
+fixed `int64` fields (`increment`, `min_value`, `max_value`, `start`, `cache`, `last_value`), and a
+`flags` byte (bit 0 `cycle`, bit 1 `is_called`) — the *Sequence entry* table in the *Catalog* section
+below. Emission order across the catalog is now **composite-type entries (kind 1), then sequence
+entries (kind 2), then table entries (kind 0)**, each group in ascending lowercased-name order; a
+sequence is referenced by nothing at load (a `DEFAULT nextval('s')` is stored expr-text, resolved at
+evaluation), so it needs no two-pass. A file with no sequences still moves to v12 (the version byte +
+meta CRC change). Each version is a **clean break** — older versions are **not read** (we are pre-1.0
+and owe no on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only**
+version 12.
+
+`format_version` 11 was **`FOREIGN KEY` constraints**
 ([../design/constraints.md §6](../design/constraints.md)). A foreign key is referential metadata
 on the *referencing* table — it owns no B-tree and adds no value-codec change — so the only on-disk
 change is in the **table catalog entry**: after the index list and before the trailing root-page
@@ -26,9 +41,7 @@ ordinal list, the referenced table name, the referenced-column ordinal list into
 one-byte `on_delete`/`on_update` action field — *Foreign-key list* in the *Catalog* section below).
 The per-table data B-tree, the value codec, and the meta page are untouched. A file with no foreign
 keys still moves to v11 (the version byte + meta CRC change, and every table entry gains an
-`fk_count = 0`). Each version is a **clean break** — older versions are **not read** (we are pre-1.0
-and owe no on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only**
-version 11.
+`fk_count = 0`).
 
 `format_version` 10 was **array (`T[]`) columns**
 ([../design/array.md](../design/array.md)). An array is a **structural** type (no catalog object —
@@ -279,24 +292,26 @@ B-tree root moves). Its **encoding is byte-identical to v1**; only its location 
 (`root_page`) and `root_data_page` now points at a **B-tree root node** instead of a record
 chain head.
 
-**Each catalog entry is kind-tagged (v9):** a leading `entry_kind` u8 — `0` = a table entry, `1`
-= a composite-type entry ([../design/composite.md §3](../design/composite.md)). **Composite-type
-entries are emitted first** (ascending lowercased-name order), then table entries (ascending
-lowercased-name order). Each page's `item_count` is the number of entries (of either kind) it
-holds; entries are packed greedily into the chain, kind-tagged in stream order, exactly as table
-entries were through v8 (a single entry must fit one page, i.e. ≤ `C`, else `0A000`; the
-`RECORD_MAX = C/2` cap is a B-tree-record rule and does **not** apply to catalog entries, which
-never split). Tables are emitted in **ascending order of the lowercased table name** (the engine
-stores tables in a hash map keyed by lowercased name; sorting by that key removes any
-iteration-order leak — CLAUDE.md §8; names are unique after lowercasing, so there are no ties);
-composite types likewise.
+**Each catalog entry is kind-tagged (v9, extended v12):** a leading `entry_kind` u8 — `0` = a table
+entry, `1` = a composite-type entry ([../design/composite.md §3](../design/composite.md)), `2` = a
+sequence entry ([../design/sequences.md §3](../design/sequences.md)). Entries are emitted in kind
+order **composite-type (1), then sequence (2), then table (0)**, each group in ascending
+lowercased-name order. Each page's `item_count` is the number of entries (of any kind) it holds;
+entries are packed greedily into the chain, kind-tagged in stream order, exactly as table entries
+were through v8 (a single entry must fit one page, i.e. ≤ `C`, else `0A000`; the `RECORD_MAX = C/2`
+cap is a B-tree-record rule and does **not** apply to catalog entries, which never split). Each group
+is emitted in **ascending order of the lowercased name** (the engine stores each object set in a hash
+map keyed by lowercased name; sorting by that key removes any iteration-order leak — CLAUDE.md §8;
+names are unique after lowercasing, so there are no ties).
 
 **Load is two-pass (v9):** the reader walks the whole chain collecting every composite-type entry
 into a name→definition map, validates that every composite **referenced** by a column or a field
 exists and that the reference graph is **acyclic** (a dangling or cyclic reference is `XX001`),
 then builds the tables — resolving each composite column's type name against the map. Because of
 nested composites a single pass cannot guarantee a referenced type is already read (name order
-does not imply dependency order), hence the two passes.
+does not imply dependency order), hence the two passes. **Sequence entries (v12)** are
+self-contained — referenced by nothing at load — so a sequence entry is registered directly into
+the catalog's sequence set as the chain is walked, with no second pass.
 
 Each **table entry** (after its `entry_kind = 0`; v5 adds the primary-key ordinal list after the
 columns and the index list after the checks, and retires column-flag bit0):
@@ -404,6 +419,31 @@ flags byte (where a nested-composite name sits) so the element type is self-desc
 loader's two-pass validation rejects a dangling reference or a definition cycle — including a
 composite reached **through an array field** — as `XX001` (a v10 additive extension; no
 `format_version` bump, since an array element descriptor is already a v10 shape).
+
+### Sequence entry (`entry_kind = 2`, v12)
+
+A sequence entry records a `CREATE SEQUENCE name [options]` definition
+([../design/sequences.md §3](../design/sequences.md)). It is **fixed-width** — every field is
+always present and non-NULL, so there are no presence tags or conditional fields:
+
+| field | encoding |
+|---|---|
+| `entry_kind` | u8 = `2` |
+| `name_len` | u16 |
+| `name` | `name_len` bytes UTF-8 (original case) |
+| `increment` | i64 — 8 bytes **big-endian two's-complement, no sign-flip** |
+| `min_value` | i64 — same encoding |
+| `max_value` | i64 — same encoding |
+| `start` | i64 — same encoding |
+| `cache` | i64 — same encoding (stored for fidelity; behaves as `1`, sequences.md §7) |
+| `last_value` | i64 — same encoding (the mutable counter; `= start` on a fresh sequence) |
+| `flags` | u8 — bit0 `cycle`, bit1 `is_called`; bits 2–7 reserved, written 0 (a set reserved bit is `XX001`) |
+
+The six `int64` fields use the **interval-body encoding** (plain big-endian two's-complement) rather
+than the order-preserving sign-flip, because a catalog entry is a *value*-codec context, not a sorted
+key. `last_value` + `is_called` are the only mutable state; a `nextval` rewrites them, and the whole
+catalog is rewritten copy-on-write at the next commit (transactions.md §4.5). A sequence entry owns
+no B-tree (no `root_data_page`), like a foreign key.
 
 ### Check-expression text
 

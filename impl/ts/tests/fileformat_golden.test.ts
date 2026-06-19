@@ -478,6 +478,21 @@ function nestedCompositeTableDB(): Database {
   return db;
 }
 
+// sequenceTableDB: two sequences (v12) — `s1` ascending, advanced 3 times (is_called, last_value 3),
+// `s2` descending/fresh with a non-default cache + cycle — plus a one-row table, pinning the sequence
+// catalog entry (entry_kind 2) and the catalog emission order (sequences before tables).
+function sequenceTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE SEQUENCE s1");
+  run(db, "SELECT nextval('s1')");
+  run(db, "SELECT nextval('s1')");
+  run(db, "SELECT nextval('s1')");
+  run(db, "CREATE SEQUENCE s2 INCREMENT BY -2 MINVALUE -100 MAXVALUE -1 CACHE 5 CYCLE");
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+  run(db, "INSERT INTO t VALUES (1, 10)");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -508,6 +523,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "fk_table.jed", build: fkTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB },
+    { name: "sequence_table.jed", build: sequenceTableDB },
     { name: "array_table.jed", build: arrayTableDB },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB },
@@ -553,6 +569,7 @@ test("read goldens reproduces rows", () => {
     { name: "fk_table.jed", build: fkTableDB, table: "c" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB, table: "t" },
+    { name: "sequence_table.jed", build: sequenceTableDB, table: "t" },
     { name: "array_table.jed", build: arrayTableDB, table: "t" },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB, table: "t" },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB, table: "t" },

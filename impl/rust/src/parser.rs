@@ -5,11 +5,11 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateTable, CreateType, Cte,
-    DefaultDef, Delete, DropIndex, DropTable, DropType, Expr, ForeignKeyDef, Insert, InsertSource,
-    InsertValue, JoinClause, JoinKind, Literal, OrderKey, QueryExpr, RefAction, Select, SelectItem,
-    SelectItems, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod,
-    UnaryOp, UniqueDef, Update, WithQuery,
+    Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateSequence, CreateTable,
+    CreateType, Cte, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType, Expr,
+    ForeignKeyDef, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OrderKey,
+    QueryExpr, RefAction, Select, SelectItem, SelectItems, SetOp, SetOpKind, Statement,
+    SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WithQuery,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -107,12 +107,19 @@ impl Parser {
             Some("create") if self.peek_keyword_at(1).as_deref() == Some("type") => {
                 Ok(Statement::CreateType(self.parse_create_type()?))
             }
+            // CREATE SEQUENCE — a 2-token lookahead keeps SEQUENCE non-reserved (sequences.md §44).
+            Some("create") if self.peek_keyword_at(1).as_deref() == Some("sequence") => {
+                Ok(Statement::CreateSequence(self.parse_create_sequence()?))
+            }
             Some("create") => Ok(Statement::CreateTable(self.parse_create_table()?)),
             Some("drop") if self.peek_keyword_at(1).as_deref() == Some("index") => {
                 Ok(Statement::DropIndex(self.parse_drop_index()?))
             }
             Some("drop") if self.peek_keyword_at(1).as_deref() == Some("type") => {
                 Ok(Statement::DropType(self.parse_drop_type()?))
+            }
+            Some("drop") if self.peek_keyword_at(1).as_deref() == Some("sequence") => {
+                Ok(Statement::DropSequence(self.parse_drop_sequence()?))
             }
             Some("drop") => Ok(Statement::DropTable(self.parse_drop_table()?)),
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
@@ -749,6 +756,178 @@ impl Parser {
             ));
         }
         Ok(DropType { name, if_exists })
+    }
+
+    /// `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` (spec/design/grammar.md §44). The
+    /// options are order-free and each at most once (a repeat is 42601); option values are signed
+    /// integer literals. Validation of the resolved option set (22023) and the namespace collision
+    /// (42P07) are execution-time.
+    fn parse_create_sequence(&mut self) -> Result<CreateSequence> {
+        self.expect_keyword("create")?;
+        self.expect_keyword("sequence")?;
+        let if_not_exists = self.parse_if_not_exists()?;
+        let name = self.expect_identifier()?;
+        let mut seq = CreateSequence {
+            name,
+            if_not_exists,
+            increment: None,
+            min_value: None,
+            max_value: None,
+            start: None,
+            cache: None,
+            cycle: None,
+        };
+        // Order-free option loop: dispatch on the leading keyword, each option at most once.
+        loop {
+            match self.peek_keyword().as_deref() {
+                Some("increment") => {
+                    self.dup_check(seq.increment.is_some(), "INCREMENT")?;
+                    self.advance();
+                    self.consume_keyword("by");
+                    seq.increment = Some(self.parse_signed_int_literal()?);
+                }
+                Some("minvalue") => {
+                    self.dup_check(seq.min_value.is_some(), "MINVALUE")?;
+                    self.advance();
+                    seq.min_value = Some(Some(self.parse_signed_int_literal()?));
+                }
+                Some("maxvalue") => {
+                    self.dup_check(seq.max_value.is_some(), "MAXVALUE")?;
+                    self.advance();
+                    seq.max_value = Some(Some(self.parse_signed_int_literal()?));
+                }
+                Some("start") => {
+                    self.dup_check(seq.start.is_some(), "START")?;
+                    self.advance();
+                    self.consume_keyword("with");
+                    seq.start = Some(self.parse_signed_int_literal()?);
+                }
+                Some("cache") => {
+                    self.dup_check(seq.cache.is_some(), "CACHE")?;
+                    self.advance();
+                    seq.cache = Some(self.parse_signed_int_literal()?);
+                }
+                Some("cycle") => {
+                    self.dup_check(seq.cycle.is_some(), "CYCLE")?;
+                    self.advance();
+                    seq.cycle = Some(true);
+                }
+                // `NO MINVALUE` / `NO MAXVALUE` / `NO CYCLE`.
+                Some("no") => {
+                    self.advance();
+                    match self.peek_keyword().as_deref() {
+                        Some("minvalue") => {
+                            self.dup_check(seq.min_value.is_some(), "MINVALUE")?;
+                            self.advance();
+                            seq.min_value = Some(None);
+                        }
+                        Some("maxvalue") => {
+                            self.dup_check(seq.max_value.is_some(), "MAXVALUE")?;
+                            self.advance();
+                            seq.max_value = Some(None);
+                        }
+                        Some("cycle") => {
+                            self.dup_check(seq.cycle.is_some(), "CYCLE")?;
+                            self.advance();
+                            seq.cycle = Some(false);
+                        }
+                        other => {
+                            return Err(syntax(format!(
+                                "expected MINVALUE, MAXVALUE, or CYCLE after NO, found {other:?}"
+                            )));
+                        }
+                    }
+                }
+                _ => break,
+            }
+        }
+        Ok(seq)
+    }
+
+    /// `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT | CASCADE]` (grammar.md §44). `CASCADE`
+    /// is 0A000 at execution; a missing sequence (42P01) is execution-time.
+    fn parse_drop_sequence(&mut self) -> Result<DropSequence> {
+        self.expect_keyword("drop")?;
+        self.expect_keyword("sequence")?;
+        let if_exists = self.peek_keyword().as_deref() == Some("if");
+        if if_exists {
+            self.advance();
+            self.expect_keyword("exists")?;
+        }
+        let mut names = vec![self.expect_identifier()?];
+        while matches!(self.peek(), Token::Comma) {
+            self.advance();
+            names.push(self.expect_identifier()?);
+        }
+        let cascade = match self.peek_keyword().as_deref() {
+            Some("restrict") => {
+                self.advance();
+                false
+            }
+            Some("cascade") => {
+                self.advance();
+                true
+            }
+            _ => false,
+        };
+        if cascade {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "DROP SEQUENCE ... CASCADE is not supported".to_string(),
+            ));
+        }
+        Ok(DropSequence { names, if_exists })
+    }
+
+    /// `IF NOT EXISTS` prefix (optional) — consumed when present.
+    fn parse_if_not_exists(&mut self) -> Result<bool> {
+        if self.peek_keyword().as_deref() == Some("if") {
+            self.advance();
+            self.expect_keyword("not")?;
+            self.expect_keyword("exists")?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// Consume an optional noise keyword (e.g. the `BY` in `INCREMENT BY`, the `WITH` in
+    /// `START WITH`) when present.
+    fn consume_keyword(&mut self, kw: &str) {
+        if self.peek_keyword().as_deref() == Some(kw) {
+            self.advance();
+        }
+    }
+
+    /// 42601 when an option appeared twice.
+    fn dup_check(&self, already: bool, opt: &str) -> Result<()> {
+        if already {
+            Err(syntax(format!("{opt} specified more than once")))
+        } else {
+            Ok(())
+        }
+    }
+
+    /// A signed integer literal (`-? INT`) as an i64 — the sequence-option value form. The lexer
+    /// caps an `Int` magnitude at 2^63, so the only out-of-range case is a bare positive 2^63
+    /// (2200H/22003 — `numeric_value_out_of_range`); a negated 2^63 is i64::MIN (valid).
+    fn parse_signed_int_literal(&mut self) -> Result<i64> {
+        let neg = matches!(self.peek(), Token::Minus);
+        if neg {
+            self.advance();
+        }
+        let m = match self.advance() {
+            Token::Int(m) => m,
+            other => return Err(syntax(format!("expected an integer, found {other:?}"))),
+        };
+        let v: i128 = if neg { -(m as i128) } else { m as i128 };
+        if v < i64::MIN as i128 || v > i64::MAX as i128 {
+            return Err(EngineError::new(
+                SqlState::NumericValueOutOfRange,
+                "sequence parameter out of int64 range".to_string(),
+            ));
+        }
+        Ok(v as i64)
     }
 
     /// `INSERT INTO <table> [( <col> [, <col>]* )] ( VALUES <row> [, <row>]* | <select> )`. The

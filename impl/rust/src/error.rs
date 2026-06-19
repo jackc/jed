@@ -31,6 +31,9 @@ pub enum SqlState {
     DivisionByZero,
     /// 22023 — invalid parameter value (e.g. a bad numeric typmod, `numeric(0)`).
     InvalidParameterValue,
+    /// 2200H — sequence generator limit exceeded: `nextval` advanced past a sequence's
+    /// MAXVALUE/MINVALUE bound without CYCLE (spec/design/sequences.md §4).
+    SequenceGeneratorLimitExceeded,
     /// 2202E — array subscript error: a multidimensional array constructed/parsed with
     /// non-matching sub-array dimensions, or an array literal whose declared `[l:u]` bounds are
     /// inverted (`l > u`) — spec/design/array.md §11.
@@ -62,6 +65,9 @@ pub enum SqlState {
     /// 25P02 — a statement (other than ROLLBACK/COMMIT) issued in a failed/aborted transaction
     /// block; it stays poisoned until the block ends (transactions.md §6).
     InFailedSqlTransaction,
+    /// 55000 — object not in prerequisite state: `currval`/`lastval` before `nextval` has defined
+    /// the value in this session (spec/design/sequences.md §6).
+    ObjectNotInPrerequisiteState,
     /// 42601 — syntax error.
     SyntaxError,
     /// 42P01 — undefined table.
@@ -161,6 +167,7 @@ impl SqlState {
             SqlState::DatetimeFieldOverflow => "22008",
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidParameterValue => "22023",
+            SqlState::SequenceGeneratorLimitExceeded => "2200H",
             SqlState::ArraySubscriptError => "2202E",
             SqlState::InvalidTextRepresentation => "22P02",
             SqlState::InvalidEscapeSequence => "22025",
@@ -173,6 +180,7 @@ impl SqlState {
             SqlState::ActiveSqlTransaction => "25001",
             SqlState::ReadOnlySqlTransaction => "25006",
             SqlState::InFailedSqlTransaction => "25P02",
+            SqlState::ObjectNotInPrerequisiteState => "55000",
             SqlState::SyntaxError => "42601",
             SqlState::UndefinedTable => "42P01",
             SqlState::UndefinedColumn => "42703",

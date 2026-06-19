@@ -333,6 +333,34 @@ export type TypeFieldDef = {
 // missing type without IF EXISTS is 42704.
 export type DropType = { kind: "dropType"; name: string; ifExists: boolean };
 
+// CreateSequence is a `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` statement — a named,
+// persisted int64 generator (spec/design/sequences.md). The options are order-free; each is
+// captured as a parsed override, with `null` meaning "use the default" (resolved at execution
+// against the INCREMENT sign). Execution validates the option set (22023), rejects a relation-
+// namespace collision (42P07 unless `ifNotExists`), and registers the sequence in the catalog.
+// `minValue`/`maxValue` use a nested-override form: `{ value: v }` = MINVALUE v; `{ value: null }`
+// = NO MINVALUE (the type default); the outer `null` = unset.
+export type CreateSequence = {
+  kind: "createSequence";
+  name: string;
+  ifNotExists: boolean;
+  increment: bigint | null;
+  minValue: { value: bigint | null } | null;
+  maxValue: { value: bigint | null } | null;
+  start: bigint | null;
+  cache: bigint | null;
+  cycle: boolean | null;
+};
+
+// DropSequence is a `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT]` statement — remove one or
+// more sequences (spec/design/sequences.md §1). A missing sequence without IF EXISTS is 42P01;
+// CASCADE is 0A000 (RESTRICT is the default and only mode this slice).
+export type DropSequence = {
+  kind: "dropSequence";
+  names: string[];
+  ifExists: boolean;
+};
+
 // Insert is an INSERT ... [(col, ..)] whose rows come from EITHER a VALUES list (each value a
 // literal or the DEFAULT keyword) OR a SELECT (INSERT ... SELECT — spec/design/grammar.md §24).
 // An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
@@ -536,6 +564,8 @@ export type Statement =
   | DropIndex
   | CreateType
   | DropType
+  | CreateSequence
+  | DropSequence
   | Insert
   | Select
   | SetOp

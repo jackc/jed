@@ -2064,3 +2064,30 @@ re-executed per outer row (§26). Cost is the sum of those per-row evaluations �
   that references only an *enclosing* query)`, recorded in the override ledger. A `RIGHT`/`FULL JOIN` to
   a fully **un**correlated lateral item is allowed (matches PG).
 - **comma-`FROM` `LATERAL`** (`FROM t, LATERAL (…)`) waits on comma-`FROM` (§15).
+
+## 45. `CREATE SEQUENCE` / `DROP SEQUENCE` ([sequences.md](sequences.md))
+
+```
+create_sequence ::= "CREATE" "SEQUENCE" ("IF" "NOT" "EXISTS")? identifier sequence_option*
+sequence_option ::= "INCREMENT" "BY"? signed_integer
+                  | "MINVALUE" signed_integer | "NO" "MINVALUE"
+                  | "MAXVALUE" signed_integer | "NO" "MAXVALUE"
+                  | "START" "WITH"? signed_integer
+                  | "CACHE" signed_integer
+                  | "CYCLE" | "NO" "CYCLE"
+drop_sequence   ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier)* "RESTRICT"?
+```
+
+The options are **order-free** and each appears at most once (a repeat is `42601`), like the FK
+actions (§43) — the parser loops, dispatching on the leading keyword. `INCREMENT`/`START` accept an
+optional `BY`/`WITH`. An option value is a `signed_integer` (an optional leading `-` then an integer
+literal — `START WITH -1`, `INCREMENT BY -2`); it spans the full int64 range, so a value out of range
+is `22003` at parse, and `INCREMENT 0` / `CACHE < 1` / an inconsistent `START`/`MIN`/`MAX` is `22023`
+at execution. `SEQUENCE`, `INCREMENT`, `MINVALUE`, `MAXVALUE`, `START`, `CACHE`, `CYCLE`, `BY`, `WITH`
+stay **non-reserved** (§3): `CREATE SEQUENCE` / `DROP SEQUENCE` is recognized by the two leading
+keywords, and the option keywords are matched positionally inside the loop, so an unrelated identifier
+use is unaffected. The parser knows no catalog; execution resolves the name against the shared relation
+namespace (`42P07` duplicate unless `IF NOT EXISTS`) and (`DROP`) raises `42P01` on a missing sequence
+unless `IF EXISTS`. PostgreSQL *reserves* none of these either, so no oracle-override surface beyond the
+sequence behavior itself. `nextval('s')` / `currval('s')` are ordinary `function_call`s (§ no new
+production) — they resolve their `text` argument to a sequence at evaluation (`42P01` if missing).

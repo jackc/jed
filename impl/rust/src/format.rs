@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    FkAction, ForeignKeyConstraint, IndexDef, Table,
+    FkAction, ForeignKeyConstraint, IndexDef, SequenceDef, Table,
 };
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
@@ -41,7 +41,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// expression-default flag; v7 added a per-page CRC-32 (header grew 12→16 bytes). The bump from 10
 /// was atomic across the Rust/Go/TS cores + the Ruby golden reference (every `.jed` golden's version
 /// byte + CRC changed together).
-const FORMAT_VERSION: u16 = 11;
+const FORMAT_VERSION: u16 = 12;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -765,6 +765,11 @@ impl Snapshot {
             e.extend_from_slice(&composite_type_entry_bytes(ct));
             cat_entries.push(e);
         }
+        for s in self.sequences_sorted() {
+            let mut e = vec![2u8];
+            e.extend_from_slice(&sequence_entry_bytes(s));
+            cat_entries.push(e);
+        }
         for (ti, (_, t, _)) in tables.iter().enumerate() {
             let mut e = vec![0u8];
             e.extend_from_slice(&table_entry_bytes(t, root_data_page[ti], &index_roots[ti]));
@@ -1024,6 +1029,11 @@ impl Snapshot {
             e.extend_from_slice(&composite_type_entry_bytes(ct));
             cat_entries.push(e);
         }
+        for s in self.sequences_sorted() {
+            let mut e = vec![2u8];
+            e.extend_from_slice(&sequence_entry_bytes(s));
+            cat_entries.push(e);
+        }
         for (ti, (_, t, _)) in tables.iter().enumerate() {
             let mut e = vec![0u8];
             e.extend_from_slice(&table_entry_bytes(t, root_data_page[ti], &index_roots[ti]));
@@ -1185,6 +1195,12 @@ impl Database {
                     snap.put_type(ct);
                     continue;
                 }
+                if kind == 2 {
+                    // A sequence entry (v12): self-contained, registered directly (no two-pass).
+                    let s = decode_sequence_entry(page.payload, &mut pos)?;
+                    snap.put_sequence(s);
+                    continue;
+                }
                 if kind != 0 {
                     return Err(corrupt("unknown catalog entry kind"));
                 }
@@ -1298,6 +1314,12 @@ impl Database {
                 if kind == 1 {
                     let ct = decode_composite_type_entry(page.payload, &mut pos)?;
                     snap.put_type(ct);
+                    continue;
+                }
+                if kind == 2 {
+                    // A sequence entry (v12): self-contained, registered directly (no two-pass).
+                    let s = decode_sequence_entry(page.payload, &mut pos)?;
+                    snap.put_sequence(s);
                     continue;
                 }
                 if kind != 0 {
@@ -2097,6 +2119,58 @@ fn decode_composite_type_entry(buf: &[u8], pos: &mut usize) -> Result<CompositeT
     Ok(CompositeType { name, fields })
 }
 
+/// Serialize a sequence catalog entry's BODY (after its `entry_kind = 2` byte): name, then the six
+/// fixed i64 fields (big-endian two's-complement, no sign-flip) and a flags byte — spec/fileformat/
+/// format.md *Sequence entry*. Fixed-width, every field present (no presence tags).
+fn sequence_entry_bytes(s: &SequenceDef) -> Vec<u8> {
+    let mut out = Vec::new();
+    let name = s.name.as_bytes();
+    out.extend_from_slice(&(name.len() as u16).to_be_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&s.increment.to_be_bytes());
+    out.extend_from_slice(&s.min_value.to_be_bytes());
+    out.extend_from_slice(&s.max_value.to_be_bytes());
+    out.extend_from_slice(&s.start.to_be_bytes());
+    out.extend_from_slice(&s.cache.to_be_bytes());
+    out.extend_from_slice(&s.last_value.to_be_bytes());
+    let mut flags = 0u8;
+    if s.cycle {
+        flags |= 0b1;
+    }
+    if s.is_called {
+        flags |= 0b10;
+    }
+    out.push(flags);
+    out
+}
+
+/// Decode a sequence catalog entry's body (inverse of `sequence_entry_bytes`); the caller has
+/// already consumed the `entry_kind` byte.
+fn decode_sequence_entry(buf: &[u8], pos: &mut usize) -> Result<SequenceDef> {
+    let name = read_string(buf, pos)?;
+    let increment = read_i64(buf, pos)?;
+    let min_value = read_i64(buf, pos)?;
+    let max_value = read_i64(buf, pos)?;
+    let start = read_i64(buf, pos)?;
+    let cache = read_i64(buf, pos)?;
+    let last_value = read_i64(buf, pos)?;
+    let flags = read_u8(buf, pos)?;
+    if flags & !0b11 != 0 {
+        return Err(corrupt("reserved sequence flag set"));
+    }
+    Ok(SequenceDef {
+        name,
+        increment,
+        min_value,
+        max_value,
+        start,
+        cache,
+        cycle: flags & 0b1 != 0,
+        last_value,
+        is_called: flags & 0b10 != 0,
+    })
+}
+
 fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u32>)> {
     let name = read_string(buf, pos)?;
     let col_count = read_u16(buf, pos)? as usize;
@@ -2772,6 +2846,14 @@ fn read_string(buf: &[u8], pos: &mut usize) -> Result<String> {
     let len = read_u16(buf, pos)? as usize;
     let bytes = take(buf, pos, len)?.to_vec();
     String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 name"))
+}
+
+/// Read an 8-byte big-endian two's-complement i64 (the sequence-entry field encoding).
+fn read_i64(buf: &[u8], pos: &mut usize) -> Result<i64> {
+    let s = take(buf, pos, 8)?;
+    Ok(i64::from_be_bytes([
+        s[0], s[1], s[2], s[3], s[4], s[5], s[6], s[7],
+    ]))
 }
 
 #[cfg(test)]

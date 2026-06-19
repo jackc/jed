@@ -171,10 +171,13 @@ class Parser {
         // CREATE TYPE — a 2-token lookahead keeps TYPE non-reserved (the CREATE UNIQUE INDEX
         // precedent — composite.md §1).
         if (this.peekKeywordAt(1) === "type") return this.parseCreateType();
+        // CREATE SEQUENCE — a 2-token lookahead keeps SEQUENCE non-reserved (sequences.md §1).
+        if (this.peekKeywordAt(1) === "sequence") return this.parseCreateSequence();
         return this.parseCreateTable();
       case "drop":
         if (this.peekKeywordAt(1) === "index") return this.parseDropIndex();
         if (this.peekKeywordAt(1) === "type") return this.parseDropType();
+        if (this.peekKeywordAt(1) === "sequence") return this.parseDropSequence();
         return this.parseDropTable();
       case "insert":
         return this.parseInsert();
@@ -693,6 +696,172 @@ class Parser {
       throw engineError("feature_not_supported", "DROP TYPE ... CASCADE is not supported");
     }
     return { kind: "dropType", name, ifExists };
+  }
+
+  // parseCreateSequence parses `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]`
+  // (spec/design/sequences.md §1). The options are order-free and each at most once (a repeat is
+  // 42601); option values are signed integer literals. Validation of the resolved option set
+  // (22023) and the namespace collision (42P07) are execution-time.
+  private parseCreateSequence(): Statement {
+    this.expectKeyword("create");
+    this.expectKeyword("sequence");
+    const ifNotExists = this.parseIfNotExists();
+    const name = this.expectIdentifier();
+    const seq: Statement = {
+      kind: "createSequence",
+      name,
+      ifNotExists,
+      increment: null,
+      minValue: null,
+      maxValue: null,
+      start: null,
+      cache: null,
+      cycle: null,
+    };
+    // Order-free option loop: dispatch on the leading keyword, each option at most once.
+    for (;;) {
+      switch (this.peekKeyword()) {
+        case "increment": {
+          this.dupCheck(seq.increment !== null, "INCREMENT");
+          this.advance();
+          this.consumeKeyword("by");
+          seq.increment = this.parseSignedIntLiteral();
+          break;
+        }
+        case "minvalue": {
+          this.dupCheck(seq.minValue !== null, "MINVALUE");
+          this.advance();
+          seq.minValue = { value: this.parseSignedIntLiteral() };
+          break;
+        }
+        case "maxvalue": {
+          this.dupCheck(seq.maxValue !== null, "MAXVALUE");
+          this.advance();
+          seq.maxValue = { value: this.parseSignedIntLiteral() };
+          break;
+        }
+        case "start": {
+          this.dupCheck(seq.start !== null, "START");
+          this.advance();
+          this.consumeKeyword("with");
+          seq.start = this.parseSignedIntLiteral();
+          break;
+        }
+        case "cache": {
+          this.dupCheck(seq.cache !== null, "CACHE");
+          this.advance();
+          seq.cache = this.parseSignedIntLiteral();
+          break;
+        }
+        case "cycle": {
+          this.dupCheck(seq.cycle !== null, "CYCLE");
+          this.advance();
+          seq.cycle = true;
+          break;
+        }
+        // `NO MINVALUE` / `NO MAXVALUE` / `NO CYCLE`.
+        case "no": {
+          this.advance();
+          switch (this.peekKeyword()) {
+            case "minvalue":
+              this.dupCheck(seq.minValue !== null, "MINVALUE");
+              this.advance();
+              seq.minValue = { value: null };
+              break;
+            case "maxvalue":
+              this.dupCheck(seq.maxValue !== null, "MAXVALUE");
+              this.advance();
+              seq.maxValue = { value: null };
+              break;
+            case "cycle":
+              this.dupCheck(seq.cycle !== null, "CYCLE");
+              this.advance();
+              seq.cycle = false;
+              break;
+            default:
+              throw engineError(
+                "syntax_error",
+                `expected MINVALUE, MAXVALUE, or CYCLE after NO, found '${this.peekKeyword()}'`,
+              );
+          }
+          break;
+        }
+        default:
+          return seq;
+      }
+    }
+  }
+
+  // parseDropSequence parses `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT | CASCADE]`
+  // (spec/design/sequences.md §1). CASCADE is 0A000 at parse; a missing sequence (42P01) is
+  // execution-time.
+  private parseDropSequence(): Statement {
+    this.expectKeyword("drop");
+    this.expectKeyword("sequence");
+    let ifExists = false;
+    if (this.peekKeyword() === "if") {
+      this.advance();
+      this.expectKeyword("exists");
+      ifExists = true;
+    }
+    const names = [this.expectIdentifier()];
+    while (this.peek().kind === "comma") {
+      this.advance();
+      names.push(this.expectIdentifier());
+    }
+    let cascade = false;
+    if (this.peekKeyword() === "restrict") {
+      this.advance();
+    } else if (this.peekKeyword() === "cascade") {
+      this.advance();
+      cascade = true;
+    }
+    if (cascade) {
+      throw engineError("feature_not_supported", "DROP SEQUENCE ... CASCADE is not supported");
+    }
+    return { kind: "dropSequence", names, ifExists };
+  }
+
+  // parseIfNotExists consumes an optional `IF NOT EXISTS` prefix, returning whether it was present.
+  private parseIfNotExists(): boolean {
+    if (this.peekKeyword() === "if") {
+      this.advance();
+      this.expectKeyword("not");
+      this.expectKeyword("exists");
+      return true;
+    }
+    return false;
+  }
+
+  // consumeKeyword consumes an optional noise keyword (e.g. the `BY` in `INCREMENT BY`, the
+  // `WITH` in `START WITH`) when present.
+  private consumeKeyword(kw: string): void {
+    if (this.peekKeyword() === kw) this.advance();
+  }
+
+  // dupCheck raises 42601 when an option appeared twice.
+  private dupCheck(already: boolean, opt: string): void {
+    if (already) throw engineError("syntax_error", `${opt} specified more than once`);
+  }
+
+  // parseSignedIntLiteral parses a signed integer literal (`-? INT`) as a bigint — the sequence-
+  // option value form. The lexer caps an `int` magnitude at 2^63, so the only out-of-range case is
+  // a bare positive 2^63 (22003 — numeric_value_out_of_range); a negated 2^63 is i64::MIN (valid).
+  private parseSignedIntLiteral(): bigint {
+    let neg = false;
+    if (this.peek().kind === "minus") {
+      this.advance();
+      neg = true;
+    }
+    const t = this.advance();
+    if (t.kind !== "int") {
+      throw engineError("syntax_error", `expected an integer, found ${t.kind}`);
+    }
+    const v = neg ? -t.int! : t.int!;
+    if (v < -9223372036854775808n || v > 9223372036854775807n) {
+      throw engineError("numeric_value_out_of_range", "sequence parameter out of int64 range");
+    }
+    return v;
   }
 
   // parseInsert parses `INSERT INTO <table> [( <col> [, <col>]* )] ( VALUES <row> [, <row>]* |

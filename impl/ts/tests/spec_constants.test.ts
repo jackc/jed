@@ -95,6 +95,8 @@ test("error codes are registered in spec/errors/registry.toml", () => {
     "datetime_field_overflow",
     "division_by_zero",
     "invalid_parameter_value",
+    "sequence_generator_limit_exceeded",
+    "object_not_in_prerequisite_state",
     "array_subscript_error",
     "invalid_row_count_in_limit_clause",
     "invalid_row_count_in_offset_clause",
@@ -242,6 +244,8 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.generatedRow;
       case "cte_scan_row":
         return COSTS.cteScanRow;
+      case "sequence_advance":
+        return COSTS.sequenceAdvance;
       default:
         throw new Error(`cost unit ${id} has no COSTS field — update this cross-check`);
     }

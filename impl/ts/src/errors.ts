@@ -15,6 +15,7 @@ export type SqlState =
   | "datetime_field_overflow" // 22008 — out-of-range datetime field or value beyond int64 µs
   | "division_by_zero" // 22012 — division or modulo by zero
   | "invalid_parameter_value" // 22023 — a bad numeric typmod (e.g. numeric(0))
+  | "sequence_generator_limit_exceeded" // 2200H — nextval advanced past a sequence's MAX/MINVALUE bound without CYCLE (sequences.md §4)
   | "array_subscript_error" // 2202E — non-matching multidim sub-array dims, or inverted [l:u] array bounds
   | "invalid_text_representation" // 22P02 — malformed text input (e.g. bytea hex)
   | "invalid_escape_sequence" // 22025 — a LIKE pattern ending in a lone escape character
@@ -27,6 +28,7 @@ export type SqlState =
   | "active_sql_transaction" // 25001 — a nested BEGIN (no SAVEPOINT this slice; transactions.md §4.2)
   | "read_only_sql_transaction" // 25006 — a write in a READ ONLY transaction (transactions.md §4.3)
   | "in_failed_sql_transaction" // 25P02 — a statement in a failed/aborted block (transactions.md §6)
+  | "object_not_in_prerequisite_state" // 55000 — currval/lastval before nextval defined it this session (sequences.md §6)
   | "syntax_error" // 42601
   | "undefined_table" // 42P01
   | "undefined_column" // 42703
@@ -65,6 +67,7 @@ const CODES: Record<SqlState, string> = {
   datetime_field_overflow: "22008",
   division_by_zero: "22012",
   invalid_parameter_value: "22023",
+  sequence_generator_limit_exceeded: "2200H",
   array_subscript_error: "2202E",
   invalid_text_representation: "22P02",
   invalid_escape_sequence: "22025",
@@ -77,6 +80,7 @@ const CODES: Record<SqlState, string> = {
   active_sql_transaction: "25001",
   read_only_sql_transaction: "25006",
   in_failed_sql_transaction: "25P02",
+  object_not_in_prerequisite_state: "55000",
   syntax_error: "42601",
   undefined_table: "42P01",
   undefined_column: "42703",

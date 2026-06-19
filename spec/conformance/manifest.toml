@@ -65,6 +65,10 @@ id = "ddl.column_default_expr"
 description = "DEFAULT <expression> column constraint — a non-constant default (function calls like uuidv7(), arithmetic like 1 + 1); no column refs/subqueries/aggregates/params (0A000/0A000/42803/42P02), result type checked assignable to the column (42804) at CREATE TABLE; evaluated per row at INSERT through the per-statement seam (spec/design/constraints.md §2)"
 
 [[capability]]
+id = "ddl.sequence"
+description = "CREATE SEQUENCE [IF NOT EXISTS] name [INCREMENT [BY] n] [MINVALUE m | NO MINVALUE] [MAXVALUE x | NO MAXVALUE] [START [WITH] s] [CACHE c] [[NO] CYCLE] / DROP SEQUENCE [IF EXISTS] name [, …] — a named, persisted, monotonic int64 generator as the third catalog-object kind (entry_kind 2, format_version 12). Order-free options, bigint-only (AS type 0A000); the name shares the relation namespace (42P07 duplicate / 42P01 missing); INCREMENT 0 / CACHE < 1 / inconsistent START/MIN/MAX is 22023; CACHE accepted but behaves as 1 (a documented PG divergence); RESTRICT-only (CASCADE 0A000). nextval is TRANSACTIONAL — rolls back with the txn (a documented PG divergence mandated by determinism.md §5) (spec/design/sequences.md, grammar.md §44)"
+
+[[capability]]
 id = "dml.insert_column_list"
 description = "INSERT with an explicit column list `(a, c)` — unlisted columns take their default else NULL; the DEFAULT keyword in a value slot; unknown column 42703, duplicate 42701 (spec/design/grammar.md §12)"
 
@@ -457,6 +461,10 @@ description = "CASE expression (searched + simple forms): lazy first-match evalu
 # Scalar functions (kind = "function", spec/design/functions.md §9) — named f(args) calls
 # evaluated per row, valid anywhere an expression is (unlike aggregates). One capability per
 # function so a core can land them independently.
+[[capability]]
+id = "func.sequence"
+description = "nextval('s') / currval('s') sequence value functions (volatile, int64) — nextval advances a sequence and returns the new value (first call returns START, then +INCREMENT, bounded by MIN/MAXVALUE → 2200H or CYCLE wrap), making the statement a WRITE (25006 in a read-only txn) and TRANSACTIONALLY (rolls back — a documented PG divergence, sequences.md §5); currval returns the value nextval last produced IN THIS SESSION (55000 before the first nextval), a per-handle read. Missing sequence 42P01, NULL name propagates NULL; one sequence_advance cost unit per nextval (spec/design/functions.md §14, sequences.md §4)"
+
 [[capability]]
 id = "func.abs"
 description = "abs(x) scalar function — abs(int16|int32|int64) → same int type (abs(INT_MIN) overflows, 22003); abs(numeric) → numeric; NULL propagates (spec/design/functions.md §9)"

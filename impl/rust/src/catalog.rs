@@ -121,6 +121,48 @@ pub struct CompositeField {
     pub not_null: bool,
 }
 
+/// A **sequence** (spec/design/sequences.md): a named, persisted, monotonic int64 generator —
+/// the third database-level catalog-object kind (after tables and composite types). The
+/// definition fields (`increment`/`min_value`/`max_value`/`start`/`cache`/`cycle`) are immutable;
+/// `last_value` + `is_called` are the mutable counter state a `nextval` advances. The whole struct
+/// lives in the snapshot catalog, so the counter is transactional by construction (sequences.md §5).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SequenceDef {
+    /// The sequence name (original case; looked up case-insensitively).
+    pub name: String,
+    /// The step per `nextval` (non-zero). Positive = ascending, negative = descending.
+    pub increment: i64,
+    /// The inclusive lower bound.
+    pub min_value: i64,
+    /// The inclusive upper bound.
+    pub max_value: i64,
+    /// The first value `nextval` returns (on a fresh sequence, `last_value == start`).
+    pub start: i64,
+    /// The PostgreSQL `CACHE` size — stored for fidelity but behaves as 1 (sequences.md §7).
+    pub cache: i64,
+    /// Whether `nextval` wraps at a bound (`CYCLE`) instead of raising `2200H`.
+    pub cycle: bool,
+    /// The mutable counter: the most recent value produced (or `start` before the first call).
+    pub last_value: i64,
+    /// Whether `nextval` has been called: `false` ⇒ the next call returns `last_value` (= `start`)
+    /// without incrementing; `true` ⇒ it adds `increment` (PostgreSQL's `is_called`).
+    pub is_called: bool,
+}
+
+impl SequenceDef {
+    /// The type defaults for an ascending (`increment > 0`) vs descending sequence, before any
+    /// explicit MIN/MAX/START override (PostgreSQL): ascending ⇒ [1, i64::MAX], start = MIN;
+    /// descending ⇒ [-(i64::MAX), -1], start = MAX. (`i64::MIN` is reserved out of the default
+    /// descending floor, matching PG's `-9223372036854775807` default MINVALUE.)
+    pub fn default_bounds(increment: i64) -> (i64, i64) {
+        if increment < 0 {
+            (-i64::MAX, -1)
+        } else {
+            (1, i64::MAX)
+        }
+    }
+}
+
 /// A table definition.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Table {

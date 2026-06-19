@@ -5,14 +5,14 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    BinaryOp, CreateIndex, CreateTable, CreateType, Delete, DropIndex, DropTable, DropType, Expr,
-    Insert, InsertSource, InsertValue, JoinKind, Literal, OrderKey, QueryExpr, RefAction, Select,
-    SelectItems, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update,
-    WithQuery,
+    BinaryOp, CreateIndex, CreateSequence, CreateTable, CreateType, Delete, DropIndex,
+    DropSequence, DropTable, DropType, Expr, Insert, InsertSource, InsertValue, JoinKind, Literal,
+    OrderKey, QueryExpr, RefAction, Select, SelectItems, SetOp, SetOpKind, Statement,
+    SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    FkAction, ForeignKeyConstraint, IndexDef, Table, resolve_col_type,
+    FkAction, ForeignKeyConstraint, IndexDef, SequenceDef, Table, resolve_col_type,
 };
 use crate::cost::Meter;
 use crate::costs::COSTS;
@@ -143,6 +143,11 @@ pub struct Snapshot {
     /// lowercased index name (index names live in the relation namespace, globally unique).
     /// Which table owns an index is recorded in that table's `Table::indexes`.
     index_stores: HashMap<String, TableStore>,
+    /// Sequences, keyed by lowercased name (spec/design/sequences.md). A database-level object set
+    /// separate from `tables`/`types`; serialized into the catalog's sequence entries
+    /// (spec/fileformat/format.md, `entry_kind = 2`). The mutable counter (`last_value`/`is_called`)
+    /// lives here, so `nextval` advances the working snapshot and rolls back with it (sequences.md §5).
+    sequences: HashMap<String, SequenceDef>,
 }
 
 impl Snapshot {
@@ -173,6 +178,30 @@ impl Snapshot {
         let mut keys: Vec<&String> = self.types.keys().collect();
         keys.sort();
         keys.into_iter().map(|k| &self.types[k]).collect()
+    }
+
+    /// Look up a sequence by name (case-insensitive).
+    pub fn sequence(&self, name: &str) -> Option<&SequenceDef> {
+        self.sequences.get(&name.to_ascii_lowercase())
+    }
+
+    /// Register a sequence (CREATE SEQUENCE). Lower-cased name is the key. The caller has already
+    /// validated the option set and checked the relation namespace for a collision.
+    pub(crate) fn put_sequence(&mut self, seq: SequenceDef) {
+        self.sequences.insert(seq.name.to_ascii_lowercase(), seq);
+    }
+
+    /// Remove a sequence (DROP SEQUENCE). The caller has checked it exists.
+    pub(crate) fn remove_sequence(&mut self, key: &str) {
+        self.sequences.remove(key);
+    }
+
+    /// All sequences in ascending lowercased-name order — the on-disk emission order
+    /// (spec/fileformat/format.md) and a deterministic order with no hash-iteration leak (§8).
+    pub(crate) fn sequences_sorted(&self) -> Vec<&SequenceDef> {
+        let mut keys: Vec<&String> = self.sequences.keys().collect();
+        keys.sort();
+        keys.into_iter().map(|k| &self.sequences[k]).collect()
     }
 
     /// Whether any table column or composite-type field still references the composite type
@@ -558,6 +587,19 @@ pub struct Database {
     /// (the `# seed:` / `# clock:` directives) for exact cross-core output. A handle setting, not
     /// stored in the file; does not affect a query that calls no generator.
     pub(crate) seam: crate::seam::Seam,
+    /// Per-handle **session** sequence state for `currval` (spec/design/sequences.md §6): the last
+    /// value `nextval` produced **in this session** for each sequence (lowercased name). NOT part of
+    /// the snapshot and NOT persisted — strictly session-local, as in PostgreSQL. Updated when a
+    /// sequence-advancing statement succeeds (flushing `pending_seq`); `currval` of an unlisted
+    /// sequence this session is `55000`.
+    session_seq: HashMap<String, i64>,
+    /// Per-**statement** running sequence advances (spec/design/sequences.md §4), behind a `RefCell`
+    /// for interior mutability — `EvalEnv` borrows `&Database`, so a `nextval` records its advance
+    /// here (seeded from the working snapshot on first touch), and later `nextval`/`currval` calls in
+    /// the same statement see the running state. On statement success it is flushed into the working
+    /// snapshot (so commit persists it) + `session_seq`; on error it is discarded (the transactional
+    /// rollback of the advance, sequences.md §5). Cleared at the start of every statement.
+    pending_seq: std::cell::RefCell<HashMap<String, SequenceDef>>,
 }
 
 /// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
@@ -601,6 +643,8 @@ impl Database {
             read_only: false,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             seam: crate::seam::Seam::default(),
+            session_seq: HashMap::new(),
+            pending_seq: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -623,6 +667,8 @@ impl Database {
             read_only: false,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             seam: crate::seam::Seam::default(),
+            session_seq: HashMap::new(),
+            pending_seq: std::cell::RefCell::new(HashMap::new()),
         }
     }
 
@@ -650,6 +696,102 @@ impl Database {
     /// `Transaction`/read surfaces and for the on-disk serializer.
     pub(crate) fn committed(&self) -> &Snapshot {
         &self.committed
+    }
+
+    /// `nextval('name')` (spec/design/sequences.md §4): advance the named sequence and return the
+    /// new value. Interior-mutable (the evaluator borrows `&Database`): the running state lives in
+    /// `pending_seq`, seeded from the working snapshot on first touch this statement, and is flushed
+    /// into the working snapshot + `session_seq` on statement success ([`flush_pending_sequences`]).
+    /// A missing sequence is 42P01; advancing past a bound without CYCLE is 2200H.
+    fn seq_nextval(&self, name: &str) -> Result<i64> {
+        let key = name.to_ascii_lowercase();
+        let mut pending = self.pending_seq.borrow_mut();
+        let mut def = match pending.get(&key) {
+            Some(d) => d.clone(),
+            None => self.read_snap().sequence(name).cloned().ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("relation does not exist: {name}"),
+                )
+            })?,
+        };
+        let result = if !def.is_called {
+            // The first nextval returns START (the current last_value) without incrementing.
+            def.is_called = true;
+            def.last_value
+        } else {
+            // Advance by increment, treating an i64 overflow or a bound crossing identically.
+            let stepped = def.last_value.checked_add(def.increment);
+            let next = match stepped {
+                Some(n) if def.increment > 0 && n <= def.max_value => n,
+                Some(n) if def.increment < 0 && n >= def.min_value => n,
+                _ => {
+                    if def.cycle {
+                        if def.increment > 0 {
+                            def.min_value
+                        } else {
+                            def.max_value
+                        }
+                    } else {
+                        return Err(EngineError::new(
+                            SqlState::SequenceGeneratorLimitExceeded,
+                            format!(
+                                "nextval: reached {} value of sequence {name}",
+                                if def.increment > 0 {
+                                    "maximum"
+                                } else {
+                                    "minimum"
+                                }
+                            ),
+                        ));
+                    }
+                }
+            };
+            def.last_value = next;
+            next
+        };
+        pending.insert(key, def);
+        Ok(result)
+    }
+
+    /// `currval('name')` (spec/design/sequences.md §6): the value `nextval` last produced for this
+    /// sequence IN THIS SESSION. Resolves the name against the catalog first (42P01 if absent), then
+    /// reads the running advance this statement (`pending_seq`) else the session value
+    /// (`session_seq`); 55000 if `nextval` has not been called this session.
+    fn seq_currval(&self, name: &str) -> Result<i64> {
+        if self.read_snap().sequence(name).is_none() {
+            return Err(EngineError::new(
+                SqlState::UndefinedTable,
+                format!("relation does not exist: {name}"),
+            ));
+        }
+        let key = name.to_ascii_lowercase();
+        if let Some(d) = self.pending_seq.borrow().get(&key)
+            && d.is_called
+        {
+            return Ok(d.last_value);
+        }
+        if let Some(v) = self.session_seq.get(&key) {
+            return Ok(*v);
+        }
+        Err(EngineError::new(
+            SqlState::ObjectNotInPrerequisiteState,
+            format!("currval of sequence {name} is not yet defined in this session"),
+        ))
+    }
+
+    /// Flush the statement's pending sequence advances into the working snapshot (so a commit
+    /// persists them) and into `session_seq` (so `currval` sees them). Called on the success of a
+    /// sequence-advancing statement, while a write transaction is open; a no-op when nothing
+    /// advanced. On statement error the pending map is instead discarded (cleared at the next
+    /// statement), giving the transactional rollback of the advance (sequences.md §5).
+    fn flush_pending_sequences(&mut self) {
+        let pending = std::mem::take(&mut *self.pending_seq.borrow_mut());
+        for (key, def) in pending {
+            let last = def.last_value;
+            self.working_mut().put_sequence(def);
+            self.session_seq.insert(key, last);
+        }
     }
 
     /// The oldest still-live snapshot's txid (spec/design/transactions.md §8) — the Phase-6
@@ -850,6 +992,9 @@ impl Database {
             Statement::Rollback => return self.rollback_tx(),
             _ => {}
         }
+        // Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
+        // populated — it is discarded, not flushed, on error; sequences.md §5).
+        self.pending_seq.borrow_mut().clear();
 
         // Inside an explicit block? Read the flags, dropping the borrow before dispatch.
         if self.tx.is_some() {
@@ -875,7 +1020,11 @@ impl Database {
             } else {
                 self.dispatch_stmt(stmt, params)
             };
-            if result.is_err() {
+            if result.is_ok() {
+                // Land any nextval advances into the block's working snapshot; COMMIT publishes
+                // them, ROLLBACK discards them with the rest of the working set (sequences.md §5).
+                self.flush_pending_sequences();
+            } else {
                 self.tx.as_mut().expect("tx is open").failed = true;
             }
             return result;
@@ -906,7 +1055,12 @@ impl Database {
             working: self.committed.clone(),
         });
         match self.dispatch_stmt(stmt, params) {
-            Ok(outcome) => self.commit_tx().map(|_| outcome),
+            Ok(outcome) => {
+                // Persist any nextval advances into the working snapshot before publishing it
+                // (sequences.md §5); a non-sequence statement flushes nothing.
+                self.flush_pending_sequences();
+                self.commit_tx().map(|_| outcome)
+            }
             Err(e) => {
                 self.tx = None;
                 Err(e)
@@ -1023,6 +1177,14 @@ impl Database {
             Statement::DropType(dt) => {
                 reject_params_for_ddl(params)?;
                 self.execute_drop_type(dt)
+            }
+            Statement::CreateSequence(cs) => {
+                reject_params_for_ddl(params)?;
+                self.execute_create_sequence(cs)
+            }
+            Statement::DropSequence(ds) => {
+                reject_params_for_ddl(params)?;
+                self.execute_drop_sequence(ds)
             }
             Statement::Insert(ins) => self.execute_insert(ins, params),
             Statement::Select(sel) => self.execute_select(sel, params),
@@ -2135,6 +2297,114 @@ impl Database {
         }
         let key = dt.name.to_ascii_lowercase();
         self.working_mut().remove_type(&key);
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
+    }
+
+    /// Analyze and run a CREATE SEQUENCE (spec/design/sequences.md). Resolve the option overrides
+    /// against the INCREMENT sign's type defaults, validate the set (22023), reject a relation-
+    /// namespace collision (42P07 unless `IF NOT EXISTS`), and register the sequence.
+    fn execute_create_sequence(&mut self, cs: CreateSequence) -> Result<Outcome> {
+        if self.relation_exists(&cs.name) {
+            if cs.if_not_exists {
+                return Ok(Outcome::Statement {
+                    cost: 0,
+                    rows_affected: None,
+                });
+            }
+            return Err(EngineError::new(
+                SqlState::DuplicateTable,
+                format!("relation already exists: {}", cs.name),
+            ));
+        }
+        let increment = cs.increment.unwrap_or(1);
+        if increment == 0 {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                "INCREMENT must not be zero".to_string(),
+            ));
+        }
+        let cache = cs.cache.unwrap_or(1);
+        if cache < 1 {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!("CACHE ({cache}) must be greater than zero"),
+            ));
+        }
+        let (def_min, def_max) = SequenceDef::default_bounds(increment);
+        // `Some(Some(v))` MINVALUE v / `Some(None)` NO MINVALUE / `None` unset → the default.
+        let min_value = match cs.min_value {
+            Some(Some(v)) => v,
+            Some(None) | None => def_min,
+        };
+        let max_value = match cs.max_value {
+            Some(Some(v)) => v,
+            Some(None) | None => def_max,
+        };
+        if min_value > max_value {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!("MINVALUE ({min_value}) must be less than MAXVALUE ({max_value})"),
+            ));
+        }
+        // START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
+        let start = cs
+            .start
+            .unwrap_or(if increment < 0 { max_value } else { min_value });
+        if start < min_value || start > max_value {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!(
+                    "START value ({start}) cannot be {} the {} value",
+                    if start < min_value {
+                        "less than MINVALUE"
+                    } else {
+                        "greater than MAXVALUE"
+                    },
+                    if start < min_value {
+                        min_value
+                    } else {
+                        max_value
+                    }
+                ),
+            ));
+        }
+        self.working_mut().put_sequence(SequenceDef {
+            name: cs.name.clone(),
+            increment,
+            min_value,
+            max_value,
+            start,
+            cache,
+            cycle: cs.cycle.unwrap_or(false),
+            last_value: start,
+            is_called: false,
+        });
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
+    }
+
+    /// Analyze and run a DROP SEQUENCE (spec/design/sequences.md §1). RESTRICT-only: a missing
+    /// sequence is 42P01 unless `IF EXISTS`. No dependency tracking this slice (a plain `DEFAULT
+    /// nextval('s')` creates none — PG). Multiple names are dropped left to right.
+    fn execute_drop_sequence(&mut self, ds: DropSequence) -> Result<Outcome> {
+        for name in &ds.names {
+            if self.read_snap().sequence(name).is_none() {
+                if ds.if_exists {
+                    continue;
+                }
+                return Err(EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("sequence does not exist: {name}"),
+                ));
+            }
+            let key = name.to_ascii_lowercase();
+            self.working_mut().remove_sequence(&key);
+        }
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
@@ -5605,7 +5875,9 @@ impl Database {
     /// Whether `name` is taken in the shared relation namespace (a table OR an index —
     /// spec/design/indexes.md §2), case-insensitively.
     fn relation_exists(&self, name: &str) -> bool {
-        self.table(name).is_some() || self.find_index(name).is_some()
+        self.table(name).is_some()
+            || self.find_index(name).is_some()
+            || self.read_snap().sequence(name).is_some()
     }
 
     /// Execute an index equality bound (cost.md §3 "index-bounded scan"): fetch the rows the
@@ -6178,6 +6450,13 @@ enum ScalarFunc {
     /// clock_timestamp() → timestamptz — the clock seam read on EVERY call, so it may advance
     /// within a statement (entropy.md §5). VOLATILE.
     ClockTimestamp,
+    /// nextval(text) → int64 — advance the named sequence and return the new value
+    /// (spec/design/sequences.md §4). VOLATILE; MUTATES the working snapshot (via `pending_seq`),
+    /// so a statement calling it runs on the write path.
+    Nextval,
+    /// currval(text) → int64 — the value `nextval` last produced for the named sequence IN THIS
+    /// SESSION (sequences.md §6). VOLATILE; reads per-session state, 55000 before the first nextval.
+    Currval,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -8413,6 +8692,10 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "uuidv7" => ScalarFunc::Uuidv7,
         "now" => ScalarFunc::Now,
         "clock_timestamp" => ScalarFunc::ClockTimestamp,
+        // Sequence value functions (sequences.md §4). nextval MUTATES (write path); both resolve
+        // their text argument to a catalog sequence at eval.
+        "nextval" => ScalarFunc::Nextval,
+        "currval" => ScalarFunc::Currval,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -9463,10 +9746,129 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
             | Statement::DropIndex(_)
             | Statement::CreateType(_)
             | Statement::DropType(_)
+            | Statement::CreateSequence(_)
+            | Statement::DropSequence(_)
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
     )
+    // A read-shaped statement that calls a sequence-mutating function (nextval) IS a write
+    // (spec/design/sequences.md §4): it must take the write gate, stage the advance, and commit
+    // (autocommit) — and is 25006 in a READ ONLY transaction, exactly like any other write.
+    || stmt_calls_seq_mutator(stmt)
+}
+
+/// Whether `stmt`'s expression trees contain a sequence-MUTATING function call (`nextval`; in S2,
+/// `setval`) anywhere — which makes an otherwise read-shaped statement a write (sequences.md §4).
+/// Only the **read-shaped** statements need checking: INSERT/UPDATE/DELETE/DDL are already writes
+/// (the `matches!` in [`stmt_is_write`] short-circuits before this), and an INSERT `VALUES` slot is
+/// literal-only (no function call). `currval` is a pure read and is NOT counted. The `Expr` walk is
+/// exhaustive (the compiler enforces it), so no expression position is missed.
+fn stmt_calls_seq_mutator(stmt: &Statement) -> bool {
+    match stmt {
+        Statement::Select(s) => select_calls_seq_mutator(s),
+        Statement::SetOp(so) => setop_calls_seq_mutator(so),
+        Statement::With(w) => {
+            w.ctes.iter().any(|c| query_calls_seq_mutator(&c.query))
+                || query_calls_seq_mutator(&w.body)
+        }
+        _ => false,
+    }
+}
+
+fn query_calls_seq_mutator(qe: &QueryExpr) -> bool {
+    match qe {
+        QueryExpr::Select(s) => select_calls_seq_mutator(s),
+        QueryExpr::SetOp(so) => setop_calls_seq_mutator(so),
+    }
+}
+
+fn setop_calls_seq_mutator(so: &SetOp) -> bool {
+    query_calls_seq_mutator(&so.lhs) || query_calls_seq_mutator(&so.rhs)
+}
+
+fn select_calls_seq_mutator(s: &Select) -> bool {
+    let item_calls = match &s.items {
+        SelectItems::All => false,
+        SelectItems::Items(items) => items.iter().any(|i| expr_calls_seq_mutator(&i.expr)),
+    };
+    item_calls
+        || s.from.as_ref().is_some_and(table_ref_calls)
+        || s.joins
+            .iter()
+            .any(|j| table_ref_calls(&j.table) || j.on.as_ref().is_some_and(expr_calls_seq_mutator))
+        || s.filter.as_ref().is_some_and(expr_calls_seq_mutator)
+        || s.group_by.iter().any(expr_calls_seq_mutator)
+        || s.having.as_ref().is_some_and(expr_calls_seq_mutator)
+}
+
+fn table_ref_calls(t: &TableRef) -> bool {
+    t.args
+        .as_ref()
+        .is_some_and(|a| a.iter().any(expr_calls_seq_mutator))
+        || t.subquery
+            .as_ref()
+            .is_some_and(|q| query_calls_seq_mutator(q))
+        || t.values
+            .as_ref()
+            .is_some_and(|rows| rows.iter().flatten().any(expr_calls_seq_mutator))
+}
+
+/// Exhaustive over `Expr` (the compiler enforces it): true iff the tree contains a `nextval` call.
+fn expr_calls_seq_mutator(e: &Expr) -> bool {
+    match e {
+        Expr::FuncCall { name, args, .. } => {
+            name.eq_ignore_ascii_case("nextval") || args.iter().any(expr_calls_seq_mutator)
+        }
+        Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::Param(_) => false,
+        Expr::Row(es) | Expr::Array(es) => es.iter().any(expr_calls_seq_mutator),
+        Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_calls_seq_mutator(base),
+        Expr::Subscript { base, subscripts } => {
+            expr_calls_seq_mutator(base)
+                || subscripts.iter().any(|s| match s {
+                    SubscriptSpec::Index(x) => expr_calls_seq_mutator(x),
+                    SubscriptSpec::Slice(lo, hi) => {
+                        lo.as_ref().is_some_and(|x| expr_calls_seq_mutator(x))
+                            || hi.as_ref().is_some_and(|x| expr_calls_seq_mutator(x))
+                    }
+                })
+        }
+        Expr::Cast { inner, .. } | Expr::Unary { operand: inner, .. } => {
+            expr_calls_seq_mutator(inner)
+        }
+        Expr::IsNull { operand, .. } => expr_calls_seq_mutator(operand),
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::Like { lhs, rhs, .. } => expr_calls_seq_mutator(lhs) || expr_calls_seq_mutator(rhs),
+        Expr::In { lhs, list, .. } => {
+            expr_calls_seq_mutator(lhs) || list.iter().any(expr_calls_seq_mutator)
+        }
+        Expr::Between { lhs, lo, hi, .. } => {
+            expr_calls_seq_mutator(lhs) || expr_calls_seq_mutator(lo) || expr_calls_seq_mutator(hi)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            operand.as_ref().is_some_and(|x| expr_calls_seq_mutator(x))
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_calls_seq_mutator(c) || expr_calls_seq_mutator(r))
+                || els.as_ref().is_some_and(|x| expr_calls_seq_mutator(x))
+        }
+        Expr::ScalarSubquery(q) | Expr::Exists(q) => query_calls_seq_mutator(q),
+        Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
+            expr_calls_seq_mutator(lhs) || query_calls_seq_mutator(query)
+        }
+        Expr::Quantified { lhs, array, .. } => {
+            expr_calls_seq_mutator(lhs) || expr_calls_seq_mutator(array)
+        }
+    }
 }
 
 /// A short label for a statement kind, for the 25006 read-only-violation message (the message
@@ -9479,6 +9881,8 @@ fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::DropIndex(_) => "DROP INDEX",
         Statement::CreateType(_) => "CREATE TYPE",
         Statement::DropType(_) => "DROP TYPE",
+        Statement::CreateSequence(_) => "CREATE SEQUENCE",
+        Statement::DropSequence(_) => "DROP SEQUENCE",
         Statement::Insert(_) => "INSERT",
         Statement::Update(_) => "UPDATE",
         Statement::Delete(_) => "DELETE",
@@ -13750,6 +14154,24 @@ impl RExpr {
                         let micros = r.clock_now_micros(&env.exec.seam);
                         Ok(Value::Timestamptz(micros))
                     }
+                    // Sequence value functions (spec/design/sequences.md §4/§6). nextval charges an
+                    // additional sequence_advance unit (the catalog-tuple read+rewrite) and mutates
+                    // the per-statement pending state; currval is a pure session-state read.
+                    ScalarFunc::Nextval => {
+                        m.charge(COSTS.sequence_advance);
+                        let name = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => unreachable!("resolver restricts nextval's argument to text"),
+                        };
+                        Ok(Value::Int(env.exec.seq_nextval(name)?))
+                    }
+                    ScalarFunc::Currval => {
+                        let name = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => unreachable!("resolver restricts currval's argument to text"),
+                        };
+                        Ok(Value::Int(env.exec.seq_currval(name)?))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -14416,9 +14838,11 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Uuidv4
         | ScalarFunc::Uuidv7
         | ScalarFunc::Now
-        | ScalarFunc::ClockTimestamp => {
+        | ScalarFunc::ClockTimestamp
+        | ScalarFunc::Nextval
+        | ScalarFunc::Currval => {
             unreachable!(
-                "abs/round/make_interval/uuid_*/now/clock_timestamp are handled before eval_float_func"
+                "abs/round/make_interval/uuid_*/now/clock_timestamp/nextval/currval are handled before eval_float_func"
             )
         }
     };

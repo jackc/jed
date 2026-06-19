@@ -156,3 +156,16 @@ event  = "one row produced by a set-returning function (e.g. generate_series) in
 # but not row_produced — and the two diverge under WHERE/LIMIT. The arguments are evaluated once
 # up front (each charging its own operator_eval). Charged at the identical per-row point in every
 # core, so the accrued cost and the abort point are cross-core identical (CLAUDE.md §8/§13).
+
+[[unit]]
+id     = "sequence_advance"
+weight = 1
+event  = "one nextval/setval sequence-state mutation (the catalog tuple read + rewrite)"
+# Landed with sequences (../design/sequences.md §8, ../design/cost.md). Charged once per nextval (and,
+# from S2, setval) evaluation IN ADDITION to the one operator_eval every function call already rides —
+# the advance touches and rewrites a catalog tuple, more than a pure value→value map. currval reads
+# only per-session state and charges nothing beyond its operator_eval. The catalog-tuple I/O is
+# schema-bounded (a fixed SequenceDef), so a flat per-call weight is a sound bound; it keeps a runaway
+# nextval (e.g. a generate_series-driven sweep of SELECT nextval('s')) bounded by max_cost — the 54P01
+# ceiling aborts deterministically — and keeps cost cross-core identical (CLAUDE.md §8/§13). Charged at
+# the identical point (the nextval kernel) in every core.

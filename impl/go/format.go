@@ -22,7 +22,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 11    // on-disk format version (11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6). 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 10 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion   uint16 = 12    // on-disk format version (12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3). 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 11 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -388,6 +388,13 @@ func appendU32(b []byte, v uint32) []byte {
 	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
 
+// appendI64 appends v as 8 big-endian two's-complement bytes (the sequence-entry field encoding).
+func appendI64(b []byte, v int64) []byte {
+	var s [8]byte
+	binary.BigEndian.PutUint64(s[:], uint64(v))
+	return append(b, s[:]...)
+}
+
 // ToImage serializes the whole committed state to one on-disk image (format.md). A thin wrapper
 // over Snapshot.ToImage for the committed snapshot — txid is written into both meta slots. (The
 // writer's working snapshot is serialized directly via Snapshot.ToImage at commit; this serves
@@ -467,6 +474,9 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	var catEntries [][]byte
 	for _, ct := range s.compositeTypesSorted() {
 		catEntries = append(catEntries, append([]byte{1}, compositeTypeEntryBytes(ct)...))
+	}
+	for _, sq := range s.sequencesSorted() {
+		catEntries = append(catEntries, append([]byte{2}, sequenceEntryBytes(sq)...))
 	}
 	for ti, k := range keys {
 		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti])...))
@@ -667,6 +677,9 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 	for _, ct := range s.compositeTypesSorted() {
 		catEntries = append(catEntries, append([]byte{1}, compositeTypeEntryBytes(ct)...))
 	}
+	for _, sq := range s.sequencesSorted() {
+		catEntries = append(catEntries, append([]byte{2}, sequenceEntryBytes(sq)...))
+	}
 	for ti, k := range keys {
 		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti])...))
 	}
@@ -840,6 +853,15 @@ func LoadDatabase(image []byte) (*Database, error) {
 				snap.putType(ct)
 				continue
 			}
+			if kind == 2 {
+				// A sequence entry (v12): self-contained, registered directly (no two-pass).
+				sq, err := decodeSequenceEntry(pg.payload, &pos)
+				if err != nil {
+					return nil, err
+				}
+				snap.putSequence(sq)
+				continue
+			}
 			if kind != 0 {
 				return nil, NewError(DataCorrupted, "unknown catalog entry kind")
 			}
@@ -973,6 +995,15 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 					return nil, err
 				}
 				snap.putType(ct)
+				continue
+			}
+			if kind == 2 {
+				// A sequence entry (v12): self-contained, registered directly (no two-pass).
+				sq, err := decodeSequenceEntry(pg.payload, &pos)
+				if err != nil {
+					return nil, err
+				}
+				snap.putSequence(sq)
 				continue
 			}
 			if kind != 0 {
@@ -1716,6 +1747,81 @@ func decodeCompositeTypeEntry(buf []byte, pos *int) (*CompositeType, error) {
 		fields = append(fields, CompositeField{Name: fname, Type: fty, Decimal: decimal, NotNull: flags&0b1 != 0})
 	}
 	return &CompositeType{Name: name, Fields: fields}, nil
+}
+
+// sequenceEntryBytes serializes a sequence catalog entry's BODY (after its entry_kind = 2 byte):
+// name, then the six fixed i64 fields (big-endian two's-complement, no sign-flip) and a flags byte
+// — spec/fileformat/format.md *Sequence entry*. Fixed-width, every field present (no presence tags).
+func sequenceEntryBytes(s *SequenceDef) []byte {
+	var out []byte
+	out = appendU16(out, uint16(len(s.Name)))
+	out = append(out, s.Name...)
+	out = appendI64(out, s.Increment)
+	out = appendI64(out, s.MinValue)
+	out = appendI64(out, s.MaxValue)
+	out = appendI64(out, s.Start)
+	out = appendI64(out, s.Cache)
+	out = appendI64(out, s.LastValue)
+	var flags byte
+	if s.Cycle {
+		flags |= 0b1
+	}
+	if s.IsCalled {
+		flags |= 0b10
+	}
+	out = append(out, flags)
+	return out
+}
+
+// decodeSequenceEntry decodes a sequence catalog entry's body (inverse of sequenceEntryBytes); the
+// caller has already consumed the entry_kind byte.
+func decodeSequenceEntry(buf []byte, pos *int) (*SequenceDef, error) {
+	name, err := readString(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	increment, err := readI64(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	minValue, err := readI64(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	maxValue, err := readI64(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	start, err := readI64(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	cache, err := readI64(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	lastValue, err := readI64(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	flags, err := readU8(buf, pos)
+	if err != nil {
+		return nil, err
+	}
+	if flags&^uint8(0b11) != 0 {
+		return nil, NewError(DataCorrupted, "reserved sequence flag set")
+	}
+	return &SequenceDef{
+		Name:      name,
+		Increment: increment,
+		MinValue:  minValue,
+		MaxValue:  maxValue,
+		Start:     start,
+		Cache:     cache,
+		Cycle:     flags&0b1 != 0,
+		LastValue: lastValue,
+		IsCalled:  flags&0b10 != 0,
+	}, nil
 }
 
 // tableEntryBytes builds one table's catalog entry (format.md). indexRoots is each
@@ -2999,6 +3105,15 @@ func readU16(buf []byte, pos *int) (uint16, error) {
 		return 0, err
 	}
 	return binary.BigEndian.Uint16(s), nil
+}
+
+// readI64 reads an 8-byte big-endian two's-complement i64 (the sequence-entry field encoding).
+func readI64(buf []byte, pos *int) (int64, error) {
+	s, err := take(buf, pos, 8)
+	if err != nil {
+		return 0, err
+	}
+	return int64(binary.BigEndian.Uint64(s)), nil
 }
 
 func readU32(buf []byte, pos *int) (uint32, error) {

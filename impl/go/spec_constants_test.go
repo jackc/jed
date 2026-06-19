@@ -404,6 +404,8 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.CteScanRow
 		case "generated_row":
 			return Costs.GeneratedRow
+		case "sequence_advance":
+			return Costs.SequenceAdvance
 		default:
 			t.Fatalf("cost unit %q has no Costs field — update this cross-check", id)
 			return 0
@@ -433,6 +435,8 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			return resolvedType{kind: rtUuid}
 		case "interval":
 			return resolvedType{kind: rtInterval}
+		case "text":
+			return resolvedType{kind: rtText}
 		default: // "integer" or "any"
 			return resolvedType{kind: rtInt, intTy: Int32}
 		}

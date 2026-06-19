@@ -58,6 +58,10 @@ var SupportedCapabilities = []string{
 	// Array function surface AF7 (array-functions.md §13): the whole AF1–AF6 surface over a
 	// COMPOSITE element type + unnest(composite[]) — the quantifiers use the composite total order.
 	"func.array_composite",
+	// Sequences — CREATE SEQUENCE / DROP SEQUENCE, a persisted int64 generator (format_version 12),
+	// and the value functions nextval/currval (transactional advance — sequences.md §5).
+	"ddl.sequence",
+	"func.sequence",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
 	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

@@ -18,6 +18,7 @@ export interface CostSchedule {
   aggregateAccumulate: bigint;
   cteScanRow: bigint;
   generatedRow: bigint;
+  sequenceAdvance: bigint;
 }
 
 // The canonical cost schedule — weights accrued per unit during query execution.
@@ -32,4 +33,5 @@ export const COSTS: CostSchedule = {
   aggregateAccumulate: 1n,
   cteScanRow: 1n,
   generatedRow: 1n,
+  sequenceAdvance: 1n,
 };

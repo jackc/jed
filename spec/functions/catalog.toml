@@ -2084,6 +2084,37 @@ null           = "propagates"
 errors         = []
 volatility     = "volatile"
 
+# --- sequence value functions (nextval/currval — ../design/sequences.md §4) -----
+# The PostgreSQL sequence generators. Each takes the sequence NAME as a text argument (the
+# nextval('s'::regclass) form, regclass implicit) — the FIRST built-ins to resolve a string to a
+# catalog object, looked up in Snapshot.sequences at evaluation. null = "propagates" (nextval(NULL)
+# is NULL, PG). volatility = "volatile": nextval MUTATES the sequence (so a statement containing it
+# runs on the write path, 25006 in a read-only txn — §4) and currval reads per-session state.
+# nextval is jed-TRANSACTIONAL (rolls back; a documented PG divergence — §5/determinism.md §5).
+# Errors: 42P01 (missing sequence), 2200H (past a bound without CYCLE), 25006 (read-only txn) for
+# nextval; 42P01, 55000 (no nextval yet this session) for currval. setval/lastval land in S2.
+[[operator]]
+name           = "nextval"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "int64"
+null           = "propagates"
+errors         = ["42P01", "2200H", "25006"]
+volatility     = "volatile"
+
+[[operator]]
+name           = "currval"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "int64"
+null           = "propagates"
+errors         = ["42P01", "55000"]
+volatility     = "volatile"
+
 # --- argument-counting functions (num_nulls/num_nonnulls — the VARIADIC surface) ---
 # PostgreSQL's NULL-counting functions, and the engine's FIRST VARIADIC functions
 # (../design/array-functions.md §12). Each declares ONE parameter, the VARIADIC "any" (variadic =

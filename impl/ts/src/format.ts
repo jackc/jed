@@ -11,7 +11,7 @@
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
 import type { Expr } from "./ast.ts";
-import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type FkAction, type ForeignKey, type IndexDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
+import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type FkAction, type ForeignKey, type IndexDef, type SequenceDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
@@ -60,7 +60,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 11; // on-disk format version (11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6). 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 10 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 12; // on-disk format version (12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3). 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 10 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -435,6 +435,13 @@ class ByteWriter {
   }
   u32(v: number): void {
     this.buf.push((v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff);
+  }
+  // i64 writes an 8-byte big-endian two's-complement int64 (a value-codec context, not a key —
+  // the interval-micros / sequence-field encoding). Big-endian via DataView.
+  i64(v: bigint): void {
+    const dv = new DataView(new ArrayBuffer(8));
+    dv.setBigInt64(0, v, false);
+    for (let i = 0; i < 8; i++) this.buf.push(dv.getUint8(i));
   }
   bytes(b: Uint8Array): void {
     for (const x of b) this.buf.push(x);
@@ -970,6 +977,55 @@ function decodeCompositeTypeEntry(buf: Uint8Array, cur: Cursor): CompositeType {
   return { name, fields };
 }
 
+// sequenceEntryBytes serializes a sequence catalog entry's BODY (after its entry_kind = 2 byte):
+// name, then the six fixed i64 fields (big-endian two's-complement, no sign-flip) and a flags byte
+// — spec/fileformat/format.md *Sequence entry*. Fixed-width, every field present (no presence tags).
+function sequenceEntryBytes(s: SequenceDef): Uint8Array {
+  const w = new ByteWriter();
+  const nameB = UTF8.encode(s.name);
+  w.u16(nameB.length);
+  w.bytes(nameB);
+  w.i64(s.increment);
+  w.i64(s.minValue);
+  w.i64(s.maxValue);
+  w.i64(s.start);
+  w.i64(s.cache);
+  w.i64(s.lastValue);
+  let flags = 0;
+  if (s.cycle) flags |= 0b1;
+  if (s.isCalled) flags |= 0b10;
+  w.u8(flags);
+  return w.toBytes();
+}
+
+// decodeSequenceEntry decodes a sequence catalog entry's body (inverse of sequenceEntryBytes); the
+// caller has already consumed the entry_kind byte. A sequence is self-contained — registered
+// directly, no two-pass (spec/design/sequences.md §3).
+function decodeSequenceEntry(buf: Uint8Array, cur: Cursor): SequenceDef {
+  const name = readString(buf, cur);
+  const increment = readI64(buf, cur);
+  const minValue = readI64(buf, cur);
+  const maxValue = readI64(buf, cur);
+  const start = readI64(buf, cur);
+  const cache = readI64(buf, cur);
+  const lastValue = readI64(buf, cur);
+  const flags = readU8(buf, cur);
+  if ((flags & ~0b11) !== 0) {
+    throw engineError("data_corrupted", "reserved sequence flag set");
+  }
+  return {
+    name,
+    increment,
+    minValue,
+    maxValue,
+    start,
+    cache,
+    cycle: (flags & 0b1) !== 0,
+    lastValue,
+    isCalled: (flags & 0b10) !== 0,
+  };
+}
+
 // pack greedily packs item sizes into pages of capacity `capacity`, returning groups of
 // item indices. Empty input yields one empty group. A single item larger than capacity
 // is unsupported (no overflow pages in step-5b).
@@ -1050,12 +1106,16 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   }
 
   // The catalog chain follows the data; its head is the relocatable root_page. Each entry is
-  // kind-tagged (v9): composite-type entries (kind 1) first in lowercased-name order, then table
-  // entries (kind 0) — spec/fileformat/format.md.
+  // kind-tagged (v9/v12): composite-type entries (kind 1) first in lowercased-name order, then
+  // sequence entries (kind 2, name order — v12), then table entries (kind 0) —
+  // spec/fileformat/format.md.
   const catRoot = nextIndex;
   const catEntries: Uint8Array[] = [];
   for (const ct of snap.compositeTypesSorted()) {
     catEntries.push(concat([Uint8Array.of(1), compositeTypeEntryBytes(ct)]));
+  }
+  for (const s of snap.sequencesSorted()) {
+    catEntries.push(concat([Uint8Array.of(2), sequenceEntryBytes(s)]));
   }
   for (let ti = 0; ti < keys.length; ti++) {
     const t = snap.tables.get(keys[ti]!)!;
@@ -1228,11 +1288,14 @@ export function incrementalImage(
   // The catalog chain is rewritten to fresh pages every commit (table roots move). Allocate its page
   // indices up front — they may be reused free pages, hence not contiguous — so each page can point at
   // the next (`pack` always returns ≥ 1 group, so catPages is non-empty). Entries are kind-tagged
-  // (v9): composite-type entries (kind 1, name order) then table entries (kind 0) —
-  // spec/fileformat/format.md.
+  // (v9/v12): composite-type entries (kind 1, name order) then sequence entries (kind 2, name order —
+  // v12) then table entries (kind 0) — spec/fileformat/format.md.
   const catEntries: Uint8Array[] = [];
   for (const ct of snap.compositeTypesSorted()) {
     catEntries.push(concat([Uint8Array.of(1), compositeTypeEntryBytes(ct)]));
+  }
+  for (const s of snap.sequencesSorted()) {
+    catEntries.push(concat([Uint8Array.of(2), sequenceEntryBytes(s)]));
   }
   for (let ti = 0; ti < keys.length; ti++) {
     const t = snap.tables.get(keys[ti]!)!;
@@ -1347,11 +1410,16 @@ export function loadDatabase(image: Uint8Array): Database {
     }
     const cur = { pos: 0 };
     for (let i = 0; i < pg.itemCount; i++) {
-      // Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered now; its
-      // nested refs are validated after the full walk), 0 = a table entry.
+      // Each catalog entry is kind-tagged (v9/v12): 1 = a composite-type entry (registered now; its
+      // nested refs are validated after the full walk), 2 = a sequence entry (v12; self-contained,
+      // registered directly — no two-pass), 0 = a table entry.
       const kind = readU8(pg.payload, cur);
       if (kind === 1) {
         snap.putType(decodeCompositeTypeEntry(pg.payload, cur));
+        continue;
+      }
+      if (kind === 2) {
+        snap.putSequence(decodeSequenceEntry(pg.payload, cur));
         continue;
       }
       if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
@@ -1470,11 +1538,16 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
     if (pg.pageType !== PAGE_CATALOG) throw engineError("data_corrupted", "expected a catalog page");
     const cur = { pos: 0 };
     for (let i = 0; i < pg.itemCount; i++) {
-      // Each catalog entry is kind-tagged (v9): 1 = a composite-type entry (registered now; its
-      // nested refs are validated after the full walk), 0 = a table entry.
+      // Each catalog entry is kind-tagged (v9/v12): 1 = a composite-type entry (registered now; its
+      // nested refs are validated after the full walk), 2 = a sequence entry (v12; self-contained,
+      // registered directly — no two-pass), 0 = a table entry.
       const kind = readU8(pg.payload, cur);
       if (kind === 1) {
         snap.putType(decodeCompositeTypeEntry(pg.payload, cur));
+        continue;
+      }
+      if (kind === 2) {
+        snap.putSequence(decodeSequenceEntry(pg.payload, cur));
         continue;
       }
       if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
@@ -2420,6 +2493,13 @@ function readU32(buf: Uint8Array, cur: Cursor): number {
   const v = ((buf[p]! << 24) | (buf[p + 1]! << 16) | (buf[p + 2]! << 8) | buf[p + 3]!) >>> 0;
   cur.pos += 4;
   return v;
+}
+
+// readI64 reads an 8-byte big-endian two's-complement int64 (the interval-micros / sequence-field
+// encoding). Big-endian via DataView.
+function readI64(buf: Uint8Array, cur: Cursor): bigint {
+  const b = take(buf, cur, 8);
+  return new DataView(b.buffer, b.byteOffset, b.byteLength).getBigInt64(0, false);
 }
 
 function readString(buf: Uint8Array, cur: Cursor): string {

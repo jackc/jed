@@ -485,10 +485,15 @@ biases below are where an overriding reason *does* steer away from PG.
   **composite (row) types** (`format_version` 9 — kind-tagged catalog entries + a composite-type
   section + two-pass acyclic load, `spec/design/composite.md`), **array (`T[]`) columns**
   (`format_version` 10 — `type_code 15` + an inline element-type descriptor + the compact array
-  value body, `spec/design/array.md`), and **`FOREIGN KEY` constraints** (`format_version` 11 — the
+  value body, `spec/design/array.md`), **`FOREIGN KEY` constraints** (`format_version` 11 — the
   table catalog entry gains a per-table foreign-key list after the index list, referencing the
   parent table/columns by name/ordinal with an `on_delete`/`on_update` action byte; an FK owns no
-  B-tree, so it adds no value-codec change, `spec/design/constraints.md` §6). **Still deferred**
+  B-tree, so it adds no value-codec change, `spec/design/constraints.md` §6), and **sequences**
+  (`format_version` 12 — a third kind-tagged catalog entry `entry_kind 2` carrying the name, six
+  fixed int64 fields, and a flags byte; emitted composites→sequences→tables; a sequence owns no
+  B-tree. `nextval` is **transactional** — the counter is a snapshot field that rolls back with its
+  transaction, a deliberate PG divergence mandated by determinism.md §5, `spec/design/sequences.md`).
+  **Still deferred**
   (later Phase-6, none foreclosed): continuous within-session reclamation + on-disk free-list
   persistence (the P6.2 follow-ons). The from-scratch whole-image serializer survives as
   `create`'s initial write and the golden generator.

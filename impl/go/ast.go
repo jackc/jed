@@ -11,8 +11,12 @@ type Statement struct {
 	DropIndex   *DropIndex
 	CreateType  *CreateType
 	DropType    *DropType
-	Insert      *Insert
-	Select      *Select
+	// CreateSequence/DropSequence are the sequence DDL statements (spec/design/sequences.md):
+	// a named, persisted int64 generator. Non-nil only for that statement.
+	CreateSequence *CreateSequence
+	DropSequence   *DropSequence
+	Insert         *Insert
+	Select         *Select
 	// SetOp is a set operation (UNION/INTERSECT/EXCEPT) combining two query expressions
 	// (spec/design/grammar.md §25). Non-nil only when at least one set operator is present; a
 	// lone SELECT stays in Select, so the plain-query path and host API are untouched.
@@ -194,6 +198,41 @@ type TypeFieldDef struct {
 // missing type without IF EXISTS is 42704.
 type DropType struct {
 	Name     string
+	IfExists bool
+}
+
+// CreateSequence is a CREATE SEQUENCE [IF NOT EXISTS] <name> [options] statement — a named,
+// persisted int64 generator (spec/design/sequences.md). The options are order-free; each is
+// captured as a parsed override, with a nil pointer meaning "use the default" (resolved at
+// execution against the INCREMENT sign). Execution validates the option set (22023), rejects a
+// relation-namespace collision (42P07 unless IfNotExists), and registers the sequence.
+type CreateSequence struct {
+	Name        string
+	IfNotExists bool
+	Increment   *int64
+	// MinValue is the MINVALUE override: a SeqBound whose Set distinguishes
+	// MINVALUE v (Set, Value=v) from NO MINVALUE (Set, NoValue) from unset (nil) — the
+	// Rust Option<Option<i64>>. nil = unset (use the default).
+	MinValue *SeqBound
+	MaxValue *SeqBound
+	Start    *int64
+	Cache    *int64
+	Cycle    *bool
+}
+
+// SeqBound is a MINVALUE/MAXVALUE override (spec/design/sequences.md): NoValue true selects
+// the type default (NO MINVALUE / NO MAXVALUE); otherwise Value is the explicit bound. A nil
+// *SeqBound on CreateSequence means the option was unset (also the default).
+type SeqBound struct {
+	NoValue bool
+	Value   int64
+}
+
+// DropSequence is a DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT] statement — remove one or
+// more sequences (spec/design/sequences.md §1). A missing sequence without IF EXISTS is 42P01;
+// CASCADE is 0A000 (RESTRICT is the default and only mode this slice).
+type DropSequence struct {
+	Names    []string
 	IfExists bool
 }
 

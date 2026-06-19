@@ -12,6 +12,8 @@ pub enum Statement {
     DropIndex(DropIndex),
     CreateType(CreateType),
     DropType(DropType),
+    CreateSequence(CreateSequence),
+    DropSequence(DropSequence),
     Insert(Insert),
     Select(Select),
     /// A set operation (`UNION`/`INTERSECT`/`EXCEPT`) combining two query expressions
@@ -190,6 +192,33 @@ pub struct TypeFieldDef {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct DropType {
     pub name: String,
+    pub if_exists: bool,
+}
+
+/// `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` — a named, persisted int64 generator
+/// (spec/design/sequences.md). The options are order-free; each is captured as a parsed override,
+/// with `None` meaning "use the default" (resolved at execution against the INCREMENT sign).
+/// Execution validates the option set (22023), rejects a relation-namespace collision (42P07
+/// unless `if_not_exists`), and registers the sequence in the catalog.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CreateSequence {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub increment: Option<i64>,
+    /// `Some(Some(v))` = MINVALUE v; `Some(None)` = NO MINVALUE (the type default); `None` = unset.
+    pub min_value: Option<Option<i64>>,
+    pub max_value: Option<Option<i64>>,
+    pub start: Option<i64>,
+    pub cache: Option<i64>,
+    pub cycle: Option<bool>,
+}
+
+/// `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT]` — remove one or more sequences
+/// (spec/design/sequences.md §1). A missing sequence without `IF EXISTS` is 42P01; `CASCADE` is
+/// `0A000` (RESTRICT is the default and only mode this slice).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct DropSequence {
+    pub names: Vec<String>,
     pub if_exists: bool,
 }
 
