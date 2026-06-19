@@ -53,7 +53,7 @@ pub(crate) fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
 }
 
 /// Civil date `(year, month, day)` from days since 1970-01-01 (inverse of `days_from_civil`).
-fn civil_from_days(z: i64) -> (i64, u32, u32) {
+pub(crate) fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let z = z + 719468;
     let era = (if z >= 0 { z } else { z - 146096 }) / 146097;
     let doe = z - era * 146097; // [0, 146096]
@@ -82,11 +82,11 @@ pub(crate) fn civil_from_micros(t: i64) -> (i64, u32, u32, u32, u32, u32, u32) {
 
 // --- parsing -----------------------------------------------------------------
 
-fn invalid_format(detail: impl Into<String>) -> EngineError {
+pub(crate) fn invalid_format(detail: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::InvalidDatetimeFormat, detail.into())
 }
 
-fn field_overflow(detail: impl Into<String>) -> EngineError {
+pub(crate) fn field_overflow(detail: impl Into<String>) -> EngineError {
     EngineError::new(SqlState::DatetimeFieldOverflow, detail.into())
 }
 
@@ -96,7 +96,7 @@ fn is_ws(b: u8) -> bool {
     matches!(b, b' ' | b'\t' | b'\n' | b'\x0c' | b'\r')
 }
 
-fn trim_ascii_ws(s: &str) -> &str {
+pub(crate) fn trim_ascii_ws(s: &str) -> &str {
     let b = s.as_bytes();
     let mut start = 0;
     let mut end = b.len();
@@ -111,7 +111,7 @@ fn trim_ascii_ws(s: &str) -> &str {
 
 /// Read one run of ASCII digits at `*i` as an `i64` (checked). Empty run → 22007; a value
 /// that overflows `i64` → 22008.
-fn read_uint(b: &[u8], i: &mut usize) -> Result<i64> {
+pub(crate) fn read_uint(b: &[u8], i: &mut usize) -> Result<i64> {
     let start = *i;
     let mut v: i64 = 0;
     while *i < b.len() && b[*i].is_ascii_digit() {
@@ -127,7 +127,7 @@ fn read_uint(b: &[u8], i: &mut usize) -> Result<i64> {
     Ok(v)
 }
 
-fn expect(b: &[u8], i: &mut usize, c: u8) -> Result<()> {
+pub(crate) fn expect(b: &[u8], i: &mut usize, c: u8) -> Result<()> {
     if *i < b.len() && b[*i] == c {
         *i += 1;
         Ok(())
@@ -139,7 +139,7 @@ fn expect(b: &[u8], i: &mut usize, c: u8) -> Result<()> {
 /// Parse the fractional-seconds digits after the `.` into microseconds (0..=1_000_000;
 /// 1_000_000 means the rounding carried into the next second). 0–6 digits are exact;
 /// 7+ digits round to µs **half away from zero** (the 7th digit `>= 5` rounds up).
-fn read_frac(b: &[u8], i: &mut usize) -> Result<i64> {
+pub(crate) fn read_frac(b: &[u8], i: &mut usize) -> Result<i64> {
     let start = *i;
     while *i < b.len() && b[*i].is_ascii_digit() {
         *i += 1;

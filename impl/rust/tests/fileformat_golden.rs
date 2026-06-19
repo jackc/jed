@@ -540,6 +540,22 @@ fn float32_table_db() -> Database {
     db
 }
 
+/// A table with a date column (type code 16) — the 4-byte int32 day-count value-codec branch (the
+/// same int-be-signflip body as int32). A positive date, a pre-1970 negative one, a BC-era one,
+/// the −infinity/+infinity sentinels (i32::MIN/MAX), and a NULL. The bare-string literals adapt to
+/// the date column. PK stays int32. (spec/design/date.md)
+fn date_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, d date)");
+    run(&mut db, "INSERT INTO t VALUES (1, '2024-01-15')");
+    run(&mut db, "INSERT INTO t VALUES (2, '1969-12-31')");
+    run(&mut db, "INSERT INTO t VALUES (3, '0044-03-15 BC')");
+    run(&mut db, "INSERT INTO t VALUES (4, '-infinity')");
+    run(&mut db, "INSERT INTO t VALUES (5, 'infinity')");
+    run(&mut db, "INSERT INTO t VALUES (6, NULL)");
+    db
+}
+
 /// A composite TYPE defined + persisted (v9) AND used by a column with stored values (S3): pins
 /// the recursive value codec — the null bitmap, a present-field body, and a NULL field's
 /// zero-byte omission (row 2's `zip`) — spec/design/composite.md §4.
@@ -637,6 +653,7 @@ fn write_matches_goldens() {
         ("interval_table.jed", interval_table_db),
         ("float64_table.jed", float64_table_db),
         ("float32_table.jed", float32_table_db),
+        ("date_table.jed", date_table_db),
         ("nopk_table.jed", nopk_table_db),
         ("composite_pk_table.jed", composite_pk_table_db),
         ("check_table.jed", check_table_db),
@@ -681,6 +698,7 @@ fn read_goldens_reproduces_rows() {
         ("interval_table.jed", interval_table_db, "t"),
         ("float64_table.jed", float64_table_db, "t"),
         ("float32_table.jed", float32_table_db, "t"),
+        ("date_table.jed", date_table_db, "t"),
         ("nopk_table.jed", nopk_table_db, "r"),
         ("composite_pk_table.jed", composite_pk_table_db, "t"),
         ("check_table.jed", check_table_db, "t"),

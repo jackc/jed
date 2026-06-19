@@ -1,0 +1,99 @@
+# Date parse / render vectors — CANONICAL DATA (CLAUDE.md §8).
+#
+# The calendar/parse/render arithmetic of spec/design/date.md, pinned as (input -> days),
+# (input -> error), and (days -> text) vectors. A core's date implementation is conformant
+# iff, for every vector below:
+#   parse        parse_date(input) == days        (the int32 days since 1970-01-01)
+#   parse_error  parse_date(input) traps `error`  (the SQLSTATE, raised at resolve)
+#   render       render_date(days) == text        (the canonical output string)
+# Reasoning + the algorithm live in ../design/date.md. `days` are computed by the SAME Hinnant
+# civil<->days algorithm timestamp uses (../design/timestamp.md §2; the civil path uses
+# TRUNCATING division). Test-time only.
+#
+#   -infinity sentinel = i32::MIN = -2147483648
+#   +infinity sentinel = i32::MAX =  2147483647
+
+schema_version = 1
+
+# --- parse: date -------------------------------------------------------------
+# Strict ISO `YYYY-MM-DD` with optional BC/AD era. A trailing time and/or offset is VALIDATED
+# then DISCARDED (PG): the day comes from the date fields directly, so 24:00:00 does NOT roll
+# into the day (unlike timestamp) and an offset is never applied. Surrounding whitespace trimmed.
+[[parse]]
+type = "date"
+cases = [
+  { input = "1970-01-01",                 days = 0 },
+  { input = "2024-01-15",                 days = 19737 },
+  { input = "2024-01-15 12:34:56",        days = 19737 },   # time portion dropped
+  { input = "2024-01-15T12:34:56.789",    days = 19737 },   # T separator + fraction dropped
+  { input = "2024-01-15 12:34:56+05",     days = 19737 },   # offset dropped (not applied)
+  { input = "2024-01-15 24:00:00",        days = 19737 },   # 24:00 does NOT advance the day (vs timestamp)
+  { input = "  2024-01-15  ",             days = 19737 },   # surrounding ws trimmed
+  { input = "2000-01-01",                 days = 10957 },
+  { input = "2024-02-29",                 days = 19782 },   # leap day
+  { input = "1969-12-31",                 days = -1 },      # pre-epoch (negative)
+  { input = "0001-01-01",                 days = -719162 }, # AD min 4-digit year
+  { input = "9999-12-31",                 days = 2932896 }, # AD max 4-digit year
+  { input = "10000-01-01",                days = 2932897 }, # wide (5-digit) year
+  { input = "0001-01-01 BC",              days = -719528 }, # astro year 0
+  { input = "0002-01-01 BC",              days = -719893 }, # astro -1
+  { input = "0044-03-15 BC",              days = -735160 }, # Ides of March, astro -43
+  # jed owns a WIDER range than PG: 5874898-01-01 is one day past PG's max (5874897-12-31), so
+  # PG rejects it but jed accepts it as a finite date — a documented divergence (oracle ledger).
+  { input = "5874898-01-01",              days = 2145042906 },
+  { input = "infinity",                   days = 2147483647 },
+  { input = "+infinity",                  days = 2147483647 },  # optional leading +
+  { input = "INFINITY",                   days = 2147483647 },  # case-insensitive
+  { input = "-infinity",                  days = -2147483648 },
+]
+
+# --- parse_error: 22007 malformed syntax / 22008 field-or-range overflow ------
+[[parse_error]]
+type = "date"
+cases = [
+  { input = "2024-13-01",                error = "22008" },  # month 13
+  { input = "2024-00-01",                error = "22008" },  # month 0
+  { input = "2024-01-32",                error = "22008" },  # day 32
+  { input = "2024-02-30",                error = "22008" },  # Feb 30 never exists
+  { input = "2023-02-29",                error = "22008" },  # 2023 is not a leap year
+  { input = "2024-01-15 25:00:00",       error = "22008" },  # hour 25 (the time IS validated)
+  { input = "2024-01-15 12:60:00",       error = "22008" },  # minute 60
+  # jed rejects :60 (strict). PG accepts :60 (and drops it for a date) — a documented divergence
+  # inherited from timestamp (../design/timestamp.md §3, ../design/date.md §2).
+  { input = "2024-01-15 12:00:60",       error = "22008" },  # second 60
+  { input = "2024-01-15 24:00:01",       error = "22008" },  # 24:xx other than exactly 24:00:00
+  { input = "2024-01-15 12:00:00+99",    error = "22008" },  # offset hours out of range
+  { input = "",                          error = "22007" },  # empty
+  { input = "   ",                       error = "22007" },  # whitespace only
+  { input = "not a date",                error = "22007" },  # garbage
+  { input = "2024/01/15",                error = "22007" },  # wrong separators
+  # jed accepts ONLY the strict ISO grammar. PG's DateStyle-dependent / non-ISO spellings
+  # (no separators, month names, M/D/Y) trap 22007 here — a documented divergence (date.md §2).
+  { input = "20240115",                  error = "22007" },  # no separators
+  { input = "Jan 15, 2024",              error = "22007" },  # month name
+  { input = "01/15/2024",                error = "22007" },  # slash / DateStyle form
+  { input = "now",                       error = "22007" },  # clock-relative special: deferred
+  { input = "today",                     error = "22007" },  # deferred
+  { input = "epoch",                     error = "22007" },  # deferred alias
+  { input = "2024-01-15 12:00:00 XY",    error = "22007" },  # unknown era token
+]
+
+# --- render: date ------------------------------------------------------------
+# YYYY-MM-DD; >=4-digit zero-padded year, full width beyond 9999; BC suffix for astronomical
+# year <= 0 (displayed = 1 - astro). infinity/-infinity are bare. No time, fraction, or offset.
+[[render]]
+type = "date"
+cases = [
+  { days = 0,           text = "1970-01-01" },
+  { days = 19737,       text = "2024-01-15" },
+  { days = 10957,       text = "2000-01-01" },
+  { days = -1,          text = "1969-12-31" },
+  { days = -719162,     text = "0001-01-01" },
+  { days = 2932896,     text = "9999-12-31" },
+  { days = 2932897,     text = "10000-01-01" },
+  { days = -719528,     text = "0001-01-01 BC" },
+  { days = -719893,     text = "0002-01-01 BC" },
+  { days = -735160,     text = "0044-03-15 BC" },
+  { days = 2147483647,  text = "infinity" },
+  { days = -2147483648, text = "-infinity" },
+]

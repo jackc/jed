@@ -34,6 +34,7 @@ import {
   isTimestamp,
   isTimestamptz,
   isInterval,
+  isDate,
   isUuid,
   scalarT,
   typeScalar,
@@ -51,6 +52,7 @@ import {
   float64Value,
   intValue,
   intervalValue,
+  dateValue,
   nullValue,
   textValue,
   timestampValue,
@@ -124,6 +126,8 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 12;
     case "float32":
       return 13;
+    case "date":
+      return 16;
   }
 }
 
@@ -156,6 +160,8 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "float64";
     case 13:
       return "float32";
+    case 16:
+      return "date";
     default:
       return undefined;
   }
@@ -372,6 +378,11 @@ function encodeScalar(ty: ScalarType, v: Value): Uint8Array {
     // Timestamps store their int64 microsecond instant via the same fixed-width codec as
     // int64 (spec/design/timestamp.md §6).
     return encodeNullable(ty, v.micros);
+  }
+  if (v.kind === "date") {
+    // A date stores its int32 day count via the same fixed-width (4-byte) order-preserving codec
+    // as int32 (spec/design/date.md).
+    return encodeNullable(ty, v.days);
   }
   if (v.kind === "interval") {
     // Fixed 16-byte body: i32 months, i32 days, i64 micros — big-endian two's-complement, no
@@ -2303,6 +2314,8 @@ function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
   }
   if (isTimestamp(ty)) return timestampValue(readIntBody(ty, buf, cur));
   if (isTimestamptz(ty)) return timestamptzValue(readIntBody(ty, buf, cur));
+  // A date is a 4-byte int32 day count, same order-preserving codec as int32 (spec/design/date.md).
+  if (isDate(ty)) return dateValue(readIntBody(ty, buf, cur));
   if (isInterval(ty)) {
     // Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
     const b = take(buf, cur, 16);

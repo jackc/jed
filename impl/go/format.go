@@ -80,6 +80,8 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 12
 	case Float32:
 		return 13
+	case Date:
+		return 16
 	default:
 		return 0
 	}
@@ -151,6 +153,8 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return Float64, true
 	case 13:
 		return Float32, true
+	case 16:
+		return Date, true
 	default:
 		return 0, false
 	}
@@ -2875,6 +2879,13 @@ func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
 		}
 		bits := uint32(vb[0])<<24 | uint32(vb[1])<<16 | uint32(vb[2])<<8 | uint32(vb[3])
 		return Value{Kind: ValFloat32, Int: int64(bits)}, nil
+	case ty.IsDate():
+		// 4-byte int32 day count, same order-preserving codec as int32 (spec/design/date.md).
+		vb, err := take(buf, pos, ty.WidthBytes())
+		if err != nil {
+			return Value{}, err
+		}
+		return DateValue(int32(DecodeInt(ty, vb))), nil
 	case ty.IsInterval():
 		// Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
 		mb, err := take(buf, pos, 4)

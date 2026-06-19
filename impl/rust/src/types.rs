@@ -48,6 +48,10 @@ pub enum ScalarType {
     /// Rank 2 of the float promotion tower; stored as 8 big-endian IEEE bytes (type code 12).
     /// Not a key this slice.
     Float64,
+    /// A calendar date — int32 days since the Unix epoch, no time/zone (spec/design/date.md).
+    /// Reuses timestamp's calendar core; stored as a 4-byte order-preserving int32 body (type
+    /// code 16). A key this slice (the int32 key encoding is exercised, like timestamp).
+    Date,
 }
 
 impl ScalarType {
@@ -67,6 +71,7 @@ impl ScalarType {
             ScalarType::Interval => "interval",
             ScalarType::Float32 => "float32",
             ScalarType::Float64 => "float64",
+            ScalarType::Date => "date",
         }
     }
 
@@ -93,6 +98,7 @@ impl ScalarType {
             // `float(p)` precision typmod are NOT accepted (we own our surface — CLAUDE.md §1).
             "float32" | "real" => Some(ScalarType::Float32),
             "float64" | "double precision" | "float" => Some(ScalarType::Float64),
+            "date" => Some(ScalarType::Date),
             _ => None,
         }
     }
@@ -137,6 +143,11 @@ impl ScalarType {
         matches!(self, ScalarType::Interval)
     }
 
+    /// Whether this is the `date` (calendar date) type.
+    pub fn is_date(self) -> bool {
+        matches!(self, ScalarType::Date)
+    }
+
     /// Whether this is the `float32` (binary32) type.
     pub fn is_float32(self) -> bool {
         matches!(self, ScalarType::Float32)
@@ -177,6 +188,9 @@ impl ScalarType {
             ScalarType::Int32 => 4,
             ScalarType::Int64 | ScalarType::Timestamp | ScalarType::Timestamptz => 8,
             ScalarType::Uuid => 16,
+            // `date` is a fixed-width 4-byte int32 day count (reuses the int32 codec — it is a
+            // key this slice, like timestamp; spec/design/date.md).
+            ScalarType::Date => 4,
             // The float types are fixed-width (binary32 = 4 bytes, binary64 = 8) — the value
             // codec writes the IEEE bytes big-endian, no length prefix (spec/fileformat/format.md).
             ScalarType::Float32 => 4,
@@ -204,9 +218,10 @@ impl ScalarType {
             | ScalarType::Timestamptz
             | ScalarType::Interval
             | ScalarType::Float32
-            | ScalarType::Float64 => {
+            | ScalarType::Float64
+            | ScalarType::Date => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/uuid/timestamp/interval/float have no integer range"
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval/float/date have no integer range"
                 )
             }
         }
@@ -227,9 +242,10 @@ impl ScalarType {
             | ScalarType::Timestamptz
             | ScalarType::Interval
             | ScalarType::Float32
-            | ScalarType::Float64 => {
+            | ScalarType::Float64
+            | ScalarType::Date => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/uuid/timestamp/interval/float have no integer range"
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval/float/date have no integer range"
                 )
             }
         }
@@ -255,9 +271,10 @@ impl ScalarType {
             | ScalarType::Uuid
             | ScalarType::Timestamp
             | ScalarType::Timestamptz
-            | ScalarType::Interval => {
+            | ScalarType::Interval
+            | ScalarType::Date => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/uuid/timestamp/interval have no promotion rank"
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval/date have no promotion rank"
                 )
             }
         }
@@ -269,7 +286,7 @@ impl ScalarType {
     }
 
     /// All types, for exhaustive iteration in tests.
-    pub fn all() -> [ScalarType; 13] {
+    pub fn all() -> [ScalarType; 14] {
         [
             ScalarType::Int16,
             ScalarType::Int32,
@@ -284,6 +301,7 @@ impl ScalarType {
             ScalarType::Interval,
             ScalarType::Float32,
             ScalarType::Float64,
+            ScalarType::Date,
         ]
     }
 }
@@ -411,5 +429,8 @@ impl Type {
     }
     pub fn is_timestamptz(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_timestamptz())
+    }
+    pub fn is_date(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_date())
     }
 }

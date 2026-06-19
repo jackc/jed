@@ -49,6 +49,10 @@ const (
 	// Float64 is IEEE 754 binary64 / double precision / float (rank 2, 8 bytes). Same family as
 	// float32; a mixed-width float op promotes to float64 (the only implicit float edge).
 	Float64
+	// Date is a calendar date — int32 days since the Unix epoch, no time/zone
+	// (spec/design/date.md). Reuses timestamp's calendar core; stored as a 4-byte order-preserving
+	// int32 body (type code 16). A key this slice (the int32 key encoding is exercised).
+	Date
 )
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. Precision >= 1;
@@ -88,6 +92,8 @@ func (t ScalarType) CanonicalName() string {
 		return "float32"
 	case Float64:
 		return "float64"
+	case Date:
+		return "date"
 	default:
 		return "?"
 	}
@@ -131,6 +137,8 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		// "double precision" is a two-word alias; this slice's parser only emits single-word type
 		// names, so it is reachable only via a future multi-word parse (a documented narrowing).
 		return Float64, true
+	case "date":
+		return Date, true
 	default:
 		return 0, false
 	}
@@ -159,6 +167,9 @@ func (t ScalarType) IsTimestamptz() bool { return t == Timestamptz }
 
 // IsInterval reports whether this is the interval (span) type.
 func (t ScalarType) IsInterval() bool { return t == IntervalType }
+
+// IsDate reports whether this is the date (calendar date) type.
+func (t ScalarType) IsDate() bool { return t == Date }
 
 // IsFloat32 reports whether this is the binary32 float type (real).
 func (t ScalarType) IsFloat32() bool { return t == Float32 }
@@ -200,6 +211,10 @@ func (t ScalarType) WidthBytes() int {
 		return 4
 	case Float64:
 		return 8
+	case Date:
+		// A date is a fixed-width 4-byte int32 day count (reuses the int32 codec — it is a key
+		// this slice, like timestamp; spec/design/date.md).
+		return 4
 	default:
 		return 0
 	}
@@ -256,7 +271,7 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType, Float32, Float64}
+	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType, Float32, Float64, Date}
 }
 
 // Type is a column / value type: either a built-in ScalarType or a reference to a user-defined
@@ -381,3 +396,6 @@ func (t Type) IsTimestamp() bool { return t.isScalar() && t.Scalar.IsTimestamp()
 
 // IsTimestamptz reports whether this is the scalar timestamptz type (false for a composite/array).
 func (t Type) IsTimestamptz() bool { return t.isScalar() && t.Scalar.IsTimestamptz() }
+
+// IsDate reports whether this is the scalar date type (false for a composite/array).
+func (t Type) IsDate() bool { return t.isScalar() && t.Scalar.IsDate() }

@@ -88,6 +88,7 @@ import {
   isTimestamp,
   isTimestamptz,
   isInterval,
+  isDate,
   promoteFloat,
   rank,
   roundToWidth,
@@ -98,11 +99,13 @@ import {
   typeIsInteger,
   typeIsTimestamp,
   typeIsTimestamptz,
+  typeIsDate,
   typeIsUuid,
   typeScalar,
   widthBytes,
 } from "./types.ts";
 import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
+import { parseDate } from "./date.ts";
 import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
 import { type ClockFunc, type RandomFill, Seam, StmtRng } from "./seam.ts";
 import {
@@ -162,6 +165,7 @@ import {
   timestampValue,
   timestamptzValue,
   intervalValue,
+  dateValue,
 } from "./value.ts";
 
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
@@ -1046,7 +1050,8 @@ export class Database {
           !typeIsBoolean(colType) &&
           !typeIsUuid(colType) &&
           !typeIsTimestamp(colType) &&
-          !typeIsTimestamptz(colType)
+          !typeIsTimestamptz(colType) &&
+          !typeIsDate(colType)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -1143,7 +1148,8 @@ export class Database {
           !typeIsBoolean(ty) &&
           !typeIsUuid(ty) &&
           !typeIsTimestamp(ty) &&
-          !typeIsTimestamptz(ty)
+          !typeIsTimestamptz(ty) &&
+          !typeIsDate(ty)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -1187,7 +1193,8 @@ export class Database {
           !typeIsBoolean(ty) &&
           !typeIsUuid(ty) &&
           !typeIsTimestamp(ty) &&
-          !typeIsTimestamptz(ty)
+          !typeIsTimestamptz(ty) &&
+          !typeIsDate(ty)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -2129,6 +2136,9 @@ export class Database {
           } else if (pkv.kind === "timestamp" || pkv.kind === "timestamptz") {
             // A timestamp / timestamptz PK encodes its int64 instant (spec/design/timestamp.md §6).
             parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.micros));
+          } else if (pkv.kind === "date") {
+            // A date PK encodes its int32 day count (spec/design/date.md §5).
+            parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.days));
           } else {
             throw engineError("data_corrupted", "a primary key must be an integer, boolean, uuid, or timestamp value");
           }
@@ -4129,6 +4139,8 @@ function indexEntryKey(columns: Column[], def: IndexDef, storageKey: Uint8Array,
       parts.push(Uint8Array.of(0x00), v.bytes);
     } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
       parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.micros));
+    } else if (v.kind === "date") {
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.days));
     } else {
       throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
     }
@@ -4162,6 +4174,8 @@ function indexPrefixKey(columns: Column[], def: IndexDef, row: Row): Uint8Array 
       parts.push(Uint8Array.of(0x00), v.bytes);
     } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
       parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.micros));
+    } else if (v.kind === "date") {
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.days));
     } else {
       throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
     }
@@ -4196,6 +4210,7 @@ function encodeKeyValue(ty: ScalarType, value: Value): Uint8Array {
   if (value.kind === "bool") return encodeBool(value.value);
   if (value.kind === "uuid") return value.bytes.slice();
   if (value.kind === "timestamp" || value.kind === "timestamptz") return encodeInt(ty, value.micros);
+  if (value.kind === "date") return encodeInt(ty, value.days);
   throw new Error("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)");
 }
 
@@ -4377,6 +4392,8 @@ function isConstSource(e: RExpr, pkType: ScalarType): boolean {
       return isTimestamp(pkType);
     case "constTimestamptz":
       return isTimestamptz(pkType);
+    case "constDate":
+      return isDate(pkType);
     default:
       return false;
   }
@@ -4449,6 +4466,7 @@ function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[], outer: 
       return { kind: "key", key: src.value.slice() };
     case "constTimestamp":
     case "constTimestamptz":
+    case "constDate":
       return { kind: "key", key: encodeInt(pkType, src.value) };
     case "param":
       return encodeValueKey(pkType, params[src.index]!);
@@ -4470,6 +4488,7 @@ function encodeValueKey(pkType: ScalarType, v: Value): BoundKey {
   if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
   if (v.kind === "int")
     return inRange(pkType, v.int) ? { kind: "key", key: encodeInt(pkType, v.int) } : { kind: "outOfRange" };
+  if (v.kind === "date") return { kind: "key", key: encodeInt(pkType, v.days) };
   if (v.kind === "timestamp" || v.kind === "timestamptz")
     return { kind: "key", key: encodeInt(pkType, v.micros) };
   return { kind: "outOfRange" };
@@ -4748,6 +4767,8 @@ function valueToRExpr(v: Value): RExpr {
       return { kind: "constTimestamp", value: v.micros };
     case "timestamptz":
       return { kind: "constTimestamptz", value: v.micros };
+    case "date":
+      return { kind: "constDate", value: v.days };
     case "interval":
       return { kind: "constInterval", value: v.iv };
     case "composite":
@@ -4874,6 +4895,7 @@ type ResolvedType =
   | { kind: "uuid" } // the uuid family (fixed 16 bytes); does not promote. The first non-integer key.
   | { kind: "timestamp" } // zoneless instant; does not compare/cast to timestamptz
   | { kind: "timestamptz" } // UTC instant; does not compare/cast to timestamp
+  | { kind: "date" } // calendar date (int32 days); strict island, no compare/cast to timestamp
   | { kind: "interval" } // a span; compares only with itself, by the canonical span
   // A composite (row) type (spec/design/composite.md §5). `name` is non-null for a named catalog
   // type — rendered in the `# types:` output and the basis for cross-comparability — or null for an
@@ -4911,6 +4933,7 @@ type RExpr =
   | { kind: "constUuid"; value: Uint8Array }
   | { kind: "constTimestamp"; value: bigint }
   | { kind: "constTimestamptz"; value: bigint }
+  | { kind: "constDate"; value: bigint }
   | { kind: "constInterval"; value: Interval }
   | { kind: "constNull" }
   // A ROW(...) constructor (spec/design/composite.md §1): evaluate each field and assemble a
@@ -5845,6 +5868,8 @@ function argFamily(t: ResolvedType): string | null {
       return "timestamp";
     case "timestamptz":
       return "timestamptz";
+    case "date":
+      return "date";
     case "interval":
       return "interval";
     case "composite":
@@ -6350,6 +6375,8 @@ function elemScalarHint(t: ResolvedType): ScalarType | null {
       return "timestamp";
     case "timestamptz":
       return "timestamptz";
+    case "date":
+      return "date";
     case "interval":
       return "interval";
     default:
@@ -6611,6 +6638,7 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
   if (isUuid(ty)) return { kind: "uuid" };
   if (isTimestamp(ty)) return { kind: "timestamp" };
   if (isTimestamptz(ty)) return { kind: "timestamptz" };
+  if (isDate(ty)) return { kind: "date" };
   if (isInterval(ty)) return { kind: "interval" };
   return { kind: "int", ty };
 }
@@ -6672,7 +6700,8 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
         isBytea(colTy) ||
         isTimestamp(colTy) ||
         isTimestamptz(colTy) ||
-        isInterval(colTy)
+        isInterval(colTy) ||
+        isDate(colTy)
       );
     case "bytea":
       return isBytea(colTy);
@@ -6682,6 +6711,8 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
       return isTimestamp(colTy);
     case "timestamptz":
       return isTimestamptz(colTy);
+    case "date":
+      return isDate(colTy);
     case "interval":
       return isInterval(colTy);
   }
@@ -6716,6 +6747,8 @@ function rtName(t: ResolvedType): string {
       return "timestamp";
     case "timestamptz":
       return "timestamptz";
+    case "date":
+      return "date";
     case "interval":
       return "interval";
     case "composite":
@@ -6788,6 +6821,8 @@ function typeFromResolved(rt: ResolvedType): Type {
       return scalarT("timestamp");
     case "timestamptz":
       return scalarT("timestamptz");
+    case "date":
+      return scalarT("date");
     case "interval":
       return scalarT("interval");
     case "composite":
@@ -7258,6 +7293,13 @@ function resolve(
               type: { kind: "timestamptz" },
             };
           }
+          if (ctx !== null && isDate(ctx)) {
+            // A string adapts to a DATE context (the ISO date, dropping any time/offset; date.md §2).
+            return {
+              node: { kind: "constDate", value: parseDate(e.literal.text) },
+              type: { kind: "date" },
+            };
+          }
           if (ctx !== null && isInterval(ctx)) {
             // A string adapts to an INTERVAL context (parse the "unit + time" subset,
             // 22007/22008 — spec/design/interval.md), like timestamp adaptation.
@@ -7444,6 +7486,10 @@ function resolve(
       if (isInterval(target)) {
         throw engineError("feature_not_supported", "casting to an interval type is not supported yet");
       }
+      // date casts are deferred (spec/design/date.md §5/§6): casting TO date is 0A000.
+      if (isDate(target)) {
+        throw engineError("feature_not_supported", "casting to a date type is not supported yet");
+      }
       // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
       // `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
       // (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
@@ -7473,6 +7519,10 @@ function resolve(
       // Casting FROM an interval is likewise deferred (0A000).
       if (inner.type.kind === "interval") {
         throw engineError("feature_not_supported", "casting from an interval type is not supported yet");
+      }
+      // Casting FROM a date is likewise deferred (0A000; date↔timestamp unblocks the cross-family comparison — date.md §4/§6).
+      if (inner.type.kind === "date") {
+        throw engineError("feature_not_supported", "casting from a date type is not supported yet");
       }
       // Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
       if (inner.type.kind === "array") {
@@ -8031,6 +8081,13 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   if ((tsL || tsR) && lt.kind !== rt.kind && lt.kind !== "null" && rt.kind !== "null") {
     throw typeError("cannot compare a timestamp value with a value of a different type");
   }
+  // date compares only within its own family (or with NULL); date vs any other family — incl.
+  // timestamp, which would need a cast — is a 42804 (date is a strict island, spec/design/date.md §4).
+  const dateL = lt.kind === "date";
+  const dateR = rt.kind === "date";
+  if (dateL !== dateR && lt.kind !== "null" && rt.kind !== "null") {
+    throw typeError("cannot compare a date value with a value of a different type");
+  }
   // interval compares only with itself (or NULL); interval vs any other family is a 42804.
   const ivL = lt.kind === "interval";
   const ivR = rt.kind === "interval";
@@ -8069,6 +8126,7 @@ function ctxOf(t: ResolvedType): ScalarType | null {
   if (t.kind === "timestamp") return "timestamp";
   if (t.kind === "timestamptz") return "timestamptz";
   if (t.kind === "interval") return "interval";
+  if (t.kind === "date") return "date";
   return null;
 }
 
@@ -8142,6 +8200,8 @@ function coerceStringLiteral(
       return { node: { kind: "constTimestamp", value: parseTimestamp(s) }, type: { kind: "timestamp" } };
     case "timestamptz":
       return { node: { kind: "constTimestamptz", value: parseTimestamptz(s) }, type: { kind: "timestamptz" } };
+    case "date":
+      return { node: { kind: "constDate", value: parseDate(s) }, type: { kind: "date" } };
     case "interval":
       return { node: { kind: "constInterval", value: parseInterval(s) }, type: { kind: "interval" } };
     case "text":
@@ -8420,6 +8480,7 @@ function requireNumericOperand(t: ResolvedType): void {
     t.kind === "timestamp" ||
     t.kind === "timestamptz" ||
     t.kind === "interval" ||
+    t.kind === "date" ||
     // float is a strict island — it never mixes with int/decimal arithmetic (the both-float case
     // is handled before this; reaching here with a float means a cross-family int/decimal ⊕ float
     // pair → 42804, float.md §6).
@@ -8480,7 +8541,8 @@ function requireBool(t: ResolvedType, msg: string): void {
     t.kind === "uuid" ||
     t.kind === "timestamp" ||
     t.kind === "timestamptz" ||
-    t.kind === "interval"
+    t.kind === "interval" ||
+    t.kind === "date"
   ) {
     throw typeError(msg);
   }
@@ -8966,7 +9028,8 @@ function unifyValuesColumn(a: ResolvedType, b: ResolvedType): ResolvedType {
       a.kind === "uuid" ||
       a.kind === "timestamp" ||
       a.kind === "timestamptz" ||
-      a.kind === "interval")
+      a.kind === "interval" ||
+      a.kind === "date")
   ) {
     return a;
   }
@@ -8996,6 +9059,8 @@ function scalarForParamHint(rt: ResolvedType): ScalarType | null {
       return "timestamp";
     case "timestamptz":
       return "timestamptz";
+    case "date":
+      return "date";
     case "interval":
       return "interval";
     default:
@@ -9157,6 +9222,7 @@ function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): voi
   else if (isTimestamp(colTy)) ok = t.kind === "timestamp" || t.kind === "null";
   else if (isTimestamptz(colTy)) ok = t.kind === "timestamptz" || t.kind === "null";
   else if (isInterval(colTy)) ok = t.kind === "interval" || t.kind === "null";
+  else if (isDate(colTy)) ok = t.kind === "date" || t.kind === "null";
   else ok = t.kind === "text" || t.kind === "null";
   if (!ok) {
     throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
@@ -9249,6 +9315,7 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
       // ... or to a timestamp column (spec/design/timestamp.md); bad input traps 22007/22008.
       if (isTimestamp(colTy)) return timestampValue(parseTimestamp(v.text));
       if (isTimestamptz(colTy)) return timestamptzValue(parseTimestamptz(v.text));
+      if (isDate(colTy)) return dateValue(parseDate(v.text));
       // ... or to an interval column (spec/design/interval.md); bad input traps 22007/22008.
       if (isInterval(colTy)) return intervalValue(parseInterval(v.text));
       throw typeError("cannot store a text value in " + canonicalName(colTy) + " column " + colName);
@@ -9264,6 +9331,9 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
     case "timestamptz":
       if (isTimestamptz(colTy)) return v;
       throw typeError("cannot store a timestamptz value in " + canonicalName(colTy) + " column " + colName);
+    case "date":
+      if (isDate(colTy)) return v;
+      throw typeError("cannot store a date value in " + canonicalName(colTy) + " column " + colName);
     case "interval":
       if (isInterval(colTy)) return v;
       throw typeError("cannot store an interval value in " + canonicalName(colTy) + " column " + colName);
@@ -9490,6 +9560,8 @@ function rexprConstToValue(e: RExpr): Value {
       return timestampValue(e.value);
     case "constTimestamptz":
       return timestamptzValue(e.value);
+    case "constDate":
+      return dateValue(e.value);
     case "constInterval":
       return intervalValue(e.value);
     case "constFloat":
@@ -9579,6 +9651,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return timestampValue(e.value);
     case "constTimestamptz":
       return timestamptzValue(e.value);
+    case "constDate":
+      return dateValue(e.value);
     case "constInterval":
       return intervalValue(e.value);
     case "constNull":
@@ -10454,6 +10528,9 @@ function valueCmp(a: Value, b: Value): number {
   if (a.kind === "timestamptz" && b.kind === "timestamptz") {
     return a.micros < b.micros ? -1 : a.micros > b.micros ? 1 : 0;
   }
+  if (a.kind === "date" && b.kind === "date") {
+    return a.days < b.days ? -1 : a.days > b.days ? 1 : 0;
+  }
   // Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
   if (a.kind === "interval" && b.kind === "interval") return intervalCmp(a.iv, b.iv);
   // A composite sorts lexicographically, NULLs-last per field (the composite sort key —
@@ -10520,6 +10597,8 @@ function familyRank(v: Value): number {
       return 10;
     case "interval":
       return 11;
+    case "date":
+      return 13;
     // A composite sorts only against composites of its own type (ORDER BY is single-typed), so this
     // cross-family rank is only for totality; it sits after the scalar families.
     case "composite":

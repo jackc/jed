@@ -237,7 +237,7 @@ encoding = { method = "uuid-raw16", width_bytes = 16 }
 #   timestamptz  an absolute UTC INSTANT; input text MAY carry a numeric offset
 #                (Z, +HH, +HH:MM, +HH:MM:SS) which normalizes the value to UTC and is
 #                then DISCARDED (only the UTC instant is stored — no offset retained).
-# STORABLE this slice (on-disk type code 8 timestamp / 9 timestamptz —
+# STORABLE this slice (on-disk type code 9 timestamp / 10 timestamptz —
 # ../fileformat/format.md). Both are FIXED-WIDTH 8-byte and reuse the int64 order-
 # preserving KEY encoding (int-be-signflip) verbatim — so unlike text/bytea/decimal a
 # timestamp PRIMARY KEY is SUPPORTED this slice (the encoding is already exercised). The
@@ -343,3 +343,34 @@ overflow = "trap"
 overflow_error = "22003"
 encoding = { method = "float-order-preserving", width_bytes = 8 }
 rank = 2
+
+# --- date: a calendar date (../design/date.md) -------------------------------
+# A year/month/day with NO time and NO zone — PostgreSQL's `date`, the day-granular member of
+# the datetime family and the sibling of timestamp. A value is an int32 count of DAYS since the
+# Unix epoch (1970-01-01), proleptic Gregorian, reusing timestamp's days_from_civil/
+# civil_from_days calendar core VERBATIM (same epoch) so the two types cannot drift. (PostgreSQL
+# stores days since 2000-01-01 internally — an INVISIBLE divergence, since the integer is never
+# exposed; jed owns its representation, CLAUDE.md §1.) STORABLE this slice (on-disk type code 16
+# — ../fileformat/format.md), a FIXED-WIDTH 4-byte body reusing the int32 order-preserving codec.
+# Finite values occupy i32::MIN+1 .. i32::MAX-1 (≈ 5877550 BC … 5879610 AD around 1970 — WIDER
+# than PG's 4713 BC … 5874897 AD; a date jed accepts beyond PG's range is a documented divergence,
+# oracle ledger). The infinity/-infinity sentinels are i32::MAX/i32::MIN (PG DATEVAL_NOEND/NOBEGIN;
+# unlike decimal, which excludes ±Infinity — a date infinity is a genuine, totally-ordered value).
+# A value is written as a single-quoted string in a date context (literal adaptation, like
+# timestamp — ../design/types.md §6, date.md §2) OR with the `DATE '...'` keyword literal: the
+# strict ISO `YYYY-MM-DD` grammar with optional BC/AD era, reusing timestamp's FULL literal
+# grammar but keeping ONLY the date portion — a time/offset is validated then DISCARDED (PG), and
+# 24:00:00 does NOT roll into the day (unlike timestamp). Malformed input traps 22007; an
+# out-of-range field / a day count beyond the int32 range traps 22008. Date is its OWN family and
+# does NOT compare or cast to timestamp/timestamptz/int this slice (a documented divergence — PG
+# implicitly casts date→timestamp; deferred to the cast follow-on). Like timestamp (and unlike
+# text/decimal/bytea/interval), the int-be-signflip KEY encoding (width 4) is EXERCISED — a date
+# PRIMARY KEY is supported. Date arithmetic (date±int, date-date, date±interval), CAST, the
+# clock-relative literals (today/epoch), and date functions are all DEFERRED (date.md §6). No
+# bits/min/max/overflow/rank (not the integer family); no collation. width_bytes = 4.
+[[type]]
+id = "date"
+aliases = []
+family = "date"
+storable = true
+encoding = { method = "int-be-signflip", width_bytes = 4 }

@@ -35,6 +35,14 @@
 # `CAST(x AS interval)` and casting FROM an interval are DEFERRED to a later cast slice (0A000 /
 # 42804), exactly like timestamp (../design/interval.md §6).
 #
+# date (scalars.toml) is likewise STORABLE with NO cast rules here. A single-quoted string lands
+# in a date column by LITERAL ADAPTATION (parsed in a date context — only the date portion kept),
+# and the `DATE '...'` keyword literal names the type directly — neither is a (text, date) CAST.
+# `CAST(x AS date)`, text<->date, and the date<->timestamp/timestamptz conversions are all
+# DEFERRED to a later cast slice (the date<->timestamp pair unblocks the cross-family date <
+# timestamp comparison — compare.toml has no date cross rule this slice), exactly like timestamp
+# (../design/date.md §5/§6).
+#
 # STRING-LITERAL coercion is the one (text -> T) cast admitted ahead of the general cast slice,
 # and it is NOT a (from, to) pair in this matrix because its source is a string LITERAL, not the
 # `text` TYPE. PostgreSQL's `type 'string'` form and `CAST(<string literal> AS T)` coerce the

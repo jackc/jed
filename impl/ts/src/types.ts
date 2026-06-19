@@ -20,7 +20,8 @@ export type ScalarType =
   | "uuid"
   | "timestamp"
   | "timestamptz"
-  | "interval";
+  | "interval"
+  | "date";
 
 export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "int16",
@@ -36,6 +37,7 @@ export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "timestamp",
   "timestamptz",
   "interval",
+  "date",
 ];
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. precision >= 1;
@@ -87,6 +89,11 @@ export function isTimestamptz(t: ScalarType): boolean {
 // isInterval reports whether this is the interval (span) type.
 export function isInterval(t: ScalarType): boolean {
   return t === "interval";
+}
+
+// isDate reports whether this is the date (calendar date) type (spec/design/date.md).
+export function isDate(t: ScalarType): boolean {
+  return t === "date";
 }
 
 // isInteger reports whether this is one of the fixed-width signed integer types.
@@ -157,6 +164,8 @@ export function scalarTypeFromName(name: string): ScalarType | undefined {
       return "timestamptz";
     case "interval":
       return "interval";
+    case "date":
+      return "date";
     default:
       return undefined;
   }
@@ -203,6 +212,10 @@ export function widthBytes(t: ScalarType): number {
       throw new Error("bytea is variable-width; widthBytes is integer-only");
     case "interval":
       throw new Error("interval is not serialized through the integer codec; widthBytes is integer-only");
+    // A date is a fixed-width 4-byte int32 day count (reuses the int32 codec — it is a key this
+    // slice, like timestamp; spec/design/date.md).
+    case "date":
+      return 4;
   }
 }
 
@@ -233,6 +246,8 @@ export function minOf(t: ScalarType): bigint {
       throw new Error("timestamp has no integer range");
     case "interval":
       throw new Error("interval has no integer range");
+    case "date":
+      throw new Error("date has no integer range");
   }
 }
 
@@ -263,6 +278,8 @@ export function maxOf(t: ScalarType): bigint {
       throw new Error("timestamp has no integer range");
     case "interval":
       throw new Error("interval has no integer range");
+    case "date":
+      throw new Error("date has no integer range");
   }
 }
 
@@ -294,6 +311,8 @@ export function rank(t: ScalarType): number {
       throw new Error("timestamp has no promotion rank");
     case "interval":
       throw new Error("interval has no promotion rank");
+    case "date":
+      throw new Error("date has no promotion rank");
   }
 }
 
@@ -428,4 +447,7 @@ export function typeIsTimestamp(t: Type): boolean {
 }
 export function typeIsTimestamptz(t: Type): boolean {
   return t.kind === "scalar" && isTimestamptz(t.scalar);
+}
+export function typeIsDate(t: Type): boolean {
+  return t.kind === "scalar" && isDate(t.scalar);
 }

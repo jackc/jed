@@ -16,6 +16,7 @@ use crate::catalog::{
 };
 use crate::cost::Meter;
 use crate::costs::COSTS;
+use crate::date::parse_date;
 use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
 use crate::encoding::{encode_bool, encode_int};
 use crate::error::{EngineError, Result, SqlState};
@@ -1140,12 +1141,14 @@ impl Database {
                 // text/decimal/bytea/interval/float PRIMARY KEY is a documented 0A000 narrowing
                 // (spec/design/types.md §11/§12/§13), relaxable in a later in-key slice.
                 // timestamp / timestamptz are also allowed — they share the int64 `int-be-signflip`
-                // key encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
+                // key encoding (exercised + byte-pinned, spec/design/timestamp.md §6). date is
+                // likewise allowed — the int32 `int-be-signflip` key encoding (spec/design/date.md §5).
                 if !ty.is_integer()
                     && !ty.is_bool()
                     && !ty.is_uuid()
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
+                    && !ty.is_date()
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -1281,6 +1284,7 @@ impl Database {
                     && !ty.is_uuid()
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
+                    && !ty.is_date()
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -1328,6 +1332,7 @@ impl Database {
                     && !ty.is_uuid()
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
+                    && !ty.is_date()
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -1376,6 +1381,7 @@ impl Database {
                 | ResolvedType::Uuid
                 | ResolvedType::Timestamp
                 | ResolvedType::Timestamptz
+                | ResolvedType::Date
                 | ResolvedType::Interval
                 | ResolvedType::Float(_)
                 | ResolvedType::Composite(_)
@@ -1865,6 +1871,7 @@ impl Database {
                 && !ty.is_uuid()
                 && !ty.is_timestamp()
                 && !ty.is_timestamptz()
+                && !ty.is_date()
             {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
@@ -2586,6 +2593,8 @@ impl Database {
                         Value::Timestamp(m) | Value::Timestamptz(m) => {
                             k.extend_from_slice(&encode_int(pk_ty, *m))
                         }
+                        // A date PRIMARY KEY is supported: the int32 day codec (spec/design/date.md §5).
+                        Value::Date(d) => k.extend_from_slice(&encode_int(pk_ty, *d as i64)),
                         // Unreachable: a PK column is NOT NULL, enforced above.
                         Value::Null => unreachable!("primary key column is NOT NULL"),
                         // Unreachable: a text/decimal/bytea/interval/float PRIMARY KEY is rejected
@@ -5496,6 +5505,7 @@ impl Database {
             | RExpr::ConstUuid(_)
             | RExpr::ConstTimestamp(_)
             | RExpr::ConstTimestamptz(_)
+            | RExpr::ConstDate(_)
             | RExpr::ConstInterval(_)
             | RExpr::ConstArray(_)
             | RExpr::ConstNull => Ok(()),
@@ -6008,6 +6018,9 @@ enum ResolvedType {
     Timestamptz,
     /// The `interval` family (a span). Compares only with itself (by the canonical span).
     Interval,
+    /// The `date` family (calendar date). A strict island — compares only with itself (by the
+    /// int32 day count); no implicit cast to `timestamp` this slice (spec/design/date.md §4).
+    Date,
     /// The float family, carrying its width (spec/design/float.md §2). The two widths form a
     /// promotion tower: `float32 → float64` is the one implicit float cast; mixed-width arithmetic
     /// and comparison promote to `float64` first. A strict island — no implicit int/decimal ↔ float.
@@ -6047,6 +6060,7 @@ impl ResolvedType {
             ResolvedType::Timestamp => "timestamp".to_string(),
             ResolvedType::Timestamptz => "timestamptz".to_string(),
             ResolvedType::Interval => "interval".to_string(),
+            ResolvedType::Date => "date".to_string(),
             ResolvedType::Float(st) => st.canonical_name().to_string(),
             ResolvedType::Null => "unknown".to_string(),
             ResolvedType::Composite(c) => c.name.clone().unwrap_or_else(|| "record".to_string()),
@@ -6084,12 +6098,14 @@ impl ResolvedType {
                     || col_ty.is_timestamp()
                     || col_ty.is_timestamptz()
                     || col_ty.is_interval()
+                    || col_ty.is_date()
             }
             ResolvedType::Bytea => col_ty.is_bytea(),
             ResolvedType::Uuid => col_ty.is_uuid(),
             ResolvedType::Timestamp => col_ty.is_timestamp(),
             ResolvedType::Timestamptz => col_ty.is_timestamptz(),
             ResolvedType::Interval => col_ty.is_interval(),
+            ResolvedType::Date => col_ty.is_date(),
             // A float assigns to a float column of equal-or-wider width: float32 → float32/float64
             // (the implicit widening cast), float64 → float64 only (float64 → float32 is explicit).
             // store_value enforces the same rule per row (spec/types/casts.toml).
@@ -6255,6 +6271,8 @@ enum RExpr {
     /// A parsed `timestamp` / `timestamptz` literal: the int64 microsecond instant.
     ConstTimestamp(i64),
     ConstTimestamptz(i64),
+    /// A parsed `date` literal: the int32 day count since 1970-01-01 (spec/design/date.md).
+    ConstDate(i32),
     /// A parsed `interval` literal: the three-field span (spec/design/interval.md).
     ConstInterval(Interval),
     ConstNull,
@@ -6572,6 +6590,7 @@ fn type_from_resolved(rt: &ResolvedType) -> Result<Type> {
         ResolvedType::Uuid => Type::Scalar(ScalarType::Uuid),
         ResolvedType::Timestamp => Type::Scalar(ScalarType::Timestamp),
         ResolvedType::Timestamptz => Type::Scalar(ScalarType::Timestamptz),
+        ResolvedType::Date => Type::Scalar(ScalarType::Date),
         ResolvedType::Interval => Type::Scalar(ScalarType::Interval),
         ResolvedType::Composite(r) => match &r.name {
             Some(n) => Type::Composite(crate::types::CompositeRef { name: n.clone() }),
@@ -6791,6 +6810,7 @@ enum BoundSrc {
     Bool(bool),
     Uuid([u8; 16]),
     Timestamp(i64),
+    Date(i32),
     Null,
     Param(usize),
     Outer { level: usize, index: usize },
@@ -6903,6 +6923,7 @@ fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: 
                     Value::Timestamp(m) | Value::Timestamptz(m) => {
                         out.extend_from_slice(&encode_int(ty, *m))
                     }
+                    Value::Date(d) => out.extend_from_slice(&encode_int(ty, *d as i64)),
                     _ => {
                         unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
                     }
@@ -6933,6 +6954,7 @@ fn index_prefix_key(columns: &[Column], def: &IndexDef, row: &Row) -> Option<Vec
                     Value::Timestamp(m) | Value::Timestamptz(m) => {
                         out.extend_from_slice(&encode_int(ty, *m))
                     }
+                    Value::Date(d) => out.extend_from_slice(&encode_int(ty, *d as i64)),
                     _ => {
                         unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
                     }
@@ -6980,6 +7002,7 @@ fn encode_key_value(ty: ScalarType, value: &Value) -> Vec<u8> {
         Value::Bool(b) => encode_bool(*b),
         Value::Uuid(u) => u.to_vec(),
         Value::Timestamp(m) | Value::Timestamptz(m) => encode_int(ty, *m),
+        Value::Date(d) => encode_int(ty, *d as i64),
         _ => unreachable!("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)"),
     }
 }
@@ -7118,6 +7141,7 @@ fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
         RExpr::ConstUuid(u) if pk_type.is_uuid() => Some(BoundSrc::Uuid(*u)),
         RExpr::ConstTimestamp(m) if pk_type.is_timestamp() => Some(BoundSrc::Timestamp(*m)),
         RExpr::ConstTimestamptz(m) if pk_type.is_timestamptz() => Some(BoundSrc::Timestamp(*m)),
+        RExpr::ConstDate(d) if pk_type.is_date() => Some(BoundSrc::Date(*d)),
         RExpr::OuterColumn { level, index } => Some(BoundSrc::Outer {
             level: *level,
             index: *index,
@@ -7191,6 +7215,7 @@ fn encode_bound_key(
         BoundSrc::Bool(b) => BoundKey::Key(encode_bool(*b)),
         BoundSrc::Uuid(u) => BoundKey::Key(u.to_vec()),
         BoundSrc::Timestamp(m) => BoundKey::Key(encode_int(pk_ty, *m)),
+        BoundSrc::Date(d) => BoundKey::Key(encode_int(pk_ty, *d as i64)),
         BoundSrc::Param(i) => encode_value_key(pk_ty, &params[*i]),
         // A correlated reference: column `index` of the enclosing row `level` hops out — the same
         // indexing the evaluator uses for `RExpr::OuterColumn` (innermost outer row is last).
@@ -7216,6 +7241,7 @@ fn encode_value_key(pk_ty: ScalarType, v: &Value) -> BoundKey {
             }
         }
         Value::Timestamp(m) | Value::Timestamptz(m) => BoundKey::Key(encode_int(pk_ty, *m)),
+        Value::Date(d) => BoundKey::Key(encode_int(pk_ty, *d as i64)),
         _ => BoundKey::OutOfRange,
     }
 }
@@ -7967,6 +7993,7 @@ fn value_to_rexpr(v: &Value) -> RExpr {
         Value::Uuid(u) => RExpr::ConstUuid(*u),
         Value::Timestamp(m) => RExpr::ConstTimestamp(*m),
         Value::Timestamptz(m) => RExpr::ConstTimestamptz(*m),
+        Value::Date(d) => RExpr::ConstDate(*d),
         Value::Interval(iv) => RExpr::ConstInterval(*iv),
         // A folded composite constant: fold each field and wrap in a ROW node so eval rebuilds the
         // `Value::Composite` (spec/design/composite.md).
@@ -8097,6 +8124,7 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::ConstUuid(_)
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
+        | RExpr::ConstDate(_)
         | RExpr::ConstInterval(_)
         | RExpr::ConstArray(_)
         | RExpr::ConstNull => false,
@@ -8200,6 +8228,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::ConstUuid(_)
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
+        | RExpr::ConstDate(_)
         | RExpr::ConstInterval(_)
         | RExpr::ConstArray(_)
         | RExpr::ConstNull => {}
@@ -8312,6 +8341,7 @@ fn arg_family(t: &ResolvedType) -> Option<&'static str> {
         ResolvedType::Uuid => Some("uuid"),
         ResolvedType::Timestamp => Some("timestamp"),
         ResolvedType::Timestamptz => Some("timestamptz"),
+        ResolvedType::Date => Some("date"),
         ResolvedType::Interval => Some("interval"),
         ResolvedType::Null => None,
         // A composite/array is no built-in function/aggregate argument family this slice.
@@ -8565,6 +8595,7 @@ fn elem_scalar_hint(t: &ResolvedType) -> Option<ScalarType> {
         ResolvedType::Uuid => Some(ScalarType::Uuid),
         ResolvedType::Timestamp => Some(ScalarType::Timestamp),
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
+        ResolvedType::Date => Some(ScalarType::Date),
         ResolvedType::Interval => Some(ScalarType::Interval),
         ResolvedType::Null | ResolvedType::Composite(_) | ResolvedType::Array(_) => None,
     }
@@ -9307,6 +9338,7 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> R
         | ResolvedType::Uuid
         | ResolvedType::Timestamp
         | ResolvedType::Timestamptz
+        | ResolvedType::Date
         | ResolvedType::Interval
         | ResolvedType::Float(_)
         | ResolvedType::Composite(_)
@@ -9499,6 +9531,8 @@ fn resolved_type_of(ty: ScalarType) -> ResolvedType {
         ResolvedType::Timestamptz
     } else if ty.is_interval() {
         ResolvedType::Interval
+    } else if ty.is_date() {
+        ResolvedType::Date
     } else if ty.is_float() {
         ResolvedType::Float(ty)
     } else {
@@ -9821,6 +9855,11 @@ fn resolve(
                     RExpr::ConstTimestamptz(parse_timestamptz(s)?),
                     ResolvedType::Timestamptz,
                 )),
+                // A string adapts to a DATE context (parse the ISO date, dropping any time/offset;
+                // 22007/22008 — spec/design/date.md §2), exactly like timestamp adaptation.
+                Some(t) if t.is_date() => {
+                    Ok((RExpr::ConstDate(parse_date(s)?), ResolvedType::Date))
+                }
                 // A string adapts to an INTERVAL context (parse the "unit + time" subset,
                 // 22007/22008 — spec/design/interval.md), exactly like timestamp adaptation.
                 Some(t) if t.is_interval() => Ok((
@@ -10065,6 +10104,15 @@ fn resolve(
                     "casting to an interval type is not supported yet",
                 ));
             }
+            // date casts are deferred (spec/design/date.md §5/§6): casting TO date is 0A000 (a
+            // string lands in a date column by literal adaptation / the DATE '...' keyword literal,
+            // not a CAST).
+            if target.is_date() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "casting to a date type is not supported yet",
+                ));
+            }
             // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int`
             // (and `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
             // (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
@@ -10126,6 +10174,14 @@ fn resolve(
                         "casting from an interval type is not supported yet",
                     ));
                 }
+                // Casting FROM a date is likewise deferred (0A000; date↔timestamp unblocks the
+                // cross-family comparison — spec/design/date.md §4/§6).
+                ResolvedType::Date => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting from a date type is not supported yet",
+                    ));
+                }
                 // Casting a composite (text↔composite) lands in a later slice (composite.md §8/§12).
                 ResolvedType::Composite(_) => {
                     return Err(EngineError::new(
@@ -10177,6 +10233,7 @@ fn resolve(
                 | ResolvedType::Uuid
                 | ResolvedType::Timestamp
                 | ResolvedType::Timestamptz
+                | ResolvedType::Date
                 | ResolvedType::Composite(_)
                 | ResolvedType::Array(_) => {
                     return Err(type_error("unary minus requires a numeric operand"));
@@ -10891,6 +10948,8 @@ fn ctx_of(ty: &ResolvedType) -> Option<ScalarType> {
         // A datetime sibling offers its type so a string literal parses as that datetime.
         ResolvedType::Timestamp => Some(ScalarType::Timestamp),
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
+        // A date sibling offers its type so a string literal parses as a date.
+        ResolvedType::Date => Some(ScalarType::Date),
         // An interval sibling offers its type so a string literal parses as an interval.
         ResolvedType::Interval => Some(ScalarType::Interval),
         // A float sibling offers its width so an integer/decimal literal ADAPTS to a float
@@ -10988,6 +11047,7 @@ fn require_numeric_operand(ty: &ResolvedType) -> Result<()> {
         | ResolvedType::Uuid
         | ResolvedType::Timestamp
         | ResolvedType::Timestamptz
+        | ResolvedType::Date
         | ResolvedType::Interval
         | ResolvedType::Float(_)
         | ResolvedType::Composite(_)
@@ -11004,7 +11064,7 @@ fn require_numeric_operand(ty: &ResolvedType) -> Result<()> {
 /// across these families but never compares across them.
 fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Result<()> {
     use ResolvedType::{
-        Array, Bool, Bytea, Composite, Decimal, Float, Int, Interval, Null, Text, Timestamp,
+        Array, Bool, Bytea, Composite, Date, Decimal, Float, Int, Interval, Null, Text, Timestamp,
         Timestamptz, Uuid,
     };
     match (lt, rt) {
@@ -11058,6 +11118,14 @@ fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Result<()> {
         (Timestamp, Null) | (Null, Timestamp) | (Timestamptz, Null) | (Null, Timestamptz) => Ok(()),
         (Timestamp, _) | (_, Timestamp) | (Timestamptz, _) | (_, Timestamptz) => Err(type_error(
             "cannot compare a timestamp value with a value of a different type",
+        )),
+        // date compares only within its own family (or with a bare NULL), by the int32 day count
+        // (spec/design/date.md §4). date vs any other family — including timestamp, which would
+        // need a cast (a documented divergence from PG) — is a 42804.
+        (Date, Date) => Ok(()),
+        (Date, Null) | (Null, Date) => Ok(()),
+        (Date, _) | (_, Date) => Err(type_error(
+            "cannot compare a date value with a value of a different type",
         )),
         // Boolean compares only with boolean (or NULL); boolean with a number/text/bytea is a mismatch.
         (Bool, Int(_))
@@ -11869,6 +11937,7 @@ fn unify_values_column(a: &ResolvedType, b: &ResolvedType) -> Result<ResolvedTyp
         (Uuid, Uuid) => Uuid,
         (Timestamp, Timestamp) => Timestamp,
         (Timestamptz, Timestamptz) => Timestamptz,
+        (Date, Date) => Date,
         (Interval, Interval) => Interval,
         (Float(x), Float(y)) if x == y => Float(*x),
         _ => {
@@ -11897,6 +11966,7 @@ fn scalar_for_param_hint(rt: &ResolvedType) -> Option<ScalarType> {
         ResolvedType::Uuid => Some(ScalarType::Uuid),
         ResolvedType::Timestamp => Some(ScalarType::Timestamp),
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
+        ResolvedType::Date => Some(ScalarType::Date),
         ResolvedType::Interval => Some(ScalarType::Interval),
         ResolvedType::Null | ResolvedType::Composite(_) | ResolvedType::Array(_) => None,
     }
@@ -11915,6 +11985,7 @@ fn unify_setop_column(a: &ResolvedType, b: &ResolvedType, op: SetOpKind) -> Resu
         (Uuid, Uuid) => Uuid,
         (Timestamp, Timestamp) => Timestamp,
         (Timestamptz, Timestamptz) => Timestamptz,
+        (Date, Date) => Date,
         _ => {
             return Err(EngineError::new(
                 SqlState::DatatypeMismatch,
@@ -12066,6 +12137,7 @@ fn require_bool(ty: &ResolvedType, msg: &str) -> Result<()> {
         | ResolvedType::Uuid
         | ResolvedType::Timestamp
         | ResolvedType::Timestamptz
+        | ResolvedType::Date
         | ResolvedType::Interval
         | ResolvedType::Float(_)
         | ResolvedType::Composite(_)
@@ -12099,6 +12171,8 @@ fn require_assignable(ty: &ResolvedType, col_ty: ScalarType, col: &str) -> Resul
         matches!(ty, ResolvedType::Timestamptz | ResolvedType::Null)
     } else if col_ty.is_interval() {
         matches!(ty, ResolvedType::Interval | ResolvedType::Null)
+    } else if col_ty.is_date() {
+        matches!(ty, ResolvedType::Date | ResolvedType::Null)
     } else if col_ty.is_float() {
         // A float value assigns to an equal-or-wider float column: float32 → float32/float64
         // (implicit widening), float64 → float64 only (float64 → float32 is explicit-CAST only).
@@ -12344,6 +12418,7 @@ fn coerce_string_literal(
             RExpr::ConstInterval(parse_interval(s)?),
             ResolvedType::Interval,
         ),
+        ScalarType::Date => (RExpr::ConstDate(parse_date(s)?), ResolvedType::Date),
         // `text 'x'` is identity — the string IS the value.
         ScalarType::Text => (RExpr::ConstText(s.to_string()), ResolvedType::Text),
         ScalarType::Bool => (RExpr::ConstBool(parse_bool_literal(s)?), ResolvedType::Bool),
@@ -12663,6 +12738,10 @@ fn store_value(
                 // A string literal adapts to an interval column (spec/design/interval.md);
                 // malformed input traps 22007, an out-of-range field 22008.
                 Ok(Value::Interval(parse_interval(&s)?))
+            } else if col_ty.is_date() {
+                // A string literal adapts to a date column (spec/design/date.md); malformed
+                // input traps 22007, an out-of-range field 22008.
+                Ok(Value::Date(parse_date(&s)?))
             } else {
                 Err(type_error(format!(
                     "cannot store a text value in {} column {col_name}",
@@ -12706,6 +12785,16 @@ fn store_value(
             } else {
                 Err(type_error(format!(
                     "cannot store a timestamptz value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+        Value::Date(d) => {
+            if col_ty.is_date() {
+                Ok(Value::Date(d))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a date value in {} column {col_name}",
                     col_ty.canonical_name()
                 )))
             }
@@ -13093,6 +13182,7 @@ fn rexpr_const_to_value(node: &RExpr) -> Result<Value> {
         RExpr::ConstUuid(u) => Value::Uuid(*u),
         RExpr::ConstTimestamp(m) => Value::Timestamp(*m),
         RExpr::ConstTimestamptz(m) => Value::Timestamptz(*m),
+        RExpr::ConstDate(d) => Value::Date(*d),
         RExpr::ConstInterval(iv) => Value::Interval(*iv),
         _ => return Err(type_error("non-constant array element literal".to_string())),
     })
@@ -13189,6 +13279,7 @@ impl RExpr {
             RExpr::ConstUuid(u) => Ok(Value::Uuid(*u)),
             RExpr::ConstTimestamp(m) => Ok(Value::Timestamp(*m)),
             RExpr::ConstTimestamptz(m) => Ok(Value::Timestamptz(*m)),
+            RExpr::ConstDate(d) => Ok(Value::Date(*d)),
             RExpr::ConstInterval(iv) => Ok(Value::Interval(*iv)),
             RExpr::ConstNull => Ok(Value::Null),
             RExpr::Cast {
@@ -13245,6 +13336,7 @@ impl RExpr {
                     Value::Timestamp(_) | Value::Timestamptz(_) => {
                         unreachable!("resolver rejects a timestamp cast operand")
                     }
+                    Value::Date(_) => unreachable!("resolver rejects a date cast operand"),
                     Value::Interval(_) => unreachable!("resolver rejects an interval cast operand"),
                     Value::Composite(_) => {
                         unreachable!("resolver rejects a composite cast operand this slice")
@@ -13285,6 +13377,7 @@ impl RExpr {
                     Value::Timestamp(_) | Value::Timestamptz(_) => {
                         unreachable!("resolver rejects a timestamp unary minus")
                     }
+                    Value::Date(_) => unreachable!("resolver rejects a date unary minus"),
                     Value::Interval(iv) => Ok(Value::Interval(iv.neg()?)),
                     Value::Composite(_) => {
                         unreachable!("resolver rejects a composite unary minus")
@@ -14433,6 +14526,7 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         // Timestamps order by the int64 instant (-infinity < finite < infinity).
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
+        (Value::Date(x), Value::Date(y)) => x.cmp(y),
         // Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
         (Value::Interval(x), Value::Interval(y)) => x.cmp(y),
         // A composite sorts lexicographically, NULLs-last per field (the composite sort key —
@@ -14500,6 +14594,7 @@ fn family_rank(v: &Value) -> u8 {
         Value::Interval(_) => 8,
         Value::Float32(_) => 9,
         Value::Float64(_) => 10,
+        Value::Date(_) => 13,
         // A composite sorts only against composites of its own type (ORDER BY is single-typed), so
         // this cross-family rank is only for totality; it sits after the scalar families.
         Value::Composite(_) => 11,

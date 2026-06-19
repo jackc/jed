@@ -145,8 +145,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `round(x,n)` and other decimal functions.
 - [x] **`timestamp` / `timestamptz`** — PG instant model, int64 µs, no tz database, `±infinity`
       first-class, timestamp PK supported. → [timestamp.md](spec/design/timestamp.md)
-  - [ ] _follow-on:_ `EXTRACT`/`date_trunc`/`age`; separate `date`/`time` types; named-zone
+  - [ ] _follow-on:_ `EXTRACT`/`date_trunc`/`age`; separate `time` type; named-zone
         `AT TIME ZONE`; timestamp⇄text/date casts; `timestamp(p)` precision typmods.
+        (`date` ✅ landed below.)
+- [x] **`date`** — a calendar date (year/month/day, no time/zone): int32 days since 1970-01-01,
+      reusing timestamp's calendar core; strict ISO `YYYY-MM-DD` literals (string-adapt + `DATE '…'`
+      keyword) with BC era + `±infinity`, a trailing time/offset validated then dropped (24:00:00
+      does NOT roll into the day, unlike timestamp), comparison/ordering by the day count, a date
+      PRIMARY KEY (key encoding = int32; on-disk type code 16, no `format_version` bump). A **strict
+      island** — no compare/cast to timestamp this slice (a documented PG divergence). jed owns a
+      wider range than PG (≈ ±5.88M years). → [date.md](spec/design/date.md)
+  - [ ] _follow-on:_ **date arithmetic** (`date ± int` → date, `date - date` → int, `date ± interval`
+        → timestamp, `date + time` → timestamp); **casts** (text↔date, date↔timestamp — the latter
+        unblocks cross-family `date < timestamp`); **clock-relative literals** (`today`/`tomorrow`/
+        `yesterday`/`now`/`epoch`, on the entropy/clock seam); **date functions** (`make_date`,
+        `EXTRACT`/`date_part`, `date_trunc`, `current_date`). → [date.md §6](spec/design/date.md)
 - [x] **Typed string literals + string-literal casts (`type 'string'`)** — one generalized
       production = `CAST('string' AS type)`; literal-only coercion preserves strictness.
       → [grammar.md §36](spec/design/grammar.md)

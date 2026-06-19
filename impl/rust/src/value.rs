@@ -9,6 +9,7 @@
 //! executor clones a value only when reading it out of a stored row. A `uuid` value holds a
 //! fixed `[u8; 16]` (stack, `Copy`-able, but `Value` stays `Clone` for the heap variants).
 
+use crate::date;
 use crate::decimal::Decimal;
 use crate::interval::{self, Interval};
 use crate::timestamp;
@@ -52,6 +53,9 @@ pub enum Value {
     /// A UTC-instant `timestamptz` — int64 microseconds since the Unix epoch. Distinct from
     /// `Timestamp` (it renders with a +00 suffix and never compares cross-family).
     Timestamptz(i64),
+    /// A `date` — int32 days since the Unix epoch (the two sentinels i32::MIN/i32::MAX are
+    /// -infinity/+infinity). Compares by the day count; renders `YYYY-MM-DD` (spec/design/date.md).
+    Date(i32),
     /// An `interval` span — months/days/micros (spec/design/interval.md). Its `PartialEq`/`Eq`/
     /// `Hash` are **span-canonical** (`'1 mon' == '30 days'`), so DISTINCT/GROUP BY compare by the
     /// 128-bit span while `render` still preserves each value's field representation.
@@ -233,6 +237,7 @@ impl PartialEq for Value {
             (Value::Uuid(a), Value::Uuid(b)) => a == b,
             (Value::Timestamp(a), Value::Timestamp(b)) => a == b,
             (Value::Timestamptz(a), Value::Timestamptz(b)) => a == b,
+            (Value::Date(a), Value::Date(b)) => a == b,
             (Value::Interval(a), Value::Interval(b)) => a == b,
             // Composite equality is structural: same arity and every field equal (recursing into
             // each field's own canonical equality, so a `Decimal`/`Interval`/float field compares
@@ -270,6 +275,7 @@ impl std::hash::Hash for Value {
             Value::Uuid(u) => u.hash(state),
             Value::Timestamp(m) => m.hash(state),
             Value::Timestamptz(m) => m.hash(state),
+            Value::Date(d) => d.hash(state),
             Value::Interval(iv) => iv.hash(state),
             // Hash each field in order (the discriminant tag above already separates a composite
             // from a scalar), consistent with the structural `PartialEq` (the Hash/Eq contract).
@@ -368,6 +374,9 @@ impl Value {
             // `YYYY-MM-DD HH:MM:SS[.ffffff]`, timestamptz with a `+00` suffix, ±infinity bare.
             Value::Timestamp(m) => timestamp::render_timestamp(*m),
             Value::Timestamptz(m) => timestamp::render_timestamptz(*m),
+            // A date renders via the calendar formatter (spec/design/date.md): `YYYY-MM-DD`,
+            // ±infinity bare, a ` BC` suffix for an astronomical year ≤ 0.
+            Value::Date(d) => date::render_date(*d),
             // Interval renders via the shared formatter (PG `IntervalStyle = postgres`).
             Value::Interval(iv) => interval::render_interval(iv),
             // A composite renders as PG `record_out`: `(f1,f2,…)` with per-field quoting
@@ -416,6 +425,8 @@ impl Value {
             // Timestamps compare by the int64 instant; infinity is just an extreme value.
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a == b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a == b),
+            // Dates compare by the int32 day count; infinity is just an extreme value.
+            (Value::Date(a), Value::Date(b)) => bool3(a == b),
             // Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
             (Value::Interval(a), Value::Interval(b)) => bool3(a == b),
             // Composite `=` is element-wise 3VL (PG row comparison, spec/design/composite.md §5):
@@ -470,6 +481,7 @@ impl Value {
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a < b),
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a < b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a < b),
+            (Value::Date(a), Value::Date(b)) => bool3(a < b),
             (Value::Interval(a), Value::Interval(b)) => bool3(a < b),
             // Composite `<` is lexicographic with PG row-comparison NULL propagation
             // (spec/design/composite.md §5): the first field that is not equal decides via its own
@@ -508,6 +520,7 @@ impl Value {
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a > b),
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a > b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a > b),
+            (Value::Date(a), Value::Date(b)) => bool3(a > b),
             (Value::Interval(a), Value::Interval(b)) => bool3(a > b),
             // Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
             (Value::Composite(a), Value::Composite(b)) => composite_order3(a, b, true),

@@ -44,6 +44,10 @@ const (
 	// ValFloat64 is an IEEE 754 binary64 (the float64 / double-precision type). Int holds
 	// math.Float64bits(value); same verbatim-storage / canonical-comparison rule as float32.
 	ValFloat64
+	// ValDate is a calendar date; Int holds the int32 day count since 1970-01-01 (the sentinels
+	// DateNegInfinity/DatePosInfinity are -infinity/+infinity — spec/design/date.md). Compares by
+	// the day count; renders YYYY-MM-DD.
+	ValDate
 	// ValComposite is a composite (row) value — an ordered list of field values, recursive (a
 	// field may itself be a ValComposite), spec/design/composite.md §2. Comp holds a *[]Value
 	// POINTER so the flat Value struct stays ==-comparable (the slice would otherwise be
@@ -180,6 +184,9 @@ func TimestamptzValue(m int64) Value { return Value{Kind: ValTimestamptz, Int: m
 
 // IntervalValue builds a non-null interval value.
 func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, Iv: iv} }
+
+// DateValue builds a non-null date from its int32 day count since 1970-01-01.
+func DateValue(d int32) Value { return Value{Kind: ValDate, Int: int64(d)} }
 
 // CompositeValue builds a non-null composite (row) value from its field values
 // (spec/design/composite.md §2). The slice is held by pointer so Value stays ==-comparable;
@@ -409,6 +416,8 @@ func (v Value) Render() string {
 		return RenderTimestamp(v.Int)
 	case ValTimestamptz:
 		return RenderTimestamptz(v.Int)
+	case ValDate:
+		return RenderDate(int32(v.Int))
 	case ValInterval:
 		return RenderInterval(v.Iv)
 	case ValFloat32:
@@ -505,6 +514,10 @@ func (v Value) Eq3(o Value) ThreeValued {
 		return bool3(v.Int == o.Int)
 	}
 	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
+		return bool3(v.Int == o.Int)
+	}
+	// Dates compare by the int32 day count (infinity is just an extreme value).
+	if v.Kind == ValDate && o.Kind == ValDate {
 		return bool3(v.Int == o.Int)
 	}
 	// Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
@@ -618,6 +631,9 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
 		return bool3(v.Int < o.Int)
 	}
+	if v.Kind == ValDate && o.Kind == ValDate {
+		return bool3(v.Int < o.Int)
+	}
 	if v.Kind == ValInterval && o.Kind == ValInterval {
 		return bool3(v.Iv.SpanCmp(o.Iv) < 0)
 	}
@@ -669,6 +685,9 @@ func (v Value) Gt3(o Value) ThreeValued {
 		return bool3(v.Int > o.Int)
 	}
 	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
+		return bool3(v.Int > o.Int)
+	}
+	if v.Kind == ValDate && o.Kind == ValDate {
 		return bool3(v.Int > o.Int)
 	}
 	if v.Kind == ValInterval && o.Kind == ValInterval {

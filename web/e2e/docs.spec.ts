@@ -106,6 +106,17 @@ test('the select page runs the composite-with-array-field demo live (field acces
 	await expect(panel.getByTestId('result-rows')).toContainText('10');
 });
 
+test('the select page runs the date demo live', async ({ page }) => {
+	await page.goto('/docs/sql/select/');
+	// Sixteenth LiveSql panel = the date demo: WHERE on_day < '2024-03-01' ORDER BY on_day keeps
+	// only the two early dates, chronologically — review (2023-11-02) then launch (2024-01-15); the
+	// 2024-06-15 and infinity rows are filtered out (spec/design/date.md).
+	const panel = page.getByTestId('live-sql').nth(15);
+	await expect(panel.getByTestId('result-rows')).toContainText('review');
+	await expect(panel.getByTestId('result-rows')).toContainText('launch');
+	await expect(panel.getByTestId('result-rows')).not.toContainText('kickoff');
+});
+
 test('the reference pages are generated from the spec', async ({ page }) => {
 	await page.goto('/docs/reference/errors/');
 	// 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.

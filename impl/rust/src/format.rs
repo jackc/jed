@@ -116,6 +116,7 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Interval => 11,
         ScalarType::Float64 => 12,
         ScalarType::Float32 => 13,
+        ScalarType::Date => 16,
     }
 }
 
@@ -166,6 +167,7 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         11 => Some(ScalarType::Interval),
         12 => Some(ScalarType::Float64),
         13 => Some(ScalarType::Float32),
+        16 => Some(ScalarType::Date),
         _ => None,
     }
 }
@@ -304,6 +306,9 @@ fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
         // Timestamps store their int64 microsecond instant via the same fixed-width codec as
         // int64 (the sentinels are ordinary extreme values; spec/design/timestamp.md).
         Value::Timestamp(m) | Value::Timestamptz(m) => encode_nullable(ty, Some(*m)),
+        // A date stores its int32 day count via the same fixed-width (4-byte) order-preserving
+        // codec as int32 (the sentinels are ordinary extreme values; spec/design/date.md).
+        Value::Date(d) => encode_nullable(ty, Some(*d as i64)),
         Value::Text(s) => {
             let bytes = s.as_bytes();
             let mut out = Vec::with_capacity(3 + bytes.len());
@@ -2505,6 +2510,10 @@ fn read_inline_scalar(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Val
     } else if ty.is_timestamptz() {
         let vb = take(buf, pos, ty.width_bytes())?;
         Ok(Value::Timestamptz(decode_int(ty, vb)))
+    } else if ty.is_date() {
+        // 4-byte int32 day count, same order-preserving codec as int32 (spec/design/date.md).
+        let vb = take(buf, pos, ty.width_bytes())?;
+        Ok(Value::Date(decode_int(ty, vb) as i32))
     } else if ty.is_interval() {
         // Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
         let months = i32::from_be_bytes(

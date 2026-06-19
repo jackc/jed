@@ -231,6 +231,25 @@ file = "types/timestamp.test"
 sql = "SELECT id FROM m WHERE a = b"
 reason = "jed: timestamp and timestamptz are distinct comparison families — `timestamp = timestamptz` is not comparable (42804, the strict type system §4). PostgreSQL implicitly coerces timestamp to timestamptz (at the session zone) and returns a result."
 
+# --- date (spec/design/date.md). date tracks PG's date on nearly everything (ISO rendering, BC
+# era, the infinity sentinels, comparison/ordering, a date PRIMARY KEY, 22008 field overflow), so
+# most date.test records regenerate byte-identically from the oracle. These are the deliberate
+# divergences:
+[[override]]
+file = "types/date.test"
+sql = "INSERT INTO t VALUES (10, 'today')"
+reason = "jed: the clock-relative special 'today' is rejected this slice (22007, date.md §2) — deferred, like timestamp's 'now'. PostgreSQL resolves 'today' to the current date and accepts the insert (a wall-clock, nondeterministic value jed forbids by design, CLAUDE.md §10)."
+
+[[override]]
+file = "types/date.test"
+sql = "INSERT INTO t VALUES (13, '2024-01-15 12:00:60')"
+reason = "jed: a seconds field of 60 in a date literal's (dropped) time is out of range (22008, date.md §2 — the same strict :60 rule as timestamp). PostgreSQL accepts :60, carries it over, then drops the whole time, storing 2024-01-15. jed validates the time strictly even though it discards it."
+
+[[override]]
+file = "types/date.test"
+sql = "SELECT id FROM m WHERE a = b"
+reason = "jed: date and timestamp are distinct comparison families — `date = timestamp` is not comparable (42804, the strict type system §4; date is a strict island this slice, date.md §4). PostgreSQL implicitly casts the date to timestamp and returns a result. Deferred to the date↔timestamp cast follow-on."
+
 [[override]]
 file = "expr/timestamp_literal.test"
 sql = "SELECT TIMESTAMP '2024-01-01 00:00:00' = TIMESTAMPTZ '2024-01-01 00:00:00+00'"

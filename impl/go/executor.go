@@ -987,7 +987,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+def.TypeName+" primary key is not supported yet")
 			}
-			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -1084,7 +1084,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -1128,7 +1128,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
 			}
@@ -1626,7 +1626,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+name)
 		}
 		ty := columns[idx].Type
-		if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() {
+		if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
 			return Outcome{}, NewError(FeatureNotSupported,
 				"a "+ty.CanonicalName()+" index column is not supported yet")
 		}
@@ -1838,7 +1838,7 @@ func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) [
 		case ValUuid:
 			out = append(out, 0x00)
 			out = append(out, v.Str...)
-		case ValTimestamp, ValTimestamptz:
+		case ValTimestamp, ValTimestamptz, ValDate:
 			out = append(out, 0x00)
 			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		default:
@@ -1869,7 +1869,7 @@ func indexPrefixKey(columns []Column, def IndexDef, row Row) ([]byte, bool) {
 		case ValUuid:
 			out = append(out, 0x00)
 			out = append(out, v.Str...)
-		case ValTimestamp, ValTimestamptz:
+		case ValTimestamp, ValTimestamptz, ValDate:
 			out = append(out, 0x00)
 			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
 		default:
@@ -3342,6 +3342,8 @@ func typeFromResolved(rt resolvedType) (Type, error) {
 		return ScalarT(Timestamp), nil
 	case rtTimestamptz:
 		return ScalarT(Timestamptz), nil
+	case rtDate:
+		return ScalarT(Date), nil
 	case rtInterval:
 		return ScalarT(IntervalType), nil
 	case rtComposite:
@@ -3699,6 +3701,7 @@ func unifyValuesColumn(a, b resolvedType) (resolvedType, error) {
 		a.kind == rtUuid && b.kind == rtUuid,
 		a.kind == rtTimestamp && b.kind == rtTimestamp,
 		a.kind == rtTimestamptz && b.kind == rtTimestamptz,
+		a.kind == rtDate && b.kind == rtDate,
 		a.kind == rtInterval && b.kind == rtInterval,
 		a.kind == rtFloat32 && b.kind == rtFloat32,
 		a.kind == rtFloat64 && b.kind == rtFloat64:
@@ -3745,6 +3748,9 @@ func scalarForParamHint(rt resolvedType) *ScalarType {
 		return &t
 	case rtTimestamptz:
 		t := Timestamptz
+		return &t
+	case rtDate:
+		t := Date
 		return &t
 	case rtInterval:
 		t := IntervalType
@@ -4744,6 +4750,8 @@ func isConstSource(e *rExpr, pkType ScalarType) bool {
 		return pkType.IsTimestamp()
 	case reConstTimestamptz:
 		return pkType.IsTimestamptz()
+	case reConstDate:
+		return pkType.IsDate()
 	}
 	return false
 }
@@ -6149,6 +6157,8 @@ func valueToRExpr(v Value) *rExpr {
 		return &rExpr{kind: reConstTimestamp, cInt: v.Int}
 	case ValTimestamptz:
 		return &rExpr{kind: reConstTimestamptz, cInt: v.Int}
+	case ValDate:
+		return &rExpr{kind: reConstDate, cInt: v.Int}
 	case ValInterval:
 		return &rExpr{kind: reConstInterval, cIv: v.Iv}
 	case ValComposite:
@@ -6227,6 +6237,10 @@ func distinctRowKey(row []Value) string {
 			// already normalized to UTC at parse, so +00 and +05-of-the-same-instant bucket together.
 			b.WriteByte('z')
 			b.WriteString(strconv.FormatInt(v.Int, 10))
+		case ValDate:
+			// The int32 day count (held in Int), under a distinct 'd' tag.
+			b.WriteByte('d')
+			b.WriteString(strconv.FormatInt(v.Int, 10))
 		case ValInterval:
 			// The canonical 128-bit span as a decimal string, under a distinct 'v' tag, so
 			// span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/
@@ -6303,6 +6317,7 @@ const (
 	rtUuid        // uuid (one family, fixed 16 bytes); does not promote. First non-integer key.
 	rtTimestamp   // timestamp (zoneless instant); does not compare/cast to timestamptz
 	rtTimestamptz // timestamptz (UTC instant); does not compare/cast to timestamp
+	rtDate        // date (calendar date, int32 days); strict island, no compare/cast to timestamp
 	rtInterval    // interval (a span); compares only with itself, by the canonical span
 	rtFloat32     // float32 / real (binary32); promotes to float64; a strict island vs int/decimal
 	rtFloat64     // float64 / double precision (binary64)
@@ -6376,6 +6391,8 @@ func resolvedOfColumn(ty ScalarType) resolvedType {
 		return resolvedType{kind: rtTimestamp}
 	case ty.IsTimestamptz():
 		return resolvedType{kind: rtTimestamptz}
+	case ty.IsDate():
+		return resolvedType{kind: rtDate}
 	case ty.IsInterval():
 		return resolvedType{kind: rtInterval}
 	case ty.IsFloat32():
@@ -6410,7 +6427,7 @@ func assignableTo(t resolvedType, colTy ScalarType) bool {
 		return colTy.IsBool()
 	case rtText:
 		return colTy.IsText() || colTy.IsUuid() || colTy.IsBytea() ||
-			colTy.IsTimestamp() || colTy.IsTimestamptz() || colTy.IsInterval()
+			colTy.IsTimestamp() || colTy.IsTimestamptz() || colTy.IsInterval() || colTy.IsDate()
 	case rtBytea:
 		return colTy.IsBytea()
 	case rtUuid:
@@ -6419,6 +6436,8 @@ func assignableTo(t resolvedType, colTy ScalarType) bool {
 		return colTy.IsTimestamp()
 	case rtTimestamptz:
 		return colTy.IsTimestamptz()
+	case rtDate:
+		return colTy.IsDate()
 	case rtInterval:
 		return colTy.IsInterval()
 	case rtFloat32:
@@ -6463,6 +6482,8 @@ func rtName(t resolvedType) string {
 		return "timestamp"
 	case rtTimestamptz:
 		return "timestamptz"
+	case rtDate:
+		return "date"
 	case rtInterval:
 		return "interval"
 	case rtFloat32:
@@ -6516,6 +6537,9 @@ func ctxOf(t resolvedType) *ScalarType {
 	case rtTimestamptz:
 		ty := Timestamptz
 		return &ty
+	case rtDate:
+		ty := Date
+		return &ty
 	case rtInterval:
 		ty := IntervalType
 		return &ty
@@ -6547,6 +6571,7 @@ const (
 	reConstUuid
 	reConstTimestamp
 	reConstTimestamptz
+	reConstDate
 	reConstInterval
 	reConstFloat32
 	reConstFloat64
@@ -7731,6 +7756,8 @@ func argFamily(t resolvedType) string {
 		return "timestamp"
 	case rtTimestamptz:
 		return "timestamptz"
+	case rtDate:
+		return "date"
 	case rtInterval:
 		return "interval"
 	default: // rtNull
@@ -8093,6 +8120,8 @@ func elemScalarHint(t resolvedType) (ScalarType, bool) {
 		return Timestamp, true
 	case rtTimestamptz:
 		return Timestamptz, true
+	case rtDate:
+		return Date, true
 	case rtInterval:
 		return IntervalType, true
 	default:
@@ -9159,6 +9188,8 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 		return resolvedType{kind: rtTimestamp}
 	case ty.IsTimestamptz():
 		return resolvedType{kind: rtTimestamptz}
+	case ty.IsDate():
+		return resolvedType{kind: rtDate}
 	case ty.IsInterval():
 		return resolvedType{kind: rtInterval}
 	case ty.IsFloat32():
@@ -9553,6 +9584,14 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 					return nil, resolvedType{}, err
 				}
 				return &rExpr{kind: reConstTimestamptz, cInt: m}, resolvedType{kind: rtTimestamptz}, nil
+			case ctx != nil && ctx.IsDate():
+				// A string adapts to a DATE context (parse the ISO date, dropping any time/offset;
+				// 22007/22008 — spec/design/date.md §2), like timestamp adaptation.
+				m, err := ParseDate(e.Literal.Str)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return &rExpr{kind: reConstDate, cInt: int64(m)}, resolvedType{kind: rtDate}, nil
 			case ctx != nil && ctx.IsInterval():
 				// A string adapts to an INTERVAL context (parse the "unit + time" subset,
 				// 22007/22008 — spec/design/interval.md), like timestamp adaptation.
@@ -9758,6 +9797,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if target.IsInterval() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to an interval type is not supported yet")
 		}
+		// date casts are deferred (spec/design/date.md §5/§6): casting TO date is 0A000.
+		if target.IsDate() {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to a date type is not supported yet")
+		}
 		// A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
 		// `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
 		// (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
@@ -9794,6 +9837,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// Casting FROM an interval is likewise deferred (0A000).
 		if ity.kind == rtInterval {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from an interval type is not supported yet")
+		}
+		// Casting FROM a date is likewise deferred (0A000; date↔timestamp unblocks the cross-family comparison — date.md §4/§6).
+		if ity.kind == rtDate {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting from a date type is not supported yet")
 		}
 		// Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
 		if ity.kind == rtArray {
@@ -10136,7 +10183,7 @@ func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes)
 // or NULL); a boolean or text operand is a 42804 type error.
 func requireNumericOperand(t resolvedType) error {
 	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea || t.kind == rtUuid ||
-		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval ||
+		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval || t.kind == rtDate ||
 		isFloatKind(t.kind) {
 		// float is handled by the dedicated float branch in resolveBinary BEFORE this is reached;
 		// reject here too so any other caller treats it as a non-(int/decimal) operand.
@@ -10286,6 +10333,13 @@ func classifyComparable(lt, rt resolvedType) error {
 	ivL, ivR := lt.kind == rtInterval, rt.kind == rtInterval
 	if ivL != ivR && lt.kind != rtNull && rt.kind != rtNull {
 		return typeError("cannot compare an interval value with a value of a different type")
+	}
+	// date compares only within its own family (or with NULL); date vs any other family —
+	// including timestamp, which would need a cast — is a 42804 (date is a strict island,
+	// spec/design/date.md §4, a documented PG divergence).
+	dateL, dateR := lt.kind == rtDate, rt.kind == rtDate
+	if dateL != dateR && lt.kind != rtNull && rt.kind != rtNull {
+		return typeError("cannot compare a date value with a value of a different type")
 	}
 	// float compares only with float (either width promotes — §2) or NULL; float vs any other
 	// family (incl. integer/decimal) is a 42804 — float is a strict island requiring an explicit
@@ -10452,6 +10506,12 @@ func coerceStringLiteral(s string, target ScalarType, typmod *DecimalTypmod) (*r
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstInterval, cIv: iv}, resolvedType{kind: rtInterval}, nil
+	case Date:
+		d, err := ParseDate(s)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstDate, cInt: int64(d)}, resolvedType{kind: rtDate}, nil
 	case Text:
 		// text 'x' is identity — the string IS the value.
 		return &rExpr{kind: reConstText, cText: s}, resolvedType{kind: rtText}, nil
@@ -10741,7 +10801,7 @@ func promote(a, b resolvedType) ScalarType {
 
 func requireBool(t resolvedType, msg string) error {
 	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal || t.kind == rtBytea || t.kind == rtUuid ||
-		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval {
+		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval || t.kind == rtDate {
 		return typeError(msg)
 	}
 	return nil
@@ -11442,6 +11502,8 @@ func requireAssignable(t resolvedType, colTy ScalarType, col string) error {
 		ok = t.kind == rtTimestamptz || t.kind == rtNull
 	case colTy.IsInterval():
 		ok = t.kind == rtInterval || t.kind == rtNull
+	case colTy.IsDate():
+		ok = t.kind == rtDate || t.kind == rtNull
 	default: // text
 		ok = t.kind == rtText || t.kind == rtNull
 	}
@@ -11598,6 +11660,8 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		return TimestampValue(e.cInt), nil
 	case reConstTimestamptz:
 		return TimestamptzValue(e.cInt), nil
+	case reConstDate:
+		return DateValue(int32(e.cInt)), nil
 	case reConstInterval:
 		return IntervalValue(e.cIv), nil
 	case reConstFloat32:
@@ -12434,6 +12498,8 @@ func valueCmp(a, b Value) int {
 		return cmpInt64(a.Int, b.Int)
 	case a.Kind == ValTimestamptz && b.Kind == ValTimestamptz:
 		return cmpInt64(a.Int, b.Int)
+	case a.Kind == ValDate && b.Kind == ValDate:
+		return cmpInt64(a.Int, b.Int)
 	case a.Kind == ValInterval && b.Kind == ValInterval:
 		// Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
 		return a.Iv.SpanCmp(b.Iv)
@@ -12535,6 +12601,8 @@ func familyRank(v Value) int {
 		return 10
 	case ValFloat64:
 		return 11
+	case ValDate:
+		return 13
 	default:
 		return 12
 	}
@@ -12661,6 +12729,15 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			}
 			return TimestamptzValue(m), nil
 		}
+		if colTy.IsDate() {
+			// A string literal adapts to a date column (spec/design/date.md); malformed input
+			// traps 22007, an out-of-range field 22008.
+			d, err := ParseDate(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return DateValue(d), nil
+		}
 		if colTy.IsFloat() {
 			// A string literal adapts to a float column via float's input parse (the float8in
 			// spellings — sign/digits/e-notation/Infinity/NaN; spec/design/float.md §4). Malformed
@@ -12705,6 +12782,11 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			return v, nil
 		}
 		return Value{}, typeError("cannot store a timestamptz value in " + colTy.CanonicalName() + " column " + colName)
+	case ValDate:
+		if colTy.IsDate() {
+			return v, nil
+		}
+		return Value{}, typeError("cannot store a date value in " + colTy.CanonicalName() + " column " + colName)
 	case ValInterval:
 		if colTy.IsInterval() {
 			return v, nil
@@ -13049,6 +13131,8 @@ func rExprConstToValue(e *rExpr) (Value, error) {
 		return TimestampValue(e.cInt), nil
 	case reConstTimestamptz:
 		return TimestamptzValue(e.cInt), nil
+	case reConstDate:
+		return DateValue(int32(e.cInt)), nil
 	case reConstInterval:
 		return IntervalValue(e.cIv), nil
 	case reConstFloat32:
@@ -13121,7 +13205,7 @@ func encodeKeyValue(ty ScalarType, value Value) []byte {
 		return EncodeBool(value.Bool)
 	case ValUuid:
 		return []byte(value.Str)
-	case ValTimestamp, ValTimestamptz:
+	case ValTimestamp, ValTimestamptz, ValDate:
 		return EncodeInt(ty, value.Int)
 	default:
 		panic("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)")

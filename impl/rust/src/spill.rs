@@ -392,6 +392,11 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             w.write_all(&[8])?;
             w.write_all(&m.to_le_bytes())
         }
+        // Date — tag 17 (the int32 day count); internal merge-sort scratch format (spec/design/date.md).
+        Value::Date(d) => {
+            w.write_all(&[17])?;
+            w.write_all(&d.to_le_bytes())
+        }
         // Interval — tag 12 (tags 9/10/11 are the Unfetched forms below); months, days, micros.
         Value::Interval(iv) => {
             w.write_all(&[12])?;
@@ -515,6 +520,7 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
         }
         7 => Value::Timestamp(read_i64(r)?),
         8 => Value::Timestamptz(read_i64(r)?),
+        17 => Value::Date(read_u32(r)? as i32),
         9 => Value::Unfetched(Unfetched::External {
             first_page: read_u32(r)?,
             len: read_u32(r)?,

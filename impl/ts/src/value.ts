@@ -11,6 +11,7 @@
 import { Decimal } from "./decimal.ts";
 import { type Interval, intervalCmp, renderInterval } from "./interval.ts";
 import { renderTimestamp, renderTimestamptz } from "./timestamp.ts";
+import { renderDate } from "./date.ts";
 
 export type Value =
   | { kind: "null" }
@@ -21,6 +22,10 @@ export type Value =
   // -infinity/+infinity). They compare by the instant and never cross-family (timestamp.ts).
   | { kind: "timestamp"; micros: bigint }
   | { kind: "timestamptz"; micros: bigint }
+  // A calendar date; days is the int32 day count since 1970-01-01 (held as `bigint`, the core's
+  // uniform-integer discipline; the sentinels DATE_NEG_INFINITY/DATE_POS_INFINITY are
+  // -infinity/+infinity). Compares by the day count; renders YYYY-MM-DD (spec/design/date.md).
+  | { kind: "date"; days: bigint }
   // An interval span — months/days/micros (spec/design/interval.md). Comparison/dedup go through
   // the canonical 128-bit span (intervalSpan), NOT field equality, so '1 mon' == '30 days' while
   // render preserves each value's fields. micros is a bigint (int64 exactness).
@@ -171,6 +176,11 @@ export function timestamptzValue(m: bigint): Value {
 // intervalValue builds a non-null interval value.
 export function intervalValue(iv: Interval): Value {
   return { kind: "interval", iv };
+}
+
+// dateValue builds a non-null date from its int32 day count since 1970-01-01 (as a bigint).
+export function dateValue(days: bigint): Value {
+  return { kind: "date", days };
 }
 
 // compositeValue builds a composite (row) value from its ordered field values (spec/design/composite.md §2).
@@ -383,6 +393,8 @@ export function render(v: Value): string {
       return renderTimestamp(v.micros);
     case "timestamptz":
       return renderTimestamptz(v.micros);
+    case "date":
+      return renderDate(v.days);
     case "interval":
       return renderInterval(v.iv);
     case "composite":
@@ -867,6 +879,7 @@ export function eq3(a: Value, b: Value): ThreeValued {
   // Timestamps compare by the int64 instant (infinity is just an extreme value).
   if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros === b.micros);
   if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros === b.micros);
+  if (a.kind === "date" && b.kind === "date") return bool3(a.days === b.days);
   // Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
   if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) === 0);
   // Composite `=` is element-wise 3VL (PG row comparison, spec/design/composite.md §5): FALSE if any
@@ -996,6 +1009,7 @@ export function lt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "bool" && b.kind === "bool") return bool3(!a.value && b.value);
   if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros < b.micros);
   if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros < b.micros);
+  if (a.kind === "date" && b.kind === "date") return bool3(a.days < b.days);
   if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) < 0);
   // Composite `<` is lexicographic with PG row-comparison NULL propagation (spec/design/composite.md
   // §5): the first field that is not equal decides via its own `<`; a field whose `=` is UNKNOWN (a
@@ -1026,6 +1040,7 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value && !b.value);
   if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros > b.micros);
   if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros > b.micros);
+  if (a.kind === "date" && b.kind === "date") return bool3(a.days > b.days);
   if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) > 0);
   // Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
   if (a.kind === "composite" && b.kind === "composite") return compositeOrder3(a.fields, b.fields, true);

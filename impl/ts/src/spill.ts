@@ -396,6 +396,11 @@ function writeValue(w: ByteWriter, v: Value): void {
       w.u8(8);
       w.u64(v.micros);
       break;
+    case "date":
+      // Date — tag 17 (the int32 day count); internal merge-sort scratch format (spec/design/date.md).
+      w.u8(17);
+      w.u64(v.days);
+      break;
     case "float64":
       // The 8 IEEE bytes (DataView, the spill format is per-core internal — bits round-trip incl
       // -0/NaN/±Inf so an ORDER BY over / carrying a float column spills correctly).
@@ -496,6 +501,8 @@ function readValue(r: SpillByteReader): Value {
       return { kind: "timestamp", micros: r.u64() };
     case 8:
       return { kind: "timestamptz", micros: r.u64() };
+    case 17:
+      return { kind: "date", days: r.u64() };
     case 9:
       return {
         kind: "unfetched",

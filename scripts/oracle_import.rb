@@ -51,7 +51,7 @@ class OracleImport
     "double precision" => "R", "real" => "R", # the float types' tolerant render tag (float.md §9)
     "text" => "T", "character varying" => "T", "uuid" => "T", "bytea" => "T",
     "timestamp without time zone" => "T", "timestamp with time zone" => "T",
-    "interval" => "T",
+    "interval" => "T", "date" => "T",
   }.freeze
 
   def initialize(path)

@@ -213,6 +213,10 @@ var SupportedCapabilities = []string{
 	// SUM/AVG; exempt from cross-core identity for computed/rendered values (R tag). float.md.
 	"types.float64",
 	"types.float32",
+	// date scalar type (a calendar date — int32 days since 1970-01-01): ISO literals, BC era,
+	// infinity sentinels, comparison/ordering, a date PRIMARY KEY (key encoding = int32). A
+	// strict island — no compare/cast to timestamp this slice. spec/design/date.md.
+	"types.date",
 	// interval ± interval → interval and unary minus (interval.md §5).
 	"expr.interval_arithmetic",
 	// interval ×÷ number → interval (the exact field-scaling cascade — interval.md §5).

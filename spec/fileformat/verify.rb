@@ -47,10 +47,11 @@ S_COMPRESS = 32 # payloads below this are never fed to the encoder (large-values
 
 require_relative "lz4"
 
-WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "timestamp" => 8, "timestamptz" => 8 }.freeze
+WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "timestamp" => 8, "timestamptz" => 8,
+          "date" => 4 }.freeze
 TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
              "bytea" => 7, "uuid" => 8, "timestamp" => 9, "timestamptz" => 10, "interval" => 11,
-             "float64" => 12, "float32" => 13 }.freeze
+             "float64" => 12, "float32" => 13, "date" => 16 }.freeze
 CODETYPE = TYPECODE.invert.freeze
 
 # An array (T[]) column type is the element type's string with a trailing "[]" (spec/design/array.md
@@ -324,6 +325,17 @@ INTERVAL_TABLE = {
          [4, [1, 0, 0]], [5, [0, 30, 0]], [6, nil]]
 }.freeze
 
+# A table with a date column (type code 16): exercises the value codec's date branch (the int32
+# day count, the same 4-byte int-be-signflip body as int32). Covers a positive date (2024-01-15 ->
+# day 19737), a pre-1970 negative one (1969-12-31 -> -1), a BC-era one (0044-03-15 BC -> astro -43
+# -> day -735160), the -infinity/+infinity sentinels (i32::MIN/MAX), and a NULL. Values are the raw
+# day counts the cores compute from the corresponding literals. PK is int32. (spec/design/date.md)
+DATE_TABLE = {
+  name: "t",
+  columns: [col("id", "int32", pk: true), col("d", "date")],
+  rows: [[1, 19_737], [2, -1], [3, -735_160], [4, -2_147_483_648], [5, 2_147_483_647], [6, nil]]
+}.freeze
+
 # A table with a float64 column (type code 12): exercises the value codec's 8-byte IEEE branch.
 # Covers a positive fraction, a negative value, +0 and -0 (the sign bit is preserved on disk —
 # distinct bytes 0x0000…/0x8000…), +Infinity, -Infinity, a canonicalized NaN (stored as the single
@@ -576,6 +588,7 @@ FIXTURES = [
   { file: "interval_table.jed",    page_size: 256, tables: [INTERVAL_TABLE] },
   { file: "float64_table.jed",     page_size: 256, tables: [FLOAT64_TABLE] },
   { file: "float32_table.jed",     page_size: 256, tables: [FLOAT32_TABLE] },
+  { file: "date_table.jed",        page_size: 256, tables: [DATE_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
     tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },

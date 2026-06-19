@@ -104,6 +104,18 @@ INSERT INTO shapes VALUES
        (p).pts[1]   AS first_point
 FROM shapes
 ORDER BY p;`;
+
+	const dateSeed = `CREATE TABLE event (id int32 PRIMARY KEY, name text, on_day date);
+INSERT INTO event VALUES
+  (1, 'launch',  '2024-01-15'),
+  (2, 'review',  '2023-11-02'),
+  (3, 'kickoff', '2024-06-15'),
+  (4, 'someday', 'infinity');`;
+
+	const dateExample = `SELECT name, on_day
+FROM event
+WHERE on_day < DATE '2024-03-01'
+ORDER BY on_day;`;
 </script>
 
 <svelte:head>
@@ -251,6 +263,15 @@ with `(p).pts`, and subscript it with `(p).pts[1]`. Comparison and `ORDER BY` fo
 field-by-field, using the array's element-wise order for the array field:
 
 <LiveSql seed={compositeArrayFieldSeed} query={compositeArrayFieldExample} rows={2} />
+
+## Dates
+
+A `date` is a calendar date — year/month/day, no time or zone. Write one as a quoted ISO string
+(`'2024-01-15'`) that adapts to the column, or with the `DATE '…'` keyword literal. Dates compare
+and sort chronologically, and `infinity` / `-infinity` are first-class values. (A literal carrying
+a time keeps only the date part, so `'2024-01-15 09:30:00'` stores `2024-01-15`.)
+
+<LiveSql seed={dateSeed} query={dateExample} rows={3} />
 
 ## Cost
 

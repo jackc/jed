@@ -1612,6 +1612,7 @@ just "coerce the string `x` to that type, with the type named explicitly." The p
 | target | rule | error codes |
 |---|---|---|
 | `timestamp` / `timestamptz` | the §3 datetime parse ([timestamp.md](timestamp.md)); tz normalizes the offset to UTC | `22007` / `22008` |
+| `date` | the ISO `YYYY-MM-DD` parse ([date.md](date.md) §2); a trailing time/offset is validated then dropped | `22007` / `22008` |
 | `interval` | the "unit + time" subset ([interval.md](interval.md) §3) | `22007` / `22008` |
 | `bytea` | `\x`-hex input ([types.md](types.md) §13) | `22P02` |
 | `uuid` | PG-flexible uuid input ([types.md](types.md) §14) | `22P02` |

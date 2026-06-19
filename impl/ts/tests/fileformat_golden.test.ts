@@ -403,6 +403,22 @@ function float32TableDB(): Database {
   return db;
 }
 
+// dateTableDB exercises the value codec's date branch (type code 16): the 4-byte int32 day-count
+// body (same int-be-signflip codec as int32). A positive date, a pre-1970 negative one, a BC-era
+// one, the −infinity/+infinity sentinels (i32 min/max), and a NULL. The bare-string literals adapt
+// to the date column. PK is int32 (spec/design/date.md).
+function dateTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, d date)");
+  run(db, "INSERT INTO t VALUES (1, '2024-01-15')");
+  run(db, "INSERT INTO t VALUES (2, '1969-12-31')");
+  run(db, "INSERT INTO t VALUES (3, '0044-03-15 BC')");
+  run(db, "INSERT INTO t VALUES (4, '-infinity')");
+  run(db, "INSERT INTO t VALUES (5, 'infinity')");
+  run(db, "INSERT INTO t VALUES (6, NULL)");
+  return db;
+}
+
 // compositeTypeTableDB: a composite TYPE defined + persisted (v9), used by a stored composite COLUMN
 // (S3 — the recursive value codec). Exercises the kind-tagged catalog (a composite-type entry, kind
 // 1, before the table entry, kind 0), a composite column (type_code 14), and the value codec's null
@@ -479,6 +495,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "default_table.jed", build: defaultTableDB },
     { name: "default_expr_table.jed", build: defaultExprTableDB },
     { name: "timestamp_table.jed", build: timestampTableDB },
+    { name: "date_table.jed", build: dateTableDB },
     { name: "timestamptz_table.jed", build: timestamptzTableDB },
     { name: "interval_table.jed", build: intervalTableDB },
     { name: "float64_table.jed", build: float64TableDB },
@@ -523,6 +540,7 @@ test("read goldens reproduces rows", () => {
     { name: "default_table.jed", build: defaultTableDB, table: "t" },
     { name: "default_expr_table.jed", build: defaultExprTableDB, table: "t" },
     { name: "timestamp_table.jed", build: timestampTableDB, table: "t" },
+    { name: "date_table.jed", build: dateTableDB, table: "t" },
     { name: "timestamptz_table.jed", build: timestamptzTableDB, table: "t" },
     { name: "interval_table.jed", build: intervalTableDB, table: "t" },
     { name: "float64_table.jed", build: float64TableDB, table: "t" },

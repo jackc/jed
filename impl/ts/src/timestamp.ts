@@ -70,7 +70,7 @@ export function daysFromCivil(y: bigint, m: bigint, d: bigint): bigint {
 }
 
 // civilFromDays returns the civil date [year, month, day] from days since 1970-01-01.
-function civilFromDays(z: bigint): [bigint, bigint, bigint] {
+export function civilFromDays(z: bigint): [bigint, bigint, bigint] {
   z += 719468n;
   const era = (z >= 0n ? z : z - 146096n) / 146097n;
   const doe = z - era * 146097n;
@@ -98,11 +98,11 @@ export function civilFromMicros(
 
 // --- parsing -----------------------------------------------------------------
 
-function invalidDatetime(detail: string): EngineError {
+export function invalidDatetime(detail: string): EngineError {
   return engineError("invalid_datetime_format", detail);
 }
 
-function fieldOverflow(detail: string): EngineError {
+export function fieldOverflow(detail: string): EngineError {
   return engineError("datetime_field_overflow", detail);
 }
 
@@ -110,7 +110,7 @@ function isWS(c: number): boolean {
   return c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0c || c === 0x0d;
 }
 
-function trimASCIIWS(s: string): string {
+export function trimASCIIWS(s: string): string {
   let start = 0;
   let end = s.length;
   while (start < end && isWS(s.charCodeAt(start))) start++;
@@ -121,7 +121,7 @@ function trimASCIIWS(s: string): string {
 const MAX_I64 = 9223372036854775807n;
 
 // A small mutable cursor (index into the string).
-type Cur = { i: number };
+export type Cur = { i: number };
 
 function isDigit(c: number): boolean {
   return c >= 48 && c <= 57;
@@ -129,7 +129,7 @@ function isDigit(c: number): boolean {
 
 // readUint reads one run of ASCII digits at cur.i as a bigint. Empty run → 22007; a value
 // beyond int64 → 22008.
-function readUint(b: string, cur: Cur): bigint {
+export function readUint(b: string, cur: Cur): bigint {
   const start = cur.i;
   let v = 0n;
   while (cur.i < b.length && isDigit(b.charCodeAt(cur.i))) {
@@ -141,7 +141,7 @@ function readUint(b: string, cur: Cur): bigint {
   return v;
 }
 
-function expectChar(b: string, cur: Cur, c: string): void {
+export function expectChar(b: string, cur: Cur, c: string): void {
   if (cur.i < b.length && b[cur.i] === c) {
     cur.i++;
     return;
@@ -151,7 +151,7 @@ function expectChar(b: string, cur: Cur, c: string): void {
 
 // readFrac parses fractional-seconds digits into microseconds (0..1_000_000; 1_000_000 means
 // the rounding carried). 0–6 digits exact; 7+ round to µs half away from zero (7th digit >= 5).
-function readFrac(b: string, cur: Cur): bigint {
+export function readFrac(b: string, cur: Cur): bigint {
   const start = cur.i;
   while (cur.i < b.length && isDigit(b.charCodeAt(cur.i))) cur.i++;
   const digits = b.slice(start, cur.i);

@@ -444,6 +444,22 @@ func float32TableDB(t *testing.T) *Database {
 	return db
 }
 
+// dateTableDB exercises the value codec's date branch (type code 16): the 4-byte int32 day-count
+// body (same int-be-signflip codec as int32). A positive date, a pre-1970 negative one, a BC-era
+// one, the −infinity/+infinity sentinels (i32 min/max), and a NULL. The bare-string literals adapt
+// to the date column. PK is int32 (spec/design/date.md).
+func dateTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, d date)")
+	run(t, db, "INSERT INTO t VALUES (1, '2024-01-15')")
+	run(t, db, "INSERT INTO t VALUES (2, '1969-12-31')")
+	run(t, db, "INSERT INTO t VALUES (3, '0044-03-15 BC')")
+	run(t, db, "INSERT INTO t VALUES (4, '-infinity')")
+	run(t, db, "INSERT INTO t VALUES (5, 'infinity')")
+	run(t, db, "INSERT INTO t VALUES (6, NULL)")
+	return db
+}
+
 // compositeTypeTableDB has a composite TYPE defined + persisted (v9) AND used by a column with
 // stored values (S3): pins the recursive value codec — the null bitmap, a present-field body, and a
 // NULL field's zero-byte omission (row 2's zip) — spec/design/composite.md §4.
@@ -526,6 +542,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"interval_table.jed", intervalTableDB},
 		{"float64_table.jed", float64TableDB},
 		{"float32_table.jed", float32TableDB},
+		{"date_table.jed", dateTableDB},
 		{"nopk_table.jed", nopkTableDB},
 		{"composite_pk_table.jed", compositePKTableDB},
 		{"check_table.jed", checkTableDB},
@@ -575,6 +592,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"interval_table.jed", intervalTableDB, "t"},
 		{"float64_table.jed", float64TableDB, "t"},
 		{"float32_table.jed", float32TableDB, "t"},
+		{"date_table.jed", dateTableDB, "t"},
 		{"nopk_table.jed", nopkTableDB, "r"},
 		{"composite_pk_table.jed", compositePKTableDB, "t"},
 		{"check_table.jed", checkTableDB, "t"},
