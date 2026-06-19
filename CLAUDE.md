@@ -193,6 +193,22 @@ everything else tests against, not a detail discovered during implementation.
     semantics (NULLs comparable, always a definite boolean), *not* composite's 3VL. Delivered
     S0–S4; arrays-as-key, multidimensional values, and the array function surface are deferred
     `0A000` follow-ons (`spec/design/array.md` §12).
+  - **The `range` container is the third open-`Type` axis** (`spec/design/ranges.md`,
+    `spec/types/ranges.toml`; `i32range`/`i64range`/`numrange`/`tsrange`/`tstzrange`/`daterange`,
+    `'[1,5)'::i32range`, `i32range(1,5)`). PostgreSQL's six built-in range types, **structural**
+    like array — `Type::Range(Box<Type>)` carries the element (sub)type inline, no `CREATE TYPE`,
+    no catalog object, self-describing on disk — but over a **bounded** set of six scalar elements
+    (the subtypes PG ships a range for; any other element → `42704`). The jed names use the
+    i/f-prefix (`i32range`/`i64range`), with PG's `int4range`/`int8range` as aliases (the
+    naming the i/f-prefix rename was done to enable — no `i8range` collision). A range carries
+    inclusive/exclusive + unbounded endpoints and a distinguished `empty`; discrete subtypes
+    (i32/i64/date) are stored in PG's canonical `[)` form; comparison is PostgreSQL's total range
+    btree order (definite boolean, like array — not composite's 3VL). The **six type-set facts**
+    are shared data (`ranges.toml` → the codegen'd `RANGES` table); the recursive codec/comparator/
+    text-I/O are hand-written per core, byte-identical by construction (the composite/array
+    precedent, §5). Delivered in slices (R0–R3 type axis, RF1–RF4 function/operator surface,
+    `ranges.md` §11); ranges-as-key / a range index (PG uses GiST) and multirange/custom range
+    types are deferred `0A000`/out-of-scope follow-ons (`ranges.md` §10).
   - **The type system is OPEN, not closed — composite (row) types have landed**
     (`spec/design/composite.md`, `CREATE TYPE addr AS (street text, zip i32)`). This is the
     pivot the scalar set above only hinted at: a type is no longer *only* a compiled-in

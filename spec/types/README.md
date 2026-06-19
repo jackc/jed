@@ -14,6 +14,7 @@ The reasoning behind these tables lives in
 | [scalars.toml](scalars.toml) | Scalar type definitions: id, aliases, width, range, overflow behavior, key-encoding rule, promotion rank. |
 | [compare.toml](compare.toml) | Comparison & promotion: comparability classes, the numeric promotion tower, three-valued NULL logic. |
 | [casts.toml](casts.toml) | Coercion matrix: which casts exist and their mode (implicit / assignment / explicit). Anything unlisted is forbidden. |
+| [ranges.toml](ranges.toml) | The six built-in range types (a structural range over a scalar element): id, element subtype, aliases, discreteness. Codegen'd to the per-core `RANGES` table; see [../design/ranges.md](../design/ranges.md). |
 
 ## Current scope — the storable scalar set
 

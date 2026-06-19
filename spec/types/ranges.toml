@@ -1,0 +1,76 @@
+# Range type definitions — CANONICAL DATA (CLAUDE.md §4, §5).
+#
+# The six built-in PostgreSQL range types, modeled as a STRUCTURAL container over a
+# scalar element (subtype) — the THIRD open-`Type` axis after composite (nominal) and
+# array (structural). `i32range` is "range of i32" the way `i32[]` is "array of i32":
+# derived from its element type, no DDL, no catalog object, the element carried inline,
+# self-describing on disk (../design/ranges.md §2). Reasoning lives in ../design/ranges.md
+# — read it before editing this file.
+#
+# Build-time input to per-language codegen (scripts/gen_catalog.rb → the per-core `RANGES`
+# descriptor table); never parsed at runtime. As with composite/array, only this TYPE-SET
+# table is shared data: the recursive value codec / comparator / text-I/O / canonicalize
+# rule are hand-written per core (CLAUDE.md §5 forbids codegenning them) and stay
+# byte-identical BY CONSTRUCTION, because each is derived from an element type that is
+# already cross-core-identical (../design/extensibility.md §4.1).
+
+schema_version = 1
+
+# --- conventions -------------------------------------------------------------
+# id         canonical range type name. ALL aliases normalize to this; it is the single
+#            name that appears in error messages, the catalog, and conformance `query`
+#            column-type tags (determinism: one name per type).
+# element    the scalar subtype id (../types/scalars.toml) the range is built over. The
+#            range type is STRUCTURAL — `i32range` identity == "range of i32", derived from
+#            this element with no `CREATE TYPE` and no array-type-style id. The six element
+#            types are exactly those PostgreSQL ships a built-in range for; an element with
+#            no entry here has no range type (`textrange` etc. → 42704, a deliberate bound).
+# aliases    additional names accepted on input, normalizing to id. PostgreSQL's
+#            `int4range`/`int8range` alias jed's `i32range`/`i64range` — the `i`-prefix keeps
+#            jed's bit-namespace lexically disjoint from PG's byte-namespace, so `int8range`
+#            aliases `i64range` with no `i8range` collision (CLAUDE.md §4; the reason the
+#            i/f-prefix rename was done). The other four keep PostgreSQL's names verbatim.
+# discrete   true if the element has a discrete step, so a canonical `[)` form exists: the
+#            integer subtypes (i32/i64) and date. A discrete range is STORED canonicalized to
+#            `[)` — `(x` → `[x+1`, `x]` → `x+1)` — which at the representation level is just
+#            "increment the element's underlying integer by 1" (date is i32 days, so its +1
+#            day IS +1 on the stored int), trapping 22003 if a bound steps past the element
+#            domain (../design/ranges.md §4). false = continuous (decimal/timestamp/
+#            timestamptz): the bounds are kept verbatim, inclusivity and all.
+# -----------------------------------------------------------------------------
+
+[[range]]
+id = "i32range"
+element = "i32"
+aliases = ["int4range"]
+discrete = true
+
+[[range]]
+id = "i64range"
+element = "i64"
+aliases = ["int8range"]
+discrete = true
+
+[[range]]
+id = "numrange"
+element = "decimal"
+aliases = []
+discrete = false
+
+[[range]]
+id = "tsrange"
+element = "timestamp"
+aliases = []
+discrete = false
+
+[[range]]
+id = "tstzrange"
+element = "timestamptz"
+aliases = []
+discrete = false
+
+[[range]]
+id = "daterange"
+element = "date"
+aliases = []
+discrete = true

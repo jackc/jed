@@ -543,6 +543,8 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 13 | `f32` |
 | 14 | composite (a user-defined row type — followed by the type name, **not** a fixed body; v9) |
 | 15 | array (a structural `T[]` — followed by the element type descriptor, **not** a fixed body; v10) |
+| 16 | `date` (a calendar date — i32 days since the Unix epoch, fixed 4-byte body; v12) |
+| 17 | range (a structural range over a scalar element — followed by the element type descriptor, **not** a fixed body; v15 — [../design/ranges.md](../design/ranges.md)) |
 
 A **`f64`** value (`type_code == 12`) is the **8 IEEE 754 bytes, big-endian**, and a
 **`f32`** value (`type_code == 13`) is the **4 IEEE 754 bytes, big-endian** — both behind the

@@ -277,9 +277,13 @@ alter_sequence_option ::= sequence_option | "RESTART" ("WITH"? signed_integer)?
  *   decimal | numeric | dec
  *   bytea
  *   uuid
+ *   i32range | int4range | i64range | int8range | numrange | tsrange | tstzrange | daterange
  * (canonical names use the i/f-prefix bit-width spelling; the SQL-standard words and PG's
  *  byte-shorthand int2/int4/int8, float4/float8 are aliases — types.md §2. The old jed names
- *  int16/int32/int64/float32/float64 are NOT accepted, a clean break.)
+ *  int16/int32/int64/float32/float64 are NOT accepted, a clean break. The range type names
+ *  are STRUCTURAL ranges over a scalar element — ../design/ranges.md; int4range/int8range
+ *  alias i32range/i64range; the other four match PostgreSQL. timestamp/timestamptz/interval/
+ *  date and user composite type names are also accepted here, resolved by the catalog.)
  * An unknown name is rejected at execution time (42704), not by the grammar. The typmod
  * is accepted ONLY for decimal/numeric: numeric(p) (= numeric(p,0)) and numeric(p,s),
  * with 1 <= p <= 1000 and 0 <= s <= p (a bad typmod traps 22023; ../design/grammar.md).
