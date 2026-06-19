@@ -2,7 +2,7 @@
 // functions) to match the boring/explicit style (CLAUDE.md §10).
 
 import type { Expr } from "./ast.ts";
-import { type DecimalTypmod, type ScalarType, type Type } from "./types.ts";
+import { type DecimalTypmod, type ScalarType, type Type, scalarTypeFromName } from "./types.ts";
 import type { Value } from "./value.ts";
 
 // Column is a column definition: name, declared type, nullability, primary-key flag, default.
@@ -182,16 +182,66 @@ export type SeqOwner = {
   column: number;
 };
 
-// I64_MAX is the i64 maximum (2^63-1), the default ascending MAXVALUE / descending floor base.
+// I64_MAX is the i64 maximum (2^63-1), the default ascending MAXVALUE for an AS bigint sequence.
 export const I64_MAX = 9223372036854775807n;
 
-// defaultSequenceBounds is the type defaults for an ascending (increment > 0) vs descending sequence,
-// before any explicit MIN/MAX/START override (PostgreSQL): ascending ⇒ [1, i64::MAX], start = MIN;
-// descending ⇒ [-(i64::MAX), -1], start = MAX. (i64::MIN is reserved out of the default descending
-// floor, matching PG's -9223372036854775807 default MINVALUE.) Returns [min, max].
-export function defaultSequenceBounds(increment: bigint): [bigint, bigint] {
-  if (increment < 0n) return [-I64_MAX, -1n];
-  return [1n, I64_MAX];
+// SeqDataType is a sequence's value data type (`AS smallint | integer | bigint`,
+// spec/design/sequences.md §14). Its only effect is on the bounds: it sets the default + validated
+// MINVALUE/MAXVALUE. The counter is always an i64 (bigint here), and the type is not persisted (it
+// is reducible to the bounds), so this is a parse/build-time concept only. Modeled as a
+// string-literal union with free functions, matching ScalarType's style (CLAUDE.md §10).
+export type SeqDataType = "smallint" | "integer" | "bigint";
+
+// seqDataTypeRange returns the inclusive value range [T_min, T_max] of the type (the natural
+// i16/i32/i64 range).
+export function seqDataTypeRange(t: SeqDataType): [bigint, bigint] {
+  switch (t) {
+    case "smallint":
+      return [-32768n, 32767n];
+    case "integer":
+      return [-2147483648n, 2147483647n];
+    case "bigint":
+      return [-9223372036854775808n, 9223372036854775807n];
+  }
+}
+
+// seqDataTypePgName returns the PostgreSQL type name used in error messages (smallint / integer /
+// bigint). The union member is already that name; kept as a function to mirror the Go/Rust API.
+export function seqDataTypePgName(t: SeqDataType): string {
+  return t;
+}
+
+// seqDataTypeDefaultBounds returns the type defaults for an ascending (increment > 0) vs descending
+// sequence, before any explicit MIN/MAX/START override (PostgreSQL init_params): ascending ⇒
+// [1, T_max], start = MIN; descending ⇒ [T_min, -1], start = MAX. Returns [min, max].
+export function seqDataTypeDefaultBounds(t: SeqDataType, increment: bigint): [bigint, bigint] {
+  const [lo, hi] = seqDataTypeRange(t);
+  if (increment < 0n) return [lo, -1n];
+  return [1n, hi];
+}
+
+// seqDataTypeFromName resolves an `AS <name>` type to a sequence data type, or undefined if the name
+// is not an integer type (caller raises 22023 "sequence type must be smallint, integer, or bigint").
+export function seqDataTypeFromName(name: string): SeqDataType | undefined {
+  const s = scalarTypeFromName(name);
+  if (s === undefined) return undefined;
+  return seqDataTypeForScalar(s);
+}
+
+// seqDataTypeForScalar returns the sequence data type matching a column's integer scalar
+// (serial/identity auto-wiring): an i16/i32/i64 column maps to smallint/integer/bigint; any other
+// scalar → undefined.
+export function seqDataTypeForScalar(s: ScalarType): SeqDataType | undefined {
+  switch (s) {
+    case "i16":
+      return "smallint";
+    case "i32":
+      return "integer";
+    case "i64":
+      return "bigint";
+    default:
+      return undefined;
+  }
 }
 
 // ColType is a fully-resolved storage/codec column type (spec/design/composite.md §4): a scalar,

@@ -1591,6 +1591,24 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			if def.Identity != nil {
 				opts = def.Identity.Options
 			}
+			// The owned sequence's data type follows the column (§14): serial → the pseudo-type,
+			// identity → the column type. An explicit `AS` inside the identity `( … )` options
+			// conflicts with that — 42601 (PG: "conflicting or redundant options"). serial carries no
+			// parsed options, so this only fires for identity.
+			if opts.DataType != "" {
+				return Outcome{}, NewError(SyntaxError, "conflicting or redundant options")
+			}
+			seqScalar := serialKind
+			if !isSerial {
+				seqScalar = colType.ScalarTy()
+			}
+			seqDtype, ok := SeqDataTypeForScalar(seqScalar)
+			if !ok {
+				// Unreachable: a serial / identity column is i16/i32/i64 (gated above).
+				return Outcome{}, NewError(InvalidParameterValue,
+					"serial / identity column is i16/i32/i64")
+			}
+			opts.DataType = seqDtype.PgName()
 			seqDef, err := buildSequenceDef(seqName, opts, owner)
 			if err != nil {
 				return Outcome{}, err
@@ -2239,11 +2257,24 @@ func (db *Database) chooseSerialSeqName(table, column string, pending []*Sequenc
 }
 
 // buildSequenceDef resolves a parsed SeqOptions set into a validated SequenceDef
-// (spec/design/sequences.md §1), shared by CREATE SEQUENCE and an IDENTITY column's `( seq_options )`
-// (§13). Validates INCREMENT (≠ 0), CACHE (≥ 1), MINVALUE ≤ MAXVALUE, and START in [min, max] (each
-// 22023); a fresh sequence starts with LastValue = Start, IsCalled = false. ownedBy carries the
-// IDENTITY / serial owner link (nil for a plain CREATE SEQUENCE).
+// (spec/design/sequences.md §1/§14), shared by CREATE SEQUENCE and an IDENTITY column's
+// `( seq_options )` (§13). The AS type (or the serial/identity-supplied default) sets the default +
+// validated bounds; then validates INCREMENT (≠ 0), CACHE (≥ 1), explicit MIN/MAX within the type
+// range, MINVALUE ≤ MAXVALUE, and START in [min, max] (each 22023); a fresh sequence starts with
+// LastValue = Start, IsCalled = false. ownedBy carries the IDENTITY / serial owner link (nil for a
+// plain CREATE SEQUENCE).
 func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*SequenceDef, error) {
+	// The value type (§14): `AS <type>` → the named type (22023 if not an integer type), else bigint.
+	dtype := SeqBigInt
+	if options.DataType != "" {
+		dt, ok := SeqDataTypeFromName(options.DataType)
+		if !ok {
+			return nil, NewError(InvalidParameterValue,
+				"sequence type must be smallint, integer, or bigint")
+		}
+		dtype = dt
+	}
+	typeMin, typeMax := dtype.Range()
 	increment := int64(1)
 	if options.Increment != nil {
 		increment = *options.Increment
@@ -2259,7 +2290,19 @@ func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*Sequ
 		return nil, NewError(InvalidParameterValue,
 			fmt.Sprintf("CACHE (%d) must be greater than zero", cache))
 	}
-	defMin, defMax := DefaultBounds(increment)
+	defMin, defMax := dtype.DefaultBounds(increment)
+	// An explicit MAXVALUE/MINVALUE outside the type range is 22023 — checked (MAX first, PG order)
+	// BEFORE the MIN > MAX consistency check (§14.2).
+	if options.MaxValue != nil && !options.MaxValue.NoValue && options.MaxValue.Value > typeMax {
+		return nil, NewError(InvalidParameterValue, fmt.Sprintf(
+			"MAXVALUE (%d) is out of range for sequence data type %s", options.MaxValue.Value, dtype.PgName(),
+		))
+	}
+	if options.MinValue != nil && !options.MinValue.NoValue && options.MinValue.Value < typeMin {
+		return nil, NewError(InvalidParameterValue, fmt.Sprintf(
+			"MINVALUE (%d) is out of range for sequence data type %s", options.MinValue.Value, dtype.PgName(),
+		))
+	}
 	// A non-nil SeqBound with NoValue selects the default; with a value sets the explicit bound; a
 	// nil SeqBound means the option was unset → the default (the Rust Some(Some)/Some(None)/None).
 	minValue := defMin

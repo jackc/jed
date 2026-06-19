@@ -1,9 +1,10 @@
 // IDENTITY columns (spec/design/sequences.md §13) — the per-core unit tests for what the PG-clean
 // oracle corpus cannot express (CLAUDE.md §10): the on-disk persistence of the ALWAYS/BY DEFAULT
-// distinction (the 428C9 gate still fires after a close/open), the auto-named owned sequence
-// introspection, and the bigint-flavored owned sequence divergence (decision 11). The PG-agreeing
-// behavior (auto-numbering, OVERRIDING SYSTEM/USER, 428C9, the 42601 conflicts, the 22023 type
-// gate) lives in suites/ddl/identity.test. Mirrors impl/rust/tests/identity.rs.
+// distinction (the 428C9 gate still fires after a close/open) and the auto-named owned-sequence
+// auto-drop. The PG-agreeing behavior (auto-numbering, OVERRIDING SYSTEM/USER, 428C9, the 42601
+// conflicts, the 22023 type gate, and — since S5, §14 — the owned sequence following the column
+// type) lives in suites/ddl/identity.test + suites/ddl/sequence_as_type.test. Mirrors
+// impl/rust/tests/identity.rs.
 
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
@@ -111,20 +112,20 @@ test("identity owned sequences auto-drop", () => {
   assert.equal(errCode(db, "SELECT nextval('t_n_seq')"), "42P01");
 });
 
-// DIVERGENCE (decision 11): an IDENTITY column's owned sequence is bigint-flavored regardless of the
-// column width — a smallint GENERATED … AS IDENTITY gets a default i64 sequence (MAXVALUE 2^63-1),
-// not PG's smallint sequence (MAXVALUE 32767). Advancing the sequence past 32767 succeeds in jed
-// where PG would raise 2200H; the narrower column type only bounds stored values (22003 at INSERT).
-test("identity owned sequence is bigint-flavored", () => {
+// S5 (§14): an IDENTITY column's owned sequence follows the column type — a smallint GENERATED …
+// AS IDENTITY gets an AS smallint sequence bounded to [1, 32767] (matching PG; the prior
+// bigint-flavored divergence is closed). Introspects the auto-created sequence via its derived name:
+// setval past 32767 is 22003, and nextval at the boundary traps 2200H — the sequence itself is now
+// bounded (the corpus pins the boundary too, but the auto-name wiring stays a per-core check).
+test("identity owned sequence follows column type", () => {
   const db = new Database();
   execute(db, "CREATE TABLE t (id smallint GENERATED ALWAYS AS IDENTITY, v text)");
-  // Drive the owned sequence past the i16 max directly — jed allows it (bigint sequence); PG's
-  // smallint identity sequence would 2200H here.
-  execute(db, "SELECT setval('t_id_seq', 40000)");
-  assert.equal(oneInt(db, "SELECT nextval('t_id_seq')"), 40001n);
-  // The column type still bounds a stored value: an INSERT pulling 40001 traps 22003 (the column is
-  // i16), the documented divergence point (PG's 2200H lives at the sequence instead).
-  assert.equal(errCode(db, "INSERT INTO t (v) VALUES ('a')"), "22003");
+  // The owned sequence is AS smallint: setval past the i16 max is out of bounds (22003).
+  assert.equal(errCode(db, "SELECT setval('t_id_seq', 40000)"), "22003");
+  // At the boundary, the next value overflows the sequence (2200H) — not the column (the i16
+  // sequence stops here, exactly as PG).
+  execute(db, "SELECT setval('t_id_seq', 32767)");
+  assert.equal(errCode(db, "SELECT nextval('t_id_seq')"), "2200H");
 });
 
 // The identity sequence options ( … ) tune the owned sequence (a per-core check that the option set

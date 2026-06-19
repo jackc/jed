@@ -853,6 +853,14 @@ impl Parser {
         let mut seq = SeqOptions::default();
         loop {
             match self.peek_keyword().as_deref() {
+                // `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw
+                // type name is stored; it is resolved (and a non-integer type rejected 22023) at
+                // execution. Inside an IDENTITY column's `( … )` a set `data_type` is 42601.
+                Some("as") => {
+                    self.dup_check(seq.data_type.is_some(), "AS")?;
+                    self.advance();
+                    seq.data_type = Some(self.expect_identifier()?);
+                }
                 Some("increment") => {
                     self.dup_check(seq.increment.is_some(), "INCREMENT")?;
                     self.advance();

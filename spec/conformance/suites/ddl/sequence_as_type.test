@@ -1,0 +1,131 @@
+# CREATE SEQUENCE … AS { smallint | integer | bigint } — the sequence value data type (S5,
+# spec/design/sequences.md §14). The type sets the default + validated MINVALUE/MAXVALUE; the counter
+# is always i64 and the type is NOT persisted (reducible to the bounds — no format_version change).
+# serial follows the pseudo-type and a GENERATED AS IDENTITY column follows its column type, so their
+# owned sequences are now properly bounded (closing the prior bigint-flavored divergence). AS is an
+# order-free option; a non-integer AS type or an explicit bound outside the type range is 22023; an AS
+# clause inside an identity column's ( … ) options is 42601.
+#
+# The bounds are pinned with self-contained setval checks — a value AT the type ceiling/floor is
+# accepted (setval returns it) and one PAST it is 22003 — which together fix MIN/MAX without relying
+# on cross-statement sequence state. (The nextval-past-the-ceiling 2200H, which needs a stateful
+# prefix the single-handle oracle harness does not replay for SELECT setval/nextval, is a per-core
+# test.)
+# requires: ddl.sequence_as_type, ddl.sequence, ddl.serial, ddl.identity, func.sequence, ddl.create_table, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, types.i16, types.i32, types.i64
+
+# --- AS smallint: the default MAXVALUE is the i16 ceiling 32767 -----------------------------------
+
+statement ok
+CREATE SEQUENCE ss AS smallint
+
+# the type ceiling is reachable …
+query I nosort
+SELECT setval('ss', 32767)
+----
+32767
+
+# … and one past it is out of bounds (22003), so MAXVALUE is exactly 32767
+statement error 22003
+SELECT setval('ss', 32768)
+
+# --- AS is order-free; a descending smallint floors at -32768 -------------------------------------
+
+statement ok
+CREATE SEQUENCE sd INCREMENT -1 AS smallint
+
+query I nosort
+SELECT setval('sd', -32768)
+----
+-32768
+
+statement error 22003
+SELECT setval('sd', -32769)
+
+# --- AS integer: the default ceiling is the i32 max -----------------------------------------------
+
+statement ok
+CREATE SEQUENCE si AS integer
+
+query I nosort
+SELECT setval('si', 2147483647)
+----
+2147483647
+
+statement error 22003
+SELECT setval('si', 2147483648)
+
+# --- bigint (the default, no AS): a descending sequence floors at -2^63 (i64::MIN) ----------------
+# (Pins the type's full range as the default bound — a value the prior code rejected off-by-one.)
+
+statement ok
+CREATE SEQUENCE bd INCREMENT -1
+
+query I nosort
+SELECT setval('bd', -9223372036854775808)
+----
+-9223372036854775808
+
+# --- explicit bounds must lie within the AS type's range (22023) ----------------------------------
+
+statement error 22023
+CREATE SEQUENCE bad1 AS smallint MAXVALUE 40000
+
+statement error 22023
+CREATE SEQUENCE bad2 AS smallint MINVALUE -40000
+
+# in-range explicit bounds are fine
+statement ok
+CREATE SEQUENCE ok1 AS smallint MINVALUE -100 MAXVALUE 100
+
+# a non-integer AS type is 22023
+statement error 22023
+CREATE SEQUENCE bad3 AS text
+
+# --- smallserial: the owned sequence follows the pseudo-type (AS smallint, MAXVALUE 32767) ---------
+
+statement ok
+CREATE TABLE tsm (id smallserial, v text)
+
+query I nosort
+SELECT setval('tsm_id_seq', 32767)
+----
+32767
+
+statement error 22003
+SELECT setval('tsm_id_seq', 32768)
+
+# --- a smallint identity column's owned sequence is AS smallint too --------------------------------
+
+statement ok
+CREATE TABLE tid (id smallint GENERATED ALWAYS AS IDENTITY, v text)
+
+statement error 22003
+SELECT setval('tid_id_seq', 40000)
+
+# --- an AS clause inside an identity column's ( … ) options is 42601 (the column type fixes it) ----
+
+statement error 42601
+CREATE TABLE tbad (id smallint GENERATED ALWAYS AS IDENTITY (AS bigint))
+
+# --- cleanup --------------------------------------------------------------------------------------
+
+statement ok
+DROP SEQUENCE ss
+
+statement ok
+DROP SEQUENCE sd
+
+statement ok
+DROP SEQUENCE si
+
+statement ok
+DROP SEQUENCE bd
+
+statement ok
+DROP SEQUENCE ok1
+
+statement ok
+DROP TABLE tsm
+
+statement ok
+DROP TABLE tid

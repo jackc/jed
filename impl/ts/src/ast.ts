@@ -347,6 +347,11 @@ export type DropType = { kind: "dropType"; name: string; ifExists: boolean };
 // form: `{ value: v }` = MINVALUE v; `{ value: null }` = NO MINVALUE (the type default); the outer
 // `null` = unset.
 export type SeqOptions = {
+  // dataType is the `AS <type>` value type as written (the raw type name, e.g. "smallint" /
+  // "int4"), resolved to a SeqDataType at execution (spec/design/sequences.md §14); null = the
+  // bigint default. A non-integer type is 22023. Inside an IDENTITY column's options a set dataType
+  // is 42601 (the column type fixes it).
+  dataType: string | null;
   increment: bigint | null;
   minValue: { value: bigint | null } | null;
   maxValue: { value: bigint | null } | null;
@@ -357,7 +362,15 @@ export type SeqOptions = {
 
 // emptySeqOptions builds a fresh SeqOptions with every override unset (the all-default sequence).
 export function emptySeqOptions(): SeqOptions {
-  return { increment: null, minValue: null, maxValue: null, start: null, cache: null, cycle: null };
+  return {
+    dataType: null,
+    increment: null,
+    minValue: null,
+    maxValue: null,
+    start: null,
+    cache: null,
+    cycle: null,
+  };
 }
 
 // CreateSequence is a `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` statement — a named,

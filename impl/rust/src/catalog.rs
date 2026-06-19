@@ -194,16 +194,58 @@ pub struct SeqOwner {
     pub column: u16,
 }
 
-impl SequenceDef {
+/// A sequence's value data type (`AS smallint | integer | bigint`, spec/design/sequences.md §14).
+/// Its **only** effect is on the bounds: it sets the default + validated MINVALUE/MAXVALUE. The
+/// counter is always an `i64`, and the type is not persisted (it is reducible to the bounds), so this
+/// is a parse/build-time concept only.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum SeqDataType {
+    SmallInt,
+    Integer,
+    BigInt,
+}
+
+impl SeqDataType {
+    /// The inclusive value range `[T_min, T_max]` of the type (the natural `i16`/`i32`/`i64` range).
+    pub fn range(self) -> (i64, i64) {
+        match self {
+            SeqDataType::SmallInt => (i16::MIN as i64, i16::MAX as i64),
+            SeqDataType::Integer => (i32::MIN as i64, i32::MAX as i64),
+            SeqDataType::BigInt => (i64::MIN, i64::MAX),
+        }
+    }
+
+    /// The PostgreSQL type name used in error messages (`smallint` / `integer` / `bigint`).
+    pub fn pg_name(self) -> &'static str {
+        match self {
+            SeqDataType::SmallInt => "smallint",
+            SeqDataType::Integer => "integer",
+            SeqDataType::BigInt => "bigint",
+        }
+    }
+
     /// The type defaults for an ascending (`increment > 0`) vs descending sequence, before any
-    /// explicit MIN/MAX/START override (PostgreSQL): ascending ⇒ [1, i64::MAX], start = MIN;
-    /// descending ⇒ [-(i64::MAX), -1], start = MAX. (`i64::MIN` is reserved out of the default
-    /// descending floor, matching PG's `-9223372036854775807` default MINVALUE.)
-    pub fn default_bounds(increment: i64) -> (i64, i64) {
-        if increment < 0 {
-            (-i64::MAX, -1)
-        } else {
-            (1, i64::MAX)
+    /// explicit MIN/MAX/START override (PostgreSQL `init_params`): ascending ⇒ `[1, T_max]`,
+    /// start = MIN; descending ⇒ `[T_min, -1]`, start = MAX.
+    pub fn default_bounds(self, increment: i64) -> (i64, i64) {
+        let (lo, hi) = self.range();
+        if increment < 0 { (lo, -1) } else { (1, hi) }
+    }
+
+    /// Resolve an `AS <name>` type to a sequence data type, or `None` if the name is not an integer
+    /// type (caller raises `22023` "sequence type must be smallint, integer, or bigint").
+    pub fn from_type_name(name: &str) -> Option<SeqDataType> {
+        Self::for_scalar(ScalarType::from_name(name)?)
+    }
+
+    /// The sequence data type matching a column's integer scalar (`serial`/identity auto-wiring): an
+    /// `i16`/`i32`/`i64` column maps to `smallint`/`integer`/`bigint`; any other scalar → `None`.
+    pub fn for_scalar(s: ScalarType) -> Option<SeqDataType> {
+        match s {
+            ScalarType::Int16 => Some(SeqDataType::SmallInt),
+            ScalarType::Int32 => Some(SeqDataType::Integer),
+            ScalarType::Int64 => Some(SeqDataType::BigInt),
+            _ => None,
         }
     }
 }

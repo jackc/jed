@@ -776,6 +776,15 @@ class Parser {
     // Order-free option loop: dispatch on the leading keyword, each option at most once.
     for (;;) {
       switch (this.peekKeyword()) {
+        // `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw type
+        // name is stored; it is resolved (and a non-integer type rejected 22023) at execution.
+        // Inside an IDENTITY column's `( … )` a set dataType is 42601.
+        case "as": {
+          this.dupCheck(seq.dataType !== null, "AS");
+          this.advance();
+          seq.dataType = this.expectIdentifier();
+          break;
+        }
         case "increment": {
           this.dupCheck(seq.increment !== null, "INCREMENT");
           this.advance();

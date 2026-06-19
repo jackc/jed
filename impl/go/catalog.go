@@ -166,15 +166,77 @@ type SeqOwner struct {
 	Column uint16
 }
 
-// DefaultBounds returns the type defaults for an ascending (increment > 0) vs descending
-// sequence, before any explicit MIN/MAX/START override (PostgreSQL): ascending ⇒ [1, MaxInt64],
-// start = MIN; descending ⇒ [-MaxInt64, -1], start = MAX. (MinInt64 is reserved out of the
-// default descending floor, matching PG's -9223372036854775807 default MINVALUE.)
-func DefaultBounds(increment int64) (int64, int64) {
-	if increment < 0 {
-		return -math.MaxInt64, -1
+// SeqDataType is a sequence's value data type (`AS smallint | integer | bigint`,
+// spec/design/sequences.md §14). Its only effect is on the bounds: it sets the default + validated
+// MINVALUE/MAXVALUE. The counter is always an i64, and the type is not persisted (it is reducible to
+// the bounds), so this is a parse/build-time concept only.
+type SeqDataType int
+
+const (
+	SeqSmallInt SeqDataType = iota
+	SeqInteger
+	SeqBigInt
+)
+
+// Range returns the inclusive value range [T_min, T_max] of the type (the natural i16/i32/i64 range).
+func (t SeqDataType) Range() (int64, int64) {
+	switch t {
+	case SeqSmallInt:
+		return math.MinInt16, math.MaxInt16
+	case SeqInteger:
+		return math.MinInt32, math.MaxInt32
+	default: // SeqBigInt
+		return math.MinInt64, math.MaxInt64
 	}
-	return 1, math.MaxInt64
+}
+
+// PgName returns the PostgreSQL type name used in error messages (smallint / integer / bigint).
+func (t SeqDataType) PgName() string {
+	switch t {
+	case SeqSmallInt:
+		return "smallint"
+	case SeqInteger:
+		return "integer"
+	default: // SeqBigInt
+		return "bigint"
+	}
+}
+
+// DefaultBounds returns the type defaults for an ascending (increment > 0) vs descending sequence,
+// before any explicit MIN/MAX/START override (PostgreSQL init_params): ascending ⇒ [1, T_max],
+// start = MIN; descending ⇒ [T_min, -1], start = MAX.
+func (t SeqDataType) DefaultBounds(increment int64) (int64, int64) {
+	lo, hi := t.Range()
+	if increment < 0 {
+		return lo, -1
+	}
+	return 1, hi
+}
+
+// SeqDataTypeFromName resolves an `AS <name>` type to a sequence data type. ok is false if the name
+// is not an integer type (caller raises 22023 "sequence type must be smallint, integer, or bigint").
+func SeqDataTypeFromName(name string) (SeqDataType, bool) {
+	s, ok := ScalarTypeFromName(name)
+	if !ok {
+		return 0, false
+	}
+	return SeqDataTypeForScalar(s)
+}
+
+// SeqDataTypeForScalar returns the sequence data type matching a column's integer scalar
+// (serial/identity auto-wiring): an i16/i32/i64 column maps to smallint/integer/bigint; any other
+// scalar → ok false.
+func SeqDataTypeForScalar(s ScalarType) (SeqDataType, bool) {
+	switch s {
+	case Int16:
+		return SeqSmallInt, true
+	case Int32:
+		return SeqInteger, true
+	case Int64:
+		return SeqBigInt, true
+	default:
+		return 0, false
+	}
 }
 
 // IndexKind selects an ordered B-tree (the default) or a GIN inverted index

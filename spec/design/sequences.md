@@ -23,6 +23,7 @@ like a table's rows. The one decision that defines the feature is what happens t
 ```sql
 CREATE SEQUENCE s
 CREATE SEQUENCE [IF NOT EXISTS] s
+    [AS { smallint | integer | bigint }]        -- the value type (S5 — §14); default bigint
     [INCREMENT [BY] n] [MINVALUE m | NO MINVALUE] [MAXVALUE x | NO MAXVALUE]
     [START [WITH] s0] [CACHE c] [[NO] CYCLE]
 ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]   -- reset the counter (S2 — §4)
@@ -42,16 +43,25 @@ SELECT setval('s', n, false)   -- set the counter; next nextval = n (is_called =
 SELECT lastval()               -- the value the most recent nextval returned this session (§6)
 ```
 
-- **i64-valued.** A sequence generates `i64` (`bigint`) values, matching PostgreSQL's internal
-  `int8` sequence representation. The `AS smallint | integer | bigint` typmod (PG 10+) is deferred
-  `0A000` — every jed sequence is the `bigint` flavor this slice. `nextval`/`currval` return `i64`.
+- **i64-valued, with an `AS` data type (S5 — §14).** A sequence's counter is always an `i64`
+  internally (`nextval`/`currval` return `i64`); the **`AS smallint | integer | bigint`** clause (PG
+  10+, an order-free option) selects the value **type**, which sets the **default MINVALUE/MAXVALUE**
+  and **bounds** any explicit ones. `smallint` → `[-32768, 32767]`, `integer` → `[-2147483648,
+  2147483647]`, `bigint` (the default, with no `AS`) → `[-2^63, 2^63-1]` (the full `i64` range).
+  A non-integer `AS` type (`AS text`, `AS numeric`, …) is `22023` ("sequence type must be smallint,
+  integer, or bigint"). The type is **not persisted** — it is fully reducible to the resulting
+  MIN/MAX bounds (§14), so a typed sequence and a plain one with the same explicit bounds are
+  byte-identical; no `format_version` change.
 - **Options.** `INCREMENT BY` (non-zero step; `22023` for zero), `MINVALUE`/`MAXVALUE` (the inclusive
-  bounds; `NO MINVALUE`/`NO MAXVALUE` select the type defaults), `START WITH` (the first value), and
-  `[NO] CYCLE` (wrap vs. error at a bound). Defaults match PostgreSQL: a positive `INCREMENT`
-  (default `1`) gives `MINVALUE 1`, `MAXVALUE 2^63-1`, `START` = `MINVALUE`; a negative `INCREMENT`
-  gives `MINVALUE -(2^63-1)`, `MAXVALUE -1`, `START` = `MAXVALUE`. A `START`/`MINVALUE`/`MAXVALUE`
-  combination that is inconsistent (`START < MINVALUE`, `START > MAXVALUE`, or `MINVALUE > MAXVALUE`)
-  is `22023` at `CREATE`.
+  bounds; `NO MINVALUE`/`NO MAXVALUE` select the **type** defaults), `START WITH` (the first value),
+  `CACHE`, `[NO] CYCLE` (wrap vs. error at a bound), and `AS <type>` (above). Defaults match
+  PostgreSQL relative to the chosen type `T` (`[T_min, T_max]`): a positive `INCREMENT` (default `1`)
+  gives `MINVALUE 1`, `MAXVALUE T_max`, `START` = `MINVALUE`; a negative `INCREMENT` gives `MINVALUE
+  T_min`, `MAXVALUE -1`, `START` = `MAXVALUE`. An explicit `MAXVALUE > T_max` is `22023` ("MAXVALUE
+  (x) is out of range for sequence data type *T*") and an explicit `MINVALUE < T_min` is `22023`
+  ("MINVALUE (x) is out of range …") — checked before the consistency checks. A
+  `START`/`MINVALUE`/`MAXVALUE` combination that is inconsistent (`START < MINVALUE`, `START >
+  MAXVALUE`, or `MINVALUE > MAXVALUE`) is `22023` at `CREATE`.
 - **`CACHE`** is **parsed and stored but behaviorally `1`** — see §7. A `CACHE < 1` is `22023`.
 - **`nextval('s')`/`currval('s')`/`setval('s', n[, is_called])`** take the sequence **name as a text
   argument** (the PG `nextval('s'::regclass)` form, with the `regclass` cast implicit). They are the
@@ -65,8 +75,10 @@ SELECT lastval()               -- the value the most recent nextval returned thi
   create a dependency in PostgreSQL either (only `serial`/`OWNED BY`/identity do, both deferred), so
   `DROP SEQUENCE` of a sequence named in some column default succeeds and a later `INSERT` raises
   `42P01` at evaluation — exactly PG.
-- **`ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]`** lands in **S2** (§4) — the only `ALTER` action
-  this slice. `ALTER SEQUENCE … SET INCREMENT|MINVALUE|… RENAME|OWNED BY|AS type` stay `0A000`.
+- **`ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]`** lands in **S2** (§4) — the only `ALTER` action.
+  `ALTER SEQUENCE … SET INCREMENT|MINVALUE|… RENAME|OWNED BY|AS type` stay `0A000` (the `AS type`
+  clause is supported only at `CREATE` — and on `serial`/identity, via the column type — not in
+  `ALTER`, which would have to re-derive bounds against a *persisted* type the engine does not store).
 
 ## 2. Sequences as a catalog object — `Snapshot.sequences`
 
@@ -276,12 +288,13 @@ flat per-call weight is a sound bound.
 | `currval` before `nextval`/`setval(…,true)`; `lastval` before any `nextval`, this session | `55000` object_not_in_prerequisite_state |
 | `nextval` past `MAXVALUE`/`MINVALUE` without `CYCLE` | `2200H` sequence_generator_limit_exceeded |
 | `setval` value outside `[MINVALUE, MAXVALUE]` | `22003` numeric_value_out_of_range |
-| `INCREMENT 0`, `CACHE < 1`, inconsistent `START`/`MIN`/`MAX`, `RESTART` value out of bounds, or an IDENTITY column whose type is not `smallint`/`integer`/`bigint` (§13.1) | `22023` invalid_parameter_value |
+| `INCREMENT 0`, `CACHE < 1`, inconsistent `START`/`MIN`/`MAX`, `RESTART` value out of bounds, an IDENTITY column whose type is not `smallint`/`integer`/`bigint` (§13.1), a non-integer `AS` type ("sequence type must be smallint, integer, or bigint"), or an explicit `MINVALUE`/`MAXVALUE` outside the `AS` type's range ("MINVALUE/MAXVALUE (x) is out of range for sequence data type *T*") (§14) | `22023` invalid_parameter_value |
+| `AS` clause inside an IDENTITY column's `( … )` options ("conflicting or redundant options", §14) — the column type already fixes the sequence type | `42601` syntax_error |
 | Explicit `DEFAULT` (or a `serial` type) **and** `IDENTITY` on one column; two identity specs on one column (§13.2) | `42601` syntax_error |
 | Explicit non-`DEFAULT` value into a `GENERATED ALWAYS` identity column without `OVERRIDING SYSTEM VALUE`; assigning one in `UPDATE` (§13.3/§13.4) | `428C9` generated_always |
 | `nextval`/`setval`/`ALTER SEQUENCE` in a read-only transaction | `25006` read_only_sql_transaction |
 | Corrupt sequence catalog entry | `XX001` data_corrupted |
-| `ALTER SEQUENCE` actions other than `RESTART`; `DROP SEQUENCE … CASCADE`; `AS type` typmod | `0A000` feature_not_supported |
+| `ALTER SEQUENCE` actions other than `RESTART` (incl. `ALTER … AS type`); `DROP SEQUENCE … CASCADE` | `0A000` feature_not_supported |
 
 ## 10. Ratified decisions and deliberate PostgreSQL divergences
 
@@ -292,7 +305,9 @@ are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_ove
    determinism (CLAUDE.md §8/§10, determinism.md §5) + the single-writer model removes PG's
    concurrency rationale. The headline divergence.
 2. **`CACHE` is no value-burning** — accepted and stored, behaves as `CACHE 1` (§7). Same reason.
-3. **`bigint`-only** — no `AS smallint|integer` typmod this slice (`0A000`); jed sequences are i64.
+3. **~~`bigint`-only~~ — CLOSED in S5 (§14).** `AS smallint | integer | bigint` is now supported; a
+   sequence's value type sets its default/validated bounds (the counter stays `i64` internally). The
+   type is not persisted (it is reducible to the bounds — §14). `ALTER … AS type` stays `0A000`.
 4. **No implicit dependency from a plain `DEFAULT nextval('s')`** — matches PG (only `serial`/identity
    create one); `DROP SEQUENCE` needs no dependency tracking this slice (§1).
 5. **`nextval`/`setval` make the statement a write** — required by the single-writer staging model
@@ -303,22 +318,21 @@ are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_ove
    alone; `setval` never touches `lastval`; `RESTART` touches no session state — §4/§6).
 8. **`setval` out-of-bounds is `22003`, `RESTART` out-of-bounds is `22023`** — the two distinct PG
    error paths (`do_setval` vs. `init_params`) are preserved as-is (§4).
-9. **`serial` sequences are `bigint`-flavored** (§12) — `serial`/`smallserial` do NOT get PG's
-   per-type `AS integer`/`AS smallint` sequence (the `AS type` typmod is `0A000` this slice, decision
-   3). The owned sequence is the default ascending i64 sequence; the *column* is `i32`/`i16` and
-   bounds stored values (a too-large `nextval` traps `22003` at the INSERT coercion rather than PG's
-   `2200H` at the sequence). Overriding reason: the deferred `AS type`. Same divergence-class as
-   decision 3, ledgered.
+9. **~~`serial` sequences are `bigint`-flavored~~ — CLOSED in S5 (§14).** With `AS type` implemented,
+   a `serial`/`bigserial`/`smallserial` column's owned sequence now follows the pseudo-type
+   (`serial` → `AS integer`, `bigserial` → `AS bigint`, `smallserial` → `AS smallint`), matching PG
+   exactly — a too-large `nextval` traps `2200H` at the sequence (PG's behavior), not `22003` at the
+   INSERT coercion. The divergence is removed (no oracle override).
 10. **The owned (`serial`) sequence is dropped with its table; dropping it alone is `2BP01`** (§12) —
     the `OWNED BY` dependency. Matches PG. Unlike a *plain* `DEFAULT nextval('s')` (decision 4, no
     dependency), a `serial`-created sequence carries a persisted owner link.
-11. **IDENTITY sequences are `bigint`-flavored** (§13) — a `GENERATED … AS IDENTITY` column's owned
-    sequence is the default ascending i64 sequence regardless of the column width (the `AS type`
-    deferral, decisions 3/9); the `( sequence_options )` clause may tune it but not its i64 flavor. The
-    *column* type (`i16`/`i32`/`i64`) bounds stored values (`22003` at the INSERT coercion, vs. PG's
-    `2200H` at a narrower sequence `MAXVALUE`). Same divergence-class as decision 9, ledgered. Identity
-    columns are otherwise behaviorally PG-exact: ALWAYS/BY DEFAULT gating, `OVERRIDING`, the `42601`
-    conflicts, the `22023` type gate, the owned-sequence auto-drop / `2BP01` (decision 10, inherited).
+11. **~~IDENTITY sequences are `bigint`-flavored~~ — CLOSED in S5 (§14).** A `GENERATED … AS IDENTITY`
+    column's owned sequence now follows the **column type** (`i16` → `AS smallint`, `i32` → `AS
+    integer`, `i64` → `AS bigint`), matching PG — the sequence itself is bounded to the column's range
+    (a too-large `nextval` traps `2200H` at the sequence). An explicit `AS` inside the identity `(
+    … )` options is `42601` ("conflicting or redundant options" — the column type already fixes it).
+    Identity columns are otherwise behaviorally PG-exact: ALWAYS/BY DEFAULT gating, `OVERRIDING`, the
+    `42601` conflicts, the `22023` type gate, the owned-sequence auto-drop / `2BP01` (decision 10).
 
 ## 11. Delivery (sub-slices)
 
@@ -345,8 +359,8 @@ sub-slices, each passing `rake ci`:
   the `OWNED BY` link, so `DROP TABLE` auto-drops the owned sequence and `DROP SEQUENCE` of an owned
   sequence is `2BP01`. The owner reference is persisted (**`format_version` 14**, the `has_owner`
   flag bit + trailing owner bytes — §3), with the `serial_table.jed` golden
-  (`rust == go == ts == ruby`) and capability `ddl.serial`. `serial` sequences are `bigint`-flavored
-  (the `AS type` deferral, §12) — a documented divergence.
+  (`rust == go == ts == ruby`) and capability `ddl.serial`. (`serial` sequences were `bigint`-flavored
+  here; **S5 (§14) makes them follow the pseudo-type** — `serial` → `integer`, etc.)
 - **S4** ✅ — `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` columns (the SQL-standard identity
   surface, §13) + the optional `( sequence_options )` + the `OVERRIDING { SYSTEM | USER } VALUE` INSERT
   clause. Reuses S3's owned-sequence + `nextval`-default + `NOT NULL` desugaring wholesale, adding only
@@ -355,6 +369,15 @@ sub-slices, each passing `rake ci`:
   `428C9 generated_always` error (registered, §9), the `i16`/`i32`/`i64`-only type gate (`22023`), the
   `CREATE TABLE` conflict errors (`42601`, §13.2), and the INSERT/UPDATE value gating (§13.3/§13.4).
   Capability `ddl.identity`; corpus `ddl/identity.test`.
+- **S5** — the `AS { smallint | integer | bigint }` sequence data type (§14): an order-free `CREATE
+  SEQUENCE` option that sets the value type → default/validated MIN/MAX bounds; `serial` follows the
+  pseudo-type and an IDENTITY column follows its column type (both auto-wiring the owned sequence's
+  type). **Closes the bigint-flavored divergence** (decisions 3/9/11) — a `smallserial` / `smallint
+  GENERATED AS IDENTITY` sequence is now properly bounded to `[1, 32767]`. The type is **not
+  persisted** (reducible to the MIN/MAX bounds — §14), so there is **no `format_version` change**; the
+  `serial_table.jed` / `identity_table.jed` goldens regenerate only because the integer column's owned
+  sequence now records `MAXVALUE 2147483647` instead of `2^63-1`. Capability `ddl.sequence_as_type`;
+  corpus `ddl/sequence_as_type.test`.
 
 Each later slice is its own design-doc revision + corpus + (where it touches bytes) a `format_version`
 note and golden.
@@ -404,11 +427,13 @@ For each `serial` column `c` of table `t`, in column declaration order:
 3. **An explicit `DEFAULT` is rejected** `42601` — "multiple default values specified for column
    *c* of table *t*" (PG): a `serial` column's default is `nextval(...)`, and a second default is an
    error.
-4. **The owned sequence** is created: a **default ascending i64 sequence** (`INCREMENT 1`,
-   `MINVALUE 1`, `MAXVALUE 2^63-1`, `START 1`, `CACHE 1`, no `CYCLE`) — the same `SequenceDef`
-   `CREATE SEQUENCE t_id_seq` would build, **plus** an `owned_by = (t, ordinal-of-c)` link (§3,
-   persisted v14). It is `bigint`-flavored for all three pseudo-types (decision 9 — the `AS type`
-   deferral); the *column's* narrower type bounds stored values.
+4. **The owned sequence** is created: a default ascending sequence (`INCREMENT 1`, `START 1`,
+   `CACHE 1`, no `CYCLE`) **of the pseudo-type's data type** (`serial` → `AS integer`, `bigserial` →
+   `AS bigint`, `smallserial` → `AS smallint` — S5, §14), so its bounds are `[1, T_max]` (e.g.
+   `MAXVALUE 32767` for `smallserial`) — the same `SequenceDef` `CREATE SEQUENCE t_id_seq AS <T>`
+   would build, **plus** an `owned_by = (t, ordinal-of-c)` link (§3, persisted v14). The sequence
+   itself is therefore bounded to the column's range (a too-large `nextval` traps `2200H`, matching
+   PG). *(Before S5 the sequence was `bigint`-flavored and the column type alone bounded values.)*
 5. **The sequence name** is `lower(t)_lower(c)_seq`. If that name already names a relation
    (table / index / sequence — the shared relation namespace, §2), including a sequence created by an
    *earlier* `serial` column of the **same** statement, the smallest integer suffix `1`, `2`, … is
@@ -477,14 +502,16 @@ INSERT INTO t (id, v) OVERRIDING USER VALUE   VALUES (42, 'x')   -- discard the 
   declared type is `22023 invalid_parameter_value` ("identity column type must be smallint, integer,
   or bigint"), matching PG (PG raises this from `init_params`). Unlike `serial` (a pseudo-*type*),
   identity is a *constraint* on a written-out real type, so jed validates the resolved column type.
-- **The owned sequence** is created exactly as §12.4's: a default ascending **i64** (`bigint`-flavored)
-  sequence named `<table>_<col>_seq` with the same numeric-suffix collision resolution (§12.2 step 5),
-  `OWNED BY` the column (persisted v14). The optional **`( sequence_options )`** overrides the sequence
-  definition using the *same* option set and validation as `CREATE SEQUENCE` (§1 — `INCREMENT`,
-  `MINVALUE`/`MAXVALUE`, `START`, `CACHE`, `[NO] CYCLE`; a bad option is the same `22023`). The
-  sequence is `bigint`-flavored for all three column widths (the `AS type` deferral, decision 3/9), so
-  a `smallint`/`integer` identity column's *column type* bounds stored values, not a narrower sequence
-  `MAXVALUE` — a documented divergence (decision 11 below), same class as `serial`.
+- **The owned sequence** is created exactly as §12.4's: a default ascending sequence named
+  `<table>_<col>_seq` with the same numeric-suffix collision resolution (§12.2 step 5), `OWNED BY` the
+  column (persisted v14). Its **data type is the column type** (`i16` → `AS smallint`, `i32` → `AS
+  integer`, `i64` → `AS bigint` — S5, §14), so the sequence is bounded to the column's range (a
+  `smallint` identity sequence maxes at `32767`, trapping `2200H` past it — matching PG). The optional
+  **`( sequence_options )`** overrides the sequence definition using the *same* option set and
+  validation as `CREATE SEQUENCE` (§1 — `INCREMENT`, `MINVALUE`/`MAXVALUE`, `START`, `CACHE`, `[NO]
+  CYCLE`; a bad option is the same `22023`, and an explicit bound outside the column type's range is
+  `22023` "out of range for sequence data type *T*"). An **`AS`** clause inside these options is
+  `42601` ("conflicting or redundant options" — the column type already fixes the sequence type).
 - **`NOT NULL`** is forced (PG: an identity column is `NOT NULL`).
 - **The column `DEFAULT`** becomes the expression default `nextval('<seqname>')` (the v8 mechanism,
   evaluated per row at INSERT through the §4 write path), identical to a `serial` column's.
@@ -554,3 +581,68 @@ shape is `serial` + 2 flag bits. After a reopen the bits restore the INSERT/UPDA
 adds **no** new nondeterminism (it inherits §12.4 wholesale: a transactional owned sequence, a pure
 auto-name, a deterministic auto-drop). Pinned by the `identity_table.jed` golden (§3,
 `rust == go == ts == ruby`) and the `ddl/identity.test` corpus.
+
+## 14. `AS { smallint | integer | bigint }` — the sequence data type (S5)
+
+PostgreSQL sequences carry a **value data type** (`AS smallint | integer | bigint`, PG 10+). jed
+adopts it. The type's *only* observable effect is on the **bounds**: it sets the default
+`MINVALUE`/`MAXVALUE` and constrains explicit ones. Since jed's counter is already an `i64` and every
+operation (`nextval`/`setval`/`RESTART`/`currval`) reads only the stored `(min_value, max_value)`, the
+type is **fully reducible to those two fields** — so jed derives the bounds at `CREATE` and **does not
+persist the type** (see *Persistence* below). This closes the bigint-flavored divergence (decisions
+3/9/11) with **no `format_version` change**.
+
+### 14.1 The three types and their ranges
+
+| `AS` type | aliases | range `[T_min, T_max]` |
+|---|---|---|
+| `smallint` | `int2`, `i16` | `[-32768, 32767]` |
+| `integer` | `int`, `int4`, `i32` | `[-2147483648, 2147483647]` |
+| `bigint` (default) | `int8`, `i64` | `[-9223372036854775808, 9223372036854775807]` (full `i64`) |
+
+The `AS` argument is a type name resolved like any column type; a name that does not resolve to
+`i16`/`i32`/`i64` (`AS text`, `AS numeric`, …) is `22023 invalid_parameter_value` ("sequence type must
+be smallint, integer, or bigint"). With no `AS` clause the type is **`bigint`** — the prior default.
+(NB: the `bigint` descending default `MINVALUE` is now `-2^63` = `i64::MIN`, matching PG 18 exactly;
+the pre-S5 code used `-(2^63-1)`, a latent off-by-one against PG — corrected here, and untested before,
+so no golden moved for it.)
+
+### 14.2 Bound derivation and validation (PG-exact, `init_params`)
+
+Given the resolved type `T` with range `[T_min, T_max]`:
+
+- **Defaults** (relative to `T`, not hard-coded `i64`): ascending `INCREMENT` → `MINVALUE 1`, `MAXVALUE
+  T_max`; descending → `MINVALUE T_min`, `MAXVALUE -1`. `NO MINVALUE` / `NO MAXVALUE` select these
+  same type defaults.
+- **Validation order** (matching PG): `INCREMENT 0` and `CACHE < 1` first (`22023`); then an explicit
+  `MAXVALUE > T_max` is `22023` ("MAXVALUE (x) is out of range for sequence data type *T*"); then an
+  explicit `MINVALUE < T_min` is `22023` ("MINVALUE (x) is out of range …"); then the consistency
+  check `MINVALUE > MAXVALUE` (`22023`); then `START` ∈ `[MINVALUE, MAXVALUE]` (`22023`). The
+  type-range checks fire **before** the consistency check (oracle-pinned: `AS smallint MINVALUE 50000
+  MAXVALUE 40000` reports the `MAXVALUE` range error, not `MINVALUE > MAXVALUE`).
+
+### 14.3 `AS` is order-free; `serial` and identity auto-wire it
+
+- On `CREATE SEQUENCE`, `AS T` is an **order-free option** (it may appear anywhere among
+  `INCREMENT`/`MINVALUE`/… — PG allows `INCREMENT -1 AS smallint`), at most once.
+- A **`serial`/`bigserial`/`smallserial`** column's owned sequence is built with `AS integer` /
+  `AS bigint` / `AS smallint` respectively (§12.2 step 4).
+- A **`GENERATED … AS IDENTITY`** column's owned sequence is built with the **column type** as `AS T`
+  (`i16` → `smallint`, etc. — §13.1). An explicit `AS` inside the identity `( … )` options is `42601`
+  ("conflicting or redundant options") — the column type already fixes the type. The identity `( … )`
+  options are otherwise validated against the **column type's** range.
+
+### 14.4 Persistence — the type is *not* stored (a deliberate, recorded decision)
+
+The `SequenceDef` on disk is **unchanged** (the six `i64` fields + flags — §3); the `AS` type is baked
+into `min_value`/`max_value` at `CREATE` and never stored separately. Rationale: (a) every runtime
+operation depends only on the bounds, so the type carries no additional behavior to persist; (b) a
+typed sequence and a plain `CREATE SEQUENCE … MINVALUE … MAXVALUE …` with the same bounds are then
+**byte-identical**, keeping the cross-core contract and the determinism story trivial; (c) it avoids a
+`format_version` bump for a purely value-level change. The one thing this forecloses is `ALTER SEQUENCE
+… AS type` (which would re-derive the default bound for the *new* type and so needs the old type on
+record) and type introspection — both already deferred (`0A000` / no `pg_catalog`). If either lands,
+it adds a persisted type field **then**, with a `format_version` bump at that point. The
+`serial_table.jed` / `identity_table.jed` goldens move only because their integer column's owned
+sequence now records `MAXVALUE 2147483647` (was `2^63-1`); `sequence_table.jed` (explicit-bounds /
+ascending-bigint sequences) is byte-unchanged.

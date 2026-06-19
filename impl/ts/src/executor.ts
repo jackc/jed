@@ -50,12 +50,17 @@ import {
   type ForeignKey,
   type IdentityKind,
   type IndexDef,
+  type SeqDataType,
   type SeqOwner,
   type SequenceDef,
   type Table,
   columnIndex,
-  defaultSequenceBounds,
   pkIndices,
+  seqDataTypeDefaultBounds,
+  seqDataTypeForScalar,
+  seqDataTypeFromName,
+  seqDataTypePgName,
+  seqDataTypeRange,
   primaryKeyIndex,
   resolveColType,
 } from "./catalog.ts";
@@ -1414,6 +1419,22 @@ export class Database {
         const seqName = this.chooseSerialSeqName(ct.name, def.name, pendingSerials);
         const owner: SeqOwner = { table: ct.name, column: columns.length }; // this column's ordinal
         const opts = def.identity !== null ? def.identity.options : emptySeqOptions();
+        // The owned sequence's data type follows the column (§14): serial → the pseudo-type,
+        // identity → the column type. An explicit `AS` inside the identity `( … )` options conflicts
+        // with that — 42601 (PG: "conflicting or redundant options"). serial carries no parsed
+        // options, so this only fires for identity.
+        if (opts.dataType !== null) {
+          throw engineError("syntax_error", "conflicting or redundant options");
+        }
+        // serial fixes the scalar to its pseudo-type; identity's column type is a gated integer
+        // scalar (typeIsInteger above), so colType is always a scalar in the identity branch.
+        const seqScalar = serialKind ?? (colType.kind === "scalar" ? colType.scalar : undefined);
+        const seqDtype = seqScalar === undefined ? undefined : seqDataTypeForScalar(seqScalar);
+        if (seqDtype === undefined) {
+          // Unreachable: a serial / identity column is i16/i32/i64 (gated above).
+          throw engineError("invalid_parameter_value", "serial / identity column is i16/i32/i64");
+        }
+        opts.dataType = seqDtype;
         pendingSerials.push(buildSequenceDef(seqName, opts, owner));
         // Render the synthetic default exactly as the parser would the equivalent
         // DEFAULT nextval('<seqName>') (space-joined tokens — the canonical expression-text form),
@@ -7824,11 +7845,23 @@ function rejectParamsForDDL(params: Value[]): void {
 }
 
 // buildSequenceDef resolves a parsed SeqOptions set into a validated SequenceDef
-// (spec/design/sequences.md §1), shared by CREATE SEQUENCE and an IDENTITY column's `( seq_options )`
-// (§13). Validates INCREMENT (≠ 0), CACHE (≥ 1), MINVALUE ≤ MAXVALUE, and START in [min, max] (each
-// 22023); a fresh sequence starts with lastValue = start, isCalled = false. ownedBy carries the
-// IDENTITY / serial owner link (undefined for a plain CREATE SEQUENCE).
+// (spec/design/sequences.md §1/§14), shared by CREATE SEQUENCE and an IDENTITY column's
+// `( seq_options )` (§13). The AS type (or the serial/identity-supplied default) sets the default +
+// validated bounds; then validates INCREMENT (≠ 0), CACHE (≥ 1), explicit MIN/MAX within the type
+// range, MINVALUE ≤ MAXVALUE, and START in [min, max] (each 22023); a fresh sequence starts with
+// lastValue = start, isCalled = false. ownedBy carries the IDENTITY / serial owner link (undefined
+// for a plain CREATE SEQUENCE).
 function buildSequenceDef(name: string, options: SeqOptions, ownedBy: SeqOwner | undefined): SequenceDef {
+  // The value type (§14): `AS <type>` → the named type (22023 if not an integer type), else bigint.
+  let dtype: SeqDataType = "bigint";
+  if (options.dataType !== null) {
+    const dt = seqDataTypeFromName(options.dataType);
+    if (dt === undefined) {
+      throw engineError("invalid_parameter_value", "sequence type must be smallint, integer, or bigint");
+    }
+    dtype = dt;
+  }
+  const [typeMin, typeMax] = seqDataTypeRange(dtype);
   const increment = options.increment ?? 1n;
   if (increment === 0n) {
     throw engineError("invalid_parameter_value", "INCREMENT must not be zero");
@@ -7837,8 +7870,22 @@ function buildSequenceDef(name: string, options: SeqOptions, ownedBy: SeqOwner |
   if (cache < 1n) {
     throw engineError("invalid_parameter_value", `CACHE (${cache}) must be greater than zero`);
   }
-  const [defMin, defMax] = defaultSequenceBounds(increment);
-  // `{ value: v }` MINVALUE v / `{ value: null }` NO MINVALUE / outer null unset → the default.
+  const [defMin, defMax] = seqDataTypeDefaultBounds(dtype, increment);
+  // An explicit MAXVALUE/MINVALUE outside the type range is 22023 — checked (MAX first, PG order)
+  // BEFORE the MIN > MAX consistency check (§14.2).
+  if (options.maxValue !== null && options.maxValue.value !== null && options.maxValue.value > typeMax) {
+    throw engineError(
+      "invalid_parameter_value",
+      `MAXVALUE (${options.maxValue.value}) is out of range for sequence data type ${seqDataTypePgName(dtype)}`,
+    );
+  }
+  if (options.minValue !== null && options.minValue.value !== null && options.minValue.value < typeMin) {
+    throw engineError(
+      "invalid_parameter_value",
+      `MINVALUE (${options.minValue.value}) is out of range for sequence data type ${seqDataTypePgName(dtype)}`,
+    );
+  }
+  // `{ value: v }` MINVALUE v / `{ value: null }` NO MINVALUE / outer null unset → the type default.
   const minValue = options.minValue !== null && options.minValue.value !== null ? options.minValue.value : defMin;
   const maxValue = options.maxValue !== null && options.maxValue.value !== null ? options.maxValue.value : defMax;
   if (minValue > maxValue) {

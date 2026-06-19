@@ -657,7 +657,8 @@ SEQUENCE_TABLE = {
 #   CREATE TABLE t (id serial PRIMARY KEY, v text); INSERT INTO t (v) VALUES ('hello')
 SERIAL_TABLE = {
   sequences: [
-    seq("t_id_seq", increment: 1, min_value: 1, max_value: 9_223_372_036_854_775_807, start: 1,
+    # serial → AS integer (S5, §14): max_value is the i32 ceiling 2_147_483_647, not 2^63-1.
+    seq("t_id_seq", increment: 1, min_value: 1, max_value: 2_147_483_647, start: 1,
         cache: 1, cycle: false, last_value: 1, is_called: true, owned_by: ["t", 0])
   ],
   tables: [{ name: "t",
@@ -669,7 +670,7 @@ SERIAL_TABLE = {
 # IDENTITY (v15 — spec/design/sequences.md §13): pins the two new column flag bits (bit4 is_identity,
 # bit5 identity_always) for both identity kinds, atop the same serial-shaped OWNED-sequence bytes. The
 # ALWAYS column `id` (flags bit1+bit3+bit4+bit5) and the BY DEFAULT column `n` (flags bit1+bit3+bit4)
-# each get an owned default-i64 sequence (`t_id_seq` owned by col 0, `t_n_seq` owned by col 1) and an
+# each get an owned AS-integer sequence (`t_id_seq` owned by col 0, `t_n_seq` owned by col 1) and an
 # EXPRESSION DEFAULT `nextval ( '<seq>' )`. One INSERT advances both sequences once. The cores build
 # this via
 #   CREATE TABLE t (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
@@ -677,9 +678,10 @@ SERIAL_TABLE = {
 #   INSERT INTO t (v) VALUES ('hi')
 IDENTITY_TABLE = {
   sequences: [
-    seq("t_id_seq", increment: 1, min_value: 1, max_value: 9_223_372_036_854_775_807, start: 1,
+    # int GENERATED … AS IDENTITY → AS integer (S5, §14): max_value is the i32 ceiling 2_147_483_647.
+    seq("t_id_seq", increment: 1, min_value: 1, max_value: 2_147_483_647, start: 1,
         cache: 1, cycle: false, last_value: 1, is_called: true, owned_by: ["t", 0]),
-    seq("t_n_seq", increment: 1, min_value: 1, max_value: 9_223_372_036_854_775_807, start: 1,
+    seq("t_n_seq", increment: 1, min_value: 1, max_value: 2_147_483_647, start: 1,
         cache: 1, cycle: false, last_value: 1, is_called: true, owned_by: ["t", 1])
   ],
   tables: [{ name: "t",

@@ -230,7 +230,14 @@ drop_index     ::= "DROP" "INDEX" identifier
  * DROP SEQUENCE removes one or more sequences by name: a missing sequence is 42P01 (the relation
  * namespace) unless IF EXISTS; RESTRICT (the default and only mode this slice — CASCADE 0A000). */
 create_sequence ::= "CREATE" "SEQUENCE" ("IF" "NOT" "EXISTS")? identifier sequence_option*
-sequence_option ::= "INCREMENT" "BY"? signed_integer
+/* The options are order-free, each at most once. "AS type" (S5 — ../design/sequences.md §14) sets the
+ * sequence value type — smallint / integer / bigint (and their int2/int4/int8/i16/i32/i64 aliases),
+ * which fixes the default + validated MINVALUE/MAXVALUE; a non-integer type is 22023. "AS" is also a
+ * sequence_option here, so it may appear anywhere among the others (PG order-freedom). The same
+ * sequence_option list is reused inside an IDENTITY column's "( … )" — EXCEPT "AS" there is 42601
+ * (the column type already fixes it). */
+sequence_option ::= "AS" type_name
+                  | "INCREMENT" "BY"? signed_integer
                   | "MINVALUE" signed_integer | "NO" "MINVALUE"
                   | "MAXVALUE" signed_integer | "NO" "MAXVALUE"
                   | "START" "WITH"? signed_integer

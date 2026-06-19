@@ -210,6 +210,11 @@ type DropType struct {
 // a parsed override, with a nil pointer meaning "use the default" (resolved at execution against
 // the INCREMENT sign); execution validates the set (22023).
 type SeqOptions struct {
+	// DataType is the `AS <type>` value type as written (the raw type name, e.g. "smallint" /
+	// "int4"), resolved to a SeqDataType at execution (spec/design/sequences.md §14); "" = the
+	// bigint default. A non-integer type is 22023. Inside an IDENTITY column's options a set
+	// DataType is 42601 (the column type fixes it).
+	DataType  string
 	Increment *int64
 	// MinValue is the MINVALUE override: a SeqBound whose NoValue distinguishes
 	// MINVALUE v (Value=v) from NO MINVALUE (NoValue) from unset (nil) — the

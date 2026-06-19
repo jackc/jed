@@ -63,6 +63,11 @@ SELECT * FROM log;
 log` drops it too. (Supplying an explicit `id` overrides the default for that row without advancing
 the sequence — just like PostgreSQL.)
 
+The backing sequence matches the column's type: `smallserial` / `bigserial` (and a `smallint` / `bigint`
+identity column) get a sequence bounded to that integer type's range, so it tops out exactly where the
+column does — a `smallserial` sequence stops at `32767`. A standalone `CREATE SEQUENCE` can choose the
+type the same way with `AS smallint | integer | bigint` (default `bigint`).
+
 ## Identity columns — `GENERATED … AS IDENTITY`
 
 The SQL-standard spelling of an auto-numbered column. Like `serial` it creates an owned sequence and

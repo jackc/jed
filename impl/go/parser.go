@@ -1072,6 +1072,19 @@ func (p *Parser) parseSequenceOptions(parenthesized bool) (SeqOptions, error) {
 	// Order-free option loop: dispatch on the leading keyword, each option at most once.
 	for {
 		switch p.peekKeyword() {
+		case "as":
+			// `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw
+			// type name is stored; it is resolved (and a non-integer type rejected 22023) at
+			// execution. Inside an IDENTITY column's `( … )` a set DataType is 42601.
+			if err := p.dupCheck(seq.DataType != "", "AS"); err != nil {
+				return SeqOptions{}, err
+			}
+			p.advance()
+			name, err := p.expectIdentifier()
+			if err != nil {
+				return SeqOptions{}, err
+			}
+			seq.DataType = name
 		case "increment":
 			if err := p.dupCheck(seq.Increment != nil, "INCREMENT"); err != nil {
 				return SeqOptions{}, err

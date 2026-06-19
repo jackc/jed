@@ -12,8 +12,8 @@ use crate::ast::{
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    FkAction, ForeignKeyConstraint, IdentityKind, IndexDef, IndexKind, SeqOwner, SequenceDef,
-    Table, resolve_col_type,
+    FkAction, ForeignKeyConstraint, IdentityKind, IndexDef, IndexKind, SeqDataType, SeqOwner,
+    SequenceDef, Table, resolve_col_type,
 };
 use crate::cost::Meter;
 use crate::costs::COSTS;
@@ -1560,11 +1560,28 @@ impl Database {
                     table: ct.name.clone(),
                     column: columns.len() as u16, // this column's ordinal (pushed below)
                 };
-                let opts = def
+                let mut opts = def
                     .identity
                     .as_ref()
                     .map(|id| id.options.clone())
                     .unwrap_or_default();
+                // The owned sequence's data type follows the column (§14): `serial` → the
+                // pseudo-type, identity → the column type. An explicit `AS` inside the identity
+                // `( … )` options conflicts with that — 42601 (PG: "conflicting or redundant
+                // options"). `serial` carries no parsed options, so this only fires for identity.
+                if opts.data_type.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        "conflicting or redundant options".to_string(),
+                    ));
+                }
+                let seq_scalar = serial_kind.unwrap_or_else(|| ty.scalar());
+                opts.data_type = Some(
+                    SeqDataType::for_scalar(seq_scalar)
+                        .expect("serial / identity column is i16/i32/i64")
+                        .pg_name()
+                        .to_string(),
+                );
                 pending_serials.push(build_sequence_def(&seqname, &opts, Some(owner))?);
                 // Build the synthetic default exactly as the parser would render the equivalent
                 // `DEFAULT nextval('<seqname>')` (space-joined tokens — the canonical expression-text
@@ -10619,16 +10636,28 @@ fn serial_pseudo_type(name: &str) -> Option<ScalarType> {
     }
 }
 
-/// Resolve a parsed `SeqOptions` set into a validated `SequenceDef` (spec/design/sequences.md §1),
-/// shared by `CREATE SEQUENCE` and an IDENTITY column's `( seq_options )` (§13). Validates INCREMENT
-/// (≠ 0), CACHE (≥ 1), MINVALUE ≤ MAXVALUE, and START in `[min, max]` (each `22023`); a fresh
-/// sequence starts with `last_value = start`, `is_called = false`. `owned_by` carries the IDENTITY /
-/// `serial` owner link (`None` for a plain `CREATE SEQUENCE`).
+/// Resolve a parsed `SeqOptions` set into a validated `SequenceDef` (spec/design/sequences.md §1/§14),
+/// shared by `CREATE SEQUENCE` and an IDENTITY column's `( seq_options )` (§13). The `AS` type (or the
+/// `serial`/identity-supplied default) sets the default + validated bounds; then validates INCREMENT
+/// (≠ 0), CACHE (≥ 1), explicit MIN/MAX within the type range, MINVALUE ≤ MAXVALUE, and START in
+/// `[min, max]` (each `22023`). A fresh sequence starts with `last_value = start`, `is_called = false`.
+/// `owned_by` carries the IDENTITY / `serial` owner link (`None` for a plain `CREATE SEQUENCE`).
 fn build_sequence_def(
     name: &str,
     options: &SeqOptions,
     owned_by: Option<SeqOwner>,
 ) -> Result<SequenceDef> {
+    // The value type (§14): `AS <type>` → the named type (22023 if not an integer type), else bigint.
+    let dtype = match &options.data_type {
+        Some(tn) => SeqDataType::from_type_name(tn).ok_or_else(|| {
+            EngineError::new(
+                SqlState::InvalidParameterValue,
+                "sequence type must be smallint, integer, or bigint".to_string(),
+            )
+        })?,
+        None => SeqDataType::BigInt,
+    };
+    let (type_min, type_max) = dtype.range();
     let increment = options.increment.unwrap_or(1);
     if increment == 0 {
         return Err(EngineError::new(
@@ -10643,8 +10672,32 @@ fn build_sequence_def(
             format!("CACHE ({cache}) must be greater than zero"),
         ));
     }
-    let (def_min, def_max) = SequenceDef::default_bounds(increment);
-    // `Some(Some(v))` MINVALUE v / `Some(None)` NO MINVALUE / `None` unset → the default.
+    let (def_min, def_max) = dtype.default_bounds(increment);
+    // An explicit MAXVALUE/MINVALUE outside the type range is 22023 — checked (MAX first, PG order)
+    // BEFORE the MIN > MAX consistency check (§14.2).
+    if let Some(Some(v)) = options.max_value {
+        if v > type_max {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!(
+                    "MAXVALUE ({v}) is out of range for sequence data type {}",
+                    dtype.pg_name()
+                ),
+            ));
+        }
+    }
+    if let Some(Some(v)) = options.min_value {
+        if v < type_min {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!(
+                    "MINVALUE ({v}) is out of range for sequence data type {}",
+                    dtype.pg_name()
+                ),
+            ));
+        }
+    }
+    // `Some(Some(v))` MINVALUE v / `Some(None)` NO MINVALUE / `None` unset → the type default.
     let min_value = match options.min_value {
         Some(Some(v)) => v,
         Some(None) | None => def_min,

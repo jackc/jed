@@ -570,7 +570,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.
       → [grammar.md §32](spec/design/grammar.md)
   - [ ] _follow-on:_ the `WITH (OLD AS o, NEW AS n)` aliasing form; `old.*`/`new.*`.
-- [x] **Sequences** (`CREATE SEQUENCE` / `nextval` / `currval`) — ✅ **landed (S0–S4)**: the PostgreSQL
+- [x] **Sequences** (`CREATE SEQUENCE` / `nextval` / `currval`) — ✅ **landed (S0–S5)**: the PostgreSQL
       sequence object as a third catalog-object kind (after tables + composite types): a named, persisted, monotonic
       **i64** generator in `Snapshot.sequences`, advanced by `nextval('s')` and read by
       `currval('s')` (session-local). **The defining decision — `nextval` is TRANSACTIONAL** (rolls
@@ -609,9 +609,20 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         column flag bits (**`format_version` 15** — bit 4 `is_identity`, bit 5 `identity_always`), the
         `identity_table.jed` golden (`rust == go == ts == ruby`), the `428C9 generated_always` error,
         the `i16`/`i32`/`i64`-only type gate (`22023`), the `CREATE TABLE` conflicts (`42601`), and the
-        INSERT/UPDATE value gating. Owned sequences are `bigint`-flavored (the `AS type` deferral — a
-        documented divergence). All three cores + Ruby; `ddl/identity.test`; capability `ddl.identity`.
-        → [sequences.md §13](spec/design/sequences.md) _(size: L)_
+        INSERT/UPDATE value gating. All three cores + Ruby; `ddl/identity.test`; capability
+        `ddl.identity`. → [sequences.md §13](spec/design/sequences.md) _(size: L)_
+  - [x] **S5** — the `AS { smallint | integer | bigint }` sequence data type (an order-free `CREATE
+        SEQUENCE` option) → the type sets the default + validated `MINVALUE`/`MAXVALUE`; `serial`
+        follows the pseudo-type and a `GENERATED AS IDENTITY` column follows its column type (both
+        auto-wiring the owned sequence's type). **Closes the bigint-flavored divergence** (the old
+        decisions 3/9/11 — a `smallserial` / `smallint` identity sequence is now bounded to
+        `[1, 32767]`, trapping `2200H` like PG) and corrects the bigint descending default min to
+        `i64::MIN`. A non-integer `AS` type or an explicit bound outside the type range is `22023`; an
+        `AS` clause inside an identity column's `( … )` options is `42601`. The type is **not
+        persisted** (reducible to the MIN/MAX bounds), so **no `format_version` change** — only the
+        `serial_table.jed` / `identity_table.jed` goldens move (`MAXVALUE 2147483647`). All three
+        cores + Ruby; `ddl/sequence_as_type.test`; capability `ddl.sequence_as_type`.
+        → [sequences.md §14](spec/design/sequences.md) _(size: M)_
 - [ ] **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE ✅, RETURNING ✅ — unblocked)_
 - [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
       `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).

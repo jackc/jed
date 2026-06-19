@@ -204,6 +204,11 @@ pub struct DropType {
 /// (resolved at execution against the INCREMENT sign); execution validates the set (22023).
 #[derive(Clone, PartialEq, Eq, Debug, Default)]
 pub struct SeqOptions {
+    /// The `AS <type>` value type as written (the raw type name, e.g. `"smallint"` / `"int4"`),
+    /// resolved to a `SeqDataType` at execution (spec/design/sequences.md §14); `None` = `bigint`
+    /// default. A non-integer type is `22023`. Inside an IDENTITY column's options a set `data_type`
+    /// is `42601` (the column type fixes it).
+    pub data_type: Option<String>,
     pub increment: Option<i64>,
     /// `Some(Some(v))` = MINVALUE v; `Some(None)` = NO MINVALUE (the type default); `None` = unset.
     pub min_value: Option<Option<i64>>,

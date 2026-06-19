@@ -129,6 +129,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY columns + the INSERT OVERRIDING clause —
     // serial's machinery + ALWAYS/BY DEFAULT gating; format_version 15 (sequences.md §13).
     "ddl.identity",
+    // CREATE SEQUENCE … AS { smallint | integer | bigint } — the sequence value type sets the
+    // default + validated MIN/MAX bounds; serial/identity follow the column type (sequences.md §14).
+    "ddl.sequence_as_type",
     // NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
     "ddl.not_null",
     // DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).
