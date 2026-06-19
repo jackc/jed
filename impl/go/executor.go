@@ -1519,6 +1519,12 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, NewError(UndefinedObject, "type does not exist: "+base)
 			}
 			isArray = true
+		} else if _, ok := rangeByName(def.TypeName); ok {
+			// A range column is not storable yet (spec/design/ranges.md §8 — storage lands in R2).
+			// The range type name IS known, so this is 0A000 "not supported", not the 42704 "type
+			// does not exist" the fall-through below would give.
+			return Outcome{}, NewError(FeatureNotSupported,
+				"a "+def.TypeName+" column is not supported yet")
 		} else if _, ok := ScalarTypeFromName(def.TypeName); ok {
 			ty, d, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
 			if err != nil {
@@ -8507,6 +8513,9 @@ func valueToRExpr(v Value) *rExpr {
 	case ValArray:
 		// A folded array constant — preserve its full shape (dims/lbounds) in a const node.
 		return &rExpr{kind: reConstArray, cArray: v.Array}
+	case ValRange:
+		// A folded range constant (already canonical).
+		return &rExpr{kind: reConstRange, cRange: v.Range}
 	default: // ValNull
 		return &rExpr{kind: reConstNull}
 	}
@@ -8664,6 +8673,10 @@ const (
 	// Two arrays are comparable iff their element types are comparable; assignable to an array
 	// column of the same element type.
 	rtArray
+	// rtRange is a range type (spec/design/ranges.md §2): elem carries the resolved element
+	// (subtype) type. Two ranges are comparable iff their elements are equal; the element is one of
+	// the six scalar subtypes that have a range.
+	rtRange
 )
 
 // isFloatKind reports whether a resolvedType is one of the two float kinds.
@@ -8836,8 +8849,39 @@ func rtName(t resolvedType) string {
 			return rtName(*t.elem) + "[]"
 		}
 		return "array"
+	case rtRange:
+		// A range names itself by its element subtype (i32 → i32range — spec/design/ranges.md).
+		if t.elem != nil {
+			if s, ok := resolvedRangeElementScalar(t.elem); ok {
+				if name, ok2 := rangeNameForElement(s); ok2 {
+					return name
+				}
+			}
+			return "range<" + rtName(*t.elem) + ">"
+		}
+		return "range"
 	default:
 		return "unknown"
+	}
+}
+
+// resolvedRangeElementScalar returns the scalar element type of a resolved range element. A range's
+// element is always one of the six scalar subtypes; ok is false for anything else (never a valid
+// range). Used to name a range and to build its codec.
+func resolvedRangeElementScalar(elem *resolvedType) (ScalarType, bool) {
+	switch elem.kind {
+	case rtInt:
+		return elem.intTy, true
+	case rtDecimal:
+		return DecimalType, true
+	case rtTimestamp:
+		return Timestamp, true
+	case rtTimestamptz:
+		return Timestamptz, true
+	case rtDate:
+		return Date, true
+	default:
+		return 0, false
 	}
 }
 
@@ -8962,6 +9006,9 @@ const (
 	// reConstArray is a folded array constant (the value_to_rexpr equivalent), preserving its shape;
 	// it evaluates to its ValArray directly (cArray).
 	reConstArray
+	// reConstRange is a folded range constant ('[1,5)'::i32range, already canonicalized at resolve);
+	// it evaluates to its ValRange directly (cRange).
+	reConstRange
 	// reField is field selection `(composite).field` (spec/design/composite.md §S4): evaluate
 	// `operand` (the base) to a composite value and return its `index`-th field (the field ordinal,
 	// fixed at resolve). A whole-value-NULL composite yields NULL for any field. One operator_eval
@@ -9122,6 +9169,8 @@ type rExpr struct {
 	isSlice bool
 	// reConstArray: a folded array constant (its full shape preserved).
 	cArray *ArrayVal
+	// reConstRange: a folded range constant (already canonicalized).
+	cRange *RangeVal
 
 	// reQuantified: `lhs` is the scalar, `rhs` the array node, `op` the comparison, `quantAll`
 	// selects ALL (true) vs ANY/SOME (false) (spec/design/array-functions.md §11).
@@ -12017,6 +12066,11 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if ct := s.catalog.readSnap().compositeType(e.TypeLitName); ct != nil {
 			return coerceStringToComposite(e.TypeLitText, ct, s.catalog)
 		}
+		// A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via range_in
+		// against the element type (spec/design/ranges.md §5) — the same primitive as the cast.
+		if desc, ok := rangeByName(e.TypeLitName); ok {
+			return coerceStringToRangeExpr(e.TypeLitText, desc)
+		}
 		target, _, err := resolveTypeAndTypmod(e.TypeLitName, nil)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -12098,6 +12152,24 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			}
 			return nil, resolvedType{}, NewError(FeatureNotSupported,
 				"casting to an array type is only supported from a string literal this slice")
+		}
+		// A range cast target (`'[1,5)'::i32range`, `…::int4range`). Like array, v1 supports the
+		// string-literal form and a bare NULL; every other range cast is a 0A000 narrowing
+		// (spec/design/ranges.md §1/§5).
+		if desc, ok := rangeByName(e.Cast.TypeName); ok {
+			if e.Cast.TypeMod != nil {
+				return nil, resolvedType{}, NewError(FeatureNotSupported,
+					"a type modifier on a range type is not supported")
+			}
+			elemRT := resolvedTypeOf(elementScalar(desc))
+			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralText {
+				return coerceStringToRangeExpr(in.Literal.Str, desc)
+			}
+			if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralNull {
+				return &rExpr{kind: reConstNull}, resolvedType{kind: rtRange, elem: &elemRT}, nil
+			}
+			return nil, resolvedType{}, NewError(FeatureNotSupported,
+				"casting to a range type is only supported from a string literal this slice")
 		}
 		// A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
 		// (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
@@ -12553,9 +12625,11 @@ func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes)
 func requireNumericOperand(t resolvedType) error {
 	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea || t.kind == rtUuid ||
 		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval || t.kind == rtDate ||
+		t.kind == rtRange || t.kind == rtComposite || t.kind == rtArray ||
 		isFloatKind(t.kind) {
 		// float is handled by the dedicated float branch in resolveBinary BEFORE this is reached;
-		// reject here too so any other caller treats it as a non-(int/decimal) operand.
+		// reject here too so any other caller treats it as a non-(int/decimal) operand. A range/
+		// composite/array operand is likewise non-numeric (range arithmetic + * - lands in RF4).
 		return typeError("arithmetic operators require numeric operands")
 	}
 	return nil
@@ -12717,6 +12791,13 @@ func classifyComparable(lt, rt resolvedType) error {
 	if flL != flR && lt.kind != rtNull && rt.kind != rtNull {
 		return typeError("cannot compare a float value with a value of a different type")
 	}
+	// Range comparison is deferred to R3 (the range_cmp total order — spec/design/ranges.md §6); a
+	// range operand (range×range or range×anything) is a 42804 this slice. A range×NULL is allowed
+	// (the comparison is unknown), like every other family above.
+	rangeL, rangeR := lt.kind == rtRange, rt.kind == rtRange
+	if (rangeL || rangeR) && lt.kind != rtNull && rt.kind != rtNull {
+		return typeError("range comparison is not supported yet")
+	}
 	return nil
 }
 
@@ -12843,6 +12924,51 @@ func coerceStringToComposite(text string, ct *CompositeType, catalog *Database) 
 // parse by their own input, text is identity, and int/decimal/boolean are the cast from text
 // admitted only for a literal operand. 22P02 malformed / 22003 out of range / the type's parse
 // code. typmod (decimal only) re-scales the result.
+// coerceStringToRangeExpr coerces a range text literal to a constant range expression
+// ('[1,5)'::i32range / i32range '[1,5)'): parse, coerce each bound to the element type, then
+// canonicalize (spec/design/ranges.md §4/§5). Folds to a reConstRange. Malformed → 22P02;
+// lower>upper → 22000; a canonicalize overflow → 22003.
+func coerceStringToRangeExpr(text string, desc RangeDesc) (*rExpr, resolvedType, error) {
+	val, err := coerceStringToRange(text, desc)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	elemRT := resolvedTypeOf(elementScalar(desc))
+	return &rExpr{kind: reConstRange, cRange: val}, resolvedType{kind: rtRange, elem: &elemRT}, nil
+}
+
+// coerceStringToRange parses a range text literal and coerces its bounds to the element type,
+// producing a canonical RangeVal (spec/design/ranges.md §4). Shared by the cast / typed-literal paths.
+func coerceStringToRange(text string, desc RangeDesc) (*RangeVal, error) {
+	parsed, err := parseRangeText(text)
+	if err != nil {
+		return nil, err
+	}
+	if parsed.empty {
+		return EmptyRangeVal(), nil
+	}
+	elem := elementScalar(desc)
+	coerceBound := func(b *string) (*Value, error) {
+		if b == nil {
+			return nil, nil
+		}
+		v, err := coerceStringLiteralToValue(*b, elem)
+		if err != nil {
+			return nil, err
+		}
+		return &v, nil
+	}
+	lower, err := coerceBound(parsed.lower)
+	if err != nil {
+		return nil, err
+	}
+	upper, err := coerceBound(parsed.upper)
+	if err != nil {
+		return nil, err
+	}
+	return finalizeRange(desc, lower, upper, parsed.lowerInc, parsed.upperInc)
+}
+
 func coerceStringLiteral(s string, target ScalarType, typmod *DecimalTypmod) (*rExpr, resolvedType, error) {
 	switch target {
 	case Bytea:
@@ -13170,7 +13296,8 @@ func promote(a, b resolvedType) ScalarType {
 
 func requireBool(t resolvedType, msg string) error {
 	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal || t.kind == rtBytea || t.kind == rtUuid ||
-		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval || t.kind == rtDate {
+		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval || t.kind == rtDate ||
+		t.kind == rtRange {
 		return typeError(msg)
 	}
 	return nil
@@ -13990,6 +14117,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	case reConstArray:
 		// A folded array constant (shape preserved) — return it directly.
 		return ArrayValueOf(e.cArray), nil
+	case reConstRange:
+		// A folded range constant (already canonical) — return it directly.
+		return RangeValue(e.cRange), nil
 	case reField:
 		// Field selection `(composite).field` — one operator_eval, then return the `index`-th field
 		// of the evaluated composite base (spec/design/composite.md §S4, cost.md §9). A whole-value

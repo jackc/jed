@@ -68,6 +68,11 @@ const (
 	// must never reach a comparison, render, or encode. It is POISONED: those paths panic loudly
 	// (an engine bug), never read it as NULL.
 	ValUnfetched
+	// ValRange is a range value (spec/design/ranges.md §2/§4) — the distinguished empty range or a
+	// non-empty range over a scalar element. Range holds a *RangeVal POINTER so the flat Value
+	// struct stays ==-comparable (like Comp/Array); range equality/hashing/comparison go through
+	// Eq3 / the structural value-key path, never raw ==. Discrete ranges are stored canonical (`[)`).
+	ValRange
 )
 
 // Unfetched is the on-disk form of a lazily-loaded large value (spec/design/large-values.md §14;
@@ -121,7 +126,31 @@ type Value struct {
 	// POINTER (*ArrayVal) so the flat Value struct stays ==-comparable — like Comp; array
 	// equality/hashing go through Eq3 / the structural value-key path, never raw `==`.
 	Array *ArrayVal
+	// Range holds the range value when Kind == ValRange (spec/design/ranges.md §4). A POINTER
+	// (*RangeVal) so the flat Value struct stays ==-comparable — like Array; range equality/hashing
+	// go through Eq3 / the structural value-key path, never raw `==`.
+	Range *RangeVal
 }
+
+// RangeVal is a range value (spec/design/ranges.md §4). Either the distinguished Empty range
+// (Empty == true, both bounds nil) or a non-empty range with optional Lower/Upper bound values — a
+// nil bound is unbounded/infinite on that side (and its inclusivity flag is then false). The bound
+// values are element values; the element type comes from the range's *type*, not stored here (the
+// array precedent). The stored form is CANONICAL (discrete ranges in `[)` form, the empty range
+// normalized — §4), so structural equality on the stored form is the correct value-level equality.
+type RangeVal struct {
+	Empty    bool
+	Lower    *Value
+	Upper    *Value
+	LowerInc bool
+	UpperInc bool
+}
+
+// EmptyRangeVal returns the empty range (the canonical representation: no bounds, no inclusivity).
+func EmptyRangeVal() *RangeVal { return &RangeVal{Empty: true} }
+
+// RangeValue wraps a *RangeVal as a Value.
+func RangeValue(r *RangeVal) Value { return Value{Kind: ValRange, Range: r} }
 
 // ArrayVal is a shaped array value (spec/design/array.md §4). Shape is a value property: Dims holds
 // the per-dimension element counts (row-major), Lbounds the per-dimension lower bounds (default 1,
@@ -434,6 +463,11 @@ func (v Value) Render() string {
 		// optional `[l:u]=` prefix when any lower bound ≠ 1), with per-element quoting and an
 		// unquoted `NULL` for a null element (spec/design/array.md §7).
 		return arrayOut(v.Array)
+	case ValRange:
+		// A range renders as PG range_out: `empty`, or `[lo,hi)` with bracket/inclusivity, an
+		// omitted bound for infinite, and per-bound quoting where the element text has special
+		// chars (e.g. a tsrange bound's space — spec/design/ranges.md §5).
+		return rangeOut(v.Range)
 	case ValUnfetched:
 		panic("BUG: unfetched large value escaped the storage layer")
 	default:

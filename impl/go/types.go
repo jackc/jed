@@ -302,7 +302,13 @@ type Type struct {
 	// Comp. The element is a scalar or composite, never another array (multidimensionality is a
 	// value property, not array-of-array — §2). The pointer also breaks == like Comp.
 	Array *Type
-	// Scalar is the inner scalar type when Comp == nil && Array == nil. Meaningless otherwise.
+	// Range is the element (subtype) when this is a *structural* range type (`i32range`), else nil
+	// (spec/design/ranges.md §2). Like Array, the element is carried inline (no catalog object); it
+	// is one of the six scalar subtypes that have a range, never a composite/array/range. The
+	// pointer also breaks == like Comp/Array.
+	Range *Type
+	// Scalar is the inner scalar type when Comp == nil && Array == nil && Range == nil. Meaningless
+	// otherwise.
 	Scalar ScalarType
 }
 
@@ -322,6 +328,9 @@ func CompositeT(name string) Type { return Type{Comp: &CompositeRef{Name: name}}
 // ArrayT builds a structural array Type over the given element type (spec/design/array.md §2).
 func ArrayT(elem Type) Type { return Type{Array: &elem} }
 
+// RangeT builds a structural range Type over the given scalar element (spec/design/ranges.md §2).
+func RangeT(elem Type) Type { return Type{Range: &elem} }
+
 // ScalarTy returns the inner scalar type. Scalar-only paths (the integer codec, the scalar value
 // codec, the scalar resolver) call this; a composite/array column reaches those paths only after
 // the caller has branched on IsComposite/IsArray, so a non-scalar here is an engine-invariant
@@ -334,12 +343,15 @@ func (t Type) ScalarTy() ScalarType {
 	if t.Array != nil {
 		panic("BUG: array type used where a scalar was expected (spec/design/array.md)")
 	}
+	if t.Range != nil {
+		panic("BUG: range type used where a scalar was expected (spec/design/ranges.md)")
+	}
 	return t.Scalar
 }
 
-// AsScalar returns the inner scalar type and true, or (0, false) for a composite/array.
+// AsScalar returns the inner scalar type and true, or (0, false) for a composite/array/range.
 func (t Type) AsScalar() (ScalarType, bool) {
-	if t.Comp != nil || t.Array != nil {
+	if t.Comp != nil || t.Array != nil || t.Range != nil {
 		return 0, false
 	}
 	return t.Scalar, true
@@ -350,6 +362,17 @@ func (t Type) IsComposite() bool { return t.Comp != nil }
 
 // IsArray reports whether this is an array type.
 func (t Type) IsArray() bool { return t.Array != nil }
+
+// IsRange reports whether this is a range type.
+func (t Type) IsRange() bool { return t.Range != nil }
+
+// RangeElement returns the element (subtype) of a range type, or (zero, false) if not a range.
+func (t Type) RangeElement() (Type, bool) {
+	if t.Range != nil {
+		return *t.Range, true
+	}
+	return Type{}, false
+}
 
 // CompositeRefOf returns the composite type this type references, looking through one array level —
 // the ref for both `addr` and `addr[]`, nil for a scalar or a `scalar[]`. There is at most one
@@ -375,6 +398,13 @@ func (t Type) CanonicalName() string {
 	if t.Array != nil {
 		return t.Array.CanonicalName() + "[]"
 	}
+	if t.Range != nil {
+		// A range's canonical name comes from ranges.toml keyed by the element (i32 → i32range).
+		if name, ok := rangeNameForElement(t.Range.Scalar); ok {
+			return name
+		}
+		return "range<" + t.Range.CanonicalName() + ">"
+	}
 	return t.Scalar.CanonicalName()
 }
 
@@ -382,7 +412,7 @@ func (t Type) CanonicalName() string {
 // none of these families — so keyability checks (IsInteger || IsUuid || …) correctly reject them
 // (0A000), and family branches fall through to their composite/array handling.
 
-func (t Type) isScalar() bool { return t.Comp == nil && t.Array == nil }
+func (t Type) isScalar() bool { return t.Comp == nil && t.Array == nil && t.Range == nil }
 
 // IsInteger reports whether this is a scalar integer type (false for a composite/array).
 func (t Type) IsInteger() bool { return t.isScalar() && t.Scalar.IsInteger() }

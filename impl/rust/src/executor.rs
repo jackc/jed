@@ -13572,10 +13572,15 @@ fn require_numeric_operand(ty: &ResolvedType) -> Result<()> {
 /// across these families but never compares across them.
 fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Result<()> {
     use ResolvedType::{
-        Array, Bool, Bytea, Composite, Date, Decimal, Float, Int, Interval, Null, Text, Timestamp,
-        Timestamptz, Uuid,
+        Array, Bool, Bytea, Composite, Date, Decimal, Float, Int, Interval, Null, Range, Text,
+        Timestamp, Timestamptz, Uuid,
     };
     match (lt, rt) {
+        // Range comparison is deferred to R3 (the range_cmp total order — spec/design/ranges.md §6);
+        // a range operand (range×range or range×anything) is a 42804 this slice. A range×NULL is
+        // allowed (the comparison is unknown), like every other family below.
+        (Range(_), Null) | (Null, Range(_)) => Ok(()),
+        (Range(_), _) | (_, Range(_)) => Err(type_error("range comparison is not supported yet")),
         // Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff
         // their element types are comparable (recursively). A bare NULL is always comparable; an
         // array vs any non-array is 42804.

@@ -95,6 +95,9 @@ func pushArrayElementType(out []byte, elem Type) []byte {
 	if elem.Array != nil {
 		panic("nested array element (array-of-array) is not a jed type — array.md §2")
 	}
+	if elem.Range != nil {
+		panic("array-of-range is not storable yet (range columns land in R2)")
+	}
 	if elem.Comp != nil {
 		out = append(out, 14)
 		out = appendU16(out, uint16(len(elem.Comp.Name)))
@@ -305,6 +308,9 @@ func encodeScalar(ty ScalarType, v Value) []byte {
 	case ValArray:
 		// An array value is encoded by encodeValue's array arm, never here.
 		panic("BUG: an array value reached the scalar codec")
+	case ValRange:
+		// A range value is not storable yet (R2 adds the range codec); it never reaches here.
+		panic("BUG: a range value reached the scalar codec (R2)")
 	case ValText, ValBytea:
 		// text (UTF-8) and bytea (raw bytes) share the compact length-prefixed body; both
 		// hold their bytes in Str, so the on-disk form is identical.
@@ -1884,6 +1890,11 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 			out = append(out, flags)
 			out = pushArrayElementType(out, *col.Type.Array)
 			continue
+		}
+		if col.Type.Range != nil {
+			// Range columns are not storable yet (R2 adds type_code 17 + the codec); CREATE TABLE
+			// rejects a range column, so a stored column type is never a range.
+			panic("range columns are not storable yet (R2); never serialized")
 		}
 		out = append(out, typeCodeForScalar(col.Type.ScalarTy()))
 		// bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is
