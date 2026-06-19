@@ -117,6 +117,34 @@ test('the select page runs the date demo live', async ({ page }) => {
 	await expect(panel.getByTestId('result-rows')).not.toContainText('kickoff');
 });
 
+test('the indexes page runs an ordered-index lookup live', async ({ page }) => {
+	await page.goto('/docs/sql/indexes/');
+	// First panel = the ordered city_country index: WHERE country = 'JP' ORDER BY name →
+	// Kyoto, Osaka, Tokyo (the index narrows the scan; the result set is unchanged).
+	const panel = page.getByTestId('live-sql').first();
+	await expect(panel.getByTestId('result-rows')).toContainText('Kyoto');
+	await expect(panel.getByTestId('result-rows')).not.toContainText('Paris');
+});
+
+test('the indexes page runs the GIN @> contains scan live', async ({ page }) => {
+	await page.goto('/docs/sql/indexes/');
+	// Second panel = the GIN containment scan: tags @> ARRAY[10,20] → intro and gin (both hold
+	// {10,20}); arrays/storage/empty do not — the posting-list intersection of the index.
+	const panel = page.getByTestId('live-sql').nth(1);
+	await expect(panel.getByTestId('result-rows')).toContainText('intro');
+	await expect(panel.getByTestId('result-rows')).toContainText('gin');
+	await expect(panel.getByTestId('result-rows')).not.toContainText('arrays');
+});
+
+test('the indexes page runs the GIN && overlaps scan live', async ({ page }) => {
+	await page.goto('/docs/sql/indexes/');
+	// Third panel = the GIN overlap scan: tags && ARRAY[30,40] → intro (30), arrays (40),
+	// storage (40) — the posting-list union; empty shares nothing and is excluded.
+	const panel = page.getByTestId('live-sql').nth(2);
+	await expect(panel.getByTestId('result-rows')).toContainText('storage');
+	await expect(panel.getByTestId('result-rows')).not.toContainText('empty');
+});
+
 test('the reference pages are generated from the spec', async ({ page }) => {
 	await page.goto('/docs/reference/errors/');
 	// 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.

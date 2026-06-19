@@ -23,6 +23,7 @@ export const DOCS_NAV: readonly DocSection[] = [
 		links: [
 			{ title: 'Types', href: '/docs/sql/types/' },
 			{ title: 'Tables & constraints', href: '/docs/sql/tables/' },
+			{ title: 'Indexes', href: '/docs/sql/indexes/' },
 			{ title: 'Querying', href: '/docs/sql/select/' }
 		]
 	},
