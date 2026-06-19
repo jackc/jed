@@ -49,7 +49,8 @@ func fkNames(t *testing.T, db *Database, table string) []string {
 // Auto-naming follows PostgreSQL's <table>_<localcols>_fkey; an explicit CONSTRAINT name is used as
 // written; the catalog holds FKs in ascending lowercased-name order.
 func TestForeignKeyNamingAndOrder(t *testing.T) {
-	db := fkSetup(t,
+	db := fkSetup(
+		t,
 		"CREATE TABLE p (a int32, b int32, code int32 UNIQUE, PRIMARY KEY (a, b))",
 		"CREATE TABLE c (id int32 PRIMARY KEY, pa int32, pb int32, pcode int32, "+
 			"CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), "+
@@ -59,7 +60,8 @@ func TestForeignKeyNamingAndOrder(t *testing.T) {
 		t.Fatalf("fk names: got %v", got)
 	}
 
-	db2 := fkSetup(t,
+	db2 := fkSetup(
+		t,
 		"CREATE TABLE q (id int32 PRIMARY KEY)",
 		"CREATE TABLE r (id int32 PRIMARY KEY, x int32 REFERENCES q, FOREIGN KEY (x) REFERENCES q (id))",
 	)
@@ -105,7 +107,8 @@ func TestForeignKeyReferentialActionsNarrowed(t *testing.T) {
 // values keeps every referenced tuple present, so the UPDATE succeeds where PG fails on the
 // transient — a documented divergence (constraints.md §6.7).
 func TestForeignKeyParentUpdateEndStateSwap(t *testing.T) {
-	db := fkSetup(t,
+	db := fkSetup(
+		t,
 		"CREATE TABLE p (id int32 PRIMARY KEY, code int32 UNIQUE)",
 		"INSERT INTO p VALUES (1, 100), (2, 200)",
 		"CREATE TABLE c (id int32 PRIMARY KEY, pc int32 REFERENCES p (code))",
