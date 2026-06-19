@@ -83,6 +83,9 @@ TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row qu
 CTE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.cte expr.arithmetic
              expr.between expr.comparison_value types.i32].freeze
+GIN_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan dml.insert
+             dml.insert_multi_row query.select query.order_by types.i32 types.array
+             func.array_containment].freeze
 
 # The default relation note describes the NoREC pair (an optimized form vs a non-optimizable
 # rewrite). TLP overrides it with its own partition-reconstruction note (it is not an opt pair).
@@ -328,6 +331,60 @@ def gen_index(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: GIN-bounded scan (@> via the GIN index vs <@ full scan) ------------------------
+# `col @> Q` over a GIN-indexed array column gathers candidates from the index (spec/design/gin.md
+# §6); the SEMANTICALLY IDENTICAL `Q <@ col` (contained-by) is NOT GIN-accelerated (§10) and full
+# scans. So the metamorphic pair is `tags @> Q` vs `Q <@ tags` — the same predicate, the bound
+# taken on one side and not the other; both must return identical rows. Expected rows are known by
+# construction (a row matches iff its tags contain every distinct element of Q), so no oracle is
+# consulted — this catches a GIN gather/combine bug ALL cores might share, which differential
+# testing alone cannot. `'{…}'::i32[]` literals pin the element type (no bare-array adaptation).
+def gen_gin(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  # (id, tags): a small int array from a small domain (so @> admits several rows); one row is NULL
+  # and some are empty {} (a non-empty @> never matches them — they carry no term).
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+
+    [id, Array.new(rng.rand(0..3)) { rng.rand(0..4) }]
+  end
+  # The by-construction @> oracle: tags contains every DISTINCT element of `ks` (a NULL tags, or a
+  # missing element, → not contained). Duplicates in `ks` are a SET (PG @> semantics, gin.md §2).
+  matches = ->(ks) { rows.select { |_id, t| !t.nil? && ks.uniq.all? { |k| t.include?(k) } }.map { |id, _| id.to_s } }
+
+  elems = rows.filter_map { |_id, t| t }.flatten
+  present = elems.sample(random: rng) || 0
+  absent = ((0..9).to_a - elems).sample(random: rng) || 9
+  # A second term co-occurring with `present` in some row (so the intersection is non-empty when
+  # possible); else fall back to `present` (then [present, k2].uniq is a single term — still valid).
+  partner = rows.filter_map { |_id, t| t }.find { |t| t.include?(present) && t.size > 1 }
+  k2 = partner ? (partner - [present]).sample(random: rng) : present
+
+  lit = ->(t) { t.nil? ? "NULL" : "'{#{t.join(',')}}'" }
+  arr = ->(ks) { "'{#{ks.join(',')}}'::i32[]" }
+
+  out = header(seed, GIN_REQ, "GIN-bounded scan (@> via the GIN index vs <@ full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, tags i32[])")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, t| "(#{id}, #{lit.call(t)})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_tags_gin ON t USING gin (tags)")
+
+  gpair = lambda do |title, ks, exp|
+    out << "# #{title}"
+    out << "# GIN bound (col @> const -> term gather + intersection)"
+    q(out, "I", "SELECT id FROM t WHERE tags @> #{arr.call(ks)} ORDER BY id", exp)
+    out << "# full scan (Q <@ col is the same predicate, not GIN-accelerated) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE #{arr.call(ks)} <@ tags ORDER BY id", exp)
+  end
+
+  gpair.call("@> {#{present}} (present)", [present], matches.call([present]))
+  gpair.call("@> {#{absent}} (absent -> empty)", [absent], matches.call([absent]))
+  gpair.call("@> {#{present},#{k2}} (intersection)", [present, k2], matches.call([present, k2]))
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: TLP (ternary-logic partitioning) -----------------------------------------------
 # Kleene 3-valued helpers: Ruby `nil` is SQL UNKNOWN. A comparison with a NULL operand is UNKNOWN;
 # AND/OR follow Kleene logic; NOT(UNKNOWN) is UNKNOWN. These mirror jed's PG-default 3VL exactly
@@ -476,6 +533,7 @@ SCENARIOS = {
   "join" => method(:gen_join),
   "correlated" => method(:gen_correlated),
   "index" => method(:gen_index),
+  "gin" => method(:gen_gin),
   "tlp" => method(:gen_tlp),
   "cte" => method(:gen_cte),
 }.freeze
