@@ -5282,13 +5282,36 @@ type pkBoundPlan struct {
 	terms  []boundTerm
 }
 
-// scanBound is a per-relation scan bound (cost.md §3): a primary-key range, or a
-// secondary-index equality (spec/design/indexes.md §5) — exactly one of pk/index is set.
-// The PK bound wins when both apply (it is the row's own key — no second tree,
-// range-capable, strictly cheaper).
+// scanBound is a per-relation scan bound (cost.md §3): a primary-key range, a
+// secondary-index equality (spec/design/indexes.md §5), or a GIN-bounded scan over an
+// array column (spec/design/gin.md §6) — exactly one of pk/index/gin is set. The PK bound
+// wins when several apply (it is the row's own key — no second tree, range-capable,
+// strictly cheaper); the ordered-index equality bound wins over GIN (gin.md §6).
 type scanBound struct {
 	pk    *pkBoundPlan
 	index *indexBoundPlan
+	gin   *ginBoundPlan
+}
+
+// ginStrategy is which array operator a GIN bound accelerates (spec/design/gin.md §6): @>
+// (contains, mode ALL → posting-list intersection) or && (overlaps, mode ANY → union).
+type ginStrategy int
+
+const (
+	ginContains ginStrategy = iota
+	ginOverlaps
+)
+
+// ginBoundPlan is the plan-time result of GIN analysis (spec/design/gin.md §6): the chosen
+// GIN index (lowest lowercased name whose array column has a `col @> const` / `col && const`
+// conjunct), the array ELEMENT type (for encode(term) — the term bytes), the operator
+// strategy, and the column's global scope index. The constant query Q is NOT stored; it is
+// re-found in plan.filter at exec time by ginMatch and evaluated there.
+type ginBoundPlan struct {
+	nameKey   string
+	elemType  ScalarType
+	strategy  ginStrategy
+	colGlobal int
 }
 
 // indexBoundPlan is the plan-time result of index analysis (indexes.md §5): the chosen
@@ -5319,6 +5342,11 @@ func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 		}
 	}
 	for _, idx := range rel.table.Indexes {
+		// A GIN index is not an ordered-equality bound — its array column is keyed by terms, not
+		// the whole value (handled by the GIN pass below, gin.md §6).
+		if idx.Kind == IndexGin {
+			continue
+		}
 		ci := idx.Columns[0]
 		ty := rel.table.Columns[ci].Type.ScalarTy()
 		var eqs []*rExpr
@@ -5339,7 +5367,108 @@ func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 			}}
 		}
 	}
+	// GIN bound (gin.md §6) — after the PK and ordered-index equality bounds: the lowest-named GIN
+	// index whose array column has a `col @> const` / `col && const` conjunct.
+	for _, idx := range rel.table.Indexes {
+		if idx.Kind != IndexGin {
+			continue
+		}
+		ci := idx.Columns[0]
+		colGlobal := rel.offset + ci
+		at := rel.table.Columns[ci].Type
+		if at.Array == nil {
+			continue // a GIN column is always an array (the CREATE INDEX gate); defensive
+		}
+		if s, _, ok := ginMatch(filter, colGlobal); ok {
+			return &scanBound{gin: &ginBoundPlan{
+				nameKey: strings.ToLower(idx.Name), elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
+			}}
+		}
+	}
 	return nil
+}
+
+// ginMatch finds the first WHERE AND-chain conjunct a GIN index on colGlobal accelerates
+// (spec/design/gin.md §6): `col @> Q` (contains) or `col && Q` (overlaps) where Q is a constant
+// array (references no column / outer / subquery). @> is asymmetric (the indexed column must be
+// the LEFT operand — `Q @> col` is the non-accelerated <@); && is symmetric. Returns the strategy
+// and Q. Used at plan time (strategy) and exec time (recover Q from plan.filter), so the two agree
+// on the same conjunct by construction.
+func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
+	if filter == nil {
+		return 0, nil, false
+	}
+	if filter.kind == reAnd {
+		if s, q, ok := ginMatch(filter.lhs, colGlobal); ok {
+			return s, q, true
+		}
+		return ginMatch(filter.rhs, colGlobal)
+	}
+	if filter.kind == reArrayFunc && len(filter.sargs) == 2 {
+		a, b := filter.sargs[0], filter.sargs[1]
+		switch filter.afunc {
+		case afContains:
+			if isColumn(a, colGlobal) && rexprIsConstant(b) {
+				return ginContains, b, true
+			}
+		case afOverlaps:
+			if isColumn(a, colGlobal) && rexprIsConstant(b) {
+				return ginOverlaps, b, true
+			}
+			if isColumn(b, colGlobal) && rexprIsConstant(a) {
+				return ginOverlaps, a, true
+			}
+		}
+	}
+	return 0, nil, false
+}
+
+// isColumn reports whether e is a reference to the column at global scope index colGlobal.
+func isColumn(e *rExpr, colGlobal int) bool {
+	return e != nil && e.kind == reColumn && e.index == colGlobal
+}
+
+// rexprIsConstant reports whether e is evaluable without a current/outer row (so its value is the
+// same for every scanned row — computable once). False for any column, correlated outer column, or
+// subquery; true for literals, params, and pure operations over them. Used to admit a GIN query
+// operand Q (spec/design/gin.md §6: a constant query only this slice). Mirrors the traversal of
+// rexprReferencesOuter.
+func rexprIsConstant(e *rExpr) bool {
+	if e == nil {
+		return true
+	}
+	switch e.kind {
+	case reColumn, reOuterColumn, reSubquery:
+		return false
+	}
+	if e.operand != nil && !rexprIsConstant(e.operand) {
+		return false
+	}
+	if e.lhs != nil && !rexprIsConstant(e.lhs) {
+		return false
+	}
+	if e.rhs != nil && !rexprIsConstant(e.rhs) {
+		return false
+	}
+	for _, arm := range e.caseArms {
+		if !rexprIsConstant(arm.cond) || !rexprIsConstant(arm.result) {
+			return false
+		}
+	}
+	if e.caseEls != nil && !rexprIsConstant(e.caseEls) {
+		return false
+	}
+	for _, a := range e.sargs {
+		if !rexprIsConstant(a) {
+			return false
+		}
+	}
+	for _, s := range e.subs {
+		if !rexprIsConstant(s.index) || !rexprIsConstant(s.lower) || !rexprIsConstant(s.upper) {
+			return false
+		}
+	}
+	return true
 }
 
 // indexBoundRows executes an index equality bound (cost.md §3 "index-bounded scan"):
@@ -5402,6 +5531,159 @@ func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params 
 		rows = append(rows, row)
 	}
 	return rows, pages, slabs, nil
+}
+
+// ginBoundRows executes a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the
+// constant query Q, extracts its terms + mode via the array_ops opclass, gathers each term's
+// posting list (a prefix range scan of the GIN entry tree), combines them by mode (@> →
+// intersection, && → union) into the candidate storage-key set, and point-looks-up each candidate
+// in storage-key order. The original @>/&& predicate stays the residual WHERE filter (re-applied
+// downstream), so the result is always correct. Returns the candidate rows + the scan's up-front
+// (pages, slabs); gin_entry (per posting entry visited) is charged on meter directly. Degenerate
+// constant queries (gin.md §6): a NULL Q, an @> whose Q holds a NULL element, and an && with no
+// non-NULL term are provably empty; @> '{}' falls back to the full scan.
+func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (rows []Row, pages, slabs int, err error) {
+	store := db.readSnap().store(tableName)
+	if query == nil {
+		return nil, 0, 0, nil
+	}
+	// Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
+	// §3): evaluate Q on a scratch meter. Q is a constant, so the nil row suffices.
+	qv, err := query.eval(nil, env, &Meter{})
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if qv.Kind != ValArray {
+		return nil, 0, 0, nil // a NULL whole-array (or non-array) query → provably empty
+	}
+	seen := make(map[int64]bool)
+	var terms []int64
+	hasNull := false
+	for _, el := range qv.Array.Elements {
+		switch el.Kind {
+		case ValInt:
+			if !seen[el.Int] {
+				seen[el.Int] = true
+				terms = append(terms, el.Int)
+			}
+		case ValNull:
+			hasNull = true
+		}
+	}
+	isEmpty := len(qv.Array.Elements) == 0
+	slices.Sort(terms)
+
+	switch gb.strategy {
+	case ginContains:
+		if isEmpty {
+			// @> '{}': every non-NULL array contains the empty array — not derivable from the index;
+			// fall back to the full scan (the residual filter keeps the right rows — gin.md §6).
+			entries, p, sl, e := store.ScanWithUnits(mask)
+			if e != nil {
+				return nil, 0, 0, e
+			}
+			rows = make([]Row, len(entries))
+			for i := range entries {
+				rows[i] = entries[i].Row
+			}
+			return rows, p, sl, nil
+		}
+		if hasNull {
+			return nil, 0, 0, nil // @> a query with a NULL element is never TRUE
+		}
+	case ginOverlaps:
+		if len(terms) == 0 {
+			return nil, 0, 0, nil // && with no non-NULL term overlaps nothing
+		}
+	}
+
+	// Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
+	// (gin.md §4). The entry is encode(term) ‖ storage_key; the fixed-width term self-delimits, so
+	// the storage key is the suffix after termWidth bytes.
+	istore := db.readSnap().indexStore(gb.nameKey)
+	termWidth := gb.elemType.WidthBytes()
+	entriesVisited := 0
+	postings := make([][][]byte, 0, len(terms))
+	for _, t := range terms {
+		prefix := EncodeInt(gb.elemType, t)
+		b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
+		es, p, _, e := istore.RangeScanWithUnits(b, nil)
+		if e != nil {
+			return nil, 0, 0, e
+		}
+		pages += p
+		entriesVisited += len(es)
+		keys := make([][]byte, len(es))
+		for i := range es {
+			keys[i] = es[i].Key[termWidth:]
+		}
+		postings = append(postings, keys)
+	}
+	meter.Charge(Costs.GinEntry * int64(entriesVisited))
+
+	// Combine into the candidate storage keys, ascending byte (= storage-key) order, so the point
+	// lookups and emitted rows follow storage order exactly as a full scan (gin.md §6/§8).
+	var cand [][]byte
+	if gb.strategy == ginContains {
+		cand = intersectPostings(postings)
+	} else {
+		cand = unionPostings(postings)
+	}
+
+	for _, key := range cand {
+		row, ok, n, sl, e := store.GetWithUnits(key, mask)
+		if e != nil {
+			return nil, 0, 0, e
+		}
+		pages += n
+		slabs += sl
+		if !ok {
+			panic("a GIN entry references a stored row")
+		}
+		rows = append(rows, row)
+	}
+	return rows, pages, slabs, nil
+}
+
+// intersectPostings returns the storage keys present in EVERY posting list (the @> mode-ALL
+// combine), sorted ascending. Each posting list holds distinct keys (one (term,row) entry per
+// row), so a per-list count == the number of lists means the key is in all of them.
+func intersectPostings(postings [][][]byte) [][]byte {
+	if len(postings) == 0 {
+		return nil
+	}
+	count := make(map[string]int)
+	for _, list := range postings {
+		for _, k := range list {
+			count[string(k)]++
+		}
+	}
+	need := len(postings)
+	var out [][]byte
+	for _, k := range postings[0] {
+		if count[string(k)] == need {
+			out = append(out, k)
+		}
+	}
+	slices.SortFunc(out, bytes.Compare)
+	return out
+}
+
+// unionPostings returns the storage keys present in ANY posting list (the && mode-ANY combine),
+// deduplicated and sorted ascending.
+func unionPostings(postings [][][]byte) [][]byte {
+	seen := make(map[string]bool)
+	var out [][]byte
+	for _, list := range postings {
+		for _, k := range list {
+			if !seen[string(k)] {
+				seen[string(k)] = true
+				out = append(out, k)
+			}
+		}
+	}
+	slices.SortFunc(out, bytes.Compare)
+	return out
 }
 
 // prefixSuccessor is the byte-successor of a prefix: the smallest byte string greater
@@ -5679,7 +5961,7 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 	b := unboundedBound()
 	empty := false
 	overlap, slabs := 0, 0
-	if plan.relBounds[0] != nil {
+	if plan.relBounds[0] != nil && plan.relBounds[0].pk != nil {
 		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer)
 	}
 	if !empty {
@@ -5757,7 +6039,7 @@ func (db *Database) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Met
 	b := unboundedBound()
 	empty := false
 	overlap, slabs := 0, 0
-	if plan.relBounds[0] != nil {
+	if plan.relBounds[0] != nil && plan.relBounds[0].pk != nil {
 		b, empty = db.buildKeyBound(plan.relBounds[0].pk, params, env.outer)
 	}
 	if !empty {
@@ -5943,6 +6225,19 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 		if rows, nodeCount, slabs, err = db.indexBoundRows(rel.tableName, sb.index, params, outer, plan.relMasks[ri]); err != nil {
 			return nil, err
 		}
+	} else if sb != nil && sb.gin != nil {
+		// Re-find the constant query Q in the WHERE filter (the same conjunct plan-time ginMatch
+		// chose — gin.md §6); the @>/&& predicate also stays the residual filter downstream.
+		var query *rExpr
+		if plan.filter != nil {
+			if _, q, ok := ginMatch(plan.filter, sb.gin.colGlobal); ok {
+				query = q
+			}
+		}
+		var err error
+		if rows, nodeCount, slabs, err = db.ginBoundRows(rel.tableName, sb.gin, query, env, meter, plan.relMasks[ri]); err != nil {
+			return nil, err
+		}
 	} else if sb != nil {
 		b, empty := db.buildKeyBound(sb.pk, params, outer)
 		if !empty {
@@ -6007,7 +6302,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// (functions.md §10); the streaming reader assumes a table store.
 	if plan.limit != nil && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.distinct && len(plan.order) == 0 &&
-		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) &&
+		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil)) &&
 		plan.rels[0].srf == nil &&
 		// A CTE reference is a computed/buffered source, not a table store — the eager path
 		// (cte.md §5) delivers its rows; the streaming reader assumes a store.
@@ -6025,7 +6320,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// (the sort is unmetered — cost.md §3; spill.md §6).
 	if len(plan.order) > 0 && len(plan.rels) == 1 && len(plan.joins) == 0 &&
 		!plan.isAgg && !plan.distinct &&
-		(plan.relBounds[0] == nil || plan.relBounds[0].index == nil) &&
+		(plan.relBounds[0] == nil || (plan.relBounds[0].index == nil && plan.relBounds[0].gin == nil)) &&
 		plan.rels[0].srf == nil &&
 		// A CTE reference takes the eager path (cte.md §5).
 		plan.rels[0].cte == nil &&

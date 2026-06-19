@@ -28,7 +28,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "ddl.secondary_index",
   "ddl.unique",
   // GIN inverted indexes — CREATE INDEX ... USING gin over an integer-element array column;
-  // built + maintained on every write, persisted (format_version 12). spec/design/gin.md
+  // built + maintained on every write, persisted (format_version 13). The query-side planner
+  // bound is query.gin_scan. spec/design/gin.md
   "ddl.gin_index",
   // Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9); composite
   // columns/values are a later slice (spec/design/composite.md).
@@ -105,6 +106,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.limit_short_circuit",
   "query.correlated_pushdown",
   "query.join_pushdown",
+  // GIN-bounded scan — `col @> const` / `col && const` over a GIN-indexed array column narrows
+  // the SELECT scan to candidate rows (term gather → intersect/union → residual filter); the
+  // result is identical to the full scan (spec/design/gin.md §6).
+  "query.gin_scan",
   "query.is_null",
   "query.order_by",
   // Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

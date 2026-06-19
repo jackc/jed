@@ -2245,6 +2245,91 @@ export class Database {
     return { rows, pages, slabs };
   }
 
+  // ginBoundRows executes a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the
+  // constant query Q, extracts its terms + mode via the array_ops opclass, gathers each term's
+  // posting list (a prefix range scan of the GIN entry tree), combines them by mode (@> →
+  // intersection, && → union) into the candidate storage-key set, and point-looks-up each candidate
+  // in storage-key order. The original @>/&& predicate stays the residual WHERE filter (re-applied
+  // downstream), so the result is always correct. Returns the candidate rows + the scan's up-front
+  // (pages, slabs); gin_entry (per posting entry visited) is charged on meter directly. Degenerate
+  // constant queries (gin.md §6): a NULL Q, an @> whose Q holds a NULL element, and an && with no
+  // non-NULL term are provably empty; @> '{}' falls back to the full scan.
+  ginBoundRows(
+    tableName: string,
+    gb: GinBound,
+    query: RExpr | null,
+    env: EvalEnv,
+    meter: Meter,
+    mask: boolean[],
+  ): { rows: Row[]; pages: number; slabs: number } {
+    const store = this.readSnap().store(tableName);
+    if (query === null) return { rows: [], pages: 0, slabs: 0 };
+    // Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
+    // §3): evaluate Q on a scratch meter. Q is a constant, so the empty row suffices.
+    const qv = evalExpr(query, [], env, new Meter());
+    if (qv.kind !== "array") return { rows: [], pages: 0, slabs: 0 }; // NULL/non-array → provably empty
+    const seen = new Set<bigint>();
+    const terms: bigint[] = [];
+    let hasNull = false;
+    for (const el of qv.elements) {
+      if (el.kind === "int") {
+        if (!seen.has(el.int)) {
+          seen.add(el.int);
+          terms.push(el.int);
+        }
+      } else if (el.kind === "null") {
+        hasNull = true;
+      }
+    }
+    const isEmpty = qv.elements.length === 0;
+    terms.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+
+    if (gb.strategy === "contains") {
+      if (isEmpty) {
+        // @> '{}': every non-NULL array contains the empty array — not derivable from the index;
+        // fall back to the full scan (the residual filter keeps the right rows — gin.md §6).
+        const u = store.scanWithUnits(mask);
+        return { rows: u.entries.map((e) => e.row), pages: u.pages, slabs: u.slabs };
+      }
+      if (hasNull) return { rows: [], pages: 0, slabs: 0 }; // @> a query with a NULL element is never TRUE
+    } else {
+      if (terms.length === 0) return { rows: [], pages: 0, slabs: 0 }; // && with no non-NULL term
+    }
+
+    // Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
+    // (gin.md §4). The entry is encode(term) ‖ storage_key; the fixed-width term self-delimits, so
+    // the storage key is the suffix after termWidth bytes.
+    const istore = this.readSnap().indexStore(gb.nameKey);
+    const termWidth = widthBytes(gb.elemType);
+    let pages = 0;
+    let entriesVisited = 0;
+    const postings: Uint8Array[][] = [];
+    for (const t of terms) {
+      const prefix = encodeInt(gb.elemType, t);
+      const b: KeyBound = { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
+      const scan = istore.rangeScanWithUnits(b, []);
+      pages += scan.pages;
+      entriesVisited += scan.entries.length;
+      postings.push(scan.entries.map((e) => e.key.slice(termWidth)));
+    }
+    meter.charge(COSTS.ginEntry * BigInt(entriesVisited));
+
+    // Combine into the candidate storage keys, ascending byte (= storage-key) order, so the point
+    // lookups and emitted rows follow storage order exactly as a full scan (gin.md §6/§8).
+    const cand = gb.strategy === "contains" ? intersectPostings(postings) : unionPostings(postings);
+
+    let slabs = 0;
+    const rows: Row[] = [];
+    for (const key of cand) {
+      const u = store.getWithUnits(key, mask);
+      pages += u.pages;
+      slabs += u.slabs;
+      if (u.row === undefined) throw new Error("a GIN entry references a stored row");
+      rows.push(u.row);
+    }
+    return { rows, pages, slabs };
+  }
+
   // executeInsert runs an INSERT whose rows come from a VALUES list or a SELECT (grammar.md
   // §12 / §24). An optional column list names the target columns (unknown → 42703, duplicate →
   // 42701); an unlisted column, or a DEFAULT keyword slot, takes the column's stored default
@@ -3835,7 +3920,8 @@ export class Database {
     let empty = false;
     const sb = plan.relBounds[0]!;
     if (sb !== null) {
-      if (sb.kind === "index") throw new Error("the streaming path is gated to PK/full scans");
+      if (sb.kind === "index" || sb.kind === "gin")
+        throw new Error("the streaming path is gated to PK/full scans");
       const b = buildKeyBound(sb.pk, params, env.outer);
       if (b === null) empty = true;
       else bound = b;
@@ -3884,7 +3970,8 @@ export class Database {
     let empty = false;
     const sb = plan.relBounds[0]!;
     if (sb !== null) {
-      if (sb.kind === "index") throw new Error("the streaming sort path is gated to PK/full scans");
+      if (sb.kind === "index" || sb.kind === "gin")
+        throw new Error("the streaming sort path is gated to PK/full scans");
       const b = buildKeyBound(sb.pk, params, env.outer);
       if (b === null) empty = true;
       else bound = b;
@@ -4005,6 +4092,14 @@ export class Database {
       rows = r.rows;
       nodeCount = r.pages;
       slabs = r.slabs;
+    } else if (relBound !== null && relBound.kind === "gin") {
+      // Re-find the constant query Q in the WHERE filter (the same conjunct plan-time ginMatch
+      // chose — gin.md §6); the @>/&& predicate also stays the residual filter downstream.
+      const m = plan.filter !== null ? ginMatch(plan.filter, relBound.gin.colGlobal) : null;
+      const r = this.ginBoundRows(rel.tableName, relBound.gin, m?.query ?? null, env, meter, plan.relMasks[ri]!);
+      rows = r.rows;
+      nodeCount = r.pages;
+      slabs = r.slabs;
     } else if (relBound !== null) {
       const b = buildKeyBound(relBound.pk, params, outer);
       if (b === null) {
@@ -4061,9 +4156,10 @@ export class Database {
       !plan.isAgg &&
       !plan.distinct &&
       plan.order.length === 0 &&
-      // An index-bounded scan does not stream (cost.md §3 "index-bounded scan"): it
-      // reads the full admitted set via the eager path below.
+      // An index- or GIN-bounded scan does not stream (cost.md §3 "index-bounded scan",
+      // gin.md §6): it reads the full admitted set via the eager path below.
       plan.relBounds[0]?.kind !== "index" &&
+      plan.relBounds[0]?.kind !== "gin" &&
       // A set-returning relation is generated, not scanned — it takes the eager path
       // (functions.md §10); the streaming reader assumes a table store.
       plan.rels[0]!.srf === undefined &&
@@ -4089,6 +4185,7 @@ export class Database {
       !plan.isAgg &&
       !plan.distinct &&
       plan.relBounds[0]?.kind !== "index" &&
+      plan.relBounds[0]?.kind !== "gin" &&
       // A set-returning relation takes the eager path (functions.md §10).
       plan.rels[0]!.srf === undefined &&
       // A CTE reference takes the eager path (cte.md §5).
@@ -4488,10 +4585,26 @@ function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Ro
 // result is always correct — the bound only narrows which rows are scanned, and page_read/storageRowRead
 // drop to what it touches. The unbounded case keeps the full scan, so its cost never moves.
 
-// ScanBound is a per-relation scan bound (cost.md §3): a primary-key range, or a
-// secondary-index equality (spec/design/indexes.md §5). The PK bound wins when both apply
-// (it is the row's own key — no second tree, range-capable, strictly cheaper).
-type ScanBound = { kind: "pk"; pk: PkBound } | { kind: "index"; index: IndexBound };
+// ScanBound is a per-relation scan bound (cost.md §3): a primary-key range, a
+// secondary-index equality (spec/design/indexes.md §5), or a GIN-bounded scan over an array
+// column (spec/design/gin.md §6). The PK bound wins when several apply (it is the row's own
+// key — no second tree, range-capable, strictly cheaper); the ordered-index equality bound
+// wins over GIN (gin.md §6).
+type ScanBound =
+  | { kind: "pk"; pk: PkBound }
+  | { kind: "index"; index: IndexBound }
+  | { kind: "gin"; gin: GinBound };
+
+// GinStrategy is which array operator a GIN bound accelerates (spec/design/gin.md §6): @>
+// (contains, mode ALL → posting-list intersection) or && (overlaps, mode ANY → union).
+type GinStrategy = "contains" | "overlaps";
+
+// GinBound is the plan-time result of GIN analysis (spec/design/gin.md §6): the chosen GIN
+// index (lowest lowercased name whose array column has a `col @> const` / `col && const`
+// conjunct), the array ELEMENT type (for encode(term) — the term bytes), the operator
+// strategy, and the column's global scope index. The constant query Q is NOT stored; it is
+// re-found in plan.filter at exec time by ginMatch and evaluated there.
+type GinBound = { nameKey: string; elemType: ScalarType; strategy: GinStrategy; colGlobal: number };
 
 // IndexBound is the plan-time result of index analysis (indexes.md §5): the chosen index
 // (lowest lowercased name whose FIRST key column has an equality conjunct), that column's
@@ -4515,6 +4628,9 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
     if (bp !== null) return { kind: "pk", pk: bp };
   }
   for (const idx of rel.table.indexes) {
+    // A GIN index is not an ordered-equality bound — its array column is keyed by terms, not the
+    // whole value (handled by the GIN pass below, gin.md §6).
+    if (idx.kind === "gin") continue;
     const ci = idx.columns[0]!;
     const ty = typeScalar(rel.table.columns[ci]!.type);
     const bp = detectPkBound(filter, rel.offset + ci, ty);
@@ -4527,7 +4643,99 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
       return { kind: "index", index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, tailTypes } };
     }
   }
+  // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds: the lowest-named GIN
+  // index whose array column has a `col @> const` / `col && const` conjunct.
+  for (const idx of rel.table.indexes) {
+    if (idx.kind !== "gin") continue;
+    const ci = idx.columns[0]!;
+    const colGlobal = rel.offset + ci;
+    const colType = rel.table.columns[ci]!.type;
+    if (colType.kind !== "array") continue; // a GIN column is always an array (the gate); defensive
+    const m = ginMatch(filter, colGlobal);
+    if (m !== null) {
+      return {
+        kind: "gin",
+        gin: { nameKey: idx.name.toLowerCase(), elemType: typeScalar(colType.elem), strategy: m.strategy, colGlobal },
+      };
+    }
+  }
   return null;
+}
+
+// ginMatch finds the first WHERE AND-chain conjunct a GIN index on colGlobal accelerates
+// (spec/design/gin.md §6): `col @> Q` (contains) or `col && Q` (overlaps) where Q is a constant
+// array (references no column / outer / subquery). @> is asymmetric (the indexed column must be the
+// LEFT operand — `Q @> col` is the non-accelerated <@); && is symmetric. Returns the strategy and Q.
+// Used at plan time (strategy) and exec time (recover Q from plan.filter), so the two agree on the
+// same conjunct by construction.
+function ginMatch(filter: RExpr, colGlobal: number): { strategy: GinStrategy; query: RExpr } | null {
+  if (filter.kind === "and") {
+    return ginMatch(filter.lhs, colGlobal) ?? ginMatch(filter.rhs, colGlobal);
+  }
+  if (filter.kind === "arrayFunc" && filter.args.length === 2) {
+    const a = filter.args[0]!;
+    const b = filter.args[1]!;
+    if (filter.func === "contains") {
+      if (isColumnRef(a, colGlobal) && rexprIsConstant(b)) return { strategy: "contains", query: b };
+    } else if (filter.func === "overlaps") {
+      if (isColumnRef(a, colGlobal) && rexprIsConstant(b)) return { strategy: "overlaps", query: b };
+      if (isColumnRef(b, colGlobal) && rexprIsConstant(a)) return { strategy: "overlaps", query: a };
+    }
+  }
+  return null;
+}
+
+// isColumnRef reports whether e is a reference to the column at global scope index colGlobal.
+function isColumnRef(e: RExpr, colGlobal: number): boolean {
+  return e.kind === "column" && e.index === colGlobal;
+}
+
+// rexprIsConstant reports whether e is evaluable without a current/outer row (so its value is the
+// same for every scanned row — computable once). False for any column, correlated outer column, or
+// subquery; true for literals, params, and pure operations over them. Used to admit a GIN query
+// operand Q (spec/design/gin.md §6: a constant query only this slice).
+function rexprIsConstant(e: RExpr): boolean {
+  switch (e.kind) {
+    case "column":
+    case "outerColumn":
+    case "subquery":
+      return false;
+    case "row":
+      return e.fields.every(rexprIsConstant);
+    case "array":
+      return e.elements.every(rexprIsConstant);
+    case "field":
+      return rexprIsConstant(e.base);
+    case "cast":
+    case "neg":
+    case "not":
+    case "isNull":
+      return rexprIsConstant(e.operand);
+    case "arith":
+    case "compare":
+    case "and":
+    case "or":
+    case "distinct":
+    case "like":
+      return rexprIsConstant(e.lhs) && rexprIsConstant(e.rhs);
+    case "case":
+      return e.arms.every((a) => rexprIsConstant(a.cond) && rexprIsConstant(a.result)) && rexprIsConstant(e.els);
+    case "scalarFunc":
+    case "arrayFunc":
+    case "variadic":
+      return e.args.every(rexprIsConstant);
+    case "inValues":
+      return rexprIsConstant(e.lhs);
+    case "quantified":
+      return rexprIsConstant(e.lhs) && rexprIsConstant(e.array);
+    default:
+      // Every leaf constant (constInt/constArray/param/…) is constant; a subscript / any other node
+      // is treated conservatively as non-constant (no GIN accel; the residual filter still applies).
+      return (
+        e.kind === "param" ||
+        e.kind.startsWith("const")
+      );
+  }
 }
 
 // indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each
@@ -4604,6 +4812,62 @@ function ginEntries(columns: Column[], def: IndexDef, storageKey: Uint8Array, ro
     out.set(storageKey, term.length);
     return out;
   });
+}
+
+// cmpBytes compares two byte strings lexicographically (-1/0/1), the on-disk storage-key order.
+function cmpBytes(a: Uint8Array, b: Uint8Array): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) {
+    if (a[i]! !== b[i]!) return a[i]! - b[i]!;
+  }
+  return a.length - b.length;
+}
+
+// byteKey is a stable string key for a (small) byte string — used to dedup / count storage keys in
+// the GIN posting combine. Storage keys are short (an encoded PK or rowid), so per-char is fine.
+function byteKey(a: Uint8Array): string {
+  let s = "";
+  for (let i = 0; i < a.length; i++) s += String.fromCharCode(a[i]!);
+  return s;
+}
+
+// intersectPostings returns the storage keys present in EVERY posting list (the @> mode-ALL
+// combine), sorted ascending. Each posting list holds distinct keys (one (term,row) entry per row),
+// so a per-list count == the number of lists means the key is in all of them.
+function intersectPostings(postings: Uint8Array[][]): Uint8Array[] {
+  if (postings.length === 0) return [];
+  const count = new Map<string, number>();
+  for (const list of postings) {
+    for (const k of list) {
+      const key = byteKey(k);
+      count.set(key, (count.get(key) ?? 0) + 1);
+    }
+  }
+  const need = postings.length;
+  const out: Uint8Array[] = [];
+  for (const k of postings[0]!) {
+    if (count.get(byteKey(k)) === need) out.push(k);
+  }
+  out.sort(cmpBytes);
+  return out;
+}
+
+// unionPostings returns the storage keys present in ANY posting list (the && mode-ANY combine),
+// deduplicated and sorted ascending.
+function unionPostings(postings: Uint8Array[][]): Uint8Array[] {
+  const seen = new Set<string>();
+  const out: Uint8Array[] = [];
+  for (const list of postings) {
+    for (const k of list) {
+      const key = byteKey(k);
+      if (!seen.has(key)) {
+        seen.add(key);
+        out.push(k);
+      }
+    }
+  }
+  out.sort(cmpBytes);
+  return out;
 }
 
 // bytesDiff returns the entries in a that are not in b (set difference over byte strings),

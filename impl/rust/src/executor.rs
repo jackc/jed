@@ -29,7 +29,7 @@ use crate::types::{DecimalTypmod, ScalarType, Type};
 use crate::value::{
     ArrayVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
 };
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// The outcome of executing one statement. Both variants carry the deterministic
 /// execution `cost` accrued while running the statement (CLAUDE.md §13) — a DML
@@ -5125,7 +5125,7 @@ impl Database {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
-            Some(ScanBound::Index(_)) => {
+            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) => {
                 unreachable!("the streaming path is gated to PK/full scans")
             }
             None => (KeyBound::unbounded(), false),
@@ -5210,7 +5210,7 @@ impl Database {
                 Some(b) => (b, false),
                 None => (KeyBound::unbounded(), true),
             },
-            Some(ScanBound::Index(_)) => {
+            Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_)) => {
                 unreachable!("the streaming sort path is gated to PK/full scans")
             }
             None => (KeyBound::unbounded(), false),
@@ -5382,6 +5382,16 @@ impl Database {
             Some(ScanBound::Index(ib)) => {
                 self.index_bound_rows(&rel.table_name, ib, params, outer, &plan.rel_masks[ri])?
             }
+            Some(ScanBound::Gin(gb)) => {
+                // Re-find the constant query `Q` in the WHERE filter (the same conjunct the plan-time
+                // `gin_match` chose — gin.md §6); the `@>`/`&&` predicate also stays as the residual
+                // filter applied to these rows downstream.
+                let query = plan
+                    .filter
+                    .as_ref()
+                    .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
+                self.gin_bound_rows(&rel.table_name, gb, query, &env, meter, &plan.rel_masks[ri])?
+            }
             None => {
                 let (entries, pages, slabs) = store.scan_with_units(&plan.rel_masks[ri])?;
                 let rows = entries.into_iter().map(|(_, v)| v).collect();
@@ -5435,9 +5445,12 @@ impl Database {
             && !plan.is_agg
             && !plan.distinct
             && plan.order.is_empty()
-            // An index-bounded scan does not stream (cost.md §3 "index-bounded scan"): it
-            // reads the full admitted set via the eager path below.
-            && !matches!(plan.rel_bounds[0], Some(ScanBound::Index(_)))
+            // An index- or GIN-bounded scan does not stream (cost.md §3 "index-bounded scan",
+            // gin.md §6): it reads the full admitted set via the eager path below.
+            && !matches!(
+                plan.rel_bounds[0],
+                Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_))
+            )
             // A set-returning relation is generated, not scanned — it takes the eager path
             // (functions.md §10); the streaming reader assumes a table store.
             && plan.rels[0].srf.is_none()
@@ -5461,7 +5474,10 @@ impl Database {
             && plan.joins.is_empty()
             && !plan.is_agg
             && !plan.distinct
-            && !matches!(plan.rel_bounds[0], Some(ScanBound::Index(_)))
+            && !matches!(
+                plan.rel_bounds[0],
+                Some(ScanBound::Index(_)) | Some(ScanBound::Gin(_))
+            )
             // A set-returning relation takes the eager path (functions.md §10).
             && plan.rels[0].srf.is_none()
             // A CTE reference takes the eager path (cte.md §5).
@@ -6207,6 +6223,124 @@ impl Database {
             pages += n;
             slabs += s;
             rows.push(row.expect("an index entry references a stored row"));
+        }
+        Ok((rows, (pages, slabs)))
+    }
+
+    /// Execute a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the constant
+    /// query `Q`, extracts its terms + mode via the `array_ops` opclass, gathers each term's
+    /// posting list (a prefix range scan of the GIN entry tree), combines them by mode
+    /// (`@>` → intersection, `&&` → union) into the candidate storage-key set, and point-looks-up
+    /// each candidate in storage-key order. The original `@>`/`&&` predicate stays the residual
+    /// WHERE filter (re-applied downstream), so the result is always correct — the bound only
+    /// narrows which rows are fetched. Returns the candidate rows + the scan's up-front units
+    /// `(pages, slabs)` (entry-tree overlap nodes per term + each candidate's table point-lookup);
+    /// `gin_entry` (per posting entry visited) is charged on `meter` directly. Degenerate constant
+    /// queries (gin.md §6): a NULL `Q`, an `@>` whose `Q` holds a NULL element, and an `&&` with no
+    /// non-NULL term are provably empty (read nothing); `@> '{}'` falls back to the full scan.
+    fn gin_bound_rows(
+        &self,
+        table_name: &str,
+        gb: &GinBound,
+        query: Option<&RExpr>,
+        env: &EvalEnv,
+        meter: &mut Meter,
+        mask: &[bool],
+    ) -> Result<(Vec<Row>, (usize, usize))> {
+        let store = self.store(table_name);
+        // Extract the query's distinct terms. This (the opclass `extract_query_terms`) is a pure
+        // planning step, NOT metered (cost.md §3) — evaluate `Q` on a scratch meter. `Q` is a
+        // constant, so the empty row suffices.
+        let qv = match query {
+            Some(q) => q.eval(&[], env, &mut Meter::new())?,
+            None => return Ok((Vec::new(), (0, 0))),
+        };
+        let arr = match &qv {
+            // A NULL whole-array query is 3VL-NULL for every row → never TRUE (both @> and &&).
+            Value::Null => return Ok((Vec::new(), (0, 0))),
+            Value::Array(a) => a,
+            _ => return Ok((Vec::new(), (0, 0))), // not an array (impossible post-resolve)
+        };
+        let mut terms: Vec<i64> = Vec::new();
+        let mut has_null = false;
+        for el in &arr.elements {
+            match el {
+                Value::Int(n) => terms.push(*n),
+                Value::Null => has_null = true,
+                _ => {} // a non-integer element is impossible under the array_ops gate
+            }
+        }
+        let is_empty = arr.elements.is_empty();
+        terms.sort_unstable();
+        terms.dedup();
+
+        match gb.strategy {
+            // `@> '{}'`: every non-NULL array contains the empty array — not derivable from the
+            // index (which knows only rows that HAVE terms), so fall back to the full scan. The
+            // residual filter then keeps the right rows (gin.md §6).
+            GinStrategy::Contains if is_empty => {
+                let (entries, pages, slabs) = store.scan_with_units(mask)?;
+                let rows = entries.into_iter().map(|(_, v)| v).collect();
+                return Ok((rows, (pages, slabs)));
+            }
+            // `@>` a query containing a NULL element is never TRUE (strict element equality).
+            GinStrategy::Contains if has_null => return Ok((Vec::new(), (0, 0))),
+            // `&&` with no non-NULL term (empty or all-NULL `Q`) overlaps nothing.
+            GinStrategy::Overlaps if terms.is_empty() => return Ok((Vec::new(), (0, 0))),
+            _ => {}
+        }
+
+        // Gather each term's posting list: the entry range [encode(term), successor) of the GIN
+        // tree (gin.md §4). The entry is `encode_element(term) ‖ storage_key`; the element type is
+        // fixed-width, so the storage key is the suffix after `term_width` bytes.
+        let istore = self.index_store(&gb.name_key);
+        let term_width = gb.elem_type.width_bytes();
+        let mut pages = 0usize;
+        let mut entries_visited = 0usize;
+        let mut postings: Vec<Vec<Vec<u8>>> = Vec::with_capacity(terms.len());
+        for &t in &terms {
+            let prefix = encode_int(gb.elem_type, t);
+            let bound = KeyBound {
+                lo: Some(prefix.clone()),
+                lo_inc: true,
+                hi: prefix_successor(&prefix),
+                hi_inc: false,
+            };
+            let (es, p, _) = istore.range_scan_with_units(&bound, &[])?;
+            pages += p;
+            entries_visited += es.len();
+            postings.push(
+                es.into_iter()
+                    .map(|(ekey, _)| ekey[term_width..].to_vec())
+                    .collect(),
+            );
+        }
+        meter.charge(COSTS.gin_entry * entries_visited as i64);
+
+        // Combine the posting sets by mode into the candidate storage keys, in ascending byte
+        // (= storage-key) order, so the point lookups and the emitted rows follow storage order
+        // exactly as a full scan would (gin.md §6/§8).
+        let candidates: BTreeSet<Vec<u8>> = match gb.strategy {
+            GinStrategy::Contains => {
+                let mut it = postings.into_iter();
+                let mut acc: BTreeSet<Vec<u8>> =
+                    it.next().unwrap_or_default().into_iter().collect();
+                for list in it {
+                    let s: BTreeSet<Vec<u8>> = list.into_iter().collect();
+                    acc.retain(|k| s.contains(k));
+                }
+                acc
+            }
+            GinStrategy::Overlaps => postings.into_iter().flatten().collect(),
+        };
+
+        let mut slabs = 0usize;
+        let mut rows = Vec::with_capacity(candidates.len());
+        for key in candidates {
+            let (row, n, s) = store.get_with_units(&key, mask)?;
+            pages += n;
+            slabs += s;
+            rows.push(row.expect("a GIN entry references a stored row"));
         }
         Ok((rows, (pages, slabs)))
     }
@@ -7380,12 +7514,38 @@ struct PkBound {
     terms: Vec<BoundTerm>,
 }
 
-/// A per-relation scan bound (cost.md §3): a primary-key range, or a secondary-index
-/// equality (spec/design/indexes.md §5). The PK bound wins when both apply — it is the
-/// row's own key (no second tree, range-capable, strictly cheaper).
+/// A per-relation scan bound (cost.md §3): a primary-key range, a secondary-index
+/// equality (spec/design/indexes.md §5), or a GIN-bounded scan over an array column
+/// (spec/design/gin.md §6). The PK bound wins when several apply — it is the row's own key
+/// (no second tree, range-capable, strictly cheaper); the ordered-index equality bound wins
+/// over GIN (the deterministic precedence, gin.md §6).
 enum ScanBound {
     Pk(PkBound),
     Index(IndexBound),
+    Gin(GinBound),
+}
+
+/// Which array operator a GIN bound accelerates (spec/design/gin.md §6): `@>` (contains, mode
+/// ALL → posting-list intersection) or `&&` (overlaps, mode ANY → posting-list union).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GinStrategy {
+    Contains,
+    Overlaps,
+}
+
+/// The plan-time result of GIN analysis (spec/design/gin.md §6): the chosen GIN index (lowest
+/// lowercased name whose array column has a `col @> const` / `col && const` conjunct), the array
+/// **element** type (for `encode_element` — the term bytes), the operator strategy, and the
+/// column's global scope index. The constant query `Q` is NOT stored (`RExpr` is not `Clone`); it
+/// is re-found in `plan.filter` at exec time by `gin_match` and evaluated there.
+struct GinBound {
+    /// The index store's key — the lowercased index name.
+    name_key: String,
+    /// The array element type, whose key encoding produces each term's bytes.
+    elem_type: ScalarType,
+    strategy: GinStrategy,
+    /// The GIN-indexed column's global scope index (`rel.offset + ci`).
+    col_global: usize,
 }
 
 /// The plan-time result of index analysis (indexes.md §5): the chosen index (lowest
@@ -7429,6 +7589,11 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
         return Some(ScanBound::Pk(b));
     }
     for idx in &rel.table.indexes {
+        // A GIN index is not an ordered-equality bound — its column is an array and it is keyed by
+        // terms, not the whole value (handled by the GIN pass below, gin.md §6).
+        if idx.kind == IndexKind::Gin {
+            continue;
+        }
         let ci = idx.columns[0];
         let ty = rel.table.columns[ci].ty.scalar();
         let mut terms = Vec::new();
@@ -7450,7 +7615,119 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
             }));
         }
     }
+    // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds: the lowest-named GIN
+    // index whose array column has a `col @> const` / `col && const` conjunct.
+    for idx in &rel.table.indexes {
+        if idx.kind != IndexKind::Gin {
+            continue;
+        }
+        let ci = idx.columns[0];
+        let col_global = rel.offset + ci;
+        let Some(elem_ty) = rel.table.columns[ci].ty.array_element().map(|t| t.scalar()) else {
+            continue; // a GIN column is always an array (the CREATE INDEX gate); defensive
+        };
+        if let Some((strategy, _)) = gin_match(filter, col_global) {
+            return Some(ScanBound::Gin(GinBound {
+                name_key: idx.name.to_ascii_lowercase(),
+                elem_type: elem_ty,
+                strategy,
+                col_global,
+            }));
+        }
+    }
     None
+}
+
+/// Find the first WHERE AND-chain conjunct that a GIN index on `col_global` accelerates
+/// (spec/design/gin.md §6): `col @> Q` (contains) or `col && Q` (overlaps) where `Q` is a
+/// **constant** array (references no column / outer / subquery — re-evaluable per scan, not per
+/// row). `@>` is asymmetric (the indexed column must be the LEFT operand — `Q @> col` is the
+/// non-accelerated `<@`); `&&` is symmetric (the column may be either operand). Returns the
+/// strategy and a reference to `Q`. Used both at plan time (for the strategy) and exec time (to
+/// recover `Q` from `plan.filter`), so the two agree on the same conjunct by construction.
+fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrategy, &RExpr)> {
+    match filter {
+        RExpr::And(l, r) => gin_match(l, col_global).or_else(|| gin_match(r, col_global)),
+        RExpr::ArrayFunc {
+            func: ArrayFunc::Contains,
+            args,
+        } if args.len() == 2 => (is_column(&args[0], col_global) && rexpr_is_constant(&args[1]))
+            .then_some((GinStrategy::Contains, &args[1])),
+        RExpr::ArrayFunc {
+            func: ArrayFunc::Overlaps,
+            args,
+        } if args.len() == 2 => {
+            if is_column(&args[0], col_global) && rexpr_is_constant(&args[1]) {
+                Some((GinStrategy::Overlaps, &args[1]))
+            } else if is_column(&args[1], col_global) && rexpr_is_constant(&args[0]) {
+                Some((GinStrategy::Overlaps, &args[0]))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Is `e` a reference to the column at global scope index `col_global`?
+fn is_column(e: &RExpr, col_global: usize) -> bool {
+    matches!(e, RExpr::Column(i) if *i == col_global)
+}
+
+/// Is `e` a **constant** expression — evaluable without a current/outer row (so its value is the
+/// same for every scanned row, computable once)? False for any column, correlated outer column, or
+/// subquery; true for literals, params, and pure operations over them. Used to admit a GIN query
+/// operand `Q` (spec/design/gin.md §6: a constant query only this slice).
+fn rexpr_is_constant(e: &RExpr) -> bool {
+    match e {
+        RExpr::Column(_) | RExpr::OuterColumn { .. } | RExpr::Subquery { .. } => false,
+        RExpr::ConstInt(_)
+        | RExpr::ConstBool(_)
+        | RExpr::ConstText(_)
+        | RExpr::ConstDecimal(_)
+        | RExpr::ConstFloat32(_)
+        | RExpr::ConstFloat64(_)
+        | RExpr::ConstBytea(_)
+        | RExpr::ConstUuid(_)
+        | RExpr::ConstTimestamp(_)
+        | RExpr::ConstTimestamptz(_)
+        | RExpr::ConstDate(_)
+        | RExpr::ConstInterval(_)
+        | RExpr::ConstNull
+        | RExpr::ConstArray(_)
+        | RExpr::Param(_) => true,
+        RExpr::Row(xs) | RExpr::Array { elems: xs, .. } => xs.iter().all(rexpr_is_constant),
+        RExpr::Field { base, .. } => rexpr_is_constant(base),
+        RExpr::Subscript {
+            base, subscripts, ..
+        } => {
+            rexpr_is_constant(base)
+                && subscripts
+                    .iter()
+                    .flat_map(subscript_bounds)
+                    .all(rexpr_is_constant)
+        }
+        RExpr::Cast { inner, .. } => rexpr_is_constant(inner),
+        RExpr::Neg { operand, .. } => rexpr_is_constant(operand),
+        RExpr::Not(x) => rexpr_is_constant(x),
+        RExpr::Arith { lhs, rhs, .. }
+        | RExpr::Compare { lhs, rhs, .. }
+        | RExpr::Distinct { lhs, rhs, .. }
+        | RExpr::Like { lhs, rhs, .. }
+        | RExpr::And(lhs, rhs)
+        | RExpr::Or(lhs, rhs) => rexpr_is_constant(lhs) && rexpr_is_constant(rhs),
+        RExpr::IsNull { operand, .. } => rexpr_is_constant(operand),
+        RExpr::Case { arms, els, .. } => {
+            arms.iter()
+                .all(|(c, r)| rexpr_is_constant(c) && rexpr_is_constant(r))
+                && rexpr_is_constant(els)
+        }
+        RExpr::ScalarFunc { args, .. }
+        | RExpr::ArrayFunc { args, .. }
+        | RExpr::Variadic { args, .. } => args.iter().all(rexpr_is_constant),
+        RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
+        RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
+    }
 }
 
 /// A secondary-index entry key (spec/design/indexes.md §3): each indexed column as the
