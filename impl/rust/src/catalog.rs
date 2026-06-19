@@ -293,6 +293,12 @@ pub enum ColType {
     /// elements are deferred). The codec reads the element structure; store-coercion coerces each
     /// element to it.
     Array(Box<ColType>),
+    /// A range's resolved element type (spec/design/ranges.md §3). Structural like array — the
+    /// element is carried inline, but is always one of the six scalar subtypes (`i32`/`i64`/
+    /// `decimal`/`timestamp`/`timestamptz`/`date`), never composite/array/nested-range. The codec
+    /// reads the element scalar for the bound bodies; the descriptor (discreteness) is re-derived
+    /// from the element via `range::range_for_element`.
+    Range(Box<ColType>),
 }
 
 /// One resolved field of a [`ColType::Composite`] — its name, recursively-resolved type, the
@@ -333,14 +339,10 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
             }
         }
         Type::Array(elem) => ColType::Array(Box::new(resolve_col_type(elem, types))),
-        // Range columns are not storable yet (spec/design/ranges.md §8 — R2 adds the codec +
-        // ColType::Range). CREATE TABLE rejects a range column and a CTE range column is 0A000, so
-        // no `Type::Range` ever reaches a `ColType` this slice.
-        Type::Range(_) => {
-            unreachable!(
-                "range columns are not storable yet (R2); resolve_col_type never sees a range"
-            )
-        }
+        // A range column (spec/design/ranges.md §3): structural like array, the element resolved
+        // inline. The element is always one of the six scalar subtypes, so the recursion bottoms
+        // out at `ColType::Scalar` immediately.
+        Type::Range(elem) => ColType::Range(Box::new(resolve_col_type(elem, types))),
     }
 }
 

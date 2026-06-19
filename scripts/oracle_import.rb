@@ -52,6 +52,10 @@ class OracleImport
     "text" => "T", "character varying" => "T", "uuid" => "T", "bytea" => "T",
     "timestamp without time zone" => "T", "timestamp with time zone" => "T",
     "interval" => "T", "date" => "T",
+    # Range types render as text (range_out). PG reports the canonical PG name; jed's i32range/
+    # i64range are aliases of int4range/int8range, so both spellings tag T (spec/design/ranges.md §5).
+    "int4range" => "T", "int8range" => "T", "numrange" => "T",
+    "tsrange" => "T", "tstzrange" => "T", "daterange" => "T",
   }.freeze
 
   def initialize(path)

@@ -22,7 +22,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 15    // on-disk format version (15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13). 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion   uint16 = 16    // on-disk format version (16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -96,7 +96,7 @@ func pushArrayElementType(out []byte, elem Type) []byte {
 		panic("nested array element (array-of-array) is not a jed type — array.md §2")
 	}
 	if elem.Range != nil {
-		panic("array-of-range is not storable yet (range columns land in R2)")
+		panic("array-of-range is not a storable type (ranges.md §2)")
 	}
 	if elem.Comp != nil {
 		out = append(out, 14)
@@ -123,6 +123,37 @@ func readArrayElementType(buf []byte, pos *int) (Type, error) {
 	s, ok := scalarForTypeCode(code)
 	if !ok {
 		return Type{}, NewError(DataCorrupted, "invalid array element code")
+	}
+	return ScalarT(s), nil
+}
+
+// pushRangeElementType appends a range column's element type descriptor (spec/design/ranges.md §3): a
+// single u8 scalar type code. A range element is always one of the six scalar subtypes (i32/i64/
+// decimal/timestamp/timestamptz/date) — never composite, array, or nested range — and numrange's
+// element is the unconstrained decimal, so no typmod is stored (the type name fully determines the
+// element). The element descriptor is self-describing: it identifies which of the six ranges the
+// column is.
+func pushRangeElementType(out []byte, elem Type) []byte {
+	if elem.Comp != nil || elem.Array != nil || elem.Range != nil {
+		panic("a range element is always a scalar subtype (ranges.md §2)")
+	}
+	return append(out, typeCodeForScalar(elem.Scalar))
+}
+
+// readRangeElementType decodes a range column's element type descriptor (inverse of
+// pushRangeElementType): one scalar code, validated to be one of the six range element subtypes
+// (else XX001).
+func readRangeElementType(buf []byte, pos *int) (Type, error) {
+	code, err := readU8(buf, pos)
+	if err != nil {
+		return Type{}, err
+	}
+	s, ok := scalarForTypeCode(code)
+	if !ok {
+		return Type{}, NewError(DataCorrupted, "invalid range element code")
+	}
+	if _, ok := rangeForElement(s); !ok {
+		return Type{}, NewError(DataCorrupted, "type code is not a valid range element subtype")
 	}
 	return ScalarT(s), nil
 }
@@ -208,6 +239,17 @@ func encodeValue(ty ColType, v Value) []byte {
 		out := []byte{0x00} // present
 		return append(out, encodeArrayBody(*ty.Elem, v.Array)...)
 	}
+	if ty.RangeElem != nil {
+		// A range column (spec/design/ranges.md §4): the shared presence tag then the range body.
+		if v.Kind == ValNull {
+			return []byte{0x01}
+		}
+		if v.Kind != ValRange {
+			panic("BUG: a non-range value in a range column")
+		}
+		out := []byte{0x00} // present
+		return append(out, encodeRangeBody(*ty.RangeElem, v.Range)...)
+	}
 	if !ty.Composite {
 		return encodeScalar(ty.Scalar, v)
 	}
@@ -267,6 +309,40 @@ func encodeArrayBody(elem ColType, a *ArrayVal) []byte {
 	return out
 }
 
+// encodeRangeBody is a range value's body (after the 0x00 present tag, spec/design/ranges.md §4): a
+// single flags u8 then the present bound bodies. The flags bits are EMPTY (0), LB_INF (1), UB_INF (2),
+// LB_INC (3), UB_INC (4); bits 5-7 are reserved 0. An empty range is the lone flags byte 0x01 (no
+// bounds follow). Otherwise a finite lower bound (!LB_INF) then a finite upper bound (!UB_INF) each
+// contribute the element's value-codec body MINUS the presence tag (the same tag-byte+body split
+// array/composite use). The stored value is canonical (§4) — canonicalization happens at parse/cast,
+// not here.
+func encodeRangeBody(elem ColType, rv *RangeVal) []byte {
+	if rv.Empty {
+		return []byte{0x01} // RANGE_EMPTY
+	}
+	var flags byte
+	if rv.Lower == nil {
+		flags |= 0x02 // LB_INF
+	}
+	if rv.Upper == nil {
+		flags |= 0x04 // UB_INF
+	}
+	if rv.LowerInc {
+		flags |= 0x08 // LB_INC
+	}
+	if rv.UpperInc {
+		flags |= 0x10 // UB_INC
+	}
+	out := []byte{flags}
+	if rv.Lower != nil {
+		out = append(out, encodeValue(elem, *rv.Lower)[1:]...) // body only (no presence tag)
+	}
+	if rv.Upper != nil {
+		out = append(out, encodeValue(elem, *rv.Upper)[1:]...)
+	}
+	return out
+}
+
 // encodeCompositeBody is a composite value's body (after the 0x00 present tag,
 // spec/design/composite.md §4): a null bitmap of ceil(field_count/8) bytes (MSB-first — field i is
 // bit 0x80 >> (i%8) of byte i/8; a set bit = NULL) followed by each PRESENT field's value-codec body
@@ -309,8 +385,8 @@ func encodeScalar(ty ScalarType, v Value) []byte {
 		// An array value is encoded by encodeValue's array arm, never here.
 		panic("BUG: an array value reached the scalar codec")
 	case ValRange:
-		// A range value is not storable yet (R2 adds the range codec); it never reaches here.
-		panic("BUG: a range value reached the scalar codec (R2)")
+		// A range value is encoded by encodeValue's range arm, never here.
+		panic("BUG: a range value reached the scalar codec")
 	case ValText, ValBytea:
 		// text (UTF-8) and bytea (raw bytes) share the compact length-prefixed body; both
 		// hold their bytes in Str, so the on-disk form is identical.
@@ -1315,8 +1391,11 @@ func readTree(image []byte, ps int, pageIdx uint32, colTypes []ColType, reached 
 // spills via the same overflow + LZ4 path when a record exceeds RECORD_MAX (spec/design/composite.md
 // §4); a small composite is never actually chosen by the plan.
 func isSpillable(ty ColType) bool {
-	if ty.Composite || ty.Elem != nil {
-		// An array's opaque inline body spills via the same overflow + LZ4 path (array.md §4).
+	if ty.Composite || ty.Elem != nil || ty.RangeElem != nil {
+		// An array's opaque inline body spills via the same overflow + LZ4 path (array.md §4). A
+		// range's body is its flags byte + bound bodies; a numrange over huge decimals could exceed
+		// RECORD_MAX, so it rides the same path (a discrete range is tiny — never actually chosen by
+		// the plan, spec/design/ranges.md §4).
 		return true
 	}
 	return ty.Scalar.IsText() || ty.Scalar.IsBytea() || ty.Scalar.IsDecimal()
@@ -1521,6 +1600,10 @@ func valuePayload(ty ColType, v Value) []byte {
 		// a large array spills through the same overflow + LZ4 path (spec/design/array.md §4).
 		return encodeArrayBody(*ty.Elem, v.Array)
 	}
+	if ty.RangeElem != nil {
+		// A range's payload is its body (the flags byte + present bound bodies, spec/design/ranges.md §4).
+		return encodeRangeBody(*ty.RangeElem, v.Range)
+	}
 	if ty.Composite {
 		// A composite's payload is its body — the encoding minus the leading presence tag, i.e. the
 		// null bitmap + present-field bodies (spec/design/composite.md §4).
@@ -1543,6 +1626,11 @@ func valueFromPayload(ty ColType, payload []byte) (Value, error) {
 		// An array's payload is its body; decode it with a fresh cursor (spec/design/array.md §4).
 		pos := 0
 		return readArrayBody(ty, payload, &pos)
+	}
+	if ty.RangeElem != nil {
+		// A range's payload is its body; decode it with a fresh cursor (spec/design/ranges.md §4).
+		pos := 0
+		return readRangeBody(*ty.RangeElem, payload, &pos)
 	}
 	if ty.Composite {
 		// A composite's payload is its body (bitmap + present-field bodies); decode it with a fresh
@@ -1892,9 +1980,17 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 			continue
 		}
 		if col.Type.Range != nil {
-			// Range columns are not storable yet (R2 adds type_code 17 + the codec); CREATE TABLE
-			// rejects a range column, so a stored column type is never a range.
-			panic("range columns are not storable yet (R2); never serialized")
+			// A range column (v16): type_code 17, flags, then the element type descriptor — one
+			// scalar code (spec/design/ranges.md §3). Ranges carry no default this slice (flags bits
+			// 2/3 = 0), so the entry is type_code ‖ flags ‖ element_code.
+			out = append(out, 17)
+			var flags byte
+			if col.NotNull {
+				flags |= 0b10
+			}
+			out = append(out, flags)
+			out = pushRangeElementType(out, *col.Type.Range)
+			continue
 		}
 		out = append(out, typeCodeForScalar(col.Type.ScalarTy()))
 		// bit0 (primary_key through v4) is RETIRED in v5 — the pk ordinal list below is
@@ -2313,6 +2409,27 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			columns = append(columns, Column{
 				Name:    cname,
 				Type:    ArrayT(elem),
+				NotNull: flags&0b10 != 0,
+			})
+			continue
+		}
+		if tc == 17 {
+			// A range column (v16): flags, then the element type descriptor — one scalar code
+			// (spec/design/ranges.md §3). Ranges carry no default this slice.
+			flags, err := readU8(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			if flags&0b01 != 0 {
+				return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit0 set")
+			}
+			elem, err := readRangeElementType(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+			columns = append(columns, Column{
+				Name:    cname,
+				Type:    RangeT(elem),
 				NotNull: flags&0b10 != 0,
 			})
 			continue
@@ -2872,10 +2989,54 @@ func readInlineBody(ty ColType, buf []byte, pos *int) (Value, error) {
 	if ty.Elem != nil {
 		return readArrayBody(ty, buf, pos)
 	}
+	if ty.RangeElem != nil {
+		return readRangeBody(*ty.RangeElem, buf, pos)
+	}
 	if ty.Composite {
 		return readCompositeBody(ty, buf, pos)
 	}
 	return readInlineScalar(ty.Scalar, buf, pos)
+}
+
+// readRangeBody reads a range value's present body (after the 0x00 tag): inverse of encodeRangeBody
+// (spec/design/ranges.md §4). Reads the flags byte; an EMPTY range stops there. Otherwise the finite
+// lower bound (!LB_INF) then the finite upper bound (!UB_INF) are each read as the element's
+// value-codec body (no presence tag). A reserved flag bit set is XX001.
+func readRangeBody(elem ColType, buf []byte, pos *int) (Value, error) {
+	flags, err := readU8(buf, pos)
+	if err != nil {
+		return Value{}, err
+	}
+	if flags&^0x1f != 0 {
+		return Value{}, NewError(DataCorrupted, "range flags has a reserved bit set")
+	}
+	if flags&0x01 != 0 {
+		return RangeValue(EmptyRangeVal()), nil
+	}
+	lbInf := flags&0x02 != 0
+	ubInf := flags&0x04 != 0
+	var lower, upper *Value
+	if !lbInf {
+		v, err := readInlineBody(elem, buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		lower = &v
+	}
+	if !ubInf {
+		v, err := readInlineBody(elem, buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		upper = &v
+	}
+	return RangeValue(&RangeVal{
+		Empty:    false,
+		Lower:    lower,
+		Upper:    upper,
+		LowerInc: flags&0x08 != 0,
+		UpperInc: flags&0x10 != 0,
+	}), nil
 }
 
 // readArrayBody reads an array value's present body (after the 0x00 tag): inverse of

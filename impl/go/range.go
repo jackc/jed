@@ -49,6 +49,20 @@ func elementScalar(desc RangeDesc) ScalarType {
 	return s
 }
 
+// rangeForElement returns the range descriptor whose element is elem (i32 → the i32range descriptor)
+// and true, or (zero, false) if the scalar has no built-in range type. Used by the storage/codec
+// paths that hold a resolved element ScalarType (a range column's RangeElem) and need the descriptor's
+// discreteness / canonicalization rule.
+func rangeForElement(elem ScalarType) (RangeDesc, bool) {
+	ename := elem.CanonicalName()
+	for _, r := range Ranges {
+		if r.Element == ename {
+			return r, true
+		}
+	}
+	return RangeDesc{}, false
+}
+
 // --- text input ------------------------------------------------------------
 
 // parsedRange is a range literal parsed lexically (before element coercion): the bracket

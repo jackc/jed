@@ -23,7 +23,7 @@ use crate::error::{EngineError, Result, SqlState};
 use crate::executor::key_cmp;
 use crate::interval::Interval;
 use crate::storage::Row;
-use crate::value::{ArrayVal, Unfetched, Value};
+use crate::value::{ArrayVal, RangeVal, Unfetched, Value};
 
 /// The default work-memory budget, in **bytes** (256 MiB) — the [`crate::OpenOptions::work_mem`]
 /// default (spec/design/spill.md §2, api.md §2.1). Matches the buffer-pool default so a RAM-sized
@@ -429,10 +429,38 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             }
             Ok(())
         }
-        // A range value is never spilled this slice: range comparison / ORDER BY / DISTINCT land in
-        // R3 (which adds the spill tag), so a sort/dedup over a range cannot reach the spill codec.
-        Value::Range(_) => {
-            unreachable!("range values are not spilled until R3 (no range ORDER BY)")
+        // Range — tag 18: the flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) then each present
+        // bound value, recursive (spec/design/ranges.md §4). Internal merge-sort scratch format
+        // only, so the recursion needs no element-type context — the bound `Value`s round-trip
+        // themselves. A range column can ride a spilling sort as a carried (non-key) column even
+        // before range ORDER BY lands (R3), so it must spill faithfully now.
+        Value::Range(rv) => {
+            let mut flags = 0u8;
+            if rv.empty {
+                flags |= 0x01;
+            }
+            if rv.lower.is_none() {
+                flags |= 0x02;
+            }
+            if rv.upper.is_none() {
+                flags |= 0x04;
+            }
+            if rv.lower_inc {
+                flags |= 0x08;
+            }
+            if rv.upper_inc {
+                flags |= 0x10;
+            }
+            w.write_all(&[18, flags])?;
+            if !rv.empty {
+                if let Some(lo) = &rv.lower {
+                    write_value(w, lo)?;
+                }
+                if let Some(hi) = &rv.upper {
+                    write_value(w, hi)?;
+                }
+            }
+            Ok(())
         }
         // An untouched large-value reference rides along to the output unread (spill.md §4); spill
         // it opaquely (the pointer/inline block) so it round-trips, never resolving it.
@@ -586,6 +614,32 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
                 lbounds,
                 elements,
             })
+        }
+        18 => {
+            let flags = read_u8(r)?;
+            if flags & 0x01 != 0 {
+                Value::Range(RangeVal::empty())
+            } else {
+                let lb_inf = flags & 0x02 != 0;
+                let ub_inf = flags & 0x04 != 0;
+                let lower = if lb_inf {
+                    None
+                } else {
+                    Some(Box::new(read_value(r)?))
+                };
+                let upper = if ub_inf {
+                    None
+                } else {
+                    Some(Box::new(read_value(r)?))
+                };
+                Value::Range(RangeVal {
+                    empty: false,
+                    lower,
+                    upper,
+                    lower_inc: flags & 0x08 != 0,
+                    upper_inc: flags & 0x10 != 0,
+                })
+            }
         }
         _ => {
             return Err(io::Error::new(

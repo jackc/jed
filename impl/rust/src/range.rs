@@ -38,6 +38,15 @@ pub fn element_scalar(desc: &RangeDesc) -> ScalarType {
     ScalarType::from_name(desc.element).expect("ranges.toml element is a valid scalar id")
 }
 
+/// The range descriptor whose element is `elem` (`i32` → the `i32range` descriptor), or `None` if
+/// the scalar has no built-in range type. Used by the storage/codec paths that hold a resolved
+/// element `ScalarType` (a range column's `ColType::Range(Scalar(elem))`) and need the descriptor's
+/// discreteness / canonicalization rule.
+pub fn range_for_element(elem: ScalarType) -> Option<&'static RangeDesc> {
+    let ename = elem.canonical_name();
+    RANGES.iter().find(|r| r.element == ename)
+}
+
 // --- text input ------------------------------------------------------------
 
 /// A range literal parsed lexically (before element coercion): the bracket inclusivity, the two

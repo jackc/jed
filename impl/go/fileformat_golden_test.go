@@ -166,6 +166,22 @@ func arrayTableDB(t *testing.T) *Database {
 	return db
 }
 
+// rangeTableDB is CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range) with rows exercising
+// every range flags bit + the canonical-[) storage (spec/design/ranges.md §4): a finite [), an
+// inclusive-upper literal that canonicalizes ([1,5] → [1,6)), the EMPTY range, infinite bounds
+// (lower-only, both), a NULL range, an exclusive-lower literal with infinite upper ((5,) → [6,)), and
+// a singleton ([1,1] → [1,2)). Pins range_table.jed cross-core.
+func rangeTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)")
+	run(t, db, "INSERT INTO t VALUES (1, '[1,5)', '[10,20)')")
+	run(t, db, "INSERT INTO t VALUES (2, '[1,5]', NULL)")
+	run(t, db, "INSERT INTO t VALUES (3, 'empty', '(,100)')")
+	run(t, db, "INSERT INTO t VALUES (4, '(,)', '(5,)')")
+	run(t, db, "INSERT INTO t VALUES (5, NULL, '[1,1]')")
+	return db
+}
+
 // ginArrayTableDB has a GIN inverted index (v13 — the per-index index_kind byte, spec/design/gin.md):
 // i_nums_gin over an i32[] column (kind 1) beside an ordinary ordered index i_n over a scalar
 // column (kind 0 — a btree index cannot sit on the array column). Rows exercise term dedup (row 2's
@@ -633,6 +649,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"nested_composite_table.jed", nestedCompositeTableDB},
 		{"array_table.jed", arrayTableDB},
+		{"range_table.jed", rangeTableDB},
 		{"array_composite_table.jed", arrayCompositeTableDB},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB},
 		{"sequence_table.jed", sequenceTableDB},
@@ -688,6 +705,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},
 		{"array_table.jed", arrayTableDB, "t"},
+		{"range_table.jed", rangeTableDB, "t"},
 		{"array_composite_table.jed", arrayCompositeTableDB, "t"},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB, "t"},
 		{"sequence_table.jed", sequenceTableDB, "t"},

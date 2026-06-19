@@ -1464,14 +1464,18 @@ impl Database {
                         }
                     }
                 }
-            } else if crate::range::range_by_name(&def.type_name).is_some() {
-                // A range column is not storable yet (spec/design/ranges.md §8 — storage lands in
-                // R2). The range type name IS known, so this is 0A000 "not supported", not the 42704
-                // "type does not exist" the fall-through below would give.
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    format!("a {} column is not supported yet", def.type_name),
-                ));
+            } else if let Some(rdesc) = crate::range::range_by_name(&def.type_name) {
+                // A range column (spec/design/ranges.md §3): structural like array, the element
+                // carried inline. A range takes no typmod (`numrange(10,2)` is not a thing — the
+                // element is the unconstrained subtype), so a type modifier is rejected.
+                if def.type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a type modifier on a range type is not supported".to_string(),
+                    ));
+                }
+                let elem = crate::range::element_scalar(rdesc);
+                (Type::Range(Box::new(Type::Scalar(elem))), None)
             } else if ScalarType::from_name(&def.type_name).is_some() {
                 let (s, d) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
                 (Type::Scalar(s), d)
@@ -1623,13 +1627,13 @@ impl Database {
                     }
                 });
                 (None, Some(DefaultExpr { expr_text, expr }), identity_kind)
-            } else if ty.is_composite() || ty.is_array() {
-                // A DEFAULT on a composite- or array-typed column is not supported this slice
-                // (composite.md §12 / array.md §12).
+            } else if ty.is_composite() || ty.is_array() || ty.is_range() {
+                // A DEFAULT on a composite-, array-, or range-typed column is not supported this
+                // slice (composite.md §12 / array.md §12 / ranges.md §8).
                 if def.default.is_some() {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
-                        "a DEFAULT on a composite- or array-typed column is not supported yet"
+                        "a DEFAULT on a composite-, array-, or range-typed column is not supported yet"
                             .to_string(),
                     ));
                 }
@@ -2582,6 +2586,17 @@ impl Database {
                 } else if ScalarType::from_name(&f.type_name).is_some() {
                     let (s, d) = resolve_type_and_typmod(&f.type_name, &f.type_mod)?;
                     (Type::Scalar(s), d)
+                } else if crate::range::range_by_name(&f.type_name).is_some() {
+                    // A range-typed composite field (a `range` inside `CREATE TYPE`) is deferred
+                    // this slice (only range *columns* are storable — spec/design/ranges.md §3); the
+                    // type name IS known, so this is 0A000, not the 42704 below.
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "a range-typed composite field ({}) is not supported yet",
+                            f.type_name
+                        ),
+                    ));
                 } else if self.read_snap().composite_type(&f.type_name).is_some() {
                     if f.type_mod.is_some() {
                         return Err(EngineError::new(
@@ -3201,11 +3216,17 @@ impl Database {
                                     ),
                                 ));
                             }
-                            // Range columns are not storable yet (R2); CREATE TABLE rejects them, so
-                            // a `col.ty` is never a range here.
-                            Type::Range(_) => unreachable!(
-                                "range columns are not storable yet (R2); col.ty is never a range"
-                            ),
+                            // INSERT ... SELECT into a range column is deferred (the VALUES + range
+                            // literal/cast path is the supported input — spec/design/ranges.md §1).
+                            Type::Range(_) => {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    format!(
+                                        "INSERT ... SELECT into range column {} is not supported yet",
+                                        col.name
+                                    ),
+                                ));
+                            }
                         }
                     }
                 }
@@ -15545,6 +15566,52 @@ fn coerce_for_store(
         ColType::Scalar(s) => store_value(v, *s, typmod, not_null, col_name),
         ColType::Composite { name, fields } => store_composite(v, name, fields, not_null, col_name),
         ColType::Array(elem) => store_array(v, elem, not_null, col_name),
+        ColType::Range(elem) => store_range(v, elem, not_null, col_name),
+    }
+}
+
+/// Coerce a value into a **range** column (spec/design/ranges.md §4): NULL honours NOT NULL
+/// (23502); a `Value::Range` is already canonical + element-typed by the resolver (the literal/cast
+/// path canonicalized it), so each present bound is re-coerced to the element type as a belt-and-
+/// suspenders identity (an unconstrained scalar coercion — no typmod, NULL-tolerant) and the value
+/// passes through; any other value is a 42804.
+fn store_range(v: Value, elem: &ColType, not_null: bool, col_name: &str) -> Result<Value> {
+    match v {
+        Value::Null => {
+            if not_null {
+                return Err(EngineError::new(
+                    SqlState::NotNullViolation,
+                    format!("null value in column {col_name} violates not-null constraint"),
+                ));
+            }
+            Ok(Value::Null)
+        }
+        Value::Range(rv) => {
+            if rv.empty {
+                return Ok(Value::Range(rv));
+            }
+            // Coerce each finite bound to the element type (identity for an already-typed bound;
+            // an infinite bound is None and skipped). Bounds are never NULL here — a None bound is
+            // infinite, not NULL — so the element store is never NOT NULL.
+            let coerce = |b: Option<Box<Value>>| -> Result<Option<Box<Value>>> {
+                match b {
+                    None => Ok(None),
+                    Some(val) => Ok(Some(Box::new(coerce_for_store(
+                        *val, elem, None, false, col_name,
+                    )?))),
+                }
+            };
+            Ok(Value::Range(RangeVal {
+                empty: false,
+                lower: coerce(rv.lower)?,
+                upper: coerce(rv.upper)?,
+                lower_inc: rv.lower_inc,
+                upper_inc: rv.upper_inc,
+            }))
+        }
+        _ => Err(type_error(format!(
+            "cannot store a non-range value in range column {col_name}"
+        ))),
     }
 }
 
@@ -15747,6 +15814,37 @@ fn materialize_insert_value(iv: &InsertValue, ty: &ColType, bound: &[Value]) -> 
                 "DEFAULT is not allowed inside ARRAY[...]",
             )),
         },
+        ColType::Range(elem) => {
+            // A range column's element is always a scalar; the descriptor (for canonicalization)
+            // is re-derived from it (spec/design/ranges.md §3/§4).
+            let ColType::Scalar(es) = elem.as_ref() else {
+                unreachable!("a range element is always a scalar (ranges.md §2)")
+            };
+            let desc = crate::range::range_for_element(*es)
+                .expect("a range column's element always has a range type");
+            match iv {
+                // A bare string literal adapts to the range context via `range_in` (the same
+                // string-adapts-to-context rule array/bytea/uuid use — spec/design/ranges.md §5).
+                InsertValue::Lit(Literal::Text(s)) => {
+                    Ok(Value::Range(coerce_string_to_range(s, desc)?))
+                }
+                InsertValue::Lit(Literal::Null) => Ok(Value::Null),
+                InsertValue::Param(nn) => Ok(bound[(*nn as usize) - 1].clone()),
+                InsertValue::Lit(_) => Err(type_error(
+                    "cannot assign a scalar value to a range column".to_string(),
+                )),
+                InsertValue::Array(_) => Err(type_error(
+                    "cannot assign an array value to a range column".to_string(),
+                )),
+                InsertValue::Row(_) => Err(type_error(
+                    "cannot assign a record value to a range column".to_string(),
+                )),
+                InsertValue::Default => Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    "DEFAULT is not allowed inside ROW(...)",
+                )),
+            }
+        }
     }
 }
 
@@ -15795,6 +15893,11 @@ fn coerce_array_element_text(tok: &str, elem: &ColType) -> Result<Value> {
         }
         ColType::Composite { name, fields } => coerce_record_text(tok, name, fields),
         ColType::Array(inner) => coerce_string_to_array(tok, inner),
+        // A range element token is unreachable: array-of-range is not a storable jed type (R2),
+        // so an array element ColType is never a range.
+        ColType::Range(_) => {
+            unreachable!("array-of-range is not a storable type (ranges.md §2)")
+        }
     }
 }
 
@@ -15831,6 +15934,10 @@ fn coerce_record_text(
                     fields: f2,
                 } => coerce_record_text(&s, n2, f2)?,
                 ColType::Array(inner) => coerce_string_to_array(&s, inner)?,
+                // A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
+                ColType::Range(_) => {
+                    unreachable!("a composite range field is rejected at CREATE TYPE (R2)")
+                }
             }),
         }
     }

@@ -11,7 +11,7 @@
 
 import { Decimal } from "./decimal.ts";
 import type { Row } from "./storage.ts";
-import { type Value, float32Value, float64Value } from "./value.ts";
+import { type Value, emptyRangeValue, float32Value, float64Value, rangeValue } from "./value.ts";
 
 // SpillSink is the host backing for spilled runs — the Node `fs` implementation is FileSpillSink
 // (spillfile.ts), injected on the Database handle by a durable host that can spill to disk. null for an
@@ -437,10 +437,26 @@ function writeValue(w: ByteWriter, v: Value): void {
       }
       for (const el of v.elements) writeValue(w, el);
       break;
-    case "range":
-      // A range value is never spilled this slice: range comparison / ORDER BY / DISTINCT land in
-      // R3 (which adds the spill tag), so a sort/dedup over a range cannot reach the spill codec.
-      throw new Error("range values are not spilled until R3 (no range ORDER BY)");
+    case "range": {
+      // Range — tag 18: the flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) then each present bound
+      // value, recursive (spec/design/ranges.md §4). Internal merge-sort scratch format only, so the
+      // recursion needs no element-type context — the bound values round-trip themselves. A range
+      // column can ride a spilling sort as a carried (non-key) column even before range ORDER BY
+      // lands (R3), so it must spill faithfully now.
+      let flags = 0;
+      if (v.empty) flags |= 0x01;
+      if (v.lower === null) flags |= 0x02;
+      if (v.upper === null) flags |= 0x04;
+      if (v.lowerInc) flags |= 0x08;
+      if (v.upperInc) flags |= 0x10;
+      w.u8(18);
+      w.u8(flags);
+      if (!v.empty) {
+        if (v.lower !== null) writeValue(w, v.lower);
+        if (v.upper !== null) writeValue(w, v.upper);
+      }
+      break;
+    }
     case "unfetched":
       // An untouched large-value reference rides along to the output unread (spill.md §4); spill it
       // opaquely so it round-trips, never resolving it.
@@ -555,6 +571,15 @@ function readValue(r: SpillByteReader): Value {
       const elements: Value[] = new Array(n);
       for (let i = 0; i < n; i++) elements[i] = readValue(r);
       return { kind: "array", dims, lbounds, elements };
+    }
+    case 18: {
+      const flags = r.byte();
+      if ((flags & 0x01) !== 0) return emptyRangeValue();
+      const lbInf = (flags & 0x02) !== 0;
+      const ubInf = (flags & 0x04) !== 0;
+      const lower = lbInf ? null : readValue(r);
+      const upper = ubInf ? null : readValue(r);
+      return rangeValue(lower, upper, (flags & 0x08) !== 0, (flags & 0x10) !== 0);
     }
     default:
       throw new Error("bad spill value tag");

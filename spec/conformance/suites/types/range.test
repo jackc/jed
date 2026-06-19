@@ -1,0 +1,147 @@
+# Range values (spec/design/ranges.md): the six built-in PostgreSQL range types as a structural type
+# over a scalar element. This slice (R0–R2): the '[1,5)' text literal coerced by a named type
+# ('[1,5)'::int4range / a bare string adapting to a range column), inclusive/exclusive + unbounded
+# endpoints + the distinguished empty value, the compact value codec (type_code 17, format_version
+# 16), range_out rendering ([lo,hi) with PG bound quoting), canonicalization of discrete subtypes
+# (i32/i64/date stored canonical [); continuous subtypes kept verbatim), empty normalization, and the
+# whole-value IS NULL rule. Comparison/ordering (range_cmp) and the constructor/operator surface land
+# in follow-ons (R3, RF1–RF4); a range PRIMARY KEY / DEFAULT is 0A000 (a per-core test — PG allows
+# them). The names int4range/int8range are jed aliases of i32range/i64range, used here so the SQL is
+# oracle-clean (the canonical i32range/i64range spelling is a per-core divergence test). range_out
+# matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.is_null, types.range, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, r int4range, br int8range)
+
+# A bare string literal adapts to the range column (range_in); a finite [) is stored verbatim.
+statement ok
+INSERT INTO t VALUES (1, '[1,5)', '[10,20)')
+
+# A discrete range canonicalizes to [): an inclusive upper '[1,5]' becomes [1,6); a NULL range stores
+# the lone NULL (distinct from the empty range).
+statement ok
+INSERT INTO t VALUES (2, '[1,5]', NULL)
+
+# 'empty' is the distinguished empty value; an infinite-lower (,100) keeps the open lower bound.
+statement ok
+INSERT INTO t VALUES (3, 'empty', '(,100)')
+
+# Both-infinite (,) ; an exclusive-lower '(5,)' canonicalizes to [6,) (the +1 step with an open upper).
+statement ok
+INSERT INTO t VALUES (4, '(,)', '(5,)')
+
+# A NULL range; a singleton '[1,1]' canonicalizes to [1,2).
+statement ok
+INSERT INTO t VALUES (5, NULL, '[1,1]')
+
+# range_out renders [lo,hi): empty for the empty range, an omitted bound for an infinite side, a NULL
+# range as NULL. Ordering is by id (range comparison lands in R3).
+query ITT nosort
+SELECT id, r, br FROM t ORDER BY id
+----
+1
+[1,5)
+[10,20)
+2
+[1,6)
+NULL
+3
+empty
+(,100)
+4
+(,)
+[6,)
+5
+NULL
+[1,2)
+
+# Whole-value IS NULL: only a SQL-NULL range is NULL — the empty range and (,) are NOT NULL.
+query I nosort
+SELECT id FROM t WHERE r IS NULL ORDER BY id
+----
+5
+
+query I nosort
+SELECT id FROM t WHERE r IS NOT NULL ORDER BY id
+----
+1
+2
+3
+4
+
+# --- the literal cast / typed-literal forms (oracle-pinned renders) ---
+
+# Discrete canonicalization: an exclusive lower steps up, an inclusive upper steps up.
+query T nosort
+SELECT '(1,5)'::int4range
+----
+[2,5)
+
+# A one-point discrete range that is not both-inclusive normalizes to empty.
+query T nosort
+SELECT '[5,5)'::int4range
+----
+empty
+
+# A both-inclusive singleton is kept (then canonicalized [5,6)).
+query T nosort
+SELECT '[5,5]'::int4range
+----
+[5,6)
+
+# int8range over i64.
+query T nosort
+SELECT '[100,200)'::int8range
+----
+[100,200)
+
+# numrange is continuous — bounds + inclusivity kept verbatim (no canonicalization).
+query T nosort
+SELECT '[1.5,2.5]'::numrange
+----
+[1.5,2.5]
+
+query T nosort
+SELECT 'empty'::numrange
+----
+empty
+
+# daterange is discrete — an inclusive upper steps up one day.
+query T nosort
+SELECT '[2024-01-01,2024-02-01]'::daterange
+----
+[2024-01-01,2024-02-02)
+
+# A daterange bound has no special char, so it renders bare (no quoting).
+query T nosort
+SELECT '[2024-01-01,)'::daterange
+----
+[2024-01-01,)
+
+# A tsrange bound contains a space, so range_out double-quotes both bounds (the §5 quoting path).
+query T nosort
+SELECT '["2020-01-01 09:00","2020-02-01 12:30")'::tsrange
+----
+["2020-01-01 09:00:00","2020-02-01 12:30:00")
+
+# --- error conditions (oracle-pinned) ---
+
+# A range whose lower bound exceeds its upper bound is 22000.
+statement error 22000
+SELECT '[5,1)'::int4range
+
+# A malformed range literal (missing comma / extra field) is 22P02.
+statement error 22P02
+SELECT '[1,2,3)'::int4range
+
+statement error 22P02
+SELECT 'not a range'::int4range
+
+# Canonicalizing a discrete upper past the element domain overflows (22003).
+statement error 22003
+SELECT '[1,2147483647]'::int4range
+
+# There is no range type over text — textrange is an undefined type (42704).
+statement error 42704
+CREATE TABLE bad (id i32 PRIMARY KEY, r textrange)

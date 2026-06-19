@@ -408,9 +408,38 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 			spillWriteValue(w, el)
 		}
 	case ValRange:
-		// A range value is never spilled this slice: range comparison / ORDER BY / DISTINCT land in
-		// R3 (which adds the spill tag), so a sort/dedup over a range cannot reach the spill codec.
-		panic("BUG: range values are not spilled until R3 (no range ORDER BY)")
+		// Range — tag 18: the flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) then each present bound
+		// value, recursive (spec/design/ranges.md §4). Internal merge-sort scratch format only, so the
+		// recursion needs no element-type context — the bound Values round-trip themselves. A range
+		// column can ride a spilling sort as a carried (non-key) column even before range ORDER BY
+		// lands (R3), so it must spill faithfully now.
+		rv := v.Range
+		var flags byte
+		if rv.Empty {
+			flags |= 0x01
+		}
+		if rv.Lower == nil {
+			flags |= 0x02
+		}
+		if rv.Upper == nil {
+			flags |= 0x04
+		}
+		if rv.LowerInc {
+			flags |= 0x08
+		}
+		if rv.UpperInc {
+			flags |= 0x10
+		}
+		_ = w.WriteByte(18)
+		_ = w.WriteByte(flags)
+		if !rv.Empty {
+			if rv.Lower != nil {
+				spillWriteValue(w, *rv.Lower)
+			}
+			if rv.Upper != nil {
+				spillWriteValue(w, *rv.Upper)
+			}
+		}
 	case ValUnfetched:
 		// An untouched large-value reference rides along to the output unread (spill.md §4); spill
 		// it opaquely so it round-trips, never resolving it.
@@ -611,6 +640,38 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			elems[i] = el
 		}
 		return ArrayValueOf(&ArrayVal{Dims: dims, Lbounds: lbounds, Elements: elems}), nil
+	case 18:
+		flags, err := spillReadU8(r)
+		if err != nil {
+			return Value{}, err
+		}
+		if flags&0x01 != 0 {
+			return RangeValue(EmptyRangeVal()), nil
+		}
+		lbInf := flags&0x02 != 0
+		ubInf := flags&0x04 != 0
+		var lower, upper *Value
+		if !lbInf {
+			lo, err := spillReadValue(r)
+			if err != nil {
+				return Value{}, err
+			}
+			lower = &lo
+		}
+		if !ubInf {
+			hi, err := spillReadValue(r)
+			if err != nil {
+				return Value{}, err
+			}
+			upper = &hi
+		}
+		return RangeValue(&RangeVal{
+			Empty:    false,
+			Lower:    lower,
+			Upper:    upper,
+			LowerInc: flags&0x08 != 0,
+			UpperInc: flags&0x10 != 0,
+		}), nil
 	default:
 		return Value{}, io.ErrUnexpectedEOF
 	}

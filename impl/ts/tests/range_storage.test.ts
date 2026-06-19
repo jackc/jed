@@ -1,0 +1,87 @@
+// Range storage (spec/design/ranges.md, R2) — the divergences + introspection the oracle corpus
+// cannot express (CLAUDE.md §10): the deliberate `0A000` narrowings PostgreSQL does NOT share (a
+// range PRIMARY KEY / DEFAULT / index — PG allows them via its btree/GiST opclasses), the
+// jed-canonical `i32range` spelling (PG reports `int4range`), INSERT…SELECT deferral, and the
+// whole-image store/load round-trip of a range column (the byte layout is pinned cross-core by
+// range_table.jed; this is the behavioral check). The agreeing behavior — render, canonicalization,
+// `IS NULL`, 22000/22P02/22003/42704 — lives in types/range.test (oracle-clean), not here.
+// Mirrors impl/rust/tests/range_storage.rs and impl/go/range_storage_test.go.
+
+import assert from "node:assert/strict";
+import { test } from "node:test";
+import { Database, execute, loadDatabase, toImage } from "../src/lib.ts";
+import { dbWith, errCode, query } from "./util.ts";
+
+// A range column survives a whole-image serialize + reload (toImage → loadDatabase), exercising
+// encodeRangeBody / readRangeBody (the empty range, infinite bounds, a NULL range, the canonical
+// `[)` storage). The on-disk byte layout is pinned cross-core by range_table.jed; this is the
+// behavioral round-trip.
+test("range image roundtrip", () => {
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)",
+    "INSERT INTO t VALUES (1, '[1,5)', '[10,20)')",
+    "INSERT INTO t VALUES (2, '[1,5]', NULL)", // canonical [1,6)
+    "INSERT INTO t VALUES (3, 'empty', '(,100)')",
+    "INSERT INTO t VALUES (4, '(,)', '(5,)')", // canonical [6,)
+    "INSERT INTO t VALUES (5, NULL, '[1,1]')", // canonical [1,2)
+  ]);
+  const loaded = loadDatabase(toImage(db, 4096, 1n));
+  assert.deepEqual(query(loaded, "SELECT id, r, br FROM t ORDER BY id"), [
+    ["1", "[1,5)", "[10,20)"],
+    ["2", "[1,6)", "NULL"],
+    ["3", "empty", "(,100)"],
+    ["4", "(,)", "[6,)"],
+    ["5", "NULL", "[1,2)"],
+  ]);
+});
+
+// The jed-canonical name is `i32range` (PG reports `int4range`), and `int4range`/`int8range` are
+// accepted as aliases (the i/f-prefix rename — CLAUDE.md §4). The PG alias declares a column whose
+// stored value renders identically to the canonical spelling, and the canonical name (not the PG
+// `int4range`) appears in a jed message.
+test("range canonical name and aliases", () => {
+  // The PG alias is accepted on the column; the value renders the same as the canonical spelling.
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, r int4range)",
+    "INSERT INTO t VALUES (1, '[1,5)')",
+  ]);
+  assert.deepEqual(query(db, "SELECT r FROM t"), [["[1,5)"]]);
+  // The canonical name appears in the 0A000 PK-narrowing message, even though the column was
+  // declared with the PG alias int4range.
+  const db2 = new Database();
+  let msg = "";
+  try {
+    execute(db2, "CREATE TABLE u (r int4range PRIMARY KEY)");
+    assert.fail("a range primary key should be rejected");
+  } catch (e) {
+    msg = e instanceof Error ? e.message : String(e);
+  }
+  assert.ok(msg.includes("i32range"), `message names i32range: ${msg}`);
+});
+
+// The staged `0A000` narrowings PostgreSQL does NOT share: a range PRIMARY KEY, a range DEFAULT, a
+// range index, and INSERT…SELECT into a range column (PG accepts a range key via its default btree
+// opclass and a range DEFAULT outright — spec/design/ranges.md §8). These are jed-stricter, so they
+// cannot live in the oracle-clean corpus.
+test("range narrowings are 0A000", () => {
+  const db = dbWith([]);
+  assert.equal(errCode(() => execute(db, "CREATE TABLE a (r i32range PRIMARY KEY)")), "0A000");
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE b (id i32 PRIMARY KEY, r i32range DEFAULT '[1,5)')")),
+    "0A000",
+  );
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
+  // A range index needs a GiST opclass jed does not ship (§8/§10).
+  assert.equal(errCode(() => execute(db, "CREATE INDEX ri ON t (r)")), "0A000");
+  // INSERT … SELECT into a range column is deferred (the VALUES + literal path is the input).
+  execute(db, "CREATE TABLE src (id i32 PRIMARY KEY, r i32range)");
+  execute(db, "INSERT INTO src VALUES (1, '[1,5)')");
+  assert.equal(errCode(() => execute(db, "INSERT INTO t SELECT id, r FROM src")), "0A000");
+});
+
+// A range-typed composite field is deferred (`0A000`) — only range *columns* are storable this
+// slice. The type name IS known, so it is `0A000`, not the `42704` an unknown type would give.
+test("composite range field is 0A000", () => {
+  const db = new Database();
+  assert.equal(errCode(() => execute(db, "CREATE TYPE rec AS (lo i32, span i32range)")), "0A000");
+});

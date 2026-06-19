@@ -148,6 +148,24 @@ function arrayTableDB(): Database {
   return db;
 }
 
+// rangeTableDB has RANGE columns (v15 — spec/design/ranges.md): pins the catalog range-column entry
+// (type_code 17 + the one-byte element descriptor, §3) and the compact value body (the flags byte +
+// present bound bodies, §4). Two discrete range columns — an i32range and an i64range — over rows
+// exercising every flags bit and the canonical-`[)` storage: a finite `[)`, an inclusive-upper
+// literal that canonicalizes (`[1,5]` → `[1,6)`), the EMPTY range, infinite bounds (lower-only,
+// both), a NULL range, an exclusive-lower literal with infinite upper (`(5,)` → `[6,)`), and a
+// singleton (`[1,1]` → `[1,2)`). Must match the Ruby reference's RANGE_TABLE (spec/fileformat/verify.rb).
+function rangeTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)");
+  run(db, "INSERT INTO t VALUES (1, '[1,5)', '[10,20)')");
+  run(db, "INSERT INTO t VALUES (2, '[1,5]', NULL)");
+  run(db, "INSERT INTO t VALUES (3, 'empty', '(,100)')");
+  run(db, "INSERT INTO t VALUES (4, '(,)', '(5,)')");
+  run(db, "INSERT INTO t VALUES (5, NULL, '[1,1]')");
+  return db;
+}
+
 // ginArrayTableDB has a GIN inverted index (v13 — the per-index index_kind byte, spec/design/gin.md):
 // i_nums_gin over an i32[] column (kind 1) beside an ordinary ordered index i_n over a scalar
 // column (kind 0 — a btree index cannot sit on the array column). Rows exercise term dedup (row 2's
@@ -596,6 +614,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "serial_table.jed", build: serialTableDB },
     { name: "identity_table.jed", build: identityTableDB },
     { name: "array_table.jed", build: arrayTableDB },
+    { name: "range_table.jed", build: rangeTableDB },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
@@ -646,6 +665,7 @@ test("read goldens reproduces rows", () => {
     { name: "serial_table.jed", build: serialTableDB, table: "t" },
     { name: "identity_table.jed", build: identityTableDB, table: "t" },
     { name: "array_table.jed", build: arrayTableDB, table: "t" },
+    { name: "range_table.jed", build: rangeTableDB, table: "t" },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB, table: "t" },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },

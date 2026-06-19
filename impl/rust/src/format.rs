@@ -30,23 +30,26 @@ use crate::paging::SharedPaging;
 use crate::pmap::{Child, Node};
 use crate::storage::{Row, TableStore};
 use crate::types::{DecimalTypmod, ScalarType, Type};
-use crate::value::{ArrayVal, Unfetched, Value};
+use crate::value::{ArrayVal, RangeVal, Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 15 = IDENTITY columns (the column-entry flags byte gains bit4
-/// `is_identity` + bit5 `identity_always`; an identity column desugars like `serial` plus those two
-/// bits, spec/design/sequences.md §13). v14 = the `serial` owned-sequence link (the sequence-entry
-/// flags byte gains a `has_owner` bit + a trailing owner table-name/column-ordinal,
-/// spec/design/sequences.md §12). v13 = GIN indexes (a per-index `index_kind` byte after `index_flags`, spec/design/gin.md
-/// §7). v12 = sequences (a kind-tagged sequence catalog section) + the `date` scalar. v11 = FOREIGN
-/// KEY constraints (a per-table catalog foreign-key list after the index list,
-/// spec/design/constraints.md §6). v10 = array (`T[]`) columns (type_code 15 + an element-type
-/// descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4); v9 =
-/// composite (row) types (kind-tagged catalog entries); v8 = a per-column expression-default flag;
-/// v7 added a per-page CRC-32 (header grew 12→16 bytes). Each bump is atomic across the Rust/Go/TS
-/// cores + the Ruby golden reference (every `.jed` golden's version byte + CRC changed together).
-const FORMAT_VERSION: u16 = 15;
+/// On-disk format version — 16 = range columns (type_code 17 + an inline element-type descriptor in
+/// the catalog, spec/design/ranges.md §3, and the compact range value body — a flags byte
+/// EMPTY/LB_INF/UB_INF/LB_INC/UB_INC followed by the present bound bodies, §4). v15 = IDENTITY columns
+/// (the column-entry flags byte gains bit4 `is_identity` + bit5 `identity_always`; an identity column
+/// desugars like `serial` plus those two bits, spec/design/sequences.md §13). v14 = the `serial`
+/// owned-sequence link (the sequence-entry flags byte gains a `has_owner` bit + a trailing owner
+/// table-name/column-ordinal, spec/design/sequences.md §12). v13 = GIN indexes (a per-index
+/// `index_kind` byte after `index_flags`, spec/design/gin.md §7). v12 = sequences (a kind-tagged
+/// sequence catalog section) + the `date` scalar. v11 = FOREIGN KEY constraints (a per-table catalog
+/// foreign-key list after the index list, spec/design/constraints.md §6). v10 = array (`T[]`) columns
+/// (type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact
+/// array value body, §4); v9 = composite (row) types (kind-tagged catalog entries); v8 = a per-column
+/// expression-default flag; v7 added a per-page CRC-32 (header grew 12→16 bytes). Each bump is atomic
+/// across the Rust/Go/TS cores + the Ruby golden reference (every `.jed` golden's version byte + CRC
+/// changed together).
+const FORMAT_VERSION: u16 = 16;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -159,6 +162,30 @@ fn read_array_element_type(buf: &[u8], pos: &mut usize) -> Result<Type> {
     }
 }
 
+/// Append a range column's **element type descriptor** (spec/design/ranges.md §3): a single `u8`
+/// scalar type code. A range element is always one of the six scalar subtypes (`i32`/`i64`/
+/// `decimal`/`timestamp`/`timestamptz`/`date`) — never composite, array, or nested range — and
+/// `numrange`'s element is the *unconstrained* `decimal`, so no typmod is stored (the type name
+/// fully determines the element). The element descriptor is self-describing: it identifies which of
+/// the six ranges the column is.
+fn push_range_element_type(out: &mut Vec<u8>, elem: &Type) {
+    match elem {
+        Type::Scalar(s) => out.push(type_code_for_scalar(*s)),
+        _ => unreachable!("a range element is always a scalar subtype (ranges.md §2)"),
+    }
+}
+
+/// Decode a range column's element type descriptor (inverse of [`push_range_element_type`]): one
+/// scalar code, validated to be one of the six range element subtypes (else `XX001`).
+fn read_range_element_type(buf: &[u8], pos: &mut usize) -> Result<Type> {
+    let code = read_u8(buf, pos)?;
+    let s = scalar_for_type_code(code).ok_or_else(|| corrupt("invalid range element code"))?;
+    if crate::range::range_for_element(s).is_none() {
+        return Err(corrupt("type code is not a valid range element subtype"));
+    }
+    Ok(Type::Scalar(s))
+}
+
 /// Inverse of `type_code_for_scalar`; None for an unknown code.
 fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
     match code {
@@ -244,7 +271,50 @@ fn encode_value(ty: &ColType, v: &Value) -> Vec<u8> {
             }
             _ => panic!("BUG: a non-array value in an array column"),
         },
+        ColType::Range(elem) => match v {
+            Value::Null => vec![0x01],
+            Value::Range(rv) => {
+                let mut out = vec![0x00]; // present
+                out.extend_from_slice(&encode_range_body(elem, rv));
+                out
+            }
+            _ => panic!("BUG: a non-range value in a range column"),
+        },
     }
+}
+
+/// A range value's **body** (after the `0x00` present tag, spec/design/ranges.md §4): a single
+/// `flags u8` then the present bound bodies. The flags bits are `EMPTY` (0), `LB_INF` (1),
+/// `UB_INF` (2), `LB_INC` (3), `UB_INC` (4); bits 5–7 are reserved 0. An empty range is the lone
+/// flags byte `0x01` (no bounds follow). Otherwise a finite lower bound (`!LB_INF`) then a finite
+/// upper bound (`!UB_INF`) each contribute the element's value-codec body **minus the presence
+/// tag** (the same tag-byte+body split array/composite use). The stored value is canonical (§4) —
+/// canonicalization happens at parse/cast, not here.
+fn encode_range_body(elem: &ColType, rv: &RangeVal) -> Vec<u8> {
+    if rv.empty {
+        return vec![0x01]; // RANGE_EMPTY
+    }
+    let mut flags = 0u8;
+    if rv.lower.is_none() {
+        flags |= 0x02; // LB_INF
+    }
+    if rv.upper.is_none() {
+        flags |= 0x04; // UB_INF
+    }
+    if rv.lower_inc {
+        flags |= 0x08; // LB_INC
+    }
+    if rv.upper_inc {
+        flags |= 0x10; // UB_INC
+    }
+    let mut out = vec![flags];
+    if let Some(lo) = &rv.lower {
+        out.extend_from_slice(&encode_value(elem, lo)[1..]); // body only (no presence tag)
+    }
+    if let Some(hi) = &rv.upper {
+        out.extend_from_slice(&encode_value(elem, hi)[1..]);
+    }
+    out
 }
 
 /// An array value's **body** (after the `0x00` present tag, spec/design/array.md §4):
@@ -422,6 +492,10 @@ fn is_spillable(ty: &ColType) -> bool {
         // An array's opaque inline body spills via the same overflow + LZ4 path
         // (spec/design/array.md §4); a small array is never actually chosen by the plan.
         ColType::Array(_) => true,
+        // A range's body is its flags byte + bound bodies; a `numrange` over huge decimals could
+        // exceed RECORD_MAX, so it rides the same overflow + LZ4 path. A discrete range (tiny,
+        // fixed-width bounds) is never actually chosen by the plan (spec/design/ranges.md §4).
+        ColType::Range(_) => true,
     }
 }
 
@@ -669,6 +743,8 @@ fn value_payload(ty: &ColType, v: &Value) -> Vec<u8> {
         // An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies);
         // a large array spills through the same overflow + LZ4 path (spec/design/array.md §4).
         (ColType::Array(elem), Value::Array(arr)) => encode_array_body(elem, arr),
+        // A range's payload is its body (the flags byte + present bound bodies, spec/design/ranges.md §4).
+        (ColType::Range(elem), Value::Range(rv)) => encode_range_body(elem, rv),
         _ => unreachable!("only spillable values are externalized"),
     }
 }
@@ -697,6 +773,11 @@ fn value_from_payload(ty: &ColType, payload: &[u8]) -> Result<Value> {
         ColType::Array(elem) => {
             let mut pos = 0usize;
             read_array_body(elem, payload, &mut pos)
+        }
+        // A range's payload is its body; decode it with a fresh cursor (spec/design/ranges.md §4).
+        ColType::Range(elem) => {
+            let mut pos = 0usize;
+            read_range_body(elem, payload, &mut pos)
         }
         _ => Err(corrupt("a non-spillable type was stored external")),
     }
@@ -1696,10 +1777,14 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
                 out.push(flags);
                 push_array_element_type(&mut out, elem);
             }
-            // Range columns are not storable yet (R2 adds type_code 17 + the codec); CREATE TABLE
-            // rejects a range column, so a stored column type is never a range.
-            Type::Range(_) => {
-                unreachable!("range columns are not storable yet (R2); never serialized")
+            Type::Range(elem) => {
+                // A range column (v16): type_code 17, flags, then the element type descriptor — one
+                // scalar code (spec/design/ranges.md §3). Ranges carry no default this slice (flags
+                // bits 2/3 = 0), so the entry is type_code ‖ flags ‖ element_code.
+                out.push(17);
+                let flags = if col.not_null { 0b10u8 } else { 0 };
+                out.push(flags);
+                push_range_element_type(&mut out, elem);
             }
             Type::Scalar(s) => {
                 out.push(type_code_for_scalar(*s));
@@ -2268,6 +2353,26 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             });
             continue;
         }
+        if tc == 17 {
+            // A range column (v16): flags, then the element type descriptor — one scalar code
+            // (spec/design/ranges.md §3). Ranges carry no default this slice (and never identity).
+            let flags = read_u8(buf, pos)?;
+            if flags & 0b01 != 0 {
+                return Err(corrupt("reserved column flag bit0 set"));
+            }
+            let elem = read_range_element_type(buf, pos)?;
+            columns.push(Column {
+                name: cname,
+                ty: Type::Range(Box::new(elem)),
+                decimal: None,
+                primary_key: false,
+                not_null: flags & 0b10 != 0,
+                default: None,
+                default_expr: None,
+                identity: None,
+            });
+            continue;
+        }
         let ty = scalar_for_type_code(tc).ok_or_else(|| corrupt("unknown type code"))?;
         let flags = read_u8(buf, pos)?;
         // bit0 was the primary_key flag through v4; v5 retired it (the pk list below is the
@@ -2537,7 +2642,43 @@ fn read_inline_body(ty: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> 
         ColType::Scalar(s) => read_inline_scalar(*s, buf, pos),
         ColType::Composite { .. } => read_composite_body(ty, buf, pos),
         ColType::Array(elem) => read_array_body(elem, buf, pos),
+        ColType::Range(elem) => read_range_body(elem, buf, pos),
     }
+}
+
+/// A range value's present **body** (after the `0x00` tag): inverse of [`encode_range_body`]
+/// (spec/design/ranges.md §4). Reads the `flags` byte; an `EMPTY` range stops there. Otherwise the
+/// finite lower bound (`!LB_INF`) then the finite upper bound (`!UB_INF`) are each read as the
+/// element's value-codec body (no presence tag). A reserved flag bit set is `XX001`. Note: an
+/// infinite bound's inclusivity bit is canonically 0, but the body that produced the bytes already
+/// enforced that — read whatever bits are present and rebuild the `RangeVal` faithfully.
+fn read_range_body(elem: &ColType, buf: &[u8], pos: &mut usize) -> Result<Value> {
+    let flags = read_u8(buf, pos)?;
+    if flags & !0x1f != 0 {
+        return Err(corrupt("range flags has a reserved bit set"));
+    }
+    if flags & 0x01 != 0 {
+        return Ok(Value::Range(RangeVal::empty()));
+    }
+    let lb_inf = flags & 0x02 != 0;
+    let ub_inf = flags & 0x04 != 0;
+    let lower = if lb_inf {
+        None
+    } else {
+        Some(Box::new(read_inline_body(elem, buf, pos)?))
+    };
+    let upper = if ub_inf {
+        None
+    } else {
+        Some(Box::new(read_inline_body(elem, buf, pos)?))
+    };
+    Ok(Value::Range(RangeVal {
+        empty: false,
+        lower,
+        upper,
+        lower_inc: flags & 0x08 != 0,
+        upper_inc: flags & 0x10 != 0,
+    }))
 }
 
 /// An array value's present **body** (after the `0x00` tag): inverse of [`encode_array_body`]

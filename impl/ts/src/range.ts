@@ -30,6 +30,15 @@ export function elementScalar(desc: RangeDesc): ScalarType {
   return scalarTypeFromName(desc.element) as ScalarType;
 }
 
+// rangeForElement returns the range descriptor whose element is `elem` (i32 → the i32range
+// descriptor), or undefined if the scalar has no built-in range type. Used by the storage/codec
+// paths that hold a resolved element ScalarType (a range column's range ColType element) and need
+// the descriptor's discreteness / canonicalization rule. Inverse of elementScalar.
+export function rangeForElement(elem: ScalarType): RangeDesc | undefined {
+  const ename = canonicalName(elem);
+  return RANGES.find((r) => r.element === ename);
+}
+
 // --- text input ------------------------------------------------------------
 
 // ParsedRange is a range literal parsed lexically (before element coercion): the bracket

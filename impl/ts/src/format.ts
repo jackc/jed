@@ -19,6 +19,7 @@ import { engineError } from "./errors.ts";
 import { Database, Snapshot } from "./executor.ts";
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
 import { onDiskRef, residentRef } from "./pmap.ts";
+import { rangeForElement } from "./range.ts";
 import type { Child, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
 import { TableStore, type Row } from "./storage.ts";
@@ -36,6 +37,7 @@ import {
   isInterval,
   isDate,
   isUuid,
+  rangeT,
   scalarT,
   typeScalar,
   widthBytes,
@@ -48,6 +50,8 @@ import {
   emptyArray,
   compositeValue,
   decimalValue,
+  emptyRangeValue,
+  rangeValue,
   float32Value,
   float64Value,
   intValue,
@@ -60,7 +64,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 15; // on-disk format version (15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13). 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 16; // on-disk format version (16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -200,6 +204,29 @@ function readArrayElementType(buf: Uint8Array, cur: Cursor): Type {
   return scalarT(s);
 }
 
+// pushRangeElementType writes a range column's element type descriptor (spec/design/ranges.md §3):
+// a single u8 scalar type code. A range element is always one of the six scalar subtypes (i32/i64/
+// decimal/timestamp/timestamptz/date) — never composite, array, or nested range — and numrange's
+// element is the unconstrained decimal, so no typmod is stored (the type code fully determines the
+// element). The descriptor identifies which of the six ranges the column is.
+function pushRangeElementType(w: ByteWriter, elem: Type): void {
+  if (elem.kind !== "scalar") {
+    throw new Error("a range element is always a scalar subtype (ranges.md §2)");
+  }
+  w.u8(typeCodeForScalar(elem.scalar));
+}
+
+// readRangeElementType decodes a range column's element type descriptor (inverse of the above): one
+// scalar code, validated to be one of the six range element subtypes (else XX001).
+function readRangeElementType(buf: Uint8Array, cur: Cursor): Type {
+  const code = readU8(buf, cur);
+  const s = scalarForTypeCode(code);
+  if (s === undefined || rangeForElement(s) === undefined) {
+    throw engineError("data_corrupted", "type code is not a valid range element subtype");
+  }
+  return scalarT(s);
+}
+
 // crc32Update folds data into a running CRC-32/IEEE register (reflected, poly 0xEDB88320)
 // WITHOUT the final XOR, so it composes: crc32Update(crc32Update(0xFFFFFFFF, a), b) over a split
 // buffer equals folding a‖b. Both crc32Ieee and the split pageCrc build on it. `>>> 0` keeps the
@@ -243,6 +270,16 @@ function encodeValue(ty: ColType, v: Value): Uint8Array {
     if (v.kind === "null") return Uint8Array.of(0x01);
     if (v.kind !== "array") throw new Error("BUG: a non-array value in an array column");
     const body = encodeArrayBody(ty.elem, v);
+    const out = new Uint8Array(1 + body.length);
+    out[0] = 0x00; // present
+    out.set(body, 1);
+    return out;
+  }
+  if (ty.kind === "range") {
+    // A range column (spec/design/ranges.md §4): the shared presence tag then the range body.
+    if (v.kind === "null") return Uint8Array.of(0x01);
+    if (v.kind !== "range") throw new Error("BUG: a non-range value in a range column");
+    const body = encodeRangeBody(ty.elem, v);
     const out = new Uint8Array(1 + body.length);
     out[0] = 0x00; // present
     out.set(body, 1);
@@ -294,6 +331,25 @@ function encodeArrayBody(elem: ColType, a: { dims: number[]; lbounds: number[]; 
   for (const e of elems) {
     if (e.kind !== "null") parts.push(encodeValue(elem, e).subarray(1)); // body only (no presence tag)
   }
+  return concat(parts);
+}
+
+// encodeRangeBody builds a range value's BODY (after the 0x00 present tag, spec/design/ranges.md
+// §4): a single flags u8 then the present bound bodies. Flags bits: EMPTY (0), LB_INF (1), UB_INF
+// (2), LB_INC (3), UB_INC (4); bits 5–7 reserved 0. An empty range is the lone flags byte 0x01 (no
+// bounds follow). Otherwise a finite lower bound (!LB_INF) then a finite upper bound (!UB_INF) each
+// contribute the element's value-codec body MINUS the presence tag (the same tag-byte+body split
+// array/composite use). The stored value is canonical (§4) — canonicalization happens at parse/cast.
+function encodeRangeBody(elem: ColType, rv: Value & { kind: "range" }): Uint8Array {
+  if (rv.empty) return Uint8Array.of(0x01); // RANGE_EMPTY
+  let flags = 0;
+  if (rv.lower === null) flags |= 0x02; // LB_INF
+  if (rv.upper === null) flags |= 0x04; // UB_INF
+  if (rv.lowerInc) flags |= 0x08; // LB_INC
+  if (rv.upperInc) flags |= 0x10; // UB_INC
+  const parts: Uint8Array[] = [Uint8Array.of(flags)];
+  if (rv.lower !== null) parts.push(encodeValue(elem, rv.lower).subarray(1)); // body only (no presence tag)
+  if (rv.upper !== null) parts.push(encodeValue(elem, rv.upper).subarray(1));
   return concat(parts);
 }
 
@@ -475,6 +531,10 @@ function isSpillable(ty: ColType): boolean {
   if (ty.kind === "composite") return true;
   // An array's opaque inline body spills via the same overflow + LZ4 path (array.md §4).
   if (ty.kind === "array") return true;
+  // A range's body is its flags byte + bound bodies; a numrange over huge decimals could exceed
+  // RECORD_MAX, so it rides the same overflow + LZ4 path. A discrete range (tiny, fixed-width
+  // bounds) is never actually chosen by the plan (spec/design/ranges.md §4).
+  if (ty.kind === "range") return true;
   const s = ty.scalar;
   return isText(s) || isBytea(s) || s === "decimal";
 }
@@ -660,6 +720,8 @@ function valuePayload(ty: ColType, v: Value): Uint8Array {
   // An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies); a large
   // array spills through the same overflow + LZ4 path (spec/design/array.md §4).
   if (ty.kind === "array" && v.kind === "array") return encodeArrayBody(ty.elem, v);
+  // A range's payload is its body (the flags byte + present bound bodies, spec/design/ranges.md §4).
+  if (ty.kind === "range" && v.kind === "range") return encodeRangeBody(ty.elem, v);
   if (v.kind === "text") return UTF8.encode(v.text);
   if (v.kind === "bytea") return v.bytes;
   if (v.kind === "decimal" && ty.kind === "scalar") return encodeScalar(ty.scalar, v).subarray(1); // strip the presence tag
@@ -677,6 +739,10 @@ function valueFromPayload(ty: ColType, payload: Uint8Array): Value {
   if (ty.kind === "array") {
     // An array's payload is its body; decode it with a fresh cursor (spec/design/array.md §4).
     return readArrayBody(ty, payload, { pos: 0 });
+  }
+  if (ty.kind === "range") {
+    // A range's payload is its body; decode it with a fresh cursor (spec/design/ranges.md §4).
+    return readRangeBody(ty.elem, payload, { pos: 0 });
   }
   const s = ty.scalar;
   if (isText(s)) {
@@ -800,6 +866,14 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
       w.u8(15);
       w.u8(col.notNull ? 0b10 : 0);
       pushArrayElementType(w, col.type.elem);
+      continue;
+    }
+    if (col.type.kind === "range") {
+      // A range column (v16): type_code 17, flags, then the element type descriptor — one scalar
+      // code (spec/design/ranges.md §3). Ranges carry no default this slice (flags bits 2/3 = 0).
+      w.u8(17);
+      w.u8(col.notNull ? 0b10 : 0);
+      pushRangeElementType(w, col.type.elem);
       continue;
     }
     const s = typeScalar(col.type);
@@ -2012,6 +2086,26 @@ function decodeTableEntry(
       });
       continue;
     }
+    if (tc === 17) {
+      // A range column (v16): flags, then the element type descriptor — one scalar code
+      // (spec/design/ranges.md §3). Ranges carry no default this slice (and never identity).
+      const cflags = readU8(buf, cur);
+      if ((cflags & 0b01) !== 0) {
+        throw engineError("data_corrupted", "reserved column flag bit0 set");
+      }
+      const elem = readRangeElementType(buf, cur);
+      columns.push({
+        name: cname,
+        type: rangeT(elem),
+        decimal: null,
+        primaryKey: false,
+        notNull: (cflags & 0b10) !== 0,
+        default: null,
+        defaultExpr: null,
+        identity: null,
+      });
+      continue;
+    }
     const ty = scalarForTypeCode(tc);
     if (ty === undefined) {
       throw engineError("data_corrupted", "unknown type code");
@@ -2341,7 +2435,25 @@ function readValue(
 function readInlineBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
   if (ty.kind === "composite") return readCompositeBody(ty, buf, cur);
   if (ty.kind === "array") return readArrayBody(ty, buf, cur);
+  if (ty.kind === "range") return readRangeBody(ty.elem, buf, cur);
   return readInlineScalar(ty.scalar, buf, cur);
+}
+
+// readRangeBody reads a range value's present BODY (after the 0x00 tag): inverse of encodeRangeBody
+// (spec/design/ranges.md §4). Reads the flags byte; an EMPTY range stops there. Otherwise the
+// finite lower bound (!LB_INF) then the finite upper bound (!UB_INF) are each read as the element's
+// value-codec body (no presence tag). A reserved flag bit set is XX001. An infinite bound's
+// inclusivity bit is canonically 0, but the body that produced the bytes already enforced that —
+// rebuild the range value faithfully from the bits present.
+function readRangeBody(elem: ColType, buf: Uint8Array, cur: Cursor): Value {
+  const flags = readU8(buf, cur);
+  if ((flags & ~0x1f) !== 0) throw engineError("data_corrupted", "range flags has a reserved bit set");
+  if ((flags & 0x01) !== 0) return emptyRangeValue();
+  const lbInf = (flags & 0x02) !== 0;
+  const ubInf = (flags & 0x04) !== 0;
+  const lower = lbInf ? null : readInlineBody(elem, buf, cur);
+  const upper = ubInf ? null : readInlineBody(elem, buf, cur);
+  return rangeValue(lower, upper, (flags & 0x08) !== 0, (flags & 0x10) !== 0);
 }
 
 // readArrayBody reads an array value's present BODY (after the 0x00 tag): inverse of encodeArrayBody

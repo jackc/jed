@@ -18,10 +18,15 @@
 > semantics are the default (CLAUDE.md §1) and are pinned against the live `postgres:18`
 > oracle — several canonicalization / empty / ordering / text-quoting rules are subtle (§4–§7).
 
-> **Status: planned, delivered in slices (§11).** R0 (this doc + `ranges.toml` + the
-> codegen'd `RANGES` table) is the spec/data foundation. The naming, the structural-type
-> decision, the value model, canonicalization, text I/O, comparison, and the deferred
-> narrowings below are ratified spec-first; the per-slice delivery is §11.
+> **Status: R0–R2 landed; comparison (R3) + the function/operator surface (RF1–RF4) follow
+> (§11).** R0 (this doc + `ranges.toml` + the codegen'd `RANGES` table) is the spec/data
+> foundation; **R1** threaded the open-`Type` `Range` arm + the `'[1,5)'::i32range` literal/cast
+> through all three cores; **R2** made range **columns** declarable + storable — the value codec
+> (`type_code 17`, `format_version 16`), canonicalization / empty normalization at store, text I/O,
+> and the cross-core golden `range_table.jed` (`rust == go == ts == ruby`). Comparison/ordering
+> (R3) is still deferred — a range `=`/`<`/`ORDER BY` is `42804` until then. The naming, the
+> structural-type decision, the value model, canonicalization, text I/O, comparison, and the
+> deferred narrowings below are ratified spec-first; the per-slice delivery is §11.
 
 ## 1. Surface
 
@@ -92,12 +97,16 @@ encodes its element type **inline** in its catalog column entry. The on-disk sha
 layout in [../fileformat/format.md](../fileformat/format.md), landed R2):
 
 - **A new `type_code = 17` ("range").** Codes 1–13 are scalars, 14 composite, 15 array, 16
-  `date`; **17** is the next free. A range column stores `type_code = 17` followed by an
-  **element type descriptor** — a `u8 element_type_code` (one of the six scalar codes: 2, 3,
-  6, 9, 10, 16), plus the decimal typmod when the element is `decimal` (code 6) — the same
-  inline-descriptor framing an array column uses one level down. No persisted range-type
-  entry, no range-type id; a range file is self-describing.
-- **`format_version` 15** is a clean break (the v15 reader rejects v14 and earlier, as
+  `date`; **17** is the next free. The full column entry is `type_code = 17 ‖ flags ‖
+  element_type_code` — the `type_code`, then the **column flags byte** (bit1 `not_null`; bits
+  0/2/3 reserved 0, since a range column carries no `DEFAULT` this slice — §8), then a single
+  `u8 element_type_code` (one of the six scalar codes: 2, 3, 6, 9, 10, 16). **No typmod is
+  stored even when the element is `decimal`**: `numrange`'s element is the *unconstrained*
+  `decimal` (there is no `numrange(p,s)`), and the type-code alone fully determines which of the
+  six ranges the column is — so the descriptor is self-describing with the element code only,
+  the same inline-descriptor framing an array column uses one level down. No persisted
+  range-type entry, no range-type id; a range file is self-describing.
+- **`format_version` 16** is a clean break (the v16 reader rejects v15 and earlier, as
   v9/v10/v13 did). All existing `.jed` goldens regenerate at the bump (the version byte);
   range columns appear only in new goldens.
 
@@ -250,7 +259,7 @@ function/operator surface (RF1–RF4, [range-functions.md](range-functions.md)) 
 
 | Slice | Content |
 |---|---|
-| **R0** | this doc + `ranges.toml` + the codegen'd `RANGES` table + `type_code 17`/`format_version 15` reservation + grammar/CLAUDE notes |
+| **R0** | this doc + `ranges.toml` + the codegen'd `RANGES` table + `type_code 17`/`format_version 16` reservation + grammar/CLAUDE notes |
 | **R1** | the open-`Type` `Range` arm threaded through parser/resolver/evaluator + type-name parse (`i32range` + aliases) + element restriction (`42704`); `'[1,5)'::i32range` resolves & renders |
 | **R2** | declarable + storable range **column** + `type_code 17` value codec + canonicalization/empty (§4) + text I/O (§5) + the `range_table.jed` golden (`rust == go == ts == ruby`) |
 | **R3** | comparison / ordering / DISTINCT / GROUP BY / `IS NULL` via `range_cmp` (§6) |

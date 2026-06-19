@@ -114,6 +114,7 @@ import {
   isInterval,
   isDate,
   promoteFloat,
+  rangeT,
   rank,
   roundToWidth,
   scalarT,
@@ -161,6 +162,7 @@ import {
   arrayValue,
   emptyArray,
   emptyRangeValue,
+  rangeValue,
   arrayNdim,
   arrayUbound,
   boolOr,
@@ -202,6 +204,7 @@ import {
   finalizeRange,
   parseRangeText,
   rangeByName,
+  rangeForElement,
   rangeNameForElement,
 } from "./range.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
@@ -1414,9 +1417,15 @@ export class Database {
         }
         decimal = null;
       } else if (rangeByName(def.typeName) !== undefined) {
-        // A range column is not storable yet (spec/design/ranges.md §8 — storage lands in R2). The
-        // range type name IS known, so this is 0A000 "not supported", not 42704 "type does not exist".
-        throw engineError("feature_not_supported", "a " + def.typeName + " column is not supported yet");
+        // A range column (spec/design/ranges.md §3): structural like array, the element carried
+        // inline. A range takes no typmod (numrange(10,2) is not a thing — the element is the
+        // unconstrained subtype), so a type modifier is rejected.
+        if (def.typeMod !== null) {
+          throw engineError("feature_not_supported", "a type modifier on a range type is not supported");
+        }
+        const rdesc = rangeByName(def.typeName)!;
+        colType = rangeT(scalarT(elementScalar(rdesc)));
+        decimal = null;
       } else if (scalarTypeFromName(def.typeName) !== undefined) {
         const [s, d] = resolveTypeAndTypmod(def.typeName, def.typeMod);
         colType = scalarT(s);
@@ -2464,6 +2473,14 @@ export class Database {
         const [s, d] = resolveTypeAndTypmod(f.typeName, f.typeMod);
         fty = scalarT(s);
         fdecimal = d;
+      } else if (rangeByName(f.typeName) !== undefined) {
+        // A range-typed composite field (a range inside CREATE TYPE) is deferred this slice (only
+        // range *columns* are storable — spec/design/ranges.md §3); the type name IS known, so this
+        // is 0A000, not the 42704 below.
+        throw engineError(
+          "feature_not_supported",
+          "a range-typed composite field (" + f.typeName + ") is not supported yet",
+        );
       } else if (this.compositeType(f.typeName) !== undefined) {
         if (f.typeMod !== null) {
           throw engineError(
@@ -2995,8 +3012,12 @@ export class Database {
           );
         }
         if (col.type.kind === "range") {
-          // Range columns are not storable yet (R2); CREATE TABLE rejects them, so this is unreachable.
-          throw new Error("range columns are not storable yet (R2); col.type is never a range");
+          // INSERT ... SELECT into a range column is deferred (the VALUES + range literal/cast path
+          // is the supported input — spec/design/ranges.md §1), like array.
+          throw engineError(
+            "feature_not_supported",
+            "INSERT ... SELECT into range column " + col.name + " is not supported yet",
+          );
         }
         if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
           throw typeError(
@@ -4297,8 +4318,9 @@ export class Database {
         );
       }
       if (col.type.kind === "range") {
-        // Range columns are not storable yet (R2); CREATE TABLE rejects them, so this is unreachable.
-        throw new Error("range columns are not storable yet (R2); col.type is never a range");
+        // Updating a range column is deferred this slice (the storable column round-trips via INSERT
+        // VALUES; assignment lands with the range operator surface) — reject it 0A000, like array.
+        throw engineError("feature_not_supported", "updating range column " + a.column + " is not supported yet");
       }
       const targetScalar = col.type.scalar;
       // The RHS is a general expression evaluated against the OLD row; a literal operand
@@ -13630,7 +13652,31 @@ function coerceForStore(
   if (ty.kind === "scalar")
     return storeValue(v, ty.scalar, typmod, notNull, colName);
   if (ty.kind === "array") return storeArray(v, ty.elem, notNull, colName);
+  if (ty.kind === "range") return storeRange(v, ty.elem, notNull, colName);
   return storeComposite(v, ty.name, ty.fields, notNull, colName);
+}
+
+// storeRange coerces a value into a RANGE column (spec/design/ranges.md §4): NULL honours NOT NULL
+// (23502); a range value is already canonical + element-typed by the resolver (the literal/cast
+// path canonicalized it), so each present finite bound is re-coerced to the element type as a
+// belt-and-suspenders identity (an unconstrained scalar coercion — no typmod, NULL-tolerant) and
+// the value passes through; any other value is a 42804. An infinite bound is null and skipped;
+// bounds are never NULL here (a null bound is infinite, not NULL), so the element store is never
+// NOT NULL.
+function storeRange(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
+  if (v.kind === "null") {
+    if (notNull) {
+      throw engineError("not_null_violation", "null value in column " + colName + " violates not-null constraint");
+    }
+    return nullValue();
+  }
+  if (v.kind !== "range") {
+    throw typeError("cannot store a non-range value in range column " + colName);
+  }
+  if (v.empty) return v;
+  const coerce = (b: Value | null): Value | null =>
+    b === null ? null : coerceForStore(b, elem, null, false, colName);
+  return rangeValue(coerce(v.lower), coerce(v.upper), v.lowerInc, v.upperInc);
 }
 
 // storeArray coerces a value into an ARRAY column (spec/design/array.md §4): NULL honours NOT NULL
@@ -13757,6 +13803,29 @@ function materializeInsertValue(
         );
     }
   }
+  if (ty.kind === "range") {
+    // A range column's element is always a scalar; the descriptor (for canonicalization) is
+    // re-derived from it (spec/design/ranges.md §3/§4).
+    if (ty.elem.kind !== "scalar") throw new Error("a range element is always a scalar (ranges.md §2)");
+    const desc = rangeForElement(ty.elem.scalar);
+    if (desc === undefined) throw new Error("a range column's element always has a range type");
+    switch (iv.kind) {
+      case "lit":
+        // A bare string literal adapts to the range context via range_in (the same
+        // string-adapts-to-context rule array/bytea/uuid use — spec/design/ranges.md §5).
+        if (iv.lit.kind === "text") return coerceStringToRange(iv.lit.text, desc);
+        if (iv.lit.kind === "null") return nullValue();
+        throw typeError("cannot assign a scalar value to a range column");
+      case "param":
+        return bound[iv.index - 1]!;
+      case "array":
+        throw typeError("cannot assign an array value to a range column");
+      case "row":
+        throw typeError("cannot assign a record value to a range column");
+      default: // default
+        throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
+    }
+  }
   if (ty.kind === "scalar") {
     switch (iv.kind) {
       case "lit":
@@ -13858,6 +13927,9 @@ function coerceStringToArray(s: string, elem: ColType): Value {
 function coerceArrayElementText(tok: string, elem: ColType): Value {
   if (elem.kind === "composite") return coerceRecordTextToValue(tok, elem);
   if (elem.kind === "array") return coerceStringToArray(tok, elem.elem);
+  // A range element is unreachable: array-of-range is not a storable jed type (R2), so an array
+  // element ColType is never a range.
+  if (elem.kind === "range") throw new Error("array-of-range is not a storable type (ranges.md §2)");
   const { node } = coerceStringLiteral(tok, elem.scalar, null);
   return rexprConstToValue(node);
 }
@@ -13884,6 +13956,8 @@ function coerceRecordTextToValue(
     if (f.type.kind === "composite")
       return coerceRecordTextToValue(tok, f.type);
     if (f.type.kind === "array") return coerceStringToArray(tok, f.type.elem);
+    // A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
+    if (f.type.kind === "range") throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
     const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod);
     return rexprConstToValue(node);
   });

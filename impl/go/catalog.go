@@ -293,6 +293,12 @@ type ColType struct {
 	// Elem is the resolved element type when this is an array ColType (spec/design/array.md §3),
 	// else nil. Structural — the element type is carried inline, recursively.
 	Elem *ColType
+	// RangeElem is the resolved element type when this is a range ColType (spec/design/ranges.md §3),
+	// else nil. Structural like array — the element is carried inline, but is always one of the six
+	// scalar subtypes (i32/i64/decimal/timestamp/timestamptz/date), never composite/array/nested-range.
+	// The codec reads the element scalar for the bound bodies; the range descriptor (discreteness) is
+	// re-derived from the element via rangeForElement.
+	RangeElem *ColType
 }
 
 // ColField is one resolved field of a composite ColType — its name, recursively-resolved type, the
@@ -317,6 +323,13 @@ func ResolveColType(ty Type, types map[string]*CompositeType) ColType {
 	if ty.Array != nil {
 		elem := ResolveColType(*ty.Array, types)
 		return ColType{Elem: &elem}
+	}
+	if ty.Range != nil {
+		// A range column (spec/design/ranges.md §3): structural like array, the element resolved
+		// inline. The element is always one of the six scalar subtypes, so the recursion bottoms out
+		// at a scalar ColType immediately.
+		elem := ResolveColType(*ty.Range, types)
+		return ColType{RangeElem: &elem}
 	}
 	if ty.Comp == nil {
 		return ColType{Scalar: ty.Scalar}

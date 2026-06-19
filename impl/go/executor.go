@@ -1496,6 +1496,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		var decimal *DecimalTypmod
 		isComposite := false
 		isArray := false
+		isRange := false
 		if isSerial {
 			// A serial column takes no typmod (serial(5) is 42601) and no [] (the array branch).
 			if def.TypeMod != nil {
@@ -1519,12 +1520,16 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, NewError(UndefinedObject, "type does not exist: "+base)
 			}
 			isArray = true
-		} else if _, ok := rangeByName(def.TypeName); ok {
-			// A range column is not storable yet (spec/design/ranges.md §8 — storage lands in R2).
-			// The range type name IS known, so this is 0A000 "not supported", not the 42704 "type
-			// does not exist" the fall-through below would give.
-			return Outcome{}, NewError(FeatureNotSupported,
-				"a "+def.TypeName+" column is not supported yet")
+		} else if rdesc, ok := rangeByName(def.TypeName); ok {
+			// A range column (spec/design/ranges.md §3): structural like array, the element carried
+			// inline. A range takes no typmod (numrange(10,2) is not a thing — the element is the
+			// unconstrained subtype), so a type modifier is rejected.
+			if def.TypeMod != nil {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a type modifier on a range type is not supported")
+			}
+			colType = RangeT(ScalarT(elementScalar(rdesc)))
+			isRange = true
 		} else if _, ok := ScalarTypeFromName(def.TypeName); ok {
 			ty, d, err := resolveTypeAndTypmod(def.TypeName, def.TypeMod)
 			if err != nil {
@@ -1552,11 +1557,12 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// narrowing (types.md §11/§12/§13; composite.md §6), relaxable in a later in-key slice.
 			// timestamp / timestamptz are also allowed — they share the i64 int-be-signflip key
 			// encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
-			if isComposite || isArray {
-				// A composite/array PRIMARY KEY is rejected 0A000 — the key encoding is authored but
-				// unexercised (composite.md §6, array.md §8).
+			if isComposite || isArray || isRange {
+				// A composite/array/range PRIMARY KEY is rejected 0A000 — the key encoding is authored
+				// but unexercised (composite.md §6, array.md §8, ranges.md §8). colType.CanonicalName()
+				// gives the canonical type name (i32range, even when declared with the int4range alias).
 				return Outcome{}, NewError(FeatureNotSupported,
-					"a "+def.TypeName+" primary key is not supported yet")
+					"a "+colType.CanonicalName()+" primary key is not supported yet")
 			}
 			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
 				return Outcome{}, NewError(FeatureNotSupported,
@@ -1654,12 +1660,12 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				}
 				identityKind = &k
 			}
-		} else if isComposite || isArray {
-			// A DEFAULT on a composite- or array-typed column is not supported this slice
-			// (composite.md §12 / array.md §12).
+		} else if isComposite || isArray || isRange {
+			// A DEFAULT on a composite-, array-, or range-typed column is not supported this slice
+			// (composite.md §12 / array.md §12 / ranges.md §8).
 			if def.Default != nil {
 				return Outcome{}, NewError(FeatureNotSupported,
-					"a DEFAULT on a composite- or array-typed column is not supported yet")
+					"a DEFAULT on a composite-, array-, or range-typed column is not supported yet")
 			}
 		} else if def.Default != nil {
 			ty := colType.Scalar
@@ -2702,6 +2708,12 @@ func (db *Database) executeCreateType(ct *CreateType) (Outcome, error) {
 				return Outcome{}, err
 			}
 			fty, fdecimal = ScalarT(s), d
+		} else if _, ok := rangeByName(f.TypeName); ok {
+			// A range-typed composite field (a range inside CREATE TYPE) is deferred this slice (only
+			// range *columns* are storable — spec/design/ranges.md §3); the type name IS known, so this
+			// is 0A000, not the 42704 below.
+			return Outcome{}, NewError(FeatureNotSupported,
+				"a range-typed composite field ("+f.TypeName+") is not supported yet")
 		} else if db.readSnap().compositeType(f.TypeName) != nil {
 			if f.TypeMod != nil {
 				return Outcome{}, NewError(FeatureNotSupported,
@@ -3425,6 +3437,13 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 				if col.Type.IsComposite() {
 					return Outcome{}, NewError(FeatureNotSupported, fmt.Sprintf(
 						"INSERT ... SELECT into composite column %s is not supported yet", col.Name,
+					))
+				}
+				// INSERT ... SELECT into a range column is deferred (the VALUES + range literal/cast
+				// path is the supported input — spec/design/ranges.md §1).
+				if col.Type.IsRange() {
+					return Outcome{}, NewError(FeatureNotSupported, fmt.Sprintf(
+						"INSERT ... SELECT into range column %s is not supported yet", col.Name,
 					))
 				}
 				if !assignableTo(q.columnTypes[p], col.Type.ScalarTy()) {
@@ -15355,10 +15374,64 @@ func coerceForStore(v Value, ty ColType, typmod *DecimalTypmod, notNull bool, co
 	if ty.Elem != nil {
 		return storeArray(v, *ty.Elem, notNull, colName)
 	}
+	if ty.RangeElem != nil {
+		return storeRange(v, *ty.RangeElem, notNull, colName)
+	}
 	if ty.Composite {
 		return storeComposite(v, ty.Name, ty.Fields, notNull, colName)
 	}
 	return storeValue(v, ty.Scalar, typmod, notNull, colName)
+}
+
+// storeRange coerces a value into a RANGE column (spec/design/ranges.md §4): NULL honours NOT NULL
+// (23502); a ValRange is already canonical + element-typed by the resolver (the literal/cast path
+// canonicalized it), so each present bound is re-coerced to the element type as a belt-and-suspenders
+// identity (an unconstrained scalar coercion — no typmod, NULL-tolerant) and the value passes through;
+// any other value is a 42804.
+func storeRange(v Value, elem ColType, notNull bool, colName string) (Value, error) {
+	switch v.Kind {
+	case ValNull:
+		if notNull {
+			return Value{}, NewError(NotNullViolation,
+				"null value in column "+colName+" violates not-null constraint")
+		}
+		return NullValue(), nil
+	case ValRange:
+		rv := v.Range
+		if rv.Empty {
+			return RangeValue(rv), nil
+		}
+		// Coerce each finite bound to the element type (identity for an already-typed bound; an
+		// infinite bound is nil and skipped). Bounds are never NULL here — a nil bound is infinite,
+		// not NULL — so the element store is never NOT NULL.
+		coerce := func(b *Value) (*Value, error) {
+			if b == nil {
+				return nil, nil
+			}
+			cv, err := coerceForStore(*b, elem, nil, false, colName)
+			if err != nil {
+				return nil, err
+			}
+			return &cv, nil
+		}
+		lower, err := coerce(rv.Lower)
+		if err != nil {
+			return Value{}, err
+		}
+		upper, err := coerce(rv.Upper)
+		if err != nil {
+			return Value{}, err
+		}
+		return RangeValue(&RangeVal{
+			Empty:    false,
+			Lower:    lower,
+			Upper:    upper,
+			LowerInc: rv.LowerInc,
+			UpperInc: rv.UpperInc,
+		}), nil
+	default:
+		return Value{}, typeError("cannot store a non-range value in range column " + colName)
+	}
 }
 
 // storeArray coerces a value into an ARRAY column (spec/design/array.md §4): NULL honours NOT NULL
@@ -15507,6 +15580,37 @@ func materializeInsertValue(iv InsertValue, ty ColType, bound []Value) (Value, e
 			return Value{}, typeError("cannot assign a scalar value to an array column")
 		}
 	}
+	if ty.RangeElem != nil {
+		// A range column's element is always a scalar; the descriptor (for canonicalization) is
+		// re-derived from it (spec/design/ranges.md §3/§4).
+		es := ty.RangeElem.Scalar
+		desc, ok := rangeForElement(es)
+		if !ok {
+			panic("a range column's element always has a range type")
+		}
+		switch {
+		case iv.IsParam:
+			return bound[int(iv.Param)-1], nil
+		case iv.IsRow:
+			return Value{}, typeError("cannot assign a record value to a range column")
+		case iv.IsArray:
+			return Value{}, typeError("cannot assign an array value to a range column")
+		case iv.IsDefault:
+			return Value{}, NewError(SyntaxError, "DEFAULT is not allowed inside ROW(...)")
+		case iv.Lit.Kind == LiteralText:
+			// A bare string literal adapts to the range context via range_in (the same
+			// string-adapts-to-context rule array/bytea/uuid use — spec/design/ranges.md §5).
+			rv, err := coerceStringToRange(iv.Lit.Str, desc)
+			if err != nil {
+				return Value{}, err
+			}
+			return RangeValue(rv), nil
+		case iv.Lit.Kind == LiteralNull:
+			return NullValue(), nil
+		default:
+			return Value{}, typeError("cannot assign a scalar value to a range column")
+		}
+	}
 	if !ty.Composite {
 		switch {
 		case iv.IsDefault:
@@ -15585,6 +15689,10 @@ func coerceArrayElementText(tok string, elem ColType) (Value, error) {
 		return coerceRecordTextToValue(tok, elem)
 	case elem.Elem != nil:
 		return coerceStringToArray(tok, *elem.Elem)
+	case elem.RangeElem != nil:
+		// A range element token is unreachable: array-of-range is not a storable jed type (R2), so an
+		// array element ColType is never a range.
+		panic("array-of-range is not a storable type (ranges.md §2)")
 	default:
 		return coerceStringLiteralToValue(tok, elem.Scalar)
 	}
@@ -15618,6 +15726,9 @@ func coerceRecordTextToValue(text string, ct ColType) (Value, error) {
 			v, err = coerceRecordTextToValue(*tokens[i], f.Type)
 		case f.Type.Elem != nil:
 			v, err = coerceStringToArray(*tokens[i], *f.Type.Elem)
+		case f.Type.RangeElem != nil:
+			// A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
+			panic("a composite range field is rejected at CREATE TYPE (R2)")
 		default:
 			var node *rExpr
 			node, _, err = coerceStringLiteral(*tokens[i], f.Type.Scalar, f.Typmod)

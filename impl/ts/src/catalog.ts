@@ -259,7 +259,13 @@ export type ColType =
   | { kind: "composite"; name: string; fields: ColField[] }
   // An array's resolved element type (spec/design/array.md §3). Structural — the element type is
   // carried inline, recursively; v1 element types are scalars.
-  | { kind: "array"; elem: ColType };
+  | { kind: "array"; elem: ColType }
+  // A range's resolved element type (spec/design/ranges.md §3). Structural like array — the element
+  // is carried inline, but is always one of the six scalar subtypes (i32/i64/decimal/timestamp/
+  // timestamptz/date), never composite/array/nested-range. The codec reads the element scalar for
+  // the bound bodies; the descriptor (discreteness) is re-derived from the element via
+  // rangeForElement.
+  | { kind: "range"; elem: ColType };
 
 // ColField is one resolved field of a composite ColType — its name, recursively-resolved type, the
 // decimal typmod (when the field is decimal), and declared nullability (mirrors CompositeField, but
@@ -275,9 +281,10 @@ export function resolveColType(ty: Type, types: Map<string, CompositeType>): Col
   if (ty.kind === "scalar") return { kind: "scalar", scalar: ty.scalar };
   if (ty.kind === "array") return { kind: "array", elem: resolveColType(ty.elem, types) };
   if (ty.kind === "range") {
-    // Range columns are not storable yet (spec/design/ranges.md §8 — R2 adds the codec). CREATE
-    // TABLE rejects a range column, so no range Type ever reaches a ColType this slice.
-    throw new Error("range columns are not storable yet (R2); resolveColType never sees a range");
+    // A range column (spec/design/ranges.md §3): structural like array, the element resolved inline.
+    // The element is always one of the six scalar subtypes, so the recursion bottoms out at a
+    // scalar ColType immediately.
+    return { kind: "range", elem: resolveColType(ty.elem, types) };
   }
   const def = types.get(ty.name.toLowerCase());
   if (def === undefined) {

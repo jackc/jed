@@ -197,6 +197,25 @@ fn array_table_db() -> Database {
 /// (row 2's duplicate 20), an EMPTY and a NULL whole-value array (rows 3/4 → no entries), and a
 /// NULL element (row 5). Rows are inserted before the indexes so each builds via the sorted-bulk
 /// path, matching the Ruby reference's GIN_ARRAY_TABLE.
+/// `CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)` with rows exercising every
+/// range flags bit + the canonical-`[)` storage (spec/design/ranges.md §4): a finite `[)`, an
+/// inclusive-upper literal that canonicalizes (`[1,5]` → `[1,6)`), the EMPTY range, infinite bounds
+/// (lower-only, both), a NULL range, an exclusive-lower literal with infinite upper (`(5,)` →
+/// `[6,)`), and a singleton (`[1,1]` → `[1,2)`). Pins range_table.jed cross-core.
+fn range_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, r i32range, br i64range)",
+    );
+    run(&mut db, "INSERT INTO t VALUES (1, '[1,5)', '[10,20)')");
+    run(&mut db, "INSERT INTO t VALUES (2, '[1,5]', NULL)");
+    run(&mut db, "INSERT INTO t VALUES (3, 'empty', '(,100)')");
+    run(&mut db, "INSERT INTO t VALUES (4, '(,)', '(5,)')");
+    run(&mut db, "INSERT INTO t VALUES (5, NULL, '[1,1]')");
+    db
+}
+
 fn gin_array_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
@@ -752,6 +771,7 @@ fn write_matches_goldens() {
         ("serial_table.jed", serial_table_db),
         ("identity_table.jed", identity_table_db),
         ("array_table.jed", array_table_db),
+        ("range_table.jed", range_table_db),
         ("array_composite_table.jed", array_composite_table_db),
         (
             "composite_array_field_table.jed",
@@ -799,6 +819,7 @@ fn read_goldens_reproduces_rows() {
         ("composite_type_table.jed", composite_type_table_db, "t"),
         ("nested_composite_table.jed", nested_composite_table_db, "t"),
         ("array_table.jed", array_table_db, "t"),
+        ("range_table.jed", range_table_db, "t"),
         ("array_composite_table.jed", array_composite_table_db, "t"),
         (
             "composite_array_field_table.jed",
