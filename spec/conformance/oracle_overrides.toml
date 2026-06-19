@@ -926,3 +926,17 @@ reason = "query/distinct.test poisoned-prefix tail: `distinct` before FROM is th
 file = "query/distinct.test"
 sql = "SELECT DISTINCT distinct FROM tk"
 reason = "query/distinct.test poisoned-prefix tail: the first `distinct` is the modifier, the second the column (jed lookahead), so the 100s collapse. PostgreSQL cannot parse the `tk` table; the oracle has no relation to describe. jed's committed rows are kept."
+
+# --- GIN narrowings: PostgreSQL BUILDS these GIN indexes; jed defers them 0A000 this slice
+# (spec/design/gin.md §3/§10 — the "lift it when its key encoding lands" narrowing the ordered
+# index makes for non-integer keys, plus multicolumn GIN). PG would succeed (the CREATE returns
+# no error), so each is a deliberate jed-stricter divergence recorded here.
+[[override]]
+file = "ddl/create_gin_index.test"
+sql = "CREATE INDEX i ON t USING gin (tags, tags2)"
+reason = "jed: a multi-column GIN index is 0A000 this slice (gin.md §3/§10 — single-column only for now). PostgreSQL builds a multicolumn GIN over the two array columns and the CREATE succeeds. A deliberate, documented narrowing; relaxable as its own slice."
+
+[[override]]
+file = "ddl/create_gin_index.test"
+sql = "CREATE INDEX i ON t USING gin (notes)"
+reason = "jed: a GIN over a non-integer element array (text[]) is 0A000 this slice (gin.md §3/§10 — the array_ops opclass covers the integer element types only, the same lift-when-encoded narrowing as a text ordered key). PostgreSQL builds a text[] GIN and the CREATE succeeds. A deliberate, documented narrowing; relaxable when the text element key encoding lifts."
