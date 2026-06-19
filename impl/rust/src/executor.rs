@@ -3604,6 +3604,15 @@ impl Database {
             (Some(f), Some((pk_idx, pk_ty))) => detect_pk_bound(f, pk_idx, pk_ty),
             _ => None,
         };
+        // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct
+        // (`@>`/`&&`/`= ANY`/`=`) over a GIN-indexed array column bounds the delete's target-row
+        // scan through the index instead of a full scan. A mutation uses PK-then-GIN-then-full —
+        // the ordered-index equality bound stays SELECT-only (a follow-on). `tcolumns` is the full
+        // column list whenever the table has any index, so it is populated when a GIN index exists.
+        let gin_bound = match (&filter, &pk_bound) {
+            (Some(f), None) => detect_gin_bound(f, &indexes, &tcolumns, 0),
+            _ => None,
+        };
         // DELETE's touched set (cost.md §3): the filter's columns plus the RETURNING items'
         // OLD-side references — a returned old value is a logical read of the dropped row,
         // while a `new.col` is the constant NULL row and reads nothing. The RETURNING mask
@@ -3622,9 +3631,9 @@ impl Database {
                 *m |= ret_mask[i];
             }
         }
-        let (entries, (overlap, slabs)) = match &pk_bound {
+        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound) {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
-            Some(bp) => match build_key_bound(bp, &bound, &[]) {
+            (Some(bp), _) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
                     let (entries, pages, slabs) =
                         self.store(&del.table).range_scan_with_units(&b, &mask)?;
@@ -3632,7 +3641,16 @@ impl Database {
                 }
                 None => (Vec::new(), (0, 0)),
             },
-            None => {
+            // GIN-bounded delete (gin.md §6): gather the candidate `(key, row)` pairs through the
+            // index; the predicate stays the residual filter, re-applied per candidate in the loop
+            // below. `gin_entry` is charged inside; the block (page_read/value_decompress) below.
+            (None, Some(gb)) => {
+                let query = filter
+                    .as_ref()
+                    .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
+                self.gin_bound_rows(&del.table, gb, query, &env, &mut meter, &mask)?
+            }
+            (None, None) => {
                 let (entries, pages, slabs) = self.store(&del.table).scan_with_units(&mask)?;
                 (entries, (pages, slabs))
             }
@@ -3894,6 +3912,15 @@ impl Database {
             (Some(f), Some((pk_i, pk_ty))) => detect_pk_bound(f, pk_i, pk_ty),
             _ => None,
         };
+        // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct
+        // (`@>`/`&&`/`= ANY`/`=`) over a GIN-indexed array column bounds the update's target-row
+        // scan through the index instead of a full scan (PK-then-GIN-then-full; the ordered-index
+        // bound stays SELECT-only). The bound is over the PRE-update index state (the WHERE reads
+        // the old row), so it admits exactly the rows the full scan would match.
+        let gin_bound = match (&filter, &pk_bound) {
+            (Some(f), None) => detect_gin_bound(f, &indexes, &tcolumns, 0),
+            _ => None,
+        };
         // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's,
         // and the RETURNING items' — the NEW side minus the assigned columns (an assigned
         // column's returned value is the freshly computed one, not a storage read), plus the
@@ -3918,9 +3945,9 @@ impl Database {
                 *m |= ret_mask[ncols + i]; // old side — always a storage read
             }
         }
-        let (entries, (overlap, slabs)) = match &pk_bound {
+        let (entries, (overlap, slabs)) = match (&pk_bound, &gin_bound) {
             // Top-level statement: no enclosing query, so the bound never has a correlated source.
-            Some(bp) => match build_key_bound(bp, &bound, &[]) {
+            (Some(bp), _) => match build_key_bound(bp, &bound, &[]) {
                 Some(b) => {
                     let (entries, pages, slabs) =
                         self.store(&upd.table).range_scan_with_units(&b, &mask)?;
@@ -3928,7 +3955,16 @@ impl Database {
                 }
                 None => (Vec::new(), (0, 0)),
             },
-            None => {
+            // GIN-bounded update (gin.md §6): gather the candidate `(key, row)` pairs through the
+            // index; the predicate stays the residual filter (re-applied per candidate in the loop
+            // below). `gin_entry` charged inside; the page_read/value_decompress block below.
+            (None, Some(gb)) => {
+                let query = filter
+                    .as_ref()
+                    .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
+                self.gin_bound_rows(&upd.table, gb, query, &env, &mut meter, &mask)?
+            }
+            (None, None) => {
                 let (entries, pages, slabs) = self.store(&upd.table).scan_with_units(&mask)?;
                 (entries, (pages, slabs))
             }
@@ -5573,7 +5609,16 @@ impl Database {
                     .filter
                     .as_ref()
                     .and_then(|f| gin_match(f, gb.col_global).map(|(_, q)| q));
-                self.gin_bound_rows(&rel.table_name, gb, query, &env, meter, &plan.rel_masks[ri])?
+                let (pairs, units) = self.gin_bound_rows(
+                    &rel.table_name,
+                    gb,
+                    query,
+                    &env,
+                    meter,
+                    &plan.rel_masks[ri],
+                )?;
+                // SELECT discards the storage keys (UPDATE/DELETE keep them — gin.md §6).
+                (pairs.into_iter().map(|(_, v)| v).collect(), units)
             }
             None => {
                 let (entries, pages, slabs) = store.scan_with_units(&plan.rel_masks[ri])?;
@@ -6452,6 +6497,11 @@ impl Database {
     /// `meter` directly. Degenerate constant queries (gin.md §6): a NULL `Q`, an `@>` whose `Q`
     /// holds a NULL element, an `&&` with no non-NULL term, and a NULL `= ANY` scalar are provably
     /// empty (read nothing); `@> '{}'` and array `=` with no non-NULL term fall back to the full scan.
+    /// Gather a GIN-bounded scan's candidate rows as `(storage_key, row)` pairs (the candidate
+    /// set *is* the storage keys), with the up-front `(page_read nodes, value_decompress slabs)`
+    /// block. SELECT drops the keys; UPDATE/DELETE keep them to rewrite/remove the rows
+    /// (gin.md §6). `gin_entry` is charged inside (during the gather); the caller charges the
+    /// returned block.
     fn gin_bound_rows(
         &self,
         table_name: &str,
@@ -6460,7 +6510,7 @@ impl Database {
         env: &EvalEnv,
         meter: &mut Meter,
         mask: &[bool],
-    ) -> Result<(Vec<Row>, (usize, usize))> {
+    ) -> Result<(Vec<(Vec<u8>, Row)>, (usize, usize))> {
         let store = self.store(table_name);
         // Extract the query's distinct terms. This (the opclass `extract_query_terms`) is a pure
         // planning step, NOT metered (cost.md §3) — evaluate `Q` on a scratch meter. `Q` is a
@@ -6509,8 +6559,7 @@ impl Database {
             // residual filter then keeps the right rows (gin.md §6).
             GinStrategy::Contains if is_empty => {
                 let (entries, pages, slabs) = store.scan_with_units(mask)?;
-                let rows = entries.into_iter().map(|(_, v)| v).collect();
-                return Ok((rows, (pages, slabs)));
+                return Ok((entries, (pages, slabs)));
             }
             // `@>` a query containing a NULL element is never TRUE (strict element equality).
             GinStrategy::Contains if has_null => return Ok((Vec::new(), (0, 0))),
@@ -6521,8 +6570,7 @@ impl Database {
             // element is NOT caught here (it gathers, even when it also has a NULL element).
             GinStrategy::Equal if terms.is_empty() => {
                 let (entries, pages, slabs) = store.scan_with_units(mask)?;
-                let rows = entries.into_iter().map(|(_, v)| v).collect();
-                return Ok((rows, (pages, slabs)));
+                return Ok((entries, (pages, slabs)));
             }
             // `&&` with no non-NULL term (empty or all-NULL `Q`) overlaps nothing.
             GinStrategy::Overlaps if terms.is_empty() => return Ok((Vec::new(), (0, 0))),
@@ -6582,7 +6630,7 @@ impl Database {
             let (row, n, s) = store.get_with_units(&key, mask)?;
             pages += n;
             slabs += s;
-            rows.push(row.expect("a GIN entry references a stored row"));
+            rows.push((key, row.expect("a GIN entry references a stored row")));
         }
         Ok((rows, (pages, slabs)))
     }
@@ -7870,24 +7918,37 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
             }));
         }
     }
-    // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds: the lowest-named GIN
-    // index whose array column has a `col @> const` / `col && const` conjunct.
-    for idx in &rel.table.indexes {
+    // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
+    detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset).map(ScanBound::Gin)
+}
+
+/// Detect a GIN-bounded scan over `columns`/`indexes` (gin.md §6): the lowest-named GIN index
+/// whose array column at `offset + ci` has a GIN-accelerable conjunct (`col @> const`,
+/// `col && const`, `const = ANY(col)`, or `col = const`). Factored out so the SELECT planner
+/// (`detect_scan_bound`) and the UPDATE/DELETE scan both use the identical detection — the
+/// mutations pass their own table's indexes/columns at `offset = 0`.
+fn detect_gin_bound(
+    filter: &RExpr,
+    indexes: &[IndexDef],
+    columns: &[Column],
+    offset: usize,
+) -> Option<GinBound> {
+    for idx in indexes {
         if idx.kind != IndexKind::Gin {
             continue;
         }
         let ci = idx.columns[0];
-        let col_global = rel.offset + ci;
-        let Some(elem_ty) = rel.table.columns[ci].ty.array_element().map(|t| t.scalar()) else {
+        let col_global = offset + ci;
+        let Some(elem_ty) = columns[ci].ty.array_element().map(|t| t.scalar()) else {
             continue; // a GIN column is always an array (the CREATE INDEX gate); defensive
         };
         if let Some((strategy, _)) = gin_match(filter, col_global) {
-            return Some(ScanBound::Gin(GinBound {
+            return Some(GinBound {
                 name_key: idx.name.to_ascii_lowercase(),
                 elem_type: elem_ty,
                 strategy,
                 col_global,
-            }));
+            });
         }
     }
     None

@@ -125,6 +125,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // GIN-bounded array equality `col = Q` — the `@> distinct(Q)` superset gather + residual = over
   // a GIN-indexed array column (spec/design/gin.md §6); same rows as the full scan.
   "query.gin_array_eq",
+  // GIN-bounded UPDATE/DELETE — a mutation whose WHERE has a GIN-accelerable conjunct bounds its
+  // target-row scan through the GIN index (PK-then-GIN-then-full), same end state as the full
+  // scan (spec/design/gin.md §6); the ordered-index bound stays SELECT-only.
+  "query.gin_mutation",
   "query.is_null",
   "query.order_by",
   // Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

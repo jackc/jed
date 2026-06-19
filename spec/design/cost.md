@@ -343,12 +343,14 @@ INSERT/UPDATE/DELETE is unmetered ("What is NOT metered" below).
 ### GIN-bounded scan — an inverted index narrows an array-column scan
 
 A **GIN index** ([gin.md](gin.md)) gives a third bound kind at the same per-relation seam (after
-the PK bound and the ordered-index equality bound). For a base relation of a **SELECT** scan whose
-WHERE has a conjunct `col @> Q` (contains), `col && Q` (overlaps), `c = ANY(col)` (membership), or
-`col = Q` (exact array equality) where `col` is GIN-indexed and the query operand is a **constant**,
-the scan gathers candidates from the index instead of full-scanning. Gated by the `query.gin_scan`
-capability (with `query.gin_any_eq` for `= ANY` and `query.gin_array_eq` for array `=`), pinned
-cross-core in `spec/conformance/suites/query/gin_scan.test` (and `gin_any_eq.test` / `gin_array_eq.test`).
+the PK bound and the ordered-index equality bound). For a base relation of a **`SELECT`, `UPDATE`,
+or `DELETE`** scan whose WHERE has a conjunct `col @> Q` (contains), `col && Q` (overlaps),
+`c = ANY(col)` (membership), or `col = Q` (exact array equality) where `col` is GIN-indexed and the
+query operand is a **constant**, the scan gathers candidates from the index instead of
+full-scanning. Gated by the `query.gin_scan` capability (with `query.gin_any_eq` for `= ANY`,
+`query.gin_array_eq` for array `=`, and `query.gin_mutation` for the `UPDATE`/`DELETE` bound), pinned
+cross-core in `spec/conformance/suites/query/gin_scan.test` (and `gin_any_eq.test` /
+`gin_array_eq.test` / `gin_mutation.test`).
 
 A GIN-bounded scan accrues, in place of the full-scan block:
 
@@ -372,7 +374,12 @@ cannot enumerate, having no terms): `@> '{}'` (every non-NULL array contains the
 array `=` whose `Q` has no non-NULL element (`col = '{}'` / `col = ARRAY[NULL,…]`). Deterministic and
 byte-identical across cores: the term extraction, the term encoding, the entry-tree shape, and the
 overlap rule are all §8 contracts (gin.md §8). **Narrowings this slice** (gin.md §6): constant query
-operand only, `@>`/`&&`/`= ANY`/`=` only, SELECT scans only, and no LIMIT-streaming combination.
+operand only, `@>`/`&&`/`= ANY`/`=` only, and no LIMIT-streaming combination. A **GIN-bounded
+`UPDATE`/`DELETE`** accrues this same scan block in place of its full-scan block (its target-row scan
+uses the **PK then GIN** bound — not the ordered-index bound, which stays SELECT-only); so a
+`DELETE … WHERE col @> Q` costs the matching `SELECT`'s scan minus the `row_produced` a bare mutation
+omits (a `RETURNING` clause restores it plus its projection units), and the phase-2 rewrite/remove +
+index maintenance are unmetered writes ("What is NOT metered" below).
 **DDL cost:** `CREATE INDEX … USING gin` charges its
 build scan — `page_read` × the table's node count + `storage_row_read` per row, plus the array
 column's overflow-chain `page_read` / `value_decompress` if its values spilled (the build's touched

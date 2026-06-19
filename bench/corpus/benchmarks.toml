@@ -238,3 +238,32 @@ max = 500
 gen = "int_uniform"
 min = 1
 max = 500
+
+# GIN-bounded DELETE: a mutation whose WHERE has a GIN-accelerable `@>` conjunct bounds its
+# target-row scan through the GIN index (spec/design/gin.md §6; query.gin_mutation), just like the
+# gin_contains SELECT — instead of full-scanning the 200k rows. Each iteration BEGINs, deletes the
+# handful of rows whose tags contain BOTH query terms (the gather + the index-maintenance writes),
+# then ROLLBACKs (so the dataset is preserved; the post-run count(*) must hold at 200k). Measures
+# the bounded mutation path end-to-end (gather → delete → GIN-entry removal → rollback); a core
+# lacking the bound would full-scan every iteration. jed + PostgreSQL only (the gin dataset).
+[[bench]]
+name = "gin_delete"
+description = "GIN-bounded DELETE: delete the rows whose tags contain BOTH query terms via the GIN bound, then ROLLBACK — the bounded target-row scan + index-maintenance writes over a 200k-row bigint[] column"
+dataset = "gin"
+kind = "write_rollback"
+engines = ["jed", "postgres"]
+sql = "DELETE FROM docs WHERE tags @> ARRAY[$1::bigint, $2::bigint]"
+warmup = 100
+iterations = 1000
+seed = 4213
+batch = 1
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500

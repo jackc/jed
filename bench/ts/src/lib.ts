@@ -422,14 +422,17 @@ async function runOne(cfg: Config, b: Bench, corpusDir: string, dataDir: string,
   }
 }
 
+// The target table of a write statement — the word after INTO (INSERT INTO <table>) or
+// FROM (DELETE FROM <table>) — for the post-run count.
 function insertTable(sql: string): string {
   const fields = sql.split(/\s+/);
   for (let i = 0; i < fields.length - 1; i++) {
-    if (fields[i].toUpperCase() === "INTO") {
+    const kw = fields[i].toUpperCase();
+    if (kw === "INTO" || kw === "FROM") {
       return fields[i + 1].split("(")[0];
     }
   }
-  throw new Error(`write bench SQL has no INSERT INTO table: ${sql}`);
+  throw new Error(`write bench SQL has no INSERT INTO / DELETE FROM table: ${sql}`);
 }
 
 // Uniform binary entrypoint: bench-<engine> <corpus_dir> <data_dir> <out_path> [filter].

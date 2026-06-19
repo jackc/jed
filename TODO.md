@@ -559,12 +559,26 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         cores + capability `query.gin_array_eq` + `suites/query/gin_array_eq.test` (cost-asserted,
         oracle-checked) + the `gin_eq` NoREC scenario (`= Q` vs `NOT(<> Q)`) + a `gin_array_eq`
         bench + `/web` Indexes page + e2e. → [gin.md §6](spec/design/gin.md)
+  - [x] _follow-on — GIN bounds for UPDATE/DELETE scans:_ a mutation whose `WHERE` has a
+        GIN-accelerable conjunct (`@>`/`&&`/`= ANY`/`=`) now bounds its **target-row scan** through
+        the GIN index instead of full-scanning (PK-then-GIN-then-full; the ordered-index equality
+        bound stays SELECT-only, a separate follow-on). Refactored `gin_bound_rows` to return
+        `(storage_key, row)` pairs — the candidate set IS the keys — so the mutation can rewrite/remove
+        them; a shared `detect_gin_bound` helper feeds both the SELECT planner and the mutation scan.
+        The bound is over the pre-mutation index state and the array column is in the `WHERE` (so
+        resolved), so GIN-entry maintenance stays correct; end state + RETURNING rows identical to the
+        full scan. **Matches PG** (it uses its array GIN index for UPDATE/DELETE too). All three cores
+        + capability `query.gin_mutation` + `suites/query/gin_mutation.test` (cost-asserted across all
+        four strategies + the `@> '{}'` fallback + a miss, oracle-checked) + the `gin_mut` NoREC
+        scenario (index-bound mutation vs `<@` full-scan mutation, same end state) + a `gin_delete`
+        write-rollback bench + `/web` Indexes page. → [gin.md §6](spec/design/gin.md)
   - [ ] _follow-on (each its own slice):_ `<@` (contained-by, broad scan + recheck — blocked on the
         index recording empty/NULL-array rows) / `IN` over a scalar list; non-integer element types
         (as their key encodings lift) + composite-element arrays; multi-column GIN; correlated /
-        array-column query operands; GIN for UPDATE/DELETE scans; the LIMIT-streaming combination;
-        posting-list run compression; the **`jsonb_ops`** opclass (the lossy-recheck path the seam
-        already seats) and a future object/document opclass.
+        array-column query operands; the **ordered-index** equality bound for UPDATE/DELETE (mutations
+        use PK+GIN but not the ordered index yet); the LIMIT-streaming combination; posting-list run
+        compression; the **`jsonb_ops`** opclass (the lossy-recheck path the seam already seats) and a
+        future object/document opclass.
 - [x] **`RETURNING`** — `INSERT`/`UPDATE`/`DELETE … RETURNING <select_items>` projecting affected
       rows (INSERT stored / UPDATE new / DELETE old), evaluated after validation before any write;
       the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.

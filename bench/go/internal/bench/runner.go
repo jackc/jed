@@ -239,15 +239,15 @@ func runOne(cfg Config, b *Bench, datasets *Datasets, dataDir, want string) (Res
 	return res, nil
 }
 
-// insertTable extracts the target table from "INSERT INTO <table> ..." for the
-// post-run count.
+// insertTable extracts the target table of a write statement — the word after INTO
+// (INSERT INTO <table>) or FROM (DELETE FROM <table>) — for the post-run count.
 func insertTable(sql string) string {
 	fields := strings.Fields(sql)
 	for i, f := range fields {
-		if strings.EqualFold(f, "INTO") && i+1 < len(fields) {
+		if (strings.EqualFold(f, "INTO") || strings.EqualFold(f, "FROM")) && i+1 < len(fields) {
 			name, _, _ := strings.Cut(fields[i+1], "(")
 			return name
 		}
 	}
-	panic("write bench SQL has no INSERT INTO table: " + sql)
+	panic("write bench SQL has no INSERT INTO / DELETE FROM table: " + sql)
 }

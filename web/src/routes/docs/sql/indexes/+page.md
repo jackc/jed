@@ -95,7 +95,10 @@ It accelerates the two array set operators, array membership, and exact equality
   residual `=` enforces order and length — **stricter** than containment.
 
 The original `WHERE` stays as the residual filter, so the answer is identical to the full-scan
-answer — the index is transparent. Containment (`intro` and `gin` both hold `{10, 20}`):
+answer — the index is transparent. The same bound applies to **`UPDATE` and `DELETE`**: a mutation
+whose `WHERE` is GIN-accelerable narrows its target-row scan through the index too, so the rows it
+rewrites or removes are exactly the full-scan set (only faster). Containment (`intro` and `gin` both
+hold `{10, 20}`):
 
 <LiveSql seed={ginSeed} query={containsQuery} rows={6} />
 

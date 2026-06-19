@@ -560,14 +560,16 @@ fn run_one(
     })
 }
 
+// The target table of a write statement — the word after INTO (INSERT INTO <table>) or
+// FROM (DELETE FROM <table>) — for the post-run count.
 fn insert_table(sql: &str) -> String {
     let fields: Vec<&str> = sql.split_whitespace().collect();
     for (i, f) in fields.iter().enumerate() {
-        if f.eq_ignore_ascii_case("INTO") && i + 1 < fields.len() {
+        if (f.eq_ignore_ascii_case("INTO") || f.eq_ignore_ascii_case("FROM")) && i + 1 < fields.len() {
             return fields[i + 1].split('(').next().unwrap().to_string();
         }
     }
-    panic!("write bench SQL has no INSERT INTO table: {sql}");
+    panic!("write bench SQL has no INSERT INTO / DELETE FROM table: {sql}");
 }
 
 /// Uniform binary entrypoint: bench-<engine> <corpus_dir> <data_dir> <out_path> [filter].

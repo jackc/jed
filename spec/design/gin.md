@@ -198,16 +198,25 @@ may be large/compressed/external (unlike the fixed-width ordered keys), so maint
 fault a value's overflow chain to read its elements — the read is part of the (unmetered)
 write phase, deterministic, and cannot fail.
 
-## 6. The planner: GIN-bounded scans (SELECT)
+## 6. The planner: GIN-bounded scans (SELECT, UPDATE, DELETE)
 
 The per-relation pushdown seam ([indexes.md §5](indexes.md), [cost.md §3](cost.md)) gains a
-**third bound kind**, after the PK bound and the ordered-index equality bound. For each base
-relation of a **SELECT** scan, if the `WHERE` AND-chain has a conjunct
+**third bound kind**, after the PK bound and the ordered-index equality bound. For a base
+relation scanned by a **`SELECT`, `UPDATE`, or `DELETE`**, if the `WHERE` AND-chain has a conjunct
 `col @> Q` (contains), `col && Q` (overlaps), `c = ANY(col)` (membership), or `col = Q`
 (exact array equality) where `col` is a GIN-indexed column and **the query operand is a
 constant** (`Q` a literal/`$N`-param array, `c` a literal/`$N`-param scalar — a
 correlated/array-column operand is a follow-on), the plan bounds the scan through the GIN
-index. (`= ANY` is the only quantified form accelerated: the membership `c = ANY(col)` —
+index. **`UPDATE`/`DELETE` apply the identical bound to their target-row scan** (the gather +
+residual filter that finds the rows to rewrite/remove), so the same conjunct that bounds a
+`SELECT` bounds the mutation — only the precedence differs: a mutation prefers its own
+**PK bound** first, then the **GIN** bound, then a full scan (the *ordered-index* equality bound
+stays SELECT-only — a separate follow-on, §10). The bound is over the **pre-mutation** index
+state (the `WHERE` evaluates against the old row), so the candidate set is exactly the rows the
+full scan would have matched; phase 2 then rewrites/removes them and maintains every index
+(the GIN entries among them) as before — the result and end state are identical to the full
+scan ([indexes.md §4](indexes.md)). The array column is in the `WHERE`, hence in the touched
+set, hence resolved, so GIN-entry maintenance over it stays correct. (`= ANY` is the only quantified form accelerated: the membership `c = ANY(col)` —
 *not* `c = ALL(col)` or any `<>`/`<`/… quantifier, which are not a single-term posting gather;
 and the indexed column must be `ANY`'s **array** operand, with `c` the scalar. Array `=` is
 **commutative** — both `col = Q` and `Q = col` are recognized; the terms come from the constant
@@ -248,9 +257,10 @@ PK/ordered/full choice stands.
 **Narrowings this slice** (documented, relaxable, each a follow-on with its own NoREC
 obligation — [conformance.md §8](conformance.md)): a **constant** query operand only (no
 correlated / array-column operand); **`@>`, `&&`, `= ANY`, and array `=` only** (no `<@` or
-`IN` over a scalar list); **SELECT scans only** (UPDATE/DELETE keep their PK pushdown); and
-**no LIMIT-streaming combination** — a GIN-bounded scan with a `LIMIT` takes the eager path,
-like the ordered-index bound.
+`IN` over a scalar list); a mutation uses the **PK then GIN** bound but **not** the
+ordered-index equality bound (SELECT-only, a separate follow-on); and **no LIMIT-streaming
+combination** — a GIN-bounded scan with a `LIMIT` takes the eager path, like the ordered-index
+bound (mutations have no `LIMIT`).
 
 ### Cost (the cross-core contract — [cost.md §3](cost.md))
 
@@ -271,7 +281,13 @@ A GIN-bounded scan accrues, in place of the full-scan block:
   **`row_produced`**, unchanged.
 
 A provably-empty bound charges nothing; the `@> '{}'` fallback charges the full scan it
-falls back to. `CREATE INDEX … USING gin` charges its build scan — `page_read` × the
+falls back to. A **GIN-bounded `UPDATE`/`DELETE`** accrues this **same scan block** (the gather
++ per-candidate point lookup + residual `operator_eval`), in place of its full-scan block — so
+a `DELETE … WHERE col @> Q` costs the same scan as the matching `SELECT … WHERE col @> Q`,
+minus the `row_produced` a bare mutation does not emit (a `RETURNING` clause restores it, plus
+its projection's units); the phase-2 rewrite/remove and index maintenance are **unmetered**
+writes (as for any mutation — [cost.md §3](cost.md)). `CREATE INDEX … USING gin` charges its
+build scan — `page_read` × the
 table's full node count + `storage_row_read` per row (the build's touched set is the array
 column, which **can** be large, so its overflow-chain `page_read` and `value_decompress`
 terms are *not* structurally zero, unlike the fixed-width ordered build); an empty table
@@ -355,8 +371,9 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   element key encodings lift ([encoding.md §2.4–§2.6](encoding.md)); composite-element arrays.
 - **More operators** — `<@` (contained-by, a broad scan + recheck), `IN` membership over a
   scalar list. (`const = ANY(col)` membership and array `=` have landed — §1/§6.)
-- **Multi-column GIN**, correlated / array-column query operands, GIN bounds for UPDATE /
-  DELETE scans, and the LIMIT-streaming combination.
+- **Multi-column GIN**, correlated / array-column query operands, and the LIMIT-streaming
+  combination. (GIN bounds for `UPDATE`/`DELETE` scans have landed — §6; the **ordered-index**
+  equality bound for mutations, still SELECT-only, is the remaining mutation-pushdown follow-on.)
 - **Posting-list run compression** — a long contiguous run of one term's entries
   (a term present in very many rows) is stored as the raw entry sequence this slice; PG's
   posting-tree TID compression is a later storage optimization, byte-contract-pinned when it lands.

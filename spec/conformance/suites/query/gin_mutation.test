@@ -1,0 +1,173 @@
+# GIN-bounded UPDATE/DELETE — a mutation whose WHERE has a GIN-accelerable conjunct bounds its
+# TARGET-ROW scan through the GIN index, instead of full-scanning (spec/design/gin.md §6). The same
+# four predicate shapes a SELECT accelerates — `tags @> Q` (contains), `tags && Q` (overlaps),
+# `c = ANY(tags)` (membership), `tags = Q` (equality) — bound an UPDATE's / DELETE's scan: gather the
+# candidate rows (term posting lists → intersect/union), re-apply the predicate as the residual
+# filter, then rewrite/remove exactly those rows and maintain every index (the GIN entries among
+# them). The END STATE is identical to the full scan — this file pins that the index is transparent
+# under mutation (correct rows updated/deleted, across all four strategies, the @> '{}' full-scan
+# fallback, and a miss), and PostgreSQL agrees (it uses its array GIN index for UPDATE/DELETE too —
+# the end state never depends on whether an index is used).
+#
+# The `# cost:` assertions (on each mutation `statement`/`query`) PIN that the GIN bound — not a full
+# scan — is taken: page_read per query term's posting range + gin_entry per posting entry visited +
+# per-candidate point lookup (page_read + storage_row_read) + the residual operator_eval; a bare
+# mutation omits row_produced (a RETURNING clause restores it + its projection units), and the
+# phase-2 rewrite/remove + index maintenance are unmetered writes (gin.md §6 / cost.md §3). The costs
+# are cross-core identical (CLAUDE.md §8). Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_mutation, query.gin_scan, query.gin_any_eq, query.gin_array_eq, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, query.select, query.order_by, query.where_eq, func.array_containment, func.array_quantified, expr.arithmetic, types.i32, types.i64, types.array, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], m i32)
+
+statement ok
+CREATE INDEX t_tags_gin ON t USING gin (tags)
+
+# shared / disjoint / duplicate / empty / NULL-array / single-element rows; m starts 0
+statement ok
+INSERT INTO t VALUES
+  (1, ARRAY[10,20,30], 0),
+  (2, ARRAY[20,40], 0),
+  (3, ARRAY[40,50], 0),
+  (4, ARRAY[10,20], 0),
+  (5, '{}', 0),
+  (6, NULL, 0),
+  (7, ARRAY[10], 0)
+
+# --- DELETE @> miss: no row contains 99 → the gather finds nothing, deletes nothing -------------
+# (a real GIN gather over the empty posting list, NOT a provably-empty bound — pins the bound is
+# taken even on a miss; the table is unchanged)
+# cost: 1
+statement ok
+DELETE FROM t WHERE tags @> ARRAY[99]
+
+query II nosort
+SELECT id, m FROM t ORDER BY id
+----
+1
+0
+2
+0
+3
+0
+4
+0
+5
+0
+6
+0
+7
+0
+
+# --- UPDATE via @> (contains): rows whose tags contain BOTH 10 and 20 → ids 1,4 get m = 1 --------
+# cost: 16
+statement ok
+UPDATE t SET m = 1 WHERE tags @> ARRAY[10,20]
+
+query II nosort
+SELECT id, m FROM t ORDER BY id
+----
+1
+1
+2
+0
+3
+0
+4
+1
+5
+0
+6
+0
+7
+0
+
+# --- UPDATE via && (overlaps): rows sharing 40 → ids 2,3 get m = m + 10 (arithmetic over the bound)
+# cost: 13
+statement ok
+UPDATE t SET m = m + 10 WHERE tags && ARRAY[40]
+
+query II nosort
+SELECT id, m FROM t ORDER BY id
+----
+1
+1
+2
+10
+3
+10
+4
+1
+5
+0
+6
+0
+7
+0
+
+# --- DELETE via = ANY (membership) RETURNING: rows containing 50 → id 3 (RETURNING restores
+# row_produced, so this cost carries one more row_produced than the bare deletes below) -----------
+# cost: 8
+query I rowsort
+DELETE FROM t WHERE 50 = ANY(tags) RETURNING id
+----
+3
+
+query II nosort
+SELECT id, m FROM t ORDER BY id
+----
+1
+1
+2
+10
+4
+1
+5
+0
+6
+0
+7
+0
+
+# --- DELETE via = (exact array equality): tags exactly {10,20} → id 4 (the @>-superset gather +
+# residual = makes it exact — only id 4, not id 1 which merely CONTAINS {10,20}) -----------------
+# cost: 16
+statement ok
+DELETE FROM t WHERE tags = ARRAY[10,20]
+
+query II nosort
+SELECT id, m FROM t ORDER BY id
+----
+1
+1
+2
+10
+5
+0
+6
+0
+7
+0
+
+# the GIN index itself reflects the deletions — a GIN-bounded SELECT now finds only the surviving
+# rows that still carry the term: ids 1 and 7 hold 10; id 4 (which also held 10) was removed by the
+# DELETE above, so its GIN entries are gone. (Pins that a GIN-bounded mutation maintains the index.)
+# cost: 13
+query I nosort
+SELECT id FROM t WHERE 10 = ANY(tags) ORDER BY id
+----
+1
+7
+
+# --- DELETE via @> '{}' (full-scan fallback): every NON-NULL array contains the empty array, so
+# this falls back to the full scan and the residual @> '{}' keeps ids 1,2,5,7 — only the NULL-tags
+# row 6 survives (its tags are NULL, never @> anything) ------------------------------------------
+# cost: 11
+statement ok
+DELETE FROM t WHERE tags @> '{}'::i32[]
+
+query II nosort
+SELECT id, m FROM t ORDER BY id
+----
+6
+0

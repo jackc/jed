@@ -41,6 +41,11 @@
 #   gin_eq   — `tags = Q` over a GIN-indexed array column gathers candidates via the @>-superset
 #              bound + residual = (gin.md §6); the equivalent `NOT (tags <> Q)` is NOT GIN-accelerated
 #              (full scan). Both must return identical rows (exact-equality gather oracle).
+#   gin_mut  — a GIN-bounded UPDATE/DELETE: `UPDATE … WHERE tags @> Q` / `DELETE … WHERE c = ANY(tags)`
+#              bound their scan through the index (gin.md §6); the SAME predicates spelled `Q <@ tags`
+#              / `'{c}' <@ tags` are NOT GIN-accelerated (full scan). Applied to two identically-seeded
+#              tables (one bounded, one not), both reach the SAME by-construction end state (the bound
+#              is transparent under mutation).
 #
 # Determinism (CLAUDE.md §10): generation is SEEDED, so a discovered failure reduces to this exact
 # deterministic .test, which then joins the corpus. The fuzzer is dev-time discovery; the emitted
@@ -101,6 +106,9 @@ GIN_ANY_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_any_eq
 GIN_EQ_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_array_eq dml.insert
                 dml.insert_multi_row query.select query.order_by query.where_eq types.i32
                 types.array].freeze
+GIN_MUT_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_mutation query.gin_any_eq
+                 dml.insert dml.insert_multi_row dml.update dml.delete query.select query.where_eq
+                 query.order_by types.i32 types.array func.array_containment func.array_quantified].freeze
 
 # The default relation note describes the NoREC pair (an optimized form vs a non-optimizable
 # rewrite). TLP overrides it with its own partition-reconstruction note (it is not an opt pair).
@@ -503,6 +511,70 @@ def gen_gin_eq(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: GIN-bounded UPDATE/DELETE (index-bound mutation vs <@ full-scan mutation) ---------
+# A GIN-bounded UPDATE/DELETE bounds its TARGET-ROW scan through the index (spec/design/gin.md §6;
+# query.gin_mutation): `UPDATE … WHERE tags @> Q` takes the @> bound, `DELETE … WHERE c = ANY(tags)`
+# the single-term membership bound. The SEMANTICALLY IDENTICAL predicates spelled with `<@` —
+# `Q <@ tags` (= `tags @> Q`) and `'{c}' <@ tags` (= c ∈ tags) — are NOT GIN-accelerated (gin_match
+# never matches `<@`) and full-scan. So the metamorphic relation runs the SAME mutation sequence on
+# two identically-seeded tables — t1 via the GIN-accelerable spellings (the new bound path), t2 via
+# the `<@` spellings (the old full-scan path) — and asserts BOTH reach the SAME end state, which is
+# the by-construction expected state (UPDATE m=1 on rows whose tags ⊇ Q, then DELETE rows containing
+# c). This catches a GIN-bounded-mutation bug ALL cores might share (the bound admits the wrong rows,
+# or maintenance corrupts state), which differential testing alone cannot. No NULL ELEMENTS are
+# generated, so the oracle is exact; `'{…}'::i32[]` literals pin the element type.
+def gen_gin_mutation(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  # (id, tags): a small int array from a small domain; one row is NULL and some are empty {}.
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+
+    [id, Array.new(rng.rand(0..3)) { rng.rand(0..4) }]
+  end
+
+  elems = rows.filter_map { |_id, t| t }.flatten
+  present = elems.sample(random: rng) || 0
+  # Q = a 1- or 2-term @> query: `present` plus a co-occurring DISTINCT element when one exists
+  # (so @> admits ≥1 row); else just `present` (the .uniq collapses the duplicate — still valid).
+  partner = rows.filter_map { |_id, t| t }.find { |t| t.include?(present) && (t.uniq - [present]).any? }
+  k2 = partner ? (partner.uniq - [present]).sample(random: rng) : present
+  qa = [present, k2].uniq
+  c = elems.sample(random: rng) || 0 # the = ANY membership delete term (may equal present)
+
+  # By construction: UPDATE sets m=1 on rows whose (non-NULL) tags ⊇ Q, THEN DELETE removes rows
+  # whose (non-NULL) tags contain c. Survivors keep m (1 iff they matched @> Q). NULL/empty tags
+  # never match either, so those rows survive with m=0.
+  contains_qa = ->(t) { !t.nil? && qa.all? { |k| t.include?(k) } }
+  survivors = rows.reject { |_id, t| !t.nil? && t.include?(c) }
+  expected = survivors.sort_by(&:first).flat_map { |id, t| [id.to_s, contains_qa.call(t) ? "1" : "0"] }
+
+  arr = ->(ks) { "'{#{ks.join(',')}}'::i32[]" }
+  ins = rows.map { |id, t| "(#{id}, #{t.nil? ? 'NULL' : "'{#{t.join(',')}}'"}, 0)" }.join(", ")
+
+  out = header(seed, GIN_MUT_REQ, "GIN-bounded UPDATE/DELETE (index-bound mutation vs <@ full-scan mutation)")
+  stmt(out, "CREATE TABLE t1 (id i32 PRIMARY KEY, tags i32[], m i32)")
+  stmt(out, "CREATE TABLE t2 (id i32 PRIMARY KEY, tags i32[], m i32)")
+  stmt(out, "INSERT INTO t1 VALUES #{ins}")
+  stmt(out, "INSERT INTO t2 VALUES #{ins}")
+  stmt(out, "CREATE INDEX t1_tags_gin ON t1 USING gin (tags)")
+  stmt(out, "CREATE INDEX t2_tags_gin ON t2 USING gin (tags)")
+
+  out << "# t1: GIN-bounded mutations — `tags @> Q` and `c = ANY(tags)` take the index bound"
+  stmt(out, "UPDATE t1 SET m = 1 WHERE tags @> #{arr.call(qa)}")
+  stmt(out, "DELETE FROM t1 WHERE #{c} = ANY(tags)")
+  out << "# t2: the SAME predicates spelled with <@ — NOT GIN-accelerated (full scan)"
+  stmt(out, "UPDATE t2 SET m = 1 WHERE #{arr.call(qa)} <@ tags")
+  stmt(out, "DELETE FROM t2 WHERE #{arr.call([c])} <@ tags")
+
+  out << "# both tables reach the SAME by-construction end state (the bound is transparent under mutation)"
+  q(out, "II", "SELECT id, m FROM t1 ORDER BY id", expected)
+  q(out, "II", "SELECT id, m FROM t2 ORDER BY id", expected)
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: TLP (ternary-logic partitioning) -----------------------------------------------
 # Kleene 3-valued helpers: Ruby `nil` is SQL UNKNOWN. A comparison with a NULL operand is UNKNOWN;
 # AND/OR follow Kleene logic; NOT(UNKNOWN) is UNKNOWN. These mirror jed's PG-default 3VL exactly
@@ -654,6 +726,7 @@ SCENARIOS = {
   "gin" => method(:gen_gin),
   "gin_any" => method(:gen_gin_any),
   "gin_eq" => method(:gen_gin_eq),
+  "gin_mut" => method(:gen_gin_mutation),
   "tlp" => method(:gen_tlp),
   "cte" => method(:gen_cte),
 }.freeze

@@ -2371,9 +2371,9 @@ export class Database {
     env: EvalEnv,
     meter: Meter,
     mask: boolean[],
-  ): { rows: Row[]; pages: number; slabs: number } {
+  ): { entries: Entry[]; pages: number; slabs: number } {
     const store = this.readSnap().store(tableName);
-    if (query === null) return { rows: [], pages: 0, slabs: 0 };
+    if (query === null) return { entries: [], pages: 0, slabs: 0 };
     // Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
     // §3): evaluate Q on a scratch meter. Q is a constant, so the empty row suffices.
     const qv = evalExpr(query, [], env, new Meter());
@@ -2386,10 +2386,10 @@ export class Database {
       // (jed coerces c to the element type, rejecting an out-of-range constant 22003 before exec);
       // inRange is a defensive guard against silently truncating an out-of-range value into a wrong
       // term.
-      if (qv.kind !== "int" || !inRange(gb.elemType, qv.int)) return { rows: [], pages: 0, slabs: 0 };
+      if (qv.kind !== "int" || !inRange(gb.elemType, qv.int)) return { entries: [], pages: 0, slabs: 0 };
       terms.push(qv.int);
     } else {
-      if (qv.kind !== "array") return { rows: [], pages: 0, slabs: 0 }; // NULL/non-array → provably empty
+      if (qv.kind !== "array") return { entries: [], pages: 0, slabs: 0 }; // NULL/non-array → provably empty
       const seen = new Set<bigint>();
       for (const el of qv.elements) {
         if (el.kind === "int") {
@@ -2410,9 +2410,9 @@ export class Database {
         // @> '{}': every non-NULL array contains the empty array — not derivable from the index;
         // fall back to the full scan (the residual filter keeps the right rows — gin.md §6).
         const u = store.scanWithUnits(mask);
-        return { rows: u.entries.map((e) => e.row), pages: u.pages, slabs: u.slabs };
+        return { entries: u.entries, pages: u.pages, slabs: u.slabs };
       }
-      if (hasNull) return { rows: [], pages: 0, slabs: 0 }; // @> a query with a NULL element is never TRUE
+      if (hasNull) return { entries: [], pages: 0, slabs: 0 }; // @> a query with a NULL element is never TRUE
     } else if (gb.strategy === "equal") {
       if (terms.length === 0) {
         // col = Q with NO non-NULL term — '{}' (isEmpty) or an all-NULL Q (hasNull, no non-NULL
@@ -2421,10 +2421,10 @@ export class Database {
         // NOT a provably-empty bound — and a Q with ≥1 non-NULL element is NOT caught here (it
         // gathers, even when it also has a NULL element).
         const u = store.scanWithUnits(mask);
-        return { rows: u.entries.map((e) => e.row), pages: u.pages, slabs: u.slabs };
+        return { entries: u.entries, pages: u.pages, slabs: u.slabs };
       }
     } else if (gb.strategy === "overlaps") {
-      if (terms.length === 0) return { rows: [], pages: 0, slabs: 0 }; // && with no non-NULL term
+      if (terms.length === 0) return { entries: [], pages: 0, slabs: 0 }; // && with no non-NULL term
     }
 
     // Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
@@ -2453,15 +2453,15 @@ export class Database {
     const cand = gb.strategy === "overlaps" ? unionPostings(postings) : intersectPostings(postings);
 
     let slabs = 0;
-    const rows: Row[] = [];
+    const entries: Entry[] = [];
     for (const key of cand) {
       const u = store.getWithUnits(key, mask);
       pages += u.pages;
       slabs += u.slabs;
       if (u.row === undefined) throw new Error("a GIN entry references a stored row");
-      rows.push(u.row);
+      entries.push({ key, row: u.row });
     }
-    return { rows, pages, slabs };
+    return { entries, pages, slabs };
   }
 
   // executeInsert runs an INSERT whose rows come from a VALUES list or a SELECT (grammar.md
@@ -3030,7 +3030,31 @@ export class Database {
     // (empty rows), never a bare statement (grammar.md §32). The whole WHERE stays the
     // residual filter below. page_read per visited node (block, before the rows), then
     // storageRowRead per scanned row.
-    const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound, mask);
+    const mb = mutationPkBound(table, filter);
+    let entries: Entry[] | null;
+    let overlap: number;
+    let slabs: number;
+    if (mb !== null) {
+      ({ entries, overlap, slabs } = scanEntries(store, mb, bound, mask));
+    } else {
+      // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct bounds the
+      // delete's target-row scan through the index instead of a full scan (PK-then-GIN-then-full; the
+      // ordered-index bound stays SELECT-only). readSnap()==working() during a mutation (tx open), so
+      // this reads the read-your-writes state. ginEntry charged inside; the block below.
+      const gb = detectGinBound(filter, table.indexes, table.columns, 0);
+      if (gb !== null) {
+        const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
+        const r = this.ginBoundRows(del.table, gb, m?.query ?? null, env, meter, mask);
+        entries = r.entries;
+        overlap = r.pages;
+        slabs = r.slabs;
+      } else {
+        const u = store.scanWithUnits(mask);
+        entries = u.entries;
+        overlap = u.pages;
+        slabs = u.slabs;
+      }
+    }
     if (entries === null) return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
@@ -3211,7 +3235,30 @@ export class Database {
     // (empty rows), never a bare statement (grammar.md §32). The whole WHERE stays the
     // residual filter below. page_read per visited node (block, before the rows), then
     // storageRowRead per scanned row.
-    const { entries, overlap, slabs } = scanEntries(store, mutationPkBound(table, filter), bound, mask);
+    const mb = mutationPkBound(table, filter);
+    let entries: Entry[] | null;
+    let overlap: number;
+    let slabs: number;
+    if (mb !== null) {
+      ({ entries, overlap, slabs } = scanEntries(store, mb, bound, mask));
+    } else {
+      // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct bounds the
+      // update's target-row scan through the index over the PRE-update state (PK-then-GIN-then-full;
+      // the ordered-index bound stays SELECT-only). ginEntry charged inside; the block below.
+      const gb = detectGinBound(filter, table.indexes, table.columns, 0);
+      if (gb !== null) {
+        const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
+        const r = this.ginBoundRows(upd.table, gb, m?.query ?? null, env, meter, mask);
+        entries = r.entries;
+        overlap = r.pages;
+        slabs = r.slabs;
+      } else {
+        const u = store.scanWithUnits(mask);
+        entries = u.entries;
+        overlap = u.pages;
+        slabs = u.slabs;
+      }
+    }
     if (entries === null) return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
     meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
@@ -4283,7 +4330,8 @@ export class Database {
       // chose — gin.md §6); the @>/&& predicate also stays the residual filter downstream.
       const m = plan.filter !== null ? ginMatch(plan.filter, relBound.gin.colGlobal) : null;
       const r = this.ginBoundRows(rel.tableName, relBound.gin, m?.query ?? null, env, meter, plan.relMasks[ri]!);
-      rows = r.rows;
+      // SELECT discards the storage keys (UPDATE/DELETE keep them — gin.md §6).
+      rows = r.entries.map((e) => e.row);
       nodeCount = r.pages;
       slabs = r.slabs;
     } else if (relBound !== null) {
@@ -4834,20 +4882,27 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
       return { kind: "index", index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, tailTypes } };
     }
   }
-  // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds: the lowest-named GIN
-  // index whose array column has a `col @> const` / `col && const` conjunct.
-  for (const idx of rel.table.indexes) {
+  // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
+  const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
+  return gb !== null ? { kind: "gin", gin: gb } : null;
+}
+
+// detectGinBound detects a GIN-bounded scan over columns/indexes (gin.md §6): the lowest-named GIN
+// index whose array column at offset+ci has a GIN-accelerable conjunct (`col @> const`,
+// `col && const`, `const = ANY(col)`, or `col = const`). Factored out so the SELECT planner
+// (detectScanBound) and the UPDATE/DELETE scan both use the identical detection — the mutations
+// pass their own table's indexes/columns at offset 0.
+function detectGinBound(filter: RExpr | null, indexes: IndexDef[], columns: Column[], offset: number): GinBound | null {
+  if (filter === null) return null;
+  for (const idx of indexes) {
     if (idx.kind !== "gin") continue;
     const ci = idx.columns[0]!;
-    const colGlobal = rel.offset + ci;
-    const colType = rel.table.columns[ci]!.type;
+    const colGlobal = offset + ci;
+    const colType = columns[ci]!.type;
     if (colType.kind !== "array") continue; // a GIN column is always an array (the gate); defensive
     const m = ginMatch(filter, colGlobal);
     if (m !== null) {
-      return {
-        kind: "gin",
-        gin: { nameKey: idx.name.toLowerCase(), elemType: typeScalar(colType.elem), strategy: m.strategy, colGlobal },
-      };
+      return { nameKey: idx.name.toLowerCase(), elemType: typeScalar(colType.elem), strategy: m.strategy, colGlobal };
     }
   }
   return null;

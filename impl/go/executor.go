@@ -3577,6 +3577,18 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
 			return Outcome{}, err
 		}
+	} else if gb := detectGinBound(filter, table.Indexes, table.Columns, 0); gb != nil {
+		// GIN-bounded delete (gin.md §6): when no PK bound applies, gather the candidate (key,row)
+		// Entry pairs through the index; the predicate stays the residual filter, re-applied per
+		// candidate below. GinEntry charged inside; the page_read/value_decompress block below.
+		// readSnap()==working() during a mutation (tx open), so this reads the read-your-writes state.
+		var query *rExpr
+		if _, q, ok := ginMatch(filter, gb.colGlobal); ok {
+			query = q
+		}
+		if entries, overlap, slabs, err = db.ginBoundRows(del.Table, gb, query, env, meter, mask); err != nil {
+			return Outcome{}, err
+		}
 	} else {
 		if entries, overlap, slabs, err = store.ScanWithUnits(mask); err != nil {
 			return Outcome{}, err
@@ -3852,6 +3864,17 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			return dmlOutcome(retNames, retTypes, nil, 0, meter.Accrued), nil
 		}
 		if entries, overlap, slabs, err = store.RangeScanWithUnits(kb, mask); err != nil {
+			return Outcome{}, err
+		}
+	} else if gb := detectGinBound(filter, table.Indexes, table.Columns, 0); gb != nil {
+		// GIN-bounded update (gin.md §6): when no PK bound applies, gather the candidate (key,row)
+		// Entry pairs through the index over the PRE-update state; the predicate stays the residual
+		// filter (re-applied per candidate below). GinEntry charged inside; the block below.
+		var query *rExpr
+		if _, q, ok := ginMatch(filter, gb.colGlobal); ok {
+			query = q
+		}
+		if entries, overlap, slabs, err = db.ginBoundRows(upd.Table, gb, query, env, meter, mask); err != nil {
 			return Outcome{}, err
 		}
 	} else {
@@ -5662,22 +5685,36 @@ func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 			}}
 		}
 	}
-	// GIN bound (gin.md §6) — after the PK and ordered-index equality bounds: the lowest-named GIN
-	// index whose array column has a `col @> const` / `col && const` conjunct.
-	for _, idx := range rel.table.Indexes {
+	// GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
+	if gb := detectGinBound(filter, rel.table.Indexes, rel.table.Columns, rel.offset); gb != nil {
+		return &scanBound{gin: gb}
+	}
+	return nil
+}
+
+// detectGinBound detects a GIN-bounded scan over columns/indexes (gin.md §6): the lowest-named
+// GIN index whose array column at offset+ci has a GIN-accelerable conjunct (`col @> const`,
+// `col && const`, `const = ANY(col)`, or `col = const`). Factored out so the SELECT planner
+// (detectScanBound) and the UPDATE/DELETE scan both use the identical detection — the mutations
+// pass their own table's indexes/columns at offset 0.
+func detectGinBound(filter *rExpr, indexes []IndexDef, columns []Column, offset int) *ginBoundPlan {
+	if filter == nil {
+		return nil
+	}
+	for _, idx := range indexes {
 		if idx.Kind != IndexGin {
 			continue
 		}
 		ci := idx.Columns[0]
-		colGlobal := rel.offset + ci
-		at := rel.table.Columns[ci].Type
+		colGlobal := offset + ci
+		at := columns[ci].Type
 		if at.Array == nil {
 			continue // a GIN column is always an array (the CREATE INDEX gate); defensive
 		}
 		if s, _, ok := ginMatch(filter, colGlobal); ok {
-			return &scanBound{gin: &ginBoundPlan{
+			return &ginBoundPlan{
 				nameKey: strings.ToLower(idx.Name), elemType: at.Array.ScalarTy(), strategy: s, colGlobal: colGlobal,
-			}}
+			}
 		}
 	}
 	return nil
@@ -5861,7 +5898,11 @@ func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params 
 // Degenerate constant queries (gin.md §6): a NULL Q, an @> whose Q holds a NULL element, an && with
 // no non-NULL term, and a NULL = ANY scalar are provably empty; @> '{}' and array = with no non-NULL
 // term fall back to the full scan.
-func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (rows []Row, pages, slabs int, err error) {
+// ginBoundRows gathers a GIN-bounded scan's candidate rows as (storage key, row) Entry pairs
+// (the candidate set IS the storage keys), with the up-front (page_read nodes, value_decompress
+// slabs) block. SELECT drops the keys; UPDATE/DELETE keep them to rewrite/remove the rows
+// (gin.md §6). GinEntry is charged inside (during the gather); the caller charges the block.
+func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (out []Entry, pages, slabs int, err error) {
 	store := db.readSnap().store(tableName)
 	if query == nil {
 		return nil, 0, 0, nil
@@ -5914,11 +5955,7 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 			if e != nil {
 				return nil, 0, 0, e
 			}
-			rows = make([]Row, len(entries))
-			for i := range entries {
-				rows[i] = entries[i].Row
-			}
-			return rows, p, sl, nil
+			return entries, p, sl, nil
 		}
 		if hasNull {
 			return nil, 0, 0, nil // @> a query with a NULL element is never TRUE
@@ -5934,11 +5971,7 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 			if e != nil {
 				return nil, 0, 0, e
 			}
-			rows = make([]Row, len(entries))
-			for i := range entries {
-				rows[i] = entries[i].Row
-			}
-			return rows, p, sl, nil
+			return entries, p, sl, nil
 		}
 	case ginOverlaps:
 		if len(terms) == 0 {
@@ -5992,9 +6025,9 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 		if !ok {
 			panic("a GIN entry references a stored row")
 		}
-		rows = append(rows, row)
+		out = append(out, Entry{Key: key, Row: row})
 	}
-	return rows, pages, slabs, nil
+	return out, pages, slabs, nil
 }
 
 // intersectPostings returns the storage keys present in EVERY posting list (the @> mode-ALL
@@ -6586,10 +6619,16 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 				query = q
 			}
 		}
-		var err error
-		if rows, nodeCount, slabs, err = db.ginBoundRows(rel.tableName, sb.gin, query, env, meter, plan.relMasks[ri]); err != nil {
+		entries, pages, sl, err := db.ginBoundRows(rel.tableName, sb.gin, query, env, meter, plan.relMasks[ri])
+		if err != nil {
 			return nil, err
 		}
+		// SELECT discards the storage keys (UPDATE/DELETE keep them — gin.md §6).
+		rows = make([]Row, len(entries))
+		for i := range entries {
+			rows[i] = entries[i].Row
+		}
+		nodeCount, slabs = pages, sl
 	} else if sb != nil {
 		b, empty := db.buildKeyBound(sb.pk, params, outer)
 		if !empty {
