@@ -87,3 +87,99 @@ fn currval_session_state() {
     // currval does not advance: repeated reads return the same value.
     assert_eq!(one_int(&mut db, "SELECT currval('s')"), Some(1));
 }
+
+// --- S2 (setval / lastval / ALTER SEQUENCE RESTART, spec/design/sequences.md §4/§6) -----------
+
+/// A `setval` is transactional too (the §5 divergence): an advance inside a rolled-back transaction
+/// is discarded — PostgreSQL would keep it.
+#[test]
+fn setval_rolls_back() {
+    let mut db = Database::new();
+    execute(&mut db, "CREATE SEQUENCE s START 1").unwrap();
+    assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(1)); // committed last_value 1
+
+    execute(&mut db, "BEGIN").unwrap();
+    assert_eq!(one_int(&mut db, "SELECT setval('s', 99)"), Some(99)); // working last_value 99
+    execute(&mut db, "ROLLBACK").unwrap();
+
+    // jed: the setval vanished — the committed counter is still 1, so the next value is 2.
+    assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(2));
+}
+
+/// An `ALTER SEQUENCE … RESTART` is transactional as well (the same §5 divergence).
+#[test]
+fn alter_restart_rolls_back() {
+    let mut db = Database::new();
+    execute(&mut db, "CREATE SEQUENCE s START 10").unwrap();
+    assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(10));
+
+    execute(&mut db, "BEGIN").unwrap();
+    execute(&mut db, "ALTER SEQUENCE s RESTART WITH 100").unwrap();
+    assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(100)); // working
+    execute(&mut db, "ROLLBACK").unwrap();
+
+    // The RESTART (and its advance) rolled back — the committed counter is still 10, next is 11.
+    assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(11));
+}
+
+/// A `nextval`'s `lastval`/`currval` session updates roll back with the transaction too (§5/§6):
+/// after a rolled-back `nextval`, `lastval` reverts to its pre-transaction state. (The PG-agreeing
+/// `lastval` *values* — tracking the most recent `nextval`, reflecting a `setval` on that same
+/// sequence — live in the oracle corpus; this asserts only the rollback, which the corpus cannot.)
+#[test]
+fn lastval_rolls_back() {
+    let mut db = Database::new();
+    execute(&mut db, "CREATE SEQUENCE a START 100").unwrap();
+    execute(&mut db, "CREATE SEQUENCE b START 200").unwrap();
+    one_int(&mut db, "SELECT nextval('a')"); // committed: lastval → a's 100
+    assert_eq!(one_int(&mut db, "SELECT lastval()"), Some(100));
+
+    execute(&mut db, "BEGIN").unwrap();
+    one_int(&mut db, "SELECT nextval('b')"); // working: lastval → b's 200
+    assert_eq!(one_int(&mut db, "SELECT lastval()"), Some(200));
+    execute(&mut db, "ROLLBACK").unwrap();
+
+    // The in-transaction nextval('b') vanished, so lastval reverts to a's committed 100.
+    assert_eq!(one_int(&mut db, "SELECT lastval()"), Some(100));
+}
+
+/// A non-RESTART `ALTER SEQUENCE` action is `0A000` in jed (only RESTART is supported this slice) —
+/// a divergence from PostgreSQL, where `ALTER SEQUENCE … INCREMENT BY` is valid, so it cannot live
+/// in the PG-clean oracle corpus.
+#[test]
+fn alter_non_restart_is_0a000() {
+    let mut db = Database::new();
+    execute(&mut db, "CREATE SEQUENCE s").unwrap();
+    assert_eq!(
+        err_code(&mut db, "ALTER SEQUENCE s INCREMENT BY 2"),
+        "0A000"
+    );
+    assert_eq!(err_code(&mut db, "ALTER SEQUENCE s OWNED BY t.c"), "0A000");
+    // ALTER of a non-sequence object is not a known statement at all → 42601 (no escape hatch).
+    assert_eq!(
+        err_code(&mut db, "ALTER TABLE t ADD COLUMN c int32"),
+        "42601"
+    );
+}
+
+/// `setval`/`ALTER … RESTART` are writes — a READ ONLY transaction rejects each with 25006 (each in
+/// its own block, since the error poisons the block). `lastval`/`currval` (pure reads) are allowed.
+#[test]
+fn setval_alter_in_read_only_is_25006() {
+    let mut db = Database::new();
+    execute(&mut db, "CREATE SEQUENCE s").unwrap();
+    one_int(&mut db, "SELECT nextval('s')"); // 1, defines session state
+
+    execute(&mut db, "BEGIN READ ONLY").unwrap();
+    assert_eq!(err_code(&mut db, "SELECT setval('s', 5)"), "25006");
+    execute(&mut db, "ROLLBACK").unwrap();
+
+    execute(&mut db, "BEGIN READ ONLY").unwrap();
+    assert_eq!(err_code(&mut db, "ALTER SEQUENCE s RESTART"), "25006");
+    execute(&mut db, "ROLLBACK").unwrap();
+
+    // lastval is allowed in a read-only block (it mutates nothing).
+    execute(&mut db, "BEGIN READ ONLY").unwrap();
+    assert_eq!(one_int(&mut db, "SELECT lastval()"), Some(1));
+    execute(&mut db, "ROLLBACK").unwrap();
+}

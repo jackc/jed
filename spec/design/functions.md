@@ -577,12 +577,13 @@ statement (`COPY … TO/FROM`, `CREATE FUNCTION`, `DO`, `LOAD`, `CREATE EXTENSIO
 is a tripwire: introducing any of them flips exactly one line from error to ok. It is jed-specific
 (PG provides these), so it is not oracle-checked.
 
-## 14. Sequence value functions (`nextval` / `currval`) — the first stateful built-ins
+## 14. Sequence value functions (`nextval` / `currval` / `setval` / `lastval`) — the stateful built-ins
 
-`nextval('s')` / `currval('s')` ([sequences.md](sequences.md)) are the first built-ins that (a)
-resolve a **text argument to a catalog object** and (b) reach beyond a pure value→value map —
-`nextval` **mutates** the sequence counter (§13's curated exception). Both are `kind = "function"`,
-`arg_families = ["text"]`, `result = "int64"`, `null = "propagates"`, `volatility = "volatile"`.
+`nextval('s')` / `currval('s')` / `setval('s', n[, b])` / `lastval()` ([sequences.md](sequences.md))
+are the built-ins that (a) resolve a **text argument to a catalog object** (all but `lastval`) and
+(b) reach beyond a pure value→value map — `nextval`/`setval` **mutate** the sequence counter (§13's
+curated exception). All are `kind = "function"`, `result = "int64"`, `null = "propagates"`,
+`volatility = "volatile"`.
 
 - **`nextval('s')`** advances sequence `s` and returns the new int64 value (PG-exact: the first call
   returns `START`, subsequent calls add `INCREMENT`, bounded by `MIN/MAXVALUE` → `2200H` or `CYCLE`
@@ -590,11 +591,19 @@ resolve a **text argument to a catalog object** and (b) reach beyond a pure valu
   nextval('s')` commits a new snapshot) and is `25006` in a read-only transaction. The advance is
   **transactional** — it rolls back with its transaction, jed's documented divergence from PG's
   non-transactional sequences (sequences.md §5, mandated by [determinism.md §5](determinism.md)).
-- **`currval('s')`** returns the value `nextval('s')` last produced **in this session** (a per-handle
-  state read, not a snapshot read), `55000` before the first `nextval` this session. It is pure-read
-  (no write path).
-- A missing sequence is `42P01`; a NULL name propagates NULL. The argument is the bare sequence name
-  (the PG `'s'::regclass` form, regclass implicit). `setval`/`lastval` land in S2.
+- **`currval('s')`** returns the value `nextval('s')`/`setval('s', n)` last produced **in this
+  session** (a per-handle state read, not a snapshot read), `55000` before the first such call this
+  session. It is pure-read (no write path).
+- **`setval('s', n)`** sets `s`'s counter so the next `nextval` returns `n + INCREMENT`, returns `n`,
+  and (like `nextval`) updates `currval`; **`setval('s', n, is_called)`** with `is_called = false`
+  makes the next `nextval` return `n` and leaves `currval` untouched. A value outside `[MINVALUE,
+  MAXVALUE]` is `22003`. `setval` is a write (transactional, `25006` in a read-only txn) but, unlike
+  `nextval`, does **not** update `lastval` (PG; §6). Two overloads (arity 2 / arity 3), like `round`.
+- **`lastval()`** returns the value the most recent `nextval` (of **any** sequence) produced in this
+  session, `55000` before the first `nextval`; a pure session read (no name argument, no write path),
+  unaffected by `setval`. It is the first 0-arg sequence function (the `now()` precedent).
+- A missing sequence is `42P01`; a NULL argument propagates NULL. The name argument is the bare
+  sequence name (the PG `'s'::regclass` form, regclass implicit).
 
 These stay within the §13 untrusted-query guarantee: no host reach, deterministic, and cost-bounded
-(the `sequence_advance` cost unit, [cost.md](cost.md)).
+(`nextval`/`setval` each charge one `sequence_advance` unit, [cost.md](cost.md)).

@@ -437,6 +437,8 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			return resolvedType{kind: rtInterval}
 		case "text":
 			return resolvedType{kind: rtText}
+		case "boolean":
+			return resolvedType{kind: rtBool}
 		default: // "integer" or "any"
 			return resolvedType{kind: rtInt, intTy: Int32}
 		}

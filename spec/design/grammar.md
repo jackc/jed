@@ -2076,6 +2076,7 @@ sequence_option ::= "INCREMENT" "BY"? signed_integer
                   | "CACHE" signed_integer
                   | "CYCLE" | "NO" "CYCLE"
 drop_sequence   ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier)* "RESTRICT"?
+alter_sequence  ::= "ALTER" "SEQUENCE" ("IF" "EXISTS")? identifier "RESTART" ("WITH"? signed_integer)?
 ```
 
 The options are **order-free** and each appears at most once (a repeat is `42601`), like the FK
@@ -2089,5 +2090,14 @@ keywords, and the option keywords are matched positionally inside the loop, so a
 use is unaffected. The parser knows no catalog; execution resolves the name against the shared relation
 namespace (`42P07` duplicate unless `IF NOT EXISTS`) and (`DROP`) raises `42P01` on a missing sequence
 unless `IF EXISTS`. PostgreSQL *reserves* none of these either, so no oracle-override surface beyond the
-sequence behavior itself. `nextval('s')` / `currval('s')` are ordinary `function_call`s (§ no new
-production) — they resolve their `text` argument to a sequence at evaluation (`42P01` if missing).
+sequence behavior itself. `nextval('s')` / `currval('s')` / `setval('s', n[, b])` / `lastval()` are
+ordinary `function_call`s (§ no new production) — the first three resolve their `text` argument to a
+sequence at evaluation (`42P01` if missing), `lastval()` reads per-session state.
+
+`ALTER SEQUENCE [IF EXISTS] name RESTART [WITH n]` is the only `ALTER` action this slice (S2) — and
+`ALTER` is **not otherwise a statement keyword yet**, so the dispatcher recognizes it solely as
+`ALTER SEQUENCE` (a two-keyword lookahead, the `CREATE SEQUENCE` precedent; `ALTER`/`RESTART` stay
+non-reserved). `RESTART` resets the counter so the next `nextval` returns `n` (`RESTART WITH n`) or
+the original `START` (bare `RESTART`), clearing `is_called`; the stored `START` is unchanged. A
+missing sequence is `42P01` unless `IF EXISTS` (then a no-op); a value outside `[MINVALUE, MAXVALUE]`
+is `22023` (NB — `setval`'s out-of-bounds error is `22003`; the two PG paths differ).

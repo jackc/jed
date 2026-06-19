@@ -11,9 +11,10 @@ type Statement struct {
 	DropIndex   *DropIndex
 	CreateType  *CreateType
 	DropType    *DropType
-	// CreateSequence/DropSequence are the sequence DDL statements (spec/design/sequences.md):
-	// a named, persisted int64 generator. Non-nil only for that statement.
+	// CreateSequence/AlterSequence/DropSequence are the sequence DDL statements
+	// (spec/design/sequences.md): a named, persisted int64 generator. Non-nil only for that statement.
 	CreateSequence *CreateSequence
+	AlterSequence  *AlterSequence
 	DropSequence   *DropSequence
 	Insert         *Insert
 	Select         *Select
@@ -234,6 +235,16 @@ type SeqBound struct {
 type DropSequence struct {
 	Names    []string
 	IfExists bool
+}
+
+// AlterSequence is an ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH n] statement — the only ALTER
+// action this slice (spec/design/sequences.md §4). The presence of the statement implies RESTART;
+// RestartWith is non-nil for RESTART WITH n and nil for a bare RESTART (reset to the original
+// START). A missing sequence without IfExists is 42P01; a value out of bounds is 22023.
+type AlterSequence struct {
+	Name        string
+	IfExists    bool
+	RestartWith *int64
 }
 
 // ColumnDef is a column definition in a CREATE TABLE.

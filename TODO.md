@@ -537,13 +537,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       read-only txn). → [sequences.md](spec/design/sequences.md) _(size: XL; §4/§8)_
   - [x] **S0** — `spec/design/sequences.md` + the error registrations (`2200H`/`55000`) + the §5
         transactional-divergence record + this TODO touch. Decisions ratified spec-first.
-  - [ ] **S1** — `CREATE`/`DROP SEQUENCE` (full option grammar) + the `sequences` catalog map +
+  - [x] **S1** — `CREATE`/`DROP SEQUENCE` (full option grammar) + the `sequences` catalog map +
         `format_version` 12 + the `sequence_table.jed` golden (`rust == go == ts == ruby`) +
         `nextval` + `currval` + the `sequence_advance` unit + write-path detection + read-only
         `25006` + corpus (`ddl/sequence.test`, `expr/sequence_value.test`) + capabilities
         `ddl.sequence`/`func.sequence`. The "it's alive" slice. _(size: L)_
-  - [ ] **S2** — `setval(s,n[,is_called])` + `lastval()` + `ALTER SEQUENCE … RESTART` + corpus
-        coverage of `CYCLE` wraparound and the `2200H` bound errors. _(size: M)_
+  - [x] **S2** — `setval(s,n[,is_called])` + `lastval()` (the `session_last` source) + `ALTER
+        SEQUENCE [IF EXISTS] s RESTART [WITH n]` (the first `ALTER` action) + corpus coverage of
+        `CYCLE` wraparound and the bound errors (`22003` setval / `22023` RESTART). `setval`/`ALTER`
+        reuse the `nextval` write-path + transactional-rollback machinery; with `setval` available
+        the corpus sets a known state in one statement and asserts directly. _(size: M)_
   - [ ] **S3** — `serial` / `bigserial` / `smallserial` pseudo-types (owned sequence + `DEFAULT
         nextval(...)` + `OWNED BY` auto-drop; `2BP01` dependency tracking). _(size: M–L)_
   - [ ] **S4** — `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` columns + `OVERRIDING … VALUE`.

@@ -13,6 +13,7 @@ pub enum Statement {
     CreateType(CreateType),
     DropType(DropType),
     CreateSequence(CreateSequence),
+    AlterSequence(AlterSequence),
     DropSequence(DropSequence),
     Insert(Insert),
     Select(Select),
@@ -220,6 +221,17 @@ pub struct CreateSequence {
 pub struct DropSequence {
     pub names: Vec<String>,
     pub if_exists: bool,
+}
+
+/// `ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH n]` — the only `ALTER` action this slice
+/// (spec/design/sequences.md §4). The presence of the statement implies `RESTART`; `restart_with`
+/// is `Some(n)` for `RESTART WITH n` and `None` for a bare `RESTART` (reset to the original
+/// `START`). A missing sequence without `IF EXISTS` is 42P01; a value out of bounds is 22023.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct AlterSequence {
+    pub name: String,
+    pub if_exists: bool,
+    pub restart_with: Option<i64>,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

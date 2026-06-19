@@ -47,6 +47,7 @@ sql_statement  ::= create_table
                  | create_index
                  | drop_index
                  | create_sequence
+                 | alter_sequence
                  | drop_sequence
                  | insert
                  | query_statement
@@ -212,8 +213,16 @@ sequence_option ::= "INCREMENT" "BY"? signed_integer
 signed_integer ::= "-"? integer
 drop_sequence  ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier)* "RESTRICT"?
 
-/* nextval('s') / currval('s') (../design/sequences.md §4) are ordinary function calls — no new
- * production; they resolve their text argument to a sequence in the catalog at evaluation. */
+/* ALTER SEQUENCE [IF EXISTS] name RESTART [WITH n] (../design/sequences.md §1) — the only ALTER
+ * action this slice: reset the counter so the next nextval returns n (RESTART WITH n) or the
+ * original START (bare RESTART), with is_called cleared. A missing sequence is 42P01 unless IF
+ * EXISTS; a value outside [MINVALUE, MAXVALUE] is 22023 (NB: setval's bounds error is 22003). The
+ * stored START is unchanged (a later bare RESTART still uses the original START). */
+alter_sequence ::= "ALTER" "SEQUENCE" ("IF" "EXISTS")? identifier "RESTART" ("WITH"? signed_integer)?
+
+/* nextval('s') / currval('s') / setval('s', n[, is_called]) / lastval() (../design/sequences.md
+ * §4/§6) are ordinary function calls — no new production; the first three resolve their text
+ * argument to a sequence in the catalog at evaluation, lastval() reads per-session state. */
 
 /* type_name is an identifier, optionally followed by a parenthesized type modifier
  * (precision, optional scale) — `decimal` is the FIRST parameterized type. The name is

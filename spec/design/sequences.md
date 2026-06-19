@@ -25,10 +25,14 @@ CREATE SEQUENCE s
 CREATE SEQUENCE [IF NOT EXISTS] s
     [INCREMENT [BY] n] [MINVALUE m | NO MINVALUE] [MAXVALUE x | NO MAXVALUE]
     [START [WITH] s0] [CACHE c] [[NO] CYCLE]
+ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]   -- reset the counter (S2 — §4)
 DROP SEQUENCE [IF EXISTS] s [, ...] [RESTRICT]
 
 SELECT nextval('s')            -- advance and return the new value (a WRITE statement — §4)
-SELECT currval('s')            -- the last value nextval returned IN THIS SESSION (§6)
+SELECT currval('s')            -- the last value nextval/setval produced IN THIS SESSION (§6)
+SELECT setval('s', n)          -- set the counter; next nextval = n + INCREMENT (a WRITE — §4)
+SELECT setval('s', n, false)   -- set the counter; next nextval = n (is_called = false)
+SELECT lastval()               -- the value the most recent nextval returned this session (§6)
 ```
 
 - **int64-valued.** A sequence generates `int64` (`bigint`) values, matching PostgreSQL's internal
@@ -42,18 +46,20 @@ SELECT currval('s')            -- the last value nextval returned IN THIS SESSIO
   combination that is inconsistent (`START < MINVALUE`, `START > MAXVALUE`, or `MINVALUE > MAXVALUE`)
   is `22023` at `CREATE`.
 - **`CACHE`** is **parsed and stored but behaviorally `1`** — see §7. A `CACHE < 1` is `22023`.
-- **`nextval('s')`/`currval('s')`** take the sequence **name as a text argument** (the PG
-  `nextval('s'::regclass)` form, with the `regclass` cast implicit). They are the first built-in
-  functions to resolve a string argument to a **catalog object** and the first to **mutate** the
-  database during expression evaluation. `setval(s, n[, is_called])` and `lastval()` are deferred to
-  S2 (§11).
+- **`nextval('s')`/`currval('s')`/`setval('s', n[, is_called])`** take the sequence **name as a text
+  argument** (the PG `nextval('s'::regclass)` form, with the `regclass` cast implicit). They are the
+  first built-in functions to resolve a string argument to a **catalog object** and (`nextval`/
+  `setval`) the first to **mutate** the database during expression evaluation. **`lastval()`** takes
+  no argument (the first 0-arg sequence function). `setval`/`lastval` land in **S2** (§11) — their
+  precise semantics are §4 (`setval`) and §6 (`lastval`).
 - **`DROP SEQUENCE`** is `RESTRICT` by default and RESTRICT-only this slice (`CASCADE` is `0A000`).
   A missing sequence is `42P01` (sequences share the relation namespace — like `DROP TABLE`), unless
   `IF EXISTS`. **No dependency tracking this slice:** a plain `column DEFAULT nextval('s')` does *not*
   create a dependency in PostgreSQL either (only `serial`/`OWNED BY`/identity do, both deferred), so
   `DROP SEQUENCE` of a sequence named in some column default succeeds and a later `INSERT` raises
   `42P01` at evaluation — exactly PG.
-- **`ALTER SEQUENCE`** (`RESTART [WITH n]`, `SET INCREMENT`, …) is deferred `0A000` (S2/S3).
+- **`ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]`** lands in **S2** (§4) — the only `ALTER` action
+  this slice. `ALTER SEQUENCE … SET INCREMENT|MINVALUE|… RENAME|OWNED BY|AS type` stay `0A000`.
 
 ## 2. Sequences as a catalog object — `Snapshot.sequences`
 
@@ -133,7 +139,29 @@ is_called)`:
   set `last_value = next`. The add is **overflow-safe** (a wrap past the int64 boundary is treated as
   crossing the bound, never a native overflow).
 
-After a successful `nextval`, the value is recorded in the **session** state (§6) for `currval`.
+After a successful `nextval`, the value is recorded in the **session** state (§6) for `currval` and
+`lastval`.
+
+**`setval` semantics** (PG-exact, [pg `sequence.c` `do_setval`]): `setval('s', n)` and `setval('s',
+n, is_called)` set the counter directly. The value `n` must lie in `[min_value, max_value]` or it is
+`22003 numeric_value_out_of_range` ("setval: value n is out of bounds for sequence \"s\"
+(min..max)"). On success: `last_value = n` and `is_called` = the third argument (default `true`); the
+result is `n`. The effect on the next `nextval` follows from `is_called` — `setval('s', n)` (called)
+makes the next `nextval` return `n + increment`; `setval('s', n, false)` makes it return `n`.
+`setval` is a **write** (the write path + `25006` in a read-only txn, exactly like `nextval`) and is
+**transactional** (rolls back — §5). Two deliberate session-state asymmetries with `nextval`, both
+matching PG (verified against the oracle): (a) `setval` updates `currval` **only when `is_called` is
+true** (with `is_called = false`, `currval` keeps its prior value / stays `55000`); (b) `setval`
+**never** updates `lastval` — `lastval` tracks `nextval` alone (§6).
+
+**`ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]`** resets the counter: `last_value = n` (`RESTART
+WITH n`) or `last_value = start` (bare `RESTART`, the original `START` — `RESTART` does **not** change
+the stored `start`), with `is_called = false`, so the next `nextval` returns that value. A value
+outside `[min_value, max_value]` is `22023 invalid_parameter_value` (PG: "RESTART value (n) cannot be
+greater than MAXVALUE (max)" / "… less than MINVALUE (min)" — note `22023`, **not** `setval`'s
+`22003`). A missing sequence is `42P01` unless `IF EXISTS` (then a no-op). `ALTER` is a catalog
+mutation (the write path, transactional) and touches **no** session state — `currval`/`lastval` are
+unchanged by a `RESTART`.
 
 ## 5. The defining decision — transactional sequences (a documented PG divergence)
 
@@ -173,21 +201,28 @@ committed sequence value**. This is **per-handle transient state**, NOT part of 
 persisted:
 
 - Each `Database` handle carries a small `session_seq: map<lowercased-name → int64>` of the last value
-  this handle's `nextval` returned for each sequence, plus (for `lastval`, S2) the single
-  most-recent-overall value.
-- `currval('s')` before any `nextval('s')` in this session is `55000
+  this handle's `nextval`/`setval` produced for each sequence, plus a single `session_last: int64?` —
+  the most-recent-overall value `nextval` returned (the `lastval` source).
+- `currval('s')` before any `nextval('s')`/`setval('s', …, true)` in this session is `55000
   object_not_in_prerequisite_state` ("currval of sequence \"s\" is not yet defined in this session") —
   even if the sequence exists and another session advanced it. A missing sequence is still `42P01`
   (the name is resolved against the catalog first).
+- **`lastval()`** returns `session_last` — the value the most recent `nextval` (of **any** sequence)
+  returned in this session — and is `55000 object_not_in_prerequisite_state` ("lastval is not yet
+  defined in this session") before the first `nextval`. It takes **no name argument** (no `42P01`
+  path). Two oracle-pinned details: `lastval` reads `nextval`'s history **only** (a `setval` never
+  updates `session_last`, so `lastval` is unaffected by it), and `currval`'s per-sequence map **is**
+  updated by `setval('s', n)` (called) but **not** by `setval('s', n, false)`.
 - Because jed read results depend only on commit order + the session's own call history (never wall
   clock), `currval` is deterministic *given the session's statement sequence* — the conformance corpus
   is single-handle and sequential, so it pins `currval` directly; the cross-session independence is a
   per-core / concurrency-suite concern.
-- **Does `currval` survive rollback?** jed records the session value on a *successful* `nextval`
-  evaluation. Since a rolled-back `nextval` did not commit and (jed §5) did not advance the sequence,
-  the session value it set is also discarded on rollback, keeping `currval` consistent with the
-  transactional counter. (This is moot under PG-comparison since PG's session value *would* survive —
-  another facet of the §5 divergence, ledgered.)
+- **Does `currval`/`lastval` survive rollback?** jed records the session values (`session_seq`,
+  `session_last`) on a *successful* `nextval`/`setval` evaluation, flushed together with the counter
+  advance on statement success. Since a rolled-back `nextval`/`setval` did not commit and (jed §5) did
+  not advance the sequence, the session values it set are also discarded on rollback, keeping
+  `currval`/`lastval` consistent with the transactional counter. (Moot under PG-comparison since PG's
+  session value *would* survive — another facet of the §5 divergence, ledgered.)
 
 ## 7. `CACHE` — accepted, never value-burning (a documented PG divergence)
 
@@ -216,12 +251,14 @@ flat per-call weight is a sound bound.
 | `CREATE SEQUENCE` name already a relation (no `IF NOT EXISTS`) | `42P07` duplicate_table |
 | `nextval`/`currval` on a missing sequence | `42P01` undefined_table |
 | `DROP SEQUENCE` of a missing sequence (no `IF EXISTS`) | `42P01` undefined_table |
-| `currval` before `nextval` in this session | `55000` object_not_in_prerequisite_state |
+| `setval`/`ALTER … RESTART`/`nextval`/`currval` on a missing sequence | `42P01` undefined_table |
+| `currval` before `nextval`/`setval(…,true)`; `lastval` before any `nextval`, this session | `55000` object_not_in_prerequisite_state |
 | `nextval` past `MAXVALUE`/`MINVALUE` without `CYCLE` | `2200H` sequence_generator_limit_exceeded |
-| `INCREMENT 0`, `CACHE < 1`, or inconsistent `START`/`MIN`/`MAX` | `22023` invalid_parameter_value |
-| `nextval`/`setval` in a read-only transaction | `25006` read_only_sql_transaction |
+| `setval` value outside `[MINVALUE, MAXVALUE]` | `22003` numeric_value_out_of_range |
+| `INCREMENT 0`, `CACHE < 1`, inconsistent `START`/`MIN`/`MAX`, or `RESTART` value out of bounds | `22023` invalid_parameter_value |
+| `nextval`/`setval`/`ALTER SEQUENCE` in a read-only transaction | `25006` read_only_sql_transaction |
 | Corrupt sequence catalog entry | `XX001` data_corrupted |
-| `ALTER SEQUENCE`; `DROP SEQUENCE … CASCADE`; `AS type` typmod; `serial`; identity | `0A000` feature_not_supported |
+| `ALTER SEQUENCE` actions other than `RESTART`; `DROP SEQUENCE … CASCADE`; `AS type` typmod; `serial`; identity | `0A000` feature_not_supported |
 
 ## 10. Ratified decisions and deliberate PostgreSQL divergences
 
@@ -235,9 +272,14 @@ are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_ove
 3. **`bigint`-only** — no `AS smallint|integer` typmod this slice (`0A000`); jed sequences are int64.
 4. **No implicit dependency from a plain `DEFAULT nextval('s')`** — matches PG (only `serial`/identity
    create one); `DROP SEQUENCE` needs no dependency tracking this slice (§1).
-5. **`nextval` makes the statement a write** — required by the single-writer staging model (§4); a
-   `SELECT nextval('s')` commits a new snapshot. Observably matches PG (the value persists).
-6. **Session-local `currval` with `55000`** — adopted as-is (§6).
+5. **`nextval`/`setval` make the statement a write** — required by the single-writer staging model
+   (§4); a `SELECT nextval('s')` commits a new snapshot. Observably matches PG (the value persists).
+6. **Session-local `currval`/`lastval` with `55000`** — adopted as-is (§6).
+7. **`setval`/`ALTER RESTART` are transactional** — they roll back like `nextval` (§5, the same
+   reason). Their session-state asymmetries match PG exactly (`setval(…,false)` leaves `currval`
+   alone; `setval` never touches `lastval`; `RESTART` touches no session state — §4/§6).
+8. **`setval` out-of-bounds is `22003`, `RESTART` out-of-bounds is `22023`** — the two distinct PG
+   error paths (`do_setval` vs. `init_params`) are preserved as-is (§4).
 
 ## 11. Delivery (sub-slices)
 
@@ -252,9 +294,13 @@ sub-slices, each passing `rake ci`:
   the conformance corpus (`ddl/sequence.test`, `expr/sequence_value.test`) + capabilities
   `ddl.sequence` / `func.sequence`. The "it's alive" slice — a sequence is created, advanced, read,
   persisted, and dropped.
-- **S2** — `setval(s, n[, is_called])` + `lastval()` + `ALTER SEQUENCE … RESTART` + corpus coverage of
-  `CYCLE` wraparound and the `2200H` bound errors. (The `nextval` kernel already enforces bounds/cycle
-  in S1; S2 adds the explicit-`setval` reset path, `lastval`, and the focused corpus.)
+- **S2** ✅ — `setval(s, n[, is_called])` + `lastval()` + `ALTER SEQUENCE [IF EXISTS] s RESTART
+  [WITH n]` + the `session_last` lastval source + corpus coverage of `CYCLE` wraparound and the
+  bound errors. `setval`/`ALTER RESTART` reuse the `nextval` write-path + transactional-rollback
+  machinery (the `pending_seq` flush); `setval` charges the existing `sequence_advance` unit. With
+  `setval`/`ALTER RESTART` available, the corpus reaches a known counter state in **one replayable
+  statement** and then asserts a single `nextval`/`currval`, so the S1 "advance via `statement ok`,
+  read via terminal `query`" scaffolding is replaced by direct `setval`-then-assert checks.
 - **S3** — the `serial` / `bigserial` / `smallserial` pseudo-types: column sugar that creates an
   owned sequence + a `DEFAULT nextval(...)` + the `OWNED BY` auto-drop dependency (so `DROP TABLE`
   removes the owned sequence; `2BP01` dependency tracking arrives here).

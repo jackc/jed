@@ -5,10 +5,10 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    BinaryOp, CreateIndex, CreateSequence, CreateTable, CreateType, Delete, DropIndex,
-    DropSequence, DropTable, DropType, Expr, Insert, InsertSource, InsertValue, JoinKind, Literal,
-    OrderKey, QueryExpr, RefAction, Select, SelectItems, SetOp, SetOpKind, Statement,
-    SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
+    AlterSequence, BinaryOp, CreateIndex, CreateSequence, CreateTable, CreateType, Delete,
+    DropIndex, DropSequence, DropTable, DropType, Expr, Insert, InsertSource, InsertValue,
+    JoinKind, Literal, OrderKey, QueryExpr, RefAction, Select, SelectItems, SetOp, SetOpKind,
+    Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -587,19 +587,34 @@ pub struct Database {
     /// (the `# seed:` / `# clock:` directives) for exact cross-core output. A handle setting, not
     /// stored in the file; does not affect a query that calls no generator.
     pub(crate) seam: crate::seam::Seam,
-    /// Per-handle **session** sequence state for `currval` (spec/design/sequences.md §6): the last
-    /// value `nextval` produced **in this session** for each sequence (lowercased name). NOT part of
-    /// the snapshot and NOT persisted — strictly session-local, as in PostgreSQL. Updated when a
-    /// sequence-advancing statement succeeds (flushing `pending_seq`); `currval` of an unlisted
-    /// sequence this session is `55000`.
+    /// Per-handle **session** `currval` state (spec/design/sequences.md §6): the last value
+    /// `nextval`/`setval(…,true)` produced **in this session** for each sequence (lowercased name).
+    /// NOT part of the snapshot and NOT persisted — strictly session-local, as in PostgreSQL.
+    /// Updated when a sequence-advancing statement succeeds (flushing `pending_currval`); `currval`
+    /// of an unlisted sequence this session is `55000`.
     session_seq: HashMap<String, i64>,
+    /// Per-handle **session** `lastval` state (spec/design/sequences.md §6): the lowercased **name**
+    /// of the sequence the most recent `nextval` (of **any** sequence) ran on — `None` before the
+    /// first `nextval`. `lastval()` returns the *current* session value of that sequence (PG: it
+    /// reads the last-used sequence's cached value), so a `setval` on that same sequence is
+    /// reflected; a `setval` never changes *which* sequence this points to. `55000` when `None`.
+    session_last_name: Option<String>,
     /// Per-**statement** running sequence advances (spec/design/sequences.md §4), behind a `RefCell`
-    /// for interior mutability — `EvalEnv` borrows `&Database`, so a `nextval` records its advance
-    /// here (seeded from the working snapshot on first touch), and later `nextval`/`currval` calls in
-    /// the same statement see the running state. On statement success it is flushed into the working
-    /// snapshot (so commit persists it) + `session_seq`; on error it is discarded (the transactional
-    /// rollback of the advance, sequences.md §5). Cleared at the start of every statement.
+    /// for interior mutability — `EvalEnv` borrows `&Database`, so a `nextval`/`setval` records its
+    /// advance here (seeded from the working snapshot on first touch), and later calls in the same
+    /// statement see the running state. On statement success it is flushed into the working snapshot
+    /// (so commit persists it); on error it is discarded (the transactional rollback of the advance,
+    /// sequences.md §5). Cleared at the start of every statement.
     pending_seq: std::cell::RefCell<HashMap<String, SequenceDef>>,
+    /// Per-**statement** running `currval` updates (the names `nextval`/`setval(…,true)` touched
+    /// this statement → their produced value). Kept separate from `pending_seq` because `currval` is
+    /// updated by a *subset* of catalog mutations: `setval(…,false)` and `ALTER … RESTART` advance
+    /// the counter without defining `currval`. Flushed into `session_seq` on statement success.
+    pending_currval: std::cell::RefCell<HashMap<String, i64>>,
+    /// Per-**statement** running `lastval` update (the lowercased name of the most recent `nextval`
+    /// this statement, `None` if no `nextval` ran). `setval` never sets it. Flushed into
+    /// `session_last_name` on success.
+    pending_last_name: std::cell::RefCell<Option<String>>,
 }
 
 /// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
@@ -612,6 +627,13 @@ struct ActiveTx {
     writable: bool,
     failed: bool,
     working: Snapshot,
+    /// The handle's `currval`/`lastval` session state (spec/design/sequences.md §6) captured when
+    /// this transaction opened. A `nextval`/`setval` inside the block updates the handle's session
+    /// state per-statement (so an in-block `currval` sees its own advance), but those updates must
+    /// **roll back** with the transaction (§5) — so ROLLBACK (and a failed/read-only COMMIT)
+    /// restores these, while a successful COMMIT keeps the advanced state.
+    saved_session_seq: HashMap<String, i64>,
+    saved_session_last_name: Option<String>,
 }
 
 impl Default for Database {
@@ -644,7 +666,10 @@ impl Database {
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             seam: crate::seam::Seam::default(),
             session_seq: HashMap::new(),
+            session_last_name: None,
             pending_seq: std::cell::RefCell::new(HashMap::new()),
+            pending_currval: std::cell::RefCell::new(HashMap::new()),
+            pending_last_name: std::cell::RefCell::new(None),
         }
     }
 
@@ -668,7 +693,10 @@ impl Database {
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             seam: crate::seam::Seam::default(),
             session_seq: HashMap::new(),
+            session_last_name: None,
             pending_seq: std::cell::RefCell::new(HashMap::new()),
+            pending_currval: std::cell::RefCell::new(HashMap::new()),
+            pending_last_name: std::cell::RefCell::new(None),
         }
     }
 
@@ -750,14 +778,91 @@ impl Database {
             def.last_value = next;
             next
         };
-        pending.insert(key, def);
+        pending.insert(key.clone(), def);
+        // nextval defines this session's currval for the sequence AND makes it the lastval target
+        // (the most-recent-nextval sequence; lastval then reads its current session value — §6).
+        self.pending_currval
+            .borrow_mut()
+            .insert(key.clone(), result);
+        *self.pending_last_name.borrow_mut() = Some(key);
         Ok(result)
     }
 
-    /// `currval('name')` (spec/design/sequences.md §6): the value `nextval` last produced for this
-    /// sequence IN THIS SESSION. Resolves the name against the catalog first (42P01 if absent), then
-    /// reads the running advance this statement (`pending_seq`) else the session value
-    /// (`session_seq`); 55000 if `nextval` has not been called this session.
+    /// `setval('name', n)` / `setval('name', n, is_called)` (spec/design/sequences.md §4): set the
+    /// sequence's counter directly and return `n`. A missing sequence is 42P01; `n` outside
+    /// `[min_value, max_value]` is 22003. `last_value = n`, `is_called` = the flag (default true);
+    /// when `is_called` is true the value also defines this session's `currval` (PG: `is_called =
+    /// false` leaves `currval` untouched). `setval` never updates `lastval` (PG — §6).
+    fn seq_setval(&self, name: &str, n: i64, is_called: bool) -> Result<i64> {
+        let key = name.to_ascii_lowercase();
+        let mut pending = self.pending_seq.borrow_mut();
+        let mut def = match pending.get(&key) {
+            Some(d) => d.clone(),
+            None => self.read_snap().sequence(name).cloned().ok_or_else(|| {
+                EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("relation does not exist: {name}"),
+                )
+            })?,
+        };
+        if n < def.min_value || n > def.max_value {
+            return Err(EngineError::new(
+                SqlState::NumericValueOutOfRange,
+                format!(
+                    "setval: value {n} is out of bounds for sequence {name} ({}..{})",
+                    def.min_value, def.max_value
+                ),
+            ));
+        }
+        def.last_value = n;
+        def.is_called = is_called;
+        pending.insert(key.clone(), def);
+        // currval is defined only when is_called (PG do_setval: elm->last_valid set iff iscalled).
+        if is_called {
+            self.pending_currval.borrow_mut().insert(key, n);
+        }
+        Ok(n)
+    }
+
+    /// `lastval()` (spec/design/sequences.md §6): the **current** session value of the sequence the
+    /// most recent `nextval` (of any sequence) ran on IN THIS SESSION — PG reads the last-used
+    /// sequence's cached value, so a `setval` on that same sequence is reflected, while a `setval`
+    /// on a *different* sequence is not (it does not change which sequence this points to). Takes no
+    /// name argument (no 42P01 path); `55000` before the first `nextval` this session. The effective
+    /// name and its value both honor the statement's running updates over the session state.
+    fn seq_lastval(&self) -> Result<i64> {
+        let name = self
+            .pending_last_name
+            .borrow()
+            .clone()
+            .or_else(|| self.session_last_name.clone());
+        let key = match name {
+            Some(k) => k,
+            None => {
+                return Err(EngineError::new(
+                    SqlState::ObjectNotInPrerequisiteState,
+                    "lastval is not yet defined in this session".to_string(),
+                ));
+            }
+        };
+        if let Some(v) = self.pending_currval.borrow().get(&key) {
+            return Ok(*v);
+        }
+        if let Some(v) = self.session_seq.get(&key) {
+            return Ok(*v);
+        }
+        // A nextval always defines the sequence's session value, so a recorded last-name with no
+        // value is unreachable; fall back to 55000 defensively rather than panic.
+        Err(EngineError::new(
+            SqlState::ObjectNotInPrerequisiteState,
+            "lastval is not yet defined in this session".to_string(),
+        ))
+    }
+
+    /// `currval('name')` (spec/design/sequences.md §6): the value `nextval`/`setval(…,true)` last
+    /// produced for this sequence IN THIS SESSION. Resolves the name against the catalog first
+    /// (42P01 if absent), then reads the running update this statement (`pending_currval`) else the
+    /// session value (`session_seq`); 55000 if it has not been defined this session.
     fn seq_currval(&self, name: &str) -> Result<i64> {
         if self.read_snap().sequence(name).is_none() {
             return Err(EngineError::new(
@@ -766,10 +871,8 @@ impl Database {
             ));
         }
         let key = name.to_ascii_lowercase();
-        if let Some(d) = self.pending_seq.borrow().get(&key)
-            && d.is_called
-        {
-            return Ok(d.last_value);
+        if let Some(v) = self.pending_currval.borrow().get(&key) {
+            return Ok(*v);
         }
         if let Some(v) = self.session_seq.get(&key) {
             return Ok(*v);
@@ -781,16 +884,22 @@ impl Database {
     }
 
     /// Flush the statement's pending sequence advances into the working snapshot (so a commit
-    /// persists them) and into `session_seq` (so `currval` sees them). Called on the success of a
-    /// sequence-advancing statement, while a write transaction is open; a no-op when nothing
-    /// advanced. On statement error the pending map is instead discarded (cleared at the next
-    /// statement), giving the transactional rollback of the advance (sequences.md §5).
+    /// persists them) and the pending session updates into `session_seq`/`session_last` (so
+    /// `currval`/`lastval` see them). Called on the success of a sequence-advancing statement, while
+    /// a write transaction is open; a no-op when nothing advanced. On statement error the pending
+    /// state is instead discarded (cleared at the next statement), giving the transactional rollback
+    /// of the advance (sequences.md §5).
     fn flush_pending_sequences(&mut self) {
         let pending = std::mem::take(&mut *self.pending_seq.borrow_mut());
-        for (key, def) in pending {
-            let last = def.last_value;
+        for def in pending.into_values() {
             self.working_mut().put_sequence(def);
-            self.session_seq.insert(key, last);
+        }
+        let currvals = std::mem::take(&mut *self.pending_currval.borrow_mut());
+        for (key, v) in currvals {
+            self.session_seq.insert(key, v);
+        }
+        if let Some(name) = self.pending_last_name.borrow_mut().take() {
+            self.session_last_name = Some(name);
         }
     }
 
@@ -995,6 +1104,8 @@ impl Database {
         // Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
         // populated — it is discarded, not flushed, on error; sequences.md §5).
         self.pending_seq.borrow_mut().clear();
+        self.pending_currval.borrow_mut().clear();
+        *self.pending_last_name.borrow_mut() = None;
 
         // Inside an explicit block? Read the flags, dropping the borrow before dispatch.
         if self.tx.is_some() {
@@ -1053,6 +1164,8 @@ impl Database {
             writable: true,
             failed: false,
             working: self.committed.clone(),
+            saved_session_seq: self.session_seq.clone(),
+            saved_session_last_name: self.session_last_name.clone(),
         });
         match self.dispatch_stmt(stmt, params) {
             Ok(outcome) => {
@@ -1062,7 +1175,11 @@ impl Database {
                 self.commit_tx().map(|_| outcome)
             }
             Err(e) => {
-                self.tx = None;
+                // The statement failed before any flush, so session state is untouched; restore
+                // from the captured copy anyway to keep the discard path uniform (sequences.md §6).
+                if let Some(tx) = self.tx.take() {
+                    self.restore_session_state(tx);
+                }
                 Err(e)
             }
         }
@@ -1093,11 +1210,21 @@ impl Database {
             writable: writable.unwrap_or(!self.read_only),
             failed: false,
             working: self.committed.clone(),
+            saved_session_seq: self.session_seq.clone(),
+            saved_session_last_name: self.session_last_name.clone(),
         });
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
         })
+    }
+
+    /// Restore the handle's `currval`/`lastval` session state from a discarded transaction's
+    /// captured copy (spec/design/sequences.md §5/§6) — the rollback of any in-block `nextval`/
+    /// `setval` session updates. Called wherever a transaction is dropped without publishing.
+    fn restore_session_state(&mut self, tx: ActiveTx) {
+        self.session_seq = tx.saved_session_seq;
+        self.session_last_name = tx.saved_session_last_name;
     }
 
     /// Commit the current transaction (spec/design/transactions.md §4.2). With no open block it is
@@ -1118,6 +1245,9 @@ impl Database {
             Some(tx) => tx,
         };
         if tx.failed || !tx.writable {
+            // A failed or read-only block publishes nothing — a failed COMMIT is a ROLLBACK (PG),
+            // so any in-block session updates revert with the discarded working set (§5/§6).
+            self.restore_session_state(tx);
             return Ok(Outcome::Statement {
                 cost: 0,
                 rows_affected: None,
@@ -1141,9 +1271,13 @@ impl Database {
     /// Roll back the current transaction (spec/design/transactions.md §4.2). With no open block it
     /// is a no-op success. Otherwise the working snapshot is **dropped** — every staged
     /// INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7), vanish with it;
-    /// `committed` was never mutated, so there is nothing to restore. Returns to autocommit.
+    /// `committed` was never mutated, so there is nothing to restore there. The handle's
+    /// `currval`/`lastval` session state, however, was updated in place by in-block `nextval`/
+    /// `setval`, so it is restored from the block's captured copy (sequences.md §5/§6).
     pub(crate) fn rollback_tx(&mut self) -> Result<Outcome> {
-        self.tx = None;
+        if let Some(tx) = self.tx.take() {
+            self.restore_session_state(tx);
+        }
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
@@ -1185,6 +1319,10 @@ impl Database {
             Statement::DropSequence(ds) => {
                 reject_params_for_ddl(params)?;
                 self.execute_drop_sequence(ds)
+            }
+            Statement::AlterSequence(als) => {
+                reject_params_for_ddl(params)?;
+                self.execute_alter_sequence(als)
             }
             Statement::Insert(ins) => self.execute_insert(ins, params),
             Statement::Select(sel) => self.execute_select(sel, params),
@@ -2405,6 +2543,49 @@ impl Database {
             let key = name.to_ascii_lowercase();
             self.working_mut().remove_sequence(&key);
         }
+        Ok(Outcome::Statement {
+            cost: 0,
+            rows_affected: None,
+        })
+    }
+
+    /// Analyze and run an `ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]` (spec/design/sequences.md
+    /// §4). A missing sequence is 42P01 unless `IF EXISTS` (then a no-op). `RESTART WITH n` resets
+    /// `last_value` to `n`, a bare `RESTART` to the original `START` (unchanged); either way
+    /// `is_called = false`, so the next `nextval` returns that value. A restart value outside
+    /// `[min_value, max_value]` is 22023. Touches no session state (`currval`/`lastval` unchanged).
+    fn execute_alter_sequence(&mut self, als: AlterSequence) -> Result<Outcome> {
+        let mut def = match self.read_snap().sequence(&als.name) {
+            Some(d) => d.clone(),
+            None => {
+                if als.if_exists {
+                    return Ok(Outcome::Statement {
+                        cost: 0,
+                        rows_affected: None,
+                    });
+                }
+                return Err(EngineError::new(
+                    SqlState::UndefinedTable,
+                    format!("relation does not exist: {}", als.name),
+                ));
+            }
+        };
+        let value = als.restart_with.unwrap_or(def.start);
+        if value < def.min_value || value > def.max_value {
+            // PG's init_params path: 22023 (distinct from setval's 22003 do_setval path — §4).
+            let bound = if value > def.max_value {
+                format!("greater than MAXVALUE ({})", def.max_value)
+            } else {
+                format!("less than MINVALUE ({})", def.min_value)
+            };
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!("RESTART value ({value}) cannot be {bound}"),
+            ));
+        }
+        def.last_value = value;
+        def.is_called = false;
+        self.working_mut().put_sequence(def);
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
@@ -6454,9 +6635,16 @@ enum ScalarFunc {
     /// (spec/design/sequences.md §4). VOLATILE; MUTATES the working snapshot (via `pending_seq`),
     /// so a statement calling it runs on the write path.
     Nextval,
-    /// currval(text) → int64 — the value `nextval` last produced for the named sequence IN THIS
-    /// SESSION (sequences.md §6). VOLATILE; reads per-session state, 55000 before the first nextval.
+    /// currval(text) → int64 — the value `nextval`/`setval` last produced for the named sequence IN
+    /// THIS SESSION (sequences.md §6). VOLATILE; reads per-session state, 55000 before defined.
     Currval,
+    /// setval(text, int64[, bool]) → int64 — set the named sequence's counter to the value and
+    /// return it (sequences.md §4). VOLATILE; MUTATES the working snapshot, so a statement calling
+    /// it runs on the write path. Arity 2 (is_called defaults true) or 3.
+    Setval,
+    /// lastval() → int64 — the value the most recent `nextval` (any sequence) returned IN THIS
+    /// SESSION (sequences.md §6). VOLATILE; reads per-session state, 55000 before the first nextval.
+    Lastval,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -8692,10 +8880,12 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "uuidv7" => ScalarFunc::Uuidv7,
         "now" => ScalarFunc::Now,
         "clock_timestamp" => ScalarFunc::ClockTimestamp,
-        // Sequence value functions (sequences.md §4). nextval MUTATES (write path); both resolve
-        // their text argument to a catalog sequence at eval.
+        // Sequence value functions (sequences.md §4). nextval/setval MUTATE (write path); all but
+        // lastval resolve their text argument to a catalog sequence at eval.
         "nextval" => ScalarFunc::Nextval,
         "currval" => ScalarFunc::Currval,
+        "setval" => ScalarFunc::Setval,
+        "lastval" => ScalarFunc::Lastval,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -9747,12 +9937,13 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
             | Statement::CreateType(_)
             | Statement::DropType(_)
             | Statement::CreateSequence(_)
+            | Statement::AlterSequence(_)
             | Statement::DropSequence(_)
             | Statement::Insert(_)
             | Statement::Update(_)
             | Statement::Delete(_)
     )
-    // A read-shaped statement that calls a sequence-mutating function (nextval) IS a write
+    // A read-shaped statement that calls a sequence-mutating function (nextval/setval) IS a write
     // (spec/design/sequences.md §4): it must take the write gate, stage the advance, and commit
     // (autocommit) — and is 25006 in a READ ONLY transaction, exactly like any other write.
     || stmt_calls_seq_mutator(stmt)
@@ -9814,11 +10005,14 @@ fn table_ref_calls(t: &TableRef) -> bool {
             .is_some_and(|rows| rows.iter().flatten().any(expr_calls_seq_mutator))
 }
 
-/// Exhaustive over `Expr` (the compiler enforces it): true iff the tree contains a `nextval` call.
+/// Exhaustive over `Expr` (the compiler enforces it): true iff the tree contains a sequence-
+/// mutating call (`nextval` or `setval`).
 fn expr_calls_seq_mutator(e: &Expr) -> bool {
     match e {
         Expr::FuncCall { name, args, .. } => {
-            name.eq_ignore_ascii_case("nextval") || args.iter().any(expr_calls_seq_mutator)
+            name.eq_ignore_ascii_case("nextval")
+                || name.eq_ignore_ascii_case("setval")
+                || args.iter().any(expr_calls_seq_mutator)
         }
         Expr::Column(_)
         | Expr::QualifiedColumn { .. }
@@ -9882,6 +10076,7 @@ fn stmt_kind(stmt: &Statement) -> &'static str {
         Statement::CreateType(_) => "CREATE TYPE",
         Statement::DropType(_) => "DROP TYPE",
         Statement::CreateSequence(_) => "CREATE SEQUENCE",
+        Statement::AlterSequence(_) => "ALTER SEQUENCE",
         Statement::DropSequence(_) => "DROP SEQUENCE",
         Statement::Insert(_) => "INSERT",
         Statement::Update(_) => "UPDATE",
@@ -14172,6 +14367,30 @@ impl RExpr {
                         };
                         Ok(Value::Int(env.exec.seq_currval(name)?))
                     }
+                    // setval charges sequence_advance (it rewrites the catalog tuple, like nextval).
+                    // Arity 2 → is_called defaults true; arity 3 → the boolean third argument.
+                    ScalarFunc::Setval => {
+                        m.charge(COSTS.sequence_advance);
+                        let name = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => unreachable!("resolver restricts setval's first argument to text"),
+                        };
+                        let n = match &vals[1] {
+                            Value::Int(n) => *n,
+                            _ => unreachable!("resolver restricts setval's value to integer"),
+                        };
+                        let is_called = match vals.get(2) {
+                            None => true,
+                            Some(Value::Bool(b)) => *b,
+                            Some(_) => {
+                                unreachable!(
+                                    "resolver restricts setval's third argument to boolean"
+                                )
+                            }
+                        };
+                        Ok(Value::Int(env.exec.seq_setval(name, n, is_called)?))
+                    }
+                    ScalarFunc::Lastval => Ok(Value::Int(env.exec.seq_lastval()?)),
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -14840,9 +15059,11 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Now
         | ScalarFunc::ClockTimestamp
         | ScalarFunc::Nextval
-        | ScalarFunc::Currval => {
+        | ScalarFunc::Currval
+        | ScalarFunc::Setval
+        | ScalarFunc::Lastval => {
             unreachable!(
-                "abs/round/make_interval/uuid_*/now/clock_timestamp/nextval/currval are handled before eval_float_func"
+                "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence fns are handled before eval_float_func"
             )
         }
     };

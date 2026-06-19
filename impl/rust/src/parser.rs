@@ -5,10 +5,10 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateSequence, CreateTable,
-    CreateType, Cte, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType, Expr,
-    ForeignKeyDef, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OrderKey,
-    QueryExpr, RefAction, Select, SelectItem, SelectItems, SetOp, SetOpKind, Statement,
+    AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateSequence,
+    CreateTable, CreateType, Cte, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType,
+    Expr, ForeignKeyDef, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal,
+    OrderKey, QueryExpr, RefAction, Select, SelectItem, SelectItems, SetOp, SetOpKind, Statement,
     SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WithQuery,
 };
 use crate::decimal::Decimal;
@@ -122,6 +122,13 @@ impl Parser {
                 Ok(Statement::DropSequence(self.parse_drop_sequence()?))
             }
             Some("drop") => Ok(Statement::DropTable(self.parse_drop_table()?)),
+            // ALTER SEQUENCE — the only ALTER statement this slice (sequences.md §4). A 2-token
+            // lookahead recognizes it; any other `ALTER …` (TABLE, SYSTEM, …) is not a statement
+            // keyword jed knows and falls through to the generic unknown-keyword 42601 below
+            // (the no-escape-hatch surface — resource/no_escape_hatch.test).
+            Some("alter") if self.peek_keyword_at(1).as_deref() == Some("sequence") => {
+                Ok(Statement::AlterSequence(self.parse_alter_sequence()?))
+            }
             Some("insert") => Ok(Statement::Insert(self.parse_insert()?)),
             Some("select") => self.parse_query_expr(),
             // `WITH …` at statement start can only begin a query with common table expressions
@@ -877,6 +884,43 @@ impl Parser {
             ));
         }
         Ok(DropSequence { names, if_exists })
+    }
+
+    /// `ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH <signed_int>]` (spec/design/sequences.md §4).
+    /// The only ALTER action this slice; `RESTART` is required. `RESTART WITH n` yields
+    /// `restart_with = Some(n)`, a bare `RESTART` yields `None` (reset to the original START).
+    fn parse_alter_sequence(&mut self) -> Result<AlterSequence> {
+        self.expect_keyword("alter")?;
+        self.expect_keyword("sequence")?;
+        let if_exists = self.peek_keyword().as_deref() == Some("if");
+        if if_exists {
+            self.advance();
+            self.expect_keyword("exists")?;
+        }
+        let name = self.expect_identifier()?;
+        // RESTART is the only supported action; any other ALTER SEQUENCE action (SET INCREMENT,
+        // RENAME, OWNED BY, …) is 0A000 (sequences.md §9), not a syntax error.
+        if self.peek_keyword().as_deref() != Some("restart") {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "only ALTER SEQUENCE ... RESTART is supported".to_string(),
+            ));
+        }
+        self.expect_keyword("restart")?;
+        // RESTART [WITH] <signed_int>; bare RESTART (no value) resets to the stored START.
+        let restart_with = if matches!(self.peek(), Token::Int(_) | Token::Minus)
+            || self.peek_keyword().as_deref() == Some("with")
+        {
+            self.consume_keyword("with");
+            Some(self.parse_signed_int_literal()?)
+        } else {
+            None
+        };
+        Ok(AlterSequence {
+            name,
+            if_exists,
+            restart_with,
+        })
     }
 
     /// `IF NOT EXISTS` prefix (optional) — consumed when present.

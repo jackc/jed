@@ -1,29 +1,30 @@
-# CREATE SEQUENCE / DROP SEQUENCE — a named, persisted, monotonic int64 generator as the third
-# catalog-object kind (after tables + composite types), format_version 12. Order-free options
-# (INCREMENT/MINVALUE/MAXVALUE/START/CACHE/CYCLE), bigint-only, the shared relation namespace
-# (42P07 duplicate / 42P01 missing), option validation 22023, RESTRICT-only. The value functions
-# nextval/currval are exercised in ../expr/sequence_value.test. The transactional-rollback
-# divergence (nextval rolls back — a documented PG divergence, sequences.md §5) and read-only 25006
-# live in the per-core unit tests (it cannot live in the PG-clean oracle corpus).
+# CREATE SEQUENCE / ALTER SEQUENCE RESTART / DROP SEQUENCE — a named, persisted, monotonic int64
+# generator as the third catalog-object kind (after tables + composite types), format_version 12.
+# Order-free CREATE options (INCREMENT/MINVALUE/MAXVALUE/START/CACHE/CYCLE), bigint-only, the shared
+# relation namespace (42P07 duplicate / 42P01 missing), option validation 22023, RESTRICT-only DROP.
+# ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n] resets the counter (the only ALTER action this
+# slice; a non-RESTART action is 0A000). The value functions nextval/currval/setval/lastval are
+# exercised in ../expr/sequence_value.test. The transactional-rollback divergence (nextval/setval/
+# RESTART roll back — sequences.md §5) and read-only 25006 live in the per-core unit tests.
 # requires: ddl.sequence, func.sequence, ddl.create_table, ddl.drop_table, dml.insert, query.select, types.int64
 
 # a bare CREATE SEQUENCE defaults to INCREMENT 1, MINVALUE 1, START 1
 statement ok
 CREATE SEQUENCE s
 
-# the sequence is usable immediately (first value is START = 1). NOTE on the corpus structure: an
-# advancing nextval is written `statement ok` (a side-effecting statement the oracle harness replays
-# in each row's prefix) and the value is asserted with a trailing `query`; a `query nextval` is not
-# replayed, so it never double-advances — this keeps the cumulative progression oracle-reproducible.
+# the sequence is usable immediately (first value is START = 1). NOTE on the corpus structure: a
+# counter state a later `query nextval` must observe is pinned with `statement ok SELECT setval(...)`
+# (a side-effecting statement the oracle harness replays in each row's prefix); the `query nextval`
+# itself is not replayed, so it never double-advances — keeping the progression oracle-reproducible.
 statement ok
-SELECT nextval('s')
+SELECT setval('s', 1)
 
 # CREATE SEQUENCE of a name already in the relation namespace is 42P07 (no IF NOT EXISTS)
 statement error 42P07
 CREATE SEQUENCE s
 
-# IF NOT EXISTS makes a re-create a no-op success (the existing sequence is unchanged — the next
-# value is 2, proving the counter was not reset)
+# IF NOT EXISTS makes a re-create a no-op success: the existing sequence is unchanged, so the counter
+# pinned at 1 above still yields 2 next (proving it was not reset)
 statement ok
 CREATE SEQUENCE IF NOT EXISTS s
 
@@ -56,7 +57,7 @@ CREATE SEQUENCE bad MINVALUE 10 MAXVALUE 5
 statement error 22023
 CREATE SEQUENCE bad MINVALUE 1 MAXVALUE 10 START 100
 
-# the full ascending option set is accepted
+# the full ascending option set is accepted; first value is START (10)
 statement ok
 CREATE SEQUENCE upward INCREMENT BY 5 MINVALUE 1 MAXVALUE 100 START WITH 10 CACHE 1
 
@@ -65,7 +66,7 @@ SELECT nextval('upward')
 ----
 10
 
-# a descending sequence: negative INCREMENT, START defaults to MAXVALUE
+# a descending sequence: negative INCREMENT, START defaults to MAXVALUE (-1)
 statement ok
 CREATE SEQUENCE downward INCREMENT BY -1 MINVALUE -5 MAXVALUE -1
 
@@ -77,6 +78,47 @@ SELECT nextval('downward')
 # NO MINVALUE / NO MAXVALUE / NO CYCLE select the defaults (well-formed)
 statement ok
 CREATE SEQUENCE defs INCREMENT 2 NO MINVALUE NO MAXVALUE NO CYCLE
+
+# --- ALTER SEQUENCE RESTART --------------------------------------------------
+
+statement ok
+CREATE SEQUENCE r INCREMENT BY 5 START WITH 10
+
+# RESTART WITH n: the next nextval returns n (is_called cleared)
+statement ok
+ALTER SEQUENCE r RESTART WITH 50
+
+query I nosort
+SELECT nextval('r')
+----
+50
+
+# a bare RESTART resets to the ORIGINAL START (10), not the RESTART WITH value — RESTART does not
+# change the stored START
+statement ok
+ALTER SEQUENCE r RESTART
+
+query I nosort
+SELECT nextval('r')
+----
+10
+
+# a RESTART value outside [MINVALUE, MAXVALUE] is 22023 (distinct from setval's 22003)
+statement ok
+CREATE SEQUENCE rb MINVALUE 1 MAXVALUE 10
+
+statement error 22023
+ALTER SEQUENCE rb RESTART WITH 100
+
+# ALTER on a missing sequence is 42P01 unless IF EXISTS (then a no-op success)
+statement error 42P01
+ALTER SEQUENCE never_existed RESTART
+
+statement ok
+ALTER SEQUENCE IF EXISTS never_existed RESTART
+
+# (a non-RESTART ALTER SEQUENCE action — e.g. INCREMENT BY — is 0A000 in jed but VALID in
+# PostgreSQL, so that divergence is a per-core unit test, not an oracle corpus row.)
 
 # --- DROP SEQUENCE -----------------------------------------------------------
 
@@ -109,7 +151,7 @@ SELECT nextval('s')
 
 # clean up the live oracle (autocommit DDL persists across corpus:check files)
 statement ok
-DROP SEQUENCE s, defs
+DROP SEQUENCE s, defs, r, rb
 
 statement ok
 DROP TABLE tbl

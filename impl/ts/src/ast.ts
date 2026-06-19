@@ -361,6 +361,17 @@ export type DropSequence = {
   ifExists: boolean;
 };
 
+// AlterSequence is an `ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH n]` statement — the only
+// ALTER action this slice (spec/design/sequences.md §4). The statement implies RESTART; restartWith
+// is a bigint for RESTART WITH n and null for a bare RESTART (reset to the original START). A
+// missing sequence without ifExists is 42P01; a value out of bounds is 22023.
+export type AlterSequence = {
+  kind: "alterSequence";
+  name: string;
+  ifExists: boolean;
+  restartWith: bigint | null;
+};
+
 // Insert is an INSERT ... [(col, ..)] whose rows come from EITHER a VALUES list (each value a
 // literal or the DEFAULT keyword) OR a SELECT (INSERT ... SELECT — spec/design/grammar.md §24).
 // An INSERT is two-phase / all-or-nothing — every row is validated before any is stored
@@ -565,6 +576,7 @@ export type Statement =
   | CreateType
   | DropType
   | CreateSequence
+  | AlterSequence
   | DropSequence
   | Insert
   | Select

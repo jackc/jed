@@ -179,6 +179,12 @@ class Parser {
         if (this.peekKeywordAt(1) === "type") return this.parseDropType();
         if (this.peekKeywordAt(1) === "sequence") return this.parseDropSequence();
         return this.parseDropTable();
+      // ALTER SEQUENCE — the only ALTER statement this slice (sequences.md §4). A 2-token lookahead
+      // recognizes it; any other `ALTER …` (TABLE, SYSTEM, …) is not a statement keyword jed knows
+      // and falls through to the generic unknown-keyword 42601 (the no-escape-hatch surface).
+      case "alter":
+        if (this.peekKeywordAt(1) === "sequence") return this.parseAlterSequence();
+        throw engineError("syntax_error", "unexpected keyword 'alter'");
       case "insert":
         return this.parseInsert();
       case "select":
@@ -820,6 +826,34 @@ class Parser {
       throw engineError("feature_not_supported", "DROP SEQUENCE ... CASCADE is not supported");
     }
     return { kind: "dropSequence", names, ifExists };
+  }
+
+  // parseAlterSequence parses `ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH <signed_int>]`
+  // (spec/design/sequences.md §4). RESTART is the only supported action; RESTART WITH n yields a
+  // non-null restartWith, a bare RESTART null (reset to the original START). A non-RESTART action is
+  // 0A000 (not a syntax error).
+  private parseAlterSequence(): Statement {
+    this.expectKeyword("alter");
+    this.expectKeyword("sequence");
+    let ifExists = false;
+    if (this.peekKeyword() === "if") {
+      this.advance();
+      this.expectKeyword("exists");
+      ifExists = true;
+    }
+    const name = this.expectIdentifier();
+    // RESTART is the only supported action; any other (SET INCREMENT, RENAME, OWNED BY, …) is 0A000.
+    if (this.peekKeyword() !== "restart") {
+      throw engineError("feature_not_supported", "only ALTER SEQUENCE ... RESTART is supported");
+    }
+    this.advance(); // RESTART
+    // RESTART [WITH] <signed_int>; bare RESTART (no value) resets to the stored START.
+    let restartWith: bigint | null = null;
+    if (this.peek().kind === "int" || this.peek().kind === "minus" || this.peekKeyword() === "with") {
+      this.consumeKeyword("with");
+      restartWith = this.parseSignedIntLiteral();
+    }
+    return { kind: "alterSequence", name, ifExists, restartWith };
   }
 
   // parseIfNotExists consumes an optional `IF NOT EXISTS` prefix, returning whether it was present.

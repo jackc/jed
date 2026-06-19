@@ -172,6 +172,19 @@ func (p *Parser) parseStatement() (Statement, error) {
 			return Statement{}, err
 		}
 		return Statement{DropTable: dt}, nil
+	case "alter":
+		// ALTER SEQUENCE — the only ALTER statement this slice (sequences.md §4). A 2-token
+		// lookahead recognizes it; any other `ALTER …` (TABLE, SYSTEM, …) is not a statement
+		// keyword jed knows and falls through to the generic unknown-keyword 42601 below
+		// (the no-escape-hatch surface — resource/no_escape_hatch.test).
+		if p.peekKeywordAt(1) == "sequence" {
+			as, err := p.parseAlterSequence()
+			if err != nil {
+				return Statement{}, err
+			}
+			return Statement{AlterSequence: as}, nil
+		}
+		return Statement{}, NewError(SyntaxError, "unexpected keyword 'alter'")
 	case "insert":
 		ins, err := p.parseInsert()
 		if err != nil {
@@ -1117,6 +1130,46 @@ func (p *Parser) parseDropSequence() (*DropSequence, error) {
 		return nil, NewError(FeatureNotSupported, "DROP SEQUENCE ... CASCADE is not supported")
 	}
 	return &DropSequence{Names: names, IfExists: ifExists}, nil
+}
+
+// parseAlterSequence parses `ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH <signed_int>]`
+// (spec/design/sequences.md §4). RESTART is the only supported action; RESTART WITH n yields a
+// non-nil RestartWith, a bare RESTART a nil one (reset to the original START). A non-RESTART action
+// is 0A000 (not a syntax error).
+func (p *Parser) parseAlterSequence() (*AlterSequence, error) {
+	if err := p.expectKeyword("alter"); err != nil {
+		return nil, err
+	}
+	if err := p.expectKeyword("sequence"); err != nil {
+		return nil, err
+	}
+	ifExists := p.peekKeyword() == "if"
+	if ifExists {
+		p.advance()
+		if err := p.expectKeyword("exists"); err != nil {
+			return nil, err
+		}
+	}
+	name, err := p.expectIdentifier()
+	if err != nil {
+		return nil, err
+	}
+	// RESTART is the only supported action; any other (SET INCREMENT, RENAME, OWNED BY, …) is 0A000.
+	if p.peekKeyword() != "restart" {
+		return nil, NewError(FeatureNotSupported, "only ALTER SEQUENCE ... RESTART is supported")
+	}
+	p.advance() // RESTART
+	// RESTART [WITH] <signed_int>; bare RESTART (no value) resets to the stored START.
+	var restartWith *int64
+	if p.peek().Kind == TokInt || p.peek().Kind == TokMinus || p.peekKeyword() == "with" {
+		p.consumeKeyword("with")
+		v, err := p.parseSignedIntLiteral()
+		if err != nil {
+			return nil, err
+		}
+		restartWith = &v
+	}
+	return &AlterSequence{Name: name, IfExists: ifExists, RestartWith: restartWith}, nil
 }
 
 // parseIfNotExists consumes an optional `IF NOT EXISTS` prefix, reporting whether it was present.

@@ -5,6 +5,7 @@
 // row), stable ORDER BY with NULLs last (the PostgreSQL model).
 
 import type {
+  AlterSequence,
   BinaryOp,
   CreateIndex,
   CreateSequence,
@@ -583,6 +584,13 @@ type ActiveTx = {
   writable: boolean;
   failed: boolean;
   working: Snapshot;
+  // savedSessionSeq / savedSessionLastName capture the handle's currval/lastval session state
+  // (spec/design/sequences.md §6) when this transaction opened. A nextval/setval inside the block
+  // updates the handle's session state per-statement (so an in-block currval sees its own advance),
+  // but those updates must ROLL BACK with the transaction (§5) — so ROLLBACK (and a failed/read-only
+  // COMMIT) restores these, while a successful COMMIT keeps the advanced state.
+  savedSessionSeq: Map<string, bigint>;
+  savedSessionLastName: string | null;
 };
 
 export class Database {
@@ -656,19 +664,33 @@ export class Database {
   // provided seededRandomSource + fixedClock (the # seed: / # clock: directives) for exact
   // cross-core output. A handle setting, not stored in the file.
   seam: Seam;
-  // sessionSeq is per-handle SESSION sequence state for currval (spec/design/sequences.md §6): the
-  // last value nextval produced IN THIS SESSION for each sequence (lowercased name). NOT part of the
-  // snapshot and NOT persisted — strictly session-local, as in PostgreSQL. Updated when a
-  // sequence-advancing statement succeeds (flushing pendingSeq); currval of an unlisted sequence
+  // sessionSeq is per-handle SESSION currval state (spec/design/sequences.md §6): the last value
+  // nextval/setval(…,true) produced IN THIS SESSION for each sequence (lowercased name). NOT part of
+  // the snapshot and NOT persisted — strictly session-local, as in PostgreSQL. Updated when a
+  // sequence-advancing statement succeeds (flushing pendingCurrval); currval of an unlisted sequence
   // this session is 55000.
   sessionSeq: Map<string, bigint>;
-  // pendingSeq is per-STATEMENT running sequence advances (spec/design/sequences.md §4): a nextval
-  // records its advance here (seeded from the working snapshot on first touch), and later
-  // nextval/currval calls in the same statement see the running state. On statement success it is
-  // flushed into the working snapshot (so commit persists it) + sessionSeq; on error it is discarded
-  // (the transactional rollback of the advance, sequences.md §5). Cleared at the start of every
-  // statement.
+  // sessionLastName is per-handle SESSION lastval state (spec/design/sequences.md §6): the lowercased
+  // NAME of the sequence the most recent nextval (of any sequence) ran on — null before the first
+  // nextval. lastval() returns the CURRENT session value of that sequence (PG reads the last-used
+  // sequence's cached value), so a setval on that same sequence is reflected; a setval never changes
+  // which sequence this points to. 55000 when null.
+  sessionLastName: string | null;
+  // pendingSeq is per-STATEMENT running sequence advances (spec/design/sequences.md §4): a
+  // nextval/setval records its advance here (seeded from the working snapshot on first touch), and
+  // later calls in the same statement see the running state. On statement success it is flushed into
+  // the working snapshot (so commit persists it); on error it is discarded (the transactional
+  // rollback of the advance, sequences.md §5). Cleared at the start of every statement.
   pendingSeq: Map<string, SequenceDef>;
+  // pendingCurrval is per-STATEMENT running currval updates (the names nextval/setval(…,true) touched
+  // → their produced value). Separate from pendingSeq because currval is updated by a subset of
+  // catalog mutations: setval(…,false) and ALTER … RESTART advance the counter without defining
+  // currval. Flushed into sessionSeq on statement success.
+  pendingCurrval: Map<string, bigint>;
+  // pendingLastName is per-STATEMENT running lastval update (the lowercased name of the most recent
+  // nextval this statement, null if none). setval never sets it. Flushed into sessionLastName on
+  // success.
+  pendingLastName: string | null;
 
   constructor() {
     this.committed = new Snapshot();
@@ -686,7 +708,10 @@ export class Database {
     this.spillSink = null;
     this.seam = new Seam();
     this.sessionSeq = new Map();
+    this.sessionLastName = null;
     this.pendingSeq = new Map();
+    this.pendingCurrval = new Map();
+    this.pendingLastName = null;
   }
 
   // setMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
@@ -816,22 +841,74 @@ export class Database {
       result = next;
     }
     this.pendingSeq.set(key, def);
+    // nextval defines this session's currval for the sequence AND makes it the lastval target (the
+    // most-recent-nextval sequence; lastval then reads its current session value — §6).
+    this.pendingCurrval.set(key, result);
+    this.pendingLastName = key;
     return result;
   }
 
-  // seqCurrval is currval('name') (spec/design/sequences.md §6): the value nextval last produced for
-  // this sequence IN THIS SESSION. Resolves the name against the catalog first (42P01 if absent),
-  // then reads the running advance this statement (pendingSeq) else the session value (sessionSeq);
-  // 55000 if nextval has not been called this session.
+  // seqSetval is setval('name', n) / setval('name', n, isCalled) (spec/design/sequences.md §4): set
+  // the sequence's counter directly and return n. A missing sequence is 42P01; n outside
+  // [minValue, maxValue] is 22003. lastValue = n, isCalled = the flag (default true); when isCalled
+  // is true the value also defines this session's currval (PG: isCalled=false leaves currval
+  // untouched). setval never updates lastval (PG — §6).
+  seqSetval(name: string, n: bigint, isCalled: boolean): bigint {
+    const key = name.toLowerCase();
+    let def = this.pendingSeq.get(key);
+    if (def === undefined) {
+      const committed = this.readSnap().sequence(name);
+      if (committed === undefined) {
+        throw engineError("undefined_table", `relation does not exist: ${name}`);
+      }
+      def = { ...committed };
+    } else {
+      def = { ...def };
+    }
+    if (n < def.minValue || n > def.maxValue) {
+      throw engineError(
+        "numeric_value_out_of_range",
+        `setval: value ${n} is out of bounds for sequence ${name} (${def.minValue}..${def.maxValue})`,
+      );
+    }
+    def.lastValue = n;
+    def.isCalled = isCalled;
+    this.pendingSeq.set(key, def);
+    // currval is defined only when isCalled (PG do_setval: elm->last_valid set iff iscalled).
+    if (isCalled) this.pendingCurrval.set(key, n);
+    return n;
+  }
+
+  // seqLastval is lastval() (spec/design/sequences.md §6): the CURRENT session value of the sequence
+  // the most recent nextval (of any sequence) ran on IN THIS SESSION — PG reads the last-used
+  // sequence's cached value, so a setval on that same sequence is reflected, while a setval on a
+  // different sequence is not. Takes no name argument (no 42P01); 55000 before the first nextval. The
+  // effective name and its value both honor the statement's running updates over the session state.
+  seqLastval(): bigint {
+    const key = this.pendingLastName ?? this.sessionLastName;
+    if (key === null) {
+      throw engineError("object_not_in_prerequisite_state", "lastval is not yet defined in this session");
+    }
+    const pending = this.pendingCurrval.get(key);
+    if (pending !== undefined) return pending;
+    const v = this.sessionSeq.get(key);
+    if (v !== undefined) return v;
+    // A nextval always defines the sequence's session value, so a recorded last-name with no value is
+    // unreachable; fall back to 55000 defensively rather than returning a wrong value.
+    throw engineError("object_not_in_prerequisite_state", "lastval is not yet defined in this session");
+  }
+
+  // seqCurrval is currval('name') (spec/design/sequences.md §6): the value nextval/setval(…,true)
+  // last produced for this sequence IN THIS SESSION. Resolves the name against the catalog first
+  // (42P01 if absent), then reads the running update this statement (pendingCurrval) else the session
+  // value (sessionSeq); 55000 if it has not been defined this session.
   seqCurrval(name: string): bigint {
     if (this.readSnap().sequence(name) === undefined) {
       throw engineError("undefined_table", `relation does not exist: ${name}`);
     }
     const key = name.toLowerCase();
-    const pending = this.pendingSeq.get(key);
-    if (pending !== undefined && pending.isCalled) {
-      return pending.lastValue;
-    }
+    const pending = this.pendingCurrval.get(key);
+    if (pending !== undefined) return pending;
     const v = this.sessionSeq.get(key);
     if (v !== undefined) return v;
     throw engineError(
@@ -841,17 +918,45 @@ export class Database {
   }
 
   // flushPendingSequences flushes the statement's pending sequence advances into the working
-  // snapshot (so a commit persists them) and into sessionSeq (so currval sees them). Called on the
-  // success of a sequence-advancing statement, while a write transaction is open; a no-op when
-  // nothing advanced. On statement error the pending map is instead discarded (cleared at the next
-  // statement), giving the transactional rollback of the advance (sequences.md §5).
+  // snapshot (so a commit persists them) and the pending session updates into sessionSeq/
+  // sessionLastName (so currval/lastval see them). Called on the success of a sequence-advancing
+  // statement, while a write transaction is open; a no-op when nothing advanced. On statement error
+  // the pending state is instead discarded (cleared at the next statement), giving the transactional
+  // rollback of the advance (sequences.md §5).
   private flushPendingSequences(): void {
-    if (this.pendingSeq.size === 0) return;
-    for (const [key, def] of this.pendingSeq) {
+    for (const def of this.pendingSeq.values()) {
       this.working().putSequence(def);
-      this.sessionSeq.set(key, def.lastValue);
+    }
+    for (const [key, v] of this.pendingCurrval) {
+      this.sessionSeq.set(key, v);
+    }
+    if (this.pendingLastName !== null) {
+      this.sessionLastName = this.pendingLastName;
     }
     this.pendingSeq.clear();
+    this.pendingCurrval.clear();
+    this.pendingLastName = null;
+  }
+
+  // restoreSessionState restores the handle's currval/lastval session state from a discarded
+  // transaction's captured copy (spec/design/sequences.md §5/§6) — the rollback of any in-block
+  // nextval/setval session updates. Called wherever a transaction is dropped without publishing.
+  private restoreSessionState(tx: ActiveTx): void {
+    this.sessionSeq = tx.savedSessionSeq;
+    this.sessionLastName = tx.savedSessionLastName;
+  }
+
+  // newTx opens a transaction over a clone of the committed snapshot, capturing the handle's
+  // currval/lastval session state so it can be restored if the transaction is discarded (the
+  // rollback of any in-block nextval/setval session updates — spec/design/sequences.md §5/§6).
+  private newTx(writable: boolean): ActiveTx {
+    return {
+      writable,
+      failed: false,
+      working: this.committed.clone(),
+      savedSessionSeq: new Map(this.sessionSeq),
+      savedSessionLastName: this.sessionLastName,
+    };
   }
 
   // The monotonic commit counter (spec/design/api.md §2): the committed snapshot's version.
@@ -942,6 +1047,8 @@ export class Database {
     // Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
     // populated — it is discarded, not flushed, on error; sequences.md §5).
     this.pendingSeq.clear();
+    this.pendingCurrval.clear();
+    this.pendingLastName = null;
 
     // Inside an explicit block?
     const tx = this.tx;
@@ -987,11 +1094,14 @@ export class Database {
         "cannot execute " + stmtKind(stmt) + " in a read-only transaction",
       );
     }
-    this.tx = { writable: true, failed: false, working: this.committed.clone() };
+    this.tx = this.newTx(true);
     let outcome: Outcome;
     try {
       outcome = this.dispatchStmt(stmt, params);
     } catch (e) {
+      // The statement failed before any flush, so session state is untouched; restore from the
+      // captured copy anyway to keep the discard path uniform (sequences.md §6).
+      this.restoreSessionState(this.tx);
       this.tx = null;
       throw e;
     }
@@ -1020,11 +1130,7 @@ export class Database {
         "cannot set transaction read-write mode on a read-only database",
       );
     }
-    this.tx = {
-      writable: writable ?? !this.readOnly,
-      failed: false,
-      working: this.committed.clone(),
-    };
+    this.tx = this.newTx(writable ?? !this.readOnly);
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -1039,7 +1145,12 @@ export class Database {
     const tx = this.tx;
     if (tx === null) return { kind: "statement", cost: 0n, rowsAffected: null };
     this.tx = null;
-    if (tx.failed || !tx.writable) return { kind: "statement", cost: 0n, rowsAffected: null };
+    if (tx.failed || !tx.writable) {
+      // A failed or read-only block publishes nothing — a failed COMMIT is a ROLLBACK (PG), so any
+      // in-block session updates revert with the discarded working set (§5/§6).
+      this.restoreSessionState(tx);
+      return { kind: "statement", cost: 0n, rowsAffected: null };
+    }
     const working = tx.working;
     // The txid advances for a durable database, signalled by the presence of a persistHook (the file
     // and OPFS hosts set one; an in-memory database has none and stays at txid 0). Keyed on persistHook,
@@ -1058,8 +1169,11 @@ export class Database {
   // rollbackTx rolls back the current transaction (spec/design/transactions.md §4.2). With no open
   // block it is a no-op success. Otherwise the working snapshot is dropped — every staged
   // INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7), vanish with it;
-  // committed was never mutated, so there is nothing to restore. Returns to autocommit.
+  // committed was never mutated, so there is nothing to restore there. The handle's currval/lastval
+  // session state, however, was updated in place by in-block nextval/setval, so it is restored from
+  // the block's captured copy (sequences.md §5/§6).
   rollbackTx(): Outcome {
+    if (this.tx !== null) this.restoreSessionState(this.tx);
     this.tx = null;
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
@@ -1089,6 +1203,9 @@ export class Database {
       case "createSequence":
         rejectParamsForDDL(params);
         return this.executeCreateSequence(stmt);
+      case "alterSequence":
+        rejectParamsForDDL(params);
+        return this.executeAlterSequence(stmt);
       case "dropSequence":
         rejectParamsForDDL(params);
         return this.executeDropSequence(stmt);
@@ -2010,6 +2127,33 @@ export class Database {
       }
       this.working().removeSequence(name.toLowerCase());
     }
+    return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // executeAlterSequence analyzes and runs an ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]
+  // (spec/design/sequences.md §4). A missing sequence is 42P01 unless IF EXISTS (then a no-op).
+  // RESTART WITH n resets lastValue to n, a bare RESTART to the original start (unchanged); either
+  // way isCalled = false, so the next nextval returns that value. A restart value outside
+  // [minValue, maxValue] is 22023. Touches no session state (currval/lastval unchanged).
+  private executeAlterSequence(as: AlterSequence): Outcome {
+    const committed = this.readSnap().sequence(as.name);
+    if (committed === undefined) {
+      if (as.ifExists) return { kind: "statement", cost: 0n, rowsAffected: null };
+      throw engineError("undefined_table", `relation does not exist: ${as.name}`);
+    }
+    const def = { ...committed };
+    const value = as.restartWith ?? def.start;
+    if (value < def.minValue || value > def.maxValue) {
+      // PG's init_params path: 22023 (distinct from setval's 22003 do_setval path — §4).
+      const bound =
+        value > def.maxValue
+          ? `greater than MAXVALUE (${def.maxValue})`
+          : `less than MINVALUE (${def.minValue})`;
+      throw engineError("invalid_parameter_value", `RESTART value (${value}) cannot be ${bound}`);
+    }
+    def.lastValue = value;
+    def.isCalled = false;
+    this.working().putSequence(def);
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -5276,9 +5420,12 @@ type ScalarFuncName =
   | "clock_timestamp"
   // Sequence value functions (spec/design/sequences.md §4/§6). nextval → int64, advance the named
   // sequence (VOLATILE; MUTATES the working snapshot via pendingSeq, so the statement is a write).
-  // currval → int64, the value nextval last produced for the named sequence IN THIS SESSION.
+  // currval → int64, the value nextval/setval last produced for the named sequence IN THIS SESSION.
+  // setval → int64, set the counter (also a write); lastval → int64, the most-recent-nextval value.
   | "nextval"
-  | "currval";
+  | "currval"
+  | "setval"
+  | "lastval";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -7141,12 +7288,13 @@ export function stmtIsWrite(stmt: Statement): boolean {
     stmt.kind === "createType" ||
     stmt.kind === "dropType" ||
     stmt.kind === "createSequence" ||
+    stmt.kind === "alterSequence" ||
     stmt.kind === "dropSequence" ||
     stmt.kind === "insert" ||
     stmt.kind === "update" ||
     stmt.kind === "delete" ||
-    // A read-shaped statement that calls nextval IS a write (sequences.md §4): it must take the
-    // write gate, stage the advance, and commit (autocommit) — and is 25006 in a READ ONLY
+    // A read-shaped statement that calls nextval/setval IS a write (sequences.md §4): it must take
+    // the write gate, stage the advance, and commit (autocommit) — and is 25006 in a READ ONLY
     // transaction, exactly like any other write.
     stmtCallsSeqMutator(stmt)
   );
@@ -7202,11 +7350,13 @@ function tableRefCallsSeqMutator(t: TableRef): boolean {
 }
 
 // exprCallsSeqMutator is exhaustive over Expr (every kind is matched): true iff the tree contains a
-// nextval call.
+// sequence-mutating call (nextval or setval).
 function exprCallsSeqMutator(e: Expr): boolean {
   switch (e.kind) {
-    case "funcCall":
-      return e.name.toLowerCase() === "nextval" || e.args.some(exprCallsSeqMutator);
+    case "funcCall": {
+      const n = e.name.toLowerCase();
+      return n === "nextval" || n === "setval" || e.args.some(exprCallsSeqMutator);
+    }
     case "column":
     case "qualifiedColumn":
     case "literal":
@@ -7280,6 +7430,8 @@ function stmtKind(stmt: Statement): string {
       return "DROP TYPE";
     case "createSequence":
       return "CREATE SEQUENCE";
+    case "alterSequence":
+      return "ALTER SEQUENCE";
     case "dropSequence":
       return "DROP SEQUENCE";
     case "insert":
@@ -10293,6 +10445,18 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       if (e.func === "currval") {
         return intValue(env.exec.seqCurrval((vals[0] as { text: string }).text));
+      }
+      // setval charges sequence_advance (it rewrites the catalog tuple, like nextval). Arity 2 →
+      // isCalled defaults true; arity 3 → the boolean third argument.
+      if (e.func === "setval") {
+        m.charge(COSTS.sequenceAdvance);
+        const isCalled = vals.length > 2 ? (vals[2] as { value: boolean }).value : true;
+        return intValue(
+          env.exec.seqSetval((vals[0] as { text: string }).text, (vals[1] as { int: bigint }).int, isCalled),
+        );
+      }
+      if (e.func === "lastval") {
+        return intValue(env.exec.seqLastval());
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

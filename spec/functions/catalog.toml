@@ -2084,15 +2084,16 @@ null           = "propagates"
 errors         = []
 volatility     = "volatile"
 
-# --- sequence value functions (nextval/currval — ../design/sequences.md §4) -----
-# The PostgreSQL sequence generators. Each takes the sequence NAME as a text argument (the
-# nextval('s'::regclass) form, regclass implicit) — the FIRST built-ins to resolve a string to a
-# catalog object, looked up in Snapshot.sequences at evaluation. null = "propagates" (nextval(NULL)
-# is NULL, PG). volatility = "volatile": nextval MUTATES the sequence (so a statement containing it
-# runs on the write path, 25006 in a read-only txn — §4) and currval reads per-session state.
-# nextval is jed-TRANSACTIONAL (rolls back; a documented PG divergence — §5/determinism.md §5).
-# Errors: 42P01 (missing sequence), 2200H (past a bound without CYCLE), 25006 (read-only txn) for
-# nextval; 42P01, 55000 (no nextval yet this session) for currval. setval/lastval land in S2.
+# --- sequence value functions (nextval/currval/setval/lastval — ../design/sequences.md §4/§6) --
+# The PostgreSQL sequence generators. nextval/currval/setval take the sequence NAME as a text
+# argument (the nextval('s'::regclass) form, regclass implicit) — the FIRST built-ins to resolve a
+# string to a catalog object, looked up in Snapshot.sequences at evaluation; lastval() takes none.
+# null = "propagates" (nextval(NULL) is NULL, PG). volatility = "volatile": nextval/setval MUTATE
+# the sequence (so a statement containing one runs on the write path, 25006 in a read-only txn —
+# §4); currval/lastval read per-session state. nextval/setval are jed-TRANSACTIONAL (roll back; a
+# documented PG divergence — §5/determinism.md §5). Errors: 42P01 (missing sequence), 2200H (past a
+# bound without CYCLE), 25006 (read-only txn) for nextval; 42P01/22003 (value out of bounds)/25006
+# for setval; 42P01, 55000 (no nextval yet this session) for currval; 55000 for lastval.
 [[operator]]
 name           = "nextval"
 kind           = "function"
@@ -2113,6 +2114,46 @@ arg_resolution = "none"
 result         = "int64"
 null           = "propagates"
 errors         = ["42P01", "55000"]
+volatility     = "volatile"
+
+# setval(s, n) — set last_value=n, is_called=true (next nextval = n+increment); updates currval.
+# setval(s, n, is_called) — when is_called=false, next nextval = n and currval stays undefined/old.
+# Either form returns n. setval does NOT update lastval (PG; only nextval does — §6). A value
+# outside [MINVALUE, MAXVALUE] is 22003. Two overloads (arity 2 / arity 3) like round.
+[[operator]]
+name           = "setval"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "integer"]
+arg_resolution = "none"
+result         = "int64"
+null           = "propagates"
+errors         = ["42P01", "22003", "25006"]
+volatility     = "volatile"
+
+[[operator]]
+name           = "setval"
+kind           = "function"
+arity          = 3
+arg_families   = ["text", "integer", "boolean"]
+arg_resolution = "none"
+result         = "int64"
+null           = "propagates"
+errors         = ["42P01", "22003", "25006"]
+volatility     = "volatile"
+
+# lastval() — the value the most recent nextval (any sequence) returned IN THIS SESSION; 55000
+# before the first nextval. A pure session read (no name argument, never the write path); unaffected
+# by setval. The first 0-arg sequence function (now()/clock_timestamp() are the 0-arg precedent).
+[[operator]]
+name           = "lastval"
+kind           = "function"
+arity          = 0
+arg_families   = []
+arg_resolution = "none"
+result         = "int64"
+null           = "propagates"
+errors         = ["55000"]
 volatility     = "volatile"
 
 # --- argument-counting functions (num_nulls/num_nonnulls — the VARIADIC surface) ---

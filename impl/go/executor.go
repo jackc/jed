@@ -551,19 +551,33 @@ type Database struct {
 	// provided SeededRandomSource + FixedClock (the # seed: / # clock: directives) for exact
 	// cross-core output. A handle setting, not stored in the file.
 	seam Seam
-	// sessionSeq is the per-handle SESSION sequence state for currval (spec/design/sequences.md §6):
-	// the last value nextval produced IN THIS SESSION for each sequence (lowercased name). NOT part
-	// of the snapshot and NOT persisted — strictly session-local, as in PostgreSQL. Updated when a
-	// sequence-advancing statement succeeds (flushing pendingSeq); currval of an unlisted sequence
-	// this session is 55000.
+	// sessionSeq is the per-handle SESSION currval state (spec/design/sequences.md §6): the last
+	// value nextval/setval(…,true) produced IN THIS SESSION for each sequence (lowercased name). NOT
+	// part of the snapshot and NOT persisted — strictly session-local, as in PostgreSQL. Updated
+	// when a sequence-advancing statement succeeds (flushing pendingCurrval); currval of an unlisted
+	// sequence this session is 55000.
 	sessionSeq map[string]int64
+	// sessionLastName is the per-handle SESSION lastval state (spec/design/sequences.md §6): the
+	// lowercased NAME of the sequence the most recent nextval (of any sequence) ran on — "" before
+	// the first nextval. lastval() returns the CURRENT session value of that sequence (PG reads the
+	// last-used sequence's cached value), so a setval on that same sequence is reflected; a setval
+	// never changes which sequence this points to. 55000 when empty.
+	sessionLastName string
 	// pendingSeq is the per-STATEMENT running sequence advances (spec/design/sequences.md §4): a
-	// nextval records its advance here (seeded from the working snapshot on first touch), so later
-	// nextval/currval calls in the same statement see the running state. On statement success it is
-	// flushed into the working snapshot (so commit persists it) + sessionSeq; on error it is
-	// discarded (the transactional rollback of the advance, sequences.md §5). Cleared at the start
-	// of every statement.
+	// nextval/setval records its advance here (seeded from the working snapshot on first touch), so
+	// later calls in the same statement see the running state. On statement success it is flushed
+	// into the working snapshot (so commit persists it); on error it is discarded (the transactional
+	// rollback of the advance, sequences.md §5). Cleared at the start of every statement.
 	pendingSeq map[string]*SequenceDef
+	// pendingCurrval is the per-STATEMENT running currval updates (the names nextval/setval(…,true)
+	// touched → their produced value). Separate from pendingSeq because currval is updated by a
+	// subset of catalog mutations: setval(…,false) and ALTER … RESTART advance the counter without
+	// defining currval. Flushed into sessionSeq on statement success.
+	pendingCurrval map[string]int64
+	// pendingLastName is the per-STATEMENT running lastval update (the lowercased name of the most
+	// recent nextval this statement, "" if none). setval never sets it. Flushed into sessionLastName
+	// on success.
+	pendingLastName string
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
@@ -575,6 +589,13 @@ type activeTx struct {
 	writable bool
 	failed   bool
 	working  *Snapshot
+	// savedSessionSeq / savedSessionLastName capture the handle's currval/lastval session state
+	// (spec/design/sequences.md §6) when this transaction opened. A nextval/setval inside the block
+	// updates the handle's session state per-statement (so an in-block currval sees its own
+	// advance), but those updates must ROLL BACK with the transaction (§5) — so ROLLBACK (and a
+	// failed/read-only COMMIT) restores these, while a successful COMMIT keeps the advanced state.
+	savedSessionSeq      map[string]int64
+	savedSessionLastName string
 }
 
 // NewDatabase builds an empty in-memory database.
@@ -759,6 +780,8 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 	// Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
 	// populated — it is discarded, not flushed, on error; sequences.md §5).
 	db.pendingSeq = nil
+	db.pendingCurrval = nil
+	db.pendingLastName = ""
 
 	// Inside an explicit block?
 	if db.tx != nil {
@@ -799,9 +822,12 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 		return Outcome{}, NewError(ReadOnlySqlTransaction,
 			"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 	}
-	db.tx = &activeTx{writable: true, working: db.committed.clone()}
+	db.tx = db.newTx(true)
 	outcome, err := db.dispatchStmt(stmt, params)
 	if err != nil {
+		// The statement failed before any flush, so session state is untouched; restore from the
+		// captured copy anyway to keep the discard path uniform (sequences.md §6).
+		db.restoreSessionState(db.tx)
 		db.tx = nil
 		return Outcome{}, err
 	}
@@ -833,8 +859,32 @@ func (db *Database) beginTx(writable, modeSet bool) (Outcome, error) {
 	if !modeSet {
 		writable = !db.readOnly
 	}
-	db.tx = &activeTx{writable: writable, working: db.committed.clone()}
+	db.tx = db.newTx(writable)
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// newTx opens a transaction over a clone of the committed snapshot, capturing the handle's
+// currval/lastval session state so it can be restored if the transaction is discarded (the
+// rollback of any in-block nextval/setval session updates — spec/design/sequences.md §5/§6).
+func (db *Database) newTx(writable bool) *activeTx {
+	saved := make(map[string]int64, len(db.sessionSeq))
+	for k, v := range db.sessionSeq {
+		saved[k] = v
+	}
+	return &activeTx{
+		writable:             writable,
+		working:              db.committed.clone(),
+		savedSessionSeq:      saved,
+		savedSessionLastName: db.sessionLastName,
+	}
+}
+
+// restoreSessionState restores the handle's currval/lastval session state from a discarded
+// transaction's captured copy (spec/design/sequences.md §5/§6) — the rollback of any in-block
+// nextval/setval session updates. Called wherever a transaction is dropped without publishing.
+func (db *Database) restoreSessionState(tx *activeTx) {
+	db.sessionSeq = tx.savedSessionSeq
+	db.sessionLastName = tx.savedSessionLastName
 }
 
 // commitTx commits the current transaction (spec/design/transactions.md §4.2). With no open block
@@ -850,6 +900,9 @@ func (db *Database) commitTx() (Outcome, error) {
 	}
 	db.tx = nil
 	if tx.failed || !tx.writable {
+		// A failed or read-only block publishes nothing — a failed COMMIT is a ROLLBACK (PG), so any
+		// in-block session updates revert with the discarded working set (§5/§6).
+		db.restoreSessionState(tx)
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 	}
 	working := tx.working
@@ -866,8 +919,13 @@ func (db *Database) commitTx() (Outcome, error) {
 // rollbackTx rolls back the current transaction (spec/design/transactions.md §4.2). With no open
 // block it is a no-op success. Otherwise the working snapshot is dropped — every staged
 // INSERT/UPDATE/DELETE and DDL CREATE/DROP, plus any rowid allocations (§7), vanish with it;
-// committed was never mutated, so there is nothing to restore. Returns to autocommit.
+// committed was never mutated, so there is nothing to restore there. The handle's currval/lastval
+// session state, however, was updated in place by in-block nextval/setval, so it is restored from
+// the block's captured copy (sequences.md §5/§6).
 func (db *Database) rollbackTx() (Outcome, error) {
+	if db.tx != nil {
+		db.restoreSessionState(db.tx)
+	}
 	db.tx = nil
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
@@ -928,22 +986,64 @@ func (db *Database) seqNextval(name string) (int64, error) {
 	}
 	d := def
 	db.pendingSeq[key] = &d
+	// nextval defines this session's currval for the sequence AND makes it the lastval target (the
+	// most-recent-nextval sequence; lastval then reads its current session value — §6).
+	if db.pendingCurrval == nil {
+		db.pendingCurrval = make(map[string]int64)
+	}
+	db.pendingCurrval[key] = result
+	db.pendingLastName = key
 	return result, nil
 }
 
-// seqCurrval implements currval('name') (spec/design/sequences.md §6): the value nextval last
-// produced for this sequence IN THIS SESSION. Resolves the name against the catalog first (42P01
-// if absent), then reads the running advance this statement (pendingSeq) else the session value
-// (sessionSeq); 55000 if nextval has not been called this session.
+// seqSetval implements setval('name', n) / setval('name', n, isCalled) (spec/design/sequences.md
+// §4): set the sequence's counter directly and return n. A missing sequence is 42P01; n outside
+// [MinValue, MaxValue] is 22003. LastValue = n, IsCalled = the flag (default true); when isCalled is
+// true the value also defines this session's currval (PG: isCalled=false leaves currval untouched).
+// setval never updates lastval (PG — §6).
+func (db *Database) seqSetval(name string, n int64, isCalled bool) (int64, error) {
+	key := strings.ToLower(name)
+	var def SequenceDef
+	if d, ok := db.pendingSeq[key]; ok {
+		def = *d
+	} else if snapDef := db.readSnap().sequence(name); snapDef != nil {
+		def = *snapDef
+	} else {
+		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
+	}
+	if n < def.MinValue || n > def.MaxValue {
+		return 0, NewError(NumericValueOutOfRange,
+			fmt.Sprintf("setval: value %d is out of bounds for sequence %s (%d..%d)",
+				n, name, def.MinValue, def.MaxValue))
+	}
+	def.LastValue = n
+	def.IsCalled = isCalled
+	if db.pendingSeq == nil {
+		db.pendingSeq = make(map[string]*SequenceDef)
+	}
+	d := def
+	db.pendingSeq[key] = &d
+	// currval is defined only when isCalled (PG do_setval: elm->last_valid set iff iscalled).
+	if isCalled {
+		if db.pendingCurrval == nil {
+			db.pendingCurrval = make(map[string]int64)
+		}
+		db.pendingCurrval[key] = n
+	}
+	return n, nil
+}
+
+// seqCurrval implements currval('name') (spec/design/sequences.md §6): the value nextval/
+// setval(…,true) last produced for this sequence IN THIS SESSION. Resolves the name against the
+// catalog first (42P01 if absent), then reads the running update this statement (pendingCurrval)
+// else the session value (sessionSeq); 55000 if it has not been defined this session.
 func (db *Database) seqCurrval(name string) (int64, error) {
 	if db.readSnap().sequence(name) == nil {
 		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
 	}
 	key := strings.ToLower(name)
-	if db.pendingSeq != nil {
-		if d, ok := db.pendingSeq[key]; ok && d.IsCalled {
-			return d.LastValue, nil
-		}
+	if v, ok := db.pendingCurrval[key]; ok {
+		return v, nil
 	}
 	if v, ok := db.sessionSeq[key]; ok {
 		return v, nil
@@ -952,23 +1052,53 @@ func (db *Database) seqCurrval(name string) (int64, error) {
 		"currval of sequence "+name+" is not yet defined in this session")
 }
 
-// flushPendingSequences lands the statement's pending sequence advances into the working snapshot
-// (so a commit persists them) and into sessionSeq (so currval sees them). Called on the success of
-// a sequence-advancing statement, while a write transaction is open; a no-op when nothing advanced.
-// On statement error the pending map is instead discarded (cleared at the next statement), giving
-// the transactional rollback of the advance (sequences.md §5).
-func (db *Database) flushPendingSequences() {
-	if db.pendingSeq == nil {
-		return
+// seqLastval implements lastval() (spec/design/sequences.md §6): the CURRENT session value of the
+// sequence the most recent nextval (of any sequence) ran on IN THIS SESSION — PG reads the last-used
+// sequence's cached value, so a setval on that same sequence is reflected, while a setval on a
+// different sequence is not. Takes no name argument (no 42P01); 55000 before the first nextval. The
+// effective name and its value both honor the statement's running updates over the session state.
+func (db *Database) seqLastval() (int64, error) {
+	key := db.pendingLastName
+	if key == "" {
+		key = db.sessionLastName
 	}
-	if db.sessionSeq == nil {
+	if key == "" {
+		return 0, NewError(ObjectNotInPrerequisiteState,
+			"lastval is not yet defined in this session")
+	}
+	if v, ok := db.pendingCurrval[key]; ok {
+		return v, nil
+	}
+	if v, ok := db.sessionSeq[key]; ok {
+		return v, nil
+	}
+	// A nextval always defines the sequence's session value, so a recorded last-name with no value
+	// is unreachable; fall back to 55000 defensively rather than returning a wrong value.
+	return 0, NewError(ObjectNotInPrerequisiteState,
+		"lastval is not yet defined in this session")
+}
+
+// flushPendingSequences lands the statement's pending sequence advances into the working snapshot
+// (so a commit persists them) and the pending session updates into sessionSeq/sessionLastName (so
+// currval/lastval see them). Called on the success of a sequence-advancing statement, while a write
+// transaction is open; a no-op when nothing advanced. On statement error the pending state is
+// instead discarded (cleared at the next statement), giving the transactional rollback (§5).
+func (db *Database) flushPendingSequences() {
+	for _, def := range db.pendingSeq {
+		db.working().putSequence(def)
+	}
+	if len(db.pendingCurrval) > 0 && db.sessionSeq == nil {
 		db.sessionSeq = make(map[string]int64)
 	}
-	for key, def := range db.pendingSeq {
-		db.working().putSequence(def)
-		db.sessionSeq[key] = def.LastValue
+	for key, v := range db.pendingCurrval {
+		db.sessionSeq[key] = v
+	}
+	if db.pendingLastName != "" {
+		db.sessionLastName = db.pendingLastName
 	}
 	db.pendingSeq = nil
+	db.pendingCurrval = nil
+	db.pendingLastName = ""
 }
 
 // checkedAddInt64 adds a + b, reporting overflow=true (and an undefined sum) when the result does
@@ -989,11 +1119,11 @@ func stmtIsWrite(stmt Statement) bool {
 	if stmt.CreateTable != nil || stmt.DropTable != nil ||
 		stmt.CreateIndex != nil || stmt.DropIndex != nil ||
 		stmt.CreateType != nil || stmt.DropType != nil ||
-		stmt.CreateSequence != nil || stmt.DropSequence != nil ||
+		stmt.CreateSequence != nil || stmt.AlterSequence != nil || stmt.DropSequence != nil ||
 		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil {
 		return true
 	}
-	// A read-shaped statement that calls a sequence-mutating function (nextval) IS a write
+	// A read-shaped statement that calls a sequence-mutating function (nextval/setval) IS a write
 	// (spec/design/sequences.md §4): it must take the write gate, stage the advance, and commit
 	// (autocommit) — and is 25006 in a READ ONLY transaction, exactly like any other write.
 	return stmtCallsSeqMutator(stmt)
@@ -1091,7 +1221,7 @@ func tableRefCallsSeqMutator(t *TableRef) bool {
 func exprCallsSeqMutator(e *Expr) bool {
 	switch e.Kind {
 	case ExprFuncCall:
-		if strings.EqualFold(e.FuncCall.Name, "nextval") {
+		if strings.EqualFold(e.FuncCall.Name, "nextval") || strings.EqualFold(e.FuncCall.Name, "setval") {
 			return true
 		}
 		for _, a := range e.FuncCall.Args {
@@ -1198,6 +1328,8 @@ func stmtKind(stmt Statement) string {
 		return "DROP TYPE"
 	case stmt.CreateSequence != nil:
 		return "CREATE SEQUENCE"
+	case stmt.AlterSequence != nil:
+		return "ALTER SEQUENCE"
 	case stmt.DropSequence != nil:
 		return "DROP SEQUENCE"
 	case stmt.Insert != nil:
@@ -1250,6 +1382,11 @@ func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error
 			return Outcome{}, err
 		}
 		return db.executeCreateSequence(stmt.CreateSequence)
+	case stmt.AlterSequence != nil:
+		if err := rejectParamsForDDL(params); err != nil {
+			return Outcome{}, err
+		}
+		return db.executeAlterSequence(stmt.AlterSequence)
 	case stmt.DropSequence != nil:
 		if err := rejectParamsForDDL(params); err != nil {
 			return Outcome{}, err
@@ -2285,6 +2422,41 @@ func (db *Database) executeDropSequence(ds *DropSequence) (Outcome, error) {
 		}
 		db.working().removeSequence(strings.ToLower(name))
 	}
+	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// executeAlterSequence analyzes and runs an ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]
+// (spec/design/sequences.md §4). A missing sequence is 42P01 unless IF EXISTS (then a no-op).
+// RESTART WITH n resets LastValue to n, a bare RESTART to the original Start (unchanged); either way
+// IsCalled = false, so the next nextval returns that value. A restart value outside
+// [MinValue, MaxValue] is 22023. Touches no session state (currval/lastval unchanged).
+func (db *Database) executeAlterSequence(as *AlterSequence) (Outcome, error) {
+	snapDef := db.readSnap().sequence(as.Name)
+	if snapDef == nil {
+		if as.IfExists {
+			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+		}
+		return Outcome{}, NewError(UndefinedTable, "relation does not exist: "+as.Name)
+	}
+	def := *snapDef
+	value := def.Start
+	if as.RestartWith != nil {
+		value = *as.RestartWith
+	}
+	if value < def.MinValue || value > def.MaxValue {
+		// PG's init_params path: 22023 (distinct from setval's 22003 do_setval path — §4).
+		var bound string
+		if value > def.MaxValue {
+			bound = fmt.Sprintf("greater than MAXVALUE (%d)", def.MaxValue)
+		} else {
+			bound = fmt.Sprintf("less than MINVALUE (%d)", def.MinValue)
+		}
+		return Outcome{}, NewError(InvalidParameterValue,
+			fmt.Sprintf("RESTART value (%d) cannot be %s", value, bound))
+	}
+	def.LastValue = value
+	def.IsCalled = false
+	db.working().putSequence(&def)
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
@@ -7167,10 +7339,12 @@ const (
 	sfClockTimestamp
 	// sequence value functions (spec/design/sequences.md §4/§6): sfNextval(text) → int64 advances
 	// the named sequence and MUTATES the per-statement pending state (write path); sfCurrval(text)
-	// → int64 is a pure session-state read. Both resolve their text argument to a catalog sequence
-	// at eval.
+	// → int64 is a pure session-state read. sfSetval(text, int64[, bool]) → int64 sets the counter
+	// (also a write); sfLastval() → int64 reads the most-recent-nextval session value (pure read).
 	sfNextval
 	sfCurrval
+	sfSetval
+	sfLastval
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -8362,12 +8536,16 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfNow
 	case "clock_timestamp":
 		return sfClockTimestamp
-	// Sequence value functions (sequences.md §4). nextval MUTATES (write path); both resolve their
-	// text argument to a catalog sequence at eval.
+	// Sequence value functions (sequences.md §4). nextval/setval MUTATE (write path); all but
+	// lastval resolve their text argument to a catalog sequence at eval.
 	case "nextval":
 		return sfNextval
 	case "currval":
 		return sfCurrval
+	case "setval":
+		return sfSetval
+	case "lastval":
+		return sfLastval
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -12532,6 +12710,25 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return IntValue(n), nil
 		case sfCurrval:
 			n, err := env.exec.seqCurrval(vals[0].Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntValue(n), nil
+		case sfSetval:
+			// setval charges sequence_advance (it rewrites the catalog tuple, like nextval). Arity 2
+			// → isCalled defaults true; arity 3 → the boolean third argument.
+			m.Charge(Costs.SequenceAdvance)
+			isCalled := true
+			if len(vals) > 2 {
+				isCalled = vals[2].Bool
+			}
+			n, err := env.exec.seqSetval(vals[0].Str, vals[1].Int, isCalled)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntValue(n), nil
+		case sfLastval:
+			n, err := env.exec.seqLastval()
 			if err != nil {
 				return Value{}, err
 			}
