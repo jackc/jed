@@ -1,7 +1,7 @@
 # Sequences — design
 
 > `CREATE SEQUENCE name [options]` / `DROP SEQUENCE` and the value functions `nextval('s')`,
-> `currval('s')` (later `setval`/`lastval`): named, persisted, monotonic **int64 generators** — the
+> `currval('s')` (later `setval`/`lastval`): named, persisted, monotonic **i64 generators** — the
 > PostgreSQL sequence object. A sequence is a database-level catalog object (like a composite type),
 > created and dropped at runtime, persisted in the catalog, and advanced by `nextval`. This doc is
 > the contract all three cores implement in lockstep (CLAUDE.md §2); the grammar is in
@@ -35,9 +35,9 @@ SELECT setval('s', n, false)   -- set the counter; next nextval = n (is_called =
 SELECT lastval()               -- the value the most recent nextval returned this session (§6)
 ```
 
-- **int64-valued.** A sequence generates `int64` (`bigint`) values, matching PostgreSQL's internal
+- **i64-valued.** A sequence generates `i64` (`bigint`) values, matching PostgreSQL's internal
   `int8` sequence representation. The `AS smallint | integer | bigint` typmod (PG 10+) is deferred
-  `0A000` — every jed sequence is the `bigint` flavor this slice. `nextval`/`currval` return `int64`.
+  `0A000` — every jed sequence is the `bigint` flavor this slice. `nextval`/`currval` return `i64`.
 - **Options.** `INCREMENT BY` (non-zero step; `22023` for zero), `MINVALUE`/`MAXVALUE` (the inclusive
   bounds; `NO MINVALUE`/`NO MAXVALUE` select the type defaults), `START WITH` (the first value), and
   `[NO] CYCLE` (wrap vs. error at a bound). Defaults match PostgreSQL: a positive `INCREMENT`
@@ -68,7 +68,7 @@ A sequence is resident in the snapshot catalog beside `tables` and `types`:
 - A new `sequences` map on `Snapshot` (Rust `HashMap<String, SequenceDef>`, Go `map[string]*SequenceDef`,
   TS `Map<string, SequenceDef>`), keyed by **lowercased name** — the same keying tables/types use.
 - `SequenceDef = { name, increment, min_value, max_value, start, cache, cycle, last_value, is_called }`
-  — all `int64` except `name`, `cycle`, and `is_called`. `last_value` + `is_called` are the **mutable
+  — all `i64` except `name`, `cycle`, and `is_called`. `last_value` + `is_called` are the **mutable
   counter state** (PG's sequence-tuple fields); the rest are immutable definition (PG's `pg_sequence`
   fields). On `CREATE`, `last_value = start` and `is_called = false`.
 - Because the whole `Snapshot` is the unit a commit publishes and a rollback discards (CLAUDE.md §3,
@@ -94,7 +94,7 @@ third kind. The on-disk shape (full byte layout in [../fileformat/format.md](../
   tables — they are grouped with the other non-table objects for a clean "schema objects, then tables"
   layout.
 - **Sequence entry** (after the `entry_kind = 2` byte): `name_len u16` + name, then six fixed
-  `int64` fields **big-endian two's-complement, no sign-flip** (a value-codec context, not a key —
+  `i64` fields **big-endian two's-complement, no sign-flip** (a value-codec context, not a key —
   like the interval body) in this order — `increment`, `min_value`, `max_value`, `start`, `cache`,
   `last_value` — then `flags u8` (bit 0 = `cycle`, bit 1 = `is_called`; bits 2–7 reserved, written 0).
   Fixed-width, no presence tags: every field is always present and non-NULL.
@@ -110,7 +110,7 @@ tree, only its catalog tuple (like a `FOREIGN KEY`, which also owns no B-tree).
 ## 4. The value functions — name resolution, the write implication, read-only
 
 `nextval`/`currval` are ordinary `[[operator]]` catalog rows (`kind = "function"`, `arg_families =
-["text"]`, `result = "int64"`, `null = "propagates"`, `volatility = "volatile"`), resolved by the
+["text"]`, `result = "i64"`, `null = "propagates"`, `volatility = "volatile"`), resolved by the
 normal overload path. Three things make them the first of their kind:
 
 - **Name → catalog object at evaluation time.** The argument is a `text` value naming a sequence. The
@@ -136,7 +136,7 @@ is_called)`:
 - else: compute `next = last_value + increment`. If `increment > 0` and `next > max_value`: if `cycle`,
   `next = min_value`, else `2200H sequence_generator_limit_exceeded` ("nextval: reached maximum value
   of sequence \"s\""). Symmetrically for `increment < 0` / `next < min_value`. The result is `next`;
-  set `last_value = next`. The add is **overflow-safe** (a wrap past the int64 boundary is treated as
+  set `last_value = next`. The add is **overflow-safe** (a wrap past the i64 boundary is treated as
   crossing the bound, never a native overflow).
 
 After a successful `nextval`, the value is recorded in the **session** state (§6) for `currval` and
@@ -200,8 +200,8 @@ This makes the entire feature deterministic with no new seam: a sequence's value
 committed sequence value**. This is **per-handle transient state**, NOT part of the snapshot and NOT
 persisted:
 
-- Each `Database` handle carries a small `session_seq: map<lowercased-name → int64>` of the last value
-  this handle's `nextval`/`setval` produced for each sequence, plus a single `session_last: int64?` —
+- Each `Database` handle carries a small `session_seq: map<lowercased-name → i64>` of the last value
+  this handle's `nextval`/`setval` produced for each sequence, plus a single `session_last: i64?` —
   the most-recent-overall value `nextval` returned (the `lastval` source).
 - `currval('s')` before any `nextval('s')`/`setval('s', …, true)` in this session is `55000
   object_not_in_prerequisite_state` ("currval of sequence \"s\" is not yet defined in this session") —
@@ -269,7 +269,7 @@ are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_ove
    determinism (CLAUDE.md §8/§10, determinism.md §5) + the single-writer model removes PG's
    concurrency rationale. The headline divergence.
 2. **`CACHE` is no value-burning** — accepted and stored, behaves as `CACHE 1` (§7). Same reason.
-3. **`bigint`-only** — no `AS smallint|integer` typmod this slice (`0A000`); jed sequences are int64.
+3. **`bigint`-only** — no `AS smallint|integer` typmod this slice (`0A000`); jed sequences are i64.
 4. **No implicit dependency from a plain `DEFAULT nextval('s')`** — matches PG (only `serial`/identity
    create one); `DROP SEQUENCE` needs no dependency tracking this slice (§1).
 5. **`nextval`/`setval` make the statement a write** — required by the single-writer staging model

@@ -80,7 +80,7 @@ is `1.50`.
 **Value-format caps — PostgreSQL's numeric format limits.** An unconstrained value is bounded
 by the same two limits PG's storage format imposes (`numeric.c`): at most
 **`max_int_digits = 131072` integer-part digits** (PG: `(NUMERIC_WEIGHT_MAX + 1) · DEC_DIGITS`,
-the int16 base-10⁴ weight) and at most **`max_scale = 16383` fractional digits** (PG:
+the i16 base-10⁴ weight) and at most **`max_scale = 16383` fractional digits** (PG:
 `NUMERIC_DSCALE_MAX`, the 14-bit dscale). Both live in
 [scalars.toml](../types/scalars.toml). Exceeding either traps **`22003`** — at literal/input
 resolve (PG `numeric_in`) and at every operation result (PG `make_result`) — with **one**

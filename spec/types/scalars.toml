@@ -10,10 +10,18 @@ schema_version = 1
 # --- conventions -------------------------------------------------------------
 # id            canonical name. ALL aliases normalize to this. It is the single
 #               name that appears in error messages, the catalog, and conformance
-#               `query` column-type tags (determinism: one name per type). Integer
-#               names state the width in BITS (int16/int32/int64), the convention
-#               common in programming languages.
-# aliases       additional SQL spellings accepted on input (the SQL-standard names).
+#               `query` column-type tags (determinism: one name per type). Integer and
+#               float names state the width in BITS under the `i`/`f` prefix (i16/i32/i64,
+#               f32/f64) — the Rust/Zig convention. The `i`/`f` prefix is load-bearing: it
+#               makes jed's bit-namespace (i8…i64) LEXICALLY DISJOINT from PostgreSQL's
+#               byte-namespace (int2/int4/int8, float4/float8), so jed can accept BOTH without
+#               the `int8`-means-8-bit-vs-64-bit collision, and a future 8-bit `i8` stays free
+#               (../design/types.md §11; CLAUDE.md §1/§4).
+# aliases       additional SQL spellings accepted on input: the SQL-standard words
+#               (smallint/int/integer/bigint, real/double precision/float) AND PostgreSQL's
+#               byte-shorthand (int2/int4/int8, float4/float8 — safe per the disjoint-namespace
+#               rule above). The old jed bit-names int16/int32/int64/float32/float64 are NO
+#               LONGER accepted (replaced by the i/f prefix; a clean break, not back-compat).
 # family        types in the same family share comparison/promotion rules.
 # storable      true if a column may be declared of this type (and a value of it
 #               stored on disk). false = the type exists only as an EXPRESSION type
@@ -45,7 +53,7 @@ schema_version = 1
 #               byte-for-byte identically to logical order. width_bytes is omitted for the
 #               variable-width types (text, bytea, decimal) but PRESENT for the fixed-width
 #               non-integer keys uuid (16) and boolean (1) — the two non-integer types usable
-#               as a key (besides the int64-backed timestamps).
+#               as a key (besides the i64-backed timestamps).
 # max_precision for decimal only: the maximum DECLARABLE precision p of numeric(p,s) —
 #               1000, PG's NUMERIC_MAX_PRECISION — and (as in PG) the display-scale clamp
 #               on a division result (../design/decimal.md §4). NOT a cap on what an
@@ -66,8 +74,8 @@ schema_version = 1
 # -----------------------------------------------------------------------------
 
 [[type]]
-id = "int16"
-aliases = ["smallint"]
+id = "i16"
+aliases = ["smallint", "int2"]
 family = "integer"
 storable = true
 signed = true
@@ -80,8 +88,8 @@ encoding = { method = "int-be-signflip", width_bytes = 2 }
 rank = 1
 
 [[type]]
-id = "int32"
-aliases = ["int", "integer"]
+id = "i32"
+aliases = ["int", "integer", "int4"]
 family = "integer"
 storable = true
 signed = true
@@ -94,8 +102,8 @@ encoding = { method = "int-be-signflip", width_bytes = 4 }
 rank = 2
 
 [[type]]
-id = "int64"
-aliases = ["bigint"]
+id = "i64"
+aliases = ["bigint", "int8"]
 family = "integer"
 storable = true
 signed = true
@@ -228,7 +236,7 @@ storable = true
 encoding = { method = "uuid-raw16", width_bytes = 16 }
 
 # --- timestamp / timestamptz: the datetime types (../design/timestamp.md) ----
-# Two DISTINCT types that share ONE physical representation: int64 MICROSECONDS since
+# Two DISTINCT types that share ONE physical representation: i64 MICROSECONDS since
 # the Unix epoch (1970-01-01 00:00:00), proleptic Gregorian, NO leap seconds. They are
 # the PostgreSQL *instant* model, not the SQL-standard *offset-bearing* model, and this
 # slice ships NO time-zone database and NO named zones (a deliberate divergence, kept
@@ -238,7 +246,7 @@ encoding = { method = "uuid-raw16", width_bytes = 16 }
 #                (Z, +HH, +HH:MM, +HH:MM:SS) which normalizes the value to UTC and is
 #                then DISCARDED (only the UTC instant is stored — no offset retained).
 # STORABLE this slice (on-disk type code 9 timestamp / 10 timestamptz —
-# ../fileformat/format.md). Both are FIXED-WIDTH 8-byte and reuse the int64 order-
+# ../fileformat/format.md). Both are FIXED-WIDTH 8-byte and reuse the i64 order-
 # preserving KEY encoding (int-be-signflip) verbatim — so unlike text/bytea/decimal a
 # timestamp PRIMARY KEY is SUPPORTED this slice (the encoding is already exercised). The
 # two families do NOT compare or cast to each other (that needs a zone): timestamp ×
@@ -267,7 +275,7 @@ storable = true
 encoding = { method = "int-be-signflip", width_bytes = 8 }
 
 # --- interval: a span of time (../design/interval.md) ------------------------
-# PostgreSQL's three INDEPENDENT fields — months (int32), days (int32), micros (int64) —
+# PostgreSQL's three INDEPENDENT fields — months (i32), days (i32), micros (i64) —
 # kept separate so `+ 1 month` is calendar-aware (Jan 31 + 1 month -> Feb 28/29, day clamped)
 # and genuinely distinct from `+ 30 days`. STORABLE this slice (on-disk type code 11 —
 # ../fileformat/format.md), with a FIXED 16-byte value body (i32 months + i32 days + i64
@@ -295,7 +303,7 @@ family = "interval"
 storable = true
 encoding = { method = "interval-fixed16" }
 
-# --- float64: IEEE 754 double precision (../design/float.md) ------------------
+# --- f64: IEEE 754 double precision (../design/float.md) ------------------
 # The engine's APPROXIMATE numeric and the FIRST type deliberately EXEMPTED from
 # cross-core byte-identity (CLAUDE.md §2/§8; ../design/determinism.md §6, class A).
 # The exemption is NARROW: storage, the total order, the +-*/ /sqrt arithmetic kernel,
@@ -304,13 +312,16 @@ encoding = { method = "interval-fixed16" }
 # (absorbed by the conformance `R` tag's tolerant compare). STORABLE this slice with the
 # on-disk value codec (type code 12 — ../fileformat/format.md): the 8 IEEE bytes, big-
 # endian, behind the presence tag (fixed-width, no length prefix, like uuid/timestamp).
-# Two widths forming a PROMOTION TOWER like the integers (float32 rank 1 < float64 rank 2):
-#   float64  canonical; aliases `double precision` and `float` (in PG a bare `float` with NO
-#            precision IS double precision / 64-bit — NOT 32-bit; the C/Java intuition is wrong).
-#   float32  canonical; alias `real` (PG's 32-bit single-precision type, `float4`).
-# PG's `float8`/`float4` and the `float(p)` precision typmod are NOT accepted (we own our surface,
-# like int2/4/8). WIDENING float32 -> float64 is LOSSLESS (every binary32 is an exact binary64), so
-# it is IMPLICIT, exactly like int16 -> int64 (casts.toml); float64 -> float32 is lossy -> explicit.
+# Two widths forming a PROMOTION TOWER like the integers (f32 rank 1 < f64 rank 2):
+#   f64  canonical; aliases `double precision`, `float`, and PG's byte-shorthand `float8` (in
+#            PG a bare `float` with NO precision IS double precision / 64-bit — NOT 32-bit; the
+#            C/Java intuition is wrong).
+#   f32  canonical; aliases `real` and PG's byte-shorthand `float4` (PG's 32-bit single).
+# PG's byte-shorthand `float8`/`float4` IS accepted (like int8/int4) — the `f` prefix keeps jed's
+# bit-namespace disjoint from PG's byte-namespace, so there is no collision (CLAUDE.md §1/§4). The
+# `float(p)` precision typmod is NOT accepted. WIDENING f32 -> f64 is LOSSLESS (every binary32 is an
+# exact binary64), so
+# it is IMPLICIT, exactly like i16 -> i64 (casts.toml); f64 -> f32 is lossy -> explicit.
 # Cross-family int/decimal <-> float stays EXPLICIT either way (float is a strict island — the only
 # implicit edge is within-family widening). Mixed-width float arithmetic/comparison promotes to the
 # higher rank (compare.toml `max-rank`), matching PG (real promotes to double).
@@ -320,13 +331,13 @@ encoding = { method = "interval-fixed16" }
 # casts/stored values and propagate; FINITE arithmetic that would produce them TRAPS
 # instead (overflow 22003, x/0 22012), the PG trap model. The order-preserving KEY
 # encoding (float-order-preserving — ../design/encoding.md §2.8) is AUTHORED but
-# UNEXERCISED: a float64 PRIMARY KEY is rejected 0A000 (the text/decimal/bytea/interval
+# UNEXERCISED: a f64 PRIMARY KEY is rejected 0A000 (the text/decimal/bytea/interval
 # precedent, reinforced by the determinism.md §4 contamination rule — float stays out of
 # stored order). No bits/min/max/rank (not the integer family); no collation. overflow =
 # "trap" (finite-overflow 22003, the §3 rule). width_bytes present (fixed 8).
 [[type]]
-id = "float32"
-aliases = ["real"]
+id = "f32"
+aliases = ["real", "float4"]
 family = "float"
 storable = true
 overflow = "trap"
@@ -335,8 +346,8 @@ encoding = { method = "float-order-preserving", width_bytes = 4 }
 rank = 1
 
 [[type]]
-id = "float64"
-aliases = ["double precision", "float"]
+id = "f64"
+aliases = ["double precision", "float", "float8"]
 family = "float"
 storable = true
 overflow = "trap"
@@ -346,12 +357,12 @@ rank = 2
 
 # --- date: a calendar date (../design/date.md) -------------------------------
 # A year/month/day with NO time and NO zone — PostgreSQL's `date`, the day-granular member of
-# the datetime family and the sibling of timestamp. A value is an int32 count of DAYS since the
+# the datetime family and the sibling of timestamp. A value is an i32 count of DAYS since the
 # Unix epoch (1970-01-01), proleptic Gregorian, reusing timestamp's days_from_civil/
 # civil_from_days calendar core VERBATIM (same epoch) so the two types cannot drift. (PostgreSQL
 # stores days since 2000-01-01 internally — an INVISIBLE divergence, since the integer is never
 # exposed; jed owns its representation, CLAUDE.md §1.) STORABLE this slice (on-disk type code 16
-# — ../fileformat/format.md), a FIXED-WIDTH 4-byte body reusing the int32 order-preserving codec.
+# — ../fileformat/format.md), a FIXED-WIDTH 4-byte body reusing the i32 order-preserving codec.
 # Finite values occupy i32::MIN+1 .. i32::MAX-1 (≈ 5877550 BC … 5879610 AD around 1970 — WIDER
 # than PG's 4713 BC … 5874897 AD; a date jed accepts beyond PG's range is a documented divergence,
 # oracle ledger). The infinity/-infinity sentinels are i32::MAX/i32::MIN (PG DATEVAL_NOEND/NOBEGIN;
@@ -361,7 +372,7 @@ rank = 2
 # strict ISO `YYYY-MM-DD` grammar with optional BC/AD era, reusing timestamp's FULL literal
 # grammar but keeping ONLY the date portion — a time/offset is validated then DISCARDED (PG), and
 # 24:00:00 does NOT roll into the day (unlike timestamp). Malformed input traps 22007; an
-# out-of-range field / a day count beyond the int32 range traps 22008. Date is its OWN family and
+# out-of-range field / a day count beyond the i32 range traps 22008. Date is its OWN family and
 # does NOT compare or cast to timestamp/timestamptz/int this slice (a documented divergence — PG
 # implicitly casts date→timestamp; deferred to the cast follow-on). Like timestamp (and unlike
 # text/decimal/bytea/interval), the int-be-signflip KEY encoding (width 4) is EXERCISED — a date

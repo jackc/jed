@@ -5,7 +5,7 @@
 //
 // This is a §8 determinism hotspot: the fractional-unit cascade, the half-away µs rounding, and
 // the render format must be byte-identical across the Rust/Go/TS cores. ALL cascade/span math is
-// `bigint` (JS `number` is f64 — loses int64 precision), matching Rust's i128 and Go's big.Int.
+// `bigint` (JS `number` is f64 — loses i64 precision), matching Rust's i128 and Go's big.Int.
 
 import { engineError, EngineError } from "./errors.ts";
 import { civilFromMicros, daysFromCivil, daysInMonth, NEG_INFINITY, POS_INFINITY } from "./timestamp.ts";
@@ -23,7 +23,7 @@ const I32_MIN = -2147483648n;
 const I32_MAX = 2147483647n;
 
 // An interval value — three independent fields. months/days are i32-range integers, micros is the
-// int64 µs offset (a bigint). Comparison/ordering/dedup go through the canonical span, NOT the
+// i64 µs offset (a bigint). Comparison/ordering/dedup go through the canonical span, NOT the
 // field triple, so `'1 mon'` == `'30 days'` == `'720:00:00'`.
 export interface Interval {
   months: number;
@@ -182,7 +182,7 @@ function floorModB(a: bigint, b: bigint): bigint {
 // tsShift computes ts + iv (or ts - iv with subtract) — the calendar-aware datetime arithmetic
 // (spec/design/interval.md §5). Months added first WITH DAY-OF-MONTH CLAMPING (Jan 31 + 1 month
 // -> Feb 28/29), then days (24 h each), then micros. ±infinity stays ±infinity; a result onto a
-// sentinel or beyond the int64-µs range traps 22008.
+// sentinel or beyond the i64-µs range traps 22008.
 export function tsShift(ts: bigint, iv: Interval, subtract: boolean): bigint {
   if (ts === NEG_INFINITY || ts === POS_INFINITY) return ts;
   const sign = subtract ? -1n : 1n;

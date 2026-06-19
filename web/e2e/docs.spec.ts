@@ -11,7 +11,7 @@ test('the types page autoruns a decimal demo (0.1 + 0.2 = 0.3, exactly)', async 
 
 test('the types page shows the integer overflow trap (22003)', async ({ page }) => {
 	await page.goto('/docs/sql/types/');
-	// Second panel = the int16 overflow demo; it autoruns to a 22003 error.
+	// Second panel = the i16 overflow demo; it autoruns to a 22003 error.
 	const overflowPanel = page.getByTestId('live-sql').nth(1);
 	await expect(overflowPanel.getByTestId('error-code')).toHaveText('22003');
 });
@@ -98,7 +98,7 @@ test('the select page runs the composite-with-array-field demo live (field acces
 	page,
 }) => {
 	await page.goto('/docs/sql/select/');
-	// Fifteenth LiveSql panel = the poly(name, pts int32[]) demo: row 1 renders its array field
+	// Fifteenth LiveSql panel = the poly(name, pts i32[]) demo: row 1 renders its array field
 	// {10,20,30}, (p).pts reads the whole array, and (p).pts[1] reads the first element 10 —
 	// a composite type with an array-typed field (array.md §12, the mirror of array-of-composite).
 	const panel = page.getByTestId('live-sql').nth(14);

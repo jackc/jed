@@ -31,7 +31,7 @@ func bigValueDB(t *testing.T) (*Database, string) {
 	t.Helper()
 	db := NewDatabase()
 	big := fillerText(1250) // incompressible, so Slice B keeps it external-plain
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s')", big))
 	mustExec(t, db, "INSERT INTO t VALUES (2, 'tiny')")
 	return db, big
@@ -66,7 +66,7 @@ func TestExternalValueSpansOverflowChainAndRoundTrips(t *testing.T) {
 
 func TestSmallValuesNeverSpill(t *testing.T) {
 	db := NewDatabase()
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
 	image, err := db.ToImage(256, 1)
 	if err != nil {
@@ -106,7 +106,7 @@ func TestExternalValueThroughPagedFileAndReclaims(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s')", big))
 	mustExec(t, db, "INSERT INTO t VALUES (2, 'small')")
 	if err := db.Close(); err != nil {

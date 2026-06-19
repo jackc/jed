@@ -36,7 +36,7 @@ type Outcome struct {
 	// statement); the column count is len(ColumnNames) (spec/design/grammar.md §8).
 	ColumnNames []string
 	// ColumnTypes is the canonical name of each output column's resolved type (parallel to
-	// ColumnNames; nil for a non-query statement) — int16/int32/int64/text/boolean/decimal/…,
+	// ColumnNames; nil for a non-query statement) — i16/i32/i64/text/boolean/decimal/…,
 	// or "unknown" for an untyped NULL column. It is the resolved SCALAR type — for decimal the
 	// unconstrained "decimal", not the numeric(p,s) typmod (spec/design/conformance.md §7).
 	ColumnTypes []string
@@ -957,7 +957,7 @@ func (db *Database) seqNextval(name string) (int64, error) {
 		def.IsCalled = true
 		result = def.LastValue
 	} else {
-		// Advance by increment, treating an int64 overflow or a bound crossing identically.
+		// Advance by increment, treating an i64 overflow or a bound crossing identically.
 		next, overflow := checkedAddInt64(def.LastValue, def.Increment)
 		inRange := !overflow &&
 			((def.Increment > 0 && next <= def.MaxValue) ||
@@ -1102,7 +1102,7 @@ func (db *Database) flushPendingSequences() {
 }
 
 // checkedAddInt64 adds a + b, reporting overflow=true (and an undefined sum) when the result does
-// not fit in an int64 — the overflow-safe sequence advance (sequences.md §4).
+// not fit in an i64 — the overflow-safe sequence advance (sequences.md §4).
 func checkedAddInt64(a, b int64) (sum int64, overflow bool) {
 	sum = a + b
 	// Overflow iff the operands share a sign that the sum does not.
@@ -1495,7 +1495,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// interval, float §2.8) are authored but unexercised, so a
 			// text/decimal/bytea/interval/float/composite PRIMARY KEY is a documented 0A000
 			// narrowing (types.md §11/§12/§13; composite.md §6), relaxable in a later in-key slice.
-			// timestamp / timestamptz are also allowed — they share the int64 int-be-signflip key
+			// timestamp / timestamptz are also allowed — they share the i64 int-be-signflip key
 			// encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
 			if isComposite || isArray {
 				// A composite/array PRIMARY KEY is rejected 0A000 — the key encoding is authored but
@@ -4268,7 +4268,7 @@ func (db *Database) execValuesPlan(plan *valuesPlan, outer []Row, params []Value
 				return selectResult{}, err
 			}
 			// Int -> decimal where the column unified to decimal (the set-operation rule); every
-			// other unified type is a value no-op (int-width promotion is free — all ints are int64).
+			// other unified type is a value no-op (int-width promotion is free — all ints are i64).
 			if plan.columnTypes[ci].kind == rtDecimal && v.Kind == ValInt {
 				v = DecimalValue(DecimalFromInt64(v.Int))
 			}
@@ -4405,7 +4405,7 @@ func scalarForParamHint(rt resolvedType) *ScalarType {
 
 // coerceSetopRows converts each row's values in place to the unified set-operation column types —
 // the only runtime change is integer -> decimal (a NULL stays NULL; integer-width promotion is a
-// value no-op since every integer is int64). Same conversion coerceCase uses for CASE.
+// value no-op since every integer is i64). Same conversion coerceCase uses for CASE.
 func coerceSetopRows(rows [][]Value, from, to []resolvedType) {
 	for i := range to {
 		if from[i].kind == rtInt && to[i].kind == rtDecimal {
@@ -4921,7 +4921,7 @@ func (db *Database) resolveSRF(name string, args []*Expr, alias *string, parent 
 // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
 // §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
 // PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
-// int64.
+// i64.
 func (db *Database) resolveGenerateSeries(args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
 	if len(args) != 2 && len(args) != 3 {
 		return nil, nil, noFuncOverload("generate_series")
@@ -4959,7 +4959,7 @@ func (db *Database) resolveGenerateSeries(args []*Expr, alias *string, argScope 
 // argument must be an array (binding ELEM := its element type, the produced column's type), else
 // 42883 (a non-array, e.g. unnest(5)). A bare untyped NULL argument leaves ELEM undeterminable →
 // 42P18 (jed's polymorphic posture, like array_append(NULL, NULL)); a typed NULL array
-// (NULL::int32[]) resolves and yields zero rows at exec. ELEM may be a scalar OR a composite (AF7 —
+// (NULL::i32[]) resolves and yields zero rows at exec. ELEM may be a scalar OR a composite (AF7 —
 // unnest(composite[])): the synthetic column is typed at the bound element type directly
 // (typeFromResolved), so a composite array produces composite rows (an anonymous-composite element
 // has no catalog name → 0A000, not reachable from a typed array).
@@ -5695,7 +5695,7 @@ func (db *Database) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Met
 	}
 
 	// LIMIT / OFFSET window over the sort's total row count (known without materializing the
-	// output). Clamp in the int64 domain before indexing (CLAUDE.md §8).
+	// output). Clamp in the i64 domain before indexing (CLAUDE.md §8).
 	total := int64(s.total)
 	var start int64
 	if plan.offset != nil && *plan.offset < total {
@@ -6090,7 +6090,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		})
 	}
 
-	// LIMIT / OFFSET window bounds over a result of n rows. Clamp in the int64 domain
+	// LIMIT / OFFSET window bounds over a result of n rows. Clamp in the i64 domain
 	// against the row count before indexing — never truncate a huge count (CLAUDE.md §8;
 	// spec/design/grammar.md §9). The counts are already non-negative (parser).
 	windowBounds := func(n int64) (int64, int64) {
@@ -6722,7 +6722,7 @@ func quantifiedMembership(op BinaryOp, all bool, lv, av Value, m *Meter) (Value,
 }
 
 // quantifiedCmp3 is the per-element three-valued comparison `lhs op e` for a quantified node,
-// normalizing a mixed-width float pair to float64 first (the resolver admits float32 vs float64,
+// normalizing a mixed-width float pair to f64 first (the resolver admits f32 vs f64,
 // matching reCompare's promote — here the array elements are runtime values, so the widen happens per
 // element). Bottoms out in the value module's Eq3/Lt3/Gt3 kernels.
 //
@@ -6870,18 +6870,18 @@ func distinctRowKey(row []Value) string {
 			b.WriteByte(':')
 			b.WriteString(v.Str)
 		case ValTimestamp:
-			// The int64 microsecond instant (held in Int), under a distinct 's' tag. Two literals
+			// The i64 microsecond instant (held in Int), under a distinct 's' tag. Two literals
 			// for the same instant (e.g. 12:00:00 and 12:00:00.0) share the int, so they bucket
 			// together; the infinity sentinels are ordinary int values with their own buckets.
 			b.WriteByte('s')
 			b.WriteString(strconv.FormatInt(v.Int, 10))
 		case ValTimestamptz:
-			// The int64 UTC-instant micros (held in Int), under a distinct 'z' tag: offsets are
+			// The i64 UTC-instant micros (held in Int), under a distinct 'z' tag: offsets are
 			// already normalized to UTC at parse, so +00 and +05-of-the-same-instant bucket together.
 			b.WriteByte('z')
 			b.WriteString(strconv.FormatInt(v.Int, 10))
 		case ValDate:
-			// The int32 day count (held in Int), under a distinct 'd' tag.
+			// The i32 day count (held in Int), under a distinct 'd' tag.
 			b.WriteByte('d')
 			b.WriteString(strconv.FormatInt(v.Int, 10))
 		case ValInterval:
@@ -6960,10 +6960,10 @@ const (
 	rtUuid        // uuid (one family, fixed 16 bytes); does not promote. First non-integer key.
 	rtTimestamp   // timestamp (zoneless instant); does not compare/cast to timestamptz
 	rtTimestamptz // timestamptz (UTC instant); does not compare/cast to timestamp
-	rtDate        // date (calendar date, int32 days); strict island, no compare/cast to timestamp
+	rtDate        // date (calendar date, i32 days); strict island, no compare/cast to timestamp
 	rtInterval    // interval (a span); compares only with itself, by the canonical span
-	rtFloat32     // float32 / real (binary32); promotes to float64; a strict island vs int/decimal
-	rtFloat64     // float64 / double precision (binary64)
+	rtFloat32     // f32 / real (binary32); promotes to f64; a strict island vs int/decimal
+	rtFloat64     // f64 / double precision (binary64)
 	// rtComposite is a composite (row) type (spec/design/composite.md §5): comp carries the
 	// (optional) name and resolved field list. A named catalog type's name drives the `# types:`
 	// output; an anonymous ROW(...) result has a nil name (rendered "record").
@@ -6978,7 +6978,7 @@ const (
 func isFloatKind(k rtKind) bool { return k == rtFloat32 || k == rtFloat64 }
 
 // promoteFloat is the float promotion tower (compare.toml max-rank): a mixed-width pair widens to
-// float64; same-width stays. Caller guarantees both kinds are float.
+// f64; same-width stays. Caller guarantees both kinds are float.
 func promoteFloat(a, b rtKind) ScalarType {
 	if a == rtFloat64 || b == rtFloat64 {
 		return Float64
@@ -7084,10 +7084,10 @@ func assignableTo(t resolvedType, colTy ScalarType) bool {
 	case rtInterval:
 		return colTy.IsInterval()
 	case rtFloat32:
-		// float32 assigns to a float32 OR a float64 column (the implicit, lossless widen — §2).
+		// f32 assigns to a f32 OR a f64 column (the implicit, lossless widen — §2).
 		return colTy.IsFloat32() || colTy.IsFloat64()
 	case rtFloat64:
-		// float64 assigns only to a float64 column (float64→float32 is explicit-CAST only).
+		// f64 assigns only to a f64 column (f64→f32 is explicit-CAST only).
 		return colTy.IsFloat64()
 	default:
 		return false
@@ -7130,9 +7130,9 @@ func rtName(t resolvedType) string {
 	case rtInterval:
 		return "interval"
 	case rtFloat32:
-		return "float32"
+		return "f32"
 	case rtFloat64:
-		return "float64"
+		return "f64"
 	case rtComposite:
 		// A named composite is its type name; an anonymous ROW(...) is "record" (PG).
 		if t.comp != nil && t.comp.named {
@@ -7152,7 +7152,7 @@ func rtName(t resolvedType) string {
 // ctxOf returns the type a sibling operand offers an adaptable operand. For an integer literal
 // this is the integer width it adopts; for a string literal, bytea/uuid/text (so it can decode
 // the hex/uuid input); a bind parameter additionally adopts a decimal/boolean sibling (a literal
-// ignores those — its arm keeps int64/text — so widening the mapping is safe). Only a bare NULL
+// ignores those — its arm keeps i64/text — so widening the mapping is safe). Only a bare NULL
 // offers no context (spec/design/api.md §5).
 func ctxOf(t resolvedType) *ScalarType {
 	switch t.kind {
@@ -7242,7 +7242,7 @@ const (
 	// num_nulls/num_nonnulls). Non-strict (null = "none"): no blanket NULL short-circuit. Its
 	// argument nodes reuse `sargs`; `variadicArray` records the call shape (false = the spread form,
 	// counting sargs' null-ness directly; true = the VARIADIC-array form, one sargs operand whose
-	// flattened elements are counted, a NULL whole-array → NULL). Result is always int32.
+	// flattened elements are counted, a NULL whole-array → NULL). Result is always i32.
 	reVariadic
 	// reOuterColumn is a correlated column reference (spec/design/grammar.md §26): the column
 	// `index` of the enclosing row `level` hops out (1 = immediate parent). A leaf.
@@ -7321,10 +7321,10 @@ const (
 	sfCos
 	sfTan
 	// sfMakeInterval builds an interval from its (named/defaulted) integer components plus the
-	// float64 secs (spec/design/functions.md §11). The one scalar function returning interval.
+	// f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
 	sfMakeInterval
 	// uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
-	// sfUuidExtractVersion → int16 (NULL off-RFC-variant); sfUuidExtractTimestamp → timestamptz
+	// sfUuidExtractVersion → i16 (NULL off-RFC-variant); sfUuidExtractTimestamp → timestamptz
 	// (the embedded instant for v1/v7, else NULL).
 	sfUuidExtractVersion
 	sfUuidExtractTimestamp
@@ -7337,10 +7337,10 @@ const (
 	// timestamptz, the clock seam read on EVERY call (VOLATILE).
 	sfNow
 	sfClockTimestamp
-	// sequence value functions (spec/design/sequences.md §4/§6): sfNextval(text) → int64 advances
+	// sequence value functions (spec/design/sequences.md §4/§6): sfNextval(text) → i64 advances
 	// the named sequence and MUTATES the per-statement pending state (write path); sfCurrval(text)
-	// → int64 is a pure session-state read. sfSetval(text, int64[, bool]) → int64 sets the counter
-	// (also a write); sfLastval() → int64 reads the most-recent-nextval session value (pure read).
+	// → i64 is a pure session-state read. sfSetval(text, i64[, bool]) → i64 sets the counter
+	// (also a write); sfLastval() → i64 reads the most-recent-nextval session value (pure read).
 	sfNextval
 	sfCurrval
 	sfSetval
@@ -7353,31 +7353,31 @@ const (
 type arrayFunc int
 
 const (
-	afNdims       arrayFunc = iota // array_ndims(anyarray) → int32; NULL for the empty array
-	afLength                       // array_length(anyarray, integer) → int32; NULL if empty / out of range
-	afLower                        // array_lower(anyarray, integer) → int32
-	afUpper                        // array_upper(anyarray, integer) → int32
-	afCardinality                  // cardinality(anyarray) → int32; 0 for the empty array
+	afNdims       arrayFunc = iota // array_ndims(anyarray) → i32; NULL for the empty array
+	afLength                       // array_length(anyarray, integer) → i32; NULL if empty / out of range
+	afLower                        // array_lower(anyarray, integer) → i32
+	afUpper                        // array_upper(anyarray, integer) → i32
+	afCardinality                  // cardinality(anyarray) → i32; 0 for the empty array
 	afDims                         // array_dims(anyarray) → text; NULL for the empty array
 	afAppend                       // array_append(anyarray, anyelement) → anyarray; non-strict; 22000 if multidim
 	afPrepend                      // array_prepend(anyelement, anyarray) → anyarray
 	afCat                          // array_cat(anyarray, anyarray) → anyarray; 2202E on incompatible dims
 	afRemove                       // array_remove(anyarray, anyelement) → anyarray; 1-D/empty only (0A000); lb preserved
 	afReplace                      // array_replace(anyarray, anyelement, anyelement) → anyarray; any dim, shape preserved
-	afPosition                     // array_position(anyarray, anyelement[, integer]) → int32; 1-D/empty (0A000); NULL start 22004
-	afPositions                    // array_positions(anyarray, anyelement) → int32[]; 1-D/empty only (0A000)
+	afPosition                     // array_position(anyarray, anyelement[, integer]) → i32; 1-D/empty (0A000); NULL start 22004
+	afPositions                    // array_positions(anyarray, anyelement) → i32[]; 1-D/empty only (0A000)
 	afContains                     // a @> b (anyarray, anyarray) → boolean; does a contain b; strict eq; any dim (§10)
 	afContainedBy                  // a <@ b (anyarray, anyarray) → boolean; is a contained by b (b @> a) (§10)
 	afOverlaps                     // a && b (anyarray, anyarray) → boolean; do a and b share an element; strict eq (§10)
 )
 
 // variadicFunc selects a VARIADIC argument-counting function (spec/design/array-functions.md §12).
-// Both return int32; the call form (spread vs VARIADIC-array) lives on the rExpr node.
+// Both return i32; the call form (spread vs VARIADIC-array) lives on the rExpr node.
 type variadicFunc int
 
 const (
-	vfNumNulls    variadicFunc = iota // num_nulls(VARIADIC "any") → int32 — count of NULL args/elements
-	vfNumNonnulls                     // num_nonnulls(VARIADIC "any") → int32 — count of non-NULL args/elements
+	vfNumNulls    variadicFunc = iota // num_nulls(VARIADIC "any") → i32 — count of NULL args/elements
+	vfNumNonnulls                     // num_nonnulls(VARIADIC "any") → i32 — count of non-NULL args/elements
 )
 
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
@@ -7392,7 +7392,7 @@ type rExpr struct {
 	cDec    Decimal        // reConstDecimal
 	cBytea  []byte         // reConstBytea
 	cIv     Interval       // reConstInterval
-	cFloat  float64        // reConstFloat32 / reConstFloat64 (a float32 const is held as the f64 of its value)
+	cFloat  float64        // reConstFloat32 / reConstFloat64 (a f32 const is held as the f64 of its value)
 	op      BinaryOp       // reArith, reCompare
 	result  ScalarType     // reCast target; reNeg / reArith result type
 	typmod  *DecimalTypmod // reCast: a decimal target's numeric(p,s) typmod
@@ -7711,13 +7711,13 @@ type aggPlan int
 const (
 	planCountStar  aggPlan = iota // COUNT(*) — count every row
 	planCount                     // COUNT(expr) — count non-NULL inputs
-	planSumInt                    // SUM(int16|int32) — accumulate i64, result int64 (trap at int64)
-	planSumDecimal                // SUM(int64|decimal) — accumulate decimal, result decimal
+	planSumInt                    // SUM(i16|i32) — accumulate i64, result i64 (trap at i64)
+	planSumDecimal                // SUM(i64|decimal) — accumulate decimal, result decimal
 	planAvg                       // AVG — decimal sum + i64 count; result sum/count (NULL if 0)
-	planSumFloat32                // SUM(float32) — canonical-order fold, result float32 (float.md §7)
-	planSumFloat64                // SUM(float64) — canonical-order fold, result float64
-	planAvgFloat32                // AVG(float32) — fold sum / count, result float32
-	planAvgFloat64                // AVG(float64) — fold sum / count, result float64
+	planSumFloat32                // SUM(f32) — canonical-order fold, result f32 (float.md §7)
+	planSumFloat64                // SUM(f64) — canonical-order fold, result f64
+	planAvgFloat32                // AVG(f32) — fold sum / count, result f32
+	planAvgFloat64                // AVG(f64) — fold sum / count, result f64
 	planMin
 	planMax
 )
@@ -8553,7 +8553,7 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 
 // scalarResultType is the result ScalarType of a scalar function from its catalog result code
 // (functions.md §9): "promoted" = the (single) operand's own type; otherwise the code is a literal
-// scalar-type id (e.g. "decimal", "float64", "interval", "int16", "timestamptz", "uuid").
+// scalar-type id (e.g. "decimal", "f64", "interval", "i16", "timestamptz", "uuid").
 func scalarResultType(code string, tys []resolvedType) ScalarType {
 	if code == "promoted" {
 		return resolvedScalarType(tys[0])
@@ -8668,7 +8668,7 @@ func resolvedTypeEqual(a, b resolvedType) bool {
 }
 
 // unifyElem binds/checks the type variable ELEM against a concrete type x: binds if unbound (*set),
-// else requires structural equality. false ⇒ a conflict (array_cat(int32[], text[])) — no match.
+// else requires structural equality. false ⇒ a conflict (array_cat(i32[], text[])) — no match.
 func unifyElem(elem **resolvedType, x resolvedType) bool {
 	if *elem == nil {
 		cp := x
@@ -8716,7 +8716,7 @@ func matchPoly(slots []string, tys []resolvedType) (elem *resolvedType, matched 
 
 // polyResultType is the result resolvedType of an array function from its catalog result code and
 // the bound ELEM: anyarray → ELEM[], anyelement → ELEM (both 42P18 if ELEM is undeterminable); any
-// other code is a concrete scalar id (int32, text).
+// other code is a concrete scalar id (i32, text).
 func polyResultType(code string, elem *resolvedType) (resolvedType, error) {
 	switch code {
 	case "anyarray":
@@ -8731,7 +8731,7 @@ func polyResultType(code string, elem *resolvedType) (resolvedType, error) {
 		}
 		return *elem, nil
 	default:
-		// A concrete array result `<scalar>[]` (array_positions → "int32[]"): the element type is
+		// A concrete array result `<scalar>[]` (array_positions → "i32[]"): the element type is
 		// fixed (independent of ELEM), so the result is Array(scalar) (array-functions.md §8).
 		if base, ok := strings.CutSuffix(code, "[]"); ok {
 			ty, ok := ScalarTypeFromName(base)
@@ -9017,7 +9017,7 @@ func resolveQuantified(s *scope, q *QuantifiedExpr, ag *aggCtx, params *paramTyp
 	}
 	// If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
 	// bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the
-	// constructor adapts (`c = ANY(ARRAY[1,2])` over an int32 column → int32[]). Harmless for a
+	// constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a
 	// column / cast operand (it ignores the hint).
 	if !isAdaptableOperand(q.Lhs) {
 		if h := ctxOf(lt); h != nil {
@@ -9027,7 +9027,7 @@ func resolveQuantified(s *scope, q *QuantifiedExpr, ag *aggCtx, params *paramTyp
 		}
 	}
 	// If the array resolved to E[] and `x` is an adaptable bare literal, adapt `x` to E (with a
-	// range check) — exactly the operand pairing `=` uses (`5 = ANY(int32[]_col)` lands `x` on int32).
+	// range check) — exactly the operand pairing `=` uses (`5 = ANY(i32[]_col)` lands `x` on i32).
 	if at.kind == rtArray && isAdaptableOperand(q.Lhs) {
 		if h, ok := elemScalarHint(*at.elem); ok {
 			if rl, lt, err = resolve(s, q.Lhs, &h, ag, params); err != nil {
@@ -9155,7 +9155,7 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 	case surface == "count":
 		return planCount, resolvedType{kind: rtInt, intTy: Int64}
 	case surface == "sum" && result == "sum_widen":
-		// SUM(int16|int32) → int64; SUM(int64) → decimal (PG widening).
+		// SUM(i16|i32) → i64; SUM(i64) → decimal (PG widening).
 		if t.kind == rtInt && t.intTy == Int64 {
 			return planSumDecimal, resolvedType{kind: rtDecimal}
 		}
@@ -9256,8 +9256,8 @@ func scalarFuncDesc(name string) *OperatorDesc {
 }
 
 // familyHint is the type context offered to an untyped literal in a function-argument slot of the
-// given family, so it adapts (functions.md §11): an integer slot offers int64, a float slot offers
-// float64 (so a bare 0/1.5 becomes float64 for secs). Other families offer no hint (nil).
+// given family, so it adapts (functions.md §11): an integer slot offers i64, a float slot offers
+// f64 (so a bare 0/1.5 becomes f64 for secs). Other families offer no hint (nil).
 func familyHint(family string) *ScalarType {
 	switch family {
 	case "integer":
@@ -9273,7 +9273,7 @@ func familyHint(family string) *ScalarType {
 
 // defaultExpr materializes a catalog DEFAULT (an integer-literal string, verify.rb-checked) as an
 // Expr so an omitted trailing argument resolves through the normal literal path — adapting to its
-// slot's family (e.g. "0" → float64 for secs). functions.md §11.
+// slot's family (e.g. "0" → f64 for secs). functions.md §11.
 func defaultExpr(lit string) Expr {
 	n, err := strconv.ParseInt(lit, 10, 64)
 	if err != nil {
@@ -9341,7 +9341,7 @@ func normalizeNamedArgs(desc *OperatorDesc, args []*Expr, argNames []*string) ([
 // resolveMakeInterval resolves make_interval(years, months, weeks, days, hours, mins, secs) — the
 // engine's first named + defaulted function (functions.md §11). Normalize named/positional args +
 // defaults onto the seven slots, resolve each with its declared family as the type hint (so a bare
-// numeric literal adapts to the float64 secs slot), and emit a sfMakeInterval node. The arguments
+// numeric literal adapts to the f64 secs slot), and emit a sfMakeInterval node. The arguments
 // keep their families (no promotion); a wrong family in a slot is 42883.
 func resolveMakeInterval(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
@@ -9362,7 +9362,7 @@ func resolveMakeInterval(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTy
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
-		// Type-check against the declared family. A NULL adapts (NULL propagates); a float32 secs
+		// Type-check against the declared family. A NULL adapts (NULL propagates); a f32 secs
 		// is read at eval and widened losslessly to f64 (no Cast node — cost matches the cores).
 		ok := t.kind == rtNull ||
 			(fam == "integer" && t.kind == rtInt) ||
@@ -9377,12 +9377,12 @@ func resolveMakeInterval(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTy
 }
 
 // f64ToMicros converts make_interval's secs (double precision) to a microsecond count: one
-// correctly-rounded multiply, rounded half-away-from-zero to int64 (the engine's one mode —
-// interval.md / float.md §6). A non-finite or out-of-int64-range product traps 22008 (interval
+// correctly-rounded multiply, rounded half-away-from-zero to i64 (the engine's one mode —
+// interval.md / float.md §6). A non-finite or out-of-i64-range product traps 22008 (interval
 // out of range), matching PG. The result stays in-contract (multiply + round are deterministic).
 func f64ToMicros(secs float64) (int64, error) {
 	p := math.Round(secs * 1_000_000.0) // round-half-away-from-zero (math.Round)
-	// 2^63 = 9_223_372_036_854_775_808.0 is the first float64 strictly above math.MaxInt64.
+	// 2^63 = 9_223_372_036_854_775_808.0 is the first f64 strictly above math.MaxInt64.
 	if math.IsNaN(p) || math.IsInf(p, 0) || p < -9_223_372_036_854_775_808.0 || p >= 9_223_372_036_854_775_808.0 {
 		return 0, NewError(DatetimeFieldOverflow, "interval out of range")
 	}
@@ -9412,7 +9412,7 @@ func resolveScalarFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 	// its kernel id by name + family (extensibility.md §5) — replacing the old hand-written
 	// (name, arg-types) switch. abs's "promoted" gives the operand's own type (its boundary
 	// range-checks for integers, its width for floats); round's numeric overloads return decimal,
-	// its float overloads float64; the remaining float functions return float64; the uuid
+	// its float overloads f64; the remaining float functions return f64; the uuid
 	// extractors/generators return their catalog scalar id.
 	desc := lookupScalarOverload(name, tys)
 	if desc == nil {
@@ -9434,7 +9434,7 @@ func variadicNotArray() error {
 // array-functions.md §12). The lone catalog row's last parameter is variadic; the call is EITHER a
 // spread of trailing arguments OR (with the VARIADIC keyword) a single array passed directly.
 // Non-strict (null = "none"): the node carries no blanket NULL short-circuit. The result type is
-// the catalog Result (int32 here), independent of the arguments.
+// the catalog Result (i32 here), independent of the arguments.
 func resolveVariadicFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	if fc.Star {
 		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
@@ -10057,7 +10057,7 @@ func resolveSubscriptIntPtr(s *scope, e *Expr, ag *aggCtx, params *paramTypes) (
 
 // resolve resolves one Expr into an rExpr plus its static type. ctx (non-nil) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); nil
-// defaults a bare literal to int64.
+// defaults a bare literal to i64.
 func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	switch e.Kind {
 	case ExprParam:
@@ -10181,7 +10181,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		// An element-type hint (ctx) flows down to the elements so an array literal adapts its
 		// untyped integer/decimal literals exactly as a scalar literal does — e.g. resolving
-		// ARRAY[7,8] with an int32 context yields int32[], not the default int64[] (the polymorphic
+		// ARRAY[7,8] with an i32 context yields i32[], not the default i64[] (the polymorphic
 		// array functions pass the bound element type here, array-functions.md §2). Almost every
 		// other caller passes nil, so the default 1-D unification is unchanged.
 		nodes := make([]*rExpr, len(e.RowItems))
@@ -10265,7 +10265,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
 		case LiteralDecimal:
 			// A decimal literal is decimal by default, but ADAPTS to a FLOAT context: in a
-			// float64/float32 column/operand context it coerces decimal→float at resolve (the
+			// f64/f32 column/operand context it coerces decimal→float at resolve (the
 			// nearest binary value, round-ties-to-even — spec/design/float.md §4). Any other
 			// context keeps it decimal (cap-checked, 22003 on an over-long coefficient/scale).
 			if ctx != nil && ctx.IsFloat() {
@@ -10278,7 +10278,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return &rExpr{kind: reConstDecimal, cDec: d}, resolvedType{kind: rtDecimal}, nil
 		default: // LiteralInt
 			// An integer literal adapts to an integer context, OR to a FLOAT context (int→float
-			// at resolve — float.md §4). A non-integer/non-float context defaults to int64, and
+			// at resolve — float.md §4). A non-integer/non-float context defaults to i64, and
 			// the surrounding check then reports the mismatch (42804) / widens it (int→decimal).
 			if ctx != nil && ctx.IsFloat() {
 				if ctx.IsFloat32() {
@@ -10512,7 +10512,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		// resolvedTypeOf maps the target to the right kind (incl. rtFloat32/rtFloat64). A float
 		// source reaching here is int/decimal/float (others were deferred above); every cross-family
 		// float cast is explicit (spec/design/float.md Â§6) â the only implicit float edge,
-		// float32->float64, is the tower, never a CAST.
+		// f32->f64, is the tower, never a CAST.
 		resultRt := resolvedTypeOf(target)
 		return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod}, resultRt, nil
 	case ExprUnary:
@@ -10535,7 +10535,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				return &rExpr{kind: reNeg, operand: rop, result: IntervalType}, // -interval (interval.md §5)
 					resolvedType{kind: rtInterval}, nil
 			case rtFloat32:
-				return &rExpr{kind: reNeg, operand: rop, result: Float32}, // -float32 (IEEE sign flip)
+				return &rExpr{kind: reNeg, operand: rop, result: Float32}, // -f32 (IEEE sign flip)
 					resolvedType{kind: rtFloat32}, nil
 			case rtFloat64:
 				return &rExpr{kind: reNeg, operand: rop, result: Float64},
@@ -10722,7 +10722,7 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 			return &rExpr{kind: reArith, op: b.Op, lhs: rl, rhs: rr, result: st}, resolvedTypeOf(st), nil
 		}
 		// Float arithmetic (spec/design/float.md §5): float ⊕ float → float, mixed widths promote
-		// to float64. Float is a STRICT island — float ⊕ int/decimal is a 42804 (no cross-family
+		// to f64. Float is a STRICT island — float ⊕ int/decimal is a 42804 (no cross-family
 		// promotion, UNLIKE PG; only literals adapt to a float context — §6). A bare NULL operand
 		// adopts the other side's float type so `f + NULL` types as that float and evaluates NULL.
 		lFloat, rFloat := isFloatKind(lt.kind), isFloatKind(rt.kind)
@@ -10800,9 +10800,9 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 
 // resolveOperandPair resolves the two operands of a binary operator, giving a bare
 // *integer* literal the other operand's integer type as context (so `small + 1` types `1`
-// as int16, and `small + 100000` traps 22003 at resolve). A text literal needs no context
+// as i16, and `small + 100000` traps 22003 at resolve). A text literal needs no context
 // (it is always text); when the sibling is text, an integer literal gets no integer
-// context (ctxOf returns nil) and defaults to int64 — the caller's family check then
+// context (ctxOf returns nil) and defaults to i64 — the caller's family check then
 // reports the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
 // classifyComparable (comparison) layer that on top.
 func resolveOperandPair(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, *rExpr, resolvedType, error) {
@@ -11255,11 +11255,11 @@ func parseIntLiteral(s string, ty ScalarType) (int64, error) {
 }
 
 // parseFloatLiteral parses a string literal's content as a float of width ty — the text→float
-// coercion for float '1.5e10' / CAST('Infinity' AS float64) (spec/design/float.md §4, the float8in
+// coercion for float '1.5e10' / CAST('Infinity' AS f64) (spec/design/float.md §4, the float8in
 // spellings). Accepts: trimmed ASCII whitespace, then either a finite numeric (optional sign,
 // decimal digits with an optional point and optional e-notation) OR a case-insensitive special
 // word — `Infinity`/`+Infinity`/`-Infinity`/`inf`/`+inf`/`-inf`/`NaN`. Malformed → 22P02; a finite
-// value outside the width's range → 22003. Returns the value as a float64 (a float32 result is the
+// value outside the width's range → 22003. Returns the value as a f64 (a f32 result is the
 // f64 of the binary32 value). NO hex floats / underscores (a documented PG-input narrowing,
 // cross-core determinism — like the int/decimal literals).
 func parseFloatLiteral(s string, ty ScalarType) (float64, error) {
@@ -11386,7 +11386,7 @@ func parseDecimalLiteral(s string) (Decimal, error) {
 		if e == "" || !allASCIIDigits(e) {
 			return invalid()
 		}
-		// Clamp the magnitude to expLimit while accumulating (keeps it in int64 and bounds the
+		// Clamp the magnitude to expLimit while accumulating (keeps it in i64 and bounds the
 		// coefficient the shared builder may materialize).
 		for m := 0; m < len(e); m++ {
 			if exp < expLimit {
@@ -11441,7 +11441,7 @@ func allASCIIDigits(s string) bool {
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the
-// higher-ranked integer type, or int64 when both are untyped NULLs.
+// higher-ranked integer type, or i64 when both are untyped NULLs.
 func promote(a, b resolvedType) ScalarType {
 	ax, aok := intType(a)
 	bx, bok := intType(b)
@@ -11480,7 +11480,7 @@ func requireTextOrNull(t resolvedType) error {
 
 // unifyArrayElementTypes unifies the element types of an ARRAY[...] constructor into one element
 // type (spec/design/array.md §1). All-NULL → text (the PG unknown rule). All integer → the widest
-// via the promotion tower (no runtime coercion — every integer is an int64 value). Otherwise every
+// via the promotion tower (no runtime coercion — every integer is an i64 value). Otherwise every
 // element must be the SAME family — a cross-family mix (including int + decimal) is a documented
 // 42804 narrowing this slice (the representation-changing coercion is deferred with numeric(p,s)[]).
 func unifyArrayElementTypes(types []resolvedType) (resolvedType, error) {
@@ -11766,7 +11766,7 @@ func arrayPositionValue(arr, elem Value, start *Value) (Value, error) {
 	return NullValue(), nil
 }
 
-// arrayPositionsValue is array_positions(a, e) (array-functions.md §8): the int32[] of every match's
+// arrayPositionsValue is array_positions(a, e) (array-functions.md §8): the i32[] of every match's
 // subscript (in the array's lower-bound space), the empty array {} if none. NULL array → NULL;
 // 1-D/empty only (a multidimensional array is 0A000).
 func arrayPositionsValue(arr, elem Value) (Value, error) {
@@ -12129,7 +12129,7 @@ func unifyCaseTypes(arms []resolvedType) (resolvedType, error) {
 
 // coerceCase coerces a CASE arm's value to the unified result type. The only runtime coercion
 // needed is widening an integer result to decimal when the unified type is decimal — integer-width
-// unification needs none (all integers are int64), and an all-NULL CASE is text but every arm
+// unification needs none (all integers are i64), and an all-NULL CASE is text but every arm
 // evaluates to NULL anyway.
 func coerceCase(v Value, toDecimal bool) Value {
 	if toDecimal && v.Kind == ValInt {
@@ -12367,7 +12367,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 			return DecimalValue(v.Dec.Negate()), nil
 		}
-		if v.Int == math.MinInt64 { // negating int64's minimum overflows int64
+		if v.Int == math.MinInt64 { // negating i64's minimum overflows i64
 			return Value{}, overflowErr(e.result)
 		}
 		n := -v.Int
@@ -12466,7 +12466,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		}
 		if e.result.IsFloat() {
 			// Float arithmetic (spec/design/float.md §5): correctly-rounded IEEE, one op per node
-			// (no FMA — the tree-walk). float32⊕float32→float32; any float64 operand → float64.
+			// (no FMA — the tree-walk). f32⊕f32→f32; any f64 operand → f64.
 			// /0 → 22012; finite overflow to ±Inf → 22003; Inf/NaN propagate.
 			return evalFloatArith(e.op, a, b, e.result.IsFloat32())
 		}
@@ -12608,7 +12608,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfAbs:
 			if vals[0].Kind == ValInt {
 				// abs over an integer: |x| then range-check at the result type's boundary
-				// (abs(int16 -32768) → 22003), exactly like reNeg.
+				// (abs(i16 -32768) → 22003), exactly like reNeg.
 				n := vals[0].Int
 				if n == math.MinInt64 {
 					return Value{}, overflowErr(e.result)
@@ -12639,7 +12639,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 			return DecimalValue(r), nil
 		case sfMakeInterval:
-			// make_interval — six integer components plus the float64 secs. years/months →
+			// make_interval — six integer components plus the f64 secs. years/months →
 			// months field (×12), weeks/days → days field (×7), hours/mins/secs → micros; an
 			// i32/i64 field overflow traps 22008 (functions.md §11). The one float step (secs →
 			// micros) is correctly-rounded + deterministic, so the interval is in-contract.
@@ -12735,7 +12735,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return IntValue(n), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
-			// (Float32 only for abs; float64 for the rest, per the catalog).
+			// (Float32 only for abs; f64 for the rest, per the catalog).
 			return evalFloatFunc(e.sfunc, vals, e.result)
 		}
 	case reArrayFunc:
@@ -12930,8 +12930,8 @@ func likeMatch(subject, pattern string) (bool, error) {
 }
 
 // evalArith evaluates an integer arithmetic op in 64-bit, trapping 22012 on a zero
-// divisor and 22003 if the op overflows int64 OR the in-range result falls outside the
-// declared result type (the int16+int16 → int16 boundary — spec/design/functions.md §7).
+// divisor and 22003 if the op overflows i64 OR the in-range result falls outside the
+// declared result type (the i16+i16 → i16 boundary — spec/design/functions.md §7).
 func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
 	var v int64
 	switch op {
@@ -12964,7 +12964,7 @@ func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
 		}
 		// `x % -1` is mathematically 0 for every x; Go computes it as 0 natively (no
 		// overflow). Unlike division, modulo by -1 has no out-of-range result, so it does
-		// NOT trap — matching PostgreSQL and the int16/int32 widths (spec/design/types.md §3).
+		// NOT trap — matching PostgreSQL and the i16/i32 widths (spec/design/types.md §3).
 		v = x % y
 	}
 	if !result.InRange(v) {
@@ -13001,10 +13001,10 @@ func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) 
 		f := v.asF64()
 		switch {
 		case target.IsFloat64():
-			// float32 -> float64 (lossless widen) or float64 -> float64 (identity).
+			// f32 -> f64 (lossless widen) or f64 -> f64 (identity).
 			return Float64Value(f), nil
 		case target.IsFloat32():
-			// float64 -> float32 (lossy, ties-to-even; finite overflow -> 22003) or f32 -> f32.
+			// f64 -> f32 (lossy, ties-to-even; finite overflow -> 22003) or f32 -> f32.
 			r, err := float64ToFloat32(f)
 			if err != nil {
 				return Value{}, err
@@ -13023,7 +13023,7 @@ func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) 
 	}
 	// v.Kind == ValDecimal
 	if target.IsFloat32() {
-		// decimal -> float32 (explicit, lossy; finite overflow -> 22003).
+		// decimal -> f32 (explicit, lossy; finite overflow -> 22003).
 		r, err := decimalToFloat32(*v.Dec)
 		if err != nil {
 			return Value{}, err
@@ -13202,7 +13202,7 @@ func valueCmp(a, b Value) int {
 		return a.Iv.SpanCmp(b.Iv)
 	case a.IsFloat() && b.IsFloat():
 		// The PG float8 TOTAL order: -0 = +0, NaN = NaN, NaN largest (spec/design/float.md §3).
-		// Mixed widths widen to float64 (lossless). Drives ORDER BY / MIN / MAX / DISTINCT / GROUP BY.
+		// Mixed widths widen to f64 (lossless). Drives ORDER BY / MIN / MAX / DISTINCT / GROUP BY.
 		return floatTotalCmp(a.asF64(), b.asF64())
 	case a.Kind == ValComposite && b.Kind == ValComposite:
 		// A composite sorts lexicographically, NULLs-last per field (the composite sort key —
@@ -13494,15 +13494,15 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			return v, nil
 		}
 		if colTy.IsFloat64() {
-			// float32 → float64 column is the implicit, lossless widen (§2).
+			// f32 → f64 column is the implicit, lossless widen (§2).
 			return Float64Value(float64(v.F32())), nil
 		}
-		return Value{}, typeError("cannot store a float32 value in " + colTy.CanonicalName() + " column " + colName)
+		return Value{}, typeError("cannot store a f32 value in " + colTy.CanonicalName() + " column " + colName)
 	case ValFloat64:
 		if colTy.IsFloat64() {
 			return v, nil
 		}
-		return Value{}, typeError("cannot store a float64 value in " + colTy.CanonicalName() + " column " + colName)
+		return Value{}, typeError("cannot store a f64 value in " + colTy.CanonicalName() + " column " + colName)
 	default: // ValBool
 		if colTy.IsBool() {
 			return BoolValue(v.Bool), nil

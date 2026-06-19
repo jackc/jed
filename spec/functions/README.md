@@ -10,7 +10,7 @@ operators**, not aspirational, and grows one entry per feature. The *why* — th
 truth-value result types, NULL propagation vs detection — lives in
 [../design/functions.md](../design/functions.md).
 
-Operator *result types* (e.g. the type of `int32 + int32`) live here, not in
+Operator *result types* (e.g. the type of `i32 + i32`) live here, not in
 [../types/](../types/): `types/` defines the scalars and how they compare/promote;
 `functions/` defines what operators do with them, **referencing** `types/` rather than
 restating it.

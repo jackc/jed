@@ -66,7 +66,7 @@ schema_version = 2
 #                 as integer-literal strings (length ≤ arity; a default may occupy only a
 #                 trailing slot — no required parameter follows a defaulted one, like PG). An
 #                 omitted trailing argument is filled with its default at resolve; the default
-#                 literal ADAPTS to the slot's family (e.g. "0" → float64 for `secs`).
+#                 literal ADAPTS to the slot's family (e.g. "0" → f64 for `secs`).
 # volatility      OPTIONAL value-stability class (PostgreSQL's, ../design/functions.md §12),
 #                 absent ⇒ "immutable". "immutable" = same args → same result always (every
 #                 operator + the pure scalar functions); "stable" = fixed within a statement,
@@ -127,8 +127,8 @@ precedence     = 30
 errors         = []
 
 # --- comparison operators ----------------------------------------------------
-# Binary comparisons over the integer family. A mixed-width pair (e.g. int16 vs
-# int64) is widened to the common type by the promotion tower, then compared as
+# Binary comparisons over the integer family. A mixed-width pair (e.g. i16 vs
+# i64) is widened to the common type by the promotion tower, then compared as
 # one integer (../types/compare.toml). Result is a boolean: any NULL operand
 # yields unknown (a NULL boolean) — NULL = NULL is unknown, equality is not
 # reflexive across NULL. No overflow is possible (widening is lossless; no
@@ -795,7 +795,7 @@ errors         = []
 # The datetime-family OVERLOADS of the comparisons: the same operator names/symbols
 # (`=` < > <= >=, and IS [NOT] DISTINCT FROM) applied to timestamp×timestamp and to
 # timestamptz×timestamptz. arg_resolution = "none" — one type per family, no promotion
-# (compare.toml). Operands compare by their int64 microsecond instant (signed numeric
+# (compare.toml). Operands compare by their i64 microsecond instant (signed numeric
 # order), which places -infinity < every finite < infinity for free. A MIXED timestamp ×
 # timestamptz pair is NOT comparable (it would need a zone — compare.toml lists neither
 # cross pair), so it is a 42804 type error; likewise a datetime vs any other family. Same
@@ -1093,12 +1093,12 @@ null           = "null_safe"
 precedence     = 35
 errors         = []
 
-# --- comparison operators (float64) ------------------------------------------
+# --- comparison operators (f64) ------------------------------------------
 # The float-family OVERLOAD of the comparisons (`=` < > <= >=, IS [NOT] DISTINCT FROM) over
-# float64 × float64. arg_resolution = "none" — one float type, no promotion (compare.toml).
+# f64 × f64. arg_resolution = "none" — one float type, no promotion (compare.toml).
 # Operands compare by the TOTAL order (compare.toml `float = "float-total-order"`): -0 = +0,
 # NaN = NaN, NaN largest — NOT raw IEEE (where NaN is unordered). So `NaN = NaN` is TRUE.
-# float64 vs ANY other family (incl. integer/decimal) is NOT comparable (compare.toml lists only
+# f64 vs ANY other family (incl. integer/decimal) is NOT comparable (compare.toml lists only
 # float × float) → 42804: float is strict, requiring an explicit cast (../design/float.md §3/§6).
 # Same precedence (35) and NULL discipline as the other comparisons; no failure, errors = [].
 
@@ -1229,7 +1229,7 @@ errors         = []
 # Binary integer arithmetic. A mixed-width pair is widened to the common type by
 # the promotion tower (arg_resolution = "promote"); the result type is that
 # common type (result = "promoted"), and a result outside the common type's range
-# traps 22003 (so int16 + int16 overflows at the int16 boundary, not int64's).
+# traps 22003 (so i16 + i16 overflows at the i16 boundary, not i64's).
 # Any NULL operand yields NULL (null = "propagates"). Multiplicative binds tighter
 # than additive. Division and modulo additionally trap 22012 on a zero divisor;
 # integer division truncates toward zero and the remainder takes the dividend's
@@ -1295,7 +1295,7 @@ null           = "propagates"
 precedence     = 50
 errors         = ["22003", "22012"]
 
-# Unary minus (negation). Same family/result discipline; negating int64's minimum
+# Unary minus (negation). Same family/result discipline; negating i64's minimum
 # has no positive counterpart and traps 22003. Binds tighter than multiplicative.
 
 [[operator]]
@@ -1624,12 +1624,12 @@ null           = "propagates"
 precedence     = 50
 errors         = ["22008", "22012"]
 
-# --- arithmetic operators (float64) ------------------------------------------
-# The float-family OVERLOAD of the arithmetic operators. float64 ⊕ float64 → float64 for
+# --- arithmetic operators (f64) ------------------------------------------
+# The float-family OVERLOAD of the arithmetic operators. f64 ⊕ f64 → f64 for
 # + - * / % and unary -, each the IEEE 754 CORRECTLY-ROUNDED operation (round-ties-to-even),
 # evaluated ONE OP PER NODE in the tree-walking evaluator (so no FMA fusion — a G3 hazard in Go;
-# ../design/float.md §5). result = "promoted" (the common operand type = float64). NO cross-family
-# promotion: int/decimal × float64 is 42804 (compare.toml has no float promotion). The PG TRAP
+# ../design/float.md §5). result = "promoted" (the common operand type = f64). NO cross-family
+# promotion: int/decimal × f64 is 42804 (compare.toml has no float promotion). The PG TRAP
 # model: a FINITE result that overflows binary64 traps 22003; x/0 traps 22012 — finite arithmetic
 # never PRODUCES Inf/NaN (they are input-only and propagate by IEEE once present, §3). unary neg
 # only flips the sign bit (no overflow), but a NaN/Inf operand passes through, so errors = [].
@@ -1719,8 +1719,8 @@ errors         = []
 # emits them into the OPERATORS table unchanged.
 #
 # abs: result "promoted" = the operand's own type (like unary neg). abs over the integer
-# family range-checks at the result type's boundary — abs(int16 -32768) has no positive
-# int16 → 22003 (the neg overflow path). abs over decimal clears the sign (cannot overflow).
+# family range-checks at the result type's boundary — abs(i16 -32768) has no positive
+# i16 → 22003 (the neg overflow path). abs over decimal clears the sign (cannot overflow).
 # round: result "decimal", half-away-from-zero (decimal.md §3) to scale 0 (1-arg) or the
 # given count (2-arg). Integer overloads return numeric — PostgreSQL's round(5) → 5::numeric
 # — authored as explicit rows rather than an implicit int→decimal coercion (strict typing).
@@ -1746,7 +1746,7 @@ null           = "propagates"
 errors         = []
 
 # round's carry can push a value at the integer-digit cap over it (decimal.md §2/§4) —
-# 22003, exactly PG. The integer overloads below cannot (an int64 is at most 19 digits).
+# 22003, exactly PG. The integer overloads below cannot (an i64 is at most 19 digits).
 [[operator]]
 name           = "round"
 kind           = "function"
@@ -1787,7 +1787,7 @@ result         = "decimal"
 null           = "propagates"
 errors         = []
 
-# --- scalar functions (float64) ----------------------------------------------
+# --- scalar functions (f64) ----------------------------------------------
 # Two classes (../design/float.md §8), distinguished only by the determinism contract, not by
 # any catalog field — the split is enforced at the conformance layer (the `R` tag's tolerant
 # compare + the determinism_exceptions.toml ledger), so these are ordinary function rows:
@@ -1795,11 +1795,11 @@ errors         = []
 #   EXACT / correctly-rounded — IN-CONTRACT (bit-identical cross-core, exact `R` assertions):
 #     abs, ceil, floor, trunc, round (half-away, 1- and 2-arg), and sqrt (IEEE-mandated
 #     correctly-rounded). result "promoted" for abs (operand-typed, like int/decimal abs);
-#     "float64" for the others (always float64). No overflow is possible except sqrt of a
+#     "f64" for the others (always f64). No overflow is possible except sqrt of a
 #     negative, a DOMAIN error -> 22003 (NaN stays input-only, §3).
 #
 #   TRANSCENDENTAL — EXEMPTED (libm differs by an ULP per core; ledgered class A): exp, ln,
-#     log10, pow, sin, cos, tan. result "float64". exp/ln/log10/pow carry 22003 (overflow /
+#     log10, pow, sin, cos, tan. result "f64". exp/ln/log10/pow carry 22003 (overflow /
 #     domain, e.g. ln(0), ln(-1), exp(710)); sin/cos/tan cannot trap (a NaN/Inf operand
 #     propagates). These are PG-oracle-only in the corpus and compared at `R` tolerance.
 # Further functions (sign, asin/acos/atan/atan2, cbrt, log(b,x), the `^` power operator) are
@@ -1821,7 +1821,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = []
 
@@ -1831,7 +1831,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = []
 
@@ -1841,7 +1841,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = []
 
@@ -1851,7 +1851,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = []
 
@@ -1861,7 +1861,7 @@ kind           = "function"
 arity          = 2
 arg_families   = ["float", "integer"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = []
 
@@ -1871,7 +1871,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = ["22003"]
 
@@ -1881,7 +1881,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = ["22003"]
 
@@ -1891,7 +1891,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = ["22003"]
 
@@ -1901,7 +1901,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = ["22003"]
 
@@ -1911,7 +1911,7 @@ kind           = "function"
 arity          = 2
 arg_families   = ["float", "float"]
 arg_resolution = "promote"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = ["22003"]
 
@@ -1921,7 +1921,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = []
 
@@ -1931,7 +1931,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = []
 
@@ -1941,7 +1941,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["float"]
 arg_resolution = "none"
-result         = "float64"
+result         = "f64"
 null           = "propagates"
 errors         = []
 
@@ -1976,7 +1976,7 @@ errors         = ["22008"]
 # functions of their input). The generators uuidv4()/uuidv7() (volatile, the entropy+clock
 # seam) land in a later slice.
 #
-# uuid_extract_version: the version nibble (high nibble of byte 6), 0..15, as int16; NULL when
+# uuid_extract_version: the version nibble (high nibble of byte 6), 0..15, as i16; NULL when
 # the variant is not RFC 4122.
 # uuid_extract_timestamp: the embedded instant as timestamptz, for VERSION 1 and 7 ONLY
 # (matching PG 18 — v6 returns NULL there); NULL for every other version and for a non-RFC
@@ -1988,7 +1988,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["uuid"]
 arg_resolution = "none"
-result         = "int16"
+result         = "i16"
 null           = "propagates"
 errors         = []
 volatility     = "immutable"
@@ -2100,7 +2100,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["text"]
 arg_resolution = "none"
-result         = "int64"
+result         = "i64"
 null           = "propagates"
 errors         = ["42P01", "2200H", "25006"]
 volatility     = "volatile"
@@ -2111,7 +2111,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["text"]
 arg_resolution = "none"
-result         = "int64"
+result         = "i64"
 null           = "propagates"
 errors         = ["42P01", "55000"]
 volatility     = "volatile"
@@ -2126,7 +2126,7 @@ kind           = "function"
 arity          = 2
 arg_families   = ["text", "integer"]
 arg_resolution = "none"
-result         = "int64"
+result         = "i64"
 null           = "propagates"
 errors         = ["42P01", "22003", "25006"]
 volatility     = "volatile"
@@ -2137,7 +2137,7 @@ kind           = "function"
 arity          = 3
 arg_families   = ["text", "integer", "boolean"]
 arg_resolution = "none"
-result         = "int64"
+result         = "i64"
 null           = "propagates"
 errors         = ["42P01", "22003", "25006"]
 volatility     = "volatile"
@@ -2151,7 +2151,7 @@ kind           = "function"
 arity          = 0
 arg_families   = []
 arg_resolution = "none"
-result         = "int64"
+result         = "i64"
 null           = "propagates"
 errors         = ["55000"]
 volatility     = "volatile"
@@ -2162,7 +2162,7 @@ volatility     = "volatile"
 # true, the last arg_families entry the variadic element family), so a call takes EITHER a SPREAD
 # of ≥1 heterogeneous arguments — num_nulls(1, 'x', NULL) — OR a single array via the VARIADIC
 # keyword — num_nulls(VARIADIC ARRAY[1,NULL,3]). num_nulls returns the count of NULL arguments;
-# num_nonnulls the count of non-NULL ones; result is always int32 (PG integer). NON-STRICT (null =
+# num_nonnulls the count of non-NULL ones; result is always i32 (PG integer). NON-STRICT (null =
 # "none"): the kernel inspects null-ness itself rather than short-circuiting, so the spread form
 # NEVER returns NULL (num_nulls(NULL) is 1, not NULL). The VARIADIC array form flattens the array's
 # elements (row-major, any dimensionality) and counts their null-ness — but a NULL whole-array
@@ -2178,7 +2178,7 @@ arity          = 1
 arg_families   = ["any"]
 variadic       = true
 arg_resolution = "none"
-result         = "int32"
+result         = "i32"
 null           = "none"
 errors         = ["42804"]
 volatility     = "immutable"
@@ -2190,7 +2190,7 @@ arity          = 1
 arg_families   = ["any"]
 variadic       = true
 arg_resolution = "none"
-result         = "int32"
+result         = "i32"
 null           = "none"
 errors         = ["42804"]
 volatility     = "immutable"
@@ -2212,7 +2212,7 @@ volatility     = "immutable"
 # an empty array or an out-of-range dimension; array_ndims/array_dims are NULL for the empty
 # array; cardinality is 0 for the empty array (the one introspector distinguishing empty from
 # absent). The dimension arg is the `integer` family (jed accepts any integer width — a minor
-# documented divergence from PG's strict int4). All return int32 (array_dims returns text:
+# documented divergence from PG's strict int4). All return i32 (array_dims returns text:
 # `[l1:u1][l2:u2]…`).
 #
 # Builders (array_append/array_prepend/array_cat): result = "anyarray". They are NON-STRICT —
@@ -2227,7 +2227,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["anyarray"]
 arg_resolution = "none"
-result         = "int32"
+result         = "i32"
 null           = "propagates"
 errors         = []
 
@@ -2237,7 +2237,7 @@ kind           = "function"
 arity          = 2
 arg_families   = ["anyarray", "integer"]
 arg_resolution = "none"
-result         = "int32"
+result         = "i32"
 null           = "propagates"
 errors         = []
 
@@ -2247,7 +2247,7 @@ kind           = "function"
 arity          = 2
 arg_families   = ["anyarray", "integer"]
 arg_resolution = "none"
-result         = "int32"
+result         = "i32"
 null           = "propagates"
 errors         = []
 
@@ -2257,7 +2257,7 @@ kind           = "function"
 arity          = 2
 arg_families   = ["anyarray", "integer"]
 arg_resolution = "none"
-result         = "int32"
+result         = "i32"
 null           = "propagates"
 errors         = []
 
@@ -2267,7 +2267,7 @@ kind           = "function"
 arity          = 1
 arg_families   = ["anyarray"]
 arg_resolution = "none"
-result         = "int32"
+result         = "i32"
 null           = "propagates"
 errors         = []
 
@@ -2322,9 +2322,9 @@ errors         = ["2202E"]
 # multidimensional array is 0A000); array_replace(a, from, to) substitutes (any dimensionality —
 # shape preserved); array_position(a, e [, start]) returns the first element's SUBSCRIPT (in the
 # array's own lower-bound space, NULL if absent — 0A000 if multidimensional; the optional start is
-# a subscript to begin at, and a NULL start is 22004); array_positions(a, e) returns the int32[]
+# a subscript to begin at, and a NULL start is 22004); array_positions(a, e) returns the i32[]
 # of every match's subscript (empty {} if none, NULL if a is NULL — 0A000 if multidimensional).
-# array_position returns int32, array_positions int32[] (PG's integer / integer[]); both keep
+# array_position returns i32, array_positions i32[] (PG's integer / integer[]); both keep
 # jed's integer-result convention regardless of element type (§3.1).
 
 [[operator]]
@@ -2353,7 +2353,7 @@ kind           = "function"
 arity          = 2
 arg_families   = ["anyarray", "anyelement"]
 arg_resolution = "none"
-result         = "int32"
+result         = "i32"
 null           = "none"
 errors         = ["0A000"]
 
@@ -2363,7 +2363,7 @@ kind           = "function"
 arity          = 3
 arg_families   = ["anyarray", "anyelement", "integer"]
 arg_resolution = "none"
-result         = "int32"
+result         = "i32"
 null           = "none"
 errors         = ["0A000", "22004"]
 
@@ -2373,7 +2373,7 @@ kind           = "function"
 arity          = 2
 arg_families   = ["anyarray", "anyelement"]
 arg_resolution = "none"
-result         = "int32[]"
+result         = "i32[]"
 null           = "none"
 errors         = ["0A000"]
 
@@ -2385,7 +2385,7 @@ errors         = ["0A000"]
 # takes the first whose anyarray/anyelement slots unify (§2). Cat-first is load-bearing: a bare
 # untyped NULL operand DEFERS in an anyarray slot (binds nothing), so `arr || NULL` / `NULL || arr`
 # resolve to array_cat (NULL array = identity), exactly as PostgreSQL does — while a TYPED null
-# element (`arr || NULL::int32`) is a concrete anyelement and resolves to array_append. The three
+# element (`arr || NULL::i32`) is a concrete anyelement and resolves to array_append. The three
 # overloads reuse the AF1 array_cat / array_append / array_prepend kernels (and their 2202E / 22000
 # errors). Element-type / non-array operands that match no overload are 42883 (text `||` deferred).
 
@@ -2498,15 +2498,15 @@ errors         = []
 # arg_families  required family of the expression argument ("any" = unconstrained).
 #               Omitted for arg = "star". SUM/AVG take a numeric family (integer/decimal —
 #               one row per family); COUNT(expr)/MIN/MAX take "any".
-# result        a scalar id (int64, decimal) OR a reserved widening id — "sum_widen"
-#               (SUM: int16/int32 -> int64, int64 -> decimal) or "same_as_input" (MIN/MAX
-#               -> the argument's type). COUNT -> int64; AVG -> decimal (sum::decimal /
+# result        a scalar id (i64, decimal) OR a reserved widening id — "sum_widen"
+#               (SUM: i16/i32 -> i64, i64 -> decimal) or "same_as_input" (MIN/MAX
+#               -> the argument's type). COUNT -> i64; AVG -> decimal (sum::decimal /
 #               count::decimal, the exact decimal division, ../design/decimal.md §4).
 # null          always "aggregate": NULL inputs are SKIPPED (COUNT(*) excepted — it counts
 #               every row); over an empty/all-NULL group SUM/AVG/MIN/MAX return NULL and
 #               COUNT returns 0.
 # errors        SQLSTATE codes the aggregate may raise; SUM/AVG carry 22003 (overflow at
-#               the result type's bound — the decimal cap or int64), COUNT/MIN/MAX [].
+#               the result type's bound — the decimal cap or i64), COUNT/MIN/MAX [].
 # -----------------------------------------------------------------------------
 
 [[aggregate]]
@@ -2514,7 +2514,7 @@ name    = "count_star"
 kind    = "aggregate"
 surface = "COUNT"
 arg     = "star"
-result  = "int64"
+result  = "i64"
 null    = "aggregate"
 errors  = []
 
@@ -2524,7 +2524,7 @@ kind         = "aggregate"
 surface      = "COUNT"
 arg          = "expr"
 arg_families = ["any"]
-result       = "int64"
+result       = "i64"
 null         = "aggregate"
 errors       = []
 
@@ -2568,8 +2568,8 @@ result       = "decimal"
 null         = "aggregate"
 errors       = ["22003"]
 
-# SUM/AVG over the float family -> SAME width as input (same_as_input: SUM(float32) -> float32,
-# SUM(float64) -> float64; NOT sum_widen — a float sum stays the same width, matching PG sum(real)
+# SUM/AVG over the float family -> SAME width as input (same_as_input: SUM(f32) -> f32,
+# SUM(f64) -> f64; NOT sum_widen — a float sum stays the same width, matching PG sum(real)
 # -> real). Computed via the ORDER-INDEPENDENT CANONICAL-ORDER FOLD (../design/float.md §7):
 # canonicalize -0, resolve NaN/±Inf first, sort the finite inputs by the §3 total order, then fold
 # left with width-correct IEEE addition — so the result is identical across cores AND across any

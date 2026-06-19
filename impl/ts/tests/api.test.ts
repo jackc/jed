@@ -35,7 +35,7 @@ test("create → commit → reopen round-trips", () => {
     const path = join(dir, "round_trip.jed");
     const db = create(path);
     assert.equal(db.txid, 1n); // the initial empty image is committed at create
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     execute(db, "INSERT INTO t VALUES (1, 10), (2, 20)");
     commit(db);
     const afterCommit = db.txid;
@@ -107,7 +107,7 @@ test("autocommit persists each write across close", () => {
   try {
     const path = join(dir, "autocommit.jed");
     const db = create(path);
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
     execute(db, "INSERT INTO t VALUES (1)"); // autocommitted, no explicit commit
     close(db);
 
@@ -126,7 +126,7 @@ test("autocommit persists each write across close", () => {
 test("commit and rollback are no-ops under autocommit", () => {
   // With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1)");
   commit(db);
   rollback(db); // does NOT undo the autocommitted insert
@@ -140,7 +140,7 @@ test("commit and rollback are no-ops under autocommit", () => {
 
 test("prepare → execute → query with params, iterating rows", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const insert = prepare(db, "INSERT INTO t VALUES ($1, $2)");
   insert.execute([intValue(1n), intValue(100n)]);
   insert.execute([intValue(2n), intValue(200n)]);
@@ -157,7 +157,7 @@ test("prepare → execute → query with params, iterating rows", () => {
 
 test("one-shot query iterates rows", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1), (2), (3)");
   const ids: bigint[] = [];
   for (const row of query(db, "SELECT id FROM t")) {
@@ -168,7 +168,7 @@ test("one-shot query iterates rows", () => {
 
 test("query on a non-query statement throws", () => {
   const db = new Database();
-  assert.throws(() => query(db, "CREATE TABLE t (id int32 PRIMARY KEY)"));
+  assert.throws(() => query(db, "CREATE TABLE t (id i32 PRIMARY KEY)"));
 });
 
 test("errors surface with SQLSTATE", () => {
@@ -184,7 +184,7 @@ test("errors surface with SQLSTATE", () => {
 
 test("commit on in-memory db is a no-op success", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   commit(db); // no path -> no-op, not an error
   assert.equal(db.txid, 0n);
   assert.equal(db.path, null);
@@ -195,14 +195,14 @@ test("tableNames lists tables sorted by lowercased name, excluding indexes", () 
   // lowercased name; secondary indexes are relations but not tables.
   const db = new Database();
   assert.deepStrictEqual(db.tableNames(), []);
-  execute(db, "CREATE TABLE Zed (id int32 PRIMARY KEY, v int32)");
-  execute(db, "CREATE TABLE apple (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)");
+  execute(db, "CREATE TABLE apple (id i32 PRIMARY KEY)");
   execute(db, "CREATE INDEX zed_v_idx ON Zed (v)");
   // Sorted by LOWERCASED name (apple < zed), returning the canonical spelling (`Zed`).
   assert.deepStrictEqual(db.tableNames(), ["apple", "Zed"]);
   // The visible snapshot includes an open transaction's working set.
   execute(db, "BEGIN");
-  execute(db, "CREATE TABLE mid (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE mid (id i32 PRIMARY KEY)");
   assert.deepStrictEqual(db.tableNames(), ["apple", "mid", "Zed"]);
   execute(db, "ROLLBACK");
   assert.deepStrictEqual(db.tableNames(), ["apple", "Zed"]);
@@ -220,7 +220,7 @@ test("rowsAffected reports DML counts", () => {
     return out.kind === "statement" ? out.rowsAffected : null;
   };
 
-  assert.equal(affected("CREATE TABLE t (id int32 PRIMARY KEY, v int32)"), null);
+  assert.equal(affected("CREATE TABLE t (id i32 PRIMARY KEY, v i32)"), null);
   assert.equal(affected("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)"), 3);
   assert.equal(affected("UPDATE t SET v = v + 1 WHERE id <= 2"), 2);
   assert.equal(affected("DELETE FROM t WHERE id = 3"), 1);
@@ -229,7 +229,7 @@ test("rowsAffected reports DML counts", () => {
   assert.equal(affected("COMMIT"), null);
 
   // INSERT ... SELECT counts the inserted rows; DML with RETURNING is a Query.
-  execute(db, "CREATE TABLE dst (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE dst (id i32 PRIMARY KEY)");
   assert.equal(affected("INSERT INTO dst SELECT id FROM t"), 2);
   const out = execute(db, "DELETE FROM dst RETURNING id");
   assert.equal(out.kind, "query");
@@ -244,7 +244,7 @@ test("open read-only blocks writes and never touches the file", () => {
   try {
     const path = join(dir, "readonly.jed");
     let db = create(path);
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
     execute(db, "INSERT INTO t VALUES (1)");
     close(db);
     const before = readFileSync(path);

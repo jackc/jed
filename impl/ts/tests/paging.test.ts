@@ -25,7 +25,7 @@ test("demand paging: scans + mutates correctly with bounded residency", () => {
 
     // Build a multi-level tree at a small page size, so a few hundred rows span many pages.
     const db = create(path, { pageSize: 256 });
-    execute(db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)");
+    execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)");
     execute(db, "BEGIN"); // one commit, not 600
     for (let k = 0; k < n; k++) execute(db, `INSERT INTO t VALUES (${k}, ${k * 2})`);
     execute(db, "COMMIT");
@@ -83,7 +83,7 @@ test("memory budget: bounds residency under repeated lookups on a large file", (
     const CAP = 4;
 
     const db = create(path, { pageSize: 256 });
-    execute(db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)");
+    execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)");
     execute(db, "BEGIN");
     for (let k = 0; k < n; k++) execute(db, `INSERT INTO t VALUES (${k}, ${k + 1})`);
     execute(db, "COMMIT");
@@ -121,7 +121,7 @@ test("memory budget: a sub-page budget keeps exactly one leaf resident", () => {
     const n = 400;
 
     const db = create(path, { pageSize: 256 });
-    execute(db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)");
+    execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)");
     execute(db, "BEGIN");
     for (let k = 0; k < n; k++) execute(db, `INSERT INTO t VALUES (${k}, ${k + 1})`);
     execute(db, "COMMIT");

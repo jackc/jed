@@ -272,7 +272,7 @@ function assertNames(expected: string[] | null, actual: string[], sql: string): 
   }
 }
 
-// parseTypesDirective parses a `# types: int16, text, decimal` directive line. Returns the
+// parseTypesDirective parses a `# types: i16, text, decimal` directive line. Returns the
 // asserted output column types — each the canonical name of a result column's resolved type (the
 // integer WIDTH, the unconstrained `decimal`, `unknown` for an untyped NULL), beyond the
 // `I`/`T`/`D` rendering tag (conformance.md §1/§7); null if not a types directive.

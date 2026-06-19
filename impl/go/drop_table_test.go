@@ -10,7 +10,7 @@ import "testing"
 
 func TestDropRemovesTableAndRows(t *testing.T) {
 	db := NewDatabase()
-	mustCreate(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")
+	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 10), (2, 20)")
 	out := mustCreate(t, db, "DROP TABLE t")
 	if out.Kind != OutcomeStatement || out.Cost != 0 {
@@ -26,11 +26,11 @@ func TestDropRemovesTableAndRows(t *testing.T) {
 
 func TestNameIsFreeToRecreateAfterDrop(t *testing.T) {
 	db := NewDatabase()
-	mustCreate(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")
+	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 10)")
 	mustCreate(t, db, "DROP TABLE t")
 	// Re-create the freed name with a different shape; the new table starts empty.
-	mustCreate(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, w int64)")
+	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, w i64)")
 	if rows := db.RowsInKeyOrder("t"); len(rows) != 0 {
 		t.Errorf("re-created table not empty: %v", rows)
 	}
@@ -42,7 +42,7 @@ func TestNameIsFreeToRecreateAfterDrop(t *testing.T) {
 
 func TestDropIsCaseInsensitive(t *testing.T) {
 	db := NewDatabase()
-	mustCreate(t, db, "create table T (id int32 primary key)")
+	mustCreate(t, db, "create table T (id i32 primary key)")
 	mustCreate(t, db, "DROP TABLE t")
 	if _, ok := db.Table("t"); ok {
 		t.Error("case-insensitive drop failed")
@@ -51,8 +51,8 @@ func TestDropIsCaseInsensitive(t *testing.T) {
 
 func TestDropLeavesOtherTablesIntact(t *testing.T) {
 	db := NewDatabase()
-	mustCreate(t, db, "CREATE TABLE a (id int32 PRIMARY KEY)")
-	mustCreate(t, db, "CREATE TABLE b (id int32 PRIMARY KEY)")
+	mustCreate(t, db, "CREATE TABLE a (id i32 PRIMARY KEY)")
+	mustCreate(t, db, "CREATE TABLE b (id i32 PRIMARY KEY)")
 	mustCreate(t, db, "INSERT INTO b VALUES (2)")
 	mustCreate(t, db, "DROP TABLE a")
 	if _, ok := db.Table("a"); ok {
@@ -69,7 +69,7 @@ func TestDropLeavesOtherTablesIntact(t *testing.T) {
 func TestDropTableSyntaxErrors(t *testing.T) {
 	db := NewDatabase()
 	wantErr(t, db, "DROP TABLE", "42601") // no table name
-	mustCreate(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	wantErr(t, db, "DROP TABLE t extra", "42601") // trailing input
 	// DROP INDEX is its own statement now (spec/design/indexes.md §2): a missing index
 	// is 42704, not a syntax error; DROP of any other object kind is still unparsed.

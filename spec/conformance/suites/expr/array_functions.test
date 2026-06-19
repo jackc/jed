@@ -6,10 +6,10 @@
 # identity, reject a multidimensional array_append/prepend (22000), and 2202E on an incompatible
 # array_cat. PostgreSQL-oracle-verified (postgres:18). A bare untyped NULL in a typed slot is out of
 # scope (jed's existing 42883 strictness); NULL is exercised through typed NULL columns / casts.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.int32, types.text, func.array, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.i32, types.text, func.array, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], ys int32[])
+CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], ys i32[])
 
 # Row 1: a 3-element xs + a 2-element ys. Row 2: an EMPTY xs + a NULL ys. Row 3: a NULL xs.
 statement ok
@@ -124,7 +124,7 @@ SELECT array_ndims(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]]), array_length(ARRAY[ARRAY[1
 
 # A custom lower bound is preserved by append/prepend (the opposite bound grows).
 query TT nosort
-SELECT array_dims(array_append('[2:4]={7,8,9}'::int32[], 10)), array_dims(array_prepend(6, '[2:4]={7,8,9}'::int32[])) FROM t WHERE id = 1
+SELECT array_dims(array_append('[2:4]={7,8,9}'::i32[], 10)), array_dims(array_prepend(6, '[2:4]={7,8,9}'::i32[])) FROM t WHERE id = 1
 ----
 [2:5]
 [2:5]
@@ -139,7 +139,7 @@ SELECT array_append(ARRAY[1,2], NULL), array_cat(ARRAY[ARRAY[1,2],ARRAY[3,4]], A
 # G20 — array_cat of two NULL arrays is NULL (each NULL operand is the identity, so the result is
 # the other operand — here also NULL).
 query T nosort
-SELECT array_cat(NULL::int32[], NULL::int32[]) FROM t WHERE id = 1
+SELECT array_cat(NULL::i32[], NULL::i32[]) FROM t WHERE id = 1
 ----
 NULL
 

@@ -41,7 +41,7 @@ test("corrupting any body page is caught or inert, never silent", () => {
     // Seed a tree spanning every body-page kind at page_size 256: a multi-leaf B-tree (interior
     // root) of ~30 rows, with row 1 a 600-char incompressible body that spills out-of-line.
     const db = create(path, { pageSize: PAGE_SIZE });
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)");
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
     let sql = `INSERT INTO t VALUES (1, '${fillerText(600)}')`;
     for (let id = 2; id <= 30; id++) sql += `, (${id}, 'row${id}')`;
     execute(db, sql);

@@ -4,10 +4,10 @@
 # duplicate primary key (23505, against both stored rows AND earlier rows in the same
 # batch) — before any row is inserted, so a failing batch stores NOTHING.
 # Format + the `requires` directive: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.int16, types.int32, types.int64, error.overflow_trap
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i16, types.i32, types.i64, error.overflow_trap
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int16, b int64)
+CREATE TABLE t (id i32 PRIMARY KEY, a i16, b i64)
 
 # one statement, three rows
 statement ok
@@ -48,7 +48,7 @@ SELECT a FROM t WHERE id = 6
 ----
 60
 
-# all-or-nothing: the second row overflows int16 (max 32767), so NEITHER row is stored
+# all-or-nothing: the second row overflows i16 (max 32767), so NEITHER row is stored
 statement error 22003
 INSERT INTO t VALUES (7, 70, 700), (8, 99999, 800)
 
@@ -94,7 +94,7 @@ SELECT id FROM t ORDER BY id
 # a table with no primary key: multi-row INSERT keeps the rows in insertion order
 # (the synthetic rowid is monotonic, allocated left-to-right at insert)
 statement ok
-CREATE TABLE log (a int32, b int16)
+CREATE TABLE log (a i32, b i16)
 
 statement ok
 INSERT INTO log VALUES (30, 3), (10, 1), (20, 2)

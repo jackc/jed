@@ -12,7 +12,7 @@ import { dbWith, errCode } from "./util.ts";
 
 function setup() {
   return dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, v int32 DEFAULT 7, w int32)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
     "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
   ]);
 }
@@ -59,7 +59,7 @@ test("RETURNING output names and expressions", () => {
 
 test("INSERT ... SELECT ... RETURNING", () => {
   const db = setup();
-  execute(db, "CREATE TABLE src (a int32)");
+  execute(db, "CREATE TABLE src (a i32)");
   execute(db, "INSERT INTO src VALUES (40), (41)");
   // RETURNING belongs to the INSERT: it projects the INSERTED rows (defaults filled).
   assert.deepStrictEqual(rows(db, "INSERT INTO t (id) SELECT a FROM src RETURNING id, v"), [
@@ -222,7 +222,7 @@ test("RETURNING grows the touched set", () => {
   // ceil(100000/8180) = 13 slabs.
   const big = `INSERT INTO big VALUES (1, 0, '${"x".repeat(100_000)}')`;
   const fresh = () =>
-    dbWith(["CREATE TABLE big (id int32 PRIMARY KEY, w int32, t text)", big]);
+    dbWith(["CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)", big]);
   // RETURNING only fixed-width columns: no decompression (page 1 + row 1 + filter 1 +
   // row_produced 1).
   assert.equal(cost(fresh(), "DELETE FROM big WHERE id = 1 RETURNING id, w"), 4n);
@@ -273,7 +273,7 @@ test("old/new qualifiers per statement", () => {
     ["30", "NULL", "30"],
   ]);
   // INSERT ... SELECT takes the same mapping.
-  execute(db, "CREATE TABLE src2 (a int32)");
+  execute(db, "CREATE TABLE src2 (a i32)");
   execute(db, "INSERT INTO src2 VALUES (60)");
   assert.deepStrictEqual(rows(db, "INSERT INTO t (id) SELECT a FROM src2 RETURNING old.v, new.v"), [
     ["NULL", "7"],
@@ -297,20 +297,20 @@ test("old/new naming and star", () => {
 test("old/new shadowed by a table actually named old/new", () => {
   // A target table literally named old (or new) keeps the ordinary table-qualified
   // meaning — the row-version pseudo-relation is suppressed (PG-probed).
-  const db = dbWith(["CREATE TABLE old (x int32)"]);
+  const db = dbWith(["CREATE TABLE old (x i32)"]);
   assert.deepStrictEqual(rows(db, "INSERT INTO old VALUES (1) RETURNING old.x"), [["1"]]);
   assert.deepStrictEqual(rows(db, "UPDATE old SET x = x + 1 RETURNING old.x"), [["2"]]);
   // The other qualifier still works alongside the shadowed one.
   assert.deepStrictEqual(rows(db, "UPDATE old SET x = x + 1 RETURNING new.x"), [["3"]]);
   assert.deepStrictEqual(rows(db, "DELETE FROM old RETURNING old.x"), [["3"]]);
-  execute(db, "CREATE TABLE new (x int32)");
+  execute(db, "CREATE TABLE new (x i32)");
   assert.deepStrictEqual(rows(db, "INSERT INTO new VALUES (9) RETURNING new.x"), [["9"]]);
   assert.deepStrictEqual(rows(db, "DELETE FROM new RETURNING new.x"), [["9"]]);
 });
 
 test("old/new in RETURNING subqueries", () => {
   const db = setup();
-  execute(db, "CREATE TABLE s2 (a int32, b int32)");
+  execute(db, "CREATE TABLE s2 (a i32, b i32)");
   execute(db, "INSERT INTO s2 VALUES (1, 500)");
   // old/new resolve inside item subqueries like any outer reference (probed; jed has no
   // FROM-less SELECT, so the single-row s2 anchors the scalar subqueries).
@@ -336,7 +336,7 @@ test("old/new touched-set sides", () => {
   // Compressed 100k text at page_size 8192 = 13 slabs.
   const big = `INSERT INTO big VALUES (1, 0, '${"x".repeat(100_000)}')`;
   const fresh = () =>
-    dbWith(["CREATE TABLE big (id int32 PRIMARY KEY, w int32, t text)", big]);
+    dbWith(["CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)", big]);
   // RETURNING the ASSIGNED column's old version forces the decompress the new version
   // avoided (4 there): 3-unit bounded scan + 13 value_decompress + row_produced (the
   // shrunken rewrite attempts no compression).

@@ -17,7 +17,7 @@ import { engineError } from "./errors.ts";
 
 // Meter accrues deterministic execution cost and enforces an optional ceiling (CLAUDE.md
 // §13). Threaded through the executor and the recursive expression evaluator; the accrued
-// total is reported on Outcome. The counter is a bigint for int64 parity with the Rust/Go
+// total is reported on Outcome. The counter is a bigint for i64 parity with the Rust/Go
 // cores — a number is f64, which loses integer precision above 2^53 and would silently
 // diverge (CLAUDE.md §8).
 export class Meter {

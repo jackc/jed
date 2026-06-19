@@ -19,37 +19,37 @@ function fkNames(db: Database, table: string): string[] {
 // written; the catalog holds FKs in ascending lowercased-name order.
 test("FK naming and catalog order", () => {
   const db = dbWith([
-    "CREATE TABLE p (a int32, b int32, code int32 UNIQUE, PRIMARY KEY (a, b))",
-    "CREATE TABLE c (id int32 PRIMARY KEY, pa int32, pb int32, pcode int32, " +
+    "CREATE TABLE p (a i32, b i32, code i32 UNIQUE, PRIMARY KEY (a, b))",
+    "CREATE TABLE c (id i32 PRIMARY KEY, pa i32, pb i32, pcode i32, " +
       "CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), " +
       "FOREIGN KEY (pa, pb) REFERENCES p (a, b))",
   ]);
   assert.deepEqual(fkNames(db, "c"), ["c_code_fk", "c_pa_pb_fkey"]);
 
   const db2 = dbWith([
-    "CREATE TABLE q (id int32 PRIMARY KEY)",
-    "CREATE TABLE r (id int32 PRIMARY KEY, x int32 REFERENCES q, FOREIGN KEY (x) REFERENCES q (id))",
+    "CREATE TABLE q (id i32 PRIMARY KEY)",
+    "CREATE TABLE r (id i32 PRIMARY KEY, x i32 REFERENCES q, FOREIGN KEY (x) REFERENCES q (id))",
   ]);
   assert.deepEqual(fkNames(db2, "r"), ["r_x_fkey", "r_x_fkey1"]);
 });
 
 // jed is STRICTER than PostgreSQL on type pairing: corresponding columns must be the SAME scalar
-// type (42804), where PG allows any comparable pair (e.g. int32 ↔ int64) — constraints.md §6.7.
+// type (42804), where PG allows any comparable pair (e.g. i32 ↔ i64) — constraints.md §6.7.
 test("FK strict same-type pairing (42804)", () => {
-  const db = dbWith(["CREATE TABLE p (id int32 PRIMARY KEY)"]);
-  assert.equal(errCode(() => execute(db, "CREATE TABLE c1 (x int64 REFERENCES p)")), "42804");
+  const db = dbWith(["CREATE TABLE p (id i32 PRIMARY KEY)"]);
+  assert.equal(errCode(() => execute(db, "CREATE TABLE c1 (x i64 REFERENCES p)")), "42804");
   assert.equal(errCode(() => execute(db, "CREATE TABLE c2 (x text REFERENCES p)")), "42804");
-  execute(db, "CREATE TABLE c3 (x int32 REFERENCES p)"); // same type — accepted
+  execute(db, "CREATE TABLE c3 (x i32 REFERENCES p)"); // same type — accepted
 });
 
 // CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE TABLE (0A000); NO ACTION and
 // RESTRICT are accepted (constraints.md §6.6).
 test("FK referential actions narrowed (0A000)", () => {
-  const db = dbWith(["CREATE TABLE p (id int32 PRIMARY KEY)"]);
-  assert.equal(errCode(() => execute(db, "CREATE TABLE c1 (x int32 REFERENCES p ON DELETE CASCADE)")), "0A000");
-  assert.equal(errCode(() => execute(db, "CREATE TABLE c2 (x int32 REFERENCES p ON UPDATE SET NULL)")), "0A000");
-  assert.equal(errCode(() => execute(db, "CREATE TABLE c3 (x int32 REFERENCES p ON DELETE SET DEFAULT)")), "0A000");
-  execute(db, "CREATE TABLE c4 (x int32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)");
+  const db = dbWith(["CREATE TABLE p (id i32 PRIMARY KEY)"]);
+  assert.equal(errCode(() => execute(db, "CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)")), "0A000");
+  assert.equal(errCode(() => execute(db, "CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)")), "0A000");
+  assert.equal(errCode(() => execute(db, "CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)")), "0A000");
+  execute(db, "CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)");
 });
 
 // jed validates the parent side against the statement's END STATE: a swap of two referenced UNIQUE
@@ -57,9 +57,9 @@ test("FK referential actions narrowed (0A000)", () => {
 // transient — a documented divergence (constraints.md §6.7).
 test("FK parent UPDATE end-state swap allowed", () => {
   const db = dbWith([
-    "CREATE TABLE p (id int32 PRIMARY KEY, code int32 UNIQUE)",
+    "CREATE TABLE p (id i32 PRIMARY KEY, code i32 UNIQUE)",
     "INSERT INTO p VALUES (1, 100), (2, 200)",
-    "CREATE TABLE c (id int32 PRIMARY KEY, pc int32 REFERENCES p (code))",
+    "CREATE TABLE c (id i32 PRIMARY KEY, pc i32 REFERENCES p (code))",
     "INSERT INTO c VALUES (10, 100), (11, 200)",
   ]);
   execute(db, "UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END"); // swap — end state valid

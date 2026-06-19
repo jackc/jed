@@ -1,13 +1,13 @@
 # Integer arithmetic in the general expression evaluator: + - * / %, operator
 # precedence, parenthesization, and projection of computed columns. Overflow traps
-# 22003 at the RESULT type's boundary (int32 + int32 overflows at int32, not int64);
+# 22003 at the RESULT type's boundary (i32 + i32 overflows at i32, not i64);
 # division and modulo by zero are a defined trap, 22012. Integer division truncates
 # toward zero and the remainder takes the dividend's sign (spec/design/types.md §3,
 # spec/design/functions.md §7). Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.int16, types.int32, types.int64, cast.explicit, expr.arithmetic, expr.parens, expr.precedence, error.overflow_trap, error.division_by_zero
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.i16, types.i32, types.i64, cast.explicit, expr.arithmetic, expr.parens, expr.precedence, error.overflow_trap, error.division_by_zero
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
 
 statement ok
 INSERT INTO t VALUES (1, 6, 4)
@@ -84,22 +84,22 @@ SELECT a / 0 FROM t WHERE id = 1
 statement error 22012
 SELECT a % 0 FROM t WHERE id = 1
 
-# A separate table at the int32 boundary, so the overflow row does not poison the
+# A separate table at the i32 boundary, so the overflow row does not poison the
 # full-scan arithmetic predicate above.
 statement ok
-CREATE TABLE edge (id int32 PRIMARY KEY, a int32, b int32)
+CREATE TABLE edge (id i32 PRIMARY KEY, a i32, b i32)
 
 statement ok
 INSERT INTO edge VALUES (1, 2147483647, 1)
 
-# int32 + int32 overflows at the int32 boundary — the result type is int32, even
-# though 2147483647 + 1 fits int64
+# i32 + i32 overflows at the i32 boundary — the result type is i32, even
+# though 2147483647 + 1 fits i64
 statement error 22003
 SELECT a + b FROM edge WHERE id = 1
 
-# the SAME values widened to int64 do NOT overflow — the trap is at the result type
+# the SAME values widened to i64 do NOT overflow — the trap is at the result type
 query I nosort
-SELECT CAST(a AS int64) + b FROM edge WHERE id = 1
+SELECT CAST(a AS i64) + b FROM edge WHERE id = 1
 ----
 2147483648
 
@@ -109,16 +109,16 @@ SELECT CAST(a AS int64) + b FROM edge WHERE id = 1
 # for all three widths; values staged via columns (the bare literal -9223372036854775808
 # cannot be written directly — it lexes as unary minus of an out-of-range magnitude).
 statement ok
-CREATE TABLE divmin (id int32 PRIMARY KEY, i16 int16, i32 int32, i64 int64, neg1 int64)
+CREATE TABLE divmin (id i32 PRIMARY KEY, i16 i16, i32 i32, i64 i64, neg1 i64)
 
 statement ok
 INSERT INTO divmin VALUES (1, -32768, -2147483648, -9223372036854775808, -1)
 
 statement error 22003
-SELECT i16 / CAST(neg1 AS int16) FROM divmin WHERE id = 1
+SELECT i16 / CAST(neg1 AS i16) FROM divmin WHERE id = 1
 
 statement error 22003
-SELECT i32 / CAST(neg1 AS int32) FROM divmin WHERE id = 1
+SELECT i32 / CAST(neg1 AS i32) FROM divmin WHERE id = 1
 
 statement error 22003
 SELECT i64 / neg1 FROM divmin WHERE id = 1
@@ -128,12 +128,12 @@ SELECT i64 / neg1 FROM divmin WHERE id = 1
 # core special-cases divisor -1 rather than letting the 64-bit IDIV fault (types.md §3).
 # Matches PostgreSQL.
 query I nosort
-SELECT i16 % CAST(neg1 AS int16) FROM divmin WHERE id = 1
+SELECT i16 % CAST(neg1 AS i16) FROM divmin WHERE id = 1
 ----
 0
 
 query I nosort
-SELECT i32 % CAST(neg1 AS int32) FROM divmin WHERE id = 1
+SELECT i32 % CAST(neg1 AS i32) FROM divmin WHERE id = 1
 ----
 0
 

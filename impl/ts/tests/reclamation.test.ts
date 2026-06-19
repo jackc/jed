@@ -57,7 +57,7 @@ function padOf(db: Database, id: number): string | null {
 
 function setup(path: string, rows: number): Database {
   const db = create(path, { pageSize: PS });
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
   const base = "x".repeat(40);
   for (let i = 1; i <= rows; i++) {
     execute(db, `INSERT INTO t VALUES (${i}, 'r${String(i).padStart(2, "0")}-${base}')`);

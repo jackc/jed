@@ -74,7 +74,7 @@ test("set operation operands", () => {
 });
 
 test("subqueries: uncorrelated fold and correlated outward resolution", () => {
-  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)", "INSERT INTO t VALUES (1), (2)"]);
+  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1), (2)"]);
   // Uncorrelated FROM-less inner: folded once.
   assert.deepStrictEqual(query(db, "SELECT (SELECT 1)"), [["1"]]);
   // Correlated FROM-less inner: the zero-relation scope resolves o.id purely outward,
@@ -86,7 +86,7 @@ test("subqueries: uncorrelated fold and correlated outward resolution", () => {
 });
 
 test("INSERT ... SELECT source", () => {
-  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
   const out = execute(db, "INSERT INTO t SELECT 3");
   assert.equal(out.cost, 1n); // exactly the embedded SELECT's cost
   assert.deepStrictEqual(query(db, "SELECT id FROM t"), [["3"]]);

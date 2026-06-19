@@ -196,7 +196,7 @@ pub struct DropType {
     pub if_exists: bool,
 }
 
-/// `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` — a named, persisted int64 generator
+/// `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` — a named, persisted i64 generator
 /// (spec/design/sequences.md). The options are order-free; each is captured as a parsed override,
 /// with `None` meaning "use the default" (resolved at execution against the INCREMENT sign).
 /// Execution validates the option set (22023), rejects a relation-namespace collision (42P07
@@ -780,7 +780,7 @@ pub enum Literal {
     /// the value). A bare integer literal is an *untyped constant* that adapts to its
     /// context — the target column on INSERT/UPDATE, a sibling operand, the compared
     /// column in a WHERE predicate — and traps 22003 if it does not fit; with no
-    /// context it defaults to int64. See spec/design/types.md §6.
+    /// context it defaults to i64. See spec/design/types.md §6.
     Int(i64),
     /// A boolean literal, `TRUE` or `FALSE`. boolean is expression-only this slice
     /// (spec/design/types.md §1): a boolean literal is well-formed but cannot be

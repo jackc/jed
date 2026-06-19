@@ -15,7 +15,7 @@ import (
 )
 
 // correlatedTables builds `o` (five outer rows whose k-values all exist as inner ids) and `inr` (n
-// rows id int32 PRIMARY KEY, v int32; v == id) large enough to span several leaves.
+// rows id i32 PRIMARY KEY, v i32; v == id) large enough to span several leaves.
 func correlatedTables(t *testing.T, n int) *Database {
 	t.Helper()
 	var b strings.Builder
@@ -28,8 +28,8 @@ func correlatedTables(t *testing.T, n int) *Database {
 	}
 	return dbWith(
 		t,
-		"CREATE TABLE o (id int32 PRIMARY KEY, k int32)",
-		"CREATE TABLE inr (id int32 PRIMARY KEY, v int32)",
+		"CREATE TABLE o (id i32 PRIMARY KEY, k i32)",
+		"CREATE TABLE inr (id i32 PRIMARY KEY, v i32)",
 		"INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)",
 		b.String(),
 	)

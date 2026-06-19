@@ -27,7 +27,7 @@ const lazyPageSize = 256
 // inline-compressed (a 600-char run), id 4 plain inline.
 func lazySeed(t *testing.T, db *Database) {
 	t.Helper()
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	plain := fillerText(600)
 	extc := fillerText(200) + strings.Repeat("y", 200)
 	inlc := strings.Repeat("x", 600)
@@ -156,7 +156,7 @@ func TestLazyUpdateOfOtherColumnsPreservesSpilledValues(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, body text, n int32)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)")
 	mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, '%s', 10), (2, 'small', 20)", big))
 	if err := db.Close(); err != nil {
 		t.Fatal(err)

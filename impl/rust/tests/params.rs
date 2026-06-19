@@ -31,7 +31,7 @@ fn err_code(db: &mut Database, sql: &str, params: &[Value]) -> String {
 #[test]
 fn where_pk_eq_param_point_lookup() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
         "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
     ]);
     let got = rows(&mut db, "SELECT v FROM t WHERE id = $1", &[Value::Int(2)]);
@@ -40,9 +40,9 @@ fn where_pk_eq_param_point_lookup() {
 
 #[test]
 fn param_adopts_narrow_column_type_and_traps_overflow() {
-    // `$1` compared against an int16 column is typed int16; a value out of int16 range traps
+    // `$1` compared against an i16 column is typed i16; a value out of i16 range traps
     // 22003 at bind, before any scan.
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY, s int16)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, s i16)"]);
     execute(&mut db, "INSERT INTO t VALUES (1, 100)").unwrap();
     assert_eq!(
         err_code(
@@ -59,7 +59,7 @@ fn param_adopts_narrow_column_type_and_traps_overflow() {
 
 #[test]
 fn insert_values_params_round_trip() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY, name text)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, name text)"]);
     execute_params(
         &mut db,
         "INSERT INTO t VALUES ($1, $2)",
@@ -76,7 +76,7 @@ fn insert_values_params_round_trip() {
 
 #[test]
 fn insert_param_null_into_not_null_traps_23502() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY, name text NOT NULL)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, name text NOT NULL)"]);
     assert_eq!(
         err_code(
             &mut db,
@@ -89,8 +89,8 @@ fn insert_param_null_into_not_null_traps_23502() {
 
 #[test]
 fn insert_param_wrong_family_traps_42804() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY, n int32)"]);
-    // `$2` is typed int32 (its column); binding text is a family mismatch.
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, n i32)"]);
+    // `$2` is typed i32 (its column); binding text is a family mismatch.
     assert_eq!(
         err_code(
             &mut db,
@@ -104,7 +104,7 @@ fn insert_param_wrong_family_traps_42804() {
 #[test]
 fn update_set_and_where_params() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
         "INSERT INTO t VALUES (1, 10), (2, 20)",
     ]);
     execute_params(
@@ -120,7 +120,7 @@ fn update_set_and_where_params() {
 #[test]
 fn delete_where_param() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1), (2), (3)",
     ]);
     execute_params(&mut db, "DELETE FROM t WHERE id = $1", &[Value::Int(2)]).unwrap();
@@ -131,7 +131,7 @@ fn delete_where_param() {
 #[test]
 fn text_param_inference() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, name text)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, name text)",
         "INSERT INTO t VALUES (1, 'alice'), (2, 'bob')",
     ]);
     let got = rows(
@@ -144,7 +144,7 @@ fn text_param_inference() {
 
 #[test]
 fn bare_select_param_is_indeterminate_42p18() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     assert_eq!(
         err_code(&mut db, "SELECT $1 FROM t", &[Value::Int(1)]),
         "42P18"
@@ -154,7 +154,7 @@ fn bare_select_param_is_indeterminate_42p18() {
 #[test]
 fn gap_in_param_indices_is_42p18() {
     // `$1` and `$3` referenced, `$2` never — the missing slot is indeterminate.
-    let mut db = db_with(&["CREATE TABLE t (a int32 PRIMARY KEY, b int32)"]);
+    let mut db = db_with(&["CREATE TABLE t (a i32 PRIMARY KEY, b i32)"]);
     assert_eq!(
         err_code(
             &mut db,
@@ -167,7 +167,7 @@ fn gap_in_param_indices_is_42p18() {
 
 #[test]
 fn conflicting_inference_is_42804() {
-    let mut db = db_with(&["CREATE TABLE t (a int32 PRIMARY KEY, name text)"]);
+    let mut db = db_with(&["CREATE TABLE t (a i32 PRIMARY KEY, name text)"]);
     assert_eq!(
         err_code(
             &mut db,
@@ -181,7 +181,7 @@ fn conflicting_inference_is_42804() {
 #[test]
 fn count_mismatch_is_42601() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1)",
     ]);
     assert_eq!(
@@ -202,7 +202,7 @@ fn count_mismatch_is_42601() {
 fn null_param_three_valued() {
     // `col = $1` with a NULL bound yields UNKNOWN, so no rows; IS NOT DISTINCT FROM matches NULL.
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
         "INSERT INTO t VALUES (1, 10)",
     ]);
     let got = rows(&mut db, "SELECT id FROM t WHERE v = $1", &[Value::Null]);
@@ -212,7 +212,7 @@ fn null_param_three_valued() {
 #[test]
 fn param_in_in_list() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1), (2), (3)",
     ]);
     let got = rows(
@@ -229,7 +229,7 @@ fn ddl_with_params_traps_42601() {
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE t (id int32 PRIMARY KEY)",
+            "CREATE TABLE t (id i32 PRIMARY KEY)",
             &[Value::Int(1)]
         ),
         "42601"
@@ -240,7 +240,7 @@ fn ddl_with_params_traps_42601() {
 fn param_typed_by_cast_operator() {
     // `$1::int` declares `$1` as int — PostgreSQL types a parameter by its cast target
     // (api.md §5, grammar.md §37). No surrounding context is needed, so this is NOT 42P18.
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     let got = rows(&mut db, "SELECT $1::int", &[Value::Int(42)]);
     assert_eq!(got, vec![vec![Value::Int(42)]]);
     // The `CAST(... AS ...)` spelling infers the parameter's type identically.
@@ -250,9 +250,9 @@ fn param_typed_by_cast_operator() {
 
 #[test]
 fn param_cast_operator_narrows_and_traps_22003() {
-    // `$1::smallint` declares `$1` as int16; a bound value out of int16 range traps 22003 at
+    // `$1::smallint` declares `$1` as i16; a bound value out of i16 range traps 22003 at
     // bind, before any scan (the same two-phase binding as a column-typed parameter).
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     assert_eq!(
         err_code(&mut db, "SELECT $1::smallint", &[Value::Int(100000)]),
         "22003"
@@ -263,7 +263,7 @@ fn param_cast_operator_narrows_and_traps_22003() {
 fn param_cast_to_deferred_target_is_0a000() {
     // Casting a parameter to a deferred target (text) is 0A000, like any non-string-literal
     // cast to text — the `::` operator adds no behavior of its own beyond the spelling.
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     assert_eq!(
         err_code(&mut db, "SELECT $1::text", &[Value::Int(1)]),
         "0A000"
@@ -274,7 +274,7 @@ fn param_cast_to_deferred_target_is_0a000() {
 fn cast_operator_inherits_deferred_narrowings_and_rejects_lone_colon() {
     // `::` desugars to CAST, so casting a non-string-literal value to text/boolean is the same
     // deferred 0A000 narrowing the CAST spelling carries (a documented PG divergence).
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     assert_eq!(err_code(&mut db, "SELECT 5::text", &[]), "0A000");
     assert_eq!(err_code(&mut db, "SELECT 5::boolean", &[]), "0A000");
     // A lone `:` is not part of jed's surface — a 42601 syntax error from the lexer.
@@ -283,7 +283,7 @@ fn cast_operator_inherits_deferred_narrowings_and_rejects_lone_colon() {
 
 #[test]
 fn lexer_rejects_bad_param_tokens() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     for sql in [
         "SELECT id FROM t WHERE id = $0",
         "SELECT id FROM t WHERE id = $",

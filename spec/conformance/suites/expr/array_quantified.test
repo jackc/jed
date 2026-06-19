@@ -5,14 +5,14 @@
 # NULL if any is NULL, else TRUE; empty → TRUE). A NULL array operand → NULL. The right operand must be an
 # array (a non-array side is 42809); an incomparable element type is 42883; a bare untyped NULL is 42P18;
 # the subquery quantifier form op ANY(SELECT …) is a deferred 0A000. PostgreSQL-oracle-verified (postgres:18).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.int32, types.text, func.array_quantified, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.i32, types.text, func.array_quantified, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, x int32, xs int32[])
+CREATE TABLE t (id i32 PRIMARY KEY, x i32, xs i32[])
 
 # Row 1: x in xs. Row 2: x not in xs. Row 3: x matches, with a NULL element. Row 4: x absent, with a
 # NULL element. Row 5: an EMPTY xs. Row 6: a NULL xs. Row 7: a NULL x over a non-empty array. Row 8: a
-# NULL x over the empty array (the empty short-circuit beats the NULL x for ALL). The int32 column / int32[]
+# NULL x over the empty array (the empty short-circuit beats the NULL x for ALL). The i32 column / i32[]
 # array align with PostgreSQL's int4 on both sides, so the comparisons resolve in BOTH engines.
 statement ok
 INSERT INTO t VALUES
@@ -131,18 +131,18 @@ true
 
 # A custom lower bound is irrelevant (the quantifiers compare ELEMENTS, not subscripts).
 query B nosort
-SELECT 20 = ANY('[5:6]={10,20}'::int32[])
+SELECT 20 = ANY('[5:6]={10,20}'::i32[])
 ----
 true
 
 # --- the empty / NULL array via a typed literal, as bare expressions -----------------------
 query B nosort
-SELECT 1 = ANY('{}'::int32[])
+SELECT 1 = ANY('{}'::i32[])
 ----
 false
 
 query B nosort
-SELECT 1 = ALL('{}'::int32[])
+SELECT 1 = ALL('{}'::i32[])
 ----
 true
 

@@ -2,7 +2,7 @@
 
 The third native core (CLAUDE.md §2), built **natively** — *not* a Rust→WASM wrapper.
 It exists to exercise dimensions the two systems cores share and hide: JS has no native
-int64 (numbers are f64), strings are UTF-16 (the format is UTF-8), and there is no native
+i64 (numbers are f64), strings are UTF-16 (the format is UTF-8), and there is no native
 big-endian access. A third independent implementation that still produces **byte-identical**
 output is the strongest confirmation the spec is real, not a Rust/Go accident (CLAUDE.md §2, §8).
 
@@ -14,7 +14,7 @@ Style (CLAUDE.md §10): **boring, explicit code over clever abstraction.**
 
 ## Load-bearing decisions
 
-- **Uniform `bigint`.** Every integer (int16/int32/int64) is stored as a JS `bigint`,
+- **Uniform `bigint`.** Every integer (i16/i32/i64) is stored as a JS `bigint`,
   mirroring "everything is i64 internally" in Rust/Go. Exact at all widths; the declared
   column type governs only range checks (`22003`) and key-encoding width — never the
   in-memory representation. `number` is never used for a stored value.

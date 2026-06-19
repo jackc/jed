@@ -53,9 +53,9 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   vanishing (CLAUDE.md §2/§8/§10/§13).
 - [decimal.md](decimal.md) — the exact `decimal`/`numeric` type: representation, PG result-scale
   rules, half-away-from-zero rounding, e-notation literals, and the `decimal_work` cost unit.
-- [float.md](float.md) — the binary floats `float32`/`float64`: the PG total order, the trapping
+- [float.md](float.md) — the binary floats `f32`/`f64`: the PG total order, the trapping
   arithmetic kernel, the order-independent canonical-fold SUM/AVG, and the `R` render tag.
-- [timestamp.md](timestamp.md) — `timestamp`/`timestamptz`: the int64-microsecond instant model,
+- [timestamp.md](timestamp.md) — `timestamp`/`timestamptz`: the i64-microsecond instant model,
   literal parsing, infinity sentinels, and the (no-time-zone-db) scope.
 - [interval.md](interval.md) — the `interval` span (months/days/micros): the input subset, PG
   render, the canonical 128-bit comparison, and interval/timestamp arithmetic.

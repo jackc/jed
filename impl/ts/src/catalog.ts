@@ -121,12 +121,12 @@ export type CompositeField = {
   notNull: boolean;
 };
 
-// SequenceDef is a SEQUENCE (spec/design/sequences.md): a named, persisted, monotonic int64
+// SequenceDef is a SEQUENCE (spec/design/sequences.md): a named, persisted, monotonic i64
 // generator — the third database-level catalog-object kind (after tables and composite types). The
 // definition fields (increment/minValue/maxValue/start/cache/cycle) are immutable; lastValue +
 // isCalled are the mutable counter state a nextval advances. The whole struct lives in the snapshot
-// catalog, so the counter is transactional by construction (sequences.md §5). The int64 fields are
-// bigint (the TS core's exact-int64 representation).
+// catalog, so the counter is transactional by construction (sequences.md §5). The i64 fields are
+// bigint (the TS core's exact-i64 representation).
 export type SequenceDef = {
   // The sequence name (original case; looked up case-insensitively).
   name: string;
@@ -149,7 +149,7 @@ export type SequenceDef = {
   isCalled: boolean;
 };
 
-// I64_MAX is the int64 maximum (2^63-1), the default ascending MAXVALUE / descending floor base.
+// I64_MAX is the i64 maximum (2^63-1), the default ascending MAXVALUE / descending floor base.
 export const I64_MAX = 9223372036854775807n;
 
 // defaultSequenceBounds is the type defaults for an ascending (increment > 0) vs descending sequence,

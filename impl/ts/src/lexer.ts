@@ -1,6 +1,6 @@
 // Hand-written lexer (CLAUDE.md §5: parsers are per-language, not codegen'd). Produces
 // tokens terminated by an "eof" token. Integer literals may carry a leading '-' and are
-// parsed to bigint; a value outside the int64 range is a structured 42601 syntax error
+// parsed to bigint; a value outside the i64 range is a structured 42601 syntax error
 // (matching Go's strconv.ParseInt(.., 64) behaviour). Errors throw EngineError.
 
 import { decimalFromParts, EXP_LIMIT } from "./decimal.ts";
@@ -8,7 +8,7 @@ import { engineError } from "./errors.ts";
 import type { Token } from "./token.ts";
 
 // The maximum integer-literal MAGNITUDE the lexer accepts: 2^63, so that the unary
-// minus of it folds to int64's minimum. A larger magnitude cannot be represented.
+// minus of it folds to i64's minimum. A larger magnitude cannot be represented.
 const MAX_MAGNITUDE = 9223372036854775808n;
 
 // MAX_IDENTIFIER_LENGTH is the maximum length, in bytes, of a single identifier — table / column /
@@ -266,7 +266,7 @@ export function lex(sql: string): Token[] {
         tokens.push({ kind: "decimal", decDigits: digits, decScale: scale });
       } else {
         // Integer literal: an unsigned magnitude (the sign is the "minus" operator). The
-        // magnitude must be <= 2^63 so that -(2^63) = int64's minimum is reachable; anything
+        // magnitude must be <= 2^63 so that -(2^63) = i64's minimum is reachable; anything
         // larger cannot be represented (42601).
         const text = intPart;
         const v = BigInt(text);

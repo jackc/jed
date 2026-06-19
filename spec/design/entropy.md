@@ -164,7 +164,7 @@ The engine provides these constructors for the deterministic / reproducible path
 | Provided source | Rust | Go | TS |
 |---|---|---|---|
 | seeded PRNG source | `seeded_random_source(u64)` | `SeededRandomSource(uint64)` | `seededRandomSource(bigint)` |
-| fixed clock | `fixed_clock(i64)` | `FixedClock(int64)` | `fixedClock(bigint)` |
+| fixed clock | `fixed_clock(i64)` | `FixedClock(i64)` | `fixedClock(bigint)` |
 | advancing clock | `advancing_clock(start, step)` | `AdvancingClock(start, step)` | `advancingClock(start, step)` |
 
 The **advancing clock** returns `start`, then `start+step`, `start+2·step`, … — one increment per

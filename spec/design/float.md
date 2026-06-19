@@ -1,4 +1,4 @@
-# The `float32` / `float64` types — design
+# The `f32` / `f64` types — design
 
 > The reasoning behind binary floating point. The **data is authoritative**
 > ([../types/scalars.toml](../types/scalars.toml) — the type, encoding;
@@ -13,9 +13,9 @@
 > update [CLAUDE.md](../../CLAUDE.md) §8 and [determinism.md](determinism.md) §6 if it revises
 > a commitment.
 
-`float64` is the engine's **approximate** numeric: IEEE 754 binary64 (double precision). It
+`f64` is the engine's **approximate** numeric: IEEE 754 binary64 (double precision). It
 is deliberately the opposite of `decimal` ([decimal.md](decimal.md)) — `decimal` is exact,
-base-10, finite, and fully cross-core deterministic; `float64` is inexact, base-2, admits
+base-10, finite, and fully cross-core deterministic; `f64` is inexact, base-2, admits
 NaN/±Infinity, and is the **first type exempted from cross-core byte-identity** (CLAUDE.md
 §2/§8). The exemption is **narrow and deliberate** (determinism.md §1–§6): determinism is
 preserved everywhere it is *reasonably easy*, and surrendered only where IEEE/libm make it
@@ -24,7 +24,7 @@ genuinely hard.
 ## 1. Why floats at all, and the determinism stance
 
 `decimal` already owns exact numerics (the §8 bias is "keep `f64` out of compare/text"), so
-`float64` exists only for what decimal cannot serve: ingesting/storing real-world
+`f64` exists only for what decimal cannot serve: ingesting/storing real-world
 double-precision data (scientific, sensor, ML, geo), 8-byte compactness, fast approximate
 math, and transcendental functions. Because the type is intrinsically approximate, paying
 `decimal`-level effort to make it bit-identical across cores would be over-investing the
@@ -68,40 +68,42 @@ the exemption bites only at transcendentals, the PG oracle, and the rendering la
 ## 2. Scope — two widths forming a promotion tower
 
 Two types, a **promotion tower** like the integers (canonical ids state width in bits, the
-`int16`/`int32`/`int64` convention — [types.md](types.md) §2):
+`i16`/`i32`/`i64` convention — [types.md](types.md) §2):
 
 | Canonical id | rank | Aliases | IEEE | On-disk code |
 |---|---|---|---|---|
-| `float32` | 1 | `real` | binary32 (single, ~6 digits) | 13 |
-| `float64` | 2 | `double precision`, `float` | binary64 (double, ~15 digits) | 12 |
+| `f32` | 1 | `real` | binary32 (single, ~6 digits) | 13 |
+| `f64` | 2 | `double precision`, `float` | binary64 (double, ~15 digits) | 12 |
 
 **Naming, against the C/Java intuition:** in PostgreSQL a bare **`float` (no precision) is
 `double precision` (64-bit)** — *not* 32-bit; the 32-bit type is spelled `real` (`float4`).
-So `float` aliases `float64`, and `real` aliases `float32`. PG's `float8`/`float4` byte-count
-spellings and the `float(p)` precision typmod are **not** accepted (we own our surface —
-CLAUDE.md §1, as `int2/4/8` are rejected).
+So `float` aliases `f64`, and `real` aliases `f32`. PG's byte-shorthand `float8` → `f64`
+and `float4` → `f32` **is** accepted as an alias — the `f` prefix keeps jed's bit-namespace
+disjoint from PG's byte-namespace, so there is no collision (the same disjoint-namespace rule
+that lets `int8` → `i64` — types.md §2, CLAUDE.md §1/§4). The `float(p)` precision typmod is
+**not** accepted.
 
 **The tower (compare.toml `max-rank`).** When two floats of different width meet
-(arithmetic or comparison), both widen to the higher rank: **`float32 → float64`, which is
+(arithmetic or comparison), both widen to the higher rank: **`f32 → f64`, which is
 lossless** (every binary32 is an exact binary64), so it is also an **implicit cast** — the
-float analogue of `int16 → int64`, and matching PG (`real` promotes to `double`). `float64 →
-float32` is lossy and **explicit**. Crossing *out of* the float family (int/decimal ↔ float)
+float analogue of `i16 → i64`, and matching PG (`real` promotes to `double`). `f64 →
+f32` is lossy and **explicit**. Crossing *out of* the float family (int/decimal ↔ float)
 stays **explicit** either way (§6) — within-family widening is the *only* implicit float edge.
 
 **Everything below applies to each width** (the total order §3, the trap model §3, the kernel
 §5, the exact-sum aggregates §7, the functions §8, rendering §9), differing only by width:
-`float32` arithmetic rounds to binary32 (Rust `f32`, Go `float32`, **TS `Math.fround` on every
+`f32` arithmetic rounds to binary32 (Rust `f32`, Go `f32`, **TS `Math.fround` on every
 op/literal/cast** — the one extra determinism discipline a second width adds), stores 4 bytes,
-and `SUM`/`AVG` round at the input width. A mixed-width binary op promotes to `float64` first,
+and `SUM`/`AVG` round at the input width. A mixed-width binary op promotes to `f64` first,
 so the actual computation is always at one width.
 
 ## 3. Representation, the total order, and special values
 
 **Representation.** A value is an IEEE 754 binary64: sign, 11-bit exponent, 52-bit mantissa.
 NaN and ±Infinity are **first-class values** (unlike `decimal`, which excludes them —
-decimal.md §2 — because it has no float source; `float64` is that source). This is the
+decimal.md §2 — because it has no float source; `f64` is that source). This is the
 `timestamp` precedent generalized: `timestamp` already carries ±infinity as totally-ordered
-sentinels (timestamp.md), and `float64` does the same for ±Inf and NaN.
+sentinels (timestamp.md), and `f64` does the same for ±Inf and NaN.
 
 **The total order (PostgreSQL's `float8` btree order — CLAUDE.md §1).** IEEE comparison is a
 *partial* order (NaN is unordered; `-0 == +0`), but SQL needs a total order for `ORDER BY`,
@@ -117,7 +119,7 @@ equivalence class — bit patterns are not distinguished). So `NaN` is the singl
 divergence from raw IEEE (where `NaN <> NaN` and comparisons with NaN are UNKNOWN) — but it is
 PG's behavior, and it is what makes ordering, dedup, and keys total and deterministic. The
 `=`/`<`/`>`/`<=`/`>=` operators and `IS [NOT] DISTINCT FROM` all use this total order, so
-`NaN = NaN` is **TRUE** in jed (PG's float8 `=` agrees). `float64 × float64` is the only
+`NaN = NaN` is **TRUE** in jed (PG's float8 `=` agrees). `f64 × f64` is the only
 comparable pair (§6); NULL is still the largest of all (after NaN — the presence tag, §10).
 
 **How special values arise — PG's trap model (CLAUDE.md §8, the existing trap philosophy).**
@@ -153,23 +155,23 @@ existing literal machinery — types.md §6, grammar.md §36):
 
 - **A decimal literal adapting to a float context.** A `.`-bearing numeric constant is an
   untyped decimal constant (decimal.md §6) that adapts to its context. In a **float context**
-  — `INSERT`/`UPDATE` into a `float64` column, a comparison against one (`WHERE f = 1.5`), or
-  the other operand of float arithmetic — it coerces **decimal → float64** at resolve time
+  — `INSERT`/`UPDATE` into a `f64` column, a comparison against one (`WHERE f = 1.5`), or
+  the other operand of float arithmetic — it coerces **decimal → f64** at resolve time
   (the nearest binary64 to the exact decimal, round-ties-to-even, the IEEE conversion). An
   integer literal adapts the same way. This is *literal adaptation*, not an implicit
   cross-family cast (§6): a bare literal carries no type until its context names one.
-- **The typed literal `float '…'`** (and `float64 '…'`, `CAST('…' AS float64)`) — the
-  `type 'string'` form (grammar.md §36). The string is parsed by float64's input function:
+- **The typed literal `float '…'`** (and `f64 '…'`, `CAST('…' AS f64)`) — the
+  `type 'string'` form (grammar.md §36). The string is parsed by f64's input function:
   an optional sign, decimal digits with an optional point and **`e`-notation** (`1.5e10`,
   `-3E-7` — the same e-notation a bare decimal literal now takes, grammar.md §14, here via
-  float64's own string parse), plus the case-insensitive special words
+  f64's own string parse), plus the case-insensitive special words
   **`Infinity`/`+Infinity`/`-Infinity`/`inf`/`NaN`** (PG's `float8in` spellings). Malformed
   input traps **`22P02`** (`invalid_text_representation`) deterministically at resolve, before
   any row is scanned; a value outside the binary64 range traps **`22003`**.
 
 ## 5. Arithmetic — the correctly-rounded kernel
 
-`float64 ⊕ float64 → float64` for `+ − * /` and unary `−` (and `%`/`mod`, IEEE `fmod`, exact).
+`f64 ⊕ f64 → f64` for `+ − * /` and unary `−` (and `%`/`mod`, IEEE `fmod`, exact).
 Each is the IEEE 754 correctly-rounded operation (round-ties-to-even), evaluated **one
 operator per expression node** in the tree-walking evaluator. Division by zero traps `22012`;
 a finite result that overflows binary64 traps `22003` (§3). Operands that are already Inf/NaN
@@ -187,7 +189,7 @@ core silently changes the computation. The disciplines, pinned here as a §8-sty
    node that writes its rounded result to a value before the next node consumes it — fusion is
    structurally impossible across that boundary. Any hand-written numeric kernel (the §8
    transcendentals, the §7 accumulator) that computes `a*b+c` in one Go expression **must**
-   defeat fusion with the spec-blessed barrier `float64(a*b) + c` (a named intermediate is
+   defeat fusion with the spec-blessed barrier `f64(a*b) + c` (a named intermediate is
    *not* a guaranteed barrier).
 2. **No x87 extended precision** (modern SSE2/ARM64/WASM scalar f64 — a build note, not a code
    path), **no flush-to-zero** (subnormals computed, not zeroed), **round-ties-to-even** (the
@@ -197,10 +199,10 @@ So the kernel keeps G1–G3. Only transcendentals (§8) leave the contract.
 
 ## 6. Coercion and casts — strict, no implicit cross-family
 
-`float64` is its own comparison/arithmetic family. **No implicit coercion** crosses into or
+`f64` is its own comparison/arithmetic family. **No implicit coercion** crosses into or
 out of it (stricter than PG, justified by the strict type system — CLAUDE.md §4):
 
-- `int ⊕ float64`, `decimal ⊕ float64`, `int = float64`, `decimal < float64`, … are
+- `int ⊕ f64`, `decimal ⊕ f64`, `int = f64`, `decimal < f64`, … are
   **`42804`** datatype-mismatch errors. (PG promotes the other operand to `float8`; jed
   requires an explicit cast. A documented divergence, oracle-ledgered.) Only *literals* adapt
   to a float context (§4) — a *value* never silently becomes a float.
@@ -210,13 +212,13 @@ one is lossy or representation-changing:
 
 | from → to | mode | rule |
 |---|---|---|
-| `int{16,32,64} → float64` | explicit | nearest binary64, round-ties-to-even (exact ≤ 2^53; larger int64 may round). Never traps. |
-| `decimal → float64` | explicit | nearest binary64 to the exact decimal value, round-ties-to-even. Never traps (a huge decimal → ±Inf? **traps `22003`** rather than yielding Inf, matching the finite-overflow rule §3). |
-| `float64 → int{16,32,64}` | explicit | round **half away from zero** to an integer (jed's one rounding mode — decimal.md §3), then range-check (`22003`). NaN/±Inf → `22003`. **Documented divergence from PG**, which rounds half-to-even (`rint`); jed keeps one engine-wide mode. |
-| `float64 → decimal` | explicit | the exact decimal of the binary64 value, then the target typmod's scale coercion (decimal.md §3). NaN/±Inf → `22003` (decimal is finite). |
-| `text ⇄ float64` | — | the `float '…'` literal coercion (§4) is the text→float *literal* path; a **runtime** `CAST(text_col AS float64)` and `CAST(float_expr AS text)` are **deferred `0A000`** (the general runtime-text-cast slice — types.md §5), exactly as for the other types. |
+| `int{16,32,64} → f64` | explicit | nearest binary64, round-ties-to-even (exact ≤ 2^53; larger i64 may round). Never traps. |
+| `decimal → f64` | explicit | nearest binary64 to the exact decimal value, round-ties-to-even. Never traps (a huge decimal → ±Inf? **traps `22003`** rather than yielding Inf, matching the finite-overflow rule §3). |
+| `f64 → int{16,32,64}` | explicit | round **half away from zero** to an integer (jed's one rounding mode — decimal.md §3), then range-check (`22003`). NaN/±Inf → `22003`. **Documented divergence from PG**, which rounds half-to-even (`rint`); jed keeps one engine-wide mode. |
+| `f64 → decimal` | explicit | the exact decimal of the binary64 value, then the target typmod's scale coercion (decimal.md §3). NaN/±Inf → `22003` (decimal is finite). |
+| `text ⇄ f64` | — | the `float '…'` literal coercion (§4) is the text→float *literal* path; a **runtime** `CAST(text_col AS f64)` and `CAST(float_expr AS text)` are **deferred `0A000`** (the general runtime-text-cast slice — types.md §5), exactly as for the other types. |
 
-`int`/`decimal` → `float64` is explicit (not implicit like `int → decimal`) precisely because
+`int`/`decimal` → `f64` is explicit (not implicit like `int → decimal`) precisely because
 it is **lossy** — the whole point of the strict matrix.
 
 ## 7. `SUM` / `AVG` — the order-independent exact accumulator
@@ -242,16 +244,16 @@ sum — is a future refinement; it is harder to keep byte-identical across three
    §3 total order (equivalently, by the `float-order-preserving` key — encoding.md §2.8). After
    `-0` canonicalization and NaN/Inf extraction, distinct values have distinct keys, so the sort
    is **total and deterministic** — every core sees the same sequence.
-3. **Fold left** with width-correct IEEE addition (round-ties-to-even per add; `float32` via the
+3. **Fold left** with width-correct IEEE addition (round-ties-to-even per add; `f32` via the
    width's rounding — TS `Math.fround` each step). A running total that overflows to ±Inf → `22003`
    (the §3 finite-overflow rule; PG yields ±Inf — a documented divergence). One canonical order +
    one rounding rule ⇒ bit-identical across cores and across any serial/parallel plan.
 
 `AVG` = `SUM / count` (count exact; the division rounded once at the input width), NULLs skipped,
-empty group → `NULL`. **Result types**: `SUM`/`AVG(float32) → float32`, `SUM`/`AVG(float64) →
-float64` (a float sum/avg stays the input width — `same_as_input`, matching PG `sum(real) → real`;
+empty group → `NULL`. **Result types**: `SUM`/`AVG(f32) → f32`, `SUM`/`AVG(f64) →
+f64` (a float sum/avg stays the input width — `same_as_input`, matching PG `sum(real) → real`;
 AVG over float stays float, unlike `AVG(int) → decimal`, and a minor divergence from PG which
-widens `AVG(real) → double`). `MIN`/`MAX(floatN) → floatN` (the §3 total order), `COUNT → int64`.
+widens `AVG(real) → double`). `MIN`/`MAX(floatN) → floatN` (the §3 total order), `COUNT → i64`.
 
 **Cost.** One `aggregate_accumulate` per input row (the accumulator add is O(1) amortized),
 deterministic and cross-core — so float aggregate queries keep `# cost:` assertions even
@@ -265,7 +267,7 @@ Float scalar functions split by whether they are correctly-rounded:
 (half away from zero — the engine's one mode; `round(f)` and `round(f, n)`), `sign`, and
 **`sqrt`** (IEEE-mandated correctly-rounded). These are bit-identical across cores and carry
 exact `R`-tag assertions; they reuse the existing scalar-function machinery (functions.md §9,
-the `abs`/`round` precedent) with `float64` overloads.
+the `abs`/`round` precedent) with `f64` overloads.
 
 **Transcendental — exempted (G2/G3 dropped, ledgered):** `exp`, `ln`, `log10`, `log(b, x)`,
 `pow(x, y)` / the `^` operator, `sin`, `cos`, `tan`, `asin`, `acos`, `atan`, `atan2`, `cbrt`.
@@ -282,7 +284,7 @@ follow-ons (each one operator-catalog row + a ledger line).
 
 ## 9. Rendering and the `R` conformance tag
 
-**Rendering.** A `float64` renders with each core's **native shortest round-trip** formatter
+**Rendering.** A `f64` renders with each core's **native shortest round-trip** formatter
 (Rust `{}`, Go `strconv.FormatFloat(f, 'g', -1, 64)`, JS `Number.prototype.toString`),
 producing the shortest decimal string that parses back to the same binary64. Special values
 render PG-style: `Infinity`, `-Infinity`, `NaN` (and `-0` renders `-0`). The *digits* of
@@ -302,15 +304,15 @@ compare; the tolerance exists for the exempted surface and the oracle. `# cost:`
 
 ## 10. On-disk, keys, and cost
 
-- **On-disk value codec** — stable **type code 12** (`float64`, 8 bytes) and **13** (`float32`,
-  4 bytes) (format.md). The body is the IEEE bytes, **big-endian** (`float64`: Go
+- **On-disk value codec** — stable **type code 12** (`f64`, 8 bytes) and **13** (`f32`,
+  4 bytes) (format.md). The body is the IEEE bytes, **big-endian** (`f64`: Go
   `math.Float64bits`, TS `DataView.setFloat64(_, false)`, Rust `f64::to_bits().to_be_bytes()`;
-  `float32`: Go `math.Float32bits`, TS `setFloat32(_, false)`, Rust `f32::to_bits().to_be_bytes()`)
+  `f32`: Go `math.Float32bits`, TS `setFloat32(_, false)`, Rust `f32::to_bits().to_be_bytes()`)
   behind the shared presence tag (NULL = tag only). Fixed-width, so no length prefix — like
   `uuid`/`timestamp`. The stored bits are preserved **verbatim for every value except `NaN`**: a
   stored `-0.0` keeps its sign bit, and `±Infinity`/finite values keep theirs, but a `NaN` is
-  **canonicalized to the single quiet pattern** `0x7FF8000000000000` (`float64`) / `0x7FC00000`
-  (`float32`) on the way to disk. This NaN-only step is the one storage divergence from verbatim,
+  **canonicalized to the single quiet pattern** `0x7FF8000000000000` (`f64`) / `0x7FC00000`
+  (`f32`) on the way to disk. This NaN-only step is the one storage divergence from verbatim,
   and the determinism contract forces it: a NaN's *payload* bits are **core-specific** (Go's
   `math.NaN()` is `0x7FF8…001`, Go/Rust hardware `Inf − Inf` is the negative `0xFFF8…`, JS
   materializes `0x7FF8…000`), so storing them verbatim would make the cores' files disagree. A
@@ -325,7 +327,7 @@ compare; the tolerance exists for the exempted surface and the oracle. `# cost:`
   and **if the sign bit is set (negative) flip all 64 bits, else flip just the sign bit** — the
   standard transform that maps the binary64 total order (§3) monotonically onto unsigned byte
   order, with NaN's canonical pattern landing above `+Inf`. **Authored but unexercised this
-  slice**: a `float64 PRIMARY KEY`/index is rejected **`0A000`** (the text/decimal/bytea/
+  slice**: a `f64 PRIMARY KEY`/index is rejected **`0A000`** (the text/decimal/bytea/
   interval precedent — and the determinism.md §4 contamination argument: keeping float out of
   keys bounds an exempted value to *query-time* order, never *stored* order). Lifting it adds
   the byte-vector fixtures + the executor key path.
@@ -342,7 +344,7 @@ compare; the tolerance exists for the exempted surface and the oracle. `# cost:`
 3. **NaN is input-only** — finite arithmetic traps (`22003`/`22012`) instead of producing
    Inf/NaN; domain errors trap. NaN/±Inf enter via literals/casts/stored values and propagate.
 4. **FMA discipline (G3)** — the kernel is safe via the tree-walking evaluator; any hand-rolled
-   `a*b+c` (transcendentals, the §7 accumulator) uses the `float64(a*b)+c` barrier in Go.
+   `a*b+c` (transcendentals, the §7 accumulator) uses the `f64(a*b)+c` barrier in Go.
 5. **Exact accumulator** — `SUM`/`AVG` round once over an order-independent exact sum; special
    values resolved before the finite sum. Hand-rolled identically per core (no library drift).
 6. **In-contract vs exempted** — storage, ordering, the kernel, exact functions (incl `sqrt`),
@@ -351,5 +353,5 @@ compare; the tolerance exists for the exempted surface and the oracle. `# cost:`
    compare + the ledger; float-gated control flow is the one promotion path (§1, §4).
 7. **`R` tag compares by value** (parse to f64 + tolerance), never by string; NaN==NaN, ±Inf
    exact, -0==+0.
-8. **Strict coercion** — no implicit `int`/`decimal` ⊕ `float64` (`42804`); only literals adapt
+8. **Strict coercion** — no implicit `int`/`decimal` ⊕ `f64` (`42804`); only literals adapt
    to a float context; all casts explicit.

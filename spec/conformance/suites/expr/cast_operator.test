@@ -7,7 +7,7 @@
 # (`-32768::smallint` traps before the negation; `(-32768)::smallint` is the in-range value) and
 # tighter than arithmetic (`1 + 2::bigint`). Type names here are spelled with the SQL-standard
 # aliases (smallint/int/integer/bigint/numeric/text) so the oracle and jed agree.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.order_by_keys, types.int16, types.int32, types.int64, types.decimal, types.text, expr.arithmetic, expr.unary_minus, expr.parens, expr.precedence, cast.explicit, cast.string_literal, cast.operator, error.overflow_trap
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, query.order_by_keys, types.i16, types.i32, types.i64, types.decimal, types.text, expr.arithmetic, expr.unary_minus, expr.parens, expr.precedence, cast.explicit, cast.string_literal, cast.operator, error.overflow_trap
 
 # --- string-literal casts: `'42'::int` is `CAST('42' AS int)` is `integer '42'` -----------
 query I nosort
@@ -15,7 +15,7 @@ SELECT '42'::int
 ----
 42
 
-# a cast-coerced literal is an ordinary int32, comparable to a bare integer literal
+# a cast-coerced literal is an ordinary i32, comparable to a bare integer literal
 query B nosort
 SELECT '42'::integer = 42
 ----
@@ -44,7 +44,7 @@ SELECT -2.5::int
 ----
 -3
 
-# integer widening (int32 -> int64) is lossless
+# integer widening (i32 -> i64) is lossless
 query I nosort
 SELECT 1000::bigint
 ----
@@ -70,7 +70,7 @@ SELECT '3'::numeric(6,2)
 3.00
 
 # --- precedence: `::` binds tighter than unary minus ----------------------------------------
-# `(-32768)::smallint` parenthesizes the negation first — the in-range int16 minimum
+# `(-32768)::smallint` parenthesizes the negation first — the in-range i16 minimum
 query I nosort
 SELECT (-32768)::smallint
 ----
@@ -102,7 +102,7 @@ CREATE TABLE t (id int PRIMARY KEY, a int, d numeric(10,2))
 statement ok
 INSERT INTO t VALUES (1, 5, 2.75), (2, 40, -1.25)
 
-# widen an int32 column to int64, and round a decimal column to int (half-away: 2.75 -> 3,
+# widen an i32 column to i64, and round a decimal column to int (half-away: 2.75 -> 3,
 # -1.25 -> -1) — ordered by the key for determinism
 query II nosort
 SELECT a::bigint, d::int FROM t ORDER BY id
@@ -120,7 +120,7 @@ SELECT a::smallint + 1 FROM t ORDER BY id
 41
 
 # --- errors: narrowing that does not fit traps 22003 (same as CAST) -------------------------
-# `-32768::smallint` is `-(32768::smallint)`: the inner 32768 overflows int16 BEFORE the
+# `-32768::smallint` is `-(32768::smallint)`: the inner 32768 overflows i16 BEFORE the
 # negation, so it traps — unlike the parenthesized `(-32768)::smallint` above
 statement error 22003
 SELECT -32768::smallint

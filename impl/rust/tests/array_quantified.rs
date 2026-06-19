@@ -3,8 +3,8 @@
 //! universal dual. Every expected value is pinned against PostgreSQL 18 (the three-valued NULL rules
 //! especially — a NULL element / a NULL `x` / an empty array / a NULL array).
 //!
-//! jed types a bare integer literal / `ARRAY[…]` constructor as `int64`, so the bare cases use
-//! `int64`; column adaptation (`int32` column vs a bare `ARRAY[…]`) is exercised via a table.
+//! jed types a bare integer literal / `ARRAY[…]` constructor as `i64`, so the bare cases use
+//! `i64`; column adaptation (`i32` column vs a bare `ARRAY[…]`) is exercised via a table.
 
 use jed::{Database, Outcome, execute};
 
@@ -37,7 +37,7 @@ fn any_equality_is_in() {
     // SOME is the SQL-standard synonym for ANY.
     assert_eq!(val(&mut db, "SELECT 2 = SOME(ARRAY[1,2,3])"), "true");
     // The '{…}'::T[] literal operand resolves too.
-    assert_eq!(val(&mut db, "SELECT 2 = ANY('{1,2,3}'::int64[])"), "true");
+    assert_eq!(val(&mut db, "SELECT 2 = ANY('{1,2,3}'::i64[])"), "true");
     // The SUBQUERY operand form is the subquery spelling of IN: `x = ANY(SELECT …)` ≡
     // `x IN (SELECT …)` (shipped; thorough coverage in suites/subquery/quantified.test).
     assert_eq!(val(&mut db, "SELECT 1 = ANY(SELECT 1)"), "true");
@@ -52,12 +52,9 @@ fn all_universal() {
     assert_eq!(val(&mut db, "SELECT 3 = ALL(ARRAY[4,NULL])"), "false");
     assert_eq!(val(&mut db, "SELECT 3 = ALL(ARRAY[3,NULL])"), "NULL");
     // Empty array → TRUE (vacuous), even for a NULL x; NULL array → NULL.
-    assert_eq!(val(&mut db, "SELECT 3 = ALL('{}'::int64[])"), "true");
-    assert_eq!(
-        val(&mut db, "SELECT NULL::int64 = ALL('{}'::int64[])"),
-        "true"
-    );
-    assert_eq!(val(&mut db, "SELECT 3 = ALL(NULL::int64[])"), "NULL");
+    assert_eq!(val(&mut db, "SELECT 3 = ALL('{}'::i64[])"), "true");
+    assert_eq!(val(&mut db, "SELECT NULL::i64 = ALL('{}'::i64[])"), "true");
+    assert_eq!(val(&mut db, "SELECT 3 = ALL(NULL::i64[])"), "NULL");
 }
 
 #[test]
@@ -84,7 +81,7 @@ fn flattens_multidim_and_custom_lbounds() {
     );
     // A custom lower bound is irrelevant (elements, not subscripts).
     assert_eq!(
-        val(&mut db, "SELECT 20 = ANY('[5:6]={10,20}'::int64[])"),
+        val(&mut db, "SELECT 20 = ANY('[5:6]={10,20}'::i64[])"),
         "true"
     );
 }
@@ -99,13 +96,13 @@ fn text_elements() {
 #[test]
 fn column_literal_adaptation() {
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])").unwrap();
     execute(
         &mut db,
         "INSERT INTO t VALUES (1, ARRAY[10,20,30]), (2, ARRAY[40,50])",
     )
     .unwrap();
-    // A bare integer literal adapts to the int32 element type; a bare ARRAY[…] adapts to a column.
+    // A bare integer literal adapts to the i32 element type; a bare ARRAY[…] adapts to a column.
     assert_eq!(
         val(&mut db, "SELECT 20 = ANY(xs) FROM t WHERE id = 1"),
         "true"
@@ -114,7 +111,7 @@ fn column_literal_adaptation() {
         val(&mut db, "SELECT count(*) FROM t WHERE 20 = ANY(xs)"),
         "1"
     );
-    // A scalar int32 column vs a bare ARRAY[…] (the constructor adapts to the column's element type).
+    // A scalar i32 column vs a bare ARRAY[…] (the constructor adapts to the column's element type).
     assert_eq!(
         val(&mut db, "SELECT count(*) FROM t WHERE id = ANY(ARRAY[1,2])"),
         "2"

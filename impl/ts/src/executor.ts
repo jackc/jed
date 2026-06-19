@@ -177,12 +177,12 @@ import {
 // Outcome is the result of executing one statement: a bare statement (CREATE, INSERT,
 // UPDATE, DELETE) or a query result set. cost is the deterministic execution cost accrued
 // while running it (CLAUDE.md §13) — a DML statement accrues its scan + filter cost even
-// though it returns no rows. It is a bigint for int64 parity across cores (§8).
+// though it returns no rows. It is a bigint for i64 parity across cores (§8).
 // rowsAffected is how many rows a DML statement (INSERT/UPDATE/DELETE without RETURNING)
 // touched — PostgreSQL's command-tag count (spec/design/api.md §4); 0 for a DML statement
 // that matched nothing, null for DDL and transaction control, which have no row count.
 // columnTypes is the canonical name of each output column's resolved type (parallel to
-// columnNames) — int16/int32/int64/text/boolean/decimal/…, or "unknown" for an untyped NULL
+// columnNames) — i16/i32/i64/text/boolean/decimal/…, or "unknown" for an untyped NULL
 // column. The resolved SCALAR type — for decimal the unconstrained "decimal", not the
 // numeric(p,s) typmod (spec/design/conformance.md §7).
 export type Outcome =
@@ -1309,7 +1309,7 @@ export class Database {
         // key encodings (text §2.4, decimal §2.5, bytea §2.6, interval, float §2.8, composite §2.10)
         // are authored but unexercised, so a text/decimal/bytea/interval/float/composite PRIMARY KEY
         // is a documented 0A000 narrowing (types.md §11/§12/§13, composite.md §6), relaxable in a
-        // later in-key slice. timestamp / timestamptz are also allowed — they share the int64
+        // later in-key slice. timestamp / timestamptz are also allowed — they share the i64
         // int-be-signflip key encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
         if (
           !typeIsInteger(colType) &&
@@ -2498,10 +2498,10 @@ export class Database {
           } else if (pkv.kind === "int") {
             parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.int));
           } else if (pkv.kind === "timestamp" || pkv.kind === "timestamptz") {
-            // A timestamp / timestamptz PK encodes its int64 instant (spec/design/timestamp.md §6).
+            // A timestamp / timestamptz PK encodes its i64 instant (spec/design/timestamp.md §6).
             parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.micros));
           } else if (pkv.kind === "date") {
-            // A date PK encodes its int32 day count (spec/design/date.md §5).
+            // A date PK encodes its i32 day count (spec/design/date.md §5).
             parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.days));
           } else {
             throw engineError("data_corrupted", "a primary key must be an integer, boolean, uuid, or timestamp value");
@@ -2608,7 +2608,7 @@ export class Database {
     // unchanged).
     const indexInserts: Uint8Array[][] = table.indexes.map(() => []);
     for (const pr of prepared) {
-      const key = pr.key ?? encodeInt("int64", store.allocRowid());
+      const key = pr.key ?? encodeInt("i64", store.allocRowid());
       for (let k = 0; k < table.indexes.length; k++) {
         indexInserts[k]!.push(indexEntryKey(table.columns, table.indexes[k]!, key, pr.row));
       }
@@ -3667,14 +3667,14 @@ export class Database {
   // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
   // §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
   // PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
-  // int64.
+  // i64.
   private resolveGenerateSeries(args: Expr[], alias: string | null, argScope: Scope, ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
     if (args.length !== 2 && args.length !== 3) throw noFuncOverload("generate_series");
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const rargs: RExpr[] = [];
     let result: ScalarType | null = null;
     for (const a of args) {
-      const { node, type } = resolve(argScope, a, "int64", forbidden, ptypes);
+      const { node, type } = resolve(argScope, a, "i64", forbidden, ptypes);
       if (type.kind === "int") {
         if (result === null || rank(type.ty) > rank(result)) result = type.ty;
       } else if (type.kind === "null") {
@@ -3684,7 +3684,7 @@ export class Database {
       }
       rargs.push(node);
     }
-    const table = srfTable("generate_series", alias, scalarT(result ?? "int64"));
+    const table = srfTable("generate_series", alias, scalarT(result ?? "i64"));
     return { table, srf: { kind: "generate_series", args: rargs } };
   }
 
@@ -3692,7 +3692,7 @@ export class Database {
   // argument must be an array (binding ELEM := its element type, the produced column's type), else
   // 42883 (a non-array, e.g. unnest(5)). A bare untyped NULL argument leaves ELEM undeterminable →
   // 42P18 (jed's polymorphic posture, like array_append(NULL, NULL)); a typed NULL array
-  // (NULL::int32[]) resolves and yields zero rows at exec. ELEM may be a scalar OR a composite (AF7 —
+  // (NULL::i32[]) resolves and yields zero rows at exec. ELEM may be a scalar OR a composite (AF7 —
   // unnest(composite[])): the synthetic column is typed at the bound element type directly
   // (typeFromResolved), so a composite array produces composite rows (an anonymous-composite element
   // has no catalog name → 0A000, not reachable from a typed array).
@@ -4177,7 +4177,7 @@ export class Database {
       // emits ONE row even over zero input; GROUP BY over an empty table creates no groups ->
       // zero rows. Each (row × aggregate) charges aggregateAccumulate; the bucketing/finalize is
       // unmetered (cost.md §3).
-      const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAcc(s.plan, s.floatWidth ?? "float64"));
+      const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAcc(s.plan, s.floatWidth ?? "f64"));
       const index = new Map<string, number>();
       const groups: { keys: Value[]; accs: Acc[] }[] = [];
       if (plan.groupKeys.length === 0) {
@@ -5204,12 +5204,12 @@ function distinctValueKey(v: Value): string {
           // bytea/text of the same bytes.
           return "u" + renderUuid(v.bytes);
         case "timestamp":
-          // The int64 microsecond instant under a distinct 's' tag: two literals for the same
+          // The i64 microsecond instant under a distinct 's' tag: two literals for the same
           // instant (12:00:00 and 12:00:00.0) share micros and bucket together; the infinity
           // sentinels are ordinary int values with their own buckets.
           return "s" + v.micros.toString();
         case "timestamptz":
-          // The int64 UTC-instant micros under a distinct 'z' tag: offsets are normalized to UTC
+          // The i64 UTC-instant micros under a distinct 'z' tag: offsets are normalized to UTC
           // at parse, so +00 and +05-of-the-same-instant bucket together.
           return "z" + v.micros.toString();
         case "interval":
@@ -5217,16 +5217,16 @@ function distinctValueKey(v: Value): string {
           // span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/
           // GROUP BY bucket while each value renders its own fields (spec/design/interval.md §2).
           return "v" + intervalSpan(v.iv).toString();
-        case "float32":
-        case "float64":
+        case "f32":
+        case "f64":
           // The TOTAL-order canonical key so -0 and +0 collapse to one bucket and all NaNs to one
           // (float.md §3): canonicalize -0 → +0, map every NaN to a single sentinel string. Distinct
-          // tags 'f'/'g' per width so a float32 never collides with a float64 of the same number
+          // tags 'f'/'g' per width so a f32 never collides with a f64 of the same number
           // (they are different typed columns; the tag keeps the key total). The number's toString
           // is the shortest round-trip — unique per binary value, so distinct values get distinct
           // keys after the -0/NaN normalization.
           return (
-            (v.kind === "float32" ? "f" : "g") +
+            (v.kind === "f32" ? "f" : "g") +
             (Number.isNaN(v.value) ? "NaN" : renderFloat(canonFloat(v.value)))
           );
         default:
@@ -5249,10 +5249,10 @@ function distinctValueKey(v: Value): string {
 // literal (its integer type, if needed, is settled by the surrounding operator/context).
 type ResolvedType =
   | { kind: "int"; ty: ScalarType }
-  // The float family (spec/design/float.md): ty is float32 or float64. A strict island — no
+  // The float family (spec/design/float.md): ty is f32 or f64. A strict island — no
   // implicit cross-family coercion (int/decimal ⊕ float is 42804); within-family widening
-  // (float32 → float64) is the only implicit edge. ty carries the width so arithmetic rounds
-  // at the right precision (Math.fround for float32) and the on-disk codec picks the codec.
+  // (f32 → f64) is the only implicit edge. ty carries the width so arithmetic rounds
+  // at the right precision (Math.fround for f32) and the on-disk codec picks the codec.
   | { kind: "float"; ty: ScalarType }
   | { kind: "bool" }
   | { kind: "text" } // the text family (one collation, C); does not promote
@@ -5261,7 +5261,7 @@ type ResolvedType =
   | { kind: "uuid" } // the uuid family (fixed 16 bytes); does not promote. The first non-integer key.
   | { kind: "timestamp" } // zoneless instant; does not compare/cast to timestamptz
   | { kind: "timestamptz" } // UTC instant; does not compare/cast to timestamp
-  | { kind: "date" } // calendar date (int32 days); strict island, no compare/cast to timestamp
+  | { kind: "date" } // calendar date (i32 days); strict island, no compare/cast to timestamp
   | { kind: "interval" } // a span; compares only with itself, by the canonical span
   // A composite (row) type (spec/design/composite.md §5). `name` is non-null for a named catalog
   // type — rendered in the `# types:` output and the basis for cross-comparability — or null for an
@@ -5289,7 +5289,7 @@ type RExpr =
   // supplied (and coerced) before evaluation.
   | { kind: "param"; index: number }
   | { kind: "constInt"; value: bigint }
-  // A float constant: `ty` is the width (float32/float64); for float32 `value` is already
+  // A float constant: `ty` is the width (f32/f64); for f32 `value` is already
   // Math.fround'd (spec/design/float.md §4).
   | { kind: "constFloat"; ty: ScalarType; value: number }
   | { kind: "constBool"; value: boolean }
@@ -5334,9 +5334,9 @@ type RExpr =
   // A scalar-function call (spec/design/functions.md §9, float.md §8), evaluated per row in any
   // context. `result` is the static result type — for abs over an integer/float it is the
   // operand's own type (range-checked / fround'd at that width), for round over int/decimal it is
-  // decimal, and for the float math functions (ceil/floor/.../sqrt/exp/.../tan) it is float64 per
+  // decimal, and for the float math functions (ceil/floor/.../sqrt/exp/.../tan) it is f64 per
   // the catalog (only abs is operand-typed). `argWidth` carries the operand's float width so the
-  // evaluator can Math.fround a float32 result of abs (the only width-preserving float func).
+  // evaluator can Math.fround a f32 result of abs (the only width-preserving float func).
   | {
       kind: "scalarFunc";
       func: ScalarFuncName;
@@ -5354,7 +5354,7 @@ type RExpr =
   // Non-strict (null = "none"), like "arrayFunc": no blanket NULL short-circuit. `arrayForm` records
   // the call shape — false = the spread form (count `args`' null-ness directly, never NULL); true =
   // the VARIADIC-array form (one `args` operand — a NULL array → NULL, else count its flattened
-  // elements' null-ness). Result is always int32.
+  // elements' null-ness). Result is always i32.
   | { kind: "variadic"; func: VariadicFuncName; args: RExpr[]; arrayForm: boolean }
   // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
   // row `level` hops out (1 = immediate parent). A leaf — reads from the outer-row environment.
@@ -5402,10 +5402,10 @@ type ScalarFuncName =
   | "cos"
   | "tan"
   // make_interval — builds an interval from its (named/defaulted) integer components plus the
-  // float64 secs (spec/design/functions.md §11). The one scalar function returning interval.
+  // f64 secs (spec/design/functions.md §11). The one scalar function returning interval.
   | "make_interval"
   // uuid extractors (spec/design/functions.md §12): pure inspectors of a uuid's bits.
-  // uuid_extract_version → int16 (NULL off-RFC-variant); uuid_extract_timestamp → timestamptz
+  // uuid_extract_version → i16 (NULL off-RFC-variant); uuid_extract_timestamp → timestamptz
   // (the embedded instant for v1/v7, else NULL).
   | "uuid_extract_version"
   | "uuid_extract_timestamp"
@@ -5418,10 +5418,10 @@ type ScalarFuncName =
   // timestamptz, the clock seam read on EVERY call (VOLATILE).
   | "now"
   | "clock_timestamp"
-  // Sequence value functions (spec/design/sequences.md §4/§6). nextval → int64, advance the named
+  // Sequence value functions (spec/design/sequences.md §4/§6). nextval → i64, advance the named
   // sequence (VOLATILE; MUTATES the working snapshot via pendingSeq, so the statement is a write).
-  // currval → int64, the value nextval/setval last produced for the named sequence IN THIS SESSION.
-  // setval → int64, set the counter (also a write); lastval → int64, the most-recent-nextval value.
+  // currval → i64, the value nextval/setval last produced for the named sequence IN THIS SESSION.
+  // setval → i64, set the counter (also a write); lastval → i64, the most-recent-nextval value.
   | "nextval"
   | "currval"
   | "setval"
@@ -5451,7 +5451,7 @@ type ArrayFuncName =
   | "overlaps";
 
 // VariadicFuncName is the internal identity of a VARIADIC counting-function node
-// (spec/design/array-functions.md §12). Both return int32; the call form lives on the node.
+// (spec/design/array-functions.md §12). Both return i32; the call form lives on the node.
 type VariadicFuncName = "num_nulls" | "num_nonnulls";
 
 // ============================================================================
@@ -5654,12 +5654,12 @@ type EvalEnv = {
 type AggPlan =
   | "countStar" // COUNT(*) — count every row
   | "count" // COUNT(expr) — count non-NULL inputs
-  | "sumInt" // SUM(int16|int32) — accumulate int64, result int64 (trap at int64)
-  | "sumDecimal" // SUM(int64|decimal) — accumulate decimal, result decimal
+  | "sumInt" // SUM(i16|i32) — accumulate i64, result i64 (trap at i64)
+  | "sumDecimal" // SUM(i64|decimal) — accumulate decimal, result decimal
   | "avg" // AVG — decimal sum + count; result sum/count (NULL if count 0)
   // SUM/AVG over float: the ORDER-INDEPENDENT CANONICAL-ORDER FOLD (float.md §7). Inputs are
   // COLLECTED (not streamed), then at finalize: resolve NaN/±Inf, -0-canonicalize + sort the finite
-  // values by the total order, fold left at the width (fround per add for float32), trapping 22003
+  // values by the total order, fold left at the width (fround per add for f32), trapping 22003
   // on overflow. Result keeps the input width (same_as_input). avgFloat divides the sum by the
   // count, rounded once. The width rides on the Acc.
   | "sumFloat"
@@ -5693,7 +5693,7 @@ type Acc = {
   floatWidth: ScalarType;
 };
 
-function newAcc(plan: AggPlan, floatWidth: ScalarType = "float64"): Acc {
+function newAcc(plan: AggPlan, floatWidth: ScalarType = "f64"): Acc {
   return {
     plan,
     count: 0n,
@@ -5722,7 +5722,7 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
     case "sumInt":
       if (v.kind === "int") {
         const s = a.sumInt + v.int;
-        if (!inRange("int64", s)) throw overflow("int64");
+        if (!inRange("i64", s)) throw overflow("i64");
         a.sumInt = s;
         a.seen = true;
       }
@@ -5755,7 +5755,7 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
       // Float SUM/AVG: COLLECT the inputs for the canonical-order fold at finalize (float.md §7).
       // NULL is skipped (every aggregate). The fold itself (sort + width-correct add) runs once at
       // finalize, so per-row cost stays the structural aggregate_accumulate already charged.
-      if (v.kind === "float32" || v.kind === "float64") {
+      if (v.kind === "f32" || v.kind === "f64") {
         a.floats.push(v.value);
         a.count += 1n;
         a.seen = true;
@@ -5795,7 +5795,7 @@ function finalizeAcc(a: Acc): Value {
     case "sumFloat": {
       if (!a.seen) return nullValue(); // empty / all-NULL group → NULL
       const s = floatCanonicalSum(a.floats, a.floatWidth);
-      return a.floatWidth === "float32" ? float32Value(s) : float64Value(s);
+      return a.floatWidth === "f32" ? float32Value(s) : float64Value(s);
     }
     case "avgFloat": {
       if (a.count === 0n) return nullValue();
@@ -5803,8 +5803,8 @@ function finalizeAcc(a: Acc): Value {
       // exact; Number(count) is safe for any plausible group size.
       const s = floatCanonicalSum(a.floats, a.floatWidth);
       const avg = s / Number(a.count);
-      const r = a.floatWidth === "float32" ? Math.fround(avg) : avg;
-      return a.floatWidth === "float32" ? float32Value(r) : float64Value(r);
+      const r = a.floatWidth === "f32" ? Math.fround(avg) : avg;
+      return a.floatWidth === "f32" ? float32Value(r) : float64Value(r);
     }
     case "min":
     case "max":
@@ -5817,9 +5817,9 @@ function finalizeAcc(a: Acc): Value {
 //   1. Special values first (order-independent): any NaN → NaN; else if both +Inf and -Inf → NaN;
 //      else if +Inf present → +Inf; else if -Inf present → -Inf; else all-finite → step 2.
 //   2. Canonicalize each finite value -0 → +0, then SORT by the total order (floatTotalCmp).
-//   3. FOLD LEFT with width-correct IEEE addition (Math.fround each add for float32). A running
+//   3. FOLD LEFT with width-correct IEEE addition (Math.fround each add for f32). A running
 //      total overflowing to ±Inf traps 22003 (the finite-overflow rule; PG yields ±Inf — a
-//      documented divergence). `caller` builds the float32/float64 Value.
+//      documented divergence). `caller` builds the f32/f64 Value.
 function floatCanonicalSum(values: number[], width: ScalarType): number {
   let anyNaN = false;
   let posInf = false;
@@ -5838,7 +5838,7 @@ function floatCanonicalSum(values: number[], width: ScalarType): number {
   // All finite: sort by the total order (after -0 canonicalization, distinct values have distinct
   // keys, so the sort is total and deterministic — every core sees the same sequence).
   finite.sort(floatTotalCmp);
-  const f32 = width === "float32";
+  const f32 = width === "f32";
   let acc = 0; // +0 start; adding to it preserves the first value's sign correctly under IEEE
   for (const v of finite) {
     acc = acc + v;
@@ -6171,7 +6171,7 @@ function resolveAggregate(
     if (!aggregateHasStar(name)) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     plan = "countStar";
     operand = null;
-    result = { kind: "int", ty: "int64" };
+    result = { kind: "int", ty: "i64" };
   } else {
     // One operand, resolved in a fresh Forbidden sub-context. The registry validates the (surface,
     // operand-family) overload exists (else 42883) and yields its result code; the plan + result
@@ -6309,7 +6309,7 @@ function resolvedScalarType(t: ResolvedType): ScalarType {
 
 // scalarResultType is the result ScalarType of a scalar function from its catalog result code
 // (functions.md §9): "promoted" = the (single) operand's own type; otherwise the code is a literal
-// scalar-type id (e.g. "decimal", "float64", "interval", "int16", "timestamptz", "uuid").
+// scalar-type id (e.g. "decimal", "f64", "interval", "i16", "timestamptz", "uuid").
 function scalarResultType(code: string, tys: ResolvedType[]): ScalarType {
   if (code === "promoted") return resolvedScalarType(tys[0]!);
   const ty = scalarTypeFromName(code);
@@ -6346,11 +6346,11 @@ function aggregatePlan(
   code: string,
   t: ResolvedType,
 ): [AggPlan, ResolvedType, ScalarType | undefined] {
-  if (surface === "count") return ["count", { kind: "int", ty: "int64" }, undefined];
+  if (surface === "count") return ["count", { kind: "int", ty: "i64" }, undefined];
   if (surface === "sum" && code === "sum_widen") {
-    // SUM(int16|int32) → int64; SUM(int64) → decimal (PG widening).
-    if (t.kind === "int" && t.ty === "int64") return ["sumDecimal", { kind: "decimal" }, undefined];
-    return ["sumInt", { kind: "int", ty: "int64" }, undefined];
+    // SUM(i16|i32) → i64; SUM(i64) → decimal (PG widening).
+    if (t.kind === "int" && t.ty === "i64") return ["sumDecimal", { kind: "decimal" }, undefined];
+    return ["sumInt", { kind: "int", ty: "i64" }, undefined];
   }
   if (surface === "sum" && code === "decimal") return ["sumDecimal", { kind: "decimal" }, undefined];
   if (surface === "sum" && code === "same_as_input" && t.kind === "float") {
@@ -6425,17 +6425,17 @@ function scalarFuncDesc(name: string): OperatorDesc | undefined {
 }
 
 // familyHint is the type context offered to an untyped literal in a function-argument slot of the
-// given family, so it adapts (functions.md §11): an integer slot offers int64, a float slot offers
-// float64 (so a bare 0/1.5 becomes float64 for secs). Other families offer no hint (null).
+// given family, so it adapts (functions.md §11): an integer slot offers i64, a float slot offers
+// f64 (so a bare 0/1.5 becomes f64 for secs). Other families offer no hint (null).
 function familyHint(family: string): ScalarType | null {
-  if (family === "integer") return "int64";
-  if (family === "float") return "float64";
+  if (family === "integer") return "i64";
+  if (family === "float") return "f64";
   return null;
 }
 
 // defaultExpr materializes a catalog DEFAULT (an integer-literal string, verify.rb-checked) as an
 // Expr so an omitted trailing argument resolves through the normal literal path — adapting to its
-// slot's family (e.g. "0" → float64 for secs). functions.md §11.
+// slot's family (e.g. "0" → f64 for secs). functions.md §11.
 function defaultExpr(lit: string): Expr {
   return { kind: "literal", literal: { kind: "int", int: BigInt(lit) } };
 }
@@ -6488,7 +6488,7 @@ function normalizeNamedArgs(desc: OperatorDesc, args: Expr[], argNames: (string 
 // resolveMakeInterval resolves make_interval(years, months, weeks, days, hours, mins, secs) — the
 // engine's first named + defaulted function (functions.md §11). Normalize named/positional args +
 // defaults onto the seven slots, resolve each with its declared family as the type hint (so a bare
-// numeric literal adapts to the float64 secs slot), and emit a make_interval node. The arguments
+// numeric literal adapts to the f64 secs slot), and emit a make_interval node. The arguments
 // keep their families (no promotion); a wrong family in a slot is 42883.
 function resolveMakeInterval(
   scope: Scope,
@@ -6504,7 +6504,7 @@ function resolveMakeInterval(
   for (let i = 0; i < positional.length; i++) {
     const fam = desc.argFamilies[i]!;
     const r = resolve(scope, positional[i]!, familyHint(fam), ag, params);
-    // Type-check against the declared family. A NULL adapts (NULL propagates); a float32 secs is
+    // Type-check against the declared family. A NULL adapts (NULL propagates); a f32 secs is
     // read at eval and widened losslessly to f64 (no cast node — cost matches the cores).
     const ok =
       r.type.kind === "null" ||
@@ -6553,8 +6553,8 @@ function resolveScalarFunc(
   // (extensibility.md §5) — replacing the old hand-written chain of (name, arg-types) checks.
   const desc = lookupScalarOverload(name, tys);
   if (!desc) throw noFuncOverload(name);
-  // Every float function computes at the operand's float width (argWidth), so a float32 operand
-  // rounds at binary32 even where the catalog's result is float64; abs(float) also keeps that width
+  // Every float function computes at the operand's float width (argWidth), so a f32 operand
+  // rounds at binary32 even where the catalog's result is f64; abs(float) also keeps that width
   // as its result. Non-float args carry no width. pow is the one (float, float) function — it
   // promotes its mixed-width pair to a common width and widens both arguments to it.
   let argWidth: ScalarType | undefined;
@@ -6583,7 +6583,7 @@ function scalarFuncNode(
 // array-functions.md §12). The lone catalog row's last parameter is variadic; the call is EITHER a
 // spread of trailing arguments OR (with the VARIADIC keyword) a single array passed directly.
 // Non-strict (null = "none"): the node carries no blanket NULL short-circuit. The result type is the
-// catalog `result` (int32 here), independent of the arguments.
+// catalog `result` (i32 here), independent of the arguments.
 function resolveVariadicFunc(
   scope: Scope,
   e: { name: string; args: Expr[]; star: boolean; variadic: boolean },
@@ -6701,7 +6701,7 @@ function matchPoly(slots: readonly string[], tys: ResolvedType[]): { elem: Resol
 
 // polyResultType is the result ResolvedType of an array function from its catalog result code and the
 // bound ELEM: anyarray → ELEM[], anyelement → ELEM (both 42P18 if ELEM is undeterminable); any other
-// code is a concrete scalar id (int32, text).
+// code is a concrete scalar id (i32, text).
 function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
   if (code === "anyarray") {
     if (elem === null) throw indeterminatePoly();
@@ -6711,7 +6711,7 @@ function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
     if (elem === null) throw indeterminatePoly();
     return elem;
   }
-  // A concrete array result `<scalar>[]` (array_positions → "int32[]"): the element type is fixed
+  // A concrete array result `<scalar>[]` (array_positions → "i32[]"): the element type is fixed
   // (independent of ELEM), so the result is Array(scalar) (array-functions.md §8).
   if (code.endsWith("[]")) {
     const base = code.slice(0, -2);
@@ -7065,8 +7065,8 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
     case "decimal":
       return isDecimal(colTy);
     case "float":
-      // A float assigns only to a float column, within-family WIDENING only (float32 → float64 is
-      // lossless/implicit; float64 → float32 is lossy and needs an explicit CAST — float.md §2/§6).
+      // A float assigns only to a float column, within-family WIDENING only (f32 → f64 is
+      // lossless/implicit; f64 → f32 is lossy and needs an explicit CAST — float.md §2/§6).
       // No int/decimal ↔ float storage adaptation (a strict island). storeValue mirrors this.
       return isFloat(colTy) && promoteFloat(t.ty, colTy) === colTy;
     case "bool":
@@ -7633,7 +7633,7 @@ function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): Query
 
 // resolve resolves one Expr into an RExpr plus its static type. ctx (non-null) is the
 // type an untyped integer literal should adapt to (spec/design/types.md §6); null
-// defaults a bare literal to int64.
+// defaults a bare literal to i64.
 function resolve(
   scope: Scope,
   e: Expr,
@@ -7665,7 +7665,7 @@ function resolve(
       }
       // An element-type hint (ctx) flows down to the elements so an array literal adapts its untyped
       // integer/decimal literals exactly as a scalar literal does — e.g. resolving ARRAY[7,8] with an
-      // int32 context yields int32[], not the default int64[] (the polymorphic array functions pass the
+      // i32 context yields i32[], not the default i64[] (the polymorphic array functions pass the
       // bound element type here, array-functions.md §2). Almost every other caller passes null, so the
       // default 1-D unification is unchanged.
       const nodes: RExpr[] = [];
@@ -7715,7 +7715,7 @@ function resolve(
         throw typeError(`cannot subscript a value of type ${rtName(base.type)}, which is not an array`);
       }
       const resolveBound = (b: Expr): RExpr => {
-        const r = resolve(scope, b, "int32", ag, params);
+        const r = resolve(scope, b, "i32", ag, params);
         if (r.type.kind !== "int" && r.type.kind !== "null") {
           throw typeError(`array subscript must be an integer, not ${rtName(r.type)}`);
         }
@@ -7816,7 +7816,7 @@ function resolve(
         }
         case "decimal":
           // A decimal literal adapts to a FLOAT context (float.md §4): decimal → float at resolve
-          // (the nearest binary64 to the exact decimal; Math.fround if the context is float32). The
+          // (the nearest binary64 to the exact decimal; Math.fround if the context is f32). The
           // exact-decimal string already round-trips IEEE conversion via Number(...). Otherwise it
           // is decimal — cap-checked here (an over-long coefficient/scale traps 22003 at resolve).
           if (ctx !== null && isFloat(ctx)) {
@@ -7826,14 +7826,14 @@ function resolve(
         default: {
           // An integer literal adapts to an integer context or — like a decimal literal — a FLOAT
           // context (int → float at resolve; float.md §4). A non-numeric context (a text/decimal
-          // column or assignment target) does not apply — it defaults to int64, and the surrounding
+          // column or assignment target) does not apply — it defaults to i64, and the surrounding
           // check then reports the family mismatch (42804) or widens it (int→decimal), never a wrong
           // range check.
           if (ctx !== null && isFloat(ctx)) {
             const n = roundToWidth(ctx, Number(e.literal.int));
             return { node: { kind: "constFloat", ty: ctx, value: n }, type: { kind: "float", ty: ctx } };
           }
-          const ty = ctx !== null && isInteger(ctx) ? ctx : "int64";
+          const ty = ctx !== null && isInteger(ctx) ? ctx : "i64";
           if (!inRange(ty, e.literal.int)) throw overflow(ty);
           return { node: { kind: "constInt", value: e.literal.int }, type: { kind: "int", ty } };
         }
@@ -8060,7 +8060,7 @@ function resolve(
         }
         let result: ScalarType;
         if (type.kind === "int") result = type.ty;
-        else if (type.kind === "null") result = "int64"; // -NULL = NULL
+        else if (type.kind === "null") result = "i64"; // -NULL = NULL
         else throw typeError("unary minus requires a numeric operand");
         return { node: { kind: "neg", result, operand: node }, type: { kind: "int", ty: result } };
       }
@@ -8211,7 +8211,7 @@ function resolveBinary(
         return { node: { kind: "arith", op, result: temporal, lhs: p.rl, rhs: p.rr }, type: resolvedTypeOf(temporal) };
       }
       // Float arithmetic (float.md §5): float ⊕ float → float for + - * / % (and unary - via the
-      // neg path). A mixed-width pair PROMOTES to float64 (the higher rank), so the computation is
+      // neg path). A mixed-width pair PROMOTES to f64 (the higher rank), so the computation is
       // always at one width. NO cross-family promotion — int/decimal ⊕ float is 42804 (a float
       // operand with a non-float, non-null sibling falls through to requireNumericOperand, which
       // does NOT accept float, raising the type error). A float literal sibling already adapted via
@@ -8245,7 +8245,7 @@ function resolveBinary(
       // (eq3/lt3/gt3) dispatches on the value kinds.
       const p = resolveOperandPair(scope, lhs, rhs, ag, params);
       classifyComparable(p.lt, p.rt);
-      // A mixed-width float comparison promotes the narrower operand to float64 (float.md §3), so
+      // A mixed-width float comparison promotes the narrower operand to f64 (float.md §3), so
       // the runtime eq3/lt3/gt3 see one width (they require both sides the same float kind).
       let cl = p.rl;
       let cr = p.rr;
@@ -8392,14 +8392,14 @@ function resolveQuantified(
   let ra = resolve(scope, array, null, ag, params);
   // If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
   // bare ARRAY[…] constructor, re-resolve the array with `x`'s type as the element hint so the
-  // constructor adapts (`c = ANY(ARRAY[1,2])` over an int32 column → int32[]). Harmless for a
+  // constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a
   // column / cast operand (it ignores the hint).
   if (!isAdaptableOperand(lhs)) {
     const h = ctxOf(rl.type);
     if (h !== null) ra = resolve(scope, array, h, ag, params);
   }
   // If the array resolved to E[] and `x` is an adaptable bare literal, adapt `x` to E (with a range
-  // check) — exactly the operand pairing `=` uses (`5 = ANY(int32[]_col)` lands `x` on int32).
+  // check) — exactly the operand pairing `=` uses (`5 = ANY(i32[]_col)` lands `x` on i32).
   if (ra.type.kind === "array" && isAdaptableOperand(lhs)) {
     const h = elemScalarHint(ra.type.elem);
     if (h !== null) rl = resolve(scope, lhs, h, ag, params);
@@ -8473,9 +8473,9 @@ function binaryOpSymbol(op: BinaryOp): string {
 
 // resolveOperandPair resolves the two operands of a binary operator, giving a bare
 // *integer* literal the other operand's integer type as context (so `small + 1` types `1`
-// as int16, and `small + 100000` traps 22003 at resolve). A text literal needs no context
+// as i16, and `small + 100000` traps 22003 at resolve). A text literal needs no context
 // (it is always text); when the sibling is text, an integer literal gets no integer context
-// (intTypeOf returns null) and defaults to int64 — the caller's family check then reports
+// (intTypeOf returns null) and defaults to i64 — the caller's family check then reports
 // the mismatch. This does NOT enforce a family — resolveIntPair (arithmetic) and
 // classifyComparable (comparison) layer that on top.
 function resolveOperandPair(
@@ -8490,8 +8490,8 @@ function resolveOperandPair(
   let l: { node: RExpr; type: ResolvedType };
   let r: { node: RExpr; type: ResolvedType };
   if (lhsLit && rhsLit) {
-    l = resolve(scope, lhs, "int64", ag, params);
-    r = resolve(scope, rhs, "int64", ag, params);
+    l = resolve(scope, lhs, "i64", ag, params);
+    r = resolve(scope, rhs, "i64", ag, params);
   } else if (lhsLit) {
     r = resolve(scope, rhs, null, ag, params);
     l = resolve(scope, lhs, ctxOf(r.type), ag, params);
@@ -8557,9 +8557,9 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
     throw typeError("cannot compare a text value with a numeric value");
   }
   // float is a STRICT island (float.md §3/§6): float compares ONLY with float (either width — a
-  // mixed-width pair promotes to float64) or NULL. float vs int/decimal/text/anything-else is a
+  // mixed-width pair promotes to f64) or NULL. float vs int/decimal/text/anything-else is a
   // 42804 — NOT comparable (PG promotes the other operand; jed requires an explicit cast, a
-  // documented divergence). The pair is promoted to float64 in resolveBinary before eval.
+  // documented divergence). The pair is promoted to f64 in resolveBinary before eval.
   const floatL = lt.kind === "float";
   const floatR = rt.kind === "float";
   if (floatL !== floatR && lt.kind !== "null" && rt.kind !== "null") {
@@ -8615,7 +8615,7 @@ function isAdaptableOperand(e: Expr): boolean {
 // ctxOf returns the type a sibling operand offers an adaptable operand. For an integer literal
 // this is the integer width it adopts; for a string literal, bytea/uuid/text (so it can decode
 // the hex/uuid input); a bind parameter additionally adopts a decimal/boolean sibling (a literal
-// ignores those — its arm keeps int64/text — so widening the mapping is safe). Only a bare NULL
+// ignores those — its arm keeps i64/text — so widening the mapping is safe). Only a bare NULL
 // offers no context (spec/design/api.md §5).
 function ctxOf(t: ResolvedType): ScalarType | null {
   if (t.kind === "int") return t.ty;
@@ -8672,7 +8672,7 @@ const allAsciiDigits = (s: string): boolean => /^[0-9]+$/.test(s);
 // floatFromDecimalLiteral converts an untyped decimal/integer literal adapting to a float context
 // into a float constant (float.md §4): the nearest binary64 to the exact decimal value (round-
 // ties-to-even — JS Number(...) of the canonical decimal string is exactly the IEEE conversion),
-// then Math.fround if the context width is float32. The exact-decimal cap-check is NOT applied: a
+// then Math.fround if the context width is f32. The exact-decimal cap-check is NOT applied: a
 // literal adapting to a float column is a float value, not a stored decimal. A magnitude beyond the
 // binary64 range becomes ±Infinity here — but a finite literal is meant, so an out-of-range literal
 // traps 22003 (the finite-overflow rule, §3) rather than silently yielding Infinity.
@@ -8680,7 +8680,7 @@ function floatFromDecimalLiteral(d: Decimal, ty: ScalarType): { node: RExpr; typ
   const exact = Number(d.render());
   if (!Number.isFinite(exact)) throw overflow(ty);
   const n = roundToWidth(ty, exact);
-  if (!Number.isFinite(n)) throw overflow(ty); // float32 rounding pushed a finite double to ±Inf
+  if (!Number.isFinite(n)) throw overflow(ty); // f32 rounding pushed a finite double to ±Inf
   return { node: { kind: "constFloat", ty, value: n }, type: { kind: "float", ty } };
 }
 
@@ -8713,8 +8713,8 @@ function coerceStringLiteral(
       return { node: { kind: "constText", value: s }, type: { kind: "text" } };
     case "boolean":
       return { node: { kind: "constBool", value: parseBoolLiteral(s) }, type: { kind: "bool" } };
-    case "float32":
-    case "float64": {
+    case "f32":
+    case "f64": {
       const n = parseFloatLiteral(s, target);
       return { node: { kind: "constFloat", ty: target, value: n }, type: { kind: "float", ty: target } };
     }
@@ -8724,7 +8724,7 @@ function coerceStringLiteral(
       return { node: { kind: "constDecimal", value: d }, type: { kind: "decimal" } };
     }
     default: {
-      // int16 / int32 / int64
+      // i16 / i32 / i64
       const n = parseIntLiteral(s, target);
       return { node: { kind: "constInt", value: n }, type: { kind: "int", ty: target } };
     }
@@ -8897,7 +8897,7 @@ function parseBoolLiteral(s: string): boolean {
   }
 }
 
-// FLOAT_GRAMMAR is jed's float64 string-input grammar (float.md §4 — PG's float8in subset): an
+// FLOAT_GRAMMAR is jed's f64 string-input grammar (float.md §4 — PG's float8in subset): an
 // optional sign, then either a finite decimal (digits with an optional point and optional
 // e-notation) or one of the special words. It is validated explicitly — NOT via parseFloat, which
 // is too lenient (it accepts "1.5xyz", leading junk after trim, etc.). Anchored to the whole
@@ -8905,10 +8905,10 @@ function parseBoolLiteral(s: string): boolean {
 const FLOAT_FINITE = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
 
 // parseFloatLiteral parses a string literal's content as a float of type ty — the text→float
-// coercion for `float '1.5'` / `real '1e10'` / CAST('Infinity' AS float64) (float.md §4). Grammar:
+// coercion for `float '1.5'` / `real '1e10'` / CAST('Infinity' AS f64) (float.md §4). Grammar:
 // trimmed ASCII whitespace (the shared LIT_WS), optional sign, finite decimal with optional point
 // and e-notation, OR the case-insensitive specials Infinity/+Infinity/-Infinity/inf/+inf/-inf/NaN.
-// Malformed input → 22P02; a finite value outside the binary64 range → 22003. For float32 the
+// Malformed input → 22P02; a finite value outside the binary64 range → 22003. For f32 the
 // parsed binary64 is Math.fround'd; a finite value that frounds to ±Inf (beyond binary32 range)
 // also traps 22003. NaN/±Infinity are first-class here (they enter ONLY via this path, casts, or
 // stored values — float.md §3).
@@ -8934,7 +8934,7 @@ function parseFloatLiteral(s: string, ty: ScalarType): number {
       special = -Infinity;
       break;
   }
-  if (special !== undefined) return ty === "float32" ? Math.fround(special) : special;
+  if (special !== undefined) return ty === "f32" ? Math.fround(special) : special;
   if (!FLOAT_GRAMMAR_OK(t)) throw invalid();
   // Number(...) does the IEEE-correct decimal→binary64 conversion (round-ties-to-even). The grammar
   // already rejected junk, so a NaN here would only come from an empty/degenerate string the regex
@@ -8944,7 +8944,7 @@ function parseFloatLiteral(s: string, ty: ScalarType): number {
   // A finite literal that overflows the binary64 range parses to ±Infinity — trap 22003 rather than
   // yield Infinity (Infinity is input-only via the special words above, not via a finite literal).
   if (!Number.isFinite(d)) throw overflow(ty);
-  const n = ty === "float32" ? Math.fround(d) : d;
+  const n = ty === "f32" ? Math.fround(d) : d;
   if (!Number.isFinite(n)) throw overflow(ty); // finite double beyond binary32 range
   return n;
 }
@@ -8955,7 +8955,7 @@ function FLOAT_GRAMMAR_OK(t: string): boolean {
 }
 
 // widenFloatTo wraps a float operand in an explicit widening cast when its width is narrower than
-// the target (float32 → float64 is lossless — float.md §2), so a mixed-width float arithmetic /
+// the target (f32 → f64 is lossless — float.md §2), so a mixed-width float arithmetic /
 // comparison node sees both sides at one width. Identity when from === to. Implemented as a `cast`
 // RExpr (the evaluator's evalCast handles float→float widening), so no new node kind is needed.
 function widenFloatTo(node: RExpr, from: ScalarType, to: ScalarType): RExpr {
@@ -8963,14 +8963,14 @@ function widenFloatTo(node: RExpr, from: ScalarType, to: ScalarType): RExpr {
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the
-// higher-ranked integer type, or int64 when both are untyped NULLs.
+// higher-ranked integer type, or i64 when both are untyped NULLs.
 function promote(a: ResolvedType, b: ResolvedType): ScalarType {
   const ax = intTypeOf(a);
   const bx = intTypeOf(b);
   if (ax !== null && bx !== null) return rank(ax) >= rank(bx) ? ax : bx;
   if (ax !== null) return ax;
   if (bx !== null) return bx;
-  return "int64";
+  return "i64";
 }
 
 // requireNumericOperand requires that an arithmetic operand is numeric (integer or decimal,
@@ -9227,7 +9227,7 @@ function arrayPositionValue(arr: Value, elem: Value, start: Value | null): Value
   return nullValue();
 }
 
-// arrayPositionsValue is array_positions(a, e) (array-functions.md §8): the int32[] of every match's
+// arrayPositionsValue is array_positions(a, e) (array-functions.md §8): the i32[] of every match's
 // subscript (in the array's lower-bound space), the empty array {} if none. NULL array → NULL;
 // 1-D/empty only (a multidimensional array is 0A000).
 function arrayPositionsValue(arr: Value, elem: Value): Value {
@@ -9472,7 +9472,7 @@ function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
     for (const t of nonNull.slice(1)) acc = { kind: "int", ty: promote(acc, t) };
     return acc;
   }
-  // All float: the widest via the float tower (float32 + float64 → float64). A float mixed with a
+  // All float: the widest via the float tower (f32 + f64 → f64). A float mixed with a
   // non-float arm is a cross-family 42804 (caught by the same-family check below — float is a strict
   // island, no int/decimal reconciliation, float.md §6).
   if (nonNull.every((t) => t.kind === "float")) {
@@ -9581,7 +9581,7 @@ function unifySetopColumn(a: ResolvedType, b: ResolvedType, op: SetOpKind): Reso
     // at least one decimal (both-int handled above) -> decimal
     return { kind: "decimal" };
   }
-  // Two floats unify to the widest (the float tower — float32 + float64 → float64; the narrower
+  // Two floats unify to the widest (the float tower — f32 + f64 → f64; the narrower
   // operand's rows are widened in coerceSetopRows). float never reconciles with int/decimal.
   if (a.kind === "float" && b.kind === "float") return { kind: "float", ty: promoteFloat(a.ty, b.ty) };
   if (a.kind === b.kind) return a;
@@ -9602,13 +9602,13 @@ function coerceSetopRows(rows: Value[][], from: ResolvedType[], to: ResolvedType
         if (v.kind === "int") row[i] = decimalValue(Decimal.fromBigInt(v.int));
       }
     }
-    // float32 → float64 widening (lossless): the column unified to float64 but this operand is
-    // float32, so its values become float64 Values (the number is already an exact binary64).
+    // f32 → f64 widening (lossless): the column unified to f64 but this operand is
+    // f32, so its values become f64 Values (the number is already an exact binary64).
     const t = to[i]!;
-    if (from[i]!.kind === "float" && t.kind === "float" && t.ty === "float64") {
+    if (from[i]!.kind === "float" && t.kind === "float" && t.ty === "f64") {
       for (const row of rows) {
         const v = row[i]!;
-        if (v.kind === "float32") row[i] = float64Value(v.value);
+        if (v.kind === "f32") row[i] = float64Value(v.value);
       }
     }
   }
@@ -9717,8 +9717,8 @@ function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): voi
   let ok: boolean;
   if (isInteger(colTy)) ok = t.kind === "int" || t.kind === "null";
   else if (isDecimal(colTy)) ok = t.kind === "int" || t.kind === "decimal" || t.kind === "null";
-  // A float column accepts a float value of EQUAL OR NARROWER width (float32 → float64 widening is
-  // implicit; float64 → float32 needs an explicit CAST — float.md §6) or NULL. No int/decimal.
+  // A float column accepts a float value of EQUAL OR NARROWER width (f32 → f64 widening is
+  // implicit; f64 → f32 needs an explicit CAST — float.md §6) or NULL. No int/decimal.
   else if (isFloat(colTy)) ok = (t.kind === "float" && promoteFloat(t.ty, colTy) === colTy) || t.kind === "null";
   else if (isBool(colTy)) ok = t.kind === "bool" || t.kind === "null";
   else if (isBytea(colTy)) ok = t.kind === "bytea" || t.kind === "null";
@@ -9785,30 +9785,30 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
       if (isDecimal(colTy)) return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
       // An integer LITERAL adapts to a float column (float.md §4 literal adaptation — INSERT VALUES /
       // DEFAULT bypass the expression resolver, so the adaptation lands here, like text→bytea). This
-      // is literal adaptation, NOT an implicit cross-family cast of a value (storing a float64 into a
-      // float32 is still rejected below). Out of binary range → 22003 (the finite-overflow rule).
+      // is literal adaptation, NOT an implicit cross-family cast of a value (storing a f64 into a
+      // f32 is still rejected below). Out of binary range → 22003 (the finite-overflow rule).
       if (isFloat(colTy)) return makeFloat(colTy, Number(v.int));
       throw typeError("cannot store an integer value in " + canonicalName(colTy) + " column " + colName);
     case "decimal":
       if (isDecimal(colTy)) return decimalValue(coerceDecimal(v.dec, typmod));
-      // A decimal LITERAL adapts to a float column (float.md §4): nearest binary, fround for float32.
+      // A decimal LITERAL adapts to a float column (float.md §4): nearest binary, fround for f32.
       if (isFloat(colTy)) {
         const d = Number(v.dec.render());
         if (!Number.isFinite(d)) throw overflow(colTy);
         return makeFloat(colTy, d);
       }
       throw typeError("cannot store a decimal value in " + canonicalName(colTy) + " column " + colName);
-    case "float32":
-      // float32 into float32 stores as-is; into float64 widens losslessly (every binary32 is an
+    case "f32":
+      // f32 into f32 stores as-is; into f64 widens losslessly (every binary32 is an
       // exact binary64 — float.md §2). Bits (incl -0/NaN) preserved. No cross-family store.
-      if (colTy === "float32") return v;
-      if (colTy === "float64") return float64Value(v.value);
-      throw typeError("cannot store a float32 value in " + canonicalName(colTy) + " column " + colName);
-    case "float64":
-      // float64 into float64 stores as-is. float64 → float32 is LOSSY (explicit cast required, not a
+      if (colTy === "f32") return v;
+      if (colTy === "f64") return float64Value(v.value);
+      throw typeError("cannot store a f32 value in " + canonicalName(colTy) + " column " + colName);
+    case "f64":
+      // f64 into f64 stores as-is. f64 → f32 is LOSSY (explicit cast required, not a
       // silent store) so it is rejected here (the resolver's assignableTo already gates it 42804).
-      if (colTy === "float64") return v;
-      throw typeError("cannot store a float64 value in " + canonicalName(colTy) + " column " + colName);
+      if (colTy === "f64") return v;
+      throw typeError("cannot store a f64 value in " + canonicalName(colTy) + " column " + colName);
     case "text":
       if (isText(colTy)) return v;
       // A string literal adapts to a bytea column, decoding the hex input (types.md §6/§13);
@@ -10069,7 +10069,7 @@ function rexprConstToValue(e: RExpr): Value {
     case "constInterval":
       return intervalValue(e.value);
     case "constFloat":
-      return e.ty === "float32" ? float32Value(e.value) : float64Value(e.value);
+      return e.ty === "f32" ? float32Value(e.value) : float64Value(e.value);
     default:
       throw typeError("non-constant array element literal");
   }
@@ -10139,8 +10139,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
     case "constInt":
       return intValue(e.value);
     case "constFloat":
-      // The value was already width-rounded at resolve (float32 frounded); rebuild the Value.
-      return e.ty === "float32" ? float32Value(e.value) : float64Value(e.value);
+      // The value was already width-rounded at resolve (f32 frounded); rebuild the Value.
+      return e.ty === "f32" ? float32Value(e.value) : float64Value(e.value);
     case "constBool":
       return { kind: "bool", value: e.value };
     case "constText":
@@ -10215,11 +10215,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         return decimalValue((v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec).negate());
       }
       if (isFloat(e.result)) {
-        // Negation flips the sign (no overflow); -NaN is NaN, -Inf is -Inf per IEEE. float32 stays
+        // Negation flips the sign (no overflow); -NaN is NaN, -Inf is -Inf per IEEE. f32 stays
         // binary32 (negation never changes the width's representability, but fround keeps the path
         // uniform). float.md §5.
-        if (v.kind !== "float32" && v.kind !== "float64") throw typeError("internal: non-float unary minus");
-        return e.result === "float32" ? float32Value(-v.value) : float64Value(-v.value);
+        if (v.kind !== "f32" && v.kind !== "f64") throw typeError("internal: non-float unary minus");
+        return e.result === "f32" ? float32Value(-v.value) : float64Value(-v.value);
       }
       if (v.kind !== "int") throw typeError("internal: boolean unary minus");
       const n = -v.int;
@@ -10288,9 +10288,9 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       if (isFloat(e.result)) {
         // Float arithmetic: the resolver promoted both operands to e.result's width (mixed-width
-        // pairs were cast to float64), so both are the same float kind here. One IEEE op per node
+        // pairs were cast to f64), so both are the same float kind here. One IEEE op per node
         // (no FMA fusion — structural in the tree walker, float.md §5).
-        if ((a.kind !== "float32" && a.kind !== "float64") || (b.kind !== "float32" && b.kind !== "float64")) {
+        if ((a.kind !== "f32" && a.kind !== "f64") || (b.kind !== "f32" && b.kind !== "f64")) {
           throw typeError("internal: non-float arithmetic");
         }
         return evalFloatArith(e.op, a.value, b.value, e.result);
@@ -10393,10 +10393,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         vals.push(v);
       }
       if (e.func === "make_interval") {
-        // make_interval — six integer components plus the float64 secs. years/months → months
+        // make_interval — six integer components plus the f64 secs. years/months → months
         // field (×12), weeks/days → days field (×7), hours/mins/secs → micros; an i32/i64 field
         // overflow traps 22008 (functions.md §11). The one float step (secs → micros) is
-        // correctly-rounded + deterministic, so the interval is in-contract. A float32 secs reads
+        // correctly-rounded + deterministic, so the interval is in-contract. A f32 secs reads
         // as its exact f64 value (.value holds the binary64 of either width).
         const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
         const secMicros = f64ToMicros((vals[6] as { value: number }).value);
@@ -10461,11 +10461,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the
       // catalog, only abs is operand-typed (result "promoted"); every other float func returns
-      // float64 (result "float64") — so the result Value's width is e.result, not argWidth. The
-      // computation is done in binary64; abs frounds for a float32 result via e.result.
-      if (v0.kind === "float32" || v0.kind === "float64") {
+      // f64 (result "f64") — so the result Value's width is e.result, not argWidth. The
+      // computation is done in binary64; abs frounds for a f32 result via e.result.
+      if (v0.kind === "f32" || v0.kind === "f64") {
         if (e.func === "pow") {
-          // pow(x, y): both operands are float (promoted to one width at resolve); result float64.
+          // pow(x, y): both operands are float (promoted to one width at resolve); result f64.
           const v1 = vals[1] as { value: number };
           return evalFloatPow(v0.value, v1.value, e.result);
         }
@@ -10476,7 +10476,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.func === "abs") {
         if (v0.kind === "int") {
           // abs over an integer: |x| then range-check at the result type's boundary
-          // (abs(int16 -32768) → 22003), exactly like neg.
+          // (abs(i16 -32768) → 22003), exactly like neg.
           let n = v0.int;
           if (n < 0n) n = -n;
           if (!inRange(e.result, n)) throw overflow(e.result);
@@ -10598,7 +10598,7 @@ function quantifiedMembership(op: BinaryOp, all: boolean, lv: Value, av: Value, 
 }
 
 // quantifiedCmp3 is the per-element three-valued comparison `lhs op e` for a quantified node,
-// normalizing a mixed-width float pair to float64 first (the resolver admits float32 vs float64,
+// normalizing a mixed-width float pair to f64 first (the resolver admits f32 vs f64,
 // matching the compare node's promote — here the array elements are runtime values, so the widen
 // happens per element). Bottoms out in the value module's eq3/lt3/gt3 kernels.
 //
@@ -10635,8 +10635,8 @@ function quantifiedCmp3(op: BinaryOp, x: Value, e: Value): ThreeValued {
     }
     return matched ? "true" : "false";
   }
-  if (x.kind === "float32" && e.kind === "float64") x = float64Value(x.value);
-  else if (x.kind === "float64" && e.kind === "float32") e = float64Value(e.value);
+  if (x.kind === "f32" && e.kind === "f64") x = float64Value(x.value);
+  else if (x.kind === "f64" && e.kind === "f32") e = float64Value(e.value);
   switch (op) {
     case "eq":
       return eq3(x, e);
@@ -10711,8 +10711,8 @@ function likeMatch(subject: string, pattern: string): boolean {
 }
 
 // evalArith computes an integer op with exact bigint, throwing 22012 on a zero divisor
-// and 22003 if the result falls outside the declared result type (the int16+int16 →
-// int16 boundary — spec/design/functions.md §7). The MinInt64/-1 cases trap to match the
+// and 22003 if the result falls outside the declared result type (the i16+i16 →
+// i16 boundary — spec/design/functions.md §7). The MinInt64/-1 cases trap to match the
 // Rust/Go checked-op behaviour (bigint would not overflow on its own).
 function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Value {
   let v: bigint;
@@ -10735,7 +10735,7 @@ function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Valu
       if (y === 0n) throw engineError("division_by_zero", "division by zero");
       // `x % -1` is mathematically 0 for every x; bigint computes it as 0n exactly (no
       // overflow). Unlike division, modulo by -1 has no out-of-range result, so it does NOT
-      // trap — matching PostgreSQL and the int16/int32 widths (spec/design/types.md §3).
+      // trap — matching PostgreSQL and the i16/i32 widths (spec/design/types.md §3).
       v = x % y; // bigint remainder takes the dividend's sign
       break;
   }
@@ -10748,12 +10748,12 @@ function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Valu
 //     trap, only NaN/0 propagates to NaN (matching PG);
 //   - a FINITE op whose true result overflows the float range to ±Inf traps 22003 (e.g. 1e308*10);
 //   - an Inf/NaN OPERAND otherwise propagates by IEEE (Inf+1=Inf, Inf-Inf=NaN, NaN*0=NaN) — no trap.
-// For float32 every result is Math.fround'd (true binary32 rounding — the TS-specific discipline);
+// For f32 every result is Math.fround'd (true binary32 rounding — the TS-specific discipline);
 // the overflow check is then re-applied because fround can push a finite double past binary32 range.
 // `%` is IEEE remainder via JS `%` (which is fmod — truncated, dividend's sign), exact, never
 // overflows.
 function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType): Value {
-  const f32 = result === "float32";
+  const f32 = result === "f32";
   const finiteInputs = Number.isFinite(x) && Number.isFinite(y);
   let r: number;
   switch (op) {
@@ -10784,15 +10784,15 @@ function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType):
 }
 
 // evalFloatFunc evaluates a unary float scalar function (float.md §8) over a float value `x`,
-// producing a value of width `result` (always float64 here except abs, whose result is the operand
+// producing a value of width `result` (always f64 here except abs, whose result is the operand
 // width). `places` is the second argument of round(x, n) (ignored by the others). An Inf/NaN operand
 // propagates through the exact functions; the transcendentals call native Math.* (exempted — the R
 // tag absorbs cross-core ULP differences). Domain / overflow errors trap (float.md §8):
 //   sqrt(neg) → 22003; ln(0)/ln(neg) → 22003; exp overflow → 22003; sin/cos/tan never trap.
 function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: ScalarType): Value {
   const out = (r: number): Value => {
-    // result is float64 for all but abs; abs's result is the operand width, so fround for float32.
-    if (result === "float32") {
+    // result is f64 for all but abs; abs's result is the operand width, so fround for f32.
+    if (result === "f32") {
       const f = Math.fround(r);
       // abs cannot overflow (|finite| stays finite at the same width); a NaN/Inf propagates.
       return float32Value(f);
@@ -10842,20 +10842,20 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
   }
 }
 
-// evalFloatPow evaluates pow(x, y) → float64 (float.md §8): native Math.pow (transcendental,
+// evalFloatPow evaluates pow(x, y) → f64 (float.md §8): native Math.pow (transcendental,
 // exempted), trapping 22003 on a finite-input overflow to ±Inf (e.g. pow(10, 400)); a NaN/±Inf
-// operand propagates per IEEE. result is float64 (the catalog), so no fround.
+// operand propagates per IEEE. result is f64 (the catalog), so no fround.
 function evalFloatPow(x: number, y: number, result: ScalarType): Value {
   const r = Math.pow(x, y);
   if (Number.isFinite(x) && Number.isFinite(y) && !Number.isFinite(r)) throw overflow(result);
-  return result === "float32" ? float32Value(Math.fround(r)) : float64Value(r);
+  return result === "f32" ? float32Value(Math.fround(r)) : float64Value(r);
 }
 
 // roundFloatHalfAway rounds a float to `places` decimal places, HALF AWAY FROM ZERO (jed's one
 // mode — float.md §8). For an Inf/NaN it returns the value unchanged (propagation). It scales by
 // 10^places, rounds half-away (negatives by magnitude — Math.round is half-UP, wrong for ties), then
-// unscales. Done in binary64; the caller frounds for a float32 result of round (catalog result is
-// float64, so in practice no fround). Note: this is approximate at the binary level (the scale
+// unscales. Done in binary64; the caller frounds for a f32 result of round (catalog result is
+// f64, so in practice no fround). Note: this is approximate at the binary level (the scale
 // factor is not exactly representable) — acceptable since float rounding is in the R-tag surface.
 function roundFloatHalfAway(x: number, places: number): number {
   if (!Number.isFinite(x)) return x;
@@ -10871,8 +10871,8 @@ function roundFloatHalfAway(x: number, places: number): number {
 function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): Value {
   if (v.kind === "int") {
     if (isDecimal(target)) return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
-    // int → float (explicit, lossy): nearest binary representable, then fround for float32. Exact
-    // for |int| ≤ 2^53; a larger int64 may round. Never traps (float.md §6).
+    // int → float (explicit, lossy): nearest binary representable, then fround for f32. Exact
+    // for |int| ≤ 2^53; a larger i64 may round. Never traps (float.md §6).
     if (isFloat(target)) return makeFloat(target, Number(v.int));
     if (!inRange(target, v.int)) throw overflow(target);
     return intValue(v.int);
@@ -10891,8 +10891,8 @@ function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): V
     if (n === null || !inRange(target, n)) throw overflow(target);
     return intValue(n);
   }
-  if (v.kind === "float32" || v.kind === "float64") {
-    // float → float (the tower): float32 → float64 lossless (widen); float64 → float32 frounds
+  if (v.kind === "f32" || v.kind === "f64") {
+    // float → float (the tower): f32 → f64 lossless (widen); f64 → f32 frounds
     // (lossy), trapping 22003 if a finite double rounds beyond binary32 range. float→float never
     // converts a NaN/±Inf to an error — those are first-class values that propagate (float.md §6).
     if (isFloat(target)) return makeFloatCast(target, v.value);
@@ -10911,7 +10911,7 @@ function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): V
     if (isDecimal(target)) {
       if (!Number.isFinite(v.value)) throw overflow(target);
       const exact =
-        v.kind === "float32" ? Decimal.exactFromFloat32(v.value) : Decimal.exactFromFloat64(v.value);
+        v.kind === "f32" ? Decimal.exactFromFloat32(v.value) : Decimal.exactFromFloat64(v.value);
       return decimalValue(coerceDecimal(exact, typmod));
     }
     throw typeError("internal: unsupported float cast target");
@@ -10920,19 +10920,19 @@ function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): V
 }
 
 // makeFloat builds a float Value at `ty`, trapping 22003 if a finite-source value rounds to ±Inf
-// (the finite-overflow rule; the source here is already finite — only float32 rounding can push a
+// (the finite-overflow rule; the source here is already finite — only f32 rounding can push a
 // finite double beyond binary32 range). Used by int/decimal → float.
 function makeFloat(ty: ScalarType, n: number): Value {
-  const r = ty === "float32" ? Math.fround(n) : n;
+  const r = ty === "f32" ? Math.fround(n) : n;
   if (!Number.isFinite(r)) throw overflow(ty);
-  return ty === "float32" ? float32Value(r) : float64Value(r);
+  return ty === "f32" ? float32Value(r) : float64Value(r);
 }
 
 // makeFloatCast builds a float Value at `ty` from a float SOURCE value, where a NaN/±Inf source is
 // preserved (it propagates — float→float is not a finite operation). Only a FINITE double that
 // frounds past binary32 range traps 22003. Used by float → float casts.
 function makeFloatCast(ty: ScalarType, n: number): Value {
-  if (ty === "float64") return float64Value(n);
+  if (ty === "f64") return float64Value(n);
   const r = Math.fround(n);
   // A finite double beyond binary32 range frounds to ±Inf → trap; a NaN/±Inf source stays as-is.
   if (Number.isFinite(n) && !Number.isFinite(r)) throw overflow(ty);
@@ -11039,15 +11039,15 @@ function valueCmp(a: Value, b: Value): number {
   if (a.kind === "decimal" && b.kind === "decimal") return a.dec.cmpValue(b.dec);
   // Floats by the TOTAL order (-0 == +0, NaN == NaN, NaN largest — float.md §3). ORDER BY / MIN /
   // MAX / DISTINCT over a float column reach here with same-width values (one typed column).
-  if (a.kind === "float32" && b.kind === "float32") return floatTotalCmp(a.value, b.value);
-  if (a.kind === "float64" && b.kind === "float64") return floatTotalCmp(a.value, b.value);
+  if (a.kind === "f32" && b.kind === "f32") return floatTotalCmp(a.value, b.value);
+  if (a.kind === "f64" && b.kind === "f64") return floatTotalCmp(a.value, b.value);
   if (a.kind === "text" && b.kind === "text") return compareTextC(a.text, b.text);
   if (a.kind === "bytea" && b.kind === "bytea") return compareBytea(a.bytes, b.bytes);
   if (a.kind === "uuid" && b.kind === "uuid") return compareBytea(a.bytes, b.bytes);
   if (a.kind === "bool" && b.kind === "bool") {
     return a.value === b.value ? 0 : a.value ? 1 : -1;
   }
-  // Timestamps order by the int64 instant (-infinity < finite < infinity).
+  // Timestamps order by the i64 instant (-infinity < finite < infinity).
   if (a.kind === "timestamp" && b.kind === "timestamp") {
     return a.micros < b.micros ? -1 : a.micros > b.micros ? 1 : 0;
   }
@@ -11107,9 +11107,9 @@ function familyRank(v: Value): number {
       return 2;
     case "decimal":
       return 3;
-    case "float32":
+    case "f32":
       return 4;
-    case "float64":
+    case "f64":
       return 5;
     case "text":
       return 6;

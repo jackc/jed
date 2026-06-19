@@ -90,7 +90,7 @@ function intOf(v: Value): bigint {
 // page_size 256 to span several pages and cross the preallocation threshold (so file growth is exercised
 // identically on both hosts).
 const WORKLOAD: string[] = [
-  "CREATE TABLE t (k int32 PRIMARY KEY, v text, n int64)",
+  "CREATE TABLE t (k i32 PRIMARY KEY, v text, n i64)",
   "BEGIN",
   ...Array.from({ length: 80 }, (_, k) => `INSERT INTO t VALUES (${k}, 'row-${k}', ${k * 1000})`),
   "COMMIT",

@@ -1,4 +1,4 @@
-//! The `float32` / `float64` IEEE 754 types, end to end through `execute`
+//! The `f32` / `f64` IEEE 754 types, end to end through `execute`
 //! (spec/design/float.md). The cross-core contract is asserted on the RENDERED output (the `R`
 //! tag tolerates layout, but these finite values render identically), the total order, the trap
 //! model, strict-island coercion, the casts, the canonical-order-fold SUM/AVG, and a transcendental.
@@ -51,38 +51,36 @@ fn err_code(db: &mut Database, sql: &str) -> String {
 
 #[test]
 fn aliases_resolve_and_rejected_spellings_fail() {
-    // `real` → float32; `float` → float64 (the single-word aliases the parser accepts; the
+    // `real` → f32; `float` → f64 (the single-word aliases the parser accepts; the
     // two-word `double precision` is a from_name alias but, like `timestamp without time zone`,
     // not produced by this slice's single-identifier type parser — a documented narrowing).
-    // PG's float8/float4/float(p) are NOT accepted (we own our surface).
+    // PG's byte-shorthand float8 → f64 / float4 → f32 IS accepted (the f prefix keeps jed's
+    // bit-namespace disjoint from PG's byte-namespace — CLAUDE.md §1/§4); the `float(p)`
+    // precision typmod is still NOT accepted.
     let mut db = db_with(&[
         "CREATE TABLE t (a real, b float)",
         "INSERT INTO t VALUES (1.5, 2.5)",
     ]);
-    assert_eq!(
-        col_types(&mut db, "SELECT a, b FROM t"),
-        vec!["float32", "float64"]
-    );
+    assert_eq!(col_types(&mut db, "SELECT a, b FROM t"), vec!["f32", "f64"]);
     // The canonical ids resolve too.
-    let mut db2 = db_with(&["CREATE TABLE t (a float32, b float64)"]);
-    assert_eq!(
-        col_types(&mut db2, "SELECT * FROM t"),
-        vec!["float32", "float64"]
-    );
-    assert!(execute(&mut db, "CREATE TABLE u (x float8)").is_err());
-    assert!(execute(&mut db, "CREATE TABLE u (x float4)").is_err());
+    let mut db2 = db_with(&["CREATE TABLE t (a f32, b f64)"]);
+    assert_eq!(col_types(&mut db2, "SELECT * FROM t"), vec!["f32", "f64"]);
+    // PG byte-shorthand resolves: float4 → f32, float8 → f64.
+    let mut db3 = db_with(&["CREATE TABLE t (a float4, b float8)"]);
+    assert_eq!(col_types(&mut db3, "SELECT * FROM t"), vec!["f32", "f64"]);
+    // The `float(p)` precision typmod is still rejected.
     assert!(execute(&mut db, "CREATE TABLE u (x float(10))").is_err());
 }
 
 #[test]
 fn mixed_width_arithmetic_promotes_to_float64() {
     let mut db = db_with(&[
-        "CREATE TABLE t (f float64, g float32)",
+        "CREATE TABLE t (f f64, g f32)",
         "INSERT INTO t VALUES (1.5, 2.5)",
     ]);
-    // float32 + float64 → float64 (the tower); float32 + float32 stays float32.
-    assert_eq!(col_types(&mut db, "SELECT f + g FROM t"), vec!["float64"]);
-    assert_eq!(col_types(&mut db, "SELECT g + g FROM t"), vec!["float32"]);
+    // f32 + f64 → f64 (the tower); f32 + f32 stays f32.
+    assert_eq!(col_types(&mut db, "SELECT f + g FROM t"), vec!["f64"]);
+    assert_eq!(col_types(&mut db, "SELECT g + g FROM t"), vec!["f32"]);
     assert_eq!(one(&mut db, "SELECT f + g FROM t"), "4");
 }
 
@@ -93,9 +91,9 @@ fn mixed_width_arithmetic_promotes_to_float64() {
 #[test]
 fn distinct_and_group_by_collapse_neg_zero_and_nan() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, f float64)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, f f64)",
         "INSERT INTO t VALUES (1, 0.0), (2, 0.0), (3, 0.0), (4, 0.0), (5, 1.5)",
-        "UPDATE t SET f = -CAST(0.0 AS float64) WHERE id = 2", // -0.0
+        "UPDATE t SET f = -CAST(0.0 AS f64) WHERE id = 2", // -0.0
         "UPDATE t SET f = float 'NaN' WHERE id = 3",
         "UPDATE t SET f = float 'NaN' WHERE id = 4", // a second NaN
     ]);
@@ -123,7 +121,7 @@ fn rendering_of_special_values() {
     assert_eq!(one(&mut db, "SELECT float '-Infinity'"), "-Infinity");
     assert_eq!(one(&mut db, "SELECT float 'NaN'"), "NaN");
     // -0 renders -0 (a genuine float negative zero, via negation of +0).
-    assert_eq!(one(&mut db, "SELECT -CAST(0.0 AS float64)"), "-0");
+    assert_eq!(one(&mut db, "SELECT -CAST(0.0 AS f64)"), "-0");
     // The case-insensitive special spellings all parse.
     assert_eq!(one(&mut db, "SELECT float 'inf'"), "Infinity");
     assert_eq!(one(&mut db, "SELECT float '-inf'"), "-Infinity");

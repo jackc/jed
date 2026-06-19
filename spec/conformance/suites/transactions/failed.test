@@ -5,10 +5,10 @@
 # is discarded — including statements that SUCCEEDED before the error. The error that aborts the
 # block here is a duplicate primary key (23505). Format + the `requires` directive:
 # ../../../design/conformance.md.
-# requires: txn.failed_state, txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.int32
+# requires: txn.failed_state, txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.i32
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY)
+CREATE TABLE t (id i32 PRIMARY KEY)
 
 statement ok
 INSERT INTO t VALUES (1)

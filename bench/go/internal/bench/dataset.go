@@ -33,7 +33,7 @@ type Table struct {
 // Column is one generated column.
 type Column struct {
 	Name       string `toml:"name"`
-	Type       string `toml:"type"` // int64 | int32 | int16 | text
+	Type       string `toml:"type"` // i64 | i32 | i16 | text
 	Gen        string `toml:"gen"`  // serial | int_uniform | text
 	PrimaryKey bool   `toml:"primary_key"`
 	Min        int64  `toml:"min"`
@@ -91,11 +91,11 @@ func columnType(engine string, c Column) string {
 	switch engine {
 	case "jed", "postgres":
 		switch c.Type {
-		case "int64":
+		case "i64":
 			return "bigint"
-		case "int32":
+		case "i32":
 			return "integer"
-		case "int16":
+		case "i16":
 			return "smallint"
 		case "text":
 			return "text"
@@ -131,7 +131,7 @@ func (t *Table) DDL(engine string) []string {
 
 // RowStream generates the table's rows in the deterministic order of the contract
 // (§4): one splitmix64 stream per table, rows 1..N, non-serial columns drawn in
-// declared column order. Values are int64 or string.
+// declared column order. Values are i64 or string.
 type RowStream struct {
 	table *Table
 	prng  *Prng

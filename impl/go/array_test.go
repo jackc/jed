@@ -1,6 +1,6 @@
 package jed
 
-// Array types (spec/design/array.md) — the S1–S4 vertical slice: a structural int32[] column, the
+// Array types (spec/design/array.md) — the S1–S4 vertical slice: a structural i32[] column, the
 // ARRAY[…] constructor + the '{…}' literal, the compact value codec (S2), btree-NULL element
 // comparison / ORDER BY / DISTINCT (S4), and array_out rendering. Mirrors impl/rust/tests/array.rs.
 
@@ -31,7 +31,7 @@ func errArray(t *testing.T, db *Database, sql string) string {
 
 func TestArrayImageRoundtrip(t *testing.T) {
 	db := NewDatabase()
-	runArray(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])")
+	runArray(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])")
 	runArray(t, db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])")
 	runArray(t, db, "INSERT INTO t VALUES (2, ARRAY[1, NULL, 3], '{}')")
 	runArray(t, db, "INSERT INTO t VALUES (3, NULL, NULL)")
@@ -63,8 +63,8 @@ func TestArrayImageRoundtrip(t *testing.T) {
 // layers; subscript yields the composite, field access reads into it, a slice yields addr[].
 func TestArrayOfCompositeRoundtripAndAccess(t *testing.T) {
 	db := NewDatabase()
-	runArray(t, db, "CREATE TYPE addr AS (street text, zip int32)")
-	runArray(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])")
+	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
+	runArray(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])")
 	runArray(t, db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`)
 	runArray(t, db, "INSERT INTO t VALUES (2, ARRAY[ROW('Other, Ln', 12)])")
 	runArray(t, db, `INSERT INTO t VALUES (3, '{"(Main,)",NULL}')`)
@@ -93,8 +93,8 @@ func TestArrayOfCompositeRoundtripAndAccess(t *testing.T) {
 // cross-core golden).
 func TestArrayOfCompositeImageRoundtrip(t *testing.T) {
 	db := NewDatabase()
-	runArray(t, db, "CREATE TYPE addr AS (street text, zip int32)")
-	runArray(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])")
+	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
+	runArray(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])")
 	runArray(t, db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`)
 	runArray(t, db, `INSERT INTO t VALUES (2, '{"(Main,)",NULL}')`)
 	runArray(t, db, "INSERT INTO t VALUES (3, NULL)")
@@ -123,7 +123,7 @@ func TestArrayOfCompositeImageRoundtrip(t *testing.T) {
 // elements have NULL fields (spec/design/array.md §5, oracle-pinned).
 func TestArrayOfCompositeNullFieldOrderingOperators(t *testing.T) {
 	db := NewDatabase()
-	runArray(t, db, "CREATE TYPE addr AS (street text, zip int32)")
+	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	got := queryRendered(t, db, `SELECT '{"(1,)"}'::addr[] <= '{"(1,)"}'::addr[], `+
 		`'{"(1,)"}'::addr[] >= '{"(1,)"}'::addr[], `+
 		`'{"(1,)"}'::addr[] < '{"(1,)"}'::addr[]`)
@@ -141,7 +141,7 @@ func TestArrayOfCompositeNullFieldOrderingOperators(t *testing.T) {
 // the new element type does not relax the key gate.
 func TestArrayOfCompositePrimaryKeyIs0A000(t *testing.T) {
 	db := NewDatabase()
-	runArray(t, db, "CREATE TYPE addr AS (street text, zip int32)")
+	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	if code := errArray(t, db, "CREATE TABLE t (items addr[] PRIMARY KEY)"); code != "0A000" {
 		t.Fatalf("composite-array PK: got %s, want 0A000", code)
 	}

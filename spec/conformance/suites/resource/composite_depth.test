@@ -5,7 +5,7 @@
 # (input_size_limit.test) gates.
 #
 # Why it needs its own gate: a chain of cheap CREATE TYPEs each nesting the previous (`c1 AS (x
-# int32)`, `c2 AS (x c1)`, …) builds unbounded composite-nesting depth across MANY statements. The
+# i32)`, `c2 AS (x c1)`, …) builds unbounded composite-nesting depth across MANY statements. The
 # per-statement input-size cap never sees it (each statement is tiny), and the parser nesting counter
 # never sees it either (the depth is a property of the catalog GRAPH, resolved at use/codec time, not
 # any one statement's AST). But every derived recursive walk — the value codec, the comparator,
@@ -22,13 +22,13 @@
 #
 # jed-SPECIFIC (PG bounds composite nesting only by a runtime stack probe, not a fixed deterministic
 # limit), so the 54001 records are NOT oracle-checked.
-# requires: types.composite, types.array, types.composite_array_field, types.int32, resource.composite_depth_limit
+# requires: types.composite, types.array, types.composite_array_field, types.i32, resource.composite_depth_limit
 
 # === Boundary: depth 32 is the deepest ACCEPTED composite type. ===
 # Build the chain c1 (depth 1) … c32 (depth 32), one nesting level per CREATE TYPE.
 
 statement ok
-CREATE TYPE c1 AS (x int32)
+CREATE TYPE c1 AS (x i32)
 
 statement ok
 CREATE TYPE c2 AS (x c1)
@@ -127,7 +127,7 @@ CREATE TYPE c32 AS (x c31)
 # A depth-32 type is fully usable: declaring a column of it walks resolve_col_type 32 levels deep
 # without overflow — proof the limit leaves the derived walks safe at the boundary.
 statement ok
-CREATE TABLE deep32 (id int32 PRIMARY KEY, v c32)
+CREATE TABLE deep32 (id i32 PRIMARY KEY, v c32)
 
 # === One level over (depth 33) aborts with 54001 at CREATE TYPE — the producer gate. ===
 

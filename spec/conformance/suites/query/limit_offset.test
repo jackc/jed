@@ -6,10 +6,10 @@
 # window charges storage_row_read + its filter ops but no row_produced/projection cost. The
 # count is a non-negative integer literal; a negative value is a deterministic parse-time data
 # error (2201W for LIMIT, 2201X for OFFSET) raised before any scan.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.limit, query.offset, types.int32, dml.insert_multi_row, query.point_lookup, query.limit_short_circuit, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.limit, query.offset, types.i32, dml.insert_multi_row, query.point_lookup, query.limit_short_circuit, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, val int32)
+CREATE TABLE t (id i32 PRIMARY KEY, val i32)
 
 statement ok
 INSERT INTO t VALUES (1, 10)
@@ -147,7 +147,7 @@ SELECT id FROM t OFFSET 1 OFFSET 2
 # a specific result WITHOUT an ORDER BY — whose subset is otherwise unspecified (CLAUDE.md §8) —
 # `u` gives every row the same `v`, so any 2-row subset is identically {7, 7}.
 statement ok
-CREATE TABLE u (id int32 PRIMARY KEY, v int32)
+CREATE TABLE u (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO u VALUES (1, 7), (2, 7), (3, 7), (4, 7), (5, 7)

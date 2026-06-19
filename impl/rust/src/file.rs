@@ -311,7 +311,7 @@ mod tests {
         // Build a multi-level tree at a small page size, so a few hundred rows span many pages.
         {
             let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
-            execute(&mut db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)").unwrap();
+            execute(&mut db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)").unwrap();
             execute(&mut db, "BEGIN").unwrap(); // one commit, not 600
             for k in 0..n {
                 execute(&mut db, &format!("INSERT INTO t VALUES ({k}, {})", k * 2)).unwrap();
@@ -407,7 +407,7 @@ mod tests {
 
         {
             let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
-            execute(&mut db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)").unwrap();
+            execute(&mut db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)").unwrap();
             execute(&mut db, "BEGIN").unwrap();
             for k in 0..n {
                 execute(&mut db, &format!("INSERT INTO t VALUES ({k}, {})", k + 1)).unwrap();
@@ -464,7 +464,7 @@ mod tests {
 
         {
             let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
-            execute(&mut db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)").unwrap();
+            execute(&mut db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)").unwrap();
             execute(&mut db, "BEGIN").unwrap();
             for k in 0..n {
                 execute(&mut db, &format!("INSERT INTO t VALUES ({k}, {})", k + 1)).unwrap();
@@ -607,7 +607,7 @@ mod tests {
 
         {
             let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
-            execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)").unwrap();
+            execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)").unwrap();
             execute(&mut db, &format!("INSERT INTO t VALUES (1, '{big}')")).unwrap();
             execute(&mut db, "INSERT INTO t VALUES (2, 'small')").unwrap();
             db.close().unwrap();
@@ -677,7 +677,7 @@ mod tests {
         // A from-scratch image is just the empty catalog — far below one chunk — so the file starts
         // un-aligned (create writes exactly page_count pages, no preallocation).
         let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
-        execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)").unwrap();
+        execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)").unwrap();
 
         // One commit big enough to push the tree past a chunk: ~400 rows of a ~3.5 KiB pad ≈ 1.4 MiB
         // of tree, > the 128-page (1 MiB) chunk at the default 8 KiB page size.

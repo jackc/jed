@@ -139,7 +139,7 @@ and like the float `R` tag (host-supplied tolerant compare) when it is not.
 
 ### 4.1 Composite types — safest; derived codec; G2 free (do this first)
 
-`CREATE TYPE addr AS (street text, zip int32)`. The host supplies only the **shape** — a field
+`CREATE TYPE addr AS (street text, zip i32)`. The host supplies only the **shape** — a field
 list of *existing* types (built-in or previously-defined composite). **No host codec code at
 all.** jed derives every method compositionally from fields that are already cross-core-identical:
 
@@ -272,7 +272,7 @@ fine-grained hot kernels. So the recommendation is **registry the many, inline t
   `Type` gains `Extension(TypeId)` / `Composite(TypeId)` arms that dispatch through the registry;
   built-in arms stay inlined `match`. CLAUDE.md §10 ("boring, explicit code; resist deep generics /
   over-interfacing") and the SQLite-footprint benchmark bar ([benchmarks.md](benchmarks.md)) both
-  argue here, and *only* here — an indirect call at the bottom of a sort over `int64` keys replaces
+  argue here, and *only* here — an indirect call at the bottom of a sort over `i64` keys replaces
   a one-instruction compare and is the one place SQLite-class engines guard.
 
 **On "PostgreSQL routes everything through `fmgr` and is plenty fast" — accurate, with the caveat

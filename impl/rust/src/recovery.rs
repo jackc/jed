@@ -15,13 +15,13 @@ fn tmp(name: &str) -> std::path::PathBuf {
     std::env::temp_dir().join(name)
 }
 
-/// A fresh file-backed `t(id int32 PRIMARY KEY)` seeded with rows `1..=2`, returned with the prior
+/// A fresh file-backed `t(id i32 PRIMARY KEY)` seeded with rows `1..=2`, returned with the prior
 /// committed `txid`. Each autocommit `INSERT` persists durably, so the file holds a real two-row
 /// commit before any fault is armed.
 fn seeded(path: &std::path::Path) -> (Database, u64) {
     let _ = std::fs::remove_file(path);
     let mut db = Database::create(path, DatabaseOptions::default()).unwrap();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (2)").unwrap();
     let prior = db.txid();

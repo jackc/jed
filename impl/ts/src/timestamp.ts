@@ -1,5 +1,5 @@
 // The timestamp / timestamptz calendar math, parsing, and rendering
-// (spec/design/timestamp.md). Both types are an int64 count of microseconds since the Unix
+// (spec/design/timestamp.md). Both types are an i64 count of microseconds since the Unix
 // epoch (1970-01-01 00:00:00 UTC), proleptic Gregorian, no leap seconds.
 //
 // This is a §8 determinism hotspot: the civil↔instant conversion (Hinnant), the parse
@@ -10,9 +10,9 @@
 
 import { engineError, EngineError } from "./errors.ts";
 
-// NEG_INFINITY is the -infinity sentinel (the smallest int64; sorts before every finite instant).
+// NEG_INFINITY is the -infinity sentinel (the smallest i64; sorts before every finite instant).
 export const NEG_INFINITY = -9223372036854775808n;
-// POS_INFINITY is the +infinity sentinel (the largest int64; sorts after every finite instant).
+// POS_INFINITY is the +infinity sentinel (the largest i64; sorts after every finite instant).
 export const POS_INFINITY = 9223372036854775807n;
 
 const MICROS_PER_SEC = 1_000_000n;
@@ -128,7 +128,7 @@ function isDigit(c: number): boolean {
 }
 
 // readUint reads one run of ASCII digits at cur.i as a bigint. Empty run → 22007; a value
-// beyond int64 → 22008.
+// beyond i64 → 22008.
 export function readUint(b: string, cur: Cur): bigint {
   const start = cur.i;
   let v = 0n;
@@ -248,7 +248,7 @@ function parseDatetime(input: string, applyOffset: boolean, typeName: string): b
 
   let days = daysFromCivil(astro, month, day);
   if (extraDay) days += 1n;
-  // bigint is arbitrary-precision; range-check against int64 explicitly after composing.
+  // bigint is arbitrary-precision; range-check against i64 explicitly after composing.
   let micros = days * SECS_PER_DAY + (hourPart * 3600n + minute * 60n + second);
   micros = micros * MICROS_PER_SEC + micro;
   if (applyOffset) micros -= offsetSecs * MICROS_PER_SEC;

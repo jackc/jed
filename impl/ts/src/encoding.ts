@@ -5,7 +5,7 @@
 // spec/encoding/integers.toml in tests — this is what guarantees the Rust, Go, and TS
 // cores iterate keys identically.
 //
-// Values are `bigint` (int64 keys exceed JS's safe-integer range); the byte marshalling
+// Values are `bigint` (i64 keys exceed JS's safe-integer range); the byte marshalling
 // itself runs width-specialized in the number domain where exact (≤ 32-bit halves), since
 // per-byte bigint arithmetic allocates and these codecs sit on the hot path.
 

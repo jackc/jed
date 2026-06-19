@@ -6,7 +6,7 @@
 // `rake verify` fails if this file is stale. Reasoning: ../../../spec/design/cost.md.
 
 // The deterministic cost-unit weights, mirroring spec/cost/schedule.toml. Weights are
-// bigint for int64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).
+// bigint for i64 parity with the Rust/Go cores (a number is f64 — CLAUDE.md §8).
 export interface CostSchedule {
   storageRowRead: bigint;
   pageRead: bigint;

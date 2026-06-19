@@ -303,11 +303,11 @@ fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
     match v {
         Value::Null => encode_nullable(ty, None),
         Value::Int(n) => encode_nullable(ty, Some(*n)),
-        // Timestamps store their int64 microsecond instant via the same fixed-width codec as
-        // int64 (the sentinels are ordinary extreme values; spec/design/timestamp.md).
+        // Timestamps store their i64 microsecond instant via the same fixed-width codec as
+        // i64 (the sentinels are ordinary extreme values; spec/design/timestamp.md).
         Value::Timestamp(m) | Value::Timestamptz(m) => encode_nullable(ty, Some(*m)),
-        // A date stores its int32 day count via the same fixed-width (4-byte) order-preserving
-        // codec as int32 (the sentinels are ordinary extreme values; spec/design/date.md).
+        // A date stores its i32 day count via the same fixed-width (4-byte) order-preserving
+        // codec as i32 (the sentinels are ordinary extreme values; spec/design/date.md).
         Value::Date(d) => encode_nullable(ty, Some(*d as i64)),
         Value::Text(s) => {
             let bytes = s.as_bytes();
@@ -347,7 +347,7 @@ fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
         }
         Value::Bool(b) => vec![0x00, u8::from(*b)], // present tag + bool-byte (0x00 false, 0x01 true)
         // Float value codec (spec/fileformat/format.md, spec/design/float.md §10): present tag,
-        // then the IEEE bytes big-endian (float64 = 8, float32 = 4), no length prefix. The stored
+        // then the IEEE bytes big-endian (f64 = 8, f32 = 4), no length prefix. The stored
         // bits are VERBATIM for every value EXCEPT NaN: a -0.0 keeps its sign bit and ±Inf/finite
         // keep theirs, but a NaN is canonicalized to the single quiet pattern (0x7FF8…000 /
         // 0x7FC00000). A NaN's payload is core-specific (hardware Inf-Inf is the negative 0xFFF8…),
@@ -1218,7 +1218,7 @@ impl Database {
                         read_tree(image, page_size, root_data_page, &col_types, &mut reached)?;
                     let store = snap.store_mut(&name);
                     store.set_tree(Some(root), len);
-                    // No-PK keys are synthetic int64 rowids — advance the counter past the largest
+                    // No-PK keys are synthetic i64 rowids — advance the counter past the largest
                     // (the last entry in key order) so future inserts don't collide.
                     if !has_pk {
                         // In-memory load (no paging) — `iter_entries` never faults, so `?` is inert.
@@ -2569,14 +2569,14 @@ fn read_inline_scalar(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Val
         // §10). Must branch before the integer path (width_bytes is 8 there too).
         let b: [u8; 8] = take(buf, pos, 8)?
             .try_into()
-            .map_err(|_| corrupt("invalid float64 length"))?;
+            .map_err(|_| corrupt("invalid f64 length"))?;
         Ok(Value::Float64(f64::from_bits(u64::from_be_bytes(b))))
     } else if ty.is_float32() {
         // 4 IEEE bytes, big-endian. Must branch before the integer path (width_bytes is 4, which
-        // would otherwise match int32 and sign-flip).
+        // would otherwise match i32 and sign-flip).
         let b: [u8; 4] = take(buf, pos, 4)?
             .try_into()
-            .map_err(|_| corrupt("invalid float32 length"))?;
+            .map_err(|_| corrupt("invalid f32 length"))?;
         Ok(Value::Float32(f32::from_bits(u32::from_be_bytes(b))))
     } else if ty.is_timestamp() {
         let vb = take(buf, pos, ty.width_bytes())?;
@@ -2585,7 +2585,7 @@ fn read_inline_scalar(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Val
         let vb = take(buf, pos, ty.width_bytes())?;
         Ok(Value::Timestamptz(decode_int(ty, vb)))
     } else if ty.is_date() {
-        // 4-byte int32 day count, same order-preserving codec as int32 (spec/design/date.md).
+        // 4-byte i32 day count, same order-preserving codec as i32 (spec/design/date.md).
         let vb = take(buf, pos, ty.width_bytes())?;
         Ok(Value::Date(decode_int(ty, vb) as i32))
     } else if ty.is_interval() {
@@ -2872,7 +2872,7 @@ mod tests {
             assert_eq!(scalar_for_type_code(type_code_for_scalar(ty)), Some(ty));
         }
         assert_eq!(scalar_for_type_code(0), None);
-        // 12 = float64, 13 = float32 (spec/fileformat/format.md); 14 is the next unassigned code.
+        // 12 = f64, 13 = f32 (spec/fileformat/format.md); 14 is the next unassigned code.
         assert_eq!(scalar_for_type_code(12), Some(ScalarType::Float64));
         assert_eq!(scalar_for_type_code(13), Some(ScalarType::Float32));
         assert_eq!(scalar_for_type_code(14), None);
@@ -2886,7 +2886,7 @@ mod tests {
     #[test]
     fn float_value_codec_round_trips_bits() {
         let mut sink = Vec::new();
-        // float64 cases, compared by RAW BITS so -0 vs +0 and NaN payloads are distinguished.
+        // f64 cases, compared by RAW BITS so -0 vs +0 and NaN payloads are distinguished.
         let f64s = [
             0.0f64,
             -0.0f64,
@@ -2911,7 +2911,7 @@ mod tests {
             assert_eq!(
                 enc.len(),
                 1 + 8,
-                "float64 body is 8 bytes behind the presence tag"
+                "f64 body is 8 bytes behind the presence tag"
             );
             assert_eq!(enc[0], 0x00, "present tag");
             assert_eq!(
@@ -2933,7 +2933,7 @@ mod tests {
                 other => panic!("expected Float64, got {other:?}"),
             }
         }
-        // float32 cases (4-byte body).
+        // f32 cases (4-byte body).
         let f32s = [
             0.0f32,
             -0.0f32,
@@ -2954,7 +2954,7 @@ mod tests {
             assert_eq!(
                 enc.len(),
                 1 + 4,
-                "float32 body is 4 bytes behind the presence tag"
+                "f32 body is 4 bytes behind the presence tag"
             );
             assert_eq!(&enc[1..], &want_bits.to_be_bytes());
             let mut pos = 0usize;
@@ -2989,7 +2989,7 @@ mod tests {
     fn float_table_in_memory_round_trip() {
         let mut db = Database::new();
         for s in [
-            "CREATE TABLE t (id int32 PRIMARY KEY, f float64, g float32)",
+            "CREATE TABLE t (id i32 PRIMARY KEY, f f64, g f32)",
             "INSERT INTO t VALUES (1, 1.5, 2.5)",
             "INSERT INTO t VALUES (2, 0.0, 0.0)",
             "INSERT INTO t VALUES (3, 0.0, 0.0)",
@@ -3017,11 +3017,11 @@ mod tests {
     fn sample_db() -> Database {
         let mut db = Database::new();
         for s in [
-            "CREATE TABLE t (id int32 PRIMARY KEY, v int16)",
+            "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
             "INSERT INTO t VALUES (1, 10)",
             "INSERT INTO t VALUES (2, NULL)",
             "INSERT INTO t VALUES (3, 30)",
-            "CREATE TABLE r (a int16, b int64)",
+            "CREATE TABLE r (a i16, b i64)",
             "INSERT INTO r VALUES (7, 70)",
         ] {
             execute(&mut db, s).expect("setup");
@@ -3113,7 +3113,7 @@ mod tests {
         let mut db = Database::new();
         let big = filler_text(1250);
         for s in [
-            "CREATE TABLE t (id int32 PRIMARY KEY, body text)".to_string(),
+            "CREATE TABLE t (id i32 PRIMARY KEY, body text)".to_string(),
             format!("INSERT INTO t VALUES (1, '{big}')"),
             "INSERT INTO t VALUES (2, 'tiny')".to_string(),
         ] {

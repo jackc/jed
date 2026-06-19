@@ -1,4 +1,4 @@
-//! Array types (spec/design/array.md) — the S1–S4 vertical slice: a structural `int32[]` column,
+//! Array types (spec/design/array.md) — the S1–S4 vertical slice: a structural `i32[]` column,
 //! the `ARRAY[…]` constructor + the `'{…}'` literal, the compact value codec (S2), btree-NULL
 //! element comparison / ORDER BY / DISTINCT (S4), and `array_out` rendering. v1 is 1-D values of
 //! scalar elements; multidim values, arrays-in-keys, slices, and the array function surface are
@@ -36,7 +36,7 @@ fn array_image_roundtrip() {
     let mut db = Database::new();
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])",
+        "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])",
     );
     run(
         &mut db,
@@ -70,11 +70,8 @@ fn array_image_roundtrip() {
 #[test]
 fn array_of_composite_roundtrip_and_access() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])",
-    );
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
     // The text-literal construction path.
     run(
         &mut db,
@@ -115,11 +112,8 @@ fn array_of_composite_roundtrip_and_access() {
 #[test]
 fn array_of_composite_image_roundtrip() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])",
-    );
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
     run(
         &mut db,
         "INSERT INTO t VALUES (1, '{\"(Main,90210)\",\"(Side,5)\"}')",
@@ -146,7 +140,7 @@ fn array_of_composite_image_roundtrip() {
 #[test]
 fn array_of_composite_null_field_ordering_operators() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     // Equal arrays with a NULL composite field: definite, never UNKNOWN.
     assert_eq!(
         query(
@@ -173,7 +167,7 @@ fn array_of_composite_null_field_ordering_operators() {
 #[test]
 fn array_of_composite_primary_key_is_0a000() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     assert_eq!(
         err(&mut db, "CREATE TABLE t (items addr[] PRIMARY KEY)"),
         "0A000"

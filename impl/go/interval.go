@@ -35,7 +35,7 @@ type Interval struct {
 // fields via 1 month = 30 days and 1 day = 24 h (PG interval_cmp_value). Returned as a *big.Int
 // (Go has no int128); the value is exact.
 func (iv Interval) Span() *big.Int {
-	days := int64(iv.Months)*daysPerMonth + int64(iv.Days) // fits int64 (i32*30 + i32)
+	days := int64(iv.Months)*daysPerMonth + int64(iv.Days) // fits i64 (i32*30 + i32)
 	b := big.NewInt(days)
 	b.Mul(b, big.NewInt(microsPerDay))
 	b.Add(b, big.NewInt(iv.Micros))
@@ -179,7 +179,7 @@ func MulByFraction(iv Interval, fnum, fden *big.Int) (Interval, error) {
 // TsShift computes ts + iv (or ts - iv with subtract) — the calendar-aware datetime arithmetic
 // (spec/design/interval.md §5). Months are added first WITH DAY-OF-MONTH CLAMPING (Jan 31 + 1
 // month -> Feb 28/29), then days (24 h each), then micros. Adding to ±infinity stays ±infinity; a
-// finite result onto a sentinel or beyond the int64-µs range traps 22008.
+// finite result onto a sentinel or beyond the i64-µs range traps 22008.
 func TsShift(ts int64, iv Interval, subtract bool) (int64, error) {
 	if ts == NegInfinity || ts == PosInfinity {
 		return ts, nil
@@ -309,7 +309,7 @@ func roundDivBig(num, den *big.Int) *big.Int {
 	return q
 }
 
-// toI64 converts a big.Int to int64, trapping 22008 on overflow.
+// toI64 converts a big.Int to i64, trapping 22008 on overflow.
 func toI64(b *big.Int) (int64, error) {
 	if !b.IsInt64() {
 		return 0, intervalFieldOverflow("interval out of range")

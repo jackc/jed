@@ -4,10 +4,10 @@
 # block is the opposite: a lenient no-op success (it always has a well-defined action, of which
 # there is none), so it succeeds rather than raising 25P01. Format + the `requires` directive:
 # ../../../design/conformance.md.
-# requires: txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.int32
+# requires: txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.i32
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY)
+CREATE TABLE t (id i32 PRIMARY KEY)
 
 # COMMIT / ROLLBACK with no open block — lenient no-op successes (no 25P01)
 statement ok

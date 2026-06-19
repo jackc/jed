@@ -4,14 +4,14 @@
 # Reasoning lives in ../design/types.md — read it before editing this file.
 #
 # This file governs *comparison* (=, <, >, ORDER BY, index order). Operator
-# RESULT types (e.g. the type of `int32 + int32`) belong to ../functions/, not here.
+# RESULT types (e.g. the type of `i32 + i32`) belong to ../functions/, not here.
 
 schema_version = 1
 
 # --- promotion tower ---------------------------------------------------------
 # When two values of the same family meet, both promote to a common type before
 # comparison. For the integer family the common type is the operand with the
-# higher `rank` in scalars.toml (widening is always lossless). int16 < int32 < int64.
+# higher `rank` in scalars.toml (widening is always lossless). i16 < i32 < i64.
 [[promotion]]
 family = "integer"
 strategy = "max-rank"
@@ -52,7 +52,7 @@ family = "uuid"
 strategy = "none"
 
 # timestamp / timestamptz each have a single type with no promotion tower (strategy =
-# "none"): two same-type datetime operands compare directly by their int64 instant, no
+# "none"): two same-type datetime operands compare directly by their i64 instant, no
 # reconciliation. The two families do NOT reconcile with EACH OTHER (that would require a
 # zone) — there is deliberately no cross comparable rule below, so timestamp × timestamptz
 # is a 42804 type error (../design/timestamp.md).
@@ -71,7 +71,7 @@ family = "interval"
 strategy = "none"
 
 # date has a single type with no promotion tower (strategy = "none"): two date operands compare
-# directly by the int32 day count (../design/date.md §4), no reconciliation. There is deliberately
+# directly by the i32 day count (../design/date.md §4), no reconciliation. There is deliberately
 # NO cross-family date reconciliation (date × timestamp would need a zone cast), so date is a
 # strict island this slice — a documented divergence from PG, which implicitly casts date →
 # timestamp (date.md §4).
@@ -79,8 +79,8 @@ strategy = "none"
 family = "date"
 strategy = "none"
 
-# float (float32, float64) forms a PROMOTION TOWER like the integers (strategy = "max-rank"):
-# when two floats of different width meet, both widen to the higher-rank type (float32 -> float64,
+# float (f32, f64) forms a PROMOTION TOWER like the integers (strategy = "max-rank"):
+# when two floats of different width meet, both widen to the higher-rank type (f32 -> f64,
 # lossless) before comparison/arithmetic — exactly the integer rule, and matching PG (real promotes
 # to double). There is deliberately NO CROSS-family float reconciliation: int/decimal × float is a
 # 42804 type error (no comparable rule below) — float is a strict island requiring an explicit cast,
@@ -157,7 +157,7 @@ right_family = "uuid"
 via = "none"
 
 # timestamp × timestamp and timestamptz × timestamptz only. via = "none": one type per
-# family, no promotion; compare by the int64 instant (signed numeric order), which places
+# family, no promotion; compare by the i64 instant (signed numeric order), which places
 # -infinity < every finite < infinity for free (../design/timestamp.md). There is NO
 # timestamp × timestamptz rule (it would require a zone), so a mixed datetime pair is a
 # 42804 type error — likewise timestamp × {integer,decimal,text,bool,bytea}.
@@ -180,7 +180,7 @@ left_family = "interval"
 right_family = "interval"
 via = "none"
 
-# date × date only. via = "none": one type per family, no promotion; compare by the int32 day
+# date × date only. via = "none": one type per family, no promotion; compare by the i32 day
 # count (signed numeric order), which places -infinity < every finite < infinity for free
 # (../design/date.md §4). date × {timestamp, timestamptz, integer, text, …} is NOT listed, so it
 # is a 42804 type error — date is a strict island this slice (PG would cast date → timestamp; a
@@ -191,7 +191,7 @@ right_family = "date"
 via = "none"
 
 # float × float (either width). via = "promote": a mixed-width pair widens to the higher rank
-# (float32 -> float64) via the tower, then compares. Operands compare by the TOTAL order (below):
+# (f32 -> f64) via the tower, then compares. Operands compare by the TOTAL order (below):
 # -0 = +0, NaN = NaN, NaN is the largest value (PG float btree order — NOT raw IEEE, where NaN is
 # unordered). So `NaN = NaN` is TRUE and two NaNs dedup. float vs ANY other family (incl. integer
 # and decimal) is NOT listed, so it is a 42804 type error — float is a strict island, requiring an
@@ -234,9 +234,9 @@ bytea = "byte-ascending"
 # stored byte order == logical order — and uuid is the first non-integer type that EXERCISES
 # this as a real key (../design/encoding.md §2.7).
 uuid = "byte-ascending"
-# timestamp / timestamptz order by their int64 microsecond instant (signed numeric order),
+# timestamp / timestamptz order by their i64 microsecond instant (signed numeric order),
 # so -infinity (i64::MIN) < every finite value < infinity (i64::MAX). The order-preserving
-# key encoding (scalars.toml "int-be-signflip", the same as int64) reproduces this in raw
+# key encoding (scalars.toml "int-be-signflip", the same as i64) reproduces this in raw
 # bytes — and unlike text/bytea/decimal it is EXERCISED this slice (a timestamp PRIMARY KEY
 # is allowed), so stored byte order == logical order. No NaN exists for timestamps, so the
 # order is total (contrast decimal/float).
@@ -247,20 +247,20 @@ timestamptz = "numeric-ascending"
 # authored this slice (interval is not yet a key), so there is no "stored byte order == logical
 # order" claim to make for it — ordering is the in-memory span comparison only.
 interval = "span-ascending"
-# date orders by its int32 day count (signed numeric order), so -infinity (i32::MIN) < every
+# date orders by its i32 day count (signed numeric order), so -infinity (i32::MIN) < every
 # finite value < infinity (i32::MAX). The order-preserving key encoding (scalars.toml
-# "int-be-signflip", width 4, the same as int32) reproduces this in raw bytes — and, like
+# "int-be-signflip", width 4, the same as i32) reproduces this in raw bytes — and, like
 # timestamp (unlike text/decimal/bytea/interval), it is EXERCISED this slice (a date PRIMARY KEY
 # is allowed), so stored byte order == logical order. No NaN exists for dates, so the order is
 # total (../design/date.md §4).
 date = "numeric-ascending"
-# float64 orders by the PG float8 TOTAL order (not raw IEEE): -Infinity < every finite value <
+# f64 orders by the PG float8 TOTAL order (not raw IEEE): -Infinity < every finite value <
 # +Infinity < NaN, with -0 = +0 and NaN = NaN (NaN is the single largest value, above +Infinity).
 # This makes ORDER BY / DISTINCT / GROUP BY / MIN / MAX total and deterministic over a type that
 # is otherwise only partially ordered by IEEE. The order-preserving key encoding (scalars.toml
 # "float-order-preserving", ../design/encoding.md §2.8) reproduces THIS order in raw bytes
 # (canonicalize -0 and NaN, then the sign-flip bit transform) — authored but UNEXERCISED this
-# slice (float64 is not yet a key). Note the contrast with timestamp (no NaN, so totally ordered
+# slice (f64 is not yet a key). Note the contrast with timestamp (no NaN, so totally ordered
 # for free) and decimal (excludes NaN/∞ entirely); float carries them as real, ordered values.
 float = "float-total-order"
 

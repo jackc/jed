@@ -2,13 +2,13 @@
 # the table name) is the relation's LABEL, used to qualify columns. Labels must be distinct: a
 # self-join without aliases is 42712 duplicate_alias, and an alias SHADOWS the table name (the
 # bare table name is no longer a valid qualifier once aliased — PostgreSQL behaviour).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.join_inner, query.table_alias, query.qualified_column, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.join_inner, query.table_alias, query.qualified_column, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TABLE emp (id int32 PRIMARY KEY, name text, dept int32)
+CREATE TABLE emp (id i32 PRIMARY KEY, name text, dept i32)
 
 statement ok
-CREATE TABLE dept (id int32 PRIMARY KEY, name text)
+CREATE TABLE dept (id i32 PRIMARY KEY, name text)
 
 statement ok
 INSERT INTO emp VALUES (1, 'ann', 10), (2, 'bob', 20), (3, 'cy', 10)

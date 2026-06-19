@@ -28,11 +28,11 @@ fn run(db: &mut Database, sql: &str) {
     execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
 }
 
-/// `CREATE TABLE t (id int32 PRIMARY KEY, v int16)` with 20 rows (id 3 has a NULL
+/// `CREATE TABLE t (id i32 PRIMARY KEY, v i16)` with 20 rows (id 3 has a NULL
 /// value) — enough rows to span more than one data page at page_size 256.
 fn pk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
     for i in 1..=20i64 {
         let v = if i == 3 {
             "NULL".to_string()
@@ -46,19 +46,19 @@ fn pk_table_db() -> Database {
 
 fn one_table_empty_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
     db
 }
 
 /// A table with a COMPOSITE primary key (constraints.md §3) — the stored key is the
-/// concatenation of the members' encodings (4-byte int32 ‖ 2-byte int16, encoding.md §2.3).
+/// concatenation of the members' encodings (4-byte i32 ‖ 2-byte i16, encoding.md §2.3).
 /// Rows insert in ascending tuple order (the tree shape is order-sensitive), with a negative
 /// first component and first-component ties broken by the second.
 fn composite_pk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (a int32, b int16, v int16, PRIMARY KEY (a, b))",
+        "CREATE TABLE t (a i32, b i16, v i16, PRIMARY KEY (a, b))",
     );
     for (a, b, v) in [
         (-2, 5, 10),
@@ -105,7 +105,7 @@ fn index_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (a int32, b int32, u uuid, PRIMARY KEY (b, a))",
+        "CREATE TABLE t (a i32, b i32, u uuid, PRIMARY KEY (b, a))",
     );
     run(&mut db, "CREATE INDEX i_u ON t (u)");
     run(&mut db, "CREATE INDEX ON t (a, b)");
@@ -124,7 +124,7 @@ fn unique_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32, UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))",
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32, UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))",
     );
     run(&mut db, "CREATE INDEX nu ON t (v)");
     run(&mut db, "CREATE UNIQUE INDEX uq ON t (w)");
@@ -145,7 +145,7 @@ fn fk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE p (pid int32 PRIMARY KEY, code int32 UNIQUE, a int32, b int32, UNIQUE (a, b))",
+        "CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))",
     );
     run(
         &mut db,
@@ -153,7 +153,7 @@ fn fk_table_db() -> Database {
     );
     run(
         &mut db,
-        "CREATE TABLE c (id int32 PRIMARY KEY, pid int32, pcode int32, x int32, y int32, mgr int32, \
+        "CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32, \
          FOREIGN KEY (pid) REFERENCES p (pid), \
          CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), \
          FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT, \
@@ -168,14 +168,14 @@ fn fk_table_db() -> Database {
 
 /// A table with ARRAY (`T[]`) columns (v10 — spec/design/array.md): pins the catalog array-column
 /// entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). An
-/// `int32[]` (fixed-width elements: no per-element length prefix) and a `text[]`; row 2 has an EMPTY
+/// `i32[]` (fixed-width elements: no per-element length prefix) and a `text[]`; row 2 has an EMPTY
 /// array (ndim=0), row 3 a NULL element (the HAS_NULLS bitmap) and a whole-value NULL array (the
 /// lone 0x01 tag). Must match the Ruby reference's ARRAY_TABLE (spec/fileformat/verify.rb).
 fn array_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])",
+        "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])",
     );
     run(
         &mut db,
@@ -183,7 +183,7 @@ fn array_table_db() -> Database {
     );
     run(&mut db, "INSERT INTO t VALUES (2, '{40,50}', '{}')");
     run(&mut db, "INSERT INTO t VALUES (3, ARRAY[1, NULL, 3], NULL)");
-    // Row 4 pins the §12 shapes: a 2-D int32[] and a custom-lower-bound text[] (the lb i32 field).
+    // Row 4 pins the §12 shapes: a 2-D i32[] and a custom-lower-bound text[] (the lb i32 field).
     run(
         &mut db,
         "INSERT INTO t VALUES (4, ARRAY[ARRAY[10,20],ARRAY[30,40]], '[2:3]={x,y}')",
@@ -191,10 +191,10 @@ fn array_table_db() -> Database {
     db
 }
 
-/// A table with no primary key — exercises the stored synthetic int64 rowid key.
+/// A table with no primary key — exercises the stored synthetic i64 rowid key.
 fn nopk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TABLE r (a int16, b int64)");
+    run(&mut db, "CREATE TABLE r (a i16, b i64)");
     for (a, b) in [(7, 70), (8, 80), (9, 90)] {
         run(&mut db, &format!("INSERT INTO r VALUES ({a}, {b})"));
     }
@@ -206,7 +206,7 @@ fn nopk_table_db() -> Database {
 /// post-order page allocation across a deeper tree (spec/fileformat/format.md).
 fn tall_tree_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
     for i in 1..=18i64 {
         let pad = format!("row-{i:02}-{}", "x".repeat(48));
         run(&mut db, &format!("INSERT INTO t VALUES ({i}, '{pad}')"));
@@ -216,10 +216,10 @@ fn tall_tree_db() -> Database {
 
 /// A table with a text column — exercises the value codec's text branch (u16 length +
 /// UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text
-/// value, and a 4-byte astral char (😀). The PK stays int32 (no text key this slice).
+/// value, and a 4-byte astral char (😀). The PK stays i32 (no text key this slice).
 fn text_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, s text)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)");
     run(&mut db, "INSERT INTO t VALUES (1, 'alice')");
     run(&mut db, "INSERT INTO t VALUES (2, '')");
     run(&mut db, "INSERT INTO t VALUES (3, 'O''Brien')");
@@ -230,14 +230,11 @@ fn text_table_db() -> Database {
 }
 
 /// A table with a boolean column — exercises the value codec's boolean branch (a single
-/// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (the boolean
+/// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays i32 (the boolean
 /// PRIMARY KEY case is `bool_pk_table_db`).
 fn bool_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)",
-    );
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)");
     run(&mut db, "INSERT INTO t VALUES (1, TRUE)");
     run(&mut db, "INSERT INTO t VALUES (2, FALSE)");
     run(&mut db, "INSERT INTO t VALUES (3, NULL)");
@@ -265,7 +262,7 @@ fn decimal_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, d numeric, m numeric(10,2))",
+        "CREATE TABLE t (id i32 PRIMARY KEY, d numeric, m numeric(10,2))",
     );
     run(
         &mut db,
@@ -277,11 +274,11 @@ fn decimal_table_db() -> Database {
 
 /// A table with a bytea column — exercises the value codec's bytea branch (u16 length + raw
 /// bytes): a multi-byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high
-/// byte (0xFF), a NULL, and a lone 0x00. The PK stays int32 (no bytea key this slice).
+/// byte (0xFF), a NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice).
 /// Literals are the `\x` hex input form, adapting to the bytea column (types.md §6).
 fn bytea_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, b bytea)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, b bytea)");
     run(&mut db, "INSERT INTO t VALUES (1, '\\xdeadbeef')");
     run(&mut db, "INSERT INTO t VALUES (2, '\\x')");
     run(&mut db, "INSERT INTO t VALUES (3, '\\x000102')");
@@ -334,7 +331,7 @@ fn overflow_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)",
     );
     run(
         &mut db,
@@ -358,7 +355,7 @@ fn compressed_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)",
     );
     run(
         &mut db,
@@ -408,9 +405,9 @@ fn default_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, n int32 DEFAULT 0, note text DEFAULT 'none', \
-         maybe int32 DEFAULT NULL, req int32 NOT NULL DEFAULT 7, amt numeric(6,2) DEFAULT 1.5, \
-         plain int16)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, n i32 DEFAULT 0, note text DEFAULT 'none', \
+         maybe i32 DEFAULT NULL, req i32 NOT NULL DEFAULT 7, amt numeric(6,2) DEFAULT 1.5, \
+         plain i16)",
     );
     run(&mut db, "INSERT INTO t (id) VALUES (1)");
     run(
@@ -421,29 +418,26 @@ fn default_table_db() -> Database {
 }
 
 /// A table with EXPRESSION column defaults (v8) — the catalog flags bit3 (default_is_expr) + the
-/// expr-text written after the typmod: a `uuid DEFAULT uuidv7()`, an `int32 DEFAULT 1 + 1`, a
+/// expr-text written after the typmod: a `uuid DEFAULT uuidv7()`, an `i32 DEFAULT 1 + 1`, a
 /// CONSTANT default beside them (bit2), and a plain no-default column. EMPTY table — the catalog
 /// encoding is the cross-core proof; the per-row evaluation is covered by the conformance corpus.
 fn default_expr_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n int32 DEFAULT 1 + 1, \
-         k int32 DEFAULT 7, plain int16)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n i32 DEFAULT 1 + 1, \
+         k i32 DEFAULT 7, plain i16)",
     );
     db
 }
 
-/// A table with a timestamp column — exercises the value codec's int64-instant branch (type
+/// A table with a timestamp column — exercises the value codec's i64-instant branch (type
 /// code 8): a positive instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels,
-/// and a NULL. The literals parse to the same micros the golden stores. The PK stays int32 (a
+/// and a NULL. The literals parse to the same micros the golden stores. The PK stays i32 (a
 /// timestamp PK is supported, but the value-codec branch is the point here).
 fn timestamp_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamp)",
-    );
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp)");
     run(&mut db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')");
     run(&mut db, "INSERT INTO t VALUES (2, '1969-12-31 23:59:59.5')");
     run(
@@ -462,7 +456,7 @@ fn timestamptz_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamptz)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz)",
     );
     run(
         &mut db,
@@ -485,10 +479,10 @@ fn timestamptz_table_db() -> Database {
 /// A table with an interval column (type code 11) — the fixed 16-byte value-codec branch
 /// (i32 months ‖ i32 days ‖ i64 micros). A positive multi-field value, a negative value, the
 /// zero interval, a months-only `'1 mon'` vs a span-equal-but-byte-distinct `'30 days'`, and a
-/// NULL. The bare-string literals adapt to the interval column. PK stays int32.
+/// NULL. The bare-string literals adapt to the interval column. PK stays i32.
 fn interval_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, d interval)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, d interval)");
     run(&mut db, "INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05')");
     run(&mut db, "INSERT INTO t VALUES (2, '-1 day')");
     run(&mut db, "INSERT INTO t VALUES (3, '0 seconds')");
@@ -498,55 +492,55 @@ fn interval_table_db() -> Database {
     db
 }
 
-/// A table with a float64 column (type code 12) — the 8-byte IEEE value-codec branch. A positive
+/// A table with a f64 column (type code 12) — the 8-byte IEEE value-codec branch. A positive
 /// fraction, a negative value, +0 and -0 (the sign bit is preserved on disk — distinct bytes), both
 /// infinities, a canonicalized NaN (stored as the single quiet pattern `0x7FF8…000`), a NULL, and
 /// `f64::MAX` (a full mantissa). Finite values enter via bare numeric literals (decimal adaptation);
 /// the specials enter via typed literals in `INSERT ... SELECT` (a VALUES slot takes only bare
-/// literals this slice — float.md). PK stays int32 (float PK → 0A000).
+/// literals this slice — float.md). PK stays i32 (float PK → 0A000).
 fn float64_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, d float64)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, d f64)");
     run(&mut db, "INSERT INTO t VALUES (1, 1.5)");
     run(&mut db, "INSERT INTO t VALUES (2, -2.5)");
     run(&mut db, "INSERT INTO t VALUES (3, 0.0)");
-    run(&mut db, "INSERT INTO t SELECT 4, float64 '-0'");
-    run(&mut db, "INSERT INTO t SELECT 5, float64 'Infinity'");
-    run(&mut db, "INSERT INTO t SELECT 6, float64 '-Infinity'");
-    run(&mut db, "INSERT INTO t SELECT 7, float64 'NaN'");
+    run(&mut db, "INSERT INTO t SELECT 4, f64 '-0'");
+    run(&mut db, "INSERT INTO t SELECT 5, f64 'Infinity'");
+    run(&mut db, "INSERT INTO t SELECT 6, f64 '-Infinity'");
+    run(&mut db, "INSERT INTO t SELECT 7, f64 'NaN'");
     run(&mut db, "INSERT INTO t VALUES (8, NULL)");
     run(
         &mut db,
-        "INSERT INTO t SELECT 9, float64 '1.7976931348623157e308'",
+        "INSERT INTO t SELECT 9, f64 '1.7976931348623157e308'",
     );
     db
 }
 
-/// A table with a float32 column (type code 13) — the 4-byte IEEE branch. The same special-value
+/// A table with a f32 column (type code 13) — the 4-byte IEEE branch. The same special-value
 /// coverage as `float64_table_db` (canonicalized NaN → `0x7FC00000`) plus 100.25 (exactly
-/// representable in binary32). PK stays int32.
+/// representable in binary32). PK stays i32.
 fn float32_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, r float32)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, r f32)");
     run(&mut db, "INSERT INTO t VALUES (1, 1.5)");
     run(&mut db, "INSERT INTO t VALUES (2, -2.5)");
     run(&mut db, "INSERT INTO t VALUES (3, 0.0)");
-    run(&mut db, "INSERT INTO t SELECT 4, float32 '-0'");
-    run(&mut db, "INSERT INTO t SELECT 5, float32 'Infinity'");
-    run(&mut db, "INSERT INTO t SELECT 6, float32 '-Infinity'");
-    run(&mut db, "INSERT INTO t SELECT 7, float32 'NaN'");
+    run(&mut db, "INSERT INTO t SELECT 4, f32 '-0'");
+    run(&mut db, "INSERT INTO t SELECT 5, f32 'Infinity'");
+    run(&mut db, "INSERT INTO t SELECT 6, f32 '-Infinity'");
+    run(&mut db, "INSERT INTO t SELECT 7, f32 'NaN'");
     run(&mut db, "INSERT INTO t VALUES (8, NULL)");
     run(&mut db, "INSERT INTO t VALUES (9, 100.25)");
     db
 }
 
-/// A table with a date column (type code 16) — the 4-byte int32 day-count value-codec branch (the
-/// same int-be-signflip body as int32). A positive date, a pre-1970 negative one, a BC-era one,
+/// A table with a date column (type code 16) — the 4-byte i32 day-count value-codec branch (the
+/// same int-be-signflip body as i32). A positive date, a pre-1970 negative one, a BC-era one,
 /// the −infinity/+infinity sentinels (i32::MIN/MAX), and a NULL. The bare-string literals adapt to
-/// the date column. PK stays int32. (spec/design/date.md)
+/// the date column. PK stays i32. (spec/design/date.md)
 fn date_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, d date)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, d date)");
     run(&mut db, "INSERT INTO t VALUES (1, '2024-01-15')");
     run(&mut db, "INSERT INTO t VALUES (2, '1969-12-31')");
     run(&mut db, "INSERT INTO t VALUES (3, '0044-03-15 BC')");
@@ -563,9 +557,9 @@ fn composite_type_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TYPE addr AS (street text NOT NULL, zip int32)",
+        "CREATE TYPE addr AS (street text NOT NULL, zip i32)",
     );
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, home addr)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, home addr)");
     run(&mut db, "INSERT INTO t VALUES (1, ROW('Main', 90210))");
     run(&mut db, "INSERT INTO t VALUES (2, ROW('Oak', NULL))");
     db
@@ -580,12 +574,9 @@ fn array_composite_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TYPE addr AS (street text NOT NULL, zip int32)",
+        "CREATE TYPE addr AS (street text NOT NULL, zip i32)",
     );
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])",
-    );
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
     run(
         &mut db,
         "INSERT INTO t VALUES (1, '{\"(Main,90210)\",\"(Side,5)\"}')",
@@ -598,13 +589,13 @@ fn array_composite_table_db() -> Database {
 }
 
 /// A composite type with an array-typed FIELD (array.md §12 — the mirror of array-of-composite):
-/// the catalog composite-type entry carries a code-15 array field (`element_type_code` 2 = int32)
+/// the catalog composite-type entry carries a code-15 array field (`element_type_code` 2 = i32)
 /// and the value body recurses (a composite body whose `pts` field is an array body). Row 2 has an
 /// empty array field `{}` (ndim 0); row 3 a NULL array field (the composite null-bitmap).
 fn composite_array_field_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    run(&mut db, "CREATE TYPE poly AS (name text, pts int32[])");
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+    run(&mut db, "CREATE TYPE poly AS (name text, pts i32[])");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)");
     run(&mut db, "INSERT INTO t VALUES (1, ROW('a', '{10,20,30}'))");
     run(&mut db, "INSERT INTO t VALUES (2, ROW('b', '{}'))");
     run(&mut db, "INSERT INTO t VALUES (3, ROW('c', NULL))");
@@ -620,10 +611,10 @@ fn nested_composite_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)",
+        "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)",
     );
     run(&mut db, "CREATE TYPE line AS (a point, b point)");
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, ln line)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, ln line)");
     run(
         &mut db,
         "INSERT INTO t VALUES (1, ROW(ROW(1, 2), ROW(3, 4)))",
@@ -644,7 +635,7 @@ fn sequence_table_db() -> Database {
         &mut db,
         "CREATE SEQUENCE s2 INCREMENT BY -2 MINVALUE -100 MAXVALUE -1 CACHE 5 CYCLE",
     );
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     run(&mut db, "INSERT INTO t VALUES (1, 10)");
     db
 }
@@ -814,7 +805,7 @@ fn rowid_counter_survives_serialize_and_load() {
 #[test]
 fn round_trip_at_default_page_size() {
     let mut db = Database::with_page_size(8192);
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
     for i in 1..=20i64 {
         let v = if i == 3 {
             "NULL".to_string()

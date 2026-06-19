@@ -25,7 +25,7 @@ fn rows(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
 #[test]
 fn boolean_primary_key_crud() {
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (k boolean PRIMARY KEY, v int32)").unwrap();
+    execute(&mut db, "CREATE TABLE t (k boolean PRIMARY KEY, v i32)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (FALSE, 10), (TRUE, 20)").unwrap();
 
     // Point lookup on the boolean PK resolves to the right row.
@@ -51,7 +51,7 @@ fn boolean_composite_primary_key() {
     let mut db = Database::new();
     execute(
         &mut db,
-        "CREATE TABLE t (a int32, b boolean, v int32, PRIMARY KEY (a, b))",
+        "CREATE TABLE t (a i32, b boolean, v i32, PRIMARY KEY (a, b))",
     )
     .unwrap();
     execute(
@@ -79,11 +79,7 @@ fn boolean_composite_primary_key() {
 #[test]
 fn boolean_secondary_index() {
     let mut db = Database::new();
-    execute(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)",
-    )
-    .unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)").unwrap();
     execute(
         &mut db,
         "INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE)",

@@ -14,28 +14,28 @@
 # names accepted, in Rust / Go / TS alike.
 #
 # jed-SPECIFIC (PG truncates rather than erroring), so the 42622 records are NOT oracle-checked.
-# requires: ddl.create_table, ddl.primary_key, query.select, types.int32, resource.identifier_length_limit
+# requires: ddl.create_table, ddl.primary_key, query.select, types.i32, resource.identifier_length_limit
 
 # === Boundary: 63 bytes is the highest ACCEPTED identifier length. ===
 
 # A 63-character table name is accepted — the gate never perturbs an ordinary-length name.
 statement ok
-CREATE TABLE zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz (id int32 PRIMARY KEY)
+CREATE TABLE zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz (id i32 PRIMARY KEY)
 
 # A 63-character column name is accepted too.
 statement ok
-CREATE TABLE t63c (zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz int32 PRIMARY KEY)
+CREATE TABLE t63c (zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz i32 PRIMARY KEY)
 
 # === One byte over (64) aborts with 42622, in EVERY identifier position — the lexer catches it
 # during tokenization, before the parser dispatches on the statement kind. ===
 
 # A 64-character table name.
 statement error 42622
-CREATE TABLE zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz (id int32 PRIMARY KEY)
+CREATE TABLE zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz (id i32 PRIMARY KEY)
 
 # A 64-character column name.
 statement error 42622
-CREATE TABLE tbad (zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz int32 PRIMARY KEY)
+CREATE TABLE tbad (zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz i32 PRIMARY KEY)
 
 # A 64-character table reference in FROM (a read, not a definition — still bounded).
 statement error 42622

@@ -2,7 +2,7 @@
 	import LiveSql from '$lib/components/LiveSql.svelte';
 
 	const seed = `CREATE TABLE product (
-  id       int32 PRIMARY KEY,
+  id       i32 PRIMARY KEY,
   name     text NOT NULL,
   category text NOT NULL,
   price    numeric(8,2) NOT NULL
@@ -67,8 +67,8 @@ ORDER BY price;`;
        num_nulls(VARIADIC ARRAY[1, NULL, 3]) AS variadic,
        num_nonnulls(1, NULL, 3)              AS non_nulls;`;
 
-	const arrayCompositeSeed = `CREATE TYPE addr AS (street text, zip int32);
-CREATE TABLE person (id int32 PRIMARY KEY, places addr[]);
+	const arrayCompositeSeed = `CREATE TYPE addr AS (street text, zip i32);
+CREATE TABLE person (id i32 PRIMARY KEY, places addr[]);
 INSERT INTO person VALUES
   (1, ARRAY[ROW('Main', 90210), ROW('Side', 5)]),
   (2, '{"(Oak,)"}');`;
@@ -92,8 +92,8 @@ ORDER BY u;`;
 FROM person
 ORDER BY id;`;
 
-	const compositeArrayFieldSeed = `CREATE TYPE poly AS (name text, pts int32[]);
-CREATE TABLE shapes (id int32 PRIMARY KEY, p poly);
+	const compositeArrayFieldSeed = `CREATE TYPE poly AS (name text, pts i32[]);
+CREATE TABLE shapes (id i32 PRIMARY KEY, p poly);
 INSERT INTO shapes VALUES
   (1, ROW('a', ARRAY[10, 20, 30])),
   (2, ROW('b', ARRAY[5]));`;
@@ -105,7 +105,7 @@ INSERT INTO shapes VALUES
 FROM shapes
 ORDER BY p;`;
 
-	const dateSeed = `CREATE TABLE event (id int32 PRIMARY KEY, name text, on_day date);
+	const dateSeed = `CREATE TABLE event (id i32 PRIMARY KEY, name text, on_day date);
 INSERT INTO event VALUES
   (1, 'launch',  '2024-01-15'),
   (2, 'review',  '2023-11-02'),
@@ -257,7 +257,7 @@ so a matching `NULL` field still counts as equal):
 ## Composite types with array fields
 
 The nesting works the other way too: a composite type can have an **array-typed field**, so one
-row holds a list — `CREATE TYPE poly AS (name text, pts int32[])`. Build a value with `ROW(name,
+row holds a list — `CREATE TYPE poly AS (name text, pts i32[])`. Build a value with `ROW(name,
 ARRAY[…])` (or write the field as a text literal, `ROW(name, '{10,20,30}')`), read the whole array
 with `(p).pts`, and subscript it with `(p).pts[1]`. Comparison and `ORDER BY` follow the row order
 field-by-field, using the array's element-wise order for the array field:

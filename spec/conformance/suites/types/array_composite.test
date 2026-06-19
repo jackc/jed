@@ -12,13 +12,13 @@
 # composite element, slice → addr[], field access (items[i]).field; multidimensional addr[] values.
 # array_out / record_out match PostgreSQL byte-for-byte. Type name avoids PG's geometric builtins.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.group_by, query.aggregates, types.array_composite, types.composite, types.array, types.array_multidim, expr.array_subscript, expr.array_slice, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.group_by, query.aggregates, types.array_composite, types.composite, types.array, types.array_multidim, expr.array_subscript, expr.array_slice, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TYPE addr AS (street text, zip int32)
+CREATE TYPE addr AS (street text, zip i32)
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, items addr[])
+CREATE TABLE t (id i32 PRIMARY KEY, items addr[])
 
 # Construct a composite-element array from the text literal: array_in tokenizes the outer braces,
 # then routes each quoted element through record_in to build the composite value.
@@ -105,7 +105,7 @@ true
 false
 
 statement ok
-CREATE TABLE t2 (id int32 PRIMARY KEY, items addr[])
+CREATE TABLE t2 (id i32 PRIMARY KEY, items addr[])
 
 statement ok
 INSERT INTO t2 VALUES (1, '{"(a,2)"}'), (2, '{"(a,)"}'), (3, '{"(a,1)"}'), (4, '{"(a,1)"}')

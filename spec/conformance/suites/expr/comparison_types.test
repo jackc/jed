@@ -3,11 +3,11 @@
 # covered elsewhere; this file pins the FOUR ordering operators as projected boolean
 # VALUES — the value-module Lt3/Gt3 kernels and the `<=`/`>=` (Lt3∨Eq3 / Gt3∨Eq3)
 # compositions — for each type family beyond the integer/decimal numeric path:
-# float64, float32, text, boolean, bytea, uuid, timestamp, timestamptz, interval, and
+# f64, f32, text, boolean, bytea, uuid, timestamp, timestamptz, interval, and
 # the decimal path itself. Each operator is three-valued: a NULL operand makes the
 # result UNKNOWN (NULL), never true/false (null.three_valued). PostgreSQL-oracle-checkable.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, expr.comparison_value, cast.operator, cast.string_literal, types.int32, types.text, types.boolean, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, types.float64, types.float32, null.three_valued
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, expr.comparison_value, cast.operator, cast.string_literal, types.i32, types.text, types.boolean, types.boolean_storable, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, types.f64, types.f32, null.three_valued
 
 # Each section asserts a strictly-less pair (`a < b`) — which makes `< <=` true and `> >=`
 # false (the row `t t f f`) — and the equal pair (`a = a`) — `< >` false, `<= >=` true
@@ -66,9 +66,9 @@ true
 false
 true
 
-# --- float64: IEEE total order ------------------------------------------------------
+# --- f64: IEEE total order ------------------------------------------------------
 query BBBB nosort
-SELECT 1.5::float64 < 2.5::float64, 1.5::float64 <= 2.5::float64, 1.5::float64 > 2.5::float64, 1.5::float64 >= 2.5::float64
+SELECT 1.5::f64 < 2.5::f64, 1.5::f64 <= 2.5::f64, 1.5::f64 > 2.5::f64, 1.5::f64 >= 2.5::f64
 ----
 true
 true
@@ -76,7 +76,7 @@ false
 false
 
 query BBBB nosort
-SELECT 2.5::float64 < 2.5::float64, 2.5::float64 <= 2.5::float64, 2.5::float64 > 2.5::float64, 2.5::float64 >= 2.5::float64
+SELECT 2.5::f64 < 2.5::f64, 2.5::f64 <= 2.5::f64, 2.5::f64 > 2.5::f64, 2.5::f64 >= 2.5::f64
 ----
 false
 true
@@ -86,22 +86,22 @@ true
 # float total order (float.md §9): -Infinity < finite < +Infinity < NaN, and NaN equals
 # itself (so `NaN > NaN` is false but `NaN >= NaN` is true — the btree order, not raw IEEE).
 query BBB nosort
-SELECT float64 '-Infinity' < 1.0::float64, float64 'Infinity' > 1.0::float64, float64 'NaN' > float64 'Infinity'
+SELECT f64 '-Infinity' < 1.0::f64, f64 'Infinity' > 1.0::f64, f64 'NaN' > f64 'Infinity'
 ----
 true
 true
 true
 
 query BBB nosort
-SELECT float64 'NaN' < float64 'NaN', float64 'NaN' > float64 'NaN', float64 'NaN' >= float64 'NaN'
+SELECT f64 'NaN' < f64 'NaN', f64 'NaN' > f64 'NaN', f64 'NaN' >= f64 'NaN'
 ----
 false
 false
 true
 
-# --- float32: same total order at single precision ----------------------------------
+# --- f32: same total order at single precision ----------------------------------
 query BBBB nosort
-SELECT 1.5::float32 < 2.5::float32, 1.5::float32 <= 2.5::float32, 1.5::float32 > 2.5::float32, 1.5::float32 >= 2.5::float32
+SELECT 1.5::f32 < 2.5::f32, 1.5::f32 <= 2.5::f32, 1.5::f32 > 2.5::f32, 1.5::f32 >= 2.5::f32
 ----
 true
 true
@@ -109,7 +109,7 @@ false
 false
 
 query BBBB nosort
-SELECT 2.5::float32 < 2.5::float32, 2.5::float32 <= 2.5::float32, 2.5::float32 > 2.5::float32, 2.5::float32 >= 2.5::float32
+SELECT 2.5::f32 < 2.5::f32, 2.5::f32 <= 2.5::f32, 2.5::f32 > 2.5::f32, 2.5::f32 >= 2.5::f32
 ----
 false
 true
@@ -147,7 +147,7 @@ SELECT 'ff000000-0000-0000-0000-000000000000'::uuid > '00000000-0000-0000-0000-0
 ----
 true
 
-# --- timestamp: by instant (int64 microseconds) -------------------------------------
+# --- timestamp: by instant (i64 microseconds) -------------------------------------
 query BBBB nosort
 SELECT timestamp '2024-01-01 00:00:00' < timestamp '2024-06-01 12:00:00', timestamp '2024-01-01 00:00:00' <= timestamp '2024-06-01 12:00:00', timestamp '2024-01-01 00:00:00' > timestamp '2024-06-01 12:00:00', timestamp '2024-01-01 00:00:00' >= timestamp '2024-06-01 12:00:00'
 ----
@@ -191,7 +191,7 @@ false
 # --- three-valued NULL propagation: a NULL operand makes every ordering op UNKNOWN ----
 # Reached through columns (a typed NULL) so each type's Lt3/Gt3 hits its NULL guard.
 statement ok
-CREATE TABLE n (id int32 PRIMARY KEY, a text, b text)
+CREATE TABLE n (id i32 PRIMARY KEY, a text, b text)
 
 statement ok
 INSERT INTO n VALUES (1, 'x', 'y'), (2, 'x', NULL), (3, NULL, 'y'), (4, NULL, NULL)

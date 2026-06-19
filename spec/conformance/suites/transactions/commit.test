@@ -4,10 +4,10 @@
 # (CREATE TABLE) inside a committed block persists too. The harness runs every record against one
 # Database handle, so this BEGIN/.../COMMIT/SELECT sequence is an ordinary deterministic entry
 # (transactions.md §10). Format + the `requires` directive: ../../../design/conformance.md.
-# requires: txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, dml.update, query.select, query.where_eq, query.order_by, types.int32
+# requires: txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, dml.update, query.select, query.where_eq, query.order_by, types.i32
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
 
 statement ok
 BEGIN
@@ -47,7 +47,7 @@ statement ok
 BEGIN
 
 statement ok
-CREATE TABLE u (id int32 PRIMARY KEY)
+CREATE TABLE u (id i32 PRIMARY KEY)
 
 statement ok
 INSERT INTO u VALUES (7)

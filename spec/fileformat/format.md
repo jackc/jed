@@ -19,10 +19,10 @@ other's output. A fourth independent encoder/decoder (the Ruby reference in
 
 The current on-disk version is **`format_version` 12** — **sequences**
 ([../design/sequences.md](../design/sequences.md)). A sequence (`CREATE SEQUENCE s`) is a
-database-level catalog object — a named, persisted, monotonic int64 generator — that owns no B-tree
+database-level catalog object — a named, persisted, monotonic i64 generator — that owns no B-tree
 and adds no value-codec change, so the only on-disk change is a **third kind of catalog entry**:
 `entry_kind = 2` (joining `0` = table, `1` = composite-type). A sequence entry carries the name, six
-fixed `int64` fields (`increment`, `min_value`, `max_value`, `start`, `cache`, `last_value`), and a
+fixed `i64` fields (`increment`, `min_value`, `max_value`, `start`, `cache`, `last_value`), and a
 `flags` byte (bit 0 `cycle`, bit 1 `is_called`) — the *Sequence entry* table in the *Catalog* section
 below. Emission order across the catalog is now **composite-type entries (kind 1), then sequence
 entries (kind 2), then table entries (kind 0)**, each group in ascending lowercased-name order; a
@@ -56,7 +56,7 @@ change).
 
 `format_version` 9 was **composite (row) types**
 ([../design/composite.md](../design/composite.md)). A user-defined composite type
-(`CREATE TYPE addr AS (street text, zip int32)`) is a database-level object, so the catalog —
+(`CREATE TYPE addr AS (street text, zip i32)`) is a database-level object, so the catalog —
 through v8 a chain of **table** entries — became a chain of **kind-tagged** entries. Three
 coupled changes, all in the catalog (the per-table data B-tree and the meta page untouched):
 
@@ -413,7 +413,7 @@ A composite-type entry records a `CREATE TYPE name AS (field type, …)` definit
 
 Fields are emitted in **declaration order** (the order they appear in `CREATE TYPE`). A field
 type code of `14` references another composite **by name** (nested composites); a field type code
-of `15` is an **array-typed field** (`xs int32[]`, [../design/array.md §12](../design/array.md) —
+of `15` is an **array-typed field** (`xs i32[]`, [../design/array.md §12](../design/array.md) —
 the mirror of an array-of-composite element), carrying the inline element descriptor **before** the
 flags byte (where a nested-composite name sits) so the element type is self-describing. The
 loader's two-pass validation rejects a dangling reference or a definition cycle — including a
@@ -439,7 +439,7 @@ always present and non-NULL, so there are no presence tags or conditional fields
 | `last_value` | i64 — same encoding (the mutable counter; `= start` on a fresh sequence) |
 | `flags` | u8 — bit0 `cycle`, bit1 `is_called`; bits 2–7 reserved, written 0 (a set reserved bit is `XX001`) |
 
-The six `int64` fields use the **interval-body encoding** (plain big-endian two's-complement) rather
+The six `i64` fields use the **interval-body encoding** (plain big-endian two's-complement) rather
 than the order-preserving sign-flip, because a catalog entry is a *value*-codec context, not a sorted
 key. `last_value` + `is_called` are the only mutable state; a `nextval` rewrites them, and the whole
 catalog is rewritten copy-on-write at the next commit (transactions.md §4.5). A sequence entry owns
@@ -482,9 +482,9 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | `type_code` | type |
 |---|---|
 | 0 | reserved |
-| 1 | `int16` |
-| 2 | `int32` |
-| 3 | `int64` |
+| 1 | `i16` |
+| 2 | `i32` |
+| 3 | `i64` |
 | 4 | `text` |
 | 5 | `boolean` |
 | 6 | `decimal` |
@@ -493,17 +493,17 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 9 | `timestamp` |
 | 10 | `timestamptz` |
 | 11 | `interval` |
-| 12 | `float64` |
-| 13 | `float32` |
+| 12 | `f64` |
+| 13 | `f32` |
 | 14 | composite (a user-defined row type — followed by the type name, **not** a fixed body; v9) |
 | 15 | array (a structural `T[]` — followed by the element type descriptor, **not** a fixed body; v10) |
 
-A **`float64`** value (`type_code == 12`) is the **8 IEEE 754 bytes, big-endian**, and a
-**`float32`** value (`type_code == 13`) is the **4 IEEE 754 bytes, big-endian** — both behind the
-presence tag, fixed-width, no length prefix, the `int64`/`uuid`/`timestamp` shape. The stored bits
+A **`f64`** value (`type_code == 12`) is the **8 IEEE 754 bytes, big-endian**, and a
+**`f32`** value (`type_code == 13`) is the **4 IEEE 754 bytes, big-endian** — both behind the
+presence tag, fixed-width, no length prefix, the `i64`/`uuid`/`timestamp` shape. The stored bits
 are preserved verbatim for every value **except `NaN`**: a stored `-0.0` keeps its sign bit and
 `±Infinity`/finite values keep theirs, but a `NaN` is **canonicalized to the single quiet pattern**
-`0x7FF8000000000000` (`float64`) / `0x7FC00000` (`float32`) on write. A NaN's payload bits are
+`0x7FF8000000000000` (`f64`) / `0x7FC00000` (`f32`) on write. A NaN's payload bits are
 core-specific (Go's `math.NaN()` is `0x7FF8…001`, hardware `Inf − Inf` is the negative `0xFFF8…`),
 so this NaN-only step is what keeps a stored NaN byte-identical across cores; everything else is
 verbatim (the `-0 = +0` collapse is a comparison/key concern only — [../design/float.md](../design/float.md)
@@ -687,7 +687,7 @@ tag alone), `0x02` **present-external-plain** (the body is an overflow pointer),
 are in *Large values* below). Any other tag is `data_corrupted`. `0x00` and `0x01` are **unchanged
 from v1**. The present-**inline-plain** body depends on the type:
 
-- **Integers** (`int16`/`int32`/`int64`) — the **same order-preserving bytes as keys**
+- **Integers** (`i16`/`i32`/`i64`) — the **same order-preserving bytes as keys**
   ([encoding.md §2.1](../design/encoding.md)): fixed-width big-endian, sign-bit flipped.
 
 - **`text`** — a **`u16` byte-length** (big-endian) then exactly that many **UTF-8 bytes** (the
@@ -709,9 +709,9 @@ from v1**. The present-**inline-plain** body depends on the type:
 - **`uuid`** — a **fixed 16-byte** body (the raw `uuid-raw16` bytes — encoding.md §2.7), with
   **no length prefix**.
 
-- **`timestamp` / `timestamptz`** — both store an **`int64` microsecond instant** via the
-  **same 8-byte order-preserving integer body as `int64`** (the two type codes 9/10 differ in
-  semantics, not bytes); the `±infinity` sentinels are the extreme `int64` values.
+- **`timestamp` / `timestamptz`** — both store an **`i64` microsecond instant** via the
+  **same 8-byte order-preserving integer body as `i64`** (the two type codes 9/10 differ in
+  semantics, not bytes); the `±infinity` sentinels are the extreme `i64` values.
 
 - **`interval`** — a **fixed 16-byte** body: **`i32` months**, **`i32` days**, **`i64` micros**,
   each **big-endian two's-complement** (plain — **no** sign-flip; this is a value codec, not an
@@ -727,8 +727,8 @@ from v1**. The present-**inline-plain** body depends on the type:
   composite **recurses** (its body is another bitmap + field bodies). A **whole-value-NULL**
   composite is the lone `0x01` tag (no bitmap). The field types come from the column's composite
   type in the catalog, so the body is self-delimiting. Worked example,
-  `addr AS (street text, zip int32)`: `('Main', 90210)` → `00`(tag) `00`(bitmap) `00 04 4D 61 69 6E`
-  (text body) `80 01 60 62` (int32 body) — an 11-byte body; `('Main', NULL)` → `00`(tag) `40`
+  `addr AS (street text, zip i32)`: `('Main', 90210)` → `00`(tag) `00`(bitmap) `00 04 4D 61 69 6E`
+  (text body) `80 01 60 62` (i32 body) — an 11-byte body; `('Main', NULL)` → `00`(tag) `40`
   (bitmap: field 1 NULL) `00 04 4D 61 69 6E` (the int field omitted) — a 7-byte body.
 
 - **array** (`type_code 15`, **v10** — [../design/array.md §4](../design/array.md)) — `ndim u8`,
@@ -740,15 +740,15 @@ from v1**. The present-**inline-plain** body depends on the type:
   value records each dimension's `len`/`lb` (the `lb` field carries a value's custom lower bound —
   [../design/array.md §12](../design/array.md)). A **whole-value-NULL** array is the lone `0x01` tag. The element
   type comes from the column's array type in the catalog, so the body is self-delimiting; fixed-width
-  elements pay **no** per-element prefix. Worked example, `int32[]`: `{1,2,3}` → `00`(tag) `01`(ndim)
-  `00`(flags) `00 00 00 03`(len) `00 00 00 01`(lb) `80 00 00 01 80 00 00 02 80 00 00 03`(three int32
+  elements pay **no** per-element prefix. Worked example, `i32[]`: `{1,2,3}` → `00`(tag) `01`(ndim)
+  `00`(flags) `00 00 00 03`(len) `00 00 00 01`(lb) `80 00 00 01 80 00 00 02 80 00 00 03`(three i32
   bodies); `{1,NULL,3}` → `00 01`(HAS_NULLS) `00 00 00 03 00 00 00 01` `40`(bitmap: elem 1 NULL) +
   the bodies for elements 0 and 2.
 
 **Rowid reconstruction (no-PK tables).** The synthetic rowid is allocated from a **monotonic
 counter** that is never reused. It is **not stored** — on load it is set to `max(rowid) + 1`
 over the table's persisted keys (0 for an empty table), exact because a no-PK key is a bare
-`int64` rowid and the rowids issued are `0, 1, 2, …`. Walking the B-tree in key order yields
+`i64` rowid and the rowids issued are `0, 1, 2, …`. Walking the B-tree in key order yields
 the rowids in ascending order; the largest is the rightmost leaf's last key.
 
 ### Large values (overflow pages + compression, v3)
@@ -926,12 +926,12 @@ the interior-node format and the split contract.
 | `bytea_table.jed` | a bytea column — the bytea branch; empty value, embedded `0x00`, a high byte, a NULL |
 | `uuid_table.jed` | a **uuid PRIMARY KEY** (the first non-integer stored key — the §8 cross-core key-path proof) + a nullable uuid column |
 | `default_table.jed` | columns with a **constant** `DEFAULT` — the `has_default` flag (bit2) + default value codec written after the typmod |
-| `default_expr_table.jed` | columns with an **expression** `DEFAULT` (v8) — the `default_is_expr` flag (bit3) + the expr-text after the typmod: a `uuid DEFAULT uuidv7()`, an `int32 DEFAULT 1 + 1`, beside a plain no-default column and a constant-default column (bit2) in the same catalog (empty table — the row eval is covered by the conformance corpus) |
-| `timestamp_table.jed` | a timestamp column — the 8-byte int64 branch; epoch, pre-1970, BC-era, `±infinity`, NULL |
+| `default_expr_table.jed` | columns with an **expression** `DEFAULT` (v8) — the `default_is_expr` flag (bit3) + the expr-text after the typmod: a `uuid DEFAULT uuidv7()`, an `i32 DEFAULT 1 + 1`, beside a plain no-default column and a constant-default column (bit2) in the same catalog (empty table — the row eval is covered by the conformance corpus) |
+| `timestamp_table.jed` | a timestamp column — the 8-byte i64 branch; epoch, pre-1970, BC-era, `±infinity`, NULL |
 | `timestamptz_table.jed` | a timestamptz column — the same 8-byte branch under type code 10 |
 | `interval_table.jed` | an interval column — the fixed 16-byte branch (i32 months ‖ i32 days ‖ i64 micros, big-endian); a positive multi-field value, a negative value, the zero interval, a months-only/`'1 mon'` value (vs a `'30 days'` value that is span-equal but byte-distinct), and a NULL (single leaf) |
-| `nopk_table.jed` | a no-PK table — the stored synthetic `int64` rowid key |
-| `composite_pk_table.jed` | a **composite PRIMARY KEY** (`int32` ‖ `int16`) — the concatenated key encoding (encoding.md §2.3) + the v5 `pk_ordinal` list; negative first component and tie-breaking second |
+| `nopk_table.jed` | a no-PK table — the stored synthetic `i64` rowid key |
+| `composite_pk_table.jed` | a **composite PRIMARY KEY** (`i32` ‖ `i16`) — the concatenated key encoding (encoding.md §2.3) + the v5 `pk_ordinal` list; negative first component and tie-breaking second |
 | `index_table.jed` | **secondary indexes** (v5) — a table whose PK list order differs from declaration order (`PRIMARY KEY (b, a)` — the lifted narrowing), one single-column index over a **nullable** column holding a NULL (the encoding.md §2.2 presence tag in stored index order, NULL last) and one auto-named two-column index; empty-payload index records |
 | `unique_table.jed` | **unique indexes** (v6) — the per-index `index_flags` byte: a `UNIQUE` constraint's auto-named `t_v_key` (over a nullable column holding two NULLs — *NULLS DISTINCT* stored side by side), a named two-column constraint, a `CREATE UNIQUE INDEX`, and one plain index (`index_flags` 0) in the same catalog |
 | `check_table.jed` | **`CHECK` constraints** (v4) — the catalog check list: an auto-named single-column check, an explicitly-named multi-column check, and a check whose text exercises the token rendering (string + decimal literals, `<=`); stored in name order |

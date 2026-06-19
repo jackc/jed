@@ -27,7 +27,7 @@
 Arrays are the **second user-facing container type** and the axis the composite (row) type
 already cleared the way for. Where composite added a *nominal* arm to the open type system
 (a `CREATE TYPE`-named, catalog-resident `Composite(ref)`), an array is a **structural** type
-constructor — `int32[]` exists for every element type with no DDL, derived on demand, the
+constructor — `i32[]` exists for every element type with no DDL, derived on demand, the
 element type carried inline. The cross-core contract is the same one composite established: not
 "the data table is byte-identical" (scalars) but "the **recursive** codec / comparator /
 NULL-rule / text-I/O is byte-identical," hand-written per core (CLAUDE.md §5 forbids
@@ -39,20 +39,20 @@ byte-identity holds *by construction*, and an array value is **self-describing a
 ## 1. Surface
 
 ```sql
-CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])
+CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])
 INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])
 INSERT INTO t VALUES (2, '{40,50}', '{}')
 SELECT id, xs, xs[1], tags FROM t ORDER BY xs
 SELECT * FROM t WHERE xs = ARRAY[40, 50]
 ```
 
-- **Structural type, dimension-agnostic.** `int32[]` is "array of `int32`" — there is no DDL to
+- **Structural type, dimension-agnostic.** `i32[]` is "array of `i32`" — there is no DDL to
   create it and no catalog entry for it; it exists the moment its element type does (§2). Matching
   PostgreSQL exactly (CLAUDE.md §1), **array shape (number of dimensions, per-dimension lengths,
-  lower bounds) is a property of the *value*, not the type**: the same `int32[]` column may hold a
+  lower bounds) is a property of the *value*, not the type**: the same `i32[]` column may hold a
   3-element array in one row and a 2×2 array in another, and a declared size like
-  `int32[3]` enforces nothing. This is the one place arrays relax "strict static" (CLAUDE.md §4) —
-  but only on *shape*; the **element type stays static and strictly enforced** (an `int32[]` never
+  `i32[3]` enforces nothing. This is the one place arrays relax "strict static" (CLAUDE.md §4) —
+  but only on *shape*; the **element type stays static and strictly enforced** (an `i32[]` never
   holds a `text` element), which is the part of §4 that matters. See §10.1.
 - **Element type** is any *existing* type — a built-in scalar or a previously-defined composite —
   **except another array** (PG-faithful: multidimensionality is a value property, *not*
@@ -65,7 +65,7 @@ SELECT * FROM t WHERE xs = ARRAY[40, 50]
   dimensionality — one canonical name per type (determinism, [types.md §2](types.md)).
 - **Two constructors, both PG.** `ARRAY[e1, e2, …]` (the expression constructor — elements are
   arbitrary expressions, unified to one element type) and the `'{…}'` text literal coerced by a
-  named type (`'{1,2,3}'::int32[]`, `int32[] '{1,2,3}'`). `ARRAY[]::int32[]` is the empty array;
+  named type (`'{1,2,3}'::i32[]`, `i32[] '{1,2,3}'`). `ARRAY[]::i32[]` is the empty array;
   `'{}'` is the empty array (zero elements, `ndim = 0` — §4).
 - **Subscripting** `a[i]` reads the *i*-th element, **1-based**, returning the element type;
   an out-of-bounds or NULL subscript yields **NULL**, never an error (PG; §6).
@@ -89,7 +89,7 @@ Composite opened the type system; arrays add the **third arm**, and a **structur
 - `Array` carries its **element `Type` inline** (a boxed/owned recursive `Type`), *not* a catalog
   reference. This is the structural↔nominal split decided in design: composite is nominal (two
   same-shaped composites are distinct types, identified by catalog id+name), arrays are structural
-  (two `int32[]` are the same type because their element types are equal). It matches PostgreSQL
+  (two `i32[]` are the same type because their element types are equal). It matches PostgreSQL
   observably — PG materializes a companion array type per element (`typarray`/`_int4`), but array
   type identity in PG is a **bijection on the element type** (exactly one array type per element,
   no surface to name or distinguish a second), so a structural representation computes the
@@ -97,8 +97,8 @@ Composite opened the type system; arrays add the **third arm**, and a **structur
   (Rust `enum Type` gains `Array(Box<Type>)`; Go a tagged `Type` with an `Elem *Type`; TS a
   `{kind:"array", elem:Type}` union arm.)
 - The element type is constrained to **`Scalar | Composite`** — *not* `Array` — because
-  multidimensionality is a value property (§4), not array-of-array. `int32[][]` parses to
-  `Array(Scalar(int32))` with a *value* `ndim` of 2, never `Array(Array(int32))`. (A future
+  multidimensionality is a value property (§4), not array-of-array. `i32[][]` parses to
+  `Array(Scalar(i32))` with a *value* `ndim` of 2, never `Array(Array(i32))`. (A future
   array-of-array, if ever wanted, would be a deliberate divergence from PG and is **not** this
   axis.)
 - An array **value** is `Value::Array { ndim, dims, lbounds, elements }` (Rust) / a `ValArray`
@@ -175,7 +175,7 @@ element bodies     each PRESENT element's value-codec BODY, no presence tag, row
   no elements.
 - A **whole-value-NULL** array is the lone `0x01` presence tag, no body.
 
-Worked examples, `int32[]` (element body = the `int32` value-codec body, 4 bytes BE):
+Worked examples, `i32[]` (element body = the `i32` value-codec body, 4 bytes BE):
 
 | value | bytes (body, after the present tag) |
 |---|---|
@@ -184,7 +184,7 @@ Worked examples, `int32[]` (element body = the `int32` value-codec body, 4 bytes
 | `{1,NULL,3}` | `01` `01`(HAS_NULLS) `00000003` `00000001` `40`(bitmap: elem 1 NULL) ‖ `<b(1)><b(3)>` |
 | whole-value NULL | (no body; the value is the lone `0x01` tag) |
 
-An `int32[]` of 3 non-null elements is **22 bytes** (vs PG's ~32+); an `int32[]` of N elements is
+An `i32[]` of 3 non-null elements is **22 bytes** (vs PG's ~32+); an `i32[]` of N elements is
 `10 + 4N` bytes. An array is one opaque inline body that **spills via the existing large-values
 overflow + LZ4 path** ([large-values.md](large-values.md)) when it exceeds `RECORD_MAX` — and a
 repetitive numeric array compresses very well. Element-*internal* per-element spill is deferred; an
@@ -201,7 +201,7 @@ case in the value module's `eq3` / `lt3` / `gt3`, not a [../functions/catalog.to
 operator row (the catalog cannot express "recurse over N elements"; CLAUDE.md §5 forbids
 codegenning it). [compare.toml](../types/compare.toml) stays scalar-only. Two array values are
 comparable iff they share the **same element type**; any other pair is `42804` at resolve time
-(`int32[]` vs `text[]` is not comparable, exactly as `int32` vs `text` is not).
+(`i32[]` vs `text[]` is not comparable, exactly as `i32` vs `text` is not).
 
 **The load-bearing difference from composite: arrays do NOT use 3VL for NULL elements.** PostgreSQL
 array comparison (`array_eq` / `array_cmp`) is built on the element type's **btree** comparison, in
@@ -214,7 +214,7 @@ oracle (the composite `IS NULL` rule was oracle-corrected — expect the same sc
 - **Equality (`=`, `<>`):** TRUE iff same dimensionality **and** lower bounds *and* every element
   pair is equal-or-both-NULL; else FALSE (oracle-pinned): `ARRAY[1,NULL] = ARRAY[1,NULL]` → **TRUE**,
   `ARRAY[1,NULL] = ARRAY[1,2]` → **FALSE**, `ARRAY[1,2] = ARRAY[1,2,3]` → **FALSE** (length differs),
-  and **`'[2:4]={1,2,3}'::int32[] = '{1,2,3}'::int32[]` → FALSE** (same elements, but lower bound 2 vs
+  and **`'[2:4]={1,2,3}'::i32[] = '{1,2,3}'::i32[]` → FALSE** (same elements, but lower bound 2 vs
   1 — `array_eq` considers lower bounds, §10.3). `<>` is the boolean negation (not a 3VL negation).
 - **Ordering (`< <= > >=`, and the ORDER BY / DISTINCT / GROUP BY sort key):** the PG `array_cmp`
   total order — element-wise over the **flattened** element order (the first element pair that is not
@@ -241,7 +241,7 @@ pair UNKNOWN and break the "always a definite boolean" guarantee). So a NULL *fi
 composite element is comparable exactly like a NULL *element* is: two composite elements with equal
 non-NULL fields and matching NULL fields are **equal**, and a NULL field sorts after any non-NULL
 field. This keeps `=` / `array_cmp` / `ORDER BY` / `DISTINCT` / `GROUP BY` mutually consistent for
-`addr[]`. Oracle-pinned (`addr AS (street text, zip int32)`):
+`addr[]`. Oracle-pinned (`addr AS (street text, zip i32)`):
 
 - `ARRAY[ROW(1,NULL)::addr] = ARRAY[ROW(1,NULL)::addr]` → **TRUE** (the NULL field is comparable —
   contrast the bare `ROW(1,NULL) = ROW(1,NULL)`, which is UNKNOWN under composite 3VL).
@@ -309,7 +309,7 @@ bytea/uuid/composite; [conformance.md §1](conformance.md)) — **no new tag**.
   round-trip). A multidim literal must be **rectangular**, and a declared prefix's dimensions must
   match the contents (else `22P02`); a prefix with `u < l` is `2202E`. A malformed literal is
   `22P02`; a bad element value surfaces that element's own parse error.
-- An array literal is `'{1,2,3}'::int32[]` or `int32[] '{1,2,3}'` — the cast / typed-literal
+- An array literal is `'{1,2,3}'::i32[]` or `i32[] '{1,2,3}'` — the cast / typed-literal
   machinery routes the **string-literal → array** coercion through `array_in`, the same
   out-of-matrix path string-literal → scalar/composite coercions use (so
   [../types/casts.toml](../types/casts.toml) stays scalar-only). A bare `NULL` casts to the array; a
@@ -350,7 +350,7 @@ recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_overrid
 corpus lands.
 
 1. **Match PG semantics; array shape is a *value* property** — dimensionality, per-dimension
-   lengths, and lower bounds live in the value, declared sizes (`int32[3]`) enforce nothing, a column
+   lengths, and lower bounds live in the value, declared sizes (`i32[3]`) enforce nothing, a column
    holds arrays of mixed dimensionality. This relaxes "strict static" (CLAUDE.md §4) **only on
    shape**; the **element type stays static and strictly enforced**. Matching PG *is* the §1 default,
    so this is the baseline, not a ledgered divergence.
@@ -376,8 +376,8 @@ corpus lands.
    `array_cmp` and a deliberate contrast with composite row-comparison 3VL. Oracle-pinned.
 6. **`IS NULL` tests the whole value only, not element-wise** (§5) — the contrast with composite's
    all-fields rule. PG; oracle-pinned.
-7. **Multidimensionality is a value property, not array-of-array** (§2) — `int32[][]` is
-   `Array(Scalar(int32))` with value `ndim` 2, never `Array(Array(int32))`. Multidim construction
+7. **Multidimensionality is a value property, not array-of-array** (§2) — `i32[][]` is
+   `Array(Scalar(i32))` with value `ndim` 2, never `Array(Array(i32))`. Multidim construction
    (`ARRAY[ARRAY[…],…]` stacking — rectangular or `2202E`; `'{{…},{…}}'` literal) landed in S5; the
    codec header already carried `ndim`/`dims`/`lbounds`, so it was a pure unlock (no format bump —
    still `format_version` 10). The resolved type renders as `T[]` regardless of a value's `ndim`.
@@ -392,7 +392,7 @@ corpus lands.
     access `(a[i]).f`). A composite element keeps array btree NULL-comparable semantics (decision 5)
     by bottoming the per-element compare out in the composite sort key, so an array comparison stays a
     definite boolean even when a composite element has a NULL field. Oracle-pinned. The mirror nesting
-    — a composite type with an **array-typed field** (`CREATE TYPE t AS (xs int32[])`) — landed
+    — a composite type with an **array-typed field** (`CREATE TYPE t AS (xs i32[])`) — landed
     (composite.md §12), and `unnest(composite[])` + the polymorphic array **function/operator** surface
     over composite elements landed (AF7, [array-functions.md §13](array-functions.md)).
 
@@ -461,7 +461,7 @@ capabilities `func.array` + `func.unnest` + `func.array_containment` + `func.arr
 `func.variadic`). The array function/operator surface is **complete**.
 
 - **AC1 ✅** — **array-of-composite elements**: a composite type is now a first-class array element
-  type (`CREATE TABLE t (id int32 PRIMARY KEY, items addr[])`). The catalog already framed it
+  type (`CREATE TABLE t (id i32 PRIMARY KEY, items addr[])`). The catalog already framed it
   (`element_type_code = 14` + name, §3) and the value codec/comparison/text-I/O already recursed, so
   **no `format_version` bump** (still 10) — this slice **lifts the three `0A000` gates** (the `addr[]`
   column declaration, the `'{…}'::addr[]` literal cast, and `array_in`'s composite-element coercion)
@@ -476,7 +476,7 @@ capabilities `func.array` + `func.unnest` + `func.array_containment` + `func.arr
   `types.array_composite`.
 
 **The mirror nesting landed (`CMP-ARR-FIELD`)** — a composite type with an **array-typed field**
-(`CREATE TYPE poly AS (name text, pts int32[])`; capability `types.composite_array_field`). It
+(`CREATE TYPE poly AS (name text, pts i32[])`; capability `types.composite_array_field`). It
 touches the composite-type *catalog* serialization (a `field_type_code = 15` array field carrying
 the inline element descriptor, §3 — before the field flags byte, no `format_version` bump, still
 10), not the array-column path; the value codec / comparison / `record_out` / `record_in` recurse

@@ -60,7 +60,7 @@ func siErr(t *testing.T, db *Database, sql string) string {
 func siDB20(t *testing.T) *Database {
 	t.Helper()
 	db := NewDatabase()
-	siRun(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)")
+	siRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
 	for i := 1; i <= 20; i++ {
 		siRun(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d, %d)", i, i%5, i))
 	}
@@ -73,7 +73,7 @@ func siDB20(t *testing.T) *Database {
 // indexes in ascending lowercased-name order.
 func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 	db := NewDatabase()
-	siRun(t, db, "CREATE TABLE T (A int32 PRIMARY KEY, B int32)")
+	siRun(t, db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)")
 	siRun(t, db, "CREATE INDEX ON T (B)")    // t_b_idx
 	siRun(t, db, "CREATE INDEX ON T (B)")    // t_b_idx1
 	siRun(t, db, "CREATE INDEX ON T (B)")    // t_b_idx2
@@ -102,7 +102,7 @@ func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 // tables; DROP mismatches are 42704/42809.
 func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
 	db := NewDatabase()
-	siRun(t, db, "CREATE TABLE t (a int32 PRIMARY KEY, s text)")
+	siRun(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, s text)")
 	if got := siErr(t, db, "CREATE INDEX i ON nosuch (nope)"); got != "42P01" {
 		t.Fatalf("missing table: %s", got)
 	}
@@ -119,7 +119,7 @@ func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
 	if got := siErr(t, db, "CREATE INDEX t ON t (a)"); got != "42P07" {
 		t.Fatalf("index name vs table: %s", got)
 	}
-	if got := siErr(t, db, "CREATE TABLE taken (x int32)"); got != "42P07" {
+	if got := siErr(t, db, "CREATE TABLE taken (x i32)"); got != "42P07" {
 		t.Fatalf("table name vs index: %s", got)
 	}
 	if got := siErr(t, db, "DROP INDEX nosuch"); got != "42704" {
@@ -137,17 +137,17 @@ func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
 	}
 	siRun(t, db, "CREATE INDEX taken ON t (a)")
 	siRun(t, db, "DROP TABLE t")
-	siRun(t, db, "CREATE TABLE taken (x int32)") // DROP TABLE freed its index names
+	siRun(t, db, "CREATE TABLE taken (x i32)") // DROP TABLE freed its index names
 	// The lookahead keeps every word non-reserved (grammar.md §30): the unnamed form
 	// over a table named `on`, and an index explicitly named `on`.
-	siRun(t, db, "CREATE TABLE on (x int32)")
+	siRun(t, db, "CREATE TABLE on (x i32)")
 	siRun(t, db, "CREATE INDEX ON on (x)")
 	onTab, _ := db.Table("on")
 	if onTab.Indexes[0].Name != "on_x_idx" {
 		t.Fatalf("auto-name over table on: %s", onTab.Indexes[0].Name)
 	}
 	siRun(t, db, "DROP TABLE on") // free the name `on` in the relation namespace
-	siRun(t, db, "CREATE TABLE q (x int32)")
+	siRun(t, db, "CREATE TABLE q (x i32)")
 	siRun(t, db, "CREATE INDEX on ON q (x)")
 	qTab, _ := db.Table("q")
 	if qTab.Indexes[0].Name != "on" {
@@ -260,7 +260,7 @@ func TestIndexFileBackedPagedReopen(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	siRun(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)")
+	siRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
 	for i := 1; i <= 20; i++ {
 		siRun(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d, %d)", i, i%5, i))
 	}

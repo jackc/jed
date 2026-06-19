@@ -10,10 +10,10 @@
 # oracle overrides and sit LAST — a PG-failing `statement ok` would poison the oracle
 # replay prefix).
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.drop_table, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.drop_table, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TABLE t (a int32 PRIMARY KEY, b int32, s text)
+CREATE TABLE t (a i32 PRIMARY KEY, b i32, s text)
 
 # an index on an empty table builds for free (no rows, no nodes)
 # cost: 0
@@ -66,7 +66,7 @@ CREATE INDEX t ON t (b)
 
 # a table may not take an index's name
 statement error 42P07
-CREATE TABLE explicit_b (x int32)
+CREATE TABLE explicit_b (x i32)
 
 # the auto-namer found t_a_b_idx taken? no — it chose it; an explicit clash proves the
 # derived name exists
@@ -95,7 +95,7 @@ DROP INDEX explicit_b
 
 # after the drop the name is free again — for any relation kind
 statement ok
-CREATE TABLE explicit_b (x int32)
+CREATE TABLE explicit_b (x i32)
 
 statement ok
 DROP TABLE explicit_b
@@ -112,7 +112,7 @@ statement ok
 DROP TABLE t
 
 statement ok
-CREATE TABLE t_b_idx (x int32)
+CREATE TABLE t_b_idx (x i32)
 
 statement ok
 DROP TABLE t_b_idx
@@ -120,7 +120,7 @@ DROP TABLE t_b_idx
 # --- indexes keep working as relations come and go ------------------------------
 
 statement ok
-CREATE TABLE r (id int32 PRIMARY KEY, v int32)
+CREATE TABLE r (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO r VALUES (1, 5), (2, 5), (3, 6)
@@ -139,7 +139,7 @@ SELECT id FROM r WHERE v = 5 ORDER BY id
 # `on`, and an index explicitly named `on`. PostgreSQL reserves ON, so it cannot parse
 # these — they sit LAST with oracle overrides (conformance.md §5).
 statement ok
-CREATE TABLE on (x int32)
+CREATE TABLE on (x i32)
 
 statement ok
 CREATE INDEX ON on (x)
@@ -151,7 +151,7 @@ statement ok
 DROP TABLE on
 
 statement ok
-CREATE TABLE q (x int32)
+CREATE TABLE q (x i32)
 
 statement ok
 CREATE INDEX on ON q (x)

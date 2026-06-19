@@ -392,7 +392,7 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             w.write_all(&[8])?;
             w.write_all(&m.to_le_bytes())
         }
-        // Date — tag 17 (the int32 day count); internal merge-sort scratch format (spec/design/date.md).
+        // Date — tag 17 (the i32 day count); internal merge-sort scratch format (spec/design/date.md).
         Value::Date(d) => {
             w.write_all(&[17])?;
             w.write_all(&d.to_le_bytes())

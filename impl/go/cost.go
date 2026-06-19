@@ -21,7 +21,7 @@ import "fmt"
 // §13). Threaded by pointer through the executor and the recursive expression evaluator;
 // the accrued total is reported on Outcome.
 type Meter struct {
-	// Accrued is the total cost so far (CLAUDE.md §13). int64 mirrors the engine's
+	// Accrued is the total cost so far (CLAUDE.md §13). i64 mirrors the engine's
 	// native integer; the ceiling compares against this same counter.
 	Accrued int64
 	// Limit is the caller-set cost ceiling, or 0 (the default) for unlimited. A positive

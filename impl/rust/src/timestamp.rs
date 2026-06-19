@@ -1,5 +1,5 @@
 //! The `timestamp` / `timestamptz` calendar math, parsing, and rendering
-//! (spec/design/timestamp.md). Both types are an `int64` count of microseconds since the
+//! (spec/design/timestamp.md). Both types are an `i64` count of microseconds since the
 //! Unix epoch (1970-01-01 00:00:00 UTC), proleptic Gregorian, no leap seconds.
 //!
 //! This is a §8 determinism hotspot: the civil↔instant conversion (Howard Hinnant's
@@ -10,9 +10,9 @@
 
 use crate::error::{EngineError, Result, SqlState};
 
-/// The `-infinity` sentinel — the smallest `int64`, sorts before every finite instant.
+/// The `-infinity` sentinel — the smallest `i64`, sorts before every finite instant.
 pub const NEG_INFINITY: i64 = i64::MIN;
-/// The `+infinity` sentinel — the largest `int64`, sorts after every finite instant.
+/// The `+infinity` sentinel — the largest `i64`, sorts after every finite instant.
 pub const POS_INFINITY: i64 = i64::MAX;
 
 const MICROS_PER_SEC: i64 = 1_000_000;

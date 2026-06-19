@@ -200,8 +200,8 @@ current cores cannot disagree about because they agree by construction.** The ax
 actually generate spec-leakage:
 
 - **Numeric tower.** Rust and Go *both* have native fixed-width two's-complement integers,
-  so they agree on `int16/int32/int64` and overflow (CLAUDE.md §4/§8) almost for free.
-  **JavaScript has no native int64 — only `f64` + `BigInt`.** A core whose only number is
+  so they agree on `i16/i32/i64` and overflow (CLAUDE.md §4/§8) almost for free.
+  **JavaScript has no native i64 — only `f64` + `BigInt`.** A core whose only number is
   `f64` *forces* the spec to confront integer semantics the current pair quietly satisfies.
   This is the single highest-yield axis not currently exercised.
 - **String encoding.** Rust and Go are both **UTF-8**. Java, C#, and JS are **UTF-16**

@@ -704,7 +704,7 @@ impl Parser {
             let fname = self.expect_identifier()?;
             let base_type = self.expect_identifier()?;
             let type_mod = self.parse_type_mod()?;
-            // An array-typed field (`xs int32[]`) — the same `[]` suffix a column type takes
+            // An array-typed field (`xs i32[]`) — the same `[]` suffix a column type takes
             // (spec/design/array.md §1); the canonical spelling carries the brackets.
             let type_name = if self.consume_array_brackets()? {
                 format!("{base_type}[]")
@@ -968,7 +968,7 @@ impl Parser {
         if v < i64::MIN as i128 || v > i64::MAX as i128 {
             return Err(EngineError::new(
                 SqlState::NumericValueOutOfRange,
-                "sequence parameter out of int64 range".to_string(),
+                "sequence parameter out of i64 range".to_string(),
             ));
         }
         Ok(v as i64)
@@ -2194,7 +2194,7 @@ impl Parser {
         if matches!(self.peek(), Token::Minus) {
             self.advance();
             // Fold unary-minus-of-an-integer-literal into one negative literal: this
-            // makes int64::MIN representable (`-(2^63)`) and lets the negative value
+            // makes i64::MIN representable (`-(2^63)`) and lets the negative value
             // range-check against its context like any literal (spec/design/types.md §6).
             // SUPPRESSED when a `::` immediately follows the literal: `::` binds tighter than
             // unary minus (PostgreSQL), so `-N::T` is `-(N::T)` — the cast applies to the

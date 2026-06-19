@@ -61,11 +61,11 @@ fn index_names(db: &Database, table: &str) -> Vec<(String, bool)> {
 #[test]
 fn constraint_naming_matches_postgres() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TABLE other (x int32)");
+    run(&mut db, "CREATE TABLE other (x i32)");
     run(&mut db, "CREATE INDEX walk_a_key ON other (x)"); // occupies the derived base
     run(
         &mut db,
-        "CREATE TABLE Walk (a int32 UNIQUE, b int32, CONSTRAINT Named UNIQUE (b, a), CONSTRAINT walk_b_check CHECK (b > 0), UNIQUE (b))",
+        "CREATE TABLE Walk (a i32 UNIQUE, b i32, CONSTRAINT Named UNIQUE (b, a), CONSTRAINT walk_b_check CHECK (b > 0), UNIQUE (b))",
     );
     // walk_a_key taken by a relation -> walk_a_key1; walk_b_key derived past the CHECK
     // name walk_b_check (different name, no walk needed); Named kept as written.
@@ -80,7 +80,7 @@ fn constraint_naming_matches_postgres() {
     // A derived name walks past a CHECK name too (PG-probed: w1_a_key -> w1_a_key1).
     run(
         &mut db,
-        "CREATE TABLE w1 (a int32, CONSTRAINT w1_a_key CHECK (a > 0), UNIQUE (a))",
+        "CREATE TABLE w1 (a i32, CONSTRAINT w1_a_key CHECK (a > 0), UNIQUE (a))",
     );
     assert_eq!(
         index_names(&db, "w1"),
@@ -95,37 +95,34 @@ fn constraint_naming_matches_postgres() {
 fn dedup_and_pk_fold_match_postgres() {
     let mut db = Database::new();
     // Repeated bare UNIQUE + the table-level twin all fold into one auto-named index.
-    run(
-        &mut db,
-        "CREATE TABLE e3 (a int32 UNIQUE UNIQUE, UNIQUE (a))",
-    );
+    run(&mut db, "CREATE TABLE e3 (a i32 UNIQUE UNIQUE, UNIQUE (a))");
     assert_eq!(index_names(&db, "e3"), vec![("e3_a_key".to_string(), true)]);
     // An unnamed-then-named pair keeps the NAME (PG: p1 kept "named").
     run(
         &mut db,
-        "CREATE TABLE p1 (a int32 UNIQUE, CONSTRAINT named UNIQUE (a))",
+        "CREATE TABLE p1 (a i32 UNIQUE, CONSTRAINT named UNIQUE (a))",
     );
     assert_eq!(index_names(&db, "p1"), vec![("named".to_string(), true)]);
     // Two named duplicates keep the FIRST (PG: e7 kept "x").
     run(
         &mut db,
-        "CREATE TABLE e7 (a int32, CONSTRAINT x UNIQUE (a), CONSTRAINT y UNIQUE (a))",
+        "CREATE TABLE e7 (a i32, CONSTRAINT x UNIQUE (a), CONSTRAINT y UNIQUE (a))",
     );
     assert_eq!(index_names(&db, "e7"), vec![("x".to_string(), true)]);
     // The PK absorbs an identical list — regardless of declaration order or form.
-    run(&mut db, "CREATE TABLE e5 (a int32 PRIMARY KEY UNIQUE)");
+    run(&mut db, "CREATE TABLE e5 (a i32 PRIMARY KEY UNIQUE)");
     assert_eq!(index_names(&db, "e5"), vec![]);
-    run(&mut db, "CREATE TABLE p2 (a int32 UNIQUE, PRIMARY KEY (a))");
+    run(&mut db, "CREATE TABLE p2 (a i32 UNIQUE, PRIMARY KEY (a))");
     assert_eq!(index_names(&db, "p2"), vec![]);
     run(
         &mut db,
-        "CREATE TABLE e9 (a int32, b int32, PRIMARY KEY (a, b), UNIQUE (a, b))",
+        "CREATE TABLE e9 (a i32, b i32, PRIMARY KEY (a, b), UNIQUE (a, b))",
     );
     assert_eq!(index_names(&db, "e9"), vec![]);
     // A differing member ORDER is a distinct constraint (PG: p3 kept both).
     run(
         &mut db,
-        "CREATE TABLE p3 (a int32, b int32, PRIMARY KEY (a, b), UNIQUE (b, a))",
+        "CREATE TABLE p3 (a i32, b i32, PRIMARY KEY (a, b), UNIQUE (b, a))",
     );
     assert_eq!(
         index_names(&db, "p3"),
@@ -140,31 +137,31 @@ fn dedup_and_pk_fold_match_postgres() {
 #[test]
 fn ddl_errors_match_postgres() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TABLE other (x int32)");
+    run(&mut db, "CREATE TABLE other (x i32)");
     // Member resolution, PG's wording-bearing codes.
     assert_eq!(
-        err_code(&mut db, "CREATE TABLE e2 (a int32, UNIQUE (nosuch))"),
+        err_code(&mut db, "CREATE TABLE e2 (a i32, UNIQUE (nosuch))"),
         "42703"
     );
     assert_eq!(
-        err_code(&mut db, "CREATE TABLE e1 (a int32, UNIQUE (a, a))"),
+        err_code(&mut db, "CREATE TABLE e1 (a i32, UNIQUE (a, a))"),
         "42701"
     );
     assert_eq!(
-        err_code(&mut db, "CREATE TABLE e6 (a int32, s text UNIQUE)"),
+        err_code(&mut db, "CREATE TABLE e6 (a i32, s text UNIQUE)"),
         "0A000"
     );
     // UNIQUE members resolve BEFORE any CHECK validates (PG: z1/z2), in either order.
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE z1 (a int32, CHECK (nosuch1 > 0), UNIQUE (nosuch2))"
+            "CREATE TABLE z1 (a i32, CHECK (nosuch1 > 0), UNIQUE (nosuch2))"
         ),
         "42703"
     );
     let msg = err_msg(
         &mut db,
-        "CREATE TABLE z2 (a int32, UNIQUE (nosuch2), CHECK (nosuch1 > 0))",
+        "CREATE TABLE z2 (a i32, UNIQUE (nosuch2), CHECK (nosuch1 > 0))",
     );
     assert!(msg.contains("nosuch2"), "unique member first: {msg}");
     // An explicit constraint name collides in the RELATION namespace: an existing table,
@@ -172,21 +169,18 @@ fn ddl_errors_match_postgres() {
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE c2 (a int32, CONSTRAINT other UNIQUE (a))"
+            "CREATE TABLE c2 (a i32, CONSTRAINT other UNIQUE (a))"
         ),
+        "42P07"
+    );
+    assert_eq!(
+        err_code(&mut db, "CREATE TABLE p4 (a i32, CONSTRAINT p4 UNIQUE (a))"),
         "42P07"
     );
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE p4 (a int32, CONSTRAINT p4 UNIQUE (a))"
-        ),
-        "42P07"
-    );
-    assert_eq!(
-        err_code(
-            &mut db,
-            "CREATE TABLE e8 (a int32, CONSTRAINT x UNIQUE (a), b int32, CONSTRAINT x UNIQUE (b))"
+            "CREATE TABLE e8 (a i32, CONSTRAINT x UNIQUE (a), b i32, CONSTRAINT x UNIQUE (b))"
         ),
         "42P07"
     );
@@ -195,22 +189,19 @@ fn ddl_errors_match_postgres() {
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE z4 (a int32, CONSTRAINT zc CHECK (a > 0), CONSTRAINT zc UNIQUE (a))"
+            "CREATE TABLE z4 (a i32, CONSTRAINT zc CHECK (a > 0), CONSTRAINT zc UNIQUE (a))"
         ),
         "42710"
     );
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE z5 (a int32, CONSTRAINT zc UNIQUE (a), CONSTRAINT zc CHECK (a > 0))"
+            "CREATE TABLE z5 (a i32, CONSTRAINT zc UNIQUE (a), CONSTRAINT zc CHECK (a > 0))"
         ),
         "42710"
     );
     // CREATE UNIQUE <not-index> is a syntax error.
-    assert_eq!(
-        err_code(&mut db, "CREATE UNIQUE TABLE t (a int32)"),
-        "42601"
-    );
+    assert_eq!(err_code(&mut db, "CREATE UNIQUE TABLE t (a i32)"), "42601");
 }
 
 /// INSERT enforcement (indexes.md §8): a duplicate against the store or within the batch
@@ -222,7 +213,7 @@ fn insert_enforcement() {
     let mut db = Database::new();
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32 UNIQUE, w int32, CONSTRAINT wv UNIQUE (w, v), CHECK (id < 100))",
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32, CONSTRAINT wv UNIQUE (w, v), CHECK (id < 100))",
     );
     run(&mut db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)");
     // A stored duplicate; the message names the violated index.
@@ -249,7 +240,7 @@ fn insert_enforcement() {
     // table — beside t_v_key the component dup would always be reported first).
     run(
         &mut db,
-        "CREATE TABLE c (id int32 PRIMARY KEY, w int32, v int32, CONSTRAINT wv2 UNIQUE (w, v))",
+        "CREATE TABLE c (id i32 PRIMARY KEY, w i32, v i32, CONSTRAINT wv2 UNIQUE (w, v))",
     );
     run(&mut db, "INSERT INTO c VALUES (1, 40, 400)");
     let msg = err_msg(&mut db, "INSERT INTO c VALUES (2, 40, 400)");
@@ -284,10 +275,7 @@ fn insert_enforcement() {
 #[test]
 fn update_enforcement_end_state() {
     let mut db = Database::new();
-    run(
-        &mut db,
-        "CREATE TABLE m (id int32 PRIMARY KEY, v int32 UNIQUE)",
-    );
+    run(&mut db, "CREATE TABLE m (id i32 PRIMARY KEY, v i32 UNIQUE)");
     run(&mut db, "INSERT INTO m VALUES (1, 1), (2, 2), (3, 30)");
     // PG fails both of these on the transient per-row collision; jed's end state is unique.
     run(&mut db, "UPDATE m SET v = v + 1 WHERE id < 3"); // 1,2 -> 2,3
@@ -322,10 +310,7 @@ fn update_enforcement_end_state() {
 #[test]
 fn create_unique_index_build() {
     let mut db = Database::new();
-    run(
-        &mut db,
-        "CREATE TABLE d (id int32 PRIMARY KEY, a int32, n int32)",
-    );
+    run(&mut db, "CREATE TABLE d (id i32 PRIMARY KEY, a i32, n i32)");
     run(
         &mut db,
         "INSERT INTO d VALUES (1, 7, NULL), (2, 7, NULL), (3, 8, 5)",
@@ -335,7 +320,7 @@ fn create_unique_index_build() {
     assert!(msg.contains("dup"), "names the failed index: {msg}");
     assert_eq!(index_names(&db, "d"), vec![]);
     // The name is free again (nothing was created).
-    run(&mut db, "CREATE TABLE dup (x int32)");
+    run(&mut db, "CREATE TABLE dup (x i32)");
     run(&mut db, "DROP TABLE dup");
     // NULLs are exempt at build time (two NULLs in n).
     run(&mut db, "CREATE UNIQUE INDEX ON d (n)"); // d_n_idx — the _idx auto-name
@@ -351,10 +336,7 @@ fn create_unique_index_build() {
 #[test]
 fn drop_index_drops_the_constraint() {
     let mut db = Database::new();
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32 UNIQUE)",
-    );
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE)");
     run(&mut db, "INSERT INTO t VALUES (1, 10)");
     assert_eq!(err_code(&mut db, "INSERT INTO t VALUES (2, 10)"), "23505");
     run(&mut db, "DROP INDEX t_v_key");
@@ -368,10 +350,7 @@ fn drop_index_drops_the_constraint() {
 #[test]
 fn costs_are_unchanged_by_unique() {
     let mut db = Database::new();
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)",
-    );
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
     for i in 1..=20 {
         run(
             &mut db,
@@ -394,7 +373,7 @@ fn round_trip_preserves_unique() {
     let mut db = Database::new();
     run(
         &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32 UNIQUE, w int32)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32)",
     );
     run(&mut db, "CREATE INDEX plain ON t (w)");
     run(&mut db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)");
@@ -417,7 +396,7 @@ fn round_trip_preserves_unique() {
 #[test]
 fn transactional_ddl_rolls_back() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
     run(&mut db, "INSERT INTO t VALUES (1, 10)");
     run(&mut db, "BEGIN");
     run(&mut db, "CREATE UNIQUE INDEX u ON t (v)");

@@ -121,7 +121,7 @@ pub struct CompositeField {
     pub not_null: bool,
 }
 
-/// A **sequence** (spec/design/sequences.md): a named, persisted, monotonic int64 generator —
+/// A **sequence** (spec/design/sequences.md): a named, persisted, monotonic i64 generator —
 /// the third database-level catalog-object kind (after tables and composite types). The
 /// definition fields (`increment`/`min_value`/`max_value`/`start`/`cache`/`cycle`) are immutable;
 /// `last_value` + `is_called` are the mutable counter state a `nextval` advances. The whole struct

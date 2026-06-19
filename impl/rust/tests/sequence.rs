@@ -156,10 +156,7 @@ fn alter_non_restart_is_0a000() {
     );
     assert_eq!(err_code(&mut db, "ALTER SEQUENCE s OWNED BY t.c"), "0A000");
     // ALTER of a non-sequence object is not a known statement at all → 42601 (no escape hatch).
-    assert_eq!(
-        err_code(&mut db, "ALTER TABLE t ADD COLUMN c int32"),
-        "42601"
-    );
+    assert_eq!(err_code(&mut db, "ALTER TABLE t ADD COLUMN c i32"), "42601");
 }
 
 /// `setval`/`ALTER … RESTART` are writes — a READ ONLY transaction rejects each with 25006 (each in

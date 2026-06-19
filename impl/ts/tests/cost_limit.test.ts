@@ -11,7 +11,7 @@ import { Database, EngineError, execute } from "../src/lib.ts";
 
 function rowTable(n: number): Database {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);
   execute(db, "INSERT INTO t VALUES " + parts.join(","));

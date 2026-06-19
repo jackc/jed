@@ -3,7 +3,7 @@
 # The calendar/parse/render arithmetic of spec/design/timestamp.md, pinned as
 # (input -> micros), (input -> error), and (micros -> text) vectors. A core's
 # timestamp implementation is conformant iff, for every vector below:
-#   parse        parse(input, type) == micros        (the int64 µs since 1970-01-01 UTC)
+#   parse        parse(input, type) == micros        (the i64 µs since 1970-01-01 UTC)
 #   parse_error  parse(input, type) traps `error`    (the SQLSTATE, raised at resolve)
 #   render       render(micros, type) == text        (the canonical output string)
 # Reasoning + the algorithm live in ../design/timestamp.md. micros are computed by the
@@ -86,7 +86,7 @@ cases = [
   # documented divergence (../design/timestamp.md §3, oracle-checked).
   { input = "2024-01-01 12:00:60",       error = "22008" },  # second 60
   { input = "2024-01-01 24:00:01",       error = "22008" },  # 24:xx other than exactly 24:00:00
-  { input = "300000-01-01 00:00:00",     error = "22008" },  # beyond representable int64 µs range
+  { input = "300000-01-01 00:00:00",     error = "22008" },  # beyond representable i64 µs range
   { input = "",                          error = "22007" },  # empty
   { input = "   ",                       error = "22007" },  # whitespace only
   { input = "not a timestamp",           error = "22007" },  # garbage

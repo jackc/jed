@@ -21,10 +21,10 @@ and **casts** (text↔date, date↔timestamp) are **deferred follow-ons**, exact
 slice deferred interval arithmetic and casts (§6). The non-goal is wire/`pg_catalog` fidelity
 (CLAUDE.md §1); the goal is PG's *observable* date behavior on the surface we implement.
 
-## 1. Representation — int32 days since the Unix epoch
+## 1. Representation — i32 days since the Unix epoch
 
-A value is an **`int32` count of days** since `1970-01-01`, proleptic Gregorian, **no leap
-seconds** (every day is one count). This is the day-granular analogue of `timestamp`'s int64
+A value is an **`i32` count of days** since `1970-01-01`, proleptic Gregorian, **no leap
+seconds** (every day is one count). This is the day-granular analogue of `timestamp`'s i64
 microseconds, and it deliberately **reuses timestamp's exact calendar core** —
 `days_from_civil` / `civil_from_days` (Howard Hinnant), which already measure days from
 1970-01-01 ([timestamp.md](timestamp.md) §2). So the two types share one tested civil↔days
@@ -42,15 +42,15 @@ epoch constant.
 5 879 610 AD** around 1970, *wider* than PostgreSQL's `4713 BC … 5874897 AD`. A date PG rejects
 as out of range but jed accepts (e.g. `5874898-01-01`) is a **documented divergence** (we own
 our range — the timestamp.md §1 precedent), recorded in the oracle-override ledger. A parse
-whose day count would fall outside the finite int32 range traps `22008` (§2).
+whose day count would fall outside the finite i32 range traps `22008` (§2).
 
-**Infinity sentinels.** The two extreme `int32` values are reserved, matching PostgreSQL's
+**Infinity sentinels.** The two extreme `i32` values are reserved, matching PostgreSQL's
 `DATEVAL_NOBEGIN` / `DATEVAL_NOEND`:
 
 - `i32::MIN` (`-2147483648`) = **`-infinity`**
 - `i32::MAX` (`2147483647`) = **`+infinity`**
 
-As with timestamp, infinity costs almost nothing: signed-`int32` comparison already gives
+As with timestamp, infinity costs almost nothing: signed-`i32` comparison already gives
 `-infinity < every finite < infinity`; the `int-be-signflip` key encoding sends `i32::MIN` →
 all-zero (sorts first) and `i32::MAX` → all-ones (sorts last); the 4-byte on-disk codec stores
 them verbatim. So **ordering, key encoding, and storage handle infinity for free** — only parse
@@ -73,7 +73,7 @@ date keeps **only the date portion**: any time and offset are **validated then d
 input  := special | [era_pre] date [ (' '|'T') time ] [offset] [' ' era]
 special := ('+'|'-')? 'infinity'           # case-insensitive
 era      := 'BC' | 'AD'                     # case-insensitive
-date     := year '-' month '-' day         # year 1..7 digits (magnitude; the int32-day range spans ≈ ±5.88M years)
+date     := year '-' month '-' day         # year 1..7 digits (magnitude; the i32-day range spans ≈ ±5.88M years)
 time     := hour ':' minute [ ':' second [ '.' frac ] ]
 offset   := 'Z' | ('+'|'-') HH [ ':' MM [ ':' SS ] ]
 ```
@@ -102,7 +102,7 @@ Rules (all identical to timestamp §3 unless noted):
   `astro = 1 − displayed` for `BC` (so `1 BC` = astronomical `0`). No astronomical year 0 on
   input. Same as timestamp.
 - **Field validation.** year magnitude `≥ 1` (capped only as an overflow guard — the real bound
-  is the int32 day-range check); month `1–12`; day valid for the month
+  is the i32 day-range check); month `1–12`; day valid for the month
   including Feb-29 on the astronomical year; hour `0–23` (plus exactly `24:00:00`); minute
   `0–59`; **second `0–59` — `:60` is rejected** (`22008`).
   - **Documented PG divergences (oracle-checked), inherited from timestamp §3:** PostgreSQL
@@ -110,14 +110,14 @@ Rules (all identical to timestamp §3 unless noted):
     (`Jan 15, 2024`, `01/15/2024`, `20240115`, scientific forms). jed accepts **only** the
     strict ISO `year-month-day` grammar above and **rejects** `:60` — the same strict, locale-
     free, deterministic posture as timestamp.
-- **Day computation.** `day_count = days_from_civil(astro, month, day)` (int64 intermediate),
-  range-checked to the finite int32 window; a value beyond it (or onto a sentinel) traps
+- **Day computation.** `day_count = days_from_civil(astro, month, day)` (i64 intermediate),
+  range-checked to the finite i32 window; a value beyond it (or onto a sentinel) traps
   `22008`. **No instant is computed**, so a far-future date that would overflow timestamp's
-  int64-µs range (e.g. `5000000-06-15`) is still a valid date.
+  i64-µs range (e.g. `5000000-06-15`) is still a valid date.
 
 **Errors.** Malformed / unparseable syntax traps **`22007`** (`invalid_datetime_format`); a
 syntactically valid but out-of-range field (`month 13`, `day 32`, `:60`, bad `24:xx`,
-out-of-range offset), or a day count beyond the representable int32 range, traps **`22008`**
+out-of-range offset), or a day count beyond the representable i32 range, traps **`22008`**
 (`datetime_field_overflow`). Parsing happens at **resolve time**, before any scan, so a bad
 literal in a `WHERE` predicate traps deterministically *before* row iteration — exactly like
 timestamp.
@@ -141,7 +141,7 @@ wide-year rows of the corpus are **bootstrapped from the live PG oracle** (CLAUD
 
 ## 4. Comparison and ordering
 
-`date × date` compares by the **`int32` day count** ([compare.toml](../types/compare.toml),
+`date × date` compares by the **`i32` day count** ([compare.toml](../types/compare.toml),
 `via = "none"`): plain signed numeric order, so `-infinity < every finite < infinity`,
 `infinity = infinity` is true, and the order is total (no NaN). NULL is the largest value
 (sorts last ascending), three-valued logic throughout — the existing machinery, unchanged.
@@ -170,13 +170,13 @@ coercion to the cast follow-on (§6).
   `CAST(x AS date)`, text↔date, and the date↔timestamp/timestamptz conversions are all later
   work. (The string-literal coercion of §2/§5 is **literal adaptation**, not a `(text, date)`
   CAST.)
-- **Key encoding** ([encoding.md](encoding.md) §2.1, the int32 codec): `date` reuses the
+- **Key encoding** ([encoding.md](encoding.md) §2.1, the i32 codec): `date` reuses the
   fixed-width `int-be-signflip` integer key encoding (width 4) **verbatim** — and, like
   timestamp (and unlike text/decimal/bytea/interval), it is **exercised** this slice, so a
   `date` PRIMARY KEY is **supported** (the bytes already sort in calendar order, infinities
   included).
 - **On-disk value codec** (type code **16**, [format.md](../fileformat/format.md)): the same
-  4-byte order-preserving integer body as `int32`, behind the presence tag. Adding the type code
+  4-byte order-preserving integer body as `i32`, behind the presence tag. Adding the type code
   is **additive** within the current `format_version` (the uuid/timestamp/interval/float
   precedent — a new scalar code does not bump the version); a new `date_table.jed` golden pins
   the bytes cross-core (`rust == go == ts == ruby`).
@@ -206,16 +206,16 @@ interval precedent of landing the type before its arithmetic and casts:
 2. **Date portion only** — compute the day from `(astro, month, day)` directly; never from an
    instant. `24:00:00` does **not** advance the day, and an offset is **never** applied (the two
    places date diverges from timestamp's field handling).
-3. **int32 range, int32 sentinels** — finite is `i32::MIN+1 ..= i32::MAX-1`; `i32::MIN` /
-   `i32::MAX` are `-infinity` / `infinity`; a finite parse onto a sentinel, or beyond the int32
+3. **i32 range, i32 sentinels** — finite is `i32::MIN+1 ..= i32::MAX-1`; `i32::MIN` /
+   `i32::MAX` are `-infinity` / `infinity`; a finite parse onto a sentinel, or beyond the i32
    window, traps `22008`. Checked first in both parse and render.
 4. **TS day field** — held as `bigint` like every other integer in the TS core (uniform-bigint
-   discipline), converted at the int32 encode/decode boundary.
+   discipline), converted at the i32 encode/decode boundary.
 5. **Era mapping** — `BC` ⇒ `astro = 1 − displayed`; render inverts it. No astronomical year 0
    on input. 4-digit zero-pad, full width beyond 9999.
 6. **Field validation** — month/day (leap Feb-29)/hour/minute/second ranges; `:60` rejected;
    only exactly `24:00:00` accepted for the hour. All trap `22008`; malformed syntax `22007`.
 7. **Resolve-time parse** — a bad literal in `WHERE` traps before any scan, deterministically.
-8. **Own family** — a distinct `Value` variant and type code (16); never collapse to the int32
+8. **Own family** — a distinct `Value` variant and type code (16); never collapse to the i32
    variant (results render via the value's own `render()`, which needs the type). `date ×
    timestamp` is `42804`.

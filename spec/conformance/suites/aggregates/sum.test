@@ -1,12 +1,12 @@
-# Aggregate SUM — PostgreSQL widening (spec/design/aggregates.md §3): SUM(int16/int32) ->
-# int64, SUM(int64) -> decimal, SUM(decimal) -> decimal. NULL inputs are skipped; an
+# Aggregate SUM — PostgreSQL widening (spec/design/aggregates.md §3): SUM(i16/i32) ->
+# i64, SUM(i64) -> decimal, SUM(decimal) -> decimal. NULL inputs are skipped; an
 # empty/all-NULL group sums to NULL (never 0 — that is COUNT). Output name `sum`.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.int16, types.int32, types.int64, types.decimal, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.i16, types.i32, types.i64, types.decimal, resource.cost_metering
 
-# SUM(int16) widens to int64: 30000 + 30000 + 10000 = 70000 (exceeds int16 max 32767 but
-# the result type is int64, so NO trap — the boundary is the result type, §3).
+# SUM(i16) widens to i64: 30000 + 30000 + 10000 = 70000 (exceeds i16 max 32767 but
+# the result type is i64, so NO trap — the boundary is the result type, §3).
 statement ok
-CREATE TABLE t16 (id int32 PRIMARY KEY, s int16)
+CREATE TABLE t16 (id i32 PRIMARY KEY, s i16)
 
 statement ok
 INSERT INTO t16 VALUES (1, 30000), (2, 30000), (3, 10000)
@@ -18,10 +18,10 @@ SELECT SUM(s) FROM t16
 ----
 70000
 
-# SUM(int64) widens to decimal (PG model): int64 max + 3 overflows int64 but is exact in
+# SUM(i64) widens to decimal (PG model): i64 max + 3 overflows i64 but is exact in
 # decimal -> rendered with the D tag, no trap.
 statement ok
-CREATE TABLE t64 (id int32 PRIMARY KEY, big int64)
+CREATE TABLE t64 (id i32 PRIMARY KEY, big i64)
 
 statement ok
 INSERT INTO t64 VALUES (1, 9223372036854775807), (2, 3)
@@ -35,7 +35,7 @@ SELECT SUM(big) FROM t64
 
 # SUM(decimal) -> decimal, scale = max(operand scales). 1.50 + 2.25 = 3.75.
 statement ok
-CREATE TABLE tdec (id int32 PRIMARY KEY, d numeric(10,2))
+CREATE TABLE tdec (id i32 PRIMARY KEY, d numeric(10,2))
 
 statement ok
 INSERT INTO tdec VALUES (1, 1.50), (2, 2.25)
@@ -52,7 +52,7 @@ SELECT SUM(d) FROM tdec
 # 6 (1 page + 2 scan + 2 accumulate + 1 produced) a small decimal would — the extra 8 is
 # decimal_work, proving the unit is metered in the aggregate path.
 statement ok
-CREATE TABLE bd (id int32 PRIMARY KEY, d numeric)
+CREATE TABLE bd (id i32 PRIMARY KEY, d numeric)
 
 statement ok
 INSERT INTO bd VALUES (1, 123456789012345.67), (2, 987654321098765.43)
@@ -66,7 +66,7 @@ SELECT SUM(d) FROM bd
 
 # NULL inputs are skipped: SUM over the present rows only.
 statement ok
-CREATE TABLE tmix (id int32 PRIMARY KEY, a int32)
+CREATE TABLE tmix (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO tmix VALUES (1, 10), (2, NULL), (3, 30)
@@ -79,7 +79,7 @@ SELECT SUM(a) FROM tmix
 
 # All-NULL group: SUM -> NULL (a single row), never 0.
 statement ok
-CREATE TABLE tnull (id int32 PRIMARY KEY, a int32)
+CREATE TABLE tnull (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO tnull VALUES (1, NULL), (2, NULL)
@@ -93,7 +93,7 @@ NULL
 
 # Empty table: SUM -> NULL as ONE row.
 statement ok
-CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+CREATE TABLE e (id i32 PRIMARY KEY, a i32)
 
 # names: sum
 query I nosort
@@ -101,30 +101,30 @@ SELECT SUM(a) FROM e
 ----
 NULL
 
-# SUM(int32) widens to int64 (§3): a running sum that exceeds int32 max (2147483647) but
-# fits int64 does NOT trap — the boundary is the RESULT type, not the input width.
-# 2000000000 * 3 = 6000000000. The `# types:` directive pins the result as int64 (the three
+# SUM(i32) widens to i64 (§3): a running sum that exceeds i32 max (2147483647) but
+# fits i64 does NOT trap — the boundary is the RESULT type, not the input width.
+# 2000000000 * 3 = 6000000000. The `# types:` directive pins the result as i64 (the three
 # integer widths are indistinguishable under the `I` render tag, so a core widening to the
 # wrong width would pass on rows alone — the §8 promotion hotspot, made assertable).
 statement ok
-CREATE TABLE t32w (id int32 PRIMARY KEY, a int32)
+CREATE TABLE t32w (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO t32w VALUES (1, 2000000000), (2, 2000000000), (3, 2000000000)
 
 # names: sum
-# types: int64
+# types: i64
 # cost: 8
 query I nosort
 SELECT SUM(a) FROM t32w
 ----
 6000000000
 
-# SUM overflow trap (22003): the boundary is the RESULT type (§3, §9) — int64 for the
-# int16/int32 case, the decimal cap for the int64/decimal case — and is checked on the FINAL
+# SUM overflow trap (22003): the boundary is the RESULT type (§3, §9) — i64 for the
+# i16/i32 case, the decimal cap for the i64/decimal case — and is checked on the FINAL
 # result only, never an intermediate. It is pinned here ONLY by the non-trapping widening
 # cases above, because the trap itself is unreachable with practical corpus data: overflowing
-# the int64 accumulator needs ~4.3e9 int32 rows, and overflowing the decimal cap needs a
+# the i64 accumulator needs ~4.3e9 i32 rows, and overflowing the decimal cap needs a
 # ~131072-digit value (max_int_digits, decimal.md §2). The per-value arithmetic overflow trap
 # is covered in expr/arithmetic.test; this note keeps the coverage boundary explicit, not
 # silent (CLAUDE.md §10).

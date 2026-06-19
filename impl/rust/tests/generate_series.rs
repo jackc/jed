@@ -114,7 +114,7 @@ fn param_argument() {
 #[test]
 fn sibling_reference_works_implicitly_lateral() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, n int32)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, n i32)",
         "INSERT INTO t VALUES (1, 3)",
     ]);
     // A FROM-sibling reference inside the SRF args IS visible — an SRF is implicitly lateral
@@ -154,10 +154,10 @@ fn mixed_width_promotes_to_the_wider_type() {
     let mut db = Database::new();
     let out = execute(
         &mut db,
-        "SELECT * FROM generate_series(CAST(1 AS int16), CAST(5 AS int32))",
+        "SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))",
     )
     .unwrap();
-    assert_eq!(out.column_types(), &["int32"]);
+    assert_eq!(out.column_types(), &["i32"]);
     match out {
         Outcome::Query { rows, .. } => assert_eq!(rows, ints(&[1, 2, 3, 4, 5])),
         other => panic!("expected a query result, got {other:?}"),

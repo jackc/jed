@@ -22,7 +22,7 @@ func TestDemandPagingScansCorrectlyWithBoundedResidency(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)"); err != nil {
+	if _, err := Execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Execute(db, "BEGIN"); err != nil { // one commit, not 600
@@ -132,7 +132,7 @@ func TestMemoryBudgetBoundsResidencyUnderLookups(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)"); err != nil {
+	if _, err := Execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Execute(db, "BEGIN"); err != nil {
@@ -192,7 +192,7 @@ func TestTinyBudgetKeepsOneLeafResident(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (k int32 PRIMARY KEY, v int32)"); err != nil {
+	if _, err := Execute(db, "CREATE TABLE t (k i32 PRIMARY KEY, v i32)"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := Execute(db, "BEGIN"); err != nil {

@@ -8,7 +8,7 @@ import { dbWith, errCode } from "./util.ts";
 
 function seed() {
   return dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, v int16)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
     "INSERT INTO t VALUES (1, 10)",
     "INSERT INTO t VALUES (2, NULL)",
     "INSERT INTO t VALUES (3, 30)",
@@ -17,7 +17,7 @@ function seed() {
 
 function limitDB() {
   return dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, v int32)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
     "INSERT INTO t VALUES (1, 10)",
     "INSERT INTO t VALUES (2, 20)",
     "INSERT INTO t VALUES (3, 30)",

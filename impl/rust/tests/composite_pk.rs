@@ -28,7 +28,7 @@ fn err_code(db: &mut Database, sql: &str) -> String {
 /// breaking its ties), independent of insertion order.
 #[test]
 fn composite_key_orders_by_tuple() {
-    let mut db = db_with(&["CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))"]);
+    let mut db = db_with(&["CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))"]);
     let t = db.table("t").unwrap();
     assert_eq!(t.pk_indices(), vec![0, 1]);
     assert!(t.columns[0].primary_key && t.columns[0].not_null);
@@ -64,7 +64,7 @@ fn composite_key_orders_by_tuple() {
 #[test]
 fn uniqueness_is_the_whole_tuple() {
     let mut db = db_with(&[
-        "CREATE TABLE t (a int32, b int32, PRIMARY KEY (a, b))",
+        "CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, b))",
         "INSERT INTO t VALUES (1, 1)",
     ]);
     execute(&mut db, "INSERT INTO t VALUES (1, 2)").unwrap(); // shared prefix: distinct row
@@ -84,27 +84,24 @@ fn uniqueness_is_the_whole_tuple() {
 fn ddl_errors_match_postgres_and_narrowings() {
     let mut db = Database::new();
     assert_eq!(
-        err_code(&mut db, "CREATE TABLE t (a int32, PRIMARY KEY (a, nosuch))"),
+        err_code(&mut db, "CREATE TABLE t (a i32, PRIMARY KEY (a, nosuch))"),
         "42703"
     );
     assert_eq!(
-        err_code(
-            &mut db,
-            "CREATE TABLE t (a int32, b int32, PRIMARY KEY (a, a))"
-        ),
+        err_code(&mut db, "CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, a))"),
         "42701"
     );
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE t (a int32 PRIMARY KEY, b int32, PRIMARY KEY (b))"
+            "CREATE TABLE t (a i32 PRIMARY KEY, b i32, PRIMARY KEY (b))"
         ),
         "42P16"
     );
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE t (a int32, b int32, PRIMARY KEY (a), PRIMARY KEY (b))"
+            "CREATE TABLE t (a i32, b i32, PRIMARY KEY (a), PRIMARY KEY (b))"
         ),
         "42P16"
     );
@@ -112,18 +109,14 @@ fn ddl_errors_match_postgres_and_narrowings() {
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE t (a int32 PRIMARY KEY, PRIMARY KEY (nosuch))"
+            "CREATE TABLE t (a i32 PRIMARY KEY, PRIMARY KEY (nosuch))"
         ),
         "42P16"
     );
     // The list order is the KEY order — it may differ from declaration order (the original
     // 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
     // keys by (b, a), so the stored scan order is b-major.
-    execute(
-        &mut db,
-        "CREATE TABLE t (a int32, b int32, PRIMARY KEY (b, a))",
-    )
-    .unwrap();
+    execute(&mut db, "CREATE TABLE t (a i32, b i32, PRIMARY KEY (b, a))").unwrap();
     assert_eq!(db.table("t").unwrap().pk_indices(), vec![1, 0]);
     execute(&mut db, "INSERT INTO t VALUES (1, 20), (2, 10), (3, 15)").unwrap();
     let rows = db.rows_in_key_order("t").unwrap();
@@ -144,12 +137,12 @@ fn ddl_errors_match_postgres_and_narrowings() {
     assert_eq!(
         err_code(
             &mut db,
-            "CREATE TABLE t (a int32, s text, PRIMARY KEY (a, s))"
+            "CREATE TABLE t (a i32, s text, PRIMARY KEY (a, s))"
         ),
         "0A000"
     );
     // A single-column table constraint is the column-level form's equivalent.
-    execute(&mut db, "CREATE TABLE ok (a int32, PRIMARY KEY (a))").unwrap();
+    execute(&mut db, "CREATE TABLE ok (a i32, PRIMARY KEY (a))").unwrap();
     let t = db.table("ok").unwrap();
     assert_eq!(t.primary_key_index(), Some(0));
     assert!(t.columns[0].not_null);
@@ -160,7 +153,7 @@ fn ddl_errors_match_postgres_and_narrowings() {
 #[test]
 fn members_are_not_null_and_update_guarded() {
     let mut db = db_with(&[
-        "CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))",
+        "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
         "INSERT INTO t VALUES (1, 1, 10)",
     ]);
     assert_eq!(
@@ -176,11 +169,11 @@ fn members_are_not_null_and_update_guarded() {
     execute(&mut db, "UPDATE t SET v = 11").unwrap();
 }
 
-/// Mixed fixed-width components (uuid first, int32 second) concatenate per encoding.md
+/// Mixed fixed-width components (uuid first, i32 second) concatenate per encoding.md
 /// §2.3 and iterate in tuple order — uuid bytes compare first, the int breaks ties.
 #[test]
 fn mixed_uuid_int_components_order_correctly() {
-    let mut db = db_with(&["CREATE TABLE t (u uuid, n int32, PRIMARY KEY (u, n))"]);
+    let mut db = db_with(&["CREATE TABLE t (u uuid, n i32, PRIMARY KEY (u, n))"]);
     for stmt in [
         "INSERT INTO t VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', -5)",
         "INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', 7)",
@@ -206,7 +199,7 @@ fn mixed_uuid_int_components_order_correctly() {
 #[test]
 fn round_trips_through_the_on_disk_image() {
     let db = db_with(&[
-        "CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))",
+        "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
         "INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
     ]);
     let image = db.to_image(256, 1).unwrap();

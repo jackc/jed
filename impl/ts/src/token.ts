@@ -40,8 +40,8 @@ export type TokenKind =
   | "eof"; // end of input
 
 // Token is a lexed token. `word` holds the text for "word"; `int` holds the unsigned
-// magnitude for "int" (a bigint, so 2^63 — int64's negated minimum — is representable;
-// the parser folds the sign and traps a bare magnitude > int64's maximum).
+// magnitude for "int" (a bigint, so 2^63 — i64's negated minimum — is representable;
+// the parser folds the sign and traps a bare magnitude > i64's maximum).
 export type Token = {
   kind: TokenKind;
   word?: string;

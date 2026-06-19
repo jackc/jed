@@ -7,19 +7,19 @@
 # must be comparable, else 42883 (operator does not exist). Uncorrelated folds once; correlated
 # re-executes per outer row. Verified against the live PostgreSQL 18 oracle; cost is jed's
 # deterministic cross-core contract (spec/design/cost.md §3).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.table_alias, query.qualified_column, query.subquery_correlated, query.subquery_quantified, expr.comparison_value, types.int32, types.text, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.table_alias, query.qualified_column, query.subquery_correlated, query.subquery_quantified, expr.comparison_value, types.i32, types.text, null.three_valued, resource.cost_metering
 
 statement ok
-CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+CREATE TABLE b (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE vals (id int32 PRIMARY KEY, v int32)
+CREATE TABLE vals (id i32 PRIMARY KEY, v i32)
 
 statement ok
-CREATE TABLE words (id int32 PRIMARY KEY, w text)
+CREATE TABLE words (id i32 PRIMARY KEY, w text)
 
 statement ok
 INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
@@ -135,7 +135,7 @@ SELECT x.id FROM a x WHERE x.k > ANY(SELECT k FROM a y WHERE y.id < x.id) ORDER 
 statement error 42601
 SELECT id FROM a WHERE k = ANY(SELECT id, k FROM b)
 
-# An incomparable pair (int32 vs the body's text column) -> 42883 (operator does not exist), the
+# An incomparable pair (i32 vs the body's text column) -> 42883 (operator does not exist), the
 # quantifier posture (PG's code + message), not the bare 42804 a plain int = text raises.
 statement error 42883
 SELECT id FROM a WHERE k = ANY(SELECT w FROM words)

@@ -34,11 +34,11 @@ function goldenDb(): Database {
   return db;
 }
 
-// pkTableDB: CREATE TABLE t (id int32 PRIMARY KEY, v int16) with 20 rows (id 3's v is
+// pkTableDB: CREATE TABLE t (id i32 PRIMARY KEY, v i16) with 20 rows (id 3's v is
 // NULL) — enough to span more than one data page at page_size 256.
 function pkTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   for (let i = 1; i <= 20; i++) {
     const v = i === 3 ? "NULL" : `${i * 10}`;
     run(db, `INSERT INTO t VALUES (${i}, ${v})`);
@@ -48,18 +48,18 @@ function pkTableDB(): Database {
 
 function oneTableEmptyDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   return db;
 }
 
 // compositePKTableDB has a COMPOSITE primary key (constraints.md §3) — the stored key is
-// the concatenation of the members' encodings (4-byte int32 then 2-byte int16,
+// the concatenation of the members' encodings (4-byte i32 then 2-byte i16,
 // encoding.md §2.3). Rows insert in ascending tuple order (the tree shape is
 // order-sensitive), with a negative first component and first-component ties broken by
 // the second.
 function compositePKTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (a int32, b int16, v int16, PRIMARY KEY (a, b))");
+  run(db, "CREATE TABLE t (a i32, b i16, v i16, PRIMARY KEY (a, b))");
   for (const [a, b, v] of [
     [-2, 5, 10], [1, 1, 20], [1, 2, 30], [1, 3, 40],
     [2, 0, 50], [2, 1, 60], [3, 7, 70], [3, 9, 80],
@@ -91,7 +91,7 @@ function checkTableDB(): Database {
 // auto-names to t_a_b_idx. Index records have empty payloads (key only).
 function indexTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (a int32, b int32, u uuid, PRIMARY KEY (b, a))");
+  run(db, "CREATE TABLE t (a i32, b i32, u uuid, PRIMARY KEY (b, a))");
   run(db, "CREATE INDEX i_u ON t (u)");
   run(db, "CREATE INDEX ON t (a, b)");
   run(db, "INSERT INTO t VALUES (1, 10, '550e8400-e29b-41d4-a716-446655440000'), " +
@@ -105,7 +105,7 @@ function indexTableDB(): Database {
 // INDEX uq, and the plain index nu (flags 0 beside flags 1).
 function uniqueTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32, " +
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32, " +
     "UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))");
   run(db, "CREATE INDEX nu ON t (v)");
   run(db, "CREATE UNIQUE INDEX uq ON t (w)");
@@ -121,9 +121,9 @@ function uniqueTableDB(): Database {
 // match the Ruby reference's FK_TABLE (spec/fileformat/verify.rb).
 function fkTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE p (pid int32 PRIMARY KEY, code int32 UNIQUE, a int32, b int32, UNIQUE (a, b))");
+  run(db, "CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))");
   run(db, "INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)");
-  run(db, "CREATE TABLE c (id int32 PRIMARY KEY, pid int32, pcode int32, x int32, y int32, mgr int32, " +
+  run(db, "CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32, " +
     "FOREIGN KEY (pid) REFERENCES p (pid), " +
     "CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), " +
     "FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT, " +
@@ -134,24 +134,24 @@ function fkTableDB(): Database {
 
 // arrayTableDB has ARRAY (T[]) columns (v10 — spec/design/array.md): pins the catalog array-column
 // entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). An
-// int32[] (fixed-width elements: no per-element length prefix) and a text[]; row 2 has an EMPTY
+// i32[] (fixed-width elements: no per-element length prefix) and a text[]; row 2 has an EMPTY
 // array (ndim=0), row 3 a NULL element (the HAS_NULLS bitmap) and a whole-value NULL array (the
 // lone 0x01 tag). Must match the Ruby reference's ARRAY_TABLE (spec/fileformat/verify.rb).
 function arrayTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])");
   run(db, "INSERT INTO t VALUES (1, ARRAY[10, 20, 30], ARRAY['a', 'b'])");
   run(db, "INSERT INTO t VALUES (2, '{40,50}', '{}')");
   run(db, "INSERT INTO t VALUES (3, ARRAY[1, NULL, 3], NULL)");
-  // Row 4 pins the §12 shapes: a 2-D int32[] and a custom-lower-bound text[] (the lb i32 field).
+  // Row 4 pins the §12 shapes: a 2-D i32[] and a custom-lower-bound text[] (the lb i32 field).
   run(db, "INSERT INTO t VALUES (4, ARRAY[ARRAY[10,20],ARRAY[30,40]], '[2:3]={x,y}')");
   return db;
 }
 
-// nopkTableDB has no primary key — exercises the stored synthetic int64 rowid key.
+// nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 function nopkTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE r (a int16, b int64)");
+  run(db, "CREATE TABLE r (a i16, b i64)");
   for (const [a, b] of [[7, 70], [8, 80], [9, 90]]) {
     run(db, `INSERT INTO r VALUES (${a}, ${b})`);
   }
@@ -163,7 +163,7 @@ function nopkTableDB(): Database {
 // post-order page allocation across a deeper tree (spec/fileformat/format.md).
 function tallTreeDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
   for (let i = 1; i <= 18; i++) {
     const pad = `row-${String(i).padStart(2, "0")}-${"x".repeat(48)}`;
     run(db, `INSERT INTO t VALUES (${i}, '${pad}')`);
@@ -173,10 +173,10 @@ function tallTreeDB(): Database {
 
 // textTableDB has a text column — exercises the value codec's text branch (u16 length +
 // UTF-8 bytes): the empty string, an embedded quote, a 2-byte char (é), a NULL text value,
-// and a 4-byte astral char (😀). The PK stays int32 (no text key this slice).
+// and a 4-byte astral char (😀). The PK stays i32 (no text key this slice).
 function textTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, s text)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, s text)");
   run(db, "INSERT INTO t VALUES (1, 'alice')");
   run(db, "INSERT INTO t VALUES (2, '')");
   run(db, "INSERT INTO t VALUES (3, 'O''Brien')");
@@ -187,11 +187,11 @@ function textTableDB(): Database {
 }
 
 // boolTableDB has a boolean column — exercises the value codec's boolean branch (a single
-// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays int32 (the boolean
+// bool-byte, 0x00 false / 0x01 true) plus a NULL boolean. The PK stays i32 (the boolean
 // PRIMARY KEY case is boolPkTableDB).
 function boolTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)");
   run(db, "INSERT INTO t VALUES (1, TRUE)");
   run(db, "INSERT INTO t VALUES (2, FALSE)");
   run(db, "INSERT INTO t VALUES (3, NULL)");
@@ -217,7 +217,7 @@ function boolPkTableDB(): Database {
 // coercion). Covers positive, negative, zero, a multi-group coefficient, and a NULL.
 function decimalTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, d numeric, m numeric(10,2))");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric, m numeric(10,2))");
   run(db, "INSERT INTO t VALUES (1, 1.50, 1.50), (2, -12345.6789, -12.34), " +
     "(3, 0.00, 0.00), (4, 100000000.000001, 100.00), (5, NULL, NULL)");
   return db;
@@ -225,11 +225,11 @@ function decimalTableDB(): Database {
 
 // byteaTableDB exercises the value codec's bytea branch (u16 length + raw bytes): a multi-
 // byte value (a-f hex), the empty byte string, embedded 0x00 bytes, a high byte (0xFF), a
-// NULL, and a lone 0x00. The PK stays int32 (no bytea key this slice). Literals are the `\x`
+// NULL, and a lone 0x00. The PK stays i32 (no bytea key this slice). Literals are the `\x`
 // hex input form, adapting to the bytea column (spec/design/types.md §6).
 function byteaTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, b bytea)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, b bytea)");
   run(db, "INSERT INTO t VALUES (1, '\\xdeadbeef')");
   run(db, "INSERT INTO t VALUES (2, '\\x')");
   run(db, "INSERT INTO t VALUES (3, '\\x000102')");
@@ -247,7 +247,7 @@ function byteaTableDB(): Database {
 // Must match the Ruby reference's OVERFLOW_TABLE (spec/fileformat/verify.rb).
 function overflowTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)");
   run(db, `INSERT INTO t VALUES (1, '${fillerText(600)}', '\\x${fillerBytesHex(300)}')`);
   run(db, "INSERT INTO t VALUES (2, 'small', '\\xcafe')");
   run(db, "INSERT INTO t VALUES (3, NULL, NULL)");
@@ -262,7 +262,7 @@ function overflowTableDB(): Database {
 // COMPRESSED_TABLE (spec/fileformat/verify.rb).
 function compressedTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text, blob bytea)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, blob bytea)");
   run(db, `INSERT INTO t VALUES (1, '${"x".repeat(600)}', '\\x${"ab".repeat(200)}')`);
   run(db, `INSERT INTO t VALUES (2, '${fillerText(200)}${"y".repeat(200)}', NULL)`);
   run(db, "INSERT INTO t VALUES (3, 'tiny', '\\xcafe')");
@@ -297,8 +297,8 @@ function defaultTableDB(): Database {
   const db = goldenDb();
   run(
     db,
-    "CREATE TABLE t (id int32 PRIMARY KEY, n int32 DEFAULT 0, note text DEFAULT 'none', " +
-      "maybe int32 DEFAULT NULL, req int32 NOT NULL DEFAULT 7, amt numeric(6,2) DEFAULT 1.5, plain int16)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, n i32 DEFAULT 0, note text DEFAULT 'none', " +
+      "maybe i32 DEFAULT NULL, req i32 NOT NULL DEFAULT 7, amt numeric(6,2) DEFAULT 1.5, plain i16)",
   );
   run(db, "INSERT INTO t (id) VALUES (1)");
   run(db, "INSERT INTO t VALUES (2, 42, 'hi', 5, 9, 2.00, 100)");
@@ -307,25 +307,25 @@ function defaultTableDB(): Database {
 
 // defaultExprTableDB exercises EXPRESSION column defaults on disk (v8) — the catalog flags bit3
 // (default_is_expr) + the expr-text written after the typmod: a `uuid DEFAULT uuidv7()`, an
-// `int32 DEFAULT 1 + 1`, a CONSTANT default beside them (bit2), and a plain no-default column.
+// `i32 DEFAULT 1 + 1`, a CONSTANT default beside them (bit2), and a plain no-default column.
 // EMPTY table — the catalog encoding is the cross-core proof; the per-row evaluation is covered
 // by the conformance corpus.
 function defaultExprTableDB(): Database {
   const db = goldenDb();
   run(
     db,
-    "CREATE TABLE t (id int32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n int32 DEFAULT 1 + 1, " +
-      "k int32 DEFAULT 7, plain int16)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n i32 DEFAULT 1 + 1, " +
+      "k i32 DEFAULT 7, plain i16)",
   );
   return db;
 }
 
-// timestampTableDB exercises the value codec's int64-instant branch (type code 8): a positive
+// timestampTableDB exercises the value codec's i64-instant branch (type code 8): a positive
 // instant, a pre-1970 negative one, a BC-era one, the ±infinity sentinels, and a NULL. The
-// literals parse to the same micros the golden stores. The PK stays int32.
+// literals parse to the same micros the golden stores. The PK stays i32.
 function timestampTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamp)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp)");
   run(db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00')");
   run(db, "INSERT INTO t VALUES (2, '1969-12-31 23:59:59.5')");
   run(db, "INSERT INTO t VALUES (3, '0001-01-01 00:00:00 BC')");
@@ -339,7 +339,7 @@ function timestampTableDB(): Database {
 // normalizes to UTC before storage.
 function timestamptzTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, ts timestamptz)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, ts timestamptz)");
   run(db, "INSERT INTO t VALUES (1, '2024-01-01 12:00:00+00')");
   run(db, "INSERT INTO t VALUES (2, '2024-01-01 12:00:00+05')");
   run(db, "INSERT INTO t VALUES (3, '1969-12-31 23:59:59.5+00')");
@@ -354,7 +354,7 @@ function timestamptzTableDB(): Database {
 // span-equal-but-byte-distinct '30 days', and a NULL. The bare-string literals adapt.
 function intervalTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, d interval)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d interval)");
   run(db, "INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05')");
   run(db, "INSERT INTO t VALUES (2, '-1 day')");
   run(db, "INSERT INTO t VALUES (3, '0 seconds')");
@@ -369,47 +369,47 @@ function intervalTableDB(): Database {
 // infinities, a canonicalized NaN (stored as the single quiet pattern 0x7FF8…000), a NULL, and
 // Float64 max (a full mantissa). Finite values enter via bare numeric literals (decimal adaptation);
 // the specials enter via typed literals in INSERT ... SELECT (a VALUES slot takes only bare literals
-// this slice — float.md). PK is int32 (no float key this slice — float PK → 0A000).
+// this slice — float.md). PK is i32 (no float key this slice — float PK → 0A000).
 function float64TableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, d float64)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d f64)");
   run(db, "INSERT INTO t VALUES (1, 1.5)");
   run(db, "INSERT INTO t VALUES (2, -2.5)");
   run(db, "INSERT INTO t VALUES (3, 0.0)");
-  run(db, "INSERT INTO t SELECT 4, float64 '-0'");
-  run(db, "INSERT INTO t SELECT 5, float64 'Infinity'");
-  run(db, "INSERT INTO t SELECT 6, float64 '-Infinity'");
-  run(db, "INSERT INTO t SELECT 7, float64 'NaN'");
+  run(db, "INSERT INTO t SELECT 4, f64 '-0'");
+  run(db, "INSERT INTO t SELECT 5, f64 'Infinity'");
+  run(db, "INSERT INTO t SELECT 6, f64 '-Infinity'");
+  run(db, "INSERT INTO t SELECT 7, f64 'NaN'");
   run(db, "INSERT INTO t VALUES (8, NULL)");
-  run(db, "INSERT INTO t SELECT 9, float64 '1.7976931348623157e308'");
+  run(db, "INSERT INTO t SELECT 9, f64 '1.7976931348623157e308'");
   return db;
 }
 
 // float32TableDB exercises the value codec's 4-byte IEEE branch (type code 13): the same
 // special-value coverage as float64TableDB (canonicalized NaN → 0x7FC00000) plus 100.25 (exactly
-// representable in binary32). PK is int32 (no float key this slice).
+// representable in binary32). PK is i32 (no float key this slice).
 function float32TableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, r float32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, r f32)");
   run(db, "INSERT INTO t VALUES (1, 1.5)");
   run(db, "INSERT INTO t VALUES (2, -2.5)");
   run(db, "INSERT INTO t VALUES (3, 0.0)");
-  run(db, "INSERT INTO t SELECT 4, float32 '-0'");
-  run(db, "INSERT INTO t SELECT 5, float32 'Infinity'");
-  run(db, "INSERT INTO t SELECT 6, float32 '-Infinity'");
-  run(db, "INSERT INTO t SELECT 7, float32 'NaN'");
+  run(db, "INSERT INTO t SELECT 4, f32 '-0'");
+  run(db, "INSERT INTO t SELECT 5, f32 'Infinity'");
+  run(db, "INSERT INTO t SELECT 6, f32 '-Infinity'");
+  run(db, "INSERT INTO t SELECT 7, f32 'NaN'");
   run(db, "INSERT INTO t VALUES (8, NULL)");
   run(db, "INSERT INTO t VALUES (9, 100.25)");
   return db;
 }
 
-// dateTableDB exercises the value codec's date branch (type code 16): the 4-byte int32 day-count
-// body (same int-be-signflip codec as int32). A positive date, a pre-1970 negative one, a BC-era
+// dateTableDB exercises the value codec's date branch (type code 16): the 4-byte i32 day-count
+// body (same int-be-signflip codec as i32). A positive date, a pre-1970 negative one, a BC-era
 // one, the −infinity/+infinity sentinels (i32 min/max), and a NULL. The bare-string literals adapt
-// to the date column. PK is int32 (spec/design/date.md).
+// to the date column. PK is i32 (spec/design/date.md).
 function dateTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, d date)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d date)");
   run(db, "INSERT INTO t VALUES (1, '2024-01-15')");
   run(db, "INSERT INTO t VALUES (2, '1969-12-31')");
   run(db, "INSERT INTO t VALUES (3, '0044-03-15 BC')");
@@ -425,8 +425,8 @@ function dateTableDB(): Database {
 // bitmap + present-field bodies (row 2's NULL zip field).
 function compositeTypeTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TYPE addr AS (street text NOT NULL, zip int32)");
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, home addr)");
+  run(db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, home addr)");
   run(db, "INSERT INTO t VALUES (1, ROW('Main', 90210))");
   run(db, "INSERT INTO t VALUES (2, ROW('Oak', NULL))");
   return db;
@@ -439,8 +439,8 @@ function compositeTypeTableDB(): Database {
 // present composite element with a NULL element (the array HAS_NULLS bitmap).
 function arrayCompositeTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TYPE addr AS (street text NOT NULL, zip int32)");
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])");
+  run(db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
   run(db, `INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}')`);
   run(db, `INSERT INTO t VALUES (2, '{"(Oak,)"}')`);
   run(db, `INSERT INTO t VALUES (3, '{"(A,1)",NULL}')`);
@@ -451,13 +451,13 @@ function arrayCompositeTableDB(): Database {
 
 // compositeArrayFieldTableDB: a composite type with an array-typed FIELD (array.md §12 — the mirror
 // of array-of-composite). The catalog composite-type entry carries a code-15 array field
-// (element_type_code 2 = int32) and the value body recurses (a composite body whose `pts` field is an
+// (element_type_code 2 = i32) and the value body recurses (a composite body whose `pts` field is an
 // array body). Row 2 has an empty array field {} (ndim 0); row 3 a NULL array field (the composite
 // null-bitmap).
 function compositeArrayFieldTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TYPE poly AS (name text, pts int32[])");
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+  run(db, "CREATE TYPE poly AS (name text, pts i32[])");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)");
   run(db, "INSERT INTO t VALUES (1, ROW('a', '{10,20,30}'))");
   run(db, "INSERT INTO t VALUES (2, ROW('b', '{}'))");
   run(db, "INSERT INTO t VALUES (3, ROW('c', NULL))");
@@ -471,9 +471,9 @@ function compositeArrayFieldTableDB(): Database {
 // through a composite field.
 function nestedCompositeTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)");
+  run(db, "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)");
   run(db, "CREATE TYPE line AS (a point, b point)");
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, ln line)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, ln line)");
   run(db, "INSERT INTO t VALUES (1, ROW(ROW(1, 2), ROW(3, 4)))");
   return db;
 }
@@ -488,7 +488,7 @@ function sequenceTableDB(): Database {
   run(db, "SELECT nextval('s1')");
   run(db, "SELECT nextval('s1')");
   run(db, "CREATE SEQUENCE s2 INCREMENT BY -2 MINVALUE -100 MAXVALUE -1 CACHE 5 CYCLE");
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   run(db, "INSERT INTO t VALUES (1, 10)");
   return db;
 }
@@ -598,8 +598,8 @@ test("read golden reconstructs catalog", () => {
   assert.equal(tbl!.name, "t");
   assert.equal(tbl!.columns.length, 2);
   const [id, v] = tbl!.columns;
-  assert.deepStrictEqual(id, { name: "id", type: scalarT("int32"), decimal: null, primaryKey: true, notNull: true, default: null, defaultExpr: null });
-  assert.deepStrictEqual(v, { name: "v", type: scalarT("int16"), decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null });
+  assert.deepStrictEqual(id, { name: "id", type: scalarT("i32"), decimal: null, primaryKey: true, notNull: true, default: null, defaultExpr: null });
+  assert.deepStrictEqual(v, { name: "v", type: scalarT("i16"), decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null });
   // A NULL value round-trips (id 3's v).
   const rows = loaded.rowsInKeyOrder("t");
   assert.deepStrictEqual(rows[2], [{ kind: "int", int: 3n }, { kind: "null" }]);
@@ -637,7 +637,7 @@ test("default survives load", () => {
 test("round trip at default page size", () => {
   const db = new Database();
   db.pageSize = 8192;
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   for (let i = 1; i <= 20; i++) {
     const v = i === 3 ? "NULL" : `${i * 10}`;
     run(db, `INSERT INTO t VALUES (${i}, ${v})`);

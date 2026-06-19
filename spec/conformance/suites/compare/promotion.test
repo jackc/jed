@@ -1,11 +1,11 @@
 # Cross-type integer comparison via the promotion tower
-# (spec/types/compare.toml: int16 < int32 < int64). When two integer types meet,
+# (spec/types/compare.toml: i16 < i32 < i64). When two integer types meet,
 # both promote to the higher-ranked type and compare there; widening is lossless.
 # Format + the `requires` directive: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.comparison_order, query.order_by, types.int16, types.int32, types.int64, compare.promotion, expr.arithmetic
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.comparison_order, query.order_by, types.i16, types.i32, types.i64, compare.promotion, expr.arithmetic
 
 statement ok
-CREATE TABLE pairs (id int32 PRIMARY KEY, a int16, b int32, c int64)
+CREATE TABLE pairs (id i32 PRIMARY KEY, a i16, b i32, c i64)
 
 # row 1: all three columns hold the same logical value
 statement ok
@@ -15,31 +15,31 @@ INSERT INTO pairs VALUES (1, 100, 100, 100)
 statement ok
 INSERT INTO pairs VALUES (2, 100, 200, 300)
 
-# int16 vs int32: promote to int32, equal only when values match
+# i16 vs i32: promote to i32, equal only when values match
 query I nosort
 SELECT id FROM pairs WHERE a = b ORDER BY id
 ----
 1
 
-# int16 vs int64: promote to int64
+# i16 vs i64: promote to i64
 query I nosort
 SELECT id FROM pairs WHERE a = c ORDER BY id
 ----
 1
 
-# int32 vs int64: promote to int64
+# i32 vs i64: promote to i64
 query I nosort
 SELECT id FROM pairs WHERE b = c ORDER BY id
 ----
 1
 
-# ordering comparison across types (int16 vs int64)
+# ordering comparison across types (i16 vs i64)
 query I nosort
 SELECT id FROM pairs WHERE a < c ORDER BY id
 ----
 2
 
-# ordering the other direction (int64 vs int32)
+# ordering the other direction (i64 vs i32)
 query I nosort
 SELECT id FROM pairs WHERE c > b ORDER BY id
 ----
@@ -48,20 +48,20 @@ SELECT id FROM pairs WHERE c > b ORDER BY id
 # The promotion tower governs the RESULT type of an expression, not only comparison. All three
 # widths render under the `I` tag, so a core that promoted to the wrong width would pass on rows
 # alone — the `# types:` directive pins the resolved width (the §8 promotion hotspot, made
-# assertable). int16 + int32 -> int32; int16 + int64 and int32 + int64 -> int64. (row 1: 100+100)
-# types: int32
+# assertable). i16 + i32 -> i32; i16 + i64 and i32 + i64 -> i64. (row 1: 100+100)
+# types: i32
 query I nosort
 SELECT a + b FROM pairs WHERE id = 1
 ----
 200
 
-# types: int64
+# types: i64
 query I nosort
 SELECT a + c FROM pairs WHERE id = 1
 ----
 200
 
-# types: int64
+# types: i64
 query I nosort
 SELECT b + c FROM pairs WHERE id = 1
 ----

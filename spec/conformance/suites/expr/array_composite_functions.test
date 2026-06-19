@@ -10,10 +10,10 @@
 # nothing) and NULL-safe for the search/edit functions, and folds to UNKNOWN for the quantifiers.
 # Construction uses the PG-portable '{…}'::addr[] / '(…)'::addr literals. PostgreSQL-oracle-verified
 # (postgres:18).
-# requires: query.select, func.array, func.array_composite, func.array_containment, func.array_quantified, func.variadic, types.array_composite, types.composite, types.array, types.int32, types.text, resource.cost_metering
+# requires: query.select, func.array, func.array_composite, func.array_containment, func.array_quantified, func.variadic, types.array_composite, types.composite, types.array, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TYPE addr AS (street text, zip int32)
+CREATE TYPE addr AS (street text, zip i32)
 
 # --- builders: array_append / array_prepend / array_cat / || (element-agnostic) ---------
 # names: array_append

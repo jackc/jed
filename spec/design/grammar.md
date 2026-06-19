@@ -53,7 +53,7 @@ encodes:
 
 This is a CLAUDE.md §8 divergence hotspot: if one core folded case differently, or
 reserved a word another did not, the corpus would diverge. Recording the rule in the
-grammar keeps all cores honest. (Canonical *output* names — `int16` not `smallint` — are
+grammar keeps all cores honest. (Canonical *output* names — `i16` not `smallint` — are
 a separate determinism rule owned by the type system, see [types.md](types.md) §2.)
 
 ## 4. Lexical edges: the minus operator and two-character operators
@@ -66,10 +66,10 @@ Two lexer facts are easy to get subtly wrong across cores, so the grammar pins t
   literal). The parser folds unary-minus-of-a-literal into a single negative `Literal`
   value, so the negative-literal range checks (types.md §6) are unchanged.
   - **Magnitude range.** A magnitude must be `<= 2^63` (`9223372036854775808`); a larger
-    one is a syntax error (`42601`), not a silent wrap. So that `int64`'s minimum is
+    one is a syntax error (`42601`), not a silent wrap. So that `i64`'s minimum is
     reachable, the lexer carries the magnitude *unsigned* (Rust `u64`, Go `uint64`, TS
-    `bigint`) — `i64`/`int64` cannot hold `2^63`. The value `2^63` is in range **only** as
-    the operand of unary minus, where it folds to `-9223372036854775808` (`int64::MIN`); a
+    `bigint`) — `i64`/`i64` cannot hold `2^63`. The value `2^63` is in range **only** as
+    the operand of unary minus, where it folds to `-9223372036854775808` (`i64::MIN`); a
     bare `2^63` fits no signed integer type and traps `22003` at resolve time (deterministic,
     before any row is scanned).
 - **`<=`, `>=`, and `<>` are single tokens**, lexed greedily. The comparison operators are
@@ -160,7 +160,7 @@ With `decimal` the rule gains an **optional parenthesized type modifier** —
 parameterized type**. The grammar accepts the typmod *shape* for any type name (it is one
 production), but the **semantics** are owned by resolution: a typmod is meaningful only for
 `decimal`/`numeric` (precision, optional scale; §14), and a typmod on a type that takes
-none — `int32(5)` — is rejected at resolve. Empty parens (`numeric()`) and a non-integer
+none — `i32(5)` — is rejected at resolve. Empty parens (`numeric()`) and a non-integer
 inside are `42601`. This mirrors §6's standing split: the grammar stays small and
 permissive about *shape*, the type system enforces *meaning*.
 
@@ -193,7 +193,7 @@ this order:
    are never looked up.
 2. **A bare column reference** (no alias) → the **catalog's canonical column name** at the
    resolved index, i.e. the spelling from `CREATE TABLE`, *not* the spelling typed in the
-   SELECT. So with `c int32` declared, `SELECT C FROM t` names the column `c`. (Identifiers
+   SELECT. So with `c i32` declared, `SELECT C FROM t` names the column `c`. (Identifiers
    match case-insensitively — §3 — so the user's casing must not leak into the output.)
 3. **`*`** → expands to each underlying column's canonical name, in column order — the same
    expansion that produces the projections.
@@ -236,7 +236,7 @@ rejected **before any row is scanned** with a precise structured error — `2201
 (`invalid_row_count_in_offset_clause`) for `OFFSET` ([../errors/registry.toml](../errors/registry.toml)),
 the PostgreSQL SQLSTATEs. The value `-0` folds to `0` and is accepted. The shared integer
 lexer's magnitude rules still hold: a magnitude `> 2^63` is a `42601` syntax error, and a
-positive magnitude of `2^63` (over `int64`'s max) traps `22003` (§4). `LIMIT 0` is valid and
+positive magnitude of `2^63` (over `i64`'s max) traps `22003` (§4). `LIMIT 0` is valid and
 yields the empty result; an `OFFSET` past the end yields the empty result.
 
 Without `ORDER BY`, **which rows a `LIMIT` returns is unspecified** — `LIMIT` windows an
@@ -469,7 +469,7 @@ the point (`0 ≤ s ≤ p`); an out-of-range or malformed typmod — `numeric(0)
 `numeric(5,7)` — traps **`22023`** (`invalid_parameter_value`,
 [../errors/registry.toml](../errors/registry.toml)), PostgreSQL's SQLSTATE. The grammar
 accepts the typmod shape on *any* type name (one production, §6); a typmod on a type that
-takes none (`int32(5)`, `text(10)`) is a resolve-time error this slice (`0A000` — `varchar(n)`
+takes none (`i32(5)`, `text(10)`) is a resolve-time error this slice (`0A000` — `varchar(n)`
 length limits and other parameterized types are deferred, [types.md](types.md) §11). The
 limits, the p/s interaction (integer-part digits ≤ `p − s`), and the rounding-on-coercion rule
 are the type system's, detailed in [decimal.md](decimal.md) §2–3; the grammar fixes only that
@@ -913,7 +913,7 @@ two forms and is the **first deliberately lazy** expression in the engine.
   decimal at eval when the common type is decimal (so `CASE WHEN c THEN 1 ELSE 1.5 END` renders
   `1` / `1.5`); a non-numeric family (text/boolean/bytea) must be homogeneous. A **cross-family**
   mix — e.g. an integer `THEN` and a text `ELSE` — is **`42804`** ("CASE types … cannot be
-  matched"). Bare integer-literal arms keep their natural width (defaulting to int64), so width
+  matched"). Bare integer-literal arms keep their natural width (defaulting to i64), so width
   differences from PostgreSQL are unobservable (every integer renders under the `I` tag).
 - **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the CASE node, plus the
   `operator_eval`s of the conditions tested up to the match and of the selected result only
@@ -1014,7 +1014,7 @@ left spine.
 fold of the operands' types at that position ([cost.md](cost.md) §3 records the same lattice as a
 cross-core contract):
 
-- integer widths **promote** to the widest (`int16` < `int32` < `int64`);
+- integer widths **promote** to the widest (`i16` < `i32` < `i64`);
 - integer and `decimal` unify to **`decimal`** (oracle: `int2 ∪ int4` → `integer`, `int4 ∪ int8`
   → `bigint`, `int ∪ numeric` → `numeric`);
 - a column that is **`NULL`-typed in every operand** unifies to **`text`** (PostgreSQL's
@@ -1617,7 +1617,7 @@ just "coerce the string `x` to that type, with the type named explicitly." The p
 | `bytea` | `\x`-hex input ([types.md](types.md) §13) | `22P02` |
 | `uuid` | PG-flexible uuid input ([types.md](types.md) §14) | `22P02` |
 | `text` | identity (the string itself) | — |
-| `int16` / `int32` / `int64` | optional sign + decimal digits, surrounding whitespace trimmed | `22P02` malformed / `22003` out of range |
+| `i16` / `i32` / `i64` | optional sign + decimal digits, surrounding whitespace trimmed | `22P02` malformed / `22003` out of range |
 | `decimal` / `numeric` | jed's decimal-literal grammar (sign, digits, one `.`), whitespace trimmed; capped | `22P02` malformed / `22003` over cap |
 | `boolean` | PG's `boolin`: `t`/`tr`/`tru`/`true`, `f`/`fa`/`fal`/`fals`/`false`, `y`/`ye`/`yes`, `n`/`no`, `on`/`off`, `1`, `0` (case-insensitive, trimmed) | `22P02` malformed |
 
@@ -1674,8 +1674,8 @@ over unchanged:
   `22023` (bad typmod), and a **typmod on the type name** (`x :: numeric(10,2)`), exactly as CAST.
 
 **Chaining is left-associative.** `x :: int8 :: int2` is `(x :: int8) :: int2` — the parser loops,
-wrapping each `Cast` around the previous. So `42 :: int8 :: int2` is `42` widened to int64 then
-narrowed to int16 (= 42), and `9999999999 :: int8 :: int2` traps `22003` at the **inner** narrow's
+wrapping each `Cast` around the previous. So `42 :: int8 :: int2` is `42` widened to i64 then
+narrowed to i16 (= 42), and `9999999999 :: int8 :: int2` traps `22003` at the **inner** narrow's
 eval.
 
 **Precedence — `::` binds tighter than unary minus** (PostgreSQL's operator table: `::` sits just
@@ -1683,12 +1683,12 @@ below the `.` qualifier, above unary `+`/`-`). So:
 
 ```
 -5 :: int        ==  -(5 :: int)        -- NOT (-5) :: int
--32768 :: int16  ->  22003              -- inner 32768 overflows int16, THEN negate
-(-32768) :: int16 ->  -32768            -- parenthesized: the in-range value
+-32768 :: i16  ->  22003              -- inner 32768 overflows i16, THEN negate
+(-32768) :: i16 ->  -32768            -- parenthesized: the in-range value
 1 + 2 :: int8    ==  1 + (2 :: int8)    -- tighter than additive, too
 ```
 
-This matters because of §4's **leading-`-`-of-a-literal fold** (which makes `int64`'s minimum
+This matters because of §4's **leading-`-`-of-a-literal fold** (which makes `i64`'s minimum
 representable as `-9223372036854775808`). That fold is **suppressed when a `::` immediately follows
 the numeric literal**, so `-N :: T` parses as `-(N :: T)` (the cast applies to the unsigned
 magnitude first), matching PG. A bare `-N` with no trailing `::` still folds as before — no
@@ -2082,7 +2082,7 @@ alter_sequence  ::= "ALTER" "SEQUENCE" ("IF" "EXISTS")? identifier "RESTART" ("W
 The options are **order-free** and each appears at most once (a repeat is `42601`), like the FK
 actions (§43) — the parser loops, dispatching on the leading keyword. `INCREMENT`/`START` accept an
 optional `BY`/`WITH`. An option value is a `signed_integer` (an optional leading `-` then an integer
-literal — `START WITH -1`, `INCREMENT BY -2`); it spans the full int64 range, so a value out of range
+literal — `START WITH -1`, `INCREMENT BY -2`); it spans the full i64 range, so a value out of range
 is `22003` at parse, and `INCREMENT 0` / `CACHE < 1` / an inconsistent `START`/`MIN`/`MAX` is `22023`
 at execution. `SEQUENCE`, `INCREMENT`, `MINVALUE`, `MAXVALUE`, `START`, `CACHE`, `CYCLE`, `BY`, `WITH`
 stay **non-reserved** (§3): `CREATE SEQUENCE` / `DROP SEQUENCE` is recognized by the two leading

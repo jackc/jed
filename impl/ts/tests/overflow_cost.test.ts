@@ -35,9 +35,9 @@ function cost(db: Database, sql: string): bigint {
 function overflowTables(): Database {
   const db = smallPageDb();
   const big = fillerText(600);
-  execute(db, "CREATE TABLE spill (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE spill (id i32 PRIMARY KEY, body text)");
   execute(db, `INSERT INTO spill VALUES (1, '${big}'), (2, 'small')`);
-  execute(db, "CREATE TABLE control (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE control (id i32 PRIMARY KEY, body text)");
   execute(db, "INSERT INTO control VALUES (1, 'tiny'), (2, 'small')");
   return db;
 }
@@ -68,9 +68,9 @@ test("LIMIT does not lower the block", () => {
   // chain pages.
   const db = smallPageDb();
   const big = fillerText(600);
-  execute(db, "CREATE TABLE spill (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE spill (id i32 PRIMARY KEY, body text)");
   execute(db, `INSERT INTO spill VALUES (1, 'small'), (2, '${big}')`);
-  execute(db, "CREATE TABLE control (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE control (id i32 PRIMARY KEY, body text)");
   execute(db, "INSERT INTO control VALUES (1, 'small'), (2, 'tiny')");
   const spill = cost(db, "SELECT * FROM spill LIMIT 1");
   const control = cost(db, "SELECT * FROM control LIMIT 1");
@@ -116,9 +116,9 @@ test("multiple chains in one record sum", () => {
   const db = smallPageDb();
   const bigText = fillerText(600);
   const bigHex = fillerBytesHex(300);
-  execute(db, "CREATE TABLE spill (id int32 PRIMARY KEY, body text, blob bytea)");
+  execute(db, "CREATE TABLE spill (id i32 PRIMARY KEY, body text, blob bytea)");
   execute(db, `INSERT INTO spill VALUES (1, '${bigText}', '\\x${bigHex}')`);
-  execute(db, "CREATE TABLE control (id int32 PRIMARY KEY, body text, blob bytea)");
+  execute(db, "CREATE TABLE control (id i32 PRIMARY KEY, body text, blob bytea)");
   execute(db, "INSERT INTO control VALUES (1, 'tiny', '\\xcafe')");
   const spill = cost(db, "SELECT * FROM spill");
   const control = cost(db, "SELECT * FROM control");

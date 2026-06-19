@@ -22,7 +22,7 @@ func TestCreateCommitReopenRoundTrips(t *testing.T) {
 	if db.Txid() != 1 { // the initial empty image is committed at create
 		t.Fatalf("txid after create = %d want 1", db.Txid())
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	mustExec(t, db, "INSERT INTO t VALUES (1, 10), (2, 20)")
 	if err := db.Commit(); err != nil {
 		t.Fatal(err)
@@ -94,7 +94,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)") // autocommitted, no explicit commit
 	db.Close()
 
@@ -111,7 +111,7 @@ func TestAutocommitPersistsEachWriteAcrossClose(t *testing.T) {
 func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 	// With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
 	db := NewDatabase()
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	if err := db.Commit(); err != nil {
 		t.Fatal(err)
@@ -127,7 +127,7 @@ func TestCommitAndRollbackAreNoopsUnderAutocommit(t *testing.T) {
 
 func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 	db := NewDatabase()
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	insert, err := db.Prepare("INSERT INTO t VALUES ($1, $2)")
 	if err != nil {
 		t.Fatal(err)
@@ -164,7 +164,7 @@ func TestPrepareExecuteAndQueryWithParams(t *testing.T) {
 
 func TestQueryOnNonQueryStatementErrors(t *testing.T) {
 	db := NewDatabase()
-	if _, err := db.QuerySQL("CREATE TABLE t (id int32 PRIMARY KEY)", nil); err == nil {
+	if _, err := db.QuerySQL("CREATE TABLE t (id i32 PRIMARY KEY)", nil); err == nil {
 		t.Fatal("expected error")
 	}
 }
@@ -180,7 +180,7 @@ func TestErrorsSurfaceWithSQLState(t *testing.T) {
 
 func TestCommitOnInMemoryIsNoopSuccess(t *testing.T) {
 	db := NewDatabase()
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	if err := db.Commit(); err != nil { // no path -> no-op, not an error
 		t.Fatal(err)
 	}
@@ -203,8 +203,8 @@ func TestTableNamesListsTablesSortedExcludingIndexes(t *testing.T) {
 	if got := db.TableNames(); len(got) != 0 {
 		t.Fatalf("empty catalog: got %v", got)
 	}
-	mustCreate(t, db, "CREATE TABLE Zed (id int32 PRIMARY KEY, v int32)")
-	mustCreate(t, db, "CREATE TABLE apple (id int32 PRIMARY KEY)")
+	mustCreate(t, db, "CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)")
+	mustCreate(t, db, "CREATE TABLE apple (id i32 PRIMARY KEY)")
 	mustCreate(t, db, "CREATE INDEX zed_v_idx ON Zed (v)")
 	// Sorted by LOWERCASED name (apple < zed), returning the canonical spelling (`Zed`).
 	want := []string{"apple", "Zed"}
@@ -213,7 +213,7 @@ func TestTableNamesListsTablesSortedExcludingIndexes(t *testing.T) {
 	}
 	// The visible snapshot includes an open transaction's working set.
 	mustCreate(t, db, "BEGIN")
-	mustCreate(t, db, "CREATE TABLE mid (id int32 PRIMARY KEY)")
+	mustCreate(t, db, "CREATE TABLE mid (id i32 PRIMARY KEY)")
 	if got := db.TableNames(); !slices.Equal(got, []string{"apple", "mid", "Zed"}) {
 		t.Fatalf("in-tx TableNames() = %v", got)
 	}
@@ -241,7 +241,7 @@ func TestRowsAffectedReportsDMLCounts(t *testing.T) {
 		return out.RowsAffected, out.HasRowsAffected
 	}
 
-	if n, ok := affected("CREATE TABLE t (id int32 PRIMARY KEY, v int32)"); ok || n != 0 {
+	if n, ok := affected("CREATE TABLE t (id i32 PRIMARY KEY, v i32)"); ok || n != 0 {
 		t.Fatalf("DDL: got (%d, %v) want (0, false)", n, ok)
 	}
 	if n, ok := affected("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)"); !ok || n != 3 {
@@ -264,7 +264,7 @@ func TestRowsAffectedReportsDMLCounts(t *testing.T) {
 	}
 
 	// INSERT ... SELECT counts the inserted rows; DML with RETURNING is a Query.
-	mustExec(t, db, "CREATE TABLE dst (id int32 PRIMARY KEY)")
+	mustExec(t, db, "CREATE TABLE dst (id i32 PRIMARY KEY)")
 	if n, ok := affected("INSERT INTO dst SELECT id FROM t"); !ok || n != 2 {
 		t.Fatalf("INSERT ... SELECT: got (%d, %v) want (2, true)", n, ok)
 	}
@@ -286,7 +286,7 @@ func TestOpenReadOnlyBlocksWritesAndNeverTouchesTheFile(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	if err := db.Close(); err != nil {
 		t.Fatal(err)

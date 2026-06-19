@@ -14,7 +14,7 @@
 
 `timestamp` (zoneless wall clock) and `timestamptz` (UTC instant) are the datetime types. They
 are the first case where **two distinct SQL types share one physical representation** — an
-`int64` microsecond instant — differing only in semantics and on-disk type code.
+`i64` microsecond instant — differing only in semantics and on-disk type code.
 
 This slice deliberately ships **no time-zone database and no named zones**. The split is the
 PostgreSQL *instant* model, not the SQL-standard *offset-bearing* model:
@@ -31,25 +31,25 @@ fully deterministic and byte-identical across cores (CLAUDE.md §8/§13) with ze
 dependency. The non-goal is wire/`pg_catalog` fidelity (CLAUDE.md §1); the goal is PG's
 *observable* datetime behavior on the surface we implement.
 
-## 1. Representation — int64 microseconds since the Unix epoch
+## 1. Representation — i64 microseconds since the Unix epoch
 
-A value is an **`int64` count of microseconds** since `1970-01-01 00:00:00`, proleptic
+A value is an **`i64` count of microseconds** since `1970-01-01 00:00:00`, proleptic
 Gregorian, **no leap seconds** (a day is always 86 400 s). `timestamp` measures the wall
-clock; `timestamptz` measures UTC. Microsecond resolution matches PG; `int64` µs spans
+clock; `timestamptz` measures UTC. Microsecond resolution matches PG; `i64` µs spans
 ≈ ±292 277 years around 1970, far more than the calendar needs.
 
 We **own this range** — there is no need to match PG's exact 4713 BC … 294276 AD bounds (which
-fall out of PG's 2000-01-01 epoch). The binding constraint is the `int64` itself, checked on
+fall out of PG's 2000-01-01 epoch). The binding constraint is the `i64` itself, checked on
 input (§2).
 
-**Infinity sentinels.** The two extreme `int64` values are reserved:
+**Infinity sentinels.** The two extreme `i64` values are reserved:
 
 - `i64::MIN` (`-9223372036854775808`) = **`-infinity`**
 - `i64::MAX` (`9223372036854775807`) = **`+infinity`**
 
 Finite values therefore occupy `i64::MIN + 1 ..= i64::MAX − 1`; a finite parse that would land
 exactly on a sentinel traps `22008` (§2). This is PG's `DT_NOBEGIN`/`DT_NOEND` scheme, and it
-is the reason infinity costs almost nothing here: signed-`int64` comparison already gives
+is the reason infinity costs almost nothing here: signed-`i64` comparison already gives
 `-infinity < every finite < infinity`; the `int-be-signflip` key encoding already sends
 `i64::MIN` → all-zero (sorts first) and `i64::MAX` → all-ones (sorts last); the 8-byte on-disk
 codec stores them verbatim. So **ordering, key encoding, and storage handle infinity for
@@ -117,7 +117,7 @@ civil_from_micros(t):                      # FLOOR (Euclidean) division/modulo t
 
 Per core: Rust `i64::div_euclid`/`rem_euclid`; Go a small floor-div/mod helper; TS does **all µs
 math in `bigint`** (`number` loses precision past 2⁵³, and JS `%` truncates), with a `bigint`
-floor helper. `micros_from_civil` uses **checked** multiply/add and traps `22008` on `int64`
+floor helper. `micros_from_civil` uses **checked** multiply/add and traps `22008` on `i64`
 overflow for extreme years or if a finite result would equal a reserved sentinel.
 
 ## 3. Parsing — a text literal adapting in a timestamp context
@@ -184,7 +184,7 @@ Rules:
 
 **Errors.** Malformed / unparseable syntax traps **`22007`** (`invalid_datetime_format`).
 A syntactically valid but out-of-range field (`month 13`, `day 32`, `:60`, bad `24:xx`), or a
-value beyond the representable `int64`-µs range (or onto a sentinel), traps **`22008`**
+value beyond the representable `i64`-µs range (or onto a sentinel), traps **`22008`**
 (`datetime_field_overflow`). Parsing happens at **resolve time**, before any scan, so a bad
 literal in a `WHERE` predicate traps deterministically *before* row iteration — mirroring
 `bytea`'s `decode_bytea_literal`.
@@ -212,7 +212,7 @@ Because BC/AD and wide-year forms are easy to get subtly wrong, the corpus rows 
 
 ## 5. Comparison and ordering
 
-`timestamp × timestamp` and `timestamptz × timestamptz` compare by the **`int64` instant**
+`timestamp × timestamp` and `timestamptz × timestamptz` compare by the **`i64` instant**
 ([compare.toml](../types/compare.toml), `via = "none"`): plain signed numeric order, so
 `-infinity < every finite < infinity`, `infinity = infinity` is true, and ordering is total
 (no NaN). NULL is the largest value (sorts last ascending), three-valued logic throughout — the
@@ -239,7 +239,7 @@ comparable value (always definite).
 - **Casts** ([casts.toml](../types/casts.toml)): **deferred**. `CAST(x AS timestamp)`,
   text↔timestamp, and the zone-requiring timestamp↔timestamptz conversion are all later work;
   the latter needs a zone and so never reconciles the two families here.
-- **Key encoding** ([encoding.md](../design/encoding.md) §2.1, the `int64` codec): both types
+- **Key encoding** ([encoding.md](../design/encoding.md) §2.1, the `i64` codec): both types
   reuse the fixed-width `int-be-signflip` integer key encoding **verbatim** — and unlike
   text/bytea/decimal it is **exercised** this slice, so a timestamp / timestamptz `PRIMARY KEY`
   is **supported** (the bytes already sort in instant order, infinities included).

@@ -14,7 +14,7 @@
 # 42703; an aggregate in WHERE stays 42803. PG-divergent forms that fall out of non-reserved
 # keywords (`SELECT`, `SELECT from`, `SELECT distinct` — §34) are deliberately NOT tested
 # here: the corpus pins the PG-agreeing surface.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.aggregates, query.having, query.distinct, query.limit, query.offset, query.order_by, query.column_alias, query.union, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.table_alias, query.qualified_column, query.point_lookup, expr.arithmetic, expr.comparison_value, types.int32, types.boolean, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.aggregates, query.having, query.distinct, query.limit, query.offset, query.order_by, query.column_alias, query.union, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.table_alias, query.qualified_column, query.point_lookup, expr.arithmetic, expr.comparison_value, types.i32, types.boolean, resource.cost_metering
 
 # --- the virtual row ------------------------------------------------------------------
 # A literal projection is a leaf (no operator_eval): the whole query costs the single
@@ -76,7 +76,7 @@ SELECT count(*) WHERE false
 0
 
 # A value aggregate over the virtual row returns its argument. (sum(1) is deliberately not
-# pinned here: jed types the literal int64 so sum widens to decimal, while PG types it int4
+# pinned here: jed types the literal i64 so sum widens to decimal, while PG types it int4
 # and derives bigint — the documented literal-default divergence; the widening itself is
 # pinned over columns in aggregates/sum.test.)
 # names: max
@@ -171,7 +171,7 @@ true
 
 # --- composing with real tables -------------------------------------------------------
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY)
+CREATE TABLE t (id i32 PRIMARY KEY)
 
 statement ok
 INSERT INTO t VALUES (1), (2)

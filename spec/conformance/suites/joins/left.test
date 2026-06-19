@@ -8,16 +8,16 @@
 # them; IS NULL on the nullable key is the anti-join. Cost is the cost.md §3 contract: an outer
 # join evaluates ON over the same |running|×|right| candidate set as an inner join (NULL-extension
 # charges no operator_eval) and only the produced-row count grows.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.is_null, query.logical_connectives, query.order_by, query.order_by_keys, query.join_left, query.qualified_column, null.three_valued, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.is_null, query.logical_connectives, query.order_by, query.order_by_keys, query.join_left, query.qualified_column, null.three_valued, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE b (id int32 PRIMARY KEY, k int32, label text)
+CREATE TABLE b (id i32 PRIMARY KEY, k i32, label text)
 
 statement ok
-CREATE TABLE empt (id int32 PRIMARY KEY, v int32)
+CREATE TABLE empt (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO a VALUES (1, 10), (2, 20), (3, 30), (4, NULL)

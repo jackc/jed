@@ -1,17 +1,17 @@
 # GROUP BY over NON-INTEGER key types — the bucketing / NULL-as-its-own-group / value-canonical
 # grouping rules (aggregates.md §5-6) exercised for text, boolean, bytea, uuid, timestamp, and
-# timestamptz. The dedicated group_by.test covers only int32 + decimal keys; this file pushes the
+# timestamptz. The dedicated group_by.test covers only i32 + decimal keys; this file pushes the
 # grouping machinery through each type's EQUALITY + value-canonicalization, the §8 divergence
 # hotspot. The canonical-form cases are the point: two input spellings of the SAME value
 # (uuid case/braces, bytea hex case, timestamp sub-second zero, timestamptz offset) must land in
 # ONE group — proving grouping compares the stored value, not the input text. NULL is always its
 # own single group. Rows are asserted with `rowsort` (the harness's collation-independent byte
 # sort) so the assertion does not depend on jed's collation-C ORDER BY vs PG's locale collation.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.aggregates, query.group_by, types.int32, types.text, types.boolean_storable, types.bytea, types.uuid, types.timestamp, types.timestamptz
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.aggregates, query.group_by, types.i32, types.text, types.boolean_storable, types.bytea, types.uuid, types.timestamp, types.timestamptz
 
 # --- text keys: distinct values bucket separately; NULL is its own group --------------------
 statement ok
-CREATE TABLE gt (id int32 PRIMARY KEY, k text)
+CREATE TABLE gt (id i32 PRIMARY KEY, k text)
 
 statement ok
 INSERT INTO gt VALUES (1, 'apple'), (2, 'apple'), (3, 'banana'), (4, NULL), (5, 'cherry'), (6, NULL)
@@ -33,7 +33,7 @@ cherry
 # text equality is case-sensitive (collation C — types.md §11): 'x' and 'X' are DISTINCT groups,
 # so two singleton groups (counts 1, 1), not one group of 2. Asserted as the multiset of counts.
 statement ok
-CREATE TABLE gtc (id int32 PRIMARY KEY, k text)
+CREATE TABLE gtc (id i32 PRIMARY KEY, k text)
 
 statement ok
 INSERT INTO gtc VALUES (1, 'x'), (2, 'X'), (3, 'x')
@@ -47,7 +47,7 @@ SELECT COUNT(*) FROM gtc GROUP BY k
 
 # --- boolean keys: true / false / NULL are three groups -------------------------------------
 statement ok
-CREATE TABLE gb (id int32 PRIMARY KEY, k boolean)
+CREATE TABLE gb (id i32 PRIMARY KEY, k boolean)
 
 statement ok
 INSERT INTO gb VALUES (1, true), (2, false), (3, true), (4, NULL), (5, true)
@@ -65,7 +65,7 @@ true
 
 # --- bytea keys: hex INPUT case is normalized, so \xAB and \xab are the SAME value ----------
 statement ok
-CREATE TABLE gby (id int32 PRIMARY KEY, k bytea)
+CREATE TABLE gby (id i32 PRIMARY KEY, k bytea)
 
 statement ok
 INSERT INTO gby VALUES (1, '\xab'), (2, '\xAB'), (3, '\xcd'), (4, NULL), (5, '\x')
@@ -86,7 +86,7 @@ NULL
 
 # --- uuid keys: input spelling (case / braces / hyphenation) normalizes before grouping ------
 statement ok
-CREATE TABLE gu (id int32 PRIMARY KEY, k uuid)
+CREATE TABLE gu (id i32 PRIMARY KEY, k uuid)
 
 statement ok
 INSERT INTO gu VALUES
@@ -110,7 +110,7 @@ f47ac10b-58cc-4372-a567-0e02b2c3d479
 
 # --- timestamp keys: the same instant written two ways (sub-second zero) is ONE group --------
 statement ok
-CREATE TABLE gts (id int32 PRIMARY KEY, k timestamp)
+CREATE TABLE gts (id i32 PRIMARY KEY, k timestamp)
 
 statement ok
 INSERT INTO gts VALUES
@@ -137,7 +137,7 @@ infinity
 
 # --- timestamptz keys: offsets normalize to the same UTC instant → ONE group ----------------
 statement ok
-CREATE TABLE gtz (id int32 PRIMARY KEY, k timestamptz)
+CREATE TABLE gtz (id i32 PRIMARY KEY, k timestamptz)
 
 statement ok
 INSERT INTO gtz VALUES

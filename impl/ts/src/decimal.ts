@@ -298,7 +298,7 @@ export class Decimal {
   }
 
   // toBigIntRound rounds to an integer (scale 0, half away) and returns it as a bigint, or
-  // null if it would exceed the int64 range (the decimal→int cast; caller range-checks).
+  // null if it would exceed the i64 range (the decimal→int cast; caller range-checks).
   toBigIntRound(): bigint | null {
     const r = this.roundToScale(0);
     let v = 0n;

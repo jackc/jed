@@ -9,12 +9,12 @@
 use jed::value::Value;
 use jed::{Database, Outcome, execute};
 
-/// `o` is a handful of outer rows; `inr` is `n` rows (id int32 PRIMARY KEY, v int32; v == id), wide
+/// `o` is a handful of outer rows; `inr` is `n` rows (id i32 PRIMARY KEY, v i32; v == id), wide
 /// enough to span several leaves. The outer k-values are all present as inner ids.
 fn tables(n: i64) -> Database {
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE o (id int32 PRIMARY KEY, k int32)").unwrap();
-    execute(&mut db, "CREATE TABLE inr (id int32 PRIMARY KEY, v int32)").unwrap();
+    execute(&mut db, "CREATE TABLE o (id i32 PRIMARY KEY, k i32)").unwrap();
+    execute(&mut db, "CREATE TABLE inr (id i32 PRIMARY KEY, v i32)").unwrap();
     execute(
         &mut db,
         "INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)",

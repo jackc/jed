@@ -79,15 +79,15 @@ func uqNames(t *testing.T, db *Database, table string) []string {
 // index name as written.
 func TestUniqueConstraintNamingMatchesPostgres(t *testing.T) {
 	db := NewDatabase()
-	uqRun(t, db, "CREATE TABLE other (x int32)")
+	uqRun(t, db, "CREATE TABLE other (x i32)")
 	uqRun(t, db, "CREATE INDEX walk_a_key ON other (x)") // occupies the derived base
-	uqRun(t, db, "CREATE TABLE Walk (a int32 UNIQUE, b int32, CONSTRAINT Named UNIQUE (b, a), "+
+	uqRun(t, db, "CREATE TABLE Walk (a i32 UNIQUE, b i32, CONSTRAINT Named UNIQUE (b, a), "+
 		"CONSTRAINT walk_b_check CHECK (b > 0), UNIQUE (b))")
 	if got := uqNames(t, db, "walk"); !slices.Equal(got, []string{"Named!", "walk_a_key1!", "walk_b_key!"}) {
 		t.Fatalf("walk indexes = %v", got)
 	}
 	// A derived name walks past a CHECK name too (PG-probed: w1_a_key -> w1_a_key1).
-	uqRun(t, db, "CREATE TABLE w1 (a int32, CONSTRAINT w1_a_key CHECK (a > 0), UNIQUE (a))")
+	uqRun(t, db, "CREATE TABLE w1 (a i32, CONSTRAINT w1_a_key CHECK (a > 0), UNIQUE (a))")
 	if got := uqNames(t, db, "w1"); !slices.Equal(got, []string{"w1_a_key1!"}) {
 		t.Fatalf("w1 indexes = %v", got)
 	}
@@ -98,35 +98,35 @@ func TestUniqueConstraintNamingMatchesPostgres(t *testing.T) {
 // identical to the primary key's folds away entirely; a differing ORDER is distinct.
 func TestUniqueDedupAndPKFoldMatchPostgres(t *testing.T) {
 	db := NewDatabase()
-	uqRun(t, db, "CREATE TABLE e3 (a int32 UNIQUE UNIQUE, UNIQUE (a))")
+	uqRun(t, db, "CREATE TABLE e3 (a i32 UNIQUE UNIQUE, UNIQUE (a))")
 	if got := uqNames(t, db, "e3"); !slices.Equal(got, []string{"e3_a_key!"}) {
 		t.Fatalf("e3 indexes = %v", got)
 	}
 	// An unnamed-then-named pair keeps the NAME (PG: p1 kept "named").
-	uqRun(t, db, "CREATE TABLE p1 (a int32 UNIQUE, CONSTRAINT named UNIQUE (a))")
+	uqRun(t, db, "CREATE TABLE p1 (a i32 UNIQUE, CONSTRAINT named UNIQUE (a))")
 	if got := uqNames(t, db, "p1"); !slices.Equal(got, []string{"named!"}) {
 		t.Fatalf("p1 indexes = %v", got)
 	}
 	// Two named duplicates keep the FIRST (PG: e7 kept "x").
-	uqRun(t, db, "CREATE TABLE e7 (a int32, CONSTRAINT x UNIQUE (a), CONSTRAINT y UNIQUE (a))")
+	uqRun(t, db, "CREATE TABLE e7 (a i32, CONSTRAINT x UNIQUE (a), CONSTRAINT y UNIQUE (a))")
 	if got := uqNames(t, db, "e7"); !slices.Equal(got, []string{"x!"}) {
 		t.Fatalf("e7 indexes = %v", got)
 	}
 	// The PK absorbs an identical list — regardless of declaration order or form.
-	uqRun(t, db, "CREATE TABLE e5 (a int32 PRIMARY KEY UNIQUE)")
+	uqRun(t, db, "CREATE TABLE e5 (a i32 PRIMARY KEY UNIQUE)")
 	if got := uqNames(t, db, "e5"); len(got) != 0 {
 		t.Fatalf("e5 indexes = %v", got)
 	}
-	uqRun(t, db, "CREATE TABLE p2 (a int32 UNIQUE, PRIMARY KEY (a))")
+	uqRun(t, db, "CREATE TABLE p2 (a i32 UNIQUE, PRIMARY KEY (a))")
 	if got := uqNames(t, db, "p2"); len(got) != 0 {
 		t.Fatalf("p2 indexes = %v", got)
 	}
-	uqRun(t, db, "CREATE TABLE e9 (a int32, b int32, PRIMARY KEY (a, b), UNIQUE (a, b))")
+	uqRun(t, db, "CREATE TABLE e9 (a i32, b i32, PRIMARY KEY (a, b), UNIQUE (a, b))")
 	if got := uqNames(t, db, "e9"); len(got) != 0 {
 		t.Fatalf("e9 indexes = %v", got)
 	}
 	// A differing member ORDER is a distinct constraint (PG: p3 kept both).
-	uqRun(t, db, "CREATE TABLE p3 (a int32, b int32, PRIMARY KEY (a, b), UNIQUE (b, a))")
+	uqRun(t, db, "CREATE TABLE p3 (a i32, b i32, PRIMARY KEY (a, b), UNIQUE (b, a))")
 	if got := uqNames(t, db, "p3"); !slices.Equal(got, []string{"p3_b_a_key!"}) {
 		t.Fatalf("p3 indexes = %v", got)
 	}
@@ -138,47 +138,47 @@ func TestUniqueDedupAndPKFoldMatchPostgres(t *testing.T) {
 // table's constraint names).
 func TestUniqueDDLErrorsMatchPostgres(t *testing.T) {
 	db := NewDatabase()
-	uqRun(t, db, "CREATE TABLE other (x int32)")
-	if code, _ := uqErr(t, db, "CREATE TABLE e2 (a int32, UNIQUE (nosuch))"); code != "42703" {
+	uqRun(t, db, "CREATE TABLE other (x i32)")
+	if code, _ := uqErr(t, db, "CREATE TABLE e2 (a i32, UNIQUE (nosuch))"); code != "42703" {
 		t.Fatalf("unknown member = %s", code)
 	}
-	if code, _ := uqErr(t, db, "CREATE TABLE e1 (a int32, UNIQUE (a, a))"); code != "42701" {
+	if code, _ := uqErr(t, db, "CREATE TABLE e1 (a i32, UNIQUE (a, a))"); code != "42701" {
 		t.Fatalf("dup member = %s", code)
 	}
-	if code, _ := uqErr(t, db, "CREATE TABLE e6 (a int32, s text UNIQUE)"); code != "0A000" {
+	if code, _ := uqErr(t, db, "CREATE TABLE e6 (a i32, s text UNIQUE)"); code != "0A000" {
 		t.Fatalf("text member = %s", code)
 	}
 	// UNIQUE members resolve BEFORE any CHECK validates (PG: z1/z2), in either order.
-	if code, _ := uqErr(t, db, "CREATE TABLE z1 (a int32, CHECK (nosuch1 > 0), UNIQUE (nosuch2))"); code != "42703" {
+	if code, _ := uqErr(t, db, "CREATE TABLE z1 (a i32, CHECK (nosuch1 > 0), UNIQUE (nosuch2))"); code != "42703" {
 		t.Fatalf("z1 = %s", code)
 	}
-	if _, msg := uqErr(t, db, "CREATE TABLE z2 (a int32, UNIQUE (nosuch2), CHECK (nosuch1 > 0))"); !strings.Contains(msg, "nosuch2") {
+	if _, msg := uqErr(t, db, "CREATE TABLE z2 (a i32, UNIQUE (nosuch2), CHECK (nosuch1 > 0))"); !strings.Contains(msg, "nosuch2") {
 		t.Fatalf("unique member first: %q", msg)
 	}
 	// An explicit constraint name collides in the RELATION namespace: an existing table,
 	// the table being created (PG: p4), and a same-statement sibling (PG: e8).
-	if code, _ := uqErr(t, db, "CREATE TABLE c2 (a int32, CONSTRAINT other UNIQUE (a))"); code != "42P07" {
+	if code, _ := uqErr(t, db, "CREATE TABLE c2 (a i32, CONSTRAINT other UNIQUE (a))"); code != "42P07" {
 		t.Fatalf("vs table = %s", code)
 	}
-	if code, _ := uqErr(t, db, "CREATE TABLE p4 (a int32, CONSTRAINT p4 UNIQUE (a))"); code != "42P07" {
+	if code, _ := uqErr(t, db, "CREATE TABLE p4 (a i32, CONSTRAINT p4 UNIQUE (a))"); code != "42P07" {
 		t.Fatalf("vs self = %s", code)
 	}
 	if code, _ := uqErr(t, db,
-		"CREATE TABLE e8 (a int32, CONSTRAINT x UNIQUE (a), b int32, CONSTRAINT x UNIQUE (b))"); code != "42P07" {
+		"CREATE TABLE e8 (a i32, CONSTRAINT x UNIQUE (a), b i32, CONSTRAINT x UNIQUE (b))"); code != "42P07" {
 		t.Fatalf("vs sibling = %s", code)
 	}
 	// ... and with a CHECK constraint's name it is 42710, in either declaration order
 	// (PG: z4/z5 — both report when the unique constraint is created).
 	if code, _ := uqErr(t, db,
-		"CREATE TABLE z4 (a int32, CONSTRAINT zc CHECK (a > 0), CONSTRAINT zc UNIQUE (a))"); code != "42710" {
+		"CREATE TABLE z4 (a i32, CONSTRAINT zc CHECK (a > 0), CONSTRAINT zc UNIQUE (a))"); code != "42710" {
 		t.Fatalf("z4 = %s", code)
 	}
 	if code, _ := uqErr(t, db,
-		"CREATE TABLE z5 (a int32, CONSTRAINT zc UNIQUE (a), CONSTRAINT zc CHECK (a > 0))"); code != "42710" {
+		"CREATE TABLE z5 (a i32, CONSTRAINT zc UNIQUE (a), CONSTRAINT zc CHECK (a > 0))"); code != "42710" {
 		t.Fatalf("z5 = %s", code)
 	}
 	// CREATE UNIQUE <not-index> is a syntax error.
-	if code, _ := uqErr(t, db, "CREATE UNIQUE TABLE t (a int32)"); code != "42601" {
+	if code, _ := uqErr(t, db, "CREATE UNIQUE TABLE t (a i32)"); code != "42601" {
 		t.Fatalf("create unique table = %s", code)
 	}
 }
@@ -189,7 +189,7 @@ func TestUniqueDDLErrorsMatchPostgres(t *testing.T) {
 // the catalog (name) order.
 func TestUniqueInsertEnforcement(t *testing.T) {
 	db := NewDatabase()
-	uqRun(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32 UNIQUE, w int32, "+
+	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32, "+
 		"CONSTRAINT wv UNIQUE (w, v), CHECK (id < 100))")
 	uqRun(t, db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)")
 	// A stored duplicate; the message names the violated index.
@@ -209,7 +209,7 @@ func TestUniqueInsertEnforcement(t *testing.T) {
 	uqRun(t, db, "INSERT INTO t VALUES (6, NULL, 300), (7, NULL, 300)")
 	// A fully non-NULL composite duplicate traps, naming the composite index (its own
 	// table — beside t_v_key the component dup would always be reported first).
-	uqRun(t, db, "CREATE TABLE c (id int32 PRIMARY KEY, w int32, v int32, CONSTRAINT wv2 UNIQUE (w, v))")
+	uqRun(t, db, "CREATE TABLE c (id i32 PRIMARY KEY, w i32, v i32, CONSTRAINT wv2 UNIQUE (w, v))")
 	uqRun(t, db, "INSERT INTO c VALUES (1, 40, 400)")
 	if _, msg := uqErr(t, db, "INSERT INTO c VALUES (2, 40, 400)"); !strings.Contains(msg, "wv2") {
 		t.Fatalf("composite dup: %q", msg)
@@ -240,7 +240,7 @@ func TestUniqueInsertEnforcement(t *testing.T) {
 // untouched rows and in-batch collisions trap 23505; nothing is written on failure.
 func TestUniqueUpdateEnforcementEndState(t *testing.T) {
 	db := NewDatabase()
-	uqRun(t, db, "CREATE TABLE m (id int32 PRIMARY KEY, v int32 UNIQUE)")
+	uqRun(t, db, "CREATE TABLE m (id i32 PRIMARY KEY, v i32 UNIQUE)")
 	uqRun(t, db, "INSERT INTO m VALUES (1, 1), (2, 2), (3, 30)")
 	// PG fails both of these on the transient per-row collision; jed's end state is unique.
 	uqRun(t, db, "UPDATE m SET v = v + 1 WHERE id < 3") // 1,2 -> 2,3
@@ -277,7 +277,7 @@ func TestUniqueUpdateEnforcementEndState(t *testing.T) {
 // thereafter it enforces like a constraint-backed index. The auto-name keeps _idx.
 func TestCreateUniqueIndexBuild(t *testing.T) {
 	db := NewDatabase()
-	uqRun(t, db, "CREATE TABLE d (id int32 PRIMARY KEY, a int32, n int32)")
+	uqRun(t, db, "CREATE TABLE d (id i32 PRIMARY KEY, a i32, n i32)")
 	uqRun(t, db, "INSERT INTO d VALUES (1, 7, NULL), (2, 7, NULL), (3, 8, 5)")
 	// Build over duplicates fails and registers nothing.
 	if code, msg := uqErr(t, db, "CREATE UNIQUE INDEX dup ON d (a)"); code != "23505" || !strings.Contains(msg, "dup") {
@@ -287,7 +287,7 @@ func TestCreateUniqueIndexBuild(t *testing.T) {
 		t.Fatalf("not registered: %v", got)
 	}
 	// The name is free again (nothing was created).
-	uqRun(t, db, "CREATE TABLE dup (x int32)")
+	uqRun(t, db, "CREATE TABLE dup (x i32)")
 	uqRun(t, db, "DROP TABLE dup")
 	// NULLs are exempt at build time (two NULLs in n).
 	uqRun(t, db, "CREATE UNIQUE INDEX ON d (n)") // d_n_idx — the _idx auto-name
@@ -306,7 +306,7 @@ func TestCreateUniqueIndexBuild(t *testing.T) {
 // name is the constraint's only handle).
 func TestDropIndexDropsTheConstraint(t *testing.T) {
 	db := NewDatabase()
-	uqRun(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32 UNIQUE)")
+	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE)")
 	uqRun(t, db, "INSERT INTO t VALUES (1, 10)")
 	if code, _ := uqErr(t, db, "INSERT INTO t VALUES (2, 10)"); code != "23505" {
 		t.Fatalf("enforced = %s", code)
@@ -323,7 +323,7 @@ func TestDropIndexDropsTheConstraint(t *testing.T) {
 // scan. The planner treats a unique index like any other (the bounded-scan cost).
 func TestUniqueCostsAreUnchanged(t *testing.T) {
 	db := NewDatabase()
-	uqRun(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)")
+	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
 	for i := 1; i <= 20; i++ {
 		uqRun(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, %d, %d)", i, i%5, i))
 	}
@@ -346,7 +346,7 @@ func TestUniqueCostsAreUnchanged(t *testing.T) {
 // database still enforces), and the image is byte-stable across a second serialize.
 func TestUniqueRoundTrip(t *testing.T) {
 	db := NewDatabase()
-	uqRun(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32 UNIQUE, w int32)")
+	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32)")
 	uqRun(t, db, "CREATE INDEX plain ON t (w)")
 	uqRun(t, db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)")
 	image, err := db.ToImage(8192, 1)
@@ -377,7 +377,7 @@ func TestUniqueRoundTrip(t *testing.T) {
 // definition, no store, no enforcement (the §3 snapshot model).
 func TestUniqueTransactionalDDLRollsBack(t *testing.T) {
 	db := NewDatabase()
-	uqRun(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
+	uqRun(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
 	uqRun(t, db, "INSERT INTO t VALUES (1, 10)")
 	uqRun(t, db, "BEGIN")
 	uqRun(t, db, "CREATE UNIQUE INDEX u ON t (v)")

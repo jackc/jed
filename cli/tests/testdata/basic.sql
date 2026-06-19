@@ -1,7 +1,7 @@
 -- The basic surface: DDL, multi-row INSERT, an aligned SELECT, transaction tags,
 -- comments (engine-side, grammar.md §33), and multi-line statements.
 CREATE TABLE users (
-  id int64 PRIMARY KEY,
+  id i64 PRIMARY KEY,
   name text NOT NULL,
   score numeric(5,2) DEFAULT 0
 );

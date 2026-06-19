@@ -9,7 +9,7 @@ import { dbWith, errCode } from "./util.ts";
 
 function setup() {
   return dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, a int16, b int16)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, a i16, b i16)",
     "INSERT INTO t VALUES (1, 10, 11)",
     "INSERT INTO t VALUES (2, 20, 22)",
     "INSERT INTO t VALUES (3, 30, 33)",

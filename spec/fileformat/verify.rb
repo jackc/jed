@@ -52,15 +52,15 @@ S_COMPRESS = 32 # payloads below this are never fed to the encoder (large-values
 
 require_relative "lz4"
 
-WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "timestamp" => 8, "timestamptz" => 8,
+WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "timestamp" => 8, "timestamptz" => 8,
           "date" => 4 }.freeze
-TYPECODE = { "int16" => 1, "int32" => 2, "int64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
+TYPECODE = { "i16" => 1, "i32" => 2, "i64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
              "bytea" => 7, "uuid" => 8, "timestamp" => 9, "timestamptz" => 10, "interval" => 11,
-             "float64" => 12, "float32" => 13, "date" => 16 }.freeze
+             "f64" => 12, "f32" => 13, "date" => 16 }.freeze
 CODETYPE = TYPECODE.invert.freeze
 
 # An array (T[]) column type is the element type's string with a trailing "[]" (spec/design/array.md
-# §2 — structural, no catalog object). `array_elem("int32[]")` => "int32"; nil for a non-array type.
+# §2 — structural, no catalog object). `array_elem("i32[]")` => "i32"; nil for a non-array type.
 def array_elem(type) = type.is_a?(String) && type.end_with?("[]") ? type[0...-2] : nil
 
 # uuid-raw16 (encoding.md §2.7): the 16 raw bytes of the canonical 8-4-4-4-12 form. Used both
@@ -113,12 +113,12 @@ end
 # value codec is pinned: row 1 has both fields present; row 2's `zip` is NULL (the bitmap's bit 1
 # is set and the field contributes ZERO body bytes). A composite value is the field-value array;
 # `nil` is a NULL field. The cores build this via
-#   CREATE TYPE addr AS (street text NOT NULL, zip int32)
-#   CREATE TABLE t (id int32 PRIMARY KEY, home addr)
+#   CREATE TYPE addr AS (street text NOT NULL, zip i32)
+#   CREATE TABLE t (id i32 PRIMARY KEY, home addr)
 #   INSERT (1, ROW('Main', 90210)); INSERT (2, ROW('Oak', NULL))
 COMPOSITE_TYPE_TABLE = {
-  types: [ctype("addr", [field("street", "text", not_null: true), field("zip", "int32")])],
-  tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("home", "addr")],
+  types: [ctype("addr", [field("street", "text", not_null: true), field("zip", "i32")])],
+  tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("home", "addr")],
              rows: [[1, ["Main", 90210]], [2, ["Oak", nil]]] }]
 }.freeze
 
@@ -127,28 +127,28 @@ COMPOSITE_TYPE_TABLE = {
 # then resolve) is exercised: a single name-ordered pass would meet `line`'s reference before
 # `point` is read. The row pins the recursive value codec descending through a composite field. The
 # cores build this via
-#   CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL); CREATE TYPE line AS (a point, b point)
-#   CREATE TABLE t (id int32 PRIMARY KEY, ln line); INSERT (1, ROW(ROW(1, 2), ROW(3, 4)))
+#   CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL); CREATE TYPE line AS (a point, b point)
+#   CREATE TABLE t (id i32 PRIMARY KEY, ln line); INSERT (1, ROW(ROW(1, 2), ROW(3, 4)))
 NESTED_COMPOSITE_TABLE = {
   types: [
     ctype("line", [field("a", "point"), field("b", "point")]),
-    ctype("point", [field("x", "int32", not_null: true), field("y", "int32", not_null: true)])
+    ctype("point", [field("x", "i32", not_null: true), field("y", "i32", not_null: true)])
   ],
-  tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("ln", "line")],
+  tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("ln", "line")],
              rows: [[1, [[1, 2], [3, 4]]]] }]
 }.freeze
 
 # A table with a COMPOSITE primary key (constraints.md §3): the stored key is the
-# concatenation of the members' encodings in key order (a 4-byte int32 then a
-# 2-byte int16 — mixed widths, ../design/encoding.md §2.3), pinning the cross-core
+# concatenation of the members' encodings in key order (a 4-byte i32 then a
+# 2-byte i16 — mixed widths, ../design/encoding.md §2.3), pinning the cross-core
 # composite key bytes; the catalog persists the v5 pk ordinal list [0, 1].
 # Rows include a negative first component (sign-flip ordering) and
 # first-component ties broken by the second. Listed in ascending tuple order — the
-# cores build this via `CREATE TABLE t (a int32, b int16, v int16, PRIMARY KEY (a, b))`
+# cores build this via `CREATE TABLE t (a i32, b i16, v i16, PRIMARY KEY (a, b))`
 # and insert in this order (the tree shape is order-sensitive).
 COMPOSITE_PK_TABLE = {
   name: "t",
-  columns: [col("a", "int32", pk: true), col("b", "int16", pk: true), col("v", "int16")],
+  columns: [col("a", "i32", pk: true), col("b", "i16", pk: true), col("v", "i16")],
   rows: [[-2, 5, 10], [1, 1, 20], [1, 2, 30], [1, 3, 40],
          [2, 0, 50], [2, 1, 60], [3, 7, 70], [3, 9, 80]]
 }.freeze
@@ -164,7 +164,7 @@ COMPOSITE_PK_TABLE = {
 # and insert rows in ascending key order.
 CHECK_TABLE = {
   name: "t",
-  columns: [col("a", "int32", pk: true), col("b", "int32"),
+  columns: [col("a", "i32", pk: true), col("b", "i32"),
             col("price", "decimal", precision: 8, scale: 2), col("note", "text")],
   checks: [
     { name: "price_range", expr: "price >= 0.50 AND price <= 9999.99" },
@@ -176,7 +176,7 @@ CHECK_TABLE = {
 
 PK_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("v", "int16")],
+  columns: [col("id", "i32", pk: true), col("v", "i16")],
   # 20 rows: each record is 14 bytes, so a 256-byte page (cap 240, v7) overflows at 18 rows and
   # the tree becomes interior-root + two leaves (the load-bearing interior-node + split proof).
   # id 3 has a NULL value. Inserted in ascending key order (the tree shape is order-sensitive).
@@ -186,30 +186,30 @@ PK_TABLE = {
 # A table whose rows force a HEIGHT-2 tree (an interior node whose children are themselves
 # interior nodes) at page_size 256. A wide text padding column makes each record ~66 bytes, so a
 # leaf holds 3 records and the root interior overflows after ~5 leaves -> a two-level interior.
-# 18 rows, ascending int32 PK. Exercises interior-of-interior child pointers + post-order
+# 18 rows, ascending i32 PK. Exercises interior-of-interior child pointers + post-order
 # page allocation across a deeper tree.
 TALL_TREE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("pad", "text")],
+  columns: [col("id", "i32", pk: true), col("pad", "text")],
   rows: (1..18).map { |i| [i, format("row-%02d-%s", i, "x" * 48)] }
 }.freeze
 
 # A table with a text column: exercises the value codec's text branch (u16 byte-length +
 # UTF-8 bytes), the empty string (a distinct non-NULL value), an embedded quote, a 2-byte
 # UTF-8 char (U+00E9), a NULL text value, and a 4-byte astral char (U+1F600). The PK is an
-# int32 (text is not allowed in a key this slice). \u escapes keep this source ASCII-only.
+# i32 (text is not allowed in a key this slice). \u escapes keep this source ASCII-only.
 TEXT_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("s", "text")],
+  columns: [col("id", "i32", pk: true), col("s", "text")],
   rows: [[1, "alice"], [2, ""], [3, "O'Brien"], [4, "caf\u{E9}"], [5, nil], [6, "\u{1F600}"]]
 }.freeze
 
 # A table with a boolean column: exercises the value codec's boolean branch (a single
-# bool-byte, 0x00 false / 0x01 true) plus a NULL boolean (the tag alone). The PK is an int32
+# bool-byte, 0x00 false / 0x01 true) plus a NULL boolean (the tag alone). The PK is an i32
 # (boolean as a value column; the boolean PRIMARY KEY case is BOOL_PK_TABLE below).
 BOOL_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("flag", "boolean")],
+  columns: [col("id", "i32", pk: true), col("flag", "boolean")],
   rows: [[1, true], [2, false], [3, nil]]
 }.freeze
 
@@ -230,11 +230,11 @@ BOOL_PK_TABLE = {
 # + u16 ndigits + base-10^4 groups), positive/negative/zero, a multi-group coefficient, a NULL,
 # AND the catalog typmod (an unconstrained `numeric` column `d` and a constrained numeric(10,2)
 # column `m`). The `m` values are already at scale 2, so storing them is a no-op coercion — the
-# stored bytes equal what the cores write when they INSERT the same literals. PK is an int32
+# stored bytes equal what the cores write when they INSERT the same literals. PK is an i32
 # (decimal is not allowed in a key this slice).
 DECIMAL_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("d", "decimal"), col("m", "decimal", precision: 10, scale: 2)],
+  columns: [col("id", "i32", pk: true), col("d", "decimal"), col("m", "decimal", precision: 10, scale: 2)],
   rows: [[1, "1.50", "1.50"], [2, "-12345.6789", "-12.34"], [3, "0.00", "0.00"],
          [4, "100000000.000001", "100.00"], [5, nil, nil]]
 }.freeze
@@ -242,11 +242,11 @@ DECIMAL_TABLE = {
 # A table with a bytea column: exercises the value codec's bytea branch (u16 byte-length +
 # RAW bytes, no UTF-8 validation). Covers a multi-byte value with a-f hex (\xdeadbeef), the
 # empty byte string (a distinct non-NULL value), embedded 0x00 bytes, a high byte (0xFF), a
-# NULL bytea, and a lone 0x00 byte. The PK is an int32 (bytea is not allowed in a key this
+# NULL bytea, and a lone 0x00 byte. The PK is an i32 (bytea is not allowed in a key this
 # slice). All byte values are forced to ASCII-8BIT (.b) so they round-trip verbatim.
 BYTEA_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("b", "bytea")],
+  columns: [col("id", "i32", pk: true), col("b", "bytea")],
   rows: [[1, "\xDE\xAD\xBE\xEF".b], [2, "".b], [3, "\x00\x01\x02".b],
          [4, "\xFF".b], [5, nil], [6, "\x00".b]]
 }.freeze
@@ -271,17 +271,17 @@ UUID_TABLE = {
 # column with a default (bit1 + bit2), a decimal default coerced to numeric(6,2), and a plain
 # no-default column (bit2 off, no extra bytes). The stored defaults and row values are exactly
 # what the cores write when they CREATE the table and INSERT (row 1 takes every default; row 2
-# provides all values). PK is an int32.
+# provides all values). PK is an i32.
 DEFAULT_TABLE = {
   name: "t",
   columns: [
-    col("id", "int32", pk: true),
-    col("n", "int32", default: 0),
+    col("id", "i32", pk: true),
+    col("n", "i32", default: 0),
     col("note", "text", default: "none"),
-    col("maybe", "int32", default: nil),
-    col("req", "int32", not_null: true, default: 7),
+    col("maybe", "i32", default: nil),
+    col("req", "i32", not_null: true, default: 7),
     col("amt", "decimal", precision: 6, scale: 2, default: "1.50"),
-    col("plain", "int16")
+    col("plain", "i16")
   ],
   rows: [[1, 0, "none", nil, 7, "1.50", nil],
          [2, 42, "hi", 5, 9, "2.00", 100]]
@@ -289,42 +289,42 @@ DEFAULT_TABLE = {
 
 # A table with EXPRESSION column defaults (constraints.md §2, v8): the catalog flags bit3
 # (default_is_expr) + the expr-text written AFTER the typmod, via the same token rendering a
-# CHECK uses. Covers a `uuid DEFAULT uuidv7()` (text "uuidv7 ( )"), an `int32 DEFAULT 1 + 1`
+# CHECK uses. Covers a `uuid DEFAULT uuidv7()` (text "uuidv7 ( )"), an `i32 DEFAULT 1 + 1`
 # (text "1 + 1"), a CONSTANT default beside them (bit2, "k"), and a plain no-default column. An
 # EMPTY table — the catalog encoding of expression defaults is the cross-core proof; the per-row
 # evaluation (nondeterministic without a seed) is exercised by the conformance corpus instead.
 # The cores build this via
-#   CREATE TABLE t (id int32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n int32 DEFAULT 1 + 1,
-#                   k int32 DEFAULT 7, plain int16)
+#   CREATE TABLE t (id i32 PRIMARY KEY, g uuid DEFAULT uuidv7(), n i32 DEFAULT 1 + 1,
+#                   k i32 DEFAULT 7, plain i16)
 DEFAULT_EXPR_TABLE = {
   name: "t",
   columns: [
-    col("id", "int32", pk: true),
+    col("id", "i32", pk: true),
     col("g", "uuid", default_expr: "uuidv7 ( )"),
-    col("n", "int32", default_expr: "1 + 1"),
-    col("k", "int32", default: 7),
-    col("plain", "int16")
+    col("n", "i32", default_expr: "1 + 1"),
+    col("k", "i32", default: 7),
+    col("plain", "i16")
   ],
   rows: []
 }.freeze
 
-# A table with a timestamp column: exercises the value codec's timestamp branch (the int64
-# microsecond instant, the same 8-byte int-be-signflip body as int64 — type code 8). Covers a
+# A table with a timestamp column: exercises the value codec's timestamp branch (the i64
+# microsecond instant, the same 8-byte int-be-signflip body as i64 — type code 8). Covers a
 # positive instant (2024-01-01 12:00:00), a pre-1970 negative one (1969-12-31 23:59:59.5), a
 # BC-era one (0001-01-01 00:00:00 BC), the -infinity/+infinity sentinels (i64::MIN/MAX), and a
-# NULL. Values are the raw micros the cores compute from the corresponding literals. PK is int32.
+# NULL. Values are the raw micros the cores compute from the corresponding literals. PK is i32.
 TIMESTAMP_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("ts", "timestamp")],
+  columns: [col("id", "i32", pk: true), col("ts", "timestamp")],
   rows: [[1, 1_704_110_400_000_000], [2, -500_000], [3, -62_167_219_200_000_000],
          [4, -9_223_372_036_854_775_808], [5, 9_223_372_036_854_775_807], [6, nil]]
 }.freeze
 
-# A table with a timestamptz column (type code 10): same 8-byte int64 body. The +05 literal
+# A table with a timestamptz column (type code 10): same 8-byte i64 body. The +05 literal
 # normalizes to UTC (12:00+05 -> 07:00Z -> 1_704_092_400_000_000).
 TIMESTAMPTZ_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("ts", "timestamptz")],
+  columns: [col("id", "i32", pk: true), col("ts", "timestamptz")],
   rows: [[1, 1_704_110_400_000_000], [2, 1_704_092_400_000_000], [3, -500_000],
          [4, -9_223_372_036_854_775_808], [5, 9_223_372_036_854_775_807], [6, nil]]
 }.freeze
@@ -333,45 +333,45 @@ TIMESTAMPTZ_TABLE = {
 # ‖ i64 micros, big-endian, no sign-flip). Covers a positive multi-field value
 # ('1 mon 2 days 03:04:05'), a negative value ('-1 day'), the zero interval, a months-only value
 # ('1 mon') vs a '30 days' value that is SPAN-EQUAL but byte-distinct, and a NULL. Each interval
-# value is the [months, days, micros] triple the cores compute from the literal. PK is int32.
+# value is the [months, days, micros] triple the cores compute from the literal. PK is i32.
 INTERVAL_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("d", "interval")],
+  columns: [col("id", "i32", pk: true), col("d", "interval")],
   rows: [[1, [1, 2, 11_045_000_000]], [2, [0, -1, 0]], [3, [0, 0, 0]],
          [4, [1, 0, 0]], [5, [0, 30, 0]], [6, nil]]
 }.freeze
 
-# A table with a date column (type code 16): exercises the value codec's date branch (the int32
-# day count, the same 4-byte int-be-signflip body as int32). Covers a positive date (2024-01-15 ->
+# A table with a date column (type code 16): exercises the value codec's date branch (the i32
+# day count, the same 4-byte int-be-signflip body as i32). Covers a positive date (2024-01-15 ->
 # day 19737), a pre-1970 negative one (1969-12-31 -> -1), a BC-era one (0044-03-15 BC -> astro -43
 # -> day -735160), the -infinity/+infinity sentinels (i32::MIN/MAX), and a NULL. Values are the raw
-# day counts the cores compute from the corresponding literals. PK is int32. (spec/design/date.md)
+# day counts the cores compute from the corresponding literals. PK is i32. (spec/design/date.md)
 DATE_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("d", "date")],
+  columns: [col("id", "i32", pk: true), col("d", "date")],
   rows: [[1, 19_737], [2, -1], [3, -735_160], [4, -2_147_483_648], [5, 2_147_483_647], [6, nil]]
 }.freeze
 
-# A table with a float64 column (type code 12): exercises the value codec's 8-byte IEEE branch.
+# A table with a f64 column (type code 12): exercises the value codec's 8-byte IEEE branch.
 # Covers a positive fraction, a negative value, +0 and -0 (the sign bit is preserved on disk —
 # distinct bytes 0x0000…/0x8000…), +Infinity, -Infinity, a canonicalized NaN (stored as the single
 # quiet pattern 0x7FF8…000 regardless of source — float.md §10), a NULL, and Float::MAX (a full
-# mantissa, bits 0x7FEFFFFFFFFFFFFF). The PK is an int32 (float is not allowed in a key this slice
+# mantissa, bits 0x7FEFFFFFFFFFFFFF). The PK is an i32 (float is not allowed in a key this slice
 # — a float PRIMARY KEY traps 0A000). Values are the exact f64 the cores compute from the literals.
 FLOAT64_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("d", "float64")],
+  columns: [col("id", "i32", pk: true), col("d", "f64")],
   rows: [[1, 1.5], [2, -2.5], [3, 0.0], [4, -0.0], [5, Float::INFINITY],
          [6, -Float::INFINITY], [7, Float::NAN], [8, nil], [9, Float::MAX]]
 }.freeze
 
-# A table with a float32 column (type code 13): the 4-byte IEEE branch. Same special-value coverage
+# A table with a f32 column (type code 13): the 4-byte IEEE branch. Same special-value coverage
 # as FLOAT64_TABLE (+0/-0 distinct on disk, ±Infinity, a canonicalized NaN → 0x7FC00000, NULL) plus
 # 100.25 (exactly representable in binary32, bits 0x42C88000). Values are exactly representable in
-# binary32 so the f64 fixture value equals the f32-widened decode. PK is int32 (no float key).
+# binary32 so the f64 fixture value equals the f32-widened decode. PK is i32 (no float key).
 FLOAT32_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("r", "float32")],
+  columns: [col("id", "i32", pk: true), col("r", "f32")],
   rows: [[1, 1.5], [2, -2.5], [3, 0.0], [4, -0.0], [5, Float::INFINITY],
          [6, -Float::INFINITY], [7, Float::NAN], [8, nil], [9, 100.25]]
 }.freeze
@@ -416,10 +416,10 @@ end
 # record holds a fixed 0x02 pointer (u32 first_page + u32 len) and the raw bytes live in a chain
 # of page_type-4 slabs (240 bytes each). Row 1's text (600 B → 3 slabs) and bytea (300 B → 2
 # slabs) both spill; row 2's values stay inline; row 3 is NULL/NULL. Exercises multi-page chains,
-# multi-column spill, and the inline+external mix in one leaf. The PK stays int32.
+# multi-column spill, and the inline+external mix in one leaf. The PK stays i32.
 OVERFLOW_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("body", "text"), col("blob", "bytea")],
+  columns: [col("id", "i32", pk: true), col("body", "text"), col("blob", "bytea")],
   rows: [[1, filler_text(600), filler_bytes(300)], [2, "small", ["cafe"].pack("H*")], [3, nil, nil]]
 }.freeze
 
@@ -429,10 +429,10 @@ OVERFLOW_TABLE = {
 # 200-byte 0xAB bytea run → 0x03 inline-compressed bytea (two compressed values, one record);
 # row 2's 400-char half-filler/half-run text compresses to ~200 B — smaller than plain but still
 # over RECORD_MAX → 0x04 external-compressed (a chain carrying the COMPRESSED block);
-# row 3 stays fully inline-plain; row 4 is NULL/NULL. PK int32.
+# row 3 stays fully inline-plain; row 4 is NULL/NULL. PK i32.
 COMPRESSED_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("body", "text"), col("blob", "bytea")],
+  columns: [col("id", "i32", pk: true), col("body", "text"), col("blob", "bytea")],
   rows: [[1, "x" * 600, (["ab"].pack("H*") * 200)],
          [2, filler_text(200) + ("y" * 200), nil],
          [3, "tiny", ["cafe"].pack("H*")],
@@ -446,12 +446,12 @@ COMPRESSED_TABLE = {
 # last), and `t_a_b_idx` is the auto-named two-column index. Index records have EMPTY
 # payloads (key only). Indexes listed in ascending lowercased-name order (the catalog
 # order). The cores build this via
-#   CREATE TABLE t (a int32, b int32, u uuid, PRIMARY KEY (b, a));
+#   CREATE TABLE t (a i32, b i32, u uuid, PRIMARY KEY (b, a));
 #   CREATE INDEX i_u ON t (u);  CREATE INDEX ON t (a, b);
 # and insert rows in ascending storage-key order.
 INDEX_TABLE = {
   name: "t",
-  columns: [col("a", "int32", pk: true), col("b", "int32", pk: true), col("u", "uuid")],
+  columns: [col("a", "i32", pk: true), col("b", "i32", pk: true), col("u", "uuid")],
   pk_order: [1, 0], # PRIMARY KEY (b, a)
   indexes: [
     { name: "i_u", cols: [2] },
@@ -468,12 +468,12 @@ INDEX_TABLE = {
 # value); `wv` is a named two-column UNIQUE constraint; `uq` is a CREATE UNIQUE INDEX; `nu`
 # is a plain index over the same column as `t_v_key` (flags 0 beside flags 1). The cores
 # build this via
-#   CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32,
+#   CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32,
 #                   UNIQUE (v), CONSTRAINT wv UNIQUE (w, v));
 #   CREATE INDEX nu ON t (v);  CREATE UNIQUE INDEX uq ON t (w);
 UNIQUE_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("v", "int32"), col("w", "int32")],
+  columns: [col("id", "i32", pk: true), col("v", "i32"), col("w", "i32")],
   indexes: [
     { name: "nu", cols: [1] },
     { name: "t_v_key", cols: [1], unique: true },
@@ -485,18 +485,18 @@ UNIQUE_TABLE = {
 
 # A table with ARRAY (T[]) columns (v10 — spec/design/array.md): pins the catalog array-column
 # entry (type_code 15 + the element-type descriptor, §3) and the compact value body (§4). Two
-# array columns — an int32[] (fixed-width elements: NO per-element length prefix) and a text[]
+# array columns — an i32[] (fixed-width elements: NO per-element length prefix) and a text[]
 # (variable-width). Row 1 is a plain int + text array; row 2 has an EMPTY array (ndim=0) and an
 # empty text array; row 3 has a NULL element (the HAS_NULLS bitmap branch) and a whole-value NULL
 # array (the lone 0x01 tag — distinct from an array OF a NULL element). Row 4 pins the §12 shapes:
-# a 2-D int32[] (ndim=2, dims [2,2]) and a custom-lower-bound text[] ([2:3], so the lb i32 field is
+# a 2-D i32[] (ndim=2, dims [2,2]) and a custom-lower-bound text[] ([2:3], so the lb i32 field is
 # exercised). The cores build this via
-#   CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])
+#   CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])
 #   INSERT (1, ARRAY[10,20,30], ARRAY['a','b']); (2, '{40,50}', '{}'); (3, ARRAY[1,NULL,3], NULL)
 #   INSERT (4, ARRAY[ARRAY[10,20],ARRAY[30,40]], '[2:3]={x,y}')
 ARRAY_TABLE = {
   name: "t",
-  columns: [col("id", "int32", pk: true), col("xs", "int32[]"), col("tags", "text[]")],
+  columns: [col("id", "i32", pk: true), col("xs", "i32[]"), col("tags", "text[]")],
   rows: [[1, [10, 20, 30], %w[a b]],
          [2, [40, 50], []],
          [3, [1, nil, 3], nil],
@@ -513,12 +513,12 @@ ARRAY_TABLE = {
 # FIELD (the composite null-bitmap branch, inside an array element). Row 3: a present composite
 # element AND a NULL ELEMENT (the array HAS_NULLS bitmap). Row 4: the empty array (ndim 0). Row 5: a
 # whole-value NULL array (the lone 0x01 tag). The cores build this via
-#   CREATE TYPE addr AS (street text NOT NULL, zip int32)
-#   CREATE TABLE t (id int32 PRIMARY KEY, items addr[])
+#   CREATE TYPE addr AS (street text NOT NULL, zip i32)
+#   CREATE TABLE t (id i32 PRIMARY KEY, items addr[])
 #   INSERT (1, '{"(Main,90210)","(Side,5)"}'); (2, '{"(Oak,)"}'); (3, '{"(A,1)",NULL}'); (4, '{}'); (5, NULL)
 ARRAY_COMPOSITE_TABLE = {
-  types: [ctype("addr", [field("street", "text", not_null: true), field("zip", "int32")])],
-  tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("items", "addr[]")],
+  types: [ctype("addr", [field("street", "text", not_null: true), field("zip", "i32")])],
+  tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("items", "addr[]")],
              rows: [[1, [["Main", 90210], ["Side", 5]]],
                     [2, [["Oak", nil]]],
                     [3, [["A", 1], nil]],
@@ -528,18 +528,18 @@ ARRAY_COMPOSITE_TABLE = {
 
 # A composite type with an ARRAY-typed field (v10 — spec/design/array.md §12, the mirror of
 # array-of-composite AC1): pins the catalog composite-type entry with a code-15 array field
-# (field_type_code 15 + the inline element descriptor element_type_code 2 = int32, format.md
+# (field_type_code 15 + the inline element descriptor element_type_code 2 = i32, format.md
 # *Composite-type entry*) AND the recursive value body — a composite body (null-bitmap + present
 # fields, §4) whose `pts` field is an array body (ndim/flags/dims + element bodies). No
-# format_version bump (still 10). Row 1: both fields present (a text name + a 3-element int32[]).
+# format_version bump (still 10). Row 1: both fields present (a text name + a 3-element i32[]).
 # Row 2: an EMPTY array field {} (ndim 0). Row 3: a NULL array field (the composite null-bitmap
 # marks field 1 NULL — distinct from an empty array). The cores build this via
-#   CREATE TYPE poly AS (name text, pts int32[])
-#   CREATE TABLE t (id int32 PRIMARY KEY, p poly)
+#   CREATE TYPE poly AS (name text, pts i32[])
+#   CREATE TABLE t (id i32 PRIMARY KEY, p poly)
 #   INSERT (1, ROW('a', '{10,20,30}')); (2, ROW('b', '{}')); (3, ROW('c', NULL))
 COMPOSITE_ARRAY_FIELD_TABLE = {
-  types: [ctype("poly", [field("name", "text"), field("pts", "int32[]")])],
-  tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("p", "poly")],
+  types: [ctype("poly", [field("name", "text"), field("pts", "i32[]")])],
+  tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("p", "poly")],
              rows: [[1, ["a", [10, 20, 30]]],
                     [2, ["b", []]],
                     [3, ["c", nil]]] }]
@@ -553,9 +553,9 @@ COMPOSITE_ARRAY_FIELD_TABLE = {
 # (auto-named, COMPOSITE — references the two-column UNIQUE (a,b) — with ON DELETE RESTRICT, the lone
 # non-zero actions byte). FKs are emitted in ascending lowercased-name order; an FK owns no B-tree.
 # The cores build this via
-#   CREATE TABLE p (pid int32 PRIMARY KEY, code int32 UNIQUE, a int32, b int32, UNIQUE (a, b))
+#   CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))
 #   INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)
-#   CREATE TABLE c (id int32 PRIMARY KEY, pid int32, pcode int32, x int32, y int32, mgr int32,
+#   CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32,
 #     FOREIGN KEY (pid) REFERENCES p (pid),
 #     CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code),
 #     FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT,
@@ -564,16 +564,16 @@ COMPOSITE_ARRAY_FIELD_TABLE = {
 FK_TABLE = {
   tables: [
     { name: "p",
-      columns: [col("pid", "int32", pk: true), col("code", "int32"),
-                col("a", "int32"), col("b", "int32")],
+      columns: [col("pid", "i32", pk: true), col("code", "i32"),
+                col("a", "i32"), col("b", "i32")],
       indexes: [
         { name: "p_a_b_key", cols: [2, 3], unique: true },
         { name: "p_code_key", cols: [1], unique: true }
       ],
       rows: [[1, 100, 10, 20], [2, 200, 30, 40]] },
     { name: "c",
-      columns: [col("id", "int32", pk: true), col("pid", "int32"), col("pcode", "int32"),
-                col("x", "int32"), col("y", "int32"), col("mgr", "int32")],
+      columns: [col("id", "i32", pk: true), col("pid", "i32"), col("pcode", "i32"),
+                col("x", "i32"), col("y", "i32"), col("mgr", "i32")],
       fks: [
         { name: "c_code_fk", local: [2], ref_table: "p", ref: [1] },
         { name: "c_mgr_fkey", local: [5], ref_table: "c", ref: [0] },
@@ -594,7 +594,7 @@ FK_TABLE = {
 # cores build this via
 #   CREATE SEQUENCE s1; SELECT nextval('s1') [×3];
 #   CREATE SEQUENCE s2 INCREMENT BY -2 MINVALUE -100 MAXVALUE -1 CACHE 5 CYCLE;
-#   CREATE TABLE t (id int32 PRIMARY KEY, v int32); INSERT INTO t VALUES (1, 10)
+#   CREATE TABLE t (id i32 PRIMARY KEY, v i32); INSERT INTO t VALUES (1, 10)
 SEQUENCE_TABLE = {
   sequences: [
     seq("s1", increment: 1, min_value: 1, max_value: 9_223_372_036_854_775_807, start: 1,
@@ -602,7 +602,7 @@ SEQUENCE_TABLE = {
     seq("s2", increment: -2, min_value: -100, max_value: -1, start: -1,
         cache: 5, cycle: true, last_value: -1, is_called: false)
   ],
-  tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("v", "int32")],
+  tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("v", "i32")],
              rows: [[1, 10]] }]
 }.freeze
 
@@ -611,7 +611,7 @@ FIXTURES = [
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
   { file: "compressed_table.jed", page_size: 256, tables: [COMPRESSED_TABLE] },
   { file: "one_table_empty.jed", page_size: 256,
-    tables: [{ name: "t", columns: [col("id", "int32", pk: true), col("v", "int16")], rows: [] }] },
+    tables: [{ name: "t", columns: [col("id", "i32", pk: true), col("v", "i16")], rows: [] }] },
   { file: "pk_table.jed",        page_size: 256, tables: [PK_TABLE] },
   { file: "text_table.jed",      page_size: 256, tables: [TEXT_TABLE] },
   { file: "bool_table.jed",      page_size: 256, tables: [BOOL_TABLE] },
@@ -628,7 +628,7 @@ FIXTURES = [
   { file: "float32_table.jed",     page_size: 256, tables: [FLOAT32_TABLE] },
   { file: "date_table.jed",        page_size: 256, tables: [DATE_TABLE] },
   { file: "nopk_table.jed",      page_size: 256,
-    tables: [{ name: "r", columns: [col("a", "int16"), col("b", "int64")],
+    tables: [{ name: "r", columns: [col("a", "i16"), col("b", "i64")],
                rows: [[7, 70], [8, 80], [9, 90]] }] },
   { file: "composite_pk_table.jed", page_size: 256, tables: [COMPOSITE_PK_TABLE] },
   { file: "check_table.jed", page_size: 256, tables: [CHECK_TABLE] },
@@ -692,7 +692,7 @@ end
 # The BARE order-preserving KEY body for one present (non-NULL) value of `type` — no presence
 # tag (callers add it for nullable index slots; a PK member is NOT NULL). uuid is the 16 raw
 # bytes (uuid-raw16, §2.7), boolean a single bool-byte (0x00 false / 0x01 true, §2.9), every
-# other keyable type the sign-flipped fixed-width int encoding (timestamps reuse the int64 rule).
+# other keyable type the sign-flipped fixed-width int encoding (timestamps reuse the i64 rule).
 def key_body(type, v)
   case type
   when "uuid" then uuid_to_bytes(v)
@@ -743,9 +743,9 @@ def encode_value(type, v)
     # sign-flip (a value codec, not a key). v is [months, days, micros].
     m, d, us = v
     "\x00".b + [m].pack("l>") + [d].pack("l>") + [us].pack("q>")
-  when "float64"
+  when "f64"
     "\x00".b + encode_float64(v)
-  when "float32"
+  when "f32"
     "\x00".b + encode_float32(v)
   else
     "\x00".b + encode_int(WIDTH.fetch(type), v)
@@ -1031,7 +1031,7 @@ end
 # (key, row) pairs in stored (encoded-key) order. PK tables key on the PK member columns —
 # the key is the CONCATENATION of the members' encodings in KEY order (a composite
 # PRIMARY KEY, ../design/encoding.md §2.3; a single-column key is the one-member case).
-# A no-PK table keys on a synthetic int64 rowid = insertion index (executor.rs).
+# A no-PK table keys on a synthetic i64 rowid = insertion index (executor.rs).
 def table_entries(table)
   pk_idxs = pk_order(table)
   pairs = table[:rows].each_with_index.map do |row, i|
@@ -1736,10 +1736,10 @@ def decode_value(type, buf, pos, fetch = nil)
     db, pos = take(buf, pos, 4)
     ub, pos = take(buf, pos, 8)
     [[mb.unpack1("l>"), db.unpack1("l>"), ub.unpack1("q>")], pos]
-  when "float64"
+  when "f64"
     vb, pos = take(buf, pos, 8)
     [vb.unpack1("G"), pos] # a canonical-NaN body unpacks to a Float NaN; content_equal? handles ==
-  when "float32"
+  when "f32"
     vb, pos = take(buf, pos, 4)
     [vb.unpack1("g"), pos]
   else

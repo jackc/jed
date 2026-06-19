@@ -2,13 +2,13 @@
 # itself under two distinct aliases (each is its own scope relation, with its own column offset).
 # A 3-table chain mixes INNER and CROSS, left-deep. With NO ORDER BY the row order is
 # unspecified (CLAUDE.md §8) — multi-row results are compared rowsort; ORDER BY pins a sequence.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, query.join_inner, query.join_left, query.cross_join, query.table_alias, query.qualified_column, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, query.join_inner, query.join_left, query.cross_join, query.table_alias, query.qualified_column, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TABLE emp (id int32 PRIMARY KEY, name text, mgr int32)
+CREATE TABLE emp (id i32 PRIMARY KEY, name text, mgr i32)
 
 statement ok
-CREATE TABLE region (id int32 PRIMARY KEY, rname text)
+CREATE TABLE region (id i32 PRIMARY KEY, rname text)
 
 statement ok
 INSERT INTO emp VALUES (1, 'ceo', NULL), (2, 'vp', 1), (3, 'eng', 2), (4, 'eng2', 2)

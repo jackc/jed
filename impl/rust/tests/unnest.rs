@@ -39,7 +39,7 @@ fn ints(ns: &[i64]) -> Vec<Vec<Value>> {
 #[test]
 fn names_and_types_its_column_at_the_element_type() {
     let mut db = Database::new();
-    // An untyped ARRAY[…] literal is int64[] (jed's literal typing), so the column is int64.
+    // An untyped ARRAY[…] literal is i64[] (jed's literal typing), so the column is i64.
     let out = execute(&mut db, "SELECT * FROM unnest(ARRAY[10, 20, 30])").unwrap();
     match &out {
         Outcome::Query {
@@ -48,13 +48,13 @@ fn names_and_types_its_column_at_the_element_type() {
             ..
         } => {
             assert_eq!(column_names, &["unnest"]);
-            assert_eq!(column_types, &["int64"]);
+            assert_eq!(column_types, &["i64"]);
         }
         other => panic!("expected a query result, got {other:?}"),
     }
-    // A typed '{…}'::int32[] literal pins the element type — the column is int32.
-    let out = execute(&mut db, "SELECT * FROM unnest('{1,2,3}'::int32[])").unwrap();
-    assert_eq!(out.column_types(), &["int32"]);
+    // A typed '{…}'::i32[] literal pins the element type — the column is i32.
+    let out = execute(&mut db, "SELECT * FROM unnest('{1,2,3}'::i32[])").unwrap();
+    assert_eq!(out.column_types(), &["i32"]);
     // A text[] argument → a text column.
     let out = execute(&mut db, "SELECT * FROM unnest(ARRAY['a','b'])").unwrap();
     assert_eq!(out.column_types(), &["text"]);
@@ -66,16 +66,16 @@ fn names_and_types_its_column_at_the_element_type() {
 fn empty_and_null_arrays_yield_zero_rows() {
     let mut db = Database::new();
     assert_eq!(
-        query(&mut db, "SELECT * FROM unnest('{}'::int32[])"),
+        query(&mut db, "SELECT * FROM unnest('{}'::i32[])"),
         Vec::<Vec<Value>>::new()
     );
     assert_eq!(
-        query(&mut db, "SELECT * FROM unnest(NULL::int32[])"),
+        query(&mut db, "SELECT * FROM unnest(NULL::i32[])"),
         Vec::<Vec<Value>>::new()
     );
     // Both charge zero cost — nothing generated, nothing produced.
-    assert_eq!(cost(&mut db, "SELECT * FROM unnest('{}'::int32[])"), 0);
-    assert_eq!(cost(&mut db, "SELECT * FROM unnest(NULL::int32[])"), 0);
+    assert_eq!(cost(&mut db, "SELECT * FROM unnest('{}'::i32[])"), 0);
+    assert_eq!(cost(&mut db, "SELECT * FROM unnest(NULL::i32[])"), 0);
 }
 
 // ---- composition: alias, CROSS JOIN, the correlated / implicitly-lateral argument ----------
@@ -100,7 +100,7 @@ fn alias_renames_the_single_column() {
 #[test]
 fn correlated_outer_array_column_and_sibling_are_legal_args() {
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])").unwrap();
     execute(
         &mut db,
         "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')",
@@ -171,15 +171,15 @@ fn select_list_srf_position_is_deferred() {
 #[test]
 fn generated_row_cost_and_ceiling() {
     let mut db = Database::new();
-    // '{…}'::int32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
-    assert_eq!(cost(&mut db, "SELECT * FROM unnest('{1,2,3}'::int32[])"), 6);
+    // '{…}'::i32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
+    assert_eq!(cost(&mut db, "SELECT * FROM unnest('{1,2,3}'::i32[])"), 6);
     // A large array aborts deterministically once accrued cost reaches the ceiling (54P01),
     // before the whole thing materializes — the guard fires mid-generation, like generate_series.
     let big = (1..=1000)
         .map(|n| n.to_string())
         .collect::<Vec<_>>()
         .join(",");
-    let sql = format!("SELECT * FROM unnest('{{{big}}}'::int32[])");
+    let sql = format!("SELECT * FROM unnest('{{{big}}}'::i32[])");
     db.set_max_cost(50);
     assert_eq!(err_code(&mut db, &sql), "54P01");
 }

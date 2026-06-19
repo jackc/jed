@@ -2,16 +2,16 @@
 # cardinality is |left| x |right|; an empty side yields the empty result. Cost (cost.md §3 JOIN):
 # storage_row_read per materialized row (sum of cardinalities), NO ON operator_eval (every pair
 # is kept), WHERE per surviving combined row, row_produced per emitted row.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.order_by_keys, query.cross_join, query.qualified_column, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.order_by_keys, query.cross_join, query.qualified_column, types.i32, resource.cost_metering
 
 statement ok
-CREATE TABLE x (id int32 PRIMARY KEY, v int32)
+CREATE TABLE x (id i32 PRIMARY KEY, v i32)
 
 statement ok
-CREATE TABLE y (id int32 PRIMARY KEY, w int32)
+CREATE TABLE y (id i32 PRIMARY KEY, w i32)
 
 statement ok
-CREATE TABLE z (id int32 PRIMARY KEY)
+CREATE TABLE z (id i32 PRIMARY KEY)
 
 statement ok
 INSERT INTO x VALUES (1, 100), (2, 200), (3, 300)

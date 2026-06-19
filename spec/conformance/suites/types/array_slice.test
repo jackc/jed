@@ -5,10 +5,10 @@
 # bound 1 on every dimension. In a multidimensional access any slice subscript makes the whole access
 # a slice and a scalar index i means 1:i; too many subscripts → {}, fewer leave trailing dimensions at
 # full range. array_out matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.array, types.array_multidim, types.int32, expr.array_subscript, expr.array_slice, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.array, types.array_multidim, types.i32, expr.array_subscript, expr.array_slice, resource.cost_metering
 
 statement ok
-CREATE TABLE s (id int32 PRIMARY KEY, a int32[])
+CREATE TABLE s (id i32 PRIMARY KEY, a i32[])
 
 statement ok
 INSERT INTO s VALUES (1, ARRAY[10,20,30,40,50])
@@ -85,7 +85,7 @@ SELECT (ARRAY[1,2,3,4,5])[2:4] FROM s WHERE id = 1
 {2,3,4}
 
 statement ok
-CREATE TABLE g (id int32 PRIMARY KEY, m int32[])
+CREATE TABLE g (id i32 PRIMARY KEY, m i32[])
 
 statement ok
 INSERT INTO g VALUES (1, ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]])

@@ -29,18 +29,18 @@ function qOut(db: Database, sql: string) {
 
 test("unnest names its column at the bound element type", () => {
   const db = new Database();
-  // An untyped ARRAY[…] literal is int64[] (jed's literal typing).
+  // An untyped ARRAY[…] literal is i64[] (jed's literal typing).
   const out = qOut(db, "SELECT * FROM unnest(ARRAY[10,20,30])");
   assert.deepStrictEqual(out.columnNames, ["unnest"]);
-  assert.deepStrictEqual(out.columnTypes, ["int64"]);
-  // A typed '{…}'::int32[] literal pins the element type; a text[] argument → a text column.
-  assert.deepStrictEqual(qOut(db, "SELECT * FROM unnest('{1,2,3}'::int32[])").columnTypes, ["int32"]);
+  assert.deepStrictEqual(out.columnTypes, ["i64"]);
+  // A typed '{…}'::i32[] literal pins the element type; a text[] argument → a text column.
+  assert.deepStrictEqual(qOut(db, "SELECT * FROM unnest('{1,2,3}'::i32[])").columnTypes, ["i32"]);
   assert.deepStrictEqual(qOut(db, "SELECT * FROM unnest(ARRAY['a','b'])").columnTypes, ["text"]);
 });
 
 test("unnest of the empty array or a NULL array yields zero rows", () => {
   const db = new Database();
-  for (const sql of ["SELECT * FROM unnest('{}'::int32[])", "SELECT * FROM unnest(NULL::int32[])"]) {
+  for (const sql of ["SELECT * FROM unnest('{}'::i32[])", "SELECT * FROM unnest(NULL::i32[])"]) {
     assert.deepStrictEqual(query(db, sql), [], sql);
     assert.equal(cost(db, sql), 0n, sql);
   }
@@ -54,7 +54,7 @@ test("unnest alias renames the single column", () => {
 
 test("unnest takes a correlated outer column AND an earlier sibling (implicitly lateral, §44)", () => {
   const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])",
+    "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])",
     "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')",
   ]);
   // A correlated OUTER column resolves into the SRF arg of an enclosing-query subquery (the SRF is
@@ -86,12 +86,12 @@ test("unnest strictness + deferred-form errors", () => {
 
 test("unnest generated_row cost and the maxCost ceiling", () => {
   const db = new Database();
-  // '{…}'::int32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
-  assert.equal(cost(db, "SELECT * FROM unnest('{1,2,3}'::int32[])"), 6n);
+  // '{…}'::i32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
+  assert.equal(cost(db, "SELECT * FROM unnest('{1,2,3}'::i32[])"), 6n);
   // A large array aborts deterministically once accrued cost reaches the ceiling (54P01), before
   // the whole thing materializes — the guard fires mid-generation, like generate_series.
   const big = Array.from({ length: 1000 }, (_, i) => String(i + 1)).join(",");
   db.setMaxCost(50n);
-  assert.equal(errCode(() => execute(db, `SELECT * FROM unnest('{${big}}'::int32[])`)), "54P01");
+  assert.equal(errCode(() => execute(db, `SELECT * FROM unnest('{${big}}'::i32[])`)), "54P01");
   db.setMaxCost(0n);
 });

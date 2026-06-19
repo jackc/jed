@@ -18,11 +18,11 @@ The reasoning behind these tables lives in
 ## Current scope — the storable scalar set
 
 Per CLAUDE.md §4, the **storable** scalar types are the three signed integers
-(`int16`/`smallint`, `int32`/`int`/`integer`, `int64`/`bigint`), `text` (variable-width
+(`i16`/`smallint`, `i32`/`int`/`integer`, `i64`/`bigint`), `text` (variable-width
 UTF-8, collation `C`), `boolean` (aliases `bool`; `{false, true}`, ordered false `<` true),
 `decimal`/`numeric` (exact base-10), `bytea` (raw bytes), `uuid` (fixed 16-byte value), the
-temporal types `timestamp`/`timestamptz`/`interval`, and the binary floats `float32`/`real`
-and `float64`/`double precision`. Only `json`/`jsonb` (and the composite `array` container)
+temporal types `timestamp`/`timestamptz`/`interval`, and the binary floats `f32`/`real`
+and `f64`/`double precision`. Only `json`/`jsonb` (and the composite `array` container)
 remain deferred. `boolean` is also the type of comparison/logical results and `TRUE`/`FALSE`
 literals.
 

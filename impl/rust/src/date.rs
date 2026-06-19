@@ -1,12 +1,12 @@
 //! The `date` calendar type — parsing and rendering (spec/design/date.md). A date is an
-//! `int32` count of days since the Unix epoch (1970-01-01), proleptic Gregorian. It is the
+//! `i32` count of days since the Unix epoch (1970-01-01), proleptic Gregorian. It is the
 //! day-granular sibling of `timestamp` and **reuses timestamp's calendar core verbatim**
 //! (`days_from_civil`/`civil_from_days`, same epoch — spec/design/timestamp.md §2), so the two
 //! types cannot drift.
 //!
 //! Unlike timestamp, a date keeps **only the date portion**: a time/offset in the input is
 //! parsed and validated, then **discarded** — and `24:00:00` does **not** roll into the day
-//! (PG behavior). No instant is ever computed, so a date spans a wider range than the int64-µs
+//! (PG behavior). No instant is ever computed, so a date spans a wider range than the i64-µs
 //! timestamp (finite `i32::MIN+1 ..= i32::MAX-1`).
 
 use crate::error::Result;
@@ -15,20 +15,20 @@ use crate::timestamp::{
     read_frac, read_uint, trim_ascii_ws,
 };
 
-/// The `-infinity` sentinel — the smallest `int32`, sorts before every finite date.
+/// The `-infinity` sentinel — the smallest `i32`, sorts before every finite date.
 pub const NEG_INFINITY: i32 = i32::MIN;
-/// The `+infinity` sentinel — the largest `int32`, sorts after every finite date.
+/// The `+infinity` sentinel — the largest `i32`, sorts after every finite date.
 pub const POS_INFINITY: i32 = i32::MAX;
 
 /// Finite day counts occupy `i32::MIN+1 ..= i32::MAX-1`; the extremes are reserved for ±infinity.
 const MIN_FINITE: i64 = (i32::MIN + 1) as i64;
 const MAX_FINITE: i64 = (i32::MAX - 1) as i64;
 
-/// Parse a `date` literal to its int32 day count since 1970-01-01. The grammar is the full
+/// Parse a `date` literal to its i32 day count since 1970-01-01. The grammar is the full
 /// timestamp literal grammar (spec/design/timestamp.md §3), but only the date portion is kept:
 /// a trailing time and/or offset is validated then discarded, and `24:00:00` does not advance
 /// the day. Malformed syntax traps `22007`; an out-of-range field or a day count beyond the
-/// finite int32 range traps `22008`.
+/// finite i32 range traps `22008`.
 pub fn parse_date(input: &str) -> Result<i32> {
     let s = trim_ascii_ws(input);
     let low = s.to_ascii_lowercase();
@@ -117,7 +117,7 @@ pub fn parse_date(input: &str) -> Result<i32> {
 
     // Field validation (range errors are 22008). The year magnitude cap (a date spans ≈ ±5.88M
     // years, far wider than timestamp's ±294k) is only an i64-overflow guard for `days_from_civil`;
-    // the real bound is the int32 day-range check below, which rejects any out-of-range date.
+    // the real bound is the i32 day-range check below, which rejects any out-of-range date.
     if !(1..=9_999_999).contains(&year) {
         return Err(field_overflow("year out of range"));
     }
@@ -148,7 +148,7 @@ pub fn parse_date(input: &str) -> Result<i32> {
     Ok(days as i32)
 }
 
-/// Render a `date` value (int32 days since 1970-01-01) to its canonical `YYYY-MM-DD` text
+/// Render a `date` value (i32 days since 1970-01-01) to its canonical `YYYY-MM-DD` text
 /// (BC suffix for an astronomical year ≤ 0; ±infinity render as the bare words).
 pub fn render_date(days: i32) -> String {
     if days == NEG_INFINITY {

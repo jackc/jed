@@ -10,11 +10,11 @@
 # sit LAST with ledger overrides (conformance.md §5): a composite PRIMARY KEY and DROP ... CASCADE
 # both succeed in PostgreSQL but are 0A000 in jed this slice.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, types.composite, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, types.composite, types.i32, types.text, resource.cost_metering
 
 # A composite type is created and lives in the catalog.
 statement ok
-CREATE TYPE addr AS (street text NOT NULL, zip int32)
+CREATE TYPE addr AS (street text NOT NULL, zip i32)
 
 # A second type with the same name is a duplicate object.
 statement error 42710
@@ -26,7 +26,7 @@ CREATE TYPE bad AS (a nosuchtype)
 
 # A field name may not repeat within a type.
 statement error 42701
-CREATE TYPE bad AS (a int32, a int64)
+CREATE TYPE bad AS (a i32, a i64)
 
 # A composite type drops cleanly when nothing depends on it.
 statement ok
@@ -45,7 +45,7 @@ statement error 42704
 CREATE TYPE line AS (a point, b point)
 
 statement ok
-CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)
+CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)
 
 statement ok
 CREATE TYPE line AS (a point, b point)
@@ -63,7 +63,7 @@ DROP TYPE point
 
 # --- jed narrowings (PG-divergent; ledger overrides) ------------------------------------------
 statement ok
-CREATE TYPE addr AS (street text, zip int32)
+CREATE TYPE addr AS (street text, zip i32)
 
 # A composite PRIMARY KEY is not supported (the order-preserving composite key encoding is authored
 # but unexercised — composite.md §6). PostgreSQL allows it; jed rejects 0A000.

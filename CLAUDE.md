@@ -87,7 +87,7 @@ language, because hardening the spec was never the reason to add it.
 3. **JS / TypeScript** — ✅ **landed as a native core** (`impl/ts`), at full parity with
    Rust and Go (every capability and conformance suite, and the byte-exact on-disk
    format — `rust == go == ts == ruby`). A Rust→WASM wrap remains an acceptable *production*
-   fallback, but the native core is what stresses the spec — and it does: int64 is exact
+   fallback, but the native core is what stresses the spec — and it does: i64 is exact
    via uniform `bigint` (JS numbers are f64), names are UTF-8 (JS strings are UTF-16), and
    bytes are big-endian via `DataView`. Runs on modern Node by **native type-stripping**
    (no build step), TS limited to the erasable subset. The **Browser/OPFS storage host** (CLAUDE.md
@@ -165,14 +165,21 @@ everything else tests against, not a detail discovered during implementation.
   `text` (one defined collation/encoding to start), `boolean`, `timestamp` /
   `timestamptz`, `bytea`, **`uuid`** (a fixed 16-byte value), and `json`/`jsonb` if we
   want a headline feature.
-  - **First implemented step — signed integers only:** `int16` / `smallint` (16-bit),
-    `int32` / `int` / `integer` (32-bit), `int64` / `bigint` (64-bit). Canonical names
-    state width in **bits** (the programming-language convention); SQL-standard names are
-    aliases. Two's-complement, with trap-on-overflow (§8). Every other scalar above is
-    explicitly **deferred** to a later slice. The float/decimal/collation decisions in §8
-    do not bind step 1.
+  - **First implemented step — signed integers only:** `i16` / `smallint` (16-bit),
+    `i32` / `int` / `integer` (32-bit), `i64` / `bigint` (64-bit). Canonical names state
+    width in **bits** under the **`i`/`f` prefix** (`i16`/`i32`/`i64`, `f32`/`f64` — the
+    Rust/Zig convention). The prefix is load-bearing: it makes jed's bit-namespace
+    (`i8`…`i64`) **lexically disjoint** from PostgreSQL's byte-namespace (`int2`/`int4`/`int8`,
+    `float4`/`float8`), so jed accepts **both** the SQL-standard words *and* PG's byte-shorthand
+    as aliases (`int8` → `i64`) with no `int8`-means-8-bit-vs-64-bit collision, and a future
+    8-bit `i8` stays free (the same property that lets a future `int8range` alias `i64range`
+    without colliding with `i8range` — `spec/design/types.md` §2). The old jed names
+    `i16`/`i32`/`i64`/`f32`/`f64` are a **clean break** — no longer accepted.
+    Two's-complement, with trap-on-overflow (§8). Every other scalar above is explicitly
+    **deferred** to a later slice. The float/decimal/collation decisions in §8 do not bind
+    step 1.
   - **Beyond scalars — the `array` container is the second open-`Type` axis**
-    (`spec/design/array.md`, `int32[]`, `ARRAY[1,2,3]`, `'{1,2,3}'::int32[]`). An array is a
+    (`spec/design/array.md`, `i32[]`, `ARRAY[1,2,3]`, `'{1,2,3}'::i32[]`). An array is a
     *container* layered over the element type, not a scalar — its own value codec, comparison
     rules, and (deferred) order-preserving key encoding. Two decisions distinguish it from
     composite. (a) It is a **structural** type — `Type::Array(Box<Type>)` carries the element
@@ -180,14 +187,14 @@ everything else tests against, not a detail discovered during implementation.
     *nominal* `Composite(catalog-ref)`); this is observably identical to PostgreSQL because array
     type identity is a bijection on the element type, and self-describing on disk. (b) Matching
     PostgreSQL exactly (§1), **array *shape* — dimensionality, lengths, lower bounds — is a
-    property of the *value*, not the type** (`int32[3]` enforces nothing; a column holds arrays
+    property of the *value*, not the type** (`i32[3]` enforces nothing; a column holds arrays
     of mixed dimensionality), which relaxes "strict static" **only on shape** — the **element
     type stays static and strictly enforced**. Array comparison uses PostgreSQL btree NULL
     semantics (NULLs comparable, always a definite boolean), *not* composite's 3VL. Delivered
     S0–S4; arrays-as-key, multidimensional values, and the array function surface are deferred
     `0A000` follow-ons (`spec/design/array.md` §12).
   - **The type system is OPEN, not closed — composite (row) types have landed**
-    (`spec/design/composite.md`, `CREATE TYPE addr AS (street text, zip int32)`). This is the
+    (`spec/design/composite.md`, `CREATE TYPE addr AS (street text, zip i32)`). This is the
     pivot the scalar set above only hinted at: a type is no longer *only* a compiled-in
     `ScalarType` variant but can be **a fact about a database** — named, created/dropped at
     runtime, recursive, persisted in the catalog. So a column/value type is `Type { Scalar |
@@ -490,7 +497,7 @@ biases below are where an overriding reason *does* steer away from PG.
   parent table/columns by name/ordinal with an `on_delete`/`on_update` action byte; an FK owns no
   B-tree, so it adds no value-codec change, `spec/design/constraints.md` §6), and **sequences**
   (`format_version` 12 — a third kind-tagged catalog entry `entry_kind 2` carrying the name, six
-  fixed int64 fields, and a flags byte; emitted composites→sequences→tables; a sequence owns no
+  fixed i64 fields, and a flags byte; emitted composites→sequences→tables; a sequence owns no
   B-tree. `nextval` is **transactional** — the counter is a snapshot field that rolls back with its
   transaction, a deliberate PG divergence mandated by determinism.md §5, `spec/design/sequences.md`).
   **Still deferred**
@@ -538,7 +545,7 @@ The design is optimized for AI agents even more than for humans. In practice:
   everything *else* stays bit-reproducible, which is what the agent loop and cross-impl sync
   depend on. Determinism is **default-deny with a ledger** (`spec/design/determinism.md`): the
   few sanctioned relaxations are enumerated in `spec/conformance/determinism_exceptions.toml` —
-  `float64` value/render (class A), and the **`uuidv4`/`uuidv7` generators** plus the **clock
+  `f64` value/render (class A), and the **`uuidv4`/`uuidv7` generators** plus the **clock
   functions `now()`/`current_timestamp`/`clock_timestamp()`**, which read entropy + the clock through
   a **host-injected seam** (`spec/design/entropy.md`) and so stay *deterministic given the seam
   inputs* (tests inject a fixed seed + a fixed/advancing clock → byte-identical cross-core; production
@@ -588,7 +595,7 @@ The design is optimized for AI agents even more than for humans. In practice:
 4. **Storage seam + key-encoding fixtures** (§8, §9).
 5. **First vertical slice — the "it's alive" milestone:**
    `CREATE TABLE` / `INSERT` / `SELECT ... WHERE pk = $1`, **with integer columns only**
-   (`int16`/`int32`/`int64`, §4), driven through **both** the Rust and Go cores against
+   (`i16`/`i32`/`i64`, §4), driven through **both** the Rust and Go cores against
    shared corpus entries. Proves the whole multi-core machinery end to end.
 5b. **On-disk format + cross-core round-trip** — the single-file byte format
    (`spec/fileformat/format.md`) with byte-exact golden fixtures and the load-bearing §8

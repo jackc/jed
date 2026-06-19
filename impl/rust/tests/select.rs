@@ -23,7 +23,7 @@ fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
 
 fn setup() -> Database {
     db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int16)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
         "INSERT INTO t VALUES (1, 10)",
         "INSERT INTO t VALUES (2, 20)",
         "INSERT INTO t VALUES (3, NULL)",
@@ -37,7 +37,7 @@ fn ids(rows: Vec<Vec<Value>>) -> Vec<Value> {
 #[test]
 fn limit_caps_and_offset_skips() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
         "INSERT INTO t VALUES (1, 10)",
         "INSERT INTO t VALUES (2, 20)",
         "INSERT INTO t VALUES (3, 30)",
@@ -81,7 +81,7 @@ fn limit_offset_window_reduces_produced_cost() {
     // The slice runs before projection, so only windowed rows charge row_produced:
     // 1 page_read (t is one leaf) + 5 scanned + 2 produced = 8 (spec/design/cost.md §3).
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1)",
         "INSERT INTO t VALUES (2)",
         "INSERT INTO t VALUES (3)",

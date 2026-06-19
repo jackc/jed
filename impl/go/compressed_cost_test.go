@@ -31,9 +31,9 @@ func compressedTables(t *testing.T) *Database {
 	t.Helper()
 	db := WithPageSize(compressedPageSize)
 	run600 := strings.Repeat("x", 600)
-	mustExec(t, db, "CREATE TABLE comp (id int32 PRIMARY KEY, body text)")
+	mustExec(t, db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO comp VALUES (1, '"+run600+"'), (2, 'small')")
-	mustExec(t, db, "CREATE TABLE control (id int32 PRIMARY KEY, body text)")
+	mustExec(t, db, "CREATE TABLE control (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO control VALUES (1, 'tiny'), (2, 'small')")
 	return db
 }
@@ -55,9 +55,9 @@ func TestCompressedCostExternalCompressedChargesChainPlusSlabs(t *testing.T) {
 	// ceil(400/244) = 2 value_decompress slabs.
 	db := WithPageSize(compressedPageSize)
 	mix := fillerText(200) + strings.Repeat("y", 200)
-	mustExec(t, db, "CREATE TABLE comp (id int32 PRIMARY KEY, body text)")
+	mustExec(t, db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO comp VALUES (1, '"+mix+"')")
-	mustExec(t, db, "CREATE TABLE control (id int32 PRIMARY KEY, body text)")
+	mustExec(t, db, "CREATE TABLE control (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO control VALUES (1, 'tiny')")
 	comp := mustCost(t, db, "SELECT * FROM comp")
 	control := mustCost(t, db, "SELECT * FROM control")
@@ -84,7 +84,7 @@ func TestCompressedCostBoundedScanAndLimit(t *testing.T) {
 
 func TestCompressedCostInsertMetersAttemptsAdoptedOrRejected(t *testing.T) {
 	db := WithPageSize(compressedPageSize)
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)")
 	// A fully-inline row attempts nothing: INSERT stays zero-cost.
 	if c := mustCost(t, db, "INSERT INTO t VALUES (1, 'small')"); c != 0 {
 		t.Fatalf("inline INSERT cost = %d, want 0", c)
@@ -118,11 +118,11 @@ func TestCompressedCostDecimalPayloadsCompressToo(t *testing.T) {
 	// ceil(407/244) = 2 slabs both ways.
 	db := WithPageSize(compressedPageSize)
 	digits := strings.Repeat("12", 400) + ".5"
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, d numeric)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric)")
 	if c := mustCost(t, db, fmt.Sprintf("INSERT INTO t VALUES (1, %s)", digits)); c != 2 {
 		t.Fatalf("decimal INSERT cost = %d, want 2 (the compress attempt)", c)
 	}
-	mustExec(t, db, "CREATE TABLE control (id int32 PRIMARY KEY, d numeric)")
+	mustExec(t, db, "CREATE TABLE control (id i32 PRIMARY KEY, d numeric)")
 	mustExec(t, db, "INSERT INTO control VALUES (1, 7)")
 	comp := mustCost(t, db, "SELECT * FROM t")
 	control := mustCost(t, db, "SELECT * FROM control")
@@ -154,7 +154,7 @@ func TestCompressedCostCorrelatedOuterReferenceIsATouch(t *testing.T) {
 	// tables' row 2, so the two queries emit identical row counts and differ only in the
 	// outer table's storage — isolating the slabs600 the outer reference charges.
 	db := compressedTables(t)
-	mustExec(t, db, "CREATE TABLE probe (id int32 PRIMARY KEY, body text)")
+	mustExec(t, db, "CREATE TABLE probe (id i32 PRIMARY KEY, body text)")
 	mustExec(t, db, "INSERT INTO probe VALUES (1, 'small')")
 	a := mustCost(t, db, "SELECT id FROM comp WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = comp.body)")
 	b := mustCost(t, db, "SELECT id FROM control WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = control.body)")

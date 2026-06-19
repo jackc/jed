@@ -51,8 +51,8 @@ func fkNames(t *testing.T, db *Database, table string) []string {
 func TestForeignKeyNamingAndOrder(t *testing.T) {
 	db := fkSetup(
 		t,
-		"CREATE TABLE p (a int32, b int32, code int32 UNIQUE, PRIMARY KEY (a, b))",
-		"CREATE TABLE c (id int32 PRIMARY KEY, pa int32, pb int32, pcode int32, "+
+		"CREATE TABLE p (a i32, b i32, code i32 UNIQUE, PRIMARY KEY (a, b))",
+		"CREATE TABLE c (id i32 PRIMARY KEY, pa i32, pb i32, pcode i32, "+
 			"CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), "+
 			"FOREIGN KEY (pa, pb) REFERENCES p (a, b))",
 	)
@@ -62,8 +62,8 @@ func TestForeignKeyNamingAndOrder(t *testing.T) {
 
 	db2 := fkSetup(
 		t,
-		"CREATE TABLE q (id int32 PRIMARY KEY)",
-		"CREATE TABLE r (id int32 PRIMARY KEY, x int32 REFERENCES q, FOREIGN KEY (x) REFERENCES q (id))",
+		"CREATE TABLE q (id i32 PRIMARY KEY)",
+		"CREATE TABLE r (id i32 PRIMARY KEY, x i32 REFERENCES q, FOREIGN KEY (x) REFERENCES q (id))",
 	)
 	if got := fkNames(t, db2, "r"); !slices.Equal(got, []string{"r_x_fkey", "r_x_fkey1"}) {
 		t.Fatalf("auto-name suffix walk: got %v", got)
@@ -71,16 +71,16 @@ func TestForeignKeyNamingAndOrder(t *testing.T) {
 }
 
 // jed is STRICTER than PostgreSQL on type pairing: corresponding columns must be the SAME scalar
-// type (42804), where PG allows any comparable pair (e.g. int32 ↔ int64) — constraints.md §6.7.
+// type (42804), where PG allows any comparable pair (e.g. i32 ↔ i64) — constraints.md §6.7.
 func TestForeignKeyStrictTypePairing(t *testing.T) {
-	db := fkSetup(t, "CREATE TABLE p (id int32 PRIMARY KEY)")
-	if got := fkErr(t, db, "CREATE TABLE c1 (x int64 REFERENCES p)"); got != "42804" {
-		t.Fatalf("int64→int32 pk: got %s, want 42804", got)
+	db := fkSetup(t, "CREATE TABLE p (id i32 PRIMARY KEY)")
+	if got := fkErr(t, db, "CREATE TABLE c1 (x i64 REFERENCES p)"); got != "42804" {
+		t.Fatalf("i64→i32 pk: got %s, want 42804", got)
 	}
 	if got := fkErr(t, db, "CREATE TABLE c2 (x text REFERENCES p)"); got != "42804" {
-		t.Fatalf("text→int32 pk: got %s, want 42804", got)
+		t.Fatalf("text→i32 pk: got %s, want 42804", got)
 	}
-	if _, err := Execute(db, "CREATE TABLE c3 (x int32 REFERENCES p)"); err != nil {
+	if _, err := Execute(db, "CREATE TABLE c3 (x i32 REFERENCES p)"); err != nil {
 		t.Fatalf("same-type FK should be accepted: %v", err)
 	}
 }
@@ -88,17 +88,17 @@ func TestForeignKeyStrictTypePairing(t *testing.T) {
 // CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE TABLE (0A000); NO ACTION and
 // RESTRICT are accepted (constraints.md §6.6).
 func TestForeignKeyReferentialActionsNarrowed(t *testing.T) {
-	db := fkSetup(t, "CREATE TABLE p (id int32 PRIMARY KEY)")
+	db := fkSetup(t, "CREATE TABLE p (id i32 PRIMARY KEY)")
 	for _, sql := range []string{
-		"CREATE TABLE c1 (x int32 REFERENCES p ON DELETE CASCADE)",
-		"CREATE TABLE c2 (x int32 REFERENCES p ON UPDATE SET NULL)",
-		"CREATE TABLE c3 (x int32 REFERENCES p ON DELETE SET DEFAULT)",
+		"CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)",
+		"CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)",
+		"CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)",
 	} {
 		if got := fkErr(t, db, sql); got != "0A000" {
 			t.Fatalf("%q: got %s, want 0A000", sql, got)
 		}
 	}
-	if _, err := Execute(db, "CREATE TABLE c4 (x int32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)"); err != nil {
+	if _, err := Execute(db, "CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)"); err != nil {
 		t.Fatalf("NO ACTION/RESTRICT should be accepted: %v", err)
 	}
 }
@@ -109,9 +109,9 @@ func TestForeignKeyReferentialActionsNarrowed(t *testing.T) {
 func TestForeignKeyParentUpdateEndStateSwap(t *testing.T) {
 	db := fkSetup(
 		t,
-		"CREATE TABLE p (id int32 PRIMARY KEY, code int32 UNIQUE)",
+		"CREATE TABLE p (id i32 PRIMARY KEY, code i32 UNIQUE)",
 		"INSERT INTO p VALUES (1, 100), (2, 200)",
-		"CREATE TABLE c (id int32 PRIMARY KEY, pc int32 REFERENCES p (code))",
+		"CREATE TABLE c (id i32 PRIMARY KEY, pc i32 REFERENCES p (code))",
 		"INSERT INTO c VALUES (10, 100), (11, 200)",
 	)
 	if _, err := Execute(db, "UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END"); err != nil {

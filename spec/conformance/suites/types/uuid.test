@@ -6,7 +6,7 @@
 # nil UUID (all-zero) is a distinct, non-NULL value. A single-quoted literal adapts to a uuid
 # context (§6); malformed input traps 22P02. A literal in a NON-uuid context stays text. uuid
 # renders under the `T` tag. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.int32, types.text, types.uuid, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.text, types.uuid, resource.cost_metering
 
 # uuid is a valid PRIMARY KEY (the first non-integer key type) — this CREATE succeeds.
 statement ok
@@ -52,7 +52,7 @@ SELECT id FROM t WHERE id = '{550e8400-e29b-41d4-a716-446655440000}'
 # as raw 16 bytes and renders as the canonical 8-4-4-4-12 form unchanged. Mixed-case input also
 # lowercases on output.
 statement ok
-CREATE TABLE ov (id int32 PRIMARY KEY, u uuid)
+CREATE TABLE ov (id i32 PRIMARY KEY, u uuid)
 
 statement ok
 INSERT INTO ov VALUES (1, '0123456789abcdef0123456789abcdef'), (2, '12345678123412341234123456789ABC')
@@ -198,7 +198,7 @@ INSERT INTO t VALUES (1, NULL)
 # with a text column is the ordinary text value, NOT a 22P02 (and here it matches). A
 # malformed-uuid-shaped string in a text context is likewise fine (text is never decoded).
 statement ok
-CREATE TABLE txt (id int32 PRIMARY KEY, s text)
+CREATE TABLE txt (id i32 PRIMARY KEY, s text)
 
 statement ok
 INSERT INTO txt VALUES (1, '550e8400-e29b-41d4-a716-446655440000'), (2, 'not-a-uuid')

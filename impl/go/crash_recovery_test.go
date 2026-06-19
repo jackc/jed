@@ -24,7 +24,7 @@ func armCommitFault(t *testing.T, db *Database, f commitFault) {
 	}
 }
 
-// seeded returns a fresh file-backed t(id int32 PRIMARY KEY) holding rows 1,2 (each INSERT autocommits
+// seeded returns a fresh file-backed t(id i32 PRIMARY KEY) holding rows 1,2 (each INSERT autocommits
 // durably) and the prior committed txid.
 func seedTwoRows(t *testing.T, path string) (*Database, uint64) {
 	t.Helper()
@@ -32,7 +32,7 @@ func seedTwoRows(t *testing.T, path string) (*Database, uint64) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	mustExec(t, db, "INSERT INTO t VALUES (1)")
 	mustExec(t, db, "INSERT INTO t VALUES (2)")
 	return db, db.Txid()

@@ -70,8 +70,8 @@ func TestValuesBodyMultiColumnAndRename(t *testing.T) {
 
 func TestValuesBodyColumnTypeUnification(t *testing.T) {
 	db := dbWith(t)
-	// int + int -> int (all bare integer literals are int64 in jed).
-	if got := valuesTypes(t, db, "SELECT column1 FROM (VALUES (1), (2)) AS v"); !eqStrs(got, "int64") {
+	// int + int -> int (all bare integer literals are i64 in jed).
+	if got := valuesTypes(t, db, "SELECT column1 FROM (VALUES (1), (2)) AS v"); !eqStrs(got, "i64") {
 		t.Errorf("int+int got %v", got)
 	}
 	// int + decimal -> decimal; the int value coerces.
@@ -83,7 +83,7 @@ func TestValuesBodyColumnTypeUnification(t *testing.T) {
 		t.Errorf("int+decimal coercion got %v", rows)
 	}
 	// anything + NULL keeps the other type.
-	if got := valuesTypes(t, db, "SELECT column1 FROM (VALUES (1), (NULL)) AS v"); !eqStrs(got, "int64") {
+	if got := valuesTypes(t, db, "SELECT column1 FROM (VALUES (1), (NULL)) AS v"); !eqStrs(got, "i64") {
 		t.Errorf("int+NULL got %v", got)
 	}
 	// an all-NULL column is text (unknown -> text).

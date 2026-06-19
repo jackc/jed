@@ -43,7 +43,7 @@ fn err_code(db: &mut Database, sql: &str) -> String {
 fn setup() -> Database {
     let mut db = Database::new();
     for s in [
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32 DEFAULT 7, w int32)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
         "INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
     ] {
         execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
@@ -102,7 +102,7 @@ fn returning_output_names_and_expressions() {
 #[test]
 fn insert_select_returning() {
     let mut db = setup();
-    run(&mut db, "CREATE TABLE src (a int32)");
+    run(&mut db, "CREATE TABLE src (a i32)");
     run(&mut db, "INSERT INTO src VALUES (40), (41)");
     // RETURNING belongs to the INSERT: it projects the INSERTED rows (defaults filled).
     assert_eq!(
@@ -351,7 +351,7 @@ fn returning_grows_the_touched_set() {
         let mut db = Database::new();
         run(
             &mut db,
-            "CREATE TABLE big (id int32 PRIMARY KEY, w int32, t text)",
+            "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)",
         );
         run(&mut db, &big);
         db
@@ -448,7 +448,7 @@ fn old_new_qualifiers_per_statement() {
         vec![vec![int(30), Value::Null, int(30)]]
     );
     // INSERT ... SELECT takes the same mapping.
-    run(&mut db, "CREATE TABLE src2 (a int32)");
+    run(&mut db, "CREATE TABLE src2 (a i32)");
     run(&mut db, "INSERT INTO src2 VALUES (60)");
     assert_eq!(
         rows(
@@ -482,7 +482,7 @@ fn old_new_shadowed_by_table_name() {
     // A target table literally named old (or new) keeps the ordinary table-qualified
     // meaning — the row-version pseudo-relation is suppressed (PG-probed).
     let mut db = Database::new();
-    run(&mut db, "CREATE TABLE old (x int32)");
+    run(&mut db, "CREATE TABLE old (x i32)");
     assert_eq!(
         rows(&mut db, "INSERT INTO old VALUES (1) RETURNING old.x"),
         vec![vec![int(1)]] // the inserted value, NOT the NULL old side
@@ -500,7 +500,7 @@ fn old_new_shadowed_by_table_name() {
         rows(&mut db, "DELETE FROM old RETURNING old.x"),
         vec![vec![int(3)]] // bare semantics = the deleted value
     );
-    run(&mut db, "CREATE TABLE new (x int32)");
+    run(&mut db, "CREATE TABLE new (x i32)");
     assert_eq!(
         rows(&mut db, "INSERT INTO new VALUES (9) RETURNING new.x"),
         vec![vec![int(9)]]
@@ -514,7 +514,7 @@ fn old_new_shadowed_by_table_name() {
 #[test]
 fn old_new_in_subqueries() {
     let mut db = setup();
-    run(&mut db, "CREATE TABLE s2 (a int32, b int32)");
+    run(&mut db, "CREATE TABLE s2 (a i32, b i32)");
     run(&mut db, "INSERT INTO s2 VALUES (1, 500)");
     // old/new resolve inside item subqueries like any outer reference (probed; jed has no
     // FROM-less SELECT, so the single-row s2 anchors the scalar subqueries).
@@ -544,7 +544,7 @@ fn old_new_touched_set() {
         let mut db = Database::new();
         run(
             &mut db,
-            "CREATE TABLE big (id int32 PRIMARY KEY, w int32, t text)",
+            "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)",
         );
         run(&mut db, &big);
         db

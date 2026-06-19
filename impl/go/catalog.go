@@ -106,7 +106,7 @@ type IndexDef struct {
 	Unique  bool
 }
 
-// SequenceDef is a sequence (spec/design/sequences.md): a named, persisted, monotonic int64
+// SequenceDef is a sequence (spec/design/sequences.md): a named, persisted, monotonic i64
 // generator — the third database-level catalog-object kind (after tables and composite types).
 // The definition fields (Increment/MinValue/MaxValue/Start/Cache/Cycle) are immutable; LastValue
 // + IsCalled are the mutable counter state a nextval advances. The whole struct lives in the

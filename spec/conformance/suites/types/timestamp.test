@@ -1,13 +1,13 @@
-# timestamp scalar type (spec/design/timestamp.md): zoneless wall clock, int64 microseconds.
+# timestamp scalar type (spec/design/timestamp.md): zoneless wall clock, i64 microseconds.
 # Storage, ISO-8601-ish literals (adapting from a single-quoted string like bytea), comparison/
 # ordering by the instant, the infinity/-infinity sentinels, NULL, a timestamp PRIMARY KEY (the
-# key encoding is the int64 codec, so PK is SUPPORTED — unlike text/bytea/decimal), and the
+# key encoding is the i64 codec, so PK is SUPPORTED — unlike text/bytea/decimal), and the
 # parse-error codes (22007 malformed / 22008 field-or-range overflow). An offset in a zoneless
 # timestamp literal is ACCEPTED and IGNORED (PG behavior). No time-zone database, no named zones.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.int32, types.text, types.timestamp, types.timestamptz, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.text, types.timestamp, types.timestamptz, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, ts timestamp)
+CREATE TABLE t (id i32 PRIMARY KEY, ts timestamp)
 
 statement ok
 INSERT INTO t VALUES (1, '2024-01-01 12:00:00'), (2, '1969-12-31 23:59:59.5'), (3, 'infinity'), (4, '-infinity'), (5, NULL), (6, '0001-01-01 00:00:00 BC'), (7, '2024-06-15 08:30:00+05')
@@ -159,7 +159,7 @@ INSERT INTO t VALUES (12, '2024-02-30 00:00:00')
 statement error 22008
 INSERT INTO t VALUES (13, '2024-01-01 12:00:60')
 
-# ... and a value beyond the representable int64-microsecond range
+# ... and a value beyond the representable i64-microsecond range
 statement error 22008
 INSERT INTO t VALUES (14, '300000-01-01 00:00:00')
 
@@ -170,7 +170,7 @@ SELECT id FROM t WHERE ts = 'garbage'
 # a string literal with NO timestamp context stays text and is never parsed as a datetime:
 # compared with a text column it is the ordinary text value, NOT a 22007
 statement ok
-CREATE TABLE txt (id int32 PRIMARY KEY, s text)
+CREATE TABLE txt (id i32 PRIMARY KEY, s text)
 
 statement ok
 INSERT INTO txt VALUES (1, 'not a timestamp')
@@ -182,7 +182,7 @@ SELECT id FROM txt WHERE s = 'not a timestamp'
 
 # --- timestamp / timestamptz do not compare (would need a zone): 42804 --------
 statement ok
-CREATE TABLE m (id int32 PRIMARY KEY, a timestamp, b timestamptz)
+CREATE TABLE m (id i32 PRIMARY KEY, a timestamp, b timestamptz)
 
 statement ok
 INSERT INTO m VALUES (1, '2024-01-01 12:00:00', '2024-01-01 12:00:00+00')
@@ -190,7 +190,7 @@ INSERT INTO m VALUES (1, '2024-01-01 12:00:00', '2024-01-01 12:00:00+00')
 statement error 42804
 SELECT id FROM m WHERE a = b
 
-# --- timestamp PRIMARY KEY is supported (key encoding = int64) ----------------
+# --- timestamp PRIMARY KEY is supported (key encoding = i64) ----------------
 statement ok
 CREATE TABLE k (ts timestamp PRIMARY KEY)
 
@@ -213,7 +213,7 @@ INSERT INTO k VALUES ('2024-01-01 00:00:00')
 
 # --- deterministic, cross-core cost ------------------------------------------
 statement ok
-CREATE TABLE c (id int32 PRIMARY KEY, ts timestamp)
+CREATE TABLE c (id i32 PRIMARY KEY, ts timestamp)
 
 statement ok
 INSERT INTO c VALUES (1, '2020-01-01 00:00:00'), (2, '2021-01-01 00:00:00'), (3, '2022-01-01 00:00:00'), (4, '2023-01-01 00:00:00'), (5, '2024-01-01 00:00:00'), (6, '2025-01-01 00:00:00')
@@ -228,7 +228,7 @@ SELECT id FROM c WHERE ts = '2023-01-01 00:00:00'
 
 # --- G24: time-of-day / fraction / range boundary edges (own table, leaves `t`/`c` intact) ----
 statement ok
-CREATE TABLE e (id int32 PRIMARY KEY, ts timestamp)
+CREATE TABLE e (id i32 PRIMARY KEY, ts timestamp)
 
 # Hour 24:00:00 is the valid end-of-day, normalized to next-day midnight (PG behavior).
 statement ok
@@ -254,7 +254,7 @@ SELECT ts FROM e WHERE id = 3
 294247-01-10 04:00:54.775806
 
 # One microsecond more lands on the +infinity sentinel (i64::MAX); a FINITE parse of it traps
-# 22008. jed owns its int64-microsecond range (timestamp.md §1), narrower than PG's calendar bound,
+# 22008. jed owns its i64-microsecond range (timestamp.md §1), narrower than PG's calendar bound,
 # so PG accepts this value as finite — a documented divergence (oracle_overrides ledger).
 statement error 22008
 INSERT INTO e VALUES (4, '294247-01-10 04:00:54.775807')

@@ -14,7 +14,7 @@ fn creates_table_with_resolved_types_and_pk() {
     let mut db = Database::new();
     let out = create(
         &mut db,
-        "CREATE TABLE nums (id int32 PRIMARY KEY, small int16, big int64)",
+        "CREATE TABLE nums (id i32 PRIMARY KEY, small i16, big i64)",
     )
     .unwrap();
     assert_eq!(
@@ -59,7 +59,7 @@ fn sql_standard_type_aliases_resolve() {
 #[test]
 fn table_and_type_names_are_case_insensitive() {
     let mut db = Database::new();
-    create(&mut db, "create table T (Id INT32 primary key)").unwrap();
+    create(&mut db, "create table T (Id I32 primary key)").unwrap();
     assert!(db.table("t").is_some());
     assert!(db.table("T").is_some());
 }
@@ -67,15 +67,15 @@ fn table_and_type_names_are_case_insensitive() {
 #[test]
 fn duplicate_table_is_rejected() {
     let mut db = Database::new();
-    create(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
-    let err = create(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap_err();
+    create(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
+    let err = create(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap_err();
     assert_eq!(err.code(), "42P07");
 }
 
 #[test]
 fn duplicate_column_is_rejected() {
     let mut db = Database::new();
-    let err = create(&mut db, "CREATE TABLE t (a int32, a int16)").unwrap_err();
+    let err = create(&mut db, "CREATE TABLE t (a i32, a i16)").unwrap_err();
     assert_eq!(err.code(), "42701");
 }
 
@@ -84,14 +84,16 @@ fn unknown_type_is_rejected() {
     let mut db = Database::new();
     let err = create(&mut db, "CREATE TABLE t (a int128)").unwrap_err();
     assert_eq!(err.code(), "42704");
-}
-
-#[test]
-fn pg_internal_type_names_are_not_accepted() {
-    // We own our surface (CLAUDE.md §1): int2/int4/int8 are NOT type names.
-    let mut db = Database::new();
+    // The old jed bit-names are a CLEAN BREAK — replaced by the i/f prefix, no longer
+    // accepted (CLAUDE.md §4; types.md §11).
     assert_eq!(
-        create(&mut db, "CREATE TABLE t (a int2)")
+        create(&mut db, "CREATE TABLE t (a int32)")
+            .unwrap_err()
+            .code(),
+        "42704"
+    );
+    assert_eq!(
+        create(&mut db, "CREATE TABLE t (a float64)")
             .unwrap_err()
             .code(),
         "42704"
@@ -99,11 +101,36 @@ fn pg_internal_type_names_are_not_accepted() {
 }
 
 #[test]
+fn pg_byte_shorthand_type_names_are_accepted() {
+    // The i/f prefix makes jed's bit-namespace (i8…i64) lexically disjoint from PG's
+    // byte-namespace, so PG's byte-shorthand is accepted as aliases (CLAUDE.md §1/§4;
+    // types.md §11): int2→i16, int4→i32, int8→i64, float4→f32, float8→f64. There is no
+    // int8-means-8-bit collision, and a future 8-bit i8 stays free.
+    let mut db = Database::new();
+    create(
+        &mut db,
+        "CREATE TABLE t (a int2, b int4, c int8, d float4, e float8)",
+    )
+    .unwrap();
+    let tbl = db.table("t").unwrap();
+    let want = [
+        ScalarType::Int16,
+        ScalarType::Int32,
+        ScalarType::Int64,
+        ScalarType::Float32,
+        ScalarType::Float64,
+    ];
+    for (i, w) in want.iter().enumerate() {
+        assert_eq!(tbl.columns[i].ty.scalar(), *w, "col {i}");
+    }
+}
+
+#[test]
 fn multiple_primary_keys_are_rejected() {
     let mut db = Database::new();
     let err = create(
         &mut db,
-        "CREATE TABLE t (a int32 PRIMARY KEY, b int32 PRIMARY KEY)",
+        "CREATE TABLE t (a i32 PRIMARY KEY, b i32 PRIMARY KEY)",
     )
     .unwrap_err();
     assert_eq!(err.code(), "42P16");
@@ -117,7 +144,7 @@ fn syntax_errors_are_reported() {
         "42601"
     );
     assert_eq!(
-        create(&mut db, "CREATE TABLE t (a int32,)")
+        create(&mut db, "CREATE TABLE t (a i32,)")
             .unwrap_err()
             .code(),
         "42601"

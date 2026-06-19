@@ -82,8 +82,8 @@ function isTableRefStopKeyword(kw: string): boolean {
 }
 
 // foldInt converts a lexed unsigned magnitude (<= 2^63) and a sign into a signed
-// int64-range bigint, throwing 22003 when the result does not fit (a bare 2^63, or the
-// not-negated 2^63). -(2^63) folds to int64's minimum (spec/design/grammar.md §4).
+// i64-range bigint, throwing 22003 when the result does not fit (a bare 2^63, or the
+// not-negated 2^63). -(2^63) folds to i64's minimum (spec/design/grammar.md §4).
 function foldInt(magnitude: bigint, negate: boolean): bigint {
   const v = negate ? -magnitude : magnitude;
   if (v < I64_MIN || v > I64_MAX) {
@@ -658,7 +658,7 @@ class Parser {
       const fname = this.expectIdentifier();
       const baseType = this.expectIdentifier();
       const typeMod = this.parseTypeMod();
-      // An array-typed field (`xs int32[]`) — the same `[]` suffix a column type takes
+      // An array-typed field (`xs i32[]`) — the same `[]` suffix a column type takes
       // (spec/design/array.md §12); the canonical spelling carries the brackets.
       const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
       let notNull = false;
@@ -893,7 +893,7 @@ class Parser {
     }
     const v = neg ? -t.int! : t.int!;
     if (v < -9223372036854775808n || v > 9223372036854775807n) {
-      throw engineError("numeric_value_out_of_range", "sequence parameter out of int64 range");
+      throw engineError("numeric_value_out_of_range", "sequence parameter out of i64 range");
     }
     return v;
   }
@@ -1558,7 +1558,7 @@ class Parser {
 
   // parseCount parses a LIMIT/OFFSET count: a non-negative integer literal. The sign is
   // folded as in parseLiteral; a negative value is rejected with 2201W (LIMIT) / 2201X
-  // (OFFSET), and a magnitude over int64's max throws 22003 (the value -0 folds to 0 and
+  // (OFFSET), and a magnitude over i64's max throws 22003 (the value -0 folds to 0 and
   // is accepted). isLimit selects which structured error to raise.
   private parseCount(isLimit: boolean): bigint {
     let negate = false;
@@ -1894,7 +1894,7 @@ class Parser {
   private parseUnary(): Expr {
     if (this.peek().kind === "minus") {
       this.advance();
-      // Fold unary-minus-of-an-integer-literal into one negative literal, so int64's
+      // Fold unary-minus-of-an-integer-literal into one negative literal, so i64's
       // minimum is representable and the literal range-checks against context. SUPPRESSED
       // when a `::` immediately follows: `::` binds tighter than unary minus (PostgreSQL),
       // so `-N::T` is `-(N::T)` — the cast applies to the unsigned magnitude first
@@ -2132,7 +2132,7 @@ class Parser {
       return { kind: "param", index: this.advance().paramIndex! };
     }
     if (t.kind === "int") {
-      // The only magnitude > int64 max the lexer admits is 2^63, which fits no signed
+      // The only magnitude > i64 max the lexer admits is 2^63, which fits no signed
       // integer type unless negated (handled by the unary-minus fold).
       const v = foldInt(this.advance().int!, false);
       return { kind: "literal", literal: { kind: "int", int: v } };

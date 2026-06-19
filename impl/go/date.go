@@ -1,13 +1,13 @@
 package jed
 
-// The date calendar type — parsing and rendering (spec/design/date.md). A date is an int32
+// The date calendar type — parsing and rendering (spec/design/date.md). A date is an i32
 // count of days since the Unix epoch (1970-01-01), proleptic Gregorian. It is the day-granular
 // sibling of timestamp and REUSES timestamp's calendar core verbatim (daysFromCivil/civilFromDays,
 // same epoch — spec/design/timestamp.md §2), so the two types cannot drift.
 //
 // Unlike timestamp, a date keeps ONLY the date portion: a time/offset in the input is parsed and
 // validated, then DISCARDED — and 24:00:00 does NOT roll into the day (PG behavior). No instant is
-// ever computed, so a date spans a wider range than the int64-µs timestamp (finite
+// ever computed, so a date spans a wider range than the i64-µs timestamp (finite
 // math.MinInt32+1 .. math.MaxInt32-1).
 
 import (
@@ -15,10 +15,10 @@ import (
 	"strings"
 )
 
-// DateNegInfinity is the -infinity sentinel — the smallest int32, sorts before every finite date.
+// DateNegInfinity is the -infinity sentinel — the smallest i32, sorts before every finite date.
 const DateNegInfinity int32 = -2147483648
 
-// DatePosInfinity is the +infinity sentinel — the largest int32, sorts after every finite date.
+// DatePosInfinity is the +infinity sentinel — the largest i32, sorts after every finite date.
 const DatePosInfinity int32 = 2147483647
 
 // Finite day counts occupy [MinInt32+1, MaxInt32-1]; the extremes are reserved for ±infinity.
@@ -27,11 +27,11 @@ const (
 	dateMaxFinite int64 = 2147483646
 )
 
-// ParseDate parses a date literal to its int32 day count since 1970-01-01. The grammar is the
+// ParseDate parses a date literal to its i32 day count since 1970-01-01. The grammar is the
 // full timestamp literal grammar (spec/design/timestamp.md §3), but only the date portion is
 // kept: a trailing time and/or offset is validated then discarded, and 24:00:00 does not advance
 // the day. Malformed syntax traps 22007; an out-of-range field or a day count beyond the finite
-// int32 range traps 22008.
+// i32 range traps 22008.
 func ParseDate(input string) (int32, error) {
 	s := trimASCIIWS(input)
 	low := strings.ToLower(s)
@@ -138,8 +138,8 @@ func ParseDate(input string) (int32, error) {
 	}
 
 	// Field validation (range errors are 22008). The year magnitude cap (a date spans ≈ ±5.88M
-	// years, far wider than timestamp's ±294k) is only an int64-overflow guard for daysFromCivil;
-	// the real bound is the int32 day-range check below.
+	// years, far wider than timestamp's ±294k) is only an i64-overflow guard for daysFromCivil;
+	// the real bound is the i32 day-range check below.
 	if year < 1 || year > 9_999_999 {
 		return 0, datetimeFieldOverflow("year out of range")
 	}
@@ -173,7 +173,7 @@ func ParseDate(input string) (int32, error) {
 	return int32(days), nil
 }
 
-// RenderDate renders a date value (int32 days since 1970-01-01) to its canonical YYYY-MM-DD text
+// RenderDate renders a date value (i32 days since 1970-01-01) to its canonical YYYY-MM-DD text
 // (a BC suffix for an astronomical year <= 0; ±infinity render as the bare words).
 func RenderDate(days int32) string {
 	if days == DateNegInfinity {

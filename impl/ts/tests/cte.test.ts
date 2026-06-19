@@ -12,7 +12,7 @@ import { dbWith } from "./util.ts";
 // A 3-row, single-node table t(id, n) = {(1,10),(2,20),(3,30)}.
 function t3(): Database {
   return dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, n int32)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, n i32)",
     "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
   ]);
 }

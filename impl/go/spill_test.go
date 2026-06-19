@@ -29,12 +29,12 @@ func runQuery(t *testing.T, db *Database, sql string) ([][]Value, int64) {
 	return out.Rows, out.Cost
 }
 
-// seedSpill populates t(id int32 PK, k int32, s text) with n rows whose k is deliberately unsorted
+// seedSpill populates t(id i32 PK, k i32, s text) with n rows whose k is deliberately unsorted
 // and has many duplicates + a repeating NULL (to exercise the stable-sort tie-break and NULL
 // ordering), and a variable-length s (so a spilled run carries variable-width values).
 func seedSpill(t *testing.T, db *Database, n int64) {
 	t.Helper()
-	if _, err := Execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, k int32, s text)"); err != nil {
+	if _, err := Execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)"); err != nil {
 		t.Fatal(err)
 	}
 	for id := int64(0); id < n; id++ {
@@ -183,7 +183,7 @@ func TestSpillingSortIsStableOnTies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, k int32)"); err != nil {
+	if _, err := Execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32)"); err != nil {
 		t.Fatal(err)
 	}
 	for id := int64(0); id < 100; id++ {

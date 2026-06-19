@@ -16,7 +16,7 @@ import (
 
 func depthDB(t *testing.T) *Database {
 	t.Helper()
-	return dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)", "INSERT INTO t VALUES (1, 1)")
+	return dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", "INSERT INTO t VALUES (1, 1)")
 }
 
 // codeOf returns the SQLSTATE of running sql, or "ok" if it succeeded.
@@ -117,7 +117,7 @@ func TestDepthNestingInWhereAndCheckIsBounded(t *testing.T) {
 	if c := codeOf(db, fmt.Sprintf("SELECT v FROM t WHERE %s = 0", pred)); c != "54001" {
 		t.Fatalf("deep WHERE = %s, want 54001", c)
 	}
-	if c := codeOf(db, fmt.Sprintf("CREATE TABLE u (a int32 CHECK (%s > 0))", pred)); c != "54001" {
+	if c := codeOf(db, fmt.Sprintf("CREATE TABLE u (a i32 CHECK (%s > 0))", pred)); c != "54001" {
 		t.Fatalf("deep CHECK = %s, want 54001", c)
 	}
 }

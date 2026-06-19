@@ -754,11 +754,11 @@ evaluation. It deliberately does **not** meter:
 
 ## 4. Counter representation — exactness across cores (CLAUDE.md §8)
 
-The accrued cost is carried as a signed 64-bit integer: `i64` (Rust), `int64` (Go),
+The accrued cost is carried as a signed 64-bit integer: `i64` (Rust), `i64` (Go),
 **`bigint` (TS)**. TS must use `bigint`, not `number`: a `number` is an IEEE-754 `f64`,
 and a large scan crosses 2^53 where `f64` loses integer precision, silently diverging
 from the Rust/Go `i64` totals — exactly the §8 hotspot the type system exists to kill.
-The TS core already carries int64 values as `bigint`, so this is consistent. Cost renders
+The TS core already carries i64 values as `bigint`, so this is consistent. Cost renders
 as a plain shortest-decimal integer, matching the `# cost: N` corpus directive.
 
 ## 5. The seam shape (so enforcement is additive)
@@ -984,7 +984,7 @@ pins the 63/64-byte identifier boundary in several positions; gated by
 
 §7's nesting counter and §7a's input-size cap both bound a **single statement** — its AST height
 (§7) and its total byte size (§7a). One native-stack vector escapes both: a **composite-type chain**
-built across *many* cheap statements (`CREATE TYPE c1 AS (x int32)`, `CREATE TYPE c2 AS (x c1)`, …).
+built across *many* cheap statements (`CREATE TYPE c1 AS (x i32)`, `CREATE TYPE c2 AS (x c1)`, …).
 Each statement is tiny (under the input cap) and shallow (under the nesting counter), but the chain's
 **nesting depth grows without bound**, and that depth is a property of the *catalog graph* — resolved
 at use/codec time, not visible in any one statement's AST. Every recursive walk **derived** from a

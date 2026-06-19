@@ -192,7 +192,7 @@ create_index   ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" identifier
                    "(" identifier ("," identifier)* ")"
 drop_index     ::= "DROP" "INDEX" identifier
 
-/* CREATE SEQUENCE declares a named, persisted int64 generator (../design/sequences.md). The
+/* CREATE SEQUENCE declares a named, persisted i64 generator (../design/sequences.md). The
  * options may appear in any order, each at most once (a repeat is 42601). "INCREMENT" and
  * "START" take an optional "BY"/"WITH"; option values are signed integer literals. "NO MINVALUE"
  * / "NO MAXVALUE" select the type defaults; "CACHE" is parsed and stored but behaves as 1 (§7).
@@ -227,12 +227,16 @@ alter_sequence ::= "ALTER" "SEQUENCE" ("IF" "EXISTS")? identifier "RESTART" ("WI
 /* type_name is an identifier, optionally followed by a parenthesized type modifier
  * (precision, optional scale) — `decimal` is the FIRST parameterized type. The name is
  * resolved by the catalog (case-insensitively); accepted names:
- *   int16 | smallint | int32 | int | integer | int64 | bigint
+ *   i16 | smallint | int2 | i32 | int | integer | int4 | i64 | bigint | int8
+ *   f32 | real | float4 | f64 | "double precision" | float | float8
  *   text | varchar | "character varying" | string
  *   boolean | bool
  *   decimal | numeric | dec
  *   bytea
  *   uuid
+ * (canonical names use the i/f-prefix bit-width spelling; the SQL-standard words and PG's
+ *  byte-shorthand int2/int4/int8, float4/float8 are aliases — types.md §2. The old jed names
+ *  int16/int32/int64/float32/float64 are NOT accepted, a clean break.)
  * An unknown name is rejected at execution time (42704), not by the grammar. The typmod
  * is accepted ONLY for decimal/numeric: numeric(p) (= numeric(p,0)) and numeric(p,s),
  * with 1 <= p <= 1000 and 0 <= s <= p (a bad typmod traps 22023; ../design/grammar.md).
@@ -635,8 +639,8 @@ unary          ::= "-" unary
  * `42704`/`22003`/`22P02` resolve codes. Casts CHAIN left-associatively — `x :: int8 :: int2` is
  * `(x :: int8) :: int2` — and a typmod rides on the type name exactly as in CAST (`x :: numeric(10,2)`).
  *   PRECEDENCE: `::` binds TIGHTER than unary minus (PostgreSQL), so `-5 :: int` is `-(5 :: int)`,
- * NOT `(-5) :: int`. This is observable at the type bound: `-32768 :: int16` traps `22003` (the inner
- * `32768` overflows int16 before the negation), while `(-32768) :: int16` is the in-range value. The
+ * NOT `(-5) :: int`. This is observable at the type bound: `-32768 :: i16` traps `22003` (the inner
+ * `32768` overflows i16 before the negation), while `(-32768) :: i16` is the in-range value. The
  * leading-`-`-of-a-numeric-literal fold (../design/grammar.md §4) is therefore suppressed when a `::`
  * immediately follows the literal, so the cast applies to the unsigned magnitude first.
  *   A bind parameter operand takes the cast TARGET as its inferred type — `$1 :: int` declares `$1`
@@ -788,7 +792,7 @@ number         ::= decimal | integer
 /* An integer is an UNSIGNED magnitude of digits; its magnitude must be <= 2^63
  * (9223372036854775808); a larger magnitude is a syntax error (42601, cannot be
  * represented). The single value 2^63 is in range only as the operand of unary
- * minus, where it folds to int64's minimum (-9223372036854775808); a bare 2^63
+ * minus, where it folds to i64's minimum (-9223372036854775808); a bare 2^63
  * fits no signed integer type and traps 22003 at resolve time. */
 integer        ::= digit+
 

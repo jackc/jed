@@ -6,10 +6,10 @@
 # fractional-unit cascade, parse-error codes (22007 malformed / 22008 field overflow), and the
 # interval-PRIMARY-KEY rejection (0A000 — not a key this slice). No field qualifiers, no
 # precision typmod, no CAST.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.is_null, query.order_by, query.distinct, query.group_by, query.aggregates, types.int32, types.interval
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.is_null, query.order_by, query.distinct, query.group_by, query.aggregates, types.i32, types.interval
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, d interval)
+CREATE TABLE t (id i32 PRIMARY KEY, d interval)
 
 statement ok
 INSERT INTO t VALUES (1, '1 mon 2 days 03:04:05'), (2, '-1 day'), (3, '30 days'), (4, '1 mon'), (5, NULL), (6, '1.5 days')

@@ -40,10 +40,10 @@ expression-argument forms, the argument evaluated **per row**. **NULL inputs are
 
 | Aggregate | Argument | Result type | NULL inputs | Empty / all-NULL group |
 |---|---|---|---|---|
-| `COUNT(*)` | (none) | `int64` | counts every row | `0` |
-| `COUNT(expr)` | any | `int64` | skipped (counts non-NULL) | `0` |
-| `SUM(int16\|int32)` | integer | `int64` | skipped | `NULL` |
-| `SUM(int64)` | integer | `decimal` | skipped | `NULL` |
+| `COUNT(*)` | (none) | `i64` | counts every row | `0` |
+| `COUNT(expr)` | any | `i64` | skipped (counts non-NULL) | `0` |
+| `SUM(i16\|i32)` | integer | `i64` | skipped | `NULL` |
+| `SUM(i64)` | integer | `decimal` | skipped | `NULL` |
 | `SUM(decimal)` | decimal | `decimal` | skipped | `NULL` |
 | `AVG(int\|decimal)` | numeric | `decimal` | skipped | `NULL` |
 | `MIN`/`MAX` | any ordered | the input type | skipped | `NULL` |
@@ -60,13 +60,13 @@ and `COUNT` only tests NULL-ness.
 Result types are a **function of the operand type**, the reason aggregates need the reserved
 `sum_widen` / `same_as_input` result ids ([functions.md](functions.md) §8):
 
-- **`SUM(int16)` and `SUM(int32)` → `int64`.** The running sum accumulates in `int64`; a
-  sum that exceeds `int64` traps `22003`. The trap boundary is the **result** type, not the
-  input width — `SUM` over many `int32`s that exceeds `int32` but fits `int64` does **not**
+- **`SUM(i16)` and `SUM(i32)` → `i64`.** The running sum accumulates in `i64`; a
+  sum that exceeds `i64` traps `22003`. The trap boundary is the **result** type, not the
+  input width — `SUM` over many `i32`s that exceeds `i32` but fits `i64` does **not**
   trap, mirroring the arithmetic rule ([functions.md](functions.md) §7).
-- **`SUM(int64)` → `decimal`.** Summing 64-bit values overflows `int64` readily, so PG
+- **`SUM(i64)` → `decimal`.** Summing 64-bit values overflows `i64` readily, so PG
   widens to `numeric`; jed matches. The running sum accumulates in the exact `decimal`
-  domain (each `int64` widened to `decimal` scale 0); it traps `22003` only when the **final**
+  domain (each `i64` widened to `decimal` scale 0); it traps `22003` only when the **final**
   result exceeds the decimal cap — never an intermediate ([decimal.md](decimal.md) §2).
 - **`SUM(decimal)` → `decimal`**, scale carried exactly (no rounding); traps `22003` at the
   cap of the **final** result only (the order-independent `add_uncapped` fold —
@@ -80,7 +80,7 @@ Result types are a **function of the operand type**, the reason aggregates need 
   `AVG` of `10, 20, 30` is `60 / 3 = 20.0000000000000000`. `AVG` over an empty/all-NULL
   group is `NULL` (count `0`, no division).
 
-`COUNT` is always `int64`. Every core must widen **identically** — this is a CLAUDE.md §8
+`COUNT` is always `i64`. Every core must widen **identically** — this is a CLAUDE.md §8
 divergence hotspot, asserted in the corpus.
 
 ## 4. Whole-table aggregation (no `GROUP BY`) — the single-row result
@@ -171,8 +171,8 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
 - **`AVG` division scale** — the highest cross-core risk: it flows through `select_div_scale`
   + half-away rounding ([decimal.md](decimal.md) §4, §7.2), pinned by the corpus with exact
   rendered strings.
-- **`SUM` overflow boundary** — at the **result** type (int64 for the int16/int32 case, the
-  decimal cap for the int64/decimal cases); pinned with a value that widens without trapping
+- **`SUM` overflow boundary** — at the **result** type (i64 for the i16/i32 case, the
+  decimal cap for the i64/decimal cases); pinned with a value that widens without trapping
   and one that traps.
 - **Group ordering / value-canonical keys** — with no `ORDER BY`, group **emission order is
   unspecified** (the corpus compares `rowsort` or adds an explicit `ORDER BY`); the grouping

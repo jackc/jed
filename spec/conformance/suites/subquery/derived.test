@@ -8,10 +8,10 @@
 # inheriting statement CTE bindings — an outer/sibling column inside is 42703/42P01. Rows verified
 # against the live PostgreSQL 18 oracle; cost assertions are jed's deterministic cross-core contract
 # (spec/design/cost.md §3, the inline path).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.group_by, query.join_inner, query.cross_join, query.union, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_in, query.cte, query.derived_table, expr.arithmetic, expr.in_list, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.group_by, query.join_inner, query.cross_join, query.union, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_in, query.cte, query.derived_table, expr.arithmetic, expr.in_list, types.i32, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, n int32)
+CREATE TABLE t (id i32 PRIMARY KEY, n i32)
 
 statement ok
 INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
@@ -154,7 +154,7 @@ SELECT id FROM t WHERE id IN (SELECT x FROM (SELECT id AS x FROM t WHERE n >= 20
 # stay single-table at top level — §42/§15) ---
 
 statement ok
-CREATE TABLE m (id int32 PRIMARY KEY, n int32)
+CREATE TABLE m (id i32 PRIMARY KEY, n i32)
 
 statement ok
 INSERT INTO m VALUES (1, 10), (2, 20), (3, 30)

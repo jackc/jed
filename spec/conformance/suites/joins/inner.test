@@ -5,13 +5,13 @@
 # through the FROM scope. Cost is the CROSS-CORE contract of cost.md §3 (JOIN): storage_row_read
 # once per row as each table is materialized (sum of cardinalities), ON operator_eval per
 # candidate combination, WHERE per surviving combined row, row_produced per emitted row.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.table_alias, query.qualified_column, expr.arithmetic, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.join_inner, query.table_alias, query.qualified_column, expr.arithmetic, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE b (id int32 PRIMARY KEY, k int32, label text)
+CREATE TABLE b (id i32 PRIMARY KEY, k i32, label text)
 
 statement ok
 INSERT INTO a VALUES (1, 10), (2, 20), (3, 30), (4, NULL)

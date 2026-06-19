@@ -6,13 +6,13 @@
 # of cost.md §3: cost = lhs.cost + rhs.cost; the dedup, the ORDER BY sort, and the LIMIT/OFFSET
 # slice are all unmetered — so a bare-column `SELECT col FROM t` operand costs 2*|t|
 # (storage_row_read + row_produced per row), and LIMIT does NOT lower the cost.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.column_alias, query.limit, query.offset, types.int32, types.decimal, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.where_eq, query.comparison_order, query.order_by, query.order_by_keys, query.column_alias, query.limit, query.offset, types.i32, types.decimal, resource.cost_metering
 
 statement ok
-CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+CREATE TABLE b (id i32 PRIMARY KEY, k i32)
 
 statement ok
 INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
@@ -143,10 +143,10 @@ SELECT id, k FROM a UNION ALL SELECT id, k FROM b
 
 # --- NULL identity: NULL matches NULL in set-op dedup (not three-valued =) --------------------
 statement ok
-CREATE TABLE an (id int32 PRIMARY KEY, k int32)
+CREATE TABLE an (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE bn (id int32 PRIMARY KEY, k int32)
+CREATE TABLE bn (id i32 PRIMARY KEY, k i32)
 
 statement ok
 INSERT INTO an VALUES (1, 10), (2, NULL)
@@ -178,10 +178,10 @@ NULL
 # --- integer <-> decimal unification: the int operand's values convert to decimal before -------
 # --- row matching, so 5 (int) and 5.00 (decimal) are the SAME row. Output type is decimal (D). --
 statement ok
-CREATE TABLE ai (id int32 PRIMARY KEY, n int32)
+CREATE TABLE ai (id i32 PRIMARY KEY, n i32)
 
 statement ok
-CREATE TABLE ad (id int32 PRIMARY KEY, n decimal(10,2))
+CREATE TABLE ad (id i32 PRIMARY KEY, n decimal(10,2))
 
 statement ok
 INSERT INTO ai VALUES (1, 5), (2, 7)

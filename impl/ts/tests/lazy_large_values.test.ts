@@ -24,7 +24,7 @@ const PAGE_OVERFLOW = 4; // page_type for an overflow slab (large-values.md §12
 // half run → the ~212-byte block spills to a 1-page chain), id 3 inline-compressed (a
 // 600-char run), id 4 plain inline.
 function seed(db: Database): void {
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
   const plain = fillerText(600);
   const extc = fillerText(200) + "y".repeat(200);
   const inlc = "x".repeat(600);
@@ -131,7 +131,7 @@ test("lazy: UPDATE of other columns preserves spilled values", () => {
   const big = fillerText(600);
   try {
     let db = create(path, { pageSize: PAGE_SIZE });
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text, n int32)");
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)");
     execute(db, `INSERT INTO t VALUES (1, '${big}', 10), (2, 'small', 20)`);
     close(db);
 

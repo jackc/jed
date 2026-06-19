@@ -3,10 +3,10 @@
 # comparison, casts (int->decimal implicit, decimal->int explicit half-away), numeric(p,s) coercion
 # (round half away from zero) on store, and the typmod / decimal-PK narrowings. Arithmetic is in
 # expr/decimal_arithmetic.test. Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, query.distinct, cast.explicit, types.int32, types.decimal
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, query.distinct, cast.explicit, types.i32, types.decimal
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v numeric)
+CREATE TABLE t (id i32 PRIMARY KEY, v numeric)
 
 statement ok
 INSERT INTO t VALUES (1, 1.50), (2, 1.5), (3, 0.00), (4, -0.013), (5, 123), (6, NULL)
@@ -93,7 +93,7 @@ SELECT id FROM t WHERE v IS NOT DISTINCT FROM NULL
 
 # --- numeric(p,s): rounding (half away from zero) + precision-overflow on store ---------------
 statement ok
-CREATE TABLE money (id int32 PRIMARY KEY, amt numeric(10,2))
+CREATE TABLE money (id i32 PRIMARY KEY, amt numeric(10,2))
 
 statement ok
 INSERT INTO money VALUES (1, 1.5), (2, 1.555), (3, 1.554), (4, 5), (5, -2.5)
@@ -110,7 +110,7 @@ SELECT amt FROM money ORDER BY id
 
 # numeric(3,2): the integer part may have at most p - s = 1 digit.
 statement ok
-CREATE TABLE tight (id int32 PRIMARY KEY, x numeric(3,2))
+CREATE TABLE tight (id i32 PRIMARY KEY, x numeric(3,2))
 
 # 12.34 has a 2-digit integer part -> 22003 overflow
 statement error 22003
@@ -122,7 +122,7 @@ INSERT INTO tight VALUES (2, 9.999)
 
 # --- casts: int <-> decimal -------------------------------------------------------------------
 statement ok
-CREATE TABLE c (id int32 PRIMARY KEY, i int32, d numeric)
+CREATE TABLE c (id i32 PRIMARY KEY, i i32, d numeric)
 
 statement ok
 INSERT INTO c VALUES (1, 7, 2.5)
@@ -135,12 +135,12 @@ SELECT CAST(i AS numeric(10,2)) FROM c WHERE id = 1
 
 # decimal -> int is explicit; it ROUNDS half away from zero (2.5 -> 3, -2.5 -> -3)
 query I nosort
-SELECT CAST(d AS int32) FROM c WHERE id = 1
+SELECT CAST(d AS i32) FROM c WHERE id = 1
 ----
 3
 
 query I nosort
-SELECT CAST(-2.5 AS int32) FROM c WHERE id = 1
+SELECT CAST(-2.5 AS i32) FROM c WHERE id = 1
 ----
 -3
 
@@ -166,7 +166,7 @@ CREATE TABLE bad3 (x numeric(5,7))
 
 # a type modifier on a non-decimal type is unsupported this slice (varchar(n) etc. deferred): 0A000
 statement error 0A000
-CREATE TABLE bad4 (x int32(5))
+CREATE TABLE bad4 (x i32(5))
 
 # a decimal PRIMARY KEY is rejected this slice (documented narrowing, like text PK): 0A000
 statement error 0A000
@@ -174,7 +174,7 @@ CREATE TABLE bad5 (k numeric PRIMARY KEY)
 
 # --- DISTINCT collapses values equal across display scale --------------------------------------
 statement ok
-CREATE TABLE d2 (id int32 PRIMARY KEY, v numeric)
+CREATE TABLE d2 (id i32 PRIMARY KEY, v numeric)
 
 statement ok
 INSERT INTO d2 VALUES (1, 1.5), (2, 1.50), (3, 1.500), (4, 2.0)
@@ -193,7 +193,7 @@ SELECT DISTINCT v FROM d2 ORDER BY v
 # mul rounding) are pinned in the per-core decimal suites to keep corpus lines reviewable;
 # here the corpus pins representative over-OLD-cap values storing and round-tripping.
 statement ok
-CREATE TABLE caps (id int32 PRIMARY KEY, v numeric)
+CREATE TABLE caps (id i32 PRIMARY KEY, v numeric)
 
 # 1010 significant digits — over the original 1000-digit cap — store and round-trip exactly.
 statement ok
@@ -225,7 +225,7 @@ false
 # exponent makes 5e2 a decimal (not an integer), and the written display scale is preserved
 # through storage exactly like a '.'-spelled literal (1.50e1 -> 15.0 scale 1, 1.5e1 -> 15 scale 0).
 statement ok
-CREATE TABLE enote (id int32 PRIMARY KEY, v numeric)
+CREATE TABLE enote (id i32 PRIMARY KEY, v numeric)
 
 statement ok
 INSERT INTO enote VALUES (1, 1.5e3), (2, 5e2), (3, 1.5e-3), (4, 1.50e-3), (5, 1.234e2), (6, 1.50e1), (7, 1.5e1), (8, .5e2), (9, 100e-2), (10, 2E3), (11, 1.5e+3), (12, -1.5e3)
@@ -274,7 +274,7 @@ INSERT INTO enote VALUES (99, 1e131072)
 # 0.125 -> 0.13, -0.125 -> -0.13, 0.135 -> 0.14 at scale 2. This is the canonical determinism
 # example (§3); the money table above uses 1.555/1.554, which are not exact halves at the digit.
 statement ok
-CREATE TABLE htie (id int32 PRIMARY KEY, x numeric(10,2))
+CREATE TABLE htie (id i32 PRIMARY KEY, x numeric(10,2))
 
 statement ok
 INSERT INTO htie VALUES (1, 0.125), (2, -0.125), (3, 0.135)
@@ -287,15 +287,15 @@ SELECT x FROM htie ORDER BY id
 0.14
 
 # Negative zero never survives: a decimal carries a positive sign on every zero (§2), so a value
-# that rounds to zero renders 0, never -0. CAST(-0.4 AS int32) rounds half-away to 0 (magnitude
+# that rounds to zero renders 0, never -0. CAST(-0.4 AS i32) rounds half-away to 0 (magnitude
 # < 0.5); the literals -0.0 / -0.000 store and render as 0.0 / 0.000 (scale kept, sign dropped).
 query I nosort
-SELECT CAST(-0.4 AS int32) FROM htie WHERE id = 1
+SELECT CAST(-0.4 AS i32) FROM htie WHERE id = 1
 ----
 0
 
 statement ok
-CREATE TABLE nz (id int32 PRIMARY KEY, v numeric)
+CREATE TABLE nz (id i32 PRIMARY KEY, v numeric)
 
 statement ok
 INSERT INTO nz VALUES (1, -0.0), (2, -0.000)

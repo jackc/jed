@@ -10,11 +10,11 @@ import "strings"
 type ScalarType int
 
 const (
-	// Int16 is int16 / smallint.
+	// Int16 is i16 / smallint (PG byte-shorthand alias int2).
 	Int16 ScalarType = iota
-	// Int32 is int32 / int / integer.
+	// Int32 is i32 / int / integer (PG byte-shorthand alias int4).
 	Int32
-	// Int64 is int64 / bigint.
+	// Int64 is i64 / bigint (PG byte-shorthand alias int8).
 	Int64
 	// Text is text / varchar / string: variable-width UTF-8, collation C (byte /
 	// code-point order — spec/design/types.md §11).
@@ -32,10 +32,10 @@ const (
 	// Uuid is a fixed 16-byte value (RFC 4122), compared by unsigned byte order —
 	// spec/design/types.md §14. The first non-integer type usable as a key (WidthBytes 16).
 	Uuid
-	// Timestamp is the zoneless wall clock, int64 microseconds since the Unix epoch
+	// Timestamp is the zoneless wall clock, i64 microseconds since the Unix epoch
 	// (spec/design/timestamp.md).
 	Timestamp
-	// Timestamptz is the UTC instant, int64 microseconds since the Unix epoch.
+	// Timestamptz is the UTC instant, i64 microseconds since the Unix epoch.
 	Timestamptz
 	// IntervalType is a span of time — three independent fields (months/days/micros), compared
 	// by the canonical 128-bit span (spec/design/interval.md). Not a key this slice; not
@@ -47,11 +47,11 @@ const (
 	// total order (NOT raw IEEE). Storable; never a key (float PRIMARY KEY → 0A000).
 	Float32
 	// Float64 is IEEE 754 binary64 / double precision / float (rank 2, 8 bytes). Same family as
-	// float32; a mixed-width float op promotes to float64 (the only implicit float edge).
+	// f32; a mixed-width float op promotes to f64 (the only implicit float edge).
 	Float64
-	// Date is a calendar date — int32 days since the Unix epoch, no time/zone
+	// Date is a calendar date — i32 days since the Unix epoch, no time/zone
 	// (spec/design/date.md). Reuses timestamp's calendar core; stored as a 4-byte order-preserving
-	// int32 body (type code 16). A key this slice (the int32 key encoding is exercised).
+	// i32 body (type code 16). A key this slice (the i32 key encoding is exercised).
 	Date
 )
 
@@ -67,11 +67,11 @@ type DecimalTypmod struct {
 func (t ScalarType) CanonicalName() string {
 	switch t {
 	case Int16:
-		return "int16"
+		return "i16"
 	case Int32:
-		return "int32"
+		return "i32"
 	case Int64:
-		return "int64"
+		return "i64"
 	case Text:
 		return "text"
 	case Bool:
@@ -89,9 +89,9 @@ func (t ScalarType) CanonicalName() string {
 	case IntervalType:
 		return "interval"
 	case Float32:
-		return "float32"
+		return "f32"
 	case Float64:
-		return "float64"
+		return "f64"
 	case Date:
 		return "date"
 	default:
@@ -100,16 +100,21 @@ func (t ScalarType) CanonicalName() string {
 }
 
 // ScalarTypeFromName resolves a type name (canonical or alias) case-insensitively.
-// PG's int2/int4/int8 are intentionally NOT accepted (we own our surface §1). The
+// Canonical names state width in bits under the i/f prefix (i16/i32/i64, f32/f64 — the
+// Rust/Zig convention). Accepted aliases: the SQL-standard words (smallint/int/integer/
+// bigint, real/double precision/float) AND PG's byte-shorthand (int2/int4/int8, float4/
+// float8). The byte-shorthand is safe to accept BECAUSE of the i/f prefix: jed's
+// bit-namespace (i8…i64) is lexically disjoint from PG's byte-namespace (int2…int8), so
+// int8 → i64 with no collision and a future 8-bit i8 stays free (types.md §11; §1/§4). The
 // two-word "character varying" alias is recognized, though this slice's parser only
 // produces single-word type names (a documented narrowing — spec/design/types.md §11).
 func ScalarTypeFromName(name string) (ScalarType, bool) {
 	switch strings.ToLower(name) {
-	case "int16", "smallint":
+	case "i16", "smallint", "int2":
 		return Int16, true
-	case "int32", "int", "integer":
+	case "i32", "int", "integer", "int4":
 		return Int32, true
-	case "int64", "bigint":
+	case "i64", "bigint", "int8":
 		return Int64, true
 	case "text", "varchar", "string", "character varying":
 		return Text, true
@@ -127,13 +132,13 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return Timestamptz, true
 	case "interval":
 		return IntervalType, true
-	case "float32", "real":
-		// float32 / real (binary32). PG's `float4` byte-count spelling is NOT accepted (we own
-		// our surface — spec/design/float.md §2), like int2/4/8.
+	case "f32", "real", "float4":
+		// f32 / real / float4 (binary32). A bare `float` (no precision) is double precision in
+		// PG, so it maps to f64 below — NOT here (spec/design/float.md §2).
 		return Float32, true
-	case "float64", "double precision", "float":
-		// float64 / double precision / float. A bare `float` (no precision) is double precision
-		// in PG — NOT 32-bit. `float8` and the `float(p)` typmod are NOT accepted (float.md §2).
+	case "f64", "double precision", "float", "float8":
+		// f64 / double precision / float / float8. A bare `float` (no precision) is double
+		// precision in PG — NOT 32-bit. The `float(p)` typmod is not accepted (float.md §2).
 		// "double precision" is a two-word alias; this slice's parser only emits single-word type
 		// names, so it is reachable only via a future multi-word parse (a documented narrowing).
 		return Float64, true
@@ -185,7 +190,7 @@ func (t ScalarType) IsInteger() bool { return t == Int16 || t == Int32 || t == I
 
 // WidthBytes is the fixed KEY-encoding width in bytes — the bare key body, no presence tag —
 // for the fixed-width keyable types: the three integers, uuid (16), boolean (1 — the bool-byte
-// key, spec/design/encoding.md §2.9), the two int64-microsecond timestamps, and the two floats.
+// key, spec/design/encoding.md §2.9), the two i64-microsecond timestamps, and the two floats.
 // Used by the index tail-slot skip (each self-delimiting component is 0x01 NULL or 0x00 + this
 // many bytes). text/decimal/bytea/interval are variable-width or struct-bodied (return 0) — they
 // are never keys / carry their own length / fixed body (spec/fileformat/format.md) and never use
@@ -202,8 +207,8 @@ func (t ScalarType) WidthBytes() int {
 	case Int32:
 		return 4
 	case Int64, Timestamp, Timestamptz:
-		// The two timestamps are int64-microsecond instants — fixed-width 8-byte, reusing the
-		// int64 key/value codec (spec/design/timestamp.md §6).
+		// The two timestamps are i64-microsecond instants — fixed-width 8-byte, reusing the
+		// i64 key/value codec (spec/design/timestamp.md §6).
 		return 8
 	case Uuid:
 		return 16
@@ -212,7 +217,7 @@ func (t ScalarType) WidthBytes() int {
 	case Float64:
 		return 8
 	case Date:
-		// A date is a fixed-width 4-byte int32 day count (reuses the int32 codec — it is a key
+		// A date is a fixed-width 4-byte i32 day count (reuses the i32 codec — it is a key
 		// this slice, like timestamp; spec/design/date.md).
 		return 4
 	default:
@@ -248,8 +253,8 @@ func (t ScalarType) Max() int64 {
 	}
 }
 
-// Rank is the promotion-tower rank within a family: int16 < int32 < int64, and (a SEPARATE
-// tower) float32 < float64 (spec/types/compare.toml). Ranks are only compared within one family
+// Rank is the promotion-tower rank within a family: i16 < i32 < i64, and (a SEPARATE
+// tower) f32 < f64 (spec/types/compare.toml). Ranks are only compared within one family
 // (the integer promote path and the float promote path never mix — float is a strict island).
 func (t ScalarType) Rank() int {
 	switch t {
@@ -292,7 +297,7 @@ type Type struct {
 	// Comp is the composite reference when this is a composite type, else nil (⇒ scalar). The
 	// pointer is the discriminant (keeps Type ==-comparable for the scalar case).
 	Comp *CompositeRef
-	// Array is the element type when this is a *structural* array type (`int32[]`), else nil
+	// Array is the element type when this is a *structural* array type (`i32[]`), else nil
 	// (spec/design/array.md §2). The element type is carried inline — no catalog object, unlike
 	// Comp. The element is a scalar or composite, never another array (multidimensionality is a
 	// value property, not array-of-array — §2). The pointer also breaks == like Comp.

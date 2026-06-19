@@ -1,6 +1,6 @@
 package jed
 
-// IEEE 754 binary floating point — float32 / float64 (spec/design/float.md). The engine's
+// IEEE 754 binary floating point — f32 / f64 (spec/design/float.md). The engine's
 // APPROXIMATE numeric, the deliberate opposite of decimal: inexact, base-2, and admitting
 // NaN/±Infinity. It is the FIRST type partially exempted from cross-core byte-identity
 // (determinism.md §6), but the exemption is NARROW — storage, the total order, the
@@ -25,23 +25,23 @@ import (
 // with -0 = +0 and NaN = NaN (all NaN bit patterns are ONE equivalence class). So NaN is the
 // single largest value and `NaN = NaN` is TRUE. A documented divergence from raw IEEE.
 
-// canonicalNaN64Bits is the single quiet-NaN bit pattern jed materializes for a float64 NaN
+// canonicalNaN64Bits is the single quiet-NaN bit pattern jed materializes for a f64 NaN
 // (spec/design/float.md §3/§10). Go's math.NaN() is 0x7FF8000000000001 — its low payload bit
 // differs from the canonical 0x7FF8000000000000 the Rust/TS cores produce, so a NaN LITERAL uses
 // THIS pattern to stay cross-core byte-identical in memory (and the storage codec re-canonicalizes
-// any other NaN, e.g. hardware Inf-Inf, on the way to disk). float32's canonical NaN is 0x7FC00000.
+// any other NaN, e.g. hardware Inf-Inf, on the way to disk). f32's canonical NaN is 0x7FC00000.
 const canonicalNaN64Bits uint64 = 0x7FF8000000000000
 
-// canonicalNaN64 is the float64 NaN jed materializes (see canonicalNaN64Bits).
+// canonicalNaN64 is the f64 NaN jed materializes (see canonicalNaN64Bits).
 func canonicalNaN64() float64 { return math.Float64frombits(canonicalNaN64Bits) }
 
-// floatTotalRank maps a float64 to a totally-ordered class rank: every NaN → the largest class,
+// floatTotalRank maps a f64 to a totally-ordered class rank: every NaN → the largest class,
 // everything else compares numerically with -0 folded to +0. Used only as a tie-break gate.
 //
-// floatTotalCmp is the total-order comparison of two float64 values (the §3 order), returning
+// floatTotalCmp is the total-order comparison of two f64 values (the §3 order), returning
 // <0, 0, >0. NaN is the largest (NaN vs NaN is 0; NaN vs anything finite/Inf is +1). -0 and +0
 // compare equal because Go's < / > already treat them equal and 0 == 0. Mixed widths reach
-// here already widened to float64 (lossless — §2).
+// here already widened to f64 (lossless — §2).
 func floatTotalCmp(a, b float64) int {
 	aNaN, bNaN := math.IsNaN(a), math.IsNaN(b)
 	switch {
@@ -77,7 +77,7 @@ func canonicalizeFloat64(f float64) float64 {
 // differences. Go: strconv.FormatFloat('g', -1, width). Special values render PG-style —
 // `Infinity` / `-Infinity` / `NaN` (Go prints `+Inf`/`-Inf`/`NaN`), and -0 renders `-0`.
 
-// renderFloat64 formats a float64 as its shortest round-trip decimal, mapping Go's special-value
+// renderFloat64 formats a f64 as its shortest round-trip decimal, mapping Go's special-value
 // spellings to the spec's PG spellings (spec/design/float.md §9).
 func renderFloat64(f float64) string {
 	if math.IsNaN(f) {
@@ -119,11 +119,11 @@ func renderFloat32(f float32) string {
 // operation (round-ties-to-even), ONE operator per node (the tree-walk guarantees no FMA
 // contraction — float.md §5). FINITE arithmetic NEVER produces Inf/NaN: a finite result that
 // overflows traps 22003; x/0 traps 22012. An operand that is ALREADY Inf/NaN propagates per
-// IEEE (no trap). Mixed widths promote to float64 first (so the result kind is float64).
+// IEEE (no trap). Mixed widths promote to f64 first (so the result kind is f64).
 
 // evalFloatArith evaluates one float arithmetic op. a and b are the operand VALUES (each
-// ValFloat32 or ValFloat64). resultIs32 says the static result type is float32 (both operands
-// float32); otherwise float64 (either operand float64 — the promotion). Returns a float Value
+// ValFloat32 or ValFloat64). resultIs32 says the static result type is f32 (both operands
+// f32); otherwise f64 (either operand f64 — the promotion). Returns a float Value
 // of the result width, or a trap (22003 finite-overflow, 22012 division by zero).
 func evalFloatArith(op BinaryOp, a, b Value, resultIs32 bool) (Value, error) {
 	if resultIs32 {
@@ -176,9 +176,9 @@ func float64Op(op BinaryOp, x, y float64) (float64, error) {
 	return r, nil
 }
 
-// float32Op is float64Op at binary32 width — every op rounds to binary32 (Go float32 arithmetic),
+// float32Op is float64Op at binary32 width — every op rounds to binary32 (Go f32 arithmetic),
 // matching the §2/§5 "compute at the input width" rule. The finite-overflow check is against the
-// binary32 range (a finite float32 pair whose true result exceeds float32 max → ±Inf → 22003).
+// binary32 range (a finite f32 pair whose true result exceeds f32 max → ±Inf → 22003).
 func float32Op(op BinaryOp, x, y float32) (float32, error) {
 	var r float32
 	switch op {
@@ -189,7 +189,7 @@ func float32Op(op BinaryOp, x, y float32) (float32, error) {
 	case OpMul:
 		r = x * y
 	case OpDiv:
-		// Same zero-divisor rule as float64: traps for every numerator except NaN (Inf/0 traps).
+		// Same zero-divisor rule as f64: traps for every numerator except NaN (Inf/0 traps).
 		if y == 0 && !math.IsNaN(float64(x)) {
 			return 0, NewError(DivisionByZero, "division by zero")
 		}
@@ -225,7 +225,7 @@ func overflowFloatErr() error {
 
 // --- casts (spec/design/float.md §6, ../types/casts.toml) ---------------------------------
 
-// intToFloat64 converts an integer (any width, carried in int64) to the nearest binary64,
+// intToFloat64 converts an integer (any width, carried in i64) to the nearest binary64,
 // round-ties-to-even (the IEEE conversion; never traps — §6).
 func intToFloat64(n int64) float64 { return float64(n) }
 
@@ -240,8 +240,8 @@ func floatToInt(f float64, target ScalarType) (int64, error) {
 		return 0, overflowErr(target)
 	}
 	r := math.Round(f) // Go's math.Round is round-half-AWAY-from-zero — exactly jed's mode
-	// math.Round of a huge value stays huge; the int64 conversion below must be range-guarded
-	// BEFORE the Go float→int conversion (which is undefined for out-of-int64-range values).
+	// math.Round of a huge value stays huge; the i64 conversion below must be range-guarded
+	// BEFORE the Go float→int conversion (which is undefined for out-of-i64-range values).
 	if r >= 9223372036854775808.0 || r < -9223372036854775808.0 {
 		return 0, overflowErr(target)
 	}
@@ -338,7 +338,7 @@ func decimalToFloat32(d Decimal) (float32, error) {
 	return float32(f), nil
 }
 
-// float64ToFloat32 narrows a float64 to float32, round-ties-to-even. A finite float64 beyond the
+// float64ToFloat32 narrows a f64 to f32, round-ties-to-even. A finite f64 beyond the
 // binary32 range traps 22003 (the §3 finite-overflow rule). NaN/±Inf convert unchanged (no trap).
 func float64ToFloat32(f float64) (float32, error) {
 	r := float32(f)
@@ -356,8 +356,8 @@ func float64ToFloat32(f float64) (float32, error) {
 // width-correct IEEE add. Identical regardless of row/partition order, bit-identical cross-core.
 
 // floatSumAcc accumulates the inputs of a float SUM/AVG so they can be folded in canonical order
-// at finalize. is32 selects the fold width (float32 vs float64). It records the special-value
-// flags and collects the finite inputs (as float64 — float32 widens losslessly for sorting; the
+// at finalize. is32 selects the fold width (f32 vs f64). It records the special-value
+// flags and collects the finite inputs (as f64 — f32 widens losslessly for sorting; the
 // FOLD re-narrows per step when is32).
 type floatSumAcc struct {
 	is32      bool
@@ -386,7 +386,7 @@ func (a *floatSumAcc) add(v Value) {
 	}
 }
 
-// sumF64 resolves the SUM as a float64 result (the special-value rules, then the canonical fold).
+// sumF64 resolves the SUM as a f64 result (the special-value rules, then the canonical fold).
 // ok=false means the group was empty (→ NULL). A running total that overflows to ±Inf traps 22003.
 func (a *floatSumAcc) sumF64() (float64, bool, error) {
 	if a.count == 0 {
@@ -408,8 +408,8 @@ func (a *floatSumAcc) sumF64() (float64, bool, error) {
 	return total, true, nil
 }
 
-// sumF32 resolves the SUM as a float32 result — the same canonical fold, but each add rounds to
-// binary32 (the §7 width-correct fold for float32).
+// sumF32 resolves the SUM as a f32 result — the same canonical fold, but each add rounds to
+// binary32 (the §7 width-correct fold for f32).
 func (a *floatSumAcc) sumF32() (float32, bool, error) {
 	if a.count == 0 {
 		return 0, false, nil
@@ -446,7 +446,7 @@ func (a *floatSumAcc) specialSum() (float64, bool) {
 	}
 }
 
-// avgF64 resolves AVG as a float64: SUM / count, the division rounded once (empty → NULL). A NaN
+// avgF64 resolves AVG as a f64: SUM / count, the division rounded once (empty → NULL). A NaN
 // or ±Inf sum carries through the division (NaN/n = NaN, ±Inf/n = ±Inf).
 func (a *floatSumAcc) avgF64() (float64, bool, error) {
 	s, ok, err := a.sumF64()
@@ -456,7 +456,7 @@ func (a *floatSumAcc) avgF64() (float64, bool, error) {
 	return s / float64(a.count), true, nil
 }
 
-// avgF32 resolves AVG as a float32 (sum at f32 / count, one rounding).
+// avgF32 resolves AVG as a f32 (sum at f32 / count, one rounding).
 func (a *floatSumAcc) avgF32() (float32, bool, error) {
 	s, ok, err := a.sumF32()
 	if err != nil || !ok {
@@ -469,7 +469,7 @@ func (a *floatSumAcc) avgF32() (float32, bool, error) {
 //
 // EXACT / correctly-rounded (in-contract): abs, ceil, floor, trunc, round (half away, 1- & 2-arg),
 // sqrt. TRANSCENDENTAL (exempted, native math pkg): exp, ln, log10, pow, sin, cos, tan. Result
-// width is the call's `result` (Float32 only for abs over a float32 arg; float64 for the rest, per
+// width is the call's `result` (Float32 only for abs over a f32 arg; f64 for the rest, per
 // the catalog). Domain errors follow PG: ln(0) → 22003, sqrt/ln of a negative → 22003, exp/pow
 // overflow → 22003 — keeping NaN an INPUT-ONLY value (a finite call never RETURNS NaN/±Inf).
 
@@ -478,7 +478,7 @@ func (a *floatSumAcc) avgF32() (float32, bool, error) {
 // operand (either width — widened to f64 for the kernel); a 2-arg form carries vals[1].
 func evalFloatFunc(fn scalarFunc, vals []Value, result ScalarType) (Value, error) {
 	x := vals[0].asF64()
-	// wrap returns the result at the call's width (sfFloatAbs may be float32; the rest are float64).
+	// wrap returns the result at the call's width (sfFloatAbs may be f32; the rest are f64).
 	wrap := func(r float64) Value {
 		if result.IsFloat32() {
 			return Float32Value(float32(r))

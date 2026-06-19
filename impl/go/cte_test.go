@@ -12,7 +12,7 @@ import "testing"
 func cteT3(t *testing.T) *Database {
 	return dbWith(
 		t,
-		"CREATE TABLE t (id int32 PRIMARY KEY, n int32)",
+		"CREATE TABLE t (id i32 PRIMARY KEY, n i32)",
 		"INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
 	)
 }

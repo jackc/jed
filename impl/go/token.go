@@ -85,9 +85,9 @@ const (
 )
 
 // Token is a lexed token. Word holds the text for TokWord; Int holds the unsigned
-// magnitude for TokInt. The lexer guarantees the magnitude is <= 2^63; int64 cannot
+// magnitude for TokInt. The lexer guarantees the magnitude is <= 2^63; i64 cannot
 // hold 2^63, so the parser converts — a bare magnitude > MaxInt64 traps 22003, and
-// -(2^63) folds to int64's minimum (spec/design/grammar.md §4).
+// -(2^63) folds to i64's minimum (spec/design/grammar.md §4).
 type Token struct {
 	Kind TokenKind
 	Word string // TokWord, or the decoded string for TokStr

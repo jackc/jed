@@ -8,10 +8,10 @@
 
 use jed::{Database, Outcome, execute};
 
-/// A table of `n` rows (id int32 PRIMARY KEY, v int32; v == id).
+/// A table of `n` rows (id i32 PRIMARY KEY, v i32; v == id).
 fn table(n: i64) -> Database {
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     let mut sql = String::from("INSERT INTO t VALUES ");
     for i in 1..=n {
         if i > 1 {

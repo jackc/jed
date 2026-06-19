@@ -20,9 +20,9 @@ func valArrayFunc(t *testing.T, db *Database, sql string) string {
 func TestArrayFuncMultidimAndCustomLB(t *testing.T) {
 	db := NewDatabase()
 	cases := map[string]string{
-		"SELECT array_lower('[2:4]={7,8,9}'::int32[], 1)":          "2",
-		"SELECT array_upper('[2:4]={7,8,9}'::int32[], 1)":          "4",
-		"SELECT array_dims('[2:4]={7,8,9}'::int32[])":              "[2:4]",
+		"SELECT array_lower('[2:4]={7,8,9}'::i32[], 1)":            "2",
+		"SELECT array_upper('[2:4]={7,8,9}'::i32[], 1)":            "4",
+		"SELECT array_dims('[2:4]={7,8,9}'::i32[])":                "[2:4]",
 		"SELECT array_ndims(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]])":     "2",
 		"SELECT array_length(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]], 2)": "3",
 		"SELECT cardinality(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]])":     "6",

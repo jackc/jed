@@ -1,12 +1,12 @@
 # Array function/operator surface AF6 (spec/design/array-functions.md §12): the VARIADIC call syntax
 # + variadic overload resolution, spent on the engine's first VARIADIC built-ins num_nulls /
-# num_nonnulls (count the NULL / non-NULL arguments → int32). A variadic parameter takes EITHER a
+# num_nonnulls (count the NULL / non-NULL arguments → i32). A variadic parameter takes EITHER a
 # SPREAD of trailing arguments — num_nulls(1, NULL, 3) — OR a single array via the VARIADIC keyword —
 # num_nulls(VARIADIC ARRAY[1,NULL,3]). NON-STRICT (null = "none"): the spread form NEVER returns NULL
 # (num_nulls(NULL) is 1), while the VARIADIC-array form returns NULL on a NULL whole-array operand.
 # A VARIADIC keyword on a non-array (or a bare untyped NULL) operand is 42804; a spread of zero args
 # (num_nulls()) is 42883. PostgreSQL-oracle-verified (postgres:18).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.array, types.array_multidim, types.int32, types.text, types.boolean, func.variadic, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.array, types.array_multidim, types.i32, types.text, types.boolean, func.variadic, resource.cost_metering
 
 # --- spread form: count the NULL / non-NULL arguments (heterogeneous; the "any" element family) ---
 # num_nulls(NULL) is 1, NOT NULL — the non-strict discipline (the kernel counts, never short-circuits).
@@ -81,29 +81,29 @@ SELECT num_nonnulls(VARIADIC ARRAY[1, NULL, 3])
 
 # The empty array → 0; a multidimensional array flattens (row-major).
 query I nosort
-SELECT num_nulls(VARIADIC '{}'::int32[])
+SELECT num_nulls(VARIADIC '{}'::i32[])
 ----
 0
 
 query I nosort
-SELECT num_nulls(VARIADIC '{{1,2},{NULL,4}}'::int32[])
+SELECT num_nulls(VARIADIC '{{1,2},{NULL,4}}'::i32[])
 ----
 1
 
 # A NULL whole-array operand → NULL (both functions) — distinct from the spread form's never-NULL.
 query I nosort
-SELECT num_nulls(VARIADIC NULL::int32[])
+SELECT num_nulls(VARIADIC NULL::i32[])
 ----
 NULL
 
 query I nosort
-SELECT num_nonnulls(VARIADIC NULL::int32[])
+SELECT num_nonnulls(VARIADIC NULL::i32[])
 ----
 NULL
 
 # --- both forms agree, and compose over a column --------------------------------------------------
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])
+CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])
 
 statement ok
 INSERT INTO t VALUES (1, ARRAY[1, NULL, 3]), (2, '{}'), (3, NULL)

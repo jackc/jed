@@ -12,7 +12,7 @@ import { Database, execute } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 function addrDb(): Database {
-  return dbWith(["CREATE TYPE addr AS (street text, zip int32)"]);
+  return dbWith(["CREATE TYPE addr AS (street text, zip i32)"]);
 }
 
 // val runs a one-row, one-column query and returns the rendered value ("NULL" for SQL-NULL).
@@ -102,7 +102,7 @@ test("AF7 unnest(composite[])", () => {
 // The jed extension: ARRAY[ROW(…)] under a composite-column context (not in the PG corpus).
 test("AF7 ARRAY[ROW(…)] under a composite-column context", () => {
   const db = addrDb();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
   execute(db, "INSERT INTO t VALUES (1, ARRAY[ROW('Main', 90210), ROW('Side', 5)])");
   assert.equal(val(db, "SELECT (SELECT count(*) FROM unnest(o.items)) FROM t o ORDER BY id"), "2");
   assert.equal(val(db, "SELECT array_length(items, 1) FROM t ORDER BY id"), "2");

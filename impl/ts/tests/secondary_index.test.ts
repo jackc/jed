@@ -52,7 +52,7 @@ function errCode(fn: () => unknown): string {
 // value, so an equality admits 4 of 20.
 function db20(): Database {
   const db = new Database();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
   for (let i = 1; i <= 20; i++) {
     run(db, `INSERT INTO t VALUES (${i}, ${i % 5}, ${i})`);
   }
@@ -64,7 +64,7 @@ test("auto-naming matches PostgreSQL", () => {
   // §2); duplicates in the column list are allowed and named through; an explicit name
   // round-trips as written. The catalog holds indexes in ascending lowercased-name order.
   const db = new Database();
-  run(db, "CREATE TABLE T (A int32 PRIMARY KEY, B int32)");
+  run(db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)");
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx1
   run(db, "CREATE INDEX ON T (B)"); // t_b_idx2
@@ -86,14 +86,14 @@ test("DDL errors match PostgreSQL", () => {
   // indexes.md §2); the relation namespace is shared with tables; DROP mismatches are
   // 42704/42809.
   const db = new Database();
-  run(db, "CREATE TABLE t (a int32 PRIMARY KEY, s text)");
+  run(db, "CREATE TABLE t (a i32 PRIMARY KEY, s text)");
   assert.equal(errCode(() => run(db, "CREATE INDEX i ON nosuch (nope)")), "42P01");
   run(db, "CREATE INDEX taken ON t (a)");
   assert.equal(errCode(() => run(db, "CREATE INDEX taken ON t (nope)")), "42703");
   assert.equal(errCode(() => run(db, "CREATE INDEX i ON t (s)")), "0A000");
   assert.equal(errCode(() => run(db, "CREATE INDEX taken ON t (a)")), "42P07");
   assert.equal(errCode(() => run(db, "CREATE INDEX t ON t (a)")), "42P07");
-  assert.equal(errCode(() => run(db, "CREATE TABLE taken (x int32)")), "42P07");
+  assert.equal(errCode(() => run(db, "CREATE TABLE taken (x i32)")), "42P07");
   assert.equal(errCode(() => run(db, "DROP INDEX nosuch")), "42704");
   assert.equal(errCode(() => run(db, "DROP INDEX t")), "42809");
   assert.equal(errCode(() => run(db, "DROP TABLE taken")), "42809");
@@ -101,14 +101,14 @@ test("DDL errors match PostgreSQL", () => {
   assert.equal(errCode(() => run(db, "DROP INDEX taken")), "42704");
   run(db, "CREATE INDEX taken ON t (a)");
   run(db, "DROP TABLE t");
-  run(db, "CREATE TABLE taken (x int32)"); // DROP TABLE freed its index names
+  run(db, "CREATE TABLE taken (x i32)"); // DROP TABLE freed its index names
   // The lookahead keeps every word non-reserved (grammar.md §30): the unnamed form over
   // a table named `on`, and an index explicitly named `on`.
-  run(db, "CREATE TABLE on (x int32)");
+  run(db, "CREATE TABLE on (x i32)");
   run(db, "CREATE INDEX ON on (x)");
   assert.equal(db.table("on")!.indexes[0]!.name, "on_x_idx");
   run(db, "DROP TABLE on"); // free the name `on` in the relation namespace
-  run(db, "CREATE TABLE q (x int32)");
+  run(db, "CREATE TABLE q (x i32)");
   run(db, "CREATE INDEX on ON q (x)");
   assert.equal(db.table("q")!.indexes[0]!.name, "on");
   run(db, "DROP INDEX on");
@@ -182,7 +182,7 @@ test("file-backed paged reopen uses the index", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-"));
   const path = join(dir, "secondary_index_paged.jed");
   const db = create(path, { pageSize: 256 });
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
   for (let i = 1; i <= 20; i++) {
     run(db, `INSERT INTO t VALUES (${i}, ${i % 5}, ${i})`);
   }

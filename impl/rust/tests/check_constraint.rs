@@ -147,7 +147,7 @@ fn ddl_errors_match_postgres() {
     // `CHECK ()` is a syntax error; so is a CHECK with no parenthesized expression.
     assert_eq!(err(&mut db, "CREATE TABLE x (a int, CHECK ())").0, "42601");
     // Columns may be NAMED check / constraint (the keywords stay non-reserved).
-    execute(&mut db, "CREATE TABLE odd (check int, constraint int16)").unwrap();
+    execute(&mut db, "CREATE TABLE odd (check int, constraint i16)").unwrap();
     execute(&mut db, "INSERT INTO odd VALUES (1, 2)").unwrap();
 }
 

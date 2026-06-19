@@ -26,7 +26,7 @@ const (
 	// InvalidDatetimeFormat is 22007 — malformed timestamp/timestamptz input.
 	InvalidDatetimeFormat
 	// DatetimeFieldOverflow is 22008 — an out-of-range datetime field or a value beyond the
-	// representable int64-microsecond range (spec/design/timestamp.md).
+	// representable i64-microsecond range (spec/design/timestamp.md).
 	DatetimeFieldOverflow
 	// DivisionByZero is 22012 — division or modulo by zero.
 	DivisionByZero

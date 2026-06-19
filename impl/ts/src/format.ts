@@ -100,11 +100,11 @@ const UTF8_DECODE = new TextDecoder("utf-8", { fatal: true });
 // in-memory ordering. See format.md.
 function typeCodeForScalar(ty: ScalarType): number {
   switch (ty) {
-    case "int16":
+    case "i16":
       return 1;
-    case "int32":
+    case "i32":
       return 2;
-    case "int64":
+    case "i64":
       return 3;
     case "text":
       return 4;
@@ -122,9 +122,9 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 10;
     case "interval":
       return 11;
-    case "float64":
+    case "f64":
       return 12;
-    case "float32":
+    case "f32":
       return 13;
     case "date":
       return 16;
@@ -135,11 +135,11 @@ function typeCodeForScalar(ty: ScalarType): number {
 function scalarForTypeCode(code: number): ScalarType | undefined {
   switch (code) {
     case 1:
-      return "int16";
+      return "i16";
     case 2:
-      return "int32";
+      return "i32";
     case 3:
-      return "int64";
+      return "i64";
     case 4:
       return "text";
     case 5:
@@ -157,9 +157,9 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
     case 11:
       return "interval";
     case 12:
-      return "float64";
+      return "f64";
     case 13:
-      return "float32";
+      return "f32";
     case 16:
       return "date";
     default:
@@ -375,13 +375,13 @@ function encodeScalar(ty: ScalarType, v: Value): Uint8Array {
     return out;
   }
   if (v.kind === "timestamp" || v.kind === "timestamptz") {
-    // Timestamps store their int64 microsecond instant via the same fixed-width codec as
-    // int64 (spec/design/timestamp.md §6).
+    // Timestamps store their i64 microsecond instant via the same fixed-width codec as
+    // i64 (spec/design/timestamp.md §6).
     return encodeNullable(ty, v.micros);
   }
   if (v.kind === "date") {
-    // A date stores its int32 day count via the same fixed-width (4-byte) order-preserving codec
-    // as int32 (spec/design/date.md).
+    // A date stores its i32 day count via the same fixed-width (4-byte) order-preserving codec
+    // as i32 (spec/design/date.md).
     return encodeNullable(ty, v.days);
   }
   if (v.kind === "interval") {
@@ -395,7 +395,7 @@ function encodeScalar(ty: ScalarType, v: Value): Uint8Array {
     dv.setBigInt64(9, v.iv.micros, false);
     return out;
   }
-  if (v.kind === "float64") {
+  if (v.kind === "f64") {
     // 8 IEEE bytes, big-endian, no length prefix (fixed-width like uuid/timestamp). Stored VERBATIM
     // for every value EXCEPT NaN: a -0.0 keeps its sign bit and ±Inf/finite keep theirs, but a NaN
     // is canonicalized to the single quiet pattern 0x7FF8000000000000. A NaN's payload is
@@ -410,9 +410,9 @@ function encodeScalar(ty: ScalarType, v: Value): Uint8Array {
     else dv.setFloat64(1, v.value, false); // big-endian
     return out;
   }
-  if (v.kind === "float32") {
+  if (v.kind === "f32") {
     // 4 IEEE bytes, big-endian. v.value is already Math.fround'd (binary32), so setFloat32 stores it
-    // without further rounding loss. NaN is canonicalized to 0x7FC00000 (see float64 above).
+    // without further rounding loss. NaN is canonicalized to 0x7FC00000 (see f64 above).
     const out = new Uint8Array(1 + 4);
     out[0] = 0x00; // present
     const dv = new DataView(out.buffer);
@@ -436,7 +436,7 @@ class ByteWriter {
   u32(v: number): void {
     this.buf.push((v >>> 24) & 0xff, (v >>> 16) & 0xff, (v >>> 8) & 0xff, v & 0xff);
   }
-  // i64 writes an 8-byte big-endian two's-complement int64 (a value-codec context, not a key —
+  // i64 writes an 8-byte big-endian two's-complement i64 (a value-codec context, not a key —
   // the interval-micros / sequence-field encoding). Big-endian via DataView.
   i64(v: bigint): void {
     const dv = new DataView(new ArrayBuffer(8));
@@ -1433,11 +1433,11 @@ export function loadDatabase(image: Uint8Array): Database {
       if (root !== 0) {
         const t = readTree(image, dv, pageSize, root, colTypes, reached);
         store.setTree(t.node, t.length);
-        // No-PK keys are synthetic int64 rowids — advance the counter past the largest (the last
+        // No-PK keys are synthetic i64 rowids — advance the counter past the largest (the last
         // entry in key order) so future inserts don't collide.
         if (!hasPK && t.length > 0) {
           const entries = store.entriesInKeyOrder();
-          store.bumpRowidTo(decodeInt("int64", entries[entries.length - 1]!.key) + 1n);
+          store.bumpRowidTo(decodeInt("i64", entries[entries.length - 1]!.key) + 1n);
         }
       }
       // The table's index trees (v5): zero-column stores of entry keys
@@ -1572,7 +1572,7 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
           // No-PK rowid reconstruction faults the leaves to find the largest key; only for keyless
           // tables (most have a PK), and bounded by the pool.
           const entries = store.entriesInKeyOrder();
-          store.bumpRowidTo(decodeInt("int64", entries[entries.length - 1]!.key) + 1n);
+          store.bumpRowidTo(decodeInt("i64", entries[entries.length - 1]!.key) + 1n);
         }
       }
       // The table's index trees (v5): zero-column demand-paged stores of entry keys
@@ -2373,13 +2373,13 @@ function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
     // decodeInt would sign-flip and widthBytes is 16 there too. .slice() copies out.
     return uuidValue(take(buf, cur, 16).slice());
   }
-  if (ty === "float64") {
+  if (ty === "f64") {
     // 8 IEEE bytes, big-endian; bits preserved verbatim (a stored -0/NaN round-trips). DataView
     // needs the byteOffset within the page buffer (take() does not copy).
     const b = take(buf, cur, 8);
     return float64Value(new DataView(b.buffer, b.byteOffset, b.byteLength).getFloat64(0, false));
   }
-  if (ty === "float32") {
+  if (ty === "f32") {
     // 4 IEEE bytes, big-endian; getFloat32 yields the exact binary32 value as a JS number, so
     // float32Value's Math.fround is a no-op (the bits already are binary32).
     const b = take(buf, cur, 4);
@@ -2387,7 +2387,7 @@ function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
   }
   if (isTimestamp(ty)) return timestampValue(readIntBody(ty, buf, cur));
   if (isTimestamptz(ty)) return timestamptzValue(readIntBody(ty, buf, cur));
-  // A date is a 4-byte int32 day count, same order-preserving codec as int32 (spec/design/date.md).
+  // A date is a 4-byte i32 day count, same order-preserving codec as i32 (spec/design/date.md).
   if (isDate(ty)) return dateValue(readIntBody(ty, buf, cur));
   if (isInterval(ty)) {
     // Fixed 16-byte body: i32 months + i32 days + i64 micros, big-endian (no sign-flip).
@@ -2495,7 +2495,7 @@ function readU32(buf: Uint8Array, cur: Cursor): number {
   return v;
 }
 
-// readI64 reads an 8-byte big-endian two's-complement int64 (the interval-micros / sequence-field
+// readI64 reads an 8-byte big-endian two's-complement i64 (the interval-micros / sequence-field
 // encoding). Big-endian via DataView.
 function readI64(buf: Uint8Array, cur: Cursor): bigint {
   const b = take(buf, cur, 8);

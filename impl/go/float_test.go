@@ -1,6 +1,6 @@
 package jed
 
-// float32 / float64 — the IEEE 754 binary float types (spec/design/float.md). These per-feature
+// f32 / f64 — the IEEE 754 binary float types (spec/design/float.md). These per-feature
 // Go tests stand in for the (not-yet-authored) shared float conformance suite this slice precedes:
 // the value codec, the total order, the trap model, the promotion tower, the casts, the
 // order-independent canonical-fold SUM/AVG, and one transcendental.
@@ -24,10 +24,10 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 		pos := 0
 		got, err := readInlineBody(ScalarColType(Float64), enc[1:], &pos) // skip the 0x00 presence tag
 		if err != nil {
-			t.Fatalf("float64 decode %v: %v", f, err)
+			t.Fatalf("f64 decode %v: %v", f, err)
 		}
 		if got.Kind != ValFloat64 {
-			t.Fatalf("float64 %v: kind %v", f, got.Kind)
+			t.Fatalf("f64 %v: kind %v", f, got.Kind)
 		}
 		// Compare by BITS. Storage preserves the original pattern verbatim (incl -0's sign bit) EXCEPT
 		// for NaN, which canonicalizes to the single quiet pattern 0x7FF8…000 (float.md §10).
@@ -37,7 +37,7 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 			want = 0x7FF8000000000000
 		}
 		if uint64(got.Int) != want {
-			t.Errorf("float64 %v: bits %#016x != %#016x", f, uint64(got.Int), want)
+			t.Errorf("f64 %v: bits %#016x != %#016x", f, uint64(got.Int), want)
 		}
 	}
 	cases32 := []float32{
@@ -50,14 +50,14 @@ func TestFloatValueCodecRoundTrip(t *testing.T) {
 		pos := 0
 		got, err := readInlineBody(ScalarColType(Float32), enc[1:], &pos)
 		if err != nil {
-			t.Fatalf("float32 decode %v: %v", f, err)
+			t.Fatalf("f32 decode %v: %v", f, err)
 		}
 		want := math.Float32bits(f)
 		if math.IsNaN(float64(f)) {
 			want = 0x7FC00000 // NaN canonicalizes on store (float.md §10)
 		}
 		if got.Kind != ValFloat32 || uint32(got.Int) != want {
-			t.Errorf("float32 %v: bits %#08x != %#08x", f, uint32(got.Int), want)
+			t.Errorf("f32 %v: bits %#08x != %#08x", f, uint32(got.Int), want)
 		}
 	}
 }
@@ -68,7 +68,7 @@ func TestFloatImageRoundTrip(t *testing.T) {
 	// pattern but stays a NaN; float.md §10).
 	db := dbWith(
 		t,
-		"CREATE TABLE f (id int32 PRIMARY KEY, a float32, b float64)",
+		"CREATE TABLE f (id i32 PRIMARY KEY, a f32, b f64)",
 		"INSERT INTO f VALUES (1, '1.5', 'NaN')",
 		"INSERT INTO f VALUES (2, '-0', '-Infinity')",
 		"INSERT INTO f VALUES (3, 'Infinity', '3.141592653589793')",
@@ -99,7 +99,7 @@ func TestFloatImageRoundTrip(t *testing.T) {
 func TestFloatStoredNegZeroPreservesBits(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE f (id int32 PRIMARY KEY, x float64)",
+		"CREATE TABLE f (id i32 PRIMARY KEY, x f64)",
 		"INSERT INTO f VALUES (1, '-0')",
 		"INSERT INTO f VALUES (2, '0')",
 	)
@@ -141,7 +141,7 @@ func TestFloatTotalOrderComparator(t *testing.T) {
 func TestFloatDistinctCollapsesNaNAndZeroSigns(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE f (id int32 PRIMARY KEY, x float64)",
+		"CREATE TABLE f (id i32 PRIMARY KEY, x f64)",
 		"INSERT INTO f VALUES (1, 'NaN')",
 		"INSERT INTO f VALUES (2, 'NaN')",
 		"INSERT INTO f VALUES (3, '-0')",
@@ -154,45 +154,45 @@ func TestFloatDistinctCollapsesNaNAndZeroSigns(t *testing.T) {
 	}
 }
 
-// --- the promotion tower: float32 + float64 → float64 -------------------------------------
+// --- the promotion tower: f32 + f64 → f64 -------------------------------------
 
 func TestFloatMixedWidthArithmeticPromotes(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE f (id int32 PRIMARY KEY, a float32, b float64)",
+		"CREATE TABLE f (id i32 PRIMARY KEY, a f32, b f64)",
 		"INSERT INTO f VALUES (1, '1.5', '2.25')",
 	)
 	out, err := Execute(db, "SELECT a + b FROM f")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if out.ColumnTypes[0] != "float64" {
-		t.Errorf("float32 + float64 result type = %s, want float64", out.ColumnTypes[0])
+	if out.ColumnTypes[0] != "f64" {
+		t.Errorf("f32 + f64 result type = %s, want f64", out.ColumnTypes[0])
 	}
 	if got := out.Rows[0][0]; got.Kind != ValFloat64 || got.F64() != 3.75 {
-		t.Errorf("1.5 + 2.25 = %v, want 3.75 (float64)", got.Render())
+		t.Errorf("1.5 + 2.25 = %v, want 3.75 (f64)", got.Render())
 	}
 }
 
 func TestFloat32ImplicitWidenStoresIntoFloat64Column(t *testing.T) {
-	// float32 → float64 is the implicit, lossless widen (the tower): a float32 VALUE stores into a
-	// float64 column (storeValue widens), and assignableTo permits the family pairing.
+	// f32 → f64 is the implicit, lossless widen (the tower): a f32 VALUE stores into a
+	// f64 column (storeValue widens), and assignableTo permits the family pairing.
 	got, err := storeValue(Float32Value(1.5), Float64, nil, false, "x")
 	if err != nil {
-		t.Fatalf("float32 → float64 column store: %v", err)
+		t.Fatalf("f32 → f64 column store: %v", err)
 	}
 	if got.Kind != ValFloat64 || got.F64() != 1.5 {
-		t.Errorf("float32 1.5 widened = %v (kind %v)", got.Render(), got.Kind)
+		t.Errorf("f32 1.5 widened = %v (kind %v)", got.Render(), got.Kind)
 	}
 	if !assignableTo(resolvedType{kind: rtFloat32}, Float64) {
-		t.Errorf("float32 should be assignable to a float64 column")
+		t.Errorf("f32 should be assignable to a f64 column")
 	}
-	// float64 → float32 column is NOT implicitly assignable (explicit CAST only).
+	// f64 → f32 column is NOT implicitly assignable (explicit CAST only).
 	if assignableTo(resolvedType{kind: rtFloat64}, Float32) {
-		t.Errorf("float64 should NOT be implicitly assignable to a float32 column")
+		t.Errorf("f64 should NOT be implicitly assignable to a f32 column")
 	}
 	if _, err := storeValue(Float64Value(1.5), Float32, nil, false, "x"); err == nil {
-		t.Errorf("storing a float64 value into a float32 column should be a 42804")
+		t.Errorf("storing a f64 value into a f32 column should be a 42804")
 	}
 }
 
@@ -265,12 +265,12 @@ func TestFloatSumSpecialValues(t *testing.T) {
 func TestFloatLiteralParsing(t *testing.T) {
 	db := dbWith(t)
 	good := map[string]float64{
-		"float64 '1.5'":       1.5,
-		"float64 '-3E-7'":     -3e-7,
-		"float64 '1.5e10'":    1.5e10,
-		"float64 'Infinity'":  math.Inf(1),
-		"float64 '-Infinity'": math.Inf(-1),
-		"float64 'inf'":       math.Inf(1),
+		"f64 '1.5'":       1.5,
+		"f64 '-3E-7'":     -3e-7,
+		"f64 '1.5e10'":    1.5e10,
+		"f64 'Infinity'":  math.Inf(1),
+		"f64 '-Infinity'": math.Inf(-1),
+		"f64 'inf'":       math.Inf(1),
 	}
 	for sql, want := range good {
 		got := query(t, db, "SELECT "+sql)[0][0].F64()
@@ -278,18 +278,18 @@ func TestFloatLiteralParsing(t *testing.T) {
 			t.Errorf("%s = %v, want %v", sql, got, want)
 		}
 	}
-	if r := query(t, db, "SELECT float64 'NaN'"); !math.IsNaN(r[0][0].F64()) {
-		t.Errorf("float64 'NaN' should parse to NaN")
+	if r := query(t, db, "SELECT f64 'NaN'"); !math.IsNaN(r[0][0].F64()) {
+		t.Errorf("f64 'NaN' should parse to NaN")
 	}
 	// Malformed → 22P02; out of range → 22003.
-	if code := errCode(t, db, "SELECT float64 'abc'"); code != "22P02" {
+	if code := errCode(t, db, "SELECT f64 'abc'"); code != "22P02" {
 		t.Errorf("malformed float literal should be 22P02, got %s", code)
 	}
-	if code := errCode(t, db, "SELECT float64 '1e400'"); code != "22003" {
+	if code := errCode(t, db, "SELECT f64 '1e400'"); code != "22003" {
 		t.Errorf("out-of-range float literal should be 22003, got %s", code)
 	}
-	if code := errCode(t, db, "SELECT float32 '1e40'"); code != "22003" {
-		t.Errorf("out-of-range float32 literal should be 22003, got %s", code)
+	if code := errCode(t, db, "SELECT f32 '1e40'"); code != "22003" {
+		t.Errorf("out-of-range f32 literal should be 22003, got %s", code)
 	}
 }
 

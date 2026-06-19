@@ -98,10 +98,10 @@ fn multi_column_and_rename_list() {
 #[test]
 fn column_type_unification() {
     let mut db = Database::new();
-    // int + int -> int (widths widen): all bare integer literals are int64 in jed.
+    // int + int -> int (widths widen): all bare integer literals are i64 in jed.
     assert_eq!(
         types(&mut db, "SELECT column1 FROM (VALUES (1), (2)) AS v"),
-        vec!["int64"]
+        vec!["i64"]
     );
     // int + decimal -> decimal; the int value coerces.
     assert_eq!(
@@ -122,7 +122,7 @@ fn column_type_unification() {
     // anything + NULL keeps the other type (a NULL row stays NULL).
     assert_eq!(
         types(&mut db, "SELECT column1 FROM (VALUES (1), (NULL)) AS v"),
-        vec!["int64"]
+        vec!["i64"]
     );
     // an all-NULL column is text (unknown -> text).
     assert_eq!(

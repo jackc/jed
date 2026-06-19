@@ -49,7 +49,7 @@ test("$N parameter argument", () => {
 });
 
 test("a sibling reference works (an SRF is implicitly lateral, grammar.md §44)", () => {
-  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY, n int32)", "INSERT INTO t VALUES (1, 3)"]);
+  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, n i32)", "INSERT INTO t VALUES (1, 3)"]);
   // The rows are pinned by suites/joins/lateral.test; here we only assert the prior non-LATERAL
   // 42P01 rejection is lifted — generate_series(1, t.n) re-runs per t row (1 row, n=3 ⇒ 3 rows).
   const out = execute(db, "SELECT * FROM t CROSS JOIN generate_series(1, t.n)");
@@ -68,10 +68,10 @@ test("generated_row cost and the maxCost ceiling", () => {
 
 test("mixed-width promotes to the wider type", () => {
   const db = new Database();
-  const out = execute(db, "SELECT * FROM generate_series(CAST(1 AS int16), CAST(5 AS int32))");
+  const out = execute(db, "SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))");
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
-  assert.deepStrictEqual(out.columnTypes, ["int32"]);
+  assert.deepStrictEqual(out.columnTypes, ["i32"]);
 });
 
 test("i64 overflow while stepping stops cleanly (bigint parity)", () => {

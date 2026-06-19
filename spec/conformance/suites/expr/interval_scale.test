@@ -3,7 +3,7 @@
 # with the fractional part cascading months→days→micros (1 month = 30 days, 1 day = 24 h),
 # computed EXACTLY (a documented PG divergence only on sub-unit ties), µs rounded half away from
 # zero. Overflow traps 22008; a zero divisor traps 22012.
-# requires: query.select, query.select_no_from, types.int32, types.interval, expr.interval_scale
+# requires: query.select, query.select_no_from, types.i32, types.interval, expr.interval_scale
 
 # integer factor: simple field scaling
 query T nosort

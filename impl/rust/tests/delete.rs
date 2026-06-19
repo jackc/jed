@@ -13,7 +13,7 @@ fn db_with(stmts: &[&str]) -> Database {
 
 fn setup() -> Database {
     db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int16)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
         "INSERT INTO t VALUES (1, 10)",
         "INSERT INTO t VALUES (2, 20)",
         "INSERT INTO t VALUES (3, 30)",

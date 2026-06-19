@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-// joinTables builds `a` (n rows id int32 PRIMARY KEY, k int32; k == id) wide enough to span several
+// joinTables builds `a` (n rows id i32 PRIMARY KEY, k i32; k == id) wide enough to span several
 // leaves, and `b` (three small rows whose k-values exist as a's k-values, so the join matches).
 func joinTables(t *testing.T, n int) *Database {
 	t.Helper()
@@ -27,8 +27,8 @@ func joinTables(t *testing.T, n int) *Database {
 	}
 	return dbWith(
 		t,
-		"CREATE TABLE a (id int32 PRIMARY KEY, k int32)",
-		"CREATE TABLE b (id int32 PRIMARY KEY, k int32)",
+		"CREATE TABLE a (id i32 PRIMARY KEY, k i32)",
+		"CREATE TABLE b (id i32 PRIMARY KEY, k i32)",
 		b.String(),
 		"INSERT INTO b VALUES (1, 500), (2, 600), (3, 700)",
 	)

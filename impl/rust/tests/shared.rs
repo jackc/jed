@@ -11,7 +11,7 @@ fn count(r: &mut ReadHandle) -> i64 {
     let rows: Vec<_> = r.query("SELECT count(*) FROM t", &[]).unwrap().collect();
     match &rows[0][0] {
         jed::Value::Int(n) => *n,
-        other => panic!("expected an int64 count, got {other:?}"),
+        other => panic!("expected an i64 count, got {other:?}"),
     }
 }
 

@@ -4,10 +4,10 @@
 # `NULL` (spec/design/conformance.md §1, types.md §9). A comparison in WHERE still
 # filters: a row is kept iff the predicate is TRUE (FALSE and unknown both exclude).
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.is_null, types.int32, types.boolean, expr.comparison_value, null.three_valued
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.is_null, types.i32, types.boolean, expr.comparison_value, null.three_valued
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
 
 statement ok
 INSERT INTO t VALUES (1, 5, 5)

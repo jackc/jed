@@ -43,11 +43,7 @@ fn cost(db: &mut Database, sql: &str) -> i64 {
 fn two_tables() -> Database {
     let mut db = Database::with_page_size(PAGE_SIZE);
     let run600 = "x".repeat(600);
-    execute(
-        &mut db,
-        "CREATE TABLE comp (id int32 PRIMARY KEY, body text)",
-    )
-    .unwrap();
+    execute(&mut db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)").unwrap();
     execute(
         &mut db,
         &format!("INSERT INTO comp VALUES (1, '{run600}'), (2, 'small')"),
@@ -55,7 +51,7 @@ fn two_tables() -> Database {
     .unwrap();
     execute(
         &mut db,
-        "CREATE TABLE control (id int32 PRIMARY KEY, body text)",
+        "CREATE TABLE control (id i32 PRIMARY KEY, body text)",
     )
     .unwrap();
     execute(
@@ -83,15 +79,11 @@ fn external_compressed_charges_chain_pages_plus_decompress_slabs() {
     // ceil(400/244) = 2 value_decompress slabs.
     let mut db = Database::with_page_size(PAGE_SIZE);
     let mix = format!("{}{}", filler_text(200), "y".repeat(200));
-    execute(
-        &mut db,
-        "CREATE TABLE comp (id int32 PRIMARY KEY, body text)",
-    )
-    .unwrap();
+    execute(&mut db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)").unwrap();
     execute(&mut db, &format!("INSERT INTO comp VALUES (1, '{mix}')")).unwrap();
     execute(
         &mut db,
-        "CREATE TABLE control (id int32 PRIMARY KEY, body text)",
+        "CREATE TABLE control (id i32 PRIMARY KEY, body text)",
     )
     .unwrap();
     execute(&mut db, "INSERT INTO control VALUES (1, 'tiny')").unwrap();
@@ -121,7 +113,7 @@ fn bounded_scan_charges_only_admitted_values_and_limit_does_not_lower() {
 #[test]
 fn insert_meters_compress_attempts_adopted_or_rejected() {
     let mut db = Database::with_page_size(PAGE_SIZE);
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)").unwrap();
     // A fully-inline row attempts nothing: INSERT stays zero-cost.
     assert_eq!(cost(&mut db, "INSERT INTO t VALUES (1, 'small')"), 0);
     // An adopted compression (the "x" run) costs its ceil(600/244) = 3 attempt slabs ...
@@ -167,12 +159,12 @@ fn decimal_payloads_compress_too() {
     // compressible (repeating groups), and ceil(407/244) = 2 slabs both ways.
     let mut db = Database::with_page_size(PAGE_SIZE);
     let digits = format!("{}.5", "12".repeat(400));
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, d numeric)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric)").unwrap();
     let ins = cost(&mut db, &format!("INSERT INTO t VALUES (1, {digits})"));
     assert_eq!(ins, 2, "the compress attempt is metered");
     execute(
         &mut db,
-        "CREATE TABLE control (id int32 PRIMARY KEY, d numeric)",
+        "CREATE TABLE control (id i32 PRIMARY KEY, d numeric)",
     )
     .unwrap();
     execute(&mut db, "INSERT INTO control VALUES (1, 7)").unwrap();
@@ -206,7 +198,7 @@ fn correlated_outer_reference_is_a_touch() {
     let mut db = two_tables();
     execute(
         &mut db,
-        "CREATE TABLE probe (id int32 PRIMARY KEY, body text)",
+        "CREATE TABLE probe (id i32 PRIMARY KEY, body text)",
     )
     .unwrap();
     execute(&mut db, "INSERT INTO probe VALUES (1, 'small')").unwrap();

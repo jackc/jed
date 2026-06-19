@@ -153,7 +153,7 @@ test("non-RESTART ALTER SEQUENCE is 0A000", () => {
   assert.equal(errCode(db, "ALTER SEQUENCE s INCREMENT BY 2"), "0A000");
   assert.equal(errCode(db, "ALTER SEQUENCE s OWNED BY t.c"), "0A000");
   // ALTER of a non-sequence object is not a known statement at all → 42601 (no escape hatch).
-  assert.equal(errCode(db, "ALTER TABLE t ADD COLUMN c int32"), "42601");
+  assert.equal(errCode(db, "ALTER TABLE t ADD COLUMN c i32"), "42601");
 });
 
 // setval/ALTER … RESTART are writes — a READ ONLY transaction rejects each with 25006 (each in its

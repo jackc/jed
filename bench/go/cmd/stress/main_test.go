@@ -16,7 +16,7 @@ func balanceFile() *stressFile {
 	return &stressFile{
 		Meta: stressMeta{Name: "t", Parallel: "optional", Seed: 1234},
 		Setup: stressSetup{SQL: []string{
-			"CREATE TABLE acct (id int32 PRIMARY KEY, bal int64)",
+			"CREATE TABLE acct (id i32 PRIMARY KEY, bal i64)",
 			"INSERT INTO acct VALUES (1, 100), (2, 0)",
 		}},
 		Worker: []stressWorker{

@@ -26,10 +26,10 @@ catalog, so any jed can read a file containing it).
 ## 1. Surface
 
 ```sql
-CREATE TYPE addr AS (street text, zip int32)
+CREATE TYPE addr AS (street text, zip i32)
 DROP TYPE [IF EXISTS] addr [RESTRICT]
 
-CREATE TABLE person (id int32 PRIMARY KEY, home addr)
+CREATE TABLE person (id i32 PRIMARY KEY, home addr)
 INSERT INTO person VALUES (1, ROW('Main', 90210))
 SELECT id, (home).zip, home FROM person ORDER BY home
 SELECT * FROM person WHERE home = ROW('Main', 90210)
@@ -147,11 +147,11 @@ null-bitmap  ‖  each PRESENT field's value-codec body, in declaration order
   recurses on the body half (a clean refactor across all three cores + the Ruby reference encoder).
 - A **whole-value-NULL** composite is the lone `0x01` tag, no bitmap.
 
-Worked example, `addr AS (street text, zip int32)`:
+Worked example, `addr AS (street text, zip i32)`:
 
 | value | bytes (body, after the present tag) |
 |---|---|
-| `('Main', 90210)` | `00`(bitmap) `00 04 4D 61 69 6E`(text) `80 01 60 62`(int32 = 90210 + 2³¹, BE) |
+| `('Main', 90210)` | `00`(bitmap) `00 04 4D 61 69 6E`(text) `80 01 60 62`(i32 = 90210 + 2³¹, BE) |
 | `('Main', NULL)` | `40`(bitmap: field 1 NULL) `00 04 4D 61 69 6E`(text) — int field omitted |
 | whole-value NULL | (no body; the value is the lone `0x01` tag) |
 
@@ -309,7 +309,7 @@ byte-identically from live PG (two documented comparison-error-code overrides); 
 composite is a first-class array element type (the recursive codec/comparator/text-I/O composed for
 free; the per-element array comparison routes through the composite *total order*, not 3VL —
 array.md §5). The **mirror** nesting — a composite type with an **array-typed field**
-(`CREATE TYPE poly AS (name text, pts int32[])`) — **landed** ([array.md §12](array.md), capability
+(`CREATE TYPE poly AS (name text, pts i32[])`) — **landed** ([array.md §12](array.md), capability
 `types.composite_array_field`): the composite-type catalog entry gains a `field_type_code = 15`
 array field carrying the inline element descriptor (§3, no `format_version` bump — still 10), and
 the value codec / comparison / `record_out` / `record_in` recurse through the array field for free

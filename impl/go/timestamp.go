@@ -6,16 +6,16 @@ import (
 )
 
 // Timestamp / timestamptz calendar math, parsing, and rendering (spec/design/timestamp.md).
-// Both types are an int64 count of microseconds since the Unix epoch (1970-01-01 00:00:00
+// Both types are an i64 count of microseconds since the Unix epoch (1970-01-01 00:00:00
 // UTC), proleptic Gregorian, no leap seconds. This is a §8 determinism hotspot: the
 // civil↔instant conversion (Hinnant), parse grammar, and render format must be byte-identical
 // across the Rust/Go/TS cores. The civil↔days path uses Go's TRUNCATING `/` paired with the
 // Hinnant -399/-146096 adjustment; the instant↔civil decomposition uses FLOOR div/mod helpers.
 
-// NegInfinity is the -infinity sentinel — the smallest int64, sorts before every finite instant.
+// NegInfinity is the -infinity sentinel — the smallest i64, sorts before every finite instant.
 const NegInfinity int64 = -9223372036854775808
 
-// PosInfinity is the +infinity sentinel — the largest int64, sorts after every finite instant.
+// PosInfinity is the +infinity sentinel — the largest i64, sorts after every finite instant.
 const PosInfinity int64 = 9223372036854775807
 
 const (
@@ -151,15 +151,15 @@ func trimASCIIWS(s string) string {
 	return s[start:end]
 }
 
-// readUint reads one run of ASCII digits at *i as an int64 (checked). Empty run → 22007; a
-// value that overflows int64 → 22008.
+// readUint reads one run of ASCII digits at *i as an i64 (checked). Empty run → 22007; a
+// value that overflows i64 → 22008.
 func readUint(b string, i *int) (int64, error) {
 	start := *i
 	var v int64
 	for *i < len(b) && b[*i] >= '0' && b[*i] <= '9' {
 		d := int64(b[*i] - '0')
 		nv := v*10 + d
-		if nv < v { // int64 overflow
+		if nv < v { // i64 overflow
 			return 0, datetimeFieldOverflow("numeric field too large")
 		}
 		v = nv
@@ -370,7 +370,7 @@ func parseDatetime(input string, applyOffset bool, typeName string) (int64, erro
 	return micros, nil
 }
 
-// mulAdd computes a*b + c with int64 overflow detection.
+// mulAdd computes a*b + c with i64 overflow detection.
 func mulAdd(a, b, c int64) (int64, bool) {
 	p, ok := mul64(a, b)
 	if !ok {

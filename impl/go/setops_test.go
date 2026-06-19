@@ -9,8 +9,8 @@ import "testing"
 func setopAB(t *testing.T) *Database {
 	return dbWith(
 		t,
-		"CREATE TABLE a (id int32 PRIMARY KEY, k int32)",
-		"CREATE TABLE b (id int32 PRIMARY KEY, k int32)",
+		"CREATE TABLE a (id i32 PRIMARY KEY, k i32)",
+		"CREATE TABLE b (id i32 PRIMARY KEY, k i32)",
 		"INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)",
 		"INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)",
 	)

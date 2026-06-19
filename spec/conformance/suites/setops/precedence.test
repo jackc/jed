@@ -2,16 +2,16 @@
 # §25). PostgreSQL precedence: INTERSECT binds TIGHTER than UNION/EXCEPT, which share one level
 # and are LEFT-associative. Type unification folds left to right across a chain (integer widths
 # to the widest; integer with decimal to decimal). Cost = sum of all operand costs (cost.md §3).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.intersect, query.except, query.order_by, types.int16, types.int32, types.int64, types.decimal, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.intersect, query.except, query.order_by, types.i16, types.i32, types.i64, types.decimal, resource.cost_metering
 
 statement ok
-CREATE TABLE p (id int32 PRIMARY KEY, k int32)
+CREATE TABLE p (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE q (id int32 PRIMARY KEY, k int32)
+CREATE TABLE q (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE s (id int32 PRIMARY KEY, k int32)
+CREATE TABLE s (id i32 PRIMARY KEY, k i32)
 
 statement ok
 INSERT INTO p VALUES (1, 1)
@@ -85,13 +85,13 @@ SELECT k FROM q UNION ALL SELECT k FROM s UNION ALL SELECT k FROM p ORDER BY k
 
 # --- chained type unification -----------------------------------------------------------------
 statement ok
-CREATE TABLE ci (id int32 PRIMARY KEY, n int16)
+CREATE TABLE ci (id i32 PRIMARY KEY, n i16)
 
 statement ok
-CREATE TABLE ck (id int32 PRIMARY KEY, n int64)
+CREATE TABLE ck (id i32 PRIMARY KEY, n i64)
 
 statement ok
-CREATE TABLE cd (id int32 PRIMARY KEY, n decimal(10,2))
+CREATE TABLE cd (id i32 PRIMARY KEY, n decimal(10,2))
 
 statement ok
 INSERT INTO ci VALUES (1, 5)
@@ -102,7 +102,7 @@ INSERT INTO ck VALUES (1, 7)
 statement ok
 INSERT INTO cd VALUES (1, 8.25)
 
-# int16 UNION int64 folds to int64 (the widest integer); values stay integers. Output type I.
+# i16 UNION i64 folds to i64 (the widest integer); values stay integers. Output type I.
 # cost = 2 + 2 = 4.
 # names: n
 # cost: 6

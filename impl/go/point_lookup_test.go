@@ -11,7 +11,7 @@ import (
 	"testing"
 )
 
-// bigTable builds a table of n rows (id int32 PRIMARY KEY, v int32; v == id) large enough to span
+// bigTable builds a table of n rows (id i32 PRIMARY KEY, v i32; v == id) large enough to span
 // several B-tree leaves at the default page size.
 func bigTable(t *testing.T, n int) *Database {
 	t.Helper()
@@ -23,7 +23,7 @@ func bigTable(t *testing.T, n int) *Database {
 		}
 		fmt.Fprintf(&b, "(%d,%d)", i, i)
 	}
-	return dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)", b.String())
+	return dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", b.String())
 }
 
 func TestPointLookupMultiLeaf(t *testing.T) {
@@ -151,7 +151,7 @@ func TestLimitShortCircuitMultiLeaf(t *testing.T) {
 	// Trap windowing: streaming projects ONLY the windowed rows (like the eager path), so a later
 	// row that would trap is never reached under a LIMIT that excludes it.
 	dz := dbWith(t,
-		"CREATE TABLE z (id int32 PRIMARY KEY, c int32)",
+		"CREATE TABLE z (id i32 PRIMARY KEY, c i32)",
 		"INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)")
 	if rows := query(t, dz, "SELECT 100 / c FROM z LIMIT 1"); len(rows) != 1 || rows[0][0].Int != 20 {
 		t.Errorf("LIMIT 1 should produce only the safe first row (100/5=20), got %v", rows)

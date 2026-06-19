@@ -22,8 +22,8 @@ test("|| — the three concatenation forms", () => {
     ["SELECT ARRAY[1,2] || 3", "{1,2,3}"],
     ["SELECT 0 || ARRAY[1,2]", "{0,1,2}"],
     ["SELECT ARRAY['a','b'] || 'c'", "{a,b,c}"],
-    ["SELECT '{1,2}'::int32[] || 3", "{1,2,3}"],
-    ["SELECT '{1,2}'::int32[] || ARRAY[7,8]", "{1,2,7,8}"],
+    ["SELECT '{1,2}'::i32[] || 3", "{1,2,3}"],
+    ["SELECT '{1,2}'::i32[] || ARRAY[7,8]", "{1,2,7,8}"],
     ["SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] || ARRAY[5,6]", "{{1,2},{3,4},{5,6}}"],
   ];
   for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
@@ -34,9 +34,9 @@ test("|| — a bare NULL operand resolves to array_cat (identity)", () => {
   const cases: [string, string][] = [
     ["SELECT ARRAY[1,2] || NULL", "{1,2}"],
     ["SELECT NULL || ARRAY[1,2]", "{1,2}"],
-    ["SELECT ARRAY[1,2] || NULL::int64[]", "{1,2}"],
-    ["SELECT ARRAY[1,2] || NULL::int64", "{1,2,NULL}"], // typed null element → array_append
-    ["SELECT NULL::int64[] || NULL::int64[]", "NULL"],
+    ["SELECT ARRAY[1,2] || NULL::i64[]", "{1,2}"],
+    ["SELECT ARRAY[1,2] || NULL::i64", "{1,2,NULL}"], // typed null element → array_append
+    ["SELECT NULL::i64[] || NULL::i64[]", "NULL"],
   ];
   for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
 });
@@ -57,13 +57,13 @@ test("array_remove", () => {
   const db = new Database();
   const cases: [string, string][] = [
     ["SELECT array_remove(ARRAY[1,2,3,2], 2)", "{1,3}"],
-    ["SELECT array_remove(NULL::int32[], 2)", "NULL"],
+    ["SELECT array_remove(NULL::i32[], 2)", "NULL"],
     ["SELECT array_remove(ARRAY[1,2,3], 9)", "{1,2,3}"],
-    ["SELECT array_remove('{}'::int32[], 1)", "{}"],
+    ["SELECT array_remove('{}'::i32[], 1)", "{}"],
     ["SELECT array_remove(ARRAY[1,NULL,2,NULL], NULL)", "{1,2}"],
     ["SELECT array_remove(ARRAY[1,NULL,2], 1)", "{NULL,2}"],
-    ["SELECT array_dims(array_remove('[2:4]={1,2,3}'::int32[], 2))", "[2:3]"],
-    ["SELECT array_remove('[5:7]={9,9,9}'::int32[], 9)", "{}"],
+    ["SELECT array_dims(array_remove('[2:4]={1,2,3}'::i32[], 2))", "[2:3]"],
+    ["SELECT array_remove('[5:7]={9,9,9}'::i32[], 9)", "{}"],
   ];
   for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
   assert.equal(errCode(() => execute(db, "SELECT array_remove(ARRAY[ARRAY[1,2],ARRAY[3,4]], 1)")), "0A000");
@@ -73,12 +73,12 @@ test("array_replace", () => {
   const db = new Database();
   const cases: [string, string][] = [
     ["SELECT array_replace(ARRAY[1,2,3,2], 2, 9)", "{1,9,3,9}"],
-    ["SELECT array_replace(NULL::int32[], 2, 9)", "NULL"],
+    ["SELECT array_replace(NULL::i32[], 2, 9)", "NULL"],
     ["SELECT array_replace(ARRAY[1,2,3], 8, 9)", "{1,2,3}"],
     ["SELECT array_replace(ARRAY[1,2,3], 2, NULL)", "{1,NULL,3}"],
     ["SELECT array_replace(ARRAY[1,NULL,3], NULL, 9)", "{1,9,3}"],
     ["SELECT array_replace(ARRAY[ARRAY[1,2],ARRAY[1,4]], 1, 0)", "{{0,2},{0,4}}"],
-    ["SELECT array_replace('[5:7]={10,20,10}'::int32[], 10, 99)", "[5:7]={99,20,99}"],
+    ["SELECT array_replace('[5:7]={10,20,10}'::i32[], 10, 99)", "[5:7]={99,20,99}"],
   ];
   for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
 });
@@ -88,16 +88,16 @@ test("array_position", () => {
   const cases: [string, string][] = [
     ["SELECT array_position(ARRAY[10,20,30,20], 20)", "2"],
     ["SELECT array_position(ARRAY[10,20], 99)", "NULL"],
-    ["SELECT array_position(NULL::int32[], 5)", "NULL"],
-    ["SELECT array_position('{}'::int32[], 5)", "NULL"],
+    ["SELECT array_position(NULL::i32[], 5)", "NULL"],
+    ["SELECT array_position('{}'::i32[], 5)", "NULL"],
     ["SELECT array_position(ARRAY[1,NULL,3], NULL)", "2"],
     ["SELECT array_position(ARRAY[10,20,30,20], 20, 3)", "4"],
     ["SELECT array_position(ARRAY[10,20,30], 20, 3)", "NULL"],
-    ["SELECT array_position('[5:7]={10,20,30}'::int32[], 20)", "6"],
-    ["SELECT array_position('[5:8]={10,20,30,20}'::int32[], 20, 7)", "8"],
+    ["SELECT array_position('[5:7]={10,20,30}'::i32[], 20)", "6"],
+    ["SELECT array_position('[5:8]={10,20,30,20}'::i32[], 20, 7)", "8"],
   ];
   for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
-  assert.equal(errCode(() => execute(db, "SELECT array_position(ARRAY[10,20,30], 20, NULL::int32)")), "22004");
+  assert.equal(errCode(() => execute(db, "SELECT array_position(ARRAY[10,20,30], 20, NULL::i32)")), "22004");
   assert.equal(errCode(() => execute(db, "SELECT array_position(ARRAY[ARRAY[1,2],ARRAY[3,4]], 1)")), "0A000");
 });
 
@@ -106,9 +106,9 @@ test("array_positions", () => {
   const cases: [string, string][] = [
     ["SELECT array_positions(ARRAY[10,20,30,20], 20)", "{2,4}"],
     ["SELECT array_positions(ARRAY[10,20], 99)", "{}"],
-    ["SELECT array_positions(NULL::int32[], 5)", "NULL"],
+    ["SELECT array_positions(NULL::i32[], 5)", "NULL"],
     ["SELECT array_positions(ARRAY[1,NULL,3,NULL], NULL)", "{2,4}"],
-    ["SELECT array_positions('[5:8]={10,20,30,20}'::int32[], 20)", "{6,8}"],
+    ["SELECT array_positions('[5:8]={10,20,30,20}'::i32[], 20)", "{6,8}"],
   ];
   for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
   assert.equal(errCode(() => execute(db, "SELECT array_positions(ARRAY[ARRAY[1,2],ARRAY[3,4]], 1)")), "0A000");

@@ -882,7 +882,7 @@ func LoadDatabase(image []byte) (*Database, error) {
 				}
 				store := snap.stores[strings.ToLower(name)]
 				store.setTree(root, length)
-				// No-PK keys are synthetic int64 rowids — advance the counter past the largest (the
+				// No-PK keys are synthetic i64 rowids — advance the counter past the largest (the
 				// last entry in key order) so future inserts don't collide. In-memory load (nil
 				// source) never faults, so the error is inert.
 				if !hasPK && length > 0 {
@@ -2986,7 +2986,7 @@ func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
 		bits := uint32(vb[0])<<24 | uint32(vb[1])<<16 | uint32(vb[2])<<8 | uint32(vb[3])
 		return Value{Kind: ValFloat32, Int: int64(bits)}, nil
 	case ty.IsDate():
-		// 4-byte int32 day count, same order-preserving codec as int32 (spec/design/date.md).
+		// 4-byte i32 day count, same order-preserving codec as i32 (spec/design/date.md).
 		vb, err := take(buf, pos, ty.WidthBytes())
 		if err != nil {
 			return Value{}, err

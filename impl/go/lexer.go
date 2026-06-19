@@ -259,8 +259,8 @@ func Lex(sql string) ([]Token, error) {
 				tokens = append(tokens, Token{Kind: TokDecimal, Word: digits, Int: uint64(scale)})
 			} else {
 				// Integer literal: an unsigned magnitude. The sign is TokMinus. The magnitude
-				// must be <= 2^63 so that -(2^63) = int64's minimum is reachable; anything
-				// larger cannot be represented (42601). int64 cannot hold 2^63, so carry it
+				// must be <= 2^63 so that -(2^63) = i64's minimum is reachable; anything
+				// larger cannot be represented (42601). i64 cannot hold 2^63, so carry it
 				// unsigned and let the parser convert.
 				text := intPart
 				n, err := strconv.ParseUint(text, 10, 64)

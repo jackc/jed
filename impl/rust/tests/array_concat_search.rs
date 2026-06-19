@@ -33,10 +33,10 @@ fn concat_three_forms() {
     assert_eq!(val(&mut db, "SELECT 0 || ARRAY[1,2]"), "{0,1,2}");
     // text[] flows through the polymorphic operator too.
     assert_eq!(val(&mut db, "SELECT ARRAY['a','b'] || 'c'"), "{a,b,c}");
-    // The literal element / untyped constructor adapts to a narrower element type (int32[]).
-    assert_eq!(val(&mut db, "SELECT '{1,2}'::int32[] || 3"), "{1,2,3}");
+    // The literal element / untyped constructor adapts to a narrower element type (i32[]).
+    assert_eq!(val(&mut db, "SELECT '{1,2}'::i32[] || 3"), "{1,2,3}");
     assert_eq!(
-        val(&mut db, "SELECT '{1,2}'::int32[] || ARRAY[7,8]"),
+        val(&mut db, "SELECT '{1,2}'::i32[] || ARRAY[7,8]"),
         "{1,2,7,8}"
     );
     // 2-D || 1-D stacks a row (array_cat along the outer dimension).
@@ -53,17 +53,11 @@ fn concat_null_prefers_cat() {
     assert_eq!(val(&mut db, "SELECT ARRAY[1,2] || NULL"), "{1,2}");
     assert_eq!(val(&mut db, "SELECT NULL || ARRAY[1,2]"), "{1,2}");
     // A TYPED null array is likewise the cat identity.
-    assert_eq!(val(&mut db, "SELECT ARRAY[1,2] || NULL::int64[]"), "{1,2}");
+    assert_eq!(val(&mut db, "SELECT ARRAY[1,2] || NULL::i64[]"), "{1,2}");
     // A TYPED null ELEMENT instead resolves to array_append — appended as a real NULL element.
-    assert_eq!(
-        val(&mut db, "SELECT ARRAY[1,2] || NULL::int64"),
-        "{1,2,NULL}"
-    );
+    assert_eq!(val(&mut db, "SELECT ARRAY[1,2] || NULL::i64"), "{1,2,NULL}");
     // Both NULL arrays → NULL.
-    assert_eq!(
-        val(&mut db, "SELECT NULL::int64[] || NULL::int64[]"),
-        "NULL"
-    );
+    assert_eq!(val(&mut db, "SELECT NULL::i64[] || NULL::i64[]"), "NULL");
 }
 
 #[test]
@@ -93,15 +87,12 @@ fn array_remove_kernel() {
         "{1,3}"
     );
     // NULL array → NULL; not found → unchanged; empty → empty.
-    assert_eq!(
-        val(&mut db, "SELECT array_remove(NULL::int32[], 2)"),
-        "NULL"
-    );
+    assert_eq!(val(&mut db, "SELECT array_remove(NULL::i32[], 2)"), "NULL");
     assert_eq!(
         val(&mut db, "SELECT array_remove(ARRAY[1,2,3], 9)"),
         "{1,2,3}"
     );
-    assert_eq!(val(&mut db, "SELECT array_remove('{}'::int32[], 1)"), "{}");
+    assert_eq!(val(&mut db, "SELECT array_remove('{}'::i32[], 1)"), "{}");
     // NULL-safe: removing NULL drops NULL elements; removing a value keeps NULLs.
     assert_eq!(
         val(&mut db, "SELECT array_remove(ARRAY[1,NULL,2,NULL], NULL)"),
@@ -115,13 +106,13 @@ fn array_remove_kernel() {
     assert_eq!(
         val(
             &mut db,
-            "SELECT array_dims(array_remove('[2:4]={1,2,3}'::int32[], 2))"
+            "SELECT array_dims(array_remove('[2:4]={1,2,3}'::i32[], 2))"
         ),
         "[2:3]"
     );
     // All removed → the empty array.
     assert_eq!(
-        val(&mut db, "SELECT array_remove('[5:7]={9,9,9}'::int32[], 9)"),
+        val(&mut db, "SELECT array_remove('[5:7]={9,9,9}'::i32[], 9)"),
         "{}"
     );
     // Multidimensional → 0A000.
@@ -142,7 +133,7 @@ fn array_replace_kernel() {
         "{1,9,3,9}"
     );
     assert_eq!(
-        val(&mut db, "SELECT array_replace(NULL::int32[], 2, 9)"),
+        val(&mut db, "SELECT array_replace(NULL::i32[], 2, 9)"),
         "NULL"
     );
     assert_eq!(
@@ -170,7 +161,7 @@ fn array_replace_kernel() {
     assert_eq!(
         val(
             &mut db,
-            "SELECT array_replace('[5:7]={10,20,10}'::int32[], 10, 99)"
+            "SELECT array_replace('[5:7]={10,20,10}'::i32[], 10, 99)"
         ),
         "[5:7]={99,20,99}"
     );
@@ -188,11 +179,11 @@ fn array_position_kernel() {
         "NULL"
     );
     assert_eq!(
-        val(&mut db, "SELECT array_position(NULL::int32[], 5)"),
+        val(&mut db, "SELECT array_position(NULL::i32[], 5)"),
         "NULL"
     );
     assert_eq!(
-        val(&mut db, "SELECT array_position('{}'::int32[], 5)"),
+        val(&mut db, "SELECT array_position('{}'::i32[], 5)"),
         "NULL"
     );
     // NULL-safe: finds a NULL element.
@@ -213,14 +204,14 @@ fn array_position_kernel() {
     assert_eq!(
         val(
             &mut db,
-            "SELECT array_position('[5:7]={10,20,30}'::int32[], 20)"
+            "SELECT array_position('[5:7]={10,20,30}'::i32[], 20)"
         ),
         "6"
     );
     assert_eq!(
         val(
             &mut db,
-            "SELECT array_position('[5:8]={10,20,30,20}'::int32[], 20, 7)"
+            "SELECT array_position('[5:8]={10,20,30,20}'::i32[], 20, 7)"
         ),
         "8"
     );
@@ -228,7 +219,7 @@ fn array_position_kernel() {
     assert_eq!(
         err(
             &mut db,
-            "SELECT array_position(ARRAY[10,20,30], 20, NULL::int32)"
+            "SELECT array_position(ARRAY[10,20,30], 20, NULL::i32)"
         ),
         "22004"
     );
@@ -254,7 +245,7 @@ fn array_positions_kernel() {
         "{}"
     );
     assert_eq!(
-        val(&mut db, "SELECT array_positions(NULL::int32[], 5)"),
+        val(&mut db, "SELECT array_positions(NULL::i32[], 5)"),
         "NULL"
     );
     // NULL-safe: every NULL element's subscript.
@@ -269,7 +260,7 @@ fn array_positions_kernel() {
     assert_eq!(
         val(
             &mut db,
-            "SELECT array_positions('[5:8]={10,20,30,20}'::int32[], 20)"
+            "SELECT array_positions('[5:8]={10,20,30,20}'::i32[], 20)"
         ),
         "{6,8}"
     );

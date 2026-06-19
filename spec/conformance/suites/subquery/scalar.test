@@ -4,16 +4,16 @@
 # NULL, and the per-row evaluator is untouched. A >1-row result is 21000 and a >1-column result is
 # 42601 (see errors.test). Cost = the enclosing query's cost PLUS the subquery's cost counted once;
 # the folded constant is a leaf (no operator_eval). Verified against the live PostgreSQL 18 oracle.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.aggregates, expr.arithmetic, query.subquery_scalar, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.aggregates, expr.arithmetic, query.subquery_scalar, types.i32, resource.cost_metering
 
 statement ok
-CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+CREATE TABLE b (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE one (id int32 PRIMARY KEY)
+CREATE TABLE one (id i32 PRIMARY KEY)
 
 statement ok
 INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)
@@ -69,7 +69,7 @@ SELECT (SELECT (SELECT max(k) FROM b) FROM one) FROM one
 ----
 40
 
-# A scalar subquery compared with a column promotes by type (int32 column vs the subquery's value).
+# A scalar subquery compared with a column promotes by type (i32 column vs the subquery's value).
 query I nosort
 SELECT id FROM a WHERE k = (SELECT min(k) FROM b) ORDER BY id
 ----

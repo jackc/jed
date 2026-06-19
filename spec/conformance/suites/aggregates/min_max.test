@@ -2,15 +2,15 @@
 # aggregates.md §2/§3). Ordering follows the family's compare rule (integers numeric, text
 # C-collation, boolean false<true). NULL inputs are skipped; an empty/all-NULL group -> NULL.
 # Output names `min` / `max`.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.int32, types.text, types.boolean_storable, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.i32, types.text, types.boolean_storable, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32, s text)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, s text)
 
 statement ok
 INSERT INTO t VALUES (1, 10, 'banana'), (2, NULL, 'apple'), (3, 30, 'cherry')
 
-# MIN/MAX over int32 skip the NULL row. Result type is int32 (I tag).
+# MIN/MAX over i32 skip the NULL row. Result type is i32 (I tag).
 # names: min
 # cost: 8
 query I nosort
@@ -43,7 +43,7 @@ cherry
 
 # MIN/MAX over boolean: false < true.
 statement ok
-CREATE TABLE tb (id int32 PRIMARY KEY, f boolean)
+CREATE TABLE tb (id i32 PRIMARY KEY, f boolean)
 
 statement ok
 INSERT INTO tb VALUES (1, TRUE), (2, FALSE), (3, NULL)
@@ -57,7 +57,7 @@ true
 
 # All-NULL group: MIN/MAX -> NULL (a single row).
 statement ok
-CREATE TABLE tnull (id int32 PRIMARY KEY, a int32)
+CREATE TABLE tnull (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO tnull VALUES (1, NULL), (2, NULL)
@@ -71,7 +71,7 @@ NULL
 
 # Empty table: MIN/MAX -> NULL as ONE row.
 statement ok
-CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+CREATE TABLE e (id i32 PRIMARY KEY, a i32)
 
 # names: min
 query I nosort

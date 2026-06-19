@@ -37,8 +37,8 @@ fn fk_names(db: &Database, table: &str) -> Vec<String> {
 #[test]
 fn naming_and_catalog_order() {
     let db = db_with(&[
-        "CREATE TABLE p (a int32, b int32, code int32 UNIQUE, PRIMARY KEY (a, b))",
-        "CREATE TABLE c (id int32 PRIMARY KEY, pa int32, pb int32, pcode int32, \
+        "CREATE TABLE p (a i32, b i32, code i32 UNIQUE, PRIMARY KEY (a, b))",
+        "CREATE TABLE c (id i32 PRIMARY KEY, pa i32, pb i32, pcode i32, \
          CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), \
          FOREIGN KEY (pa, pb) REFERENCES p (a, b))",
     ]);
@@ -47,62 +47,62 @@ fn naming_and_catalog_order() {
 
     // A duplicate auto-name walks the suffix (two FKs on the same column).
     let db2 = db_with(&[
-        "CREATE TABLE q (id int32 PRIMARY KEY)",
-        "CREATE TABLE r (id int32 PRIMARY KEY, x int32 REFERENCES q, FOREIGN KEY (x) REFERENCES q (id))",
+        "CREATE TABLE q (id i32 PRIMARY KEY)",
+        "CREATE TABLE r (id i32 PRIMARY KEY, x i32 REFERENCES q, FOREIGN KEY (x) REFERENCES q (id))",
     ]);
     assert_eq!(fk_names(&db2, "r"), vec!["r_x_fkey", "r_x_fkey1"]);
 }
 
 /// jed is STRICTER than PostgreSQL on type pairing: corresponding columns must be the SAME scalar
-/// type (42804), where PG allows any comparable pair (e.g. int32 ↔ int64). A documented divergence
+/// type (42804), where PG allows any comparable pair (e.g. i32 ↔ i64). A documented divergence
 /// (spec/design/constraints.md §6.7).
 #[test]
 fn strict_same_type_pairing() {
-    let mut db = db_with(&["CREATE TABLE p (id int32 PRIMARY KEY)"]);
-    // int64 referencing an int32 PK — jed rejects (PG would allow).
+    let mut db = db_with(&["CREATE TABLE p (id i32 PRIMARY KEY)"]);
+    // i64 referencing an i32 PK — jed rejects (PG would allow).
     assert_eq!(
-        err(&mut db, "CREATE TABLE c1 (x int64 REFERENCES p)"),
+        err(&mut db, "CREATE TABLE c1 (x i64 REFERENCES p)"),
         "42804"
     );
-    // text referencing an int32 PK — both jed and PG reject 42804 (sanity).
+    // text referencing an i32 PK — both jed and PG reject 42804 (sanity).
     assert_eq!(
         err(&mut db, "CREATE TABLE c2 (x text REFERENCES p)"),
         "42804"
     );
     // The same type is accepted.
-    execute(&mut db, "CREATE TABLE c3 (x int32 REFERENCES p)").unwrap();
+    execute(&mut db, "CREATE TABLE c3 (x i32 REFERENCES p)").unwrap();
 }
 
 /// The referential actions CASCADE / SET NULL / SET DEFAULT parse but are rejected at CREATE TABLE
 /// (0A000); NO ACTION and RESTRICT are accepted (spec/design/constraints.md §6.6).
 #[test]
 fn referential_actions_narrowed() {
-    let mut db = db_with(&["CREATE TABLE p (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE p (id i32 PRIMARY KEY)"]);
     assert_eq!(
         err(
             &mut db,
-            "CREATE TABLE c1 (x int32 REFERENCES p ON DELETE CASCADE)"
+            "CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)"
         ),
         "0A000"
     );
     assert_eq!(
         err(
             &mut db,
-            "CREATE TABLE c2 (x int32 REFERENCES p ON UPDATE SET NULL)"
+            "CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)"
         ),
         "0A000"
     );
     assert_eq!(
         err(
             &mut db,
-            "CREATE TABLE c3 (x int32 REFERENCES p ON DELETE SET DEFAULT)"
+            "CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)"
         ),
         "0A000"
     );
     // NO ACTION / RESTRICT (and the default) are fine.
     execute(
         &mut db,
-        "CREATE TABLE c4 (x int32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)",
+        "CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)",
     )
     .unwrap();
 }
@@ -114,9 +114,9 @@ fn referential_actions_narrowed() {
 #[test]
 fn parent_update_end_state_swap_allowed() {
     let mut db = db_with(&[
-        "CREATE TABLE p (id int32 PRIMARY KEY, code int32 UNIQUE)",
+        "CREATE TABLE p (id i32 PRIMARY KEY, code i32 UNIQUE)",
         "INSERT INTO p VALUES (1, 100), (2, 200)",
-        "CREATE TABLE c (id int32 PRIMARY KEY, pc int32 REFERENCES p (code))",
+        "CREATE TABLE c (id i32 PRIMARY KEY, pc i32 REFERENCES p (code))",
         "INSERT INTO c VALUES (10, 100), (11, 200)",
     ]);
     // Swap 100 ⇄ 200 across the two parent rows: the end state still contains {100, 200}, so both

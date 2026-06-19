@@ -25,7 +25,7 @@ func compositeErrCode(t *testing.T, db *Database, sql string) string {
 // tuple's lexicographic order (the concatenated key — first component, then the second
 // breaking its ties), independent of insertion order.
 func TestCompositeKeyOrdersByTuple(t *testing.T) {
-	db := dbWith(t, "CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))")
+	db := dbWith(t, "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))")
 	tab, _ := db.Table("t")
 	if got := tab.PKIndices(); !slices.Equal(got, []int{0, 1}) {
 		t.Fatalf("PKIndices = %v, want [0 1]", got)
@@ -72,7 +72,7 @@ func TestCompositeKeyOrdersByTuple(t *testing.T) {
 func TestCompositeUniquenessIsTheWholeTuple(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE t (a int32, b int32, PRIMARY KEY (a, b))",
+		"CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, b))",
 		"INSERT INTO t VALUES (1, 1)",
 	)
 	if _, err := Execute(db, "INSERT INTO t VALUES (1, 2)"); err != nil {
@@ -98,14 +98,14 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	cases := []struct {
 		sql, want string
 	}{
-		{"CREATE TABLE t (a int32, PRIMARY KEY (a, nosuch))", "42703"},
-		{"CREATE TABLE t (a int32, b int32, PRIMARY KEY (a, a))", "42701"},
-		{"CREATE TABLE t (a int32 PRIMARY KEY, b int32, PRIMARY KEY (b))", "42P16"},
-		{"CREATE TABLE t (a int32, b int32, PRIMARY KEY (a), PRIMARY KEY (b))", "42P16"},
+		{"CREATE TABLE t (a i32, PRIMARY KEY (a, nosuch))", "42703"},
+		{"CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, a))", "42701"},
+		{"CREATE TABLE t (a i32 PRIMARY KEY, b i32, PRIMARY KEY (b))", "42P16"},
+		{"CREATE TABLE t (a i32, b i32, PRIMARY KEY (a), PRIMARY KEY (b))", "42P16"},
 		// 42P16 fires BEFORE the second constraint's members resolve (PostgreSQL's order).
-		{"CREATE TABLE t (a int32 PRIMARY KEY, PRIMARY KEY (nosuch))", "42P16"},
+		{"CREATE TABLE t (a i32 PRIMARY KEY, PRIMARY KEY (nosuch))", "42P16"},
 		// Narrowing: every member must be key-encodable (text is not, types.md §11).
-		{"CREATE TABLE t (a int32, s text, PRIMARY KEY (a, s))", "0A000"},
+		{"CREATE TABLE t (a i32, s text, PRIMARY KEY (a, s))", "0A000"},
 	}
 	for _, c := range cases {
 		if code := compositeErrCode(t, db, c.sql); code != c.want {
@@ -115,7 +115,7 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	// The list order is the KEY order — it may differ from declaration order (the original
 	// 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
 	// keys by (b, a), so the stored scan order is b-major.
-	if _, err := Execute(db, "CREATE TABLE rev (a int32, b int32, PRIMARY KEY (b, a))"); err != nil {
+	if _, err := Execute(db, "CREATE TABLE rev (a i32, b i32, PRIMARY KEY (b, a))"); err != nil {
 		t.Fatalf("out-of-declaration-order PK: %v", err)
 	}
 	if revTab, _ := db.Table("rev"); !slices.Equal(revTab.PKIndices(), []int{1, 0}) {
@@ -133,7 +133,7 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 	}
 
 	// A single-column table constraint is the column-level form's equivalent.
-	if _, err := Execute(db, "CREATE TABLE ok (a int32, PRIMARY KEY (a))"); err != nil {
+	if _, err := Execute(db, "CREATE TABLE ok (a i32, PRIMARY KEY (a))"); err != nil {
 		t.Fatalf("single-column table constraint: %v", err)
 	}
 	tab, _ := db.Table("ok")
@@ -147,7 +147,7 @@ func TestCompositeDDLErrorsMatchPostgresAndNarrowings(t *testing.T) {
 func TestCompositeMembersNotNullAndUpdateGuarded(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))",
+		"CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
 		"INSERT INTO t VALUES (1, 1, 10)",
 	)
 	if code := compositeErrCode(t, db, "INSERT INTO t VALUES (1, NULL, 5)"); code != "23502" {
@@ -167,10 +167,10 @@ func TestCompositeMembersNotNullAndUpdateGuarded(t *testing.T) {
 	}
 }
 
-// Mixed fixed-width components (uuid first, int32 second) concatenate per encoding.md
+// Mixed fixed-width components (uuid first, i32 second) concatenate per encoding.md
 // §2.3 and iterate in tuple order — uuid bytes compare first, the int breaks ties.
 func TestCompositeMixedUuidIntComponentsOrder(t *testing.T) {
-	db := dbWith(t, "CREATE TABLE t (u uuid, n int32, PRIMARY KEY (u, n))")
+	db := dbWith(t, "CREATE TABLE t (u uuid, n i32, PRIMARY KEY (u, n))")
 	for _, stmt := range []string{
 		"INSERT INTO t VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', -5)",
 		"INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', 7)",
@@ -196,7 +196,7 @@ func TestCompositeMixedUuidIntComponentsOrder(t *testing.T) {
 func TestCompositeRoundTripsThroughTheOnDiskImage(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))",
+		"CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
 		"INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
 	)
 	image, err := db.ToImage(256, 1)

@@ -10,7 +10,7 @@ import { dbWith, errCode, query } from "./util.ts";
 
 function setup(): Database {
   return dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, v int32, s text)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)",
     "INSERT INTO t VALUES (1, 10, '--x /*y*/')",
   ]);
 }

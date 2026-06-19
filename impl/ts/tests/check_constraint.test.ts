@@ -109,7 +109,7 @@ test("DDL errors match PostgreSQL", () => {
   // CHECK () is a syntax error.
   assert.equal(errCode(() => execute(db, "CREATE TABLE x (a int, CHECK ())")), "42601");
   // Columns may be NAMED check / constraint (the keywords stay non-reserved).
-  execute(db, "CREATE TABLE odd (check int, constraint int16)");
+  execute(db, "CREATE TABLE odd (check int, constraint i16)");
   execute(db, "INSERT INTO odd VALUES (1, 2)");
 });
 

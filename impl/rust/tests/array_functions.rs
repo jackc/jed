@@ -29,15 +29,15 @@ fn val(db: &mut Database, sql: &str) -> String {
 fn introspection_custom_lower_bound_and_multidim() {
     let mut db = Database::new();
     assert_eq!(
-        val(&mut db, "SELECT array_lower('[2:4]={7,8,9}'::int32[], 1)"),
+        val(&mut db, "SELECT array_lower('[2:4]={7,8,9}'::i32[], 1)"),
         "2"
     );
     assert_eq!(
-        val(&mut db, "SELECT array_upper('[2:4]={7,8,9}'::int32[], 1)"),
+        val(&mut db, "SELECT array_upper('[2:4]={7,8,9}'::i32[], 1)"),
         "4"
     );
     assert_eq!(
-        val(&mut db, "SELECT array_dims('[2:4]={7,8,9}'::int32[])"),
+        val(&mut db, "SELECT array_dims('[2:4]={7,8,9}'::i32[])"),
         "[2:4]"
     );
     let two_d = "ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]]";
@@ -100,7 +100,7 @@ fn error_cases() {
 #[test]
 fn result_types_polymorphic() {
     let mut db = Database::new();
-    // text[] flows through the builders; introspection returns int32/text regardless of element.
+    // text[] flows through the builders; introspection returns i32/text regardless of element.
     assert_eq!(
         val(&mut db, "SELECT array_append(ARRAY['a','b'], 'c')"),
         "{a,b,c}"

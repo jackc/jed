@@ -58,7 +58,7 @@ reason = "jed: scale > precision is an invalid typmod (22023). PG 18 accepts num
 
 [[override]]
 file = "types/decimal.test"
-sql = "CREATE TABLE bad4 (x int32(5))"
+sql = "CREATE TABLE bad4 (x i32(5))"
 reason = "jed: a type modifier on a non-decimal type is unsupported this slice (0A000). PG rejects `integer(5)` as a syntax error (42601) — both reject, different code/class."
 
 [[override]]
@@ -108,12 +108,12 @@ reason = "jed: assigning any primary-key member is the documented 0A000 narrowin
 
 [[override]]
 file = "ddl/composite_pk.test"
-sql = "CREATE TABLE e6 (a int32, s text, PRIMARY KEY (a, s))"
+sql = "CREATE TABLE e6 (a i32, s text, PRIMARY KEY (a, s))"
 reason = "jed: a text primary-key member is the same documented 0A000 narrowing as a single-column text PRIMARY KEY (types.md §11 — the text key encoding is authored but unexercised). PG allows text key columns."
 
 [[override]]
 file = "ddl/check.test"
-sql = "CREATE TABLE odd (check int, constraint int16)"
+sql = "CREATE TABLE odd (check int, constraint i16)"
 reason = "jed: the constraint keywords (check, constraint) are NOT reserved — a column may carry those names, distinguished positionally (constraints.md intro, grammar.md §3/§29). They are fully reserved words in PostgreSQL, which raises a 42601 syntax error here."
 
 [[override]]
@@ -128,7 +128,7 @@ reason = "jed: a text index key column is rejected this slice (0A000), the same 
 
 [[override]]
 file = "ddl/create_index.test"
-sql = "CREATE TABLE on (x int32)"
+sql = "CREATE TABLE on (x i32)"
 reason = "jed keeps every word non-reserved (grammar.md §30): `on` is a legal table name. PG reserves ON (42601). The whole `on` block sits LAST in the file so the PG-failing ok does not poison the oracle replay prefix."
 
 [[override]]
@@ -148,7 +148,7 @@ reason = "Follows the PG-unparseable `on` block (PG reserves ON; 25P02 in the po
 
 [[override]]
 file = "ddl/create_index.test"
-sql = "CREATE TABLE q (x int32)"
+sql = "CREATE TABLE q (x i32)"
 reason = "Inside the PG-poisoned tail of the `on` block (25P02 in the replay prefix); plain SQL otherwise."
 
 [[override]]
@@ -163,7 +163,7 @@ reason = "jed: dropping the index named `on`. PG reserves ON (42601)."
 
 [[override]]
 file = "ddl/unique.test"
-sql = "CREATE TABLE e6 (a int32, s text UNIQUE)"
+sql = "CREATE TABLE e6 (a i32, s text UNIQUE)"
 reason = "jed: a text UNIQUE member is rejected this slice (0A000), the same documented narrowing as a text PRIMARY KEY / index key column (constraints.md §5.1, indexes.md §1). PG allows text unique columns."
 
 [[override]]
@@ -260,23 +260,23 @@ file = "types/timestamptz.test"
 sql = "INSERT INTO t VALUES (10, '2024-01-01 12:00:00+99')"
 reason = "jed: a +99 zone offset is out of range, reported as 22008. PostgreSQL reports the same rejection under 22009 (invalid_time_zone_displacement_value). Both reject; the SQLSTATE subcode differs."
 
-# --- float64 / float32 (spec/design/float.md). jed's float behavior tracks PG's float8/float4 on
+# --- f64 / f32 (spec/design/float.md). jed's float behavior tracks PG's float8/float4 on
 # nearly everything (the total order — NaN largest, NaN = NaN, -0 = +0; div-by-zero 22012; finite
 # overflow 22003; NaN→int 22003), so most float.test records regenerate byte-identically from the
 # oracle and need NO entry. These three are the deliberate divergences:
 [[override]]
 file = "types/float.test"
-sql = "SELECT CAST(float64 '2.5' AS int32)"
+sql = "SELECT CAST(f64 '2.5' AS i32)"
 reason = "jed: float→int rounds HALF AWAY FROM ZERO (2.5 → 3) — jed's single engine-wide rounding mode, no float in the value path (float.md §5, decimal.md §3). PostgreSQL's float8→int4 cast applies rint() (round half to EVEN), so 2.5 → 2. A documented divergence on the cast's rounding mode (same half-away vs half-even split as the decimal casts)."
 
 [[override]]
 file = "types/float.test"
 sql = "SELECT id FROM t WHERE id = d"
-reason = "jed: int64 vs float64 is not comparable (42804) — the strict type system requires an explicit cast across the int/float families (no implicit int→float promotion; float.md §2/§11). PostgreSQL implicitly coerces the bigint to double precision and compares, returning an (empty) result with no error."
+reason = "jed: i64 vs f64 is not comparable (42804) — the strict type system requires an explicit cast across the int/float families (no implicit int→float promotion; float.md §2/§11). PostgreSQL implicitly coerces the bigint to double precision and compares, returning an (empty) result with no error."
 
 [[override]]
 file = "types/float.test"
-sql = "CREATE TABLE bad (k float64 PRIMARY KEY)"
+sql = "CREATE TABLE bad (k f64 PRIMARY KEY)"
 reason = "jed: a float PRIMARY KEY is rejected this slice (0A000), the documented narrowing every non-integer type takes — the float-order-preserving key encoding is authored but unexercised (float.md §10, encoding.md §2.8). PostgreSQL allows a double precision primary key."
 
 # --- composite types: a composite PRIMARY KEY is rejected this slice (composite.md §6). The
@@ -341,23 +341,23 @@ reason = "jed: sqrt takes the float family with arg_resolution = none (catalog),
 # its committed answer; this is a documented surface extension, not a behavior divergence.
 [[override]]
 file = "expr/float_arithmetic.test"
-sql = "SELECT 7.5::float64 % 2.0::float64"
-reason = "jed extension: `%` over float64 is IEEE fmod (float.md §4), 7.5 fmod 2.0 = 1.5. PostgreSQL has no `%` operator for double precision (mod() is numeric/int only), so PG cannot plan the query. jed keeps its committed row."
+sql = "SELECT 7.5::f64 % 2.0::f64"
+reason = "jed extension: `%` over f64 is IEEE fmod (float.md §4), 7.5 fmod 2.0 = 1.5. PostgreSQL has no `%` operator for double precision (mod() is numeric/int only), so PG cannot plan the query. jed keeps its committed row."
 
 [[override]]
 file = "expr/float_arithmetic.test"
-sql = "SELECT 7.5::float32 % 2.0::float32"
-reason = "jed extension: `%` over float32 is IEEE fmod (float.md §4), 7.5 fmod 2.0 = 1.5. PostgreSQL has no `%` operator for real, so PG cannot plan the query. jed keeps its committed row."
+sql = "SELECT 7.5::f32 % 2.0::f32"
+reason = "jed extension: `%` over f32 is IEEE fmod (float.md §4), 7.5 fmod 2.0 = 1.5. PostgreSQL has no `%` operator for real, so PG cannot plan the query. jed keeps its committed row."
 
 [[override]]
 file = "expr/float_arithmetic.test"
-sql = "SELECT 1.0::float64 % 0.0::float64"
-reason = "jed: `%` over float64 (IEEE fmod) traps 22012 on a finite-numerator zero divisor, like `/` (float.md §4). PostgreSQL has no float8 `%` operator, so it raises 42883 (operator does not exist) at parse, never reaching a zero-divisor check. A surface extension, not a behavior divergence."
+sql = "SELECT 1.0::f64 % 0.0::f64"
+reason = "jed: `%` over f64 (IEEE fmod) traps 22012 on a finite-numerator zero divisor, like `/` (float.md §4). PostgreSQL has no float8 `%` operator, so it raises 42883 (operator does not exist) at parse, never reaching a zero-divisor check. A surface extension, not a behavior divergence."
 
 [[override]]
 file = "expr/float_arithmetic.test"
-sql = "SELECT 1.0::float32 % 0.0::float32"
-reason = "jed: `%` over float32 (IEEE fmod) traps 22012 on a finite-numerator zero divisor, like `/` (float.md §4). PostgreSQL has no real `%` operator, so it raises 42883 (operator does not exist) at parse. A surface extension, not a behavior divergence."
+sql = "SELECT 1.0::f32 % 0.0::f32"
+reason = "jed: `%` over f32 (IEEE fmod) traps 22012 on a finite-numerator zero divisor, like `/` (float.md §4). PostgreSQL has no real `%` operator, so it raises 42883 (operator does not exist) at parse. A surface extension, not a behavior divergence."
 
 # --- float round() ties: jed rounds half-AWAY-from-zero (one deterministic mode engine-wide,
 # decimal.md §3 / CLAUDE.md §8), so round(2.5) = 3. PostgreSQL's float8 round uses the C library
@@ -367,16 +367,16 @@ reason = "jed: `%` over float32 (IEEE fmod) traps 22012 on a finite-numerator ze
 [[override]]
 file = "expr/float_math.test"
 sql = "SELECT round(x) FROM f WHERE id = 10"
-reason = "jed: float round() is half-away-from-zero (the engine-wide deterministic rounding mode, decimal.md §3), so round(2.5::float64) = 3. PostgreSQL's double-precision round is the platform rint() (half-to-even) and returns 2 — nondeterministic across platforms, which jed deliberately avoids for cross-core determinism (CLAUDE.md §8/§10)."
+reason = "jed: float round() is half-away-from-zero (the engine-wide deterministic rounding mode, decimal.md §3), so round(2.5::f64) = 3. PostgreSQL's double-precision round is the platform rint() (half-to-even) and returns 2 — nondeterministic across platforms, which jed deliberately avoids for cross-core determinism (CLAUDE.md §8/§10)."
 
-# --- round(float64, n): jed defines a 2-argument round over the float family (catalog
-# round/2, result float64). PostgreSQL's 2-arg round is numeric-only — there is no
+# --- round(f64, n): jed defines a 2-argument round over the float family (catalog
+# round/2, result f64). PostgreSQL's 2-arg round is numeric-only — there is no
 # round(double precision, integer) — so PG cannot resolve this call. A deliberate jed surface
 # extension (the float-math family, float_math.test); the 1-arg float round is PG-comparable.
 [[override]]
 file = "expr/float_math.test"
 sql = "SELECT round(x, 1) FROM f WHERE id = 6"
-reason = "jed extension: a 2-argument round() over float64 (catalog round/2, result float64). PostgreSQL's 2-arg round is numeric-only (no round(double precision, integer)), so PG has no such overload. jed returns 1.5."
+reason = "jed extension: a 2-argument round() over f64 (catalog round/2, result f64). PostgreSQL's 2-arg round is numeric-only (no round(double precision, integer)), so PG has no such overload. jed returns 1.5."
 
 # --- float domain-error codes: jed has a single numeric range/domain trap, 22003 (the registry
 # defines no granular 2201E/2201F), so every float math domain error collapses to 22003 — the
@@ -423,11 +423,11 @@ reason = "jed: a VALUES-body derived table takes NO trailing ORDER BY / LIMIT th
 [[override]]
 file = "types/array.test"
 sql = "SELECT id FROM t WHERE xs = tags"
-reason = "jed: comparing int32[] to text[] is a cross-type error 42804 (the strict type system, §4 — like bool = int). PostgreSQL has no such operator and raises 42883 (undefined_function). Both reject; the codes differ."
+reason = "jed: comparing i32[] to text[] is a cross-type error 42804 (the strict type system, §4 — like bool = int). PostgreSQL has no such operator and raises 42883 (undefined_function). Both reject; the codes differ."
 
 [[override]]
 file = "types/array.test"
-sql = "CREATE TABLE k (xs int32[] PRIMARY KEY)"
+sql = "CREATE TABLE k (xs i32[] PRIMARY KEY)"
 reason = "jed: an array PRIMARY KEY is rejected 0A000 this slice (the order-preserving array key encoding is authored but unexercised — array.md §12). PostgreSQL allows an array primary key, so it does NOT raise. A documented narrowing."
 
 # --- not_equal.test: `<>` inherits `=`'s deliberate strict-typing divergences (the same three
@@ -435,12 +435,12 @@ reason = "jed: an array PRIMARY KEY is rejected 0A000 this slice (the order-pres
 [[override]]
 file = "expr/not_equal.test"
 sql = "SELECT id FROM t WHERE a <> 'x'"
-reason = "jed: int32 vs a text literal is not comparable (42804) — the strict type system (§4) rejects the cross-family comparison rather than coercing the literal. PostgreSQL coerces 'x' to integer and fails parsing it, raising 22P02. Both reject; the codes differ (the `=`/IS DISTINCT FROM precedent)."
+reason = "jed: i32 vs a text literal is not comparable (42804) — the strict type system (§4) rejects the cross-family comparison rather than coercing the literal. PostgreSQL coerces 'x' to integer and fails parsing it, raising 22P02. Both reject; the codes differ (the `=`/IS DISTINCT FROM precedent)."
 
 [[override]]
 file = "expr/not_equal.test"
 sql = "SELECT id FROM w WHERE s <> 100000"
-reason = "jed: an untyped literal adapts to the sibling column's type, so 100000 against an int16 column overflows and traps 22003 at resolve, before any row is scanned (the literal range check `=` performs — types.md §6). PostgreSQL types 100000 as int4, promotes the int2 column, and raises no error. A standing, documented divergence."
+reason = "jed: an untyped literal adapts to the sibling column's type, so 100000 against an i16 column overflows and traps 22003 at resolve, before any row is scanned (the literal range check `=` performs — types.md §6). PostgreSQL types 100000 as int4, promotes the int2 column, and raises no error. A standing, documented divergence."
 
 [[override]]
 file = "expr/not_equal.test"
@@ -462,18 +462,18 @@ reason = "jed: IS NULL is non-associative — a trailing second `IS NULL` is 426
 # its array-literal surface and collapses the over-dimension case to 22P02; the codes differ.
 [[override]]
 file = "types/array_multidim.test"
-sql = "SELECT '{{{{{{{1}}}}}}}'::int32[] FROM m WHERE id = 1"
+sql = "SELECT '{{{{{{{1}}}}}}}'::i32[] FROM m WHERE id = 1"
 reason = "jed: a text literal beyond MAXDIM (6) is 22P02 invalid_text_representation (array_in's malformed-literal code). PostgreSQL raises 54000 program_limit_exceeded. jed owns its array-literal surface; a documented code divergence."
 
-# --- G24 timestamp/interval boundary divergences (jed owns its int64 range + engine-wide rounding) ---
+# --- G24 timestamp/interval boundary divergences (jed owns its i64 range + engine-wide rounding) ---
 # jed's finite timestamp range is i64::MIN+1 .. i64::MAX-1 microseconds from the 1970 epoch
-# (timestamp.md §1); the extreme int64 values are the ±infinity sentinels, so a finite parse landing
+# (timestamp.md §1); the extreme i64 values are the ±infinity sentinels, so a finite parse landing
 # exactly on i64::MAX traps 22008. PostgreSQL's calendar bound (to 294276 AD) is wider and accepts
 # this value as an ordinary finite timestamp.
 [[override]]
 file = "types/timestamp.test"
 sql = "INSERT INTO e VALUES (4, '294247-01-10 04:00:54.775807')"
-reason = "jed: i64::MAX microseconds is the +infinity sentinel, so a finite parse of it is out of range (22008). PostgreSQL accepts it as a finite timestamp (its calendar range reaches 294276 AD). jed owns its int64-µs range (timestamp.md §1); a documented divergence."
+reason = "jed: i64::MAX microseconds is the +infinity sentinel, so a finite parse of it is out of range (22008). PostgreSQL accepts it as a finite timestamp (its calendar range reaches 294276 AD). jed owns its i64-µs range (timestamp.md §1); a documented divergence."
 
 # jed rounds sub-microsecond fractions half-AWAY from zero (its single engine-wide rounding mode);
 # PostgreSQL rounds half-to-EVEN. .1234565 → jed .123457 vs PG .123456.
@@ -528,7 +528,7 @@ file = "query/order_by.test"
 sql = "SELECT a FROM t ORDER BY a + 1"
 reason = "jed: ORDER BY keys are restricted to column identifiers (grammar.md §10), so an expression key is 42601. PostgreSQL accepts ORDER BY <expression>. A documented surface narrowing."
 
-# --- the int64-magnitude literal boundary (grammar.md §4, types.md §6); PG types them as numeric.
+# --- the i64-magnitude literal boundary (grammar.md §4, types.md §6); PG types them as numeric.
 [[override]]
 file = "expr/unary_minus.test"
 sql = "SELECT 9223372036854775808 FROM t WHERE id = 1"
@@ -548,7 +548,7 @@ reason = "jed: a cross-family BETWEEN bound is 42804 (strict typing — no impli
 [[override]]
 file = "expr/between.test"
 sql = "SELECT id FROM s16 WHERE v BETWEEN 1 AND 100000"
-reason = "jed: an untyped literal bound adapts to the int16 column's type, so 100000 overflows and traps 22003 at resolve (types.md §6). PostgreSQL types 100000 as int4 and promotes the int2 column, raising no error. A standing divergence."
+reason = "jed: an untyped literal bound adapts to the i16 column's type, so 100000 overflows and traps 22003 at resolve (types.md §6). PostgreSQL types 100000 as int4 and promotes the int2 column, raising no error. A standing divergence."
 
 # --- cross-family element / too-wide literal in IN (strict typing; mirror of BETWEEN).
 [[override]]
@@ -559,7 +559,7 @@ reason = "jed: a cross-family IN element is 42804 (strict typing). PostgreSQL co
 [[override]]
 file = "expr/in_list.test"
 sql = "SELECT id FROM s16 WHERE v IN (1, 100000)"
-reason = "jed: an untyped literal element adapts to the int16 column's type, so 100000 overflows and traps 22003 at resolve. PostgreSQL types it as int4 and promotes the column, raising no error. A standing divergence."
+reason = "jed: an untyped literal element adapts to the i16 column's type, so 100000 overflows and traps 22003 at resolve. PostgreSQL types it as int4 and promotes the column, raising no error. A standing divergence."
 
 # --- non-text LIKE operand (strict typing): jed 42804 vs PG's no-operator 42883.
 [[override]]
@@ -576,7 +576,7 @@ reason = "jed: a cross-type bytea = integer comparison is 42804 (strict typing).
 [[override]]
 file = "types/bytea.test"
 sql = '''INSERT INTO t VALUES ('seven', '\x00')'''
-reason = "jed: a string into an int32 column is 42804 (strict typing). PostgreSQL coerces 'seven' to integer and reports 22P02 invalid input syntax. A standing divergence."
+reason = "jed: a string into an i32 column is 42804 (strict typing). PostgreSQL coerces 'seven' to integer and reports 22P02 invalid input syntax. A standing divergence."
 
 [[override]]
 file = "types/bytea.test"
@@ -612,7 +612,7 @@ reason = "jed: a cross-type uuid = integer comparison is 42804 (strict typing). 
 [[override]]
 file = "types/uuid.test"
 sql = "INSERT INTO txt VALUES ('550e8400-e29b-41d4-a716-446655440000', 'x')"
-reason = "jed: a string into an int32 column is 42804 (strict typing). PostgreSQL coerces the literal to integer and reports 22P02 invalid input syntax. A standing divergence."
+reason = "jed: a string into an i32 column is 42804 (strict typing). PostgreSQL coerces the literal to integer and reports 22P02 invalid input syntax. A standing divergence."
 
 # --- DISTINCT inside an aggregate is deferred (42601); PG supports COUNT(DISTINCT …).
 [[override]]
@@ -650,13 +650,13 @@ reason = "jed: ordering a subquery BY an enclosing-query column is a degenerate 
 # CREATE TABLE, where PostgreSQL defers it.
 [[override]]
 file = "ddl/column_default.test"
-sql = "CREATE TABLE bad1 (id int32 PRIMARY KEY, s int16 DEFAULT 99999)"
+sql = "CREATE TABLE bad1 (id i32 PRIMARY KEY, s i16 DEFAULT 99999)"
 reason = "jed: a DEFAULT constant out of the column type's range is rejected at CREATE TABLE (22003) — the default is folded and range-checked eagerly (constraints.md §2). PostgreSQL accepts the CREATE and defers the range check to INSERT time, so it raises nothing here. A documented eager-validation divergence."
 
 [[override]]
 file = "ddl/column_default.test"
-sql = "CREATE TABLE bad2 (id int32 PRIMARY KEY, n int32 DEFAULT 'x')"
-reason = "jed: a cross-family DEFAULT is a 42804 datatype mismatch at CREATE TABLE — the strict type system (§4) has no implicit text->int32 coercion for the default 'x'. PostgreSQL coerces 'x'::integer and reports 22P02 (invalid_text_representation). Both reject; the code differs."
+sql = "CREATE TABLE bad2 (id i32 PRIMARY KEY, n i32 DEFAULT 'x')"
+reason = "jed: a cross-family DEFAULT is a 42804 datatype mismatch at CREATE TABLE — the strict type system (§4) has no implicit text->i32 coercion for the default 'x'. PostgreSQL coerces 'x'::integer and reports 22P02 (invalid_text_representation). Both reject; the code differs."
 
 # --- ddl/create_type.test: jed's CREATE TYPE field grammar accepts an optional per-field `NOT NULL`
 # (parser parseCreateType, composite.md) — a `statement ok` jed surface. PostgreSQL forbids attribute
@@ -668,12 +668,12 @@ reason = "jed: a cross-family DEFAULT is a 42804 datatype mismatch at CREATE TAB
 # `on`-block precedent).
 [[override]]
 file = "ddl/create_type.test"
-sql = "CREATE TYPE addr AS (street text NOT NULL, zip int32)"
+sql = "CREATE TYPE addr AS (street text NOT NULL, zip i32)"
 reason = "jed ROOT divergence: jed's CREATE TYPE field grammar accepts an optional per-field `NOT NULL` token (parser parseCreateType; composite.md), so this is `statement ok`. PostgreSQL forbids attribute constraints in a composite-type definition and raises 42601 (syntax error at or near NOT). Because this statement_ok stays in the oracle replay prefix, every later record in the file replays against PG's aborted transaction — the entries below mark that poisoned tail."
 
 [[override]]
 file = "ddl/create_type.test"
-sql = "CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)"
+sql = "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)"
 reason = "jed ROOT divergence (2nd occurrence): a per-field `NOT NULL` in a composite-type definition is `statement ok` in jed (parseCreateType) but a 42601 syntax error in PostgreSQL. Like the `addr` root above, it poisons the rest of PG's replay prefix."
 
 [[override]]
@@ -688,7 +688,7 @@ reason = "create_type.test poisoned-prefix tail: PG's transaction is already abo
 
 [[override]]
 file = "ddl/create_type.test"
-sql = "CREATE TYPE bad AS (a int32, a int64)"
+sql = "CREATE TYPE bad AS (a i32, a i64)"
 reason = "create_type.test poisoned-prefix tail: PG returns 25P02 in the aborted transaction rather than jed's 42701 (duplicate field name). jed reports the intended 42701."
 
 [[override]]
@@ -718,7 +718,7 @@ reason = "create_type.test poisoned-prefix tail: a clean DROP in jed, but PG re-
 
 [[override]]
 file = "ddl/create_type.test"
-sql = "CREATE TYPE addr AS (street text, zip int32)"
+sql = "CREATE TYPE addr AS (street text, zip i32)"
 reason = "create_type.test poisoned-prefix tail: this no-constraint CREATE TYPE is accepted by BOTH engines on its own, but PG still re-hits the upstream `NOT NULL` prefix syntax error in its aborted-transaction replay. jed creates it cleanly. (The two records after it — the composite PRIMARY KEY and DROP TYPE … CASCADE narrowings — are already ledgered above.)"
 
 # --- dml/insert_column_list.test: jed's positional VALUES requires a value for EVERY column.
@@ -736,7 +736,7 @@ reason = "jed: a boolean operand (a = b) IS NOT DISTINCT FROM an integer is 4280
 [[override]]
 file = "expr/is_distinct_from.test"
 sql = "SELECT id FROM w WHERE s IS NOT DISTINCT FROM 100000"
-reason = "jed: an untyped literal adapts to the sibling column's type, so 100000 against an int16 column overflows and traps 22003 at resolve, before any row is scanned (the literal range check, types.md §6). PostgreSQL types 100000 as int4, promotes the int2 column, and raises no error. A standing divergence (the `=`/`<>` precedent)."
+reason = "jed: an untyped literal adapts to the sibling column's type, so 100000 against an i16 column overflows and traps 22003 at resolve, before any row is scanned (the literal range check, types.md §6). PostgreSQL types 100000 as int4, promotes the int2 column, and raises no error. A standing divergence (the `=`/`<>` precedent)."
 
 # --- expr/scalar_functions.test: jed's round(int) returns decimal; DISTINCT in a scalar fn.
 [[override]]
@@ -767,7 +767,7 @@ reason = "jed: casting TO boolean is deferred this slice (0A000 — types.md §9
 
 [[override]]
 file = "expr/type_errors.test"
-sql = "SELECT CAST(a = b AS int32) FROM t WHERE id = 1"
+sql = "SELECT CAST(a = b AS i32) FROM t WHERE id = 1"
 reason = "jed: there is no boolean->integer cast (a forbidden pair in the strict type system, §4) — 42804. PostgreSQL supports boolean->integer (true -> 1, false -> 0) and returns a value. A documented strict-typing divergence."
 
 # --- joins/errors.test: jed dropped the comma (implicit) cross join.
@@ -802,22 +802,22 @@ reason = "jed: a `$N` typed by an inner context is inferred, so the statement ex
 [[override]]
 file = "types/literals.test"
 sql = "SELECT id FROM t WHERE small = 100000"
-reason = "jed: an untyped literal adapts to the compared column's type, so 100000 overflows the int16 column and traps 22003 at resolve, before any row is scanned (types.md §6). PostgreSQL types 100000 as int4 and promotes the int2 column, raising no error. A standing strict-typing divergence."
+reason = "jed: an untyped literal adapts to the compared column's type, so 100000 overflows the i16 column and traps 22003 at resolve, before any row is scanned (types.md §6). PostgreSQL types 100000 as int4 and promotes the int2 column, raising no error. A standing strict-typing divergence."
 
 [[override]]
 file = "types/literals.test"
 sql = "SELECT id FROM t WHERE small < 100000"
-reason = "jed: the same int16 literal-overflow 22003 as the `=` case, here on an ordering comparison — the literal range check fires at resolve regardless of operator (types.md §6). PostgreSQL promotes the column to int4 and raises no error."
+reason = "jed: the same i16 literal-overflow 22003 as the `=` case, here on an ordering comparison — the literal range check fires at resolve regardless of operator (types.md §6). PostgreSQL promotes the column to int4 and raises no error."
 
 [[override]]
 file = "types/literals.test"
 sql = "SELECT id FROM t WHERE small > 100000"
-reason = "jed: the same int16 literal-overflow 22003 (types.md §6). PostgreSQL promotes the column to int4 and raises no error."
+reason = "jed: the same i16 literal-overflow 22003 (types.md §6). PostgreSQL promotes the column to int4 and raises no error."
 
 [[override]]
 file = "types/literals.test"
 sql = "SELECT id FROM t WHERE id = 5000000000"
-reason = "jed: the untyped literal adapts to the int32 column `id`, and 5000000000 fits int64 but not int32, so it traps 22003 at resolve (types.md §6). PostgreSQL types it as int8 and promotes the int4 column, returning an (empty) result with no error. A standing divergence."
+reason = "jed: the untyped literal adapts to the i32 column `id`, and 5000000000 fits i64 but not i32, so it traps 22003 at resolve (types.md §6). PostgreSQL types it as int8 and promotes the int4 column, returning an (empty) result with no error. A standing divergence."
 
 # --- types/text.test: the single defined `C`/byte collation (§8) vs the oracle's en_US.utf8, plus
 # the strict-typing / text-PK narrowings.
@@ -849,7 +849,7 @@ reason = "jed: text vs a non-text operand is 42804 (datatype_mismatch — strict
 [[override]]
 file = "types/text.test"
 sql = "INSERT INTO t VALUES ('seven', 'g')"
-reason = "jed: a string literal into the int32 PRIMARY KEY column is 42804 (strict typing). PostgreSQL coerces 'seven'::integer and reports 22P02 (invalid_text_representation). Both reject; the code differs (the bytea/uuid precedent)."
+reason = "jed: a string literal into the i32 PRIMARY KEY column is 42804 (strict typing). PostgreSQL coerces 'seven'::integer and reports 22P02 (invalid_text_representation). Both reject; the code differs (the bytea/uuid precedent)."
 
 [[override]]
 file = "types/text.test"
@@ -899,7 +899,7 @@ reason = "jed: under DISTINCT, an ORDER BY key must be a bare-projected column; 
 
 [[override]]
 file = "query/distinct.test"
-sql = "CREATE TABLE tk (id int32 PRIMARY KEY, distinct int32)"
+sql = "CREATE TABLE tk (id i32 PRIMARY KEY, distinct i32)"
 reason = "jed ROOT divergence: DISTINCT is NOT reserved, so `distinct` is a legal column name (the two-token lookahead, grammar.md §11) — `statement ok`. PostgreSQL fully reserves DISTINCT and raises 42601 (syntax error at distinct). Because this statement_ok stays in the oracle replay prefix, every later `tk` record replays against PG's aborted transaction (the entries below). The file places this block LAST so only its own tail is poisoned."
 
 [[override]]

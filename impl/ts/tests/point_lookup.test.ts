@@ -58,7 +58,7 @@ test("bounded range + overlap over a multi-leaf tree", () => {
 
 function bigTable(n: number): Database {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);
   execute(db, "INSERT INTO t VALUES " + parts.join(","));
@@ -116,7 +116,7 @@ test("LIMIT short-circuit is sublinear", () => {
   // Trap windowing: streaming projects ONLY the windowed rows, so a later trapping row is never
   // reached under a LIMIT that excludes it.
   const dz = new Database();
-  execute(dz, "CREATE TABLE z (id int32 PRIMARY KEY, c int32)");
+  execute(dz, "CREATE TABLE z (id i32 PRIMARY KEY, c i32)");
   execute(dz, "INSERT INTO z VALUES (1, 5), (2, 0), (3, 5)");
   assert.deepStrictEqual(ids(dz, "SELECT 100 / c FROM z LIMIT 1"), [20]);
   assert.throws(() => execute(dz, "SELECT 100 / c FROM z LIMIT 2"));

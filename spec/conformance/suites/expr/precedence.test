@@ -3,10 +3,10 @@
 # override. Authored precedence is in spec/functions/catalog.toml (the `precedence`
 # field); the tower is spec/grammar/grammar.ebnf `expr`. Format + `requires`:
 # ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.is_null, types.int32, types.boolean, expr.arithmetic, expr.precedence, expr.parens, query.logical_connectives, expr.comparison_value, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.is_null, types.i32, types.boolean, expr.arithmetic, expr.precedence, expr.parens, query.logical_connectives, expr.comparison_value, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
 
 statement ok
 INSERT INTO t VALUES (1, 2, 3)
@@ -50,7 +50,7 @@ false
 # as `(a IS NULL) AND (b = 1)`. Row 2 (a NULL, b=1) is the only one whose both conjuncts hold.
 # 3 scanned + `And(IsNull(a), Eq(b,1))` (3 interior nodes per row = 9) + 1 produced + 1 page = 14.
 statement ok
-CREATE TABLE n (id int32 PRIMARY KEY, a int32, b int32)
+CREATE TABLE n (id i32 PRIMARY KEY, a i32, b i32)
 
 statement ok
 INSERT INTO n VALUES (1, 10, 1), (2, NULL, 1), (3, NULL, 9)

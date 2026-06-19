@@ -3,10 +3,10 @@
 # (read_only_sql_transaction). ROLLBACK clears the block and autocommit resumes, so a later write
 # succeeds. READ WRITE is the default and may write. Format + the `requires` directive:
 # ../../../design/conformance.md.
-# requires: txn.read_only, txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, types.int32
+# requires: txn.read_only, txn.explicit, ddl.create_table, ddl.primary_key, dml.insert, dml.update, dml.delete, query.select, query.where_eq, query.order_by, types.i32
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO t VALUES (1, 10), (2, 20)

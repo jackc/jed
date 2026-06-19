@@ -137,7 +137,7 @@ fn set_operation_operands() {
 #[test]
 fn subqueries_uncorrelated_and_correlated() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1), (2)",
     ]);
     // Uncorrelated FROM-less inner: folded once.
@@ -161,7 +161,7 @@ fn subqueries_uncorrelated_and_correlated() {
 
 #[test]
 fn insert_select_source() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     let out = execute(&mut db, "INSERT INTO t SELECT 3").unwrap();
     assert_eq!(out.cost(), 1); // exactly the embedded SELECT's cost
     assert_eq!(

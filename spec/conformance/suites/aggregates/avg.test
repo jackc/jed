@@ -3,10 +3,10 @@
 # aggregates.md §3). The running sum is decimal even for integer input. NULL inputs skipped;
 # an empty/all-NULL group -> NULL. Output name `avg`. The rendered scale (16 here) is fixed by
 # select_div_scale — a cross-core determinism contract (decimal.md §7.2).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.int32, types.decimal, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.i32, types.decimal, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
@@ -21,7 +21,7 @@ SELECT AVG(a) FROM t
 
 # 10 / 4 = 2.5 at scale 16.
 statement ok
-CREATE TABLE t4 (id int32 PRIMARY KEY, a int32)
+CREATE TABLE t4 (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO t4 VALUES (1, 1), (2, 2), (3, 3), (4, 4)
@@ -34,7 +34,7 @@ SELECT AVG(a) FROM t4
 
 # AVG over decimal: (1.00 + 2.00) / 2 = 1.5 at scale 16 (>= the operand scale).
 statement ok
-CREATE TABLE tdec (id int32 PRIMARY KEY, d numeric(10,2))
+CREATE TABLE tdec (id i32 PRIMARY KEY, d numeric(10,2))
 
 statement ok
 INSERT INTO tdec VALUES (1, 1.00), (2, 2.00)
@@ -47,7 +47,7 @@ SELECT AVG(d) FROM tdec
 
 # NULL inputs skipped: AVG over the present rows. (10 + 30) / 2 = 20.
 statement ok
-CREATE TABLE tmix (id int32 PRIMARY KEY, a int32)
+CREATE TABLE tmix (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO tmix VALUES (1, 10), (2, NULL), (3, 30)
@@ -60,7 +60,7 @@ SELECT AVG(a) FROM tmix
 
 # All-NULL group: AVG -> NULL (count 0, no division).
 statement ok
-CREATE TABLE tnull (id int32 PRIMARY KEY, a int32)
+CREATE TABLE tnull (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO tnull VALUES (1, NULL), (2, NULL)
@@ -73,7 +73,7 @@ NULL
 
 # Empty table: AVG -> NULL as ONE row.
 statement ok
-CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+CREATE TABLE e (id i32 PRIMARY KEY, a i32)
 
 # names: avg
 query D nosort
@@ -85,7 +85,7 @@ NULL
 # arithmetic charge, cost.md §2): the running decimal sum + the final division over two ~17-digit
 # values cost more than a small-decimal AVG would, proving decimal_work is metered in this path.
 statement ok
-CREATE TABLE bd (id int32 PRIMARY KEY, d numeric)
+CREATE TABLE bd (id i32 PRIMARY KEY, d numeric)
 
 statement ok
 INSERT INTO bd VALUES (1, 123456789012345.67), (2, 987654321098765.43)

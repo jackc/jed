@@ -48,7 +48,7 @@ fn a_single_row_commit_appends_only_the_dirty_path() {
     let _ = std::fs::remove_file(&path);
     let ps = 256u64;
     let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)").unwrap();
     // Enough rows for a multi-level tree at 256-byte pages (≈3 records/leaf). Each insert
     // autocommits, so the file already holds many leaked pages by the end of the loop.
     let pad = "x".repeat(48);
@@ -107,7 +107,7 @@ fn delete_heavy_history_reopens_correctly() {
     let _ = std::fs::remove_file(&path);
     let pad = "x".repeat(48);
     let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)").unwrap();
     for i in 1..=30 {
         execute(
             &mut db,
@@ -135,7 +135,7 @@ fn meta_slots_alternate_across_commits() {
     assert_eq!(slot_txid(&img, 0), 1);
     assert_eq!(slot_txid(&img, 1), 1);
 
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap(); // txid 2 → slot 0
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap(); // txid 2 → slot 0
     execute(&mut db, "INSERT INTO t VALUES (1)").unwrap(); // txid 3 → slot 1
     db.close().unwrap();
 
@@ -153,7 +153,7 @@ fn torn_latest_commit_falls_back_to_prior_snapshot() {
     let path = tmp("incremental_torn_meta.jed");
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap(); // txid 2 (slot 0)
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap(); // txid 2 (slot 0)
     execute(&mut db, "INSERT INTO t VALUES (1)").unwrap(); // txid 3 (slot 1)
     execute(&mut db, "INSERT INTO t VALUES (2)").unwrap(); // txid 4 (slot 0) — the newest commit
     db.close().unwrap();

@@ -5,10 +5,10 @@
 # shorter-prefix-first), and the whole-value IS NULL rule. v1 ships 1-D values of scalar elements;
 # arrays-in-keys, multidim values, slices, and the array function surface are deferred. array_out
 # matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.aggregates, query.group_by, expr.not_equal, types.array, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.aggregates, query.group_by, expr.not_equal, types.array, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], tags text[])
+CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], tags text[])
 
 # The ARRAY[…] constructor builds the array value stored in the column.
 statement ok
@@ -59,7 +59,7 @@ SELECT id FROM t WHERE xs = ARRAY[1,NULL,3] ORDER BY id
 3
 
 statement ok
-CREATE TABLE s (id int32 PRIMARY KEY, xs int32[])
+CREATE TABLE s (id i32 PRIMARY KEY, xs i32[])
 
 statement ok
 INSERT INTO s VALUES (1, ARRAY[1, 2, 3])
@@ -93,7 +93,7 @@ SELECT DISTINCT xs FROM s
 
 # A comma in a text element forces double-quoting in array_out.
 statement ok
-CREATE TABLE q (id int32 PRIMARY KEY, tags text[])
+CREATE TABLE q (id i32 PRIMARY KEY, tags text[])
 
 statement ok
 INSERT INTO q VALUES (1, ARRAY['a,b', 'c'])
@@ -105,7 +105,7 @@ SELECT tags FROM q ORDER BY id
 
 # An over-range element value traps 22003 at store.
 statement ok
-CREATE TABLE o (id int32 PRIMARY KEY, xs int16[])
+CREATE TABLE o (id i32 PRIMARY KEY, xs i16[])
 
 statement error 22003
 INSERT INTO o VALUES (1, ARRAY[100000])
@@ -120,14 +120,14 @@ SELECT id FROM t WHERE xs = tags
 
 # An array PRIMARY KEY is rejected 0A000 — the key encoding is authored but unexercised.
 statement error 0A000
-CREATE TABLE k (xs int32[] PRIMARY KEY)
+CREATE TABLE k (xs i32[] PRIMARY KEY)
 
 # --- array comparison with NULL ELEMENTS yields a DEFINITE boolean (PG btree semantics, array.md
 # §5), NOT the composite 3VL rule: a NULL element sorts LAST (is the largest), every comparison is
 # TRUE or FALSE (never NULL/UNKNOWN), and NULL elements are mutually equal. (Inequality is
 # exercised below via <, >, <=, >=; whole-array `=`/`<>` are definite the same way — array.md §5.)
 statement ok
-CREATE TABLE cmpn (id int32 PRIMARY KEY, xs int32[])
+CREATE TABLE cmpn (id i32 PRIMARY KEY, xs i32[])
 
 statement ok
 INSERT INTO cmpn VALUES (1, ARRAY[1,2]), (2, ARRAY[1,NULL]), (3, ARRAY[1,3]), (4, ARRAY[1])
@@ -179,7 +179,7 @@ false
 # backslash-escaped. The unquoted token NULL (any case) is a NULL ELEMENT; "NULL" (quoted) is the
 # 4-character string. array_in is the inverse and trims unquoted surrounding whitespace.
 statement ok
-CREATE TABLE aio (id int32 PRIMARY KEY, tags text[])
+CREATE TABLE aio (id i32 PRIMARY KEY, tags text[])
 
 statement ok
 INSERT INTO aio VALUES
@@ -221,7 +221,7 @@ SELECT id FROM aio WHERE tags = ARRAY['NULL'] ORDER BY id
 # array_out escapes an embedded double-quote (\") and backslash (\\), and quotes a brace-bearing
 # element.
 statement ok
-CREATE TABLE aesc (id int32 PRIMARY KEY, tags text[])
+CREATE TABLE aesc (id i32 PRIMARY KEY, tags text[])
 
 statement ok
 INSERT INTO aesc VALUES (1, ARRAY['a"b']), (2, ARRAY['a\b']), (3, ARRAY['{x}'])
@@ -238,7 +238,7 @@ SELECT tags FROM aesc ORDER BY id
 # edge is pinned scalar-side in types/text.test; the same comparator is reused here). Lowercase
 # ASCII so the ordering is collation-independent (oracle-clean): a shorter prefix sorts first.
 statement ok
-CREATE TABLE tarr (id int32 PRIMARY KEY, tags text[])
+CREATE TABLE tarr (id i32 PRIMARY KEY, tags text[])
 
 statement ok
 INSERT INTO tarr VALUES (1, ARRAY['banana']), (2, ARRAY['apple']), (3, ARRAY['apple','zebra']), (4, ARRAY['cherry'])
@@ -267,7 +267,7 @@ SELECT id FROM tarr WHERE tags = ARRAY['apple','zebra']
 # array-vs-composite distinction). ORDER BY xs uses the array_cmp total order (NULLs-last per
 # element): {1,2} < {1,NULL,3} < {3}. 5 scanned + 5 accumulate + 3 produced + 1 page = 14.
 statement ok
-CREATE TABLE ga (id int32 PRIMARY KEY, xs int32[])
+CREATE TABLE ga (id i32 PRIMARY KEY, xs i32[])
 
 statement ok
 INSERT INTO ga VALUES (1, ARRAY[1,2]), (2, ARRAY[1,2]), (3, ARRAY[3]), (4, ARRAY[1,NULL,3]), (5, ARRAY[1,NULL,3])

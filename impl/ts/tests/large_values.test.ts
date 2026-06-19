@@ -40,7 +40,7 @@ const BIG = fillerText(1250); // incompressible, so Slice B keeps it external-pl
 
 function bigValueDB(): Database {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
   execute(db, `INSERT INTO t VALUES (1, '${BIG}')`);
   execute(db, "INSERT INTO t VALUES (2, 'tiny')");
   return db;
@@ -62,7 +62,7 @@ test("external value spans an overflow chain and round-trips byte-identically", 
 
 test("small values never spill", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   execute(db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
   const image = toImage(db, 256, 1n);
   assert.equal(countPageType(image, 256, PAGE_OVERFLOW), 0, "inline-fitting values are never externalized");
@@ -84,7 +84,7 @@ test("external value through the default demand-paged file path, with reclamatio
   const big = fillerText(1500); // incompressible ≫ RECORD_MAX at ps 256 ⇒ a multi-page overflow chain
   try {
     let db = create(path, { pageSize: 256 });
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)");
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
     execute(db, `INSERT INTO t VALUES (1, '${big}')`);
     execute(db, "INSERT INTO t VALUES (2, 'small')");
     close(db);

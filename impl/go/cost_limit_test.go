@@ -13,7 +13,7 @@ import (
 	"testing"
 )
 
-// rowTable builds a table of n rows (id int32 PRIMARY KEY, v int32; v == id).
+// rowTable builds a table of n rows (id i32 PRIMARY KEY, v i32; v == id).
 func rowTable(t *testing.T, n int) *Database {
 	t.Helper()
 	var b strings.Builder
@@ -24,7 +24,7 @@ func rowTable(t *testing.T, n int) *Database {
 		}
 		fmt.Fprintf(&b, "(%d,%d)", i, i)
 	}
-	return dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)", b.String())
+	return dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)", b.String())
 }
 
 func mustCost(t *testing.T, db *Database, sql string) int64 {

@@ -23,11 +23,11 @@ fn run(db: &mut Database, sql: &str) -> (Vec<Vec<Value>>, i64) {
     }
 }
 
-/// Populate `t(id int32 PK, k int32, s text)` with `n` rows whose `k` is deliberately unsorted and
+/// Populate `t(id i32 PK, k i32, s text)` with `n` rows whose `k` is deliberately unsorted and
 /// has many duplicates + a repeating NULL (to exercise the stable-sort tie-break and NULL ordering),
 /// and a variable-length `s` (so a spilled run carries variable-width values).
 fn seed(db: &mut Database, n: i64) {
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, k int32, s text)").unwrap();
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)").unwrap();
     for id in 0..n {
         // A scrambled key with duplicates; every 7th row's key is NULL.
         let k = if id % 7 == 0 {
@@ -135,7 +135,7 @@ fn spilling_sort_is_stable_on_ties() {
     let _ = std::fs::remove_file(&path);
 
     let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, k int32)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32)").unwrap();
     for id in 0..100 {
         execute(&mut db, &format!("INSERT INTO t VALUES ({id}, 5)")).unwrap();
     }

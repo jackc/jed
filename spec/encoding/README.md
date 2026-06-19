@@ -23,7 +23,7 @@ nullable presence tag, composition, and the NULLs-last decision — is in
 
 | File | Contents |
 |---|---|
-| [integers.toml](integers.toml) | Byte-exact `(value → bytes)` **key-encoding** vectors: `int16`/`int32`/`int64` bare values, the nullable presence-tag slot, and the descending (inverted) encoding. |
+| [integers.toml](integers.toml) | Byte-exact `(value → bytes)` **key-encoding** vectors: `i16`/`i32`/`i64` bare values, the nullable presence-tag slot, and the descending (inverted) encoding. |
 | [timestamps.toml](timestamps.toml) | `timestamp`/`timestamptz` parse / render vectors — `(input → micros)`, `(input → error)`, `(micros → text)` ([../design/timestamp.md](../design/timestamp.md)). |
 | [intervals.toml](intervals.toml) | `interval` parse / render vectors — `(input → months/days/micros)` and `(fields → text)` ([../design/interval.md](../design/interval.md)). |
 | [prng.toml](prng.toml) | splitmix64 PRNG stream + v4/v7 UUID byte-layout fixtures for the entropy seam ([../design/entropy.md](../design/entropy.md)). |
@@ -43,7 +43,7 @@ model (NULL is the largest value), ratifying the NULL sort-position decision tha
 > [../design/encoding.md §2.7](../design/encoding.md)), `boolean` (method `bool-byte`: a single
 > byte 0x00 false / 0x01 true, no sign-flip/escape/terminator;
 > [../design/encoding.md §2.9](../design/encoding.md)), and `timestamp`/`timestamptz` (key
-> encoding = the int64 rule) — all usable as a `PRIMARY KEY`. The remaining non-integer key
+> encoding = the i64 rule) — all usable as a `PRIMARY KEY`. The remaining non-integer key
 > vectors (decimal/text/bytea/float/interval) and composite keys follow when those features
 > exercise keys. The directory has also grown beyond pure key encoding to hold cross-core
 > parse/render byte vectors (`timestamps.toml`, `intervals.toml`) and the entropy-seam

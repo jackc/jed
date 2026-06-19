@@ -274,7 +274,7 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                     tokens.push(Token::Decimal(digits, scale));
                 } else {
                     // Integer literal: an unsigned magnitude. The sign is the `Minus`
-                    // operator. The magnitude must be <= 2^63 so that -(2^63) = int64::MIN
+                    // operator. The magnitude must be <= 2^63 so that -(2^63) = i64::MIN
                     // is reachable; anything larger cannot be represented (42601). i64
                     // cannot hold 2^63, so carry it unsigned and let the parser convert.
                     let text = int_part;

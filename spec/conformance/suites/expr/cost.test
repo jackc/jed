@@ -12,10 +12,10 @@
 # emitted; operator_eval per INTERIOR expression node (leaf column/constant = free); no
 # short-circuit, so both operands of AND/OR/compare are always counted. Format + the
 # `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.delete, query.select, query.where_eq, query.comparison_order, query.order_by, expr.arithmetic, expr.precedence, query.logical_connectives, expr.comparison_value, types.int32, query.point_lookup, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.delete, query.select, query.where_eq, query.comparison_order, query.order_by, expr.arithmetic, expr.precedence, query.logical_connectives, expr.comparison_value, types.i32, query.point_lookup, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
 
 statement ok
 INSERT INTO t VALUES (1, 6, 4)

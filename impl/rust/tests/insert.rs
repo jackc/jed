@@ -15,7 +15,7 @@ fn db_with(sql: &[&str]) -> Database {
 #[test]
 fn negative_keys_sort_before_positive() {
     // Exercises the sign-flip in the order-preserving key encoding.
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     for v in [
         "INSERT INTO t VALUES (1)",
         "INSERT INTO t VALUES (-1)",
@@ -30,7 +30,7 @@ fn negative_keys_sort_before_positive() {
 
 #[test]
 fn boundary_values_round_trip() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY, s int16, b int64)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)"]);
     execute(
         &mut db,
         "INSERT INTO t VALUES (1, 32767, 9223372036854775807)",
@@ -62,14 +62,14 @@ fn boundary_values_round_trip() {
 
 #[test]
 fn int32_and_int64_overflow_boundaries() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY, n int32)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY, n i32)"]);
     assert_eq!(
         execute(&mut db, "INSERT INTO t VALUES (1, 2147483648)")
             .unwrap_err()
             .code(),
         "22003"
     );
-    // int32 max fits.
+    // i32 max fits.
     assert_eq!(
         execute(&mut db, "INSERT INTO t VALUES (2, 2147483647)").unwrap(),
         Outcome::Statement {
@@ -90,7 +90,7 @@ fn insert_into_missing_table_traps() {
 
 #[test]
 fn no_pk_multi_row_insert_keeps_insertion_order() {
-    let mut db = db_with(&["CREATE TABLE log (a int32)"]);
+    let mut db = db_with(&["CREATE TABLE log (a i32)"]);
     // No PK ⇒ monotonic synthetic rowids, allocated left-to-right; key order = insertion order.
     execute(&mut db, "INSERT INTO log VALUES (30), (10), (20)").unwrap();
     let vals: Vec<Value> = db
@@ -104,9 +104,9 @@ fn no_pk_multi_row_insert_keeps_insertion_order() {
 
 #[test]
 fn no_pk_multi_row_insert_is_all_or_nothing() {
-    let mut db = db_with(&["CREATE TABLE log (a int16)"]);
+    let mut db = db_with(&["CREATE TABLE log (a i16)"]);
     execute(&mut db, "INSERT INTO log VALUES (1)").unwrap();
-    // The batch fails validation (second row overflows int16), so its first row (2) must
+    // The batch fails validation (second row overflows i16), so its first row (2) must
     // not be stored either — even though a no-PK row can never collide on its rowid.
     let err = execute(&mut db, "INSERT INTO log VALUES (2), (99999)").unwrap_err();
     assert_eq!(err.code(), "22003");
@@ -128,9 +128,9 @@ fn no_pk_multi_row_insert_is_all_or_nothing() {
 #[test]
 fn insert_select_param_in_source_where() {
     let mut db = db_with(&[
-        "CREATE TABLE src (id int32 PRIMARY KEY, a int16)",
+        "CREATE TABLE src (id i32 PRIMARY KEY, a i16)",
         "INSERT INTO src VALUES (1, 10), (2, 20), (3, 30)",
-        "CREATE TABLE dst (id int32 PRIMARY KEY, a int16)",
+        "CREATE TABLE dst (id i32 PRIMARY KEY, a i16)",
     ]);
     // A `$1` inside the source SELECT binds through the SELECT's own resolver.
     execute_params(
@@ -151,9 +151,9 @@ fn insert_select_param_in_source_where() {
 #[test]
 fn insert_select_cost_is_the_embedded_select_cost() {
     let mut db = db_with(&[
-        "CREATE TABLE src (id int32 PRIMARY KEY, a int16, b int64)",
+        "CREATE TABLE src (id i32 PRIMARY KEY, a i16, b i64)",
         "INSERT INTO src VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
-        "CREATE TABLE dst (id int32 PRIMARY KEY, a int16, b int64)",
+        "CREATE TABLE dst (id i32 PRIMARY KEY, a i16, b i64)",
     ]);
     // 1 page_read (src is one leaf) + 3 scanned + 3 produced + 0 projection (bare columns) = 7;
     // storing the rows is unmetered.

@@ -205,7 +205,7 @@ fn parse_names_directive(rest: &str) -> Option<Vec<String>> {
     )
 }
 
-/// Parse a `# types: int16, text, decimal` directive body. Returns the asserted output column
+/// Parse a `# types: i16, text, decimal` directive body. Returns the asserted output column
 /// types — each the canonical name of a result column's resolved type (the integer WIDTH, the
 /// unconstrained `decimal`, `unknown` for an untyped NULL), beyond the `I`/`T`/`D` rendering tag
 /// (spec/design/conformance.md §1/§7). None if this comment is not a types directive.

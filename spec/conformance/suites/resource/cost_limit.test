@@ -12,10 +12,10 @@
 # is the first DISALLOWED value: accrued *reaching* it (≥) aborts, so a ceiling equal to a query's
 # true cost aborts and one above it succeeds. The abort is an ordinary error, so an aborted DELETE /
 # UPDATE rolls back its (autocommit) transaction and leaves the table untouched.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, query.select, query.where_eq, query.comparison_order, expr.arithmetic, types.int32, query.point_lookup, resource.cost_metering, resource.cost_limit
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, dml.delete, dml.returning, query.select, query.where_eq, query.comparison_order, expr.arithmetic, types.i32, query.point_lookup, resource.cost_metering, resource.cost_limit
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)

@@ -31,7 +31,7 @@ func queryIDs(t *testing.T, db *Database, sql string) []int64 {
 func setupT(t *testing.T) *Database {
 	return dbWith(
 		t,
-		"CREATE TABLE t (id int32 PRIMARY KEY, v int16)",
+		"CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
 		"INSERT INTO t VALUES (1, 10)",
 		"INSERT INTO t VALUES (2, 20)",
 		"INSERT INTO t VALUES (3, NULL)",
@@ -47,7 +47,7 @@ func TestUnknownColumnTraps(t *testing.T) {
 func limitDB(t *testing.T) *Database {
 	return dbWith(
 		t,
-		"CREATE TABLE t (id int32 PRIMARY KEY, v int32)",
+		"CREATE TABLE t (id i32 PRIMARY KEY, v i32)",
 		"INSERT INTO t VALUES (1, 10)",
 		"INSERT INTO t VALUES (2, 20)",
 		"INSERT INTO t VALUES (3, 30)",

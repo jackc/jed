@@ -19,9 +19,9 @@ function val(db: Database, sql: string): string {
 test("introspection over multidim + custom lower bounds", () => {
   const db = new Database();
   const cases: [string, string][] = [
-    ["SELECT array_lower('[2:4]={7,8,9}'::int32[], 1)", "2"],
-    ["SELECT array_upper('[2:4]={7,8,9}'::int32[], 1)", "4"],
-    ["SELECT array_dims('[2:4]={7,8,9}'::int32[])", "[2:4]"],
+    ["SELECT array_lower('[2:4]={7,8,9}'::i32[], 1)", "2"],
+    ["SELECT array_upper('[2:4]={7,8,9}'::i32[], 1)", "4"],
+    ["SELECT array_dims('[2:4]={7,8,9}'::i32[])", "[2:4]"],
     ["SELECT array_ndims(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]])", "2"],
     ["SELECT array_length(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]], 2)", "3"],
     ["SELECT cardinality(ARRAY[ARRAY[1,2,3],ARRAY[4,5,6]])", "6"],

@@ -11,7 +11,7 @@ use jed::{Database, execute};
 
 fn db() -> Database {
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1, 1)").unwrap();
     db
 }
@@ -111,7 +111,7 @@ fn deep_nesting_in_where_and_check_is_bounded() {
     assert_eq!(
         code(
             &mut db,
-            &format!("CREATE TABLE u (a int32 CHECK ({pred} > 0))")
+            &format!("CREATE TABLE u (a i32 CHECK ({pred} > 0))")
         ),
         "54001"
     );

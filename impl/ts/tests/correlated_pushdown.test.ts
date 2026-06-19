@@ -11,12 +11,12 @@ import { test } from "node:test";
 import { Database, execute } from "../src/lib.ts";
 import type { Value } from "../src/value.ts";
 
-// `o` is five outer rows whose k-values all exist as inner ids; `inr` is n rows (id int32 PRIMARY KEY,
-// v int32; v == id) wide enough to span several leaves.
+// `o` is five outer rows whose k-values all exist as inner ids; `inr` is n rows (id i32 PRIMARY KEY,
+// v i32; v == id) wide enough to span several leaves.
 function correlatedTables(n: number): Database {
   const db = new Database();
-  execute(db, "CREATE TABLE o (id int32 PRIMARY KEY, k int32)");
-  execute(db, "CREATE TABLE inr (id int32 PRIMARY KEY, v int32)");
+  execute(db, "CREATE TABLE o (id i32 PRIMARY KEY, k i32)");
+  execute(db, "CREATE TABLE inr (id i32 PRIMARY KEY, v i32)");
   execute(db, "INSERT INTO o VALUES (1, 100), (2, 300), (3, 500), (4, 700), (5, 900)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);

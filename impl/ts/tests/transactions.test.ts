@@ -28,7 +28,7 @@ function codeOf(fn: () => void): string {
 
 test("begin → execute → commit is visible", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   const tx = begin(db, true);
   tx.execute("INSERT INTO t VALUES (1)");
   tx.execute("INSERT INTO t VALUES (2)");
@@ -43,7 +43,7 @@ test("begin → execute → commit is visible", () => {
 
 test("begin → execute → rollback discards", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1)");
   const tx = begin(db, true);
   tx.execute("INSERT INTO t VALUES (2)");
@@ -54,7 +54,7 @@ test("begin → execute → rollback discards", () => {
 
 test("update closure commits on success", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   const n = update(db, (tx) => {
     tx.execute("INSERT INTO t VALUES (1)");
     tx.execute("INSERT INTO t VALUES (2)");
@@ -67,7 +67,7 @@ test("update closure commits on success", () => {
 
 test("update closure rolls back on a thrown error", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1)");
   const code = codeOf(() =>
     update(db, (tx) => {
@@ -84,7 +84,7 @@ test("update closure rolls back on a thrown error", () => {
 
 test("view is read-only", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1), (2)");
   // a read inside a view works and returns its value
   const got = view(db, (tx) => {
@@ -101,7 +101,7 @@ test("view is read-only", () => {
 
 test("nested begin is 25001", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   const tx = begin(db, true);
   tx.execute("INSERT INTO t VALUES (1)");
   // a SQL BEGIN inside an already-open transaction is 25001
@@ -112,7 +112,7 @@ test("nested begin is 25001", () => {
 
 test("commit and rollback are no-ops in autocommit", () => {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   // no open transaction: both are lenient no-op successes (transactions.md §4.2)
   db.commitTx();
   db.rollbackTx();

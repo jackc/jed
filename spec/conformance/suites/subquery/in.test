@@ -3,16 +3,16 @@
 # semantics are inherited verbatim: a NULL in the result with no positive match yields NULL, not
 # FALSE. An EMPTY result folds to FALSE (IN) / TRUE (NOT IN), independent of the LHS (even NULL). A
 # >1-column subquery is 42601 (see errors.test). Verified against the live PostgreSQL 18 oracle.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, expr.in_list, expr.comparison_value, query.subquery_in, types.int32, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, expr.in_list, expr.comparison_value, query.subquery_in, types.i32, null.three_valued, resource.cost_metering
 
 statement ok
-CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+CREATE TABLE b (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE vals (id int32 PRIMARY KEY, v int32)
+CREATE TABLE vals (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)

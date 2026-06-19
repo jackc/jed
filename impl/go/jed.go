@@ -58,7 +58,7 @@ var SupportedCapabilities = []string{
 	// Array function surface AF7 (array-functions.md §13): the whole AF1–AF6 surface over a
 	// COMPOSITE element type + unnest(composite[]) — the quantifiers use the composite total order.
 	"func.array_composite",
-	// Sequences — CREATE SEQUENCE / DROP SEQUENCE, a persisted int64 generator (format_version 12),
+	// Sequences — CREATE SEQUENCE / DROP SEQUENCE, a persisted i64 generator (format_version 12),
 	// and the value functions nextval/currval (transactional advance — sequences.md §5).
 	"ddl.sequence",
 	"func.sequence",
@@ -182,9 +182,9 @@ var SupportedCapabilities = []string{
 	// The postfix `::` cast operator — `expr :: type` desugars to CAST(expr AS type), sharing
 	// its whole machinery; binds tighter than unary minus (spec/design/grammar.md §37).
 	"cast.operator",
-	"types.int16",
-	"types.int32",
-	"types.int64",
+	"types.i16",
+	"types.i32",
+	"types.i64",
 	// text scalar type (variable-width UTF-8, collation C): storage, literals, and
 	// comparison/ordering. Non-key column only this slice (text PRIMARY KEY → 0A000).
 	"types.text",
@@ -204,21 +204,21 @@ var SupportedCapabilities = []string{
 	// uuid scalar type (fixed 16-byte RFC 4122): storage, PG-flexible input literals, and
 	// unsigned-byte comparison/ordering. The FIRST non-integer type usable as a PRIMARY KEY.
 	"types.uuid",
-	// timestamp / timestamptz datetime types (int64 microseconds, instant model, no time
+	// timestamp / timestamptz datetime types (i64 microseconds, instant model, no time
 	// zone db): storage, literals (offset→UTC for tz), comparison/ordering, infinity, and a
-	// timestamp PRIMARY KEY (key encoding = int64). spec/design/timestamp.md.
+	// timestamp PRIMARY KEY (key encoding = i64). spec/design/timestamp.md.
 	"types.timestamp",
 	"types.timestamptz",
 	// interval scalar type (a span — months/days/micros): the "unit + time" input subset, PG
 	// render, and comparison/ordering/dedup by the canonical 128-bit span. Non-key column only.
 	// spec/design/interval.md.
 	"types.interval",
-	// float64/float32 (IEEE binary): storage, total order, kernel, casts, canonical-fold
+	// f64/f32 (IEEE binary): storage, total order, kernel, casts, canonical-fold
 	// SUM/AVG; exempt from cross-core identity for computed/rendered values (R tag). float.md.
-	"types.float64",
-	"types.float32",
-	// date scalar type (a calendar date — int32 days since 1970-01-01): ISO literals, BC era,
-	// infinity sentinels, comparison/ordering, a date PRIMARY KEY (key encoding = int32). A
+	"types.f64",
+	"types.f32",
+	// date scalar type (a calendar date — i32 days since 1970-01-01): ISO literals, BC era,
+	// infinity sentinels, comparison/ordering, a date PRIMARY KEY (key encoding = i32). A
 	// strict island — no compare/cast to timestamp this slice. spec/design/date.md.
 	"types.date",
 	// interval ± interval → interval and unary minus (interval.md §5).

@@ -12,7 +12,7 @@ import "testing"
 func commentsSetup(t *testing.T) *Database {
 	t.Helper()
 	db := NewDatabase()
-	mustCreate(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, s text)")
+	mustCreate(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 10, '--x /*y*/')")
 	return db
 }

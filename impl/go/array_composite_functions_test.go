@@ -12,7 +12,7 @@ import "testing"
 func addrDB(t *testing.T) *Database {
 	t.Helper()
 	db := NewDatabase()
-	runArray(t, db, "CREATE TYPE addr AS (street text, zip int32)")
+	runArray(t, db, "CREATE TYPE addr AS (street text, zip i32)")
 	return db
 }
 
@@ -126,7 +126,7 @@ func TestAF7UnnestComposite(t *testing.T) {
 // The jed extension: ARRAY[ROW(…)] under a composite-column context (not in the PG corpus).
 func TestAF7ArrayRowConstructorUnderColumnContext(t *testing.T) {
 	db := addrDB(t)
-	runArray(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])")
+	runArray(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])")
 	// The ARRAY[ROW(…)] constructor takes the column's composite element type as context (no ::addr).
 	runArray(t, db, "INSERT INTO t VALUES (1, ARRAY[ROW('Main', 90210), ROW('Side', 5)])")
 	eq(t, val1(t, db, "SELECT (SELECT count(*) FROM unnest(o.items)) FROM t o ORDER BY id"), "2", "unnest stored column")

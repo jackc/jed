@@ -6,10 +6,10 @@
 # correlation. The §8 hotspots covered: decimal cross-scale equality through a subquery (1.50 =
 # 1.5), the timestamp instant order via MAX in a scalar subquery, and a 0-row scalar subquery
 # folding to a TYPED NULL (so the comparison is UNKNOWN, never an error). Rows are `rowsort`.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.aggregates, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.int32, types.text, types.decimal, types.timestamp
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.aggregates, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.i32, types.text, types.decimal, types.timestamp
 
 statement ok
-CREATE TABLE products (id int32 PRIMARY KEY, name text, price numeric, made timestamp)
+CREATE TABLE products (id i32 PRIMARY KEY, name text, price numeric, made timestamp)
 
 statement ok
 INSERT INTO products VALUES
@@ -71,7 +71,7 @@ SELECT id FROM products WHERE made IN (SELECT made FROM products WHERE price >= 
 
 # --- correlated EXISTS keyed on TEXT: the outer name flows into the inner predicate ----------
 statement ok
-CREATE TABLE sales (sid int32 PRIMARY KEY, pname text)
+CREATE TABLE sales (sid i32 PRIMARY KEY, pname text)
 
 statement ok
 INSERT INTO sales VALUES (1, 'apple'), (2, 'cherry'), (3, 'durian')

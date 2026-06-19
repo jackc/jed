@@ -191,7 +191,7 @@ pub fn mul_by_fraction(iv: &Interval, fnum: i128, fden: i128) -> Result<Interval
 /// (spec/design/interval.md §5, the engine's first timestamp arithmetic). Months are added
 /// first **with day-of-month clamping** (Jan 31 + 1 month → Feb 28/29), then days (24 h each —
 /// jed has no zones), then microseconds. Adding to ±infinity stays ±infinity (PG); a finite
-/// result onto a sentinel or beyond the `int64`-µs range traps `22008`.
+/// result onto a sentinel or beyond the `i64`-µs range traps `22008`.
 pub fn ts_shift(ts: i64, iv: &Interval, subtract: bool) -> Result<i64> {
     if ts == timestamp::NEG_INFINITY || ts == timestamp::POS_INFINITY {
         return Ok(ts); // ±infinity ± any finite interval is unchanged

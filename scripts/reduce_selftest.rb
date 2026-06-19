@@ -18,10 +18,10 @@ REPO = File.expand_path("..", __dir__)
 
 # The failing query reads `v` after the UPDATE (so it sees 99); its expected is deliberately wrong.
 FIXTURE = <<~TEST
-  # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, query.select, query.where_eq, query.order_by, types.int32
+  # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.update, query.select, query.where_eq, query.order_by, types.i32
 
   statement ok
-  CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+  CREATE TABLE t (id i32 PRIMARY KEY, v i32)
 
   statement ok
   INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)

@@ -27,17 +27,17 @@ problem (CLAUDE.md §7). We use the standard record types:
 Conventions, fixed here so every implementation renders identically:
 
 - **coltypes** — one letter per result column: `I` integer, `B` boolean, `T` text, `D`
-  decimal, `R` real. The corpus uses `I`, `B`, `T`, `D`, and now **`R`** (`float64` — the
+  decimal, `R` real. The corpus uses `I`, `B`, `T`, `D`, and now **`R`** (`f64` — the
   first binary float, CLAUDE.md §4). Unlike the others, an `R` column is compared **by value at
   a tolerance, not by string**: both sides are parsed to f64 and considered equal iff bit-equal
   or within a small ULP/relative tolerance, with `NaN == NaN`, `±Inf` exact, and `-0 == +0`
   ([float.md](float.md) §9, [determinism.md](determinism.md) §6). This single rule absorbs the
   cross-core rendering-layout difference and the exempted transcendental last-ULP divergence
-  (`float64` is the first type exempted from cross-core byte-identity for *computed/rendered
+  (`f64` is the first type exempted from cross-core byte-identity for *computed/rendered
   values*; its *storage*, *ordering*, *kernel*, *exact-sum aggregates*, and *cost* stay exact).
   The letter is a **rendering** tag (how a value
-  is printed), *not* a type assertion — asserting the precise resolved type (`int16` vs
-  `int32`) is the separate **`# types:`** directive (below; the decimal `numeric(p,s)` typmod
+  is printed), *not* a type assertion — asserting the precise resolved type (`i16` vs
+  `i32`) is the separate **`# types:`** directive (below; the decimal `numeric(p,s)` typmod
   granularity stays deferred, §7). Types that render as a printable-ASCII string reuse the `T`
   tag accordingly: `bytea` (the `\x…` lowercase-hex form) and `uuid` (the canonical
   `8-4-4-4-12` lowercase form) are `T`-tag values.
@@ -61,7 +61,7 @@ Conventions, fixed here so every implementation renders identically:
 - **conditionals** — `skipif <capability>` / `onlyif <capability>` immediately before a
   record gate it on a capability (§3).
 - **`# requires:` header** — each file declares the capabilities it needs on one comment
-  line: `# requires: ddl.create_table, dml.insert, types.int16`. This is the file-level
+  line: `# requires: ddl.create_table, dml.insert, types.i16`. This is the file-level
   gate (§3). It is a **comment**, so the stock runner ignores it (§1.1); our harness reads
   it. Exactly one per file; the checker enforces this.
 - **`# names:` directive** — an optional `# names: id, total, ?column?` comment that binds
@@ -72,16 +72,16 @@ Conventions, fixed here so every implementation renders identically:
   rule that fixes them (bare column → canonical name, `expr AS alias` → alias, `*` → column
   names, any other expression → `?column?`) lives in [grammar.md](grammar.md) §8. The
   directive must precede a `query`, never a `statement` (a statement has no result columns).
-- **`# types:` directive** — an optional `# types: int16, int32, decimal` comment that binds
+- **`# types:` directive** — an optional `# types: i16, i32, decimal` comment that binds
   to the **next `query` record** and asserts each output column's **precise resolved type**, in
   order, as its canonical name. This is deliberately the assertion the **coltypes** *rendering*
-  tag is **not**: the tag says how a value *prints*, so the three integer widths `int16`/`int32`/
-  `int64` all carry the `I` tag and are indistinguishable by value alone — `# types:` pins the
+  tag is **not**: the tag says how a value *prints*, so the three integer widths `i16`/`i32`/
+  `i64` all carry the `I` tag and are indistinguishable by value alone — `# types:` pins the
   width, so a cross-core divergence in the integer **promotion tower**, a `CAST` target, or a
   comparison's result type fails here even when the printed rows agree (the §8 promotion-matrix
   hotspot, made assertable). Like `# names:`/`# cost:` it is a comment the stock runner ignores
   (§1.1), consumed independently by the next record, and must precede a `query`, never a
-  `statement`. The names are the canonical scalar-type ids (`int16`/`int32`/`int64`/`text`/
+  `statement`. The names are the canonical scalar-type ids (`i16`/`i32`/`i64`/`text`/
   `boolean`/`decimal`/`bytea`/`uuid`/`timestamp`/`timestamptz`, `unknown` for an untyped NULL
   column), from the type system ([types.md](types.md) §1, [compare.toml](../types/compare.toml)).
   The asserted type is the resolved **scalar** type — for `decimal` the unconstrained `decimal`,
@@ -134,7 +134,7 @@ separated into three independent axes:
    `cast/`, `compare/`). A suite says nothing about gating; it just answers "what area is
    this test about." New areas are new subdirectories.
 
-2. **Capabilities** — fine-grained features named with a dotted id (`types.int64`,
+2. **Capabilities** — fine-grained features named with a dotted id (`types.i64`,
    `cast.explicit`, `null.three_valued`). This is the **gating** axis:
    - Each implementation **declares the set of capabilities it supports.**
    - Each `.test` file **declares the capabilities it requires** via its `# requires:`
@@ -186,15 +186,15 @@ Every corpus entry MUST obey:
 - **No *unledgered* nondeterminism.** Determinism is **default-deny** ([determinism.md](determinism.md)
   §1): no wall-clock, no random, no hashmap-order leakage — *unless* the behavior is an entry in
   the determinism-exception ledger ([../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml))
-  with a stated blast radius and test mechanism. Two relaxations are exercised today: `float64`
+  with a stated blast radius and test mechanism. Two relaxations are exercised today: `f64`
   (class **A**, below) and the UUID generators (class **B**); everything else stays fully
   deterministic and cross-core byte-identical.
-- **Floats** are the class-**A** ledgered exception. `float64` ([float.md](float.md)) is exempt from
+- **Floats** are the class-**A** ledgered exception. `f64` ([float.md](float.md)) is exempt from
   cross-core byte-identity for *computed/rendered values only* — compared via the `R` tag's
   tolerant rule (§1). Its *storage* bytes, *total order*, *arithmetic kernel*, *exact-sum
   `SUM`/`AVG`*, and *cost/names/types* remain exact and cross-core (so a float query still carries
   `# cost:`). `decimal` stays the exact path (`1.50` prints `1.50`, a `D`-tag value); a value is
-  an `R`-tag value only when it is genuinely `float64`.
+  an `R`-tag value only when it is genuinely `f64`.
 - **The UUID generators** are the class-**B** ledgered exception, but they stay **exact** in the
   corpus: `uuidv4()` / `uuidv7()` run on a host-injected **random + clock seam** (two functions —
   [entropy.md](entropy.md)), so a record pins both with the **`# seed: N`** and **`# clock: N`**
@@ -266,7 +266,7 @@ profile's capabilities passes. All three cores (Rust, Go, TS) ship this harness 
 ## 7. Open / deferred
 
 - **Result-type assertions** — ✅ **resolved**: the `# types:` directive (§1) asserts each result
-  column's precise resolved type (`int16` vs `int32`, the family) beyond the `I`/`T`/`D` rendering
+  column's precise resolved type (`i16` vs `i32`, the family) beyond the `I`/`T`/`D` rendering
   tag, exposed through each core's `Outcome::Query` column-types accessor. It pins the integer
   promotion tower / `CAST` target / comparison result type — the cross-core divergence the value
   tag alone cannot catch. Coverage in `suites/types/result_types.test`. **Still deferred:** the
@@ -276,14 +276,14 @@ profile's capabilities passes. All three cores (Rust, Go, TS) ship this harness 
   typmod threaded through expression type resolution.
 - **Integer-literal typing** — ✅ **resolved**: a bare integer literal is an *untyped
   constant* that adapts to its context and traps `22003` when its value does not fit (so
-  `WHERE small = 100000`, with `small int16`, is a type error, not a silent non-match). See
+  `WHERE small = 100000`, with `small i16`, is a type error, not a silent non-match). See
   [../design/types.md](../design/types.md) §6; coverage in `suites/types/literals.test`.
 - **Boolean results / connectives** — ✅ **resolved**: the `boolean` type (now storable —
   types.md §9), comparisons-as-values, and `AND`/`OR`/`NOT` Kleene connectives landed with the
   general expression substrate. Rendered under the `B` tag (§1); the `expression` profile (§3)
   gates them; coverage in `suites/expr/`. Boolean as a *storable column type* remains
   deferred (types.md §10).
-- **Render-tag breadth** — `I`, `B`, `T` (text), `D` (decimal), and now `R` (`float64` — binary
+- **Render-tag breadth** — `I`, `B`, `T` (text), `D` (decimal), and now `R` (`f64` — binary
   float, compared at tolerance §1) are all in use (CLAUDE.md §8).
 
 ## 8. Metamorphic generator (SQLancer-style) — and the obligation to grow it

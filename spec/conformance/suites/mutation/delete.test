@@ -2,10 +2,10 @@
 # No WHERE deletes every row. Includes the no-PK rowid regression: a monotonic rowid
 # counter means DELETE-then-INSERT never collides with a freed key.
 # Format + the `requires` directive: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.delete, query.select, query.where_eq, query.comparison_order, query.is_null, query.order_by, types.int16, types.int32
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.delete, query.select, query.where_eq, query.comparison_order, query.is_null, query.order_by, types.i16, types.i32
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v int16)
+CREATE TABLE t (id i32 PRIMARY KEY, v i16)
 
 statement ok
 INSERT INTO t VALUES (1, 10)
@@ -64,7 +64,7 @@ SELECT id FROM t ORDER BY id
 # inserting again must NOT collide (it would wrongly trap 23505 if the rowid were the
 # current row count).
 statement ok
-CREATE TABLE log (n int32)
+CREATE TABLE log (n i32)
 
 statement ok
 INSERT INTO log VALUES (100)

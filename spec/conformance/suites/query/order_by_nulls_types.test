@@ -1,7 +1,7 @@
 # ORDER BY NULL position (NULLS FIRST / LAST, ASC / DESC) over NON-INTEGER types — the sort
 # machinery's NULL placement and per-type ordering (grammar.md §17, query.order_by_keys) exercised
 # for text, boolean, bytea, uuid, timestamp, and timestamptz. The dedicated order_by.test pins
-# this only for int32. PostgreSQL's defaults are NULLS LAST for ASC and NULLS FIRST for DESC; an
+# this only for i32. PostgreSQL's defaults are NULLS LAST for ASC and NULLS FIRST for DESC; an
 # explicit NULLS FIRST|LAST overrides that independently of direction. NULL is the largest value
 # under jed's ordering (CLAUDE.md §8), which is exactly why the default ASC puts it last.
 #
@@ -9,11 +9,11 @@
 # values whose order is identical under jed's collation C and PG's locale collation, so the text
 # cases stay oracle-clean (the collation itself is pinned in types/text.test); the other types are
 # collation-independent.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, types.int32, types.text, types.boolean_storable, types.bytea, types.uuid, types.timestamp, types.timestamptz
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.order_by_keys, types.i32, types.text, types.boolean_storable, types.bytea, types.uuid, types.timestamp, types.timestamptz
 
 # --- timestamp: the full default + explicit matrix on one representative type ----------------
 statement ok
-CREATE TABLE ts (id int32 PRIMARY KEY, k timestamp)
+CREATE TABLE ts (id i32 PRIMARY KEY, k timestamp)
 
 statement ok
 INSERT INTO ts VALUES (1, '2024-01-01 12:00:00'), (2, '1999-06-15 08:30:00'), (3, NULL), (4, '2024-12-31 23:59:59')
@@ -60,7 +60,7 @@ NULL
 
 # --- text (collation-agreeing lowercase values): NULL position under each clause -------------
 statement ok
-CREATE TABLE tt (id int32 PRIMARY KEY, k text)
+CREATE TABLE tt (id i32 PRIMARY KEY, k text)
 
 statement ok
 INSERT INTO tt VALUES (1, 'banana'), (2, 'apple'), (3, NULL), (4, 'cherry')
@@ -85,7 +85,7 @@ NULL
 
 # --- boolean: false < true, NULL placed by the clause ----------------------------------------
 statement ok
-CREATE TABLE tb (id int32 PRIMARY KEY, k boolean)
+CREATE TABLE tb (id i32 PRIMARY KEY, k boolean)
 
 statement ok
 INSERT INTO tb VALUES (1, true), (2, false), (3, NULL)
@@ -108,7 +108,7 @@ NULL
 
 # --- bytea: unsigned byte order, NULL placed by the clause -----------------------------------
 statement ok
-CREATE TABLE tby (id int32 PRIMARY KEY, k bytea)
+CREATE TABLE tby (id i32 PRIMARY KEY, k bytea)
 
 statement ok
 INSERT INTO tby VALUES (1, '\x02'), (2, '\x01'), (3, NULL), (4, '\xff')
@@ -133,7 +133,7 @@ NULL
 
 # --- uuid: unsigned 16-byte order, NULL placed by the clause ---------------------------------
 statement ok
-CREATE TABLE tu (id int32 PRIMARY KEY, k uuid)
+CREATE TABLE tu (id i32 PRIMARY KEY, k uuid)
 
 statement ok
 INSERT INTO tu VALUES
@@ -162,7 +162,7 @@ NULL
 
 # --- timestamptz: instant order after offset normalization, NULL placed by the clause --------
 statement ok
-CREATE TABLE tz (id int32 PRIMARY KEY, k timestamptz)
+CREATE TABLE tz (id i32 PRIMARY KEY, k timestamptz)
 
 statement ok
 INSERT INTO tz VALUES

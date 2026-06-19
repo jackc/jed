@@ -14,7 +14,7 @@
 # fixed 16-byte value, NO sign-flip, escape, or terminator, so the bytes ARE the value — and
 # `boolean` (method `bool-byte`, §2.9) — a single byte 0x00 false / 0x01 true, fixed-width 1,
 # likewise no sign-flip/escape/terminator. uuid and boolean are the two non-integer types usable
-# as a key (besides the int64-backed timestamps, which reuse the `int-be-signflip` int64 vectors).
+# as a key (besides the i64-backed timestamps, which reuse the `int-be-signflip` i64 vectors).
 
 schema_version = 1
 
@@ -22,9 +22,9 @@ schema_version = 1
 # bit inverted (== add bias 2^(bits-1), emit unsigned big-endian). Each group is
 # in ascending logical order so invariant (3) is a walk of the list.
 
-# --- int16 (width 2) ---------------------------------------------------------
+# --- i16 (width 2) ---------------------------------------------------------
 [[bare]]
-type = "int16"
+type = "i16"
 cases = [
   { value = -32768, bytes = "0000" },  # MIN
   { value = -256,   bytes = "7f00" },
@@ -36,9 +36,9 @@ cases = [
   { value = 32767,  bytes = "ffff" },  # MAX
 ]
 
-# --- int32 (width 4) ---------------------------------------------------------
+# --- i32 (width 4) ---------------------------------------------------------
 [[bare]]
-type = "int32"
+type = "i32"
 cases = [
   { value = -2147483648, bytes = "00000000" },  # MIN
   { value = -1,          bytes = "7fffffff" },
@@ -50,9 +50,9 @@ cases = [
   { value = 2147483647,  bytes = "ffffffff" },  # MAX
 ]
 
-# --- int64 (width 8) ---------------------------------------------------------
+# --- i64 (width 8) ---------------------------------------------------------
 [[bare]]
-type = "int64"
+type = "i64"
 cases = [
   { value = -9223372036854775808, bytes = "0000000000000000" },  # MIN
   { value = -1,                   bytes = "7fffffffffffffff" },
@@ -68,7 +68,7 @@ cases = [
 # 0x01). `null = true` marks the NULL case (TOML has no typed null); present cases
 # carry `value`. Listed in ascending logical order.
 [[nullable]]
-type = "int16"
+type = "i16"
 cases = [
   { value = -1,          bytes = "007fff" },
   { value = 0,           bytes = "008000" },
@@ -80,7 +80,7 @@ cases = [
 # encoding, tag byte included. Order reverses; NULL lands FIRST. Listed in
 # ascending byte order (= descending logical order) so invariant (3) still holds.
 [[descending]]
-type = "int16"
+type = "i16"
 base = "nullable"
 cases = [
   { null = true,  bytes = "fe"     },  # NULL sorts first under descending

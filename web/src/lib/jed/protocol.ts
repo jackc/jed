@@ -19,7 +19,7 @@ export type OpenSpec = {
 	mode: DbMode;
 	name?: string;
 	create?: boolean;
-	maxCost?: string; // int64 ceiling as a decimal string; 0/absent = unlimited
+	maxCost?: string; // i64 ceiling as a decimal string; 0/absent = unlimited
 	workMem?: number;
 	pageSize?: number;
 	readOnly?: boolean;
@@ -65,7 +65,7 @@ export type Req =
 	| { rid: number; op: 'commit'; id: string }
 	| { rid: number; op: 'rollback'; id: string }
 	| { rid: number; op: 'reset'; id: string } // memory only: replace with a fresh Database
-	| { rid: number; op: 'setMaxCost'; id: string; value: string } // int64 ceiling as decimal string
+	| { rid: number; op: 'setMaxCost'; id: string; value: string } // i64 ceiling as decimal string
 	| { rid: number; op: 'schema'; id: string }
 	| { rid: number; op: 'close'; id: string }
 	| { rid: number; op: 'exportBytes'; name: string } // OPFS: read a (closed) file out for download

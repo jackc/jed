@@ -28,7 +28,7 @@ func unnestInts(t *testing.T, db *Database, sql string) []int64 {
 
 func TestUnnestNamesAndElementType(t *testing.T) {
 	db := NewDatabase()
-	// An untyped ARRAY[…] literal is int64[] (jed's literal typing).
+	// An untyped ARRAY[…] literal is i64[] (jed's literal typing).
 	out, err := Execute(db, "SELECT * FROM unnest(ARRAY[10,20,30])")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -36,13 +36,13 @@ func TestUnnestNamesAndElementType(t *testing.T) {
 	if len(out.ColumnNames) != 1 || out.ColumnNames[0] != "unnest" {
 		t.Errorf("column names: %v", out.ColumnNames)
 	}
-	if len(out.ColumnTypes) != 1 || out.ColumnTypes[0] != "int64" {
+	if len(out.ColumnTypes) != 1 || out.ColumnTypes[0] != "i64" {
 		t.Errorf("column types: %v", out.ColumnTypes)
 	}
-	// A typed '{…}'::int32[] literal pins the element type.
-	out, _ = Execute(db, "SELECT * FROM unnest('{1,2,3}'::int32[])")
-	if out.ColumnTypes[0] != "int32" {
-		t.Errorf("int32[] element type = %s, want int32", out.ColumnTypes[0])
+	// A typed '{…}'::i32[] literal pins the element type.
+	out, _ = Execute(db, "SELECT * FROM unnest('{1,2,3}'::i32[])")
+	if out.ColumnTypes[0] != "i32" {
+		t.Errorf("i32[] element type = %s, want i32", out.ColumnTypes[0])
 	}
 	// A text[] argument → a text column.
 	out, _ = Execute(db, "SELECT * FROM unnest(ARRAY['a','b'])")
@@ -54,8 +54,8 @@ func TestUnnestNamesAndElementType(t *testing.T) {
 func TestUnnestEmptyAndNullArraysYieldZeroRows(t *testing.T) {
 	db := NewDatabase()
 	for _, sql := range []string{
-		"SELECT * FROM unnest('{}'::int32[])",
-		"SELECT * FROM unnest(NULL::int32[])",
+		"SELECT * FROM unnest('{}'::i32[])",
+		"SELECT * FROM unnest(NULL::i32[])",
 	} {
 		out, err := Execute(db, sql)
 		if err != nil {
@@ -81,7 +81,7 @@ func TestUnnestAliasRenamesColumn(t *testing.T) {
 
 func TestUnnestCorrelatedOuterArg(t *testing.T) {
 	db := NewDatabase()
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])")
 	mustExec(t, db, "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')")
 	// A correlated OUTER column resolves into the SRF arg of an enclosing-query subquery (the SRF is
 	// the subquery's sole/first FROM item, so its args see the enclosing query — functions.md §10).
@@ -131,8 +131,8 @@ func TestUnnestStrictnessAndDeferredErrors(t *testing.T) {
 
 func TestUnnestGeneratedRowCostAndCeiling(t *testing.T) {
 	db := NewDatabase()
-	// '{…}'::int32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
-	out, _ := Execute(db, "SELECT * FROM unnest('{1,2,3}'::int32[])")
+	// '{…}'::i32[] is a const (no operator_eval): 3 generated_row + 3 row_produced.
+	out, _ := Execute(db, "SELECT * FROM unnest('{1,2,3}'::i32[])")
 	if out.Cost != 6 {
 		t.Errorf("cost = %d, want 6", out.Cost)
 	}
@@ -142,7 +142,7 @@ func TestUnnestGeneratedRowCostAndCeiling(t *testing.T) {
 	for i := range parts {
 		parts[i] = strconv.Itoa(i + 1)
 	}
-	sql := "SELECT * FROM unnest('{" + strings.Join(parts, ",") + "}'::int32[])"
+	sql := "SELECT * FROM unnest('{" + strings.Join(parts, ",") + "}'::i32[])"
 	db.SetMaxCost(50)
 	if code := genErrCode(t, db, sql); code != "54P01" {
 		t.Errorf("ceiling abort code = %s, want 54P01", code)

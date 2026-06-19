@@ -3,10 +3,10 @@
 # non-NULL value. bytea is a NON-key column this slice — a bytea PRIMARY KEY is rejected 0A000.
 # A single-quoted literal adapts to a bytea context (§6); malformed hex traps 22P02. A literal
 # in a NON-bytea context is never decoded (it stays text). Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.int32, types.text, types.bytea, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.text, types.bytea, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, b bytea)
+CREATE TABLE t (id i32 PRIMARY KEY, b bytea)
 
 statement ok
 INSERT INTO t VALUES (1, '\xdeadbeef'), (2, '\x'), (3, '\x00'), (4, '\xff'), (5, NULL)
@@ -107,7 +107,7 @@ SELECT id FROM t WHERE b = '\xgg'
 # a string literal with NO bytea context stays text and is never decoded: '\xzz' compared with
 # a text column is the ordinary 4-character text value \xzz, NOT a 22P02 (and here it matches).
 statement ok
-CREATE TABLE txt (id int32 PRIMARY KEY, s text)
+CREATE TABLE txt (id i32 PRIMARY KEY, s text)
 
 statement ok
 INSERT INTO txt VALUES (1, '\xzz')
@@ -123,7 +123,7 @@ CREATE TABLE bad (k bytea PRIMARY KEY)
 
 # --- ordering: UNSIGNED byte order, the prefix/length case, embedded 0x00, and cost --------
 statement ok
-CREATE TABLE w (id int32 PRIMARY KEY, b bytea)
+CREATE TABLE w (id i32 PRIMARY KEY, b bytea)
 
 statement ok
 INSERT INTO w VALUES (1, '\x62'), (2, '\x6161'), (3, '\x6162'), (4, '\x61'), (5, '\x00'), (6, '\xff')
@@ -165,7 +165,7 @@ SELECT id FROM w WHERE b = '\x61'
 # compares first-byte 0x00 < 0x61, so it sorts BEFORE the single-byte \x61. A core that treated
 # 0x00 as a C-string terminator would mis-order these.
 statement ok
-CREATE TABLE nul (id int32 PRIMARY KEY, b bytea)
+CREATE TABLE nul (id i32 PRIMARY KEY, b bytea)
 
 statement ok
 INSERT INTO nul VALUES (1, '\x0061'), (2, '\x61')

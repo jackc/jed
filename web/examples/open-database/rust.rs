@@ -6,7 +6,7 @@ fn main() -> jed::Result<()> {
     // uncommitted changes).
     let mut db = Database::create("people.jed", DatabaseOptions::default())?;
 
-    execute(&mut db, "CREATE TABLE person (id int32 PRIMARY KEY, name text NOT NULL)")?;
+    execute(&mut db, "CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)")?;
     execute(&mut db, "INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')")?;
     db.commit()?;
 

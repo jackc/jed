@@ -108,7 +108,7 @@ fn cost_ceiling_aborts_with_54p01_and_a_hint() {
             "--max-cost",
             "2",
             "-c",
-            "CREATE TABLE t (a int32 PRIMARY KEY)",
+            "CREATE TABLE t (a i32 PRIMARY KEY)",
         ],
         "",
     );
@@ -121,7 +121,7 @@ fn cost_ceiling_aborts_with_54p01_and_a_hint() {
             "--create",
             db_str,
             "-c",
-            "CREATE TABLE t (a int32 PRIMARY KEY); INSERT INTO t VALUES (1)",
+            "CREATE TABLE t (a i32 PRIMARY KEY); INSERT INTO t VALUES (1)",
         ],
         "",
     );
@@ -147,7 +147,7 @@ fn create_then_reopen_round_trips() {
             "--create",
             db_str,
             "-c",
-            "CREATE TABLE t (a int32 PRIMARY KEY); INSERT INTO t VALUES (7)",
+            "CREATE TABLE t (a i32 PRIMARY KEY); INSERT INTO t VALUES (7)",
         ],
         "",
     );
@@ -186,7 +186,7 @@ fn sources_run_in_command_line_order() {
     let r = run(
         &[
             "-c",
-            "CREATE TABLE t (a int32 PRIMARY KEY)",
+            "CREATE TABLE t (a i32 PRIMARY KEY)",
             "-c",
             "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2)",
             "-q",
@@ -208,7 +208,7 @@ fn readonly_serves_reads_and_rejects_writes() {
             "--create",
             db_str,
             "-c",
-            "CREATE TABLE t (a int32 PRIMARY KEY); INSERT INTO t VALUES (1)",
+            "CREATE TABLE t (a i32 PRIMARY KEY); INSERT INTO t VALUES (1)",
         ],
         "",
     );
@@ -261,7 +261,7 @@ fn output_redirection_writes_results_to_the_file() {
             "-o",
             out_str,
             "-c",
-            "CREATE TABLE t (a int32 PRIMARY KEY); INSERT INTO t VALUES (7); SELECT a FROM t",
+            "CREATE TABLE t (a i32 PRIMARY KEY); INSERT INTO t VALUES (7); SELECT a FROM t",
         ],
         "",
     );
@@ -304,7 +304,7 @@ fn import_csv_inserts_atomically_in_command_line_order() {
     let r = run(
         &[
             "-c",
-            "CREATE TABLE p (id int32 PRIMARY KEY, name text, note text, ok boolean DEFAULT true)",
+            "CREATE TABLE p (id i32 PRIMARY KEY, name text, note text, ok boolean DEFAULT true)",
             "--import-csv",
             &format!("p={csv_str}"),
             "-c",
@@ -336,7 +336,7 @@ fn import_csv_inserts_atomically_in_command_line_order() {
     let r = run(
         &[
             "-c",
-            "CREATE TABLE q (id int32 PRIMARY KEY, name text)",
+            "CREATE TABLE q (id i32 PRIMARY KEY, name text)",
             "--import-csv",
             &format!("q={bad_str}"),
         ],
@@ -378,9 +378,9 @@ fn csv_export_then_import_round_trips() {
             "--create",
             db_str,
             "-c",
-            "CREATE TABLE t (id int32 PRIMARY KEY, name text); \
+            "CREATE TABLE t (id i32 PRIMARY KEY, name text); \
              INSERT INTO t VALUES (1, 'a,b'), (2, NULL), (3, ''); \
-             CREATE TABLE back (id int32 PRIMARY KEY, name text)",
+             CREATE TABLE back (id i32 PRIMARY KEY, name text)",
         ],
         "",
     );
@@ -428,9 +428,9 @@ fn dump_replays_into_an_identical_database() {
             "--create",
             db_str,
             "-c",
-            "CREATE TABLE t (id int32 PRIMARY KEY, name text, score numeric(5,2) DEFAULT 1.00); \
+            "CREATE TABLE t (id i32 PRIMARY KEY, name text, score numeric(5,2) DEFAULT 1.00); \
              INSERT INTO t (id, name) VALUES (2, 'it''s b'), (1, NULL); \
-             CREATE TABLE u (a int64, b int32 UNIQUE); INSERT INTO u VALUES (5, 6)",
+             CREATE TABLE u (a i64, b i32 UNIQUE); INSERT INTO u VALUES (5, 6)",
         ],
         "",
     );

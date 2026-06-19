@@ -6,14 +6,14 @@
 //! two never drift.
 
 /// The storable scalar types: three signed integers, `text`, `boolean`, `decimal`, and
-/// `bytea`. Canonical integer names state width in bits (int16/int32/int64); SQL-standard names
+/// `bytea`. Canonical integer names state width in bits (i16/i32/i64); SQL-standard names
 /// (smallint/integer/bigint) are accepted aliases. `text` is variable-width UTF-8 with one
 /// collation, `C` (byte / code-point order) — spec/design/types.md §11. `boolean` (alias
 /// `bool`) stores false/true behind the value codec's 1-byte `bool-byte` body (types.md §9).
 /// `decimal` (aliases `numeric`/`dec`) is the exact base-10 numeric (decimal.md). `bytea` is a
 /// variable-width binary string (raw bytes), compared by unsigned byte order — §13. The
 /// integer accessors `min`/`max`/`rank`/`in_range` panic on the non-integer types; `width_bytes`
-/// covers every fixed-width KEYABLE type (the integers, `uuid` → 16, `boolean` → 1, the int64
+/// covers every fixed-width KEYABLE type (the integers, `uuid` → 16, `boolean` → 1, the i64
 /// timestamps, the floats) but panics on the variable-width / non-key `Text`/`Decimal`/`Bytea`/
 /// `Interval`. Callers route the panicking cases through their own paths (the value codec, the
 /// comparators), never these, so the panic is an internal-invariant guard.
@@ -33,9 +33,9 @@ pub enum ScalarType {
     /// non-integer type usable as a key (`boolean` is the second); `width_bytes` returns 16 (it is
     /// genuinely fixed-width).
     Uuid,
-    /// Zoneless wall clock, int64 microseconds since the Unix epoch (spec/design/timestamp.md).
+    /// Zoneless wall clock, i64 microseconds since the Unix epoch (spec/design/timestamp.md).
     Timestamp,
-    /// UTC instant, int64 microseconds since the Unix epoch (spec/design/timestamp.md).
+    /// UTC instant, i64 microseconds since the Unix epoch (spec/design/timestamp.md).
     Timestamptz,
     /// A span of time — three independent fields (months/days/micros), compared by the canonical
     /// 128-bit span (spec/design/interval.md). Not a key this slice; not fixed-width through the
@@ -48,9 +48,9 @@ pub enum ScalarType {
     /// Rank 2 of the float promotion tower; stored as 8 big-endian IEEE bytes (type code 12).
     /// Not a key this slice.
     Float64,
-    /// A calendar date — int32 days since the Unix epoch, no time/zone (spec/design/date.md).
-    /// Reuses timestamp's calendar core; stored as a 4-byte order-preserving int32 body (type
-    /// code 16). A key this slice (the int32 key encoding is exercised, like timestamp).
+    /// A calendar date — i32 days since the Unix epoch, no time/zone (spec/design/date.md).
+    /// Reuses timestamp's calendar core; stored as a 4-byte order-preserving i32 body (type
+    /// code 16). A key this slice (the i32 key encoding is exercised, like timestamp).
     Date,
 }
 
@@ -58,9 +58,9 @@ impl ScalarType {
     /// The single canonical name used in all output (determinism — CLAUDE.md §10).
     pub fn canonical_name(self) -> &'static str {
         match self {
-            ScalarType::Int16 => "int16",
-            ScalarType::Int32 => "int32",
-            ScalarType::Int64 => "int64",
+            ScalarType::Int16 => "i16",
+            ScalarType::Int32 => "i32",
+            ScalarType::Int64 => "i64",
             ScalarType::Text => "text",
             ScalarType::Bool => "boolean",
             ScalarType::Decimal => "decimal",
@@ -69,22 +69,27 @@ impl ScalarType {
             ScalarType::Timestamp => "timestamp",
             ScalarType::Timestamptz => "timestamptz",
             ScalarType::Interval => "interval",
-            ScalarType::Float32 => "float32",
-            ScalarType::Float64 => "float64",
+            ScalarType::Float32 => "f32",
+            ScalarType::Float64 => "f64",
             ScalarType::Date => "date",
         }
     }
 
     /// Resolve a type name (canonical or alias) to a type, case-insensitively.
-    /// Returns None for an unknown name. PG's int2/int4/int8 are intentionally
-    /// NOT accepted (we own our surface — CLAUDE.md §1). The two-word `character
-    /// varying` alias is recognized here, though this slice's parser only produces
-    /// single-word type names (a documented narrowing — spec/design/types.md §11).
+    /// Returns None for an unknown name. Canonical names state width in bits under the
+    /// `i`/`f` prefix (i16/i32/i64, f32/f64 — the Rust/Zig convention). Accepted aliases:
+    /// the SQL-standard words (smallint/int/integer/bigint, real/double precision/float)
+    /// AND PG's byte-shorthand (int2/int4/int8, float4/float8). The byte-shorthand is safe
+    /// to accept precisely BECAUSE of the `i`/`f` prefix: jed's bit-namespace (`i8`…`i64`)
+    /// is lexically disjoint from PG's byte-namespace (`int2`…`int8`), so `int8` → i64 with
+    /// no collision and a future 8-bit `i8` stays free (spec/design/types.md §11; CLAUDE.md
+    /// §1/§4). The two-word `character varying` alias is recognized here, though this slice's
+    /// parser only produces single-word type names (a documented narrowing — types.md §11).
     pub fn from_name(name: &str) -> Option<ScalarType> {
         match name.to_ascii_lowercase().as_str() {
-            "int16" | "smallint" => Some(ScalarType::Int16),
-            "int32" | "int" | "integer" => Some(ScalarType::Int32),
-            "int64" | "bigint" => Some(ScalarType::Int64),
+            "i16" | "smallint" | "int2" => Some(ScalarType::Int16),
+            "i32" | "int" | "integer" | "int4" => Some(ScalarType::Int32),
+            "i64" | "bigint" | "int8" => Some(ScalarType::Int64),
             "text" | "varchar" | "string" | "character varying" => Some(ScalarType::Text),
             "boolean" | "bool" => Some(ScalarType::Bool),
             "decimal" | "numeric" | "dec" => Some(ScalarType::Decimal),
@@ -93,11 +98,12 @@ impl ScalarType {
             "timestamp" | "timestamp without time zone" => Some(ScalarType::Timestamp),
             "timestamptz" | "timestamp with time zone" => Some(ScalarType::Timestamptz),
             "interval" => Some(ScalarType::Interval),
-            // Float promotion tower (spec/design/float.md §2). Canonical ids state width in bits;
-            // SQL-standard names are aliases. PG's `float8`/`float4` byte-count spellings and the
-            // `float(p)` precision typmod are NOT accepted (we own our surface — CLAUDE.md §1).
-            "float32" | "real" => Some(ScalarType::Float32),
-            "float64" | "double precision" | "float" => Some(ScalarType::Float64),
+            // Float promotion tower (spec/design/float.md §2). Canonical ids state width in bits
+            // (f32/f64); the SQL-standard names (real, double precision, float) and PG's
+            // byte-shorthand (float4/float8) are aliases. A bare `float` (no precision) is double
+            // precision in PG — NOT 32-bit. The `float(p)` precision typmod is not accepted.
+            "f32" | "real" | "float4" => Some(ScalarType::Float32),
+            "f64" | "double precision" | "float" | "float8" => Some(ScalarType::Float64),
             "date" => Some(ScalarType::Date),
             _ => None,
         }
@@ -148,12 +154,12 @@ impl ScalarType {
         matches!(self, ScalarType::Date)
     }
 
-    /// Whether this is the `float32` (binary32) type.
+    /// Whether this is the `f32` (binary32) type.
     pub fn is_float32(self) -> bool {
         matches!(self, ScalarType::Float32)
     }
 
-    /// Whether this is the `float64` (binary64) type.
+    /// Whether this is the `f64` (binary64) type.
     pub fn is_float64(self) -> bool {
         matches!(self, ScalarType::Float64)
     }
@@ -173,8 +179,8 @@ impl ScalarType {
     }
 
     /// Fixed storage width in bytes (the KEY-encoding width — the bare key body, no presence tag —
-    /// for the fixed-width keyable types): the three integers, the two `int64`-microsecond
-    /// timestamps (which reuse the int64 codec — spec/design/timestamp.md), `uuid` (16 bytes), and
+    /// for the fixed-width keyable types): the three integers, the two `i64`-microsecond
+    /// timestamps (which reuse the i64 codec — spec/design/timestamp.md), `uuid` (16 bytes), and
     /// `boolean` (1 byte — the `bool-byte` key, spec/design/encoding.md §2.9). Used by the index
     /// tail-slot skip (each self-delimiting component is `0x01` NULL or `0x00` + this many bytes).
     /// The variable-width `text`/`bytea` and the self-describing `decimal`/`interval` are never
@@ -188,7 +194,7 @@ impl ScalarType {
             ScalarType::Int32 => 4,
             ScalarType::Int64 | ScalarType::Timestamp | ScalarType::Timestamptz => 8,
             ScalarType::Uuid => 16,
-            // `date` is a fixed-width 4-byte int32 day count (reuses the int32 codec — it is a
+            // `date` is a fixed-width 4-byte i32 day count (reuses the i32 codec — it is a
             // key this slice, like timestamp; spec/design/date.md).
             ScalarType::Date => 4,
             // The float types are fixed-width (binary32 = 4 bytes, binary64 = 8) — the value
@@ -252,8 +258,8 @@ impl ScalarType {
     }
 
     /// Promotion-tower rank within a family (spec/types/compare.toml, spec/design/float.md §2):
-    /// the integer tower int16(1) < int32(2) < int64(3), and the *separate* float tower
-    /// float32(1) < float64(2). The two towers never mix — `promote` only ever compares ranks
+    /// the integer tower i16(1) < i32(2) < i64(3), and the *separate* float tower
+    /// f32(1) < f64(2). The two towers never mix — `promote` only ever compares ranks
     /// among types of one family — so the float values reuse the small-integer slots safely.
     /// Non-tower types (text/boolean/decimal/bytea/uuid/timestamp/interval) have no rank.
     pub fn rank(self) -> u8 {
@@ -325,7 +331,7 @@ pub struct DecimalTypmod {
 pub enum Type {
     Scalar(ScalarType),
     Composite(CompositeRef),
-    /// A **structural** array type over an element type (spec/design/array.md): `int32[]`. The
+    /// A **structural** array type over an element type (spec/design/array.md): `i32[]`. The
     /// element type is carried inline (not a catalog reference like `Composite`) — `T[]` exists for
     /// every element type with no DDL and no catalog object. The element is a scalar or composite,
     /// never another array (multidimensionality is a value property, not array-of-array — §2).

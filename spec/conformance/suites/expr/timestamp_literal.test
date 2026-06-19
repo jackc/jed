@@ -6,7 +6,7 @@
 # overflow) codes are identical, at resolve time before any scan. TIMESTAMP is zoneless (an offset
 # in the string is accepted and ignored); TIMESTAMPTZ normalizes the offset to UTC then renders
 # +00. The keywords stay non-reserved: a column named `timestamp` / `interval` still resolves.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, types.int32, types.timestamp, types.timestamptz, types.interval, expr.timestamp_arithmetic
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, types.i32, types.timestamp, types.timestamptz, types.interval, expr.timestamp_arithmetic
 
 # context-free: a TIMESTAMP literal in the select list, no column to adapt from
 query T nosort
@@ -89,7 +89,7 @@ SELECT TIMESTAMPTZ '2024-06-15 08:30:00+00' - INTERVAL '2 hours'
 
 # disambiguation: TIMESTAMP / INTERVAL stay non-reserved — a column may be named `timestamp`
 statement ok
-CREATE TABLE kw (timestamp int32 PRIMARY KEY, interval int32)
+CREATE TABLE kw (timestamp i32 PRIMARY KEY, interval i32)
 
 statement ok
 INSERT INTO kw VALUES (7, 9), (3, 4)

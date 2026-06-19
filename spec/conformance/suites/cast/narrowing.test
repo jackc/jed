@@ -2,10 +2,10 @@
 # Narrowing is lossy in general: it requires an explicit CAST and traps (22003)
 # when the value does not fit.
 # Format + the `requires` directive: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.int16, types.int32, types.int64, cast.explicit, error.overflow_trap
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.i16, types.i32, types.i64, cast.explicit, error.overflow_trap
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, b int64)
+CREATE TABLE t (id i32 PRIMARY KEY, b i64)
 
 statement ok
 INSERT INTO t VALUES (1, 2000000000)
@@ -16,54 +16,54 @@ INSERT INTO t VALUES (2, 5000000000)
 statement ok
 INSERT INTO t VALUES (3, 1000)
 
-# int64 -> int32 narrowing that fits. The `# types:` directive pins the CAST target width — the
-# resolved type is int32, not the int64 source (all integer widths render under `I`, so this is
+# i64 -> i32 narrowing that fits. The `# types:` directive pins the CAST target width — the
+# resolved type is i32, not the i64 source (all integer widths render under `I`, so this is
 # invisible on rows alone).
-# types: int32
+# types: i32
 query I nosort
-SELECT CAST(b AS int32) FROM t WHERE id = 1
+SELECT CAST(b AS i32) FROM t WHERE id = 1
 ----
 2000000000
 
-# int64 -> int16 narrowing that does NOT fit -> trap
+# i64 -> i16 narrowing that does NOT fit -> trap
 statement error 22003
-SELECT CAST(b AS int16) FROM t WHERE id = 1
+SELECT CAST(b AS i16) FROM t WHERE id = 1
 
-# int64 -> int32 narrowing that does NOT fit -> trap
+# i64 -> i32 narrowing that does NOT fit -> trap
 statement error 22003
-SELECT CAST(b AS int32) FROM t WHERE id = 2
+SELECT CAST(b AS i32) FROM t WHERE id = 2
 
 # narrowing a literal that fits the target
 query I nosort
-SELECT CAST(1000 AS int16) FROM t WHERE id = 1
+SELECT CAST(1000 AS i16) FROM t WHERE id = 1
 ----
 1000
 
-# chained narrowing int64 -> int32 -> int16, fits at every step (b = 1000). The outermost CAST
-# fixes the resolved type at int16.
-# types: int16
+# chained narrowing i64 -> i32 -> i16, fits at every step (b = 1000). The outermost CAST
+# fixes the resolved type at i16.
+# types: i16
 query I nosort
-SELECT CAST(CAST(b AS int32) AS int16) FROM t WHERE id = 3
+SELECT CAST(CAST(b AS i32) AS i16) FROM t WHERE id = 3
 ----
 1000
 
-# G13 — the exact int16 range boundary [-32768, 32767]. The two endpoints fit; one step past
-# either end traps 22003. -32769 is unary minus over the literal 32769 (itself out of int16
+# G13 — the exact i16 range boundary [-32768, 32767]. The two endpoints fit; one step past
+# either end traps 22003. -32769 is unary minus over the literal 32769 (itself out of i16
 # range), so the negation result is what is checked against the target.
-# types: int16
+# types: i16
 query I nosort
-SELECT CAST(32767 AS int16) FROM t WHERE id = 3
+SELECT CAST(32767 AS i16) FROM t WHERE id = 3
 ----
 32767
 
 statement error 22003
-SELECT CAST(32768 AS int16) FROM t WHERE id = 3
+SELECT CAST(32768 AS i16) FROM t WHERE id = 3
 
-# types: int16
+# types: i16
 query I nosort
-SELECT CAST(-32768 AS int16) FROM t WHERE id = 3
+SELECT CAST(-32768 AS i16) FROM t WHERE id = 3
 ----
 -32768
 
 statement error 22003
-SELECT CAST(-32769 AS int16) FROM t WHERE id = 3
+SELECT CAST(-32769 AS i16) FROM t WHERE id = 3

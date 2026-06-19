@@ -57,7 +57,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       → [gen_catalog.rb](scripts/gen_catalog.rb), [codegen.md](spec/design/codegen.md)
   - [ ] _follow-on:_ extend the generator to types/errors.
 - [x] **Resolve integer-literal typing** — context-adaptive untyped constants (adapt to the
-      column/CAST target, trap `22003` out of range, default int64). → [types.md §6](spec/design/types.md)
+      column/CAST target, trap `22003` out of range, default i64). → [types.md §6](spec/design/types.md)
 - [x] **General expression evaluator** — unified recursive `Expr` (Column/Literal/Cast/Unary/
       Binary/IsNull), one-function-per-precedence-level parser, shared by WHERE + the SELECT list.
 - [x] **Integer arithmetic `+ - * / %` + unary `-`** — trap-on-overflow `22003` at the result
@@ -95,7 +95,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       the engine's first lazy expression. → grammar.md §20–§23
   - [ ] _follow-on:_ LIKE `ESCAPE 'c'`, `ILIKE`, `SIMILAR TO`.
 - [x] **Aggregates `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` + `GROUP BY` + `HAVING`** — first
-      function-call syntax, whole-table + grouped aggregation, PG widening (SUM int→int64/decimal,
+      function-call syntax, whole-table + grouped aggregation, PG widening (SUM int→i64/decimal,
       AVG→decimal), grouping-error `42803`. → [aggregates.md](spec/design/aggregates.md)
   - [ ] _follow-on:_ `COUNT(DISTINCT x)`, `SELECT DISTINCT` in an aggregate query, GROUP BY by
         expression/ordinal/alias, functional-dependency grouping, `GROUPING SETS`/`FILTER`/ordered-set.
@@ -121,7 +121,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 
 > The **real type system** is the product (§4) — PostgreSQL's behavior, stricter than its
 > typing, nothing like SQLite's runtime affinity. `boolean`, `text` (collation `C`), `decimal`,
-> `timestamp`/`timestamptz`, `interval`, `bytea`, `uuid`, and `float32`/`float64` are done;
+> `timestamp`/`timestamptz`, `interval`, `bytea`, `uuid`, and `f32`/`f64` are done;
 > `json` and `array` are the remaining headline items.
 
 - [x] **Storable `boolean` column type** — on-disk type code 5, `bool-byte` codec, comparison +
@@ -143,16 +143,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       promotion; finite-only (documented PG divergence). → [decimal.md](spec/design/decimal.md)
   - [ ] _follow-on:_ decimal in a PRIMARY KEY/index (`0A000`); negative / `s>p` scale typmods;
         `round(x,n)` and other decimal functions.
-- [x] **`timestamp` / `timestamptz`** — PG instant model, int64 µs, no tz database, `±infinity`
+- [x] **`timestamp` / `timestamptz`** — PG instant model, i64 µs, no tz database, `±infinity`
       first-class, timestamp PK supported. → [timestamp.md](spec/design/timestamp.md)
   - [ ] _follow-on:_ `EXTRACT`/`date_trunc`/`age`; separate `time` type; named-zone
         `AT TIME ZONE`; timestamp⇄text/date casts; `timestamp(p)` precision typmods.
         (`date` ✅ landed below.)
-- [x] **`date`** — a calendar date (year/month/day, no time/zone): int32 days since 1970-01-01,
+- [x] **`date`** — a calendar date (year/month/day, no time/zone): i32 days since 1970-01-01,
       reusing timestamp's calendar core; strict ISO `YYYY-MM-DD` literals (string-adapt + `DATE '…'`
       keyword) with BC era + `±infinity`, a trailing time/offset validated then dropped (24:00:00
       does NOT roll into the day, unlike timestamp), comparison/ordering by the day count, a date
-      PRIMARY KEY (key encoding = int32; on-disk type code 16, no `format_version` bump). A **strict
+      PRIMARY KEY (key encoding = i32; on-disk type code 16, no `format_version` bump). A **strict
       island** — no compare/cast to timestamp this slice (a documented PG divergence). jed owns a
       wider range than PG (≈ ±5.88M years). → [date.md](spec/design/date.md)
   - [ ] _follow-on:_ **date arithmetic** (`date ± int` → date, `date - date` → int, `date ± interval`
@@ -184,7 +184,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       entropy+clock seam (splitmix64 PRNG). → [entropy.md](spec/design/entropy.md)
 - [x] **Current-time functions** — `now()` (STABLE) / `current_timestamp` (sugar) /
       `clock_timestamp()` (VOLATILE) on the clock seam. → [functions.md §12](spec/design/functions.md)
-- [x] **`float32` + `float64` (IEEE 754)** — two-width promotion tower; the first types **narrowly**
+- [x] **`f32` + `f64` (IEEE 754)** — two-width promotion tower; the first types **narrowly**
       exempted from cross-core byte-identity (only transcendental *values* + render *layout*, via the
       `R` tag's tolerant compare); established the determinism framework + exception ledger; NaN
       canonicalized on store. On-disk type code 12. → [float.md](spec/design/float.md),
@@ -237,7 +237,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `array_positions` (NULL-safe element match; 1-D-only `0A000` for remove/position/positions;
         `array_replace` any-dim; `array_position` returns a SUBSCRIPT, NULL start → `22004`). All three
         cores, oracle-checked (`suites/expr/array_concat_search.test`), registry code `22004`, result
-        code `int32[]`. → [array-functions.md §8](spec/design/array-functions.md)
+        code `i32[]`. → [array-functions.md §8](spec/design/array-functions.md)
   - [x] **AF3 — `unnest(anyarray)` the set-returning function** — the engine's second FROM-clause
         SRF (after `generate_series`), generalizing the [functions.md §10](spec/design/functions.md)
         SRF machinery to a **polymorphic element-type** output column: a new reserved SRF result
@@ -282,7 +282,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           [array-functions.md §11.6](spec/design/array-functions.md)
   - [x] **AF6 — the `VARIADIC` call syntax + variadic overload resolution** — the `make_interval`-era
         follow-on unblocked by the array type, spent on the engine's first VARIADIC built-ins
-        `num_nulls`/`num_nonnulls` (count the NULL / non-NULL arguments → int32). A new catalog field
+        `num_nulls`/`num_nonnulls` (count the NULL / non-NULL arguments → i32). A new catalog field
         `variadic=true` marks the last parameter VARIADIC: a call takes EITHER a spread of ≥1 trailing
         args (`num_nulls(1,NULL,3)`, heterogeneous — the variadic element family is `"any"`; zero args
         is `42883`) OR a single array via the `VARIADIC` keyword (`num_nulls(VARIADIC ARRAY[1,NULL,3])`,
@@ -308,7 +308,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `array_composite_table.jed` (`rust == go == ts == ruby`); all three cores + Ruby; oracle-checked
         `types/array_composite.test`; capability `types.array_composite`. → [array.md §12](spec/design/array.md)
   - [x] **CMP-ARR-FIELD — a composite type with an array-typed field** (`CREATE TYPE poly AS (name
-        text, pts int32[])` — the mirror of AC1): the composite-type catalog entry gains a
+        text, pts i32[])` — the mirror of AC1): the composite-type catalog entry gains a
         `field_type_code = 15` array field carrying the inline element descriptor (no
         `format_version` bump — still 10; before the field flags byte, where a nested-composite name
         sits), and the value codec / comparison / `record_out` / `record_in` recurse for free (an
@@ -527,7 +527,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ the `WITH (OLD AS o, NEW AS n)` aliasing form; `old.*`/`new.*`.
 - [ ] **Sequences** (`CREATE SEQUENCE` / `nextval` / `currval`) — the PostgreSQL sequence object as
       a third catalog-object kind (after tables + composite types): a named, persisted, monotonic
-      **int64** generator in `Snapshot.sequences`, advanced by `nextval('s')` and read by
+      **i64** generator in `Snapshot.sequences`, advanced by `nextval('s')` and read by
       `currval('s')` (session-local). **The defining decision — `nextval` is TRANSACTIONAL** (rolls
       back with the txn), a deliberate PG divergence already mandated by
       [determinism.md §5](spec/design/determinism.md) ("do not exempt" the counter): jed is
@@ -782,7 +782,7 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       `SUM`/`MIN`/`MAX`/`AVG` + `GROUP BY` TLP (blocked on `COALESCE`/`LEAST`/`GREATEST`), and
       **broader NoREC relations** (see the growth obligation below). _(size: M remaining; §7)_
 - [x] **Result-type assertion directive** — the `# types:` directive asserts each result column's
-      precise resolved type (`int16` vs `int32`) beyond the render tag; `numeric(p,s)` typmod
+      precise resolved type (`i16` vs `i32`) beyond the render tag; `numeric(p,s)` typmod
       granularity stays deferred. → [conformance.md §7](spec/design/conformance.md)
 - [ ] **Corpus growth** — keep adding `.test` coverage as each feature lands (ongoing). Two
       **standing obligations** when a feature lands (conformance.md §5/§8): (a) on the

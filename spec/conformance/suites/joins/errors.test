@@ -2,13 +2,13 @@
 # An INNER/bare JOIN requires ON (a missing ON is 42601); a CROSS JOIN takes no ON. Comma-FROM
 # (`FROM a, b`) is dropped (42601). An unknown table in FROM is 42P01. (The OUTER family now
 # executes — its semantics are covered by left.test / right.test / full.test.)
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.join_inner, query.cross_join, query.qualified_column, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.join_inner, query.cross_join, query.qualified_column, types.i32, resource.cost_metering
 
 statement ok
-CREATE TABLE p (id int32 PRIMARY KEY, v int32)
+CREATE TABLE p (id i32 PRIMARY KEY, v i32)
 
 statement ok
-CREATE TABLE q (id int32 PRIMARY KEY, v int32)
+CREATE TABLE q (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO p VALUES (1, 10)

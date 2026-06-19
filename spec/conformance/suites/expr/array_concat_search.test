@@ -6,10 +6,10 @@
 # works on any dimensionality; array_position returns a SUBSCRIPT in the array's lower-bound space and
 # its optional start subscript must not be NULL (22004). A bare untyped NULL operand of `||` resolves
 # to array_cat (the NULL array = identity), matching PostgreSQL. PostgreSQL-oracle-verified (postgres:18).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.int32, types.text, func.array, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.i32, types.text, func.array, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, xs int32[], ys int32[])
+CREATE TABLE t (id i32 PRIMARY KEY, xs i32[], ys i32[])
 
 # Row 1: xs has a duplicate 20 (for remove/replace/position). Row 2: an EMPTY xs + a NULL ys. Row 3: a NULL xs.
 statement ok
@@ -146,7 +146,7 @@ SELECT array_positions(ARRAY[1,2,3], 99) FROM t WHERE id = 1
 {}
 
 query T nosort
-SELECT array_positions(NULL::int32[], 1) FROM t WHERE id = 1
+SELECT array_positions(NULL::i32[], 1) FROM t WHERE id = 1
 ----
 NULL
 
@@ -172,14 +172,14 @@ SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] || ARRAY[5,6] FROM t WHERE id = 1
 
 # array_position over a custom lower bound returns the SUBSCRIPT; the optional start is a subscript.
 query II nosort
-SELECT array_position('[5:7]={10,20,30}'::int32[], 20), array_position(ARRAY[10,20,30,20], 20, 3) FROM t WHERE id = 1
+SELECT array_position('[5:7]={10,20,30}'::i32[], 20), array_position(ARRAY[10,20,30,20], 20, 3) FROM t WHERE id = 1
 ----
 6
 4
 
 # array_remove preserves the lower bound (a removal shrinks the upper bound).
 query T nosort
-SELECT array_dims(array_remove('[2:4]={1,2,3}'::int32[], 2)) FROM t WHERE id = 1
+SELECT array_dims(array_remove('[2:4]={1,2,3}'::i32[], 2)) FROM t WHERE id = 1
 ----
 [2:3]
 
@@ -193,7 +193,7 @@ SELECT array_position(ARRAY[ARRAY[1,2],ARRAY[3,4]], 1) FROM t WHERE id = 1
 
 # A NULL start subscript (typed) → 22004.
 statement error 22004
-SELECT array_position(ARRAY[10,20,30], 20, NULL::int32) FROM t WHERE id = 1
+SELECT array_position(ARRAY[10,20,30], 20, NULL::i32) FROM t WHERE id = 1
 
 # array || element on a multidimensional array → 22000 (the array_append rule).
 statement error 22000

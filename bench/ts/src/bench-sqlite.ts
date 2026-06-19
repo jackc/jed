@@ -1,6 +1,6 @@
 // bench-sqlite benchmarks SQLite via node:sqlite — built into Node, zero dependency
 // (spec/design/benchmarks.md §7). $N is rewritten to ?N at prepare time (§3); integers
-// are read as BigInt so int64 stays exact.
+// are read as BigInt so i64 stays exact.
 
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";

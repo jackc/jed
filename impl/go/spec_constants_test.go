@@ -452,7 +452,7 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			// A polymorphic array function (array-functions.md §2): its kernel id comes from
 			// arrayFuncID and its result is a reserved poly code or a scalar id.
 			_ = arrayFuncID(o.Name) // panics if the name has no kernel id
-			// A concrete array result `<scalar>[]` (array_positions → "int32[]") is also valid.
+			// A concrete array result `<scalar>[]` (array_positions → "i32[]") is also valid.
 			concreteArray := false
 			if base, ok := strings.CutSuffix(o.Result, "[]"); ok {
 				_, concreteArray = ScalarTypeFromName(base)
@@ -488,7 +488,7 @@ func TestRegistryCoversCatalog(t *testing.T) {
 	for i := range Aggregates {
 		a := &Aggregates[i]
 		switch a.Result {
-		case "int64", "decimal", "sum_widen", "same_as_input":
+		case "i64", "decimal", "sum_widen", "same_as_input":
 		default:
 			t.Fatalf("aggregate %s has unhandled result code %s", a.Name, a.Result)
 		}

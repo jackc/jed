@@ -14,9 +14,9 @@ import "testing"
 func subqueryAB(t *testing.T) *Database {
 	return dbWith(
 		t,
-		"CREATE TABLE a (id int32 PRIMARY KEY, k int32)",
-		"CREATE TABLE b (id int32 PRIMARY KEY, k int32)",
-		"CREATE TABLE one (id int32 PRIMARY KEY)",
+		"CREATE TABLE a (id i32 PRIMARY KEY, k i32)",
+		"CREATE TABLE b (id i32 PRIMARY KEY, k i32)",
+		"CREATE TABLE one (id i32 PRIMARY KEY)",
 		"INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)",
 		"INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)",
 		"INSERT INTO one VALUES (1)",
@@ -55,8 +55,8 @@ func TestCorrelatedInnerErrorOverEmptyOuter(t *testing.T) {
 	// same guarantee via an empty inner filter, not an empty outer — so this trigger shape is kept.
 	db := dbWith(
 		t,
-		"CREATE TABLE e (id int32 PRIMARY KEY, v int32)",
-		"CREATE TABLE f (id int32 PRIMARY KEY, v int32)",
+		"CREATE TABLE e (id i32 PRIMARY KEY, v i32)",
+		"CREATE TABLE f (id i32 PRIMARY KEY, v i32)",
 		"INSERT INTO f VALUES (1, 1)",
 	)
 	if got := errCode(t, db, "SELECT (SELECT id, v FROM f WHERE v = e.v) FROM e"); got != "42601" {

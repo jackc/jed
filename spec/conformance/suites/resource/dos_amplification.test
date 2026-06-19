@@ -13,10 +13,10 @@
 #
 # jed-SPECIFIC (PostgreSQL has no execution-cost ceiling — a documented divergence, CLAUDE.md §1/§13),
 # so the 54P01 records are NOT oracle-checked; the `# cost:` baselines are the cross-core contract.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, types.int32, types.decimal, expr.decimal_arithmetic, resource.cost_metering, resource.cost_limit
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, types.i32, types.decimal, expr.decimal_arithmetic, resource.cost_metering, resource.cost_limit
 
 statement ok
-CREATE TABLE s (id int32 PRIMARY KEY, v int32)
+CREATE TABLE s (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO s VALUES (1, 10), (2, 20)
@@ -67,7 +67,7 @@ SELECT a.v FROM s a CROSS JOIN s b CROSS JOIN s c
 # The explosion is the point: scaling the table up makes the cube of produced rows dwarf the
 # scan, so a fixed ceiling that passes a keyed query aborts the product far below its full cost.
 statement ok
-CREATE TABLE wide (id int32 PRIMARY KEY, v int32)
+CREATE TABLE wide (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO wide VALUES (1,1),(2,2),(3,3),(4,4),(5,5),(6,6)
@@ -80,7 +80,7 @@ SELECT a.v FROM wide a CROSS JOIN wide b CROSS JOIN wide c
 # === 2. Correlated subquery — the inner relation is re-scanned once PER OUTER ROW ===
 
 statement ok
-CREATE TABLE o (id int32 PRIMARY KEY, v int32)
+CREATE TABLE o (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO o VALUES (1, 10), (2, 20)

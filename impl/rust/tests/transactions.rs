@@ -25,7 +25,7 @@ fn count(db: &mut Database, table: &str) -> usize {
 
 #[test]
 fn begin_execute_commit_is_visible() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     let mut tx = db.begin(true).unwrap();
     tx.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
     tx.execute("INSERT INTO t VALUES (2)", &[]).unwrap();
@@ -41,7 +41,7 @@ fn begin_execute_commit_is_visible() {
 #[test]
 fn begin_execute_rollback_discards() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1)",
     ]);
     let mut tx = db.begin(true).unwrap();
@@ -53,7 +53,7 @@ fn begin_execute_rollback_discards() {
 #[test]
 fn dropping_an_unfinished_tx_rolls_back() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1)",
     ]);
     {
@@ -67,7 +67,7 @@ fn dropping_an_unfinished_tx_rolls_back() {
 
 #[test]
 fn update_closure_commits_on_ok() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     let n = db
         .update(|tx| {
             tx.execute("INSERT INTO t VALUES (1)", &[])?;
@@ -83,7 +83,7 @@ fn update_closure_commits_on_ok() {
 #[test]
 fn update_closure_rolls_back_on_err() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1)",
     ]);
     let r: jed::Result<()> = db.update(|tx| {
@@ -101,7 +101,7 @@ fn update_closure_rolls_back_on_err() {
 #[test]
 fn view_is_read_only() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1), (2)",
     ]);
     // a read inside a view works and returns its value
@@ -120,7 +120,7 @@ fn view_is_read_only() {
 
 #[test]
 fn nested_begin_is_25001() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     let mut tx = db.begin(true).unwrap();
     tx.execute("INSERT INTO t VALUES (1)", &[]).unwrap();
     // a SQL BEGIN inside an already-open transaction is 25001
@@ -132,7 +132,7 @@ fn nested_begin_is_25001() {
 
 #[test]
 fn commit_and_rollback_are_noops_in_autocommit() {
-    let mut db = db_with(&["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+    let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     // no open transaction: both are lenient no-op successes (transactions.md §4.2)
     db.commit().unwrap();
     db.rollback().unwrap();

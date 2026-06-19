@@ -36,7 +36,7 @@ byte-wise comparison: `memcmp` reads the most-significant byte first, so the MSB
 stored first. The sign-bit flip — equivalently, **add the bias `2^(bits-1)` and emit the
 sum as an unsigned big-endian integer** — maps the two's-complement signed range
 monotonically onto `[0, 2^bits)`, so negatives sort below positives. Width is the type's
-width (`int16` → 2 bytes, `int32` → 4, `int64` → 8); the value is assumed already
+width (`i16` → 2 bytes, `i32` → 4, `i64` → 8); the value is assumed already
 range-checked by the caller.
 
 ### 2.2 Nullable key slot — the presence tag
@@ -242,15 +242,15 @@ is NOT NULL, so no presence tag). A stored uuid *value* reuses the same 16 bytes
 value-codec presence tag ([../fileformat/format.md](../fileformat/format.md)); for uuid the key
 and value bodies coincide (both the raw 16 bytes), the simplest case of the §3 key/value seam.
 
-### 2.8 Float (`float32` / `float64`) — `float-order-preserving` (authored; unexercised this slice)
+### 2.8 Float (`f32` / `f64`) — `float-order-preserving` (authored; unexercised this slice)
 
-Both binary floats are fixed-width (`float64` = 8 bytes, `float32` = 4 bytes) but, unlike the
+Both binary floats are fixed-width (`f64` = 8 bytes, `f32` = 4 bytes) but, unlike the
 integers, the IEEE 754 bit pattern does **not** sort by `memcmp` in numeric order: negatives have
 the sign bit set (so they would sort *above* positives), and within negatives larger magnitudes
 sort later (backwards). The standard transform maps the type's **total order**
 ([compare.toml](../types/compare.toml) `float = "float-total-order"`;
 [../design/float.md](float.md) §3) onto unsigned byte order — identical for both widths, over a
-`u32` (`float32`) or `u64` (`float64`):
+`u32` (`f32`) or `u64` (`f64`):
 
 1. **Canonicalize** first, so equal values encode identically: `-0.0 → +0.0`, and every NaN → one
    canonical NaN bit pattern (`NaN = NaN` and `-0 = +0` in the total order — §3).
@@ -262,12 +262,12 @@ sort later (backwards). The standard transform maps the type's **total order**
 This composes with the §2.2 nullable presence tag (`0x00` present ‖ the 8 bytes, or `0x01` NULL)
 and the §2.3 descending inversion unchanged.
 
-**Status — authored, not yet exercised.** A `float32`/`float64` `PRIMARY KEY`/index is rejected
+**Status — authored, not yet exercised.** A `f32`/`f64` `PRIMARY KEY`/index is rejected
 `0A000` this slice — the text/decimal/bytea/interval precedent, reinforced by the
 **contamination** rule ([determinism.md](determinism.md) §4): keeping an exempted-value type out
 of *keys* bounds float non-determinism to *query-time* order, never *stored* order. Stored float
 *values* use the simpler fixed value codec ([../fileformat/format.md](../fileformat/format.md),
-type code 12 for `float64` / 13 for `float32`), which preserves the bits verbatim (no
+type code 12 for `f64` / 13 for `f32`), which preserves the bits verbatim (no
 canonicalization) because a stored value never needs to sort.
 Lifting the narrowing adds the `(value → bytes)` fixtures and the executor key path then.
 
@@ -322,7 +322,7 @@ order with no comparator), proving the executor key path generalizes beyond inte
 concatenates its fixed-width components per §2.3, pinned by the `composite_pk_table.jed`
 golden. Nullable **secondary indexes** have since **landed** ([indexes.md](indexes.md),
 `index_table.jed` golden) — the first place §2.2's presence-tag sort order is load-bearing
-rather than spec-only — as have `timestamp`/`timestamptz` keys (the int64 rule). The remaining
+rather than spec-only — as have `timestamp`/`timestamptz` keys (the i64 rule). The remaining
 non-integer scalars (`decimal`, `text`, `bytea`, `float`, `interval`) add their own §2 key paths
 when their in-key narrowings lift.
 

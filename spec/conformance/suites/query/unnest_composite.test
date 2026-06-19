@@ -10,10 +10,10 @@
 # NULL-element-renders-as-(,) PG quirks are jed-divergent, decisions 23/24, and live in the per-core
 # unit tests, not here.) Construction uses the PG-portable '{…}'::addr[] / '(…)'::addr text literals.
 # PostgreSQL-oracle-verified (postgres:18).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.set_returning, func.unnest, func.array, func.array_composite, types.array_composite, types.composite, types.array, types.array_multidim, query.order_by, query.aggregates, query.subquery_correlated, query.qualified_column, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.set_returning, func.unnest, func.array, func.array_composite, types.array_composite, types.composite, types.array, types.array_multidim, query.order_by, query.aggregates, query.subquery_correlated, query.qualified_column, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TYPE addr AS (street text, zip int32)
+CREATE TYPE addr AS (street text, zip i32)
 
 # --- the basic case: unnest produces one COMPOSITE row per element ----------------------
 # `SELECT u` reads the whole composite (the alias is a whole-row reference, agreeing with PG); the
@@ -73,7 +73,7 @@ SELECT u FROM unnest('{{"(a,1)","(b,2)"},{"(c,3)","(d,4)"}}'::addr[]) AS u ORDER
 
 # --- a correlated OUTER column (a stored addr[] column) as the argument (non-LATERAL) ----
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, items addr[])
+CREATE TABLE t (id i32 PRIMARY KEY, items addr[])
 
 statement ok
 INSERT INTO t VALUES (1, '{"(Main,90210)","(Side,5)"}'), (2, '{}'), (3, NULL)

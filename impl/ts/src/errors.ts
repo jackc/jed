@@ -12,7 +12,7 @@ export type SqlState =
   | "numeric_value_out_of_range" // 22003 — integer overflow (CLAUDE.md §8)
   | "null_value_not_allowed" // 22004 — array_position's start subscript must not be NULL (array-functions.md §8)
   | "invalid_datetime_format" // 22007 — malformed timestamp/timestamptz input
-  | "datetime_field_overflow" // 22008 — out-of-range datetime field or value beyond int64 µs
+  | "datetime_field_overflow" // 22008 — out-of-range datetime field or value beyond i64 µs
   | "division_by_zero" // 22012 — division or modulo by zero
   | "invalid_parameter_value" // 22023 — a bad numeric typmod (e.g. numeric(0))
   | "sequence_generator_limit_exceeded" // 2200H — nextval advanced past a sequence's MAX/MINVALUE bound without CYCLE (sequences.md §4)

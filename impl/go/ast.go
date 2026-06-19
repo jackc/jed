@@ -12,7 +12,7 @@ type Statement struct {
 	CreateType  *CreateType
 	DropType    *DropType
 	// CreateSequence/AlterSequence/DropSequence are the sequence DDL statements
-	// (spec/design/sequences.md): a named, persisted int64 generator. Non-nil only for that statement.
+	// (spec/design/sequences.md): a named, persisted i64 generator. Non-nil only for that statement.
 	CreateSequence *CreateSequence
 	AlterSequence  *AlterSequence
 	DropSequence   *DropSequence
@@ -203,7 +203,7 @@ type DropType struct {
 }
 
 // CreateSequence is a CREATE SEQUENCE [IF NOT EXISTS] <name> [options] statement — a named,
-// persisted int64 generator (spec/design/sequences.md). The options are order-free; each is
+// persisted i64 generator (spec/design/sequences.md). The options are order-free; each is
 // captured as a parsed override, with a nil pointer meaning "use the default" (resolved at
 // execution against the INCREMENT sign). Execution validates the option set (22023), rejects a
 // relation-namespace collision (42P07 unless IfNotExists), and registers the sequence.
@@ -886,7 +886,7 @@ const (
 // Literal is a literal value as written in SQL. A bare integer literal is an *untyped
 // constant* that adapts to its context — the target column on INSERT/UPDATE, a sibling
 // operand, the compared column in a WHERE predicate — and traps 22003 if it does not
-// fit; with no context it defaults to int64 (spec/design/types.md §6). A boolean
+// fit; with no context it defaults to i64 (spec/design/types.md §6). A boolean
 // literal is expression-only this slice (it cannot be stored).
 type Literal struct {
 	Kind LiteralKind

@@ -108,11 +108,11 @@ func TestGenerateSeriesCostCeiling(t *testing.T) {
 
 func TestGenerateSeriesMixedWidthPromotion(t *testing.T) {
 	db := NewDatabase()
-	out, err := Execute(db, "SELECT * FROM generate_series(CAST(1 AS int16), CAST(5 AS int32))")
+	out, err := Execute(db, "SELECT * FROM generate_series(CAST(1 AS i16), CAST(5 AS i32))")
 	if err != nil {
 		t.Fatalf("mixed width: %v", err)
 	}
-	if len(out.ColumnTypes) != 1 || out.ColumnTypes[0] != "int32" {
+	if len(out.ColumnTypes) != 1 || out.ColumnTypes[0] != "i32" {
 		t.Errorf("column types: %v", out.ColumnTypes)
 	}
 }

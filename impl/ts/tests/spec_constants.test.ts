@@ -264,7 +264,7 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
   // additionally pin their per-core kernel-id maps.)
   // A scalar function's result code is "promoted" or a literal scalar-type id; a polymorphic array
   // function's (array-functions.md §2) is the reserved "anyarray"/"anyelement", a concrete array
-  // `<scalar>[]` (array_positions → "int32[]", §8), or a scalar id.
+  // `<scalar>[]` (array_positions → "i32[]", §8), or a scalar id.
   for (const o of OPERATORS) {
     if (o.kind !== "function") continue;
     const concreteArray = o.result.endsWith("[]") && scalarTypeFromName(o.result.slice(0, -2)) !== undefined;
@@ -276,7 +276,7 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
       scalarTypeFromName(o.result) !== undefined;
     assert.ok(ok, `function ${o.name} has unhandled result code ${o.result}`);
   }
-  const AGG_RESULT_CODES = new Set(["int64", "decimal", "sum_widen", "same_as_input"]);
+  const AGG_RESULT_CODES = new Set(["i64", "decimal", "sum_widen", "same_as_input"]);
   for (const a of AGGREGATES) {
     assert.ok(AGG_RESULT_CODES.has(a.result), `aggregate ${a.name} has unhandled result code ${a.result}`);
   }

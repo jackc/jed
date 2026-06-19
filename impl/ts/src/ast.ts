@@ -1,12 +1,12 @@
 // Abstract syntax for the step-1 SQL surface. Boring, explicit shapes (CLAUDE.md §10);
 // the hand-written parser produces these. Variants are discriminated unions tagged
 // with `kind` (the elidable-subset analogue of Go's one-field-set structs / Rust's
-// enums). Integer literals carry a `bigint` so int64 is exact.
+// enums). Integer literals carry a `bigint` so i64 is exact.
 
 // Literal is a literal value as written in SQL. A bare integer literal is an *untyped
 // constant* that adapts to its context — the target column on INSERT/UPDATE, a sibling
 // operand, the compared column in a WHERE predicate — and traps 22003 if it does not
-// fit; with no context it defaults to int64 (spec/design/types.md §6). A boolean literal
+// fit; with no context it defaults to i64 (spec/design/types.md §6). A boolean literal
 // is expression-only this slice (it cannot be stored).
 import type { Decimal } from "./decimal.ts";
 
@@ -334,7 +334,7 @@ export type TypeFieldDef = {
 export type DropType = { kind: "dropType"; name: string; ifExists: boolean };
 
 // CreateSequence is a `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` statement — a named,
-// persisted int64 generator (spec/design/sequences.md). The options are order-free; each is
+// persisted i64 generator (spec/design/sequences.md). The options are order-free; each is
 // captured as a parsed override, with `null` meaning "use the default" (resolved at execution
 // against the INCREMENT sign). Execution validates the option set (22023), rejects a relation-
 // namespace collision (42P07 unless `ifNotExists`), and registers the sequence in the catalog.

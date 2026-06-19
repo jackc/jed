@@ -10,12 +10,12 @@ import { test } from "node:test";
 import { Database, execute } from "../src/lib.ts";
 import type { Value } from "../src/value.ts";
 
-// `a` is n rows (id int32 PRIMARY KEY, k int32; k == id) wide enough to span several leaves; `b` is
+// `a` is n rows (id i32 PRIMARY KEY, k i32; k == id) wide enough to span several leaves; `b` is
 // three small rows whose k-values exist as a's k-values, so the join matches.
 function joinTables(n: number): Database {
   const db = new Database();
-  execute(db, "CREATE TABLE a (id int32 PRIMARY KEY, k int32)");
-  execute(db, "CREATE TABLE b (id int32 PRIMARY KEY, k int32)");
+  execute(db, "CREATE TABLE a (id i32 PRIMARY KEY, k i32)");
+  execute(db, "CREATE TABLE b (id i32 PRIMARY KEY, k i32)");
   const parts: string[] = [];
   for (let i = 1; i <= n; i++) parts.push(`(${i},${i})`);
   execute(db, "INSERT INTO a VALUES " + parts.join(","));

@@ -14,7 +14,7 @@ reference implementation** (CLAUDE.md §2) — each is a downstream consumer of
 
 Rust, Go, and TS are the differential set: Rust and Go are about as far apart as two
 systems languages get, and the native TS core closes the two axes they agreed on by
-construction (exact int64 via `bigint`, UTF-8 names, big-endian bytes — CLAUDE.md §2).
+construction (exact i64 via `bigint`, UTF-8 names, big-endian bytes — CLAUDE.md §2).
 Java, C#, and Swift come later, chosen **native or wrapped per language** on
 best-experience grounds (CLAUDE.md §2, [../spec/design/cores.md](../spec/design/cores.md)).
 

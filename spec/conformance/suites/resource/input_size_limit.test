@@ -16,10 +16,10 @@
 #
 # jed-SPECIFIC (PostgreSQL has no fixed query-length limit — a documented divergence, CLAUDE.md
 # §1/§13), so the 54000 records are NOT oracle-checked.
-# requires: ddl.create_table, ddl.primary_key, query.select, expr.arithmetic, types.int32, types.text, resource.sql_length_limit
+# requires: ddl.create_table, ddl.primary_key, query.select, expr.arithmetic, types.i32, types.text, resource.sql_length_limit
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
 
 # === Boundary: the cap is the maximum allowed byte length (inclusive). `SELECT 1` is 8 bytes. ===
 

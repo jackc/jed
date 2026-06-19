@@ -3,7 +3,7 @@
 # The calendar/parse/render arithmetic of spec/design/date.md, pinned as (input -> days),
 # (input -> error), and (days -> text) vectors. A core's date implementation is conformant
 # iff, for every vector below:
-#   parse        parse_date(input) == days        (the int32 days since 1970-01-01)
+#   parse        parse_date(input) == days        (the i32 days since 1970-01-01)
 #   parse_error  parse_date(input) traps `error`  (the SQLSTATE, raised at resolve)
 #   render       render_date(days) == text        (the canonical output string)
 # Reasoning + the algorithm live in ../design/date.md. `days` are computed by the SAME Hinnant

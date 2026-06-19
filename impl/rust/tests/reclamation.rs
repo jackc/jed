@@ -65,7 +65,7 @@ fn setup(path: &PathBuf, rows: i64) -> Database {
         },
     )
     .unwrap();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)").unwrap();
     let base = "x".repeat(40);
     for i in 1..=rows {
         execute(

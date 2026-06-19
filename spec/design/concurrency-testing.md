@@ -96,11 +96,11 @@ read (a write is `25006`, never poisoning the handle); a `write` session must en
 
 ```
 # format: concurrency
-# requires: txn.shared, txn.read_handle, txn.watermark, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.int32
+# requires: txn.shared, txn.read_handle, txn.watermark, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.i32
 
 open w write
 on w statement ok
-CREATE TABLE t (id int32 PRIMARY KEY)
+CREATE TABLE t (id i32 PRIMARY KEY)
 on w statement ok
 INSERT INTO t VALUES (1)
 commit w
@@ -219,7 +219,7 @@ seed        = 1234         # drives the fallback scheduler and any workload rand
 
 [setup]                    # run once, deterministically (whole-image autocommit, before any worker)
 sql = [
-  "CREATE TABLE acct (id int32 PRIMARY KEY, bal int64)",
+  "CREATE TABLE acct (id i32 PRIMARY KEY, bal i64)",
   "INSERT INTO acct VALUES (1, 1000), (2, 0)",
 ]
 

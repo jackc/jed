@@ -1,10 +1,10 @@
 # Error surface of non-recursive common table expressions (spec/design/cte.md §4). Codes verified
 # against the live PostgreSQL 18 oracle, except the two deliberate jed narrowings recorded in
 # oracle_overrides.toml (WITH RECURSIVE and a nested WITH, both of which PostgreSQL accepts).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.cte, types.int32
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.cte, types.i32
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, n int32)
+CREATE TABLE t (id i32 PRIMARY KEY, n i32)
 
 statement ok
 INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)

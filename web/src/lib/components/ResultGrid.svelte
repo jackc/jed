@@ -18,7 +18,7 @@
 
 	// A numeric column (int/decimal) is right-aligned, mirroring the CLI's aligned format.
 	function isNumeric(type: string): boolean {
-		return /^(int16|int32|int64|decimal|numeric|float32|float64)/.test(type);
+		return /^(i16|i32|i64|decimal|numeric|f32|f64)/.test(type);
 	}
 
 	const log = $derived(

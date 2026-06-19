@@ -10,16 +10,16 @@
 # RIGHT/FULL JOIN to a lateral item that references the left side is 42P10; an uncorrelated one is
 # materialized once and allowed. Cost is the sum of the per-left-row body evaluations (deterministic,
 # max_cost-bounded). Oracle-checked against PostgreSQL (rake corpus:check).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.cross_join, query.join_inner, query.join_left, query.join_right, query.qualified_column, query.table_alias, query.order_by, query.order_by_keys, query.limit, query.set_returning, func.unnest, func.array, query.values, query.derived_table, query.lateral, query.subquery_scalar, query.subquery_correlated, null.three_valued, types.int32, types.int64, types.array, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.cross_join, query.join_inner, query.join_left, query.join_right, query.qualified_column, query.table_alias, query.order_by, query.order_by_keys, query.limit, query.set_returning, func.unnest, func.array, query.values, query.derived_table, query.lateral, query.subquery_scalar, query.subquery_correlated, null.three_valued, types.i32, types.i64, types.array, resource.cost_metering
 
 statement ok
-CREATE TABLE lt (id int32 PRIMARY KEY, n int32)
+CREATE TABLE lt (id i32 PRIMARY KEY, n i32)
 
 statement ok
 INSERT INTO lt VALUES (1, 2), (2, 0), (3, 3)
 
 statement ok
-CREATE TABLE lc (id int32 PRIMARY KEY, arr int32[])
+CREATE TABLE lc (id i32 PRIMARY KEY, arr i32[])
 
 statement ok
 INSERT INTO lc VALUES (1, '{10,20}'), (2, '{}'), (3, '{30}')

@@ -5,9 +5,9 @@ pub enum Token {
     /// A bare word: keyword or identifier (callers compare case-insensitively).
     Word(String),
     /// An integer literal's UNSIGNED magnitude (the sign is the `Minus` operator).
-    /// The lexer guarantees it is `<= 2^63`; `i64`/`int64` cannot hold `2^63`, so the
+    /// The lexer guarantees it is `<= 2^63`; `i64`/`i64` cannot hold `2^63`, so the
     /// parser converts: a bare magnitude `> i64::MAX` traps 22003, and `-(2^63)` folds
-    /// to `int64::MIN`. See spec/design/grammar.md §4.
+    /// to `i64::MIN`. See spec/design/grammar.md §4.
     Int(u64),
     /// A single-quoted string literal's decoded content (the `text` type). The lexer
     /// strips the surrounding quotes and collapses each doubled `''` to one `'`

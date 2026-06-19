@@ -12,7 +12,7 @@
 #   3. every arg_families entry is "any", a real `family` in scalars.toml, or a
 #      polymorphic pseudo-family (anyarray | anyelement — array-functions.md §2)
 #   4. result is a scalar id in scalars.toml ("boolean"), a reserved id (promoted |
-#      anyarray | anyelement), or a concrete array result `<scalar>[]` (array_positions → int32[])
+#      anyarray | anyelement), or a concrete array result `<scalar>[]` (array_positions → i32[])
 #   5. arg_resolution is "promote" | "none"; "promote" requires the operand pair
 #      to be comparable and the family to have a promotion rule (compare.toml)
 #   6. null is "propagates" | "detects" | "kleene" | "null_safe" | "none" (null_safe = the
@@ -156,7 +156,7 @@ def main
     end
 
     # (4) result is a scalar id, a reserved id, or a concrete array result `<scalar>[]`
-    # (array_positions → "int32[]"; the resolver reads it as Array(scalar) — array-functions.md §8).
+    # (array_positions → "i32[]"; the resolver reads it as Array(scalar) — array-functions.md §8).
     result = op["result"]
     array_result = result.is_a?(String) && result.end_with?("[]") && scalar_ids.include?(result[0..-3])
     unless scalar_ids.include?(result) || RESERVED_RESULTS.include?(result) || array_result

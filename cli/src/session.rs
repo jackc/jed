@@ -173,7 +173,7 @@ mod tests {
     fn tags_and_tx_state() {
         let mut s = mem();
         assert!(matches!(s.tx_state(), TxState::Autocommit));
-        match s.run("CREATE TABLE t (id int32 PRIMARY KEY)").unwrap() {
+        match s.run("CREATE TABLE t (id i32 PRIMARY KEY)").unwrap() {
             ExecOutput::Statement { tag, rows, .. } => {
                 assert_eq!(tag, "OK");
                 assert_eq!(rows, None);
@@ -219,7 +219,7 @@ mod tests {
     #[test]
     fn dml_statements_carry_affected_rows() {
         let mut s = mem();
-        s.run("CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+        s.run("CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
         match s.run("INSERT INTO t VALUES (1), (2), (3)").unwrap() {
             ExecOutput::Statement { tag, rows, .. } => {
                 assert_eq!(tag, "OK");
@@ -236,8 +236,7 @@ mod tests {
     #[test]
     fn query_output_carries_columns_rows_cost() {
         let mut s = mem();
-        s.run("CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
-            .unwrap();
+        s.run("CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
         s.run("INSERT INTO t VALUES (1, 10)").unwrap();
         match s.run("SELECT id, v FROM t ORDER BY id").unwrap() {
             ExecOutput::Query {

@@ -3,13 +3,13 @@
 # An ORDER BY on an operand is a 42601 (leftover token — operands carry no trailing clauses); a
 # trailing ORDER BY resolves by OUTPUT column name only, so a qualified key is 42P01 and an
 # unknown name is 42703.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.intersect, query.except, query.order_by, types.int32, types.text
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.union, query.intersect, query.except, query.order_by, types.i32, types.text
 
 statement ok
-CREATE TABLE x (id int32 PRIMARY KEY, a int32, b int32)
+CREATE TABLE x (id i32 PRIMARY KEY, a i32, b i32)
 
 statement ok
-CREATE TABLE y (id int32 PRIMARY KEY, a int32, t text)
+CREATE TABLE y (id i32 PRIMARY KEY, a i32, t text)
 
 statement ok
 INSERT INTO x VALUES (1, 10, 20)

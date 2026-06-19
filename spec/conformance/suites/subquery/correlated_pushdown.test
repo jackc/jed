@@ -9,13 +9,13 @@
 # §3; the same units in Rust, Go, TS). All units weigh 1. `o` and `inr` are three/four rows in one
 # leaf each, so page_read is 1 for any non-empty inner bound and 0 for an empty one; the win shows in
 # storage_row_read — a point lookup reads 0/1 inner rows per outer row, not all of `inr`.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.qualified_column, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.correlated_pushdown, types.int32, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.qualified_column, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, query.correlated_pushdown, types.i32, null.three_valued, resource.cost_metering
 
 statement ok
-CREATE TABLE o (id int32 PRIMARY KEY, k int32)
+CREATE TABLE o (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE inr (id int32 PRIMARY KEY, v int32)
+CREATE TABLE inr (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO o VALUES (1, 2), (2, 5), (3, 9), (4, NULL)

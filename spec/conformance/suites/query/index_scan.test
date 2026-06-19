@@ -7,10 +7,10 @@
 # charges nothing. The WHERE stays the residual filter, so rows NEVER change — only cost
 # does. Maintenance (indexes.md §4) keeps the index exact across INSERT/UPDATE/DELETE.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.limit, query.point_lookup, query.join_inner, query.qualified_column, query.table_alias, query.subquery_scalar, query.subquery_correlated, query.correlated_pushdown, types.int32, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, query.select, query.where_eq, query.order_by, query.limit, query.point_lookup, query.join_inner, query.qualified_column, query.table_alias, query.subquery_scalar, query.subquery_correlated, query.correlated_pushdown, types.i32, null.three_valued, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)
+CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)
 
 statement ok
 INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (5, 0, 5), (6, 1, 6), (7, 2, 7), (8, 3, 8), (9, 4, 9), (10, 0, 10), (11, 1, 11), (12, 2, 12), (13, 3, 13), (14, 4, 14), (15, 0, 15), (16, 1, 16), (17, 2, 17), (18, 3, 18), (19, 4, 19), (20, 0, 20)
@@ -131,7 +131,7 @@ SELECT id FROM t WHERE v = 3 ORDER BY id
 # --- the index bound composes with JOIN and correlated subqueries ----------------
 
 statement ok
-CREATE TABLE side (k int32 PRIMARY KEY, tag int32)
+CREATE TABLE side (k i32 PRIMARY KEY, tag i32)
 
 statement ok
 INSERT INTO side VALUES (1, 3), (2, 4)

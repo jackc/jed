@@ -8,8 +8,8 @@ import (
 )
 
 // foldInt converts a lexed unsigned magnitude (<= 2^63) and a sign into a signed
-// int64, reporting ok=false when the result does not fit (a bare 2^63, or the
-// not-negated 2^63). -(2^63) folds to int64's minimum. See spec/design/grammar.md §4.
+// i64, reporting ok=false when the result does not fit (a bare 2^63, or the
+// not-negated 2^63). -(2^63) folds to i64's minimum. See spec/design/grammar.md §4.
 func foldInt(magnitude uint64, negate bool) (int64, bool) {
 	if negate {
 		if magnitude <= uint64(math.MaxInt64) {
@@ -906,7 +906,7 @@ func (p *Parser) parseCreateType() (*CreateType, error) {
 		if err != nil {
 			return nil, err
 		}
-		// An array-typed field (`xs int32[]`) — the same `[]` suffix a column type takes
+		// An array-typed field (`xs i32[]`) — the same `[]` suffix a column type takes
 		// (spec/design/array.md §12); the canonical spelling carries the brackets.
 		isArray, err := p.consumeArrayBrackets()
 		if err != nil {
@@ -1203,10 +1203,10 @@ func (p *Parser) dupCheck(already bool, opt string) error {
 	return nil
 }
 
-// parseSignedIntLiteral parses a signed integer literal (`-? INT`) as an int64 — the
+// parseSignedIntLiteral parses a signed integer literal (`-? INT`) as an i64 — the
 // sequence-option value form. The lexer caps an Int magnitude at 2^63, so the only out-of-range
 // case is a bare positive 2^63 (22003 — numeric_value_out_of_range); a negated 2^63 is the
-// int64 minimum (valid).
+// i64 minimum (valid).
 func (p *Parser) parseSignedIntLiteral() (int64, error) {
 	negate := false
 	if p.peek().Kind == TokMinus {
@@ -1219,7 +1219,7 @@ func (p *Parser) parseSignedIntLiteral() (int64, error) {
 	}
 	v, ok := foldInt(t.Int, negate)
 	if !ok {
-		return 0, NewError(NumericValueOutOfRange, "sequence parameter out of int64 range")
+		return 0, NewError(NumericValueOutOfRange, "sequence parameter out of i64 range")
 	}
 	return v, nil
 }
@@ -2197,7 +2197,7 @@ func (p *Parser) parseLimitOffset(sel *Select) error {
 
 // parseCount parses a LIMIT/OFFSET count: a non-negative integer literal. The sign is
 // folded as in parseLiteral; a negative value is rejected with 2201W (LIMIT) / 2201X
-// (OFFSET), and a magnitude over int64's max traps 22003 (the value -0 folds to 0 and is
+// (OFFSET), and a magnitude over i64's max traps 22003 (the value -0 folds to 0 and is
 // accepted). isLimit selects which structured error to raise.
 func (p *Parser) parseCount(isLimit bool) (int64, error) {
 	negate := false
@@ -2702,7 +2702,7 @@ func (p *Parser) parseMultiplicative() (Expr, error) {
 func (p *Parser) parseUnary() (Expr, error) {
 	if p.peek().Kind == TokMinus {
 		p.advance()
-		// Fold unary-minus-of-an-integer-literal into one negative literal, so int64's
+		// Fold unary-minus-of-an-integer-literal into one negative literal, so i64's
 		// minimum is representable and the literal range-checks against context. SUPPRESSED
 		// when a `::` immediately follows: `::` binds tighter than unary minus (PostgreSQL),
 		// so `-N::T` is `-(N::T)` — the cast applies to the unsigned magnitude first

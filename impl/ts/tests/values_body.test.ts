@@ -49,8 +49,8 @@ test("VALUES body — multi-column default names and rename list", () => {
 
 test("VALUES body — per-column type unification across rows", () => {
   const db = new Database();
-  // int + int -> int (all bare integer literals are int64 in jed).
-  assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (2)) AS v"), ["int64"]);
+  // int + int -> int (all bare integer literals are i64 in jed).
+  assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (2)) AS v"), ["i64"]);
   // int + decimal -> decimal; the int value coerces.
   assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (2.5)) AS v"), ["decimal"]);
   assert.deepStrictEqual(query(db, "SELECT column1 FROM (VALUES (1), (2.5)) AS v ORDER BY column1"), [
@@ -58,7 +58,7 @@ test("VALUES body — per-column type unification across rows", () => {
     ["2.5"],
   ]);
   // anything + NULL keeps the other type.
-  assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (NULL)) AS v"), ["int64"]);
+  assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (NULL)) AS v"), ["i64"]);
   // an all-NULL column is text (unknown -> text).
   assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (NULL), (NULL)) AS v"), ["text"]);
 });

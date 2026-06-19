@@ -17,21 +17,21 @@
 #   status        ratified | proposed | unratified
 #   reason        why the non-determinism is intrinsic (not an accidental artifact)
 
-# --- float64: transcendental function values ---------------------------------
+# --- f64: transcendental function values ---------------------------------
 [[exception]]
 id           = "float-transcendental"
-surface      = "exp, ln, log10, pow, sin, cos, tan over float32/float64 (../design/float.md §8)"
+surface      = "exp, ln, log10, pow, sin, cos, tan over f32/f64 (../design/float.md §8)"
 class        = "A"
 drops        = ["G2", "G3"]
-blast_radius = "the function's result column; promotes to the row multiset / other columns ONLY via a float-gated WHERE / ORDER BY...LIMIT / narrowing CAST (the float64-control-flow entry below). A float64 query that does not call a transcendental stays bit-identical cross-core."
+blast_radius = "the function's result column; promotes to the row multiset / other columns ONLY via a float-gated WHERE / ORDER BY...LIMIT / narrowing CAST (the f64-control-flow entry below). A f64 query that does not call a transcendental stays bit-identical cross-core."
 test         = "the `R` render tag's tolerant compare (parse to f64, equal within ULP/relative tolerance; NaN==NaN, ±Inf exact, -0==+0 — conformance.md §1); PG-oracle-only, with any larger PG divergence recorded in oracle_overrides.toml. # cost:/# names:/# types: stay exact (structural)."
 status       = "ratified"
 reason       = "IEEE 754 does NOT mandate correctly-rounded transcendentals (the table-maker's dilemma), so every libm differs by an ULP across Rust/Go/TS and PG. Not injectable away; bit-pinned reimplementations would cost decimal-limb-level effort on an approximate type (the over-investment determinism.md §6 declines). The arithmetic kernel (+ - * / sqrt) IS correctly-rounded and stays in-contract (float.md §5)."
 
-# --- float64: text rendering layout ------------------------------------------
+# --- f64: text rendering layout ------------------------------------------
 [[exception]]
 id           = "float-render-layout"
-surface      = "float32/float64 value -> text (each core's native shortest-round-trip formatter)"
+surface      = "f32/f64 value -> text (each core's native shortest-round-trip formatter)"
 class        = "A"
 drops        = ["G2", "G3"]
 blast_radius = "the rendered STRING layout only (exponent threshold/spelling). The shortest-round-trip DIGITS are mathematically unique, so the cores agree on value; only layout may differ, and the `R` tag compares by parsed value, so layout never affects a test result. No promotion path (rendering is terminal)."
@@ -83,13 +83,13 @@ test         = "injected-advancing-clock-exact: the `# clock_advance:` directive
 status       = "ratified"
 reason       = "The wall clock is intrinsic to clock_timestamp(), read per call by definition. It is pushed to the host clock seam (determinism.md §5): with an advancing clock injected the engine is a deterministic function of it, so the only irreducible production non-determinism is the raw per-call clock reads — G1+G2 hold on the injected/test path. A DISTINCT ledger entry from now() (per-call, not statement-stable). NOT oracle-imported (PG's wall clock differs)."
 
-# --- float64: control-flow promotion of an exempted value --------------------
+# --- f64: control-flow promotion of an exempted value --------------------
 [[exception]]
 id           = "float-control-flow"
 surface      = "a query whose ROW MULTISET depends on an exempted float value (a transcendental result near a WHERE / ORDER BY...LIMIT boundary, or feeding a narrowing CAST)"
 class        = "A"
 drops        = ["G2", "G3"]
-blast_radius = "the affected query's row multiset (and thereby its non-float columns and cost). BOUNDED by keeping float64 OUT of keys/indexes (rejected 0A000 — encoding.md §2.8): an exempted value can at worst reorder/refilter a QUERY result, never corrupt STORED order. A query not gated on an exempted value is unaffected."
+blast_radius = "the affected query's row multiset (and thereby its non-float columns and cost). BOUNDED by keeping f64 OUT of keys/indexes (rejected 0A000 — encoding.md §2.8): an exempted value can at worst reorder/refilter a QUERY result, never corrupt STORED order. A query not gated on an exempted value is unaffected."
 test         = "such corpus entries are PG-oracle-only and authored to avoid knife-edge boundaries where possible; the documented residue is recorded here. The in-contract float surface (kernel/exact-sum/total-order) does NOT trigger this — only the transcendental-gated case does."
 status       = "ratified"
 reason       = "Non-determinism is infectious through boolean/control-flow boundaries (determinism.md §4): a <=1-ULP transcendental difference near a comparison boundary can flip a row's inclusion. Intrinsic to admitting transcendentals at all; bounded, not eliminable, so ledgered rather than pretended away."

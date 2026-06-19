@@ -50,7 +50,7 @@ fn query_rows(db: &mut Database, sql: &str) -> Vec<Vec<jed::Value>> {
 /// filler / half run → the ~212-byte block spills to a 1-page chain), id 3
 /// inline-compressed (a 600-char run), id 4 plain inline.
 fn seed(db: &mut Database) {
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)").unwrap();
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)").unwrap();
     let plain = filler_text(600);
     let extc = format!("{}{}", filler_text(200), "y".repeat(200));
     let inlc = "x".repeat(600);
@@ -199,7 +199,7 @@ fn update_of_other_columns_preserves_spilled_values() {
         .unwrap();
         execute(
             &mut db,
-            "CREATE TABLE t (id int32 PRIMARY KEY, body text, n int32)",
+            "CREATE TABLE t (id i32 PRIMARY KEY, body text, n i32)",
         )
         .unwrap();
         execute(

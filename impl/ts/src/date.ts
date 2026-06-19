@@ -1,12 +1,12 @@
-// The date calendar type — parsing and rendering (spec/design/date.md). A date is an int32
+// The date calendar type — parsing and rendering (spec/design/date.md). A date is an i32
 // count of days since the Unix epoch (1970-01-01), proleptic Gregorian. It is the day-granular
 // sibling of timestamp and REUSES timestamp's calendar core verbatim (daysFromCivil/civilFromDays,
 // same epoch — spec/design/timestamp.md §2), so the two types cannot drift.
 //
 // Unlike timestamp, a date keeps ONLY the date portion: a time/offset in the input is parsed and
 // validated, then DISCARDED — and 24:00:00 does NOT roll into the day (PG behavior). No instant is
-// ever computed, so a date spans a wider range than the int64-µs timestamp. The day count is held
-// as `bigint` (the TS core's uniform-integer discipline), converted to int32 at the codec boundary.
+// ever computed, so a date spans a wider range than the i64-µs timestamp. The day count is held
+// as `bigint` (the TS core's uniform-integer discipline), converted to i32 at the codec boundary.
 
 import { EngineError } from "./errors.ts";
 import {
@@ -22,20 +22,20 @@ import {
   trimASCIIWS,
 } from "./timestamp.ts";
 
-// DATE_NEG_INFINITY is the -infinity sentinel (the smallest int32; sorts before every finite date).
+// DATE_NEG_INFINITY is the -infinity sentinel (the smallest i32; sorts before every finite date).
 export const DATE_NEG_INFINITY = -2147483648n;
-// DATE_POS_INFINITY is the +infinity sentinel (the largest int32; sorts after every finite date).
+// DATE_POS_INFINITY is the +infinity sentinel (the largest i32; sorts after every finite date).
 export const DATE_POS_INFINITY = 2147483647n;
 
 // Finite day counts occupy [MinInt32+1, MaxInt32-1]; the extremes are reserved for ±infinity.
 const DATE_MIN_FINITE = -2147483647n;
 const DATE_MAX_FINITE = 2147483646n;
 
-// parseDate parses a date literal to its int32 day count (a bigint in [DATE_MIN_FINITE,
+// parseDate parses a date literal to its i32 day count (a bigint in [DATE_MIN_FINITE,
 // DATE_MAX_FINITE], or a ±infinity sentinel) since 1970-01-01. The grammar is the full timestamp
 // literal grammar (spec/design/timestamp.md §3), but only the date portion is kept: a trailing
 // time and/or offset is validated then discarded, and 24:00:00 does not advance the day. Malformed
-// syntax traps 22007; an out-of-range field or a day count beyond the finite int32 range traps 22008.
+// syntax traps 22007; an out-of-range field or a day count beyond the finite i32 range traps 22008.
 export function parseDate(input: string): bigint {
   const s = trimASCIIWS(input);
   const low = s.toLowerCase();
@@ -108,7 +108,7 @@ export function parseDate(input: string): bigint {
   if (cur.i !== body.length) throw bad();
 
   // Field validation. The year magnitude cap (a date spans ≈ ±5.88M years, far wider than
-  // timestamp's ±294k) is only an overflow guard; the real bound is the int32 day-range check.
+  // timestamp's ±294k) is only an overflow guard; the real bound is the i32 day-range check.
   if (year < 1n || year > 9_999_999n) throw fieldOverflow("year out of range");
   if (month < 1n || month > 12n) throw fieldOverflow("month out of range");
   const astro = bc ? 1n - year : year;
@@ -125,7 +125,7 @@ export function parseDate(input: string): bigint {
   return days;
 }
 
-// renderDate renders a date value (int32 days since 1970-01-01, as a bigint) to its canonical
+// renderDate renders a date value (i32 days since 1970-01-01, as a bigint) to its canonical
 // YYYY-MM-DD text (a BC suffix for an astronomical year <= 0; ±infinity render as the bare words).
 export function renderDate(days: bigint): string {
   if (days === DATE_NEG_INFINITY) return "-infinity";

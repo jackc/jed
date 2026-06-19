@@ -221,7 +221,7 @@ exactly-representable `secs`).
    and the dedup bucket all key on `span()`; the surviving dedup representative is first-seen.
 3. **128-bit math** — Rust `i128`, TS `BigInt`, Go a hand-rolled signed 128-bit compare
    (`math/bits`, never a silent 64-bit wrap). Identical on negatives and extremes.
-4. **TS `micros` is `bigint`** end to end (parse, value, codec, span) — `number` loses int64
+4. **TS `micros` is `bigint`** end to end (parse, value, codec, span) — `number` loses i64
    precision (CLAUDE.md §2).
 5. **Render byte-identity** — field order, zero-field omission, the `+`/`-` sign placement, the
    unbounded hour, the plural rule (plural when ≠ 1, so `-1` is plural), and the bare `00:00:00` for

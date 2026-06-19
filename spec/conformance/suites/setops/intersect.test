@@ -4,13 +4,13 @@
 # (NULL == NULL) and value-canonical (1.0 == 1, int converts to decimal first). Output columns
 # count + names from the left operand. Cost = lhs.cost + rhs.cost (the match is unmetered) —
 # cost.md §3.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.intersect, query.where_eq, query.comparison_order, query.order_by, types.int32, types.decimal, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.intersect, query.where_eq, query.comparison_order, query.order_by, types.i32, types.decimal, resource.cost_metering
 
 statement ok
-CREATE TABLE l (id int32 PRIMARY KEY, k int32)
+CREATE TABLE l (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE r (id int32 PRIMARY KEY, k int32)
+CREATE TABLE r (id i32 PRIMARY KEY, k i32)
 
 # l.k multiplicities: 1->2, 2->1, 3->1 ; r.k multiplicities: 1->3, 2->1
 statement ok
@@ -83,10 +83,10 @@ SELECT k FROM l WHERE k > 100 INTERSECT SELECT k FROM r
 
 # --- NULL identity: NULL intersects NULL --------------------------------------------------------
 statement ok
-CREATE TABLE ln (id int32 PRIMARY KEY, k int32)
+CREATE TABLE ln (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE rn (id int32 PRIMARY KEY, k int32)
+CREATE TABLE rn (id i32 PRIMARY KEY, k i32)
 
 statement ok
 INSERT INTO ln VALUES (1, 5), (2, NULL)
@@ -104,10 +104,10 @@ NULL
 
 # --- integer <-> decimal: the representative row is the LEFT operand's value -------------------
 statement ok
-CREATE TABLE ld (id int32 PRIMARY KEY, n decimal(10,1))
+CREATE TABLE ld (id i32 PRIMARY KEY, n decimal(10,1))
 
 statement ok
-CREATE TABLE ri (id int32 PRIMARY KEY, n int32)
+CREATE TABLE ri (id i32 PRIMARY KEY, n i32)
 
 statement ok
 INSERT INTO ld VALUES (1, 1.0), (2, 2.5)

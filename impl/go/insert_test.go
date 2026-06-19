@@ -38,7 +38,7 @@ func eqInts(a []int64, b ...int64) bool {
 
 func TestNegativeKeysSortBeforePositive(t *testing.T) {
 	// Exercises the sign-flip in the order-preserving key encoding.
-	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	for _, s := range []string{"INSERT INTO t VALUES (1)", "INSERT INTO t VALUES (-1)", "INSERT INTO t VALUES (0)"} {
 		mustCreate(t, db, s)
 	}
@@ -48,7 +48,7 @@ func TestNegativeKeysSortBeforePositive(t *testing.T) {
 }
 
 func TestBoundaryValuesRoundTrip(t *testing.T) {
-	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY, s int16, b int64)")
+	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY, s i16, b i64)")
 	mustCreate(t, db, "INSERT INTO t VALUES (1, 32767, 9223372036854775807)")
 	mustCreate(t, db, "INSERT INTO t VALUES (2, -32768, -9223372036854775808)")
 	rows := db.RowsInKeyOrder("t")
@@ -68,7 +68,7 @@ func TestInsertIntoMissingTableTraps(t *testing.T) {
 // --- multi-row INSERT (spec/design/grammar.md §12) --------------------------------
 
 func TestNoPKMultiRowInsertKeepsInsertionOrder(t *testing.T) {
-	db := dbWith(t, "CREATE TABLE log (a int32)")
+	db := dbWith(t, "CREATE TABLE log (a i32)")
 	// No PK ⇒ monotonic synthetic rowids, allocated left-to-right; key order = insertion order.
 	mustCreate(t, db, "INSERT INTO log VALUES (30), (10), (20)")
 	if got := ids(db.RowsInKeyOrder("log")); !eqInts(got, 30, 10, 20) {
@@ -77,7 +77,7 @@ func TestNoPKMultiRowInsertKeepsInsertionOrder(t *testing.T) {
 }
 
 func TestNoPKMultiRowInsertIsAllOrNothing(t *testing.T) {
-	db := dbWith(t, "CREATE TABLE log (a int16)")
+	db := dbWith(t, "CREATE TABLE log (a i16)")
 	mustCreate(t, db, "INSERT INTO log VALUES (1)")
 	// The batch fails validation (second row overflows), so its first row (2) is not stored.
 	wantErr(t, db, "INSERT INTO log VALUES (2), (99999)", "22003")
@@ -94,9 +94,9 @@ func TestNoPKMultiRowInsertIsAllOrNothing(t *testing.T) {
 func TestInsertSelectParamInSourceWhere(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE src (id int32 PRIMARY KEY, a int16)",
+		"CREATE TABLE src (id i32 PRIMARY KEY, a i16)",
 		"INSERT INTO src VALUES (1, 10), (2, 20), (3, 30)",
-		"CREATE TABLE dst (id int32 PRIMARY KEY, a int16)",
+		"CREATE TABLE dst (id i32 PRIMARY KEY, a i16)",
 	)
 	// A $1 inside the source SELECT binds through the SELECT's own resolver.
 	if _, err := ExecuteParams(db, "INSERT INTO dst SELECT id, a FROM src WHERE id >= $1",
@@ -111,9 +111,9 @@ func TestInsertSelectParamInSourceWhere(t *testing.T) {
 func TestInsertSelectCostIsEmbeddedSelectCost(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE src (id int32 PRIMARY KEY, a int16, b int64)",
+		"CREATE TABLE src (id i32 PRIMARY KEY, a i16, b i64)",
 		"INSERT INTO src VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
-		"CREATE TABLE dst (id int32 PRIMARY KEY, a int16, b int64)",
+		"CREATE TABLE dst (id i32 PRIMARY KEY, a i16, b i64)",
 	)
 	// 1 page_read (src is one leaf) + 3 scanned + 3 produced + 0 projection (bare columns) = 7;
 	// storing the rows is unmetered.

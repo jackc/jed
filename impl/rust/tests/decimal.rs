@@ -34,7 +34,7 @@ fn one(db: &mut Database, sql: &str) -> String {
 #[test]
 fn update_coerces_to_typmod() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, money numeric(10,2))",
+        "CREATE TABLE t (id i32 PRIMARY KEY, money numeric(10,2))",
         "INSERT INTO t VALUES (1, 0)",
         "UPDATE t SET money = 3.14159 WHERE id = 1",
     ]);
@@ -44,7 +44,7 @@ fn update_coerces_to_typmod() {
 #[test]
 fn on_disk_round_trip_preserves_decimals_and_typmod() {
     let db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, money numeric(10,2), free numeric)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, money numeric(10,2), free numeric)",
         "INSERT INTO t VALUES (1, 1.5, -12345.6789), (2, 0, 0.00), (3, 100, NULL)",
     ]);
     let image = db.to_image(8192, 1).unwrap();
@@ -71,7 +71,7 @@ fn mul_result_scale_rounds_at_max_scale() {
     // half away from zero, instead of trapping (spec/design/decimal.md §2). Mirrors
     // impl/go/decimal_test.go and impl/ts/tests/decimal.test.ts.
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1)",
     ]);
     let tiny1 = format!("0.{}1", "0".repeat(8191)); // 1e-8192 (scale 8192)
@@ -94,7 +94,7 @@ fn cost_ceiling_aborts_ahead_of_a_big_multiply() {
     // so a ceiling aborts a pathological multiply up front (CLAUDE.md §13). ~20000 digits is
     // ~5000 groups; the mul W is ~25,000,000 — far over the tiny ceiling.
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
+        "CREATE TABLE t (id i32 PRIMARY KEY)",
         "INSERT INTO t VALUES (1)",
     ]);
     let big = format!("{}.5", "9".repeat(20000));

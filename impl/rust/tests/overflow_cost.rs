@@ -63,7 +63,7 @@ fn two_tables() -> Database {
     let big = filler_text(600);
     execute(
         &mut db,
-        "CREATE TABLE spill (id int32 PRIMARY KEY, body text)",
+        "CREATE TABLE spill (id i32 PRIMARY KEY, body text)",
     )
     .unwrap();
     execute(
@@ -73,7 +73,7 @@ fn two_tables() -> Database {
     .unwrap();
     execute(
         &mut db,
-        "CREATE TABLE control (id int32 PRIMARY KEY, body text)",
+        "CREATE TABLE control (id i32 PRIMARY KEY, body text)",
     )
     .unwrap();
     execute(
@@ -115,7 +115,7 @@ fn limit_does_not_lower_the_block() {
     let big = filler_text(600);
     execute(
         &mut db,
-        "CREATE TABLE spill (id int32 PRIMARY KEY, body text)",
+        "CREATE TABLE spill (id i32 PRIMARY KEY, body text)",
     )
     .unwrap();
     execute(
@@ -125,7 +125,7 @@ fn limit_does_not_lower_the_block() {
     .unwrap();
     execute(
         &mut db,
-        "CREATE TABLE control (id int32 PRIMARY KEY, body text)",
+        "CREATE TABLE control (id i32 PRIMARY KEY, body text)",
     )
     .unwrap();
     execute(
@@ -184,7 +184,7 @@ fn multiple_chains_sum() {
     let big_hex = filler_bytes_hex(300);
     execute(
         &mut db,
-        "CREATE TABLE spill (id int32 PRIMARY KEY, body text, blob bytea)",
+        "CREATE TABLE spill (id i32 PRIMARY KEY, body text, blob bytea)",
     )
     .unwrap();
     execute(
@@ -194,7 +194,7 @@ fn multiple_chains_sum() {
     .unwrap();
     execute(
         &mut db,
-        "CREATE TABLE control (id int32 PRIMARY KEY, body text, blob bytea)",
+        "CREATE TABLE control (id i32 PRIMARY KEY, body text, blob bytea)",
     )
     .unwrap();
     execute(&mut db, "INSERT INTO control VALUES (1, 'tiny', '\\xcafe')").unwrap();

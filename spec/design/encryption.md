@@ -87,7 +87,7 @@ codec is hand-rolled (large-values.md §6). **Encryption is the opposite case:**
 - **Open sub-decision (when built): keep byte-identity, or ledger an exception.** The above keeps
   encrypted files inside the §8 contract (preferred — it preserves the cross-core/cross-host
   round-trip and the keyless-replica interop). The alternative is to declare encrypted files a
-  determinism-ledger exception (like `float64` and the UUID generators, determinism.md §5) and
+  determinism-ledger exception (like `f64` and the UUID generators, determinism.md §5) and
   permit a random nonce. **Recommendation: keep byte-identity via the deterministic
   `(page_index, txid)` nonce** — the interop is worth more than the marginal security of a random
   nonce, and AEAD with a never-repeated deterministic nonce is the standard, safe construction.

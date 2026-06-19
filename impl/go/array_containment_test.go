@@ -5,8 +5,8 @@ package jed
 // pinned against PostgreSQL 18 (the strict-element-equality NULL rule especially — §10.1 #1).
 // Mirrors impl/rust/tests/array_containment.rs.
 //
-// jed types a bare integer literal / ARRAY[…] constructor as int64, so the tests pair bare arrays
-// with int64[] casts; the element hint comes from the FIRST array operand (§5 #8).
+// jed types a bare integer literal / ARRAY[…] constructor as i64, so the tests pair bare arrays
+// with i64[] casts; the element hint comes from the FIRST array operand (§5 #8).
 
 import "testing"
 
@@ -17,9 +17,9 @@ func TestContainsBasic(t *testing.T) {
 		"SELECT ARRAY[1,2,3] @> ARRAY[2,4]":       "false",
 		"SELECT ARRAY[1,2,3] @> ARRAY[3,2,1]":     "true", // order irrelevant
 		"SELECT ARRAY[1,2,2,3] @> ARRAY[2,2,2]":   "true", // duplicates irrelevant
-		"SELECT ARRAY[1,2,3] @> '{}'::int64[]":    "true", // empty contained by anything
-		"SELECT '{}'::int64[] @> ARRAY[1]":        "false",
-		"SELECT '{}'::int64[] @> '{}'::int64[]":   "true",
+		"SELECT ARRAY[1,2,3] @> '{}'::i64[]":      "true", // empty contained by anything
+		"SELECT '{}'::i64[] @> ARRAY[1]":          "false",
+		"SELECT '{}'::i64[] @> '{}'::i64[]":       "true",
 		"SELECT ARRAY['a','b','c'] @> ARRAY['b']": "true",
 	}
 	for sql, want := range cases {
@@ -32,12 +32,12 @@ func TestContainsBasic(t *testing.T) {
 func TestContainedByAndOverlaps(t *testing.T) {
 	db := NewDatabase()
 	cases := map[string]string{
-		"SELECT ARRAY[2] <@ ARRAY[1,2,3]":    "true",
-		"SELECT ARRAY[2,4] <@ ARRAY[1,2,3]":  "false",
-		"SELECT '{}'::int64[] <@ ARRAY[1]":   "true",
-		"SELECT ARRAY[1,2] && ARRAY[2,3]":    "true",
-		"SELECT ARRAY[1,2] && ARRAY[3,4]":    "false",
-		"SELECT ARRAY[1,2] && '{}'::int64[]": "false", // empty overlaps nothing
+		"SELECT ARRAY[2] <@ ARRAY[1,2,3]":   "true",
+		"SELECT ARRAY[2,4] <@ ARRAY[1,2,3]": "false",
+		"SELECT '{}'::i64[] <@ ARRAY[1]":    "true",
+		"SELECT ARRAY[1,2] && ARRAY[2,3]":   "true",
+		"SELECT ARRAY[1,2] && ARRAY[3,4]":   "false",
+		"SELECT ARRAY[1,2] && '{}'::i64[]":  "false", // empty overlaps nothing
 	}
 	for sql, want := range cases {
 		if got := valArrayFunc(t, db, sql); got != want {
@@ -51,12 +51,12 @@ func TestContainmentStrictNullElement(t *testing.T) {
 	// STRICT equality — a NULL element matches NOTHING, including another NULL (the inverse of the
 	// search/edit functions' NOT DISTINCT FROM). All of these are FALSE, never NULL.
 	cases := map[string]string{
-		"SELECT ARRAY[1,2,NULL] @> ARRAY[2]":                 "true",
-		"SELECT ARRAY[1,2,NULL] @> '{NULL}'::int64[]":        "false",
-		"SELECT ARRAY[1,2,3] @> '{NULL}'::int64[]":           "false",
-		"SELECT '{NULL,NULL}'::int64[] @> '{NULL}'::int64[]": "false",
-		"SELECT ARRAY[1,NULL] && '{NULL}'::int64[]":          "false",
-		"SELECT ARRAY[1,NULL] && ARRAY[1]":                   "true",
+		"SELECT ARRAY[1,2,NULL] @> ARRAY[2]":             "true",
+		"SELECT ARRAY[1,2,NULL] @> '{NULL}'::i64[]":      "false",
+		"SELECT ARRAY[1,2,3] @> '{NULL}'::i64[]":         "false",
+		"SELECT '{NULL,NULL}'::i64[] @> '{NULL}'::i64[]": "false",
+		"SELECT ARRAY[1,NULL] && '{NULL}'::i64[]":        "false",
+		"SELECT ARRAY[1,NULL] && ARRAY[1]":               "true",
 	}
 	for sql, want := range cases {
 		if got := valArrayFunc(t, db, sql); got != want {
@@ -68,10 +68,10 @@ func TestContainmentStrictNullElement(t *testing.T) {
 func TestContainmentNullWholeArrayPropagates(t *testing.T) {
 	db := NewDatabase()
 	cases := map[string]string{
-		"SELECT NULL::int64[] @> ARRAY[1]": "NULL",
-		"SELECT ARRAY[1] @> NULL::int64[]": "NULL",
-		"SELECT NULL::int64[] && ARRAY[1]": "NULL",
-		"SELECT ARRAY[1] <@ NULL::int64[]": "NULL",
+		"SELECT NULL::i64[] @> ARRAY[1]": "NULL",
+		"SELECT ARRAY[1] @> NULL::i64[]": "NULL",
+		"SELECT NULL::i64[] && ARRAY[1]": "NULL",
+		"SELECT ARRAY[1] <@ NULL::i64[]": "NULL",
 	}
 	for sql, want := range cases {
 		if got := valArrayFunc(t, db, sql); got != want {
@@ -87,9 +87,9 @@ func TestContainmentPrecedenceAndAdaptation(t *testing.T) {
 		"SELECT ARRAY[1,2] || ARRAY[3] @> ARRAY[3]": "true",
 		"SELECT ARRAY[3] @> ARRAY[1 + 2]":           "true", // binds looser than +
 		"SELECT ARRAY[1,2] @> ARRAY[2] = true":      "true", // binds tighter than =
-		// The bare ARRAY[…] adapts to a typed (int32[]) array's element type when the typed array is left.
-		"SELECT '{1,2,3}'::int32[] @> ARRAY[2]": "true",
-		"SELECT '{2}'::int32[] <@ ARRAY[1,2,3]": "true",
+		// The bare ARRAY[…] adapts to a typed (i32[]) array's element type when the typed array is left.
+		"SELECT '{1,2,3}'::i32[] @> ARRAY[2]": "true",
+		"SELECT '{2}'::i32[] <@ ARRAY[1,2,3]": "true",
 	}
 	for sql, want := range cases {
 		if got := valArrayFunc(t, db, sql); got != want {

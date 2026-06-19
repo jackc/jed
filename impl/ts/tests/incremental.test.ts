@@ -41,7 +41,7 @@ test("a single-row commit appends only the dirty path", () => {
     const path = join(dir, "incremental_small_growth.jed");
     const ps = 256;
     const db = create(path, { pageSize: 256 });
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)");
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
     // Enough rows for a multi-level tree at 256-byte pages (≈3 records/leaf). Each insert
     // autocommits, so the file already holds many leaked pages by the end of the loop.
     const pad = "x".repeat(48);
@@ -88,7 +88,7 @@ test("a delete-heavy history reopens correctly", () => {
   try {
     const path = join(dir, "incremental_deletes.jed");
     const db = create(path, { pageSize: 256 });
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)");
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
     const pad = "x".repeat(48);
     for (let i = 1; i <= 30; i++) {
       execute(db, `INSERT INTO t VALUES (${i}, 'row-${String(i).padStart(2, "0")}-${pad}')`);
@@ -119,7 +119,7 @@ test("meta slots alternate across commits", () => {
     assert.equal(slotTxid(img, 0), 1n);
     assert.equal(slotTxid(img, 1), 1n);
 
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)"); // txid 2 → slot 0
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)"); // txid 2 → slot 0
     execute(db, "INSERT INTO t VALUES (1)"); // txid 3 → slot 1
     close(db);
 
@@ -140,7 +140,7 @@ test("a torn latest commit falls back to the prior snapshot", () => {
   try {
     const path = join(dir, "incremental_torn_meta.jed");
     const db = create(path);
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)"); // txid 2 (slot 0)
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)"); // txid 2 (slot 0)
     execute(db, "INSERT INTO t VALUES (1)"); // txid 3 (slot 1)
     execute(db, "INSERT INTO t VALUES (2)"); // txid 4 (slot 0) — the newest commit
     close(db);
@@ -175,7 +175,7 @@ test("a commit preallocates file growth in chunks and reuses the slack", () => {
     // A from-scratch image is just the empty catalog — far below one chunk — so the file starts
     // un-aligned (create writes exactly pageCount pages, no preallocation).
     const db = create(path); // default 8 KiB page size
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)");
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)");
 
     // One commit big enough to push the tree past a chunk: ~400 rows of a ~3.5 KiB pad ≈ 1.4 MiB of
     // tree, > the 128-page (1 MiB) chunk at the default 8 KiB page size.

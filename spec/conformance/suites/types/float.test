@@ -1,17 +1,17 @@
-# float64 / float32 — IEEE 754 binary floating point (spec/design/float.md). The FIRST types
+# f64 / f32 — IEEE 754 binary floating point (spec/design/float.md). The FIRST types
 # deliberately EXEMPTED from cross-core byte-identity for COMPUTED/RENDERED values: float result
 # columns use the `R` render tag, compared by PARSED VALUE at tolerance (conformance.md §1), so a
 # core's native render layout and a transcendental's last ULP don't fail a test. The IN-CONTRACT
 # surface stays exact & cross-core: storage, the TOTAL ORDER (-0=+0, NaN=NaN, NaN is the LARGEST
 # value), the trapping +-*/ kernel, casts (float->decimal yields an exact `D` value), and the
-# order-independent canonical-fold SUM/AVG. The two widths form a promotion tower (float32 widens
-# to float64, lossless). Non-key column only (a float PRIMARY KEY -> 0A000). float vs int/decimal
+# order-independent canonical-fold SUM/AVG. The two widths form a promotion tower (f32 widens
+# to f64, lossless). Non-key column only (a float PRIMARY KEY -> 0A000). float vs int/decimal
 # is 42804 (strict — an explicit cast is required). Format: ../../../design/conformance.md.
-# requires: ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.aggregates, cast.explicit, types.int32, types.int64, types.decimal, types.float32, types.float64
+# requires: ddl.create_table, dml.insert, dml.insert_multi_row, dml.insert_select, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, query.aggregates, cast.explicit, types.i32, types.i64, types.decimal, types.f32, types.f64
 
 # --- storage: both widths, NULL, and the special values (NaN / ±Infinity / -0) round-trip ---
 statement ok
-CREATE TABLE t (id int64 PRIMARY KEY, d float64, r float32)
+CREATE TABLE t (id i64 PRIMARY KEY, d f64, r f32)
 
 # finite values: a bare decimal literal adapts to the float column's width (literal adaptation)
 statement ok
@@ -21,12 +21,12 @@ INSERT INTO t VALUES
   (5, 0.0, 0.0)
 
 # Infinity / NaN have no bare-literal form, so they enter via a typed literal in INSERT ... SELECT
-# (a multi-row VALUES slot takes only bare literals this slice). Row 4 also stores a NULL float32.
+# (a multi-row VALUES slot takes only bare literals this slice). Row 4 also stores a NULL f32.
 statement ok
-INSERT INTO t SELECT 3, float64 'Infinity', float32 '-Infinity'
+INSERT INTO t SELECT 3, f64 'Infinity', f32 '-Infinity'
 
 statement ok
-INSERT INTO t SELECT 4, float64 'NaN', NULL
+INSERT INTO t SELECT 4, f64 'NaN', NULL
 
 # float columns render under the `R` tag (parsed-value compare). NULL renders NULL.
 query IRR nosort
@@ -60,23 +60,23 @@ SELECT id FROM t ORDER BY d
 
 # NaN = NaN is TRUE under the total order (PG float btree order), unlike raw IEEE
 query B nosort
-SELECT float64 'NaN' = float64 'NaN'
+SELECT f64 'NaN' = f64 'NaN'
 ----
 true
 
 # -0 = +0 is TRUE
 query B nosort
-SELECT float64 '-0' = float64 '0'
+SELECT f64 '-0' = f64 '0'
 ----
 true
 
-# --- the arithmetic kernel: correctly-rounded; mixed widths promote to float64 ---
+# --- the arithmetic kernel: correctly-rounded; mixed widths promote to f64 ---
 query R nosort
-SELECT float64 '1.5' + float64 '2.5'
+SELECT f64 '1.5' + f64 '2.5'
 ----
 4
 
-# float32 (r=2.5) + float64 (d=1.5) promotes to float64 -> 4
+# f32 (r=2.5) + f64 (d=1.5) promotes to f64 -> 4
 query R nosort
 SELECT r + d FROM t WHERE id = 1
 ----
@@ -84,38 +84,38 @@ SELECT r + d FROM t WHERE id = 1
 
 # an Infinity operand propagates (it is already non-finite — no trap)
 query R nosort
-SELECT float64 'Infinity' + float64 '1'
+SELECT f64 'Infinity' + f64 '1'
 ----
 Infinity
 
 # division by zero TRAPS (finite math never yields ±Inf) ...
 statement error 22012
-SELECT float64 '1' / float64 '0'
+SELECT f64 '1' / f64 '0'
 
 # ... and finite overflow TRAPS rather than producing +Infinity
 statement error 22003
-SELECT float64 '1e308' * float64 '10'
+SELECT f64 '1e308' * f64 '10'
 
 # --- casts: all explicit; float->int rounds HALF AWAY FROM ZERO; float->decimal is EXACT ---
 query I nosort
-SELECT CAST(float64 '2.5' AS int32)
+SELECT CAST(f64 '2.5' AS i32)
 ----
 3
 
 query R nosort
-SELECT CAST(2 AS float64)
+SELECT CAST(2 AS f64)
 ----
 2
 
 # float->decimal is in-contract: the EXACT decimal value, then the typmod scale (a `D` value)
 query D nosort
-SELECT CAST(float64 '0.5' AS numeric(10,2))
+SELECT CAST(f64 '0.5' AS numeric(10,2))
 ----
 0.50
 
 # NaN / ±Infinity cannot become an integer
 statement error 22003
-SELECT CAST(float64 'NaN' AS int32)
+SELECT CAST(f64 'NaN' AS i32)
 
 # --- strict family: a float column vs an int column is a type error (no implicit coercion) ---
 statement error 42804
@@ -142,23 +142,23 @@ SELECT min(d), max(d) FROM t
 -0.5
 NaN
 
-# --- float64 <-> float32 casts: the narrowing direction + the binary32-rounding witness ---
-# float64 -> float32 is an explicit narrowing; an exactly-representable value is preserved.
+# --- f64 <-> f32 casts: the narrowing direction + the binary32-rounding witness ---
+# f64 -> f32 is an explicit narrowing; an exactly-representable value is preserved.
 query R nosort
-SELECT CAST(float64 '1.5' AS float32)
+SELECT CAST(f64 '1.5' AS f32)
 ----
 1.5
 
-# float32 cannot represent 0.1 exactly. Widening that float32 back to float64 EXPOSES the binary32
-# rounding: the value is the nearest binary32 to 0.1, rendered in full — distinct from float64 0.1,
-# and identical across cores (Rust `as f32`, Go float32(), TS Math.fround). The float32-precision
+# f32 cannot represent 0.1 exactly. Widening that f32 back to f64 EXPOSES the binary32
+# rounding: the value is the nearest binary32 to 0.1, rendered in full — distinct from f64 0.1,
+# and identical across cores (Rust `as f32`, Go f32(), TS Math.fround). The f32-precision
 # witness (the narrowing's lossiness is invisible until widened back).
 query R nosort
-SELECT CAST(float32 '0.1' AS float64)
+SELECT CAST(f32 '0.1' AS f64)
 ----
 0.10000000149011612
 
-# --- a float64 / float32 PRIMARY KEY is rejected this slice (the float-order-preserving key
+# --- a f64 / f32 PRIMARY KEY is rejected this slice (the float-order-preserving key
 # encoding is authored but unexercised — encoding.md §2.8) ---
 statement error 0A000
-CREATE TABLE bad (k float64 PRIMARY KEY)
+CREATE TABLE bad (k f64 PRIMARY KEY)

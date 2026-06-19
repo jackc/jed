@@ -27,7 +27,7 @@ The catalog now lists:
 | `null_test` | `IS NULL`, `IS NOT NULL` | `boolean` |
 | `arithmetic` | `+` `-` `*` `/` `%`, unary `-` | `promoted` |
 | `function` (scalar) | `abs` `round` (§9), `make_interval` (§11), `uuid_extract_version`/`uuid_extract_timestamp`, `uuidv4`/`uuidv7`, `now`/`clock_timestamp` (§12), `num_nulls`/`num_nonnulls` (VARIADIC, array-functions.md §12) | per-function |
-| `aggregate` | `COUNT` `SUM` `MIN` `MAX` `AVG` | `int64` / `decimal` / widened (§8) |
+| `aggregate` | `COUNT` `SUM` `MIN` `MAX` `AVG` | `i64` / `decimal` / widened (§8) |
 | `set_returning` | `generate_series`, `unnest` (§10, array-functions.md §9) | a row **set** (§10) |
 
 The **aggregates** are not operators — they collapse a set of rows into one value, have no
@@ -60,8 +60,8 @@ The `result` field is one field that holds *either* a scalar id from
 [../types/scalars.toml](../types/scalars.toml) *or* a reserved non-scalar id. The one
 remaining reserved id is:
 
-- `promoted` — the common promoted operand type of an arithmetic operator: `int16 + int16
-  → int16`, `int16 + int64 → int64` (the higher-`rank` operand wins, per the promotion
+- `promoted` — the common promoted operand type of an arithmetic operator: `i16 + i16
+  → i16`, `i16 + i64 → i64` (the higher-`rank` operand wins, per the promotion
   tower in [../types/compare.toml](../types/compare.toml)). It is reserved rather than a
   concrete scalar because the actual result type is computed per call from the operands.
 
@@ -114,7 +114,7 @@ the `null` field:
 
 ## 4. Operand resolution by reference, not duplication
 
-A single comparison operator accepts many operand pairs: `int16 = int64`, `int32 < int16`,
+A single comparison operator accepts many operand pairs: `i16 = i64`, `i32 < i16`,
 and so on. The catalog expresses this with **operand families** plus a **resolution
 reference**, not an enumerated overload per type pair:
 
@@ -178,8 +178,8 @@ operator descriptor table so the value is one authored number, not three hand-co
 
 An arithmetic operator's `result = "promoted"` is the higher-`rank` operand type (the same
 promotion tower comparisons use, §4). The computed value is range-checked against **that**
-type, so `int16 + int16` overflows at the `int16` boundary (`30000 + 30000` traps `22003`),
-not at `int64`'s — the type-faithful behavior, matching PostgreSQL's `smallint + smallint`.
+type, so `i16 + i16` overflows at the `i16` boundary (`30000 + 30000` traps `22003`),
+not at `i64`'s — the type-faithful behavior, matching PostgreSQL's `smallint + smallint`.
 This is a deterministic, cross-core-identical decision (CLAUDE.md §8): every core computes
 in 64-bit, traps `22003` if the 64-bit op itself overflows, *and* traps `22003` if the
 in-range 64-bit result falls outside the declared result type. `div`/`mod` additionally
@@ -224,9 +224,9 @@ the literal-adaptation rule, and the per-function semantics — lives in
 **Aggregates are authored (`kind = "aggregate"`).** `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` landed
 in a **separate `[[aggregate]]` array**, not as `[[operator]]` rows, because they do not fit
 the operator mold on three counts: (1) the **result widens by the operand type** —
-`SUM(int16/int32) → int64`, `SUM(int64) → decimal`, `MIN/MAX → the input type` — expressed
-by two reserved result ids, `sum_widen` and `same_as_input`, alongside the concrete `int64`
-/`decimal` (`COUNT → int64`, `AVG → decimal`); (2) a fifth **NULL discipline**, `aggregate`
+`SUM(i16/i32) → i64`, `SUM(i64) → decimal`, `MIN/MAX → the input type` — expressed
+by two reserved result ids, `sum_widen` and `same_as_input`, alongside the concrete `i64`
+/`decimal` (`COUNT → i64`, `AVG → decimal`); (2) a fifth **NULL discipline**, `aggregate`
 — NULL inputs are *skipped* (except `COUNT(*)`, which counts every row), and an empty or
 all-NULL group yields `NULL` for `SUM/AVG/MIN/MAX` but `0` for `COUNT`; (3) **`COUNT(*)`
 takes no expression** (`arg = "star"`), and there is no infix symbol, precedence, or
@@ -276,10 +276,10 @@ declared family directly; there is no promotion *between* arguments. (A general 
 instead, below, keeping the type system honest, CLAUDE.md §4.)
 
 **`abs`** carries `result = "promoted"` — for a one-argument function the promoted operand
-type is just the operand's own type, so `abs(int16) → int16`, `abs(int64) → int64`,
+type is just the operand's own type, so `abs(i16) → i16`, `abs(i64) → i64`,
 `abs(numeric) → numeric` (exactly as unary `neg`, §7). Over the integer family the magnitude
-is **range-checked at the result type's boundary**: `abs(int16 -32768)` has no positive
-`int16` and traps `22003` — the same overflow discipline as `-(int16 -32768)` — so `abs`
+is **range-checked at the result type's boundary**: `abs(i16 -32768)` has no positive
+`i16` and traps `22003` — the same overflow discipline as `-(i16 -32768)` — so `abs`
 carries `errors = ["22003"]`. Over `decimal` it clears the sign and cannot overflow
 (`errors = []`).
 
@@ -293,7 +293,7 @@ without an implicit coercion pass — they are authored as concrete catalog rows
 `round`'s forms `propagate` NULL (any NULL argument → NULL), as does `abs`. The **decimal**
 overloads carry `errors = ["22003"]`: a round-up carry can push a value at the integer-digit
 format cap over it ([decimal.md](decimal.md) §2/§4 — exactly PG); the integer overloads
-cannot (an int64 is at most 19 digits). `round`'s scale argument clamps to `max_scale`
+cannot (an i64 is at most 19 digits). `round`'s scale argument clamps to `max_scale`
 (16383) like PG `numeric_round`.
 
 **Cost.** A scalar-function call charges one `operator_eval` ([cost.md](cost.md)) — the same
@@ -333,8 +333,8 @@ functions).
 `FROM` clause ([grammar.md](grammar.md) §35): `generate_series(start, stop)` and
 `generate_series(start, stop, step)` over the integer family. It resolves to a **synthetic
 one-column relation** — a `Table` built at plan time with a single column whose type is the
-**promoted integer type** of the arguments (`generate_series(int16, int32)` ⇒ `int32`;
-integer literals default to `int64`). The relation threads through the planner and the
+**promoted integer type** of the arguments (`generate_series(i16, i32)` ⇒ `i32`;
+integer literals default to `i64`). The relation threads through the planner and the
 nested-loop join unchanged; the executor, instead of scanning a store, **generates** the
 rows in the materialization step. The synthetic table is the only new structure: a §8
 borrow-checker note for Rust — it is owned in a `Vec<Box<Table>>` local to the planner so a
@@ -394,7 +394,7 @@ set) and defaulted, so the slice is **oracle-checkable from day one** (postgres:
 a jed-only divergence — the reason it was chosen over naming an existing built-in like `round`,
 whose PG parameters are nameless (naming them would have been a documented §1/§7 divergence).
 
-**`secs` is `float64` (`double precision`), its true PG type** — available since the float
+**`secs` is `f64` (`double precision`), its true PG type** — available since the float
 slice ([float.md](float.md)). `years…mins` are the `integer` family; `secs` is `float`. The
 value folds into the interval **exactly**: `years/months → months` field (×12), `weeks/days →
 days` field (×7), `hours/mins/secs → micros`, grouped `(((hours*60)+mins)*60)*10⁶ +
@@ -420,7 +420,7 @@ the scalar-function (`[[operator]]`) mold ([../functions/catalog.toml](../functi
 - `arg_defaults` — integer-literal default strings for the **trailing** parameters (length ≤
   arity; a default may occupy only a trailing slot, like PG). An omitted trailing argument is
   filled with its default at resolve, and the default literal **adapts to its slot's family**
-  (so `make_interval`'s `"0"` becomes `float64 0.0` for `secs`, `int64 0` elsewhere).
+  (so `make_interval`'s `"0"` becomes `f64 0.0` for `secs`, `i64 0` elsewhere).
 
 Both are codegen'd into the per-core descriptor table (`OperatorDesc`) as data (CLAUDE.md §5) —
 the resolver **reads** the names/defaults rather than re-hardcoding them. `verify.rb` checks the
@@ -437,7 +437,7 @@ their index in order; each named arg is placed at its `arg_names` index (unknown
 duplicate / collision `42601`); every still-empty trailing slot is filled from `arg_defaults`,
 and a still-empty *non*-defaulted slot means no overload matches (`42883`). Each resolved
 argument is then resolved **with its declared family as the expected-type hint** — this is what
-lets a bare numeric literal adapt to the `float64` `secs` slot (reusing the existing float
+lets a bare numeric literal adapt to the `f64` `secs` slot (reusing the existing float
 literal-adaptation path; float is otherwise a strict island), so `make_interval(secs => 1.5)`
 and `make_interval(secs => 2)` work like PG instead of erroring as a family mismatch. Fully
 positional calls take a fast path identical to before (no names, no behavior change). The
@@ -448,7 +448,7 @@ arguments' own costs), asserted in the corpus (`# cost:`).
 **Deferred (sequenced follow-ons).** General DEFAULT values for *arbitrary* (non-integer)
 literals and user-defined functions are not built (jed has no UDFs; built-ins use overloads or
 `make_interval`-style 0-defaults). The sibling constructors `make_timestamp` /
-`make_timestamptz` reuse this exact mold (their `sec` is also `float64`). **`VARIADIC`** was blocked
+`make_timestamptz` reuse this exact mold (their `sec` is also `f64`). **`VARIADIC`** was blocked
 on the `array` type; that has since landed (array.md), so `VARIADIC` **landed** as **AF6** in the
 array function surface ([array-functions.md §12](array-functions.md)) — a `VARIADIC` keyword before a
 call's final argument plus variadic overload resolution, spent on the engine's first VARIADIC
@@ -460,7 +460,7 @@ arguments or a single array via the keyword).
 PostgreSQL's UUID functions split cleanly along jed's determinism contract
 ([determinism.md](determinism.md) §1), and that split is the build order:
 
-- **Pure extractors (landed):** `uuid_extract_version(uuid) → int16` and
+- **Pure extractors (landed):** `uuid_extract_version(uuid) → i16` and
   `uuid_extract_timestamp(uuid) → timestamptz` are deterministic functions of their input
   bits — immutable, fully in-contract, oracle-checked against PostgreSQL 18. They reuse the §9
   scalar-function mold (`[[operator]]`, `kind = "function"`), one row each.
@@ -478,7 +478,7 @@ PostgreSQL's UUID functions split cleanly along jed's determinism contract
   A non-RFC variant (Microsoft GUIDs `11`, the legacy NCS variant `0`, the all-zero nil UUID)
   makes **both** functions return NULL. NULL input propagates (the `null = "propagates"` rule).
 - `uuid_extract_version` returns the version nibble — the high nibble of byte 6, `0..15` — as
-  `int16`, for an RFC value.
+  `i16`, for an RFC value.
 - `uuid_extract_timestamp` returns the embedded instant as `timestamptz`, for **version 1 and
   7 only**, NULL for every other version. This matches PG 18, which extracts from v1/v7 only —
   **v6 returns NULL there**, a deliberate match to the pinned oracle, not a divergence (a later
@@ -582,10 +582,10 @@ is a tripwire: introducing any of them flips exactly one line from error to ok. 
 `nextval('s')` / `currval('s')` / `setval('s', n[, b])` / `lastval()` ([sequences.md](sequences.md))
 are the built-ins that (a) resolve a **text argument to a catalog object** (all but `lastval`) and
 (b) reach beyond a pure value→value map — `nextval`/`setval` **mutate** the sequence counter (§13's
-curated exception). All are `kind = "function"`, `result = "int64"`, `null = "propagates"`,
+curated exception). All are `kind = "function"`, `result = "i64"`, `null = "propagates"`,
 `volatility = "volatile"`.
 
-- **`nextval('s')`** advances sequence `s` and returns the new int64 value (PG-exact: the first call
+- **`nextval('s')`** advances sequence `s` and returns the new i64 value (PG-exact: the first call
   returns `START`, subsequent calls add `INCREMENT`, bounded by `MIN/MAXVALUE` → `2200H` or `CYCLE`
   wrap). Because it mutates, a statement containing it runs on the **write path** (so `SELECT
   nextval('s')` commits a new snapshot) and is `25006` in a read-only transaction. The advance is

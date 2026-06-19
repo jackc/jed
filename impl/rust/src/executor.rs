@@ -46,7 +46,7 @@ pub enum Outcome {
         rows_affected: Option<i64>,
     },
     /// A query result: output column names, the canonical name of each column's resolved type
-    /// (`int16`/`int32`/`int64`/`text`/`boolean`/`decimal`/…; `unknown` for an untyped NULL),
+    /// (`i16`/`i32`/`i64`/`text`/`boolean`/`decimal`/…; `unknown` for an untyped NULL),
     /// and rows in result order. The column count is `column_names.len()`
     /// (spec/design/grammar.md §8); `column_types` is parallel to it. The type is the resolved
     /// *scalar* type — for `decimal` it is the unconstrained `decimal`, not the `numeric(p,s)`
@@ -77,7 +77,7 @@ impl Outcome {
     }
 
     /// The canonical type name of each output column of a query result (parallel to
-    /// `column_names`; empty for a non-query statement) — `int16`/`text`/`decimal`/…, or
+    /// `column_names`; empty for a non-query statement) — `i16`/`text`/`decimal`/…, or
     /// `unknown` for an untyped NULL column (spec/design/conformance.md §7).
     pub fn column_types(&self) -> &[String] {
         match self {
@@ -1440,9 +1440,9 @@ impl Database {
                 // bytea §2.6, interval, float §2.8) are authored but unexercised, so a
                 // text/decimal/bytea/interval/float PRIMARY KEY is a documented 0A000 narrowing
                 // (spec/design/types.md §11/§12/§13), relaxable in a later in-key slice.
-                // timestamp / timestamptz are also allowed — they share the int64 `int-be-signflip`
+                // timestamp / timestamptz are also allowed — they share the i64 `int-be-signflip`
                 // key encoding (exercised + byte-pinned, spec/design/timestamp.md §6). date is
-                // likewise allowed — the int32 `int-be-signflip` key encoding (spec/design/date.md §5).
+                // likewise allowed — the i32 `int-be-signflip` key encoding (spec/design/date.md §5).
                 if !ty.is_integer()
                     && !ty.is_bool()
                     && !ty.is_uuid()
@@ -3040,11 +3040,11 @@ impl Database {
                         // (0x00 false / 0x01 true, encoding.md §2.9) — likewise no presence tag.
                         Value::Bool(b) => k.extend_from_slice(&encode_bool(*b)),
                         // A timestamp / timestamptz PRIMARY KEY is supported: its key bytes are
-                        // the int64 instant codec (spec/design/timestamp.md §6).
+                        // the i64 instant codec (spec/design/timestamp.md §6).
                         Value::Timestamp(m) | Value::Timestamptz(m) => {
                             k.extend_from_slice(&encode_int(pk_ty, *m))
                         }
-                        // A date PRIMARY KEY is supported: the int32 day codec (spec/design/date.md §5).
+                        // A date PRIMARY KEY is supported: the i32 day codec (spec/design/date.md §5).
                         Value::Date(d) => k.extend_from_slice(&encode_int(pk_ty, *d as i64)),
                         // Unreachable: a PK column is NOT NULL, enforced above.
                         Value::Null => unreachable!("primary key column is NOT NULL"),
@@ -4870,7 +4870,7 @@ impl Database {
     /// Resolve `generate_series(start, stop[, step])` (spec/design/functions.md §10): 2 or 3
     /// integer args (a wrong arity/type → `42883`). The produced column is typed at the PROMOTED
     /// integer type of the args (PG); a NULL-typed arg contributes no width (the call yields zero
-    /// rows at exec). All-NULL defaults int64.
+    /// rows at exec). All-NULL defaults i64.
     fn resolve_generate_series(
         &self,
         args: &[Expr],
@@ -4912,7 +4912,7 @@ impl Database {
     /// be an array (binding `ELEM` := its element type, the produced column's type), else `42883`
     /// (a non-array, e.g. `unnest(5)`). A bare untyped `NULL` argument leaves `ELEM` undeterminable
     /// → `42P18` (jed's polymorphic posture, exactly like `array_append(NULL, NULL)`); a *typed*
-    /// NULL array (`NULL::int32[]`) resolves and yields zero rows at exec. `ELEM` may be a **scalar
+    /// NULL array (`NULL::i32[]`) resolves and yields zero rows at exec. `ELEM` may be a **scalar
     /// or a composite** (AF7 — `unnest(composite[])`): the synthetic column is typed at the bound
     /// element type directly (`type_from_resolved`), so a composite array produces composite rows
     /// (an anonymous-composite element has no catalog name → `0A000`, not reachable from a typed array).
@@ -6472,11 +6472,11 @@ enum ResolvedType {
     /// The `interval` family (a span). Compares only with itself (by the canonical span).
     Interval,
     /// The `date` family (calendar date). A strict island — compares only with itself (by the
-    /// int32 day count); no implicit cast to `timestamp` this slice (spec/design/date.md §4).
+    /// i32 day count); no implicit cast to `timestamp` this slice (spec/design/date.md §4).
     Date,
     /// The float family, carrying its width (spec/design/float.md §2). The two widths form a
-    /// promotion tower: `float32 → float64` is the one implicit float cast; mixed-width arithmetic
-    /// and comparison promote to `float64` first. A strict island — no implicit int/decimal ↔ float.
+    /// promotion tower: `f32 → f64` is the one implicit float cast; mixed-width arithmetic
+    /// and comparison promote to `f64` first. A strict island — no implicit int/decimal ↔ float.
     Float(ScalarType),
     Null,
     /// A composite (row) type (spec/design/composite.md §5). `name` is `Some` for a named catalog
@@ -6559,8 +6559,8 @@ impl ResolvedType {
             ResolvedType::Timestamptz => col_ty.is_timestamptz(),
             ResolvedType::Interval => col_ty.is_interval(),
             ResolvedType::Date => col_ty.is_date(),
-            // A float assigns to a float column of equal-or-wider width: float32 → float32/float64
-            // (the implicit widening cast), float64 → float64 only (float64 → float32 is explicit).
+            // A float assigns to a float column of equal-or-wider width: f32 → f32/f64
+            // (the implicit widening cast), f64 → f64 only (f64 → f32 is explicit).
             // store_value enforces the same rule per row (spec/types/casts.toml).
             ResolvedType::Float(st) => col_ty.is_float() && st.rank() <= col_ty.rank(),
         }
@@ -6614,9 +6614,9 @@ enum ScalarFunc {
     Cos,
     Tan,
     /// make_interval — builds an interval from its (named/defaulted) integer components plus the
-    /// float64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
+    /// f64 `secs` (spec/design/functions.md §11). The one scalar function returning interval.
     MakeInterval,
-    /// uuid_extract_version(uuid) → int16 — the version nibble, NULL off-RFC-variant (§12).
+    /// uuid_extract_version(uuid) → i16 — the version nibble, NULL off-RFC-variant (§12).
     UuidExtractVersion,
     /// uuid_extract_timestamp(uuid) → timestamptz — the embedded instant for v1/v7, else NULL (§12).
     UuidExtractTimestamp,
@@ -6631,18 +6631,18 @@ enum ScalarFunc {
     /// clock_timestamp() → timestamptz — the clock seam read on EVERY call, so it may advance
     /// within a statement (entropy.md §5). VOLATILE.
     ClockTimestamp,
-    /// nextval(text) → int64 — advance the named sequence and return the new value
+    /// nextval(text) → i64 — advance the named sequence and return the new value
     /// (spec/design/sequences.md §4). VOLATILE; MUTATES the working snapshot (via `pending_seq`),
     /// so a statement calling it runs on the write path.
     Nextval,
-    /// currval(text) → int64 — the value `nextval`/`setval` last produced for the named sequence IN
+    /// currval(text) → i64 — the value `nextval`/`setval` last produced for the named sequence IN
     /// THIS SESSION (sequences.md §6). VOLATILE; reads per-session state, 55000 before defined.
     Currval,
-    /// setval(text, int64[, bool]) → int64 — set the named sequence's counter to the value and
+    /// setval(text, i64[, bool]) → i64 — set the named sequence's counter to the value and
     /// return it (sequences.md §4). VOLATILE; MUTATES the working snapshot, so a statement calling
     /// it runs on the write path. Arity 2 (is_called defaults true) or 3.
     Setval,
-    /// lastval() → int64 — the value the most recent `nextval` (any sequence) returned IN THIS
+    /// lastval() → i64 — the value the most recent `nextval` (any sequence) returned IN THIS
     /// SESSION (sequences.md §6). VOLATILE; reads per-session state, 55000 before the first nextval.
     Lastval,
 }
@@ -6653,15 +6653,15 @@ enum ScalarFunc {
 /// ([`RExpr::ArrayFunc`]). The kernel id is the function name; the eval recovers everything else
 /// from the operand values (the array's own shape header), so the node carries no result type.
 enum ArrayFunc {
-    /// array_ndims(anyarray) → int32 — the dimension count; NULL for the empty array.
+    /// array_ndims(anyarray) → i32 — the dimension count; NULL for the empty array.
     ArrayNdims,
-    /// array_length(anyarray, integer) → int32 — length of a dimension; NULL if empty / out of range.
+    /// array_length(anyarray, integer) → i32 — length of a dimension; NULL if empty / out of range.
     ArrayLength,
-    /// array_lower(anyarray, integer) → int32 — a dimension's lower bound; NULL if empty / out of range.
+    /// array_lower(anyarray, integer) → i32 — a dimension's lower bound; NULL if empty / out of range.
     ArrayLower,
-    /// array_upper(anyarray, integer) → int32 — a dimension's upper bound; NULL if empty / out of range.
+    /// array_upper(anyarray, integer) → i32 — a dimension's upper bound; NULL if empty / out of range.
     ArrayUpper,
-    /// cardinality(anyarray) → int32 — the total element count; 0 for the empty array.
+    /// cardinality(anyarray) → i32 — the total element count; 0 for the empty array.
     Cardinality,
     /// array_dims(anyarray) → text — the bound spec `[l1:u1][l2:u2]…`; NULL for the empty array.
     ArrayDims,
@@ -6679,11 +6679,11 @@ enum ArrayFunc {
     /// array_replace(anyarray, anyelement, anyelement) → anyarray — substitute every element NOT
     /// DISTINCT FROM `from` with `to`; any dimensionality, shape preserved (§8).
     ArrayReplace,
-    /// array_position(anyarray, anyelement[, integer]) → int32 — the first match's SUBSCRIPT (in the
+    /// array_position(anyarray, anyelement[, integer]) → i32 — the first match's SUBSCRIPT (in the
     /// array's lower-bound space), NULL if absent; 1-D/empty only (0A000); the optional `start`
     /// subscript begins the scan and a NULL `start` is 22004 (§8).
     ArrayPosition,
-    /// array_positions(anyarray, anyelement) → int32[] — the int32[] of every match's subscript
+    /// array_positions(anyarray, anyelement) → i32[] — the i32[] of every match's subscript
     /// (empty {} if none); 1-D/empty only (0A000) (§8).
     ArrayPositions,
     /// `a @> b` (anyarray, anyarray) → boolean — does `a` CONTAIN `b`: is every element of `b`
@@ -6700,13 +6700,13 @@ enum ArrayFunc {
 /// The VARIADIC argument-counting functions (spec/design/array-functions.md §12). Distinct from
 /// [`ScalarFunc`] because they are non-strict (`null = "none"`, like [`ArrayFunc`]) and take either
 /// a spread of arguments or a single array via the `VARIADIC` keyword — the call form is carried on
-/// the [`RExpr::Variadic`] node. Both return `int32`.
+/// the [`RExpr::Variadic`] node. Both return `i32`.
 enum VariadicFunc {
-    /// num_nulls(VARIADIC "any") → int32 — the count of NULL arguments (spread form), or of NULL
+    /// num_nulls(VARIADIC "any") → i32 — the count of NULL arguments (spread form), or of NULL
     /// flattened elements (VARIADIC-array form; a NULL whole-array operand → NULL). Never NULL in
     /// spread form.
     NumNulls,
-    /// num_nonnulls(VARIADIC "any") → int32 — the mirror: the count of non-NULL arguments/elements.
+    /// num_nonnulls(VARIADIC "any") → i32 — the mirror: the count of non-NULL arguments/elements.
     NumNonnulls,
 }
 
@@ -6722,23 +6722,23 @@ enum RSubscript {
 
 /// A resolved expression: a tree over fixed column indices, ready to evaluate against
 /// a row. Arithmetic nodes carry their (promotion-tower) result type so the computed
-/// value can be range-checked against it (the int16+int16 → int16 boundary).
+/// value can be range-checked against it (the i16+i16 → i16 boundary).
 enum RExpr {
     Column(usize),
     ConstInt(i64),
     ConstBool(bool),
     ConstText(String),
     ConstDecimal(Decimal),
-    /// A `float32` / `float64` constant (a typed float literal, an adapted decimal/int literal
+    /// A `f32` / `f64` constant (a typed float literal, an adapted decimal/int literal
     /// in a float context, or a folded subquery value — spec/design/float.md §4).
     ConstFloat32(f32),
     ConstFloat64(f64),
     ConstBytea(Vec<u8>),
     ConstUuid([u8; 16]),
-    /// A parsed `timestamp` / `timestamptz` literal: the int64 microsecond instant.
+    /// A parsed `timestamp` / `timestamptz` literal: the i64 microsecond instant.
     ConstTimestamp(i64),
     ConstTimestamptz(i64),
-    /// A parsed `date` literal: the int32 day count since 1970-01-01 (spec/design/date.md).
+    /// A parsed `date` literal: the i32 day count since 1970-01-01 (spec/design/date.md).
     ConstDate(i32),
     /// A parsed `interval` literal: the three-field span (spec/design/interval.md).
     ConstInterval(Interval),
@@ -6861,7 +6861,7 @@ enum RExpr {
     /// is no blanket NULL short-circuit. `array_form` records the call shape: `false` = the SPREAD
     /// form (count `args`' null-ness directly, never NULL); `true` = the VARIADIC-array form (one
     /// `args` operand — a NULL array → NULL, else count its flattened elements' null-ness). Result
-    /// is always int32.
+    /// is always i32.
     Variadic {
         func: VariadicFunc,
         args: Vec<RExpr>,
@@ -7855,16 +7855,16 @@ enum AggPlan {
     CountStar,
     /// COUNT(expr) — count non-NULL inputs.
     Count,
-    /// SUM(int16|int32) — accumulate i64, result int64 (traps 22003 at the int64 bound).
+    /// SUM(i16|i32) — accumulate i64, result i64 (traps 22003 at the i64 bound).
     SumInt,
-    /// SUM(int64|decimal) — accumulate decimal, result decimal (traps 22003 at the cap).
+    /// SUM(i64|decimal) — accumulate decimal, result decimal (traps 22003 at the cap).
     SumDecimal,
     /// AVG — accumulate a decimal sum + i64 count; result sum/count (decimal), NULL if count 0.
     Avg,
-    /// SUM(float32|float64) — the ORDER-INDEPENDENT CANONICAL-ORDER FOLD (spec/design/float.md §7).
+    /// SUM(f32|f64) — the ORDER-INDEPENDENT CANONICAL-ORDER FOLD (spec/design/float.md §7).
     /// Carries the width so the result/fold round at the input width. Buffers the finite inputs.
     SumFloat(ScalarType),
-    /// AVG(float32|float64) — SUM (canonical fold) / count, one final rounding at the input width.
+    /// AVG(f32|f64) — SUM (canonical fold) / count, one final rounding at the input width.
     AvgFloat(ScalarType),
     Min,
     Max,
@@ -8010,7 +8010,7 @@ impl Acc {
                 ..
             } => {
                 // Classify each non-NULL input order-independently (the §7 special-value pass).
-                // Convert a float32 to its exact f64 for buffering; the fold re-rounds per step.
+                // Convert a f32 to its exact f64 for buffering; the fold re-rounds per step.
                 let f = match value {
                     Value::Null => return Ok(()),
                     Value::Float32(f) => f as f64,
@@ -8903,7 +8903,7 @@ fn variadic_func_id(name: &str) -> VariadicFunc {
 
 /// The result `ScalarType` of a scalar function from its catalog `result` code (functions.md §9):
 /// "promoted" = the (single) operand's own type; otherwise the code is a literal scalar-type id
-/// (e.g. "decimal", "float64", "interval", "int16", "timestamptz", "uuid") naming the result.
+/// (e.g. "decimal", "f64", "interval", "i16", "timestamptz", "uuid") naming the result.
 fn scalar_result_type(code: &str, arg_tys: &[ResolvedType]) -> ScalarType {
     if code == "promoted" {
         return resolved_scalar_type(&arg_tys[0]);
@@ -8965,7 +8965,7 @@ fn array_func_id(name: &str) -> ArrayFunc {
 }
 
 /// Bind/check the type variable ELEM against a concrete type `x`: bind if unbound, else require
-/// structural equality. `false` ⇒ a conflict (e.g. `array_cat(int32[], text[])`) — the overload
+/// structural equality. `false` ⇒ a conflict (e.g. `array_cat(i32[], text[])`) — the overload
 /// does not match. An untyped `NULL` operand never reaches here (the caller defers it).
 fn unify_elem(elem: &mut Option<ResolvedType>, x: &ResolvedType) -> bool {
     match elem {
@@ -9019,7 +9019,7 @@ fn match_poly(slots: &[&str], tys: &[ResolvedType]) -> Option<Option<ResolvedTyp
 
 /// The result `ResolvedType` of an array function from its catalog `result` code and the bound
 /// ELEM: `anyarray` → `ELEM[]`, `anyelement` → `ELEM` (both 42P18 if ELEM is undeterminable — every
-/// polymorphic arg was an untyped NULL); any other code is a concrete scalar id (`int32`, `text`).
+/// polymorphic arg was an untyped NULL); any other code is a concrete scalar id (`i32`, `text`).
 fn poly_result_type(code: &str, elem: &Option<ResolvedType>) -> Result<ResolvedType> {
     match code {
         "anyarray" => match elem {
@@ -9030,7 +9030,7 @@ fn poly_result_type(code: &str, elem: &Option<ResolvedType>) -> Result<ResolvedT
             Some(e) => Ok(e.clone()),
             None => Err(indeterminate_poly()),
         },
-        // A concrete array result `<scalar>[]` (array_positions → "int32[]"): the element type is
+        // A concrete array result `<scalar>[]` (array_positions → "i32[]"): the element type is
         // fixed (independent of ELEM), so the result is `Array(scalar)` (array-functions.md §8).
         c if c.ends_with("[]") => {
             let base = &c[..c.len() - 2];
@@ -9057,7 +9057,7 @@ fn indeterminate_poly() -> EngineError {
 /// The element type's `ScalarType`, for the literal-adaptation hint (array-functions.md §2): the
 /// bound array element type is threaded back as the `ctx` when re-resolving the polymorphic args,
 /// so a bare integer/decimal literal element adapts (with range-checking) to that type — e.g.
-/// `array_append(int32[], 40)` adapts `40` to `int32`. `None` for a composite/array/NULL element.
+/// `array_append(i32[], 40)` adapts `40` to `i32`. `None` for a composite/array/NULL element.
 fn elem_scalar_hint(t: &ResolvedType) -> Option<ScalarType> {
     match t {
         ResolvedType::Int(s) | ResolvedType::Float(s) => Some(*s),
@@ -9082,8 +9082,8 @@ fn elem_scalar_hint(t: &ResolvedType) -> Option<ScalarType> {
 /// Two passes (§2): pass 1 resolves the arguments with no hint to discover the array's element
 /// type; if that element is a scalar, pass 2 re-resolves the polymorphic-slot arguments with it as
 /// the `ctx`, so an untyped literal element (or an `ARRAY[…]` constructor argument) adapts to the
-/// array's element type — `array_append(int32[], 40)` and `array_cat(int32[], ARRAY[7,8])` both
-/// land on `int32`, with a range check on the literal. (The concrete `integer` dimension slot of
+/// array's element type — `array_append(i32[], 40)` and `array_cat(i32[], ARRAY[7,8])` both
+/// land on `i32`, with a range check on the literal. (The concrete `integer` dimension slot of
 /// `array_length`/`lower`/`upper` keeps its pass-1 resolution.)
 fn resolve_array_func(
     scope: &Scope,
@@ -9163,7 +9163,7 @@ fn lookup_aggregate_overload(surface: &str, t: &ResolvedType) -> Option<&'static
 fn aggregate_plan(surface: &str, result: &str, t: &ResolvedType) -> (AggPlan, ResolvedType) {
     match (surface, result) {
         ("count", _) => (AggPlan::Count, ResolvedType::Int(ScalarType::Int64)),
-        // SUM(int16|int32) → int64; SUM(int64) → decimal (PG widening).
+        // SUM(i16|i32) → i64; SUM(i64) → decimal (PG widening).
         ("sum", "sum_widen") => match t {
             ResolvedType::Int(it) if *it == ScalarType::Int64 => {
                 (AggPlan::SumDecimal, ResolvedType::Decimal)
@@ -9381,8 +9381,8 @@ fn scalar_func_desc(name: &str) -> Option<&'static OperatorDesc> {
 }
 
 /// The type context offered to an untyped literal in a function-argument slot of `family`, so it
-/// adapts (functions.md §11): an integer slot offers int64, a float slot offers float64 (so a
-/// bare `0`/`1.5` becomes float64 for `secs`). Other families offer no hint (the literal keeps
+/// adapts (functions.md §11): an integer slot offers i64, a float slot offers f64 (so a
+/// bare `0`/`1.5` becomes f64 for `secs`). Other families offer no hint (the literal keeps
 /// its default family, and the slot type-check catches a mismatch).
 fn family_hint(family: &str) -> Option<ScalarType> {
     match family {
@@ -9394,7 +9394,7 @@ fn family_hint(family: &str) -> Option<ScalarType> {
 
 /// Materialize a catalog DEFAULT (an integer-literal string, verify.rb-checked) as an `Expr` so
 /// an omitted trailing argument resolves through the normal literal path — adapting to its slot's
-/// family (e.g. "0" → float64 for `secs`). functions.md §11.
+/// family (e.g. "0" → f64 for `secs`). functions.md §11.
 fn default_expr(lit: &str) -> Expr {
     let n: i64 = lit
         .parse()
@@ -9468,7 +9468,7 @@ fn normalize_named_args(
 /// Resolve `make_interval(years, months, weeks, days, hours, mins, secs)` — the engine's first
 /// named + defaulted function (functions.md §11). Normalize named/positional args + defaults onto
 /// the seven slots, resolve each with its declared family as the type hint (so a bare numeric
-/// literal adapts to the `float64` `secs` slot), and emit a `MakeInterval` node. The arguments
+/// literal adapts to the `f64` `secs` slot), and emit a `MakeInterval` node. The arguments
 /// keep their families (no promotion); a wrong family in a slot is 42883.
 fn resolve_make_interval(
     scope: &Scope,
@@ -9491,8 +9491,8 @@ fn resolve_make_interval(
         let fam = desc.arg_families[i];
         let (r, t) = resolve(scope, e, family_hint(fam), agg, params)?;
         // Type-check the resolved arg against its declared family. A NULL adapts (NULL
-        // propagates). A float32 `secs` is read at its own width and widened losslessly to f64
-        // at eval (no Cast node — so the cost matches the float64 case and the Go/TS cores).
+        // propagates). A f32 `secs` is read at its own width and widened losslessly to f64
+        // at eval (no Cast node — so the cost matches the f64 case and the Go/TS cores).
         let ok = matches!(t, ResolvedType::Null)
             || (fam == "integer" && matches!(t, ResolvedType::Int(_)))
             || (fam == "float" && matches!(t, ResolvedType::Float(_)));
@@ -9556,13 +9556,13 @@ fn resolve_scalar_func(
     // its kernel id by name (extensibility.md §5) — replacing the old hand-written (name,
     // arg-types) result match + name→variant match. abs's "promoted" gives the operand's own type
     // (its boundary range-checks for integers; its width for floats, the only `promoted` float fn);
-    // round's decimal/integer overloads return numeric, its float overloads float64; the remaining
-    // float functions return float64; the uuid extractors/generators return their catalog scalar id.
+    // round's decimal/integer overloads return numeric, its float overloads f64; the remaining
+    // float functions return f64; the uuid extractors/generators return their catalog scalar id.
     let desc = lookup_scalar_overload(name, &tys).ok_or_else(|| no_func_overload(name))?;
     let result = scalar_result_type(desc.result, &tys);
     let func = scalar_func_id(name);
-    // Promote float arguments to float64 when the function computes at float64 (every float
-    // overload except `abs(float32)`, which keeps its width). The eval then sees one width.
+    // Promote float arguments to f64 when the function computes at f64 (every float
+    // overload except `abs(f32)`, which keeps its width). The eval then sees one width.
     let widen_args = !matches!(func, ScalarFunc::Abs);
     if widen_args && result == ScalarType::Float64 {
         rargs = rargs
@@ -9593,7 +9593,7 @@ fn variadic_not_array() -> EngineError {
 /// The lone catalog row's last parameter is variadic; the call is EITHER a spread of trailing
 /// arguments OR (with the `VARIADIC` keyword) a single array passed directly. Non-strict
 /// (`null = "none"`): the resolved node carries no blanket NULL short-circuit. Builds an
-/// `RExpr::Variadic` node; the result type is the catalog `result` (int32 here), independent of
+/// `RExpr::Variadic` node; the result type is the catalog `result` (i32 here), independent of
 /// the arguments.
 fn resolve_variadic_func(
     scope: &Scope,
@@ -9865,7 +9865,7 @@ impl ParamTypes {
 }
 
 /// Unify two inferred types for the same bind parameter: equal agrees; two integer widths
-/// widen to the wider (so `$1` works against both an int16 and an int32 column); any other
+/// widen to the wider (so `$1` works against both an i16 and an i32 column); any other
 /// mismatch is 42804 (spec/design/api.md §5).
 fn unify_param_type(a: ScalarType, b: ScalarType, idx0: usize) -> Result<ScalarType> {
     if a == b {
@@ -10141,7 +10141,7 @@ fn resolved_type_of(ty: ScalarType) -> ResolvedType {
 
 /// Resolve one `Expr` into an `RExpr` plus its static type, against the FROM `scope`. `ctx`
 /// is the type an untyped integer literal should adapt to (spec/design/types.md §6); `None`
-/// defaults a bare literal to int64. A column reference resolves to a flat row index via the
+/// defaults a bare literal to i64. A column reference resolves to a flat row index via the
 /// scope — a bare name ambiguous across relations is 42702, an unknown qualifier is 42P01
 /// (spec/design/grammar.md §15).
 /// Turn a chain resolution into a resolved node + type. A `Local` column obeys the grouping
@@ -10281,7 +10281,7 @@ fn resolve(
             }
             // An element-type hint (`ctx`) flows down to the elements so an array literal adapts
             // its untyped integer/decimal literals exactly as a scalar literal does — e.g. resolving
-            // `ARRAY[7,8]` with an int32 context yields `int32[]`, not the default `int64[]` (the
+            // `ARRAY[7,8]` with an i32 context yields `i32[]`, not the default `i64[]` (the
             // polymorphic array functions pass the bound element type here, array-functions.md §2).
             // Almost every other caller passes `None`, so the default 1-D unification is unchanged.
             let mut nodes = Vec::with_capacity(items.len());
@@ -10419,7 +10419,7 @@ fn resolve(
             // context width (nearest, round-ties-to-even — spec/design/float.md §4). This is
             // literal adaptation, not an implicit cross-family cast (a *value* never silently
             // becomes a float). Otherwise it adapts only to an integer context, defaulting to
-            // int64; a non-numeric context defers the family-mismatch check to the surroundings.
+            // i64; a non-numeric context defers the family-mismatch check to the surroundings.
             if let Some(t) = ctx.filter(|t| t.is_float()) {
                 return Ok((int_to_const_float(*n, t), ResolvedType::Float(t)));
             }
@@ -11125,7 +11125,7 @@ fn resolve_binary(
                 ));
             }
             // Float arithmetic (spec/design/float.md §5): float ⊕ float → float, mixed widths
-            // PROMOTE to float64 first (the implicit float32 → float64 cast). A float paired with
+            // PROMOTE to f64 first (the implicit f32 → f64 cast). A float paired with
             // any non-float family is a 42804 (the strict island), reported by require_numeric
             // below since one side is Float. A pure float pair (or float × NULL) is handled here.
             if matches!(lt, ResolvedType::Float(_)) || matches!(rt, ResolvedType::Float(_)) {
@@ -11189,7 +11189,7 @@ fn resolve_binary(
             // The runtime comparison (eq3/lt3/gt3) dispatches on the value variants.
             let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
             classify_comparable(&lt, &rt)?;
-            // A mixed-width float comparison promotes the float32 side to float64 first (the
+            // A mixed-width float comparison promotes the f32 side to f64 first (the
             // implicit cast — spec/design/float.md §2/§3), so the runtime compare sees one width.
             let (rl, rr) =
                 if matches!(lt, ResolvedType::Float(_)) && matches!(rt, ResolvedType::Float(_)) {
@@ -11317,7 +11317,7 @@ fn resolve_quantified(
     let (mut ra, mut at) = resolve(scope, array, None, agg, params)?;
     // If `x` is a CONCRETE scalar (not itself an adaptable bare literal) and the array operand is a
     // bare `ARRAY[…]` constructor, re-resolve the array with `x`'s type as the element hint so the
-    // constructor adapts (`c = ANY(ARRAY[1,2])` over an int32 column → int32[]). Harmless for a
+    // constructor adapts (`c = ANY(ARRAY[1,2])` over an i32 column → i32[]). Harmless for a
     // column / cast operand (it ignores the hint).
     if !is_adaptable_operand(lhs) {
         if let Some(s) = ctx_of(&lt) {
@@ -11325,7 +11325,7 @@ fn resolve_quantified(
         }
     }
     // If the array resolved to `E[]` and `x` is an adaptable bare literal, adapt `x` to `E` (with a
-    // range check) — exactly the operand pairing `=` uses (`5 = ANY(int32[]_col)` lands `x` on int32).
+    // range check) — exactly the operand pairing `=` uses (`5 = ANY(i32[]_col)` lands `x` on i32).
     if let ResolvedType::Array(e) = &at {
         if is_adaptable_operand(lhs) {
             if let Some(s) = elem_scalar_hint(e) {
@@ -11479,7 +11479,7 @@ fn resolve_concat(
 
 /// Resolve the two operands of a binary operator, giving each adaptable literal the other
 /// operand's type as context: a bare *integer* literal adopts the sibling's integer type (so
-/// `small + 1` types `1` as int16, and `small + 100000` traps 22003 at resolve), and a
+/// `small + 1` types `1` as i16, and `small + 100000` traps 22003 at resolve), and a
 /// *string* literal adapts to a bytea sibling (decoding the hex input — types.md §6/§13),
 /// otherwise staying text. When the sibling offers no usable context, the literal defaults to
 /// its own family and the caller's family check reports the mismatch. This does NOT enforce a
@@ -11495,7 +11495,7 @@ fn resolve_operand_pair(
     let rhs_lit = is_adaptable_operand(rhs);
     let (rl, lt, rr, rt) = if lhs_lit && rhs_lit {
         // Two bare adaptable operands: no column context. Default an integer literal (and a
-        // bind parameter) to int64; a string literal stays text (no bytea context — types.md §6).
+        // bind parameter) to i64; a string literal stays text (no bytea context — types.md §6).
         let (rl, lt) = resolve(scope, lhs, Some(ScalarType::Int64), agg, params)?;
         let (rr, rt) = resolve(scope, rhs, Some(ScalarType::Int64), agg, params)?;
         (rl, lt, rr, rt)
@@ -11531,7 +11531,7 @@ fn is_adaptable_operand(e: &Expr) -> bool {
 /// The context type a sibling operand offers an adaptable operand. For an integer literal this
 /// is the integer width it adopts; for a string literal, `bytea`/`uuid`/`text` (so it can decode
 /// the hex/uuid input); a bind parameter additionally adopts a `decimal`/`boolean` sibling (a
-/// literal ignores those — its arm keeps int64/text — so widening the mapping is safe). Only a
+/// literal ignores those — its arm keeps i64/text — so widening the mapping is safe). Only a
 /// bare NULL offers no context.
 fn ctx_of(ty: &ResolvedType) -> Option<ScalarType> {
     match ty {
@@ -11695,7 +11695,7 @@ fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Result<()> {
             "cannot compare a composite value with a value of a different type",
         )),
         // Float is a STRICT ISLAND (spec/design/float.md §3/§6): comparable only float × float
-        // (either width — a mixed-width pair promotes to float64 first, compare.toml `max-rank`)
+        // (either width — a mixed-width pair promotes to f64 first, compare.toml `max-rank`)
         // or with a bare NULL. Float vs ANY other family (int/decimal included) is 42804 — jed
         // requires an explicit cast, a documented divergence from PG which promotes to float8.
         (Float(_), Float(_)) => Ok(()),
@@ -11718,7 +11718,7 @@ fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Result<()> {
         (Timestamp, _) | (_, Timestamp) | (Timestamptz, _) | (_, Timestamptz) => Err(type_error(
             "cannot compare a timestamp value with a value of a different type",
         )),
-        // date compares only within its own family (or with a bare NULL), by the int32 day count
+        // date compares only within its own family (or with a bare NULL), by the i32 day count
         // (spec/design/date.md §4). date vs any other family — including timestamp, which would
         // need a cast (a documented divergence from PG) — is a 42804.
         (Date, Date) => Ok(()),
@@ -11778,8 +11778,8 @@ fn int_type(ty: &ResolvedType) -> Option<ScalarType> {
     }
 }
 
-/// Wrap a `float32`-typed operand in an implicit `CAST(... AS float64)` so a mixed-width float
-/// pair (compare or arith) computes at one width (spec/design/float.md §2/§5). A float64 or
+/// Wrap a `f32`-typed operand in an implicit `CAST(... AS f64)` so a mixed-width float
+/// pair (compare or arith) computes at one width (spec/design/float.md §2/§5). A f64 or
 /// non-float operand is returned unchanged; the caller decides when widening is needed.
 fn widen_float_to_f64(node: RExpr, ty: &ResolvedType) -> RExpr {
     if matches!(ty, ResolvedType::Float(ScalarType::Float32)) {
@@ -11794,7 +11794,7 @@ fn widen_float_to_f64(node: RExpr, ty: &ResolvedType) -> RExpr {
 }
 
 /// Resolve a float arithmetic pair to `(lhs, rhs, result_width)` with mixed widths promoted to
-/// float64 (spec/design/float.md §5). Returns `None` when the pair is NOT a pure float pair (one
+/// f64 (spec/design/float.md §5). Returns `None` when the pair is NOT a pure float pair (one
 /// side is a non-float, non-NULL family) — the caller then raises the strict-island 42804. A
 /// `float × NULL` pair adopts the float side's width (the NULL propagates at eval).
 fn promote_float_arith(
@@ -11815,7 +11815,7 @@ fn promote_float_arith(
         (Float(a), Null) | (Null, Float(a)) => *a,
         _ => return None,
     };
-    // Promote a float32 operand to the common width when the result is float64.
+    // Promote a f32 operand to the common width when the result is f64.
     let (rl, rr) = if width == ScalarType::Float64 {
         (widen_float_to_f64(rl, &lt), widen_float_to_f64(rr, &rt))
     } else {
@@ -11825,7 +11825,7 @@ fn promote_float_arith(
 }
 
 /// The promotion-tower result type of two arithmetic operands: the higher-ranked
-/// integer type, or int64 when both are untyped NULLs.
+/// integer type, or i64 when both are untyped NULLs.
 fn promote(a: &ResolvedType, b: &ResolvedType) -> ScalarType {
     match (int_type(a), int_type(b)) {
         (Some(x), Some(y)) => {
@@ -12165,7 +12165,7 @@ fn array_position_value(arr: &Value, elem: &Value, start: Option<&Value>) -> Res
     Ok(Value::Null)
 }
 
-/// array_positions(a, e) (array-functions.md §8): the int32[] of every match's subscript (in the
+/// array_positions(a, e) (array-functions.md §8): the i32[] of every match's subscript (in the
 /// array's lower-bound space), the empty array `{}` if none. NULL array → NULL; **1-D/empty only**
 /// (a multidimensional array is 0A000).
 fn array_positions_value(arr: &Value, elem: &Value) -> Result<Value> {
@@ -12773,8 +12773,8 @@ fn require_assignable(ty: &ResolvedType, col_ty: ScalarType, col: &str) -> Resul
     } else if col_ty.is_date() {
         matches!(ty, ResolvedType::Date | ResolvedType::Null)
     } else if col_ty.is_float() {
-        // A float value assigns to an equal-or-wider float column: float32 → float32/float64
-        // (implicit widening), float64 → float64 only (float64 → float32 is explicit-CAST only).
+        // A float value assigns to an equal-or-wider float column: f32 → f32/f64
+        // (implicit widening), f64 → f64 only (f64 → f32 is explicit-CAST only).
         matches!(ty, ResolvedType::Float(st) if st.rank() <= col_ty.rank())
             || matches!(ty, ResolvedType::Null)
     } else {
@@ -13033,7 +13033,7 @@ fn coerce_string_literal(
             RExpr::ConstInt(parse_int_literal(s, target)?),
             ResolvedType::Int(target),
         ),
-        // `float '…'` / `real '…'` / CAST('…' AS float64) — parse via the float input function
+        // `float '…'` / `real '…'` / CAST('…' AS f64) — parse via the float input function
         // (sign, digits, `.`, e-notation, Infinity/inf/NaN; spec/design/float.md §4). Malformed →
         // 22P02, out of range → 22003.
         ScalarType::Float64 => (
@@ -13047,8 +13047,8 @@ fn coerce_string_literal(
     })
 }
 
-/// Parse a string literal's content as a `float64` — the text→float coercion for `float '1.5e10'`
-/// / `CAST('Infinity' AS float64)` (spec/design/float.md §4). Accepts an optional leading sign,
+/// Parse a string literal's content as a `f64` — the text→float coercion for `float '1.5e10'`
+/// / `CAST('Infinity' AS f64)` (spec/design/float.md §4). Accepts an optional leading sign,
 /// decimal digits with an optional point and `e`-notation, and the case-insensitive special words
 /// `Infinity`/`+Infinity`/`-Infinity`/`inf`/`+inf`/`-inf`/`NaN` (PG `float8in` spellings).
 /// Surrounding ASCII whitespace is trimmed. Malformed input traps `22P02`; a value outside the
@@ -13058,7 +13058,7 @@ fn parse_f64_literal(s: &str) -> Result<f64> {
     let invalid = || {
         EngineError::new(
             SqlState::InvalidTextRepresentation,
-            format!("invalid input syntax for type float64: \"{s}\""),
+            format!("invalid input syntax for type f64: \"{s}\""),
         )
     };
     if let Some(v) = parse_float_special_f64(t) {
@@ -13077,14 +13077,14 @@ fn parse_f64_literal(s: &str) -> Result<f64> {
     }
 }
 
-/// As [`parse_f64_literal`], for `float32` (binary32). A finite value beyond the binary32 range
+/// As [`parse_f64_literal`], for `f32` (binary32). A finite value beyond the binary32 range
 /// traps `22003`.
 fn parse_f32_literal(s: &str) -> Result<f32> {
     let t = s.trim_matches(|c: char| c.is_ascii_whitespace());
     let invalid = || {
         EngineError::new(
             SqlState::InvalidTextRepresentation,
-            format!("invalid input syntax for type float32: \"{s}\""),
+            format!("invalid input syntax for type f32: \"{s}\""),
         )
     };
     if let Some(v) = parse_float_special_f32(t) {
@@ -13418,8 +13418,8 @@ fn store_value(
                 )))
             }
         }
-        // A float32 stores into a float32 column verbatim, or WIDENS losslessly into a float64
-        // column (the implicit float32 → float64 cast, spec/types/casts.toml). Other targets 42804.
+        // A f32 stores into a f32 column verbatim, or WIDENS losslessly into a f64
+        // column (the implicit f32 → f64 cast, spec/types/casts.toml). Other targets 42804.
         Value::Float32(f) => {
             if col_ty.is_float32() {
                 Ok(Value::Float32(f))
@@ -13427,19 +13427,19 @@ fn store_value(
                 Ok(Value::Float64(f as f64))
             } else {
                 Err(type_error(format!(
-                    "cannot store a float32 value in {} column {col_name}",
+                    "cannot store a f32 value in {} column {col_name}",
                     col_ty.canonical_name()
                 )))
             }
         }
-        // A float64 stores into a float64 column verbatim. float64 → float32 is an EXPLICIT cast
+        // A f64 stores into a f64 column verbatim. f64 → f32 is an EXPLICIT cast
         // (lossy), so it never reaches store_value as an implicit assignment — any other target 42804.
         Value::Float64(f) => {
             if col_ty.is_float64() {
                 Ok(Value::Float64(f))
             } else {
                 Err(type_error(format!(
-                    "cannot store a float64 value in {} column {col_name}",
+                    "cannot store a f64 value in {} column {col_name}",
                     col_ty.canonical_name()
                 )))
             }
@@ -14078,7 +14078,7 @@ impl RExpr {
                 } else if result.is_float() {
                     // Float arithmetic (spec/design/float.md §5): the IEEE correctly-rounded op at
                     // the result width, ONE op per node (no FMA fusion — the tree-walk guarantees
-                    // it). The resolver promoted a mixed-width pair to float64, so both operands
+                    // it). The resolver promoted a mixed-width pair to f64, so both operands
                     // are already the result width. A finite overflow to ±Inf traps 22003, x/0
                     // traps 22012; an Inf/NaN operand propagates by IEEE.
                     match (a, b) {
@@ -14197,7 +14197,7 @@ impl RExpr {
                 match func {
                     ScalarFunc::Abs => match &vals[0] {
                         // abs over an integer: |x| then range-check at the result type's
-                        // boundary (abs(int16 -32768) → 22003), exactly like Neg.
+                        // boundary (abs(i16 -32768) → 22003), exactly like Neg.
                         Value::Int(n) => {
                             let v = n.checked_abs().ok_or_else(|| overflow(*result))?;
                             if result.in_range(v) {
@@ -14212,7 +14212,7 @@ impl RExpr {
                         Value::Float64(f) => Ok(Value::Float64(f.abs())),
                         _ => unreachable!("resolver restricts abs to numeric operands"),
                     },
-                    // round over a float (1- or 2-arg) → float64 (half-away — the engine's mode;
+                    // round over a float (1- or 2-arg) → f64 (half-away — the engine's mode;
                     // a NaN/Inf operand passes through). Distinguished from decimal round by the
                     // operand variant.
                     ScalarFunc::Round if matches!(&vals[0], Value::Float64(_)) => {
@@ -14242,8 +14242,8 @@ impl RExpr {
                         };
                         Ok(Value::Decimal(d.round_places(places)?))
                     }
-                    // The other float functions all take a single float64 arg (the resolver widened
-                    // it) and return float64 (spec/design/float.md §8). EXACT (in-contract):
+                    // The other float functions all take a single f64 arg (the resolver widened
+                    // it) and return f64 (spec/design/float.md §8). EXACT (in-contract):
                     // ceil/floor/trunc/sqrt. sqrt of a negative is a DOMAIN error → 22003 (NaN stays
                     // input-only). TRANSCENDENTAL (exempted — native libm): exp/ln/log10/pow/sin/
                     // cos/tan; ln(0)/ln(neg) → 22003, exp/pow overflow → 22003.
@@ -14260,11 +14260,11 @@ impl RExpr {
                     | ScalarFunc::Tan => {
                         let x = match &vals[0] {
                             Value::Float64(f) => *f,
-                            _ => unreachable!("resolver widens a float function arg to float64"),
+                            _ => unreachable!("resolver widens a float function arg to f64"),
                         };
                         eval_float_func(*func, x, vals.get(1))
                     }
-                    // make_interval — six integer components plus the float64 `secs`. years/
+                    // make_interval — six integer components plus the f64 `secs`. years/
                     // months → months field (×12), weeks/days → days field (×7), hours/mins/secs
                     // → micros; an i32/i64 field overflow traps 22008 (functions.md §11). The one
                     // float step (secs → micros) is correctly-rounded + deterministic, so the
@@ -14278,7 +14278,7 @@ impl RExpr {
                         };
                         let secs = match &vals[6] {
                             Value::Float64(f) => *f,
-                            // float32 widens losslessly to f64 (every binary32 is an exact binary64).
+                            // f32 widens losslessly to f64 (every binary32 is an exact binary64).
                             Value::Float32(f) => *f as f64,
                             _ => unreachable!("resolver restricts make_interval's secs to a float"),
                         };
@@ -14578,7 +14578,7 @@ fn quantified_membership(
 }
 
 /// The per-element three-valued comparison `lhs op e` for a quantified node, normalizing a
-/// mixed-width float pair to `float64` first (the resolver admits `float32` vs `float64`, matching
+/// mixed-width float pair to `f64` first (the resolver admits `f32` vs `f64`, matching
 /// `RExpr::Compare`'s promote — here the array elements are runtime values, so the widen happens per
 /// element). Bottoms out in the value module's `eq3`/`lt3`/`gt3` kernels.
 ///
@@ -14696,7 +14696,7 @@ fn like_match(subject: &str, pattern: &str) -> Result<bool> {
 
 /// Evaluate an integer arithmetic op in 64-bit, trapping 22012 on a zero divisor and
 /// 22003 if the 64-bit op overflows OR the in-range result falls outside the declared
-/// result type (the int16+int16 → int16 boundary — spec/design/functions.md §7).
+/// result type (the i16+i16 → i16 boundary — spec/design/functions.md §7).
 fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> {
     let computed = match op {
         ArithOp::Add => x.checked_add(y),
@@ -14720,7 +14720,7 @@ fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> 
             }
             // `x % -1` is mathematically 0 for every x. Special-cased so i64::MIN % -1
             // returns 0 instead of trapping on the i64 IDIV overflow (which `checked_rem`
-            // reports as None) — matching PostgreSQL and the int16/int32 widths, which
+            // reports as None) — matching PostgreSQL and the i16/i32 widths, which
             // already compute 0 cleanly in 64-bit (spec/design/types.md §3).
             if y == -1 { Some(0) } else { x.checked_rem(y) }
         }
@@ -14733,7 +14733,7 @@ fn eval_arith(op: ArithOp, x: i64, y: i64, result: ScalarType) -> Result<Value> 
     }
 }
 
-/// Evaluate `float64 ⊕ float64` for one node (spec/design/float.md §5): the IEEE correctly-rounded
+/// Evaluate `f64 ⊕ f64` for one node (spec/design/float.md §5): the IEEE correctly-rounded
 /// op (round-ties-to-even — Rust's default). The PG TRAP model: a FINITE pair whose result
 /// overflows to ±Inf traps 22003 (finite arithmetic never PRODUCES non-finite values); `x / 0`
 /// (or `x % 0`) traps 22012 for EVERY numerator except NaN (`Inf/0` and `0/0` trap; only `NaN/0`
@@ -14761,10 +14761,10 @@ fn eval_float64_arith(op: ArithOp, x: f64, y: f64) -> Result<Value> {
     Ok(Value::Float64(r))
 }
 
-/// As [`eval_float64_arith`], at binary32 (`float32`). Each op rounds to binary32 (native `f32`
-/// arithmetic), so a finite overflow to ±Inf at the float32 range traps 22003.
+/// As [`eval_float64_arith`], at binary32 (`f32`). Each op rounds to binary32 (native `f32`
+/// arithmetic), so a finite overflow to ±Inf at the f32 range traps 22003.
 fn eval_float32_arith(op: ArithOp, x: f32, y: f32) -> Result<Value> {
-    // Same zero-divisor rule as float64: traps for every numerator except NaN (Inf/0 traps).
+    // Same zero-divisor rule as f64: traps for every numerator except NaN (Inf/0 traps).
     if matches!(op, ArithOp::Div | ArithOp::Mod) && y == 0.0 && !x.is_nan() {
         return Err(EngineError::new(
             SqlState::DivisionByZero,
@@ -14830,15 +14830,15 @@ fn decimal_to_float(d: &Decimal, target: ScalarType) -> Result<Value> {
 
 /// Cast a float value (already widened to f64) to a non-float `target` — int / decimal — or to a
 /// narrower float width (spec/design/float.md §6). NaN/±Inf → 22003 for every non-float target
-/// (and for float64 → float32 overflow). Float → int rounds HALF AWAY FROM ZERO (jed's one mode)
+/// (and for f64 → f32 overflow). Float → int rounds HALF AWAY FROM ZERO (jed's one mode)
 /// then range-checks. Float → decimal is the exact decimal of the binary value, then the typmod.
 fn cast_from_float(f: f64, target: ScalarType, typmod: Option<DecimalTypmod>) -> Result<Value> {
     if target.is_float64() {
-        // float → float64: widening (lossless from f32, identity from f64).
+        // float → f64: widening (lossless from f32, identity from f64).
         return Ok(Value::Float64(f));
     }
     if target.is_float32() {
-        // float64 → float32: nearest (round-ties-to-even). A finite value beyond the binary32
+        // f64 → f32: nearest (round-ties-to-even). A finite value beyond the binary32
         // range traps 22003 (not ±Inf); NaN/±Inf convert across widths unchanged (propagate).
         let n = f as f32;
         if n.is_infinite() && f.is_finite() {
@@ -14852,7 +14852,7 @@ fn cast_from_float(f: f64, target: ScalarType, typmod: Option<DecimalTypmod>) ->
     }
     if target.is_decimal() {
         // float → decimal: the EXACT decimal of the binary value (spec/design/float.md §6), then
-        // the typmod's scale coercion. `f` is finite (checked above); a float32 reaches here
+        // the typmod's scale coercion. `f` is finite (checked above); a f32 reaches here
         // already losslessly widened to f64, so the exact decimal IS the binary32 value's.
         let d = Decimal::from_float64(f);
         return Ok(Value::Decimal(coerce_decimal(d, typmod)?));
@@ -14951,7 +14951,7 @@ fn finalize_float_fold(
     }
 }
 
-/// `round(float64, places)` — round half away from zero to `places` decimal digits (the engine's
+/// `round(f64, places)` — round half away from zero to `places` decimal digits (the engine's
 /// one mode — spec/design/float.md §8). A NaN/±Inf operand passes through. `places` may be
 /// negative (round to the left of the point). Done by scaling by 10^places, `round()` (half-away),
 /// then unscaling — the approximate float path (binary, so itself inexact, which the `R` tag
@@ -15037,7 +15037,7 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         ScalarFunc::Pow => {
             let y = match arg2 {
                 Some(Value::Float64(y)) => *y,
-                _ => unreachable!("pow's second arg is a widened float64"),
+                _ => unreachable!("pow's second arg is a widened f64"),
             };
             let v = x.powf(y);
             // pow overflow from finite operands → 22003.
@@ -15168,7 +15168,7 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         (Value::Float64(x), Value::Float64(y)) => crate::value::total_cmp_f64(*x, *y),
         (Value::Bytea(x), Value::Bytea(y)) => x.cmp(y),
         (Value::Uuid(x), Value::Uuid(y)) => x.cmp(y),
-        // Timestamps order by the int64 instant (-infinity < finite < infinity).
+        // Timestamps order by the i64 instant (-infinity < finite < infinity).
         (Value::Timestamp(x), Value::Timestamp(y)) => x.cmp(y),
         (Value::Timestamptz(x), Value::Timestamptz(y)) => x.cmp(y),
         (Value::Date(x), Value::Date(y)) => x.cmp(y),
@@ -15308,10 +15308,7 @@ mod registry_tests {
         }
         for a in AGGREGATES.iter() {
             assert!(
-                matches!(
-                    a.result,
-                    "int64" | "decimal" | "sum_widen" | "same_as_input"
-                ),
+                matches!(a.result, "i64" | "decimal" | "sum_widen" | "same_as_input"),
                 "aggregate {} has unhandled result code {}",
                 a.name,
                 a.result

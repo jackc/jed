@@ -9,10 +9,10 @@
 # STATE (PG checks per-row in heap order), and DROP INDEX of a constraint-backed index is
 # allowed (jed has no ALTER TABLE ... DROP CONSTRAINT).
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.check, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, query.select, query.order_by, types.int32, types.text, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.check, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, query.select, query.order_by, types.i32, types.text, null.three_valued, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v int32 UNIQUE, w int32, CONSTRAINT wv UNIQUE (w, v))
+CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32, CONSTRAINT wv UNIQUE (w, v))
 
 statement ok
 INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)
@@ -61,7 +61,7 @@ statement error 42P07
 CREATE INDEX t_v_key ON t (w)
 
 statement error 42P07
-CREATE TABLE t_v_key (x int32)
+CREATE TABLE t_v_key (x i32)
 
 # ... and the CONSTRAINT name became the index wv
 statement error 42P07
@@ -70,28 +70,28 @@ CREATE INDEX wv ON t (w)
 # --- member resolution (PG codes, in PG's order) ----------------------------------
 
 statement error 42703
-CREATE TABLE e2 (a int32, UNIQUE (nosuch))
+CREATE TABLE e2 (a i32, UNIQUE (nosuch))
 
 statement error 42701
-CREATE TABLE e1 (a int32, UNIQUE (a, a))
+CREATE TABLE e1 (a i32, UNIQUE (a, a))
 
 # a non-key-encodable member is the documented 0A000 narrowing (as for PK / CREATE INDEX)
 statement error 0A000
-CREATE TABLE e6 (a int32, s text UNIQUE)
+CREATE TABLE e6 (a i32, s text UNIQUE)
 
 # --- dedup and the PK fold ---------------------------------------------------------
 
 # the PK absorbs an identical-list UNIQUE; identical UNIQUE lists fold into one
 statement ok
-CREATE TABLE f (a int32 PRIMARY KEY UNIQUE, b int32 UNIQUE, UNIQUE (b))
+CREATE TABLE f (a i32 PRIMARY KEY UNIQUE, b i32 UNIQUE, UNIQUE (b))
 
 # no index f_a_key was created (the PK absorbed it) — the name is free ...
 statement ok
-CREATE TABLE f_a_key (x int32)
+CREATE TABLE f_a_key (x i32)
 
 # ... while the folded pair left exactly one f_b_key
 statement error 42P07
-CREATE TABLE f_b_key (x int32)
+CREATE TABLE f_b_key (x i32)
 
 statement ok
 DROP TABLE f_a_key
@@ -101,26 +101,26 @@ DROP TABLE f_a_key
 # an explicit constraint name vs an existing relation, vs its own table, and vs a
 # same-statement sibling — all 42P07 (the relation namespace)
 statement error 42P07
-CREATE TABLE c2 (a int32, CONSTRAINT t UNIQUE (a))
+CREATE TABLE c2 (a i32, CONSTRAINT t UNIQUE (a))
 
 statement error 42P07
-CREATE TABLE p4 (a int32, CONSTRAINT p4 UNIQUE (a))
+CREATE TABLE p4 (a i32, CONSTRAINT p4 UNIQUE (a))
 
 statement error 42P07
-CREATE TABLE e8 (a int32, CONSTRAINT x UNIQUE (a), b int32, CONSTRAINT x UNIQUE (b))
+CREATE TABLE e8 (a i32, CONSTRAINT x UNIQUE (a), b i32, CONSTRAINT x UNIQUE (b))
 
 # ... vs a CHECK constraint's name it is 42710 (the per-table constraint namespace),
 # in either declaration order
 statement error 42710
-CREATE TABLE z4 (a int32, CONSTRAINT zc CHECK (a > 0), CONSTRAINT zc UNIQUE (a))
+CREATE TABLE z4 (a i32, CONSTRAINT zc CHECK (a > 0), CONSTRAINT zc UNIQUE (a))
 
 statement error 42710
-CREATE TABLE z5 (a int32, CONSTRAINT zc UNIQUE (a), CONSTRAINT zc CHECK (a > 0))
+CREATE TABLE z5 (a i32, CONSTRAINT zc UNIQUE (a), CONSTRAINT zc CHECK (a > 0))
 
 # --- CREATE UNIQUE INDEX: build verification ---------------------------------------
 
 statement ok
-CREATE TABLE d (id int32 PRIMARY KEY, a int32, n int32)
+CREATE TABLE d (id i32 PRIMARY KEY, a i32, n i32)
 
 statement ok
 INSERT INTO d VALUES (1, 7, NULL), (2, 7, NULL), (3, 8, 5)
@@ -131,7 +131,7 @@ CREATE UNIQUE INDEX dup ON d (a)
 
 # nothing was created — the name is free
 statement ok
-CREATE TABLE dup (x int32)
+CREATE TABLE dup (x i32)
 
 statement ok
 DROP TABLE dup
@@ -158,7 +158,7 @@ INSERT INTO d VALUES (5, 1, 1)
 # cannot poison the oracle replay prefix — conformance.md §5) ------------------------
 
 statement ok
-CREATE TABLE m (id int32 PRIMARY KEY, vv int32 UNIQUE)
+CREATE TABLE m (id i32 PRIMARY KEY, vv i32 UNIQUE)
 
 statement ok
 INSERT INTO m VALUES (1, 1), (2, 2), (3, 30)

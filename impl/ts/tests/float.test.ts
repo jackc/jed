@@ -1,7 +1,7 @@
-// Phase: the IEEE 754 binary float types float32 / float64 (spec/design/float.md). Unit tests on
+// Phase: the IEEE 754 binary float types f32 / f64 (spec/design/float.md). Unit tests on
 // the value-level semantics (total order, render, the -0/NaN canonicalization, the codec bytes) and
 // end-to-end tests through execute (literals, arithmetic + traps, casts, the canonical-fold SUM/AVG,
-// MIN/MAX, GROUP BY, the scalar functions, the strict-island 42804s, and the float32 Math.fround
+// MIN/MAX, GROUP BY, the scalar functions, the strict-island 42804s, and the f32 Math.fround
 // discipline). The R-tag exemption (float.md §9) means cross-core text layout differs; these
 // assertions pin THIS core's deterministic surface (storage, total order, kernel, exact-sum fold).
 
@@ -79,7 +79,7 @@ function roundTripF32(n: number): number {
   return dv.getFloat32(0, false);
 }
 
-test("float64 codec round-trips finite/±Inf verbatim, NaN as a NaN", () => {
+test("f64 codec round-trips finite/±Inf verbatim, NaN as a NaN", () => {
   for (const n of [0, 1.5, -1.5, 1e308, 5e-324, Infinity, -Infinity]) {
     assert.ok(Object.is(roundTripF64(n), n), `round-trip ${n}`);
   }
@@ -88,7 +88,7 @@ test("float64 codec round-trips finite/±Inf verbatim, NaN as a NaN", () => {
   assert.ok(Number.isNaN(roundTripF64(NaN)), "round-trip NaN (canonicalized to one quiet pattern)");
 });
 
-test("float32 codec round-trips binary32 finite/±Inf verbatim, NaN as a NaN", () => {
+test("f32 codec round-trips binary32 finite/±Inf verbatim, NaN as a NaN", () => {
   for (const n of [0, 1.5, -1.5, Math.fround(0.1), 3.4e38, Infinity, -Infinity]) {
     const v = Math.fround(n);
     assert.ok(Object.is(roundTripF32(v), v), `round-trip ${v}`);
@@ -97,7 +97,7 @@ test("float32 codec round-trips binary32 finite/±Inf verbatim, NaN as a NaN", (
   assert.ok(Number.isNaN(roundTripF32(NaN)), "round-trip NaN");
 });
 
-test("float64 big-endian on-disk bytes (cross-core byte contract)", () => {
+test("f64 big-endian on-disk bytes (cross-core byte contract)", () => {
   // 1.5 = 0x3FF8000000000000 big-endian.
   const dv = new DataView(new ArrayBuffer(8));
   dv.setFloat64(0, 1.5, false);
@@ -107,7 +107,7 @@ test("float64 big-endian on-disk bytes (cross-core byte contract)", () => {
   assert.equal(hex, "3ff8000000000000");
 });
 
-test("float32 big-endian on-disk bytes (cross-core byte contract)", () => {
+test("f32 big-endian on-disk bytes (cross-core byte contract)", () => {
   // 1.5f = 0x3FC00000 big-endian.
   const dv = new DataView(new ArrayBuffer(4));
   dv.setFloat32(0, Math.fround(1.5), false);
@@ -121,12 +121,12 @@ test("float32 big-endian on-disk bytes (cross-core byte contract)", () => {
 
 test("finite float rows survive an on-disk round-trip (toImage → loadDatabase)", () => {
   const db = dbWith([
-    "CREATE TABLE t (id int PRIMARY KEY, a float64, b float32)",
+    "CREATE TABLE t (id int PRIMARY KEY, a f64, b f32)",
     "INSERT INTO t VALUES (1, 1.5, 0.1), (2, -2.25, -3.5), (3, 100000.5, 1.0)",
   ]);
   const image = toImage(db, GOLDEN_PAGE_SIZE, 1n);
   const loaded = loadDatabase(image);
-  // float32 0.1 frounds to 0.10000000149011612 — its shortest binary32 form.
+  // f32 0.1 frounds to 0.10000000149011612 — its shortest binary32 form.
   assert.deepEqual(query(loaded, "SELECT a, b FROM t ORDER BY id"), [
     ["1.5", "0.10000000149011612"],
     ["-2.25", "-3.5"],
@@ -134,16 +134,16 @@ test("finite float rows survive an on-disk round-trip (toImage → loadDatabase)
   ]);
 });
 
-// --- literals + the float32 Math.fround discipline --------------------------
+// --- literals + the f32 Math.fround discipline --------------------------
 
-test("float32 0.1 differs from float64 0.1 (Math.fround applied)", () => {
+test("f32 0.1 differs from f64 0.1 (Math.fround applied)", () => {
   const db = new Database();
-  assert.deepEqual(query(db, "SELECT CAST('0.1' AS float32), CAST('0.1' AS float64)"), [
+  assert.deepEqual(query(db, "SELECT CAST('0.1' AS f32), CAST('0.1' AS f64)"), [
     ["0.10000000149011612", "0.1"],
   ]);
   // Aliases real / float resolve to the two widths.
   assert.deepEqual(query(db, "SELECT CAST('1.5' AS real)"), [["1.5"]]);
-  assert.deepEqual(query(db, "SELECT float '2.5'"), [["2.5"]]); // `float` = float64
+  assert.deepEqual(query(db, "SELECT float '2.5'"), [["2.5"]]); // `float` = f64
 });
 
 test("typed-literal float parse: e-notation, signs, specials; reject junk/range", () => {
@@ -160,14 +160,14 @@ test("typed-literal float parse: e-notation, signs, specials; reject junk/range"
   }
   // Out of binary64 range → 22003.
   assert.equal(errCode(() => void execute(db, "SELECT float '1e400'")), "22003");
-  // Finite literal beyond float32 range → 22003.
+  // Finite literal beyond f32 range → 22003.
   assert.equal(errCode(() => void execute(db, "SELECT real '1e40'")), "22003");
 });
 
 test("decimal/integer literal adapts to a float context", () => {
   const db = dbWith([
-    "CREATE TABLE t (id int PRIMARY KEY, a float64)",
-    "INSERT INTO t VALUES (1, 2.5), (2, 4)", // decimal 2.5 and integer 4 adapt to float64
+    "CREATE TABLE t (id int PRIMARY KEY, a f64)",
+    "INSERT INTO t VALUES (1, 2.5), (2, 4)", // decimal 2.5 and integer 4 adapt to f64
   ]);
   assert.deepEqual(query(db, "SELECT a FROM t ORDER BY id"), [["2.5"], ["4"]]);
   // Comparison against a decimal/integer literal adapts the literal (WHERE f = 2.5).
@@ -183,15 +183,15 @@ test("float arithmetic: one op per node, width promotion, fround", () => {
   assert.deepEqual(query(db, "SELECT float '10.0' / float '4.0'"), [["2.5"]]);
   assert.deepEqual(query(db, "SELECT float '7.0' % float '3.0'"), [["1"]]);
   assert.deepEqual(query(db, "SELECT - float '3.5'"), [["-3.5"]]);
-  // Mixed widths promote to float64: a float32 0.1 widened to f64 keeps its binary32 value.
-  assert.deepEqual(query(db, "SELECT CAST('0.1' AS float32) + float '0'"), [["0.10000000149011612"]]);
+  // Mixed widths promote to f64: a f32 0.1 widened to f64 keeps its binary32 value.
+  assert.deepEqual(query(db, "SELECT CAST('0.1' AS f32) + float '0'"), [["0.10000000149011612"]]);
 });
 
 // --- total order in SQL: ORDER BY / DISTINCT / GROUP BY ---------------------
 
 test("ORDER BY / DISTINCT over a float column: total order + -0/NaN dedup", () => {
   const db = dbWith([
-    "CREATE TABLE t (id int PRIMARY KEY, a float64)",
+    "CREATE TABLE t (id int PRIMARY KEY, a f64)",
     "INSERT INTO t VALUES (1, 3.0), (2, -1.5), (3, 0.0), (4, 100.0)",
   ]);
   assert.deepEqual(query(db, "SELECT a FROM t ORDER BY a"), [["-1.5"], ["0"], ["3"], ["100"]]);
@@ -210,13 +210,13 @@ test("float→decimal is the EXACT decimal expansion (matches Go exactDecimalFro
   // Exact value of the binary64 0.1 = 0.1000000000000000055511151231257827021181583404541015625
   // (Go: exactDecimalFromFloat64(0.1).Render()). A shortest-round-trip route would give "0.1".
   const exact01 = "0.1000000000000000055511151231257827021181583404541015625";
-  assert.deepEqual(query(new Database(), "SELECT CAST(float64 '0.1' AS numeric(60,55))"), [[exact01]]);
+  assert.deepEqual(query(new Database(), "SELECT CAST(f64 '0.1' AS numeric(60,55))"), [[exact01]]);
   // Values that are exactly representable in binary expand to themselves: 0.5, 2.5, 1e20.
   assert.deepEqual(
-    query(new Database(), "SELECT CAST(float64 '0.5' AS decimal), CAST(float64 '2.5' AS decimal)"),
+    query(new Database(), "SELECT CAST(f64 '0.5' AS decimal), CAST(f64 '2.5' AS decimal)"),
     [["0.5", "2.5"]],
   );
-  assert.deepEqual(query(new Database(), "SELECT CAST(float64 '1e20' AS decimal)"), [
+  assert.deepEqual(query(new Database(), "SELECT CAST(f64 '1e20' AS decimal)"), [
     ["100000000000000000000"],
   ]);
   // Direct Decimal API parity with Go (the underlying exact-expansion path).
@@ -226,34 +226,34 @@ test("float→decimal is the EXACT decimal expansion (matches Go exactDecimalFro
   assert.equal(Decimal.exactFromFloat64(1e20).render(), "100000000000000000000");
   // typmod scale coercion (round HALF AWAY) over the exact value: numeric(5,1) rounds 0.1000…0555…
   // down to 0.1 (the 2nd fractional digit is 0).
-  assert.deepEqual(query(new Database(), "SELECT CAST(float64 '0.1' AS numeric(5,1))"), [["0.1"]]);
-  // float32: the EXACT decimal of the binary32 value (Math.fround(0.1) = 0.10000000149011612),
+  assert.deepEqual(query(new Database(), "SELECT CAST(f64 '0.1' AS numeric(5,1))"), [["0.1"]]);
+  // f32: the EXACT decimal of the binary32 value (Math.fround(0.1) = 0.10000000149011612),
   // identical whether taken from the binary32 bits directly or widened to binary64 first (the path
   // Go uses): 0.100000001490116119384765625 (scale 27; padded to 30 here).
   const exact01f32 = "0.100000001490116119384765625";
-  assert.deepEqual(query(new Database(), "SELECT CAST(float32 '0.1' AS numeric(40,30))"), [
+  assert.deepEqual(query(new Database(), "SELECT CAST(f32 '0.1' AS numeric(40,30))"), [
     [exact01f32 + "000"],
   ]);
   assert.equal(Decimal.exactFromFloat32(Math.fround(0.1)).render(), exact01f32);
-  // A float32 whole/dyadic value expands exactly too.
+  // A f32 whole/dyadic value expands exactly too.
   assert.equal(Decimal.exactFromFloat32(Math.fround(2.5)).render(), "2.5");
 });
 
 // --- strict island: no implicit int/decimal ⊕ float (42804) -----------------
 
-test("float64 value into a float32 column needs an explicit cast (42804)", () => {
+test("f64 value into a f32 column needs an explicit cast (42804)", () => {
   const db = dbWith([
-    "CREATE TABLE src (id int PRIMARY KEY, a float64)",
+    "CREATE TABLE src (id int PRIMARY KEY, a f64)",
     "INSERT INTO src VALUES (1, 1.5)",
-    "CREATE TABLE dst (id int PRIMARY KEY, x float32)",
+    "CREATE TABLE dst (id int PRIMARY KEY, x f32)",
   ]);
-  // float64 → float32 is lossy/explicit; INSERT ... SELECT of a float64 column into float32 is 42804.
+  // f64 → f32 is lossy/explicit; INSERT ... SELECT of a f64 column into f32 is 42804.
   assert.equal(errCode(() => void execute(db, "INSERT INTO dst SELECT id, a FROM src")), "42804");
-  // float32 → float64 widening IS allowed (lossless).
+  // f32 → f64 widening IS allowed (lossless).
   const db2 = dbWith([
-    "CREATE TABLE src2 (id int PRIMARY KEY, b float32)",
+    "CREATE TABLE src2 (id int PRIMARY KEY, b f32)",
     "INSERT INTO src2 VALUES (1, 1.5)",
-    "CREATE TABLE dst2 (id int PRIMARY KEY, y float64)",
+    "CREATE TABLE dst2 (id int PRIMARY KEY, y f64)",
     "INSERT INTO dst2 SELECT id, b FROM src2",
   ]);
   assert.deepEqual(query(db2, "SELECT y FROM dst2"), [["1.5"]]);
@@ -263,7 +263,7 @@ test("float64 value into a float32 column needs an explicit cast (42804)", () =>
 
 test("GROUP BY a float column buckets by the total order", () => {
   const db = dbWith([
-    "CREATE TABLE t (id int PRIMARY KEY, a float64)",
+    "CREATE TABLE t (id int PRIMARY KEY, a f64)",
     "INSERT INTO t VALUES (1, 2.5), (2, 2.5), (3, 4.0)",
   ]);
   assert.deepEqual(query(db, "SELECT a, count(*) FROM t GROUP BY a ORDER BY a"), [
@@ -283,10 +283,10 @@ test("float column round-trips through the spill-to-disk sort (per-core codec)",
     const mem = new Database();
     const db = create(join(dir, "float_spill.jed"), {});
     for (const d of [mem, db]) {
-      execute(d, "CREATE TABLE t (id int PRIMARY KEY, a float64, b float32)");
+      execute(d, "CREATE TABLE t (id int PRIMARY KEY, a f64, b f32)");
       for (let i = 0; i < 60; i++) {
-        const a = (((i * 37) % 100) - 50) / 4; // unsorted, fractional float64
-        const b = (((i * 53) % 100) - 50) / 8; // fractional float32
+        const a = (((i * 37) % 100) - 50) / 4; // unsorted, fractional f64
+        const b = (((i * 53) % 100) - 50) / 8; // fractional f32
         execute(d, `INSERT INTO t VALUES (${i}, ${a}, ${b})`);
       }
     }

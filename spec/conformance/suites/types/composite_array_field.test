@@ -1,6 +1,6 @@
 # A composite type with an ARRAY-typed field (spec/design/array.md §12 — the mirror of the
 # array-of-composite element type, types/array_composite.test). CREATE TYPE poly AS (name text,
-# pts int32[]) declares a composite whose field is a structural T[]. No format_version bump (still
+# pts i32[]) declares a composite whose field is a structural T[]. No format_version bump (still
 # 10): the catalog composite-type entry gains a field_type_code 15 + the inline element descriptor
 # (§3); the value codec / comparison / record_out / record_in all recurse for free through the array
 # field. This corpus constructs via ROW(name, '{…}') / ROW(name, ARRAY[…]) — the array field as a
@@ -13,15 +13,15 @@
 # doubly-nested array-of-composite field (homes addr[]). record_out / array_out match PostgreSQL
 # byte-for-byte. Type name avoids PG's geometric builtins.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, types.composite_array_field, types.composite, types.array, types.array_composite, expr.array_subscript, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, types.composite_array_field, types.composite, types.array, types.array_composite, expr.array_subscript, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TYPE poly AS (name text, pts int32[])
+CREATE TYPE poly AS (name text, pts i32[])
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, p poly)
+CREATE TABLE t (id i32 PRIMARY KEY, p poly)
 
-# The array field as a text literal (array_in coerces "{10,20,30}" to int32[]).
+# The array field as a text literal (array_in coerces "{10,20,30}" to i32[]).
 statement ok
 INSERT INTO t VALUES (1, ROW('a', '{10,20,30}'))
 
@@ -85,7 +85,7 @@ SELECT id FROM t WHERE p IS NULL ORDER BY id
 # Comparison and ordering: the composite 3VL fold uses the array field's btree (always-definite)
 # comparison; the lexicographic sort uses the array total order ({1} < {1,2} < {1,3}).
 statement ok
-CREATE TABLE t2 (id int32 PRIMARY KEY, p poly)
+CREATE TABLE t2 (id i32 PRIMARY KEY, p poly)
 
 statement ok
 INSERT INTO t2 VALUES (1, ROW('a', ARRAY[1, 2])), (2, ROW('a', ARRAY[1, 3])), (3, ROW('a', ARRAY[1]))
@@ -113,13 +113,13 @@ true
 # catalog field carries element code 14 + name; the value codec nests array-over-composite, and the
 # record_in / array_in / record_out quoting layers all nest.
 statement ok
-CREATE TYPE addr AS (street text, zip int32)
+CREATE TYPE addr AS (street text, zip i32)
 
 statement ok
 CREATE TYPE person AS (name text, homes addr[])
 
 statement ok
-CREATE TABLE p2 (id int32 PRIMARY KEY, who person)
+CREATE TABLE p2 (id i32 PRIMARY KEY, who person)
 
 statement ok
 INSERT INTO p2 VALUES (1, ROW('jo', '{"(Main,1)","(Oak,2)"}'))

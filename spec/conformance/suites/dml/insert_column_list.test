@@ -3,10 +3,10 @@
 # a slot. Bad lists are rejected: unknown column 42703, duplicate 42701, value/list arity
 # mismatch 42601. The positional form (no list) still requires full arity. Two-phase /
 # all-or-nothing per statement. spec/design/constraints.md §2, spec/design/grammar.md §12.
-# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, query.select, query.is_null, query.order_by, types.int16, types.int32, types.text
+# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, query.select, query.is_null, query.order_by, types.i16, types.i32, types.text
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32 DEFAULT 10, b text)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32 DEFAULT 10, b text)
 
 # the list need not be in declaration order; values map to the named columns. a defaults to
 # 10 (omitted), b -> 'x'
@@ -74,7 +74,7 @@ SELECT id FROM t ORDER BY id
 
 # a NOT NULL column omitted from the list, with no default, is 23502
 statement ok
-CREATE TABLE r (id int32 PRIMARY KEY, must int32 NOT NULL)
+CREATE TABLE r (id i32 PRIMARY KEY, must i32 NOT NULL)
 
 statement error 23502
 INSERT INTO r (id) VALUES (1)

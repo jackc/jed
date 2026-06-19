@@ -4,10 +4,10 @@
 # max(s1,s2) with the dividend's sign. Computation is exact (no binary float). Division/modulo by
 # zero is a defined trap, 22012. Mixed integer<->decimal arithmetic promotes the integer to decimal.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.int32, types.decimal, expr.decimal_arithmetic, error.division_by_zero
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, types.i32, types.decimal, expr.decimal_arithmetic, error.division_by_zero
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a numeric, b numeric)
+CREATE TABLE t (id i32 PRIMARY KEY, a numeric, b numeric)
 
 statement ok
 INSERT INTO t VALUES (1, 1.50, 1.5), (2, 2.0, 3.000), (3, 1.234, 1.2), (4, 1, 3), (5, 10.0, 4.0), (6, -5.5, 2)
@@ -79,7 +79,7 @@ SELECT a % 0 FROM t WHERE id = 1
 
 # --- mixed integer <-> decimal arithmetic (the integer promotes to decimal) --------------------
 statement ok
-CREATE TABLE m (id int32 PRIMARY KEY, d numeric, i int32)
+CREATE TABLE m (id i32 PRIMARY KEY, d numeric, i i32)
 
 statement ok
 INSERT INTO m VALUES (1, 1.5, 3)

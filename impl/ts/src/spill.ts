@@ -320,12 +320,12 @@ class ByteWriter {
       x >>= 8n;
     }
   }
-  float64(n: number): void {
+  f64(n: number): void {
     const dv = new DataView(new ArrayBuffer(8));
     dv.setFloat64(0, n, true); // little-endian, matching this format's u32/u64
     this.raw(new Uint8Array(dv.buffer));
   }
-  float32(n: number): void {
+  f32(n: number): void {
     const dv = new DataView(new ArrayBuffer(4));
     dv.setFloat32(0, n, true);
     this.raw(new Uint8Array(dv.buffer));
@@ -397,19 +397,19 @@ function writeValue(w: ByteWriter, v: Value): void {
       w.u64(v.micros);
       break;
     case "date":
-      // Date — tag 17 (the int32 day count); internal merge-sort scratch format (spec/design/date.md).
+      // Date — tag 17 (the i32 day count); internal merge-sort scratch format (spec/design/date.md).
       w.u8(17);
       w.u64(v.days);
       break;
-    case "float64":
+    case "f64":
       // The 8 IEEE bytes (DataView, the spill format is per-core internal — bits round-trip incl
       // -0/NaN/±Inf so an ORDER BY over / carrying a float column spills correctly).
       w.u8(13);
-      w.float64(v.value);
+      w.f64(v.value);
       break;
-    case "float32":
+    case "f32":
       w.u8(14);
-      w.float32(v.value);
+      w.f32(v.value);
       break;
     case "interval":
       // Interval — tag 12 (tags 9/10/11 are the Unfetched forms below); months, days, micros.
@@ -519,9 +519,9 @@ function readValue(r: SpillByteReader): Value {
         ref: { form: 0x04, firstPage: readU32(r), storedLen: readU32(r), rawLen: readU32(r), comp: undefined },
       };
     case 12: {
-      const months = readU32(r) | 0; // signed int32
+      const months = readU32(r) | 0; // signed i32
       const days = readU32(r) | 0;
-      const micros = BigInt.asIntN(64, r.u64()); // signed int64
+      const micros = BigInt.asIntN(64, r.u64()); // signed i64
       return { kind: "interval", iv: { months, days, micros } };
     }
     case 13: {

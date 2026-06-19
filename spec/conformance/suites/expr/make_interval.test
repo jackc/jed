@@ -3,7 +3,7 @@
 # parameter is named and DEFAULTs to 0, so it is callable positionally, by named notation
 # (name => value), or mixed (positional then named), with any subset supplied. years/months
 # fold into the months field (×12), weeks/days into the days field (×7), hours/mins/secs into
-# the microsecond field; `secs` is `double precision` (float64), folded EXACTLY into micros, so
+# the microsecond field; `secs` is `double precision` (f64), folded EXACTLY into micros, so
 # the result is in-contract (a normal `T` interval render, not an `R`-exempt float). NULL in any
 # argument propagates. Errors: an unknown parameter name, a named arg on a function with no
 # parameter names, or too many arguments is 42883; a positional arg after a named one or a
@@ -12,7 +12,7 @@
 # Each call charges one operator_eval + one row_produced (the literal/default args are leaves),
 # so every single-row form costs 2 — identical for a named call and its positional twin (§13).
 # PostgreSQL-oracle-verified (postgres:18).
-# requires: query.select, query.select_no_from, types.int32, types.int64, types.interval, types.float64, func.named_arguments, resource.cost_metering
+# requires: query.select, query.select_no_from, types.i32, types.i64, types.interval, types.f64, func.named_arguments, resource.cost_metering
 
 # --- named notation, a subset of parameters ---------------------------------------------
 # cost: 2
@@ -27,7 +27,7 @@ SELECT make_interval(years => 1, mins => 30)
 ----
 1 year 00:30:00
 
-# --- a bare numeric literal adapts to the float64 `secs` slot (decimal and integer forms) ---
+# --- a bare numeric literal adapts to the f64 `secs` slot (decimal and integer forms) ---
 # cost: 2
 query T nosort
 SELECT make_interval(secs => 1.5)

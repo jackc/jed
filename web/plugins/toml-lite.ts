@@ -64,7 +64,7 @@ function parseValue(s: string): TomlValue {
 		}
 		return obj;
 	}
-	// Integers: keep big int64 bounds (beyond Number.MAX_SAFE_INTEGER) as their exact digit string.
+	// Integers: keep big i64 bounds (beyond Number.MAX_SAFE_INTEGER) as their exact digit string.
 	if (/^-?\d+$/.test(s)) {
 		const n = Number(s);
 		return Number.isSafeInteger(n) ? n : s;

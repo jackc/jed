@@ -59,30 +59,30 @@ CORES = {
 PUSHDOWN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                   query.where_eq query.comparison_order query.point_lookup query.order_by
                   query.logical_connectives expr.arithmetic expr.between expr.comparison_value
-                  types.int32].freeze
+                  types.i32].freeze
 LIMIT_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                query.comparison_order query.order_by query.limit query.offset
-               query.limit_short_circuit types.int32].freeze
+               query.limit_short_circuit types.i32].freeze
 JOIN_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
               query.where_eq query.comparison_order query.order_by query.order_by_keys
               query.qualified_column query.join_inner query.join_left query.join_pushdown
-              query.point_lookup expr.arithmetic expr.comparison_value types.int32].freeze
+              query.point_lookup expr.arithmetic expr.comparison_value types.i32].freeze
 CORRELATED_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
                     query.where_eq query.comparison_order query.order_by query.qualified_column
                     query.subquery_scalar query.subquery_in query.subquery_exists
-                    query.subquery_correlated query.correlated_pushdown expr.arithmetic types.int32
+                    query.subquery_correlated query.correlated_pushdown expr.arithmetic types.i32
                     null.three_valued].freeze
 INDEX_REQ = %w[ddl.create_table ddl.primary_key ddl.secondary_index dml.insert dml.insert_multi_row
                dml.update dml.delete query.select query.where_eq query.comparison_order
-               query.order_by expr.arithmetic expr.comparison_value types.int32
+               query.order_by expr.arithmetic expr.comparison_value types.i32
                null.three_valued].freeze
 TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.is_null
              query.logical_connectives query.union query.aggregates query.subquery_scalar
-             expr.arithmetic expr.comparison_value types.int32 null.three_valued].freeze
+             expr.arithmetic expr.comparison_value types.i32 null.three_valued].freeze
 CTE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.cte expr.arithmetic
-             expr.between expr.comparison_value types.int32].freeze
+             expr.between expr.comparison_value types.i32].freeze
 
 # The default relation note describes the NoREC pair (an optimized form vs a non-optimizable
 # rewrite). TLP overrides it with its own partition-reconstruction note (it is not an opt pair).
@@ -123,7 +123,7 @@ def gen_pushdown(seed)
   lo, hi = ids.sample(2, random: rng).sort
 
   out = header(seed, PUSHDOWN_REQ, "primary-key pushdown (point lookup + range)")
-  stmt(out, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
   stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v| "(#{id}, #{v})" }.join(', ')}")
 
   pair = lambda do |title, opt, scan, exp|
@@ -158,7 +158,7 @@ def gen_limit(seed)
   a = rng.rand(2..n - 2)
 
   out = header(seed, LIMIT_REQ, "LIMIT short-circuit (windows reconstruct the ordered whole)")
-  stmt(out, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
   stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v| "(#{id}, #{v})" }.join(', ')}")
 
   # Each window of `ORDER BY id` (a total order) must match its by-construction slice: LIMIT a
@@ -204,8 +204,8 @@ def gen_join(seed)
   jb = inner.map(&:last).uniq.sample(random: rng) || b.first.first
 
   out = header(seed, JOIN_REQ, "JOIN base-table pk pushdown (bound a relation by its own WHERE)")
-  stmt(out, "CREATE TABLE a (id int32 PRIMARY KEY, k int32)")
-  stmt(out, "CREATE TABLE b (id int32 PRIMARY KEY, k int32)")
+  stmt(out, "CREATE TABLE a (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "CREATE TABLE b (id i32 PRIMARY KEY, k i32)")
   stmt(out, "INSERT INTO a VALUES #{a.map { |id, k| "(#{id}, #{k})" }.join(', ')}")
   stmt(out, "INSERT INTO b VALUES #{b.map { |id, k| "(#{id}, #{k})" }.join(', ')}")
 
@@ -252,8 +252,8 @@ def gen_correlated(seed)
   end
 
   out = header(seed, CORRELATED_REQ, "correlated-subquery pk pushdown (bound the inner re-scan by the outer row)")
-  stmt(out, "CREATE TABLE o (id int32 PRIMARY KEY, k int32)")
-  stmt(out, "CREATE TABLE inr (id int32 PRIMARY KEY, v int32)")
+  stmt(out, "CREATE TABLE o (id i32 PRIMARY KEY, k i32)")
+  stmt(out, "CREATE TABLE inr (id i32 PRIMARY KEY, v i32)")
   stmt(out, "INSERT INTO o VALUES #{o.map { |oid, k| "(#{oid}, #{k.nil? ? 'NULL' : k})" }.join(', ')}")
   stmt(out, "INSERT INTO inr VALUES #{inr.map { |id, v| "(#{id}, #{v})" }.join(', ')}")
 
@@ -296,7 +296,7 @@ def gen_index(seed)
   absent = ((0..9).to_a - rows.map { |_id, v, _w| v }).sample(random: rng) || 9
 
   out = header(seed, INDEX_REQ, "secondary-index equality bound (index fetch vs full scan)")
-  stmt(out, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)")
   stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v, w| "(#{id}, #{v.nil? ? 'NULL' : v}, #{w})" }.join(', ')}")
   stmt(out, "CREATE INDEX t_v_idx ON t (v)")
 
@@ -386,7 +386,7 @@ def gen_tlp(seed)
   ]
 
   out = header(seed, TLP_REQ, "TLP ternary-logic partitioning (WHERE p / NOT p / p IS NULL reconstruct the whole)", note: TLP_NOTE)
-  stmt(out, "CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)")
   stmt(out, "INSERT INTO t VALUES #{rows.map { |id, a, b| "(#{id}, #{lit.call(a)}, #{lit.call(b)})" }.join(', ')}")
 
   out << "# reference: the whole table — every row falls in exactly one partition below"
@@ -445,7 +445,7 @@ def gen_cte(seed)
   k = rng.rand(-100..100)
 
   out = header(seed, CTE_REQ, "CTE inline vs materialize vs direct (all equivalent)")
-  stmt(out, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
   stmt(out, "INSERT INTO t VALUES #{rows.map { |id, v| "(#{id}, #{v})" }.join(', ')}")
 
   # Three forms that MUST return identical rows: the direct query, a single-reference CTE (which

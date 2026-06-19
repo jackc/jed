@@ -48,10 +48,7 @@ fn err_code(db: &mut Database, sql: &str) -> String {
 /// value, so an equality admits 4 of 20.
 fn db20() -> Database {
     let mut db = Database::new();
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)",
-    );
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
     for i in 1..=20 {
         run(
             &mut db,
@@ -68,7 +65,7 @@ fn db20() -> Database {
 #[test]
 fn auto_naming_matches_postgres() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TABLE T (A int32 PRIMARY KEY, B int32)");
+    run(&mut db, "CREATE TABLE T (A i32 PRIMARY KEY, B i32)");
     run(&mut db, "CREATE INDEX ON T (B)"); // t_b_idx
     run(&mut db, "CREATE INDEX ON T (B)"); // t_b_idx1
     run(&mut db, "CREATE INDEX ON T (B)"); // t_b_idx2
@@ -101,7 +98,7 @@ fn auto_naming_matches_postgres() {
 #[test]
 fn ddl_errors_match_postgres() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TABLE t (a int32 PRIMARY KEY, s text)");
+    run(&mut db, "CREATE TABLE t (a i32 PRIMARY KEY, s text)");
     // Table existence first (even with a bad column).
     assert_eq!(
         err_code(&mut db, "CREATE INDEX i ON nosuch (nope)"),
@@ -116,7 +113,7 @@ fn ddl_errors_match_postgres() {
     // and CREATE TABLE vs an index name.
     assert_eq!(err_code(&mut db, "CREATE INDEX taken ON t (a)"), "42P07");
     assert_eq!(err_code(&mut db, "CREATE INDEX t ON t (a)"), "42P07");
-    assert_eq!(err_code(&mut db, "CREATE TABLE taken (x int32)"), "42P07");
+    assert_eq!(err_code(&mut db, "CREATE TABLE taken (x i32)"), "42P07");
     // DROP mismatches.
     assert_eq!(err_code(&mut db, "DROP INDEX nosuch"), "42704");
     assert_eq!(err_code(&mut db, "DROP INDEX t"), "42809");
@@ -126,14 +123,14 @@ fn ddl_errors_match_postgres() {
     assert_eq!(err_code(&mut db, "DROP INDEX taken"), "42704");
     run(&mut db, "CREATE INDEX taken ON t (a)");
     run(&mut db, "DROP TABLE t");
-    run(&mut db, "CREATE TABLE taken (x int32)");
+    run(&mut db, "CREATE TABLE taken (x i32)");
     // The lookahead keeps every word non-reserved (grammar.md §30): the unnamed form
     // over a table named `on`, and an index explicitly named `on`.
-    run(&mut db, "CREATE TABLE on (x int32)");
+    run(&mut db, "CREATE TABLE on (x i32)");
     run(&mut db, "CREATE INDEX ON on (x)"); // unnamed form over the table named on
     assert_eq!(db.table("on").unwrap().indexes[0].name, "on_x_idx");
     run(&mut db, "DROP TABLE on"); // free the name `on` in the relation namespace
-    run(&mut db, "CREATE TABLE q (x int32)");
+    run(&mut db, "CREATE TABLE q (x i32)");
     run(&mut db, "CREATE INDEX on ON q (x)"); // an index NAMED on
     assert_eq!(db.table("q").unwrap().indexes[0].name, "on");
     run(&mut db, "DROP INDEX on");
@@ -231,10 +228,7 @@ fn file_backed_paged_reopen_uses_the_index() {
     let path = tmp("secondary_index_paged.jed");
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)",
-    );
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
     for i in 1..=20 {
         run(
             &mut db,

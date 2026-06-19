@@ -98,7 +98,7 @@ test("decimal div/mod by zero traps 22012", () => {
   assert.equal(errCode(() => void dec("1").rem(dec("0"))), "22012");
 });
 
-test("decimal to int64 rounds half away", () => {
+test("decimal to i64 rounds half away", () => {
   assert.equal(dec("2.5").toBigIntRound(), 3n);
   assert.equal(dec("-2.5").toBigIntRound(), -3n);
   assert.equal(dec("2.4").toBigIntRound(), 2n);
@@ -132,7 +132,7 @@ function one(db: ReturnType<typeof dbWith>, sql: string): string {
 
 test("decimal on-disk round trip persists values + typmod", () => {
   const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, money numeric(10,2), free numeric)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, money numeric(10,2), free numeric)",
     "INSERT INTO t VALUES (1, 1.5, -12345.6789), (2, 0, 0.00), (3, 100, NULL)",
   ]);
   const image = toImage(db, 8192, 1n);
@@ -175,7 +175,7 @@ test("decimal SUM accumulator checks only the final cap", () => {
 // PG numeric_mul's rounding: an exact product whose scale exceeds max_scale (16383) ROUNDS to
 // it, half away from zero, instead of trapping (spec/design/decimal.md §2).
 test("decimal mul rounds its result scale at max_scale", () => {
-  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)", "INSERT INTO t VALUES (1)"]);
+  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)"]);
   const tiny1 = "0." + "0".repeat(8191) + "1"; // 1e-8192 (scale 8192)
   const tiny5 = "0." + "0".repeat(8191) + "5"; // 5e-8192
   // 1e-8192 * 1e-8192 = 1e-16384: the dropped digit is 1 -> rounds DOWN to 0 at scale 16383.
@@ -188,7 +188,7 @@ test("decimal mul rounds its result scale at max_scale", () => {
 // so a ceiling aborts a pathological multiply up front (CLAUDE.md §13). ~20000 digits is
 // ~5000 groups; the mul W is ~25,000,000 — far over the tiny ceiling.
 test("decimal cost ceiling aborts ahead of a big multiply", () => {
-  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)", "INSERT INTO t VALUES (1)"]);
+  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)"]);
   const big = "9".repeat(20000) + ".5";
   db.setMaxCost(1000n);
   assert.equal(errCode(() => void execD(db, `SELECT ${big} * ${big} FROM t`)), "54P01");

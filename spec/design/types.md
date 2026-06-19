@@ -16,23 +16,23 @@ discovering semantics in code.
 
 The storable scalar types are three signed integers (CLAUDE.md §4) plus `text`, `boolean`,
 `decimal`, `bytea`, `uuid`, the temporal types `timestamp`/`timestamptz`/`interval`, and the
-binary floats `float32`/`float64`:
+binary floats `f32`/`f64`:
 
 | Canonical id | Aliases | Bits | Range |
 |---|---|---|---|
-| `int16` | `smallint` | 16 | −32768 … 32767 |
-| `int32` | `int`, `integer` | 32 | −2147483648 … 2147483647 |
-| `int64` | `bigint` | 64 | −9223372036854775808 … 9223372036854775807 |
+| `i16` | `smallint` | 16 | −32768 … 32767 |
+| `i32` | `int`, `integer` | 32 | −2147483648 … 2147483647 |
+| `i64` | `bigint` | 64 | −9223372036854775808 … 9223372036854775807 |
 | `text` | `varchar`, `character varying`, `string` | — | variable-width UTF-8 (collation `C`) |
 | `boolean` | `bool` | — | `{false, true}`, ordered false `<` true |
 | `decimal` | `numeric`, `dec` | — | exact base-10 (`numeric(p,s)`, `1≤p≤1000`, `0≤s≤p`) |
 | `bytea` | — | — | variable-width raw bytes (unsigned byte order) |
 | `uuid` | — | 128 | fixed 16-byte value, RFC 4122 (unsigned byte order) |
-| `timestamp` | `timestamp without time zone` | 64 | zoneless wall clock, int64 microseconds ([timestamp.md](timestamp.md)) |
-| `timestamptz` | `timestamp with time zone` | 64 | UTC instant, int64 microseconds ([timestamp.md](timestamp.md)) |
+| `timestamp` | `timestamp without time zone` | 64 | zoneless wall clock, i64 microseconds ([timestamp.md](timestamp.md)) |
+| `timestamptz` | `timestamp with time zone` | 64 | UTC instant, i64 microseconds ([timestamp.md](timestamp.md)) |
 | `interval` | — | — | span of months/days/micros, 128-bit canonical ([interval.md](interval.md)) |
-| `float32` | `real` | 32 | IEEE 754 binary32 ([float.md](float.md)) |
-| `float64` | `double precision` | 64 | IEEE 754 binary64 ([float.md](float.md)) |
+| `f32` | `real` | 32 | IEEE 754 binary32 ([float.md](float.md)) |
+| `f64` | `double precision` | 64 | IEEE 754 binary64 ([float.md](float.md)) |
 
 The integers are signed, two's-complement. **`text`** is the first storable non-integer
 scalar — a variable-width UTF-8 string with one defined collation, `C` (byte / code-point
@@ -53,10 +53,10 @@ string (raw bytes), compared by unsigned byte order. **`uuid`** (§14) is the fi
 16-byte value (RFC 4122), compared by unsigned byte order, and the **first non-integer type
 usable as a `PRIMARY KEY`** (its fixed-width key encoding is exercised, lifting the key narrowing
 the other non-integer types still defer). The temporal types
-(`timestamp`/`timestamptz`/`interval`) and the binary floats (`float32`/`float64`) have since
+(`timestamp`/`timestamptz`/`interval`) and the binary floats (`f32`/`f64`) have since
 landed, each with its own design doc ([timestamp.md](timestamp.md), [interval.md](interval.md),
 [float.md](float.md)); `boolean`, `timestamp`, and `timestamptz` join `uuid` as non-integer
-`PRIMARY KEY` types, while `interval`/`float32`/`float64` stay non-key for now. The remaining scalars (`json`/`jsonb`,
+`PRIMARY KEY` types, while `interval`/`f32`/`f64` stay non-key for now. The remaining scalars (`json`/`jsonb`,
 and the composite `array` container) are still **deferred**. The float-formatting and NaN/∞
 decisions of CLAUDE.md §8 are now **settled** by the landed floats ([float.md](float.md)): they
 keep their own PG total order and the `R` render tag (ledgered in the determinism exceptions),
@@ -69,20 +69,38 @@ non-integer key — §14) on the smallest possible surfaces.
 
 ## 2. Canonical names vs. aliases
 
-Each type has one **canonical id** (`int16`/`int32`/`int64`) plus accepted SQL aliases. The
+Each type has one **canonical id** (`i16`/`i32`/`i64`) plus accepted SQL aliases. The
 canonical id is the single name that appears in error messages, the catalog, and the
 conformance corpus's `query` column-type tags. Why one canonical name: determinism
 (CLAUDE.md §10). If two implementations could each pick a different spelling — `smallint`
-vs `int16` — in output, the conformance corpus would spuriously diverge. Aliases are an
+vs `i16` — in output, the conformance corpus would spuriously diverge. Aliases are an
 input convenience only; they normalize to the canonical id immediately at parse time.
 
-We name the canonical types by their width **in bits** (`int16`/`int32`/`int64`) — the
-convention common across programming languages (Rust `i16`, Go `int32`, …) — rather than
-PostgreSQL's byte-count spellings (`int2`/`int4`/`int8`). The SQL-standard names
-(`smallint`, `integer`/`int`, `bigint`) are kept as **aliases** so ordinary SQL
-(`CREATE TABLE t (x smallint)`) still works; PG's `int2`/`int4`/`int8` are **not** accepted
-(we own our surface — CLAUDE.md §1). The canonical choice is arbitrary-but-fixed; what
-matters is that it is fixed.
+We name the canonical types by their width **in bits** under the **`i`/`f` prefix**
+(`i16`/`i32`/`i64`, `f32`/`f64`) — the convention common across programming languages
+(Rust `i32`, Go/Zig `i64`, `f64`) — rather than PostgreSQL's byte-count spellings
+(`int2`/`int4`/`int8`, `float4`/`float8`). Accepted **aliases** are the SQL-standard words
+(`smallint`, `integer`/`int`, `bigint`; `real`, `double precision`, `float`) **and**
+PostgreSQL's byte-shorthand (`int2`/`int4`/`int8`, `float4`/`float8`), so both ordinary SQL
+(`CREATE TABLE t (x smallint)`) and pasted PG DDL (`x int8`) work.
+
+The **`i`/`f` prefix is load-bearing**, not cosmetic. It makes jed's bit-namespace
+(`i8`…`i64`) **lexically disjoint** from PostgreSQL's byte-namespace (`int2`…`int8`): the
+two `8`s can never collide, because one is spelled `i8` and the other `int8`. That is what
+lets jed accept the full PG byte-shorthand *and* keep the door open for a future 8-bit type:
+
+- `int8` → `i64` (PG's bigint shorthand), unambiguously, while
+- `i8` stays **free** for a future 8-bit integer.
+
+Had we kept PostgreSQL's own `int`-prefix for the bit-names (`int16`/`int32`/`int64`), the
+shared prefix would have forced a choice between accepting `int8` (= 64-bit, foreclosing an
+8-bit type) and rejecting it (losing PG compatibility) — the classic `int8` ambiguity. The
+prefix dissolves it. This also extends cleanly to future **range types**: PG's `int8range`
+becomes an atomic alias for the canonical `i64range` with no collision against a future
+`i8range`. The canonical choice is arbitrary-but-fixed; what matters is that it is fixed.
+
+The old jed names `int16`/`int32`/`int64`/`float32`/`float64` are a **clean break** — no
+longer accepted (an unknown type, 42704), replaced wholesale by the `i`/`f` prefix.
 
 ## 3. Integer overflow: trap, never wrap
 
@@ -92,15 +110,15 @@ raises `22003` (`numeric_value_out_of_range`,
 
 CLAUDE.md §8 left this as "defined wrap vs. trap." We choose **trap** because silent
 wraparound is exactly the runtime reinterpretation a strict static type system exists to
-prevent (CLAUDE.md §4): `int16` holding `32767` plus `1` must not become `−32768`. Trap is
+prevent (CLAUDE.md §4): `i16` holding `32767` plus `1` must not become `−32768`. Trap is
 also PostgreSQL's behavior, which §1 lets us borrow where principled. Wrap is the rejected
 alternative; if a wrapping operation is ever wanted it will be a *distinct, explicitly
 named* operator, not the default `+`.
 
 This applies uniformly to arithmetic, to literals that don't fit their target column, and
 to narrowing casts (§5). For arithmetic the trap boundary is the operator's **result type**,
-not int64: `int16 + int16` yields `int16`, so `30000 + 30000` traps `22003` at the int16
-range even though the sum fits int64 (the type-faithful boundary — see
+not i64: `i16 + i16` yields `i16`, so `30000 + 30000` traps `22003` at the i16
+range even though the sum fits i64 (the type-faithful boundary — see
 [functions.md](functions.md) §7 and the promotion tower in §4). Each core computes in 64-bit
 and traps both if the 64-bit operation itself overflows and if the in-range 64-bit result
 falls outside the declared result type. `division`/`modulo` by zero is a distinct defined
@@ -112,7 +130,7 @@ positive counterpart in the type (the same overflow as negating `int64_min`). Bu
 **modulo** counterpart `x % -1` is **`0` for every `x`** (the remainder is mathematically
 zero), so it **never traps** — even at `int64_min % -1`, where a naive 64-bit `IDIV` would
 fault. Each core special-cases divisor `-1` in modulo to yield `0`, matching PostgreSQL and
-keeping the three integer widths consistent (the `int16`/`int32` cases already compute `0`
+keeping the three integer widths consistent (the `i16`/`i32` cases already compute `0`
 cleanly when widened to 64-bit).
 
 ## 4. Comparison, promotion, three-valued NULL
@@ -120,7 +138,7 @@ cleanly when widened to 64-bit).
 See [../types/compare.toml](../types/compare.toml).
 
 **Promotion tower.** The three integer types form one ordered family by `rank`:
-`int16 (1) < int32 (2) < int64 (3)`. When two integers meet, both promote to the
+`i16 (1) < i32 (2) < i64 (3)`. When two integers meet, both promote to the
 higher-ranked type (`strategy = "max-rank"`) and are compared there. Widening is always
 lossless, so promotion never loses information or traps.
 
@@ -183,9 +201,9 @@ See [../types/casts.toml](../types/casts.toml). The matrix is **strict**: any `(
 not listed is forbidden. Identity casts are implicit and always succeed (implied, not
 listed).
 
-- **Widening** (`int16→int32`, `int16→int64`, `int32→int64`) is lossless, so it is
+- **Widening** (`i16→i32`, `i16→i64`, `i32→i64`) is lossless, so it is
   **implicit** — inserted automatically wherever a wider integer is wanted.
-- **Narrowing** (`int64→int32`, `int64→int16`, `int32→int16`) is lossy in general, so it
+- **Narrowing** (`i64→i32`, `i64→i16`, `i32→i16`) is lossy in general, so it
   requires an **explicit** `CAST(...)` and **traps** (`22003`) when the value does not fit.
 - **Text casts** split by operand. A **string LITERAL** coerces to a named type — the
   `type 'string'` typed literal and `CAST(<string literal> AS T)` ([grammar.md](grammar.md) §36) —
@@ -221,13 +239,13 @@ A bare integer literal (`1000`, `-32768`) is an **untyped integer constant** —
 spirit of Go's and Rust's untyped constants. It has no intrinsic type; it acquires one from
 its **context**, and **traps `22003`** if its value does not fit that context type. This
 keeps a literal from silently forcing a width, and makes `WHERE small = 100000` (where
-`small` is `int16`) a type error rather than a value that silently never matches.
+`small` is `i16`) a type error rather than a value that silently never matches.
 
 - **Lexing first.** A literal is an unsigned magnitude of digits (the sign is the
   unary-minus operator); a magnitude beyond `2^63` is a *syntax* error (`42601`,
   [../grammar/grammar.ebnf](../grammar/grammar.ebnf) §4), decided before any typing applies.
   The value `2^63` is representable only as the operand of unary minus (folding to
-  `int64`'s minimum); a bare `2^63` fits no type and traps `22003` at resolve time.
+  `i64`'s minimum); a bare `2^63` fits no type and traps `22003` at resolve time.
 - **Assignment context** (`INSERT ... VALUES`, `UPDATE ... SET col = lit`): the context is
   the target column's type. The literal adapts to it — accepted iff in range, else `22003`.
 - **Cast context** (`CAST(lit AS T)`): the context is `T`; range-checked, else `22003`.
@@ -237,20 +255,20 @@ keeps a literal from silently forcing a width, and makes `WHERE small = 100000` 
   error, not a silent non-match, for every operator (`=`, `<`, `>`, `<=`, `>=`). In range,
   the comparison proceeds within that type (no promotion needed). A `NULL` literal is exempt
   (it is the absence of a value).
-- **No context** (a bare projected literal, `SELECT 1000`): defaults to **int64**, the
+- **No context** (a bare projected literal, `SELECT 1000`): defaults to **i64**, the
   widest integer.
 
 - **Arithmetic context** (`a <op> lit`): an untyped literal operand adapts to the *other*
-  operand's type — `small + 1000` types the literal `1000` as `int16` and traps `22003` at
+  operand's type — `small + 1000` types the literal `1000` as `i16` and traps `22003` at
   resolve if it does not fit (here it does not: `1000` fits, but `small + 100000` traps).
   A literal meeting only literals (`1000 + 1`) has no column context, so both default to
-  `int64`. The result type is then the promotion of the operand types (§3, §4), and a
+  `i64`. The result type is then the promotion of the operand types (§3, §4), and a
   *computed* result outside that type still traps `22003` at run time (`30000 + 30000` over
-  `int16`). The unary-minus fold (`-lit`) is one negative literal, range-checked against its
+  `i16`). The unary-minus fold (`-lit`) is one negative literal, range-checked against its
   context like any literal.
 
-**Why this, not "smallest fitting" or "always int64".** Smallest-fitting makes ordinary
-arithmetic overflow surprisingly (`30000 + 30000` would be `int16 + int16`). Always-int64
+**Why this, not "smallest fitting" or "always i64".** Smallest-fitting makes ordinary
+arithmetic overflow surprisingly (`30000 + 30000` would be `i16 + i16`). Always-i64
 removes the type error in a comparison (an out-of-range literal would silently never match).
 Context-adaptation gives each literal exactly the type its use demands and surfaces an
 impossible literal as a `22003` the moment it is resolved — consistent with the strict cast
@@ -261,12 +279,12 @@ promotion tower (§4: once typed, a literal participates like any value), and tr
 **Deliberate PostgreSQL divergence (the no-context default).** PostgreSQL does *not* treat a
 bare integer constant as untyped: it assigns the **smallest fitting** type at parse time —
 `int4` if it fits, else `int8`, else `numeric` — independent of context. jed's untyped-constant
-model adapts to context instead, and where there is no context it defaults to **`int64`**, *not*
+model adapts to context instead, and where there is no context it defaults to **`i64`**, *not*
 PG's smallest-fitting `int4`. Two observable consequences, both intentional: (a) a context-free
 integer literal — including the elements of a bare `ARRAY[…]` constructor, which is a no-context
-position — is `int64`, so `ARRAY[1,2,3]` is `int64[]` where PG infers `int4[]`
+position — is `i64`, so `ARRAY[1,2,3]` is `i64[]` where PG infers `int4[]`
 ([array-functions.md §2/§5 #8](array-functions.md)); (b) literal-only arithmetic is more
-permissive than PG — `2000000000 + 2000000000` computes to `int64` `4000000000`, where PG
+permissive than PG — `2000000000 + 2000000000` computes to `i64` `4000000000`, where PG
 overflows `int4` (`22003`). This is the one place jed's literal typing diverges from PG by
 default (CLAUDE.md §1/§8); the strict comparison/assignment behavior above matches the *intent*
 of a strict type system and is stricter than PG (PG silently returns no rows for
@@ -430,11 +448,11 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   encoding is exercised, [encoding.md §2.7](encoding.md)). Deferred sub-features (uuid⇄other casts,
   uuid functions like `gen_random_uuid()`) are enumerated in §14.
 - **`timestamp` / `timestamptz`** — ✅ landed ([timestamp.md](timestamp.md)): the instant
-  model (int64 microseconds), no time-zone database, infinity sentinels, and usable as a
-  `PRIMARY KEY` (key encoding = the int64 rule).
+  model (i64 microseconds), no time-zone database, infinity sentinels, and usable as a
+  `PRIMARY KEY` (key encoding = the i64 rule).
 - **`interval`** — ✅ landed ([interval.md](interval.md)): a months/days/micros span with
   PostgreSQL arithmetic; non-key only (`0A000`).
-- **`float32` / `float64`** — ✅ landed ([float.md](float.md)): IEEE 754 binary32/binary64,
+- **`f32` / `f64`** — ✅ landed ([float.md](float.md)): IEEE 754 binary32/binary64,
   the PostgreSQL total order, a trapping arithmetic kernel, and the `R` render tag exempting
   computed/rendered values from cross-core byte-identity (settling the CLAUDE.md §8 float
   hotspots); non-key only (`0A000`).

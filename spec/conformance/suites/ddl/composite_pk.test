@@ -5,10 +5,10 @@
 # a non-keyable member type is a documented 0A000 narrowing.
 # spec/design/constraints.md §3, grammar.md §28.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.update, query.select, query.order_by, types.int16, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.update, query.select, query.order_by, types.i16, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))
+CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))
 
 # rows arrive out of tuple order; a negative first component exercises the sign-flip
 statement ok
@@ -87,7 +87,7 @@ SELECT a, b, v FROM t ORDER BY a, b
 
 # a single-column table constraint is the column-level form's equivalent
 statement ok
-CREATE TABLE s (k int32, PRIMARY KEY (k))
+CREATE TABLE s (k i32, PRIMARY KEY (k))
 
 statement ok
 INSERT INTO s VALUES (1)
@@ -99,24 +99,24 @@ INSERT INTO s VALUES (1)
 
 # an unknown member column
 statement error 42703
-CREATE TABLE e1 (a int32, PRIMARY KEY (a, nosuch))
+CREATE TABLE e1 (a i32, PRIMARY KEY (a, nosuch))
 
 # a repeated member column
 statement error 42701
-CREATE TABLE e2 (a int32, b int32, PRIMARY KEY (a, a))
+CREATE TABLE e2 (a i32, b i32, PRIMARY KEY (a, a))
 
 # at most one primary key across both forms
 statement error 42P16
-CREATE TABLE e3 (a int32 PRIMARY KEY, b int32, PRIMARY KEY (b))
+CREATE TABLE e3 (a i32 PRIMARY KEY, b i32, PRIMARY KEY (b))
 
 statement error 42P16
-CREATE TABLE e4 (a int32, b int32, PRIMARY KEY (a), PRIMARY KEY (b))
+CREATE TABLE e4 (a i32, b i32, PRIMARY KEY (a), PRIMARY KEY (b))
 
 # the list order is the KEY order — it may differ from declaration order (the original
 # 0A000 narrowing was lifted by the secondary-index catalog reshape, constraints.md §3):
 # this table keys by (b, a); a duplicate (b, a) tuple still traps 23505.
 statement ok
-CREATE TABLE e5 (a int32, b int32, PRIMARY KEY (b, a))
+CREATE TABLE e5 (a i32, b i32, PRIMARY KEY (b, a))
 
 statement ok
 INSERT INTO e5 VALUES (1, 20), (2, 10), (3, 15)
@@ -137,4 +137,4 @@ SELECT a, b FROM e5 ORDER BY b
 
 # narrowing: every member must be of a key-encodable type (text is not yet — types.md §11)
 statement error 0A000
-CREATE TABLE e6 (a int32, s text, PRIMARY KEY (a, s))
+CREATE TABLE e6 (a i32, s text, PRIMARY KEY (a, s))

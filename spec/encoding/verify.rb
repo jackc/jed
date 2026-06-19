@@ -13,7 +13,7 @@
 require "bundler/setup"
 require "toml-rb"
 
-WIDTH = { "int16" => 2, "int32" => 4, "int64" => 8, "boolean" => 1, "uuid" => 16 }.freeze
+WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "boolean" => 1, "uuid" => 16 }.freeze
 
 # uuid-raw16: the 16 raw bytes of the canonical 8-4-4-4-12 form (no sign-flip, no
 # escape/terminator — encoding.md §2.7). encode = strip hyphens, pack the 32 hex digits.

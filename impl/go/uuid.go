@@ -45,7 +45,7 @@ func uuidExtractTimestampMicros(b []byte) (int64, bool) {
 }
 
 // uuidV7Micros reads the 48-bit big-endian Unix-millisecond field (bytes 0..5); micros = ms *
-// 1000. A 48-bit ms times 1000 stays well within int64, so this cannot overflow.
+// 1000. A 48-bit ms times 1000 stays well within i64, so this cannot overflow.
 func uuidV7Micros(b []byte) int64 {
 	ms := int64(b[0])<<40 | int64(b[1])<<32 | int64(b[2])<<24 |
 		int64(b[3])<<16 | int64(b[4])<<8 | int64(b[5])

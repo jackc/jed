@@ -3,16 +3,16 @@
 // never drift.
 //
 // ScalarType is a string-literal union (not a TS enum — the elidable subset forbids
-// enums); the member IS the canonical name. All bounds are `bigint` (CLAUDE.md: int64
+// enums); the member IS the canonical name. All bounds are `bigint` (CLAUDE.md: i64
 // exceeds JS's safe-integer range, so every integer flows through bigint — uniform,
 // exact at all widths).
 
 export type ScalarType =
-  | "int16"
-  | "int32"
-  | "int64"
-  | "float32"
-  | "float64"
+  | "i16"
+  | "i32"
+  | "i64"
+  | "f32"
+  | "f64"
   | "text"
   | "boolean"
   | "decimal"
@@ -24,11 +24,11 @@ export type ScalarType =
   | "date";
 
 export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
-  "int16",
-  "int32",
-  "int64",
-  "float32",
-  "float64",
+  "i16",
+  "i32",
+  "i64",
+  "f32",
+  "f64",
   "text",
   "boolean",
   "decimal",
@@ -98,13 +98,13 @@ export function isDate(t: ScalarType): boolean {
 
 // isInteger reports whether this is one of the fixed-width signed integer types.
 export function isInteger(t: ScalarType): boolean {
-  return t === "int16" || t === "int32" || t === "int64";
+  return t === "i16" || t === "i32" || t === "i64";
 }
 
 // isFloat reports whether this is one of the two IEEE 754 binary float types
-// (spec/design/float.md). float32 = binary32 (single), float64 = binary64 (double).
+// (spec/design/float.md). f32 = binary32 (single), f64 = binary64 (double).
 export function isFloat(t: ScalarType): boolean {
-  return t === "float32" || t === "float64";
+  return t === "f32" || t === "f64";
 }
 
 // canonicalName is the single name used in all output (determinism — CLAUDE.md §10).
@@ -114,30 +114,40 @@ export function canonicalName(t: ScalarType): string {
 }
 
 // scalarTypeFromName resolves a type name (canonical or alias) case-insensitively, or
-// undefined. PG's int2/int4/int8 are intentionally NOT accepted (we own our surface §1).
+// undefined. Canonical names state width in bits under the i/f prefix (i16/i32/i64, f32/f64
+// — the Rust/Zig convention). Accepted aliases: the SQL-standard words (smallint/int/integer/
+// bigint, real/double precision/float) AND PG's byte-shorthand (int2/int4/int8, float4/float8).
+// The byte-shorthand is safe to accept BECAUSE of the i/f prefix: jed's bit-namespace (i8…i64)
+// is lexically disjoint from PG's byte-namespace (int2…int8), so int8 → i64 with no collision
+// and a future 8-bit i8 stays free (spec/design/types.md §11; CLAUDE.md §1/§4).
 export function scalarTypeFromName(name: string): ScalarType | undefined {
   switch (name.toLowerCase()) {
-    case "int16":
+    case "i16":
     case "smallint":
-      return "int16";
-    case "int32":
+    case "int2":
+      return "i16";
+    case "i32":
     case "int":
     case "integer":
-      return "int32";
-    case "int64":
+    case "int4":
+      return "i32";
+    case "i64":
     case "bigint":
-      return "int64";
-    // Float types (spec/design/float.md §2). The promotion tower's canonical ids state
-    // width in bits; the SQL-standard names are aliases. PG's `float8`/`float4` byte-count
-    // spellings and the `float(p)` typmod are NOT accepted (we own our surface). Note the
-    // C/Java-counterintuitive PG rule: a bare `float` (no precision) IS double precision.
-    case "float32":
+    case "int8":
+      return "i64";
+    // Float types (spec/design/float.md §2). The promotion tower's canonical ids state width
+    // in bits (f32/f64); the SQL-standard names (real, double precision, float) and PG's
+    // byte-shorthand (float4/float8) are aliases. Note the C/Java-counterintuitive PG rule:
+    // a bare `float` (no precision) IS double precision (so it maps to f64, not f32).
+    case "f32":
     case "real":
-      return "float32";
-    case "float64":
+    case "float4":
+      return "f32";
+    case "f64":
     case "double precision":
     case "float":
-      return "float64";
+    case "float8":
+      return "f64";
     // The two-word "character varying" alias is recognized, though this slice's parser
     // only produces single-word type names (a documented narrowing — types.md §11).
     case "text":
@@ -172,7 +182,7 @@ export function scalarTypeFromName(name: string): ScalarType | undefined {
 }
 
 // widthBytes is the fixed storage width in bytes (the KEY-encoding width — the bare key body,
-// no presence tag — for the fixed-width keyable types: the three integers, the two int64
+// no presence tag — for the fixed-width keyable types: the three integers, the two i64
 // timestamps, uuid (16), and boolean (1 — the bool-byte key, spec/design/encoding.md §2.9)).
 // Used by the index tail-slot skip (each self-delimiting component is 0x01 NULL or 0x00 + this
 // many bytes). text/decimal/bytea/interval are variable-width / non-key and throw — they carry
@@ -184,13 +194,13 @@ export function widthBytes(t: ScalarType): number {
   switch (t) {
     case "boolean":
       return 1;
-    case "int16":
+    case "i16":
       return 2;
-    case "int32":
+    case "i32":
       return 4;
-    case "int64":
-    // The two timestamps are int64-microsecond instants — fixed-width 8-byte, reusing the
-    // int64 key/value codec (spec/design/timestamp.md §6).
+    case "i64":
+    // The two timestamps are i64-microsecond instants — fixed-width 8-byte, reusing the
+    // i64 key/value codec (spec/design/timestamp.md §6).
     case "timestamp":
     case "timestamptz":
       return 8;
@@ -200,9 +210,9 @@ export function widthBytes(t: ScalarType): number {
     // 8 bytes (binary64). They use the float value codec (DataView, big-endian) on disk and
     // the float-order-preserving key encoding — both keyed on this width (spec/design/float.md
     // §10). They are NOT routed through the integer key/value codec.
-    case "float32":
+    case "f32":
       return 4;
-    case "float64":
+    case "f64":
       return 8;
     case "text":
       throw new Error("text is variable-width; widthBytes is integer-only");
@@ -212,7 +222,7 @@ export function widthBytes(t: ScalarType): number {
       throw new Error("bytea is variable-width; widthBytes is integer-only");
     case "interval":
       throw new Error("interval is not serialized through the integer codec; widthBytes is integer-only");
-    // A date is a fixed-width 4-byte int32 day count (reuses the int32 codec — it is a key this
+    // A date is a fixed-width 4-byte i32 day count (reuses the i32 codec — it is a key this
     // slice, like timestamp; spec/design/date.md).
     case "date":
       return 4;
@@ -222,14 +232,14 @@ export function widthBytes(t: ScalarType): number {
 // minOf is the inclusive minimum value (integer-only).
 export function minOf(t: ScalarType): bigint {
   switch (t) {
-    case "int16":
+    case "i16":
       return -32768n;
-    case "int32":
+    case "i32":
       return -2147483648n;
-    case "int64":
+    case "i64":
       return -9223372036854775808n;
-    case "float32":
-    case "float64":
+    case "f32":
+    case "f64":
       throw new Error("float has no integer range");
     case "text":
       throw new Error("text has no integer range");
@@ -254,14 +264,14 @@ export function minOf(t: ScalarType): bigint {
 // maxOf is the inclusive maximum value (integer-only).
 export function maxOf(t: ScalarType): bigint {
   switch (t) {
-    case "int16":
+    case "i16":
       return 32767n;
-    case "int32":
+    case "i32":
       return 2147483647n;
-    case "int64":
+    case "i64":
       return 9223372036854775807n;
-    case "float32":
-    case "float64":
+    case "f32":
+    case "f64":
       throw new Error("float has no integer range");
     case "text":
       throw new Error("text has no integer range");
@@ -283,18 +293,18 @@ export function maxOf(t: ScalarType): bigint {
   }
 }
 
-// rank is the promotion-tower rank: int16 < int32 < int64 (spec/types/compare.toml).
+// rank is the promotion-tower rank: i16 < i32 < i64 (spec/types/compare.toml).
 // Integer-only — text does not promote (there is one text type).
 export function rank(t: ScalarType): number {
   switch (t) {
-    case "int16":
+    case "i16":
       return 1;
-    case "int32":
+    case "i32":
       return 2;
-    case "int64":
+    case "i64":
       return 3;
-    case "float32":
-    case "float64":
+    case "f32":
+    case "f64":
       throw new Error("float uses floatRank, not the integer promotion rank");
     case "text":
       throw new Error("text has no promotion rank");
@@ -321,14 +331,14 @@ export function inRange(t: ScalarType, v: bigint): boolean {
   return v >= minOf(t) && v <= maxOf(t);
 }
 
-// floatRank is the float-family promotion-tower rank: float32 (1) < float64 (2)
+// floatRank is the float-family promotion-tower rank: f32 (1) < f64 (2)
 // (spec/types/compare.toml `max-rank`; spec/design/float.md §2). When two floats of different
-// width meet (arithmetic / comparison) both widen to the higher rank — float32 → float64,
+// width meet (arithmetic / comparison) both widen to the higher rank — f32 → f64,
 // which is lossless. Separate from the integer `rank`: the two towers never mix (cross-family
 // int↔float is an explicit cast, never an implicit promotion). float-only; throws otherwise.
 export function floatRank(t: ScalarType): number {
-  if (t === "float32") return 1;
-  if (t === "float64") return 2;
+  if (t === "f32") return 1;
+  if (t === "f64") return 2;
   throw new Error("floatRank is float-only");
 }
 
@@ -339,12 +349,12 @@ export function promoteFloat(a: ScalarType, b: ScalarType): ScalarType {
 }
 
 // roundToWidth rounds a JS number to the exact value representable at this float type's width:
-// identity for float64 (JS `number` IS binary64) and `Math.fround` for float32 (true binary32
-// rounding). It MUST be applied on EVERY float32 operation, literal, cast, and result — JS does
-// all arithmetic in binary64, so without it a float32 value would carry binary64 precision and
+// identity for f64 (JS `number` IS binary64) and `Math.fround` for f32 (true binary32
+// rounding). It MUST be applied on EVERY f32 operation, literal, cast, and result — JS does
+// all arithmetic in binary64, so without it a f32 value would carry binary64 precision and
 // diverge from the Rust/Go cores (spec/design/float.md §2, the one extra TS discipline).
 export function roundToWidth(ty: ScalarType, v: number): number {
-  return ty === "float32" ? Math.fround(v) : v;
+  return ty === "f32" ? Math.fround(v) : v;
 }
 
 // Type is a column / value type: either a built-in ScalarType or a by-name reference to a

@@ -222,7 +222,7 @@ func decOne(t *testing.T, db *Database, sql string) string {
 func TestDecimalOnDiskRoundTripEndToEnd(t *testing.T) {
 	db := decDB(
 		t,
-		"CREATE TABLE t (id int32 PRIMARY KEY, money numeric(10,2), free numeric)",
+		"CREATE TABLE t (id i32 PRIMARY KEY, money numeric(10,2), free numeric)",
 		"INSERT INTO t VALUES (1, 1.5, -12345.6789), (2, 0, 0.00), (3, 100, NULL)",
 	)
 	image, err := db.ToImage(8192, 1)
@@ -281,7 +281,7 @@ func TestSumAccumulatorChecksOnlyFinalCap(t *testing.T) {
 // exceeds max_scale (16383) ROUNDS to it, half away from zero, instead of trapping
 // (spec/design/decimal.md §2).
 func TestDecimalMulRoundsAtMaxScale(t *testing.T) {
-	db := decDB(t, "CREATE TABLE t (id int32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
+	db := decDB(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
 	tiny1 := "0." + strings.Repeat("0", 8191) + "1" // 1e-8192 (scale 8192)
 	tiny5 := "0." + strings.Repeat("0", 8191) + "5" // 5e-8192
 	// 1e-8192 * 1e-8192 = 1e-16384: the dropped digit is 1 -> rounds DOWN to 0 at scale 16383.
@@ -298,7 +298,7 @@ func TestDecimalMulRoundsAtMaxScale(t *testing.T) {
 // the limb work runs (spec/design/cost.md §3/§6), so a ceiling aborts a pathological multiply
 // up front (CLAUDE.md §13). ~20000 digits is ~5000 groups; the mul W is ~25,000,000.
 func TestDecimalCostCeilingAbortsAheadOfBigMultiply(t *testing.T) {
-	db := decDB(t, "CREATE TABLE t (id int32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
+	db := decDB(t, "CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)")
 	big := strings.Repeat("9", 20000) + ".5"
 	db.SetMaxCost(1000)
 	_, err := Execute(db, "SELECT "+big+" * "+big+" FROM t")

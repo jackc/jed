@@ -42,7 +42,7 @@ fn col(db: &mut Database, sql: &str) -> Vec<String> {
 
 fn addr_db() -> Database {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     db
 }
 
@@ -279,10 +279,7 @@ fn unnest_composite_array() {
 #[test]
 fn array_row_constructor_under_column_context() {
     let mut db = addr_db();
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])",
-    );
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
     // The ARRAY[ROW(…)] constructor takes the column's composite element type as context — no `::addr`
     // cast needed (PG requires the cast; this is the documented jed extension, like AC1).
     run(

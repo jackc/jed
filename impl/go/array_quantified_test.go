@@ -10,10 +10,10 @@ import "testing"
 func TestQuantifiedAnyEqualityIsIn(t *testing.T) {
 	db := NewDatabase()
 	cases := map[string]string{
-		"SELECT 1 = ANY(ARRAY[1,2,3])":       "true",
-		"SELECT 5 = ANY(ARRAY[1,2,3])":       "false",
-		"SELECT 2 = SOME(ARRAY[1,2,3])":      "true", // SOME is the synonym for ANY
-		"SELECT 2 = ANY('{1,2,3}'::int64[])": "true",
+		"SELECT 1 = ANY(ARRAY[1,2,3])":     "true",
+		"SELECT 5 = ANY(ARRAY[1,2,3])":     "false",
+		"SELECT 2 = SOME(ARRAY[1,2,3])":    "true", // SOME is the synonym for ANY
+		"SELECT 2 = ANY('{1,2,3}'::i64[])": "true",
 		// The SUBQUERY operand form is the subquery spelling of IN: x = ANY(SELECT …) ≡
 		// x IN (SELECT …) (shipped; thorough coverage in suites/subquery/quantified.test).
 		"SELECT 1 = ANY(SELECT 1)": "true",
@@ -28,13 +28,13 @@ func TestQuantifiedAnyEqualityIsIn(t *testing.T) {
 func TestQuantifiedAll(t *testing.T) {
 	db := NewDatabase()
 	cases := map[string]string{
-		"SELECT 3 = ALL(ARRAY[3,3,3])":            "true",
-		"SELECT 3 = ALL(ARRAY[3,3,4])":            "false",
-		"SELECT 3 = ALL(ARRAY[4,NULL])":           "false", // a FALSE element dominates a NULL
-		"SELECT 3 = ALL(ARRAY[3,NULL])":           "NULL",  // else a NULL → NULL
-		"SELECT 3 = ALL('{}'::int64[])":           "true",  // empty → TRUE (vacuous)
-		"SELECT NULL::int64 = ALL('{}'::int64[])": "true",  // empty beats a NULL x
-		"SELECT 3 = ALL(NULL::int64[])":           "NULL",  // NULL array → NULL
+		"SELECT 3 = ALL(ARRAY[3,3,3])":        "true",
+		"SELECT 3 = ALL(ARRAY[3,3,4])":        "false",
+		"SELECT 3 = ALL(ARRAY[4,NULL])":       "false", // a FALSE element dominates a NULL
+		"SELECT 3 = ALL(ARRAY[3,NULL])":       "NULL",  // else a NULL → NULL
+		"SELECT 3 = ALL('{}'::i64[])":         "true",  // empty → TRUE (vacuous)
+		"SELECT NULL::i64 = ALL('{}'::i64[])": "true",  // empty beats a NULL x
+		"SELECT 3 = ALL(NULL::i64[])":         "NULL",  // NULL array → NULL
 	}
 	for sql, want := range cases {
 		if got := valArrayFunc(t, db, sql); got != want {
@@ -55,7 +55,7 @@ func TestQuantifiedOrderingAndShape(t *testing.T) {
 		"SELECT 3 = ANY(ARRAY[ARRAY[1,2],ARRAY[3,4]])": "true",
 		"SELECT 4 = ALL(ARRAY[ARRAY[4,4],ARRAY[4,4]])": "true",
 		// A custom lower bound is irrelevant (elements, not subscripts).
-		"SELECT 20 = ANY('[5:6]={10,20}'::int64[])": "true",
+		"SELECT 20 = ANY('[5:6]={10,20}'::i64[])": "true",
 		// text elements flow through.
 		"SELECT 'b' = ANY(ARRAY['a','b','c'])": "true",
 	}
@@ -68,7 +68,7 @@ func TestQuantifiedOrderingAndShape(t *testing.T) {
 
 func TestQuantifiedColumnLiteralAdaptation(t *testing.T) {
 	db := NewDatabase()
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])")
 	mustExec(t, db, "INSERT INTO t VALUES (1, ARRAY[10,20,30]), (2, ARRAY[40,50])")
 	cases := map[string]string{
 		"SELECT 20 = ANY(xs) FROM t WHERE id = 1":           "true",

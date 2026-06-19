@@ -15,7 +15,7 @@ function run(db: Database, sql: string): void {
 
 test("CREATE TYPE registers fields", () => {
   const db = new Database();
-  run(db, "CREATE TYPE addr AS (street text NOT NULL, zip int32)");
+  run(db, "CREATE TYPE addr AS (street text NOT NULL, zip i32)");
   const ct = db.compositeType("addr");
   assert.ok(ct, "type addr");
   assert.equal(ct!.name, "addr");
@@ -31,7 +31,7 @@ test("CREATE TYPE registers fields", () => {
 
 test("DROP TYPE removes it", () => {
   const db = new Database();
-  run(db, "CREATE TYPE addr AS (a int32)");
+  run(db, "CREATE TYPE addr AS (a i32)");
   run(db, "DROP TYPE addr");
   assert.equal(db.compositeType("addr"), undefined);
 });
@@ -39,9 +39,9 @@ test("DROP TYPE removes it", () => {
 // A nested composite value round-trips and renders with the inner record quoted.
 test("nested composite value round-trip", () => {
   const db = new Database();
-  run(db, "CREATE TYPE point AS (x int32, y int32)");
+  run(db, "CREATE TYPE point AS (x i32, y i32)");
   run(db, "CREATE TYPE seg AS (a point, b point)");
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, s seg)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, s seg)");
   run(db, "INSERT INTO t VALUES (1, ROW(ROW(1, 2), ROW(3, 4)))");
   assert.deepStrictEqual(query(db, "SELECT s FROM t"), [['("(1,2)","(3,4)")']]);
 });
@@ -49,8 +49,8 @@ test("nested composite value round-trip", () => {
 // Composite values survive a serialize → load round-trip (the v9 recursive value codec).
 test("composite values persist through the on-disk image", () => {
   const db = new Database();
-  run(db, "CREATE TYPE addr AS (street text, zip int32)");
-  run(db, "CREATE TABLE p (id int32 PRIMARY KEY, home addr)");
+  run(db, "CREATE TYPE addr AS (street text, zip i32)");
+  run(db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)");
   run(db, "INSERT INTO p VALUES (1, ROW('Main', 90210))");
   run(db, "INSERT INTO p VALUES (2, ROW('Oak', NULL))");
   const image = toImage(db, 256, 1n);
@@ -63,7 +63,7 @@ test("composite values persist through the on-disk image", () => {
 
 test("DROP TYPE ... CASCADE is 0A000", () => {
   const db = new Database();
-  run(db, "CREATE TYPE addr AS (a int32)");
+  run(db, "CREATE TYPE addr AS (a i32)");
   assert.equal(errCode(() => run(db, "DROP TYPE addr CASCADE")), "0A000");
 });
 
@@ -78,9 +78,9 @@ test("nested type self- or forward-reference is 42704", () => {
 // load, byte-backed by the v9 catalog type-definition section.
 test("types persist through the on-disk image", () => {
   const db = new Database();
-  run(db, "CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)");
+  run(db, "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)");
   run(db, "CREATE TYPE line AS (a point, b point)");
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, n int32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, n i32)");
   run(db, "INSERT INTO t VALUES (1, 10)");
 
   const image = toImage(db, 256, 1n);
@@ -104,8 +104,8 @@ test("types persist through the on-disk image", () => {
 // parenthesized column, a ROW(…) literal, and chains through a nested composite.
 test("field access selects a field", () => {
   const db = new Database();
-  run(db, "CREATE TYPE addr AS (street text, zip int32)");
-  run(db, "CREATE TABLE person (id int32 PRIMARY KEY, home addr)");
+  run(db, "CREATE TYPE addr AS (street text, zip i32)");
+  run(db, "CREATE TABLE person (id i32 PRIMARY KEY, home addr)");
   run(db, "INSERT INTO person VALUES (1, ROW('Main', 90210))");
   // Parenthesized-column field access.
   assert.deepStrictEqual(query(db, "SELECT (home).zip, (home).street FROM person"), [["90210", "Main"]]);
@@ -117,7 +117,7 @@ test("field access selects a field", () => {
 // FALSE; else UNKNOWN if any field is UNKNOWN; else TRUE.
 test("composite equality 3VL", () => {
   const db = new Database();
-  run(db, "CREATE TYPE rec AS (a int32, b int32)");
+  run(db, "CREATE TYPE rec AS (a i32, b i32)");
   // Equal rows.
   assert.deepStrictEqual(query(db, "SELECT ROW(1, 2) = ROW(1, 2)"), [["true"]]);
   // A NULL field with all-else-equal → UNKNOWN (renders NULL).
@@ -132,8 +132,8 @@ test("composite equality 3VL", () => {
 // over the composite column sorts lexicographically.
 test("composite column compare and order", () => {
   const db = new Database();
-  run(db, "CREATE TYPE addr AS (street text, zip int32)");
-  run(db, "CREATE TABLE p (id int32 PRIMARY KEY, home addr)");
+  run(db, "CREATE TYPE addr AS (street text, zip i32)");
+  run(db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)");
   run(db, "INSERT INTO p VALUES (1, ROW('Oak', 30))");
   run(db, "INSERT INTO p VALUES (2, ROW('Oak', 10))");
   run(db, "INSERT INTO p VALUES (3, ROW('Elm', 99))");
@@ -148,7 +148,7 @@ test("composite column compare and order", () => {
 // as PRESENT: a nested all-NULL row is therefore `IS NULL` = FALSE and `IS NOT NULL` = TRUE.
 test("composite IS NULL non recursive", () => {
   const db = new Database();
-  run(db, "CREATE TYPE point AS (x int32, y int32)");
+  run(db, "CREATE TYPE point AS (x i32, y i32)");
   run(db, "CREATE TYPE seg AS (a point, b point)");
   // The two inner rows are non-null values → the outer row is NOT all-(SQL-)null → IS NULL false,
   // IS NOT NULL true. PG does NOT recurse into the inner all-NULL rows.
@@ -173,25 +173,25 @@ test("composite IS NULL non recursive", () => {
 
 test("CREATE TYPE with an array field registers it", () => {
   const db = new Database();
-  run(db, "CREATE TYPE poly AS (name text, pts int32[])");
+  run(db, "CREATE TYPE poly AS (name text, pts i32[])");
   const ct = db.compositeType("poly");
   assert.ok(ct);
   assert.equal(ct!.fields.length, 2);
   assert.equal(ct!.fields[1]!.name, "pts");
-  assert.deepStrictEqual(ct!.fields[1]!.type, arrayT(scalarT("int32")));
+  assert.deepStrictEqual(ct!.fields[1]!.type, arrayT(scalarT("i32")));
 });
 
 test("composite with an array field persists through the on-disk image", () => {
   const db = new Database();
-  run(db, "CREATE TYPE poly AS (name text, pts int32[])");
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+  run(db, "CREATE TYPE poly AS (name text, pts i32[])");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)");
   run(db, "INSERT INTO t VALUES (1, ROW('a', ARRAY[1, 2, 3]))");
   run(db, "INSERT INTO t VALUES (2, ROW('b', NULL))");
   const image = toImage(db, 256, 1n);
   const loaded = loadDatabase(image);
   const ct = loaded.compositeType("poly");
   assert.ok(ct);
-  assert.deepStrictEqual(ct!.fields[1]!.type, arrayT(scalarT("int32")));
+  assert.deepStrictEqual(ct!.fields[1]!.type, arrayT(scalarT("i32")));
   assert.deepStrictEqual(query(loaded, "SELECT id, p FROM t ORDER BY id"), [
     ["1", `(a,"{1,2,3}")`],
     ["2", "(b,)"],
@@ -200,9 +200,9 @@ test("composite with an array field persists through the on-disk image", () => {
 
 test("composite with an array-of-composite field (homes addr[])", () => {
   const db = new Database();
-  run(db, "CREATE TYPE addr AS (street text, zip int32)");
+  run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TYPE person AS (name text, homes addr[])");
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, who person)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, who person)");
   run(db, `INSERT INTO t VALUES (1, ROW('jo', '{"(Main,1)","(Oak,2)"}'))`);
   const image = toImage(db, 256, 1n);
   const loaded = loadDatabase(image);
@@ -211,7 +211,7 @@ test("composite with an array-of-composite field (homes addr[])", () => {
 
 test("DROP TYPE is blocked by an array-typed field dependent", () => {
   const db = new Database();
-  run(db, "CREATE TYPE addr AS (street text, zip int32)");
+  run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TYPE person AS (name text, homes addr[])");
   assert.equal(errCode(() => run(db, "DROP TYPE addr")), "2BP01");
   run(db, "DROP TYPE person");
@@ -220,8 +220,8 @@ test("DROP TYPE is blocked by an array-typed field dependent", () => {
 
 test("DROP TYPE is blocked by an array-typed column dependent", () => {
   const db = new Database();
-  run(db, "CREATE TYPE addr AS (street text, zip int32)");
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])");
+  run(db, "CREATE TYPE addr AS (street text, zip i32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
   assert.equal(errCode(() => run(db, "DROP TYPE addr")), "2BP01");
 });
 

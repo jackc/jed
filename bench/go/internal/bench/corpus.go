@@ -96,7 +96,7 @@ func LoadCorpus(corpusDir string) (*Corpus, error) {
 
 // ParamStream draws the per-iteration argument lists for a bench: one shared PRNG
 // consumed continuously across warmup + measured iterations, serial counters advancing
-// per statement (spec/design/benchmarks.md §3/§4). Args are int64 or string.
+// per statement (spec/design/benchmarks.md §3/§4). Args are i64 or string.
 type ParamStream struct {
 	params  []Param
 	prng    *Prng

@@ -19,12 +19,12 @@
 # A core without the gate-blocking annotation declares no txn.gate_blocking and SKIPS this file
 # before parsing any record (the capability gate, conformance.md §3).
 # format: concurrency
-# requires: txn.gate_blocking, txn.shared, txn.read_handle, txn.watermark, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.int32
+# requires: txn.gate_blocking, txn.shared, txn.read_handle, txn.watermark, ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.i32
 
 # --- seed one row, committed as version 1 -----------------------------------
 open w write
 on w statement ok
-CREATE TABLE t (id int32 PRIMARY KEY)
+CREATE TABLE t (id i32 PRIMARY KEY)
 on w statement ok
 INSERT INTO t VALUES (1)
 commit w

@@ -10,19 +10,19 @@
 # jed-specific divergences — stricter type pairing, the end-state parent UPDATE, and the 0A000
 # CASCADE/SET NULL/SET DEFAULT actions — live in the per-core unit tests, not this corpus.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.unique, ddl.check, ddl.foreign_key, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.order_by, types.int32, types.text, null.three_valued
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.unique, ddl.check, ddl.foreign_key, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.order_by, types.i32, types.text, null.three_valued
 
 # --- a single-column FK to the parent's primary key (column-level REFERENCES) -----
 
 statement ok
-CREATE TABLE dept (id int32 PRIMARY KEY, name text)
+CREATE TABLE dept (id i32 PRIMARY KEY, name text)
 
 statement ok
 INSERT INTO dept VALUES (1, 'eng'), (2, 'sales'), (3, 'hr')
 
 # the referenced column list defaults to the parent's primary key
 statement ok
-CREATE TABLE emp (id int32 PRIMARY KEY, dept_id int32 REFERENCES dept)
+CREATE TABLE emp (id i32 PRIMARY KEY, dept_id i32 REFERENCES dept)
 
 # referencing an existing parent key is fine
 statement ok
@@ -83,13 +83,13 @@ NULL
 # --- a FK to a UNIQUE (non-PK) column, and parent UPDATE that orphans -------------
 
 statement ok
-CREATE TABLE pu (id int32 PRIMARY KEY, code int32 UNIQUE)
+CREATE TABLE pu (id i32 PRIMARY KEY, code i32 UNIQUE)
 
 statement ok
 INSERT INTO pu VALUES (1, 100), (2, 200)
 
 statement ok
-CREATE TABLE cu (id int32 PRIMARY KEY, pcode int32 REFERENCES pu (code))
+CREATE TABLE cu (id i32 PRIMARY KEY, pcode i32 REFERENCES pu (code))
 
 statement ok
 INSERT INTO cu VALUES (10, 100)
@@ -105,13 +105,13 @@ UPDATE pu SET code = 999 WHERE id = 2
 # --- a composite FK to a composite primary key -----------------------------------
 
 statement ok
-CREATE TABLE comp_p (a int32, b int32, label text, PRIMARY KEY (a, b))
+CREATE TABLE comp_p (a i32, b i32, label text, PRIMARY KEY (a, b))
 
 statement ok
 INSERT INTO comp_p VALUES (1, 1, 'x'), (1, 2, 'y')
 
 statement ok
-CREATE TABLE comp_c (id int32 PRIMARY KEY, pa int32, pb int32, CONSTRAINT comp_fk FOREIGN KEY (pa, pb) REFERENCES comp_p (a, b))
+CREATE TABLE comp_c (id i32 PRIMARY KEY, pa i32, pb i32, CONSTRAINT comp_fk FOREIGN KEY (pa, pb) REFERENCES comp_p (a, b))
 
 statement ok
 INSERT INTO comp_c VALUES (10, 1, 1)
@@ -127,7 +127,7 @@ INSERT INTO comp_c VALUES (12, 1, NULL)
 # --- a self-referencing FK (the batch end state resolves forward references) ------
 
 statement ok
-CREATE TABLE node (id int32 PRIMARY KEY, parent int32 REFERENCES node (id))
+CREATE TABLE node (id i32 PRIMARY KEY, parent i32 REFERENCES node (id))
 
 # a forward reference within one multi-row INSERT (row 2 references id 1, inserted after it)
 statement ok
@@ -157,23 +157,23 @@ SELECT id FROM node ORDER BY id
 
 # a missing referenced table is 42P01
 statement error 42P01
-CREATE TABLE m1 (z int32 REFERENCES nosuchtable)
+CREATE TABLE m1 (z i32 REFERENCES nosuchtable)
 
 # referencing a column that is neither a PK nor a UNIQUE set is 42830
 statement ok
-CREATE TABLE np (x int32, y int32)
+CREATE TABLE np (x i32, y i32)
 
 statement error 42830
-CREATE TABLE m2 (z int32 REFERENCES np (x))
+CREATE TABLE m2 (z i32 REFERENCES np (x))
 
 # a referencing/referenced column-count disagreement is 42830
 statement error 42830
-CREATE TABLE m3 (z int32, FOREIGN KEY (z) REFERENCES comp_p (a, b))
+CREATE TABLE m3 (z i32, FOREIGN KEY (z) REFERENCES comp_p (a, b))
 
 # omitting the referenced list when the parent has no primary key is 42704 (PG's code here:
 # the default is specifically the PK, distinct from the explicit-no-unique-match 42830 above)
 statement error 42704
-CREATE TABLE m4 (z int32 REFERENCES np)
+CREATE TABLE m4 (z i32 REFERENCES np)
 
 # a same-position type mismatch is 42804
 statement error 42804
@@ -181,19 +181,19 @@ CREATE TABLE m5 (z text REFERENCES dept (id))
 
 # an FK shares the per-table constraint namespace with CHECK — a name collision is 42710
 statement error 42710
-CREATE TABLE m6 (id int32 PRIMARY KEY, a int32, CONSTRAINT dup CHECK (a > 0), CONSTRAINT dup FOREIGN KEY (a) REFERENCES dept (id))
+CREATE TABLE m6 (id i32 PRIMARY KEY, a i32, CONSTRAINT dup CHECK (a > 0), CONSTRAINT dup FOREIGN KEY (a) REFERENCES dept (id))
 
 # ON DELETE / ON UPDATE NO ACTION and RESTRICT are accepted (identical in jed)
 statement ok
-CREATE TABLE m7 (id int32 PRIMARY KEY, d int32 REFERENCES dept (id) ON DELETE NO ACTION ON UPDATE RESTRICT)
+CREATE TABLE m7 (id i32 PRIMARY KEY, d i32 REFERENCES dept (id) ON DELETE NO ACTION ON UPDATE RESTRICT)
 
 # --- DROP TABLE and dependencies -------------------------------------------------
 
 statement ok
-CREATE TABLE dp (id int32 PRIMARY KEY)
+CREATE TABLE dp (id i32 PRIMARY KEY)
 
 statement ok
-CREATE TABLE dc (id int32 PRIMARY KEY, r int32 REFERENCES dp)
+CREATE TABLE dc (id i32 PRIMARY KEY, r i32 REFERENCES dp)
 
 # a table referenced by another table's FK cannot be dropped (2BP01)
 statement error 2BP01
@@ -208,7 +208,7 @@ DROP TABLE dp
 
 # a self-reference does not block dropping its own table
 statement ok
-CREATE TABLE sd (id int32 PRIMARY KEY, p int32 REFERENCES sd (id))
+CREATE TABLE sd (id i32 PRIMARY KEY, p i32 REFERENCES sd (id))
 
 statement ok
 DROP TABLE sd

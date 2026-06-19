@@ -8,13 +8,13 @@
 # one leaf each, so page_read is 1 per non-empty scan and 0 for an empty bound. Sound for outer joins:
 # a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows, so bounding the
 # NULL-extended side cannot drop a surviving row (the `WHERE b.id = …` LEFT-JOIN case below).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_pushdown, query.point_lookup, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.logical_connectives, query.order_by, query.order_by_keys, query.qualified_column, query.join_inner, query.join_left, query.join_pushdown, query.point_lookup, types.i32, resource.cost_metering
 
 statement ok
-CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+CREATE TABLE b (id i32 PRIMARY KEY, k i32)
 
 statement ok
 INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)

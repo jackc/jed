@@ -66,7 +66,7 @@ func seedChecksum(t *testing.T, path string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := Execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)"); err != nil {
+	if _, err := Execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)"); err != nil {
 		t.Fatal(err)
 	}
 	sql := "INSERT INTO t VALUES (1, '" + fillerText(600) + "')"

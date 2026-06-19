@@ -28,12 +28,12 @@ pub enum Value {
     Null,
     Int(i64),
     Bool(bool),
-    /// IEEE 754 binary32 (`float32`/`real` — spec/design/float.md). Held as the native `f32`;
+    /// IEEE 754 binary32 (`f32`/`real` — spec/design/float.md). Held as the native `f32`;
     /// the stored bits round-trip verbatim (a stored `-0.0` keeps its sign), but equality,
     /// ordering, and `DISTINCT`/`GROUP BY` use the PG TOTAL order (`-0 = +0`, `NaN = NaN`, NaN
     /// the largest value — §3), implemented in the manual `PartialEq`/`Eq`/`Hash` below.
     Float32(f32),
-    /// IEEE 754 binary64 (`float64`/`double precision` — spec/design/float.md). Same total-order
+    /// IEEE 754 binary64 (`f64`/`double precision` — spec/design/float.md). Same total-order
     /// semantics as `Float32`, at binary64 width.
     Float64(f64),
     Text(String),
@@ -47,13 +47,13 @@ pub enum Value {
     /// (types.md §14). Held as `[u8; 16]`, so `PartialEq`/`Eq`/`Hash` (DISTINCT/GROUP BY) and
     /// `<` (ORDER BY) are the natural byte-wise unsigned operations.
     Uuid([u8; 16]),
-    /// A zoneless `timestamp` — int64 microseconds since the Unix epoch (the two sentinels
+    /// A zoneless `timestamp` — i64 microseconds since the Unix epoch (the two sentinels
     /// i64::MIN/i64::MAX are -infinity/+infinity). Compares by the instant (spec/design/timestamp.md).
     Timestamp(i64),
-    /// A UTC-instant `timestamptz` — int64 microseconds since the Unix epoch. Distinct from
+    /// A UTC-instant `timestamptz` — i64 microseconds since the Unix epoch. Distinct from
     /// `Timestamp` (it renders with a +00 suffix and never compares cross-family).
     Timestamptz(i64),
-    /// A `date` — int32 days since the Unix epoch (the two sentinels i32::MIN/i32::MAX are
+    /// A `date` — i32 days since the Unix epoch (the two sentinels i32::MIN/i32::MAX are
     /// -infinity/+infinity). Compares by the day count; renders `YYYY-MM-DD` (spec/design/date.md).
     Date(i32),
     /// An `interval` span — months/days/micros (spec/design/interval.md). Its `PartialEq`/`Eq`/
@@ -69,7 +69,7 @@ pub enum Value {
     Composite(Vec<Value>),
     /// An **array** value (spec/design/array.md §2) — a shaped, row-major list of element values
     /// ([`ArrayVal`]). Shape (dimensionality, per-dimension lengths, lower bounds) is a property of
-    /// the *value*, not the type (PG-faithful, CLAUDE.md §4); the whole value is one `int32[]`
+    /// the *value*, not the type (PG-faithful, CLAUDE.md §4); the whole value is one `i32[]`
     /// regardless of its `ndim`. A NULL element is `Value::Null` of the element type; the empty
     /// array `{}` is `ndim = 0` (no elements). Comparison uses PG **btree** semantics (NULLs
     /// comparable and mutually equal — *not* the composite 3VL rule, §5), so `PartialEq`/`Eq`/`Hash`
@@ -157,7 +157,7 @@ impl ArrayVal {
     }
 }
 
-/// A `float64`'s canonical bits for the TOTAL order (spec/design/float.md §3): collapse `-0.0`
+/// A `f64`'s canonical bits for the TOTAL order (spec/design/float.md §3): collapse `-0.0`
 /// to `+0.0` and every NaN bit pattern to one canonical quiet NaN, leaving every other value's
 /// bits unchanged. Equality, hashing, dedup, and key encoding all act on this canonical form, so
 /// `-0 = +0` and `NaN = NaN` while a stored value's *original* bits are preserved by the codec.
@@ -173,7 +173,7 @@ pub(crate) fn canon_f64_bits(x: f64) -> u64 {
     }
 }
 
-/// As [`canon_f64_bits`], for `float32` (binary32): one canonical quiet NaN, `-0 → +0`.
+/// As [`canon_f64_bits`], for `f32` (binary32): one canonical quiet NaN, `-0 → +0`.
 pub(crate) fn canon_f32_bits(x: f32) -> u32 {
     if x.is_nan() {
         0x7fc0_0000
@@ -204,7 +204,7 @@ pub(crate) fn total_cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {
     }
 }
 
-/// As [`total_cmp_f64`], for `float32` (binary32) — the same PG total order at single precision.
+/// As [`total_cmp_f64`], for `f32` (binary32) — the same PG total order at single precision.
 pub(crate) fn total_cmp_f32(a: f32, b: f32) -> std::cmp::Ordering {
     use std::cmp::Ordering;
     let (an, bn) = (a.is_nan(), b.is_nan());
@@ -413,7 +413,7 @@ impl Value {
             (Value::Bool(a), Value::Bool(b)) => bool3(a == b),
             // Floats compare by the PG TOTAL order (spec/design/float.md §3): `-0 = +0` and
             // `NaN = NaN` (so `NaN = NaN` is TRUE in jed). Same-width only — the resolver
-            // promotes a mixed-width pair to float64 (an implicit cast) before eval.
+            // promotes a mixed-width pair to f64 (an implicit cast) before eval.
             (Value::Float32(a), Value::Float32(b)) => {
                 bool3(total_cmp_f32(*a, *b) == std::cmp::Ordering::Equal)
             }
@@ -422,10 +422,10 @@ impl Value {
             }
             (Value::Bytea(a), Value::Bytea(b)) => bool3(a == b),
             (Value::Uuid(a), Value::Uuid(b)) => bool3(a == b),
-            // Timestamps compare by the int64 instant; infinity is just an extreme value.
+            // Timestamps compare by the i64 instant; infinity is just an extreme value.
             (Value::Timestamp(a), Value::Timestamp(b)) => bool3(a == b),
             (Value::Timestamptz(a), Value::Timestamptz(b)) => bool3(a == b),
-            // Dates compare by the int32 day count; infinity is just an extreme value.
+            // Dates compare by the i32 day count; infinity is just an extreme value.
             (Value::Date(a), Value::Date(b)) => bool3(a == b),
             // Intervals compare by the canonical 128-bit span (spec/design/interval.md §2).
             (Value::Interval(a), Value::Interval(b)) => bool3(a == b),
@@ -1187,7 +1187,7 @@ fn bool3(b: bool) -> ThreeValued {
     }
 }
 
-/// Render a `float64` as its native shortest-round-trip decimal, with PG-style special-value
+/// Render a `f64` as its native shortest-round-trip decimal, with PG-style special-value
 /// spellings (spec/design/float.md §9). Rust's `{}` is already shortest-round-trip and prints
 /// `-0` for negative zero, but spells infinity `inf`/`-inf` and NaN `NaN`; PG (and the corpus)
 /// want `Infinity` / `-Infinity` / `NaN`, so those three are spelled here. The layout of finite
@@ -1206,7 +1206,7 @@ fn render_f64(f: f64) -> String {
     }
 }
 
-/// As [`render_f64`], for `float32` — `f32::to_string()` is the binary32 shortest round trip.
+/// As [`render_f64`], for `f32` — `f32::to_string()` is the binary32 shortest round trip.
 fn render_f32(f: f32) -> String {
     if f.is_nan() {
         "NaN".to_string()

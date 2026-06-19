@@ -7,10 +7,10 @@
 # FIRST|LAST overrides that default regardless of direction. The sort is unmetered (cost.md
 # §3): cost = storage_row_read per scanned row + row_produced per produced row (+ filter
 # operator_eval); multi-key/NULLS placement adds nothing.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.order_by_keys, query.comparison_order, query.limit, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.order_by_keys, query.comparison_order, query.limit, types.i32, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
 
 # Deliberate ties in `a` (rows 1,2,4 all have a=10) and NULLs in both `a` (row 5) and `b`
 # (row 2) to exercise secondary keys, stable tie-breaking, and NULL placement.
@@ -176,7 +176,7 @@ SELECT a FROM t ORDER BY nope
 # over an empty input. LIMIT windows the same empty input to nothing. (The DISTINCT counterpart
 # lives in distinct.test.)
 statement ok
-CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+CREATE TABLE e (id i32 PRIMARY KEY, a i32)
 
 # names: a
 # cost: 0

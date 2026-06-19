@@ -1,9 +1,9 @@
 # NULL storage and three-valued logic (CLAUDE.md §4).
 # Format + the `requires` directive: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.is_null, query.order_by, types.int16, types.int32, types.int64, types.decimal, types.text, types.boolean_storable, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, null.three_valued, expr.arithmetic, expr.unary_minus, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.is_null, query.order_by, types.i16, types.i32, types.i64, types.decimal, types.text, types.boolean_storable, types.bytea, types.uuid, types.timestamp, types.timestamptz, types.interval, null.three_valued, expr.arithmetic, expr.unary_minus, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v int16)
+CREATE TABLE t (id i32 PRIMARY KEY, v i16)
 
 statement ok
 INSERT INTO t VALUES (1, 10)
@@ -94,7 +94,7 @@ NULL
 # UNKNOWN), TRUE for a NULL value and FALSE for a present one. One consolidated table holds a column
 # of each shipped scalar; row 1 is fully populated (all IS NULL false), row 2 is all-NULL (all true).
 statement ok
-CREATE TABLE allt (id int32 PRIMARY KEY, a int16, b int64, c numeric, t text, bl boolean, by bytea, u uuid, ts timestamp, tz timestamptz, iv interval)
+CREATE TABLE allt (id i32 PRIMARY KEY, a i16, b i64, c numeric, t text, bl boolean, by bytea, u uuid, ts timestamp, tz timestamptz, iv interval)
 
 statement ok
 INSERT INTO allt VALUES (1, 1, 2, 3.5, 'x', true, '\x01', '00000000-0000-0000-0000-000000000001', '2024-01-01 00:00:00', '2024-01-01 00:00:00+00', '1 day')
@@ -131,7 +131,7 @@ true
 true
 true
 
-# IS NOT NULL is the exact complement (a representative spread: int16, text, interval).
+# IS NOT NULL is the exact complement (a representative spread: i16, text, interval).
 # 2 scan + 2x3 IsNotNull evals (6) + 2 produced + 1 page = 11.
 # cost: 11
 query IBBB nosort

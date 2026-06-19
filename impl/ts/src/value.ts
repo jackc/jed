@@ -1,8 +1,8 @@
 // Runtime values and three-valued (Kleene) logic.
 //
 // A Value is SQL NULL, an integer, a boolean, or text. Integers are held as `bigint`
-// regardless of declared column type (so int64 is exact — JS `number` cannot represent
-// the full int64 range); the declared type governs range checks and key-encoding width.
+// regardless of declared column type (so i64 is exact — JS `number` cannot represent
+// the full i64 range); the declared type governs range checks and key-encoding width.
 // A "bool" Value is produced by comparisons and connectives, can be projected/rendered,
 // and — now that boolean is storable (spec/design/types.md §9) — is stored in a boolean
 // column; a NULL boolean (unknown) is the "null" Value, so {true, false, NULL} is the
@@ -17,18 +17,18 @@ export type Value =
   | { kind: "null" }
   | { kind: "int"; int: bigint }
   | { kind: "bool"; value: boolean }
-  // A zoneless timestamp / UTC-instant timestamptz; micros is the int64 microsecond instant
+  // A zoneless timestamp / UTC-instant timestamptz; micros is the i64 microsecond instant
   // (held as `bigint`, never `number` — the sentinels NEG_INFINITY/POS_INFINITY are
   // -infinity/+infinity). They compare by the instant and never cross-family (timestamp.ts).
   | { kind: "timestamp"; micros: bigint }
   | { kind: "timestamptz"; micros: bigint }
-  // A calendar date; days is the int32 day count since 1970-01-01 (held as `bigint`, the core's
+  // A calendar date; days is the i32 day count since 1970-01-01 (held as `bigint`, the core's
   // uniform-integer discipline; the sentinels DATE_NEG_INFINITY/DATE_POS_INFINITY are
   // -infinity/+infinity). Compares by the day count; renders YYYY-MM-DD (spec/design/date.md).
   | { kind: "date"; days: bigint }
   // An interval span — months/days/micros (spec/design/interval.md). Comparison/dedup go through
   // the canonical 128-bit span (intervalSpan), NOT field equality, so '1 mon' == '30 days' while
-  // render preserves each value's fields. micros is a bigint (int64 exactness).
+  // render preserves each value's fields. micros is a bigint (i64 exactness).
   | { kind: "interval"; iv: Interval }
   // The first stored non-integer value; compares by the C collation (UTF-8 byte /
   // code-point order — spec/design/types.md §11). NOT compared with JS `<`/localeCompare,
@@ -38,14 +38,14 @@ export type Value =
   // (1.5 == 1.50) and goes through eq3/cmpValue / the DISTINCT value-canonical key.
   | { kind: "decimal"; dec: Decimal }
   // An IEEE 754 binary float (spec/design/float.md). `value` is a plain JS number — which IS
-  // binary64, so a float64's number is exact; a float32's number is ALWAYS the `Math.fround`'d
+  // binary64, so a f64's number is exact; a f32's number is ALWAYS the `Math.fround`'d
   // value (true binary32), maintained by every constructor/op/cast/literal. NaN/±Infinity are
   // first-class. Comparison/dedup/keys use the TOTAL order (floatTotalCmp): -0 == +0, NaN == NaN,
   // NaN largest — NOT JS `<`/`===` (which give NaN!==NaN and -0===+0 wrong for ordering). Storage
   // preserves the bits verbatim (a stored -0.0 keeps its sign); canonicalization is a compare/key
   // concern only.
-  | { kind: "float32"; value: number }
-  | { kind: "float64"; value: number }
+  | { kind: "f32"; value: number }
+  | { kind: "f64"; value: number }
   // A raw byte string (the bytea column type); compares by UNSIGNED byte order (§13). It
   // holds a Uint8Array — already raw bytes, so unlike text there is NO UTF-16 trap here.
   | { kind: "bytea"; bytes: Uint8Array }
@@ -116,17 +116,17 @@ export function decimalValue(d: Decimal): Value {
   return { kind: "decimal", dec: d };
 }
 
-// float64Value builds a non-null float64 value (the number IS already binary64; verbatim bits).
+// float64Value builds a non-null f64 value (the number IS already binary64; verbatim bits).
 export function float64Value(n: number): Value {
-  return { kind: "float64", value: n };
+  return { kind: "f64", value: n };
 }
 
-// float32Value builds a non-null float32 value, rounding to binary32 via Math.fround so the
-// stored number is exactly the value the float32 width represents (spec/design/float.md §2).
-// Every caller building a float32 — literal, cast, arithmetic result, decode — goes through here
-// (or Math.fround directly) so a binary64-precision number can never leak into a float32 value.
+// float32Value builds a non-null f32 value, rounding to binary32 via Math.fround so the
+// stored number is exactly the value the f32 width represents (spec/design/float.md §2).
+// Every caller building a f32 — literal, cast, arithmetic result, decode — goes through here
+// (or Math.fround directly) so a binary64-precision number can never leak into a f32 value.
 export function float32Value(n: number): Value {
-  return { kind: "float32", value: Math.fround(n) };
+  return { kind: "f32", value: Math.fround(n) };
 }
 
 // canonFloat maps -0 → +0 for comparison / dedup / key encoding (NOT for storage, which keeps the
@@ -163,12 +163,12 @@ export function uuidValue(b: Uint8Array): Value {
   return { kind: "uuid", bytes: b };
 }
 
-// timestampValue builds a non-null timestamp from its int64 microsecond instant.
+// timestampValue builds a non-null timestamp from its i64 microsecond instant.
 export function timestampValue(m: bigint): Value {
   return { kind: "timestamp", micros: m };
 }
 
-// timestamptzValue builds a non-null timestamptz from its int64 microsecond instant.
+// timestamptzValue builds a non-null timestamptz from its i64 microsecond instant.
 export function timestamptzValue(m: bigint): Value {
   return { kind: "timestamptz", micros: m };
 }
@@ -178,7 +178,7 @@ export function intervalValue(iv: Interval): Value {
   return { kind: "interval", iv };
 }
 
-// dateValue builds a non-null date from its int32 day count since 1970-01-01 (as a bigint).
+// dateValue builds a non-null date from its i32 day count since 1970-01-01 (as a bigint).
 export function dateValue(days: bigint): Value {
   return { kind: "date", days };
 }
@@ -375,10 +375,10 @@ export function render(v: Value): string {
       // Decimal renders as its canonical base-10 string, preserving display scale
       // (the D tag — spec/design/decimal.md §6).
       return v.dec.render();
-    case "float32":
-    case "float64":
+    case "f32":
+    case "f64":
       // Native shortest-round-trip (JS Number#toString), the R tag (spec/design/float.md §9).
-      // float32's value is already Math.fround'd (binary32), so its toString is the shortest
+      // f32's value is already Math.fround'd (binary32), so its toString is the shortest
       // form of the binary32 value. Specials render PG-style. NOTE the JS quirk: (-0).toString()
       // is "0" (and (+0).toString() is "0"), so -0 is special-cased to "-0"; Infinity.toString()
       // is already "Infinity"/"−" handled, and NaN.toString() is "NaN". Layout (exponent
@@ -868,15 +868,15 @@ export function eq3(a: Value, b: Value): ThreeValued {
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c === 0);
   // Floats compare by the TOTAL order (NaN == NaN TRUE, -0 == +0). A mixed-width float pair never
-  // reaches here — the resolver promotes both to float64 first. float is a strict island, so a
+  // reaches here — the resolver promotes both to f64 first. float is a strict island, so a
   // float never compares with int/decimal (resolver rejects 42804).
-  if (a.kind === "float32" && b.kind === "float32") return bool3(floatTotalCmp(a.value, b.value) === 0);
-  if (a.kind === "float64" && b.kind === "float64") return bool3(floatTotalCmp(a.value, b.value) === 0);
+  if (a.kind === "f32" && b.kind === "f32") return bool3(floatTotalCmp(a.value, b.value) === 0);
+  if (a.kind === "f64" && b.kind === "f64") return bool3(floatTotalCmp(a.value, b.value) === 0);
   if (a.kind === "text" && b.kind === "text") return bool3(a.text === b.text);
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) === 0);
   if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) === 0);
   if (a.kind === "bool" && b.kind === "bool") return bool3(a.value === b.value);
-  // Timestamps compare by the int64 instant (infinity is just an extreme value).
+  // Timestamps compare by the i64 instant (infinity is just an extreme value).
   if (a.kind === "timestamp" && b.kind === "timestamp") return bool3(a.micros === b.micros);
   if (a.kind === "timestamptz" && b.kind === "timestamptz") return bool3(a.micros === b.micros);
   if (a.kind === "date" && b.kind === "date") return bool3(a.days === b.days);
@@ -1001,8 +1001,8 @@ export function lt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c < 0);
-  if (a.kind === "float32" && b.kind === "float32") return bool3(floatTotalCmp(a.value, b.value) < 0);
-  if (a.kind === "float64" && b.kind === "float64") return bool3(floatTotalCmp(a.value, b.value) < 0);
+  if (a.kind === "f32" && b.kind === "f32") return bool3(floatTotalCmp(a.value, b.value) < 0);
+  if (a.kind === "f64" && b.kind === "f64") return bool3(floatTotalCmp(a.value, b.value) < 0);
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) < 0);
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) < 0);
   if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) < 0);
@@ -1032,8 +1032,8 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "null" || b.kind === "null") return "unknown";
   const c = numericCmp(a, b);
   if (c !== undefined) return bool3(c > 0);
-  if (a.kind === "float32" && b.kind === "float32") return bool3(floatTotalCmp(a.value, b.value) > 0);
-  if (a.kind === "float64" && b.kind === "float64") return bool3(floatTotalCmp(a.value, b.value) > 0);
+  if (a.kind === "f32" && b.kind === "f32") return bool3(floatTotalCmp(a.value, b.value) > 0);
+  if (a.kind === "f64" && b.kind === "f64") return bool3(floatTotalCmp(a.value, b.value) > 0);
   if (a.kind === "text" && b.kind === "text") return bool3(compareTextC(a.text, b.text) > 0);
   if (a.kind === "bytea" && b.kind === "bytea") return bool3(compareBytea(a.bytes, b.bytes) > 0);
   if (a.kind === "uuid" && b.kind === "uuid") return bool3(compareBytea(a.bytes, b.bytes) > 0);

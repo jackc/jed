@@ -233,7 +233,7 @@ mod tests {
         let mut db = Database::new();
         execute(
             &mut db,
-            "CREATE TABLE t (id int32 PRIMARY KEY, name text, score numeric(5,2), ok boolean DEFAULT true)",
+            "CREATE TABLE t (id i32 PRIMARY KEY, name text, score numeric(5,2), ok boolean DEFAULT true)",
         )
         .unwrap();
         db

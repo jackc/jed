@@ -49,16 +49,16 @@ function names(db: Database, table: string): string[] {
 // index name as written.
 test("constraint naming matches PostgreSQL", () => {
   const db = new Database();
-  run(db, "CREATE TABLE other (x int32)");
+  run(db, "CREATE TABLE other (x i32)");
   run(db, "CREATE INDEX walk_a_key ON other (x)"); // occupies the derived base
   run(
     db,
-    "CREATE TABLE Walk (a int32 UNIQUE, b int32, CONSTRAINT Named UNIQUE (b, a), " +
+    "CREATE TABLE Walk (a i32 UNIQUE, b i32, CONSTRAINT Named UNIQUE (b, a), " +
       "CONSTRAINT walk_b_check CHECK (b > 0), UNIQUE (b))",
   );
   assert.deepEqual(names(db, "walk"), ["Named!", "walk_a_key1!", "walk_b_key!"]);
   // A derived name walks past a CHECK name too (PG-probed: w1_a_key -> w1_a_key1).
-  run(db, "CREATE TABLE w1 (a int32, CONSTRAINT w1_a_key CHECK (a > 0), UNIQUE (a))");
+  run(db, "CREATE TABLE w1 (a i32, CONSTRAINT w1_a_key CHECK (a > 0), UNIQUE (a))");
   assert.deepEqual(names(db, "w1"), ["w1_a_key1!"]);
 });
 
@@ -67,23 +67,23 @@ test("constraint naming matches PostgreSQL", () => {
 // identical to the primary key's folds away entirely; a differing ORDER is distinct.
 test("dedup and PK fold match PostgreSQL", () => {
   const db = new Database();
-  run(db, "CREATE TABLE e3 (a int32 UNIQUE UNIQUE, UNIQUE (a))");
+  run(db, "CREATE TABLE e3 (a i32 UNIQUE UNIQUE, UNIQUE (a))");
   assert.deepEqual(names(db, "e3"), ["e3_a_key!"]);
   // An unnamed-then-named pair keeps the NAME (PG: p1 kept "named").
-  run(db, "CREATE TABLE p1 (a int32 UNIQUE, CONSTRAINT named UNIQUE (a))");
+  run(db, "CREATE TABLE p1 (a i32 UNIQUE, CONSTRAINT named UNIQUE (a))");
   assert.deepEqual(names(db, "p1"), ["named!"]);
   // Two named duplicates keep the FIRST (PG: e7 kept "x").
-  run(db, "CREATE TABLE e7 (a int32, CONSTRAINT x UNIQUE (a), CONSTRAINT y UNIQUE (a))");
+  run(db, "CREATE TABLE e7 (a i32, CONSTRAINT x UNIQUE (a), CONSTRAINT y UNIQUE (a))");
   assert.deepEqual(names(db, "e7"), ["x!"]);
   // The PK absorbs an identical list — regardless of declaration order or form.
-  run(db, "CREATE TABLE e5 (a int32 PRIMARY KEY UNIQUE)");
+  run(db, "CREATE TABLE e5 (a i32 PRIMARY KEY UNIQUE)");
   assert.deepEqual(names(db, "e5"), []);
-  run(db, "CREATE TABLE p2 (a int32 UNIQUE, PRIMARY KEY (a))");
+  run(db, "CREATE TABLE p2 (a i32 UNIQUE, PRIMARY KEY (a))");
   assert.deepEqual(names(db, "p2"), []);
-  run(db, "CREATE TABLE e9 (a int32, b int32, PRIMARY KEY (a, b), UNIQUE (a, b))");
+  run(db, "CREATE TABLE e9 (a i32, b i32, PRIMARY KEY (a, b), UNIQUE (a, b))");
   assert.deepEqual(names(db, "e9"), []);
   // A differing member ORDER is a distinct constraint (PG: p3 kept both).
-  run(db, "CREATE TABLE p3 (a int32, b int32, PRIMARY KEY (a, b), UNIQUE (b, a))");
+  run(db, "CREATE TABLE p3 (a i32, b i32, PRIMARY KEY (a, b), UNIQUE (b, a))");
   assert.deepEqual(names(db, "p3"), ["p3_b_a_key!"]);
 });
 
@@ -93,33 +93,33 @@ test("dedup and PK fold match PostgreSQL", () => {
 // table's constraint names).
 test("DDL errors match PostgreSQL", () => {
   const db = new Database();
-  run(db, "CREATE TABLE other (x int32)");
-  assert.equal(errInfo(() => run(db, "CREATE TABLE e2 (a int32, UNIQUE (nosuch))")).code, "42703");
-  assert.equal(errInfo(() => run(db, "CREATE TABLE e1 (a int32, UNIQUE (a, a))")).code, "42701");
-  assert.equal(errInfo(() => run(db, "CREATE TABLE e6 (a int32, s text UNIQUE)")).code, "0A000");
+  run(db, "CREATE TABLE other (x i32)");
+  assert.equal(errInfo(() => run(db, "CREATE TABLE e2 (a i32, UNIQUE (nosuch))")).code, "42703");
+  assert.equal(errInfo(() => run(db, "CREATE TABLE e1 (a i32, UNIQUE (a, a))")).code, "42701");
+  assert.equal(errInfo(() => run(db, "CREATE TABLE e6 (a i32, s text UNIQUE)")).code, "0A000");
   // UNIQUE members resolve BEFORE any CHECK validates (PG: z1/z2), in either order.
   assert.equal(
-    errInfo(() => run(db, "CREATE TABLE z1 (a int32, CHECK (nosuch1 > 0), UNIQUE (nosuch2))")).code,
+    errInfo(() => run(db, "CREATE TABLE z1 (a i32, CHECK (nosuch1 > 0), UNIQUE (nosuch2))")).code,
     "42703",
   );
   assert.match(
-    errInfo(() => run(db, "CREATE TABLE z2 (a int32, UNIQUE (nosuch2), CHECK (nosuch1 > 0))"))
+    errInfo(() => run(db, "CREATE TABLE z2 (a i32, UNIQUE (nosuch2), CHECK (nosuch1 > 0))"))
       .message,
     /nosuch2/,
   );
   // An explicit constraint name collides in the RELATION namespace: an existing table,
   // the table being created (PG: p4), and a same-statement sibling (PG: e8).
   assert.equal(
-    errInfo(() => run(db, "CREATE TABLE c2 (a int32, CONSTRAINT other UNIQUE (a))")).code,
+    errInfo(() => run(db, "CREATE TABLE c2 (a i32, CONSTRAINT other UNIQUE (a))")).code,
     "42P07",
   );
   assert.equal(
-    errInfo(() => run(db, "CREATE TABLE p4 (a int32, CONSTRAINT p4 UNIQUE (a))")).code,
+    errInfo(() => run(db, "CREATE TABLE p4 (a i32, CONSTRAINT p4 UNIQUE (a))")).code,
     "42P07",
   );
   assert.equal(
     errInfo(() =>
-      run(db, "CREATE TABLE e8 (a int32, CONSTRAINT x UNIQUE (a), b int32, CONSTRAINT x UNIQUE (b))"),
+      run(db, "CREATE TABLE e8 (a i32, CONSTRAINT x UNIQUE (a), b i32, CONSTRAINT x UNIQUE (b))"),
     ).code,
     "42P07",
   );
@@ -127,18 +127,18 @@ test("DDL errors match PostgreSQL", () => {
   // (PG: z4/z5 — both report when the unique constraint is created).
   assert.equal(
     errInfo(() =>
-      run(db, "CREATE TABLE z4 (a int32, CONSTRAINT zc CHECK (a > 0), CONSTRAINT zc UNIQUE (a))"),
+      run(db, "CREATE TABLE z4 (a i32, CONSTRAINT zc CHECK (a > 0), CONSTRAINT zc UNIQUE (a))"),
     ).code,
     "42710",
   );
   assert.equal(
     errInfo(() =>
-      run(db, "CREATE TABLE z5 (a int32, CONSTRAINT zc UNIQUE (a), CONSTRAINT zc CHECK (a > 0))"),
+      run(db, "CREATE TABLE z5 (a i32, CONSTRAINT zc UNIQUE (a), CONSTRAINT zc CHECK (a > 0))"),
     ).code,
     "42710",
   );
   // CREATE UNIQUE <not-index> is a syntax error.
-  assert.equal(errInfo(() => run(db, "CREATE UNIQUE TABLE t (a int32)")).code, "42601");
+  assert.equal(errInfo(() => run(db, "CREATE UNIQUE TABLE t (a i32)")).code, "42601");
 });
 
 // INSERT enforcement (indexes.md §8): a duplicate against the store or within the batch
@@ -149,7 +149,7 @@ test("INSERT enforcement", () => {
   const db = new Database();
   run(
     db,
-    "CREATE TABLE t (id int32 PRIMARY KEY, v int32 UNIQUE, w int32, " +
+    "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32, " +
       "CONSTRAINT wv UNIQUE (w, v), CHECK (id < 100))",
   );
   run(db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)");
@@ -169,7 +169,7 @@ test("INSERT enforcement", () => {
   run(db, "INSERT INTO t VALUES (6, NULL, 300), (7, NULL, 300)");
   // A fully non-NULL composite duplicate traps, naming the composite index (its own
   // table — beside t_v_key the component dup would always be reported first).
-  run(db, "CREATE TABLE c (id int32 PRIMARY KEY, w int32, v int32, CONSTRAINT wv2 UNIQUE (w, v))");
+  run(db, "CREATE TABLE c (id i32 PRIMARY KEY, w i32, v i32, CONSTRAINT wv2 UNIQUE (w, v))");
   run(db, "INSERT INTO c VALUES (1, 40, 400)");
   assert.match(errInfo(() => run(db, "INSERT INTO c VALUES (2, 40, 400)")).message, /wv2/);
   // A distinct pair sharing one component is a different tuple — allowed.
@@ -193,7 +193,7 @@ test("INSERT enforcement", () => {
 // untouched rows and in-batch collisions trap 23505; nothing is written on failure.
 test("UPDATE enforcement validates the end state", () => {
   const db = new Database();
-  run(db, "CREATE TABLE m (id int32 PRIMARY KEY, v int32 UNIQUE)");
+  run(db, "CREATE TABLE m (id i32 PRIMARY KEY, v i32 UNIQUE)");
   run(db, "INSERT INTO m VALUES (1, 1), (2, 2), (3, 30)");
   // PG fails both of these on the transient per-row collision; jed's end state is unique.
   run(db, "UPDATE m SET v = v + 1 WHERE id < 3"); // 1,2 -> 2,3
@@ -218,7 +218,7 @@ test("UPDATE enforcement validates the end state", () => {
 // thereafter it enforces like a constraint-backed index. The auto-name keeps _idx.
 test("CREATE UNIQUE INDEX build verification", () => {
   const db = new Database();
-  run(db, "CREATE TABLE d (id int32 PRIMARY KEY, a int32, n int32)");
+  run(db, "CREATE TABLE d (id i32 PRIMARY KEY, a i32, n i32)");
   run(db, "INSERT INTO d VALUES (1, 7, NULL), (2, 7, NULL), (3, 8, 5)");
   // Build over duplicates fails and registers nothing.
   const e = errInfo(() => run(db, "CREATE UNIQUE INDEX dup ON d (a)"));
@@ -226,7 +226,7 @@ test("CREATE UNIQUE INDEX build verification", () => {
   assert.match(e.message, /dup/);
   assert.deepEqual(names(db, "d"), []);
   // The name is free again (nothing was created).
-  run(db, "CREATE TABLE dup (x int32)");
+  run(db, "CREATE TABLE dup (x i32)");
   run(db, "DROP TABLE dup");
   // NULLs are exempt at build time (two NULLs in n).
   run(db, "CREATE UNIQUE INDEX ON d (n)"); // d_n_idx — the _idx auto-name
@@ -241,7 +241,7 @@ test("CREATE UNIQUE INDEX build verification", () => {
 // name is the constraint's only handle).
 test("DROP INDEX drops the constraint", () => {
   const db = new Database();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32 UNIQUE)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE)");
   run(db, "INSERT INTO t VALUES (1, 10)");
   assert.equal(errInfo(() => run(db, "INSERT INTO t VALUES (2, 10)")).code, "23505");
   run(db, "DROP INDEX t_v_key");
@@ -254,7 +254,7 @@ test("DROP INDEX drops the constraint", () => {
 // scan. The planner treats a unique index like any other (the bounded-scan cost).
 test("costs are unchanged by unique", () => {
   const db = new Database();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32, w int32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32)");
   for (let i = 1; i <= 20; i++) {
     run(db, `INSERT INTO t VALUES (${i}, ${i % 5}, ${i})`);
   }
@@ -271,7 +271,7 @@ test("costs are unchanged by unique", () => {
 // database still enforces), and the image is byte-stable across a second serialize.
 test("round-trip preserves unique", () => {
   const db = new Database();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32 UNIQUE, w int32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32 UNIQUE, w i32)");
   run(db, "CREATE INDEX plain ON t (w)");
   run(db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 100)");
   const image = toImage(db, 8192, 1n);
@@ -286,7 +286,7 @@ test("round-trip preserves unique", () => {
 // definition, no store, no enforcement (the §3 snapshot model).
 test("transactional DDL rolls back", () => {
   const db = new Database();
-  run(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   run(db, "INSERT INTO t VALUES (1, 10)");
   run(db, "BEGIN");
   run(db, "CREATE UNIQUE INDEX u ON t (v)");

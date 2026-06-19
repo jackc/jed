@@ -33,7 +33,7 @@ fn scalar(db: &mut Database, sql: &str) -> Value {
 #[test]
 fn comparisons_project_booleans() {
     let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)",
         "INSERT INTO t VALUES (1, 5, 5)",
         "INSERT INTO t VALUES (2, 5, 9)",
         "INSERT INTO t VALUES (3, 5, NULL)",

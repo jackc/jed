@@ -35,13 +35,13 @@ class OracleImport
 
   # jed canonical type names -> the PG / SQL-standard spelling PG parses. A skeleton authored
   # in the common subset (smallint/integer/bigint) needs no rewrite; this lets us also replay
-  # the existing corpus, which uses jed's canonical int16/int32/int64.
-  # float64/float32 -> the SQL-standard spellings PG's ConstTypename grammar accepts in a
+  # the existing corpus, which uses jed's canonical i16/i32/i64.
+  # f64/f32 -> the SQL-standard spellings PG's ConstTypename grammar accepts in a
   # `typename 'literal'` const (double precision / real — float.md §2; float8/float4 are not in
   # that production). Only these two appear in the corpus; no other rewrite is needed.
   TYPE_REWRITE = {
-    "int16" => "smallint", "int32" => "integer", "int64" => "bigint",
-    "float64" => "double precision", "float32" => "real",
+    "i16" => "smallint", "i32" => "integer", "i64" => "bigint",
+    "f64" => "double precision", "f32" => "real",
   }.freeze
 
   # PG result-column type (from \gdesc) -> the conformance coltype tag (conformance.md §1).

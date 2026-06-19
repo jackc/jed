@@ -4,10 +4,10 @@
 # `/* */` block comments NEST per PG / the SQL standard; comment openers inside a '...'
 # string are ordinary text; an unterminated block comment is 42601. Comments are token
 # separators and never survive into the AST.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.point_lookup, expr.arithmetic, expr.unary_minus, types.int32, types.text
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.point_lookup, expr.arithmetic, expr.unary_minus, types.i32, types.text
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v int32, s text)
+CREATE TABLE t (id i32 PRIMARY KEY, v i32, s text)
 
 statement ok
 INSERT INTO t VALUES (1, 10, '--x /*y*/')

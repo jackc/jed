@@ -5,7 +5,7 @@
 	// Home (Phase 4) — clean & minimal: the north-star pitch, a LIVE in-memory jed database the
 	// visitor can edit and run in their browser, and the key properties. No server is involved.
 	const seed = `CREATE TABLE person (
-  id    int32 PRIMARY KEY,
+  id    i32 PRIMARY KEY,
   name  text NOT NULL,
   score numeric(6,2)
 );

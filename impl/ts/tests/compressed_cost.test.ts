@@ -33,9 +33,9 @@ function cost(db: Database, sql: string): bigint {
 // both. Same tree shape (one leaf each), so cost deltas isolate the compression units.
 function twoTables(): Database {
   const db = smallPageDb();
-  execute(db, "CREATE TABLE comp (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)");
   execute(db, `INSERT INTO comp VALUES (1, '${"x".repeat(600)}'), (2, 'small')`);
-  execute(db, "CREATE TABLE control (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE control (id i32 PRIMARY KEY, body text)");
   execute(db, "INSERT INTO control VALUES (1, 'tiny'), (2, 'small')");
   return db;
 }
@@ -52,9 +52,9 @@ test("external-compressed charges chain pages plus decompress slabs", () => {
   // over RECORD_MAX → 0x04 external-compressed: ceil(212/244) = 1 chain page_read PLUS
   // ceil(400/244) = 2 value_decompress slabs.
   const db = smallPageDb();
-  execute(db, "CREATE TABLE comp (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE comp (id i32 PRIMARY KEY, body text)");
   execute(db, `INSERT INTO comp VALUES (1, '${fillerText(200)}${"y".repeat(200)}')`);
-  execute(db, "CREATE TABLE control (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE control (id i32 PRIMARY KEY, body text)");
   execute(db, "INSERT INTO control VALUES (1, 'tiny')");
   assert.equal(cost(db, "SELECT * FROM comp"), cost(db, "SELECT * FROM control") + 1n + SLABS_400);
 });
@@ -74,7 +74,7 @@ test("bounded scan charges only admitted values and LIMIT does not lower", () =>
 
 test("INSERT meters compress attempts, adopted or rejected", () => {
   const db = smallPageDb();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, body text)");
   // A fully-inline row attempts nothing: INSERT stays zero-cost.
   assert.equal(cost(db, "INSERT INTO t VALUES (1, 'small')"), 0n);
   // An adopted compression (the "x" run) costs its ceil(600/244) = 3 attempt slabs ...
@@ -99,9 +99,9 @@ test("decimal payloads compress too", () => {
   // ceil(407/244) = 2 slabs both ways.
   const db = smallPageDb();
   const digits = "12".repeat(400) + ".5";
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, d numeric)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric)");
   assert.equal(cost(db, `INSERT INTO t VALUES (1, ${digits})`), 2n, "the compress attempt is metered");
-  execute(db, "CREATE TABLE control (id int32 PRIMARY KEY, d numeric)");
+  execute(db, "CREATE TABLE control (id i32 PRIMARY KEY, d numeric)");
   execute(db, "INSERT INTO control VALUES (1, 7)");
   assert.equal(cost(db, "SELECT * FROM t"), cost(db, "SELECT * FROM control") + 2n, "the decompress slabs are metered");
 });
@@ -121,7 +121,7 @@ test("a correlated outer reference is a touch", () => {
   // tables' row 2, so the two queries emit identical row counts and differ only in the
   // outer table's storage — isolating the SLABS_600 the outer reference charges.
   const db = twoTables();
-  execute(db, "CREATE TABLE probe (id int32 PRIMARY KEY, body text)");
+  execute(db, "CREATE TABLE probe (id i32 PRIMARY KEY, body text)");
   execute(db, "INSERT INTO probe VALUES (1, 'small')");
   const comp = cost(db, "SELECT id FROM comp WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = comp.body)");
   const control = cost(db, "SELECT id FROM control WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = control.body)");

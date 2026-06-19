@@ -6,10 +6,10 @@
 # literal range check), so a too-wide literal traps 22003 and a boolean vs a non-boolean
 # operand is 42804.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.is_distinct_from, types.int16, types.int32, types.boolean, compare.promotion, expr.comparison_value, expr.parens, null.three_valued
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, query.order_by, query.is_distinct_from, types.i16, types.i32, types.boolean, compare.promotion, expr.comparison_value, expr.parens, null.three_valued
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
 
 statement ok
 INSERT INTO t VALUES (1, 5, 5)
@@ -107,9 +107,9 @@ SELECT id FROM t WHERE a IS DISTINCT FROM b IS DISTINCT FROM b
 statement error 42804
 SELECT id FROM t WHERE (a = b) IS NOT DISTINCT FROM 1
 
-# Cross-type operands promote exactly like `=` (int16 vs int32 widen to int32).
+# Cross-type operands promote exactly like `=` (i16 vs i32 widen to i32).
 statement ok
-CREATE TABLE w (id int32 PRIMARY KEY, s int16, n int32)
+CREATE TABLE w (id i32 PRIMARY KEY, s i16, n i32)
 
 statement ok
 INSERT INTO w VALUES (1, 7, 7)

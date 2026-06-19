@@ -6,7 +6,7 @@
   (1.50 = 1.5)  AS equal_by_value,
   1.50          AS preserves_scale;`;
 
-	const overflowDemo = `SELECT CAST(32767 AS int16) + CAST(1 AS int16) AS overflows;`;
+	const overflowDemo = `SELECT CAST(32767 AS i16) + CAST(1 AS i16) AS overflows;`;
 
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
@@ -36,8 +36,8 @@ Every example below is a **live database in your browser**. Edit the SQL and run
 
 ## Integers with defined overflow
 
-Integers are fixed-width (`int16`, `int32`, `int64`) and **trap on overflow** — there is no silent
-wraparound. Adding `1` to the largest `int16` raises error `22003`:
+Integers are fixed-width (`i16`, `i32`, `i64`) and **trap on overflow** — there is no silent
+wraparound. Adding `1` to the largest `i16` raises error `22003`:
 
 <LiveSql query={overflowDemo} rows={3} />
 

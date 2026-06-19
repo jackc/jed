@@ -67,7 +67,7 @@ func retSetup(t *testing.T) *Database {
 	t.Helper()
 	db := NewDatabase()
 	for _, s := range []string{
-		"CREATE TABLE t (id int32 PRIMARY KEY, v int32 DEFAULT 7, w int32)",
+		"CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)",
 		"INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)",
 	} {
 		if _, err := Execute(db, s); err != nil {
@@ -108,7 +108,7 @@ func TestReturningOutputNamesAndExpressions(t *testing.T) {
 
 func TestInsertSelectReturning(t *testing.T) {
 	db := retSetup(t)
-	retRun(t, db, "CREATE TABLE src (a int32)")
+	retRun(t, db, "CREATE TABLE src (a i32)")
 	retRun(t, db, "INSERT INTO src VALUES (40), (41)")
 	// RETURNING belongs to the INSERT: it projects the INSERTED rows (defaults filled).
 	if g := retGrid(retRows(t, db, "INSERT INTO t (id) SELECT a FROM src RETURNING id, v")); g != "40,7|41,7" {
@@ -286,7 +286,7 @@ func TestReturningGrowsTheTouchedSet(t *testing.T) {
 	big := "INSERT INTO big VALUES (1, 0, '" + strings.Repeat("x", 100_000) + "')"
 	fresh := func() *Database {
 		db := NewDatabase()
-		retRun(t, db, "CREATE TABLE big (id int32 PRIMARY KEY, w int32, t text)")
+		retRun(t, db, "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)")
 		retRun(t, db, big)
 		return db
 	}
@@ -354,7 +354,7 @@ func TestOldNewQualifiersPerStatement(t *testing.T) {
 		t.Fatalf("got %s", g)
 	}
 	// INSERT ... SELECT takes the same mapping.
-	retRun(t, db, "CREATE TABLE src2 (a int32)")
+	retRun(t, db, "CREATE TABLE src2 (a i32)")
 	retRun(t, db, "INSERT INTO src2 VALUES (60)")
 	if g := retGrid(retRows(t, db, "INSERT INTO t (id) SELECT a FROM src2 RETURNING old.v, new.v")); g != "NULL,7" {
 		t.Fatalf("got %s", g)
@@ -379,7 +379,7 @@ func TestOldNewShadowedByTableName(t *testing.T) {
 	// A target table literally named old (or new) keeps the ordinary table-qualified
 	// meaning — the row-version pseudo-relation is suppressed (PG-probed).
 	db := NewDatabase()
-	retRun(t, db, "CREATE TABLE old (x int32)")
+	retRun(t, db, "CREATE TABLE old (x i32)")
 	if g := retGrid(retRows(t, db, "INSERT INTO old VALUES (1) RETURNING old.x")); g != "1" {
 		t.Fatalf("got %s", g) // the inserted value, NOT the NULL old side
 	}
@@ -393,7 +393,7 @@ func TestOldNewShadowedByTableName(t *testing.T) {
 	if g := retGrid(retRows(t, db, "DELETE FROM old RETURNING old.x")); g != "3" {
 		t.Fatalf("got %s", g) // bare semantics = the deleted value
 	}
-	retRun(t, db, "CREATE TABLE new (x int32)")
+	retRun(t, db, "CREATE TABLE new (x i32)")
 	if g := retGrid(retRows(t, db, "INSERT INTO new VALUES (9) RETURNING new.x")); g != "9" {
 		t.Fatalf("got %s", g)
 	}
@@ -404,7 +404,7 @@ func TestOldNewShadowedByTableName(t *testing.T) {
 
 func TestOldNewInSubqueries(t *testing.T) {
 	db := retSetup(t)
-	retRun(t, db, "CREATE TABLE s2 (a int32, b int32)")
+	retRun(t, db, "CREATE TABLE s2 (a i32, b i32)")
 	retRun(t, db, "INSERT INTO s2 VALUES (1, 500)")
 	// old/new resolve inside item subqueries like any outer reference (probed; jed has no
 	// FROM-less SELECT, so the single-row s2 anchors the scalar subqueries).
@@ -425,7 +425,7 @@ func TestOldNewTouchedSet(t *testing.T) {
 	big := "INSERT INTO big VALUES (1, 0, '" + strings.Repeat("x", 100_000) + "')"
 	fresh := func() *Database {
 		db := NewDatabase()
-		retRun(t, db, "CREATE TABLE big (id int32 PRIMARY KEY, w int32, t text)")
+		retRun(t, db, "CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)")
 		retRun(t, db, big)
 		return db
 	}

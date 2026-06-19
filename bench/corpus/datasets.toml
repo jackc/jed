@@ -20,20 +20,20 @@ seed = 101
 
 [[dataset.table.column]]
 name = "id"
-type = "int64"
+type = "i64"
 gen = "serial"
 primary_key = true
 
 [[dataset.table.column]]
 name = "customer_id"
-type = "int32"
+type = "i32"
 gen = "int_uniform"
 min = 1
 max = 1000
 
 [[dataset.table.column]]
 name = "amount"
-type = "int32"
+type = "i32"
 gen = "int_uniform"
 min = 0
 max = 99999
@@ -59,20 +59,20 @@ seed = 201
 
 [[dataset.table.column]]
 name = "id"
-type = "int64"
+type = "i64"
 gen = "serial"
 primary_key = true
 
 [[dataset.table.column]]
 name = "customer_id"
-type = "int32"
+type = "i32"
 gen = "int_uniform"
 min = 1
 max = 100000
 
 [[dataset.table.column]]
 name = "amount"
-type = "int32"
+type = "i32"
 gen = "int_uniform"
 min = 0
 max = 99999

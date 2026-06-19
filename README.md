@@ -30,14 +30,14 @@ impl/        native cores, one per language, each a downstream consumer of spec/
 
 All three cores agree byte-for-byte (CLAUDE.md §8): the on-disk format round-trip is
 `rust == go == ts == ruby`. The TS core is native (not a Rust→WASM wrapper) precisely to
-stress the spec on dimensions the systems cores hide — exact int64 (`bigint`), UTF-8 names,
+stress the spec on dimensions the systems cores hide — exact i64 (`bigint`), UTF-8 names,
 big-endian bytes.
 
 ## Build order & current status (CLAUDE.md §11)
 
 1. ✅ **Scaffold** the repo around `spec/`.
 2. ✅ **Type-system spec** — scalar set + comparison/coercion matrix as data. *Step-1
-   scope: signed integers only* (`int16`/`int32`/`int64`). See [spec/types/](spec/types/)
+   scope: signed integers only* (`i16`/`i32`/`i64`). See [spec/types/](spec/types/)
    and [spec/design/types.md](spec/design/types.md).
 3. ✅ **Conformance harness format + first corpus** — sqllogictest-style format, three-axis
    taxonomy (suites / capabilities / profiles), integer corpus. See
@@ -68,7 +68,7 @@ The six steps above are CLAUDE.md §11's "it's alive" bootstrap. Substantial wor
 since across **all three cores** (Rust, Go, TS) — forward work is tracked in
 **[TODO.md](TODO.md)**. Highlights:
 
-- **Type system** — the full scalar set: `decimal`/`numeric` (exact), `float32`/`float64`,
+- **Type system** — the full scalar set: `decimal`/`numeric` (exact), `f32`/`f64`,
   `text`, `boolean`, `bytea`, `uuid`, `timestamp`/`timestamptz`, `interval`; arithmetic, `CAST`
   and `::`, typed string literals.
 - **Query surface** — `JOIN` (inner/cross/left/right/full), `GROUP BY`/`HAVING`, aggregates,

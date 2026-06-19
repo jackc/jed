@@ -6,7 +6,7 @@
 # metered expression work (operator_eval per interior node per row) — the documented
 # exception to "VALUES inserts cost zero". spec/design/constraints.md §4, grammar.md §29.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.update, query.select, query.order_by, query.aggregates, types.int32, types.text, types.boolean_storable, types.decimal, expr.case, expr.between, expr.like, expr.in_list, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.check, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.update, query.select, query.order_by, query.aggregates, types.i32, types.text, types.boolean_storable, types.decimal, expr.case, expr.between, expr.like, expr.in_list, resource.cost_metering
 
 statement ok
 CREATE TABLE t (a int CHECK (a > 0), b int, CHECK (b > a))
@@ -228,7 +228,7 @@ CREATE TABLE e10 (a int, CHECK ())
 # overrides — and they sit LAST because PG's failure would poison the oracle's replayed
 # statement prefix for everything after them)
 statement ok
-CREATE TABLE odd (check int, constraint int16)
+CREATE TABLE odd (check int, constraint i16)
 
 statement ok
 INSERT INTO odd VALUES (1, 2)

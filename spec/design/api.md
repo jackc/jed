@@ -266,8 +266,8 @@ and the postfix `$1 :: int` ([grammar.md](grammar.md) §37) — so `$1 :: int` t
 and `$1 :: numeric(10,2)` types it decimal and re-scales the bound value to `(10,2)`. A parameter
 with **no derivable type** (e.g. a bare `SELECT $1`,
 or a gap in `$1..$N`) is `42P18 indeterminate_datatype`. Conflicting inferences for the same
-index (`int16` here, `text` there) are `42804 datatype_mismatch`. Two adaptable operands
-with no anchoring type (`$1 = $2`, `$1 = 5`) default the parameter to `int64`, matching the
+index (`i16` here, `text` there) are `42804 datatype_mismatch`. Two adaptable operands
+with no anchoring type (`$1 = $2`, `$1 = 5`) default the parameter to `i64`, matching the
 existing integer-literal default (a documented local-consistency divergence from PG).
 
 **Binding is two-phase / all-or-nothing**, like `INSERT`/`UPDATE`: every supplied value is

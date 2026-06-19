@@ -1,6 +1,6 @@
 // Cross-check: the TS interval parser/renderer reproduces the byte-exact vectors in
 // spec/encoding/intervals.toml (CLAUDE.md §8) — identical to the Rust/Go cores. All cascade/span
-// math is bigint (number loses int64 precision).
+// math is bigint (number loses i64 precision).
 
 import assert from "node:assert/strict";
 import { test } from "node:test";

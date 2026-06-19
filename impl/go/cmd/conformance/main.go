@@ -186,7 +186,7 @@ func parseSeedDirective(line string) (uint64, bool) {
 }
 
 // parseClockDirective parses a `# clock: N` directive line (entropy.md §6): the fixed statement
-// clock (int64 micros since the Unix epoch) to run the next record under, fixing uuidv7's instant.
+// clock (i64 micros since the Unix epoch) to run the next record under, fixing uuidv7's instant.
 func parseClockDirective(line string) (int64, bool) {
 	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "clock:")
 	if !ok {
@@ -255,7 +255,7 @@ func assertNames(expected []string, actual []string, sql string) error {
 	return nil
 }
 
-// parseTypesDirective parses a `# types: int16, text, decimal` directive line. Returns the
+// parseTypesDirective parses a `# types: i16, text, decimal` directive line. Returns the
 // asserted output column types — each the canonical name of a result column's resolved type (the
 // integer WIDTH, the unconstrained `decimal`, `unknown` for an untyped NULL), beyond the
 // `I`/`T`/`D` rendering tag (spec/design/conformance.md §1/§7). (nil, false) if not a types directive.

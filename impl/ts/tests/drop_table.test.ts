@@ -9,7 +9,7 @@ import { dbWith, errCode, query } from "./util.ts";
 
 test("drop removes the table and its rows", () => {
   const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, v int16)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
     "INSERT INTO t VALUES (1, 10), (2, 20)",
   ]);
   const out = execute(db, "DROP TABLE t");
@@ -20,24 +20,24 @@ test("drop removes the table and its rows", () => {
 
 test("the name is free to re-create after a drop", () => {
   const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, v int16)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, v i16)",
     "INSERT INTO t VALUES (1, 10)",
     "DROP TABLE t",
-    "CREATE TABLE t (id int32 PRIMARY KEY, w int64)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, w i64)",
   ]);
   assert.deepStrictEqual(db.rowsInKeyOrder("t"), []);
   assert.equal(db.table("t")!.columns[1]!.name, "w");
 });
 
 test("drop is case-insensitive on the table name", () => {
-  const db = dbWith(["create table T (id int32 primary key)", "DROP TABLE t"]);
+  const db = dbWith(["create table T (id i32 primary key)", "DROP TABLE t"]);
   assert.equal(db.table("t"), undefined);
 });
 
 test("dropping one table leaves the others intact", () => {
   const db = dbWith([
-    "CREATE TABLE a (id int32 PRIMARY KEY)",
-    "CREATE TABLE b (id int32 PRIMARY KEY)",
+    "CREATE TABLE a (id i32 PRIMARY KEY)",
+    "CREATE TABLE b (id i32 PRIMARY KEY)",
     "INSERT INTO b VALUES (2)",
     "DROP TABLE a",
   ]);
@@ -47,7 +47,7 @@ test("dropping one table leaves the others intact", () => {
 });
 
 test("DROP TABLE syntax errors trap 42601", () => {
-  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)"]);
+  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
   assert.equal(errCode(() => execute(db, "DROP TABLE")), "42601"); // no table name
   assert.equal(errCode(() => execute(db, "DROP TABLE t extra")), "42601"); // trailing input
   // DROP INDEX is its own statement now (spec/design/indexes.md §2): a missing index is

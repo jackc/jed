@@ -1,5 +1,5 @@
 # nextval / currval / setval / lastval — the sequence value functions (spec/design/sequences.md
-# §4/§6, functions.md §14). nextval advances the sequence and returns the new int64 value (first
+# §4/§6, functions.md §14). nextval advances the sequence and returns the new i64 value (first
 # call = START, then +INCREMENT, bounded by MIN/MAXVALUE → 2200H or CYCLE wrap). setval sets the
 # counter directly and returns the value (setval(s, n, false) makes the next nextval return n).
 # currval/lastval read THIS SESSION's history. nextval/setval are WRITES (each charges one
@@ -12,7 +12,7 @@
 # exactly `K + INCREMENT`, independent of any earlier `query nextval` (jed runs those, PG never sees
 # them, and the setval overwrites their effect). The transactional-rollback divergence (§5), the
 # read-only 25006, and cross-handle session-locality are per-core unit tests.
-# requires: func.sequence, ddl.sequence, query.select, types.int64, resource.cost_metering
+# requires: func.sequence, ddl.sequence, query.select, types.i64, resource.cost_metering
 
 statement ok
 CREATE SEQUENCE s INCREMENT BY 5 MINVALUE 1 MAXVALUE 1000 START WITH 10

@@ -33,7 +33,7 @@ const (
 	// this large already drives the value past the caps (so it traps 22003 at resolve), and a
 	// zero coefficient still normalizes to 0 (spec/design/grammar.md §14). Callers clamp the
 	// exponent magnitude to ±expLimit while scanning (both to honor this bound and to keep the
-	// accumulation inside int64).
+	// accumulation inside i64).
 	expLimit = int64(MaxIntDigits) + int64(MaxScale) + 2
 )
 
@@ -352,11 +352,11 @@ func (d Decimal) CoerceToTypmod(precision, scale uint32) (Decimal, error) {
 	return rounded, nil
 }
 
-// ToInt64Round rounds to an integer (scale 0, half away) and returns it as int64 if it fits,
+// ToInt64Round rounds to an integer (scale 0, half away) and returns it as i64 if it fits,
 // else ok=false (the decimal→int cast; the caller range-checks the target int type).
 func (d Decimal) ToInt64Round() (int64, bool) {
 	r := d.RoundToScale(0)
-	if len(r.Limbs) > 3 { // > 27 digits, far beyond int64
+	if len(r.Limbs) > 3 { // > 27 digits, far beyond i64
 		return 0, false
 	}
 	var u uint64

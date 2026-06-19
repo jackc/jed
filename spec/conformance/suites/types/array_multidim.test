@@ -7,10 +7,10 @@
 # subscripts (a[i] on an N-D value with fewer is NULL); the index domain is the value's lb..ub.
 # array_eq considers dimensionality and lower bounds, so [2:4]={7,8,9} ≠ {7,8,9}. Values round-trip
 # through storage. array_out matches PostgreSQL byte-for-byte. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.int32, expr.array_subscript, func.array, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.where_eq, types.array, types.array_multidim, types.i32, expr.array_subscript, func.array, resource.cost_metering
 
 statement ok
-CREATE TABLE m (id int32 PRIMARY KEY, g int32[])
+CREATE TABLE m (id i32 PRIMARY KEY, g i32[])
 
 # ARRAY[ARRAY[…],…] stacks sub-arrays into a 2-D value (row-major).
 statement ok
@@ -68,18 +68,18 @@ NULL
 
 # Equality includes the lower bound: [2:4]={7,8,9} is NOT equal to {7,8,9} (same elements, lb 2 vs 1).
 query I nosort
-SELECT id FROM m WHERE g = '{7,8,9}'::int32[] ORDER BY id
+SELECT id FROM m WHERE g = '{7,8,9}'::i32[] ORDER BY id
 ----
 
 # … it equals the explicit-bound literal.
 query I nosort
-SELECT id FROM m WHERE g = '[2:4]={7,8,9}'::int32[] ORDER BY id
+SELECT id FROM m WHERE g = '[2:4]={7,8,9}'::i32[] ORDER BY id
 ----
 3
 
 # A 1-D value and a 2-D value with the same flattened elements are NOT equal (ndim tiebreak).
 query I nosort
-SELECT id FROM m WHERE g = '{1,2,3,4}'::int32[] ORDER BY id
+SELECT id FROM m WHERE g = '{1,2,3,4}'::i32[] ORDER BY id
 ----
 
 # G21 — a NEGATIVE/zero custom lower bound. '[-2:0]={7,8,9}' has indices -2,-1,0; it stores and
@@ -123,4 +123,4 @@ INSERT INTO m VALUES (5, '[3:1]={1}')
 # enforce this bound (a 7-D constructor currently builds and stores), so only the literal edge is
 # pinned here; bounding the constructor is a known follow-on.
 statement error 22P02
-SELECT '{{{{{{{1}}}}}}}'::int32[] FROM m WHERE id = 1
+SELECT '{{{{{{{1}}}}}}}'::i32[] FROM m WHERE id = 1

@@ -5,10 +5,10 @@
 # index uses the `bool-byte` key encoding (the second non-integer key after uuid; encoding.md
 # §2.9), exercised below. CAST(x AS boolean) stays deferred (0A000), a documented narrowing.
 # Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.int32, types.boolean, types.boolean_storable, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.boolean, types.boolean_storable, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)
+CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)
 
 statement ok
 INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE), (5, FALSE)
@@ -177,10 +177,10 @@ no
 true
 yes
 
-# a boolean member of a COMPOSITE primary key concatenates with the leading int32 component;
+# a boolean member of a COMPOSITE primary key concatenates with the leading i32 component;
 # (1,false) and (1,true) are distinct keys, and key order is a-ascending then false<true
 statement ok
-CREATE TABLE ck (a int32, b boolean, v int32, PRIMARY KEY (a, b))
+CREATE TABLE ck (a i32, b boolean, v i32, PRIMARY KEY (a, b))
 
 statement ok
 INSERT INTO ck VALUES (1, TRUE, 10), (1, FALSE, 20), (2, FALSE, 30)

@@ -140,7 +140,7 @@ func TestCheckDDLErrorsMatchPostgres(t *testing.T) {
 		t.Fatalf("empty check = %s, want 42601", code)
 	}
 	// Columns may be NAMED check / constraint (the keywords stay non-reserved).
-	mustExecCheck(t, db, "CREATE TABLE odd (check int, constraint int16)")
+	mustExecCheck(t, db, "CREATE TABLE odd (check int, constraint i16)")
 	mustExecCheck(t, db, "INSERT INTO odd VALUES (1, 2)")
 }
 

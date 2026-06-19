@@ -23,7 +23,7 @@ function tuples(db: Database, table: string): [bigint, bigint][] {
 }
 
 test("composite key flags members and orders by tuple", () => {
-  const db = dbWith(["CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))"]);
+  const db = dbWith(["CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))"]);
   const t = db.table("t")!;
   assert.deepEqual(pkIndices(t), [0, 1]);
   assert.ok(t.columns[0]!.primaryKey && t.columns[0]!.notNull);
@@ -54,7 +54,7 @@ test("composite key flags members and orders by tuple", () => {
 
 test("uniqueness is over the whole tuple", () => {
   const db = dbWith([
-    "CREATE TABLE t (a int32, b int32, PRIMARY KEY (a, b))",
+    "CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, b))",
     "INSERT INTO t VALUES (1, 1)",
   ]);
   execute(db, "INSERT INTO t VALUES (1, 2)"); // shared prefix: distinct row
@@ -69,14 +69,14 @@ test("uniqueness is over the whole tuple", () => {
 
 test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   const cases: [string, string][] = [
-    ["CREATE TABLE t (a int32, PRIMARY KEY (a, nosuch))", "42703"],
-    ["CREATE TABLE t (a int32, b int32, PRIMARY KEY (a, a))", "42701"],
-    ["CREATE TABLE t (a int32 PRIMARY KEY, b int32, PRIMARY KEY (b))", "42P16"],
-    ["CREATE TABLE t (a int32, b int32, PRIMARY KEY (a), PRIMARY KEY (b))", "42P16"],
+    ["CREATE TABLE t (a i32, PRIMARY KEY (a, nosuch))", "42703"],
+    ["CREATE TABLE t (a i32, b i32, PRIMARY KEY (a, a))", "42701"],
+    ["CREATE TABLE t (a i32 PRIMARY KEY, b i32, PRIMARY KEY (b))", "42P16"],
+    ["CREATE TABLE t (a i32, b i32, PRIMARY KEY (a), PRIMARY KEY (b))", "42P16"],
     // 42P16 fires BEFORE the second constraint's members resolve (PostgreSQL's order).
-    ["CREATE TABLE t (a int32 PRIMARY KEY, PRIMARY KEY (nosuch))", "42P16"],
+    ["CREATE TABLE t (a i32 PRIMARY KEY, PRIMARY KEY (nosuch))", "42P16"],
     // Narrowing: every member must be key-encodable (text is not, types.md §11).
-    ["CREATE TABLE t (a int32, s text, PRIMARY KEY (a, s))", "0A000"],
+    ["CREATE TABLE t (a i32, s text, PRIMARY KEY (a, s))", "0A000"],
   ];
   for (const [sql, want] of cases) {
     assert.equal(errCode(() => execute(new Database(), sql)), want, sql);
@@ -86,7 +86,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
   // keys by (b, a), so the stored scan order is b-major.
   {
     const rev = new Database();
-    execute(rev, "CREATE TABLE rev (a int32, b int32, PRIMARY KEY (b, a))");
+    execute(rev, "CREATE TABLE rev (a i32, b i32, PRIMARY KEY (b, a))");
     assert.deepEqual(pkIndices(rev.table("rev")!), [1, 0]);
     execute(rev, "INSERT INTO rev VALUES (1, 20), (2, 10), (3, 15)");
     const bs = rev.rowsInKeyOrder("rev").map((r) => (r[1]!.kind === "int" ? r[1]!.int : null));
@@ -95,7 +95,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
 
   // A single-column table constraint is the column-level form's equivalent.
   const db = new Database();
-  execute(db, "CREATE TABLE ok (a int32, PRIMARY KEY (a))");
+  execute(db, "CREATE TABLE ok (a i32, PRIMARY KEY (a))");
   const t = db.table("ok")!;
   assert.equal(primaryKeyIndex(t), 0);
   assert.ok(t.columns[0]!.notNull);
@@ -103,7 +103,7 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
 
 test("members are NOT NULL and UPDATE may not assign one", () => {
   const db = dbWith([
-    "CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))",
+    "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
     "INSERT INTO t VALUES (1, 1, 10)",
   ]);
   assert.equal(errCode(() => execute(db, "INSERT INTO t VALUES (1, NULL, 5)")), "23502");
@@ -114,7 +114,7 @@ test("members are NOT NULL and UPDATE may not assign one", () => {
 });
 
 test("mixed uuid + int components order correctly", () => {
-  const db = dbWith(["CREATE TABLE t (u uuid, n int32, PRIMARY KEY (u, n))"]);
+  const db = dbWith(["CREATE TABLE t (u uuid, n i32, PRIMARY KEY (u, n))"]);
   for (const stmt of [
     "INSERT INTO t VALUES ('ffffffff-ffff-ffff-ffff-ffffffffffff', -5)",
     "INSERT INTO t VALUES ('00000000-0000-0000-0000-000000000001', 7)",
@@ -132,7 +132,7 @@ test("mixed uuid + int components order correctly", () => {
 
 test("round-trips through the on-disk image as a keyed table", () => {
   const db = dbWith([
-    "CREATE TABLE t (a int32, b int32, v int16, PRIMARY KEY (a, b))",
+    "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
     "INSERT INTO t VALUES (2, 1, 40), (1, 2, 20), (1, 1, 10)",
   ]);
   const image = toImage(db, 256, 1n);

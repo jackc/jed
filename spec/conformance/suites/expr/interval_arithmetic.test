@@ -2,7 +2,7 @@
 # PG keeps months/days/micros independent — no justification) and unary minus. A NULL operand
 # propagates; an i32 month/day or i64 micros overflow traps 22008. interval ×÷ number and
 # timestamp ± interval are later slices (this suite is the ± / unary-minus part).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.int32, types.interval, expr.interval_arithmetic
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.interval, expr.interval_arithmetic
 
 # --- literal arithmetic (the INTERVAL keyword form) ---
 
@@ -51,7 +51,7 @@ NULL
 # --- arithmetic over stored interval columns ---
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a interval, b interval)
+CREATE TABLE t (id i32 PRIMARY KEY, a interval, b interval)
 
 statement ok
 INSERT INTO t VALUES (1, '1 mon', '10 days'), (2, '2 hours', '30 minutes'), (3, '1 day', NULL)

@@ -8,20 +8,20 @@
 # (42804, the full-PostgreSQL behavior). Cost = the embedded SELECT's accrued cost (not the
 # VALUES form's zero). The source is materialized BEFORE any write, so a self-insert reads
 # the pre-insert snapshot. Format + the `requires` directive: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, query.select, query.where_eq, query.comparison_order, query.order_by, query.limit, query.offset, query.distinct, query.aggregates, query.group_by, query.join_inner, query.table_alias, query.qualified_column, expr.arithmetic, types.int16, types.int32, types.int64, types.text, error.overflow_trap, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.not_null, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, query.select, query.where_eq, query.comparison_order, query.order_by, query.limit, query.offset, query.distinct, query.aggregates, query.group_by, query.join_inner, query.table_alias, query.qualified_column, expr.arithmetic, types.i16, types.i32, types.i64, types.text, error.overflow_trap, resource.cost_metering
 
 # --- basic copy + cost ----------------------------------------------------------------
 # Cost is the embedded SELECT's accrued cost: src_c has 3 rows, the SELECT scans 3
 # (storage_row_read) + produces 3 (row_produced); a bare-column projection is free (leaves)
 # = 6. Storing the rows is unmetered, like every INSERT.
 statement ok
-CREATE TABLE src_c (id int32 PRIMARY KEY, a int16, b int64)
+CREATE TABLE src_c (id i32 PRIMARY KEY, a i16, b i64)
 
 statement ok
 INSERT INTO src_c VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)
 
 statement ok
-CREATE TABLE dst_c (id int32 PRIMARY KEY, a int16, b int64)
+CREATE TABLE dst_c (id i32 PRIMARY KEY, a i16, b i64)
 
 # cost: 7
 statement ok
@@ -42,13 +42,13 @@ SELECT id, a, b FROM dst_c ORDER BY id
 
 # --- WHERE / ORDER BY / LIMIT / OFFSET source ------------------------------------------
 statement ok
-CREATE TABLE w_src (id int32 PRIMARY KEY, a int16)
+CREATE TABLE w_src (id i32 PRIMARY KEY, a i16)
 
 statement ok
 INSERT INTO w_src VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50)
 
 statement ok
-CREATE TABLE w_dst (id int32 PRIMARY KEY, a int16)
+CREATE TABLE w_dst (id i32 PRIMARY KEY, a i16)
 
 # WHERE id >= 2 (matches 2,3,4,5), ORDER BY id, OFFSET 1 (skip 2), LIMIT 2 -> id 3,4
 statement ok
@@ -76,14 +76,14 @@ SELECT id, a FROM w_dst ORDER BY id
 
 # --- DISTINCT source -------------------------------------------------------------------
 statement ok
-CREATE TABLE d_src (id int32 PRIMARY KEY, c int16)
+CREATE TABLE d_src (id i32 PRIMARY KEY, c i16)
 
 statement ok
 INSERT INTO d_src VALUES (1, 5), (2, 5), (3, 7)
 
 # no-PK target: rows get monotonic rowids in the SELECT's (deterministic) output order
 statement ok
-CREATE TABLE d_dst (c int16)
+CREATE TABLE d_dst (c i16)
 
 statement ok
 INSERT INTO d_dst SELECT DISTINCT c FROM d_src
@@ -95,9 +95,9 @@ SELECT c FROM d_dst
 7
 
 # --- GROUP BY + aggregate source -------------------------------------------------------
-# COUNT(*) is int64; group by c -> (5 -> 2), (7 -> 1)
+# COUNT(*) is i64; group by c -> (5 -> 2), (7 -> 1)
 statement ok
-CREATE TABLE g_dst (k int16, n int64)
+CREATE TABLE g_dst (k i16, n i64)
 
 statement ok
 INSERT INTO g_dst SELECT c, COUNT(*) FROM d_src GROUP BY c
@@ -112,19 +112,19 @@ SELECT k, n FROM g_dst
 
 # --- JOIN source -----------------------------------------------------------------------
 statement ok
-CREATE TABLE a_tbl (id int32 PRIMARY KEY, v int16)
+CREATE TABLE a_tbl (id i32 PRIMARY KEY, v i16)
 
 statement ok
 INSERT INTO a_tbl VALUES (1, 100), (2, 200)
 
 statement ok
-CREATE TABLE b_tbl (id int32 PRIMARY KEY, w int16)
+CREATE TABLE b_tbl (id i32 PRIMARY KEY, w i16)
 
 statement ok
 INSERT INTO b_tbl VALUES (1, 7), (2, 8)
 
 statement ok
-CREATE TABLE joined (x int16, y int16)
+CREATE TABLE joined (x i16, y i16)
 
 statement ok
 INSERT INTO joined SELECT a.v, b.w FROM a_tbl a JOIN b_tbl b ON a.id = b.id
@@ -140,7 +140,7 @@ SELECT x, y FROM joined
 # --- column list: reorder + omitted column takes DEFAULT / NULL ------------------------
 # the list (b, id, a) maps the SELECT's three outputs by NAME, not position
 statement ok
-CREATE TABLE r_dst (id int32 PRIMARY KEY, a int16, b int64)
+CREATE TABLE r_dst (id i32 PRIMARY KEY, a i16, b i64)
 
 statement ok
 INSERT INTO r_dst (b, id, a) SELECT b, id, a FROM src_c
@@ -160,7 +160,7 @@ SELECT id, a, b FROM r_dst ORDER BY id
 
 # an omitted column takes its DEFAULT (a -> 99); `b` here is nullable and omitted -> NULL
 statement ok
-CREATE TABLE def_dst (id int32 PRIMARY KEY, a int16 DEFAULT 99, b int64)
+CREATE TABLE def_dst (id i32 PRIMARY KEY, a i16 DEFAULT 99, b i64)
 
 statement ok
 INSERT INTO def_dst (id) SELECT id FROM src_c
@@ -180,7 +180,7 @@ NULL
 
 # --- all-or-nothing: NOT NULL violation from an omitted column (23502) -----------------
 statement ok
-CREATE TABLE nn_dst (id int32 PRIMARY KEY, a int16 NOT NULL)
+CREATE TABLE nn_dst (id i32 PRIMARY KEY, a i16 NOT NULL)
 
 # `a` is NOT NULL with no default and is omitted -> 23502, nothing inserted
 statement error 23502
@@ -191,16 +191,16 @@ SELECT id FROM nn_dst
 ----
 
 # --- all-or-nothing: integer overflow from a widening projection (22003) ---------------
-# int64 -> int16 is family-assignable (both integer), so the up-front type gate passes;
+# i64 -> i16 is family-assignable (both integer), so the up-front type gate passes;
 # the per-row range check then traps 22003 and stores nothing.
 statement ok
-CREATE TABLE big (id int32 PRIMARY KEY, n int64)
+CREATE TABLE big (id i32 PRIMARY KEY, n i64)
 
 statement ok
 INSERT INTO big VALUES (1, 5), (2, 99999)
 
 statement ok
-CREATE TABLE small (id int32 PRIMARY KEY, s int16)
+CREATE TABLE small (id i32 PRIMARY KEY, s i16)
 
 statement error 22003
 INSERT INTO small SELECT id, n FROM big
@@ -211,13 +211,13 @@ SELECT id FROM small
 
 # --- all-or-nothing: duplicate PK WITHIN the SELECT result (23505) ---------------------
 statement ok
-CREATE TABLE dup_src (id int32 PRIMARY KEY, k int32)
+CREATE TABLE dup_src (id i32 PRIMARY KEY, k i32)
 
 statement ok
 INSERT INTO dup_src VALUES (1, 7), (2, 7), (3, 8)
 
 statement ok
-CREATE TABLE pk_dst (pk int32 PRIMARY KEY, v int32)
+CREATE TABLE pk_dst (pk i32 PRIMARY KEY, v i32)
 
 # two produced rows share pk=7 -> 23505, nothing inserted
 statement error 23505
@@ -229,13 +229,13 @@ SELECT pk FROM pk_dst
 
 # --- all-or-nothing: duplicate PK against an EXISTING row (23505) ----------------------
 statement ok
-CREATE TABLE keys (id int32 PRIMARY KEY, k int32)
+CREATE TABLE keys (id i32 PRIMARY KEY, k i32)
 
 statement ok
 INSERT INTO keys VALUES (1, 7), (2, 8)
 
 statement ok
-CREATE TABLE pk_dst2 (pk int32 PRIMARY KEY, v int32)
+CREATE TABLE pk_dst2 (pk i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO pk_dst2 VALUES (7, 99)
@@ -278,15 +278,15 @@ SELECT id FROM src_c ORDER BY id
 
 # --- up-front type-assignability gate: 42804 EVEN over an empty source ------------------
 statement ok
-CREATE TABLE t_src (id int32 PRIMARY KEY, name text)
+CREATE TABLE t_src (id i32 PRIMARY KEY, name text)
 
 statement ok
 INSERT INTO t_src VALUES (1, 'alice'), (2, 'bob')
 
 statement ok
-CREATE TABLE i_dst (n int32)
+CREATE TABLE i_dst (n i32)
 
-# empty source + incompatible projection (text -> int32): rejected up front (42804), 0 rows
+# empty source + incompatible projection (text -> i32): rejected up front (42804), 0 rows
 statement error 42804
 INSERT INTO i_dst SELECT name FROM t_src WHERE id > 100
 
@@ -309,7 +309,7 @@ INSERT INTO i_dst SELECT id, id FROM t_src WHERE id > 100
 
 # --- no-PK target with an ordered source -----------------------------------------------
 statement ok
-CREATE TABLE log_dst (a int16, b int64)
+CREATE TABLE log_dst (a i16, b i64)
 
 statement ok
 INSERT INTO log_dst SELECT a, b FROM src_c WHERE id < 100 ORDER BY id

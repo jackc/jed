@@ -10,10 +10,10 @@
 # a cost ceiling (cost.md §6) aborts ahead of the expensive operation. Cost is a CROSS-CORE
 # contract: the single `# cost: N` asserted here holds for Rust, Go, and TS alike.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.aggregates, types.int32, types.decimal, expr.decimal_arithmetic, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.point_lookup, query.aggregates, types.i32, types.decimal, expr.decimal_arithmetic, resource.cost_metering
 
 statement ok
-CREATE TABLE d (id int32 PRIMARY KEY, v numeric)
+CREATE TABLE d (id i32 PRIMARY KEY, v numeric)
 
 statement ok
 INSERT INTO d VALUES (1, 1.5)
@@ -62,7 +62,7 @@ SELECT id FROM d WHERE v < 12345.6789
 1
 
 statement ok
-CREATE TABLE s (id int32 PRIMARY KEY, v numeric)
+CREATE TABLE s (id i32 PRIMARY KEY, v numeric)
 
 statement ok
 INSERT INTO s VALUES (1, 12345.678), (2, 0.001)

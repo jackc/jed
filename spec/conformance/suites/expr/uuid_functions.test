@@ -1,5 +1,5 @@
 # UUID extractor functions (spec/design/functions.md §12) — the PURE inspectors
-# uuid_extract_version(uuid) → int16 and uuid_extract_timestamp(uuid) → timestamptz.
+# uuid_extract_version(uuid) → i16 and uuid_extract_timestamp(uuid) → timestamptz.
 # PostgreSQL-18-oracle-verified. Both gate on the RFC 4122 variant ((byte 8 & 0xC0) == 0x80):
 # a non-RFC variant (Microsoft GUID, the nil uuid) yields NULL from both. uuid_extract_version
 # returns the version nibble (0..15) for an RFC value; uuid_extract_timestamp returns the
@@ -8,10 +8,10 @@
 # every other version — v6 included, matching PG 18. NULL input propagates. Both are immutable
 # (deterministic functions of their input bits); the volatile generators uuidv4()/uuidv7() land
 # in a later slice. timestamptz renders UTC (`+00`) under the `T` tag. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.int32, types.int16, types.uuid, types.timestamptz, func.uuid_extract, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.order_by, types.i32, types.i16, types.uuid, types.timestamptz, func.uuid_extract, resource.cost_metering
 
 statement ok
-CREATE TABLE u (id int32 PRIMARY KEY, val uuid)
+CREATE TABLE u (id i32 PRIMARY KEY, val uuid)
 
 # One row per case: v4, v7, v1, v6, the nil uuid, a non-RFC variant (top variant bits 00), a
 # Microsoft-GUID variant (top bits 11), and a NULL value.

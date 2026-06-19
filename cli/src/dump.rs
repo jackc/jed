@@ -136,12 +136,12 @@ mod tests {
         let mut db = Database::new();
         for sql in [
             "CREATE TABLE users (
-                id int32,
-                age int32 UNIQUE,
+                id i32,
+                age i32 UNIQUE,
                 name text NOT NULL,
                 score numeric(5,2) DEFAULT 0.50,
                 ok boolean DEFAULT true,
-                n int32 DEFAULT 1 + 1,
+                n i32 DEFAULT 1 + 1,
                 blob bytea,
                 PRIMARY KEY (id),
                 CONSTRAINT score_pos CHECK (score >= 0)
@@ -149,7 +149,7 @@ mod tests {
             "CREATE INDEX users_age_idx ON users (age)",
             "INSERT INTO users (id, age, name, blob) VALUES (2, 30, 'it''s bob', '\\x6869')",
             "INSERT INTO users (id, age, name, score) VALUES (1, 40, 'alice', 9.50)",
-            "CREATE TABLE nopk (v int64)",
+            "CREATE TABLE nopk (v i64)",
             "INSERT INTO nopk VALUES (10), (20)",
         ] {
             execute(&mut db, sql).unwrap();
@@ -163,16 +163,16 @@ mod tests {
         assert_eq!(
             dump_to_string(&mut db),
             "BEGIN;\n\
-             CREATE TABLE nopk (\n  v int64\n);\n\
+             CREATE TABLE nopk (\n  v i64\n);\n\
              INSERT INTO nopk VALUES (10);\n\
              INSERT INTO nopk VALUES (20);\n\
              CREATE TABLE users (\n\
-             \x20 id int32,\n\
-             \x20 age int32,\n\
+             \x20 id i32,\n\
+             \x20 age i32,\n\
              \x20 name text NOT NULL,\n\
              \x20 score numeric(5,2) DEFAULT 0.50,\n\
              \x20 ok boolean DEFAULT true,\n\
-             \x20 n int32 DEFAULT 1 + 1,\n\
+             \x20 n i32 DEFAULT 1 + 1,\n\
              \x20 blob bytea,\n\
              \x20 PRIMARY KEY (id),\n\
              \x20 CONSTRAINT score_pos CHECK (score >= 0)\n\

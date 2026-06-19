@@ -13,7 +13,7 @@ import { MAX_EXPR_DEPTH } from "../src/parser.ts";
 
 function depthDB(): Database {
   const db = new Database();
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   execute(db, "INSERT INTO t VALUES (1, 1)");
   return db;
 }
@@ -95,5 +95,5 @@ test("deep nesting in WHERE and CHECK is bounded", () => {
   const db = depthDB();
   const pred = "1 + ".repeat(MAX_EXPR_DEPTH + 2) + "1";
   assert.strictEqual(codeOf(db, `SELECT v FROM t WHERE ${pred} = 0`), "54001");
-  assert.strictEqual(codeOf(db, `CREATE TABLE u (a int32 CHECK (${pred} > 0))`), "54001");
+  assert.strictEqual(codeOf(db, `CREATE TABLE u (a i32 CHECK (${pred} > 0))`), "54001");
 });

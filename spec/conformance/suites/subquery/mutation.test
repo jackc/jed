@@ -4,13 +4,13 @@
 # two-phase / all-or-nothing: the subquery reads the pre-statement snapshot (DELETE collects keys
 # before removing; UPDATE validates all rows before writing). Costs (cost.md §3): an uncorrelated
 # subquery folds once, a correlated one re-runs per scanned row. Results verified against PostgreSQL 18.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.qualified_column, expr.arithmetic, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.delete, dml.update, query.select, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.qualified_column, expr.arithmetic, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.i32, resource.cost_metering
 
 statement ok
-CREATE TABLE a (id int32 PRIMARY KEY, k int32)
+CREATE TABLE a (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE b (id int32 PRIMARY KEY, k int32)
+CREATE TABLE b (id i32 PRIMARY KEY, k i32)
 
 statement ok
 INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)

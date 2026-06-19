@@ -12,7 +12,7 @@ const SELECT = "SELECT k, v FROM t ORDER BY k";
 async function writeScenario(name: string): Promise<string[][]> {
   const db = await OpfsDatabase.create(name);
   try {
-    await db.execute("CREATE TABLE t (k int32 PRIMARY KEY, v text)");
+    await db.execute("CREATE TABLE t (k i32 PRIMARY KEY, v text)");
     await db.execute("INSERT INTO t VALUES (1, 'one')");
     await db.execute("INSERT INTO t VALUES (2, 'two')");
     await db.execute("INSERT INTO t VALUES (3, 'three')");

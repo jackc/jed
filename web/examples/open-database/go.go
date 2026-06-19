@@ -17,7 +17,7 @@ func main() {
 	}
 	defer db.Close()
 
-	mustExec(db, "CREATE TABLE person (id int32 PRIMARY KEY, name text NOT NULL)")
+	mustExec(db, "CREATE TABLE person (id i32 PRIMARY KEY, name text NOT NULL)")
 	mustExec(db, "INSERT INTO person VALUES (1, 'Ada'), (2, 'Grace')")
 	if err := db.Commit(); err != nil {
 		log.Fatal(err)

@@ -128,7 +128,7 @@ func TestNoFromSetOperationOperands(t *testing.T) {
 func TestNoFromSubqueries(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE t (id int32 PRIMARY KEY)",
+		"CREATE TABLE t (id i32 PRIMARY KEY)",
 		"INSERT INTO t VALUES (1), (2)",
 	)
 	// Uncorrelated FROM-less inner: folded once.
@@ -148,7 +148,7 @@ func TestNoFromSubqueries(t *testing.T) {
 }
 
 func TestNoFromInsertSelectSource(t *testing.T) {
-	db := dbWith(t, "CREATE TABLE t (id int32 PRIMARY KEY)")
+	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	out, err := Execute(db, "INSERT INTO t SELECT 3")
 	if err != nil {
 		t.Fatalf("INSERT INTO t SELECT 3: %v", err)

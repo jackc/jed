@@ -102,7 +102,7 @@ checksum (§6) compares rendered rows in order.
 
 **Type rule.** Stick to the common subset: jed's `smallint`/`integer`/`bigint` aliases
 parse in all three engines, so one SQL text serves all of them. Aggregates were chosen so
-result types match too (jed `SUM(int32) → int64` = PG `sum(integer) → bigint`).
+result types match too (jed `SUM(i32) → i64` = PG `sum(integer) → bigint`).
 
 ## 4. Dataset spec and deterministic generation — `bench/corpus/datasets.toml`
 
@@ -120,13 +120,13 @@ seed = 101                # one splitmix64 stream per table
 
   [[dataset.table.column]]
   name = "id"
-  type = "int64"          # int64 | int32 | int16 | text
+  type = "i64"          # i64 | i32 | i16 | text
   gen  = "serial"         # 1..rows; consumes no PRNG draws
   primary_key = true
 
   [[dataset.table.column]]
   name = "customer_id"
-  type = "int32"
+  type = "i32"
   gen  = "int_uniform"
   min  = 1
   max  = 1000
@@ -146,8 +146,8 @@ fixed type map:
 
 | spec type | jed | PostgreSQL | SQLite |
 |---|---|---|---|
-| `int64` + `primary_key` | `bigint PRIMARY KEY` | `bigint PRIMARY KEY` | `INTEGER PRIMARY KEY` |
-| `int64` / `int32` / `int16` | same name | `bigint` / `integer` / `smallint` | `INTEGER` |
+| `i64` + `primary_key` | `bigint PRIMARY KEY` | `bigint PRIMARY KEY` | `INTEGER PRIMARY KEY` |
+| `i64` / `i32` / `i16` | same name | `bigint` / `integer` / `smallint` | `INTEGER` |
 | `text` | `text` | `text` | `TEXT` |
 
 The SQLite pk maps to `INTEGER PRIMARY KEY` (the rowid alias) deliberately: it is

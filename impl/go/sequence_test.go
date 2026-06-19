@@ -213,7 +213,7 @@ func TestSequenceAlterNonRestartIs0A000(t *testing.T) {
 		t.Fatalf("expected 0A000, got %s", code)
 	}
 	// ALTER of a non-sequence object is not a known statement at all → 42601 (no escape hatch).
-	if code := seqErrCode(t, db, "ALTER TABLE t ADD COLUMN c int32"); code != "42601" {
+	if code := seqErrCode(t, db, "ALTER TABLE t ADD COLUMN c i32"); code != "42601" {
 		t.Fatalf("expected 42601, got %s", code)
 	}
 }

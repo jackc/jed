@@ -2,14 +2,14 @@
 	import LiveSql from '$lib/components/LiveSql.svelte';
 
 	const seed = `CREATE TABLE account (
-  id      int32 PRIMARY KEY,
+  id      i32 PRIMARY KEY,
   owner   text NOT NULL,
   balance numeric(12,2) NOT NULL CHECK (balance >= 0)
 );
 INSERT INTO account VALUES (1, 'Ada', 100.00), (2, 'Grace', 50.00);
 CREATE TABLE txn (
-  id         int32 PRIMARY KEY,
-  account_id int32 NOT NULL REFERENCES account,
+  id         i32 PRIMARY KEY,
+  account_id i32 NOT NULL REFERENCES account,
   amount     numeric(12,2) NOT NULL
 );
 INSERT INTO txn VALUES (1, 1, 25.00), (2, 2, 10.00);`;

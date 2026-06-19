@@ -7,13 +7,13 @@
 # `box`/…), and the corpus uses the PG-compatible record_in literal for NESTED composites — the bare
 # nested `ROW(ROW(…),…)` constructor is a documented jed extension PG rejects, covered by the unit
 # tests, not this PG-oracle corpus. Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.group_by, query.aggregates, expr.not_equal, types.composite, types.int32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, query.order_by, query.where_eq, query.comparison_order, query.is_null, query.distinct, query.group_by, query.aggregates, expr.not_equal, types.composite, types.i32, types.text, resource.cost_metering
 
 statement ok
-CREATE TYPE addr AS (street text, zip int32)
+CREATE TYPE addr AS (street text, zip i32)
 
 statement ok
-CREATE TABLE person (id int32 PRIMARY KEY, home addr)
+CREATE TABLE person (id i32 PRIMARY KEY, home addr)
 
 # A ROW(...) constructor builds the composite value stored in the column.
 statement ok
@@ -42,10 +42,10 @@ NULL
 # a comma, a parenthesis, a double-quote, or a backslash is double-quoted; inside the quotes PG
 # DOUBLES an embedded `"` → `""` and `\` → `\\`; the empty string is quoted `""`.
 statement ok
-CREATE TYPE rec AS (a text, b int32)
+CREATE TYPE rec AS (a text, b i32)
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, r rec)
+CREATE TABLE t (id i32 PRIMARY KEY, r rec)
 
 statement ok
 INSERT INTO t VALUES (1, ROW('a b', 1)), (2, ROW('x,y', 2)), (3, ROW('', 3)), (4, ROW('q"s', 4)), (5, ROW('a\b', 6))
@@ -64,7 +64,7 @@ SELECT r FROM t ORDER BY id
 # PG rejects — see the unit tests). The inner record is itself quoted in the outer rendering
 # (it contains parens/commas).
 statement ok
-CREATE TYPE coord AS (x int32, y int32)
+CREATE TYPE coord AS (x i32, y i32)
 
 statement ok
 CREATE TYPE pair AS (p coord, q coord)
@@ -174,10 +174,10 @@ true
 # literal as PG `unknown`, which PG refuses to compare — the `ROW(…)` comparison form (jed types the
 # literal as text and accepts it) is covered in the unit tests.
 statement ok
-CREATE TYPE loc AS (city text, zip int32)
+CREATE TYPE loc AS (city text, zip i32)
 
 statement ok
-CREATE TABLE places (id int32 PRIMARY KEY, at loc)
+CREATE TABLE places (id i32 PRIMARY KEY, at loc)
 
 statement ok
 INSERT INTO places VALUES (1, ROW('Oak', 30)), (2, ROW('Oak', 10)), (3, ROW('Elm', 99))
@@ -226,7 +226,7 @@ true
 # DISTINCT / GROUP BY over a composite column use the recursive value key (NULL-safe). Two
 # identical composite values collapse to one group.
 statement ok
-CREATE TABLE dups (id int32 PRIMARY KEY, at loc)
+CREATE TABLE dups (id i32 PRIMARY KEY, at loc)
 
 statement ok
 INSERT INTO dups VALUES (1, ROW('Oak', 10)), (2, ROW('Oak', 10)), (3, ROW('Elm', 20))

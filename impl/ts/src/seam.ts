@@ -12,7 +12,7 @@
 // source a caller may opt into; it is never the default.
 //
 // The PRNG runs over `bigint` masked to 64 bits — JS numbers are f64, so splitmix64's 64-bit
-// arithmetic (and the int64 clock/ms) must use bigint, the same discipline as the cost counter.
+// arithmetic (and the i64 clock/ms) must use bigint, the same discipline as the cost counter.
 
 import { engineError } from "./errors.ts";
 import { buildUuidV4, buildUuidV7 } from "./uuid.ts";

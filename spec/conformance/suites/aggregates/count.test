@@ -3,10 +3,10 @@
 # an empty table both return 0 as a SINGLE row (not the empty result — the §4 single-group
 # rule). Output name is the lowercased function name `count` (grammar.md §8). Cost = rows
 # scanned (storage_row_read) + rows x aggregates (aggregate_accumulate) + 1 produced (§8).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, types.i32, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30)
@@ -30,7 +30,7 @@ SELECT COUNT(a) FROM t
 # COUNT is not reserved: a column may be named count. With no "(", it is a column_ref,
 # not the aggregate (grammar.md §17 one-token lookahead).
 statement ok
-CREATE TABLE c (id int32 PRIMARY KEY, count int32)
+CREATE TABLE c (id i32 PRIMARY KEY, count i32)
 
 statement ok
 INSERT INTO c VALUES (1, 100), (2, 200)
@@ -52,7 +52,7 @@ SELECT COUNT(*) FROM c
 # Empty table: COUNT(*) -> 0 as ONE row (not the empty result). 0 scanned, 0 accumulate,
 # 1 produced (the §4 single-group rule).
 statement ok
-CREATE TABLE e (id int32 PRIMARY KEY, a int32)
+CREATE TABLE e (id i32 PRIMARY KEY, a i32)
 
 # names: count
 # cost: 1

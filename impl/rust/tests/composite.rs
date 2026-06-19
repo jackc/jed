@@ -37,7 +37,7 @@ fn create_type_registers_fields() {
     let mut db = Database::new();
     run(
         &mut db,
-        "CREATE TYPE addr AS (street text NOT NULL, zip int32)",
+        "CREATE TYPE addr AS (street text NOT NULL, zip i32)",
     );
     let ct = db.composite_type("addr").expect("type addr");
     assert_eq!(ct.name, "addr");
@@ -54,7 +54,7 @@ fn create_type_registers_fields() {
 #[test]
 fn drop_type_removes_it() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (a int32)");
+    run(&mut db, "CREATE TYPE addr AS (a i32)");
     run(&mut db, "DROP TYPE addr");
     assert!(db.composite_type("addr").is_none());
 }
@@ -63,9 +63,9 @@ fn drop_type_removes_it() {
 #[test]
 fn nested_composite_value_roundtrip() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE point AS (x int32, y int32)");
+    run(&mut db, "CREATE TYPE point AS (x i32, y i32)");
     run(&mut db, "CREATE TYPE seg AS (a point, b point)");
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, s seg)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, s seg)");
     run(
         &mut db,
         "INSERT INTO t VALUES (1, ROW(ROW(1, 2), ROW(3, 4)))",
@@ -80,8 +80,8 @@ fn nested_composite_value_roundtrip() {
 #[test]
 fn composite_values_persist_through_image() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
-    run(&mut db, "CREATE TABLE p (id int32 PRIMARY KEY, home addr)");
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
+    run(&mut db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)");
     run(&mut db, "INSERT INTO p VALUES (1, ROW('Main', 90210))");
     run(&mut db, "INSERT INTO p VALUES (2, ROW('Oak', NULL))");
     let image = db.to_image(256, 1).unwrap();
@@ -100,10 +100,10 @@ fn composite_values_persist_through_image() {
 #[test]
 fn field_access_selects_field() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(
         &mut db,
-        "CREATE TABLE person (id int32 PRIMARY KEY, home addr)",
+        "CREATE TABLE person (id i32 PRIMARY KEY, home addr)",
     );
     run(&mut db, "INSERT INTO person VALUES (1, ROW('Main', 90210))");
     // Parenthesized-column field access.
@@ -123,7 +123,7 @@ fn field_access_selects_field() {
 #[test]
 fn composite_equality_3vl() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE rec AS (a int32, b int32)");
+    run(&mut db, "CREATE TYPE rec AS (a i32, b i32)");
     // Equal rows.
     assert_eq!(
         query(&mut db, "SELECT ROW(1, 2) = ROW(1, 2)"),
@@ -151,8 +151,8 @@ fn composite_equality_3vl() {
 #[test]
 fn composite_column_compare_and_order() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
-    run(&mut db, "CREATE TABLE p (id int32 PRIMARY KEY, home addr)");
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
+    run(&mut db, "CREATE TABLE p (id i32 PRIMARY KEY, home addr)");
     run(&mut db, "INSERT INTO p VALUES (1, ROW('Oak', 30))");
     run(&mut db, "INSERT INTO p VALUES (2, ROW('Oak', 10))");
     run(&mut db, "INSERT INTO p VALUES (3, ROW('Elm', 99))");
@@ -179,7 +179,7 @@ fn composite_column_compare_and_order() {
 #[test]
 fn composite_is_null_non_recursive() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE point AS (x int32, y int32)");
+    run(&mut db, "CREATE TYPE point AS (x i32, y i32)");
     run(&mut db, "CREATE TYPE seg AS (a point, b point)");
     // The two inner rows are non-null values → the outer row is NOT all-(SQL-)null → IS NULL false,
     // IS NOT NULL true. PG does NOT recurse into the inner all-NULL rows.
@@ -216,10 +216,10 @@ fn types_persist_through_image() {
     let mut db = Database::new();
     run(
         &mut db,
-        "CREATE TYPE point AS (x int32 NOT NULL, y int32 NOT NULL)",
+        "CREATE TYPE point AS (x i32 NOT NULL, y i32 NOT NULL)",
     );
     run(&mut db, "CREATE TYPE line AS (a point, b point)");
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, n int32)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, n i32)");
     run(&mut db, "INSERT INTO t VALUES (1, 10)");
 
     let image = db.to_image(256, 1).unwrap();
@@ -246,11 +246,11 @@ fn types_persist_through_image() {
 // array-of-composite element). The catalog persists the array field as type_code 15 + the inline
 // element descriptor; the value codec / comparison / text-I/O all recurse for free. ---
 
-/// `CREATE TYPE t AS (xs int32[])` registers an array-typed field.
+/// `CREATE TYPE t AS (xs i32[])` registers an array-typed field.
 #[test]
 fn create_type_with_array_field_registers() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE poly AS (name text, pts int32[])");
+    run(&mut db, "CREATE TYPE poly AS (name text, pts i32[])");
     let ct = db.composite_type("poly").expect("type poly");
     assert_eq!(ct.fields.len(), 2);
     assert_eq!(ct.fields[1].name, "pts");
@@ -265,8 +265,8 @@ fn create_type_with_array_field_registers() {
 #[test]
 fn composite_with_array_field_image_roundtrip() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE poly AS (name text, pts int32[])");
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, p poly)");
+    run(&mut db, "CREATE TYPE poly AS (name text, pts i32[])");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, p poly)");
     run(
         &mut db,
         "INSERT INTO t VALUES (1, ROW('a', ARRAY[1, 2, 3]))",
@@ -290,9 +290,9 @@ fn composite_with_array_field_image_roundtrip() {
 #[test]
 fn composite_with_array_of_composite_field() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TYPE person AS (name text, homes addr[])");
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, who person)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, who person)");
     // The array-of-composite field as a text literal: array_in tokenizes the braces, then routes
     // each quoted element through record_in to build the addr value.
     run(
@@ -313,7 +313,7 @@ fn composite_with_array_of_composite_field() {
 #[test]
 fn drop_type_blocked_by_array_field_dependent() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
     run(&mut db, "CREATE TYPE person AS (name text, homes addr[])");
     assert_eq!(err(&mut db, "DROP TYPE addr"), "2BP01");
     // Dropping the dependent first frees it.
@@ -325,11 +325,8 @@ fn drop_type_blocked_by_array_field_dependent() {
 #[test]
 fn drop_type_blocked_by_array_column_dependent() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TYPE addr AS (street text, zip int32)");
-    run(
-        &mut db,
-        "CREATE TABLE t (id int32 PRIMARY KEY, items addr[])",
-    );
+    run(&mut db, "CREATE TYPE addr AS (street text, zip i32)");
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
     assert_eq!(err(&mut db, "DROP TYPE addr"), "2BP01");
 }
 

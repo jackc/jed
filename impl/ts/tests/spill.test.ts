@@ -20,11 +20,11 @@ function runQuery(db: Database, sql: string): { rows: Value[][]; cost: bigint } 
   return { rows: out.rows, cost: out.cost };
 }
 
-// seedSpill populates t(id int32 PK, k int32, s text) with n rows whose k is deliberately unsorted
+// seedSpill populates t(id i32 PK, k i32, s text) with n rows whose k is deliberately unsorted
 // and has many duplicates + a repeating NULL (to exercise the stable-sort tie-break and NULL
 // ordering), and a variable-length s (so a spilled run carries variable-width values).
 function seedSpill(db: Database, n: number): void {
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, k int32, s text)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32, s text)");
   for (let id = 0; id < n; id++) {
     const k = id % 7 === 0 ? "NULL" : String((id * 48271) % 100);
     const s = "x".repeat(id % 17);
@@ -132,7 +132,7 @@ test("spilling sort is stable on ties", () => {
   const dir = mkdtempSync(join(tmpdir(), "jed-spill-stable-"));
   try {
     const db = create(join(dir, "spill_stable.jed"), {});
-    execute(db, "CREATE TABLE t (id int32 PRIMARY KEY, k int32)");
+    execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, k i32)");
     for (let id = 0; id < 100; id++) execute(db, `INSERT INTO t VALUES (${id}, 5)`);
     db.setWorkMem(96); // force spilling so the merge tie-break is exercised
 

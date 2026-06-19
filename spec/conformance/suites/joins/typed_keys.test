@@ -1,23 +1,23 @@
 # JOIN ON equality over NON-INTEGER key types — the nested-loop ON match (grammar.md §15) driven
 # by each type's value-canonical equality and three-valued ON, for decimal, bytea, uuid, timestamp,
-# and timestamptz. The dedicated joins/*.test match only int32 / text / boolean keys; this file
+# and timestamptz. The dedicated joins/*.test match only i32 / text / boolean keys; this file
 # pushes the join key comparison through the §8 hotspot types. The headline case is decimal: 1.5
 # JOINs 1.50 (cross-scale value-canonical equality), and likewise the canonical-form matches for
 # uuid (case/braces), bytea (hex case), timestamp (sub-second zero), and timestamptz (offset). The
 # LEFT JOIN case pins the 3VL ON rule: a NULL join key never matches, so its row is NULL-extended
 # like any other unmatched left row. Rows are asserted with `rowsort` (join output order is
 # unspecified — §8).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.table_alias, query.qualified_column, types.int16, types.int32, types.int64, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.join_inner, query.join_left, query.table_alias, query.qualified_column, types.i16, types.i32, types.i64, types.decimal, types.bytea, types.uuid, types.timestamp, types.timestamptz, resource.cost_metering
 
 # --- decimal: 1.5 matches 1.50 across stored scales (value-canonical, not lexical) -----------
 statement ok
-CREATE TABLE da (id int32 PRIMARY KEY, k numeric)
+CREATE TABLE da (id i32 PRIMARY KEY, k numeric)
 
 statement ok
 INSERT INTO da VALUES (1, 1.5), (2, 2.0), (3, 3.14)
 
 statement ok
-CREATE TABLE db (id int32 PRIMARY KEY, k numeric)
+CREATE TABLE db (id i32 PRIMARY KEY, k numeric)
 
 statement ok
 INSERT INTO db VALUES (10, 1.50), (11, 2.00), (12, 9.9)
@@ -34,13 +34,13 @@ SELECT a.id, b.id FROM da a JOIN db b ON a.k = b.k
 
 # --- bytea: \xAB matches \xab (hex input case normalized before the key compare) -------------
 statement ok
-CREATE TABLE ba (id int32 PRIMARY KEY, k bytea)
+CREATE TABLE ba (id i32 PRIMARY KEY, k bytea)
 
 statement ok
 INSERT INTO ba VALUES (1, '\xAB'), (2, '\x01')
 
 statement ok
-CREATE TABLE bb (id int32 PRIMARY KEY, k bytea)
+CREATE TABLE bb (id i32 PRIMARY KEY, k bytea)
 
 statement ok
 INSERT INTO bb VALUES (10, '\xab'), (11, '\x02')
@@ -54,13 +54,13 @@ SELECT a.id, b.id FROM ba a JOIN bb b ON a.k = b.k
 
 # --- uuid: a lowercase value matches a braced/uppercase/hyphenless spelling of itself ---------
 statement ok
-CREATE TABLE ua (id int32 PRIMARY KEY, k uuid)
+CREATE TABLE ua (id i32 PRIMARY KEY, k uuid)
 
 statement ok
 INSERT INTO ua VALUES (1, '550e8400-e29b-41d4-a716-446655440000'), (2, 'f47ac10b-58cc-4372-a567-0e02b2c3d479')
 
 statement ok
-CREATE TABLE ub (id int32 PRIMARY KEY, k uuid)
+CREATE TABLE ub (id i32 PRIMARY KEY, k uuid)
 
 statement ok
 INSERT INTO ub VALUES (10, '{550E8400E29B41D4A716446655440000}'), (11, '00000000-0000-0000-0000-000000000000')
@@ -74,13 +74,13 @@ SELECT a.id, b.id FROM ua a JOIN ub b ON a.k = b.k
 
 # --- timestamp: 12:00:00 matches 12:00:00.0 (same instant) -----------------------------------
 statement ok
-CREATE TABLE ta (id int32 PRIMARY KEY, k timestamp)
+CREATE TABLE ta (id i32 PRIMARY KEY, k timestamp)
 
 statement ok
 INSERT INTO ta VALUES (1, '2024-01-01 12:00:00'), (2, '2024-06-15 08:30:00')
 
 statement ok
-CREATE TABLE tb (id int32 PRIMARY KEY, k timestamp)
+CREATE TABLE tb (id i32 PRIMARY KEY, k timestamp)
 
 statement ok
 INSERT INTO tb VALUES (10, '2024-01-01 12:00:00.0'), (11, '2030-01-01 00:00:00')
@@ -94,13 +94,13 @@ SELECT a.id, b.id FROM ta a JOIN tb b ON a.k = b.k
 
 # --- timestamptz: 12:00+00 matches 17:00+05 (same UTC instant) -------------------------------
 statement ok
-CREATE TABLE za (id int32 PRIMARY KEY, k timestamptz)
+CREATE TABLE za (id i32 PRIMARY KEY, k timestamptz)
 
 statement ok
 INSERT INTO za VALUES (1, '2024-01-01 12:00:00+00'), (2, '2024-06-01 00:00:00+00')
 
 statement ok
-CREATE TABLE zb (id int32 PRIMARY KEY, k timestamptz)
+CREATE TABLE zb (id i32 PRIMARY KEY, k timestamptz)
 
 statement ok
 INSERT INTO zb VALUES (10, '2024-01-01 17:00:00+05'), (11, '2025-01-01 00:00:00+00')
@@ -114,13 +114,13 @@ SELECT a.id, b.id FROM za a JOIN zb b ON a.k = b.k
 
 # --- LEFT JOIN over a timestamp key: 3VL ON — a NULL key never matches, so it NULL-extends -----
 statement ok
-CREATE TABLE la (id int32 PRIMARY KEY, k timestamp)
+CREATE TABLE la (id i32 PRIMARY KEY, k timestamp)
 
 statement ok
 INSERT INTO la VALUES (1, '2024-01-01 12:00:00'), (2, NULL), (3, '2099-12-31 00:00:00')
 
 statement ok
-CREATE TABLE lb (id int32 PRIMARY KEY, k timestamp)
+CREATE TABLE lb (id i32 PRIMARY KEY, k timestamp)
 
 statement ok
 INSERT INTO lb VALUES (10, '2024-01-01 12:00:00'), (11, '2050-01-01 00:00:00')
@@ -138,21 +138,21 @@ NULL
 NULL
 
 # --- G26: cross-width integer join key (the promotion tower at the join boundary) -------------
-# An int16 key joins an int64 key: the comparison promotes the int16 side to int64 before
+# An i16 key joins an i64 key: the comparison promotes the i16 side to i64 before
 # matching (the promotion tower, compare.toml), so equal numeric values match across widths.
 statement ok
-CREATE TABLE s16 (id int32 PRIMARY KEY, k int16)
+CREATE TABLE s16 (id i32 PRIMARY KEY, k i16)
 
 statement ok
 INSERT INTO s16 VALUES (1, 100), (2, 200), (3, 300)
 
 statement ok
-CREATE TABLE s64 (id int32 PRIMARY KEY, k int64)
+CREATE TABLE s64 (id i32 PRIMARY KEY, k i64)
 
 statement ok
 INSERT INTO s64 VALUES (10, 100), (11, 300), (12, 5000000000)
 
-# 100=100 → (1,10); 300=300 → (3,11); 200 and the out-of-int16-range 5000000000 are unmatched.
+# 100=100 → (1,10); 300=300 → (3,11); 200 and the out-of-i16-range 5000000000 are unmatched.
 # 3 + 3 materialize + 2 page + 9 ON (3x3 `=`) + 2 produced = 19.
 # names: id, id
 # cost: 19

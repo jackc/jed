@@ -25,7 +25,7 @@ func boolKeyErrCode(t *testing.T, db *Database, sql string) string {
 func TestBooleanPrimaryKeyCRUD(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE t (k boolean PRIMARY KEY, v int32)",
+		"CREATE TABLE t (k boolean PRIMARY KEY, v i32)",
 		"INSERT INTO t VALUES (FALSE, 10), (TRUE, 20)",
 	)
 
@@ -56,7 +56,7 @@ func TestBooleanPrimaryKeyCRUD(t *testing.T) {
 func TestBooleanCompositePrimaryKey(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE t (a int32, b boolean, v int32, PRIMARY KEY (a, b))",
+		"CREATE TABLE t (a i32, b boolean, v i32, PRIMARY KEY (a, b))",
 		"INSERT INTO t VALUES (1, TRUE, 10), (1, FALSE, 20), (2, FALSE, 30)",
 	)
 	// (1,FALSE) and (1,TRUE) are distinct keys; the same (a,b) again conflicts.
@@ -84,7 +84,7 @@ func TestBooleanCompositePrimaryKey(t *testing.T) {
 func TestBooleanSecondaryIndex(t *testing.T) {
 	db := dbWith(
 		t,
-		"CREATE TABLE t (id int32 PRIMARY KEY, flag boolean)",
+		"CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)",
 		"INSERT INTO t VALUES (1, TRUE), (2, FALSE), (3, NULL), (4, TRUE)",
 		"CREATE INDEX i ON t (flag)",
 	)

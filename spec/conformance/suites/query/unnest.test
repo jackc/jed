@@ -10,15 +10,15 @@
 # produced element (spec/design/cost.md §3) — so a query's cost is the generated rows plus the
 # usual evaluation + row_produced, and a max_cost ceiling bounds a runaway unnest (54P01). A
 # non-array argument is 42883. PostgreSQL-oracle-verified (postgres:18). The ARRAY[…] literal args
-# default to int64 (jed's literal typing), so those columns are int64 — value-identical to PG's
-# int4/int8; the '{…}'::int32[] form pins int32. The SELECT-list SRF position, LATERAL, the
+# default to i64 (jed's literal typing), so those columns are i64 — value-identical to PG's
+# int4/int8; the '{…}'::i32[] form pins i32. The SELECT-list SRF position, LATERAL, the
 # column-alias-list form, and a bare untyped NULL (42P18) are out of scope (array-functions.md §6).
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.set_returning, func.unnest, func.array, query.order_by, query.limit, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, query.comparison_order, expr.comparison_value, types.int32, types.int64, types.text, types.array, types.array_multidim, resource.cost_metering, resource.cost_limit
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.set_returning, func.unnest, func.array, query.order_by, query.limit, query.cross_join, query.table_alias, query.qualified_column, query.subquery_scalar, query.subquery_correlated, query.aggregates, query.comparison_order, expr.comparison_value, types.i32, types.i64, types.text, types.array, types.array_multidim, resource.cost_metering, resource.cost_limit
 
 # --- the basic case: one column named unnest, one row per element ---------------------
 # The ARRAY[…] constructor is one operator_eval; 3 generated_row + 3 row_produced.
 # names: unnest
-# types: int64
+# types: i64
 # cost: 7
 query I rowsort
 SELECT * FROM unnest(ARRAY[10,20,30])
@@ -27,12 +27,12 @@ SELECT * FROM unnest(ARRAY[10,20,30])
 20
 30
 
-# --- a typed '{…}'::int32[] literal pins the element type (and is a const, no operator_eval) ----
+# --- a typed '{…}'::i32[] literal pins the element type (and is a const, no operator_eval) ----
 # 3 generated_row + 3 row_produced.
-# types: int32
+# types: i32
 # cost: 6
 query I rowsort
-SELECT * FROM unnest('{1,2,3}'::int32[])
+SELECT * FROM unnest('{1,2,3}'::i32[])
 ----
 1
 2
@@ -51,13 +51,13 @@ NULL
 # --- the empty array {} yields ZERO rows -----------------------------------------------
 # cost: 0
 query I rowsort
-SELECT * FROM unnest('{}'::int32[])
+SELECT * FROM unnest('{}'::i32[])
 ----
 
 # --- a NULL array argument yields ZERO rows (the empty_on_null discipline) --------------
 # cost: 0
 query I rowsort
-SELECT * FROM unnest(NULL::int32[])
+SELECT * FROM unnest(NULL::i32[])
 ----
 
 # --- a multidimensional array flattens in row-major order ------------------------------
@@ -75,7 +75,7 @@ SELECT * FROM unnest(ARRAY[ARRAY[1,2],ARRAY[3,4]]) AS u ORDER BY u
 # --- a custom lower bound is flattened away (unnest ignores lbounds) --------------------
 # cost: 6
 query I nosort
-SELECT * FROM unnest('[5:7]={10,20,30}'::int32[]) AS u ORDER BY u
+SELECT * FROM unnest('[5:7]={10,20,30}'::i32[]) AS u ORDER BY u
 ----
 10
 20
@@ -123,7 +123,7 @@ SELECT * FROM unnest(ARRAY[10,20,30,40]) AS u ORDER BY u DESC LIMIT 2
 
 # --- CROSS JOIN with a base table: the unnested array is one operand of the product -----
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])
+CREATE TABLE t (id i32 PRIMARY KEY, xs i32[])
 
 statement ok
 INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')
@@ -132,7 +132,7 @@ INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')
 # names: id, u
 # cost: 15
 query II nosort
-SELECT t.id, u FROM t CROSS JOIN unnest('{7,8}'::int32[]) AS u ORDER BY t.id, u
+SELECT t.id, u FROM t CROSS JOIN unnest('{7,8}'::i32[]) AS u ORDER BY t.id, u
 ----
 1
 7
@@ -190,4 +190,4 @@ SELECT * FROM unnest(ARRAY[1,2]) WITH ORDINALITY
 # cannot be oracle-verified — corpus:check warns, like cost_limit.test.)
 # max_cost: 8
 statement error 54P01
-SELECT * FROM unnest('{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20}'::int32[])
+SELECT * FROM unnest('{1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20}'::i32[])

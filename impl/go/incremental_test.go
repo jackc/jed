@@ -40,7 +40,7 @@ func TestSingleRowCommitAppendsOnlyTheDirtyPath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 	// Enough rows for a multi-level tree at 256-byte pages (≈3 records/leaf). Each insert
 	// autocommits, so the file already holds many leaked pages by the end of the loop.
 	pad := ""
@@ -107,7 +107,7 @@ func TestDeleteHeavyHistoryReopensCorrectly(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 	pad := ""
 	for i := 0; i < 48; i++ {
 		pad += "x"
@@ -150,8 +150,8 @@ func TestMetaSlotsAlternateAcrossCommits(t *testing.T) {
 		t.Fatalf("create should seed both slots at txid 1, got %d/%d", slotTxid(img, 0), slotTxid(img, 1))
 	}
 
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)") // txid 2 → slot 0
-	mustExec(t, db, "INSERT INTO t VALUES (1)")              // txid 3 → slot 1
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)") // txid 2 → slot 0
+	mustExec(t, db, "INSERT INTO t VALUES (1)")            // txid 3 → slot 1
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -180,9 +180,9 @@ func TestTornLatestCommitFallsBackToPriorSnapshot(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)") // txid 2 (slot 0)
-	mustExec(t, db, "INSERT INTO t VALUES (1)")              // txid 3 (slot 1)
-	mustExec(t, db, "INSERT INTO t VALUES (2)")              // txid 4 (slot 0) — the newest commit
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY)") // txid 2 (slot 0)
+	mustExec(t, db, "INSERT INTO t VALUES (1)")            // txid 3 (slot 1)
+	mustExec(t, db, "INSERT INTO t VALUES (2)")            // txid 4 (slot 0) — the newest commit
 	if err := db.Close(); err != nil {
 		t.Fatal(err)
 	}
@@ -228,7 +228,7 @@ func TestCommitPreallocatesFileGrowthInChunks(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 
 	// One commit big enough to push the tree past a chunk: ~400 rows of a ~3.5 KiB pad ≈ 1.4 MiB of
 	// tree, > the 128-page (1 MiB) chunk at the default 8 KiB page size.

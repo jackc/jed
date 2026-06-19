@@ -3,16 +3,16 @@
 # per outer row. Covers correlated EXISTS / scalar / IN, correlation in a JOIN ON, an outer
 # reference inside an aggregate argument, multi-level + skip-level (grandparent) correlation, and
 # the degenerate GROUP BY / ORDER BY-outer-key narrowing (0A000). Results verified against PostgreSQL 18.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.qualified_column, query.table_alias, query.join_inner, query.aggregates, expr.arithmetic, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.int32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.qualified_column, query.table_alias, query.join_inner, query.aggregates, expr.arithmetic, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_correlated, types.i32, resource.cost_metering
 
 statement ok
-CREATE TABLE t1 (id int32 PRIMARY KEY, v int32)
+CREATE TABLE t1 (id i32 PRIMARY KEY, v i32)
 
 statement ok
-CREATE TABLE t2 (id int32 PRIMARY KEY, v int32)
+CREATE TABLE t2 (id i32 PRIMARY KEY, v i32)
 
 statement ok
-CREATE TABLE t3 (id int32 PRIMARY KEY, v int32)
+CREATE TABLE t3 (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO t1 VALUES (1, 10), (2, 20)
@@ -131,7 +131,7 @@ SELECT t1.id, (SELECT count(*) FROM t2 WHERE t2.v = t3.v) FROM t1 JOIN t3 ON t1.
 # `v` is not a column of the inner FROM (inr), so it escapes to the outer scope, where both t1 and
 # t3 expose `v` → 42702.
 statement ok
-CREATE TABLE inr (id int32 PRIMARY KEY, x int32)
+CREATE TABLE inr (id i32 PRIMARY KEY, x i32)
 
 statement ok
 INSERT INTO inr VALUES (1, 10)
@@ -151,10 +151,10 @@ SELECT t1.id FROM t1 WHERE EXISTS (SELECT t2.v FROM t2 ORDER BY t1.v)
 # plan-time error: the same subquery shape returns one row for one outer row and two for another,
 # so the engine cannot know it will trip until it runs the subquery for the offending row.
 statement ok
-CREATE TABLE s1 (id int32 PRIMARY KEY, k int32)
+CREATE TABLE s1 (id i32 PRIMARY KEY, k i32)
 
 statement ok
-CREATE TABLE s2 (id int32 PRIMARY KEY, v int32)
+CREATE TABLE s2 (id i32 PRIMARY KEY, v i32)
 
 # s2 has two rows with v=5 and one with v=100. The correlated scalar (SELECT s2.v WHERE s2.v = s1.k)
 # returns one row when s1.k=100 (the single v=100) and two when s1.k=5 (the duplicated v=5).

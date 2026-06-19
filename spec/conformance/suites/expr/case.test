@@ -5,10 +5,10 @@
 # cross-family 42804; all-NULL → text). The simple form `CASE x WHEN v …` is `x = v` per branch.
 # Verified against PostgreSQL 18.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, expr.case, expr.comparison_value, expr.arithmetic, error.division_by_zero, types.int32, types.text, types.decimal, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, expr.case, expr.comparison_value, expr.arithmetic, error.division_by_zero, types.i32, types.text, types.decimal, null.three_valued, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO t VALUES (1, 10), (2, 0), (3, 20), (4, NULL)
@@ -98,7 +98,7 @@ SELECT 1 + CASE WHEN a > 15 THEN 10 ELSE 0 END FROM t ORDER BY id
 # (whose `1/0` would trap 22012) nor the ELSE is evaluated — the query succeeds and the cost
 # reflects only the case node + the first (constant, leaf) condition = 1 per row.
 statement ok
-CREATE TABLE one (id int32 PRIMARY KEY)
+CREATE TABLE one (id i32 PRIMARY KEY)
 
 statement ok
 INSERT INTO one VALUES (1)
@@ -120,13 +120,13 @@ SELECT CASE NULL WHEN NULL THEN 'matched' ELSE 'fellthrough' END FROM one
 ----
 fellthrough
 
-# A searched WHEN that is not boolean is a type error (the column `a` is int32).
+# A searched WHEN that is not boolean is a type error (the column `a` is i32).
 statement error 42804
 SELECT CASE WHEN a THEN 1 ELSE 0 END FROM t
 
 # Cross-family result arms (an integer column and a text column) cannot be unified — 42804.
 statement ok
-CREATE TABLE m (id int32 PRIMARY KEY, i int32, s text)
+CREATE TABLE m (id i32 PRIMARY KEY, i i32, s text)
 
 statement error 42804
 SELECT CASE WHEN true THEN i ELSE s END FROM m

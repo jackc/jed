@@ -61,7 +61,7 @@ test('OPFS: create, insert, then reopen across a reload persists data', async ({
 
 	await setEditor(
 		page,
-		"CREATE TABLE t (id int32 PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'kept'); SELECT * FROM t;"
+		"CREATE TABLE t (id i32 PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'kept'); SELECT * FROM t;"
 	);
 	await page.getByTestId('run-button').click();
 	await expect(page.getByTestId('result-rows')).toContainText('kept');
@@ -81,7 +81,7 @@ test('OPFS: export then re-import round-trips a database', async ({ page }) => {
 
 	await page.getByTestId('new-db-name').fill('rt');
 	await page.getByTestId('create-db').click();
-	await setEditor(page, "CREATE TABLE t (id int32 PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'roundtrip');");
+	await setEditor(page, "CREATE TABLE t (id i32 PRIMARY KEY, v text); INSERT INTO t VALUES (1, 'roundtrip');");
 	await page.getByTestId('run-button').click();
 	await expect(page.getByTestId('db-label')).toContainText('rt.jed');
 

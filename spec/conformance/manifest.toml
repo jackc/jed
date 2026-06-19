@@ -66,7 +66,7 @@ description = "DEFAULT <expression> column constraint — a non-constant default
 
 [[capability]]
 id = "ddl.sequence"
-description = "CREATE SEQUENCE [IF NOT EXISTS] name [INCREMENT [BY] n] [MINVALUE m | NO MINVALUE] [MAXVALUE x | NO MAXVALUE] [START [WITH] s] [CACHE c] [[NO] CYCLE] / DROP SEQUENCE [IF EXISTS] name [, …] — a named, persisted, monotonic int64 generator as the third catalog-object kind (entry_kind 2, format_version 12). Order-free options, bigint-only (AS type 0A000); the name shares the relation namespace (42P07 duplicate / 42P01 missing); INCREMENT 0 / CACHE < 1 / inconsistent START/MIN/MAX is 22023; CACHE accepted but behaves as 1 (a documented PG divergence); RESTRICT-only (CASCADE 0A000). nextval is TRANSACTIONAL — rolls back with the txn (a documented PG divergence mandated by determinism.md §5) (spec/design/sequences.md, grammar.md §44)"
+description = "CREATE SEQUENCE [IF NOT EXISTS] name [INCREMENT [BY] n] [MINVALUE m | NO MINVALUE] [MAXVALUE x | NO MAXVALUE] [START [WITH] s] [CACHE c] [[NO] CYCLE] / DROP SEQUENCE [IF EXISTS] name [, …] — a named, persisted, monotonic i64 generator as the third catalog-object kind (entry_kind 2, format_version 12). Order-free options, bigint-only (AS type 0A000); the name shares the relation namespace (42P07 duplicate / 42P01 missing); INCREMENT 0 / CACHE < 1 / inconsistent START/MIN/MAX is 22023; CACHE accepted but behaves as 1 (a documented PG divergence); RESTRICT-only (CASCADE 0A000). nextval is TRANSACTIONAL — rolls back with the txn (a documented PG divergence mandated by determinism.md §5) (spec/design/sequences.md, grammar.md §44)"
 
 [[capability]]
 id = "dml.insert_column_list"
@@ -202,7 +202,7 @@ description = "Qualified column references `rel.col` — resolved against the na
 
 [[capability]]
 id = "query.aggregates"
-description = "Scalar aggregate functions COUNT/SUM/MIN/MAX/AVG over the whole table (no GROUP BY): single-row result; COUNT(*) counts rows, COUNT(expr)/SUM/AVG/MIN/MAX skip NULL; COUNT->0 and SUM/AVG/MIN/MAX->NULL over empty/all-NULL; PG widening (SUM int16/int32->int64, int64->decimal, decimal->decimal; AVG->decimal; MIN/MAX->input type); overflow 22003; aggregate in WHERE/nested is 42803; unknown function 42883; DISTINCT-in-aggregate 42601 (spec/design/aggregates.md)"
+description = "Scalar aggregate functions COUNT/SUM/MIN/MAX/AVG over the whole table (no GROUP BY): single-row result; COUNT(*) counts rows, COUNT(expr)/SUM/AVG/MIN/MAX skip NULL; COUNT->0 and SUM/AVG/MIN/MAX->NULL over empty/all-NULL; PG widening (SUM i16/i32->i64, i64->decimal, decimal->decimal; AVG->decimal; MIN/MAX->input type); overflow 22003; aggregate in WHERE/nested is 42803; unknown function 42883; DISTINCT-in-aggregate 42601 (spec/design/aggregates.md)"
 
 [[capability]]
 id = "query.group_by"
@@ -261,16 +261,16 @@ id = "query.values"
 description = "VALUES-body derived table — FROM (VALUES (e11,…),(e21,…)) [AS] v(c1,…): a parenthesized VALUES list used as a FROM relation, a computed relation of literal rows (spec/design/grammar.md §42). The FROM-position sibling of the INSERT … VALUES source, reusing the derived-table seam (anonymous always-inlined single-reference CTE): the same alias / column-rename (AS v(a,b), 42P10) / 42712 / 42702 / non-correlation / intrinsic-cost rules as query.derived_table. A value is a GENERAL CONSTANT expression (1+1, upper('a'), now(), casts, CASE, ROW(…), ARRAY[…], an uncorrelated scalar subquery) — richer than the INSERT slot (which stays literal/$N/DEFAULT). The body is non-LATERAL (parent=None): a column reference is 42703/42P01, an aggregate is 42803, a bare $N with no inferable local type is 42P18 (no cross-row inference — the §26 posture; write $1::int). All rows must have the same arity (42601, 'VALUES lists must all be the same length'); the columns default to names column1, column2, … (PG, overridable by the rename list) and each column's type unifies across rows like a set operation (int widths widen, int+decimal→decimal, anything+NULL keeps the other, all-NULL→text; 42804 on a mismatch), then coerces each value (int→decimal). Disambiguation: a leading ( followed by VALUES selects this form. Narrowings: a trailing ORDER BY/LIMIT on the body is 42601 (deferred — PG accepts it). cost = row_produced per row + each value's operator_eval (jed's deterministic cross-core contract). Builds on query.derived_table / dml.insert_multi_row"
 
 [[capability]]
-id = "types.int16"
-description = "int16 / smallint scalar type"
+id = "types.i16"
+description = "i16 / smallint scalar type"
 
 [[capability]]
-id = "types.int32"
-description = "int32 / int / integer scalar type"
+id = "types.i32"
+description = "i32 / int / integer scalar type"
 
 [[capability]]
-id = "types.int64"
-description = "int64 / bigint scalar type"
+id = "types.i64"
+description = "i64 / bigint scalar type"
 
 [[capability]]
 id = "types.text"
@@ -298,27 +298,27 @@ description = "uuid scalar type (fixed 16-byte RFC 4122 value): storage, Postgre
 
 [[capability]]
 id = "types.timestamp"
-description = "timestamp / timestamp without time zone scalar type (zoneless wall clock, int64 microseconds): storage, ISO-8601-ish literals, comparison/ordering, infinity sentinels, and timestamp PRIMARY KEY (key encoding = int64). No time zone db (spec/design/timestamp.md)"
+description = "timestamp / timestamp without time zone scalar type (zoneless wall clock, i64 microseconds): storage, ISO-8601-ish literals, comparison/ordering, infinity sentinels, and timestamp PRIMARY KEY (key encoding = i64). No time zone db (spec/design/timestamp.md)"
 
 [[capability]]
 id = "types.timestamptz"
-description = "timestamptz / timestamp with time zone scalar type (UTC instant, int64 microseconds): storage, literals with offset→UTC normalization (offset then discarded), comparison/ordering, infinity, and timestamptz PRIMARY KEY. No named zones (spec/design/timestamp.md)"
+description = "timestamptz / timestamp with time zone scalar type (UTC instant, i64 microseconds): storage, literals with offset→UTC normalization (offset then discarded), comparison/ordering, infinity, and timestamptz PRIMARY KEY. No named zones (spec/design/timestamp.md)"
 
 [[capability]]
 id = "types.interval"
 description = "interval scalar type (a span — months/days/micros): storage, the 'unit + time' input subset (units with abbreviations, per-field signs, trailing 'ago', the fractional-unit cascade, bare HH:MM:SS) via a single-quoted literal or the INTERVAL '...' keyword, PG 'postgres' render, and comparison/ordering/dedup by the canonical 128-bit span (1 month = 30 days, 1 day = 24 h — so '1 mon' = '30 days'). Non-key column only — an interval PRIMARY KEY/index is rejected 0A000; CAST and field qualifiers/precision are deferred (spec/design/interval.md)"
 
 [[capability]]
-id = "types.float64"
-description = "float64 / double precision scalar type (IEEE 754 binary64): storage, literals (incl Infinity/-Infinity/NaN, e-notation), the float total order (-0=+0, NaN=NaN, NaN largest), the trapping +-*/ /sqrt arithmetic kernel, casts, the order-independent canonical-fold SUM/AVG, and MIN/MAX/COUNT. The FIRST type exempted from cross-core byte-identity for COMPUTED/RENDERED values (compared via the R tag at tolerance — conformance.md §1, float.md, determinism.md §6); storage/ordering/kernel/exact-sum/cost stay in-contract. Non-key column only — a float64 PRIMARY KEY is rejected 0A000. Cross-family int/decimal<->float is explicit-only (else 42804)"
+id = "types.f64"
+description = "f64 / double precision scalar type (IEEE 754 binary64): storage, literals (incl Infinity/-Infinity/NaN, e-notation), the float total order (-0=+0, NaN=NaN, NaN largest), the trapping +-*/ /sqrt arithmetic kernel, casts, the order-independent canonical-fold SUM/AVG, and MIN/MAX/COUNT. The FIRST type exempted from cross-core byte-identity for COMPUTED/RENDERED values (compared via the R tag at tolerance — conformance.md §1, float.md, determinism.md §6); storage/ordering/kernel/exact-sum/cost stay in-contract. Non-key column only — a f64 PRIMARY KEY is rejected 0A000. Cross-family int/decimal<->float is explicit-only (else 42804)"
 
 [[capability]]
-id = "types.float32"
-description = "float32 / real scalar type (IEEE 754 binary32): the same surface as float64 at single precision; forms a promotion tower with float64 (float32->float64 lossless-implicit). Exempt from cross-core byte-identity for computed/rendered values (R tag); storage (4 bytes, on-disk code 13) / total order / kernel / exact-sum SUM/AVG / cost in-contract. Non-key column only (0A000). spec/design/float.md"
+id = "types.f32"
+description = "f32 / real scalar type (IEEE 754 binary32): the same surface as f64 at single precision; forms a promotion tower with f64 (f32->f64 lossless-implicit). Exempt from cross-core byte-identity for computed/rendered values (R tag); storage (4 bytes, on-disk code 13) / total order / kernel / exact-sum SUM/AVG / cost in-contract. Non-key column only (0A000). spec/design/float.md"
 
 [[capability]]
 id = "types.date"
-description = "date scalar type (a calendar date — year/month/day, no time/zone; int32 days since 1970-01-01, reusing timestamp's calendar core): storage, strict ISO YYYY-MM-DD literals (a single-quoted string adapting to a date context, or the DATE '…' keyword literal) with optional BC/AD era and the infinity/-infinity sentinels, where a trailing time/offset is validated then DROPPED (24:00:00 does NOT roll into the day, unlike timestamp), comparison/ordering by the day count, and a date PRIMARY KEY (key encoding = int32 int-be-signflip; on-disk type code 16). jed owns a WIDER range than PG (≈ ±5.88M years). date is a STRICT ISLAND — it does not compare/cast to timestamp/timestamptz/int this slice (date × timestamp is 42804, a documented PG divergence); date arithmetic, casts, the clock-relative literals (today/epoch), and date functions are deferred. Malformed input traps 22007, an out-of-range field / day count 22008 (spec/design/date.md)"
+description = "date scalar type (a calendar date — year/month/day, no time/zone; i32 days since 1970-01-01, reusing timestamp's calendar core): storage, strict ISO YYYY-MM-DD literals (a single-quoted string adapting to a date context, or the DATE '…' keyword literal) with optional BC/AD era and the infinity/-infinity sentinels, where a trailing time/offset is validated then DROPPED (24:00:00 does NOT roll into the day, unlike timestamp), comparison/ordering by the day count, and a date PRIMARY KEY (key encoding = i32 int-be-signflip; on-disk type code 16). jed owns a WIDER range than PG (≈ ±5.88M years). date is a STRICT ISLAND — it does not compare/cast to timestamp/timestamptz/int this slice (date × timestamp is 42804, a documented PG divergence); date arithmetic, casts, the clock-relative literals (today/epoch), and date functions are deferred. Malformed input traps 22007, an out-of-range field / day count 22008 (spec/design/date.md)"
 
 [[capability]]
 id = "types.composite"
@@ -326,7 +326,7 @@ description = "composite (row) types — CREATE TYPE name AS (field type [NOT NU
 
 [[capability]]
 id = "types.array"
-description = "array types (spec/design/array.md) — a structural T[] type over any scalar element type (int32[], text[], …): the ARRAY[…] constructor + the '{…}' text literal ('{}'::T[] / a bare string adapting to an array column), the compact value codec (the array body — ndim/flags/dims + a HAS_NULLS-gated bitmap + element bodies, type_code 15), array_out rendering ({e1,e2,…} with PG element quoting + unquoted NULL elements), element-wise comparison with PG BTREE NULL semantics (NULLs comparable and mutually equal — array equality is always a definite boolean, NOT the composite 3VL rule), ORDER BY / DISTINCT / GROUP BY array keys (the array_cmp total order, NULLs-last per element, shorter-prefix-first), and the whole-value IS NULL rule (a non-null array of NULL elements is NOT NULL). v1 ships 1-D values of scalar elements; multidimensional values (types.array_multidim), array slices (expr.array_slice), array-of-composite elements (types.array_composite), and the array function surface (func.array) landed as their own capabilities; arrays-in-keys (0A000) stay deferred. A bad element value traps 22003; a malformed array literal traps 22P02; comparing arrays of different element types is 42804; an array PRIMARY KEY is 0A000. Builds on types.int32"
+description = "array types (spec/design/array.md) — a structural T[] type over any scalar element type (i32[], text[], …): the ARRAY[…] constructor + the '{…}' text literal ('{}'::T[] / a bare string adapting to an array column), the compact value codec (the array body — ndim/flags/dims + a HAS_NULLS-gated bitmap + element bodies, type_code 15), array_out rendering ({e1,e2,…} with PG element quoting + unquoted NULL elements), element-wise comparison with PG BTREE NULL semantics (NULLs comparable and mutually equal — array equality is always a definite boolean, NOT the composite 3VL rule), ORDER BY / DISTINCT / GROUP BY array keys (the array_cmp total order, NULLs-last per element, shorter-prefix-first), and the whole-value IS NULL rule (a non-null array of NULL elements is NOT NULL). v1 ships 1-D values of scalar elements; multidimensional values (types.array_multidim), array slices (expr.array_slice), array-of-composite elements (types.array_composite), and the array function surface (func.array) landed as their own capabilities; arrays-in-keys (0A000) stay deferred. A bad element value traps 22003; a malformed array literal traps 22P02; comparing arrays of different element types is 42804; an array PRIMARY KEY is 0A000. Builds on types.i32"
 
 [[capability]]
 id = "types.array_composite"
@@ -334,7 +334,7 @@ description = "array-of-composite element types (spec/design/array.md §12 AC1) 
 
 [[capability]]
 id = "types.composite_array_field"
-description = "a composite type with an ARRAY-typed field (spec/design/array.md §12 — the mirror of types.array_composite) — CREATE TYPE poly AS (name text, pts int32[]) declares a composite whose field is a structural T[]. No format_version bump (still 10): the catalog composite-type entry gains a field_type_code 15 + the inline element-type descriptor (the same descriptor an array column uses, §3), placed before the field flags byte where a nested-composite name sits; the value codec / comparison / record_out / record_in all recurse for free through the array field (an array field's record_in token is an array text literal coerced through array_in, one level down). The element is a scalar or a previously-defined composite (the doubly-nested addr[] field — element_type_code 14 + name). Build via ROW('a', '{1,2,3}') / ROW('a', ARRAY[1,2,3]) (the array field as a text literal or ARRAY[…]); the PG-portable '(a,\"{1,2,3}\")'::poly cast parses it through record_in/array_in. Store/load round-trip; array_out renders the array field (then record_out quotes it, the two layers nest); composite 3VL comparison uses the array field's BTREE (always-definite) comparison and the lexicographic sort uses the array total order. DROP TYPE addr is blocked (2BP01) while an addr[] field (or column) references it — the dependency check looks through one array level. An array field typmod is 0A000; an unknown array element type is 42704. Builds on types.array and types.composite"
+description = "a composite type with an ARRAY-typed field (spec/design/array.md §12 — the mirror of types.array_composite) — CREATE TYPE poly AS (name text, pts i32[]) declares a composite whose field is a structural T[]. No format_version bump (still 10): the catalog composite-type entry gains a field_type_code 15 + the inline element-type descriptor (the same descriptor an array column uses, §3), placed before the field flags byte where a nested-composite name sits; the value codec / comparison / record_out / record_in all recurse for free through the array field (an array field's record_in token is an array text literal coerced through array_in, one level down). The element is a scalar or a previously-defined composite (the doubly-nested addr[] field — element_type_code 14 + name). Build via ROW('a', '{1,2,3}') / ROW('a', ARRAY[1,2,3]) (the array field as a text literal or ARRAY[…]); the PG-portable '(a,\"{1,2,3}\")'::poly cast parses it through record_in/array_in. Store/load round-trip; array_out renders the array field (then record_out quotes it, the two layers nest); composite 3VL comparison uses the array field's BTREE (always-definite) comparison and the lexicographic sort uses the array total order. DROP TYPE addr is blocked (2BP01) while an addr[] field (or column) references it — the dependency check looks through one array level. An array field typmod is 0A000; an unknown array element type is 42704. Builds on types.array and types.composite"
 
 [[capability]]
 id = "expr.array_subscript"
@@ -366,7 +366,7 @@ description = "array function surface AF5 (spec/design/array-functions.md §11) 
 
 [[capability]]
 id = "func.variadic"
-description = "array function surface AF6 (spec/design/array-functions.md §12) — the VARIADIC call syntax + variadic overload resolution, the make_interval-era follow-on unblocked by the array type, spent on the engine's first VARIADIC built-ins num_nulls/num_nonnulls (count the NULL / non-NULL arguments, result int32). A catalog row marked variadic=true makes its last parameter VARIADIC: the call takes EITHER a SPREAD of trailing arguments — num_nulls(1,'x',NULL), heterogeneous since the variadic element family is 'any', ≥1 arg required (num_nulls() is 42883) — OR a single array via the VARIADIC keyword — num_nulls(VARIADIC ARRAY[1,NULL,3]), whose flattened elements (any dimensionality) are counted. One grammar change: the VARIADIC keyword before a call's final argument only (a non-final or named VARIADIC is 42601), recorded as a variadic flag on the FuncCall node; VARIADIC is not reserved. NON-STRICT (null='none'): the spread form NEVER returns NULL (num_nulls(NULL) is 1), while the VARIADIC-array form returns NULL on a NULL whole-array operand. A VARIADIC keyword on a non-array or a bare untyped NULL operand is 42804 (not the polymorphic 42P18). The kernel charges one operator_eval (the per-element count walk is unmetered, like the array introspectors); arguments charge their own cost. Oracle-checked (postgres:18). Builds on func.array"
+description = "array function surface AF6 (spec/design/array-functions.md §12) — the VARIADIC call syntax + variadic overload resolution, the make_interval-era follow-on unblocked by the array type, spent on the engine's first VARIADIC built-ins num_nulls/num_nonnulls (count the NULL / non-NULL arguments, result i32). A catalog row marked variadic=true makes its last parameter VARIADIC: the call takes EITHER a SPREAD of trailing arguments — num_nulls(1,'x',NULL), heterogeneous since the variadic element family is 'any', ≥1 arg required (num_nulls() is 42883) — OR a single array via the VARIADIC keyword — num_nulls(VARIADIC ARRAY[1,NULL,3]), whose flattened elements (any dimensionality) are counted. One grammar change: the VARIADIC keyword before a call's final argument only (a non-final or named VARIADIC is 42601), recorded as a variadic flag on the FuncCall node; VARIADIC is not reserved. NON-STRICT (null='none'): the spread form NEVER returns NULL (num_nulls(NULL) is 1), while the VARIADIC-array form returns NULL on a NULL whole-array operand. A VARIADIC keyword on a non-array or a bare untyped NULL operand is 42804 (not the polymorphic 42P18). The kernel charges one operator_eval (the per-element count walk is unmetered, like the array introspectors); arguments charge their own cost. Oracle-checked (postgres:18). Builds on func.array"
 
 [[capability]]
 id = "func.array_composite"
@@ -398,15 +398,15 @@ description = "Explicit CAST(x AS type), including narrowing that may trap"
 
 [[capability]]
 id = "cast.string_literal"
-description = "Typed string literals — PostgreSQL's `type 'string'` form and `CAST(<string literal> AS type)` (spec/design/grammar.md §36): the literal's string is coerced to the NAMED type at resolve (int16/int32/int64, decimal, boolean, text + the string-native bytea/uuid/timestamp/timestamptz/interval). Unknown type name → 42704, malformed → 22P02, out of range → 22003. A runtime text→T cast on a non-literal text expression stays deferred (0A000); a bare string still does not silently coerce to a number/bool (strict, 42804). For integer/decimal, jed's own literal grammar — scientific `e`-notation is accepted (numeric '1.5e3' → 1500), but hex/underscore/NaN trap 22P02 where PG accepts them"
+description = "Typed string literals — PostgreSQL's `type 'string'` form and `CAST(<string literal> AS type)` (spec/design/grammar.md §36): the literal's string is coerced to the NAMED type at resolve (i16/i32/i64, decimal, boolean, text + the string-native bytea/uuid/timestamp/timestamptz/interval). Unknown type name → 42704, malformed → 22P02, out of range → 22003. A runtime text→T cast on a non-literal text expression stays deferred (0A000); a bare string still does not silently coerce to a number/bool (strict, 42804). For integer/decimal, jed's own literal grammar — scientific `e`-notation is accepted (numeric '1.5e3' → 1500), but hex/underscore/NaN trap 22P02 where PG accepts them"
 
 [[capability]]
 id = "cast.operator"
-description = "PostgreSQL's postfix `::` cast operator — `expr :: type` is exactly `CAST(expr AS type)` (spec/design/grammar.md §37): same cast matrix, string-literal coercion, deferred narrowings, typmod, and resolve codes. Chains left-associatively (`x::int8::int2`); binds tighter than unary minus (`-32768::int16` traps 22003, `(-32768)::int16` is in range); a lone `:` is 42601"
+description = "PostgreSQL's postfix `::` cast operator — `expr :: type` is exactly `CAST(expr AS type)` (spec/design/grammar.md §37): same cast matrix, string-literal coercion, deferred narrowings, typmod, and resolve codes. Chains left-associatively (`x::int8::int2`); binds tighter than unary minus (`-32768::i16` traps 22003, `(-32768)::i16` is in range); a lone `:` is 42601"
 
 [[capability]]
 id = "compare.promotion"
-description = "Cross-type integer comparison via the promotion tower (int16<int32<int64)"
+description = "Cross-type integer comparison via the promotion tower (i16<i32<i64)"
 
 [[capability]]
 id = "types.boolean"
@@ -463,11 +463,11 @@ description = "CASE expression (searched + simple forms): lazy first-match evalu
 # function so a core can land them independently.
 [[capability]]
 id = "func.sequence"
-description = "nextval('s') / currval('s') sequence value functions (volatile, int64) — nextval advances a sequence and returns the new value (first call returns START, then +INCREMENT, bounded by MIN/MAXVALUE → 2200H or CYCLE wrap), making the statement a WRITE (25006 in a read-only txn) and TRANSACTIONALLY (rolls back — a documented PG divergence, sequences.md §5); currval returns the value nextval last produced IN THIS SESSION (55000 before the first nextval), a per-handle read. Missing sequence 42P01, NULL name propagates NULL; one sequence_advance cost unit per nextval (spec/design/functions.md §14, sequences.md §4)"
+description = "nextval('s') / currval('s') sequence value functions (volatile, i64) — nextval advances a sequence and returns the new value (first call returns START, then +INCREMENT, bounded by MIN/MAXVALUE → 2200H or CYCLE wrap), making the statement a WRITE (25006 in a read-only txn) and TRANSACTIONALLY (rolls back — a documented PG divergence, sequences.md §5); currval returns the value nextval last produced IN THIS SESSION (55000 before the first nextval), a per-handle read. Missing sequence 42P01, NULL name propagates NULL; one sequence_advance cost unit per nextval (spec/design/functions.md §14, sequences.md §4)"
 
 [[capability]]
 id = "func.abs"
-description = "abs(x) scalar function — abs(int16|int32|int64) → same int type (abs(INT_MIN) overflows, 22003); abs(numeric) → numeric; NULL propagates (spec/design/functions.md §9)"
+description = "abs(x) scalar function — abs(i16|i32|i64) → same int type (abs(INT_MIN) overflows, 22003); abs(numeric) → numeric; NULL propagates (spec/design/functions.md §9)"
 
 [[capability]]
 id = "func.round"
@@ -479,7 +479,7 @@ description = "PostgreSQL named-argument notation f(name => value) + DEFAULT par
 
 [[capability]]
 id = "func.uuid_extract"
-description = "PURE uuid inspectors (spec/design/functions.md §12), oracle-checked against PostgreSQL 18 — uuid_extract_version(uuid) → int16 (the version nibble) and uuid_extract_timestamp(uuid) → timestamptz (the embedded instant). Both gate on the RFC 4122 variant ((byte8 & 0xC0)==0x80) and return NULL off-variant (Microsoft GUIDs, the nil uuid); uuid_extract_timestamp returns the instant for VERSION 1 and 7 only (v7 = 48-bit ms; v1 = 60-bit Gregorian 100ns minus the 1582→1970 offset, truncated to micros) and NULL for every other version (v6 included, matching PG 18). NULL input propagates"
+description = "PURE uuid inspectors (spec/design/functions.md §12), oracle-checked against PostgreSQL 18 — uuid_extract_version(uuid) → i16 (the version nibble) and uuid_extract_timestamp(uuid) → timestamptz (the embedded instant). Both gate on the RFC 4122 variant ((byte8 & 0xC0)==0x80) and return NULL off-variant (Microsoft GUIDs, the nil uuid); uuid_extract_timestamp returns the instant for VERSION 1 and 7 only (v7 = 48-bit ms; v1 = 60-bit Gregorian 100ns minus the 1582→1970 offset, truncated to micros) and NULL for every other version (v6 included, matching PG 18). NULL input propagates"
 
 [[capability]]
 id = "func.uuid_generate"
@@ -581,9 +581,9 @@ capabilities = [
   "query.where_eq",
   "query.is_null",
   "query.order_by",
-  "types.int16",
-  "types.int32",
-  "types.int64",
+  "types.i16",
+  "types.i32",
+  "types.i64",
   "null.three_valued",
   "error.overflow_trap",
 ]

@@ -5,10 +5,10 @@
 # Both bounds parse at the additive level, so the structural AND is not the logical connective
 # and `x BETWEEN a AND b AND c` is `(x BETWEEN a AND b) AND c`. Verified against PostgreSQL 18.
 # Format + `requires`: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.logical_connectives, expr.between, expr.comparison_value, types.int16, types.int32, types.text, null.three_valued, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.logical_connectives, expr.between, expr.comparison_value, types.i16, types.i32, types.text, null.three_valued, resource.cost_metering
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, a int32)
+CREATE TABLE t (id i32 PRIMARY KEY, a i32)
 
 statement ok
 INSERT INTO t VALUES (1, 5), (2, 15), (3, 25), (4, NULL)
@@ -70,7 +70,7 @@ SELECT id FROM t WHERE a BETWEEN id AND id + 20 ORDER BY id
 
 # A one-row table to evaluate constant predicates: the headline Kleene-AND cases.
 statement ok
-CREATE TABLE one (id int32 PRIMARY KEY)
+CREATE TABLE one (id i32 PRIMARY KEY)
 
 statement ok
 INSERT INTO one VALUES (1)
@@ -106,7 +106,7 @@ SELECT id FROM t WHERE a BETWEEN 1 AND 'x'
 
 # An untyped integer-literal bound too wide for the column's type traps at resolve.
 statement ok
-CREATE TABLE s16 (id int32 PRIMARY KEY, v int16)
+CREATE TABLE s16 (id i32 PRIMARY KEY, v i16)
 
 statement error 22003
 SELECT id FROM s16 WHERE v BETWEEN 1 AND 100000

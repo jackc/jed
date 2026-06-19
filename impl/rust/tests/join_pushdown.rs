@@ -8,12 +8,12 @@
 use jed::value::Value;
 use jed::{Database, Outcome, execute};
 
-/// `a` is `n` rows (id int32 PRIMARY KEY, k int32; k == id), wide enough to span several leaves; `b`
+/// `a` is `n` rows (id i32 PRIMARY KEY, k i32; k == id), wide enough to span several leaves; `b`
 /// is three small rows whose k-values exist as a's k-values, so the join matches.
 fn tables(n: i64) -> Database {
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE a (id int32 PRIMARY KEY, k int32)").unwrap();
-    execute(&mut db, "CREATE TABLE b (id int32 PRIMARY KEY, k int32)").unwrap();
+    execute(&mut db, "CREATE TABLE a (id i32 PRIMARY KEY, k i32)").unwrap();
+    execute(&mut db, "CREATE TABLE b (id i32 PRIMARY KEY, k i32)").unwrap();
     let mut sql = String::from("INSERT INTO a VALUES ");
     for i in 1..=n {
         if i > 1 {

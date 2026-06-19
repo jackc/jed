@@ -32,11 +32,11 @@ function idsSorted(db: Database): bigint[] {
   return out.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
-// seed returns a fresh file-backed t(id int32 PRIMARY KEY) holding rows 1,2 (each INSERT autocommits
+// seed returns a fresh file-backed t(id i32 PRIMARY KEY) holding rows 1,2 (each INSERT autocommits
 // durably) and the prior committed txid.
 function seed(path: string): { db: Database; prior: bigint } {
   const db = create(path);
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
+  execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   execute(db, "INSERT INTO t VALUES (1)");
   execute(db, "INSERT INTO t VALUES (2)");
   return { db, prior: db.txid };

@@ -1,4 +1,4 @@
-# CREATE SEQUENCE / ALTER SEQUENCE RESTART / DROP SEQUENCE — a named, persisted, monotonic int64
+# CREATE SEQUENCE / ALTER SEQUENCE RESTART / DROP SEQUENCE — a named, persisted, monotonic i64
 # generator as the third catalog-object kind (after tables + composite types), format_version 12.
 # Order-free CREATE options (INCREMENT/MINVALUE/MAXVALUE/START/CACHE/CYCLE), bigint-only, the shared
 # relation namespace (42P07 duplicate / 42P01 missing), option validation 22023, RESTRICT-only DROP.
@@ -6,7 +6,7 @@
 # slice; a non-RESTART action is 0A000). The value functions nextval/currval/setval/lastval are
 # exercised in ../expr/sequence_value.test. The transactional-rollback divergence (nextval/setval/
 # RESTART roll back — sequences.md §5) and read-only 25006 live in the per-core unit tests.
-# requires: ddl.sequence, func.sequence, ddl.create_table, ddl.drop_table, dml.insert, query.select, types.int64
+# requires: ddl.sequence, func.sequence, ddl.create_table, ddl.drop_table, dml.insert, query.select, types.i64
 
 # a bare CREATE SEQUENCE defaults to INCREMENT 1, MINVALUE 1, START 1
 statement ok
@@ -35,13 +35,13 @@ SELECT nextval('s')
 
 # the name collides with a table in the same namespace, both directions
 statement ok
-CREATE TABLE tbl (id int32 PRIMARY KEY)
+CREATE TABLE tbl (id i32 PRIMARY KEY)
 
 statement error 42P07
 CREATE SEQUENCE tbl
 
 statement error 42P07
-CREATE TABLE s (id int32 PRIMARY KEY)
+CREATE TABLE s (id i32 PRIMARY KEY)
 
 # --- option validation (22023) ----------------------------------------------
 

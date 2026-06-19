@@ -26,7 +26,7 @@
 	const DEFAULT_MAX_COST = 50_000_000n;
 	const DEFAULT_SQL = `-- A scratch in-memory database. Create a table, or open / import a .jed file on the left.
 CREATE TABLE note (
-  id   int32 PRIMARY KEY,
+  id   i32 PRIMARY KEY,
   body text NOT NULL
 );
 INSERT INTO note VALUES (1, 'hello'), (2, 'world');

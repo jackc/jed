@@ -3,10 +3,10 @@
 # restoring the committed state captured at BEGIN (including synthetic-rowid allocations — §7).
 # DDL is transactional: a table CREATEd in a rolled-back block does not exist afterward; a table
 # DROPped in one is still there. Format + the `requires` directive: ../../../design/conformance.md.
-# requires: txn.explicit, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, types.int32
+# requires: txn.explicit, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.where_eq, query.order_by, types.i32
 
 statement ok
-CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO t VALUES (1, 10), (2, 20)
@@ -49,7 +49,7 @@ statement ok
 BEGIN
 
 statement ok
-CREATE TABLE tmp (id int32 PRIMARY KEY)
+CREATE TABLE tmp (id i32 PRIMARY KEY)
 
 statement ok
 ROLLBACK

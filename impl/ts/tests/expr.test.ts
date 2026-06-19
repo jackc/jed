@@ -9,7 +9,7 @@ import { dbWith, query } from "./util.ts";
 
 test("comparisons project booleans (true / false / NULL)", () => {
   const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, a int32, b int32)",
+    "CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)",
     "INSERT INTO t VALUES (1, 5, 5)",
     "INSERT INTO t VALUES (2, 5, 9)",
     "INSERT INTO t VALUES (3, 5, NULL)",

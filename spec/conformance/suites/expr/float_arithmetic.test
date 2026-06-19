@@ -1,20 +1,20 @@
 # Binary float arithmetic operators `+ - * /` (and the jed-defined `%`) plus unary minus
-# over BOTH IEEE widths — float64 and float32 (spec/design/float.md §4). float_math.test
+# over BOTH IEEE widths — f64 and f32 (spec/design/float.md §4). float_math.test
 # covers the float FUNCTIONS (sqrt/ln/…); this file pins the OPERATOR kernel: the trapping
 # `+ − * /` path, IEEE special-value propagation (±Infinity / NaN), the finite-overflow trap
 # (22003), the zero-divisor trap (22012), and unary minus. Results render under the `R` tag
 # (parsed-value compare at tolerance, conformance.md §1), so a core's native float layout and
 # last-ULP rounding do not fail a test. Bare integer/decimal literals do NOT promote to float
-# (float.md §4), so operands are explicit float64/float32 values. PostgreSQL-oracle-checkable
+# (float.md §4), so operands are explicit f64/f32 values. PostgreSQL-oracle-checkable
 # except the `%` operator, which jed defines (IEEE fmod) and PostgreSQL does not (override ledger).
 # Format + `requires`: ../../../design/conformance.md.
-# requires: query.select, query.select_no_from, cast.operator, cast.string_literal, expr.arithmetic, expr.unary_minus, expr.parens, types.float64, types.float32, error.division_by_zero, error.overflow_trap
+# requires: query.select, query.select_no_from, cast.operator, cast.string_literal, expr.arithmetic, expr.unary_minus, expr.parens, types.f64, types.f32, error.division_by_zero, error.overflow_trap
 
-# === float64 =========================================================================
+# === f64 =========================================================================
 
 # --- finite +,-,*,/ : exact for these powers-of-two-friendly operands ----------------
 query RRRR nosort
-SELECT 10.0::float64 + 4.0::float64, 10.0::float64 - 4.0::float64, 10.0::float64 * 4.0::float64, 10.0::float64 / 4.0::float64
+SELECT 10.0::f64 + 4.0::f64, 10.0::f64 - 4.0::f64, 10.0::f64 * 4.0::f64, 10.0::f64 / 4.0::f64
 ----
 14
 6
@@ -23,14 +23,14 @@ SELECT 10.0::float64 + 4.0::float64, 10.0::float64 - 4.0::float64, 10.0::float64
 
 # --- IEEE special-value propagation: ±Infinity arithmetic, Infinity−Infinity = NaN ---
 query RRR nosort
-SELECT float64 'Infinity' * 2.0::float64, float64 'Infinity' / 2.0::float64, float64 '-Infinity' + 1.0::float64
+SELECT f64 'Infinity' * 2.0::f64, f64 'Infinity' / 2.0::f64, f64 '-Infinity' + 1.0::f64
 ----
 Infinity
 Infinity
 -Infinity
 
 query RRR nosort
-SELECT float64 'Infinity' - float64 'Infinity', 0.0::float64 / float64 'Infinity', float64 'NaN' * 2.0::float64
+SELECT f64 'Infinity' - f64 'Infinity', 0.0::f64 / f64 'Infinity', f64 'NaN' * 2.0::f64
 ----
 NaN
 0
@@ -38,70 +38,70 @@ NaN
 
 # --- finite overflow traps 22003 (a finite result that exceeds binary64 range) -------
 statement error 22003
-SELECT 1e308::float64 * 10.0::float64
+SELECT 1e308::f64 * 10.0::f64
 
 # --- zero divisor traps 22012 for EVERY numerator EXCEPT NaN (matching PG, float.md §3) ---
 # A finite numerator over a zero divisor traps.
 statement error 22012
-SELECT 1.0::float64 / 0.0::float64
+SELECT 1.0::f64 / 0.0::f64
 
 # An INFINITE numerator over a zero divisor also traps — `Inf / 0` is a division-by-zero error,
 # NOT a propagating ±Inf (the one zero-divisor exception to IEEE special-value propagation).
 statement error 22012
-SELECT float64 'Infinity' / 0.0::float64
+SELECT f64 'Infinity' / 0.0::f64
 
 # Only `NaN / 0` escapes the trap: a NaN numerator propagates to NaN (NOT a zero-divisor error).
 query R nosort
-SELECT float64 'NaN' / 0.0::float64
+SELECT f64 'NaN' / 0.0::f64
 ----
 NaN
 
 # --- unary minus: flips the sign, including ±Infinity; −NaN stays NaN -----------------
 query RRR nosort
-SELECT - (2.5::float64), - (float64 'Infinity'), - (float64 'NaN')
+SELECT - (2.5::f64), - (f64 'Infinity'), - (f64 'NaN')
 ----
 -2.5
 -Infinity
 NaN
 
-# === float32 =========================================================================
+# === f32 =========================================================================
 
 # --- finite +,-,*,/ at single precision ----------------------------------------------
 query RRRR nosort
-SELECT 10.0::float32 + 4.0::float32, 10.0::float32 - 4.0::float32, 10.0::float32 * 4.0::float32, 10.0::float32 / 4.0::float32
+SELECT 10.0::f32 + 4.0::f32, 10.0::f32 - 4.0::f32, 10.0::f32 * 4.0::f32, 10.0::f32 / 4.0::f32
 ----
 14
 6
 40
 2.5
 
-# --- IEEE special values propagate identically at float32 ----------------------------
+# --- IEEE special values propagate identically at f32 ----------------------------
 query RRR nosort
-SELECT float32 'Infinity' + 1.0::float32, float32 'Infinity' - float32 'Infinity', float32 'NaN' * 2.0::float32
+SELECT f32 'Infinity' + 1.0::f32, f32 'Infinity' - f32 'Infinity', f32 'NaN' * 2.0::f32
 ----
 Infinity
 NaN
 NaN
 
-# --- float32 finite overflow traps 22003 (a result beyond binary32 range) ------------
+# --- f32 finite overflow traps 22003 (a result beyond binary32 range) ------------
 statement error 22003
-SELECT 1e38::float32 * 10.0::float32
+SELECT 1e38::f32 * 10.0::f32
 
-# --- float32 zero-divisor: same rule as float64 (finite and Inf trap; only NaN/0 = NaN) ---
+# --- f32 zero-divisor: same rule as f64 (finite and Inf trap; only NaN/0 = NaN) ---
 statement error 22012
-SELECT 1.0::float32 / 0.0::float32
+SELECT 1.0::f32 / 0.0::f32
 
 statement error 22012
-SELECT float32 'Infinity' / 0.0::float32
+SELECT f32 'Infinity' / 0.0::f32
 
 query R nosort
-SELECT float32 'NaN' / 0.0::float32
+SELECT f32 'NaN' / 0.0::f32
 ----
 NaN
 
-# --- float32 unary minus -------------------------------------------------------------
+# --- f32 unary minus -------------------------------------------------------------
 query RR nosort
-SELECT - (10.0::float32), - (float32 'Infinity')
+SELECT - (10.0::f32), - (f32 'Infinity')
 ----
 -10
 -Infinity
@@ -111,18 +111,18 @@ SELECT - (10.0::float32), - (float32 'Infinity')
 # are pinned by oracle_overrides.toml. jed defines `%` for both float widths as IEEE fmod.
 
 query R nosort
-SELECT 7.5::float64 % 2.0::float64
+SELECT 7.5::f64 % 2.0::f64
 ----
 1.5
 
 query R nosort
-SELECT 7.5::float32 % 2.0::float32
+SELECT 7.5::f32 % 2.0::f32
 ----
 1.5
 
 # fmod by a zero divisor traps 22012, like `/` (a finite-numerator zero divisor).
 statement error 22012
-SELECT 1.0::float64 % 0.0::float64
+SELECT 1.0::f64 % 0.0::f64
 
 statement error 22012
-SELECT 1.0::float32 % 0.0::float32
+SELECT 1.0::f32 % 0.0::f32

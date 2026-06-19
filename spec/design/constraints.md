@@ -478,7 +478,7 @@ FK constraints resolve **after** the table-level `PRIMARY KEY`, the `UNIQUE` con
 5. **Types must match.** Each local column and its paired referenced column must be the **same**
    scalar type — else **`42804`** (`foreign key constraint <name> cannot be implemented: key columns
    <local> and <ref> are of incompatible types`). This is **stricter than PostgreSQL** (which allows
-   any pair sharing a btree equality operator, e.g. `int32`↔`int64`); the strict static type system
+   any pair sharing a btree equality operator, e.g. `i32`↔`i64`); the strict static type system
    (CLAUDE.md §4) is the overriding reason, recorded in §6.7. Because the referenced columns are a
    PK/unique key, they are already key-encodable; same-type pairing makes the local columns
    key-encodable too, so no separate `0A000` type gate is needed.
@@ -581,7 +581,7 @@ catalog is forward-compatible, but only `NO ACTION`/`RESTRICT` are ever written 
 ### 6.7 Divergences from PostgreSQL (documented per CLAUDE.md §1)
 
 - **Stricter type matching.** Corresponding FK columns must be the **same** scalar type (`42804`);
-  PG allows any pair with a shared btree equality operator (e.g. `int32`↔`int64`). The strict static
+  PG allows any pair with a shared btree equality operator (e.g. `i32`↔`i64`). The strict static
   type system (CLAUDE.md §4) is the overriding reason.
 - **End-state, not per-row, parent-side checks.** A parent UPDATE that swaps referenced unique
   values, or otherwise keeps every referenced tuple present in the end state, succeeds where PG's

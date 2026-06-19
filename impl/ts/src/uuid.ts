@@ -1,7 +1,7 @@
 // UUID bit-level operations (spec/design/functions.md §12). Value<->text rendering/parsing
 // lives in value.ts; this is the SEMANTIC bit work — extracting the version and embedded
 // timestamp from the 16 raw big-endian bytes (byte 0 is the most-significant). All functions
-// are PURE — deterministic functions of their input bytes. Computed over `bigint` (the int64
+// are PURE — deterministic functions of their input bytes. Computed over `bigint` (the i64
 // discipline — JS numbers are f64; the v1 60-bit ticks and v7 ms*1000 exceed 2^53). The pure
 // generator byte builders (buildUuidV4/buildUuidV7 below) live here too; the PRNG draws + clock
 // for the generators live on the entropy+clock seam (seam.ts).

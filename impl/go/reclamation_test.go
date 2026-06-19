@@ -41,7 +41,7 @@ func reclaimSetup(t *testing.T, path string, rows int) *Database {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, pad text)")
+	mustExec(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, pad text)")
 	base := strings.Repeat("x", 40)
 	for i := 1; i <= rows; i++ {
 		mustExec(t, db, fmt.Sprintf("INSERT INTO t VALUES (%d, 'r%02d-%s')", i, i, base))

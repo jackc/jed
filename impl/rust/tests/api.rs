@@ -18,7 +18,7 @@ fn create_commit_reopen_round_trips() {
 
     let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
     assert_eq!(db.txid(), 1); // the initial empty image is committed at create
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20)").unwrap();
     db.commit().unwrap();
     let after_commit = db.txid();
@@ -82,7 +82,7 @@ fn autocommit_persists_each_write_across_close() {
     let path = tmp("autocommit.jed");
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1)").unwrap(); // autocommitted, no explicit commit
     db.close().unwrap();
 
@@ -103,7 +103,7 @@ fn autocommit_persists_each_write_across_close() {
 fn commit_and_rollback_are_noops_under_autocommit() {
     // With no explicit transaction open, both are lenient no-op successes (transactions.md §4.2).
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
     db.commit().unwrap();
     db.rollback().unwrap(); // does NOT undo the autocommitted insert
@@ -116,7 +116,7 @@ fn commit_and_rollback_are_noops_under_autocommit() {
 #[test]
 fn prepare_execute_and_query_with_params() {
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     let insert = db.prepare("INSERT INTO t VALUES ($1, $2)").unwrap();
     insert
         .execute(&mut db, &[Value::Int(1), Value::Int(100)])
@@ -136,7 +136,7 @@ fn prepare_execute_and_query_with_params() {
 #[test]
 fn one_shot_query_iterates_rows() {
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1), (2), (3)").unwrap();
     let ids: Vec<Value> = db
         .query("SELECT id FROM t", &[])
@@ -150,7 +150,7 @@ fn one_shot_query_iterates_rows() {
 fn query_on_non_query_statement_errors() {
     let mut db = Database::new();
     assert!(
-        db.query("CREATE TABLE t (id int32 PRIMARY KEY)", &[])
+        db.query("CREATE TABLE t (id i32 PRIMARY KEY)", &[])
             .is_err()
     );
 }
@@ -164,7 +164,7 @@ fn errors_surface_with_sqlstate() {
 #[test]
 fn commit_on_in_memory_is_noop_success() {
     let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     db.commit().unwrap(); // no path -> no-op, not an error
     assert_eq!(db.txid(), 0);
     assert!(db.path().is_none());
@@ -180,7 +180,7 @@ fn incremental_commit_round_trips_to_canonical_image() {
     let path = tmp("incremental_canonical.jed");
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (5, 50)").unwrap();
     db.commit().unwrap();
     let canonical = db.to_image(db.page_size(), db.txid()).unwrap();
@@ -204,7 +204,7 @@ fn open_read_only_blocks_writes_and_never_touches_the_file() {
     let path = tmp("readonly.jed");
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
-    execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1)").unwrap();
     db.close().unwrap();
     let before = std::fs::read(&path).unwrap();
@@ -284,7 +284,7 @@ fn rows_affected_reports_dml_counts() {
         Outcome::Query { .. } => panic!("expected a statement outcome"),
     };
 
-    let ddl = execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int32)").unwrap();
+    let ddl = execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)").unwrap();
     assert_eq!(affected(ddl), None);
     let ins = execute(&mut db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)").unwrap();
     assert_eq!(affected(ins), Some(3));
@@ -300,7 +300,7 @@ fn rows_affected_reports_dml_counts() {
     assert_eq!(affected(commit), None);
 
     // INSERT ... SELECT counts the inserted rows; DML with RETURNING is a Query.
-    execute(&mut db, "CREATE TABLE dst (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "CREATE TABLE dst (id i32 PRIMARY KEY)").unwrap();
     let ins_sel = execute(&mut db, "INSERT INTO dst SELECT id FROM t").unwrap();
     assert_eq!(affected(ins_sel), Some(2));
     match execute(&mut db, "DELETE FROM dst RETURNING id").unwrap() {
@@ -315,8 +315,8 @@ fn table_names_lists_tables_sorted_excluding_indexes() {
     // lowercased name; secondary indexes are relations but not tables.
     let mut db = Database::new();
     assert_eq!(db.table_names(), Vec::<String>::new());
-    execute(&mut db, "CREATE TABLE Zed (id int32 PRIMARY KEY, v int32)").unwrap();
-    execute(&mut db, "CREATE TABLE apple (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "CREATE TABLE Zed (id i32 PRIMARY KEY, v i32)").unwrap();
+    execute(&mut db, "CREATE TABLE apple (id i32 PRIMARY KEY)").unwrap();
     execute(&mut db, "CREATE INDEX zed_v_idx ON Zed (v)").unwrap();
     // Sorted by LOWERCASED name (apple < zed), returning the canonical spelling (`Zed`).
     assert_eq!(
@@ -325,7 +325,7 @@ fn table_names_lists_tables_sorted_excluding_indexes() {
     );
     // The visible snapshot includes an open transaction's working set.
     execute(&mut db, "BEGIN").unwrap();
-    execute(&mut db, "CREATE TABLE mid (id int32 PRIMARY KEY)").unwrap();
+    execute(&mut db, "CREATE TABLE mid (id i32 PRIMARY KEY)").unwrap();
     assert_eq!(db.table_names(), vec!["apple", "mid", "Zed"]);
     execute(&mut db, "ROLLBACK").unwrap();
     assert_eq!(db.table_names(), vec!["apple", "Zed"]);

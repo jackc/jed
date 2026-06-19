@@ -7,10 +7,10 @@
 # one-arg round(integer) is double precision; jed has no float type, so it returns numeric —
 # value-identical. A bare untyped NULL / parameter as an argument (ambiguous overload) is out
 # of scope; NULL is exercised here through typed NULL columns, which propagate.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.int16, types.int32, types.int64, types.decimal, types.text, func.abs, func.round, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, types.i16, types.i32, types.i64, types.decimal, types.text, func.abs, func.round, resource.cost_metering
 
 statement ok
-CREATE TABLE n (id int32 PRIMARY KEY, i32 int32, i16 int16, i64 int64, d numeric)
+CREATE TABLE n (id i32 PRIMARY KEY, i32 i32, i16 i16, i64 i64, d numeric)
 
 statement ok
 INSERT INTO n VALUES
@@ -55,7 +55,7 @@ NULL
 
 # --- abs(int_min) has no positive counterpart → overflow 22003 at the result boundary ---
 statement ok
-CREATE TABLE mins (id int32 PRIMARY KEY, i32 int32, i16 int16, i64 int64)
+CREATE TABLE mins (id i32 PRIMARY KEY, i32 i32, i16 i16, i64 i64)
 
 statement ok
 INSERT INTO mins VALUES (1, -2147483648, -32768, -9223372036854775808)
@@ -71,7 +71,7 @@ SELECT abs(i64) FROM mins
 
 # --- round: half away from zero, to scale 0 (1-arg) or n places (2-arg) -----------------
 statement ok
-CREATE TABLE r (id int32 PRIMARY KEY, d numeric, places int32)
+CREATE TABLE r (id i32 PRIMARY KEY, d numeric, places i32)
 
 statement ok
 INSERT INTO r VALUES
@@ -176,7 +176,7 @@ SELECT abs(i32 - i16) FROM n WHERE id = 2
 
 # --- function names are NOT reserved: a column may be named abs / round -----------------
 statement ok
-CREATE TABLE c (id int32 PRIMARY KEY, abs int32, round numeric)
+CREATE TABLE c (id i32 PRIMARY KEY, abs i32, round numeric)
 
 statement ok
 INSERT INTO c VALUES (1, -8, -3.5)
@@ -198,7 +198,7 @@ SELECT round(round) FROM c WHERE id = 1
 
 # --- cost: one operator_eval per call. 3 scanned + 3 produced + 3 abs evals = 9 ---------
 statement ok
-CREATE TABLE k (id int32 PRIMARY KEY, v int32)
+CREATE TABLE k (id i32 PRIMARY KEY, v i32)
 
 statement ok
 INSERT INTO k VALUES (1, -5), (2, 5), (3, 0)
@@ -222,7 +222,7 @@ statement error 42883
 SELECT round(d, d) FROM n
 
 statement ok
-CREATE TABLE tx (id int32 PRIMARY KEY, s text)
+CREATE TABLE tx (id i32 PRIMARY KEY, s text)
 
 statement ok
 INSERT INTO tx VALUES (1, 'hi')

@@ -175,7 +175,7 @@ is the design that lets them land without breaking G1/G2.
 
 ## 6. Binary floats — the only internal surrender of G2
 
-**Status: landed — `float32`/`float64` are the first exempted types** ([float.md](float.md);
+**Status: landed — `f32`/`f64` are the first exempted types** ([float.md](float.md);
 the design doc, type-system data, and exception ledger are authored and the types are landed
 across all three cores). They are the *defining* members of class **A**: the one case where a value that **has** a right answer is
 computed *differently per core* (G2) and per platform (G3) and cannot be injected away — but the
@@ -191,7 +191,7 @@ The hard surface and the resolutions taken (full detail in [float.md](float.md))
   precision, round-ties-to-even, no flush-to-zero, and **no FMA contraction**. Rust and TS do
   not contract by default; **Go does** (`(Add (Mul x y) z)` fuses on ARM64 always, amd64 at
   `GOAMD64≥v3`), so the same Go source diverges across platforms (a G3 break) unless each
-  multiply-feeding-add is written `float64(a*b)+c` (the spec-blessed barrier; a named
+  multiply-feeding-add is written `f64(a*b)+c` (the spec-blessed barrier; a named
   intermediate is *not* guaranteed). In a tree-walking evaluator this barrier is structural
   (the product is a rounded return value before the add sees it), so the real exposure is
   hand-written numeric kernels — i.e. aggregates and transcendentals.
@@ -243,7 +243,7 @@ operation rather than discovering sensitivity at runtime:
 | Aggregate | Order-sensitive? | Resolution |
 |---|---|---|
 | `COUNT`, `MIN`, `MAX`, `bool_and`/`bool_or` | no (commutative+associative+idempotent) | parallel-safe, no work |
-| `SUM`/`AVG` over **int** | no (widens to int64/decimal; intermediates don't overflow) | parallel-safe |
+| `SUM`/`AVG` over **int** | no (widens to i64/decimal; intermediates don't overflow) | parallel-safe |
 | `SUM`/`AVG` over **decimal** | no (**resolved**) | values associative; the fold checks the cap only on the **final** result (the `add_uncapped` accumulator path — [decimal.md](decimal.md) §2), matching PG → order-independent. (Previously trapped on the first over-cap intermediate, an order-dependent trap; that edge is closed.) |
 | `SUM`/`AVG` over **float** | yes (value) | **A**: exact accumulator → order-independent (§6) |
 | `string_agg`, `array_agg`, `json_agg` | yes (inherently) | **B/C** below — concatenation order *is* the meaning |
@@ -331,7 +331,7 @@ exists and is wired into `rake verify`; each entry states:
 # bounded blast radius (determinism.md §4), and how the corpus still tests it.
 [[exception]]
 id          = "float-transcendental"      # stable slug
-surface     = "sin/cos/exp/log/pow over float64"
+surface     = "sin/cos/exp/log/pow over f64"
 class       = "A"                          # U | B | A | I | P  (determinism.md §2)
 drops       = ["G2", "G3"]                 # keeps the rest
 blast_radius = "the float result column; promotes to row multiset only via a float-gated WHERE/ORDER BY/CAST (determinism.md §4)"
@@ -389,7 +389,7 @@ When a section here moves from proposed/unratified to ratified, update **in the 
 | §3 | Non-members (limits, collation, iteration-order) | **ratified** (restates existing rules) |
 | §4 | Containment / no-contamination invariant | **proposed** |
 | §5 class **B** | Clock + entropy seams, spec'd PRNG | **ratified** for `uuidv4`/`uuidv7` and the clock functions `now()`/`current_timestamp`/`clock_timestamp()` ([entropy.md](entropy.md)); **proposed** for `random()` |
-| §6 class **A** | Binary floats (`float32`/`float64`) | **landed** — spec + ledger authored, all three cores ([float.md](float.md)) |
+| §6 class **A** | Binary floats (`f32`/`f64`) | **landed** — spec + ledger authored, all three cores ([float.md](float.md)) |
 | §7 class **P** | Parallelism = optimization; `order_sensitive` flag | **proposed framework** |
 | §8 class **P** | Plan-dependent observables / cost-identity fork | **unratified** (open) |
 | §9 | Exception ledger + admission criteria | **proposed** |

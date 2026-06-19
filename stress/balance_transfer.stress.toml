@@ -17,7 +17,7 @@ seed        = 1234         # drives the fallback interleaver (a fixed-op workloa
 
 [setup]                    # run once, deterministically, before any worker starts
 sql = [
-  "CREATE TABLE acct (id int32 PRIMARY KEY, bal int64)",
+  "CREATE TABLE acct (id i32 PRIMARY KEY, bal i64)",
   "INSERT INTO acct VALUES (1, 1000), (2, 0)",
 ]
 

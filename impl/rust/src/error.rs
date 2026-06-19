@@ -25,7 +25,7 @@ pub enum SqlState {
     /// 22007 — invalid datetime format (malformed timestamp / timestamptz input).
     InvalidDatetimeFormat,
     /// 22008 — datetime field overflow (an out-of-range datetime field or a value
-    /// beyond the representable int64-microsecond range; spec/design/timestamp.md).
+    /// beyond the representable i64-microsecond range; spec/design/timestamp.md).
     DatetimeFieldOverflow,
     /// 22012 — division (or modulo) by zero.
     DivisionByZero,

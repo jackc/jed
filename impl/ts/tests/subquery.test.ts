@@ -15,9 +15,9 @@ import { dbWith, errCode } from "./util.ts";
 
 function ab() {
   return dbWith([
-    "CREATE TABLE a (id int32 PRIMARY KEY, k int32)",
-    "CREATE TABLE b (id int32 PRIMARY KEY, k int32)",
-    "CREATE TABLE one (id int32 PRIMARY KEY)",
+    "CREATE TABLE a (id i32 PRIMARY KEY, k i32)",
+    "CREATE TABLE b (id i32 PRIMARY KEY, k i32)",
+    "CREATE TABLE one (id i32 PRIMARY KEY)",
     "INSERT INTO a VALUES (1, 10), (2, 20), (3, 30)",
     "INSERT INTO b VALUES (1, 20), (2, 30), (3, 40)",
     "INSERT INTO one VALUES (1)",
@@ -39,8 +39,8 @@ test("a subquery's inner error is raised over an empty outer (plan-once)", () =>
   // The subquery is planned once, so a >1-column error fires even when the outer is empty. The
   // corpus pins the same guarantee via an empty inner filter, not an empty outer — so this is kept.
   const db = dbWith([
-    "CREATE TABLE e (id int32 PRIMARY KEY, v int32)",
-    "CREATE TABLE f (id int32 PRIMARY KEY, v int32)",
+    "CREATE TABLE e (id i32 PRIMARY KEY, v i32)",
+    "CREATE TABLE f (id i32 PRIMARY KEY, v i32)",
     "INSERT INTO f VALUES (1, 1)",
   ]);
   assert.strictEqual(

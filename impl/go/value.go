@@ -13,7 +13,7 @@ type ValueKind int
 const (
 	// ValNull is SQL NULL. It is the zero ValueKind, so a zero Value is NULL.
 	ValNull ValueKind = iota
-	// ValInt is an integer (any int* column type; stored as int64).
+	// ValInt is an integer (any int* column type; stored as i64).
 	ValInt
 	// ValBool is a boolean (the boolean column type; false/true stored as a bool-byte).
 	ValBool
@@ -28,23 +28,23 @@ const (
 	// ValBytea, but a distinct kind: a uuid renders 8-4-4-4-12 and is its own comparison family,
 	// so a uuid never equals a bytea even with identical bytes — spec/design/types.md §14).
 	ValUuid
-	// ValTimestamp is a zoneless timestamp; Int holds the int64 microsecond instant (the
+	// ValTimestamp is a zoneless timestamp; Int holds the i64 microsecond instant (the
 	// sentinels NegInfinity/PosInfinity are -infinity/+infinity — spec/design/timestamp.md).
 	ValTimestamp
-	// ValTimestamptz is a UTC-instant timestamptz; Int holds the int64 microsecond instant.
+	// ValTimestamptz is a UTC-instant timestamptz; Int holds the i64 microsecond instant.
 	ValTimestamptz
 	// ValInterval is a span — Iv holds the three fields (months/days/micros). Comparison/dedup
 	// go through the canonical 128-bit span, NOT field equality (spec/design/interval.md).
 	ValInterval
-	// ValFloat32 is an IEEE 754 binary32 (the float32 / real type, spec/design/float.md). Int
-	// holds math.Float32bits(value) zero-extended to int64 — the bits are stored VERBATIM (a
+	// ValFloat32 is an IEEE 754 binary32 (the f32 / real type, spec/design/float.md). Int
+	// holds math.Float32bits(value) zero-extended to i64 — the bits are stored VERBATIM (a
 	// stored -0.0 keeps its sign bit); the total order / dedup / keys canonicalize -0→+0 and
 	// collapse NaN patterns at COMPARISON time, not in storage (float.md §3).
 	ValFloat32
-	// ValFloat64 is an IEEE 754 binary64 (the float64 / double-precision type). Int holds
-	// math.Float64bits(value); same verbatim-storage / canonical-comparison rule as float32.
+	// ValFloat64 is an IEEE 754 binary64 (the f64 / double-precision type). Int holds
+	// math.Float64bits(value); same verbatim-storage / canonical-comparison rule as f32.
 	ValFloat64
-	// ValDate is a calendar date; Int holds the int32 day count since 1970-01-01 (the sentinels
+	// ValDate is a calendar date; Int holds the i32 day count since 1970-01-01 (the sentinels
 	// DateNegInfinity/DatePosInfinity are -infinity/+infinity — spec/design/date.md). Compares by
 	// the day count; renders YYYY-MM-DD.
 	ValDate
@@ -86,7 +86,7 @@ type Unfetched struct {
 }
 
 // Value is a runtime value: SQL NULL, an integer, a boolean, or a text string. Integers
-// fit in int64 regardless of their declared column type (the type governs range checks and
+// fit in i64 regardless of their declared column type (the type governs range checks and
 // key-encoding width, not the representation). A ValBool is produced by comparisons and
 // connectives, can be projected/rendered, and — now that boolean is storable
 // (spec/design/types.md §9) — is stored in a boolean column; a NULL boolean (unknown) is
@@ -176,16 +176,16 @@ func ByteaValue(b []byte) Value { return Value{Kind: ValBytea, Str: string(b)} }
 // like bytea, but tagged ValUuid). The caller must pass exactly 16 bytes (ParseUUID guarantees).
 func UuidValue(b []byte) Value { return Value{Kind: ValUuid, Str: string(b)} }
 
-// TimestampValue builds a non-null timestamp from its int64 microsecond instant.
+// TimestampValue builds a non-null timestamp from its i64 microsecond instant.
 func TimestampValue(m int64) Value { return Value{Kind: ValTimestamp, Int: m} }
 
-// TimestamptzValue builds a non-null timestamptz from its int64 microsecond instant.
+// TimestamptzValue builds a non-null timestamptz from its i64 microsecond instant.
 func TimestamptzValue(m int64) Value { return Value{Kind: ValTimestamptz, Int: m} }
 
 // IntervalValue builds a non-null interval value.
 func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, Iv: iv} }
 
-// DateValue builds a non-null date from its int32 day count since 1970-01-01.
+// DateValue builds a non-null date from its i32 day count since 1970-01-01.
 func DateValue(d int32) Value { return Value{Kind: ValDate, Int: int64(d)} }
 
 // CompositeValue builds a non-null composite (row) value from its field values
@@ -199,26 +199,26 @@ func ArrayValue(elems []Value) Value { return Value{Kind: ValArray, Array: OneDi
 // ArrayValueOf builds an array value from an already-shaped ArrayVal (spec/design/array.md §4).
 func ArrayValueOf(a *ArrayVal) Value { return Value{Kind: ValArray, Array: a} }
 
-// Float32Value builds a non-null float32 value from a Go float32 — the bits are stored verbatim
+// Float32Value builds a non-null f32 value from a Go f32 — the bits are stored verbatim
 // in Int (math.Float32bits, zero-extended), so -0.0 / NaN / ±Inf keep their original pattern
 // (spec/design/float.md §3/§10). The total order / keys canonicalize at comparison time, not here.
 func Float32Value(f float32) Value {
 	return Value{Kind: ValFloat32, Int: int64(math.Float32bits(f))}
 }
 
-// Float64Value builds a non-null float64 value from a Go float64 — the bits are stored verbatim
+// Float64Value builds a non-null f64 value from a Go f64 — the bits are stored verbatim
 // in Int (math.Float64bits), preserving -0.0 / NaN / ±Inf bit patterns (spec/design/float.md §3/§10).
 func Float64Value(f float64) Value {
 	return Value{Kind: ValFloat64, Int: int64(math.Float64bits(f))}
 }
 
-// F32 returns the Go float32 of a ValFloat32 value (the inverse of Float32Value).
+// F32 returns the Go f32 of a ValFloat32 value (the inverse of Float32Value).
 func (v Value) F32() float32 { return math.Float32frombits(uint32(v.Int)) }
 
-// F64 returns the Go float64 of a ValFloat64 value (the inverse of Float64Value).
+// F64 returns the Go f64 of a ValFloat64 value (the inverse of Float64Value).
 func (v Value) F64() float64 { return math.Float64frombits(uint64(v.Int)) }
 
-// asF64 returns a float value (either width) as a float64 — float32 widens losslessly (the
+// asF64 returns a float value (either width) as a f64 — f32 widens losslessly (the
 // implicit-cast / total-order path; spec/design/float.md §2). Caller guarantees a float kind.
 func (v Value) asF64() float64 {
 	if v.Kind == ValFloat32 {
@@ -475,7 +475,7 @@ func numericCmp(a, b Value) (int, bool) {
 
 // Eq3 is three-valued equality. NULL compared with anything (including NULL) is
 // UNKNOWN — equality is not reflexive across NULL (CLAUDE.md §4). Integers compare by
-// value (all integer types promote losslessly into int64); text compares by the C
+// value (all integer types promote losslessly into i64); text compares by the C
 // collation — raw UTF-8 bytes, which for UTF-8 equals code-point order
 // (spec/design/types.md §11). Go string == / < / > already compare by byte order;
 // booleans compare by value (false < true). A mixed cross-family pair never reaches here
@@ -494,7 +494,7 @@ func (v Value) Eq3(o Value) ThreeValued {
 	}
 	if v.IsFloat() && o.IsFloat() {
 		// The PG float8 TOTAL order (NOT raw IEEE): -0 = +0, NaN = NaN, NaN largest. So
-		// NaN = NaN is TRUE (spec/design/float.md §3). Mixed widths promote to float64.
+		// NaN = NaN is TRUE (spec/design/float.md §3). Mixed widths promote to f64.
 		return bool3(floatTotalCmp(v.asF64(), o.asF64()) == 0)
 	}
 	if v.Kind == ValText && o.Kind == ValText {
@@ -509,14 +509,14 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValUuid || o.Kind == ValUuid {
 		return bool3(v.Str == o.Str)
 	}
-	// Timestamps compare by the int64 instant (infinity is just an extreme value).
+	// Timestamps compare by the i64 instant (infinity is just an extreme value).
 	if v.Kind == ValTimestamp && o.Kind == ValTimestamp {
 		return bool3(v.Int == o.Int)
 	}
 	if v.Kind == ValTimestamptz && o.Kind == ValTimestamptz {
 		return bool3(v.Int == o.Int)
 	}
-	// Dates compare by the int32 day count (infinity is just an extreme value).
+	// Dates compare by the i32 day count (infinity is just an extreme value).
 	if v.Kind == ValDate && o.Kind == ValDate {
 		return bool3(v.Int == o.Int)
 	}
