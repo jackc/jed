@@ -368,8 +368,11 @@ def gen_gin(seed)
   absent = ((0..9).to_a - elems).sample(random: rng) || 9
   # A second term co-occurring with `present` in some row (so the intersection is non-empty when
   # possible); else fall back to `present` (then [present, k2].uniq is a single term — still valid).
-  partner = rows.filter_map { |_id, t| t }.find { |t| t.include?(present) && t.size > 1 }
-  k2 = partner ? (partner - [present]).sample(random: rng) : present
+  # The partner row must hold a DISTINCT element other than `present`: `t.size > 1` counts
+  # duplicates, so a row like `{3,3,3}` would match yet `t - [present]` is empty → `k2 = nil` →
+  # the malformed literal `'{3,}'` (22P02). Require `(t.uniq - [present]).any?` instead.
+  partner = rows.filter_map { |_id, t| t }.find { |t| t.include?(present) && (t.uniq - [present]).any? }
+  k2 = partner ? (partner.uniq - [present]).sample(random: rng) : present
 
   lit = ->(t) { t.nil? ? "NULL" : "'{#{t.join(',')}}'" }
   arr = ->(ks) { "'{#{ks.join(',')}}'::i32[]" }
