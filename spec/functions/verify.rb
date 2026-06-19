@@ -58,14 +58,15 @@ SPEC_DIR = File.expand_path("..", FUNC_DIR)
 
 # Polymorphic pseudo-families (../design/array-functions.md §2). NOT real families in
 # scalars.toml (not storable, no id/codec) — catalog CONTRACT TOKENS the hand-written resolver
-# interprets: `anyarray` matches any array arg (binds ELEM := its element type); `anyelement`
-# matches any arg (binds/checks ELEM). Admitted in arg_families AND, for the array builders'
-# result, as reserved result codes (anyarray = ELEM[], anyelement = ELEM).
-POLYMORPHIC_FAMILIES = %w[anyarray anyelement].to_set
+# interprets: `anyarray` matches any array arg (binds ELEM := its element type); `anyrange` matches
+# any range arg (binds ELEM := its element type — range-functions.md §1); `anyelement` matches any
+# arg (binds/checks ELEM). Admitted in arg_families AND, for the array builders' / range constructors'
+# result, as reserved result codes (anyarray = ELEM[], anyrange = ELEM-range, anyelement = ELEM).
+POLYMORPHIC_FAMILIES = %w[anyarray anyrange anyelement].to_set
 
 # `none` is the non-strict discipline (array_append/prepend/cat): the resolver does NOT
 # short-circuit a NULL argument — the kernel handles NULL itself (array-functions.md §4).
-RESERVED_RESULTS = %w[promoted anyarray anyelement].to_set
+RESERVED_RESULTS = %w[promoted anyarray anyrange anyelement].to_set
 # "concat" is the `||` array concatenation operator's kind (array-functions.md §8): a binary infix
 # operator with its own precedence, polymorphic over anyarray/anyelement like the array functions.
 # "containment" is the kind of the array containment/overlap operators `@>`/`<@`/`&&`

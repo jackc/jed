@@ -48,6 +48,9 @@ var SupportedCapabilities = []string{
 	// range_out, discrete canonicalization, empty normalization, IS NULL. Comparison + the
 	// constructor/operator surface land in R3 / RF1–RF4.
 	"types.range",
+	// Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
+	// the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
+	"func.range_accessors",
 	// Array function/operator surface AF1 (array-functions.md): the polymorphic anyarray/anyelement
 	// resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
 	// (array_append/prepend/cat).

@@ -9023,6 +9023,12 @@ const (
 	// its builders return an array; NULL handling is per-kernel (the introspectors propagate, the
 	// builders are non-strict), so there is no blanket NULL short-circuit at eval.
 	reArrayFunc
+	// reRangeFunc is a polymorphic range accessor call (spec/design/range-functions.md §1 — lower/
+	// upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf), evaluated per row. Like reArrayFunc it
+	// resolves over a pseudo-family (anyrange, binding ELEM := the element type) and reuses `sargs`
+	// for its single range argument; `rfunc` selects the kernel. All are STRICT (a NULL range → NULL,
+	// handled in the kernel). The result type lives in the surrounding resolvedType.
+	reRangeFunc
 	// reVariadic is a VARIADIC argument-counting call (spec/design/array-functions.md §12 —
 	// num_nulls/num_nonnulls). Non-strict (null = "none"): no blanket NULL short-circuit. Its
 	// argument nodes reuse `sargs`; `variadicArray` records the call shape (false = the spread form,
@@ -9159,6 +9165,21 @@ const (
 	afOverlaps                     // a && b (anyarray, anyarray) → boolean; do a and b share an element; strict eq (§10)
 )
 
+// rangeFunc selects a polymorphic range accessor (spec/design/range-functions.md §1, RF1). Like
+// arrayFunc each is single-arity, so the name alone picks the kernel; the eval recovers everything
+// else from the operand range value (self-describing). All are STRICT (a NULL range → NULL).
+type rangeFunc int
+
+const (
+	rfLower    rangeFunc = iota // lower(anyrange) → anyelement; NULL if empty / unbounded below
+	rfUpper                     // upper(anyrange) → anyelement; NULL if empty / unbounded above
+	rfIsEmpty                   // isempty(anyrange) → boolean
+	rfLowerInc                  // lower_inc(anyrange) → boolean (false for empty / an infinite lower bound)
+	rfUpperInc                  // upper_inc(anyrange) → boolean (false for empty / an infinite upper bound)
+	rfLowerInf                  // lower_inf(anyrange) → boolean (false for the empty range)
+	rfUpperInf                  // upper_inf(anyrange) → boolean (false for the empty range)
+)
+
 // variadicFunc selects a VARIADIC argument-counting function (spec/design/array-functions.md §12).
 // Both return i32; the call form (spread vs VARIADIC-array) lives on the rExpr node.
 type variadicFunc int
@@ -9204,6 +9225,10 @@ type rExpr struct {
 	// type lives in the surrounding resolvedType (carried out of resolve), not on the node — the
 	// kernel produces the result value from the operands (an array value is self-describing).
 	afunc arrayFunc
+	// reRangeFunc: the polymorphic range accessor; its single range argument reuses `sargs`. Like
+	// reArrayFunc the result type lives in the surrounding resolvedType (carried out of resolve), not
+	// on the node — the kernel produces the result value from the operand (a range is self-describing).
+	rfunc rangeFunc
 	// reVariadic: the VARIADIC counting function and its call shape. Argument nodes reuse `sargs`;
 	// `variadicArray` true ⇒ the VARIADIC-array form (one array operand), false ⇒ the spread form.
 	vfunc         variadicFunc
@@ -10487,6 +10512,22 @@ func matchPoly(slots []string, tys []resolvedType) (elem *resolvedType, matched 
 			}
 		}
 	}
+	// anyrange binds ELEM := the range's element type, like anyarray (both definitive, before
+	// anyelement) — range-functions.md §1.
+	for j, slot := range slots {
+		if slot == "anyrange" {
+			switch tys[j].kind {
+			case rtRange:
+				if !unifyElem(&elem, *tys[j].elem) {
+					return nil, false
+				}
+			case rtNull:
+				// untyped NULL — defer
+			default:
+				return nil, false // a non-range where anyrange is required
+			}
+		}
+	}
 	for j, slot := range slots {
 		if slot == "anyelement" {
 			if tys[j].kind != rtNull { // untyped NULL — defer
@@ -10497,7 +10538,7 @@ func matchPoly(slots []string, tys []resolvedType) (elem *resolvedType, matched 
 		}
 	}
 	for j, slot := range slots {
-		if slot != "anyarray" && slot != "anyelement" && !familyMatches(slot, tys[j]) {
+		if slot != "anyarray" && slot != "anyrange" && slot != "anyelement" && !familyMatches(slot, tys[j]) {
 			return nil, false
 		}
 	}
@@ -10515,6 +10556,12 @@ func polyResultType(code string, elem *resolvedType) (resolvedType, error) {
 		}
 		cp := *elem
 		return resolvedType{kind: rtArray, elem: &cp}, nil
+	case "anyrange":
+		if elem == nil {
+			return resolvedType{}, indeterminatePoly()
+		}
+		cp := *elem
+		return resolvedType{kind: rtRange, elem: &cp}, nil
 	case "anyelement":
 		if elem == nil {
 			return resolvedType{}, indeterminatePoly()
@@ -10649,6 +10696,89 @@ func resolveArrayFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		return nil, resolvedType{}, err
 	}
 	return &rExpr{kind: reArrayFunc, afunc: arrayFuncID(name), sargs: rargs}, result, nil
+}
+
+// isRangeFuncName reports whether name (lowercased) is a polymorphic range function — a
+// Kind=="function" catalog row whose ArgFamilies mention anyrange (range-functions.md §1).
+// Data-driven, so a new range-function row wires here without touching this gate.
+func isRangeFuncName(name string) bool {
+	for i := range Operators {
+		o := &Operators[i]
+		if o.Kind == "function" && o.Name == name {
+			for _, f := range o.ArgFamilies {
+				if f == "anyrange" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
+// rangeFuncID is the kernel id for range accessor name (each is single-arity, so the name selects the
+// kernel). Total over the catalog's range-function names (isRangeFuncName gates the call).
+func rangeFuncID(name string) rangeFunc {
+	switch name {
+	case "lower":
+		return rfLower
+	case "upper":
+		return rfUpper
+	case "isempty":
+		return rfIsEmpty
+	case "lower_inc":
+		return rfLowerInc
+	case "upper_inc":
+		return rfUpperInc
+	case "lower_inf":
+		return rfLowerInf
+	case "upper_inf":
+		return rfUpperInf
+	default:
+		panic("rangeFuncID: " + name + " is not a catalog range function")
+	}
+}
+
+// resolveRangeFunc resolves a polymorphic range accessor over the anyrange pseudo-family
+// (range-functions.md §1). Simpler than resolveArrayFunc — the accessors take a single anyrange arg
+// with no anyelement arg, so there is no element-hint literal adaptation. lower/upper resolve to ELEM
+// (the bound type), the rest to boolean.
+func resolveRangeFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if fc.Star {
+		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+	}
+	name := toLowerASCII(fc.Name)
+	var desc *OperatorDesc
+	for i := range Operators {
+		o := &Operators[i]
+		if o.Kind == "function" && o.Name == name && o.Arity == len(fc.Args) {
+			desc = o
+			break
+		}
+	}
+	if desc == nil {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	slots := desc.ArgFamilies
+
+	rargs := make([]*rExpr, len(fc.Args))
+	tys := make([]resolvedType, len(fc.Args))
+	for i := range fc.Args {
+		r, t, err := resolve(s, *fc.Args[i], nil, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		rargs[i] = r
+		tys[i] = t
+	}
+	elem, matched := matchPoly(slots, tys)
+	if !matched {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	result, err := polyResultType(desc.Result, elem)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	return &rExpr{kind: reRangeFunc, rfunc: rangeFuncID(name), sargs: rargs}, result, nil
 }
 
 // resolveConcat resolves the `||` array concatenation operator (array-functions.md §8): overload
@@ -11012,6 +11142,12 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		return resolveArrayFunc(s, fc, ag, params)
+	}
+	if isRangeFuncName(name) {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return resolveRangeFunc(s, fc, ag, params)
 	}
 	if isScalarFuncName(name) {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
@@ -11675,6 +11811,10 @@ func resolvedTypeOfCol(ty Type, snap *Snapshot) resolvedType {
 	if ty.Array != nil {
 		elem := resolvedTypeOfCol(*ty.Array, snap)
 		return resolvedType{kind: rtArray, elem: &elem}
+	}
+	if ty.Range != nil {
+		elem := resolvedTypeOfCol(*ty.Range, snap)
+		return resolvedType{kind: rtRange, elem: &elem}
 	}
 	if ty.Comp == nil {
 		return resolvedTypeOf(ty.Scalar)
@@ -13531,6 +13671,43 @@ func evalArrayFunc(fn arrayFunc, vals []Value) (Value, error) {
 	}
 }
 
+// evalRangeFunc evaluates a range accessor (spec/design/range-functions.md §1). STRICT: a NULL range
+// → NULL. lower/upper yield the bound value (NULL when empty or unbounded on that side); the _inc/_inf
+// readers + isempty yield boolean. For the empty range every reader but isempty is false/NULL; for an
+// infinite bound the _inf reader is true and the _inc reader false. The resolver guarantees the
+// operand is a range or NULL.
+func evalRangeFunc(fn rangeFunc, vals []Value) (Value, error) {
+	if vals[0].Kind == ValNull {
+		return NullValue(), nil
+	}
+	rv := vals[0].Range
+	switch fn {
+	case rfLower:
+		if rv.Empty || rv.Lower == nil {
+			return NullValue(), nil
+		}
+		return *rv.Lower, nil
+	case rfUpper:
+		if rv.Empty || rv.Upper == nil {
+			return NullValue(), nil
+		}
+		return *rv.Upper, nil
+	case rfIsEmpty:
+		return BoolValue(rv.Empty), nil
+	// For the empty range both inclusivity flags are false by the canonical invariant, so reading them
+	// directly already yields PG's false; an infinite bound likewise stores LowerInc/UpperInc = false.
+	case rfLowerInc:
+		return BoolValue(rv.LowerInc), nil
+	case rfUpperInc:
+		return BoolValue(rv.UpperInc), nil
+	// The empty range is NOT infinite on either side (PG): guard before reading the bound.
+	case rfLowerInf:
+		return BoolValue(!rv.Empty && rv.Lower == nil), nil
+	default: // rfUpperInf
+		return BoolValue(!rv.Empty && rv.Upper == nil), nil
+	}
+}
+
 // notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
 // element comparator, so NULL equals NULL and a non-NULL never equals NULL.
 func notDistinct(a, b Value) bool { return valueCmp(a, b) == 0 }
@@ -14650,6 +14827,19 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			vals[i] = v
 		}
 		return evalArrayFunc(e.afunc, vals)
+	case reRangeFunc:
+		// A polymorphic range accessor (spec/design/range-functions.md §1). One operator_eval per
+		// call; arguments charge their own. STRICT — the NULL short-circuit lives in the kernel.
+		m.Charge(Costs.OperatorEval)
+		vals := make([]Value, len(e.sargs))
+		for i, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			vals[i] = v
+		}
+		return evalRangeFunc(e.rfunc, vals)
 	case reVariadic:
 		// A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval
 		// (the per-element/arg count walk is unmetered, like the array introspectors §3.3);

@@ -6985,6 +6985,7 @@ impl Database {
             }
             RExpr::ScalarFunc { args, .. }
             | RExpr::ArrayFunc { args, .. }
+            | RExpr::RangeFunc { args, .. }
             | RExpr::Variadic { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
@@ -8012,6 +8013,32 @@ enum ArrayFunc {
     Overlaps,
 }
 
+/// The polymorphic range ACCESSOR functions (spec/design/range-functions.md §1, RF1). Like
+/// [`ArrayFunc`], they resolve over a pseudo-family (`anyrange`, binding ELEM := the element type)
+/// and get their own resolved node ([`RExpr::RangeFunc`]); the kernel recovers everything from the
+/// operand range value (self-describing). All are STRICT (a NULL range → NULL). `lower`/`upper`
+/// return the bound value (ELEM) or NULL when empty/unbounded; the rest return boolean.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RangeFunc {
+    /// lower(anyrange) → anyelement — the lower bound value; NULL if the range is empty or
+    /// unbounded below.
+    Lower,
+    /// upper(anyrange) → anyelement — the upper bound value; NULL if empty or unbounded above.
+    Upper,
+    /// isempty(anyrange) → boolean — is this the empty range.
+    IsEmpty,
+    /// lower_inc(anyrange) → boolean — is the lower bound inclusive (always false for empty / an
+    /// infinite lower bound).
+    LowerInc,
+    /// upper_inc(anyrange) → boolean — is the upper bound inclusive (always false for empty / an
+    /// infinite upper bound).
+    UpperInc,
+    /// lower_inf(anyrange) → boolean — is the lower bound infinite (false for the empty range).
+    LowerInf,
+    /// upper_inf(anyrange) → boolean — is the upper bound infinite (false for the empty range).
+    UpperInf,
+}
+
 /// The VARIADIC argument-counting functions (spec/design/array-functions.md §12). Distinct from
 /// [`ScalarFunc`] because they are non-strict (`null = "none"`, like [`ArrayFunc`]) and take either
 /// a spread of arguments or a single array via the `VARIADIC` keyword — the call form is carried on
@@ -8173,6 +8200,14 @@ enum RExpr {
     /// (`null = "none"`), so NULL handling lives in the kernel, not a blanket short-circuit here.
     ArrayFunc {
         func: ArrayFunc,
+        args: Vec<RExpr>,
+    },
+    /// A polymorphic range accessor (spec/design/range-functions.md §1 — lower/upper/isempty/
+    /// lower_inc/upper_inc/lower_inf/upper_inf). Like [`RExpr::ArrayFunc`], the resolved element type
+    /// lives in the surrounding `ResolvedType`; the kernel produces the result `Value` from the
+    /// operand range value alone (self-describing). All are STRICT (NULL handled in the kernel).
+    RangeFunc {
+        func: RangeFunc,
         args: Vec<RExpr>,
     },
     /// A VARIADIC argument-counting call (spec/design/array-functions.md §12 — num_nulls/
@@ -8907,6 +8942,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         }
         RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
+        | RExpr::RangeFunc { args, .. }
         | RExpr::Variadic { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
@@ -10218,6 +10254,7 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         }
         RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
+        | RExpr::RangeFunc { args, .. }
         | RExpr::Variadic { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
@@ -10319,6 +10356,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         }
         RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
+        | RExpr::RangeFunc { args, .. }
         | RExpr::Variadic { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);
@@ -10653,6 +10691,21 @@ fn match_poly(slots: &[&str], tys: &[ResolvedType]) -> Option<Option<ResolvedTyp
             }
         }
     }
+    // `anyrange` binds ELEM := the range's element type, like `anyarray` (both definitive, before
+    // `anyelement`) — range-functions.md §1.
+    for (slot, t) in std::iter::zip(slots, tys) {
+        if *slot == "anyrange" {
+            match t {
+                ResolvedType::Range(e) => {
+                    if !unify_elem(&mut elem, e) {
+                        return None;
+                    }
+                }
+                ResolvedType::Null => {} // untyped NULL — defer, contributes no binding
+                _ => return None,        // a non-range where anyrange is required
+            }
+        }
+    }
     for (slot, t) in std::iter::zip(slots, tys) {
         if *slot == "anyelement" {
             match t {
@@ -10666,7 +10719,11 @@ fn match_poly(slots: &[&str], tys: &[ResolvedType]) -> Option<Option<ResolvedTyp
         }
     }
     for (slot, t) in std::iter::zip(slots, tys) {
-        if *slot != "anyarray" && *slot != "anyelement" && !family_matches(slot, t) {
+        if *slot != "anyarray"
+            && *slot != "anyrange"
+            && *slot != "anyelement"
+            && !family_matches(slot, t)
+        {
             return None;
         }
     }
@@ -10680,6 +10737,10 @@ fn poly_result_type(code: &str, elem: &Option<ResolvedType>) -> Result<ResolvedT
     match code {
         "anyarray" => match elem {
             Some(e) => Ok(ResolvedType::Array(Box::new(e.clone()))),
+            None => Err(indeterminate_poly()),
+        },
+        "anyrange" => match elem {
+            Some(e) => Ok(ResolvedType::Range(Box::new(e.clone()))),
             None => Err(indeterminate_poly()),
         },
         "anyelement" => match elem {
@@ -10788,6 +10849,67 @@ fn resolve_array_func(
     Ok((
         RExpr::ArrayFunc {
             func: array_func_id(name),
+            args: rargs,
+        },
+        result,
+    ))
+}
+
+/// Whether `name` (case-insensitive) is a polymorphic range function — a `kind="function"` catalog
+/// row whose `arg_families` mention `anyrange` (range-functions.md §1). Data-driven, so a new
+/// range-function row wires here without touching this gate.
+fn is_range_func_name(name: &str) -> bool {
+    OPERATORS.iter().any(|o| {
+        o.kind == "function"
+            && o.name.eq_ignore_ascii_case(name)
+            && o.arg_families.iter().any(|f| *f == "anyrange")
+    })
+}
+
+/// The kernel id for range accessor `name` (each is single-arity, so the name selects the kernel).
+/// Total over the catalog's range-function names (`is_range_func_name` gates the call).
+fn range_func_id(name: &str) -> RangeFunc {
+    match name {
+        "lower" => RangeFunc::Lower,
+        "upper" => RangeFunc::Upper,
+        "isempty" => RangeFunc::IsEmpty,
+        "lower_inc" => RangeFunc::LowerInc,
+        "upper_inc" => RangeFunc::UpperInc,
+        "lower_inf" => RangeFunc::LowerInf,
+        "upper_inf" => RangeFunc::UpperInf,
+        _ => unreachable!("range_func_id: {name} is not a catalog range function"),
+    }
+}
+
+/// Resolve a polymorphic range accessor over the `anyrange` pseudo-family (range-functions.md §1).
+/// Simpler than [`resolve_array_func`] — the accessors take a single `anyrange` arg with no
+/// `anyelement` arg, so there is no element-hint literal adaptation. `lower`/`upper` resolve to ELEM
+/// (the bound type), the rest to boolean.
+fn resolve_range_func(
+    scope: &Scope,
+    name: &str, // already lowercased
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let desc = OPERATORS
+        .iter()
+        .find(|o| o.kind == "function" && o.name == name && o.arity as usize == args.len())
+        .ok_or_else(|| no_func_overload(name))?;
+    let slots = desc.arg_families;
+
+    let mut rargs = Vec::with_capacity(args.len());
+    let mut tys = Vec::with_capacity(args.len());
+    for a in args {
+        let (r, t) = resolve(scope, a, None, agg, params)?;
+        rargs.push(r);
+        tys.push(t);
+    }
+    let elem = match_poly(slots, &tys).ok_or_else(|| no_func_overload(name))?;
+    let result = poly_result_type(desc.result, &elem)?;
+    Ok((
+        RExpr::RangeFunc {
+            func: range_func_id(name),
             args: rargs,
         },
         result,
@@ -11005,6 +11127,16 @@ fn resolve_func_call(
             ));
         }
         return resolve_array_func(scope, &lname, args, agg, params);
+    }
+    if is_range_func_name(&lname) {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_range_func(scope, &lname, args, agg, params);
     }
     if is_scalar_func_name(&lname) {
         reject_named(&lname, arg_names)?;
@@ -13962,6 +14094,36 @@ fn eval_array_func(func: &ArrayFunc, vals: &[Value]) -> Result<Value> {
     }
 }
 
+/// Evaluate a range accessor (spec/design/range-functions.md §1). STRICT: a NULL range → NULL.
+/// `lower`/`upper` yield the bound value (NULL when empty or unbounded on that side); the `_inc`/
+/// `_inf` readers + `isempty` yield boolean. For the empty range every reader but `isempty` is
+/// false/NULL; for an infinite bound the `_inf` reader is true and the `_inc` reader false.
+fn eval_range_func(func: &RangeFunc, vals: &[Value]) -> Result<Value> {
+    let rv = match &vals[0] {
+        Value::Null => return Ok(Value::Null),
+        Value::Range(rv) => rv,
+        _ => unreachable!("range accessor: range operand"),
+    };
+    Ok(match func {
+        RangeFunc::Lower => match (rv.empty, &rv.lower) {
+            (false, Some(v)) => (**v).clone(),
+            _ => Value::Null,
+        },
+        RangeFunc::Upper => match (rv.empty, &rv.upper) {
+            (false, Some(v)) => (**v).clone(),
+            _ => Value::Null,
+        },
+        RangeFunc::IsEmpty => Value::Bool(rv.empty),
+        // For the empty range both inclusivity flags are false by the canonical invariant, so reading
+        // them directly already yields PG's `false`; an infinite bound likewise stores `_inc = false`.
+        RangeFunc::LowerInc => Value::Bool(rv.lower_inc),
+        RangeFunc::UpperInc => Value::Bool(rv.upper_inc),
+        // The empty range is NOT infinite on either side (PG): guard before reading the bound.
+        RangeFunc::LowerInf => Value::Bool(!rv.empty && rv.lower.is_none()),
+        RangeFunc::UpperInf => Value::Bool(!rv.empty && rv.upper.is_none()),
+    })
+}
+
 /// STRICT element equality for the containment/overlap operators (array-functions.md §10): a NULL
 /// element equals NOTHING — including another NULL — the deliberate inverse of `not_distinct` (§5
 /// #10). For two non-NULL values it is jed's total element comparator (`value_cmp == Equal`), which
@@ -16597,6 +16759,14 @@ impl RExpr {
                 }
                 eval_array_func(func, &vals)
             }
+            RExpr::RangeFunc { func, args } => {
+                m.charge(COSTS.operator_eval);
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    vals.push(a.eval(row, env, m)?);
+                }
+                eval_range_func(func, &vals)
+            }
             // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One
             // operator_eval (the per-element/arg count walk is unmetered, like the array
             // introspectors §3.3); arguments charge their own evaluation. Non-strict — no blanket
@@ -17477,6 +17647,18 @@ mod registry_tests {
                         || concrete_array
                         || ScalarType::from_name(o.result).is_some(),
                     "array function {} has unhandled result code {}",
+                    o.name,
+                    o.result
+                );
+                continue;
+            }
+            if is_range_func_name(o.name) {
+                // A polymorphic range accessor (range-functions.md §1): its kernel id comes from
+                // `range_func_id` and its result is `anyelement` (the bound value) or `boolean`.
+                let _ = range_func_id(o.name);
+                assert!(
+                    o.result == "anyelement" || ScalarType::from_name(o.result).is_some(),
+                    "range function {} has unhandled result code {}",
                     o.name,
                     o.result
                 );

@@ -2475,6 +2475,87 @@ null           = "propagates"
 precedence     = 37
 errors         = []
 
+# --- the range accessor functions (../design/range-functions.md §1, RF1) ----------------------
+# Pure readers of a range value's parts, polymorphic over the `anyrange` pseudo-family (a sibling
+# of `anyarray`/`anyelement`, §2): an `anyrange` slot matches any range argument and binds ELEM :=
+# its element type, and the reserved result `anyelement` (= ELEM) reads that binding back. All seven
+# are STRICT (null = "propagates": a NULL range → NULL). `lower`/`upper` return the bound VALUE
+# (ELEM), or NULL when the range is empty or unbounded on that side; the four `_inc`/`_inf` readers +
+# `isempty` return boolean. For the empty range: isempty = true, every other reader is false / NULL.
+# For an infinite bound: lower/upper = NULL, the *_inf reader = true, the *_inc reader = false (an
+# infinite bound is never inclusive). Oracle-pinned vs postgres:18. (jed has no string lower/upper —
+# these names are range-only here, a documented divergence from PG's overloaded lower(text)/upper(text).)
+
+[[operator]]
+name           = "lower"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyrange"]
+arg_resolution = "none"
+result         = "anyelement"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "upper"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyrange"]
+arg_resolution = "none"
+result         = "anyelement"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "isempty"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "lower_inc"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "upper_inc"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "lower_inf"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "upper_inf"
+kind           = "function"
+arity          = 1
+arg_families   = ["anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+errors         = []
+
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
 # SINGLE value. They are NOT operators — no infix symbol, no precedence, no

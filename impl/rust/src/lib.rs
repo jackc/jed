@@ -103,10 +103,13 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // composite-type entry gains a code-15 array field; the codec/comparison/text-I/O recurse.
     "types.composite_array_field",
     // Range types (ranges.md) — the six built-in PG range types as a structural type over a scalar
-    // element (R0–R2): the '[1,5)' literal/cast, the value codec (type_code 17, format_version 15),
-    // range_out, discrete canonicalization, empty normalization, IS NULL. Comparison + the
-    // constructor/operator surface land in R3 / RF1–RF4.
+    // element (R0–R3): the '[1,5)' literal/cast, the value codec (type_code 17, format_version 16),
+    // range_out, discrete canonicalization, empty normalization, IS NULL, and the range_cmp total
+    // order (=/</ORDER BY/DISTINCT/GROUP BY). The constructor/operator surface lands in RF2–RF4.
     "types.range",
+    // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
+    // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
+    "func.range_accessors",
     // Array function/operator surface AF1 (array-functions.md): the polymorphic anyarray/anyelement
     // resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
     // (array_append/prepend/cat).

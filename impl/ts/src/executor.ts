@@ -6323,6 +6323,7 @@ export class Database {
         return e;
       case "scalarFunc":
       case "arrayFunc":
+      case "rangeFunc":
       case "variadic":
         e.args = e.args.map((a) =>
           this.foldUncorrelatedInRExpr(a, bound, ctes, cost),
@@ -6627,6 +6628,7 @@ function rexprIsConstant(e: RExpr): boolean {
       );
     case "scalarFunc":
     case "arrayFunc":
+    case "rangeFunc":
     case "variadic":
       return e.args.every(rexprIsConstant);
     case "inValues":
@@ -7506,6 +7508,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       );
     case "scalarFunc":
     case "arrayFunc":
+    case "rangeFunc":
     case "variadic":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
@@ -7590,6 +7593,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       return;
     case "scalarFunc":
     case "arrayFunc":
+    case "rangeFunc":
     case "variadic":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
@@ -7920,6 +7924,12 @@ type RExpr =
   // node. NULL handling is per-kernel (the introspectors propagate, the builders are non-strict), so
   // — unlike "scalarFunc" — there is no blanket NULL short-circuit at eval.
   | { kind: "arrayFunc"; func: ArrayFuncName; args: RExpr[] }
+  // A polymorphic range-accessor call (spec/design/range-functions.md §1, RF1), evaluated per row.
+  // Like "arrayFunc", it resolves over a pseudo-family (anyrange, binding ELEM := the element type)
+  // and the result type lives in the surrounding ResolvedType (carried out of resolve), not on the
+  // node; the kernel recovers everything from the operand range value (self-describing). All are
+  // STRICT (a NULL range → NULL), handled in the eval kernel.
+  | { kind: "rangeFunc"; func: RangeFuncName; args: RExpr[] }
   // A VARIADIC argument-counting call (spec/design/array-functions.md §12 — num_nulls/num_nonnulls).
   // Non-strict (null = "none"), like "arrayFunc": no blanket NULL short-circuit. `arrayForm` records
   // the call shape — false = the spread form (count `args`' null-ness directly, never NULL); true =
@@ -8030,6 +8040,19 @@ type ArrayFuncName =
   | "contains"
   | "contained_by"
   | "overlaps";
+
+// RangeFuncName is the internal identity of a polymorphic range-accessor node
+// (spec/design/range-functions.md §1, RF1). Each name is single-arity; the kernel recovers
+// everything from the operand range value (self-describing). lower/upper yield the bound value
+// (ELEM) or NULL when empty/unbounded; the rest yield boolean. All are STRICT (a NULL range → NULL).
+type RangeFuncName =
+  | "lower"
+  | "upper"
+  | "isempty"
+  | "lower_inc"
+  | "upper_inc"
+  | "lower_inf"
+  | "upper_inf";
 
 // VariadicFuncName is the internal identity of a VARIADIC counting-function node
 // (spec/design/array-functions.md §12). Both return i32; the call form lives on the node.
@@ -9095,6 +9118,12 @@ function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     return resolveArrayFunc(scope, e, ag, params);
   }
+  // The polymorphic range accessors (range-functions.md §1) are kind === "function" too, with an
+  // anyrange slot the generic scalar path cannot unify — intercept BEFORE the scalar gate.
+  if (isRangeFuncName(lname)) {
+    rejectNamed(lname, e.argNames);
+    return resolveRangeFunc(scope, e, ag, params);
+  }
   if (isScalarFuncName(lname)) {
     rejectNamed(lname, e.argNames);
     return resolveScalarFunc(scope, e, ag, params);
@@ -9436,6 +9465,18 @@ function matchPoly(
       }
     }
   }
+  // anyrange binds ELEM := the range's element type, like anyarray (both definitive, before
+  // anyelement) — range-functions.md §1.
+  for (let j = 0; j < slots.length; j++) {
+    if (slots[j] === "anyrange") {
+      const t = tys[j]!;
+      if (t.kind === "range") {
+        if (!unify(t.elem)) return { elem: null, matched: false };
+      } else if (t.kind !== "null") {
+        return { elem: null, matched: false }; // a non-range where anyrange is required
+      }
+    }
+  }
   for (let j = 0; j < slots.length; j++) {
     if (slots[j] === "anyelement" && tys[j]!.kind !== "null") {
       if (!unify(tys[j]!)) return { elem: null, matched: false };
@@ -9444,6 +9485,7 @@ function matchPoly(
   for (let j = 0; j < slots.length; j++) {
     if (
       slots[j] !== "anyarray" &&
+      slots[j] !== "anyrange" &&
       slots[j] !== "anyelement" &&
       !familyMatches(slots[j]!, tys[j]!)
     ) {
@@ -9460,6 +9502,10 @@ function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
   if (code === "anyarray") {
     if (elem === null) throw indeterminatePoly();
     return { kind: "array", elem };
+  }
+  if (code === "anyrange") {
+    if (elem === null) throw indeterminatePoly();
+    return { kind: "range", elem };
   }
   if (code === "anyelement") {
     if (elem === null) throw indeterminatePoly();
@@ -9578,6 +9624,60 @@ function resolveArrayFunc(
   if (!matched) throw noFuncOverload(name);
   const type = polyResultType(desc.result, elem);
   return { node: { kind: "arrayFunc", func: name, args: rargs }, type };
+}
+
+// isRangeFuncName reports whether name (lowercased) is a polymorphic range function — a
+// kind === "function" catalog row whose argFamilies mention anyrange (range-functions.md §1).
+// Data-driven, so a new range-function row wires here without touching this gate.
+function isRangeFuncName(name: string): boolean {
+  return OPERATORS.some((o) => o.kind === "function" && o.name === name && o.argFamilies.some((f) => f === "anyrange"));
+}
+
+// rangeFuncId is the kernel id for range accessor name (each is single-arity, so the name selects
+// the kernel). Total over the catalog's range-function names (isRangeFuncName gates the call).
+function rangeFuncId(name: string): RangeFuncName {
+  switch (name) {
+    case "lower":
+    case "upper":
+    case "isempty":
+    case "lower_inc":
+    case "upper_inc":
+    case "lower_inf":
+    case "upper_inf":
+      return name;
+    default:
+      throw new Error("rangeFuncId: " + name + " is not a catalog range function");
+  }
+}
+
+// resolveRangeFunc resolves a polymorphic range accessor over the anyrange pseudo-family
+// (range-functions.md §1). Simpler than resolveArrayFunc — the accessors take a single anyrange arg
+// with no anyelement arg, so there is no element-hint literal adaptation. lower/upper resolve to ELEM
+// (the bound type), the rest to boolean. The kernel id is the name; NULL handling lives in the eval
+// kernel.
+function resolveRangeFunc(
+  scope: Scope,
+  e: { name: string; args: Expr[]; star: boolean },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  const name = e.name.toLowerCase();
+  const desc = OPERATORS.find((o) => o.kind === "function" && o.name === name && o.arity === e.args.length);
+  if (!desc) throw noFuncOverload(name);
+  const slots = desc.argFamilies;
+
+  const rargs: RExpr[] = [];
+  const tys: ResolvedType[] = [];
+  for (const a of e.args) {
+    const r = resolve(scope, a, null, ag, params);
+    rargs.push(r.node);
+    tys.push(r.type);
+  }
+  const { elem, matched } = matchPoly(slots, tys);
+  if (!matched) throw noFuncOverload(name);
+  const type = polyResultType(desc.result, elem);
+  return { node: { kind: "rangeFunc", func: rangeFuncId(name), args: rargs }, type };
 }
 
 // groupingErrorColumn is the 42803 for a non-aggregated column with no GROUP BY.
@@ -12741,6 +12841,36 @@ function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
   }
 }
 
+// evalRangeFunc evaluates a range accessor (spec/design/range-functions.md §1, RF1). STRICT: a NULL
+// range → NULL. lower/upper yield the bound value (NULL when empty or unbounded on that side); the
+// _inc/_inf readers + isempty yield boolean. For the empty range every reader but isempty is
+// false/NULL; for an infinite bound the _inf reader is true and the _inc reader false. The resolver
+// guarantees the operand is a range or NULL.
+function evalRangeFunc(func: RangeFuncName, vals: Value[]): Value {
+  const rv = vals[0]!;
+  if (rv.kind === "null") return nullValue();
+  if (rv.kind !== "range") throw new Error("range accessor: range operand");
+  switch (func) {
+    case "lower":
+      return !rv.empty && rv.lower !== null ? rv.lower : nullValue();
+    case "upper":
+      return !rv.empty && rv.upper !== null ? rv.upper : nullValue();
+    case "isempty":
+      return boolValue(rv.empty);
+    // For the empty range both inclusivity flags are false by the canonical invariant, so reading
+    // them directly already yields PG's false; an infinite bound likewise stores _inc = false.
+    case "lower_inc":
+      return boolValue(rv.lowerInc);
+    case "upper_inc":
+      return boolValue(rv.upperInc);
+    // The empty range is NOT infinite on either side (PG): guard before reading the bound.
+    case "lower_inf":
+      return boolValue(!rv.empty && rv.lower === null);
+    case "upper_inf":
+      return boolValue(!rv.empty && rv.upper === null);
+  }
+}
+
 // notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
 // element comparator, so NULL equals NULL and a non-NULL never equals NULL.
 function notDistinct(a: Value, b: Value): boolean {
@@ -14514,6 +14644,14 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const vals: Value[] = [];
       for (const a of e.args) vals.push(evalExpr(a, row, env, m));
       return evalArrayFunc(e.func, vals);
+    }
+    case "rangeFunc": {
+      // A polymorphic range accessor (spec/design/range-functions.md §1, RF1). One operator_eval per
+      // call; arguments charge their own. STRICT (a NULL range → NULL), handled in the kernel.
+      m.charge(COSTS.operatorEval);
+      const vals: Value[] = [];
+      for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+      return evalRangeFunc(e.func, vals);
     }
     case "variadic": {
       // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval

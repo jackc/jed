@@ -473,6 +473,15 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			}
 			continue
 		}
+		if isRangeFuncName(o.Name) {
+			// A polymorphic range accessor (range-functions.md §1): its kernel id comes from
+			// rangeFuncID and its result is a reserved poly code (anyelement) or a scalar id (boolean).
+			_ = rangeFuncID(o.Name) // panics if the name has no kernel id
+			if _, ok := ScalarTypeFromName(o.Result); o.Result != "anyelement" && !ok {
+				t.Fatalf("range function %s has unhandled result code %s", o.Name, o.Result)
+			}
+			continue
+		}
 		tys := make([]resolvedType, len(o.ArgFamilies))
 		for j, fam := range o.ArgFamilies {
 			tys[j] = probe(fam)
