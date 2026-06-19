@@ -14,12 +14,15 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 12 # format_version 12: SEQUENCES — a third kind-tagged catalog entry (entry_kind u8: 2 =
-# sequence; joining 0 table, 1 composite-type). A sequence entry is name + six fixed i64 fields
-# (increment, min_value, max_value, start, cache, last_value; big-endian two's-complement, no
-# sign-flip) + a flags byte (bit0 cycle, bit1 is_called). Emission order: composites (1), sequences
-# (2), tables (0), each name-sorted. A sequence owns no B-tree (spec/design/sequences.md §3).
-# format_version 11 was FOREIGN KEY constraints — the table catalog entry gains a
+VERSION = 13 # format_version 13: GIN inverted indexes — each catalog index entry gains a one-byte
+# index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page; a GIN index's
+# tree holds term‖storage-key entries, empty payload (spec/design/gin.md). format_version 12 was
+# SEQUENCES — a third kind-tagged catalog entry (entry_kind u8: 2 = sequence; joining 0 table, 1
+# composite-type). A sequence entry is name + six fixed i64 fields (increment, min_value, max_value,
+# start, cache, last_value; big-endian two's-complement, no sign-flip) + a flags byte (bit0 cycle,
+# bit1 is_called). Emission order: composites (1), sequences (2), tables (0), each name-sorted. A
+# sequence owns no B-tree (spec/design/sequences.md §3). v11 was FOREIGN KEY constraints — the table
+# catalog entry gains a
 # foreign-key list (fk_count + per FK: name, local ordinals, ref table, ref ordinals, actions byte)
 # after the index list, before root_data_page (spec/design/constraints.md §6, format.md). An FK owns
 # no B-tree (no root page); a file with no FKs still moves to v11 (every table entry gains fk_count=0).
@@ -504,6 +507,30 @@ ARRAY_TABLE = {
           { dims: [2], lbounds: [2], elements: %w[x y] }]]
 }.freeze
 
+# A table with a GIN inverted index (v13 — spec/design/gin.md): pins the per-index index_kind byte
+# (0 = ordered B-tree, 1 = GIN) and a GIN index tree (entries are encode(element)‖storage-key, empty
+# payload — §4). `i_nums_gin` is a USING gin index over an i32[] column; `i_n` is an ordinary
+# ordered index over a scalar column in the same catalog (kind 0 beside kind 1 — a btree index
+# cannot sit on the array column). Rows exercise term DEDUP (row 2's duplicate 20 → one entry), an
+# EMPTY array and a NULL whole-value array (rows 3/4 → no GIN entries), and a NULL element (row 5 →
+# the null is dropped, terms {10,50}). The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], n i32)
+#   INSERT (1,'{10,20,30}',1); (2,'{20,20,40}',2); (3,'{}',3); (4,NULL,4); (5,'{10,NULL,50}',5)
+#   CREATE INDEX i_n ON t (n);  CREATE INDEX i_nums_gin ON t USING gin (nums)
+GIN_ARRAY_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("nums", "i32[]"), col("n", "i32")],
+  indexes: [
+    { name: "i_n", cols: [2] },
+    { name: "i_nums_gin", cols: [1], kind: "gin" }
+  ],
+  rows: [[1, [10, 20, 30], 1],
+         [2, [20, 20, 40], 2],
+         [3, [], 3],
+         [4, nil, 4],
+         [5, [10, nil, 50], 5]]
+}.freeze
+
 # A composite type used as an ARRAY ELEMENT type (v10 — array-of-composite, spec/design/array.md §12
 # AC1): pins the catalog array-column entry with a COMPOSITE element descriptor (type_code 15, then
 # the element descriptor element_type_code 14 + name "addr", §3) AND the recursive value body — an
@@ -634,6 +661,7 @@ FIXTURES = [
   { file: "check_table.jed", page_size: 256, tables: [CHECK_TABLE] },
   { file: "index_table.jed", page_size: 256, tables: [INDEX_TABLE] },
   { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
+  { file: "gin_array_table.jed", page_size: 256, tables: [GIN_ARRAY_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
@@ -961,6 +989,7 @@ def table_entry_bytes(table, root_data_page, index_roots)
     out << u16(ix[:cols].size)
     ix[:cols].each { |i| out << u16(i) }
     out << [ix[:unique] ? 1 : 0].pack("C")
+    out << [ix[:kind] == "gin" ? 1 : 0].pack("C") # v13: index_kind byte (0 = btree, 1 = GIN)
     out << u32(index_roots[k])
   end
   # Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS table,
@@ -1070,6 +1099,26 @@ def index_entries(table, ix)
     key = index_entry_key(table, ix, storage_key, row)
     [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: 2 + key.bytesize }]
   end.sort_by { |key, _| key }
+end
+
+# A GIN index's (entry_key, record-plan) pairs in entry-key order (spec/design/gin.md §4): one
+# entry per DISTINCT non-NULL array element — encode(element) ‖ storage_key, with NO presence tag
+# (a term is never NULL) and an EMPTY payload. A NULL whole-value array and an empty array yield no
+# entries (they appear in no posting list). This slice: a single integer-element array column.
+def gin_index_entries(table, ix)
+  elem_type = array_elem(table[:columns][ix[:cols][0]][:type])
+  raise "a GIN index column must be an array" unless elem_type
+  pairs = []
+  table_entries(table).each do |storage_key, row|
+    av = row[ix[:cols][0]]
+    next if av.nil? # a NULL array yields no terms
+    elems = av.is_a?(Hash) ? av[:elements] : av
+    elems.compact.uniq.each do |e|
+      key = (key_body(elem_type, e) + storage_key).b
+      pairs << [key, { key: key, row: [], table: { columns: [] }, forms: [], comps: [], size: 2 + key.bytesize }]
+    end
+  end
+  pairs.sort_by { |key, _| key }
 end
 
 # --- out-of-line large values (large-values.md §12) -------------------------
@@ -1367,7 +1416,8 @@ def build_image(types, sequences, tables, page_size)
     # The table's index trees follow its data tree, in catalog (name) order (format.md
     # "Allocation & incremental commit" / "From-scratch image").
     (t[:indexes] || []).each do |ix|
-      r, next_index = serialize_tree(build_tree(index_entries(t, ix), cap), next_index, cap, data_pages)
+      entries = ix[:kind] == "gin" ? gin_index_entries(t, ix) : index_entries(t, ix)
+      r, next_index = serialize_tree(build_tree(entries, cap), next_index, cap, data_pages)
       index_roots[ti] << r
     end
   end
@@ -1589,9 +1639,11 @@ def decode_table_entry(buf, pos)
     end
     fb, pos = take(buf, pos, 1)
     raise "reserved index flag set (only bit0 unique is defined — v6)" if (fb.getbyte(0) & ~0b01) != 0
-
+    kb, pos = take(buf, pos, 1) # v12: index_kind byte (0 = btree, 1 = GIN)
+    raise "reserved index kind (only 0=btree, 1=gin defined — v12)" if kb.getbyte(0) > 1
     rb, pos = take(buf, pos, 4)
-    indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0, root_page: rb.unpack1("N") }
+    indexes << { name: iname, cols: cols, unique: (fb.getbyte(0) & 1) != 0,
+                 kind: kb.getbyte(0) == 1 ? "gin" : "btree", root_page: rb.unpack1("N") }
   end
   # Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
   # actions byte, in name order. An FK owns no B-tree (no root page).
@@ -1995,8 +2047,9 @@ def expected_tables(fx)
       pk: pk_order(t),
       checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr] } },
       indexes: (t[:indexes] || []).map do |ix|
+        ent = ix[:kind] == "gin" ? gin_index_entries(t, ix) : index_entries(t, ix)
         { name: ix[:name], cols: ix[:cols],
-          entries: index_entries(t, ix).map { |key, _| key.unpack1("H*") } }
+          entries: ent.map { |key, _| key.unpack1("H*") } }
       end,
       rows: table_entries(t).map { |_key, row| row } }
   end

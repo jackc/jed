@@ -191,6 +191,27 @@ fn array_table_db() -> Database {
     db
 }
 
+/// A table with a GIN inverted index (v13 — the per-index index_kind byte, spec/design/gin.md):
+/// `i_nums_gin` over an i32[] column (kind 1) beside an ordinary ordered index `i_n` over a
+/// scalar column (kind 0 — a btree index cannot sit on the array column). Rows exercise term DEDUP
+/// (row 2's duplicate 20), an EMPTY and a NULL whole-value array (rows 3/4 → no entries), and a
+/// NULL element (row 5). Rows are inserted before the indexes so each builds via the sorted-bulk
+/// path, matching the Ruby reference's GIN_ARRAY_TABLE.
+fn gin_array_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], n i32)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, '{10,20,30}', 1), (2, '{20,20,40}', 2), (3, '{}', 3), (4, NULL, 4), (5, '{10,NULL,50}', 5)",
+    );
+    run(&mut db, "CREATE INDEX i_n ON t (n)");
+    run(&mut db, "CREATE INDEX i_nums_gin ON t USING gin (nums)");
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic i64 rowid key.
 fn nopk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
@@ -668,6 +689,7 @@ fn write_matches_goldens() {
         ("check_table.jed", check_table_db),
         ("index_table.jed", index_table_db),
         ("unique_table.jed", unique_table_db),
+        ("gin_array_table.jed", gin_array_table_db),
         ("fk_table.jed", fk_table_db),
         ("composite_type_table.jed", composite_type_table_db),
         ("nested_composite_table.jed", nested_composite_table_db),
@@ -714,6 +736,7 @@ fn read_goldens_reproduces_rows() {
         ("check_table.jed", check_table_db, "t"),
         ("index_table.jed", index_table_db, "t"),
         ("unique_table.jed", unique_table_db, "t"),
+        ("gin_array_table.jed", gin_array_table_db, "t"),
         ("fk_table.jed", fk_table_db, "c"),
         ("composite_type_table.jed", composite_type_table_db, "t"),
         ("nested_composite_table.jed", nested_composite_table_db, "t"),

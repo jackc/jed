@@ -304,6 +304,9 @@ export type CreateIndex = {
   table: string;
   columns: string[];
   unique: boolean;
+  // The `USING <method>` access method as written, or undefined for the default ordered B-tree.
+  // Resolved at execution: undefined/"btree" → B-tree, "gin" → GIN, else 42704 (gin.md §3).
+  using: string | undefined;
 };
 
 // DropIndex is a DROP INDEX <name> statement — remove one secondary index

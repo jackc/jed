@@ -453,6 +453,7 @@ fn cost_schedule_matches_spec() {
             "generated_row" => COSTS.generated_row,
             "cte_scan_row" => COSTS.cte_scan_row,
             "sequence_advance" => COSTS.sequence_advance,
+            "gin_entry" => COSTS.gin_entry,
             other => panic!("cost unit {other} has no COSTS field — update this cross-check"),
         }
     };

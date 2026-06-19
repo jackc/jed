@@ -12,7 +12,7 @@ use crate::ast::{
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    FkAction, ForeignKeyConstraint, IndexDef, SequenceDef, Table, resolve_col_type,
+    FkAction, ForeignKeyConstraint, IndexDef, IndexKind, SequenceDef, Table, resolve_col_type,
 };
 use crate::cost::Meter;
 use crate::costs::COSTS;
@@ -1818,6 +1818,7 @@ impl Database {
                     name,
                     columns: cols,
                     unique: true,
+                    kind: IndexKind::Btree,
                 },
             );
         }
@@ -2157,6 +2158,20 @@ impl Database {
         })?;
         let table_key = table.name.to_ascii_lowercase();
         let columns = table.columns.clone();
+        // Resolve the access method (spec/design/gin.md §3): the default / `btree` is the ordered
+        // B-tree, `gin` a GIN inverted index; an unknown method is 42704. Resolved here (not in the
+        // parser) so the error is the resolve-time undefined_object, after the table-exists check
+        // and before the column checks.
+        let kind = match ci.using.as_deref().map(str::to_ascii_lowercase).as_deref() {
+            None | Some("btree") => IndexKind::Btree,
+            Some("gin") => IndexKind::Gin,
+            Some(other) => {
+                return Err(EngineError::new(
+                    SqlState::UndefinedObject,
+                    format!("access method does not exist: {other}"),
+                ));
+            }
+        };
         let mut cols: Vec<usize> = Vec::with_capacity(ci.columns.len());
         for name in &ci.columns {
             let idx = table.column_index(name).ok_or_else(|| {
@@ -2166,23 +2181,69 @@ impl Database {
                 )
             })?;
             let ty = &columns[idx].ty;
-            if !ty.is_integer()
-                && !ty.is_bool()
-                && !ty.is_uuid()
-                && !ty.is_timestamp()
-                && !ty.is_timestamptz()
-                && !ty.is_date()
-            {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    format!(
-                        "a {} index column is not supported yet",
-                        ty.canonical_name()
-                    ),
-                ));
+            match kind {
+                IndexKind::Btree => {
+                    if !ty.is_integer()
+                        && !ty.is_bool()
+                        && !ty.is_uuid()
+                        && !ty.is_timestamp()
+                        && !ty.is_timestamptz()
+                        && !ty.is_date()
+                    {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            format!(
+                                "a {} index column is not supported yet",
+                                ty.canonical_name()
+                            ),
+                        ));
+                    }
+                }
+                IndexKind::Gin => {
+                    // GIN needs an operator class for the column type: only an array has one (else
+                    // 42704, no default opclass), and this slice only the integer element types
+                    // (else 0A000) — spec/design/gin.md §3.
+                    match ty.array_element() {
+                        None => {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedObject,
+                                format!(
+                                    "data type {} has no default operator class for access method gin",
+                                    ty.canonical_name()
+                                ),
+                            ));
+                        }
+                        Some(elem) if !elem.is_integer() => {
+                            return Err(EngineError::new(
+                                SqlState::FeatureNotSupported,
+                                format!(
+                                    "a gin index on {} is not supported yet",
+                                    ty.canonical_name()
+                                ),
+                            ));
+                        }
+                        Some(_) => {}
+                    }
+                }
             }
             // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
             cols.push(idx);
+        }
+        // GIN narrowings this slice (spec/design/gin.md §3): no uniqueness (undefined for an
+        // inverted index) and a single column only — both deferred 0A000.
+        if kind == IndexKind::Gin {
+            if ci.unique {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "access method gin does not support unique indexes".to_string(),
+                ));
+            }
+            if cols.len() != 1 {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "a multi-column gin index is not supported yet".to_string(),
+                ));
+            }
         }
         let name = match &ci.name {
             Some(n) => {
@@ -2226,6 +2287,7 @@ impl Database {
             name,
             columns: cols,
             unique: ci.unique,
+            kind,
         };
         let store = self.store(&ci.table);
         let (table_entries, nodes, slabs) = store.scan_with_units(&mask)?;
@@ -2250,7 +2312,7 @@ impl Database {
                     ),
                 ));
             }
-            entries.push(index_entry_key(&columns, &def, &key, &row));
+            entries.extend(index_entry_keys(&columns, &def, &key, &row));
         }
         meter.guard()?;
 
@@ -3199,7 +3261,7 @@ impl Database {
         for (key, row) in prepared {
             let key = key.unwrap_or_else(|| encode_int(ScalarType::Int64, store.alloc_rowid()));
             for (k, def) in indexes.iter().enumerate() {
-                index_inserts[k].push(index_entry_key(columns, def, &key, &row));
+                index_inserts[k].extend(index_entry_keys(columns, def, &key, &row));
             }
             assert!(
                 store.insert(key, row)?,
@@ -3474,7 +3536,9 @@ impl Database {
         for def in &indexes {
             let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
             for (k, row) in &matched {
-                istore.remove(&index_entry_key(&tcolumns, def, k, row))?;
+                for ek in index_entry_keys(&tcolumns, def, k, row) {
+                    istore.remove(&ek)?;
+                }
             }
         }
         Ok(match (ret, returned) {
@@ -3897,13 +3961,28 @@ impl Database {
         // the copy-on-write dirty set, and so the commit's written pages, byte-identical
         // across cores). The storage key cannot change (PK assignment is rejected), so the
         // suffix is stable. Computed before the rewrite consumes the rows.
-        let mut index_moves: Vec<Vec<(Vec<u8>, Vec<u8>)>> = vec![Vec::new(); indexes.len()];
+        let mut index_moves: Vec<Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>> =
+            vec![Vec::new(); indexes.len()];
         for (key, new_row, old_row) in &updates {
             for (k, def) in indexes.iter().enumerate() {
-                let old_ek = index_entry_key(&tcolumns, def, key, old_row);
-                let new_ek = index_entry_key(&tcolumns, def, key, new_row);
-                if old_ek != new_ek {
-                    index_moves[k].push((old_ek, new_ek));
+                // The row's old and new entry SETS (one entry for an ordered index, one per term
+                // for GIN — gin.md §5). Remove old−new, insert new−old: a shared entry (an ordered
+                // key that did not change, or a GIN term present in both) is left untouched,
+                // keeping the copy-on-write dirty set byte-identical across cores.
+                let old_eks = index_entry_keys(&tcolumns, def, key, old_row);
+                let new_eks = index_entry_keys(&tcolumns, def, key, new_row);
+                let removals: Vec<Vec<u8>> = old_eks
+                    .iter()
+                    .filter(|e| !new_eks.contains(*e))
+                    .cloned()
+                    .collect();
+                let insertions: Vec<Vec<u8>> = new_eks
+                    .iter()
+                    .filter(|e| !old_eks.contains(*e))
+                    .cloned()
+                    .collect();
+                if !removals.is_empty() || !insertions.is_empty() {
+                    index_moves[k].push((removals, insertions));
                 }
             }
         }
@@ -3917,12 +3996,16 @@ impl Database {
         }
         for (k, def) in indexes.iter().enumerate() {
             let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
-            for (old_ek, new_ek) in index_moves[k].drain(..) {
-                istore.remove(&old_ek)?;
-                assert!(
-                    istore.insert(new_ek, Vec::new())?,
-                    "index entry keys are unique (storage-key suffix)"
-                );
+            for (removals, insertions) in index_moves[k].drain(..) {
+                for old_ek in removals {
+                    istore.remove(&old_ek)?;
+                }
+                for new_ek in insertions {
+                    assert!(
+                        istore.insert(new_ek, Vec::new())?,
+                        "index entry keys are unique (storage-key suffix)"
+                    );
+                }
             }
         }
         Ok(match (ret, returned) {
@@ -7400,6 +7483,55 @@ fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: 
     }
     out.extend_from_slice(storage_key);
     out
+}
+
+/// The index entries a row contributes (spec/design/gin.md §4/§5): exactly one for an ordered
+/// (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL element for a
+/// GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index uniformly as "a
+/// row maps to a set of entries."
+fn index_entry_keys(
+    columns: &[Column],
+    def: &IndexDef,
+    storage_key: &[u8],
+    row: &Row,
+) -> Vec<Vec<u8>> {
+    match def.kind {
+        IndexKind::Btree => vec![index_entry_key(columns, def, storage_key, row)],
+        IndexKind::Gin => gin_entries(columns, def, storage_key, row),
+    }
+}
+
+/// A GIN index's entry keys for one row (spec/design/gin.md §4): one entry per DISTINCT non-NULL
+/// array element — `encode_element(term) ‖ storage_key`, with NO presence tag (a term is never
+/// NULL) and an empty payload. A NULL array column value and an empty array both yield no entries
+/// (so they never appear in any posting list — correct for `@>`/`&&`). Returned sorted by term
+/// (= encoded-byte order for the integer element types), so the per-row order is deterministic.
+/// This slice: a single integer-element array column (`array_ops`).
+fn gin_entries(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row) -> Vec<Vec<u8>> {
+    let ci = def.columns[0];
+    let elem_ty = columns[ci]
+        .ty
+        .array_element()
+        .expect("a GIN index column is an array (CREATE INDEX gate)")
+        .scalar();
+    let mut vals: Vec<i64> = Vec::new();
+    if let Value::Array(arr) = &row[ci] {
+        for el in &arr.elements {
+            if let Value::Int(n) = el {
+                vals.push(*n);
+            }
+            // a NULL element (or any non-integer — impossible under the gate) contributes no term
+        }
+    }
+    vals.sort_unstable();
+    vals.dedup();
+    vals.into_iter()
+        .map(|n| {
+            let mut entry = encode_int(elem_ty, n);
+            entry.extend_from_slice(storage_key);
+            entry
+        })
+        .collect()
 }
 
 /// A row's UNIQUENESS PROBE KEY for one unique index (spec/design/indexes.md §8): the §3

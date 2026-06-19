@@ -60,7 +60,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 12; // on-disk format version (12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3). 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 10 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 13; // on-disk format version (13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md). 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 12 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -861,6 +861,7 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
     w.u16(idx.columns.length);
     for (const c of idx.columns) w.u16(c);
     w.u8(idx.unique ? 1 : 0);
+    w.u8(idx.kind === "gin" ? 1 : 0); // v12: index_kind byte (0 = btree, 1 = GIN)
     w.u32(indexRoots[k]!);
   }
   // Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
@@ -2084,8 +2085,15 @@ function decodeTableEntry(
     if ((iflags & ~0b01) !== 0) {
       throw engineError("data_corrupted", "reserved index flag set");
     }
+    const ikind = readU8(buf, cur); // v12: index_kind byte (0 = btree, 1 = GIN)
+    if (ikind > 1) throw engineError("data_corrupted", "unsupported index kind");
     indexRoots.push(readU32(buf, cur));
-    indexes.push({ name: iname, columns: cols, unique: (iflags & 0b01) !== 0 });
+    indexes.push({
+      name: iname,
+      columns: cols,
+      unique: (iflags & 0b01) !== 0,
+      kind: ikind === 1 ? "gin" : "btree",
+    });
   }
   // Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the
   // actions byte, in the catalog's (lowercased-name ascending) order — a reader trusts the

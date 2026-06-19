@@ -615,13 +615,24 @@ class Parser {
     const unique = this.peekKeyword() === "unique";
     if (unique) this.advance();
     this.expectKeyword("index");
+    // The unnamed form is `INDEX ON <table> [USING <method>] (` — the word after INDEX is the
+    // index name unless it is `ON` followed by a word and then `(` OR `USING` (the three-token
+    // lookahead, extended for the optional USING clause — grammar.md §30, gin.md §3).
     const unnamed =
       this.peekKeyword() === "on" &&
       this.peekKindAt(1) === "word" &&
-      this.peekKindAt(2) === "lparen";
+      (this.peekKindAt(2) === "lparen" || this.peekKeywordAt(2) === "using");
     const name = unnamed ? null : this.expectIdentifier();
     this.expectKeyword("on");
     const table = this.expectIdentifier();
+    // Optional `USING <method>` between the table name and the column list (PG order — gin.md §3,
+    // grammar.md §30). Not reserved (positional); the method is resolved at execution (42704 if
+    // unknown), not here.
+    let using: string | undefined = undefined;
+    if (this.peekKeyword() === "using") {
+      this.advance();
+      using = this.expectIdentifier();
+    }
     this.expect("lparen");
     const columns: string[] = [];
     for (;;) {
@@ -631,7 +642,7 @@ class Parser {
       if (tok.kind === "rparen") break;
       throw engineError("syntax_error", `expected ',' or ')', found ${tok.kind}`);
     }
-    return { kind: "createIndex", name, table, columns, unique };
+    return { kind: "createIndex", name, table, columns, unique, using };
   }
 
   // parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing

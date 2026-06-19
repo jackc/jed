@@ -1,0 +1,112 @@
+# GIN-bounded scans — a GIN index narrows a SELECT over an array column by the @> / && operators
+# (spec/design/gin.md §6). With a GIN index present, `col @> const` gathers the INTERSECTION of
+# the query terms' posting lists (rows containing ALL terms) and `col && const` the UNION (rows
+# sharing ANY term); the original predicate stays the residual WHERE filter, so the RESULT is
+# identical to the full-scan answer — this file pins that the index is transparent (correct rows
+# with the index, including across INSERT/UPDATE/DELETE maintenance). The PostgreSQL oracle agrees
+# (the rows do not depend on whether an index is used); the operator semantics themselves are
+# pinned in expr/array_containment.test.
+#
+# NOTE (G0 draft): exact `# cost:` assertions — which PIN that the GIN bound (not a full scan) is
+# taken: page_read per query term + gin_entry per posting entry + per-candidate fetch — are added
+# in G2 once a core computes them (gin.md §6 / cost.md). This file asserts correctness now.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_scan, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i32, types.array, func.array_containment
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, tags i32[])
+
+statement ok
+CREATE INDEX t_tags_gin ON t USING gin (tags)
+
+# shared / disjoint / duplicate-element / empty / NULL element sets
+statement ok
+INSERT INTO t VALUES
+  (1, ARRAY[10,20,30]),
+  (2, ARRAY[20,40]),
+  (3, ARRAY[40,50]),
+  (4, ARRAY[10,10,20]),
+  (5, '{}'),
+  (6, NULL)
+
+# --- @> contains: rows whose tags contain ALL query terms (posting-list intersection) -----
+# both 10 and 20 → rows 1 and 4
+query I nosort
+SELECT id FROM t WHERE tags @> ARRAY[10,20] ORDER BY id
+----
+1
+4
+
+# a single term → every row containing 20 (the bare ARRAY[…] adapts to tags's i32 element)
+query I nosort
+SELECT id FROM t WHERE tags @> ARRAY[20] ORDER BY id
+----
+1
+2
+4
+
+# duplicate query terms are a SET — @> ARRAY[10,10] is @> ARRAY[10]
+query I nosort
+SELECT id FROM t WHERE tags @> ARRAY[10,10] ORDER BY id
+----
+1
+4
+
+# no row contains 99 → empty
+query I nosort
+SELECT id FROM t WHERE tags @> ARRAY[99] ORDER BY id
+----
+
+# --- && overlap: rows whose tags share ANY query term (posting-list union) -----------------
+# 30 or 40 → row 1 (30), row 2 (40), row 3 (40)
+query I nosort
+SELECT id FROM t WHERE tags && ARRAY[30,40] ORDER BY id
+----
+1
+2
+3
+
+# --- degenerate constant queries (gin.md §6) ----------------------------------------------
+# @> '{}' is TRUE for every NON-NULL array (the full-scan fallback) — rows 1..5, not the NULL row 6
+query I nosort
+SELECT id FROM t WHERE tags @> '{}'::i32[] ORDER BY id
+----
+1
+2
+3
+4
+5
+
+# && '{}' overlaps nothing → empty (a provably-empty bound)
+query I nosort
+SELECT id FROM t WHERE tags && '{}'::i32[] ORDER BY id
+----
+
+# @> a query containing NULL is never TRUE (strict element equality) → empty
+query I nosort
+SELECT id FROM t WHERE tags @> '{NULL}'::i32[] ORDER BY id
+----
+
+# --- the index is transparent under maintenance: results stay correct after UPDATE/DELETE ---
+statement ok
+UPDATE t SET tags = ARRAY[20,60] WHERE id = 3
+
+# row 3's term set changed (40,50 → 20,60); it now joins the 20-posting
+query I nosort
+SELECT id FROM t WHERE tags @> ARRAY[20] ORDER BY id
+----
+1
+2
+3
+4
+
+statement ok
+DELETE FROM t WHERE id = 1
+
+# row 1's entries are gone from every posting
+query I nosort
+SELECT id FROM t WHERE tags @> ARRAY[20] ORDER BY id
+----
+2
+3
+4

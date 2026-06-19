@@ -178,9 +178,18 @@ drop_table     ::= "DROP" "TABLE" identifier
  * lookahead, byte-identical across the parsers (../design/grammar.md §30). Each named
  * column must exist (42703) and be of a key-encodable type (else 0A000); a column may be
  * listed more than once (PostgreSQL allows it). Index names share the TABLE namespace (a
- * duplicate in either is 42P07, "relation"). Narrowings this slice (each 0A000-free —
- * simply not in the grammar): no expression/ordered/partial keys (a key is a bare column
- * name), no IF NOT EXISTS, no USING, no NULLS NOT DISTINCT.
+ * duplicate in either is 42P07, "relation").
+ *   The optional "USING method" clause selects the index KIND (../design/gin.md, indexes.md):
+ * the method is a bare identifier, "btree" (the default — an ordered B-tree, identical to
+ * omitting USING) or "gin" (a GIN inverted index over a single integer-element array column,
+ * accelerating @> / && — ../design/gin.md). USING is recognized POSITIONALLY after the table
+ * name (before the column list, PG order), so it stays non-reserved (§3): a table/column may be
+ * named "using"; the unnamed-form lookahead (§30) extends to `ON <table> USING …`. An unknown
+ * method is 42704 ("access method does not exist"); USING gin on a non-array column is 42704
+ * (no GIN operator class), and on a non-integer-element array / as a multi-column / as UNIQUE
+ * is 0A000 (deferred — gin.md §3). Narrowings this slice (each 0A000-free — simply not in the
+ * grammar): no expression/ordered/partial keys (a key is a bare column name), no IF NOT EXISTS,
+ * no NULLS NOT DISTINCT.
  *
  * DROP INDEX removes one index by name: 42704 if it does not exist, 42809 if the name is
  * a table ("is not an index"); symmetrically DROP TABLE of an index name is 42809 ("is
@@ -189,7 +198,8 @@ drop_table     ::= "DROP" "TABLE" identifier
  * divergence — jed has no ALTER TABLE ... DROP CONSTRAINT, so the index name is the
  * constraint's only handle; indexes.md §8). */
 create_index   ::= "CREATE" "UNIQUE"? "INDEX" identifier? "ON" identifier
-                   "(" identifier ("," identifier)* ")"
+                   using_clause? "(" identifier ("," identifier)* ")"
+using_clause   ::= "USING" identifier
 drop_index     ::= "DROP" "INDEX" identifier
 
 /* CREATE SEQUENCE declares a named, persisted i64 generator (../design/sequences.md). The

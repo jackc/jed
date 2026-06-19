@@ -155,6 +155,9 @@ pub struct CreateIndex {
     pub table: String,
     pub columns: Vec<String>,
     pub unique: bool,
+    /// The `USING <method>` access method as written, or `None` for the default ordered B-tree.
+    /// Resolved at execution: `None`/`btree` → B-tree, `gin` → GIN, else 42704 (gin.md §3).
+    pub using: Option<String>,
 }
 
 /// `DROP INDEX <name>` — remove one secondary index (spec/design/indexes.md §2).

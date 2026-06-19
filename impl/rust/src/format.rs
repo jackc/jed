@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    FkAction, ForeignKeyConstraint, IndexDef, SequenceDef, Table,
+    FkAction, ForeignKeyConstraint, IndexDef, IndexKind, SequenceDef, Table,
 };
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
@@ -34,14 +34,16 @@ use crate::value::{ArrayVal, Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 11 = FOREIGN KEY constraints (a per-table catalog foreign-key list
-/// after the index list, spec/design/constraints.md §6). v10 = array (`T[]`) columns (type_code 15
-/// + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array
-/// value body, §4); v9 = composite (row) types (kind-tagged catalog entries); v8 = a per-column
-/// expression-default flag; v7 added a per-page CRC-32 (header grew 12→16 bytes). The bump from 10
+/// On-disk format version — 13 = GIN indexes (a per-index `index_kind` byte after `index_flags`,
+/// spec/design/gin.md §7). v12 = sequences (a kind-tagged sequence catalog section) + the `date`
+/// scalar. v11 = FOREIGN KEY constraints (a per-table catalog foreign-key list after the index
+/// list, spec/design/constraints.md §6). v10 = array (`T[]`) columns (type_code 15 + an
+/// element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value
+/// body, §4); v9 = composite (row) types (kind-tagged catalog entries); v8 = a per-column
+/// expression-default flag; v7 added a per-page CRC-32 (header grew 12→16 bytes). The bump from 12
 /// was atomic across the Rust/Go/TS cores + the Ruby golden reference (every `.jed` golden's version
 /// byte + CRC changed together).
-const FORMAT_VERSION: u16 = 12;
+const FORMAT_VERSION: u16 = 13;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -1761,6 +1763,8 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
             out.extend_from_slice(&(c as u16).to_be_bytes());
         }
         out.push(if idx.unique { 1 } else { 0 });
+        // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7).
+        out.push(idx.kind as u8);
         out.extend_from_slice(&root.to_be_bytes());
     }
     // Foreign keys (v11): count, then per FK the name, the local-column ordinals (into THIS
@@ -2325,11 +2329,18 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
         if iflags & !0b01 != 0 {
             return Err(corrupt("reserved index flag set"));
         }
+        // v13: index_kind byte (0 = ordered B-tree, 1 = GIN — spec/design/gin.md §7).
+        let kind = match read_u8(buf, pos)? {
+            0 => IndexKind::Btree,
+            1 => IndexKind::Gin,
+            _ => return Err(corrupt("unsupported index kind")),
+        };
         index_roots.push(read_u32(buf, pos)?);
         indexes.push(IndexDef {
             name: iname,
             columns: cols,
             unique: iflags & 0b01 != 0,
+            kind,
         });
     }
     // Foreign keys (v11): name + local ordinals + referenced table + referenced ordinals + the

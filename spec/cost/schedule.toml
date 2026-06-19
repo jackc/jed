@@ -169,3 +169,17 @@ event  = "one nextval/setval sequence-state mutation (the catalog tuple read + r
 # nextval (e.g. a generate_series-driven sweep of SELECT nextval('s')) bounded by max_cost — the 54P01
 # ceiling aborts deterministically — and keeps cost cross-core identical (CLAUDE.md §8/§13). Charged at
 # the identical point (the nextval kernel) in every core.
+
+[[unit]]
+id     = "gin_entry"
+weight = 1
+event  = "one GIN posting-list entry visited during a GIN-bounded scan's term gather"
+# Landed with GIN inverted indexes (../design/gin.md §6, ../design/cost.md §3 "GIN-bounded scan").
+# A `col @> const` / `col && const` scan over a GIN-indexed array column reads each query term's
+# posting list (a prefix range of the entry B-tree) and combines them by intersection (@>) / union
+# (&&); this unit fires once per posting entry visited across all those term scans. It bounds the
+# per-entry gather work that `page_read` (a per-NODE count) under-meters when a term's posting list
+# is long — so a many-term or high-posting predicate an untrusted query can drive stays cost-
+# proportional and a max_cost ceiling aborts it (54P01). Distinct from `storage_row_read` (charged
+# only per CANDIDATE row actually fetched after the combine) and from `page_read` (the index/table
+# tree NODE count). Charged at the identical per-entry point in every core (CLAUDE.md §8/§13).

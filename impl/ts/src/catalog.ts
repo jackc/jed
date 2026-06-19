@@ -90,7 +90,14 @@ export type ForeignKey = {
 // keyed by the lowercased name. A unique index enforces uniqueness over its key tuple
 // (NULLS DISTINCT — spec/design/indexes.md §8); it is what backs a UNIQUE constraint
 // (spec/design/constraints.md §5).
-export type IndexDef = { name: string; columns: number[]; unique: boolean };
+export type IndexDef = {
+  name: string;
+  columns: number[];
+  unique: boolean;
+  // kind selects an ordered B-tree (the default) or a GIN inverted index (spec/design/gin.md).
+  // Persisted as the v12 per-index index_kind byte; a GIN index is never unique.
+  kind: "btree" | "gin";
+};
 
 // CheckConstraint is one CHECK constraint: its (resolved, unique-per-table) name, its
 // persisted expression text — written back verbatim at every commit so the catalog bytes

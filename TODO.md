@@ -520,6 +520,28 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         index scans for UPDATE/DELETE (keep PK pushdown today); LIMIT-streaming combination;
         non-key-encodable index types (text/decimal/bytea/interval/float keys — boolean has since
         landed); expression/ordered/partial keys; `IF NOT EXISTS`.
+- [ ] **GIN inverted indexes** (`CREATE INDEX … USING gin`) — a second index *kind* beside the
+      ordered B-tree, via a type-generic operator-class seam (extract-terms / extract-query /
+      consistent). This slice: the **`array_ops`** opclass over a single integer-element array
+      column (`int16[]`/`int32[]`/`int64[]`), accelerating **`@>`** and **`&&`** only; one entry
+      per distinct non-NULL element (`encode(elem) ‖ storage-key`, empty payload); the planner
+      gathers candidates by posting-list intersection (`@>`) / union (`&&`) with the predicate as
+      the residual filter; `format_version` 12 adds a per-index `index_kind` byte; a new
+      `gin_entry` cost unit. Spec + corpus authored (G0): → [gin.md](spec/design/gin.md),
+      `suites/ddl/create_gin_index.test`, `suites/query/gin_scan.test`. _(size: L; deps: secondary
+      indexes ✅, arrays ✅, `@>`/`&&` ✅)_
+  - [x] _G1:_ grammar `USING` + `IndexKind` + the `index_kind` byte + the `gin_array_table.jed`
+        golden (byte-identical rust == go == ts == ruby), term extraction + N-entries-per-row
+        maintenance — all three cores + the Ruby reference (the index builds & round-trips on disk;
+        `create_gin_index.test` green on every core; queries don't use it yet — that's G2).
+  - [ ] _G2:_ the planner GIN bound + multi-term gather + cost (`gin_entry`), `gin_scan.test` cost
+        assertions, the `gin` NoREC scenario (`scripts/norec_gen.rb`), a `bench/` GIN workload, and
+        the `/web` docs + the oracle-override ledger entries for the deferred-narrowing DDL records.
+  - [ ] _follow-on (each its own slice):_ `<@` / `= ANY` / `IN` acceleration; non-integer element
+        types (as their key encodings lift) + composite-element arrays; multi-column GIN;
+        correlated / array-column query operands; GIN for UPDATE/DELETE scans; the LIMIT-streaming
+        combination; posting-list run compression; the **`jsonb_ops`** opclass (the lossy-recheck
+        path the seam already seats) and a future object/document opclass.
 - [x] **`RETURNING`** — `INSERT`/`UPDATE`/`DELETE … RETURNING <select_items>` projecting affected
       rows (INSERT stored / UPDATE new / DELETE old), evaluated after validation before any write;
       the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.

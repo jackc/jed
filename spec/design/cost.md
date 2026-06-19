@@ -51,8 +51,9 @@ The core seam units, all weight `1`:
 "`page_read`" — *alongside* `storage_row_read`, not a rename; the later
 `aggregate_accumulate` unit, [../cost/schedule.toml](../cost/schedule.toml), is metered in
 the aggregates path, the `value_compress`/`value_decompress` units — §3 "the compression
-units" — in the large-value codec paths, and the `decimal_work` unit — §3 "`decimal_work`"
-— in the decimal arithmetic/comparison evaluations.) The weights are uniform on purpose — phase 1 proves the seam reads
+units" — in the large-value codec paths, the `decimal_work` unit — §3 "`decimal_work`"
+— in the decimal arithmetic/comparison evaluations, and the `gin_entry` unit — §3
+"GIN-bounded scan" — in the GIN index gather.) The weights are uniform on purpose — phase 1 proves the seam reads
 cost from **data**; tuning the numbers later is a data-only change touching no executor code.
 
 ## 3. Accrual rules (the cross-core determinism contract)
@@ -338,6 +339,41 @@ empty table charges 0. `CREATE UNIQUE INDEX` charges **exactly the same** — it
 verification (indexes.md §8) is unmetered validation, like the uniqueness probes below.
 `DROP INDEX` charges 0 (a pure catalog edit, like DROP TABLE). Index **maintenance** at
 INSERT/UPDATE/DELETE is unmetered ("What is NOT metered" below).
+
+### GIN-bounded scan — an inverted index narrows an array-column scan
+
+A **GIN index** ([gin.md](gin.md)) gives a third bound kind at the same per-relation seam (after
+the PK bound and the ordered-index equality bound). For a base relation of a **SELECT** scan whose
+WHERE has a conjunct `col @> Q` (contains) or `col && Q` (overlaps) where `col` is GIN-indexed and
+`Q` is a **constant** array, the scan gathers candidates from the index instead of full-scanning.
+Gated by the `query.gin_scan` capability, pinned cross-core in
+`spec/conformance/suites/query/gin_scan.test`.
+
+A GIN-bounded scan accrues, in place of the full-scan block:
+
+- **`page_read` × the entry-tree nodes** overlapping each query term's prefix range — the same
+  overlap-node rule as the ordered index, applied **once per query term** (`@>` gathers all of
+  `Q`'s distinct elements, `&&` its distinct non-NULL elements — gin.md §2).
+- **`gin_entry` × the posting entries visited** across all term scans — the per-entry combine work
+  (intersection for `@>`, union for `&&`) that the per-node `page_read` under-meters when a posting
+  list is long.
+- **Per candidate row** (post-combine, point-looked-up in storage-key order): `page_read` × the
+  table-tree nodes on its descent + its touched-column `value_decompress` slabs +
+  **`storage_row_read`** — each candidate fetch costs exactly a PK point lookup of that row.
+- **The residual filter** — the `@>`/`&&` predicate stays the residual WHERE filter, so one
+  `operator_eval` per candidate — and **`row_produced`**, unchanged.
+
+A **provably-empty** bound charges nothing — a NULL `Q`, an `@>` whose `Q` holds a NULL element
+(never TRUE under strict equality), or an `&&` whose `Q` has no non-NULL element. The one
+**full-scan fallback**, `@> '{}'` (every non-NULL array contains the empty array — not derivable
+from the index), charges the full scan. Deterministic and byte-identical across cores: the term
+extraction, the term encoding, the entry-tree shape, and the overlap rule are all §8 contracts
+(gin.md §8). **Narrowings this slice** (gin.md §6): constant `Q` only, `@>`/`&&` only, SELECT scans
+only, and no LIMIT-streaming combination. **DDL cost:** `CREATE INDEX … USING gin` charges its
+build scan — `page_read` × the table's node count + `storage_row_read` per row, plus the array
+column's overflow-chain `page_read` / `value_decompress` if its values spilled (the build's touched
+set is the array column, which **can** be large — unlike the fixed-width ordered build); an empty
+table charges 0, `DROP INDEX` charges 0.
 
 **Bounded scan / JOIN — each base table bounded by its own PK predicate.** In a multi-table FROM
 each base table is materialized independently (see "JOIN" below), so each is bounded **on its own**

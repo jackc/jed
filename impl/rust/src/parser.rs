@@ -651,9 +651,14 @@ impl Parser {
             self.advance();
         }
         self.expect_keyword("index")?;
+        // The unnamed form is `INDEX ON <table> [USING <method>] (` — the word after INDEX is the
+        // index NAME unless it is `ON` followed by a word and then `(` OR `USING` (the three-token
+        // lookahead, extended for the optional USING clause — grammar.md §30, gin.md §3). A §8
+        // determinism surface, byte-identical across the parsers.
         let unnamed = self.peek_keyword().as_deref() == Some("on")
             && matches!(self.peek_at(1), Token::Word(_))
-            && matches!(self.peek_at(2), Token::LParen);
+            && (matches!(self.peek_at(2), Token::LParen)
+                || matches!(self.peek_at(2), Token::Word(w) if w.eq_ignore_ascii_case("using")));
         let name = if unnamed {
             None
         } else {
@@ -661,6 +666,15 @@ impl Parser {
         };
         self.expect_keyword("on")?;
         let table = self.expect_identifier()?;
+        // Optional `USING <method>` (PG order: between the table and the column list — gin.md §3,
+        // grammar.md §30). Not reserved (recognized positionally); the method name is resolved —
+        // and an unknown one rejected 42704 — at execution, not here.
+        let using = if self.peek_keyword().as_deref() == Some("using") {
+            self.advance();
+            Some(self.expect_identifier()?)
+        } else {
+            None
+        };
         self.expect(&Token::LParen)?;
         let mut columns = Vec::new();
         loop {
@@ -676,6 +690,7 @@ impl Parser {
             table,
             columns,
             unique,
+            using,
         })
     }
 

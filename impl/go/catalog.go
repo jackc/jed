@@ -104,6 +104,7 @@ type IndexDef struct {
 	Name    string
 	Columns []int
 	Unique  bool
+	Kind    IndexKind
 }
 
 // SequenceDef is a sequence (spec/design/sequences.md): a named, persisted, monotonic i64
@@ -144,6 +145,15 @@ func DefaultBounds(increment int64) (int64, int64) {
 	}
 	return 1, math.MaxInt64
 }
+
+// IndexKind selects an ordered B-tree (the default) or a GIN inverted index
+// (spec/design/gin.md). Persisted as the v13 per-index index_kind byte.
+type IndexKind byte
+
+const (
+	IndexBtree IndexKind = 0
+	IndexGin   IndexKind = 1
+)
 
 // CompositeType is a user-defined composite (row) type (spec/design/composite.md): a named,
 // ordered list of typed fields, living in the database's type catalog (a database-level object,

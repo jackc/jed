@@ -148,6 +148,24 @@ function arrayTableDB(): Database {
   return db;
 }
 
+// ginArrayTableDB has a GIN inverted index (v13 — the per-index index_kind byte, spec/design/gin.md):
+// i_nums_gin over an i32[] column (kind 1) beside an ordinary ordered index i_n over a scalar
+// column (kind 0 — a btree index cannot sit on the array column). Rows exercise term dedup (row 2's
+// duplicate 20), an empty and a NULL whole-value array (rows 3/4 → no entries), and a NULL element
+// (row 5). Rows are inserted before the indexes so each builds via the sorted-bulk path, matching
+// the Ruby reference's GIN_ARRAY_TABLE.
+function ginArrayTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], n i32)");
+  run(
+    db,
+    "INSERT INTO t VALUES (1, '{10,20,30}', 1), (2, '{20,20,40}', 2), (3, '{}', 3), (4, NULL, 4), (5, '{10,NULL,50}', 5)",
+  );
+  run(db, "CREATE INDEX i_n ON t (n)");
+  run(db, "CREATE INDEX i_nums_gin ON t USING gin (nums)");
+  return db;
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 function nopkTableDB(): Database {
   const db = goldenDb();
@@ -520,6 +538,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "check_table.jed", build: checkTableDB },
     { name: "index_table.jed", build: indexTableDB },
     { name: "unique_table.jed", build: uniqueTableDB },
+    { name: "gin_array_table.jed", build: ginArrayTableDB },
     { name: "fk_table.jed", build: fkTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB },
@@ -566,6 +585,7 @@ test("read goldens reproduces rows", () => {
     { name: "check_table.jed", build: checkTableDB, table: "t" },
     { name: "index_table.jed", build: indexTableDB, table: "t" },
     { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
+    { name: "gin_array_table.jed", build: ginArrayTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB, table: "t" },

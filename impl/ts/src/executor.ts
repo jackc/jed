@@ -1579,7 +1579,7 @@ export class Database {
       const nameKey = name.toLowerCase();
       let pos = table.indexes.findIndex((ix) => ix.name.toLowerCase() > nameKey);
       if (pos < 0) pos = table.indexes.length;
-      table.indexes.splice(pos, 0, { name, columns: ru.cols, unique: true });
+      table.indexes.splice(pos, 0, { name, columns: ru.cols, unique: true, kind: "btree" });
     }
 
     // FOREIGN KEY constraints (constraints.md §6). Resolved AFTER the PK / UNIQUE / CHECK
@@ -1869,6 +1869,14 @@ export class Database {
     }
     const tableKey = table.name.toLowerCase();
     const columns = table.columns;
+    // Resolve the access method (spec/design/gin.md §3): undefined / "btree" is the ordered
+    // B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
+    // parser) so the error is the resolve-time undefined_object, after the table-exists check.
+    const method = (ci.using ?? "btree").toLowerCase();
+    let kind: "btree" | "gin";
+    if (method === "btree") kind = "btree";
+    else if (method === "gin") kind = "gin";
+    else throw engineError("undefined_object", "access method does not exist: " + ci.using);
     const cols: number[] = [];
     for (const name of ci.columns) {
       const idx = columnIndex(table, name);
@@ -1876,7 +1884,22 @@ export class Database {
         throw engineError("undefined_column", "column does not exist: " + name);
       }
       const ty = columns[idx]!.type;
-      if (
+      if (kind === "gin") {
+        // GIN needs an operator class for the column type: only an array has one (else 42704),
+        // and this slice only the integer element types (else 0A000) — spec/design/gin.md §3.
+        if (ty.kind !== "array") {
+          throw engineError(
+            "undefined_object",
+            "data type " + typeCanonicalName(ty) + " has no default operator class for access method gin",
+          );
+        }
+        if (!typeIsInteger(ty.elem)) {
+          throw engineError(
+            "feature_not_supported",
+            "a gin index on " + typeCanonicalName(ty) + " is not supported yet",
+          );
+        }
+      } else if (
         !typeIsInteger(ty) &&
         !typeIsBoolean(ty) &&
         !typeIsUuid(ty) &&
@@ -1890,6 +1913,16 @@ export class Database {
       }
       // A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
       cols.push(idx);
+    }
+    // GIN narrowings this slice (spec/design/gin.md §3): no uniqueness (undefined for an inverted
+    // index) and a single column only — both deferred 0A000.
+    if (kind === "gin") {
+      if (ci.unique) {
+        throw engineError("feature_not_supported", "access method gin does not support unique indexes");
+      }
+      if (cols.length !== 1) {
+        throw engineError("feature_not_supported", "a multi-column gin index is not supported yet");
+      }
     }
     let name: string;
     if (ci.name !== null) {
@@ -1914,7 +1947,7 @@ export class Database {
     const meter = new Meter(this.maxCost);
     const mask = columns.map(() => false);
     for (const c of cols) mask[c] = true;
-    const def: IndexDef = { name, columns: cols, unique: ci.unique };
+    const def: IndexDef = { name, columns: cols, unique: ci.unique, kind };
     const store = this.readSnap().store(ci.table);
     const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
     meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
@@ -1939,7 +1972,7 @@ export class Database {
           seenPrefixes.add(k);
         }
       }
-      entries.push(indexEntryKey(columns, def, e.key, e.row));
+      entries.push(...indexEntryKeys(columns, def, e.key, e.row));
     }
     meter.guard();
 
@@ -2610,7 +2643,7 @@ export class Database {
     for (const pr of prepared) {
       const key = pr.key ?? encodeInt("i64", store.allocRowid());
       for (let k = 0; k < table.indexes.length; k++) {
-        indexInserts[k]!.push(indexEntryKey(table.columns, table.indexes[k]!, key, pr.row));
+        indexInserts[k]!.push(...indexEntryKeys(table.columns, table.indexes[k]!, key, pr.row));
       }
       if (!store.insert(key, pr.row)) {
         throw new Error("pre-validated INSERT key must be unique");
@@ -2788,7 +2821,7 @@ export class Database {
     for (const def of table.indexes) {
       const istore = this.working().indexStore(def.name.toLowerCase());
       for (const m of matched) {
-        istore.remove(indexEntryKey(table.columns, def, m.key, m.row));
+        for (const ek of indexEntryKeys(table.columns, def, m.key, m.row)) istore.remove(ek);
       }
     }
     return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, matched.length, meter.accrued);
@@ -3059,13 +3092,22 @@ export class Database {
     // copy-on-write dirty set, and so the commit's written pages, byte-identical across
     // cores). The storage key cannot change (PK assignment is rejected), so the suffix is
     // stable.
-    const indexMoves: { oldKey: Uint8Array; newKey: Uint8Array }[][] = table.indexes.map(() => []);
+    const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] = table.indexes.map(
+      () => [],
+    );
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
         const def = table.indexes[k]!;
-        const oldEk = indexEntryKey(table.columns, def, u.key, u.oldRow);
-        const newEk = indexEntryKey(table.columns, def, u.key, u.row);
-        if (!bytesEq(oldEk, newEk)) indexMoves[k]!.push({ oldKey: oldEk, newKey: newEk });
+        // The row's old and new entry SETS (one entry for an ordered index, one per term for GIN —
+        // gin.md §5). Remove old−new, insert new−old: a shared entry is left untouched, keeping the
+        // copy-on-write dirty set byte-identical across cores.
+        const oldEks = indexEntryKeys(table.columns, def, u.key, u.oldRow);
+        const newEks = indexEntryKeys(table.columns, def, u.key, u.row);
+        const removals = bytesDiff(oldEks, newEks);
+        const insertions = bytesDiff(newEks, oldEks);
+        if (removals.length > 0 || insertions.length > 0) {
+          indexMoves[k]!.push({ removals, insertions });
+        }
       }
     }
 
@@ -3075,9 +3117,11 @@ export class Database {
     for (let k = 0; k < table.indexes.length; k++) {
       const istore = this.working().indexStore(table.indexes[k]!.name.toLowerCase());
       for (const mv of indexMoves[k]!) {
-        istore.remove(mv.oldKey);
-        if (!istore.insert(mv.newKey, [])) {
-          throw new Error("index entry keys are unique (storage-key suffix)");
+        for (const oldEk of mv.removals) istore.remove(oldEk);
+        for (const newEk of mv.insertions) {
+          if (!istore.insert(newEk, [])) {
+            throw new Error("index entry keys are unique (storage-key suffix)");
+          }
         }
       }
     }
@@ -4520,6 +4564,52 @@ function indexEntryKey(columns: Column[], def: IndexDef, storageKey: Uint8Array,
     off += b.length;
   }
   return out;
+}
+
+// indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly
+// one for an ordered (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL
+// element for a GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index
+// uniformly as "a row maps to a set of entries."
+function indexEntryKeys(columns: Column[], def: IndexDef, storageKey: Uint8Array, row: Row): Uint8Array[] {
+  if (def.kind === "gin") return ginEntries(columns, def, storageKey, row);
+  return [indexEntryKey(columns, def, storageKey, row)];
+}
+
+// ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per
+// DISTINCT non-NULL array element — encode(element) ‖ storage_key, NO presence tag (a term is never
+// NULL) and an empty payload. A NULL array column value and an empty array yield no entries (so
+// they appear in no posting list). Returned sorted by term (= encoded-byte order for the integer
+// element types). This slice: a single integer-element array column.
+function ginEntries(columns: Column[], def: IndexDef, storageKey: Uint8Array, row: Row): Uint8Array[] {
+  const ci = def.columns[0]!;
+  const colType = columns[ci]!.type;
+  if (colType.kind !== "array") throw new Error("a GIN index column is an array (CREATE INDEX gate)");
+  const elemTy = typeScalar(colType.elem);
+  const v = row[ci]!;
+  if (v.kind !== "array") return [];
+  const seen = new Set<bigint>();
+  const vals: bigint[] = [];
+  for (const el of v.elements) {
+    if (el.kind !== "int") continue; // a NULL element (or any non-integer — impossible) is no term
+    if (!seen.has(el.int)) {
+      seen.add(el.int);
+      vals.push(el.int);
+    }
+  }
+  vals.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return vals.map((n) => {
+    const term = encodeInt(elemTy, n);
+    const out = new Uint8Array(term.length + storageKey.length);
+    out.set(term, 0);
+    out.set(storageKey, term.length);
+    return out;
+  });
+}
+
+// bytesDiff returns the entries in a that are not in b (set difference over byte strings),
+// preserving a's order — the UPDATE symmetric-difference for GIN / B-tree maintenance (gin.md §5).
+function bytesDiff(a: Uint8Array[], b: Uint8Array[]): Uint8Array[] {
+  return a.filter((x) => !b.some((y) => bytesEq(x, y)));
 }
 
 // indexPrefixKey builds a row's UNIQUENESS PROBE KEY for one unique index

@@ -1788,7 +1788,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			}
 		}
 		// Insert in catalog (ascending lowercased-name) order — indexes.md §6.
-		def := IndexDef{Name: name, Columns: ru.cols, Unique: true}
+		def := IndexDef{Name: name, Columns: ru.cols, Unique: true, Kind: IndexBtree}
 		nameKey := strings.ToLower(name)
 		pos := len(table.Indexes)
 		for i, ix := range table.Indexes {
@@ -2137,6 +2137,18 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	}
 	tableKey := strings.ToLower(table.Name)
 	columns := table.Columns
+	// Resolve the access method (spec/design/gin.md §3): the default / "btree" is the ordered
+	// B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
+	// parser) so the error is the resolve-time undefined_object, after the table-exists check.
+	var kind IndexKind
+	switch strings.ToLower(ci.Using) {
+	case "", "btree":
+		kind = IndexBtree
+	case "gin":
+		kind = IndexGin
+	default:
+		return Outcome{}, NewError(UndefinedObject, "access method does not exist: "+ci.Using)
+	}
 	cols := make([]int, 0, len(ci.Columns))
 	for _, name := range ci.Columns {
 		idx := table.ColumnIndex(name)
@@ -2144,12 +2156,36 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+name)
 		}
 		ty := columns[idx].Type
-		if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
-			return Outcome{}, NewError(FeatureNotSupported,
-				"a "+ty.CanonicalName()+" index column is not supported yet")
+		switch kind {
+		case IndexBtree:
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a "+ty.CanonicalName()+" index column is not supported yet")
+			}
+		case IndexGin:
+			// GIN needs an operator class for the column type: only an array has one (else 42704),
+			// and this slice only the integer element types (else 0A000) — spec/design/gin.md §3.
+			if ty.Array == nil {
+				return Outcome{}, NewError(UndefinedObject,
+					"data type "+ty.CanonicalName()+" has no default operator class for access method gin")
+			}
+			if elem, ok := ty.Array.AsScalar(); !ok || !elem.IsInteger() {
+				return Outcome{}, NewError(FeatureNotSupported,
+					"a gin index on "+ty.CanonicalName()+" is not supported yet")
+			}
 		}
 		// A duplicate column in the list is ALLOWED (PostgreSQL allows it — indexes.md §1).
 		cols = append(cols, idx)
+	}
+	// GIN narrowings this slice (spec/design/gin.md §3): no uniqueness (undefined for an inverted
+	// index) and a single column only — both deferred 0A000.
+	if kind == IndexGin {
+		if ci.Unique {
+			return Outcome{}, NewError(FeatureNotSupported, "access method gin does not support unique indexes")
+		}
+		if len(cols) != 1 {
+			return Outcome{}, NewError(FeatureNotSupported, "a multi-column gin index is not supported yet")
+		}
 	}
 	name := ci.Name
 	if name != "" {
@@ -2179,7 +2215,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	for _, c := range cols {
 		mask[c] = true
 	}
-	def := IndexDef{Name: name, Columns: cols, Unique: ci.Unique}
+	def := IndexDef{Name: name, Columns: cols, Unique: ci.Unique, Kind: kind}
 	store := db.readSnap().store(ci.Table)
 	stored, nodes, slabs, err := store.ScanWithUnits(mask)
 	if err != nil {
@@ -2205,7 +2241,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 				seenPrefixes[string(prefix)] = true
 			}
 		}
-		entries = append(entries, indexEntryKey(columns, def, e.Key, e.Row))
+		entries = append(entries, indexEntryKeys(columns, def, e.Key, e.Row)...)
 	}
 	if err := meter.Guard(); err != nil {
 		return Outcome{}, err
@@ -2489,6 +2525,68 @@ func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) [
 		}
 	}
 	out = append(out, storageKey...)
+	return out
+}
+
+// indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly
+// one for an ordered (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL
+// element for a GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index
+// uniformly as "a row maps to a set of entries."
+func indexEntryKeys(columns []Column, def IndexDef, storageKey []byte, row Row) [][]byte {
+	if def.Kind == IndexGin {
+		return ginEntries(columns, def, storageKey, row)
+	}
+	return [][]byte{indexEntryKey(columns, def, storageKey, row)}
+}
+
+// ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per
+// DISTINCT non-NULL array element — encode(element) ‖ storage_key, NO presence tag (a term is never
+// NULL) and an empty payload. A NULL array column value and an empty array yield no entries (so
+// they appear in no posting list). Returned sorted by term (= encoded-byte order for the integer
+// element types). This slice: a single integer-element array column.
+func ginEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][]byte {
+	ci := def.Columns[0]
+	elemTy := columns[ci].Type.Array.ScalarTy()
+	v := row[ci]
+	if v.Kind != ValArray {
+		return nil
+	}
+	seen := make(map[int64]bool)
+	var vals []int64
+	for _, el := range v.Array.Elements {
+		if el.Kind != ValInt {
+			continue // a NULL element (or any non-integer — impossible under the gate) is no term
+		}
+		if !seen[el.Int] {
+			seen[el.Int] = true
+			vals = append(vals, el.Int)
+		}
+	}
+	slices.Sort(vals)
+	entries := make([][]byte, 0, len(vals))
+	for _, n := range vals {
+		entry := append(EncodeInt(elemTy, n), storageKey...)
+		entries = append(entries, entry)
+	}
+	return entries
+}
+
+// bytesDiff returns the entries in a that are not in b (set difference over byte slices),
+// preserving a's order — the UPDATE symmetric-difference for GIN / B-tree maintenance (gin.md §5).
+func bytesDiff(a, b [][]byte) [][]byte {
+	var out [][]byte
+	for _, x := range a {
+		found := false
+		for _, y := range b {
+			if bytes.Equal(x, y) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			out = append(out, x)
+		}
+	}
 	return out
 }
 
@@ -3001,7 +3099,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			key = EncodeInt(Int64, store.AllocRowid())
 		}
 		for k, def := range table.Indexes {
-			indexInserts[k] = append(indexInserts[k], indexEntryKey(table.Columns, def, key, pr.row))
+			indexInserts[k] = append(indexInserts[k], indexEntryKeys(table.Columns, def, key, pr.row)...)
 		}
 		ok, err := store.Insert(key, pr.row)
 		if err != nil {
@@ -3291,8 +3389,10 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	for _, def := range table.Indexes {
 		istore := db.working().indexStore(strings.ToLower(def.Name))
 		for _, m := range matched {
-			if _, err := istore.Remove(indexEntryKey(table.Columns, def, m.key, m.row)); err != nil {
-				return Outcome{}, err
+			for _, ek := range indexEntryKeys(table.Columns, def, m.key, m.row) {
+				if _, err := istore.Remove(ek); err != nil {
+					return Outcome{}, err
+				}
 			}
 		}
 	}
@@ -3715,14 +3815,19 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	// copy-on-write dirty set, and so the commit's written pages, byte-identical across
 	// cores). The storage key cannot change (PK assignment is rejected), so the suffix is
 	// stable.
-	type indexMove struct{ oldKey, newKey []byte }
+	type indexMove struct{ removals, insertions [][]byte }
 	indexMoves := make([][]indexMove, len(table.Indexes))
 	for _, u := range updates {
 		for k, def := range table.Indexes {
-			oldEk := indexEntryKey(table.Columns, def, u.key, u.oldRow)
-			newEk := indexEntryKey(table.Columns, def, u.key, u.row)
-			if !bytes.Equal(oldEk, newEk) {
-				indexMoves[k] = append(indexMoves[k], indexMove{oldKey: oldEk, newKey: newEk})
+			// The row's old and new entry SETS (one entry for an ordered index, one per term for
+			// GIN — gin.md §5). Remove old−new, insert new−old: a shared entry is left untouched,
+			// keeping the copy-on-write dirty set byte-identical across cores.
+			oldEks := indexEntryKeys(table.Columns, def, u.key, u.oldRow)
+			newEks := indexEntryKeys(table.Columns, def, u.key, u.row)
+			removals := bytesDiff(oldEks, newEks)
+			insertions := bytesDiff(newEks, oldEks)
+			if len(removals) > 0 || len(insertions) > 0 {
+				indexMoves[k] = append(indexMoves[k], indexMove{removals: removals, insertions: insertions})
 			}
 		}
 	}
@@ -3737,15 +3842,19 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	for k, def := range table.Indexes {
 		istore := db.working().indexStore(strings.ToLower(def.Name))
 		for _, mv := range indexMoves[k] {
-			if _, err := istore.Remove(mv.oldKey); err != nil {
-				return Outcome{}, err
+			for _, oldEk := range mv.removals {
+				if _, err := istore.Remove(oldEk); err != nil {
+					return Outcome{}, err
+				}
 			}
-			inserted, err := istore.Insert(mv.newKey, nil)
-			if err != nil {
-				return Outcome{}, err
-			}
-			if !inserted {
-				panic("index entry keys are unique (storage-key suffix)")
+			for _, newEk := range mv.insertions {
+				inserted, err := istore.Insert(newEk, nil)
+				if err != nil {
+					return Outcome{}, err
+				}
+				if !inserted {
+					panic("index entry keys are unique (storage-key suffix)")
+				}
 			}
 		}
 	}

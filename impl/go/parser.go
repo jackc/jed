@@ -816,8 +816,12 @@ func (p *Parser) parseCreateIndex() (*CreateIndex, error) {
 	if err := p.expectKeyword("index"); err != nil {
 		return nil, err
 	}
+	// The unnamed form is `INDEX ON <table> [USING <method>] (` — the word after INDEX is the
+	// index name unless it is `ON` followed by a word and then `(` OR `USING` (the three-token
+	// lookahead, extended for the optional USING clause — grammar.md §30, gin.md §3).
 	unnamed := p.peekKeyword() == "on" &&
-		p.peekKindAt(1) == TokWord && p.peekKindAt(2) == TokLParen
+		p.peekKindAt(1) == TokWord &&
+		(p.peekKindAt(2) == TokLParen || p.peekKeywordAt(2) == "using")
 	name := ""
 	if !unnamed {
 		n, err := p.expectIdentifier()
@@ -832,6 +836,18 @@ func (p *Parser) parseCreateIndex() (*CreateIndex, error) {
 	table, err := p.expectIdentifier()
 	if err != nil {
 		return nil, err
+	}
+	// Optional `USING <method>` between the table name and the column list (PG order — gin.md §3,
+	// grammar.md §30). Not reserved (positional); the method is resolved at execution (42704 if
+	// unknown), not here.
+	using := ""
+	if p.peekKeyword() == "using" {
+		p.advance()
+		m, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		using = m
 	}
 	if err := p.expect(TokLParen); err != nil {
 		return nil, err
@@ -852,7 +868,7 @@ func (p *Parser) parseCreateIndex() (*CreateIndex, error) {
 		}
 		return nil, NewError(SyntaxError, fmt.Sprintf("expected ',' or ')', found %v", tok))
 	}
-	return &CreateIndex{Name: name, Table: table, Columns: columns, Unique: unique}, nil
+	return &CreateIndex{Name: name, Table: table, Columns: columns, Unique: unique, Using: using}, nil
 }
 
 // parseDropIndex parses `DROP INDEX <name>` (spec/design/grammar.md §30). A missing index

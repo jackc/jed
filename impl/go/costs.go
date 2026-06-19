@@ -20,6 +20,7 @@ type CostSchedule struct {
 	CteScanRow          int64
 	GeneratedRow        int64
 	SequenceAdvance     int64
+	GinEntry            int64
 }
 
 // Costs is the canonical cost schedule — weights accrued per unit during query execution.
@@ -35,4 +36,5 @@ var Costs = CostSchedule{
 	CteScanRow:          1,
 	GeneratedRow:        1,
 	SequenceAdvance:     1,
+	GinEntry:            1,
 }

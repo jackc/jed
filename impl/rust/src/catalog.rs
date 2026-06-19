@@ -56,17 +56,31 @@ pub struct CheckConstraint {
     pub expr: Expr,
 }
 
+/// The KIND of a secondary index (spec/design/gin.md): an ordered B-tree (the default) or a
+/// GIN inverted index. Persisted as the v12 per-index `index_kind` byte
+/// (spec/fileformat/format.md).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IndexKind {
+    /// An ordered B-tree over the key-column tuple — the original (and default) index.
+    Btree = 0,
+    /// A GIN inverted index: one entry per term extracted from the (array) column
+    /// (spec/design/gin.md §4). This slice: a single integer-element array column (`array_ops`).
+    Gin = 1,
+}
+
 /// One secondary index of a table (spec/design/indexes.md): its (relation-namespace) name
 /// and the indexed column ordinals in index-key order (duplicates allowed — PG). The index's
 /// B-tree lives in the snapshot's index-store map, keyed by the lowercased name. A
 /// `unique` index enforces uniqueness over its key tuple (NULLS DISTINCT —
 /// spec/design/indexes.md §8); it is what backs a `UNIQUE` constraint
-/// (spec/design/constraints.md §5).
+/// (spec/design/constraints.md §5). `kind` selects ordered-B-tree vs GIN
+/// (spec/design/gin.md); a GIN index is never `unique`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct IndexDef {
     pub name: String,
     pub columns: Vec<usize>,
     pub unique: bool,
+    pub kind: IndexKind,
 }
 
 /// The persisted referential action for a foreign key's `ON DELETE` / `ON UPDATE`

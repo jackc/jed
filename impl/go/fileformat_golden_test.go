@@ -166,6 +166,21 @@ func arrayTableDB(t *testing.T) *Database {
 	return db
 }
 
+// ginArrayTableDB has a GIN inverted index (v13 — the per-index index_kind byte, spec/design/gin.md):
+// i_nums_gin over an i32[] column (kind 1) beside an ordinary ordered index i_n over a scalar
+// column (kind 0 — a btree index cannot sit on the array column). Rows exercise term dedup (row 2's
+// duplicate 20), an empty and a NULL whole-value array (rows 3/4 → no entries), and a NULL element
+// (row 5). Rows are inserted before the indexes so each builds via the sorted-bulk path, matching
+// the Ruby reference's GIN_ARRAY_TABLE.
+func ginArrayTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, nums i32[], n i32)")
+	run(t, db, "INSERT INTO t VALUES (1, '{10,20,30}', 1), (2, '{20,20,40}', 2), (3, '{}', 3), (4, NULL, 4), (5, '{10,NULL,50}', 5)")
+	run(t, db, "CREATE INDEX i_n ON t (n)")
+	run(t, db, "CREATE INDEX i_nums_gin ON t USING gin (nums)")
+	return db
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 func nopkTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
@@ -568,6 +583,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"check_table.jed", checkTableDB},
 		{"index_table.jed", indexTableDB},
 		{"unique_table.jed", uniqueTableDB},
+		{"gin_array_table.jed", ginArrayTableDB},
 		{"fk_table.jed", fkTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"nested_composite_table.jed", nestedCompositeTableDB},
@@ -619,6 +635,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"check_table.jed", checkTableDB, "t"},
 		{"index_table.jed", indexTableDB, "t"},
 		{"unique_table.jed", uniqueTableDB, "t"},
+		{"gin_array_table.jed", ginArrayTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},

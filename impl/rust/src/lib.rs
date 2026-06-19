@@ -79,6 +79,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
     "ddl.secondary_index",
     "ddl.unique",
+    // GIN inverted indexes — CREATE INDEX ... USING gin over an integer-element array column;
+    // built + maintained on every write, persisted (format_version 12). The query-side planner
+    // bound (query.gin_scan) is a later slice (spec/design/gin.md).
+    "ddl.gin_index",
     // Composite (row) types — CREATE TYPE / DROP TYPE, persisted (format_version 9). S2: the type
     // is created/dropped/persisted; composite columns/values land later (spec/design/composite.md).
     "types.composite",

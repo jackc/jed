@@ -165,6 +165,9 @@ type CreateIndex struct {
 	Table   string
 	Columns []string
 	Unique  bool
+	// Using is the `USING <method>` access method as written, or "" for the default ordered
+	// B-tree. Resolved at execution: ""/"btree" → B-tree, "gin" → GIN, else 42704 (gin.md §3).
+	Using string
 }
 
 // DropIndex is a DROP INDEX <name> statement — remove one secondary index

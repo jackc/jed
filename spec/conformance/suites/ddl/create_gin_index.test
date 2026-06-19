@@ -1,0 +1,93 @@
+# GIN inverted indexes — CREATE INDEX ... USING gin / DROP INDEX (spec/design/gin.md).
+# A GIN index is a new index KIND beside the ordered B-tree: USING gin (col) over a single
+# integer-element array column (i16[]/i32[]/i64[]), accelerating the array containment
+# (@>) and overlap (&&) operators (gin.md §1). It reuses the ordinary index machinery — the
+# relation namespace, auto-naming (<table>_<col>_idx + suffixes), DROP, DROP TABLE cascade,
+# the page-backed B-tree — so only the validation new to USING gin is exercised here; the
+# shared DDL surface lives in create_index.test.
+#
+# Validation order (oracle-probed): table (42P01) -> access method known (42704) -> column
+# exists + has a GIN operator class (42703 / 42704 non-array) -> UNIQUE rejected (0A000) ->
+# name collision (42P07). DDL costs: CREATE INDEX charges its build scan (page_read per table
+# node + storage_row_read per row — gin.md §6); DROP INDEX charges 0.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.gin_index, ddl.drop_table, dml.insert, dml.insert_multi_row, types.i32, types.array, types.text, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, tags i32[], tags2 i32[], notes text[], n i32)
+
+# a GIN index on an empty table builds for free (no rows, no nodes)
+# cost: 0
+statement ok
+CREATE INDEX t_tags_gin ON t USING gin (tags)
+
+statement ok
+INSERT INTO t VALUES
+  (1, ARRAY[10,20,30], ARRAY[1], ARRAY['a'], 5),
+  (2, ARRAY[20,40,20], ARRAY[2], ARRAY['b'], 6),
+  (3, '{}', NULL, NULL, 7)
+
+# the build scan is metered like any index build: page_read(1 node) + 3 storage_row_read = 4
+# (the term extraction and the entry writes are unmetered — gin.md §5)
+# cost: 4
+statement ok
+CREATE INDEX explicit_tags ON t USING gin (tags)
+
+# the unnamed GIN form auto-names <table>_<col>_idx — the access method does not change the
+# name (PG); the derived t_tags_idx is proven taken by the explicit collision below
+# cost: 4
+statement ok
+CREATE INDEX ON t USING gin (tags)
+
+# USING btree is the ordinary ordered index — the explicit spelling of the default, on a scalar
+# cost: 4
+statement ok
+CREATE INDEX t_n_btree ON t USING btree (n)
+
+# --- validation order: table -> access method -> column -> UNIQUE -> name ------------------
+
+# the table must exist — reported before anything else
+statement error 42P01
+CREATE INDEX i ON nosuch USING gin (nope)
+
+# an unknown access method (PG: "access method nosuch does not exist")
+statement error 42704
+CREATE INDEX i ON t USING nosuch (tags)
+
+# GIN needs an operator class for the column type; a non-array column has none (PG 42704)
+statement error 42704
+CREATE INDEX i ON t USING gin (n)
+
+# GIN does not support unique indexes (PG 0A000 too: "access method gin does not support unique")
+statement error 0A000
+CREATE UNIQUE INDEX i ON t USING gin (tags)
+
+# the derived name t_tags_idx exists (the unnamed form above chose it)
+statement error 42P07
+CREATE INDEX t_tags_idx ON t USING gin (tags)
+
+# --- DROP ----------------------------------------------------------------------------------
+
+statement ok
+DROP INDEX explicit_tags
+
+# cost: 0
+statement ok
+DROP INDEX t_tags_gin
+
+statement error 42704
+DROP INDEX t_tags_gin
+
+# --- jed narrowings: PG BUILDS these, jed defers them 0A000 (oracle overrides — gin.md §10).
+# They sit LAST: a PG-succeeding `statement error` would poison the oracle replay prefix,
+# exactly like create_index.test's reserved-word `on` block (conformance.md §5). TODO(G1/G2):
+# add the matching spec/conformance/oracle_overrides.toml entries when this file is oracle-checked.
+
+# a multi-column GIN is deferred (PG builds a multicolumn GIN over two array columns)
+statement error 0A000
+CREATE INDEX i ON t USING gin (tags, tags2)
+
+# a non-integer array element type is deferred until its element key encoding lifts
+# (PG builds a text[] GIN; jed 0A000 — the same lift-when-encoded narrowing as a text key)
+statement error 0A000
+CREATE INDEX i ON t USING gin (notes)

@@ -246,6 +246,8 @@ test("cost schedule matches spec/cost/schedule.toml", () => {
         return COSTS.cteScanRow;
       case "sequence_advance":
         return COSTS.sequenceAdvance;
+      case "gin_entry":
+        return COSTS.ginEntry;
       default:
         throw new Error(`cost unit ${id} has no COSTS field — update this cross-check`);
     }

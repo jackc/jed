@@ -41,6 +41,10 @@ id = "ddl.unique"
 description = "UNIQUE constraints + unique indexes — column-level and table-level [CONSTRAINT name] UNIQUE (cols) and CREATE UNIQUE INDEX, all backed by a unique secondary index: PG auto-naming (t_col_key + suffixes; an explicit CONSTRAINT name names the index), identical-list dedup/PK fold, NULLS DISTINCT enforcement at INSERT/UPDATE (23505 names the constraint; UPDATE validates the end state — a documented PG divergence), build-over-duplicates 23505; the v6 catalog persists a per-index unique flag (spec/design/constraints.md §5, indexes.md §8)"
 
 [[capability]]
+id = "ddl.gin_index"
+description = "CREATE INDEX ... USING gin (col) — GIN inverted indexes, a second index KIND beside the ordered B-tree (spec/design/gin.md). This slice: the array_ops operator class over a single integer-element array column (i16[]/i32[]/i64[]), one entry per DISTINCT non-NULL element (entry = encode(elem) ‖ storage-key, empty payload; a whole-NULL/empty array yields no entries), maintained on every write; auto-naming/namespace/DROP reuse the ordinary index. Validation: unknown access method 42704, non-array column 42704 (no GIN operator class), UNIQUE gin 0A000; a non-integer element type / multi-column gin is 0A000 (deferred, PG builds them — oracle overrides). Persisted via the per-index index_kind byte (format_version 13). The query-side acceleration is query.gin_scan. Builds on ddl.secondary_index and types.array"
+
+[[capability]]
 id = "ddl.check"
 description = "CHECK constraints — column-level and table-level [CONSTRAINT name] CHECK (expr): boolean row predicates enforced per candidate row at INSERT/UPDATE (23514; TRUE/NULL pass), evaluated in name order; PG auto-naming (t_col_check / t_check + suffixes); DDL rejections 42804/0A000/42803/42P02/42703/42710; persisted as expression text in the v4 catalog (spec/design/constraints.md §4, grammar.md §29)"
 
@@ -127,6 +131,10 @@ description = "Correlated primary-key pushdown — when a correlated subquery's 
 [[capability]]
 id = "query.join_pushdown"
 description = "Join base-table primary-key pushdown — in a multi-table FROM, each base table is bounded independently by the WHERE predicates on its OWN primary key against a CONSTANT (`a JOIN b … WHERE a.pk = 5`), so that table materializes a seek/range instead of a full scan (spec/design/cost.md §3 \"bounded scan / JOIN\"). The same point-lookup mechanism as query.point_lookup applied per relation; a cross-relation `b.pk = a.x` (index-nested-loop) is NOT bounded (a follow-on). Sound for outer joins: a non-NULL PK conjunct in WHERE eliminates that relation's NULL-extended rows. A cost-visible optimization: a core lacking it full-scans every join base table and computes the higher cost, so cost-asserting join-PK tests require it."
+
+[[capability]]
+id = "query.gin_scan"
+description = "GIN-bounded scan — a SELECT base relation whose WHERE has `arr_col @> const` (contains) or `arr_col && const` (overlaps) against a GIN-indexed array column bounds the scan to candidate rows: the opclass extracts the query terms, each term's posting list is a prefix range scan of the GIN tree, the sets combine by INTERSECTION (@>) or UNION (&&), and the original predicate stays the residual WHERE filter (results identical to the full scan — gin.md §6). Degenerate constant queries: a NULL / NULL-containing query (and && of an empty/all-NULL query) is a provably-empty bound; @> '{}' falls back to the full scan. Cost: page_read per query term + gin_entry per posting entry + per-candidate point-lookup (page_read + storage_row_read) + residual operator_eval + row_produced (cost.md §3). A cost-visible optimization (a core lacking it full-scans and computes the higher cost, so cost-asserting GIN tests require it); narrowings: constant query only, @>/&& only, SELECT scans only, no LIMIT-streaming combination. Builds on ddl.gin_index and func.array_containment"
 
 [[capability]]
 id = "query.is_null"
