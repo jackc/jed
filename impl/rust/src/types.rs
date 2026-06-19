@@ -336,6 +336,12 @@ pub enum Type {
     /// every element type with no DDL and no catalog object. The element is a scalar or composite,
     /// never another array (multidimensionality is a value property, not array-of-array — §2).
     Array(Box<Type>),
+    /// A **structural** range type over a scalar element/subtype (spec/design/ranges.md): the six
+    /// built-in PostgreSQL range types. Like `Array`, the element `Type` is carried inline (not a
+    /// catalog reference); unlike array, the element is restricted to the six scalar subtypes that
+    /// have a range (i32/i64/decimal/timestamp/timestamptz/date — `ranges.toml`), never a composite,
+    /// array, or another range. The canonical name comes from `ranges.toml` (`i32` → `i32range`).
+    Range(Box<Type>),
 }
 
 /// A by-name reference to a composite type in the database's type catalog. The display name is
@@ -361,14 +367,18 @@ impl Type {
                 "array type used where a scalar was expected; the array path must branch before \
                  this point (spec/design/array.md)"
             ),
+            Type::Range(_) => unreachable!(
+                "range type used where a scalar was expected; the range path must branch before \
+                 this point (spec/design/ranges.md)"
+            ),
         }
     }
 
-    /// The inner scalar type, or `None` for a composite/array.
+    /// The inner scalar type, or `None` for a composite/array/range.
     pub fn as_scalar(&self) -> Option<ScalarType> {
         match self {
             Type::Scalar(s) => Some(*s),
-            Type::Composite(_) | Type::Array(_) => None,
+            Type::Composite(_) | Type::Array(_) | Type::Range(_) => None,
         }
     }
 
@@ -400,7 +410,22 @@ impl Type {
         match self {
             Type::Composite(r) => Some(r),
             Type::Array(elem) => elem.composite_ref(),
-            Type::Scalar(_) => None,
+            // A range's element is always a scalar subtype (never a composite), so a range never
+            // carries a composite reference (spec/design/ranges.md §2).
+            Type::Scalar(_) | Type::Range(_) => None,
+        }
+    }
+
+    /// Whether this is a range type.
+    pub fn is_range(&self) -> bool {
+        matches!(self, Type::Range(_))
+    }
+
+    /// The element (subtype) of a range, or `None` if not a range.
+    pub fn range_element(&self) -> Option<&Type> {
+        match self {
+            Type::Range(elem) => Some(elem),
+            _ => None,
         }
     }
 
@@ -412,6 +437,10 @@ impl Type {
             Type::Scalar(s) => s.canonical_name().to_string(),
             Type::Composite(r) => r.name.clone(),
             Type::Array(elem) => format!("{}[]", elem.canonical_name()),
+            // A range's canonical name comes from ranges.toml keyed by the element (i32 → i32range).
+            Type::Range(elem) => crate::range::range_name_for_element(elem.scalar())
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("range<{}>", elem.canonical_name())),
         }
     }
 

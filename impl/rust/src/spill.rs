@@ -429,6 +429,11 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             }
             Ok(())
         }
+        // A range value is never spilled this slice: range comparison / ORDER BY / DISTINCT land in
+        // R3 (which adds the spill tag), so a sort/dedup over a range cannot reach the spill codec.
+        Value::Range(_) => {
+            unreachable!("range values are not spilled until R3 (no range ORDER BY)")
+        }
         // An untouched large-value reference rides along to the output unread (spill.md §4); spill
         // it opaquely (the pointer/inline block) so it round-trips, never resolving it.
         Value::Unfetched(Unfetched::External { first_page, len }) => {

@@ -28,6 +28,8 @@ pub mod pager;
 pub mod paging;
 pub mod parser;
 pub mod pmap;
+pub mod range;
+pub mod ranges_gen;
 #[cfg(test)]
 mod recovery;
 pub mod seam;

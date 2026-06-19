@@ -29,7 +29,7 @@ use crate::storage::{Row, TableStore};
 use crate::timestamp::{parse_timestamp, parse_timestamptz};
 use crate::types::{DecimalTypmod, ScalarType, Type};
 use crate::value::{
-    ArrayVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
+    ArrayVal, RangeVal, ThreeValued, Value, and3, from3, not3, or3, parse_bytea_hex, parse_uuid,
 };
 use std::collections::{BTreeSet, HashMap, HashSet};
 
@@ -1464,6 +1464,14 @@ impl Database {
                         }
                     }
                 }
+            } else if crate::range::range_by_name(&def.type_name).is_some() {
+                // A range column is not storable yet (spec/design/ranges.md §8 — storage lands in
+                // R2). The range type name IS known, so this is 0A000 "not supported", not the 42704
+                // "type does not exist" the fall-through below would give.
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!("a {} column is not supported yet", def.type_name),
+                ));
             } else if ScalarType::from_name(&def.type_name).is_some() {
                 let (s, d) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
                 (Type::Scalar(s), d)
@@ -1833,7 +1841,8 @@ impl Database {
                 | ResolvedType::Interval
                 | ResolvedType::Float(_)
                 | ResolvedType::Composite(_)
-                | ResolvedType::Array(_) => {
+                | ResolvedType::Array(_)
+                | ResolvedType::Range(_) => {
                     return Err(type_error("argument of CHECK must be boolean"));
                 }
             }
@@ -3192,6 +3201,11 @@ impl Database {
                                     ),
                                 ));
                             }
+                            // Range columns are not storable yet (R2); CREATE TABLE rejects them, so
+                            // a `col.ty` is never a range here.
+                            Type::Range(_) => unreachable!(
+                                "range columns are not storable yet (R2); col.ty is never a range"
+                            ),
                         }
                     }
                 }
@@ -7007,6 +7021,7 @@ impl Database {
             | RExpr::ConstDate(_)
             | RExpr::ConstInterval(_)
             | RExpr::ConstArray(_)
+            | RExpr::ConstRange(_)
             | RExpr::ConstNull => Ok(()),
         }
     }
@@ -7755,6 +7770,11 @@ enum ResolvedType {
     /// comparable iff their element types are equal; an array is assignable to an array column of
     /// the same element type. Boxed to keep the scalar `ResolvedType` small.
     Array(Box<ResolvedType>),
+    /// A range type (spec/design/ranges.md §2), carrying its resolved element (subtype) type. Two
+    /// ranges are comparable iff their elements are equal; a range is assignable to a range column
+    /// of the same element. The element is always one of the six scalar subtypes. Boxed to keep the
+    /// scalar `ResolvedType` small.
+    Range(Box<ResolvedType>),
 }
 
 /// The resolved shape of a composite type — its (optional) name and resolved field list. The
@@ -7784,6 +7804,11 @@ impl ResolvedType {
             ResolvedType::Null => "unknown".to_string(),
             ResolvedType::Composite(c) => c.name.clone().unwrap_or_else(|| "record".to_string()),
             ResolvedType::Array(elem) => format!("{}[]", elem.type_name()),
+            // A range names itself by its element subtype (i32 → i32range — spec/design/ranges.md).
+            ResolvedType::Range(elem) => resolved_range_element_scalar(elem)
+                .and_then(crate::range::range_name_for_element)
+                .map(|n| n.to_string())
+                .unwrap_or_else(|| format!("range<{}>", elem.type_name())),
         }
     }
 
@@ -7807,6 +7832,9 @@ impl ResolvedType {
             // An array source never assigns to a scalar column (INSERT ... SELECT into an array
             // column is deferred — spec/design/array.md §12).
             ResolvedType::Array(_) => false,
+            // A range source never assigns to a scalar column (a range column is not yet storable —
+            // spec/design/ranges.md §8; range storage lands in R2).
+            ResolvedType::Range(_) => false,
             ResolvedType::Int(_) => col_ty.is_integer() || col_ty.is_decimal(),
             ResolvedType::Decimal => col_ty.is_decimal(),
             ResolvedType::Bool => col_ty.is_bool(),
@@ -8026,6 +8054,10 @@ enum RExpr {
     /// its shape). Boxed so the (rarely-used) shaped payload does not widen every `RExpr` frame.
     /// Eval returns it directly.
     ConstArray(Box<ArrayVal>),
+    /// A constant range value (the folded form of a range constant — `'[1,5)'::i32range`, already
+    /// canonicalized at resolve). Boxed so the payload does not widen every `RExpr` frame. Eval
+    /// returns it directly.
+    ConstRange(Box<RangeVal>),
     /// Field selection `(composite).field` (spec/design/composite.md §S4): evaluate `base` to a
     /// composite value and return its `index`-th field (the field ordinal, fixed at resolve). A
     /// whole-value-NULL composite yields NULL for any field. One `operator_eval` per node.
@@ -8336,7 +8368,29 @@ fn type_from_resolved(rt: &ResolvedType) -> Result<Type> {
             }
         },
         ResolvedType::Array(elem) => Type::Array(Box::new(type_from_resolved(elem)?)),
+        // A range-typed CTE column is deferred (range columns are not storable yet — R2); the
+        // value itself works in expression position, just not as a materialized column type.
+        ResolvedType::Range(_) => {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "a range column in a CTE is not supported yet",
+            ));
+        }
     })
+}
+
+/// The scalar element type of a resolved range element (`ResolvedType::Range(elem)`'s `elem`). A
+/// range's element is always one of the six scalar subtypes; `None` for anything else (which never
+/// occurs for a valid range). Used to name a range (`i32` → `i32range`) and to build its codec.
+fn resolved_range_element_scalar(elem: &ResolvedType) -> Option<ScalarType> {
+    match elem {
+        ResolvedType::Int(s) => Some(*s),
+        ResolvedType::Decimal => Some(ScalarType::Decimal),
+        ResolvedType::Timestamp => Some(ScalarType::Timestamp),
+        ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
+        ResolvedType::Date => Some(ScalarType::Date),
+        _ => None,
+    }
 }
 
 /// One relation in a SELECT plan: the table name (looked up in the store at exec), the flat
@@ -8802,6 +8856,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::ConstInterval(_)
         | RExpr::ConstNull
         | RExpr::ConstArray(_)
+        | RExpr::ConstRange(_)
         | RExpr::Param(_) => true,
         RExpr::Row(xs) | RExpr::Array { elems: xs, .. } => xs.iter().all(rexpr_is_constant),
         RExpr::Field { base, .. } => rexpr_is_constant(base),
@@ -8969,6 +9024,9 @@ fn encode_pk_key(pk: &[(usize, ScalarType)], row: &Row) -> Vec<u8> {
                 unreachable!("a composite primary key is rejected at CREATE TABLE")
             }
             Value::Array(_) => unreachable!("an array primary key is rejected at CREATE TABLE"),
+            // A range column is not storable yet (R2), let alone a key (spec/design/ranges.md §8),
+            // so a range value never reaches PK encoding.
+            Value::Range(_) => unreachable!("a range primary key is rejected at CREATE TABLE"),
             Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
         }
     }
@@ -10040,6 +10098,7 @@ fn value_to_rexpr(v: &Value) -> RExpr {
         Value::Composite(fields) => RExpr::Row(fields.iter().map(value_to_rexpr).collect()),
         // A folded array constant — preserve its full shape (dims/lbounds) in a const node.
         Value::Array(arr) => RExpr::ConstArray(Box::new(arr.clone())),
+        Value::Range(r) => RExpr::ConstRange(Box::new(r.clone())),
         // Poisoned (large-values.md §14): a folded subquery's projections are resolved values.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
@@ -10167,6 +10226,7 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::ConstDate(_)
         | RExpr::ConstInterval(_)
         | RExpr::ConstArray(_)
+        | RExpr::ConstRange(_)
         | RExpr::ConstNull => false,
     }
 }
@@ -10271,6 +10331,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::ConstDate(_)
         | RExpr::ConstInterval(_)
         | RExpr::ConstArray(_)
+        | RExpr::ConstRange(_)
         | RExpr::ConstNull => {}
     }
 }
@@ -10384,8 +10445,9 @@ fn arg_family(t: &ResolvedType) -> Option<&'static str> {
         ResolvedType::Date => Some("date"),
         ResolvedType::Interval => Some("interval"),
         ResolvedType::Null => None,
-        // A composite/array is no built-in function/aggregate argument family this slice.
-        ResolvedType::Composite(_) | ResolvedType::Array(_) => None,
+        // A composite/array/range is no concrete built-in argument family this slice. (A range's
+        // polymorphic `anyrange` family is matched separately by the range resolver — RF1.)
+        ResolvedType::Composite(_) | ResolvedType::Array(_) | ResolvedType::Range(_) => None,
     }
 }
 
@@ -10643,7 +10705,10 @@ fn elem_scalar_hint(t: &ResolvedType) -> Option<ScalarType> {
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
         ResolvedType::Date => Some(ScalarType::Date),
         ResolvedType::Interval => Some(ScalarType::Interval),
-        ResolvedType::Null | ResolvedType::Composite(_) | ResolvedType::Array(_) => None,
+        ResolvedType::Null
+        | ResolvedType::Composite(_)
+        | ResolvedType::Array(_)
+        | ResolvedType::Range(_) => None,
     }
 }
 
@@ -11388,7 +11453,8 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> R
         | ResolvedType::Interval
         | ResolvedType::Float(_)
         | ResolvedType::Composite(_)
-        | ResolvedType::Array(_) => Err(type_error("argument of WHERE must be boolean")),
+        | ResolvedType::Array(_)
+        | ResolvedType::Range(_) => Err(type_error("argument of WHERE must be boolean")),
     }
 }
 
@@ -11912,6 +11978,7 @@ fn resolved_type_of_col(ty: &Type, db: &Database) -> ResolvedType {
             }))
         }
         Type::Array(elem) => ResolvedType::Array(Box::new(resolved_type_of_col(elem, db))),
+        Type::Range(elem) => ResolvedType::Range(Box::new(resolved_type_of_col(elem, db))),
     }
 }
 
@@ -12297,6 +12364,12 @@ fn resolve(
             if let Some(ct) = scope.catalog.composite_type(type_name) {
                 return coerce_string_to_composite(text, ct, scope.catalog);
             }
+            // A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via
+            // `range_in` against the element type (spec/design/ranges.md §5) — the same primitive
+            // as `'[1,5)'::i32range`.
+            if let Some(desc) = crate::range::range_by_name(type_name) {
+                return coerce_string_to_range_expr(text, desc);
+            }
             let (target, _) = resolve_type_and_typmod(type_name, &None)?;
             coerce_string_literal(text, target, None)
         }
@@ -12411,6 +12484,29 @@ fn resolve(
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "casting to an array type is only supported from a string literal this slice"
+                        .to_string(),
+                ));
+            }
+            // A range cast target (`'[1,5)'::i32range`, `…::int4range`). Like array, v1 supports the
+            // string-literal form and a bare NULL; every other range cast (runtime text→range,
+            // range→text) is a documented 0A000 narrowing (spec/design/ranges.md §1/§5).
+            if let Some(desc) = crate::range::range_by_name(type_name) {
+                if type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a type modifier on a range type is not supported".to_string(),
+                    ));
+                }
+                let elem_rt = resolved_type_of(crate::range::element_scalar(desc));
+                if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
+                    return coerce_string_to_range_expr(s, desc);
+                }
+                if let Expr::Literal(Literal::Null) = inner.as_ref() {
+                    return Ok((RExpr::ConstNull, ResolvedType::Range(Box::new(elem_rt))));
+                }
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "casting to a range type is only supported from a string literal this slice"
                         .to_string(),
                 ));
             }
@@ -12599,6 +12695,14 @@ fn resolve(
                         "casting an array value is not supported yet",
                     ));
                 }
+                // Casting FROM a range (range→text, range→range) is deferred (ranges.md §5/§10);
+                // a range cast TARGET is handled above (the string-literal form).
+                ResolvedType::Range(_) => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting a range value is not supported yet",
+                    ));
+                }
             }
             let result_ty = if target.is_decimal() {
                 ResolvedType::Decimal
@@ -12637,7 +12741,8 @@ fn resolve(
                 | ResolvedType::Timestamptz
                 | ResolvedType::Date
                 | ResolvedType::Composite(_)
-                | ResolvedType::Array(_) => {
+                | ResolvedType::Array(_)
+                | ResolvedType::Range(_) => {
                     return Err(type_error("unary minus requires a numeric operand"));
                 }
             };
@@ -13345,8 +13450,8 @@ fn ctx_of(ty: &ResolvedType) -> Option<ScalarType> {
         ResolvedType::Bool => Some(ScalarType::Bool),
         ResolvedType::Decimal => Some(ScalarType::Decimal),
         ResolvedType::Null => None,
-        // A composite/array sibling offers no scalar adaptation context.
-        ResolvedType::Composite(_) | ResolvedType::Array(_) => None,
+        // A composite/array/range sibling offers no scalar adaptation context.
+        ResolvedType::Composite(_) | ResolvedType::Array(_) | ResolvedType::Range(_) => None,
         // A datetime sibling offers its type so a string literal parses as that datetime.
         ResolvedType::Timestamp => Some(ScalarType::Timestamp),
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
@@ -13453,7 +13558,8 @@ fn require_numeric_operand(ty: &ResolvedType) -> Result<()> {
         | ResolvedType::Interval
         | ResolvedType::Float(_)
         | ResolvedType::Composite(_)
-        | ResolvedType::Array(_) => {
+        | ResolvedType::Array(_)
+        | ResolvedType::Range(_) => {
             Err(type_error("arithmetic operators require numeric operands"))
         }
     }
@@ -14370,7 +14476,10 @@ fn scalar_for_param_hint(rt: &ResolvedType) -> Option<ScalarType> {
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
         ResolvedType::Date => Some(ScalarType::Date),
         ResolvedType::Interval => Some(ScalarType::Interval),
-        ResolvedType::Null | ResolvedType::Composite(_) | ResolvedType::Array(_) => None,
+        ResolvedType::Null
+        | ResolvedType::Composite(_)
+        | ResolvedType::Array(_)
+        | ResolvedType::Range(_) => None,
     }
 }
 
@@ -14543,7 +14652,8 @@ fn require_bool(ty: &ResolvedType, msg: &str) -> Result<()> {
         | ResolvedType::Interval
         | ResolvedType::Float(_)
         | ResolvedType::Composite(_)
-        | ResolvedType::Array(_) => Err(type_error(msg)),
+        | ResolvedType::Array(_)
+        | ResolvedType::Range(_) => Err(type_error(msg)),
     }
 }
 
@@ -14779,6 +14889,11 @@ fn coerce_string_to_composite(
                         let rt = resolved_type_of_col(&f.ty, catalog);
                         (value_to_rexpr(&val), rt)
                     }
+                    // A range field cannot occur: CREATE TYPE rejects a range field (range columns
+                    // are not storable yet — R2), so a composite field type is never a range.
+                    Type::Range(_) => {
+                        unreachable!("a composite range field is rejected at CREATE TYPE (R2)")
+                    }
                 };
                 nodes.push(node);
                 field_types.push((f.name.clone(), ty));
@@ -14792,6 +14907,44 @@ fn coerce_string_to_composite(
             fields: field_types,
         })),
     ))
+}
+
+/// Coerce a range text literal to a constant range expression (`'[1,5)'::i32range` /
+/// `i32range '[1,5)'`). Parses the literal, coerces each bound to the element type via the
+/// string-literal coercion, then canonicalizes (spec/design/ranges.md §4/§5). Folds to a
+/// `ConstRange`. Malformed → `22P02`; `lower>upper` → `22000`; a canonicalize overflow → `22003`.
+fn coerce_string_to_range_expr(
+    text: &str,
+    desc: &crate::ranges_gen::RangeDesc,
+) -> Result<(RExpr, ResolvedType)> {
+    let val = coerce_string_to_range(text, desc)?;
+    let elem_rt = resolved_type_of(crate::range::element_scalar(desc));
+    Ok((
+        RExpr::ConstRange(Box::new(val)),
+        ResolvedType::Range(Box::new(elem_rt)),
+    ))
+}
+
+/// Parse a range text literal and coerce its bounds to the element type, producing a canonical
+/// [`RangeVal`] (spec/design/ranges.md §4). The shared core of the range cast / typed-literal paths.
+fn coerce_string_to_range(text: &str, desc: &crate::ranges_gen::RangeDesc) -> Result<RangeVal> {
+    let parsed = crate::range::parse_range_text(text)?;
+    if parsed.empty {
+        return Ok(RangeVal::empty());
+    }
+    let elem = crate::range::element_scalar(desc);
+    let coerce_bound = |b: &Option<String>| -> Result<Option<Value>> {
+        match b {
+            None => Ok(None),
+            Some(s) => {
+                let (node, _) = coerce_string_literal(s, elem, None)?;
+                Ok(Some(rexpr_const_to_value(&node)?))
+            }
+        }
+    };
+    let lower = coerce_bound(&parsed.lower)?;
+    let upper = coerce_bound(&parsed.upper)?;
+    crate::range::finalize(desc, lower, upper, parsed.lower_inc, parsed.upper_inc)
 }
 
 fn coerce_string_literal(
@@ -15360,6 +15513,12 @@ fn store_value(
             "cannot store an array value in {} column {col_name}",
             col_ty.canonical_name()
         ))),
+        // Range columns are not storable yet (R2); this scalar-store path is reached only for a
+        // scalar column, so a range value here is a 42804 type mismatch (never a stored range).
+        Value::Range(_) => Err(type_error(format!(
+            "cannot store a range value in {} column {col_name}",
+            col_ty.canonical_name()
+        ))),
         // Poisoned (large-values.md §14): a stored value is an evaluated expression result.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
@@ -15746,6 +15905,7 @@ impl RExpr {
             }
             // A folded array constant (shape preserved) — return it directly.
             RExpr::ConstArray(a) => Ok(Value::Array((**a).clone())),
+            RExpr::ConstRange(r) => Ok(Value::Range((**r).clone())),
             // Field selection — one operator_eval, then pull the resolved field ordinal out of the
             // evaluated composite. A whole-value-NULL composite yields NULL (PG); the index is in
             // range by construction (resolve fixed it against the static field list).
@@ -15849,6 +16009,9 @@ impl RExpr {
                     Value::Array(_) => {
                         unreachable!("resolver rejects an array cast operand this slice")
                     }
+                    Value::Range(_) => {
+                        unreachable!("resolver rejects a range cast operand this slice")
+                    }
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
@@ -15889,6 +16052,9 @@ impl RExpr {
                     }
                     Value::Array(_) => {
                         unreachable!("resolver rejects an array unary minus")
+                    }
+                    Value::Range(_) => {
+                        unreachable!("resolver rejects a range unary minus")
                     }
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
@@ -17152,6 +17318,9 @@ fn family_rank(v: &Value) -> u8 {
         // An array sorts only against arrays of its own element type (ORDER BY is single-typed), so
         // this cross-family rank is only for totality; it sits after composite.
         Value::Array(_) => 12,
+        // A range sorts only against ranges of its own element type (ORDER BY is single-typed), so
+        // this cross-family rank is only for totality; it sits after array.
+        Value::Range(_) => 14,
         // Poisoned (large-values.md §14): ORDER BY slots are in the touched set, so a sort
         // key is always resolved before it reaches the comparator.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),

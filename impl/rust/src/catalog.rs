@@ -333,6 +333,14 @@ pub fn resolve_col_type(ty: &Type, types: &HashMap<String, CompositeType>) -> Co
             }
         }
         Type::Array(elem) => ColType::Array(Box::new(resolve_col_type(elem, types))),
+        // Range columns are not storable yet (spec/design/ranges.md §8 — R2 adds the codec +
+        // ColType::Range). CREATE TABLE rejects a range column and a CTE range column is 0A000, so
+        // no `Type::Range` ever reaches a `ColType` this slice.
+        Type::Range(_) => {
+            unreachable!(
+                "range columns are not storable yet (R2); resolve_col_type never sees a range"
+            )
+        }
     }
 }
 

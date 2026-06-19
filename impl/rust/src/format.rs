@@ -141,6 +141,9 @@ fn push_array_element_type(out: &mut Vec<u8>, elem: &Type) {
         Type::Array(_) => {
             unreachable!("nested array element (array-of-array) is not a jed type — §2")
         }
+        Type::Range(_) => {
+            unreachable!("array-of-range is not storable yet (range columns land in R2)")
+        }
     }
 }
 
@@ -402,6 +405,8 @@ fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
         Value::Composite(_) => panic!("BUG: a composite value reached the scalar codec"),
         // An array value is encoded by `encode_value`'s array arm, never here.
         Value::Array(_) => panic!("BUG: an array value reached the scalar codec"),
+        // A range value is not storable yet (R2 adds the range codec); it never reaches here.
+        Value::Range(_) => panic!("BUG: a range value reached the scalar codec (R2)"),
     }
 }
 
@@ -1691,6 +1696,11 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
                 out.push(flags);
                 push_array_element_type(&mut out, elem);
             }
+            // Range columns are not storable yet (R2 adds type_code 17 + the codec); CREATE TABLE
+            // rejects a range column, so a stored column type is never a range.
+            Type::Range(_) => {
+                unreachable!("range columns are not storable yet (R2); never serialized")
+            }
             Type::Scalar(s) => {
                 out.push(type_code_for_scalar(*s));
                 let mut flags = 0u8;
@@ -2065,6 +2075,11 @@ fn composite_type_entry_bytes(ct: &CompositeType) -> Vec<u8> {
             Type::Array(elem) => {
                 out.push(15);
                 push_array_element_type(&mut out, elem);
+            }
+            // A range field cannot occur: CREATE TYPE rejects a range field (range columns are not
+            // storable yet — R2).
+            Type::Range(_) => {
+                unreachable!("a composite range field is rejected at CREATE TYPE (R2)")
             }
         }
         out.push(if f.not_null { 0b1 } else { 0 });

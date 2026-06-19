@@ -77,6 +77,14 @@ pub enum Value {
     /// `array_eq`/`array_cmp`, they consider dimensionality and lower bounds, so `[2:4]={1,2,3}`
     /// and `{1,2,3}` are distinct (§5).
     Array(ArrayVal),
+    /// A **range** value (spec/design/ranges.md §4) — a range over a scalar element (subtype),
+    /// either the distinguished `empty` or a non-empty `{lower, upper, lower_inc, upper_inc}` with
+    /// a `None` bound meaning unbounded/infinite ([`RangeVal`]). The element type is carried by the
+    /// value's *type*, not the value (like array); the bound `Value`s are element values. Discrete
+    /// ranges (i32/i64/date) are stored CANONICAL (`[)`), so comparison/equality on the canonical
+    /// form is structural — `PartialEq`/`Eq`/`Hash` (DISTINCT/GROUP BY) and the total-order
+    /// `range_cmp` (R3) derive over the bound `Value`s' own canonical `Eq`/`Hash`.
+    Range(RangeVal),
     /// An **unfetched** large-value reference (spec/design/large-values.md §14): a stored
     /// external/compressed value loaded as its on-disk pointer instead of being materialized.
     /// Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -154,6 +162,42 @@ impl ArrayVal {
     /// The per-dimension upper bound `lb + len - 1` for dimension `d`.
     pub fn ubound(&self, d: usize) -> i32 {
         self.lbounds[d] + self.dims[d] as i32 - 1
+    }
+}
+
+/// A range value (spec/design/ranges.md §4). Either the distinguished **empty** range (`empty =
+/// true`, both bounds `None`) or a non-empty range with optional `lower`/`upper` bound values — a
+/// `None` bound is **unbounded/infinite** on that side (and its inclusivity flag is then always
+/// `false`). The bound `Value`s are element values (e.g. `Value::Int`/`Value::Date`/`Value::Decimal`);
+/// the element type comes from the range's *type*, not stored here (the array precedent). The stored
+/// form is CANONICAL (discrete ranges in `[)` form, the empty range normalized — §4), so the derived
+/// structural `Eq`/`Hash` is the correct value-level equality (DISTINCT/GROUP BY). `Box`ed bounds
+/// break the `Value`→`RangeVal`→`Value` size recursion.
+#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+pub struct RangeVal {
+    /// The distinguished empty range (contains no points). When `true`, both bounds are `None` and
+    /// both inclusivity flags `false` (the canonical empty representation, so all empties are equal).
+    pub empty: bool,
+    /// Lower bound value, or `None` for unbounded-below (infinite).
+    pub lower: Option<Box<Value>>,
+    /// Upper bound value, or `None` for unbounded-above (infinite).
+    pub upper: Option<Box<Value>>,
+    /// Lower bound inclusive (`[`); always `false` when `lower` is `None` (infinite).
+    pub lower_inc: bool,
+    /// Upper bound inclusive (`]`); always `false` when `upper` is `None` (infinite).
+    pub upper_inc: bool,
+}
+
+impl RangeVal {
+    /// The empty range (the canonical representation: no bounds, no inclusivity).
+    pub fn empty() -> RangeVal {
+        RangeVal {
+            empty: true,
+            lower: None,
+            upper: None,
+            lower_inc: false,
+            upper_inc: false,
+        }
     }
 }
 
@@ -249,6 +293,10 @@ impl PartialEq for Value {
             // `Null == Null` is true). This is exactly PG `array_eq` (NULLs mutually equal), and
             // the DISTINCT/GROUP BY key (spec/design/array.md §5).
             (Value::Array(a), Value::Array(b)) => a == b,
+            // Range equality is structural over the canonical form (empty + bounds + inclusivity);
+            // discrete ranges are stored canonical (`[)`), so `[1,5)` == `[1,4]` over i32range
+            // (both canonicalize to `[1,5)`). The bound `Value`s use their own canonical equality.
+            (Value::Range(a), Value::Range(b)) => a == b,
             (Value::Unfetched(a), Value::Unfetched(b)) => a == b,
             _ => false,
         }
@@ -287,6 +335,9 @@ impl std::hash::Hash for Value {
             // Hash the shape then each element (consistent with the structural `PartialEq`, which
             // includes dims/lbounds — so `[2:4]={1,2,3}` and `{1,2,3}` hash apart).
             Value::Array(a) => a.hash(state),
+            // Hash the canonical form (consistent with the structural `PartialEq`); the discriminant
+            // tag above separates a range from a scalar bound value.
+            Value::Range(r) => r.hash(state),
             Value::Unfetched(u) => u.hash(state),
         }
     }
@@ -387,6 +438,10 @@ impl Value {
             // an optional `[l:u]=` bound prefix when any lower bound ≠ 1), with per-element quoting
             // and an unquoted `NULL` for a null element (spec/design/array.md §7).
             Value::Array(a) => array_out(a),
+            // A range renders as PG `range_out`: `empty`, or `[lo,hi)` with `[`/`(`/`)`/`]` by
+            // inclusivity, an omitted bound for infinite, and per-bound quoting where the element
+            // text has special chars (e.g. a tsrange bound's space — spec/design/ranges.md §5).
+            Value::Range(r) => crate::range::range_out(r),
             Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
         }
     }
