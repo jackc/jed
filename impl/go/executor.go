@@ -8644,9 +8644,39 @@ func distinctRowKey(row []Value) string {
 			}
 			b.WriteByte('=')
 			b.WriteString(distinctRowKey(a.Elements))
+		case ValRange:
+			// A range keys structurally over its CANONICAL form (PG range btree — spec/design/ranges.md
+			// §6), under a distinct 'r' tag: the empty flag, then each bound's presence (infinite = '_'),
+			// inclusivity, and the bound value's own key recursively. Because the stored form is canonical,
+			// two equal ranges produce the identical key (rangeTotalCmp == 0 ⇔ same key), so they share a
+			// DISTINCT/GROUP BY bucket. NULL ranges key as 'n' (the whole-value NULL above).
+			rv := v.Range
+			b.WriteByte('r')
+			if rv.Empty {
+				b.WriteByte('e')
+				break
+			}
+			b.WriteByte('n') // non-empty marker
+			writeRangeBoundKey(&b, rv.Lower, rv.LowerInc)
+			writeRangeBoundKey(&b, rv.Upper, rv.UpperInc)
 		}
 	}
 	return b.String()
+}
+
+// writeRangeBoundKey appends one canonical range bound to a distinctRowKey buffer: '_' for an
+// infinite (nil) bound, else the inclusivity flag ('[' / '(') and the bound value's own recursive key.
+func writeRangeBoundKey(b *strings.Builder, bound *Value, inc bool) {
+	if bound == nil {
+		b.WriteByte('_')
+		return
+	}
+	if inc {
+		b.WriteByte('[')
+	} else {
+		b.WriteByte('(')
+	}
+	b.WriteString(distinctRowKey([]Value{*bound}))
 }
 
 // floatCanonicalKey is a collision-free string of a float's total-order equivalence class
@@ -12810,12 +12840,22 @@ func classifyComparable(lt, rt resolvedType) error {
 	if flL != flR && lt.kind != rtNull && rt.kind != rtNull {
 		return typeError("cannot compare a float value with a value of a different type")
 	}
-	// Range comparison is deferred to R3 (the range_cmp total order — spec/design/ranges.md §6); a
-	// range operand (range×range or range×anything) is a 42804 this slice. A range×NULL is allowed
-	// (the comparison is unknown), like every other family above.
+	// Range comparison is the PG range_cmp total order (spec/design/ranges.md §6). Two ranges are
+	// comparable iff they are over the SAME element type — i32range × i32range only, never i32range ×
+	// i64range or i32range × i32 (no implicit cross-element range comparison this slice; stricter than
+	// the int↔bigint scalar case, so the element resolvedTypes must be EQUAL, not merely comparable). A
+	// bare NULL is always comparable.
 	rangeL, rangeR := lt.kind == rtRange, rt.kind == rtRange
-	if (rangeL || rangeR) && lt.kind != rtNull && rt.kind != rtNull {
-		return typeError("range comparison is not supported yet")
+	switch {
+	case rangeL && rt.kind == rtNull, lt.kind == rtNull && rangeR:
+		return nil
+	case rangeL && rangeR:
+		if resolvedTypeEqual(*lt.elem, *rt.elem) {
+			return nil
+		}
+		return typeError("cannot compare ranges of different element types")
+	case rangeL || rangeR:
+		return typeError("cannot compare a range value with a value of a different type")
 	}
 	return nil
 }
@@ -15099,6 +15139,11 @@ func valueCmp(a, b Value) int {
 			}
 		}
 		return 0
+	case a.Kind == ValRange && b.Kind == ValRange:
+		// A range sorts by the PG range_cmp total order (spec/design/ranges.md §6): `empty` below every
+		// non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity). Kept
+		// identical to value.Lt3/Gt3's range arm so `<` and ORDER BY never disagree.
+		return rangeTotalCmp(a.Range, b.Range)
 	default:
 		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
 		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.

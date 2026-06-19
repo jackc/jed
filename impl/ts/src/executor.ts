@@ -206,6 +206,7 @@ import {
   rangeByName,
   rangeForElement,
   rangeNameForElement,
+  rangeTotalCmp,
 } from "./range.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
 
@@ -7712,6 +7713,21 @@ function distinctValueKey(v: Value): string {
           "=" +
           v.elements.map((el) => distinctValueKey(el)).join(",")
         );
+      case "range":
+        // A range keys structurally over its CANONICAL form (spec/design/ranges.md §6): the empty
+        // flag, the inclusivity flags, and each bound's own key (an infinite/null bound keys as
+        // 'n', like a NULL array element). Two equal canonical ranges have identical fields, so
+        // this buckets exactly like the range_cmp equality. The 'r' tag + flag chars keep it
+        // collision-free against scalar/array keys.
+        if (v.empty) return "re";
+        return (
+          "r" +
+          (v.lowerInc ? "[" : "(") +
+          (v.upperInc ? "]" : ")") +
+          (v.lower === null ? "n" : distinctValueKey(v.lower)) +
+          "," +
+          (v.upper === null ? "n" : distinctValueKey(v.upper))
+        );
       case "null":
         return "n";
       case "int":
@@ -9378,7 +9394,7 @@ function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
   if (a.kind !== b.kind) return false;
   if (a.kind === "int" || a.kind === "float")
     return a.ty === (b as { ty: ScalarType }).ty;
-  if (a.kind === "array")
+  if (a.kind === "array" || a.kind === "range")
     return resolvedTypeEqual(a.elem, (b as { elem: ResolvedType }).elem);
   if (a.kind === "composite") {
     const bc = b as {
@@ -11913,6 +11929,23 @@ function resolveOperandPair(
 // a boolean with a non-boolean, is a 42804 type error — comparison is overloaded across these
 // families but never compares across them.
 function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
+  // Range comparison is the PG range_cmp total order (spec/design/ranges.md §6). Two ranges are
+  // comparable iff they are over the SAME element type — i32range × i32range only, never
+  // i32range × i64range or i32range × i32 (no implicit cross-element range comparison this slice;
+  // stricter than the int↔bigint scalar case, so the element types must be EQUAL, not merely
+  // comparable). A bare NULL is always comparable (the comparison is unknown). Checked FIRST so a
+  // range × array/composite pair reports the range message (matching the Rust arm order).
+  const rangeL = lt.kind === "range";
+  const rangeR = rt.kind === "range";
+  if (rangeL && rangeR) {
+    if (!resolvedTypeEqual(lt.elem, rt.elem)) {
+      throw typeError("cannot compare ranges of different element types");
+    }
+    return;
+  }
+  if ((rangeL || rangeR) && lt.kind !== "null" && rt.kind !== "null") {
+    throw typeError("cannot compare a range value with a value of a different type");
+  }
   // Composite comparison is element-wise row comparison (spec/design/composite.md §5): two
   // composites are comparable iff they have the SAME field count and each corresponding field
   // pair is itself comparable (recursively — a nested composite recurses here, an anonymous
@@ -12014,14 +12047,6 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
     throw typeError(
       "cannot compare an interval value with a value of a different type",
     );
-  }
-  // Range comparison is deferred to R3 (the range_cmp total order — spec/design/ranges.md §6); a
-  // range operand (range×range or range×anything) is a 42804 this slice. A range×NULL is allowed
-  // (the comparison is unknown), like every other family above.
-  const rangeL = lt.kind === "range";
-  const rangeR = rt.kind === "range";
-  if ((rangeL || rangeR) && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError("range comparison is not supported yet");
   }
 }
 
@@ -15163,6 +15188,10 @@ function valueCmp(a: Value, b: Value): number {
     }
     return 0;
   }
+  // A range sorts by the PG range_cmp total order (spec/design/ranges.md §6): `empty` below every
+  // non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity). Kept
+  // identical to value's lt3/gt3 range arm so `<` and ORDER BY never disagree.
+  if (a.kind === "range" && b.kind === "range") return rangeTotalCmp(a, b);
   // Cross-family arms exist only for totality — ORDER BY is over a single typed column, so a
   // mixed pair is unreachable. A fixed family order keeps the comparator total.
   const fr = familyRank(a) - familyRank(b);

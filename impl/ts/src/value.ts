@@ -12,7 +12,7 @@ import { Decimal } from "./decimal.ts";
 import { type Interval, intervalCmp, renderInterval } from "./interval.ts";
 import { renderTimestamp, renderTimestamptz } from "./timestamp.ts";
 import { renderDate } from "./date.ts";
-import { rangeOut } from "./range.ts";
+import { rangeOut, rangeTotalCmp } from "./range.ts";
 
 export type Value =
   | { kind: "null" }
@@ -935,6 +935,10 @@ export function eq3(a: Value, b: Value): ThreeValued {
   // length and every element pair equal-or-both-NULL → TRUE, else FALSE. NULL elements are
   // comparable and mutually equal, so the result is ALWAYS definite (never UNKNOWN).
   if (a.kind === "array" && b.kind === "array") return bool3(arrayEqual(a, b));
+  // Range `=` is structural over the canonical form (PG range btree, NOT 3VL): two canonical ranges
+  // are equal iff rangeTotalCmp is 0, always definite (spec/design/ranges.md §6). NULLs propagate
+  // only at the whole-value level (handled above), never per-bound.
+  if (a.kind === "range" && b.kind === "range") return bool3(rangeTotalCmp(a, b) === 0);
   return "unknown";
 }
 
@@ -1054,6 +1058,9 @@ export function lt3(a: Value, b: Value): ThreeValued {
   // Array `<` uses the PG array_cmp total order (spec/design/array.md §5): element-wise, NULL after
   // every non-NULL, shorter prefix first. Always definite.
   if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a, b) < 0);
+  // Range `<` uses the PG range_cmp total order (spec/design/ranges.md §6): `empty` below every
+  // non-empty range, then by lower bound, then by upper bound. Always definite.
+  if (a.kind === "range" && b.kind === "range") return bool3(rangeTotalCmp(a, b) < 0);
   return "unknown";
 }
 
@@ -1082,6 +1089,8 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "composite" && b.kind === "composite") return compositeOrder3(a.fields, b.fields, true);
   // Array `>` — the total-order mirror of `<` (spec/design/array.md §5).
   if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a, b) > 0);
+  // Range `>` — the total-order mirror of `<` (spec/design/ranges.md §6).
+  if (a.kind === "range" && b.kind === "range") return bool3(rangeTotalCmp(a, b) > 0);
   return "unknown";
 }
 
@@ -1101,6 +1110,9 @@ export function valueEqual(a: Value, b: Value): boolean {
   // Two arrays are "not distinct" iff structurally equal (btree equality; NULL elements mutually
   // equal — spec/design/array.md §5).
   if (a.kind === "array" && b.kind === "array") return arrayEqual(a, b);
+  // Two ranges are "not distinct" iff structurally equal over the canonical form (the same equality
+  // as `==`/`eq3` — rangeTotalCmp 0; spec/design/ranges.md §6).
+  if (a.kind === "range" && b.kind === "range") return rangeTotalCmp(a, b) === 0;
   return eq3(a, b) === "true";
 }
 

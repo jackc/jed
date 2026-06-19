@@ -584,6 +584,13 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValArray && o.Kind == ValArray {
 		return bool3(arrayEqual(v.Array, o.Array))
 	}
+	// Range `=` is structural over the canonical form (PG range btree, NOT 3VL): two ranges are equal
+	// iff their canonical (empty + bounds + inclusivity) forms match — always definite
+	// (spec/design/ranges.md §6). rangeTotalCmp == 0 agrees with this structural equality (the stored
+	// form is canonical).
+	if v.Kind == ValRange && o.Kind == ValRange {
+		return bool3(rangeTotalCmp(v.Range, o.Range) == 0)
+	}
 	return Unknown
 }
 
@@ -683,6 +690,12 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValArray && o.Kind == ValArray {
 		return bool3(arrayTotalCmp(v.Array, o.Array) < 0)
 	}
+	// Range `<` uses the PG range_cmp total order (spec/design/ranges.md §6): `empty` below every
+	// non-empty, then lower bound, then upper bound — accounting for infinity and inclusivity. Always
+	// definite (the btree total order), never UNKNOWN.
+	if v.Kind == ValRange && o.Kind == ValRange {
+		return bool3(rangeTotalCmp(v.Range, o.Range) < 0)
+	}
 	return Unknown
 }
 
@@ -734,6 +747,10 @@ func (v Value) Gt3(o Value) ThreeValued {
 	// Array `>` — the total-order mirror of `<` (spec/design/array.md §5).
 	if v.Kind == ValArray && o.Kind == ValArray {
 		return bool3(arrayTotalCmp(v.Array, o.Array) > 0)
+	}
+	// Range `>` — the total-order mirror of `<` (spec/design/ranges.md §6).
+	if v.Kind == ValRange && o.Kind == ValRange {
+		return bool3(rangeTotalCmp(v.Range, o.Range) > 0)
 	}
 	return Unknown
 }

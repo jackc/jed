@@ -18,15 +18,17 @@
 > semantics are the default (CLAUDE.md §1) and are pinned against the live `postgres:18`
 > oracle — several canonicalization / empty / ordering / text-quoting rules are subtle (§4–§7).
 
-> **Status: R0–R2 landed; comparison (R3) + the function/operator surface (RF1–RF4) follow
-> (§11).** R0 (this doc + `ranges.toml` + the codegen'd `RANGES` table) is the spec/data
+> **Status: R0–R3 landed (the type axis is complete); the function/operator surface (RF1–RF4)
+> follows (§11).** R0 (this doc + `ranges.toml` + the codegen'd `RANGES` table) is the spec/data
 > foundation; **R1** threaded the open-`Type` `Range` arm + the `'[1,5)'::i32range` literal/cast
 > through all three cores; **R2** made range **columns** declarable + storable — the value codec
 > (`type_code 17`, `format_version 16`), canonicalization / empty normalization at store, text I/O,
-> and the cross-core golden `range_table.jed` (`rust == go == ts == ruby`). Comparison/ordering
-> (R3) is still deferred — a range `=`/`<`/`ORDER BY` is `42804` until then. The naming, the
-> structural-type decision, the value model, canonicalization, text I/O, comparison, and the
-> deferred narrowings below are ratified spec-first; the per-slice delivery is §11.
+> and the cross-core golden `range_table.jed` (`rust == go == ts == ruby`); **R3** added the
+> `range_cmp` total order (§6) driving `=` / `<` / `<=` / `>` / `>=` / `ORDER BY` / `DISTINCT` /
+> `GROUP BY` — a range compares only with a range over the **same** element type (a cross-element
+> pair is `42804`). The naming, the structural-type decision, the value model, canonicalization,
+> text I/O, comparison, and the deferred narrowings below are ratified spec-first; the per-slice
+> delivery is §11.
 
 ## 1. Surface
 
@@ -204,9 +206,10 @@ result always):
   finite lower; for equal lower *values*, an **inclusive** lower bound sorts before an
   **exclusive** one (`[1` < `(1`); symmetrically for the upper bound an inclusive upper sorts
   *after* an exclusive one, and an infinite upper is above any finite upper. (The exact
-  bound-with-inclusivity ranking is oracle-pinned in R3, where `eq3`/`lt3`/`gt3` gain the
-  `Value::Range` arm and the resolver's `classify_comparable` accepts a same-element range
-  pair.)
+  bound-with-inclusivity ranking is oracle-pinned, with `eq3`/`lt3`/`gt3` carrying the
+  `Value::Range` arm — equality is structural over the canonical form, ordering is `range_cmp` —
+  and the resolver's `classify_comparable` accepting a same-element range pair only; a range
+  `ORDER BY` / `DISTINCT` / `GROUP BY` rides the same total order.)
 - Because discrete ranges are stored canonical (§4), `[1,5)` and `[1,4]` over `i32range` are
   **equal** (both canonicalize to `[1,5)`) — equality is on the canonical form, oracle-pinned
   (`int4range(1,5,'[]') = int4range(1,6,'[)')` is true).

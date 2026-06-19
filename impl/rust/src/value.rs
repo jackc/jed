@@ -508,6 +508,11 @@ impl Value {
             // NULL elements are comparable and mutually equal, so the result is ALWAYS definite
             // (never UNKNOWN) — exactly `array_eq`. This is the structural `PartialEq`.
             (Value::Array(a), Value::Array(b)) => bool3(a == b),
+            // Range `=` is structural over the canonical form (PG range btree, NOT 3VL): two
+            // ranges are equal iff their canonical (empty + bounds + inclusivity) forms match —
+            // always definite (spec/design/ranges.md §6). `range_total_cmp == Equal` agrees with
+            // this structural `==` (the stored form is canonical).
+            (Value::Range(a), Value::Range(b)) => bool3(a == b),
             // Poisoned (large-values.md §14): an unfetched value must never be compared —
             // falling through to UNKNOWN here would silently read it as NULL.
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
@@ -549,6 +554,12 @@ impl Value {
             (Value::Array(a), Value::Array(b)) => {
                 bool3(array_total_cmp(a, b) == std::cmp::Ordering::Less)
             }
+            // Range `<` uses PG `range_cmp` total order (spec/design/ranges.md §6): `empty` below
+            // every non-empty, then lower bound, then upper bound — accounting for infinity and
+            // inclusivity. Always definite (the btree total order), never UNKNOWN.
+            (Value::Range(a), Value::Range(b)) => {
+                bool3(crate::range::range_total_cmp(a, b) == std::cmp::Ordering::Less)
+            }
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
                 panic!("BUG: unfetched large value escaped the storage layer")
             }
@@ -583,6 +594,10 @@ impl Value {
             (Value::Array(a), Value::Array(b)) => {
                 bool3(array_total_cmp(a, b) == std::cmp::Ordering::Greater)
             }
+            // Range `>` — the total-order mirror of `<` (spec/design/ranges.md §6).
+            (Value::Range(a), Value::Range(b)) => {
+                bool3(crate::range::range_total_cmp(a, b) == std::cmp::Ordering::Greater)
+            }
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
                 panic!("BUG: unfetched large value escaped the storage layer")
             }
@@ -607,6 +622,9 @@ impl Value {
             // Two arrays are "not distinct" iff structurally equal (the same btree equality as
             // `==`/`eq3`; NULL elements are mutually equal).
             (Value::Array(a), Value::Array(b)) => a == b,
+            // Two ranges are "not distinct" iff structurally equal over the canonical form (the
+            // same equality as `==`/`eq3`).
+            (Value::Range(a), Value::Range(b)) => a == b,
             _ => self.eq3(other) == ThreeValued::True,
         }
     }

@@ -279,6 +279,71 @@ func finalizeRange(desc RangeDesc, lower, upper *Value, lowerInc, upperInc bool)
 	return &RangeVal{Empty: false, Lower: lower, Upper: upper, LowerInc: lowerInc, UpperInc: upperInc}, nil
 }
 
+// --- comparison ------------------------------------------------------------
+
+// rangeTotalCmp is the PG range_cmp total order over two CANONICAL range values
+// (spec/design/ranges.md §6): `empty` sorts below every non-empty range, then by lower bound, then
+// by upper bound. Each bound comparison (cmpBound) accounts for infinity and inclusivity. A total
+// order (always a definite result, never 3-valued — unlike composite), and consistent with the
+// structural RangeVal equality (two canonical ranges are equal iff rangeTotalCmp is 0). Shared by
+// value.Lt3/Gt3 and executor.valueCmp so `<` and `ORDER BY` never disagree.
+func rangeTotalCmp(a, b *RangeVal) int {
+	switch {
+	case a.Empty && b.Empty:
+		return 0
+	case a.Empty && !b.Empty:
+		return -1
+	case !a.Empty && b.Empty:
+		return 1
+	}
+	if c := cmpBound(a.Lower, a.LowerInc, b.Lower, b.LowerInc, true); c != 0 {
+		return c
+	}
+	return cmpBound(a.Upper, a.UpperInc, b.Upper, b.UpperInc, false)
+}
+
+// cmpBound compares two range bounds on the same side (lower-vs-lower or upper-vs-upper), PG
+// range_cmp_bounds. A nil value is the unbounded/infinite bound: an infinite lower is below any
+// finite lower, an infinite upper is above any finite upper. For equal finite values the inclusivity
+// breaks the tie, and the direction depends on the side: a lower bound sorts inclusive-before-
+// exclusive ([1 < (1), an upper bound sorts exclusive-before-inclusive (1) < 1]). isLower selects
+// that direction.
+func cmpBound(v1 *Value, inc1 bool, v2 *Value, inc2 bool, isLower bool) int {
+	switch {
+	case v1 == nil && v2 == nil:
+		return 0
+	case v1 == nil && v2 != nil:
+		if isLower {
+			return -1
+		}
+		return 1
+	case v1 != nil && v2 == nil:
+		if isLower {
+			return 1
+		}
+		return -1
+	}
+	if c := rangeElemCmp(*v1, *v2); c != 0 {
+		return c
+	}
+	// Equal values: an exclusive lower sorts after an inclusive lower; an exclusive upper sorts
+	// before an inclusive upper (the rest fall out of the both-equal cases).
+	switch {
+	case inc1 == inc2:
+		return 0
+	case !inc1 && inc2:
+		if isLower {
+			return 1
+		}
+		return -1
+	default: // inc1 && !inc2
+		if isLower {
+			return -1
+		}
+		return 1
+	}
+}
+
 // --- text output -----------------------------------------------------------
 
 // rangeOut renders a range value as PG range_out (spec/design/ranges.md §5): `empty`, or

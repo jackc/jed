@@ -1,12 +1,14 @@
 package jed
 
-// Range storage (spec/design/ranges.md, R2) — the divergences + introspection the oracle corpus
+// Range storage (spec/design/ranges.md, R2–R3) — the divergences + introspection the oracle corpus
 // cannot express (CLAUDE.md §10): the deliberate 0A000 narrowings PostgreSQL does NOT share (a range
 // PRIMARY KEY / DEFAULT / index — PG allows them via its btree/GiST opclasses), the jed-canonical
-// i32range spelling (PG reports int4range), INSERT…SELECT deferral, and the whole-image store/load
-// round-trip of a range column (the byte layout is pinned cross-core by range_table.jed; this is the
-// behavioral check). The agreeing behavior — render, canonicalization, IS NULL, 22000/22P02/22003/
-// 42704 — lives in types/range.test (oracle-clean), not here. Mirrors impl/rust/tests/range_storage.rs.
+// i32range spelling (PG reports int4range), INSERT…SELECT deferral, the cross-element comparison code
+// (jed's uniform 42804 where PG reports 42883), and the whole-image store/load round-trip of a range
+// column (the byte layout is pinned cross-core by range_table.jed; this is the behavioral check). The
+// agreeing behavior — render, canonicalization, IS NULL, the range_cmp total order (=/</ORDER BY/
+// DISTINCT), 22000/22P02/22003/42704 — lives in types/range.test (oracle-clean), not here. Mirrors
+// impl/rust/tests/range_storage.rs.
 
 import (
 	"reflect"
@@ -114,6 +116,27 @@ func TestRangeNarrowingsAre0A000(t *testing.T) {
 	run(t, db, "INSERT INTO src VALUES (1, '[1,5)')")
 	if got := errRange(t, db, "INSERT INTO t SELECT id, r FROM src"); got != "0A000" {
 		t.Errorf("INSERT ... SELECT into range column: got %s, want 0A000", got)
+	}
+}
+
+// TestRangeCrossElementComparisonIs42804: range comparison (R3) is restricted to the SAME element
+// type (spec/design/ranges.md §6): a range is comparable only to a range over an equal element, never
+// to a different-element range or to a bare scalar. jed reports its uniform comparison-mismatch code
+// 42804; PostgreSQL reports 42883 ("operator does not exist") — a deliberate divergence, so this
+// cannot live in the oracle corpus. The agreeing same-element comparison (=/</ORDER BY) is covered by
+// types/range.test.
+func TestRangeCrossElementComparisonIs42804(t *testing.T) {
+	db := NewDatabase()
+	// A range over i32 vs a range over i64 — different element types, no implicit cross-range cast.
+	if got := errRange(t, db, "SELECT '[1,5)'::i32range = '[1,5)'::i64range"); got != "42804" {
+		t.Errorf("i32range = i64range: got %s, want 42804", got)
+	}
+	if got := errRange(t, db, "SELECT '[1,5)'::i32range < '[1,5)'::i64range"); got != "42804" {
+		t.Errorf("i32range < i64range: got %s, want 42804", got)
+	}
+	// A range vs a bare scalar of its own element type is still a 42804 (a range is not its element).
+	if got := errRange(t, db, "SELECT '[1,5)'::i32range = 5"); got != "42804" {
+		t.Errorf("i32range = i32 scalar: got %s, want 42804", got)
 	}
 }
 

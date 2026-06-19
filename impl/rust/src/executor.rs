@@ -13597,11 +13597,19 @@ fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Result<()> {
         Timestamp, Timestamptz, Uuid,
     };
     match (lt, rt) {
-        // Range comparison is deferred to R3 (the range_cmp total order — spec/design/ranges.md §6);
-        // a range operand (range×range or range×anything) is a 42804 this slice. A range×NULL is
-        // allowed (the comparison is unknown), like every other family below.
+        // Range comparison is the PG `range_cmp` total order (spec/design/ranges.md §6). Two ranges
+        // are comparable iff they are over the **same element type** — `i32range × i32range` only,
+        // never `i32range × i64range` or `i32range × i32` (no implicit cross-element range
+        // comparison this slice; stricter than the int↔bigint scalar case, so the element
+        // `ResolvedType`s must be *equal*, not merely comparable). A bare NULL is always comparable.
         (Range(_), Null) | (Null, Range(_)) => Ok(()),
-        (Range(_), _) | (_, Range(_)) => Err(type_error("range comparison is not supported yet")),
+        (Range(a), Range(b)) if a == b => Ok(()),
+        (Range(_), Range(_)) => Err(type_error(
+            "cannot compare ranges of different element types",
+        )),
+        (Range(_), _) | (_, Range(_)) => Err(type_error(
+            "cannot compare a range value with a value of a different type",
+        )),
         // Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff
         // their element types are comparable (recursively). A bare NULL is always comparable; an
         // array vs any non-array is 42804.
@@ -17400,6 +17408,10 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
             }
             Ordering::Equal
         }
+        // A range sorts by the PG `range_cmp` total order (spec/design/ranges.md §6): `empty` below
+        // every non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity).
+        // Kept identical to `value::lt3`/`gt3`'s range arm so `<` and `ORDER BY` never disagree.
+        (Value::Range(x), Value::Range(y)) => crate::range::range_total_cmp(x, y),
         (Value::Null, Value::Null) => Ordering::Equal,
         // Cross-family arms exist only for totality — ORDER BY is over a single typed column,
         // so a mixed pair is unreachable. A fixed family order keeps the comparator total.

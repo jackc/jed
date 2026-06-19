@@ -291,6 +291,97 @@ pub fn finalize(
     })
 }
 
+// --- comparison ------------------------------------------------------------
+
+/// PG `range_cmp` total order over two CANONICAL range values (spec/design/ranges.md §6): `empty`
+/// sorts below every non-empty range, then by lower bound, then by upper bound. Each bound
+/// comparison ([`cmp_bound`]) accounts for infinity and inclusivity. A total order (always a
+/// definite result, never 3-valued — unlike composite), and consistent with the structural
+/// [`RangeVal`] equality (two canonical ranges are `==` iff `range_total_cmp` is `Equal`). Shared
+/// by `value::lt3`/`gt3` and `executor::value_cmp` so `<` and `ORDER BY` never disagree.
+pub fn range_total_cmp(a: &RangeVal, b: &RangeVal) -> Ordering {
+    match (a.empty, b.empty) {
+        (true, true) => return Ordering::Equal,
+        (true, false) => return Ordering::Less,
+        (false, true) => return Ordering::Greater,
+        (false, false) => {}
+    }
+    let c = cmp_bound(
+        a.lower.as_deref(),
+        a.lower_inc,
+        b.lower.as_deref(),
+        b.lower_inc,
+        true,
+    );
+    if c != Ordering::Equal {
+        return c;
+    }
+    cmp_bound(
+        a.upper.as_deref(),
+        a.upper_inc,
+        b.upper.as_deref(),
+        b.upper_inc,
+        false,
+    )
+}
+
+/// Compare two range bounds on the same side (lower-vs-lower or upper-vs-upper), PG
+/// `range_cmp_bounds`. A `None` value is the unbounded/infinite bound: an infinite **lower** is
+/// below any finite lower, an infinite **upper** is above any finite upper. For equal finite
+/// values the inclusivity breaks the tie, and the direction depends on the side: a lower bound
+/// sorts inclusive-before-exclusive (`[1` < `(1`), an upper bound sorts exclusive-before-inclusive
+/// (`1)` < `1]`). `is_lower` selects that direction.
+fn cmp_bound(
+    v1: Option<&Value>,
+    inc1: bool,
+    v2: Option<&Value>,
+    inc2: bool,
+    is_lower: bool,
+) -> Ordering {
+    match (v1, v2) {
+        (None, None) => Ordering::Equal,
+        (None, Some(_)) => {
+            if is_lower {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
+        (Some(_), None) => {
+            if is_lower {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        }
+        (Some(x), Some(y)) => {
+            let c = elem_cmp(x, y);
+            if c != Ordering::Equal {
+                return c;
+            }
+            // Equal values: an exclusive lower sorts after an inclusive lower; an exclusive upper
+            // sorts before an inclusive upper (the rest fall out of the both-equal cases).
+            match (inc1, inc2) {
+                (true, true) | (false, false) => Ordering::Equal,
+                (false, true) => {
+                    if is_lower {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                (true, false) => {
+                    if is_lower {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+            }
+        }
+    }
+}
+
 // --- text output -----------------------------------------------------------
 
 /// Render a range value as PG `range_out` (spec/design/ranges.md §5): `empty`, or
