@@ -117,6 +117,9 @@ func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool)
 		return err
 	}
 	for _, t := range ds.Table {
+		if !t.AppliesTo("jed") {
+			continue
+		}
 		ddl := t.DDL("jed")
 		if err := exec(ddl[0]); err != nil { // CREATE TABLE
 			return err
@@ -166,7 +169,8 @@ func setupJed(dataDir string, ds *bench.Dataset, fingerprint string, force bool)
 }
 
 // writeLiteralRow renders one generated row as a SQL VALUES tuple. Generated text is
-// pure a-z (benchmarks.md §4), so no quoting subtleties exist.
+// pure a-z (benchmarks.md §4), so no quoting subtleties exist. An []int64 renders as the
+// array text literal '{1,2,3}' (empty '{}'), which jed coerces to the column's array type.
 func writeLiteralRow(sb *strings.Builder, row []any) {
 	sb.WriteByte('(')
 	for i, v := range row {
@@ -180,6 +184,15 @@ func writeLiteralRow(sb *strings.Builder, row []any) {
 			sb.WriteByte('\'')
 			sb.WriteString(x)
 			sb.WriteByte('\'')
+		case []int64:
+			sb.WriteString("'{")
+			for j, e := range x {
+				if j > 0 {
+					sb.WriteByte(',')
+				}
+				sb.WriteString(strconv.FormatInt(e, 10))
+			}
+			sb.WriteString("}'")
 		default:
 			panic(fmt.Sprintf("unsupported literal type %T", v))
 		}
@@ -190,6 +203,18 @@ func writeLiteralRow(sb *strings.Builder, row []any) {
 // --- SQLite ---
 
 func setupSQLite(dataDir string, ds *bench.Dataset, fingerprint string, force bool) error {
+	anyApplies := false
+	for i := range ds.Table {
+		if ds.Table[i].AppliesTo("sqlite") {
+			anyApplies = true
+			break
+		}
+	}
+	if !anyApplies {
+		// e.g. the gin dataset (array table, jed+postgres only) — no SQLite file at all.
+		fmt.Fprintf(os.Stderr, "sqlite/%s: no SQLite-applicable tables, skipping\n", ds.Name)
+		return nil
+	}
 	path := filepath.Join(dataDir, ds.Name+".sqlite")
 	if !force && bench.ReadSidecar(dataDir, ds.Name, "sqlite") == fingerprint {
 		if _, err := os.Stat(path); err == nil {
@@ -214,6 +239,9 @@ func setupSQLite(dataDir string, ds *bench.Dataset, fingerprint string, force bo
 		}
 	}
 	for _, t := range ds.Table {
+		if !t.AppliesTo("sqlite") {
+			continue
+		}
 		ddl := t.DDL("sqlite")
 		if _, err := db.Exec(ddl[0]); err != nil {
 			return err
@@ -283,6 +311,9 @@ func setupPG(ds *bench.Dataset, fingerprint string, force bool) error {
 	}
 	defer conn.Close(ctx)
 	for _, t := range ds.Table {
+		if !t.AppliesTo("postgres") {
+			continue
+		}
 		ddl := t.DDL("postgres")
 		if _, err := conn.Exec(ctx, ddl[0]); err != nil {
 			return err

@@ -1,7 +1,9 @@
 # Benchmarks — cross-core and cross-engine wall-clock measurement
 
 Status: v1 landed (corpus format, setup tool, six benchmarks, harnesses in all three
-cores). This document is the canonical record for the `bench/` subsystem.
+cores). Grown since with `cte_materialized`, `lateral_top_n_per_group`, and the two
+GIN-bounded-scan benchmarks (`gin_contains` / `gin_overlaps`) over a dedicated `gin`
+dataset (§4). This document is the canonical record for the `bench/` subsystem.
 
 ## 1. Purpose and non-goals
 
@@ -120,8 +122,8 @@ seed = 101                # one splitmix64 stream per table
 
   [[dataset.table.column]]
   name = "id"
-  type = "i64"          # i64 | i32 | i16 | text
-  gen  = "serial"         # 1..rows; consumes no PRNG draws
+  type = "i64"          # i64 | i32 | i16 | text | i64[] | i32[] | i16[]
+  gen  = "serial"         # serial | int_uniform | text | int_array
   primary_key = true
 
   [[dataset.table.column]]
@@ -134,12 +136,20 @@ seed = 101                # one splitmix64 stream per table
   [[dataset.table.index]]
   name    = "orders_customer_idx"
   columns = ["customer_id"]
-  # optional engines = [...] allowlist (future axis); default: every engine gets the index
+  # optional method  = "gin"   # default "" = ordered btree; "gin" → CREATE INDEX ... USING gin
+  # optional engines = [...]   # allowlist; default: every engine gets the index
 ```
+
+A table may also carry a `engines = [...]` allowlist (same shape as an index's): an empty
+list means every engine, a non-empty one restricts the table to those engines and
+bench-setup skips it elsewhere. The `gin` dataset's `docs` table is `["jed", "postgres"]`
+— SQLite has neither an array type nor GIN, so no `gin.sqlite` is produced at all.
 
 **Generation order is the determinism contract:** for each table, seed one splitmix64
 stream with `table.seed`; for each row 1..rows, draw each non-`serial` column's value in
-declared column order. Any language reproduces the dataset exactly from the spec.
+declared column order. Any language reproduces the dataset exactly from the spec. (Today
+bench-setup is Go-only; the data files it produces are read by all three language
+harnesses, so the generators below live in `bench/go` alone.)
 
 **DDL is derived** from the spec per engine — never written as literal SQL — with this
 fixed type map:
@@ -149,6 +159,7 @@ fixed type map:
 | `i64` + `primary_key` | `bigint PRIMARY KEY` | `bigint PRIMARY KEY` | `INTEGER PRIMARY KEY` |
 | `i64` / `i32` / `i16` | same name | `bigint` / `integer` / `smallint` | `INTEGER` |
 | `text` | `text` | `text` | `TEXT` |
+| `i64[]` / `i32[]` / `i16[]` | `bigint[]` / `integer[]` / `smallint[]` | same as jed | — (array table is allowlisted to jed+postgres) |
 
 The SQLite pk maps to `INTEGER PRIMARY KEY` (the rowid alias) deliberately: it is
 SQLite's idiomatic fast path, and `BIGINT PRIMARY KEY` would unfairly force a separate
@@ -174,6 +185,11 @@ Draws:
   deterministic and identical everywhere, which is all that matters here);
 - text of length `[min_len, max_len]`: one bounded draw for the length, then per
   character `'a' + next() % 26`.
+- `int_array` of length `[min_len, max_len]` with elements in `[elem_min, elem_max]`: one
+  bounded draw for the length, then that many bounded element draws — the same
+  "length-then-contents" shape as `text`. Rendered as the array text literal `'{1,2,3}'`
+  (`'{}'` when empty) for the jed/SQL load, and passed as a native `[]int64` to PostgreSQL's
+  `CopyFrom`. The `gin` dataset's `docs.tags bigint[]` column is the only user today.
 
 Ruby reference (the snippet that generated the pinned vectors below):
 

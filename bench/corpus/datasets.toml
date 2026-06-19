@@ -8,7 +8,7 @@ schema_version = 1
 # Bump whenever bench-setup's generation BEHAVIOR changes (row order, PRNG use, DDL
 # derivation — or an engine change that reshapes the produced files, like the format.md
 # split-rule fix) even if the shapes below do not.
-generator_version = 2
+generator_version = 3
 
 [[dataset]]
 name = "small"
@@ -87,3 +87,41 @@ max_len = 32
 [[dataset.table.index]]
 name = "orders_customer_idx"
 columns = ["customer_id"]
+
+# GIN dataset — a single array-column table behind a GIN inverted index (spec/design/gin.md).
+# jed + PostgreSQL only: SQLite has neither an array type nor GIN, so the table carries a
+# table-level `engines` allowlist and bench-setup skips it for SQLite entirely. The `tags`
+# column is the second open generator axis: `int_array` draws an array length in [min_len,
+# max_len], then that many elements in [elem_min, elem_max] — the same "length draw, then per-
+# element draws" shape as the `text` generator (benchmarks.md §4). bigint[] (not integer[]) so a
+# host-bound i64 param binds cleanly into ARRAY[$1,$2] with no element-type coercion across
+# jed/pgx. ~600k posting entries over 500 distinct terms ⇒ a two-term `@>` intersects to a
+# handful of rows (the GIN-bounded scan's sweet spot), a two-term `&&` unions to a few thousand.
+[[dataset]]
+name = "gin"
+
+[[dataset.table]]
+name = "docs"
+rows = 200000
+seed = 301
+engines = ["jed", "postgres"]
+
+[[dataset.table.column]]
+name = "id"
+type = "i64"
+gen = "serial"
+primary_key = true
+
+[[dataset.table.column]]
+name = "tags"
+type = "i64[]"
+gen = "int_array"
+min_len = 0
+max_len = 6
+elem_min = 1
+elem_max = 500
+
+[[dataset.table.index]]
+name = "docs_tags_gin"
+columns = ["tags"]
+method = "gin"

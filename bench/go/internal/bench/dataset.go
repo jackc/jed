@@ -21,40 +21,53 @@ type Dataset struct {
 	Table []Table `toml:"table"`
 }
 
-// Table is one generated table.
+// Table is one generated table. An empty Engines allowlist means every engine; a
+// non-empty one restricts the table to those engines (the gin dataset's array table is
+// jed+postgres only — SQLite has no array type or GIN).
 type Table struct {
-	Name   string   `toml:"name"`
-	Rows   int      `toml:"rows"`
-	Seed   uint64   `toml:"seed"`
-	Column []Column `toml:"column"`
-	Index  []Index  `toml:"index"`
+	Name    string   `toml:"name"`
+	Rows    int      `toml:"rows"`
+	Seed    uint64   `toml:"seed"`
+	Engines []string `toml:"engines"` // empty = all
+	Column  []Column `toml:"column"`
+	Index   []Index  `toml:"index"`
 }
+
+// AppliesTo reports whether the table is generated for an engine.
+func (t *Table) AppliesTo(engine string) bool { return appliesTo(t.Engines, engine) }
 
 // Column is one generated column.
 type Column struct {
 	Name       string `toml:"name"`
-	Type       string `toml:"type"` // i64 | i32 | i16 | text
-	Gen        string `toml:"gen"`  // serial | int_uniform | text
+	Type       string `toml:"type"` // i64 | i32 | i16 | text | i64[] | i32[] | i16[]
+	Gen        string `toml:"gen"`  // serial | int_uniform | text | int_array
 	PrimaryKey bool   `toml:"primary_key"`
 	Min        int64  `toml:"min"`
 	Max        int64  `toml:"max"`
-	MinLen     int64  `toml:"min_len"`
+	MinLen     int64  `toml:"min_len"` // text: string length range; int_array: array length range
 	MaxLen     int64  `toml:"max_len"`
+	ElemMin    int64  `toml:"elem_min"` // int_array: element value range
+	ElemMax    int64  `toml:"elem_max"`
 }
 
-// Index is one secondary index, created in every engine unless allowlisted.
+// Index is one index. Method "" is the default ordered btree; "gin" is an inverted index
+// over an array column (CREATE INDEX ... USING gin). Created in every engine unless
+// allowlisted.
 type Index struct {
 	Name    string   `toml:"name"`
 	Columns []string `toml:"columns"`
+	Method  string   `toml:"method"`  // "" (btree) | "gin"
 	Engines []string `toml:"engines"` // empty = all
 }
 
 // AppliesTo reports whether the index is created for an engine.
-func (ix *Index) AppliesTo(engine string) bool {
-	if len(ix.Engines) == 0 {
+func (ix *Index) AppliesTo(engine string) bool { return appliesTo(ix.Engines, engine) }
+
+func appliesTo(engines []string, engine string) bool {
+	if len(engines) == 0 {
 		return true
 	}
-	for _, e := range ix.Engines {
+	for _, e := range engines {
 		if e == engine {
 			return true
 		}
@@ -99,8 +112,16 @@ func columnType(engine string, c Column) string {
 			return "smallint"
 		case "text":
 			return "text"
+		case "i64[]":
+			return "bigint[]"
+		case "i32[]":
+			return "integer[]"
+		case "i16[]":
+			return "smallint[]"
 		}
 	case "sqlite":
+		// Array columns never reach SQLite — a table carrying one is allowlisted to
+		// jed+postgres and skipped here (see bench-setup). This map covers the scalars only.
 		if c.Type == "text" {
 			return "TEXT"
 		}
@@ -122,16 +143,21 @@ func (t *Table) DDL(engine string) []string {
 	}
 	stmts := []string{fmt.Sprintf("CREATE TABLE %s (%s)", t.Name, strings.Join(cols, ", "))}
 	for _, ix := range t.Index {
-		if ix.AppliesTo(engine) {
-			stmts = append(stmts, fmt.Sprintf("CREATE INDEX %s ON %s (%s)", ix.Name, t.Name, strings.Join(ix.Columns, ", ")))
+		if !ix.AppliesTo(engine) {
+			continue
 		}
+		using := ""
+		if ix.Method != "" {
+			using = " USING " + ix.Method
+		}
+		stmts = append(stmts, fmt.Sprintf("CREATE INDEX %s ON %s%s (%s)", ix.Name, t.Name, using, strings.Join(ix.Columns, ", ")))
 	}
 	return stmts
 }
 
 // RowStream generates the table's rows in the deterministic order of the contract
 // (§4): one splitmix64 stream per table, rows 1..N, non-serial columns drawn in
-// declared column order. Values are i64 or string.
+// declared column order. Values are i64, string, or []int64 (int_array).
 type RowStream struct {
 	table *Table
 	prng  *Prng
@@ -156,6 +182,14 @@ func (r *RowStream) Next() []any {
 			vals[i] = r.prng.IntUniform(c.Min, c.Max)
 		case "text":
 			vals[i] = r.prng.Text(c.MinLen, c.MaxLen)
+		case "int_array":
+			// One length draw, then that many element draws — mirrors text generation.
+			n := r.prng.IntUniform(c.MinLen, c.MaxLen)
+			arr := make([]int64, n)
+			for j := range arr {
+				arr[j] = r.prng.IntUniform(c.ElemMin, c.ElemMax)
+			}
+			vals[i] = arr
 		default:
 			panic("unknown column gen " + c.Gen)
 		}

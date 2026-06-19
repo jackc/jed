@@ -137,3 +137,53 @@ seed = 4208
 gen = "int_uniform"
 min = 1
 max = 99996
+
+# GIN-bounded scans over the `gin` dataset's 200k-row docs.tags bigint[] column behind a GIN
+# index (spec/design/gin.md §6). jed + PostgreSQL only (SQLite has no array type or GIN). The
+# query array is element-cast — ARRAY[$1::bigint, $2::bigint] — the one form both engines accept:
+# jed defers casting *to* an array type (0A000), and PostgreSQL infers an uncast pgx-bound
+# ARRAY[$1,$2] as text[] (no bigint[] @> text[]); element casts sidestep both. Params draw from
+# the same [1,500] term domain as the data, so a two-term `@>` intersects to a handful of rows
+# (the GIN sweet spot — jed always takes the GIN-bounded scan, rule-based) and `&&` unions to a
+# few thousand. Answers are index-independent, so the cross-engine checksum holds either way.
+[[bench]]
+name = "gin_contains"
+description = "GIN @> (contains): rows whose tags array contains BOTH query terms — a two-posting-list intersection over a 200k-row bigint[] column"
+dataset = "gin"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM docs WHERE tags @> ARRAY[$1::bigint, $2::bigint] ORDER BY id"
+warmup = 500
+iterations = 5000
+seed = 4209
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500
+
+[[bench]]
+name = "gin_overlaps"
+description = "GIN && (overlaps): rows whose tags array shares ANY query term — a two-posting-list union over a 200k-row bigint[] column (a few thousand rows per query)"
+dataset = "gin"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM docs WHERE tags && ARRAY[$1::bigint, $2::bigint] ORDER BY id"
+warmup = 100
+iterations = 1000
+seed = 4210
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500
