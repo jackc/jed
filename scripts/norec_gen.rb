@@ -32,6 +32,12 @@
 #              = the partition counts summed). Unlike the pushdown family this is NOT an
 #              optimized-vs-unoptimized pair — it is an independent oracle for the 3-valued NULL
 #              logic itself (comparison-with-NULL, Kleene AND/OR/NOT, IS NULL — the §8 hotspot).
+#   gin      — `tags @> Q` over a GIN-indexed array column gathers candidates via the index
+#              (spec/design/gin.md §6); the equivalent `Q <@ tags` is NOT GIN-accelerated (full
+#              scan). Both must return identical rows (term gather/intersection oracle).
+#   gin_any  — `c = ANY(tags)` over a GIN-indexed array column gathers c's single posting list
+#              (gin.md §6); the equivalent `'{c}' <@ tags` is NOT GIN-accelerated (full scan). Both
+#              must return identical rows (single-term gather oracle).
 #
 # Determinism (CLAUDE.md §10): generation is SEEDED, so a discovered failure reduces to this exact
 # deterministic .test, which then joins the corpus. The fuzzer is dev-time discovery; the emitted
@@ -86,6 +92,9 @@ CTE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row qu
 GIN_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan dml.insert
              dml.insert_multi_row query.select query.order_by types.i32 types.array
              func.array_containment].freeze
+GIN_ANY_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_any_eq dml.insert
+                 dml.insert_multi_row query.select query.order_by types.i32 types.array
+                 func.array_quantified func.array_containment].freeze
 
 # The default relation note describes the NoREC pair (an optimized form vs a non-optimizable
 # rewrite). TLP overrides it with its own partition-reconstruction note (it is not an opt pair).
@@ -385,6 +394,53 @@ def gen_gin(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: GIN-bounded `= ANY` membership (k = ANY via the GIN index vs '{k}' <@ full scan) ---
+# `c = ANY(col)` over a GIN-indexed array column gathers the single term c's posting list
+# (spec/design/gin.md §6; query.gin_any_eq); the SEMANTICALLY IDENTICAL `'{c}' <@ col` (contained-by)
+# is NOT GIN-accelerated (§10) and full scans. So the metamorphic pair is `c = ANY(tags)` vs
+# `'{c}' <@ tags` — both mean "tags contains c", the bound taken on one side and not the other; both
+# must return identical rows. Expected rows are known by construction (a row matches iff its tags are
+# non-NULL and contain c), so no oracle is consulted — this catches a GIN single-term gather bug ALL
+# cores might share, which differential testing alone cannot.
+def gen_gin_any(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(12, random: rng).sort
+  null_id = ids.sample(random: rng)
+  # (id, tags): a small int array from a small domain (so a term admits several rows); one row is
+  # NULL and some are empty {} (no element → no membership). No NULL ELEMENTS are generated, so the
+  # by-construction oracle below is exact for both = ANY and <@.
+  rows = ids.map do |id|
+    next [id, nil] if id == null_id
+
+    [id, Array.new(rng.rand(0..3)) { rng.rand(0..4) }]
+  end
+  # The by-construction oracle: tags is non-NULL and contains k. `k = ANY(tags)` and `'{k}' <@ tags`
+  # are both exactly this (a NULL tags → excluded; an empty/missing tags → excluded).
+  matches = ->(k) { rows.select { |_id, t| !t.nil? && t.include?(k) }.map { |id, _| id.to_s } }
+
+  elems = rows.filter_map { |_id, t| t }.flatten
+  present = elems.sample(random: rng) || 0
+  absent = ((0..9).to_a - elems).sample(random: rng) || 9
+
+  out = header(seed, GIN_ANY_REQ, "GIN-bounded = ANY membership (k = ANY via the GIN index vs '{k}' <@ full scan)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, tags i32[])")
+  stmt(out, "INSERT INTO t VALUES #{rows.map { |id, t| "(#{id}, #{t.nil? ? 'NULL' : "'{#{t.join(',')}}'"})" }.join(', ')}")
+  stmt(out, "CREATE INDEX t_tags_gin ON t USING gin (tags)")
+
+  gpair = lambda do |title, k, exp|
+    out << "# #{title}"
+    out << "# GIN bound (k = ANY(col) -> single-term posting gather)"
+    q(out, "I", "SELECT id FROM t WHERE #{k} = ANY(tags) ORDER BY id", exp)
+    out << "# full scan ('{k}' <@ col is the same predicate, not GIN-accelerated) — MUST match"
+    q(out, "I", "SELECT id FROM t WHERE '{#{k}}'::i32[] <@ tags ORDER BY id", exp)
+  end
+
+  gpair.call("#{present} = ANY (present)", present, matches.call(present))
+  gpair.call("#{absent} = ANY (absent -> empty)", absent, matches.call(absent))
+
+  out.join("\n") + "\n"
+end
+
 # --- scenario: TLP (ternary-logic partitioning) -----------------------------------------------
 # Kleene 3-valued helpers: Ruby `nil` is SQL UNKNOWN. A comparison with a NULL operand is UNKNOWN;
 # AND/OR follow Kleene logic; NOT(UNKNOWN) is UNKNOWN. These mirror jed's PG-default 3VL exactly
@@ -534,6 +590,7 @@ SCENARIOS = {
   "correlated" => method(:gen_correlated),
   "index" => method(:gen_index),
   "gin" => method(:gen_gin),
+  "gin_any" => method(:gen_gin_any),
   "tlp" => method(:gen_tlp),
   "cte" => method(:gen_cte),
 }.freeze

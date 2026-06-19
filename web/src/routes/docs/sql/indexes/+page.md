@@ -36,11 +36,15 @@ ORDER BY id;`;
 	const overlapsQuery = `SELECT title FROM post
 WHERE tags && ARRAY[30, 40]
 ORDER BY id;`;
+
+	const memberQuery = `SELECT title FROM post
+WHERE 20 = ANY(tags)
+ORDER BY id;`;
 </script>
 
 <svelte:head>
 	<title>Indexes — jed</title>
-	<meta name="description" content="CREATE INDEX in jed — ordered B-tree indexes, and GIN inverted indexes that accelerate array containment and overlap, run live." />
+	<meta name="description" content="CREATE INDEX in jed — ordered B-tree indexes, and GIN inverted indexes that accelerate array containment, overlap, and membership, run live." />
 </svelte:head>
 
 # Indexes
@@ -74,12 +78,14 @@ the whole table. Add one with `USING gin`:
 CREATE INDEX post_tags_gin ON post USING gin (tags)
 ```
 
-It accelerates the two array set operators:
+It accelerates the two array set operators and array membership:
 
 - **`tags @> ARRAY[10, 20]`** (contains) — rows whose `tags` contain **all** the query terms. jed
   gathers the rows for each term and **intersects** their lists.
 - **`tags && ARRAY[30, 40]`** (overlaps) — rows whose `tags` share **any** query term. jed gathers
   the lists and takes their **union**.
+- **`20 = ANY(tags)`** (membership) — rows that have `20` among their `tags` (the array spelling of
+  membership; equivalently `tags @> ARRAY[20]`). jed gathers that single term's rows.
 
 The original `WHERE` stays as the residual filter, so the answer is identical to the full-scan
 answer — the index is transparent. Containment (`intro` and `gin` both hold `{10, 20}`):
@@ -90,6 +96,10 @@ Overlap (`intro` holds `30`; `arrays` and `storage` hold `40`):
 
 <LiveSql seed={ginSeed} query={overlapsQuery} rows={6} />
 
+Membership (`intro`, `arrays`, and `gin` all hold `20`):
+
+<LiveSql seed={ginSeed} query={memberQuery} rows={6} />
+
 ### Current scope
 
 GIN this release covers a focused surface (it grows from here):
@@ -97,8 +107,8 @@ GIN this release covers a focused surface (it grows from here):
 - **One column, integer-element arrays** — `i16[]`, `i32[]`, or `i64[]`. A multi-column GIN, or an
   array of another element type (`text[]`, `numeric[]`, …), is rejected with `0A000` until its key
   encoding lands.
-- **`@>` and `&&` only** — `<@` (contained-by), `= ANY` / `IN` membership, and array `=` still run,
-  by full scan; they are not GIN-accelerated yet.
+- **`@>`, `&&`, and `= ANY` only** — `<@` (contained-by), `IN` over a scalar list, and array `=`
+  still run, by full scan; they are not GIN-accelerated yet.
 - **No `UNIQUE`** — an inverted index has many entries per row, so `CREATE UNIQUE INDEX … USING gin`
   is rejected (`0A000`), matching PostgreSQL.
 

@@ -534,14 +534,25 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         golden (byte-identical rust == go == ts == ruby), term extraction + N-entries-per-row
         maintenance — all three cores + the Ruby reference (the index builds & round-trips on disk;
         `create_gin_index.test` green on every core; queries don't use it yet — that's G2).
-  - [ ] _G2:_ the planner GIN bound + multi-term gather + cost (`gin_entry`), `gin_scan.test` cost
+  - [x] _G2:_ the planner GIN bound + multi-term gather + cost (`gin_entry`), `gin_scan.test` cost
         assertions, the `gin` NoREC scenario (`scripts/norec_gen.rb`), a `bench/` GIN workload, and
         the `/web` docs + the oracle-override ledger entries for the deferred-narrowing DDL records.
-  - [ ] _follow-on (each its own slice):_ `<@` / `= ANY` / `IN` acceleration; non-integer element
-        types (as their key encodings lift) + composite-element arrays; multi-column GIN;
-        correlated / array-column query operands; GIN for UPDATE/DELETE scans; the LIMIT-streaming
-        combination; posting-list run compression; the **`jsonb_ops`** opclass (the lossy-recheck
-        path the seam already seats) and a future object/document opclass.
+  - [x] _follow-on — `= ANY(col)` membership acceleration:_ `c = ANY(gin_col)` (the array spelling
+        of membership) over a GIN-indexed array column bounds the scan via a **single-term `@>`
+        reduction** (`c = ANY(col)` ⇔ `col @> ARRAY[c]`): a third `GinStrategy` (`Member`) whose
+        query operand is the scalar `c`, gathered as one posting list, original `= ANY` predicate
+        kept as the residual filter (same rows as the full scan, lower cost). A NULL `c` (typed
+        `NULL::i32`) is a provably-empty bound; an out-of-element-range `c` is rejected `22003` at
+        resolve before the bound (jed coerces `c` to the element type — a divergence from PG, which
+        full-scans `= ANY(array)` and returns empty). All three cores + capability
+        `query.gin_any_eq` + `suites/query/gin_any_eq.test` (cost-asserted, oracle-checked) + the
+        `gin_any` NoREC scenario + `/web` Indexes page + e2e. → [gin.md §6](spec/design/gin.md)
+  - [ ] _follow-on (each its own slice):_ `<@` (contained-by, broad scan + recheck — blocked on the
+        index recording empty/NULL-array rows) / `IN` over a scalar list / array `=` acceleration;
+        non-integer element types (as their key encodings lift) + composite-element arrays;
+        multi-column GIN; correlated / array-column query operands; GIN for UPDATE/DELETE scans; the
+        LIMIT-streaming combination; posting-list run compression; the **`jsonb_ops`** opclass (the
+        lossy-recheck path the seam already seats) and a future object/document opclass.
 - [x] **`RETURNING`** — `INSERT`/`UPDATE`/`DELETE … RETURNING <select_items>` projecting affected
       rows (INSERT stored / UPDATE new / DELETE old), evaluated after validation before any write;
       the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.

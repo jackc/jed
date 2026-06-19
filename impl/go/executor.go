@@ -5441,12 +5441,16 @@ type scanBound struct {
 }
 
 // ginStrategy is which array operator a GIN bound accelerates (spec/design/gin.md §6): @>
-// (contains, mode ALL → posting-list intersection) or && (overlaps, mode ANY → union).
+// (contains, mode ALL → posting-list intersection), && (overlaps, mode ANY → union), or = ANY
+// (member — `c = ANY(col)`, the single-term @> reduction: one scalar term, its lone posting list).
 type ginStrategy int
 
 const (
 	ginContains ginStrategy = iota
 	ginOverlaps
+	// ginMember is `c = ANY(col)`: c is a constant SCALAR (not an array); its single term is
+	// gathered like a one-element @>. The query operand recovered by ginMatch is the scalar c.
+	ginMember
 )
 
 // ginBoundPlan is the plan-time result of GIN analysis (spec/design/gin.md §6): the chosen
@@ -5536,11 +5540,13 @@ func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 }
 
 // ginMatch finds the first WHERE AND-chain conjunct a GIN index on colGlobal accelerates
-// (spec/design/gin.md §6): `col @> Q` (contains) or `col && Q` (overlaps) where Q is a constant
-// array (references no column / outer / subquery). @> is asymmetric (the indexed column must be
-// the LEFT operand — `Q @> col` is the non-accelerated <@); && is symmetric. Returns the strategy
-// and Q. Used at plan time (strategy) and exec time (recover Q from plan.filter), so the two agree
-// on the same conjunct by construction.
+// (spec/design/gin.md §6): `col @> Q` (contains), `col && Q` (overlaps), or `c = ANY(col)`
+// (membership) where the query operand is a constant (references no column / outer / subquery).
+// @> is asymmetric (the indexed column must be the LEFT operand — `Q @> col` is the non-accelerated
+// <@); && is symmetric; = ANY requires the column be ANY's array operand and c the scalar. Returns
+// the strategy and the query operand (the scalar c for ginMember). Used at plan time (strategy) and
+// exec time (recover the operand from plan.filter), so the two agree on the same conjunct by
+// construction.
 func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
 	if filter == nil {
 		return 0, nil, false
@@ -5566,6 +5572,14 @@ func ginMatch(filter *rExpr, colGlobal int) (ginStrategy, *rExpr, bool) {
 				return ginOverlaps, a, true
 			}
 		}
+	}
+	// `c = ANY(col)` — the array spelling of membership (gin.md §6): the GIN column must be ANY's
+	// ARRAY operand (rhs) and c (the scalar lhs) a constant. Only = ANY (not = ALL, not any other
+	// comparison/quantifier — those are not a single-term posting gather). The recovered query
+	// operand is the scalar c; ginBoundRows reads it via ginMember.
+	if filter.kind == reQuantified && filter.op == OpEq && !filter.quantAll &&
+		isColumn(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs) {
+		return ginMember, filter.lhs, true
 	}
 	return 0, nil, false
 }
@@ -5681,14 +5695,15 @@ func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params 
 }
 
 // ginBoundRows executes a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the
-// constant query Q, extracts its terms + mode via the array_ops opclass, gathers each term's
-// posting list (a prefix range scan of the GIN entry tree), combines them by mode (@> →
-// intersection, && → union) into the candidate storage-key set, and point-looks-up each candidate
-// in storage-key order. The original @>/&& predicate stays the residual WHERE filter (re-applied
-// downstream), so the result is always correct. Returns the candidate rows + the scan's up-front
-// (pages, slabs); gin_entry (per posting entry visited) is charged on meter directly. Degenerate
-// constant queries (gin.md §6): a NULL Q, an @> whose Q holds a NULL element, and an && with no
-// non-NULL term are provably empty; @> '{}' falls back to the full scan.
+// constant query operand, extracts its terms + mode via the array_ops opclass (an array for @>/&&;
+// a single scalar term for = ANY — ginMember), gathers each term's posting list (a prefix range
+// scan of the GIN entry tree), combines them by mode (@> and = ANY → intersection, && → union) into
+// the candidate storage-key set, and point-looks-up each candidate in storage-key order. The
+// original predicate stays the residual WHERE filter (re-applied downstream), so the result is
+// always correct. Returns the candidate rows + the scan's up-front (pages, slabs); gin_entry (per
+// posting entry visited) is charged on meter directly. Degenerate constant queries (gin.md §6): a
+// NULL Q, an @> whose Q holds a NULL element, an && with no non-NULL term, and a NULL = ANY scalar
+// are provably empty; @> '{}' falls back to the full scan.
 func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (rows []Row, pages, slabs int, err error) {
 	store := db.readSnap().store(tableName)
 	if query == nil {
@@ -5700,25 +5715,38 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	if qv.Kind != ValArray {
-		return nil, 0, 0, nil // a NULL whole-array (or non-array) query → provably empty
-	}
-	seen := make(map[int64]bool)
 	var terms []int64
 	hasNull := false
-	for _, el := range qv.Array.Elements {
-		switch el.Kind {
-		case ValInt:
-			if !seen[el.Int] {
-				seen[el.Int] = true
-				terms = append(terms, el.Int)
-			}
-		case ValNull:
-			hasNull = true
+	isEmpty := false
+	if gb.strategy == ginMember {
+		// `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL c can equal no element,
+		// so the bound is provably empty (gin.md §6). c is in the element type's range by resolution
+		// (jed coerces c to the element type, rejecting an out-of-range constant 22003 before exec);
+		// InRange is a defensive guard against silently truncating an out-of-range value into a wrong
+		// term.
+		if qv.Kind != ValInt || !gb.elemType.InRange(qv.Int) {
+			return nil, 0, 0, nil
 		}
+		terms = append(terms, qv.Int)
+	} else {
+		if qv.Kind != ValArray {
+			return nil, 0, 0, nil // a NULL whole-array (or non-array) query → provably empty
+		}
+		seen := make(map[int64]bool)
+		for _, el := range qv.Array.Elements {
+			switch el.Kind {
+			case ValInt:
+				if !seen[el.Int] {
+					seen[el.Int] = true
+					terms = append(terms, el.Int)
+				}
+			case ValNull:
+				hasNull = true
+			}
+		}
+		isEmpty = len(qv.Array.Elements) == 0
+		slices.Sort(terms)
 	}
-	isEmpty := len(qv.Array.Elements) == 0
-	slices.Sort(terms)
 
 	switch gb.strategy {
 	case ginContains:
@@ -5770,11 +5798,13 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 
 	// Combine into the candidate storage keys, ascending byte (= storage-key) order, so the point
 	// lookups and emitted rows follow storage order exactly as a full scan (gin.md §6/§8).
+	// @> ALL → intersection; = ANY (ginMember) is a single term, so its intersection is that lone
+	// posting list (gin.md §6). && ANY → union.
 	var cand [][]byte
-	if gb.strategy == ginContains {
-		cand = intersectPostings(postings)
-	} else {
+	if gb.strategy == ginOverlaps {
 		cand = unionPostings(postings)
+	} else {
+		cand = intersectPostings(postings)
 	}
 
 	for _, key := range cand {

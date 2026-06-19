@@ -2353,14 +2353,15 @@ export class Database {
   }
 
   // ginBoundRows executes a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the
-  // constant query Q, extracts its terms + mode via the array_ops opclass, gathers each term's
-  // posting list (a prefix range scan of the GIN entry tree), combines them by mode (@> →
-  // intersection, && → union) into the candidate storage-key set, and point-looks-up each candidate
-  // in storage-key order. The original @>/&& predicate stays the residual WHERE filter (re-applied
-  // downstream), so the result is always correct. Returns the candidate rows + the scan's up-front
-  // (pages, slabs); gin_entry (per posting entry visited) is charged on meter directly. Degenerate
-  // constant queries (gin.md §6): a NULL Q, an @> whose Q holds a NULL element, and an && with no
-  // non-NULL term are provably empty; @> '{}' falls back to the full scan.
+  // constant query operand, extracts its terms + mode via the array_ops opclass (an array for @>/&&;
+  // a single scalar term for = ANY — "member"), gathers each term's posting list (a prefix range
+  // scan of the GIN entry tree), combines them by mode (@> and = ANY → intersection, && → union)
+  // into the candidate storage-key set, and point-looks-up each candidate in storage-key order. The
+  // original predicate stays the residual WHERE filter (re-applied downstream), so the result is
+  // always correct. Returns the candidate rows + the scan's up-front (pages, slabs); gin_entry (per
+  // posting entry visited) is charged on meter directly. Degenerate constant queries (gin.md §6): a
+  // NULL Q, an @> whose Q holds a NULL element, an && with no non-NULL term, and a NULL = ANY scalar
+  // are provably empty; @> '{}' falls back to the full scan.
   ginBoundRows(
     tableName: string,
     gb: GinBound,
@@ -2374,22 +2375,33 @@ export class Database {
     // Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
     // §3): evaluate Q on a scratch meter. Q is a constant, so the empty row suffices.
     const qv = evalExpr(query, [], env, new Meter());
-    if (qv.kind !== "array") return { rows: [], pages: 0, slabs: 0 }; // NULL/non-array → provably empty
-    const seen = new Set<bigint>();
     const terms: bigint[] = [];
     let hasNull = false;
-    for (const el of qv.elements) {
-      if (el.kind === "int") {
-        if (!seen.has(el.int)) {
-          seen.add(el.int);
-          terms.push(el.int);
+    let isEmpty = false;
+    if (gb.strategy === "member") {
+      // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL c can equal no element,
+      // so the bound is provably empty (gin.md §6). c is in the element type's range by resolution
+      // (jed coerces c to the element type, rejecting an out-of-range constant 22003 before exec);
+      // inRange is a defensive guard against silently truncating an out-of-range value into a wrong
+      // term.
+      if (qv.kind !== "int" || !inRange(gb.elemType, qv.int)) return { rows: [], pages: 0, slabs: 0 };
+      terms.push(qv.int);
+    } else {
+      if (qv.kind !== "array") return { rows: [], pages: 0, slabs: 0 }; // NULL/non-array → provably empty
+      const seen = new Set<bigint>();
+      for (const el of qv.elements) {
+        if (el.kind === "int") {
+          if (!seen.has(el.int)) {
+            seen.add(el.int);
+            terms.push(el.int);
+          }
+        } else if (el.kind === "null") {
+          hasNull = true;
         }
-      } else if (el.kind === "null") {
-        hasNull = true;
       }
+      isEmpty = qv.elements.length === 0;
+      terms.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
     }
-    const isEmpty = qv.elements.length === 0;
-    terms.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 
     if (gb.strategy === "contains") {
       if (isEmpty) {
@@ -2399,7 +2411,7 @@ export class Database {
         return { rows: u.entries.map((e) => e.row), pages: u.pages, slabs: u.slabs };
       }
       if (hasNull) return { rows: [], pages: 0, slabs: 0 }; // @> a query with a NULL element is never TRUE
-    } else {
+    } else if (gb.strategy === "overlaps") {
       if (terms.length === 0) return { rows: [], pages: 0, slabs: 0 }; // && with no non-NULL term
     }
 
@@ -2422,8 +2434,10 @@ export class Database {
     meter.charge(COSTS.ginEntry * BigInt(entriesVisited));
 
     // Combine into the candidate storage keys, ascending byte (= storage-key) order, so the point
-    // lookups and emitted rows follow storage order exactly as a full scan (gin.md §6/§8).
-    const cand = gb.strategy === "contains" ? intersectPostings(postings) : unionPostings(postings);
+    // lookups and emitted rows follow storage order exactly as a full scan (gin.md §6/§8). @> ALL →
+    // intersection; = ANY (member) is a single term, so its intersection is that lone posting list;
+    // && ANY → union.
+    const cand = gb.strategy === "overlaps" ? unionPostings(postings) : intersectPostings(postings);
 
     let slabs = 0;
     const rows: Row[] = [];
@@ -4703,8 +4717,10 @@ type ScanBound =
   | { kind: "gin"; gin: GinBound };
 
 // GinStrategy is which array operator a GIN bound accelerates (spec/design/gin.md §6): @>
-// (contains, mode ALL → posting-list intersection) or && (overlaps, mode ANY → union).
-type GinStrategy = "contains" | "overlaps";
+// (contains, mode ALL → posting-list intersection), && (overlaps, mode ANY → union), or = ANY
+// ("member" — `c = ANY(col)`, the single-term @> reduction: one scalar term, its lone posting
+// list). For "member" the query operand recovered by ginMatch is the scalar c, not an array.
+type GinStrategy = "contains" | "overlaps" | "member";
 
 // GinBound is the plan-time result of GIN analysis (spec/design/gin.md §6): the chosen GIN
 // index (lowest lowercased name whose array column has a `col @> const` / `col && const`
@@ -4770,11 +4786,13 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
 }
 
 // ginMatch finds the first WHERE AND-chain conjunct a GIN index on colGlobal accelerates
-// (spec/design/gin.md §6): `col @> Q` (contains) or `col && Q` (overlaps) where Q is a constant
-// array (references no column / outer / subquery). @> is asymmetric (the indexed column must be the
-// LEFT operand — `Q @> col` is the non-accelerated <@); && is symmetric. Returns the strategy and Q.
-// Used at plan time (strategy) and exec time (recover Q from plan.filter), so the two agree on the
-// same conjunct by construction.
+// (spec/design/gin.md §6): `col @> Q` (contains), `col && Q` (overlaps), or `c = ANY(col)`
+// (membership) where the query operand is a constant (references no column / outer / subquery).
+// @> is asymmetric (the indexed column must be the LEFT operand — `Q @> col` is the non-accelerated
+// <@); && is symmetric; = ANY requires the column be ANY's array operand and c the scalar. Returns
+// the strategy and the query operand (the scalar c for "member"). Used at plan time (strategy) and
+// exec time (recover the operand from plan.filter), so the two agree on the same conjunct by
+// construction.
 function ginMatch(filter: RExpr, colGlobal: number): { strategy: GinStrategy; query: RExpr } | null {
   if (filter.kind === "and") {
     return ginMatch(filter.lhs, colGlobal) ?? ginMatch(filter.rhs, colGlobal);
@@ -4788,6 +4806,19 @@ function ginMatch(filter: RExpr, colGlobal: number): { strategy: GinStrategy; qu
       if (isColumnRef(a, colGlobal) && rexprIsConstant(b)) return { strategy: "overlaps", query: b };
       if (isColumnRef(b, colGlobal) && rexprIsConstant(a)) return { strategy: "overlaps", query: a };
     }
+  }
+  // `c = ANY(col)` — the array spelling of membership (gin.md §6): the GIN column must be ANY's
+  // ARRAY operand and c (the scalar lhs) a constant. Only = ANY (not = ALL, not any other
+  // comparison/quantifier — those are not a single-term posting gather). The recovered query operand
+  // is the scalar c; ginBoundRows reads it via "member".
+  if (
+    filter.kind === "quantified" &&
+    filter.op === "eq" &&
+    !filter.all &&
+    isColumnRef(filter.array, colGlobal) &&
+    rexprIsConstant(filter.lhs)
+  ) {
+    return { strategy: "member", query: filter.lhs };
   }
   return null;
 }

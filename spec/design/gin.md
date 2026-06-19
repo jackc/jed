@@ -32,10 +32,12 @@ CREATE [UNIQUE] INDEX [name] ON table USING gin (col)
   an array of any other element type (`text[]`, `decimal[]`, …), are `0A000` this slice
   (§3, §10) — the same "lift it when its key encoding lands" narrowing the ordered index
   makes for text/decimal keys.
-- **Accelerates `@>` and `&&` only.** A `WHERE` conjunct `col @> const` (contains) or
-  `col && const` (overlaps) against a GIN-indexed column bounds the scan to candidate rows
-  (§6). `<@` (contained-by), `= ANY` / `IN` membership, and array `=` are **not**
-  GIN-accelerated this slice (they still run, by full scan — §10).
+- **Accelerates `@>`, `&&`, and `const = ANY(col)` membership.** A `WHERE` conjunct
+  `col @> const` (contains), `col && const` (overlaps), or `const = ANY(col)` (the array
+  spelling of membership — semantically `col @> ARRAY[const]`) against a GIN-indexed column
+  bounds the scan to candidate rows (§6). `<@` (contained-by), `IN` membership over a scalar
+  list, and array `=` are **not** GIN-accelerated this slice (they still run, by full scan —
+  §10).
 - **`UNIQUE` is meaningless for GIN and rejected.** An inverted index has many entries per
   row, so uniqueness is undefined; `CREATE UNIQUE INDEX … USING gin` is `0A000` (§3). A GIN
   index never backs a `UNIQUE` constraint.
@@ -72,6 +74,15 @@ core**. This slice defines exactly one opclass:
 - `extract_query_terms(Q, strategy)`:
   - `@>` (`contains`): the distinct elements of `Q`, mode **ALL**.
   - `&&` (`overlaps`): the distinct **non-NULL** elements of `Q`, mode **ANY**.
+  - `= ANY` (`member`): `Q` is a **scalar** `const`, not an array — its single term
+    `{ encode(const) }`, mode **ALL** (one term). A degenerate single-term `@>`: the
+    posting list of `encode(const)` is exactly the rows containing `const`, which is exactly
+    where `const = ANY(col)` is TRUE (§6). A NULL `const` yields **no** term (a provably-empty
+    bound — §6). `const` is always in the element type's range here: jed resolves
+    `const = ANY(col)` by coercing `const` to the element type, so an out-of-range constant is
+    rejected at resolve (`22003`) and never reaches the gather (§6); the gather range-checks
+    anyway, as a defensive guard against silently truncating an out-of-range value into a wrong
+    term.
 - `consistent` is **the residual operator itself** — see §6: this slice always re-applies
   the original `@>`/`&&` predicate to each candidate row as the residual `WHERE` filter
   (the standard bounded-scan contract — [indexes.md §5](indexes.md)), rather than trusting
@@ -176,26 +187,36 @@ write phase, deterministic, and cannot fail.
 
 The per-relation pushdown seam ([indexes.md §5](indexes.md), [cost.md §3](cost.md)) gains a
 **third bound kind**, after the PK bound and the ordered-index equality bound. For each base
-relation of a **SELECT** scan, if the `WHERE` AND-chain has a conjunct `col @> Q` or
-`col && Q` where `col` is a GIN-indexed column and **`Q` is a constant** (a literal or `$N`
-param array — a correlated/array-column `Q` is a follow-on), the plan bounds the scan
-through the GIN index. Among several eligible GIN indexes the **lowest lowercased name**
-wins (deterministic; cost-based selection is later). Otherwise the existing PK/ordered/full
-choice stands.
+relation of a **SELECT** scan, if the `WHERE` AND-chain has a conjunct
+`col @> Q` (contains), `col && Q` (overlaps), or `c = ANY(col)` (membership) where `col` is a
+GIN-indexed column and **the query operand is a constant** (`Q` a literal/`$N`-param array,
+`c` a literal/`$N`-param scalar — a correlated/array-column operand is a follow-on), the plan
+bounds the scan through the GIN index. (`= ANY` is the only quantified form accelerated: the
+membership `c = ANY(col)` — *not* `c = ALL(col)` or any `<>`/`<`/… quantifier, which are not a
+single-term posting gather; and the indexed column must be `ANY`'s **array** operand, with `c`
+the scalar.) Among several eligible GIN indexes the **lowest lowercased name** wins
+(deterministic; cost-based selection is later). Otherwise the existing PK/ordered/full choice
+stands.
 
 **Execution** — the classic inverted gather + residual filter:
 
-1. The opclass extracts `Q`'s query terms and mode (§2). Three **provably-empty** shapes
+1. The opclass extracts the query terms and mode (§2). Several **provably-empty** shapes
    read nothing (like an ordered equality against NULL): `Q` is the NULL array (`@>`/`&&`
    both → NULL for every row); `Q` contains a NULL element under `@>` (a NULL is found in no
-   row → never TRUE); `&&` whose `Q` has no non-NULL element. One shape **falls back to the
-   full scan**: `@> '{}'` (the empty array is contained by every non-NULL array — a result
-   the index, which only knows rows that *have* terms, cannot enumerate). These are
-   degenerate constant queries; the common case proceeds.
+   row → never TRUE); `&&` whose `Q` has no non-NULL element; and **`= ANY` whose `c` is NULL**
+   (`NULL = ANY(col)` is NULL/FALSE for every row → never TRUE — reachable as a typed
+   `NULL::i32`, since a bare untyped `NULL` operand is `42P18`). (An out-of-element-range `c`
+   cannot reach the gather: jed coerces `c` to the element type at resolve, rejecting it `22003`
+   — a documented divergence from PG, which promotes the elements to `c`'s wider type and returns
+   no rows; the gather range-checks `c` defensively regardless, §2.) One shape **falls back to the
+   full scan**: `@> '{}'` (the empty array is contained by every non-NULL array — a result the
+   index, which only knows rows that *have* terms, cannot enumerate). These are degenerate
+   constant queries; the common case proceeds.
 2. Each query term's posting list is read by a **prefix range scan** of the entry B-tree
    (§4) into a set of row storage keys.
-3. The posting sets are combined by mode: **ALL → intersection** (`@>`), **ANY → union**
-   (`&&`). The result is the **candidate** storage-key set.
+3. The posting sets are combined by mode: **ALL → intersection** (`@>`, and `= ANY`'s single
+   term — an intersection of one list is that list), **ANY → union** (`&&`). The result is the
+   **candidate** storage-key set.
 4. Each candidate row is fetched from the table tree by **point lookup**, in storage-key
    order (so downstream order-determinism is unchanged), and the original `@>`/`&&` predicate
    stays the **residual `WHERE` filter**, re-applied to every fetched row — the standard
@@ -203,10 +224,11 @@ choice stands.
    correct.
 
 **Narrowings this slice** (documented, relaxable, each a follow-on with its own NoREC
-obligation — [conformance.md §8](conformance.md)): a **constant** query only (no correlated
-/ array-column `Q`); **`@>` and `&&` only** (no `<@`, `= ANY`, `IN`, `=`); **SELECT scans
-only** (UPDATE/DELETE keep their PK pushdown); and **no LIMIT-streaming combination** — a
-GIN-bounded scan with a `LIMIT` takes the eager path, like the ordered-index bound.
+obligation — [conformance.md §8](conformance.md)): a **constant** query operand only (no
+correlated / array-column operand); **`@>`, `&&`, and `= ANY` only** (no `<@`, `IN` over a
+scalar list, or array `=`); **SELECT scans only** (UPDATE/DELETE keep their PK pushdown); and
+**no LIMIT-streaming combination** — a GIN-bounded scan with a `LIMIT` takes the eager path,
+like the ordered-index bound.
 
 ### Cost (the cross-core contract — [cost.md §3](cost.md))
 
@@ -279,9 +301,12 @@ final row order is governed by `ORDER BY` exactly as any scan (CLAUDE.md §8).
   this slice covers the integer element types only, the rest `0A000` (§3) until their key
   encoding lifts. A divergence on `text[]`/etc. (PG builds, jed `0A000`), oracle-override-ledgered.
 - **Single-column only** — PG supports multicolumn GIN; jed is `0A000` this slice (§3).
-- **`<@` / `= ANY` / `IN` not accelerated** — PG's `array_ops` GIN also serves `<@` (via a
-  broad scan + recheck) and `=`; jed runs those by full scan this slice (a cost/plan
-  difference, never a result difference — §10).
+- **`<@` / `IN` / array `=` not accelerated** — PG's `array_ops` GIN also serves `<@` (via a
+  broad scan + recheck) and array `=`; jed runs those by full scan this slice (a cost/plan
+  difference, never a result difference — §10). **`const = ANY(col)` membership IS
+  accelerated** (§1/§6), a single-term `@>` gather; PG does not rewrite `= ANY(array)` onto a
+  GIN array index (it leaves it a full scan), so this is a jed *acceleration* divergence —
+  same rows, lower cost — not a result difference.
 - **Recheck always** — jed re-applies the residual predicate to every candidate even though
   the `array_ops` gather is exact (§2); an overriding-reason simplification that also seats
   the future lossy opclasses. (PG marks `array_ops` `@>`/`&&` as non-lossy and can skip the
@@ -300,8 +325,8 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
   seam; `jsonb_path_ops` (path hashes) later still.
 - **More array element types** — `text[]`, `decimal[]`, `bytea[]`, … as their order-preserving
   element key encodings lift ([encoding.md §2.4–§2.6](encoding.md)); composite-element arrays.
-- **More operators** — `<@` (contained-by, a broad scan + recheck), `= ANY` / `IN`
-  membership, array `=`.
+- **More operators** — `<@` (contained-by, a broad scan + recheck), `IN` membership over a
+  scalar list, array `=`. (`const = ANY(col)` membership has landed — §1/§6.)
 - **Multi-column GIN**, correlated / array-column query operands, GIN bounds for UPDATE /
   DELETE scans, and the LIMIT-streaming combination.
 - **Posting-list run compression** — a long contiguous run of one term's entries

@@ -6381,16 +6381,17 @@ impl Database {
     }
 
     /// Execute a GIN-bounded scan (spec/design/gin.md §6, cost.md §3). Evaluates the constant
-    /// query `Q`, extracts its terms + mode via the `array_ops` opclass, gathers each term's
-    /// posting list (a prefix range scan of the GIN entry tree), combines them by mode
-    /// (`@>` → intersection, `&&` → union) into the candidate storage-key set, and point-looks-up
-    /// each candidate in storage-key order. The original `@>`/`&&` predicate stays the residual
-    /// WHERE filter (re-applied downstream), so the result is always correct — the bound only
-    /// narrows which rows are fetched. Returns the candidate rows + the scan's up-front units
-    /// `(pages, slabs)` (entry-tree overlap nodes per term + each candidate's table point-lookup);
-    /// `gin_entry` (per posting entry visited) is charged on `meter` directly. Degenerate constant
-    /// queries (gin.md §6): a NULL `Q`, an `@>` whose `Q` holds a NULL element, and an `&&` with no
-    /// non-NULL term are provably empty (read nothing); `@> '{}'` falls back to the full scan.
+    /// query operand, extracts its terms + mode via the `array_ops` opclass (an array for `@>`/`&&`;
+    /// a single scalar term for `= ANY` — `Member`), gathers each term's posting list (a prefix
+    /// range scan of the GIN entry tree), combines them by mode (`@>` and `= ANY` → intersection,
+    /// `&&` → union) into the candidate storage-key set, and point-looks-up each candidate in
+    /// storage-key order. The original predicate stays the residual WHERE filter (re-applied
+    /// downstream), so the result is always correct — the bound only narrows which rows are fetched.
+    /// Returns the candidate rows + the scan's up-front units `(pages, slabs)` (entry-tree overlap
+    /// nodes per term + each candidate's table point-lookup); `gin_entry` (per posting entry
+    /// visited) is charged on `meter` directly. Degenerate constant queries (gin.md §6): a NULL `Q`,
+    /// an `@>` whose `Q` holds a NULL element, an `&&` with no non-NULL term, and a NULL `= ANY`
+    /// scalar are provably empty (read nothing); `@> '{}'` falls back to the full scan.
     fn gin_bound_rows(
         &self,
         table_name: &str,
@@ -6408,22 +6409,37 @@ impl Database {
             Some(q) => q.eval(&[], env, &mut Meter::new())?,
             None => return Ok((Vec::new(), (0, 0))),
         };
-        let arr = match &qv {
-            // A NULL whole-array query is 3VL-NULL for every row → never TRUE (both @> and &&).
-            Value::Null => return Ok((Vec::new(), (0, 0))),
-            Value::Array(a) => a,
-            _ => return Ok((Vec::new(), (0, 0))), // not an array (impossible post-resolve)
-        };
         let mut terms: Vec<i64> = Vec::new();
         let mut has_null = false;
-        for el in &arr.elements {
-            match el {
-                Value::Int(n) => terms.push(*n),
-                Value::Null => has_null = true,
-                _ => {} // a non-integer element is impossible under the array_ops gate
+        let mut is_empty = false;
+        if gb.strategy == GinStrategy::Member {
+            // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL `c` can equal no
+            // element, so the bound is provably empty (gin.md §6). `c` is in the element type's
+            // range by resolution (jed coerces `c` to the element type, rejecting an out-of-range
+            // constant 22003 before exec); the range check is a defensive guard against silently
+            // truncating an out-of-range value into a wrong term.
+            match &qv {
+                Value::Int(n) if *n >= gb.elem_type.min() && *n <= gb.elem_type.max() => {
+                    terms.push(*n)
+                }
+                _ => return Ok((Vec::new(), (0, 0))),
             }
+        } else {
+            let arr = match &qv {
+                // A NULL whole-array query is 3VL-NULL for every row → never TRUE (both @> and &&).
+                Value::Null => return Ok((Vec::new(), (0, 0))),
+                Value::Array(a) => a,
+                _ => return Ok((Vec::new(), (0, 0))), // not an array (impossible post-resolve)
+            };
+            for el in &arr.elements {
+                match el {
+                    Value::Int(n) => terms.push(*n),
+                    Value::Null => has_null = true,
+                    _ => {} // a non-integer element is impossible under the array_ops gate
+                }
+            }
+            is_empty = arr.elements.is_empty();
         }
-        let is_empty = arr.elements.is_empty();
         terms.sort_unstable();
         terms.dedup();
 
@@ -6474,7 +6490,9 @@ impl Database {
         // (= storage-key) order, so the point lookups and the emitted rows follow storage order
         // exactly as a full scan would (gin.md §6/§8).
         let candidates: BTreeSet<Vec<u8>> = match gb.strategy {
-            GinStrategy::Contains => {
+            // `@>` ALL → intersection; `= ANY` (Member) is a single term, so its intersection is
+            // that lone posting list (gin.md §6).
+            GinStrategy::Contains | GinStrategy::Member => {
                 let mut it = postings.into_iter();
                 let mut acc: BTreeSet<Vec<u8>> =
                     it.next().unwrap_or_default().into_iter().collect();
@@ -7679,11 +7697,16 @@ enum ScanBound {
 }
 
 /// Which array operator a GIN bound accelerates (spec/design/gin.md §6): `@>` (contains, mode
-/// ALL → posting-list intersection) or `&&` (overlaps, mode ANY → posting-list union).
+/// ALL → posting-list intersection), `&&` (overlaps, mode ANY → posting-list union), or
+/// `= ANY` (membership — `c = ANY(col)`, the single-term `@>` reduction: one scalar term, mode
+/// ALL → its lone posting list).
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum GinStrategy {
     Contains,
     Overlaps,
+    /// `c = ANY(col)` — `c` is a constant SCALAR (not an array); its single term is gathered like
+    /// a one-element `@>`. The query operand recovered by `gin_match` is the scalar `c`.
+    Member,
 }
 
 /// The plan-time result of GIN analysis (spec/design/gin.md §6): the chosen GIN index (lowest
@@ -7817,6 +7840,18 @@ fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrategy, &RExpr)>
             } else {
                 None
             }
+        }
+        // `c = ANY(col)` — the array spelling of membership (gin.md §6): the GIN column must be
+        // ANY's ARRAY operand and `c` (the scalar `lhs`) a constant. Only `= ANY` (not `= ALL`,
+        // not any other comparison/quantifier — those are not a single-term posting gather). The
+        // recovered query operand is the scalar `c`; `gin_bound_rows` reads it via `Member`.
+        RExpr::Quantified {
+            op: CmpOp::Eq,
+            all: false,
+            lhs,
+            array,
+        } if is_column(array, col_global) && rexpr_is_constant(lhs) => {
+            Some((GinStrategy::Member, lhs.as_ref()))
         }
         _ => None,
     }

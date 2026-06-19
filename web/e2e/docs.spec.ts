@@ -145,6 +145,16 @@ test('the indexes page runs the GIN && overlaps scan live', async ({ page }) => 
 	await expect(panel.getByTestId('result-rows')).not.toContainText('empty');
 });
 
+test('the indexes page runs the GIN = ANY membership scan live', async ({ page }) => {
+	await page.goto('/docs/sql/indexes/');
+	// Fourth panel = the GIN membership scan: 20 = ANY(tags) → intro, arrays, gin (all hold 20)
+	// — the single term's posting list; storage ({40,50}) and empty do not and are excluded.
+	const panel = page.getByTestId('live-sql').nth(3);
+	await expect(panel.getByTestId('result-rows')).toContainText('intro');
+	await expect(panel.getByTestId('result-rows')).toContainText('arrays');
+	await expect(panel.getByTestId('result-rows')).not.toContainText('storage');
+});
+
 test('the reference pages are generated from the spec', async ({ page }) => {
 	await page.goto('/docs/reference/errors/');
 	// 54P01 (cost limit) and 23514 (check violation) come straight from spec/errors/registry.toml.

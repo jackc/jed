@@ -187,3 +187,25 @@ max = 500
 gen = "int_uniform"
 min = 1
 max = 500
+
+# GIN-bounded `= ANY` membership: `c = ANY(tags)` is the array spelling of membership, which jed
+# accelerates as a single-term `@>` gather (spec/design/gin.md §6; query.gin_any_eq). One posting
+# list (not the two-term intersection/union above), so a tighter, single-term GIN sweet spot. The
+# `$1::bigint` scalar cast is the form both engines accept (jed coerces c to the bigint element;
+# PostgreSQL keeps `= ANY(array)` a full scan, so this also measures jed's acceleration edge). The
+# answer is index-independent, so the cross-engine checksum holds.
+[[bench]]
+name = "gin_member"
+description = "GIN = ANY (membership): rows whose tags array contains the query term — a single-posting-list gather over a 200k-row bigint[] column"
+dataset = "gin"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT id FROM docs WHERE $1::bigint = ANY(tags) ORDER BY id"
+warmup = 500
+iterations = 5000
+seed = 4211
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 500

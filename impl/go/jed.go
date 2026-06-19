@@ -109,6 +109,9 @@ var SupportedCapabilities = []string{
 	// the SELECT scan to candidate rows (term gather → intersect/union → residual filter); the
 	// result is identical to the full scan (spec/design/gin.md §6).
 	"query.gin_scan",
+	// GIN-bounded `c = ANY(col)` membership — the single-term @> reduction over a GIN-indexed
+	// array column (spec/design/gin.md §6); same rows as the full scan, lower cost.
+	"query.gin_any_eq",
 	"query.is_null",
 	"query.order_by",
 	// Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).
