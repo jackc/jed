@@ -403,11 +403,20 @@ group_by       ::= "GROUP" "BY" column_ref ("," column_ref)*
  * preceding alias name is a 42601 syntax error. When absent, the relation has no qualifier (bare
  * columns still resolve). A base table / function alias stays the bare optional form ("orders o" =
  * "orders AS o"); their column-alias-list form "AS g(cols)" remains a deferred 0A000 narrowing
- * (§35). */
+ * (§35).
+ *   LATERAL (../design/grammar.md §44). A derived table or table function may be preceded by the
+ * "LATERAL" keyword, letting its body / arguments reference columns of the FROM relations that
+ * appear BEFORE it in the same FROM clause (a dependent / correlated join). The keyword precedes
+ * a derived_table or table_function only — "LATERAL" before a bare base-table name is a 42601
+ * syntax error (PG). A table_function is IMPLICITLY lateral (its arguments may reference preceding
+ * relations with or without the keyword — PG); the keyword is accepted but redundant there. A
+ * sub-SELECT / VALUES derived table is lateral ONLY with the keyword (without it a sibling
+ * reference is 42P01/42703 — the §42 non-correlation rule). */
 from_clause    ::= table_ref join_clause*
 
-table_ref      ::= derived_table derived_alias?
-                 | (table_function | identifier) ("AS"? identifier)?
+table_ref      ::= "LATERAL"? derived_table derived_alias?
+                 | "LATERAL"? table_function ("AS"? identifier)?
+                 | identifier ("AS"? identifier)?
 
 /* A derived table's body is either a query_expr (SELECT / set op) or a VALUES list — a computed
  * relation of literal rows (../design/grammar.md §42). The VALUES body takes NO trailing

@@ -1515,8 +1515,24 @@ func (p *Parser) parseFromClause() (TableRef, []JoinClause, error) {
 // takes the next identifier unconditionally; an implicit alias is taken only when the next token is
 // a word that is NOT a clause/join keyword. The stop-keyword set is a §8 surface.
 func (p *Parser) parseTableRef() (TableRef, error) {
+	// An optional leading LATERAL (grammar.md §44) marks a derived table / table function as
+	// correlated to the EARLIER FROM relations. LATERAL is non-reserved (§3), so it is the keyword
+	// only when a derived table `(` or a function call `name(` follows (a two-token lookahead) —
+	// otherwise it is an ordinary identifier (e.g. a table named `lateral`). A table function is
+	// implicitly lateral regardless, so the keyword is redundant (but accepted) there.
+	lateral := p.peekKeyword() == "lateral" &&
+		(p.peekKindAt(1) == TokLParen ||
+			(p.peekKindAt(1) == TokWord && p.peekKindAt(2) == TokLParen))
+	if lateral {
+		p.advance()
+	}
 	if p.peek().Kind == TokLParen {
-		return p.parseDerivedTable()
+		tr, err := p.parseDerivedTable()
+		if err != nil {
+			return TableRef{}, err
+		}
+		tr.Lateral = lateral
+		return tr, nil
 	}
 	name, err := p.expectIdentifier()
 	if err != nil {
@@ -1562,7 +1578,8 @@ func (p *Parser) parseTableRef() (TableRef, error) {
 		return TableRef{}, NewError(FeatureNotSupported,
 			"column alias list on a table function is not supported yet")
 	}
-	return TableRef{Name: name, Alias: alias, IsFunc: isFunc, Args: args}, nil
+	// An SRF is implicitly lateral; Lateral records only whether the keyword was written.
+	return TableRef{Name: name, Alias: alias, IsFunc: isFunc, Args: args, Lateral: lateral}, nil
 }
 
 // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).

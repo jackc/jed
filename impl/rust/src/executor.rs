@@ -3732,17 +3732,19 @@ impl Database {
     fn plan_values<'a>(
         &'a self,
         rows: &[Vec<Expr>],
+        parent: Option<&Scope<'a>>,
         ctes: &'a [CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<ValuesPlan> {
         // The parser guarantees at least one row, each with at least one value.
         let arity = rows[0].len();
-        // The non-`LATERAL` constant scope: no local relations and no parent, so any column
-        // reference (outer, sibling, or the body's own) is unresolved; CTE bindings stay visible
-        // and subqueries are allowed (an uncorrelated one folds before the rows run).
+        // A constant scope: no local relations. With `parent = None` (the usual case) any column
+        // reference is unresolved (the non-`LATERAL` rule, §42); with a `parent` (a `LATERAL`
+        // VALUES body, §44) a column reference correlates to the earlier FROM relations instead.
+        // CTE bindings stay visible and subqueries are allowed (an uncorrelated one folds early).
         let scope = Scope {
             rels: Vec::new(),
-            parent: None,
+            parent,
             catalog: self,
             allow_subquery: true,
             ctes,
@@ -3916,22 +3918,19 @@ impl Database {
         ctes: &'a [CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<SelectPlan> {
-        // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
-        // relation's flat column offset in FROM order, and reject a duplicate label — a
-        // self-join without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less
-        // SELECT (`sel.from` = None) builds an EMPTY scope: nothing local resolves, so bare
-        // columns fall through to `parent` (the correlated-subquery rule) or 42703 at top level
-        // (spec/design/grammar.md §34). The scope links to `parent` (for correlation) and the
-        // catalog (so a subquery can resolve its own FROM); `allow_subquery` is true (subqueries
-        // are legal in a SELECT — UPDATE/DELETE pass a `Scope::single` with it false).
-        // A FROM item is either a base table or a set-returning function (generate_series —
-        // grammar.md §35). An SRF has no catalog table, so its relation borrows a SYNTHETIC
-        // one-column `Table` that must outlive the scope: build all synthetic tables (and resolve
-        // the SRF args, which determine each one's column type) in a FIRST pass into a local
-        // `Vec<Box<Table>>`, then take `&*` references into them when building `rels` (a borrow
-        // into the Vec cannot coexist with a push, hence two passes). The args resolve against an
-        // EMPTY-local-rels scope whose `parent` is the enclosing query (non-LATERAL: a $N/outer
-        // reference works, a sibling FROM table does not — functions.md §10).
+        // Build the FROM scope (spec/design/grammar.md §15/§44): resolve each table reference (42P01
+        // if unknown), compute its flat column offset in FROM order, reject a duplicate label (42712),
+        // and — for a LATERAL item — resolve its body / SRF args against the PREFIX of relations to
+        // its left (the dependent-join scope, §44). A FROM-less SELECT (`sel.from` = None) builds an
+        // EMPTY scope: bare columns fall through to `parent` (correlation) or 42703 at top level
+        // (§34). The scope links to `parent` (for correlation) and the catalog; `allow_subquery` is
+        // true (UPDATE/DELETE pass a `Scope::single` with it false).
+        //   An SRF / derived table has no catalog table — its relation borrows a SYNTHETIC `Table`
+        // that must outlive the scope, so the synthetic tables live in a local `Vec<Box<Table>>` and
+        // `rels` borrows into it. Because a LATERAL item resolves against the EARLIER synthetic tables
+        // WHILE later ones are still being pushed, the build runs in FROM order, recording each
+        // finalized relation in `finalized` (a synthetic table by INDEX, holding no borrow that would
+        // block a later push); the persistent `rels`/scope is assembled from `finalized` afterwards.
         let from_items: Vec<&TableRef> = sel
             .from
             .iter()
@@ -3941,111 +3940,161 @@ impl Database {
         // Per FROM item: `None` = a base table; `Some((synthetic_index, srf_args, kind))` = an SRF.
         let mut srf_meta: Vec<Option<(usize, Vec<RExpr>, SrfKind)>> =
             Vec::with_capacity(from_items.len());
-        // Per FROM item: the planned body of a DERIVED TABLE (grammar.md §42), else `None`. Held
-        // here through planning and moved into each relation's `PlanRel.derived` at assembly.
+        // Per FROM item: the planned body of a DERIVED TABLE (grammar.md §42), else `None`.
         let mut derived_plans: Vec<Option<QueryPlan>> = Vec::with_capacity(from_items.len());
-        // Per FROM item: the index into `synthetic` of a derived table's relation, else `None`
-        // (distinguishes a derived table from a base table / CTE in the second pass).
+        // Per FROM item: the index into `synthetic` of a derived table's relation, else `None`.
         let mut derived_meta: Vec<Option<usize>> = Vec::with_capacity(from_items.len());
-        for tref in &from_items {
-            // A DERIVED TABLE — `FROM (SELECT …) AS t` (a `query_expr` body) or
-            // `FROM (VALUES …) AS v` (a VALUES-body relation — §42). Plan the body as an INDEPENDENT
-            // query (`parent = None`: not correlated / not LATERAL — §42) that still inherits the
-            // statement's CTE bindings (cte.md §2), build its synthetic relation (the alias is the
-            // label; the optional column-rename list applies, 42P10 on overflow), and keep the plan
-            // for in-place execution. Like a single-reference CTE, it borrows a SYNTHETIC `Table`
-            // that must outlive the scope, so it joins `synthetic`.
-            let derived_plan = match (&tref.subquery, &tref.values) {
-                (Some(body), _) => Some(self.plan_query(body, None, ctes, ptypes)?),
-                (None, Some(rows)) => {
-                    Some(QueryPlan::Values(self.plan_values(rows, ctes, ptypes)?))
-                }
-                (None, None) => None,
-            };
-            if let Some(plan) = derived_plan {
+        // Per FROM item: true when it is a CORRELATED lateral relation (§44) — its body / SRF args
+        // reference an earlier sibling (or an enclosing query), so the executor re-materializes it per
+        // combined left-hand row. A non-correlated item (or the first item) is materialized once.
+        let mut lateral_flags: Vec<bool> = Vec::with_capacity(from_items.len());
+        // The relations finalized so far (label + flat offset + table source), used to build the
+        // prefix `parent` scope a LATERAL item resolves against, then to assemble `rels`.
+        let mut finalized: Vec<FinalRel> = Vec::with_capacity(from_items.len());
+        let mut seen_labels: HashSet<String> = HashSet::new();
+        let mut offset = 0usize;
+        for (i, tref) in from_items.iter().enumerate() {
+            let is_derived = tref.subquery.is_some() || tref.values.is_some();
+            // A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table /
+            // VALUES body explicitly marked `LATERAL`, or ANY table function (implicitly lateral —
+            // §44). The first item (i == 0) has no earlier sibling, so it is never lateral; an SRF
+            // there resolves against `parent` (the enclosing query) exactly as before.
+            let lateral_eligible = i > 0 && ((is_derived && tref.lateral) || tref.args.is_some());
+            let src: RelSrc;
+            if is_derived {
+                // Plan the body. LATERAL → `parent` is the prefix scope (earlier siblings chained to
+                // the enclosing query, so a sibling/outer column correlates); otherwise the body is an
+                // INDEPENDENT query (`parent = None`, §42). A LATERAL VALUES body resolves its values
+                // against the prefix too (a column ref then correlates instead of 42703).
+                let plan = if lateral_eligible {
+                    let prefix = build_prefix_scope(&finalized, &synthetic, parent, self, ctes);
+                    match (&tref.subquery, &tref.values) {
+                        (Some(body), _) => self.plan_query(body, Some(&prefix), ctes, ptypes)?,
+                        (None, Some(rows)) => QueryPlan::Values(self.plan_values(
+                            rows,
+                            Some(&prefix),
+                            ctes,
+                            ptypes,
+                        )?),
+                        _ => unreachable!(),
+                    }
+                } else {
+                    match (&tref.subquery, &tref.values) {
+                        (Some(body), _) => self.plan_query(body, None, ctes, ptypes)?,
+                        (None, Some(rows)) => {
+                            QueryPlan::Values(self.plan_values(rows, None, ctes, ptypes)?)
+                        }
+                        _ => unreachable!(),
+                    }
+                };
+                lateral_flags.push(lateral_eligible && query_plan_references_outer(&plan, 0));
                 let label = tref.alias.clone().unwrap_or_default().to_ascii_lowercase();
                 let table = cte_synthetic_table(&label, &plan, tref.column_aliases.as_deref())?;
                 synthetic.push(table);
+                let si = synthetic.len() - 1;
                 srf_meta.push(None);
-                derived_meta.push(Some(synthetic.len() - 1));
+                derived_meta.push(Some(si));
                 derived_plans.push(Some(plan));
-                continue;
-            }
-            derived_meta.push(None);
-            derived_plans.push(None);
-            match &tref.args {
-                None => srf_meta.push(None),
-                Some(args) => {
-                    let (table, rargs, kind) = self.resolve_srf(
+                src = RelSrc::Synthetic(si);
+            } else if let Some(args) = &tref.args {
+                // A table function (SRF) — implicitly lateral. At i>0 its args resolve against the
+                // prefix scope (a sibling column then correlates); at i==0 against `parent` (the
+                // enclosing query / params), unchanged (functions.md §10).
+                let (table, rargs, kind) = if lateral_eligible {
+                    let prefix = build_prefix_scope(&finalized, &synthetic, parent, self, ctes);
+                    self.resolve_srf(
+                        &tref.name,
+                        args,
+                        tref.alias.as_deref(),
+                        Some(&prefix),
+                        ctes,
+                        ptypes,
+                    )?
+                } else {
+                    self.resolve_srf(
                         &tref.name,
                         args,
                         tref.alias.as_deref(),
                         parent,
                         ctes,
                         ptypes,
-                    )?;
-                    synthetic.push(table);
-                    srf_meta.push(Some((synthetic.len() - 1, rargs, kind)));
-                }
-            }
-        }
-
-        let mut rels: Vec<ScopeRel> = Vec::with_capacity(from_items.len());
-        let mut seen_labels: HashSet<String> = HashSet::new();
-        let mut offset = 0usize;
-        for (i, (tref, meta)) in from_items.iter().zip(srf_meta.iter()).enumerate() {
-            // A plain FROM name (not an SRF call or a derived table) may resolve to a CTE, which
-            // SHADOWS a catalog table of the same name (cte.md §2); lookup is case-insensitive. A
-            // hit bumps the binding's reference count (the inline-vs-materialize decision —
-            // cost.md §3). A derived table's alias is NOT a name lookup, so it never matches a CTE.
-            let lname = tref.name.to_ascii_lowercase();
-            let cte_idx = if meta.is_none() && derived_meta[i].is_none() {
-                ctes.iter().position(|b| b.name == lname)
+                    )?
+                };
+                lateral_flags
+                    .push(lateral_eligible && rargs.iter().any(|a| rexpr_references_outer(a, 0)));
+                synthetic.push(table);
+                let si = synthetic.len() - 1;
+                srf_meta.push(Some((si, rargs, kind)));
+                derived_meta.push(None);
+                derived_plans.push(None);
+                src = RelSrc::Synthetic(si);
             } else {
-                None
-            };
-            let (table, cte): (&Table, Option<usize>) = match (meta, derived_meta[i], cte_idx) {
-                (Some((si, _, _)), _, _) => (&synthetic[*si], None),
-                // A derived table resolves against its synthetic relation (built above).
-                (None, Some(si), _) => (&synthetic[si], None),
-                (None, None, Some(i)) => {
-                    ctes[i].refs.set(ctes[i].refs.get() + 1);
-                    (&*ctes[i].table, Some(i))
-                }
-                (None, None, None) => (
-                    self.table(&tref.name).ok_or_else(|| {
+                // A base table NAME — may resolve to a CTE, which SHADOWS a catalog table of the same
+                // name (cte.md §2; case-insensitive). A CTE hit bumps the binding's reference count
+                // (the inline-vs-materialize decision — cost.md §3).
+                lateral_flags.push(false);
+                srf_meta.push(None);
+                derived_meta.push(None);
+                derived_plans.push(None);
+                let lname = tref.name.to_ascii_lowercase();
+                src = match ctes.iter().position(|b| b.name == lname) {
+                    Some(ci) => {
+                        ctes[ci].refs.set(ctes[ci].refs.get() + 1);
+                        RelSrc::Cte(&*ctes[ci].table, ci)
+                    }
+                    None => RelSrc::Base(self.table(&tref.name).ok_or_else(|| {
                         EngineError::new(
                             SqlState::UndefinedTable,
                             format!("table does not exist: {}", tref.name),
                         )
-                    })?,
-                    None,
-                ),
+                    })?),
+                };
+            }
+            // RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be
+            // both kept whole and evaluated per left row. (i ≥ 1, so the item carries a join kind.)
+            if lateral_flags[i] && matches!(sel.joins[i - 1].kind, JoinKind::Right | JoinKind::Full)
+            {
+                return Err(EngineError::new(
+                    SqlState::InvalidColumnReference,
+                    "invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT",
+                ));
+            }
+            // The relation's label (alias, else the table/function name; empty for an unaliased derived
+            // table, which has no qualifier and never collides). A duplicate explicit label is 42712.
+            let table: &Table = match src {
+                RelSrc::Base(t) | RelSrc::Cte(t, _) => t,
+                RelSrc::Synthetic(idx) => &synthetic[idx],
             };
             let label = tref
                 .alias
                 .clone()
                 .unwrap_or_else(|| table.name.clone())
                 .to_ascii_lowercase();
-            // An unaliased derived table (grammar.md §42, PG 18) has an EMPTY label — it has no
-            // qualifier, so two of them never collide and the duplicate-label check is skipped (its
-            // bare columns still resolve, and stay ambiguous via resolve_bare). Every other relation
-            // has a non-empty label (a table/function name or an explicit alias).
+            let col_count = table.columns.len();
             if !label.is_empty() && !seen_labels.insert(label.clone()) {
                 return Err(EngineError::new(
                     SqlState::DuplicateAlias,
                     format!("table name {label} specified more than once"),
                 ));
             }
-            rels.push(ScopeRel {
-                label,
-                table,
-                offset,
-                qualifier_only: false,
-                cte,
-            });
-            offset += table.columns.len();
+            finalized.push(FinalRel { label, offset, src });
+            offset += col_count;
         }
+        // Assemble the persistent scope: every synthetic table now has a stable address (no more
+        // pushes), so `rels` may borrow them.
+        let rels: Vec<ScopeRel> = finalized
+            .iter()
+            .map(|fr| ScopeRel {
+                label: fr.label.clone(),
+                table: fr.table(&synthetic),
+                offset: fr.offset,
+                qualifier_only: false,
+                cte: match fr.src {
+                    RelSrc::Cte(_, ci) => Some(ci),
+                    _ => None,
+                },
+            })
+            .collect();
         let scope = Scope {
             rels,
             parent,
@@ -4258,6 +4307,7 @@ impl Database {
                 srf: srf_plans[i].take(),
                 cte: r.cte,
                 derived: derived_plans[i].take().map(Box::new),
+                lateral: lateral_flags[i],
             })
             .collect();
         // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14):
@@ -4710,6 +4760,105 @@ impl Database {
         crate::spill::Sorter::new(order.to_vec(), self.work_mem, spill_dir)
     }
 
+    /// Materialize one FROM relation `ri` into its rows, given the current outer-row stack `outer`
+    /// (spec/design/grammar.md §15/§44). A base table is scanned (a PK/index bound may seek via
+    /// `outer`); an SRF is generated; a CTE / derived table is delivered / run in place. For a
+    /// CORRELATED `LATERAL` relation (§44) the caller passes `outer` EXTENDED with the combined
+    /// left-hand row, so the body / SRF args read that row as their immediate outer; a non-lateral
+    /// relation is passed the query's own `outer` and its `parent = None` body simply ignores it
+    /// (a `parent = None` plan holds no `OuterColumn`, so the two are observably identical).
+    fn materialize_rel(
+        &self,
+        plan: &SelectPlan,
+        ri: usize,
+        params: &[Value],
+        outer: &[&[Value]],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        ctes: CteCtx,
+        meter: &mut Meter,
+    ) -> Result<Vec<Row>> {
+        let rel = &plan.rels[ri];
+        let env = EvalEnv {
+            exec: self,
+            params,
+            outer,
+            rng,
+            ctes,
+        };
+        // A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
+        // charging generated_row per element (its args read `outer` — implicitly lateral, §44).
+        if let Some(srf) = &rel.srf {
+            return match srf.kind {
+                SrfKind::GenerateSeries => self.generate_series_rows(srf, &env, meter),
+                SrfKind::Unnest => self.unnest_rows(srf, &env, meter),
+            };
+        }
+        // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
+        // MATERIALIZED CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts
+        // 54P01); an INLINE CTE runs its body in place. (A CTE is never lateral.)
+        if let Some(ci) = rel.cte {
+            let rows = match env.ctes.modes[ci] {
+                CteMode::Materialize => {
+                    let buf = &env.ctes.buffers[ci];
+                    for _ in buf {
+                        meter.guard()?;
+                        meter.charge(COSTS.cte_scan_row);
+                    }
+                    buf.clone()
+                }
+                CteMode::Inline => {
+                    let r = self.exec_query_plan(&env.ctes.plans[ci], outer, params, env.ctes)?;
+                    meter.charge(r.cost);
+                    r.rows
+                }
+            };
+            return Ok(rows);
+        }
+        // A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
+        // cte_scan_row. Non-lateral it was planned `parent = None` and ignores `outer`; a LATERAL
+        // body (§44) reads the left-hand row from `outer`.
+        if let Some(dp) = &rel.derived {
+            let r = self.exec_query_plan(dp, outer, params, env.ctes)?;
+            meter.charge(r.cost);
+            return Ok(r.rows);
+        }
+        // A base table: scan in primary-key order via a ScanSource (the page_read block + per-row
+        // storage_row_read accrue inside next() — cost.md §3). A PK/index bound seeks/ranges instead
+        // of a full walk; an empty bound reads nothing.
+        let store = self.store(&rel.table_name);
+        let (mut rows, (node_count, slabs)) = match &plan.rel_bounds[ri] {
+            Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer) {
+                Some(b) => {
+                    let (entries, pages, slabs) =
+                        store.range_scan_with_units(&b, &plan.rel_masks[ri])?;
+                    let rows = entries.into_iter().map(|(_, v)| v).collect();
+                    (rows, (pages, slabs))
+                }
+                None => (Vec::new(), (0, 0)),
+            },
+            Some(ScanBound::Index(ib)) => {
+                self.index_bound_rows(&rel.table_name, ib, params, outer, &plan.rel_masks[ri])?
+            }
+            None => {
+                let (entries, pages, slabs) = store.scan_with_units(&plan.rel_masks[ri])?;
+                let rows = entries.into_iter().map(|(_, v)| v).collect();
+                (rows, (pages, slabs))
+            }
+        };
+        // Materialize this relation's touched columns where the lazy load left unfetched references
+        // (large-values.md §14) — exactly the static set the cost block charges.
+        for row in &mut rows {
+            store.resolve_columns(row, &plan.rel_masks[ri])?;
+        }
+        meter.charge(COSTS.value_decompress * slabs as i64);
+        let mut src = ScanSource::new(rows, node_count as i64);
+        let mut table_rows: Vec<Row> = Vec::new();
+        while let Some(row) = src.next(meter)? {
+            table_rows.push(row);
+        }
+        Ok(table_rows)
+    }
+
     /// Execute a resolved SELECT against an outer-row environment (`outer` = the enclosing
     /// rows, innermost last; empty at top level) and the bound parameters. The execute half of
     /// the old `run_select`: materialize, nested-loop join, WHERE, then aggregate / DISTINCT /
@@ -4780,96 +4929,21 @@ impl Database {
             return self.exec_streaming_sort(plan, &env, &mut meter, params);
         }
 
-        // Materialize each base table once, in primary-key order, by draining a ScanSource (the
-        // page_read block + per-row storage_row_read accrue inside next() — spec/design/cost.md §3
-        // "page_read"/JOIN). The nested loop re-reads from these in-memory buffers, which are not
-        // stores and charge nothing.
+        // Materialize each relation once, in primary-key order (base tables drain a ScanSource — the
+        // page_read block + per-row storage_row_read accrue inside next(), cost.md §3). The nested
+        // loop re-reads from these in-memory buffers, which are not stores and charge nothing. A
+        // CORRELATED `LATERAL` relation (§44) depends on the left-hand row, so it cannot be
+        // materialized up front — a placeholder holds its slot and the join loop re-materializes it
+        // per combined left row.
         let mut materialized: Vec<Vec<Row>> = Vec::with_capacity(plan.rels.len());
         for (ri, rel) in plan.rels.iter().enumerate() {
-            // A set-returning relation is generated, not scanned (functions.md §10): produce its
-            // rows (charging generated_row per element) and feed them into the same join pipeline.
-            if let Some(srf) = &rel.srf {
-                let table_rows = match srf.kind {
-                    SrfKind::GenerateSeries => self.generate_series_rows(srf, &env, &mut meter)?,
-                    SrfKind::Unnest => self.unnest_rows(srf, &env, &mut meter)?,
-                };
-                materialized.push(table_rows);
+            if rel.lateral {
+                materialized.push(Vec::new());
                 continue;
             }
-            // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
-            // MATERIALIZED CTE reads its buffer, charging cte_scan_row per row (guarded so a runaway
-            // scan still aborts 54P01); an INLINE CTE runs its body in place (re-evaluating per
-            // outer row under correlation), charging the body's intrinsic cost into this meter.
-            if let Some(ci) = rel.cte {
-                let rows = match env.ctes.modes[ci] {
-                    CteMode::Materialize => {
-                        let buf = &env.ctes.buffers[ci];
-                        for _ in buf {
-                            meter.guard()?;
-                            meter.charge(COSTS.cte_scan_row);
-                        }
-                        buf.clone()
-                    }
-                    CteMode::Inline => {
-                        // The body is an independent query (parent = None at plan time), so it reads
-                        // no outer row; it may reference an EARLIER CTE, so pass the same context.
-                        let r = self.exec_query_plan(&env.ctes.plans[ci], &[], params, env.ctes)?;
-                        meter.charge(r.cost);
-                        r.rows
-                    }
-                };
-                materialized.push(rows);
-                continue;
-            }
-            // A DERIVED TABLE runs its body in place (grammar.md §42): the inline path, exactly like
-            // a single-reference CTE. The body was planned `parent = None`, so it reads no outer row
-            // (`&[]`); it may reference a statement CTE, so it gets the same context. Its intrinsic
-            // cost accrues into this meter — no cte_scan_row.
-            if let Some(dp) = &rel.derived {
-                let r = self.exec_query_plan(dp, &[], params, env.ctes)?;
-                meter.charge(r.cost);
-                materialized.push(r.rows);
-                continue;
-            }
-            let store = self.store(&rel.table_name);
-            // Each base table's own scan bound (if any) seeks/ranges instead of walking the
-            // whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing.
-            // An index bound fetches via the index tree + per-row point lookups (cost.md §3
-            // "index-bounded scan"). Otherwise the full scan is unchanged.
-            let (mut rows, (node_count, slabs)) = match &plan.rel_bounds[ri] {
-                Some(ScanBound::Pk(bp)) => match build_key_bound(bp, params, outer) {
-                    Some(b) => {
-                        let (entries, pages, slabs) =
-                            store.range_scan_with_units(&b, &plan.rel_masks[ri])?;
-                        let rows = entries.into_iter().map(|(_, v)| v).collect();
-                        (rows, (pages, slabs))
-                    }
-                    None => (Vec::new(), (0, 0)),
-                },
-                Some(ScanBound::Index(ib)) => {
-                    self.index_bound_rows(&rel.table_name, ib, params, outer, &plan.rel_masks[ri])?
-                }
-                None => {
-                    let (entries, pages, slabs) = store.scan_with_units(&plan.rel_masks[ri])?;
-                    let rows = entries.into_iter().map(|(_, v)| v).collect();
-                    (rows, (pages, slabs))
-                }
-            };
-            // Materialize this relation's touched columns where the lazy load left unfetched
-            // references (large-values.md §14) — exactly the static set the cost block charges,
-            // so the physical chain reads/decompressions match the metered units.
-            for row in &mut rows {
-                store.resolve_columns(row, &plan.rel_masks[ri])?;
-            }
-            // The decompress slabs join the same up-front block as the page_read the
-            // ScanSource charges on its first next() (cost.md §3 "the compression units").
-            meter.charge(COSTS.value_decompress * slabs as i64);
-            let mut src = ScanSource::new(rows, node_count as i64);
-            let mut table_rows: Vec<Row> = Vec::new();
-            while let Some(row) = src.next(&mut meter)? {
-                table_rows.push(row);
-            }
-            materialized.push(table_rows);
+            materialized.push(
+                self.materialize_rel(plan, ri, params, outer, &stmt_rng, env.ctes, &mut meter)?,
+            );
         }
 
         // Left-deep nested-loop join. `running` holds the combined rows over the relations
@@ -4890,7 +4964,6 @@ impl Database {
             std::mem::take(&mut materialized[0])
         };
         for (k, pj) in plan.joins.iter().enumerate() {
-            let right_rows = &materialized[k + 1];
             let on = &pj.on;
             let emit_left = matches!(pj.kind, JoinKind::Left | JoinKind::Full);
             let emit_right = matches!(pj.kind, JoinKind::Right | JoinKind::Full);
@@ -4900,6 +4973,46 @@ impl Database {
             let left_pad = plan.rels[k + 1].offset;
             let right_pad = plan.rels[k + 1].col_count;
             let mut next: Vec<Row> = Vec::new();
+            // A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row,
+            // with that row pushed onto the outer-row stack as the body's immediate outer (the
+            // correlated-subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL
+            // to a correlated lateral is 42P10), so there is no unmatched-right emission.
+            if plan.rels[k + 1].lateral {
+                for left in &running {
+                    let mut lat_outer: Vec<&[Value]> = outer.to_vec();
+                    lat_outer.push(left);
+                    let right_rows = self.materialize_rel(
+                        plan,
+                        k + 1,
+                        params,
+                        &lat_outer,
+                        &stmt_rng,
+                        env.ctes,
+                        &mut meter,
+                    )?;
+                    let mut left_matched = false;
+                    for right in &right_rows {
+                        let mut combined = left.clone();
+                        combined.extend_from_slice(right);
+                        let keep = match on {
+                            None => true,
+                            Some(pred) => pred.eval(&combined, &env, &mut meter)?.is_true(),
+                        };
+                        if keep {
+                            next.push(combined);
+                            left_matched = true;
+                        }
+                    }
+                    if emit_left && !left_matched {
+                        let mut combined = left.clone();
+                        combined.resize(combined.len() + right_pad, Value::Null);
+                        next.push(combined);
+                    }
+                }
+                running = next;
+                continue;
+            }
+            let right_rows = &materialized[k + 1];
             let mut right_matched = vec![false; right_rows.len()];
             for left in &running {
                 let mut left_matched = false;
@@ -5584,6 +5697,71 @@ struct ScopeRel<'a> {
     /// base table — its `table` is the binding's synthetic relation and exec delivers its rows from
     /// the `CteCtx`. `None` for a base table / SRF / pseudo-relation.
     cte: Option<usize>,
+}
+
+/// Where a finalized FROM relation's `&Table` comes from, recorded during the LATERAL-aware FROM
+/// build (spec/design/grammar.md §44). A base table / CTE binding has a stable catalog address
+/// (`&Table`); a synthetic relation (derived table / SRF) is recorded by INDEX into the local
+/// `synthetic` vec — never a borrow — so a record can outlive a later push into that vec, which is
+/// what lets a LATERAL item resolve against the earlier synthetic tables while later ones grow.
+#[derive(Clone, Copy)]
+enum RelSrc<'a> {
+    Base(&'a Table),
+    Cte(&'a Table, usize),
+    Synthetic(usize),
+}
+
+/// A FROM relation finalized during the §44 LATERAL-aware build: its label, flat column offset, and
+/// table source. Held in FROM order so the prefix `parent` scope a later LATERAL item resolves
+/// against (the relations to its left) can be rebuilt, and the persistent scope assembled afterward.
+struct FinalRel<'a> {
+    label: String,
+    offset: usize,
+    src: RelSrc<'a>,
+}
+
+impl<'a> FinalRel<'a> {
+    /// The relation's `&Table` — a borrowed catalog table, or a deref into the synthetic-table vec.
+    fn table<'s>(&'s self, synthetic: &'s [Box<Table>]) -> &'s Table
+    where
+        'a: 's,
+    {
+        match self.src {
+            RelSrc::Base(t) | RelSrc::Cte(t, _) => t,
+            RelSrc::Synthetic(idx) => &synthetic[idx],
+        }
+    }
+}
+
+/// Build the temporary `parent` scope a LATERAL item resolves against (spec/design/grammar.md §44):
+/// the relations to its left, chained to the enclosing query's `parent` so a sibling column resolves
+/// as `Outer{level=1}` and an enclosing-query column as a deeper hop. The returned scope borrows
+/// `synthetic`; it is dropped before the next push, so it never blocks the build's growth.
+fn build_prefix_scope<'s>(
+    finalized: &'s [FinalRel<'s>],
+    synthetic: &'s [Box<Table>],
+    parent: Option<&'s Scope<'s>>,
+    catalog: &'s Database,
+    ctes: &'s [CteBinding],
+) -> Scope<'s> {
+    Scope {
+        rels: finalized
+            .iter()
+            .map(|fr| ScopeRel {
+                label: fr.label.clone(),
+                table: fr.table(synthetic),
+                offset: fr.offset,
+                qualifier_only: false,
+                // The prefix is only for column resolution; a correlated reference into a CTE-backed
+                // relation reads its already-delivered row, so it adds no CTE reference here.
+                cte: None,
+            })
+            .collect(),
+        parent,
+        catalog,
+        allow_subquery: true,
+        ctes,
+    }
 }
 
 /// A planned common table expression, owned by `plan_with` for the whole statement (so the scopes
@@ -6426,9 +6604,15 @@ struct PlanRel {
     /// When `Some(plan)`, this relation is a DERIVED TABLE — `FROM (SELECT …) AS t`
     /// (spec/design/grammar.md §42): a parenthesized subquery used as a relation, mechanically an
     /// anonymous always-inlined single-reference CTE. `table_name` is the alias (never looked up in
-    /// the store); the executor runs `plan` in place (it was planned `parent = None`, so it reads no
-    /// outer row), charging its intrinsic cost — no `cte_scan_row`.
+    /// the store); the executor runs `plan` in place, charging its intrinsic cost — no `cte_scan_row`.
+    /// Non-lateral (`lateral = false`) it reads no outer row; a lateral one reads the left-hand row.
     derived: Option<Box<QueryPlan>>,
+    /// When true, this relation is a CORRELATED `LATERAL` item (spec/design/grammar.md §44): its
+    /// derived body / SRF args reference an earlier sibling (or an enclosing query), so the executor
+    /// re-materializes it ONCE PER combined left-hand row (with that row pushed as its immediate outer
+    /// — the correlated-subquery mechanism), rather than materializing it once. Always `false` for the
+    /// first relation. Only a `srf` or `derived` relation is ever lateral.
+    lateral: bool,
 }
 
 /// How a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE from its
@@ -7837,14 +8021,21 @@ fn select_plan_references_outer(sp: &SelectPlan, depth: usize) -> bool {
             .projections
             .iter()
             .any(|p| rexpr_references_outer(p, depth))
-        // A set-returning relation's arguments may carry a correlated reference (non-LATERAL: an
-        // SRF arg sees params/outer — functions.md §10), which makes the enclosing subquery
-        // correlated, so it must NOT be folded once.
+        // A set-returning relation's arguments may carry a correlated reference (an implicitly-
+        // lateral SRF arg sees params / outer / an earlier sibling — functions.md §10, grammar.md
+        // §44), which makes the enclosing query correlated, so it must NOT be folded once.
         || sp.rels.iter().any(|r| {
             r.srf
                 .as_ref()
                 .is_some_and(|srf| srf.args.iter().any(|a| rexpr_references_outer(a, depth)))
         })
+        // A LATERAL derived table's body is one frame deeper; a reference in it back into this
+        // query's outer (e.g. a nested lateral reaching a grandparent relation) counts here so the
+        // enclosing item is correctly flagged correlated (spec/design/grammar.md §44).
+        || sp
+            .rels
+            .iter()
+            .any(|r| r.derived.as_ref().is_some_and(|d| query_plan_references_outer(d, depth + 1)))
 }
 
 fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {

@@ -3544,12 +3544,13 @@ func (db *Database) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value, 
 // its column's unified type (so VALUES (1),($1) types $1 as int); a column with no concrete type —
 // all NULL/param — leaves its $N untyped, surfacing 42P18 at finalize (jed's no-cross-context
 // inference posture, §26).
-func (db *Database) planValues(rows [][]*Expr, ctes []*cteBinding, ptypes *paramTypes) (*valuesPlan, error) {
+func (db *Database) planValues(rows [][]*Expr, parent *scope, ctes []*cteBinding, ptypes *paramTypes) (*valuesPlan, error) {
 	arity := len(rows[0]) // the parser guarantees at least one row, each with at least one value
-	// The non-LATERAL constant scope: no local relations and no parent, so any column reference
-	// (outer, sibling, or the body's own) is unresolved; CTE bindings stay visible and subqueries
-	// are allowed (an uncorrelated one folds before the rows run).
-	s := &scope{parent: nil, catalog: db, allowSubquery: true, ctes: ctes}
+	// A constant scope: no local relations. With parent==nil (the usual case) any column reference is
+	// unresolved (the non-LATERAL rule, §42); with a parent (a LATERAL VALUES body, §44) a column
+	// reference correlates to the earlier FROM relations instead. CTE bindings stay visible and
+	// subqueries are allowed (an uncorrelated one folds before the rows run).
+	s := &scope{parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
 	resolvedRows := make([][]*rExpr, len(rows))
 	colTypes := make([]resolvedType, arity)
 	// Per column: the 0-based bind-parameter slots appearing in it, typed in a second pass from the
@@ -3898,39 +3899,58 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	for _, j := range sel.Joins {
 		tableRefs = append(tableRefs, j.Table)
 	}
-	// A FROM item is either a base table or a set-returning function (generate_series —
-	// grammar.md §35). An SRF has no catalog table, so its relation borrows a SYNTHETIC
-	// one-column table; its args resolve against an EMPTY-local-rels scope whose parent is the
-	// enclosing query (non-LATERAL: a $N/outer reference works, a sibling FROM table does not).
+	// A FROM item is a base table, a set-returning function (grammar.md §35), or a derived table
+	// (§42). For a LATERAL item (§44) the body / SRF args resolve against the PREFIX of relations to
+	// its left (a dependent join), so the build runs in FROM order and a prefix scope over the
+	// already-resolved rels is handed to the body.
 	var rels []scopeRel
 	srfPlans := make([]*srfPlan, len(tableRefs))       // aligned with rels; nil = a base table
 	derivedPlans := make([]*queryPlan, len(tableRefs)) // aligned with rels; non-nil = a derived table
+	// lateralFlags[i] is true when FROM item i is a CORRELATED lateral relation (§44) — its body /
+	// SRF args reference an earlier sibling (or an enclosing query), so the executor re-materializes
+	// it per combined left-hand row. A non-correlated item (or the first item) is materialized once.
+	lateralFlags := make([]bool, len(tableRefs))
 	seenLabels := make(map[string]bool)
 	offset := 0
 	for i, tref := range tableRefs {
 		var t *Table
 		var cteIdx *int
-		if tref.Subquery != nil || tref.Values != nil {
-			// A DERIVED TABLE — `FROM (SELECT …) [AS] t` (a query_expr body) or `FROM (VALUES …) [AS]
-			// v` (a VALUES-body relation — §42). Plan the body as an INDEPENDENT query (parent=nil:
-			// not correlated / not LATERAL — §42) that still inherits the statement's CTE bindings
-			// (cte.md §2), build its synthetic relation (the alias is the label; the optional
-			// column-rename list applies, 42P10 on overflow), and keep the plan for in-place
-			// execution.
+		isDerived := tref.Subquery != nil || tref.Values != nil
+		// A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table / VALUES
+		// body explicitly marked LATERAL, or ANY table function (implicitly lateral — §44). The first
+		// item (i == 0) has no earlier sibling, so it is never lateral; an SRF there resolves against
+		// `parent` (the enclosing query) exactly as before.
+		lateralEligible := i > 0 && ((isDerived && tref.Lateral) || tref.IsFunc)
+		// The prefix scope a LATERAL item resolves against: the relations to its left, chained to the
+		// enclosing query's parent (so a sibling column correlates as Outer{level=1}, an enclosing one
+		// deeper). nil when not lateral-eligible.
+		var lateralParent *scope
+		if lateralEligible {
+			lateralParent = &scope{rels: rels, parent: parent, catalog: db, allowSubquery: true, ctes: ctes}
+		}
+		if isDerived {
+			// Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
+			// otherwise an INDEPENDENT query (parent=nil, §42). A LATERAL VALUES body resolves its
+			// values against the prefix too (a column ref then correlates instead of 42703).
+			bodyParent := (*scope)(nil)
+			if lateralEligible {
+				bodyParent = lateralParent
+			}
 			var plan queryPlan
 			if tref.Subquery != nil {
-				p, perr := db.planQuery(*tref.Subquery, nil, ctes, ptypes)
+				p, perr := db.planQuery(*tref.Subquery, bodyParent, ctes, ptypes)
 				if perr != nil {
 					return nil, perr
 				}
 				plan = p
 			} else {
-				vp, verr := db.planValues(tref.Values, ctes, ptypes)
+				vp, verr := db.planValues(tref.Values, bodyParent, ctes, ptypes)
 				if verr != nil {
 					return nil, verr
 				}
 				plan = queryPlan{values: vp}
 			}
+			lateralFlags[i] = lateralEligible && queryPlanReferencesOuter(&plan, 0)
 			label := ""
 			if tref.Alias != nil {
 				label = strings.ToLower(*tref.Alias)
@@ -3942,12 +3962,27 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			t = tbl
 			derivedPlans[i] = &plan
 		} else if tref.IsFunc {
-			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, parent, ctes, ptypes)
+			// A table function (SRF) — implicitly lateral. At i>0 its args resolve against the prefix
+			// scope (a sibling column then correlates); at i==0 against `parent` (the enclosing query
+			// / params), unchanged (functions.md §10).
+			srfParent := parent
+			if lateralEligible {
+				srfParent = lateralParent
+			}
+			tbl, sp, serr := db.resolveSRF(tref.Name, tref.Args, tref.Alias, srfParent, ctes, ptypes)
 			if serr != nil {
 				return nil, serr
 			}
 			t = tbl
 			srfPlans[i] = sp
+			if lateralEligible {
+				for _, a := range sp.args {
+					if rexprReferencesOuter(a, 0) {
+						lateralFlags[i] = true
+						break
+					}
+				}
+			}
 		} else {
 			// A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog
 			// table of the same name (cte.md §2); lookup is case-insensitive. A hit bumps the
@@ -3972,6 +4007,12 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 				}
 				t = tbl
 			}
+		}
+		// RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be both
+		// kept whole and evaluated per left row. (i ≥ 1 here, so the item carries a join kind.)
+		if lateralFlags[i] && (sel.Joins[i-1].Kind == JoinRight || sel.Joins[i-1].Kind == JoinFull) {
+			return nil, NewError(InvalidColumnReference,
+				"invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT")
 		}
 		label := strings.ToLower(t.Name)
 		if tref.Alias != nil {
@@ -4161,7 +4202,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// plan outlives the scope and a correlated subquery can re-execute it per row).
 	planRels := make([]planRel, len(s.rels))
 	for i, rel := range s.rels {
-		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i], cte: rel.cte, derived: derivedPlans[i]}
+		planRels[i] = planRel{tableName: rel.table.Name, offset: rel.offset, colCount: len(rel.table.Columns), srf: srfPlans[i], cte: rel.cte, derived: derivedPlans[i], lateral: lateralFlags[i]}
 	}
 	// The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
 	// columns this query statically references, collected depth-aware so a correlated
@@ -5073,6 +5114,123 @@ func rowsFromValues(in [][]Value) []Row {
 	return out
 }
 
+// materializeRel materializes one FROM relation ri into its rows, given the current outer-row stack
+// `outer` (spec/design/grammar.md §15/§44). A base table is scanned (a PK/index bound may seek via
+// outer); an SRF is generated; a CTE / derived table is delivered / run in place. For a CORRELATED
+// LATERAL relation (§44) the caller passes outer EXTENDED with the combined left-hand row, so the
+// body / SRF args read that row as their immediate outer; a non-lateral relation is passed the
+// query's own outer and its parent=nil body simply ignores it (a parent=nil plan holds no
+// outerColumn, so the two are observably identical).
+func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, outer []Row, rng *StmtRng, ctes cteCtx, meter *Meter) ([]Row, error) {
+	rel := plan.rels[ri]
+	env := &evalEnv{exec: db, params: params, outer: outer, rng: rng, ctes: ctes}
+	// A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
+	// charging generated_row per element (its args read outer — implicitly lateral, §44).
+	if rel.srf != nil {
+		switch rel.srf.kind {
+		case srfGenerateSeries:
+			return db.generateSeriesRows(rel.srf, env, meter)
+		case srfUnnest:
+			return db.unnestRows(rel.srf, env, meter)
+		}
+		return nil, nil
+	}
+	// A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a MATERIALIZED
+	// CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts 54P01); an INLINE
+	// CTE runs its body in place. (A CTE is never lateral.)
+	if rel.cte != nil {
+		ci := *rel.cte
+		switch env.ctes.modes[ci] {
+		case cteMaterialize:
+			buf := env.ctes.buffers[ci]
+			for range buf {
+				if err := meter.Guard(); err != nil {
+					return nil, err
+				}
+				meter.Charge(Costs.CteScanRow)
+			}
+			return append([]Row(nil), buf...), nil
+		case cteInline:
+			cplan := env.ctes.plans[ci]
+			r, err := db.execQueryPlan(&cplan, outer, params, env.ctes)
+			if err != nil {
+				return nil, err
+			}
+			meter.Charge(r.cost)
+			return rowsFromValues(r.rows), nil
+		}
+		return nil, nil
+	}
+	// A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
+	// cte_scan_row. Non-lateral it was planned parent=nil and ignores outer; a LATERAL body (§44)
+	// reads the left-hand row from outer.
+	if rel.derived != nil {
+		r, err := db.execQueryPlan(rel.derived, outer, params, env.ctes)
+		if err != nil {
+			return nil, err
+		}
+		meter.Charge(r.cost)
+		return rowsFromValues(r.rows), nil
+	}
+	// A base table: scan in primary-key order via a scanSource (the page_read block + per-row
+	// storage_row_read accrue inside next() — cost.md §3). A PK/index bound seeks/ranges instead of a
+	// full walk; an empty bound reads nothing.
+	store := db.readSnap().store(rel.tableName)
+	var rows []Row
+	var nodeCount, slabs int
+	if sb := plan.relBounds[ri]; sb != nil && sb.index != nil {
+		var err error
+		if rows, nodeCount, slabs, err = db.indexBoundRows(rel.tableName, sb.index, params, outer, plan.relMasks[ri]); err != nil {
+			return nil, err
+		}
+	} else if sb != nil {
+		b, empty := db.buildKeyBound(sb.pk, params, outer)
+		if !empty {
+			entries, pages, sl, err := store.RangeScanWithUnits(b, plan.relMasks[ri])
+			if err != nil {
+				return nil, err
+			}
+			rows = make([]Row, len(entries))
+			for i := range entries {
+				rows[i] = entries[i].Row
+			}
+			nodeCount, slabs = pages, sl
+		}
+	} else {
+		entries, pages, sl, err := store.ScanWithUnits(plan.relMasks[ri])
+		if err != nil {
+			return nil, err
+		}
+		rows = make([]Row, len(entries))
+		for i := range entries {
+			rows[i] = entries[i].Row
+		}
+		nodeCount, slabs = pages, sl
+	}
+	// Materialize this relation's touched columns where the lazy load left unfetched references
+	// (large-values.md §14) — exactly the static set the cost block charges.
+	for i := range rows {
+		var err error
+		if rows[i], err = store.resolveColumns(rows[i], plan.relMasks[ri]); err != nil {
+			return nil, err
+		}
+	}
+	meter.Charge(Costs.ValueDecompress * int64(slabs))
+	src := &scanSource{rows: rows, nodeCount: nodeCount}
+	var tableRows []Row
+	for {
+		row, ok, err := src.next(env, meter)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			break
+		}
+		tableRows = append(tableRows, row)
+	}
+	return tableRows, nil
+}
+
 func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
 	meter := NewMeterWithLimit(db.maxCost)
@@ -5116,134 +5274,21 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		return db.execStreamingSort(plan, env, meter, params)
 	}
 
-	// Materialize each base table once, in primary-key order, by draining a scanSource (the
-	// page_read block + per-row storage_row_read accrue inside next() — spec/design/cost.md §3
-	// "page_read"/JOIN). The nested loop re-reads from these in-memory buffers, which are not
-	// stores and charge nothing.
+	// Materialize each relation once, in primary-key order (base tables drain a scanSource — the
+	// page_read block + per-row storage_row_read accrue inside next(), cost.md §3). The nested loop
+	// re-reads from these in-memory buffers, which are not stores and charge nothing. A CORRELATED
+	// LATERAL relation (§44) depends on the left-hand row, so it cannot be materialized up front — a
+	// placeholder (nil) holds its slot and the join loop re-materializes it per combined left row.
 	materialized := make([][]Row, len(plan.rels))
 	for ri, rel := range plan.rels {
-		// A set-returning relation is generated, not scanned (functions.md §10): produce its rows
-		// (charging generated_row per element) and feed them into the same join pipeline.
-		if rel.srf != nil {
-			var tableRows []Row
-			var err error
-			switch rel.srf.kind {
-			case srfGenerateSeries:
-				tableRows, err = db.generateSeriesRows(rel.srf, env, meter)
-			case srfUnnest:
-				tableRows, err = db.unnestRows(rel.srf, env, meter)
-			}
-			if err != nil {
-				return selectResult{}, err
-			}
-			materialized[ri] = tableRows
+		if rel.lateral {
 			continue
 		}
-		// A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
-		// MATERIALIZED CTE reads its buffer, charging cte_scan_row per row (guarded so a runaway
-		// scan still aborts 54P01); an INLINE CTE runs its body in place (re-evaluating per outer
-		// row under correlation), charging the body's intrinsic cost into this meter.
-		if rel.cte != nil {
-			ci := *rel.cte
-			var rows []Row
-			switch env.ctes.modes[ci] {
-			case cteMaterialize:
-				buf := env.ctes.buffers[ci]
-				for range buf {
-					if err := meter.Guard(); err != nil {
-						return selectResult{}, err
-					}
-					meter.Charge(Costs.CteScanRow)
-				}
-				rows = append([]Row(nil), buf...)
-			case cteInline:
-				// The body is an independent query (parent = nil at plan time), so it reads no
-				// outer row; it may reference an EARLIER CTE, so pass the same context.
-				cplan := env.ctes.plans[ci]
-				r, err := db.execQueryPlan(&cplan, nil, params, env.ctes)
-				if err != nil {
-					return selectResult{}, err
-				}
-				meter.Charge(r.cost)
-				rows = rowsFromValues(r.rows)
-			}
-			materialized[ri] = rows
-			continue
+		rows, err := db.materializeRel(plan, ri, params, outer, env.rng, env.ctes, meter)
+		if err != nil {
+			return selectResult{}, err
 		}
-		// A DERIVED TABLE runs its body in place (grammar.md §42): the inline path, exactly like a
-		// single-reference CTE. The body was planned parent=nil, so it reads no outer row (nil); it
-		// may reference a statement CTE, so it gets the same context. Its intrinsic cost accrues into
-		// this meter — no cte_scan_row.
-		if rel.derived != nil {
-			r, err := db.execQueryPlan(rel.derived, nil, params, env.ctes)
-			if err != nil {
-				return selectResult{}, err
-			}
-			meter.Charge(r.cost)
-			materialized[ri] = rowsFromValues(r.rows)
-			continue
-		}
-		store := db.readSnap().store(rel.tableName)
-		// Each base table's own scan bound (if any) seeks/ranges instead of walking the whole
-		// B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing. An index
-		// bound fetches via the index tree + per-row point lookups (cost.md §3 "index-bounded
-		// scan"). Otherwise the full scan is unchanged.
-		var rows []Row
-		var nodeCount, slabs int
-		if sb := plan.relBounds[ri]; sb != nil && sb.index != nil {
-			var err error
-			if rows, nodeCount, slabs, err = db.indexBoundRows(rel.tableName, sb.index, params, outer, plan.relMasks[ri]); err != nil {
-				return selectResult{}, err
-			}
-		} else if sb != nil {
-			b, empty := db.buildKeyBound(sb.pk, params, outer)
-			if !empty {
-				entries, pages, sl, err := store.RangeScanWithUnits(b, plan.relMasks[ri])
-				if err != nil {
-					return selectResult{}, err
-				}
-				rows = make([]Row, len(entries))
-				for i := range entries {
-					rows[i] = entries[i].Row
-				}
-				nodeCount, slabs = pages, sl
-			}
-		} else {
-			entries, pages, sl, err := store.ScanWithUnits(plan.relMasks[ri])
-			if err != nil {
-				return selectResult{}, err
-			}
-			rows = make([]Row, len(entries))
-			for i := range entries {
-				rows[i] = entries[i].Row
-			}
-			nodeCount, slabs = pages, sl
-		}
-		// Materialize this relation's touched columns where the lazy load left unfetched
-		// references (large-values.md §14) — exactly the static set the cost block charges,
-		// so the physical chain reads/decompressions match the metered units.
-		for i := range rows {
-			var err error
-			if rows[i], err = store.resolveColumns(rows[i], plan.relMasks[ri]); err != nil {
-				return selectResult{}, err
-			}
-		}
-		// The decompress slabs join the same up-front block as the page_read the scanSource
-		// charges on its first next() (cost.md §3 "the compression units").
-		meter.Charge(Costs.ValueDecompress * int64(slabs))
-		src := &scanSource{rows: rows, nodeCount: nodeCount}
-		var tableRows []Row
-		for {
-			row, ok, err := src.next(env, meter)
-			if err != nil {
-				return selectResult{}, err
-			}
-			if !ok {
-				break
-			}
-			tableRows = append(tableRows, row)
-		}
-		materialized[ri] = tableRows
+		materialized[ri] = rows
 	}
 
 	// Left-deep nested-loop join. `running` holds the combined rows over the relations joined
@@ -5262,7 +5307,6 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		running = materialized[0]
 	}
 	for k := range plan.joins {
-		rightRows := materialized[k+1]
 		on := plan.joins[k].on
 		emitLeft := plan.joins[k].kind == JoinLeft || plan.joins[k].kind == JoinFull
 		emitRight := plan.joins[k].kind == JoinRight || plan.joins[k].kind == JoinFull
@@ -5272,6 +5316,50 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		leftPad := plan.rels[k+1].offset
 		rightPad := plan.rels[k+1].colCount
 		var next []Row
+		// A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row, with
+		// that row pushed onto the outer-row stack as the body's immediate outer (the correlated-
+		// subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL to a correlated
+		// lateral is 42P10), so there is no unmatched-right emission.
+		if plan.rels[k+1].lateral {
+			for _, left := range running {
+				latOuter := make([]Row, len(outer)+1)
+				copy(latOuter, outer)
+				latOuter[len(outer)] = left
+				rightRows, err := db.materializeRel(plan, k+1, params, latOuter, env.rng, env.ctes, meter)
+				if err != nil {
+					return selectResult{}, err
+				}
+				leftMatched := false
+				for _, right := range rightRows {
+					combined := make(Row, 0, len(left)+len(right))
+					combined = append(combined, left...)
+					combined = append(combined, right...)
+					keep := true
+					if on != nil {
+						v, err := on.eval(combined, env, meter)
+						if err != nil {
+							return selectResult{}, err
+						}
+						keep = v.IsTrue()
+					}
+					if keep {
+						next = append(next, combined)
+						leftMatched = true
+					}
+				}
+				if emitLeft && !leftMatched {
+					combined := make(Row, 0, len(left)+rightPad)
+					combined = append(combined, left...)
+					for i := 0; i < rightPad; i++ {
+						combined = append(combined, NullValue())
+					}
+					next = append(next, combined)
+				}
+			}
+			running = next
+			continue
+		}
+		rightRows := materialized[k+1]
 		rightMatched := make([]bool, len(rightRows))
 		for _, left := range running {
 			leftMatched := false
@@ -5765,8 +5853,9 @@ func selectPlanReferencesOuter(sp *selectPlan, depth int) bool {
 			return true
 		}
 	}
-	// A set-returning relation's arguments may carry a correlated reference (non-LATERAL: an SRF
-	// arg sees params/outer — functions.md §10), making the enclosing subquery correlated.
+	// A set-returning relation's arguments may carry a correlated reference (an implicitly-lateral
+	// SRF arg sees params / outer / an earlier sibling — functions.md §10, grammar.md §44), making
+	// the enclosing query correlated.
 	for i := range sp.rels {
 		if sp.rels[i].srf != nil {
 			for _, a := range sp.rels[i].srf.args {
@@ -5774,6 +5863,11 @@ func selectPlanReferencesOuter(sp *selectPlan, depth int) bool {
 					return true
 				}
 			}
+		}
+		// A LATERAL derived table's body is one frame deeper; a reference in it back into this
+		// query's outer counts here so the enclosing item is correctly flagged correlated (§44).
+		if sp.rels[i].derived != nil && queryPlanReferencesOuter(sp.rels[i].derived, depth+1) {
+			return true
 		}
 	}
 	return false
@@ -6792,9 +6886,15 @@ type planRel struct {
 	// derived is non-nil when this relation is a DERIVED TABLE — `FROM (SELECT …) [AS] t`
 	// (spec/design/grammar.md §42): a parenthesized subquery used as a relation, mechanically an
 	// anonymous always-inlined single-reference CTE. tableName is the alias (never looked up in the
-	// store); the executor runs this plan in place (it was planned parent=nil, so it reads no outer
-	// row), charging its intrinsic cost — no cte_scan_row.
+	// store); the executor runs this plan in place, charging its intrinsic cost — no cte_scan_row.
+	// Non-lateral it reads no outer row; a lateral one reads the left-hand row.
 	derived *queryPlan
+	// lateral is true when this relation is a CORRELATED LATERAL item (spec/design/grammar.md §44):
+	// its derived body / SRF args reference an earlier sibling (or an enclosing query), so the
+	// executor re-materializes it ONCE PER combined left-hand row (with that row pushed as its
+	// immediate outer — the correlated-subquery mechanism), rather than materializing it once. Always
+	// false for the first relation. Only a srf or derived relation is ever lateral.
+	lateral bool
 }
 
 // srfKind selects which set-returning function a srfPlan is, picking the row generator at exec

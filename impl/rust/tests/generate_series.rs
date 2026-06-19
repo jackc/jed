@@ -4,7 +4,7 @@
 //! generator's PostgreSQL edge cases (NULL → empty, step zero → 22023, descending step, the
 //! positive-default-step empty case, i64-overflow clean-stop), the synthetic-relation wiring
 //! (output column name/type, alias + qualified resolution, CROSS JOIN composition), the
-//! non-LATERAL rule ($N / correlated outer arg vs. a rejected sibling reference), the
+//! arg-scope rule ($N / correlated outer arg; an SRF is implicitly lateral so a sibling works), the
 //! generated_row cost contract + the max_cost ceiling, and the deferred-form errors.
 
 use jed::value::Value;
@@ -94,7 +94,7 @@ fn alias_forms_and_qualified_column() {
     );
 }
 
-// ---- non-LATERAL: $N / correlated outer arg work, a sibling reference does not --------------
+// ---- arg scope: $N / correlated outer arg work; a sibling works (implicitly lateral, §44) ----
 
 #[test]
 fn param_argument() {
@@ -112,19 +112,23 @@ fn param_argument() {
 }
 
 #[test]
-fn sibling_reference_is_rejected_non_lateral() {
+fn sibling_reference_works_implicitly_lateral() {
     let mut db = db_with(&[
         "CREATE TABLE t (id int32 PRIMARY KEY, n int32)",
         "INSERT INTO t VALUES (1, 3)",
     ]);
-    // A FROM-sibling reference inside the SRF args is NOT visible (no LATERAL) — undefined column.
-    assert_eq!(
-        err_code(
-            &mut db,
-            "SELECT * FROM t CROSS JOIN generate_series(1, t.n)"
-        ),
-        "42P01"
-    );
+    // A FROM-sibling reference inside the SRF args IS visible — an SRF is implicitly lateral
+    // (grammar.md §44; the rows are pinned by suites/joins/lateral.test). The prior non-LATERAL
+    // 42P01 rejection is lifted: generate_series(1, t.n) re-runs per t row (1 row, n=3 ⇒ 3 rows).
+    let out = execute(
+        &mut db,
+        "SELECT * FROM t CROSS JOIN generate_series(1, t.n)",
+    )
+    .unwrap();
+    match out {
+        Outcome::Query { rows, .. } => assert_eq!(rows.len(), 3),
+        other => panic!("expected a query result, got {other:?}"),
+    }
 }
 
 // ---- cost: generated_row accrual + the max_cost ceiling -------------------------------------

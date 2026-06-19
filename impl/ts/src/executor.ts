@@ -2916,12 +2916,13 @@ export class Database {
   // parameter is then noted at its column's unified type (so VALUES (1),($1) types $1 as int); a
   // column with no concrete type — all NULL/param — leaves its $N untyped, surfacing 42P18 at
   // finalize (jed's no-cross-context inference posture, §26).
-  private planValues(rows: Expr[][], ctes: CteBinding[], ptypes: ParamTypes): ValuesPlan {
+  private planValues(rows: Expr[][], parent: Scope | null, ctes: CteBinding[], ptypes: ParamTypes): ValuesPlan {
     const arity = rows[0]!.length; // the parser guarantees at least one row, each with ≥1 value
-    // The non-LATERAL constant scope: no local relations and no parent, so any column reference
-    // (outer, sibling, or the body's own) is unresolved; CTE bindings stay visible and subqueries
-    // are allowed (an uncorrelated one folds before the rows run).
-    const scope = new Scope([], this, null, true, ctes);
+    // A constant scope: no local relations. With parent===null (the usual case) any column reference
+    // is unresolved (the non-LATERAL rule, §42); with a parent (a LATERAL VALUES body, §44) a column
+    // reference correlates to the earlier FROM relations instead. CTE bindings stay visible and
+    // subqueries are allowed (an uncorrelated one folds before the rows run).
+    const scope = new Scope([], this, parent, true, ctes);
     const resolvedRows: RExpr[][] = [];
     const colTypes: ResolvedType[] = [];
     // Per column: the 0-based bind-parameter slots in it, typed in a second pass from the unified
@@ -3006,38 +3007,59 @@ export class Database {
     // through to `parent` (the correlated-subquery rule) or 42703 at top level
     // (spec/design/grammar.md §34). The scope links to `parent` (correlation) + the catalog
     // (so a subquery resolves its own FROM); allowSubquery is true.
-    // A FROM item is either a base table or a set-returning function (generate_series —
-    // grammar.md §35). An SRF has no catalog table, so its relation borrows a SYNTHETIC
-    // one-column table; its args resolve against an EMPTY-local-rels scope whose parent is the
-    // enclosing query (non-LATERAL: a $N/outer reference works, a sibling FROM table does not).
+    // A FROM item is a base table, a set-returning function (grammar.md §35), or a derived table
+    // (§42). For a LATERAL item (§44) the body / SRF args resolve against the PREFIX of relations to
+    // its left (a dependent join), so the build runs in FROM order and a prefix scope over the
+    // already-resolved rels is handed to the body.
     const tableRefs = sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
     const rels: ScopeRel[] = [];
     const srfPlans: (SrfPlan | undefined)[] = []; // aligned with rels; undefined = a base table
     const derivedPlans: (QueryPlan | undefined)[] = []; // aligned with rels; non-undefined = derived
+    // lateralFlags[i] is true when FROM item i is a CORRELATED lateral relation (§44) — its body /
+    // SRF args reference an earlier sibling (or an enclosing query), so the executor re-materializes
+    // it per combined left-hand row. A non-correlated item (or the first item) is materialized once.
+    const lateralFlags: boolean[] = [];
     const seenLabels = new Set<string>();
     let offset = 0;
-    for (const tref of tableRefs) {
+    for (let i = 0; i < tableRefs.length; i++) {
+      const tref = tableRefs[i]!;
       let t: Table;
       let srf: SrfPlan | undefined;
       let cteIdx: number | undefined;
       let derived: QueryPlan | undefined;
-      if (tref.subquery !== undefined || tref.values !== undefined) {
-        // A DERIVED TABLE — `FROM (SELECT …) [AS] t` (a query_expr body) or `FROM (VALUES …) [AS] v`
-        // (a VALUES-body relation — §42). Plan the body as an INDEPENDENT query (parent=null: not
-        // correlated / not LATERAL — §42) that still inherits the statement's CTE bindings (cte.md
-        // §2), build its synthetic relation (the alias is the label; the optional column-rename list
-        // applies, 42P10 on overflow), and keep the plan for in-place execution.
+      let lateral = false;
+      const isDerived = tref.subquery !== undefined || tref.values !== undefined;
+      // A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table / VALUES
+      // body explicitly marked LATERAL, or ANY table function (implicitly lateral — §44). The first
+      // item (i === 0) has no earlier sibling, so it is never lateral; an SRF there resolves against
+      // `parent` (the enclosing query) exactly as before.
+      const lateralEligible = i > 0 && ((isDerived && tref.lateral === true) || tref.args !== null);
+      // The prefix scope a LATERAL item resolves against: the relations to its left, chained to the
+      // enclosing query's parent (so a sibling column correlates as Outer{level=1}, an enclosing one
+      // deeper). null when not lateral-eligible.
+      const lateralParent = lateralEligible ? new Scope([...rels], this, parent, true, ctes) : null;
+      if (isDerived) {
+        // Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
+        // otherwise an INDEPENDENT query (parent=null, §42). A LATERAL VALUES body resolves its
+        // values against the prefix too (a column ref then correlates instead of 42703).
+        const bodyParent = lateralEligible ? lateralParent : null;
         const plan =
           tref.subquery !== undefined
-            ? this.planQuery(tref.subquery, null, ctes, ptypes)
-            : this.planValues(tref.values!, ctes, ptypes);
+            ? this.planQuery(tref.subquery, bodyParent, ctes, ptypes)
+            : this.planValues(tref.values!, bodyParent, ctes, ptypes);
+        lateral = lateralEligible && queryPlanReferencesOuter(plan, 0);
         const label = tref.alias === null ? "" : tref.alias.toLowerCase();
         t = cteSyntheticTable(label, plan, tref.columnAliases ?? null);
         derived = plan;
       } else if (tref.args !== null) {
-        const r = this.resolveSRF(tref.name, tref.args, tref.alias, parent, ctes, ptypes);
+        // A table function (SRF) — implicitly lateral. At i>0 its args resolve against the prefix
+        // scope (a sibling column then correlates); at i==0 against `parent` (the enclosing query /
+        // params), unchanged (functions.md §10).
+        const srfParent = lateralEligible ? lateralParent : parent;
+        const r = this.resolveSRF(tref.name, tref.args, tref.alias, srfParent, ctes, ptypes);
         t = r.table;
         srf = r.srf;
+        lateral = lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
       } else {
         // A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog table of
         // the same name (cte.md §2); lookup is case-insensitive. A hit bumps the binding's reference
@@ -3054,6 +3076,14 @@ export class Database {
           t = tbl;
         }
       }
+      // RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be both
+      // kept whole and evaluated per left row. (i ≥ 1 here, so the item carries a join kind.)
+      if (lateral && (sel.joins[i - 1]!.kind === "right" || sel.joins[i - 1]!.kind === "full")) {
+        throw engineError(
+          "invalid_column_reference",
+          "invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT",
+        );
+      }
       const label = (tref.alias ?? t.name).toLowerCase();
       // An unaliased derived table (grammar.md §42, PG 18) has an EMPTY label — it has no qualifier,
       // so two of them never collide and the duplicate-label check is skipped (its bare columns still
@@ -3067,6 +3097,7 @@ export class Database {
       rels.push({ label, table: t, offset, cte: cteIdx });
       srfPlans.push(srf);
       derivedPlans.push(derived);
+      lateralFlags.push(lateral);
       offset += t.columns.length;
     }
     const scope = new Scope(rels, this, parent, true, ctes);
@@ -3198,6 +3229,7 @@ export class Database {
       srf: srfPlans[i],
       cte: rel.cte,
       derived: derivedPlans[i],
+      lateral: lateralFlags[i],
     }));
     // The touched set per relation (cost.md §3 "The touched set"; large-values.md §14): the
     // columns this query statically references, collected depth-aware so a correlated
@@ -3499,6 +3531,91 @@ export class Database {
     return new Sorter(compare, this.workMem, this.spillSink);
   }
 
+  // materializeRel materializes one FROM relation ri into its rows, given the current outer-row stack
+  // `outer` (spec/design/grammar.md §15/§44). A base table is scanned (a PK/index bound may seek via
+  // outer); an SRF is generated; a CTE / derived table is delivered / run in place. For a CORRELATED
+  // LATERAL relation (§44) the caller passes outer EXTENDED with the combined left-hand row, so the
+  // body / SRF args read that row as their immediate outer; a non-lateral relation is passed the
+  // query's own outer and its parent=null body simply ignores it (a parent=null plan holds no
+  // outerColumn, so the two are observably identical).
+  private materializeRel(plan: SelectPlan, ri: number, outer: Row[], baseEnv: EvalEnv, params: Value[], meter: Meter): Row[] {
+    const rel = plan.rels[ri]!;
+    const env: EvalEnv = { ...baseEnv, outer };
+    // A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
+    // charging generated_row per element (its args read outer — implicitly lateral, §44).
+    if (rel.srf !== undefined) {
+      return rel.srf.kind === "unnest"
+        ? this.unnestRows(rel.srf, env, meter)
+        : this.generateSeriesRows(rel.srf, env, meter);
+    }
+    // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a MATERIALIZED
+    // CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts 54P01); an INLINE
+    // CTE runs its body in place. (A CTE is never lateral.)
+    if (rel.cte !== undefined) {
+      const ci = rel.cte;
+      if (env.ctes.modes[ci] === "materialize") {
+        const buf = env.ctes.buffers[ci]!;
+        for (let i = 0; i < buf.length; i++) {
+          meter.guard();
+          meter.charge(COSTS.cteScanRow);
+        }
+        return buf.slice();
+      }
+      const r = this.execQueryPlan(env.ctes.plans[ci]!, outer, params, env.ctes);
+      meter.charge(r.cost);
+      return r.rows;
+    }
+    // A DERIVED TABLE runs its body in place (grammar.md §42), charging its intrinsic cost — no
+    // cte_scan_row. Non-lateral it was planned parent=null and ignores outer; a LATERAL body (§44)
+    // reads the left-hand row from outer.
+    if (rel.derived !== undefined) {
+      const r = this.execQueryPlan(rel.derived, outer, params, env.ctes);
+      meter.charge(r.cost);
+      return r.rows;
+    }
+    // A base table: scan in primary-key order via a scanSource (the page_read block + per-row
+    // storage_row_read accrue inside the generator — cost.md §3). A PK/index bound seeks/ranges
+    // instead of a full walk; an empty bound reads nothing.
+    const store = this.readSnap().store(rel.tableName);
+    let rows: Row[];
+    let nodeCount: number;
+    let slabs = 0;
+    const relBound = plan.relBounds[ri]!;
+    if (relBound !== null && relBound.kind === "index") {
+      const r = this.indexBoundRows(rel.tableName, relBound.index, params, outer, plan.relMasks[ri]!);
+      rows = r.rows;
+      nodeCount = r.pages;
+      slabs = r.slabs;
+    } else if (relBound !== null) {
+      const b = buildKeyBound(relBound.pk, params, outer);
+      if (b === null) {
+        rows = [];
+        nodeCount = 0;
+      } else {
+        const u = store.rangeScanWithUnits(b, plan.relMasks[ri]!);
+        rows = u.entries.map((e) => e.row);
+        nodeCount = u.pages;
+        slabs = u.slabs;
+      }
+    } else {
+      const u = store.scanWithUnits(plan.relMasks[ri]!);
+      rows = u.entries.map((e) => e.row);
+      nodeCount = u.pages;
+      slabs = u.slabs;
+    }
+    // Materialize this relation's touched columns where the lazy load left unfetched references
+    // (large-values.md §14) — exactly the static set the cost block charges.
+    for (let i = 0; i < rows.length; i++) {
+      rows[i] = store.resolveColumns(rows[i]!, plan.relMasks[ri]!);
+    }
+    meter.charge(COSTS.valueDecompress * BigInt(slabs));
+    const tableRows: Row[] = [];
+    for (const row of scanSource(rows, nodeCount, meter)) {
+      tableRows.push(row);
+    }
+    return tableRows;
+  }
+
   private execSelectPlan(plan: SelectPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
     const env: EvalEnv = {
       params,
@@ -3562,94 +3679,14 @@ export class Database {
       return this.execStreamingSort(plan, env, meter, params);
     }
 
-    // Materialize each base table once, in primary-key order, by draining a scanSource (the
-    // pageRead block + per-row storageRowRead accrue inside the generator — spec/design/cost.md §3
-    // "page_read"/JOIN). Each base table's own primary-key bound (if any) seeks/ranges instead of
-    // walking the whole B-tree; an empty bound (a NULL const or contradictory bounds) reads nothing.
-    // The nested loop re-reads from these in-memory buffers, which are not stores and charge nothing.
-    const materialized: Row[][] = plan.rels.map((rel, ri) => {
-      // A set-returning relation is generated, not scanned (functions.md §10): produce its rows
-      // (charging generated_row per element) and feed them into the same join pipeline.
-      if (rel.srf !== undefined) {
-        return rel.srf.kind === "unnest"
-          ? this.unnestRows(rel.srf, env, meter)
-          : this.generateSeriesRows(rel.srf, env, meter);
-      }
-      // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
-      // MATERIALIZED CTE reads its buffer, charging cte_scan_row per row (guarded so a runaway scan
-      // still aborts 54P01); an INLINE CTE runs its body in place (re-evaluating per outer row under
-      // correlation), charging the body's intrinsic cost into this meter.
-      if (rel.cte !== undefined) {
-        const ci = rel.cte;
-        if (env.ctes.modes[ci] === "materialize") {
-          const buf = env.ctes.buffers[ci]!;
-          for (let i = 0; i < buf.length; i++) {
-            meter.guard();
-            meter.charge(COSTS.cteScanRow);
-          }
-          // A multi-reference CTE reads the SAME buffer at each reference; return a fresh array so a
-          // downstream in-place mutation cannot corrupt the shared buffer (re-iterable — cte.md §5).
-          return buf.slice();
-        }
-        // Inline: the body is an independent query (parent = null at plan time), so it reads no
-        // outer row; it may reference an EARLIER CTE, so pass the same context.
-        const r = this.execQueryPlan(env.ctes.plans[ci]!, [], params, env.ctes);
-        meter.charge(r.cost);
-        return r.rows;
-      }
-      // A DERIVED TABLE runs its body in place (grammar.md §42): the inline path, exactly like a
-      // single-reference CTE. The body was planned parent=null, so it reads no outer row ([]); it may
-      // reference a statement CTE, so it gets the same context. Its intrinsic cost accrues into this
-      // meter — no cte_scan_row.
-      if (rel.derived !== undefined) {
-        const r = this.execQueryPlan(rel.derived, [], params, env.ctes);
-        meter.charge(r.cost);
-        return r.rows;
-      }
-      const store = this.readSnap().store(rel.tableName);
-      let rows: Row[];
-      let nodeCount: number;
-      let slabs = 0;
-      const relBound = plan.relBounds[ri]!;
-      if (relBound !== null && relBound.kind === "index") {
-        // An index bound fetches via the index tree + per-row point lookups (cost.md §3
-        // "index-bounded scan").
-        const r = this.indexBoundRows(rel.tableName, relBound.index, params, outer, plan.relMasks[ri]!);
-        rows = r.rows;
-        nodeCount = r.pages;
-        slabs = r.slabs;
-      } else if (relBound !== null) {
-        const b = buildKeyBound(relBound.pk, params, outer);
-        if (b === null) {
-          rows = [];
-          nodeCount = 0;
-        } else {
-          const u = store.rangeScanWithUnits(b, plan.relMasks[ri]!);
-          rows = u.entries.map((e) => e.row);
-          nodeCount = u.pages;
-          slabs = u.slabs;
-        }
-      } else {
-        const u = store.scanWithUnits(plan.relMasks[ri]!);
-        rows = u.entries.map((e) => e.row);
-        nodeCount = u.pages;
-        slabs = u.slabs;
-      }
-      // Materialize this relation's touched columns where the lazy load left unfetched
-      // references (large-values.md §14) — exactly the static set the cost block charges, so
-      // the physical chain reads/decompressions match the metered units.
-      for (let i = 0; i < rows.length; i++) {
-        rows[i] = store.resolveColumns(rows[i]!, plan.relMasks[ri]!);
-      }
-      // The decompress slabs join the same up-front block as the page_read the scanSource
-      // charges on its first next() (cost.md §3 "the compression units").
-      meter.charge(COSTS.valueDecompress * BigInt(slabs));
-      const tableRows: Row[] = [];
-      for (const row of scanSource(rows, nodeCount, meter)) {
-        tableRows.push(row);
-      }
-      return tableRows;
-    });
+    // Materialize each relation once, in primary-key order (base tables drain a scanSource — the
+    // page_read block + per-row storage_row_read accrue inside the generator, cost.md §3). The nested
+    // loop re-reads from these in-memory buffers, which are not stores and charge nothing. A
+    // CORRELATED LATERAL relation (§44) depends on the left-hand row, so it cannot be materialized up
+    // front — an empty placeholder holds its slot and the join loop re-materializes it per left row.
+    const materialized: Row[][] = plan.rels.map((rel, ri) =>
+      rel.lateral === true ? [] : this.materializeRel(plan, ri, outer, env, params, meter),
+    );
 
     // Left-deep nested-loop join. `running` holds the combined rows over the relations joined
     // so far (starting with the first table's rows). For each join, concatenate every running
@@ -3665,7 +3702,6 @@ export class Database {
     // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
     let running: Row[] = plan.rels.length === 0 ? [[]] : materialized[0]!;
     for (let k = 0; k < plan.joins.length; k++) {
-      const rightRows = materialized[k + 1]!;
       const on = plan.joins[k]!.on;
       const kind = plan.joins[k]!.kind;
       const emitLeft = kind === "left" || kind === "full";
@@ -3676,6 +3712,27 @@ export class Database {
       const leftPad = plan.rels[k + 1]!.offset;
       const rightPad = plan.rels[k + 1]!.colCount;
       const next: Row[] = [];
+      // A CORRELATED LATERAL relation (§44): re-materialize it ONCE PER combined left-hand row, with
+      // that row pushed onto the outer-row stack as the body's immediate outer (the correlated-
+      // subquery mechanism). The plan guarantees INNER/CROSS/LEFT here (RIGHT/FULL to a correlated
+      // lateral is 42P10), so there is no unmatched-right emission.
+      if (plan.rels[k + 1]!.lateral === true) {
+        for (const left of running) {
+          const rightRows = this.materializeRel(plan, k + 1, [...outer, left], env, params, meter);
+          let leftMatched = false;
+          for (const right of rightRows) {
+            const combined = left.concat(right);
+            if (on === null || isTrue(evalExpr(on, combined, env, meter))) {
+              next.push(combined);
+              leftMatched = true;
+            }
+          }
+          if (emitLeft && !leftMatched) next.push(left.concat(nullRow(rightPad)));
+        }
+        running = next;
+        continue;
+      }
+      const rightRows = materialized[k + 1]!;
       const rightMatched: boolean[] = new Array(rightRows.length).fill(false);
       for (const left of running) {
         let leftMatched = false;
@@ -4508,12 +4565,15 @@ function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
   if (plan.having !== null && rexprReferencesOuter(plan.having, depth)) return true;
   for (const s of plan.aggSpecs) if (s.operand !== null && rexprReferencesOuter(s.operand, depth)) return true;
   for (const p of plan.projections) if (rexprReferencesOuter(p, depth)) return true;
-  // A set-returning relation's arguments may carry a correlated reference (non-LATERAL: an SRF
-  // arg sees params/outer — functions.md §10), making the enclosing subquery correlated.
+  // A set-returning relation's arguments may carry a correlated reference (an implicitly-lateral SRF
+  // arg sees params / outer / an earlier sibling — functions.md §10, grammar.md §44), making the
+  // enclosing query correlated. A LATERAL derived table's body is one frame deeper; a reference in it
+  // back into this query's outer counts here too (§44).
   for (const rel of plan.rels) {
     if (rel.srf !== undefined) {
       for (const a of rel.srf.args) if (rexprReferencesOuter(a, depth)) return true;
     }
+    if (rel.derived !== undefined && queryPlanReferencesOuter(rel.derived, depth + 1)) return true;
   }
   return false;
 }
@@ -5019,7 +5079,12 @@ type VariadicFuncName = "num_nulls" | "num_nonnulls";
 // single-reference CTE. tableName is the alias (never looked up in the store); the executor runs
 // this plan in place (it was planned parent=null, so it reads no outer row), charging its intrinsic
 // cost — no cte_scan_row.
-type PlanRel = { tableName: string; offset: number; colCount: number; srf?: SrfPlan; cte?: number; derived?: QueryPlan };
+// `lateral` is true when this relation is a CORRELATED LATERAL item (spec/design/grammar.md §44):
+// its derived body / SRF args reference an earlier sibling (or an enclosing query), so the executor
+// re-materializes it ONCE PER combined left-hand row (with that row pushed as its immediate outer —
+// the correlated-subquery mechanism), rather than materializing it once. Always false for the first
+// relation; only a srf or derived relation is ever lateral.
+type PlanRel = { tableName: string; offset: number; colCount: number; srf?: SrfPlan; cte?: number; derived?: QueryPlan; lateral?: boolean };
 
 // SrfKind selects which set-returning function an SrfPlan is, picking the row generator at exec
 // (spec/design/functions.md §10, array-functions.md §9). The dispatch is hand-written per core.

@@ -1122,8 +1122,22 @@ class Parser {
   // leading identifier marking the function form; the resolver owns arity/type errors. The alias
   // logic is shared. The stop-keyword set is a §8 cross-core surface.
   private parseTableRef(): TableRef {
+    // An optional leading LATERAL (grammar.md §44) marks a derived table / table function as
+    // correlated to the EARLIER FROM relations. LATERAL is non-reserved (§3), so it is the keyword
+    // only when a derived table `(` or a function call `name(` follows (a two-token lookahead) —
+    // otherwise it is an ordinary identifier (e.g. a table named `lateral`). A table function is
+    // implicitly lateral regardless, so the keyword is redundant (but accepted) there.
+    const lateral =
+      this.peekKeyword() === "lateral" &&
+      (this.peekKindAt(1) === "lparen" ||
+        (this.peekKindAt(1) === "word" && this.peekKindAt(2) === "lparen"));
+    if (lateral) {
+      this.advance();
+    }
     if (this.peek().kind === "lparen") {
-      return this.parseDerivedTable();
+      const tr = this.parseDerivedTable();
+      tr.lateral = lateral;
+      return tr;
     }
     const name = this.expectIdentifier();
     // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT`).
@@ -1156,7 +1170,8 @@ class Parser {
         "column alias list on a table function is not supported yet",
       );
     }
-    return { name, alias, args };
+    // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
+    return { name, alias, args, lateral };
   }
 
   // parseDerivedTable parses a DERIVED TABLE — `"(" query_expr ")" derived_alias?` (grammar.md §42).

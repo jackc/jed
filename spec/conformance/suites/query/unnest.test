@@ -5,8 +5,8 @@
 # alias, else `unnest`) is typed at ELEM. One row per element in FLATTENED ROW-MAJOR order — a
 # multidimensional array flattens, a NULL element is produced as a NULL row, and the empty array {}
 # and a NULL array argument each yield ZERO rows (the empty_on_null discipline). It composes with
-# WHERE / ORDER BY / LIMIT / cross-join exactly as generate_series does, is non-LATERAL (args see
-# $N / a correlated OUTER column, not a sibling FROM table), and charges one generated_row per
+# WHERE / ORDER BY / LIMIT / cross-join exactly as generate_series does, is implicitly LATERAL
+# (grammar.md §44 — args see $N / a correlated OUTER column / an earlier sibling), and charges one generated_row per
 # produced element (spec/design/cost.md §3) — so a query's cost is the generated rows plus the
 # usual evaluation + row_produced, and a max_cost ceiling bounds a runaway unnest (54P01). A
 # non-array argument is 42883. PostgreSQL-oracle-verified (postgres:18). The ARRAY[…] literal args

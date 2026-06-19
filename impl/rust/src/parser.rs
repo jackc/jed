@@ -1260,8 +1260,23 @@ impl Parser {
     /// a clause/join keyword (so `FROM t WHERE` and `FROM t JOIN ...` keep no alias). The
     /// stop-keyword set, and the leading-`SELECT` lookahead, are §8 cross-core surfaces.
     fn parse_table_ref(&mut self) -> Result<TableRef> {
+        // An optional leading `LATERAL` (grammar.md §44) marks a derived table / table function as
+        // correlated to the EARLIER FROM relations. `LATERAL` is non-reserved (§3), so it is the
+        // keyword only when a derived table `(` or a function call `name(` follows (a two-token
+        // lookahead) — otherwise it is an ordinary identifier (e.g. a table named `lateral`). A
+        // table function is implicitly lateral regardless, so the keyword is redundant (but
+        // accepted) there.
+        let lateral = self.peek_keyword().as_deref() == Some("lateral")
+            && (matches!(self.peek_at(1), Token::LParen)
+                || (matches!(self.peek_at(1), Token::Word(_))
+                    && matches!(self.peek_at(2), Token::LParen)));
+        if lateral {
+            self.advance();
+        }
         if matches!(self.peek(), Token::LParen) {
-            return self.parse_derived_table();
+            let mut tr = self.parse_derived_table()?;
+            tr.lateral = lateral;
+            return Ok(tr);
         }
         let name = self.expect_identifier()?;
         // A `(` right after the name = a set-returning function call (no `*`/`DISTINCT` — those
@@ -1306,6 +1321,8 @@ impl Parser {
             subquery: None,
             values: None,
             column_aliases: None,
+            // An SRF is implicitly lateral; `lateral` records only whether the keyword was written.
+            lateral,
         })
     }
 
@@ -1375,6 +1392,8 @@ impl Parser {
             subquery,
             values,
             column_aliases,
+            // The caller (`parse_table_ref`) sets `lateral` from a leading `LATERAL` keyword.
+            lateral: false,
         })
     }
 

@@ -79,11 +79,12 @@ func TestUnnestAliasRenamesColumn(t *testing.T) {
 	}
 }
 
-func TestUnnestCorrelatedOuterArgNonLateral(t *testing.T) {
+func TestUnnestCorrelatedOuterArg(t *testing.T) {
 	db := NewDatabase()
 	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])")
 	mustExec(t, db, "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')")
-	// A correlated OUTER column resolves into the SRF arg (non-LATERAL sees params/outer).
+	// A correlated OUTER column resolves into the SRF arg of an enclosing-query subquery (the SRF is
+	// the subquery's sole/first FROM item, so its args see the enclosing query — functions.md §10).
 	rows := query(t, db, "SELECT id, (SELECT count(*) FROM unnest(o.xs)) AS n FROM t o ORDER BY id")
 	want := [][2]int64{{1, 2}, {2, 1}, {3, 0}, {4, 0}}
 	if len(rows) != 4 {
@@ -94,12 +95,15 @@ func TestUnnestCorrelatedOuterArgNonLateral(t *testing.T) {
 			t.Errorf("row %d: got (%d,%d), want %v", i, rows[i][0].Int, rows[i][1].Int, w)
 		}
 	}
-	// A SIBLING FROM table's column is NOT in scope for the SRF arg (non-LATERAL).
-	if code := genErrCode(t, db, "SELECT id, u FROM t CROSS JOIN unnest(xs) AS u"); code != "42703" {
-		t.Errorf("sibling bare column code = %s, want 42703", code)
+	// A SIBLING FROM table's column IS now in scope for the SRF arg — an SRF is implicitly lateral
+	// (grammar.md §44; the rows are pinned by suites/joins/lateral.test). Here we only assert the
+	// prior non-LATERAL 42703/42P01 rejection is lifted: the bare and qualified forms succeed and
+	// explode each row's array (1→{10,20}, 2→{30}, NULL/empty → no rows ⇒ 3 rows).
+	if n := len(query(t, db, "SELECT id, u FROM t CROSS JOIN unnest(xs) AS u")); n != 3 {
+		t.Errorf("implicitly-lateral bare sibling: got %d rows, want 3", n)
 	}
-	if code := genErrCode(t, db, "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u"); code != "42P01" {
-		t.Errorf("sibling qualified column code = %s, want 42P01", code)
+	if n := len(query(t, db, "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u")); n != 3 {
+		t.Errorf("implicitly-lateral qualified sibling: got %d rows, want 3", n)
 	}
 }
 

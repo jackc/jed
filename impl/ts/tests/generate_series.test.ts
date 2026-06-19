@@ -48,9 +48,14 @@ test("$N parameter argument", () => {
   assert.deepStrictEqual(out.rows.map((r) => r.map((v) => v.kind === "int" ? String(v.int) : "?")), [["1"], ["2"], ["3"]]);
 });
 
-test("a sibling reference is rejected (non-LATERAL)", () => {
+test("a sibling reference works (an SRF is implicitly lateral, grammar.md §44)", () => {
   const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY, n int32)", "INSERT INTO t VALUES (1, 3)"]);
-  assert.equal(errCode(() => execute(db, "SELECT * FROM t CROSS JOIN generate_series(1, t.n)")), "42P01");
+  // The rows are pinned by suites/joins/lateral.test; here we only assert the prior non-LATERAL
+  // 42P01 rejection is lifted — generate_series(1, t.n) re-runs per t row (1 row, n=3 ⇒ 3 rows).
+  const out = execute(db, "SELECT * FROM t CROSS JOIN generate_series(1, t.n)");
+  assert.equal(out.kind, "query");
+  if (out.kind !== "query") return;
+  assert.equal(out.rows.length, 3);
 });
 
 test("generated_row cost and the maxCost ceiling", () => {

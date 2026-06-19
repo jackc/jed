@@ -430,8 +430,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           column names `column1…`; per-column type unification across rows like a set op (`42804`).
           A leading `(` + `VALUES` selects it; a trailing `ORDER BY`/`LIMIT` on the body is `42601`
           (deferred). New `query.values` capability. → [grammar.md §42](spec/design/grammar.md)
-    - [ ] _follow-on:_ **`LATERAL`** (body sees earlier FROM relations); a **parenthesized-join
-          FROM** (`FROM (a JOIN b ON …)`); a trailing **`ORDER BY`/`LIMIT` on a VALUES body**.
+    - [x] **`LATERAL`** — ✅ a FROM item (LATERAL `(SELECT…)`/`(VALUES…)` derived table, or an
+          implicitly-lateral table function) whose body / args reference the EARLIER FROM relations, a
+          dependent join re-evaluated per left-hand row, reusing the correlated-subquery machinery.
+          Reached via `[CROSS|INNER|LEFT] JOIN LATERAL`; `RIGHT`/`FULL` to a correlated lateral is
+          `42P10`; SRFs are implicitly lateral (lifting the §35 narrowing). All three cores +
+          `query.lateral` + `suites/joins/lateral.test`. → [grammar.md §44](spec/design/grammar.md)
+    - [ ] _follow-on:_ a **parenthesized-join FROM** (`FROM (a JOIN b ON …)`); a trailing **`ORDER
+          BY`/`LIMIT` on a VALUES body**; **comma-`FROM`** (`FROM t, LATERAL (…)`) — until it lands,
+          LATERAL is reached only through explicit `JOIN` syntax.
   - [x] **`ANY` / `ALL` over a subquery** — `x op ANY/ALL(SELECT …)`, the subquery spelling of `IN`;
         see the AF5 sub-item above and [array-functions.md §11.6](spec/design/array-functions.md).
   - [ ] **Subqueries — remaining seams:** subqueries in an **`INSERT ... VALUES`** slot (blocked on
@@ -460,7 +467,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Set-returning functions** — `generate_series(start, stop [, step])` in FROM position, a
       synthetic one-column relation, a new `generated_row` cost unit; integer variants (timestamp
       waits on interval composition). → [functions.md §10](spec/design/functions.md)
-  - [ ] _follow-on:_ `LATERAL`, the column-alias-list `AS g(c)`, `unnest(array)` (once arrays land).
+  - [ ] _follow-on:_ the column-alias-list `AS g(c)`. (`LATERAL` ✅ landed — an SRF is implicitly
+        lateral, [grammar.md §44](spec/design/grammar.md); `unnest(array)` ✅ landed — AF3.)
 - [x] **`NOT NULL`** — explicit column constraint; storing NULL → `23502`.
       → [constraints.md §1](spec/design/constraints.md)
 - [x] **`DEFAULT` (literal)** — evaluated + coerced once at CREATE TABLE; landed with the INSERT

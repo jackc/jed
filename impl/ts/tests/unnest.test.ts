@@ -52,18 +52,26 @@ test("unnest alias renames the single column", () => {
   assert.equal(errCode(() => execute(db, "SELECT g.unnest FROM unnest(ARRAY[7,8]) AS g")), "42703");
 });
 
-test("unnest takes a correlated outer column but not a sibling (non-LATERAL)", () => {
+test("unnest takes a correlated outer column AND an earlier sibling (implicitly lateral, §44)", () => {
   const db = dbWith([
     "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])",
     "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')",
   ]);
+  // A correlated OUTER column resolves into the SRF arg of an enclosing-query subquery (the SRF is
+  // the subquery's sole/first FROM item, so its args see the enclosing query — functions.md §10).
   assert.deepStrictEqual(
     query(db, "SELECT id, (SELECT count(*) FROM unnest(o.xs)) AS n FROM t o ORDER BY id"),
     [["1", "2"], ["2", "1"], ["3", "0"], ["4", "0"]],
   );
-  // A sibling FROM table's column is not in scope for the SRF arg.
-  assert.equal(errCode(() => execute(db, "SELECT id, u FROM t CROSS JOIN unnest(xs) AS u")), "42703");
-  assert.equal(errCode(() => execute(db, "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u")), "42P01");
+  // A sibling FROM table's column IS now in scope (an SRF is implicitly lateral, grammar.md §44; the
+  // rows are pinned by suites/joins/lateral.test). Here we assert the prior 42703/42P01 rejection is
+  // lifted: the bare and qualified forms succeed and explode each row (NULL/empty → no rows ⇒ 3 rows).
+  for (const sql of ["SELECT id, u FROM t CROSS JOIN unnest(xs) AS u", "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u"]) {
+    const out = execute(db, sql);
+    assert.equal(out.kind, "query");
+    if (out.kind !== "query") return;
+    assert.equal(out.rows.length, 3);
+  }
 });
 
 test("unnest strictness + deferred-form errors", () => {

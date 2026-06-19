@@ -324,9 +324,15 @@ pub struct Delete {
 /// (spec/design/grammar.md §42): a parenthesized `VALUES` list used as a relation, a computed
 /// relation of literal rows. It is the FROM-position alternative body to `subquery` (the two are
 /// mutually exclusive — at most one is `Some` on a derived table). Each value is a general
-/// constant expression (resolved `parent = None`, non-`LATERAL`); the rows share arity and the
-/// columns' types unify across rows like a set operation. The outer `Vec` is the rows, each inner
-/// `Vec` one row's values, left to right.
+/// constant expression (resolved `parent = None`, non-`LATERAL` unless this `TableRef` is marked
+/// `lateral`); the rows share arity and the columns' types unify across rows like a set operation.
+/// The outer `Vec` is the rows, each inner `Vec` one row's values, left to right.
+///
+/// `lateral` is set when the FROM item is preceded by the `LATERAL` keyword (spec/design/grammar.md
+/// §44): the derived-table body / SRF arguments may then reference columns of the FROM relations
+/// that appear BEFORE this one (a dependent / correlated join). It is meaningful only for a derived
+/// table or a table function; a table function is *implicitly* lateral, so the planner correlates an
+/// SRF's args to the earlier siblings whether or not this flag is set.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct TableRef {
     pub name: String,
@@ -335,6 +341,7 @@ pub struct TableRef {
     pub subquery: Option<Box<QueryExpr>>,
     pub values: Option<Vec<Vec<Expr>>>,
     pub column_aliases: Option<Vec<String>>,
+    pub lateral: bool,
 }
 
 /// The kind of a join. `Inner` and `Cross` execute this slice; the `Left`/`Right`/`Full`

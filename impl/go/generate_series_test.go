@@ -6,8 +6,9 @@ package jed
 // generator's PostgreSQL edge cases (NULL → empty, step zero → 22023, descending step, the
 // positive-default-step empty case, i64-overflow clean-stop), the synthetic-relation wiring
 // (output column name/type, alias + qualified resolution, CROSS JOIN composition), the
-// non-LATERAL rule ($N / correlated outer arg vs. a rejected sibling reference), the
-// generated_row cost contract + the max_cost ceiling, and the deferred-form errors.
+// arg-scope rule ($N / correlated outer arg), the generated_row cost contract + the max_cost
+// ceiling, and the deferred-form errors. (An SRF is implicitly lateral — a sibling reference
+// works, grammar.md §44 — covered by suites/joins/lateral.test.)
 
 import "testing"
 
@@ -90,16 +91,6 @@ func TestGenerateSeriesParam(t *testing.T) {
 		got[i] = r[0].Int
 	}
 	eqGenInts(t, got, []int64{1, 2, 3}, "param")
-}
-
-func TestGenerateSeriesSiblingReferenceRejected(t *testing.T) {
-	db := NewDatabase()
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, n int32)")
-	mustExec(t, db, "INSERT INTO t VALUES (1, 3)")
-	// A FROM-sibling reference inside the SRF args is NOT visible (no LATERAL) — undefined.
-	if c := genErrCode(t, db, "SELECT * FROM t CROSS JOIN generate_series(1, t.n)"); c != "42P01" {
-		t.Errorf("sibling ref code = %s, want 42P01", c)
-	}
 }
 
 func TestGenerateSeriesCostCeiling(t *testing.T) {

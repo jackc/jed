@@ -388,8 +388,14 @@ export type InsertValue =
 // v(c1,…) (grammar.md §42): a parenthesized VALUES list used as a relation, a computed relation of
 // literal rows. It is the FROM-position alternative body to `subquery` (the two are mutually
 // exclusive — at most one is set on a derived table). Each value is a general constant expression
-// (resolved parent=null, non-LATERAL); the rows share arity and the columns' types unify across
-// rows like a set operation. The outer array is the rows, each inner array one row's values.
+// (resolved parent=null, non-LATERAL unless this TableRef is marked `lateral`); the rows share arity
+// and the columns' types unify across rows like a set operation. The outer array is the rows, each
+// inner array one row's values.
+// `lateral` is set when the FROM item is preceded by the LATERAL keyword (spec/design/grammar.md
+// §44): the derived-table body / SRF arguments may then reference columns of the FROM relations that
+// appear BEFORE this one (a dependent / correlated join). It is meaningful only for a derived table
+// or table function; a table function is implicitly lateral, so the planner correlates an SRF's args
+// to the earlier siblings whether or not this flag is set.
 export type TableRef = {
   name: string;
   alias: string | null;
@@ -397,6 +403,7 @@ export type TableRef = {
   subquery?: QueryExpr;
   values?: Expr[][];
   columnAliases?: string[];
+  lateral?: boolean;
 };
 
 // JoinKind is the kind of a join. "inner"/"cross" execute this slice; the "left"/"right"/"full"

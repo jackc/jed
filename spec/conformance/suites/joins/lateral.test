@@ -1,0 +1,262 @@
+# LATERAL joins (spec/design/grammar.md §44): a FROM item whose body / arguments reference columns
+# of the FROM relations that appear BEFORE it — a dependent (correlated) join re-evaluated once per
+# combined left-hand row, reusing the correlated-subquery machinery (the scope parent chain →
+# Outer{level,index}, the per-outer-row eval stack — §26). Reached via explicit join syntax (no
+# comma-FROM yet): CROSS JOIN LATERAL, [INNER] JOIN LATERAL ... ON, LEFT [OUTER] JOIN LATERAL ... ON.
+# A derived table ((SELECT…)/(VALUES…)) is lateral ONLY with the keyword; a table function (SRF) is
+# IMPLICITLY lateral — its args may reference an earlier sibling with or without the keyword (PG,
+# lifting the §35 SRF non-LATERAL narrowing). Visibility is left-to-right and earlier-only (a
+# forward/self reference is 42P01); lateral items chain (a later lateral sees an earlier one). A
+# RIGHT/FULL JOIN to a lateral item that references the left side is 42P10; an uncorrelated one is
+# materialized once and allowed. Cost is the sum of the per-left-row body evaluations (deterministic,
+# max_cost-bounded). Oracle-checked against PostgreSQL (rake corpus:check).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.where_eq, query.cross_join, query.join_inner, query.join_left, query.join_right, query.qualified_column, query.table_alias, query.order_by, query.order_by_keys, query.limit, query.set_returning, func.unnest, func.array, query.values, query.derived_table, query.lateral, query.subquery_scalar, query.subquery_correlated, null.three_valued, types.int32, types.int64, types.array, resource.cost_metering
+
+statement ok
+CREATE TABLE lt (id int32 PRIMARY KEY, n int32)
+
+statement ok
+INSERT INTO lt VALUES (1, 2), (2, 0), (3, 3)
+
+statement ok
+CREATE TABLE lc (id int32 PRIMARY KEY, arr int32[])
+
+statement ok
+INSERT INTO lc VALUES (1, '{10,20}'), (2, '{}'), (3, '{30}')
+
+# A — IMPLICITLY-lateral table function: an SRF's args see an earlier sibling with NO keyword (PG).
+# generate_series(1, lt.n) re-runs per lt row; lt.id=2 (n=0) yields zero rows. The single-column
+# function-alias rule names the column after the alias (g).
+# names: id, g
+# cost: 14
+query II nosort
+SELECT lt.id, g FROM lt CROSS JOIN generate_series(1, lt.n) AS g ORDER BY lt.id, g
+----
+1
+1
+1
+2
+3
+1
+3
+2
+3
+3
+
+# B — the EXPLICIT LATERAL keyword before the SRF is accepted and redundant (same result as A).
+# names: id, g
+# cost: 14
+query II nosort
+SELECT lt.id, g FROM lt CROSS JOIN LATERAL generate_series(1, lt.n) AS g ORDER BY lt.id, g
+----
+1
+1
+1
+2
+3
+1
+3
+2
+3
+3
+
+# C — a LATERAL sub-SELECT derived table (FROM-less body) referencing the earlier sibling lt.
+# names: id, x
+# cost: 13
+query II nosort
+SELECT lt.id, s.x FROM lt CROSS JOIN LATERAL (SELECT lt.n + 100 AS x) s ORDER BY lt.id
+----
+1
+102
+2
+100
+3
+103
+
+# D — [INNER] JOIN LATERAL ... ON: the ON predicate filters the dependent rows (g is a local column
+# of the combined row). lt.id=2 (n=0) drops out (no row passes / generated).
+# names: id, g
+# cost: 17
+query II nosort
+SELECT lt.id, g FROM lt JOIN generate_series(1, lt.n) AS g ON g > 1 ORDER BY lt.id, g
+----
+1
+2
+3
+2
+3
+3
+
+# E — LEFT JOIN LATERAL ... ON true keeps every left row, NULL-extending it when the lateral side
+# yields ZERO rows (lt.id=2, n=0). The common "optional explode".
+# names: id, g
+# cost: 15
+query II nosort
+SELECT lt.id, g FROM lt LEFT JOIN generate_series(1, lt.n) AS g ON true ORDER BY lt.id, g
+----
+1
+1
+1
+2
+2
+NULL
+3
+1
+3
+2
+3
+3
+
+# F — implicitly-lateral unnest: explode an array column (the natural FROM t, unnest(t.arr) shape).
+# The empty array (lc.id=2) yields zero rows.
+# names: id, u
+# cost: 10
+query II nosort
+SELECT lc.id, u FROM lc CROSS JOIN unnest(lc.arr) AS u ORDER BY lc.id, u
+----
+1
+10
+1
+20
+3
+30
+
+# G — LEFT JOIN unnest ON true: the empty array (lc.id=2) NULL-extends rather than dropping the row.
+# names: id, u
+# cost: 11
+query II nosort
+SELECT lc.id, u FROM lc LEFT JOIN unnest(lc.arr) AS u ON true ORDER BY lc.id, u
+----
+1
+10
+1
+20
+2
+NULL
+3
+30
+
+# H — a LATERAL (VALUES …) body: the values reference the earlier sibling lt (general expressions).
+# names: id, x
+# cost: 19
+query II nosort
+SELECT lt.id, v.x FROM lt CROSS JOIN LATERAL (VALUES (lt.n), (lt.n + 100)) AS v(x) ORDER BY lt.id, v.x
+----
+1
+2
+1
+102
+2
+0
+2
+100
+3
+3
+3
+103
+
+# I — CHAINED laterals: the second lateral (b) references the FIRST lateral's output column (a.g),
+# so a lateral item's correlation scope is the cumulative left prefix.
+# names: id, g, h
+# cost: 16
+query III nosort
+SELECT lt.id, a.g, b.h FROM lt CROSS JOIN LATERAL (SELECT lt.n AS g) a CROSS JOIN LATERAL (SELECT a.g + 1 AS h) b ORDER BY lt.id
+----
+1
+2
+3
+2
+0
+1
+3
+3
+4
+
+# J — a lateral body referencing a column from TWO FROM items back (a, across the b join).
+# names: id, id, c
+# cost: 35
+query III nosort
+SELECT a.id, b.id, s.c FROM lt a CROSS JOIN lt b CROSS JOIN LATERAL (SELECT a.n + b.n AS c) s ORDER BY a.id, b.id
+----
+1
+1
+4
+1
+2
+2
+1
+3
+5
+2
+1
+2
+2
+2
+0
+2
+3
+3
+3
+1
+5
+3
+2
+3
+3
+3
+6
+
+# K — the canonical top-N-per-group: a LATERAL subquery with ORDER BY + LIMIT, correlated to the
+# left row. Here: the greatest n in lt that does not exceed lt.n.
+# names: id, n
+# cost: 31
+query II nosort
+SELECT lt.id, top.n FROM lt CROSS JOIN LATERAL (SELECT o.n FROM lt o WHERE o.n <= lt.n ORDER BY o.n DESC LIMIT 1) top ORDER BY lt.id
+----
+1
+2
+2
+0
+3
+3
+
+# O — a RIGHT JOIN to an UNcorrelated table function (its args do not reference the left side) is
+# NOT a dependent join, so it is materialized once and allowed (PG); every right row is kept.
+# names: id, g
+# cost: 12
+query II nosort
+SELECT lt.id, g FROM lt RIGHT JOIN generate_series(1, 2) AS g ON true ORDER BY lt.id, g
+----
+1
+1
+1
+2
+2
+1
+2
+2
+3
+1
+3
+2
+
+# --- Error surface ---
+
+# A NON-LATERAL derived-table body cannot see a sibling FROM relation (the §42 rule): mark it LATERAL
+# to correlate it. PG: 42P01 (invalid reference to FROM-clause entry — mark this subquery LATERAL).
+statement error 42P01
+SELECT lt.id FROM lt CROSS JOIN (SELECT lt.n AS g) s
+
+# A LATERAL body sees only the relations to its LEFT — a FORWARD reference (here lt2, joined after s)
+# is 42P01 (missing FROM-clause entry).
+statement error 42P01
+SELECT s.x FROM lt CROSS JOIN LATERAL (SELECT lt2.n AS x) s CROSS JOIN lt lt2
+
+# A RIGHT JOIN to a lateral item that references the LEFT side is 42P10: the combining join type must
+# be INNER or LEFT for a LATERAL reference.
+statement error 42P10
+SELECT lt.id FROM lt RIGHT JOIN LATERAL (SELECT lt.n AS g) s ON true
+
+# A FULL JOIN to a correlated lateral item is likewise 42P10.
+statement error 42P10
+SELECT lt.id FROM lt FULL JOIN LATERAL (SELECT lt.n AS g) s ON true

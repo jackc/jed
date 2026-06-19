@@ -1571,15 +1571,16 @@ follows PostgreSQL's single-column function-alias rule: the alias when one is gi
 
 **Composition.** An SRF relation is a first-class FROM item: it joins/cross-joins other
 relations (`t CROSS JOIN generate_series(1, 3)` is the product), and `WHERE` / `ORDER BY` /
-`LIMIT` / subqueries compose over it. Its arguments are **non-LATERAL**: they resolve against
-an empty-local scope linked outward, so a `$N` parameter or a **correlated outer-query
-column** is a legal argument (`(SELECT count(*) FROM generate_series(1, o.n)) FROM t o`), but
-a **sibling FROM table** is not (`42703`/`42P01`).
+`LIMIT` / subqueries compose over it. Its arguments are **implicitly `LATERAL`** (§44, matching
+PG): a `$N` parameter, a **correlated outer-query column** (`(SELECT count(*) FROM
+generate_series(1, o.n)) FROM t o`), **and** a **column of an earlier sibling FROM relation**
+(`FROM t CROSS JOIN generate_series(1, t.n) g`) are all legal arguments — a sibling reference
+re-evaluates the SRF once per left-hand row (§44). (For the first/only FROM item there is no
+sibling, so an arg sees only `$N`/outer, as before.)
 
 **Deferred narrowings** (each a `0A000` or the relevant error, relaxable later, and shared by both
 SRFs): the **SELECT-list** SRF position (`SELECT generate_series(1, 5)` / `SELECT unnest(…)` — an
-SRF is not a scalar function, `42883`), **`LATERAL`** (so `unnest` over a sibling FROM column is
-reached only via a correlated subquery), the **column-alias-list** form `AS g(c1, …)` (`0A000` — a
+SRF is not a scalar function, `42883`), the **column-alias-list** form `AS g(c1, …)` (`0A000` — a
 `(` after the alias), **`WITH ORDINALITY`**, and `generate_series`'s non-integer variants
 (numeric/timestamp). The `generate_series` integer forms and their PostgreSQL edge cases (NULL arg →
 zero rows, step zero → `22023`, overflow → clean stop), and `unnest`'s element-expansion semantics,
@@ -1933,8 +1934,9 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
 
 **Deliberate narrowings (each relaxable later, [../../TODO.md](../../TODO.md)).**
 
-- **`LATERAL`** — a derived table (or SRF, §35) that references earlier FROM relations. The body
-  stays independent (`parent = None`) until this lands.
+- **`LATERAL`** — ✅ **landed** (§44): a derived table (or SRF, §35) preceded by `LATERAL` (SRFs
+  implicitly) sees earlier FROM relations. A *non-`LATERAL`* derived-table body stays independent
+  (`parent = None`), the rule above.
 - **Parenthesized join / table-reference FROM** — `FROM (a JOIN b ON …) c`. A leading `(` not
   starting a `SELECT` is `42601`.
 - **A `WITH` *inside* the body** (nested `WITH`, `42601`) — the body production is the WITH-less
@@ -1979,3 +1981,85 @@ the per-table constraint namespace), and rejects an unsupported `referential_act
 CASCADE / SET NULL / SET DEFAULT) ([constraints.md §6](constraints.md)). PostgreSQL *reserves*
 `FOREIGN` / `REFERENCES`, so the jed-only non-reserved surface carries oracle overrides like `on`'s
 (conformance.md §5). `MATCH FULL` / `MATCH PARTIAL` are not in the grammar (MATCH SIMPLE only).
+
+## 44. `LATERAL` joins (`… JOIN LATERAL ( query_expr ) ON …`, implicitly-lateral table functions)
+
+A **`LATERAL`** FROM item may reference columns of the FROM relations that appear **before** it in the
+same FROM clause — a *dependent* (correlated) join: the lateral item is re-evaluated **once per
+combined left-hand row**, with that row bound as its immediate outer scope. It is the FROM-clause
+form of the correlated subquery (§26), and it reuses the *same* machinery: the scope `parent` chain
+(an earlier relation referenced from a lateral body resolves to an `Outer{level, index}`), the
+per-outer-row evaluation stack, and the deterministic per-row cost charging. This is the standard
+**top-N-per-group** / explode-a-row-into-many shape, e.g.
+
+```
+-- the 2 highest-value orders of each customer
+SELECT c.id, o.amount
+FROM   customers c
+JOIN   LATERAL (SELECT amount FROM orders WHERE cust = c.id ORDER BY amount DESC LIMIT 2) o ON true
+```
+
+**What may be lateral.** `LATERAL` precedes a **derived table** (a `(SELECT …)` sub-SELECT or a
+`(VALUES …)` body, §42) or a **table function** (an SRF — `generate_series`, `unnest`, §35). It may
+**not** precede a bare base-table name (`FROM a CROSS JOIN LATERAL b` is `42601`, matching PG — a plain
+table has nothing to correlate, so the keyword is meaningless there). Two visibility rules, both
+matching PostgreSQL:
+
+- A **sub-SELECT / VALUES derived table is lateral only with the keyword.** Without it the body is the
+  independent, non-correlated relation of §42 (a sibling reference is `42P01`/`42703`). *With* it, the
+  body's `parent` is the scope of the **earlier** FROM relations, so `t.col` / a bare `col` of an
+  earlier relation resolves as a correlated reference.
+- A **table function is *implicitly* lateral.** Its arguments may reference earlier FROM relations
+  **with or without** the keyword (`FROM t CROSS JOIN generate_series(1, t.n) g` works bare — PG); the
+  explicit `LATERAL` is accepted but redundant before an SRF. *(This lifts the §35 "SRF args are
+  non-LATERAL" narrowing.)*
+
+**Left-to-right, earlier-only.** A lateral body sees the relations to its **left** in FROM order, never
+itself and never a **later** sibling — a forward reference is `42P01` (`FROM t CROSS JOIN LATERAL (SELECT
+u.id) s, u` cannot see `u`). Lateral items **chain**: each one's correlation scope is the *cumulative*
+prefix, so `t CROSS JOIN LATERAL (…) a CROSS JOIN LATERAL (SELECT a.x + 1) b` lets `b` reference the
+earlier lateral relation `a`. The **first** FROM item is never lateral (nothing precedes it); a
+`LATERAL` keyword on it is accepted as a no-op (`FROM LATERAL (SELECT 1) s` — PG).
+
+**Spelled through `JOIN` (no comma-FROM).** jed reaches `LATERAL` via explicit join syntax —
+`CROSS JOIN LATERAL`, `[INNER] JOIN LATERAL … ON …`, `LEFT [OUTER] JOIN LATERAL … ON …`. The
+comma-FROM spelling (`FROM t, LATERAL (…)`) needs comma-`FROM`, still a deferred §15 narrowing; until
+it lands, write `CROSS JOIN LATERAL` for the implicit-cross form.
+
+**Join kinds.** `INNER` / `CROSS` / `LEFT` work as expected: `LEFT JOIN LATERAL … ON <pred>` keeps every
+left row, NULL-extending it across the lateral columns when the lateral side produces no matching row
+(so `LEFT JOIN LATERAL (…) ON true` keeps a left row even when the lateral body returns **zero** rows —
+the common "optional explode"). A **`RIGHT`/`FULL` JOIN to a lateral item that actually references the
+left side is `42P10`** (`invalid_column_reference` — *"the combining JOIN type must be INNER or LEFT for
+a LATERAL reference"*, matching PG): the right side cannot both be kept whole *and* be evaluated per
+left row. A lateral-eligible item with **no** actual correlation (`RIGHT JOIN generate_series(1, 2) g`,
+`RIGHT JOIN LATERAL (SELECT 1) s`) is *not* dependent, so it is materialized once and **any** join kind
+is allowed — again matching PG.
+
+**Execution + cost.** A non-correlated FROM item is materialized **once** (unchanged). A
+**correlated** lateral item is materialized **per combined left-hand row**: the left row is pushed onto
+the outer-row stack and the body / SRF args are re-evaluated, exactly as a correlated subquery is
+re-executed per outer row (§26). Cost is the sum of those per-row evaluations — fully deterministic
+(it depends only on the data, not timing), so the `max_cost` ceiling bounds a runaway lateral explode
+(`54P01`) and the corpus pins the accrued cost cross-core ([cost.md](cost.md) §3). No new cost unit and
+**no on-disk format change** — `LATERAL` is purely a query-plan construct (like a derived table).
+
+**Errors.**
+
+| Condition | Code | Notes |
+|---|---|---|
+| `LATERAL` before a bare base-table name | `42601` | The keyword is valid only before a derived table or table function (PG). |
+| Earlier-relation reference inside a **non-`LATERAL`** sub-SELECT / VALUES body | `42P01` / `42703` | The §42 non-correlation rule — mark the body `LATERAL` to correlate it. |
+| **Forward** / self reference (a later sibling) inside a lateral body | `42P01` | Only relations to the **left** are in scope. |
+| `RIGHT` / `FULL JOIN` to a lateral item that references the left side | `42P10` | `invalid_column_reference`; the combining join type must be INNER or LEFT for a LATERAL reference (PG). |
+| A lateral SRF / body whose own argument / clause errors (arity, type, `54001` depth, …) | *(as §35/§42)* | Lateral changes only the *scope* the body resolves against, not its other rules. |
+
+**Deliberate narrowings (relaxable later, [../../TODO.md](../../TODO.md)).**
+
+- **`RIGHT`/`FULL JOIN LATERAL` rejection is slightly broader than PG.** jed raises `42P10` when the
+  lateral item references **any** outer relation (a left sibling *or* an enclosing query); PG rejects
+  only a reference to the **left side of that join**. The practical case — `RIGHT JOIN LATERAL` that
+  correlates to the left — matches PG exactly; the divergence is the exotic `RIGHT JOIN LATERAL (body
+  that references only an *enclosing* query)`, recorded in the override ledger. A `RIGHT`/`FULL JOIN` to
+  a fully **un**correlated lateral item is allowed (matches PG).
+- **comma-`FROM` `LATERAL`** (`FROM t, LATERAL (…)`) waits on comma-`FROM` (§15).

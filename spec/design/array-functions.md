@@ -276,7 +276,8 @@ oracle-checked conformance — mirroring array.md S0–S5 and composite S0–S6.
 - **AF3 ✅** (§9) — **`unnest(anyarray)`** the set-returning function: generalizes the
   `generate_series` SRF machinery ([functions.md §10](functions.md)) to a **polymorphic element-type**
   output column and a per-element row generator. All three cores + `func.unnest` +
-  `suites/query/unnest.test`. (FROM-clause position only; the SELECT-list SRF, `LATERAL`, and the
+  `suites/query/unnest.test`. (FROM-clause position only; `LATERAL` since landed —
+  [grammar.md §44](grammar.md), so `unnest` is implicitly lateral; the SELECT-list SRF and the
   `WITH ORDINALITY` form remain their own follow-ons.)
 - **AF4 ✅** (§10) — the containment/overlap operators **`@>`** (contains), **`<@`** (contained by),
   **`&&`** (overlaps), as polymorphic `boolean`-result operators sharing `||`'s precedence rung.
@@ -419,9 +420,11 @@ the SRF analogue of the `anyelement` code (§2). Resolution (hand-written per co
    `(unnest(…)).field`, and orders/groups by the composite total order — exactly like any composite
    column. (A nested-array element is still unreachable: arrays-of-arrays do not exist, §2.)
 
-**The generator** (`unnest_rows`/`unnestRows`) evaluates the single array argument **once** against
-the params/outer environment (non-LATERAL, exactly like `generate_series`'s args — a `$N` or a
-**correlated outer column** is a legal argument, a **sibling FROM table is not**), then emits one
+**The generator** (`unnest_rows`/`unnestRows`) evaluates the single array argument against
+the params/outer environment (implicitly `LATERAL`, exactly like `generate_series`'s args — a `$N`,
+a **correlated outer column**, **and a column of an earlier sibling FROM relation**
+(`FROM t CROSS JOIN unnest(t.arr) u`) are all legal, the sibling form re-evaluating once per
+left-hand row — [grammar.md §44](grammar.md)), then emits one
 row per element in the value's **flattened row-major element order**. The semantics fall straight
 out of the array value's representation ([array.md §4](array.md)) and are oracle-pinned:
 
@@ -453,10 +456,10 @@ literal) **once**, up front.
 the new `set_of_element` reserved result. The row is shared registry data (CLAUDE.md §5) cross-checked
 into each core's `SET_RETURNING` table by `gen_catalog.rb`; the resolve/generate **dispatch** is
 hand-written per core. **`unnest` over a composite-element array landed in AF7** (§13) — the
-composite-typed output column. **Still deferred** (each its own follow-on, §6): the SELECT-list SRF
-position (`SELECT unnest(…)` is `42883`, like `generate_series`), `LATERAL` (so the natural "explode a
-column" `FROM t, unnest(t.xs)` is reached only via a correlated subquery this slice), `WITH
-ORDINALITY`, and the multi-array `unnest(a, b, …)` form.
+composite-typed output column. **`LATERAL` landed** ([grammar.md §44](grammar.md)): `unnest` is
+implicitly lateral, so the natural "explode a column" `FROM t CROSS JOIN unnest(t.xs) u` works.
+**Still deferred** (each its own follow-on, §6): the SELECT-list SRF position (`SELECT unnest(…)` is
+`42883`, like `generate_series`), `WITH ORDINALITY`, and the multi-array `unnest(a, b, …)` form.
 
 ## 10. AF4 — the containment / overlap operators (`@>` / `<@` / `&&`)
 

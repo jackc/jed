@@ -78,7 +78,7 @@ fn empty_and_null_arrays_yield_zero_rows() {
     assert_eq!(cost(&mut db, "SELECT * FROM unnest(NULL::int32[])"), 0);
 }
 
-// ---- composition: alias, CROSS JOIN, the non-LATERAL correlated argument -------------------
+// ---- composition: alias, CROSS JOIN, the correlated / implicitly-lateral argument ----------
 
 #[test]
 fn alias_renames_the_single_column() {
@@ -98,7 +98,7 @@ fn alias_renames_the_single_column() {
 }
 
 #[test]
-fn correlated_outer_array_column_is_a_legal_arg_but_a_sibling_is_not() {
+fn correlated_outer_array_column_and_sibling_are_legal_args() {
     let mut db = Database::new();
     execute(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, xs int32[])").unwrap();
     execute(
@@ -106,7 +106,8 @@ fn correlated_outer_array_column_is_a_legal_arg_but_a_sibling_is_not() {
         "INSERT INTO t VALUES (1, ARRAY[10,20]), (2, '{30}'), (3, NULL), (4, '{}')",
     )
     .unwrap();
-    // A correlated OUTER column (o.xs) resolves into the SRF arg (non-LATERAL sees params/outer).
+    // A correlated OUTER column (o.xs) resolves into the SRF arg of an enclosing-query subquery (the
+    // SRF is the subquery's sole/first FROM item, so its args see the enclosing query).
     assert_eq!(
         query(
             &mut db,
@@ -119,17 +120,19 @@ fn correlated_outer_array_column_is_a_legal_arg_but_a_sibling_is_not() {
             vec![Value::Int(4), Value::Int(0)],
         ],
     );
-    // A SIBLING FROM table's column is NOT in scope for the SRF arg (non-LATERAL): a bare `xs`
-    // does not resolve (42703), and a qualified `t.xs` finds no such FROM entry in the arg scope
-    // (42P01) — both confirm the args see only params/outer, never a sibling relation.
-    assert_eq!(
-        err_code(&mut db, "SELECT id, u FROM t CROSS JOIN unnest(xs) AS u"),
-        "42703"
-    );
-    assert_eq!(
-        err_code(&mut db, "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u"),
-        "42P01"
-    );
+    // A SIBLING FROM table's column IS now in scope — an SRF is implicitly lateral (grammar.md §44;
+    // the rows are pinned by suites/joins/lateral.test). The prior non-LATERAL 42703/42P01 rejection
+    // is lifted: bare `xs` and qualified `t.xs` both succeed, exploding each row (NULL/empty → no
+    // rows ⇒ 3 rows).
+    for sql in [
+        "SELECT id, u FROM t CROSS JOIN unnest(xs) AS u",
+        "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u",
+    ] {
+        match execute(&mut db, sql).unwrap() {
+            Outcome::Query { rows, .. } => assert_eq!(rows.len(), 3),
+            other => panic!("expected a query result, got {other:?}"),
+        }
+    }
 }
 
 // ---- strictness + deferred-form errors (NOT in the oracle corpus) --------------------------

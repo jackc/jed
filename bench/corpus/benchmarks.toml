@@ -121,3 +121,19 @@ warmup = 3
 iterations = 20
 seed = 4207
 expect_rows_per_iter = 1
+
+[[bench]]
+name = "lateral_top_n_per_group"
+description = "LATERAL top-N-per-group: a 5-customer generate_series driver CROSS JOIN LATERAL into each customer's three highest-value orders via the customer_id index — the dependent join re-evaluated once per left row (spec/design/grammar.md §44). jed + PostgreSQL only (SQLite has neither LATERAL nor generate_series)"
+dataset = "large"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT g.g AS cust, top.id, top.amount FROM generate_series($1, $1 + 4) AS g CROSS JOIN LATERAL (SELECT id, amount FROM orders WHERE customer_id = g.g ORDER BY amount DESC, id LIMIT 3) AS top ORDER BY g.g, top.id"
+warmup = 1000
+iterations = 5000
+seed = 4208
+
+[[bench.param]]
+gen = "int_uniform"
+min = 1
+max = 99996

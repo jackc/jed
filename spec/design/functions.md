@@ -346,13 +346,14 @@ inclusive, stepping by `step` (default `1`); **any NULL argument yields zero row
 `22023` (`invalid_parameter_value`, *"step size cannot be equal to zero"*); and an **i64
 overflow** while stepping **stops the series cleanly** (no trap — the last representable
 element is emitted, then the loop ends). The output column name follows PG's single-column
-function-alias rule (§35). The arguments are **non-LATERAL**: they evaluate once against the
-params/outer environment with no local row, so a `$N` or a correlated outer column is a
-legal argument but a sibling FROM table is not. Deferred: the SELECT-list SRF position,
-`LATERAL`, the column-alias-list form, and non-integer variants (§35).
+function-alias rule (§35). The arguments are **implicitly `LATERAL`** (§44): a `$N`, a correlated
+outer column, **and** a column of an earlier sibling FROM relation (`FROM t CROSS JOIN
+generate_series(1, t.n) g`) are all legal — a sibling reference re-evaluates the SRF once per
+left-hand row. Deferred: the SELECT-list SRF position, the column-alias-list form, and
+non-integer variants (§35).
 
 **The second SRF — `unnest(anyarray)`** ([array-functions.md §9](array-functions.md)) reuses this
-exact machinery: a FROM-clause synthetic relation, the same non-LATERAL arg scope, the same
+exact machinery: a FROM-clause synthetic relation, the same implicitly-lateral arg scope, the same
 single-column function-alias rule, the same `generated_row` cost and `max_cost` ceiling. It differs
 only in (a) its column type — the **bound element type** of its `anyarray` argument (the
 `set_of_element` result, the polymorphic analogue of `generate_series`'s `set_of_promoted`), and (b)

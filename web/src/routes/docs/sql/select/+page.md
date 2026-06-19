@@ -37,6 +37,15 @@ ORDER BY category;`;
 FROM (VALUES ('a', 1), ('b', 2), ('c', 3)) AS v (label, qty)
 ORDER BY label;`;
 
+	const lateral = `SELECT c.category, top.name, top.price
+FROM (SELECT DISTINCT category FROM product) AS c
+CROSS JOIN LATERAL (
+  SELECT name, price FROM product
+  WHERE category = c.category
+  ORDER BY price DESC LIMIT 1
+) AS top
+ORDER BY c.category;`;
+
 	const unnestExample = `SELECT u AS tag
 FROM unnest(ARRAY['red', 'green', 'blue']) AS u
 ORDER BY u;`;
@@ -138,9 +147,9 @@ column-rename list (`AS t (a, b)`):
 
 <LiveSql {seed} query={derived} rows={4} />
 
-The body is an independent query — it cannot see the enclosing query's other `FROM` relations
-(`LATERAL` is not yet supported). A parenthesized join (`FROM (a JOIN b …)`) and a `WITH` body are
-likewise not yet supported.
+By default the body is an independent query — it cannot see the enclosing query's other `FROM`
+relations. Mark it `LATERAL` (below) to correlate it. A parenthesized join (`FROM (a JOIN b …)`) and a
+`WITH` body are not yet supported.
 
 ## `VALUES` lists in `FROM` (`FROM (VALUES …) AS v(x)`)
 
@@ -153,6 +162,19 @@ is a general constant expression (`qty * 2` below):
 
 Order or limit the **outer** query (`FROM (VALUES …) v ORDER BY x`); a trailing `ORDER BY` / `LIMIT`
 inside the parentheses is not yet supported.
+
+## `LATERAL` joins
+
+A `LATERAL` `FROM` item may reference columns of the `FROM` relations that appear **before** it — a
+dependent join re-evaluated once per left-hand row. It is the idiomatic way to express
+**top-N-per-group**: for each category, the single most expensive product.
+
+<LiveSql {seed} query={lateral} rows={2} />
+
+Reach it through explicit join syntax — `CROSS JOIN LATERAL`, `JOIN LATERAL … ON …`, or `LEFT JOIN
+LATERAL … ON …` (a `LEFT JOIN` keeps a left row even when the lateral side produces no rows). A
+sub-`SELECT` or `VALUES` body is lateral only with the keyword; a **table function** (`generate_series`,
+`unnest`) is *implicitly* lateral, so `… CROSS JOIN unnest(t.tags)` correlates with or without it.
 
 ## Set-returning functions in `FROM`
 

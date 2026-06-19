@@ -151,6 +151,10 @@ var SupportedCapabilities = []string{
 	// as a FROM relation, a computed relation of literal rows (general constant expressions,
 	// per-column type unification across rows) — spec/design/grammar.md §42.
 	"query.values",
+	// LATERAL joins — a FROM item (LATERAL derived table / VALUES, or an implicitly-lateral table
+	// function) whose body / args reference the EARLIER FROM relations, a dependent join
+	// re-evaluated per left-hand row — spec/design/grammar.md §44.
+	"query.lateral",
 	// Scalar functions abs / round (per-row, valid anywhere an expression is) —
 	// spec/design/functions.md §9.
 	"func.abs",

@@ -4,8 +4,8 @@
 # typed at the promoted integer type of the args. PostgreSQL semantics: ascending/descending by
 # the step, inclusive of stop when it lands on the sequence; any NULL arg → zero rows; start past
 # stop for the step's direction → zero rows; a step of zero → 22023. It composes with WHERE /
-# ORDER BY / LIMIT, joins/cross-joins other FROM relations, and (non-LATERAL) takes a $N or a
-# correlated OUTER column as an argument. Each generated element charges one generated_row, so a
+# ORDER BY / LIMIT, joins/cross-joins other FROM relations, and (implicitly lateral, grammar.md §44)
+# takes a $N, a correlated OUTER column, or an earlier sibling as an argument. Each generated element charges one generated_row, so a
 # query's cost is the generated rows plus the usual evaluation + row_produced (spec/design/cost.md
 # §3) — distinct from a table scan's page_read/storage_row_read, of which an SRF charges none.
 # PostgreSQL-oracle-verified (postgres:18). The integer-literal args default to int64 (jed's
