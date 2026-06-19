@@ -511,6 +511,17 @@ function sequenceTableDB(): Database {
   return db;
 }
 
+// serialTableDB (v13): the OWNED-sequence link (the has_owner flag bit + the owner table-name/
+// column-ordinal tail). The serial column id desugars to an i32 column that is NOT NULL (via the PK)
+// with an expression DEFAULT nextval('t_id_seq'), and an OWNED sequence t_id_seq created alongside;
+// one INSERT advances it once. Must match the Ruby reference's SERIAL_TABLE (spec/design/sequences.md §12).
+function serialTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id serial PRIMARY KEY, v text)");
+  run(db, "INSERT INTO t (v) VALUES ('hello')");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -543,6 +554,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB },
     { name: "sequence_table.jed", build: sequenceTableDB },
+    { name: "serial_table.jed", build: serialTableDB },
     { name: "array_table.jed", build: arrayTableDB },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB },
@@ -590,6 +602,7 @@ test("read goldens reproduces rows", () => {
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB, table: "t" },
     { name: "sequence_table.jed", build: sequenceTableDB, table: "t" },
+    { name: "serial_table.jed", build: serialTableDB, table: "t" },
     { name: "array_table.jed", build: arrayTableDB, table: "t" },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB, table: "t" },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB, table: "t" },

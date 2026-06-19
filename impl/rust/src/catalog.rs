@@ -161,6 +161,21 @@ pub struct SequenceDef {
     /// Whether `nextval` has been called: `false` ⇒ the next call returns `last_value` (= `start`)
     /// without incrementing; `true` ⇒ it adds `increment` (PostgreSQL's `is_called`).
     pub is_called: bool,
+    /// The `OWNED BY` link for a sequence created by a `serial` column (spec/design/sequences.md
+    /// §12) — `Some` records the owning table + column ordinal, `None` for a plain `CREATE
+    /// SEQUENCE`. Persisted (format_version 13, the `has_owner` flag bit): it drives `DROP TABLE`
+    /// auto-drop and the `DROP SEQUENCE` 2BP01. A plain `DEFAULT nextval('s')` creates **no** owner
+    /// link (PG — sequences.md §10 decision 4).
+    pub owned_by: Option<SeqOwner>,
+}
+
+/// The `OWNED BY` reference of a `serial`-created sequence (spec/design/sequences.md §12): the
+/// owning table (original case) and the owning column's 0-based ordinal. Persisted on the sequence
+/// catalog entry (format.md *Sequence entry*, v13).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SeqOwner {
+    pub table: String,
+    pub column: u16,
 }
 
 impl SequenceDef {

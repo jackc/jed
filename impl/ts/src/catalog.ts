@@ -154,6 +154,20 @@ export type SequenceDef = {
   // Whether nextval has been called: false ⇒ the next call returns lastValue (= start) without
   // incrementing; true ⇒ it adds increment (PostgreSQL's is_called).
   isCalled: boolean;
+  // The OWNED BY link for a sequence created by a serial column (spec/design/sequences.md §12) —
+  // present records the owning table + column ordinal, undefined for a plain CREATE SEQUENCE.
+  // Persisted (format_version 13, the has_owner flag bit): it drives DROP TABLE auto-drop and the
+  // DROP SEQUENCE 2BP01. A plain DEFAULT nextval('s') creates no owner link (PG — sequences.md §10
+  // decision 4).
+  ownedBy?: SeqOwner;
+};
+
+// SeqOwner is the OWNED BY reference of a serial-created sequence (spec/design/sequences.md §12):
+// the owning table (original case) and the owning column's 0-based ordinal. Persisted on the
+// sequence catalog entry (format.ts / format.md *Sequence entry*, v13).
+export type SeqOwner = {
+  table: string;
+  column: number;
 };
 
 // I64_MAX is the i64 maximum (2^63-1), the default ascending MAXVALUE / descending floor base.

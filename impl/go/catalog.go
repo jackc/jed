@@ -133,6 +133,20 @@ type SequenceDef struct {
 	// IsCalled is whether nextval has been called: false ⇒ the next call returns LastValue (=
 	// Start) without incrementing; true ⇒ it adds Increment (PostgreSQL's is_called).
 	IsCalled bool
+	// OwnedBy is the OWNED BY link for a sequence created by a serial column
+	// (spec/design/sequences.md §12) — non-nil records the owning table + column ordinal, nil for a
+	// plain CREATE SEQUENCE. Persisted (format_version 13, the has_owner flag bit): it drives
+	// DROP TABLE auto-drop and the DROP SEQUENCE 2BP01. A plain DEFAULT nextval('s') creates no
+	// owner link (PG — sequences.md §10 decision 4).
+	OwnedBy *SeqOwner
+}
+
+// SeqOwner is the OWNED BY reference of a serial-created sequence (spec/design/sequences.md §12):
+// the owning table (original case) and the owning column's 0-based ordinal. Persisted on the
+// sequence catalog entry (format.md *Sequence entry*, v13).
+type SeqOwner struct {
+	Table  string
+	Column uint16
 }
 
 // DefaultBounds returns the type defaults for an ascending (increment > 0) vs descending

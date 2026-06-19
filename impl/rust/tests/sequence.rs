@@ -4,8 +4,14 @@
 //! propagation. The PG-agreeing behavior (nextval values, currval, 42P01/42P07/22023/2200H, CYCLE)
 //! lives in suites/ddl/sequence.test + suites/expr/sequence_value.test (CLAUDE.md §10).
 
+use std::path::PathBuf;
+
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
+use jed::{Database, DatabaseOptions, Outcome, execute};
+
+fn tmp(name: &str) -> PathBuf {
+    PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(name)
+}
 
 fn one_int(db: &mut Database, sql: &str) -> Option<i64> {
     match execute(db, sql).unwrap() {
@@ -179,4 +185,128 @@ fn setval_alter_in_read_only_is_25006() {
     execute(&mut db, "BEGIN READ ONLY").unwrap();
     assert_eq!(one_int(&mut db, "SELECT lastval()"), Some(1));
     execute(&mut db, "ROLLBACK").unwrap();
+}
+
+// ---------------------------------------------------------------------------
+// S3 — serial / bigserial / smallserial (spec/design/sequences.md §12). These per-core tests cover
+// what the PG-clean corpus cannot: the auto-named OWNED sequence (introspected by the name PG also
+// derives), the DROP TABLE auto-drop surviving a reopen (file persistence of the owner link, v13),
+// and the DROP SEQUENCE 2BP01. The PG-agreeing surface (the inserted values, an explicit override)
+// lives in suites/ddl/serial.test.
+
+/// A `serial` column desugars to an integer column, NOT NULL, with a DEFAULT nextval backed by an
+/// auto-created OWNED sequence named `<table>_<col>_seq`. Inserts auto-number from 1.
+#[test]
+fn serial_desugars_to_owned_sequence() {
+    let mut db = Database::new();
+    execute(
+        &mut db,
+        "CREATE TABLE t (id serial PRIMARY KEY, b bigserial, s smallserial, v text)",
+    )
+    .unwrap();
+    // Two inserts auto-number every serial column from 1 (each column's own sequence).
+    match execute(
+        &mut db,
+        "INSERT INTO t (v) VALUES ('a'), ('b') RETURNING id, b, s",
+    )
+    .unwrap()
+    {
+        Outcome::Query { rows, .. } => {
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0], vec![Value::Int(1), Value::Int(1), Value::Int(1)]);
+            assert_eq!(rows[1], vec![Value::Int(2), Value::Int(2), Value::Int(2)]);
+        }
+        o => panic!("expected a query, got {o:?}"),
+    }
+    // The owned sequences exist under PG's derived names and keep advancing.
+    assert_eq!(one_int(&mut db, "SELECT nextval('t_id_seq')"), Some(3));
+    assert_eq!(one_int(&mut db, "SELECT nextval('t_b_seq')"), Some(3));
+    assert_eq!(one_int(&mut db, "SELECT nextval('t_s_seq')"), Some(3));
+}
+
+/// A NULL into a serial column violates the implied NOT NULL (23502); an explicit value overrides
+/// the default and does NOT advance the sequence (PG).
+#[test]
+fn serial_not_null_and_explicit_override() {
+    let mut db = Database::new();
+    execute(&mut db, "CREATE TABLE t (id serial PRIMARY KEY, v text)").unwrap();
+    assert_eq!(
+        err_code(&mut db, "INSERT INTO t (id, v) VALUES (NULL, 'x')"),
+        "23502"
+    );
+    // Supply an explicit id — the sequence is untouched, so the next default is still 1.
+    execute(&mut db, "INSERT INTO t (id, v) VALUES (100, 'y')").unwrap();
+    match execute(&mut db, "INSERT INTO t (v) VALUES ('z') RETURNING id").unwrap() {
+        Outcome::Query { rows, .. } => assert_eq!(rows[0][0], Value::Int(1)),
+        o => panic!("expected a query, got {o:?}"),
+    }
+}
+
+/// An explicit DEFAULT on a serial column conflicts with the synthesized one — 42601 (PG).
+#[test]
+fn serial_with_explicit_default_is_42601() {
+    let mut db = Database::new();
+    assert_eq!(
+        err_code(&mut db, "CREATE TABLE t (id serial DEFAULT 5)"),
+        "42601"
+    );
+}
+
+/// The auto-name collision-resolves with a numeric suffix when `<table>_<col>_seq` is taken (PG).
+#[test]
+fn serial_seq_name_collision_resolves() {
+    let mut db = Database::new();
+    execute(&mut db, "CREATE SEQUENCE t_id_seq").unwrap();
+    execute(&mut db, "CREATE TABLE t (id serial)").unwrap();
+    // The pre-existing t_id_seq forced the owned sequence to t_id_seq1.
+    execute(&mut db, "INSERT INTO t (id) VALUES (DEFAULT)").unwrap();
+    // t_id_seq (the manual one) was never advanced; t_id_seq1 produced the row's 1.
+    assert_eq!(one_int(&mut db, "SELECT nextval('t_id_seq1')"), Some(2));
+    assert_eq!(one_int(&mut db, "SELECT nextval('t_id_seq')"), Some(1));
+}
+
+/// DROP SEQUENCE of an OWNED (serial) sequence is 2BP01; DROP TABLE auto-drops it.
+#[test]
+fn owned_sequence_drop_rules() {
+    let mut db = Database::new();
+    execute(&mut db, "CREATE TABLE t (id serial PRIMARY KEY)").unwrap();
+    // Cannot drop the owned sequence directly.
+    assert_eq!(err_code(&mut db, "DROP SEQUENCE t_id_seq"), "2BP01");
+    // DROP TABLE auto-drops it — afterwards the sequence name is undefined (42P01).
+    execute(&mut db, "DROP TABLE t").unwrap();
+    assert_eq!(err_code(&mut db, "SELECT nextval('t_id_seq')"), "42P01");
+    // The auto-dropped name is free to reuse.
+    execute(&mut db, "CREATE SEQUENCE t_id_seq").unwrap();
+}
+
+/// The OWNED BY link persists (format_version 13): after create + commit + reopen, DROP TABLE still
+/// auto-drops the owned sequence, and DROP SEQUENCE of it is still 2BP01.
+#[test]
+fn owned_link_survives_reopen() {
+    let path = tmp("serial_owned_reopen.jed");
+    let _ = std::fs::remove_file(&path);
+    {
+        let mut db = Database::create(&path, DatabaseOptions::default()).unwrap();
+        execute(&mut db, "CREATE TABLE t (id serial PRIMARY KEY, v text)").unwrap();
+        execute(&mut db, "INSERT INTO t (v) VALUES ('a')").unwrap();
+        db.commit().unwrap();
+    }
+    {
+        let mut db = Database::open(&path).unwrap();
+        // The owner link round-tripped: still 2BP01 to drop the sequence directly.
+        assert_eq!(err_code(&mut db, "DROP SEQUENCE t_id_seq"), "2BP01");
+        // And DROP TABLE still auto-drops it.
+        execute(&mut db, "DROP TABLE t").unwrap();
+        assert_eq!(err_code(&mut db, "SELECT nextval('t_id_seq')"), "42P01");
+        db.commit().unwrap();
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `serial` is recognized only in a column-type position — a CAST to it is an undefined type.
+#[test]
+fn serial_is_not_a_castable_type() {
+    let mut db = Database::new();
+    // 42704 undefined_object (serial is not a real type outside CREATE TABLE).
+    assert_eq!(err_code(&mut db, "SELECT 1::serial"), "42704");
 }

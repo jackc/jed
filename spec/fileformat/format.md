@@ -15,9 +15,21 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 13)
+## Version scope (`format_version` 14)
 
-The current on-disk version is **`format_version` 13** — **GIN inverted indexes**
+The current on-disk version is **`format_version` 14** — the **`serial` owned-sequence link**
+([../design/sequences.md §12](../design/sequences.md)). A `serial` / `bigserial` / `smallserial`
+column creates a sequence that is **owned by** its column; the owner link must persist so `DROP TABLE`
+auto-drops the owned sequence after a reopen. The only on-disk change is in the **sequence entry**: the
+`flags` byte gains **bit 2 `has_owner`**, and when set, the entry's six i64 fields + flags are followed
+by the owner reference — `owner_table_len u16` + owner table name, then `owner_column u16` (the owning
+column's 0-based ordinal) — the *Sequence entry* table in the *Catalog* section below. A non-owned
+sequence (a plain `CREATE SEQUENCE`) writes nothing after the flags byte, so its bytes are the v13
+shape (only the version byte + meta CRC change). No value-codec, key-encoding, or B-tree change. Each
+version is a **clean break** — older versions are **not read** (we are pre-1.0 and owe no on-disk
+compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only** version 14.
+
+`format_version` 13 was **GIN inverted indexes**
 ([../design/gin.md](../design/gin.md)). A GIN index is a second index *kind* beside the ordered
 B-tree; it owns an on-disk B-tree exactly as an ordinary index does, so the only catalog change is
 in the **index list** of the table entry: each index entry gains a one-byte **`index_kind`**
@@ -25,9 +37,7 @@ discriminator (`0` = ordered B-tree, `1` = GIN) between its `index_flags` byte a
 `index_root_page` (*Catalog* below). An ordinary index writes `index_kind = 0`, so every table
 entry with indexes grows by one byte per index; a GIN entry's *key bytes* differ (a term ‖
 storage-key, [../design/gin.md §4](../design/gin.md)) but the page/record framing does not. The
-per-table data B-tree, the value codec, and the meta page are untouched. Each version is a **clean
-break** — older versions are **not read** (we are pre-1.0 and owe no on-disk compatibility;
-CLAUDE.md §1, "we own our surface"), so a reader accepts **only** version 13.
+per-table data B-tree, the value codec, and the meta page are untouched.
 
 `format_version` 12 was **sequences**
 ([../design/sequences.md](../design/sequences.md)). A sequence (`CREATE SEQUENCE s`) is a
@@ -235,7 +245,7 @@ and slot selection):
 | offset | size | field |
 |---|---|---|
 | 0  | 4 | `magic` = `4A 45 44 42` (ASCII `JEDB`, for the engine `jed`) |
-| 4  | 2 | `format_version` (u16) — current = **`13`** |
+| 4  | 2 | `format_version` (u16) — current = **`14`** |
 | 6  | 2 | reserved (0) |
 | 8  | 4 | `page_size` (u32) |
 | 12 | 8 | `txid` (u64) — commit counter; the highest valid slot wins on open |
@@ -264,7 +274,7 @@ present (copy-on-write never overwrote them). `create` seeds **both** slots with
 `txid = 1` meta, so two valid slots exist from the first moment (the first even-`txid` commit
 then overwrites slot 0).
 
-**Opening (slot selection).** Validate each slot independently (magic, `format_version == 13`,
+**Opening (slot selection).** Validate each slot independently (magic, `format_version == 14`,
 reserved == 0, `crc32`). Choose the **valid** slot with the **highest `txid`**; on a tie,
 slot 0. Exactly one valid → use it (torn-write fallback). Neither valid → `data_corrupted`.
 
@@ -430,11 +440,12 @@ loader's two-pass validation rejects a dangling reference or a definition cycle 
 composite reached **through an array field** — as `XX001` (a v10 additive extension; no
 `format_version` bump, since an array element descriptor is already a v10 shape).
 
-### Sequence entry (`entry_kind = 2`, v12)
+### Sequence entry (`entry_kind = 2`, v12; owner added v13)
 
 A sequence entry records a `CREATE SEQUENCE name [options]` definition
-([../design/sequences.md §3](../design/sequences.md)). It is **fixed-width** — every field is
-always present and non-NULL, so there are no presence tags or conditional fields:
+([../design/sequences.md §3](../design/sequences.md)). The six i64 fields + flags are **fixed-width**
+(every one always present, no presence tags); the v13 owner reference is a **conditional tail** gated
+by the `has_owner` flag bit:
 
 | field | encoding |
 |---|---|
@@ -447,13 +458,19 @@ always present and non-NULL, so there are no presence tags or conditional fields
 | `start` | i64 — same encoding |
 | `cache` | i64 — same encoding (stored for fidelity; behaves as `1`, sequences.md §7) |
 | `last_value` | i64 — same encoding (the mutable counter; `= start` on a fresh sequence) |
-| `flags` | u8 — bit0 `cycle`, bit1 `is_called`; bits 2–7 reserved, written 0 (a set reserved bit is `XX001`) |
+| `flags` | u8 — bit0 `cycle`, bit1 `is_called`, bit2 `has_owner` (**new in v13**); bits 3–7 reserved, written 0 (a set reserved bit is `XX001`) |
+| `owner_table_len` | u16 — **only present when `flags` bit2 (`has_owner`)** |
+| `owner_table` | `owner_table_len` bytes UTF-8 — the owning table name (original case) |
+| `owner_column` | u16 — the owning column's **0-based ordinal** in the table |
 
 The six `i64` fields use the **interval-body encoding** (plain big-endian two's-complement) rather
 than the order-preserving sign-flip, because a catalog entry is a *value*-codec context, not a sorted
 key. `last_value` + `is_called` are the only mutable state; a `nextval` rewrites them, and the whole
 catalog is rewritten copy-on-write at the next commit (transactions.md §4.5). A sequence entry owns
-no B-tree (no `root_data_page`), like a foreign key.
+no B-tree (no `root_data_page`), like a foreign key. The owner reference (`has_owner`) records the
+`OWNED BY` link a `serial` column establishes ([../design/sequences.md §12](../design/sequences.md)),
+so a reopened database still auto-drops the owned sequence on `DROP TABLE`; a plain `CREATE SEQUENCE`
+is non-owned (`has_owner = 0`, no tail).
 
 ### Check-expression text
 

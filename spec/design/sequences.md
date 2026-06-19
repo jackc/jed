@@ -28,6 +28,10 @@ CREATE SEQUENCE [IF NOT EXISTS] s
 ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]   -- reset the counter (S2 — §4)
 DROP SEQUENCE [IF EXISTS] s [, ...] [RESTRICT]
 
+CREATE TABLE t (id serial, ...)                 -- the serial pseudo-types (S3 — §12): an
+CREATE TABLE t (id bigserial, ...)              -- auto-created OWNED sequence + DEFAULT
+CREATE TABLE t (id smallserial, ...)            -- nextval(...) + NOT NULL; DROP TABLE auto-drops it
+
 SELECT nextval('s')            -- advance and return the new value (a WRITE statement — §4)
 SELECT currval('s')            -- the last value nextval/setval produced IN THIS SESSION (§6)
 SELECT setval('s', n)          -- set the counter; next nextval = n + INCREMENT (a WRITE — §4)
@@ -80,7 +84,7 @@ when a table, index, or sequence `s` exists is `42P07 duplicate_table` (PG), and
 after `CREATE SEQUENCE s` is likewise `42P07`. (This slice enforces the sequence↔sequence and
 sequence↔table collisions; a sequence↔index collision rides the same name set.)
 
-## 3. Catalog & on-disk format (`format_version` 12)
+## 3. Catalog & on-disk format (`format_version` 12, owner added in `14`)
 
 Sequences extend the v9 **kind-tagged** catalog (today `0` = table, `1` = composite-type) with a
 third kind. The on-disk shape (full byte layout in [../fileformat/format.md](../fileformat/format.md)):
@@ -96,13 +100,21 @@ third kind. The on-disk shape (full byte layout in [../fileformat/format.md](../
 - **Sequence entry** (after the `entry_kind = 2` byte): `name_len u16` + name, then six fixed
   `i64` fields **big-endian two's-complement, no sign-flip** (a value-codec context, not a key —
   like the interval body) in this order — `increment`, `min_value`, `max_value`, `start`, `cache`,
-  `last_value` — then `flags u8` (bit 0 = `cycle`, bit 1 = `is_called`; bits 2–7 reserved, written 0).
-  Fixed-width, no presence tags: every field is always present and non-NULL.
-- **`format_version` 12** is a clean break (the v12 reader rejects v11 and earlier, as every prior
-  bump did). All existing `.jed` goldens regenerate at the bump (only the version byte changes for a
-  file with no sequences; a file *with* sequences gains the kind-2 entries). The reference encoder
-  ([../fileformat/verify.rb](../fileformat/verify.rb)) gains a `sequences:` fixture key and the new
-  `sequence_table.jed` golden, byte-identical `rust == go == ts == ruby`.
+  `last_value` — then `flags u8` (bit 0 = `cycle`, bit 1 = `is_called`, **bit 2 = `has_owner`** —
+  new in v14; bits 3–7 reserved, written 0). The six i64 fields are fixed-width, no presence tags:
+  every one is always present and non-NULL. **When `has_owner` is set** (an `owned` sequence — a
+  `serial` column's sequence, §12), the flags byte is followed by the owner reference:
+  `owner_table_len u16` + owner table name, then `owner_column u16` (the owning column's **0-based
+  ordinal**). A non-owned sequence (a plain `CREATE SEQUENCE`) writes nothing after the flags byte —
+  the v12 shape, unchanged.
+- **`format_version` 12** was the original sequence bump; **`format_version` 14** adds the optional
+  owner reference (the only on-disk change — bit 2 + the trailing owner bytes). Each is a clean break
+  (the v14 reader rejects v13 and earlier, as every prior bump did). All existing `.jed` goldens
+  regenerate at a bump (only the version byte changes for a file with no owned sequences; an owned
+  sequence gains the trailing owner bytes). The reference encoder
+  ([../fileformat/verify.rb](../fileformat/verify.rb)) carries the `sequences:` fixture key, the
+  `sequence_table.jed` golden, and the v14 `serial_table.jed` golden, byte-identical
+  `rust == go == ts == ruby`.
 
 A sequence entry adds no value-codec, key-encoding, or B-tree change — a sequence owns no rows and no
 tree, only its catalog tuple (like a `FOREIGN KEY`, which also owns no B-tree).
@@ -251,6 +263,8 @@ flat per-call weight is a sound bound.
 | `CREATE SEQUENCE` name already a relation (no `IF NOT EXISTS`) | `42P07` duplicate_table |
 | `nextval`/`currval` on a missing sequence | `42P01` undefined_table |
 | `DROP SEQUENCE` of a missing sequence (no `IF EXISTS`) | `42P01` undefined_table |
+| `DROP SEQUENCE` of an `OWNED` (`serial`) sequence, RESTRICT (§12) | `2BP01` dependent_objects_still_exist |
+| `serial` column with an explicit `DEFAULT` (§12) | `42601` syntax_error |
 | `setval`/`ALTER … RESTART`/`nextval`/`currval` on a missing sequence | `42P01` undefined_table |
 | `currval` before `nextval`/`setval(…,true)`; `lastval` before any `nextval`, this session | `55000` object_not_in_prerequisite_state |
 | `nextval` past `MAXVALUE`/`MINVALUE` without `CYCLE` | `2200H` sequence_generator_limit_exceeded |
@@ -280,6 +294,15 @@ are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle_ove
    alone; `setval` never touches `lastval`; `RESTART` touches no session state — §4/§6).
 8. **`setval` out-of-bounds is `22003`, `RESTART` out-of-bounds is `22023`** — the two distinct PG
    error paths (`do_setval` vs. `init_params`) are preserved as-is (§4).
+9. **`serial` sequences are `bigint`-flavored** (§12) — `serial`/`smallserial` do NOT get PG's
+   per-type `AS integer`/`AS smallint` sequence (the `AS type` typmod is `0A000` this slice, decision
+   3). The owned sequence is the default ascending i64 sequence; the *column* is `i32`/`i16` and
+   bounds stored values (a too-large `nextval` traps `22003` at the INSERT coercion rather than PG's
+   `2200H` at the sequence). Overriding reason: the deferred `AS type`. Same divergence-class as
+   decision 3, ledgered.
+10. **The owned (`serial`) sequence is dropped with its table; dropping it alone is `2BP01`** (§12) —
+    the `OWNED BY` dependency. Matches PG. Unlike a *plain* `DEFAULT nextval('s')` (decision 4, no
+    dependency), a `serial`-created sequence carries a persisted owner link.
 
 ## 11. Delivery (sub-slices)
 
@@ -301,11 +324,107 @@ sub-slices, each passing `rake ci`:
   `setval`/`ALTER RESTART` available, the corpus reaches a known counter state in **one replayable
   statement** and then asserts a single `nextval`/`currval`, so the S1 "advance via `statement ok`,
   read via terminal `query`" scaffolding is replaced by direct `setval`-then-assert checks.
-- **S3** — the `serial` / `bigserial` / `smallserial` pseudo-types: column sugar that creates an
-  owned sequence + a `DEFAULT nextval(...)` + the `OWNED BY` auto-drop dependency (so `DROP TABLE`
-  removes the owned sequence; `2BP01` dependency tracking arrives here).
+- **S3** ✅ — the `serial` / `bigserial` / `smallserial` pseudo-types (§12): column sugar that, at
+  `CREATE TABLE`, creates an **owned** sequence + a `DEFAULT nextval(...)` + `NOT NULL` and records
+  the `OWNED BY` link, so `DROP TABLE` auto-drops the owned sequence and `DROP SEQUENCE` of an owned
+  sequence is `2BP01`. The owner reference is persisted (**`format_version` 14**, the `has_owner`
+  flag bit + trailing owner bytes — §3), with the `serial_table.jed` golden
+  (`rust == go == ts == ruby`) and capability `ddl.serial`. `serial` sequences are `bigint`-flavored
+  (the `AS type` deferral, §12) — a documented divergence.
 - **S4** — `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` columns (the SQL-standard identity surface)
   + `OVERRIDING { SYSTEM | USER } VALUE`.
 
 Each later slice is its own design-doc revision + corpus + (where it touches bytes) a `format_version`
 note and golden.
+
+## 12. `serial` / `bigserial` / `smallserial` — the auto-sequence pseudo-types (S3)
+
+`serial` is not a real type: it is **`CREATE TABLE` column sugar** (PostgreSQL) for "an auto-numbered
+column backed by its own sequence". jed adopts PG's desugaring exactly. A column declared
+
+```sql
+CREATE TABLE t (id serial, ...)
+```
+
+is, at `CREATE TABLE` execution, expanded to the equivalent of
+
+```sql
+CREATE SEQUENCE t_id_seq;                              -- an OWNED sequence (default i64, §3)
+-- column id  =>  i32 NOT NULL DEFAULT nextval('t_id_seq')
+-- the sequence is OWNED BY t.id  (DROP TABLE t auto-drops t_id_seq; §12.3)
+```
+
+### 12.1 The three pseudo-types and their aliases
+
+Recognized **only** in a `CREATE TABLE` column-type position (not in `CAST`, `CREATE SEQUENCE … AS`,
+a `CREATE TYPE` field, or an array element type — there `serial` is an undefined type, the existing
+`42704`/“type does not exist” path, matching PG):
+
+| Pseudo-type | Aliases | Column type |
+|---|---|---|
+| `serial` | `serial4` | `i32` (`integer`) |
+| `bigserial` | `serial8` | `i64` (`bigint`) |
+| `smallserial` | `serial2` | `i16` (`smallint`) |
+
+The pseudo-type sets **only** the column's underlying type; everything else is the desugaring below.
+A `serial` column carries **no typmod** and **no `[]` array suffix** — `serial(p)` / `serial[]` is a
+`42601` syntax-style rejection (jed: `42601`; the natural “undefined type” path also suffices — PG
+rejects `serial[]` as `0A000` "array of serial is not implemented", a wording divergence not worth a
+dedicated branch).
+
+### 12.2 The desugaring (at `CREATE TABLE`)
+
+For each `serial` column `c` of table `t`, in column declaration order:
+
+1. **Column type** ← `i32` / `i64` / `i16` per the table above.
+2. **`NOT NULL`** is forced on the column (PG: a `serial` column is `NOT NULL`). An explicit
+   `NOT NULL` is harmlessly redundant; an explicit `NULL` is not a jed surface, so no conflict arises.
+3. **An explicit `DEFAULT` is rejected** `42601` — "multiple default values specified for column
+   *c* of table *t*" (PG): a `serial` column's default is `nextval(...)`, and a second default is an
+   error.
+4. **The owned sequence** is created: a **default ascending i64 sequence** (`INCREMENT 1`,
+   `MINVALUE 1`, `MAXVALUE 2^63-1`, `START 1`, `CACHE 1`, no `CYCLE`) — the same `SequenceDef`
+   `CREATE SEQUENCE t_id_seq` would build, **plus** an `owned_by = (t, ordinal-of-c)` link (§3,
+   persisted v14). It is `bigint`-flavored for all three pseudo-types (decision 9 — the `AS type`
+   deferral); the *column's* narrower type bounds stored values.
+5. **The sequence name** is `lower(t)_lower(c)_seq`. If that name already names a relation
+   (table / index / sequence — the shared relation namespace, §2), including a sequence created by an
+   *earlier* `serial` column of the **same** statement, the smallest integer suffix `1`, `2`, … is
+   appended until free (`t_id_seq` taken → `t_id_seq1`), matching PG's `ChooseRelationName`.
+6. **The column `DEFAULT`** becomes the expression default `nextval ( '<seqname>' )` — stored as
+   expression text (the `format_version` 8 expression-default mechanism — [constraints.md §2](constraints.md)),
+   evaluated per row at INSERT through the existing `nextval` write path (which advances the sequence
+   and is transactional, §4/§5). Supplying an explicit value for the column at INSERT overrides the
+   default and does **not** advance the sequence (PG — the value and the counter can later collide,
+   exactly as in PG).
+
+A `serial` column may be a `PRIMARY KEY` (the common `id serial PRIMARY KEY` form): the `i32`/`i64`/`i16`
+type is key-encodable, so the PK gate is satisfied; the column is then PK + `NOT NULL` + the
+`nextval` default.
+
+### 12.3 `OWNED BY` — the dependency (`DROP TABLE` auto-drop, `DROP SEQUENCE` 2BP01)
+
+The persisted `owned_by` link (§3) is the only thing distinguishing a `serial`-created sequence from a
+manually-created one referenced by a plain `DEFAULT nextval('s')` (which creates **no** dependency,
+decision 4). It drives two behaviors, both matching PG:
+
+- **`DROP TABLE t`** auto-drops every sequence `owned_by` `t`, silently, as part of the drop (after
+  the `FOREIGN KEY`-dependent check, which an owned sequence never trips). The owned sequences are
+  removed from the catalog before the table; the drop stays zero-cost. After reopening a persisted
+  database the link is still present (v14), so the auto-drop survives a close/open cycle.
+- **`DROP SEQUENCE s`** where `s` is owned is `2BP01 dependent_objects_still_exist` —
+  "cannot drop sequence *s* because other objects depend on it: default value for column *c* of table
+  *t* depends on sequence *s*" (RESTRICT; `CASCADE` is `0A000` this slice). The owner table is always
+  present when this fires (the table's own `DROP TABLE` would have auto-dropped the sequence first),
+  so the column name for the detail is always resolvable.
+
+`DROP TYPE` / `DROP INDEX` are unaffected (a sequence is owned only by a table column). There is no
+standalone `OWNED BY` / `ALTER SEQUENCE … OWNED BY` surface this slice — ownership is established
+**only** by `serial` (the `OWNED BY` clause stays `0A000`, §9's `ALTER` row).
+
+### 12.4 Determinism
+
+`serial` adds no new nondeterminism: the owned sequence is an ordinary snapshot field (transactional,
+§5), the auto-generated name is a pure function of `(table, column)` + the catalog (the suffix scan is
+deterministic), and the auto-drop is a deterministic catalog edit. The whole feature is byte-identical
+cross-core, pinned by the `serial_table.jed` golden (§3) and the `ddl/serial.test` corpus.

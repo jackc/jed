@@ -1,0 +1,97 @@
+# serial / bigserial / smallserial (aliases serial4 / serial8 / serial2) — CREATE TABLE column
+# pseudo-types (spec/design/sequences.md §12). Sugar (PostgreSQL) for an integer column (i32 / i64 /
+# i16) that is NOT NULL with a DEFAULT nextval(...) backed by a newly-created OWNED sequence named
+# <table>_<column>_seq (with numeric-suffix collision resolution). DROP TABLE auto-drops the owned
+# sequence; DROP SEQUENCE of an owned sequence is 2BP01; an explicit DEFAULT on a serial column is
+# 42601. The owned sequences are bigint-flavored for all three (the AS-type deferral — a documented
+# divergence) but the column type bounds stored values, so small values agree with PG exactly.
+#
+# The owner-link PERSISTENCE (auto-drop surviving a reopen), the NOT-NULL-via-implied (23502), the
+# explicit-value override (which does not advance the sequence), and serial-as-an-undefined-type
+# outside CREATE TABLE (42704) live in the per-core unit tests (introspection / reopen / divergence
+# the PG-clean single-handle corpus cannot express).
+# requires: ddl.serial, ddl.sequence, func.sequence, ddl.create_table, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, types.i64, types.text
+
+# --- a serial column auto-numbers from 1 via its owned sequence ---------------
+
+statement ok
+CREATE TABLE t (id serial PRIMARY KEY, b bigserial, s smallserial, v text)
+
+statement ok
+INSERT INTO t (v) VALUES ('a')
+
+statement ok
+INSERT INTO t (v) VALUES ('b')
+
+# every serial column auto-numbered from 1, independently (each its own sequence)
+query IIIT rowsort
+SELECT id, b, s, v FROM t
+----
+1
+1
+1
+a
+2
+2
+2
+b
+
+# the owned sequence is reachable under PostgreSQL's derived name <table>_<column>_seq; after the two
+# inserts above (replayed in this query's prefix) it sits at 2, so the next value is 3
+query I nosort
+SELECT nextval('t_id_seq')
+----
+3
+
+# bigserial / smallserial get their own owned sequences too
+query I nosort
+SELECT nextval('t_b_seq')
+----
+3
+
+query I nosort
+SELECT nextval('t_s_seq')
+----
+3
+
+# --- an explicit DEFAULT on a serial column conflicts with the synthesized one (42601) -----------
+
+statement error 42601
+CREATE TABLE bad (id serial DEFAULT 5)
+
+# --- the auto-name collision-resolves with a numeric suffix when <table>_<col>_seq is taken --------
+
+statement ok
+CREATE SEQUENCE c_id_seq
+
+statement ok
+CREATE TABLE c (id serial)
+
+# c_id_seq was taken, so the owned sequence became c_id_seq1; the manual c_id_seq is untouched
+statement ok
+INSERT INTO c (id) VALUES (DEFAULT)
+
+# after the insert (prefix), c_id_seq1 is at 1 → next is 2; the manual c_id_seq was never advanced → 1
+query I nosort
+SELECT nextval('c_id_seq1')
+----
+2
+
+query I nosort
+SELECT nextval('c_id_seq')
+----
+1
+
+# --- DROP SEQUENCE of an OWNED sequence is 2BP01 (RESTRICT; CASCADE is 0A000) ---------------------
+
+statement error 2BP01
+DROP SEQUENCE t_id_seq
+
+# --- DROP TABLE auto-drops the owned sequences ---------------------------------------------------
+
+statement ok
+DROP TABLE t
+
+# the owned sequence was auto-dropped — referencing it is now 42P01 (relation does not exist)
+statement error 42P01
+SELECT nextval('t_id_seq')

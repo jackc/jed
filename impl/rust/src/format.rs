@@ -34,16 +34,17 @@ use crate::value::{ArrayVal, Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 13 = GIN indexes (a per-index `index_kind` byte after `index_flags`,
-/// spec/design/gin.md §7). v12 = sequences (a kind-tagged sequence catalog section) + the `date`
-/// scalar. v11 = FOREIGN KEY constraints (a per-table catalog foreign-key list after the index
-/// list, spec/design/constraints.md §6). v10 = array (`T[]`) columns (type_code 15 + an
-/// element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value
-/// body, §4); v9 = composite (row) types (kind-tagged catalog entries); v8 = a per-column
-/// expression-default flag; v7 added a per-page CRC-32 (header grew 12→16 bytes). The bump from 12
-/// was atomic across the Rust/Go/TS cores + the Ruby golden reference (every `.jed` golden's version
-/// byte + CRC changed together).
-const FORMAT_VERSION: u16 = 13;
+/// On-disk format version — 14 = the `serial` owned-sequence link (the sequence-entry flags byte
+/// gains a `has_owner` bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md
+/// §12). v13 = GIN indexes (a per-index `index_kind` byte after `index_flags`, spec/design/gin.md
+/// §7). v12 = sequences (a kind-tagged sequence catalog section) + the `date` scalar. v11 = FOREIGN
+/// KEY constraints (a per-table catalog foreign-key list after the index list,
+/// spec/design/constraints.md §6). v10 = array (`T[]`) columns (type_code 15 + an element-type
+/// descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4); v9 =
+/// composite (row) types (kind-tagged catalog entries); v8 = a per-column expression-default flag;
+/// v7 added a per-page CRC-32 (header grew 12→16 bytes). Each bump is atomic across the Rust/Go/TS
+/// cores + the Ruby golden reference (every `.jed` golden's version byte + CRC changed together).
+const FORMAT_VERSION: u16 = 14;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -2144,7 +2145,18 @@ fn sequence_entry_bytes(s: &SequenceDef) -> Vec<u8> {
     if s.is_called {
         flags |= 0b10;
     }
+    if s.owned_by.is_some() {
+        flags |= 0b100; // bit2 has_owner (v13)
+    }
     out.push(flags);
+    // The OWNED BY tail (v13): only present when has_owner — owner table name + column ordinal
+    // (spec/design/sequences.md §12, format.md *Sequence entry*).
+    if let Some(owner) = &s.owned_by {
+        let ot = owner.table.as_bytes();
+        out.extend_from_slice(&(ot.len() as u16).to_be_bytes());
+        out.extend_from_slice(ot);
+        out.extend_from_slice(&owner.column.to_be_bytes());
+    }
     out
 }
 
@@ -2159,9 +2171,17 @@ fn decode_sequence_entry(buf: &[u8], pos: &mut usize) -> Result<SequenceDef> {
     let cache = read_i64(buf, pos)?;
     let last_value = read_i64(buf, pos)?;
     let flags = read_u8(buf, pos)?;
-    if flags & !0b11 != 0 {
+    if flags & !0b111 != 0 {
         return Err(corrupt("reserved sequence flag set"));
     }
+    // The OWNED BY tail (v13): present iff bit2 (has_owner) is set.
+    let owned_by = if flags & 0b100 != 0 {
+        let table = read_string(buf, pos)?;
+        let column = read_u16(buf, pos)?;
+        Some(crate::catalog::SeqOwner { table, column })
+    } else {
+        None
+    };
     Ok(SequenceDef {
         name,
         increment,
@@ -2172,6 +2192,7 @@ fn decode_sequence_entry(buf: &[u8], pos: &mut usize) -> Result<SequenceDef> {
         cycle: flags & 0b1 != 0,
         last_value,
         is_called: flags & 0b10 != 0,
+        owned_by,
     })
 }
 

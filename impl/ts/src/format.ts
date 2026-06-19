@@ -11,7 +11,7 @@
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
 import type { Expr } from "./ast.ts";
-import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type FkAction, type ForeignKey, type IndexDef, type SequenceDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
+import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type FkAction, type ForeignKey, type IndexDef, type SeqOwner, type SequenceDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
@@ -60,7 +60,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 13; // on-disk format version (13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md). 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 12 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 14; // on-disk format version (14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12). 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -995,7 +995,16 @@ function sequenceEntryBytes(s: SequenceDef): Uint8Array {
   let flags = 0;
   if (s.cycle) flags |= 0b1;
   if (s.isCalled) flags |= 0b10;
+  if (s.ownedBy !== undefined) flags |= 0b100; // bit2 has_owner (v13)
   w.u8(flags);
+  // The OWNED BY tail (v13): only present when has_owner — owner table name + column ordinal
+  // (spec/design/sequences.md §12, format.md *Sequence entry*).
+  if (s.ownedBy !== undefined) {
+    const tableB = UTF8.encode(s.ownedBy.table);
+    w.u16(tableB.length);
+    w.bytes(tableB);
+    w.u16(s.ownedBy.column);
+  }
   return w.toBytes();
 }
 
@@ -1011,8 +1020,15 @@ function decodeSequenceEntry(buf: Uint8Array, cur: Cursor): SequenceDef {
   const cache = readI64(buf, cur);
   const lastValue = readI64(buf, cur);
   const flags = readU8(buf, cur);
-  if ((flags & ~0b11) !== 0) {
+  if ((flags & ~0b111) !== 0) {
     throw engineError("data_corrupted", "reserved sequence flag set");
+  }
+  // The OWNED BY tail (v13): present iff bit2 (has_owner) is set.
+  let ownedBy: SeqOwner | undefined;
+  if ((flags & 0b100) !== 0) {
+    const table = readString(buf, cur);
+    const column = readU16(buf, cur);
+    ownedBy = { table, column };
   }
   return {
     name,
@@ -1024,6 +1040,7 @@ function decodeSequenceEntry(buf: Uint8Array, cur: Cursor): SequenceDef {
     cycle: (flags & 0b1) !== 0,
     lastValue,
     isCalled: (flags & 0b10) !== 0,
+    ownedBy,
   };
 }
 

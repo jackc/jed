@@ -6,8 +6,11 @@
 // impl/rust/tests/sequence.rs.
 
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { test } from "node:test";
-import { Database, EngineError, execute } from "../src/lib.ts";
+import { close, commit, create, Database, EngineError, execute, open } from "../src/lib.ts";
 
 // oneInt runs a single-column SELECT and returns its one int value, or null for a NULL value.
 function oneInt(db: Database, sql: string): bigint | null {
@@ -175,4 +178,94 @@ test("setval/ALTER in read-only transaction is 25006", () => {
   execute(db, "BEGIN READ ONLY");
   assert.equal(oneInt(db, "SELECT lastval()"), 1n);
   execute(db, "ROLLBACK");
+});
+
+// ---------------------------------------------------------------------------
+// S3 — serial / bigserial / smallserial (spec/design/sequences.md §12). These per-core tests cover
+// what the PG-clean corpus cannot: the auto-named OWNED sequence, the DROP TABLE auto-drop surviving
+// a reopen (file persistence of the owner link, v13), and the DROP SEQUENCE 2BP01. The PG-agreeing
+// surface lives in suites/ddl/serial.test. Mirrors impl/rust/tests/sequence.rs.
+
+// queryRows runs sql and returns its rows' int cells (throwing on a NULL/non-int cell).
+function queryRows(db: Database, sql: string): bigint[][] {
+  const o = execute(db, sql);
+  if (o.kind !== "query") throw new Error(`expected a query, got ${o.kind}`);
+  return o.rows.map((r) =>
+    r.map((v) => {
+      if (v.kind !== "int") throw new Error(`expected int, got ${v.kind}`);
+      return v.int;
+    }),
+  );
+}
+
+test("serial desugars to an owned sequence and auto-numbers from 1", () => {
+  const db = new Database();
+  execute(db, "CREATE TABLE t (id serial PRIMARY KEY, b bigserial, s smallserial, v text)");
+  const rows = queryRows(db, "INSERT INTO t (v) VALUES ('a'), ('b') RETURNING id, b, s");
+  assert.deepEqual(rows, [
+    [1n, 1n, 1n],
+    [2n, 2n, 2n],
+  ]);
+  // The owned sequences exist under PG's derived names and keep advancing.
+  assert.equal(oneInt(db, "SELECT nextval('t_id_seq')"), 3n);
+  assert.equal(oneInt(db, "SELECT nextval('t_b_seq')"), 3n);
+  assert.equal(oneInt(db, "SELECT nextval('t_s_seq')"), 3n);
+});
+
+test("serial column is NOT NULL; an explicit value overrides the default without advancing", () => {
+  const db = new Database();
+  execute(db, "CREATE TABLE t (id serial PRIMARY KEY, v text)");
+  assert.equal(errCode(db, "INSERT INTO t (id, v) VALUES (NULL, 'x')"), "23502");
+  execute(db, "INSERT INTO t (id, v) VALUES (100, 'y')"); // sequence untouched
+  assert.deepEqual(queryRows(db, "INSERT INTO t (v) VALUES ('z') RETURNING id"), [[1n]]);
+});
+
+test("an explicit DEFAULT on a serial column is 42601", () => {
+  const db = new Database();
+  assert.equal(errCode(db, "CREATE TABLE t (id serial DEFAULT 5)"), "42601");
+});
+
+test("the serial auto-name collision-resolves with a numeric suffix", () => {
+  const db = new Database();
+  execute(db, "CREATE SEQUENCE t_id_seq");
+  execute(db, "CREATE TABLE t (id serial)");
+  execute(db, "INSERT INTO t (id) VALUES (DEFAULT)");
+  // t_id_seq (the manual one) was never advanced; t_id_seq1 produced the row's 1.
+  assert.equal(oneInt(db, "SELECT nextval('t_id_seq1')"), 2n);
+  assert.equal(oneInt(db, "SELECT nextval('t_id_seq')"), 1n);
+});
+
+test("DROP SEQUENCE of an owned sequence is 2BP01; DROP TABLE auto-drops it", () => {
+  const db = new Database();
+  execute(db, "CREATE TABLE t (id serial PRIMARY KEY)");
+  assert.equal(errCode(db, "DROP SEQUENCE t_id_seq"), "2BP01");
+  execute(db, "DROP TABLE t");
+  assert.equal(errCode(db, "SELECT nextval('t_id_seq')"), "42P01"); // auto-dropped
+  execute(db, "CREATE SEQUENCE t_id_seq"); // the name is free to reuse
+});
+
+test("the owned-by link persists (format_version 13) — auto-drop survives a reopen", () => {
+  const dir = mkdtempSync(join(tmpdir(), "jed-serial-"));
+  const path = join(dir, "serial_owned_reopen.jed");
+  try {
+    const db = create(path);
+    execute(db, "CREATE TABLE t (id serial PRIMARY KEY, v text)");
+    execute(db, "INSERT INTO t (v) VALUES ('a')");
+    commit(db);
+    close(db);
+
+    const db2 = open(path);
+    // The owner link round-tripped: still 2BP01 to drop the sequence directly.
+    assert.equal(errCode(db2, "DROP SEQUENCE t_id_seq"), "2BP01");
+    execute(db2, "DROP TABLE t");
+    assert.equal(errCode(db2, "SELECT nextval('t_id_seq')"), "42P01");
+    close(db2);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("serial is recognized only in a column-type position — a CAST to it is undefined", () => {
+  const db = new Database();
+  assert.equal(errCode(db, "SELECT 1::serial"), "42704");
 });

@@ -661,6 +661,18 @@ fn sequence_table_db() -> Database {
     db
 }
 
+/// serial_table (v13): the OWNED-sequence link (the has_owner flag bit + the owner table-name/
+/// column-ordinal tail). The serial column id desugars to an i32 column that is NOT NULL (via the
+/// PK) with an expression DEFAULT nextval('t_id_seq'), and an OWNED sequence t_id_seq created
+/// alongside; one INSERT advances it once. Must match the Ruby reference's SERIAL_TABLE
+/// (spec/fileformat/verify.rb), spec/design/sequences.md §12.
+fn serial_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (id serial PRIMARY KEY, v text)");
+    run(&mut db, "INSERT INTO t (v) VALUES ('hello')");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -694,6 +706,7 @@ fn write_matches_goldens() {
         ("composite_type_table.jed", composite_type_table_db),
         ("nested_composite_table.jed", nested_composite_table_db),
         ("sequence_table.jed", sequence_table_db),
+        ("serial_table.jed", serial_table_db),
         ("array_table.jed", array_table_db),
         ("array_composite_table.jed", array_composite_table_db),
         (
@@ -747,6 +760,7 @@ fn read_goldens_reproduces_rows() {
             composite_array_field_table_db,
             "t",
         ),
+        ("serial_table.jed", serial_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
         ("torn_meta_slot0.jed", pk_table_db, "t"),
         ("torn_meta_slot1.jed", pk_table_db, "t"),

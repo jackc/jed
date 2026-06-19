@@ -70,7 +70,7 @@ import {
 import { encodeBool, encodeInt } from "./encoding.ts";
 import { EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
-import { parseSQL } from "./parser.ts";
+import { parseExpression, parseSQL } from "./parser.ts";
 import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
 import { DEFAULT_WORK_MEM, type RowCompare, type SpillSink, Sorter } from "./spill.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
@@ -344,6 +344,19 @@ export class Snapshot {
   // order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak (§8).
   sequencesSorted(): SequenceDef[] {
     return [...this.sequences.keys()].sort().map((k) => this.sequences.get(k)!);
+  }
+
+  // sequencesOwnedBy returns the lowercased keys of every sequence OWNED BY the table `name`
+  // (case-insensitive) — the serial-created sequences DROP TABLE must auto-drop
+  // (spec/design/sequences.md §12). Sorted so the auto-drop is deterministic (no map-iteration
+  // leak, §8).
+  sequencesOwnedBy(name: string): string[] {
+    const lower = name.toLowerCase();
+    const keys: string[] = [];
+    for (const [k, s] of this.sequences) {
+      if (s.ownedBy !== undefined && s.ownedBy.table.toLowerCase() === lower) keys.push(k);
+    }
+    return keys.sort();
   }
 
   // compositeDependent reports whether any table column or composite-type field still references the
@@ -1254,6 +1267,10 @@ export class Database {
     // own order.
     let pk: number[] = [];
     let pkSeen = false;
+    // The OWNED sequences a serial column desugars to (spec/design/sequences.md §12), collected
+    // during the column walk and staged into the working snapshot only after the whole CREATE TABLE
+    // validates — so a later failure (e.g. a bad CHECK) discards them with the statement.
+    const pendingSerials: SequenceDef[] = [];
     for (const def of ct.columns) {
       for (const c of columns) {
         if (c.name.toLowerCase() === def.name.toLowerCase()) {
@@ -1265,10 +1282,23 @@ export class Database {
       // (the composite's fields carry their own); a type modifier written on a composite column is
       // rejected (0A000). A composite column is storable (the recursive value codec — §4) but never
       // keyable — the PK gate below rejects it 0A000 (§6).
+      // A serial / bigserial / smallserial pseudo-type (spec/design/sequences.md §12): CREATE TABLE
+      // sugar for an integer column that is NOT NULL with a DEFAULT nextval(...) backed by a
+      // newly-created OWNED sequence. Here we only resolve the underlying integer type; the
+      // desugaring (the owned sequence + default + NOT NULL force) happens below. serial[] is NOT a
+      // serial column (it falls to the array branch as an unknown element type — §12.1).
+      const serialKind = serialPseudoType(def.typeName);
       let colType: Type;
       let decimal: DecimalTypmod | null;
       const ctype = this.compositeType(def.typeName);
-      if (def.typeName.endsWith("[]")) {
+      if (serialKind !== undefined) {
+        // A serial column takes no typmod (serial(5) is 42601) and no [] (the array branch).
+        if (def.typeMod !== null) {
+          throw engineError("syntax_error", "type modifier is not allowed for type " + def.typeName);
+        }
+        colType = scalarT(serialKind);
+        decimal = null;
+      } else if (def.typeName.endsWith("[]")) {
         // An array column (spec/design/array.md §3). The element type is a scalar or a
         // previously-defined composite (array-of-composite, §12 AC1 — element_type_code 14 + name);
         // a nested-array element and an array typmod (numeric(p,s)[]) stay deferred (0A000).
@@ -1343,7 +1373,38 @@ export class Database {
       //     assignable to the column, 42804) and stored as text for per-row eval.
       let def_default: Value | null = null;
       let def_defaultExpr: DefaultExpr | null = null;
-      if (colType.kind === "composite" || colType.kind === "array") {
+      if (serialKind !== undefined) {
+        // serial desugaring (sequences.md §12): an explicit DEFAULT conflicts with the synthesized
+        // one (PG: "multiple default values specified", 42601). Otherwise create the OWNED sequence
+        // and synthesize DEFAULT nextval('<auto-name>') — an ordinary expression default (the
+        // format_version 8 mechanism), evaluated per row at INSERT.
+        if (def.default !== null) {
+          throw engineError(
+            "syntax_error",
+            `multiple default values specified for column ${def.name} of table ${ct.name}`,
+          );
+        }
+        const seqName = this.chooseSerialSeqName(ct.name, def.name, pendingSerials);
+        const [minV, maxV] = defaultSequenceBounds(1n);
+        pendingSerials.push({
+          name: seqName,
+          increment: 1n,
+          minValue: minV,
+          maxValue: maxV,
+          start: minV,
+          cache: 1n,
+          cycle: false,
+          lastValue: minV,
+          isCalled: false,
+          ownedBy: { table: ct.name, column: columns.length }, // this column's ordinal
+        });
+        // Render the synthetic default exactly as the parser would the equivalent
+        // DEFAULT nextval('<seqName>') (space-joined tokens — the canonical expression-text form),
+        // so the in-memory expr matches what reload re-parses. The seqName is a lowercased
+        // identifier-derived name, so the quoting is always safe.
+        const exprText = `nextval ( '${seqName.replace(/'/g, "''")}' )`;
+        def_defaultExpr = { exprText, expr: parseExpression(exprText) };
+      } else if (colType.kind === "composite" || colType.kind === "array") {
         // A DEFAULT on a composite- or array-typed column is not supported this slice
         // (composite.md §12 / array.md §12).
         if (def.default !== null) {
@@ -1372,7 +1433,8 @@ export class Database {
         type: colType,
         decimal,
         primaryKey: def.primaryKey,
-        notNull: def.primaryKey || def.notNull, // PRIMARY KEY ⇒ NOT NULL
+        // PRIMARY KEY ⇒ NOT NULL; a serial column is NOT NULL too (sequences.md §12).
+        notNull: def.primaryKey || def.notNull || serialKind !== undefined,
         default: def_default,
         defaultExpr: def_defaultExpr,
       });
@@ -1706,8 +1768,30 @@ export class Database {
         new TableStore(this.pageSize - 12, []), // 12 = PAGE_HEADER
       );
     }
+    // Stage each serial column's OWNED sequence now that the table validated
+    // (spec/design/sequences.md §12). The names were resolved (collision-free) during the column
+    // walk; the table is in the catalog, so a DROP TABLE will auto-drop these.
+    for (const s of pendingSerials) this.working().putSequence(s);
     // DDL touches no rows and evaluates no expressions: zero cost.
     return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // chooseSerialSeqName chooses the auto-generated name for a serial column's OWNED sequence
+  // (spec/design/sequences.md §12), matching PostgreSQL: lower(table)_lower(column)_seq, with the
+  // smallest integer suffix 1, 2, … appended until the name is free in the relation namespace — not
+  // taken by an existing relation, not equal to the table being created, and not already chosen by
+  // an earlier serial column of the same statement (pending). All-lowercase identifier-derived.
+  private chooseSerialSeqName(table: string, column: string, pending: SequenceDef[]): string {
+    const base = `${table.toLowerCase()}_${column.toLowerCase()}_seq`;
+    const taken = (c: string): boolean =>
+      this.relationExists(c) ||
+      c.toLowerCase() === table.toLowerCase() ||
+      pending.some((s) => s.name.toLowerCase() === c.toLowerCase());
+    if (!taken(base)) return base;
+    for (let n = 1; ; n++) {
+      const cand = base + n.toString();
+      if (!taken(cand)) return cand;
+    }
   }
 
   // resolveChecks resolves a table's CHECK constraints for a write statement: each stored
@@ -1782,7 +1866,13 @@ export class Database {
         "cannot drop table " + canonical + " because other objects depend on it: " + detail,
       );
     }
-    this.working().removeTable(dt.name.toLowerCase());
+    // Auto-drop every sequence OWNED BY this table — the serial columns' sequences
+    // (spec/design/sequences.md §12). An owned sequence is never an FK dependent, so the check
+    // above never blocked on it; the sequences are removed alongside the table.
+    const ownedSeqs = this.readSnap().sequencesOwnedBy(dt.name);
+    const w = this.working();
+    for (const sk of ownedSeqs) w.removeSequence(sk);
+    w.removeTable(dt.name.toLowerCase());
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -2145,6 +2235,7 @@ export class Database {
       cycle: cs.cycle ?? false,
       lastValue: start,
       isCalled: false,
+      ownedBy: undefined,
     });
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
@@ -2154,9 +2245,25 @@ export class Database {
   // (a plain `DEFAULT nextval('s')` creates none — PG). Multiple names are dropped left to right.
   private executeDropSequence(ds: DropSequence): Outcome {
     for (const name of ds.names) {
-      if (this.readSnap().sequence(name) === undefined) {
+      // Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
+      // column's default — so RESTRICT (the only mode this slice; CASCADE 0A000) is 2BP01
+      // (spec/design/sequences.md §12).
+      const seq = this.readSnap().sequence(name);
+      if (seq === undefined) {
         if (ds.ifExists) continue;
         throw engineError("undefined_table", `sequence does not exist: ${name}`);
+      }
+      if (seq.ownedBy !== undefined) {
+        // The owning table is always present (its own DROP TABLE would auto-drop this sequence
+        // first), so the column name for the detail resolves.
+        const owner = seq.ownedBy;
+        const t = this.readSnap().table(owner.table);
+        const tableName = t?.name ?? owner.table;
+        const colName = t?.columns[owner.column]?.name ?? "";
+        throw engineError(
+          "dependent_objects_still_exist",
+          `cannot drop sequence ${seq.name} because other objects depend on it: default value for column ${colName} of table ${tableName} depends on sequence ${seq.name}`,
+        );
       }
       this.working().removeSequence(name.toLowerCase());
     }
@@ -7626,6 +7733,26 @@ function bindParams(supplied: Value[], types: ScalarType[]): Value[] {
 function rejectParamsForDDL(params: Value[]): void {
   if (params.length > 0) {
     throw engineError("syntax_error", "bind parameters are not allowed in a DDL statement");
+  }
+}
+
+// serialPseudoType maps a serial pseudo-type name to its underlying integer scalar
+// (spec/design/sequences.md §12) — serial/serial4 → i32, bigserial/serial8 → i64,
+// smallserial/serial2 → i16. undefined for any other name. Recognized only in a CREATE TABLE
+// column-type position; the match is case-insensitive.
+function serialPseudoType(name: string): ScalarType | undefined {
+  switch (name.toLowerCase()) {
+    case "serial":
+    case "serial4":
+      return "i32";
+    case "bigserial":
+    case "serial8":
+      return "i64";
+    case "smallserial":
+    case "serial2":
+      return "i16";
+    default:
+      return undefined;
   }
 }
 

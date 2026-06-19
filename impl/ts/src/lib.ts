@@ -70,6 +70,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // and the value functions nextval/currval (transactional advance — sequences.md §5).
   "ddl.sequence",
   "func.sequence",
+  // serial / bigserial / smallserial CREATE TABLE pseudo-types — an owned sequence + DEFAULT
+  // nextval(...) + NOT NULL; DROP TABLE auto-drops it; format_version 13 (sequences.md §12).
+  "ddl.serial",
   // NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
   "ddl.not_null",
   // DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

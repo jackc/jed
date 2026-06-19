@@ -204,6 +204,24 @@ impl Snapshot {
         keys.into_iter().map(|k| &self.sequences[k]).collect()
     }
 
+    /// The lowercased keys of every sequence **owned by** the table `name` (case-insensitive) — the
+    /// `serial`-created sequences `DROP TABLE` must auto-drop (spec/design/sequences.md §12). Returned
+    /// in ascending key order so the auto-drop is deterministic (no hash-iteration leak, §8).
+    pub(crate) fn sequences_owned_by(&self, name: &str) -> Vec<String> {
+        let mut keys: Vec<String> = self
+            .sequences
+            .iter()
+            .filter(|(_, s)| {
+                s.owned_by
+                    .as_ref()
+                    .is_some_and(|o| o.table.eq_ignore_ascii_case(name))
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        keys.sort();
+        keys
+    }
+
     /// Whether any table column or composite-type field still references the composite type
     /// `name` (case-insensitive) — the `DROP TYPE ... RESTRICT` dependency check (2BP01). Returns
     /// the first dependent's description for the error detail, or `None` if there are no dependents.
@@ -1360,6 +1378,10 @@ impl Database {
         // form is the one-member case; the table-level list below records its own order.
         let mut pk: Vec<usize> = Vec::new();
         let mut pk_seen = false;
+        // The OWNED sequences a `serial` column desugars to (spec/design/sequences.md §12), collected
+        // during the column walk and staged into the working snapshot only after the whole CREATE
+        // TABLE validates — so a later failure (e.g. a bad CHECK) discards them with the statement.
+        let mut pending_serials: Vec<SequenceDef> = Vec::new();
         for def in &ct.columns {
             if columns
                 .iter()
@@ -1370,68 +1392,84 @@ impl Database {
                     format!("duplicate column name: {}", def.name),
                 ));
             }
+            // A `serial` / `bigserial` / `smallserial` pseudo-type (spec/design/sequences.md §12):
+            // CREATE TABLE sugar for an integer column that is NOT NULL with a DEFAULT nextval(...)
+            // backed by a newly-created OWNED sequence. The desugaring (the owned sequence + the
+            // default + the NOT NULL force) happens in the default-classification block and the
+            // column push below; here we only resolve the underlying integer type. `serial[]` is NOT
+            // a serial column (it falls to the array branch as an unknown element type — §12.1).
+            let serial_kind = serial_pseudo_type(&def.type_name);
             // Resolve the column type: a built-in scalar, or a user-defined composite referenced by
             // name (spec/design/composite.md §3). An unknown name is 42704. A composite column
             // carries no typmod (the composite's fields carry their own); a type modifier written on
             // a composite column is rejected (0A000). A composite column is storable but never
             // keyable — the PK gate below rejects it 0A000 (§6).
-            let (ty, decimal): (Type, Option<DecimalTypmod>) =
-                if let Some(base) = def.type_name.strip_suffix("[]") {
-                    // An array column (spec/design/array.md §3). The element type is a scalar or a
-                    // previously-defined composite (array-of-composite, §12 AC1 — `element_type_code`
-                    // 14 + name); a nested-array element and an array typmod (`numeric(p,s)[]`) stay
-                    // deferred (0A000).
-                    if def.type_mod.is_some() {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            "a type modifier on an array type is not supported yet".to_string(),
-                        ));
-                    }
-                    match ScalarType::from_name(base) {
-                        Some(s) => (Type::Array(Box::new(Type::Scalar(s))), None),
-                        None => {
-                            if let Some(ctype) = self.read_snap().composite_type(base) {
-                                (
-                                    Type::Array(Box::new(Type::Composite(
-                                        crate::types::CompositeRef {
-                                            name: ctype.name.clone(),
-                                        },
-                                    ))),
-                                    None,
-                                )
-                            } else {
-                                return Err(EngineError::new(
-                                    SqlState::UndefinedObject,
-                                    format!("type does not exist: {base}"),
-                                ));
-                            }
+            let (ty, decimal): (Type, Option<DecimalTypmod>) = if let Some(sk) = serial_kind {
+                // A serial column takes no typmod (`serial(5)` is 42601) and no `[]` (handled by
+                // the array branch). Its type is the underlying integer; everything else below.
+                if def.type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        format!("type modifier is not allowed for type {}", def.type_name),
+                    ));
+                }
+                (Type::Scalar(sk), None)
+            } else if let Some(base) = def.type_name.strip_suffix("[]") {
+                // An array column (spec/design/array.md §3). The element type is a scalar or a
+                // previously-defined composite (array-of-composite, §12 AC1 — `element_type_code`
+                // 14 + name); a nested-array element and an array typmod (`numeric(p,s)[]`) stay
+                // deferred (0A000).
+                if def.type_mod.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "a type modifier on an array type is not supported yet".to_string(),
+                    ));
+                }
+                match ScalarType::from_name(base) {
+                    Some(s) => (Type::Array(Box::new(Type::Scalar(s))), None),
+                    None => {
+                        if let Some(ctype) = self.read_snap().composite_type(base) {
+                            (
+                                Type::Array(Box::new(Type::Composite(
+                                    crate::types::CompositeRef {
+                                        name: ctype.name.clone(),
+                                    },
+                                ))),
+                                None,
+                            )
+                        } else {
+                            return Err(EngineError::new(
+                                SqlState::UndefinedObject,
+                                format!("type does not exist: {base}"),
+                            ));
                         }
                     }
-                } else if ScalarType::from_name(&def.type_name).is_some() {
-                    let (s, d) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
-                    (Type::Scalar(s), d)
-                } else if let Some(ctype) = self.read_snap().composite_type(&def.type_name) {
-                    if def.type_mod.is_some() {
-                        return Err(EngineError::new(
-                            SqlState::FeatureNotSupported,
-                            format!(
-                                "a type modifier is not supported for composite type {}",
-                                def.type_name
-                            ),
-                        ));
-                    }
-                    (
-                        Type::Composite(crate::types::CompositeRef {
-                            name: ctype.name.clone(),
-                        }),
-                        None,
-                    )
-                } else {
+                }
+            } else if ScalarType::from_name(&def.type_name).is_some() {
+                let (s, d) = resolve_type_and_typmod(&def.type_name, &def.type_mod)?;
+                (Type::Scalar(s), d)
+            } else if let Some(ctype) = self.read_snap().composite_type(&def.type_name) {
+                if def.type_mod.is_some() {
                     return Err(EngineError::new(
-                        SqlState::UndefinedObject,
-                        format!("type does not exist: {}", def.type_name),
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "a type modifier is not supported for composite type {}",
+                            def.type_name
+                        ),
                     ));
-                };
+                }
+                (
+                    Type::Composite(crate::types::CompositeRef {
+                        name: ctype.name.clone(),
+                    }),
+                    None,
+                )
+            } else {
+                return Err(EngineError::new(
+                    SqlState::UndefinedObject,
+                    format!("type does not exist: {}", def.type_name),
+                ));
+            };
             if def.primary_key {
                 // Integers, boolean, and uuid may be a key. uuid is the first non-integer key
                 // type (fixed `uuid-raw16`, spec/design/encoding.md §2.7) and boolean the second
@@ -1475,7 +1513,45 @@ impl Database {
             //   - any other expression is validated (structural pre-walk, then resolved against
             //     an EMPTY scope — a default may not reference a column — then its result type is
             //     checked assignable to the column, 42804) and stored as text for per-row eval.
-            let (default, default_expr) = if ty.is_composite() || ty.is_array() {
+            let (default, default_expr) = if serial_kind.is_some() {
+                // serial desugaring (sequences.md §12): an explicit DEFAULT conflicts with the
+                // synthesized one (PG: "multiple default values specified", 42601). Otherwise create
+                // the OWNED sequence and synthesize `DEFAULT nextval('<auto-name>')` — an ordinary
+                // expression default (the format_version 8 mechanism), evaluated per row at INSERT.
+                if def.default.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        format!(
+                            "multiple default values specified for column {} of table {}",
+                            def.name, ct.name
+                        ),
+                    ));
+                }
+                let seqname = self.choose_serial_seq_name(&ct.name, &def.name, &pending_serials);
+                let (min, max) = SequenceDef::default_bounds(1);
+                pending_serials.push(SequenceDef {
+                    name: seqname.clone(),
+                    increment: 1,
+                    min_value: min,
+                    max_value: max,
+                    start: min,
+                    cache: 1,
+                    cycle: false,
+                    last_value: min,
+                    is_called: false,
+                    owned_by: Some(crate::catalog::SeqOwner {
+                        table: ct.name.clone(),
+                        column: columns.len() as u16, // this column's ordinal (pushed below)
+                    }),
+                });
+                // Build the synthetic default exactly as the parser would render the equivalent
+                // `DEFAULT nextval('<seqname>')` (space-joined tokens — the canonical expression-text
+                // form), so the in-memory expr matches what reload re-parses (constraints.md §2). The
+                // seqname is a lowercased identifier-derived name, so the quoting is always safe.
+                let expr_text = format!("nextval ( '{}' )", seqname.replace('\'', "''"));
+                let expr = crate::parser::parse_expression(&expr_text)?;
+                (None, Some(DefaultExpr { expr_text, expr }))
+            } else if ty.is_composite() || ty.is_array() {
                 // A DEFAULT on a composite- or array-typed column is not supported this slice
                 // (composite.md §12 / array.md §12).
                 if def.default.is_some() {
@@ -1535,7 +1611,8 @@ impl Database {
                 ty,
                 decimal,
                 primary_key: def.primary_key,
-                not_null: def.primary_key || def.not_null, // PRIMARY KEY ⇒ NOT NULL
+                // PRIMARY KEY ⇒ NOT NULL; a `serial` column is NOT NULL too (sequences.md §12).
+                not_null: def.primary_key || def.not_null || serial_kind.is_some(),
                 default,
                 default_expr,
             });
@@ -2013,6 +2090,12 @@ impl Database {
             self.working_mut()
                 .put_index_store(k, TableStore::new(cap, Vec::new()));
         }
+        // Stage each `serial` column's OWNED sequence now that the table validated
+        // (spec/design/sequences.md §12). The names were resolved (collision-free) during the column
+        // walk; the table is in the catalog, so a `DROP TABLE` will auto-drop these.
+        for s in pending_serials {
+            self.working_mut().put_sequence(s);
+        }
         // DDL touches no rows and evaluates no expressions: zero cost.
         Ok(Outcome::Statement {
             cost: 0,
@@ -2133,8 +2216,16 @@ impl Database {
                 ),
             ));
         }
+        // Auto-drop every sequence OWNED BY this table — the `serial` columns' sequences
+        // (spec/design/sequences.md §12). An owned sequence is never an FK dependent, so the check
+        // above never blocked on it; the sequences are removed alongside the table.
+        let owned_seqs = self.read_snap().sequences_owned_by(&dt.name);
         let key = dt.name.to_ascii_lowercase();
-        self.working_mut().remove_table(&key);
+        let w = self.working_mut();
+        for sk in &owned_seqs {
+            w.remove_sequence(sk);
+        }
+        w.remove_table(&key);
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
@@ -2581,6 +2672,7 @@ impl Database {
             cycle: cs.cycle.unwrap_or(false),
             last_value: start,
             is_called: false,
+            owned_by: None,
         });
         Ok(Outcome::Statement {
             cost: 0,
@@ -2593,13 +2685,45 @@ impl Database {
     /// nextval('s')` creates none — PG). Multiple names are dropped left to right.
     fn execute_drop_sequence(&mut self, ds: DropSequence) -> Result<Outcome> {
         for name in &ds.names {
-            if self.read_snap().sequence(name).is_none() {
-                if ds.if_exists {
-                    continue;
+            // Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
+            // column's default — so RESTRICT (the only mode this slice; CASCADE 0A000) is 2BP01
+            // (spec/design/sequences.md §12). Clone the owner ref out so the snapshot borrow ends
+            // before the working-snapshot mutation.
+            let owner = match self.read_snap().sequence(name) {
+                None => {
+                    if ds.if_exists {
+                        continue;
+                    }
+                    return Err(EngineError::new(
+                        SqlState::UndefinedTable,
+                        format!("sequence does not exist: {name}"),
+                    ));
                 }
+                Some(s) => s
+                    .owned_by
+                    .as_ref()
+                    .map(|o| (s.name.clone(), o.table.clone(), o.column)),
+            };
+            if let Some((seq_name, owner_table, owner_col)) = owner {
+                // The owning table is always present (its own DROP TABLE would auto-drop this
+                // sequence first), so the column name for the detail resolves.
+                let (col_name, table_name) = self
+                    .read_snap()
+                    .table(&owner_table)
+                    .map(|t| {
+                        (
+                            t.columns
+                                .get(owner_col as usize)
+                                .map_or_else(String::new, |c| c.name.clone()),
+                            t.name.clone(),
+                        )
+                    })
+                    .unwrap_or_else(|| (String::new(), owner_table.clone()));
                 return Err(EngineError::new(
-                    SqlState::UndefinedTable,
-                    format!("sequence does not exist: {name}"),
+                    SqlState::DependentObjectsStillExist,
+                    format!(
+                        "cannot drop sequence {seq_name} because other objects depend on it: default value for column {col_name} of table {table_name} depends on sequence {seq_name}"
+                    ),
                 ));
             }
             let key = name.to_ascii_lowercase();
@@ -6158,6 +6282,35 @@ impl Database {
         self.table(name).is_some()
             || self.find_index(name).is_some()
             || self.read_snap().sequence(name).is_some()
+    }
+
+    /// Choose the auto-generated name for a `serial` column's OWNED sequence (sequences.md §12),
+    /// matching PostgreSQL: `lower(table)_lower(column)_seq`, with the smallest integer suffix `1`,
+    /// `2`, … appended until the name is free in the relation namespace — not taken by an existing
+    /// relation, not equal to the table being created, and not already chosen by an earlier `serial`
+    /// column of the same statement (`pending`). All-lowercase identifier-derived, so deterministic.
+    fn choose_serial_seq_name(&self, table: &str, column: &str, pending: &[SequenceDef]) -> String {
+        let base = format!(
+            "{}_{}_seq",
+            table.to_ascii_lowercase(),
+            column.to_ascii_lowercase()
+        );
+        let taken = |c: &str| {
+            self.relation_exists(c)
+                || c.eq_ignore_ascii_case(table)
+                || pending.iter().any(|s| s.name.eq_ignore_ascii_case(c))
+        };
+        if !taken(&base) {
+            return base;
+        }
+        let mut n = 1u32;
+        loop {
+            let cand = format!("{base}{n}");
+            if !taken(&cand) {
+                return cand;
+            }
+            n += 1;
+        }
     }
 
     /// Execute an index equality bound (cost.md §3 "index-bounded scan"): fetch the rows the
@@ -10336,6 +10489,19 @@ fn reject_params_for_ddl(params: &[Value]) -> Result<()> {
 /// and a READ ONLY transaction must reject it — spec/design/transactions.md §4.1/§4.3). Reads
 /// (`SELECT`, set operations) and transaction control run against the committed state / handle
 /// state with no data mutation.
+/// Map a `serial` pseudo-type name to its underlying integer scalar (spec/design/sequences.md §12) —
+/// `serial`/`serial4` → i32, `bigserial`/`serial8` → i64, `smallserial`/`serial2` → i16. `None` for
+/// any other name. Recognized **only** in a CREATE TABLE column-type position (the one caller); the
+/// match is case-insensitive (the parser passes the type name verbatim).
+fn serial_pseudo_type(name: &str) -> Option<ScalarType> {
+    match name.to_ascii_lowercase().as_str() {
+        "serial" | "serial4" => Some(ScalarType::Int32),
+        "bigserial" | "serial8" => Some(ScalarType::Int64),
+        "smallserial" | "serial2" => Some(ScalarType::Int16),
+        _ => None,
+    }
+}
+
 pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
     matches!(
         stmt,

@@ -217,6 +217,21 @@ func (s *Snapshot) sequencesSorted() []*SequenceDef {
 	return out
 }
 
+// sequencesOwnedBy returns the lowercased keys of every sequence OWNED BY the table name
+// (case-insensitive) — the serial-created sequences DROP TABLE must auto-drop
+// (spec/design/sequences.md §12). Sorted so the auto-drop is deterministic (no map-iteration
+// leak, CLAUDE.md §8).
+func (s *Snapshot) sequencesOwnedBy(name string) []string {
+	var keys []string
+	for k, seq := range s.sequences {
+		if seq.OwnedBy != nil && strings.EqualFold(seq.OwnedBy.Table, name) {
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 // compositeDependent reports whether any table column or composite-type field still references the
 // composite type name (case-insensitive) — the DROP TYPE ... RESTRICT dependency check (2BP01). It
 // returns the first dependent's description for the error detail, or ("", false) if there are no
@@ -1439,6 +1454,10 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	// own order.
 	var pk []int
 	pkSeen := false
+	// The OWNED sequences a serial column desugars to (spec/design/sequences.md §12), collected
+	// during the column walk and staged into the working snapshot only after the whole CREATE TABLE
+	// validates — so a later failure (e.g. a bad CHECK) discards them with the statement.
+	var pendingSerials []*SequenceDef
 	for _, def := range ct.Columns {
 		for _, c := range columns {
 			if strings.EqualFold(c.Name, def.Name) {
@@ -1450,11 +1469,24 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		// typmod (the composite's fields carry their own); a type modifier written on a composite
 		// column is rejected (0A000). A composite column is storable (S3) but never keyable — the PK
 		// gate below rejects it 0A000 (§6).
+		// A serial / bigserial / smallserial pseudo-type (spec/design/sequences.md §12): CREATE TABLE
+		// sugar for an integer column that is NOT NULL with a DEFAULT nextval(...) backed by a
+		// newly-created OWNED sequence. Here we only resolve the underlying integer type; the
+		// desugaring (the owned sequence + default + NOT NULL force) happens below. serial[] is NOT a
+		// serial column (it falls to the array branch as an unknown element type — §12.1).
+		serialKind, isSerial := serialPseudoType(def.TypeName)
 		var colType Type
 		var decimal *DecimalTypmod
 		isComposite := false
 		isArray := false
-		if base, ok := strings.CutSuffix(def.TypeName, "[]"); ok {
+		if isSerial {
+			// A serial column takes no typmod (serial(5) is 42601) and no [] (the array branch).
+			if def.TypeMod != nil {
+				return Outcome{}, NewError(SyntaxError,
+					"type modifier is not allowed for type "+def.TypeName)
+			}
+			colType = ScalarT(serialKind)
+		} else if base, ok := strings.CutSuffix(def.TypeName, "[]"); ok {
 			// An array column (spec/design/array.md §3). The element type is a scalar or a
 			// previously-defined composite (array-of-composite, §12 AC1 — element_type_code 14 +
 			// name); a nested-array element and an array typmod (numeric(p,s)[]) stay deferred (0A000).
@@ -1524,7 +1556,41 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		//     checked assignable to the column, 42804) and stored as text for per-row eval.
 		var defaultVal *Value
 		var defaultExpr *DefaultExpr
-		if isComposite || isArray {
+		if isSerial {
+			// serial desugaring (sequences.md §12): an explicit DEFAULT conflicts with the
+			// synthesized one (PG: "multiple default values specified", 42601). Otherwise create the
+			// OWNED sequence and synthesize DEFAULT nextval('<auto-name>') — an ordinary expression
+			// default (the format_version 8 mechanism), evaluated per row at INSERT.
+			if def.Default != nil {
+				return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
+					"multiple default values specified for column %s of table %s", def.Name, ct.Name,
+				))
+			}
+			seqName := db.chooseSerialSeqName(ct.Name, def.Name, pendingSerials)
+			minV, maxV := DefaultBounds(1)
+			pendingSerials = append(pendingSerials, &SequenceDef{
+				Name:      seqName,
+				Increment: 1,
+				MinValue:  minV,
+				MaxValue:  maxV,
+				Start:     minV,
+				Cache:     1,
+				Cycle:     false,
+				LastValue: minV,
+				IsCalled:  false,
+				OwnedBy:   &SeqOwner{Table: ct.Name, Column: uint16(len(columns))}, // this column's ordinal
+			})
+			// Render the synthetic default exactly as the parser would the equivalent
+			// DEFAULT nextval('<seqName>') (space-joined tokens — the canonical expression-text form),
+			// so the in-memory expr matches what reload re-parses. The seqName is a lowercased
+			// identifier-derived name, so the quoting is always safe.
+			exprText := "nextval ( '" + strings.ReplaceAll(seqName, "'", "''") + "' )"
+			expr, err := ParseExpression(exprText)
+			if err != nil {
+				return Outcome{}, err
+			}
+			defaultExpr = &DefaultExpr{ExprText: exprText, Expr: expr}
+		} else if isComposite || isArray {
 			// A DEFAULT on a composite- or array-typed column is not supported this slice
 			// (composite.md §12 / array.md §12).
 			if def.Default != nil {
@@ -1557,11 +1623,12 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			}
 		}
 		columns = append(columns, Column{
-			Name:        def.Name,
-			Type:        colType,
-			Decimal:     decimal,
-			PrimaryKey:  def.PrimaryKey,
-			NotNull:     def.PrimaryKey || def.NotNull, // PRIMARY KEY ⇒ NOT NULL
+			Name:       def.Name,
+			Type:       colType,
+			Decimal:    decimal,
+			PrimaryKey: def.PrimaryKey,
+			// PRIMARY KEY ⇒ NOT NULL; a serial column is NOT NULL too (sequences.md §12).
+			NotNull:     def.PrimaryKey || def.NotNull || isSerial,
 			Default:     defaultVal,
 			DefaultExpr: defaultExpr,
 		})
@@ -1988,6 +2055,12 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	for _, ix := range table.Indexes {
 		db.working().putIndexStore(strings.ToLower(ix.Name), NewTableStore(int(db.pageSize)-12, nil)) // 12 = pageHeader
 	}
+	// Stage each serial column's OWNED sequence now that the table validated
+	// (spec/design/sequences.md §12). The names were resolved (collision-free) during the column
+	// walk; the table is in the catalog, so a DROP TABLE will auto-drop these.
+	for _, s := range pendingSerials {
+		db.working().putSequence(s)
+	}
 	// DDL touches no rows and evaluates no expressions: zero cost.
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
@@ -2100,8 +2173,62 @@ func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
 		return Outcome{}, NewError(DependentObjectsStillExist,
 			"cannot drop table "+canonical+" because other objects depend on it: "+detail)
 	}
-	db.working().removeTable(strings.ToLower(dt.Name))
+	// Auto-drop every sequence OWNED BY this table — the serial columns' sequences
+	// (spec/design/sequences.md §12). An owned sequence is never an FK dependent, so the check
+	// above never blocked on it; the sequences are removed alongside the table.
+	ownedSeqs := db.readSnap().sequencesOwnedBy(dt.Name)
+	w := db.working()
+	for _, sk := range ownedSeqs {
+		w.removeSequence(sk)
+	}
+	w.removeTable(strings.ToLower(dt.Name))
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// chooseSerialSeqName chooses the auto-generated name for a serial column's OWNED sequence
+// (spec/design/sequences.md §12), matching PostgreSQL: lower(table)_lower(column)_seq, with the
+// smallest integer suffix 1, 2, … appended until the name is free in the relation namespace — not
+// taken by an existing relation, not equal to the table being created, and not already chosen by an
+// earlier serial column of the same statement (pending). All-lowercase identifier-derived.
+func (db *Database) chooseSerialSeqName(table, column string, pending []*SequenceDef) string {
+	base := strings.ToLower(table) + "_" + strings.ToLower(column) + "_seq"
+	taken := func(c string) bool {
+		if db.relationExists(c) || strings.EqualFold(c, table) {
+			return true
+		}
+		for _, s := range pending {
+			if strings.EqualFold(s.Name, c) {
+				return true
+			}
+		}
+		return false
+	}
+	if !taken(base) {
+		return base
+	}
+	for n := 1; ; n++ {
+		cand := fmt.Sprintf("%s%d", base, n)
+		if !taken(cand) {
+			return cand
+		}
+	}
+}
+
+// serialPseudoType maps a serial pseudo-type name to its underlying integer scalar
+// (spec/design/sequences.md §12) — serial/serial4 → Int32, bigserial/serial8 → Int64,
+// smallserial/serial2 → Int16. The bool is false for any other name. Recognized only in a
+// CREATE TABLE column-type position; the match is case-insensitive.
+func serialPseudoType(name string) (ScalarType, bool) {
+	switch strings.ToLower(name) {
+	case "serial", "serial4":
+		return Int32, true
+	case "bigserial", "serial8":
+		return Int64, true
+	case "smallserial", "serial2":
+		return Int16, true
+	default:
+		return 0, false
+	}
 }
 
 // findIndex finds the table owning the named index in the visible snapshot
@@ -2441,6 +2568,7 @@ func (db *Database) executeCreateSequence(cs *CreateSequence) (Outcome, error) {
 		Cycle:     cycle,
 		LastValue: start,
 		IsCalled:  false,
+		OwnedBy:   nil,
 	})
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
@@ -2450,11 +2578,30 @@ func (db *Database) executeCreateSequence(cs *CreateSequence) (Outcome, error) {
 // (a plain DEFAULT nextval('s') creates none — PG). Multiple names are dropped left to right.
 func (db *Database) executeDropSequence(ds *DropSequence) (Outcome, error) {
 	for _, name := range ds.Names {
-		if db.readSnap().sequence(name) == nil {
+		// Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
+		// column's default — so RESTRICT (the only mode this slice; CASCADE 0A000) is 2BP01
+		// (spec/design/sequences.md §12).
+		seq := db.readSnap().sequence(name)
+		if seq == nil {
 			if ds.IfExists {
 				continue
 			}
 			return Outcome{}, NewError(UndefinedTable, "sequence does not exist: "+name)
+		}
+		if seq.OwnedBy != nil {
+			// The owning table is always present (its own DROP TABLE would auto-drop this
+			// sequence first), so the column name for the detail resolves.
+			colName, tableName := "", seq.OwnedBy.Table
+			if t, ok := db.readSnap().table(seq.OwnedBy.Table); ok {
+				tableName = t.Name
+				if int(seq.OwnedBy.Column) < len(t.Columns) {
+					colName = t.Columns[seq.OwnedBy.Column].Name
+				}
+			}
+			return Outcome{}, NewError(DependentObjectsStillExist, fmt.Sprintf(
+				"cannot drop sequence %s because other objects depend on it: default value for column %s of table %s depends on sequence %s",
+				seq.Name, colName, tableName, seq.Name,
+			))
 		}
 		db.working().removeSequence(strings.ToLower(name))
 	}

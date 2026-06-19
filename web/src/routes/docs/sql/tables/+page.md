@@ -19,7 +19,7 @@ INSERT INTO txn VALUES (1, 1, 25.00), (2, 2, 10.00);`;
 
 <svelte:head>
 	<title>Tables &amp; constraints — jed</title>
-	<meta name="description" content="CREATE TABLE with typed columns, PRIMARY KEY, NOT NULL, CHECK, UNIQUE and FOREIGN KEY constraints — enforced live." />
+	<meta name="description" content="CREATE TABLE with typed columns, serial auto-numbering, PRIMARY KEY, NOT NULL, CHECK, UNIQUE and FOREIGN KEY constraints — enforced live." />
 </svelte:head>
 
 # Tables & constraints
@@ -45,3 +45,20 @@ Things to try in the panel above:
 
 Each is rejected before anything is written — a statement is all-or-nothing. See the
 [error reference](../../reference/errors/) for every code.
+
+## Auto-numbering with `serial`
+
+A `serial` column (or `bigserial` / `smallserial` for `i64` / `i16`) is shorthand for an
+auto-numbering integer: it creates a dedicated sequence and defaults the column to that sequence's
+next value, and the column is `NOT NULL`. Omit it on insert and it fills in `1`, `2`, … Paste this
+into the panel above:
+
+```sql
+CREATE TABLE log (id serial PRIMARY KEY, msg text);
+INSERT INTO log (msg) VALUES ('first'), ('second');
+SELECT * FROM log;
+```
+
+`id` is assigned `1` then `2` automatically. The owned sequence is named `log_id_seq`; `DROP TABLE
+log` drops it too. (Supplying an explicit `id` overrides the default for that row without advancing
+the sequence — just like PostgreSQL.)

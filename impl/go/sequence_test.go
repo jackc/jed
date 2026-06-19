@@ -7,7 +7,10 @@ package jed
 // suites/ddl/sequence.test + suites/expr/sequence_value.test (CLAUDE.md §10). Mirrors
 // impl/rust/tests/sequence.rs.
 
-import "testing"
+import (
+	"path/filepath"
+	"testing"
+)
 
 // seqOneInt runs sql and returns its single int result (or nil for a NULL result).
 func seqOneInt(t *testing.T, db *Database, sql string) *int64 {
@@ -241,4 +244,136 @@ func TestSequenceSetvalAlterInReadOnlyIs25006(t *testing.T) {
 	mustExec(t, db, "BEGIN READ ONLY")
 	seqMustInt(t, db, "SELECT lastval()", 1)
 	mustExec(t, db, "ROLLBACK")
+}
+
+// ---------------------------------------------------------------------------
+// S3 — serial / bigserial / smallserial (spec/design/sequences.md §12). These per-core tests cover
+// what the PG-clean corpus cannot: the auto-named OWNED sequence, the DROP TABLE auto-drop surviving
+// a reopen (file persistence of the owner link, v13), and the DROP SEQUENCE 2BP01. The PG-agreeing
+// surface lives in suites/ddl/serial.test. Mirrors impl/rust/tests/sequence.rs.
+
+// seqQueryRows runs sql and returns the int values of its rows (panicking on NULL/non-int cells).
+func seqQueryRows(t *testing.T, db *Database, sql string) [][]int64 {
+	t.Helper()
+	out, err := Execute(db, sql)
+	if err != nil {
+		t.Fatalf("%q: %v", sql, err)
+	}
+	if out.Kind != OutcomeQuery {
+		t.Fatalf("%q: expected a query, got kind %v", sql, out.Kind)
+	}
+	rows := make([][]int64, len(out.Rows))
+	for i, r := range out.Rows {
+		row := make([]int64, len(r))
+		for j, v := range r {
+			if v.Kind != ValInt {
+				t.Fatalf("%q: row %d col %d expected int, got %v", sql, i, j, v)
+			}
+			row[j] = v.Int
+		}
+		rows[i] = row
+	}
+	return rows
+}
+
+// A serial column desugars to an integer column, NOT NULL, with a DEFAULT nextval backed by an
+// auto-created OWNED sequence named <table>_<col>_seq. Inserts auto-number from 1.
+func TestSerialDesugarsToOwnedSequence(t *testing.T) {
+	db := NewDatabase()
+	mustExec(t, db, "CREATE TABLE t (id serial PRIMARY KEY, b bigserial, s smallserial, v text)")
+	rows := seqQueryRows(t, db, "INSERT INTO t (v) VALUES ('a'), ('b') RETURNING id, b, s")
+	want := [][]int64{{1, 1, 1}, {2, 2, 2}}
+	if len(rows) != 2 || rows[0][0] != want[0][0] || rows[1][0] != want[1][0] ||
+		rows[0][1] != 1 || rows[1][1] != 2 || rows[0][2] != 1 || rows[1][2] != 2 {
+		t.Fatalf("auto-numbering wrong: got %v want %v", rows, want)
+	}
+	seqMustInt(t, db, "SELECT nextval('t_id_seq')", 3)
+	seqMustInt(t, db, "SELECT nextval('t_b_seq')", 3)
+	seqMustInt(t, db, "SELECT nextval('t_s_seq')", 3)
+}
+
+// A NULL into a serial column violates the implied NOT NULL (23502); an explicit value overrides the
+// default and does NOT advance the sequence (PG).
+func TestSerialNotNullAndExplicitOverride(t *testing.T) {
+	db := NewDatabase()
+	mustExec(t, db, "CREATE TABLE t (id serial PRIMARY KEY, v text)")
+	if code := seqErrCode(t, db, "INSERT INTO t (id, v) VALUES (NULL, 'x')"); code != "23502" {
+		t.Fatalf("expected 23502, got %s", code)
+	}
+	mustExec(t, db, "INSERT INTO t (id, v) VALUES (100, 'y')")
+	rows := seqQueryRows(t, db, "INSERT INTO t (v) VALUES ('z') RETURNING id")
+	if rows[0][0] != 1 {
+		t.Fatalf("expected next default 1, got %d", rows[0][0])
+	}
+}
+
+// An explicit DEFAULT on a serial column conflicts with the synthesized one — 42601 (PG).
+func TestSerialWithExplicitDefaultIs42601(t *testing.T) {
+	db := NewDatabase()
+	if code := seqErrCode(t, db, "CREATE TABLE t (id serial DEFAULT 5)"); code != "42601" {
+		t.Fatalf("expected 42601, got %s", code)
+	}
+}
+
+// The auto-name collision-resolves with a numeric suffix when <table>_<col>_seq is taken (PG).
+func TestSerialSeqNameCollisionResolves(t *testing.T) {
+	db := NewDatabase()
+	mustExec(t, db, "CREATE SEQUENCE t_id_seq")
+	mustExec(t, db, "CREATE TABLE t (id serial)")
+	mustExec(t, db, "INSERT INTO t (id) VALUES (DEFAULT)")
+	// t_id_seq (the manual one) was never advanced; t_id_seq1 produced the row's 1.
+	seqMustInt(t, db, "SELECT nextval('t_id_seq1')", 2)
+	seqMustInt(t, db, "SELECT nextval('t_id_seq')", 1)
+}
+
+// DROP SEQUENCE of an OWNED (serial) sequence is 2BP01; DROP TABLE auto-drops it.
+func TestSerialOwnedSequenceDropRules(t *testing.T) {
+	db := NewDatabase()
+	mustExec(t, db, "CREATE TABLE t (id serial PRIMARY KEY)")
+	if code := seqErrCode(t, db, "DROP SEQUENCE t_id_seq"); code != "2BP01" {
+		t.Fatalf("expected 2BP01, got %s", code)
+	}
+	mustExec(t, db, "DROP TABLE t")
+	if code := seqErrCode(t, db, "SELECT nextval('t_id_seq')"); code != "42P01" {
+		t.Fatalf("expected 42P01 after auto-drop, got %s", code)
+	}
+	mustExec(t, db, "CREATE SEQUENCE t_id_seq") // the name is free to reuse
+}
+
+// The OWNED BY link persists (format_version 13): after create + commit + reopen, DROP TABLE still
+// auto-drops the owned sequence, and DROP SEQUENCE of it is still 2BP01.
+func TestSerialOwnedLinkSurvivesReopen(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "serial_owned_reopen.jed")
+	db, err := Create(path, DatabaseOptions{PageSize: 4096})
+	if err != nil {
+		t.Fatal(err)
+	}
+	mustExec(t, db, "CREATE TABLE t (id serial PRIMARY KEY, v text)")
+	mustExec(t, db, "INSERT INTO t (v) VALUES ('a')")
+	if err := db.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	db, err = Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if code := seqErrCode(t, db, "DROP SEQUENCE t_id_seq"); code != "2BP01" {
+		t.Fatalf("expected 2BP01 after reopen, got %s", code)
+	}
+	mustExec(t, db, "DROP TABLE t")
+	if code := seqErrCode(t, db, "SELECT nextval('t_id_seq')"); code != "42P01" {
+		t.Fatalf("expected 42P01 after reopen auto-drop, got %s", code)
+	}
+}
+
+// serial is recognized only in a column-type position — a CAST to it is an undefined type.
+func TestSerialIsNotACastableType(t *testing.T) {
+	db := NewDatabase()
+	if code := seqErrCode(t, db, "SELECT 1::serial"); code != "42704" {
+		t.Fatalf("expected 42704, got %s", code)
+	}
 }

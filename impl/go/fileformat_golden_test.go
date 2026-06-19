@@ -553,6 +553,18 @@ func sequenceTableDB(t *testing.T) *Database {
 	return db
 }
 
+// serialTableDB pins the v13 OWNED-sequence link (the has_owner flag bit + the owner table-name/
+// column-ordinal tail). The serial column id desugars to an i32 column that is NOT NULL (via the PK)
+// with an expression DEFAULT nextval('t_id_seq'), and an OWNED sequence t_id_seq created alongside;
+// one INSERT advances it once (is_called true, last_value 1). Must match the Ruby reference's
+// SERIAL_TABLE (spec/fileformat/verify.rb), spec/design/sequences.md §12.
+func serialTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id serial PRIMARY KEY, v text)")
+	run(t, db, "INSERT INTO t (v) VALUES ('hello')")
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -591,6 +603,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"array_composite_table.jed", arrayCompositeTableDB},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB},
 		{"sequence_table.jed", sequenceTableDB},
+		{"serial_table.jed", serialTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -643,6 +656,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"array_composite_table.jed", arrayCompositeTableDB, "t"},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB, "t"},
 		{"sequence_table.jed", sequenceTableDB, "t"},
+		{"serial_table.jed", serialTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

@@ -22,7 +22,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 13    // on-disk format version (13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md). 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. The bump from 12 was atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion   uint16 = 14    // on-disk format version (14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12). 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -1769,7 +1769,17 @@ func sequenceEntryBytes(s *SequenceDef) []byte {
 	if s.IsCalled {
 		flags |= 0b10
 	}
+	if s.OwnedBy != nil {
+		flags |= 0b100 // bit2 has_owner (v13)
+	}
 	out = append(out, flags)
+	// The OWNED BY tail (v13): only present when has_owner — owner table name + column ordinal
+	// (spec/design/sequences.md §12, format.md *Sequence entry*).
+	if s.OwnedBy != nil {
+		out = appendU16(out, uint16(len(s.OwnedBy.Table)))
+		out = append(out, s.OwnedBy.Table...)
+		out = appendU16(out, s.OwnedBy.Column)
+	}
 	return out
 }
 
@@ -1808,8 +1818,21 @@ func decodeSequenceEntry(buf []byte, pos *int) (*SequenceDef, error) {
 	if err != nil {
 		return nil, err
 	}
-	if flags&^uint8(0b11) != 0 {
+	if flags&^uint8(0b111) != 0 {
 		return nil, NewError(DataCorrupted, "reserved sequence flag set")
+	}
+	// The OWNED BY tail (v13): present iff bit2 (has_owner) is set.
+	var owner *SeqOwner
+	if flags&0b100 != 0 {
+		ownerTable, err := readString(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		ownerCol, err := readU16(buf, pos)
+		if err != nil {
+			return nil, err
+		}
+		owner = &SeqOwner{Table: ownerTable, Column: ownerCol}
 	}
 	return &SequenceDef{
 		Name:      name,
@@ -1821,6 +1844,7 @@ func decodeSequenceEntry(buf []byte, pos *int) (*SequenceDef, error) {
 		Cycle:     flags&0b1 != 0,
 		LastValue: lastValue,
 		IsCalled:  flags&0b10 != 0,
+		OwnedBy:   owner,
 	}, nil
 }
 

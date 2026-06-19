@@ -14,15 +14,20 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 13 # format_version 13: GIN inverted indexes — each catalog index entry gains a one-byte
+VERSION = 14 # format_version 14: the serial OWNED-sequence link — the sequence-entry flags byte
+# gains bit2 has_owner; when set, the flags byte is followed by the owner reference (owner table name
+# u16-len + bytes, then owner column ordinal u16). A non-owned sequence writes nothing after the flags
+# byte (the v12 shape). The link records the OWNED BY relationship a serial column establishes, so a
+# reopened database still auto-drops the owned sequence on DROP TABLE (spec/design/sequences.md §12).
+# format_version 13 was GIN inverted indexes — each catalog index entry gains a one-byte
 # index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page; a GIN index's
 # tree holds term‖storage-key entries, empty payload (spec/design/gin.md). format_version 12 was
 # SEQUENCES — a third kind-tagged catalog entry (entry_kind u8: 2 = sequence; joining 0 table, 1
 # composite-type). A sequence entry is name + six fixed i64 fields (increment, min_value, max_value,
 # start, cache, last_value; big-endian two's-complement, no sign-flip) + a flags byte (bit0 cycle,
 # bit1 is_called). Emission order: composites (1), sequences (2), tables (0), each name-sorted. A
-# sequence owns no B-tree (spec/design/sequences.md §3). v11 was FOREIGN KEY constraints — the table
-# catalog entry gains a
+# sequence owns no B-tree (spec/design/sequences.md §3). format_version 11 was FOREIGN KEY
+# constraints — the table catalog entry gains a
 # foreign-key list (fk_count + per FK: name, local ordinals, ref table, ref ordinals, actions byte)
 # after the index list, before root_data_page (spec/design/constraints.md §6, format.md). An FK owns
 # no B-tree (no root page); a file with no FKs still moves to v11 (every table entry gains fk_count=0).
@@ -103,13 +108,14 @@ def ctype(name, fields) = { name: name, fields: fields }
 
 # A sequence definition (`CREATE SEQUENCE name ...`, spec/design/sequences.md §3). The six i64
 # fields + the cycle/is_called flags exactly as the cores persist them; `last_value` defaults to
-# `start` (a fresh sequence). The on-disk entry is fixed-width — every field present (format.md
-# *Sequence entry*).
+# `start` (a fresh sequence). `owned_by` is `[table, column_ordinal]` for a `serial` column's OWNED
+# sequence (§12, v13), else `nil`. The on-disk entry is fixed-width through the flags byte, with the
+# owner reference a conditional tail (format.md *Sequence entry*).
 def seq(name, increment:, min_value:, max_value:, start:, cache: 1, cycle: false,
-        last_value: nil, is_called: false)
+        last_value: nil, is_called: false, owned_by: nil)
   { name: name, increment: increment, min_value: min_value, max_value: max_value,
     start: start, cache: cache, cycle: cycle,
-    last_value: last_value.nil? ? start : last_value, is_called: is_called }
+    last_value: last_value.nil? ? start : last_value, is_called: is_called, owned_by: owned_by }
 end
 
 # A composite type defined, persisted, AND used by a stored column (S3 — composite.md §4). The
@@ -633,6 +639,23 @@ SEQUENCE_TABLE = {
              rows: [[1, 10]] }]
 }.freeze
 
+# SERIAL (v13 — spec/design/sequences.md §12): pins the OWNED-sequence link (the has_owner flag bit
+# + the owner table-name/column-ordinal tail). The `serial` column `id` desugars to an i32 column
+# that is NOT NULL (via the PK) with an EXPRESSION DEFAULT `nextval ( 't_id_seq' )` (flags bit3), and
+# an OWNED sequence `t_id_seq` (owned_by ["t", 0]) created alongside. One INSERT advances the sequence
+# once (is_called true, last_value 1). The cores build this via
+#   CREATE TABLE t (id serial PRIMARY KEY, v text); INSERT INTO t (v) VALUES ('hello')
+SERIAL_TABLE = {
+  sequences: [
+    seq("t_id_seq", increment: 1, min_value: 1, max_value: 9_223_372_036_854_775_807, start: 1,
+        cache: 1, cycle: false, last_value: 1, is_called: true, owned_by: ["t", 0])
+  ],
+  tables: [{ name: "t",
+             columns: [col("id", "i32", pk: true, default_expr: "nextval ( 't_id_seq' )"),
+                       col("v", "text")],
+             rows: [[1, "hello"]] }]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -674,6 +697,8 @@ FIXTURES = [
     types: NESTED_COMPOSITE_TABLE[:types], tables: NESTED_COMPOSITE_TABLE[:tables] },
   { file: "sequence_table.jed", page_size: 256,
     sequences: SEQUENCE_TABLE[:sequences], tables: SEQUENCE_TABLE[:tables] },
+  { file: "serial_table.jed", page_size: 256,
+    sequences: SERIAL_TABLE[:sequences], tables: SERIAL_TABLE[:tables] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
@@ -1037,10 +1062,11 @@ def composite_type_entry_bytes(ct)
   out
 end
 
-# Serialize a sequence catalog entry's BODY (after the entry_kind=2 byte), v12: name, then six fixed
-# i64 fields (big-endian two's-complement, no sign-flip — `q>`) and a flags byte (bit0 cycle, bit1
-# is_called). Fixed-width, every field present (spec/design/sequences.md §3, format.md *Sequence
-# entry*).
+# Serialize a sequence catalog entry's BODY (after the entry_kind=2 byte): name, then six fixed i64
+# fields (big-endian two's-complement, no sign-flip — `q>`) and a flags byte (bit0 cycle, bit1
+# is_called, bit2 has_owner — v13). When has_owner, the flags byte is followed by the owner reference
+# — owner table name (u16 len + bytes) then owner column ordinal (u16); a non-owned sequence writes
+# nothing after the flags byte (spec/design/sequences.md §3/§12, format.md *Sequence entry*).
 def sequence_entry_bytes(s)
   out = +"".b
   out << u16(s[:name].bytesize) << s[:name].b
@@ -1053,7 +1079,12 @@ def sequence_entry_bytes(s)
   flags = 0
   flags |= 0b1 if s[:cycle]
   flags |= 0b10 if s[:is_called]
+  flags |= 0b100 if s[:owned_by]
   out << [flags].pack("C")
+  if (o = s[:owned_by])
+    out << u16(o[0].bytesize) << o[0].b
+    out << u16(o[1])
+  end
   out
 end
 
@@ -2010,12 +2041,21 @@ def decode_sequence_entry(buf, pos)
   end
   fb, pos = take(buf, pos, 1)
   flags = fb.getbyte(0)
-  raise "reserved sequence flag set" if (flags & ~0b11) != 0
+  raise "reserved sequence flag set" if (flags & ~0b111) != 0
+
+  # The OWNED BY tail (v13): present iff bit2 (has_owner) is set.
+  owned_by = nil
+  if (flags & 0b100) != 0
+    tl, pos = take(buf, pos, 2)
+    table, pos = take(buf, pos, tl.unpack1("n"))
+    col_raw, pos = take(buf, pos, 2)
+    owned_by = [table, col_raw.unpack1("n")]
+  end
 
   [{ name: name, increment: fields[:increment], min_value: fields[:min_value],
      max_value: fields[:max_value], start: fields[:start], cache: fields[:cache],
      cycle: (flags & 0b1) != 0, last_value: fields[:last_value],
-     is_called: (flags & 0b10) != 0 }, pos]
+     is_called: (flags & 0b10) != 0, owned_by: owned_by }, pos]
 end
 
 # The sequence content a fixture should decode to (name-sorted).

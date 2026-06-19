@@ -569,8 +569,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `CYCLE` wraparound and the bound errors (`22003` setval / `22023` RESTART). `setval`/`ALTER`
         reuse the `nextval` write-path + transactional-rollback machinery; with `setval` available
         the corpus sets a known state in one statement and asserts directly. _(size: M)_
-  - [ ] **S3** — `serial` / `bigserial` / `smallserial` pseudo-types (owned sequence + `DEFAULT
-        nextval(...)` + `OWNED BY` auto-drop; `2BP01` dependency tracking). _(size: M–L)_
+  - [x] **S3** — `serial` / `bigserial` / `smallserial` (aliases `serial4`/`serial8`/`serial2`)
+        CREATE-TABLE column pseudo-types: sugar for an `i32`/`i64`/`i16` column that is `NOT NULL`
+        with a `DEFAULT nextval(...)` backed by a newly-created **owned** sequence
+        (`<table>_<col>_seq`, numeric-suffix collision resolution). The `OWNED BY` link is persisted
+        (**`format_version` 14** — a `has_owner` flag bit + trailing owner table/ordinal on the
+        sequence entry, new `serial_table.jed` golden `rust == go == ts == ruby`), so `DROP TABLE`
+        auto-drops the owned sequence (across a reopen) and `DROP SEQUENCE` of an owned sequence is
+        `2BP01`; an explicit `DEFAULT` on a serial column is `42601`. Owned sequences are
+        `bigint`-flavored for all three (the `AS type` deferral — a documented divergence); the
+        column type bounds stored values. All three cores + Ruby; `ddl/serial.test`; capability
+        `ddl.serial`. → [sequences.md §12](spec/design/sequences.md) _(size: M–L)_
   - [ ] **S4** — `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` columns + `OVERRIDING … VALUE`.
         _(size: L)_
 - [ ] **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE ✅, RETURNING ✅ — unblocked)_
