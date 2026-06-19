@@ -7,9 +7,10 @@
 use crate::ast::{
     AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateSequence,
     CreateTable, CreateType, Cte, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType,
-    Expr, ForeignKeyDef, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal,
-    OrderKey, QueryExpr, RefAction, Select, SelectItem, SelectItems, SetOp, SetOpKind, Statement,
-    SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WithQuery,
+    Expr, ForeignKeyDef, IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind,
+    Literal, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems,
+    SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod,
+    UnaryOp, UniqueDef, Update, WithQuery,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -250,6 +251,7 @@ impl Parser {
                 foreign_keys.push(self.parse_foreign_key_table_constraint()?);
             } else {
                 columns.push(self.parse_column_def(
+                    &name,
                     &mut checks,
                     &mut uniques,
                     &mut foreign_keys,
@@ -465,6 +467,7 @@ impl Parser {
 
     fn parse_column_def(
         &mut self,
+        table_name: &str,
         checks: &mut Vec<CheckDef>,
         uniques: &mut Vec<UniqueDef>,
         foreign_keys: &mut Vec<ForeignKeyDef>,
@@ -490,6 +493,7 @@ impl Parser {
         let mut primary_key = false;
         let mut not_null = false;
         let mut default = None;
+        let mut identity: Option<IdentitySpec> = None;
         loop {
             if self.at_check_constraint() {
                 checks.push(self.parse_check_constraint()?);
@@ -549,6 +553,45 @@ impl Parser {
                     let text = render_tokens(&self.tokens[start..self.pos]);
                     default = Some(DefaultDef { expr, text });
                 }
+                // `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( seq_options )]`
+                // (spec/design/sequences.md §13). Two identity specs on one column is 42601
+                // ("multiple identity specifications"). The desugaring (owned sequence + nextval
+                // default + NOT NULL + the type gate) is at execution.
+                Some("generated") => {
+                    self.advance();
+                    let always = match self.peek_keyword().as_deref() {
+                        Some("always") => {
+                            self.advance();
+                            true
+                        }
+                        Some("by") => {
+                            self.advance();
+                            self.expect_keyword("default")?;
+                            false
+                        }
+                        other => {
+                            return Err(syntax(format!(
+                                "expected ALWAYS or BY DEFAULT after GENERATED, found {other:?}"
+                            )));
+                        }
+                    };
+                    self.expect_keyword("as")?;
+                    self.expect_keyword("identity")?;
+                    let options = if matches!(self.peek(), Token::LParen) {
+                        self.parse_sequence_options(true)?
+                    } else {
+                        SeqOptions::default()
+                    };
+                    if identity.is_some() {
+                        return Err(EngineError::new(
+                            SqlState::SyntaxError,
+                            format!(
+                                "multiple identity specifications for column {name} of table {table_name}"
+                            ),
+                        ));
+                    }
+                    identity = Some(IdentitySpec { always, options });
+                }
                 Some("unique") => {
                     self.advance();
                     uniques.push(UniqueDef {
@@ -580,6 +623,7 @@ impl Parser {
             primary_key,
             not_null,
             default,
+            identity,
         })
     }
 
@@ -789,17 +833,24 @@ impl Parser {
         self.expect_keyword("sequence")?;
         let if_not_exists = self.parse_if_not_exists()?;
         let name = self.expect_identifier()?;
-        let mut seq = CreateSequence {
+        let options = self.parse_sequence_options(false)?;
+        Ok(CreateSequence {
             name,
             if_not_exists,
-            increment: None,
-            min_value: None,
-            max_value: None,
-            start: None,
-            cache: None,
-            cycle: None,
-        };
-        // Order-free option loop: dispatch on the leading keyword, each option at most once.
+            options,
+        })
+    }
+
+    /// Parse the order-free sequence-option set (`INCREMENT [BY] n`, `MINVALUE`/`MAXVALUE` and their
+    /// `NO` forms, `START [WITH] n`, `CACHE c`, `[NO] CYCLE`) shared by CREATE SEQUENCE and an
+    /// IDENTITY column's `( seq_options )` (spec/design/sequences.md §13). When `parenthesized`, the
+    /// options are wrapped in `( … )` and the loop stops at `)`; each option appears at most once
+    /// (a repeat is 42601 via `dup_check`).
+    fn parse_sequence_options(&mut self, parenthesized: bool) -> Result<SeqOptions> {
+        if parenthesized {
+            self.expect(&Token::LParen)?;
+        }
+        let mut seq = SeqOptions::default();
         loop {
             match self.peek_keyword().as_deref() {
                 Some("increment") => {
@@ -862,6 +913,9 @@ impl Parser {
                 }
                 _ => break,
             }
+        }
+        if parenthesized {
+            self.expect(&Token::RParen)?;
         }
         Ok(seq)
     }
@@ -1018,6 +1072,27 @@ impl Parser {
             None
         };
 
+        // Optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13),
+        // after the column list and before the source. `OVERRIDING` / `SYSTEM` / `USER` / `VALUE`
+        // are non-reserved; the clause is unambiguous against a `VALUES`/`SELECT` source.
+        let overriding = if self.peek_keyword().as_deref() == Some("overriding") {
+            self.advance();
+            let mode = match self.peek_keyword().as_deref() {
+                Some("system") => Overriding::System,
+                Some("user") => Overriding::User,
+                other => {
+                    return Err(syntax(format!(
+                        "expected SYSTEM or USER after OVERRIDING, found {other:?}"
+                    )));
+                }
+            };
+            self.advance();
+            self.expect_keyword("value")?;
+            Some(mode)
+        } else {
+            None
+        };
+
         // The source is EITHER a SELECT (INSERT ... SELECT — §24) OR a VALUES list. `VALUES`
         // and `SELECT` are disjoint leading keywords, so a peek decides without lookahead.
         let source = if self.peek_keyword().as_deref() == Some("select") {
@@ -1039,6 +1114,7 @@ impl Parser {
         Ok(Insert {
             table,
             columns,
+            overriding,
             source,
             returning,
         })

@@ -211,6 +211,10 @@ export type ColumnDef = {
   // DEFAULT keyword). A constant literal is pre-evaluated at CREATE TABLE; any other expression
   // is evaluated per row at INSERT (spec/design/constraints.md §2). null = no default.
   default: DefaultDef | null;
+  // An optional `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( opts )]` constraint
+  // (spec/design/sequences.md §13). Desugars like `serial` (an owned sequence + a `nextval` default
+  // + NOT NULL) plus the persisted ALWAYS/BY DEFAULT distinction. null = a non-identity column.
+  identity: IdentitySpec | null;
 };
 
 // Assignment is one `SET <column> = <value>` clause; value is a general expression
@@ -336,17 +340,13 @@ export type TypeFieldDef = {
 // missing type without IF EXISTS is 42704.
 export type DropType = { kind: "dropType"; name: string; ifExists: boolean };
 
-// CreateSequence is a `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` statement — a named,
-// persisted i64 generator (spec/design/sequences.md). The options are order-free; each is
-// captured as a parsed override, with `null` meaning "use the default" (resolved at execution
-// against the INCREMENT sign). Execution validates the option set (22023), rejects a relation-
-// namespace collision (42P07 unless `ifNotExists`), and registers the sequence in the catalog.
-// `minValue`/`maxValue` use a nested-override form: `{ value: v }` = MINVALUE v; `{ value: null }`
-// = NO MINVALUE (the type default); the outer `null` = unset.
-export type CreateSequence = {
-  kind: "createSequence";
-  name: string;
-  ifNotExists: boolean;
+// SeqOptions is the parsed, order-free sequence-option set shared by CREATE SEQUENCE and an
+// IDENTITY column's optional `( seq_options )` (spec/design/sequences.md §13). Each is captured as
+// a parsed override, with `null` meaning "use the default" (resolved at execution against the
+// INCREMENT sign); execution validates the set (22023). `minValue`/`maxValue` use a nested-override
+// form: `{ value: v }` = MINVALUE v; `{ value: null }` = NO MINVALUE (the type default); the outer
+// `null` = unset.
+export type SeqOptions = {
   increment: bigint | null;
   minValue: { value: bigint | null } | null;
   maxValue: { value: bigint | null } | null;
@@ -354,6 +354,26 @@ export type CreateSequence = {
   cache: bigint | null;
   cycle: boolean | null;
 };
+
+// emptySeqOptions builds a fresh SeqOptions with every override unset (the all-default sequence).
+export function emptySeqOptions(): SeqOptions {
+  return { increment: null, minValue: null, maxValue: null, start: null, cache: null, cycle: null };
+}
+
+// CreateSequence is a `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` statement — a named,
+// persisted i64 generator (spec/design/sequences.md). Execution validates the option set (22023),
+// rejects a relation-namespace collision (42P07 unless `ifNotExists`), and registers the sequence.
+export type CreateSequence = {
+  kind: "createSequence";
+  name: string;
+  ifNotExists: boolean;
+  options: SeqOptions;
+};
+
+// IdentitySpec is a column's `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( seq_options )]`
+// constraint (spec/design/sequences.md §13). `always` distinguishes ALWAYS (true) from BY DEFAULT
+// (false); `options` tunes the auto-created owned sequence (defaults to the standard ascending i64).
+export type IdentitySpec = { always: boolean; options: SeqOptions };
 
 // DropSequence is a `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT]` statement — remove one or
 // more sequences (spec/design/sequences.md §1). A missing sequence without IF EXISTS is 42P01;
@@ -388,6 +408,9 @@ export type Insert = {
   kind: "insert";
   table: string;
   columns: string[] | null;
+  // The optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13),
+  // governing IDENTITY columns. null is the default (no override).
+  overriding: Overriding | null;
   source:
     | { kind: "values"; rows: InsertValue[][] }
     | { kind: "select"; select: Select };
@@ -395,6 +418,11 @@ export type Insert = {
   // row, turning the statement into a query result. Null = no clause.
   returning: SelectItems | null;
 };
+
+// Overriding is the INSERT `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md
+// §13): "system" lets an explicit value land in a GENERATED ALWAYS identity column; "user" discards
+// a supplied value for any identity column and uses its sequence instead.
+export type Overriding = "system" | "user";
 
 // InsertValue is one value slot in an INSERT VALUES row: a literal, or the DEFAULT keyword —
 // which substitutes the target column's declared default (or NULL if it has none). The DEFAULT

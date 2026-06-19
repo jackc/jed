@@ -558,8 +558,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.
       → [grammar.md §32](spec/design/grammar.md)
   - [ ] _follow-on:_ the `WITH (OLD AS o, NEW AS n)` aliasing form; `old.*`/`new.*`.
-- [ ] **Sequences** (`CREATE SEQUENCE` / `nextval` / `currval`) — the PostgreSQL sequence object as
-      a third catalog-object kind (after tables + composite types): a named, persisted, monotonic
+- [x] **Sequences** (`CREATE SEQUENCE` / `nextval` / `currval`) — ✅ **landed (S0–S4)**: the PostgreSQL
+      sequence object as a third catalog-object kind (after tables + composite types): a named, persisted, monotonic
       **i64** generator in `Snapshot.sequences`, advanced by `nextval('s')` and read by
       `currval('s')` (session-local). **The defining decision — `nextval` is TRANSACTIONAL** (rolls
       back with the txn), a deliberate PG divergence already mandated by
@@ -591,8 +591,15 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `bigint`-flavored for all three (the `AS type` deferral — a documented divergence); the
         column type bounds stored values. All three cores + Ruby; `ddl/serial.test`; capability
         `ddl.serial`. → [sequences.md §12](spec/design/sequences.md) _(size: M–L)_
-  - [ ] **S4** — `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` columns + `OVERRIDING … VALUE`.
-        _(size: L)_
+  - [x] **S4** — `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( seq_options )]` columns + the
+        `OVERRIDING { SYSTEM | USER } VALUE` INSERT clause (the SQL-standard identity surface). Reuses
+        S3's owned-sequence + `nextval`-default + `NOT NULL` desugaring, adding only two persisted
+        column flag bits (**`format_version` 15** — bit 4 `is_identity`, bit 5 `identity_always`), the
+        `identity_table.jed` golden (`rust == go == ts == ruby`), the `428C9 generated_always` error,
+        the `i16`/`i32`/`i64`-only type gate (`22023`), the `CREATE TABLE` conflicts (`42601`), and the
+        INSERT/UPDATE value gating. Owned sequences are `bigint`-flavored (the `AS type` deferral — a
+        documented divergence). All three cores + Ruby; `ddl/identity.test`; capability `ddl.identity`.
+        → [sequences.md §13](spec/design/sequences.md) _(size: L)_
 - [ ] **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE ✅, RETURNING ✅ — unblocked)_
 - [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
       `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).

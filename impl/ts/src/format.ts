@@ -11,7 +11,7 @@
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
 import type { Expr } from "./ast.ts";
-import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type FkAction, type ForeignKey, type IndexDef, type SeqOwner, type SequenceDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
+import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type FkAction, type ForeignKey, type IdentityKind, type IndexDef, type SeqOwner, type SequenceDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
@@ -60,7 +60,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 14; // on-disk format version (14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12). 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 15; // on-disk format version (15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13). 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -809,6 +809,12 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
     // bit3 default_is_expr (v8) — mutually exclusive with bit2 (a column has at most one of a
     // constant or an expression default — spec/fileformat/format.md).
     if (col.defaultExpr !== null) flags |= 0b1000;
+    // bit4 is_identity + bit5 identity_always (v15) — an IDENTITY column also carries not_null
+    // (bit1) + the nextval expression default (bit3) — spec/design/sequences.md §13.
+    if (col.identity !== null) {
+      flags |= 0b1_0000;
+      if (col.identity === "always") flags |= 0b10_0000;
+    }
     w.u8(flags);
     // A decimal column appends its typmod (precision, scale) — only for type_code 6, so
     // non-decimal entries are byte-unchanged (format.md). precision 0 = unconstrained numeric.
@@ -1978,6 +1984,7 @@ function decodeTableEntry(
         notNull: (cflags & 0b10) !== 0,
         default: null,
         defaultExpr: null,
+        identity: null,
       });
       continue;
     }
@@ -1996,6 +2003,7 @@ function decodeTableEntry(
         notNull: (cflags & 0b10) !== 0,
         default: null,
         defaultExpr: null,
+        identity: null,
       });
       continue;
     }
@@ -2005,10 +2013,20 @@ function decodeTableEntry(
     }
     const flags = readU8(buf, cur);
     // bit0 was the primary_key flag through v4; v5 retired it (the pk list below is the
-    // authority) and reserves it as must-be-zero.
+    // authority) and reserves it as must-be-zero. bits 6-7 are reserved (v15).
     if ((flags & 0b01) !== 0) {
       throw engineError("data_corrupted", "reserved column flag bit0 set");
     }
+    if ((flags & 0b1100_0000) !== 0) {
+      throw engineError("data_corrupted", "reserved column flag bit (6/7) set");
+    }
+    // bit4 is_identity + bit5 identity_always (v15) — identity_always is meaningful only with
+    // is_identity (spec/design/sequences.md §13).
+    if ((flags & 0b11_0000) === 0b10_0000) {
+      throw engineError("data_corrupted", "identity_always set without is_identity");
+    }
+    const identity: IdentityKind | null =
+      (flags & 0b1_0000) !== 0 ? ((flags & 0b10_0000) !== 0 ? "always" : "byDefault") : null;
     // A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
     let decimal: DecimalTypmod | null = null;
     if (ty === "decimal") {
@@ -2046,6 +2064,7 @@ function decodeTableEntry(
       notNull: (flags & 0b10) !== 0,
       default: colDefault,
       defaultExpr: colDefaultExpr,
+      identity,
     });
   }
   // The primary key (v5): member ordinals in KEY order. Each must name a real column,

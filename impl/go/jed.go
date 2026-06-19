@@ -67,8 +67,11 @@ var SupportedCapabilities = []string{
 	"ddl.sequence",
 	"func.sequence",
 	// serial / bigserial / smallserial CREATE TABLE pseudo-types — an owned sequence + DEFAULT
-	// nextval(...) + NOT NULL; DROP TABLE auto-drops it; format_version 13 (sequences.md §12).
+	// nextval(...) + NOT NULL; DROP TABLE auto-drops it; format_version 14 (sequences.md §12).
 	"ddl.serial",
+	// GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY columns + the INSERT OVERRIDING clause —
+	// serial's machinery + ALWAYS/BY DEFAULT gating; format_version 15 (sequences.md §13).
+	"ddl.identity",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
 	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

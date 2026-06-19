@@ -77,6 +77,10 @@ id = "ddl.serial"
 description = "serial / bigserial / smallserial (aliases serial4 / serial8 / serial2) CREATE TABLE column pseudo-types — sugar (PostgreSQL) for an integer column (i32 / i64 / i16) that is NOT NULL with a DEFAULT nextval(...) backed by a newly-created OWNED sequence named <table>_<column>_seq (numeric-suffix collision resolution). Recognized only in a column-type position. The owned sequence is bigint-flavored for all three (AS type 0A000 — a documented divergence); DROP TABLE auto-drops it; DROP SEQUENCE of an owned sequence is 2BP01; an explicit DEFAULT on a serial column is 42601. The owner link persists (format_version 14). nextval stays TRANSACTIONAL (spec/design/sequences.md §12)"
 
 [[capability]]
+id = "ddl.identity"
+description = "GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY column constraint (the SQL-standard identity surface) + the optional ( sequence_options ) + the INSERT OVERRIDING { SYSTEM | USER } VALUE clause. Desugars like serial — an OWNED bigint sequence (named <table>_<column>_seq, suffix collision resolution) + a DEFAULT nextval(...) + NOT NULL — plus the persisted ALWAYS/BY DEFAULT distinction (format_version 15, two column flag bits). The column type must be smallint/integer/bigint (22023). ALWAYS rejects an explicit INSERT value without OVERRIDING SYSTEM VALUE (428C9) and any UPDATE assignment (428C9); OVERRIDING USER VALUE discards a supplied value and uses the sequence; BY DEFAULT uses an explicit value (not advancing the sequence). DEFAULT-and-identity / serial-and-identity / two identity specs are 42601. The owned sequence is bigint-flavored (AS type 0A000 — a documented divergence) (spec/design/sequences.md §13)"
+
+[[capability]]
 id = "dml.insert_column_list"
 description = "INSERT with an explicit column list `(a, c)` — unlisted columns take their default else NULL; the DEFAULT keyword in a value slot; unknown column 42703, duplicate 42701 (spec/design/grammar.md §12)"
 

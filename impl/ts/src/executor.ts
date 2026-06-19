@@ -22,8 +22,10 @@ import type {
   JoinKind,
   Literal,
   OrderKey,
+  Overriding,
   QueryExpr,
   RefAction,
+  SeqOptions,
   Select,
   SelectItems,
   SetOp,
@@ -35,6 +37,7 @@ import type {
   Update,
   WithQuery,
 } from "./ast.ts";
+import { emptySeqOptions } from "./ast.ts";
 import {
   type CheckConstraint,
   type ColField,
@@ -45,7 +48,9 @@ import {
   type DefaultExpr,
   type FkAction,
   type ForeignKey,
+  type IdentityKind,
   type IndexDef,
+  type SeqOwner,
   type SequenceDef,
   type Table,
   columnIndex,
@@ -1373,37 +1378,50 @@ export class Database {
       //     assignable to the column, 42804) and stored as text for per-row eval.
       let def_default: Value | null = null;
       let def_defaultExpr: DefaultExpr | null = null;
-      if (serialKind !== undefined) {
-        // serial desugaring (sequences.md §12): an explicit DEFAULT conflicts with the synthesized
-        // one (PG: "multiple default values specified", 42601). Otherwise create the OWNED sequence
-        // and synthesize DEFAULT nextval('<auto-name>') — an ordinary expression default (the
-        // format_version 8 mechanism), evaluated per row at INSERT.
-        if (def.default !== null) {
+      let identityKind: IdentityKind | null = null;
+      // A serial pseudo-type OR a GENERATED … AS IDENTITY constraint both desugar to an
+      // auto-numbered column: an OWNED sequence + a synthesized DEFAULT nextval(...) + NOT NULL
+      // (sequences.md §12/§13). Identity additionally records ALWAYS/BY DEFAULT and gates the
+      // column type to i16/i32/i64.
+      if (serialKind !== undefined || def.identity !== null) {
+        // IDENTITY type gate: the declared column type must be smallint/integer/bigint
+        // (sequences.md §13.1). serial's type is the pseudo-type (always integer), so this only
+        // bites an identity column written on a non-integer type.
+        if (def.identity !== null && !typeIsInteger(colType)) {
+          throw engineError(
+            "invalid_parameter_value",
+            "identity column type must be smallint, integer, or bigint",
+          );
+        }
+        // Conflicts (42601, sequences.md §13.2). An explicit DEFAULT — or a serial type, itself a
+        // synthesized default — alongside IDENTITY is "both default and identity"; a serial column
+        // with its own explicit DEFAULT is "multiple default values" (the S3 message, unchanged).
+        if (def.identity !== null && (def.default !== null || serialKind !== undefined)) {
+          throw engineError(
+            "syntax_error",
+            `both default and identity specified for column ${def.name} of table ${ct.name}`,
+          );
+        }
+        if (serialKind !== undefined && def.default !== null) {
           throw engineError(
             "syntax_error",
             `multiple default values specified for column ${def.name} of table ${ct.name}`,
           );
         }
+        // Create the OWNED sequence — a default ascending i64 for serial, or the IDENTITY column's
+        // `( seq_options )` (defaulting the same way) — and synthesize the DEFAULT nextval(...)
+        // expression default (format_version 8 mechanism).
         const seqName = this.chooseSerialSeqName(ct.name, def.name, pendingSerials);
-        const [minV, maxV] = defaultSequenceBounds(1n);
-        pendingSerials.push({
-          name: seqName,
-          increment: 1n,
-          minValue: minV,
-          maxValue: maxV,
-          start: minV,
-          cache: 1n,
-          cycle: false,
-          lastValue: minV,
-          isCalled: false,
-          ownedBy: { table: ct.name, column: columns.length }, // this column's ordinal
-        });
+        const owner: SeqOwner = { table: ct.name, column: columns.length }; // this column's ordinal
+        const opts = def.identity !== null ? def.identity.options : emptySeqOptions();
+        pendingSerials.push(buildSequenceDef(seqName, opts, owner));
         // Render the synthetic default exactly as the parser would the equivalent
         // DEFAULT nextval('<seqName>') (space-joined tokens — the canonical expression-text form),
         // so the in-memory expr matches what reload re-parses. The seqName is a lowercased
         // identifier-derived name, so the quoting is always safe.
         const exprText = `nextval ( '${seqName.replace(/'/g, "''")}' )`;
         def_defaultExpr = { exprText, expr: parseExpression(exprText) };
+        if (def.identity !== null) identityKind = def.identity.always ? "always" : "byDefault";
       } else if (colType.kind === "composite" || colType.kind === "array") {
         // A DEFAULT on a composite- or array-typed column is not supported this slice
         // (composite.md §12 / array.md §12).
@@ -1433,10 +1451,11 @@ export class Database {
         type: colType,
         decimal,
         primaryKey: def.primaryKey,
-        // PRIMARY KEY ⇒ NOT NULL; a serial column is NOT NULL too (sequences.md §12).
-        notNull: def.primaryKey || def.notNull || serialKind !== undefined,
+        // PRIMARY KEY ⇒ NOT NULL; a serial or IDENTITY column is NOT NULL too (sequences.md §12/§13).
+        notNull: def.primaryKey || def.notNull || serialKind !== undefined || def.identity !== null,
         default: def_default,
         defaultExpr: def_defaultExpr,
+        identity: identityKind,
       });
     }
 
@@ -2197,46 +2216,7 @@ export class Database {
       if (cs.ifNotExists) return { kind: "statement", cost: 0n, rowsAffected: null };
       throw engineError("duplicate_table", `relation already exists: ${cs.name}`);
     }
-    const increment = cs.increment ?? 1n;
-    if (increment === 0n) {
-      throw engineError("invalid_parameter_value", "INCREMENT must not be zero");
-    }
-    const cache = cs.cache ?? 1n;
-    if (cache < 1n) {
-      throw engineError("invalid_parameter_value", `CACHE (${cache}) must be greater than zero`);
-    }
-    const [defMin, defMax] = defaultSequenceBounds(increment);
-    // `{ value: v }` MINVALUE v / `{ value: null }` NO MINVALUE / outer null unset → the default.
-    const minValue = cs.minValue !== null && cs.minValue.value !== null ? cs.minValue.value : defMin;
-    const maxValue = cs.maxValue !== null && cs.maxValue.value !== null ? cs.maxValue.value : defMax;
-    if (minValue > maxValue) {
-      throw engineError(
-        "invalid_parameter_value",
-        `MINVALUE (${minValue}) must be less than MAXVALUE (${maxValue})`,
-      );
-    }
-    // START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
-    const start = cs.start ?? (increment < 0n ? maxValue : minValue);
-    if (start < minValue || start > maxValue) {
-      throw engineError(
-        "invalid_parameter_value",
-        `START value (${start}) cannot be ${
-          start < minValue ? `less than MINVALUE` : `greater than MAXVALUE`
-        } the ${start < minValue ? minValue : maxValue} value`,
-      );
-    }
-    this.working().putSequence({
-      name: cs.name,
-      increment,
-      minValue,
-      maxValue,
-      start,
-      cache,
-      cycle: cs.cycle ?? false,
-      lastValue: start,
-      isCalled: false,
-      ownedBy: undefined,
-    });
+    this.working().putSequence(buildSequenceDef(cs.name, cs.options, undefined));
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -2510,7 +2490,38 @@ export class Database {
       for (let i = 0; i < n; i++) provided[i] = i;
     }
 
+    // IDENTITY column handling (spec/design/sequences.md §13). OVERRIDING USER VALUE discards any
+    // supplied value for every identity column and uses its sequence instead — modeled by treating
+    // the column as omitted (provided[i] = -1, so its nextval default applies). Apply it before the
+    // GENERATED ALWAYS gate below so a User-overridden ALWAYS column needs no further check.
+    if (ins.overriding === "user") {
+      for (let i = 0; i < n; i++) {
+        if (table.columns[i]!.identity !== null) provided[i] = -1;
+      }
+    }
+    // The GENERATED ALWAYS columns still explicitly targeted (and not OVERRIDING SYSTEM VALUE):
+    // supplying a non-DEFAULT value to one is 428C9. Collected as (column ordinal, value position)
+    // so the source branches can enforce it (VALUES per-row, SELECT up-front).
+    const alwaysTargeted: { col: number; pos: number }[] = [];
+    if (ins.overriding !== "system") {
+      for (let i = 0; i < n; i++) {
+        const col = table.columns[i]!;
+        if (col.identity === "always" && provided[i]! >= 0) {
+          alwaysTargeted.push({ col: i, pos: provided[i]! });
+        }
+      }
+    }
+
     if (ins.source.kind === "select") {
+      // GENERATED ALWAYS gate (sequences.md §13.3): a SELECT projection always supplies an explicit
+      // value, so targeting an ALWAYS identity column without OVERRIDING SYSTEM VALUE is 428C9 —
+      // raised up front (PG raises it at rewrite), firing even over a zero-row source.
+      if (alwaysTargeted.length > 0) {
+        throw engineError(
+          "generated_always",
+          `cannot insert a non-DEFAULT value into column ${table.columns[alwaysTargeted[0]!.col]!.name}`,
+        );
+      }
       // SELECT source (§24). Plan the source query, then resolve the RETURNING projection
       // (PostgreSQL's analysis order — both precede any execution), threading ONE ParamTypes
       // so a $N shared by the source and the RETURNING list unifies statement-wide (api.md
@@ -2600,6 +2611,18 @@ export class Database {
             ptypes.note(iv.index - 1, ct.scalar);
           }
         }
+      }
+    }
+    // GENERATED ALWAYS gate (sequences.md §13.3): an explicit (non-DEFAULT) value targeting an
+    // ALWAYS identity column without OVERRIDING SYSTEM VALUE is 428C9. Statement-level — fires
+    // before any row is materialized; an all-DEFAULT column is fine. Arity is validated above, so
+    // values[pos] is in range.
+    for (const at of alwaysTargeted) {
+      if (rowsIn.some((values) => values[at.pos]!.kind !== "default")) {
+        throw engineError(
+          "generated_always",
+          `cannot insert a non-DEFAULT value into column ${table.columns[at.col]!.name}`,
+        );
       }
     }
     // Resolve the RETURNING projection after the source (PostgreSQL's analysis order) and
@@ -3058,6 +3081,15 @@ export class Database {
       const idx = columnIndex(table, a.column);
       if (idx < 0) {
         throw engineError("undefined_column", "column does not exist: " + a.column);
+      }
+      // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4); jed's
+      // UPDATE has no `= DEFAULT` form, so any assignment is 428C9. Ordered before the PK-narrowing
+      // 0A000 so an ALWAYS identity PRIMARY KEY reports 428C9 (PG's code).
+      if (table.columns[idx]!.identity === "always") {
+        throw engineError(
+          "generated_always",
+          `column ${a.column} can only be updated to DEFAULT`,
+        );
       }
       if (pkMembers.includes(idx)) {
         throw engineError(
@@ -5996,7 +6028,7 @@ type SrfPlan = { kind: SrfKind; args: RExpr[] };
 function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
   return {
     name: funcName,
-    columns: [{ name: alias ?? funcName, type: colTy, decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null }],
+    columns: [{ name: alias ?? funcName, type: colTy, decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null, identity: null }],
     pk: [],
     checks: [],
     indexes: [],
@@ -7662,6 +7694,7 @@ function cteSyntheticTable(name: string, plan: QueryPlan, rename: string[] | nul
     notNull: false,
     default: null,
     defaultExpr: null,
+    identity: null,
   }));
   return { name, columns, pk: [], checks: [], indexes: [], fks: [] };
 }
@@ -7765,6 +7798,54 @@ function rejectParamsForDDL(params: Value[]): void {
   if (params.length > 0) {
     throw engineError("syntax_error", "bind parameters are not allowed in a DDL statement");
   }
+}
+
+// buildSequenceDef resolves a parsed SeqOptions set into a validated SequenceDef
+// (spec/design/sequences.md §1), shared by CREATE SEQUENCE and an IDENTITY column's `( seq_options )`
+// (§13). Validates INCREMENT (≠ 0), CACHE (≥ 1), MINVALUE ≤ MAXVALUE, and START in [min, max] (each
+// 22023); a fresh sequence starts with lastValue = start, isCalled = false. ownedBy carries the
+// IDENTITY / serial owner link (undefined for a plain CREATE SEQUENCE).
+function buildSequenceDef(name: string, options: SeqOptions, ownedBy: SeqOwner | undefined): SequenceDef {
+  const increment = options.increment ?? 1n;
+  if (increment === 0n) {
+    throw engineError("invalid_parameter_value", "INCREMENT must not be zero");
+  }
+  const cache = options.cache ?? 1n;
+  if (cache < 1n) {
+    throw engineError("invalid_parameter_value", `CACHE (${cache}) must be greater than zero`);
+  }
+  const [defMin, defMax] = defaultSequenceBounds(increment);
+  // `{ value: v }` MINVALUE v / `{ value: null }` NO MINVALUE / outer null unset → the default.
+  const minValue = options.minValue !== null && options.minValue.value !== null ? options.minValue.value : defMin;
+  const maxValue = options.maxValue !== null && options.maxValue.value !== null ? options.maxValue.value : defMax;
+  if (minValue > maxValue) {
+    throw engineError(
+      "invalid_parameter_value",
+      `MINVALUE (${minValue}) must be less than MAXVALUE (${maxValue})`,
+    );
+  }
+  // START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
+  const start = options.start ?? (increment < 0n ? maxValue : minValue);
+  if (start < minValue || start > maxValue) {
+    throw engineError(
+      "invalid_parameter_value",
+      `START value (${start}) cannot be ${
+        start < minValue ? `less than MINVALUE` : `greater than MAXVALUE`
+      } the ${start < minValue ? minValue : maxValue} value`,
+    );
+  }
+  return {
+    name,
+    increment,
+    minValue,
+    maxValue,
+    start,
+    cache,
+    cycle: options.cycle ?? false,
+    lastValue: start,
+    isCalled: false,
+    ownedBy,
+  };
 }
 
 // serialPseudoType maps a serial pseudo-type name to its underlying integer scalar

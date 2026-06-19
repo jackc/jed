@@ -314,6 +314,17 @@ name = "name_too_long"
 class = "syntax error or access rule violation"
 template = "identifier exceeds the maximum length of {max} bytes"
 
+# 428C9 generated_always — a write supplying an explicit value to a GENERATED ALWAYS identity
+# column (spec/design/sequences.md §13). Two messages: an INSERT of a non-DEFAULT value without
+# OVERRIDING SYSTEM VALUE — "cannot insert a non-DEFAULT value into column {name}"; an UPDATE
+# assigning the column — "column {name} can only be updated to DEFAULT". jed carries no separate
+# DETAIL/HINT line (house style — like 23503); the code and core message match PostgreSQL.
+[[error]]
+code = "428C9"
+name = "generated_always"
+class = "syntax error or access rule violation"
+template = "{detail}"
+
 # --- feature not supported (class 0A) ---------------------------------------
 [[error]]
 code = "0A000"

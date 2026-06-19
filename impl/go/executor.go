@@ -1556,30 +1556,46 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		//     checked assignable to the column, 42804) and stored as text for per-row eval.
 		var defaultVal *Value
 		var defaultExpr *DefaultExpr
-		if isSerial {
-			// serial desugaring (sequences.md §12): an explicit DEFAULT conflicts with the
-			// synthesized one (PG: "multiple default values specified", 42601). Otherwise create the
-			// OWNED sequence and synthesize DEFAULT nextval('<auto-name>') — an ordinary expression
-			// default (the format_version 8 mechanism), evaluated per row at INSERT.
-			if def.Default != nil {
+		var identityKind *IdentityKind
+		// A serial pseudo-type OR a GENERATED … AS IDENTITY constraint both desugar to an
+		// auto-numbered column: an OWNED sequence + a synthesized DEFAULT nextval(...) + NOT NULL
+		// (sequences.md §12/§13). Identity additionally records ALWAYS/BY DEFAULT and gates the
+		// column type to i16/i32/i64.
+		if isSerial || def.Identity != nil {
+			// IDENTITY type gate: the declared column type must be smallint/integer/bigint
+			// (sequences.md §13.1). serial's type is the pseudo-type (always integer), so this only
+			// bites an identity column written on a non-integer type.
+			if def.Identity != nil && !colType.IsInteger() {
+				return Outcome{}, NewError(InvalidParameterValue,
+					"identity column type must be smallint, integer, or bigint")
+			}
+			// Conflicts (42601, sequences.md §13.2). An explicit DEFAULT — or a serial type, itself a
+			// synthesized default — alongside IDENTITY is "both default and identity"; a serial column
+			// with its own explicit DEFAULT is "multiple default values" (the S3 message, unchanged).
+			if def.Identity != nil && (def.Default != nil || isSerial) {
+				return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
+					"both default and identity specified for column %s of table %s", def.Name, ct.Name,
+				))
+			}
+			if isSerial && def.Default != nil {
 				return Outcome{}, NewError(SyntaxError, fmt.Sprintf(
 					"multiple default values specified for column %s of table %s", def.Name, ct.Name,
 				))
 			}
+			// Create the OWNED sequence — a default ascending i64 for serial, or the IDENTITY column's
+			// `( seq_options )` (defaulting the same way) — and synthesize the DEFAULT nextval(...)
+			// expression default (format_version 8 mechanism).
 			seqName := db.chooseSerialSeqName(ct.Name, def.Name, pendingSerials)
-			minV, maxV := DefaultBounds(1)
-			pendingSerials = append(pendingSerials, &SequenceDef{
-				Name:      seqName,
-				Increment: 1,
-				MinValue:  minV,
-				MaxValue:  maxV,
-				Start:     minV,
-				Cache:     1,
-				Cycle:     false,
-				LastValue: minV,
-				IsCalled:  false,
-				OwnedBy:   &SeqOwner{Table: ct.Name, Column: uint16(len(columns))}, // this column's ordinal
-			})
+			owner := &SeqOwner{Table: ct.Name, Column: uint16(len(columns))} // this column's ordinal
+			var opts SeqOptions
+			if def.Identity != nil {
+				opts = def.Identity.Options
+			}
+			seqDef, err := buildSequenceDef(seqName, opts, owner)
+			if err != nil {
+				return Outcome{}, err
+			}
+			pendingSerials = append(pendingSerials, seqDef)
 			// Render the synthetic default exactly as the parser would the equivalent
 			// DEFAULT nextval('<seqName>') (space-joined tokens — the canonical expression-text form),
 			// so the in-memory expr matches what reload re-parses. The seqName is a lowercased
@@ -1590,6 +1606,13 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, err
 			}
 			defaultExpr = &DefaultExpr{ExprText: exprText, Expr: expr}
+			if def.Identity != nil {
+				k := IdentityByDefault
+				if def.Identity.Always {
+					k = IdentityAlways
+				}
+				identityKind = &k
+			}
 		} else if isComposite || isArray {
 			// A DEFAULT on a composite- or array-typed column is not supported this slice
 			// (composite.md §12 / array.md §12).
@@ -1627,10 +1650,11 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			Type:       colType,
 			Decimal:    decimal,
 			PrimaryKey: def.PrimaryKey,
-			// PRIMARY KEY ⇒ NOT NULL; a serial column is NOT NULL too (sequences.md §12).
-			NotNull:     def.PrimaryKey || def.NotNull || isSerial,
+			// PRIMARY KEY ⇒ NOT NULL; a serial or IDENTITY column is NOT NULL too (sequences.md §12/§13).
+			NotNull:     def.PrimaryKey || def.NotNull || isSerial || def.Identity != nil,
 			Default:     defaultVal,
 			DefaultExpr: defaultExpr,
+			Identity:    identityKind,
 		})
 	}
 
@@ -2214,6 +2238,76 @@ func (db *Database) chooseSerialSeqName(table, column string, pending []*Sequenc
 	}
 }
 
+// buildSequenceDef resolves a parsed SeqOptions set into a validated SequenceDef
+// (spec/design/sequences.md §1), shared by CREATE SEQUENCE and an IDENTITY column's `( seq_options )`
+// (§13). Validates INCREMENT (≠ 0), CACHE (≥ 1), MINVALUE ≤ MAXVALUE, and START in [min, max] (each
+// 22023); a fresh sequence starts with LastValue = Start, IsCalled = false. ownedBy carries the
+// IDENTITY / serial owner link (nil for a plain CREATE SEQUENCE).
+func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*SequenceDef, error) {
+	increment := int64(1)
+	if options.Increment != nil {
+		increment = *options.Increment
+	}
+	if increment == 0 {
+		return nil, NewError(InvalidParameterValue, "INCREMENT must not be zero")
+	}
+	cache := int64(1)
+	if options.Cache != nil {
+		cache = *options.Cache
+	}
+	if cache < 1 {
+		return nil, NewError(InvalidParameterValue,
+			fmt.Sprintf("CACHE (%d) must be greater than zero", cache))
+	}
+	defMin, defMax := DefaultBounds(increment)
+	// A non-nil SeqBound with NoValue selects the default; with a value sets the explicit bound; a
+	// nil SeqBound means the option was unset → the default (the Rust Some(Some)/Some(None)/None).
+	minValue := defMin
+	if options.MinValue != nil && !options.MinValue.NoValue {
+		minValue = options.MinValue.Value
+	}
+	maxValue := defMax
+	if options.MaxValue != nil && !options.MaxValue.NoValue {
+		maxValue = options.MaxValue.Value
+	}
+	if minValue > maxValue {
+		return nil, NewError(InvalidParameterValue,
+			fmt.Sprintf("MINVALUE (%d) must be less than MAXVALUE (%d)", minValue, maxValue))
+	}
+	// START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
+	start := minValue
+	if increment < 0 {
+		start = maxValue
+	}
+	if options.Start != nil {
+		start = *options.Start
+	}
+	if start < minValue || start > maxValue {
+		if start < minValue {
+			return nil, NewError(InvalidParameterValue,
+				fmt.Sprintf("START value (%d) cannot be less than MINVALUE the %d value", start, minValue))
+		}
+		return nil, NewError(InvalidParameterValue,
+			fmt.Sprintf("START value (%d) cannot be greater than MAXVALUE the %d value", start, maxValue))
+	}
+	cycle := false
+	if options.Cycle != nil {
+		cycle = *options.Cycle
+	}
+	return &SequenceDef{
+		Name:      name,
+		Increment: increment,
+		MinValue:  minValue,
+		MaxValue:  maxValue,
+		Start:     start,
+		Cache:     cache,
+		Cycle:     cycle,
+		LastValue: start,
+		IsCalled:  false,
+		OwnedBy:   ownedBy,
+	}, nil
+}
+
 // serialPseudoType maps a serial pseudo-type name to its underlying integer scalar
 // (spec/design/sequences.md §12) — serial/serial4 → Int32, bigserial/serial8 → Int64,
 // smallserial/serial2 → Int16. The bool is false for any other name. Recognized only in a
@@ -2508,68 +2602,11 @@ func (db *Database) executeCreateSequence(cs *CreateSequence) (Outcome, error) {
 		}
 		return Outcome{}, NewError(DuplicateTable, "relation already exists: "+cs.Name)
 	}
-	increment := int64(1)
-	if cs.Increment != nil {
-		increment = *cs.Increment
+	def, err := buildSequenceDef(cs.Name, cs.Options, nil)
+	if err != nil {
+		return Outcome{}, err
 	}
-	if increment == 0 {
-		return Outcome{}, NewError(InvalidParameterValue, "INCREMENT must not be zero")
-	}
-	cache := int64(1)
-	if cs.Cache != nil {
-		cache = *cs.Cache
-	}
-	if cache < 1 {
-		return Outcome{}, NewError(InvalidParameterValue,
-			fmt.Sprintf("CACHE (%d) must be greater than zero", cache))
-	}
-	defMin, defMax := DefaultBounds(increment)
-	// A non-nil SeqBound with NoValue selects the default; with a value sets the explicit bound; a
-	// nil SeqBound means the option was unset → the default (the Rust Some(Some)/Some(None)/None).
-	minValue := defMin
-	if cs.MinValue != nil && !cs.MinValue.NoValue {
-		minValue = cs.MinValue.Value
-	}
-	maxValue := defMax
-	if cs.MaxValue != nil && !cs.MaxValue.NoValue {
-		maxValue = cs.MaxValue.Value
-	}
-	if minValue > maxValue {
-		return Outcome{}, NewError(InvalidParameterValue,
-			fmt.Sprintf("MINVALUE (%d) must be less than MAXVALUE (%d)", minValue, maxValue))
-	}
-	// START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
-	start := minValue
-	if increment < 0 {
-		start = maxValue
-	}
-	if cs.Start != nil {
-		start = *cs.Start
-	}
-	if start < minValue || start > maxValue {
-		if start < minValue {
-			return Outcome{}, NewError(InvalidParameterValue,
-				fmt.Sprintf("START value (%d) cannot be less than MINVALUE the %d value", start, minValue))
-		}
-		return Outcome{}, NewError(InvalidParameterValue,
-			fmt.Sprintf("START value (%d) cannot be greater than MAXVALUE the %d value", start, maxValue))
-	}
-	cycle := false
-	if cs.Cycle != nil {
-		cycle = *cs.Cycle
-	}
-	db.working().putSequence(&SequenceDef{
-		Name:      cs.Name,
-		Increment: increment,
-		MinValue:  minValue,
-		MaxValue:  maxValue,
-		Start:     start,
-		Cache:     cache,
-		Cycle:     cycle,
-		LastValue: start,
-		IsCalled:  false,
-		OwnedBy:   nil,
-	})
+	db.working().putSequence(def)
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
@@ -2839,7 +2876,39 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		}
 	}
 
+	// IDENTITY column handling (spec/design/sequences.md §13). OVERRIDING USER VALUE discards any
+	// supplied value for every identity column and uses its sequence instead — modeled by treating
+	// the column as omitted (provided[i] = -1, so its nextval default applies). Apply it before the
+	// GENERATED ALWAYS gate below so a User-overridden ALWAYS column needs no further check.
+	if ins.Overriding != nil && *ins.Overriding == OverridingUser {
+		for i, col := range table.Columns {
+			if col.Identity != nil {
+				provided[i] = -1
+			}
+		}
+	}
+	// The GENERATED ALWAYS columns still explicitly targeted (and not OVERRIDING SYSTEM VALUE):
+	// supplying a non-DEFAULT value to one is 428C9. Collected as (column ordinal, value position)
+	// so the source branches can enforce it (VALUES per-row, SELECT up-front).
+	type alwaysTarget struct{ col, pos int }
+	var alwaysTargeted []alwaysTarget
+	if !(ins.Overriding != nil && *ins.Overriding == OverridingSystem) {
+		for i, col := range table.Columns {
+			if col.Identity != nil && *col.Identity == IdentityAlways && provided[i] >= 0 {
+				alwaysTargeted = append(alwaysTargeted, alwaysTarget{col: i, pos: provided[i]})
+			}
+		}
+	}
+
 	if ins.Select != nil {
+		// GENERATED ALWAYS gate (sequences.md §13.3): a SELECT projection always supplies an
+		// explicit value, so targeting an ALWAYS identity column without OVERRIDING SYSTEM VALUE is
+		// 428C9 — raised up front (PG raises it at rewrite), firing even over a zero-row source.
+		if len(alwaysTargeted) > 0 {
+			return Outcome{}, NewError(GeneratedAlways, fmt.Sprintf(
+				"cannot insert a non-DEFAULT value into column %s", table.Columns[alwaysTargeted[0].col].Name,
+			))
+		}
 		// SELECT source (§24). Plan the source query, then resolve the RETURNING projection
 		// (PostgreSQL's analysis order — both precede any execution), threading ONE paramTypes
 		// so a $N shared by the source and the RETURNING list unifies statement-wide (api.md
@@ -2952,6 +3021,24 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 					}
 				}
 			}
+		}
+	}
+	// GENERATED ALWAYS gate (sequences.md §13.3): an explicit (non-DEFAULT) value targeting an
+	// ALWAYS identity column without OVERRIDING SYSTEM VALUE is 428C9. Statement-level — fires
+	// before any row is materialized; an all-DEFAULT column is fine. Arity is validated above, so
+	// values[pos] is in range.
+	for _, at := range alwaysTargeted {
+		nonDefault := false
+		for _, values := range ins.Rows {
+			if !values[at.pos].IsDefault {
+				nonDefault = true
+				break
+			}
+		}
+		if nonDefault {
+			return Outcome{}, NewError(GeneratedAlways, fmt.Sprintf(
+				"cannot insert a non-DEFAULT value into column %s", table.Columns[at.col].Name,
+			))
 		}
 	}
 	// Resolve the RETURNING projection after the source (PostgreSQL's analysis order) and
@@ -3571,6 +3658,13 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		idx := table.ColumnIndex(a.Column)
 		if idx < 0 {
 			return Outcome{}, NewError(UndefinedColumn, "column does not exist: "+a.Column)
+		}
+		// A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4); jed's
+		// UPDATE has no `= DEFAULT` form, so any assignment is 428C9. Ordered before the PK-narrowing
+		// 0A000 so an ALWAYS identity PRIMARY KEY reports 428C9 (PG's code).
+		if c := table.Columns[idx].Identity; c != nil && *c == IdentityAlways {
+			return Outcome{}, NewError(GeneratedAlways,
+				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
 		}
 		if slices.Contains(pkMembers, idx) {
 			return Outcome{}, NewError(FeatureNotSupported,

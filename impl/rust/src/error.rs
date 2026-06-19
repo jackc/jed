@@ -126,6 +126,10 @@ pub enum SqlState {
     /// so it bounds every identifier on every parse path. PG's `42622 name_too_long`, but jed
     /// errors where PG silently truncates (identifiers are ASCII-only, so bytes = characters).
     NameTooLong,
+    /// 428C9 — generated_always: a write supplying an explicit value to a `GENERATED ALWAYS`
+    /// identity column without `OVERRIDING SYSTEM VALUE` (an INSERT), or assigning one (an UPDATE)
+    /// (spec/design/sequences.md §13).
+    GeneratedAlways,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
     /// 54000 — program limit exceeded: the input SQL text exceeded the per-handle `max_sql_length`
@@ -200,6 +204,7 @@ impl SqlState {
             SqlState::DuplicateObject => "42710",
             SqlState::WrongObjectType => "42809",
             SqlState::NameTooLong => "42622",
+            SqlState::GeneratedAlways => "428C9",
             SqlState::DependentObjectsStillExist => "2BP01",
             SqlState::FeatureNotSupported => "0A000",
             SqlState::ProgramLimitExceeded => "54000",

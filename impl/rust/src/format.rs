@@ -18,7 +18,7 @@ use std::sync::atomic::Ordering;
 
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    FkAction, ForeignKeyConstraint, IndexDef, IndexKind, SequenceDef, Table,
+    FkAction, ForeignKeyConstraint, IdentityKind, IndexDef, IndexKind, SequenceDef, Table,
 };
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
@@ -34,9 +34,11 @@ use crate::value::{ArrayVal, Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 14 = the `serial` owned-sequence link (the sequence-entry flags byte
-/// gains a `has_owner` bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md
-/// §12). v13 = GIN indexes (a per-index `index_kind` byte after `index_flags`, spec/design/gin.md
+/// On-disk format version — 15 = IDENTITY columns (the column-entry flags byte gains bit4
+/// `is_identity` + bit5 `identity_always`; an identity column desugars like `serial` plus those two
+/// bits, spec/design/sequences.md §13). v14 = the `serial` owned-sequence link (the sequence-entry
+/// flags byte gains a `has_owner` bit + a trailing owner table-name/column-ordinal,
+/// spec/design/sequences.md §12). v13 = GIN indexes (a per-index `index_kind` byte after `index_flags`, spec/design/gin.md
 /// §7). v12 = sequences (a kind-tagged sequence catalog section) + the `date` scalar. v11 = FOREIGN
 /// KEY constraints (a per-table catalog foreign-key list after the index list,
 /// spec/design/constraints.md §6). v10 = array (`T[]`) columns (type_code 15 + an element-type
@@ -44,7 +46,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// composite (row) types (kind-tagged catalog entries); v8 = a per-column expression-default flag;
 /// v7 added a per-page CRC-32 (header grew 12→16 bytes). Each bump is atomic across the Rust/Go/TS
 /// cores + the Ruby golden reference (every `.jed` golden's version byte + CRC changed together).
-const FORMAT_VERSION: u16 = 14;
+const FORMAT_VERSION: u16 = 15;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -1703,6 +1705,13 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
                     // most one of a constant or an expression default — spec/fileformat/format.md).
                     flags |= 0b1000;
                 }
+                // bit4 is_identity + bit5 identity_always (v15) — an IDENTITY column also carries
+                // not_null (bit1) + the nextval expression default (bit3) — spec/design/sequences.md §13.
+                match col.identity {
+                    Some(IdentityKind::Always) => flags |= 0b11_0000,
+                    Some(IdentityKind::ByDefault) => flags |= 0b1_0000,
+                    None => {}
+                }
                 out.push(flags);
                 // A decimal column appends its typmod (precision, scale) — only for type_code 6,
                 // so non-decimal entries are byte-unchanged. `precision 0` = unconstrained.
@@ -2220,6 +2229,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
                 not_null: flags & 0b10 != 0,
                 default: None,
                 default_expr: None,
+                identity: None,
             });
             continue;
         }
@@ -2239,16 +2249,34 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
                 not_null: flags & 0b10 != 0,
                 default: None,
                 default_expr: None,
+                identity: None,
             });
             continue;
         }
         let ty = scalar_for_type_code(tc).ok_or_else(|| corrupt("unknown type code"))?;
         let flags = read_u8(buf, pos)?;
         // bit0 was the primary_key flag through v4; v5 retired it (the pk list below is the
-        // authority) and reserves it as must-be-zero.
+        // authority) and reserves it as must-be-zero. bits 6-7 are reserved (v15).
         if flags & 0b01 != 0 {
             return Err(corrupt("reserved column flag bit0 set"));
         }
+        if flags & 0b1100_0000 != 0 {
+            return Err(corrupt("reserved column flag bit (6/7) set"));
+        }
+        // bit4 is_identity + bit5 identity_always (v15) — identity_always is meaningful only with
+        // is_identity (spec/design/sequences.md §13).
+        if flags & 0b11_0000 == 0b10_0000 {
+            return Err(corrupt("identity_always set without is_identity"));
+        }
+        let identity = if flags & 0b1_0000 != 0 {
+            Some(if flags & 0b10_0000 != 0 {
+                IdentityKind::Always
+            } else {
+                IdentityKind::ByDefault
+            })
+        } else {
+            None
+        };
         // A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
         let decimal = if ty.is_decimal() {
             let precision = read_u16(buf, pos)?;
@@ -2295,6 +2323,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             not_null: flags & 0b10 != 0,
             default,
             default_expr,
+            identity,
         });
     }
     // The primary key (v5): member ordinals in KEY order. Each must name a real column,

@@ -124,6 +124,10 @@ const (
 	// every identifier on every parse path. PG's 42622 name_too_long, but jed errors where PG
 	// silently truncates (identifiers are ASCII-only, so bytes = characters).
 	NameTooLong
+	// GeneratedAlways is 428C9 — a write supplying an explicit value to a GENERATED ALWAYS identity
+	// column without OVERRIDING SYSTEM VALUE (an INSERT), or assigning one (an UPDATE)
+	// (spec/design/sequences.md §13).
+	GeneratedAlways
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
 	// ProgramLimitExceeded is 54000 — the input SQL text exceeded the per-handle maxSQLLength byte
@@ -238,6 +242,8 @@ func (s SqlState) Code() string {
 		return "42809"
 	case NameTooLong:
 		return "42622"
+	case GeneratedAlways:
+		return "428C9"
 	case DependentObjectsStillExist:
 		return "2BP01"
 	case FeatureNotSupported:

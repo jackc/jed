@@ -146,11 +146,21 @@ table_constraint ::= "PRIMARY" "KEY" "(" identifier ("," identifier)* ")"
  * a DEFAULT nextval(...) backed by a newly-created OWNED sequence (../design/sequences.md §12).
  * Recognized ONLY here (not in CAST / CREATE SEQUENCE AS / a composite field) — elsewhere `serial`
  * is an undefined type (42704). An explicit DEFAULT on a serial column is 42601. */
+/* A column may also be an IDENTITY column — "GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY"
+ * (../design/sequences.md §13), the SQL-standard surface that, like `serial`, auto-creates an
+ * OWNED sequence (default i64 — the optional "( seq_options )" reuses CREATE SEQUENCE's option set)
+ * + a DEFAULT nextval(...) + NOT NULL, but additionally records ALWAYS vs BY DEFAULT (persisted —
+ * format_version 15). The column type must be smallint / integer / bigint (else 22023). An explicit
+ * DEFAULT (including a `serial` type) alongside IDENTITY is 42601 ("both default and identity"); two
+ * identity specs on one column is 42601 ("multiple identity specifications"). ALWAYS rejects an
+ * explicit INSERT/UPDATE value (428C9) unless overridden — see the INSERT "OVERRIDING" clause. */
 column_def     ::= identifier type_name column_constraint*
 
 column_constraint ::= "PRIMARY" "KEY"
                  | "NOT" "NULL"
                  | "DEFAULT" expr
+                 | "GENERATED" ("ALWAYS" | "BY" "DEFAULT") "AS" "IDENTITY"
+                       ("(" sequence_option* ")")?
                  | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
                  | ["CONSTRAINT" identifier] "UNIQUE"
                  | references_clause
@@ -280,8 +290,14 @@ type_name      ::= identifier ("(" integer ("," integer)? ")")?
  * target up front (42804, even over an empty source — §24), and its cost is the embedded
  * SELECT's accrued cost (not zero).
  *   "DEFAULT" is NOT reserved (§3): a column may be named "default", disambiguated positionally
- * (it is a keyword only in a VALUES slot). */
+ * (it is a keyword only in a VALUES slot).
+ *   The optional "OVERRIDING { SYSTEM | USER } VALUE" clause (after the column list, before the
+ * source) governs IDENTITY columns (../design/sequences.md §13): "OVERRIDING SYSTEM VALUE" lets an
+ * explicit value land in a GENERATED ALWAYS column (otherwise 428C9); "OVERRIDING USER VALUE"
+ * discards any supplied value and uses the column's identity sequence instead. It is accepted (a
+ * no-op) on a statement with no identity target, matching PostgreSQL. */
 insert         ::= "INSERT" "INTO" identifier ("(" identifier ("," identifier)* ")")?
+                   ("OVERRIDING" ("SYSTEM" | "USER") "VALUE")?
                    ( "VALUES" row ("," row)* | select )
                    returning_clause?
 

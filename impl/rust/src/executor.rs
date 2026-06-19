@@ -7,12 +7,13 @@
 use crate::ast::{
     AlterSequence, BinaryOp, CreateIndex, CreateSequence, CreateTable, CreateType, Delete,
     DropIndex, DropSequence, DropTable, DropType, Expr, Insert, InsertSource, InsertValue,
-    JoinKind, Literal, OrderKey, QueryExpr, RefAction, Select, SelectItems, SetOp, SetOpKind,
-    Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
+    JoinKind, Literal, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions,
+    SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
-    FkAction, ForeignKeyConstraint, IndexDef, IndexKind, SequenceDef, Table, resolve_col_type,
+    FkAction, ForeignKeyConstraint, IdentityKind, IndexDef, IndexKind, SeqOwner, SequenceDef,
+    Table, resolve_col_type,
 };
 use crate::cost::Meter;
 use crate::costs::COSTS;
@@ -1513,12 +1514,36 @@ impl Database {
             //   - any other expression is validated (structural pre-walk, then resolved against
             //     an EMPTY scope — a default may not reference a column — then its result type is
             //     checked assignable to the column, 42804) and stored as text for per-row eval.
-            let (default, default_expr) = if serial_kind.is_some() {
-                // serial desugaring (sequences.md §12): an explicit DEFAULT conflicts with the
-                // synthesized one (PG: "multiple default values specified", 42601). Otherwise create
-                // the OWNED sequence and synthesize `DEFAULT nextval('<auto-name>')` — an ordinary
-                // expression default (the format_version 8 mechanism), evaluated per row at INSERT.
-                if def.default.is_some() {
+            // A `serial` pseudo-type OR a `GENERATED … AS IDENTITY` constraint both desugar to an
+            // auto-numbered column: an OWNED sequence + a synthesized `DEFAULT nextval(...)` + NOT
+            // NULL (sequences.md §12/§13). Identity additionally records ALWAYS/BY DEFAULT and gates
+            // the column type to i16/i32/i64.
+            let (default, default_expr, identity_kind) = if serial_kind.is_some()
+                || def.identity.is_some()
+            {
+                // IDENTITY type gate: the declared column type must be smallint/integer/bigint
+                // (sequences.md §13.1). serial's type is the pseudo-type (always integer), so this
+                // only bites an identity column written on a non-integer type.
+                if def.identity.is_some() && !ty.is_integer() {
+                    return Err(EngineError::new(
+                        SqlState::InvalidParameterValue,
+                        "identity column type must be smallint, integer, or bigint".to_string(),
+                    ));
+                }
+                // Conflicts (42601, sequences.md §13.2). An explicit DEFAULT — or a `serial` type,
+                // itself a synthesized default — alongside IDENTITY is "both default and identity";
+                // a `serial` column with its own explicit DEFAULT is "multiple default values" (the
+                // S3 message, unchanged).
+                if def.identity.is_some() && (def.default.is_some() || serial_kind.is_some()) {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        format!(
+                            "both default and identity specified for column {} of table {}",
+                            def.name, ct.name
+                        ),
+                    ));
+                }
+                if serial_kind.is_some() && def.default.is_some() {
                     return Err(EngineError::new(
                         SqlState::SyntaxError,
                         format!(
@@ -1527,30 +1552,34 @@ impl Database {
                         ),
                     ));
                 }
+                // Create the OWNED sequence — a default ascending i64 for `serial`, or the IDENTITY
+                // column's `( seq_options )` (defaulting the same way) — and synthesize the
+                // `DEFAULT nextval('<auto-name>')` expression default (format_version 8 mechanism).
                 let seqname = self.choose_serial_seq_name(&ct.name, &def.name, &pending_serials);
-                let (min, max) = SequenceDef::default_bounds(1);
-                pending_serials.push(SequenceDef {
-                    name: seqname.clone(),
-                    increment: 1,
-                    min_value: min,
-                    max_value: max,
-                    start: min,
-                    cache: 1,
-                    cycle: false,
-                    last_value: min,
-                    is_called: false,
-                    owned_by: Some(crate::catalog::SeqOwner {
-                        table: ct.name.clone(),
-                        column: columns.len() as u16, // this column's ordinal (pushed below)
-                    }),
-                });
+                let owner = SeqOwner {
+                    table: ct.name.clone(),
+                    column: columns.len() as u16, // this column's ordinal (pushed below)
+                };
+                let opts = def
+                    .identity
+                    .as_ref()
+                    .map(|id| id.options.clone())
+                    .unwrap_or_default();
+                pending_serials.push(build_sequence_def(&seqname, &opts, Some(owner))?);
                 // Build the synthetic default exactly as the parser would render the equivalent
                 // `DEFAULT nextval('<seqname>')` (space-joined tokens — the canonical expression-text
                 // form), so the in-memory expr matches what reload re-parses (constraints.md §2). The
                 // seqname is a lowercased identifier-derived name, so the quoting is always safe.
                 let expr_text = format!("nextval ( '{}' )", seqname.replace('\'', "''"));
                 let expr = crate::parser::parse_expression(&expr_text)?;
-                (None, Some(DefaultExpr { expr_text, expr }))
+                let identity_kind = def.identity.as_ref().map(|id| {
+                    if id.always {
+                        IdentityKind::Always
+                    } else {
+                        IdentityKind::ByDefault
+                    }
+                });
+                (None, Some(DefaultExpr { expr_text, expr }), identity_kind)
             } else if ty.is_composite() || ty.is_array() {
                 // A DEFAULT on a composite- or array-typed column is not supported this slice
                 // (composite.md §12 / array.md §12).
@@ -1561,11 +1590,11 @@ impl Database {
                             .to_string(),
                     ));
                 }
-                (None, None)
+                (None, None, None)
             } else {
                 let sty = ty.scalar();
                 match &def.default {
-                    None => (None, None),
+                    None => (None, None, None),
                     Some(d) => match &d.expr {
                         Expr::Literal(lit) => (
                             Some(store_value(
@@ -1575,6 +1604,7 @@ impl Database {
                                 false,
                                 &def.name,
                             )?),
+                            None,
                             None,
                         ),
                         _ => {
@@ -1601,6 +1631,7 @@ impl Database {
                                     expr_text: d.text.clone(),
                                     expr: d.expr.clone(),
                                 }),
+                                None,
                             )
                         }
                     },
@@ -1611,10 +1642,15 @@ impl Database {
                 ty,
                 decimal,
                 primary_key: def.primary_key,
-                // PRIMARY KEY ⇒ NOT NULL; a `serial` column is NOT NULL too (sequences.md §12).
-                not_null: def.primary_key || def.not_null || serial_kind.is_some(),
+                // PRIMARY KEY ⇒ NOT NULL; a `serial` or IDENTITY column is NOT NULL too
+                // (sequences.md §12/§13).
+                not_null: def.primary_key
+                    || def.not_null
+                    || serial_kind.is_some()
+                    || def.identity.is_some(),
                 default,
                 default_expr,
+                identity: identity_kind,
             });
         }
 
@@ -2610,70 +2646,8 @@ impl Database {
                 format!("relation already exists: {}", cs.name),
             ));
         }
-        let increment = cs.increment.unwrap_or(1);
-        if increment == 0 {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                "INCREMENT must not be zero".to_string(),
-            ));
-        }
-        let cache = cs.cache.unwrap_or(1);
-        if cache < 1 {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                format!("CACHE ({cache}) must be greater than zero"),
-            ));
-        }
-        let (def_min, def_max) = SequenceDef::default_bounds(increment);
-        // `Some(Some(v))` MINVALUE v / `Some(None)` NO MINVALUE / `None` unset → the default.
-        let min_value = match cs.min_value {
-            Some(Some(v)) => v,
-            Some(None) | None => def_min,
-        };
-        let max_value = match cs.max_value {
-            Some(Some(v)) => v,
-            Some(None) | None => def_max,
-        };
-        if min_value > max_value {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                format!("MINVALUE ({min_value}) must be less than MAXVALUE ({max_value})"),
-            ));
-        }
-        // START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
-        let start = cs
-            .start
-            .unwrap_or(if increment < 0 { max_value } else { min_value });
-        if start < min_value || start > max_value {
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                format!(
-                    "START value ({start}) cannot be {} the {} value",
-                    if start < min_value {
-                        "less than MINVALUE"
-                    } else {
-                        "greater than MAXVALUE"
-                    },
-                    if start < min_value {
-                        min_value
-                    } else {
-                        max_value
-                    }
-                ),
-            ));
-        }
-        self.working_mut().put_sequence(SequenceDef {
-            name: cs.name.clone(),
-            increment,
-            min_value,
-            max_value,
-            start,
-            cache,
-            cycle: cs.cycle.unwrap_or(false),
-            last_value: start,
-            is_called: false,
-            owned_by: None,
-        });
+        let def = build_sequence_def(&cs.name, &cs.options, None)?;
+        self.working_mut().put_sequence(def);
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
@@ -2794,6 +2768,7 @@ impl Database {
         let Insert {
             table,
             columns: col_list,
+            overriding,
             source,
             returning,
         } = ins;
@@ -2833,7 +2808,7 @@ impl Database {
         // values each row must carry (for a SELECT source, how many columns it must project).
         let n = columns.len();
         let has_list = col_list.is_some();
-        let (provided, arity): (Vec<Option<usize>>, usize) = match &col_list {
+        let (mut provided, arity): (Vec<Option<usize>>, usize) = match &col_list {
             Some(names) => {
                 let mut provided = vec![None; n];
                 for (p, name) in names.iter().enumerate() {
@@ -2857,6 +2832,33 @@ impl Database {
                 (provided, names.len())
             }
             None => ((0..n).map(Some).collect(), n),
+        };
+
+        // IDENTITY column handling (spec/design/sequences.md §13). `OVERRIDING USER VALUE` discards
+        // any supplied value for every identity column and uses its sequence instead — modeled by
+        // treating the column as omitted (its `nextval` default applies). Apply it before the
+        // GENERATED ALWAYS gate below so a User-overridden ALWAYS column needs no further check.
+        if overriding == Some(Overriding::User) {
+            for (i, col) in columns.iter().enumerate() {
+                if col.identity.is_some() {
+                    provided[i] = None;
+                }
+            }
+        }
+        // The GENERATED ALWAYS columns still explicitly targeted (and not OVERRIDING SYSTEM VALUE):
+        // supplying a non-DEFAULT value to one is `428C9`. Collected as (column ordinal, value
+        // position) so the source branches can enforce it (VALUES per-row, SELECT up-front).
+        let always_targeted: Vec<(usize, usize)> = if overriding == Some(Overriding::System) {
+            Vec::new()
+        } else {
+            columns
+                .iter()
+                .enumerate()
+                .filter_map(|(i, col)| match (col.identity, provided[i]) {
+                    (Some(IdentityKind::Always), Some(p)) => Some((i, p)),
+                    _ => None,
+                })
+                .collect()
         };
 
         match source {
@@ -2893,6 +2895,24 @@ impl Database {
                                 ptypes.note((*nn as usize) - 1, Some(*s))?;
                             }
                         }
+                    }
+                }
+                // GENERATED ALWAYS gate (sequences.md §13.3): an explicit (non-`DEFAULT`) value
+                // targeting an ALWAYS identity column without `OVERRIDING SYSTEM VALUE` is `428C9`.
+                // Statement-level — fires before any row is materialized; an all-`DEFAULT` column is
+                // fine. Arity is validated above, so `values[p]` is in range.
+                for &(i, p) in &always_targeted {
+                    if rows_in
+                        .iter()
+                        .any(|values| !matches!(values[p], InsertValue::Default))
+                    {
+                        return Err(EngineError::new(
+                            SqlState::GeneratedAlways,
+                            format!(
+                                "cannot insert a non-DEFAULT value into column {}",
+                                columns[i].name
+                            ),
+                        ));
                     }
                 }
                 // Resolve the RETURNING projection after the source (PostgreSQL's analysis
@@ -2984,6 +3004,19 @@ impl Database {
                 })
             }
             InsertSource::Select(sel) => {
+                // GENERATED ALWAYS gate (sequences.md §13.3): a SELECT projection always supplies an
+                // explicit value, so targeting an ALWAYS identity column without `OVERRIDING SYSTEM
+                // VALUE` is `428C9` — raised up front (PG raises it at rewrite), firing even over a
+                // zero-row source.
+                if let Some(&(i, _)) = always_targeted.first() {
+                    return Err(EngineError::new(
+                        SqlState::GeneratedAlways,
+                        format!(
+                            "cannot insert a non-DEFAULT value into column {}",
+                            columns[i].name
+                        ),
+                    ));
+                }
                 // Plan the source query, then resolve the RETURNING projection (PostgreSQL's
                 // analysis order — both precede any execution), threading ONE ParamTypes so a
                 // `$N` shared by the source and the RETURNING list unifies statement-wide
@@ -3719,6 +3752,15 @@ impl Database {
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
         for a in &upd.assignments {
             let idx = col_idx(table, &a.column)?;
+            // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4);
+            // jed's UPDATE has no `= DEFAULT` form, so any assignment is `428C9`. Ordered before the
+            // PK-narrowing 0A000 so an ALWAYS identity PRIMARY KEY reports 428C9 (PG's code).
+            if table.columns[idx].identity == Some(IdentityKind::Always) {
+                return Err(EngineError::new(
+                    SqlState::GeneratedAlways,
+                    format!("column {} can only be updated to DEFAULT", a.column),
+                ));
+            }
             if pk_members.contains(&idx) {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
@@ -7417,6 +7459,7 @@ fn cte_synthetic_table(
                 not_null: false,
                 default: None,
                 default_expr: None,
+                identity: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -7594,6 +7637,7 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
             not_null: false,
             default: None,
             default_expr: None,
+            identity: None,
         }],
         pk: Vec::new(),
         checks: Vec::new(),
@@ -10535,6 +10579,82 @@ fn serial_pseudo_type(name: &str) -> Option<ScalarType> {
         "smallserial" | "serial2" => Some(ScalarType::Int16),
         _ => None,
     }
+}
+
+/// Resolve a parsed `SeqOptions` set into a validated `SequenceDef` (spec/design/sequences.md §1),
+/// shared by `CREATE SEQUENCE` and an IDENTITY column's `( seq_options )` (§13). Validates INCREMENT
+/// (≠ 0), CACHE (≥ 1), MINVALUE ≤ MAXVALUE, and START in `[min, max]` (each `22023`); a fresh
+/// sequence starts with `last_value = start`, `is_called = false`. `owned_by` carries the IDENTITY /
+/// `serial` owner link (`None` for a plain `CREATE SEQUENCE`).
+fn build_sequence_def(
+    name: &str,
+    options: &SeqOptions,
+    owned_by: Option<SeqOwner>,
+) -> Result<SequenceDef> {
+    let increment = options.increment.unwrap_or(1);
+    if increment == 0 {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            "INCREMENT must not be zero".to_string(),
+        ));
+    }
+    let cache = options.cache.unwrap_or(1);
+    if cache < 1 {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("CACHE ({cache}) must be greater than zero"),
+        ));
+    }
+    let (def_min, def_max) = SequenceDef::default_bounds(increment);
+    // `Some(Some(v))` MINVALUE v / `Some(None)` NO MINVALUE / `None` unset → the default.
+    let min_value = match options.min_value {
+        Some(Some(v)) => v,
+        Some(None) | None => def_min,
+    };
+    let max_value = match options.max_value {
+        Some(Some(v)) => v,
+        Some(None) | None => def_max,
+    };
+    if min_value > max_value {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("MINVALUE ({min_value}) must be less than MAXVALUE ({max_value})"),
+        ));
+    }
+    // START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
+    let start = options
+        .start
+        .unwrap_or(if increment < 0 { max_value } else { min_value });
+    if start < min_value || start > max_value {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!(
+                "START value ({start}) cannot be {} the {} value",
+                if start < min_value {
+                    "less than MINVALUE"
+                } else {
+                    "greater than MAXVALUE"
+                },
+                if start < min_value {
+                    min_value
+                } else {
+                    max_value
+                }
+            ),
+        ));
+    }
+    Ok(SequenceDef {
+        name: name.to_string(),
+        increment,
+        min_value,
+        max_value,
+        start,
+        cache,
+        cycle: options.cycle.unwrap_or(false),
+        last_value: start,
+        is_called: false,
+        owned_by,
+    })
 }
 
 pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {

@@ -22,7 +22,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 14    // on-disk format version (14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12). 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion   uint16 = 15    // on-disk format version (15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13). 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -1900,6 +1900,14 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 			// one of a constant or an expression default — spec/fileformat/format.md).
 			flags |= 0b1000
 		}
+		// bit4 is_identity + bit5 identity_always (v15) — an IDENTITY column also carries not_null
+		// (bit1) + the nextval expression default (bit3) — spec/design/sequences.md §13.
+		if col.Identity != nil {
+			flags |= 0b1_0000
+			if *col.Identity == IdentityAlways {
+				flags |= 0b10_0000
+			}
+		}
 		out = append(out, flags)
 		// A decimal column appends its typmod (precision, scale) — only for type_code 6, so
 		// non-decimal entries are byte-unchanged (spec/fileformat/format.md). precision 0 =
@@ -2307,9 +2315,25 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			return nil, 0, nil, err
 		}
 		// bit0 was the primary_key flag through v4; v5 retired it (the pk list below is
-		// the authority) and reserves it as must-be-zero.
+		// the authority) and reserves it as must-be-zero. bits 6-7 are reserved (v15).
 		if flags&0b01 != 0 {
 			return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit0 set")
+		}
+		if flags&0b1100_0000 != 0 {
+			return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit (6/7) set")
+		}
+		// bit4 is_identity + bit5 identity_always (v15) — identity_always is meaningful only with
+		// is_identity (spec/design/sequences.md §13).
+		if flags&0b11_0000 == 0b10_0000 {
+			return nil, 0, nil, NewError(DataCorrupted, "identity_always set without is_identity")
+		}
+		var identity *IdentityKind
+		if flags&0b1_0000 != 0 {
+			k := IdentityByDefault
+			if flags&0b10_0000 != 0 {
+				k = IdentityAlways
+			}
+			identity = &k
 		}
 		// A decimal column carries its typmod (precision, scale); precision 0 = unconstrained.
 		var decimal *DecimalTypmod
@@ -2365,6 +2389,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			NotNull:     flags&0b10 != 0,
 			Default:     defaultVal,
 			DefaultExpr: defaultExpr,
+			Identity:    identity,
 		})
 	}
 	// The primary key (v5): member ordinals in KEY order. Each must name a real column,

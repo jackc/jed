@@ -199,15 +199,11 @@ pub struct DropType {
     pub if_exists: bool,
 }
 
-/// `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` — a named, persisted i64 generator
-/// (spec/design/sequences.md). The options are order-free; each is captured as a parsed override,
-/// with `None` meaning "use the default" (resolved at execution against the INCREMENT sign).
-/// Execution validates the option set (22023), rejects a relation-namespace collision (42P07
-/// unless `if_not_exists`), and registers the sequence in the catalog.
-#[derive(Clone, PartialEq, Eq, Debug)]
-pub struct CreateSequence {
-    pub name: String,
-    pub if_not_exists: bool,
+/// The parsed, order-free sequence options shared by `CREATE SEQUENCE` and an IDENTITY column's
+/// optional `( seq_options )` (spec/design/sequences.md §13). Each `None` means "use the default"
+/// (resolved at execution against the INCREMENT sign); execution validates the set (22023).
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct SeqOptions {
     pub increment: Option<i64>,
     /// `Some(Some(v))` = MINVALUE v; `Some(None)` = NO MINVALUE (the type default); `None` = unset.
     pub min_value: Option<Option<i64>>,
@@ -215,6 +211,25 @@ pub struct CreateSequence {
     pub start: Option<i64>,
     pub cache: Option<i64>,
     pub cycle: Option<bool>,
+}
+
+/// `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` — a named, persisted i64 generator
+/// (spec/design/sequences.md). Execution validates the option set (22023), rejects a
+/// relation-namespace collision (42P07 unless `if_not_exists`), and registers the sequence.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct CreateSequence {
+    pub name: String,
+    pub if_not_exists: bool,
+    pub options: SeqOptions,
+}
+
+/// A column's `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( seq_options )]` constraint
+/// (spec/design/sequences.md §13). `always` distinguishes ALWAYS (true) from BY DEFAULT (false);
+/// `options` tunes the auto-created owned sequence (defaults to the standard ascending i64).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct IdentitySpec {
+    pub always: bool,
+    pub options: SeqOptions,
 }
 
 /// `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT]` — remove one or more sequences
@@ -253,6 +268,10 @@ pub struct ColumnDef {
     /// the `DEFAULT` keyword). A constant literal is pre-evaluated at CREATE TABLE; any other
     /// expression is evaluated per row at INSERT (spec/design/constraints.md §2).
     pub default: Option<DefaultDef>,
+    /// An optional `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( opts )]` constraint
+    /// (spec/design/sequences.md §13). Desugars like `serial` (an owned sequence + a `nextval`
+    /// default + NOT NULL) plus the persisted ALWAYS/BY DEFAULT distinction.
+    pub identity: Option<IdentitySpec>,
 }
 
 /// A parsed type modifier: a precision and an optional scale, as written
@@ -276,11 +295,23 @@ pub struct Insert {
     /// execution time (unknown → 42703, duplicate → 42701); an unlisted column takes its default
     /// else NULL (spec/design/constraints.md §2).
     pub columns: Option<Vec<String>>,
+    /// The optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13),
+    /// governing IDENTITY columns. `None` is the default (no override).
+    pub overriding: Option<Overriding>,
     /// Where the rows come from: a `VALUES` list or a `SELECT`.
     pub source: InsertSource,
     /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
     /// stored row, turning the statement into a query result. `None` = no clause.
     pub returning: Option<SelectItems>,
+}
+
+/// The INSERT `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13): `System`
+/// lets an explicit value land in a `GENERATED ALWAYS` identity column; `User` discards a supplied
+/// value for any identity column and uses its sequence instead.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Overriding {
+    System,
+    User,
 }
 
 /// The source of an INSERT's rows (spec/design/grammar.md §24): a literal `VALUES` list, or a

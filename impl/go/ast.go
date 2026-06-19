@@ -205,23 +205,37 @@ type DropType struct {
 	IfExists bool
 }
 
-// CreateSequence is a CREATE SEQUENCE [IF NOT EXISTS] <name> [options] statement — a named,
-// persisted i64 generator (spec/design/sequences.md). The options are order-free; each is
-// captured as a parsed override, with a nil pointer meaning "use the default" (resolved at
-// execution against the INCREMENT sign). Execution validates the option set (22023), rejects a
-// relation-namespace collision (42P07 unless IfNotExists), and registers the sequence.
-type CreateSequence struct {
-	Name        string
-	IfNotExists bool
-	Increment   *int64
-	// MinValue is the MINVALUE override: a SeqBound whose Set distinguishes
-	// MINVALUE v (Set, Value=v) from NO MINVALUE (Set, NoValue) from unset (nil) — the
+// SeqOptions is the parsed, order-free sequence-option set shared by CREATE SEQUENCE and an
+// IDENTITY column's optional `( seq_options )` (spec/design/sequences.md §13). Each is captured as
+// a parsed override, with a nil pointer meaning "use the default" (resolved at execution against
+// the INCREMENT sign); execution validates the set (22023).
+type SeqOptions struct {
+	Increment *int64
+	// MinValue is the MINVALUE override: a SeqBound whose NoValue distinguishes
+	// MINVALUE v (Value=v) from NO MINVALUE (NoValue) from unset (nil) — the
 	// Rust Option<Option<i64>>. nil = unset (use the default).
 	MinValue *SeqBound
 	MaxValue *SeqBound
 	Start    *int64
 	Cache    *int64
 	Cycle    *bool
+}
+
+// CreateSequence is a CREATE SEQUENCE [IF NOT EXISTS] <name> [options] statement — a named,
+// persisted i64 generator (spec/design/sequences.md). Execution validates the option set (22023),
+// rejects a relation-namespace collision (42P07 unless IfNotExists), and registers the sequence.
+type CreateSequence struct {
+	Name        string
+	IfNotExists bool
+	Options     SeqOptions
+}
+
+// IdentitySpec is a column's `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( seq_options )]`
+// constraint (spec/design/sequences.md §13). Always distinguishes ALWAYS (true) from BY DEFAULT
+// (false); Options tunes the auto-created owned sequence (defaults to the standard ascending i64).
+type IdentitySpec struct {
+	Always  bool
+	Options SeqOptions
 }
 
 // SeqBound is a MINVALUE/MAXVALUE override (spec/design/sequences.md): NoValue true selects
@@ -266,6 +280,10 @@ type ColumnDef struct {
 	// uses the DEFAULT keyword). A constant literal is pre-evaluated at CREATE TABLE; any other
 	// expression is evaluated per row at INSERT (spec/design/constraints.md §2). nil = no default.
 	Default *DefaultDef
+	// Identity is an optional `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( opts )]` constraint
+	// (spec/design/sequences.md §13). Desugars like serial (an owned sequence + a nextval default +
+	// NOT NULL) plus the persisted ALWAYS/BY DEFAULT distinction. nil = a non-identity column.
+	Identity *IdentitySpec
 }
 
 // TypeMod is a parsed type modifier: a precision and an optional scale, as written
@@ -287,6 +305,9 @@ type Insert struct {
 	// resolve at execution time (unknown → 42703, duplicate → 42701); an unlisted column takes
 	// its default else NULL.
 	Columns []string
+	// Overriding is the optional `OVERRIDING { SYSTEM | USER } VALUE` clause
+	// (spec/design/sequences.md §13), governing IDENTITY columns. nil is the default (no override).
+	Overriding *Overriding
 	// EXACTLY ONE of Rows / Select is set (the parser guarantees it). Rows is the VALUES source:
 	// each inner slice is one row's values in the order of Columns (or column order when Columns
 	// is nil); non-empty when set, nil when Select is set. Select is the SELECT source: nil when
@@ -297,6 +318,16 @@ type Insert struct {
 	// project each stored row, turning the statement into a query result. Nil = no clause.
 	Returning *SelectItems
 }
+
+// Overriding is the INSERT `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md
+// §13): OverridingSystem lets an explicit value land in a GENERATED ALWAYS identity column;
+// OverridingUser discards a supplied value for any identity column and uses its sequence instead.
+type Overriding int
+
+const (
+	OverridingSystem Overriding = iota
+	OverridingUser
+)
 
 // InsertValue is one value slot in an INSERT VALUES row: a literal, a bind parameter ($N,
 // bound at execute — spec/design/api.md §5), or the DEFAULT keyword (IsDefault) — which

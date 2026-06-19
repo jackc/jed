@@ -343,7 +343,7 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 			}
 			foreignKeys = append(foreignKeys, fk)
 		} else {
-			col, err := p.parseColumnDef(&checks, &uniques, &foreignKeys)
+			col, err := p.parseColumnDef(name, &checks, &uniques, &foreignKeys)
 			if err != nil {
 				return nil, err
 			}
@@ -606,7 +606,7 @@ func (p *Parser) parsePKColumnList() ([]string, error) {
 	}
 }
 
-func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef, foreignKeys *[]ForeignKeyDef) (ColumnDef, error) {
+func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[]UniqueDef, foreignKeys *[]ForeignKeyDef) (ColumnDef, error) {
 	name, err := p.expectIdentifier()
 	if err != nil {
 		return ColumnDef{}, err
@@ -636,6 +636,7 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef, foreig
 	primaryKey := false
 	notNull := false
 	var def *DefaultDef
+	var identity *IdentitySpec
 	for {
 		if p.atCheckConstraint() {
 			check, err := p.parseCheckConstraint()
@@ -706,6 +707,46 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef, foreig
 			}
 			text := renderTokens(p.tokens[start:p.pos])
 			def = &DefaultDef{Expr: expr, Text: text}
+		case "generated":
+			// `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( seq_options )]`
+			// (spec/design/sequences.md §13). Two identity specs on one column is 42601
+			// ("multiple identity specifications"). The desugaring (owned sequence + nextval default
+			// + NOT NULL + the type gate) is at execution.
+			p.advance()
+			var always bool
+			switch p.peekKeyword() {
+			case "always":
+				p.advance()
+				always = true
+			case "by":
+				p.advance()
+				if err := p.expectKeyword("default"); err != nil {
+					return ColumnDef{}, err
+				}
+				always = false
+			default:
+				return ColumnDef{}, NewError(SyntaxError,
+					fmt.Sprintf("expected ALWAYS or BY DEFAULT after GENERATED, found %q", p.peekKeyword()))
+			}
+			if err := p.expectKeyword("as"); err != nil {
+				return ColumnDef{}, err
+			}
+			if err := p.expectKeyword("identity"); err != nil {
+				return ColumnDef{}, err
+			}
+			var options SeqOptions
+			if p.peek().Kind == TokLParen {
+				options, err = p.parseSequenceOptions(true)
+				if err != nil {
+					return ColumnDef{}, err
+				}
+			}
+			if identity != nil {
+				return ColumnDef{}, NewError(SyntaxError, fmt.Sprintf(
+					"multiple identity specifications for column %s of table %s", name, tableName,
+				))
+			}
+			identity = &IdentitySpec{Always: always, Options: options}
 		case "unique":
 			p.advance()
 			*uniques = append(*uniques, UniqueDef{Columns: []string{name}})
@@ -725,7 +766,7 @@ func (p *Parser) parseColumnDef(checks *[]CheckDef, uniques *[]UniqueDef, foreig
 				OnUpdate:   onUpdate,
 			})
 		default:
-			return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def}, nil
+			return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def, Identity: identity}, nil
 		}
 	}
 }
@@ -1008,65 +1049,84 @@ func (p *Parser) parseCreateSequence() (*CreateSequence, error) {
 	if err != nil {
 		return nil, err
 	}
-	seq := &CreateSequence{Name: name, IfNotExists: ifNotExists}
+	options, err := p.parseSequenceOptions(false)
+	if err != nil {
+		return nil, err
+	}
+	return &CreateSequence{Name: name, IfNotExists: ifNotExists, Options: options}, nil
+}
+
+// parseSequenceOptions parses the order-free sequence-option set (INCREMENT [BY] n,
+// MINVALUE/MAXVALUE and their NO forms, START [WITH] n, CACHE c, [NO] CYCLE) shared by CREATE
+// SEQUENCE and an IDENTITY column's `( seq_options )` (spec/design/sequences.md §13). When
+// parenthesized, the options are wrapped in `( … )` and the loop stops at `)`; each option appears
+// at most once (a repeat is 42601 via dupCheck). Validation of the resolved set (22023) is
+// execution-time.
+func (p *Parser) parseSequenceOptions(parenthesized bool) (SeqOptions, error) {
+	if parenthesized {
+		if err := p.expect(TokLParen); err != nil {
+			return SeqOptions{}, err
+		}
+	}
+	var seq SeqOptions
 	// Order-free option loop: dispatch on the leading keyword, each option at most once.
 	for {
 		switch p.peekKeyword() {
 		case "increment":
 			if err := p.dupCheck(seq.Increment != nil, "INCREMENT"); err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			p.advance()
 			p.consumeKeyword("by")
 			v, err := p.parseSignedIntLiteral()
 			if err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			seq.Increment = &v
 		case "minvalue":
 			if err := p.dupCheck(seq.MinValue != nil, "MINVALUE"); err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			p.advance()
 			v, err := p.parseSignedIntLiteral()
 			if err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			seq.MinValue = &SeqBound{Value: v}
 		case "maxvalue":
 			if err := p.dupCheck(seq.MaxValue != nil, "MAXVALUE"); err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			p.advance()
 			v, err := p.parseSignedIntLiteral()
 			if err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			seq.MaxValue = &SeqBound{Value: v}
 		case "start":
 			if err := p.dupCheck(seq.Start != nil, "START"); err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			p.advance()
 			p.consumeKeyword("with")
 			v, err := p.parseSignedIntLiteral()
 			if err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			seq.Start = &v
 		case "cache":
 			if err := p.dupCheck(seq.Cache != nil, "CACHE"); err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			p.advance()
 			v, err := p.parseSignedIntLiteral()
 			if err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			seq.Cache = &v
 		case "cycle":
 			if err := p.dupCheck(seq.Cycle != nil, "CYCLE"); err != nil {
-				return nil, err
+				return SeqOptions{}, err
 			}
 			p.advance()
 			t := true
@@ -1077,28 +1137,33 @@ func (p *Parser) parseCreateSequence() (*CreateSequence, error) {
 			switch p.peekKeyword() {
 			case "minvalue":
 				if err := p.dupCheck(seq.MinValue != nil, "MINVALUE"); err != nil {
-					return nil, err
+					return SeqOptions{}, err
 				}
 				p.advance()
 				seq.MinValue = &SeqBound{NoValue: true}
 			case "maxvalue":
 				if err := p.dupCheck(seq.MaxValue != nil, "MAXVALUE"); err != nil {
-					return nil, err
+					return SeqOptions{}, err
 				}
 				p.advance()
 				seq.MaxValue = &SeqBound{NoValue: true}
 			case "cycle":
 				if err := p.dupCheck(seq.Cycle != nil, "CYCLE"); err != nil {
-					return nil, err
+					return SeqOptions{}, err
 				}
 				p.advance()
 				f := false
 				seq.Cycle = &f
 			default:
-				return nil, NewError(SyntaxError,
+				return SeqOptions{}, NewError(SyntaxError,
 					fmt.Sprintf("expected MINVALUE, MAXVALUE, or CYCLE after NO, found %q", p.peekKeyword()))
 			}
 		default:
+			if parenthesized {
+				if err := p.expect(TokRParen); err != nil {
+					return SeqOptions{}, err
+				}
+			}
 			return seq, nil
 		}
 	}
@@ -1279,6 +1344,29 @@ func (p *Parser) parseInsert() (*Insert, error) {
 		}
 	}
 
+	// Optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13), after
+	// the column list and before the source. OVERRIDING / SYSTEM / USER / VALUE are non-reserved;
+	// the clause is unambiguous against a VALUES/SELECT source.
+	var overriding *Overriding
+	if p.peekKeyword() == "overriding" {
+		p.advance()
+		var mode Overriding
+		switch p.peekKeyword() {
+		case "system":
+			mode = OverridingSystem
+		case "user":
+			mode = OverridingUser
+		default:
+			return nil, NewError(SyntaxError,
+				fmt.Sprintf("expected SYSTEM or USER after OVERRIDING, found %q", p.peekKeyword()))
+		}
+		p.advance()
+		if err := p.expectKeyword("value"); err != nil {
+			return nil, err
+		}
+		overriding = &mode
+	}
+
 	// The source is EITHER a SELECT (INSERT ... SELECT — §24) OR a VALUES list. `VALUES` and
 	// `SELECT` are disjoint leading keywords, so a peek decides without lookahead.
 	if p.peekKeyword() == "select" {
@@ -1290,7 +1378,7 @@ func (p *Parser) parseInsert() (*Insert, error) {
 		if err != nil {
 			return nil, err
 		}
-		return &Insert{Table: table, Columns: columns, Select: sel, Returning: returning}, nil
+		return &Insert{Table: table, Columns: columns, Overriding: overriding, Select: sel, Returning: returning}, nil
 	}
 
 	if err := p.expectKeyword("values"); err != nil {
@@ -1314,7 +1402,7 @@ func (p *Parser) parseInsert() (*Insert, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Insert{Table: table, Columns: columns, Rows: rows, Returning: returning}, nil
+	return &Insert{Table: table, Columns: columns, Overriding: overriding, Rows: rows, Returning: returning}, nil
 }
 
 // parseInsertRow parses one parenthesized `( <value> [, <value>]* )` row of an INSERT.

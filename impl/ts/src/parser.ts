@@ -14,16 +14,19 @@ import type {
   ColumnDef,
   Delete,
   Expr,
+  IdentitySpec,
   Insert,
   InsertValue,
   JoinClause,
   JoinKind,
   Literal,
   OrderKey,
+  Overriding,
   QueryExpr,
   Select,
   SelectItem,
   SelectItems,
+  SeqOptions,
   SetOpKind,
   Statement,
   SubscriptSpec,
@@ -32,6 +35,7 @@ import type {
   TypeMod,
   Update,
 } from "./ast.ts";
+import { emptySeqOptions } from "./ast.ts";
 import { Decimal } from "./decimal.ts";
 import { engineError } from "./errors.ts";
 import { lex } from "./lexer.ts";
@@ -298,7 +302,7 @@ class Parser {
       } else if (this.atForeignKeyTableConstraint()) {
         fks.push(this.parseForeignKeyTableConstraint());
       } else {
-        columns.push(this.parseColumnDef(checks, uniques, fks));
+        columns.push(this.parseColumnDef(name, checks, uniques, fks));
       }
       const k = this.advance().kind;
       if (k === "comma") continue;
@@ -486,7 +490,7 @@ class Parser {
     }
   }
 
-  private parseColumnDef(checks: CheckDef[], uniques: UniqueDef[], fks: ForeignKeyDef[]): ColumnDef {
+  private parseColumnDef(tableName: string, checks: CheckDef[], uniques: UniqueDef[], fks: ForeignKeyDef[]): ColumnDef {
     const name = this.expectIdentifier();
     const baseType = this.expectIdentifier();
     const typeMod = this.parseTypeMod();
@@ -501,6 +505,7 @@ class Parser {
     let primaryKey = false;
     let notNull = false;
     let def: DefaultDef | null = null;
+    let identity: IdentitySpec | null = null;
     for (;;) {
       if (this.atCheckConstraint()) {
         checks.push(this.parseCheckConstraint());
@@ -542,6 +547,37 @@ class Parser {
         const expr = this.parseExpr();
         const text = renderTokens(this.tokens.slice(start, this.pos));
         def = { expr, text };
+      } else if (kw === "generated") {
+        // `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY [( seq_options )]`
+        // (spec/design/sequences.md §13). Two identity specs on one column is 42601
+        // ("multiple identity specifications"). The desugaring (owned sequence + nextval default +
+        // NOT NULL + the type gate) is at execution.
+        this.advance();
+        let always: boolean;
+        const akw = this.peekKeyword();
+        if (akw === "always") {
+          this.advance();
+          always = true;
+        } else if (akw === "by") {
+          this.advance();
+          this.expectKeyword("default");
+          always = false;
+        } else {
+          throw engineError(
+            "syntax_error",
+            `expected ALWAYS or BY DEFAULT after GENERATED, found '${akw}'`,
+          );
+        }
+        this.expectKeyword("as");
+        this.expectKeyword("identity");
+        const options = this.peek().kind === "lparen" ? this.parseSequenceOptions(true) : emptySeqOptions();
+        if (identity !== null) {
+          throw engineError(
+            "syntax_error",
+            `multiple identity specifications for column ${name} of table ${tableName}`,
+          );
+        }
+        identity = { always, options };
       } else if (kw === "unique") {
         this.advance();
         uniques.push({ name: null, columns: [name] });
@@ -554,7 +590,7 @@ class Parser {
         break;
       }
     }
-    return { name, typeName, typeMod, primaryKey, notNull, default: def };
+    return { name, typeName, typeMod, primaryKey, notNull, default: def, identity };
   }
 
   // parseTypeMod parses an optional parenthesized type modifier `"(" integer ("," integer)? ")"`
@@ -724,17 +760,19 @@ class Parser {
     this.expectKeyword("sequence");
     const ifNotExists = this.parseIfNotExists();
     const name = this.expectIdentifier();
-    const seq: Statement = {
-      kind: "createSequence",
-      name,
-      ifNotExists,
-      increment: null,
-      minValue: null,
-      maxValue: null,
-      start: null,
-      cache: null,
-      cycle: null,
-    };
+    const options = this.parseSequenceOptions(false);
+    return { kind: "createSequence", name, ifNotExists, options };
+  }
+
+  // parseSequenceOptions parses the order-free sequence-option set (`INCREMENT [BY] n`,
+  // `MINVALUE`/`MAXVALUE` and their `NO` forms, `START [WITH] n`, `CACHE c`, `[NO] CYCLE`) shared by
+  // CREATE SEQUENCE and an IDENTITY column's `( seq_options )` (spec/design/sequences.md §13). When
+  // `parenthesized`, the options are wrapped in `( … )` and the loop stops at `)`; each option
+  // appears at most once (a repeat is 42601 via dupCheck). Validation of the resolved set (22023) is
+  // execution-time.
+  private parseSequenceOptions(parenthesized: boolean): SeqOptions {
+    if (parenthesized) this.expect("lparen");
+    const seq = emptySeqOptions();
     // Order-free option loop: dispatch on the leading keyword, each option at most once.
     for (;;) {
       switch (this.peekKeyword()) {
@@ -804,6 +842,7 @@ class Parser {
           break;
         }
         default:
+          if (parenthesized) this.expect("rparen");
           return seq;
       }
     }
@@ -936,12 +975,30 @@ class Parser {
       columns = names;
     }
 
+    // Optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13), after
+    // the column list and before the source. OVERRIDING / SYSTEM / USER / VALUE are non-reserved;
+    // the clause is unambiguous against a VALUES/SELECT source.
+    let overriding: Overriding | null = null;
+    if (this.peekKeyword() === "overriding") {
+      this.advance();
+      const mkw = this.peekKeyword();
+      if (mkw === "system") {
+        overriding = "system";
+      } else if (mkw === "user") {
+        overriding = "user";
+      } else {
+        throw engineError("syntax_error", `expected SYSTEM or USER after OVERRIDING, found '${mkw}'`);
+      }
+      this.advance();
+      this.expectKeyword("value");
+    }
+
     // The source is EITHER a SELECT (INSERT ... SELECT — §24) OR a VALUES list. `VALUES` and
     // `SELECT` are disjoint leading keywords, so a peek decides without lookahead.
     if (this.peekKeyword() === "select") {
       const select = this.parseSelect();
       const returning = this.parseReturning();
-      return { kind: "insert", table, columns, source: { kind: "select", select }, returning };
+      return { kind: "insert", table, columns, overriding, source: { kind: "select", select }, returning };
     }
 
     this.expectKeyword("values");
@@ -956,7 +1013,7 @@ class Parser {
       break;
     }
     const returning = this.parseReturning();
-    return { kind: "insert", table, columns, source: { kind: "values", rows }, returning };
+    return { kind: "insert", table, columns, overriding, source: { kind: "values", rows }, returning };
   }
 
   // parseInsertRow parses one parenthesized `( <value> [, <value>]* )` row.
