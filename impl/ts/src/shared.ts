@@ -30,7 +30,6 @@
 import { Database, Snapshot, stmtIsWrite, type Outcome } from "./executor.ts";
 import { Rows, rowsFromOutcome } from "./api.ts";
 import { engineError } from "./errors.ts";
-import { parseSQL } from "./parser.ts";
 import type { Value } from "./value.ts";
 
 // databaseFromSnapshot builds an in-memory handle whose committed state is `snap` (no file
@@ -153,7 +152,7 @@ export class ReadHandle {
   }
 
   private readOnly(sql: string, params: Value[]): Outcome {
-    const stmt = parseSQL(sql);
+    const stmt = this.db.parse(sql);
     if (stmtIsWrite(stmt)) {
       throw engineError(
         "read_only_sql_transaction",
@@ -195,12 +194,12 @@ export class WriteHandle {
   // execute runs a (possibly mutating) statement within this write transaction. A statement error
   // aborts the block (every later statement but commit/rollback is then 25P02, §6).
   execute(sql: string, params: Value[] = []): Outcome {
-    return this.db.executeStmtParams(parseSQL(sql), params);
+    return this.db.executeStmtParams(this.db.parse(sql), params);
   }
 
   // query runs a query within this write transaction (read-your-writes against the working set).
   query(sql: string, params: Value[] = []): Rows {
-    return rowsFromOutcome(this.db.executeStmtParams(parseSQL(sql), params));
+    return rowsFromOutcome(this.db.executeStmtParams(this.db.parse(sql), params));
   }
 
   // commit publishes the working set as the new committed snapshot at the next version (the §3

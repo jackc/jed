@@ -113,6 +113,10 @@ function binaryExpr(op: BinaryOp, lhs: Expr, rhs: Expr): Expr {
 // above any realistic query. Exceeding it throws 54001 statement_too_complex.
 export const MAX_EXPR_DEPTH = 256;
 
+// MAX_IDENTIFIER_LENGTH is enforced in the lexer (the identifier-token producer); re-exported here
+// so the two parser-level limits sit together (spec/design/cost.md §7; CLAUDE.md §13).
+export { MAX_IDENTIFIER_LENGTH } from "./lexer.ts";
+
 export function parseSQL(sql: string): Statement {
   const p = new Parser(lex(sql));
   const stmt = p.parseStatement();

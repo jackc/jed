@@ -37,7 +37,6 @@ use std::sync::{Arc, Condvar, Mutex, RwLock};
 use crate::api::Rows;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{Database, Outcome, Snapshot, stmt_is_write};
-use crate::parser::Parser;
 use crate::value::Value;
 
 /// The live-reader registry: a multiset of pinned snapshot versions (transactions.md §8). Each
@@ -212,7 +211,7 @@ impl ReadHandle {
     /// `25006` (the snapshot is read-only) — rejected before dispatch, so the handle is never
     /// poisoned and every call is independent.
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
-        let ast = Parser::parse_sql(sql)?;
+        let ast = self.db.parse(sql)?;
         if stmt_is_write(&ast) {
             return Err(EngineError::new(
                 SqlState::ReadOnlySqlTransaction,
@@ -224,7 +223,7 @@ impl ReadHandle {
 
     /// Run a read statement against the pinned snapshot, returning its outcome. A write is `25006`.
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
-        let ast = Parser::parse_sql(sql)?;
+        let ast = self.db.parse(sql)?;
         if stmt_is_write(&ast) {
             return Err(EngineError::new(
                 SqlState::ReadOnlySqlTransaction,

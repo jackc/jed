@@ -64,6 +64,7 @@ import {
 import { encodeBool, encodeInt } from "./encoding.ts";
 import { EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
+import { parseSQL } from "./parser.ts";
 import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
 import { DEFAULT_WORK_MEM, type RowCompare, type SpillSink, Sorter } from "./spill.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
@@ -195,6 +196,22 @@ type SelectResult = {
 // DEFAULT_PAGE_SIZE is the default serialization page size (8 KiB — spec/design/storage.md §3),
 // used for a fresh in-memory or newly-created database when no explicit size is given.
 export const DEFAULT_PAGE_SIZE = 8192;
+
+// DEFAULT_MAX_SQL_LENGTH is the default per-handle input-SQL byte limit (1 MiB — CLAUDE.md §13;
+// spec/design/api.md §8, cost.md §7). The §13 input-size gate's default ceiling: generous for
+// hand-written / ORM SQL, yet bounds the parse tree to a few MB so unbounded untrusted input
+// cannot exhaust memory. A caller raises it (trusted bulk loads) or sets 0 for unlimited via
+// setMaxSqlLength. Identical across cores (§8).
+export const DEFAULT_MAX_SQL_LENGTH = 1 << 20;
+
+// SQL_BYTE_ENCODER measures a statement's UTF-8 byte length for the input-size gate (cost.md §7),
+// matching the byte counts Rust (&str::len) and Go (len(string)) use, so the cap accepts / rejects
+// identically across cores (§8). A TextEncoder is available in Node and the browser (the OPFS
+// host), so this stays host-agnostic.
+const SQL_BYTE_ENCODER = new TextEncoder();
+function utf8ByteLength(s: string): number {
+  return SQL_BYTE_ENCODER.encode(s).length;
+}
 
 // Snapshot is an immutable committed (or in-progress working) database state — the catalog + each
 // table's store + the commit counter (spec/design/transactions.md §2). The committed state is one
@@ -509,6 +526,13 @@ export class Database {
   // it. A handle setting (not stored in the file), set by setMaxCost; the primary guard for safely
   // evaluating untrusted, user-supplied queries.
   maxCost: bigint;
+  // maxSqlLength is the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md §13;
+  // spec/design/api.md §8, cost.md §7). Default DEFAULT_MAX_SQL_LENGTH (1 MiB); 0 = unlimited (a
+  // trusted caller's opt-out). A statement whose text exceeds it is rejected with 54000 at the
+  // handle's parse entry — before lexing — so unbounded input cannot exhaust parse memory/CPU (the
+  // §13 input-size gate, which the cost meter cannot catch because parsing precedes metering). A
+  // handle setting (not stored in the file), set by setMaxSqlLength.
+  maxSqlLength: number;
   // readOnly marks a handle opened read-only (spec/design/api.md §2.1, OpenOptions.readOnly). A
   // read-only handle behaves like PostgreSQL hot standby: every transaction defaults to READ ONLY,
   // an explicit READ WRITE request and any write statement are 25006, and the file is opened
@@ -545,6 +569,7 @@ export class Database {
     this.persistHook = null;
     this.paging = null;
     this.maxCost = 0n;
+    this.maxSqlLength = DEFAULT_MAX_SQL_LENGTH;
     this.readOnly = false;
     this.workMem = DEFAULT_WORK_MEM;
     this.spillSink = null;
@@ -558,6 +583,37 @@ export class Database {
   // setting, not stored in the file.
   setMaxCost(limit: bigint): void {
     this.maxCost = limit;
+  }
+
+  // setMaxSqlLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
+  // §13; spec/design/api.md §8). A statement whose text exceeds bytes is rejected with 54000 at
+  // parse entry, before lexing — the §13 input-size gate (cost.md §7). 0 is unlimited (a trusted
+  // caller's opt-out); the default is DEFAULT_MAX_SQL_LENGTH (1 MiB). A handle setting, not stored
+  // in the file (mirrors setMaxCost).
+  setMaxSqlLength(bytes: number): void {
+    this.maxSqlLength = bytes;
+  }
+
+  // parse parses one statement from sql, first enforcing this handle's maxSqlLength input-size limit
+  // (CLAUDE.md §13; spec/design/api.md §8, cost.md §7). The §13 input-size gate: an over-limit
+  // statement is rejected with 54000 before lexing, so unbounded untrusted input cannot exhaust
+  // parse memory/CPU (the cost meter cannot catch this — parsing precedes metering). maxSqlLength
+  // == 0 is unlimited. Every handle-bound parse path routes through here (execute/executeParams/
+  // prepare/the session handles), so the per-handle limit has no hole. The byte length is the UTF-8
+  // byte count, matching Rust/Go's byte-length idiom for cross-core identity (§8) — a JS UTF-16
+  // .length would diverge on multi-byte input.
+  parse(sql: string): Statement {
+    const max = this.maxSqlLength;
+    // Fast reject without encoding: a string's UTF-8 byte length is always >= its UTF-16 .length,
+    // so if even the UTF-16 length exceeds the cap the statement is over-limit. Otherwise measure
+    // the exact UTF-8 byte length (then bounded by the cap, so the encode is bounded).
+    if (max > 0 && (sql.length > max || utf8ByteLength(sql) > max)) {
+      throw engineError(
+        "program_limit_exceeded",
+        `SQL statement exceeds the maximum length of ${max} bytes`,
+      );
+    }
+    return parseSQL(sql);
   }
 
   // setRandomSource injects a random source for the uuid generators (spec/design/entropy.md §6) —

@@ -321,6 +321,13 @@ func Lex(sql string) ([]Token, error) {
 			for i < len(b) && (isAlpha(b[i]) || isDigit(b[i])) {
 				i++
 			}
+			// Identifier-length gate (CLAUDE.md §13; spec/design/cost.md §7). A word is an
+			// identifier or a keyword; identifiers are ASCII-only here (so bytes = chars), and no
+			// keyword is this long, so bounding the word length bounds every identifier on every
+			// parse path. Aborts with 42622 before the (possibly huge) name is interned.
+			if i-start > maxIdentifierLength {
+				return nil, NewError(NameTooLong, fmt.Sprintf("identifier exceeds the maximum length of %d bytes", maxIdentifierLength))
+			}
 			tokens = append(tokens, Token{Kind: TokWord, Word: sql[start:i]})
 		default:
 			return nil, NewError(SyntaxError, fmt.Sprintf("unexpected character '%c'", c))

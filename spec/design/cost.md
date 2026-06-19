@@ -908,9 +908,61 @@ pins both directions cross-core (a just-under-limit statement runs; an over-limi
 `statement error 54001`), gated by the `resource.depth_limit` capability. Because the trigger
 is jed-specific (not PG's runtime probe), it is **not** oracle-checked.
 
-**Known follow-on (not this slice).** Two recursion vectors are *not* bounded by this
-expression/query-nesting counter: (a) **deeply-nested `CREATE TYPE` composite chains** resolved
-at DDL time, and (b) any future grammar that recurses outside the expression / query-expression
-/ set-op cascade. Both overflow only at far greater depth (or are already capped by an earlier
-engine error — e.g. nested `ROW(…)` in `INSERT … VALUES` is `42601` at depth 2); they are noted
-so the seam's coverage boundary is explicit.
+**Known follow-on (not this slice).** One recursion vector is *not* bounded by the
+expression/query-nesting counter **or** by the input-size limit below: **deeply-nested `CREATE
+TYPE` composite chains** resolved at DDL time. The chain is built across *many* cheap, individually
+short statements (`CREATE TYPE a AS (…)`, `CREATE TYPE b AS (x a)`, …), so the per-statement
+input-size cap never sees it, and the depth is a property of the *catalog graph* (resolved at
+use/codec time), not a single statement's AST — so the nesting counter never sees it either. It
+needs its own catalog-resolution depth gate (the next slice). Any future grammar that recurses
+outside the expression / query-expression / set-op cascade is the same shape; both are noted so the
+seam's coverage boundary stays explicit. (Nested `ROW(…)` in `INSERT … VALUES` is already capped by
+an earlier engine error — `42601` at depth 2 — so it is not a vector.)
+
+## 7a. Input-size and identifier-length limits (landed)
+
+The nesting-depth gate (§7) bounds the parse tree's **height**; two sibling gates — in the same
+§13 family, all checked *before any cost is metered* (the §6 ceiling cannot catch parse-time
+work) — bound its **breadth/total size** and its **identifier length**. Together with §7 they
+close the input-hardening vectors for untrusted SQL: a hostile statement can be neither too tall,
+nor too wide/long, nor name anything unboundedly.
+
+**Input-size limit — `max_sql_length` (a per-handle setting).** A statement whose input text
+exceeds the handle's `max_sql_length` (in **bytes**) is rejected with **`54000`
+`program_limit_exceeded`** at the handle's parse entry, *before* lexing — so an adversarial 1 GB
+query cannot exhaust parse memory/CPU (parsing is O(input), and the parse tree is O(input)). It is
+a **per-handle setting** like `max_cost` ([api.md](api.md) §8): the default is **1 MiB**
+(`DEFAULT_MAX_SQL_LENGTH = 1 << 20`), generous for hand-written / ORM SQL yet bounding the tree to a
+few MB; **`0` is unlimited**, a trusted caller's opt-out (e.g. a bulk load). The cap is the
+**maximum allowed** length — a statement of exactly `max_sql_length` bytes runs, one byte over
+aborts (inclusive max, like §7's "exceeds the maximum"). The byte length is the **UTF-8 byte
+count** — Rust `&str::len`, Go `len(string)`, and the TS core's `TextEncoder`-measured length all
+agree, so the cap accepts/rejects identically across cores (§8); a core counting UTF-16 units would
+diverge on multi-byte input.
+
+*This single cap subsumes the parse-tree-breadth / node-count vector.* jed is **single-statement
+per call** (`parse_sql` parses one statement, then `expect_eof`), and nothing in the grammar
+desugars super-linearly (`BETWEEN` → 2 nodes, `IN (list)` / `CASE` stay flat `RExpr` nodes — §7),
+so the AST node count is `O(input bytes)`: every node consumes ≥ 1 token consuming ≥ 1 input byte.
+Bounding the input bytes therefore bounds the node count to within a constant — a 1 M-column
+`SELECT`, a 200 k-element `IN` list, or a giant `VALUES` is just *bytes*, stopped by the same gate,
+**without a separate node counter**. (Identifier length, below, is likewise ≤ the input size, but
+gets its own tighter gate because identifiers persist to the catalog and keys.)
+
+**Identifier-length limit — `MAX_IDENTIFIER_LENGTH = 63` bytes (a fixed constant).** A single
+identifier — table / column / type / alias / function name — longer than 63 bytes is rejected with
+**`42622` `name_too_long`**. The check sits in the **lexer**, at the identifier-token *producer*
+(the same "bound at the producer" reasoning as §7's parser gate), so it bounds **every** identifier
+on **every** parse path and fires during tokenization, before the parser dispatches. Identifiers
+are ASCII-only ([grammar.md](grammar.md) §3), so 63 bytes = 63 characters. **63** matches
+PostgreSQL's `NAMEDATALEN − 1` boundary, but jed **errors** where PG silently *truncates* — jed has
+no notices, and a silent truncation could collide two distinct names (a documented PG divergence,
+CLAUDE.md §1). A fixed, cross-core-identical constant (§8), like `MAX_EXPR_DEPTH`.
+
+**Conformance.** [../conformance/suites/resource/input_size_limit.test](../conformance/suites/resource/input_size_limit.test)
+pins the input-size boundary cross-core via the `# max_sql_length: N` directive (a small cap makes
+the boundary testable with tiny inputs; the 1 MiB default would need a > 1 MiB file), including a
+multi-byte case that pins UTF-8 byte counting; gated by `resource.sql_length_limit`.
+[../conformance/suites/resource/identifier_length.test](../conformance/suites/resource/identifier_length.test)
+pins the 63/64-byte identifier boundary in several positions; gated by
+`resource.identifier_length_limit`. Both are jed-specific, so **not** oracle-checked.

@@ -6,7 +6,6 @@
 import type { Statement } from "./ast.ts";
 import { Database, type Outcome } from "./executor.ts";
 import { engineError } from "./errors.ts";
-import { parseSQL } from "./parser.ts";
 import type { Value } from "./value.ts";
 
 // PreparedStatement is a parsed, reusable statement (spec/design/api.md §2.4). It holds the
@@ -72,12 +71,12 @@ export function rowsFromOutcome(out: Outcome): Rows {
 // prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
 // errors (42601, …) surface here.
 export function prepare(db: Database, sql: string): PreparedStatement {
-  return new PreparedStatement(db, parseSQL(sql));
+  return new PreparedStatement(db, db.parse(sql));
 }
 
 // query is a one-shot: parse + run a query sql, binding params, returning a row cursor.
 export function query(db: Database, sql: string, params: Value[] = []): Rows {
-  return rowsFromOutcome(db.executeStmtParams(parseSQL(sql), params));
+  return rowsFromOutcome(db.executeStmtParams(db.parse(sql), params));
 }
 
 // querySql is an alias for query, symmetric with the Rust/Go QuerySQL naming (api.md §6).
@@ -99,7 +98,7 @@ export class Transaction {
   // in a READ ONLY transaction is 25006; a statement error aborts the block (every later statement
   // but commit/rollback is then 25P02).
   execute(sql: string, params: Value[] = []): Outcome {
-    return this.db.executeStmtParams(parseSQL(sql), params);
+    return this.db.executeStmtParams(this.db.parse(sql), params);
   }
 
   // query runs a query within this transaction, returning a row cursor.

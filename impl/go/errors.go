@@ -112,8 +112,20 @@ const (
 	// DependentObjectsStillExist is 2BP01 — DROP TYPE ... RESTRICT of a composite type a
 	// table column or another composite field still references (spec/design/composite.md §7).
 	DependentObjectsStillExist
+	// NameTooLong is 42622 — an identifier (table / column / type / alias / function name) exceeds
+	// the engine's fixed maximum length of maxIdentifierLength = 63 bytes (CLAUDE.md §13;
+	// spec/design/cost.md §7). Checked when the lexer builds an identifier token, so it bounds
+	// every identifier on every parse path. PG's 42622 name_too_long, but jed errors where PG
+	// silently truncates (identifiers are ASCII-only, so bytes = characters).
+	NameTooLong
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
+	// ProgramLimitExceeded is 54000 — the input SQL text exceeded the per-handle maxSQLLength byte
+	// limit (CLAUDE.md §13; spec/design/api.md §8, cost.md §7). The §13 input-size gate, sibling of
+	// StatementTooComplex: both bound the parse before any cost is metered (the 54P01 cost ceiling
+	// cannot catch parse-time blowup). A per-handle setting (default 1 MiB, 0 = unlimited), checked
+	// at the handle's parse entry; deterministic + cross-core (§8).
+	ProgramLimitExceeded
 	// StatementTooComplex is 54001 — a statement's expression / subquery / set-operation nesting
 	// depth exceeds the engine's fixed maximum (maxExprDepth). The native-stack-safety gate for
 	// untrusted input — deeply-nested SQL would otherwise overflow the recursive-descent parser /
@@ -214,10 +226,14 @@ func (s SqlState) Code() string {
 		return "42710"
 	case WrongObjectType:
 		return "42809"
+	case NameTooLong:
+		return "42622"
 	case DependentObjectsStillExist:
 		return "2BP01"
 	case FeatureNotSupported:
 		return "0A000"
+	case ProgramLimitExceeded:
+		return "54000"
 	case StatementTooComplex:
 		return "54001"
 	case CostLimitExceeded:

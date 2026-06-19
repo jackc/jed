@@ -27,6 +27,19 @@ use crate::token::Token;
 /// above any realistic query. Exceeding it aborts with `54001 statement_too_complex`.
 pub const MAX_EXPR_DEPTH: usize = 256;
 
+/// Maximum length, in **bytes**, of a single identifier — table / column / type / alias /
+/// function name (spec/design/cost.md §7; CLAUDE.md §13). The §13 identifier-hardening gate for
+/// untrusted input: an unbounded identifier would otherwise consume O(input) memory and land
+/// verbatim in the on-disk catalog and keys. Checked in the lexer when an identifier token is
+/// built (the *producer*, so every identifier on every parse path is bounded), aborting with
+/// `42622 name_too_long`. Identifiers are ASCII-only (spec/design/grammar.md §3), so the byte
+/// length is the character count. `63` matches PostgreSQL's `NAMEDATALEN − 1` boundary — but jed
+/// **errors** where PG silently truncates (a documented PG divergence: jed has no notices, and a
+/// silent truncation could collide two distinct names — CLAUDE.md §1). A fixed constant, so it is
+/// deterministic and cross-core identical (§8): the same name is accepted or rejected in Rust /
+/// Go / TS alike.
+pub const MAX_IDENTIFIER_LENGTH: usize = 63;
+
 pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,

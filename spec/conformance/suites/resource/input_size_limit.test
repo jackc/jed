@@ -1,0 +1,80 @@
+# Input-size limit — the per-handle `max_sql_length` cap aborts an over-long statement BEFORE it is
+# parsed (CLAUDE.md §13; spec/design/cost.md §7, api.md §8). The input-size sibling of the
+# nesting-depth gate (depth_limit.test): both bound the parse BEFORE any cost is metered (the 54P01
+# cost ceiling cannot — parsing precedes metering), and together they bound the parse tree in both
+# dimensions — depth (54001) and breadth / total bytes (54000). Because jed is single-statement per
+# call and nothing desugars super-linearly, this ONE input-byte cap transitively bounds the
+# parse-tree node count too (every AST node costs >= 1 token >= 1 input byte) — so a 200k-column
+# SELECT or a 200k-element IN list is bounded by the same gate, with no separate node counter.
+#
+# The cap is a per-handle setting (default 1 MiB, 0 = unlimited) so a trusted caller can raise it;
+# the `# max_sql_length: N` directive runs the next record under a SMALL cap N so the boundary is
+# testable with tiny inputs (the 1 MiB default would need a >1 MiB test file). The cap is the
+# MAXIMUM ALLOWED byte length: a statement of exactly N bytes runs, one of N+1 bytes aborts (54000)
+# — inclusive max, like the depth gate's "exceeds the maximum". The length is the UTF-8 byte count
+# (names are UTF-8), identical across cores (§8); the multi-byte case at the end pins that.
+#
+# jed-SPECIFIC (PostgreSQL has no fixed query-length limit — a documented divergence, CLAUDE.md
+# §1/§13), so the 54000 records are NOT oracle-checked.
+# requires: ddl.create_table, ddl.primary_key, query.select, expr.arithmetic, types.int32, types.text, resource.sql_length_limit
+
+statement ok
+CREATE TABLE t (id int32 PRIMARY KEY, v int32)
+
+# === Boundary: the cap is the maximum allowed byte length (inclusive). `SELECT 1` is 8 bytes. ===
+
+# Exactly at the cap (8 bytes) runs normally — the gate never perturbs a within-limit statement.
+# max_sql_length: 8
+query I nosort
+SELECT 1
+----
+1
+
+# One byte over (cap 7 < 8 bytes) aborts at parse entry, before lexing — the first disallowed size.
+# max_sql_length: 7
+statement error 54000
+SELECT 1
+
+# A statement far over a tiny cap aborts (the runaway-input case in miniature: a real attacker
+# sends megabytes; the gate rejects deterministically before allocating the parse tree).
+# max_sql_length: 5
+statement error 54000
+SELECT 1 + 1 + 1 + 1 + 1
+
+# A generous cap admits ordinary SQL unchanged (the default is 1 MiB — far above any hand/ORM query).
+# max_sql_length: 1000
+query I nosort
+SELECT 1 + 1 + 1 + 1 + 1
+----
+5
+
+# A cap of 0 means UNLIMITED — a trusted caller's opt-out; the same long statement runs.
+# max_sql_length: 0
+query I nosort
+SELECT 1 + 1 + 1 + 1 + 1
+----
+5
+
+# === Breadth is bounded transitively: a wide statement is just bytes, so the same cap stops it. ===
+
+# `SELECT 1, 2, 3, 4, 5, 6` is 23 bytes — well over a 10-byte cap — so it aborts even though it is
+# SHALLOW (depth 1). The nesting-depth gate would never catch this; the input-size gate does. This
+# is why one byte cap subsumes the parse-tree-breadth vector (a million-column SELECT is just bytes).
+# max_sql_length: 10
+statement error 54000
+SELECT 1, 2, 3, 4, 5, 6
+
+# === UTF-8 byte semantics (cross-core contract): the cap counts BYTES, not characters. ===
+
+# `SELECT 'café'` is 13 UTF-16 code units but 14 UTF-8 bytes (é = 2 bytes). A cap of 14 admits it...
+# max_sql_length: 14
+query T nosort
+SELECT 'café'
+----
+café
+
+# ...and a cap of 13 rejects it (14 bytes > 13). A core counting UTF-16 units (13) would WRONGLY
+# admit it, so this record pins UTF-8 byte counting identically across Rust / Go / TS (§8).
+# max_sql_length: 13
+statement error 54000
+SELECT 'café'

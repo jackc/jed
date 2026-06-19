@@ -154,6 +154,23 @@ func parseMaxCostDirective(line string) (int64, bool) {
 	return n, true
 }
 
+// parseMaxSQLLengthDirective parses a `# max_sql_length: N` directive line. Returns the per-handle
+// input-size limit (bytes) to run the next record under and true, or (0, false) if not one.
+// Mirrors `# max_cost:`: it lets a record set a small cap and assert that an over-long statement
+// aborts with 54000 (CLAUDE.md §13; cost.md §7, api.md §8). 0 is unlimited; absent ⇒ the engine
+// default (1 MiB) for every other record.
+func parseMaxSQLLengthDirective(line string) (int, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "max_sql_length:")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(rest))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // parseSeedDirective parses a `# seed: N` directive line (spec/design/entropy.md §6): the fixed
 // PRNG seed (uint64) to run the next record under, making the uuid generators cross-core identical.
 func parseSeedDirective(line string) (uint64, bool) {
@@ -275,6 +292,7 @@ func runFile(text string) error {
 	var pendingNames []string
 	var pendingTypes []string
 	var pendingMaxCost *int64
+	var pendingMaxSQLLength *int
 	var pendingSeed *uint64
 	var pendingClock *int64
 	var pendingClockAdvance *clockAdvance
@@ -291,6 +309,8 @@ func runFile(text string) error {
 				pendingCost = &n
 			} else if n, ok := parseMaxCostDirective(line); ok {
 				pendingMaxCost = &n
+			} else if n, ok := parseMaxSQLLengthDirective(line); ok {
+				pendingMaxSQLLength = &n
 			} else if s, ok := parseSeedDirective(line); ok {
 				pendingSeed = &s
 			} else if c, ok := parseClockDirective(line); ok {
@@ -319,6 +339,14 @@ func runFile(text string) error {
 		}
 		db.SetMaxCost(maxCost)
 		pendingMaxCost = nil
+		// Apply the per-record input-size cap; absent ⇒ the engine default (1 MiB), so a
+		// `# max_sql_length:` directive never leaks past its record (cost.md §7, api.md §8).
+		maxSQLLength := jed.DefaultMaxSQLLength
+		if pendingMaxSQLLength != nil {
+			maxSQLLength = *pendingMaxSQLLength
+		}
+		db.SetMaxSQLLength(maxSQLLength)
+		pendingMaxSQLLength = nil
 		// Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md
 		// §6); absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
 		if pendingSeed != nil {

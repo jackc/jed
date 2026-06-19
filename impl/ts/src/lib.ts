@@ -5,7 +5,6 @@
 
 import { Database } from "./executor.ts";
 import type { Outcome } from "./executor.ts";
-import { parseSQL } from "./parser.ts";
 import type { Value } from "./value.ts";
 
 // SUPPORTED_CAPABILITIES lists the capabilities this core implements (spec/conformance:
@@ -246,6 +245,13 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Nesting-depth limit — a fixed MAX_EXPR_DEPTH checked in the parser aborts deeply-nested input
   // with 54001 before it can overflow the native stack (CLAUDE.md §13; cost.md §7).
   "resource.depth_limit",
+  // Input-size limit — a per-handle max_sql_length (default 1 MiB, 0 = unlimited) aborts an
+  // over-long statement with 54000 at parse entry, before lexing; the `# max_sql_length:`
+  // directive runs a record under a small cap (CLAUDE.md §13; cost.md §7, api.md §8).
+  "resource.sql_length_limit",
+  // Identifier-length limit — a fixed MAX_IDENTIFIER_LENGTH (63 bytes) checked at the lexer's
+  // identifier production aborts an over-long name with 42622, on every parse path (cost.md §7).
+  "resource.identifier_length_limit",
   // Pure built-in surface — no function/operator or statement reaches the host (filesystem,
   // network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
   // calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).
@@ -273,18 +279,23 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
 
 // execute parses and executes one SQL statement against db (no bind parameters).
 export function execute(db: Database, sql: string): Outcome {
-  return db.executeStmt(parseSQL(sql));
+  return db.executeStmt(db.parse(sql));
 }
 
 // executeParams parses and executes one SQL statement against db, binding params to its $N
 // placeholders (spec/design/api.md §5). A count mismatch is 42601; a parameter whose type cannot
 // be inferred is 42P18; a bound value out of range / of the wrong family fails like a literal.
 export function executeParams(db: Database, sql: string, params: Value[]): Outcome {
-  return db.executeStmtParams(parseSQL(sql), params);
+  return db.executeStmtParams(db.parse(sql), params);
 }
 
 // --- public surface (re-exports) ---
-export { Database, DEFAULT_PAGE_SIZE, Snapshot } from "./executor.ts";
+export {
+  Database,
+  DEFAULT_MAX_SQL_LENGTH,
+  DEFAULT_PAGE_SIZE,
+  Snapshot,
+} from "./executor.ts";
 export type { Outcome } from "./executor.ts";
 export { parseSQL } from "./parser.ts";
 export { EngineError, sqlStateCode } from "./errors.ts";

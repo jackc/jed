@@ -155,6 +155,19 @@ fn parse_max_cost_directive(rest: &str) -> Option<i64> {
         .ok()
 }
 
+/// Parse a `# max_sql_length: N` directive body. Returns the per-handle input-size limit (bytes)
+/// to run the next record under, or None if this comment is not a max_sql_length directive.
+/// Mirrors `# max_cost:`: it lets a record set a *small* cap and assert that an over-long
+/// statement aborts with `54000` (CLAUDE.md §13; spec/design/cost.md §7, api.md §8). `0` is
+/// unlimited; absent ⇒ the engine default (1 MiB) for every other record.
+fn parse_max_sql_length_directive(rest: &str) -> Option<usize> {
+    rest.trim_start()
+        .strip_prefix("max_sql_length:")?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Parse a `# seed: N` directive body (entropy.md §6): the fixed PRNG seed (u64) to run the next
 /// record under, making the volatile uuid generators deterministic + cross-core identical.
 fn parse_seed_directive(rest: &str) -> Option<u64> {
@@ -255,6 +268,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut pending_names: Option<Vec<String>> = None;
     let mut pending_types: Option<Vec<String>> = None;
     let mut pending_max_cost: Option<i64> = None;
+    let mut pending_max_sql_length: Option<usize> = None;
     let mut pending_seed: Option<u64> = None;
     let mut pending_clock: Option<i64> = None;
     let mut pending_clock_advance: Option<(i64, i64)> = None;
@@ -271,6 +285,8 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 pending_cost = Some(n);
             } else if let Some(n) = parse_max_cost_directive(rest) {
                 pending_max_cost = Some(n);
+            } else if let Some(n) = parse_max_sql_length_directive(rest) {
+                pending_max_sql_length = Some(n);
             } else if let Some(s) = parse_seed_directive(rest) {
                 pending_seed = Some(s);
             } else if let Some(c) = parse_clock_directive(rest) {
@@ -290,6 +306,13 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
         let expected_types = pending_types.take();
         // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
         db.set_max_cost(pending_max_cost.take().unwrap_or(0));
+        // Apply the per-record input-size cap; absent ⇒ the engine default (1 MiB), so a
+        // `# max_sql_length:` directive never leaks past its record (cost.md §7, api.md §8).
+        db.set_max_sql_length(
+            pending_max_sql_length
+                .take()
+                .unwrap_or(jed::DEFAULT_MAX_SQL_LENGTH),
+        );
         // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md
         // §6); absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
         match pending_seed.take() {
@@ -403,6 +426,7 @@ fn rebaseline_file(text: &str) -> Option<String> {
     let mut db = Database::new();
     let mut pending_cost_line: Option<usize> = None;
     let mut pending_max_cost: Option<i64> = None;
+    let mut pending_max_sql_length: Option<usize> = None;
     let mut pending_seed: Option<u64> = None;
     let mut pending_clock: Option<i64> = None;
     let mut pending_clock_advance: Option<(i64, i64)> = None;
@@ -419,6 +443,8 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 pending_cost_line = Some(i);
             } else if let Some(n) = parse_max_cost_directive(rest) {
                 pending_max_cost = Some(n);
+            } else if let Some(n) = parse_max_sql_length_directive(rest) {
+                pending_max_sql_length = Some(n);
             } else if let Some(s) = parse_seed_directive(rest) {
                 pending_seed = Some(s);
             } else if let Some(c) = parse_clock_directive(rest) {
@@ -433,6 +459,11 @@ fn rebaseline_file(text: &str) -> Option<String> {
         // accrue cost + advance DB state. Apply any per-record cost ceiling so an aborting
         // record evolves the DB state identically to `run_file` (it writes nothing).
         db.set_max_cost(pending_max_cost.take().unwrap_or(0));
+        db.set_max_sql_length(
+            pending_max_sql_length
+                .take()
+                .unwrap_or(jed::DEFAULT_MAX_SQL_LENGTH),
+        );
         match pending_seed.take() {
             Some(s) => db.set_random_source(jed::seam::seeded_random_source(s)),
             None => db.clear_random_source(),

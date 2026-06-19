@@ -45,6 +45,14 @@ def parse_cost_directives(path)
       .filter_map { |l| l[/^#\s*cost:\s*(\S+)/i, 1] }
 end
 
+# The raw token of every `# max_sql_length: N` directive in a .test file (CLAUDE.md §13). It
+# runs the next record under a (small) per-handle input-size cap so an over-long statement
+# aborts with 54000; a comment the stock sqllogictest runner ignores, like `# cost:`.
+def parse_max_sql_length_directives(path)
+  File.readlines(path, encoding: "UTF-8")
+      .filter_map { |l| l[/^#\s*max_sql_length:\s*(\S+)/i, 1] }
+end
+
 def main
   manifest = TomlRB.load_file(File.join(CONF_DIR, "manifest.toml"))
   capabilities = (manifest["capability"] || []).map { |c| c["id"] }
@@ -98,6 +106,18 @@ def main
       end
       unless reqs.include?("resource.cost_metering")
         fail!("#{rel}: uses `# cost:` but does not require `resource.cost_metering`")
+      end
+    end
+
+    # (6) max_sql_length directives: each is a non-negative integer, and the file must require
+    # the input-size capability (so cores lacking the gate skip it — conformance.md §3).
+    max_sql_lengths = parse_max_sql_length_directives(path)
+    unless max_sql_lengths.empty?
+      max_sql_lengths.each do |tok|
+        fail!("#{rel}: `# max_sql_length: #{tok}` is not a non-negative integer") unless tok =~ /\A\d+\z/
+      end
+      unless reqs.include?("resource.sql_length_limit")
+        fail!("#{rel}: uses `# max_sql_length:` but does not require `resource.sql_length_limit`")
       end
     end
   end

@@ -11,6 +11,18 @@ import type { Token } from "./token.ts";
 // minus of it folds to int64's minimum. A larger magnitude cannot be represented.
 const MAX_MAGNITUDE = 9223372036854775808n;
 
+// MAX_IDENTIFIER_LENGTH is the maximum length, in bytes, of a single identifier — table / column /
+// type / alias / function name (spec/design/cost.md §7; CLAUDE.md §13). The §13 identifier
+// hardening gate for untrusted input: an unbounded identifier would otherwise consume O(input)
+// memory and land verbatim in the on-disk catalog and keys. Checked below when an identifier token
+// is built (the producer, so every identifier on every parse path is bounded), throwing 42622
+// name_too_long. Identifiers are ASCII-only (spec/design/grammar.md §3), so a substring's .length
+// here equals its UTF-8 byte length. 63 matches PostgreSQL's NAMEDATALEN − 1 boundary — but jed
+// throws where PG silently truncates (a documented PG divergence: jed has no notices, and a silent
+// truncation could collide two distinct names — CLAUDE.md §1). A fixed constant, so it is
+// deterministic and cross-core identical (§8): the SAME in every core (Rust / Go / TS).
+export const MAX_IDENTIFIER_LENGTH = 63;
+
 function isDigit(c: string): boolean {
   return c >= "0" && c <= "9";
 }
@@ -314,6 +326,16 @@ export function lex(sql: string): Token[] {
       const start = i;
       while (i < n && (isAlpha(sql[i]!) || isDigit(sql[i]!))) {
         i++;
+      }
+      // Identifier-length gate (CLAUDE.md §13; spec/design/cost.md §7). A word is an identifier or
+      // a keyword; identifiers are ASCII-only here (so .length = bytes), and no keyword is this
+      // long, so bounding the word length bounds every identifier on every parse path. Throws
+      // 42622 before the (possibly huge) name is interned.
+      if (i - start > MAX_IDENTIFIER_LENGTH) {
+        throw engineError(
+          "name_too_long",
+          `identifier exceeds the maximum length of ${MAX_IDENTIFIER_LENGTH} bytes`,
+        );
       }
       tokens.push({ kind: "word", word: sql.slice(start, i) });
     } else {

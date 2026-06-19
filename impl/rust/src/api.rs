@@ -167,11 +167,29 @@ impl Database {
         }
     }
 
+    /// Parse one statement from `sql`, first enforcing this handle's `max_sql_length` input-size
+    /// limit (CLAUDE.md §13; spec/design/api.md §8, cost.md §7). The §13 input-size gate: an
+    /// over-limit statement is rejected with `54000` **before** lexing, so unbounded untrusted
+    /// input cannot exhaust parse memory/CPU (the cost meter cannot catch this — parsing precedes
+    /// metering). `max_sql_length == 0` is unlimited. **Every** handle-bound parse path routes
+    /// through here (`execute`/`execute_params`/`prepare`/the read handle), so the per-handle
+    /// limit has no hole. The byte length is `sql.len()` (Rust `&str` is UTF-8).
+    pub(crate) fn parse(&self, sql: &str) -> Result<Statement> {
+        let max = self.max_sql_length;
+        if max > 0 && sql.len() > max {
+            return Err(EngineError::new(
+                SqlState::ProgramLimitExceeded,
+                format!("SQL statement exceeds the maximum length of {max} bytes"),
+            ));
+        }
+        Parser::parse_sql(sql)
+    }
+
     /// Parse `sql` once into a reusable prepared statement (spec/design/api.md §2.4). Parse
-    /// errors (`42601`, …) surface here.
+    /// errors (`42601`, …) and the `54000` input-size limit surface here.
     pub fn prepare(&self, sql: &str) -> Result<PreparedStatement> {
         Ok(PreparedStatement {
-            ast: Parser::parse_sql(sql)?,
+            ast: self.parse(sql)?,
         })
     }
 
@@ -179,7 +197,7 @@ impl Database {
     /// materialized outcome. (The free function `jed::execute(db, sql)` is the zero-parameter
     /// convenience kept for back-compat.)
     pub fn execute(&mut self, sql: &str, params: &[Value]) -> Result<Outcome> {
-        let ast = Parser::parse_sql(sql)?;
+        let ast = self.parse(sql)?;
         self.execute_stmt_params(ast, params)
     }
 

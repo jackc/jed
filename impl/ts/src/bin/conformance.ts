@@ -10,6 +10,7 @@ import process from "node:process";
 import {
   advancingClock,
   Database,
+  DEFAULT_MAX_SQL_LENGTH,
   EngineError,
   execute,
   fixedClock,
@@ -196,6 +197,17 @@ function parseMaxCostDirective(line: string): bigint | null {
   }
 }
 
+// parseMaxSqlLengthDirective parses a `# max_sql_length: N` directive line. Returns the per-handle
+// input-size limit (bytes) to run the next record under, or null if not one. Mirrors `# max_cost:`:
+// it lets a record set a small cap and assert that an over-long statement aborts with 54000
+// (CLAUDE.md §13; cost.md §7, api.md §8). 0 is unlimited; absent ⇒ the engine default (1 MiB).
+function parseMaxSqlLengthDirective(line: string): number | null {
+  const m = line.match(/^#\s*max_sql_length:\s*(\S+)/);
+  if (!m) return null;
+  const n = Number(m[1]!);
+  return Number.isInteger(n) && n >= 0 ? n : null;
+}
+
 // parseSeedDirective parses a `# seed: N` directive line (spec/design/entropy.md §6): the fixed
 // PRNG seed (u64) to run the next record under, making the uuid generators cross-core identical.
 function parseSeedDirective(line: string): bigint | null {
@@ -293,6 +305,7 @@ function runFile(text: string): void {
   let pendingNames: string[] | null = null;
   let pendingTypes: string[] | null = null;
   let pendingMaxCost: bigint | null = null;
+  let pendingMaxSqlLength: number | null = null;
   let pendingSeed: bigint | null = null;
   let pendingClock: bigint | null = null;
   let pendingClockAdvance: [bigint, bigint] | null = null;
@@ -307,6 +320,7 @@ function runFile(text: string): void {
       // comment is ignored.
       const n = parseCostDirective(line);
       const mc = parseMaxCostDirective(line);
+      const msl = parseMaxSqlLengthDirective(line);
       const sd = parseSeedDirective(line);
       const ck = parseClockDirective(line);
       const ca = parseClockAdvanceDirective(line);
@@ -314,6 +328,8 @@ function runFile(text: string): void {
         pendingCost = n;
       } else if (mc !== null) {
         pendingMaxCost = mc;
+      } else if (msl !== null) {
+        pendingMaxSqlLength = msl;
       } else if (sd !== null) {
         pendingSeed = sd;
       } else if (ck !== null) {
@@ -342,6 +358,10 @@ function runFile(text: string): void {
     // Apply the per-record cost ceiling (0 = unlimited); set each record so it auto-resets.
     db.setMaxCost(pendingMaxCost ?? 0n);
     pendingMaxCost = null;
+    // Apply the per-record input-size cap; absent ⇒ the engine default (1 MiB), so a
+    // `# max_sql_length:` directive never leaks past its record (cost.md §7, api.md §8).
+    db.setMaxSqlLength(pendingMaxSqlLength ?? DEFAULT_MAX_SQL_LENGTH);
+    pendingMaxSqlLength = null;
     // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md §6);
     // absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
     if (pendingSeed !== null) db.setRandomSource(seededRandomSource(pendingSeed));

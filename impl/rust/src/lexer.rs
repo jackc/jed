@@ -339,6 +339,19 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
                     i += 1;
                 }
+                // Identifier-length gate (CLAUDE.md §13; spec/design/cost.md §7). A word is an
+                // identifier or a keyword; identifiers are ASCII-only here (so bytes = chars), and
+                // no keyword is this long, so bounding the word length bounds every identifier on
+                // every parse path. Aborts with 42622 before the (possibly huge) name is interned.
+                if i - start > crate::parser::MAX_IDENTIFIER_LENGTH {
+                    return Err(EngineError::new(
+                        SqlState::NameTooLong,
+                        format!(
+                            "identifier exceeds the maximum length of {} bytes",
+                            crate::parser::MAX_IDENTIFIER_LENGTH
+                        ),
+                    ));
+                }
                 tokens.push(Token::Word(sql[start..i].to_string()));
             }
             _ => {

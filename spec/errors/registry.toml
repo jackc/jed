@@ -292,6 +292,21 @@ class = "syntax error or access rule violation"
 # name (spec/design/indexes.md §2).
 template = "{name} is not {kind}"
 
+# 42622 name_too_long — an identifier (table / column / type / alias / function name) exceeds
+# the engine's fixed maximum length of MAX_IDENTIFIER_LENGTH = 63 bytes (spec/design/cost.md §7;
+# CLAUDE.md §13). The §13 input-hardening gate for identifiers: checked when the lexer constructs
+# an identifier token, so it bounds every identifier on every parse path (and keeps a hostile name
+# out of the on-disk catalog / keys). Borrows PG's `42622 name_too_long` code at PG's NAMEDATALEN−1
+# boundary, but jed ERRORS where PG silently truncates — jed has no notices and a silent truncation
+# could collide two distinct names (a documented PG divergence on the action, CLAUDE.md §1). The
+# limit is a fixed constant (deterministic, cross-core identical — §8); identifiers are ASCII-only
+# (grammar.md §3), so the byte length is the character count.
+[[error]]
+code = "42622"
+name = "name_too_long"
+class = "syntax error or access rule violation"
+template = "identifier exceeds the maximum length of {max} bytes"
+
 # --- feature not supported (class 0A) ---------------------------------------
 [[error]]
 code = "0A000"
@@ -300,9 +315,25 @@ class = "feature not supported"
 template = "feature not supported: {detail}"
 
 # --- program limit exceeded (class 54) --------------------------------------
-# A caller-imposed (or engine-fixed) limit was exceeded. The two §13 untrusted-query
+# A caller-imposed (or engine-fixed) limit was exceeded. The §13 untrusted-query
 # safety gates live here.
 #
+# 54000 program_limit_exceeded — the input SQL text exceeded the per-handle `max_sql_length`
+# byte limit (spec/design/api.md §8, cost.md §7). The §13 input-size gate, the sibling of the
+# nesting-depth gate below: both bound the parse BEFORE any cost is metered (the 54P01 cost
+# ceiling cannot catch parse-time blowup), and together they bound the parse tree in both
+# dimensions — depth (54001) and breadth/total size (54000). Because jed is single-statement
+# per call and nothing desugars super-linearly, bounding the input bytes transitively bounds the
+# parse-tree node count and the identifier length too. It is a per-handle setting (default 1 MiB,
+# `0` ⇒ unlimited) so a trusted caller can raise it; the cap (a byte count) is checked at the
+# handle's parse entry, deterministic and cross-core identical (§8). jed-specific (PostgreSQL has
+# no fixed query-length limit), asserted by the conformance corpus (resource.sql_length_limit).
+[[error]]
+code = "54000"
+name = "program_limit_exceeded"
+class = "program limit exceeded"
+template = "SQL statement exceeds the maximum length of {max} bytes"
+
 # 54001 statement_too_complex — a statement's expression / subquery / set-operation
 # nesting depth exceeds the engine's fixed maximum (spec/design/cost.md §7). This is the
 # native-stack-safety gate: the recursive-descent parser and the resolve/eval walks recurse

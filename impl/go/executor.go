@@ -54,6 +54,13 @@ type Outcome struct {
 // used for a fresh in-memory or newly-created database when no explicit size is given.
 const DefaultPageSize uint32 = 8192
 
+// DefaultMaxSQLLength is the default per-handle input-SQL byte limit (1 MiB — CLAUDE.md §13;
+// spec/design/api.md §8, cost.md §7). The §13 input-size gate's default ceiling: generous for
+// hand-written / ORM SQL, yet bounds the parse tree to a few MB so unbounded untrusted input
+// cannot exhaust memory. A caller raises it (trusted bulk loads) or sets 0 for unlimited via
+// SetMaxSQLLength. Identical across cores (§8).
+const DefaultMaxSQLLength = 1 << 20
+
 // Snapshot is an immutable committed (or in-progress working) database state — the catalog + each
 // table's store + the commit counter (spec/design/transactions.md §2). The committed state is one
 // of these; a write transaction builds a new one from it (the persistent stores clone O(1) —
@@ -408,6 +415,13 @@ type Database struct {
 	// reaches it. A handle setting (not stored in the file), set by SetMaxCost; the primary guard for
 	// safely evaluating untrusted, user-supplied queries.
 	maxCost int64
+	// maxSQLLength is the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
+	// §13; spec/design/api.md §8, cost.md §7). Default DefaultMaxSQLLength (1 MiB); 0 = unlimited
+	// (a trusted caller's opt-out). A statement whose text exceeds it is rejected with 54000 at
+	// the handle's parse entry — before lexing — so unbounded input cannot exhaust parse
+	// memory/CPU (the §13 input-size gate, which the cost meter cannot catch because parsing
+	// precedes metering). A handle setting (not stored in the file), set by SetMaxSQLLength.
+	maxSQLLength int
 	// readOnly marks a handle opened read-only (spec/design/api.md §2.1, OpenOptions.ReadOnly).
 	// A read-only handle behaves like PostgreSQL hot standby: every transaction defaults to READ
 	// ONLY, an explicit READ WRITE request and any write statement are 25006, and the file is
@@ -442,7 +456,7 @@ type activeTx struct {
 
 // NewDatabase builds an empty in-memory database.
 func NewDatabase() *Database {
-	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize, workMem: DefaultWorkMem}
+	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize, workMem: DefaultWorkMem, maxSQLLength: DefaultMaxSQLLength}
 }
 
 // WithPageSize returns an in-memory handle that serializes at pageSize. The page-backed B-tree's
@@ -450,7 +464,7 @@ func NewDatabase() *Database {
 // the size it will serialize to — this builds fixtures / tests a non-default page size; a normal
 // in-memory database uses NewDatabase (the default page size).
 func WithPageSize(pageSize uint32) *Database {
-	return &Database{committed: newSnapshot(), pageSize: pageSize, workMem: DefaultWorkMem}
+	return &Database{committed: newSnapshot(), pageSize: pageSize, workMem: DefaultWorkMem, maxSQLLength: DefaultMaxSQLLength}
 }
 
 // readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
@@ -497,6 +511,30 @@ func (db *Database) Path() string { return db.path }
 // is unlimited. The primary guard for safely evaluating untrusted, user-supplied queries; a handle
 // setting, not stored in the file.
 func (db *Database) SetMaxCost(limit int64) { db.maxCost = limit }
+
+// SetMaxSQLLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
+// §13; spec/design/api.md §8). A statement whose text exceeds bytes is rejected with 54000 at
+// parse entry, before lexing — the §13 input-size gate (cost.md §7). 0 is unlimited (a trusted
+// caller's opt-out); the default is DefaultMaxSQLLength (1 MiB). A handle setting, not stored in
+// the file (mirrors SetMaxCost).
+func (db *Database) SetMaxSQLLength(bytes int) { db.maxSQLLength = bytes }
+
+// MaxSQLLength is the current input-SQL byte limit (0 = unlimited). See SetMaxSQLLength.
+func (db *Database) MaxSQLLength() int { return db.maxSQLLength }
+
+// parse parses one statement from sql, first enforcing this handle's maxSQLLength input-size limit
+// (CLAUDE.md §13; spec/design/api.md §8, cost.md §7). The §13 input-size gate: an over-limit
+// statement is rejected with 54000 before lexing, so unbounded untrusted input cannot exhaust
+// parse memory/CPU (the cost meter cannot catch this — parsing precedes metering). maxSQLLength
+// == 0 is unlimited. Every handle-bound parse path routes through here (Execute/ExecuteParams/
+// Prepare/ExecuteSQL/the session handles), so the per-handle limit has no hole. The byte length is
+// len(sql) (Go strings are UTF-8).
+func (db *Database) parse(sql string) (Statement, error) {
+	if db.maxSQLLength > 0 && len(sql) > db.maxSQLLength {
+		return Statement{}, NewError(ProgramLimitExceeded, fmt.Sprintf("SQL statement exceeds the maximum length of %d bytes", db.maxSQLLength))
+	}
+	return ParseSQL(sql)
+}
 
 // SetRandomSource injects a random source for the uuid generators (spec/design/entropy.md §6) — the
 // deterministic / reproducible path. Pass SeededRandomSource for a byte-identical cross-core stream

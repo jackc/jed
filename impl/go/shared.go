@@ -96,7 +96,7 @@ func (s *SharedDB) Read() *ReadHandle {
 	s.core.liveMu.Unlock()
 	// Reads never mutate the snapshot (a write through the handle is rejected before dispatch), so
 	// the handle's Database shares the immutable pinned snapshot directly — no clone.
-	return &ReadHandle{core: s.core, version: snap.txid, db: &Database{committed: snap, pageSize: DefaultPageSize}}
+	return &ReadHandle{core: s.core, version: snap.txid, db: &Database{committed: snap, pageSize: DefaultPageSize, maxSQLLength: DefaultMaxSQLLength}}
 }
 
 // Write opens the write handle (transactions.md §10). Blocks until no other writer is active
@@ -107,7 +107,7 @@ func (s *SharedDB) Write() *WriteHandle {
 	s.core.writeMu.Lock()
 	base := s.core.committed.Load()
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
-	db := &Database{committed: base, pageSize: DefaultPageSize}
+	db := &Database{committed: base, pageSize: DefaultPageSize, maxSQLLength: DefaultMaxSQLLength}
 	_, _ = db.beginTx(true, true)
 	return &WriteHandle{core: s.core, db: db, baseVersion: base.txid}
 }
@@ -142,7 +142,7 @@ func (r *ReadHandle) Execute(sql string, params []Value) (Outcome, error) {
 // readOnly parses sql, rejects any write with 25006, and otherwise runs it against the pinned
 // snapshot.
 func (r *ReadHandle) readOnly(sql string, params []Value) (Outcome, error) {
-	stmt, err := ParseSQL(sql)
+	stmt, err := r.db.parse(sql)
 	if err != nil {
 		return Outcome{}, err
 	}

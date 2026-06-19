@@ -1,0 +1,51 @@
+# Identifier-length limit — a single identifier (table / column / type / alias / function name) may
+# be at most MAX_IDENTIFIER_LENGTH = 63 bytes; a longer one aborts with 42622 name_too_long
+# (CLAUDE.md §13; spec/design/cost.md §7). The input-hardening vector for names, alongside the
+# input-size (input_size_limit.test) and nesting-depth (depth_limit.test) gates: an unbounded
+# identifier would otherwise consume O(input) memory and land verbatim in the on-disk catalog/keys.
+#
+# The check sits in the LEXER, at the identifier-token producer, so it bounds EVERY identifier on
+# EVERY parse path (table, column, type, alias, function name, table reference) and fires during
+# tokenization, BEFORE the parser dispatches on the statement kind. Identifiers are ASCII-only
+# (grammar.md §3), so 63 bytes = 63 characters. 63 matches PostgreSQL's NAMEDATALEN-1 boundary, but
+# jed ERRORS where PG silently truncates (jed has no notices, and a silent truncation could collide
+# two distinct names — a documented divergence, CLAUDE.md §1). The limit is a fixed, cross-core
+# identical constant (CLAUDE.md §8): the 64-character names below are rejected, and the 63-character
+# names accepted, in Rust / Go / TS alike.
+#
+# jed-SPECIFIC (PG truncates rather than erroring), so the 42622 records are NOT oracle-checked.
+# requires: ddl.create_table, ddl.primary_key, query.select, types.int32, resource.identifier_length_limit
+
+# === Boundary: 63 bytes is the highest ACCEPTED identifier length. ===
+
+# A 63-character table name is accepted — the gate never perturbs an ordinary-length name.
+statement ok
+CREATE TABLE zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz (id int32 PRIMARY KEY)
+
+# A 63-character column name is accepted too.
+statement ok
+CREATE TABLE t63c (zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz int32 PRIMARY KEY)
+
+# === One byte over (64) aborts with 42622, in EVERY identifier position — the lexer catches it
+# during tokenization, before the parser dispatches on the statement kind. ===
+
+# A 64-character table name.
+statement error 42622
+CREATE TABLE zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz (id int32 PRIMARY KEY)
+
+# A 64-character column name.
+statement error 42622
+CREATE TABLE tbad (zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz int32 PRIMARY KEY)
+
+# A 64-character table reference in FROM (a read, not a definition — still bounded).
+statement error 42622
+SELECT id FROM zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+
+# A 64-character column alias. The lexer aborts before the alias is even parsed.
+statement error 42622
+SELECT 1 AS zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz
+
+# A 64-character function name. The lexer aborts before name resolution, so it is 42622
+# (name_too_long), not 42883 (undefined_function) — the length gate is the outermost check.
+statement error 42622
+SELECT zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz(1)

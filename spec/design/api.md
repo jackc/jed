@@ -300,6 +300,7 @@ only and the engine has no wire protocol).
 | rows cost | `rows.cost()` | `rows.Cost()` | `rows.cost` |
 | rows affected (§4) | `Outcome::Statement { rows_affected: Option<i64>, .. }` | `outcome.RowsAffected, outcome.HasRowsAffected` | `outcome.rowsAffected: number \| null` |
 | set cost ceiling (§8) | `db.set_max_cost(limit)` | `db.SetMaxCost(limit)` | `db.setMaxCost(limit)` |
+| set input-size limit (§8) | `db.set_max_sql_length(bytes)` | `db.SetMaxSQLLength(bytes)` | `db.setMaxSqlLength(bytes)` |
 | inject random source (§10) | `db.set_random_source(f)` / `db.clear_random_source()` | `db.SetRandomSource(f)` / `db.ClearRandomSource()` | `db.setRandomSource(f)` / `db.clearRandomSource()` |
 | inject clock source (§10) | `db.set_clock_source(f)` / `db.clear_clock_source()` | `db.SetClockSource(f)` / `db.ClearClockSource()` | `db.setClockSource(f)` / `db.clearClockSource()` |
 | table lookup (catalog) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*Table, bool)` | `db.table(name): Table \| undefined` |
@@ -367,6 +368,30 @@ It is a **handle setting**, not stored in the file and not a per-statement argum
 configures the budget once on whatever handle serves untrusted queries. A per-call override (an
 options object on `execute`/`prepare`) stays open for later without changing this surface. The
 `# max_cost: N` conformance directive (cost.md §6) exercises it cross-core.
+
+### Input-size limit (`max_sql_length`)
+
+A second untrusted-query safety setting bounds the work done **before** a statement runs — the
+parse — which the cost ceiling cannot reach (parsing precedes metering). The handle carries a
+**`max_sql_length`** setting — `db.set_max_sql_length(bytes)` / `db.SetMaxSQLLength(bytes)` /
+`db.setMaxSqlLength(bytes)` — that caps the input SQL text length, in **bytes**, of every statement
+parsed on it ([cost.md](cost.md) §7a):
+
+- The **default** is **1 MiB** (`DEFAULT_MAX_SQL_LENGTH`) — generous for hand-written / ORM SQL, yet
+  bounding the parse tree to a few MB.
+- `bytes > 0` ⇒ a statement whose UTF-8 byte length **exceeds** `bytes` is rejected with **`54000`**
+  (`program_limit_exceeded`) at parse entry, before lexing. The cap is the *maximum allowed* length
+  (a statement of exactly `bytes` runs; one byte over aborts).
+- `bytes == 0` ⇒ **unlimited** (a trusted caller's opt-out, e.g. a bulk load).
+
+Like `max_cost` it is a **handle setting**, not stored in the file, and the abort is deterministic
+and cross-core identical (same `(statement, max_sql_length)` → same outcome in Rust, Go, TS). It
+applies on **every** handle-bound parse path — `execute`/`execute_params`, `prepare`, and the
+session read/write handles — so the per-handle limit has no hole. Because jed is single-statement
+per call, this one byte cap also transitively bounds the parse-tree node count (cost.md §7a). A
+companion fixed limit, **`MAX_IDENTIFIER_LENGTH = 63` bytes** (`42622 name_too_long`, not a handle
+setting), bounds any single identifier. The `# max_sql_length: N` conformance directive exercises
+the input-size cap cross-core.
 
 ## 9. Non-goals this slice
 

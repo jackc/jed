@@ -199,7 +199,7 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 		SyntaxError, UndefinedTable, UndefinedColumn, UndefinedObject,
 		DatatypeMismatch, DuplicateTable, DuplicateColumn,
 		InvalidTableDefinition, IndeterminateDatatype, FeatureNotSupported,
-		StatementTooComplex, CostLimitExceeded,
+		NameTooLong, ProgramLimitExceeded, StatementTooComplex, CostLimitExceeded,
 		IoError, UndefinedFile, DuplicateFile, DataCorrupted,
 	} {
 		if _, ok := codes[st.Code()]; !ok {

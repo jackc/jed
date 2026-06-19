@@ -90,7 +90,7 @@ type PreparedStatement struct {
 // Prepare parses sql once into a reusable prepared statement (spec/design/api.md §2.4). Parse
 // errors (42601, …) surface here.
 func (db *Database) Prepare(sql string) (*PreparedStatement, error) {
-	stmt, err := ParseSQL(sql)
+	stmt, err := db.parse(sql)
 	if err != nil {
 		return nil, err
 	}

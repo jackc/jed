@@ -101,6 +101,13 @@ struct SelectResult {
 /// in-memory or newly-created database when no explicit size is given.
 pub const DEFAULT_PAGE_SIZE: u32 = 8192;
 
+/// The default per-handle input-SQL byte limit (1 MiB — CLAUDE.md §13; spec/design/api.md §8,
+/// cost.md §7). The §13 input-size gate's default ceiling: generous for hand-written / ORM SQL,
+/// yet bounds the parse tree to a few MB so unbounded untrusted input cannot exhaust memory. A
+/// caller raises it (trusted bulk loads) or sets `0` for unlimited via
+/// [`Database::set_max_sql_length`]. Identical across cores (§8).
+pub const DEFAULT_MAX_SQL_LENGTH: usize = 1 << 20;
+
 /// An immutable committed (or in-progress working) database state — the catalog + each table's
 /// store + the commit counter (spec/design/transactions.md §2). The committed state is one of
 /// these; a write transaction builds a new one from it (path-copying the persistent stores, so the
@@ -436,6 +443,14 @@ pub struct Database {
     /// in the file), set by [`set_max_cost`](Database::set_max_cost); the primary guard for
     /// safely evaluating untrusted, user-supplied queries.
     pub(crate) max_cost: i64,
+    /// The maximum input SQL length, in **bytes**, accepted on this handle (CLAUDE.md §13;
+    /// spec/design/api.md §8, cost.md §7). Default [`DEFAULT_MAX_SQL_LENGTH`] (1 MiB); `0` ⇒
+    /// **unlimited** (a trusted caller's opt-out). A statement whose text exceeds it is rejected
+    /// with `54000` at [`parse`](Database::parse) — **before** lexing — so unbounded input cannot
+    /// exhaust parse memory/CPU (the §13 input-size gate, which the cost meter cannot catch
+    /// because parsing precedes metering). A handle setting (not stored in the file), set by
+    /// [`set_max_sql_length`](Database::set_max_sql_length).
+    pub(crate) max_sql_length: usize,
     /// Whether this handle was opened **read-only** (spec/design/api.md §2.1,
     /// [`crate::file::OpenOptions::read_only`]). A read-only handle behaves like PostgreSQL
     /// hot standby: every transaction defaults to READ ONLY, an explicit `BEGIN READ WRITE`
@@ -498,6 +513,7 @@ impl Database {
             free_pages: Vec::new(),
             paging: None,
             max_cost: 0,
+            max_sql_length: DEFAULT_MAX_SQL_LENGTH,
             read_only: false,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             seam: crate::seam::Seam::default(),
@@ -519,6 +535,7 @@ impl Database {
             free_pages: Vec::new(),
             paging: None,
             max_cost: 0,
+            max_sql_length: DEFAULT_MAX_SQL_LENGTH,
             read_only: false,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             seam: crate::seam::Seam::default(),
@@ -599,6 +616,20 @@ impl Database {
     /// untrusted, user-supplied queries; a handle setting, not stored in the file.
     pub fn set_max_cost(&mut self, limit: i64) {
         self.max_cost = limit;
+    }
+
+    /// Set the maximum input SQL length, in **bytes**, accepted on this handle (CLAUDE.md §13;
+    /// spec/design/api.md §8). A statement whose text exceeds `bytes` is rejected with `54000`
+    /// at parse entry, before lexing — the §13 input-size gate (cost.md §7). `0` is **unlimited**
+    /// (a trusted caller's opt-out); the default is [`DEFAULT_MAX_SQL_LENGTH`] (1 MiB). A handle
+    /// setting, not stored in the file (mirrors `set_max_cost`).
+    pub fn set_max_sql_length(&mut self, bytes: usize) {
+        self.max_sql_length = bytes;
+    }
+
+    /// The current input-SQL byte limit (`0` ⇒ unlimited). See [`set_max_sql_length`](Database::set_max_sql_length).
+    pub fn max_sql_length(&self) -> usize {
+        self.max_sql_length
     }
 
     /// Whether this handle was opened read-only (spec/design/api.md §2.1): every transaction

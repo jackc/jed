@@ -42,7 +42,7 @@ pub mod value;
 pub use api::{PreparedStatement, Rows, Transaction};
 pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
-pub use executor::{DEFAULT_PAGE_SIZE, Database, Outcome, Snapshot};
+pub use executor::{DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Database, Outcome, Snapshot};
 pub use file::{DatabaseOptions, OpenOptions};
 pub use parser::Parser;
 pub use shared::{ReadHandle, SharedDb, WriteHandle};
@@ -297,6 +297,13 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Nesting-depth limit — a fixed MAX_EXPR_DEPTH checked in the parser aborts deeply-nested
     // input with 54001 before it can overflow the native stack (CLAUDE.md §13; cost.md §7).
     "resource.depth_limit",
+    // Input-size limit — a per-handle `max_sql_length` (default 1 MiB, 0 = unlimited) aborts an
+    // over-long statement with 54000 at parse entry, before lexing; the `# max_sql_length:`
+    // directive runs a record under a small cap (CLAUDE.md §13; cost.md §7, api.md §8).
+    "resource.sql_length_limit",
+    // Identifier-length limit — a fixed MAX_IDENTIFIER_LENGTH (63 bytes) checked at the lexer's
+    // identifier production aborts an over-long name with 42622, on every parse path (cost.md §7).
+    "resource.identifier_length_limit",
     // Pure built-in surface — no function/operator or statement reaches the host (filesystem,
     // network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
     // calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).
@@ -325,7 +332,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).
 pub fn execute(db: &mut Database, sql: &str) -> Result<Outcome> {
-    let stmt = Parser::parse_sql(sql)?;
+    let stmt = db.parse(sql)?;
     db.execute_stmt(stmt)
 }
 
@@ -334,6 +341,6 @@ pub fn execute(db: &mut Database, sql: &str) -> Result<Outcome> {
 /// cannot be inferred is `42P18`; a bound value out of range / of the wrong family fails like a
 /// literal (22003/42804/…).
 pub fn execute_params(db: &mut Database, sql: &str, params: &[Value]) -> Result<Outcome> {
-    let stmt = Parser::parse_sql(sql)?;
+    let stmt = db.parse(sql)?;
     db.execute_stmt_params(stmt, params)
 }

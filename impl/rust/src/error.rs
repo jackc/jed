@@ -114,8 +114,20 @@ pub enum SqlState {
     /// 2BP01 — dependent objects still exist: `DROP TYPE ... RESTRICT` of a composite type a
     /// column or another composite field still references (spec/design/composite.md §7).
     DependentObjectsStillExist,
+    /// 42622 — name too long: an identifier (table / column / type / alias / function name)
+    /// exceeds the engine's fixed maximum length of `parser::MAX_IDENTIFIER_LENGTH` = 63 bytes
+    /// (CLAUDE.md §13; spec/design/cost.md §7). Checked when the lexer builds an identifier token,
+    /// so it bounds every identifier on every parse path. PG's `42622 name_too_long`, but jed
+    /// errors where PG silently truncates (identifiers are ASCII-only, so bytes = characters).
+    NameTooLong,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
+    /// 54000 — program limit exceeded: the input SQL text exceeded the per-handle `max_sql_length`
+    /// byte limit (CLAUDE.md §13; spec/design/api.md §8, cost.md §7). The §13 input-size gate,
+    /// sibling of `StatementTooComplex`: both bound the parse before any cost is metered (the
+    /// `54P01` cost ceiling cannot catch parse-time blowup). A per-handle setting (default 1 MiB,
+    /// `0` ⇒ unlimited), checked at the handle's parse entry; deterministic + cross-core (§8).
+    ProgramLimitExceeded,
     /// 54001 — statement too complex: a statement's expression / subquery / set-operation nesting
     /// depth exceeds the engine's fixed maximum (`parser::MAX_EXPR_DEPTH`). The native-stack-safety
     /// gate for untrusted input — deeply-nested SQL would otherwise overflow the recursive-descent
@@ -179,8 +191,10 @@ impl SqlState {
             SqlState::UndefinedParameter => "42P02",
             SqlState::DuplicateObject => "42710",
             SqlState::WrongObjectType => "42809",
+            SqlState::NameTooLong => "42622",
             SqlState::DependentObjectsStillExist => "2BP01",
             SqlState::FeatureNotSupported => "0A000",
+            SqlState::ProgramLimitExceeded => "54000",
             SqlState::StatementTooComplex => "54001",
             SqlState::CostLimitExceeded => "54P01",
             SqlState::IoError => "58030",
