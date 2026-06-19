@@ -390,8 +390,12 @@ applies on **every** handle-bound parse path — `execute`/`execute_params`, `pr
 session read/write handles — so the per-handle limit has no hole. Because jed is single-statement
 per call, this one byte cap also transitively bounds the parse-tree node count (cost.md §7a). A
 companion fixed limit, **`MAX_IDENTIFIER_LENGTH = 63` bytes** (`42622 name_too_long`, not a handle
-setting), bounds any single identifier. The `# max_sql_length: N` conformance directive exercises
-the input-size cap cross-core.
+setting), bounds any single identifier. A third fixed limit, **`MAX_COMPOSITE_DEPTH = 32`**
+(`54001 statement_too_complex` at `CREATE TYPE`, `XX001` on a corrupt over-deep file; not a handle
+setting), bounds composite-type nesting — a chain of cheap `CREATE TYPE`s that neither the input-size
+cap nor the parser nesting limit sees, but whose recursive codec/comparator walks would overflow the
+native stack ([cost.md §7b](cost.md)). The `# max_sql_length: N` conformance directive exercises the
+input-size cap cross-core.
 
 ## 9. Non-goals this slice
 

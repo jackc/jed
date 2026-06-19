@@ -47,7 +47,8 @@ configure once on whatever handle serves untrusted queries:
   jed parses one statement per call, this also bounds the parse tree's size (a million-column
   `SELECT` is just bytes).
 
-Two further limits are fixed engine constants (no configuration): a statement may not nest
-expressions/subqueries more than **256** deep (`54001`), and a single identifier may not exceed
-**63 bytes** (`42622`). Each limit is deterministic and identical across the Rust, Go, and
-TypeScript cores.
+Three further limits are fixed engine constants (no configuration): a statement may not nest
+expressions/subqueries more than **256** deep (`54001`), a single identifier may not exceed
+**63 bytes** (`42622`), and a composite type may not nest more than **32** composites deep
+(`54001` at `CREATE TYPE` — a chain of small `CREATE TYPE`s that the input-size cap can't see).
+Each limit is deterministic and identical across the Rust, Go, and TypeScript cores.

@@ -204,6 +204,18 @@ export const DEFAULT_PAGE_SIZE = 8192;
 // setMaxSqlLength. Identical across cores (§8).
 export const DEFAULT_MAX_SQL_LENGTH = 1 << 20;
 
+// MAX_COMPOSITE_DEPTH is the maximum composite-type nesting depth (CLAUDE.md §13; cost.md §7b). A
+// composite type's depth is the length of its deepest chain of nested composites, counting itself: a
+// row of scalars is depth 1, `CREATE TYPE b AS (x a)` is `1 + depth(a)`, and an array field counts
+// as its element (array levels are not composite levels — compositeRefName looks through one array
+// level the same way). A CREATE TYPE whose result would exceed this is rejected 54001, and a loaded
+// catalog that exceeds it is treated as corrupt XX001 — bounding the native recursion of every
+// derived walk (value codec, comparator, record_out/record_in, resolveColType) at the two producers
+// (DDL + load) so all downstream walks are transitively stack-safe. A fixed, cross-core constant like
+// MAX_EXPR_DEPTH (§8). The chain is built across many cheap statements, so neither the per-statement
+// input-size cap nor the parser nesting counter sees it (cost.md §7).
+export const MAX_COMPOSITE_DEPTH = 32;
+
 // SQL_BYTE_ENCODER measures a statement's UTF-8 byte length for the input-size gate (cost.md §7),
 // matching the byte counts Rust (&str::len) and Go (len(string)) use, so the cap accepts / rejects
 // identically across cores (§8). A TextEncoder is available in Node and the browser (the OPFS
@@ -339,9 +351,12 @@ export class Snapshot {
   }
 
   // validateCompositeTypes validates the loaded composite-type catalog (the on-disk two-pass load —
-  // spec/design/composite.md §3): every composite a field references must exist, and the reference
-  // graph must be acyclic. A dangling or cyclic reference is a malformed file (XX001). Called once
-  // after the whole catalog is read.
+  // spec/design/composite.md §3): every composite a field references must exist, the reference graph
+  // must be acyclic, and no type may nest deeper than MAX_COMPOSITE_DEPTH. A dangling, cyclic, or
+  // over-deep reference is a malformed file (XX001). Called once after the whole catalog is read, and
+  // BEFORE any store is built — so the subsequent resolveColType walks (and every later
+  // value-codec/comparator walk) recurse over a depth-bounded catalog and stay stack-safe (CLAUDE.md
+  // §13; cost.md §7b).
   validateCompositeTypes(): void {
     // Existence: every composite a field references (directly, or as an array element —
     // compositeRefName looks through one array level) names a registered type.
@@ -356,32 +371,74 @@ export class Snapshot {
         }
       }
     }
-    // Acyclicity: DFS over the type → referenced-types graph (0 unvisited, 1 on-stack, 2 done).
+    // One DFS over the type → referenced-types graph that enforces BOTH acyclicity and the
+    // nesting-depth bound (color: 0 unvisited, 1 on-stack, 2 done; cache memoizes each done type's
+    // absolute nesting depth). Two guards make it stack-safe AND sound regardless of visitation
+    // order: levelsAbove >= MAX_COMPOSITE_DEPTH bounds the native recursion on a fresh descent, and
+    // the post-compute depth > MAX_COMPOSITE_DEPTH check catches an over-deep type reached via a
+    // memoized (color-2) shortcut — which the descent guard alone would miss when the catalog is
+    // colored bottom-up. Existence ran first, so every referenced type is present.
     const color = new Map<string, number>();
-    const visit = (key: string): void => {
+    const cache = new Map<string, number>();
+    const visit = (key: string, levelsAbove: number): number => {
+      if (levelsAbove >= MAX_COMPOSITE_DEPTH) {
+        throw engineError(
+          "data_corrupted",
+          `composite type nesting exceeds the maximum depth of ${MAX_COMPOSITE_DEPTH}`,
+        );
+      }
+      const c = color.get(key) ?? 0;
+      if (c === 1) {
+        throw engineError("data_corrupted", `composite type definition cycle through ${key}`);
+      }
+      if (c === 2) return cache.get(key) ?? 1;
       color.set(key, 1);
+      let child = 0;
       const ct = this.types.get(key);
       if (ct) {
         for (const f of ct.fields) {
           const r = compositeRefName(f.type);
-          if (r !== null) {
-            const ck = r.toLowerCase();
-            const c = color.get(ck) ?? 0;
-            if (c === 1) {
-              throw engineError(
-                "data_corrupted",
-                `composite type definition cycle through ${r}`,
-              );
-            }
-            if (c === 0) visit(ck);
-          }
+          if (r !== null) child = Math.max(child, visit(r.toLowerCase(), levelsAbove + 1));
         }
       }
+      const depth = 1 + child;
+      if (depth > MAX_COMPOSITE_DEPTH) {
+        throw engineError(
+          "data_corrupted",
+          `composite type nesting exceeds the maximum depth of ${MAX_COMPOSITE_DEPTH}`,
+        );
+      }
       color.set(key, 2);
+      cache.set(key, depth);
+      return depth;
     };
     for (const k of [...this.types.keys()]) {
-      if ((color.get(k) ?? 0) === 0) visit(k);
+      if ((color.get(k) ?? 0) === 0) visit(k, 0);
     }
+  }
+
+  // compositeTypeDepth returns the composite-type nesting depth of ty against this snapshot's type
+  // catalog, memoized in cache (lowercased name → depth): a scalar is 0, T[] is depth(T) (array
+  // levels are not composite levels — compositeRefName looks through one array level the same way),
+  // and a composite is 1 + max(field depths) (an empty composite is 1). The CREATE TYPE gate uses
+  // this against the *existing* catalog, every type of which already satisfies depth ≤
+  // MAX_COMPOSITE_DEPTH (the load + create invariant), so the recursion is bounded by the limit;
+  // memoization keeps a diamond-shaped reference graph linear (spec/design/cost.md §7b).
+  compositeTypeDepth(ty: Type, cache: Map<string, number>): number {
+    const r = compositeRefName(ty);
+    if (r === null) return 0; // a scalar (or a scalar array) adds no composite level
+    const key = r.toLowerCase();
+    const cached = cache.get(key);
+    if (cached !== undefined) return cached;
+    const def = this.types.get(key);
+    let depth = 1;
+    if (def) {
+      let child = 0;
+      for (const f of def.fields) child = Math.max(child, this.compositeTypeDepth(f.type, cache));
+      depth = 1 + child;
+    }
+    cache.set(key, depth);
+    return depth;
   }
 
   // store returns a table's store (the table is known to exist).
@@ -1689,6 +1746,23 @@ export class Database {
         throw engineError("undefined_object", "type does not exist: " + f.typeName);
       }
       fields.push({ name: f.name, type: fty, decimal: fdecimal, notNull: f.notNull });
+    }
+    // Bound composite-type nesting depth (CLAUDE.md §13; cost.md §7b). A chain of CREATE TYPEs each
+    // nesting the previous (`a`, `b AS (x a)`, …) builds unbounded depth across many cheap statements —
+    // invisible to the per-statement input-size cap and the parser nesting counter — and every derived
+    // recursive walk (codec, comparator, record_out/in, resolveColType) recurses to this depth. Reject
+    // at the producer so no over-deep type enters the catalog and every downstream walk stays
+    // stack-safe. Fields reference only existing types (each already ≤ MAX_COMPOSITE_DEPTH), so this
+    // depth computation's recursion is itself bounded.
+    const cache = new Map<string, number>();
+    let maxField = 0;
+    for (const f of fields) maxField = Math.max(maxField, this.readSnap().compositeTypeDepth(f.type, cache));
+    const depth = 1 + maxField;
+    if (depth > MAX_COMPOSITE_DEPTH) {
+      throw engineError(
+        "statement_too_complex",
+        `composite type ${ct.name} nesting depth ${depth} exceeds the maximum of ${MAX_COMPOSITE_DEPTH}`,
+      );
     }
     this.working().putType({ name: ct.name, fields });
     return { kind: "statement", cost: 0n, rowsAffected: null };

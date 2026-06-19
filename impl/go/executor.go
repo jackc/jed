@@ -61,6 +61,18 @@ const DefaultPageSize uint32 = 8192
 // SetMaxSQLLength. Identical across cores (§8).
 const DefaultMaxSQLLength = 1 << 20
 
+// maxCompositeDepth is the maximum composite-type nesting depth (CLAUDE.md §13; spec/design/cost.md
+// §7b). A composite type's depth is the length of its deepest chain of nested composites, counting
+// itself: a row of scalars is depth 1, `CREATE TYPE b AS (x a)` is `1 + depth(a)`, and an array
+// field counts as its element (array levels are not composite levels — CompositeRefOf looks through
+// one array level the same way). A CREATE TYPE whose result would exceed this is rejected 54001, and
+// a loaded catalog that exceeds it is treated as corrupt XX001 — bounding the native recursion of
+// every derived walk (value codec, comparator, record_out/record_in, ResolveColType) at the two
+// producers (DDL + load) so all downstream walks are transitively stack-safe. A fixed, cross-core
+// constant like maxExprDepth (§8). The chain is built across many cheap statements, so neither the
+// per-statement input-size cap nor the parser nesting counter sees it (cost.md §7).
+const maxCompositeDepth = 32
+
 // Snapshot is an immutable committed (or in-progress working) database state — the catalog + each
 // table's store + the commit counter (spec/design/transactions.md §2). The committed state is one
 // of these; a write transaction builds a new one from it (the persistent stores clone O(1) —
@@ -225,9 +237,12 @@ func (s *Snapshot) foreignKeyDependent(name string) (string, bool) {
 }
 
 // validateCompositeTypes validates the loaded composite-type catalog (the on-disk two-pass load —
-// spec/design/composite.md §3): every composite a field references must exist, and the reference
-// graph must be acyclic. A dangling or cyclic reference is a malformed file (XX001). Called once
-// after the whole catalog is read.
+// spec/design/composite.md §3): every composite a field references must exist, the reference graph
+// must be acyclic, and no type may nest deeper than maxCompositeDepth. A dangling, cyclic, or
+// over-deep reference is a malformed file (XX001). Called once after the whole catalog is read, and
+// BEFORE any store is built — so the subsequent ResolveColType walks (and every later
+// value-codec/comparator walk) recurse over a depth-bounded catalog and stay stack-safe (CLAUDE.md
+// §13; cost.md §7b).
 func (s *Snapshot) validateCompositeTypes() error {
 	// Existence: every nested-composite field names a registered type. Visit in name order so the
 	// first reported dangling reference is deterministic.
@@ -247,41 +262,91 @@ func (s *Snapshot) validateCompositeTypes() error {
 			}
 		}
 	}
-	// Acyclicity: DFS over the type → referenced-types graph (0 unvisited, 1 on-stack, 2 done).
+	// One DFS over the type → referenced-types graph that enforces BOTH acyclicity and the
+	// nesting-depth bound (color: 0 unvisited, 1 on-stack, 2 done; cache memoizes each done type's
+	// absolute nesting depth). Two guards make it stack-safe AND sound regardless of visitation
+	// order: levelsAbove >= maxCompositeDepth bounds the native recursion on a fresh descent, and the
+	// post-compute depth > maxCompositeDepth check catches an over-deep type reached via a memoized
+	// (color-2) shortcut — which the descent guard alone would miss when the catalog is colored
+	// bottom-up. Existence ran first, so every referenced type is present.
 	color := make(map[string]uint8)
-	var visit func(key string) error
-	visit = func(key string) error {
+	cache := make(map[string]int)
+	var visit func(key string, levelsAbove int) (int, error)
+	visit = func(key string, levelsAbove int) (int, error) {
+		if levelsAbove >= maxCompositeDepth {
+			return 0, NewError(DataCorrupted,
+				fmt.Sprintf("composite type nesting exceeds the maximum depth of %d", maxCompositeDepth))
+		}
+		switch color[key] {
+		case 1:
+			return 0, NewError(DataCorrupted, "composite type definition cycle through "+key)
+		case 2:
+			return cache[key], nil
+		}
 		color[key] = 1
+		child := 0
 		if ct, ok := s.types[key]; ok {
 			for _, f := range ct.Fields {
 				r := f.Type.CompositeRefOf()
 				if r == nil {
 					continue
 				}
-				ck := strings.ToLower(r.Name)
-				switch color[ck] {
-				case 1:
-					return NewError(DataCorrupted,
-						"composite type definition cycle through "+r.Name)
-				case 2:
-				default:
-					if err := visit(ck); err != nil {
-						return err
-					}
+				d, err := visit(strings.ToLower(r.Name), levelsAbove+1)
+				if err != nil {
+					return 0, err
+				}
+				if d > child {
+					child = d
 				}
 			}
 		}
+		depth := 1 + child
+		if depth > maxCompositeDepth {
+			return 0, NewError(DataCorrupted,
+				fmt.Sprintf("composite type nesting exceeds the maximum depth of %d", maxCompositeDepth))
+		}
 		color[key] = 2
-		return nil
+		cache[key] = depth
+		return depth, nil
 	}
 	for _, k := range keys {
 		if color[k] == 0 {
-			if err := visit(k); err != nil {
+			if _, err := visit(k, 0); err != nil {
 				return err
 			}
 		}
 	}
 	return nil
+}
+
+// compositeTypeDepth returns the composite-type nesting depth of ty against this snapshot's type
+// catalog, memoized in cache (lowercased name → depth): a scalar is 0, T[] is depth(T) (array levels
+// are not composite levels — CompositeRefOf looks through one array level the same way), and a
+// composite is 1 + max(field depths) (an empty composite is 1). The CREATE TYPE gate uses this
+// against the *existing* catalog, every type of which already satisfies depth ≤ maxCompositeDepth
+// (the load + create invariant), so the recursion is bounded by the limit; memoization keeps a
+// diamond-shaped reference graph linear (spec/design/cost.md §7b).
+func (s *Snapshot) compositeTypeDepth(ty Type, cache map[string]int) int {
+	r := ty.CompositeRefOf()
+	if r == nil {
+		return 0 // a scalar (or a scalar array) adds no composite level
+	}
+	key := strings.ToLower(r.Name)
+	if d, ok := cache[key]; ok {
+		return d
+	}
+	depth := 1
+	if def, ok := s.types[key]; ok {
+		child := 0
+		for _, f := range def.Fields {
+			if d := s.compositeTypeDepth(f.Type, cache); d > child {
+				child = d
+			}
+		}
+		depth = 1 + child
+	}
+	cache[key] = depth
+	return depth
 }
 
 // putTable registers a new table and its empty store. The store carries the page payload cap (=
@@ -1711,6 +1776,24 @@ func (db *Database) executeCreateType(ct *CreateType) (Outcome, error) {
 			return Outcome{}, NewError(UndefinedObject, "type does not exist: "+f.TypeName)
 		}
 		fields = append(fields, CompositeField{Name: f.Name, Type: fty, Decimal: fdecimal, NotNull: f.NotNull})
+	}
+	// Bound composite-type nesting depth (CLAUDE.md §13; cost.md §7b). A chain of CREATE TYPEs each
+	// nesting the previous (`a`, `b AS (x a)`, …) builds unbounded depth across many cheap statements —
+	// invisible to the per-statement input-size cap and the parser nesting counter — and every derived
+	// recursive walk (codec, comparator, record_out/in, ResolveColType) recurses to this depth. Reject
+	// at the producer so no over-deep type enters the catalog and every downstream walk stays
+	// stack-safe. Fields reference only existing types (each already ≤ maxCompositeDepth), so this
+	// depth computation's recursion is itself bounded.
+	cache := make(map[string]int)
+	maxField := 0
+	for _, f := range fields {
+		if d := db.readSnap().compositeTypeDepth(f.Type, cache); d > maxField {
+			maxField = d
+		}
+	}
+	if depth := 1 + maxField; depth > maxCompositeDepth {
+		return Outcome{}, NewError(StatementTooComplex,
+			fmt.Sprintf("composite type %s nesting depth %d exceeds the maximum of %d", ct.Name, depth, maxCompositeDepth))
 	}
 	db.working().putType(&CompositeType{Name: ct.Name, Fields: fields})
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil

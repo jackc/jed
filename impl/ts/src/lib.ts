@@ -252,6 +252,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Identifier-length limit — a fixed MAX_IDENTIFIER_LENGTH (63 bytes) checked at the lexer's
   // identifier production aborts an over-long name with 42622, on every parse path (cost.md §7).
   "resource.identifier_length_limit",
+  // Composite-type nesting-depth limit — a fixed MAX_COMPOSITE_DEPTH (32) bounds the depth of a
+  // composite-type chain at the producer: CREATE TYPE rejects an over-deep type with 54001, and a
+  // loaded catalog that exceeds it is XX001, keeping every derived recursive walk (codec,
+  // comparator, record_out/in, resolveColType) stack-safe (CLAUDE.md §13; cost.md §7b).
+  "resource.composite_depth_limit",
   // Pure built-in surface — no function/operator or statement reaches the host (filesystem,
   // network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
   // calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).

@@ -42,7 +42,9 @@ SELECT * FROM person WHERE home = ROW('Main', 90210)
   composite column.
 - **Field types** are any *existing* type — a built-in scalar or a previously-defined composite.
   **Nested composites are supported** (`CREATE TYPE line AS (a addr, b addr)`): every derived
-  method recurses. An unknown field type is `42704`.
+  method recurses. An unknown field type is `42704`. Nesting is bounded to `MAX_COMPOSITE_DEPTH`
+  (32) deep — a deeper chain aborts `54001` ([cost.md §7b](cost.md)), the untrusted-query
+  native-stack gate that keeps the recursive derived methods safe.
 - **`ROW(…)` constructor only.** The bare `(a, b, …)` row constructor (PostgreSQL's parenthesized
   form) is deferred (`0A000`) — it is parser-ambiguous with grouping/subqueries and adds no
   capability `ROW(…)` lacks. `ROW(x)` is a one-field row; `ROW()` is the zero-field row.
@@ -116,9 +118,14 @@ layout in [../fileformat/format.md](../fileformat/format.md)):
   `field_type_code = 14` + the referenced type's name, never an inline nested definition (PG's
   `atttypid` model; keeps the byte stream non-recursive). The loader is therefore **two-pass**:
   collect every composite-type entry into a name→definition map, then validate that every
-  referenced composite name exists and the reference graph is **acyclic**; only then build the
-  tables (resolving each composite column's name). A dangling reference or a definition **cycle**
-  is a malformed file — `XX001`.
+  referenced composite name exists, the reference graph is **acyclic**, and no type nests deeper
+  than `MAX_COMPOSITE_DEPTH` (32 — the nesting-depth gate, [cost.md §7b](cost.md)); only then build
+  the tables (resolving each composite column's name). A dangling reference, a definition **cycle**,
+  or an **over-deep chain** is a malformed file — `XX001`. The depth bound runs before any store is
+  built, so the `resolve_col_type` walk (and every later value-codec/comparator walk) recurses over
+  a depth-bounded catalog and stays stack-safe — a conformant engine never *writes* an over-deep
+  type (`CREATE TYPE` rejects it with `54001`), so an over-deep chain in a file is
+  tampering/corruption, like the cyclic case.
 - **`format_version` 9** is a clean break (the v9 reader rejects v8 and earlier, as v5/v6 did).
   All existing `.jed` goldens regenerate at the bump (the version byte, plus the new `entry_kind`
   byte on each table entry).
@@ -272,7 +279,8 @@ and are recorded in [../conformance/oracle_overrides.toml](../conformance/oracle
 | Malformed composite text literal | `22P02` invalid_text_representation |
 | `DROP TYPE … RESTRICT` with dependents | `2BP01` dependent_objects_still_exist |
 | `DROP TYPE` of a missing type (no `IF EXISTS`) | `42704` undefined_object |
-| Corrupt type catalog (dangling/cyclic field ref) | `XX001` data_corrupted |
+| `CREATE TYPE` nesting deeper than `MAX_COMPOSITE_DEPTH` (32) | `54001` statement_too_complex |
+| Corrupt type catalog (dangling/cyclic/over-deep field ref) | `XX001` data_corrupted |
 | Composite `PRIMARY KEY` / index / `UNIQUE`; bare `(a,b)`; anonymous `record`; `ALTER TYPE`; `DROP TYPE … CASCADE` | `0A000` feature_not_supported |
 
 ## 12. Delivery (sub-slices)

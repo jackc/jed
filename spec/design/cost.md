@@ -908,16 +908,16 @@ pins both directions cross-core (a just-under-limit statement runs; an over-limi
 `statement error 54001`), gated by the `resource.depth_limit` capability. Because the trigger
 is jed-specific (not PG's runtime probe), it is **not** oracle-checked.
 
-**Known follow-on (not this slice).** One recursion vector is *not* bounded by the
+**Composite-chain follow-on — ✅ landed (§7b).** One recursion vector is *not* bounded by the
 expression/query-nesting counter **or** by the input-size limit below: **deeply-nested `CREATE
 TYPE` composite chains** resolved at DDL time. The chain is built across *many* cheap, individually
 short statements (`CREATE TYPE a AS (…)`, `CREATE TYPE b AS (x a)`, …), so the per-statement
 input-size cap never sees it, and the depth is a property of the *catalog graph* (resolved at
-use/codec time), not a single statement's AST — so the nesting counter never sees it either. It
-needs its own catalog-resolution depth gate (the next slice). Any future grammar that recurses
-outside the expression / query-expression / set-op cascade is the same shape; both are noted so the
-seam's coverage boundary stays explicit. (Nested `ROW(…)` in `INSERT … VALUES` is already capped by
-an earlier engine error — `42601` at depth 2 — so it is not a vector.)
+use/codec time), not a single statement's AST — so the nesting counter never sees it either. It has
+its own catalog-resolution depth gate — the composite-type nesting limit in §7b. Any future grammar
+that recurses outside the expression / query-expression / set-op cascade is the same shape; both are
+noted so the seam's coverage boundary stays explicit. (Nested `ROW(…)` in `INSERT … VALUES` is
+already capped by an earlier engine error — `42601` at depth 2 — so it is not a vector.)
 
 ## 7a. Input-size and identifier-length limits (landed)
 
@@ -966,3 +966,56 @@ multi-byte case that pins UTF-8 byte counting; gated by `resource.sql_length_lim
 [../conformance/suites/resource/identifier_length.test](../conformance/suites/resource/identifier_length.test)
 pins the 63/64-byte identifier boundary in several positions; gated by
 `resource.identifier_length_limit`. Both are jed-specific, so **not** oracle-checked.
+
+## 7b. Composite-type nesting-depth limit (landed)
+
+§7's nesting counter and §7a's input-size cap both bound a **single statement** — its AST height
+(§7) and its total byte size (§7a). One native-stack vector escapes both: a **composite-type chain**
+built across *many* cheap statements (`CREATE TYPE c1 AS (x int32)`, `CREATE TYPE c2 AS (x c1)`, …).
+Each statement is tiny (under the input cap) and shallow (under the nesting counter), but the chain's
+**nesting depth grows without bound**, and that depth is a property of the *catalog graph* — resolved
+at use/codec time, not visible in any one statement's AST. Every recursive walk **derived** from a
+composite type (the value codec, the `eq3`/`lt3`/`gt3` comparator, `record_out`/`record_in`,
+`resolve_col_type`) recurses to this depth, so a long enough chain overflows the native call stack —
+the same hazard §7 guards for expressions, reached by a different door.
+
+**The gate — a fixed `MAX_COMPOSITE_DEPTH = 32`, enforced at the two producers of catalog types.** A
+composite type's *depth* is the length of its deepest chain of nested composites, counting itself: a
+row of scalars is depth 1, and `cN AS (x c{N-1})` is depth N. An **array field counts as its element
+type** — array levels are not composite levels (`composite_ref` looks through one array level the
+same way the dependency-tracking and two-pass-load paths do), so `c31[]` contributes depth 31, not
+32. The two producers:
+
+- **`CREATE TYPE` (the in-scope §13 query gate) → `54001` `statement_too_complex`.** A new composite
+  references only *existing* types (an unknown field type is `42704` — no forward references, so no
+  runtime cycle), each of which already satisfies depth ≤ `MAX_COMPOSITE_DEPTH` (the invariant this
+  gate maintains). So the new type's depth is `1 + max(field depths)`, computed by a small memoized
+  recursion bounded by the limit; if it would exceed `MAX_COMPOSITE_DEPTH` the statement aborts. This
+  is the **"bound at the producer"** rule §7 also follows: no over-deep type ever enters the catalog,
+  so every later derived walk is transitively stack-safe with zero per-walk guards.
+- **On-disk load (defense-in-depth) → `XX001` `data_corrupted`.** A conformant engine never *writes*
+  an over-deep type (creation rejects it), so an over-deep chain in a file means tampering/corruption
+  — treated like the existing dangling/cyclic-reference `XX001`. The two-pass load's acyclicity DFS
+  is **extended into one pass that enforces acyclicity *and* depth**: it tracks a memoized absolute
+  depth per type plus a descent guard. Both are needed — the descent guard (`levels_above >= MAX`)
+  bounds the native recursion so the DFS itself cannot overflow on a deep tampered chain, while the
+  post-compute `depth > MAX` value check catches an over-deep type reached through a memoized
+  (already-`done`) shortcut, which the descent guard alone would miss when the catalog is colored
+  bottom-up. The check runs **before** any store is built, so the subsequent `resolve_col_type` (and
+  every later codec/comparator) walk is over a depth-bounded catalog.
+
+**Why `32`, and why a fixed number.** Like `MAX_EXPR_DEPTH` (§7) it is a deterministic, cross-core
+constant — the same `CREATE TYPE` is accepted or rejected with `54001` in Rust, Go, and TS alike (§8)
+— rather than PG's runtime stack probe (PostgreSQL bounds composite nesting only by `check_stack_depth`,
+a build/platform-dependent `54001`). `32` sits far above any real schema (composites nest a handful
+deep in practice) yet well under the weakest core's native-stack limit for the derived codec/`record_in`
+recursion, whose per-level frames are heavier than a parser level — so a tighter cap than §7's `256`
+is the deliberate, defensible choice. It is a documented divergence from PG (the *overriding reason*:
+cross-core determinism + the weakest core's stack, CLAUDE.md §1/§8/§13).
+
+**Conformance.** [../conformance/suites/resource/composite_depth.test](../conformance/suites/resource/composite_depth.test)
+pins the boundary cross-core: the chain `c1`…`c32` is accepted (depth 32 is declarable as a column,
+exercising `resolve_col_type` 32 levels deep), `c33` aborts `54001`, depth is **max over fields not
+sum** (two depth-31 fields are still depth 32), and an **array field counts as its element** (a
+`c32[]` field is depth 33, rejected). Gated by `resource.composite_depth_limit`; jed-specific, so
+**not** oracle-checked.

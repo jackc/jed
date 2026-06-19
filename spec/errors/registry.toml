@@ -343,8 +343,12 @@ template = "SQL statement exceeds the maximum length of {max} bytes"
 # deterministically instead. This BORROWS PostgreSQL's condition name + code (PG raises 54001
 # `statement_too_complex` from check_stack_depth), but jed's trigger is a fixed nesting depth
 # (deterministic, cross-core identical — §8) rather than PG's runtime stack-pointer probe
-# (build-/platform-dependent). Asserted by the conformance corpus (the resource.depth_limit
-# capability), since the abort point is part of the cross-core contract (no reference impl, §2).
+# (build-/platform-dependent). A SECOND trigger is the composite-type nesting-depth gate
+# (spec/design/cost.md §7b): a CREATE TYPE whose result would nest deeper than MAX_COMPOSITE_DEPTH
+# (32) raises 54001 too — the same native-stack hazard reached via the catalog graph rather than a
+# single statement's AST (a corrupt over-deep file is XX001, not 54001). Asserted by the conformance
+# corpus (the resource.depth_limit and resource.composite_depth_limit capabilities), since the abort
+# point is part of the cross-core contract (no reference impl, §2).
 [[error]]
 code = "54001"
 name = "statement_too_complex"
