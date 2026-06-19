@@ -20,40 +20,6 @@ function rows1(ns: number[]): string[][] {
   return ns.map((n) => [String(n)]);
 }
 
-test("two-arg generate_series names and types its column", () => {
-  const db = new Database();
-  const out = execute(db, "SELECT * FROM generate_series(1, 5)");
-  assert.equal(out.kind, "query");
-  if (out.kind !== "query") return;
-  assert.deepStrictEqual(out.columnNames, ["generate_series"]);
-  // Integer literals default to int64, so the promoted column type is int64.
-  assert.deepStrictEqual(out.columnTypes, ["int64"]);
-  assert.deepStrictEqual(query(db, "SELECT * FROM generate_series(1, 5)"), rows1([1, 2, 3, 4, 5]));
-  // 5 generated_row + 5 row_produced; the integer-literal args are leaves (no operator_eval).
-  assert.equal(out.cost, 10n);
-});
-
-test("three-arg step and descending", () => {
-  const db = new Database();
-  assert.deepStrictEqual(query(db, "SELECT * FROM generate_series(1, 10, 2)"), rows1([1, 3, 5, 7, 9]));
-  assert.deepStrictEqual(query(db, "SELECT * FROM generate_series(5, 1, -1)"), rows1([5, 4, 3, 2, 1]));
-  assert.deepStrictEqual(query(db, "SELECT * FROM generate_series(3, 3)"), rows1([3]));
-});
-
-test("empty cases: start past stop and NULL args", () => {
-  const db = new Database();
-  assert.deepStrictEqual(query(db, "SELECT * FROM generate_series(5, 1)"), []);
-  assert.equal(cost(db, "SELECT * FROM generate_series(5, 1)"), 0n);
-  for (const sql of [
-    "SELECT * FROM generate_series(NULL, 5)",
-    "SELECT * FROM generate_series(1, NULL)",
-    "SELECT * FROM generate_series(1, 5, NULL)",
-  ]) {
-    assert.deepStrictEqual(query(db, sql), [], sql);
-    assert.equal(cost(db, sql), 0n, sql);
-  }
-});
-
 test("step of zero is invalid_parameter_value (22023)", () => {
   const db = new Database();
   assert.equal(errCode(() => execute(db, "SELECT * FROM generate_series(1, 5, 0)")), "22023");
@@ -74,44 +40,12 @@ test("alias forms and qualified column", () => {
   );
 });
 
-test("WHERE / ORDER BY / LIMIT compose", () => {
-  const db = new Database();
-  assert.deepStrictEqual(query(db, "SELECT * FROM generate_series(1, 5) WHERE generate_series > 2"), rows1([3, 4, 5]));
-  assert.deepStrictEqual(query(db, "SELECT * FROM generate_series(1, 5) ORDER BY generate_series DESC LIMIT 2"), rows1([5, 4]));
-});
-
-test("CROSS JOIN with a base table", () => {
-  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY)", "INSERT INTO t VALUES (10), (20)"]);
-  assert.deepStrictEqual(
-    query(db, "SELECT * FROM t CROSS JOIN generate_series(1, 3) ORDER BY id, generate_series"),
-    [
-      ["10", "1"],
-      ["10", "2"],
-      ["10", "3"],
-      ["20", "1"],
-      ["20", "2"],
-      ["20", "3"],
-    ],
-  );
-});
-
 test("$N parameter argument", () => {
   const db = new Database();
   const out = executeParams(db, "SELECT * FROM generate_series(1, $1)", [intValue(3n)]);
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
   assert.deepStrictEqual(out.rows.map((r) => r.map((v) => v.kind === "int" ? String(v.int) : "?")), [["1"], ["2"], ["3"]]);
-});
-
-test("correlated outer argument in a subquery (non-LATERAL)", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, n int32)",
-    "INSERT INTO t VALUES (1, 0), (2, 2), (3, 3)",
-  ]);
-  assert.deepStrictEqual(
-    query(db, "SELECT (SELECT count(*) FROM generate_series(1, o.n)) FROM t o ORDER BY id"),
-    rows1([0, 2, 3]),
-  );
 });
 
 test("a sibling reference is rejected (non-LATERAL)", () => {

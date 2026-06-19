@@ -12,7 +12,7 @@ import { join } from "node:path";
 import { test } from "node:test";
 import { Decimal } from "../src/decimal.ts";
 import { loadDatabase, toImage } from "../src/format.ts";
-import { create, Database, execute, render } from "../src/lib.ts";
+import { create, Database, execute } from "../src/lib.ts";
 import { canonFloat, float32Value, float64Value, floatTotalCmp, renderFloat } from "../src/value.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
@@ -187,29 +187,7 @@ test("float arithmetic: one op per node, width promotion, fround", () => {
   assert.deepEqual(query(db, "SELECT CAST('0.1' AS float32) + float '0'"), [["0.10000000149011612"]]);
 });
 
-test("float arithmetic traps: /0 → 22012, finite overflow → 22003, Inf/NaN propagate", () => {
-  const db = new Database();
-  assert.equal(errCode(() => void execute(db, "SELECT float '1.0' / float '0'")), "22012");
-  assert.equal(errCode(() => void execute(db, "SELECT float '1.0' % float '0'")), "22012");
-  assert.equal(errCode(() => void execute(db, "SELECT float '1e308' * float '10'")), "22003");
-  // float32 finite overflow traps too (3e38 + 3e38 overflows binary32).
-  assert.equal(errCode(() => void execute(db, "SELECT real '3e38' + real '3e38'")), "22003");
-  // An Inf/NaN OPERAND propagates (not a trap).
-  assert.deepEqual(query(db, "SELECT float 'Infinity' + float '1.0'"), [["Infinity"]]);
-  assert.deepEqual(query(db, "SELECT float 'Infinity' - float 'Infinity'"), [["NaN"]]); // Inf-Inf=NaN
-  assert.deepEqual(query(db, "SELECT float 'NaN' * float '0'"), [["NaN"]]);
-});
-
-// --- total order in SQL: =, <, NaN largest, -0==+0, NaN=NaN -----------------
-
-test("float comparison uses the total order (NaN=NaN true, -0=+0, NaN largest)", () => {
-  const db = new Database();
-  assert.deepEqual(query(db, "SELECT float 'NaN' = float 'NaN'"), [["true"]]);
-  assert.deepEqual(query(db, "SELECT float '-0' = float '0'"), [["true"]]);
-  assert.deepEqual(query(db, "SELECT float 'NaN' > float 'Infinity'"), [["true"]]);
-  assert.deepEqual(query(db, "SELECT float '-Infinity' < float '0'"), [["true"]]);
-  assert.deepEqual(query(db, "SELECT float '1.5' = float '1.5'"), [["true"]]);
-});
+// --- total order in SQL: ORDER BY / DISTINCT / GROUP BY ---------------------
 
 test("ORDER BY / DISTINCT over a float column: total order + -0/NaN dedup", () => {
   const db = dbWith([
@@ -224,15 +202,6 @@ test("ORDER BY / DISTINCT over a float column: total order + -0/NaN dedup", () =
 });
 
 // --- casts: strict matrix ----------------------------------------------------
-
-test("casts: explicit int↔float, decimal↔float, float↔float; half-away float→int", () => {
-  const db = new Database();
-  assert.deepEqual(query(db, "SELECT CAST(5 AS float64)"), [["5"]]);
-  assert.deepEqual(query(db, "SELECT CAST(float '3.75' AS decimal)"), [["3.75"]]);
-  assert.deepEqual(query(db, "SELECT CAST(CAST('1.5' AS float32) AS float64)"), [["1.5"]]); // widen implicit-castable, here explicit
-  assert.deepEqual(query(db, "SELECT CAST(float '2.5' AS int), CAST(float '-2.5' AS int)"), [["3", "-3"]]); // half away from zero
-  assert.deepEqual(query(db, "SELECT CAST(float '2.4' AS int), CAST(float '2.6' AS int)"), [["2", "3"]]);
-});
 
 // float→decimal must yield the EXACT decimal value of the IEEE float, NOT Number#toString's
 // shortest round-trip (which differs in layout across cores and would diverge the `D`-tag compare).
@@ -270,33 +239,7 @@ test("float→decimal is the EXACT decimal expansion (matches Go exactDecimalFro
   assert.equal(Decimal.exactFromFloat32(Math.fround(2.5)).render(), "2.5");
 });
 
-test("casts: NaN/±Inf → int and → decimal trap 22003; finite float→float32 overflow traps", () => {
-  const db = new Database();
-  for (const s of ["NaN", "Infinity", "-Infinity"]) {
-    assert.equal(errCode(() => void execute(db, `SELECT CAST(float '${s}' AS int)`)), "22003", s);
-    assert.equal(errCode(() => void execute(db, `SELECT CAST(float '${s}' AS decimal)`)), "22003", s);
-  }
-  // float64 → float32 lossy explicit cast; a value beyond binary32 range traps 22003.
-  assert.equal(errCode(() => void execute(db, "SELECT CAST(float '1e40' AS float32)")), "22003");
-  // ...but NaN/±Inf float→float32 propagate (first-class), not trap.
-  assert.deepEqual(query(db, "SELECT CAST(float 'Infinity' AS float32)"), [["Infinity"]]);
-});
-
 // --- strict island: no implicit int/decimal ⊕ float (42804) -----------------
-
-test("strict island: int/decimal VALUE ⊕/= float is 42804 (only literals adapt)", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id int PRIMARY KEY, i int, d decimal, a float64)",
-    "INSERT INTO t VALUES (1, 5, 2.5, 1.0)",
-  ]);
-  assert.equal(errCode(() => void execute(db, "SELECT i + a FROM t")), "42804");
-  assert.equal(errCode(() => void execute(db, "SELECT d * a FROM t")), "42804");
-  assert.equal(errCode(() => void execute(db, "SELECT i = a FROM t")), "42804");
-  assert.equal(errCode(() => void execute(db, "SELECT a < d FROM t")), "42804");
-  // A bare numeric LITERAL with a float sibling DOES adapt (literal adaptation, not value cast).
-  assert.deepEqual(query(db, "SELECT 1 + a FROM t"), [["2"]]);
-  assert.deepEqual(query(db, "SELECT a = 1.0 FROM t"), [["true"]]);
-});
 
 test("float64 value into a float32 column needs an explicit cast (42804)", () => {
   const db = dbWith([
@@ -316,52 +259,7 @@ test("float64 value into a float32 column needs an explicit cast (42804)", () =>
   assert.deepEqual(query(db2, "SELECT y FROM dst2"), [["1.5"]]);
 });
 
-// --- SUM / AVG: order-independent canonical-order fold ----------------------
-
-test("SUM/AVG over float: result keeps width; canonical fold; specials", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id int PRIMARY KEY, a float64, b float32)",
-    "INSERT INTO t VALUES (1, 1.0, 1.0), (2, 2.0, 2.0), (3, 3.0, 4.0)",
-  ]);
-  const o = execute(db, "SELECT sum(a), avg(a), sum(b), avg(b) FROM t");
-  if (o.kind !== "query") throw new Error("expected query");
-  assert.deepEqual(o.columnTypes, ["float64", "float64", "float32", "float32"]); // same_as_input
-  // avg(b) = fround(7.0 / 3) at binary32 = 2.3333332538604736 (the float32 division rounded once).
-  assert.deepEqual(o.rows.map((r) => r.map(render)), [["6", "2", "7", "2.3333332538604736"]]);
-  // Empty group → NULL.
-  assert.deepEqual(query(db, "SELECT sum(a), avg(a) FROM t WHERE id > 99"), [["NULL", "NULL"]]);
-});
-
-test("SUM canonical fold is order-independent (same multiset → same bit result)", () => {
-  // The canonical fold sorts by the total order before folding, so the row insertion order does not
-  // change the sum. Two tables with the SAME values in DIFFERENT order must give the identical sum —
-  // and a value where naive (insertion-order) summation would diverge (catastrophic cancellation:
-  // 1e16 + 1 - 1e16 loses the 1 in naive order but the canonical sort recovers determinism). Decimal
-  // literals adapt to the float64 column (INSERT VALUES takes plain literals, not `float '...'`).
-  const vals = ["10000000000000000.0", "1.0", "-10000000000000000.0", "0.5", "2.0", "-3.0"];
-  const fwd = vals.map((v, i) => `(${i}, ${v})`).join(", ");
-  const rev = vals
-    .slice()
-    .reverse()
-    .map((v, i) => `(${i}, ${v})`)
-    .join(", ");
-  const a = dbWith(["CREATE TABLE t (id int PRIMARY KEY, x float64)", `INSERT INTO t VALUES ${fwd}`]);
-  const b = dbWith(["CREATE TABLE t (id int PRIMARY KEY, x float64)", `INSERT INTO t VALUES ${rev}`]);
-  const sa = query(a, "SELECT sum(x) FROM t");
-  const sb = query(b, "SELECT sum(x) FROM t");
-  assert.deepEqual(sa, sb, "insertion order must not change the canonical-fold sum");
-});
-
-test("MIN/MAX over float use the total order; COUNT → int64", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id int PRIMARY KEY, a float64)",
-    "INSERT INTO t VALUES (1, 3.0), (2, -1.5), (3, 100.0)",
-  ]);
-  assert.deepEqual(query(db, "SELECT min(a), max(a) FROM t"), [["-1.5", "100"]]);
-  const o = execute(db, "SELECT count(a), min(a) FROM t");
-  if (o.kind !== "query") throw new Error("expected query");
-  assert.deepEqual(o.columnTypes, ["int64", "float64"]);
-});
+// --- GROUP BY: total-order bucketing ----------------------------------------
 
 test("GROUP BY a float column buckets by the total order", () => {
   const db = dbWith([
@@ -372,69 +270,6 @@ test("GROUP BY a float column buckets by the total order", () => {
     ["2.5", "2"],
     ["4", "1"],
   ]);
-});
-
-// --- scalar functions --------------------------------------------------------
-
-test("exact float functions: abs/ceil/floor/trunc/round/sqrt", () => {
-  const db = new Database();
-  assert.deepEqual(query(db, "SELECT abs(float '-1.5'), ceil(float '1.2'), floor(float '1.8')"), [
-    ["1.5", "2", "1"],
-  ]);
-  assert.deepEqual(query(db, "SELECT trunc(float '-1.7'), round(float '2.5'), round(float '3.14159', 2)"), [
-    ["-1", "3", "3.14"],
-  ]);
-  assert.deepEqual(query(db, "SELECT sqrt(float '2.0')"), [["1.4142135623730951"]]);
-  // abs over float32 preserves the width (the only operand-typed float func).
-  const o = execute(db, "SELECT abs(CAST('-1.5' AS float32))");
-  if (o.kind !== "query") throw new Error("expected query");
-  assert.deepEqual(o.columnTypes, ["float32"]);
-  assert.deepEqual(o.rows.map((r) => r.map(render)), [["1.5"]]);
-  // ceil/floor/etc. return float64 even for a float32 operand (catalog result "float64").
-  const o2 = execute(db, "SELECT ceil(CAST('1.2' AS float32))");
-  if (o2.kind !== "query") throw new Error("expected query");
-  assert.deepEqual(o2.columnTypes, ["float64"]);
-});
-
-test("float function domain errors: sqrt(neg)/ln(0)/ln(neg) → 22003; exp overflow → 22003", () => {
-  const db = new Database();
-  assert.equal(errCode(() => void execute(db, "SELECT sqrt(float '-1')")), "22003");
-  assert.equal(errCode(() => void execute(db, "SELECT ln(float '0')")), "22003");
-  assert.equal(errCode(() => void execute(db, "SELECT ln(float '-1')")), "22003");
-  assert.equal(errCode(() => void execute(db, "SELECT log10(float '0')")), "22003");
-  assert.equal(errCode(() => void execute(db, "SELECT exp(float '710')")), "22003");
-});
-
-test("transcendental functions evaluate (R-tag surface — values are exempted)", () => {
-  // One transcendental: exp(1) ≈ e. The R tag tolerates cross-core ULP; this core's value is
-  // Math.exp(1). The assertion is loose (a tolerance) to mirror the R-tag contract.
-  const o = execute(new Database(), "SELECT exp(float '1.0'), sin(float '0.0'), cos(float '0.0')");
-  if (o.kind !== "query") throw new Error("expected query");
-  const [e, s, c] = o.rows[0]!.map((v) => Number(render(v)));
-  assert.ok(Math.abs(e! - Math.E) < 1e-9, "exp(1) ≈ e");
-  assert.equal(s, 0);
-  assert.equal(c, 1);
-});
-
-test("pow promotes mixed widths to float64; finite overflow → 22003", () => {
-  const db = new Database();
-  assert.deepEqual(query(db, "SELECT pow(float '2.0', float '10.0')"), [["1024"]]);
-  assert.equal(errCode(() => void execute(db, "SELECT pow(float '10.0', float '400.0')")), "22003");
-});
-
-// --- keys: float not a valid PRIMARY KEY / index ----------------------------
-
-test("float is not a valid key: PRIMARY KEY and CREATE INDEX reject 0A000", () => {
-  const db = new Database();
-  assert.equal(errCode(() => void execute(db, "CREATE TABLE a (x float32 PRIMARY KEY)")), "0A000");
-  assert.equal(errCode(() => void execute(db, "CREATE TABLE b (x float64 PRIMARY KEY)")), "0A000");
-  // A table-level PRIMARY KEY over a float column is also 0A000 (the per-member key-type gate).
-  assert.equal(
-    errCode(() => void execute(db, "CREATE TABLE c (a float64, PRIMARY KEY (a))")),
-    "0A000",
-  );
-  const db2 = dbWith(["CREATE TABLE t (id int PRIMARY KEY, a float64)"]);
-  assert.equal(errCode(() => void execute(db2, "CREATE INDEX ix ON t (a)")), "0A000");
 });
 
 // --- value constructors (Math.fround invariant) -----------------------------

@@ -67,19 +67,6 @@ fn concat_null_prefers_cat() {
 }
 
 #[test]
-fn concat_precedence_and_assoc() {
-    let mut db = Database::new();
-    // || binds tighter than `=`: `a || b = c` is `(a || b) = c`.
-    assert_eq!(
-        val(&mut db, "SELECT ARRAY[1,2] || ARRAY[3] = ARRAY[1,2,3]"),
-        "true"
-    );
-    // Left-associative chaining: append then append; prepend then append.
-    assert_eq!(val(&mut db, "SELECT ARRAY[1] || 2 || 3"), "{1,2,3}");
-    assert_eq!(val(&mut db, "SELECT 0 || ARRAY[1,2] || 3"), "{0,1,2,3}");
-}
-
-#[test]
 fn concat_errors() {
     let mut db = Database::new();
     // Element-type conflict / non-array / text||text — no overload (42883).

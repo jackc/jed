@@ -156,37 +156,6 @@ func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
 	siRun(t, db, "DROP INDEX on")
 }
 
-// Index maintenance at INSERT/UPDATE/DELETE (indexes.md §4): the index-bounded scan
-// observes every mutation, including NULL transitions; an UPDATE that does not touch the
-// indexed column leaves the entries in place.
-func TestIndexMaintenanceTracksMutations(t *testing.T) {
-	db := siDB20(t)
-	siRun(t, db, "CREATE INDEX t_v_idx ON t (v)")
-	check := func(want ...int64) {
-		t.Helper()
-		got := siIds(t, db, "SELECT id FROM t WHERE v = 3 ORDER BY id")
-		if !slices.Equal(got, want) {
-			t.Fatalf("v = 3 ids = %v, want %v", got, want)
-		}
-	}
-	check(3, 8, 13, 18)
-	siRun(t, db, "UPDATE t SET v = 99 WHERE id = 3")
-	check(8, 13, 18)
-	if got := siIds(t, db, "SELECT id FROM t WHERE v = 99"); !slices.Equal(got, []int64{3}) {
-		t.Fatalf("v = 99 ids = %v", got)
-	}
-	siRun(t, db, "UPDATE t SET w = 0 WHERE id = 8") // non-indexed column: index untouched
-	check(8, 13, 18)
-	siRun(t, db, "UPDATE t SET v = NULL WHERE id = 8")
-	check(13, 18)
-	siRun(t, db, "UPDATE t SET v = 3 WHERE id = 8")
-	check(8, 13, 18)
-	siRun(t, db, "DELETE FROM t WHERE v = 3")
-	check()
-	siRun(t, db, "INSERT INTO t SELECT id + 100, 3, w FROM t WHERE v = 4")
-	check(104, 109, 114, 119)
-}
-
 // The planner picks the index for a first-column equality and the cost drops to the
 // index-bounded form (cost.md §3 "index-bounded scan"); a provably-empty bound reads
 // nothing; the PK bound wins over an index; the lowest-named index breaks ties.
@@ -219,19 +188,6 @@ func TestIndexPlannerCostsArePinned(t *testing.T) {
 	siRun(t, db, "DROP INDEX a_first")
 	siRun(t, db, "DROP INDEX two")
 	pin("SELECT id FROM t WHERE w = 7", 42) // full scan again
-}
-
-// LIMIT does not stream over an index bound (cost.md §3): the eager path reads the full
-// admitted set, so only row_produced drops.
-func TestIndexLimitTakesTheEagerPath(t *testing.T) {
-	db := siDB20(t)
-	siRun(t, db, "CREATE INDEX t_v_idx ON t (v)")
-	if got := siCost(t, db, "SELECT id FROM t WHERE v = 3"); got != 17 {
-		t.Fatalf("index scan cost = %d, want 17", got)
-	}
-	if got := siCost(t, db, "SELECT id FROM t WHERE v = 3 LIMIT 1"); got != 14 {
-		t.Fatalf("limited index scan cost = %d, want 14", got)
-	}
 }
 
 // The v5 image round-trips: index trees (including a NULL entry), the out-of-order PK

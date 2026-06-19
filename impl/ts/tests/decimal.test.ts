@@ -6,15 +6,10 @@ import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Decimal, MAX_INT_DIGITS } from "../src/decimal.ts";
 import { loadDatabase, toImage } from "../src/format.ts";
-import { Database, execute } from "../src/lib.ts";
+import { execute } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 const execD = execute;
-// freshErr runs one statement on a brand-new database, for error-path assertions (dbWith wraps
-// errors as plain Errors, hiding the EngineError that errCode needs).
-function freshErr(sql: string): string {
-  return errCode(() => void execute(new Database(), sql));
-}
 
 // dec parses "[-]int[.frac]" into a Decimal (mirrors the lexer/parser).
 function dec(s: string): Decimal {
@@ -135,50 +130,6 @@ function one(db: ReturnType<typeof dbWith>, sql: string): string {
   return rows[0]![0]!;
 }
 
-test("decimal storage preserves display scale (end to end)", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, v numeric)",
-    "INSERT INTO t VALUES (1, 1.50), (2, 1.5), (3, 0.00), (4, -0.013), (5, 123), (6, NULL)",
-  ]);
-  const want: Record<string, string> = { "1": "1.50", "2": "1.5", "3": "0.00", "4": "-0.013", "5": "123", "6": "NULL" };
-  for (const [id, w] of Object.entries(want)) assert.equal(one(db, `SELECT v FROM t WHERE id = ${id}`), w, id);
-});
-
-test("numeric(p,s) rounds + pads on store", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, money numeric(10,2))",
-    "INSERT INTO t VALUES (1, 1.5), (2, 1.555), (3, 1.554), (4, 5), (5, -2.5)",
-  ]);
-  const want: Record<string, string> = { "1": "1.50", "2": "1.56", "3": "1.55", "4": "5.00", "5": "-2.50" };
-  for (const [id, w] of Object.entries(want)) assert.equal(one(db, `SELECT money FROM t WHERE id = ${id}`), w, id);
-});
-
-test("decimal type/typmod/PK errors", () => {
-  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY, v numeric(3,2))"]);
-  assert.equal(errCode(() => void execD(db, "INSERT INTO t VALUES (1, 12.34)")), "22003");
-  assert.equal(freshErr("CREATE TABLE a (x numeric(0))"), "22023");
-  assert.equal(freshErr("CREATE TABLE c (x numeric(5,7))"), "22023");
-  assert.equal(freshErr("CREATE TABLE d (x int32(5))"), "0A000");
-  assert.equal(freshErr("CREATE TABLE k (k numeric PRIMARY KEY)"), "0A000");
-});
-
-test("decimal arithmetic + comparison + casts (end to end)", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, a numeric, b numeric, i int32)",
-    "INSERT INTO t VALUES (1, 1.50, 1.5, 3), (2, 1, 3, 2), (3, -5.5, 2, 0)",
-  ]);
-  assert.equal(one(db, "SELECT a + b FROM t WHERE id = 1"), "3.00");
-  assert.equal(one(db, "SELECT a / b FROM t WHERE id = 2"), "0.33333333333333333333");
-  assert.equal(one(db, "SELECT a % b FROM t WHERE id = 3"), "-1.5");
-  assert.equal(one(db, "SELECT a + i FROM t WHERE id = 1"), "4.50"); // mixed int + decimal
-  assert.equal(one(db, "SELECT CAST(i AS numeric(10,2)) FROM t WHERE id = 1"), "3.00");
-  assert.equal(one(db, "SELECT CAST(a AS int32) FROM t WHERE id = 1"), "2"); // 1.50 -> 2
-  assert.equal(one(db, "SELECT CAST(-2.5 AS int32) FROM t WHERE id = 1"), "-3");
-  assert.equal(errCode(() => void execD(db, "SELECT a / 0 FROM t WHERE id = 1")), "22012");
-  // comparison by value + integer↔decimal promotion
-  assert.deepStrictEqual(query(db, "SELECT id FROM t WHERE a = 1.5"), [["1"]]);
-});
-
 test("decimal on-disk round trip persists values + typmod", () => {
   const db = dbWith([
     "CREATE TABLE t (id int32 PRIMARY KEY, money numeric(10,2), free numeric)",
@@ -190,36 +141,6 @@ test("decimal on-disk round trip persists values + typmod", () => {
   assert.equal(one(loaded, "SELECT free FROM t WHERE id = 1"), "-12345.6789");
   execD(loaded, "INSERT INTO t VALUES (4, 9.999, 9.999)");
   assert.equal(one(loaded, "SELECT money FROM t WHERE id = 4"), "10.00"); // typmod persisted
-});
-
-test("DISTINCT collapses equal decimal values across scale", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, v numeric)",
-    "INSERT INTO t VALUES (1, 1.5), (2, 1.50), (3, 1.500), (4, 2.0)",
-  ]);
-  assert.deepStrictEqual(query(db, "SELECT DISTINCT v FROM t ORDER BY v"), [["1.5"], ["2.0"]]);
-});
-
-// The PG numeric-format caps (spec/design/decimal.md §2): the original 1000/1000 absolute cap
-// is lifted; the bounds are 131072 integer digits and scale 16383, 22003 past either; a value
-// AT both caps stores (spilling to overflow chains) and round-trips. Mirrors
-// impl/rust/tests/decimal.rs and impl/go/decimal_test.go.
-test("decimal format caps are PG's numeric limits", () => {
-  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY, v numeric)"]);
-  const overOld = "0." + "0".repeat(1001) + "1"; // scale 1002: legal now
-  execD(db, `INSERT INTO t VALUES (1, ${overOld})`);
-  assert.equal(one(db, "SELECT v FROM t WHERE id = 1"), overOld);
-  // scale > 16383 traps 22003 at resolve (PG numeric_in).
-  const overScale = "0." + "0".repeat(16383) + "1";
-  assert.equal(errCode(() => void execD(db, `INSERT INTO t VALUES (2, ${overScale})`)), "22003");
-  // integer digits > 131072 trap 22003 at resolve. (Dotted: a dot-less literal is an INTEGER
-  // literal, 42601 past i64 — types.md §6; the decimal path needs the `.`.)
-  const overInt = "1" + "0".repeat(131072) + ".0";
-  assert.equal(errCode(() => void execD(db, `INSERT INTO t VALUES (2, ${overInt})`)), "22003");
-  // exactly AT both caps is legal, stores, and round-trips.
-  const atCaps = "1" + "0".repeat(131071) + "." + "0".repeat(16382) + "1";
-  execD(db, `INSERT INTO t VALUES (3, ${atCaps})`);
-  assert.equal(one(db, "SELECT v FROM t WHERE id = 3"), atCaps);
 });
 
 // The SUM/AVG accumulator's addUncapped path (spec/design/decimal.md §2, determinism.md §7): the

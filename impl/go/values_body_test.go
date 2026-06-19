@@ -68,30 +68,6 @@ func TestValuesBodyMultiColumnAndRename(t *testing.T) {
 	}
 }
 
-func TestValuesBodyOptionalAlias(t *testing.T) {
-	db := dbWith(t)
-	// No alias at all (PG 18) — bare columns still resolve by their default names.
-	if got := queryIDs(t, db, "SELECT column1 FROM (VALUES (5), (6)) ORDER BY column1"); !eqInts(got, 5, 6) {
-		t.Errorf("unaliased got %v", got)
-	}
-}
-
-func TestValuesBodyGeneralExpressions(t *testing.T) {
-	db := dbWith(t)
-	// Arithmetic — richer than the literal-only INSERT … VALUES slot.
-	if got := queryIDs(t, db, "SELECT column1 FROM (VALUES (1 + 1), (2 * 3), (10 - 4)) AS v ORDER BY column1"); !eqInts(got, 2, 6, 6) {
-		t.Errorf("arithmetic got %v", got)
-	}
-	// A cast as a value (decimal -> int32 rounds half away from zero: 2.5 -> 3).
-	if got := queryIDs(t, db, "SELECT column1 FROM (VALUES (2.5 :: int32)) AS v"); !eqInts(got, 3) {
-		t.Errorf("cast got %v", got)
-	}
-	// A CASE expression as a value.
-	if got := queryIDs(t, db, "SELECT column1 FROM (VALUES (CASE WHEN true THEN 1 ELSE 0 END)) AS v"); !eqInts(got, 1) {
-		t.Errorf("case got %v", got)
-	}
-}
-
 func TestValuesBodyColumnTypeUnification(t *testing.T) {
 	db := dbWith(t)
 	// int + int -> int (all bare integer literals are int64 in jed).
@@ -113,26 +89,6 @@ func TestValuesBodyColumnTypeUnification(t *testing.T) {
 	// an all-NULL column is text (unknown -> text).
 	if got := valuesTypes(t, db, "SELECT column1 FROM (VALUES (NULL), (NULL)) AS v"); !eqStrs(got, "text") {
 		t.Errorf("all-NULL got %v", got)
-	}
-}
-
-func TestValuesBodyComposition(t *testing.T) {
-	db := dbWith(
-		t,
-		"CREATE TABLE t (id int32 PRIMARY KEY, k int32)",
-		"INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
-	)
-	if got := queryIDs(t, db, "SELECT column1 FROM (VALUES (1), (2), (3)) AS v WHERE column1 > 1 ORDER BY column1"); !eqInts(got, 2, 3) {
-		t.Errorf("WHERE got %v", got)
-	}
-	if got := queryIDs(t, db, "SELECT t.id FROM t JOIN (VALUES (1), (3)) AS v(id) ON t.id = v.id ORDER BY t.id"); !eqInts(got, 1, 3) {
-		t.Errorf("JOIN got %v", got)
-	}
-	if got := queryIDs(t, db, "SELECT max(column1) FROM (VALUES (1), (2), (3)) AS v"); !eqInts(got, 3) {
-		t.Errorf("aggregate got %v", got)
-	}
-	if got := queryIDs(t, db, "SELECT id FROM t WHERE id IN (SELECT column1 FROM (VALUES (1), (3)) AS v) ORDER BY id"); !eqInts(got, 1, 3) {
-		t.Errorf("inside IN-subquery got %v", got)
 	}
 }
 

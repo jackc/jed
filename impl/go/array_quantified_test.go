@@ -25,22 +25,6 @@ func TestQuantifiedAnyEqualityIsIn(t *testing.T) {
 	}
 }
 
-func TestQuantifiedAnyThreeValued(t *testing.T) {
-	db := NewDatabase()
-	cases := map[string]string{
-		"SELECT NULL::int64 = ANY(ARRAY[1,2,3])": "NULL",  // NULL x, non-empty → NULL
-		"SELECT 1 = ANY(ARRAY[2,NULL])":          "NULL",  // no TRUE, a NULL element → NULL
-		"SELECT 2 = ANY(ARRAY[2,NULL])":          "true",  // a TRUE match dominates a NULL
-		"SELECT 1 = ANY('{}'::int64[])":          "false", // empty → FALSE
-		"SELECT 1 = ANY(NULL::int64[])":          "NULL",  // NULL array → NULL
-	}
-	for sql, want := range cases {
-		if got := valArrayFunc(t, db, sql); got != want {
-			t.Errorf("%s = %q, want %q", sql, got, want)
-		}
-	}
-}
-
 func TestQuantifiedAll(t *testing.T) {
 	db := NewDatabase()
 	cases := map[string]string{

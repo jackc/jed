@@ -49,53 +49,6 @@ fn addr_db() -> Database {
 // ---- the builders / introspectors over composite elements (free via polymorphic resolution) ----
 
 #[test]
-fn builders_over_composite_elements() {
-    let mut db = addr_db();
-    // array_append / array_prepend / array_cat / || all manipulate the element list, element-agnostic.
-    assert_eq!(
-        val(
-            &mut db,
-            r#"SELECT array_append('{"(a,1)"}'::addr[], '(b,2)'::addr)"#
-        ),
-        r#"{"(a,1)","(b,2)"}"#
-    );
-    assert_eq!(
-        val(
-            &mut db,
-            r#"SELECT array_prepend('(z,0)'::addr, '{"(a,1)"}'::addr[])"#
-        ),
-        r#"{"(z,0)","(a,1)"}"#
-    );
-    assert_eq!(
-        val(
-            &mut db,
-            r#"SELECT array_cat('{"(a,1)"}'::addr[], '{"(b,2)"}'::addr[])"#
-        ),
-        r#"{"(a,1)","(b,2)"}"#
-    );
-    assert_eq!(
-        val(&mut db, r#"SELECT '{"(a,1)"}'::addr[] || '(b,2)'::addr"#),
-        r#"{"(a,1)","(b,2)"}"#
-    );
-    // A NULL/empty array is the builder identity (the non-strict `none` discipline).
-    assert_eq!(
-        val(
-            &mut db,
-            r#"SELECT array_append(NULL::addr[], '(a,1)'::addr)"#
-        ),
-        r#"{"(a,1)"}"#
-    );
-    // An element-type conflict is 42883 (the polymorphic unify rejects it).
-    assert_eq!(
-        err(
-            &mut db,
-            r#"SELECT array_cat('{"(a,1)"}'::addr[], ARRAY[1,2])"#
-        ),
-        "42883"
-    );
-}
-
-#[test]
 fn introspectors_over_composite_elements() {
     let mut db = addr_db();
     assert_eq!(
@@ -191,50 +144,6 @@ fn containment_over_composite_elements() {
             r#"SELECT (NULL::addr[] @> '{"(a,1)"}'::addr[]) IS NULL"#
         ),
         "true"
-    );
-}
-
-// ---- search/edit: NULL-safe element match (the inverse of containment's strict rule) ----
-
-#[test]
-fn search_edit_over_composite_elements() {
-    let mut db = addr_db();
-    // array_remove of a WHOLE-element NULL (NULL-safe — removes the NULL element).
-    assert_eq!(
-        val(
-            &mut db,
-            r#"SELECT array_remove('{"(a,1)",NULL}'::addr[], NULL::addr)"#
-        ),
-        r#"{"(a,1)"}"#
-    );
-    // array_remove of a composite with a NULL field (NULL-safe — matches it).
-    assert_eq!(
-        val(
-            &mut db,
-            r#"SELECT array_remove('{"(a,)","(b,2)"}'::addr[], '(a,)'::addr)"#
-        ),
-        r#"{"(b,2)"}"#
-    );
-    assert_eq!(
-        val(
-            &mut db,
-            r#"SELECT array_position('{"(a,1)","(b,2)"}'::addr[], '(b,2)'::addr)"#
-        ),
-        "2"
-    );
-    assert_eq!(
-        val(
-            &mut db,
-            r#"SELECT array_positions('{"(a,1)","(b,2)","(a,1)"}'::addr[], '(a,1)'::addr)"#
-        ),
-        "{1,3}"
-    );
-    assert_eq!(
-        val(
-            &mut db,
-            r#"SELECT array_replace('{"(a,1)"}'::addr[], '(a,1)'::addr, '(z,9)'::addr)"#
-        ),
-        r#"{"(z,9)"}"#
     );
 }
 

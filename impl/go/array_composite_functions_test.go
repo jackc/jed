@@ -47,16 +47,6 @@ func eq(t *testing.T, got, want, what string) {
 	}
 }
 
-func TestAF7BuildersOverComposite(t *testing.T) {
-	db := addrDB(t)
-	eq(t, val1(t, db, `SELECT array_append('{"(a,1)"}'::addr[], '(b,2)'::addr)`), `{"(a,1)","(b,2)"}`, "array_append")
-	eq(t, val1(t, db, `SELECT array_prepend('(z,0)'::addr, '{"(a,1)"}'::addr[])`), `{"(z,0)","(a,1)"}`, "array_prepend")
-	eq(t, val1(t, db, `SELECT array_cat('{"(a,1)"}'::addr[], '{"(b,2)"}'::addr[])`), `{"(a,1)","(b,2)"}`, "array_cat")
-	eq(t, val1(t, db, `SELECT '{"(a,1)"}'::addr[] || '(b,2)'::addr`), `{"(a,1)","(b,2)"}`, "||")
-	eq(t, val1(t, db, `SELECT array_append(NULL::addr[], '(a,1)'::addr)`), `{"(a,1)"}`, "append NULL identity")
-	eq(t, errArray(t, db, `SELECT array_cat('{"(a,1)"}'::addr[], ARRAY[1,2])`), "42883", "element conflict")
-}
-
 func TestAF7IntrospectorsOverComposite(t *testing.T) {
 	db := addrDB(t)
 	eq(t, val1(t, db, `SELECT array_length('{"(a,1)","(b,2)"}'::addr[], 1)`), "2", "array_length")
@@ -76,15 +66,6 @@ func TestAF7ContainmentOverComposite(t *testing.T) {
 	eq(t, val1(t, db, `SELECT '{"(a,1)"}'::addr[] <@ '{"(a,1)","(b,2)"}'::addr[]`), "true", "<@")
 	eq(t, val1(t, db, `SELECT '{"(a,1)"}'::addr[] && '{"(a,1)","(b,2)"}'::addr[]`), "true", "&&")
 	eq(t, val1(t, db, `SELECT (NULL::addr[] @> '{"(a,1)"}'::addr[]) IS NULL`), "true", "@> NULL whole-array")
-}
-
-func TestAF7SearchEditOverComposite(t *testing.T) {
-	db := addrDB(t)
-	eq(t, val1(t, db, `SELECT array_remove('{"(a,1)",NULL}'::addr[], NULL::addr)`), `{"(a,1)"}`, "array_remove whole-NULL")
-	eq(t, val1(t, db, `SELECT array_remove('{"(a,)","(b,2)"}'::addr[], '(a,)'::addr)`), `{"(b,2)"}`, "array_remove NULL-field")
-	eq(t, val1(t, db, `SELECT array_position('{"(a,1)","(b,2)"}'::addr[], '(b,2)'::addr)`), "2", "array_position")
-	eq(t, val1(t, db, `SELECT array_positions('{"(a,1)","(b,2)","(a,1)"}'::addr[], '(a,1)'::addr)`), "{1,3}", "array_positions")
-	eq(t, val1(t, db, `SELECT array_replace('{"(a,1)"}'::addr[], '(a,1)'::addr, '(z,9)'::addr)`), `{"(z,9)"}`, "array_replace")
 }
 
 // The AF7 code change #2: x op ANY/ALL(composite[]) uses the composite TOTAL ORDER, not bare-ROW 3VL.

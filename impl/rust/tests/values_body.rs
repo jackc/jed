@@ -10,14 +10,6 @@
 use jed::value::Value;
 use jed::{Database, Outcome, execute, execute_params};
 
-fn db_with(stmts: &[&str]) -> Database {
-    let mut db = Database::new();
-    for s in stmts {
-        execute(&mut db, s).unwrap_or_else(|e| panic!("setup {s:?}: {}", e.message));
-    }
-    db
-}
-
 fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
     match execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message)) {
         Outcome::Query { rows, .. } => rows,
@@ -101,47 +93,6 @@ fn multi_column_and_rename_list() {
     );
 }
 
-#[test]
-fn optional_alias() {
-    let mut db = Database::new();
-    // No alias at all (PG 18) — bare columns still resolve by their default names.
-    assert_eq!(
-        ints(
-            &mut db,
-            "SELECT column1 FROM (VALUES (5), (6)) ORDER BY column1"
-        ),
-        vec![5, 6]
-    );
-}
-
-// ---- general constant expressions (the PG-faithful surface, richer than INSERT … VALUES) -----
-
-#[test]
-fn general_constant_expressions() {
-    let mut db = Database::new();
-    // Arithmetic — constant-folded per row (richer than the literal-only INSERT … VALUES slot).
-    assert_eq!(
-        ints(
-            &mut db,
-            "SELECT column1 FROM (VALUES (1 + 1), (2 * 3), (10 - 4)) AS v ORDER BY column1"
-        ),
-        vec![2, 6, 6]
-    );
-    // A cast as a value (decimal -> int32 rounds half away from zero: 2.5 -> 3).
-    assert_eq!(
-        ints(&mut db, "SELECT column1 FROM (VALUES (2.5 :: int32)) AS v"),
-        vec![3]
-    );
-    // A CASE expression as a value.
-    assert_eq!(
-        ints(
-            &mut db,
-            "SELECT column1 FROM (VALUES (CASE WHEN true THEN 1 ELSE 0 END)) AS v"
-        ),
-        vec![1]
-    );
-}
-
 // ---- per-column type unification across rows --------------------------------------------------
 
 #[test]
@@ -181,54 +132,6 @@ fn column_type_unification() {
 }
 
 // ---- composition ------------------------------------------------------------------------------
-
-#[test]
-fn composes_with_where_join_aggregate() {
-    let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, k int32)",
-        "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
-    ]);
-    // WHERE over the VALUES relation.
-    assert_eq!(
-        ints(
-            &mut db,
-            "SELECT column1 FROM (VALUES (1), (2), (3)) AS v WHERE column1 > 1 ORDER BY column1"
-        ),
-        vec![2, 3]
-    );
-    // JOIN a base table against a VALUES relation.
-    assert_eq!(
-        ints(
-            &mut db,
-            "SELECT t.id FROM t JOIN (VALUES (1), (3)) AS v(id) ON t.id = v.id ORDER BY t.id"
-        ),
-        vec![1, 3]
-    );
-    // Aggregate over a VALUES relation (max returns the int column type; sum widens to decimal).
-    assert_eq!(
-        ints(
-            &mut db,
-            "SELECT max(column1) FROM (VALUES (1), (2), (3)) AS v"
-        ),
-        vec![3]
-    );
-}
-
-#[test]
-fn reachable_inside_a_subquery() {
-    let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
-        "INSERT INTO t VALUES (1), (2), (5)",
-    ]);
-    // A VALUES body inside an IN-subquery.
-    assert_eq!(
-        ints(
-            &mut db,
-            "SELECT id FROM t WHERE id IN (SELECT column1 FROM (VALUES (1), (5)) AS v) ORDER BY id"
-        ),
-        vec![1, 5]
-    );
-}
 
 #[test]
 fn params_typed_by_sibling_rows() {

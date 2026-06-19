@@ -114,30 +114,6 @@ test("DDL errors match PostgreSQL", () => {
   run(db, "DROP INDEX on");
 });
 
-test("maintenance tracks mutations", () => {
-  // Index maintenance at INSERT/UPDATE/DELETE (indexes.md §4): the index-bounded scan
-  // observes every mutation, including NULL transitions; an UPDATE that does not touch
-  // the indexed column leaves the entries in place.
-  const db = db20();
-  run(db, "CREATE INDEX t_v_idx ON t (v)");
-  const check = (...want: bigint[]) =>
-    assert.deepEqual(ids(db, "SELECT id FROM t WHERE v = 3 ORDER BY id"), want);
-  check(3n, 8n, 13n, 18n);
-  run(db, "UPDATE t SET v = 99 WHERE id = 3");
-  check(8n, 13n, 18n);
-  assert.deepEqual(ids(db, "SELECT id FROM t WHERE v = 99"), [3n]);
-  run(db, "UPDATE t SET w = 0 WHERE id = 8"); // non-indexed column: index untouched
-  check(8n, 13n, 18n);
-  run(db, "UPDATE t SET v = NULL WHERE id = 8");
-  check(13n, 18n);
-  run(db, "UPDATE t SET v = 3 WHERE id = 8");
-  check(8n, 13n, 18n);
-  run(db, "DELETE FROM t WHERE v = 3");
-  check();
-  run(db, "INSERT INTO t SELECT id + 100, 3, w FROM t WHERE v = 4");
-  check(104n, 109n, 114n, 119n);
-});
-
 test("planner costs are pinned", () => {
   // The planner picks the index for a first-column equality and the cost drops to the
   // index-bounded form (cost.md §3 "index-bounded scan"); a provably-empty bound reads
@@ -162,15 +138,6 @@ test("planner costs are pinned", () => {
   run(db, "DROP INDEX a_first");
   run(db, "DROP INDEX two");
   assert.equal(cost(db, "SELECT id FROM t WHERE w = 7"), 42n); // full scan again
-});
-
-test("LIMIT takes the eager path over an index", () => {
-  // LIMIT does not stream over an index bound (cost.md §3): the eager path reads the
-  // full admitted set, so only row_produced drops.
-  const db = db20();
-  run(db, "CREATE INDEX t_v_idx ON t (v)");
-  assert.equal(cost(db, "SELECT id FROM t WHERE v = 3"), 17n);
-  assert.equal(cost(db, "SELECT id FROM t WHERE v = 3 LIMIT 1"), 14n);
 });
 
 test("round-trips through the on-disk image", () => {

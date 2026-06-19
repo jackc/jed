@@ -49,50 +49,6 @@ func eqGenInts(t *testing.T, got, want []int64, ctx string) {
 	}
 }
 
-func TestGenerateSeriesTwoArgNamesAndTypes(t *testing.T) {
-	db := NewDatabase()
-	out, err := Execute(db, "SELECT * FROM generate_series(1, 5)")
-	if err != nil {
-		t.Fatalf("generate_series(1,5): %v", err)
-	}
-	if len(out.ColumnNames) != 1 || out.ColumnNames[0] != "generate_series" {
-		t.Errorf("column names: %v", out.ColumnNames)
-	}
-	if len(out.ColumnTypes) != 1 || out.ColumnTypes[0] != "int64" {
-		t.Errorf("column types: %v", out.ColumnTypes)
-	}
-	eqGenInts(t, genInts(t, db, "SELECT * FROM generate_series(1, 5)"), []int64{1, 2, 3, 4, 5}, "two-arg")
-	// 5 generated_row + 5 row_produced; the integer-literal args are leaves (no operator_eval).
-	if out.Cost != 10 {
-		t.Errorf("cost = %d, want 10", out.Cost)
-	}
-}
-
-func TestGenerateSeriesStepsAndDescending(t *testing.T) {
-	db := NewDatabase()
-	eqGenInts(t, genInts(t, db, "SELECT * FROM generate_series(1, 10, 2)"), []int64{1, 3, 5, 7, 9}, "step")
-	eqGenInts(t, genInts(t, db, "SELECT * FROM generate_series(5, 1, -1)"), []int64{5, 4, 3, 2, 1}, "descending")
-	eqGenInts(t, genInts(t, db, "SELECT * FROM generate_series(3, 3)"), []int64{3}, "single")
-}
-
-func TestGenerateSeriesEmptyCases(t *testing.T) {
-	db := NewDatabase()
-	eqGenInts(t, genInts(t, db, "SELECT * FROM generate_series(5, 1)"), []int64{}, "start past stop")
-	if c := costOf(t, db, "SELECT * FROM generate_series(5, 1)"); c != 0 {
-		t.Errorf("empty cost = %d, want 0", c)
-	}
-	for _, sql := range []string{
-		"SELECT * FROM generate_series(NULL, 5)",
-		"SELECT * FROM generate_series(1, NULL)",
-		"SELECT * FROM generate_series(1, 5, NULL)",
-	} {
-		eqGenInts(t, genInts(t, db, sql), []int64{}, sql)
-		if c := costOf(t, db, sql); c != 0 {
-			t.Errorf("%s cost = %d, want 0", sql, c)
-		}
-	}
-}
-
 func TestGenerateSeriesZeroStep(t *testing.T) {
 	db := NewDatabase()
 	_, err := Execute(db, "SELECT * FROM generate_series(1, 5, 0)")
@@ -123,28 +79,6 @@ func TestGenerateSeriesAliasAndQualified(t *testing.T) {
 	eqGenInts(t, genInts(t, db, "SELECT generate_series.generate_series FROM generate_series(1, 2)"), []int64{1, 2}, "no alias label")
 }
 
-func TestGenerateSeriesComposition(t *testing.T) {
-	db := NewDatabase()
-	eqGenInts(t, genInts(t, db, "SELECT * FROM generate_series(1, 5) WHERE generate_series > 2"), []int64{3, 4, 5}, "where")
-	eqGenInts(t, genInts(t, db, "SELECT * FROM generate_series(1, 5) ORDER BY generate_series DESC LIMIT 2"), []int64{5, 4}, "order-limit")
-}
-
-func TestGenerateSeriesCrossJoin(t *testing.T) {
-	db := NewDatabase()
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
-	mustExec(t, db, "INSERT INTO t VALUES (10), (20)")
-	rows := query(t, db, "SELECT * FROM t CROSS JOIN generate_series(1, 3) ORDER BY id, generate_series")
-	want := [][2]int64{{10, 1}, {10, 2}, {10, 3}, {20, 1}, {20, 2}, {20, 3}}
-	if len(rows) != len(want) {
-		t.Fatalf("got %d rows, want %d", len(rows), len(want))
-	}
-	for i, r := range rows {
-		if r[0].Int != want[i][0] || r[1].Int != want[i][1] {
-			t.Errorf("row %d = (%d,%d), want %v", i, r[0].Int, r[1].Int, want[i])
-		}
-	}
-}
-
 func TestGenerateSeriesParam(t *testing.T) {
 	db := NewDatabase()
 	out, err := ExecuteParams(db, "SELECT * FROM generate_series(1, $1)", []Value{IntValue(3)})
@@ -156,16 +90,6 @@ func TestGenerateSeriesParam(t *testing.T) {
 		got[i] = r[0].Int
 	}
 	eqGenInts(t, got, []int64{1, 2, 3}, "param")
-}
-
-func TestGenerateSeriesCorrelatedOuterArg(t *testing.T) {
-	db := NewDatabase()
-	mustExec(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, n int32)")
-	mustExec(t, db, "INSERT INTO t VALUES (1, 0), (2, 2), (3, 3)")
-	// The inner generate_series arg references the outer row's n (non-LATERAL). Counts 0, 2, 3.
-	eqGenInts(t, genInts(t, db,
-		"SELECT (SELECT count(*) FROM generate_series(1, o.n)) FROM t o ORDER BY id"),
-		[]int64{0, 2, 3}, "correlated")
 }
 
 func TestGenerateSeriesSiblingReferenceRejected(t *testing.T) {

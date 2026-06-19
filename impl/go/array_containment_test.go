@@ -80,21 +80,6 @@ func TestContainmentNullWholeArrayPropagates(t *testing.T) {
 	}
 }
 
-func TestContainmentAnyDimensionality(t *testing.T) {
-	db := NewDatabase()
-	// No 1-D restriction — the comparison is over the flattened element multiset.
-	cases := map[string]string{
-		"SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] @> ARRAY[3]":   "true",
-		"SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] && ARRAY[4,9]": "true",
-		"SELECT '[5:7]={10,20,30}'::int32[] @> ARRAY[20]":   "true",
-	}
-	for sql, want := range cases {
-		if got := valArrayFunc(t, db, sql); got != want {
-			t.Errorf("%s = %q, want %q", sql, got, want)
-		}
-	}
-}
-
 func TestContainmentPrecedenceAndAdaptation(t *testing.T) {
 	db := NewDatabase()
 	cases := map[string]string{

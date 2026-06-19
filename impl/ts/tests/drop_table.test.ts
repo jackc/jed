@@ -4,7 +4,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { execute } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 test("drop removes the table and its rows", () => {
@@ -16,26 +16,6 @@ test("drop removes the table and its rows", () => {
   assert.deepStrictEqual(out, { kind: "statement", cost: 0n, rowsAffected: null });
   assert.equal(db.table("t"), undefined);
   assert.deepStrictEqual(db.rowsInKeyOrder("t"), []);
-});
-
-test("every access path against a dropped table traps 42P01", () => {
-  const db = dbWith(["CREATE TABLE t (id int32 PRIMARY KEY, v int16)", "DROP TABLE t"]);
-  for (const sql of [
-    "SELECT id FROM t",
-    "INSERT INTO t VALUES (1, 1)",
-    "UPDATE t SET v = 0",
-    "DELETE FROM t",
-  ]) {
-    assert.equal(errCode(() => execute(db, sql)), "42P01", sql);
-  }
-});
-
-test("dropping a missing table traps 42P01 (no IF EXISTS this slice)", () => {
-  const db = new Database();
-  assert.equal(errCode(() => execute(db, "DROP TABLE nope")), "42P01");
-  execute(db, "CREATE TABLE t (id int32 PRIMARY KEY)");
-  execute(db, "DROP TABLE t");
-  assert.equal(errCode(() => execute(db, "DROP TABLE t")), "42P01");
 });
 
 test("the name is free to re-create after a drop", () => {

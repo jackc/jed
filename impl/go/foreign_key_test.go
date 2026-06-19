@@ -121,15 +121,3 @@ func TestForeignKeyParentUpdateEndStateSwap(t *testing.T) {
 		t.Fatalf("orphaning update: got %s, want 23503", got)
 	}
 }
-
-// A forward reference inside one multi-row INSERT, and a row referencing itself, both resolve
-// against the batch end state (PG's end-of-statement semantics).
-func TestForeignKeySelfReferenceBatch(t *testing.T) {
-	db := fkSetup(t, "CREATE TABLE node (id int32 PRIMARY KEY, parent int32 REFERENCES node (id))")
-	if _, err := Execute(db, "INSERT INTO node VALUES (2, 1), (1, NULL), (3, 3)"); err != nil {
-		t.Fatalf("forward + self batch reference should succeed: %v", err)
-	}
-	if got := fkErr(t, db, "INSERT INTO node VALUES (4, 99)"); got != "23503" {
-		t.Fatalf("missing parent: got %s, want 23503", got)
-	}
-}

@@ -37,19 +37,6 @@ function qOut(db: Database, sql: string) {
   return o;
 }
 
-test("AF7 builders over composite elements", () => {
-  const db = addrDb();
-  assert.equal(val(db, `SELECT array_append('{"(a,1)"}'::addr[], '(b,2)'::addr)`), `{"(a,1)","(b,2)"}`);
-  assert.equal(val(db, `SELECT array_prepend('(z,0)'::addr, '{"(a,1)"}'::addr[])`), `{"(z,0)","(a,1)"}`);
-  assert.equal(val(db, `SELECT array_cat('{"(a,1)"}'::addr[], '{"(b,2)"}'::addr[])`), `{"(a,1)","(b,2)"}`);
-  assert.equal(val(db, `SELECT '{"(a,1)"}'::addr[] || '(b,2)'::addr`), `{"(a,1)","(b,2)"}`);
-  assert.equal(val(db, `SELECT array_append(NULL::addr[], '(a,1)'::addr)`), `{"(a,1)"}`);
-  assert.equal(
-    errCode(() => execute(db, `SELECT array_cat('{"(a,1)"}'::addr[], ARRAY[1,2])`)),
-    "42883",
-  );
-});
-
 test("AF7 introspectors over composite elements", () => {
   const db = addrDb();
   assert.equal(val(db, `SELECT array_length('{"(a,1)","(b,2)"}'::addr[], 1)`), "2");
@@ -69,15 +56,6 @@ test("AF7 containment over composite: strict value-level, total-order field-leve
   assert.equal(val(db, `SELECT '{"(a,1)"}'::addr[] <@ '{"(a,1)","(b,2)"}'::addr[]`), "true");
   assert.equal(val(db, `SELECT '{"(a,1)"}'::addr[] && '{"(a,1)","(b,2)"}'::addr[]`), "true");
   assert.equal(val(db, `SELECT (NULL::addr[] @> '{"(a,1)"}'::addr[]) IS NULL`), "true");
-});
-
-test("AF7 search/edit over composite: NULL-safe element match", () => {
-  const db = addrDb();
-  assert.equal(val(db, `SELECT array_remove('{"(a,1)",NULL}'::addr[], NULL::addr)`), `{"(a,1)"}`);
-  assert.equal(val(db, `SELECT array_remove('{"(a,)","(b,2)"}'::addr[], '(a,)'::addr)`), `{"(b,2)"}`);
-  assert.equal(val(db, `SELECT array_position('{"(a,1)","(b,2)"}'::addr[], '(b,2)'::addr)`), "2");
-  assert.equal(val(db, `SELECT array_positions('{"(a,1)","(b,2)","(a,1)"}'::addr[], '(a,1)'::addr)`), "{1,3}");
-  assert.equal(val(db, `SELECT array_replace('{"(a,1)"}'::addr[], '(a,1)'::addr, '(z,9)'::addr)`), `{"(z,9)"}`);
 });
 
 // The AF7 code change #2: x op ANY/ALL(composite[]) uses the composite TOTAL ORDER, not bare-ROW 3VL.

@@ -41,16 +41,6 @@ test("|| — a bare NULL operand resolves to array_cat (identity)", () => {
   for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
 });
 
-test("|| — precedence and left-associativity", () => {
-  const db = new Database();
-  const cases: [string, string][] = [
-    ["SELECT ARRAY[1,2] || ARRAY[3] = ARRAY[1,2,3]", "true"], // || binds tighter than =
-    ["SELECT ARRAY[1] || 2 || 3", "{1,2,3}"],
-    ["SELECT 0 || ARRAY[1,2] || 3", "{0,1,2,3}"],
-  ];
-  for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
-});
-
 test("|| — errors", () => {
   const db = new Database();
   const cases: [string, string][] = [

@@ -33,18 +33,6 @@ test("ANY equality is IN", () => {
   for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
 });
 
-test("ANY is three-valued", () => {
-  const db = new Database();
-  const cases: [string, string][] = [
-    ["SELECT NULL::int64 = ANY(ARRAY[1,2,3])", "NULL"], // NULL x, non-empty → NULL
-    ["SELECT 1 = ANY(ARRAY[2,NULL])", "NULL"], // no TRUE, a NULL element → NULL
-    ["SELECT 2 = ANY(ARRAY[2,NULL])", "true"], // a TRUE match dominates a NULL
-    ["SELECT 1 = ANY('{}'::int64[])", "false"], // empty → FALSE
-    ["SELECT 1 = ANY(NULL::int64[])", "NULL"], // NULL array → NULL
-  ];
-  for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
-});
-
 test("ALL is the universal dual", () => {
   const db = new Database();
   const cases: [string, string][] = [

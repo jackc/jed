@@ -25,23 +25,6 @@ test("boolean primary key CRUD + point lookup", () => {
   assert.deepEqual(query(db, "SELECT k FROM t"), [["false"], ["true"]]);
 });
 
-// A duplicate boolean PK is a 23505 unique violation (only two keys are possible).
-test("boolean primary key duplicate is 23505", () => {
-  const db = dbWith([
-    "CREATE TABLE t (k boolean PRIMARY KEY)",
-    "INSERT INTO t VALUES (TRUE)",
-  ]);
-  assert.equal(errCode(() => execute(db, "INSERT INTO t VALUES (TRUE)")), "23505");
-  // The other value still inserts.
-  execute(db, "INSERT INTO t VALUES (FALSE)");
-});
-
-// A NULL boolean PK is rejected NOT NULL (23502), like any PK.
-test("boolean primary key NULL is 23502", () => {
-  const db = dbWith(["CREATE TABLE t (k boolean PRIMARY KEY)"]);
-  assert.equal(errCode(() => execute(db, "INSERT INTO t VALUES (NULL)")), "23502");
-});
-
 // A boolean member of a COMPOSITE primary key concatenates with the other component.
 test("boolean composite primary key", () => {
   const db = dbWith([

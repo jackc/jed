@@ -44,23 +44,6 @@ fn any_equality_is_in() {
 }
 
 #[test]
-fn any_three_valued() {
-    let mut db = Database::new();
-    // A NULL x with a non-empty array → NULL (no element can be TRUE).
-    assert_eq!(
-        val(&mut db, "SELECT NULL::int64 = ANY(ARRAY[1,2,3])"),
-        "NULL"
-    );
-    // No TRUE match but a NULL element present → NULL.
-    assert_eq!(val(&mut db, "SELECT 1 = ANY(ARRAY[2,NULL])"), "NULL");
-    // A TRUE match dominates a NULL element → TRUE.
-    assert_eq!(val(&mut db, "SELECT 2 = ANY(ARRAY[2,NULL])"), "true");
-    // Empty array → FALSE; NULL array → NULL.
-    assert_eq!(val(&mut db, "SELECT 1 = ANY('{}'::int64[])"), "false");
-    assert_eq!(val(&mut db, "SELECT 1 = ANY(NULL::int64[])"), "NULL");
-}
-
-#[test]
 fn all_universal() {
     let mut db = Database::new();
     assert_eq!(val(&mut db, "SELECT 3 = ALL(ARRAY[3,3,3])"), "true");

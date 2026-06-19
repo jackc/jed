@@ -132,14 +132,3 @@ fn parent_update_end_state_swap_allowed() {
         "23503"
     );
 }
-
-/// A forward reference inside one multi-row INSERT, and a row referencing itself, both resolve
-/// against the batch end state (PG's end-of-statement semantics).
-#[test]
-fn self_reference_batch_end_state() {
-    let mut db =
-        db_with(&["CREATE TABLE node (id int32 PRIMARY KEY, parent int32 REFERENCES node (id))"]);
-    // Row (2 → 1) precedes the row that supplies id 1; (3 → 3) references itself.
-    execute(&mut db, "INSERT INTO node VALUES (2, 1), (1, NULL), (3, 3)").unwrap();
-    assert_eq!(err(&mut db, "INSERT INTO node VALUES (4, 99)"), "23503");
-}

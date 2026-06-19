@@ -63,19 +63,6 @@ fn names_and_types_its_column_at_the_element_type() {
 // ---- NULL / empty semantics ----------------------------------------------------------------
 
 #[test]
-fn null_elements_become_null_rows() {
-    let mut db = Database::new();
-    // A NULL element of a non-NULL array is produced as a NULL row (ORDER BY puts it last).
-    assert_eq!(
-        query(
-            &mut db,
-            "SELECT * FROM unnest(ARRAY[1,NULL,3]) AS u ORDER BY u"
-        ),
-        vec![vec![Value::Int(1)], vec![Value::Int(3)], vec![Value::Null]],
-    );
-}
-
-#[test]
 fn empty_and_null_arrays_yield_zero_rows() {
     let mut db = Database::new();
     assert_eq!(
@@ -89,29 +76,6 @@ fn empty_and_null_arrays_yield_zero_rows() {
     // Both charge zero cost — nothing generated, nothing produced.
     assert_eq!(cost(&mut db, "SELECT * FROM unnest('{}'::int32[])"), 0);
     assert_eq!(cost(&mut db, "SELECT * FROM unnest(NULL::int32[])"), 0);
-}
-
-// ---- multidimensional flatten + custom lower bounds ----------------------------------------
-
-#[test]
-fn multidim_flattens_row_major_and_lbounds_are_dropped() {
-    let mut db = Database::new();
-    // A 2×2 value flattens to its 4 elements (row-major).
-    assert_eq!(
-        query(
-            &mut db,
-            "SELECT * FROM unnest(ARRAY[ARRAY[1,2],ARRAY[3,4]]) AS u ORDER BY u"
-        ),
-        ints(&[1, 2, 3, 4]),
-    );
-    // A custom lower bound is flattened away (unnest yields elements, not subscripts).
-    assert_eq!(
-        query(
-            &mut db,
-            "SELECT * FROM unnest('[5:7]={10,20,30}'::int32[]) AS u ORDER BY u"
-        ),
-        ints(&[10, 20, 30]),
-    );
 }
 
 // ---- composition: alias, CROSS JOIN, the non-LATERAL correlated argument -------------------

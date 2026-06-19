@@ -51,14 +51,6 @@ func TestUnnestNamesAndElementType(t *testing.T) {
 	}
 }
 
-func TestUnnestNullElementsBecomeNullRows(t *testing.T) {
-	db := NewDatabase()
-	rows := query(t, db, "SELECT * FROM unnest(ARRAY[1,NULL,3]) AS u ORDER BY u")
-	if len(rows) != 3 || rows[0][0].Int != 1 || rows[1][0].Int != 3 || rows[2][0].Kind != ValNull {
-		t.Fatalf("null-element unnest: got %v", rows)
-	}
-}
-
 func TestUnnestEmptyAndNullArraysYieldZeroRows(t *testing.T) {
 	db := NewDatabase()
 	for _, sql := range []string{
@@ -76,14 +68,6 @@ func TestUnnestEmptyAndNullArraysYieldZeroRows(t *testing.T) {
 			t.Errorf("%q: cost = %d, want 0", sql, out.Cost)
 		}
 	}
-}
-
-func TestUnnestMultidimFlattensAndDropsLowerBounds(t *testing.T) {
-	db := NewDatabase()
-	got := unnestInts(t, db, "SELECT * FROM unnest(ARRAY[ARRAY[1,2],ARRAY[3,4]]) AS u ORDER BY u")
-	eqGenInts(t, got, []int64{1, 2, 3, 4}, "multidim flatten")
-	got = unnestInts(t, db, "SELECT * FROM unnest('[5:7]={10,20,30}'::int32[]) AS u ORDER BY u")
-	eqGenInts(t, got, []int64{10, 20, 30}, "custom lbound flatten")
 }
 
 func TestUnnestAliasRenamesColumn(t *testing.T) {

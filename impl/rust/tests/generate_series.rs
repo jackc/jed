@@ -45,81 +45,6 @@ fn ints(ns: &[i64]) -> Vec<Vec<Value>> {
 
 // ---- the generator: rows, names, type ------------------------------------------------------
 
-#[test]
-fn two_arg_series_names_and_types_its_column() {
-    let mut db = Database::new();
-    let out = execute(&mut db, "SELECT * FROM generate_series(1, 5)").unwrap();
-    match &out {
-        Outcome::Query {
-            column_names,
-            column_types,
-            rows,
-            ..
-        } => {
-            assert_eq!(column_names, &["generate_series"]);
-            // Integer literals default to int64, so the promoted column type is int64.
-            assert_eq!(column_types, &["int64"]);
-            assert_eq!(rows, &ints(&[1, 2, 3, 4, 5]));
-        }
-        other => panic!("expected a query result, got {other:?}"),
-    }
-    // 5 generated_row + 5 row_produced; the integer-literal args are leaves (no operator_eval).
-    assert_eq!(out.cost(), 10);
-}
-
-#[test]
-fn three_arg_series_steps() {
-    let mut db = Database::new();
-    assert_eq!(
-        query(&mut db, "SELECT * FROM generate_series(1, 10, 2)"),
-        ints(&[1, 3, 5, 7, 9])
-    );
-}
-
-#[test]
-fn descending_step() {
-    let mut db = Database::new();
-    assert_eq!(
-        query(&mut db, "SELECT * FROM generate_series(5, 1, -1)"),
-        ints(&[5, 4, 3, 2, 1])
-    );
-}
-
-#[test]
-fn positive_default_step_with_start_past_stop_is_empty() {
-    let mut db = Database::new();
-    assert_eq!(
-        query(&mut db, "SELECT * FROM generate_series(5, 1)"),
-        ints(&[])
-    );
-    // Zero rows generated and produced.
-    assert_eq!(cost(&mut db, "SELECT * FROM generate_series(5, 1)"), 0);
-}
-
-#[test]
-fn single_element_series() {
-    let mut db = Database::new();
-    assert_eq!(
-        query(&mut db, "SELECT * FROM generate_series(3, 3)"),
-        ints(&[3])
-    );
-}
-
-// ---- NULL arguments → zero rows -------------------------------------------------------------
-
-#[test]
-fn null_argument_yields_zero_rows() {
-    let mut db = Database::new();
-    for sql in [
-        "SELECT * FROM generate_series(NULL, 5)",
-        "SELECT * FROM generate_series(1, NULL)",
-        "SELECT * FROM generate_series(1, 5, NULL)",
-    ] {
-        assert_eq!(query(&mut db, sql), ints(&[]), "{sql}");
-        assert_eq!(cost(&mut db, sql), 0, "{sql}");
-    }
-}
-
 // ---- step of zero → 22023 -------------------------------------------------------------------
 
 #[test]
@@ -169,51 +94,6 @@ fn alias_forms_and_qualified_column() {
     );
 }
 
-// ---- composition: WHERE / ORDER BY / LIMIT / join -------------------------------------------
-
-#[test]
-fn where_order_by_limit_compose() {
-    let mut db = Database::new();
-    assert_eq!(
-        query(
-            &mut db,
-            "SELECT * FROM generate_series(1, 5) WHERE generate_series > 2"
-        ),
-        ints(&[3, 4, 5])
-    );
-    assert_eq!(
-        query(
-            &mut db,
-            "SELECT * FROM generate_series(1, 5) ORDER BY generate_series DESC LIMIT 2"
-        ),
-        ints(&[5, 4])
-    );
-}
-
-#[test]
-fn cross_join_with_base_table() {
-    let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY)",
-        "INSERT INTO t VALUES (10), (20)",
-    ]);
-    // 2 rows × 3 series rows = 6, ordered running (t key order) then series order.
-    let rows = query(
-        &mut db,
-        "SELECT * FROM t CROSS JOIN generate_series(1, 3) ORDER BY id, generate_series",
-    );
-    assert_eq!(
-        rows,
-        vec![
-            vec![Value::Int(10), Value::Int(1)],
-            vec![Value::Int(10), Value::Int(2)],
-            vec![Value::Int(10), Value::Int(3)],
-            vec![Value::Int(20), Value::Int(1)],
-            vec![Value::Int(20), Value::Int(2)],
-            vec![Value::Int(20), Value::Int(3)],
-        ]
-    );
-}
-
 // ---- non-LATERAL: $N / correlated outer arg work, a sibling reference does not --------------
 
 #[test]
@@ -229,23 +109,6 @@ fn param_argument() {
         Outcome::Query { rows, .. } => assert_eq!(rows, ints(&[1, 2, 3])),
         other => panic!("expected a query result, got {other:?}"),
     }
-}
-
-#[test]
-fn correlated_outer_argument_in_subquery() {
-    let mut db = db_with(&[
-        "CREATE TABLE t (id int32 PRIMARY KEY, n int32)",
-        "INSERT INTO t VALUES (1, 0), (2, 2), (3, 3)",
-    ]);
-    // The inner generate_series arg references the outer row's `n` (non-LATERAL: a subquery
-    // arg may see the enclosing query). Counts are 0, 2, 3.
-    assert_eq!(
-        query(
-            &mut db,
-            "SELECT (SELECT count(*) FROM generate_series(1, o.n)) FROM t o ORDER BY id"
-        ),
-        ints(&[0, 2, 3])
-    );
 }
 
 #[test]

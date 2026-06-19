@@ -10,7 +10,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Database, execute, executeParams, intValue } from "../src/lib.ts";
-import { dbWith, errCode, query } from "./util.ts";
+import { errCode, query } from "./util.ts";
 
 function names(db: Database, sql: string): string[] {
   const o = execute(db, sql);
@@ -47,23 +47,6 @@ test("VALUES body — multi-column default names and rename list", () => {
   assert.deepStrictEqual(query(db, "SELECT v.n FROM (VALUES (7), (8)) AS v(n) ORDER BY v.n"), [["7"], ["8"]]);
 });
 
-test("VALUES body — optional alias (PG 18)", () => {
-  const db = new Database();
-  assert.deepStrictEqual(query(db, "SELECT column1 FROM (VALUES (5), (6)) ORDER BY column1"), [["5"], ["6"]]);
-});
-
-test("VALUES body — general constant expressions", () => {
-  const db = new Database();
-  assert.deepStrictEqual(
-    query(db, "SELECT column1 FROM (VALUES (1 + 1), (2 * 3), (10 - 4)) AS v ORDER BY column1"),
-    [["2"], ["6"], ["6"]],
-  );
-  // A cast as a value (decimal -> int32 rounds half away from zero: 2.5 -> 3).
-  assert.deepStrictEqual(query(db, "SELECT column1 FROM (VALUES (2.5 :: int32)) AS v"), [["3"]]);
-  // A CASE expression as a value.
-  assert.deepStrictEqual(query(db, "SELECT column1 FROM (VALUES (CASE WHEN true THEN 1 ELSE 0 END)) AS v"), [["1"]]);
-});
-
 test("VALUES body — per-column type unification across rows", () => {
   const db = new Database();
   // int + int -> int (all bare integer literals are int64 in jed).
@@ -78,26 +61,6 @@ test("VALUES body — per-column type unification across rows", () => {
   assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (NULL)) AS v"), ["int64"]);
   // an all-NULL column is text (unknown -> text).
   assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (NULL), (NULL)) AS v"), ["text"]);
-});
-
-test("VALUES body — composes with WHERE / JOIN / aggregate / subquery", () => {
-  const db = dbWith([
-    "CREATE TABLE t (id int32 PRIMARY KEY, k int32)",
-    "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
-  ]);
-  assert.deepStrictEqual(
-    query(db, "SELECT column1 FROM (VALUES (1), (2), (3)) AS v WHERE column1 > 1 ORDER BY column1"),
-    [["2"], ["3"]],
-  );
-  assert.deepStrictEqual(
-    query(db, "SELECT t.id FROM t JOIN (VALUES (1), (3)) AS v(id) ON t.id = v.id ORDER BY t.id"),
-    [["1"], ["3"]],
-  );
-  assert.deepStrictEqual(query(db, "SELECT max(column1) FROM (VALUES (1), (2), (3)) AS v"), [["3"]]);
-  assert.deepStrictEqual(
-    query(db, "SELECT id FROM t WHERE id IN (SELECT column1 FROM (VALUES (1), (3)) AS v) ORDER BY id"),
-    [["1"], ["3"]],
-  );
 });
 
 test("VALUES body — a $N is typed by its sibling rows", () => {

@@ -65,11 +65,3 @@ test("FK parent UPDATE end-state swap allowed", () => {
   execute(db, "UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END"); // swap — end state valid
   assert.equal(errCode(() => execute(db, "UPDATE p SET code = 999 WHERE id = 1")), "23503");
 });
-
-// A forward reference inside one multi-row INSERT, and a row referencing itself, both resolve
-// against the batch end state (PG's end-of-statement semantics).
-test("FK self-reference resolves against the batch end state", () => {
-  const db = dbWith(["CREATE TABLE node (id int32 PRIMARY KEY, parent int32 REFERENCES node (id))"]);
-  execute(db, "INSERT INTO node VALUES (2, 1), (1, NULL), (3, 3)");
-  assert.equal(errCode(() => execute(db, "INSERT INTO node VALUES (4, 99)")), "23503");
-});

@@ -45,25 +45,6 @@ fn boolean_primary_key_crud() {
     );
 }
 
-/// A duplicate boolean PK is a 23505 unique violation (only two keys are possible).
-#[test]
-fn boolean_primary_key_duplicate() {
-    let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (k boolean PRIMARY KEY)").unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (TRUE)").unwrap();
-    assert_eq!(err_code(&mut db, "INSERT INTO t VALUES (TRUE)"), "23505");
-    // The other value still inserts.
-    execute(&mut db, "INSERT INTO t VALUES (FALSE)").unwrap();
-}
-
-/// A NULL boolean PK is rejected NOT NULL (23502), like any PK.
-#[test]
-fn boolean_primary_key_null_rejected() {
-    let mut db = Database::new();
-    execute(&mut db, "CREATE TABLE t (k boolean PRIMARY KEY)").unwrap();
-    assert_eq!(err_code(&mut db, "INSERT INTO t VALUES (NULL)"), "23502");
-}
-
 /// A boolean member of a COMPOSITE primary key concatenates with the other component.
 #[test]
 fn boolean_composite_primary_key() {

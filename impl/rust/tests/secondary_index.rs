@@ -139,56 +139,6 @@ fn ddl_errors_match_postgres() {
     run(&mut db, "DROP INDEX on");
 }
 
-/// Index maintenance at INSERT/UPDATE/DELETE (indexes.md §4): the index-bounded scan
-/// observes every mutation, including NULL transitions; an UPDATE that does not touch
-/// the indexed column leaves the entries in place.
-#[test]
-fn maintenance_tracks_mutations() {
-    let mut db = db20();
-    run(&mut db, "CREATE INDEX t_v_idx ON t (v)");
-    assert_eq!(
-        ids(&mut db, "SELECT id FROM t WHERE v = 3 ORDER BY id"),
-        vec![3, 8, 13, 18]
-    );
-    // UPDATE moves an entry only when the indexed value changed.
-    run(&mut db, "UPDATE t SET v = 99 WHERE id = 3");
-    assert_eq!(
-        ids(&mut db, "SELECT id FROM t WHERE v = 3 ORDER BY id"),
-        vec![8, 13, 18]
-    );
-    assert_eq!(ids(&mut db, "SELECT id FROM t WHERE v = 99"), vec![3]);
-    // An UPDATE of a non-indexed column changes nothing the index observes.
-    run(&mut db, "UPDATE t SET w = 0 WHERE id = 8");
-    assert_eq!(
-        ids(&mut db, "SELECT id FROM t WHERE v = 3 ORDER BY id"),
-        vec![8, 13, 18]
-    );
-    // NULL transitions: a NULL entry is never matched by equality, and setting a value
-    // back makes the row findable again.
-    run(&mut db, "UPDATE t SET v = NULL WHERE id = 8");
-    assert_eq!(
-        ids(&mut db, "SELECT id FROM t WHERE v = 3 ORDER BY id"),
-        vec![13, 18]
-    );
-    run(&mut db, "UPDATE t SET v = 3 WHERE id = 8");
-    assert_eq!(
-        ids(&mut db, "SELECT id FROM t WHERE v = 3 ORDER BY id"),
-        vec![8, 13, 18]
-    );
-    // DELETE removes the entries.
-    run(&mut db, "DELETE FROM t WHERE v = 3");
-    assert!(ids(&mut db, "SELECT id FROM t WHERE v = 3").is_empty());
-    // INSERT ... SELECT maintains too (the shared insert path).
-    run(
-        &mut db,
-        "INSERT INTO t SELECT id + 100, 3, w FROM t WHERE v = 4",
-    );
-    assert_eq!(
-        ids(&mut db, "SELECT id FROM t WHERE v = 3 ORDER BY id"),
-        vec![104, 109, 114, 119]
-    );
-}
-
 /// The planner picks the index for a first-column equality and the cost drops to the
 /// index-bounded form (cost.md §3 "index-bounded scan"); a provably-empty bound reads
 /// nothing; the PK bound wins over an index; the lowest-named index breaks ties.
@@ -229,20 +179,6 @@ fn planner_costs_are_pinned() {
     run(&mut db, "DROP INDEX a_first");
     run(&mut db, "DROP INDEX two");
     assert_eq!(cost(&mut db, "SELECT id FROM t WHERE w = 7"), 42);
-}
-
-/// LIMIT does not stream over an index bound (cost.md §3): the eager path reads the full
-/// admitted set, so the cost equals the un-LIMITed index scan minus the un-produced rows.
-#[test]
-fn limit_takes_the_eager_path_over_an_index() {
-    let mut db = db20();
-    run(&mut db, "CREATE INDEX t_v_idx ON t (v)");
-    let full = cost(&mut db, "SELECT id FROM t WHERE v = 3");
-    let limited = cost(&mut db, "SELECT id FROM t WHERE v = 3 LIMIT 1");
-    // All 4 rows are read and filtered (no short-circuit); only row_produced drops (3
-    // fewer) — 17 vs 14.
-    assert_eq!(full, 17);
-    assert_eq!(limited, 14);
 }
 
 /// The v5 image round-trips: index trees (including a NULL entry), the out-of-order PK

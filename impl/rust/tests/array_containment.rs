@@ -111,27 +111,6 @@ fn null_whole_array_propagates() {
 }
 
 #[test]
-fn any_dimensionality_flattens() {
-    let mut db = Database::new();
-    // No 1-D restriction (contrast array_remove/position): the comparison is over the flattened
-    // element multiset, so multidimensional operands work.
-    assert_eq!(
-        val(&mut db, "SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] @> ARRAY[3]"),
-        "true"
-    );
-    assert_eq!(
-        val(&mut db, "SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] && ARRAY[4,9]"),
-        "true"
-    );
-    // Custom lower bounds are irrelevant (the value's elements decide). The typed array is the left
-    // operand, so the bare ARRAY[20] adapts to its int32 element type.
-    assert_eq!(
-        val(&mut db, "SELECT '[5:7]={10,20,30}'::int32[] @> ARRAY[20]"),
-        "true"
-    );
-}
-
-#[test]
 fn literal_adaptation_to_element_type() {
     let mut db = Database::new();
     // The untyped `ARRAY[…]` constructor adapts to the typed (int32[]) array's element type when the

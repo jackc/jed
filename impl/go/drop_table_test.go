@@ -24,30 +24,6 @@ func TestDropRemovesTableAndRows(t *testing.T) {
 	}
 }
 
-func TestAccessAfterDropIsUndefinedTable(t *testing.T) {
-	db := NewDatabase()
-	mustCreate(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")
-	mustCreate(t, db, "DROP TABLE t")
-	// Every access path shares the same catalog lookup, so all four trap 42P01.
-	for _, sql := range []string{
-		"SELECT id FROM t",
-		"INSERT INTO t VALUES (1, 1)",
-		"UPDATE t SET v = 0",
-		"DELETE FROM t",
-	} {
-		wantErr(t, db, sql, "42P01")
-	}
-}
-
-func TestDroppingMissingTableTraps42P01(t *testing.T) {
-	db := NewDatabase()
-	wantErr(t, db, "DROP TABLE nope", "42P01")
-	// No IF EXISTS this slice: a second drop of the same name also errors.
-	mustCreate(t, db, "CREATE TABLE t (id int32 PRIMARY KEY)")
-	mustCreate(t, db, "DROP TABLE t")
-	wantErr(t, db, "DROP TABLE t", "42P01")
-}
-
 func TestNameIsFreeToRecreateAfterDrop(t *testing.T) {
 	db := NewDatabase()
 	mustCreate(t, db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)")

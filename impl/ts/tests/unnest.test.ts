@@ -38,23 +38,12 @@ test("unnest names its column at the bound element type", () => {
   assert.deepStrictEqual(qOut(db, "SELECT * FROM unnest(ARRAY['a','b'])").columnTypes, ["text"]);
 });
 
-test("unnest produces a NULL element as a NULL row", () => {
-  const db = new Database();
-  assert.deepStrictEqual(query(db, "SELECT * FROM unnest(ARRAY[1,NULL,3]) AS u ORDER BY u"), [["1"], ["3"], ["NULL"]]);
-});
-
 test("unnest of the empty array or a NULL array yields zero rows", () => {
   const db = new Database();
   for (const sql of ["SELECT * FROM unnest('{}'::int32[])", "SELECT * FROM unnest(NULL::int32[])"]) {
     assert.deepStrictEqual(query(db, sql), [], sql);
     assert.equal(cost(db, sql), 0n, sql);
   }
-});
-
-test("unnest flattens multidim row-major and drops lower bounds", () => {
-  const db = new Database();
-  assert.deepStrictEqual(query(db, "SELECT * FROM unnest(ARRAY[ARRAY[1,2],ARRAY[3,4]]) AS u ORDER BY u"), rows1([1, 2, 3, 4]));
-  assert.deepStrictEqual(query(db, "SELECT * FROM unnest('[5:7]={10,20,30}'::int32[]) AS u ORDER BY u"), rows1([10, 20, 30]));
 });
 
 test("unnest alias renames the single column", () => {

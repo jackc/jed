@@ -512,6 +512,20 @@ The design is optimized for AI agents even more than for humans. In practice:
   (`rake corpus:check`) and record any deliberate PG divergence in the override ledger; when it
   adds a query optimization, add a metamorphic (NoREC) relation so the sweep keeps pace —
   neither grows on its own (`spec/design/conformance.md` §5/§8).
+- **Put tests in the corpus by default; write a per-core unit test ONLY for what the corpus
+  cannot express.** The corpus runs on **every** core, so one entry tests all cores at once —
+  re-asserting the same *SQL-in → rows/error-out, PostgreSQL-agreeing* behavior as a per-core
+  unit test adds **no** coverage and drifts N ways (the §5 trap, in test form). A per-core unit
+  test earns its place **only** when the behavior is structurally out of the corpus's reach:
+  a deliberate **PG divergence** (the oracle corpus is PG-clean, so a jed-stricter / jed-differs
+  case cannot live there), **catalog/host introspection** (constraint/index names, ordinals,
+  internal state), **on-disk / byte-level** checks (golden round-trips, key-encoding vectors),
+  **cost-meter values** no cost suite pins, **host-API surface** (open/create/commit/close,
+  param binding, cursors, concurrency handles), or **internal invariants** (tree/split shapes,
+  page counts, spec-constant cross-checks). When unsure, write the corpus entry, not the unit
+  test. The per-core `foreign_key` tests are the model: they keep only the divergences +
+  introspection and leave the agreeing behavior (23503 at every write site, MATCH SIMPLE, the
+  batch end state, 42830/2BP01) to `ddl/foreign_key.test`.
 - **Determinism everywhere** — deterministic results (exact multiset, values, types, errors,
   cost), deterministic error messages, no wall-clock nondeterminism. **Row order is
   deterministic iff `ORDER BY` is present** (§8): without it the order is unspecified (the

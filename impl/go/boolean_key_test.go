@@ -52,30 +52,6 @@ func TestBooleanPrimaryKeyCRUD(t *testing.T) {
 	}
 }
 
-// A duplicate boolean PK is a 23505 unique violation (only two keys are possible).
-func TestBooleanPrimaryKeyDuplicate(t *testing.T) {
-	db := dbWith(
-		t,
-		"CREATE TABLE t (k boolean PRIMARY KEY)",
-		"INSERT INTO t VALUES (TRUE)",
-	)
-	if code := boolKeyErrCode(t, db, "INSERT INTO t VALUES (TRUE)"); code != "23505" {
-		t.Fatalf("duplicate boolean PK: got %s, want 23505", code)
-	}
-	// The other value still inserts.
-	if _, err := Execute(db, "INSERT INTO t VALUES (FALSE)"); err != nil {
-		t.Fatalf("the other boolean key must still insert: %v", err)
-	}
-}
-
-// A NULL boolean PK is rejected NOT NULL (23502), like any PK.
-func TestBooleanPrimaryKeyNullRejected(t *testing.T) {
-	db := dbWith(t, "CREATE TABLE t (k boolean PRIMARY KEY)")
-	if code := boolKeyErrCode(t, db, "INSERT INTO t VALUES (NULL)"); code != "23502" {
-		t.Fatalf("NULL boolean PK: got %s, want 23502", code)
-	}
-}
-
 // A boolean member of a COMPOSITE primary key concatenates with the other component.
 func TestBooleanCompositePrimaryKey(t *testing.T) {
 	db := dbWith(

@@ -40,20 +40,6 @@ func TestConcatNullPrefersCat(t *testing.T) {
 	}
 }
 
-func TestConcatPrecedenceAndAssoc(t *testing.T) {
-	db := NewDatabase()
-	cases := map[string]string{
-		"SELECT ARRAY[1,2] || ARRAY[3] = ARRAY[1,2,3]": "true", // || binds tighter than =
-		"SELECT ARRAY[1] || 2 || 3":                    "{1,2,3}",
-		"SELECT 0 || ARRAY[1,2] || 3":                  "{0,1,2,3}",
-	}
-	for sql, want := range cases {
-		if got := valArrayFunc(t, db, sql); got != want {
-			t.Errorf("%s = %q, want %q", sql, got, want)
-		}
-	}
-}
-
 func TestConcatErrors(t *testing.T) {
 	db := NewDatabase()
 	cases := map[string]string{

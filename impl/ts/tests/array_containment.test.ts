@@ -71,16 +71,6 @@ test("@> / && — a NULL whole-array operand propagates to NULL", () => {
   for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
 });
 
-test("@> / && — any dimensionality (flattened multiset)", () => {
-  const db = new Database();
-  const cases: [string, string][] = [
-    ["SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] @> ARRAY[3]", "true"],
-    ["SELECT ARRAY[ARRAY[1,2],ARRAY[3,4]] && ARRAY[4,9]", "true"],
-    ["SELECT '[5:7]={10,20,30}'::int32[] @> ARRAY[20]", "true"],
-  ];
-  for (const [sql, want] of cases) assert.equal(val(db, sql), want, sql);
-});
-
 test("@> — precedence and literal adaptation", () => {
   const db = new Database();
   const cases: [string, string][] = [

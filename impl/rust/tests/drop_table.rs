@@ -28,32 +28,6 @@ fn drop_removes_table_and_rows() {
 }
 
 #[test]
-fn access_after_drop_is_undefined_table() {
-    let mut db = Database::new();
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)").unwrap();
-    run(&mut db, "DROP TABLE t").unwrap();
-    // Every access path shares the same catalog lookup, so all four trap 42P01.
-    for sql in [
-        "SELECT id FROM t",
-        "INSERT INTO t VALUES (1, 1)",
-        "UPDATE t SET v = 0",
-        "DELETE FROM t",
-    ] {
-        assert_eq!(run(&mut db, sql).unwrap_err().code(), "42P01", "{sql}");
-    }
-}
-
-#[test]
-fn dropping_a_missing_table_traps_42p01() {
-    let mut db = Database::new();
-    assert_eq!(run(&mut db, "DROP TABLE nope").unwrap_err().code(), "42P01");
-    // No IF EXISTS this slice: a second drop of the same name also errors.
-    run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY)").unwrap();
-    run(&mut db, "DROP TABLE t").unwrap();
-    assert_eq!(run(&mut db, "DROP TABLE t").unwrap_err().code(), "42P01");
-}
-
-#[test]
 fn name_is_free_to_recreate_after_drop() {
     let mut db = Database::new();
     run(&mut db, "CREATE TABLE t (id int32 PRIMARY KEY, v int16)").unwrap();
