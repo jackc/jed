@@ -5,10 +5,6 @@
 
 use jed::{Database, Outcome, execute};
 
-fn run(db: &mut Database, sql: &str) {
-    execute(db, sql).unwrap_or_else(|e| panic!("{sql}: {}", e.message));
-}
-
 fn err(db: &mut Database, sql: &str) -> String {
     execute(db, sql)
         .err()
