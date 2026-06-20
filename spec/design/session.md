@@ -236,16 +236,32 @@ session.execute_script(sql) -> ScriptSummary   # split + run each in order, disc
 It calls the library-level `split_statements` and runs each statement on the session, **discards result-set rows**
 (keeping only counts), and — when the session is `Idle` — wraps the run in **one implicit
 transaction**, all-or-nothing: any statement's error stops the run, rolls the implicit transaction
-back, and returns that `EngineError`. Explicit `BEGIN` / `COMMIT` / `ROLLBACK` in the script
-**partition** it (PG simple-query semantics, §2.2); a script run while the session is already `Open`
-joins that transaction. `ScriptSummary` is **`O(1)`, not `O(rows)`** — `{ statements_run,
-rows_affected_total, cost }` — so memory is bounded by construction (one statement's transient
-result at a time, discarded), and `lifetime_max_cost` bounds the total work.
+back, and returns that `EngineError`. A script run while the session is already `Open` **joins**
+that transaction (no wrapper, no auto-commit — the caller's block stays open and owns the boundary,
+so a mid-run error leaves the block `Failed` for the caller to roll back). `ScriptSummary` is
+**`O(1)`, not `O(rows)`** — `{ statements_run, rows_affected_total, cost }` (`rows_affected_total`
+sums only the DML command-tag counts — a `SELECT` contributes to neither it nor, by itself, an
+error) — so memory is bounded by construction (one statement's transient result at a time,
+discarded), and `lifetime_max_cost` (when it lands) bounds the total work.
+
+**v1 narrowing — transaction control inside a script is `0A000`.** Because the implicit wrapper owns
+the transaction boundary, an explicit `BEGIN` / `COMMIT` / `ROLLBACK` (or `START TRANSACTION`)
+**statement inside** an `execute_script` run is rejected **`0A000 feature_not_supported`**, aborting
+the run (and rolling the implicit wrapper back). The PG-simple-query **partitioning** semantics —
+where an in-script `COMMIT` would partition the run into separately-committed segments and an
+in-script `BEGIN` would open a nested explicit block — is a deferred follow-on (§11); the implicit
+wrapper coexisting with in-script `BEGIN` is the subtlety that defers it. A host that needs
+self-managed transactions in a multi-statement run writes the explicit §4.1 `split_statements` loop
+instead, which has no wrapper and runs each statement under the session's own state.
 
 A host that *does* want rows from a multi-statement run does **not** call `execute_script` — it
-writes its own §4.1 loop and consumes the cursors it cares about. The `execute_script` transaction
-behavior (all-or-nothing, explicit-`BEGIN` partitioning, error-stops-the-run) **is** corpus-tested
-(an ordered schedule). Capability: `session.script`.
+writes its own §4.1 loop and consumes the cursors it cares about. `execute_script` is **host-API
+surface** (like `open`/`commit`/`close` and the §2 session methods), so its behavior — all-or-nothing
+when `Idle`, join-when-`Open`, error-stops-the-run, the `0A000` control-statement gate, the
+`ScriptSummary` counts — is **per-core unit tested**, the same way S1's session machine is
+(CLAUDE.md §10: the single-statement corpus cannot *call* `execute_script`, and the transaction
+*atomicity* it rests on is already corpus-covered by the transactions suite). The splitter's
+boundary correctness (§4.1) is likewise per-core unit tested.
 
 ## 5. The safety envelope (bucket A)
 
@@ -494,10 +510,13 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
    TS `Session` exposes `execute` + settings + `status`; its `view`/`update` closure sugar is deferred
    to avoid an `api.ts` module cycle — TS drives an additional session's transactions via SQL
    `BEGIN`/`COMMIT` through `execute`.)
-2. **Multi-statement splitter + `execute_script`** (§4) — the **library-level** lexer `split_statements`
-   function (no `Session`/`Database`; per-core unit tested) + the session-level discard-rows /
-   one-implicit-transaction `execute_script` convenience (corpus-tested ordered schedule). The
-   capability `session.script` covers `execute_script` only — the splitter adds no SQL semantics.
+2. **Multi-statement splitter + `execute_script`** (§4) — ✅ **landed (all 3 cores).** The
+   **library-level** lexer `split_statements` function (a top-level export, no `Session`/`Database`) + the session-level discard-rows /
+   one-implicit-transaction `execute_script` convenience. Both are **host-API surface**, so both are
+   **per-core unit tested** (the single-statement corpus can call neither, CLAUDE.md §10);
+   `execute_script`'s atomicity rests on the already-corpus-covered transaction machinery, and the
+   splitter adds no SQL semantics. v1 narrowing: an in-script `BEGIN`/`COMMIT`/`ROLLBACK` is `0A000`
+   (partitioning is a §11 follow-on). No new capability flag (nothing in the corpus gates on it).
 3. **Privileges — the GRANT/REVOKE model** (§5.3) — per-table `SELECT`/`INSERT`/`UPDATE`/`DELETE`
    + function `EXECUTE` + `allow_ddl`, resolve-time enforcement with `42501`. Capabilities
    `session.privileges` / `session.allow_ddl`; the `# default_privileges:` / `# grant:` /
@@ -512,6 +531,12 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
 
 ## 11. Open / deferred (none foreclosed)
 
+- **`execute_script` transaction partitioning** — the PG-simple-query semantics where an in-script
+  `COMMIT`/`ROLLBACK` partitions a multi-statement run into separately-committed segments (and an
+  in-script `BEGIN` opens a nested explicit block inside the implicit wrapper). v1 rejects **all**
+  in-script transaction control with `0A000` (§4.2) — clean and well-defined — and leaves the
+  partitioning state machine, which must reconcile the implicit wrapper with an in-script `BEGIN`,
+  for a later slice. The §4.1 `split_statements` loop is the escape hatch in the meantime.
 - **`idle_in_transaction_timeout` enforcement** — the setting slot is defined (§2.2/§3); the
   background auto-rollback of an idle open transaction + the `25P03` abort is a deferred slice (it
   needs a clock read on the §6 seam, so its trigger stays deterministic-given-the-clock).

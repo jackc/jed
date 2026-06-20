@@ -909,16 +909,23 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         a swap** (`Session::execute`/`query`/`view`/`update`). State ownership: committed data on
         `Database`, session state on `Session`. Near-pure refactor — corpus + all suites unchanged
         (162/0 ×3, NoREC 660/660), per-core `session` tests added. _(§2)_
-  - [ ] **S2 — multi-statement splitter + `execute_script`** — NOT a buffering `Vec<Outcome>` batch
-        (that would be an unbounded buffer, violating §13). A **library-level** (no `Session`/`Database`)
-        lazy **`split_statements(sql)`** iterator (top-level core export / parser surface; lexer-level
-        boundary scan respecting strings/dollar-quotes/comments, yields one statement span at a time,
-        no parse tree, per-core unit tested) — the host loops it through the normal single-statement
-        path, so all existing bounds (`max_sql_length`/`54001`/`max_cost`/`lifetime_max_cost`/
-        privileges/streaming cursor) apply for free. Plus a thin **session-level**
-        **`session.execute_script(sql)`** convenience: split + run-each + discard rows + one implicit
-        transaction (honor explicit `BEGIN`/`COMMIT`), returning an `O(1)` `ScriptSummary`. Capability
-        `session.script` (covers `execute_script`; the splitter adds no SQL semantics). _(size: L; §4)_
+  - [x] **S2 — multi-statement splitter + `execute_script`** — ✅ **landed (all 3 cores).** A
+        **library-level** (no `Session`/`Database`) lazy **`split_statements(sql)`** iterator
+        (`SplitStatements`/`StatementSpan`; top-level core export / parser surface; an O(n) lexer-level
+        boundary scan respecting string literals, dollar-quoted strings, and line/block comments,
+        yielding one statement span at a time, buffering nothing) — the host loops it through the
+        normal single-statement path, so all existing bounds (`max_sql_length`/`54001`/`max_cost`/
+        privileges/cursor) apply for free. Plus the thin **`db.execute_script(sql)`** /
+        **`session.execute_script`** convenience: split + run-each + **discard rows** + one implicit
+        transaction when `Idle` (all-or-nothing; **joins** an already-`Open` transaction), returning
+        the `O(1)` `ScriptSummary { statements_run, rows_affected_total, cost }`. NOT a buffering
+        `Vec<Outcome>` batch (that would be an unbounded buffer, violating §13). Both are **host-API
+        surface**, so **per-core unit tested** (the single-statement corpus can call neither, §10):
+        `split.rs`/`split_test.go`/`split.test.ts` (boundary correctness) + `execute_script` tests
+        (atomicity / join / counts). **v1 narrowing:** in-script transaction control
+        (`BEGIN`/`COMMIT`/`ROLLBACK`) is **`0A000`** — the implicit wrapper owns the boundary;
+        PG-simple-query partitioning is deferred (session.md §11). No new error code, no format
+        change, no capability flag. → [session.md §4](spec/design/session.md) _(§4)_
   - [ ] **S3 — privileges (the GRANT/REVOKE model)** — per-table `SELECT`/`INSERT`/`UPDATE`/`DELETE`
         + per-function `EXECUTE`, expressed as a session `default_privileges` set (granted to all
         tables — replaces the read-only/read-write boolean) plus per-object `grant`/`revoke` deltas
