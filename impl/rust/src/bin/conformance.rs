@@ -303,6 +303,25 @@ fn parse_allow_ddl_directive(rest: &str) -> Option<bool> {
     }
 }
 
+/// Parse a `# set: name=value, name2=value2` directive body (spec/design/session.md §6.1): the
+/// session variables to set for the next record, returned as `(name, value)` pairs (or None if this
+/// comment is not a `set:` directive). Per-record (reset after), like `# seed:` / `# grant:`. Each
+/// pair splits on the first `=`; names are dotted (custom) variables (a non-dotted name would be
+/// rejected `42704` when applied).
+fn parse_set_directive(rest: &str) -> Option<Vec<(String, String)>> {
+    let body = rest.trim_start().strip_prefix("set:")?;
+    let mut pairs = Vec::new();
+    for part in body.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        let (name, value) = part.split_once('=')?;
+        pairs.push((name.trim().to_string(), value.trim().to_string()));
+    }
+    Some(pairs)
+}
+
 /// Parse a `# seed: N` directive body (entropy.md §6): the fixed PRNG seed (u64) to run the next
 /// record under, making the volatile uuid generators deterministic + cross-core identical.
 fn parse_seed_directive(rest: &str) -> Option<u64> {
@@ -413,6 +432,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut pending_grants: Vec<(jed::PrivilegeSet, String)> = Vec::new();
     let mut pending_revokes: Vec<(jed::PrivilegeSet, String)> = Vec::new();
     let mut pending_allow_ddl: Option<bool> = None;
+    let mut pending_vars: Vec<(String, String)> = Vec::new();
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -448,6 +468,8 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 pending_revokes.push(r);
             } else if let Some(a) = parse_allow_ddl_directive(rest) {
                 pending_allow_ddl = Some(a);
+            } else if let Some(vars) = parse_set_directive(rest) {
+                pending_vars.extend(vars);
             } else if let Some(s) = parse_seed_directive(rest) {
                 pending_seed = Some(s);
             } else if let Some(c) = parse_clock_directive(rest) {
@@ -505,6 +527,13 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
         }
         if let Some(a) = pending_allow_ddl.take() {
             db.set_allow_ddl(a);
+        }
+        // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
+        // pending `# set:` pair, so a directive decorates only its record and never leaks forward.
+        db.reset_vars();
+        for (name, value) in pending_vars.drain(..) {
+            db.set_var(&name, &value)
+                .expect("# set: directive uses a dotted (custom) variable name");
         }
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();

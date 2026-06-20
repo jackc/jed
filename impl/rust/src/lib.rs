@@ -405,6 +405,11 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // session's running total reaches it; sibling to resource.cost_limit's per-statement 54P01. The
     // sticky `# lifetime_max_cost:` directive sets the budget for the rest of the file (session.md §5.4).
     "session.lifetime_cost",
+    // Session variables — PostgreSQL's GUC model scoped to the session: a string→string map the host
+    // sets (set_var/reset_var/var) and SQL reads with current_setting('name'[, missing_ok]). Custom
+    // (dotted) names only; an unset name is 42704 unless missing_ok. The `# set:` directive configures
+    // the session for the next record (session.md §6.1).
+    "session.variables",
     // Identifier-length limit — a fixed MAX_IDENTIFIER_LENGTH (63 bytes) checked at the lexer's
     // identifier production aborts an over-long name with 42622, on every parse path (cost.md §7).
     "resource.identifier_length_limit",

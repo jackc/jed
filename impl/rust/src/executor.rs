@@ -761,6 +761,28 @@ pub struct Session {
     /// schema change is `42501`. Default **on** — jed has no schema/owner model, so this single
     /// boolean governs all DDL (the per-object CREATE/ownership privilege is a deferred follow-on).
     pub(crate) allow_ddl: bool,
+    /// The session variables (spec/design/session.md §6.1): PostgreSQL's GUC model scoped to the
+    /// session — a `string→string` map (PG GUCs are all text) the host sets (`set_var`/`reset_var`)
+    /// and SQL reads with `current_setting`. Custom (dotted) names only in v1. **Session state, not
+    /// snapshot state**: it does NOT roll back with a transaction (PG `SET SESSION`), and it carries
+    /// across the additional-session swap because it lives on `Session` (like the privilege envelope).
+    pub(crate) vars: HashMap<String, String>,
+}
+
+/// Validate + canonicalize a session-variable name (spec/design/session.md §6.1). A variable must be
+/// **namespaced** like a PostgreSQL custom GUC — a dotted name (`myapp.tenant`); a non-dotted name
+/// would be a built-in setting, and v1 exposes none through this map (the `time_zone` built-in is a
+/// separate slice), so it is `42704`. Returns the case-folded (lowercase, PG GUC names are
+/// case-insensitive) map key.
+fn require_custom_var_name(name: &str) -> Result<String> {
+    if name.contains('.') {
+        Ok(name.to_ascii_lowercase())
+    } else {
+        Err(EngineError::new(
+            SqlState::UndefinedObject,
+            format!("unrecognized configuration parameter: {name}"),
+        ))
+    }
 }
 
 impl Default for Session {
@@ -795,6 +817,7 @@ impl Session {
             pending_last_name: std::cell::RefCell::new(None),
             privileges,
             allow_ddl: opts.allow_ddl,
+            vars: HashMap::new(),
         }
     }
 
@@ -936,6 +959,34 @@ impl Session {
     /// Whether DDL is permitted on this session.
     pub fn allow_ddl(&self) -> bool {
         self.allow_ddl
+    }
+    /// Set a session variable (spec/design/session.md §6.1) — PostgreSQL's GUC model, scoped to the
+    /// session. Custom variables must be **namespaced** (a dotted name like `myapp.tenant`); a
+    /// non-dotted name is `42704` (no built-in setting is reachable through this map in v1 — the
+    /// `time_zone` built-in is its own slice). The name is case-insensitive (folded to lowercase, PG);
+    /// the value is text. Session state, not snapshot state — it does NOT roll back with a transaction.
+    pub fn set_var(&mut self, name: &str, value: &str) -> Result<()> {
+        let key = require_custom_var_name(name)?;
+        self.vars.insert(key, value.to_string());
+        Ok(())
+    }
+    /// Clear a session variable (§6.1). A non-dotted name is `42704` (as for `set_var`); an unset
+    /// name is a no-op success (PG `RESET` of an unset custom variable).
+    pub fn reset_var(&mut self, name: &str) -> Result<()> {
+        let key = require_custom_var_name(name)?;
+        self.vars.remove(&key);
+        Ok(())
+    }
+    /// Read a session variable's value (§6.1), or `None` if it is not set. The host getter never
+    /// errors — it is the SQL `current_setting` read that raises `42704` on an unset name.
+    pub fn var(&self, name: &str) -> Option<String> {
+        self.vars.get(&name.to_ascii_lowercase()).cloned()
+    }
+    /// Clear every session variable (§6.1) — PostgreSQL's `RESET ALL` for the variable map. Also the
+    /// per-record reset hook the conformance harness's `# set:` directive uses (so a directive never
+    /// leaks past its record).
+    pub fn reset_vars(&mut self) {
+        self.vars.clear();
     }
     /// Inject a random source for the uuid generators (entropy.md §6).
     pub fn set_random_source(&mut self, f: crate::seam::RandomSource) {
@@ -1358,6 +1409,29 @@ impl Database {
     /// Whether DDL is permitted on the default session.
     pub fn allow_ddl(&self) -> bool {
         self.session.allow_ddl
+    }
+
+    /// Set a session variable on the default session (spec/design/session.md §6.1). Custom variables
+    /// must be **namespaced** (a dotted name); a non-dotted name is `42704`. Read it back in SQL with
+    /// `current_setting('name'[, missing_ok])`.
+    pub fn set_var(&mut self, name: &str, value: &str) -> Result<()> {
+        self.session.set_var(name, value)
+    }
+
+    /// Clear a session variable on the default session (§6.1); a non-dotted name is `42704`.
+    pub fn reset_var(&mut self, name: &str) -> Result<()> {
+        self.session.reset_var(name)
+    }
+
+    /// Read a session variable's value on the default session (§6.1), or `None` if it is not set.
+    pub fn var(&self, name: &str) -> Option<String> {
+        self.session.var(name)
+    }
+
+    /// Clear every session variable on the default session (§6.1) — PostgreSQL's `RESET ALL` for the
+    /// variable map (also the conformance harness `# set:` reset hook).
+    pub fn reset_vars(&mut self) {
+        self.session.reset_vars();
     }
 
     /// Set the maximum input SQL length, in **bytes**, accepted on this handle (CLAUDE.md §13;
@@ -8529,6 +8603,10 @@ enum ScalarFunc {
     /// lastval() → i64 — the value the most recent `nextval` (any sequence) returned IN THIS
     /// SESSION (sequences.md §6). VOLATILE; reads per-session state, 55000 before the first nextval.
     Lastval,
+    /// current_setting(text[, bool]) → text — the named session variable's value (spec/design/session.md
+    /// §6.1). STABLE; reads per-session state (the variable map). An unset name is `42704` unless the
+    /// two-arg `missing_ok` is true (→ NULL). Arity 1 or 2.
+    CurrentSetting,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -11255,6 +11333,8 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "currval" => ScalarFunc::Currval,
         "setval" => ScalarFunc::Setval,
         "lastval" => ScalarFunc::Lastval,
+        // Session-variable read (spec/design/session.md §6.1): reads the session's variable map.
+        "current_setting" => ScalarFunc::CurrentSetting,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -18312,6 +18392,31 @@ impl RExpr {
                         Ok(Value::Int(env.exec.seq_setval(name, n, is_called)?))
                     }
                     ScalarFunc::Lastval => Ok(Value::Int(env.exec.seq_lastval()?)),
+                    // current_setting (spec/design/session.md §6.1): read the named session variable
+                    // from the session's variable map. The blanket NULL short-circuit above already
+                    // returned NULL for a NULL name / missing_ok argument, so both are non-NULL here.
+                    // An unset name is 42704 UNLESS the two-arg overload's missing_ok is true (→ NULL).
+                    ScalarFunc::CurrentSetting => {
+                        let name = match &vals[0] {
+                            Value::Text(s) => s,
+                            _ => unreachable!("resolver restricts current_setting's name to text"),
+                        };
+                        let missing_ok = match vals.get(1) {
+                            None => false,
+                            Some(Value::Bool(b)) => *b,
+                            Some(_) => unreachable!(
+                                "resolver restricts current_setting's missing_ok to boolean"
+                            ),
+                        };
+                        match env.exec.session.vars.get(&name.to_ascii_lowercase()) {
+                            Some(v) => Ok(Value::Text(v.clone())),
+                            None if missing_ok => Ok(Value::Null),
+                            None => Err(EngineError::new(
+                                SqlState::UndefinedObject,
+                                format!("unrecognized configuration parameter: {name}"),
+                            )),
+                        }
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -19019,9 +19124,10 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Nextval
         | ScalarFunc::Currval
         | ScalarFunc::Setval
-        | ScalarFunc::Lastval => {
+        | ScalarFunc::Lastval
+        | ScalarFunc::CurrentSetting => {
             unreachable!(
-                "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence fns are handled before eval_float_func"
+                "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting fns are handled before eval_float_func"
             )
         }
     };
