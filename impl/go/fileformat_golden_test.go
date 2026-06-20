@@ -502,6 +502,24 @@ func intervalTableDB(t *testing.T) *Database {
 	return db
 }
 
+// intervalPKTableDB is a golden with a fixed-width SIGNED 16-byte stored key — the
+// interval-span-i128 encoding (encoding.md §2.10). Rows store in canonical-span (= key) order:
+// -1 mon < -1 day < 0 < 1 sec < 1 day < 1 mon < 100 years; all spans distinct (span-equal
+// intervals collide on the span key). Inserted in ascending key order to match verify.rb's
+// build_tree (the split shape is order-sensitive); the out-of-order proof is in the conformance test.
+func intervalPKTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (k interval PRIMARY KEY, v i32)")
+	run(t, db, "INSERT INTO t VALUES ('-1 mon', 6)")
+	run(t, db, "INSERT INTO t VALUES ('-1 day', 5)")
+	run(t, db, "INSERT INTO t VALUES ('0 seconds', 4)")
+	run(t, db, "INSERT INTO t VALUES ('1 sec', 1)")
+	run(t, db, "INSERT INTO t VALUES ('1 day', 2)")
+	run(t, db, "INSERT INTO t VALUES ('1 mon', 3)")
+	run(t, db, "INSERT INTO t VALUES ('100 years', 7)")
+	return db
+}
+
 // float64TableDB exercises the value codec's 8-byte IEEE branch (type code 12): a positive
 // fraction, a negative value, +0 and -0 (the sign bit is preserved on disk — distinct bytes), both
 // infinities, a canonicalized NaN (stored as the single quiet pattern 0x7FF8…000), a NULL, and
@@ -685,6 +703,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"timestamp_table.jed", timestampTableDB},
 		{"timestamptz_table.jed", timestamptzTableDB},
 		{"interval_table.jed", intervalTableDB},
+		{"interval_pk_table.jed", intervalPKTableDB},
 		{"float64_table.jed", float64TableDB},
 		{"float32_table.jed", float32TableDB},
 		{"date_table.jed", dateTableDB},
@@ -744,6 +763,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"timestamp_table.jed", timestampTableDB, "t"},
 		{"timestamptz_table.jed", timestamptzTableDB, "t"},
 		{"interval_table.jed", intervalTableDB, "t"},
+		{"interval_pk_table.jed", intervalPKTableDB, "t"},
 		{"float64_table.jed", float64TableDB, "t"},
 		{"float32_table.jed", float32TableDB, "t"},
 		{"date_table.jed", dateTableDB, "t"},

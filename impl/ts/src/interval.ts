@@ -45,6 +45,25 @@ export function intervalCmp(a: Interval, b: Interval): number {
   return sa < sb ? -1 : sa > sb ? 1 : 0;
 }
 
+// The order-preserving KEY body for an interval (method interval-span-i128,
+// spec/design/encoding.md §2.10): the 16-byte order-preserving encoding of the canonical 128-bit
+// span — int-be-signflip at i128 width (add the bias 2^127, emit a 16-byte big-endian unsigned
+// integer), mapping the signed span range monotonically onto [0, 2^128) so negatives sort below
+// positives. Fixed-width 16, so self-delimiting with no escape/terminator (like uuid). Because the
+// key is the span, two field-distinct but span-equal intervals ('1 mon' / '30 days') produce
+// identical bytes — a UNIQUE interval index treats them as one (the "equal but not identical"
+// wrinkle, the decimal 1.5/1.50 precedent). A PK is NOT NULL, so the stored key is this bare
+// 16-byte body. (micros is a bigint end-to-end, so the span is exact — CLAUDE.md §2.)
+export function intervalEncodeKey(iv: Interval): Uint8Array {
+  let v = intervalSpan(iv) + (1n << 127n);
+  const out = new Uint8Array(16);
+  for (let i = 15; i >= 0; i--) {
+    out[i] = Number(v & 0xffn);
+    v >>= 8n;
+  }
+  return out;
+}
+
 function checkedI32(v: number): number {
   if (v < -2147483648 || v > 2147483647) throw intervalFieldOverflow("interval out of range");
   return v;

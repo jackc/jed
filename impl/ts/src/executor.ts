@@ -128,6 +128,7 @@ import {
   typeIsTimestamp,
   typeIsTimestamptz,
   typeIsDate,
+  typeIsInterval,
   typeIsUuid,
   typeScalar,
   widthBytes,
@@ -140,6 +141,7 @@ import {
   type Interval,
   intervalAdd,
   intervalCmp,
+  intervalEncodeKey,
   intervalNeg,
   intervalSpan,
   intervalSub,
@@ -1468,10 +1470,10 @@ export class Database {
         // §2.9). text/bytea (…-terminated-escape §2.4/§2.6) and decimal (decimal-order-preserving
         // §2.5) are also allowed — their variable-width key encodings are self-delimiting, so they
         // compose in composite keys / index suffixes; an oversized one trips the RECORD_MAX
-        // oversized-item 0A000 (PG's btree key limit). Still rejected 0A000: interval (a later slice)
-        // and float (the determinism carve-out, determinism.md §4), plus the recursive containers
-        // composite/array/range. timestamp / timestamptz / date share the i64/i32 int-be-signflip key
-        // encoding (timestamp.md §6).
+        // oversized-item 0A000 (PG's btree key limit). interval is the fixed 16-byte span key
+        // (interval-span-i128, §2.10). Still rejected 0A000: float (the determinism carve-out,
+        // determinism.md §4) and the recursive containers composite/array/range. timestamp /
+        // timestamptz / date share the i64/i32 int-be-signflip key encoding (timestamp.md §6).
         if (
           !typeIsInteger(colType) &&
           !typeIsBoolean(colType) &&
@@ -1481,7 +1483,8 @@ export class Database {
           !typeIsUuid(colType) &&
           !typeIsTimestamp(colType) &&
           !typeIsTimestamptz(colType) &&
-          !typeIsDate(colType)
+          !typeIsDate(colType) &&
+          !typeIsInterval(colType)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -1684,7 +1687,8 @@ export class Database {
           !typeIsUuid(ty) &&
           !typeIsTimestamp(ty) &&
           !typeIsTimestamptz(ty) &&
-          !typeIsDate(ty)
+          !typeIsDate(ty) &&
+          !typeIsInterval(ty)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -1735,7 +1739,8 @@ export class Database {
           !typeIsUuid(ty) &&
           !typeIsTimestamp(ty) &&
           !typeIsTimestamptz(ty) &&
-          !typeIsDate(ty)
+          !typeIsDate(ty) &&
+          !typeIsInterval(ty)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -2315,8 +2320,9 @@ export class Database {
       if (kind === "gin") {
         // GIN needs an operator class for the column type: only an array has one (else 42704),
         // and only a FIXED-WIDTH KEY-ENCODABLE element type (else 0A000) — the GIN term IS that
-        // element's key encoding (gin.md §3/§4), so the admitted set is exactly the keyable scalars
-        // a PK / ordered-index key column accepts.
+        // element's key encoding (gin.md §3/§4), so the admitted set is the integers, boolean, uuid,
+        // date, timestamp, timestamptz (interval's GIN-element support is a separate follow-on — its
+        // key landed but the GIN slice has not; gin.md §3/§10).
         if (ty.kind !== "array") {
           throw engineError(
             "undefined_object",
@@ -2339,7 +2345,9 @@ export class Database {
         !typeIsDecimal(ty) &&
         !typeIsUuid(ty) &&
         !typeIsTimestamp(ty) &&
-        !typeIsTimestamptz(ty)
+        !typeIsTimestamptz(ty) &&
+        !typeIsDate(ty) &&
+        !typeIsInterval(ty)
       ) {
         throw engineError(
           "feature_not_supported",
@@ -6717,6 +6725,8 @@ function indexEntryKey(
       parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
     } else if (v.kind === "decimal") {
       parts.push(Uint8Array.of(0x00), v.dec.encodeKey());
+    } else if (v.kind === "interval") {
+      parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
     } else {
       throw new Error(
         "an index column is a key-encodable type (CREATE INDEX gate)",
@@ -6753,12 +6763,13 @@ function indexEntryKeys(
 // NULL) and an empty payload. A NULL array column value and an empty array yield no entries (so
 // they appear in no posting list). Returned sorted by term (= encoded-byte order for the integer
 // element types). This slice: a single integer-element array column.
-// isGinElementType reports whether elem is an element type a GIN (array_ops) index admits — exactly
-// the fixed-width key-encodable scalars (the integers, boolean, uuid, date, timestamp, timestamptz;
-// spec/design/gin.md §3): a GIN term IS the element's order-preserving key encoding (§4) and a term
-// carries no length/terminator framing, so only the FIXED-WIDTH keyables qualify. The variable-width
-// keyables (text, bytea, decimal) — valid ordered-index / PK keys — are 0A000 here, as are the
-// not-yet-key-encoded interval and the floats.
+// isGinElementType reports whether elem is an element type a GIN (array_ops) index admits — the
+// integers, boolean, uuid, date, timestamp, timestamptz (spec/design/gin.md §3): a GIN term IS the
+// element's order-preserving key encoding (§4) and a term carries no length/terminator framing, so
+// only the FIXED-WIDTH keyables qualify. The variable-width keyables (text, bytea, decimal) — valid
+// ordered-index / PK keys — are 0A000 here, as is float. interval is fixed-width keyable (its 16-byte
+// span key landed, encoding.md §2.10) but its GIN element support is a separate follow-on slice
+// (gin.md §3/§10), so it is not yet admitted here.
 function isGinElementType(elem: Type): boolean {
   return (
     typeIsInteger(elem) ||
@@ -6892,10 +6903,12 @@ function encodePkKey(table: Table, pk: number[], row: Row): Uint8Array {
       parts.push(encodeTerminated(pkv.bytes));
     } else if (pkv.kind === "decimal") {
       parts.push(pkv.dec.encodeKey());
+    } else if (pkv.kind === "interval") {
+      parts.push(intervalEncodeKey(pkv.iv));
     } else {
       throw engineError(
         "data_corrupted",
-        "a primary key must be an integer, boolean, uuid, text, bytea, decimal, or timestamp value",
+        "a primary key must be an integer, boolean, uuid, text, bytea, decimal, interval, or timestamp value",
       );
     }
   }
@@ -7026,6 +7039,8 @@ function indexPrefixKey(
       parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
     } else if (v.kind === "decimal") {
       parts.push(Uint8Array.of(0x00), v.dec.encodeKey());
+    } else if (v.kind === "interval") {
+      parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
     } else {
       throw new Error(
         "an index column is a key-encodable type (CREATE INDEX gate)",
@@ -7067,6 +7082,7 @@ function encodeKeyValue(ty: ScalarType, value: Value): Uint8Array {
   if (value.kind === "text") return encodeTerminated(SQL_BYTE_ENCODER.encode(value.text));
   if (value.kind === "bytea") return encodeTerminated(value.bytes);
   if (value.kind === "decimal") return value.dec.encodeKey();
+  if (value.kind === "interval") return intervalEncodeKey(value.iv);
   throw new Error(
     "a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)",
   );
@@ -7295,6 +7311,8 @@ function isConstSource(e: RExpr, pkType: ScalarType): boolean {
       return isBytea(pkType);
     case "constDecimal":
       return isDecimal(pkType);
+    case "constInterval":
+      return isInterval(pkType);
     default:
       return false;
   }
@@ -7386,6 +7404,8 @@ function encodeBoundKey(
       return { kind: "key", key: encodeTerminated(src.value) };
     case "constDecimal":
       return { kind: "key", key: src.value.encodeKey() };
+    case "constInterval":
+      return { kind: "key", key: intervalEncodeKey(src.value) };
     case "param":
       return encodeValueKey(pkType, params[src.index]!);
     case "outerColumn":
@@ -7411,6 +7431,7 @@ function encodeValueKey(pkType: ScalarType, v: Value): BoundKey {
     return { kind: "key", key: encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)) };
   if (v.kind === "bytea") return { kind: "key", key: encodeTerminated(v.bytes) };
   if (v.kind === "decimal") return { kind: "key", key: v.dec.encodeKey() };
+  if (v.kind === "interval") return { kind: "key", key: intervalEncodeKey(v.iv) };
   if (v.kind === "int")
     return inRange(pkType, v.int)
       ? { kind: "key", key: encodeInt(pkType, v.int) }

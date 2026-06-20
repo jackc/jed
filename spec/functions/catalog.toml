@@ -1446,7 +1446,8 @@ errors         = ["22008"]
 # traps 22008. interval + timestamp[tz] commutes. timestamp[tz] − timestamp[tz] -> interval,
 # justified into days + time (months = 0); an ±infinity operand traps 22008. arg_resolution =
 # "none" (the two operands are genuinely different types, not reconciled to one). result is the
-# concrete type. These are NOT a key/index concern (interval is not a key this slice).
+# concrete type. (These arithmetic operators are not a key/index concern; interval IS keyable via
+# its order-preserving span key — encoding.md §2.10 — but that is the storage layer, not these ops.)
 
 [[operator]]
 name           = "add"

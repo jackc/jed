@@ -1,0 +1,69 @@
+# Order-preserving key-encoding vectors for `interval` — method `interval-span-i128`
+# (../design/encoding.md §2.10). The value's canonical 128-bit microsecond **span**
+# (span = (months·30 + days)·86_400_000_000 + micros — interval.md §2) is encoded as a 16-byte
+# `int-be-signflip` i128: add the bias 2^127 and emit a 16-byte big-endian unsigned integer, so the
+# signed span range maps monotonically onto [0, 2^128). Fixed-width 16, so self-delimiting with no
+# escape/terminator (like uuid §2.7). The encoding is over the SPAN, so two field-distinct but
+# span-equal intervals (`1 mon` / `30 days` / `720:00:00`) produce identical bytes — they index as
+# equal (a UNIQUE interval index treats them as one, the "equal but not identical" wrinkle).
+# An interval PRIMARY KEY stores the BARE body (NOT NULL, no presence tag); an index slot wraps it
+# in the §2.2 nullable tag; descending inverts the whole component (§2.3). Verified by verify.rb
+# (round-trip-free: a key is never decoded back to a value, so only encode + byte-exactness +
+# strict order are checked).
+#
+# Each case carries the (months, days, micros) field triple and a human `label`. Groups are in
+# ascending logical (= byte) order, so the order invariant is a walk of the list.
+
+schema_version = 1
+
+# --- bare interval key body (the PRIMARY KEY form) ---------------------------
+# A full ascending spread crossing the sign boundary, through the zero interval, ±1 µs, and the
+# month/day/time fields — the strongest order proof. (`1 mon` and `30 days` are span-equal and would
+# collide, so only one appears in this strictly-increasing list; the collision is pinned by the core
+# unit tests + the conformance 23505 case.)
+[[bare]]
+type = "interval"
+cases = [
+  { label = "-100 years",  months = -1200, days = 0,  micros = 0,        bytes = "7ffffffffffffffffff4f31b90e40000" },
+  { label = "-1 mon",      months = -1,    days = 0,  micros = 0,        bytes = "7ffffffffffffffffffffda480c2c000" },
+  { label = "-1 day",      months = 0,     days = -1, micros = 0,        bytes = "7fffffffffffffffffffffebe228a000" },
+  { label = "-00:00:01",   months = 0,     days = 0,  micros = -1000000, bytes = "7ffffffffffffffffffffffffff0bdc0" },
+  { label = "-0.000001 s", months = 0,     days = 0,  micros = -1,       bytes = "7fffffffffffffffffffffffffffffff" },
+  { label = "00:00:00",    months = 0,     days = 0,  micros = 0,        bytes = "80000000000000000000000000000000" },
+  { label = "0.000001 s",  months = 0,     days = 0,  micros = 1,        bytes = "80000000000000000000000000000001" },
+  { label = "00:00:01",    months = 0,     days = 0,  micros = 1000000,  bytes = "800000000000000000000000000f4240" },
+  { label = "1 day",       months = 0,     days = 1,  micros = 0,        bytes = "8000000000000000000000141dd76000" },
+  { label = "1 mon",       months = 1,     days = 0,  micros = 0,        bytes = "80000000000000000000025b7f3d4000" },
+  { label = "100 years",   months = 1200,  days = 0,  micros = 0,        bytes = "8000000000000000000b0ce46f1c0000" },
+]
+
+# --- nullable interval slot --------------------------------------------------
+# 0x00 = present + the 16-byte body; 0x01 = NULL. Present sorts before NULL, so NULLs sort last
+# ascending (the PostgreSQL model — §2.2/§4).
+[[nullable]]
+type = "interval"
+cases = [
+  { label = "-1 mon",     months = -1, days = 0,  micros = 0, bytes = "007ffffffffffffffffffffda480c2c000" },
+  { label = "-1 day",     months = 0,  days = -1, micros = 0, bytes = "007fffffffffffffffffffffebe228a000" },
+  { label = "00:00:00",   months = 0,  days = 0,  micros = 0, bytes = "0080000000000000000000000000000000" },
+  { label = "0.000001 s", months = 0,  days = 0,  micros = 1, bytes = "0080000000000000000000000000000001" },
+  { label = "1 day",      months = 0,  days = 1,  micros = 0, bytes = "008000000000000000000000141dd76000" },
+  { label = "1 mon",      months = 1,  days = 0,  micros = 0, bytes = "0080000000000000000000025b7f3d4000" },
+  { null = true,                                              bytes = "01" },                                  # NULL sorts last
+]
+
+# --- descending interval slot ------------------------------------------------
+# Bitwise inversion of the nullable encoding (tag byte + body); NULL lifts to first. Listed in
+# ascending byte order (= descending logical order) so the order invariant holds.
+[[descending]]
+type = "interval"
+base = "nullable"
+cases = [
+  { null = true,                                              bytes = "fe" },                                  # NULL sorts first under descending
+  { label = "1 mon",      months = 1,  days = 0,  micros = 0, bytes = "ff7ffffffffffffffffffffda480c2bfff" },
+  { label = "1 day",      months = 0,  days = 1,  micros = 0, bytes = "ff7fffffffffffffffffffffebe2289fff" },
+  { label = "0.000001 s", months = 0,  days = 0,  micros = 1, bytes = "ff7ffffffffffffffffffffffffffffffe" },
+  { label = "00:00:00",   months = 0,  days = 0,  micros = 0, bytes = "ff7fffffffffffffffffffffffffffffff" },
+  { label = "-1 day",     months = 0,  days = -1, micros = 0, bytes = "ff8000000000000000000000141dd75fff" },
+  { label = "-1 mon",     months = -1, days = 0,  micros = 0, bytes = "ff80000000000000000000025b7f3d3fff" },
+]

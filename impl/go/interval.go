@@ -45,6 +45,23 @@ func (iv Interval) Span() *big.Int {
 // SpanCmp compares two intervals by their canonical span: -1, 0, or 1.
 func (iv Interval) SpanCmp(o Interval) int { return iv.Span().Cmp(o.Span()) }
 
+// EncodeKey is the order-preserving KEY body for an interval (method interval-span-i128,
+// spec/design/encoding.md §2.10): the 16-byte order-preserving encoding of the canonical 128-bit
+// Span — int-be-signflip at i128 width (add the bias 2^127, emit a 16-byte big-endian unsigned
+// integer), mapping the signed span range monotonically onto [0, 2^128) so negatives sort below
+// positives. Fixed-width 16, so self-delimiting with no escape/terminator (like uuid). Because the
+// key is the Span, two field-distinct but span-equal intervals ('1 mon' / '30 days') produce
+// identical bytes — a UNIQUE interval index treats them as one (the "equal but not identical"
+// wrinkle, the decimal 1.5/1.50 precedent). A PK is NOT NULL, so the stored key is this bare
+// 16-byte body. (math/big since Go has no int128; the bias keeps the value non-negative so
+// FillBytes never panics.)
+func (iv Interval) EncodeKey() []byte {
+	biased := iv.Span()
+	biased.Add(biased, new(big.Int).Lsh(big.NewInt(1), 127)) // + 2^127
+	out := make([]byte, 16)
+	return biased.FillBytes(out) // big-endian, left-zero-padded into the 16-byte buffer
+}
+
 // addI32 adds two int32s with overflow detection.
 func addI32(a, b int32) (int32, bool) {
 	s := int64(a) + int64(b)

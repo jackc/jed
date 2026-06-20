@@ -368,6 +368,25 @@ fn decimal_pk_table_db() -> Database {
     db
 }
 
+/// A table with an (unconstrained) interval PRIMARY KEY (the interval-span-i128 encoding,
+/// encoding.md §2.10) — the first fixed-width SIGNED 16-byte key. Stored in canonical-span
+/// (= key) order: -1 mon < -1 day < 0 < 1 sec < 1 day < 1 mon < 100 years. All spans distinct
+/// (span-equal intervals would collide on the span key). Inserted in ascending key order — the
+/// builder splits a node by inserting ascending (verify.rb `build_tree`), so the core must match
+/// that order for byte-identical pages; the out-of-order-insert proof lives in the conformance test.
+fn interval_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (k interval PRIMARY KEY, v i32)");
+    run(&mut db, "INSERT INTO t VALUES ('-1 mon', 6)");
+    run(&mut db, "INSERT INTO t VALUES ('-1 day', 5)");
+    run(&mut db, "INSERT INTO t VALUES ('0 seconds', 4)");
+    run(&mut db, "INSERT INTO t VALUES ('1 sec', 1)");
+    run(&mut db, "INSERT INTO t VALUES ('1 day', 2)");
+    run(&mut db, "INSERT INTO t VALUES ('1 mon', 3)");
+    run(&mut db, "INSERT INTO t VALUES ('100 years', 7)");
+    db
+}
+
 /// A table with a decimal column — exercises the value codec's decimal branch (flags + u16
 /// scale + u16 ndigits + base-10⁴ groups) and the catalog typmod: an unconstrained `numeric`
 /// column `d` and a constrained `numeric(10,2)` column `m` (values already at scale 2, so a
@@ -805,6 +824,7 @@ fn write_matches_goldens() {
         ("timestamp_table.jed", timestamp_table_db),
         ("timestamptz_table.jed", timestamptz_table_db),
         ("interval_table.jed", interval_table_db),
+        ("interval_pk_table.jed", interval_pk_table_db),
         ("float64_table.jed", float64_table_db),
         ("float32_table.jed", float32_table_db),
         ("date_table.jed", date_table_db),
@@ -859,6 +879,7 @@ fn read_goldens_reproduces_rows() {
         ("timestamp_table.jed", timestamp_table_db, "t"),
         ("timestamptz_table.jed", timestamptz_table_db, "t"),
         ("interval_table.jed", interval_table_db, "t"),
+        ("interval_pk_table.jed", interval_pk_table_db, "t"),
         ("float64_table.jed", float64_table_db, "t"),
         ("float32_table.jed", float32_table_db, "t"),
         ("date_table.jed", date_table_db, "t"),

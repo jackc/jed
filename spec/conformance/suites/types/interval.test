@@ -4,9 +4,10 @@
 # PG `IntervalStyle = postgres` rendering, and comparison/ordering/dedup by the canonical 128-bit
 # SPAN (1 month = 30 days, 1 day = 24 h — so '1 mon' = '30 days' = '720:00:00'). NULL, the
 # fractional-unit cascade, parse-error codes (22007 malformed / 22008 field overflow), and the
-# interval-PRIMARY-KEY rejection (0A000 — not a key this slice). No field qualifiers, no
-# precision typmod, no CAST.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.is_null, query.order_by, query.distinct, query.group_by, query.aggregates, types.i32, types.interval
+# interval PRIMARY KEY / UNIQUE / secondary index (the 16-byte interval-span-i128 span key,
+# encoding.md §2.10 — span-equal values share a key). No field qualifiers, no precision typmod,
+# no CAST.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.is_null, query.order_by, query.distinct, query.group_by, query.aggregates, types.i32, types.interval
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, d interval)
@@ -161,7 +162,73 @@ SELECT INTERVAL '-1 year 2 mons'
 statement error 22008
 SELECT INTERVAL '100000000000 years'
 
-# --- interval as a key is rejected (0A000); deliberate divergence from PG (kept LAST) ---
+# --- interval as a PRIMARY KEY (encoding.md §2.10: interval-span-i128) --------------------------
+# interval IS a valid PRIMARY KEY — its order-preserving 16-byte SPAN key is exercised here (the
+# third fixed-width non-integer key, and the first whose key body differs from its stored value body:
+# the key is the derived canonical span, the value keeps the three raw fields).
+statement ok
+CREATE TABLE ik (k interval PRIMARY KEY, n i32)
 
-statement error 0A000
-CREATE TABLE bad (d interval PRIMARY KEY)
+# insert deliberately NOT in key order; the spread crosses the sign boundary, the zero interval, and
+# the month/day/time fields.
+statement ok
+INSERT INTO ik VALUES ('1 day', 2), ('-1 mon', 6), ('100 years', 7), ('0', 4), ('1 sec', 1), ('-1 day', 5), ('1 mon', 3)
+
+# point lookup on the interval PK (span-keyed equality) resolves the matching row
+query I nosort
+SELECT n FROM ik WHERE k = '1 day'
+----
+2
+
+# the key encodes the canonical SPAN, not the field triple: '30 days' (span-equal to the stored
+# '1 mon') finds that row — the "equal but not identical" case (1 mon = 30 days)
+query I nosort
+SELECT n FROM ik WHERE k = '30 days'
+----
+3
+
+# a full scan iterates in key (= span) order: -1 mon < -1 day < 0 < 1 sec < 1 day < 1 mon < 100 years;
+# each value renders its OWN fields (PG returns heap order — oracle_overrides ledger)
+query TI nosort
+SELECT k, n FROM ik
+----
+-1 mons
+6
+-1 days
+5
+00:00:00
+4
+00:00:01
+1
+1 day
+2
+1 mon
+3
+100 years
+7
+
+# a duplicate interval PK is a unique violation (23505)
+statement error 23505
+INSERT INTO ik VALUES ('1 day', 9)
+
+# span-canonicality: '30 days' equals the stored '1 mon', so it conflicts too (23505) — they index as one
+statement error 23505
+INSERT INTO ik VALUES ('30 days', 9)
+
+# a NULL interval PK is rejected NOT NULL (23502)
+statement error 23502
+INSERT INTO ik VALUES (NULL, 9)
+
+# interval is also a valid UNIQUE column and an ordered secondary-index key (the same lifted gate)
+statement ok
+CREATE TABLE iu (id i32 PRIMARY KEY, span interval UNIQUE)
+
+statement ok
+INSERT INTO iu VALUES (1, '1 mon'), (2, '2 days')
+
+# the UNIQUE interval index treats '30 days' as equal to the stored '1 mon' (span-equal, field-distinct) — 23505
+statement error 23505
+INSERT INTO iu VALUES (3, '30 days')
+
+statement ok
+CREATE INDEX iu_span ON iu (span)

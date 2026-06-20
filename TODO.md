@@ -174,7 +174,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       unary minus; a bind-param operand takes the cast target as its type. → [grammar.md §37](spec/design/grammar.md)
 - [x] **`interval`** — PG three-field span (months/days/micros), calendar-aware arithmetic, the
       engine's first timestamp arithmetic; on-disk type code 11. → [interval.md](spec/design/interval.md)
-  - [ ] _follow-on:_ interval PK/index (`0A000`); CAST to/from interval; ISO-8601 `P…` + SQL-standard
+  - [x] interval PK/index — the `interval-span-i128` 16-byte span key (PRIMARY KEY / ordered index /
+        UNIQUE / FK target / GIN element); span-equal values share a key. → [encoding.md §2.10](spec/design/encoding.md)
+  - [ ] _follow-on:_ CAST to/from interval; ISO-8601 `P…` + SQL-standard
         input; field qualifiers (`YEAR TO MONTH`) + `interval(p)`; `justify_*`/`EXTRACT`/`age`.
 - [x] **`bytea`** — variable-width bytes, unsigned byte order, `\x`-hex literals (`22P02` on bad
       hex), on-disk type code 7. → [types.md §13](spec/design/types.md)
@@ -527,8 +529,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       → [indexes.md](spec/design/indexes.md)
   - [ ] _follow-on (each its own slice + NoREC obligation):_ index ranges / multi-column prefixes;
         index scans for UPDATE/DELETE (keep PK pushdown today); LIMIT-streaming combination;
-        not-yet-key-encodable index types (interval/float keys — boolean, text, bytea, and decimal
-        have since landed); expression/ordered/partial keys; `IF NOT EXISTS`.
+        the lone not-yet-key-encodable index type (`float` keys — boolean, text, bytea, decimal, and
+        interval have since landed); expression/ordered/partial keys; `IF NOT EXISTS`.
 - [ ] **GIN inverted indexes** (`CREATE INDEX … USING gin`) — a second index *kind* beside the
       ordered B-tree, via a type-generic operator-class seam (extract-terms / extract-query /
       consistent). This slice: the **`array_ops`** opclass over a single integer-element array
@@ -596,8 +598,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on (each its own slice):_ `<@` (contained-by, broad scan + recheck — blocked on the
         index recording empty/NULL-array rows) / `IN` over a scalar list; the **remaining** element
         types — the VARIABLE-width keyables (`text[]`, `bytea[]`, `decimal[]`) need GIN term framing
-        (a term carries no length/terminator), and `interval[]`/`float[]` need their key encoding to
-        lift first — plus composite-element arrays; multi-column GIN; correlated / array-column query operands; the
+        (a term carries no length/terminator), and `float[]` needs its key encoding to lift first;
+        `interval[]` is now UNBLOCKED (its fixed-width 16-byte span key landed, encoding.md §2.10) but
+        its GIN element support is its own slice — plus composite-element arrays; multi-column GIN; correlated / array-column query operands; the
         **ordered-index** equality bound for UPDATE/DELETE (mutations use PK+GIN but not the ordered
         index yet); the LIMIT-streaming combination; posting-list run compression; the **`jsonb_ops`**
         opclass (the lossy-recheck path the seam already seats) and a future object/document opclass.

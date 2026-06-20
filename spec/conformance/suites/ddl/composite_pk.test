@@ -5,7 +5,7 @@
 # a non-keyable member type is a documented 0A000 narrowing.
 # spec/design/constraints.md §3, grammar.md §28.
 # Format: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.update, query.select, query.order_by, types.i16, types.i32, types.text, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.composite_primary_key, ddl.not_null, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.update, query.select, query.order_by, types.i16, types.i32, types.text, types.decimal, types.interval, resource.cost_metering
 
 statement ok
 CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))
@@ -136,8 +136,8 @@ SELECT a, b FROM e5 ORDER BY b
 20
 
 # a text member is now key-encodable (the text-terminated-escape encoding, encoding.md §2.4 —
-# self-delimiting, so it composes with the fixed-width members); decimal (§2.5) is likewise
-# key-encodable. Types still without a key encoding (interval/float/composite/array/range) remain
+# self-delimiting, so it composes with the fixed-width members); decimal (§2.5) and interval (§2.10)
+# are likewise key-encodable. Types still without a key encoding (float/composite/array/range) remain
 # the 0A000 narrowing.
 statement ok
 CREATE TABLE e6 (a i32, s text, PRIMARY KEY (a, s))
@@ -177,4 +177,25 @@ SELECT d, a FROM e7
 2
 1
 -1.5
+2
+
+# an interval member composes with a fixed-width member: its 16-byte span key (interval-span-i128,
+# encoding.md §2.10) is fixed-width, so the following column is unambiguous. Orders by a, then by the
+# interval member iv in canonical-span order (-1 day < 1 hour < 1 day).
+statement ok
+CREATE TABLE e8 (a i32, iv interval, PRIMARY KEY (a, iv))
+
+statement ok
+INSERT INTO e8 VALUES (1, '1 day'), (1, '-1 day'), (1, '1 hour'), (2, '-1 day')
+
+query TI nosort
+SELECT iv, a FROM e8
+----
+-1 days
+1
+01:00:00
+1
+1 day
+1
+-1 days
 2

@@ -1504,14 +1504,15 @@ impl Database {
             if def.primary_key {
                 // The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
                 // boolean (`bool-byte` §2.9), uuid (`uuid-raw16` §2.7), timestamp/timestamptz (i64
-                // `int-be-signflip`, spec/design/timestamp.md §6), date (i32, spec/design/date.md §5)
-                // — plus the variable-width `text`/`bytea` (`…-terminated-escape`, encoding.md
-                // §2.4/§2.6) and `decimal` (`decimal-order-preserving` §2.5), all self-delimiting so
-                // they compose in composite keys / index suffixes. Still rejected `0A000`: interval
-                // (a later slice) and `float` (the principled determinism carve-out — determinism.md
-                // §4), plus the recursive containers composite/array/range. An oversized text/bytea/
-                // decimal key (one that can't fit a node) trips the existing RECORD_MAX oversized-item
-                // 0A000, mirroring PG's btree key-size limit.
+                // `int-be-signflip`, spec/design/timestamp.md §6), date (i32, spec/design/date.md §5),
+                // interval (`interval-span-i128` — the 16-byte span key, encoding.md §2.10) — plus
+                // the variable-width `text`/`bytea` (`…-terminated-escape`, encoding.md §2.4/§2.6) and
+                // `decimal` (`decimal-order-preserving` §2.5), all self-delimiting so they compose in
+                // composite keys / index suffixes. Still rejected `0A000`: `float` (the principled
+                // determinism carve-out — determinism.md §4) and the recursive containers
+                // composite/array/range. An oversized text/bytea/decimal key (one that can't fit a
+                // node) trips the existing RECORD_MAX oversized-item 0A000, mirroring PG's btree
+                // key-size limit.
                 if !ty.is_integer()
                     && !ty.is_bool()
                     && !ty.is_text()
@@ -1521,6 +1522,7 @@ impl Database {
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
                     && !ty.is_date()
+                    && !ty.is_interval()
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -1751,6 +1753,7 @@ impl Database {
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
                     && !ty.is_date()
+                    && !ty.is_interval()
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -1802,6 +1805,7 @@ impl Database {
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
                     && !ty.is_date()
+                    && !ty.is_interval()
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -2376,6 +2380,7 @@ impl Database {
                         && !ty.is_timestamp()
                         && !ty.is_timestamptz()
                         && !ty.is_date()
+                        && !ty.is_interval()
                     {
                         return Err(EngineError::new(
                             SqlState::FeatureNotSupported,
@@ -2390,8 +2395,8 @@ impl Database {
                     // GIN needs an operator class for the column type: only an array has one (else
                     // 42704, no default opclass), and only a FIXED-WIDTH KEY-ENCODABLE element type
                     // (else 0A000) — the GIN term IS that element's key encoding (gin.md §3/§4), so
-                    // the admitted set is exactly the keyable scalars a PK / ordered-index key
-                    // column accepts (the integers, boolean, uuid, date, timestamp, timestamptz).
+                    // the admitted set is the integers, boolean, uuid, date, timestamp, timestamptz
+                    // (interval's GIN-element support is a separate follow-on — gin.md §3/§10).
                     match ty.array_element() {
                         None => {
                             return Err(EngineError::new(
@@ -8748,6 +8753,7 @@ enum BoundSrc {
     Text(String),
     Bytea(Vec<u8>),
     Decimal(Decimal),
+    Interval(Interval),
     Null,
     Param(usize),
     Outer { level: usize, index: usize },
@@ -9070,6 +9076,7 @@ fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: 
                     Value::Text(s) => out.extend_from_slice(&encode_terminated(s.as_bytes())),
                     Value::Bytea(b) => out.extend_from_slice(&encode_terminated(b)),
                     Value::Decimal(d) => out.extend_from_slice(&d.encode_key()),
+                    Value::Interval(iv) => out.extend_from_slice(&iv.encode_key()),
                     _ => {
                         unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
                     }
@@ -9097,12 +9104,14 @@ fn index_entry_keys(
     }
 }
 
-/// Is `elem` an element type a GIN (`array_ops`) index admits? Exactly the fixed-width
-/// key-encodable scalars — the integers, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`
-/// (spec/design/gin.md §3): the GIN term IS the element's order-preserving key encoding (§4) and a
-/// term carries no length/terminator framing, so only the FIXED-WIDTH keyables qualify. The
-/// VARIABLE-width keyables (`text`, `bytea`, `decimal`) — though valid ordered-index / PK keys — are
-/// 0A000 here, as are the not-yet-key-encoded `interval` and the floats.
+/// Is `elem` an element type a GIN (`array_ops`) index admits? The integers, `boolean`, `uuid`,
+/// `date`, `timestamp`, `timestamptz` (spec/design/gin.md §3): the GIN term IS the element's
+/// order-preserving key encoding (§4) and a term carries no length/terminator framing, so only the
+/// FIXED-WIDTH keyables qualify. The VARIABLE-width keyables (`text`, `bytea`, `decimal`) — though
+/// valid ordered-index / PK keys — are 0A000 here, as is `float`. `interval` is fixed-width keyable
+/// (its 16-byte span key landed this slice, encoding.md §2.10) but its GIN *element* support is a
+/// separate follow-on slice (gin.md §3/§10 — like each element type before it), so it is not yet
+/// admitted here.
 fn is_gin_element_type(elem: &Type) -> bool {
     elem.is_integer()
         || elem.is_bool()
@@ -9172,9 +9181,11 @@ fn encode_pk_key(pk: &[(usize, ScalarType)], row: &Row) -> Vec<u8> {
             Value::Bytea(b) => k.extend_from_slice(&encode_terminated(b)),
             // decimal: the variable-width `decimal-order-preserving` body (encoding.md §2.5).
             Value::Decimal(d) => k.extend_from_slice(&d.encode_key()),
+            // interval: the fixed 16-byte `interval-span-i128` span key (encoding.md §2.10).
+            Value::Interval(iv) => k.extend_from_slice(&iv.encode_key()),
             Value::Null => unreachable!("primary key column is NOT NULL"),
-            Value::Interval(_) | Value::Float32(_) | Value::Float64(_) => {
-                unreachable!("an interval/float primary key is rejected at CREATE TABLE")
+            Value::Float32(_) | Value::Float64(_) => {
+                unreachable!("a float primary key is rejected at CREATE TABLE")
             }
             Value::Composite(_) => {
                 unreachable!("a composite primary key is rejected at CREATE TABLE")
@@ -9212,6 +9223,7 @@ fn index_prefix_key(columns: &[Column], def: &IndexDef, row: &Row) -> Option<Vec
                     Value::Text(s) => out.extend_from_slice(&encode_terminated(s.as_bytes())),
                     Value::Bytea(b) => out.extend_from_slice(&encode_terminated(b)),
                     Value::Decimal(d) => out.extend_from_slice(&d.encode_key()),
+                    Value::Interval(iv) => out.extend_from_slice(&iv.encode_key()),
                     _ => {
                         unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
                     }
@@ -9263,6 +9275,7 @@ fn encode_key_value(ty: ScalarType, value: &Value) -> Vec<u8> {
         Value::Text(s) => encode_terminated(s.as_bytes()),
         Value::Bytea(b) => encode_terminated(b),
         Value::Decimal(d) => d.encode_key(),
+        Value::Interval(iv) => iv.encode_key(),
         _ => unreachable!("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)"),
     }
 }
@@ -9405,6 +9418,7 @@ fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
         RExpr::ConstText(s) if pk_type.is_text() => Some(BoundSrc::Text(s.clone())),
         RExpr::ConstBytea(b) if pk_type.is_bytea() => Some(BoundSrc::Bytea(b.clone())),
         RExpr::ConstDecimal(d) if pk_type.is_decimal() => Some(BoundSrc::Decimal(d.clone())),
+        RExpr::ConstInterval(iv) if pk_type.is_interval() => Some(BoundSrc::Interval(*iv)),
         RExpr::OuterColumn { level, index } => Some(BoundSrc::Outer {
             level: *level,
             index: *index,
@@ -9482,6 +9496,7 @@ fn encode_bound_key(
         BoundSrc::Text(s) => BoundKey::Key(encode_terminated(s.as_bytes())),
         BoundSrc::Bytea(b) => BoundKey::Key(encode_terminated(b)),
         BoundSrc::Decimal(d) => BoundKey::Key(d.encode_key()),
+        BoundSrc::Interval(iv) => BoundKey::Key(iv.encode_key()),
         BoundSrc::Param(i) => encode_value_key(pk_ty, &params[*i]),
         // A correlated reference: column `index` of the enclosing row `level` hops out — the same
         // indexing the evaluator uses for `RExpr::OuterColumn` (innermost outer row is last).
@@ -9511,6 +9526,7 @@ fn encode_value_key(pk_ty: ScalarType, v: &Value) -> BoundKey {
         Value::Text(s) => BoundKey::Key(encode_terminated(s.as_bytes())),
         Value::Bytea(b) => BoundKey::Key(encode_terminated(b)),
         Value::Decimal(d) => BoundKey::Key(d.encode_key()),
+        Value::Interval(iv) => BoundKey::Key(iv.encode_key()),
         _ => BoundKey::OutOfRange,
     }
 }

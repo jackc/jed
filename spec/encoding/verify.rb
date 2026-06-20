@@ -133,6 +133,30 @@ end
 
 def decimal_label(c) = c["null"] ? "NULL" : c["value"]
 
+# The canonical 128-bit microsecond span of an interval (spec/design/interval.md §2): 1 month =
+# 30 days, 1 day = 24 h. The comparison/dedup key the encoding sorts by.
+def interval_span(months, days, micros) = (months * 30 + days) * 86_400_000_000 + micros
+
+# interval-span-i128 (encoding.md §2.10): the 16-byte order-preserving encoding of the canonical
+# 128-bit span — int-be-signflip at i128 width (bias 2^127, big-endian). enc_bare already does the
+# fixed-width int-be-signflip; width 16 = i128 (the bias keeps the value in [0, 2^128)). Span-equal
+# intervals ('1 mon' / '30 days') coincide — the "equal but not identical" wrinkle.
+def enc_interval(c)
+  enc_bare(interval_span(c["months"], c["days"], c["micros"]), 16)
+end
+
+def enc_interval_nullable(c)
+  return [0x01].pack("C") if c["null"]
+
+  [0x00].pack("C") + enc_interval(c)
+end
+
+def interval_label(c)
+  return "NULL" if c["null"]
+
+  c["label"] || "{#{c['months']} #{c['days']} #{c['micros']}}"
+end
+
 # Verify spec/encoding/decimal.toml: the same three invariants as the terminated-escape path
 # (byte-exact + strict order, minus round-trip — a key is never decoded back to a value).
 def check_decimal_file(filename)
@@ -148,6 +172,31 @@ def check_decimal_file(filename)
         got = hex(enc.call(c))
         fail!("#{kind} #{group['type']} #{decimal_label(c)}: encode=#{got} want=#{want}") unless got == want
         rows << [decimal_label(c), [want].pack("H*").b]
+        checked += 1
+      end
+      check_order("#{kind} #{group['type']}", rows)
+    end
+  end
+  checked
+end
+
+# Verify spec/encoding/interval.toml: the interval-span-i128 KEY encoding (§2.10) — the same three
+# invariants as the decimal path (byte-exact + strict order, minus round-trip: a key is never
+# decoded back to a value). The bare body is the 16-byte span; nullable prepends the §2.2 tag;
+# descending inverts the whole component.
+def check_interval_file(filename)
+  data = TomlRB.load_file(File.join(__dir__, filename))
+  checked = 0
+  [["bare", ->(c) { enc_interval(c) }],
+   ["nullable", ->(c) { enc_interval_nullable(c) }],
+   ["descending", ->(c) { invert(enc_interval_nullable(c)) }]].each do |kind, enc|
+    (data[kind] || []).each do |group|
+      rows = []
+      group["cases"].each do |c|
+        want = c["bytes"]
+        got = hex(enc.call(c))
+        fail!("#{kind} #{group['type']} #{interval_label(c)}: encode=#{got} want=#{want}") unless got == want
+        rows << [interval_label(c), [want].pack("H*").b]
         checked += 1
       end
       check_order("#{kind} #{group['type']}", rows)
@@ -278,6 +327,10 @@ def main
   # Decimal: the variable-width decimal-order-preserving rule (§2.5) — its own file, its own
   # value→bytes derivation (mantissa pairs + i32 exponent), not the WIDTH/terminated paths.
   checked += check_decimal_file("decimal.toml")
+
+  # Interval: the interval-span-i128 rule (§2.10) — the 16-byte canonical span, int-be-signflip at
+  # i128 width. Its own file: the value is a (months, days, micros) triple, not a fixed-WIDTH scalar.
+  checked += check_interval_file("interval.toml")
 
   puts "OK: #{checked} vectors verified (round-trip + byte-exact + order)"
 end

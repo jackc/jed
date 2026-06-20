@@ -474,4 +474,7 @@ impl Type {
     pub fn is_date(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_date())
     }
+    pub fn is_interval(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_interval())
+    }
 }

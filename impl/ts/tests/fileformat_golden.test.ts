@@ -469,6 +469,24 @@ function intervalTableDB(): Database {
   return db;
 }
 
+// intervalPkTableDB is a golden with a fixed-width SIGNED 16-byte stored key — the
+// interval-span-i128 encoding (encoding.md §2.10). Rows store in canonical-span (= key) order:
+// -1 mon < -1 day < 0 < 1 sec < 1 day < 1 mon < 100 years; all spans distinct (span-equal intervals
+// collide on the span key). Inserted in ascending key order to match verify.rb's build_tree (the
+// split shape is order-sensitive); the out-of-order proof is in the conformance test.
+function intervalPkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (k interval PRIMARY KEY, v i32)");
+  run(db, "INSERT INTO t VALUES ('-1 mon', 6)");
+  run(db, "INSERT INTO t VALUES ('-1 day', 5)");
+  run(db, "INSERT INTO t VALUES ('0 seconds', 4)");
+  run(db, "INSERT INTO t VALUES ('1 sec', 1)");
+  run(db, "INSERT INTO t VALUES ('1 day', 2)");
+  run(db, "INSERT INTO t VALUES ('1 mon', 3)");
+  run(db, "INSERT INTO t VALUES ('100 years', 7)");
+  return db;
+}
+
 // float64TableDB exercises the value codec's 8-byte IEEE branch (type code 12): a positive
 // fraction, a negative value, +0 and -0 (the sign bit is preserved on disk — distinct bytes), both
 // infinities, a canonicalized NaN (stored as the single quiet pattern 0x7FF8…000), a NULL, and
@@ -648,6 +666,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "date_table.jed", build: dateTableDB },
     { name: "timestamptz_table.jed", build: timestamptzTableDB },
     { name: "interval_table.jed", build: intervalTableDB },
+    { name: "interval_pk_table.jed", build: intervalPkTableDB },
     { name: "float64_table.jed", build: float64TableDB },
     { name: "float32_table.jed", build: float32TableDB },
     { name: "nopk_table.jed", build: nopkTableDB },
@@ -702,6 +721,7 @@ test("read goldens reproduces rows", () => {
     { name: "date_table.jed", build: dateTableDB, table: "t" },
     { name: "timestamptz_table.jed", build: timestamptzTableDB, table: "t" },
     { name: "interval_table.jed", build: intervalTableDB, table: "t" },
+    { name: "interval_pk_table.jed", build: intervalPkTableDB, table: "t" },
     { name: "float64_table.jed", build: float64TableDB, table: "t" },
     { name: "float32_table.jed", build: float32TableDB, table: "t" },
     { name: "nopk_table.jed", build: nopkTableDB, table: "r" },

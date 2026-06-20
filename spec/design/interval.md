@@ -196,11 +196,16 @@ exactly-representable `secs`).
   keyword, a string stays text.
 - **Casts** ([casts.toml](../types/casts.toml)): **deferred**. `CAST(x AS interval)` and casting
   FROM interval are `0A000` / `42804` (a later cast slice) — exactly like timestamp.
-- **Keys.** interval is **not** a key this slice: no order-preserving encoding is authored, so an
-  interval `PRIMARY KEY` / index / UNIQUE traps `0A000` (the same narrowing as decimal/text/bytea).
-  When lifted, the key would encode the order-preserving form of the 128-bit span — but two
-  span-equal values then share a key, so a unique interval index is the "equal but not identical"
-  case to settle then.
+- **Keys.** interval **is** a key (method `interval-span-i128`, [encoding.md §2.10](encoding.md)):
+  the 16-byte order-preserving encoding of the canonical 128-bit **span** (§2) — `int-be-signflip`
+  at i128 width (bias `2^127`, big-endian). It is a valid `PRIMARY KEY` / ordered secondary index /
+  `UNIQUE` key and a FK target, and (being fixed-width) a **GIN element** too. Because the key is the
+  span, two span-equal but field-distinct values (`1 mon` / `30 days` / `720:00:00`) share a key —
+  the **"equal but not identical"** wrinkle: a `UNIQUE` interval index treats them as one (matching
+  `1 mon = 30 days`, §2), exactly like decimal's scale-independence (`1.5` / `1.50`,
+  [decimal.md](decimal.md)). The stored *value* still keeps each interval's own three fields (the
+  value codec below) and renders them distinctly; only the *key* canonicalizes. Pinned by
+  [../encoding/interval.toml](../encoding/interval.toml) and the `interval_pk_table.jed` golden.
 - **On-disk value codec** (type code **11**, [format.md](../fileformat/format.md)): a fixed 16-byte
   body — `i32 months`, `i32 days`, `i64 micros`, big-endian two's-complement, no sign-flip, no
   length prefix.

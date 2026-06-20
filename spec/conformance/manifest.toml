@@ -350,7 +350,7 @@ description = "timestamptz / timestamp with time zone scalar type (UTC instant, 
 
 [[capability]]
 id = "types.interval"
-description = "interval scalar type (a span — months/days/micros): storage, the 'unit + time' input subset (units with abbreviations, per-field signs, trailing 'ago', the fractional-unit cascade, bare HH:MM:SS) via a single-quoted literal or the INTERVAL '...' keyword, PG 'postgres' render, and comparison/ordering/dedup by the canonical 128-bit span (1 month = 30 days, 1 day = 24 h — so '1 mon' = '30 days'). Non-key column only — an interval PRIMARY KEY/index is rejected 0A000; CAST and field qualifiers/precision are deferred (spec/design/interval.md)"
+description = "interval scalar type (a span — months/days/micros): storage, the 'unit + time' input subset (units with abbreviations, per-field signs, trailing 'ago', the fractional-unit cascade, bare HH:MM:SS) via a single-quoted literal or the INTERVAL '...' keyword, PG 'postgres' render, and comparison/ordering/dedup by the canonical 128-bit span (1 month = 30 days, 1 day = 24 h — so '1 mon' = '30 days'). KEYABLE — a valid PRIMARY KEY / ordered index / UNIQUE / FK target / GIN element via the 16-byte interval-span-i128 span key (encoding.md §2.10); span-equal values ('1 mon' / '30 days') share a key, so a UNIQUE interval index treats them as one. CAST and field qualifiers/precision are deferred (spec/design/interval.md)"
 
 [[capability]]
 id = "types.f64"

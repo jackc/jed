@@ -98,8 +98,8 @@ reason = "jed: a bare `m` unit is ambiguous (months vs minutes) and rejected (22
 
 [[override]]
 file = "types/interval.test"
-sql = "CREATE TABLE bad (d interval PRIMARY KEY)"
-reason = "jed: an interval PRIMARY KEY is rejected this slice (0A000), a documented narrowing (like decimal/text PK — interval has no exercised order-preserving key encoding yet, interval.md §6). PG allows an interval primary key."
+sql = "SELECT k, n FROM ik"
+reason = "jed: a full scan iterates the interval PRIMARY KEY in key (= canonical-span) order — -1 mon < -1 day < 0 < 1 sec < 1 day < 1 mon < 100 years (encoding.md §2.10, interval-span-i128). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical (the values agree exactly — interval key order is span order, the same ordering PG uses for interval comparison)."
 
 [[override]]
 file = "ddl/composite_pk.test"
@@ -115,6 +115,11 @@ reason = "jed: a full scan iterates in composite-PRIMARY-KEY order — a ascendi
 file = "ddl/composite_pk.test"
 sql = "SELECT d, a FROM e7"
 reason = "jed: a full scan iterates in composite-PRIMARY-KEY order — a ascending, then the decimal member d in numeric order within each a (encoding.md §2.3/§2.5), so (1,-1.5),(1,0.5),(1,2),(2,-1.5). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical (numeric values agree exactly)."
+
+[[override]]
+file = "ddl/composite_pk.test"
+sql = "SELECT iv, a FROM e8"
+reason = "jed: a full scan iterates in composite-PRIMARY-KEY order — a ascending, then the interval member iv in canonical-span order within each a (encoding.md §2.3/§2.10), so (1,-1 day),(1,1 hour),(1,1 day),(2,-1 day). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical (interval key order is span order, the same ordering PG uses for interval comparison)."
 
 [[override]]
 file = "ddl/check.test"

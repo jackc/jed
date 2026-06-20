@@ -5,7 +5,10 @@ package jed
 // inline-table scanner helpers from timestamp_test.go (same package). Test-only.
 
 import (
+	"bytes"
+	"encoding/hex"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"testing"
@@ -98,5 +101,51 @@ func TestIntervalSpanCanonical(t *testing.T) {
 	negDay, _ := ParseInterval("-1 day")
 	if day.SpanCmp(twoDays) >= 0 || negDay.SpanCmp(day) >= 0 {
 		t.Errorf("span ordering wrong")
+	}
+}
+
+// TestIntervalEncodeKey verifies the order-preserving KEY body (interval-span-i128,
+// encoding.md §2.10): the 16-byte i128 span (bias 2^127 + big-endian). Sorting by EncodeKey must
+// equal span order; span-equal intervals share a key (the "equal but not identical" UNIQUE
+// wrinkle, decimal's 1.5/1.50); byte-exact against the canonical vectors (interval.toml).
+func TestIntervalEncodeKey(t *testing.T) {
+	iv := func(m, d int32, u int64) Interval { return Interval{Months: m, Days: d, Micros: u} }
+	// Ascending by span — sorting by key must reproduce this order (sign boundary, zero, ±µs).
+	ordered := []Interval{
+		iv(-1200, 0, 0), iv(-1, 0, 0), iv(0, -1, 0), iv(0, 0, -1_000_000), iv(0, 0, -1),
+		iv(0, 0, 0), iv(0, 0, 1), iv(0, 0, 1_000_000), iv(0, 1, 0), iv(1, 0, 0), iv(1200, 0, 0),
+	}
+	byKey := append([]Interval(nil), ordered...)
+	sort.Slice(byKey, func(i, j int) bool {
+		return bytes.Compare(byKey[i].EncodeKey(), byKey[j].EncodeKey()) < 0
+	})
+	for i := range ordered {
+		if byKey[i].SpanCmp(ordered[i]) != 0 {
+			t.Fatalf("encode_key order must equal span order at %d", i)
+		}
+	}
+	// Span-equal intervals share a key (1 mon == 30 days == 720:00:00) — the UNIQUE wrinkle.
+	if !bytes.Equal(iv(1, 0, 0).EncodeKey(), iv(0, 30, 0).EncodeKey()) {
+		t.Errorf("1 mon / 30 days keys must coincide")
+	}
+	if !bytes.Equal(iv(1, 0, 0).EncodeKey(), iv(0, 0, 30*86_400_000_000).EncodeKey()) {
+		t.Errorf("1 mon / 720:00:00 keys must coincide")
+	}
+	// Byte-exact canonical vectors (the §2.10 worked-bytes table).
+	exact := []struct {
+		iv   Interval
+		want string
+	}{
+		{iv(0, 0, 0), "80000000000000000000000000000000"},
+		{iv(0, 0, 1), "80000000000000000000000000000001"},
+		{iv(0, 0, -1), "7fffffffffffffffffffffffffffffff"},
+		{iv(0, 1, 0), "8000000000000000000000141dd76000"},
+		{iv(1, 0, 0), "80000000000000000000025b7f3d4000"},
+		{iv(0, -1, 0), "7fffffffffffffffffffffebe228a000"},
+	}
+	for _, e := range exact {
+		if got := hex.EncodeToString(e.iv.EncodeKey()); got != e.want {
+			t.Errorf("EncodeKey(%+v) = %s, want %s", e.iv, got, e.want)
+		}
 	}
 }

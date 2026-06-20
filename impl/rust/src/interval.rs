@@ -82,6 +82,22 @@ impl Interval {
         })
     }
 
+    /// The order-preserving KEY body for an interval (method `interval-span-i128`,
+    /// spec/design/encoding.md §2.10). The 16-byte order-preserving encoding of the canonical
+    /// 128-bit **span** ([`Interval::span`], §2) — `int-be-signflip` at i128 width: add the bias
+    /// `2^127` and emit the sum as a 16-byte big-endian unsigned integer, mapping the signed span
+    /// range monotonically onto `[0, 2^128)` so negatives sort below positives. Fixed-width 16, so
+    /// self-delimiting with no escape/terminator (like uuid §2.7). Because the key is the **span**,
+    /// two field-distinct but span-equal intervals (`'1 mon'` / `'30 days'`) produce identical bytes
+    /// — a UNIQUE interval index treats them as one (the "equal but not identical" wrinkle, the
+    /// decimal `1.5`/`1.50` precedent). A PK is NOT NULL, so the stored key is this bare 16-byte
+    /// body; the §2.2 nullable slot prepends the presence tag and §2.3 descending inverts the whole
+    /// component (both at the caller).
+    pub fn encode_key(&self) -> Vec<u8> {
+        let biased = (self.span() as u128).wrapping_add(1u128 << 127);
+        biased.to_be_bytes().to_vec()
+    }
+
     /// `-self` — negate all three fields. `i32::MIN` / `i64::MIN` would overflow → `22008`.
     pub fn neg(&self) -> Result<Interval> {
         Ok(Interval {

@@ -1550,11 +1550,11 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		if def.PrimaryKey {
 			// The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
 			// boolean (bool-byte §2.9), uuid (uuid-raw16 §2.7), timestamp/timestamptz (i64
-			// int-be-signflip, timestamp.md §6), date (i32, date.md §5) — plus the variable-width
-			// text/bytea (…-terminated-escape §2.4/§2.6) and decimal (decimal-order-preserving §2.5),
-			// all self-delimiting so they compose in composite keys / index suffixes. Still 0A000:
-			// interval (a later slice) and float (the principled determinism carve-out — §4), plus
-			// the recursive containers composite/array/range.
+			// int-be-signflip, timestamp.md §6), date (i32, date.md §5), interval (interval-span-i128,
+			// the 16-byte span key §2.10) — plus the variable-width text/bytea (…-terminated-escape
+			// §2.4/§2.6) and decimal (decimal-order-preserving §2.5), all self-delimiting so they
+			// compose in composite keys / index suffixes. Still 0A000: float (the principled
+			// determinism carve-out — §4) and the recursive containers composite/array/range.
 			if isComposite || isArray || isRange {
 				// A composite/array/range PRIMARY KEY is rejected 0A000 — the key encoding is authored
 				// but unexercised (composite.md §6, array.md §8, ranges.md §8). colType.CanonicalName()
@@ -1562,7 +1562,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+colType.CanonicalName()+" primary key is not supported yet")
 			}
-			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
+			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -1736,7 +1736,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -1780,7 +1780,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
 			}
@@ -2542,15 +2542,16 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		ty := columns[idx].Type
 		switch kind {
 		case IndexBtree:
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" index column is not supported yet")
 			}
 		case IndexGin:
 			// GIN needs an operator class for the column type: only an array has one (else 42704),
 			// and only a FIXED-WIDTH KEY-ENCODABLE element type (else 0A000) — the GIN term IS that
-			// element's key encoding (gin.md §3/§4), so the admitted set is exactly the keyable
-			// scalars a PK / ordered-index key column accepts.
+			// element's key encoding (gin.md §3/§4), so the admitted set is the integers, boolean,
+			// uuid, date, timestamp, timestamptz (interval's GIN-element support is a separate
+			// follow-on — its key landed but the GIN slice has not; gin.md §3/§10).
 			if ty.Array == nil {
 				return Outcome{}, NewError(UndefinedObject,
 					"data type "+ty.CanonicalName()+" has no default operator class for access method gin")
@@ -2904,6 +2905,9 @@ func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) [
 		case ValDecimal:
 			out = append(out, 0x00)
 			out = append(out, v.Dec.EncodeKey()...)
+		case ValInterval:
+			out = append(out, 0x00)
+			out = append(out, v.Iv.EncodeKey()...)
 		default:
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
@@ -2924,11 +2928,12 @@ func indexEntryKeys(columns []Column, def IndexDef, storageKey []byte, row Row) 
 }
 
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits —
-// exactly the fixed-width key-encodable scalars (the integers, boolean, uuid, date, timestamp,
-// timestamptz; spec/design/gin.md §3): a GIN term IS the element's order-preserving key encoding
-// (§4) and a term carries no length/terminator framing, so only the FIXED-WIDTH keyables qualify.
-// The variable-width keyables (text, bytea, decimal) — valid ordered-index / PK keys — are 0A000
-// here, as are the not-yet-key-encoded interval and the floats.
+// the integers, boolean, uuid, date, timestamp, timestamptz (spec/design/gin.md §3): a GIN term IS
+// the element's order-preserving key encoding (§4) and a term carries no length/terminator framing,
+// so only the FIXED-WIDTH keyables qualify. The variable-width keyables (text, bytea, decimal) —
+// valid ordered-index / PK keys — are 0A000 here, as is float. interval is fixed-width keyable (its
+// 16-byte span key landed, encoding.md §2.10) but its GIN element support is a separate follow-on
+// slice (gin.md §3/§10), so it is not yet admitted here.
 func isGinElementType(elem ScalarType) bool {
 	return elem.IsInteger() || elem.IsBool() || elem.IsUuid() ||
 		elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate()
@@ -3018,6 +3023,9 @@ func indexPrefixKey(columns []Column, def IndexDef, row Row) ([]byte, bool) {
 		case ValDecimal:
 			out = append(out, 0x00)
 			out = append(out, v.Dec.EncodeKey()...)
+		case ValInterval:
+			out = append(out, 0x00)
+			out = append(out, v.Iv.EncodeKey()...)
 		default:
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
@@ -3065,6 +3073,9 @@ func encodePkKey(table *Table, pk []int, row Row) []byte {
 		case table.Columns[i].Type.IsDecimal():
 			// decimal: the variable-width decimal-order-preserving body (encoding.md §2.5).
 			key = append(key, row[i].Dec.EncodeKey()...)
+		case table.Columns[i].Type.IsInterval():
+			// interval: the fixed 16-byte interval-span-i128 span key (encoding.md §2.10).
+			key = append(key, row[i].Iv.EncodeKey()...)
 		default:
 			// integers / timestamp / timestamptz / date: the fixed-width key codec.
 			key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
@@ -7117,6 +7128,8 @@ func isConstSource(e *rExpr, pkType ScalarType) bool {
 		return pkType.IsBytea()
 	case reConstDecimal:
 		return pkType.IsDecimal()
+	case reConstInterval:
+		return pkType.IsInterval()
 	}
 	return false
 }
@@ -7202,6 +7215,8 @@ func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row) 
 		return EncodeTerminated(src.cBytea), false, true
 	case reConstDecimal:
 		return src.cDec.EncodeKey(), false, true
+	case reConstInterval:
+		return src.cIv.EncodeKey(), false, true
 	case reParam:
 		return encodeValueKey(pkType, params[src.index])
 	case reOuterColumn:
@@ -7231,6 +7246,11 @@ func encodeValueKey(pkType ScalarType, v Value) (key []byte, isNull bool, ok boo
 			return nil, false, false // mismatched param kind: drop this half-bound (sound widening)
 		}
 		return v.Dec.EncodeKey(), false, true
+	case pkType.IsInterval():
+		if v.Kind != ValInterval {
+			return nil, false, false // mismatched param kind: drop this half-bound (sound widening)
+		}
+		return v.Iv.EncodeKey(), false, true
 	case pkType.IsInteger():
 		if !pkType.InRange(v.Int) {
 			return nil, false, false
@@ -16639,6 +16659,8 @@ func encodeKeyValue(ty ScalarType, value Value) []byte {
 		return EncodeTerminated([]byte(value.Str))
 	case ValDecimal:
 		return value.Dec.EncodeKey()
+	case ValInterval:
+		return value.Iv.EncodeKey()
 	default:
 		panic("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)")
 	}

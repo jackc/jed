@@ -83,3 +83,72 @@ fn span_is_canonical() {
     assert!(day < two_days);
     assert!(parse_interval("-1 day").unwrap() < day);
 }
+
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// The order-preserving KEY body (`interval-span-i128`, encoding.md §2.10): the 16-byte i128
+/// span (bias `2^127` + big-endian). Sorting by `encode_key` must equal span order; span-equal
+/// intervals share a key (the "equal but not identical" UNIQUE wrinkle, decimal's 1.5/1.50);
+/// byte-exact against the canonical vectors (spec/encoding/interval.toml + the §2.10 table).
+#[test]
+fn key_encoding_is_order_preserving() {
+    let iv = |m: i32, d: i32, u: i64| Interval {
+        months: m,
+        days: d,
+        micros: u,
+    };
+    // Ascending by span — sorting by key must reproduce this order (sign boundary, zero, ±µs).
+    let ordered = [
+        iv(-1200, 0, 0),      // -100 years
+        iv(-1, 0, 0),         // -1 mon
+        iv(0, -1, 0),         // -1 day
+        iv(0, 0, -1_000_000), // -00:00:01
+        iv(0, 0, -1),         // -0.000001 s
+        iv(0, 0, 0),          // zero
+        iv(0, 0, 1),          // 0.000001 s
+        iv(0, 0, 1_000_000),  // 00:00:01
+        iv(0, 1, 0),          // 1 day
+        iv(1, 0, 0),          // 1 mon
+        iv(1200, 0, 0),       // 100 years
+    ];
+    let mut by_key = ordered;
+    by_key.sort_by(|a, b| a.encode_key().cmp(&b.encode_key()));
+    let want: Vec<i128> = ordered.iter().map(|x| x.span()).collect();
+    let got: Vec<i128> = by_key.iter().map(|x| x.span()).collect();
+    assert_eq!(got, want, "encode_key order must equal span order");
+
+    // Span-equal intervals share a key (1 mon == 30 days == 720:00:00) — the UNIQUE wrinkle.
+    assert_eq!(iv(1, 0, 0).encode_key(), iv(0, 30, 0).encode_key());
+    assert_eq!(
+        iv(1, 0, 0).encode_key(),
+        iv(0, 0, 30 * 86_400_000_000).encode_key()
+    );
+
+    // Byte-exact canonical vectors (the §2.10 worked-bytes table).
+    assert_eq!(
+        hex(&iv(0, 0, 0).encode_key()),
+        "80000000000000000000000000000000"
+    );
+    assert_eq!(
+        hex(&iv(0, 0, 1).encode_key()),
+        "80000000000000000000000000000001"
+    );
+    assert_eq!(
+        hex(&iv(0, 0, -1).encode_key()),
+        "7fffffffffffffffffffffffffffffff"
+    );
+    assert_eq!(
+        hex(&iv(0, 1, 0).encode_key()),
+        "8000000000000000000000141dd76000"
+    );
+    assert_eq!(
+        hex(&iv(1, 0, 0).encode_key()),
+        "80000000000000000000025b7f3d4000"
+    );
+    assert_eq!(
+        hex(&iv(0, -1, 0).encode_key()),
+        "7fffffffffffffffffffffebe228a000"
+    );
+}

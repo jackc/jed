@@ -64,8 +64,10 @@ keeps every index up to date on each `INSERT`, `UPDATE`, and `DELETE`.
 equality lookups — `WHERE column = …` — by seeking instead of scanning the whole table. The
 `PRIMARY KEY` is itself an index, and a `UNIQUE` constraint is backed by a unique index. The
 indexed column must be a key-encodable type (the integer widths, `boolean`, `uuid`, `timestamp`,
-`timestamptz`, `date`, and the variable-width `text`/`bytea`/`numeric`); indexing an `interval`
-or `float` column is `0A000` until its key encoding lands.
+`timestamptz`, `date`, `interval`, and the variable-width `text`/`bytea`/`numeric`); indexing a
+`float` column is `0A000` (a deliberate, permanent exclusion — a computed binary float could sort
+differently across implementations, so floats stay out of stored order). An `interval` key sorts by
+its canonical span, so `INTERVAL '1 mon'` and `INTERVAL '30 days'` index as one value.
 
 The `city` table below indexes its `region` code (`1` = Asia, `2` = Europe). Run the lookup, then
 edit the `WHERE` to `region = 2` — the index narrows the scan to the matching rows, and the result

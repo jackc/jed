@@ -771,10 +771,12 @@ from v1**. The present-**inline-plain** body depends on the type:
   semantics, not bytes); the `±infinity` sentinels are the extreme `i64` values.
 
 - **`interval`** — a **fixed 16-byte** body: **`i32` months**, **`i32` days**, **`i64` micros**,
-  each **big-endian two's-complement** (plain — **no** sign-flip; this is a value codec, not an
-  order-preserving key, and interval is not a key this slice — [../design/interval.md](../design/interval.md)).
-  No length prefix; the three fields are independent (PG's representation), and comparison goes
-  through the canonical 128-bit span at runtime, never these bytes.
+  each **big-endian two's-complement** (plain — **no** sign-flip; this is the **value** codec,
+  storing the three raw fields). No length prefix; the three fields are independent (PG's
+  representation). interval **is** a key (the separate `interval-span-i128` **key** encoding — the
+  16-byte canonical span, [../design/encoding.md §2.10](../design/encoding.md)), so its key body and
+  value body genuinely differ: comparison / ordering / the stored key go through the canonical
+  128-bit span, never these value bytes.
 
 - **composite** (`type_code 14`, v9 — [../design/composite.md §4](../design/composite.md)) — a
   **null bitmap** of `ceil(field_count / 8)` bytes (**MSB-first**: field *i*'s NULL bit is

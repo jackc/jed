@@ -52,8 +52,8 @@ CREATE INDEX explicit_b ON t (nope)
 
 # a text key column is now supported — its variable-width text-terminated-escape key encoding
 # (encoding.md §2.4) is self-delimiting, so it composes as a §3 index entry (the same as a text
-# PRIMARY KEY member); decimal (§2.5) is likewise supported, covered in its type test. Types still
-# without a key encoding (interval/float/composite/array/range) remain the 0A000 narrowing.
+# PRIMARY KEY member); decimal (§2.5) and interval (§2.10) are likewise supported, covered in their
+# type tests. Types still without a key encoding (float/composite/array/range) remain the 0A000 narrowing.
 statement ok
 CREATE INDEX i ON t (s)
 

@@ -440,3 +440,6 @@ func (t Type) IsTimestamptz() bool { return t.isScalar() && t.Scalar.IsTimestamp
 
 // IsDate reports whether this is the scalar date type (false for a composite/array).
 func (t Type) IsDate() bool { return t.isScalar() && t.Scalar.IsDate() }
+
+// IsInterval reports whether this is the scalar interval type (false for a composite/array).
+func (t Type) IsInterval() bool { return t.isScalar() && t.Scalar.IsInterval() }

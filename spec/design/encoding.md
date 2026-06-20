@@ -297,9 +297,12 @@ This composes with the §2.2 nullable presence tag (`0x00` present ‖ the 8 byt
 and the §2.3 descending inversion unchanged.
 
 **Status — authored, not yet exercised.** A `f32`/`f64` `PRIMARY KEY`/index is rejected
-`0A000` this slice — the text/decimal/bytea/interval precedent, reinforced by the
+`0A000` — unlike text/decimal/bytea/interval (whose narrowings have all since lifted), float's
+rejection is **permanent**, reinforced by the
 **contamination** rule ([determinism.md](determinism.md) §4): keeping an exempted-value type out
-of *keys* bounds float non-determinism to *query-time* order, never *stored* order. Stored float
+of *keys* bounds float non-determinism to *query-time* order, never *stored* order. With interval
+keyable (§2.10), `float` is now the **lone** non-keyable scalar — the only one whose key narrowing
+is principled (the determinism carve-out) rather than merely pending. Stored float
 *values* use the simpler fixed value codec ([../fileformat/format.md](../fileformat/format.md),
 type code 12 for `f64` / 13 for `f32`), which preserves the bits verbatim (no
 canonicalization) because a stored value never needs to sort.
@@ -336,6 +339,59 @@ are authored in [../encoding/integers.toml](../encoding/integers.toml) and the e
 boolean PK to the bare 1 byte (a PK is NOT NULL, so no presence tag), pinned by the
 `bool_pk_table.jed` golden ([../fileformat/format.md](../fileformat/format.md)).
 
+### 2.10 Interval — `interval-span-i128`
+
+`interval` is the engine's first type whose **comparison key differs from its stored
+representation** ([interval.md §2](interval.md)): the three independent fields `months` (i32),
+`days` (i32), `micros` (i64) are stored separately (so `+ 1 month` stays calendar-aware), but
+comparison/ordering/dedup collapse them into a single signed **128-bit microsecond span**
+
+```
+span(iv) = (iv.months · 30 + iv.days) · 86_400_000_000 + iv.micros        # signed 128-bit
+```
+
+(1 month = 30 days, 1 day = 24 h — PG `interval_cmp_value`). The key must sort by that span, so it
+is simply the span run through the **`int-be-signflip` rule (§2.1) at i128 width**:
+
+1. Compute `span(iv)` (a signed 128-bit value — `(i32·30 + i32)·86.4e9 + i64` overflows i64 but fits
+   i128 with vast headroom).
+2. **Add the bias `2^127`** and emit the sum as a **16-byte big-endian unsigned integer**, mapping
+   the signed span range monotonically onto `[0, 2^128)` so negatives sort below positives.
+3. **No escape, no terminator, no length prefix** — every value is exactly 16 bytes, so it is
+   self-delimiting by width alone (exactly like uuid §2.7 and the bare integers §2.1).
+
+Because the key is the **span**, two field-distinct but span-equal intervals (`1 mon` / `30 days` /
+`720:00:00` all have span `2_592_000_000_000`) produce **identical key bytes** — they index as
+equal, so a `UNIQUE` interval index treats them as one (`1 mon = 30 days` is also `TRUE`,
+[interval.md §2](interval.md)). This is the **"equal but not identical"** wrinkle: the exact analogue
+of decimal's scale-independence (`1.5` / `1.50`, §2.5) — the key encodes the canonical value, while
+the stored *value* preserves each interval's own three fields (and renders them distinctly). Worked
+bytes:
+
+| value | span | encoded key bytes |
+|---|---|---|
+| `00:00:00` (zero) | `0` | `80000000000000000000000000000000` |
+| `00:00:00.000001` | `1` | `80000000000000000000000000000001` |
+| `-00:00:00.000001` | `-1` | `7fffffffffffffffffffffffffffffff` |
+| `1 day` | `86_400_000_000` | `8000000000000000000000141dd76000` |
+| `1 mon` = `30 days` | `2_592_000_000_000` | `80000000000000000000025b7f3d4000` |
+| `-1 day` | `-86_400_000_000` | `7fffffffffffffffffffffebe228a000` |
+
+The **nullable** slot is the §2.2 tag (`0x00` present ‖ the 16 bytes, or `0x01` for NULL) and
+**descending** is the §2.3 whole-component bitwise inversion — both unchanged.
+
+**Status — EXERCISED.** `interval` **is** a valid `PRIMARY KEY` / ordered secondary index /
+`UNIQUE` key ([interval.md §6](interval.md)) — the **third** fixed-width non-integer key (after uuid
+§2.7 and boolean §2.9), and the first whose 16-byte key body is *not* its value body (the value
+codec stores the three raw fields — `months ‖ days ‖ micros`, [../fileformat/format.md](../fileformat/format.md)
+type code 11 — while the key stores the derived span; the §3 key/value seam genuinely diverging). An
+interval PK stores the bare 16-byte span (a PK is NOT NULL, so no presence tag); an index entry /
+composite member wraps it in the §2.2 nullable slot, and because it is fixed-width it qualifies as a
+**GIN element** too ([gin.md §3](gin.md) — span-equal elements share a term, matching the `@>`/`&&`
+element-equality). The `(value → bytes)` vectors are in [../encoding/interval.toml](../encoding/interval.toml)
+and the on-disk image is pinned by the `interval_pk_table.jed` golden. Only `float` (the determinism
+carve-out §2.8) and the recursive containers composite/array/range remain `0A000` keys.
+
 ## 3. Where this is used today
 
 The bare integer rule is exercised by every stored key. The on-disk **value codec**
@@ -359,9 +415,10 @@ concatenates its fixed-width components per §2.3, pinned by the `composite_pk_t
 golden. Nullable **secondary indexes** have since **landed** ([indexes.md](indexes.md),
 `index_table.jed` golden) — the first place §2.2's presence-tag sort order is load-bearing
 rather than spec-only — as have `timestamp`/`timestamptz` keys (the i64 rule), `text`/`bytea`
-keys (the `…-terminated-escape` rules §2.4/§2.6), and `decimal` keys (the
-`decimal-order-preserving` rule §2.5, `decimal_pk_table.jed`). The remaining non-integer scalars
-(`float`, `interval`) add their own §2 key paths when their in-key narrowings lift.
+keys (the `…-terminated-escape` rules §2.4/§2.6), `decimal` keys (the
+`decimal-order-preserving` rule §2.5, `decimal_pk_table.jed`), and `interval` keys (the
+`interval-span-i128` span rule §2.10, `interval_pk_table.jed`). The lone remaining non-integer
+scalar, `float`, adds its own §2 key path only if the determinism carve-out (§2.8) ever lifts.
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)
 

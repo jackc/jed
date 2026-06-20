@@ -411,6 +411,20 @@ INTERVAL_TABLE = {
          [4, [1, 0, 0]], [5, [0, 30, 0]], [6, nil]]
 }.freeze
 
+# A table with an (unconstrained) interval PRIMARY KEY (the interval-span-i128 encoding, encoding.md
+# §2.10) — the first FIXED-width SIGNED 16-byte key. Rows are in canonical-span (= key) order:
+# -1 mon < -1 day < 0 < 1 sec < 1 day < 1 mon < 100 years, exercising the sign boundary, the zero
+# interval, and the month/day/time fields. All spans are distinct (span-equal intervals like
+# `1 mon`/`30 days` would collide on the span-independent key). The cores build this via
+#   CREATE TABLE t (k interval PRIMARY KEY, v i32); INSERT the rows.
+# Each k value is the [months, days, micros] triple.
+INTERVAL_PK_TABLE = {
+  name: "t",
+  columns: [col("k", "interval", pk: true), col("v", "i32")],
+  rows: [[[-1, 0, 0], 6], [[0, -1, 0], 5], [[0, 0, 0], 4], [[0, 0, 1_000_000], 1],
+         [[0, 1, 0], 2], [[1, 0, 0], 3], [[1200, 0, 0], 7]]
+}.freeze
+
 # A table with a date column (type code 16): exercises the value codec's date branch (the i32
 # day count, the same 4-byte int-be-signflip body as i32). Covers a positive date (2024-01-15 ->
 # day 19737), a pre-1970 negative one (1969-12-31 -> -1), a BC-era one (0044-03-15 BC -> astro -43
@@ -811,6 +825,7 @@ FIXTURES = [
   { file: "timestamp_table.jed",   page_size: 256, tables: [TIMESTAMP_TABLE] },
   { file: "timestamptz_table.jed", page_size: 256, tables: [TIMESTAMPTZ_TABLE] },
   { file: "interval_table.jed",    page_size: 256, tables: [INTERVAL_TABLE] },
+  { file: "interval_pk_table.jed", page_size: 256, tables: [INTERVAL_PK_TABLE] },
   { file: "float64_table.jed",     page_size: 256, tables: [FLOAT64_TABLE] },
   { file: "float32_table.jed",     page_size: 256, tables: [FLOAT32_TABLE] },
   { file: "date_table.jed",        page_size: 256, tables: [DATE_TABLE] },
@@ -917,12 +932,21 @@ def encode_decimal_key(s)
   d[:neg] ? "\x03".b + body.bytes.map { |b| b ^ 0xFF }.pack("C*") : "\x05".b + body
 end
 
+# The BARE order-preserving KEY body for an interval (interval-span-i128, encoding.md §2.10): the
+# 16-byte canonical span (span = (months·30 + days)·86_400_000_000 + micros), int-be-signflip at
+# i128 width. `v` is the [months, days, micros] triple. Span-equal intervals coincide.
+def encode_interval_key(v)
+  m, d, us = v
+  span = (m * 30 + d) * 86_400_000_000 + us
+  encode_int(16, span)
+end
+
 # The BARE order-preserving KEY body for one present (non-NULL) value of `type` — no presence
 # tag (callers add it for nullable index slots; a PK member is NOT NULL). uuid is the 16 raw
 # bytes (uuid-raw16, §2.7), boolean a single bool-byte (0x00 false / 0x01 true, §2.9), text/bytea
 # the variable-width …-terminated-escape body (§2.4/§2.6), decimal the decimal-order-preserving
-# body (§2.5), every other keyable type the sign-flipped fixed-width int encoding (timestamps
-# reuse the i64 rule).
+# body (§2.5), interval the 16-byte interval-span-i128 span (§2.10), every other keyable type the
+# sign-flipped fixed-width int encoding (timestamps reuse the i64 rule).
 def key_body(type, v)
   case type
   when "uuid" then uuid_to_bytes(v)
@@ -930,6 +954,7 @@ def key_body(type, v)
   when "text" then enc_terminated(v.b)
   when "bytea" then enc_terminated(v.b)
   when "decimal" then encode_decimal_key(v)
+  when "interval" then encode_interval_key(v)
   else encode_int(WIDTH.fetch(type), v)
   end
 end

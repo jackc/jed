@@ -55,10 +55,12 @@ usable as a `PRIMARY KEY`** (its fixed-width key encoding is exercised, lifting 
 the other non-integer types still defer). The temporal types
 (`timestamp`/`timestamptz`/`interval`) and the binary floats (`f32`/`f64`) have since
 landed, each with its own design doc ([timestamp.md](timestamp.md), [interval.md](interval.md),
-[float.md](float.md)); `boolean`, `timestamp`, `timestamptz`, `date`, and the variable-width
+[float.md](float.md)); `boolean`, `timestamp`, `timestamptz`, `date`, the variable-width
 `text`/`bytea` (the `…-terminated-escape` key encoding, encoding.md §2.4/§2.6) and `decimal`
-(the `decimal-order-preserving` encoding, encoding.md §2.5) join `uuid` as non-integer
-`PRIMARY KEY` types, while `interval`/`f32`/`f64` stay non-key for now. The remaining scalars (`json`/`jsonb`,
+(the `decimal-order-preserving` encoding, encoding.md §2.5), and `interval` (the
+`interval-span-i128` 16-byte span encoding, encoding.md §2.10) join `uuid` as non-integer
+`PRIMARY KEY` types, leaving `f32`/`f64` as the **only** non-key scalars (the principled
+determinism carve-out — encoding.md §2.8). The remaining scalars (`json`/`jsonb`,
 and the composite `array` container) are still **deferred**. The float-formatting and NaN/∞
 decisions of CLAUDE.md §8 are now **settled** by the landed floats ([float.md](float.md)): they
 keep their own PG total order and the `R` render tag (ledgered in the determinism exceptions),

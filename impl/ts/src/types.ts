@@ -495,3 +495,6 @@ export function typeIsTimestamptz(t: Type): boolean {
 export function typeIsDate(t: Type): boolean {
   return t.kind === "scalar" && isDate(t.scalar);
 }
+export function typeIsInterval(t: Type): boolean {
+  return t.kind === "scalar" && isInterval(t.scalar);
+}

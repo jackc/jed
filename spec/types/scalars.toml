@@ -45,18 +45,23 @@ schema_version = 1
 #               value's RAW bytes (no UTF-8 / collation framing — ../design/encoding.md
 #               §2.6); "decimal-order-preserving" = sign/class byte + order-preserving
 #               exponent + big-endian base-100 mantissa pairs + terminator (CockroachDB
-#               style — ../design/encoding.md §2.5); "uuid-raw16" = the 16 raw bytes of
+#               style — ../design/encoding.md §2.5); "interval-span-i128" = the canonical
+#               128-bit span ((months*30 + days)*86_400_000_000 + micros) as int-be-signflip
+#               at i128 width (bias 2^127, 16-byte big-endian) — span-equal intervals share a
+#               key (../design/encoding.md §2.10); "uuid-raw16" = the 16 raw bytes of
 #               the value, big-endian, with NO sign-flip, escape, or terminator (fixed-
 #               width, so unsigned memcmp over the bytes IS the order — ../design/encoding.md
 #               §2.7); "bool-byte" = a single byte 0x00 (false) < 0x01 (true), fixed-width
 #               1, no sign-flip/escape/terminator (../design/encoding.md §2.9). All sort
 #               byte-for-byte identically to logical order. width_bytes is omitted for the
-#               variable-width types (text, bytea, decimal) but PRESENT for the fixed-width
-#               non-integer keys uuid (16) and boolean (1). Exercised non-integer keys: uuid,
-#               boolean, the i64/i32-backed timestamp/timestamptz/date, the variable-width
-#               text/bytea (their terminated-escape encoding self-delimits), and decimal
-#               (decimal-order-preserving §2.5, scale-independent); interval/float remain
-#               authored-but-unexercised key methods.
+#               variable-width types (text, bytea, decimal) AND for interval (whose key is the
+#               derived 128-bit span, not the multi-field value body) but PRESENT for the
+#               fixed-width non-integer keys uuid (16) and boolean (1). Exercised non-integer keys:
+#               uuid, boolean, the i64/i32-backed timestamp/timestamptz/date, the variable-width
+#               text/bytea (their terminated-escape encoding self-delimits), decimal
+#               (decimal-order-preserving §2.5, scale-independent), and interval
+#               (interval-span-i128 §2.10, span-canonical); only float remains a non-key scalar
+#               (the principled determinism carve-out — ../design/encoding.md §2.8).
 # max_precision for decimal only: the maximum DECLARABLE precision p of numeric(p,s) —
 #               1000, PG's NUMERIC_MAX_PRECISION — and (as in PG) the display-scale clamp
 #               on a division result (../design/decimal.md §4). NOT a cap on what an
@@ -292,18 +297,19 @@ encoding = { method = "int-be-signflip", width_bytes = 8 }
 # `1 day 12:00:00`, and a bare `HH:MM:SS[.ffffff]`). Malformed input traps 22007; an out-of-range
 # field 22008. ISO-8601 `P…`, the SQL-standard combined forms (`1-2`/`3 4:05:06`), field
 # qualifiers (`YEAR TO MONTH`), the `interval(p)` precision typmod, and CAST to/from interval are
-# all DEFERRED. NOT a key this slice — its order-preserving key encoding is not authored, so an
-# interval PRIMARY KEY / index is rejected 0A000 (like decimal/text/bytea). No bits/min/max/
-# overflow/rank (not the integer family); no collation; no width_bytes (the fixed body is
-# multi-field, not a single int through the integer codec). `interval * / number` arithmetic
-# computes the fractional cascade EXACTLY (no float — CLAUDE.md §8), a documented PG divergence
-# on sub-unit ties (../design/interval.md §5).
+# all DEFERRED. KEYABLE: a valid PRIMARY KEY / ordered index / UNIQUE / FK target / GIN element via
+# interval-span-i128 (the 16-byte canonical span — ../design/encoding.md §2.10); span-equal values
+# (`'1 mon'` / `'30 days'`) share a key, so a UNIQUE interval index treats them as one (the "equal
+# but not identical" wrinkle, the decimal 1.5/1.50 precedent). No bits/min/max/overflow/rank (not
+# the integer family); no collation; no width_bytes (the value body is multi-field; the KEY is the
+# derived span). `interval * / number` arithmetic computes the fractional cascade EXACTLY (no float
+# — CLAUDE.md §8), a documented PG divergence on sub-unit ties (../design/interval.md §5).
 [[type]]
 id = "interval"
 aliases = []
 family = "interval"
 storable = true
-encoding = { method = "interval-fixed16" }
+encoding = { method = "interval-span-i128" }
 
 # --- f64: IEEE 754 double precision (../design/float.md) ------------------
 # The engine's APPROXIMATE numeric and the FIRST type deliberately EXEMPTED from
