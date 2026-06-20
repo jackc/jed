@@ -494,6 +494,7 @@ impl Parser {
         let mut not_null = false;
         let mut default = None;
         let mut identity: Option<IdentitySpec> = None;
+        let mut collation: Option<String> = None;
         loop {
             if self.at_check_constraint() {
                 checks.push(self.parse_check_constraint()?);
@@ -592,6 +593,13 @@ impl Parser {
                     }
                     identity = Some(IdentitySpec { always, options });
                 }
+                // `COLLATE "name"` in column position (spec/design/collation.md §1) — a quoted,
+                // case-sensitive collation name. Validity (text-only 42804, loaded name 42704) is
+                // checked at execution against the catalog. A repeat keeps the last (like DEFAULT).
+                Some("collate") => {
+                    self.advance();
+                    collation = Some(self.expect_collation_name()?);
+                }
                 Some("unique") => {
                     self.advance();
                     uniques.push(UniqueDef {
@@ -624,6 +632,7 @@ impl Parser {
             not_null,
             default,
             identity,
+            collation,
         })
     }
 

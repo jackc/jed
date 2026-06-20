@@ -20,6 +20,7 @@ use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
     FkAction, ForeignKeyConstraint, IdentityKind, IndexDef, IndexKind, SequenceDef, Table,
 };
+use crate::collation::Collation;
 use crate::decimal::Decimal;
 use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
@@ -34,7 +35,10 @@ use crate::value::{ArrayVal, RangeVal, Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 16 = range columns (type_code 17 + an inline element-type descriptor in
+/// On-disk format version — 17 = baked collations (catalog `entry_kind = 3` collation snapshots — a
+/// flags byte `is_default`/`reference` + the LZ4-compressed `.coll` artifact; plus a per-column
+/// collation: flags-byte bit 6 `has_collation` + a trailing name — spec/design/collation.md §5,
+/// spec/fileformat/format.md). v16 = range columns (type_code 17 + an inline element-type descriptor in
 /// the catalog, spec/design/ranges.md §3, and the compact range value body — a flags byte
 /// EMPTY/LB_INF/UB_INF/LB_INC/UB_INC followed by the present bound bodies, §4). v15 = IDENTITY columns
 /// (the column-entry flags byte gains bit4 `is_identity` + bit5 `identity_always`; an identity column
@@ -49,7 +53,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// expression-default flag; v7 added a per-page CRC-32 (header grew 12→16 bytes). Each bump is atomic
 /// across the Rust/Go/TS cores + the Ruby golden reference (every `.jed` golden's version byte + CRC
 /// changed together).
-const FORMAT_VERSION: u16 = 16;
+const FORMAT_VERSION: u16 = 17;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -862,6 +866,17 @@ impl Snapshot {
             e.extend_from_slice(&sequence_entry_bytes(s));
             cat_entries.push(e);
         }
+        // Collation snapshots (kind 3, v17) — after sequences, before tables, so a collated table
+        // entry is read after the snapshot it references (spec/design/collation.md §5).
+        let default_coll = self.default_collation();
+        for coll in self.collations_sorted() {
+            let mut e = vec![3u8];
+            e.extend_from_slice(&collation_entry_bytes(
+                coll,
+                default_coll == Some(coll.name.as_str()),
+            ));
+            cat_entries.push(e);
+        }
         for (ti, (_, t, _)) in tables.iter().enumerate() {
             let mut e = vec![0u8];
             e.extend_from_slice(&table_entry_bytes(t, root_data_page[ti], &index_roots[ti]));
@@ -1126,6 +1141,17 @@ impl Snapshot {
             e.extend_from_slice(&sequence_entry_bytes(s));
             cat_entries.push(e);
         }
+        // Collation snapshots (kind 3, v17) — after sequences, before tables, so a collated table
+        // entry is read after the snapshot it references (spec/design/collation.md §5).
+        let default_coll = self.default_collation();
+        for coll in self.collations_sorted() {
+            let mut e = vec![3u8];
+            e.extend_from_slice(&collation_entry_bytes(
+                coll,
+                default_coll == Some(coll.name.as_str()),
+            ));
+            cat_entries.push(e);
+        }
         for (ti, (_, t, _)) in tables.iter().enumerate() {
             let mut e = vec![0u8];
             e.extend_from_slice(&table_entry_bytes(t, root_data_page[ti], &index_roots[ti]));
@@ -1293,6 +1319,17 @@ impl Database {
                     snap.put_sequence(s);
                     continue;
                 }
+                if kind == 3 {
+                    // A collation snapshot (v17): the baked `.coll` artifact + an `is_default` flag
+                    // (spec/design/collation.md §5). Registered directly; the default restores the
+                    // per-database default collation.
+                    let (coll, is_default) = decode_collation_entry(page.payload, &mut pos)?;
+                    if is_default {
+                        snap.set_default_collation(Some(coll.name.clone()));
+                    }
+                    snap.put_collation(std::sync::Arc::new(coll));
+                    continue;
+                }
                 if kind != 0 {
                     return Err(corrupt("unknown catalog entry kind"));
                 }
@@ -1412,6 +1449,17 @@ impl Database {
                     // A sequence entry (v12): self-contained, registered directly (no two-pass).
                     let s = decode_sequence_entry(page.payload, &mut pos)?;
                     snap.put_sequence(s);
+                    continue;
+                }
+                if kind == 3 {
+                    // A collation snapshot (v17): the baked `.coll` artifact + an `is_default` flag
+                    // (spec/design/collation.md §5). Registered directly; the default restores the
+                    // per-database default collation.
+                    let (coll, is_default) = decode_collation_entry(page.payload, &mut pos)?;
+                    if is_default {
+                        snap.set_default_collation(Some(coll.name.clone()));
+                    }
+                    snap.put_collation(std::sync::Arc::new(coll));
                     continue;
                 }
                 if kind != 0 {
@@ -1808,6 +1856,11 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
                     Some(IdentityKind::ByDefault) => flags |= 0b1_0000,
                     None => {}
                 }
+                // bit6 has_collation (v17) — a text column with a non-`C` effective collation
+                // (spec/design/collation.md §5); the name is appended after the default.
+                if col.collation.is_some() {
+                    flags |= 0b100_0000;
+                }
                 out.push(flags);
                 // A decimal column appends its typmod (precision, scale) — only for type_code 6,
                 // so non-decimal entries are byte-unchanged. `precision 0` = unconstrained.
@@ -1831,6 +1884,13 @@ fn table_entry_bytes(table: &Table, root_data_page: u32, index_roots: &[u32]) ->
                     let et = de.expr_text.as_bytes();
                     out.extend_from_slice(&(et.len() as u16).to_be_bytes());
                     out.extend_from_slice(et);
+                }
+                // The effective collation name (v17, flags bit6) — last in the per-column entry, so
+                // a non-collated column is byte-unchanged (spec/design/collation.md §5).
+                if let Some(coll) = &col.collation {
+                    let cb = coll.as_bytes();
+                    out.extend_from_slice(&(cb.len() as u16).to_be_bytes());
+                    out.extend_from_slice(cb);
                 }
             }
         }
@@ -2306,6 +2366,44 @@ fn decode_sequence_entry(buf: &[u8], pos: &mut usize) -> Result<SequenceDef> {
     })
 }
 
+/// Serialize a collation-snapshot catalog entry's BODY (after its `entry_kind = 3` byte, v17): a
+/// flags byte (bit0 `is_default`, bit1 `reference` — deferred, always 0/baked this slice), then the
+/// baked `.coll` artifact (u32 length + LZ4-compressed bytes) — spec/design/collation.md §5,
+/// spec/fileformat/format.md *Collation snapshot entry*. The artifact is byte-identical to
+/// `db.save_collation`, so a golden doubles as an artifact fixture.
+fn collation_entry_bytes(coll: &Collation, is_default: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(if is_default { 0b1u8 } else { 0 });
+    let artifact = crate::collation::save_collation(coll);
+    out.extend_from_slice(&(artifact.len() as u32).to_be_bytes());
+    out.extend_from_slice(&artifact);
+    out
+}
+
+/// Decode a collation-snapshot entry's body (inverse of `collation_entry_bytes`); the caller has
+/// consumed the `entry_kind` byte. Returns the loaded collation and whether it is the per-database
+/// default (the `is_default` flag bit).
+fn decode_collation_entry(buf: &[u8], pos: &mut usize) -> Result<(Collation, bool)> {
+    let flags = read_u8(buf, pos)?;
+    if flags & !0b11 != 0 {
+        return Err(corrupt("reserved collation flag set"));
+    }
+    if flags & 0b10 != 0 {
+        return Err(corrupt(
+            "reference-mode collation snapshots are not supported yet",
+        ));
+    }
+    let is_default = flags & 0b1 != 0;
+    let len = read_u32(buf, pos)? as usize;
+    let end = pos
+        .checked_add(len)
+        .filter(|e| *e <= buf.len())
+        .ok_or_else(|| corrupt("collation artifact truncated"))?;
+    let coll = crate::collation::open_collation(&buf[*pos..end])?;
+    *pos = end;
+    Ok((coll, is_default))
+}
+
 fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u32>)> {
     let name = read_string(buf, pos)?;
     let col_count = read_u16(buf, pos)? as usize;
@@ -2331,6 +2429,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
                 default: None,
                 default_expr: None,
                 identity: None,
+                collation: None,
             });
             continue;
         }
@@ -2351,6 +2450,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
                 default: None,
                 default_expr: None,
                 identity: None,
+                collation: None,
             });
             continue;
         }
@@ -2371,18 +2471,19 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
                 default: None,
                 default_expr: None,
                 identity: None,
+                collation: None,
             });
             continue;
         }
         let ty = scalar_for_type_code(tc).ok_or_else(|| corrupt("unknown type code"))?;
         let flags = read_u8(buf, pos)?;
         // bit0 was the primary_key flag through v4; v5 retired it (the pk list below is the
-        // authority) and reserves it as must-be-zero. bits 6-7 are reserved (v15).
+        // authority) and reserves it as must-be-zero. bit6 is has_collation (v17); bit7 reserved.
         if flags & 0b01 != 0 {
             return Err(corrupt("reserved column flag bit0 set"));
         }
-        if flags & 0b1100_0000 != 0 {
-            return Err(corrupt("reserved column flag bit (6/7) set"));
+        if flags & 0b1000_0000 != 0 {
+            return Err(corrupt("reserved column flag bit7 set"));
         }
         // bit4 is_identity + bit5 identity_always (v15) — identity_always is meaningful only with
         // is_identity (spec/design/sequences.md §13).
@@ -2436,6 +2537,13 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
         } else {
             None
         };
+        // The effective collation (v17, flags bit6) — appended last; a non-collated column has the
+        // bit clear and reads nothing (spec/design/collation.md §5).
+        let collation = if flags & 0b100_0000 != 0 {
+            Some(read_string(buf, pos)?)
+        } else {
+            None
+        };
         columns.push(Column {
             name: cname,
             ty: Type::Scalar(ty),
@@ -2445,6 +2553,7 @@ fn decode_table_entry(buf: &[u8], pos: &mut usize) -> Result<(Table, u32, Vec<u3
             default,
             default_expr,
             identity,
+            collation,
         });
     }
     // The primary key (v5): member ordinals in KEY order. Each must name a real column,

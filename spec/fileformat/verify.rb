@@ -14,7 +14,14 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 16 # format_version 16: range columns — a column type can be a range (type_code 17 + an
+VERSION = 17 # format_version 17: baked collations — a catalog entry_kind 3 collation snapshot (a
+# flags byte: bit0 is_default, bit1 reference [deferred, 0 = baked]; then the baked `.coll` artifact
+# as u32 length + LZ4-compressed bytes), emitted after sequences and before tables; plus a per-column
+# collation — the column-entry flags byte gains bit6 has_collation, and when set a trailing name
+# (u16-len + UTF-8) after the default. C (no collation) leaves the bit clear and writes nothing, so a
+# non-collated table/column is byte-unchanged but for the meta version byte. The per-database default
+# collation rides the is_default flag on its snapshot (spec/design/collation.md §5). format_version 16
+# was range columns — a column type can be a range (type_code 17 + an
 # inline element-type descriptor, one scalar code, spec/design/ranges.md §3), and a range value is a
 # flags byte (bit0 EMPTY, bit1 LB_INF, bit2 UB_INF, bit3 LB_INC, bit4 UB_INC) followed by the present
 # bound bodies (each the element's value-codec body, no presence tag — §4). An empty range is the
@@ -114,10 +121,10 @@ end
 # BY DEFAULT) — the v15 column flag bits 4 (is_identity) + 5 (identity_always); an identity column
 # also carries not_null + an expression default (the nextval, spec/design/sequences.md §13).
 def col(name, type, pk: false, not_null: nil, precision: nil, scale: nil, default: :none,
-        default_expr: nil, identity: nil)
+        default_expr: nil, identity: nil, collation: nil)
   { name: name, type: type, pk: pk, not_null: not_null.nil? ? pk : not_null,
     precision: precision, scale: scale, default: default, default_expr: default_expr,
-    identity: identity }
+    identity: identity, collation: collation }
 end
 
 # A composite-type field (format.md *Composite-type entry*, v9): a name + type (a scalar string,
@@ -820,6 +827,25 @@ IDENTITY_TABLE = {
              rows: [[1, 1, "hi"]] }]
 }.freeze
 
+# collation_table (v17): a baked COLLATION snapshot (entry_kind 3) + per-column collations. The
+# dev-root collation is imported and set as the per-database default (the is_default flag); the baked
+# artifact is the committed spec/collation/fixtures/dev-root.coll (= db.SaveCollation, treated opaquely
+# here). `name` carries an explicit COLLATE "dev-root" (flags bit6 + name), `plain` is un-annotated and
+# inherits the default (also dev-root, frozen), and `byteorder` carries explicit COLLATE "C" → no
+# collation (bit6 clear). Must match the cores' collation_table_db (spec/design/collation.md §5).
+COLLATION_TABLE = {
+  collations: [
+    { name: "dev-root", default: true,
+      artifact: File.binread(File.join(__dir__, "..", "collation", "fixtures", "dev-root.coll")) }
+  ],
+  tables: [{ name: "t",
+             columns: [col("id", "i32", pk: true),
+                       col("name", "text", collation: "dev-root"),
+                       col("plain", "text", collation: "dev-root"),
+                       col("byteorder", "text", collation: nil)],
+             rows: [[1, "a", "b", "z"], [2, "z", "a", "a"]] }]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -872,6 +898,8 @@ FIXTURES = [
     sequences: SERIAL_TABLE[:sequences], tables: SERIAL_TABLE[:tables] },
   { file: "identity_table.jed", page_size: 256,
     sequences: IDENTITY_TABLE[:sequences], tables: IDENTITY_TABLE[:tables] },
+  { file: "collation_table.jed", page_size: 256,
+    collations: COLLATION_TABLE[:collations], tables: COLLATION_TABLE[:tables] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
@@ -1273,6 +1301,9 @@ def table_entry_bytes(table, root_data_page, index_roots)
       flags |= 0b1_0000
       flags |= 0b10_0000 if c[:identity] == :always
     end
+    # bit6 has_collation (v17) — a text column with a non-C effective collation (collation.md §5);
+    # the name is appended last.
+    flags |= 0b100_0000 if c[:collation]
     out << [flags].pack("C")
     # A decimal column appends its typmod (precision, scale) — only for type_code 6, so
     # non-decimal entries are byte-unchanged. precision 0 = unconstrained numeric.
@@ -1286,6 +1317,8 @@ def table_entry_bytes(table, root_data_page, index_roots)
     elsif has_default_expr
       out << u16(c[:default_expr].bytesize) << c[:default_expr].b
     end
+    # The effective collation name (v17, flags bit6) — last in the per-column entry (collation.md §5).
+    out << u16(c[:collation].bytesize) << c[:collation].b if c[:collation]
   end
   # The primary key (v5): count, then the member column ordinals in KEY order.
   pk = pk_order(table)
@@ -1381,6 +1414,33 @@ def sequence_entry_bytes(s)
     out << u16(o[1])
   end
   out
+end
+
+# Serialize a collation-snapshot catalog entry's BODY (after its entry_kind = 3 byte, v17): a flags
+# byte (bit0 is_default, bit1 reference — deferred, 0/baked), then the baked `.coll` artifact (u32
+# length + LZ4-compressed bytes). The artifact is treated opaquely (Ruby has no collation compiler) —
+# it is byte-identical to db.SaveCollation (spec/design/collation.md §5, format.md *Collation entry*).
+def collation_entry_bytes(c)
+  out = +"".b
+  out << [c[:default] ? 0b1 : 0].pack("C")
+  out << u32(c[:artifact].bytesize) << c[:artifact].b
+  out
+end
+
+# Decode a collation-snapshot entry's body (inverse of collation_entry_bytes); the caller has
+# consumed the entry_kind byte. The artifact is opaque (its name lives inside, prefixed after the
+# 6-byte JCOLL\0 magic + 2-byte version — read for the expected comparison).
+def decode_collation_entry(buf, pos)
+  fb, pos = take(buf, pos, 1)
+  f = fb.getbyte(0)
+  raise "reserved collation flag set" if (f & ~0b11) != 0
+  raise "reference-mode collation snapshots are not supported yet" if (f & 0b10) != 0
+
+  lb, pos = take(buf, pos, 4)
+  artifact, pos = take(buf, pos, lb.unpack1("N"))
+  nl = artifact.byteslice(8, 2).unpack1("n") # name length: after JCOLL\0 (6) + version (2)
+  name = artifact.byteslice(10, nl).force_encoding("UTF-8")
+  [{ name: name, default: (f & 0b1) != 0, artifact: artifact }, pos]
 end
 
 # (key, row) pairs in stored (encoded-key) order. PK tables key on the PK member columns —
@@ -1720,7 +1780,7 @@ end
 # A from-scratch image (format.md "Allocation & incremental commit"): the special case where
 # every node is dirty — data B-trees post-order (per table, name order) from page 2, then the
 # catalog chain, then both meta slots at txid 1.
-def build_image(types, sequences, tables, page_size)
+def build_image(types, sequences, tables, page_size, collations = [])
   ps = page_size
   cap = ps - PAGE_HEADER
   # Composite types in scope for the recursive value codec, keyed by lowercased name (§4).
@@ -1728,6 +1788,7 @@ def build_image(types, sequences, tables, page_size)
   sorted = tables.sort_by { |t| t[:name].downcase }
   sorted_types = types.sort_by { |t| t[:name].downcase }
   sorted_seqs = sequences.sort_by { |s| s[:name].downcase }
+  sorted_colls = collations.sort_by { |c| c[:name] }
 
   data_pages = {} # index => [page_type, item_count, payload]
   root_data = Array.new(sorted.size, 0)
@@ -1749,11 +1810,13 @@ def build_image(types, sequences, tables, page_size)
   end
 
   # Catalog entries are kind-tagged: composite-type entries (kind 1, name order) first, then
-  # sequence entries (kind 2, name order, v12), then table entries (kind 0) — format.md.
+  # sequence entries (kind 2, name order, v12), then collation snapshots (kind 3, name order, v17),
+  # then table entries (kind 0) — format.md.
   cat_root = next_index
   cat_entries = []
   sorted_types.each { |ct| cat_entries << ("\x01".b + composite_type_entry_bytes(ct)) }
   sorted_seqs.each { |s| cat_entries << ("\x02".b + sequence_entry_bytes(s)) }
+  sorted_colls.each { |c| cat_entries << ("\x03".b + collation_entry_bytes(c)) }
   sorted.each_with_index { |t, ti| cat_entries << ("\x00".b + table_entry_bytes(t, root_data[ti], index_roots[ti])) }
   cat_groups = pack(cat_entries.map(&:bytesize), cap)
   page_count = cat_root + cat_groups.size
@@ -1776,7 +1839,8 @@ end
 
 # The bytes a fixture should contain (applying any torn-slot corruption).
 def fixture_image(fx)
-  image = build_image(fx[:types] || [], fx[:sequences] || [], fx[:tables], fx[:page_size])
+  image = build_image(fx[:types] || [], fx[:sequences] || [], fx[:tables], fx[:page_size],
+                      fx[:collations] || [])
   if fx[:corrupt_slot]
     off = fx[:corrupt_slot] * fx[:page_size] + 35 # last CRC byte of that slot
     image.setbyte(off, image.getbyte(off) ^ 0xFF)
@@ -1888,7 +1952,8 @@ def decode_table_entry(buf, pos)
       tnl, pos = take(buf, pos, 2)
       tname, pos = take(buf, pos, tnl.unpack1("n"))
       columns << { name: cname, type: tname, pk: false, not_null: (cf & 0b10) != 0,
-                   precision: nil, scale: nil, default: :none, default_expr: nil, identity: nil }
+                   precision: nil, scale: nil, default: :none, default_expr: nil, identity: nil,
+                   collation: nil }
       next
     end
     # An array column (v10, type_code 15): flags, then the element-type descriptor
@@ -1900,7 +1965,8 @@ def decode_table_entry(buf, pos)
 
       elem_type, pos = read_array_element_type(buf, pos)
       columns << { name: cname, type: "#{elem_type}[]", pk: false, not_null: (af & 0b10) != 0,
-                   precision: nil, scale: nil, default: :none, default_expr: nil, identity: nil }
+                   precision: nil, scale: nil, default: :none, default_expr: nil, identity: nil,
+                   collation: nil }
       next
     end
     # A range column (v15, type_code 17): flags, then the element-type descriptor — one scalar code
@@ -1914,13 +1980,14 @@ def decode_table_entry(buf, pos)
       elem_type = CODETYPE.fetch(ecb.getbyte(0))
       rname = RANGE_ELEM.key(elem_type) or raise "type code is not a valid range element subtype"
       columns << { name: cname, type: rname, pk: false, not_null: (rf & 0b10) != 0,
-                   precision: nil, scale: nil, default: :none, default_expr: nil, identity: nil }
+                   precision: nil, scale: nil, default: :none, default_expr: nil, identity: nil,
+                   collation: nil }
       next
     end
     flags, pos = take(buf, pos, 1)
     f = flags.getbyte(0)
     raise "reserved flag bit0 set (retired primary_key bit — v5)" if (f & 0b01) != 0
-    raise "reserved column flag bit (6/7) set" if (f & 0b1100_0000) != 0
+    raise "reserved column flag bit7 set" if (f & 0b1000_0000) != 0 # bit6 = has_collation (v17)
     # bit4 is_identity + bit5 identity_always (v15) — identity_always meaningful only with bit4.
     raise "identity_always set without is_identity" if (f & 0b11_0000) == 0b10_0000
     identity = if (f & 0b1_0000) != 0
@@ -1949,9 +2016,16 @@ def decode_table_entry(buf, pos)
       de, pos = take(buf, pos, el.unpack1("n"))
       default_expr = de.force_encoding("UTF-8")
     end
+    # The effective collation name (v17, flags bit6) — last in the per-column entry (collation.md §5).
+    collation = nil
+    if (f & 0b100_0000) != 0
+      cl, pos = take(buf, pos, 2)
+      cb, pos = take(buf, pos, cl.unpack1("n"))
+      collation = cb.force_encoding("UTF-8")
+    end
     columns << { name: cname, type: type, pk: false, not_null: (f & 0b10) != 0,
                  precision: precision, scale: scale, default: default, default_expr: default_expr,
-                 identity: identity }
+                 identity: identity, collation: collation }
   end
   # The primary key (v5): member ordinals in KEY order; pk membership marks the columns.
   pk = []
@@ -2335,6 +2409,7 @@ def decode_image(image)
   meta = select_meta(image, ps)
   types = []
   sequences = []
+  collations = []
   tables = []
   # Composite types in scope for the recursive value codec; populated as the (types-first) catalog
   # is read, so every composite a table row references is registered before its rows are decoded.
@@ -2346,7 +2421,7 @@ def decode_image(image)
 
     pos = 0
     pg[:item_count].times do
-      kb, pos = take(pg[:payload], pos, 1) # entry_kind: 0 table, 1 composite type, 2 sequence (v12)
+      kb, pos = take(pg[:payload], pos, 1) # entry_kind: 0 table, 1 composite, 2 sequence, 3 collation
       kind = kb.getbyte(0)
       if kind == 1
         ct, pos = decode_composite_type_entry(pg[:payload], pos)
@@ -2357,6 +2432,11 @@ def decode_image(image)
       if kind == 2
         s, pos = decode_sequence_entry(pg[:payload], pos)
         sequences << s
+        next
+      end
+      if kind == 3
+        c, pos = decode_collation_entry(pg[:payload], pos)
+        collations << c
         next
       end
       raise "unknown catalog entry kind #{kind}" unless kind.zero?
@@ -2372,7 +2452,7 @@ def decode_image(image)
     end
     cat = pg[:next_page]
   end
-  { types: types, sequences: sequences, tables: tables }
+  { types: types, sequences: sequences, collations: collations, tables: tables }
 end
 
 # Decode a sequence catalog entry's body (inverse of sequence_entry_bytes); the caller has consumed
@@ -2409,6 +2489,11 @@ def expected_sequences(fx)
   (fx[:sequences] || []).sort_by { |s| s[:name].downcase }
 end
 
+def expected_collations(fx)
+  (fx[:collations] || []).sort_by { |c| c[:name] }
+                         .map { |c| { name: c[:name], default: !!c[:default], artifact: c[:artifact] } }
+end
+
 # The composite-type content a fixture should decode to (name-sorted, normalized fields).
 def expected_types(fx)
   (fx[:types] || []).sort_by { |t| t[:name].downcase }.map do |t|
@@ -2428,7 +2513,7 @@ def expected_tables(fx)
       columns: t[:columns].map do |c|
         { name: c[:name], type: c[:type], pk: c[:pk], not_null: c[:not_null],
           precision: c[:precision], scale: c[:scale], default: c[:default],
-          default_expr: c[:default_expr], identity: c[:identity] }
+          default_expr: c[:default_expr], identity: c[:identity], collation: c[:collation] }
       end,
       pk: pk_order(t),
       checks: (t[:checks] || []).map { |ck| { name: ck[:name], expr: ck[:expr] } },
@@ -2567,6 +2652,13 @@ def verify
     decoded[:sequences].each_with_index do |s, i|
       unless content_equal?(s, want_seqs[i])
         fail!("#{fx[:file]}: sequence #{i} mismatch\n  got:  #{s.inspect}\n  want: #{want_seqs[i].inspect}")
+      end
+    end
+    want_colls = expected_collations(fx)
+    fail!("#{fx[:file]}: decoded #{decoded[:collations].size} collations, expected #{want_colls.size}") unless decoded[:collations].size == want_colls.size
+    decoded[:collations].each_with_index do |c, i|
+      unless content_equal?(c, want_colls[i])
+        fail!("#{fx[:file]}: collation #{i} mismatch\n  got:  #{c[:name].inspect} default=#{c[:default]}\n  want: #{want_colls[i][:name].inspect} default=#{want_colls[i][:default]}")
       end
     end
   end

@@ -1,13 +1,15 @@
-//! Collation slice 1c — the host `db.import_collation` API (spec/design/collation.md §4). These are
-//! the host-API behaviors the conformance corpus cannot express (CLAUDE.md §10): the import call
-//! itself, its idempotency, the same-name conflict, and the `C` rejection. The SQL behavior a loaded
-//! collation drives (COLLATE / ORDER BY / errors) lives in suites/collation/collate.test, which runs
-//! on every core. Mirrored by impl/go/collation_host_test.go and impl/ts/tests/collation_host.test.ts.
+//! Collation host API (spec/design/collation.md §1/§4): `db.import_collation` (1c) plus the slice-1d
+//! host surface — `export_collation`, `set_default_collation` / `default_collation`, `collations`,
+//! per-database default inheritance, and the baked **file round-trip** (`format_version` 17,
+//! `entry_kind = 3`). These are the host-API + persistence behaviors the conformance corpus cannot
+//! express (CLAUDE.md §10); the in-memory SQL behavior a loaded collation drives (COLLATE / ORDER BY
+//! / derivation / 42P21 / 42P22) lives in suites/collation/collate.test, which runs on every core.
+//! Mirrored by impl/go/collation_host_test.go and impl/ts/tests/collation_host.test.ts.
 
 use jed::collation::compile_collation;
 use jed::value::Value;
-use jed::{Database, Outcome, execute};
-use std::path::Path;
+use jed::{Database, DatabaseOptions, Outcome, execute};
+use std::path::{Path, PathBuf};
 
 fn spec(rel: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -16,8 +18,23 @@ fn spec(rel: &str) -> String {
     std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+fn tmp(name: &str) -> PathBuf {
+    std::env::temp_dir().join(name)
+}
+
 fn dev_root() -> jed::collation::Collation {
     compile_collation("dev-root", &spec("collation/fixtures/dev-root.allkeys")).unwrap()
+}
+
+/// The dev-nordic collation: the root weights plus the dev-nordic LDML tailoring (ä ö after z) — a
+/// genuinely different table from dev-root, for the implicit-conflict (42P22) and default cases.
+fn dev_nordic() -> jed::collation::Collation {
+    let def = format!(
+        "{}\n{}",
+        spec("collation/fixtures/dev-root.allkeys"),
+        spec("collation/fixtures/dev-nordic.ldml")
+    );
+    compile_collation("dev-nordic", &def).unwrap()
 }
 
 /// A collation under the name "dev-root" but with the dev-nordic *table* (a different content hash)
@@ -75,4 +92,165 @@ fn importing_C_is_rejected() {
     let c = compile_collation("C", &spec("collation/fixtures/dev-root.allkeys")).unwrap();
     let err = db.import_collation(c).unwrap_err();
     assert_eq!(err.code(), "42710");
+}
+
+// ---- slice 1d ----
+
+fn texts(rows: Vec<Vec<Value>>) -> Vec<String> {
+    rows.into_iter()
+        .map(|r| match &r[0] {
+            Value::Text(s) => s.clone(),
+            other => panic!("expected text, got {other:?}"),
+        })
+        .collect()
+}
+
+#[test]
+fn per_column_collation_orders_implicitly() {
+    // A column declared `COLLATE "dev-root"` sorts by that collation with NO explicit COLLATE on the
+    // query — the whole point of per-column collations (collation.md §1). dev-root puts ä next to a.
+    let mut db = Database::new();
+    db.import_collation(dev_root()).unwrap();
+    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\")").unwrap();
+    execute(&mut db, "INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
+    let rows = texts(query(&mut db, "SELECT name FROM t ORDER BY name"));
+    assert_eq!(rows, vec!["a", "ä", "z"]);
+    // An explicit COLLATE "C" on the query overrides back to byte order (ä is a 2-byte UTF-8 → after z).
+    let rows = texts(query(&mut db, "SELECT name FROM t ORDER BY name COLLATE \"C\""));
+    assert_eq!(rows, vec!["a", "z", "ä"]);
+}
+
+#[test]
+fn implicit_conflict_is_42p22() {
+    // Two columns with DIFFERENT implicit collations compared with no explicit COLLATE → 42P22
+    // (PG-matching). C counts as a distinct implicit collation, so dev-root vs C also conflicts.
+    let mut db = Database::new();
+    db.import_collation(dev_root()).unwrap();
+    db.import_collation(dev_nordic()).unwrap();
+    execute(
+        &mut db,
+        "CREATE TABLE t (a text COLLATE \"dev-root\", b text COLLATE \"dev-nordic\", c text COLLATE \"C\")",
+    )
+    .unwrap();
+    // Values use only dev-mapped code points (a, b, z). The 42P22 cases fail at resolve (before any
+    // eval), so the row values matter only for the explicit-override case.
+    execute(&mut db, "INSERT INTO t VALUES ('a','z','b')").unwrap();
+    assert_eq!(
+        execute(&mut db, "SELECT a < b FROM t").unwrap_err().code(),
+        "42P22"
+    );
+    assert_eq!(
+        execute(&mut db, "SELECT a < c FROM t").unwrap_err().code(),
+        "42P22"
+    );
+    // An explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') = true.
+    let rows = query(&mut db, "SELECT a < b COLLATE \"dev-root\" FROM t");
+    assert_eq!(rows, vec![vec![Value::Bool(true)]]);
+}
+
+#[test]
+fn non_text_collate_column_is_42804_unknown_name_42704() {
+    let mut db = Database::new();
+    db.import_collation(dev_root()).unwrap();
+    assert_eq!(
+        execute(&mut db, "CREATE TABLE t (a i32 COLLATE \"dev-root\")")
+            .unwrap_err()
+            .code(),
+        "42804"
+    );
+    assert_eq!(
+        execute(&mut db, "CREATE TABLE t (a text COLLATE \"nope\")")
+            .unwrap_err()
+            .code(),
+        "42704"
+    );
+}
+
+#[test]
+fn default_collation_inherited_by_unannotated_column() {
+    // SetDefaultCollation moves the per-database default; an un-annotated text column created AFTER
+    // inherits it (frozen). A column created BEFORE keeps C (collation.md §1, PG-matching).
+    let mut db = Database::new();
+    db.import_collation(dev_root()).unwrap();
+    assert_eq!(db.default_collation(), "C");
+    execute(&mut db, "CREATE TABLE before (id i32 PRIMARY KEY, name text)").unwrap();
+    db.set_default_collation("dev-root").unwrap();
+    assert_eq!(db.default_collation(), "dev-root");
+    execute(&mut db, "CREATE TABLE after (id i32 PRIMARY KEY, name text)").unwrap();
+    execute(&mut db, "INSERT INTO after VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
+    // `after.name` inherited dev-root → ä sorts next to a even with no COLLATE clause.
+    assert_eq!(
+        texts(query(&mut db, "SELECT name FROM after ORDER BY name")),
+        vec!["a", "ä", "z"]
+    );
+    // `before.name` was frozen at C → byte order.
+    execute(&mut db, "INSERT INTO before VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
+    assert_eq!(
+        texts(query(&mut db, "SELECT name FROM before ORDER BY name")),
+        vec!["a", "z", "ä"]
+    );
+}
+
+#[test]
+fn set_default_unknown_is_42704() {
+    let mut db = Database::new();
+    assert_eq!(db.set_default_collation("nope").unwrap_err().code(), "42704");
+    // C always resolves (resets to byte order).
+    db.set_default_collation("C").unwrap();
+}
+
+#[test]
+fn export_round_trips_and_introspects() {
+    let mut db = Database::new();
+    db.import_collation(dev_root()).unwrap();
+    // Export pulls the collation back; re-importing it is idempotent (identical content hash).
+    let exported = db.export_collation("dev-root").unwrap();
+    assert_eq!(exported.name, "dev-root");
+    let mut db2 = Database::new();
+    assert_eq!(db2.import_collation(exported).unwrap(), "dev-root");
+    // Unknown / built-in C → 42704 (nothing to export).
+    assert_eq!(db.export_collation("nope").unwrap_err().code(), "42704");
+    assert_eq!(db.export_collation("C").unwrap_err().code(), "42704");
+    // Introspection lists the loaded collation with its default flag.
+    db.set_default_collation("dev-root").unwrap();
+    let infos = db.collations();
+    assert_eq!(infos.len(), 1);
+    assert_eq!(infos[0].name, "dev-root");
+    assert!(infos[0].is_default);
+}
+
+#[test]
+fn baked_file_round_trip() {
+    // The full slice-1d persistence path: a collation + a collated table + the per-database default
+    // are baked into the file (format_version 17, entry_kind 3) and survive a close + paged reopen.
+    let path = tmp("collation_baked_roundtrip.jed");
+    let _ = std::fs::remove_file(&path);
+    let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
+    db.import_collation(dev_root()).unwrap();
+    db.set_default_collation("dev-root").unwrap();
+    execute(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\", plain text)",
+    )
+    .unwrap();
+    execute(&mut db, "INSERT INTO t VALUES (1,'z','z'),(2,'ä','ä'),(3,'a','a')").unwrap();
+    db.commit().unwrap();
+    db.close().unwrap();
+
+    let mut re = Database::open(&path).unwrap();
+    // The baked collation is back, still the default.
+    assert_eq!(re.default_collation(), "dev-root");
+    assert_eq!(re.collations().len(), 1);
+    // The collated column still sorts by dev-root (the snapshot was read before the table entry).
+    assert_eq!(
+        texts(query(&mut re, "SELECT name FROM t ORDER BY name")),
+        vec!["a", "ä", "z"]
+    );
+    // `plain` (un-annotated) inherited the default (dev-root) at create time → also dev-root order.
+    assert_eq!(
+        texts(query(&mut re, "SELECT plain FROM t ORDER BY plain")),
+        vec!["a", "ä", "z"]
+    );
+    re.close().unwrap();
+    let _ = std::fs::remove_file(&path);
 }

@@ -118,10 +118,12 @@ pub enum SqlState {
     /// (spec/design/indexes.md §2).
     WrongObjectType,
     /// 42P21 — collation mismatch: two DIFFERENT explicit collations combined in one comparison
-    /// (`'a' COLLATE "C" < 'b' COLLATE "en-US"`; spec/design/collation.md §1/§7). PG's separate
-    /// 42P22 (indeterminate_collation — conflicting IMPLICIT collations) is reachable once
-    /// per-column collations land in slice 1d.
+    /// (`'a' COLLATE "C" < 'b' COLLATE "en-US"`; spec/design/collation.md §1/§7).
     CollationMismatch,
+    /// 42P22 — indeterminate collation: two DIFFERENT IMPLICIT collations meet in one comparison /
+    /// ORDER BY without an explicit `COLLATE` to break the tie (two columns with different
+    /// collations; spec/design/collation.md §1/§7). Reachable since slice 1d (per-column collations).
+    IndeterminateCollation,
     /// 2BP01 — dependent objects still exist: `DROP TYPE ... RESTRICT` of a composite type a
     /// column or another composite field still references (spec/design/composite.md §7).
     DependentObjectsStillExist,
@@ -221,6 +223,7 @@ impl SqlState {
             SqlState::DuplicateObject => "42710",
             SqlState::WrongObjectType => "42809",
             SqlState::CollationMismatch => "42P21",
+            SqlState::IndeterminateCollation => "42P22",
             SqlState::NameTooLong => "42622",
             SqlState::GeneratedAlways => "428C9",
             SqlState::DependentObjectsStillExist => "2BP01",

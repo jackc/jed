@@ -161,6 +161,7 @@ column_constraint ::= "PRIMARY" "KEY"
                  | "DEFAULT" expr
                  | "GENERATED" ("ALWAYS" | "BY" "DEFAULT") "AS" "IDENTITY"
                        ("(" sequence_option* ")")?
+                 | collate_clause          /* COLLATE "name" — text columns only (../design/collation.md §1) */
                  | ["CONSTRAINT" identifier] "CHECK" "(" expr ")"
                  | ["CONSTRAINT" identifier] "UNIQUE"
                  | references_clause

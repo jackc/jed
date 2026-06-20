@@ -290,8 +290,19 @@ class = "syntax error or access rule violation"
 # Two DIFFERENT explicit collations combined in one comparison/operator (spec/design/collation.md
 # §1/§7): `'a' COLLATE "C" < 'b' COLLATE "en-US"`. The collation slice's explicit-conflict error,
 # resolved by removing one COLLATE. (PG's separate 42P22 indeterminate_collation — conflicting
-# IMPLICIT collations — becomes reachable once per-column collations land in slice 1d.)
+# IMPLICIT collations — became reachable with per-column collations in slice 1d.)
 template = "collation mismatch between explicit collations {left} and {right}"
+
+[[error]]
+code = "42P22"
+name = "indeterminate_collation"
+class = "syntax error or access rule violation"
+# Two DIFFERENT IMPLICIT collations meet in one comparison / ORDER BY without an explicit COLLATE to
+# break the tie (spec/design/collation.md §1/§7): two columns with different collations — e.g. a
+# `text COLLATE "C"` column compared to a `text COLLATE "en-US"` column. PG-matching; reachable since
+# slice 1d (per-column collations). Resolved by adding an explicit COLLATE to one side. C counts as a
+# distinct implicit collation (so C-vs-en-US conflicts), matching PostgreSQL.
+template = "could not determine which collation to use for string comparison"
 
 [[error]]
 code = "42710"

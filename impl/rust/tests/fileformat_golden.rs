@@ -817,6 +817,35 @@ fn identity_table_db() -> Database {
     db
 }
 
+/// A baked COLLATION (v17 — entry_kind 3 snapshot + per-column collations): the dev-root collation
+/// imported and set as the per-database default (the `is_default` flag), a column with an explicit
+/// `COLLATE "dev-root"` (flags bit6 + name), an un-annotated column inheriting the default (bit6 +
+/// name), and an explicit `COLLATE "C"` column (no collation, bit6 clear). The baked snapshot is the
+/// `dev-root.coll` artifact (spec/collation/fixtures) wrapped in catalog framing. Must match the Ruby
+/// reference's COLLATION_TABLE (spec/fileformat/verify.rb), spec/design/collation.md §5.
+fn dev_root_collation() -> jed::collation::Collation {
+    let def = std::fs::read_to_string(
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec/collation/fixtures/dev-root.allkeys"),
+    )
+    .unwrap();
+    jed::collation::compile_collation("dev-root", &def).unwrap()
+}
+
+fn collation_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    db.import_collation(dev_root_collation()).unwrap();
+    db.set_default_collation("dev-root").unwrap();
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\", \
+         plain text, byteorder text COLLATE \"C\")",
+    );
+    run(&mut db, "INSERT INTO t VALUES (1, 'a', 'b', 'z')");
+    run(&mut db, "INSERT INTO t VALUES (2, 'z', 'a', 'a')");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -865,6 +894,7 @@ fn write_matches_goldens() {
             "composite_array_field_table.jed",
             composite_array_field_table_db,
         ),
+        ("collation_table.jed", collation_table_db),
         ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
@@ -919,6 +949,7 @@ fn read_goldens_reproduces_rows() {
             composite_array_field_table_db,
             "t",
         ),
+        ("collation_table.jed", collation_table_db, "t"),
         ("serial_table.jed", serial_table_db, "t"),
         ("identity_table.jed", identity_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),

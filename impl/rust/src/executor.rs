@@ -94,6 +94,19 @@ impl Outcome {
 /// The `O(1)` summary of an `execute_script` run (spec/design/session.md §4.2). Carries only
 /// counts — never the result rows, which `execute_script` discards — so memory is bounded by
 /// construction regardless of how many rows the script's statements touch.
+/// Introspection metadata for one loaded collation (`db.Collations`, spec/design/collation.md §1).
+/// `content_hash` is the CRC-32 of the compiled table (the reference-mode stamp, §3/§4); the
+/// `description` is provenance, excluded from the hash.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CollationInfo {
+    pub name: String,
+    pub unicode_version: String,
+    pub cldr_version: String,
+    pub content_hash: u32,
+    pub description: String,
+    pub is_default: bool,
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScriptSummary {
     /// How many statements ran (each non-empty span the splitter yielded).
@@ -169,10 +182,15 @@ pub struct Snapshot {
     sequences: HashMap<String, SequenceDef>,
     /// Loaded collations, keyed by their exact (CASE-SENSITIVE) name — collation names are quoted
     /// identifiers (`"en-US"`, spec/design/collation.md §1). `C` is never stored (table-free, built
-    /// in). Imported by the host `db.import_collation` (slice 1c: in-memory only — no `format_version`
-    /// bump, no catalog entry yet; baking is slice 1d). `Arc` so a resolved comparison / sort key can
-    /// hold a cheap reference. Not serialized this slice.
+    /// in). Imported by the host `db.import_collation`. `Arc` so a resolved comparison / sort key can
+    /// hold a cheap reference. Persisted as catalog `entry_kind = 3` baked snapshots
+    /// (`format_version` 17, slice 1d — spec/fileformat/format.md, spec/design/collation.md §5).
     collations: HashMap<String, std::sync::Arc<Collation>>,
+    /// The per-database default collation name, or `None` for `C` (spec/design/collation.md §1/§5).
+    /// An un-annotated `text` column inherits this at CREATE TABLE. Settable to any loaded collation
+    /// (`db.set_default_collation`); persisted as the `is_default` flag bit on that collation's
+    /// `entry_kind = 3` snapshot, restored on load. `C` ⇒ no snapshot carries the bit.
+    default_collation: Option<String>,
 }
 
 impl Snapshot {
@@ -229,9 +247,29 @@ impl Snapshot {
     }
 
     /// Register a loaded collation (`db.import_collation`). Keyed by its exact name; the caller has
-    /// checked any same-name conflict (slice 1c: in-memory only, no persistence).
+    /// checked any same-name conflict.
     pub(crate) fn put_collation(&mut self, coll: std::sync::Arc<Collation>) {
         self.collations.insert(coll.name.clone(), coll);
+    }
+
+    /// All loaded collations in ascending name order — the on-disk emission order
+    /// (spec/fileformat/format.md, `entry_kind = 3`) and a deterministic order with no
+    /// hash-iteration leak (CLAUDE.md §8). Sorted by the exact (case-sensitive) name.
+    pub(crate) fn collations_sorted(&self) -> Vec<&std::sync::Arc<Collation>> {
+        let mut keys: Vec<&String> = self.collations.keys().collect();
+        keys.sort();
+        keys.into_iter().map(|k| &self.collations[k]).collect()
+    }
+
+    /// The per-database default collation name, or `None` for `C` (spec/design/collation.md §1).
+    pub(crate) fn default_collation(&self) -> Option<&str> {
+        self.default_collation.as_deref()
+    }
+
+    /// Set the per-database default collation (`db.set_default_collation`). `None` ⇒ `C`. The caller
+    /// has validated the name is loaded.
+    pub(crate) fn set_default_collation(&mut self, name: Option<String>) {
+        self.default_collation = name;
     }
 
     /// All sequences in ascending lowercased-name order — the on-disk emission order
@@ -1551,12 +1589,11 @@ impl Database {
 
     /// Import a collation into the database (the privileged host op `db.ImportCollation`,
     /// spec/design/collation.md §4). The collation becomes usable by name in `COLLATE` / `ORDER BY`
-    /// (slice 1c: in-memory only — placed in the committed catalog, NOT yet persisted; the
-    /// `format_version` bump + baked snapshot are slice 1d). Idempotent by `(name, content-hash)`:
-    /// re-importing the identical table is a no-op success; importing a DIFFERENT table under a
-    /// name already in use is 42710 (it would invalidate any structure built under that name —
-    /// re-collation is the explicit path, §12). `C` is never imported (table-free, built in).
-    /// Returns the imported name.
+    /// and is **baked** into the file at the next `commit` (catalog `entry_kind = 3`, `format_version`
+    /// 17 — §5). Idempotent by `(name, content-hash)`: re-importing the identical table is a no-op
+    /// success; importing a DIFFERENT table under a name already in use is 42710 (it would invalidate
+    /// any structure built under that name — re-collation is the explicit path, §12). `C` is never
+    /// imported (table-free, built in). Returns the imported name.
     pub fn import_collation(&mut self, coll: Collation) -> Result<String> {
         if coll.name == "C" {
             return Err(EngineError::new(
@@ -1578,6 +1615,67 @@ impl Database {
         }
         self.committed.put_collation(std::sync::Arc::new(coll));
         Ok(name)
+    }
+
+    /// Export a baked collation back out as a `Collation` value (`db.ExportCollation`,
+    /// spec/design/collation.md §1). `C` is built in and has no table → 42704 (nothing to export);
+    /// an unloaded name is 42704. The returned value round-trips through `save_collation` /
+    /// `import_collation` byte-identically.
+    pub fn export_collation(&self, name: &str) -> Result<Collation> {
+        match self.committed.collation(name) {
+            Some(c) => Ok((**c).clone()),
+            None => Err(EngineError::new(
+                SqlState::UndefinedObject,
+                format!("collation \"{name}\" does not exist"),
+            )),
+        }
+    }
+
+    /// Set the per-database default collation (`db.SetDefaultCollation`, spec/design/collation.md
+    /// §1). An un-annotated `text` column created afterward inherits it. The name must be `C` (resets
+    /// to byte order) or a loaded collation (else 42704). Persisted as the `is_default` flag on that
+    /// collation's baked snapshot at the next `commit`.
+    pub fn set_default_collation(&mut self, name: &str) -> Result<()> {
+        if name == "C" {
+            self.committed.set_default_collation(None);
+            return Ok(());
+        }
+        if self.committed.collation(name).is_none() {
+            return Err(EngineError::new(
+                SqlState::UndefinedObject,
+                format!("collation \"{name}\" does not exist"),
+            ));
+        }
+        self.committed.set_default_collation(Some(name.to_string()));
+        Ok(())
+    }
+
+    /// The per-database default collation name — `"C"` (byte order) unless `set_default_collation`
+    /// moved it (`db.DefaultCollation`, spec/design/collation.md §1).
+    pub fn default_collation(&self) -> String {
+        self.committed
+            .default_collation()
+            .unwrap_or("C")
+            .to_string()
+    }
+
+    /// Introspect the loaded collations (`db.Collations`, spec/design/collation.md §1) — each as
+    /// `(name, unicode_version, cldr_version, content_hash, description, is_default)`, in ascending
+    /// name order. `C` is built in and not listed.
+    pub fn collations(&self) -> Vec<CollationInfo> {
+        let default = self.committed.default_collation();
+        self.committed
+            .collations_sorted()
+            .into_iter()
+            .map(|c| CollationInfo {
+                name: c.name.clone(),
+                unicode_version: c.unicode_version.clone(),
+                cldr_version: c.cldr_version.clone(),
+                content_hash: crate::format::crc32_ieee(&collation::serialize_table(c)),
+                description: c.description.clone(),
+                is_default: default == Some(c.name.as_str()),
+            })
+            .collect()
     }
 
     /// Execute one parsed statement with no bind parameters.
@@ -2246,6 +2344,24 @@ impl Database {
                     },
                 }
             };
+            // The column's effective collation, frozen now (spec/design/collation.md §1). An explicit
+            // `COLLATE "name"` is text-only (42804 otherwise, PG-matching) and must name a loaded
+            // collation or `C` (42704); a text column without a clause inherits the per-database
+            // default. A `C` effective collation stores as `None` (the fast path).
+            let collation: Option<String> = if let Some(name) = &def.collation {
+                if !ty.is_text() {
+                    return Err(type_error(format!(
+                        "collations are not supported by type {}",
+                        ty.canonical_name()
+                    )));
+                }
+                resolve_collation_name(self, name)?; // validates loaded; 42704 if not
+                if name == "C" { None } else { Some(name.clone()) }
+            } else if ty.is_text() {
+                self.read_snap().default_collation().map(str::to_string)
+            } else {
+                None
+            };
             columns.push(Column {
                 name: def.name.clone(),
                 ty,
@@ -2260,6 +2376,7 @@ impl Database {
                 default,
                 default_expr,
                 identity: identity_kind,
+                collation,
             });
         }
 
@@ -6324,18 +6441,25 @@ impl Database {
                     ));
                 }
             };
-            // An explicit `COLLATE` on the sort key (spec/design/collation.md §1): the column must be
-            // text (42804) and the name must resolve ("C" → byte order, else loaded or 42704).
+            // The sort key's collation (spec/design/collation.md §1/§7). An explicit `COLLATE` must
+            // be on a text column (42804) and name a loaded collation ("C" → byte order, else 42704);
+            // absent a clause, the key inherits the column's frozen (implicit) collation — so
+            // `ORDER BY name` over an `en-US` column sorts by en-US (slice 1d). A single column can't
+            // conflict, so no 42P22 here.
             let coll = match &key.collation {
-                None => None,
                 Some(name) => {
                     if !scope.column_of(r).ty.is_text() {
-                        return Err(type_error(
-                            "collations are not supported by this column's type".to_string(),
-                        ));
+                        return Err(type_error(format!(
+                            "collations are not supported by type {}",
+                            scope.column_of(r).ty.canonical_name()
+                        )));
                     }
                     resolve_collation_name(scope.catalog, name)?
                 }
+                None => match &scope.column_of(r).collation {
+                    Some(cn) => resolve_collation_name(scope.catalog, cn)?,
+                    None => None,
+                },
             };
             let slot = if is_agg {
                 group_keys
@@ -9111,6 +9235,7 @@ fn cte_synthetic_table(
                 default: None,
                 default_expr: None,
                 identity: None,
+                collation: None,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -9311,6 +9436,7 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
             default: None,
             default_expr: None,
             identity: None,
+            collation: None,
         }],
         pk: Vec::new(),
         checks: Vec::new(),
@@ -14379,35 +14505,96 @@ fn resolve_collation_name(
     }
 }
 
-/// The single EXPLICIT collation an expression subtree forces, or `None` (spec/design/collation.md
-/// §1). In slice 1c the only source of an explicit collation is a `COLLATE` node (columns are
-/// implicitly `C`), so this finds the outermost COLLATE and, through the one text-combining operator
-/// `||`, detects an explicit-vs-explicit conflict (42P21). Propagation through CASE / COALESCE /
-/// function results is a deferred follow-on (they reset to the implicit default — a documented 1c
-/// narrowing, collation.md §14).
-fn explicit_collation(e: &Expr) -> Result<Option<String>> {
-    match e {
-        Expr::Collate { collation, .. } => Ok(Some(collation.clone())),
+/// A text expression's collation and its DERIVATION level (spec/design/collation.md §1, PostgreSQL's
+/// rules). `None` ⇒ no collation (a non-text expr, or a bare literal — takes a neighbour's).
+/// `Implicit(name)` ⇒ a column's frozen collation (`C` is a *distinct* implicit collation, so
+/// `C`-vs-`en-US` conflicts — PG-matching). `Explicit(name)` ⇒ an explicit `COLLATE`.
+/// `Indeterminate` ⇒ two different implicit collations met with no explicit override — an error only
+/// when the collation is consumed (42P22, at `resolve_deriv`).
+#[derive(Clone, PartialEq, Eq)]
+enum Deriv {
+    None,
+    Implicit(String),
+    Explicit(String),
+    Indeterminate,
+}
+
+/// Derive the collation + derivation level of a (text) expression subtree (spec/design/collation.md
+/// §1). A `COLLATE` is explicit; a column reference is implicit (its frozen collation, `C` if none);
+/// `||` combines its operands. Every other shape (literal, cast, function, CASE) resets to `None`
+/// (no collation — takes a neighbour's), a documented narrowing (collation.md §14).
+fn derive_collation(scope: &Scope, e: &Expr) -> Result<Deriv> {
+    Ok(match e {
+        Expr::Collate { collation, .. } => Deriv::Explicit(collation.clone()),
+        Expr::Column(name) => column_deriv(scope, scope.resolve_bare(name).ok()),
+        Expr::QualifiedColumn { qualifier, name } => {
+            column_deriv(scope, scope.resolve_qualified(qualifier, name).ok())
+        }
         Expr::Binary {
             op: BinaryOp::Concat,
             lhs,
             rhs,
-        } => combine_explicit(explicit_collation(lhs)?, explicit_collation(rhs)?),
-        _ => Ok(None),
+        } => combine_deriv(derive_collation(scope, lhs)?, derive_collation(scope, rhs)?)?,
+        _ => Deriv::None,
+    })
+}
+
+/// The implicit derivation of a resolved column reference: a text column carries `Implicit(name)`
+/// (its frozen collation, `C` if none); a non-text column or an unresolvable reference is `None`.
+fn column_deriv(scope: &Scope, r: Option<Resolved>) -> Deriv {
+    match r {
+        Some(r) => {
+            let col = scope.column_of(r);
+            if col.ty.is_text() {
+                Deriv::Implicit(col.collation.clone().unwrap_or_else(|| "C".to_string()))
+            } else {
+                Deriv::None
+            }
+        }
+        None => Deriv::None,
     }
 }
 
-/// Combine two operands' explicit collations (spec/design/collation.md §1/§7). Two DIFFERENT
-/// explicit collations are a conflict (42P21, the explicit-mismatch error PG raises); otherwise the
-/// single explicit collation, or `None` when neither operand forces one.
-fn combine_explicit(a: Option<String>, b: Option<String>) -> Result<Option<String>> {
-    match (a, b) {
-        (Some(x), Some(y)) if x != y => Err(EngineError::new(
-            SqlState::CollationMismatch,
-            format!("collation mismatch between explicit collations \"{x}\" and \"{y}\""),
+/// Combine two operands' derivations (spec/design/collation.md §1/§7, PG's rules). Explicit
+/// dominates; two DIFFERENT explicit collations conflict eagerly (42P21); two different implicit
+/// collations yield `Indeterminate` (deferred to 42P22 on use); explicit resolves an indeterminacy.
+fn combine_deriv(a: Deriv, b: Deriv) -> Result<Deriv> {
+    use Deriv::*;
+    Ok(match (a, b) {
+        (Explicit(x), Explicit(y)) => {
+            if x != y {
+                return Err(EngineError::new(
+                    SqlState::CollationMismatch,
+                    format!("collation mismatch between explicit collations \"{x}\" and \"{y}\""),
+                ));
+            }
+            Explicit(x)
+        }
+        (Explicit(x), _) | (_, Explicit(x)) => Explicit(x),
+        (Indeterminate, _) | (_, Indeterminate) => Indeterminate,
+        (Implicit(x), Implicit(y)) => {
+            if x == y {
+                Implicit(x)
+            } else {
+                Indeterminate
+            }
+        }
+        (Implicit(x), None) | (None, Implicit(x)) => Implicit(x),
+        (None, None) => None,
+    })
+}
+
+/// Resolve a derivation to the concrete collation a comparison / ORDER BY uses (spec/design/
+/// collation.md §1/§7). `None` and `C` ⇒ `None` (byte order, the fast path); a loaded name ⇒ its
+/// table (42704 if it vanished); `Indeterminate` ⇒ 42P22 (the collation is required but ambiguous).
+fn resolve_deriv(catalog: &Database, d: Deriv) -> Result<Option<std::sync::Arc<Collation>>> {
+    match d {
+        Deriv::None => Ok(None),
+        Deriv::Implicit(name) | Deriv::Explicit(name) => resolve_collation_name(catalog, &name),
+        Deriv::Indeterminate => Err(EngineError::new(
+            SqlState::IndeterminateCollation,
+            "could not determine which collation to use for string comparison",
         )),
-        (Some(x), _) => Ok(Some(x)),
-        (None, b) => Ok(b),
     }
 }
 
@@ -14571,18 +14758,16 @@ fn resolve_binary(
             };
             // Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text
             // comparison is collatable; for any other operand family collation is irrelevant (and a
-            // COLLATE on a non-text operand was already rejected 42804 at the Collate node). The
-            // explicit collation is found by walking each AST operand; two DIFFERENT explicit
-            // collations conflict (42P21). In 1c every column is implicitly `C` (no per-column
-            // collation yet), so the only reachable conflict is explicit-vs-explicit.
+            // COLLATE on a non-text operand was already rejected 42804 at the Collate node). Each
+            // operand's derivation (explicit COLLATE / implicit column collation / none) is combined
+            // per PG's rules: two different EXPLICIT collations conflict (42P21); two different
+            // IMPLICIT collations are indeterminate (42P22 when consumed here). The derivation runs
+            // for ALL comparison ops including `=`/`<>` (PG raises the conflict regardless), even
+            // though `=`/`<>` ignore the collation at eval (byte equality, §7).
             let collation = if matches!(lt, ResolvedType::Text) && matches!(rt, ResolvedType::Text)
             {
-                let lc = explicit_collation(lhs)?;
-                let rc = explicit_collation(rhs)?;
-                match combine_explicit(lc, rc)? {
-                    Some(name) => resolve_collation_name(scope.catalog, &name)?,
-                    None => None,
-                }
+                let d = combine_deriv(derive_collation(scope, lhs)?, derive_collation(scope, rhs)?)?;
+                resolve_deriv(scope.catalog, d)?
             } else {
                 None
             };

@@ -34,11 +34,15 @@
 > postfix expression operator and `ORDER BY … COLLATE`, the host `db.ImportCollation` (in-memory
 > only — no persistence), collation derivation (the explicit-conflict `42P21`, unloaded `42704`,
 > non-text `42804`), the `collate` cost unit, and the corpus `# load-collation:` fixture directive
-> (`suites/collation/collate.test`, run on every core). The remaining slices (§14) land against
-> these. Two decisions are **confirmed**: the definition format is the **UCA/CLDR standards** (DUCET
-> `allkeys.txt` + LDML), and the cores build **`CompileCollation` in-core first** (no external
-> authoring tool). This doc pins no `format_version` or `type_code` number: the version bump and the
-> new catalog `entry_kind` are claimed at slice 1d, against whatever the master tip is then.
+> (`suites/collation/collate.test`, run on every core). **Slice 1d** landed on-disk baking
+> (**`format_version` 17**): the `entry_kind` 3 baked collation snapshot, the per-column collation
+> (column flags bit 6 + a trailing name), `db.ImportCollation` baked-persisting +
+> `db.ExportCollation` + `db.SetDefaultCollation`/`db.DefaultCollation` + `db.Collations`, per-column
+> `COLLATE` in `CREATE TABLE` with default inheritance frozen at create, the now-reachable
+> indeterminate-collation **`42P22`**, and the `collation_table.jed` golden (`rust == go == ts ==
+> ruby`). The remaining slice (§14) is **1e** (collated keys). Two decisions are **confirmed**: the
+> definition format is the **UCA/CLDR standards** (DUCET `allkeys.txt` + LDML), and the cores build
+> **`CompileCollation` in-core first** (no external authoring tool).
 
 Collation is the rule for **ordering and equating** text, layered on the *encoding* (which
 maps characters to bytes — jed commits to UTF-8 everywhere). jed ships exactly one collation
@@ -115,10 +119,12 @@ SELECT 'ä' < 'z' COLLATE "de"                      -- per-expression collation 
   collations in one operator is **`42P21`** (`collation_mismatch`, "collation mismatch between
   explicit collations"); combining two different **implicit** collations is **`42P22`**
   (`indeterminate_collation`, "could not determine which collation to use"), resolved by an
-  explicit `COLLATE`. **In slice 1c only `42P21` is reachable** — there is no per-column collation
-  yet (every column is implicitly `C`), so two non-`C` implicit collations cannot be combined;
-  `42P22` becomes reachable when per-column collations land in **slice 1d**. (An earlier draft
-  named `42P22` for the explicit case — corrected: PG raises `42P21` there.)
+  explicit `COLLATE`. **Both are reachable since slice 1d** — a column reference's implicit collation
+  is its frozen collation, with **`C` a distinct implicit collation** (so a `C` column vs an `en-US`
+  column conflicts — PG-matching). The conflict is derived for **all** comparison ops including
+  `=`/`<>` (PG raises it regardless), even though jed's `=`/`<>` ignore the collation at eval (byte
+  equality, §7). (In slice 1c only `42P21` was reachable — every column was implicitly `C`. An earlier
+  draft named `42P22` for the explicit case — corrected: PG raises `42P21` there.)
 - **Provenance + introspection.** Each loaded collation carries an optional, human-readable
   **description** recording where it came from — auto-filled by `ExtractHostCollation` with the
   core/OS/library identity (e.g. `Go 1.26.3 / Linux 7.1 / ICU 73`), settable on any `Collation`,
@@ -259,9 +265,13 @@ matches.
 
 Two additive changes to the file, both bumping `format_version` at the implementation slice:
 
-- **The per-database default collation** (§1) is a small field in the database header / root
-  catalog — a collation name (empty ⇒ `C`). It references a loaded collation snapshot when
-  non-`C`.
+- **The per-database default collation** (§1) is **not** a separate header/meta field but the
+  **`is_default` flag bit on the collation snapshot it names** (`C` ⇒ no snapshot flagged). *(Slice
+  1d refinement: jed's catalog packs whole kind-tagged entries — there is no free-form header byte
+  stream to prepend a name to — and the meta page is a fixed-width, CRC-protected layout with no room
+  for a variable-length name. A non-`C` default must be a loaded collation, so its snapshot is always
+  present to carry the bit; this is the clean home and needs neither a meta-layout change nor a
+  synthetic header entry. The earlier "small field in the header / root catalog" plan is superseded.)*
 - **A loaded collation is a new kind-tagged catalog entry.** The catalog already carries a
   leading `entry_kind` u8 per entry (`0` table, `1` composite type, `2` sequence —
   [format.md](../fileformat/format.md)); collation snapshots take the **next kind** (`3`), with
@@ -557,10 +567,29 @@ sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
   it materializes + sorts via a decorate sorter (each sort key built once); collation is in-memory
   only, so it never spills (collated keys are slice 1e). The lexer gained a double-quoted-identifier
   token (`Token::QuotedIdent`) for collation names, consumed only in the COLLATE / ORDER BY position.
-- **1d — on-disk baking**: the `format_version` bump + the `entry_kind` 3 snapshot + the
-  per-database default-collation field (§5); `db.ImportCollation` (baked) persisting,
-  `db.ExportCollation`, `db.SetDefaultCollation` + un-annotated-column inheritance (§1); the
-  provenance description persisted (§1/§5); a golden DB (`rust == go == ts == ruby`, §10).
+- **1d — on-disk baking** ✅ *landed*: `format_version` 17 — the `entry_kind` 3 baked collation
+  snapshot (a flags byte `is_default`/`reference` + the LZ4-compressed `.coll` artifact, the artifact
+  byte-identical to `db.SaveCollation` so a golden doubles as an artifact fixture) emitted *composites
+  → sequences → collations → tables*; the per-column collation (the column flags byte gains bit 6
+  `has_collation` + a trailing name); `db.ImportCollation` baked-persisting at `commit`,
+  `db.ExportCollation`, `db.SetDefaultCollation`/`db.DefaultCollation`, `db.Collations` introspection;
+  per-column `COLLATE "name"` in `CREATE TABLE` (text-only `42804`, loaded-name `42704`); un-annotated
+  text columns inherit the per-database default, **frozen at CREATE TABLE** (PG-matching); the
+  collation `collation_table.jed` golden (`rust == go == ts == ruby`). Refinements made here, all
+  recorded below: (a) the **per-database default rides the `is_default` flag on its snapshot**, not a
+  separate header/meta field — jed's catalog packs whole kind-tagged entries (no free-form header
+  stream) and the meta page is fixed-width + CRC-protected, so a flag bit on the (already-present, since
+  a non-`C` default must be loaded) snapshot is the clean home; `C` default ⇒ no snapshot flagged (§5).
+  (b) **`42P22` (indeterminate_collation) is now reachable** — a column reference's *implicit*
+  collation is its frozen collation (`C` counts as a distinct implicit collation, PG-matching), and two
+  different implicit collations in one comparison / ORDER BY without an explicit `COLLATE` raise
+  `42P22`; an explicit `COLLATE` on either side resolves it. The conflict is derived for **all**
+  comparison ops including `=`/`<>` (PG raises it regardless), even though `=`/`<>` ignore the
+  collation at eval (byte equality, §7). (c) Collation **derivation propagates** through a column
+  reference (implicit), `COLLATE` (explicit), and `||` (combine); every other shape resets to none
+  (takes a neighbour's) — the same documented narrowing as 1c. Set-operation output columns do not
+  yet propagate an implicit collation (an explicit `COLLATE` on a set-op ORDER BY key still works) — a
+  deferred follow-on.
 - **1e — collated keys**: the sort-key key encoding (§8) as a new [encoding.md](encoding.md)
   sub-section, a collated text `PRIMARY KEY` / index / `UNIQUE`, byte fixtures + a golden with a
   collated index.

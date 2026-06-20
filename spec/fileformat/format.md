@@ -15,19 +15,30 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 16)
+## Version scope (`format_version` 17)
 
-The current on-disk version is **`format_version` 16** — **range columns**
-([../design/ranges.md](../design/ranges.md)). A column type can now be a **range** (`type_code` 17 —
+The current on-disk version is **`format_version` 17** — **baked collations**
+([../design/collation.md §5](../design/collation.md)). A loaded collation is a new **kind-tagged
+catalog entry** (`entry_kind` 3 — the *Catalog* section below), emitted **after sequences and before
+tables** (*composites → sequences → collations → tables*): a **flags byte** (bit0 `is_default`, bit1
+`reference` — deferred, always 0/baked this slice) followed by the **baked `.coll` artifact** (a
+`u32` length + the LZ4-compressed compiled table — byte-identical to `db.SaveCollation`, so a golden
+doubles as an artifact fixture). The **per-database default collation** is the `is_default`-flagged
+snapshot (no separate header/meta field — `C` ⇒ none flagged). A **per-column collation** rides the
+column-entry **flags byte bit 6 `has_collation`**; when set, a trailing name (`u16` length + UTF-8)
+follows the default. A `C` (byte-order) column leaves the bit clear and writes nothing, so a
+non-collated table is byte-unchanged but for the version byte + meta CRC. A collation snapshot owns no
+B-tree. Each version is a **clean break** — older versions are **not read** (we are pre-1.0 and owe no
+on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only** version 17.
+
+`format_version` 16 was **range columns**
+([../design/ranges.md](../design/ranges.md)). A column type can be a **range** (`type_code` 17 —
 the *Catalog* table below — followed by an **inline element-type descriptor**, one scalar code, the
 same self-describing shape an array column uses one level down). A **range value** is a compact body:
 a **flags byte** (bit0 `EMPTY`, bit1 `LB_INF`, bit2 `UB_INF`, bit3 `LB_INC`, bit4 `UB_INC`) followed
 by the **present bound bodies** (each the element's value-codec body, no presence tag). The empty
 range is the lone flags byte `0x01`; discrete subtypes (`i32`/`i64`/`date`) are stored in PostgreSQL
-canonical `[)` form. A range owns no B-tree and carries no default this slice. No other on-disk change
-(only the version byte + meta CRC move for a file with no range column). Each version is a **clean
-break** — older versions are **not read** (we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md
-§1, "we own our surface"), so a reader accepts **only** version 16.
+canonical `[)` form. A range owns no B-tree and carries no default this slice.
 
 `format_version` 15 was **IDENTITY columns**
 ([../design/sequences.md §13](../design/sequences.md)). A `GENERATED { ALWAYS | BY DEFAULT } AS
@@ -331,11 +342,12 @@ B-tree root moves). Its **encoding is byte-identical to v1**; only its location 
 (`root_page`) and `root_data_page` now points at a **B-tree root node** instead of a record
 chain head.
 
-**Each catalog entry is kind-tagged (v9, extended v12):** a leading `entry_kind` u8 — `0` = a table
-entry, `1` = a composite-type entry ([../design/composite.md §3](../design/composite.md)), `2` = a
-sequence entry ([../design/sequences.md §3](../design/sequences.md)). Entries are emitted in kind
-order **composite-type (1), then sequence (2), then table (0)**, each group in ascending
-lowercased-name order. Each page's `item_count` is the number of entries (of any kind) it holds;
+**Each catalog entry is kind-tagged (v9, extended v12/v17):** a leading `entry_kind` u8 — `0` = a
+table entry, `1` = a composite-type entry ([../design/composite.md §3](../design/composite.md)), `2` =
+a sequence entry ([../design/sequences.md §3](../design/sequences.md)), `3` = a collation snapshot
+([../design/collation.md §5](../design/collation.md)). Entries are emitted in kind order
+**composite-type (1), then sequence (2), then collation (3), then table (0)**, each group in ascending
+lowercased-name order (collations sort by their exact, case-sensitive name). Each page's `item_count` is the number of entries (of any kind) it holds;
 entries are packed greedily into the chain, kind-tagged in stream order, exactly as table entries
 were through v8 (a single entry must fit one page, i.e. ≤ `C`, else `0A000`; the `RECORD_MAX = C/2`
 cap is a B-tree-record rule and does **not** apply to catalog entries, which never split). Each group
@@ -364,12 +376,14 @@ columns and the index list after the checks, and retires column-flag bit0):
 | &nbsp;&nbsp;`col_name_len` | u16 |
 | &nbsp;&nbsp;`col_name` | UTF-8 (original case) |
 | &nbsp;&nbsp;`type_code` | u8 (stable, see below) |
-| &nbsp;&nbsp;`flags` | u8 — bit0 reserved 0 (**was** `primary_key` through v4 — the `pk` list below is the authority), bit1 `not_null`, bit2 `has_default` (constant default), bit3 `default_is_expr` (**new in v8** — expression default; mutually exclusive with bit2, both set is `XX001`), bit4 `is_identity` (**new in v15** — a `GENERATED … AS IDENTITY` column; implies bit1 + bit3 — sequences.md §13), bit5 `identity_always` (**new in v15** — `GENERATED ALWAYS` when set, `GENERATED BY DEFAULT` when clear; meaningful only with bit4, else `XX001`); bits 6–7 reserved 0 (reader trusts the bits) |
+| &nbsp;&nbsp;`flags` | u8 — bit0 reserved 0 (**was** `primary_key` through v4 — the `pk` list below is the authority), bit1 `not_null`, bit2 `has_default` (constant default), bit3 `default_is_expr` (**new in v8** — expression default; mutually exclusive with bit2, both set is `XX001`), bit4 `is_identity` (**new in v15** — a `GENERATED … AS IDENTITY` column; implies bit1 + bit3 — sequences.md §13), bit5 `identity_always` (**new in v15** — `GENERATED ALWAYS` when set, `GENERATED BY DEFAULT` when clear; meaningful only with bit4, else `XX001`), bit6 `has_collation` (**new in v17** — a text column with a non-`C` effective collation, collation.md §5); bit7 reserved 0 (reader trusts the bits) |
 | &nbsp;&nbsp;`precision` | u16 — **only present when `type_code == 6` (decimal)**; `0` = unconstrained |
 | &nbsp;&nbsp;`scale` | u16 — **only present when `type_code == 6` (decimal)** |
 | &nbsp;&nbsp;`default` | value-codec bytes — **only present when `flags` bit2 (`has_default`)**; written *after* the typmod |
 | &nbsp;&nbsp;`default_expr_len` | u16 — **only present when `flags` bit3 (`default_is_expr`)**; written *after* the typmod (in place of `default`) |
 | &nbsp;&nbsp;`default_expr` | UTF-8 — the default's expression text (*Check-expression text* below), `default_expr_len` bytes |
+| &nbsp;&nbsp;`collation_len` | u16 — **only present when `flags` bit6 (`has_collation`)** (**new in v17**); written *after* the default |
+| &nbsp;&nbsp;`collation` | UTF-8 — the effective collation name (`collation.md` §5), `collation_len` bytes |
 | `pk_count` | u16 — primary-key member count (**new in v5**; `0` = no PK, synthetic rowid keys) |
 | `pk_ordinal` ×`pk_count` | u16 each — column ordinals (0-based declaration position) in **key order**; each must be `< col_count` and distinct (else `XX001`) |
 | `check_count` | u16 — the table's `CHECK` constraints (v4; `0` for an unchecked table) |
@@ -500,6 +514,27 @@ no B-tree (no `root_data_page`), like a foreign key. The owner reference (`has_o
 so a reopened database still auto-drops the owned sequence on `DROP TABLE`; a plain `CREATE SEQUENCE`
 is non-owned (`has_owner = 0`, no tail).
 
+### Collation snapshot entry (`entry_kind = 3`, v17)
+
+A collation snapshot records a host-imported, **baked** collation
+([../design/collation.md §5](../design/collation.md)). The entry is a flags byte plus the baked
+`.coll` artifact carried as opaque, length-prefixed bytes — the artifact is byte-identical to
+`db.SaveCollation`, so a `collation_table.jed` golden doubles as an artifact fixture:
+
+| field | encoding |
+|---|---|
+| `entry_kind` | u8 = `3` |
+| `flags` | u8 — bit0 `is_default` (this snapshot is the per-database default collation), bit1 `reference` (**reserved/deferred** — always 0/baked this slice; a set bit is `XX001`); bits 2–7 reserved 0 |
+| `artifact_len` | u32 — the baked artifact length in bytes |
+| `artifact` | `artifact_len` bytes — the `.coll` artifact (`JCOLL\0` magic + version + name/unicode/cldr/description strings + content hash + the LZ4-compressed compiled table; [../collation/README.md](../collation/README.md)) |
+
+A collation snapshot owns **no B-tree** (no `root_data_page`), like a sequence or foreign key. The
+**per-database default collation** is whichever snapshot carries `is_default` (`C` ⇒ none flagged);
+on load the engine restores it from that bit. Snapshots are emitted in ascending **case-sensitive
+name** order, after sequences and before tables, so a collated table entry is read after the snapshot
+it references. `db.SetDefaultCollation` flips the bit; `db.ExportCollation` returns the artifact bytes
+verbatim.
+
 ### Check-expression text
 
 The persisted `check_expr` is the constraint's parsed **token sequence re-rendered** — the
@@ -567,11 +602,12 @@ verbatim (the `-0 = +0` collapse is a comparison/key concern only — [../design
 §3/§10). The on-disk bytes are byte-identical across cores (the float types are exempt from
 cross-core identity only for *computed/rendered values*, not for *storage* — determinism.md §6).
 
-A column's collation is **not** stored: there is one collation (`C`) for all text this slice
-([../design/types.md](../design/types.md) §11). A per-column collation field is a forward
-extension that will claim a spare `flags` bit or a new field under a `format_version` bump when
-multi-collation lands. `bytea` and `uuid` have no collation. A non-integer PRIMARY KEY needs no
-extra catalog field — the key bytes live in the data-page record (below), not the catalog.
+A **text** column's effective collation is stored **only when non-`C`** (**new in v17**,
+[../design/collation.md §5](../design/collation.md)): `flags` bit6 `has_collation` set, with the
+name (`u16` length + UTF-8) appended after the default. A `C` (byte-order) column — the common case —
+leaves the bit clear and writes nothing, so a non-collated column is byte-unchanged. `bytea` and
+`uuid` have no collation. A non-integer PRIMARY KEY needs no extra catalog field — the key bytes live
+in the data-page record (below), not the catalog.
 
 A **decimal** column carries a **typmod** (the `numeric(p,s)` precision/scale) appended to the
 column entry **only when `type_code == 6`** — two big-endian `u16`s, `precision` then `scale`.

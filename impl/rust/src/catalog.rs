@@ -38,6 +38,13 @@ pub struct Column {
     /// whether an explicit INSERT/UPDATE value is accepted (`428C9`). Persisted as two column flag
     /// bits (format_version 15: bit 4 `is_identity`, bit 5 `identity_always`).
     pub identity: Option<IdentityKind>,
+    /// The column's **effective** collation — `None` is `C` (byte / code-point order, the unchanged
+    /// fast path), `Some(name)` a loaded non-`C` collation (spec/design/collation.md §1). Frozen at
+    /// CREATE TABLE: an explicit `COLLATE "name"` clause, else the per-database default collation as
+    /// of creation (PG-matching — a column's collation is fixed at creation, never re-derived). Only
+    /// a `text` column may carry one. A column reference's *implicit* collation in the derivation
+    /// (`42P22`); persisted as column flag bit 6 + a trailing name (format_version 17).
+    pub collation: Option<String>,
 }
 
 /// The kind of an IDENTITY column (spec/design/sequences.md §13). `Always` (`GENERATED ALWAYS`)

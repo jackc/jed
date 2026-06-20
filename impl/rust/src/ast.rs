@@ -292,6 +292,11 @@ pub struct ColumnDef {
     /// (spec/design/sequences.md §13). Desugars like `serial` (an owned sequence + a `nextval`
     /// default + NOT NULL) plus the persisted ALWAYS/BY DEFAULT distinction.
     pub identity: Option<IdentitySpec>,
+    /// An optional `COLLATE "name"` column modifier (spec/design/collation.md §1) — a quoted,
+    /// case-sensitive collation name. Only valid on a `text` column (else 42804); the name must be a
+    /// loaded collation or `"C"` (else 42704). Absent ⇒ the column inherits the per-database default
+    /// collation. The effective collation is frozen into the column at CREATE TABLE.
+    pub collation: Option<String>,
 }
 
 /// A parsed type modifier: a precision and an optional scale, as written
