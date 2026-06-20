@@ -484,12 +484,16 @@ setter but `54P01` is a corpus-asserted outcome.
 Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independently testable. Spec
 (this doc) lands first; cores follow in lockstep:
 
-1. **Session concept + the one stateful default session** — un-fuse `Database`/`Session`, relocate
-   the existing handle settings onto `Session`, make the `Database`-owned default session explicit
-   and stateful (§2.1), and make the **transaction state machine** explicit on the session
-   (`Idle`/`Open`/`Failed`, §2.2) — collapsing the separate `Transaction` object into session
-   state + optional RAII sugar (revises [api.md §2.2/§6](../design/api.md)). A near-pure refactor
-   (the transactions.md-style un-fusing); existing corpus unchanged.
+1. **Session concept + the one stateful default session** — ✅ **landed (all 3 cores).** Un-fused
+   `Database`/`Session`, relocated the settings onto `Session`, made the `Database`-owned default
+   session explicit and stateful (§2.1) and the **transaction state machine** explicit on the session
+   (`Idle`/`Open`/`Failed` = `TxStatus`/`db.status()`, §2.2) — collapsing the separate `Transaction`
+   object into session state + RAII sugar. `db.session(opts)` mints additional sessions that share
+   committed storage and run sequentially via a swap. Near-pure refactor — corpus + all suites
+   unchanged (162/0 ×3, NoREC 660/660), per-core `session` tests added. (One per-core divergence: the
+   TS `Session` exposes `execute` + settings + `status`; its `view`/`update` closure sugar is deferred
+   to avoid an `api.ts` module cycle — TS drives an additional session's transactions via SQL
+   `BEGIN`/`COMMIT` through `execute`.)
 2. **Multi-statement splitter + `execute_script`** (§4) — the **library-level** lexer `split_statements`
    function (no `Session`/`Database`; per-core unit tested) + the session-level discard-rows /
    one-implicit-transaction `execute_script` convenience (corpus-tested ordered schedule). The

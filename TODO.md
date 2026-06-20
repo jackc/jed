@@ -897,15 +897,18 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       through), the explicit home for the settings the handle conflated + the new host controls.
       Spec authored: → [session.md](spec/design/session.md). Sequenced slices (each its own vertical
       slice + corpus, §10):
-  - [ ] **S1 — session concept + the one stateful default session** — `db.session(opts) -> Session`,
-        relocate the existing handle settings (`max_cost`/`max_sql_length`/`work_mem`/the
-        entropy+clock sources) onto `Session`; the `Database`-owned **default session** is explicit
-        and **stateful** (an open `BEGIN`, vars, meters persist across calls — PG/SQLite connection
-        model, §2.1); the **transaction state machine** becomes explicit on the session
-        (`Idle`/`Open`/`Failed`, §2.2), **collapsing** the separate `Transaction` object into session
-        state + optional RAII sugar (revises [api.md §2.2/§6](spec/design/api.md)). State ownership:
-        committed data on `Database`, session state on `Session`. A near-pure refactor (the
-        transactions.md un-fusing precedent); existing corpus unchanged. _(size: L; §2)_
+  - [x] **S1 — session concept + the one stateful default session** — ✅ **landed (all 3 cores).** A
+        `Session` type (Rust struct / Go struct / TS class) holds the per-connection state — the
+        relocated settings (`max_cost`/`max_sql_length`/`work_mem` + the entropy/clock seam), the open
+        transaction, and the `currval`/`lastval` session state — and `Database` owns one as its
+        long-lived **stateful default session** (an open `BEGIN`, meters persist across calls —
+        PG/SQLite connection model, §2.1). The **transaction state machine** is explicit on the
+        session (`Idle`/`Open`/`Failed` = `TxStatus`/`db.status()`, §2.2); the separate `Transaction`
+        object **collapses** to session state + RAII sugar. `db.session(opts)`/`NewSession`/`newSession`
+        mints additional independent sessions that share committed storage and run **sequentially via
+        a swap** (`Session::execute`/`query`/`view`/`update`). State ownership: committed data on
+        `Database`, session state on `Session`. Near-pure refactor — corpus + all suites unchanged
+        (162/0 ×3, NoREC 660/660), per-core `session` tests added. _(§2)_
   - [ ] **S2 — multi-statement splitter + `execute_script`** — NOT a buffering `Vec<Outcome>` batch
         (that would be an unbounded buffer, violating §13). A **library-level** (no `Session`/`Database`)
         lazy **`split_statements(sql)`** iterator (top-level core export / parser surface; lexer-level
