@@ -157,6 +157,83 @@ def interval_label(c)
   c["label"] || "{#{c['months']} #{c['days']} #{c['micros']}}"
 end
 
+# One range bound's element key given the element type name (the six range subtypes — ranges.md §2):
+# int-be-signflip for the integers (i32 = 4 bytes, i64 = 8) and `date` (the i32 day codec, 4 bytes) and
+# the timestamps (the i64 instant codec, 8 bytes); decimal-order-preserving for `decimal` (§2.5).
+def enc_range_elem(elem, value)
+  case elem
+  when "i32", "date" then enc_bare(value, 4)
+  when "i64", "timestamp", "timestamptz" then enc_bare(value, 8)
+  when "decimal" then enc_decimal(value)
+  else raise "unknown range element type #{elem}"
+  end
+end
+
+# Append one bound of a non-empty range (encoding.md §2.11): an infinite bound is a single marker
+# (−∞ = 0x00 on the lower side, +∞ = 0x02 on the upper); a finite bound is 0x01 ‖ the element key ‖ an
+# inclusivity byte (0x00 when inclusive == is_lower, else 0x01 — PG range_cmp_bounds).
+def enc_range_bound(out, elem, c, side, is_lower)
+  unless c.key?(side)
+    out << (is_lower ? 0x00 : 0x02)
+    return
+  end
+  out << 0x01
+  out << enc_range_elem(elem, c[side])
+  inc = c["#{side}_inc"]
+  out << ((inc == is_lower) ? 0x00 : 0x01)
+end
+
+# range-bounds (encoding.md §2.11): the first container key. empty = 0x00 (the whole key); non-empty =
+# 0x01 ‖ lower bound ‖ upper bound, each framed by enc_range_bound. memcmp over the bytes reproduces
+# range_total_cmp (ranges.md §6).
+def enc_range(elem, c)
+  return [0x00].pack("C") if c["empty"]
+
+  out = +"".b
+  out << 0x01
+  enc_range_bound(out, elem, c, "lower", true)
+  enc_range_bound(out, elem, c, "upper", false)
+  out
+end
+
+def enc_range_nullable(elem, c)
+  return [0x01].pack("C") if c["null"]
+
+  [0x00].pack("C") + enc_range(elem, c)
+end
+
+def range_label(c)
+  return "NULL" if c["null"]
+
+  c["label"] || "{range}"
+end
+
+# Verify spec/encoding/range.toml: the range-bounds KEY encoding (§2.11) — the same three invariants
+# as the decimal/interval paths (byte-exact + strict order, minus round-trip: a key is never decoded
+# back to a value). Each group names its element type (`elem`); the bare body is the container key,
+# nullable prepends the §2.2 tag, descending inverts the whole component.
+def check_range_file(filename)
+  data = TomlRB.load_file(File.join(__dir__, filename))
+  checked = 0
+  [["bare", ->(elem, c) { enc_range(elem, c) }],
+   ["nullable", ->(elem, c) { enc_range_nullable(elem, c) }],
+   ["descending", ->(elem, c) { invert(enc_range_nullable(elem, c)) }]].each do |kind, enc|
+    (data[kind] || []).each do |group|
+      elem = group["elem"]
+      rows = []
+      group["cases"].each do |c|
+        want = c["bytes"]
+        got = hex(enc.call(elem, c))
+        fail!("#{kind} #{group['type']} #{range_label(c)}: encode=#{got} want=#{want}") unless got == want
+        rows << [range_label(c), [want].pack("H*").b]
+        checked += 1
+      end
+      check_order("#{kind} #{group['type']}", rows)
+    end
+  end
+  checked
+end
+
 # Verify spec/encoding/decimal.toml: the same three invariants as the terminated-escape path
 # (byte-exact + strict order, minus round-trip — a key is never decoded back to a value).
 def check_decimal_file(filename)
@@ -331,6 +408,10 @@ def main
   # Interval: the interval-span-i128 rule (§2.10) — the 16-byte canonical span, int-be-signflip at
   # i128 width. Its own file: the value is a (months, days, micros) triple, not a fixed-WIDTH scalar.
   checked += check_interval_file("interval.toml")
+
+  # Range: the range-bounds container rule (§2.11) — the first container key, recursing into the
+  # element key with empty/±∞/inclusivity framing. Its own file: a bound-shape per case, not a scalar.
+  checked += check_range_file("range.toml")
 
   puts "OK: #{checked} vectors verified (round-trip + byte-exact + order)"
 end

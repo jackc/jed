@@ -390,7 +390,80 @@ composite member wraps it in the §2.2 nullable slot, and because it is fixed-wi
 **GIN element** too ([gin.md §3](gin.md) — span-equal elements share a term, matching the `@>`/`&&`
 element-equality). The `(value → bytes)` vectors are in [../encoding/interval.toml](../encoding/interval.toml)
 and the on-disk image is pinned by the `interval_pk_table.jed` golden. Only `float` (the determinism
-carve-out §2.8) and the recursive containers composite/array/range remain `0A000` keys.
+carve-out §2.8) and the recursive containers composite/array remain `0A000` keys.
+
+### 2.11 Range — `range-bounds` (the first container key)
+
+`range` is the engine's first **container** key — a structural type over a scalar element
+([ranges.md §2](ranges.md)), so its key is **recursive**: it frames the range's shape (empty, the two
+bound infinities, inclusivity) and embeds the **element type's own order-preserving key** (§2.1 for
+the integers, §2.5 for `decimal`, the i32 day rule for `date`, the i64 instant rule for the
+timestamps) for each finite bound. The layout mirrors PG `range_cmp` exactly
+([ranges.md §6](ranges.md), `range_total_cmp`): **empty sorts below every non-empty range**, then by
+**lower bound**, then by **upper bound**.
+
+```
+empty range:      0x00
+non-empty range:  0x01 ‖ <lower bound> ‖ <upper bound>
+
+bound (per side):
+  infinite:  0x00  (−∞, lower side only)  |  0x02  (+∞, upper side only)
+  finite:    0x01 ‖ <element key> ‖ <inclusivity byte>
+```
+
+1. **Empty discriminator.** A leading `0x00` for the empty range (the *entire* key — no bounds
+   follow) vs. `0x01` for a non-empty range. `0x00 < 0x01`, so empty sorts first, and **all empty
+   ranges share the one-byte key `00`** (they are all `==`, [ranges.md §4](ranges.md)).
+2. **Bound infinity marker, ordered −∞ < finite < +∞.** Each bound opens with a marker: a lower
+   bound is `0x00` (−∞, unbounded) or `0x01` (finite); an upper bound is `0x01` (finite) or `0x02`
+   (+∞, unbounded). A lower bound never uses `0x02` and an upper never `0x00`, so the markers totally
+   order the three bound kinds — the unbounded-lower range sorts below every finite-lower one, the
+   unbounded-upper above every finite-upper one, exactly as `range_cmp_bounds` ranks an infinite
+   bound.
+3. **Finite bound = element key ‖ inclusivity byte.** After the `0x01` finite marker comes the bound
+   value's **element key** (the same bytes a column of that element type would store —
+   self-delimiting: fixed-width for int/date/timestamp, `0x00`-terminated for decimal §2.5), then a
+   one-byte **inclusivity tie-break**. For equal element values PG breaks the tie by inclusivity, and
+   the side decides the direction: on the **lower** side an inclusive bound sorts *before* an
+   exclusive one (`[5,` starts at 5, `(5,` just after) → inclusive `0x00`, exclusive `0x01`; on the
+   **upper** side an exclusive bound sorts *before* an inclusive one (`,5)` ends just before 5, `,5]`
+   at 5) → exclusive `0x00`, inclusive `0x01`. (Equivalently the byte is `0x00` when `inclusive ==
+   is_lower`, else `0x01`.)
+4. **No length prefix, no whole-key terminator** — every component is fixed-width or
+   self-terminating, so the concatenation is self-delimiting and `memcmp` reproduces
+   `range_total_cmp`. Keys never round-trip (the row body holds the full range value), so the key
+   need only *sort*.
+
+Discrete ranges (`i32range`/`i64range`/`daterange`) are stored in PG's canonical `[)` form, so
+`[1,4]` and `[1,5)` over `i32range` are the *same* canonical value and encode identically — not a key
+wrinkle but genuine equality ([ranges.md §4](ranges.md)). The continuous ranges carry the two element
+wrinkles through unchanged: a `numrange` bound inherits decimal scale-independence (`[1.5,…` and
+`[1.50,…` share a key, §2.5), and inclusivity is significant (`[1.5,2)` ≠ `(1.5,2)` → distinct keys).
+Worked structure for `'[1,5)'::i32range` (lower inclusive 1, upper exclusive 5):
+
+```
+01   01 80000001 00    01 80000005 00
+└┬┘  └────┬────┘ └┬┘   └────┬────┘ └┬┘
+non-   lower=1   lower-    upper=5  upper-
+empty  finite    incl      finite   excl
+                 (0x00)              (0x00)
+```
+
+= `01 01 80000001 00 01 80000005 00`.
+
+The **nullable** slot (a range secondary index / composite member) is the §2.2 tag (`0x00` present ‖
+the bytes above, or `0x01` NULL); **descending** is the §2.3 whole-key inversion — both unchanged. A
+range key whose element bytes overflow a node trips the existing oversized-item `0A000` (§2.4).
+
+**Status — EXERCISED.** `range` **is** a valid `PRIMARY KEY` / ordered secondary index / `UNIQUE` key
+/ FK target ([ranges.md §10](ranges.md)) over all six built-in range types — the **first container
+key** (composite §2.3 is a flat tuple concatenation; range recurses into the element codec with shape
+framing). Point-lookup pushdown stays **deferred** for ranges (a range PK/index `WHERE k = …`
+full-scans + residual-filters — correct, just unindexed — matching the container precedent), and a
+range is **not** a GIN element. The `(value → bytes)` vectors are in
+[../encoding/range.toml](../encoding/range.toml); the on-disk image is pinned by the
+`range_pk_table.jed` golden. With range exercised, only `float` (the determinism carve-out §2.8) and
+the recursive **composite/array** containers remain `0A000` keys.
 
 ## 3. Where this is used today
 
@@ -416,9 +489,11 @@ golden. Nullable **secondary indexes** have since **landed** ([indexes.md](index
 `index_table.jed` golden) — the first place §2.2's presence-tag sort order is load-bearing
 rather than spec-only — as have `timestamp`/`timestamptz` keys (the i64 rule), `text`/`bytea`
 keys (the `…-terminated-escape` rules §2.4/§2.6), `decimal` keys (the
-`decimal-order-preserving` rule §2.5, `decimal_pk_table.jed`), and `interval` keys (the
-`interval-span-i128` span rule §2.10, `interval_pk_table.jed`). The lone remaining non-integer
-scalar, `float`, adds its own §2 key path only if the determinism carve-out (§2.8) ever lifts.
+`decimal-order-preserving` rule §2.5, `decimal_pk_table.jed`), `interval` keys (the
+`interval-span-i128` span rule §2.10, `interval_pk_table.jed`), and `range` keys (the recursive
+`range-bounds` container rule §2.11, `range_pk_table.jed` — the first *container* key). The lone
+remaining non-integer scalar, `float`, adds its own §2 key path only if the determinism carve-out
+(§2.8) ever lifts; the recursive `composite`/`array` containers stay `0A000` keys.
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)
 

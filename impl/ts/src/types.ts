@@ -498,3 +498,6 @@ export function typeIsDate(t: Type): boolean {
 export function typeIsInterval(t: Type): boolean {
   return t.kind === "scalar" && isInterval(t.scalar);
 }
+export function typeIsRange(t: Type): boolean {
+  return t.kind === "range";
+}

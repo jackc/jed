@@ -1,11 +1,14 @@
-// Range storage (spec/design/ranges.md, R2–R3) — the divergences + introspection the oracle corpus
-// cannot express (CLAUDE.md §10): the deliberate `0A000` narrowings PostgreSQL does NOT share (a
-// range PRIMARY KEY / DEFAULT / index — PG allows them via its btree/GiST opclasses), the
-// jed-canonical `i32range` spelling (PG reports `int4range`), INSERT…SELECT deferral, the
+// Range storage (spec/design/ranges.md, R2–R4) — the divergences + introspection the oracle corpus
+// cannot express (CLAUDE.md §10): the deliberate `0A000` narrowings PostgreSQL does NOT share that
+// remain after range became a key (a range DEFAULT and INSERT…SELECT into a range column — PG accepts
+// the DEFAULT outright), the jed-canonical `i32range` spelling (PG reports `int4range`), the
 // cross-element comparison code (jed's uniform `42804` where PG reports `42883`), and the
 // whole-image store/load round-trip of a range column (the byte layout is pinned cross-core by
-// range_table.jed; this is the behavioral check). The agreeing behavior — render, canonicalization,
-// `IS NULL`, the range_cmp total order (=/</ORDER BY/DISTINCT), 22000/22P02/22003/42704 — lives in
+// range_table.jed; this is the behavioral check). A range PRIMARY KEY / ordered index / UNIQUE / FK
+// now WORK (range-PK slice, R4 — PG also allows them via its range btree opclass), so they live
+// oracle-clean in types/range.test; the byte-exact key is pinned by range_pk_table.jed +
+// range_key.test.ts (encoding.md §2.11). The agreeing behavior — render, canonicalization, `IS NULL`,
+// the range_cmp total order (=/</ORDER BY/DISTINCT), 22000/22P02/22003/42704 — lives in
 // types/range.test (oracle-clean), not here.
 // Mirrors impl/rust/tests/range_storage.rs and impl/go/range_storage_test.go.
 
@@ -48,33 +51,43 @@ test("range canonical name and aliases", () => {
     "INSERT INTO t VALUES (1, '[1,5)')",
   ]);
   assert.deepEqual(query(db, "SELECT r FROM t"), [["[1,5)"]]);
-  // The canonical name appears in the 0A000 PK-narrowing message, even though the column was
-  // declared with the PG alias int4range.
-  const db2 = new Database();
+  // A range PRIMARY KEY now WORKS even when declared with the PG alias, and the value behaves as a
+  // key: '[1,4]' canonicalizes to '[1,5)', so re-inserting it is a duplicate key (23505). Range is
+  // keyable since R4 (encoding.md §2.11).
+  const db2 = dbWith([
+    "CREATE TABLE k (r int4range PRIMARY KEY, n i32)",
+    "INSERT INTO k VALUES ('[1,5)', 1)",
+  ]);
+  assert.equal(errCode(() => execute(db2, "INSERT INTO k VALUES ('[1,4]', 2)")), "23505");
+  // A still-rejected path reports the canonical i32range even when declared with the alias: GIN needs
+  // an array/jsonb opclass, so GIN over a plain range column is 42704 and names the canonical type
+  // (PG agrees a range has no gin opclass but reports int4range — the naming divergence, per-core).
+  const db3 = dbWith(["CREATE TABLE u (id i32 PRIMARY KEY, r int4range)"]);
   let msg = "";
   try {
-    execute(db2, "CREATE TABLE u (r int4range PRIMARY KEY)");
-    assert.fail("a range primary key should be rejected");
+    execute(db3, "CREATE INDEX ON u USING gin (r)");
+    assert.fail("a gin index over a plain range column should be rejected");
   } catch (e) {
     msg = e instanceof Error ? e.message : String(e);
   }
   assert.ok(msg.includes("i32range"), `message names i32range: ${msg}`);
 });
 
-// The staged `0A000` narrowings PostgreSQL does NOT share: a range PRIMARY KEY, a range DEFAULT, a
-// range index, and INSERT…SELECT into a range column (PG accepts a range key via its default btree
-// opclass and a range DEFAULT outright — spec/design/ranges.md §8). These are jed-stricter, so they
-// cannot live in the oracle-clean corpus.
+// The staged `0A000` narrowings PostgreSQL does NOT share that REMAIN after range became a key (R4):
+// a range DEFAULT and INSERT…SELECT into a range column (PG accepts a range DEFAULT outright —
+// spec/design/ranges.md §8). A range PRIMARY KEY / ordered index / UNIQUE now work (oracle-clean,
+// types/range.test) — PG also allows them via its range btree opclass. These remaining cases are
+// jed-stricter, so they cannot live in the oracle-clean corpus.
 test("range narrowings are 0A000", () => {
   const db = dbWith([]);
-  assert.equal(errCode(() => execute(db, "CREATE TABLE a (r i32range PRIMARY KEY)")), "0A000");
   assert.equal(
     errCode(() => execute(db, "CREATE TABLE b (id i32 PRIMARY KEY, r i32range DEFAULT '[1,5)')")),
     "0A000",
   );
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, r i32range)");
-  // A range index needs a GiST opclass jed does not ship (§8/§10).
-  assert.equal(errCode(() => execute(db, "CREATE INDEX ri ON t (r)")), "0A000");
+  // A range ordered (btree) index now WORKS (the range-bounds key, encoding.md §2.11) — a positive
+  // check that the former 0A000 narrowing is lifted.
+  execute(db, "CREATE INDEX ri ON t (r)");
   // INSERT … SELECT into a range column is deferred (the VALUES + literal path is the input).
   execute(db, "CREATE TABLE src (id i32 PRIMARY KEY, r i32range)");
   execute(db, "INSERT INTO src VALUES (1, '[1,5)')");

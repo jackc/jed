@@ -207,8 +207,11 @@ everything else tests against, not a detail discovered during implementation.
     are shared data (`ranges.toml` → the codegen'd `RANGES` table); the recursive codec/comparator/
     text-I/O are hand-written per core, byte-identical by construction (the composite/array
     precedent, §5). Delivered in slices (R0–R3 type axis, RF1–RF4 function/operator surface,
-    `ranges.md` §11); ranges-as-key / a range index (PG uses GiST) and multirange/custom range
-    types are deferred `0A000`/out-of-scope follow-ons (`ranges.md` §10).
+    R4 **range-as-key** — the order-preserving `range-bounds` encoding (`encoding.md` §2.11), the
+    engine's **first container key**, so a range is a valid `PRIMARY KEY` / ordered index / `UNIQUE` /
+    FK target; `ranges.md` §11); a GiST-style **range index** (PG uses GiST) + key-bounded point
+    lookup, and multirange/custom range types, are deferred `0A000`/out-of-scope follow-ons
+    (`ranges.md` §10).
   - **The type system is OPEN, not closed — composite (row) types have landed**
     (`spec/design/composite.md`, `CREATE TYPE addr AS (street text, zip i32)`). This is the
     pivot the scalar set above only hinted at: a type is no longer *only* a compiled-in

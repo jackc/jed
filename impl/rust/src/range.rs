@@ -9,6 +9,7 @@
 //! ranges (i32/i64/date) are stored in the canonical `[)` form so equality/comparison on the stored
 //! form is exact (`[1,5)` == `[1,4]` over i32range).
 
+use crate::encoding::encode_int;
 use crate::error::{EngineError, Result, SqlState};
 use crate::ranges_gen::{RANGES, RangeDesc};
 use crate::types::ScalarType;
@@ -420,6 +421,61 @@ fn cmp_bounds(
                 _ => Ordering::Equal,
             }
         }
+    }
+}
+
+// --- key encoding (spec/design/encoding.md §2.11) --------------------------
+
+/// The order-preserving storage-key bytes for a range value (spec/design/encoding.md §2.11) — the
+/// engine's first **container** key. It frames the range's shape and embeds each finite bound's
+/// element key, so that `memcmp` over the bytes reproduces [`range_total_cmp`]: a leading
+/// empty/non-empty discriminator (`0x00` empty sorts first, `0x01` non-empty), then the lower
+/// bound, then the upper bound. Each bound is either a single infinity marker (`0x00` = −∞ on the
+/// lower side, `0x02` = +∞ on the upper side — ordered −∞ < finite < +∞) or `0x01` ‖ the element's
+/// own order-preserving key ‖ an inclusivity byte. `elem` names the element scalar (the integer
+/// codec needs the width). Keys never round-trip — the row body holds the full range value — so this
+/// need only *sort*.
+pub fn encode_range_key(elem: ScalarType, rv: &RangeVal) -> Vec<u8> {
+    let mut out = Vec::new();
+    if rv.empty {
+        out.push(0x00); // the empty range sorts below every non-empty one; this is its whole key
+        return out;
+    }
+    out.push(0x01);
+    push_bound(&mut out, elem, rv.lower.as_deref(), rv.lower_inc, true);
+    push_bound(&mut out, elem, rv.upper.as_deref(), rv.upper_inc, false);
+    out
+}
+
+/// Append one bound of a non-empty range to `out`. An infinite bound is a single marker
+/// (`−∞ = 0x00` on the lower side, `+∞ = 0x02` on the upper); a finite bound is `0x01` ‖ the
+/// element key ‖ a one-byte inclusivity tie-break. The tie-break direction matches PG
+/// `range_cmp_bounds`: on the LOWER side an inclusive bound sorts *before* an exclusive one, on the
+/// UPPER side an exclusive bound sorts *before* an inclusive one — i.e. the byte is `0x00` when
+/// `inclusive == is_lower`, else `0x01`.
+fn push_bound(out: &mut Vec<u8>, elem: ScalarType, v: Option<&Value>, inc: bool, is_lower: bool) {
+    match v {
+        None => out.push(if is_lower { 0x00 } else { 0x02 }),
+        Some(val) => {
+            out.push(0x01);
+            out.extend_from_slice(&encode_range_elem(elem, val));
+            out.push(if inc == is_lower { 0x00 } else { 0x01 });
+        }
+    }
+}
+
+/// One range bound value's element key bytes. A range element is one of the six scalar subtypes
+/// (i32/i64/decimal/date/timestamp/timestamptz), each using the same order-preserving scalar key as
+/// a column of that type: `int-be-signflip` for the integers (encoding.md §2.1), the i32 day codec
+/// for `date`, the i64 instant codec for the timestamps, and `decimal-order-preserving` for
+/// `decimal` (§2.5). No text/bytea/bool/uuid/interval element exists for a range.
+fn encode_range_elem(elem: ScalarType, v: &Value) -> Vec<u8> {
+    match v {
+        Value::Int(n) => encode_int(elem, *n),
+        Value::Decimal(d) => d.encode_key(),
+        Value::Date(d) => encode_int(elem, *d as i64),
+        Value::Timestamp(m) | Value::Timestamptz(m) => encode_int(elem, *m),
+        _ => unreachable!("a range element is i32/i64/decimal/date/timestamp/timestamptz"),
     }
 }
 

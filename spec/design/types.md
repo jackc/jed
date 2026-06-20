@@ -60,8 +60,10 @@ landed, each with its own design doc ([timestamp.md](timestamp.md), [interval.md
 (the `decimal-order-preserving` encoding, encoding.md §2.5), and `interval` (the
 `interval-span-i128` 16-byte span encoding, encoding.md §2.10) join `uuid` as non-integer
 `PRIMARY KEY` types, leaving `f32`/`f64` as the **only** non-key scalars (the principled
-determinism carve-out — encoding.md §2.8). The remaining scalars (`json`/`jsonb`,
-and the composite `array` container) are still **deferred**. The float-formatting and NaN/∞
+determinism carve-out — encoding.md §2.8). The **`range` container** is keyable too — the
+**first container key** (the recursive `range-bounds` encoding, encoding.md §2.11), so a range is a
+valid `PRIMARY KEY` / ordered index / `UNIQUE` / FK target. The remaining scalars (`json`/`jsonb`,
+and the `composite`/`array` containers as keys) are still **deferred**. The float-formatting and NaN/∞
 decisions of CLAUDE.md §8 are now **settled** by the landed floats ([float.md](float.md)): they
 keep their own PG total order and the `R` render tag (ledgered in the determinism exceptions),
 and stay off the *decimal* compare/text path (decimal is finite and exact, never NaN/∞ — §12).

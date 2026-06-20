@@ -1508,10 +1508,11 @@ impl Database {
                 // interval (`interval-span-i128` — the 16-byte span key, encoding.md §2.10) — plus
                 // the variable-width `text`/`bytea` (`…-terminated-escape`, encoding.md §2.4/§2.6) and
                 // `decimal` (`decimal-order-preserving` §2.5), all self-delimiting so they compose in
-                // composite keys / index suffixes. Still rejected `0A000`: `float` (the principled
-                // determinism carve-out — determinism.md §4) and the recursive containers
-                // composite/array/range. An oversized text/bytea/decimal key (one that can't fit a
-                // node) trips the existing RECORD_MAX oversized-item 0A000, mirroring PG's btree
+                // composite keys / index suffixes — plus the `range` container (`range-bounds` §2.11,
+                // the first container key, recursing into the element codec). Still rejected `0A000`:
+                // `float` (the principled determinism carve-out — determinism.md §4) and the recursive
+                // composite/array containers. An oversized text/bytea/decimal/range key (one that can't
+                // fit a node) trips the existing RECORD_MAX oversized-item 0A000, mirroring PG's btree
                 // key-size limit.
                 if !ty.is_integer()
                     && !ty.is_bool()
@@ -1523,6 +1524,7 @@ impl Database {
                     && !ty.is_timestamptz()
                     && !ty.is_date()
                     && !ty.is_interval()
+                    && !ty.is_range()
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -1754,6 +1756,7 @@ impl Database {
                     && !ty.is_timestamptz()
                     && !ty.is_date()
                     && !ty.is_interval()
+                    && !ty.is_range()
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -1806,6 +1809,7 @@ impl Database {
                     && !ty.is_timestamptz()
                     && !ty.is_date()
                     && !ty.is_interval()
+                    && !ty.is_range()
                 {
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
@@ -2381,6 +2385,7 @@ impl Database {
                         && !ty.is_timestamptz()
                         && !ty.is_date()
                         && !ty.is_interval()
+                        && !ty.is_range()
                     {
                         return Err(EngineError::new(
                             SqlState::FeatureNotSupported,
@@ -2900,11 +2905,13 @@ impl Database {
         let table_name = tdef.name.clone();
         let columns: Vec<Column> = tdef.columns.clone();
         // The key members in key order — one for a single-column PK, several for a
-        // composite (constraints.md §3), empty for a no-PK (rowid) table.
-        let pk: Vec<(usize, ScalarType)> = tdef
+        // composite (constraints.md §3), empty for a no-PK (rowid) table. The full `Type` is
+        // captured (not just a scalar) so a range PK member carries its element subtype into the
+        // range-aware key codec (encoding.md §2.11).
+        let pk: Vec<(usize, Type)> = tdef
             .pk_indices()
             .into_iter()
-            .map(|i| (i, tdef.columns[i].ty.scalar()))
+            .map(|i| (i, tdef.columns[i].ty.clone()))
             .collect();
         // The CHECK constraints, resolved once per statement in evaluation (name) order;
         // `insert_rows` evaluates them per candidate row (constraints.md §4.4).
@@ -3305,7 +3312,7 @@ impl Database {
         &mut self,
         table: &str,
         columns: &[Column],
-        pk: &[(usize, ScalarType)],
+        pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
         default_exprs: &[Option<RExpr>],
         rng: &std::cell::Cell<crate::seam::StmtRng>,
@@ -3679,7 +3686,7 @@ impl Database {
         &mut self,
         table: &str,
         columns: &[Column],
-        pk: &[(usize, ScalarType)],
+        pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
         default_exprs: &[Option<RExpr>],
         rng: &std::cell::Cell<crate::seam::StmtRng>,
@@ -4124,7 +4131,7 @@ impl Database {
         &self,
         table: &str,
         columns: &[Column],
-        pk: &[(usize, ScalarType)],
+        pk: &[(usize, Type)],
         indexes: &[IndexDef],
         row: &Row,
     ) -> Result<bool> {
@@ -4181,7 +4188,7 @@ impl Database {
         &mut self,
         table: &str,
         columns: &[Column],
-        pk: &[(usize, ScalarType)],
+        pk: &[(usize, Type)],
         checks: &[(String, RExpr)],
         default_exprs: &[Option<RExpr>],
         rng: &std::cell::Cell<crate::seam::StmtRng>,
@@ -4307,7 +4314,9 @@ impl Database {
         // (indexes.md §4).
         let pk_info = table
             .primary_key_index()
-            .map(|i| (i, table.columns[i].ty.scalar()));
+            // Point-lookup pushdown is scalar-only; a non-scalar (range) PK skips it (deferred —
+            // ranges.md §10), so a range PK `WHERE k = …` full-scans + residual-filters.
+            .and_then(|i| table.columns[i].ty.as_scalar().map(|s| (i, s)));
         let ncols = table.columns.len();
         let indexes = table.indexes.clone();
         let tcolumns: Vec<Column> = if indexes.is_empty() {
@@ -4546,7 +4555,9 @@ impl Database {
         // single-column keys only (`primary_key_index`); a composite-PK table full-scans.
         let pk_info = table
             .primary_key_index()
-            .map(|i| (i, table.columns[i].ty.scalar()));
+            // Point-lookup pushdown is scalar-only; a non-scalar (range) PK skips it (deferred —
+            // ranges.md §10), so a range PK `WHERE k = …` full-scans + residual-filters.
+            .and_then(|i| table.columns[i].ty.as_scalar().map(|s| (i, s)));
         let ncols = table.columns.len();
         // The index definitions (and the columns their entry keys read) feed phase 2's
         // maintenance (indexes.md §4): an entry moves only when its key actually changed.
@@ -8850,11 +8861,10 @@ enum BoundKey {
 /// a type-matched const-source; else `None` (full scan).
 fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
     if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
-        detect_pk_bound(
-            filter,
-            rel.offset + pk_local,
-            rel.table.columns[pk_local].ty.scalar(),
-        )
+        // Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
+        // deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
+        let sty = rel.table.columns[pk_local].ty.as_scalar()?;
+        detect_pk_bound(filter, rel.offset + pk_local, sty)
     }) {
         return Some(ScanBound::Pk(b));
     }
@@ -8865,7 +8875,18 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
             continue;
         }
         let ci = idx.columns[0];
-        let ty = rel.table.columns[ci].ty.scalar();
+        // An ordered index whose leading (or any) key column is a non-scalar (range) does not
+        // pushdown — point-lookup is deferred for containers (ranges.md §10); the index is still
+        // maintained, the scan is just full + residual.
+        let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
+            continue;
+        };
+        if idx.columns[1..]
+            .iter()
+            .any(|&c| rel.table.columns[c].ty.as_scalar().is_none())
+        {
+            continue;
+        }
         let mut terms = Vec::new();
         collect_bound_terms(filter, rel.offset + ci, ty, &mut terms);
         let eqs: Vec<BoundSrc> = terms
@@ -9063,24 +9084,9 @@ fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: 
         match &row[ci] {
             Value::Null => out.push(0x01),
             v => {
+                // present tag, then the column type's order-preserving key (range-aware §2.11)
                 out.push(0x00);
-                let ty = columns[ci].ty.scalar();
-                match v {
-                    Value::Int(n) => out.extend_from_slice(&encode_int(ty, *n)),
-                    Value::Bool(b) => out.extend_from_slice(&encode_bool(*b)),
-                    Value::Uuid(u) => out.extend_from_slice(u),
-                    Value::Timestamp(m) | Value::Timestamptz(m) => {
-                        out.extend_from_slice(&encode_int(ty, *m))
-                    }
-                    Value::Date(d) => out.extend_from_slice(&encode_int(ty, *d as i64)),
-                    Value::Text(s) => out.extend_from_slice(&encode_terminated(s.as_bytes())),
-                    Value::Bytea(b) => out.extend_from_slice(&encode_terminated(b)),
-                    Value::Decimal(d) => out.extend_from_slice(&d.encode_key()),
-                    Value::Interval(iv) => out.extend_from_slice(&iv.encode_key()),
-                    _ => {
-                        unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
-                    }
-                }
+                out.extend_from_slice(&encode_typed_key(&columns[ci].ty, v));
             }
         }
     }
@@ -9157,45 +9163,18 @@ fn gin_entries(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row
 }
 
 /// A row's PRIMARY-KEY STORAGE KEY (spec/design/encoding.md §2.3): the concatenation of the
-/// members' bare encodings in key order — every keyable type is fixed-width, so the
-/// concatenation is self-delimiting and `memcmp` equals the tuple's logical order. Shared by
-/// the INSERT duplicate check and the ON CONFLICT arbiter probe (spec/design/upsert.md §3); a
-/// PK column is NOT NULL, so there is no presence tag and no NULL arm.
-fn encode_pk_key(pk: &[(usize, ScalarType)], row: &Row) -> Vec<u8> {
+/// members' order-preserving encodings in key order. Every keyable type is self-delimiting (the
+/// scalars fixed-width or `0x00`-terminated, a `range` container framed §2.11), so the
+/// concatenation is self-delimiting and `memcmp` equals the tuple's logical order. Each member is
+/// encoded by the shared range-aware [`encode_typed_key`] (so a range PK member recurses into the
+/// element codec, encoding.md §2.11); the tuple carries each member's full `Type` for that reason.
+/// Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe (spec/design/upsert.md §3);
+/// a PK column is NOT NULL, so there is no presence tag and no NULL arm. `float`/`composite`/`array`
+/// PKs are rejected at CREATE TABLE, so those value kinds never reach here.
+fn encode_pk_key(pk: &[(usize, Type)], row: &Row) -> Vec<u8> {
     let mut k = Vec::new();
-    for &(i, pk_ty) in pk {
-        match &row[i] {
-            Value::Int(nn) => k.extend_from_slice(&encode_int(pk_ty, *nn)),
-            // uuid: the bare 16 bytes (uuid-raw16, encoding.md §2.7).
-            Value::Uuid(u) => k.extend_from_slice(u),
-            // boolean: the bare 1-byte `bool-byte` (encoding.md §2.9).
-            Value::Bool(b) => k.extend_from_slice(&encode_bool(*b)),
-            // timestamp / timestamptz: the i64 instant codec (timestamp.md §6).
-            Value::Timestamp(m) | Value::Timestamptz(m) => {
-                k.extend_from_slice(&encode_int(pk_ty, *m))
-            }
-            // date: the i32 day codec (date.md §5).
-            Value::Date(d) => k.extend_from_slice(&encode_int(pk_ty, *d as i64)),
-            // text / bytea: the variable-width `…-terminated-escape` body (encoding.md §2.4/§2.6).
-            Value::Text(s) => k.extend_from_slice(&encode_terminated(s.as_bytes())),
-            Value::Bytea(b) => k.extend_from_slice(&encode_terminated(b)),
-            // decimal: the variable-width `decimal-order-preserving` body (encoding.md §2.5).
-            Value::Decimal(d) => k.extend_from_slice(&d.encode_key()),
-            // interval: the fixed 16-byte `interval-span-i128` span key (encoding.md §2.10).
-            Value::Interval(iv) => k.extend_from_slice(&iv.encode_key()),
-            Value::Null => unreachable!("primary key column is NOT NULL"),
-            Value::Float32(_) | Value::Float64(_) => {
-                unreachable!("a float primary key is rejected at CREATE TABLE")
-            }
-            Value::Composite(_) => {
-                unreachable!("a composite primary key is rejected at CREATE TABLE")
-            }
-            Value::Array(_) => unreachable!("an array primary key is rejected at CREATE TABLE"),
-            // A range column is not storable yet (R2), let alone a key (spec/design/ranges.md §8),
-            // so a range value never reaches PK encoding.
-            Value::Range(_) => unreachable!("a range primary key is rejected at CREATE TABLE"),
-            Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
-        }
+    for (i, pk_ty) in pk {
+        k.extend_from_slice(&encode_typed_key(pk_ty, &row[*i]));
     }
     k
 }
@@ -9210,24 +9189,9 @@ fn index_prefix_key(columns: &[Column], def: &IndexDef, row: &Row) -> Option<Vec
         match &row[ci] {
             Value::Null => return None,
             v => {
+                // present tag, then the column type's order-preserving key (range-aware §2.11)
                 out.push(0x00);
-                let ty = columns[ci].ty.scalar();
-                match v {
-                    Value::Int(n) => out.extend_from_slice(&encode_int(ty, *n)),
-                    Value::Bool(b) => out.extend_from_slice(&encode_bool(*b)),
-                    Value::Uuid(u) => out.extend_from_slice(u),
-                    Value::Timestamp(m) | Value::Timestamptz(m) => {
-                        out.extend_from_slice(&encode_int(ty, *m))
-                    }
-                    Value::Date(d) => out.extend_from_slice(&encode_int(ty, *d as i64)),
-                    Value::Text(s) => out.extend_from_slice(&encode_terminated(s.as_bytes())),
-                    Value::Bytea(b) => out.extend_from_slice(&encode_terminated(b)),
-                    Value::Decimal(d) => out.extend_from_slice(&d.encode_key()),
-                    Value::Interval(iv) => out.extend_from_slice(&iv.encode_key()),
-                    _ => {
-                        unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
-                    }
-                }
+                out.extend_from_slice(&encode_typed_key(&columns[ci].ty, v));
             }
         }
     }
@@ -9277,6 +9241,25 @@ fn encode_key_value(ty: ScalarType, value: &Value) -> Vec<u8> {
         Value::Decimal(d) => d.encode_key(),
         Value::Interval(iv) => iv.encode_key(),
         _ => unreachable!("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)"),
+    }
+}
+
+/// The order-preserving key bytes for one keyable value given its column **`Type`** — the
+/// range-aware encoder threaded through every key path (PK, index entry/prefix, FK probe). A range
+/// recurses into the `range-bounds` container codec (encoding.md §2.11), pulling its element scalar
+/// from the column type; every other keyable value ignores the wrapper and dispatches on its scalar
+/// via [`encode_key_value`]. `value` is non-NULL (callers handle the NULL slot tag separately), and
+/// a range column always holds a `Value::Range`, so the scalar arm never sees a range type.
+fn encode_typed_key(ty: &Type, value: &Value) -> Vec<u8> {
+    match value {
+        Value::Range(rv) => {
+            let elem = ty
+                .range_element()
+                .expect("a range key value has a range column type")
+                .scalar();
+            crate::range::encode_range_key(elem, rv)
+        }
+        _ => encode_key_value(ty.scalar(), value),
     }
 }
 
@@ -9331,8 +9314,7 @@ fn fk_probe(
     if !parent.pk.is_empty() && sorted_unique(&parent.pk) == ref_set {
         let mut k = Vec::new();
         for &pcol in &parent.pk {
-            let ty = parent.columns[pcol].ty.scalar();
-            k.extend_from_slice(&encode_key_value(ty, value_for(pcol)));
+            k.extend_from_slice(&encode_typed_key(&parent.columns[pcol].ty, value_for(pcol)));
         }
         Some(FkProbe::Pk(k))
     } else {
@@ -9344,8 +9326,7 @@ fn fk_probe(
         let mut prefix = Vec::new();
         for &pcol in &idx.columns {
             prefix.push(0x00);
-            let ty = parent.columns[pcol].ty.scalar();
-            prefix.extend_from_slice(&encode_key_value(ty, value_for(pcol)));
+            prefix.extend_from_slice(&encode_typed_key(&parent.columns[pcol].ty, value_for(pcol)));
         }
         Some(FkProbe::Unique {
             index: idx.name.to_ascii_lowercase(),
@@ -16013,7 +15994,7 @@ fn resolve_arbiter(tdef: &Table, target: Option<&ConflictTarget>) -> Result<Opti
 /// arbiter column is NULL — NULLS DISTINCT, so the row never conflicts).
 fn arbiter_key(
     arb: &Arbiter,
-    pk: &[(usize, ScalarType)],
+    pk: &[(usize, Type)],
     columns: &[Column],
     indexes: &[IndexDef],
     row: &Row,

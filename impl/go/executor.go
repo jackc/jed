@@ -1553,18 +1553,23 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			// int-be-signflip, timestamp.md §6), date (i32, date.md §5), interval (interval-span-i128,
 			// the 16-byte span key §2.10) — plus the variable-width text/bytea (…-terminated-escape
 			// §2.4/§2.6) and decimal (decimal-order-preserving §2.5), all self-delimiting so they
-			// compose in composite keys / index suffixes. Still 0A000: float (the principled
-			// determinism carve-out — §4) and the recursive containers composite/array/range.
-			if isComposite || isArray || isRange {
-				// A composite/array/range PRIMARY KEY is rejected 0A000 — the key encoding is authored
-				// but unexercised (composite.md §6, array.md §8, ranges.md §8). colType.CanonicalName()
-				// gives the canonical type name (i32range, even when declared with the int4range alias).
+			// compose in composite keys / index suffixes — plus the range container (range-bounds
+			// §2.11, the first container key). Still 0A000: float (the principled determinism
+			// carve-out — §4) and the recursive composite/array containers.
+			if isComposite || isArray {
+				// A composite/array PRIMARY KEY is rejected 0A000 — the key encoding is authored
+				// but unexercised (composite.md §6, array.md §8). colType.CanonicalName() gives the
+				// canonical type name (i32range, even when declared with the int4range alias).
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+colType.CanonicalName()+" primary key is not supported yet")
 			}
-			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
-				return Outcome{}, NewError(FeatureNotSupported,
-					"a "+ty.CanonicalName()+" primary key is not supported yet")
+			// A range is keyable (its recursive range-bounds container key, encoding.md §2.11);
+			// every other keyable column is a scalar, gated here.
+			if !isRange {
+				if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
+					return Outcome{}, NewError(FeatureNotSupported,
+						"a "+ty.CanonicalName()+" primary key is not supported yet")
+				}
 			}
 			if pkSeen {
 				return Outcome{}, NewError(InvalidTableDefinition,
@@ -1736,7 +1741,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -1780,7 +1785,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
 			}
@@ -2542,7 +2547,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		ty := columns[idx].Type
 		switch kind {
 		case IndexBtree:
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsDecimal() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() && !ty.IsInterval() && !ty.IsRange() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" index column is not supported yet")
 			}
@@ -2908,6 +2913,11 @@ func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) [
 		case ValInterval:
 			out = append(out, 0x00)
 			out = append(out, v.Iv.EncodeKey()...)
+		case ValRange:
+			// the recursive range-bounds container key (encoding.md §2.11)
+			out = append(out, 0x00)
+			elem, _ := columns[ci].Type.RangeElement()
+			out = append(out, encodeRangeKey(elem.ScalarTy(), v.Range)...)
 		default:
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
@@ -3026,6 +3036,11 @@ func indexPrefixKey(columns []Column, def IndexDef, row Row) ([]byte, bool) {
 		case ValInterval:
 			out = append(out, 0x00)
 			out = append(out, v.Iv.EncodeKey()...)
+		case ValRange:
+			// the recursive range-bounds container key (encoding.md §2.11)
+			out = append(out, 0x00)
+			elem, _ := columns[ci].Type.RangeElement()
+			out = append(out, encodeRangeKey(elem.ScalarTy(), v.Range)...)
 		default:
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
@@ -3076,6 +3091,11 @@ func encodePkKey(table *Table, pk []int, row Row) []byte {
 		case table.Columns[i].Type.IsInterval():
 			// interval: the fixed 16-byte interval-span-i128 span key (encoding.md §2.10).
 			key = append(key, row[i].Iv.EncodeKey()...)
+		case table.Columns[i].Type.IsRange():
+			// range: the recursive range-bounds container key (encoding.md §2.11, the first
+			// container key — empty/±∞/inclusivity framing around the element key).
+			elem, _ := table.Columns[i].Type.RangeElement()
+			key = append(key, encodeRangeKey(elem.ScalarTy(), row[i].Range)...)
 		default:
 			// integers / timestamp / timestamptz / date: the fixed-width key codec.
 			key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
@@ -6600,8 +6620,12 @@ type indexBoundPlan struct {
 // scan).
 func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
-		if bp := detectPKBound(filter, rel.offset+pkLocal, rel.table.Columns[pkLocal].Type.ScalarTy()); bp != nil {
-			return &scanBound{pk: bp}
+		// Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
+		// deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
+		if sty, ok := rel.table.Columns[pkLocal].Type.AsScalar(); ok {
+			if bp := detectPKBound(filter, rel.offset+pkLocal, sty); bp != nil {
+				return &scanBound{pk: bp}
+			}
 		}
 	}
 	for _, idx := range rel.table.Indexes {
@@ -6611,7 +6635,23 @@ func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 			continue
 		}
 		ci := idx.Columns[0]
-		ty := rel.table.Columns[ci].Type.ScalarTy()
+		// An ordered index whose leading (or any) key column is a non-scalar (range) does not
+		// pushdown — point-lookup is deferred for containers (ranges.md §10); the index is still
+		// maintained, the scan is just full + residual.
+		ty, ok := rel.table.Columns[ci].Type.AsScalar()
+		if !ok {
+			continue
+		}
+		nonScalarTail := false
+		for _, c := range idx.Columns[1:] {
+			if _, ok := rel.table.Columns[c].Type.AsScalar(); !ok {
+				nonScalarTail = true
+				break
+			}
+		}
+		if nonScalarTail {
+			continue
+		}
 		var eqs []*rExpr
 		if bp := detectPKBound(filter, rel.offset+ci, ty); bp != nil {
 			for _, t := range bp.terms {
@@ -7047,7 +7087,13 @@ func pkBoundFor(table *Table, filter *rExpr) *pkBoundPlan {
 	if pkIdx < 0 {
 		return nil
 	}
-	return detectPKBound(filter, pkIdx, table.Columns[pkIdx].Type.ScalarTy())
+	// Point-lookup pushdown is scalar-only; a non-scalar (range) PK skips it (deferred — ranges.md
+	// §10), so a range PK WHERE k = … full-scans + residual-filters.
+	sty, ok := table.Columns[pkIdx].Type.AsScalar()
+	if !ok {
+		return nil
+	}
+	return detectPKBound(filter, pkIdx, sty)
 }
 
 // detectPKBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction
@@ -16666,6 +16712,23 @@ func encodeKeyValue(ty ScalarType, value Value) []byte {
 	}
 }
 
+// encodeTypedKey is the order-preserving key bytes for one keyable value given its column Type — the
+// range-aware encoder threaded through every key path (PK, index entry/prefix, FK probe). A range
+// recurses into the range-bounds container codec (encoding.md §2.11), pulling its element scalar from
+// the column type; every other keyable value ignores the wrapper and dispatches on its scalar via
+// encodeKeyValue. value is non-NULL (callers handle the NULL slot tag), and a range column always
+// holds a ValRange, so the scalar arm never sees a range type.
+func encodeTypedKey(ty Type, value Value) []byte {
+	if value.Kind == ValRange {
+		elem, ok := ty.RangeElement()
+		if !ok {
+			panic("a range key value has a range column type")
+		}
+		return encodeRangeKey(elem.ScalarTy(), value.Range)
+	}
+	return encodeKeyValue(ty.ScalarTy(), value)
+}
+
 // fkProbeKind tags which physical tree a built foreign-key probe addresses.
 type fkProbeKind int
 
@@ -16708,8 +16771,7 @@ func buildFkProbe(fk *ForeignKey, parent *Table, row Row, ordinals []int) (fkPro
 	if len(parent.PK) > 0 && slices.Equal(sortedUnique(parent.PK), refSet) {
 		var k []byte
 		for _, pcol := range parent.PK {
-			ty := parent.Columns[pcol].Type.ScalarTy()
-			k = append(k, encodeKeyValue(ty, valueFor(pcol))...)
+			k = append(k, encodeTypedKey(parent.Columns[pcol].Type, valueFor(pcol))...)
 		}
 		return fkProbe{kind: fkProbePk, bytes: k}, true
 	}
@@ -16727,8 +16789,7 @@ func buildFkProbe(fk *ForeignKey, parent *Table, row Row, ordinals []int) (fkPro
 	var prefix []byte
 	for _, pcol := range idx.Columns {
 		prefix = append(prefix, 0x00)
-		ty := parent.Columns[pcol].Type.ScalarTy()
-		prefix = append(prefix, encodeKeyValue(ty, valueFor(pcol))...)
+		prefix = append(prefix, encodeTypedKey(parent.Columns[pcol].Type, valueFor(pcol))...)
 	}
 	return fkProbe{kind: fkProbeUnique, bytes: prefix, index: strings.ToLower(idx.Name)}, true
 }

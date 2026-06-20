@@ -379,6 +379,56 @@ func cmpBounds(v1 *Value, inc1 bool, lower1 bool, v2 *Value, inc2 bool, lower2 b
 	}
 }
 
+// --- key encoding (spec/design/encoding.md §2.11) --------------------------
+
+// encodeRangeKey is the order-preserving storage-key bytes for a range value
+// (spec/design/encoding.md §2.11) — the engine's first container key. It frames the range's shape
+// and embeds each finite bound's element key, so that bytes.Compare over the bytes reproduces
+// rangeTotalCmp: a leading empty/non-empty discriminator (0x00 empty sorts first, 0x01 non-empty),
+// then the lower bound, then the upper bound. Each bound is either a single infinity marker (0x00 =
+// −∞ on the lower side, 0x02 = +∞ on the upper — ordered −∞ < finite < +∞) or 0x01 ‖ the element's
+// own order-preserving key ‖ an inclusivity byte. elem names the element scalar (the integer codec
+// needs the width). Keys never round-trip (the row body holds the full value), so this need only sort.
+func encodeRangeKey(elem ScalarType, rv *RangeVal) []byte {
+	if rv.Empty {
+		return []byte{0x00} // the empty range sorts below every non-empty one; this is its whole key
+	}
+	out := []byte{0x01}
+	out = pushRangeBound(out, elem, rv.Lower, rv.LowerInc, true)
+	out = pushRangeBound(out, elem, rv.Upper, rv.UpperInc, false)
+	return out
+}
+
+// pushRangeBound appends one bound of a non-empty range. An infinite bound is a single marker
+// (−∞ = 0x00 lower, +∞ = 0x02 upper); a finite bound is 0x01 ‖ the element key ‖ a one-byte
+// inclusivity tie-break (PG range_cmp_bounds): on the LOWER side an inclusive bound sorts before an
+// exclusive one, on the UPPER side an exclusive bound sorts before an inclusive one — i.e. the byte
+// is 0x00 when inc == isLower, else 0x01.
+func pushRangeBound(out []byte, elem ScalarType, v *Value, inc bool, isLower bool) []byte {
+	if v == nil {
+		if isLower {
+			return append(out, 0x00)
+		}
+		return append(out, 0x02)
+	}
+	out = append(out, 0x01)
+	out = append(out, encodeRangeElem(elem, *v)...)
+	if inc == isLower {
+		return append(out, 0x00)
+	}
+	return append(out, 0x01)
+}
+
+// encodeRangeElem encodes one range bound value's element key. A range element is one of the six
+// scalar subtypes (i32/i64/decimal/date/timestamp/timestamptz); the decimal stores its value in Dec
+// (decimal-order-preserving, §2.5), the rest in Int via the int-be-signflip / day / instant codec.
+func encodeRangeElem(elem ScalarType, v Value) []byte {
+	if v.Kind == ValDecimal {
+		return v.Dec.EncodeKey()
+	}
+	return EncodeInt(elem, v.Int)
+}
+
 // --- boolean operators (RF3, spec/design/range-functions.md §3) -------------
 // The eight PG range boolean operators, each a definite boolean over CANONICAL range values (never
 // 3-valued — like the total order, unlike composite; a NULL operand is short-circuited by the

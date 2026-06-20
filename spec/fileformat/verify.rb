@@ -613,6 +613,22 @@ RANGE_TABLE = {
          [5, nil, { lower: 1, upper: 2, lower_inc: true, upper_inc: false }]]
 }.freeze
 
+# A table with an i32range PRIMARY KEY (the range-PK slice — range is the first CONTAINER key,
+# encoding.md §2.11). Pins the recursive range-bounds key in the key slot: the empty range (key
+# 0x00), an unbounded-lower range, a fully-unbounded range, and finite-bound ranges — listed in
+# ASCENDING range_total_cmp (= byte) order (the builder inserts in key order). The `r` value bodies
+# travel through the range value codec too (type_code 17). PK is the range; `v` is an ordinary i32.
+RANGE_PK_TABLE = {
+  name: "t",
+  columns: [col("k", "i32range", pk: true), col("v", "i32")],
+  rows: [[:empty, 0],
+         [{ lower: nil, upper: 5, lower_inc: false, upper_inc: false }, 1],   # (,5)
+         [{ lower: nil, upper: nil, lower_inc: false, upper_inc: false }, 2], # (,)
+         [{ lower: 1, upper: 5, lower_inc: true, upper_inc: false }, 3],      # [1,5)
+         [{ lower: 2, upper: 4, lower_inc: true, upper_inc: false }, 4],      # [2,4)
+         [{ lower: 2, upper: nil, lower_inc: true, upper_inc: false }, 5]]    # [2,)
+}.freeze
+
 # A table with a GIN inverted index (v13 — spec/design/gin.md): pins the per-index index_kind byte
 # (0 = ordered B-tree, 1 = GIN) and a GIN index tree (entries are encode(element)‖storage-key, empty
 # payload — §4). `i_nums_gin` is a USING gin index over an i32[] column; `i_n` is an ordinary
@@ -841,6 +857,7 @@ FIXTURES = [
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "range_table.jed", page_size: 256, tables: [RANGE_TABLE] },
+  { file: "range_pk_table.jed", page_size: 256, tables: [RANGE_PK_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
     types: COMPOSITE_TYPE_TABLE[:types], tables: COMPOSITE_TYPE_TABLE[:tables] },
   { file: "array_composite_table.jed", page_size: 256,
@@ -941,13 +958,45 @@ def encode_interval_key(v)
   encode_int(16, span)
 end
 
+# The BARE order-preserving KEY body for a range value (range-bounds, encoding.md §2.11) — the first
+# container key. empty = 0x00 (the whole key); non-empty = 0x01 ‖ lower bound ‖ upper bound. Each
+# bound is an infinity marker (−∞ 0x00 lower / +∞ 0x02 upper) or 0x01 ‖ the element's key_body ‖ an
+# inclusivity byte (0x00 when inclusive == is_lower, else 0x01). `val` is :empty or the bound hash;
+# `elem_type` names the element subtype (recursing into its key_body).
+def encode_range_key(elem_type, val)
+  return "\x00".b if val == :empty || (val.is_a?(Hash) && val[:empty])
+
+  out = +"".b
+  out << 0x01
+  encode_range_key_bound(out, elem_type, val, :lower, true)
+  encode_range_key_bound(out, elem_type, val, :upper, false)
+  out
+end
+
+def encode_range_key_bound(out, elem_type, val, side, is_lower)
+  v = val[side]
+  if v.nil?
+    out << (is_lower ? 0x00 : 0x02)
+    return
+  end
+  out << 0x01
+  out << key_body(elem_type, v)
+  inc = val[is_lower ? :lower_inc : :upper_inc]
+  out << ((inc == is_lower) ? 0x00 : 0x01)
+end
+
 # The BARE order-preserving KEY body for one present (non-NULL) value of `type` — no presence
 # tag (callers add it for nullable index slots; a PK member is NOT NULL). uuid is the 16 raw
 # bytes (uuid-raw16, §2.7), boolean a single bool-byte (0x00 false / 0x01 true, §2.9), text/bytea
 # the variable-width …-terminated-escape body (§2.4/§2.6), decimal the decimal-order-preserving
-# body (§2.5), interval the 16-byte interval-span-i128 span (§2.10), every other keyable type the
-# sign-flipped fixed-width int encoding (timestamps reuse the i64 rule).
+# body (§2.5), interval the 16-byte interval-span-i128 span (§2.10), a range the recursive
+# range-bounds container key (§2.11), every other keyable type the sign-flipped fixed-width int
+# encoding (timestamps reuse the i64 rule).
 def key_body(type, v)
+  if (relem = range_elem(type))
+    return encode_range_key(relem, v)
+  end
+
   case type
   when "uuid" then uuid_to_bytes(v)
   when "boolean" then (v ? "\x01".b : "\x00".b)

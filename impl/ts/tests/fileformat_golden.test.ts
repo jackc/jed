@@ -166,6 +166,21 @@ function rangeTableDB(): Database {
   return db;
 }
 
+// rangePkTableDB: an i32range PRIMARY KEY — the first CONTAINER key (encoding.md §2.11). The
+// range-bounds key (empty/±∞/inclusivity framing around the i32 element key) lands in the key slot.
+// Rows are inserted in ASCENDING range_total_cmp order to match verify.rb's ascending-key tree builder.
+function rangePkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (k i32range PRIMARY KEY, v i32)");
+  run(db, "INSERT INTO t VALUES ('empty', 0)");
+  run(db, "INSERT INTO t VALUES ('(,5)', 1)");
+  run(db, "INSERT INTO t VALUES ('(,)', 2)");
+  run(db, "INSERT INTO t VALUES ('[1,5)', 3)");
+  run(db, "INSERT INTO t VALUES ('[2,4)', 4)");
+  run(db, "INSERT INTO t VALUES ('[2,)', 5)");
+  return db;
+}
+
 // ginArrayTableDB has a GIN inverted index (v13 — the per-index index_kind byte, spec/design/gin.md):
 // i_nums_gin over an i32[] column (kind 1) beside an ordinary ordered index i_n over a scalar
 // column (kind 0 — a btree index cannot sit on the array column). Rows exercise term dedup (row 2's
@@ -684,6 +699,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "identity_table.jed", build: identityTableDB },
     { name: "array_table.jed", build: arrayTableDB },
     { name: "range_table.jed", build: rangeTableDB },
+    { name: "range_pk_table.jed", build: rangePkTableDB },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
@@ -739,6 +755,7 @@ test("read goldens reproduces rows", () => {
     { name: "identity_table.jed", build: identityTableDB, table: "t" },
     { name: "array_table.jed", build: arrayTableDB, table: "t" },
     { name: "range_table.jed", build: rangeTableDB, table: "t" },
+    { name: "range_pk_table.jed", build: rangePkTableDB, table: "t" },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB, table: "t" },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },

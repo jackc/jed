@@ -64,9 +64,12 @@ SELECT * FROM reservations WHERE span @> 7 AND during && tsrange('2020-01-01','2
 - **Comparison** `= <> < <= > >=` is PostgreSQL's total range btree order (§6): `empty`
   sorts below every non-empty range, then by lower bound, lower inclusivity, upper bound,
   upper inclusivity. `IS NULL` tests only the whole value.
-- **Declarable + storable from R2; never keyable this slice.** A range `PRIMARY KEY` /
-  index / `UNIQUE` is `0A000` (§8), and a range column `DEFAULT` is `0A000` — exactly the
-  array narrowings. A PG-style GiST/SP-GiST range index is a deferred follow-on (§10).
+- **Declarable + storable from R2; keyable since the range-PK slice.** A range is a valid
+  `PRIMARY KEY` / ordered (btree) secondary index / `UNIQUE` key / FK target — its
+  order-preserving `range-bounds` key ([encoding.md §2.11](encoding.md)) mirrors the §6 total
+  order (the first *container* key). A range column `DEFAULT` stays `0A000` (the array narrowing,
+  §8), and point-lookup pushdown is **deferred** (a range PK/index `WHERE k = …` full-scans +
+  residual-filters); a PG-style GiST/SP-GiST range index is a deferred follow-on (§10).
 
 ## 2. The open type system — `Type { Scalar | Composite | Array | Range }`
 
@@ -228,13 +231,18 @@ result always):
   a NULL element bound passed to a constructor means **infinite** on that side, not NULL — PG:
   `int4range(NULL, 5)` is `(,5)`, not NULL (range-functions.md RF2 pins this).
 
-## 8. Not a key, no DEFAULT — staged narrowings
+## 8. A key (since the range-PK slice), no DEFAULT — staged narrowings
 
-A range `PRIMARY KEY` / index (btree or GIN) / `UNIQUE` is **`0A000`**, and a range-typed
-column `DEFAULT` is **`0A000`** — the array narrowings verbatim (CLAUDE.md §4; array.md §1/§8).
-The order-preserving key encoding for ranges is **not authored** this slice (PG itself does
-not provide a default btree opclass usable for a range PRIMARY KEY without a GiST index); a
-range key / index is a deferred follow-on (§10).
+A range **is** a valid `PRIMARY KEY` / ordered (btree) secondary index / `UNIQUE` key / FK
+target via its order-preserving `range-bounds` key ([encoding.md §2.11](encoding.md)) — the
+first *container* key, recursing into the element codec with empty/±∞/inclusivity framing that
+mirrors the §6 total order. Two narrowings remain (the array narrowings verbatim, CLAUDE.md §4;
+array.md §1/§8): a range-typed column `DEFAULT` is still **`0A000`**, and a **GIN** index over a
+range column is **`0A000`** (a range is not a GIN element — that is a GiST job, §10). Two
+deliberate scopings on the *key*, both relaxable: **point-lookup pushdown is deferred** (a range
+PK/index `WHERE k = …` is correct via full-scan + residual filter, just unindexed — the
+container precedent), and a PG-style **GiST/SP-GiST** range index (accelerating `@>`/`&&`/…)
+is a deferred follow-on (§10).
 
 ## 9. Determinism
 
@@ -246,11 +254,13 @@ determinism exception (CLAUDE.md §10).
 
 ## 10. Deferred follow-ons (none foreclosed)
 
-- **Range indexing.** A GiST/SP-GiST-style range index accelerating `@>` / `&&` / `<<` / `>>`
-  / `-|-`, and a range as a key. PG uses GiST (not the GIN `array_ops` jed shipped for arrays);
-  this is its own slice with its own NoREC obligation. Until then range operators are
-  full-scan predicates (consistent with ranges-not-keyable), and cannot mis-fire the existing
-  integer-array GIN `gin_match` planner (a range operand never matches a GIN index).
+- **Range indexing (GiST) + key-bounded point lookup.** A GiST/SP-GiST-style range index
+  accelerating `@>` / `&&` / `<<` / `>>` / `-|-`, and point-lookup pushdown for a range
+  PK/ordered-index `WHERE k = …` (the ordered `range-bounds` key already sorts correctly — the
+  scoping is the planner side only, [encoding.md §2.11](encoding.md)). PG uses GiST (not the GIN
+  `array_ops` jed shipped for arrays); this is its own slice with its own NoREC obligation. Until
+  then range operators and a range equality `WHERE` are full-scan predicates, and cannot mis-fire
+  the existing integer-array GIN `gin_match` planner (a range operand never matches a GIN index).
 - **Multirange types** (`int4multirange` etc., PG 14+) — a separate axis, not scheduled.
 - **Custom range types** via `CREATE TYPE … AS RANGE` — jed ships only the six built-ins;
   the structural model would need a nominal escape hatch, deferred.
@@ -272,6 +282,7 @@ function/operator surface (RF1–RF4, [range-functions.md](range-functions.md)) 
 | **RF2** | the six constructors (`i32range(lo,hi)` / `(lo,hi,text)`, …) |
 | **RF3** | boolean operators `@>` `<@` `&&` `<<` `>>` `&<` `&>` `-\|-` (+ the new lexer tokens) |
 | **RF4** | set operators `+` `*` `-` + `range_merge` (reuse the arithmetic tokens; `+`/`-` raise `22000` on a non-contiguous result) — **range surface complete** |
+| **R4** | range as a **key**: the order-preserving `range-bounds` encoding ([encoding.md §2.11](encoding.md)) + lift the PK/index/`UNIQUE`/FK gate in all three cores + `range.toml` encoding vectors + the `range_pk_table.jed` golden (`rust == go == ts == ruby`). Point-lookup pushdown + GiST deferred (§10) — **the first container key** |
 
 ## 12. Divergence ledger (jed ≠ PostgreSQL)
 
@@ -281,7 +292,9 @@ function/operator surface (RF1–RF4, [range-functions.md](range-functions.md)) 
 - **Element domains.** `daterange`/`tsrange` inherit jed's **wider** `date`/`timestamp`
   domains (date.md / timestamp.md), so a range over a date PG would reject is accepted — the
   same documented divergence the element types already carry, not a range-specific one.
-- **No GiST / range index / range key** this slice (§8, §10) — a relaxable narrowing, not a
-  permanent divergence.
+- **No GiST / range index, no key-bounded point lookup** (§8, §10) — a relaxable narrowing, not
+  a permanent divergence. A range **is** a key (PK/ordered-index/`UNIQUE`/FK) since R4, but a
+  range equality `WHERE` full-scans + residual-filters rather than seeking, and PG's GiST range
+  index has no jed equivalent yet.
 - **Strict static element.** No implicit cross-element range comparison/cast (§6) — PG also
   has no implicit `int4range`↔`numrange` cast, so this matches PG; listed for completeness.

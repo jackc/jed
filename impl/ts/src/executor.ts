@@ -129,7 +129,9 @@ import {
   typeIsTimestamptz,
   typeIsDate,
   typeIsInterval,
+  typeIsRange,
   typeIsUuid,
+  typeAsScalar,
   typeScalar,
   widthBytes,
 } from "./types.ts";
@@ -207,6 +209,7 @@ import {
 import {
   elementScalar,
   finalizeRange,
+  encodeRangeKey,
   parseBoundFlags,
   parseRangeText,
   rangeAdjacent,
@@ -1471,9 +1474,10 @@ export class Database {
         // §2.5) are also allowed — their variable-width key encodings are self-delimiting, so they
         // compose in composite keys / index suffixes; an oversized one trips the RECORD_MAX
         // oversized-item 0A000 (PG's btree key limit). interval is the fixed 16-byte span key
-        // (interval-span-i128, §2.10). Still rejected 0A000: float (the determinism carve-out,
-        // determinism.md §4) and the recursive containers composite/array/range. timestamp /
-        // timestamptz / date share the i64/i32 int-be-signflip key encoding (timestamp.md §6).
+        // (interval-span-i128, §2.10), and range the first container key (range-bounds, §2.11 —
+        // recursing into the element key with empty/±∞/inclusivity framing). Still rejected 0A000:
+        // float (the determinism carve-out, determinism.md §4) and the recursive composite/array
+        // containers. timestamp / timestamptz / date share the i64/i32 int-be-signflip key (timestamp.md §6).
         if (
           !typeIsInteger(colType) &&
           !typeIsBoolean(colType) &&
@@ -1484,7 +1488,8 @@ export class Database {
           !typeIsTimestamp(colType) &&
           !typeIsTimestamptz(colType) &&
           !typeIsDate(colType) &&
-          !typeIsInterval(colType)
+          !typeIsInterval(colType) &&
+          !typeIsRange(colType)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -1688,7 +1693,8 @@ export class Database {
           !typeIsTimestamp(ty) &&
           !typeIsTimestamptz(ty) &&
           !typeIsDate(ty) &&
-          !typeIsInterval(ty)
+          !typeIsInterval(ty) &&
+          !typeIsRange(ty)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -1740,7 +1746,8 @@ export class Database {
           !typeIsTimestamp(ty) &&
           !typeIsTimestamptz(ty) &&
           !typeIsDate(ty) &&
-          !typeIsInterval(ty)
+          !typeIsInterval(ty) &&
+          !typeIsRange(ty)
         ) {
           throw engineError(
             "feature_not_supported",
@@ -2347,7 +2354,8 @@ export class Database {
         !typeIsTimestamp(ty) &&
         !typeIsTimestamptz(ty) &&
         !typeIsDate(ty) &&
-        !typeIsInterval(ty)
+        !typeIsInterval(ty) &&
+        !typeIsRange(ty)
       ) {
         throw engineError(
           "feature_not_supported",
@@ -6503,19 +6511,30 @@ type IndexBound = {
 function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
   const pkLocal = primaryKeyIndex(rel.table);
   if (pkLocal >= 0) {
-    const bp = detectPkBound(
-      filter,
-      rel.offset + pkLocal,
-      typeScalar(rel.table.columns[pkLocal]!.type),
-    );
-    if (bp !== null) return { kind: "pk", pk: bp };
+    // Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
+    // deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
+    const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
+    if (sty !== undefined) {
+      const bp = detectPkBound(filter, rel.offset + pkLocal, sty);
+      if (bp !== null) return { kind: "pk", pk: bp };
+    }
   }
   for (const idx of rel.table.indexes) {
     // A GIN index is not an ordered-equality bound — its array column is keyed by terms, not the
     // whole value (handled by the GIN pass below, gin.md §6).
     if (idx.kind === "gin") continue;
     const ci = idx.columns[0]!;
-    const ty = typeScalar(rel.table.columns[ci]!.type);
+    // An ordered index whose leading (or any) key column is a non-scalar (range) does not pushdown —
+    // point-lookup is deferred for containers (ranges.md §10); the index is still maintained.
+    const ty = typeAsScalar(rel.table.columns[ci]!.type);
+    if (ty === undefined) continue;
+    if (
+      idx.columns
+        .slice(1)
+        .some((c) => typeAsScalar(rel.table.columns[c]!.type) === undefined)
+    ) {
+      continue;
+    }
     const bp = detectPkBound(filter, rel.offset + ci, ty);
     const eqs: RExpr[] = [];
     if (bp !== null) {
@@ -6727,6 +6746,9 @@ function indexEntryKey(
       parts.push(Uint8Array.of(0x00), v.dec.encodeKey());
     } else if (v.kind === "interval") {
       parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
+    } else if (v.kind === "range") {
+      // the recursive range-bounds container key (encoding.md §2.11)
+      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v));
     } else {
       throw new Error(
         "an index column is a key-encodable type (CREATE INDEX gate)",
@@ -6905,10 +6927,13 @@ function encodePkKey(table: Table, pk: number[], row: Row): Uint8Array {
       parts.push(pkv.dec.encodeKey());
     } else if (pkv.kind === "interval") {
       parts.push(intervalEncodeKey(pkv.iv));
+    } else if (pkv.kind === "range") {
+      // the recursive range-bounds container key (encoding.md §2.11, the first container key)
+      parts.push(encodeTypedKey(table.columns[i]!.type, pkv));
     } else {
       throw engineError(
         "data_corrupted",
-        "a primary key must be an integer, boolean, uuid, text, bytea, decimal, interval, or timestamp value",
+        "a primary key must be an integer, boolean, uuid, text, bytea, decimal, interval, range, or timestamp value",
       );
     }
   }
@@ -7041,6 +7066,9 @@ function indexPrefixKey(
       parts.push(Uint8Array.of(0x00), v.dec.encodeKey());
     } else if (v.kind === "interval") {
       parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
+    } else if (v.kind === "range") {
+      // the recursive range-bounds container key (encoding.md §2.11)
+      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v));
     } else {
       throw new Error(
         "an index column is a key-encodable type (CREATE INDEX gate)",
@@ -7088,6 +7116,22 @@ function encodeKeyValue(ty: ScalarType, value: Value): Uint8Array {
   );
 }
 
+// encodeTypedKey is the order-preserving key bytes for one keyable value given its column Type — the
+// range-aware encoder threaded through every key path (PK, index entry/prefix, FK probe). A range
+// recurses into the range-bounds container codec (encoding.md §2.11), pulling its element scalar from
+// the column type; every other keyable value ignores the wrapper and dispatches on its scalar via
+// encodeKeyValue. value is non-NULL (callers handle the NULL slot tag), and a range column always
+// holds a range value, so the scalar arm never sees a range type.
+function encodeTypedKey(ty: Type, value: Value): Uint8Array {
+  if (value.kind === "range") {
+    if (ty.kind !== "range") {
+      throw new Error("a range key value has a range column type");
+    }
+    return encodeRangeKey(typeScalar(ty.elem), value);
+  }
+  return encodeKeyValue(typeScalar(ty), value);
+}
+
 // FkProbe is a built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look
 // up in the parent, tagged with which physical tree to probe — the parent's PK store (bare member
 // encodings concatenated, in PK key order) or a parent unique index's prefix (0x00-tagged slots,
@@ -7130,8 +7174,7 @@ function fkProbe(
   if (parent.pk.length > 0 && sameSet(pkSet, refSet)) {
     const parts: Uint8Array[] = [];
     for (const pcol of parent.pk) {
-      const ty = typeScalar(parent.columns[pcol]!.type);
-      parts.push(encodeKeyValue(ty, valueFor(pcol)));
+      parts.push(encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol)));
     }
     return { kind: "pk", bytes: concatBytes(parts) };
   }
@@ -7141,8 +7184,7 @@ function fkProbe(
   const parts: Uint8Array[] = [];
   for (const pcol of idx.columns) {
     parts.push(Uint8Array.of(0x00));
-    const ty = typeScalar(parent.columns[pcol]!.type);
-    parts.push(encodeKeyValue(ty, valueFor(pcol)));
+    parts.push(encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol)));
   }
   return {
     kind: "unique",
@@ -7188,6 +7230,8 @@ function fkTypesEqual(a: Type, b: Type): boolean {
   if (a.kind === "composite" && b.kind === "composite")
     return a.name === b.name;
   if (a.kind === "array" && b.kind === "array")
+    return fkTypesEqual(a.elem, b.elem);
+  if (a.kind === "range" && b.kind === "range")
     return fkTypesEqual(a.elem, b.elem);
   return false;
 }
@@ -7487,7 +7531,11 @@ function mutationPkBound(table: Table, filter: RExpr | null): PkBound | null {
   if (filter === null) return null;
   const pkIdx = primaryKeyIndex(table);
   if (pkIdx < 0) return null;
-  return detectPkBound(filter, pkIdx, typeScalar(table.columns[pkIdx]!.type));
+  // Point-lookup pushdown is scalar-only; a non-scalar (range) PK skips it (deferred — ranges.md
+  // §10), so a range PK WHERE k = … full-scans + residual-filters.
+  const sty = typeAsScalar(table.columns[pkIdx]!.type);
+  if (sty === undefined) return null;
+  return detectPkBound(filter, pkIdx, sty);
 }
 
 // scanEntries returns the (key,row) entries a mutation scans + the page_read node count: a primary-key

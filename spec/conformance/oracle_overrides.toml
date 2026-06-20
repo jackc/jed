@@ -102,6 +102,11 @@ sql = "SELECT k, n FROM ik"
 reason = "jed: a full scan iterates the interval PRIMARY KEY in key (= canonical-span) order — -1 mon < -1 day < 0 < 1 sec < 1 day < 1 mon < 100 years (encoding.md §2.10, interval-span-i128). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical (the values agree exactly — interval key order is span order, the same ordering PG uses for interval comparison)."
 
 [[override]]
+file = "types/range.test"
+sql = "SELECT k, n FROM rk"
+reason = "jed: a full scan iterates the range PRIMARY KEY in key (= range_total_cmp) order — empty < (,5) < (,) < [1,5) < [2,4) < [2,) (encoding.md §2.11, range-bounds, the first container key). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical (the values agree exactly — range key order is range_total_cmp order, the same ordering PG uses for its range btree opclass, only heap-vs-key)."
+
+[[override]]
 file = "ddl/composite_pk.test"
 sql = "UPDATE t SET b = 9 WHERE a = 1"
 reason = "jed: assigning any primary-key member is the documented 0A000 narrowing (the storage key never changes — constraints.md §3, CLAUDE.md §11 step 6). PG allows PK updates (and here would instead trap 23505 on the resulting duplicate tuple)."

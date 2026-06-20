@@ -5,13 +5,15 @@
 # 16), range_out rendering ([lo,hi) with PG bound quoting), canonicalization of discrete subtypes
 # (i32/i64/date stored canonical [); continuous subtypes kept verbatim), empty normalization, the
 # whole-value IS NULL rule, and (R3) the range_cmp total order driving =/</ORDER BY/DISTINCT. The
-# constructor/operator surface lands in follow-ons (RF1–RF4); a range PRIMARY KEY / DEFAULT is 0A000
-# and a cross-element comparison (int4range × int8range) is 42804 (per-core tests — PG allows the
-# former and reports 42883 for the latter). The names int4range/int8range are jed aliases of
-# i32range/i64range, used here so the SQL is oracle-clean (the canonical i32range/i64range spelling is
-# a per-core divergence test). range_out matches PostgreSQL byte-for-byte. Format:
+# constructor/operator surface lands in follow-ons (RF1–RF4). Since the range-PK slice a range IS a
+# valid PRIMARY KEY / ordered index / UNIQUE key / FK target — the first CONTAINER key (range-bounds,
+# encoding.md §2.11; PG also indexes ranges via its range btree opclass), exercised below; a range
+# DEFAULT stays 0A000 and a cross-element comparison (int4range × int8range) is 42804 (per-core tests —
+# PG allows the former and reports 42883 for the latter). The names int4range/int8range are jed aliases
+# of i32range/i64range, used here so the SQL is oracle-clean (the canonical i32range/i64range spelling
+# is a per-core divergence test). range_out matches PostgreSQL byte-for-byte. Format:
 # ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.distinct, query.is_null, types.range, types.i32, resource.cost_metering
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, ddl.foreign_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.distinct, query.is_null, types.range, types.i32, types.decimal, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, r int4range, br int8range)
@@ -249,3 +251,87 @@ SELECT '[1,2147483647]'::int4range
 # There is no range type over text — textrange is an undefined type (42704).
 statement error 42704
 CREATE TABLE bad (id i32 PRIMARY KEY, r textrange)
+
+# --- range as a PRIMARY KEY (encoding.md §2.11: range-bounds, the first CONTAINER key) ----------
+# A range IS a valid PRIMARY KEY — its recursive order-preserving range-bounds key is exercised here:
+# a leading empty/non-empty discriminator, the lower bound (−∞ < finite < +∞), then the upper, each
+# finite bound carrying the i32 element key + an inclusivity byte. PG also btree-indexes ranges.
+statement ok
+CREATE TABLE rk (k int4range PRIMARY KEY, n i32)
+
+# insert deliberately NOT in key order; the spread covers empty, unbounded-lower, fully-unbounded, and
+# finite-bound ranges
+statement ok
+INSERT INTO rk VALUES ('[1,5)', 3), ('empty', 0), ('(,)', 2), ('[2,)', 5), ('(,5)', 1), ('[2,4)', 4)
+
+# point lookup on the range PK resolves the matching row (the operand is cast to the range type — a
+# range `=` compares range-to-range, not range-to-text)
+query I nosort
+SELECT n FROM rk WHERE k = '[1,5)'::int4range
+----
+3
+
+# the discrete range is stored canonical [): '[1,4]' equals the stored '[1,5)', so the non-canonical
+# spelling finds that row (the "equal but not identical" container analogue of decimal scale / span)
+query I nosort
+SELECT n FROM rk WHERE k = '[1,4]'::int4range
+----
+3
+
+# a full scan iterates in key (= range_total_cmp) order: empty < (,5) < (,) < [1,5) < [2,4) < [2,)
+# (PG returns heap/insertion order — oracle_overrides ledger; the multiset is identical)
+query TI nosort
+SELECT k, n FROM rk
+----
+empty
+0
+(,5)
+1
+(,)
+2
+[1,5)
+3
+[2,4)
+4
+[2,)
+5
+
+# a duplicate range PK is a unique violation (23505)
+statement error 23505
+INSERT INTO rk VALUES ('[1,5)', 9)
+
+# discrete canonicality: '[1,4]' canonicalizes to the stored '[1,5)', so it conflicts too (23505)
+statement error 23505
+INSERT INTO rk VALUES ('[1,4]', 9)
+
+# a NULL range PK is rejected NOT NULL (23502)
+statement error 23502
+INSERT INTO rk VALUES (NULL, 9)
+
+# range is also a valid UNIQUE column and an ordered secondary-index key (the same lifted gate). A
+# numrange (continuous, decimal element) shows the bound's scale-independence carries through.
+statement ok
+CREATE TABLE ru (id i32 PRIMARY KEY, span numrange UNIQUE)
+
+statement ok
+INSERT INTO ru VALUES (1, '[1.0,2.0)'), (2, '[3,4)')
+
+# the UNIQUE numrange index treats '[1.00,2.00)' as equal to the stored '[1.0,2.0)' (the decimal
+# element 1.00 = 1.0, 2.00 = 2.0) — 23505
+statement error 23505
+INSERT INTO ru VALUES (3, '[1.00,2.00)')
+
+statement ok
+CREATE INDEX ru_span ON ru (span)
+
+# range is also a valid FOREIGN KEY reference target (the lifted gate makes it a key)
+statement ok
+CREATE TABLE rchild (id i32 PRIMARY KEY, fr int4range REFERENCES rk (k))
+
+# an FK value matching a parent range key inserts; a non-canonical spelling of a present key matches too
+statement ok
+INSERT INTO rchild VALUES (1, '[2,4)'), (2, '[1,4]')
+
+# an FK value with no matching parent range key is a foreign-key violation (23503)
+statement error 23503
+INSERT INTO rchild VALUES (3, '[100,200)')

@@ -5,6 +5,7 @@
 // check that produce a CANONICAL stored value (§4). The type-set facts come from the codegen'd
 // RANGES table (ranges_gen.ts). The value model is the `range` Value kind; bounds are element Values.
 
+import { encodeInt } from "./encoding.ts";
 import { type RangeDesc, RANGES } from "./ranges_gen.ts";
 import { canonicalName, scalarTypeFromName, type ScalarType } from "./types.ts";
 import { emptyRangeValue, rangeValue, render, type Value } from "./value.ts";
@@ -304,6 +305,56 @@ function cmpBounds(
   if (inc1 && !inc2) return lower2 ? -1 : 1;
   if (!inc1 && inc2) return lower1 ? 1 : -1;
   return 0;
+}
+
+// --- key encoding (spec/design/encoding.md §2.11) --------------------------
+
+// encodeRangeKey is the order-preserving storage-key bytes for a range value
+// (spec/design/encoding.md §2.11) — the engine's first container key. It frames the range's shape and
+// embeds each finite bound's element key, so that memcmp over the bytes reproduces rangeTotalCmp: a
+// leading empty/non-empty discriminator (0x00 empty sorts first, 0x01 non-empty), then the lower
+// bound, then the upper bound. Each bound is either a single infinity marker (0x00 = −∞ on the lower
+// side, 0x02 = +∞ on the upper — ordered −∞ < finite < +∞) or 0x01 ‖ the element's own
+// order-preserving key ‖ an inclusivity byte. elem names the element scalar (the integer codec needs
+// the width). Keys never round-trip (the row body holds the full value), so this need only sort.
+export function encodeRangeKey(elem: ScalarType, rv: RangeShape): Uint8Array {
+  if (rv.empty) return Uint8Array.of(0x00); // empty sorts below every non-empty range; whole key
+  const out: number[] = [0x01];
+  pushRangeBound(out, elem, rv.lower, rv.lowerInc, true);
+  pushRangeBound(out, elem, rv.upper, rv.upperInc, false);
+  return Uint8Array.from(out);
+}
+
+// pushRangeBound appends one bound of a non-empty range. An infinite bound is a single marker
+// (−∞ = 0x00 lower, +∞ = 0x02 upper); a finite bound is 0x01 ‖ the element key ‖ a one-byte
+// inclusivity tie-break (PG range_cmp_bounds): on the LOWER side an inclusive bound sorts before an
+// exclusive one, on the UPPER side an exclusive bound sorts before an inclusive one — i.e. the byte is
+// 0x00 when inc === isLower, else 0x01.
+function pushRangeBound(
+  out: number[],
+  elem: ScalarType,
+  v: Value | null,
+  inc: boolean,
+  isLower: boolean,
+): void {
+  if (v === null) {
+    out.push(isLower ? 0x00 : 0x02);
+    return;
+  }
+  out.push(0x01);
+  for (const b of encodeRangeElem(elem, v)) out.push(b);
+  out.push(inc === isLower ? 0x00 : 0x01);
+}
+
+// encodeRangeElem encodes one range bound value's element key. A range element is one of the six
+// scalar subtypes (i32/i64/decimal/date/timestamp/timestamptz); decimal uses decimal-order-preserving
+// (§2.5), the rest the int-be-signflip / day / instant codec.
+function encodeRangeElem(elem: ScalarType, v: Value): Uint8Array {
+  if (v.kind === "decimal") return v.dec.encodeKey();
+  if (v.kind === "date") return encodeInt(elem, v.days);
+  if (v.kind === "timestamp" || v.kind === "timestamptz") return encodeInt(elem, v.micros);
+  if (v.kind === "int") return encodeInt(elem, v.int);
+  throw new Error("a range element is i32/i64/decimal/date/timestamp/timestamptz");
 }
 
 // --- boolean operators (RF3, spec/design/range-functions.md §3) -------------

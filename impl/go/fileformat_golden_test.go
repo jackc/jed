@@ -182,6 +182,21 @@ func rangeTableDB(t *testing.T) *Database {
 	return db
 }
 
+// rangePKTableDB: an i32range PRIMARY KEY — the first CONTAINER key (encoding.md §2.11). The
+// range-bounds key (empty/±∞/inclusivity framing around the i32 element key) lands in the key slot.
+// Rows are inserted in ASCENDING range_total_cmp order to match verify.rb's ascending-key tree builder.
+func rangePKTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (k i32range PRIMARY KEY, v i32)")
+	run(t, db, "INSERT INTO t VALUES ('empty', 0)")
+	run(t, db, "INSERT INTO t VALUES ('(,5)', 1)")
+	run(t, db, "INSERT INTO t VALUES ('(,)', 2)")
+	run(t, db, "INSERT INTO t VALUES ('[1,5)', 3)")
+	run(t, db, "INSERT INTO t VALUES ('[2,4)', 4)")
+	run(t, db, "INSERT INTO t VALUES ('[2,)', 5)")
+	return db
+}
+
 // ginArrayTableDB has a GIN inverted index (v13 — the per-index index_kind byte, spec/design/gin.md):
 // i_nums_gin over an i32[] column (kind 1) beside an ordinary ordered index i_n over a scalar
 // column (kind 0 — a btree index cannot sit on the array column). Rows exercise term dedup (row 2's
@@ -719,6 +734,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"nested_composite_table.jed", nestedCompositeTableDB},
 		{"array_table.jed", arrayTableDB},
 		{"range_table.jed", rangeTableDB},
+		{"range_pk_table.jed", rangePKTableDB},
 		{"array_composite_table.jed", arrayCompositeTableDB},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB},
 		{"sequence_table.jed", sequenceTableDB},
@@ -779,6 +795,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},
 		{"array_table.jed", arrayTableDB, "t"},
 		{"range_table.jed", rangeTableDB, "t"},
+		{"range_pk_table.jed", rangePKTableDB, "t"},
 		{"array_composite_table.jed", arrayCompositeTableDB, "t"},
 		{"composite_array_field_table.jed", compositeArrayFieldTableDB, "t"},
 		{"sequence_table.jed", sequenceTableDB, "t"},

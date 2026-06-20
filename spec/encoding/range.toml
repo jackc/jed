@@ -1,0 +1,97 @@
+# Order-preserving key-encoding vectors for `range` — method `range-bounds`
+# (../design/encoding.md §2.11). Range is the engine's first **container** key: a leading
+# empty/non-empty discriminator (`0x00` empty sorts first, `0x01` non-empty), then the lower bound,
+# then the upper bound. Each bound is either a single infinity marker (`0x00` = −∞ on the lower side,
+# `0x02` = +∞ on the upper — ordered −∞ < finite < +∞) or `0x01` ‖ the element's own order-preserving
+# key ‖ a one-byte inclusivity tie-break (`0x00` when `inclusive == is_lower`, else `0x01`). The whole
+# key is self-delimiting, so `memcmp` reproduces `range_total_cmp` (ranges.md §6). Keys never
+# round-trip (the row body holds the value), so only encode + byte-exactness + strict order are
+# checked (verify.rb).
+#
+# Each case names its element type (`elem`) and the bound shape: `empty = true` for the empty range;
+# otherwise `lower`/`upper` give the finite bound value (absent = infinite on that side) with
+# `lower_inc`/`upper_inc` its inclusivity. Discrete subtypes (i32/i64/date) are stored canonical `[)`.
+# Groups are in ascending logical (= byte) order, so the order invariant is a walk of the list.
+
+schema_version = 1
+
+# --- i32range bare key body (the PRIMARY KEY form) ---------------------------
+# The core order proof: empty first, then −∞-lower ranges (by upper bound, finite < +∞), then
+# finite-lower ranges by lower bound then upper bound. i32 elements are the 4-byte int-be-signflip key.
+[[bare]]
+type = "i32range"
+elem = "i32"
+cases = [
+  { label = "empty",  empty = true,                                                     bytes = "00" },
+  { label = "(,5)",   upper = 5, upper_inc = false,                                      bytes = "0100018000000500" },
+  { label = "(,)",                                                                       bytes = "010002" },
+  { label = "[1,5)",  lower = 1, lower_inc = true, upper = 5,  upper_inc = false,        bytes = "01018000000100018000000500" },
+  { label = "[1,10)", lower = 1, lower_inc = true, upper = 10, upper_inc = false,        bytes = "01018000000100018000000a00" },
+  { label = "[2,4)",  lower = 2, lower_inc = true, upper = 4,  upper_inc = false,        bytes = "01018000000200018000000400" },
+  { label = "[2,)",   lower = 2, lower_inc = true,                                       bytes = "0101800000020002" },
+]
+
+# --- i64range bare key body (8-byte element width) ---------------------------
+[[bare]]
+type = "i64range"
+elem = "i64"
+cases = [
+  { label = "empty",  empty = true,                                              bytes = "00" },
+  { label = "[-1,1)", lower = -1, lower_inc = true, upper = 1, upper_inc = false, bytes = "01017fffffffffffffff0001800000000000000100" },
+  { label = "[1,5)",  lower = 1,  lower_inc = true, upper = 5, upper_inc = false, bytes = "010180000000000000010001800000000000000500" },
+]
+
+# --- numrange bare key body (decimal element; inclusivity is significant) -----
+# The continuous subtype: inclusivity distinguishes bounds (PG range_cmp_bounds). Ascending: −∞-lower
+# first, then the lower-1 group ordered by lower-inclusivity (inclusive before exclusive) then
+# upper-inclusivity (exclusive before inclusive), then the larger lower 1.5. The decimal element key
+# is scale-independent, so `[1.5,2)` and `[1.50,2)` would collide — only one appears in this strictly
+# increasing list; the collision is pinned by the core unit tests + the conformance 23505 case.
+[[bare]]
+type = "numrange"
+elem = "decimal"
+cases = [
+  { label = "(,1.5]", upper = "1.5", upper_inc = true,                              bytes = "010001058000000102330001" },
+  { label = "[1,2)",  lower = "1", lower_inc = true,  upper = "2", upper_inc = false, bytes = "01010580000001020000010580000001030000" },
+  { label = "[1,2]",  lower = "1", lower_inc = true,  upper = "2", upper_inc = true,  bytes = "01010580000001020000010580000001030001" },
+  { label = "(1,2)",  lower = "1", lower_inc = false, upper = "2", upper_inc = false, bytes = "01010580000001020001010580000001030000" },
+  { label = "(1,2]",  lower = "1", lower_inc = false, upper = "2", upper_inc = true,  bytes = "01010580000001020001010580000001030001" },
+  { label = "[1.5,2)", lower = "1.5", lower_inc = true, upper = "2", upper_inc = false, bytes = "0101058000000102330000010580000001030000" },
+]
+
+# --- daterange bare key body (date element, 4-byte day codec) ----------------
+[[bare]]
+type = "daterange"
+elem = "date"
+cases = [
+  { label = "empty",   empty = true,                                              bytes = "00" },
+  { label = "[0,1)",   lower = 0,  lower_inc = true, upper = 1,  upper_inc = false, bytes = "01018000000000018000000100" },
+  { label = "[10,20)", lower = 10, lower_inc = true, upper = 20, upper_inc = false, bytes = "01018000000a00018000001400" },
+]
+
+# --- nullable i32range slot --------------------------------------------------
+# 0x00 = present + the range body; 0x01 = NULL. Present sorts before NULL, so NULLs sort last
+# ascending (the PostgreSQL model — §2.2/§4).
+[[nullable]]
+type = "i32range"
+elem = "i32"
+cases = [
+  { label = "empty", empty = true,                                          bytes = "0000" },
+  { label = "[1,5)", lower = 1, lower_inc = true, upper = 5, upper_inc = false, bytes = "0001018000000100018000000500" },
+  { label = "[2,)",  lower = 2, lower_inc = true,                           bytes = "000101800000020002" },
+  { null = true,                                                            bytes = "01" },  # NULL sorts last
+]
+
+# --- descending i32range slot ------------------------------------------------
+# Bitwise inversion of the nullable encoding (tag byte + body); NULL lifts to first. Listed in
+# ascending byte order (= descending logical order) so the order invariant holds.
+[[descending]]
+type = "i32range"
+elem = "i32"
+base = "nullable"
+cases = [
+  { null = true,                                                            bytes = "fe" },  # NULL sorts first under descending
+  { label = "[2,)",  lower = 2, lower_inc = true,                           bytes = "fffefe7ffffffdfffd" },
+  { label = "[1,5)", lower = 1, lower_inc = true, upper = 5, upper_inc = false, bytes = "fffefe7ffffffefffe7ffffffaff" },
+  { label = "empty", empty = true,                                          bytes = "ffff" },
+]

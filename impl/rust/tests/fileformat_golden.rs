@@ -216,6 +216,22 @@ fn range_table_db() -> Database {
     db
 }
 
+/// A table with an i32range PRIMARY KEY — the first CONTAINER key (encoding.md §2.11). The
+/// range-bounds key (empty/±∞/inclusivity framing around the i32 element key) lands in the key slot.
+/// Rows are inserted in ASCENDING range_total_cmp order (empty, unbounded-lower, fully-unbounded,
+/// then finite-bound) to match verify.rb's ascending-key tree builder.
+fn range_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (k i32range PRIMARY KEY, v i32)");
+    run(&mut db, "INSERT INTO t VALUES ('empty', 0)");
+    run(&mut db, "INSERT INTO t VALUES ('(,5)', 1)");
+    run(&mut db, "INSERT INTO t VALUES ('(,)', 2)");
+    run(&mut db, "INSERT INTO t VALUES ('[1,5)', 3)");
+    run(&mut db, "INSERT INTO t VALUES ('[2,4)', 4)");
+    run(&mut db, "INSERT INTO t VALUES ('[2,)', 5)");
+    db
+}
+
 fn gin_array_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
@@ -843,6 +859,7 @@ fn write_matches_goldens() {
         ("identity_table.jed", identity_table_db),
         ("array_table.jed", array_table_db),
         ("range_table.jed", range_table_db),
+        ("range_pk_table.jed", range_pk_table_db),
         ("array_composite_table.jed", array_composite_table_db),
         (
             "composite_array_field_table.jed",
@@ -895,6 +912,7 @@ fn read_goldens_reproduces_rows() {
         ("nested_composite_table.jed", nested_composite_table_db, "t"),
         ("array_table.jed", array_table_db, "t"),
         ("range_table.jed", range_table_db, "t"),
+        ("range_pk_table.jed", range_pk_table_db, "t"),
         ("array_composite_table.jed", array_composite_table_db, "t"),
         (
             "composite_array_field_table.jed",
