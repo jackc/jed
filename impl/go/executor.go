@@ -569,9 +569,14 @@ type Database struct {
 // construction (use the setter for the 0 ⇒ unlimited form); a zero MaxCost IS unlimited (the
 // genuine default). The entropy/clock seam is injected via Session.SetRandomSource/SetClockSource.
 type SessionOptions struct {
-	MaxCost      int64
-	MaxSQLLength int
-	WorkMem      int
+	MaxCost int64
+	// LifetimeMaxCost is the per-session cumulative cost budget (spec/design/session.md §5.4); 0 ⇒
+	// unlimited (the default). Bounds the whole session: the instant the session's running total
+	// reaches it, the in-flight statement aborts 54P02 (and once spent, every further statement is
+	// rejected at admission). Sibling to MaxCost, which bounds one statement.
+	LifetimeMaxCost int64
+	MaxSQLLength    int
+	WorkMem         int
 	// DefaultPrivileges is the table-privilege set granted to every table — the GRANT … ON ALL TABLES
 	// default (spec/design/session.md §5.3). nil ⇒ all four (the default), so a fresh session is
 	// unrestricted; PrivSetEmpty.With(PrivSelect) is a read-only session. A pointer so the zero
@@ -631,6 +636,17 @@ type Session struct {
 	// unlimited. Bounds every statement run on this session: its Meter aborts 54P01 the instant
 	// accrued cost reaches it. The primary guard for untrusted queries.
 	maxCost int64
+	// lifetimeMaxCost is the per-session cumulative cost budget (spec/design/session.md §5.4), or 0
+	// for unlimited. Bounds the whole session: the instant lifetimeTotal reaches it the in-flight
+	// statement aborts 54P02, and once spent every further statement is rejected 54P02 at admission.
+	// Sibling to maxCost (one statement).
+	lifetimeMaxCost int64
+	// lifetimeTotal points at the session's running CUMULATIVE execution cost (spec/design/session.md
+	// §5.4) — the gauge LifetimeCost reads and the 54P02 budget bounds. A *int64 (heap) shared with
+	// every statement Meter, which live-charges into it, so partial cost of an aborted statement
+	// counts; a pointer so the activate() VALUE swap of the session keeps the same counter. SESSION
+	// state, not snapshot state: it does NOT roll back when a transaction rolls back.
+	lifetimeTotal *int64
 	// maxSQLLength is the maximum input SQL length in bytes (CLAUDE.md §13; cost.md §7); 0 =
 	// unlimited; default DefaultMaxSQLLength (1 MiB). Over-limit input is rejected 54000 at parse,
 	// before lexing.
@@ -683,11 +699,13 @@ func newSessionWithOptions(opts SessionOptions) Session {
 		opts.WorkMem = DefaultWorkMem
 	}
 	s := Session{
-		maxCost:      opts.MaxCost,
-		maxSQLLength: opts.MaxSQLLength,
-		workMem:      opts.WorkMem,
-		privileges:   newPrivileges(),
-		allowDDL:     true,
+		maxCost:         opts.MaxCost,
+		lifetimeMaxCost: opts.LifetimeMaxCost,
+		lifetimeTotal:   new(int64),
+		maxSQLLength:    opts.MaxSQLLength,
+		workMem:         opts.WorkMem,
+		privileges:      newPrivileges(),
+		allowDDL:        true,
 	}
 	if opts.DefaultPrivileges != nil {
 		s.privileges.SetDefaultTable(*opts.DefaultPrivileges)
@@ -773,6 +791,22 @@ func (db *Database) Path() string { return db.path }
 // is unlimited. The primary guard for safely evaluating untrusted, user-supplied queries; a handle
 // setting, not stored in the file.
 func (db *Database) SetMaxCost(limit int64) { db.session.maxCost = limit }
+
+// SetLifetimeMaxCost sets the PER-SESSION cumulative cost budget on the default session
+// (spec/design/session.md §5.4); limit <= 0 (the default) is unlimited. Where max_cost bounds one
+// statement (54P01), this bounds the whole session: the instant the session's running cumulative
+// cost reaches limit the in-flight statement aborts 54P02, and once spent every further statement is
+// rejected 54P02 at admission. The multi-tenant / untrusted-host gate atop max_cost; a handle
+// setting, not stored in the file.
+func (db *Database) SetLifetimeMaxCost(limit int64) { db.session.lifetimeMaxCost = limit }
+
+// LifetimeMaxCost is the default session's per-session cumulative cost budget (0 ⇒ unlimited).
+func (db *Database) LifetimeMaxCost() int64 { return db.session.lifetimeMaxCost }
+
+// LifetimeCost is the default session's running CUMULATIVE execution cost so far
+// (spec/design/session.md §5.4) — the gauge the lifetime_max_cost budget bounds. Tracked even when
+// unlimited; survives a transaction rollback (session state, not snapshot state).
+func (db *Database) LifetimeCost() int64 { return *db.session.lifetimeTotal }
 
 // SetDefaultPrivileges replaces the default session's default table-privilege set — the
 // GRANT … ON ALL TABLES default (spec/design/session.md §5.3). PrivSetEmpty.With(PrivSelect) makes
@@ -919,6 +953,25 @@ func (s *Session) InTransaction() bool { return s.tx != nil }
 // MaxCost / SetMaxCost — the per-statement execution-cost ceiling (0 ⇒ unlimited).
 func (s *Session) MaxCost() int64         { return s.maxCost }
 func (s *Session) SetMaxCost(limit int64) { s.maxCost = limit }
+
+// LifetimeMaxCost / SetLifetimeMaxCost — the per-session cumulative cost budget (0 ⇒ unlimited,
+// spec/design/session.md §5.4). Bounds the whole session: a statement aborts 54P02 the instant the
+// session's cumulative cost reaches limit, and once spent every further statement is rejected 54P02
+// at admission.
+func (s *Session) LifetimeMaxCost() int64         { return s.lifetimeMaxCost }
+func (s *Session) SetLifetimeMaxCost(limit int64) { s.lifetimeMaxCost = limit }
+
+// LifetimeCost is the session's running CUMULATIVE execution cost so far (spec/design/session.md
+// §5.4) — the gauge the lifetime_max_cost budget bounds. Tracked even when unlimited; survives a
+// transaction rollback (session state, not snapshot state).
+func (s *Session) LifetimeCost() int64 { return *s.lifetimeTotal }
+
+// newMeter builds the Meter for a statement run on this session: the per-statement max_cost ceiling
+// (54P01) plus a handle to the session's cumulative total + budget (54P02). Every statement's meter
+// is minted here, so all execution cost live-charges into the cumulative.
+func (s *Session) newMeter() *Meter {
+	return &Meter{Limit: s.maxCost, lifetimeTotal: s.lifetimeTotal, lifetimeLimit: s.lifetimeMaxCost}
+}
 
 // MaxSQLLength / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).
 func (s *Session) MaxSQLLength() int     { return s.maxSQLLength }
@@ -1585,6 +1638,21 @@ func (r *privReq) needFunction(name string) { r.functions = append(r.functions, 
 // resolution: a table privilege is required only for a name that resolves to an existing catalog
 // table (a missing table stays 42P01; a CTE / derived-table label is statement-local, not a catalog
 // object). Missing privilege → 42501.
+// checkLifetimeAdmission rejects a statement at admission when the session's lifetime cost budget is
+// already spent (spec/design/session.md §5.4): if a budget is set and the session's cumulative cost
+// has reached it, no further statement may run (it "cannot accrue") — 54P02. A no-op when the budget
+// is unlimited (the default), so the common path pays one comparison.
+func (db *Database) checkLifetimeAdmission() error {
+	limit := db.session.lifetimeMaxCost
+	total := *db.session.lifetimeTotal
+	if limit > 0 && total >= limit {
+		return NewError(SessionCostLimitExceeded, fmt.Sprintf(
+			"session exceeded the lifetime cost limit of %d (accrued %d)", limit, total,
+		))
+	}
+	return nil
+}
+
 func (db *Database) checkPrivileges(stmt Statement) error {
 	if db.session.allowDDL && db.session.privileges.IsPermissive() {
 		return nil
@@ -1977,6 +2045,14 @@ func stmtKind(stmt Statement) string {
 // dispatchStmt routes one parsed statement to its executor. The autocommit transaction handling
 // (capture / durable commit / rollback-on-error) lives in ExecuteStmtParams.
 func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error) {
+	// Lifetime budget admission (spec/design/session.md §5.4): once the session's cumulative cost has
+	// reached lifetime_max_cost, every further statement is rejected 54P02 BEFORE it can accrue —
+	// checked ahead of privileges/existence, so an exhausted session runs nothing. A no-op when the
+	// budget is unlimited (the default). Transaction control (BEGIN/COMMIT/ROLLBACK) never reaches
+	// dispatch (handled earlier), so an exhausted session can still close out an open block.
+	if err := db.checkLifetimeAdmission(); err != nil {
+		return Outcome{}, err
+	}
 	// Authorization (spec/design/session.md §5.3): enforce the session's privilege envelope before the
 	// statement runs — DDL gated by allowDDL, DML by per-table/per-function privileges, all 42501.
 	// Skipped on a fully-permissive session (the default), so the common path pays nothing. The
@@ -3209,7 +3285,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	// row, with the indexed columns as the touched set (fixed-width — the chain/decompress
 	// terms are structurally zero). An empty table charges 0. The entries are computed
 	// here, against the pre-index store; the writes below are unmetered.
-	meter := NewMeterWithLimit(db.session.maxCost)
+	meter := db.session.newMeter()
 	mask := make([]bool, len(columns))
 	for _, c := range cols {
 		mask[c] = true
@@ -4052,7 +4128,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		if err != nil {
 			return Outcome{}, err
 		}
-		meter := NewMeterWithLimit(db.session.maxCost)
+		meter := db.session.newMeter()
 		if err := db.foldUncorrelatedInPlan(&plan, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
@@ -4202,7 +4278,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	// disposition plan's compression attempts for over-RECORD_MAX rows (value_compress) and the
 	// RETURNING projection. The meter is created here (before materialization) so a
 	// DEFAULT-keyword expression default charges it too.
-	meter := NewMeterWithLimit(db.session.maxCost)
+	meter := db.session.newMeter()
 
 	// Materialize each row into its value-position-indexed candidates (length arity, checked
 	// above) resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
@@ -5095,7 +5171,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	// per-row outer environment below (it pushes the current row, so `target.col` reads it). The
 	// uncorrelated execution reads the pre-DELETE snapshot (keys are collected before mutating).
 	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
-	meter := NewMeterWithLimit(db.session.maxCost)
+	meter := db.session.newMeter()
 	if filter != nil {
 		if err := db.foldUncorrelatedInRExpr(filter, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
@@ -5369,7 +5445,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	//
 	// Phase 1: build + validate every matching row's new values; no writes yet. Each scanned row,
 	// the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
-	meter := NewMeterWithLimit(db.session.maxCost)
+	meter := db.session.newMeter()
 	for i := range plans {
 		if err := db.foldUncorrelatedInRExpr(plans[i].source, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
@@ -6242,7 +6318,7 @@ func (db *Database) planValues(rows [][]*Expr, parent *scope, ctes []*cteBinding
 // caller's meter via execQueryPlan.
 func (db *Database) execValuesPlan(plan *valuesPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
-	meter := NewMeterWithLimit(db.session.maxCost)
+	meter := db.session.newMeter()
 	rows := make([][]Value, 0, len(plan.rows))
 	for _, row := range plan.rows {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -8311,7 +8387,7 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 
 func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
-	meter := NewMeterWithLimit(db.session.maxCost)
+	meter := db.session.newMeter()
 
 	// LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
 	// operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the

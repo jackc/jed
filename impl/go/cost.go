@@ -11,55 +11,91 @@ import "fmt"
 // evaluator / storage line charges which unit) are hand-written here and in executor.go;
 // only the weights are shared data. See spec/design/cost.md.
 //
-// Every unit routes through the single Charge chokepoint; the caller-set ceiling +
-// deterministic abort (spec/design/cost.md §6) is enforced by Guard, consulted at the
-// unbounded-work points (per scanned row, per produced row, per expression node, per
-// size-scaled decimal_work charge (immediately after it — cost.md §3), and per
-// aggregate fold) so a runaway query stops deterministically.
+// Every unit routes through the single Charge chokepoint, which enforces TWO independent
+// ceilings (Guard, consulted at the unbounded-work points — per scanned row, per produced
+// row, per expression node, per size-scaled decimal_work charge (immediately after it —
+// cost.md §3), and per aggregate fold):
+//
+//   - Per-statement max_cost → 54P01 (spec/design/cost.md §6): the statement's own accrued
+//     cost reaching the caller-set ceiling.
+//   - Per-session lifetime_max_cost → 54P02 (spec/design/session.md §5.4): the session's
+//     CUMULATIVE cost reaching the budget. The meter live-charges its units into the
+//     session's cumulative total (a shared *int64), so an aborted statement's partial cost
+//     counts automatically and the cumulative is session state that survives a rollback.
 
-// Meter accrues deterministic execution cost and enforces an optional ceiling (CLAUDE.md
-// §13). Threaded by pointer through the executor and the recursive expression evaluator;
-// the accrued total is reported on Outcome.
+// Meter accrues deterministic execution cost and enforces an optional per-statement ceiling
+// AND an optional per-session budget (CLAUDE.md §13; spec/design/session.md §5.4). Threaded by
+// pointer through the executor and the recursive expression evaluator; the accrued
+// (per-statement) total is reported on Outcome, while the session cumulative is updated live.
 type Meter struct {
-	// Accrued is the total cost so far (CLAUDE.md §13). i64 mirrors the engine's
-	// native integer; the ceiling compares against this same counter.
+	// Accrued is the total cost so far FOR THIS STATEMENT (CLAUDE.md §13) — the figure reported
+	// on Outcome and asserted by the `# cost:` directive. i64 mirrors the engine's native
+	// integer; the per-statement ceiling compares against this counter.
 	Accrued int64
-	// Limit is the caller-set cost ceiling, or 0 (the default) for unlimited. A positive
-	// value bounds an untrusted query: the instant accrued cost reaches it, the next Guard
-	// aborts with 54P01 (spec/design/cost.md §6). Carried from the handle's max_cost
+	// Limit is the caller-set per-statement cost ceiling, or 0 (the default) for unlimited. A
+	// positive value bounds an untrusted query: the instant accrued cost reaches it, the next
+	// Guard aborts with 54P01 (spec/design/cost.md §6). Carried from the session's max_cost
 	// setting (spec/design/api.md §8).
 	Limit int64
+	// lifetimeTotal points at the session's running CUMULATIVE cost (spec/design/session.md §5.4),
+	// or nil for a meter with no session context (the unit-test / build-meter path). When set,
+	// every Charge live-adds into it, so partial cost of an aborted statement counts.
+	lifetimeTotal *int64
+	// lifetimeLimit is the session's cumulative cost budget, or 0 for unlimited (track-only). When
+	// positive, Guard aborts 54P02 once *lifetimeTotal reaches it.
+	lifetimeLimit int64
 }
 
-// NewMeter returns a fresh meter with zero accrued cost and no ceiling.
+// NewMeter returns a fresh meter with zero accrued cost, no ceiling, and no session context.
 func NewMeter() *Meter {
 	return &Meter{}
 }
 
 // NewMeterWithLimit returns a fresh meter that aborts once accrued cost reaches limit
-// (limit <= 0 ⇒ unlimited). The ceiling is the handle's max_cost (spec/design/api.md §8).
+// (limit <= 0 ⇒ unlimited), with no session lifetime budget. The ceiling is the session's
+// max_cost (spec/design/api.md §8). Used where there is no session cumulative to thread.
 func NewMeterWithLimit(limit int64) *Meter {
 	return &Meter{Limit: limit}
 }
 
-// Charge adds units of cost. The single accrual chokepoint. Enforcement is NOT here:
-// Charge only accrues, so the cross-core accrual count (the `# cost:` contract) is
-// untouched; Guard does the comparison at the work loops.
+// Charge adds units of cost. The single accrual chokepoint. Accrues into both the per-statement
+// counter (the `# cost:` contract) AND — when a session lifetime budget is attached — the
+// session's cumulative total (live), so partial cost of an aborted statement counts. Enforcement
+// is NOT here: Guard does the comparisons at the work loops, so the cross-core accrual count is
+// untouched.
 func (m *Meter) Charge(units int64) {
 	m.Accrued += units
+	if m.lifetimeTotal != nil {
+		*m.lifetimeTotal += units
+	}
 }
 
-// Guard enforces the ceiling: it returns a 54P01 error if a ceiling is set and accrued
-// cost has REACHED it (CLAUDE.md §13 — "the instant accrued cost reaches it, execution
-// aborts"). Called at the unbounded-work points (the scan loop, the produce step, the
-// expression evaluator, the aggregate fold) — the same mirrored points in every core, so
-// the abort is deterministic and cross-core identical (spec/design/cost.md §6). A no-op
-// (one comparison) when unlimited, so it is free on the hot path by default.
+// Guard enforces the ceilings: it aborts if the per-statement max_cost (54P01) OR the session
+// lifetime_max_cost (54P02) has been REACHED (>=, CLAUDE.md §13 — "the instant accrued cost
+// reaches it, execution aborts"). When both are over, the one REACHED FIRST wins — the ceiling
+// crossed at the lower accrued value, i.e. the larger excess; an exact tie breaks to the
+// per-statement 54P01 (the inner gate). Called at the unbounded-work points — the same mirrored
+// points in every core, so the abort is deterministic and cross-core identical (spec/design/cost.md
+// §6, spec/design/session.md §5.4). A no-op (one or two comparisons) when both are unlimited.
 func (m *Meter) Guard() error {
-	if m.Limit > 0 && m.Accrued >= m.Limit {
-		return NewError(CostLimitExceeded, fmt.Sprintf(
-			"query exceeded the cost limit of %d (accrued %d)", m.Limit, m.Accrued,
+	stmtOver := m.Limit > 0 && m.Accrued >= m.Limit
+	lifeOver := m.lifetimeTotal != nil && m.lifetimeLimit > 0 && *m.lifetimeTotal >= m.lifetimeLimit
+	if !stmtOver && !lifeOver {
+		return nil
+	}
+	// Pick the ceiling reached first. Both counters grow in lockstep, so the one crossed at the
+	// lower accrued value has the larger excess by the time this guard fires; a tie breaks to the
+	// per-statement ceiling.
+	pickLife := lifeOver
+	if stmtOver && lifeOver {
+		pickLife = (*m.lifetimeTotal - m.lifetimeLimit) > (m.Accrued - m.Limit)
+	}
+	if pickLife {
+		return NewError(SessionCostLimitExceeded, fmt.Sprintf(
+			"session exceeded the lifetime cost limit of %d (accrued %d)", m.lifetimeLimit, *m.lifetimeTotal,
 		))
 	}
-	return nil
+	return NewError(CostLimitExceeded, fmt.Sprintf(
+		"query exceeded the cost limit of %d (accrued %d)", m.Limit, m.Accrued,
+	))
 }

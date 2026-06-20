@@ -153,6 +153,11 @@ const (
 	// max_cost ceiling and execution was aborted (CLAUDE.md §13; spec/design/cost.md §6).
 	// jed-specific (PostgreSQL has no execution-cost ceiling); class 54 program_limit_exceeded.
 	CostLimitExceeded
+	// SessionCostLimitExceeded is 54P02 — the session's cumulative execution cost reached the
+	// caller-set lifetime_max_cost budget and the in-flight statement was aborted, or a further
+	// statement was rejected at admission because the budget is already spent (spec/design/session.md
+	// §5.4). Sibling to 54P01 (which bounds one statement); jed-specific, class 54.
+	SessionCostLimitExceeded
 	// IoError is 58030 — an I/O error from the host file layer (spec/design/api.md §2).
 	IoError
 	// UndefinedFile is 58P01 — open of a database path that does not exist.
@@ -262,6 +267,8 @@ func (s SqlState) Code() string {
 		return "54001"
 	case CostLimitExceeded:
 		return "54P01"
+	case SessionCostLimitExceeded:
+		return "54P02"
 	case IoError:
 		return "58030"
 	case UndefinedFile:

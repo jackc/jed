@@ -154,6 +154,24 @@ func parseMaxCostDirective(line string) (int64, bool) {
 	return n, true
 }
 
+// parseLifetimeMaxCostDirective parses a `# lifetime_max_cost: N` directive line. Returns the
+// per-SESSION cumulative cost budget and true, or (0, false) if not one. Unlike `# max_cost:`
+// (per-record, reset after each record), this is STICKY: it sets the session budget for the rest of
+// the file (the cumulative cost builds across records on the one Database the file runs against), so
+// an ordered statement sequence can drive the session to its budget and assert the 54P02 abort —
+// what the per-record `# cost:` directive cannot express (spec/design/session.md §5.4).
+func parseLifetimeMaxCostDirective(line string) (int64, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "lifetime_max_cost:")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.ParseInt(strings.TrimSpace(rest), 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // parseMaxSQLLengthDirective parses a `# max_sql_length: N` directive line. Returns the per-handle
 // input-size limit (bytes) to run the next record under and true, or (0, false) if not one.
 // Mirrors `# max_cost:`: it lets a record set a small cap and assert that an over-long statement
@@ -411,6 +429,11 @@ func runFile(text string) error {
 			// is ignored.
 			if n, ok := parseCostDirective(line); ok {
 				pendingCost = &n
+			} else if n, ok := parseLifetimeMaxCostDirective(line); ok {
+				// Sticky (spec/design/session.md §5.4): apply immediately and persistently — the
+				// session cumulative builds across records, so a later record can assert the 54P02
+				// abort. Not a pending per-record directive (it must NOT reset between records).
+				db.SetLifetimeMaxCost(n)
 			} else if n, ok := parseMaxCostDirective(line); ok {
 				pendingMaxCost = &n
 			} else if n, ok := parseMaxSQLLengthDirective(line); ok {

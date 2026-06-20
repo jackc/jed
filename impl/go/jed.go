@@ -340,6 +340,11 @@ var SupportedCapabilities = []string{
 	// DDL gate — the single allow_ddl session capability governing CREATE/DROP/ALTER; a denied
 	// schema change is 42501. The # allow_ddl: directive sets it (session.md §5.3).
 	"session.allow_ddl",
+	// Session lifetime cost budget — a per-session cumulative cost budget lifetime_max_cost aborting
+	// the in-flight statement (and rejecting later ones at admission) with 54P02 once the session's
+	// running total reaches it; sibling to resource.cost_limit's per-statement 54P01. The sticky
+	// # lifetime_max_cost: directive sets the budget for the rest of the file (session.md §5.4).
+	"session.lifetime_cost",
 	// Phase 5 — explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes,
 	// failed-block poisoning (spec/design/transactions.md §4, grammar.md §27).
 	"txn.explicit",
