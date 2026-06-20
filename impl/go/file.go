@@ -131,7 +131,7 @@ func OpenWithOptions(path string, opts OpenOptions) (*Database, error) {
 	db.path = path
 	db.readOnly = opts.ReadOnly
 	if opts.WorkMem != 0 {
-		db.workMem = opts.WorkMem
+		db.session.workMem = opts.WorkMem
 	}
 	return db, nil
 }

@@ -3,7 +3,7 @@ package jed
 // Thread-safe shared database handle (CLAUDE.md §3, spec/design/transactions.md §8/§10).
 //
 // The single-handle *Database is fast and simple but not safe to share across goroutines: a read
-// and a write touch db.tx / db.committed without synchronization, so one *Database cannot serve a
+// and a write touch db.session.tx / db.committed without synchronization, so one *Database cannot serve a
 // reader goroutine and a writer goroutine at once (the race detector would flag it). Real
 // parallelism — many readers running concurrently with an in-flight writer, never blocking it or
 // each other — needs the committed state behind a goroutine-safe cell, decoupled from any single
@@ -96,7 +96,7 @@ func (s *SharedDB) Read() *ReadHandle {
 	s.core.liveMu.Unlock()
 	// Reads never mutate the snapshot (a write through the handle is rejected before dispatch), so
 	// the handle's Database shares the immutable pinned snapshot directly — no clone.
-	return &ReadHandle{core: s.core, version: snap.txid, db: &Database{committed: snap, pageSize: DefaultPageSize, maxSQLLength: DefaultMaxSQLLength}}
+	return &ReadHandle{core: s.core, version: snap.txid, db: &Database{committed: snap, pageSize: DefaultPageSize, session: newSession()}}
 }
 
 // Write opens the write handle (transactions.md §10). Blocks until no other writer is active
@@ -107,7 +107,7 @@ func (s *SharedDB) Write() *WriteHandle {
 	s.core.writeMu.Lock()
 	base := s.core.committed.Load()
 	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
-	db := &Database{committed: base, pageSize: DefaultPageSize, maxSQLLength: DefaultMaxSQLLength}
+	db := &Database{committed: base, pageSize: DefaultPageSize, session: newSession()}
 	_, _ = db.beginTx(true, true)
 	return &WriteHandle{core: s.core, db: db, baseVersion: base.txid}
 }
@@ -200,7 +200,7 @@ func (w *WriteHandle) Commit() error {
 	}
 	w.done = true
 	defer w.core.writeMu.Unlock()
-	failed := w.db.tx != nil && w.db.tx.failed
+	failed := w.db.session.tx != nil && w.db.session.tx.failed
 	if _, err := w.db.commitTx(); err != nil { // inner in-memory swap: db.committed := working
 		return err
 	}

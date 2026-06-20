@@ -526,9 +526,13 @@ func (s *Snapshot) findIndex(name string) (string, IndexDef, bool) {
 // Every write — autocommit included — runs as a transaction, which unifies the two paths.
 type Database struct {
 	committed *Snapshot
-	// tx is the open transaction, or nil under autocommit (transactions.md §4.1); a single-statement
-	// autocommit write opens one implicitly for its duration.
-	tx *activeTx
+	// session is the DEFAULT SESSION (spec/design/session.md §2.1): the per-connection state this
+	// handle runs statements through — the open transaction (the Idle/Open/Failed machine, §2.2),
+	// the relocated settings (maxCost/maxSQLLength/workMem, the entropy/clock seam), and the
+	// currval/lastval session state. A bare Database IS committed storage + this one long-lived
+	// stateful default session; the convenience methods operate on it. NewSession mints additional
+	// independent sessions (run sequentially on this single-threaded handle by swapping in here).
+	session Session
 	// path is the backing file (empty for an in-memory database). Set by the host API
 	// Open/Create (spec/design/api.md §2); Commit writes here.
 	path string
@@ -551,65 +555,122 @@ type Database struct {
 	// commit writes through it. nil for an in-memory database (persist is then a no-op); set by
 	// Open/Create, dropped by Close.
 	paging *sharedPaging
-	// maxCost is the caller-set execution-cost ceiling (CLAUDE.md §13; spec/design/api.md §8), or 0
-	// (the default) for unlimited. A positive value bounds every statement run on this handle: each
-	// statement's Meter is built with this limit and aborts with 54P01 the instant accrued cost
-	// reaches it. A handle setting (not stored in the file), set by SetMaxCost; the primary guard for
-	// safely evaluating untrusted, user-supplied queries.
-	maxCost int64
-	// maxSQLLength is the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
-	// §13; spec/design/api.md §8, cost.md §7). Default DefaultMaxSQLLength (1 MiB); 0 = unlimited
-	// (a trusted caller's opt-out). A statement whose text exceeds it is rejected with 54000 at
-	// the handle's parse entry — before lexing — so unbounded input cannot exhaust parse
-	// memory/CPU (the §13 input-size gate, which the cost meter cannot catch because parsing
-	// precedes metering). A handle setting (not stored in the file), set by SetMaxSQLLength.
-	maxSQLLength int
 	// readOnly marks a handle opened read-only (spec/design/api.md §2.1, OpenOptions.ReadOnly).
 	// A read-only handle behaves like PostgreSQL hot standby: every transaction defaults to READ
 	// ONLY, an explicit READ WRITE request and any write statement are 25006, and the file is
 	// opened without write access, so it is never written. Always false for an in-memory or
 	// normally-opened database.
 	readOnly bool
-	// workMem is the work-memory budget in bytes (spec/design/spill.md §2, api.md §2.1): the memory
-	// a single blocking operator (currently the ORDER BY external merge sort) may hold resident
-	// before it spills sorted runs to disk. A handle setting (not stored in the file), set by
-	// SetWorkMem; 0 means unlimited (never spill). It never changes what a query observes (results +
-	// cost are invariant — spill.md §6), only when an operator spills; an in-memory database ignores
-	// it (no file to spill to). Default DefaultWorkMem.
+}
+
+// SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
+// envelope subset landed in S1): the cost ceiling, the input-size limit, and the work-memory
+// budget. Passed to (*Database).NewSession. A zero MaxSQLLength or WorkMem takes its default at
+// construction (use the setter for the 0 ⇒ unlimited form); a zero MaxCost IS unlimited (the
+// genuine default). The entropy/clock seam is injected via Session.SetRandomSource/SetClockSource.
+type SessionOptions struct {
+	MaxCost      int64
+	MaxSQLLength int
+	WorkMem      int
+}
+
+// TxStatus is the session transaction status (spec/design/session.md §2.2) — PostgreSQL's three
+// connection states made explicit on the session, derived from the open transaction: no
+// transaction ⇒ Idle (autocommit); an open clean block ⇒ Open; an open block a statement aborted ⇒
+// Failed (only ROLLBACK/COMMIT accepted, everything else 25P02).
+type TxStatus int
+
+const (
+	TxIdle TxStatus = iota
+	TxOpen
+	TxFailed
+)
+
+func (s TxStatus) String() string {
+	switch s {
+	case TxOpen:
+		return "Open"
+	case TxFailed:
+		return "Failed"
+	default:
+		return "Idle"
+	}
+}
+
+func txStatusOf(tx *activeTx) TxStatus {
+	switch {
+	case tx == nil:
+		return TxIdle
+	case tx.failed:
+		return TxFailed
+	default:
+		return TxOpen
+	}
+}
+
+// Session is the per-connection SESSION state (spec/design/session.md §2.1): the configured,
+// stateful context a host runs statements through, un-fused from the committed storage on Database.
+// It owns the open transaction (the Idle/Open/Failed machine), the relocated handle settings, the
+// entropy/clock seam, and the currval/lastval session state. A Database holds one as its long-lived
+// default session; (*Database).NewSession mints additional independent ones that run sequentially
+// on a single-threaded handle (by swapping into the default slot for the duration of a call).
+type Session struct {
+	// tx is the open transaction, or nil under autocommit (transactions.md §4.1); a single-statement
+	// autocommit write opens one implicitly for its duration. The Idle/Open/Failed status (session.md
+	// §2.2) is derived from this (txStatusOf).
+	tx *activeTx
+	// maxCost is the execution-cost ceiling (CLAUDE.md §13; spec/design/api.md §8), or 0 for
+	// unlimited. Bounds every statement run on this session: its Meter aborts 54P01 the instant
+	// accrued cost reaches it. The primary guard for untrusted queries.
+	maxCost int64
+	// maxSQLLength is the maximum input SQL length in bytes (CLAUDE.md §13; cost.md §7); 0 =
+	// unlimited; default DefaultMaxSQLLength (1 MiB). Over-limit input is rejected 54000 at parse,
+	// before lexing.
+	maxSQLLength int
+	// workMem is the work-memory budget in bytes (spec/design/spill.md §2): the memory a blocking
+	// operator (the ORDER BY external merge sort) holds before it spills. 0 = unlimited; default
+	// DefaultWorkMem. Never changes what a query observes (spill.md §6); an in-memory database
+	// ignores it.
 	workMem int
-	// seam: the entropy + clock seam for the uuid generators (spec/design/entropy.md): two
-	// host-injectable functions (a random source + a clock), each nil ⇒ the platform primitive (OS
-	// CSPRNG per value / wall clock). Set via SetRandomSource / SetClockSource; tests inject the
-	// provided SeededRandomSource + FixedClock (the # seed: / # clock: directives) for exact
-	// cross-core output. A handle setting, not stored in the file.
+	// seam is the entropy + clock seam for the uuid generators / clock functions (entropy.md): two
+	// host-injectable functions (a random source + a clock), each nil ⇒ the platform primitive.
+	// Tests inject SeededRandomSource + FixedClock (the # seed: / # clock: directives) for
+	// byte-identical cross-core output.
 	seam Seam
-	// sessionSeq is the per-handle SESSION currval state (spec/design/sequences.md §6): the last
-	// value nextval/setval(…,true) produced IN THIS SESSION for each sequence (lowercased name). NOT
-	// part of the snapshot and NOT persisted — strictly session-local, as in PostgreSQL. Updated
-	// when a sequence-advancing statement succeeds (flushing pendingCurrval); currval of an unlisted
-	// sequence this session is 55000.
+	// sessionSeq is the SESSION currval state (sequences.md §6): the last value nextval/setval(…,true)
+	// produced IN THIS SESSION for each sequence (lowercased name). NOT in the snapshot, NOT persisted.
 	sessionSeq map[string]int64
-	// sessionLastName is the per-handle SESSION lastval state (spec/design/sequences.md §6): the
-	// lowercased NAME of the sequence the most recent nextval (of any sequence) ran on — "" before
-	// the first nextval. lastval() returns the CURRENT session value of that sequence (PG reads the
-	// last-used sequence's cached value), so a setval on that same sequence is reflected; a setval
-	// never changes which sequence this points to. 55000 when empty.
+	// sessionLastName is the SESSION lastval state (sequences.md §6): the lowercased name of the
+	// sequence the most recent nextval (of any sequence) ran on — "" before the first nextval.
 	sessionLastName string
-	// pendingSeq is the per-STATEMENT running sequence advances (spec/design/sequences.md §4): a
-	// nextval/setval records its advance here (seeded from the working snapshot on first touch), so
-	// later calls in the same statement see the running state. On statement success it is flushed
-	// into the working snapshot (so commit persists it); on error it is discarded (the transactional
-	// rollback of the advance, sequences.md §5). Cleared at the start of every statement.
+	// pendingSeq is the per-STATEMENT running sequence advances (sequences.md §4); flushed into the
+	// working snapshot on success, discarded on error (the transactional rollback of the advance, §5).
 	pendingSeq map[string]*SequenceDef
-	// pendingCurrval is the per-STATEMENT running currval updates (the names nextval/setval(…,true)
-	// touched → their produced value). Separate from pendingSeq because currval is updated by a
-	// subset of catalog mutations: setval(…,false) and ALTER … RESTART advance the counter without
-	// defining currval. Flushed into sessionSeq on statement success.
+	// pendingCurrval is the per-STATEMENT running currval updates → flushed into sessionSeq on success.
 	pendingCurrval map[string]int64
-	// pendingLastName is the per-STATEMENT running lastval update (the lowercased name of the most
-	// recent nextval this statement, "" if none). setval never sets it. Flushed into sessionLastName
-	// on success.
+	// pendingLastName is the per-STATEMENT running lastval update → flushed into sessionLastName.
 	pendingLastName string
+}
+
+// newSession builds a fresh default session: no open transaction, default settings, empty state.
+func newSession() Session {
+	return newSessionWithOptions(SessionOptions{})
+}
+
+// newSessionWithOptions builds a session configured from opts (spec/design/session.md §2.1). A zero
+// MaxSQLLength or WorkMem takes its default; the rest of the per-connection state starts empty.
+func newSessionWithOptions(opts SessionOptions) Session {
+	if opts.MaxSQLLength == 0 {
+		opts.MaxSQLLength = DefaultMaxSQLLength
+	}
+	if opts.WorkMem == 0 {
+		opts.WorkMem = DefaultWorkMem
+	}
+	return Session{
+		maxCost:      opts.MaxCost,
+		maxSQLLength: opts.MaxSQLLength,
+		workMem:      opts.WorkMem,
+	}
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
@@ -632,7 +693,7 @@ type activeTx struct {
 
 // NewDatabase builds an empty in-memory database.
 func NewDatabase() *Database {
-	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize, workMem: DefaultWorkMem, maxSQLLength: DefaultMaxSQLLength}
+	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize, session: newSession()}
 }
 
 // WithPageSize returns an in-memory handle that serializes at pageSize. The page-backed B-tree's
@@ -640,25 +701,25 @@ func NewDatabase() *Database {
 // the size it will serialize to — this builds fixtures / tests a non-default page size; a normal
 // in-memory database uses NewDatabase (the default page size).
 func WithPageSize(pageSize uint32) *Database {
-	return &Database{committed: newSnapshot(), pageSize: pageSize, workMem: DefaultWorkMem, maxSQLLength: DefaultMaxSQLLength}
+	return &Database{committed: newSnapshot(), pageSize: pageSize, session: newSession()}
 }
 
 // readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
 // writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
 func (db *Database) readSnap() *Snapshot {
-	if db.tx != nil {
-		return db.tx.working
+	if db.session.tx != nil {
+		return db.session.tx.working
 	}
 	return db.committed
 }
 
 // working is the snapshot a write mutates — the open transaction's working. A write only ever runs
 // with a transaction open (autocommit opens one implicitly), so tx is non-nil here.
-func (db *Database) working() *Snapshot { return db.tx.working }
+func (db *Database) working() *Snapshot { return db.session.tx.working }
 
 // InTransaction reports whether an explicit transaction block is currently open
 // (spec/design/transactions.md §4.2). False under autocommit. Used by the host Transaction surface.
-func (db *Database) InTransaction() bool { return db.tx != nil }
+func (db *Database) InTransaction() bool { return db.session.tx != nil }
 
 // Txid is the monotonic commit counter (spec/design/api.md §2): the committed snapshot's version.
 func (db *Database) Txid() uint64 { return db.committed.txid }
@@ -686,17 +747,17 @@ func (db *Database) Path() string { return db.path }
 // 54P01 the instant accrued cost reaches limit (spec/design/cost.md §6). limit <= 0 (the default)
 // is unlimited. The primary guard for safely evaluating untrusted, user-supplied queries; a handle
 // setting, not stored in the file.
-func (db *Database) SetMaxCost(limit int64) { db.maxCost = limit }
+func (db *Database) SetMaxCost(limit int64) { db.session.maxCost = limit }
 
 // SetMaxSQLLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
 // §13; spec/design/api.md §8). A statement whose text exceeds bytes is rejected with 54000 at
 // parse entry, before lexing — the §13 input-size gate (cost.md §7). 0 is unlimited (a trusted
 // caller's opt-out); the default is DefaultMaxSQLLength (1 MiB). A handle setting, not stored in
 // the file (mirrors SetMaxCost).
-func (db *Database) SetMaxSQLLength(bytes int) { db.maxSQLLength = bytes }
+func (db *Database) SetMaxSQLLength(bytes int) { db.session.maxSQLLength = bytes }
 
 // MaxSQLLength is the current input-SQL byte limit (0 = unlimited). See SetMaxSQLLength.
-func (db *Database) MaxSQLLength() int { return db.maxSQLLength }
+func (db *Database) MaxSQLLength() int { return db.session.maxSQLLength }
 
 // parse parses one statement from sql, first enforcing this handle's maxSQLLength input-size limit
 // (CLAUDE.md §13; spec/design/api.md §8, cost.md §7). The §13 input-size gate: an over-limit
@@ -706,8 +767,8 @@ func (db *Database) MaxSQLLength() int { return db.maxSQLLength }
 // Prepare/ExecuteSQL/the session handles), so the per-handle limit has no hole. The byte length is
 // len(sql) (Go strings are UTF-8).
 func (db *Database) parse(sql string) (Statement, error) {
-	if db.maxSQLLength > 0 && len(sql) > db.maxSQLLength {
-		return Statement{}, NewError(ProgramLimitExceeded, fmt.Sprintf("SQL statement exceeds the maximum length of %d bytes", db.maxSQLLength))
+	if db.session.maxSQLLength > 0 && len(sql) > db.session.maxSQLLength {
+		return Statement{}, NewError(ProgramLimitExceeded, fmt.Sprintf("SQL statement exceeds the maximum length of %d bytes", db.session.maxSQLLength))
 	}
 	return ParseSQL(sql)
 }
@@ -715,16 +776,16 @@ func (db *Database) parse(sql string) (Statement, error) {
 // SetRandomSource injects a random source for the uuid generators (spec/design/entropy.md §6) — the
 // deterministic / reproducible path. Pass SeededRandomSource for a byte-identical cross-core stream
 // (the conformance # seed: directive). ClearRandomSource returns to the OS CSPRNG, drawn per value.
-func (db *Database) SetRandomSource(f RandomSource) { db.seam.SetRandom(f) }
-func (db *Database) ClearRandomSource()             { db.seam.ClearRandom() }
+func (db *Database) SetRandomSource(f RandomSource) { db.session.seam.SetRandom(f) }
+func (db *Database) ClearRandomSource()             { db.session.seam.ClearRandom() }
 
 // SetClockSource injects a clock source for uuidv7 (entropy.md §6) — e.g. FixedClock (the # clock:
 // directive). ClearClockSource returns to the wall clock.
-func (db *Database) SetClockSource(f ClockSource) { db.seam.SetClock(f) }
-func (db *Database) ClearClockSource()            { db.seam.ClearClock() }
+func (db *Database) SetClockSource(f ClockSource) { db.session.seam.SetClock(f) }
+func (db *Database) ClearClockSource()            { db.session.seam.ClearClock() }
 
 // MaxCost is the current execution-cost ceiling (0 ⇒ unlimited). See SetMaxCost.
-func (db *Database) MaxCost() int64 { return db.maxCost }
+func (db *Database) MaxCost() int64 { return db.session.maxCost }
 
 // SetWorkMem sets the work-memory budget (in bytes) for blocking operators run on this handle
 // (spec/design/spill.md §3, api.md §2.1): the ORDER BY external merge sort holds at most roughly
@@ -732,10 +793,85 @@ func (db *Database) MaxCost() int64 { return db.maxCost }
 // spill). It never changes what a query observes (results + cost are invariant — spill.md §6), only
 // when an operator spills; an in-memory database ignores it. A handle setting, not stored in the
 // file (mirrors SetMaxCost).
-func (db *Database) SetWorkMem(bytes int) { db.workMem = bytes }
+func (db *Database) SetWorkMem(bytes int) { db.session.workMem = bytes }
 
 // WorkMem is the current work-memory budget in bytes (0 ⇒ unlimited). See SetWorkMem.
-func (db *Database) WorkMem() int { return db.workMem }
+func (db *Database) WorkMem() int { return db.session.workMem }
+
+// Status reports the DEFAULT session's transaction status (Idle/Open/Failed, spec/design/session.md
+// §2.2) — the explicit three-state machine the convenience methods drive.
+func (db *Database) Status() TxStatus { return txStatusOf(db.session.tx) }
+
+// NewSession mints an ADDITIONAL independent session over this database (spec/design/session.md
+// §2.1), configured from opts. The new session has its own settings, transaction status, and
+// sequence state; the committed storage is shared. On a single-threaded handle, additional sessions
+// run sequentially — a statement is issued through (*Session).ExecuteSQL/QuerySQL/View/Update, which
+// swaps the session into the active slot for the call. The bare Database keeps its long-lived
+// default session, so this is purely additive.
+func (db *Database) NewSession(opts SessionOptions) *Session {
+	s := newSessionWithOptions(opts)
+	return &s
+}
+
+// --- additional-session surface (spec/design/session.md §2.1): run sequentially via the swap ---
+
+// activate installs s as db's active session and returns the restore function — the swap that lets
+// an additional session run on a single-threaded handle. Use as `defer s.activate(db)()`: the swap
+// in happens immediately, the deferred restore runs at return (even on a panic).
+func (s *Session) activate(db *Database) func() {
+	db.session, *s = *s, db.session
+	return func() { db.session, *s = *s, db.session }
+}
+
+// ExecuteSQL runs a (possibly mutating) statement on this session against db, binding $N params.
+func (s *Session) ExecuteSQL(db *Database, sql string, params []Value) (Outcome, error) {
+	defer s.activate(db)()
+	return db.ExecuteSQL(sql, params)
+}
+
+// QuerySQL runs a query on this session against db, returning a row cursor.
+func (s *Session) QuerySQL(db *Database, sql string, params []Value) (*Rows, error) {
+	defer s.activate(db)()
+	return db.QuerySQL(sql, params)
+}
+
+// View runs fn in a READ ONLY transaction on this session (auto-commit/rollback, §2.2).
+func (s *Session) View(db *Database, fn func(tx *Transaction) error) error {
+	defer s.activate(db)()
+	return db.View(fn)
+}
+
+// Update runs fn in a READ WRITE transaction on this session (auto-commit/rollback, §2.2).
+func (s *Session) Update(db *Database, fn func(tx *Transaction) error) error {
+	defer s.activate(db)()
+	return db.Update(fn)
+}
+
+// Status reports this session's transaction status (Idle/Open/Failed, session.md §2.2).
+func (s *Session) Status() TxStatus { return txStatusOf(s.tx) }
+
+// InTransaction reports whether an explicit transaction block is open on this session.
+func (s *Session) InTransaction() bool { return s.tx != nil }
+
+// MaxCost / SetMaxCost — the per-statement execution-cost ceiling (0 ⇒ unlimited).
+func (s *Session) MaxCost() int64         { return s.maxCost }
+func (s *Session) SetMaxCost(limit int64) { s.maxCost = limit }
+
+// MaxSQLLength / SetMaxSQLLength — the input-SQL byte limit (0 ⇒ unlimited).
+func (s *Session) MaxSQLLength() int     { return s.maxSQLLength }
+func (s *Session) SetMaxSQLLength(b int) { s.maxSQLLength = b }
+
+// WorkMem / SetWorkMem — the work-memory budget in bytes (0 ⇒ unlimited).
+func (s *Session) WorkMem() int     { return s.workMem }
+func (s *Session) SetWorkMem(b int) { s.workMem = b }
+
+// SetRandomSource / ClearRandomSource — the uuid-generator entropy seam (entropy.md §6).
+func (s *Session) SetRandomSource(f RandomSource) { s.seam.SetRandom(f) }
+func (s *Session) ClearRandomSource()             { s.seam.ClearRandom() }
+
+// SetClockSource / ClearClockSource — the uuidv7 / clock-function clock seam (entropy.md §6).
+func (s *Session) SetClockSource(f ClockSource) { s.seam.SetClock(f) }
+func (s *Session) ClearClockSource()            { s.seam.ClearClock() }
 
 // ReadOnly reports whether this handle was opened read-only (spec/design/api.md §2.1): every
 // transaction defaults to READ ONLY, writes are 25006, and the file is never written.
@@ -811,27 +947,27 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 	}
 	// Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
 	// populated — it is discarded, not flushed, on error; sequences.md §5).
-	db.pendingSeq = nil
-	db.pendingCurrval = nil
-	db.pendingLastName = ""
+	db.session.pendingSeq = nil
+	db.session.pendingCurrval = nil
+	db.session.pendingLastName = ""
 
 	// Inside an explicit block?
-	if db.tx != nil {
-		if db.tx.failed {
+	if db.session.tx != nil {
+		if db.session.tx.failed {
 			return Outcome{}, NewError(InFailedSqlTransaction,
 				"current transaction is aborted, commands ignored until end of transaction block")
 		}
 		// Run the statement; ANY error aborts the block (it enters the failed state — §6).
 		var outcome Outcome
 		var err error
-		if stmtIsWrite(stmt) && !db.tx.writable {
+		if stmtIsWrite(stmt) && !db.session.tx.writable {
 			err = NewError(ReadOnlySqlTransaction,
 				"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 		} else {
 			outcome, err = db.dispatchStmt(stmt, params)
 		}
 		if err != nil {
-			db.tx.failed = true
+			db.session.tx.failed = true
 			return Outcome{}, err
 		}
 		// Land any nextval advances into the block's working snapshot; COMMIT publishes them,
@@ -854,13 +990,13 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 		return Outcome{}, NewError(ReadOnlySqlTransaction,
 			"cannot execute "+stmtKind(stmt)+" in a read-only transaction")
 	}
-	db.tx = db.newTx(true)
+	db.session.tx = db.newTx(true)
 	outcome, err := db.dispatchStmt(stmt, params)
 	if err != nil {
 		// The statement failed before any flush, so session state is untouched; restore from the
 		// captured copy anyway to keep the discard path uniform (sequences.md §6).
-		db.restoreSessionState(db.tx)
-		db.tx = nil
+		db.restoreSessionState(db.session.tx)
+		db.session.tx = nil
 		return Outcome{}, err
 	}
 	// Persist any nextval advances into the working snapshot before publishing it (sequences.md
@@ -881,7 +1017,7 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 // snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.go) and the catalog is shallow.
 // committed is untouched until commit.
 func (db *Database) beginTx(writable, modeSet bool) (Outcome, error) {
-	if db.tx != nil {
+	if db.session.tx != nil {
 		return Outcome{}, NewError(ActiveSqlTransaction, "there is already a transaction in progress")
 	}
 	if modeSet && writable && db.readOnly {
@@ -891,7 +1027,7 @@ func (db *Database) beginTx(writable, modeSet bool) (Outcome, error) {
 	if !modeSet {
 		writable = !db.readOnly
 	}
-	db.tx = db.newTx(writable)
+	db.session.tx = db.newTx(writable)
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
@@ -899,15 +1035,15 @@ func (db *Database) beginTx(writable, modeSet bool) (Outcome, error) {
 // currval/lastval session state so it can be restored if the transaction is discarded (the
 // rollback of any in-block nextval/setval session updates — spec/design/sequences.md §5/§6).
 func (db *Database) newTx(writable bool) *activeTx {
-	saved := make(map[string]int64, len(db.sessionSeq))
-	for k, v := range db.sessionSeq {
+	saved := make(map[string]int64, len(db.session.sessionSeq))
+	for k, v := range db.session.sessionSeq {
 		saved[k] = v
 	}
 	return &activeTx{
 		writable:             writable,
 		working:              db.committed.clone(),
 		savedSessionSeq:      saved,
-		savedSessionLastName: db.sessionLastName,
+		savedSessionLastName: db.session.sessionLastName,
 	}
 }
 
@@ -915,8 +1051,8 @@ func (db *Database) newTx(writable bool) *activeTx {
 // transaction's captured copy (spec/design/sequences.md §5/§6) — the rollback of any in-block
 // nextval/setval session updates. Called wherever a transaction is dropped without publishing.
 func (db *Database) restoreSessionState(tx *activeTx) {
-	db.sessionSeq = tx.savedSessionSeq
-	db.sessionLastName = tx.savedSessionLastName
+	db.session.sessionSeq = tx.savedSessionSeq
+	db.session.sessionLastName = tx.savedSessionLastName
 }
 
 // commitTx commits the current transaction (spec/design/transactions.md §4.2). With no open block
@@ -926,11 +1062,11 @@ func (db *Database) restoreSessionState(tx *activeTx) {
 // txid 0), make it durable (the single persist chokepoint, §9), then swap it in as committed. A
 // durable-write failure leaves committed untouched and propagates. Returns to autocommit.
 func (db *Database) commitTx() (Outcome, error) {
-	tx := db.tx
+	tx := db.session.tx
 	if tx == nil {
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 	}
-	db.tx = nil
+	db.session.tx = nil
 	if tx.failed || !tx.writable {
 		// A failed or read-only block publishes nothing — a failed COMMIT is a ROLLBACK (PG), so any
 		// in-block session updates revert with the discarded working set (§5/§6).
@@ -955,10 +1091,10 @@ func (db *Database) commitTx() (Outcome, error) {
 // session state, however, was updated in place by in-block nextval/setval, so it is restored from
 // the block's captured copy (sequences.md §5/§6).
 func (db *Database) rollbackTx() (Outcome, error) {
-	if db.tx != nil {
-		db.restoreSessionState(db.tx)
+	if db.session.tx != nil {
+		db.restoreSessionState(db.session.tx)
 	}
-	db.tx = nil
+	db.session.tx = nil
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
@@ -970,8 +1106,8 @@ func (db *Database) rollbackTx() (Outcome, error) {
 func (db *Database) seqNextval(name string) (int64, error) {
 	key := strings.ToLower(name)
 	var def SequenceDef
-	if db.pendingSeq != nil {
-		if d, ok := db.pendingSeq[key]; ok {
+	if db.session.pendingSeq != nil {
+		if d, ok := db.session.pendingSeq[key]; ok {
 			def = *d
 		} else if snapDef := db.readSnap().sequence(name); snapDef != nil {
 			def = *snapDef
@@ -1013,18 +1149,18 @@ func (db *Database) seqNextval(name string) (int64, error) {
 		def.LastValue = next
 		result = next
 	}
-	if db.pendingSeq == nil {
-		db.pendingSeq = make(map[string]*SequenceDef)
+	if db.session.pendingSeq == nil {
+		db.session.pendingSeq = make(map[string]*SequenceDef)
 	}
 	d := def
-	db.pendingSeq[key] = &d
+	db.session.pendingSeq[key] = &d
 	// nextval defines this session's currval for the sequence AND makes it the lastval target (the
 	// most-recent-nextval sequence; lastval then reads its current session value — §6).
-	if db.pendingCurrval == nil {
-		db.pendingCurrval = make(map[string]int64)
+	if db.session.pendingCurrval == nil {
+		db.session.pendingCurrval = make(map[string]int64)
 	}
-	db.pendingCurrval[key] = result
-	db.pendingLastName = key
+	db.session.pendingCurrval[key] = result
+	db.session.pendingLastName = key
 	return result, nil
 }
 
@@ -1036,7 +1172,7 @@ func (db *Database) seqNextval(name string) (int64, error) {
 func (db *Database) seqSetval(name string, n int64, isCalled bool) (int64, error) {
 	key := strings.ToLower(name)
 	var def SequenceDef
-	if d, ok := db.pendingSeq[key]; ok {
+	if d, ok := db.session.pendingSeq[key]; ok {
 		def = *d
 	} else if snapDef := db.readSnap().sequence(name); snapDef != nil {
 		def = *snapDef
@@ -1050,17 +1186,17 @@ func (db *Database) seqSetval(name string, n int64, isCalled bool) (int64, error
 	}
 	def.LastValue = n
 	def.IsCalled = isCalled
-	if db.pendingSeq == nil {
-		db.pendingSeq = make(map[string]*SequenceDef)
+	if db.session.pendingSeq == nil {
+		db.session.pendingSeq = make(map[string]*SequenceDef)
 	}
 	d := def
-	db.pendingSeq[key] = &d
+	db.session.pendingSeq[key] = &d
 	// currval is defined only when isCalled (PG do_setval: elm->last_valid set iff iscalled).
 	if isCalled {
-		if db.pendingCurrval == nil {
-			db.pendingCurrval = make(map[string]int64)
+		if db.session.pendingCurrval == nil {
+			db.session.pendingCurrval = make(map[string]int64)
 		}
-		db.pendingCurrval[key] = n
+		db.session.pendingCurrval[key] = n
 	}
 	return n, nil
 }
@@ -1074,10 +1210,10 @@ func (db *Database) seqCurrval(name string) (int64, error) {
 		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
 	}
 	key := strings.ToLower(name)
-	if v, ok := db.pendingCurrval[key]; ok {
+	if v, ok := db.session.pendingCurrval[key]; ok {
 		return v, nil
 	}
-	if v, ok := db.sessionSeq[key]; ok {
+	if v, ok := db.session.sessionSeq[key]; ok {
 		return v, nil
 	}
 	return 0, NewError(ObjectNotInPrerequisiteState,
@@ -1090,18 +1226,18 @@ func (db *Database) seqCurrval(name string) (int64, error) {
 // different sequence is not. Takes no name argument (no 42P01); 55000 before the first nextval. The
 // effective name and its value both honor the statement's running updates over the session state.
 func (db *Database) seqLastval() (int64, error) {
-	key := db.pendingLastName
+	key := db.session.pendingLastName
 	if key == "" {
-		key = db.sessionLastName
+		key = db.session.sessionLastName
 	}
 	if key == "" {
 		return 0, NewError(ObjectNotInPrerequisiteState,
 			"lastval is not yet defined in this session")
 	}
-	if v, ok := db.pendingCurrval[key]; ok {
+	if v, ok := db.session.pendingCurrval[key]; ok {
 		return v, nil
 	}
-	if v, ok := db.sessionSeq[key]; ok {
+	if v, ok := db.session.sessionSeq[key]; ok {
 		return v, nil
 	}
 	// A nextval always defines the sequence's session value, so a recorded last-name with no value
@@ -1116,21 +1252,21 @@ func (db *Database) seqLastval() (int64, error) {
 // transaction is open; a no-op when nothing advanced. On statement error the pending state is
 // instead discarded (cleared at the next statement), giving the transactional rollback (§5).
 func (db *Database) flushPendingSequences() {
-	for _, def := range db.pendingSeq {
+	for _, def := range db.session.pendingSeq {
 		db.working().putSequence(def)
 	}
-	if len(db.pendingCurrval) > 0 && db.sessionSeq == nil {
-		db.sessionSeq = make(map[string]int64)
+	if len(db.session.pendingCurrval) > 0 && db.session.sessionSeq == nil {
+		db.session.sessionSeq = make(map[string]int64)
 	}
-	for key, v := range db.pendingCurrval {
-		db.sessionSeq[key] = v
+	for key, v := range db.session.pendingCurrval {
+		db.session.sessionSeq[key] = v
 	}
-	if db.pendingLastName != "" {
-		db.sessionLastName = db.pendingLastName
+	if db.session.pendingLastName != "" {
+		db.session.sessionLastName = db.session.pendingLastName
 	}
-	db.pendingSeq = nil
-	db.pendingCurrval = nil
-	db.pendingLastName = ""
+	db.session.pendingSeq = nil
+	db.session.pendingCurrval = nil
+	db.session.pendingLastName = ""
 }
 
 // checkedAddInt64 adds a + b, reporting overflow=true (and an undefined sum) when the result does
@@ -2602,7 +2738,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	// row, with the indexed columns as the touched set (fixed-width — the chain/decompress
 	// terms are structurally zero). An empty table charges 0. The entries are computed
 	// here, against the pre-index store; the writes below are unmetered.
-	meter := NewMeterWithLimit(db.maxCost)
+	meter := NewMeterWithLimit(db.session.maxCost)
 	mask := make([]bool, len(columns))
 	for _, c := range cols {
 		mask[c] = true
@@ -3445,7 +3581,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		if err != nil {
 			return Outcome{}, err
 		}
-		meter := NewMeterWithLimit(db.maxCost)
+		meter := NewMeterWithLimit(db.session.maxCost)
 		if err := db.foldUncorrelatedInPlan(&plan, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
@@ -3595,7 +3731,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	// disposition plan's compression attempts for over-RECORD_MAX rows (value_compress) and the
 	// RETURNING projection. The meter is created here (before materialization) so a
 	// DEFAULT-keyword expression default charges it too.
-	meter := NewMeterWithLimit(db.maxCost)
+	meter := NewMeterWithLimit(db.session.maxCost)
 
 	// Materialize each row into its value-position-indexed candidates (length arity, checked
 	// above) resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
@@ -4488,7 +4624,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	// per-row outer environment below (it pushes the current row, so `target.col` reads it). The
 	// uncorrelated execution reads the pre-DELETE snapshot (keys are collected before mutating).
 	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
-	meter := NewMeterWithLimit(db.maxCost)
+	meter := NewMeterWithLimit(db.session.maxCost)
 	if filter != nil {
 		if err := db.foldUncorrelatedInRExpr(filter, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
@@ -4762,7 +4898,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	//
 	// Phase 1: build + validate every matching row's new values; no writes yet. Each scanned row,
 	// the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
-	meter := NewMeterWithLimit(db.maxCost)
+	meter := NewMeterWithLimit(db.session.maxCost)
 	for i := range plans {
 		if err := db.foldUncorrelatedInRExpr(plans[i].source, bound, cteCtx{}, &meter.Accrued); err != nil {
 			return Outcome{}, err
@@ -5635,7 +5771,7 @@ func (db *Database) planValues(rows [][]*Expr, parent *scope, ctes []*cteBinding
 // caller's meter via execQueryPlan.
 func (db *Database) execValuesPlan(plan *valuesPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
-	meter := NewMeterWithLimit(db.maxCost)
+	meter := NewMeterWithLimit(db.session.maxCost)
 	rows := make([][]Value, 0, len(plan.rows))
 	for _, row := range plan.rows {
 		if err := meter.Guard(); err != nil { // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -7552,7 +7688,7 @@ func (db *Database) newSorterFor(order []orderSlot) *sorter {
 	if db.paging != nil {
 		spillDir = filepath.Dir(db.path)
 	}
-	return newSorter(order, db.workMem, spillDir)
+	return newSorter(order, db.session.workMem, spillDir)
 }
 
 // rowsFromValues reinterprets a result-row slice ([][]Value) as a join-feed buffer ([]Row). Row is
@@ -7704,7 +7840,7 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 
 func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value, ctes cteCtx) (selectResult, error) {
 	env := &evalEnv{exec: db, params: params, outer: outer, rng: newStmtRng(), ctes: ctes}
-	meter := NewMeterWithLimit(db.maxCost)
+	meter := NewMeterWithLimit(db.session.maxCost)
 
 	// LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
 	// operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the
@@ -9645,7 +9781,7 @@ type evalEnv struct {
 	params []Value
 	outer  []Row
 	// The per-statement entropy+clock state (spec/design/entropy.md §5): the uuidv7 monotonic counter
-	// + the once-resolved statement clock. The injected random/clock functions live on exec.seam
+	// + the once-resolved statement clock. The injected random/clock functions live on exec.session.seam
 	// (handle-scoped); only the volatile uuid generators touch any of this.
 	rng *StmtRng
 	// ctes is the statement's CTE execution context (spec/design/cte.md §5), so a FROM reference at
@@ -15315,13 +15451,13 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		case sfUuidv4:
 			// uuid generators (spec/design/entropy.md §3): draw from the per-statement seam
 			// (env.rng), advancing the PRNG/counter. The NULL-arg case is handled above.
-			b, err := env.rng.uuidV4(&env.exec.seam)
+			b, err := env.rng.uuidV4(&env.exec.session.seam)
 			if err != nil {
 				return Value{}, err
 			}
 			return UuidValue(b), nil
 		case sfUuidv7:
-			clock := env.rng.statementClockMicros(&env.exec.seam)
+			clock := env.rng.statementClockMicros(&env.exec.session.seam)
 			shifted := clock
 			if len(vals) == 1 {
 				// The optional interval arg shifts the embedded instant via the existing
@@ -15332,7 +15468,7 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				}
 				shifted = s
 			}
-			b, err := env.rng.uuidV7(&env.exec.seam, shifted)
+			b, err := env.rng.uuidV7(&env.exec.session.seam, shifted)
 			if err != nil {
 				return Value{}, err
 			}
@@ -15341,9 +15477,9 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			// current-time functions (spec/design/entropy.md §5): now() reads the statement clock
 			// ONCE and reuses it (STABLE); clock_timestamp() reads the seam on every call
 			// (VOLATILE). Both return the seam's micros directly as timestamptz.
-			return TimestamptzValue(env.rng.statementClockMicros(&env.exec.seam)), nil
+			return TimestamptzValue(env.rng.statementClockMicros(&env.exec.session.seam)), nil
 		case sfClockTimestamp:
-			return TimestamptzValue(env.rng.clockNowMicros(&env.exec.seam)), nil
+			return TimestamptzValue(env.rng.clockNowMicros(&env.exec.session.seam)), nil
 		case sfNextval:
 			// Sequence value functions (spec/design/sequences.md §4/§6). nextval charges an
 			// additional sequence_advance unit (the catalog-tuple read+rewrite) and mutates the
