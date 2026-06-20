@@ -700,12 +700,140 @@ type ActiveTx = {
   savedSessionLastName: string | null;
 };
 
+// SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
+// envelope subset landed in S1): the cost ceiling, the input-size limit, and the work-memory budget.
+// Passed to (db.newSession). An absent field takes its default. The entropy/clock seam is injected
+// via Session.setRandomSource / setClockSource, not here.
+export type SessionOptions = {
+  maxCost?: bigint;
+  maxSqlLength?: number;
+  workMem?: number;
+};
+
+// TxStatus is the session transaction status (spec/design/session.md §2.2) — PostgreSQL's three
+// connection states made explicit on the session, derived from the open transaction: no transaction
+// ⇒ "Idle" (autocommit); an open clean block ⇒ "Open"; an open block a statement aborted ⇒ "Failed"
+// (only ROLLBACK/COMMIT accepted, everything else 25P02). A string union (the engine is the erasable
+// TS subset — no enum, CLAUDE.md §2).
+export type TxStatus = "Idle" | "Open" | "Failed";
+
+function txStatusOf(tx: ActiveTx | null): TxStatus {
+  if (tx === null) return "Idle";
+  return tx.failed ? "Failed" : "Open";
+}
+
+// Session is the per-connection SESSION state (spec/design/session.md §2.1): the configured, stateful
+// context a host runs statements through, un-fused from the committed storage on Database. It owns the
+// open transaction (the Idle/Open/Failed machine), the relocated handle settings, the entropy/clock
+// seam, and the currval/lastval session state. A Database holds one as its long-lived default session;
+// db.newSession mints additional independent ones that run sequentially on a single-threaded handle
+// (by swapping into the default slot for the duration of a call — TS objects swap by reference).
+export class Session {
+  // The open transaction, or null under autocommit (transactions.md §4.1); the Idle/Open/Failed
+  // status (session.md §2.2) is derived from this.
+  tx: ActiveTx | null;
+  // The execution-cost ceiling (CLAUDE.md §13; api.md §8), or 0n for unlimited. Bounds every statement
+  // run on this session: its Meter aborts 54P01 the instant accrued cost reaches it.
+  maxCost: bigint;
+  // The maximum input SQL length in bytes (CLAUDE.md §13; cost.md §7); 0 = unlimited; default
+  // DEFAULT_MAX_SQL_LENGTH. Over-limit input is rejected 54000 at parse, before lexing.
+  maxSqlLength: number;
+  // The work-memory budget in bytes (spec/design/spill.md §2): the memory a blocking operator holds
+  // before it spills. 0 = unlimited; default DEFAULT_WORK_MEM. Never changes what a query observes.
+  workMem: number;
+  // The entropy + clock seam for the uuid generators / clock functions (entropy.md): two
+  // host-injectable functions, each unset ⇒ the platform primitive. Tests inject seededRandomSource +
+  // fixedClock (the # seed: / # clock: directives) for byte-identical cross-core output.
+  seam: Seam;
+  // SESSION currval state (sequences.md §6): the last value nextval/setval(…,true) produced IN THIS
+  // SESSION for each sequence (lowercased name). NOT in the snapshot, NOT persisted.
+  sessionSeq: Map<string, bigint>;
+  // SESSION lastval state (sequences.md §6): the lowercased name of the sequence the most recent
+  // nextval ran on — null before the first nextval.
+  sessionLastName: string | null;
+  // Per-STATEMENT running sequence advances (sequences.md §4); flushed into the working snapshot on
+  // success, discarded on error (the transactional rollback of the advance, §5).
+  pendingSeq: Map<string, SequenceDef>;
+  // Per-STATEMENT running currval updates → flushed into sessionSeq on success.
+  pendingCurrval: Map<string, bigint>;
+  // Per-STATEMENT running lastval update → flushed into sessionLastName on success.
+  pendingLastName: string | null;
+
+  constructor(opts: SessionOptions = {}) {
+    this.tx = null;
+    this.maxCost = opts.maxCost ?? 0n;
+    this.maxSqlLength = opts.maxSqlLength ?? DEFAULT_MAX_SQL_LENGTH;
+    this.workMem = opts.workMem ?? DEFAULT_WORK_MEM;
+    this.seam = new Seam();
+    this.sessionSeq = new Map();
+    this.sessionLastName = null;
+    this.pendingSeq = new Map();
+    this.pendingCurrval = new Map();
+    this.pendingLastName = null;
+  }
+
+  // run installs this session as db's active session, runs fn, and restores the default — the swap
+  // that lets an additional session run on a single-threaded handle (spec/design/session.md §2.1).
+  // TS swaps by reference (no value copy); the default is restored even if fn throws.
+  private run<T>(db: Database, fn: () => T): T {
+    const saved = db.session;
+    db.session = this;
+    try {
+      return fn();
+    } finally {
+      db.session = saved;
+    }
+  }
+
+  // execute runs a (possibly mutating) statement on this session against db, binding $N params. A
+  // SELECT returns the query Outcome (with its rows). Transactions are driven via SQL BEGIN/COMMIT
+  // through execute; the view/update closure sugar (Rust/Go) is a TS follow-on (it would import the
+  // api.ts Transaction, a module cycle the executor avoids).
+  execute(db: Database, sql: string, params: Value[] = []): Outcome {
+    return this.run(db, () => db.executeStmtParams(db.parse(sql), params));
+  }
+
+  // status is this session's transaction status (Idle/Open/Failed, session.md §2.2).
+  status(): TxStatus {
+    return txStatusOf(this.tx);
+  }
+  // inTransaction reports whether an explicit transaction block is open on this session.
+  inTransaction(): boolean {
+    return this.tx !== null;
+  }
+  setMaxCost(limit: bigint): void {
+    this.maxCost = limit;
+  }
+  setMaxSqlLength(bytes: number): void {
+    this.maxSqlLength = bytes;
+  }
+  setWorkMem(bytes: number): void {
+    this.workMem = bytes;
+  }
+  setRandomSource(f: RandomFill): void {
+    this.seam.randomFill = f;
+  }
+  clearRandomSource(): void {
+    this.seam.randomFill = undefined;
+  }
+  setClockSource(f: ClockFunc): void {
+    this.seam.clock = f;
+  }
+  clearClockSource(): void {
+    this.seam.clock = undefined;
+  }
+}
+
 export class Database {
   // The last committed, immutable state — what fresh readers (and autocommit reads) see.
   committed: Snapshot;
-  // The open transaction, or null under autocommit (transactions.md §4.1/§4.2); a single-statement
-  // autocommit write opens one implicitly for its duration.
-  tx: ActiveTx | null;
+  // The DEFAULT SESSION (spec/design/session.md §2.1): the per-connection state this handle runs
+  // statements through — the open transaction (the Idle/Open/Failed machine, §2.2), the relocated
+  // settings (maxCost/maxSqlLength/workMem, the entropy/clock seam), and the currval/lastval session
+  // state. A bare Database IS committed storage + this one long-lived stateful default session; the
+  // convenience methods operate on it. newSession mints additional independent sessions (run
+  // sequentially on this single-threaded handle by swapping into this slot for a call).
+  session: Session;
   // Persistence identity (spec/design/api.md §2): the backing file path (null for in-memory) and
   // the page size this database serializes with. The commit counter lives in `committed.txid`.
   path: string | null;
@@ -733,92 +861,30 @@ export class Database {
   // writes through it. null for an in-memory database (persistHook is then null too); set by file.ts
   // open/create, dropped by close. A type-only import keeps the executor free of a file-module dependency.
   paging: SharedPaging | null;
-  // maxCost is the caller-set execution-cost ceiling (CLAUDE.md §13; spec/design/api.md §8), or 0n
-  // (the default) for unlimited. A positive value bounds every statement run on this handle: each
-  // statement's Meter is built with this limit and aborts with 54P01 the instant accrued cost reaches
-  // it. A handle setting (not stored in the file), set by setMaxCost; the primary guard for safely
-  // evaluating untrusted, user-supplied queries.
-  maxCost: bigint;
-  // maxSqlLength is the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md §13;
-  // spec/design/api.md §8, cost.md §7). Default DEFAULT_MAX_SQL_LENGTH (1 MiB); 0 = unlimited (a
-  // trusted caller's opt-out). A statement whose text exceeds it is rejected with 54000 at the
-  // handle's parse entry — before lexing — so unbounded input cannot exhaust parse memory/CPU (the
-  // §13 input-size gate, which the cost meter cannot catch because parsing precedes metering). A
-  // handle setting (not stored in the file), set by setMaxSqlLength.
-  maxSqlLength: number;
   // readOnly marks a handle opened read-only (spec/design/api.md §2.1, OpenOptions.readOnly). A
   // read-only handle behaves like PostgreSQL hot standby: every transaction defaults to READ ONLY,
   // an explicit READ WRITE request and any write statement are 25006, and the file is opened
   // without write access, so it is never written. Always false for an in-memory or
   // normally-opened database.
   readOnly: boolean;
-  // workMem is the work-memory budget in bytes (spec/design/spill.md §2, api.md §2.1): the memory a
-  // single blocking operator (currently the ORDER BY external merge sort) may hold resident before it
-  // spills sorted runs to disk. A handle setting (not stored in the file), set by setWorkMem; 0 means
-  // unlimited (never spill). It never changes what a query observes (results + cost are invariant —
-  // spill.md §6), only when an operator spills; an in-memory database ignores it. Default
-  // DEFAULT_WORK_MEM.
-  workMem: number;
   // spillSink is the host backing for the ORDER BY external merge sort's spilled runs (spec/design/
   // spill.md §4): set by a durable host that can spill to disk (file.ts → FileSpillSink), null for an
   // in-memory or OPFS database (which never spills — sorts stay resident, spill.md §2). A type-only
   // import keeps the executor free of any node:* dependency (the Node `fs` impl lives in spillfile.ts),
   // so the engine runs in a browser bundle (the OPFS host).
   spillSink: SpillSink | null;
-  // seam: the entropy + clock seam for the uuid generators (spec/design/entropy.md): two
-  // host-injectable functions (a random source + a clock), each unset ⇒ the platform primitive (OS
-  // CSPRNG per value / wall clock). Set via setRandomSource / setClockSource; tests inject the
-  // provided seededRandomSource + fixedClock (the # seed: / # clock: directives) for exact
-  // cross-core output. A handle setting, not stored in the file.
-  seam: Seam;
-  // sessionSeq is per-handle SESSION currval state (spec/design/sequences.md §6): the last value
-  // nextval/setval(…,true) produced IN THIS SESSION for each sequence (lowercased name). NOT part of
-  // the snapshot and NOT persisted — strictly session-local, as in PostgreSQL. Updated when a
-  // sequence-advancing statement succeeds (flushing pendingCurrval); currval of an unlisted sequence
-  // this session is 55000.
-  sessionSeq: Map<string, bigint>;
-  // sessionLastName is per-handle SESSION lastval state (spec/design/sequences.md §6): the lowercased
-  // NAME of the sequence the most recent nextval (of any sequence) ran on — null before the first
-  // nextval. lastval() returns the CURRENT session value of that sequence (PG reads the last-used
-  // sequence's cached value), so a setval on that same sequence is reflected; a setval never changes
-  // which sequence this points to. 55000 when null.
-  sessionLastName: string | null;
-  // pendingSeq is per-STATEMENT running sequence advances (spec/design/sequences.md §4): a
-  // nextval/setval records its advance here (seeded from the working snapshot on first touch), and
-  // later calls in the same statement see the running state. On statement success it is flushed into
-  // the working snapshot (so commit persists it); on error it is discarded (the transactional
-  // rollback of the advance, sequences.md §5). Cleared at the start of every statement.
-  pendingSeq: Map<string, SequenceDef>;
-  // pendingCurrval is per-STATEMENT running currval updates (the names nextval/setval(…,true) touched
-  // → their produced value). Separate from pendingSeq because currval is updated by a subset of
-  // catalog mutations: setval(…,false) and ALTER … RESTART advance the counter without defining
-  // currval. Flushed into sessionSeq on statement success.
-  pendingCurrval: Map<string, bigint>;
-  // pendingLastName is per-STATEMENT running lastval update (the lowercased name of the most recent
-  // nextval this statement, null if none). setval never sets it. Flushed into sessionLastName on
-  // success.
-  pendingLastName: string | null;
 
   constructor() {
     this.committed = new Snapshot();
-    this.tx = null;
+    this.session = new Session();
     this.path = null;
     this.pageSize = DEFAULT_PAGE_SIZE;
     this.pageCount = 0;
     this.freePages = [];
     this.persistHook = null;
     this.paging = null;
-    this.maxCost = 0n;
-    this.maxSqlLength = DEFAULT_MAX_SQL_LENGTH;
     this.readOnly = false;
-    this.workMem = DEFAULT_WORK_MEM;
     this.spillSink = null;
-    this.seam = new Seam();
-    this.sessionSeq = new Map();
-    this.sessionLastName = null;
-    this.pendingSeq = new Map();
-    this.pendingCurrval = new Map();
-    this.pendingLastName = null;
   }
 
   // setMaxCost sets the execution-cost ceiling for statements run on this handle (CLAUDE.md §13;
@@ -827,7 +893,7 @@ export class Database {
   // unlimited. The primary guard for safely evaluating untrusted, user-supplied queries; a handle
   // setting, not stored in the file.
   setMaxCost(limit: bigint): void {
-    this.maxCost = limit;
+    this.session.maxCost = limit;
   }
 
   // setMaxSqlLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
@@ -836,7 +902,7 @@ export class Database {
   // caller's opt-out); the default is DEFAULT_MAX_SQL_LENGTH (1 MiB). A handle setting, not stored
   // in the file (mirrors setMaxCost).
   setMaxSqlLength(bytes: number): void {
-    this.maxSqlLength = bytes;
+    this.session.maxSqlLength = bytes;
   }
 
   // parse parses one statement from sql, first enforcing this handle's maxSqlLength input-size limit
@@ -848,7 +914,7 @@ export class Database {
   // byte count, matching Rust/Go's byte-length idiom for cross-core identity (§8) — a JS UTF-16
   // .length would diverge on multi-byte input.
   parse(sql: string): Statement {
-    const max = this.maxSqlLength;
+    const max = this.session.maxSqlLength;
     // Fast reject without encoding: a string's UTF-8 byte length is always >= its UTF-16 .length,
     // so if even the UTF-16 length exceeds the cap the statement is over-limit. Otherwise measure
     // the exact UTF-8 byte length (then bounded by the cap, so the encode is bounded).
@@ -866,21 +932,21 @@ export class Database {
   // stream (the conformance # seed: directive). clearRandomSource returns to the OS CSPRNG, drawn
   // per value (production — unpredictable output).
   setRandomSource(f: RandomFill): void {
-    this.seam.randomFill = f;
+    this.session.seam.randomFill = f;
   }
 
   clearRandomSource(): void {
-    this.seam.randomFill = undefined;
+    this.session.seam.randomFill = undefined;
   }
 
   // setClockSource injects a clock source for uuidv7 (entropy.md §6) — e.g. fixedClock (the # clock:
   // directive). clearClockSource returns to the wall clock.
   setClockSource(f: ClockFunc): void {
-    this.seam.clock = f;
+    this.session.seam.clock = f;
   }
 
   clearClockSource(): void {
-    this.seam.clock = undefined;
+    this.session.seam.clock = undefined;
   }
 
   // setWorkMem sets the work-memory budget (in bytes) for blocking operators run on this handle
@@ -890,19 +956,19 @@ export class Database {
   // only when an operator spills; an in-memory database ignores it. A handle setting, not stored in
   // the file (mirrors setMaxCost).
   setWorkMem(bytes: number): void {
-    this.workMem = bytes;
+    this.session.workMem = bytes;
   }
 
   // readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
   // writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
   private readSnap(): Snapshot {
-    return this.tx !== null ? this.tx.working : this.committed;
+    return this.session.tx !== null ? this.session.tx.working : this.committed;
   }
 
   // working is the snapshot a write mutates — the open transaction's working. A write only ever
   // runs with a transaction open (autocommit opens one implicitly), so tx is non-null here.
   private working(): Snapshot {
-    return this.tx!.working;
+    return this.session.tx!.working;
   }
 
   // seqNextval is nextval('name') (spec/design/sequences.md §4): advance the named sequence and
@@ -912,7 +978,7 @@ export class Database {
   // CYCLE is 2200H.
   seqNextval(name: string): bigint {
     const key = name.toLowerCase();
-    let def = this.pendingSeq.get(key);
+    let def = this.session.pendingSeq.get(key);
     if (def === undefined) {
       const committed = this.readSnap().sequence(name);
       if (committed === undefined) {
@@ -950,11 +1016,11 @@ export class Database {
       def.lastValue = next;
       result = next;
     }
-    this.pendingSeq.set(key, def);
+    this.session.pendingSeq.set(key, def);
     // nextval defines this session's currval for the sequence AND makes it the lastval target (the
     // most-recent-nextval sequence; lastval then reads its current session value — §6).
-    this.pendingCurrval.set(key, result);
-    this.pendingLastName = key;
+    this.session.pendingCurrval.set(key, result);
+    this.session.pendingLastName = key;
     return result;
   }
 
@@ -965,7 +1031,7 @@ export class Database {
   // untouched). setval never updates lastval (PG — §6).
   seqSetval(name: string, n: bigint, isCalled: boolean): bigint {
     const key = name.toLowerCase();
-    let def = this.pendingSeq.get(key);
+    let def = this.session.pendingSeq.get(key);
     if (def === undefined) {
       const committed = this.readSnap().sequence(name);
       if (committed === undefined) {
@@ -986,9 +1052,9 @@ export class Database {
     }
     def.lastValue = n;
     def.isCalled = isCalled;
-    this.pendingSeq.set(key, def);
+    this.session.pendingSeq.set(key, def);
     // currval is defined only when isCalled (PG do_setval: elm->last_valid set iff iscalled).
-    if (isCalled) this.pendingCurrval.set(key, n);
+    if (isCalled) this.session.pendingCurrval.set(key, n);
     return n;
   }
 
@@ -998,16 +1064,16 @@ export class Database {
   // different sequence is not. Takes no name argument (no 42P01); 55000 before the first nextval. The
   // effective name and its value both honor the statement's running updates over the session state.
   seqLastval(): bigint {
-    const key = this.pendingLastName ?? this.sessionLastName;
+    const key = this.session.pendingLastName ?? this.session.sessionLastName;
     if (key === null) {
       throw engineError(
         "object_not_in_prerequisite_state",
         "lastval is not yet defined in this session",
       );
     }
-    const pending = this.pendingCurrval.get(key);
+    const pending = this.session.pendingCurrval.get(key);
     if (pending !== undefined) return pending;
-    const v = this.sessionSeq.get(key);
+    const v = this.session.sessionSeq.get(key);
     if (v !== undefined) return v;
     // A nextval always defines the sequence's session value, so a recorded last-name with no value is
     // unreachable; fall back to 55000 defensively rather than returning a wrong value.
@@ -1026,9 +1092,9 @@ export class Database {
       throw engineError("undefined_table", `relation does not exist: ${name}`);
     }
     const key = name.toLowerCase();
-    const pending = this.pendingCurrval.get(key);
+    const pending = this.session.pendingCurrval.get(key);
     if (pending !== undefined) return pending;
-    const v = this.sessionSeq.get(key);
+    const v = this.session.sessionSeq.get(key);
     if (v !== undefined) return v;
     throw engineError(
       "object_not_in_prerequisite_state",
@@ -1043,26 +1109,26 @@ export class Database {
   // the pending state is instead discarded (cleared at the next statement), giving the transactional
   // rollback of the advance (sequences.md §5).
   private flushPendingSequences(): void {
-    for (const def of this.pendingSeq.values()) {
+    for (const def of this.session.pendingSeq.values()) {
       this.working().putSequence(def);
     }
-    for (const [key, v] of this.pendingCurrval) {
-      this.sessionSeq.set(key, v);
+    for (const [key, v] of this.session.pendingCurrval) {
+      this.session.sessionSeq.set(key, v);
     }
-    if (this.pendingLastName !== null) {
-      this.sessionLastName = this.pendingLastName;
+    if (this.session.pendingLastName !== null) {
+      this.session.sessionLastName = this.session.pendingLastName;
     }
-    this.pendingSeq.clear();
-    this.pendingCurrval.clear();
-    this.pendingLastName = null;
+    this.session.pendingSeq.clear();
+    this.session.pendingCurrval.clear();
+    this.session.pendingLastName = null;
   }
 
   // restoreSessionState restores the handle's currval/lastval session state from a discarded
   // transaction's captured copy (spec/design/sequences.md §5/§6) — the rollback of any in-block
   // nextval/setval session updates. Called wherever a transaction is dropped without publishing.
   private restoreSessionState(tx: ActiveTx): void {
-    this.sessionSeq = tx.savedSessionSeq;
-    this.sessionLastName = tx.savedSessionLastName;
+    this.session.sessionSeq = tx.savedSessionSeq;
+    this.session.sessionLastName = tx.savedSessionLastName;
   }
 
   // newTx opens a transaction over a clone of the committed snapshot, capturing the handle's
@@ -1073,8 +1139,8 @@ export class Database {
       writable,
       failed: false,
       working: this.committed.clone(),
-      savedSessionSeq: new Map(this.sessionSeq),
-      savedSessionLastName: this.sessionLastName,
+      savedSessionSeq: new Map(this.session.sessionSeq),
+      savedSessionLastName: this.session.sessionLastName,
     };
   }
 
@@ -1090,10 +1156,26 @@ export class Database {
     return this.committed.txid;
   }
 
-  // inTransaction reports whether an explicit transaction block is currently open
-  // (spec/design/transactions.md §4.2). False under autocommit. Used by the host Transaction surface.
+  // inTransaction reports whether an explicit transaction block is currently open on the DEFAULT
+  // session (spec/design/transactions.md §4.2). False under autocommit. Used by the host Transaction
+  // surface.
   inTransaction(): boolean {
-    return this.tx !== null;
+    return this.session.tx !== null;
+  }
+
+  // status reports the DEFAULT session's transaction status (Idle/Open/Failed, spec/design/session.md
+  // §2.2) — the explicit three-state machine the convenience methods drive.
+  status(): TxStatus {
+    return txStatusOf(this.session.tx);
+  }
+
+  // newSession mints an ADDITIONAL independent session over this database (spec/design/session.md
+  // §2.1), configured from opts. The new session has its own settings, transaction status, and
+  // sequence state; the committed storage is shared. On a single-threaded handle, additional sessions
+  // run sequentially — a statement is issued through Session.execute, which swaps the session into the
+  // active slot for the call. The bare Database keeps its long-lived default session.
+  newSession(opts: SessionOptions = {}): Session {
+    return new Session(opts);
   }
 
   // table looks up a table definition by name (case-insensitive) in the visible snapshot.
@@ -1165,12 +1247,12 @@ export class Database {
     }
     // Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
     // populated — it is discarded, not flushed, on error; sequences.md §5).
-    this.pendingSeq.clear();
-    this.pendingCurrval.clear();
-    this.pendingLastName = null;
+    this.session.pendingSeq.clear();
+    this.session.pendingCurrval.clear();
+    this.session.pendingLastName = null;
 
     // Inside an explicit block?
-    const tx = this.tx;
+    const tx = this.session.tx;
     if (tx !== null) {
       if (tx.failed) {
         throw engineError(
@@ -1213,15 +1295,15 @@ export class Database {
         "cannot execute " + stmtKind(stmt) + " in a read-only transaction",
       );
     }
-    this.tx = this.newTx(true);
+    this.session.tx = this.newTx(true);
     let outcome: Outcome;
     try {
       outcome = this.dispatchStmt(stmt, params);
     } catch (e) {
       // The statement failed before any flush, so session state is untouched; restore from the
       // captured copy anyway to keep the discard path uniform (sequences.md §6).
-      this.restoreSessionState(this.tx);
-      this.tx = null;
+      this.restoreSessionState(this.session.tx);
+      this.session.tx = null;
       throw e;
     }
     // Persist any nextval advances into the working snapshot before publishing it (sequences.md §5);
@@ -1240,7 +1322,7 @@ export class Database {
   // persistent stores clone O(1) (pmap.ts) and the catalog is shallow. committed is untouched
   // until commit.
   beginTx(writable: boolean | null): Outcome {
-    if (this.tx !== null) {
+    if (this.session.tx !== null) {
       throw engineError(
         "active_sql_transaction",
         "there is already a transaction in progress",
@@ -1252,7 +1334,7 @@ export class Database {
         "cannot set transaction read-write mode on a read-only database",
       );
     }
-    this.tx = this.newTx(writable ?? !this.readOnly);
+    this.session.tx = this.newTx(writable ?? !this.readOnly);
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -1264,9 +1346,9 @@ export class Database {
   // persistHook, §9), then swap it in as committed. A durable-write failure leaves committed untouched
   // and rethrows. Returns to autocommit.
   commitTx(): Outcome {
-    const tx = this.tx;
+    const tx = this.session.tx;
     if (tx === null) return { kind: "statement", cost: 0n, rowsAffected: null };
-    this.tx = null;
+    this.session.tx = null;
     if (tx.failed || !tx.writable) {
       // A failed or read-only block publishes nothing — a failed COMMIT is a ROLLBACK (PG), so any
       // in-block session updates revert with the discarded working set (§5/§6).
@@ -1295,8 +1377,8 @@ export class Database {
   // session state, however, was updated in place by in-block nextval/setval, so it is restored from
   // the block's captured copy (sequences.md §5/§6).
   rollbackTx(): Outcome {
-    if (this.tx !== null) this.restoreSessionState(this.tx);
-    this.tx = null;
+    if (this.session.tx !== null) this.restoreSessionState(this.session.tx);
+    this.session.tx = null;
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -2170,7 +2252,7 @@ export class Database {
       params: [],
       outer: [],
       runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
-      seam: this.seam,
+      seam: this.session.seam,
       rng,
       ctes: EMPTY_CTE_CTX,
       exec: this,
@@ -2405,7 +2487,7 @@ export class Database {
     // row, with the indexed columns as the touched set (fixed-width — the chain/decompress
     // terms are structurally zero). An empty table charges 0. The entries are computed
     // here, against the pre-index store; the writes below are unmetered.
-    const meter = new Meter(this.maxCost);
+    const meter = new Meter(this.session.maxCost);
     const mask = columns.map(() => false);
     for (const c of cols) mask[c] = true;
     const def: IndexDef = { name, columns: cols, unique: ci.unique, kind };
@@ -3008,7 +3090,7 @@ export class Database {
           ? this.resolveOnConflict(table, ins.onConflict, ptypes)
           : null;
       const bound = bindParams(params, ptypes.finalize());
-      const meter = new Meter(this.maxCost);
+      const meter = new Meter(this.session.maxCost);
       const foldCost = { value: 0n };
       this.foldUncorrelatedInPlan(plan, bound, EMPTY_CTE_CTX, foldCost);
       // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
@@ -3156,7 +3238,7 @@ export class Database {
     // disposition plan's compression attempts for over-RECORD_MAX rows (value_compress) and the
     // RETURNING projection. The meter is created here (before materialization) so a
     // DEFAULT-keyword expression default charges it too.
-    const meter = new Meter(this.maxCost);
+    const meter = new Meter(this.session.maxCost);
 
     // Materialize each row into its value-position-indexed candidates (length arity, checked
     // above), resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
@@ -3284,7 +3366,7 @@ export class Database {
           params: [],
           outer: [],
           runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
-          seam: this.seam,
+          seam: this.session.seam,
           rng,
           ctes: EMPTY_CTE_CTX,
           exec: this,
@@ -3686,7 +3768,7 @@ export class Database {
       params: [],
       outer: [],
       runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
-      seam: this.seam,
+      seam: this.session.seam,
       rng,
       ctes: EMPTY_CTE_CTX,
       exec: this,
@@ -3783,7 +3865,7 @@ export class Database {
         params,
         outer: [],
         runSubquery: (p, o) => this.execQueryPlan(p, o, params, EMPTY_CTE_CTX),
-        seam: this.seam,
+        seam: this.session.seam,
         rng,
         ctes: EMPTY_CTE_CTX,
         exec: this,
@@ -4068,7 +4150,7 @@ export class Database {
       params,
       outer: [],
       runSubquery: (p, o) => this.execQueryPlan(p, o, params, EMPTY_CTE_CTX),
-      seam: this.seam,
+      seam: this.session.seam,
       rng: new StmtRng(),
       ctes: EMPTY_CTE_CTX,
       exec: this,
@@ -4115,7 +4197,7 @@ export class Database {
     // per-row outer environment below (it pushes the current row, so `target.col` reads it). The
     // uncorrelated execution reads the pre-DELETE snapshot (keys are collected before mutating).
     // Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
-    const meter = new Meter(this.maxCost);
+    const meter = new Meter(this.session.maxCost);
     if (filter !== null) {
       const cost = { value: 0n };
       filter = this.foldUncorrelatedInRExpr(filter, bound, EMPTY_CTE_CTX, cost);
@@ -4134,7 +4216,7 @@ export class Database {
       params: bound,
       outer: [],
       runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
-      seam: this.seam,
+      seam: this.session.seam,
       rng: new StmtRng(),
       ctes: EMPTY_CTE_CTX,
       exec: this,
@@ -4412,7 +4494,7 @@ export class Database {
     //
     // Phase 1: build + validate every matching row's new values; no writes yet. Each scanned row,
     // the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
-    const meter = new Meter(this.maxCost);
+    const meter = new Meter(this.session.maxCost);
     const foldCost = { value: 0n };
     for (const p of plans)
       p.source = this.foldUncorrelatedInRExpr(
@@ -4438,7 +4520,7 @@ export class Database {
       params: bound,
       outer: [],
       runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
-      seam: this.seam,
+      seam: this.session.seam,
       rng: new StmtRng(),
       ctes: EMPTY_CTE_CTX,
       exec: this,
@@ -5082,12 +5164,12 @@ export class Database {
       params,
       outer,
       runSubquery: (p, o) => this.execQueryPlan(p, o, params, ctes),
-      seam: this.seam,
+      seam: this.session.seam,
       rng: new StmtRng(),
       ctes,
       exec: this,
     };
-    const meter = new Meter(this.maxCost);
+    const meter = new Meter(this.session.maxCost);
     const rows: Value[][] = [];
     for (const row of plan.rows) {
       meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -5780,7 +5862,7 @@ export class Database {
       }
       return 0;
     };
-    return new Sorter(compare, this.workMem, this.spillSink);
+    return new Sorter(compare, this.session.workMem, this.spillSink);
   }
 
   // materializeRel materializes one FROM relation ri into its rows, given the current outer-row stack
@@ -5917,12 +5999,12 @@ export class Database {
       // A subquery inherits the same CTE context (a CTE reference works at any nesting depth —
       // cte.md §2/§5).
       runSubquery: (p, o) => this.execQueryPlan(p, o, params, ctes),
-      seam: this.seam,
+      seam: this.session.seam,
       rng: new StmtRng(),
       ctes,
       exec: this,
     };
-    const meter = new Meter(this.maxCost);
+    const meter = new Meter(this.session.maxCost);
 
     // LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
     // operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the

@@ -376,9 +376,10 @@ export {
   Database,
   DEFAULT_MAX_SQL_LENGTH,
   DEFAULT_PAGE_SIZE,
+  Session,
   Snapshot,
 } from "./executor.ts";
-export type { Outcome } from "./executor.ts";
+export type { Outcome, SessionOptions, TxStatus } from "./executor.ts";
 export { parseSQL } from "./parser.ts";
 export { EngineError, sqlStateCode } from "./errors.ts";
 export type { SqlState } from "./errors.ts";

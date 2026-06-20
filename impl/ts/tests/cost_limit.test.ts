@@ -38,7 +38,7 @@ function assertAborts(db: Database, sql: string): void {
 
 test("cost limit is unlimited by default", () => {
   const db = rowTable(100);
-  assert.strictEqual(db.maxCost, 0n);
+  assert.strictEqual(db.session.maxCost, 0n);
   execute(db, "SELECT * FROM t"); // runs to completion, no ceiling
 });
 

@@ -109,7 +109,7 @@ export function open(path: string, opts: OpenOptions = {}): Database {
     db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
     db.readOnly = readOnly;
     db.spillSink = new FileSpillSink(dirname(path)); // ORDER BY spills next to the database file (spill.md §4)
-    if (opts.workMem !== undefined) db.workMem = opts.workMem;
+    if (opts.workMem !== undefined) db.session.workMem = opts.workMem;
     return db;
   } catch (e) {
     closeSync(fd); // a malformed file / read failure must not leak the fd

@@ -69,7 +69,7 @@ export function openOpfsWithHandle(handle: SyncAccessHandle, opts: OpenOptions =
   const db = loadDatabasePaged(new SharedPaging(pager, cacheLeaves(cacheBytes, pager.pageSize)));
   db.persistHook = persistImpl; // autocommit each later write (transactions.md §4.1)
   db.readOnly = readOnly;
-  if (opts.workMem !== undefined) db.workMem = opts.workMem;
+  if (opts.workMem !== undefined) db.session.workMem = opts.workMem;
   return db;
 }
 
