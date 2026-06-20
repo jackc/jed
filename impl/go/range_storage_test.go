@@ -149,3 +149,46 @@ func TestRangeCompositeFieldIs0A000(t *testing.T) {
 		t.Errorf("range composite field: got %s, want 0A000", got)
 	}
 }
+
+// TestRangeConstructorDivergences: the range CONSTRUCTORS (RF2) under jed's own spellings +
+// assignment-style bound coercion — the two places jed diverges from PG's strict function-argument
+// matching (spec/design/range-functions.md §2), which the oracle corpus (PG-clean) cannot express. The
+// agreeing constructor behavior — default `[)`, explicit bounds, NULL→infinite, canonicalize/empty,
+// 22000/42601/22003 — lives in expr/range_constructors.test. Mirrors range_constructor_divergences in
+// impl/rust/tests/range_storage.rs.
+func TestRangeConstructorDivergences(t *testing.T) {
+	db := NewDatabase()
+	// (1) jed ACCEPTS the i/f-prefix spellings i32range/i64range as constructor names (PG ships only
+	// int4range/int8range). The result is identical to the PG-spelled alias.
+	if got := queryRendered(t, db, "SELECT i32range(1, 5)"); !reflect.DeepEqual(got, [][]string{{"[1,5)"}}) {
+		t.Errorf("i32range(1, 5) = %v, want [[1,5)]", got)
+	}
+	if got := queryRendered(t, db, "SELECT i64range(100, 200, '[]')"); !reflect.DeepEqual(got, [][]string{{"[100,201)"}}) {
+		t.Errorf("i64range(100, 200, '[]') = %v, want [[100,201)]", got)
+	}
+	// (2) jed accepts a WIDER integer for a narrower range and range-checks at eval — PG rejects the
+	// int4range(bigint, …) overload outright (42883). A value that fits is built; one that overflows the
+	// element domain is 22003 (the same assignment range-check INSERT applies).
+	if got := queryRendered(t, db, "SELECT int4range(1::i64, 5::i64)"); !reflect.DeepEqual(got, [][]string{{"[1,5)"}}) {
+		t.Errorf("int4range(1::i64, 5::i64) = %v, want [[1,5)]", got)
+	}
+	if got := errRange(t, db, "SELECT int4range(3000000000::i64, 4000000000::i64)"); got != "22003" {
+		t.Errorf("int4range(overflow) = %s, want 22003", got)
+	}
+	// (3) Conversely jed is STRICTER on the unknown-literal corner: a string literal is NOT a valid
+	// integer/decimal bound (no unknown→number coercion), so it is 42883 — where PG coerces '1' to
+	// integer. (A string DOES adapt to a temporal element, exercised in the corpus.)
+	if got := errRange(t, db, "SELECT int4range('1', 5)"); got != "42883" {
+		t.Errorf("int4range('1', 5) = %s, want 42883", got)
+	}
+	if got := errRange(t, db, "SELECT numrange('1', 2)"); got != "42883" {
+		t.Errorf("numrange('1', 2) = %s, want 42883", got)
+	}
+	// Arity: only the 2-arg and 3-arg forms exist; anything else is no overload.
+	if got := errRange(t, db, "SELECT int4range(1)"); got != "42883" {
+		t.Errorf("int4range(1) = %s, want 42883", got)
+	}
+	if got := errRange(t, db, "SELECT int4range(1, 2, '[]', 3)"); got != "42883" {
+		t.Errorf("int4range(1, 2, '[]', 3) = %s, want 42883", got)
+	}
+}

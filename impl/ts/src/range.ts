@@ -216,6 +216,26 @@ export function finalizeRange(
   return rangeValue(lower, upper, lowerInc, upperInc);
 }
 
+// parseBoundFlags parses a 2-character range-constructor bounds-flags string (`'[]'`/`'[)'`/`'(]'`/
+// `'()'`) into [lowerInc, upperInc] — the 3-arg constructor's third argument
+// (spec/design/range-functions.md §2). The lower character is `[` (inclusive) or `(` (exclusive);
+// the upper is `]` (inclusive) or `)` (exclusive). Any other string throws 42601 (PG "invalid range
+// bound flags"). The caller handles a NULL flags argument separately (22000, before this is reached).
+export function parseBoundFlags(s: string): [boolean, boolean] {
+  switch (s) {
+    case "[]":
+      return [true, true];
+    case "[)":
+      return [true, false];
+    case "(]":
+      return [false, true];
+    case "()":
+      return [false, false];
+    default:
+      throw engineError("syntax_error", "invalid range bound flags");
+  }
+}
+
 // --- comparison ------------------------------------------------------------
 
 // RangeShape is the structural view of a range value used by the comparator (its empty flag,

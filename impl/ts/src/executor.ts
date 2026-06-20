@@ -202,6 +202,7 @@ import {
 import {
   elementScalar,
   finalizeRange,
+  parseBoundFlags,
   parseRangeText,
   rangeByName,
   rangeForElement,
@@ -6324,6 +6325,7 @@ export class Database {
       case "scalarFunc":
       case "arrayFunc":
       case "rangeFunc":
+      case "rangeCtor":
       case "variadic":
         e.args = e.args.map((a) =>
           this.foldUncorrelatedInRExpr(a, bound, ctes, cost),
@@ -6629,6 +6631,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "scalarFunc":
     case "arrayFunc":
     case "rangeFunc":
+    case "rangeCtor":
     case "variadic":
       return e.args.every(rexprIsConstant);
     case "inValues":
@@ -7509,6 +7512,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "scalarFunc":
     case "arrayFunc":
     case "rangeFunc":
+    case "rangeCtor":
     case "variadic":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
@@ -7594,6 +7598,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "scalarFunc":
     case "arrayFunc":
     case "rangeFunc":
+    case "rangeCtor":
     case "variadic":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
@@ -7930,6 +7935,13 @@ type RExpr =
   // node; the kernel recovers everything from the operand range value (self-describing). All are
   // STRICT (a NULL range → NULL), handled in the eval kernel.
   | { kind: "rangeFunc"; func: RangeFuncName; args: RExpr[] }
+  // A range CONSTRUCTOR call (spec/design/range-functions.md §2 — `i32range(lo, hi[, bounds])` and
+  // the five siblings, plus the int4range/int8range aliases). `elem` is the range's element scalar
+  // (the result range type is recovered from it, a bijection); `args` are the 2 bounds plus an
+  // optional bounds-flags TEXT. Non-strict (null = "none"): a NULL bound is an infinite bound,
+  // handled in the kernel. The kernel coerces each bound to `elem` (assignment-style), reads the
+  // bounds flags, and finalizes (canonicalize / order-check / empty-normalize).
+  | { kind: "rangeCtor"; elem: ScalarType; args: RExpr[] }
   // A VARIADIC argument-counting call (spec/design/array-functions.md §12 — num_nulls/num_nonnulls).
   // Non-strict (null = "none"), like "arrayFunc": no blanket NULL short-circuit. `arrayForm` records
   // the call shape — false = the spread form (count `args`' null-ness directly, never NULL); true =
@@ -9124,6 +9136,14 @@ function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     return resolveRangeFunc(scope, e, ag, params);
   }
+  // A range CONSTRUCTOR (range-functions.md §2): a call whose name is a range type name/alias. Like
+  // the array/range functions it is kind === "function", so it must be intercepted BEFORE the generic
+  // scalar path (isScalarFuncName matches every function row, the constructor rows included) — its
+  // concrete-range result + element coercion are not the family-matched scalar mold.
+  if (isRangeCtorName(lname)) {
+    rejectNamed(lname, e.argNames);
+    return resolveRangeCtor(scope, e, ag, params);
+  }
   if (isScalarFuncName(lname)) {
     rejectNamed(lname, e.argNames);
     return resolveScalarFunc(scope, e, ag, params);
@@ -9678,6 +9698,85 @@ function resolveRangeFunc(
   if (!matched) throw noFuncOverload(name);
   const type = polyResultType(desc.result, elem);
   return { node: { kind: "rangeFunc", func: rangeFuncId(name), args: rargs }, type };
+}
+
+// isRangeCtorName reports whether name (lowercased) is a range CONSTRUCTOR call
+// (range-functions.md §2): a call whose name is a range type name or alias (i32range/int4range/
+// numrange/…). The constructor functions are the only ones whose name is a range type name, so
+// rangeByName resolving is exactly the gate — data-driven over the RANGES table, no hand-written
+// name list.
+function isRangeCtorName(name: string): boolean {
+  return rangeByName(name) !== undefined;
+}
+
+// rangeBoundAssignable reports whether a bound argument of resolved type `t` is assignable to range
+// element `elem`, mirroring the storeValue coercions the kernel will apply (range-functions.md §2):
+// a NULL is an infinite bound (always ok); an integer adapts to an integer (range-checked) or
+// decimal element; a decimal to a decimal element; an already-temporal value to its own element;
+// and a string literal/text to a temporal element (parsed at eval). Anything else is no overload
+// (42883).
+function rangeBoundAssignable(t: ResolvedType, elem: ScalarType): boolean {
+  switch (t.kind) {
+    case "null":
+      return true;
+    case "int":
+      return isInteger(elem) || isDecimal(elem);
+    case "decimal":
+      return isDecimal(elem);
+    case "timestamp":
+      return isTimestamp(elem);
+    case "timestamptz":
+      return isTimestamptz(elem);
+    case "date":
+      return isDate(elem);
+    case "text":
+      return isTimestamp(elem) || isTimestamptz(elem) || isDate(elem);
+    default:
+      return false;
+  }
+}
+
+// resolveRangeCtor resolves a range constructor call (i32range(lo, hi[, bounds]) and the five
+// siblings, plus the int4range/int8range aliases — range-functions.md §2). The target range type
+// comes from the call name (rangeByName, alias-aware); the result type is fixed (concrete), not
+// polymorphic. Each bound resolves with the element scalar as the literal-adaptation context (so `1`
+// adapts to the element width, `'2024-01-01'` to a date), then is type-checked assignable to the
+// element; the optional third argument is the bounds-flags TEXT. The kernel (evalRangeCtor) does the
+// element coercion (assignment-style, 22003), the flags parse (42601 / 22000), and finalize.
+function resolveRangeCtor(
+  scope: Scope,
+  e: { name: string; args: Expr[]; star: boolean },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  const name = e.name.toLowerCase();
+  const desc = rangeByName(name);
+  if (desc === undefined) throw new Error("isRangeCtorName gated the call");
+  const elem = elementScalar(desc);
+  // Only the 2-arg (lo, hi) and 3-arg (lo, hi, bounds) overloads exist.
+  if (e.args.length !== 2 && e.args.length !== 3) throw noFuncOverload(name);
+  const rargs: RExpr[] = [];
+  for (let i = 0; i < e.args.length; i++) {
+    const a = e.args[i]!;
+    if (i < 2) {
+      // A bound: offer the element scalar as the literal-adaptation hint, then check the resolved
+      // type is assignable to the element (else no overload).
+      const r = resolve(scope, a, elem, ag, params);
+      if (!rangeBoundAssignable(r.type, elem)) throw noFuncOverload(name);
+      rargs.push(r.node);
+    } else {
+      // The bounds-flags argument: TEXT (a NULL is allowed at resolve — the kernel traps it 22000
+      // at eval, matching PG "flags argument must not be null").
+      const r = resolve(scope, a, null, ag, params);
+      if (r.type.kind !== "text" && r.type.kind !== "null") throw noFuncOverload(name);
+      rargs.push(r.node);
+    }
+  }
+  return {
+    node: { kind: "rangeCtor", elem, args: rargs },
+    type: { kind: "range", elem: resolvedTypeOf(elem) },
+  };
 }
 
 // groupingErrorColumn is the 42803 for a non-aggregated column with no GROUP BY.
@@ -12871,6 +12970,43 @@ function evalRangeFunc(func: RangeFuncName, vals: Value[]): Value {
   }
 }
 
+// evalRangeCtor evaluates a range constructor (spec/design/range-functions.md §2, RF2). `vals` is
+// [lo, hi] or [lo, hi, bounds]. Each bound is coerced to the element `elem` assignment-style (a NULL
+// bound → an infinite bound; an integer range-checks 22003; an int→decimal / text→temporal adapts),
+// the bounds flags are read (default `[)`; a NULL 3-arg flags → 22000; an invalid flags string →
+// 42601), and finalizeRange produces the canonical value (order-check 22000, canonicalize,
+// empty-normalize).
+function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
+  const desc = rangeForElement(elem);
+  if (desc === undefined) throw new Error("a range constructor's elem has a range");
+  const lower = coerceRangeBound(vals[0]!, elem);
+  const upper = coerceRangeBound(vals[1]!, elem);
+  let lowerInc: boolean;
+  let upperInc: boolean;
+  const flags = vals[2];
+  if (flags === undefined) {
+    // 2-arg form defaults to `[)`.
+    lowerInc = true;
+    upperInc = false;
+  } else if (flags.kind === "null") {
+    throw engineError("data_exception", "range constructor flags argument must not be null");
+  } else if (flags.kind === "text") {
+    [lowerInc, upperInc] = parseBoundFlags(flags.text);
+  } else {
+    throw new Error("resolver restricts the range bounds flags to text");
+  }
+  return finalizeRange(desc, lower, upper, lowerInc, upperInc);
+}
+
+// coerceRangeBound coerces one constructor bound value to the range element `elem`, returning null
+// for a NULL bound (an infinite bound). Reuses storeValue (the INSERT/UPDATE assignment coercion):
+// an integer range-checks into the element (22003), an int→decimal widens, a text→temporal parses,
+// and a non-assignable value is 42804 (the resolver already screened the common 42883 cases).
+function coerceRangeBound(v: Value, elem: ScalarType): Value | null {
+  const stored = storeValue(v, elem, null, false, "range bound");
+  return stored.kind === "null" ? null : stored;
+}
+
 // notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
 // element comparator, so NULL equals NULL and a non-NULL never equals NULL.
 function notDistinct(a: Value, b: Value): boolean {
@@ -14652,6 +14788,15 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const vals: Value[] = [];
       for (const a of e.args) vals.push(evalExpr(a, row, env, m));
       return evalRangeFunc(e.func, vals);
+    }
+    case "rangeCtor": {
+      // A range CONSTRUCTOR call (spec/design/range-functions.md §2, RF2). One operator_eval (like
+      // the range accessors); arguments charge their own evaluation. Non-strict — the kernel turns a
+      // NULL bound into an infinite bound, so there is no blanket NULL short-circuit.
+      m.charge(COSTS.operatorEval);
+      const vals: Value[] = [];
+      for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+      return evalRangeCtor(e.elem, vals);
     }
     case "variadic": {
       // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval

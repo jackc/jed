@@ -18,8 +18,9 @@
 > semantics are the default (CLAUDE.md §1) and are pinned against the live `postgres:18`
 > oracle — several canonicalization / empty / ordering / text-quoting rules are subtle (§4–§7).
 
-> **Status: R0–R3 landed (the type axis is complete); the function/operator surface (RF1–RF4)
-> follows (§11).** R0 (this doc + `ranges.toml` + the codegen'd `RANGES` table) is the spec/data
+> **Status: R0–R3 landed (the type axis is complete); the function/operator surface is landing —
+> RF1 (accessors) + RF2 (constructors) landed, RF3–RF4 (operators) follow (§11).** R0 (this doc +
+> `ranges.toml` + the codegen'd `RANGES` table) is the spec/data
 > foundation; **R1** threaded the open-`Type` `Range` arm + the `'[1,5)'::i32range` literal/cast
 > through all three cores; **R2** made range **columns** declarable + storable — the value codec
 > (`type_code 17`, `format_version 16`), canonicalization / empty normalization at store, text I/O,

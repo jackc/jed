@@ -2556,6 +2556,144 @@ result         = "boolean"
 null           = "propagates"
 errors         = []
 
+# --- the range constructor functions (../design/range-functions.md §2, RF2) -------------------
+# A CONCRETE-result builder per range type: `i32range(lo, hi)` / `i32range(lo, hi, bounds)` build an
+# i32range, and the five siblings their own range — the `result` field carries the concrete range id
+# (the make_interval precedent — a fixed result, no polymorphic ELEM). Two overloads each: a 2-arg
+# form defaulting the bounds to `[)`, and a 3-arg form taking an explicit 2-char bounds-flags TEXT
+# (`'[]'`/`'[)'`/`'(]'`/`'()'`). PostgreSQL's `int4range`/`int8range` spellings are ACCEPTED as call
+# names too (aliases of `i32range`/`i64range` — resolved via the RANGES alias table, not extra rows).
+# NON-strict (null = "none"): a NULL bound is an INFINITE bound — `i32range(NULL,5)` → `(,5)` — not a
+# NULL result; the kernel handles NULL, the resolver does not short-circuit it. (The 3-arg flags TEXT
+# is the exception: a NULL flags argument traps 22000, "range constructor flags argument must not be
+# null".) Each bound is coerced to the element type assignment-style (../design/range-functions.md §2):
+# an integer bound range-checks (22003), an int→decimal / string→temporal bound adapts, a wrong family
+# is 42883. The result is finalized — `lower > upper` traps 22000, a discrete bound is canonicalized to
+# `[)` (22003 if the +1 step overflows the element domain), and an empty range normalizes. The 3-arg
+# form's invalid bounds flags trap 42601. Oracle-pinned vs postgres:18. Resolved by the hand-written
+# `resolve_range_ctor` (gated by `is_range_ctor_name`: a call whose name is a range type name/alias),
+# parallel to the array/range resolvers — NOT the generic family-matched scalar path.
+
+[[operator]]
+name           = "i32range"
+kind           = "function"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "none"
+result         = "i32range"
+null           = "none"
+errors         = ["22000", "22003"]
+
+[[operator]]
+name           = "i32range"
+kind           = "function"
+arity          = 3
+arg_families   = ["integer", "integer", "text"]
+arg_resolution = "none"
+result         = "i32range"
+null           = "none"
+errors         = ["22000", "22003", "42601"]
+
+[[operator]]
+name           = "i64range"
+kind           = "function"
+arity          = 2
+arg_families   = ["integer", "integer"]
+arg_resolution = "none"
+result         = "i64range"
+null           = "none"
+errors         = ["22000", "22003"]
+
+[[operator]]
+name           = "i64range"
+kind           = "function"
+arity          = 3
+arg_families   = ["integer", "integer", "text"]
+arg_resolution = "none"
+result         = "i64range"
+null           = "none"
+errors         = ["22000", "22003", "42601"]
+
+[[operator]]
+name           = "numrange"
+kind           = "function"
+arity          = 2
+arg_families   = ["decimal", "decimal"]
+arg_resolution = "none"
+result         = "numrange"
+null           = "none"
+errors         = ["22000", "22003"]
+
+[[operator]]
+name           = "numrange"
+kind           = "function"
+arity          = 3
+arg_families   = ["decimal", "decimal", "text"]
+arg_resolution = "none"
+result         = "numrange"
+null           = "none"
+errors         = ["22000", "22003", "42601"]
+
+[[operator]]
+name           = "tsrange"
+kind           = "function"
+arity          = 2
+arg_families   = ["timestamp", "timestamp"]
+arg_resolution = "none"
+result         = "tsrange"
+null           = "none"
+errors         = ["22000"]
+
+[[operator]]
+name           = "tsrange"
+kind           = "function"
+arity          = 3
+arg_families   = ["timestamp", "timestamp", "text"]
+arg_resolution = "none"
+result         = "tsrange"
+null           = "none"
+errors         = ["22000", "42601"]
+
+[[operator]]
+name           = "tstzrange"
+kind           = "function"
+arity          = 2
+arg_families   = ["timestamptz", "timestamptz"]
+arg_resolution = "none"
+result         = "tstzrange"
+null           = "none"
+errors         = ["22000"]
+
+[[operator]]
+name           = "tstzrange"
+kind           = "function"
+arity          = 3
+arg_families   = ["timestamptz", "timestamptz", "text"]
+arg_resolution = "none"
+result         = "tstzrange"
+null           = "none"
+errors         = ["22000", "42601"]
+
+[[operator]]
+name           = "daterange"
+kind           = "function"
+arity          = 2
+arg_families   = ["date", "date"]
+arg_resolution = "none"
+result         = "daterange"
+null           = "none"
+errors         = ["22000", "22003"]
+
+[[operator]]
+name           = "daterange"
+kind           = "function"
+arity          = 3
+arg_families   = ["date", "date", "text"]
+arg_resolution = "none"
+result         = "daterange"
+null           = "none"
+errors         = ["22000", "22003", "42601"]
+
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
 # SINGLE value. They are NOT operators — no infix symbol, no precedence, no

@@ -482,6 +482,14 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			}
 			continue
 		}
+		if isRangeCtorName(o.Name) {
+			// A range constructor (range-functions.md §2): no scalar kernel id — the kernel is
+			// evalRangeCtor, reached from the resolver. Its result is a concrete range id.
+			if _, ok := rangeByName(o.Result); !ok {
+				t.Fatalf("range constructor %s has non-range result code %s", o.Name, o.Result)
+			}
+			continue
+		}
 		tys := make([]resolvedType, len(o.ArgFamilies))
 		for j, fam := range o.ArgFamilies {
 			tys[j] = probe(fam)

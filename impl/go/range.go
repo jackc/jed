@@ -279,6 +279,26 @@ func finalizeRange(desc RangeDesc, lower, upper *Value, lowerInc, upperInc bool)
 	return &RangeVal{Empty: false, Lower: lower, Upper: upper, LowerInc: lowerInc, UpperInc: upperInc}, nil
 }
 
+// parseBoundFlags parses a 2-character range-constructor bounds-flags string (`'[]'`/`'[)'`/`'(]'`/
+// `'()'`) into (lowerInc, upperInc) — the 3-arg constructor's third argument
+// (spec/design/range-functions.md §2). The lower character is `[` (inclusive) or `(` (exclusive);
+// the upper is `]` (inclusive) or `)` (exclusive). Any other string traps 42601 (PG "invalid range
+// bound flags"). The caller handles a NULL flags argument separately (22000, before this is reached).
+func parseBoundFlags(s string) (lowerInc, upperInc bool, err error) {
+	switch s {
+	case "[]":
+		return true, true, nil
+	case "[)":
+		return true, false, nil
+	case "(]":
+		return false, true, nil
+	case "()":
+		return false, false, nil
+	default:
+		return false, false, NewError(SyntaxError, "invalid range bound flags")
+	}
+}
+
 // --- comparison ------------------------------------------------------------
 
 // rangeTotalCmp is the PG range_cmp total order over two CANONICAL range values

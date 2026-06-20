@@ -9029,6 +9029,14 @@ const (
 	// for its single range argument; `rfunc` selects the kernel. All are STRICT (a NULL range → NULL,
 	// handled in the kernel). The result type lives in the surrounding resolvedType.
 	reRangeFunc
+	// reRangeCtor is a range CONSTRUCTOR call (spec/design/range-functions.md §2 — i32range(lo, hi[,
+	// bounds]) and the five siblings), evaluated per row. `relem` is the range's element scalar (the
+	// result range type is recovered from it, a bijection); its 2 bound nodes plus an optional
+	// bounds-flags TEXT node reuse `sargs`. Non-strict (null = "none"): a NULL bound is an infinite
+	// bound, handled in the kernel — there is no blanket NULL short-circuit. The kernel coerces each
+	// bound to relem (assignment-style), reads the bounds flags, and finalizes (canonicalize /
+	// order-check / empty-normalize).
+	reRangeCtor
 	// reVariadic is a VARIADIC argument-counting call (spec/design/array-functions.md §12 —
 	// num_nulls/num_nonnulls). Non-strict (null = "none"): no blanket NULL short-circuit. Its
 	// argument nodes reuse `sargs`; `variadicArray` records the call shape (false = the spread form,
@@ -9229,6 +9237,9 @@ type rExpr struct {
 	// reArrayFunc the result type lives in the surrounding resolvedType (carried out of resolve), not
 	// on the node — the kernel produces the result value from the operand (a range is self-describing).
 	rfunc rangeFunc
+	// reRangeCtor: the element scalar of the range being built (i32range → i32). The result range type
+	// is recovered from it (a bijection); the bound/flags argument nodes reuse `sargs`.
+	relem ScalarType
 	// reVariadic: the VARIADIC counting function and its call shape. Argument nodes reuse `sargs`;
 	// `variadicArray` true ⇒ the VARIADIC-array form (one array operand), false ⇒ the spread form.
 	vfunc         variadicFunc
@@ -10781,6 +10792,93 @@ func resolveRangeFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	return &rExpr{kind: reRangeFunc, rfunc: rangeFuncID(name), sargs: rargs}, result, nil
 }
 
+// isRangeCtorName reports whether name (lowercased) is a range CONSTRUCTOR call (range-functions.md
+// §2): a call whose name is a range type name or alias (i32range/int4range/numrange/…). The
+// constructor functions are the only ones whose name is a range type name, so rangeByName resolving
+// is exactly the gate — data-driven over the Ranges table, no hand-written name list.
+func isRangeCtorName(name string) bool {
+	_, ok := rangeByName(name)
+	return ok
+}
+
+// rangeBoundAssignable reports whether a bound argument of resolved type t is assignable to range
+// element elem, mirroring the storeValue coercions the kernel will apply (range-functions.md §2): a
+// NULL is an infinite bound (always ok); an integer adapts to an integer (range-checked) or decimal
+// element; a decimal to a decimal element; an already-temporal value to its own element; and a string
+// literal/text to a temporal element (parsed at eval). Anything else is no overload (42883).
+func rangeBoundAssignable(t resolvedType, elem ScalarType) bool {
+	switch t.kind {
+	case rtNull:
+		return true
+	case rtInt:
+		return elem.IsInteger() || elem.IsDecimal()
+	case rtDecimal:
+		return elem.IsDecimal()
+	case rtTimestamp:
+		return elem.IsTimestamp()
+	case rtTimestamptz:
+		return elem.IsTimestamptz()
+	case rtDate:
+		return elem.IsDate()
+	case rtText:
+		return elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate()
+	default:
+		return false
+	}
+}
+
+// resolveRangeCtor resolves a range constructor call (i32range(lo, hi[, bounds]) and the five
+// siblings, plus the int4range/int8range aliases — range-functions.md §2). The target range type
+// comes from the call name (rangeByName, alias-aware); the result type is fixed (concrete), not
+// polymorphic. Each bound resolves with the element scalar as the literal-adaptation context (so `1`
+// adapts to the element width, `'2024-01-01'` to a date), then is type-checked assignable to the
+// element; the optional third argument is the bounds-flags TEXT. The kernel (evalRangeCtor) does the
+// element coercion (assignment-style, 22003), the flags parse (42601 / 22000), and finalizeRange.
+func resolveRangeCtor(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if fc.Star {
+		return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+	}
+	name := toLowerASCII(fc.Name)
+	desc, ok := rangeByName(name)
+	if !ok {
+		panic("resolveRangeCtor: isRangeCtorName gated the call")
+	}
+	elem := elementScalar(desc)
+	// Only the 2-arg (lo, hi) and 3-arg (lo, hi, bounds) overloads exist.
+	if len(fc.Args) != 2 && len(fc.Args) != 3 {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	rargs := make([]*rExpr, len(fc.Args))
+	for i := range fc.Args {
+		if i < 2 {
+			// A bound: offer the element scalar as the literal-adaptation hint, then check the
+			// resolved type is assignable to the element (else no overload).
+			r, t, err := resolve(s, *fc.Args[i], &elem, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if !rangeBoundAssignable(t, elem) {
+				return nil, resolvedType{}, noFuncOverload(name)
+			}
+			rargs[i] = r
+		} else {
+			// The bounds-flags argument: TEXT (a NULL is allowed at resolve — the kernel traps it
+			// 22000 at eval, matching PG "flags argument must not be null").
+			r, t, err := resolve(s, *fc.Args[i], nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if t.kind != rtText && t.kind != rtNull {
+				return nil, resolvedType{}, noFuncOverload(name)
+			}
+			rargs[i] = r
+		}
+	}
+	elemRT := resolvedTypeOf(elem)
+	return &rExpr{kind: reRangeCtor, relem: elem, sargs: rargs},
+		resolvedType{kind: rtRange, elem: &elemRT}, nil
+}
+
 // resolveConcat resolves the `||` array concatenation operator (array-functions.md §8): overload
 // resolution over the three Kind=="concat" catalog rows — (anyarray,anyarray) [array_cat],
 // (anyarray,anyelement) [array_append], (anyelement,anyarray) [array_prepend] — tried IN CATALOG
@@ -11148,6 +11246,15 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, err
 		}
 		return resolveRangeFunc(s, fc, ag, params)
+	}
+	// A range CONSTRUCTOR (range-functions.md §2): a call whose name is a range type name/alias. Like
+	// the array/range functions it is Kind=="function", so it must be intercepted BEFORE the generic
+	// scalar path (its concrete-range result + element coercion are not the family-matched scalar mold).
+	if isRangeCtorName(name) {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return resolveRangeCtor(s, fc, ag, params)
 	}
 	if isScalarFuncName(name) {
 		if err := rejectNamed(name, fc.ArgNames); err != nil {
@@ -13708,6 +13815,61 @@ func evalRangeFunc(fn rangeFunc, vals []Value) (Value, error) {
 	}
 }
 
+// evalRangeCtor builds a range value from a constructor call's evaluated arguments
+// (range-functions.md §2). vals is [lo, hi] or [lo, hi, bounds]. Each bound is coerced to the element
+// elem assignment-style (a NULL bound → an infinite bound; an integer range-checks 22003; an
+// int→decimal / text→temporal adapts), the bounds flags are read (default `[)`; a NULL 3-arg flags →
+// 22000; an invalid flags string → 42601), and finalizeRange produces the canonical value (order-check
+// 22000, canonicalize, empty-normalize).
+func evalRangeCtor(elem ScalarType, vals []Value) (Value, error) {
+	desc, ok := rangeForElement(elem)
+	if !ok {
+		panic("evalRangeCtor: a range constructor's elem has a range")
+	}
+	lower, err := coerceRangeBound(vals[0], elem)
+	if err != nil {
+		return Value{}, err
+	}
+	upper, err := coerceRangeBound(vals[1], elem)
+	if err != nil {
+		return Value{}, err
+	}
+	lowerInc, upperInc := true, false // the 2-arg form defaults to `[)`
+	if len(vals) > 2 {
+		switch vals[2].Kind {
+		case ValNull:
+			return Value{}, NewError(DataException, "range constructor flags argument must not be null")
+		case ValText:
+			lowerInc, upperInc, err = parseBoundFlags(vals[2].Str)
+			if err != nil {
+				return Value{}, err
+			}
+		default:
+			panic("evalRangeCtor: resolver restricts the range bounds flags to text")
+		}
+	}
+	rv, err := finalizeRange(desc, lower, upper, lowerInc, upperInc)
+	if err != nil {
+		return Value{}, err
+	}
+	return RangeValue(rv), nil
+}
+
+// coerceRangeBound coerces one constructor bound value to the range element elem, returning nil for a
+// NULL bound (an infinite bound). Reuses storeValue (the INSERT/UPDATE assignment coercion): an
+// integer range-checks into the element (22003), an int→decimal widens, a text→temporal parses, and a
+// non-assignable value is 42804 (the resolver already screened the common 42883 cases).
+func coerceRangeBound(v Value, elem ScalarType) (*Value, error) {
+	out, err := storeValue(v, elem, nil, false, "range bound")
+	if err != nil {
+		return nil, err
+	}
+	if out.Kind == ValNull {
+		return nil, nil
+	}
+	return &out, nil
+}
+
 // notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
 // element comparator, so NULL equals NULL and a non-NULL never equals NULL.
 func notDistinct(a, b Value) bool { return valueCmp(a, b) == 0 }
@@ -14840,6 +15002,20 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			vals[i] = v
 		}
 		return evalRangeFunc(e.rfunc, vals)
+	case reRangeCtor:
+		// A range CONSTRUCTOR call (spec/design/range-functions.md §2). One operator_eval (like the
+		// range accessors); arguments charge their own evaluation. Non-strict — the kernel turns a NULL
+		// bound into an infinite bound, so there is no blanket NULL short-circuit.
+		m.Charge(Costs.OperatorEval)
+		vals := make([]Value, len(e.sargs))
+		for i, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			vals[i] = v
+		}
+		return evalRangeCtor(e.relem, vals)
 	case reVariadic:
 		// A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval
 		// (the per-element/arg count walk is unmetered, like the array introspectors §3.3);

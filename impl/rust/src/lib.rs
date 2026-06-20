@@ -110,6 +110,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
     // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
     "func.range_accessors",
+    // Range constructor functions RF2 (range-functions.md §2): the six concrete-result builders
+    // i32range/i64range/numrange/tsrange/tstzrange/daterange (+ int4range/int8range aliases), each a
+    // 2-arg (lo, hi) and 3-arg (lo, hi, bounds) overload; NULL bound → infinite, finalize/canonicalize.
+    "func.range_constructors",
     // Array function/operator surface AF1 (array-functions.md): the polymorphic anyarray/anyelement
     // resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
     // (array_append/prepend/cat).

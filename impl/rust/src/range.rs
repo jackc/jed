@@ -291,6 +291,24 @@ pub fn finalize(
     })
 }
 
+/// Parse a 2-character range-constructor bounds-flags string (`'[]'`/`'[)'`/`'(]'`/`'()'`) into
+/// `(lower_inc, upper_inc)` — the 3-arg constructor's third argument (spec/design/range-functions.md
+/// §2). The lower character is `[` (inclusive) or `(` (exclusive); the upper is `]` (inclusive) or
+/// `)` (exclusive). Any other string traps `42601` (PG "invalid range bound flags"). The caller
+/// handles a NULL flags argument separately (`22000`, before this is reached).
+pub fn parse_bound_flags(s: &str) -> Result<(bool, bool)> {
+    match s {
+        "[]" => Ok((true, true)),
+        "[)" => Ok((true, false)),
+        "(]" => Ok((false, true)),
+        "()" => Ok((false, false)),
+        _ => Err(EngineError::new(
+            SqlState::SyntaxError,
+            "invalid range bound flags".to_string(),
+        )),
+    }
+}
+
 // --- comparison ------------------------------------------------------------
 
 /// PG `range_cmp` total order over two CANONICAL range values (spec/design/ranges.md §6): `empty`

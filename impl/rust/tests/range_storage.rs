@@ -140,3 +140,42 @@ fn composite_range_field_is_0a000() {
         "0A000",
     );
 }
+
+/// The range CONSTRUCTORS (RF2) under jed's own spellings + assignment-style bound coercion — the two
+/// places jed diverges from PG's strict function-argument matching (spec/design/range-functions.md
+/// §2), which the oracle corpus (PG-clean) cannot express. The agreeing constructor behavior —
+/// default `[)`, explicit bounds, NULL→infinite, canonicalize/empty, 22000/42601/22003 — lives in
+/// expr/range_constructors.test.
+#[test]
+fn range_constructor_divergences() {
+    let mut db = Database::new();
+    // (1) jed ACCEPTS the i/f-prefix spellings i32range/i64range as constructor names (PG ships only
+    // int4range/int8range). The result is identical to the PG-spelled alias.
+    assert_eq!(query(&mut db, "SELECT i32range(1, 5)"), vec![vec!["[1,5)"]]);
+    assert_eq!(
+        query(&mut db, "SELECT i64range(100, 200, '[]')"),
+        vec![vec!["[100,201)"]],
+    );
+    // (2) jed accepts a WIDER integer for a narrower range and range-checks at eval — PG rejects the
+    // int4range(bigint, …) overload outright (42883). A value that fits is built; one that overflows
+    // the element domain is 22003 (the same assignment range-check INSERT applies).
+    assert_eq!(
+        query(&mut db, "SELECT int4range(1::i64, 5::i64)"),
+        vec![vec!["[1,5)"]],
+    );
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT int4range(3000000000::i64, 4000000000::i64)"
+        ),
+        "22003",
+    );
+    // (3) Conversely jed is STRICTER on the unknown-literal corner: a string literal is NOT a valid
+    // integer/decimal bound (no unknown→number coercion), so it is 42883 — where PG coerces '1' to
+    // integer. (A string DOES adapt to a temporal element, exercised in the corpus.)
+    assert_eq!(err(&mut db, "SELECT int4range('1', 5)"), "42883");
+    assert_eq!(err(&mut db, "SELECT numrange('1', 2)"), "42883");
+    // Arity: only the 2-arg and 3-arg forms exist; anything else is no overload.
+    assert_eq!(err(&mut db, "SELECT int4range(1)"), "42883");
+    assert_eq!(err(&mut db, "SELECT int4range(1, 2, '[]', 3)"), "42883");
+}

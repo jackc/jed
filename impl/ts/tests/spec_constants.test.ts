@@ -16,6 +16,7 @@ import {
 } from "../src/types.ts";
 import { MAX_INT_DIGITS, MAX_PRECISION, MAX_SCALE } from "../src/decimal.ts";
 import { AGGREGATES, OPERATORS, SET_RETURNING } from "../src/operators.ts";
+import { rangeByName } from "../src/range.ts";
 import { COSTS } from "../src/costs.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
 
@@ -269,6 +270,12 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
   // `<scalar>[]` (array_positions → "i32[]", §8), or a scalar id.
   for (const o of OPERATORS) {
     if (o.kind !== "function") continue;
+    // A range CONSTRUCTOR (range-functions.md §2): no scalar kernel id — the kernel is evalRangeCtor,
+    // reached from the resolver. Its result is a concrete range id (e.g. "i32range").
+    if (rangeByName(o.name) !== undefined) {
+      assert.ok(rangeByName(o.result) !== undefined, `range constructor ${o.name} has non-range result code ${o.result}`);
+      continue;
+    }
     const concreteArray = o.result.endsWith("[]") && scalarTypeFromName(o.result.slice(0, -2)) !== undefined;
     const ok =
       o.result === "promoted" ||

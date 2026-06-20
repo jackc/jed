@@ -101,3 +101,28 @@ test("composite range field is 0A000", () => {
   const db = new Database();
   assert.equal(errCode(() => execute(db, "CREATE TYPE rec AS (lo i32, span i32range)")), "0A000");
 });
+
+// Range CONSTRUCTOR divergences (range-functions.md §2, RF2) — the deliberate departures from
+// PostgreSQL the oracle corpus cannot express: jed accepts the i/f-prefix spellings, accepts a wider
+// integer (range-checked at eval) where PG rejects the overload, and is stricter on the
+// unknown-string corner. The agreeing constructor behavior lives in expr/range_constructors.test.
+test("range constructor divergences", () => {
+  const db = new Database();
+  // (1) jed ACCEPTS the i/f-prefix spellings i32range/i64range as constructor names (PG ships only
+  // int4range/int8range). The result is identical to the PG-spelled alias.
+  assert.deepEqual(query(db, "SELECT i32range(1, 5)"), [["[1,5)"]]);
+  assert.deepEqual(query(db, "SELECT i64range(100, 200, '[]')"), [["[100,201)"]]);
+  // (2) jed accepts a WIDER integer for a narrower range and range-checks at eval — PG rejects the
+  // int4range(bigint, …) overload outright (42883). A value that fits is built; one that overflows
+  // the element domain is 22003 (the same assignment range-check INSERT applies).
+  assert.deepEqual(query(db, "SELECT int4range(1::i64, 5::i64)"), [["[1,5)"]]);
+  assert.equal(errCode(() => execute(db, "SELECT int4range(3000000000::i64, 4000000000::i64)")), "22003");
+  // (3) Conversely jed is STRICTER on the unknown-literal corner: a string literal is NOT a valid
+  // integer/decimal bound (no unknown→number coercion), so it is 42883 — where PG coerces '1' to
+  // integer. (A string DOES adapt to a temporal element, exercised in the corpus.)
+  assert.equal(errCode(() => execute(db, "SELECT int4range('1', 5)")), "42883");
+  assert.equal(errCode(() => execute(db, "SELECT numrange('1', 2)")), "42883");
+  // Arity: only the 2-arg and 3-arg forms exist; anything else is no overload.
+  assert.equal(errCode(() => execute(db, "SELECT int4range(1)")), "42883");
+  assert.equal(errCode(() => execute(db, "SELECT int4range(1, 2, '[]', 3)")), "42883");
+});

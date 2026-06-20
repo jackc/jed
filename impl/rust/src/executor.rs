@@ -6986,6 +6986,7 @@ impl Database {
             RExpr::ScalarFunc { args, .. }
             | RExpr::ArrayFunc { args, .. }
             | RExpr::RangeFunc { args, .. }
+            | RExpr::RangeCtor { args, .. }
             | RExpr::Variadic { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
@@ -8210,6 +8211,16 @@ enum RExpr {
         func: RangeFunc,
         args: Vec<RExpr>,
     },
+    /// A range CONSTRUCTOR call (spec/design/range-functions.md §2 — `i32range(lo, hi[, bounds])` and
+    /// the five siblings). `elem` is the range's element scalar (the result range type is recovered
+    /// from it, a bijection); `args` are the 2 bounds plus an optional bounds-flags TEXT. Non-strict
+    /// (`null = "none"`): a NULL bound is an infinite bound, handled in the kernel. The kernel coerces
+    /// each bound to `elem` (assignment-style), reads the bounds flags, and finalizes (canonicalize /
+    /// order-check / empty-normalize).
+    RangeCtor {
+        elem: ScalarType,
+        args: Vec<RExpr>,
+    },
     /// A VARIADIC argument-counting call (spec/design/array-functions.md §12 — num_nulls/
     /// num_nonnulls). Non-strict (`null = "none"`): the kernel inspects null-ness itself, so there
     /// is no blanket NULL short-circuit. `array_form` records the call shape: `false` = the SPREAD
@@ -8943,6 +8954,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
+        | RExpr::RangeCtor { args, .. }
         | RExpr::Variadic { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
@@ -10255,6 +10267,7 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
+        | RExpr::RangeCtor { args, .. }
         | RExpr::Variadic { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
@@ -10357,6 +10370,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         RExpr::ScalarFunc { args, .. }
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
+        | RExpr::RangeCtor { args, .. }
         | RExpr::Variadic { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);
@@ -10916,6 +10930,78 @@ fn resolve_range_func(
     ))
 }
 
+/// Whether `name` (case-insensitive) is a range CONSTRUCTOR call (range-functions.md §2): a call
+/// whose name is a range type name or alias (`i32range`/`int4range`/`numrange`/…). The constructor
+/// functions are the only ones whose name is a range type name, so `range::range_by_name` resolving
+/// is exactly the gate — data-driven over the RANGES table, no hand-written name list.
+fn is_range_ctor_name(name: &str) -> bool {
+    crate::range::range_by_name(name).is_some()
+}
+
+/// Whether a bound argument of resolved type `t` is assignable to range element `elem`, mirroring
+/// the `store_value` coercions the kernel will apply (range-functions.md §2): a NULL is an infinite
+/// bound (always ok); an integer adapts to an integer (range-checked) or decimal element; a decimal
+/// to a decimal element; an already-temporal value to its own element; and a string literal/text to
+/// a temporal element (parsed at eval). Anything else is no overload (42883).
+fn range_bound_assignable(t: &ResolvedType, elem: ScalarType) -> bool {
+    match t {
+        ResolvedType::Null => true,
+        ResolvedType::Int(_) => elem.is_integer() || elem.is_decimal(),
+        ResolvedType::Decimal => elem.is_decimal(),
+        ResolvedType::Timestamp => elem.is_timestamp(),
+        ResolvedType::Timestamptz => elem.is_timestamptz(),
+        ResolvedType::Date => elem.is_date(),
+        ResolvedType::Text => elem.is_timestamp() || elem.is_timestamptz() || elem.is_date(),
+        _ => false,
+    }
+}
+
+/// Resolve a range constructor call (`i32range(lo, hi[, bounds])` and the five siblings, plus the
+/// `int4range`/`int8range` aliases — range-functions.md §2). The target range type comes from the
+/// call name (`range_by_name`, alias-aware); the result type is fixed (concrete), not polymorphic.
+/// Each bound resolves with the element scalar as the literal-adaptation context (so `1` adapts to
+/// the element width, `'2024-01-01'` to a date), then is type-checked assignable to the element; the
+/// optional third argument is the bounds-flags TEXT. The kernel ([`eval_range_ctor`]) does the
+/// element coercion (assignment-style, 22003), the flags parse (42601 / 22000), and `finalize`.
+fn resolve_range_ctor(
+    scope: &Scope,
+    name: &str, // already lowercased
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let desc = crate::range::range_by_name(name).expect("is_range_ctor_name gated the call");
+    let elem = crate::range::element_scalar(desc);
+    // Only the 2-arg (lo, hi) and 3-arg (lo, hi, bounds) overloads exist.
+    if args.len() != 2 && args.len() != 3 {
+        return Err(no_func_overload(name));
+    }
+    let mut rargs = Vec::with_capacity(args.len());
+    for (i, a) in args.iter().enumerate() {
+        if i < 2 {
+            // A bound: offer the element scalar as the literal-adaptation hint, then check the
+            // resolved type is assignable to the element (else no overload).
+            let (r, t) = resolve(scope, a, Some(elem), agg, params)?;
+            if !range_bound_assignable(&t, elem) {
+                return Err(no_func_overload(name));
+            }
+            rargs.push(r);
+        } else {
+            // The bounds-flags argument: TEXT (a NULL is allowed at resolve — the kernel traps it
+            // 22000 at eval, matching PG "flags argument must not be null").
+            let (r, t) = resolve(scope, a, None, agg, params)?;
+            if !matches!(t, ResolvedType::Text | ResolvedType::Null) {
+                return Err(no_func_overload(name));
+            }
+            rargs.push(r);
+        }
+    }
+    Ok((
+        RExpr::RangeCtor { elem, args: rargs },
+        ResolvedType::Range(Box::new(resolved_type_of(elem))),
+    ))
+}
+
 /// Whether aggregate `surface` (case-insensitive) has a `COUNT(*)`-style star overload — only
 /// COUNT does. The data-driven replacement for the special-cased `_ if star` arm.
 fn aggregate_has_star(surface: &str) -> bool {
@@ -11137,6 +11223,20 @@ fn resolve_func_call(
             ));
         }
         return resolve_range_func(scope, &lname, args, agg, params);
+    }
+    // A range CONSTRUCTOR (range-functions.md §2): a call whose name is a range type name/alias.
+    // Like the array/range functions it is kind="function", so it must be intercepted BEFORE the
+    // generic scalar path (its concrete-range result + element coercion are not the family-matched
+    // scalar mold).
+    if is_range_ctor_name(&lname) {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_range_ctor(scope, &lname, args, agg, params);
     }
     if is_scalar_func_name(&lname) {
         reject_named(&lname, arg_names)?;
@@ -14124,6 +14224,44 @@ fn eval_range_func(func: &RangeFunc, vals: &[Value]) -> Result<Value> {
     })
 }
 
+/// Build a range value from a constructor call's evaluated arguments (range-functions.md §2). `vals`
+/// is `[lo, hi]` or `[lo, hi, bounds]`. Each bound is coerced to the element `elem` assignment-style
+/// (a NULL bound → an infinite bound; an integer range-checks 22003; an int→decimal / text→temporal
+/// adapts), the bounds flags are read (default `[)`; a NULL 3-arg flags → 22000; an invalid flags
+/// string → 42601), and `finalize` produces the canonical value (order-check 22000, canonicalize,
+/// empty-normalize).
+fn eval_range_ctor(elem: ScalarType, vals: &[Value]) -> Result<Value> {
+    let desc =
+        crate::range::range_for_element(elem).expect("a range constructor's elem has a range");
+    let lower = coerce_range_bound(vals[0].clone(), elem)?;
+    let upper = coerce_range_bound(vals[1].clone(), elem)?;
+    let (lower_inc, upper_inc) = match vals.get(2) {
+        None => (true, false), // 2-arg form defaults to `[)`
+        Some(Value::Null) => {
+            return Err(EngineError::new(
+                SqlState::DataException,
+                "range constructor flags argument must not be null".to_string(),
+            ));
+        }
+        Some(Value::Text(s)) => crate::range::parse_bound_flags(s)?,
+        Some(_) => unreachable!("resolver restricts the range bounds flags to text"),
+    };
+    Ok(Value::Range(crate::range::finalize(
+        desc, lower, upper, lower_inc, upper_inc,
+    )?))
+}
+
+/// Coerce one constructor bound value to the range element `elem`, returning `None` for a NULL bound
+/// (an infinite bound). Reuses [`store_value`] (the INSERT/UPDATE assignment coercion): an integer
+/// range-checks into the element (22003), an int→decimal widens, a text→temporal parses, and a
+/// non-assignable value is 42804 (the resolver already screened the common 42883 cases).
+fn coerce_range_bound(v: Value, elem: ScalarType) -> Result<Option<Value>> {
+    match store_value(v, elem, None, false, "range bound")? {
+        Value::Null => Ok(None),
+        other => Ok(Some(other)),
+    }
+}
+
 /// STRICT element equality for the containment/overlap operators (array-functions.md §10): a NULL
 /// element equals NOTHING — including another NULL — the deliberate inverse of `not_distinct` (§5
 /// #10). For two non-NULL values it is jed's total element comparator (`value_cmp == Equal`), which
@@ -16767,6 +16905,17 @@ impl RExpr {
                 }
                 eval_range_func(func, &vals)
             }
+            // A range CONSTRUCTOR call (spec/design/range-functions.md §2). One operator_eval (like
+            // the range accessors); arguments charge their own evaluation. Non-strict — the kernel
+            // turns a NULL bound into an infinite bound, so there is no blanket NULL short-circuit.
+            RExpr::RangeCtor { elem, args } => {
+                m.charge(COSTS.operator_eval);
+                let mut vals = Vec::with_capacity(args.len());
+                for a in args {
+                    vals.push(a.eval(row, env, m)?);
+                }
+                eval_range_ctor(*elem, &vals)
+            }
             // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One
             // operator_eval (the per-element/arg count walk is unmetered, like the array
             // introspectors §3.3); arguments charge their own evaluation. Non-strict — no blanket
@@ -17659,6 +17808,17 @@ mod registry_tests {
                 assert!(
                     o.result == "anyelement" || ScalarType::from_name(o.result).is_some(),
                     "range function {} has unhandled result code {}",
+                    o.name,
+                    o.result
+                );
+                continue;
+            }
+            if is_range_ctor_name(o.name) {
+                // A range constructor (range-functions.md §2): no scalar kernel id — the kernel is
+                // `eval_range_ctor`, reached from the resolver. Its result is a concrete range id.
+                assert!(
+                    crate::range::range_by_name(o.result).is_some(),
+                    "range constructor {} has non-range result code {}",
                     o.name,
                     o.result
                 );

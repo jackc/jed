@@ -17,7 +17,8 @@
 #      to be comparable and the family to have a promotion rule (compare.toml)
 #   6. null is "propagates" | "detects" | "kleene" | "null_safe" | "none" (null_safe = the
 #      NULL-safe equality discipline of IS [NOT] DISTINCT FROM; none = the non-strict array
-#      builders — the kernel handles NULL, the resolver does not short-circuit it)
+#      builders + the range constructors — the kernel handles NULL (a NULL range bound is an
+#      infinite bound), the resolver does not short-circuit it)
 #   7. every code in `errors` exists in registry.toml
 #   8. kind is a known kind (comparison | null_test | arithmetic | logical | concat;
 #      function reserved). "concat" is the `||` array concatenation operator (§8).
@@ -107,6 +108,7 @@ def main
   scalars = TomlRB.load_file(File.join(SPEC_DIR, "types", "scalars.toml"))
   compare = TomlRB.load_file(File.join(SPEC_DIR, "types", "compare.toml"))
   registry = TomlRB.load_file(File.join(SPEC_DIR, "errors", "registry.toml"))
+  ranges = TomlRB.load_file(File.join(SPEC_DIR, "types", "ranges.toml"))
 
   # (1) schema_version
   fail!("catalog.toml: schema_version must be 2") unless catalog["schema_version"] == 2
@@ -114,6 +116,7 @@ def main
   # reference sets drawn from the canonical type/error tables
   families   = (scalars["type"] || []).map { |t| t["family"] }.to_set
   scalar_ids = (scalars["type"] || []).map { |t| t["id"] }.to_set
+  range_ids  = (ranges["range"] || []).map { |r| r["id"] }.to_set
   error_codes = (registry["error"] || []).map { |e| e["code"] }.to_set
   promotion_families = (compare["promotion"] || []).map { |p| p["family"] }.to_set
   comparable_pairs = (compare["comparable"] || []).map { |c| [c["left_family"], c["right_family"]] }.to_set
@@ -156,12 +159,14 @@ def main
       fail!("operator #{id}: arg family #{fam.inspect} is not a family in scalars.toml") unless families.include?(fam)
     end
 
-    # (4) result is a scalar id, a reserved id, or a concrete array result `<scalar>[]`
-    # (array_positions → "i32[]"; the resolver reads it as Array(scalar) — array-functions.md §8).
+    # (4) result is a scalar id, a reserved id, a concrete array result `<scalar>[]`
+    # (array_positions → "i32[]"; the resolver reads it as Array(scalar) — array-functions.md §8),
+    # or a concrete RANGE id (the range constructors → "i32range" etc.; the resolver reads it via the
+    # RANGES table as Range(element) — range-functions.md §2).
     result = op["result"]
     array_result = result.is_a?(String) && result.end_with?("[]") && scalar_ids.include?(result[0..-3])
-    unless scalar_ids.include?(result) || RESERVED_RESULTS.include?(result) || array_result
-      fail!("operator #{id}: result #{result.inspect} is neither a scalar id, a reserved id (#{RESERVED_RESULTS.to_a.join('|')}), nor a concrete array `<scalar>[]`")
+    unless scalar_ids.include?(result) || RESERVED_RESULTS.include?(result) || array_result || range_ids.include?(result)
+      fail!("operator #{id}: result #{result.inspect} is neither a scalar id, a reserved id (#{RESERVED_RESULTS.to_a.join('|')}), a concrete array `<scalar>[]`, nor a range id")
     end
 
     # (5) arg_resolution; promote must reference a comparable pair + promotion rule
