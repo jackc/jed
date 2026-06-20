@@ -211,11 +211,14 @@ import {
   rangeContains,
   rangeContainsElem,
   rangeForElement,
+  rangeIntersect,
+  rangeMinus,
   rangeNameForElement,
   rangeOverlaps,
   rangeOverleft,
   rangeOverright,
   rangeTotalCmp,
+  rangeUnion,
 } from "./range.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
 
@@ -6335,6 +6338,7 @@ export class Database {
       case "rangeFunc":
       case "rangeCtor":
       case "rangeOp":
+      case "rangeSetOp":
       case "variadic":
         e.args = e.args.map((a) =>
           this.foldUncorrelatedInRExpr(a, bound, ctes, cost),
@@ -6642,6 +6646,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "rangeFunc":
     case "rangeCtor":
     case "rangeOp":
+    case "rangeSetOp":
     case "variadic":
       return e.args.every(rexprIsConstant);
     case "inValues":
@@ -7524,6 +7529,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "rangeFunc":
     case "rangeCtor":
     case "rangeOp":
+    case "rangeSetOp":
     case "variadic":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
@@ -7611,6 +7617,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "rangeFunc":
     case "rangeCtor":
     case "rangeOp":
+    case "rangeSetOp":
     case "variadic":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
@@ -7960,6 +7967,13 @@ type RExpr =
   // to coerce the bare-element operand to the range's element type at eval; unused (but carried) for
   // the range-against-range operators.
   | { kind: "rangeOp"; op: RangeOpName; args: RExpr[]; elem: ScalarType }
+  // A range SET operator (spec/design/range-functions.md §4 — `+` union, `-` difference, `*`
+  // intersection, and range_merge). `args` are the two range operands. STRICT: a NULL operand → NULL
+  // (handled in the eval arm). Unlike "rangeOp" it carries no element scalar — the kernels work off
+  // the self-describing operand values, and the result range type is fixed at resolve. The kernels
+  // (rangeUnion/rangeIntersect/rangeMinus) live in range.ts; `+`/`-` raise 22000 on a non-contiguous
+  // result.
+  | { kind: "rangeSetOp"; op: RangeSetOpName; args: RExpr[] }
   // A VARIADIC argument-counting call (spec/design/array-functions.md §12 — num_nulls/num_nonnulls).
   // Non-strict (null = "none"), like "arrayFunc": no blanket NULL short-circuit. `arrayForm` records
   // the call shape — false = the spread form (count `args`' null-ness directly, never NULL); true =
@@ -8101,6 +8115,16 @@ type RangeOpName =
   | "overleft" // a &< b — a does not extend to the right of b
   | "overright" // a &> b — a does not extend to the left of b
   | "adjacent"; // a -|- b — a and b are adjacent
+
+// RangeSetOpName is the internal identity of a range SET operator node (spec/design/range-functions.md
+// §4, RF4). Each combines two ranges over a common element type into a new range. "union"/"difference"
+// raise 22000 on a non-contiguous result; "intersect"/"merge" never error. The kernels live in
+// range.ts.
+type RangeSetOpName =
+  | "union" // a + b — the smallest single range covering both (22000 if they leave a gap)
+  | "intersect" // a * b — the overlap (empty when the ranges are disjoint)
+  | "difference" // a - b — the part of a not in b (22000 if b splits a in two)
+  | "merge"; // range_merge(a, b) — like union but spans any gap silently (never errors)
 
 // VariadicFuncName is the internal identity of a VARIADIC counting-function node
 // (spec/design/array-functions.md §12). Both return i32; the call form lives on the node.
@@ -9733,6 +9757,12 @@ function resolveRangeFunc(
   const { elem, matched } = matchPoly(slots, tys);
   if (!matched) throw noFuncOverload(name);
   const type = polyResultType(desc.result, elem);
+  // range_merge(anyrange, anyrange) → anyrange is a SET operation (= union, non-strict), not a scalar
+  // accessor: emit the shared "rangeSetOp" node (range-functions.md §4). polyResultType already raised
+  // 42P18 if the element was indeterminate (both args untyped NULL), so the result type is bound here.
+  if (name === "range_merge") {
+    return { node: { kind: "rangeSetOp", op: "merge", args: rargs }, type };
+  }
   return { node: { kind: "rangeFunc", func: rangeFuncId(name), args: rargs }, type };
 }
 
@@ -11807,6 +11837,17 @@ function resolveBinary(
       // integer arithmetic; at least one decimal → decimal arithmetic (the integer operand
       // widens at eval); a text/boolean operand is a 42804 (spec/design/decimal.md §4).
       const p = resolveOperandPair(scope, lhs, rhs, ag, params);
+      // Range set operators (RF4, spec/design/range-functions.md §4): `+` union, `-` difference, `*`
+      // intersection over two ranges. A range operand in any of these three is the set-op axis — both
+      // operands must be ranges of a common element type, else 42883 (matching PG's "operator does not
+      // exist"); the numeric/temporal arithmetic below never sees a range. `/` and `%` have no range
+      // meaning and fall straight through.
+      if (
+        (op === "add" || op === "sub" || op === "mul") &&
+        (p.lt.kind === "range" || p.rt.kind === "range")
+      ) {
+        return resolveRangeSetOp(op, p.rl, p.lt, p.rr, p.rt);
+      }
       // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5). Checked
       // before the ±-only temporal rule below.
       const scaled = intervalScaleResult(op, p.lt.kind, p.rt.kind);
@@ -12120,6 +12161,49 @@ function resolveRangeOp(
     return { node: { kind: "rangeOp", op: "elemContainedBy", args: [le.node, rr.node], elem }, type: { kind: "bool" } };
   }
   throw noSetOpOverload();
+}
+
+// resolveRangeSetOp resolves a range SET operator (`+` union, `-` difference, `*` intersection —
+// range-functions.md §4), reached from resolveBinary when a `+`/`-`/`*` has a range operand (the
+// operands are already resolved). Both must be ranges over the SAME element type — a range × non-range,
+// or a cross-element pair, is 42883 (PG's "operator does not exist"); a bare untyped NULL beside a range
+// is taken as a NULL range (the range×range overload; eval → NULL, strict). The result is a range over
+// that element type. range_merge does NOT come through here (it is a function call — see
+// resolveRangeFunc); it shares the "rangeSetOp" node with op = "merge".
+function resolveRangeSetOp(
+  op: BinaryOp,
+  rl: RExpr,
+  lt: ResolvedType,
+  rr: RExpr,
+  rt: ResolvedType,
+): { node: RExpr; type: ResolvedType } {
+  let elem: ScalarType;
+  if (lt.kind === "range" && rt.kind === "range") {
+    const le = resolvedRangeElementScalar(lt.elem);
+    const re = resolvedRangeElementScalar(rt.elem);
+    if (le === undefined || re === undefined || le !== re) throw noSetOpOverload();
+    elem = le;
+  } else if (lt.kind === "range" && rt.kind === "null") {
+    const le = resolvedRangeElementScalar(lt.elem);
+    if (le === undefined) throw noSetOpOverload();
+    elem = le;
+  } else if (lt.kind === "null" && rt.kind === "range") {
+    const re = resolvedRangeElementScalar(rt.elem);
+    if (re === undefined) throw noSetOpOverload();
+    elem = re;
+  } else {
+    // A range paired with a non-range (or any other combination) — no such operator.
+    throw noSetOpOverload();
+  }
+  let setop: RangeSetOpName;
+  if (op === "add") setop = "union";
+  else if (op === "sub") setop = "difference";
+  else if (op === "mul") setop = "intersect";
+  else throw new Error("resolveRangeSetOp is only called for +, -, *");
+  return {
+    node: { kind: "rangeSetOp", op: setop, args: [rl, rr] },
+    type: { kind: "range", elem: resolvedTypeOf(elem) },
+  };
 }
 
 // resolveQuantified resolves a quantified array comparison `x op ANY/SOME/ALL(arr)`
@@ -13211,6 +13295,25 @@ function evalRangeOp(op: RangeOpName, l: Value, r: Value, elem: ScalarType): Val
       break;
   }
   return boolValue(result);
+}
+
+// evalRangeSetOp evaluates a range SET operator (range-functions.md §4, RF4) over two already-evaluated
+// operand values. STRICT: a NULL operand → NULL. "union"/"difference" raise 22000 on a non-contiguous
+// result; "intersect"/"merge" never error. The kernels live in range.ts.
+function evalRangeSetOp(op: RangeSetOpName, l: Value, r: Value): Value {
+  if (l.kind === "null" || r.kind === "null") return nullValue();
+  const a = expectRange(l);
+  const b = expectRange(r);
+  switch (op) {
+    case "union":
+      return rangeUnion(a, b, true);
+    case "merge":
+      return rangeUnion(a, b, false);
+    case "intersect":
+      return rangeIntersect(a, b);
+    case "difference":
+      return rangeMinus(a, b);
+  }
 }
 
 // notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
@@ -15012,6 +15115,14 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const l = evalExpr(e.args[0]!, row, env, m);
       const r = evalExpr(e.args[1]!, row, env, m);
       return evalRangeOp(e.op, l, r, e.elem);
+    }
+    case "rangeSetOp": {
+      // A range SET operator (spec/design/range-functions.md §4). One operator_eval; the operands
+      // charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in evalRangeSetOp.
+      m.charge(COSTS.operatorEval);
+      const l = evalExpr(e.args[0]!, row, env, m);
+      const r = evalExpr(e.args[1]!, row, env, m);
+      return evalRangeSetOp(e.op, l, r);
     }
     case "variadic": {
       // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval

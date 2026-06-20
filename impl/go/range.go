@@ -501,6 +501,132 @@ func boundsTouch(upper *Value, upperInc bool, lower *Value, lowerInc bool) bool 
 	return rangeElemCmp(*upper, *lower) == 0 && upperInc != lowerInc
 }
 
+// --- set operators (RF4, spec/design/range-functions.md §4) -----------------
+// The three set operators `+`/`*`/`-` and `range_merge`, over CANONICAL range values (PG
+// range_union/range_intersect/range_minus, rangetypes.c). They reuse the same cmpBound/cmpBounds
+// bound comparison as the boolean operators above; the result bounds are taken from the operands'
+// (already-canonical) bounds, so no re-canonicalization is needed — only makeRange's
+// empty-normalization applies (PG's make_range minus the canonicalize step the operands satisfy).
+// `+` and `-` raise 22000 when the result would not be a single contiguous range; `*` and
+// range_merge never error.
+
+// makeRange assembles a range from selected bounds (PG make_range, minus the discrete canonicalize
+// step the operands already satisfy): force an infinite bound's inclusivity off, then collapse to
+// `empty` when the bounds cross (lower > upper) or meet at one value without both being inclusive. A
+// nil bound is infinite.
+func makeRange(lower, upper *Value, lowerInc, upperInc bool) *RangeVal {
+	if lower == nil {
+		lowerInc = false
+	}
+	if upper == nil {
+		upperInc = false
+	}
+	if lower != nil && upper != nil {
+		switch c := rangeElemCmp(*lower, *upper); {
+		case c > 0:
+			return EmptyRangeVal()
+		case c == 0 && !(lowerInc && upperInc):
+			return EmptyRangeVal()
+		}
+	}
+	return &RangeVal{Empty: false, Lower: lower, Upper: upper, LowerInc: lowerInc, UpperInc: upperInc}
+}
+
+// rangeUnion is `a + b` (union) and range_merge(a, b) — the smallest single range covering both (PG
+// range_union_internal). With strict (the `+` operator) the two ranges must overlap or be adjacent,
+// else the union would span a gap and is 22000; range_merge (strict == false) spans the gap silently.
+// An empty operand yields the other unchanged.
+func rangeUnion(a, b *RangeVal, strict bool) (*RangeVal, error) {
+	if a.Empty {
+		return b, nil
+	}
+	if b.Empty {
+		return a, nil
+	}
+	if strict && !rangeOverlaps(a, b) && !rangeAdjacent(a, b) {
+		return nil, NewError(DataException, "result of range union would not be contiguous")
+	}
+	// result lower = the lesser lower bound; result upper = the greater upper bound.
+	var lower *Value
+	var lowerInc bool
+	if cmpBound(a.Lower, a.LowerInc, b.Lower, b.LowerInc, true) < 0 {
+		lower, lowerInc = a.Lower, a.LowerInc
+	} else {
+		lower, lowerInc = b.Lower, b.LowerInc
+	}
+	var upper *Value
+	var upperInc bool
+	if cmpBound(a.Upper, a.UpperInc, b.Upper, b.UpperInc, false) > 0 {
+		upper, upperInc = a.Upper, a.UpperInc
+	} else {
+		upper, upperInc = b.Upper, b.UpperInc
+	}
+	return &RangeVal{Empty: false, Lower: lower, Upper: upper, LowerInc: lowerInc, UpperInc: upperInc}, nil
+}
+
+// rangeIntersect is `a * b` (intersection) — the overlap of two ranges (PG range_intersect_internal),
+// or `empty` when they do not overlap (disjoint, merely adjacent, or either operand empty). Never
+// errors.
+func rangeIntersect(a, b *RangeVal) *RangeVal {
+	if a.Empty || b.Empty || !rangeOverlaps(a, b) {
+		return EmptyRangeVal()
+	}
+	// result lower = the greater lower bound; result upper = the lesser upper bound.
+	var lower *Value
+	var lowerInc bool
+	if cmpBound(a.Lower, a.LowerInc, b.Lower, b.LowerInc, true) >= 0 {
+		lower, lowerInc = a.Lower, a.LowerInc
+	} else {
+		lower, lowerInc = b.Lower, b.LowerInc
+	}
+	var upper *Value
+	var upperInc bool
+	if cmpBound(a.Upper, a.UpperInc, b.Upper, b.UpperInc, false) <= 0 {
+		upper, upperInc = a.Upper, a.UpperInc
+	} else {
+		upper, upperInc = b.Upper, b.UpperInc
+	}
+	return makeRange(lower, upper, lowerInc, upperInc)
+}
+
+// rangeMinus is `a - b` (difference) — the part of `a` not covered by `b` (PG range_minus_internal).
+// 22000 when `b` lies strictly inside `a` and would split it into two pieces (a non-contiguous
+// result). An empty operand, or a `b` disjoint from `a`, yields `a` unchanged.
+func rangeMinus(a, b *RangeVal) (*RangeVal, error) {
+	if a.Empty || b.Empty {
+		return a, nil
+	}
+	cmpL1L2 := cmpBounds(a.Lower, a.LowerInc, true, b.Lower, b.LowerInc, true)
+	cmpL1U2 := cmpBounds(a.Lower, a.LowerInc, true, b.Upper, b.UpperInc, false)
+	cmpU1L2 := cmpBounds(a.Upper, a.UpperInc, false, b.Lower, b.LowerInc, true)
+	cmpU1U2 := cmpBounds(a.Upper, a.UpperInc, false, b.Upper, b.UpperInc, false)
+
+	// `b` strictly inside `a` (a.lower < b.lower and a.upper > b.upper): removing it leaves two
+	// disjoint pieces — a non-contiguous result.
+	if cmpL1L2 < 0 && cmpU1U2 > 0 {
+		return nil, NewError(DataException, "result of range difference would not be contiguous")
+	}
+	// `a` and `b` do not overlap: `a` is unchanged.
+	if cmpL1U2 > 0 || cmpU1L2 < 0 {
+		return a, nil
+	}
+	// `a` is wholly within `b`: nothing remains.
+	if cmpL1L2 >= 0 && cmpU1U2 <= 0 {
+		return EmptyRangeVal(), nil
+	}
+	// `b` covers the right part of `a`: keep `[a.lower, b.lower)` — `b`'s lower bound becomes the
+	// result's upper bound, so its inclusivity flips.
+	if cmpL1L2 <= 0 && cmpU1L2 >= 0 && cmpU1U2 <= 0 {
+		return makeRange(a.Lower, b.Lower, a.LowerInc, !b.LowerInc), nil
+	}
+	// `b` covers the left part of `a`: keep `[b.upper, a.upper)` — `b`'s upper bound becomes the
+	// result's lower bound, so its inclusivity flips.
+	if cmpL1L2 >= 0 && cmpU1U2 >= 0 && cmpL1U2 <= 0 {
+		return makeRange(b.Upper, a.Upper, !b.UpperInc, a.UpperInc), nil
+	}
+	panic("unexpected case in rangeMinus")
+}
+
 // --- text output -----------------------------------------------------------
 
 // rangeOut renders a range value as PG range_out (spec/design/ranges.md §5): `empty`, or

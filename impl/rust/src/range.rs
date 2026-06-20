@@ -599,6 +599,211 @@ fn bounds_touch(
     }
 }
 
+// --- set operators (RF4, spec/design/range-functions.md §4) -----------------
+// The three set operators `+`/`*`/`-` and `range_merge`, over CANONICAL range values (PG
+// `range_union`/`range_intersect`/`range_minus`, rangetypes.c). They reuse the same `cmp_bound`/
+// `cmp_bounds` bound comparison as the boolean operators above; the result bounds are taken from the
+// operands' (already-canonical) bounds, so no re-canonicalization is needed — only `make_range`'s
+// empty-normalization applies (PG's make_range minus the canonicalize step the operands satisfy).
+// `+` and `-` raise `22000` when the result would not be a single contiguous range; `*` and
+// `range_merge` never error.
+
+/// Assemble a range from selected bounds (PG `make_range`, minus the discrete canonicalize step the
+/// operands already satisfy): force an infinite bound's inclusivity off, then collapse to `empty`
+/// when the bounds cross (`lower > upper`) or meet at one value without both being inclusive.
+fn make_range(
+    lower: Option<Box<Value>>,
+    upper: Option<Box<Value>>,
+    mut lower_inc: bool,
+    mut upper_inc: bool,
+) -> RangeVal {
+    if lower.is_none() {
+        lower_inc = false;
+    }
+    if upper.is_none() {
+        upper_inc = false;
+    }
+    if let (Some(lo), Some(hi)) = (&lower, &upper) {
+        match elem_cmp(lo, hi) {
+            Ordering::Greater => return RangeVal::empty(),
+            Ordering::Equal if !(lower_inc && upper_inc) => return RangeVal::empty(),
+            _ => {}
+        }
+    }
+    RangeVal {
+        empty: false,
+        lower,
+        upper,
+        lower_inc,
+        upper_inc,
+    }
+}
+
+/// `a + b` (union) and `range_merge(a, b)` — the smallest single range covering both (PG
+/// `range_union_internal`). With `strict` (the `+` operator) the two ranges must overlap or be
+/// adjacent, else the union would span a gap and is `22000`; `range_merge` (`strict = false`) spans
+/// the gap silently. An empty operand yields the other unchanged.
+pub fn range_union(a: &RangeVal, b: &RangeVal, strict: bool) -> Result<RangeVal> {
+    if a.empty {
+        return Ok(b.clone());
+    }
+    if b.empty {
+        return Ok(a.clone());
+    }
+    if strict && !range_overlaps(a, b) && !range_adjacent(a, b) {
+        return Err(EngineError::new(
+            SqlState::DataException,
+            "result of range union would not be contiguous".to_string(),
+        ));
+    }
+    // result lower = the lesser lower bound; result upper = the greater upper bound.
+    let (lower, lower_inc) = if cmp_bound(
+        a.lower.as_deref(),
+        a.lower_inc,
+        b.lower.as_deref(),
+        b.lower_inc,
+        true,
+    ) == Ordering::Less
+    {
+        (a.lower.clone(), a.lower_inc)
+    } else {
+        (b.lower.clone(), b.lower_inc)
+    };
+    let (upper, upper_inc) = if cmp_bound(
+        a.upper.as_deref(),
+        a.upper_inc,
+        b.upper.as_deref(),
+        b.upper_inc,
+        false,
+    ) == Ordering::Greater
+    {
+        (a.upper.clone(), a.upper_inc)
+    } else {
+        (b.upper.clone(), b.upper_inc)
+    };
+    Ok(RangeVal {
+        empty: false,
+        lower,
+        upper,
+        lower_inc,
+        upper_inc,
+    })
+}
+
+/// `a * b` (intersection) — the overlap of two ranges (PG `range_intersect_internal`), or `empty`
+/// when they do not overlap (disjoint, merely adjacent, or either operand empty). Never errors.
+pub fn range_intersect(a: &RangeVal, b: &RangeVal) -> RangeVal {
+    if a.empty || b.empty || !range_overlaps(a, b) {
+        return RangeVal::empty();
+    }
+    // result lower = the greater lower bound; result upper = the lesser upper bound.
+    let (lower, lower_inc) = if cmp_bound(
+        a.lower.as_deref(),
+        a.lower_inc,
+        b.lower.as_deref(),
+        b.lower_inc,
+        true,
+    ) != Ordering::Less
+    {
+        (a.lower.clone(), a.lower_inc)
+    } else {
+        (b.lower.clone(), b.lower_inc)
+    };
+    let (upper, upper_inc) = if cmp_bound(
+        a.upper.as_deref(),
+        a.upper_inc,
+        b.upper.as_deref(),
+        b.upper_inc,
+        false,
+    ) != Ordering::Greater
+    {
+        (a.upper.clone(), a.upper_inc)
+    } else {
+        (b.upper.clone(), b.upper_inc)
+    };
+    make_range(lower, upper, lower_inc, upper_inc)
+}
+
+/// `a - b` (difference) — the part of `a` not covered by `b` (PG `range_minus_internal`). `22000`
+/// when `b` lies strictly inside `a` and would split it into two pieces (a non-contiguous result).
+/// An empty operand, or a `b` disjoint from `a`, yields `a` unchanged.
+pub fn range_minus(a: &RangeVal, b: &RangeVal) -> Result<RangeVal> {
+    if a.empty || b.empty {
+        return Ok(a.clone());
+    }
+    let cmp_l1l2 = cmp_bounds(
+        a.lower.as_deref(),
+        a.lower_inc,
+        true,
+        b.lower.as_deref(),
+        b.lower_inc,
+        true,
+    );
+    let cmp_l1u2 = cmp_bounds(
+        a.lower.as_deref(),
+        a.lower_inc,
+        true,
+        b.upper.as_deref(),
+        b.upper_inc,
+        false,
+    );
+    let cmp_u1l2 = cmp_bounds(
+        a.upper.as_deref(),
+        a.upper_inc,
+        false,
+        b.lower.as_deref(),
+        b.lower_inc,
+        true,
+    );
+    let cmp_u1u2 = cmp_bounds(
+        a.upper.as_deref(),
+        a.upper_inc,
+        false,
+        b.upper.as_deref(),
+        b.upper_inc,
+        false,
+    );
+
+    // `b` strictly inside `a` (a.lower < b.lower and a.upper > b.upper): removing it leaves two
+    // disjoint pieces — a non-contiguous result.
+    if cmp_l1l2 == Ordering::Less && cmp_u1u2 == Ordering::Greater {
+        return Err(EngineError::new(
+            SqlState::DataException,
+            "result of range difference would not be contiguous".to_string(),
+        ));
+    }
+    // `a` and `b` do not overlap: `a` is unchanged.
+    if cmp_l1u2 == Ordering::Greater || cmp_u1l2 == Ordering::Less {
+        return Ok(a.clone());
+    }
+    // `a` is wholly within `b`: nothing remains.
+    if cmp_l1l2 != Ordering::Less && cmp_u1u2 != Ordering::Greater {
+        return Ok(RangeVal::empty());
+    }
+    // `b` covers the right part of `a`: keep `[a.lower, b.lower)` — `b`'s lower bound becomes the
+    // result's upper bound, so its inclusivity flips.
+    if cmp_l1l2 != Ordering::Greater && cmp_u1l2 != Ordering::Less && cmp_u1u2 != Ordering::Greater
+    {
+        return Ok(make_range(
+            a.lower.clone(),
+            b.lower.clone(),
+            a.lower_inc,
+            !b.lower_inc,
+        ));
+    }
+    // `b` covers the left part of `a`: keep `[b.upper, a.upper)` — `b`'s upper bound becomes the
+    // result's lower bound, so its inclusivity flips.
+    if cmp_l1l2 != Ordering::Less && cmp_u1u2 != Ordering::Less && cmp_l1u2 != Ordering::Greater {
+        return Ok(make_range(
+            b.upper.clone(),
+            a.upper.clone(),
+            !b.upper_inc,
+            a.upper_inc,
+        ));
+    }
+    unreachable!("unexpected case in range_minus")
+}
+
 // --- text output -----------------------------------------------------------
 
 /// Render a range value as PG `range_out` (spec/design/ranges.md §5): `empty`, or

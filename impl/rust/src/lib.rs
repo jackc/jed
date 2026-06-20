@@ -118,6 +118,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // @> element / element <@ range overloads) and the range-only << >> &< &> -|-, each
     // anyrange<op>anyrange → boolean; STRICT, definite boolean, same-element-type operands.
     "func.range_operators",
+    // Range set operators RF4 (range-functions.md §4): + union, * intersection, - difference (the
+    // arithmetic tokens, dispatched by range operand) and range_merge, each anyrange<op>anyrange →
+    // anyrange; STRICT; + and - raise 22000 on a non-contiguous result, * and range_merge never error.
+    "func.range_set_operators",
     // Array function/operator surface AF1 (array-functions.md): the polymorphic anyarray/anyelement
     // resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
     // (array_append/prepend/cat).

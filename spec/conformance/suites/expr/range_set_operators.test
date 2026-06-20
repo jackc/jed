@@ -1,0 +1,179 @@
+# Range set operators (spec/design/range-functions.md §4, RF4): the three set operators + (union),
+# * (intersection), - (difference) over two ranges of a common element type, plus the range_merge
+# function. The operators reuse the arithmetic tokens (no new grammar) — a +/-/* with a range operand
+# is dispatched to the range axis, anyrange <op> anyrange → anyrange. All STRICT (a NULL operand →
+# NULL). + and - raise 22000 on a non-contiguous result; * and range_merge never error. Empty-range
+# edges follow PG. Oracle-pinned vs postgres:18. Format: ../../../design/conformance.md.
+# requires: query.select, types.range, types.i32, types.decimal, types.date, func.range_constructors, func.range_accessors, func.range_operators, func.range_set_operators, resource.cost_metering
+
+# --- + union: contiguous, adjacent, empty operands ---
+
+# overlapping → merged; adjacent (touch at one boundary) → merged; an empty operand → the other
+# unchanged; both empty → empty.
+query TTTTT nosort
+SELECT
+  int4range(1,5) + int4range(4,8),
+  int4range(1,5) + int4range(5,8),
+  int4range(1,5) + 'empty'::int4range,
+  'empty'::int4range + int4range(1,5),
+  'empty'::int4range + 'empty'::int4range
+----
+[1,8)
+[1,8)
+[1,5)
+[1,5)
+empty
+
+# unbounded sides: (,5) + [3,) spans to (,); [1,) + (,5) → (,).
+query TT nosort
+SELECT
+  int4range(NULL,5) + int4range(3,NULL),
+  int4range(1,NULL) + int4range(NULL,5)
+----
+(,)
+(,)
+
+# A non-contiguous union (a gap between the ranges) is 22000.
+statement error 22000
+SELECT int4range(1,5) + int4range(7,8)
+
+# --- * intersection ---
+
+# overlap → the shared part; disjoint → empty; merely adjacent (no shared point) → empty; either
+# empty → empty.
+query TTTT nosort
+SELECT
+  int4range(1,10) * int4range(4,8),
+  int4range(1,5) * int4range(7,9),
+  int4range(1,5) * int4range(5,9),
+  int4range(1,5) * 'empty'::int4range
+----
+[4,8)
+empty
+empty
+empty
+
+# unbounded sides intersect to the bounded overlap.
+query T nosort
+SELECT int4range(NULL,10) * int4range(5,NULL)
+----
+[5,10)
+
+# --- - difference ---
+
+# b covers the right part of a → left remainder; b covers the left part → right remainder; b
+# disjoint from a → a unchanged; b wholly covers a → empty; an empty subtrahend → a unchanged.
+query TTTTT nosort
+SELECT
+  int4range(1,10) - int4range(5,20),
+  int4range(5,20) - int4range(1,10),
+  int4range(1,5) - int4range(7,9),
+  int4range(3,6) - int4range(1,10),
+  int4range(1,5) - 'empty'::int4range
+----
+[1,5)
+[10,20)
+[1,5)
+empty
+[1,5)
+
+# subtracting an unbounded-below range trims a's lower part.
+query T nosort
+SELECT int4range(1,10) - int4range(NULL,5)
+----
+[5,10)
+
+# A difference whose result would be two pieces (b strictly inside a) is 22000.
+statement error 22000
+SELECT int4range(1,10) - int4range(3,6)
+
+# --- no overload: a range × non-range, or a cross-element pair, is 42883 ---
+
+# `range + element` has no overload (only ranges combine) — 42883, matching PG.
+statement error 42883
+SELECT int4range(1,5) + 5
+
+statement error 42883
+SELECT int4range(1,5) * 5
+
+# a set operator pairs only with a range over the SAME element type (int4range vs int8range).
+statement error 42883
+SELECT int4range(1,5) + int8range(1,5)
+
+statement error 42883
+SELECT int4range(1,5) * int8range(1,5)
+
+statement error 42883
+SELECT int4range(1,5) - int8range(1,5)
+
+# --- range_merge: union without the contiguity check (spans any gap) ---
+
+query TTT nosort
+SELECT
+  range_merge(int4range(1,5), int4range(4,8)),
+  range_merge(int4range(1,5), int4range(10,20)),
+  range_merge('empty'::int4range, int4range(5,8))
+----
+[1,8)
+[1,20)
+[5,8)
+
+# --- numrange (continuous) and daterange ---
+
+query TTT nosort
+SELECT
+  numrange(1,3) + numrange(2,5),
+  numrange(1,5,'[]') * numrange(3,8,'[]'),
+  numrange(1,10) - numrange(5,20)
+----
+[1,5)
+[3,5]
+[1,5)
+
+query T nosort
+SELECT daterange('2024-01-01','2024-02-01') + daterange('2024-01-15','2024-03-01')
+----
+[2024-01-01,2024-03-01)
+
+# --- NULL propagation (STRICT): a NULL range operand → NULL ---
+
+query TTTT nosort
+SELECT
+  int4range(1,5) + NULL::int4range,
+  NULL::int4range * int4range(1,5),
+  int4range(1,5) - NULL::int4range,
+  range_merge(int4range(1,5), NULL::int4range)
+----
+NULL
+NULL
+NULL
+NULL
+
+# --- the set operators producing a value used in a predicate / projection ---
+
+statement ok
+CREATE TABLE spans (id i32 PRIMARY KEY, r int4range)
+
+statement ok
+INSERT INTO spans VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)')
+
+# union each overlapping span with [4,6): the && predicate keeps only the rows that overlap (so the
+# union stays contiguous and never trips 22000) — [1,5) → [1,6) and [3,8) → [3,8); [10,20) is excluded.
+query IT rowsort
+SELECT id, r + int4range(4,6) FROM spans WHERE r && int4range(4,6)
+----
+1
+[1,6)
+3
+[3,8)
+
+# the intersection of each span with [4,11), where non-empty.
+query IT rowsort
+SELECT id, r * int4range(4,11) FROM spans WHERE NOT isempty(r * int4range(4,11))
+----
+1
+[4,5)
+2
+[10,11)
+3
+[4,8)

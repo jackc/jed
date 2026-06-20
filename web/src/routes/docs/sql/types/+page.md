@@ -12,6 +12,14 @@
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
   (1 = NULL)      AS one_eq_null;`;
+
+	const rangeDemo = `SELECT
+  int4range(1, 10)                               AS r,
+  int4range(1, 10) @> 5                           AS contains_5,
+  int4range(1, 10) && int4range(8, 20)            AS overlaps,
+  int4range(1, 10) + int4range(8, 20)             AS unioned,
+  int4range(1, 10) * int4range(8, 20)             AS intersected,
+  range_merge(int4range(1,5), int4range(20,30))   AS merged;`;
 </script>
 
 <svelte:head>
@@ -47,5 +55,20 @@ Comparisons with `NULL` yield `NULL` (unknown), not `false` — three-valued log
 Note that `NULL = NULL` is `NULL`, while `NULL IS NULL` is `true`:
 
 <LiveSql query={nullDemo} rows={5} />
+
+## Range types
+
+A range is a structural type over a scalar element — PostgreSQL's six built-in ranges
+(`int4range`/`int8range`/`numrange`/`tsrange`/`tstzrange`/`daterange`; jed also spells the integer
+ones `i32range`/`i64range`). A range carries inclusive/exclusive (`[1,5)`) and unbounded (`(,5)`)
+endpoints and a distinguished `empty`; discrete ranges are stored in the canonical `[)` form.
+
+Construct one with a literal cast (`'[1,5)'::int4range`) or a constructor (`int4range(1, 10)`), test
+it with the boolean operators (`@>` contains, `&&` overlaps, `<<`/`>>` strictly left/right, `-|-`
+adjacent), and combine ranges with the set operators — `+` (union), `*` (intersection), `-`
+(difference), and `range_merge`. A union of non-adjacent ranges raises `22000`; `range_merge` spans
+the gap instead:
+
+<LiveSql query={rangeDemo} rows={3} />
 
 See the full [type reference](../../reference/types/) for every scalar type and its range.

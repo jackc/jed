@@ -411,6 +411,133 @@ function boundsTouch(
   return rangeElemCmp(upper, lower) === 0 && upperInc !== lowerInc;
 }
 
+// --- set operators (RF4, spec/design/range-functions.md §4) -----------------
+// The three set operators `+`/`*`/`-` and `range_merge`, over CANONICAL range values (PG
+// range_union/range_intersect/range_minus, rangetypes.c). They reuse the same cmpBound/cmpBounds
+// bound comparison as the boolean operators above; the result bounds are taken from the operands'
+// (already-canonical) bounds, so no re-canonicalization is needed — only makeRange's
+// empty-normalization applies (PG's make_range minus the canonicalize step the operands satisfy).
+// `+` and `-` raise 22000 when the result would not be a single contiguous range; `*` and
+// range_merge never error.
+
+// makeRange assembles a range Value from selected bounds (PG make_range, minus the discrete
+// canonicalize step the operands already satisfy): force an infinite bound's inclusivity off, then
+// collapse to `empty` when the bounds cross (lower > upper) or meet at one value without both being
+// inclusive.
+function makeRange(
+  lower: Value | null,
+  upper: Value | null,
+  lowerInc: boolean,
+  upperInc: boolean,
+): Value {
+  if (lower === null) lowerInc = false;
+  if (upper === null) upperInc = false;
+  if (lower !== null && upper !== null) {
+    const c = rangeElemCmp(lower, upper);
+    if (c > 0) return emptyRangeValue();
+    if (c === 0 && !(lowerInc && upperInc)) return emptyRangeValue();
+  }
+  return rangeValue(lower, upper, lowerInc, upperInc);
+}
+
+// rangeUnion is `a + b` (union) and `range_merge(a, b)` — the smallest single range covering both
+// (PG range_union_internal). With `strict` (the `+` operator) the two ranges must overlap or be
+// adjacent, else the union would span a gap and is 22000; range_merge (strict = false) spans the gap
+// silently. An empty operand yields the other unchanged.
+export function rangeUnion(a: RangeShape, b: RangeShape, strict: boolean): Value {
+  if (a.empty) return rangeShapeValue(b);
+  if (b.empty) return rangeShapeValue(a);
+  if (strict && !rangeOverlaps(a, b) && !rangeAdjacent(a, b)) {
+    throw engineError("data_exception", "result of range union would not be contiguous");
+  }
+  // result lower = the lesser lower bound; result upper = the greater upper bound.
+  let lower: Value | null;
+  let lowerInc: boolean;
+  if (cmpBound(a.lower, a.lowerInc, b.lower, b.lowerInc, true) < 0) {
+    lower = a.lower;
+    lowerInc = a.lowerInc;
+  } else {
+    lower = b.lower;
+    lowerInc = b.lowerInc;
+  }
+  let upper: Value | null;
+  let upperInc: boolean;
+  if (cmpBound(a.upper, a.upperInc, b.upper, b.upperInc, false) > 0) {
+    upper = a.upper;
+    upperInc = a.upperInc;
+  } else {
+    upper = b.upper;
+    upperInc = b.upperInc;
+  }
+  return rangeValue(lower, upper, lowerInc, upperInc);
+}
+
+// rangeIntersect is `a * b` (intersection) — the overlap of two ranges (PG range_intersect_internal),
+// or `empty` when they do not overlap (disjoint, merely adjacent, or either operand empty). Never
+// errors.
+export function rangeIntersect(a: RangeShape, b: RangeShape): Value {
+  if (a.empty || b.empty || !rangeOverlaps(a, b)) return emptyRangeValue();
+  // result lower = the greater lower bound; result upper = the lesser upper bound.
+  let lower: Value | null;
+  let lowerInc: boolean;
+  if (cmpBound(a.lower, a.lowerInc, b.lower, b.lowerInc, true) >= 0) {
+    lower = a.lower;
+    lowerInc = a.lowerInc;
+  } else {
+    lower = b.lower;
+    lowerInc = b.lowerInc;
+  }
+  let upper: Value | null;
+  let upperInc: boolean;
+  if (cmpBound(a.upper, a.upperInc, b.upper, b.upperInc, false) <= 0) {
+    upper = a.upper;
+    upperInc = a.upperInc;
+  } else {
+    upper = b.upper;
+    upperInc = b.upperInc;
+  }
+  return makeRange(lower, upper, lowerInc, upperInc);
+}
+
+// rangeMinus is `a - b` (difference) — the part of `a` not covered by `b` (PG range_minus_internal).
+// 22000 when `b` lies strictly inside `a` and would split it into two pieces (a non-contiguous
+// result). An empty operand, or a `b` disjoint from `a`, yields `a` unchanged.
+export function rangeMinus(a: RangeShape, b: RangeShape): Value {
+  if (a.empty || b.empty) return rangeShapeValue(a);
+  const cmpL1L2 = cmpBounds(a.lower, a.lowerInc, true, b.lower, b.lowerInc, true);
+  const cmpL1U2 = cmpBounds(a.lower, a.lowerInc, true, b.upper, b.upperInc, false);
+  const cmpU1L2 = cmpBounds(a.upper, a.upperInc, false, b.lower, b.lowerInc, true);
+  const cmpU1U2 = cmpBounds(a.upper, a.upperInc, false, b.upper, b.upperInc, false);
+
+  // `b` strictly inside `a` (a.lower < b.lower and a.upper > b.upper): removing it leaves two disjoint
+  // pieces — a non-contiguous result.
+  if (cmpL1L2 < 0 && cmpU1U2 > 0) {
+    throw engineError("data_exception", "result of range difference would not be contiguous");
+  }
+  // `a` and `b` do not overlap: `a` is unchanged.
+  if (cmpL1U2 > 0 || cmpU1L2 < 0) return rangeShapeValue(a);
+  // `a` is wholly within `b`: nothing remains.
+  if (cmpL1L2 >= 0 && cmpU1U2 <= 0) return emptyRangeValue();
+  // `b` covers the right part of `a`: keep `[a.lower, b.lower)` — `b`'s lower bound becomes the
+  // result's upper bound, so its inclusivity flips.
+  if (cmpL1L2 <= 0 && cmpU1L2 >= 0 && cmpU1U2 <= 0) {
+    return makeRange(a.lower, b.lower, a.lowerInc, !b.lowerInc);
+  }
+  // `b` covers the left part of `a`: keep `[b.upper, a.upper)` — `b`'s upper bound becomes the
+  // result's lower bound, so its inclusivity flips.
+  if (cmpL1L2 >= 0 && cmpU1U2 >= 0 && cmpL1U2 <= 0) {
+    return makeRange(b.upper, a.upper, !b.upperInc, a.upperInc);
+  }
+  throw new Error("unexpected case in rangeMinus");
+}
+
+// rangeShapeValue rebuilds a Value from a RangeShape (the union/difference "yields the other operand
+// unchanged" paths) — the Rust `clone()` of the unchanged operand.
+function rangeShapeValue(r: RangeShape): Value {
+  if (r.empty) return emptyRangeValue();
+  return rangeValue(r.lower, r.upper, r.lowerInc, r.upperInc);
+}
+
 // --- text output -----------------------------------------------------------
 
 // rangeOut renders a range value as PG range_out (spec/design/ranges.md §5): `empty`, or

@@ -2826,6 +2826,65 @@ result         = "daterange"
 null           = "none"
 errors         = ["22000", "22003", "42601"]
 
+# --- the range set operators + range_merge (../design/range-functions.md §4, RF4) -------------
+# The three set operators `+` (union), `*` (intersection), `-` (difference) over two ranges of a
+# common element type, plus the `range_merge` function. The operators REUSE the arithmetic tokens
+# (no new grammar): a `+`/`-`/`*` with a range operand is dispatched to the range axis at resolve
+# time (resolve_binary → resolve_range_set_op), so these rows are kind "arithmetic" (binary infix,
+# same precedence rung) overloads keyed on the `anyrange` families — the way `@>` is overloaded
+# across array and range (§3). Both operands must be ranges over the SAME element type (a range ×
+# non-range, or a cross-element pair, is 42883), `anyrange <op> anyrange → anyrange`. STRICT (null =
+# "propagates": a NULL operand → NULL). `+` and `-` raise 22000 when the result would not be a
+# single contiguous range (a gap, or `b` splitting `a` in two); `*` and `range_merge` never error.
+# `range_merge(a, b)` is `+` without the contiguity check (it spans any gap) — a kind "function"
+# row routed through resolve_range_func, which emits the shared RangeSetOp node with op = Merge.
+
+[[operator]]
+name           = "range_union"
+symbol         = "+"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "anyrange"
+null           = "propagates"
+precedence     = 40
+errors         = ["22000"]
+
+[[operator]]
+name           = "range_difference"
+symbol         = "-"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "anyrange"
+null           = "propagates"
+precedence     = 40
+errors         = ["22000"]
+
+[[operator]]
+name           = "range_intersect"
+symbol         = "*"
+kind           = "arithmetic"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "anyrange"
+null           = "propagates"
+precedence     = 50
+errors         = []
+
+[[operator]]
+name           = "range_merge"
+kind           = "function"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "anyrange"
+null           = "propagates"
+errors         = []
+
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
 # SINGLE value. They are NOT operators — no infix symbol, no precedence, no

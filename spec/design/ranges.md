@@ -18,8 +18,9 @@
 > semantics are the default (CLAUDE.md §1) and are pinned against the live `postgres:18`
 > oracle — several canonicalization / empty / ordering / text-quoting rules are subtle (§4–§7).
 
-> **Status: R0–R3 landed (the type axis is complete); the function/operator surface is landing —
-> RF1 (accessors) + RF2 (constructors) landed, RF3–RF4 (operators) follow (§11).** R0 (this doc +
+> **Status: R0–R3 landed (the type axis is complete) AND the full function/operator surface landed —
+> RF1 (accessors), RF2 (constructors), RF3 (boolean operators), RF4 (set operators + `range_merge`)
+> are all in (§11). Range types are feature-complete.** R0 (this doc +
 > `ranges.toml` + the codegen'd `RANGES` table) is the spec/data
 > foundation; **R1** threaded the open-`Type` `Range` arm + the `'[1,5)'::i32range` literal/cast
 > through all three cores; **R2** made range **columns** declarable + storable — the value codec
@@ -270,7 +271,7 @@ function/operator surface (RF1–RF4, [range-functions.md](range-functions.md)) 
 | **RF1** | `anyrange`/`anyelement` polymorphism + accessors (`lower`/`upper`/`isempty`/`lower_inc`/`upper_inc`/`lower_inf`/`upper_inf`) |
 | **RF2** | the six constructors (`i32range(lo,hi)` / `(lo,hi,text)`, …) |
 | **RF3** | boolean operators `@>` `<@` `&&` `<<` `>>` `&<` `&>` `-\|-` (+ the new lexer tokens) |
-| **RF4** | set operators `+` `*` `-` + `range_merge` |
+| **RF4** | set operators `+` `*` `-` + `range_merge` (reuse the arithmetic tokens; `+`/`-` raise `22000` on a non-contiguous result) — **range surface complete** |
 
 ## 12. Divergence ledger (jed ≠ PostgreSQL)
 

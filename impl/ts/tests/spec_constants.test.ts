@@ -276,6 +276,13 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
       assert.ok(rangeByName(o.result) !== undefined, `range constructor ${o.name} has non-range result code ${o.result}`);
       continue;
     }
+    // range_merge is the SET range function (range-functions.md §4): result `anyrange`, and NO scalar
+    // accessor kernel (the resolver emits a "rangeSetOp" node, evaluated by evalRangeSetOp), so it
+    // skips rangeFuncId and the accessor result check.
+    if (o.name === "range_merge") {
+      assert.equal(o.result, "anyrange", "range_merge result code");
+      continue;
+    }
     const concreteArray = o.result.endsWith("[]") && scalarTypeFromName(o.result.slice(0, -2)) !== undefined;
     const ok =
       o.result === "promoted" ||

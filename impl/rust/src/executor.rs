@@ -6988,6 +6988,7 @@ impl Database {
             | RExpr::RangeFunc { args, .. }
             | RExpr::RangeCtor { args, .. }
             | RExpr::RangeOp { args, .. }
+            | RExpr::RangeSetOp { args, .. }
             | RExpr::Variadic { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
@@ -8070,6 +8071,21 @@ enum RangeOp {
     Adjacent,
 }
 
+/// The range SET operators (spec/design/range-functions.md §4, RF4). Each combines two ranges over a
+/// common element type into a new range (`RExpr::RangeSetOp`). `Union`/`Difference` raise `22000` on a
+/// non-contiguous result; `Intersect`/`Merge` never error. The kernels live in `range.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RangeSetOp {
+    /// `a + b` — union: the smallest single range covering both (22000 if they leave a gap).
+    Union,
+    /// `a * b` — intersection: the overlap (empty when the ranges are disjoint).
+    Intersect,
+    /// `a - b` — difference: the part of `a` not in `b` (22000 if `b` splits `a` in two).
+    Difference,
+    /// `range_merge(a, b)` — like union but spans any gap between the ranges silently (never errors).
+    Merge,
+}
+
 /// The VARIADIC argument-counting functions (spec/design/array-functions.md §12). Distinct from
 /// [`ScalarFunc`] because they are non-strict (`null = "none"`, like [`ArrayFunc`]) and take either
 /// a spread of arguments or a single array via the `VARIADIC` keyword — the call form is carried on
@@ -8260,6 +8276,16 @@ enum RExpr {
         op: RangeOp,
         args: Vec<RExpr>,
         elem: ScalarType,
+    },
+    /// A range SET operator (spec/design/range-functions.md §4 — `+` union, `-` difference, `*`
+    /// intersection, and `range_merge`). `args` are the two range operands. STRICT: a NULL operand →
+    /// NULL (handled in the eval arm). Unlike [`RExpr::RangeOp`] it carries no element scalar — the
+    /// kernels work off the self-describing operand values, and the result range type is fixed at
+    /// resolve. The kernels (`range_union`/`range_intersect`/`range_minus`) live in `range.rs`;
+    /// `+`/`-` raise 22000 on a non-contiguous result.
+    RangeSetOp {
+        op: RangeSetOp,
+        args: Vec<RExpr>,
     },
     /// A VARIADIC argument-counting call (spec/design/array-functions.md §12 — num_nulls/
     /// num_nonnulls). Non-strict (`null = "none"`): the kernel inspects null-ness itself, so there
@@ -8996,6 +9022,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::RangeFunc { args, .. }
         | RExpr::RangeCtor { args, .. }
         | RExpr::RangeOp { args, .. }
+        | RExpr::RangeSetOp { args, .. }
         | RExpr::Variadic { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
@@ -10310,6 +10337,7 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::RangeFunc { args, .. }
         | RExpr::RangeCtor { args, .. }
         | RExpr::RangeOp { args, .. }
+        | RExpr::RangeSetOp { args, .. }
         | RExpr::Variadic { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
@@ -10414,6 +10442,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::RangeFunc { args, .. }
         | RExpr::RangeCtor { args, .. }
         | RExpr::RangeOp { args, .. }
+        | RExpr::RangeSetOp { args, .. }
         | RExpr::Variadic { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);
@@ -10964,6 +10993,19 @@ fn resolve_range_func(
     }
     let elem = match_poly(slots, &tys).ok_or_else(|| no_func_overload(name))?;
     let result = poly_result_type(desc.result, &elem)?;
+    // `range_merge(anyrange, anyrange) → anyrange` is a SET operation (= union, non-strict), not a
+    // scalar accessor: emit the shared `RangeSetOp` node (range-functions.md §4). `poly_result_type`
+    // already raised 42P18 if the element was indeterminate (both args untyped NULL), so `elem` is
+    // bound here.
+    if name == "range_merge" {
+        return Ok((
+            RExpr::RangeSetOp {
+                op: RangeSetOp::Merge,
+                args: rargs,
+            },
+            result,
+        ));
+    }
     Ok((
         RExpr::RangeFunc {
             func: range_func_id(name),
@@ -13287,6 +13329,16 @@ fn resolve_binary(
             // arithmetic (the integer operand widens at eval); a text/boolean operand is a
             // 42804 (spec/design/decimal.md §4).
             let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
+            // Range set operators (RF4, spec/design/range-functions.md §4): `+` union, `-`
+            // difference, `*` intersection over two ranges. A range operand in any of these three is
+            // the set-op axis — both operands must be ranges of a common element type, else 42883
+            // (matching PG's "operator does not exist"); the numeric/temporal arithmetic below never
+            // sees a range. `/` and `%` have no range meaning and fall straight through.
+            if matches!(op, BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul)
+                && (matches!(lt, ResolvedType::Range(_)) || matches!(rt, ResolvedType::Range(_)))
+            {
+                return resolve_range_set_op(op, rl, lt, rr, rt);
+            }
             // interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5).
             // interval * number, number * interval (commute), interval / number. Checked before
             // the ±-only temporal rule below.
@@ -13624,6 +13676,53 @@ fn resolve_range_op(
         }
         _ => Err(no_set_op_overload()),
     }
+}
+
+/// Resolve a range SET operator (`+` union, `-` difference, `*` intersection — range-functions.md §4),
+/// reached from [`resolve_binary`] when a `+`/`-`/`*` has a range operand (the operands are already
+/// resolved). Both must be ranges over the SAME element type — a range × non-range, or a cross-element
+/// pair, is `42883` (PG's "operator does not exist"); a bare untyped `NULL` beside a range is taken as
+/// a NULL range (the range×range overload; eval → NULL, strict). The result is a range over that
+/// element type. `range_merge` does NOT come through here (it is a function call — see
+/// [`resolve_range_func`]); it shares the [`RExpr::RangeSetOp`] node with `op = Merge`.
+fn resolve_range_set_op(
+    op: BinaryOp,
+    rl: RExpr,
+    lt: ResolvedType,
+    rr: RExpr,
+    rt: ResolvedType,
+) -> Result<(RExpr, ResolvedType)> {
+    let elem = match (&lt, &rt) {
+        (ResolvedType::Range(le), ResolvedType::Range(re)) => {
+            let le = resolved_range_element_scalar(le).expect("a range element is scalar");
+            let re = resolved_range_element_scalar(re).expect("a range element is scalar");
+            if le != re {
+                return Err(no_set_op_overload());
+            }
+            le
+        }
+        (ResolvedType::Range(le), ResolvedType::Null) => {
+            resolved_range_element_scalar(le).expect("a range element is scalar")
+        }
+        (ResolvedType::Null, ResolvedType::Range(re)) => {
+            resolved_range_element_scalar(re).expect("a range element is scalar")
+        }
+        // A range paired with a non-range (or any other combination) — no such operator.
+        _ => return Err(no_set_op_overload()),
+    };
+    let setop = match op {
+        BinaryOp::Add => RangeSetOp::Union,
+        BinaryOp::Sub => RangeSetOp::Difference,
+        BinaryOp::Mul => RangeSetOp::Intersect,
+        _ => unreachable!("resolve_range_set_op is only called for +, -, *"),
+    };
+    Ok((
+        RExpr::RangeSetOp {
+            op: setop,
+            args: vec![rl, rr],
+        },
+        ResolvedType::Range(Box::new(resolved_type_of(elem))),
+    ))
 }
 
 /// Resolve a quantified array comparison `x op ANY/SOME/ALL(arr)` (array-functions.md §11): the
@@ -14475,6 +14574,24 @@ fn eval_range_op(op: RangeOp, l: &Value, r: &Value, elem: ScalarType) -> Result<
         }
     };
     Ok(Value::Bool(result))
+}
+
+/// Evaluate a range SET operator (range-functions.md §4, RF4) over two already-evaluated operands.
+/// STRICT: a NULL operand → NULL. Dispatches to the `range.rs` kernels; `+` (`Union`) and `-`
+/// (`Difference`) raise 22000 on a non-contiguous result, `*` (`Intersect`) and `range_merge`
+/// (`Merge`) never error.
+fn eval_range_set_op(op: RangeSetOp, l: &Value, r: &Value) -> Result<Value> {
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let (a, b) = (expect_range(l), expect_range(r));
+    let rv = match op {
+        RangeSetOp::Union => crate::range::range_union(a, b, true)?,
+        RangeSetOp::Merge => crate::range::range_union(a, b, false)?,
+        RangeSetOp::Intersect => crate::range::range_intersect(a, b),
+        RangeSetOp::Difference => crate::range::range_minus(a, b)?,
+    };
+    Ok(Value::Range(rv))
 }
 
 /// Extract the [`RangeVal`] from a value the resolver guaranteed is a (non-NULL) range operand.
@@ -17148,6 +17265,15 @@ impl RExpr {
                 let r = args[1].eval(row, env, m)?;
                 eval_range_op(*op, &l, &r, *elem)
             }
+            // A range SET operator (spec/design/range-functions.md §4). One operator_eval; the
+            // operands charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in
+            // `eval_range_set_op`.
+            RExpr::RangeSetOp { op, args } => {
+                m.charge(COSTS.operator_eval);
+                let l = args[0].eval(row, env, m)?;
+                let r = args[1].eval(row, env, m)?;
+                eval_range_set_op(*op, &l, &r)
+            }
             // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One
             // operator_eval (the per-element/arg count walk is unmetered, like the array
             // introspectors §3.3); arguments charge their own evaluation. Non-strict — no blanket
@@ -18034,6 +18160,13 @@ mod registry_tests {
                 continue;
             }
             if is_range_func_name(o.name) {
+                // range_merge is the SET range function (range-functions.md §4): result `anyrange`,
+                // and NO scalar accessor kernel (the resolver emits a RangeSetOp node, evaluated by
+                // `eval_range_set_op`), so it skips `range_func_id` and the accessor result check.
+                if o.name == "range_merge" {
+                    assert_eq!(o.result, "anyrange", "range_merge result code");
+                    continue;
+                }
                 // A polymorphic range accessor (range-functions.md §1): its kernel id comes from
                 // `range_func_id` and its result is `anyelement` (the bound value) or `boolean`.
                 let _ = range_func_id(o.name);

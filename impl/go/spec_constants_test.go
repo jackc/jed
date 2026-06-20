@@ -474,6 +474,15 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			continue
 		}
 		if isRangeFuncName(o.Name) {
+			// range_merge is the SET range function (range-functions.md §4): result `anyrange`, and NO
+			// scalar accessor kernel (the resolver emits a reRangeSetOp node, evaluated by
+			// evalRangeSetOp), so it skips rangeFuncID and the accessor result check.
+			if o.Name == "range_merge" {
+				if o.Result != "anyrange" {
+					t.Fatalf("range_merge result code %s", o.Result)
+				}
+				continue
+			}
 			// A polymorphic range accessor (range-functions.md §1): its kernel id comes from
 			// rangeFuncID and its result is a reserved poly code (anyelement) or a scalar id (boolean).
 			_ = rangeFuncID(o.Name) // panics if the name has no kernel id

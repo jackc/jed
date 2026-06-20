@@ -3,8 +3,8 @@
 > The function/operator surface over the six range types (`spec/design/ranges.md` is the type
 > axis — value model, codec, comparison). Delivered in slices **RF1–RF4** (ranges.md §11).
 > Every behavior here is oracle-pinned against `postgres:18`. This doc grows one section per
-> slice; **RF1 (accessors), RF2 (constructors), and RF3 (the boolean operators) have landed; RF4
-> (the set operators) is deferred.**
+> slice; **RF1 (accessors), RF2 (constructors), RF3 (the boolean operators), and RF4 (the set
+> operators + `range_merge`) have all landed — the range function/operator surface is complete.**
 
 The polymorphic machinery is shared with the array function surface (`array-functions.md` §2):
 one type variable **ELEM**, bound from the polymorphic argument slots and read back into the
@@ -195,6 +195,53 @@ range's element scalar (for the element overloads' eval coercion); the eight boo
 `range_cmp_bounds` generalized to compare a lower against an upper). No on-disk change (RF3 is a
 query surface only).
 
-## 4. Set operators (RF4) — *deferred*
+## 4. Set operators (RF4)
 
-`+` (union) `*` (intersection) `-` (difference) and `range_merge`.
+The three PostgreSQL range set operators plus the `range_merge` function. Each combines two ranges
+over a **common element type** into a new range (`anyrange <op> anyrange → anyrange`). All are
+**STRICT** (a SQL-`NULL` operand → `NULL`). The operators **reuse the arithmetic tokens** `+`/`*`/`-`
+— there is **no new grammar**; a `+`/`-`/`*` with a range operand is dispatched to the range axis at
+resolve. Catalog rows: `spec/functions/catalog.toml` (the three operators are `kind = "arithmetic"`
+overloads keyed on `anyrange`, like the `@>` array/range overloads in §3; `range_merge` is a
+`kind = "function"` row).
+
+| Operator / function | Result | Meaning |
+|---|---|---|
+| `a + b` | `anyrange` | **union** — the smallest single range covering both; `22000` if the result would not be contiguous |
+| `a * b` | `anyrange` | **intersection** — the overlap of `a` and `b`; `empty` when they are disjoint |
+| `a - b` | `anyrange` | **difference** — the part of `a` not covered by `b`; `22000` if `b` splits `a` in two |
+| `range_merge(a, b)` | `anyrange` | like `+` but **spans any gap** between the ranges silently (never errors) |
+
+**Element/type match.** Both operands must be ranges over the **same** element type. A range paired
+with a non-range (`int4range + 5`), or a cross-element pair (`int4range + int8range`), is **`42883`**
+(`operator does not exist`, matching PG). A bare untyped `NULL` beside a range is taken as a NULL
+range (the eval is STRICT, so the result is `NULL`).
+
+**Contiguity errors (oracle-pinned).** `+` (union) raises **`22000`** ("result of range union would
+not be contiguous") when the two ranges neither overlap nor are adjacent — the union would span a gap
+and is not a single range. `-` (difference) raises **`22000`** ("result of range difference would not
+be contiguous") when `b` lies strictly inside `a` (`a.lower < b.lower` **and** `a.upper > b.upper`),
+which would leave two disjoint pieces. `*` (intersection) and `range_merge` **never** error.
+
+**Empty-range edges (oracle-pinned).** Union and `range_merge`: an empty operand yields the other
+unchanged (`empty + r = r`; both empty → `empty`). Intersection: a disjoint, merely-adjacent, or
+either-empty pair → `empty`. Difference: an empty subtrahend (or a `b` disjoint from `a`) yields `a`
+unchanged; a `b` wholly covering `a` yields `empty`.
+
+**`range_merge` is union, relaxed.** PG implements `range_merge(a, b)` as `range_union(a, b, strict =
+false)` — the same union kernel without the contiguity check. So `range_merge(int4range(1,5),
+int4range(10,20))` is `[1,20)` (spanning the gap), where `int4range(1,5) + int4range(10,20)` is
+`22000`.
+
+**Per core.** No grammar change and no new lexer token. The dispatch is at the top of
+`resolve_binary`'s `Add | Sub | Mul` arm: once the operands are resolved, a range operand routes to
+`resolve_range_set_op` (which checks the common-element rule and builds the result `Range` type), and
+the numeric/temporal arithmetic below never sees a range. `range_merge` is a function call, gated by
+`is_range_func_name` (it has `anyrange` arg families) and special-cased in `resolve_range_func` to emit
+the **same** `RExpr::RangeSetOp` node with `op = Merge` (rather than a scalar-accessor `RangeFunc`).
+The three set kernels (`range_union` with a `strict` flag, `range_intersect`, `range_minus`) live in
+`range.rs`, built over the same `cmp_bound`/`cmp_bounds` bound comparison as the boolean operators
+(§3) plus a small `make_range` helper (PG `make_range`, minus the discrete canonicalize step the
+operands already satisfy — the result bounds are taken from already-canonical operand bounds, so
+discrete results stay canonical `[)` by construction). No on-disk change (RF4 is a query surface
+only).

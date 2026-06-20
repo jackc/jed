@@ -9043,6 +9043,13 @@ const (
 	// only by the roContainsElem/roElemContainedBy element overloads to coerce the bare-element operand
 	// to the range's element type at eval; unused (but carried) for the range-against-range operators.
 	reRangeOp
+	// reRangeSetOp is a range SET operator (spec/design/range-functions.md §4 — `+` union, `-`
+	// difference, `*` intersection, and range_merge), evaluated per row. Its two range operand nodes
+	// reuse `sargs`; `rsop` selects the kernel. STRICT — a NULL operand → NULL (handled in the eval
+	// arm). Unlike reRangeOp it carries no element scalar — the kernels work off the self-describing
+	// operand values, and the result range type is fixed at resolve. The kernels (rangeUnion/
+	// rangeIntersect/rangeMinus) live in range.go; `+`/`-` raise 22000 on a non-contiguous result.
+	reRangeSetOp
 	// reVariadic is a VARIADIC argument-counting call (spec/design/array-functions.md §12 —
 	// num_nulls/num_nonnulls). Non-strict (null = "none"): no blanket NULL short-circuit. Its
 	// argument nodes reuse `sargs`; `variadicArray` records the call shape (false = the spread form,
@@ -9214,6 +9221,18 @@ const (
 	roAdjacent                       // a -|- b — a and b are adjacent
 )
 
+// rangeSetOp selects a range SET operator (spec/design/range-functions.md §4, RF4). Each combines two
+// ranges over a common element type into a new range. rsoUnion/rsoDifference raise 22000 on a
+// non-contiguous result; rsoIntersect/rsoMerge never error. The kernels live in range.go.
+type rangeSetOp int
+
+const (
+	rsoUnion      rangeSetOp = iota // a + b — union: the smallest single range covering both (22000 on a gap)
+	rsoIntersect                    // a * b — intersection: the overlap (empty when the ranges are disjoint)
+	rsoDifference                   // a - b — difference: the part of `a` not in `b` (22000 if `b` splits `a`)
+	rsoMerge                        // range_merge(a, b) — like union but spans any gap silently (never errors)
+)
+
 // variadicFunc selects a VARIADIC argument-counting function (spec/design/array-functions.md §12).
 // Both return i32; the call form (spread vs VARIADIC-array) lives on the rExpr node.
 type variadicFunc int
@@ -9269,6 +9288,10 @@ type rExpr struct {
 	relem ScalarType
 	// reRangeOp: the range boolean operator kernel. Its two operand nodes reuse `sargs`.
 	rop rangeOp
+	// reRangeSetOp: the range set operator kernel (+ union, - difference, * intersection, range_merge).
+	// Its two range operand nodes reuse `sargs`; no element scalar is carried (the kernels work off the
+	// self-describing operand values).
+	rsop rangeSetOp
 	// reVariadic: the VARIADIC counting function and its call shape. Argument nodes reuse `sargs`;
 	// `variadicArray` true ⇒ the VARIADIC-array form (one array operand), false ⇒ the spread form.
 	vfunc         variadicFunc
@@ -10818,6 +10841,12 @@ func resolveRangeFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
+	// range_merge(anyrange, anyrange) → anyrange is a SET operation (= union, non-strict), not a scalar
+	// accessor: emit the shared reRangeSetOp node (range-functions.md §4). polyResultType already raised
+	// 42P18 if the element was indeterminate (both args untyped NULL), so the element is bound here.
+	if name == "range_merge" {
+		return &rExpr{kind: reRangeSetOp, rsop: rsoMerge, sargs: rargs}, result, nil
+	}
 	return &rExpr{kind: reRangeFunc, rfunc: rangeFuncID(name), sargs: rargs}, result, nil
 }
 
@@ -11156,6 +11185,47 @@ func resolveRangeOp(s *scope, op BinaryOp, lhs, rhs Expr, rl *rExpr, lt resolved
 	default:
 		return nil, resolvedType{}, noSetOpOverload()
 	}
+}
+
+// resolveRangeSetOp resolves a range SET operator (`+` union, `-` difference, `*` intersection —
+// range-functions.md §4), reached from resolveBinary when a `+`/`-`/`*` has a range operand (the
+// operands are already resolved). Both must be ranges over the SAME element type — a range × non-range,
+// or a cross-element pair, is 42883 (PG's "operator does not exist"); a bare untyped NULL beside a range
+// is taken as a NULL range (the range×range overload; eval → NULL, strict). The result is a range over
+// that element type. range_merge does NOT come through here (it is a function call — see
+// resolveRangeFunc); it shares the reRangeSetOp node with op = rsoMerge.
+func resolveRangeSetOp(op BinaryOp, rl *rExpr, lt resolvedType, rr *rExpr, rt resolvedType) (*rExpr, resolvedType, error) {
+	var elem ScalarType
+	switch {
+	case lt.kind == rtRange && rt.kind == rtRange:
+		le, _ := resolvedRangeElementScalar(lt.elem)
+		re, _ := resolvedRangeElementScalar(rt.elem)
+		if le != re {
+			return nil, resolvedType{}, noSetOpOverload()
+		}
+		elem = le
+	case lt.kind == rtRange && rt.kind == rtNull:
+		elem, _ = resolvedRangeElementScalar(lt.elem)
+	case lt.kind == rtNull && rt.kind == rtRange:
+		elem, _ = resolvedRangeElementScalar(rt.elem)
+	// A range paired with a non-range (or any other combination) — no such operator.
+	default:
+		return nil, resolvedType{}, noSetOpOverload()
+	}
+	var setop rangeSetOp
+	switch op {
+	case OpAdd:
+		setop = rsoUnion
+	case OpSub:
+		setop = rsoDifference
+	case OpMul:
+		setop = rsoIntersect
+	default:
+		panic("resolveRangeSetOp is only called for +, -, *")
+	}
+	elemRT := resolvedTypeOf(elem)
+	return &rExpr{kind: reRangeSetOp, rsop: setop, sargs: []*rExpr{rl, rr}},
+		resolvedType{kind: rtRange, elem: &elemRT}, nil
 }
 
 // resolveQuantified resolves a quantified array comparison `x op ANY/SOME/ALL(arr)`
@@ -12933,6 +13003,14 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		// Range set operators (RF4, spec/design/range-functions.md §4): `+` union, `-` difference, `*`
+		// intersection over two ranges. A range operand in any of these three is the set-op axis — both
+		// operands must be ranges of a common element type, else 42883 (matching PG's "operator does not
+		// exist"); the numeric/temporal arithmetic below never sees a range. `/` and `%` have no range
+		// meaning and fall straight through.
+		if (b.Op == OpAdd || b.Op == OpSub || b.Op == OpMul) && (lt.kind == rtRange || rt.kind == rtRange) {
+			return resolveRangeSetOp(b.Op, rl, lt, rr, rt)
+		}
 		// interval ×÷ number → interval (the exact cascade; spec/design/interval.md §5). Checked
 		// before the ±-only temporal rule below.
 		if st, isScale := intervalScaleResult(b.Op, lt.kind, rt.kind); isScale {
@@ -14068,6 +14146,33 @@ func evalRangeOp(op rangeOp, l, r Value, elem ScalarType) (Value, error) {
 		}
 	}
 	return BoolValue(result), nil
+}
+
+// evalRangeSetOp evaluates a range SET operator (range-functions.md §4, RF4) over two already-evaluated
+// operands. STRICT: a NULL operand → NULL. Dispatches to the range.go kernels; `+` (rsoUnion) and `-`
+// (rsoDifference) raise 22000 on a non-contiguous result, `*` (rsoIntersect) and range_merge (rsoMerge)
+// never error.
+func evalRangeSetOp(op rangeSetOp, l, r Value) (Value, error) {
+	if l.Kind == ValNull || r.Kind == ValNull {
+		return NullValue(), nil
+	}
+	a, b := expectRange(l), expectRange(r)
+	var rv *RangeVal
+	var err error
+	switch op {
+	case rsoUnion:
+		rv, err = rangeUnion(a, b, true)
+	case rsoMerge:
+		rv, err = rangeUnion(a, b, false)
+	case rsoIntersect:
+		rv = rangeIntersect(a, b)
+	default: // rsoDifference
+		rv, err = rangeMinus(a, b)
+	}
+	if err != nil {
+		return Value{}, err
+	}
+	return RangeValue(rv), nil
 }
 
 // expectRange extracts the *RangeVal from a value the resolver guaranteed is a (non-NULL) range operand.
@@ -15232,6 +15337,19 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return Value{}, err
 		}
 		return evalRangeOp(e.rop, l, r, e.relem)
+	case reRangeSetOp:
+		// A range SET operator (spec/design/range-functions.md §4). One operator_eval; the operands
+		// charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in evalRangeSetOp.
+		m.Charge(Costs.OperatorEval)
+		l, err := e.sargs[0].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		r, err := e.sargs[1].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		return evalRangeSetOp(e.rsop, l, r)
 	case reVariadic:
 		// A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval
 		// (the per-element/arg count walk is unmetered, like the array introspectors §3.3);
