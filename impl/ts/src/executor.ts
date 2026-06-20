@@ -26,6 +26,7 @@ import type {
   QueryExpr,
   RefAction,
   SeqOptions,
+  SeqRestart,
   Select,
   SelectItems,
   SetOp,
@@ -557,6 +558,18 @@ export class Snapshot {
     }
     const indexes = [...old.indexes.slice(0, pos), def, ...old.indexes.slice(pos)];
     this.tables.set(tableKey, { ...old, indexes });
+  }
+
+  // setColumnDefaultExpr replaces a table column's expression default in place — used by ALTER
+  // SEQUENCE … RENAME of an owned sequence to rewrite the owning column's nextval default
+  // (spec/design/sequences.md §15.3), leaving the table's rows/store untouched. The Table and its
+  // columns array are re-allocated (catalog Tables are never mutated in place — snapshots share
+  // them). A no-op if the table or column ordinal is absent.
+  setColumnDefaultExpr(tableKey: string, column: number, defaultExpr: DefaultExpr): void {
+    const old = this.tables.get(tableKey);
+    if (old === undefined || column < 0 || column >= old.columns.length) return;
+    const columns = old.columns.map((c, i) => (i === column ? { ...c, defaultExpr } : c));
+    this.tables.set(tableKey, { ...old, columns });
   }
 
   // putIndexStore registers a loaded index store under its (lowercased) name — the file
@@ -2273,31 +2286,49 @@ export class Database {
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
-  // executeAlterSequence analyzes and runs an ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]
-  // (spec/design/sequences.md §4). A missing sequence is 42P01 unless IF EXISTS (then a no-op).
-  // RESTART WITH n resets lastValue to n, a bare RESTART to the original start (unchanged); either
-  // way isCalled = false, so the next nextval returns that value. A restart value outside
-  // [minValue, maxValue] is 22023. Touches no session state (currval/lastval unchanged).
+  // executeAlterSequence analyzes and runs an ALTER SEQUENCE [IF EXISTS] s <action>
+  // (spec/design/sequences.md §4/§15). A missing sequence is 42P01 unless IF EXISTS (then a no-op).
+  // The option form re-edits the definition (PG init_params, isInit=false — only written options
+  // change, the counter preserved unless RESTART); RENAME TO moves the catalog key. Touches no
+  // session state (currval/lastval unchanged). A catalog write (the write path, transactional, §5).
   private executeAlterSequence(as: AlterSequence): Outcome {
     const committed = this.readSnap().sequence(as.name);
     if (committed === undefined) {
       if (as.ifExists) return { kind: "statement", cost: 0n, rowsAffected: null };
       throw engineError("undefined_table", `relation does not exist: ${as.name}`);
     }
-    const def = { ...committed };
-    const value = as.restartWith ?? def.start;
-    if (value < def.minValue || value > def.maxValue) {
-      // PG's init_params path: 22023 (distinct from setval's 22003 do_setval path — §4).
-      const bound =
-        value > def.maxValue
-          ? `greater than MAXVALUE (${def.maxValue})`
-          : `less than MINVALUE (${def.minValue})`;
-      throw engineError("invalid_parameter_value", `RESTART value (${value}) cannot be ${bound}`);
+    if (as.action.kind === "rename") {
+      this.alterSequenceRename(committed, as.action.newName);
+    } else {
+      // AS type on ALTER is 0A000 — the value type is not persisted (sequences.md §14.4), so the
+      // original type for re-deriving a default bound is gone.
+      if (as.action.options.dataType !== null) {
+        throw engineError("feature_not_supported", "ALTER SEQUENCE ... AS type is not supported");
+      }
+      const newDef = applySeqAlter(committed, as.action.options, as.action.restart);
+      this.working().putSequence(newDef);
     }
-    def.lastValue = value;
-    def.isCalled = false;
-    this.working().putSequence(def);
     return { kind: "statement", cost: 0n, rowsAffected: null };
+  }
+
+  // alterSequenceRename implements ALTER SEQUENCE s RENAME TO s2 (spec/design/sequences.md §15.3): a
+  // collision with any relation — including s itself — is 42P07; otherwise move the entry to the new
+  // key. For an OWNED sequence, the owning column's DEFAULT nextval('s') text is rewritten in place
+  // to nextval('s2') (the rows survive — not via putTable) so a later INSERT still advances the
+  // renamed sequence (jed resolves the sequence by name, unlike PG's OID reference).
+  private alterSequenceRename(existing: SequenceDef, newName: string): void {
+    if (this.relationExists(newName)) {
+      throw engineError("duplicate_table", `relation already exists: ${newName}`);
+    }
+    if (existing.ownedBy !== undefined) {
+      const exprText = `nextval ( '${newName.toLowerCase().replace(/'/g, "''")}' )`;
+      this.working().setColumnDefaultExpr(existing.ownedBy.table.toLowerCase(), existing.ownedBy.column, {
+        exprText,
+        expr: parseExpression(exprText),
+      });
+    }
+    this.working().removeSequence(existing.name.toLowerCase());
+    this.working().putSequence({ ...existing, name: newName });
   }
 
   // indexBoundRows executes an index equality bound (cost.md §3 "index-bounded scan"):
@@ -7970,7 +8001,9 @@ function buildSequenceDef(name: string, options: SeqOptions, ownedBy: SeqOwner |
   // `{ value: v }` MINVALUE v / `{ value: null }` NO MINVALUE / outer null unset → the type default.
   const minValue = options.minValue !== null && options.minValue.value !== null ? options.minValue.value : defMin;
   const maxValue = options.maxValue !== null && options.maxValue.value !== null ? options.maxValue.value : defMax;
-  if (minValue > maxValue) {
+  // PG requires MINVALUE strictly less than MAXVALUE (a one-value sequence is rejected); jed
+  // previously allowed `==` — corrected here so CREATE and ALTER (sequences.md §15.2) agree with PG.
+  if (minValue >= maxValue) {
     throw engineError(
       "invalid_parameter_value",
       `MINVALUE (${minValue}) must be less than MAXVALUE (${maxValue})`,
@@ -7978,14 +8011,7 @@ function buildSequenceDef(name: string, options: SeqOptions, ownedBy: SeqOwner |
   }
   // START defaults to MINVALUE (ascending) / MAXVALUE (descending) and must lie in [min, max].
   const start = options.start ?? (increment < 0n ? maxValue : minValue);
-  if (start < minValue || start > maxValue) {
-    throw engineError(
-      "invalid_parameter_value",
-      `START value (${start}) cannot be ${
-        start < minValue ? `less than MINVALUE` : `greater than MAXVALUE`
-      } the ${start < minValue ? minValue : maxValue} value`,
-    );
-  }
+  seqBoundCheckStart(start, minValue, maxValue);
   return {
     name,
     increment,
@@ -7998,6 +8024,93 @@ function buildSequenceDef(name: string, options: SeqOptions, ownedBy: SeqOwner |
     isCalled: false,
     ownedBy,
   };
+}
+
+// seqBoundCheckStart is PG's START-in-bounds cross-check (init_params): start ∈ [min, max], else
+// 22023 with PG's wording. Shared by CREATE (buildSequenceDef) and ALTER (applySeqAlter).
+function seqBoundCheckStart(start: bigint, minValue: bigint, maxValue: bigint): void {
+  if (start < minValue) {
+    throw engineError(
+      "invalid_parameter_value",
+      `START value (${start}) cannot be less than MINVALUE (${minValue})`,
+    );
+  }
+  if (start > maxValue) {
+    throw engineError(
+      "invalid_parameter_value",
+      `START value (${start}) cannot be greater than MAXVALUE (${maxValue})`,
+    );
+  }
+}
+
+// seqBoundCheckLast is PG's last_value (RESTART) cross-check (init_params): the post-edit last_value ∈
+// [min, max], else 22023. PG uses the "RESTART value …" wording even with no RESTART written (§15.2).
+function seqBoundCheckLast(lastValue: bigint, minValue: bigint, maxValue: bigint): void {
+  if (lastValue < minValue) {
+    throw engineError(
+      "invalid_parameter_value",
+      `RESTART value (${lastValue}) cannot be less than MINVALUE (${minValue})`,
+    );
+  }
+  if (lastValue > maxValue) {
+    throw engineError(
+      "invalid_parameter_value",
+      `RESTART value (${lastValue}) cannot be greater than MAXVALUE (${maxValue})`,
+    );
+  }
+}
+
+// applySeqAlter re-edits an existing SequenceDef per ALTER SEQUENCE s <options>
+// (spec/design/sequences.md §15.2) — PG init_params with isInit=false. Only the WRITTEN options
+// change; lastValue/isCalled are preserved unless restart is given. The value type is not persisted
+// (§14.4), so NO MINVALUE/NO MAXVALUE reset the open direction to the bigint bound and an explicit
+// bound is i64-checked only. options.dataType must be null (the caller rejects AS as 0A000 first).
+function applySeqAlter(
+  existing: SequenceDef,
+  options: SeqOptions,
+  restart: SeqRestart | null,
+): SequenceDef {
+  const def = { ...existing };
+  if (options.increment !== null) {
+    if (options.increment === 0n) {
+      throw engineError("invalid_parameter_value", "INCREMENT must not be zero");
+    }
+    def.increment = options.increment;
+  }
+  if (options.cache !== null) {
+    if (options.cache < 1n) {
+      throw engineError("invalid_parameter_value", `CACHE (${options.cache}) must be greater than zero`);
+    }
+    def.cache = options.cache;
+  }
+  // NO MINVALUE/NO MAXVALUE recompute the default for the (possibly new) INCREMENT sign — against the
+  // bigint range (the value type is not persisted, §14.4). An explicit bound is taken as written; an
+  // unwritten bound is preserved (PG keeps it even when the sign flips).
+  const [defMin, defMax] = seqDataTypeDefaultBounds("bigint", def.increment);
+  if (options.minValue !== null) {
+    def.minValue = options.minValue.value === null ? defMin : options.minValue.value;
+  }
+  if (options.maxValue !== null) {
+    def.maxValue = options.maxValue.value === null ? defMax : options.maxValue.value;
+  }
+  if (def.minValue >= def.maxValue) {
+    throw engineError(
+      "invalid_parameter_value",
+      `MINVALUE (${def.minValue}) must be less than MAXVALUE (${def.maxValue})`,
+    );
+  }
+  if (options.start !== null) def.start = options.start;
+  // Cross-check 1: START ∈ [min, max].
+  seqBoundCheckStart(def.start, def.minValue, def.maxValue);
+  // RESTART (applied last, before the last_value cross-check).
+  if (restart !== null) {
+    def.lastValue = restart.toStart ? def.start : restart.value;
+    def.isCalled = false;
+  }
+  // Cross-check 2: the preserved/restarted last_value ∈ [min, max].
+  seqBoundCheckLast(def.lastValue, def.minValue, def.maxValue);
+  if (options.cycle !== null) def.cycle = options.cycle;
+  return def;
 }
 
 // serialPseudoType maps a serial pseudo-type name to its underlying integer scalar

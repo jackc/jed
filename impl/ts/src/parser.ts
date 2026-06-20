@@ -27,6 +27,7 @@ import type {
   SelectItem,
   SelectItems,
   SeqOptions,
+  SeqRestart,
   SetOpKind,
   Statement,
   SubscriptSpec,
@@ -35,7 +36,7 @@ import type {
   TypeMod,
   Update,
 } from "./ast.ts";
-import { emptySeqOptions } from "./ast.ts";
+import { emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
 import { Decimal } from "./decimal.ts";
 import { engineError } from "./errors.ts";
 import { lex } from "./lexer.ts";
@@ -771,11 +772,43 @@ class Parser {
   // appears at most once (a repeat is 42601 via dupCheck). Validation of the resolved set (22023) is
   // execution-time.
   private parseSequenceOptions(parenthesized: boolean): SeqOptions {
+    return this.parseSeqOptionsInner(parenthesized, false).options;
+  }
+
+  // parseSeqOptionsInner is the shared option loop. When `allowRestart` (only on ALTER SEQUENCE,
+  // never parenthesized), `RESTART [[WITH] n]` is also accepted as an interleavable pseudo-option and
+  // returned separately (null = absent; `{ toStart: true }` = bare RESTART; `{ value: n }` = RESTART
+  // WITH n); RESTART is invalid in CREATE/identity, where it ends the loop like any other keyword.
+  private parseSeqOptionsInner(
+    parenthesized: boolean,
+    allowRestart: boolean,
+  ): { options: SeqOptions; restart: SeqRestart | null } {
     if (parenthesized) this.expect("lparen");
     const seq = emptySeqOptions();
+    let restart: SeqRestart | null = null;
     // Order-free option loop: dispatch on the leading keyword, each option at most once.
     for (;;) {
       switch (this.peekKeyword()) {
+        // `RESTART [[WITH] n]` — only on ALTER; resets the counter (sequences.md §15).
+        case "restart": {
+          if (!allowRestart) {
+            if (parenthesized) this.expect("rparen");
+            return { options: seq, restart };
+          }
+          this.dupCheck(restart !== null, "RESTART");
+          this.advance();
+          if (
+            this.peek().kind === "int" ||
+            this.peek().kind === "minus" ||
+            this.peekKeyword() === "with"
+          ) {
+            this.consumeKeyword("with");
+            restart = { toStart: false, value: this.parseSignedIntLiteral() };
+          } else {
+            restart = { toStart: true };
+          }
+          break;
+        }
         // `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw type
         // name is stored; it is resolved (and a non-integer type rejected 22023) at execution.
         // Inside an IDENTITY column's `( … )` a set dataType is 42601.
@@ -852,7 +885,7 @@ class Parser {
         }
         default:
           if (parenthesized) this.expect("rparen");
-          return seq;
+          return { options: seq, restart };
       }
     }
   }
@@ -887,10 +920,11 @@ class Parser {
     return { kind: "dropSequence", names, ifExists };
   }
 
-  // parseAlterSequence parses `ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH <signed_int>]`
-  // (spec/design/sequences.md §4). RESTART is the only supported action; RESTART WITH n yields a
-  // non-null restartWith, a bare RESTART null (reset to the original START). A non-RESTART action is
-  // 0A000 (not a syntax error).
+  // parseAlterSequence parses `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md
+  // §15). After the name the next keyword dispatches: RENAME → the rename form; OWNED/OWNER/SET →
+  // 0A000; otherwise the order-free option loop (the CREATE options plus an interleavable RESTART),
+  // requiring ≥ 1 option (a bare ALTER SEQUENCE s is 42601). AS is parsed into the option set and
+  // rejected as 0A000 at execution.
   private parseAlterSequence(): Statement {
     this.expectKeyword("alter");
     this.expectKeyword("sequence");
@@ -901,18 +935,27 @@ class Parser {
       ifExists = true;
     }
     const name = this.expectIdentifier();
-    // RESTART is the only supported action; any other (SET INCREMENT, RENAME, OWNED BY, …) is 0A000.
-    if (this.peekKeyword() !== "restart") {
-      throw engineError("feature_not_supported", "only ALTER SEQUENCE ... RESTART is supported");
+    switch (this.peekKeyword()) {
+      case "rename": {
+        this.advance();
+        this.expectKeyword("to");
+        const newName = this.expectIdentifier();
+        return { kind: "alterSequence", name, ifExists, action: { kind: "rename", newName } };
+      }
+      // The remaining unsupported ALTER actions are 0A000 (not syntax errors).
+      case "owned":
+      case "owner":
+      case "set":
+        throw engineError("feature_not_supported", "this ALTER SEQUENCE action is not supported");
+      default: {
+        const { options, restart } = this.parseSeqOptionsInner(false, true);
+        // ≥ 1 action required: a bare ALTER SEQUENCE s (no option, no RESTART) is 42601.
+        if (restart === null && !seqOptionsHasAny(options)) {
+          throw engineError("syntax_error", "ALTER SEQUENCE requires at least one action");
+        }
+        return { kind: "alterSequence", name, ifExists, action: { kind: "setOptions", options, restart } };
+      }
     }
-    this.advance(); // RESTART
-    // RESTART [WITH] <signed_int>; bare RESTART (no value) resets to the stored START.
-    let restartWith: bigint | null = null;
-    if (this.peek().kind === "int" || this.peek().kind === "minus" || this.peekKeyword() === "with") {
-      this.consumeKeyword("with");
-      restartWith = this.parseSignedIntLiteral();
-    }
-    return { kind: "alterSequence", name, ifExists, restartWith };
   }
 
   // parseIfNotExists consumes an optional `IF NOT EXISTS` prefix, returning whether it was present.

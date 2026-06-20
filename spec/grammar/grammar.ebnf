@@ -246,12 +246,22 @@ sequence_option ::= "AS" type_name
 signed_integer ::= "-"? integer
 drop_sequence  ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier)* "RESTRICT"?
 
-/* ALTER SEQUENCE [IF EXISTS] name RESTART [WITH n] (../design/sequences.md §1) — the only ALTER
- * action this slice: reset the counter so the next nextval returns n (RESTART WITH n) or the
- * original START (bare RESTART), with is_called cleared. A missing sequence is 42P01 unless IF
- * EXISTS; a value outside [MINVALUE, MAXVALUE] is 22023 (NB: setval's bounds error is 22003). The
- * stored START is unchanged (a later bare RESTART still uses the original START). */
-alter_sequence ::= "ALTER" "SEQUENCE" ("IF" "EXISTS")? identifier "RESTART" ("WITH"? signed_integer)?
+/* ALTER SEQUENCE [IF EXISTS] name <action> (../design/sequences.md §4/§15). Two action forms:
+ *   (a) the order-free option set — the SAME sequence_option list as CREATE (MINUS "AS", which is
+ *       0A000 on ALTER since the value type is not persisted — §14.4) PLUS an interleavable
+ *       "RESTART [[WITH] n]" pseudo-option; at least one option is required (a bare "ALTER SEQUENCE s"
+ *       is 42601). Only written options change; last_value/is_called are preserved unless RESTART is
+ *       given. RESTART WITH n resets the counter so the next nextval returns n; a bare RESTART resets
+ *       to the stored START; either clears is_called. Post-edit cross-checks: START in [MIN,MAX], then
+ *       the preserved/restarted last_value in [MIN,MAX] (each 22023). MINVALUE < MAXVALUE is strict.
+ *   (b) RENAME TO new_name — move the catalog key (42P07 if new_name already names a relation,
+ *       including the same name); an owned sequence's owning-column nextval default is rewritten (§15.3).
+ * A missing sequence is 42P01 unless IF EXISTS. "AS type" / OWNED BY / OWNER TO / SET {SCHEMA|LOGGED|
+ * UNLOGGED} are 0A000. */
+alter_sequence ::= "ALTER" "SEQUENCE" ("IF" "EXISTS")? identifier
+                   ( "RENAME" "TO" identifier
+                   | alter_sequence_option+ )
+alter_sequence_option ::= sequence_option | "RESTART" ("WITH"? signed_integer)?
 
 /* nextval('s') / currval('s') / setval('s', n[, is_called]) / lastval() (../design/sequences.md
  * §4/§6) are ordinary function calls — no new production; the first three resolve their text

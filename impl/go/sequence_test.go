@@ -92,11 +92,14 @@ func TestSequenceNextvalRollsBack(t *testing.T) {
 // A failed autocommit statement does not advance the sequence either (the per-statement rollback).
 func TestSequenceFailedStatementDoesNotAdvance(t *testing.T) {
 	db := NewDatabase()
-	if _, err := Execute(db, "CREATE SEQUENCE s MAXVALUE 1"); err != nil {
+	// A two-value [1, 2] sequence (MINVALUE == MAXVALUE is rejected, matching PG — §15.2).
+	if _, err := Execute(db, "CREATE SEQUENCE s MAXVALUE 2"); err != nil {
 		t.Fatal(err)
 	}
 	seqMustInt(t, db, "SELECT nextval('s')", 1)
-	// The next nextval traps 2200H — and because it failed, the counter did not move.
+	seqMustInt(t, db, "SELECT nextval('s')", 2)
+	// The next nextval traps 2200H — and because it failed, the counter did not move, so a second
+	// attempt traps identically.
 	if code := seqErrCode(t, db, "SELECT nextval('s')"); code != "2200H" {
 		t.Fatalf("expected 2200H, got %s", code)
 	}
@@ -203,22 +206,41 @@ func TestSequenceLastvalRollsBack(t *testing.T) {
 	seqMustInt(t, db, "SELECT lastval()", 100)
 }
 
-// A non-RESTART ALTER SEQUENCE action is 0A000 in jed (only RESTART is supported this slice) — a
-// divergence from PostgreSQL, where ALTER SEQUENCE … INCREMENT BY is valid, so it cannot live in the
-// PG-clean oracle corpus.
-func TestSequenceAlterNonRestartIs0A000(t *testing.T) {
+// The ALTER SEQUENCE actions jed still does not support are 0A000 — each VALID in PostgreSQL, so they
+// cannot live in the PG-clean oracle corpus (sequences.md §15). AS type is foreclosed because the
+// value type is not persisted (§14.4); OWNED BY / OWNER TO / SET … have no jed concept. (The option
+// set INCREMENT/MINVALUE/… and RENAME TO are now supported — see ddl/alter_sequence.test.)
+func TestSequenceAlterUnsupportedActionsAre0A000(t *testing.T) {
 	db := NewDatabase()
 	mustExec(t, db, "CREATE SEQUENCE s")
-	if code := seqErrCode(t, db, "ALTER SEQUENCE s INCREMENT BY 2"); code != "0A000" {
-		t.Fatalf("expected 0A000, got %s", code)
-	}
-	if code := seqErrCode(t, db, "ALTER SEQUENCE s OWNED BY t.c"); code != "0A000" {
-		t.Fatalf("expected 0A000, got %s", code)
+	for _, sql := range []string{
+		"ALTER SEQUENCE s AS bigint",
+		"ALTER SEQUENCE s OWNED BY t.c",
+		"ALTER SEQUENCE s OWNER TO bob",
+		"ALTER SEQUENCE s SET SCHEMA other",
+	} {
+		if code := seqErrCode(t, db, sql); code != "0A000" {
+			t.Fatalf("%q: expected 0A000, got %s", sql, code)
+		}
 	}
 	// ALTER of a non-sequence object is not a known statement at all → 42601 (no escape hatch).
 	if code := seqErrCode(t, db, "ALTER TABLE t ADD COLUMN c i32"); code != "42601" {
 		t.Fatalf("expected 42601, got %s", code)
 	}
+}
+
+// An ALTER SEQUENCE … <options> edit is a transactional catalog write — it rolls back with its block
+// (the §5 divergence applies to every ALTER action, not just RESTART). A jed-vs-PG divergence, so a
+// per-core unit test, not corpus.
+func TestSequenceAlterOptionsRollBack(t *testing.T) {
+	db := NewDatabase()
+	mustExec(t, db, "CREATE SEQUENCE s INCREMENT 1")
+	mustExec(t, db, "BEGIN")
+	mustExec(t, db, "ALTER SEQUENCE s INCREMENT BY 100")
+	mustExec(t, db, "ROLLBACK")
+	// The INCREMENT edit rolled back, so the step is still 1: setval to 5, next is 6 (not 105).
+	mustExec(t, db, "SELECT setval('s', 5)")
+	seqMustInt(t, db, "SELECT nextval('s')", 6)
 }
 
 // setval/ALTER … RESTART are writes — a READ ONLY transaction rejects each with 25006 (each in its

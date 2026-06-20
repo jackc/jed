@@ -27,6 +27,11 @@ CREATE SEQUENCE [IF NOT EXISTS] s
     [INCREMENT [BY] n] [MINVALUE m | NO MINVALUE] [MAXVALUE x | NO MAXVALUE]
     [START [WITH] s0] [CACHE c] [[NO] CYCLE]
 ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]   -- reset the counter (S2 — §4)
+ALTER SEQUENCE [IF EXISTS] s                     -- change the definition (S6 — §15): the order-free
+    [INCREMENT [BY] n] [MINVALUE m | NO MINVALUE] -- CREATE option set (minus AS) + RESTART, ≥1 action
+    [MAXVALUE x | NO MAXVALUE] [START [WITH] s0]
+    [RESTART [[WITH] r]] [CACHE c] [[NO] CYCLE]
+ALTER SEQUENCE [IF EXISTS] s RENAME TO s2        -- rename within the relation namespace (S6 — §15)
 DROP SEQUENCE [IF EXISTS] s [, ...] [RESTRICT]
 
 CREATE TABLE t (id serial, ...)                 -- the serial pseudo-types (S3 — §12): an
@@ -75,10 +80,13 @@ SELECT lastval()               -- the value the most recent nextval returned thi
   create a dependency in PostgreSQL either (only `serial`/`OWNED BY`/identity do, both deferred), so
   `DROP SEQUENCE` of a sequence named in some column default succeeds and a later `INSERT` raises
   `42P01` at evaluation — exactly PG.
-- **`ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]`** lands in **S2** (§4) — the only `ALTER` action.
-  `ALTER SEQUENCE … SET INCREMENT|MINVALUE|… RENAME|OWNED BY|AS type` stay `0A000` (the `AS type`
-  clause is supported only at `CREATE` — and on `serial`/identity, via the column type — not in
-  `ALTER`, which would have to re-derive bounds against a *persisted* type the engine does not store).
+- **`ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]`** landed in **S2** (§4). **S6 (§15)** broadens
+  `ALTER` to the **definition-changing option set** — the *same* order-free options as `CREATE`
+  (`INCREMENT`/`MINVALUE`/`MAXVALUE`/`START`/`CACHE`/`[NO] CYCLE`), plus `RESTART` as an interleavable
+  pseudo-option — and to **`RENAME TO`**. An `ALTER` with **no action** is `42601` (PG: bare `ALTER
+  SEQUENCE s` is a syntax error). Still `0A000`: **`AS type`** (the type is not persisted — §14.4 — so
+  re-deriving the default bound for a new type is foreclosed), **`OWNED BY`**, **`OWNER TO`**, and
+  **`SET { SCHEMA | LOGGED | UNLOGGED }`**.
 
 ## 2. Sequences as a catalog object — `Snapshot.sequences`
 
@@ -194,6 +202,32 @@ greater than MAXVALUE (max)" / "… less than MINVALUE (min)" — note `22023`, 
 mutation (the write path, transactional) and touches **no** session state — `currval`/`lastval` are
 unchanged by a `RESTART`.
 
+**`ALTER SEQUENCE [IF EXISTS] s <options>`** (S6 — §15) re-runs PG's `init_params` against the
+*existing* definition (`isInit = false`): only the **explicitly written** options change; everything
+else — including `last_value`/`is_called` — is **preserved**. So `ALTER SEQUENCE s INCREMENT BY 10` on
+a sequence whose `last_value` is `2` leaves the counter at `2` and the *next* `nextval` returns `12`.
+`RESTART` may be interleaved with the options (`ALTER … INCREMENT 100 RESTART WITH 50 MAXVALUE 1000`)
+and is applied last. The same `22023` validations as `CREATE` apply (`INCREMENT ≠ 0`, `CACHE ≥ 1`,
+`MINVALUE < MAXVALUE` — strict, PG rejects `MINVALUE == MAXVALUE`), plus the **two cross-checks PG runs
+against the post-edit bounds**, in this order: (1) `START ∈ [MINVALUE, MAXVALUE]` ("START value (s)
+cannot be less than MINVALUE (m)" / "greater than MAXVALUE (m)"), then (2) the **current `last_value`**
+(after any `RESTART`) `∈ [MINVALUE, MAXVALUE]` ("RESTART value (lv) cannot be …", PG's wording even
+when no `RESTART` was given). `NO MINVALUE` / `NO MAXVALUE` reset to the default for the current
+`INCREMENT` sign (ascending → `MINVALUE 1`; descending → `MAXVALUE -1`); the *open* direction resets to
+the **bigint** bound because the value type is not persisted (§14.4 / §15) — a documented divergence
+for a typed sequence only. Changing the `INCREMENT` sign **does not** recompute the bounds (PG keeps
+them), so a previously-ascending sequence altered to a negative `INCREMENT` keeps its `MINVALUE 1`.
+
+**`ALTER SEQUENCE [IF EXISTS] s RENAME TO s2`** (S6 — §15) renames the sequence within the relation
+namespace: `s2` already naming a table/index/sequence (including `s` itself) is `42P07
+duplicate_table` ("relation already exists"). The counter and all options are unchanged. For an
+**owned** sequence (a `serial`/identity column's, §12) the owning column's `DEFAULT nextval('s')`
+expression text is **rewritten** to `nextval('s2')` in the same statement, so a subsequent `INSERT`
+still advances the renamed sequence — matching PG's observable behavior (PG references the sequence by
+OID, jed by the now-rewritten name; the `owned_by` link itself, a `(table, column-ordinal)` pair, is
+unchanged so `DROP TABLE` auto-drop and the `2BP01` on a direct drop still hold). A missing sequence is
+`42P01` unless `IF EXISTS`.
+
 ## 5. The defining decision — transactional sequences (a documented PG divergence)
 
 > **jed sequences are transactional: `nextval` rolls back with its transaction.** This is a
@@ -279,22 +313,23 @@ flat per-call weight is a sound bound.
 
 | Failure | Code |
 |---|---|
-| `CREATE SEQUENCE` name already a relation (no `IF NOT EXISTS`) | `42P07` duplicate_table |
+| `CREATE SEQUENCE` name already a relation (no `IF NOT EXISTS`); `ALTER … RENAME TO` a name already a relation (incl. the same name, §15) | `42P07` duplicate_table |
 | `nextval`/`currval` on a missing sequence | `42P01` undefined_table |
 | `DROP SEQUENCE` of a missing sequence (no `IF EXISTS`) | `42P01` undefined_table |
 | `DROP SEQUENCE` of an `OWNED` (`serial`) sequence, RESTRICT (§12) | `2BP01` dependent_objects_still_exist |
 | `serial` column with an explicit `DEFAULT` (§12) | `42601` syntax_error |
-| `setval`/`ALTER … RESTART`/`nextval`/`currval` on a missing sequence | `42P01` undefined_table |
+| `setval`/`ALTER … RESTART`/`ALTER … <options>`/`ALTER … RENAME`/`nextval`/`currval` on a missing sequence (no `IF EXISTS`) | `42P01` undefined_table |
 | `currval` before `nextval`/`setval(…,true)`; `lastval` before any `nextval`, this session | `55000` object_not_in_prerequisite_state |
 | `nextval` past `MAXVALUE`/`MINVALUE` without `CYCLE` | `2200H` sequence_generator_limit_exceeded |
 | `setval` value outside `[MINVALUE, MAXVALUE]` | `22003` numeric_value_out_of_range |
-| `INCREMENT 0`, `CACHE < 1`, inconsistent `START`/`MIN`/`MAX`, `RESTART` value out of bounds, an IDENTITY column whose type is not `smallint`/`integer`/`bigint` (§13.1), a non-integer `AS` type ("sequence type must be smallint, integer, or bigint"), or an explicit `MINVALUE`/`MAXVALUE` outside the `AS` type's range ("MINVALUE/MAXVALUE (x) is out of range for sequence data type *T*") (§14) | `22023` invalid_parameter_value |
+| `INCREMENT 0`, `CACHE < 1`, inconsistent `START`/`MIN`/`MAX` (`MINVALUE ≥ MAXVALUE`, `START` out of bounds), `RESTART` value out of bounds, an `ALTER … <options>` cross-check failure (post-edit `START` or the preserved `last_value` out of the new `[MIN, MAX]`, §15), an IDENTITY column whose type is not `smallint`/`integer`/`bigint` (§13.1), a non-integer `AS` type ("sequence type must be smallint, integer, or bigint"), or an explicit `MINVALUE`/`MAXVALUE` outside the `AS` type's range ("MINVALUE/MAXVALUE (x) is out of range for sequence data type *T*") (§14) | `22023` invalid_parameter_value |
 | `AS` clause inside an IDENTITY column's `( … )` options ("conflicting or redundant options", §14) — the column type already fixes the sequence type | `42601` syntax_error |
 | Explicit `DEFAULT` (or a `serial` type) **and** `IDENTITY` on one column; two identity specs on one column (§13.2) | `42601` syntax_error |
 | Explicit non-`DEFAULT` value into a `GENERATED ALWAYS` identity column without `OVERRIDING SYSTEM VALUE`; assigning one in `UPDATE` (§13.3/§13.4) | `428C9` generated_always |
+| `ALTER SEQUENCE` with **no action** (bare `ALTER SEQUENCE s`), or a duplicate option (PG: "conflicting or redundant options"), §15 | `42601` syntax_error |
 | `nextval`/`setval`/`ALTER SEQUENCE` in a read-only transaction | `25006` read_only_sql_transaction |
 | Corrupt sequence catalog entry | `XX001` data_corrupted |
-| `ALTER SEQUENCE` actions other than `RESTART` (incl. `ALTER … AS type`); `DROP SEQUENCE … CASCADE` | `0A000` feature_not_supported |
+| `ALTER SEQUENCE … AS type` (the type is not persisted, §14.4), `… OWNED BY`, `… OWNER TO`, `… SET { SCHEMA \| LOGGED \| UNLOGGED }`; `DROP SEQUENCE … CASCADE` | `0A000` feature_not_supported |
 
 ## 10. Ratified decisions and deliberate PostgreSQL divergences
 
@@ -378,6 +413,15 @@ sub-slices, each passing `rake ci`:
   `serial_table.jed` / `identity_table.jed` goldens regenerate only because the integer column's owned
   sequence now records `MAXVALUE 2147483647` instead of `2^63-1`. Capability `ddl.sequence_as_type`;
   corpus `ddl/sequence_as_type.test`.
+- **S6** — the `ALTER SEQUENCE` **definition-changing option set** (the order-free `CREATE` options
+  minus `AS`, plus an interleavable `RESTART`) and **`RENAME TO`** (§15). Re-runs PG's `init_params`
+  with `isInit = false` (only written options change; `last_value`/`is_called` preserved unless
+  `RESTART`), with the two post-edit cross-checks (`START`, then the preserved `last_value`) and the
+  strict `MINVALUE < MAXVALUE`. `RENAME` moves the catalog key and, for an **owned** sequence, rewrites
+  the owning column's `nextval` default text so a later `INSERT` still works. A bare `ALTER SEQUENCE s`
+  (no action) is `42601`; `AS type`/`OWNED BY`/`OWNER TO`/`SET …` stay `0A000`. **No `format_version`
+  change** (the `SequenceDef` fields and the column-default text are already-variable catalog data — no
+  golden moves). Capability `ddl.alter_sequence`; corpus `ddl/alter_sequence.test`.
 
 Each later slice is its own design-doc revision + corpus + (where it touches bytes) a `format_version`
 note and golden.
@@ -646,3 +690,90 @@ it adds a persisted type field **then**, with a `format_version` bump at that po
 `serial_table.jed` / `identity_table.jed` goldens move only because their integer column's owned
 sequence now records `MAXVALUE 2147483647` (was `2^63-1`); `sequence_table.jed` (explicit-bounds /
 ascending-bigint sequences) is byte-unchanged.
+
+A second, smaller consequence surfaces in **S6's `ALTER SEQUENCE`** (§15): an explicit
+`MINVALUE`/`MAXVALUE` on `ALTER` cannot be range-checked against the sequence's *original* declared
+type (it is gone), so jed bounds it only by the `i64` range, and `NO MINVALUE` / `NO MAXVALUE` reset the
+*open* direction to the **bigint** bound rather than the original type's. PG (which keeps the type)
+would reject an out-of-type-range `ALTER MAXVALUE` and reset to the type bound. This is a deliberate
+extension of the type-not-persisted decision, divergent **only** for a typed (`smallint`/`integer`)
+sequence altered along the open direction — the common `bigint`/default sequence matches PG exactly.
+The `ddl/alter_sequence.test` corpus therefore exercises only default-typed sequences; the typed-ALTER
+divergence is recorded here, not oracle-tested.
+
+## 15. `ALTER SEQUENCE` — the definition-changing options + `RENAME TO` (S6)
+
+S2 (§4) landed `ALTER SEQUENCE … RESTART` as the lone action. S6 completes the `ALTER` surface that
+needs **no on-disk change**: the **option set** (re-edit the definition) and **`RENAME TO`** (move the
+catalog key). The two `ALTER` forms still off the table — `AS type`, `OWNED BY`, `OWNER TO`,
+`SET { SCHEMA | LOGGED | UNLOGGED }` — stay `0A000` (`AS type` because the type is not persisted, §14.4;
+the rest because jed has no schema/owner/storage-class concept). There is **no `format_version`
+change**: the six `i64` fields + flags of a `SequenceDef` (§3) and a column's `default_expr` text are
+already variable catalog data, so no golden moves.
+
+### 15.1 Surface and grammar
+
+```sql
+ALTER SEQUENCE [IF EXISTS] s
+    [INCREMENT [BY] n] [MINVALUE m | NO MINVALUE] [MAXVALUE x | NO MAXVALUE]
+    [START [WITH] s0] [RESTART [[WITH] r]] [CACHE c] [[NO] CYCLE]    -- ≥1 option, order-free
+ALTER SEQUENCE [IF EXISTS] s RENAME TO s2
+```
+
+After the (optional `IF EXISTS`) name, the parser dispatches: `RENAME` → the rename form; `OWNED` /
+`OWNER` / `SET` → `0A000`; otherwise the **option loop** — the *same* order-free loop `CREATE SEQUENCE`
+uses (`spec/grammar/grammar.ebnf`, `sequence_option`), extended to also accept `RESTART [[WITH] n]` as
+an interleavable pseudo-option (valid only here, never in `CREATE` or an identity `( … )`). A repeated
+option is `42601` ("… specified more than once" / PG's "conflicting or redundant options"). The option
+form requires **at least one** option (or `RESTART`); an empty `ALTER SEQUENCE s` is `42601` (PG: a
+bare `ALTER SEQUENCE` is a syntax error). An `AS` token is *parsed* into the option set (it shares the
+loop) and rejected at execution as `0A000` (`ALTER … AS type`).
+
+### 15.2 Option execution — PG `init_params(isInit = false)`
+
+The existing definition is cloned; only **written** options overwrite their field; everything else —
+crucially `last_value` and `is_called` — is preserved. Validation re-uses `CREATE`'s rules with three
+`ALTER`-specific points (all oracle-pinned against `postgres:18`):
+
+1. **`INCREMENT` sign does not recompute bounds.** Unlike `CREATE` (where a negative `INCREMENT`
+   defaults `MAXVALUE -1`), an `ALTER` that only changes `INCREMENT` keeps the existing `MINVALUE`/
+   `MAXVALUE`. `NO MINVALUE` / `NO MAXVALUE` *do* recompute the default for the (new) sign — to the
+   **bigint** bound on the open direction (§14.4 divergence).
+2. **`MINVALUE < MAXVALUE` is strict** ("MINVALUE (m) must be less than MAXVALUE (x)"). PG rejects
+   `MINVALUE == MAXVALUE`; jed's shared validator uses `>=` (a latent `CREATE` divergence — jed
+   previously allowed `==` — corrected in S6 for both paths; no golden/corpus moved since no fixture
+   built a one-value sequence).
+3. **Two post-edit cross-checks, in order:** first `START ∈ [MINVALUE, MAXVALUE]` ("START value (s)
+   cannot be less than MINVALUE (m)" / "greater than MAXVALUE (m)"); then the **preserved/​restarted
+   `last_value` ∈ [MINVALUE, MAXVALUE]** ("RESTART value (lv) cannot be …" — PG's wording even with no
+   `RESTART`). So narrowing `MAXVALUE` below the current value is `22023`, reported against the
+   `last_value`. `RESTART` (if written) sets `last_value`/`is_called` *before* this second check.
+
+`ALTER … <options>` is a catalog write (transactional, §5) and touches **no** session state.
+
+### 15.3 `RENAME TO` and owned sequences
+
+`RENAME TO s2` checks the relation namespace: if `s2` (lowercased) already names a table / index /
+sequence — **including `s` itself** — it is `42P07` ("relation already exists"). Otherwise the entry
+moves to the new key with `name = s2`; the counter, options, and `owned_by` link are unchanged.
+
+The wrinkle jed's name-based `nextval` (§4) introduces over PG's OID reference: an **owned** sequence
+(§12) is named by its owning column's stored `DEFAULT nextval('s')` expression *text*. So on a rename of
+an owned sequence, jed **rewrites that column's default** to `nextval('s2')` (regenerating the
+`expr_text` + re-parsing, exactly as `serial` synthesized it) in the same statement. After the rename a
+subsequent `INSERT` advances the renamed sequence — matching PG's observable behavior. The `owned_by`
+pair (`table`, column-ordinal) is untouched, so `DROP TABLE` auto-drop (§12.3) and the `2BP01` on a
+direct `DROP SEQUENCE` of the renamed owned sequence both still hold. (A *plain* `DEFAULT nextval('s')`
+on a non-owned sequence is **not** rewritten — it has no `owned_by` link and PG makes no dependency
+either, §10 decision 4 — so renaming such a sequence then inserting raises `42P01`, exactly as in PG
+where the un-tracked textual reference likewise breaks.)
+
+### 15.4 Determinism
+
+S6 adds no nondeterminism: the option edit and the rename are pure catalog mutations on the
+transactional snapshot (§5), the owned-column default rewrite is a deterministic function of
+`(owner, new name)`, and nothing reads the clock or entropy. Cross-core byte-identity is unaffected
+(no format change); the feature is pinned by the `ddl/alter_sequence.test` corpus (oracle-clean,
+default-typed sequences) and the per-core unit tests for the deliberate divergences (the transactional
+rollback of an `ALTER`, the read-only `25006`, and — where reachable — the typed-ALTER bound
+divergence of §14.4).

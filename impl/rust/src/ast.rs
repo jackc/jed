@@ -246,15 +246,30 @@ pub struct DropSequence {
     pub if_exists: bool,
 }
 
-/// `ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH n]` — the only `ALTER` action this slice
-/// (spec/design/sequences.md §4). The presence of the statement implies `RESTART`; `restart_with`
-/// is `Some(n)` for `RESTART WITH n` and `None` for a bare `RESTART` (reset to the original
-/// `START`). A missing sequence without `IF EXISTS` is 42P01; a value out of bounds is 22023.
+/// `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md §4/§15). A missing
+/// sequence without `IF EXISTS` is 42P01. The two action forms are in `AlterSeqAction`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct AlterSequence {
     pub name: String,
     pub if_exists: bool,
-    pub restart_with: Option<i64>,
+    pub action: AlterSeqAction,
+}
+
+/// The two `ALTER SEQUENCE` action forms (spec/design/sequences.md §15).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum AlterSeqAction {
+    /// The definition-changing option set: the same order-free `CREATE` options (minus `AS`, which
+    /// is 0A000 at execution) plus an interleavable `RESTART`. Only the written options change; the
+    /// counter is preserved unless `restart` is given. `restart` is `None` (no `RESTART`),
+    /// `Some(None)` (bare `RESTART` → the stored `START`), or `Some(Some(n))` (`RESTART WITH n`).
+    /// The parser requires ≥ 1 action (a bare `ALTER SEQUENCE s` is 42601).
+    SetOptions {
+        options: SeqOptions,
+        restart: Option<Option<i64>>,
+    },
+    /// `RENAME TO <new_name>` — move the catalog key; an owned sequence's owning-column `nextval`
+    /// default is rewritten (§15.3). A collision with an existing relation is 42P07.
+    Rename(String),
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

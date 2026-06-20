@@ -1,0 +1,208 @@
+# ALTER SEQUENCE — the definition-changing option set (the order-free CREATE options minus AS, plus an
+# interleavable RESTART) and RENAME TO (spec/design/sequences.md §15). Beyond S2's RESTART
+# (ddl.sequence): re-runs PG init_params with isInit=false — only the WRITTEN options change and
+# last_value/is_called are preserved unless RESTART is given; the post-edit cross-checks are START then
+# the preserved last_value in [MIN, MAX] (22023); MINVALUE < MAXVALUE is strict; the INCREMENT sign does
+# not recompute the bounds. RENAME TO moves the catalog key (42P07 collision) and, for an OWNED (serial)
+# sequence, rewrites the owning column's nextval default so a later INSERT still advances it.
+#
+# Default-typed (bigint) sequences only: the typed-sequence ALTER-bound divergence (the value type is
+# not persisted — §14.4), the 0A000 actions (AS type / OWNED BY / OWNER TO / SET …, all PG-valid), and
+# the transactional rollback of an ALTER live in the per-core unit tests (a PG-clean single-handle
+# corpus cannot express them).
+# requires: ddl.alter_sequence, ddl.sequence, func.sequence, ddl.serial, ddl.create_table, ddl.drop_table, dml.insert, dml.insert_column_list, query.select, types.i32, types.i64
+
+# --- the option edit preserves the counter (PG init_params, isInit=false) ---------------------------
+
+statement ok
+CREATE SEQUENCE a_seq INCREMENT 1 START 1
+
+# pin the counter at 2, then change only INCREMENT — last_value is preserved, so the next value is 12
+statement ok
+SELECT setval('a_seq', 2)
+
+statement ok
+ALTER SEQUENCE a_seq INCREMENT BY 10
+
+query I nosort
+SELECT nextval('a_seq')
+----
+12
+
+# --- START is stored (a later bare RESTART uses it); RESTART itself does not change START ------------
+
+statement ok
+CREATE SEQUENCE b_seq INCREMENT 5 START 10
+
+statement ok
+ALTER SEQUENCE b_seq START WITH 100
+
+statement ok
+ALTER SEQUENCE b_seq RESTART
+
+query I nosort
+SELECT nextval('b_seq')
+----
+100
+
+# --- RESTART may be interleaved with options, and is applied last -----------------------------------
+
+statement ok
+CREATE SEQUENCE c_seq START 1
+
+statement ok
+SELECT setval('c_seq', 5)
+
+statement ok
+ALTER SEQUENCE c_seq INCREMENT 100 RESTART WITH 50 MAXVALUE 1000
+
+# RESTART WITH 50 cleared is_called, so the next value is 50 (not 50 + 100)
+query I nosort
+SELECT nextval('c_seq')
+----
+50
+
+# re-pin the counter, then confirm the new INCREMENT (100) drives the following value
+statement ok
+SELECT setval('c_seq', 50)
+
+query I nosort
+SELECT nextval('c_seq')
+----
+150
+
+# --- NO MINVALUE / NO MAXVALUE / NO CYCLE on ALTER are well-formed -----------------------------------
+
+statement ok
+CREATE SEQUENCE d_seq INCREMENT 2 MINVALUE 1 MAXVALUE 100
+
+statement ok
+ALTER SEQUENCE d_seq NO MINVALUE NO MAXVALUE NO CYCLE
+
+# --- changing the INCREMENT sign does NOT recompute the bounds (PG keeps MINVALUE 1) -----------------
+
+statement ok
+CREATE SEQUENCE e_seq START 5
+
+statement ok
+SELECT setval('e_seq', 5)
+
+statement ok
+ALTER SEQUENCE e_seq INCREMENT -1
+
+# MINVALUE stays 1 (not recomputed to the descending default), so 5 -> 4 is in range
+query I nosort
+SELECT nextval('e_seq')
+----
+4
+
+# --- option validation (22023) ----------------------------------------------------------------------
+
+statement ok
+CREATE SEQUENCE f_seq MINVALUE 1 MAXVALUE 10
+
+# MINVALUE == MAXVALUE is rejected (strict less-than, matching PG)
+statement error 22023
+ALTER SEQUENCE f_seq MINVALUE 10
+
+# START outside the current [MIN, MAX]
+statement error 22023
+ALTER SEQUENCE f_seq START WITH 100
+
+# narrowing MAXVALUE below the current last_value fails the last_value cross-check
+statement ok
+SELECT setval('f_seq', 8)
+
+statement error 22023
+ALTER SEQUENCE f_seq MAXVALUE 5
+
+statement error 22023
+ALTER SEQUENCE f_seq INCREMENT 0
+
+statement error 22023
+ALTER SEQUENCE f_seq CACHE 0
+
+# --- a bare ALTER (no action) and a duplicate option are syntax errors (42601) ----------------------
+
+statement error 42601
+ALTER SEQUENCE f_seq
+
+statement error 42601
+ALTER SEQUENCE f_seq INCREMENT 1 INCREMENT 2
+
+# --- a missing sequence is 42P01 unless IF EXISTS (then a no-op) -------------------------------------
+
+statement error 42P01
+ALTER SEQUENCE nope_seq INCREMENT 1
+
+statement ok
+ALTER SEQUENCE IF EXISTS nope_seq INCREMENT 1
+
+# --- RENAME TO moves the catalog key, keeping the counter -------------------------------------------
+
+statement ok
+CREATE SEQUENCE r_seq START 7
+
+statement ok
+SELECT setval('r_seq', 7)
+
+statement ok
+ALTER SEQUENCE r_seq RENAME TO r_seq2
+
+query I nosort
+SELECT nextval('r_seq2')
+----
+8
+
+# the old name no longer resolves
+statement error 42P01
+SELECT nextval('r_seq')
+
+# RENAME TO a name already in the relation namespace (the same name included) is 42P07
+statement ok
+CREATE SEQUENCE r_other
+
+statement error 42P07
+ALTER SEQUENCE r_seq2 RENAME TO r_other
+
+# RENAME of a missing sequence is 42P01 unless IF EXISTS
+statement error 42P01
+ALTER SEQUENCE nope_seq RENAME TO whatever_seq
+
+statement ok
+ALTER SEQUENCE IF EXISTS nope_seq RENAME TO whatever_seq
+
+# --- RENAME of an OWNED (serial) sequence rewrites the owning column's nextval default, so a later
+# --- INSERT still advances the renamed sequence (matching PG's OID-based behavior) ------------------
+
+statement ok
+CREATE TABLE jt (id serial PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO jt (v) VALUES (10)
+
+statement ok
+ALTER SEQUENCE jt_id_seq RENAME TO jt_seq_renamed
+
+statement ok
+INSERT INTO jt (v) VALUES (20)
+
+query II nosort
+SELECT id, v FROM jt ORDER BY id
+----
+1
+10
+2
+20
+
+# the owned link survives the rename: a direct DROP of the renamed owned sequence is still 2BP01
+statement error 2BP01
+DROP SEQUENCE jt_seq_renamed
+
+# --- cleanup ----------------------------------------------------------------------------------------
+
+statement ok
+DROP TABLE jt
+
+statement ok
+DROP SEQUENCE IF EXISTS a_seq, b_seq, c_seq, d_seq, e_seq, f_seq, r_seq2, r_other

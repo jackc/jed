@@ -56,9 +56,12 @@ fn nextval_rolls_back() {
 #[test]
 fn failed_statement_does_not_advance() {
     let mut db = Database::new();
-    execute(&mut db, "CREATE SEQUENCE s MAXVALUE 1").unwrap();
+    // A two-value [1, 2] sequence (MINVALUE == MAXVALUE is rejected, matching PG — §15.2).
+    execute(&mut db, "CREATE SEQUENCE s MAXVALUE 2").unwrap();
     assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(1));
-    // The next nextval traps 2200H — and because it failed, the counter did not move.
+    assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(2));
+    // The next nextval traps 2200H — and because it failed, the counter did not move, so a second
+    // attempt traps identically.
     assert_eq!(err_code(&mut db, "SELECT nextval('s')"), "2200H");
     assert_eq!(err_code(&mut db, "SELECT nextval('s')"), "2200H");
 }
@@ -149,20 +152,38 @@ fn lastval_rolls_back() {
     assert_eq!(one_int(&mut db, "SELECT lastval()"), Some(100));
 }
 
-/// A non-RESTART `ALTER SEQUENCE` action is `0A000` in jed (only RESTART is supported this slice) —
-/// a divergence from PostgreSQL, where `ALTER SEQUENCE … INCREMENT BY` is valid, so it cannot live
-/// in the PG-clean oracle corpus.
+/// The `ALTER SEQUENCE` actions jed still does not support are `0A000` — each VALID in PostgreSQL, so
+/// they cannot live in the PG-clean oracle corpus (sequences.md §15). `AS type` is foreclosed because
+/// the value type is not persisted (§14.4); `OWNED BY` / `OWNER TO` / `SET …` have no jed concept.
+/// (The option set INCREMENT/MINVALUE/… and RENAME TO are now supported — see ddl/alter_sequence.test.)
 #[test]
-fn alter_non_restart_is_0a000() {
+fn alter_unsupported_actions_are_0a000() {
     let mut db = Database::new();
     execute(&mut db, "CREATE SEQUENCE s").unwrap();
+    assert_eq!(err_code(&mut db, "ALTER SEQUENCE s AS bigint"), "0A000");
+    assert_eq!(err_code(&mut db, "ALTER SEQUENCE s OWNED BY t.c"), "0A000");
+    assert_eq!(err_code(&mut db, "ALTER SEQUENCE s OWNER TO bob"), "0A000");
     assert_eq!(
-        err_code(&mut db, "ALTER SEQUENCE s INCREMENT BY 2"),
+        err_code(&mut db, "ALTER SEQUENCE s SET SCHEMA other"),
         "0A000"
     );
-    assert_eq!(err_code(&mut db, "ALTER SEQUENCE s OWNED BY t.c"), "0A000");
     // ALTER of a non-sequence object is not a known statement at all → 42601 (no escape hatch).
     assert_eq!(err_code(&mut db, "ALTER TABLE t ADD COLUMN c i32"), "42601");
+}
+
+/// An `ALTER SEQUENCE … <options>` edit is a transactional catalog write — it rolls back with its
+/// block (the §5 divergence applies to every ALTER action, not just RESTART). A jed-vs-PG divergence
+/// (PG's sequence definition change is non-transactional), so a per-core unit test, not corpus.
+#[test]
+fn alter_options_roll_back() {
+    let mut db = Database::new();
+    execute(&mut db, "CREATE SEQUENCE s INCREMENT 1").unwrap();
+    execute(&mut db, "BEGIN").unwrap();
+    execute(&mut db, "ALTER SEQUENCE s INCREMENT BY 100").unwrap();
+    execute(&mut db, "ROLLBACK").unwrap();
+    // The INCREMENT edit rolled back, so the step is still 1: setval to 5, next is 6 (not 105).
+    execute(&mut db, "SELECT setval('s', 5)").unwrap();
+    assert_eq!(one_int(&mut db, "SELECT nextval('s')"), Some(6));
 }
 
 /// `setval`/`ALTER … RESTART` are writes — a READ ONLY transaction rejects each with 25006 (each in

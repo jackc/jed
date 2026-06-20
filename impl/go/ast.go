@@ -259,14 +259,27 @@ type DropSequence struct {
 	IfExists bool
 }
 
-// AlterSequence is an ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH n] statement — the only ALTER
-// action this slice (spec/design/sequences.md §4). The presence of the statement implies RESTART;
-// RestartWith is non-nil for RESTART WITH n and nil for a bare RESTART (reset to the original
-// START). A missing sequence without IfExists is 42P01; a value out of bounds is 22023.
+// AlterSequence is an ALTER SEQUENCE [IF EXISTS] <name> <action> statement (spec/design/sequences.md
+// §4/§15). A missing sequence without IfExists is 42P01. RenameTo != "" selects the RENAME TO form;
+// otherwise the option form (Options + Restart) applies. The two are mutually exclusive (the parser
+// requires ≥ 1 option/RESTART for the option form — a bare ALTER SEQUENCE s is 42601).
 type AlterSequence struct {
-	Name        string
-	IfExists    bool
-	RestartWith *int64
+	Name     string
+	IfExists bool
+	// RenameTo is the new name for the RENAME TO form, or "" for the option form.
+	RenameTo string
+	// Options + Restart describe the option form. Restart mirrors Rust's Option<Option<i64>>:
+	// nil = no RESTART; non-nil with ToStart = bare RESTART (reset to the stored START); non-nil
+	// with a Value = RESTART WITH Value.
+	Options SeqOptions
+	Restart *SeqRestart
+}
+
+// SeqRestart is a parsed RESTART pseudo-option on ALTER SEQUENCE (spec/design/sequences.md §15):
+// ToStart true is a bare RESTART (reset to the stored START); otherwise Value is the RESTART WITH n.
+type SeqRestart struct {
+	ToStart bool
+	Value   int64
 }
 
 // ColumnDef is a column definition in a CREATE TABLE.

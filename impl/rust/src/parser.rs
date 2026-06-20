@@ -5,12 +5,12 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex, CreateSequence,
-    CreateTable, CreateType, Cte, DefaultDef, Delete, DropIndex, DropSequence, DropTable, DropType,
-    Expr, ForeignKeyDef, IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind,
-    Literal, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems,
-    SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod,
-    UnaryOp, UniqueDef, Update, WithQuery,
+    AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex,
+    CreateSequence, CreateTable, CreateType, Cte, DefaultDef, Delete, DropIndex, DropSequence,
+    DropTable, DropType, Expr, ForeignKeyDef, IdentitySpec, Insert, InsertSource, InsertValue,
+    JoinClause, JoinKind, Literal, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem,
+    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef,
+    TypeMod, UnaryOp, UniqueDef, Update, WithQuery,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -847,12 +847,41 @@ impl Parser {
     /// options are wrapped in `( … )` and the loop stops at `)`; each option appears at most once
     /// (a repeat is 42601 via `dup_check`).
     fn parse_sequence_options(&mut self, parenthesized: bool) -> Result<SeqOptions> {
+        let (seq, _restart) = self.parse_seq_options_inner(parenthesized, false)?;
+        Ok(seq)
+    }
+
+    /// The shared order-free option loop. When `allow_restart` (only on `ALTER SEQUENCE`, never
+    /// parenthesized), `RESTART [[WITH] n]` is also accepted as an interleavable pseudo-option and
+    /// returned separately — `None` (absent), `Some(None)` (bare `RESTART`), or `Some(Some(n))`
+    /// (`RESTART WITH n`); `RESTART` is invalid in `CREATE`/identity, where it falls through to the
+    /// `_ => break` arm. Each option (including `RESTART`) appears at most once (42601).
+    fn parse_seq_options_inner(
+        &mut self,
+        parenthesized: bool,
+        allow_restart: bool,
+    ) -> Result<(SeqOptions, Option<Option<i64>>)> {
         if parenthesized {
             self.expect(&Token::LParen)?;
         }
         let mut seq = SeqOptions::default();
+        let mut restart: Option<Option<i64>> = None;
         loop {
             match self.peek_keyword().as_deref() {
+                // `RESTART [[WITH] n]` — only on ALTER; resets the counter (sequences.md §15).
+                Some("restart") if allow_restart => {
+                    self.dup_check(restart.is_some(), "RESTART")?;
+                    self.advance();
+                    let v = if matches!(self.peek(), Token::Int(_) | Token::Minus)
+                        || self.peek_keyword().as_deref() == Some("with")
+                    {
+                        self.consume_keyword("with");
+                        Some(self.parse_signed_int_literal()?)
+                    } else {
+                        None
+                    };
+                    restart = Some(v);
+                }
                 // `AS <type>` — the sequence value type (order-free, S5 — sequences.md §14). The raw
                 // type name is stored; it is resolved (and a non-integer type rejected 22023) at
                 // execution. Inside an IDENTITY column's `( … )` a set `data_type` is 42601.
@@ -925,7 +954,7 @@ impl Parser {
         if parenthesized {
             self.expect(&Token::RParen)?;
         }
-        Ok(seq)
+        Ok((seq, restart))
     }
 
     /// `DROP SEQUENCE [IF EXISTS] <name> [, …] [RESTRICT | CASCADE]` (grammar.md §44). `CASCADE`
@@ -963,9 +992,11 @@ impl Parser {
         Ok(DropSequence { names, if_exists })
     }
 
-    /// `ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH <signed_int>]` (spec/design/sequences.md §4).
-    /// The only ALTER action this slice; `RESTART` is required. `RESTART WITH n` yields
-    /// `restart_with = Some(n)`, a bare `RESTART` yields `None` (reset to the original START).
+    /// `ALTER SEQUENCE [IF EXISTS] <name> <action>` (spec/design/sequences.md §15). After the name
+    /// the next keyword dispatches: `RENAME` → the rename form; `OWNED`/`OWNER`/`SET` → 0A000;
+    /// otherwise the order-free option loop (the `CREATE` options plus an interleavable `RESTART`),
+    /// which requires ≥ 1 option (a bare `ALTER SEQUENCE s` is 42601). `AS` is parsed into the option
+    /// set and rejected as 0A000 at execution.
     fn parse_alter_sequence(&mut self) -> Result<AlterSequence> {
         self.expect_keyword("alter")?;
         self.expect_keyword("sequence")?;
@@ -975,28 +1006,35 @@ impl Parser {
             self.expect_keyword("exists")?;
         }
         let name = self.expect_identifier()?;
-        // RESTART is the only supported action; any other ALTER SEQUENCE action (SET INCREMENT,
-        // RENAME, OWNED BY, …) is 0A000 (sequences.md §9), not a syntax error.
-        if self.peek_keyword().as_deref() != Some("restart") {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "only ALTER SEQUENCE ... RESTART is supported".to_string(),
-            ));
-        }
-        self.expect_keyword("restart")?;
-        // RESTART [WITH] <signed_int>; bare RESTART (no value) resets to the stored START.
-        let restart_with = if matches!(self.peek(), Token::Int(_) | Token::Minus)
-            || self.peek_keyword().as_deref() == Some("with")
-        {
-            self.consume_keyword("with");
-            Some(self.parse_signed_int_literal()?)
-        } else {
-            None
+        let action = match self.peek_keyword().as_deref() {
+            Some("rename") => {
+                self.advance();
+                self.expect_keyword("to")?;
+                AlterSeqAction::Rename(self.expect_identifier()?)
+            }
+            // The remaining ALTER actions jed does not support are 0A000 (not syntax errors), so the
+            // parser recognizes their leading keyword and reports the feature gap (sequences.md §15).
+            Some("owned") | Some("owner") | Some("set") => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "this ALTER SEQUENCE action is not supported".to_string(),
+                ));
+            }
+            _ => {
+                let (options, restart) = self.parse_seq_options_inner(false, true)?;
+                // ≥ 1 action required: a bare `ALTER SEQUENCE s` (no option, no RESTART) is 42601.
+                if options == SeqOptions::default() && restart.is_none() {
+                    return Err(syntax(
+                        "ALTER SEQUENCE requires at least one action".to_string(),
+                    ));
+                }
+                AlterSeqAction::SetOptions { options, restart }
+            }
         };
         Ok(AlterSequence {
             name,
             if_exists,
-            restart_with,
+            action,
         })
     }
 

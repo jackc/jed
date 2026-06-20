@@ -75,6 +75,10 @@ var SupportedCapabilities = []string{
 	// CREATE SEQUENCE … AS { smallint | integer | bigint } — the sequence value type sets the
 	// default + validated MIN/MAX bounds; serial/identity follow the column type (sequences.md §14).
 	"ddl.sequence_as_type",
+	// ALTER SEQUENCE … <options> / RENAME TO — re-edit the definition (PG init_params, isInit=false)
+	// or move the catalog key (rewriting an owned sequence's nextval default); no format change
+	// (sequences.md §15).
+	"ddl.alter_sequence",
 	// NOT NULL column constraint — storing NULL traps 23502 (spec/design/constraints.md §1).
 	"ddl.not_null",
 	// DEFAULT <literal> column constraint, evaluated + coerced at CREATE (constraints.md §2).

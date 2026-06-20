@@ -2076,8 +2076,14 @@ sequence_option ::= "INCREMENT" "BY"? signed_integer
                   | "CACHE" signed_integer
                   | "CYCLE" | "NO" "CYCLE"
 drop_sequence   ::= "DROP" "SEQUENCE" ("IF" "EXISTS")? identifier ("," identifier)* "RESTRICT"?
-alter_sequence  ::= "ALTER" "SEQUENCE" ("IF" "EXISTS")? identifier "RESTART" ("WITH"? signed_integer)?
+alter_sequence  ::= "ALTER" "SEQUENCE" ("IF" "EXISTS")? identifier
+                    ( "RENAME" "TO" identifier
+                    | alter_sequence_option+ )
+alter_sequence_option ::= sequence_option | "RESTART" ("WITH"? signed_integer)?
 ```
+
+(`sequence_option` above also includes `AS type` for `CREATE`; on `ALTER` the same loop accepts it
+syntactically but execution rejects `AS` as `0A000` — §15.)
 
 The options are **order-free** and each appears at most once (a repeat is `42601`), like the FK
 actions (§43) — the parser loops, dispatching on the leading keyword. `INCREMENT`/`START` accept an
@@ -2094,10 +2100,19 @@ sequence behavior itself. `nextval('s')` / `currval('s')` / `setval('s', n[, b])
 ordinary `function_call`s (§ no new production) — the first three resolve their `text` argument to a
 sequence at evaluation (`42P01` if missing), `lastval()` reads per-session state.
 
-`ALTER SEQUENCE [IF EXISTS] name RESTART [WITH n]` is the only `ALTER` action this slice (S2) — and
-`ALTER` is **not otherwise a statement keyword yet**, so the dispatcher recognizes it solely as
-`ALTER SEQUENCE` (a two-keyword lookahead, the `CREATE SEQUENCE` precedent; `ALTER`/`RESTART` stay
-non-reserved). `RESTART` resets the counter so the next `nextval` returns `n` (`RESTART WITH n`) or
-the original `START` (bare `RESTART`), clearing `is_called`; the stored `START` is unchanged. A
-missing sequence is `42P01` unless `IF EXISTS` (then a no-op); a value outside `[MINVALUE, MAXVALUE]`
-is `22023` (NB — `setval`'s out-of-bounds error is `22003`; the two PG paths differ).
+`ALTER` is **not otherwise a statement keyword**, so the dispatcher recognizes it solely as
+`ALTER SEQUENCE` (a two-keyword lookahead, the `CREATE SEQUENCE` precedent; `ALTER`/`RESTART`/`RENAME`
+stay non-reserved). After the name the parser dispatches on the next keyword: `RENAME` → the rename
+form; `OWNED` / `OWNER` / `SET` → `0A000`; otherwise the **option loop** — the same order-free
+`sequence_option` loop `CREATE` uses, extended with an interleavable `RESTART [[WITH] n]`, requiring
+**≥ 1** option (a bare `ALTER SEQUENCE s` is `42601`, matching PG). `RESTART` resets the counter so the
+next `nextval` returns `n` (`RESTART WITH n`) or the stored `START` (bare `RESTART`), clearing
+`is_called`; the stored `START` is unchanged. On `ALTER` only the **written** options change and
+`last_value`/`is_called` are preserved unless `RESTART` is given (PG `init_params`, `isInit = false`);
+the post-edit cross-checks are `START ∈ [MIN, MAX]` then the preserved `last_value ∈ [MIN, MAX]` (each
+`22023`; NB — `setval`'s out-of-bounds error is `22003`, the two PG paths differ), and `MINVALUE <
+MAXVALUE` is strict. `RENAME TO new_name` moves the catalog key (`42P07` if `new_name` already names a
+relation, the same name included) and rewrites an **owned** sequence's owning-column `nextval` default
+(§15.3). A missing sequence is `42P01` unless `IF EXISTS` (then a no-op). `ALTER … AS type` (the type is
+not persisted — sequences.md §14.4), `OWNED BY`, `OWNER TO`, and `SET { SCHEMA | LOGGED | UNLOGGED }`
+stay `0A000`.

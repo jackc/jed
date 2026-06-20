@@ -373,6 +373,20 @@ export function emptySeqOptions(): SeqOptions {
   };
 }
 
+// seqOptionsHasAny reports whether any sequence option was written (any field non-null) — used by
+// ALTER SEQUENCE to require ≥ 1 action when there is no RESTART (spec/design/sequences.md §15).
+export function seqOptionsHasAny(o: SeqOptions): boolean {
+  return (
+    o.dataType !== null ||
+    o.increment !== null ||
+    o.minValue !== null ||
+    o.maxValue !== null ||
+    o.start !== null ||
+    o.cache !== null ||
+    o.cycle !== null
+  );
+}
+
 // CreateSequence is a `CREATE SEQUENCE [IF NOT EXISTS] <name> [options]` statement — a named,
 // persisted i64 generator (spec/design/sequences.md). Execution validates the option set (22023),
 // rejects a relation-namespace collision (42P07 unless `ifNotExists`), and registers the sequence.
@@ -397,15 +411,22 @@ export type DropSequence = {
   ifExists: boolean;
 };
 
-// AlterSequence is an `ALTER SEQUENCE [IF EXISTS] <name> RESTART [WITH n]` statement — the only
-// ALTER action this slice (spec/design/sequences.md §4). The statement implies RESTART; restartWith
-// is a bigint for RESTART WITH n and null for a bare RESTART (reset to the original START). A
-// missing sequence without ifExists is 42P01; a value out of bounds is 22023.
+// SeqRestart is a parsed RESTART pseudo-option on ALTER SEQUENCE (spec/design/sequences.md §15):
+// `{ toStart: true }` is a bare RESTART (reset to the stored START); otherwise `value` is RESTART
+// WITH n. `null` (no SeqRestart) means RESTART was not written. Mirrors Rust's Option<Option<i64>>.
+export type SeqRestart = { toStart: true } | { toStart: false; value: bigint };
+
+// AlterSequence is an `ALTER SEQUENCE [IF EXISTS] <name> <action>` statement (spec/design/sequences.md
+// §4/§15). A missing sequence without ifExists is 42P01. The two action forms: `setOptions` re-edits
+// the definition (the order-free CREATE options minus AS, plus an interleavable RESTART; the parser
+// requires ≥ 1 — a bare ALTER SEQUENCE s is 42601), `rename` moves the catalog key.
 export type AlterSequence = {
   kind: "alterSequence";
   name: string;
   ifExists: boolean;
-  restartWith: bigint | null;
+  action:
+    | { kind: "setOptions"; options: SeqOptions; restart: SeqRestart | null }
+    | { kind: "rename"; newName: string };
 };
 
 // Insert is an INSERT ... [(col, ..)] whose rows come from EITHER a VALUES list (each value a

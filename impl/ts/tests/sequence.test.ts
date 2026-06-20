@@ -59,9 +59,12 @@ test("nextval rolls back with its transaction", () => {
 // A failed autocommit statement does not advance the sequence either (the per-statement rollback).
 test("failed statement does not advance", () => {
   const db = new Database();
-  execute(db, "CREATE SEQUENCE s MAXVALUE 1");
+  // A two-value [1, 2] sequence (MINVALUE == MAXVALUE is rejected, matching PG — §15.2).
+  execute(db, "CREATE SEQUENCE s MAXVALUE 2");
   assert.equal(oneInt(db, "SELECT nextval('s')"), 1n);
-  // The next nextval traps 2200H — and because it failed, the counter did not move.
+  assert.equal(oneInt(db, "SELECT nextval('s')"), 2n);
+  // The next nextval traps 2200H — and because it failed, the counter did not move, so a second
+  // attempt traps identically.
   assert.equal(errCode(db, "SELECT nextval('s')"), "2200H");
   assert.equal(errCode(db, "SELECT nextval('s')"), "2200H");
 });
@@ -147,16 +150,33 @@ test("lastval rolls back with its transaction", () => {
   assert.equal(oneInt(db, "SELECT lastval()"), 100n);
 });
 
-// A non-RESTART ALTER SEQUENCE action is 0A000 in jed (only RESTART is supported this slice) — a
-// divergence from PostgreSQL, where ALTER SEQUENCE … INCREMENT BY is valid, so it cannot live in the
-// PG-clean oracle corpus.
-test("non-RESTART ALTER SEQUENCE is 0A000", () => {
+// The ALTER SEQUENCE actions jed still does not support are 0A000 — each VALID in PostgreSQL, so they
+// cannot live in the PG-clean oracle corpus (sequences.md §15). AS type is foreclosed because the
+// value type is not persisted (§14.4); OWNED BY / OWNER TO / SET … have no jed concept. (The option
+// set INCREMENT/MINVALUE/… and RENAME TO are now supported — see ddl/alter_sequence.test.)
+test("unsupported ALTER SEQUENCE actions are 0A000", () => {
   const db = new Database();
   execute(db, "CREATE SEQUENCE s");
-  assert.equal(errCode(db, "ALTER SEQUENCE s INCREMENT BY 2"), "0A000");
+  assert.equal(errCode(db, "ALTER SEQUENCE s AS bigint"), "0A000");
   assert.equal(errCode(db, "ALTER SEQUENCE s OWNED BY t.c"), "0A000");
+  assert.equal(errCode(db, "ALTER SEQUENCE s OWNER TO bob"), "0A000");
+  assert.equal(errCode(db, "ALTER SEQUENCE s SET SCHEMA other"), "0A000");
   // ALTER of a non-sequence object is not a known statement at all → 42601 (no escape hatch).
   assert.equal(errCode(db, "ALTER TABLE t ADD COLUMN c i32"), "42601");
+});
+
+// An ALTER SEQUENCE … <options> edit is a transactional catalog write — it rolls back with its block
+// (the §5 divergence applies to every ALTER action, not just RESTART). A jed-vs-PG divergence, so a
+// per-core unit test, not corpus.
+test("ALTER SEQUENCE options roll back", () => {
+  const db = new Database();
+  execute(db, "CREATE SEQUENCE s INCREMENT 1");
+  execute(db, "BEGIN");
+  execute(db, "ALTER SEQUENCE s INCREMENT BY 100");
+  execute(db, "ROLLBACK");
+  // The INCREMENT edit rolled back, so the step is still 1: setval to 5, next is 6 (not 105).
+  execute(db, "SELECT setval('s', 5)");
+  assert.equal(oneInt(db, "SELECT nextval('s')"), 6n);
 });
 
 // setval/ALTER … RESTART are writes — a READ ONLY transaction rejects each with 25006 (each in its

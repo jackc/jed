@@ -649,6 +649,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `serial_table.jed` / `identity_table.jed` goldens move (`MAXVALUE 2147483647`). All three
         cores + Ruby; `ddl/sequence_as_type.test`; capability `ddl.sequence_as_type`.
         → [sequences.md §14](spec/design/sequences.md) _(size: M)_
+  - [x] **S6** — the `ALTER SEQUENCE` **definition-changing option set** (the order-free `CREATE`
+        options minus `AS`, plus an interleavable `RESTART`) **+ `RENAME TO`**. Re-runs PG
+        `init_params` with `isInit = false` (only written options change; `last_value`/`is_called`
+        preserved unless `RESTART`); the two post-edit cross-checks (`START`, then the preserved
+        `last_value`), strict `MINVALUE < MAXVALUE` (also corrects the `CREATE` path, which previously
+        allowed `==`). `RENAME TO` moves the catalog key (`42P07` collision, same name included) and
+        rewrites an **owned** sequence's owning-column `nextval` default so a later `INSERT` still
+        works. A bare `ALTER SEQUENCE s` is `42601`; `AS type`/`OWNED BY`/`OWNER TO`/`SET …` stay
+        `0A000`. **No `format_version` change** (no golden moves). All three cores; `ddl/alter_sequence.test`;
+        capability `ddl.alter_sequence`. → [sequences.md §15](spec/design/sequences.md) _(size: M)_
 - [ ] **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE ✅, RETURNING ✅ — unblocked)_
 - [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
       `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).

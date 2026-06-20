@@ -466,6 +466,23 @@ func (s *Snapshot) putIndex(tableKey string, def IndexDef, pageSize uint32) {
 	s.tables[tableKey] = &t
 }
 
+// setColumnDefaultExpr replaces a table column's expression default in place — used by ALTER
+// SEQUENCE … RENAME of an owned sequence to rewrite the owning column's nextval default
+// (spec/design/sequences.md §15.3), leaving the table's rows/store untouched. The Table and its
+// Columns slice are re-allocated (catalog tables are never mutated in place — snapshots share them).
+// A no-op if the table or column ordinal is absent.
+func (s *Snapshot) setColumnDefaultExpr(tableKey string, column int, de *DefaultExpr) {
+	old, ok := s.tables[tableKey]
+	if !ok || column < 0 || column >= len(old.Columns) {
+		return
+	}
+	t := *old
+	t.Columns = make([]Column, len(old.Columns))
+	copy(t.Columns, old.Columns)
+	t.Columns[column].DefaultExpr = de
+	s.tables[tableKey] = &t
+}
+
 // putIndexStore registers a loaded index store under its (lowercased) name — the file
 // loader's hook (format.go): the owning table's Indexes list came from its catalog entry,
 // so only the store is registered here.
@@ -2313,7 +2330,9 @@ func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*Sequ
 	if options.MaxValue != nil && !options.MaxValue.NoValue {
 		maxValue = options.MaxValue.Value
 	}
-	if minValue > maxValue {
+	// PG requires MINVALUE strictly less than MAXVALUE (a one-value sequence is rejected); jed
+	// previously allowed `==` — corrected here so CREATE and ALTER (sequences.md §15.2) agree with PG.
+	if minValue >= maxValue {
 		return nil, NewError(InvalidParameterValue,
 			fmt.Sprintf("MINVALUE (%d) must be less than MAXVALUE (%d)", minValue, maxValue))
 	}
@@ -2325,13 +2344,8 @@ func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*Sequ
 	if options.Start != nil {
 		start = *options.Start
 	}
-	if start < minValue || start > maxValue {
-		if start < minValue {
-			return nil, NewError(InvalidParameterValue,
-				fmt.Sprintf("START value (%d) cannot be less than MINVALUE the %d value", start, minValue))
-		}
-		return nil, NewError(InvalidParameterValue,
-			fmt.Sprintf("START value (%d) cannot be greater than MAXVALUE the %d value", start, maxValue))
+	if err := seqBoundCheckStart(start, minValue, maxValue); err != nil {
+		return nil, err
 	}
 	cycle := false
 	if options.Cycle != nil {
@@ -2349,6 +2363,102 @@ func buildSequenceDef(name string, options SeqOptions, ownedBy *SeqOwner) (*Sequ
 		IsCalled:  false,
 		OwnedBy:   ownedBy,
 	}, nil
+}
+
+// seqBoundCheckStart is PG's START-in-bounds cross-check (init_params): start ∈ [min, max], else
+// 22023 with PG's wording. Shared by CREATE (buildSequenceDef) and ALTER (applySeqAlter).
+func seqBoundCheckStart(start, minValue, maxValue int64) error {
+	if start < minValue {
+		return NewError(InvalidParameterValue,
+			fmt.Sprintf("START value (%d) cannot be less than MINVALUE (%d)", start, minValue))
+	}
+	if start > maxValue {
+		return NewError(InvalidParameterValue,
+			fmt.Sprintf("START value (%d) cannot be greater than MAXVALUE (%d)", start, maxValue))
+	}
+	return nil
+}
+
+// seqBoundCheckLast is PG's last_value (RESTART) cross-check (init_params): the post-edit last_value ∈
+// [min, max], else 22023. PG uses the "RESTART value …" wording even with no RESTART written (§15.2).
+func seqBoundCheckLast(lastValue, minValue, maxValue int64) error {
+	if lastValue < minValue {
+		return NewError(InvalidParameterValue,
+			fmt.Sprintf("RESTART value (%d) cannot be less than MINVALUE (%d)", lastValue, minValue))
+	}
+	if lastValue > maxValue {
+		return NewError(InvalidParameterValue,
+			fmt.Sprintf("RESTART value (%d) cannot be greater than MAXVALUE (%d)", lastValue, maxValue))
+	}
+	return nil
+}
+
+// applySeqAlter re-edits an existing SequenceDef per ALTER SEQUENCE s <options>
+// (spec/design/sequences.md §15.2) — PG init_params with isInit=false. Only the WRITTEN options
+// change; LastValue/IsCalled are preserved unless restart is given. The value type is not persisted
+// (§14.4), so NO MINVALUE/NO MAXVALUE reset the open direction to the bigint bound and an explicit
+// bound is i64-checked only. options.DataType must be "" (the caller rejects AS as 0A000 first).
+func applySeqAlter(existing *SequenceDef, options SeqOptions, restart *SeqRestart) (*SequenceDef, error) {
+	def := *existing
+	if options.Increment != nil {
+		if *options.Increment == 0 {
+			return nil, NewError(InvalidParameterValue, "INCREMENT must not be zero")
+		}
+		def.Increment = *options.Increment
+	}
+	if options.Cache != nil {
+		if *options.Cache < 1 {
+			return nil, NewError(InvalidParameterValue,
+				fmt.Sprintf("CACHE (%d) must be greater than zero", *options.Cache))
+		}
+		def.Cache = *options.Cache
+	}
+	// NO MINVALUE/NO MAXVALUE recompute the default for the (possibly new) INCREMENT sign — against
+	// the bigint range (the value type is not persisted, §14.4). An explicit bound is taken as
+	// written; an unwritten bound is preserved (PG keeps it even when the sign flips).
+	defMin, defMax := SeqBigInt.DefaultBounds(def.Increment)
+	if options.MinValue != nil {
+		if options.MinValue.NoValue {
+			def.MinValue = defMin
+		} else {
+			def.MinValue = options.MinValue.Value
+		}
+	}
+	if options.MaxValue != nil {
+		if options.MaxValue.NoValue {
+			def.MaxValue = defMax
+		} else {
+			def.MaxValue = options.MaxValue.Value
+		}
+	}
+	if def.MinValue >= def.MaxValue {
+		return nil, NewError(InvalidParameterValue,
+			fmt.Sprintf("MINVALUE (%d) must be less than MAXVALUE (%d)", def.MinValue, def.MaxValue))
+	}
+	if options.Start != nil {
+		def.Start = *options.Start
+	}
+	// Cross-check 1: START ∈ [min, max].
+	if err := seqBoundCheckStart(def.Start, def.MinValue, def.MaxValue); err != nil {
+		return nil, err
+	}
+	// RESTART (applied last, before the last_value cross-check).
+	if restart != nil {
+		if restart.ToStart {
+			def.LastValue = def.Start
+		} else {
+			def.LastValue = restart.Value
+		}
+		def.IsCalled = false
+	}
+	// Cross-check 2: the preserved/restarted last_value ∈ [min, max].
+	if err := seqBoundCheckLast(def.LastValue, def.MinValue, def.MaxValue); err != nil {
+		return nil, err
+	}
+	if options.Cycle != nil {
+		def.Cycle = *options.Cycle
+	}
+	return &def, nil
 }
 
 // serialPseudoType maps a serial pseudo-type name to its underlying integer scalar
@@ -2690,11 +2800,11 @@ func (db *Database) executeDropSequence(ds *DropSequence) (Outcome, error) {
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
-// executeAlterSequence analyzes and runs an ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]
-// (spec/design/sequences.md §4). A missing sequence is 42P01 unless IF EXISTS (then a no-op).
-// RESTART WITH n resets LastValue to n, a bare RESTART to the original Start (unchanged); either way
-// IsCalled = false, so the next nextval returns that value. A restart value outside
-// [MinValue, MaxValue] is 22023. Touches no session state (currval/lastval unchanged).
+// executeAlterSequence analyzes and runs an ALTER SEQUENCE [IF EXISTS] s <action>
+// (spec/design/sequences.md §4/§15). A missing sequence is 42P01 unless IF EXISTS (then a no-op).
+// The option form re-edits the definition (PG init_params, isInit=false — only written options
+// change, the counter preserved unless RESTART); RENAME TO moves the catalog key. Touches no session
+// state (currval/lastval unchanged). A catalog write (the write path, transactional, §5).
 func (db *Database) executeAlterSequence(as *AlterSequence) (Outcome, error) {
 	snapDef := db.readSnap().sequence(as.Name)
 	if snapDef == nil {
@@ -2703,26 +2813,49 @@ func (db *Database) executeAlterSequence(as *AlterSequence) (Outcome, error) {
 		}
 		return Outcome{}, NewError(UndefinedTable, "relation does not exist: "+as.Name)
 	}
-	def := *snapDef
-	value := def.Start
-	if as.RestartWith != nil {
-		value = *as.RestartWith
-	}
-	if value < def.MinValue || value > def.MaxValue {
-		// PG's init_params path: 22023 (distinct from setval's 22003 do_setval path — §4).
-		var bound string
-		if value > def.MaxValue {
-			bound = fmt.Sprintf("greater than MAXVALUE (%d)", def.MaxValue)
-		} else {
-			bound = fmt.Sprintf("less than MINVALUE (%d)", def.MinValue)
+	existing := *snapDef
+	if as.RenameTo != "" {
+		if err := db.alterSequenceRename(&existing, as.RenameTo); err != nil {
+			return Outcome{}, err
 		}
-		return Outcome{}, NewError(InvalidParameterValue,
-			fmt.Sprintf("RESTART value (%d) cannot be %s", value, bound))
+	} else {
+		// AS type on ALTER is 0A000 — the value type is not persisted (sequences.md §14.4), so the
+		// original type for re-deriving a default bound is gone.
+		if as.Options.DataType != "" {
+			return Outcome{}, NewError(FeatureNotSupported, "ALTER SEQUENCE ... AS type is not supported")
+		}
+		newDef, err := applySeqAlter(&existing, as.Options, as.Restart)
+		if err != nil {
+			return Outcome{}, err
+		}
+		db.working().putSequence(newDef)
 	}
-	def.LastValue = value
-	def.IsCalled = false
-	db.working().putSequence(&def)
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+}
+
+// alterSequenceRename implements ALTER SEQUENCE s RENAME TO s2 (spec/design/sequences.md §15.3): a
+// collision with any relation — including s itself — is 42P07; otherwise move the entry to the new
+// key. For an OWNED sequence, the owning column's DEFAULT nextval('s') text is rewritten in place to
+// nextval('s2') (the rows survive — not via putTable) so a later INSERT still advances the renamed
+// sequence (jed resolves the sequence by name, unlike PG's OID reference).
+func (db *Database) alterSequenceRename(existing *SequenceDef, newName string) error {
+	if db.relationExists(newName) {
+		return NewError(DuplicateTable, "relation already exists: "+newName)
+	}
+	if existing.OwnedBy != nil {
+		exprText := "nextval ( '" + strings.ReplaceAll(strings.ToLower(newName), "'", "''") + "' )"
+		expr, err := ParseExpression(exprText)
+		if err != nil {
+			return err
+		}
+		db.working().setColumnDefaultExpr(strings.ToLower(existing.OwnedBy.Table),
+			int(existing.OwnedBy.Column), &DefaultExpr{ExprText: exprText, Expr: expr})
+	}
+	def := *existing
+	def.Name = newName
+	db.working().removeSequence(strings.ToLower(existing.Name))
+	db.working().putSequence(&def)
+	return nil
 }
 
 // indexEntryKey builds a secondary-index entry key (spec/design/indexes.md §3): each

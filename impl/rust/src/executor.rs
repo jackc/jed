@@ -5,8 +5,8 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    AlterSequence, BinaryOp, CreateIndex, CreateSequence, CreateTable, CreateType, Delete,
-    DropIndex, DropSequence, DropTable, DropType, Expr, Insert, InsertSource, InsertValue,
+    AlterSeqAction, AlterSequence, BinaryOp, CreateIndex, CreateSequence, CreateTable, CreateType,
+    Delete, DropIndex, DropSequence, DropTable, DropType, Expr, Insert, InsertSource, InsertValue,
     JoinKind, Literal, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions,
     SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
 };
@@ -492,6 +492,23 @@ impl Snapshot {
             .position(|i| i.name.to_ascii_lowercase() > name_key)
             .unwrap_or(table.indexes.len());
         table.indexes.insert(pos, def);
+    }
+
+    /// Replace a table column's expression default **in place**, leaving the table's rows and store
+    /// untouched — used by `ALTER SEQUENCE … RENAME` of an owned sequence to rewrite the owning
+    /// column's `nextval` default (spec/design/sequences.md §15.3). `put_table` cannot be used here:
+    /// it rebuilds a fresh empty store. A no-op if the table or column ordinal is absent.
+    pub(crate) fn set_column_default_expr(
+        &mut self,
+        table_key: &str,
+        column: usize,
+        default_expr: DefaultExpr,
+    ) {
+        if let Some(table) = self.tables.get_mut(table_key) {
+            if let Some(col) = table.columns.get_mut(column) {
+                col.default_expr = Some(default_expr);
+            }
+        }
     }
 
     /// Register a loaded index store under its (lowercased) name — the file loader's hook
@@ -2728,13 +2745,13 @@ impl Database {
         })
     }
 
-    /// Analyze and run an `ALTER SEQUENCE [IF EXISTS] s RESTART [WITH n]` (spec/design/sequences.md
-    /// §4). A missing sequence is 42P01 unless `IF EXISTS` (then a no-op). `RESTART WITH n` resets
-    /// `last_value` to `n`, a bare `RESTART` to the original `START` (unchanged); either way
-    /// `is_called = false`, so the next `nextval` returns that value. A restart value outside
-    /// `[min_value, max_value]` is 22023. Touches no session state (`currval`/`lastval` unchanged).
+    /// Analyze and run an `ALTER SEQUENCE [IF EXISTS] s <action>` (spec/design/sequences.md §4/§15).
+    /// A missing sequence is 42P01 unless `IF EXISTS` (then a no-op). The option form re-edits the
+    /// definition (PG `init_params`, `isInit = false` — only written options change, the counter is
+    /// preserved unless `RESTART`); `RENAME TO` moves the catalog key. Touches no session state
+    /// (`currval`/`lastval` unchanged). A catalog write (the write path, transactional, §5).
     fn execute_alter_sequence(&mut self, als: AlterSequence) -> Result<Outcome> {
-        let mut def = match self.read_snap().sequence(&als.name) {
+        let existing = match self.read_snap().sequence(&als.name) {
             Some(d) => d.clone(),
             None => {
                 if als.if_exists {
@@ -2749,26 +2766,62 @@ impl Database {
                 ));
             }
         };
-        let value = als.restart_with.unwrap_or(def.start);
-        if value < def.min_value || value > def.max_value {
-            // PG's init_params path: 22023 (distinct from setval's 22003 do_setval path — §4).
-            let bound = if value > def.max_value {
-                format!("greater than MAXVALUE ({})", def.max_value)
-            } else {
-                format!("less than MINVALUE ({})", def.min_value)
-            };
-            return Err(EngineError::new(
-                SqlState::InvalidParameterValue,
-                format!("RESTART value ({value}) cannot be {bound}"),
-            ));
+        match als.action {
+            AlterSeqAction::SetOptions { options, restart } => {
+                // `AS type` on ALTER is 0A000 — the value type is not persisted (sequences.md §14.4),
+                // so the original type for re-deriving a default bound is gone.
+                if options.data_type.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "ALTER SEQUENCE ... AS type is not supported".to_string(),
+                    ));
+                }
+                let new_def = apply_seq_alter(&existing, &options, restart)?;
+                self.working_mut().put_sequence(new_def);
+            }
+            AlterSeqAction::Rename(new_name) => {
+                self.alter_sequence_rename(&existing, &new_name)?;
+            }
         }
-        def.last_value = value;
-        def.is_called = false;
-        self.working_mut().put_sequence(def);
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
         })
+    }
+
+    /// `ALTER SEQUENCE s RENAME TO s2` (spec/design/sequences.md §15.3): a collision with any
+    /// relation — including `s` itself — is 42P07; otherwise move the entry to the new key. For an
+    /// **owned** sequence, the owning column's `DEFAULT nextval('s')` text is rewritten to
+    /// `nextval('s2')` so a later INSERT still advances the renamed sequence (jed resolves the
+    /// sequence by name, unlike PG's OID reference).
+    fn alter_sequence_rename(&mut self, existing: &SequenceDef, new_name: &str) -> Result<()> {
+        if self.relation_exists(new_name) {
+            return Err(EngineError::new(
+                SqlState::DuplicateTable,
+                format!("relation already exists: {new_name}"),
+            ));
+        }
+        // Rewrite the owning column's nextval default in place (an owned sequence only) — the rows
+        // and store must survive, so this mutates the catalog column, not via `put_table`. The owner
+        // table is always present (its DROP TABLE would have auto-dropped this sequence first).
+        if let Some(owner) = &existing.owned_by {
+            let expr_text = format!(
+                "nextval ( '{}' )",
+                new_name.to_ascii_lowercase().replace('\'', "''")
+            );
+            let expr = crate::parser::parse_expression(&expr_text)?;
+            self.working_mut().set_column_default_expr(
+                &owner.table.to_ascii_lowercase(),
+                owner.column as usize,
+                DefaultExpr { expr_text, expr },
+            );
+        }
+        let old_key = existing.name.to_ascii_lowercase();
+        let mut def = existing.clone();
+        def.name = new_name.to_string();
+        self.working_mut().remove_sequence(&old_key);
+        self.working_mut().put_sequence(def);
+        Ok(())
     }
 
     /// Analyze and run an INSERT whose rows come from a `VALUES` list or a `SELECT`
@@ -10789,7 +10842,9 @@ fn build_sequence_def(
         Some(Some(v)) => v,
         Some(None) | None => def_max,
     };
-    if min_value > max_value {
+    // PG requires MINVALUE strictly less than MAXVALUE (a one-value sequence is rejected); jed
+    // previously allowed `==` — corrected here so CREATE and ALTER (sequences.md §15.2) agree with PG.
+    if min_value >= max_value {
         return Err(EngineError::new(
             SqlState::InvalidParameterValue,
             format!("MINVALUE ({min_value}) must be less than MAXVALUE ({max_value})"),
@@ -10799,24 +10854,7 @@ fn build_sequence_def(
     let start = options
         .start
         .unwrap_or(if increment < 0 { max_value } else { min_value });
-    if start < min_value || start > max_value {
-        return Err(EngineError::new(
-            SqlState::InvalidParameterValue,
-            format!(
-                "START value ({start}) cannot be {} the {} value",
-                if start < min_value {
-                    "less than MINVALUE"
-                } else {
-                    "greater than MAXVALUE"
-                },
-                if start < min_value {
-                    min_value
-                } else {
-                    max_value
-                }
-            ),
-        ));
-    }
+    seq_bound_check_start(start, min_value, max_value)?;
     Ok(SequenceDef {
         name: name.to_string(),
         increment,
@@ -10829,6 +10867,126 @@ fn build_sequence_def(
         is_called: false,
         owned_by,
     })
+}
+
+/// PG's START-in-bounds cross-check (`init_params`): `start ∈ [min, max]`, else 22023 with PG's
+/// wording. Shared by `CREATE` (build_sequence_def) and `ALTER` (apply_seq_alter).
+fn seq_bound_check_start(start: i64, min_value: i64, max_value: i64) -> Result<()> {
+    if start < min_value {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("START value ({start}) cannot be less than MINVALUE ({min_value})"),
+        ));
+    }
+    if start > max_value {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("START value ({start}) cannot be greater than MAXVALUE ({max_value})"),
+        ));
+    }
+    Ok(())
+}
+
+/// PG's last_value (RESTART) cross-check (`init_params`): the post-edit `last_value ∈ [min, max]`,
+/// else 22023. PG uses the "RESTART value …" wording even when no `RESTART` was written (§15.2).
+fn seq_bound_check_last(last_value: i64, min_value: i64, max_value: i64) -> Result<()> {
+    if last_value < min_value {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("RESTART value ({last_value}) cannot be less than MINVALUE ({min_value})"),
+        ));
+    }
+    if last_value > max_value {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!("RESTART value ({last_value}) cannot be greater than MAXVALUE ({max_value})"),
+        ));
+    }
+    Ok(())
+}
+
+/// Re-edit an existing `SequenceDef` per `ALTER SEQUENCE s <options>` (spec/design/sequences.md §15.2)
+/// — PG's `init_params` with `isInit = false`. Only the **written** options change; `last_value`/
+/// `is_called` are preserved unless `restart` is given. `restart` is `None` (no `RESTART`),
+/// `Some(None)` (bare `RESTART` → the stored `START`), or `Some(Some(n))` (`RESTART WITH n`). The
+/// value type is not persisted (§14.4), so `NO MINVALUE`/`NO MAXVALUE` reset the open direction to the
+/// bigint bound and an explicit bound is range-checked only by `i64` — a documented divergence for a
+/// typed sequence. `data_type` must be `None` (the caller rejects `AS` as 0A000 first).
+fn apply_seq_alter(
+    existing: &SequenceDef,
+    options: &SeqOptions,
+    restart: Option<Option<i64>>,
+) -> Result<SequenceDef> {
+    debug_assert!(
+        options.data_type.is_none(),
+        "ALTER ... AS is rejected 0A000 by the caller"
+    );
+    let mut def = existing.clone();
+    if let Some(inc) = options.increment {
+        if inc == 0 {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                "INCREMENT must not be zero".to_string(),
+            ));
+        }
+        def.increment = inc;
+    }
+    if let Some(c) = options.cache {
+        if c < 1 {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!("CACHE ({c}) must be greater than zero"),
+            ));
+        }
+        def.cache = c;
+    }
+    // `NO MINVALUE`/`NO MAXVALUE` recompute the default for the (possibly new) INCREMENT sign — but
+    // against the bigint range, since the value type is not persisted (§14.4). An explicit bound is
+    // taken as written (i64-bounded only). An unwritten bound is preserved (PG keeps it even when the
+    // INCREMENT sign flips — sequences.md §15.2).
+    let (def_min, def_max) = SeqDataType::BigInt.default_bounds(def.increment);
+    match options.min_value {
+        Some(Some(v)) => def.min_value = v,
+        Some(None) => def.min_value = def_min,
+        None => {}
+    }
+    match options.max_value {
+        Some(Some(v)) => def.max_value = v,
+        Some(None) => def.max_value = def_max,
+        None => {}
+    }
+    if def.min_value >= def.max_value {
+        return Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            format!(
+                "MINVALUE ({}) must be less than MAXVALUE ({})",
+                def.min_value, def.max_value
+            ),
+        ));
+    }
+    if let Some(s) = options.start {
+        def.start = s;
+    }
+    // Cross-check 1: START ∈ [min, max].
+    seq_bound_check_start(def.start, def.min_value, def.max_value)?;
+    // RESTART (applied last, before the last_value cross-check).
+    match restart {
+        Some(Some(n)) => {
+            def.last_value = n;
+            def.is_called = false;
+        }
+        Some(None) => {
+            def.last_value = def.start;
+            def.is_called = false;
+        }
+        None => {}
+    }
+    // Cross-check 2: the preserved/restarted last_value ∈ [min, max].
+    seq_bound_check_last(def.last_value, def.min_value, def.max_value)?;
+    if let Some(c) = options.cycle {
+        def.cycle = c;
+    }
+    Ok(def)
 }
 
 pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
