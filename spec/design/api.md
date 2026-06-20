@@ -16,12 +16,26 @@ durable database files, prepared statements, bind parameters, and a row cursor.
 
 ## 1. The shape (same across cores)
 
-Five concepts. The names below are the *concept*; the idiomatic spelling per core is the
+Six concepts. The names below are the *concept*; the idiomatic spelling per core is the
 mapping table in §6.
 
-- **`Database`** — the handle. Holds the committed in-memory state plus a persistence
-  identity: an optional file `path`, a monotonic commit counter `txid`, and the `page_size`
-  the file is serialized with.
+- **`Database`** — **storage identity.** Holds the committed in-memory state plus a persistence
+  identity: an optional file `path`, a monotonic commit counter `txid`, the `page_size`
+  the file is serialized with, the buffer pool, and the `synchronous` durability mode. The
+  *configured-handle* role this concept originally also played (cost ceilings, `read_only`, the
+  entropy/clock seam) is **un-fused** onto the `Session` ([session.md](session.md)) — this doc's
+  §8/§10 settings are session settings a bare `Database` proxies through its built-in default
+  session.
+- **`Session`** — **the configured host context** ([session.md](session.md)). The stateful,
+  capability-bearing context a host runs statements through: it carries the safety envelope
+  (a GRANT/REVOKE-style per-table `SELECT`/`INSERT`/`UPDATE`/`DELETE` + function `EXECUTE`
+  privilege model with an `allow_ddl` gate, `max_cost`, `max_sql_length`, a `lifetime_max_cost`
+  budget), the semantic settings (session variables, the time zone), and the entropy/clock
+  seam, over an explicit transaction state machine ([session.md §2.2](session.md)); it opens
+  transactions, runs autocommit one-shots, and runs a **multi-statement script** (`execute_script`,
+  built on the **library-level** `split_statements` — a top-level core function with no
+  `Session`/`Database` dependency). A bare `Database` owns one long-lived default session, so this
+  is additive and back-compatible.
 - **`PreparedStatement`** — a parsed, reusable statement. Parameter count/types are fixed at
   prepare time; the same statement runs many times with different bound values.
 - **`Outcome`** — the result of running a statement: either a bare statement result carrying
@@ -120,7 +134,13 @@ filesystem.
 The full transaction model is [transactions.md](transactions.md); this section fixes the API
 shape. **jed autocommits by default** (PostgreSQL behavior — CLAUDE.md §1; this **supersedes**
 the original "no autocommit" rule, which was an accident of the whole-image writer —
-transactions.md §1). The commit boundary and durability are **decoupled** (transactions.md §9):
+transactions.md §1). The commit boundary and durability are **decoupled** (transactions.md §9).
+
+> **Revised by [session.md §2.2](session.md).** The transaction state lives on the **session**
+> (`Idle`/`Open`/`Failed`); SQL `BEGIN`, `begin()`, and `view`/`update` are three entry points to
+> **one** state machine, and the separate `Transaction` object below **collapses** into session
+> state + optional per-core RAII sugar. The bullets here are the pre-session shape, re-expressed
+> when the S1 session slice lands.
 
 - **Autocommit (default).** Each statement run directly on the handle is its own transaction —
   it commits on success / rolls back on error. The engine infers the access mode from the

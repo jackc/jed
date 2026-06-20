@@ -892,6 +892,49 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       tags), an additive `Outcome` field in all 3 cores. → [api.md §4](spec/design/api.md)
 - [x] **CLI follow-ons** — editor autocomplete + syntax highlighting, CSV import/export, `--dump`
       SQL export, `-o` redirection, `box`/`markdown` formats, `--readonly` open mode. → [cli.md §8](spec/design/cli.md)
+- [ ] **Sessions — the configured host context** — un-fuse `Database` (storage identity) from a
+      first-class **`Session`** (the configured, capability-bearing context a host runs statements
+      through), the explicit home for the settings the handle conflated + the new host controls.
+      Spec authored: → [session.md](spec/design/session.md). Sequenced slices (each its own vertical
+      slice + corpus, §10):
+  - [ ] **S1 — session concept + the one stateful default session** — `db.session(opts) -> Session`,
+        relocate the existing handle settings (`max_cost`/`max_sql_length`/`work_mem`/the
+        entropy+clock sources) onto `Session`; the `Database`-owned **default session** is explicit
+        and **stateful** (an open `BEGIN`, vars, meters persist across calls — PG/SQLite connection
+        model, §2.1); the **transaction state machine** becomes explicit on the session
+        (`Idle`/`Open`/`Failed`, §2.2), **collapsing** the separate `Transaction` object into session
+        state + optional RAII sugar (revises [api.md §2.2/§6](spec/design/api.md)). State ownership:
+        committed data on `Database`, session state on `Session`. A near-pure refactor (the
+        transactions.md un-fusing precedent); existing corpus unchanged. _(size: L; §2)_
+  - [ ] **S2 — multi-statement splitter + `execute_script`** — NOT a buffering `Vec<Outcome>` batch
+        (that would be an unbounded buffer, violating §13). A **library-level** (no `Session`/`Database`)
+        lazy **`split_statements(sql)`** iterator (top-level core export / parser surface; lexer-level
+        boundary scan respecting strings/dollar-quotes/comments, yields one statement span at a time,
+        no parse tree, per-core unit tested) — the host loops it through the normal single-statement
+        path, so all existing bounds (`max_sql_length`/`54001`/`max_cost`/`lifetime_max_cost`/
+        privileges/streaming cursor) apply for free. Plus a thin **session-level**
+        **`session.execute_script(sql)`** convenience: split + run-each + discard rows + one implicit
+        transaction (honor explicit `BEGIN`/`COMMIT`), returning an `O(1)` `ScriptSummary`. Capability
+        `session.script` (covers `execute_script`; the splitter adds no SQL semantics). _(size: L; §4)_
+  - [ ] **S3 — privileges (the GRANT/REVOKE model)** — per-table `SELECT`/`INSERT`/`UPDATE`/`DELETE`
+        + per-function `EXECUTE`, expressed as a session `default_privileges` set (granted to all
+        tables — replaces the read-only/read-write boolean) plus per-object `grant`/`revoke` deltas
+        (revoke wins), and an `allow_ddl` gate; enforced at name resolution with **`42501
+        insufficient_privilege`** (NOT RBAC — the host holds the grants, §3/§13; the physical
+        read-only file / `READ ONLY` txn `25006` gate stays orthogonal at the Database/txn layer).
+        Capabilities `session.privileges` / `session.allow_ddl`; `# default_privileges:` /
+        `# grant:` / `# revoke:` / `# allow_ddl:` directives. _(size: M; §5.3/§13)_
+  - [ ] **S4 — session lifetime cost budget** — a per-session cumulative cost meter aborting with
+        **`54P02 session_cost_limit_exceeded`** (new `P`-subclass code) when it reaches
+        `lifetime_max_cost`; deterministic, pinned by an ordered multi-statement schedule. Registers
+        `54P02`; capability `session.lifetime_cost`. _(size: M; §5.4/§13)_
+  - [ ] **S5 — session variables (v1)** — a string→string GUC map, host get/set + `current_setting()`
+        read; namespaced custom vars; `# set:` directive. (`SET LOCAL` / full SQL `SET`/`SHOW` /
+        `set_config()` deferred.) Capability `session.variables`. _(size: M; §6.1)_
+  - [ ] **S6 — session time zone slot** — the built-in `time_zone` var (default **`UTC`**, fixed
+        offsets only, named zones `0A000`), injected not OS-read (determinism, §6); the
+        `# timezone:` directive. Forward-looking infra — the consuming `timestamptz→date`/`AT TIME
+        ZONE` cast is a separate Phase-3 type slice. Capability `session.timezone`. _(size: S; §6.2)_
 - [ ] **(Open question, not scheduled)** low-level direct access API beneath SQL
       (`getValue("table", key)`) — keep the seam open, don't build yet (§9). _(size: —)_
 

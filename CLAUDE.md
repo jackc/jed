@@ -149,6 +149,12 @@ first-class jed.
   rather than a whole-database read-write lock. (May be revisited far in the future.
   Until then, assume it everywhere.)
 - **No users, no roles, no RBAC, no auth.** Deletes the permission catalog entirely.
+  Authorization, when a host wants it, lives **above** the engine as a per-**session**
+  capability envelope (GRANT/REVOKE-style per-table `SELECT`/`INSERT`/`UPDATE`/`DELETE` privileges
+  + function `EXECUTE`, an `allow_ddl` gate, per-statement and per-session cost budgets —
+  `spec/design/session.md`): the host is the policy decision point and the engine mechanically
+  enforces (`42501`). This is the host-extension boundary (§13), not an in-database permission
+  catalog.
 - **PG is aspirational, not strict.** See §1.
 
 ---
@@ -739,7 +745,10 @@ bounded: it cannot violate memory safety, it cannot reach outside the database (
 filesystem, network, process, environment, or clock access beyond the sanctioned seams), and
 it cannot exhaust resources. This is a **standing guarantee about the engine and its
 built-in surface**, not a feature toggled on per query — every core upholds it by
-construction. It rests on **three guarantees**, each below:
+construction. Its concrete vehicle is a configured **session** (`spec/design/session.md`):
+a host serves untrusted SQL through a session granted only the privileges it needs
+(`default_privileges = {SELECT}` + per-table `grant`) + per-statement-`max_cost`-capped +
+`lifetime_max_cost`-budgeted. It rests on **three guarantees**, each below:
 
 1. **Memory safety** — a crafted query cannot corrupt memory (every core is a memory-safe
    language).
