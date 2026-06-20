@@ -613,7 +613,14 @@ The design is optimized for AI agents even more than for humans. In practice:
   branch to `origin` promptly** — `git push -u origin <branch>` right after the first commit,
   then `git push` after each subsequent one — so the work is fetchable everywhere and backed
   up. **Merge to `master` only when green** (`rake ci` / verify) and **push `master`
-  immediately on merge**, so the master tip is never left local-only. **Memory references
+  immediately on merge**, so the master tip is never left local-only. **`master` keeps a
+  strictly linear history — no merge bubbles, ever.** A merge into `master` must be
+  fast-forward-only; integrate by **rebasing the feature branch onto the current `master`
+  tip** (then ff), or equivalently **squash-merge** or **cherry-pick**. Whatever the
+  mechanism, the result is a flat sequence of commits with no merge commits — never `git
+  merge` a divergent branch in a way that creates a merge commit, and never `git pull`
+  without `--ff-only`/`--rebase` on `master`. (The range-types and upsert landings above —
+  clean fast-forwards / rebased ladders — are the model.) **Memory references
   *pushed* state:** a "landed / committed at `<hash>`" note means pushed, and must say so
   (or explicitly "branch-only, NOT pushed — container-local") so the next instance knows
   whether `git fetch` will find it. Before trusting or continuing another instance's work,
