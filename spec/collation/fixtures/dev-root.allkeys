@@ -16,3 +16,4 @@
 0042 ; [.1C60.0020.0008]  # B   LATIN CAPITAL LETTER B
 007A ; [.1E0B.0020.0002]  # z   LATIN SMALL LETTER Z
 005A ; [.1E0B.0020.0008]  # Z   LATIN CAPITAL LETTER Z
+1F600 ; [.4000.0020.0002]  # 😀  astral (U+1F600) — exercises code-point (not UTF-16) iteration; sorts last

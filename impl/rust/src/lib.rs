@@ -11,6 +11,7 @@ pub mod ast;
 pub mod blockstore;
 pub mod bufferpool;
 pub mod catalog;
+pub mod collation;
 pub mod cost;
 pub mod costs;
 pub mod date;

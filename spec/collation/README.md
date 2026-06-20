@@ -18,11 +18,13 @@
 > collation order — the bridge to jed's `memcmp` storage ([encoding.md §1](../design/encoding.md)).
 >
 > All multi-byte integers are **big-endian** (jed's on-disk convention; CLAUDE.md §2). Hex is
-> written `0xHHHH`. **Status: slice 1a (this foundation) authored; the `CompileCollation` +
-> executor that consume it land in 1b** ([../design/collation.md §14](../design/collation.md)).
-> The dev fixture (§5) is a small hand-authored subset; the version-pinned real DUCET + curated
-> locale tailorings land with `CompileCollation` (1b/1f). The verification vectors (§6) are
-> populated in 1b, when the implementation produces and the cores cross-confirm the exact bytes
+> written `0xHHHH`. **Status: slice 1b landed — the `CompileCollation` compiler, the `sortKey`
+> executor, and the `SaveCollation`/`OpenCollation` artifact codec are implemented in all three
+> cores** (`impl/{rust,go,ts}`), host-free and byte-identical, pinned by the populated `vectors/`
+> ([../design/collation.md §14](../design/collation.md)). The dev fixture (§5) is a small
+> hand-authored subset; the version-pinned real DUCET + curated locale tailorings land with a
+> later slice (1f). The verification vectors (§6) are **populated** — produced by the Rust core
+> (`impl/rust/src/bin/gen_collation_vectors.rs`) and cross-confirmed byte-for-byte by Go and TS
 > (UCA sort keys are not safely hand-authored; §6).
 
 ## 1. The definition format (`CompileCollation` input)
@@ -210,38 +212,48 @@ A small hand-authored subset to exercise the formats end to end in 1a/1b without
 weights, enough to show primary order, a secondary (accent) diff, a tertiary (case) diff, and a
 tailoring that moves a letter's *primary* position:
 
-- [fixtures/dev-root.allkeys](fixtures/dev-root.allkeys) — `SPACE a A b B z Z ä Ä` with
-  DUCET-style weights (`ä`/`Ä` = `a`'s primary + a secondary accent CE, so they sort *near a*).
+- [fixtures/dev-root.allkeys](fixtures/dev-root.allkeys) — `SPACE a A b B z Z ä Ä 😀` with
+  DUCET-style weights (`ä`/`Ä` = `a`'s primary + a secondary accent CE, so they sort *near a*;
+  `😀` = U+1F600, mapped with a high primary so it sorts last — its purpose is to exercise
+  **code-point** iteration, the TS UTF-16 trap §6, not ordering).
 - [fixtures/dev-nordic.ldml](fixtures/dev-nordic.ldml) — `&z < ä <<< Ä`, so under this tailoring
   `ä`/`Ä` sort *after z* (the sharp Nordic case that visibly disagrees with the root).
 
-Expected orderings (oracle-checkable in 1b against `postgres:18` for the locales that map to a
-real PG collation):
+Expected orderings (the bytes are pinned in `vectors/sortkey.toml`, §6; oracle-checkable in a
+later slice against `postgres:18` for the locales that map to a real PG collation). Note that the
+multi-character a-words sort *within* the a-group, before `b`:
 
 ```
-dev-root     :  ' ' < a < A < ä < Ä < b < B < z < Z      (ä near a, by primary)
-dev-nordic   :  ' ' < a < A < b < B < z < Z < ä < Ä      (ä after z, by tailoring)
+dev-root     :  ' ' < a < A < ä < Ä < aa < ab < az < a😀 < b < B < z < Z < 😀   (ä near a, by primary)
+dev-nordic   :  ' ' < a < A < b < B < z < Z < ä < Ä < 😀                          (ä after z, by tailoring)
 ```
 
-## 6. Verification vectors (populated in 1b)
+## 6. Verification vectors (populated, slice 1b)
 
 The cross-core contract (CLAUDE.md §8), the collation analogue of the
-[encoding.md](../design/encoding.md) key vectors. Authored when 1b's implementation produces the
-bytes and the three cores cross-confirm byte-identity — **not** hand-authored, because UCA sort
-keys are error-prone to compute by hand:
+[encoding.md](../design/encoding.md) key vectors. **Populated in 1b**: produced by the Rust core
+(`impl/rust/src/bin/gen_collation_vectors.rs`, the source of truth for the case lists) and
+cross-confirmed byte-for-byte by Go and TS — **not** hand-authored, because UCA sort keys are
+error-prone to compute by hand. Each core's harness (`impl/rust/tests/collation.rs`,
+`impl/go/collation_test.go`, `impl/ts/tests/collation.test.ts`) recompiles the `def_files` and
+asserts the bytes:
 
-- **`vectors/compiler.toml`** — `(definition fixture) → (expected §2 table bytes / artifact
-  bytes)`. Pins `CompileCollation` and the `SaveCollation` container.
-- **`vectors/sortkey.toml`** — `(collation, string) → (expected §4 sort-key bytes)`. The primary
-  executor contract; includes an astral-character case (the TS UTF-16-vs-code-point trap,
-  [types.md §11](../design/types.md)).
+- **`vectors/compiler.toml`** — `(definition fixtures) → (§2 table bytes + §3 artifact bytes)`.
+  Pins `CompileCollation` and the `SaveCollation` container; the harness also round-trips each
+  artifact through `OpenCollation` (open → re-save reproduces the bytes; the reopened collation
+  equals the compiled one). `def_files` are concatenated (newline-joined) then compiled.
+- **`vectors/sortkey.toml`** — `(collation, string) → (§4 sort-key bytes)`. The primary executor
+  contract; entries are in ascending collation order so the harness also asserts the keys'
+  `memcmp` order is strictly increasing. Includes an astral-character case (`😀` U+1F600, the TS
+  UTF-16-vs-code-point trap, [types.md §11](../design/types.md)).
 - A **golden DB** with a baked collation snapshot + a collated index lands in 1d/1e
   (`rust == go == ts == ruby`), doubling as an artifact golden (§3).
 
 ## 7. Cost
 
-Sort-key generation adds a **`collate`** unit to the shared cost schedule
+Sort-key generation will add a **`collate`** unit to the shared cost schedule
 ([../design/cost.md](../design/cost.md)), charged **per code point** processed (table-bounded
 weight lookups; contractions/expansions bounded by the table), so a collated `ORDER BY` /
-comparison over a large input is cost-ceilinged like any other work (CLAUDE.md §13). Added with
-1b, when the executor that accrues it lands.
+comparison over a large input is cost-ceilinged like any other work (CLAUDE.md §13). **Deferred to
+1c**, when the executor is wired into query execution and there is a metering site to accrue it —
+slice 1b's `sortKey` is a pure function with no `Meter` threaded through it.

@@ -223,8 +223,9 @@ fn crc32_update(mut crc: u32, data: &[u8]) -> u32 {
 
 /// CRC-32/IEEE (reflected, poly 0xEDB88320, init/final 0xFFFFFFFF) — the standard
 /// zlib CRC32, hand-rolled so no runtime dependency is needed. Pinned by the vector
-/// `crc32("123456789") == 0xCBF43926`.
-fn crc32_ieee(data: &[u8]) -> u32 {
+/// `crc32("123456789") == 0xCBF43926`. Also the collation `.coll` artifact's
+/// `content_hash` (spec/collation/README.md §3), hence `pub`.
+pub fn crc32_ieee(data: &[u8]) -> u32 {
     !crc32_update(0xFFFF_FFFF, data)
 }
 
