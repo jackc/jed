@@ -1428,11 +1428,15 @@ func (p *Parser) parseInsert() (*Insert, error) {
 		if err != nil {
 			return nil, err
 		}
+		onConflict, err := p.parseOnConflict()
+		if err != nil {
+			return nil, err
+		}
 		returning, err := p.parseReturning()
 		if err != nil {
 			return nil, err
 		}
-		return &Insert{Table: table, Columns: columns, Overriding: overriding, Select: sel, Returning: returning}, nil
+		return &Insert{Table: table, Columns: columns, Overriding: overriding, Select: sel, OnConflict: onConflict, Returning: returning}, nil
 	}
 
 	if err := p.expectKeyword("values"); err != nil {
@@ -1452,11 +1456,102 @@ func (p *Parser) parseInsert() (*Insert, error) {
 		}
 		break
 	}
+	onConflict, err := p.parseOnConflict()
+	if err != nil {
+		return nil, err
+	}
 	returning, err := p.parseReturning()
 	if err != nil {
 		return nil, err
 	}
-	return &Insert{Table: table, Columns: columns, Overriding: overriding, Rows: rows, Returning: returning}, nil
+	return &Insert{Table: table, Columns: columns, Overriding: overriding, Rows: rows, OnConflict: onConflict, Returning: returning}, nil
+}
+
+// parseOnConflict parses the optional `ON CONFLICT [target] action` clause (UPSERT —
+// spec/design/upsert.md), after the source and before RETURNING. ON / CONFLICT / DO / NOTHING /
+// CONSTRAINT are not reserved (§3); the clause is recognized by the `ON CONFLICT` two-keyword lead.
+func (p *Parser) parseOnConflict() (*OnConflict, error) {
+	if p.peekKeyword() != "on" || p.peekKeywordAt(1) != "conflict" {
+		return nil, nil
+	}
+	p.advance() // ON
+	p.advance() // CONFLICT
+
+	// Optional conflict target: a `( col, … )` column list or `ON CONSTRAINT name`.
+	var target *ConflictTarget
+	if p.peek().Kind == TokLParen {
+		p.advance() // '('
+		var cols []string
+		for {
+			name, err := p.expectIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			cols = append(cols, name)
+			switch p.advance().Kind {
+			case TokComma:
+				continue
+			case TokRParen:
+			default:
+				return nil, NewError(SyntaxError, "expected ',' or ')'")
+			}
+			break
+		}
+		target = &ConflictTarget{Columns: cols}
+	} else if p.peekKeyword() == "on" {
+		p.advance() // ON
+		if err := p.expectKeyword("constraint"); err != nil {
+			return nil, err
+		}
+		name, err := p.expectIdentifier()
+		if err != nil {
+			return nil, err
+		}
+		target = &ConflictTarget{IsConstraint: true, Constraint: name}
+	}
+
+	// The action: `DO NOTHING` or `DO UPDATE SET assignment [, …] [WHERE …]`.
+	if err := p.expectKeyword("do"); err != nil {
+		return nil, err
+	}
+	switch p.peekKeyword() {
+	case "nothing":
+		p.advance()
+		return &OnConflict{Target: target, DoUpdate: false}, nil
+	case "update":
+		p.advance()
+		if err := p.expectKeyword("set"); err != nil {
+			return nil, err
+		}
+		var assignments []Assignment
+		for {
+			column, err := p.expectIdentifier()
+			if err != nil {
+				return nil, err
+			}
+			if err := p.expect(TokEq); err != nil {
+				return nil, err
+			}
+			value, err := p.parseExpr()
+			if err != nil {
+				return nil, err
+			}
+			assignments = append(assignments, Assignment{Column: column, Value: value})
+			if p.peek().Kind == TokComma {
+				p.advance()
+				continue
+			}
+			break
+		}
+		filter, err := p.parseOptionalWhere()
+		if err != nil {
+			return nil, err
+		}
+		return &OnConflict{Target: target, DoUpdate: true, Assignments: assignments, Filter: filter}, nil
+	default:
+		return nil, NewError(SyntaxError,
+			fmt.Sprintf("expected NOTHING or UPDATE after ON CONFLICT DO, found %q", p.peekKeyword()))
+	}
 }
 
 // parseInsertRow parses one parenthesized `( <value> [, <value>]* )` row of an INSERT.

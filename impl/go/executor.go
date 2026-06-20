@@ -3014,6 +3014,250 @@ func uniqueProbeBound(prefix []byte) keyBound {
 // (literals + constant defaults), SELECT is the embedded query's accrued cost. The SELECT source
 // additionally validates output arity (42601) and per-column type assignability (42804) up front,
 // before any row is produced — so both fire even over an empty source.
+// encodePkKey is a row's PRIMARY-KEY STORAGE KEY (spec/design/encoding.md §2.3): the
+// concatenation of the members' bare encodings in key order — every keyable type is fixed-width,
+// so the concatenation is self-delimiting and bytes.Compare equals the tuple's logical order.
+// Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe (upsert.md §3); a PK
+// column is NOT NULL, so there is no presence tag.
+func encodePkKey(table *Table, pk []int, row Row) []byte {
+	var key []byte
+	for _, i := range pk {
+		switch {
+		case table.Columns[i].Type.IsUuid():
+			// uuid: the bare 16 bytes (uuid-raw16, encoding.md §2.7).
+			key = append(key, row[i].Str...)
+		case table.Columns[i].Type.IsBool():
+			// boolean: the bare 1-byte bool-byte (encoding.md §2.9).
+			key = append(key, EncodeBool(row[i].Bool)...)
+		default:
+			// integers / timestamp / timestamptz / date: the fixed-width key codec.
+			key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
+		}
+	}
+	return key
+}
+
+// arbiter is which uniqueness constraint an ON CONFLICT arbitrates (spec/design/upsert.md §2):
+// the primary key (isPK), or a unique index by position in table.Indexes (indexPos).
+type arbiter struct {
+	isPK     bool
+	indexPos int
+}
+
+// conflictPlan is a resolved ON CONFLICT clause (spec/design/upsert.md), built by resolveOnConflict.
+type conflictPlan struct {
+	// arb is the arbiter constraint; nil = no target (legal only with DO NOTHING — any
+	// uniqueness conflict is then skipped).
+	arb *arbiter
+	// doUpdate true = DO UPDATE (assignments + filter); false = DO NOTHING.
+	doUpdate    bool
+	assignments []assignPlan
+	filter      *rExpr
+}
+
+// resolveArbiter resolves an ON CONFLICT target into an *arbiter (spec/design/upsert.md §2): a
+// column list is matched as an order-independent SET against a unique index / the primary key (no
+// match → 42P10); ON CONSTRAINT name names a unique index or the synthesized <table>_pkey (miss →
+// 42704). A nil target → nil arbiter (legal only with DO NOTHING).
+func resolveArbiter(table *Table, target *ConflictTarget) (*arbiter, error) {
+	if target == nil {
+		return nil, nil
+	}
+	pk := table.PKIndices()
+	if !target.IsConstraint {
+		want := make(map[int]struct{}, len(target.Columns))
+		for _, c := range target.Columns {
+			idx := table.ColumnIndex(c)
+			if idx < 0 {
+				return nil, NewError(UndefinedColumn, "column does not exist: "+c)
+			}
+			want[idx] = struct{}{}
+		}
+		if len(pk) > 0 && sameIntSet(pk, want) {
+			return &arbiter{isPK: true}, nil
+		}
+		for i, def := range table.Indexes {
+			if def.Unique && sameIntSet(def.Columns, want) {
+				return &arbiter{indexPos: i}, nil
+			}
+		}
+		return nil, NewError(InvalidColumnReference,
+			"there is no unique or exclusion constraint matching the ON CONFLICT specification")
+	}
+	pkey := strings.ToLower(table.Name) + "_pkey"
+	if len(pk) > 0 && strings.EqualFold(target.Constraint, pkey) {
+		return &arbiter{isPK: true}, nil
+	}
+	for i, def := range table.Indexes {
+		if def.Unique && strings.EqualFold(def.Name, target.Constraint) {
+			return &arbiter{indexPos: i}, nil
+		}
+	}
+	return nil, NewError(UndefinedObject, fmt.Sprintf(
+		"constraint %s for table %s does not exist", target.Constraint, table.Name))
+}
+
+// sameIntSet reports whether the slice's values (as a set) equal the given set.
+func sameIntSet(s []int, set map[int]struct{}) bool {
+	seen := make(map[int]struct{}, len(s))
+	for _, v := range s {
+		seen[v] = struct{}{}
+	}
+	if len(seen) != len(set) {
+		return false
+	}
+	for v := range seen {
+		if _, ok := set[v]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// arbiterKey is the arbiter key of a candidate row (spec/design/upsert.md §3): the storage key for
+// a PK arbiter (never NULL), or the unique-index prefix for an index arbiter (the bool is false
+// when a nullable arbiter column is NULL — NULLS DISTINCT, so the row never conflicts).
+func arbiterKey(arb *arbiter, table *Table, pk []int, row Row) ([]byte, bool) {
+	if arb.isPK {
+		return encodePkKey(table, pk, row), true
+	}
+	return indexPrefixKey(table.Columns, table.Indexes[arb.indexPos], row)
+}
+
+// resolveOnConflict resolves an ON CONFLICT clause (spec/design/upsert.md §2/§5) into a
+// conflictPlan: the arbiter, plus — for DO UPDATE — the resolved SET assignment plans and the
+// optional WHERE filter, both resolved against the [existing | excluded] scope. Threads the
+// statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT.
+func (db *Database) resolveOnConflict(table *Table, oc *OnConflict, ptypes *paramTypes) (*conflictPlan, error) {
+	arb, err := resolveArbiter(table, oc.Target)
+	if err != nil {
+		return nil, err
+	}
+	if !oc.DoUpdate {
+		return &conflictPlan{arb: arb, doUpdate: false}, nil
+	}
+	// DO UPDATE requires a target (spec/design/upsert.md §2) — PostgreSQL's message.
+	if arb == nil {
+		return nil, NewError(SyntaxError,
+			"ON CONFLICT DO UPDATE requires inference specification or constraint name")
+	}
+	s := onConflictExcludedScope(db, table)
+	pkMembers := table.PKIndices()
+	plans := make([]assignPlan, 0, len(oc.Assignments))
+	for _, a := range oc.Assignments {
+		idx := table.ColumnIndex(a.Column)
+		if idx < 0 {
+			return nil, NewError(UndefinedColumn, "column does not exist: "+a.Column)
+		}
+		if c := table.Columns[idx].Identity; c != nil && *c == IdentityAlways {
+			return nil, NewError(GeneratedAlways,
+				fmt.Sprintf("column %s can only be updated to DEFAULT", a.Column))
+		}
+		if slices.Contains(pkMembers, idx) {
+			return nil, NewError(FeatureNotSupported, "updating a primary key column is not supported")
+		}
+		for _, p := range plans {
+			if p.idx == idx {
+				return nil, NewError(DuplicateColumn, "column "+a.Column+" assigned more than once")
+			}
+		}
+		col := table.Columns[idx]
+		if col.Type.IsComposite() {
+			return nil, NewError(FeatureNotSupported,
+				"updating composite column "+a.Column+" is not supported yet")
+		}
+		colScalar := col.Type.ScalarTy()
+		src, ty, err := resolve(s, a.Value, &colScalar, &aggCtx{collecting: false}, ptypes)
+		if err != nil {
+			return nil, err
+		}
+		if err := requireAssignable(ty, colScalar, a.Column); err != nil {
+			return nil, err
+		}
+		plans = append(plans, assignPlan{
+			idx: idx, name: col.Name, target: colScalar, decimal: col.Decimal, notNull: col.NotNull, source: src,
+		})
+	}
+	var filter *rExpr
+	if oc.Filter != nil {
+		f, err := resolveBooleanFilter(s, oc.Filter, ptypes)
+		if err != nil {
+			return nil, err
+		}
+		filter = f
+	}
+	return &conflictPlan{arb: arb, doUpdate: true, assignments: plans, filter: filter}, nil
+}
+
+// arbiterExisting looks up the EXISTING (committed) conflicting row for an arbiter key
+// (spec/design/upsert.md §3): always a committed row (an in-batch row sharing the arbiter key was
+// caught earlier by the proposed-arbiter set). Returns (storageKey, fully-resident row, found).
+func (db *Database) arbiterExisting(arb *arbiter, store *TableStore, table *Table, ak []byte) ([]byte, Row, bool, error) {
+	if arb.isPK {
+		row, exists, err := store.Get(ak)
+		if err != nil || !exists {
+			return nil, nil, false, err
+		}
+		row, err = store.resolveAll(row)
+		if err != nil {
+			return nil, nil, false, err
+		}
+		return ak, row, true, nil
+	}
+	def := table.Indexes[arb.indexPos]
+	istore := db.readSnap().indexStore(strings.ToLower(def.Name))
+	entries, err := istore.RangeEntries(uniqueProbeBound(ak))
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if len(entries) == 0 {
+		return nil, nil, false, nil
+	}
+	suffix := append([]byte(nil), entries[0].Key[len(ak):]...)
+	row, exists, err := store.Get(suffix)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	if !exists {
+		panic("a unique-index entry points at a live row")
+	}
+	row, err = store.resolveAll(row)
+	if err != nil {
+		return nil, nil, false, err
+	}
+	return suffix, row, true, nil
+}
+
+// rowConflictsCommitted reports whether a candidate row conflicts with a COMMITTED row on the
+// primary key or any unique index (the no-target DO NOTHING skip test — spec/design/upsert.md §2).
+// NULLS DISTINCT: a unique tuple with any NULL component never conflicts.
+func (db *Database) rowConflictsCommitted(store *TableStore, table *Table, pk []int, row Row) (bool, error) {
+	if len(pk) > 0 {
+		if _, exists, err := store.Get(encodePkKey(table, pk, row)); err != nil {
+			return false, err
+		} else if exists {
+			return true, nil
+		}
+	}
+	for _, def := range table.Indexes {
+		if !def.Unique {
+			continue
+		}
+		prefix, ok := indexPrefixKey(table.Columns, def, row)
+		if !ok {
+			continue
+		}
+		entries, err := db.readSnap().indexStore(strings.ToLower(def.Name)).RangeEntries(uniqueProbeBound(prefix))
+		if err != nil {
+			return false, err
+		}
+		if len(entries) > 0 {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) {
 	table, ok := db.Table(ins.Table)
 	if !ok {
@@ -3119,6 +3363,12 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 				return Outcome{}, err
 			}
 		}
+		var cplan *conflictPlan
+		if ins.OnConflict != nil {
+			if cplan, err = db.resolveOnConflict(table, ins.OnConflict, ptypes); err != nil {
+				return Outcome{}, err
+			}
+		}
 		ptys, err := ptypes.finalize()
 		if err != nil {
 			return Outcome{}, err
@@ -3137,6 +3387,9 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 			if err := db.foldUncorrelatedInRExpr(node, bound, cteCtx{}, &meter.Accrued); err != nil {
 				return Outcome{}, err
 			}
+		}
+		if err := db.foldConflictPlan(cplan, bound, &meter.Accrued); err != nil {
+			return Outcome{}, err
 		}
 		q, err := db.execQueryPlan(&plan, nil, bound, cteCtx{})
 		if err != nil {
@@ -3180,11 +3433,11 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		// RETURNING projection; storing the rows themselves stays unmetered. One meter keeps
 		// one ceiling over the whole statement.
 		meter.Charge(q.cost)
-		returned, err := db.insertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, q.rows, retNodes, bound, meter)
+		affected, returned, err := db.runInsertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, q.rows, cplan, retNodes, bound, meter)
 		if err != nil {
 			return Outcome{}, err
 		}
-		return dmlOutcome(retNames, retTypes, returned, int64(len(q.rows)), meter.Accrued), nil
+		return dmlOutcome(retNames, retTypes, returned, affected, meter.Accrued), nil
 	}
 
 	// VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
@@ -3244,6 +3497,13 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 			return Outcome{}, rerr
 		}
 	}
+	var cplan *conflictPlan
+	if ins.OnConflict != nil {
+		var cerr error
+		if cplan, cerr = db.resolveOnConflict(table, ins.OnConflict, ptypes); cerr != nil {
+			return Outcome{}, cerr
+		}
+	}
 	ptys, err := ptypes.finalize()
 	if err != nil {
 		return Outcome{}, err
@@ -3299,11 +3559,14 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 	}
-	returned, err := db.insertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, rows, retNodes, bound, meter)
+	if err := db.foldConflictPlan(cplan, bound, &meter.Accrued); err != nil {
+		return Outcome{}, err
+	}
+	affected, returned, err := db.runInsertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, meter)
 	if err != nil {
 		return Outcome{}, err
 	}
-	return dmlOutcome(retNames, retTypes, returned, int64(len(rows)), meter.Accrued), nil
+	return dmlOutcome(retNames, retTypes, returned, affected, meter.Accrued), nil
 }
 
 // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -3385,23 +3648,9 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		var key []byte
 		if len(pk) > 0 {
 			// The composite key is the concatenation of the members' bare encodings in key
-			// order (encoding.md §2.3) — every keyable type is fixed-width, so the
-			// concatenation is self-delimiting and bytes.Compare equals the tuple's order. A
-			// single-column key is the one-member case of the same rule.
-			for _, i := range pk {
-				switch {
-				case table.Columns[i].Type.IsUuid():
-					// uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16,
-					// encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
-					key = append(key, row[i].Str...)
-				case table.Columns[i].Type.IsBool():
-					// boolean is the second non-integer key: the bare 1-byte bool-byte (0x00 false /
-					// 0x01 true, encoding.md §2.9) — likewise no presence tag.
-					key = append(key, EncodeBool(row[i].Bool)...)
-				default:
-					key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
-				}
-			}
+			// order (encoding.md §2.3 — encodePkKey); a single-column key is the one-member
+			// case of the same rule.
+			key = encodePkKey(table, pk, row)
 			// The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
 			// `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
 			if _, dup := seenKeys[string(key)]; dup {
@@ -3548,6 +3797,498 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		}
 	}
 	return returned, nil
+}
+
+// foldConflictPlan folds globally-uncorrelated subqueries in a DO UPDATE's SET/WHERE once (their
+// cost is added a single time — cost.md §3), exactly as UPDATE folds its assignment/filter.
+func (db *Database) foldConflictPlan(plan *conflictPlan, bound []Value, accrued *int64) error {
+	if plan == nil || !plan.doUpdate {
+		return nil
+	}
+	for i := range plan.assignments {
+		if err := db.foldUncorrelatedInRExpr(plan.assignments[i].source, bound, cteCtx{}, accrued); err != nil {
+			return err
+		}
+	}
+	if plan.filter != nil {
+		if err := db.foldUncorrelatedInRExpr(plan.filter, bound, cteCtx{}, accrued); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// runInsertRows dispatches the validated candidate rows to the plain or the ON CONFLICT insert
+// path, shared by both INSERT sources. Returns (rows affected, RETURNING rows): a plain insert
+// affects every candidate row; an ON CONFLICT may insert, update, or skip (spec/design/upsert.md §3).
+func (db *Database) runInsertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, meter *Meter) (int64, [][]Value, error) {
+	if conflict != nil {
+		return db.insertRowsOnConflict(table, store, pk, checks, defaultExprs, rng, provided, rows, conflict, returning, params, meter)
+	}
+	returned, err := db.insertRows(table, store, pk, checks, defaultExprs, rng, provided, rows, returning, params, meter)
+	if err != nil {
+		return 0, nil, err
+	}
+	return int64(len(rows)), returned, nil
+}
+
+// insertRowsOnConflict runs phase 1 + phase 2 of an INSERT ... ON CONFLICT (spec/design/upsert.md
+// §3), the UPSERT analogue of insertRows. Phase 1 walks the candidate rows in source order,
+// classifying each as a planned INSERT, a planned UPDATE of an existing row, or a SKIP; the planned
+// inserts + updates are then validated against the statement END STATE (PK / unique / CHECK / FK)
+// before phase 2 writes anything (all-or-nothing). returning projects the AFFECTED rows (inserts
+// with an all-NULL old side, updates with their pre-update existing row).
+func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, meter *Meter) (int64, [][]Value, error) {
+	n := len(table.Columns)
+	relation := table.Name
+	// The unique-index positions in table.Indexes (for the no-target skip test + end-state pass).
+	var uniqIdx []int
+	for i, def := range table.Indexes {
+		if def.Unique {
+			uniqIdx = append(uniqIdx, i)
+		}
+	}
+
+	type pendingUpdate struct {
+		key    []byte
+		newRow Row
+		oldRow Row
+	}
+	var inserts []Row
+	var updates []pendingUpdate
+	// Arbiter keys this statement has already proposed (the §4 second-affect rule).
+	proposedArb := make(map[string]struct{})
+	// For the no-target DO NOTHING path: the planned inserts' keys/prefixes, so an in-batch
+	// duplicate is skipped (the arbiter path uses proposedArb instead).
+	insPk := make(map[string]struct{})
+	insPrefixes := make([]map[string]struct{}, len(uniqIdx))
+	for i := range insPrefixes {
+		insPrefixes[i] = make(map[string]struct{})
+	}
+
+	for _, values := range rows {
+		// Build + coerce the candidate row, then CHECK — the INSERT per-row order (NOT NULL
+		// before CHECK before conflict; constraints.md §4.4).
+		row := make(Row, n)
+		for i, col := range table.Columns {
+			var candidate Value
+			if p := provided[i]; p >= 0 {
+				candidate = values[p]
+			} else {
+				dv, err := db.evalDefault(col, defaultExprs[i], rng, meter)
+				if err != nil {
+					return 0, nil, err
+				}
+				candidate = dv
+			}
+			v, err := coerceForStore(candidate, store.colTypes[i], col.Decimal, col.NotNull, col.Name)
+			if err != nil {
+				return 0, nil, err
+			}
+			row[i] = v
+		}
+		if len(checks) > 0 {
+			if err := meter.Guard(); err != nil {
+				return 0, nil, err
+			}
+			env := &evalEnv{exec: db, rng: rng}
+			if err := evalChecks(checks, relation, row, env, meter); err != nil {
+				return 0, nil, err
+			}
+		}
+
+		if plan.arb == nil {
+			// No-target DO NOTHING: skip on ANY uniqueness conflict (committed OR an earlier
+			// planned insert); else insert (upsert.md §2/§3).
+			var pkk []byte
+			if len(pk) > 0 {
+				pkk = encodePkKey(table, pk, row)
+			}
+			committed, err := db.rowConflictsCommitted(store, table, pk, row)
+			if err != nil {
+				return 0, nil, err
+			}
+			inBatch := false
+			if pkk != nil {
+				if _, dup := insPk[string(pkk)]; dup {
+					inBatch = true
+				}
+			}
+			if !inBatch {
+				for u, ix := range uniqIdx {
+					if prefix, ok := indexPrefixKey(table.Columns, table.Indexes[ix], row); ok {
+						if _, dup := insPrefixes[u][string(prefix)]; dup {
+							inBatch = true
+							break
+						}
+					}
+				}
+			}
+			if committed || inBatch {
+				continue // skip
+			}
+			if pkk != nil {
+				insPk[string(pkk)] = struct{}{}
+			}
+			for u, ix := range uniqIdx {
+				if prefix, ok := indexPrefixKey(table.Columns, table.Indexes[ix], row); ok {
+					insPrefixes[u][string(prefix)] = struct{}{}
+				}
+			}
+			inserts = append(inserts, row)
+			continue
+		}
+
+		// Arbiter present (DO UPDATE always; DO NOTHING with a target).
+		ak, ok := arbiterKey(plan.arb, table, pk, row)
+		if !ok {
+			// A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
+			inserts = append(inserts, row)
+			continue
+		}
+		if _, dup := proposedArb[string(ak)]; dup {
+			// A second proposed row with the same arbiter key (§4).
+			if plan.doUpdate {
+				return 0, nil, NewError(CardinalityViolation,
+					"ON CONFLICT DO UPDATE command cannot affect row a second time")
+			}
+			continue // DO NOTHING → skip
+		}
+		proposedArb[string(ak)] = struct{}{}
+		existKey, existRow, found, err := db.arbiterExisting(plan.arb, store, table, ak)
+		if err != nil {
+			return 0, nil, err
+		}
+		if !found {
+			// No committed conflict on the arbiter → insert (a non-arbiter conflict is caught
+			// by the end-state validation below).
+			inserts = append(inserts, row)
+			continue
+		}
+		if !plan.doUpdate {
+			continue // DO NOTHING → skip
+		}
+		// DO UPDATE: the combined eval row [existing | proposed] the §5 scope resolves against.
+		combined := make(Row, 0, 2*n)
+		combined = append(combined, existRow...)
+		combined = append(combined, row...)
+		env := &evalEnv{exec: db, params: params, rng: rng}
+		// An optional WHERE that is not TRUE skips the update (existing row unchanged, not
+		// returned) — but the arbiter key was already proposed, so a second row still trips §4.
+		if plan.filter != nil {
+			v, err := plan.filter.eval(combined, env, meter)
+			if err != nil {
+				return 0, nil, err
+			}
+			if !v.IsTrue() {
+				continue
+			}
+		}
+		newRow := make(Row, n)
+		copy(newRow, existRow)
+		for _, ap := range plan.assignments {
+			raw, err := ap.source.eval(combined, env, meter)
+			if err != nil {
+				return 0, nil, err
+			}
+			checked, err := ap.check(raw)
+			if err != nil {
+				return 0, nil, err
+			}
+			newRow[ap.idx] = checked
+		}
+		if len(checks) > 0 {
+			cenv := &evalEnv{exec: db, rng: rng}
+			if err := evalChecks(checks, relation, newRow, cenv, meter); err != nil {
+				return 0, nil, err
+			}
+		}
+		updates = append(updates, pendingUpdate{key: existKey, newRow: newRow, oldRow: existRow})
+	}
+
+	// End-state validation (upsert.md §3), before any write. PRIMARY KEY: each insert's key must
+	// be free in the committed store and distinct from the other inserts (updates never change
+	// the key) — a collision is 23505 on <table>_pkey (a non-arbiter PK conflict).
+	if len(pk) > 0 && len(inserts) > 0 {
+		seen := make(map[string]struct{}, len(inserts))
+		for _, row := range inserts {
+			k := encodePkKey(table, pk, row)
+			if _, exists, err := store.Get(k); err != nil {
+				return 0, nil, err
+			} else if exists {
+				return 0, nil, NewError(UniqueViolation,
+					"duplicate key value violates unique constraint: "+strings.ToLower(relation)+"_pkey")
+			}
+			if _, dup := seen[string(k)]; dup {
+				return 0, nil, NewError(UniqueViolation,
+					"duplicate key value violates unique constraint: "+strings.ToLower(relation)+"_pkey")
+			}
+			seen[string(k)] = struct{}{}
+		}
+	}
+
+	// UNIQUE indexes: validate the END STATE over the updated NEW rows + the inserted rows
+	// (indexes.md §8 — the same end-state model as UPDATE).
+	if len(uniqIdx) > 0 && (len(inserts) > 0 || len(updates) > 0) {
+		rewritten := make(map[string]struct{}, len(updates))
+		for _, u := range updates {
+			rewritten[string(u.key)] = struct{}{}
+		}
+		newRows := make([]Row, 0, len(updates)+len(inserts))
+		for _, u := range updates {
+			newRows = append(newRows, u.newRow)
+		}
+		newRows = append(newRows, inserts...)
+		for _, ix := range uniqIdx {
+			def := table.Indexes[ix]
+			istore := db.readSnap().indexStore(strings.ToLower(def.Name))
+			batch := make(map[string]struct{})
+			for _, newRow := range newRows {
+				prefix, ok := indexPrefixKey(table.Columns, def, newRow)
+				if !ok {
+					continue
+				}
+				conflict := false
+				if _, dup := batch[string(prefix)]; dup {
+					conflict = true
+				} else {
+					entries, err := istore.RangeEntries(uniqueProbeBound(prefix))
+					if err != nil {
+						return 0, nil, err
+					}
+					for _, e := range entries {
+						if _, own := rewritten[string(e.Key[len(prefix):])]; !own {
+							conflict = true
+							break
+						}
+					}
+				}
+				if conflict {
+					return 0, nil, NewError(UniqueViolation,
+						"duplicate key value violates unique constraint: "+def.Name)
+				}
+				batch[string(prefix)] = struct{}{}
+			}
+		}
+	}
+
+	// FOREIGN KEY child-side (constraints.md §6.4): each inserted row, and each updated row that
+	// assigned an FK local column, must reference an existing parent key — the committed parent
+	// state plus (for a self-reference) the statement's end state.
+	assigned := make(map[int]struct{})
+	if plan.doUpdate {
+		for _, ap := range plan.assignments {
+			assigned[ap.idx] = struct{}{}
+		}
+	}
+	for fki := range table.ForeignKeys {
+		fk := &table.ForeignKeys[fki]
+		parent, ok := db.Table(fk.RefTable)
+		if !ok {
+			continue
+		}
+		checkUpdates := false
+		for _, c := range fk.Columns {
+			if _, ok := assigned[c]; ok {
+				checkUpdates = true
+				break
+			}
+		}
+		// End-state referenced keys this statement supplies, for a self-reference.
+		batch := make(map[string]struct{})
+		if strings.EqualFold(fk.RefTable, relation) {
+			for _, row := range inserts {
+				if probe, ok := buildFkProbe(fk, parent, row, fk.RefColumns); ok {
+					batch[string(probe.bytes)] = struct{}{}
+				}
+			}
+			for _, u := range updates {
+				if probe, ok := buildFkProbe(fk, parent, u.newRow, fk.RefColumns); ok {
+					batch[string(probe.bytes)] = struct{}{}
+				}
+			}
+		}
+		toCheck := make([]Row, 0, len(inserts)+len(updates))
+		toCheck = append(toCheck, inserts...)
+		if checkUpdates {
+			for _, u := range updates {
+				toCheck = append(toCheck, u.newRow)
+			}
+		}
+		for _, row := range toCheck {
+			probe, ok := buildFkProbe(fk, parent, row, fk.Columns)
+			if !ok {
+				continue // a NULL local column → exempt (MATCH SIMPLE)
+			}
+			if _, inBatch := batch[string(probe.bytes)]; inBatch {
+				continue
+			}
+			hit, err := db.fkProbeHits(probe, fk.RefTable)
+			if err != nil {
+				return 0, nil, err
+			}
+			if !hit {
+				return 0, nil, NewError(ForeignKeyViolation,
+					"insert or update on table "+relation+" violates foreign key constraint "+fk.Name)
+			}
+		}
+	}
+
+	// FOREIGN KEY parent-side (constraints.md §6.5): an updated referenced row must not strand a
+	// child (only a referenced UNIQUE column is at risk; inserts add rows, never strand a child).
+	referencers := db.fkReferencers(relation)
+	if len(referencers) > 0 && len(updates) > 0 {
+		parent, _ := db.Table(relation)
+		updatedKeys := make(map[string]struct{}, len(updates))
+		for _, u := range updates {
+			updatedKeys[string(u.key)] = struct{}{}
+		}
+		for ri := range referencers {
+			r := &referencers[ri]
+			newPresent := make(map[string]struct{})
+			for _, u := range updates {
+				if probe, ok := buildFkProbe(&r.fk, parent, u.newRow, r.fk.RefColumns); ok {
+					newPresent[string(probe.bytes)] = struct{}{}
+				}
+			}
+			for _, u := range updates {
+				oldProbe, ok := buildFkProbe(&r.fk, parent, u.oldRow, r.fk.RefColumns)
+				if !ok {
+					continue
+				}
+				if newProbe, ok := buildFkProbe(&r.fk, parent, u.newRow, r.fk.RefColumns); ok {
+					if bytes.Equal(newProbe.bytes, oldProbe.bytes) {
+						continue
+					}
+				}
+				if _, present := newPresent[string(oldProbe.bytes)]; present {
+					continue
+				}
+				referenced, err := db.fkChildReferences(r.childTable, &r.fk, parent, oldProbe.bytes, updatedKeys)
+				if err != nil {
+					return 0, nil, err
+				}
+				if referenced {
+					return 0, nil, NewError(ForeignKeyViolation,
+						"update or delete on table "+parent.Name+" violates foreign key constraint "+r.fk.Name+" on table "+r.childTable)
+				}
+			}
+		}
+	}
+
+	// Meter the disposition-plan compression attempts (value_compress, cost.md §3) for the
+	// inserted + updated rows; enforce the ceiling BEFORE phase 2 writes (all-or-nothing).
+	var cunits int64
+	placeholder := make([]byte, 8)
+	for _, row := range inserts {
+		kb := placeholder
+		if len(pk) > 0 {
+			kb = encodePkKey(table, pk, row)
+		}
+		cunits += int64(store.WriteCompressUnits(kb, row))
+	}
+	for _, u := range updates {
+		cunits += int64(store.WriteCompressUnits(u.key, u.newRow))
+	}
+	meter.Charge(Costs.ValueCompress * cunits)
+	if err := meter.Guard(); err != nil {
+		return 0, nil, err
+	}
+
+	// RETURNING (grammar.md §32): project the affected rows — inserts (old side all-NULL) then
+	// updates (old side the pre-update existing row) — after all validation, before any write.
+	var returned [][]Value
+	if returning != nil {
+		nullRow := make(Row, n)
+		for i := range nullRow {
+			nullRow[i] = NullValue()
+		}
+		prows := make([]Row, 0, len(inserts)+len(updates))
+		olds := make([]Row, 0, len(inserts)+len(updates))
+		for _, row := range inserts {
+			prows = append(prows, row)
+			olds = append(olds, nullRow)
+		}
+		for _, u := range updates {
+			prows = append(prows, u.newRow)
+			olds = append(olds, u.oldRow)
+		}
+		var err error
+		if returned, err = db.projectReturning(returning, prows, olds, params, meter); err != nil {
+			return 0, nil, err
+		}
+	}
+
+	affected := int64(len(inserts) + len(updates))
+
+	// Phase 2 — every row validated. Insert the new rows (rowid alloc for a no-PK table, index
+	// entries added), then replace the updated rows (index entries moved).
+	indexAdds := make([][][]byte, len(table.Indexes))
+	for _, row := range inserts {
+		var key []byte
+		if len(pk) > 0 {
+			key = encodePkKey(table, pk, row)
+		} else {
+			key = EncodeInt(Int64, store.AllocRowid())
+		}
+		for k, def := range table.Indexes {
+			indexAdds[k] = append(indexAdds[k], indexEntryKeys(table.Columns, def, key, row)...)
+		}
+		ok, err := store.Insert(key, row)
+		if err != nil {
+			return 0, nil, err
+		}
+		if !ok {
+			panic("pre-validated INSERT key must be unique")
+		}
+	}
+	type indexMove struct{ removals, insertions [][]byte }
+	indexMoves := make([][]indexMove, len(table.Indexes))
+	for _, u := range updates {
+		for k, def := range table.Indexes {
+			oldEks := indexEntryKeys(table.Columns, def, u.key, u.oldRow)
+			newEks := indexEntryKeys(table.Columns, def, u.key, u.newRow)
+			removals := bytesDiff(oldEks, newEks)
+			insertions := bytesDiff(newEks, oldEks)
+			if len(removals) > 0 || len(insertions) > 0 {
+				indexMoves[k] = append(indexMoves[k], indexMove{removals: removals, insertions: insertions})
+			}
+		}
+	}
+	for _, u := range updates {
+		if err := store.Replace(u.key, u.newRow); err != nil {
+			return 0, nil, err
+		}
+	}
+	for k, def := range table.Indexes {
+		istore := db.working().indexStore(strings.ToLower(def.Name))
+		for _, ek := range indexAdds[k] {
+			inserted, err := istore.Insert(ek, nil)
+			if err != nil {
+				return 0, nil, err
+			}
+			if !inserted {
+				panic("index entry keys are unique (storage-key suffix)")
+			}
+		}
+		for _, mv := range indexMoves[k] {
+			for _, oldEk := range mv.removals {
+				if _, err := istore.Remove(oldEk); err != nil {
+					return 0, nil, err
+				}
+			}
+			for _, newEk := range mv.insertions {
+				inserted, err := istore.Insert(newEk, nil)
+				if err != nil {
+					return 0, nil, err
+				}
+				if !inserted {
+					panic("index entry keys are unique (storage-key suffix)")
+				}
+			}
+		}
+	}
+	return affected, returned, nil
 }
 
 // defaultOrNull is the column's stored default value, or a NULL value when it has none —
@@ -10568,6 +11309,22 @@ func returningScope(catalog *Database, t *Table, baseIsOld bool) *scope {
 		if label != pseudo.label {
 			rels = append(rels, scopeRel{label: pseudo.label, table: t, offset: pseudo.offset, qualifierOnly: true})
 		}
+	}
+	return &scope{rels: rels, catalog: catalog, allowSubquery: true}
+}
+
+// onConflictExcludedScope is the scope a DO UPDATE's SET/WHERE resolve against
+// (spec/design/upsert.md §5): the target table at offset 0 (bare and table-qualified references
+// read the EXISTING conflicting row), plus `excluded` as a QUALIFIER-ONLY relation at offset n
+// over the combined row [existing | proposed] (excluded.col reads the proposed row). A target
+// table literally named `excluded` SHADOWS the pseudo-relation (PostgreSQL's rule, like the
+// RETURNING old/new qualifiers).
+func onConflictExcludedScope(catalog *Database, t *Table) *scope {
+	n := len(t.Columns)
+	label := strings.ToLower(t.Name)
+	rels := []scopeRel{{label: label, table: t, offset: 0}}
+	if label != "excluded" {
+		rels = append(rels, scopeRel{label: "excluded", table: t, offset: n, qualifierOnly: true})
 	}
 	return &scope{rels: rels, catalog: catalog, allowSubquery: true}
 }

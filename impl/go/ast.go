@@ -332,9 +332,35 @@ type Insert struct {
 	// Rows is set.
 	Rows   [][]InsertValue
 	Select *Select
+	// OnConflict is the optional ON CONFLICT clause (UPSERT — spec/design/upsert.md), between the
+	// source and RETURNING. Nil = no clause (a conflict traps 23505 as usual).
+	OnConflict *OnConflict
 	// Returning is the optional terminal RETURNING clause (spec/design/grammar.md §32):
 	// project each stored row, turning the statement into a query result. Nil = no clause.
 	Returning *SelectItems
+}
+
+// OnConflict is the `ON CONFLICT [target] action` clause (spec/design/upsert.md §1).
+type OnConflict struct {
+	// Target is the optional conflict target (the arbiter). Nil is legal only with DoNothing
+	// (any uniqueness conflict is then skipped); DoUpdate with a nil target is 42601.
+	Target *ConflictTarget
+	// DoUpdate true = DO UPDATE (Assignments + Filter apply); false = DO NOTHING.
+	DoUpdate    bool
+	Assignments []Assignment // DO UPDATE SET … (empty for DO NOTHING)
+	Filter      *Expr        // optional DO UPDATE WHERE … (nil otherwise)
+}
+
+// ConflictTarget is the arbiter constraint named by an ON CONFLICT target (spec/design/upsert.md
+// §2). EXACTLY ONE of Columns / Constraint is meaningful (IsConstraint selects which).
+type ConflictTarget struct {
+	// Columns is the `( col [, ...] )` inference list — matched as a SET against a unique index /
+	// the primary key (order-independent; no match → 42P10). Valid when !IsConstraint.
+	Columns []string
+	// IsConstraint marks `ON CONSTRAINT name`; Constraint is a unique-index name or the
+	// synthesized <table>_pkey (miss → 42704).
+	IsConstraint bool
+	Constraint   string
 }
 
 // Overriding is the INSERT `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md
