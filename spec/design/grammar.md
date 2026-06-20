@@ -2116,3 +2116,39 @@ relation, the same name included) and rewrites an **owned** sequence's owning-co
 (§15.3). A missing sequence is `42P01` unless `IF EXISTS` (then a no-op). `ALTER … AS type` (the type is
 not persisted — sequences.md §14.4), `OWNED BY`, `OWNER TO`, and `SET { SCHEMA | LOGGED | UNLOGGED }`
 stay `0A000`.
+
+## 46. `INSERT ... ON CONFLICT` (UPSERT — [upsert.md](upsert.md))
+
+`INSERT` takes an optional **`ON CONFLICT`** clause **between the source and `RETURNING`**
+(`on_conflict` in the grammar): a candidate row that would violate a `UNIQUE`/`PRIMARY KEY`
+constraint takes a **conflict action** instead of trapping `23505`.
+
+```
+ON CONFLICT [ ( col [, …] ) | ON CONSTRAINT name ] { DO NOTHING | DO UPDATE SET … [WHERE …] }
+```
+
+- **`DO NOTHING`** skips the offending row; **`DO UPDATE SET … [WHERE …]`** updates the
+  existing conflicting row. In `DO UPDATE`, the **`excluded`** pseudo-relation names the row
+  *proposed for insertion* (`excluded.col`), while a **bare or table-qualified** column names
+  the **existing** row — the `SET`/`WHERE` reuse the `UPDATE` `assignment`/`where_clause`
+  productions, and `excluded` is a **qualifier-only** pseudo-relation exactly like `old`/`new`
+  in `RETURNING` (§32).
+- The optional **conflict target** names the **arbiter** constraint. A **column list** is
+  matched as an order-independent **set** against a unique index / the primary key
+  (`ON CONFLICT (b, a)` matches `UNIQUE (a, b)`); no match is **`42P10`**. **`ON CONSTRAINT
+  name`** names a unique index, or the synthesized **`<table>_pkey`** for the primary key; a
+  miss is **`42704`**. An unknown column in the list is **`42703`**.
+- **`DO UPDATE` requires a target** (**`42601`** without one); **`DO NOTHING`** may omit it,
+  in which case **any** uniqueness conflict is skipped. The arbiter **only** arbitrates its
+  own constraint — a conflict on a **different** unique/PK constraint still traps **`23505`**.
+- Two **proposed** rows sharing the arbiter key are **`21000`** under `DO UPDATE` (*cannot
+  affect row a second time*) and **skipped** under `DO NOTHING`.
+
+The whole feature is two-phase / all-or-nothing with **sequential planning** so a later
+proposed row observes earlier ones (PostgreSQL's row-at-a-time visibility, reproduced over
+the two-phase model). `RETURNING` projects the **affected** rows (inserted + updated);
+`DO NOTHING`-skipped and `WHERE`-false rows contribute nothing. `ON`/`CONFLICT`/`DO`/
+`NOTHING`/`EXCLUDED` stay non-reserved (§3), recognized positionally; the clause is
+disambiguated from an `INSERT ... SELECT` source by appearing after the complete source.
+Full behavior, the arbiter model, the `21000` rule, cost, and the PG divergences are in
+[upsert.md](upsert.md).

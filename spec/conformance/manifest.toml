@@ -121,6 +121,10 @@ id = "dml.returning_old_new"
 description = "The old./new. row-version qualifiers in a RETURNING list (PG 18 semantics, grammar.md §32): old.col = the pre-statement value, new.col = the post-statement value, the absent side the all-NULL row (INSERT's old, DELETE's new); valid only in RETURNING (elsewhere 42P01), shadowed by a target table actually named old/new, usable inside item subqueries; the WITH (OLD AS o, NEW AS n) aliasing form stays deferred"
 
 [[capability]]
+id = "dml.insert_on_conflict"
+description = "INSERT ... ON CONFLICT [target] { DO NOTHING | DO UPDATE SET … [WHERE …] } — UPSERT (spec/design/upsert.md, grammar.md §46). A candidate row that would violate a UNIQUE/PRIMARY KEY constraint takes the conflict action instead of trapping 23505: DO NOTHING skips it; DO UPDATE updates the existing conflicting row, with the proposed row exposed as the qualifier-only `excluded` pseudo-relation (a bare/qualified column = the existing row). The arbiter target is a column SET matched order-independently against a unique index / the PK (no match 42P10), or ON CONSTRAINT name (a unique-index name or the synthesized <table>_pkey; miss 42704); DO UPDATE requires a target (42601 without one), DO NOTHING may omit it (any conflict skipped). A non-arbiter conflict still traps 23505; two proposed rows sharing the arbiter key are 21000 under DO UPDATE, skipped under DO NOTHING. Two-phase / all-or-nothing with sequential planning; RETURNING projects the affected (inserted + updated) rows. Reuses existing error codes (no registry change) and adds no on-disk format change. Divergences: DO UPDATE assigning a PK column is 0A000, end-state (not per-row transient) uniqueness, no INSERT INTO t AS alias (upsert.md §9)"
+
+[[capability]]
 id = "query.select"
 description = "SELECT of columns from a single table"
 

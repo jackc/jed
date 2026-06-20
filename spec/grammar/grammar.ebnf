@@ -316,11 +316,30 @@ type_name      ::= identifier ("(" integer ("," integer)? ")")?
 insert         ::= "INSERT" "INTO" identifier ("(" identifier ("," identifier)* ")")?
                    ("OVERRIDING" ("SYSTEM" | "USER") "VALUE")?
                    ( "VALUES" row ("," row)* | select )
+                   on_conflict?
                    returning_clause?
 
 row            ::= "(" insert_value ("," insert_value)* ")"
 
 insert_value   ::= "DEFAULT" | parameter | literal
+
+/* ON CONFLICT (UPSERT — ../design/upsert.md): a row that would violate a UNIQUE / PRIMARY KEY
+ * constraint takes the conflict_action instead of trapping 23505. "DO NOTHING" skips it;
+ * "DO UPDATE" updates the existing conflicting row, whose proposed (would-be-inserted) version is
+ * the "excluded" pseudo-relation (a bare/qualified column = the EXISTING row). The optional
+ * conflict_target names the arbiter: a column list (matched as a SET against a unique index / the
+ * primary key — no match is 42P10) or "ON CONSTRAINT name" (a unique-index name or the synthesized
+ * <table>_pkey — a miss is 42704). "DO UPDATE" REQUIRES a target (42601 without one); "DO NOTHING"
+ * may omit it (ANY unique/PK conflict is then skipped). A conflict on a NON-arbiter constraint
+ * still traps 23505; two proposed rows sharing the arbiter key are 21000 under DO UPDATE (skipped
+ * under DO NOTHING). "ON"/"CONFLICT"/"NOTHING"/"EXCLUDED"/"DO" are NOT reserved (§3). */
+on_conflict    ::= "ON" "CONFLICT" conflict_target? conflict_action
+
+conflict_target ::= "(" identifier ("," identifier)* ")"
+                  | "ON" "CONSTRAINT" identifier
+
+conflict_action ::= "DO" "NOTHING"
+                  | "DO" "UPDATE" "SET" assignment ("," assignment)* where_clause?
 
 update         ::= "UPDATE" identifier "SET"
                    assignment ("," assignment)*

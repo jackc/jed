@@ -5,12 +5,12 @@
 //! error rather than panicking, so the harness reports "not yet" cleanly.
 
 use crate::ast::{
-    AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, CreateIndex,
-    CreateSequence, CreateTable, CreateType, Cte, DefaultDef, Delete, DropIndex, DropSequence,
-    DropTable, DropType, Expr, ForeignKeyDef, IdentitySpec, Insert, InsertSource, InsertValue,
-    JoinClause, JoinKind, Literal, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem,
-    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef,
-    TypeMod, UnaryOp, UniqueDef, Update, WithQuery,
+    AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction,
+    ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, DefaultDef, Delete,
+    DropIndex, DropSequence, DropTable, DropType, Expr, ForeignKeyDef, IdentitySpec, Insert,
+    InsertSource, InsertValue, JoinClause, JoinKind, Literal, OnConflict, OrderKey, Overriding,
+    QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
+    SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WithQuery,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -1156,14 +1156,86 @@ impl Parser {
             }
             InsertSource::Values(rows)
         };
+        let on_conflict = self.parse_on_conflict()?;
         let returning = self.parse_returning()?;
         Ok(Insert {
             table,
             columns,
             overriding,
             source,
+            on_conflict,
             returning,
         })
+    }
+
+    /// Parse the optional `ON CONFLICT [target] action` clause (UPSERT — spec/design/upsert.md),
+    /// after the source and before RETURNING. `ON`/`CONFLICT`/`DO`/`NOTHING`/`CONSTRAINT` are not
+    /// reserved (§3); the clause is recognized by the `ON CONFLICT` two-keyword lead.
+    fn parse_on_conflict(&mut self) -> Result<Option<OnConflict>> {
+        if self.peek_keyword().as_deref() != Some("on")
+            || self.peek_keyword_at(1).as_deref() != Some("conflict")
+        {
+            return Ok(None);
+        }
+        self.advance(); // ON
+        self.advance(); // CONFLICT
+
+        // Optional conflict target: a `( col, … )` column list or `ON CONSTRAINT name`.
+        let target = if matches!(self.peek(), Token::LParen) {
+            self.advance(); // '('
+            let mut cols = Vec::new();
+            loop {
+                cols.push(self.expect_identifier()?);
+                match self.advance() {
+                    Token::Comma => continue,
+                    Token::RParen => break,
+                    other => return Err(syntax(format!("expected ',' or ')', found {other:?}"))),
+                }
+            }
+            Some(ConflictTarget::Columns(cols))
+        } else if self.peek_keyword().as_deref() == Some("on") {
+            self.advance(); // ON
+            self.expect_keyword("constraint")?;
+            Some(ConflictTarget::Constraint(self.expect_identifier()?))
+        } else {
+            None
+        };
+
+        // The action: `DO NOTHING` or `DO UPDATE SET assignment [, …] [WHERE …]`.
+        self.expect_keyword("do")?;
+        let action = match self.peek_keyword().as_deref() {
+            Some("nothing") => {
+                self.advance();
+                ConflictAction::DoNothing
+            }
+            Some("update") => {
+                self.advance();
+                self.expect_keyword("set")?;
+                let mut assignments = Vec::new();
+                loop {
+                    let column = self.expect_identifier()?;
+                    self.expect(&Token::Eq)?;
+                    let value = self.parse_expr()?;
+                    assignments.push(Assignment { column, value });
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                        continue;
+                    }
+                    break;
+                }
+                let filter = self.parse_optional_where()?;
+                ConflictAction::DoUpdate {
+                    assignments,
+                    filter,
+                }
+            }
+            other => {
+                return Err(syntax(format!(
+                    "expected NOTHING or UPDATE after ON CONFLICT DO, found {other:?}"
+                )));
+            }
+        };
+        Ok(Some(OnConflict { target, action }))
     }
 
     /// One parenthesized `( <value> [, <value>]* )` row of an INSERT.

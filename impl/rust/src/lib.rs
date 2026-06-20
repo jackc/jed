@@ -163,6 +163,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // the pre-statement value, new.col = the post-statement value, the absent side the
     // all-NULL row (grammar.md §32).
     "dml.returning_old_new",
+    // INSERT ... ON CONFLICT [target] { DO NOTHING | DO UPDATE SET … [WHERE …] } — UPSERT
+    // (spec/design/upsert.md, grammar.md §46): arbiter inference / ON CONSTRAINT, the
+    // `excluded` pseudo-relation, the 21000 second-affect rule, non-arbiter 23505.
+    "dml.insert_on_conflict",
     // Phase D/E — SELECT, WHERE (=, ordering), ORDER BY, IS [NOT] NULL, 3VL, casts,
     // cross-type comparison via the promotion tower, and all three integer types.
     "query.select",

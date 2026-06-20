@@ -320,9 +320,44 @@ pub struct Insert {
     pub overriding: Option<Overriding>,
     /// Where the rows come from: a `VALUES` list or a `SELECT`.
     pub source: InsertSource,
+    /// The optional `ON CONFLICT` clause (UPSERT — spec/design/upsert.md), between the source
+    /// and `RETURNING`. `None` = no clause (a conflict traps 23505 as usual).
+    pub on_conflict: Option<OnConflict>,
     /// The optional terminal `RETURNING` clause (spec/design/grammar.md §32): project each
     /// stored row, turning the statement into a query result. `None` = no clause.
     pub returning: Option<SelectItems>,
+}
+
+/// The `ON CONFLICT [target] action` clause (spec/design/upsert.md §1).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct OnConflict {
+    /// The optional conflict target (the arbiter). `None` is legal only with `DoNothing`
+    /// (any uniqueness conflict is then skipped); `DoUpdate` with `None` is 42601.
+    pub target: Option<ConflictTarget>,
+    pub action: ConflictAction,
+}
+
+/// The arbiter constraint named by an `ON CONFLICT` target (spec/design/upsert.md §2).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ConflictTarget {
+    /// `( col [, ...] )` — index inference: matched as a column SET against a unique index /
+    /// the primary key (order-independent; no match → 42P10).
+    Columns(Vec<String>),
+    /// `ON CONSTRAINT name` — a unique-index name, or the synthesized `<table>_pkey` (miss → 42704).
+    Constraint(String),
+}
+
+/// The action an `ON CONFLICT` takes on a conflicting row (spec/design/upsert.md §1).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum ConflictAction {
+    /// `DO NOTHING` — skip the offending row.
+    DoNothing,
+    /// `DO UPDATE SET … [WHERE …]` — update the existing conflicting row. The `excluded`
+    /// pseudo-relation (resolved in the executor) names the proposed row.
+    DoUpdate {
+        assignments: Vec<Assignment>,
+        filter: Option<Expr>,
+    },
 }
 
 /// The INSERT `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13): `System`

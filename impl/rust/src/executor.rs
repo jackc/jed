@@ -5,10 +5,11 @@
 //! `Outcome`: either a bare success (DDL/DML) or a query result set.
 
 use crate::ast::{
-    AlterSeqAction, AlterSequence, BinaryOp, CreateIndex, CreateSequence, CreateTable, CreateType,
-    Delete, DropIndex, DropSequence, DropTable, DropType, Expr, Insert, InsertSource, InsertValue,
-    JoinKind, Literal, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions,
-    SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
+    AlterSeqAction, AlterSequence, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
+    CreateSequence, CreateTable, CreateType, Delete, DropIndex, DropSequence, DropTable, DropType,
+    Expr, Insert, InsertSource, InsertValue, JoinKind, Literal, OnConflict, OrderKey, Overriding,
+    QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
+    SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -2842,6 +2843,7 @@ impl Database {
             columns: col_list,
             overriding,
             source,
+            on_conflict,
             returning,
         } = ins;
 
@@ -2996,6 +2998,12 @@ impl Database {
                     }
                     None => None,
                 };
+                // Resolve the ON CONFLICT clause (its DO UPDATE SET/WHERE share this statement's
+                // ptypes so a `$N` unifies) before binding (spec/design/upsert.md §2/§5).
+                let mut conflict_plan = match &on_conflict {
+                    Some(oc) => Some(self.resolve_on_conflict(&table, oc, &mut ptypes)?),
+                    None => None,
+                };
                 let bound = bind_params(params, &ptypes.finalize()?)?;
 
                 // INSERT ... VALUES reads no rows; with only literal values and constant
@@ -3048,8 +3056,8 @@ impl Database {
                         )?;
                     }
                 }
-                let inserted = rows.len() as i64;
-                let returned = self.insert_rows(
+                self.fold_conflict_plan(&mut conflict_plan, &bound, &mut meter.accrued)?;
+                let (affected, returned) = self.run_insert_rows(
                     &table,
                     &columns,
                     &pk,
@@ -3058,6 +3066,7 @@ impl Database {
                     &stmt_rng,
                     &provided,
                     rows,
+                    conflict_plan.as_ref(),
                     ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice()),
                     &bound,
                     &mut meter,
@@ -3071,7 +3080,7 @@ impl Database {
                     },
                     _ => Outcome::Statement {
                         cost: meter.accrued,
-                        rows_affected: Some(inserted),
+                        rows_affected: Some(affected),
                     },
                 })
             }
@@ -3103,6 +3112,10 @@ impl Database {
                     }
                     None => None,
                 };
+                let mut conflict_plan = match &on_conflict {
+                    Some(oc) => Some(self.resolve_on_conflict(&table, oc, &mut ptypes)?),
+                    None => None,
+                };
                 let bound = bind_params(params, &ptypes.finalize()?)?;
                 let mut meter = Meter::with_limit(self.max_cost);
                 self.fold_uncorrelated_in_plan(
@@ -3111,6 +3124,7 @@ impl Database {
                     CteCtx::empty(),
                     &mut meter.accrued,
                 )?;
+                self.fold_conflict_plan(&mut conflict_plan, &bound, &mut meter.accrued)?;
                 let mut ret_nodes = ret;
                 if let Some((nodes, _, _)) = &mut ret_nodes {
                     for node in nodes {
@@ -3187,8 +3201,7 @@ impl Database {
                 // plus the RETURNING projection; storing the rows themselves stays unmetered.
                 // One meter keeps one ceiling over the whole statement.
                 meter.charge(q.cost);
-                let inserted = q.rows.len() as i64;
-                let returned = self.insert_rows(
+                let (affected, returned) = self.run_insert_rows(
                     &table,
                     &columns,
                     &pk,
@@ -3197,6 +3210,7 @@ impl Database {
                     &stmt_rng,
                     &provided,
                     q.rows,
+                    conflict_plan.as_ref(),
                     ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice()),
                     &bound,
                     &mut meter,
@@ -3210,7 +3224,7 @@ impl Database {
                     },
                     _ => Outcome::Statement {
                         cost: meter.accrued,
-                        rows_affected: Some(inserted),
+                        rows_affected: Some(affected),
                     },
                 })
             }
@@ -3317,57 +3331,9 @@ impl Database {
                 None
             } else {
                 // The composite key is the concatenation of the members' bare encodings in
-                // key order (encoding.md §2.3) — every keyable type is fixed-width, so the
-                // concatenation is self-delimiting and memcmp equals the tuple's order. A
-                // single-column key is the one-member case of the same rule.
-                let mut k = Vec::new();
-                for &(i, pk_ty) in pk {
-                    match &row[i] {
-                        Value::Int(nn) => k.extend_from_slice(&encode_int(pk_ty, *nn)),
-                        // uuid is the first non-integer key: its key is the bare 16 bytes
-                        // (uuid-raw16, encoding.md §2.7) — a PK is NOT NULL, so no presence tag.
-                        Value::Uuid(u) => k.extend_from_slice(u),
-                        // boolean is the second non-integer key: the bare 1-byte `bool-byte`
-                        // (0x00 false / 0x01 true, encoding.md §2.9) — likewise no presence tag.
-                        Value::Bool(b) => k.extend_from_slice(&encode_bool(*b)),
-                        // A timestamp / timestamptz PRIMARY KEY is supported: its key bytes are
-                        // the i64 instant codec (spec/design/timestamp.md §6).
-                        Value::Timestamp(m) | Value::Timestamptz(m) => {
-                            k.extend_from_slice(&encode_int(pk_ty, *m))
-                        }
-                        // A date PRIMARY KEY is supported: the i32 day codec (spec/design/date.md §5).
-                        Value::Date(d) => k.extend_from_slice(&encode_int(pk_ty, *d as i64)),
-                        // Unreachable: a PK column is NOT NULL, enforced above.
-                        Value::Null => unreachable!("primary key column is NOT NULL"),
-                        // Unreachable: a text/decimal/bytea/interval/float PRIMARY KEY is rejected
-                        // at CREATE TABLE (0A000) — those non-integer PKs are caught by the gate.
-                        Value::Text(_)
-                        | Value::Decimal(_)
-                        | Value::Bytea(_)
-                        | Value::Interval(_)
-                        | Value::Float32(_)
-                        | Value::Float64(_) => {
-                            unreachable!(
-                                "a text/decimal/bytea/interval/float primary key is rejected at CREATE TABLE"
-                            )
-                        }
-                        // Unreachable: a composite PRIMARY KEY is rejected at CREATE TABLE (0A000 —
-                        // the key encoding is authored but unexercised, spec/design/composite.md §6).
-                        Value::Composite(_) => {
-                            unreachable!("a composite primary key is rejected at CREATE TABLE")
-                        }
-                        // Unreachable: an array PRIMARY KEY is rejected at CREATE TABLE (0A000 —
-                        // the key encoding is authored but unexercised, spec/design/array.md §8).
-                        Value::Array(_) => {
-                            unreachable!("an array primary key is rejected at CREATE TABLE")
-                        }
-                        // Poisoned (large-values.md §14): INSERT values are evaluated
-                        // expressions, never lazily-loaded storage rows.
-                        Value::Unfetched(_) => {
-                            panic!("BUG: unfetched large value escaped the storage layer")
-                        }
-                    }
-                }
+                // key order (encoding.md §2.3 — `encode_pk_key`); a single-column key is the
+                // one-member case of the same rule.
+                let k = encode_pk_key(pk, &row);
                 if seen_keys.contains(&k) || self.store(table).get(&k)?.is_some() {
                     // The PK's 23505 reports PostgreSQL's derived auto-name for the PK
                     // index, `<table>_pkey` — jed persists/reserves no such relation
@@ -3507,6 +3473,706 @@ impl Database {
             }
         }
         Ok(returned)
+    }
+
+    /// Resolve an `ON CONFLICT` clause (spec/design/upsert.md §2/§5) into a `ConflictPlan`: the
+    /// arbiter constraint, plus — for `DO UPDATE` — the resolved `SET` assignment plans and the
+    /// optional `WHERE` filter, both resolved against the `[existing | excluded]` scope. Threads
+    /// the statement `ptypes` so a `$N` in a `SET`/`WHERE` unifies with the rest of the INSERT.
+    fn resolve_on_conflict(
+        &self,
+        table: &str,
+        oc: &OnConflict,
+        ptypes: &mut ParamTypes,
+    ) -> Result<ConflictPlan> {
+        let tdef = self.table(table).ok_or_else(|| {
+            EngineError::new(
+                SqlState::UndefinedTable,
+                format!("table does not exist: {table}"),
+            )
+        })?;
+        let arbiter = resolve_arbiter(tdef, oc.target.as_ref())?;
+        let action = match &oc.action {
+            ConflictAction::DoNothing => ConflictActionPlan::DoNothing,
+            ConflictAction::DoUpdate {
+                assignments,
+                filter,
+            } => {
+                // DO UPDATE requires a target (spec/design/upsert.md §2) — PostgreSQL's message.
+                if arbiter.is_none() {
+                    return Err(EngineError::new(
+                        SqlState::SyntaxError,
+                        "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+                    ));
+                }
+                let scope = Scope::on_conflict_excluded(self, tdef);
+                let pk_members = tdef.pk_indices();
+                let mut plans: Vec<AssignPlan> = Vec::with_capacity(assignments.len());
+                for a in assignments {
+                    let idx = col_idx(tdef, &a.column)?;
+                    // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md
+                    // §13.4); jed has no `= DEFAULT`, so any assignment is 428C9 (before the PK 0A000).
+                    if tdef.columns[idx].identity == Some(IdentityKind::Always) {
+                        return Err(EngineError::new(
+                            SqlState::GeneratedAlways,
+                            format!("column {} can only be updated to DEFAULT", a.column),
+                        ));
+                    }
+                    // Assigning a PRIMARY KEY member is the standing UPDATE narrowing (0A000 — the
+                    // storage key never changes, upsert.md §5/§9).
+                    if pk_members.contains(&idx) {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            "updating a primary key column is not supported",
+                        ));
+                    }
+                    if plans.iter().any(|p| p.idx == idx) {
+                        return Err(EngineError::new(
+                            SqlState::DuplicateColumn,
+                            format!("column {} assigned more than once", a.column),
+                        ));
+                    }
+                    let col = &tdef.columns[idx];
+                    let Type::Scalar(target_scalar) = &col.ty else {
+                        return Err(EngineError::new(
+                            SqlState::FeatureNotSupported,
+                            format!(
+                                "updating composite column {} is not supported yet",
+                                a.column
+                            ),
+                        ));
+                    };
+                    let target_scalar = *target_scalar;
+                    let (source, ty) = resolve(
+                        &scope,
+                        &a.value,
+                        Some(target_scalar),
+                        &mut AggCtx::Forbidden,
+                        ptypes,
+                    )?;
+                    require_assignable(&ty, target_scalar, &a.column)?;
+                    plans.push(AssignPlan {
+                        idx,
+                        name: col.name.clone(),
+                        target: target_scalar,
+                        decimal: col.decimal,
+                        not_null: col.not_null,
+                        source,
+                    });
+                }
+                let filter = match filter {
+                    Some(p) => Some(resolve_boolean_filter(&scope, p, ptypes)?),
+                    None => None,
+                };
+                ConflictActionPlan::DoUpdate {
+                    assignments: plans,
+                    filter,
+                }
+            }
+        };
+        Ok(ConflictPlan { arbiter, action })
+    }
+
+    /// Look up the EXISTING (committed) conflicting row for an arbiter key `ak`
+    /// (spec/design/upsert.md §3): the row is always a committed one (an in-batch row sharing
+    /// the arbiter key was caught earlier by the proposed-arbiter set). Returns `(storage_key,
+    /// fully-resident row)`, or `None` when no committed row carries that arbiter key.
+    fn arbiter_existing(
+        &self,
+        arb: &Arbiter,
+        table: &str,
+        indexes: &[IndexDef],
+        ak: &[u8],
+    ) -> Result<Option<(Vec<u8>, Row)>> {
+        let fetched = match arb {
+            // PK arbiter: the arbiter key IS the storage key.
+            Arbiter::PrimaryKey => self.store(table).get(ak)?.map(|row| (ak.to_vec(), row)),
+            // Unique-index arbiter: probe the index for the prefix → its entry's storage-key
+            // suffix → fetch the row (indexes.md §8).
+            Arbiter::Index(i) => {
+                let def = &indexes[*i];
+                let istore = self.index_store(&def.name.to_ascii_lowercase());
+                match istore.range_entries(&unique_probe_bound(ak))?.first() {
+                    None => None,
+                    Some((ekey, _)) => {
+                        let suffix = ekey[ak.len()..].to_vec();
+                        let row = self
+                            .store(table)
+                            .get(&suffix)?
+                            .expect("a unique-index entry points at a live row");
+                        Some((suffix, row))
+                    }
+                }
+            }
+        };
+        match fetched {
+            Some((key, mut row)) => {
+                // Resolve any lazily-loaded large values so bare references in the DO UPDATE
+                // SET/WHERE read real values (large-values.md §14).
+                self.store(table).resolve_all(&mut row)?;
+                Ok(Some((key, row)))
+            }
+            None => Ok(None),
+        }
+    }
+
+    /// Phase 1 + phase 2 of an `INSERT ... ON CONFLICT` (spec/design/upsert.md §3), the UPSERT
+    /// analogue of `insert_rows`. Phase 1 walks the candidate rows in source order, classifying
+    /// each as a planned INSERT, a planned UPDATE of an existing row, or a SKIP; the planned
+    /// inserts + updates are then validated against the statement END STATE (PK / unique / CHECK
+    /// / FK) before phase 2 writes anything (all-or-nothing). `returning` projects the AFFECTED
+    /// rows (inserts with an all-NULL old side, updates with their pre-update existing row).
+    #[allow(clippy::too_many_arguments)]
+    fn insert_rows_on_conflict(
+        &mut self,
+        table: &str,
+        columns: &[Column],
+        pk: &[(usize, ScalarType)],
+        checks: &[(String, RExpr)],
+        default_exprs: &[Option<RExpr>],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        provided: &[Option<usize>],
+        rows: Vec<Vec<Value>>,
+        plan: &ConflictPlan,
+        returning: Option<&[RExpr]>,
+        params: &[Value],
+        meter: &mut Meter,
+    ) -> Result<(i64, Option<Vec<Vec<Value>>>)> {
+        let n = columns.len();
+        let (relation, indexes) = self
+            .table(table)
+            .map(|t| (t.name.clone(), t.indexes.clone()))
+            .unwrap_or_else(|| (table.to_string(), Vec::new()));
+        let col_types: Vec<ColType> = self.store(table).col_types().to_vec();
+        let uniq_idx: Vec<usize> = indexes
+            .iter()
+            .enumerate()
+            .filter(|(_, d)| d.unique)
+            .map(|(i, _)| i)
+            .collect();
+
+        // Phase 1 — sequential classification.
+        let mut inserts: Vec<Row> = Vec::new();
+        let mut updates: Vec<(Vec<u8>, Row, Row)> = Vec::new();
+        // Arbiter keys this statement has already proposed (the §4 second-affect rule).
+        let mut proposed_arbiter: HashSet<Vec<u8>> = HashSet::new();
+        // For the no-target DO NOTHING path: the planned inserts' keys/prefixes, so an in-batch
+        // duplicate is skipped (the arbiter path uses `proposed_arbiter` instead).
+        let mut ins_pk: HashSet<Vec<u8>> = HashSet::new();
+        let mut ins_prefixes: Vec<HashSet<Vec<u8>>> = vec![HashSet::new(); uniq_idx.len()];
+
+        for values in &rows {
+            // Build + coerce the candidate row, then CHECK — the INSERT per-row order
+            // (NOT NULL before CHECK before conflict; constraints.md §4.4).
+            let mut row = Vec::with_capacity(n);
+            for (i, col) in columns.iter().enumerate() {
+                let candidate = match provided[i] {
+                    Some(p) => values[p].clone(),
+                    None => self.eval_default(col, default_exprs[i].as_ref(), rng, meter)?,
+                };
+                row.push(coerce_for_store(
+                    candidate,
+                    &col_types[i],
+                    col.decimal,
+                    col.not_null,
+                    &col.name,
+                )?);
+            }
+            self.eval_checks(checks, &row, rng, &relation, meter)?;
+
+            match &plan.arbiter {
+                // No-target DO NOTHING: skip on ANY uniqueness conflict (committed OR an
+                // earlier planned insert); else insert (upsert.md §2/§3).
+                None => {
+                    let pkk = (!pk.is_empty()).then(|| encode_pk_key(pk, &row));
+                    let committed =
+                        self.row_conflicts_committed(table, columns, pk, &indexes, &row)?;
+                    let in_batch = pkk.as_ref().is_some_and(|k| ins_pk.contains(k))
+                        || uniq_idx.iter().enumerate().any(|(u, &ix)| {
+                            index_prefix_key(columns, &indexes[ix], &row)
+                                .is_some_and(|p| ins_prefixes[u].contains(&p))
+                        });
+                    if committed || in_batch {
+                        continue; // skip
+                    }
+                    if let Some(k) = pkk {
+                        ins_pk.insert(k);
+                    }
+                    for (u, &ix) in uniq_idx.iter().enumerate() {
+                        if let Some(p) = index_prefix_key(columns, &indexes[ix], &row) {
+                            ins_prefixes[u].insert(p);
+                        }
+                    }
+                    inserts.push(row);
+                }
+                // Arbiter present (DO UPDATE always; DO NOTHING with a target).
+                Some(arb) => {
+                    let Some(ak) = arbiter_key(arb, pk, columns, &indexes, &row) else {
+                        // A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
+                        inserts.push(row);
+                        continue;
+                    };
+                    if proposed_arbiter.contains(&ak) {
+                        // A second proposed row with the same arbiter key (§4).
+                        match &plan.action {
+                            ConflictActionPlan::DoNothing => continue, // skip
+                            ConflictActionPlan::DoUpdate { .. } => {
+                                return Err(EngineError::new(
+                                    SqlState::CardinalityViolation,
+                                    "ON CONFLICT DO UPDATE command cannot affect row a second time",
+                                ));
+                            }
+                        }
+                    }
+                    proposed_arbiter.insert(ak.clone());
+                    match self.arbiter_existing(arb, table, &indexes, &ak)? {
+                        // No committed conflict on the arbiter → insert (a non-arbiter conflict is
+                        // caught by the end-state validation below).
+                        None => inserts.push(row),
+                        Some((ekey, erow)) => match &plan.action {
+                            ConflictActionPlan::DoNothing => continue, // skip
+                            ConflictActionPlan::DoUpdate {
+                                assignments,
+                                filter,
+                            } => {
+                                // The combined eval row [existing | proposed] the §5 scope resolves
+                                // against (bare/qualified = existing, `excluded.col` = proposed).
+                                let mut combined = erow.clone();
+                                combined.extend_from_slice(&row);
+                                let env = EvalEnv {
+                                    exec: self,
+                                    params,
+                                    outer: &[],
+                                    rng,
+                                    ctes: CteCtx::empty(),
+                                };
+                                // An optional WHERE that is not TRUE skips the update (existing row
+                                // unchanged, not returned) — but the arbiter key was already
+                                // proposed, so a second row still trips §4 (probed).
+                                if let Some(f) = filter {
+                                    if !f.eval(&combined, &env, meter)?.is_true() {
+                                        continue;
+                                    }
+                                }
+                                let mut new_row = erow.clone();
+                                for ap in assignments {
+                                    let raw = ap.source.eval(&combined, &env, meter)?;
+                                    new_row[ap.idx] = ap.check(raw)?;
+                                }
+                                self.eval_checks(checks, &new_row, rng, &relation, meter)?;
+                                updates.push((ekey, new_row, erow));
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
+        // End-state validation (upsert.md §3), before any write. PRIMARY KEY: each insert's key
+        // must be free in the committed store and distinct from the other inserts (updates never
+        // change the key) — a collision is 23505 on `<table>_pkey` (a non-arbiter PK conflict).
+        if !pk.is_empty() && !inserts.is_empty() {
+            let mut seen: HashSet<Vec<u8>> = HashSet::new();
+            for row in &inserts {
+                let k = encode_pk_key(pk, row);
+                if self.store(table).get(&k)?.is_some() || !seen.insert(k) {
+                    return Err(EngineError::new(
+                        SqlState::UniqueViolation,
+                        format!(
+                            "duplicate key value violates unique constraint: {}_pkey",
+                            relation.to_ascii_lowercase()
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // UNIQUE indexes: validate the END STATE over the updated NEW rows + the inserted rows
+        // (indexes.md §8 — the same end-state model as UPDATE). New prefixes must not collide
+        // with each other, nor with an existing entry whose suffix is NOT a rewritten row's key.
+        if !uniq_idx.is_empty() && (!inserts.is_empty() || !updates.is_empty()) {
+            let rewritten: HashSet<&[u8]> = updates.iter().map(|(k, _, _)| k.as_slice()).collect();
+            for &ix in &uniq_idx {
+                let def = &indexes[ix];
+                let istore = self.index_store(&def.name.to_ascii_lowercase());
+                let mut batch: HashSet<Vec<u8>> = HashSet::new();
+                for new_row in updates.iter().map(|(_, nr, _)| nr).chain(inserts.iter()) {
+                    let Some(prefix) = index_prefix_key(columns, def, new_row) else {
+                        continue;
+                    };
+                    let conflict = !batch.insert(prefix.clone())
+                        || istore
+                            .range_entries(&unique_probe_bound(&prefix))?
+                            .iter()
+                            .any(|(ekey, _)| !rewritten.contains(&ekey[prefix.len()..]));
+                    if conflict {
+                        return Err(EngineError::new(
+                            SqlState::UniqueViolation,
+                            format!(
+                                "duplicate key value violates unique constraint: {}",
+                                def.name
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // FOREIGN KEY child-side (constraints.md §6.4): each inserted row, and each updated row
+        // that assigned an FK local column, must reference an existing parent key — the committed
+        // parent state plus (for a self-reference) the statement's end state.
+        let assigned: HashSet<usize> = match &plan.action {
+            ConflictActionPlan::DoUpdate { assignments, .. } => {
+                assignments.iter().map(|a| a.idx).collect()
+            }
+            ConflictActionPlan::DoNothing => HashSet::new(),
+        };
+        let fks: Vec<ForeignKeyConstraint> = self
+            .table(table)
+            .map(|t| t.foreign_keys.clone())
+            .unwrap_or_default();
+        for fk in &fks {
+            let Some(parent) = self.table(&fk.ref_table) else {
+                continue;
+            };
+            let check_updates = fk.columns.iter().any(|c| assigned.contains(c));
+            // End-state referenced keys this statement supplies, for a self-reference: from the
+            // inserted rows and the updated NEW rows.
+            let batch: HashSet<Vec<u8>> = if fk.ref_table.eq_ignore_ascii_case(&relation) {
+                inserts
+                    .iter()
+                    .chain(updates.iter().map(|(_, nr, _)| nr))
+                    .filter_map(|r| {
+                        fk_probe(fk, parent, r, &fk.ref_columns).map(|p| p.bytes().to_vec())
+                    })
+                    .collect()
+            } else {
+                HashSet::new()
+            };
+            let to_check = inserts.iter().chain(
+                updates
+                    .iter()
+                    .filter(|_| check_updates)
+                    .map(|(_, nr, _)| nr),
+            );
+            for row in to_check {
+                let Some(probe) = fk_probe(fk, parent, row, &fk.columns) else {
+                    continue; // a NULL local column → exempt (MATCH SIMPLE)
+                };
+                if batch.contains(probe.bytes()) {
+                    continue;
+                }
+                if !self.fk_probe_hits(&probe, &fk.ref_table)? {
+                    return Err(EngineError::new(
+                        SqlState::ForeignKeyViolation,
+                        format!(
+                            "insert or update on table {relation} violates foreign key constraint {}",
+                            fk.name
+                        ),
+                    ));
+                }
+            }
+        }
+
+        // FOREIGN KEY parent-side (constraints.md §6.5): an updated referenced row must not strand
+        // a child. A referenced PK column cannot change (PK assignment is 0A000), so only a
+        // referenced UNIQUE column is at risk; a tuple DISAPPEARS when an updated row's old value
+        // is absent from the statement's new end state. (Inserts add rows, never strand a child.)
+        let referencers = self.fk_referencers(table);
+        if !referencers.is_empty() && !updates.is_empty() {
+            let parent = self.table(table).expect("insert target exists").clone();
+            let updated_keys: HashSet<Vec<u8>> =
+                updates.iter().map(|(k, _, _)| k.clone()).collect();
+            for (child_table, fk) in &referencers {
+                let new_present: HashSet<Vec<u8>> = updates
+                    .iter()
+                    .filter_map(|(_, nr, _)| {
+                        fk_probe(fk, &parent, nr, &fk.ref_columns).map(|p| p.bytes().to_vec())
+                    })
+                    .collect();
+                for (_, new_row, old_row) in &updates {
+                    let Some(old_probe) = fk_probe(fk, &parent, old_row, &fk.ref_columns) else {
+                        continue;
+                    };
+                    if let Some(new_probe) = fk_probe(fk, &parent, new_row, &fk.ref_columns) {
+                        if new_probe.bytes() == old_probe.bytes() {
+                            continue; // unchanged tuple
+                        }
+                    }
+                    if new_present.contains(old_probe.bytes()) {
+                        continue; // re-supplied by another updated row
+                    }
+                    if self.fk_child_references(
+                        child_table,
+                        fk,
+                        &parent,
+                        old_probe.bytes(),
+                        &updated_keys,
+                    )? {
+                        return Err(EngineError::new(
+                            SqlState::ForeignKeyViolation,
+                            format!(
+                                "update or delete on table {} violates foreign key constraint {} on table {}",
+                                parent.name, fk.name, child_table
+                            ),
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Meter the disposition-plan compression attempts (value_compress, cost.md §3) for the
+        // inserted + updated rows, and enforce the ceiling BEFORE phase 2 writes (all-or-nothing).
+        // Only the key LENGTH feeds the plan, so an 8-byte placeholder stands in for a yet-to-be
+        // allocated rowid deterministically (as in `insert_rows`).
+        {
+            let store = self.store(table);
+            let mut cunits: i64 = 0;
+            let placeholder = [0u8; 8];
+            for row in &inserts {
+                let kb: Vec<u8> = if pk.is_empty() {
+                    placeholder.to_vec()
+                } else {
+                    encode_pk_key(pk, row)
+                };
+                cunits += store.write_compress_units(&kb, row) as i64;
+            }
+            for (key, row, _) in &updates {
+                cunits += store.write_compress_units(key, row) as i64;
+            }
+            meter.charge(COSTS.value_compress * cunits);
+            meter.guard()?;
+        }
+
+        // RETURNING (grammar.md §32): project the affected rows — inserts (old side all-NULL) then
+        // updates (old side the pre-update existing row) — after all validation, before any write.
+        let returned = match returning {
+            Some(nodes) => {
+                let null_row: Row = vec![Value::Null; n];
+                let mut prows: Vec<&Row> = Vec::with_capacity(inserts.len() + updates.len());
+                let mut olds: Vec<&Row> = Vec::with_capacity(inserts.len() + updates.len());
+                for r in &inserts {
+                    prows.push(r);
+                    olds.push(&null_row);
+                }
+                for (_, nr, or) in &updates {
+                    prows.push(nr);
+                    olds.push(or);
+                }
+                Some(self.project_returning(nodes, &prows, Some(&olds), params, meter)?)
+            }
+            None => None,
+        };
+
+        let affected = (inserts.len() + updates.len()) as i64;
+
+        // Phase 2 — every row validated. Insert the new rows (rowid alloc for a no-PK table,
+        // index entries added), then replace the updated rows (index entries moved).
+        let store = self.store_mut(table);
+        let mut index_adds: Vec<Vec<Vec<u8>>> = vec![Vec::new(); indexes.len()];
+        for row in inserts {
+            let key = if pk.is_empty() {
+                encode_int(ScalarType::Int64, store.alloc_rowid())
+            } else {
+                encode_pk_key(pk, &row)
+            };
+            for (k, def) in indexes.iter().enumerate() {
+                index_adds[k].extend(index_entry_keys(columns, def, &key, &row));
+            }
+            assert!(
+                store.insert(key, row)?,
+                "pre-validated INSERT key must be unique"
+            );
+        }
+        let mut index_moves: Vec<Vec<(Vec<Vec<u8>>, Vec<Vec<u8>>)>> =
+            vec![Vec::new(); indexes.len()];
+        for (key, new_row, old_row) in &updates {
+            for (k, def) in indexes.iter().enumerate() {
+                let old_eks = index_entry_keys(columns, def, key, old_row);
+                let new_eks = index_entry_keys(columns, def, key, new_row);
+                let removals: Vec<Vec<u8>> = old_eks
+                    .iter()
+                    .filter(|e| !new_eks.contains(*e))
+                    .cloned()
+                    .collect();
+                let insertions: Vec<Vec<u8>> = new_eks
+                    .iter()
+                    .filter(|e| !old_eks.contains(*e))
+                    .cloned()
+                    .collect();
+                if !removals.is_empty() || !insertions.is_empty() {
+                    index_moves[k].push((removals, insertions));
+                }
+            }
+        }
+        let store = self.store_mut(table);
+        for (key, new_row, _) in updates {
+            store.replace(&key, new_row)?;
+        }
+        for (k, def) in indexes.iter().enumerate() {
+            let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
+            for ek in index_adds[k].drain(..) {
+                assert!(
+                    istore.insert(ek, Vec::new())?,
+                    "index entry keys are unique (storage-key suffix)"
+                );
+            }
+            for (removals, insertions) in index_moves[k].drain(..) {
+                for old_ek in removals {
+                    istore.remove(&old_ek)?;
+                }
+                for new_ek in insertions {
+                    assert!(
+                        istore.insert(new_ek, Vec::new())?,
+                        "index entry keys are unique (storage-key suffix)"
+                    );
+                }
+            }
+        }
+        Ok((affected, returned))
+    }
+
+    /// Evaluate the table's CHECK constraints on one candidate row (constraints.md §4.4): TRUE
+    /// and NULL pass, the first FALSE traps 23514. Shared by the ON CONFLICT insert + DO UPDATE
+    /// paths. Metered expression work (operator_eval); the per-statement `rng` is shared.
+    fn eval_checks(
+        &self,
+        checks: &[(String, RExpr)],
+        row: &Row,
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        relation: &str,
+        meter: &mut Meter,
+    ) -> Result<()> {
+        if checks.is_empty() {
+            return Ok(());
+        }
+        meter.guard()?;
+        let env = EvalEnv {
+            exec: self,
+            params: &[],
+            outer: &[],
+            rng,
+            ctes: CteCtx::empty(),
+        };
+        for (name, rexpr) in checks {
+            if matches!(rexpr.eval(row, &env, meter)?, Value::Bool(false)) {
+                return Err(EngineError::new(
+                    SqlState::CheckViolation,
+                    format!("new row for relation {relation} violates check constraint {name}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether a candidate row conflicts with a COMMITTED row on the primary key or any unique
+    /// index (the no-target `DO NOTHING` skip test — spec/design/upsert.md §2). NULLS DISTINCT:
+    /// a unique tuple with any NULL component never conflicts.
+    fn row_conflicts_committed(
+        &self,
+        table: &str,
+        columns: &[Column],
+        pk: &[(usize, ScalarType)],
+        indexes: &[IndexDef],
+        row: &Row,
+    ) -> Result<bool> {
+        if !pk.is_empty() && self.store(table).get(&encode_pk_key(pk, row))?.is_some() {
+            return Ok(true);
+        }
+        for def in indexes.iter().filter(|d| d.unique) {
+            let Some(prefix) = index_prefix_key(columns, def, row) else {
+                continue;
+            };
+            if !self
+                .index_store(&def.name.to_ascii_lowercase())
+                .range_entries(&unique_probe_bound(&prefix))?
+                .is_empty()
+            {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Fold globally-uncorrelated subqueries in a DO UPDATE's SET/WHERE once (their cost is added
+    /// a single time — cost.md §3), exactly as UPDATE folds its assignment/filter subqueries.
+    fn fold_conflict_plan(
+        &self,
+        plan: &mut Option<ConflictPlan>,
+        bound: &[Value],
+        accrued: &mut i64,
+    ) -> Result<()> {
+        if let Some(ConflictPlan {
+            action:
+                ConflictActionPlan::DoUpdate {
+                    assignments,
+                    filter,
+                },
+            ..
+        }) = plan
+        {
+            for ap in assignments {
+                self.fold_uncorrelated_in_rexpr(&mut ap.source, bound, CteCtx::empty(), accrued)?;
+            }
+            if let Some(f) = filter {
+                self.fold_uncorrelated_in_rexpr(f, bound, CteCtx::empty(), accrued)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Dispatch the validated candidate rows to the plain or the ON CONFLICT insert path, shared
+    /// by both INSERT sources. Returns `(rows affected, RETURNING rows)`: a plain insert affects
+    /// every candidate row; an ON CONFLICT may insert, update, or skip (spec/design/upsert.md §3).
+    #[allow(clippy::too_many_arguments)]
+    fn run_insert_rows(
+        &mut self,
+        table: &str,
+        columns: &[Column],
+        pk: &[(usize, ScalarType)],
+        checks: &[(String, RExpr)],
+        default_exprs: &[Option<RExpr>],
+        rng: &std::cell::Cell<crate::seam::StmtRng>,
+        provided: &[Option<usize>],
+        rows: Vec<Vec<Value>>,
+        conflict: Option<&ConflictPlan>,
+        returning: Option<&[RExpr]>,
+        params: &[Value],
+        meter: &mut Meter,
+    ) -> Result<(i64, Option<Vec<Vec<Value>>>)> {
+        match conflict {
+            Some(plan) => self.insert_rows_on_conflict(
+                table,
+                columns,
+                pk,
+                checks,
+                default_exprs,
+                rng,
+                provided,
+                rows,
+                plan,
+                returning,
+                params,
+                meter,
+            ),
+            None => {
+                let inserted = rows.len() as i64;
+                let returned = self.insert_rows(
+                    table,
+                    columns,
+                    pk,
+                    checks,
+                    default_exprs,
+                    rng,
+                    provided,
+                    rows,
+                    returning,
+                    params,
+                    meter,
+                )?;
+                Ok((inserted, returned))
+            }
+        }
     }
 
     /// Resolve a RETURNING item list against the target table's RETURNING scope
@@ -6909,6 +7575,40 @@ impl<'a> Scope<'a> {
         }
     }
 
+    /// The scope a DO UPDATE's `SET`/`WHERE` resolve against (spec/design/upsert.md §5): the
+    /// target table at offset 0 (bare and table-qualified references read the EXISTING
+    /// conflicting row), plus `excluded` as a QUALIFIER-ONLY relation at offset `n` over the
+    /// combined row `[existing | proposed]` (`excluded.col` reads the proposed row). A target
+    /// table literally named `excluded` SHADOWS the pseudo-relation (PostgreSQL's rule, like
+    /// the RETURNING `old`/`new` qualifiers, §32).
+    fn on_conflict_excluded(catalog: &'a Database, table: &'a Table) -> Scope<'a> {
+        let n = table.columns.len();
+        let label = table.name.to_ascii_lowercase();
+        let mut rels = vec![ScopeRel {
+            label: label.clone(),
+            table,
+            offset: 0,
+            qualifier_only: false,
+            cte: None,
+        }];
+        if label != "excluded" {
+            rels.push(ScopeRel {
+                label: "excluded".to_string(),
+                table,
+                offset: n,
+                qualifier_only: true,
+                cte: None,
+            });
+        }
+        Scope {
+            rels,
+            parent: None,
+            catalog,
+            allow_subquery: true,
+            ctes: &[],
+        }
+    }
+
     /// Resolve a bare column name against THIS scope, then OUTWARD through the parent chain.
     /// Within one scope: two+ relations have it → 42702 ambiguous; exactly one → `Local`; none
     /// → fall through to the parent. A name found only in an ancestor is an `Outer` reference
@@ -8232,6 +8932,47 @@ fn gin_entries(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row
             entry
         })
         .collect()
+}
+
+/// A row's PRIMARY-KEY STORAGE KEY (spec/design/encoding.md §2.3): the concatenation of the
+/// members' bare encodings in key order — every keyable type is fixed-width, so the
+/// concatenation is self-delimiting and `memcmp` equals the tuple's logical order. Shared by
+/// the INSERT duplicate check and the ON CONFLICT arbiter probe (spec/design/upsert.md §3); a
+/// PK column is NOT NULL, so there is no presence tag and no NULL arm.
+fn encode_pk_key(pk: &[(usize, ScalarType)], row: &Row) -> Vec<u8> {
+    let mut k = Vec::new();
+    for &(i, pk_ty) in pk {
+        match &row[i] {
+            Value::Int(nn) => k.extend_from_slice(&encode_int(pk_ty, *nn)),
+            // uuid: the bare 16 bytes (uuid-raw16, encoding.md §2.7).
+            Value::Uuid(u) => k.extend_from_slice(u),
+            // boolean: the bare 1-byte `bool-byte` (encoding.md §2.9).
+            Value::Bool(b) => k.extend_from_slice(&encode_bool(*b)),
+            // timestamp / timestamptz: the i64 instant codec (timestamp.md §6).
+            Value::Timestamp(m) | Value::Timestamptz(m) => {
+                k.extend_from_slice(&encode_int(pk_ty, *m))
+            }
+            // date: the i32 day codec (date.md §5).
+            Value::Date(d) => k.extend_from_slice(&encode_int(pk_ty, *d as i64)),
+            Value::Null => unreachable!("primary key column is NOT NULL"),
+            Value::Text(_)
+            | Value::Decimal(_)
+            | Value::Bytea(_)
+            | Value::Interval(_)
+            | Value::Float32(_)
+            | Value::Float64(_) => {
+                unreachable!(
+                    "a text/decimal/bytea/interval/float primary key is rejected at CREATE TABLE"
+                )
+            }
+            Value::Composite(_) => {
+                unreachable!("a composite primary key is rejected at CREATE TABLE")
+            }
+            Value::Array(_) => unreachable!("an array primary key is rejected at CREATE TABLE"),
+            Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
+        }
+    }
+    k
 }
 
 /// A row's UNIQUENESS PROBE KEY for one unique index (spec/design/indexes.md §8): the §3
@@ -14300,6 +15041,109 @@ fn parse_bool_literal(s: &str) -> Result<bool> {
             SqlState::InvalidTextRepresentation,
             format!("invalid input syntax for type boolean: \"{s}\""),
         )),
+    }
+}
+
+/// A resolved `ON CONFLICT` clause (spec/design/upsert.md), built by `resolve_on_conflict`.
+struct ConflictPlan {
+    /// The arbiter constraint whose violation triggers the action. `None` only with
+    /// `DoNothing` (any uniqueness conflict is then skipped).
+    arbiter: Option<Arbiter>,
+    action: ConflictActionPlan,
+}
+
+/// Which uniqueness constraint an `ON CONFLICT` arbitrates (spec/design/upsert.md §2).
+enum Arbiter {
+    /// The primary key — the arbiter key is the storage key.
+    PrimaryKey,
+    /// A unique index, by position in the table's `indexes` list.
+    Index(usize),
+}
+
+/// The resolved `ON CONFLICT` action (spec/design/upsert.md §5).
+enum ConflictActionPlan {
+    DoNothing,
+    DoUpdate {
+        assignments: Vec<AssignPlan>,
+        filter: Option<RExpr>,
+    },
+}
+
+/// Resolve an `ON CONFLICT` target into an `Arbiter` (spec/design/upsert.md §2): a column list is
+/// matched as an order-independent SET against a unique index / the primary key (no match →
+/// 42P10); `ON CONSTRAINT name` names a unique index or the synthesized `<table>_pkey` (miss →
+/// 42704). `None` target → `None` arbiter (legal only with `DO NOTHING`).
+fn resolve_arbiter(tdef: &Table, target: Option<&ConflictTarget>) -> Result<Option<Arbiter>> {
+    let target = match target {
+        None => return Ok(None),
+        Some(t) => t,
+    };
+    let pk = tdef.pk_indices();
+    match target {
+        ConflictTarget::Columns(cols) => {
+            let mut want = std::collections::BTreeSet::new();
+            for c in cols {
+                want.insert(col_idx(tdef, c)?); // unknown column → 42703
+            }
+            if !pk.is_empty()
+                && pk
+                    .iter()
+                    .copied()
+                    .collect::<std::collections::BTreeSet<_>>()
+                    == want
+            {
+                return Ok(Some(Arbiter::PrimaryKey));
+            }
+            for (i, def) in tdef.indexes.iter().enumerate() {
+                if def.unique
+                    && def
+                        .columns
+                        .iter()
+                        .copied()
+                        .collect::<std::collections::BTreeSet<_>>()
+                        == want
+                {
+                    return Ok(Some(Arbiter::Index(i)));
+                }
+            }
+            Err(EngineError::new(
+                SqlState::InvalidColumnReference,
+                "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+            ))
+        }
+        ConflictTarget::Constraint(name) => {
+            let pkey = format!("{}_pkey", tdef.name.to_ascii_lowercase());
+            if !pk.is_empty() && name.eq_ignore_ascii_case(&pkey) {
+                return Ok(Some(Arbiter::PrimaryKey));
+            }
+            if let Some(i) = tdef
+                .indexes
+                .iter()
+                .position(|d| d.unique && d.name.eq_ignore_ascii_case(name))
+            {
+                return Ok(Some(Arbiter::Index(i)));
+            }
+            Err(EngineError::new(
+                SqlState::UndefinedObject,
+                format!("constraint {} for table {} does not exist", name, tdef.name),
+            ))
+        }
+    }
+}
+
+/// The arbiter key of a candidate row (spec/design/upsert.md §3): the storage key for a PK
+/// arbiter (never NULL), or the unique-index prefix for an index arbiter (`None` when a nullable
+/// arbiter column is NULL — NULLS DISTINCT, so the row never conflicts).
+fn arbiter_key(
+    arb: &Arbiter,
+    pk: &[(usize, ScalarType)],
+    columns: &[Column],
+    indexes: &[IndexDef],
+    row: &Row,
+) -> Option<Vec<u8>> {
+    match arb {
+        Arbiter::PrimaryKey => Some(encode_pk_key(pk, row)),
+        Arbiter::Index(i) => index_prefix_key(columns, &indexes[*i], row),
     }
 }
 

@@ -1,0 +1,171 @@
+# INSERT ... ON CONFLICT — UPSERT (spec/design/upsert.md, grammar.md §46). A candidate row
+# that would violate a UNIQUE/PRIMARY KEY constraint takes the conflict action instead of
+# trapping 23505: DO NOTHING skips it; DO UPDATE updates the existing conflicting row, with the
+# proposed row exposed as `excluded`. Arbiter inference / ON CONSTRAINT, the 21000 second-affect
+# rule, and non-arbiter 23505 are all probed against PostgreSQL.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.unique, dml.insert, dml.insert_multi_row, dml.insert_column_list, dml.insert_select, dml.insert_on_conflict, dml.returning, query.select, query.order_by, query.where_eq, types.i32, expr.arithmetic
+
+statement ok
+CREATE TABLE onc1 (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO onc1 VALUES (1, 10), (2, 20)
+
+# DO NOTHING (no target) skips a primary-key conflict.
+statement ok
+INSERT INTO onc1 VALUES (1, 99) ON CONFLICT DO NOTHING
+
+query II nosort
+SELECT id, v FROM onc1 ORDER BY id
+----
+1
+10
+2
+20
+
+# DO NOTHING over a multi-row batch: the conflicting row is skipped, the new row inserted.
+statement ok
+INSERT INTO onc1 VALUES (1, 99), (3, 30) ON CONFLICT DO NOTHING
+
+query II nosort
+SELECT id, v FROM onc1 ORDER BY id
+----
+1
+10
+2
+20
+3
+30
+
+# DO UPDATE with `excluded` — overwrite the existing row's v with the proposed value.
+statement ok
+INSERT INTO onc1 VALUES (1, 100) ON CONFLICT (id) DO UPDATE SET v = excluded.v
+
+query I nosort
+SELECT v FROM onc1 WHERE id = 1
+----
+100
+
+# DO UPDATE referencing BOTH the existing row (bare/qualified) and the proposed row (excluded).
+statement ok
+INSERT INTO onc1 VALUES (1, 5) ON CONFLICT (id) DO UPDATE SET v = onc1.v + excluded.v
+
+query I nosort
+SELECT v FROM onc1 WHERE id = 1
+----
+105
+
+# DO UPDATE ... WHERE false → the existing row is left unchanged.
+statement ok
+INSERT INTO onc1 VALUES (2, 777) ON CONFLICT (id) DO UPDATE SET v = excluded.v WHERE false
+
+query I nosort
+SELECT v FROM onc1 WHERE id = 2
+----
+20
+
+# DO NOTHING with two proposed rows sharing the arbiter key: the first wins, the second skips.
+statement ok
+INSERT INTO onc1 VALUES (7, 1), (7, 2) ON CONFLICT (id) DO NOTHING
+
+query I nosort
+SELECT v FROM onc1 WHERE id = 7
+----
+1
+
+# 21000 — DO UPDATE cannot affect a row twice: two proposed rows with the same arbiter key.
+statement error 21000
+INSERT INTO onc1 VALUES (8, 1), (8, 2) ON CONFLICT (id) DO UPDATE SET v = excluded.v
+
+# 21000 — also when both proposed rows would update the same existing row.
+statement error 21000
+INSERT INTO onc1 VALUES (1, 1), (1, 2) ON CONFLICT (id) DO UPDATE SET v = excluded.v
+
+# 42601 — DO UPDATE requires a conflict target.
+statement error 42601
+INSERT INTO onc1 VALUES (1, 0) ON CONFLICT DO UPDATE SET v = excluded.v
+
+# RETURNING over a mix of an updated row (id 1) and an inserted row (id 9): the affected rows.
+query II rowsort
+INSERT INTO onc1 VALUES (1, 1), (9, 90) ON CONFLICT (id) DO UPDATE SET v = onc1.v + excluded.v RETURNING id, v
+----
+1
+106
+9
+90
+
+# A row skipped by DO NOTHING contributes nothing to RETURNING (only the new row 11 returns).
+query II rowsort
+INSERT INTO onc1 VALUES (1, 0), (11, 110) ON CONFLICT (id) DO NOTHING RETURNING id, v
+----
+11
+110
+
+statement ok
+DROP TABLE onc1
+
+# A unique constraint (not the PK) as the arbiter; a non-arbiter conflict still traps 23505.
+# (The unique column is integer — a text unique key is a separate 0A000 narrowing, indexes.md §1.)
+statement ok
+CREATE TABLE onc2 (id i32 PRIMARY KEY, code i32 UNIQUE, v i32)
+
+statement ok
+INSERT INTO onc2 VALUES (1, 100, 10), (2, 200, 20)
+
+# Arbiter is the code unique index: the existing row with that code is updated.
+statement ok
+INSERT INTO onc2 (id, code, v) VALUES (3, 100, 30) ON CONFLICT (code) DO UPDATE SET v = excluded.v
+
+query II nosort
+SELECT v, code FROM onc2 WHERE code = 100
+----
+30
+100
+
+# ON CONFLICT (id) DO UPDATE — a conflict on the NON-arbiter code constraint still traps 23505.
+statement error 23505
+INSERT INTO onc2 VALUES (4, 200, 40) ON CONFLICT (id) DO UPDATE SET v = excluded.v
+
+# ON CONFLICT (id) DO NOTHING — a non-arbiter (code) conflict still traps 23505 (not a skip).
+statement error 23505
+INSERT INTO onc2 VALUES (5, 100, 50) ON CONFLICT (id) DO NOTHING
+
+# ON CONSTRAINT names the unique index by name.
+statement ok
+INSERT INTO onc2 VALUES (9, 100, 999) ON CONFLICT ON CONSTRAINT onc2_code_key DO NOTHING
+
+# ON CONSTRAINT names the synthesized primary-key constraint <table>_pkey.
+statement ok
+INSERT INTO onc2 VALUES (1, 777, 0) ON CONFLICT ON CONSTRAINT onc2_pkey DO NOTHING
+
+# 42704 — ON CONSTRAINT names no unique constraint.
+statement error 42704
+INSERT INTO onc2 VALUES (1, 888, 0) ON CONFLICT ON CONSTRAINT nope DO NOTHING
+
+# 42P10 — a column-list target matches no unique index / primary key.
+statement error 42P10
+INSERT INTO onc2 VALUES (1, 888, 0) ON CONFLICT (v) DO UPDATE SET v = excluded.v
+
+statement ok
+DROP TABLE onc2
+
+# Index inference matches by column SET — order-independent (ON CONFLICT (b, a) vs UNIQUE (a, b)).
+statement ok
+CREATE TABLE onc3 (a i32, b i32, v i32, UNIQUE (a, b))
+
+statement ok
+INSERT INTO onc3 VALUES (1, 2, 10)
+
+statement ok
+INSERT INTO onc3 VALUES (1, 2, 99) ON CONFLICT (b, a) DO UPDATE SET v = excluded.v
+
+query III nosort
+SELECT a, b, v FROM onc3 ORDER BY a, b
+----
+1
+2
+99
+
+statement ok
+DROP TABLE onc3
