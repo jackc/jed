@@ -27,6 +27,13 @@ Each doc explains *why* a decision was made and points at the **data** that enco
 - [encoding.md](encoding.md) — order-preserving key encoding: the `int-be-signflip` rule,
   the nullable presence tag (NULLs-last, the PostgreSQL model), composition, and descending
   order.
+- [collation.md](collation.md) — linguistic collation (design only): a jed-owned UCA executor
+  + compiler with **no tables vendored in the binary** — collations are a first-class **portable
+  artifact** (extract from the host / compile / save / open / import-export), **baked into the
+  database file** by default (so a collated index can never drift/corrupt across machines/versions)
+  with a name+hash **reference mode** opt-out, and an optional **provenance description**; the
+  per-database default collation, sort-key key encoding, deterministic-vs-nondeterministic
+  collations, and the slice plan.
 - [storage.md](storage.md) — the storage seam: block interface, page model, and the
   root-pointer-swap commit model (CLAUDE.md §3/§9).
 - [hosts.md](hosts.md) — the formal storage-host (`BlockStore`) interface: the five-method

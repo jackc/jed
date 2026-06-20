@@ -539,7 +539,12 @@ golden. A text value too large to fit a node (its key cannot spill to overflow) 
   **concatenation `||`**, and **`LIKE`** — separate slices; this slice is comparison + storage
   only (`= < > <= >=`, `IS [NOT] DISTINCT FROM`).
 - **Multi-collation / ICU** — a second collation, a per-column collation field in the catalog
-  (the on-disk format reserves room for it — format.md), and `COLLATE` clauses.
+  (the on-disk format reserves room for it — format.md), a per-database default collation, and
+  `COLLATE` clauses. **Design ratified** in [collation.md](collation.md): a jed-owned UCA
+  executor + compiler with **no tables vendored in the binary** — collations are explicitly
+  loaded from the host or a definition and **baked into the database file** by default (so a
+  collated index can never drift/corrupt across machines or jed versions), with a name+hash
+  **reference mode** opt-out; deterministic collations first.
 
 **Practical size note.** A text value is unbounded by type, but a single stored value (or row)
 larger than one page trips the existing whole-image `feature_not_supported` (`0A000`) narrowing
