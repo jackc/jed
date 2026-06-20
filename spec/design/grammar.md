@@ -2161,8 +2161,7 @@ Full behavior, the arbiter model, the `21000` rule, cost, and the PG divergences
 `expr COLLATE "name"` is PostgreSQL's postfix collation operator: it yields the same value with an
 **explicit** collation for the surrounding comparison / sort ([collation.md](collation.md) §1). A
 collation must be **loaded** first (the host `db.ImportCollation`, or the corpus
-`# load-collation:` directive — slice 1c is in-memory only); `"C"` is the built-in byte /
-code-point order and is always available.
+`# load-collation:` directive); `"C"` is the built-in byte / code-point order and is always available.
 
 **Precedence — the postfix / typecast rung.** COLLATE binds at the **same level as `::` / `[]` /
 `.field`** ([grammar.ebnf](../grammar/grammar.ebnf) `postfix`), so it is **tighter than `||` and the
@@ -2179,13 +2178,22 @@ identifier anywhere else is a `42601` syntax error.
 
 **`ORDER BY col COLLATE "name"`.** A sort key may carry an explicit COLLATE between the column and
 the `ASC`/`DESC` direction ([grammar.ebnf](../grammar/grammar.ebnf) `sort_key`). The key is then
-ordered by that collation's UCA sort key.
+ordered by that collation's UCA sort key; **absent the clause, the key inherits the column's frozen
+collation** (slice 1d — so `ORDER BY name` over an `en-US` column sorts by en-US).
+
+**`COLLATE "name"` as a column constraint (slice 1d).** `CREATE TABLE` accepts a `COLLATE "name"`
+column modifier (`name text COLLATE "en-US"`, [grammar.ebnf](../grammar/grammar.ebnf)
+`column_constraint`) — text-only (else `42804`), the name loaded or `"C"` (else `42704`). The
+**effective** collation is frozen into the column at create (an explicit clause, else the per-database
+default as of creation, [collation.md](collation.md) §1/§5) and becomes the column's **implicit**
+collation in the derivation below.
 
 **Resolution / errors** ([collation.md](collation.md) §1/§7): applying COLLATE to a non-text
-expression is `42804` (`datatype_mismatch`); naming an unloaded collation is `42704`
+expression/column is `42804` (`datatype_mismatch`); naming an unloaded collation is `42704`
 (`undefined_object`); combining two **different explicit** collations in one comparison is `42P21`
-(`collation_mismatch`). (PG's `42P22` `indeterminate_collation` — conflicting *implicit* collations
-— is unreachable until per-column collations land at slice 1d, since every column is implicitly `C`
-this slice.) A non-`C` collation orders only the **ordering** comparisons (`< <= > >=`) and
-`ORDER BY` by its sort key; `=`/`<>` stay byte-equality (deterministic-collation equality is
-byte-identity — [collation.md](collation.md) §7).
+(`collation_mismatch`); combining two **different implicit** collations (two columns with different
+collations — `C` counts as a distinct one) with no explicit COLLATE is `42P22`
+(`indeterminate_collation`, slice 1d), resolved by adding an explicit COLLATE. The conflict is
+derived for **all** comparison ops including `=`/`<>` (PG raises it regardless). A non-`C` collation
+orders only the **ordering** comparisons (`< <= > >=`) and `ORDER BY` by its sort key; `=`/`<>` stay
+byte-equality (deterministic-collation equality is byte-identity — [collation.md](collation.md) §7).

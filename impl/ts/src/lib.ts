@@ -253,6 +253,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704, non-text
   // COLLATE 42804; the `collate` cost unit. In-memory only (no persistence yet).
   "expr.collate",
+  // Per-column COLLATE in CREATE TABLE (collation slice 1d, spec/design/collation.md §1/§5): a
+  // column's effective collation is frozen at create (text-only 42804, loaded-or-C name 42704) and is
+  // its IMPLICIT collation — ORDER BY / comparisons use it with no explicit COLLATE; two different
+  // implicit collations conflict 42P22. Persisted via format_version 17 (goldens, not corpus).
+  "ddl.collate_column",
   "types.i16",
   "types.i32",
   "types.i64",
