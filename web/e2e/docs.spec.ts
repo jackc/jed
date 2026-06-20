@@ -16,6 +16,16 @@ test('the types page shows the integer overflow trap (22003)', async ({ page }) 
 	await expect(overflowPanel.getByTestId('error-code')).toHaveText('22003');
 });
 
+test('the types page autoruns the boolean ⇄ i32 cast demo', async ({ page }) => {
+	await page.goto('/docs/sql/types/');
+	// Third panel = the boolean⇄i32 cast demo: true→1, false→0, 0→false, -5→true.
+	const boolCastPanel = page.getByTestId('live-sql').nth(2);
+	const rows = boolCastPanel.getByTestId('result-rows');
+	await expect(rows).toContainText('1');
+	await expect(rows).toContainText('false');
+	await expect(rows).toContainText('true');
+});
+
 test('the tables page enforces a CHECK constraint live and resets to seed', async ({ page }) => {
 	await page.goto('/docs/sql/tables/');
 	const panel = page.getByTestId('live-sql');

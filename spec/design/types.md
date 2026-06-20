@@ -43,7 +43,7 @@ column (`storable = true` in [../types/scalars.toml](../types/scalars.toml)) —
 t(flag boolean)`, INSERT/store/retrieve, `boolean × boolean` comparison and `ORDER BY` all work
 (§9); a boolean **PRIMARY KEY**/index is **supported** — its fixed-width `bool-byte` key encoding
 is exercised (§9, [encoding.md §2.9](encoding.md)), making boolean the second non-integer key type
-after uuid — while `CAST(x AS boolean)` and boolean⇄integer casts stay deferred `0A000` (§9, §10).
+after uuid; `boolean ⇄ i32` casts have since landed (both explicit, the only PG widths — §9, §10).
 **`decimal`** (aliases `numeric`, `dec`)
 is the third storable non-integer scalar — an exact base-10 numeric (§12,
 [decimal.md](decimal.md)); its landing **binds the decimal-rounding decision** of CLAUDE.md §8
@@ -388,10 +388,16 @@ extends to boolean unchanged, and the bytes are pinned by the `bool_pk_table.jed
 rarely a *useful* PK, but it is well-defined and supported — strictness over special-casing.) One
 narrowing remains, relaxable and mirroring text:
 
-- **boolean casts** — `CAST(x AS boolean)` and boolean⇄integer casts are rejected `0A000` /
-  `42804` (not in the cast matrix — §5, [../types/casts.toml](../types/casts.toml)). PostgreSQL's
-  boolean↔integer casts are asymmetric, so they are authored deliberately in a later cast slice
-  rather than falling out of making boolean storable.
+- **boolean⇄i32 casts** — ✅ landed (the boolean cast slice, [../types/casts.toml](../types/casts.toml)).
+  PostgreSQL ties the boolean↔integer cast to `int4` **only** and makes both directions **explicit**,
+  so jed admits exactly `boolean → i32` (`CAST(true AS int)` → `1`, `false` → `0`) and `i32 → boolean`
+  (`0` → `false`, any **nonzero** including negative → `true`); `NULL` → `NULL` either way. There is no
+  `bool⇄i16` / `bool⇄i64` cast (PG has none — `true::smallint`, `1::bigint::boolean` error), so those
+  pairs are forbidden: jed reports `42804` (`cannot cast boolean to i16` / `cannot cast i64 to
+  boolean`) where PG reports `42846` — a documented divergence, jed's standing convention for a
+  forbidden cast pair. The cast is **explicit-only** (neither implicit nor assignment): `INSERT INTO
+  int_col VALUES (true)` and `int_col = true` stay `42804`. A string-literal `'t'::boolean` /
+  `BOOLEAN 'true'` is the separate string-literal coercion (§5), unaffected.
 
 **Rendering.** A boolean renders in the conformance corpus as the literal text `true` or
 `false`, and a NULL boolean as `NULL`, under a new render tag `B`
@@ -425,8 +431,9 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   `boolean × boolean` comparison + `ORDER BY`. **boolean in a key / PRIMARY KEY** — ✅ has since
   landed (§9): the `bool-byte` key encoding is exercised (the second non-integer key after uuid),
   with boolean key byte-fixtures (`encoding/integers.toml`) and the `bool_pk_table.jed` golden.
-  One sub-feature remains deferred: **boolean⇄integer casts** (rejected; PG's are asymmetric, so a
-  dedicated cast slice — §5, casts.toml).
+  **boolean⇄i32 casts** — ✅ has since landed (§9): `boolean → i32` and `i32 → boolean`, both
+  explicit, the only widths PG ships (a `bool⇄i16`/`bool⇄i64` pair is `42804`, a documented PG-`42846`
+  divergence — §5, casts.toml).
 - **`IS [NOT] DISTINCT FROM`** — ✅ authored (NULL-safe equality; functions.md §3), now
   overloaded over the integer, text, and boolean families (§4).
 - **`boolean × boolean` comparability** — ✅ landed (§4, §9): comparing two booleans

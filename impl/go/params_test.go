@@ -227,14 +227,12 @@ func TestParamCastToDeferredTargetIs0A000(t *testing.T) {
 }
 
 func TestCastOperatorInheritsDeferralsAndRejectsLoneColon(t *testing.T) {
-	// `::` desugars to CAST, so casting a non-string-literal value to text/boolean is the same
-	// deferred 0A000 narrowing the CAST spelling carries.
+	// `::` desugars to CAST, so casting a non-string-literal value to text is the same deferred
+	// 0A000 narrowing the CAST spelling carries. The boolean cast has since landed — `5::boolean`
+	// is now valid (→ true; cast_bool_int_test.go).
 	db := dbWith(t, "CREATE TABLE t (id i32 PRIMARY KEY)")
 	if c := paramErrCode(t, db, "SELECT 5::text"); c != "0A000" {
 		t.Fatalf("5::text code = %s want 0A000", c)
-	}
-	if c := paramErrCode(t, db, "SELECT 5::boolean"); c != "0A000" {
-		t.Fatalf("5::boolean code = %s want 0A000", c)
 	}
 	// A lone `:` is not part of jed's surface — a 42601 syntax error from the lexer.
 	if c := paramErrCode(t, db, "SELECT 1 : 2"); c != "42601" {

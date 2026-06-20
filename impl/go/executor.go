@@ -12972,12 +12972,9 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if target.IsText() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to text is not supported yet")
 		}
-		// Boolean casts are likewise deferred (boolean⇄integer is a later cast slice —
-		// spec/types/casts.toml): casting TO boolean is a 0A000 this slice. Without this
-		// guard resolveTypeAndTypmod now returns boolean, so it must be caught here.
-		if target.IsBool() {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to boolean is not supported yet")
-		}
+		// A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
+		// (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 /
+		// NULL / bool source is castable), so it is handled AFTER the inner is resolved, below.
 		// bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
 		if target.IsBytea() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to bytea is not supported yet")
@@ -13007,12 +13004,37 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if e.Cast.Inner.Kind == ExprParam {
 			t := target
 			innerCtx = &t
+		} else if target.IsBool() {
+			// A boolean target accepts only an i32 source (the boolean cast slice): an untyped
+			// integer literal operand adapts to i32 (CAST(5 AS boolean) / 5::boolean), matching PG.
+			// A column/expression keeps its own type; a literal beyond i32 range then traps 22003
+			// (PG 42846 — a documented divergence).
+			t := Int32
+			innerCtx = &t
 		}
 		inner, ity, err := resolve(s, e.Cast.Inner, innerCtx, ag, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		// The boolean cast slice (spec/types/casts.toml, types.md §9): PG ties boolean↔integer to i32
+		// ONLY and makes both directions explicit. A boolean TARGET takes an i32 / NULL / bool source
+		// (the eval maps 0→false, nonzero→true); a boolean SOURCE produces an i32 (true→1, false→0).
+		// Both are handled here, ahead of the generic numeric cast below — resultRt assumes an
+		// int/decimal/float target, so a boolean target must not fall through. A bool⇄i16 / bool⇄i64
+		// pair is a forbidden 42804 (jed's datatype-mismatch convention; PG reports 42846, casts.toml).
+		if target.IsBool() {
+			if (ity.kind == rtInt && ity.intTy == Int32) || ity.kind == rtNull || ity.kind == rtBool {
+				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod},
+					resolvedType{kind: rtBool}, nil
+			}
+			return nil, resolvedType{}, typeError("cannot cast " + rtName(ity) + " to boolean")
+		}
 		if ity.kind == rtBool {
+			// boolean → i32 is the one boolean-source cast; any other target is forbidden (42804).
+			if target == Int32 {
+				return &rExpr{kind: reCast, operand: inner, result: target, typmod: typmod},
+					resolvedType{kind: rtInt, intTy: Int32}, nil
+			}
 			return nil, resolvedType{}, typeError("cannot cast boolean to " + target.CanonicalName())
 		}
 		// Casting FROM text is likewise deferred (0A000).
@@ -15813,7 +15835,24 @@ func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
 func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) {
+	if v.Kind == ValBool {
+		// boolean → boolean is the identity cast (`x::boolean` on a boolean).
+		if target.IsBool() {
+			return v, nil
+		}
+		// boolean → i32 (the boolean cast slice, casts.toml): true → 1, false → 0. The resolver
+		// guarantees the only non-bool target is i32.
+		if v.Bool {
+			return IntValue(1), nil
+		}
+		return IntValue(0), nil
+	}
 	if v.Kind == ValInt {
+		// i32 → boolean (the boolean cast slice, casts.toml): 0 → false, any nonzero (incl. negative)
+		// → true. The resolver guarantees the source is i32, so v.Int is already in i32 range.
+		if target.IsBool() {
+			return BoolValue(v.Int != 0), nil
+		}
 		// int -> float (explicit, lossy; nearest binary, ties-to-even; never traps — float.md §6).
 		if target.IsFloat32() {
 			return Float32Value(intToFloat32(v.Int)), nil

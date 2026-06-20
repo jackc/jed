@@ -272,11 +272,11 @@ fn param_cast_to_deferred_target_is_0a000() {
 
 #[test]
 fn cast_operator_inherits_deferred_narrowings_and_rejects_lone_colon() {
-    // `::` desugars to CAST, so casting a non-string-literal value to text/boolean is the same
-    // deferred 0A000 narrowing the CAST spelling carries (a documented PG divergence).
+    // `::` desugars to CAST, so casting a non-string-literal value to text is the same deferred
+    // 0A000 narrowing the CAST spelling carries (a documented PG divergence). The boolean cast has
+    // since landed — `5::boolean` is now valid (→ true; tests/cast_bool_int.rs).
     let mut db = db_with(&["CREATE TABLE t (id i32 PRIMARY KEY)"]);
     assert_eq!(err_code(&mut db, "SELECT 5::text", &[]), "0A000");
-    assert_eq!(err_code(&mut db, "SELECT 5::boolean", &[]), "0A000");
     // A lone `:` is not part of jed's surface — a 42601 syntax error from the lexer.
     assert_eq!(err_code(&mut db, "SELECT 1 : 2", &[]), "42601");
 }

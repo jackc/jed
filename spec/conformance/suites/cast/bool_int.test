@@ -1,0 +1,126 @@
+# boolean ⇄ i32 casts (the boolean cast slice — spec/types/casts.toml, spec/design/types.md §9).
+# PostgreSQL ties the boolean↔integer cast to int4 ONLY and makes both directions EXPLICIT, so jed
+# admits exactly two pairs: boolean → i32 (true → 1, false → 0) and i32 → boolean (0 → false, any
+# NONZERO incl. negative → true). NULL → NULL either way; boolean → boolean is the identity. An
+# integer LITERAL operand of a boolean target adapts to i32 (CAST(5 AS boolean) / 5::boolean),
+# matching PG. The forbidden bool⇄i16 / bool⇄i64 pairs (jed 42804, PG 42846) are a documented
+# divergence and live in the per-core unit tests, not this oracle corpus.
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, types.i32, types.boolean, types.boolean_storable, cast.explicit, cast.operator, cast.bool_int, expr.arithmetic, error.overflow_trap
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, n i32, flag boolean)
+
+statement ok
+INSERT INTO t VALUES (1, 0, TRUE), (2, 1, FALSE), (3, -5, NULL), (4, 100, TRUE)
+
+# --- boolean → i32: true → 1, false → 0, NULL → NULL. The `# types:` directive pins the result
+# width at i32 (all integer widths render under `I`, so this is invisible on rows alone).
+# types: i32
+query I nosort
+SELECT CAST(flag AS i32) FROM t WHERE id = 1
+----
+1
+
+# the `::` operator spelling is the same cast
+# types: i32
+query I nosort
+SELECT flag::int FROM t WHERE id = 2
+----
+0
+
+# a NULL boolean casts to a NULL i32
+query I nosort
+SELECT CAST(flag AS i32) FROM t WHERE id = 3
+----
+NULL
+
+# a bool→i32 result is an ordinary i32 — usable in arithmetic
+# types: i32
+query I nosort
+SELECT flag::int + 10 FROM t WHERE id = 1
+----
+11
+
+# --- i32 → boolean: 0 → false, any nonzero (incl. negative) → true, NULL → NULL.
+query B nosort
+SELECT CAST(n AS boolean) FROM t WHERE id = 1
+----
+false
+
+query B nosort
+SELECT n::boolean FROM t WHERE id = 2
+----
+true
+
+# a negative nonzero is true
+query B nosort
+SELECT CAST(n AS boolean) FROM t WHERE id = 3
+----
+true
+
+query B nosort
+SELECT n::boolean FROM t WHERE id = 4
+----
+true
+
+# i32 → boolean in a WHERE predicate: keeps the rows whose n is nonzero (id 2,3,4; id 1 has n=0)
+query I rowsort
+SELECT id FROM t WHERE CAST(n AS boolean)
+----
+2
+3
+4
+
+# boolean → boolean is the identity cast
+query B nosort
+SELECT flag::boolean FROM t WHERE id = 2
+----
+false
+
+# --- literal forms (FROM-less). A bare integer literal operand of a boolean target adapts to i32.
+# types: i32
+query I nosort
+SELECT CAST(TRUE AS int)
+----
+1
+
+# types: i32
+query I nosort
+SELECT FALSE::int
+----
+0
+
+query B nosort
+SELECT CAST(0 AS boolean)
+----
+false
+
+query B nosort
+SELECT 5::boolean
+----
+true
+
+# a negative literal casts to true
+query B nosort
+SELECT CAST(-1 AS boolean)
+----
+true
+
+# a NULL literal cast to boolean is NULL
+query B nosort
+SELECT CAST(NULL AS boolean)
+----
+NULL
+
+# --- chained casts compose the two directions
+query B nosort
+SELECT TRUE::int::boolean
+----
+true
+
+# types: i32
+query I nosort
+SELECT 7::boolean::int
+----
+1

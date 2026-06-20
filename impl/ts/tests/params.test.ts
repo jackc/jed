@@ -152,11 +152,11 @@ test("param cast to a deferred target is 0A000", () => {
 });
 
 test(":: inherits deferred narrowings and rejects a lone colon", () => {
-  // `::` desugars to CAST, so casting a non-string-literal value to text/boolean is the same
-  // deferred 0A000 narrowing the CAST spelling carries.
+  // `::` desugars to CAST, so casting a non-string-literal value to text is the same deferred
+  // 0A000 narrowing the CAST spelling carries. The boolean cast has since landed — `5::boolean`
+  // is now valid (→ true; cast_bool_int.test.ts).
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
   assert.equal(paramErrCode(db, "SELECT 5::text", []), "0A000");
-  assert.equal(paramErrCode(db, "SELECT 5::boolean", []), "0A000");
   // A lone `:` is not part of jed's surface — a 42601 syntax error from the lexer.
   assert.equal(paramErrCode(db, "SELECT 1 : 2", []), "42601");
 });

@@ -469,6 +469,10 @@ id = "cast.operator"
 description = "PostgreSQL's postfix `::` cast operator — `expr :: type` is exactly `CAST(expr AS type)` (spec/design/grammar.md §37): same cast matrix, string-literal coercion, deferred narrowings, typmod, and resolve codes. Chains left-associatively (`x::int8::int2`); binds tighter than unary minus (`-32768::i16` traps 22003, `(-32768)::i16` is in range); a lone `:` is 42601"
 
 [[capability]]
+id = "cast.bool_int"
+description = "boolean ⇄ i32 casts (the boolean cast slice — spec/types/casts.toml, spec/design/types.md §9). PostgreSQL ties the boolean↔integer cast to int4 ONLY and makes both directions EXPLICIT, so jed admits exactly two pairs: boolean → i32 (CAST(true AS int) → 1, false → 0) and i32 → boolean (0 → false, any NONZERO including negative → true); NULL → NULL either way, and boolean → boolean is the identity. An integer LITERAL operand of a boolean target adapts to i32 (CAST(5 AS boolean) / 5::boolean), matching PG (a bare 5 is int4); a literal beyond i32 range then traps 22003 (PG 42846 — a documented divergence). The cast is explicit-only (neither implicit nor assignment): INSERT INTO int_col VALUES (true) and int_col = true stay 42804. There is NO bool⇄i16 / bool⇄i64 cast (PG has none): those forbidden pairs are 42804 (cannot cast boolean to i16 / cannot cast i64 to boolean) where PG reports 42846 — jed's standing convention for a forbidden cast pair, covered by the per-core unit tests, not this oracle corpus. A string-literal 't'::boolean / BOOLEAN 'true' is the separate cast.string_literal coercion, unaffected. Builds on cast.explicit and types.boolean_storable"
+
+[[capability]]
 id = "compare.promotion"
 description = "Cross-type integer comparison via the promotion tower (i16<i32<i64)"
 

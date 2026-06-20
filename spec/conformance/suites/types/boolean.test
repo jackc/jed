@@ -3,9 +3,9 @@
 # three-valued logic. A boolean renders as the canonical `true`/`false` under the `B` tag,
 # and a NULL/unknown boolean as `NULL`. boolean is ALSO a KEY type — a boolean PRIMARY KEY /
 # index uses the `bool-byte` key encoding (the second non-integer key after uuid; encoding.md
-# §2.9), exercised below. CAST(x AS boolean) stays deferred (0A000), a documented narrowing.
-# Format + the `requires` gate: ../../../design/conformance.md.
-# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.boolean, types.boolean_storable, resource.cost_metering
+# §2.9), exercised below. boolean ⇄ i32 casts have landed (cast/bool_int.test); a smoke check is
+# at the end. Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.boolean, types.boolean_storable, cast.bool_int, resource.cost_metering
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, flag boolean)
@@ -198,6 +198,9 @@ true
 2
 false
 
-# casting TO boolean is deferred this slice (documented narrowing): 0A000
-statement error 0A000
+# boolean ⇄ i32 casts have landed (the boolean cast slice — types.md §9, full coverage in
+# cast/bool_int.test): i32 → boolean maps 0 → false, nonzero → true (id = 1 → true).
+query B nosort
 SELECT CAST(id AS boolean) FROM t WHERE id = 1
+----
+true

@@ -11790,15 +11790,9 @@ function resolve(
           "casting to text is not supported yet",
         );
       }
-      // Boolean casts are likewise deferred (boolean⇄integer is a later cast slice —
-      // spec/types/casts.toml): casting TO boolean is a 0A000 this slice. Without this guard
-      // resolveTypeAndTypmod now returns boolean, so it must be caught here.
-      if (isBool(target)) {
-        throw engineError(
-          "feature_not_supported",
-          "casting to boolean is not supported yet",
-        );
-      }
+      // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
+      // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 / NULL
+      // / bool source is castable), so it is handled AFTER the inner is resolved, below.
       // bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
       if (isBytea(target)) {
         throw engineError(
@@ -11839,9 +11833,40 @@ function resolve(
       // (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
       // context (its value is range-checked / coerced against target at eval), so changing the
       // context only for a parameter leaves all existing CAST behavior untouched.
-      const innerCtx = e.inner.kind === "param" ? target : null;
+      // A boolean target accepts only an i32 source (the boolean cast slice): an untyped integer
+      // literal operand adapts to i32 (CAST(5 AS boolean) / 5::boolean), matching PG. A column/
+      // expression keeps its own type; a literal beyond i32 range then traps 22003 (PG 42846 — a
+      // documented divergence).
+      const innerCtx =
+        e.inner.kind === "param" ? target : isBool(target) ? "i32" : null;
       const inner = resolve(scope, e.inner, innerCtx, ag, params);
+      // The boolean cast slice (spec/types/casts.toml, types.md §9): PG ties boolean↔integer to i32
+      // ONLY and makes both directions explicit. A boolean TARGET takes an i32 / NULL / bool source
+      // (the eval maps 0→false, nonzero→true); a boolean SOURCE produces an i32 (true→1, false→0).
+      // Handled here, ahead of the generic numeric cast below — resultType assumes an int/decimal/
+      // float target, so a boolean target must not fall through. A bool⇄i16 / bool⇄i64 pair is a
+      // forbidden 42804 (jed's datatype-mismatch convention; PG reports 42846, casts.toml).
+      if (isBool(target)) {
+        if (
+          (inner.type.kind === "int" && inner.type.ty === "i32") ||
+          inner.type.kind === "null" ||
+          inner.type.kind === "bool"
+        ) {
+          return {
+            node: { kind: "cast", target, typmod, operand: inner.node },
+            type: { kind: "bool" },
+          };
+        }
+        throw typeError("cannot cast " + rtName(inner.type) + " to boolean");
+      }
       if (inner.type.kind === "bool") {
+        // boolean → i32 is the one boolean-source cast; any other target is forbidden (42804).
+        if (target === "i32") {
+          return {
+            node: { kind: "cast", target, typmod, operand: inner.node },
+            type: { kind: "int", ty: "i32" },
+          };
+        }
         throw typeError("cannot cast boolean to " + canonicalName(target));
       }
       // Casting FROM text is likewise deferred (0A000).
@@ -15812,7 +15837,17 @@ function evalCast(
   target: ScalarType,
   typmod: DecimalTypmod | null,
 ): Value {
+  if (v.kind === "bool") {
+    // boolean → boolean is the identity cast (`x::boolean` on a boolean). boolean → i32 (the
+    // boolean cast slice, casts.toml): true → 1, false → 0. The resolver guarantees the only
+    // non-bool target is i32.
+    if (isBool(target)) return v;
+    return intValue(v.value ? 1n : 0n);
+  }
   if (v.kind === "int") {
+    // i32 → boolean (the boolean cast slice, casts.toml): 0 → false, any nonzero (incl. negative)
+    // → true. The resolver guarantees the source is i32, so v.int is already in i32 range.
+    if (isBool(target)) return boolValue(v.int !== 0n);
     if (isDecimal(target))
       return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
     // int → float (explicit, lossy): nearest binary representable, then fround for f32. Exact

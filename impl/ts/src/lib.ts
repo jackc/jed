@@ -245,6 +245,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The postfix `::` cast operator — `expr :: type` desugars to CAST(expr AS type), sharing
   // its whole machinery; binds tighter than unary minus (spec/design/grammar.md §37).
   "cast.operator",
+  // boolean ⇄ i32 casts (the boolean cast slice — spec/types/casts.toml, types.md §9): both
+  // directions explicit, i32 only (bool↔i16/i64 is a forbidden 42804).
+  "cast.bool_int",
   "types.i16",
   "types.i32",
   "types.i64",

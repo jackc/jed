@@ -30,10 +30,7 @@ SELECT id FROM t WHERE (a = b) = 1
 statement error 42804
 SELECT (a = b) + 1 FROM t WHERE id = 1
 
-# boolean is not a CAST target yet (casting TO boolean is deferred — types.md §9)
-statement error 0A000
-SELECT CAST(a AS boolean) FROM t WHERE id = 1
-
-# and there is no boolean -> integer cast (a forbidden pair)
-statement error 42804
-SELECT CAST(a = b AS i32) FROM t WHERE id = 1
+# boolean ⇄ i32 casts have since landed (the boolean cast slice — types.md §9, cast/bool_int.test):
+# CAST(a AS boolean) (i32→bool) and CAST(a = b AS i32) (bool→i32) are now valid, so the positive
+# cases live in cast/bool_int.test. A boolean ⇄ i16 / i64 cast is still 42804 (a jed-vs-PG-42846
+# divergence) and is covered by the per-core unit tests.

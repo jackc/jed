@@ -8,6 +8,12 @@
 
 	const overflowDemo = `SELECT CAST(32767 AS i16) + CAST(1 AS i16) AS overflows;`;
 
+	const boolCastDemo = `SELECT
+  CAST(true AS int)    AS true_to_int,
+  false::int           AS false_to_int,
+  0::boolean           AS zero_to_bool,
+  CAST(-5 AS boolean)  AS nonzero_to_bool;`;
+
 	const nullDemo = `SELECT
   (NULL = NULL)   AS eq,
   (NULL IS NULL)  AS is_null,
@@ -48,6 +54,17 @@ Integers are fixed-width (`i16`, `i32`, `i64`) and **trap on overflow** — ther
 wraparound. Adding `1` to the largest `i16` raises error `22003`:
 
 <LiveSql query={overflowDemo} rows={3} />
+
+## Boolean ⇄ integer casts
+
+Following PostgreSQL, `boolean` casts to and from `int` (`i32`) only, and always with an explicit
+`CAST` / `::` — never implicitly. `true` becomes `1` and `false` becomes `0`; an integer becomes
+`false` when it is `0` and `true` for any nonzero value (including negatives):
+
+<LiveSql query={boolCastDemo} rows={3} />
+
+Only `i32` is involved: a `boolean ⇄ i16` or `boolean ⇄ i64` cast is rejected (`42804`), matching
+PostgreSQL's choice of `int4` as the sole boolean-integer cast.
 
 ## Three-valued NULL logic
 

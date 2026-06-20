@@ -7,13 +7,18 @@
 # never silently reinterpreted (CLAUDE.md §4). Identity casts (i16->i16, ...) are
 # implicit and always succeed; they are implied and not listed.
 #
-# boolean (scalars.toml) is now a STORABLE type, but its casts are still DEFERRED to a
-# dedicated cast slice: it is NEITHER a cast source NOR a cast target here. `CAST(x AS
-# boolean)` traps 0A000 (an explicit, relaxable narrowing — like a text PRIMARY KEY),
-# and there is no boolean->integer rule, so casting a boolean value is a forbidden pair
-# (CAST-from-boolean is a 42804 datatype mismatch). PostgreSQL's boolean<->integer casts
-# are asymmetric (bool->int yes, int->bool no), so they are authored deliberately in a
-# later slice rather than falling out of making boolean storable.
+# boolean (scalars.toml) <-> i32: the boolean cast slice (the two rows at the end of this
+# file). PostgreSQL ties BOTH directions of the boolean<->integer cast to int4 ONLY and makes
+# both EXPLICIT: `true::int` -> 1 / `false::int` -> 0, and `0::int::boolean` -> false /
+# `<nonzero>::int::boolean` -> true (any nonzero, including negative). There is NO bool<->int2
+# and NO bool<->int8 cast in PG (`true::smallint` / `1::bigint::boolean` are errors), so jed
+# admits ONLY (boolean, i32) and (i32, boolean). Every other boolean<->integer pair (boolean
+# <-> i16, boolean <-> i64) is NOT in the matrix, so it is FORBIDDEN: jed reports a 42804
+# datatype mismatch (`cannot cast boolean to i16` / `cannot cast i64 to boolean`), where PG
+# reports 42846 (cannot_coerce) — a documented divergence, jed's standing convention for a
+# forbidden cast pair (per-core unit tests, not the oracle corpus). boolean is NOT implicitly
+# or assignment-castable to/from any integer (PG's contexts are `e` explicit): `INSERT INTO
+# int_col VALUES (true)` and `int_col = true` stay 42804.
 #
 # bytea and uuid (scalars.toml) are likewise NEITHER a cast source NOR a cast target here:
 # CAST(x AS bytea) / CAST(x AS uuid) trap 0A000 and casting FROM a bytea/uuid value is a
@@ -296,3 +301,19 @@ to = "decimal"
 mode = "explicit"
 on_overflow = "trap"
 overflow_error = "22003"
+
+# --- boolean <-> i32 (int4) ONLY: both directions EXPLICIT (the header block above) ----------
+# bool -> i32: true -> 1, false -> 0. Never overflows (1/0 always fit i32). i32 -> bool: 0 ->
+# false, any NONZERO (including negative) -> true. Never traps. NULL -> NULL either way. PG ties
+# both casts to int4 alone, so there is deliberately no bool<->i16 / bool<->i64 row (those pairs
+# are a forbidden 42804 — the header block). Matches PostgreSQL `pg_cast`: bool->int4 `e`,
+# int4->bool `e`.
+[[cast]]
+from = "boolean"
+to = "i32"
+mode = "explicit"
+
+[[cast]]
+from = "i32"
+to = "boolean"
+mode = "explicit"

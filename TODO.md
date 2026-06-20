@@ -131,8 +131,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         PRIMARY KEY, a composite-key member, and a secondary index — with point lookup, 23505 on a
         duplicate key, 23502 on a NULL key, and the `bool_pk_table.jed` golden + `integers.toml`
         boolean key vectors pinning the bytes cross-core.
-  - [ ] **boolean⇄integer casts** — rejected `0A000`/`42804`; PG's are asymmetric, so a dedicated
-        cast slice. _(size: S; §5)_
+  - [x] **boolean⇄i32 casts** — ✅ landed: `boolean → i32` (true→1 / false→0) and `i32 → boolean`
+        (0→false, any nonzero→true), both **explicit**, **i32 only** (PG ties the boolean↔integer cast
+        to `int4`; `NULL`→`NULL`, `bool→bool` identity). An integer literal operand of a boolean target
+        adapts to i32 (`5::boolean`). A `bool⇄i16` / `bool⇄i64` pair is a forbidden `42804` (PG `42846`
+        — a documented divergence, jed's standing forbidden-cast convention; per-core unit tests). New
+        `cast.bool_int` capability + `suites/cast/bool_int.test` (oracle-clean); no format change. →
+        [types.md §9](spec/design/types.md), [casts.toml](spec/types/casts.toml)
 - [x] **`text` + ONE collation (`C`)** — UTF-8 byte/code-point order, on-disk type code 4, first
       operator overload; the UTF-8-vs-UTF-16 ordering trap handled in TS. → [types.md §11](spec/design/types.md)
   - [x] **text in a PRIMARY KEY/index/UNIQUE** — ✅ landed: the `text-terminated-escape` key

@@ -13120,15 +13120,10 @@ fn resolve(
                     "casting to text is not supported yet",
                 ));
             }
-            // Boolean casts are likewise deferred (boolean⇄integer is a later cast slice —
-            // spec/types/casts.toml): casting TO boolean is a 0A000 this slice. Without this
-            // guard `resolve_type_and_typmod` now returns boolean, so it must be caught here.
-            if target.is_bool() {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "casting to boolean is not supported yet",
-                ));
-            }
+            // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
+            // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32
+            // / NULL / bool source is castable), so it is handled AFTER the inner is resolved, below
+            // — not guarded here.
             // bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
             if target.is_bytea() {
                 return Err(EngineError::new(
@@ -13176,10 +13171,59 @@ fn resolve(
             // the context only for a parameter leaves all existing CAST behavior untouched.
             let inner_ctx = if matches!(inner.as_ref(), Expr::Param(_)) {
                 Some(target)
+            } else if target.is_bool() {
+                // A boolean TARGET accepts only an i32 source (the boolean cast slice). An untyped
+                // integer literal operand therefore adapts to i32 — `CAST(5 AS boolean)` / `5::boolean`
+                // — matching PG (a bare `5` is int4, then int4→bool). Without this the literal would
+                // default to i64 and the i64→boolean pair is forbidden. A column/expression operand
+                // ignores this literal context and keeps its own type (an i64 column → 42804). A
+                // literal beyond i32 range then traps 22003 (PG says 42846 — a documented divergence).
+                Some(ScalarType::Int32)
             } else {
                 None
             };
             let (rinner, ity) = resolve(scope, inner, inner_ctx, agg, params)?;
+            // The boolean cast slice (spec/types/casts.toml, types.md §9): PG ties boolean↔integer to
+            // i32 ONLY and makes both directions explicit. A boolean TARGET takes an i32 / NULL / bool
+            // source (the eval maps 0→false, nonzero→true); a boolean SOURCE produces an i32 (true→1,
+            // false→0). Both are handled here, ahead of the generic numeric cast logic below — the
+            // generic `result_ty` assumes an int/decimal/float target, so a boolean target must not
+            // fall through. A bool⇄i16 / bool⇄i64 pair is a forbidden 42804 (jed's datatype-mismatch
+            // convention; PG reports 42846 — a documented divergence, casts.toml).
+            if target.is_bool() {
+                return match ity {
+                    ResolvedType::Int(ScalarType::Int32)
+                    | ResolvedType::Bool
+                    | ResolvedType::Null => Ok((
+                        RExpr::Cast {
+                            inner: Box::new(rinner),
+                            target,
+                            typmod,
+                        },
+                        ResolvedType::Bool,
+                    )),
+                    _ => Err(type_error(format!(
+                        "cannot cast {} to boolean",
+                        ity.type_name()
+                    ))),
+                };
+            }
+            if matches!(ity, ResolvedType::Bool) {
+                if target == ScalarType::Int32 {
+                    return Ok((
+                        RExpr::Cast {
+                            inner: Box::new(rinner),
+                            target,
+                            typmod,
+                        },
+                        ResolvedType::Int(ScalarType::Int32),
+                    ));
+                }
+                return Err(type_error(format!(
+                    "cannot cast boolean to {}",
+                    target.canonical_name()
+                )));
+            }
             match ity {
                 // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
                 // decimal→decimal (re-scale), and NULL are all castable. Floats add int↔float,
@@ -13189,12 +13233,8 @@ fn resolve(
                 | ResolvedType::Decimal
                 | ResolvedType::Float(_)
                 | ResolvedType::Null => {}
-                ResolvedType::Bool => {
-                    return Err(type_error(format!(
-                        "cannot cast boolean to {}",
-                        target.canonical_name()
-                    )));
-                }
+                // A boolean source is handled above (the boolean cast slice) — unreachable here.
+                ResolvedType::Bool => unreachable!("boolean cast operand handled above"),
                 // Casting FROM text is likewise deferred (0A000).
                 ResolvedType::Text => {
                     return Err(EngineError::new(
@@ -16936,7 +16976,12 @@ impl RExpr {
                 match inner.eval(row, env, m)? {
                     Value::Null => Ok(Value::Null),
                     Value::Int(n) => {
-                        if target.is_decimal() {
+                        if target.is_bool() {
+                            // i32 → boolean (the boolean cast slice, casts.toml): 0 → false, any
+                            // nonzero (incl. negative) → true. The resolver guarantees the source
+                            // is i32, so `n` is already in i32 range.
+                            Ok(Value::Bool(n != 0))
+                        } else if target.is_decimal() {
                             // int → decimal (lossless), then coerce to the typmod.
                             Ok(Value::Decimal(coerce_decimal(
                                 Decimal::from_i64(n),
@@ -16974,7 +17019,16 @@ impl RExpr {
                     // float → int / decimal / float (all explicit — spec/design/float.md §6).
                     Value::Float32(f) => cast_from_float(f as f64, *target, *typmod),
                     Value::Float64(f) => cast_from_float(f, *target, *typmod),
-                    Value::Bool(_) => unreachable!("resolver rejects a boolean cast operand"),
+                    Value::Bool(b) => {
+                        if target.is_bool() {
+                            // boolean → boolean is the identity cast (`x::boolean` on a boolean).
+                            Ok(Value::Bool(b))
+                        } else {
+                            // boolean → i32 (the boolean cast slice, casts.toml): true → 1, false →
+                            // 0. The resolver guarantees the only non-bool target is i32.
+                            Ok(Value::Int(i64::from(b)))
+                        }
+                    }
                     Value::Text(_) => unreachable!("resolver rejects a text cast operand"),
                     Value::Bytea(_) => unreachable!("resolver rejects a bytea cast operand"),
                     Value::Uuid(_) => unreachable!("resolver rejects a uuid cast operand"),
