@@ -17,7 +17,8 @@ export const DOCS_NAV: readonly DocSection[] = [
 			{ title: 'Opening a database', href: '/docs/api/opening-a-database/' },
 			{ title: 'Transactions', href: '/docs/api/transactions/' },
 			{ title: 'Running scripts', href: '/docs/api/scripts/' },
-			{ title: 'Authorization', href: '/docs/api/authorization/' }
+			{ title: 'Authorization', href: '/docs/api/authorization/' },
+			{ title: 'Resource limits', href: '/docs/api/resource-limits/' }
 		]
 	},
 	{

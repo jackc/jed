@@ -1,0 +1,38 @@
+package main
+
+import (
+	"fmt"
+	"log"
+
+	"jed"
+)
+
+func main() {
+	db, err := jed.Create("app.jed", jed.DatabaseOptions{})
+	if err != nil {
+		log.Fatal(err)
+	}
+	defer db.Close()
+
+	// Serve untrusted queries through a session bounded TWO ways:
+	//   MaxCost         — a per-STATEMENT ceiling: one runaway query aborts 54P01.
+	//   LifetimeMaxCost — a per-SESSION budget: the session's cumulative cost is capped, so a flood
+	//                     of cheap queries can't burn unbounded CPU. It aborts 54P02.
+	untrusted := db.NewSession(jed.SessionOptions{MaxCost: 10000, LifetimeMaxCost: 3})
+
+	// Each statement accrues into the session's running total; read it with LifetimeCost().
+	untrusted.ExecuteSQL(db, "SELECT 1", nil) // cost 1 — cumulative 1
+	untrusted.ExecuteSQL(db, "SELECT 1", nil) // cost 1 — cumulative 2
+
+	// The third drives the cumulative to the budget — the in-flight statement aborts 54P02, and the
+	// partial cost still counts, so the session is now spent.
+	if _, err := untrusted.ExecuteSQL(db, "SELECT 1", nil); err != nil {
+		fmt.Println("denied:", err.(*jed.EngineError).Code()) // 54P02
+	}
+	fmt.Println("spent:", untrusted.LifetimeCost()) // 3 — the budget
+
+	// Once spent, every further statement is rejected at admission — the session is done.
+	if _, err := untrusted.ExecuteSQL(db, "SELECT 1", nil); err != nil {
+		fmt.Println("admission:", err.(*jed.EngineError).Code()) // 54P02
+	}
+}
