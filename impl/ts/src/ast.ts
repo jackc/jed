@@ -104,7 +104,12 @@ export type Expr =
   // `whens` condition must be boolean. Simple form: `operand` is non-null and each branch matches
   // when `operand = cond`. `whens` has ≥1 entry; `els` is the ELSE result, or null for an implicit
   // `ELSE NULL`. Lazily evaluated: the first TRUE branch wins; result-arm types unify.
-  | { kind: "case"; operand: Expr | null; whens: { cond: Expr; result: Expr }[]; els: Expr | null }
+  | {
+      kind: "case";
+      operand: Expr | null;
+      whens: { cond: Expr; result: Expr }[];
+      els: Expr | null;
+    }
   // A function call — the shared aggregate/scalar call syntax (grammar.md §17). `name` is the
   // spelling as written, resolved case-insensitively: an aggregate (COUNT/SUM/MIN/MAX/AVG), a
   // scalar function (abs/round, kind = "function", spec/design/functions.md §9), or 42883. `star`
@@ -118,7 +123,14 @@ export type Expr =
   // `variadic` is true when the final argument was prefixed with the VARIADIC keyword
   // (num_nulls(VARIADIC arr), array-functions.md §12): the array is passed directly to a variadic
   // parameter rather than spreading individual arguments. false for every ordinary call.
-  | { kind: "funcCall"; name: string; args: Expr[]; argNames: (string | null)[]; star: boolean; variadic: boolean }
+  | {
+      kind: "funcCall";
+      name: string;
+      args: Expr[];
+      argNames: (string | null)[];
+      star: boolean;
+      variadic: boolean;
+    }
   // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26). resolve
   // plans it once against the scope chain; an uncorrelated one is then folded to a constant, a
   // correlated one is re-executed per outer row. A `$N` inside is a 0A000.
@@ -138,7 +150,13 @@ export type Expr =
   // (spec/design/array-functions.md §11.6), the subquery spelling of IN. Parallel to inSubquery: the
   // body's single column (42601 if >1) folds through the SAME three-valued fold as `quantified`.
   // Uncorrelated folds to a constant-array quantified node; correlated re-executes per outer row.
-  | { kind: "quantifiedSubquery"; op: BinaryOp; all: boolean; lhs: Expr; query: QueryExpr }
+  | {
+      kind: "quantifiedSubquery";
+      op: BinaryOp;
+      all: boolean;
+      lhs: Expr;
+      query: QueryExpr;
+    }
   // A `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Builds a row value from
   // the field expressions; `ROW(x)` is a one-field row, `ROW()` the zero-field row. The bare
   // `(a, b)` form is deferred (0A000); only the keyword form parses.
@@ -253,7 +271,12 @@ export type CreateTable = {
 // RefAction is a referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md
 // §6.6). Only "noAction" (the default) and "restrict" are supported — identical in jed (no
 // deferrable constraints); the write-actions parse but are rejected 0A000 at CREATE TABLE.
-export type RefAction = "noAction" | "restrict" | "cascade" | "setNull" | "setDefault";
+export type RefAction =
+  | "noAction"
+  | "restrict"
+  | "cascade"
+  | "setNull"
+  | "setDefault";
 
 // ForeignKeyDef is one parsed `FOREIGN KEY` / `REFERENCES` constraint (spec/design/grammar.md
 // §43): the optional explicit CONSTRAINT name (null = unnamed), the local (referencing) column
@@ -322,7 +345,11 @@ export type DropIndex = { kind: "dropIndex"; name: string };
 // each field's type (a built-in scalar or a previously-defined composite — 42704 if unknown),
 // rejects a duplicate type name (42710), and registers it in the catalog. Named composites only
 // this slice; anonymous `record` is not supported.
-export type CreateType = { kind: "createType"; name: string; fields: TypeFieldDef[] };
+export type CreateType = {
+  kind: "createType";
+  name: string;
+  fields: TypeFieldDef[];
+};
 
 // TypeFieldDef is one field of a CREATE TYPE definition: its name, its type as written (a built-in
 // scalar alias or a composite type name), an optional numeric(p,s) modifier, and an explicit
@@ -448,10 +475,32 @@ export type Insert = {
   source:
     | { kind: "values"; rows: InsertValue[][] }
     | { kind: "select"; select: Select };
+  // The optional ON CONFLICT clause (UPSERT — spec/design/upsert.md), between the source and
+  // RETURNING. Null = no clause (a conflict traps 23505 as usual).
+  onConflict: OnConflict | null;
   // The optional terminal RETURNING clause (spec/design/grammar.md §32): project each stored
   // row, turning the statement into a query result. Null = no clause.
   returning: SelectItems | null;
 };
+
+// OnConflict is the `ON CONFLICT [target] action` clause (spec/design/upsert.md §1). `target` is
+// null only with DO NOTHING (any uniqueness conflict is then skipped); DO UPDATE with a null
+// target is 42601. When `doUpdate` is true, `assignments` (SET …) and `filter` (optional WHERE …)
+// apply; for DO NOTHING `assignments` is empty and `filter` null.
+export type OnConflict = {
+  target: ConflictTarget | null;
+  doUpdate: boolean;
+  assignments: Assignment[];
+  filter: Expr | null;
+};
+
+// ConflictTarget is the arbiter constraint named by an ON CONFLICT target (spec/design/upsert.md
+// §2): a `( col [, ...] )` inference list matched as a SET against a unique index / the primary key
+// (no match → 42P10), or `ON CONSTRAINT name` (a unique-index name or the synthesized <table>_pkey;
+// miss → 42704).
+export type ConflictTarget =
+  | { kind: "columns"; columns: string[] }
+  | { kind: "constraint"; name: string };
 
 // Overriding is the INSERT `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md
 // §13): "system" lets an explicit value land in a GENERATED ALWAYS identity column; "user" discards

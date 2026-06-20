@@ -110,6 +110,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // the pre-statement value, new.col = the post-statement value, the absent side the
   // all-NULL row (grammar.md §32).
   "dml.returning_old_new",
+  // INSERT ... ON CONFLICT [target] { DO NOTHING | DO UPDATE SET … [WHERE …] } — UPSERT
+  // (spec/design/upsert.md, grammar.md §46): arbiter inference / ON CONSTRAINT, the
+  // `excluded` pseudo-relation, the 21000 second-affect rule, non-arbiter 23505.
+  "dml.insert_on_conflict",
   // SELECT, WHERE (=, ordering), ORDER BY, IS [NOT] NULL, 3VL, casts, cross-type
   // comparison via the promotion tower, and all three integer types.
   "query.select",
@@ -336,7 +340,11 @@ export function execute(db: Database, sql: string): Outcome {
 // executeParams parses and executes one SQL statement against db, binding params to its $N
 // placeholders (spec/design/api.md §5). A count mismatch is 42601; a parameter whose type cannot
 // be inferred is 42P18; a bound value out of range / of the wrong family fails like a literal.
-export function executeParams(db: Database, sql: string, params: Value[]): Outcome {
+export function executeParams(
+  db: Database,
+  sql: string,
+  params: Value[],
+): Outcome {
   return db.executeStmtParams(db.parse(sql), params);
 }
 
@@ -355,8 +363,25 @@ export { intValue, nullValue, render } from "./value.ts";
 export type { ThreeValued, Value } from "./value.ts";
 export { loadDatabase, toImage } from "./format.ts";
 export type { Statement } from "./ast.ts";
-export { PreparedStatement, Rows, Transaction, prepare, query, querySql, begin, view, update } from "./api.ts";
-export { create, open, commit, rollback, close, residentLeaves } from "./file.ts";
+export {
+  PreparedStatement,
+  Rows,
+  Transaction,
+  prepare,
+  query,
+  querySql,
+  begin,
+  view,
+  update,
+} from "./api.ts";
+export {
+  create,
+  open,
+  commit,
+  rollback,
+  close,
+  residentLeaves,
+} from "./file.ts";
 export type { DatabaseOptions, OpenOptions } from "./file.ts";
 export { ReadHandle, SharedDb, WriteHandle } from "./shared.ts";
 export { advancingClock, fixedClock, seededRandomSource } from "./seam.ts";

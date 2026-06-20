@@ -11,6 +11,7 @@ import type {
   CreateSequence,
   CreateTable,
   CreateType,
+  ConflictTarget,
   Delete,
   DropIndex,
   DropSequence,
@@ -21,6 +22,7 @@ import type {
   InsertValue,
   JoinKind,
   Literal,
+  OnConflict,
   OrderKey,
   Overriding,
   QueryExpr,
@@ -83,7 +85,12 @@ import { EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
 import { parseExpression, parseSQL } from "./parser.ts";
 import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
-import { DEFAULT_WORK_MEM, type RowCompare, type SpillSink, Sorter } from "./spill.ts";
+import {
+  DEFAULT_WORK_MEM,
+  type RowCompare,
+  type SpillSink,
+  Sorter,
+} from "./spill.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -139,7 +146,12 @@ import {
   tsDiff,
   tsShift,
 } from "./interval.ts";
-import { AGGREGATES, type AggregateDesc, OPERATORS, type OperatorDesc } from "./operators.ts";
+import {
+  AGGREGATES,
+  type AggregateDesc,
+  OPERATORS,
+  type OperatorDesc,
+} from "./operators.ts";
 import {
   type Value,
   type ArrayInResult,
@@ -198,7 +210,13 @@ import {
 // numeric(p,s) typmod (spec/design/conformance.md §7).
 export type Outcome =
   | { kind: "statement"; cost: bigint; rowsAffected: number | null }
-  | { kind: "query"; columnNames: string[]; columnTypes: string[]; rows: Value[][]; cost: bigint };
+  | {
+      kind: "query";
+      columnNames: string[];
+      columnTypes: string[];
+      rows: Value[][];
+      cost: bigint;
+    };
 
 // SelectResult is the full result of running a SELECT (runSelect): the output column names and
 // their resolved types, the rows in result order, and the accrued cost. Internal — executeSelect
@@ -365,7 +383,8 @@ export class Snapshot {
     const lower = name.toLowerCase();
     const keys: string[] = [];
     for (const [k, s] of this.sequences) {
-      if (s.ownedBy !== undefined && s.ownedBy.table.toLowerCase() === lower) keys.push(k);
+      if (s.ownedBy !== undefined && s.ownedBy.table.toLowerCase() === lower)
+        keys.push(k);
     }
     return keys.sort();
   }
@@ -455,7 +474,10 @@ export class Snapshot {
       }
       const c = color.get(key) ?? 0;
       if (c === 1) {
-        throw engineError("data_corrupted", `composite type definition cycle through ${key}`);
+        throw engineError(
+          "data_corrupted",
+          `composite type definition cycle through ${key}`,
+        );
       }
       if (c === 2) return cache.get(key) ?? 1;
       color.set(key, 1);
@@ -464,7 +486,8 @@ export class Snapshot {
       if (ct) {
         for (const f of ct.fields) {
           const r = compositeRefName(f.type);
-          if (r !== null) child = Math.max(child, visit(r.toLowerCase(), levelsAbove + 1));
+          if (r !== null)
+            child = Math.max(child, visit(r.toLowerCase(), levelsAbove + 1));
         }
       }
       const depth = 1 + child;
@@ -500,7 +523,8 @@ export class Snapshot {
     let depth = 1;
     if (def) {
       let child = 0;
-      for (const f of def.fields) child = Math.max(child, this.compositeTypeDepth(f.type, cache));
+      for (const f of def.fields)
+        child = Math.max(child, this.compositeTypeDepth(f.type, cache));
       depth = 1 + child;
     }
     cache.set(key, depth);
@@ -530,7 +554,9 @@ export class Snapshot {
   // TABLE — the indexes have no independent life, spec/design/indexes.md §2).
   removeTable(key: string): void {
     const t = this.tables.get(key);
-    if (t) for (const idx of t.indexes) this.indexStores.delete(idx.name.toLowerCase());
+    if (t)
+      for (const idx of t.indexes)
+        this.indexStores.delete(idx.name.toLowerCase());
     this.tables.delete(key);
     this.stores.delete(key);
   }
@@ -556,7 +582,11 @@ export class Snapshot {
         break;
       }
     }
-    const indexes = [...old.indexes.slice(0, pos), def, ...old.indexes.slice(pos)];
+    const indexes = [
+      ...old.indexes.slice(0, pos),
+      def,
+      ...old.indexes.slice(pos),
+    ];
     this.tables.set(tableKey, { ...old, indexes });
   }
 
@@ -565,10 +595,16 @@ export class Snapshot {
   // (spec/design/sequences.md §15.3), leaving the table's rows/store untouched. The Table and its
   // columns array are re-allocated (catalog Tables are never mutated in place — snapshots share
   // them). A no-op if the table or column ordinal is absent.
-  setColumnDefaultExpr(tableKey: string, column: number, defaultExpr: DefaultExpr): void {
+  setColumnDefaultExpr(
+    tableKey: string,
+    column: number,
+    defaultExpr: DefaultExpr,
+  ): void {
     const old = this.tables.get(tableKey);
     if (old === undefined || column < 0 || column >= old.columns.length) return;
-    const columns = old.columns.map((c, i) => (i === column ? { ...c, defaultExpr } : c));
+    const columns = old.columns.map((c, i) =>
+      i === column ? { ...c, defaultExpr } : c,
+    );
     this.tables.set(tableKey, { ...old, columns });
   }
 
@@ -584,7 +620,9 @@ export class Snapshot {
   removeIndex(tableKey: string, nameKey: string): void {
     const old = this.tables.get(tableKey);
     if (old) {
-      const indexes = old.indexes.filter((ix) => ix.name.toLowerCase() !== nameKey);
+      const indexes = old.indexes.filter(
+        (ix) => ix.name.toLowerCase() !== nameKey,
+      );
       this.tables.set(tableKey, { ...old, indexes });
     }
     this.indexStores.delete(nameKey);
@@ -845,7 +883,10 @@ export class Database {
     if (def === undefined) {
       const committed = this.readSnap().sequence(name);
       if (committed === undefined) {
-        throw engineError("undefined_table", `relation does not exist: ${name}`);
+        throw engineError(
+          "undefined_table",
+          `relation does not exist: ${name}`,
+        );
       }
       def = { ...committed };
     } else {
@@ -895,7 +936,10 @@ export class Database {
     if (def === undefined) {
       const committed = this.readSnap().sequence(name);
       if (committed === undefined) {
-        throw engineError("undefined_table", `relation does not exist: ${name}`);
+        throw engineError(
+          "undefined_table",
+          `relation does not exist: ${name}`,
+        );
       }
       def = { ...committed };
     } else {
@@ -923,7 +967,10 @@ export class Database {
   seqLastval(): bigint {
     const key = this.pendingLastName ?? this.sessionLastName;
     if (key === null) {
-      throw engineError("object_not_in_prerequisite_state", "lastval is not yet defined in this session");
+      throw engineError(
+        "object_not_in_prerequisite_state",
+        "lastval is not yet defined in this session",
+      );
     }
     const pending = this.pendingCurrval.get(key);
     if (pending !== undefined) return pending;
@@ -931,7 +978,10 @@ export class Database {
     if (v !== undefined) return v;
     // A nextval always defines the sequence's session value, so a recorded last-name with no value is
     // unreachable; fall back to 55000 defensively rather than returning a wrong value.
-    throw engineError("object_not_in_prerequisite_state", "lastval is not yet defined in this session");
+    throw engineError(
+      "object_not_in_prerequisite_state",
+      "lastval is not yet defined in this session",
+    );
   }
 
   // seqCurrval is currval('name') (spec/design/sequences.md §6): the value nextval/setval(…,true)
@@ -1158,7 +1208,10 @@ export class Database {
   // until commit.
   beginTx(writable: boolean | null): Outcome {
     if (this.tx !== null) {
-      throw engineError("active_sql_transaction", "there is already a transaction in progress");
+      throw engineError(
+        "active_sql_transaction",
+        "there is already a transaction in progress",
+      );
     }
     if (writable === true && this.readOnly) {
       throw engineError(
@@ -1281,7 +1334,10 @@ export class Database {
     // The relation namespace is shared between tables and indexes (indexes.md §2), so a
     // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
     if (this.relationExists(ct.name)) {
-      throw engineError("duplicate_table", "relation already exists: " + ct.name);
+      throw engineError(
+        "duplicate_table",
+        "relation already exists: " + ct.name,
+      );
     }
 
     const columns: Column[] = [];
@@ -1297,7 +1353,10 @@ export class Database {
     for (const def of ct.columns) {
       for (const c of columns) {
         if (c.name.toLowerCase() === def.name.toLowerCase()) {
-          throw engineError("duplicate_column", "duplicate column name: " + def.name);
+          throw engineError(
+            "duplicate_column",
+            "duplicate column name: " + def.name,
+          );
         }
       }
       // Resolve the column type: a built-in scalar, or a user-defined composite referenced by name
@@ -1317,7 +1376,10 @@ export class Database {
       if (serialKind !== undefined) {
         // A serial column takes no typmod (serial(5) is 42601) and no [] (the array branch).
         if (def.typeMod !== null) {
-          throw engineError("syntax_error", "type modifier is not allowed for type " + def.typeName);
+          throw engineError(
+            "syntax_error",
+            "type modifier is not allowed for type " + def.typeName,
+          );
         }
         colType = scalarT(serialKind);
         decimal = null;
@@ -1327,7 +1389,10 @@ export class Database {
         // a nested-array element and an array typmod (numeric(p,s)[]) stay deferred (0A000).
         const base = def.typeName.slice(0, -2);
         if (def.typeMod !== null) {
-          throw engineError("feature_not_supported", "a type modifier on an array type is not supported yet");
+          throw engineError(
+            "feature_not_supported",
+            "a type modifier on an array type is not supported yet",
+          );
         }
         const elemScalar = scalarTypeFromName(base);
         const baseComposite = this.compositeType(base);
@@ -1347,13 +1412,17 @@ export class Database {
         if (def.typeMod !== null) {
           throw engineError(
             "feature_not_supported",
-            "a type modifier is not supported for composite type " + def.typeName,
+            "a type modifier is not supported for composite type " +
+              def.typeName,
           );
         }
         colType = compositeT(ctype.name);
         decimal = null;
       } else {
-        throw engineError("undefined_object", "type does not exist: " + def.typeName);
+        throw engineError(
+          "undefined_object",
+          "type does not exist: " + def.typeName,
+        );
       }
       if (def.primaryKey) {
         // Integers, boolean, and uuid may be a key. uuid is the first non-integer key type (fixed
@@ -1374,7 +1443,9 @@ export class Database {
         ) {
           throw engineError(
             "feature_not_supported",
-            "a " + typeCanonicalName(colType) + " primary key is not supported yet",
+            "a " +
+              typeCanonicalName(colType) +
+              " primary key is not supported yet",
           );
         }
         if (pkSeen) {
@@ -1414,7 +1485,10 @@ export class Database {
         // Conflicts (42601, sequences.md §13.2). An explicit DEFAULT — or a serial type, itself a
         // synthesized default — alongside IDENTITY is "both default and identity"; a serial column
         // with its own explicit DEFAULT is "multiple default values" (the S3 message, unchanged).
-        if (def.identity !== null && (def.default !== null || serialKind !== undefined)) {
+        if (
+          def.identity !== null &&
+          (def.default !== null || serialKind !== undefined)
+        ) {
           throw engineError(
             "syntax_error",
             `both default and identity specified for column ${def.name} of table ${ct.name}`,
@@ -1429,9 +1503,14 @@ export class Database {
         // Create the OWNED sequence — a default ascending i64 for serial, or the IDENTITY column's
         // `( seq_options )` (defaulting the same way) — and synthesize the DEFAULT nextval(...)
         // expression default (format_version 8 mechanism).
-        const seqName = this.chooseSerialSeqName(ct.name, def.name, pendingSerials);
+        const seqName = this.chooseSerialSeqName(
+          ct.name,
+          def.name,
+          pendingSerials,
+        );
         const owner: SeqOwner = { table: ct.name, column: columns.length }; // this column's ordinal
-        const opts = def.identity !== null ? def.identity.options : emptySeqOptions();
+        const opts =
+          def.identity !== null ? def.identity.options : emptySeqOptions();
         // The owned sequence's data type follows the column (§14): serial → the pseudo-type,
         // identity → the column type. An explicit `AS` inside the identity `( … )` options conflicts
         // with that — 42601 (PG: "conflicting or redundant options"). serial carries no parsed
@@ -1441,11 +1520,17 @@ export class Database {
         }
         // serial fixes the scalar to its pseudo-type; identity's column type is a gated integer
         // scalar (typeIsInteger above), so colType is always a scalar in the identity branch.
-        const seqScalar = serialKind ?? (colType.kind === "scalar" ? colType.scalar : undefined);
-        const seqDtype = seqScalar === undefined ? undefined : seqDataTypeForScalar(seqScalar);
+        const seqScalar =
+          serialKind ??
+          (colType.kind === "scalar" ? colType.scalar : undefined);
+        const seqDtype =
+          seqScalar === undefined ? undefined : seqDataTypeForScalar(seqScalar);
         if (seqDtype === undefined) {
           // Unreachable: a serial / identity column is i16/i32/i64 (gated above).
-          throw engineError("invalid_parameter_value", "serial / identity column is i16/i32/i64");
+          throw engineError(
+            "invalid_parameter_value",
+            "serial / identity column is i16/i32/i64",
+          );
         }
         opts.dataType = seqDtype;
         pendingSerials.push(buildSequenceDef(seqName, opts, owner));
@@ -1455,7 +1540,8 @@ export class Database {
         // identifier-derived name, so the quoting is always safe.
         const exprText = `nextval ( '${seqName.replace(/'/g, "''")}' )`;
         def_defaultExpr = { exprText, expr: parseExpression(exprText) };
-        if (def.identity !== null) identityKind = def.identity.always ? "always" : "byDefault";
+        if (def.identity !== null)
+          identityKind = def.identity.always ? "always" : "byDefault";
       } else if (colType.kind === "composite" || colType.kind === "array") {
         // A DEFAULT on a composite- or array-typed column is not supported this slice
         // (composite.md §12 / array.md §12).
@@ -1468,16 +1554,31 @@ export class Database {
       } else if (def.default !== null) {
         const sty = colType.scalar;
         if (def.default.expr.kind === "literal") {
-          def_default = storeValue(literalToValue(def.default.expr.literal), sty, decimal, false, def.name);
+          def_default = storeValue(
+            literalToValue(def.default.expr.literal),
+            sty,
+            decimal,
+            false,
+            def.name,
+          );
         } else {
           rejectDefaultStructure(def.default.expr);
-          const { type: rt } = resolve(Scope.empty(this), def.default.expr, sty, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes());
+          const { type: rt } = resolve(
+            Scope.empty(this),
+            def.default.expr,
+            sty,
+            { collecting: false, groupKeys: [], specs: [] },
+            new ParamTypes(),
+          );
           if (!assignableTo(rt, sty)) {
             throw typeError(
               `column ${def.name} is of type ${canonicalName(sty)} but default expression is of type ${rtName(rt)}`,
             );
           }
-          def_defaultExpr = { exprText: def.default.text, expr: def.default.expr };
+          def_defaultExpr = {
+            exprText: def.default.text,
+            expr: def.default.expr,
+          };
         }
       }
       columns.push({
@@ -1486,7 +1587,11 @@ export class Database {
         decimal,
         primaryKey: def.primaryKey,
         // PRIMARY KEY ⇒ NOT NULL; a serial or IDENTITY column is NOT NULL too (sequences.md §12/§13).
-        notNull: def.primaryKey || def.notNull || serialKind !== undefined || def.identity !== null,
+        notNull:
+          def.primaryKey ||
+          def.notNull ||
+          serialKind !== undefined ||
+          def.identity !== null,
         default: def_default,
         defaultExpr: def_defaultExpr,
         identity: identityKind,
@@ -1512,7 +1617,10 @@ export class Database {
         const lower = name.toLowerCase();
         const idx = columns.findIndex((c) => c.name.toLowerCase() === lower);
         if (idx < 0) {
-          throw engineError("undefined_column", "column " + name + " named in key does not exist");
+          throw engineError(
+            "undefined_column",
+            "column " + name + " named in key does not exist",
+          );
         }
         if (indices.includes(idx)) {
           throw engineError(
@@ -1557,7 +1665,10 @@ export class Database {
         const lower = cname.toLowerCase();
         const idx = columns.findIndex((c) => c.name.toLowerCase() === lower);
         if (idx < 0) {
-          throw engineError("undefined_column", "column " + cname + " named in key does not exist");
+          throw engineError(
+            "undefined_column",
+            "column " + cname + " named in key does not exist",
+          );
         }
         if (indices.includes(idx)) {
           throw engineError(
@@ -1579,7 +1690,9 @@ export class Database {
         ) {
           throw engineError(
             "feature_not_supported",
-            "a " + typeCanonicalName(ty) + " unique constraint member is not supported yet",
+            "a " +
+              typeCanonicalName(ty) +
+              " unique constraint member is not supported yet",
           );
         }
       }
@@ -1591,14 +1704,27 @@ export class Database {
     // oracle-probed); naming follows in a second pass, so a 42703 in a later check fires
     // before a 42710 between earlier ones. Resolution needs a catalog Table, so build it
     // now (checks attach below, before putTable).
-    const table: Table = { name: ct.name, columns, pk, checks: [], indexes: [], fks: [] };
+    const table: Table = {
+      name: ct.name,
+      columns,
+      pk,
+      checks: [],
+      indexes: [],
+      fks: [],
+    };
     for (const def of ct.checks) {
       // Structural rejections first (a single pre-walk — a documented micro-order
       // divergence from PG, which interleaves them with name/type resolution): subquery
       // 0A000, aggregate 42803, bind parameter 42P02 (constraints.md §4.1).
       rejectCheckStructure(def.expr);
       const scope = Scope.single(this, table);
-      const { type } = resolve(scope, def.expr, null, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes());
+      const { type } = resolve(
+        scope,
+        def.expr,
+        null,
+        { collecting: false, groupKeys: [], specs: [] },
+        new ParamTypes(),
+      );
       if (type.kind !== "bool" && type.kind !== "null") {
         throw typeError("argument of CHECK must be boolean");
       }
@@ -1618,7 +1744,11 @@ export class Database {
         if (nameTaken(def.name)) {
           throw engineError(
             "duplicate_object",
-            "constraint " + def.name + " for relation " + table.name + " already exists",
+            "constraint " +
+              def.name +
+              " for relation " +
+              table.name +
+              " already exists",
           );
         }
         name = def.name;
@@ -1626,10 +1756,14 @@ export class Database {
         const cols = checkReferencedColumns(def.expr, columns);
         const base =
           cols.length === 1
-            ? table.name.toLowerCase() + "_" + columns[cols[0]!]!.name.toLowerCase() + "_check"
+            ? table.name.toLowerCase() +
+              "_" +
+              columns[cols[0]!]!.name.toLowerCase() +
+              "_check"
             : table.name.toLowerCase() + "_check";
         name = base;
-        for (let suffix = 1; nameTaken(name); suffix++) name = base + suffix.toString();
+        for (let suffix = 1; nameTaken(name); suffix++)
+          name = base + suffix.toString();
       }
       checks.push({ name, exprText: def.text, expr: def.expr });
     }
@@ -1672,12 +1806,19 @@ export class Database {
       let name: string;
       if (ru.name !== null) {
         if (relationTaken(ru.name)) {
-          throw engineError("duplicate_table", "relation already exists: " + ru.name);
+          throw engineError(
+            "duplicate_table",
+            "relation already exists: " + ru.name,
+          );
         }
         if (checkNameTaken(ru.name)) {
           throw engineError(
             "duplicate_object",
-            "constraint " + ru.name + " for relation " + table.name + " already exists",
+            "constraint " +
+              ru.name +
+              " for relation " +
+              table.name +
+              " already exists",
           );
         }
         name = ru.name;
@@ -1686,15 +1827,26 @@ export class Database {
         for (const i of ru.cols) base += "_" + columns[i]!.name.toLowerCase();
         base += "_key";
         name = base;
-        for (let suffix = 1; relationTaken(name) || checkNameTaken(name); suffix++) {
+        for (
+          let suffix = 1;
+          relationTaken(name) || checkNameTaken(name);
+          suffix++
+        ) {
           name = base + suffix.toString();
         }
       }
       // Insert in catalog (ascending lowercased-name) order — indexes.md §6.
       const nameKey = name.toLowerCase();
-      let pos = table.indexes.findIndex((ix) => ix.name.toLowerCase() > nameKey);
+      let pos = table.indexes.findIndex(
+        (ix) => ix.name.toLowerCase() > nameKey,
+      );
       if (pos < 0) pos = table.indexes.length;
-      table.indexes.splice(pos, 0, { name, columns: ru.cols, unique: true, kind: "btree" });
+      table.indexes.splice(pos, 0, {
+        name,
+        columns: ru.cols,
+        unique: true,
+        kind: "btree",
+      });
     }
 
     // FOREIGN KEY constraints (constraints.md §6). Resolved AFTER the PK / UNIQUE / CHECK
@@ -1713,10 +1865,16 @@ export class Database {
       for (const cname of fk.columns) {
         const idx = columnIndex(table, cname);
         if (idx < 0) {
-          throw engineError("undefined_column", "column " + cname + " named in key does not exist");
+          throw engineError(
+            "undefined_column",
+            "column " + cname + " named in key does not exist",
+          );
         }
         if (local.includes(idx)) {
-          throw engineError("duplicate_column", "column " + cname + " appears twice in foreign key constraint");
+          throw engineError(
+            "duplicate_column",
+            "column " + cname + " appears twice in foreign key constraint",
+          );
         }
         local.push(idx);
       }
@@ -1728,7 +1886,10 @@ export class Database {
       } else {
         const found = this.table(fk.refTable);
         if (found === undefined) {
-          throw engineError("undefined_table", "table does not exist: " + fk.refTable);
+          throw engineError(
+            "undefined_table",
+            "table does not exist: " + fk.refTable,
+          );
         }
         parent = found;
       }
@@ -1739,7 +1900,10 @@ export class Database {
           // Omitting the referenced list defaults to the parent's PRIMARY KEY; a parent without
           // one is 42704 (PG's code here — undefined_object — even when the parent has a UNIQUE),
           // distinct from the explicit-no-match 42830.
-          throw engineError("undefined_object", "there is no primary key for referenced table " + parent.name);
+          throw engineError(
+            "undefined_object",
+            "there is no primary key for referenced table " + parent.name,
+          );
         }
         refs = [...parent.pk];
       } else {
@@ -1747,17 +1911,26 @@ export class Database {
         for (const cname of fk.refColumns) {
           const idx = columnIndex(parent, cname);
           if (idx < 0) {
-            throw engineError("undefined_column", "column " + cname + " named in key does not exist");
+            throw engineError(
+              "undefined_column",
+              "column " + cname + " named in key does not exist",
+            );
           }
           if (refs.includes(idx)) {
-            throw engineError("duplicate_column", "column " + cname + " appears twice in foreign key constraint");
+            throw engineError(
+              "duplicate_column",
+              "column " + cname + " appears twice in foreign key constraint",
+            );
           }
           refs.push(idx);
         }
       }
       // 4. Referencing/referenced count must agree.
       if (local.length !== refs.length) {
-        throw engineError("invalid_foreign_key", "number of referencing and referenced columns for foreign key disagree");
+        throw engineError(
+          "invalid_foreign_key",
+          "number of referencing and referenced columns for foreign key disagree",
+        );
       }
       // 5. Name — the per-table constraint namespace, shared with CHECK (§6.2/§6.7).
       const nameTakenFk = (n: string): boolean =>
@@ -1766,15 +1939,24 @@ export class Database {
       let fkName: string;
       if (fk.name !== null) {
         if (nameTakenFk(fk.name)) {
-          throw engineError("duplicate_object", "constraint " + fk.name + " for relation " + table.name + " already exists");
+          throw engineError(
+            "duplicate_object",
+            "constraint " +
+              fk.name +
+              " for relation " +
+              table.name +
+              " already exists",
+          );
         }
         fkName = fk.name;
       } else {
         let base = table.name.toLowerCase();
-        for (const i of local) base += "_" + table.columns[i]!.name.toLowerCase();
+        for (const i of local)
+          base += "_" + table.columns[i]!.name.toLowerCase();
         base += "_fkey";
         fkName = base;
-        for (let suffix = 1; nameTakenFk(fkName); suffix++) fkName = base + suffix.toString();
+        for (let suffix = 1; nameTakenFk(fkName); suffix++)
+          fkName = base + suffix.toString();
       }
       // 6. Reject the unsupported write-actions (§6.6).
       const onDelete = fkAction(fk.onDelete, "DELETE");
@@ -1783,9 +1965,15 @@ export class Database {
       const refSet = sortedUnique(refs);
       const matchesUnique =
         (parent.pk.length > 0 && sameSet(sortedUnique(parent.pk), refSet)) ||
-        parent.indexes.some((i) => i.unique && sameSet(sortedUnique(i.columns), refSet));
+        parent.indexes.some(
+          (i) => i.unique && sameSet(sortedUnique(i.columns), refSet),
+        );
       if (!matchesUnique) {
-        throw engineError("invalid_foreign_key", "there is no unique constraint matching given keys for referenced table " + parent.name);
+        throw engineError(
+          "invalid_foreign_key",
+          "there is no unique constraint matching given keys for referenced table " +
+            parent.name,
+        );
       }
       // 8. Same-type pairing (§6.2). Because the referenced columns are a PK/UNIQUE key they are
       // key-encodable, so a same-typed local column is key-encodable too — no separate 0A000 type
@@ -1796,14 +1984,27 @@ export class Database {
         if (!fkTypesEqual(table.columns[li]!.type, parent.columns[ri]!.type)) {
           throw engineError(
             "datatype_mismatch",
-            "foreign key constraint " + fkName + " cannot be implemented: key columns " +
-              table.columns[li]!.name + " and " + parent.columns[ri]!.name +
-              " are of incompatible types: " + typeCanonicalName(table.columns[li]!.type) +
-              " and " + typeCanonicalName(parent.columns[ri]!.type),
+            "foreign key constraint " +
+              fkName +
+              " cannot be implemented: key columns " +
+              table.columns[li]!.name +
+              " and " +
+              parent.columns[ri]!.name +
+              " are of incompatible types: " +
+              typeCanonicalName(table.columns[li]!.type) +
+              " and " +
+              typeCanonicalName(parent.columns[ri]!.type),
           );
         }
       }
-      resolvedFks.push({ name: fkName, columns: local, refTable: parent.name, refColumns: refs, onDelete, onUpdate });
+      resolvedFks.push({
+        name: fkName,
+        columns: local,
+        refTable: parent.name,
+        refColumns: refs,
+        onDelete,
+        onUpdate,
+      });
     }
     // Held in ascending lowercased-name order (the catalog's on-disk + evaluation order, §6.9).
     resolvedFks.sort((a, b) => {
@@ -1834,7 +2035,11 @@ export class Database {
   // smallest integer suffix 1, 2, … appended until the name is free in the relation namespace — not
   // taken by an existing relation, not equal to the table being created, and not already chosen by
   // an earlier serial column of the same statement (pending). All-lowercase identifier-derived.
-  private chooseSerialSeqName(table: string, column: string, pending: SequenceDef[]): string {
+  private chooseSerialSeqName(
+    table: string,
+    column: string,
+    pending: SequenceDef[],
+  ): string {
     const base = `${table.toLowerCase()}_${column.toLowerCase()}_seq`;
     const taken = (c: string): boolean =>
       this.relationExists(c) ||
@@ -1856,7 +2061,13 @@ export class Database {
     const scope = Scope.single(this, table);
     return table.checks.map((c) => ({
       name: c.name,
-      node: resolve(scope, c.expr, null, { collecting: false, groupKeys: [], specs: [] }, new ParamTypes()).node,
+      node: resolve(
+        scope,
+        c.expr,
+        null,
+        { collecting: false, groupKeys: [], specs: [] },
+        new ParamTypes(),
+      ).node,
     }));
   }
 
@@ -1870,7 +2081,13 @@ export class Database {
   private resolveDefaultExprs(table: Table): (RExpr | null)[] {
     return table.columns.map((col) => {
       if (col.defaultExpr === null) return null;
-      return resolve(Scope.empty(this), col.defaultExpr.expr, typeScalar(col.type), { collecting: false, groupKeys: [], specs: [] }, new ParamTypes()).node;
+      return resolve(
+        Scope.empty(this),
+        col.defaultExpr.expr,
+        typeScalar(col.type),
+        { collecting: false, groupKeys: [], specs: [] },
+        new ParamTypes(),
+      ).node;
     });
   }
 
@@ -1880,7 +2097,12 @@ export class Database {
   // per-statement seam/clock (rng) and metered (operator_eval per node). Reused by the VALUES
   // materialization (a DEFAULT keyword) and insertRows (an omitted column), sharing ONE StmtRng
   // so a multi-row DEFAULT uuidv7() stays monotonic. defaultRExpr is null for a constant/no default.
-  private evalDefault(col: Column, defaultRExpr: RExpr | null, rng: StmtRng, meter: Meter): Value {
+  private evalDefault(
+    col: Column,
+    defaultRExpr: RExpr | null,
+    rng: StmtRng,
+    meter: Meter,
+  ): Value {
     if (defaultRExpr === null) return col.default ?? nullValue();
     meter.guard();
     const env: EvalEnv = {
@@ -1916,7 +2138,10 @@ export class Database {
       const canonical = this.table(dt.name)?.name ?? dt.name;
       throw engineError(
         "dependent_objects_still_exist",
-        "cannot drop table " + canonical + " because other objects depend on it: " + detail,
+        "cannot drop table " +
+          canonical +
+          " because other objects depend on it: " +
+          detail,
       );
     }
     // Auto-drop every sequence OWNED BY this table — the serial columns' sequences
@@ -1953,7 +2178,11 @@ export class Database {
     if (probe.kind === "pk") {
       return this.readSnap().store(parentTable).get(probe.bytes) !== undefined;
     }
-    return this.readSnap().indexStore(probe.index).rangeEntries(uniqueProbeBound(probe.prefix)).length > 0;
+    return (
+      this.readSnap()
+        .indexStore(probe.index)
+        .rangeEntries(uniqueProbeBound(probe.prefix)).length > 0
+    );
   }
 
   // fkChildReferences reports whether any row of `childTable` references the parent tuple `target`
@@ -1983,7 +2212,9 @@ export class Database {
   // parent DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (lowercased
   // child table, FK name) for a deterministic report order. The FK objects are the snapshot's
   // (the caller probes stores without mutating the catalog).
-  private fkReferencers(parentName: string): { childTable: string; fk: ForeignKey }[] {
+  private fkReferencers(
+    parentName: string,
+  ): { childTable: string; fk: ForeignKey }[] {
     const snap = this.readSnap();
     const key = parentName.toLowerCase();
     const out: { childTable: string; fk: ForeignKey }[] = [];
@@ -1991,7 +2222,8 @@ export class Database {
     for (const tk of tkeys) {
       const t = snap.tables.get(tk)!;
       for (const fk of t.fks) {
-        if (fk.refTable.toLowerCase() === key) out.push({ childTable: t.name, fk });
+        if (fk.refTable.toLowerCase() === key)
+          out.push({ childTable: t.name, fk });
       }
     }
     return out;
@@ -2019,7 +2251,11 @@ export class Database {
     let kind: "btree" | "gin";
     if (method === "btree") kind = "btree";
     else if (method === "gin") kind = "gin";
-    else throw engineError("undefined_object", "access method does not exist: " + ci.using);
+    else
+      throw engineError(
+        "undefined_object",
+        "access method does not exist: " + ci.using,
+      );
     const cols: number[] = [];
     for (const name of ci.columns) {
       const idx = columnIndex(table, name);
@@ -2035,7 +2271,9 @@ export class Database {
         if (ty.kind !== "array") {
           throw engineError(
             "undefined_object",
-            "data type " + typeCanonicalName(ty) + " has no default operator class for access method gin",
+            "data type " +
+              typeCanonicalName(ty) +
+              " has no default operator class for access method gin",
           );
         }
         if (!isGinElementType(ty.elem)) {
@@ -2063,16 +2301,25 @@ export class Database {
     // index) and a single column only — both deferred 0A000.
     if (kind === "gin") {
       if (ci.unique) {
-        throw engineError("feature_not_supported", "access method gin does not support unique indexes");
+        throw engineError(
+          "feature_not_supported",
+          "access method gin does not support unique indexes",
+        );
       }
       if (cols.length !== 1) {
-        throw engineError("feature_not_supported", "a multi-column gin index is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "a multi-column gin index is not supported yet",
+        );
       }
     }
     let name: string;
     if (ci.name !== null) {
       if (this.relationExists(ci.name)) {
-        throw engineError("duplicate_table", "relation already exists: " + ci.name);
+        throw engineError(
+          "duplicate_table",
+          "relation already exists: " + ci.name,
+        );
       }
       name = ci.name;
     } else {
@@ -2082,7 +2329,8 @@ export class Database {
       for (const cn of ci.columns) base += "_" + cn.toLowerCase();
       base += "_idx";
       name = base;
-      for (let suffix = 1; this.relationExists(name); suffix++) name = base + suffix.toString();
+      for (let suffix = 1; this.relationExists(name); suffix++)
+        name = base + suffix.toString();
     }
 
     // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
@@ -2095,7 +2343,9 @@ export class Database {
     const def: IndexDef = { name, columns: cols, unique: ci.unique, kind };
     const store = this.readSnap().store(ci.table);
     const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
-    meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
+    meter.charge(
+      COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs),
+    );
     const entries: Uint8Array[] = [];
     // A UNIQUE build verifies the existing rows before the index is registered
     // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
@@ -2158,13 +2408,19 @@ export class Database {
   // composites only.
   private executeCreateType(ct: CreateType): Outcome {
     if (this.compositeType(ct.name) !== undefined) {
-      throw engineError("duplicate_object", "type " + ct.name + " already exists");
+      throw engineError(
+        "duplicate_object",
+        "type " + ct.name + " already exists",
+      );
     }
     const fields: CompositeField[] = [];
     for (const f of ct.fields) {
       for (const g of fields) {
         if (g.name.toLowerCase() === f.name.toLowerCase()) {
-          throw engineError("duplicate_column", "attribute " + f.name + " specified more than once");
+          throw engineError(
+            "duplicate_column",
+            "attribute " + f.name + " specified more than once",
+          );
         }
       }
       let fty: Type;
@@ -2176,7 +2432,10 @@ export class Database {
         // exactly as for an array column.
         const base = f.typeName.slice(0, -2);
         if (f.typeMod !== null) {
-          throw engineError("feature_not_supported", "a type modifier on an array type is not supported yet");
+          throw engineError(
+            "feature_not_supported",
+            "a type modifier on an array type is not supported yet",
+          );
         }
         const elemScalar = scalarTypeFromName(base);
         const baseComposite = this.compositeType(base);
@@ -2200,9 +2459,17 @@ export class Database {
         }
         fty = compositeT(f.typeName);
       } else {
-        throw engineError("undefined_object", "type does not exist: " + f.typeName);
+        throw engineError(
+          "undefined_object",
+          "type does not exist: " + f.typeName,
+        );
       }
-      fields.push({ name: f.name, type: fty, decimal: fdecimal, notNull: f.notNull });
+      fields.push({
+        name: f.name,
+        type: fty,
+        decimal: fdecimal,
+        notNull: f.notNull,
+      });
     }
     // Bound composite-type nesting depth (CLAUDE.md §13; cost.md §7b). A chain of CREATE TYPEs each
     // nesting the previous (`a`, `b AS (x a)`, …) builds unbounded depth across many cheap statements —
@@ -2213,7 +2480,11 @@ export class Database {
     // depth computation's recursion is itself bounded.
     const cache = new Map<string, number>();
     let maxField = 0;
-    for (const f of fields) maxField = Math.max(maxField, this.readSnap().compositeTypeDepth(f.type, cache));
+    for (const f of fields)
+      maxField = Math.max(
+        maxField,
+        this.readSnap().compositeTypeDepth(f.type, cache),
+      );
     const depth = 1 + maxField;
     if (depth > MAX_COMPOSITE_DEPTH) {
       throw engineError(
@@ -2230,14 +2501,18 @@ export class Database {
   // field still references the type, 2BP01; otherwise remove it from the catalog.
   private executeDropType(dt: DropType): Outcome {
     if (this.compositeType(dt.name) === undefined) {
-      if (dt.ifExists) return { kind: "statement", cost: 0n, rowsAffected: null };
+      if (dt.ifExists)
+        return { kind: "statement", cost: 0n, rowsAffected: null };
       throw engineError("undefined_object", "type does not exist: " + dt.name);
     }
     const dep = this.readSnap().compositeDependent(dt.name);
     if (dep !== null) {
       throw engineError(
         "dependent_objects_still_exist",
-        "cannot drop type " + dt.name + " because other objects depend on it: " + dep,
+        "cannot drop type " +
+          dt.name +
+          " because other objects depend on it: " +
+          dep,
       );
     }
     this.working().removeType(dt.name.toLowerCase());
@@ -2249,10 +2524,16 @@ export class Database {
   // reject a relation-namespace collision (42P07 unless IF NOT EXISTS), and register the sequence.
   private executeCreateSequence(cs: CreateSequence): Outcome {
     if (this.relationExists(cs.name)) {
-      if (cs.ifNotExists) return { kind: "statement", cost: 0n, rowsAffected: null };
-      throw engineError("duplicate_table", `relation already exists: ${cs.name}`);
+      if (cs.ifNotExists)
+        return { kind: "statement", cost: 0n, rowsAffected: null };
+      throw engineError(
+        "duplicate_table",
+        `relation already exists: ${cs.name}`,
+      );
     }
-    this.working().putSequence(buildSequenceDef(cs.name, cs.options, undefined));
+    this.working().putSequence(
+      buildSequenceDef(cs.name, cs.options, undefined),
+    );
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -2267,7 +2548,10 @@ export class Database {
       const seq = this.readSnap().sequence(name);
       if (seq === undefined) {
         if (ds.ifExists) continue;
-        throw engineError("undefined_table", `sequence does not exist: ${name}`);
+        throw engineError(
+          "undefined_table",
+          `sequence does not exist: ${name}`,
+        );
       }
       if (seq.ownedBy !== undefined) {
         // The owning table is always present (its own DROP TABLE would auto-drop this sequence
@@ -2294,8 +2578,12 @@ export class Database {
   private executeAlterSequence(as: AlterSequence): Outcome {
     const committed = this.readSnap().sequence(as.name);
     if (committed === undefined) {
-      if (as.ifExists) return { kind: "statement", cost: 0n, rowsAffected: null };
-      throw engineError("undefined_table", `relation does not exist: ${as.name}`);
+      if (as.ifExists)
+        return { kind: "statement", cost: 0n, rowsAffected: null };
+      throw engineError(
+        "undefined_table",
+        `relation does not exist: ${as.name}`,
+      );
     }
     if (as.action.kind === "rename") {
       this.alterSequenceRename(committed, as.action.newName);
@@ -2303,9 +2591,16 @@ export class Database {
       // AS type on ALTER is 0A000 — the value type is not persisted (sequences.md §14.4), so the
       // original type for re-deriving a default bound is gone.
       if (as.action.options.dataType !== null) {
-        throw engineError("feature_not_supported", "ALTER SEQUENCE ... AS type is not supported");
+        throw engineError(
+          "feature_not_supported",
+          "ALTER SEQUENCE ... AS type is not supported",
+        );
       }
-      const newDef = applySeqAlter(committed, as.action.options, as.action.restart);
+      const newDef = applySeqAlter(
+        committed,
+        as.action.options,
+        as.action.restart,
+      );
       this.working().putSequence(newDef);
     }
     return { kind: "statement", cost: 0n, rowsAffected: null };
@@ -2318,14 +2613,21 @@ export class Database {
   // renamed sequence (jed resolves the sequence by name, unlike PG's OID reference).
   private alterSequenceRename(existing: SequenceDef, newName: string): void {
     if (this.relationExists(newName)) {
-      throw engineError("duplicate_table", `relation already exists: ${newName}`);
+      throw engineError(
+        "duplicate_table",
+        `relation already exists: ${newName}`,
+      );
     }
     if (existing.ownedBy !== undefined) {
       const exprText = `nextval ( '${newName.toLowerCase().replace(/'/g, "''")}' )`;
-      this.working().setColumnDefaultExpr(existing.ownedBy.table.toLowerCase(), existing.ownedBy.column, {
-        exprText,
-        expr: parseExpression(exprText),
-      });
+      this.working().setColumnDefaultExpr(
+        existing.ownedBy.table.toLowerCase(),
+        existing.ownedBy.column,
+        {
+          exprText,
+          expr: parseExpression(exprText),
+        },
+      );
     }
     this.working().removeSequence(existing.name.toLowerCase());
     this.working().putSequence({ ...existing, name: newName });
@@ -2354,13 +2656,19 @@ export class Database {
       const bk = encodeBoundKey(ib.colType, src, params, outer);
       if (bk.kind !== "key") return { rows: [], pages: 0, slabs: 0 };
       if (agreed === null) agreed = bk.key;
-      else if (!bytesEq(agreed, bk.key)) return { rows: [], pages: 0, slabs: 0 };
+      else if (!bytesEq(agreed, bk.key))
+        return { rows: [], pages: 0, slabs: 0 };
     }
     // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
     // is every entry extending the prefix: [prefix, byte-successor(prefix)).
     const prefix = new Uint8Array(1 + agreed!.length);
     prefix.set(agreed!, 1);
-    const b: KeyBound = { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
+    const b: KeyBound = {
+      lo: prefix,
+      loInc: true,
+      hi: prefixSuccessor(prefix),
+      hiInc: false,
+    };
     const istore = this.readSnap().indexStore(ib.nameKey);
     // The index store has no payload columns, so its mask is empty and its fused scan
     // contributes only the index-tree page_read count (no spill/compress units).
@@ -2380,7 +2688,8 @@ export class Database {
       const u = store.getWithUnits(rowKey, mask);
       pages += u.pages;
       slabs += u.slabs;
-      if (u.row === undefined) throw new Error("an index entry references a stored row");
+      if (u.row === undefined)
+        throw new Error("an index entry references a stored row");
       rows.push(u.row);
     }
     return { rows, pages, slabs };
@@ -2424,7 +2733,8 @@ export class Database {
       // exec); inRange is a defensive guard against silently truncating an out-of-range integer into
       // a wrong term.
       if (qv.kind === "null") return { entries: [], pages: 0, slabs: 0 };
-      if (qv.kind === "int" && !inRange(gb.elemType, qv.int)) return { entries: [], pages: 0, slabs: 0 };
+      if (qv.kind === "int" && !inRange(gb.elemType, qv.int))
+        return { entries: [], pages: 0, slabs: 0 };
       terms.push(encodeKeyValue(gb.elemType, qv));
     } else {
       if (qv.kind !== "array") return { entries: [], pages: 0, slabs: 0 }; // NULL/non-array → provably empty
@@ -2476,7 +2786,12 @@ export class Database {
     let entriesVisited = 0;
     const postings: Uint8Array[][] = [];
     for (const prefix of terms) {
-      const b: KeyBound = { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
+      const b: KeyBound = {
+        lo: prefix,
+        loInc: true,
+        hi: prefixSuccessor(prefix),
+        hiInc: false,
+      };
       const scan = istore.rangeScanWithUnits(b, []);
       pages += scan.pages;
       entriesVisited += scan.entries.length;
@@ -2489,7 +2804,10 @@ export class Database {
     // intersection; = ANY (member) is a single term, so its intersection is that lone posting list;
     // array = (equal) gathers the same superset as @> over Q's distinct non-NULL terms (the residual
     // = makes it exact downstream); && ANY → union.
-    const cand = gb.strategy === "overlaps" ? unionPostings(postings) : intersectPostings(postings);
+    const cand =
+      gb.strategy === "overlaps"
+        ? unionPostings(postings)
+        : intersectPostings(postings);
 
     let slabs = 0;
     const entries: Entry[] = [];
@@ -2497,7 +2815,8 @@ export class Database {
       const u = store.getWithUnits(key, mask);
       pages += u.pages;
       slabs += u.slabs;
-      if (u.row === undefined) throw new Error("a GIN entry references a stored row");
+      if (u.row === undefined)
+        throw new Error("a GIN entry references a stored row");
       entries.push({ key, row: u.row });
     }
     return { entries, pages, slabs };
@@ -2517,7 +2836,10 @@ export class Database {
   private executeInsert(ins: Insert, params: Value[]): Outcome {
     const table = this.table(ins.table);
     if (!table) {
-      throw engineError("undefined_table", "table does not exist: " + ins.table);
+      throw engineError(
+        "undefined_table",
+        "table does not exist: " + ins.table,
+      );
     }
     const store = this.working().store(ins.table);
     // The key members in key order — one for a single-column PK, several for a composite
@@ -2601,7 +2923,14 @@ export class Database {
       // t) reads the pre-insert snapshot, then writes.
       const ptypes = new ParamTypes();
       const plan = this.planQuery(ins.source.select, null, [], ptypes);
-      const ret = ins.returning !== null ? this.resolveReturning(table, ins.returning, false, ptypes) : null;
+      const ret =
+        ins.returning !== null
+          ? this.resolveReturning(table, ins.returning, false, ptypes)
+          : null;
+      const cplan =
+        ins.onConflict !== null
+          ? this.resolveOnConflict(table, ins.onConflict, ptypes)
+          : null;
       const bound = bindParams(params, ptypes.finalize());
       const meter = new Meter(this.maxCost);
       const foldCost = { value: 0n };
@@ -2609,8 +2938,11 @@ export class Database {
       // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
       // pre-statement snapshot (grammar.md §32).
       if (ret !== null) {
-        ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost));
+        ret.nodes = ret.nodes.map((node) =>
+          this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost),
+        );
       }
+      this.foldConflictPlan(cplan, bound, foldCost);
       meter.charge(foldCost.value);
       const q = this.execQueryPlan(plan, [], bound, EMPTY_CTE_CTX);
       // Arity: the SELECT's output column count must match the target — checked before any row is
@@ -2635,13 +2967,17 @@ export class Database {
         if (col.type.kind === "composite") {
           throw engineError(
             "feature_not_supported",
-            "INSERT ... SELECT into composite column " + col.name + " is not supported yet",
+            "INSERT ... SELECT into composite column " +
+              col.name +
+              " is not supported yet",
           );
         }
         if (col.type.kind === "array") {
           throw engineError(
             "feature_not_supported",
-            "INSERT ... SELECT into array column " + col.name + " is not supported yet",
+            "INSERT ... SELECT into array column " +
+              col.name +
+              " is not supported yet",
           );
         }
         if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
@@ -2655,8 +2991,27 @@ export class Database {
       // RETURNING projection; storing the rows themselves stays unmetered. One meter keeps
       // one ceiling over the whole statement.
       meter.charge(q.cost);
-      const returned = this.insertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, q.rows, ret?.nodes ?? null, bound, meter);
-      return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, q.rows.length, meter.accrued);
+      const { affected, returned } = this.runInsertRows(
+        table,
+        store,
+        pk,
+        checks,
+        defaultExprs,
+        stmtRng,
+        provided,
+        q.rows,
+        cplan,
+        ret?.nodes ?? null,
+        bound,
+        meter,
+      );
+      return dmlOutcome(
+        ret?.names ?? null,
+        ret?.types ?? null,
+        returned,
+        affected,
+        meter.accrued,
+      );
     }
 
     // VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
@@ -2666,7 +3021,8 @@ export class Database {
     const ptypes = new ParamTypes();
     for (const values of rowsIn) {
       if (values.length !== arity) {
-        const which = ins.columns !== null ? "target columns are" : "columns are";
+        const which =
+          ins.columns !== null ? "target columns are" : "columns are";
         throw engineError(
           "syntax_error",
           `INSERT row has ${values.length} values but ${arity} ${which} expected for table ${table.name}`,
@@ -2699,7 +3055,14 @@ export class Database {
     }
     // Resolve the RETURNING projection after the source (PostgreSQL's analysis order) and
     // before binding/execution — a 42703 here beats a would-be 23505 (grammar.md §32).
-    const ret = ins.returning !== null ? this.resolveReturning(table, ins.returning, false, ptypes) : null;
+    const ret =
+      ins.returning !== null
+        ? this.resolveReturning(table, ins.returning, false, ptypes)
+        : null;
+    const cplan =
+      ins.onConflict !== null
+        ? this.resolveOnConflict(table, ins.onConflict, ptypes)
+        : null;
     const bound = bindParams(params, ptypes.finalize());
 
     // INSERT ... VALUES reads no rows; with only literal values and constant defaults it
@@ -2726,21 +3089,45 @@ export class Database {
           // DEFAULT at the top level → the column's default (constant or per-row expression). A
           // ROW(…) / literal / $N slot is materialized against the column's resolved ColType
           // (composite-aware — composite.md §1/§4); coerceForStore in insertRows then range-checks.
-          if (iv.kind === "default") rv[p] = this.evalDefault(col, defaultExprs[i]!, stmtRng, meter);
-          else rv[p] = materializeInsertValue(iv, store.columnTypes()[i]!, bound);
+          if (iv.kind === "default")
+            rv[p] = this.evalDefault(col, defaultExprs[i]!, stmtRng, meter);
+          else
+            rv[p] = materializeInsertValue(iv, store.columnTypes()[i]!, bound);
         }
       }
       rows.push(rv);
     }
-    // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
-    // pre-statement snapshot (grammar.md §32).
+    // Uncorrelated subqueries in the RETURNING list and the DO UPDATE SET/WHERE fold once
+    // (cost.md §3), reading the pre-statement snapshot (grammar.md §32).
+    const foldCost = { value: 0n };
     if (ret !== null) {
-      const foldCost = { value: 0n };
-      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost));
-      meter.charge(foldCost.value);
+      ret.nodes = ret.nodes.map((node) =>
+        this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost),
+      );
     }
-    const returned = this.insertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, rows, ret?.nodes ?? null, bound, meter);
-    return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, rows.length, meter.accrued);
+    this.foldConflictPlan(cplan, bound, foldCost);
+    meter.charge(foldCost.value);
+    const { affected, returned } = this.runInsertRows(
+      table,
+      store,
+      pk,
+      checks,
+      defaultExprs,
+      stmtRng,
+      provided,
+      rows,
+      cplan,
+      ret?.nodes ?? null,
+      bound,
+      meter,
+    );
+    return dmlOutcome(
+      ret?.names ?? null,
+      ret?.types ?? null,
+      returned,
+      affected,
+      meter.accrued,
+    );
   }
 
   // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -2788,8 +3175,17 @@ export class Database {
         // this row through the shared per-statement seam/clock (constraints.md §2). evalDefault
         // charges operator_eval for an expression default; a constant (or no default → NULL) is
         // free.
-        const candidate: Value = p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-        row[i] = coerceForStore(candidate, colTypes[i]!, col.decimal, col.notNull, col.name);
+        const candidate: Value =
+          p >= 0
+            ? values[p]!
+            : this.evalDefault(col, defaultExprs[i]!, rng, meter);
+        row[i] = coerceForStore(
+          candidate,
+          colTypes[i]!,
+          col.decimal,
+          col.notNull,
+          col.name,
+        );
       }
 
       // CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
@@ -2814,40 +3210,9 @@ export class Database {
 
       let key: Uint8Array | null = null;
       if (pk.length > 0) {
-        // The composite key is the concatenation of the members' bare encodings in key
-        // order (encoding.md §2.3) — every keyable type is fixed-width, so the
-        // concatenation is self-delimiting and byte comparison equals the tuple's order. A
-        // single-column key is the one-member case of the same rule.
-        const parts: Uint8Array[] = [];
-        for (const i of pk) {
-          const pkv = row[i]!; // non-null: a PK member is NOT NULL and was checked above
-          if (pkv.kind === "uuid") {
-            // uuid is the first non-integer key: its key is the bare 16 bytes (uuid-raw16,
-            // encoding.md §2.7) — a PK is NOT NULL, so no presence tag, no sign-flip.
-            parts.push(pkv.bytes.slice());
-          } else if (pkv.kind === "bool") {
-            // boolean is the second non-integer key: the bare 1-byte bool-byte (0x00 false /
-            // 0x01 true, encoding.md §2.9) — likewise no presence tag.
-            parts.push(encodeBool(pkv.value));
-          } else if (pkv.kind === "int") {
-            parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.int));
-          } else if (pkv.kind === "timestamp" || pkv.kind === "timestamptz") {
-            // A timestamp / timestamptz PK encodes its i64 instant (spec/design/timestamp.md §6).
-            parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.micros));
-          } else if (pkv.kind === "date") {
-            // A date PK encodes its i32 day count (spec/design/date.md §5).
-            parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.days));
-          } else {
-            throw engineError("data_corrupted", "a primary key must be an integer, boolean, uuid, or timestamp value");
-          }
-        }
-        const total = parts.reduce((acc, b) => acc + b.length, 0);
-        key = new Uint8Array(total);
-        let off = 0;
-        for (const b of parts) {
-          key.set(b, off);
-          off += b.length;
-        }
+        // The composite key is the concatenation of the members' bare encodings in key order
+        // (encoding.md §2.3 — encodePkKey); a single-column key is the one-member case.
+        key = encodePkKey(table, pk, row);
         // The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
         // `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
         const seen = key.join(",");
@@ -2916,7 +3281,10 @@ export class Database {
         if (!this.fkProbeHits(probe, fk.refTable)) {
           throw engineError(
             "foreign_key_violation",
-            "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
+            "insert or update on table " +
+              relation +
+              " violates foreign key constraint " +
+              fk.name,
           );
         }
       }
@@ -2931,7 +3299,13 @@ export class Database {
     // the pre-statement snapshot and a 54P01 here leaves the store untouched.
     const returned =
       returning !== null
-        ? this.projectReturning(returning, prepared.map((pr) => pr.row), null, params, meter)
+        ? this.projectReturning(
+            returning,
+            prepared.map((pr) => pr.row),
+            null,
+            params,
+            meter,
+          )
         : null;
 
     // Phase 2 — every row validated, so each insert is guaranteed to succeed. A synthetic
@@ -2944,14 +3318,18 @@ export class Database {
     for (const pr of prepared) {
       const key = pr.key ?? encodeInt("i64", store.allocRowid());
       for (let k = 0; k < table.indexes.length; k++) {
-        indexInserts[k]!.push(...indexEntryKeys(table.columns, table.indexes[k]!, key, pr.row));
+        indexInserts[k]!.push(
+          ...indexEntryKeys(table.columns, table.indexes[k]!, key, pr.row),
+        );
       }
       if (!store.insert(key, pr.row)) {
         throw new Error("pre-validated INSERT key must be unique");
       }
     }
     for (let k = 0; k < table.indexes.length; k++) {
-      const istore = this.working().indexStore(table.indexes[k]!.name.toLowerCase());
+      const istore = this.working().indexStore(
+        table.indexes[k]!.name.toLowerCase(),
+      );
       for (const ek of indexInserts[k]!) {
         if (!istore.insert(ek, [])) {
           throw new Error("index entry keys are unique (storage-key suffix)");
@@ -2959,6 +3337,603 @@ export class Database {
       }
     }
     return returned;
+  }
+
+  // resolveOnConflict resolves an ON CONFLICT clause (spec/design/upsert.md §2/§5) into a
+  // ConflictPlan: the arbiter, plus — for DO UPDATE — the resolved SET assignment plans and the
+  // optional WHERE filter, both resolved against the [existing | excluded] scope. Threads the
+  // statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT.
+  private resolveOnConflict(
+    table: Table,
+    oc: OnConflict,
+    ptypes: ParamTypes,
+  ): ConflictPlan {
+    const arb = resolveArbiter(table, oc.target);
+    if (!oc.doUpdate) {
+      return { arb, doUpdate: false, assignments: [], filter: null };
+    }
+    // DO UPDATE requires a target (spec/design/upsert.md §2) — PostgreSQL's message.
+    if (arb === null) {
+      throw engineError(
+        "syntax_error",
+        "ON CONFLICT DO UPDATE requires inference specification or constraint name",
+      );
+    }
+    const scope = Scope.onConflictExcluded(this, table);
+    const pkMembers = pkIndices(table);
+    const plans: AssignPlan[] = [];
+    for (const a of oc.assignments) {
+      const idx = columnIndex(table, a.column);
+      if (idx < 0)
+        throw engineError(
+          "undefined_column",
+          "column does not exist: " + a.column,
+        );
+      if (table.columns[idx]!.identity === "always") {
+        throw engineError(
+          "generated_always",
+          `column ${a.column} can only be updated to DEFAULT`,
+        );
+      }
+      if (pkMembers.includes(idx)) {
+        throw engineError(
+          "feature_not_supported",
+          "updating a primary key column is not supported",
+        );
+      }
+      for (const p of plans) {
+        if (p.idx === idx) {
+          throw engineError(
+            "duplicate_column",
+            "column " + a.column + " assigned more than once",
+          );
+        }
+      }
+      const col = table.columns[idx]!;
+      if (col.type.kind === "composite") {
+        throw engineError(
+          "feature_not_supported",
+          "updating composite column " + a.column + " is not supported yet",
+        );
+      }
+      if (col.type.kind === "array") {
+        throw engineError(
+          "feature_not_supported",
+          "updating array column " + a.column + " is not supported yet",
+        );
+      }
+      const targetScalar = col.type.scalar;
+      const { node, type } = resolve(
+        scope,
+        a.value,
+        targetScalar,
+        { collecting: false, groupKeys: [], specs: [] },
+        ptypes,
+      );
+      requireAssignable(type, targetScalar, a.column);
+      plans.push({
+        idx,
+        name: col.name,
+        target: targetScalar,
+        decimal: col.decimal,
+        notNull: col.notNull,
+        source: node,
+      });
+    }
+    const filter =
+      oc.filter !== null
+        ? resolveBooleanFilter(scope, oc.filter, ptypes)
+        : null;
+    return { arb, doUpdate: true, assignments: plans, filter };
+  }
+
+  // arbiterExisting looks up the EXISTING (committed) conflicting row for an arbiter key
+  // (spec/design/upsert.md §3): always a committed row (an in-batch row sharing the arbiter key was
+  // caught earlier by the proposed-arbiter set). Returns { key, row } or null.
+  private arbiterExisting(
+    arb: Arbiter,
+    store: TableStore,
+    table: Table,
+    ak: Uint8Array,
+  ): { key: Uint8Array; row: Row } | null {
+    if (arb.isPK) {
+      const row = store.get(ak);
+      if (row === undefined) return null;
+      return { key: ak, row: store.resolveAll(row) };
+    }
+    const def = table.indexes[arb.indexPos]!;
+    const entries = this.readSnap()
+      .indexStore(def.name.toLowerCase())
+      .rangeEntries(uniqueProbeBound(ak));
+    if (entries.length === 0) return null;
+    const suffix = entries[0]!.key.slice(ak.length);
+    const row = store.get(suffix);
+    if (row === undefined)
+      throw new Error("a unique-index entry points at a live row");
+    return { key: suffix, row: store.resolveAll(row) };
+  }
+
+  // rowConflictsCommitted reports whether a candidate row conflicts with a COMMITTED row on the
+  // primary key or any unique index (the no-target DO NOTHING skip test — spec/design/upsert.md §2).
+  // NULLS DISTINCT: a unique tuple with any NULL component never conflicts.
+  private rowConflictsCommitted(
+    store: TableStore,
+    table: Table,
+    pk: number[],
+    row: Row,
+  ): boolean {
+    if (pk.length > 0 && store.get(encodePkKey(table, pk, row)) !== undefined)
+      return true;
+    for (const def of table.indexes) {
+      if (!def.unique) continue;
+      const prefix = indexPrefixKey(table.columns, def, row);
+      if (prefix === null) continue;
+      if (
+        this.readSnap()
+          .indexStore(def.name.toLowerCase())
+          .rangeEntries(uniqueProbeBound(prefix)).length > 0
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  // foldConflictPlan folds globally-uncorrelated subqueries in a DO UPDATE's SET/WHERE once (their
+  // cost is added a single time — cost.md §3), exactly as UPDATE folds its assignment/filter.
+  private foldConflictPlan(
+    plan: ConflictPlan | null,
+    bound: Value[],
+    foldCost: { value: bigint },
+  ): void {
+    if (plan === null || !plan.doUpdate) return;
+    plan.assignments = plan.assignments.map((ap) => ({
+      ...ap,
+      source: this.foldUncorrelatedInRExpr(
+        ap.source,
+        bound,
+        EMPTY_CTE_CTX,
+        foldCost,
+      ),
+    }));
+    if (plan.filter !== null) {
+      plan.filter = this.foldUncorrelatedInRExpr(
+        plan.filter,
+        bound,
+        EMPTY_CTE_CTX,
+        foldCost,
+      );
+    }
+  }
+
+  // runInsertRows dispatches the validated candidate rows to the plain or the ON CONFLICT insert
+  // path, shared by both INSERT sources. Returns { affected, returned }: a plain insert affects
+  // every candidate row; an ON CONFLICT may insert, update, or skip (spec/design/upsert.md §3).
+  private runInsertRows(
+    table: Table,
+    store: TableStore,
+    pk: number[],
+    checks: NamedCheck[],
+    defaultExprs: (RExpr | null)[],
+    rng: StmtRng,
+    provided: number[],
+    rows: Value[][],
+    conflict: ConflictPlan | null,
+    returning: RExpr[] | null,
+    params: Value[],
+    meter: Meter,
+  ): { affected: number; returned: Value[][] | null } {
+    if (conflict !== null) {
+      return this.insertRowsOnConflict(
+        table,
+        store,
+        pk,
+        checks,
+        defaultExprs,
+        rng,
+        provided,
+        rows,
+        conflict,
+        returning,
+        params,
+        meter,
+      );
+    }
+    const returned = this.insertRows(
+      table,
+      store,
+      pk,
+      checks,
+      defaultExprs,
+      rng,
+      provided,
+      rows,
+      returning,
+      params,
+      meter,
+    );
+    return { affected: rows.length, returned };
+  }
+
+  // insertRowsOnConflict runs phase 1 + phase 2 of an INSERT ... ON CONFLICT (spec/design/upsert.md
+  // §3), the UPSERT analogue of insertRows. Phase 1 walks the candidate rows in source order,
+  // classifying each as a planned INSERT, a planned UPDATE of an existing row, or a SKIP; the
+  // planned inserts + updates are then validated against the statement END STATE (PK / unique /
+  // CHECK / FK) before phase 2 writes anything (all-or-nothing). returning projects the AFFECTED
+  // rows (inserts with an all-NULL old side, updates with their pre-update existing row).
+  private insertRowsOnConflict(
+    table: Table,
+    store: TableStore,
+    pk: number[],
+    checks: NamedCheck[],
+    defaultExprs: (RExpr | null)[],
+    rng: StmtRng,
+    provided: number[],
+    rows: Value[][],
+    plan: ConflictPlan,
+    returning: RExpr[] | null,
+    params: Value[],
+    meter: Meter,
+  ): { affected: number; returned: Value[][] | null } {
+    const n = table.columns.length;
+    const relation = table.name;
+    const colTypes = store.columnTypes();
+    // The unique-index positions in table.indexes (no-target skip test + end-state pass).
+    const uniqIdx: number[] = [];
+    for (let i = 0; i < table.indexes.length; i++)
+      if (table.indexes[i]!.unique) uniqIdx.push(i);
+
+    const inserts: Row[] = [];
+    const updates: { key: Uint8Array; newRow: Row; oldRow: Row }[] = [];
+    // Arbiter keys this statement has already proposed (the §4 second-affect rule).
+    const proposedArb = new Set<string>();
+    // For the no-target DO NOTHING path: the planned inserts' keys/prefixes (the arbiter path uses
+    // proposedArb instead).
+    const insPk = new Set<string>();
+    const insPrefixes = uniqIdx.map(() => new Set<string>());
+
+    const checkEnv = (): EvalEnv => ({
+      params: [],
+      outer: [],
+      runSubquery: (p, o) => this.execQueryPlan(p, o, [], EMPTY_CTE_CTX),
+      seam: this.seam,
+      rng,
+      ctes: EMPTY_CTE_CTX,
+      exec: this,
+    });
+
+    for (const values of rows) {
+      // Build + coerce the candidate row, then CHECK — the INSERT per-row order (NOT NULL before
+      // CHECK before conflict; constraints.md §4.4).
+      const row: Row = new Array(n);
+      for (let i = 0; i < n; i++) {
+        const col = table.columns[i]!;
+        const p = provided[i]!;
+        const candidate: Value =
+          p >= 0
+            ? values[p]!
+            : this.evalDefault(col, defaultExprs[i]!, rng, meter);
+        row[i] = coerceForStore(
+          candidate,
+          colTypes[i]!,
+          col.decimal,
+          col.notNull,
+          col.name,
+        );
+      }
+      if (checks.length > 0) {
+        meter.guard();
+        evalChecks(checks, relation, row, checkEnv(), meter);
+      }
+
+      if (plan.arb === null) {
+        // No-target DO NOTHING: skip on ANY uniqueness conflict (committed OR an earlier planned
+        // insert); else insert (upsert.md §2/§3).
+        const pkk = pk.length > 0 ? encodePkKey(table, pk, row) : null;
+        let conflictHit = this.rowConflictsCommitted(store, table, pk, row);
+        if (!conflictHit && pkk !== null && insPk.has(pkk.join(",")))
+          conflictHit = true;
+        if (!conflictHit) {
+          for (let u = 0; u < uniqIdx.length; u++) {
+            const prefix = indexPrefixKey(
+              table.columns,
+              table.indexes[uniqIdx[u]!]!,
+              row,
+            );
+            if (prefix !== null && insPrefixes[u]!.has(prefix.join(","))) {
+              conflictHit = true;
+              break;
+            }
+          }
+        }
+        if (conflictHit) continue; // skip
+        if (pkk !== null) insPk.add(pkk.join(","));
+        for (let u = 0; u < uniqIdx.length; u++) {
+          const prefix = indexPrefixKey(
+            table.columns,
+            table.indexes[uniqIdx[u]!]!,
+            row,
+          );
+          if (prefix !== null) insPrefixes[u]!.add(prefix.join(","));
+        }
+        inserts.push(row);
+        continue;
+      }
+
+      // Arbiter present (DO UPDATE always; DO NOTHING with a target).
+      const ak = arbiterKey(plan.arb, table, pk, row);
+      if (ak === null) {
+        // A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
+        inserts.push(row);
+        continue;
+      }
+      const akKey = ak.join(",");
+      if (proposedArb.has(akKey)) {
+        // A second proposed row with the same arbiter key (§4).
+        if (plan.doUpdate) {
+          throw engineError(
+            "cardinality_violation",
+            "ON CONFLICT DO UPDATE command cannot affect row a second time",
+          );
+        }
+        continue; // DO NOTHING → skip
+      }
+      proposedArb.add(akKey);
+      const existing = this.arbiterExisting(plan.arb, store, table, ak);
+      if (existing === null) {
+        // No committed conflict on the arbiter → insert (a non-arbiter conflict is caught by the
+        // end-state validation below).
+        inserts.push(row);
+        continue;
+      }
+      if (!plan.doUpdate) continue; // DO NOTHING → skip
+      // DO UPDATE: the combined eval row [existing | proposed] the §5 scope resolves against.
+      const combined = existing.row.concat(row);
+      const env: EvalEnv = {
+        params,
+        outer: [],
+        runSubquery: (p, o) => this.execQueryPlan(p, o, params, EMPTY_CTE_CTX),
+        seam: this.seam,
+        rng,
+        ctes: EMPTY_CTE_CTX,
+        exec: this,
+      };
+      // An optional WHERE that is not TRUE skips the update (existing row unchanged, not returned)
+      // — but the arbiter key was already proposed, so a second row still trips §4.
+      if (
+        plan.filter !== null &&
+        !isTrue(evalExpr(plan.filter, combined, env, meter))
+      )
+        continue;
+      const newRow = existing.row.slice();
+      for (const ap of plan.assignments) {
+        newRow[ap.idx] = checkAssign(
+          ap,
+          evalExpr(ap.source, combined, env, meter),
+        );
+      }
+      if (checks.length > 0)
+        evalChecks(checks, relation, newRow, checkEnv(), meter);
+      updates.push({ key: existing.key, newRow, oldRow: existing.row });
+    }
+
+    // End-state validation (upsert.md §3), before any write. PRIMARY KEY: each insert's key must be
+    // free in the committed store and distinct from the other inserts — a collision is 23505 on
+    // <table>_pkey (a non-arbiter PK conflict).
+    if (pk.length > 0 && inserts.length > 0) {
+      const seen = new Set<string>();
+      for (const row of inserts) {
+        const k = encodePkKey(table, pk, row);
+        const ks = k.join(",");
+        if (store.get(k) !== undefined || seen.has(ks)) {
+          throw engineError(
+            "unique_violation",
+            "duplicate key value violates unique constraint: " +
+              relation.toLowerCase() +
+              "_pkey",
+          );
+        }
+        seen.add(ks);
+      }
+    }
+
+    // UNIQUE indexes: validate the END STATE over the updated NEW rows + the inserted rows
+    // (indexes.md §8 — the same end-state model as UPDATE).
+    if (uniqIdx.length > 0 && (inserts.length > 0 || updates.length > 0)) {
+      const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
+      const newRows = updates.map((u) => u.newRow).concat(inserts);
+      for (const ix of uniqIdx) {
+        const def = table.indexes[ix]!;
+        const istore = this.readSnap().indexStore(def.name.toLowerCase());
+        const batch = new Set<string>();
+        for (const newRow of newRows) {
+          const prefix = indexPrefixKey(table.columns, def, newRow);
+          if (prefix === null) continue;
+          const k = prefix.join(",");
+          const conflict =
+            batch.has(k) ||
+            istore
+              .rangeEntries(uniqueProbeBound(prefix))
+              .some(
+                (e) => !rewritten.has(e.key.slice(prefix.length).join(",")),
+              );
+          if (conflict) {
+            throw engineError(
+              "unique_violation",
+              "duplicate key value violates unique constraint: " + def.name,
+            );
+          }
+          batch.add(k);
+        }
+      }
+    }
+
+    // FOREIGN KEY child-side (constraints.md §6.4): each inserted row, and each updated row that
+    // assigned an FK local column, must reference an existing parent key — the committed parent
+    // state plus (for a self-reference) the statement's end state.
+    const assigned = new Set<number>(
+      plan.doUpdate ? plan.assignments.map((a) => a.idx) : [],
+    );
+    const fks = this.table(relation)?.fks ?? [];
+    for (const fk of fks) {
+      const parent = this.table(fk.refTable);
+      if (parent === undefined) continue;
+      const checkUpdates = fk.columns.some((c) => assigned.has(c));
+      const batch = new Set<string>();
+      if (fk.refTable.toLowerCase() === relation.toLowerCase()) {
+        for (const row of inserts) {
+          const p = fkProbe(fk, parent, row, fk.refColumns);
+          if (p !== null) batch.add(fkProbeBytes(p).join(","));
+        }
+        for (const u of updates) {
+          const p = fkProbe(fk, parent, u.newRow, fk.refColumns);
+          if (p !== null) batch.add(fkProbeBytes(p).join(","));
+        }
+      }
+      const toCheck = inserts.concat(
+        checkUpdates ? updates.map((u) => u.newRow) : [],
+      );
+      for (const row of toCheck) {
+        const probe = fkProbe(fk, parent, row, fk.columns);
+        if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
+        if (batch.has(fkProbeBytes(probe).join(","))) continue;
+        if (!this.fkProbeHits(probe, fk.refTable)) {
+          throw engineError(
+            "foreign_key_violation",
+            "insert or update on table " +
+              relation +
+              " violates foreign key constraint " +
+              fk.name,
+          );
+        }
+      }
+    }
+
+    // FOREIGN KEY parent-side (constraints.md §6.5): an updated referenced row must not strand a
+    // child (only a referenced UNIQUE column is at risk; inserts add rows, never strand a child).
+    const referencers = this.fkReferencers(relation);
+    if (referencers.length > 0 && updates.length > 0) {
+      const parent = this.table(relation)!;
+      const updatedKeys = new Set<string>(updates.map((u) => u.key.join(",")));
+      for (const { childTable, fk } of referencers) {
+        const newPresent = new Set<string>();
+        for (const u of updates) {
+          const p = fkProbe(fk, parent, u.newRow, fk.refColumns);
+          if (p !== null) newPresent.add(fkProbeBytes(p).join(","));
+        }
+        for (const u of updates) {
+          const oldProbe = fkProbe(fk, parent, u.oldRow, fk.refColumns);
+          if (oldProbe === null) continue;
+          const newProbe = fkProbe(fk, parent, u.newRow, fk.refColumns);
+          if (
+            newProbe !== null &&
+            bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))
+          )
+            continue;
+          if (newPresent.has(fkProbeBytes(oldProbe).join(","))) continue;
+          if (
+            this.fkChildReferences(
+              childTable,
+              fk,
+              parent,
+              fkProbeBytes(oldProbe),
+              updatedKeys,
+            )
+          ) {
+            throw engineError(
+              "foreign_key_violation",
+              "update or delete on table " +
+                parent.name +
+                " violates foreign key constraint " +
+                fk.name +
+                " on table " +
+                childTable,
+            );
+          }
+        }
+      }
+    }
+
+    // Meter the disposition-plan compression attempts (value_compress, cost.md §3) for the inserted
+    // + updated rows; enforce the ceiling BEFORE phase 2 writes (all-or-nothing).
+    let cunits = 0n;
+    const placeholder = new Uint8Array(8);
+    for (const row of inserts) {
+      const kb = pk.length > 0 ? encodePkKey(table, pk, row) : placeholder;
+      cunits += BigInt(store.writeCompressUnits(kb, row));
+    }
+    for (const u of updates)
+      cunits += BigInt(store.writeCompressUnits(u.key, u.newRow));
+    meter.charge(COSTS.valueCompress * cunits);
+    meter.guard();
+
+    // RETURNING (grammar.md §32): project the affected rows — inserts (old side all-NULL) then
+    // updates (old side the pre-update existing row) — after all validation, before any write.
+    let returned: Value[][] | null = null;
+    if (returning !== null) {
+      const nullRow: Row = table.columns.map(() => nullValue());
+      const prows: Row[] = [];
+      const olds: Row[] = [];
+      for (const row of inserts) {
+        prows.push(row);
+        olds.push(nullRow);
+      }
+      for (const u of updates) {
+        prows.push(u.newRow);
+        olds.push(u.oldRow);
+      }
+      returned = this.projectReturning(returning, prows, olds, params, meter);
+    }
+
+    const affected = inserts.length + updates.length;
+
+    // Phase 2 — every row validated. Insert the new rows (rowid alloc for a no-PK table, index
+    // entries added), then replace the updated rows (index entries moved).
+    const indexAdds: Uint8Array[][] = table.indexes.map(() => []);
+    for (const row of inserts) {
+      const key =
+        pk.length > 0
+          ? encodePkKey(table, pk, row)
+          : encodeInt("i64", store.allocRowid());
+      for (let k = 0; k < table.indexes.length; k++) {
+        indexAdds[k]!.push(
+          ...indexEntryKeys(table.columns, table.indexes[k]!, key, row),
+        );
+      }
+      if (!store.insert(key, row))
+        throw new Error("pre-validated INSERT key must be unique");
+    }
+    const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] =
+      table.indexes.map(() => []);
+    for (const u of updates) {
+      for (let k = 0; k < table.indexes.length; k++) {
+        const def = table.indexes[k]!;
+        const oldEks = indexEntryKeys(table.columns, def, u.key, u.oldRow);
+        const newEks = indexEntryKeys(table.columns, def, u.key, u.newRow);
+        const removals = bytesDiff(oldEks, newEks);
+        const insertions = bytesDiff(newEks, oldEks);
+        if (removals.length > 0 || insertions.length > 0)
+          indexMoves[k]!.push({ removals, insertions });
+      }
+    }
+    for (const u of updates) store.replace(u.key, u.newRow);
+    for (let k = 0; k < table.indexes.length; k++) {
+      const istore = this.working().indexStore(
+        table.indexes[k]!.name.toLowerCase(),
+      );
+      for (const ek of indexAdds[k]!) {
+        if (!istore.insert(ek, []))
+          throw new Error("index entry keys are unique (storage-key suffix)");
+      }
+      for (const mv of indexMoves[k]!) {
+        for (const oldEk of mv.removals) istore.remove(oldEk);
+        for (const newEk of mv.insertions) {
+          if (!istore.insert(newEk, []))
+            throw new Error("index entry keys are unique (storage-key suffix)");
+        }
+      }
+    }
+    return { affected, returned };
   }
 
   // resolveReturning resolves a RETURNING item list against the target table's one-relation
@@ -2999,12 +3974,22 @@ export class Database {
     params: Value[],
     meter: Meter,
   ): Value[][] {
-    const env: EvalEnv = { params, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, params, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX, exec: this };
+    const env: EvalEnv = {
+      params,
+      outer: [],
+      runSubquery: (p, o) => this.execQueryPlan(p, o, params, EMPTY_CTE_CTX),
+      seam: this.seam,
+      rng: new StmtRng(),
+      ctes: EMPTY_CTE_CTX,
+      exec: this,
+    };
     const out: Value[][] = [];
     rows.forEach((row, i) => {
       meter.guard();
       meter.charge(COSTS.rowProduced);
-      const combined = row.concat(others !== null ? others[i]! : row.map(() => nullValue()));
+      const combined = row.concat(
+        others !== null ? others[i]! : row.map(() => nullValue()),
+      );
       out.push(nodes.map((node) => evalExpr(node, combined, env, meter)));
     });
     return out;
@@ -3016,15 +4001,23 @@ export class Database {
   private executeDelete(del: Delete, params: Value[]): Outcome {
     const table = this.table(del.table);
     if (!table) {
-      throw engineError("undefined_table", "table does not exist: " + del.table);
+      throw engineError(
+        "undefined_table",
+        "table does not exist: " + del.table,
+      );
     }
     // DELETE is single-table; resolve its WHERE against a one-relation scope. The RETURNING
     // projection resolves after it (PostgreSQL's analysis order), against the same scope
     // (grammar.md §32).
     const scope = Scope.single(this, table);
     const ptypes = new ParamTypes();
-    let filter = del.filter ? resolveBooleanFilter(scope, del.filter, ptypes) : null;
-    const ret = del.returning !== null ? this.resolveReturning(table, del.returning, true, ptypes) : null;
+    let filter = del.filter
+      ? resolveBooleanFilter(scope, del.filter, ptypes)
+      : null;
+    const ret =
+      del.returning !== null
+        ? this.resolveReturning(table, del.returning, true, ptypes)
+        : null;
     const bound = bindParams(params, ptypes.finalize());
 
     // Fold globally-uncorrelated WHERE subqueries once (their cost is added a single time —
@@ -3042,10 +4035,20 @@ export class Database {
     // pre-statement snapshot (grammar.md §32).
     if (ret !== null) {
       const cost = { value: 0n };
-      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, cost));
+      ret.nodes = ret.nodes.map((node) =>
+        this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, cost),
+      );
       meter.charge(cost.value);
     }
-    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX, exec: this };
+    const env: EvalEnv = {
+      params: bound,
+      outer: [],
+      runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+      seam: this.seam,
+      rng: new StmtRng(),
+      ctes: EMPTY_CTE_CTX,
+      exec: this,
+    };
     const store = this.working().store(del.table);
     // matched collects (key, row) pairs before mutating; the rows feed phase 2's
     // index-entry removal (indexed columns are fixed-width and always resident).
@@ -3058,7 +4061,9 @@ export class Database {
     const mask: boolean[] = new Array(table.columns.length).fill(false);
     if (filter !== null) collectTouched(filter, 0, mask);
     if (ret !== null) {
-      const retMask: boolean[] = new Array(2 * table.columns.length).fill(false);
+      const retMask: boolean[] = new Array(2 * table.columns.length).fill(
+        false,
+      );
       for (const node of ret.nodes) collectTouched(node, 0, retMask);
       for (let i = 0; i < mask.length; i++) {
         if (retMask[i]) mask[i] = true;
@@ -3083,7 +4088,14 @@ export class Database {
       const gb = detectGinBound(filter, table.indexes, table.columns, 0);
       if (gb !== null) {
         const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
-        const r = this.ginBoundRows(del.table, gb, m?.query ?? null, env, meter, mask);
+        const r = this.ginBoundRows(
+          del.table,
+          gb,
+          m?.query ?? null,
+          env,
+          meter,
+          mask,
+        );
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -3094,8 +4106,17 @@ export class Database {
         slabs = u.slabs;
       }
     }
-    if (entries === null) return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
-    meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
+    if (entries === null)
+      return dmlOutcome(
+        ret?.names ?? null,
+        ret?.types ?? null,
+        null,
+        0,
+        meter.accrued,
+      ); // empty bound
+    meter.charge(
+      COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs),
+    );
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
@@ -3119,14 +4140,30 @@ export class Database {
       const deletedKeys = new Set<string>(matched.map((m) => m.key.join(",")));
       const empty = new Set<string>();
       for (const { childTable, fk } of delReferencers) {
-        const exclude = childTable.toLowerCase() === del.table.toLowerCase() ? deletedKeys : empty;
+        const exclude =
+          childTable.toLowerCase() === del.table.toLowerCase()
+            ? deletedKeys
+            : empty;
         for (const m of matched) {
           const probe = fkProbe(fk, parent, m.row, fk.refColumns);
           if (probe === null) continue; // a NULL referenced value cannot be referenced (MATCH SIMPLE)
-          if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(probe), exclude)) {
+          if (
+            this.fkChildReferences(
+              childTable,
+              fk,
+              parent,
+              fkProbeBytes(probe),
+              exclude,
+            )
+          ) {
             throw engineError(
               "foreign_key_violation",
-              "update or delete on table " + parent.name + " violates foreign key constraint " + fk.name + " on table " + childTable,
+              "update or delete on table " +
+                parent.name +
+                " violates foreign key constraint " +
+                fk.name +
+                " on table " +
+                childTable,
             );
           }
         }
@@ -3138,7 +4175,13 @@ export class Database {
     // snapshot, and a 54P01 here deletes nothing (all-or-nothing).
     const returned =
       ret !== null
-        ? this.projectReturning(ret.nodes, matched.map((m) => m.row), null, bound, meter)
+        ? this.projectReturning(
+            ret.nodes,
+            matched.map((m) => m.row),
+            null,
+            bound,
+            meter,
+          )
         : null;
     // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
     // unmetered write work; an index removal cannot fail).
@@ -3146,10 +4189,17 @@ export class Database {
     for (const def of table.indexes) {
       const istore = this.working().indexStore(def.name.toLowerCase());
       for (const m of matched) {
-        for (const ek of indexEntryKeys(table.columns, def, m.key, m.row)) istore.remove(ek);
+        for (const ek of indexEntryKeys(table.columns, def, m.key, m.row))
+          istore.remove(ek);
       }
     }
-    return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, matched.length, meter.accrued);
+    return dmlOutcome(
+      ret?.names ?? null,
+      ret?.types ?? null,
+      returned,
+      matched.length,
+      meter.accrued,
+    );
   }
 
   // executeUpdate is two-phase / all-or-nothing: phase 1 builds and type-checks every
@@ -3160,7 +4210,10 @@ export class Database {
   private executeUpdate(upd: Update, params: Value[]): Outcome {
     const table = this.table(upd.table);
     if (!table) {
-      throw engineError("undefined_table", "table does not exist: " + upd.table);
+      throw engineError(
+        "undefined_table",
+        "table does not exist: " + upd.table,
+      );
     }
 
     // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
@@ -3176,7 +4229,10 @@ export class Database {
     for (const a of upd.assignments) {
       const idx = columnIndex(table, a.column);
       if (idx < 0) {
-        throw engineError("undefined_column", "column does not exist: " + a.column);
+        throw engineError(
+          "undefined_column",
+          "column does not exist: " + a.column,
+        );
       }
       // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4); jed's
       // UPDATE has no `= DEFAULT` form, so any assignment is 428C9. Ordered before the PK-narrowing
@@ -3205,24 +4261,48 @@ export class Database {
       // Updating a composite-typed column lands in a later slice (the storable + INSERT/SELECT
       // round-trip is S3 — spec/design/composite.md §12); reject it for now (0A000).
       if (col.type.kind === "composite") {
-        throw engineError("feature_not_supported", "updating composite column " + a.column + " is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "updating composite column " + a.column + " is not supported yet",
+        );
       }
       if (col.type.kind === "array") {
-        throw engineError("feature_not_supported", "updating array column " + a.column + " is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "updating array column " + a.column + " is not supported yet",
+        );
       }
       const targetScalar = col.type.scalar;
       // The RHS is a general expression evaluated against the OLD row; a literal operand
       // adapts to the target column's type. The result must be assignable to the column's
       // family (integer/decimal/text or NULL; never boolean; decimal→int is explicit only).
-      const { node, type } = resolve(scope, a.value, targetScalar, { collecting: false, groupKeys: [], specs: [] }, ptypes);
+      const { node, type } = resolve(
+        scope,
+        a.value,
+        targetScalar,
+        { collecting: false, groupKeys: [], specs: [] },
+        ptypes,
+      );
       requireAssignable(type, targetScalar, a.column);
-      plans.push({ idx, name: col.name, target: targetScalar, decimal: col.decimal, notNull: col.notNull, source: node });
+      plans.push({
+        idx,
+        name: col.name,
+        target: targetScalar,
+        decimal: col.decimal,
+        notNull: col.notNull,
+        source: node,
+      });
     }
 
-    let filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
+    let filter = upd.filter
+      ? resolveBooleanFilter(scope, upd.filter, ptypes)
+      : null;
     // The RETURNING projection resolves last (PostgreSQL's analysis order), against the same
     // one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
-    const ret = upd.returning !== null ? this.resolveReturning(table, upd.returning, false, ptypes) : null;
+    const ret =
+      upd.returning !== null
+        ? this.resolveReturning(table, upd.returning, false, ptypes)
+        : null;
     // The CHECK constraints, resolved once per statement in evaluation (name) order;
     // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
     const checks = this.resolveChecks(table);
@@ -3239,13 +4319,35 @@ export class Database {
     // the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
     const meter = new Meter(this.maxCost);
     const foldCost = { value: 0n };
-    for (const p of plans) p.source = this.foldUncorrelatedInRExpr(p.source, bound, EMPTY_CTE_CTX, foldCost);
-    if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, EMPTY_CTE_CTX, foldCost);
+    for (const p of plans)
+      p.source = this.foldUncorrelatedInRExpr(
+        p.source,
+        bound,
+        EMPTY_CTE_CTX,
+        foldCost,
+      );
+    if (filter !== null)
+      filter = this.foldUncorrelatedInRExpr(
+        filter,
+        bound,
+        EMPTY_CTE_CTX,
+        foldCost,
+      );
     if (ret !== null) {
-      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost));
+      ret.nodes = ret.nodes.map((node) =>
+        this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost),
+      );
     }
     meter.charge(foldCost.value);
-    const env: EvalEnv = { params: bound, outer: [], runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX), seam: this.seam, rng: new StmtRng(), ctes: EMPTY_CTE_CTX, exec: this };
+    const env: EvalEnv = {
+      params: bound,
+      outer: [],
+      runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+      seam: this.seam,
+      rng: new StmtRng(),
+      ctes: EMPTY_CTE_CTX,
+      exec: this,
+    };
     const store = this.working().store(upd.table);
     // Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
     const updates: { key: Uint8Array; row: Row; oldRow: Row }[] = [];
@@ -3287,7 +4389,14 @@ export class Database {
       const gb = detectGinBound(filter, table.indexes, table.columns, 0);
       if (gb !== null) {
         const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
-        const r = this.ginBoundRows(upd.table, gb, m?.query ?? null, env, meter, mask);
+        const r = this.ginBoundRows(
+          upd.table,
+          gb,
+          m?.query ?? null,
+          env,
+          meter,
+          mask,
+        );
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -3298,15 +4407,25 @@ export class Database {
         slabs = u.slabs;
       }
     }
-    if (entries === null) return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
-    meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
+    if (entries === null)
+      return dmlOutcome(
+        ret?.names ?? null,
+        ret?.types ?? null,
+        null,
+        0,
+        meter.accrued,
+      ); // empty bound
+    meter.charge(
+      COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs),
+    );
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
       // Materialize the filter's + assignment sources' columns if the lazy load left them
       // unfetched — exactly the touched set the block above charged (large-values.md §14).
       const row = store.resolveColumns(e.row, mask);
-      if (filter !== null && !isTrue(evalExpr(filter, row, env, meter))) continue;
+      if (filter !== null && !isTrue(evalExpr(filter, row, env, meter)))
+        continue;
       const newRow = row.slice();
       for (const p of plans) {
         newRow[p.idx] = checkAssign(p, evalExpr(p.source, row, env, meter));
@@ -3345,7 +4464,9 @@ export class Database {
             batch.has(k) ||
             istore
               .rangeEntries(uniqueProbeBound(prefix))
-              .some((e) => !rewritten.has(e.key.slice(prefix.length).join(",")));
+              .some(
+                (e) => !rewritten.has(e.key.slice(prefix.length).join(",")),
+              );
           if (conflict) {
             throw engineError(
               "unique_violation",
@@ -3383,7 +4504,10 @@ export class Database {
         if (!this.fkProbeHits(probe, fk.refTable)) {
           throw engineError(
             "foreign_key_violation",
-            "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
+            "insert or update on table " +
+              relation +
+              " violates foreign key constraint " +
+              fk.name,
           );
         }
       }
@@ -3408,19 +4532,39 @@ export class Database {
           const p = fkProbe(fk, parent, u.row, fk.refColumns);
           if (p !== null) newPresent.add(fkProbeBytes(p).join(","));
         }
-        const exclude = childTable.toLowerCase() === upd.table.toLowerCase() ? updatedKeys : empty;
+        const exclude =
+          childTable.toLowerCase() === upd.table.toLowerCase()
+            ? updatedKeys
+            : empty;
         for (const u of updates) {
           const oldProbe = fkProbe(fk, parent, u.oldRow, fk.refColumns);
           if (oldProbe === null) continue; // a NULL old referenced value was referenced by nothing
           // Unchanged tuples (incl. a NULL → already skipped) do not disappear.
           const newProbe = fkProbe(fk, parent, u.row, fk.refColumns);
-          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))) continue;
+          if (
+            newProbe !== null &&
+            bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))
+          )
+            continue;
           // Re-supplied by another updated row (e.g. a value swap) → not disappearing.
           if (newPresent.has(fkProbeBytes(oldProbe).join(","))) continue;
-          if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), exclude)) {
+          if (
+            this.fkChildReferences(
+              childTable,
+              fk,
+              parent,
+              fkProbeBytes(oldProbe),
+              exclude,
+            )
+          ) {
             throw engineError(
               "foreign_key_violation",
-              "update or delete on table " + parent.name + " violates foreign key constraint " + fk.name + " on table " + childTable,
+              "update or delete on table " +
+                parent.name +
+                " violates foreign key constraint " +
+                fk.name +
+                " on table " +
+                childTable,
             );
           }
         }
@@ -3431,7 +4575,8 @@ export class Database {
     // — meter the attempts (value_compress, cost.md §3) and enforce the ceiling BEFORE phase 2
     // writes anything, preserving all-or-nothing.
     let cunits = 0n;
-    for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.key, u.row));
+    for (const u of updates)
+      cunits += BigInt(store.writeCompressUnits(u.key, u.row));
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
 
@@ -3441,7 +4586,13 @@ export class Database {
     // writes nothing (all-or-nothing).
     const returned =
       ret !== null
-        ? this.projectReturning(ret.nodes, updates.map((u) => u.row), updates.map((u) => u.oldRow), bound, meter)
+        ? this.projectReturning(
+            ret.nodes,
+            updates.map((u) => u.row),
+            updates.map((u) => u.oldRow),
+            bound,
+            meter,
+          )
         : null;
 
     // Index maintenance (indexes.md §4): an entry moves only when its key CHANGED — equal
@@ -3449,9 +4600,8 @@ export class Database {
     // copy-on-write dirty set, and so the commit's written pages, byte-identical across
     // cores). The storage key cannot change (PK assignment is rejected), so the suffix is
     // stable.
-    const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] = table.indexes.map(
-      () => [],
-    );
+    const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] =
+      table.indexes.map(() => []);
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
         const def = table.indexes[k]!;
@@ -3472,7 +4622,9 @@ export class Database {
     // changed index entries (unmetered write work; cannot fail).
     for (const u of updates) store.replace(u.key, u.row);
     for (let k = 0; k < table.indexes.length; k++) {
-      const istore = this.working().indexStore(table.indexes[k]!.name.toLowerCase());
+      const istore = this.working().indexStore(
+        table.indexes[k]!.name.toLowerCase(),
+      );
       for (const mv of indexMoves[k]!) {
         for (const oldEk of mv.removals) istore.remove(oldEk);
         for (const newEk of mv.insertions) {
@@ -3482,21 +4634,39 @@ export class Database {
         }
       }
     }
-    return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, updates.length, meter.accrued);
+    return dmlOutcome(
+      ret?.names ?? null,
+      ret?.types ?? null,
+      returned,
+      updates.length,
+      meter.accrued,
+    );
   }
 
   // executeSelect runs a SELECT as a top-level statement: runSelect, then wrap as a query
   // Outcome (the projection types are internal — only INSERT ... SELECT consumes them).
   private executeSelect(sel: Select, params: Value[]): Outcome {
     const r = this.runSelect(sel, params);
-    return { kind: "query", columnNames: r.columnNames, columnTypes: typeNames(r.columnTypes), rows: r.rows, cost: r.cost };
+    return {
+      kind: "query",
+      columnNames: r.columnNames,
+      columnTypes: typeNames(r.columnTypes),
+      rows: r.rows,
+      cost: r.cost,
+    };
   }
 
   // executeSetOp runs a set operation as a top-level statement: runSetOp, then wrap as a query
   // Outcome. Cost is lhs.cost + rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
   private executeSetOp(so: SetOp, params: Value[]): Outcome {
     const r = this.runSetOp(so, params);
-    return { kind: "query", columnNames: r.columnNames, columnTypes: typeNames(r.columnTypes), rows: r.rows, cost: r.cost };
+    return {
+      kind: "query",
+      columnNames: r.columnNames,
+      columnTypes: typeNames(r.columnTypes),
+      rows: r.rows,
+      cost: r.cost,
+    };
   }
 
   // runQueryExpr runs a query expression to a SelectResult — a lone SELECT via runSelect, or a set
@@ -3532,7 +4702,13 @@ export class Database {
   // as a query Outcome.
   private executeWith(wq: WithQuery, params: Value[]): Outcome {
     const r = this.runWith(wq, params);
-    return { kind: "query", columnNames: r.columnNames, columnTypes: typeNames(r.columnTypes), rows: r.rows, cost: r.cost };
+    return {
+      kind: "query",
+      columnNames: r.columnNames,
+      columnTypes: typeNames(r.columnTypes),
+      rows: r.rows,
+      cost: r.cost,
+    };
   }
 
   // runWith runs a WITH query (spec/design/cte.md). The CTE orchestrator:
@@ -3553,11 +4729,20 @@ export class Database {
     for (const cte of wq.ctes) {
       const lname = cte.name.toLowerCase();
       if (bindings.some((b) => b.name === lname)) {
-        throw engineError("duplicate_alias", `WITH query name ${lname} specified more than once`);
+        throw engineError(
+          "duplicate_alias",
+          `WITH query name ${lname} specified more than once`,
+        );
       }
       const plan = this.planQuery(cte.query, null, bindings, ptypes);
       const table = cteSyntheticTable(lname, plan, cte.columns);
-      bindings.push({ name: lname, table, plan, hint: cte.materialized, refs: 0 });
+      bindings.push({
+        name: lname,
+        table,
+        plan,
+        hint: cte.materialized,
+        refs: 0,
+      });
     }
     // (2) Plan the main body with all bindings visible.
     const plan = this.planQuery(wq.body, null, bindings, ptypes);
@@ -3580,7 +4765,11 @@ export class Database {
       if (modes[i] === "materialize") {
         // Earlier-only context (the prefix): a CTE body sees EARLIER CTEs, never itself or a later
         // one (forward-only visibility — cte.md §2).
-        const ctx: CteCtx = { modes: modes.slice(0, i), plans: plans.slice(0, i), buffers };
+        const ctx: CteCtx = {
+          modes: modes.slice(0, i),
+          plans: plans.slice(0, i),
+          buffers,
+        };
         const r = this.execQueryPlan(plans[i]!, [], bound, ctx);
         totalCost += r.cost;
         buffers.push(r.rows);
@@ -3602,7 +4791,12 @@ export class Database {
   // is the statement's CTE bindings visible here (spec/design/cte.md §2) — inherited into every
   // nested scope, never via the parent chain.
   // Not private: the free function planSubquery calls it through scope.catalog (an internal seam).
-  planQuery(qe: QueryExpr, parent: Scope | null, ctes: CteBinding[], ptypes: ParamTypes): QueryPlan {
+  planQuery(
+    qe: QueryExpr,
+    parent: Scope | null,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+  ): QueryPlan {
     return qe.kind === "select"
       ? this.planSelect(qe, parent, ctes, ptypes)
       : this.planSetOp(qe, parent, ctes, ptypes);
@@ -3611,16 +4805,28 @@ export class Database {
   // execQueryPlan executes a resolved plan against an outer-row environment (outer = the enclosing
   // rows, innermost last; empty at top level), the bound parameters, and the CTE context (a FROM
   // reference at any depth delivers a CTE's rows — spec/design/cte.md §5).
-  private execQueryPlan(plan: QueryPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
-    if (plan.kind === "select") return this.execSelectPlan(plan, outer, params, ctes);
-    if (plan.kind === "values") return this.execValuesPlan(plan, outer, params, ctes);
+  private execQueryPlan(
+    plan: QueryPlan,
+    outer: Row[],
+    params: Value[],
+    ctes: CteCtx,
+  ): SelectResult {
+    if (plan.kind === "select")
+      return this.execSelectPlan(plan, outer, params, ctes);
+    if (plan.kind === "values")
+      return this.execValuesPlan(plan, outer, params, ctes);
     return this.execSetOpPlan(plan, outer, params, ctes);
   }
 
   // planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
   // parent scope, check arity + unify column types up front (so the 42601/42804 fire even over
   // empty operands), and resolve the trailing ORDER BY by output column name.
-  private planSetOp(so: SetOp, parent: Scope | null, ctes: CteBinding[], ptypes: ParamTypes): SetOpPlan {
+  private planSetOp(
+    so: SetOp,
+    parent: Scope | null,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+  ): SetOpPlan {
     const lhs = this.planQuery(so.lhs, parent, ctes, ptypes);
     const rhs = this.planQuery(so.rhs, parent, ctes, ptypes);
 
@@ -3630,7 +4836,9 @@ export class Database {
         `each ${setopName(so.op)} query must have the same number of columns`,
       );
     }
-    const columnTypes = lhs.columnTypes.map((l, i) => unifySetopColumn(l, rhs.columnTypes[i]!, so.op));
+    const columnTypes = lhs.columnTypes.map((l, i) =>
+      unifySetopColumn(l, rhs.columnTypes[i]!, so.op),
+    );
     const columnNames = lhs.columnNames;
     const order: OrderSlot[] = so.orderBy.map((key) => ({
       idx: resolveSetopOrderKey(key, columnNames),
@@ -3654,7 +4862,12 @@ export class Database {
   // execSetOpPlan executes a resolved set operation: run both operands against the outer
   // environment, coerce to the unified types, combine, then sort + window. Cost is lhs.cost +
   // rhs.cost — the combine, sort, and window are unmetered (cost.md §3).
-  private execSetOpPlan(plan: SetOpPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
+  private execSetOpPlan(
+    plan: SetOpPlan,
+    outer: Row[],
+    params: Value[],
+    ctes: CteCtx,
+  ): SelectResult {
     const left = this.execQueryPlan(plan.lhs, outer, params, ctes);
     const right = this.execQueryPlan(plan.rhs, outer, params, ctes);
 
@@ -3676,10 +4889,16 @@ export class Database {
 
     const n = BigInt(rows.length);
     const start = plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
-    const end = plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
+    const end =
+      plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
     rows = rows.slice(Number(start), Number(end));
 
-    return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows, cost };
+    return {
+      columnNames: plan.columnNames,
+      columnTypes: plan.columnTypes,
+      rows,
+      cost,
+    };
   }
 
   // planValues resolves a VALUES-body relation into a ValuesPlan (spec/design/grammar.md §42) — the
@@ -3691,7 +4910,12 @@ export class Database {
   // parameter is then noted at its column's unified type (so VALUES (1),($1) types $1 as int); a
   // column with no concrete type — all NULL/param — leaves its $N untyped, surfacing 42P18 at
   // finalize (jed's no-cross-context inference posture, §26).
-  private planValues(rows: Expr[][], parent: Scope | null, ctes: CteBinding[], ptypes: ParamTypes): ValuesPlan {
+  private planValues(
+    rows: Expr[][],
+    parent: Scope | null,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+  ): ValuesPlan {
     const arity = rows[0]!.length; // the parser guarantees at least one row, each with ≥1 value
     // A constant scope: no local relations. With parent===null (the usual case) any column reference
     // is unresolved (the non-LATERAL rule, §42); with a parent (a LATERAL VALUES body, §44) a column
@@ -3705,12 +4929,21 @@ export class Database {
     const colParams: number[][] = Array.from({ length: arity }, () => []);
     rows.forEach((row, ri) => {
       if (row.length !== arity) {
-        throw engineError("syntax_error", "VALUES lists must all be the same length");
+        throw engineError(
+          "syntax_error",
+          "VALUES lists must all be the same length",
+        );
       }
       const resolvedRow: RExpr[] = [];
       row.forEach((val, ci) => {
         // Forbidden aggregate context: an aggregate inside a value is 42803.
-        const { node, type } = resolve(scope, val, null, { collecting: false, groupKeys: [], specs: [] }, ptypes);
+        const { node, type } = resolve(
+          scope,
+          val,
+          null,
+          { collecting: false, groupKeys: [], specs: [] },
+          ptypes,
+        );
         if (node.kind === "param") colParams[ci]!.push(node.index);
         if (ri === 0) colTypes.push(type);
         else colTypes[ci] = unifyValuesColumn(colTypes[ci]!, type);
@@ -3726,8 +4959,16 @@ export class Database {
     }
     // PostgreSQL names a VALUES relation's columns column1, column2, … ; the derived table's optional
     // column-rename list overrides them at the synthetic relation (cteSyntheticTable).
-    const columnNames = Array.from({ length: arity }, (_, i) => `column${i + 1}`);
-    return { kind: "values", rows: resolvedRows, columnTypes: colTypes, columnNames };
+    const columnNames = Array.from(
+      { length: arity },
+      (_, i) => `column${i + 1}`,
+    );
+    return {
+      kind: "values",
+      rows: resolvedRows,
+      columnTypes: colTypes,
+      columnNames,
+    };
   }
 
   // execValuesPlan executes a resolved VALUES-body relation (spec/design/grammar.md §42): evaluate
@@ -3736,7 +4977,12 @@ export class Database {
   // the set-operation rule), and emit the rows. Charges rowProduced per row plus each value's
   // operatorEval (the evaluator) — the derived table's intrinsic cost (cost.md §3), folded into the
   // caller's meter via execQueryPlan.
-  private execValuesPlan(plan: ValuesPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
+  private execValuesPlan(
+    plan: ValuesPlan,
+    outer: Row[],
+    params: Value[],
+    ctes: CteCtx,
+  ): SelectResult {
     const env: EvalEnv = {
       params,
       outer,
@@ -3763,7 +5009,12 @@ export class Database {
       }
       rows.push(out);
     }
-    return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows, cost: meter.accrued };
+    return {
+      columnNames: plan.columnNames,
+      columnTypes: plan.columnTypes,
+      rows,
+      cost: meter.accrued,
+    };
   }
 
   // runSelect resolves projected columns and the WHERE/ORDER BY columns against the catalog,
@@ -3775,7 +5026,12 @@ export class Database {
   // query's scope, for correlated references — grammar.md §26). The resolve half of the old
   // runSelect: build the FROM scope, resolve every clause, infer $N types into ptypes. No row is
   // touched and no parameter is bound here (runQueryExpr binds once, after the whole tree is planned).
-  private planSelect(sel: Select, parent: Scope | null, ctes: CteBinding[], ptypes: ParamTypes): SelectPlan {
+  private planSelect(
+    sel: Select,
+    parent: Scope | null,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+  ): SelectPlan {
     // Build the FROM scope: resolve each table reference (42P01 if unknown), compute each
     // relation's flat column offset in FROM order, and reject a duplicate label — a self-join
     // without distinct aliases is 42712 (spec/design/grammar.md §15). A FROM-less SELECT
@@ -3787,7 +5043,8 @@ export class Database {
     // (§42). For a LATERAL item (§44) the body / SRF args resolve against the PREFIX of relations to
     // its left (a dependent join), so the build runs in FROM order and a prefix scope over the
     // already-resolved rels is handed to the body.
-    const tableRefs = sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
+    const tableRefs =
+      sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
     const rels: ScopeRel[] = [];
     const srfPlans: (SrfPlan | undefined)[] = []; // aligned with rels; undefined = a base table
     const derivedPlans: (QueryPlan | undefined)[] = []; // aligned with rels; non-undefined = derived
@@ -3804,16 +5061,20 @@ export class Database {
       let cteIdx: number | undefined;
       let derived: QueryPlan | undefined;
       let lateral = false;
-      const isDerived = tref.subquery !== undefined || tref.values !== undefined;
+      const isDerived =
+        tref.subquery !== undefined || tref.values !== undefined;
       // A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table / VALUES
       // body explicitly marked LATERAL, or ANY table function (implicitly lateral — §44). The first
       // item (i === 0) has no earlier sibling, so it is never lateral; an SRF there resolves against
       // `parent` (the enclosing query) exactly as before.
-      const lateralEligible = i > 0 && ((isDerived && tref.lateral === true) || tref.args !== null);
+      const lateralEligible =
+        i > 0 && ((isDerived && tref.lateral === true) || tref.args !== null);
       // The prefix scope a LATERAL item resolves against: the relations to its left, chained to the
       // enclosing query's parent (so a sibling column correlates as Outer{level=1}, an enclosing one
       // deeper). null when not lateral-eligible.
-      const lateralParent = lateralEligible ? new Scope([...rels], this, parent, true, ctes) : null;
+      const lateralParent = lateralEligible
+        ? new Scope([...rels], this, parent, true, ctes)
+        : null;
       if (isDerived) {
         // Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
         // otherwise an INDEPENDENT query (parent=null, §42). A LATERAL VALUES body resolves its
@@ -3832,10 +5093,18 @@ export class Database {
         // scope (a sibling column then correlates); at i==0 against `parent` (the enclosing query /
         // params), unchanged (functions.md §10).
         const srfParent = lateralEligible ? lateralParent : parent;
-        const r = this.resolveSRF(tref.name, tref.args, tref.alias, srfParent, ctes, ptypes);
+        const r = this.resolveSRF(
+          tref.name,
+          tref.args,
+          tref.alias,
+          srfParent,
+          ctes,
+          ptypes,
+        );
         t = r.table;
         srf = r.srf;
-        lateral = lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
+        lateral =
+          lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
       } else {
         // A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog table of
         // the same name (cte.md §2); lookup is case-insensitive. A hit bumps the binding's reference
@@ -3848,13 +5117,21 @@ export class Database {
           cteIdx = ci;
         } else {
           const tbl = this.table(tref.name);
-          if (!tbl) throw engineError("undefined_table", "table does not exist: " + tref.name);
+          if (!tbl)
+            throw engineError(
+              "undefined_table",
+              "table does not exist: " + tref.name,
+            );
           t = tbl;
         }
       }
       // RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be both
       // kept whole and evaluated per left row. (i ≥ 1 here, so the item carries a join kind.)
-      if (lateral && (sel.joins[i - 1]!.kind === "right" || sel.joins[i - 1]!.kind === "full")) {
+      if (
+        lateral &&
+        (sel.joins[i - 1]!.kind === "right" ||
+          sel.joins[i - 1]!.kind === "full")
+      ) {
         throw engineError(
           "invalid_column_reference",
           "invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT",
@@ -3866,7 +5143,10 @@ export class Database {
       // resolve, and stay ambiguous via resolveBare). Every other relation has a non-empty label.
       if (label !== "") {
         if (seenLabels.has(label)) {
-          throw engineError("duplicate_alias", "table name " + label + " specified more than once");
+          throw engineError(
+            "duplicate_alias",
+            "table name " + label + " specified more than once",
+          );
         }
         seenLabels.add(label);
       }
@@ -3887,7 +5167,10 @@ export class Database {
           ? scope.resolveQualified(key.qualifier, key.name)
           : scope.resolveBare((key as { name: string }).name);
       if (r.level !== 0) {
-        throw engineError("feature_not_supported", "GROUP BY may not reference an outer query column");
+        throw engineError(
+          "feature_not_supported",
+          "GROUP BY may not reference an outer query column",
+        );
       }
       return r.index;
     });
@@ -3898,9 +5181,16 @@ export class Database {
     // mode (columns normal). Output names per grammar.md §8.
     // GROUP BY, an aggregate in the select list, OR a HAVING clause all make this an aggregate
     // query (HAVING alone groups the whole table — grammar.md §19).
-    const isAgg = groupKeys.length > 0 || itemsHaveAggregate(sel.items) || sel.having !== null;
+    const isAgg =
+      groupKeys.length > 0 ||
+      itemsHaveAggregate(sel.items) ||
+      sel.having !== null;
     const projAgg: AggCtx = { collecting: isAgg, groupKeys, specs: [] };
-    const { nodes: projections, names: columnNames, types: columnTypes } = resolveProjections(scope, sel.items, projAgg, ptypes);
+    const {
+      nodes: projections,
+      names: columnNames,
+      types: columnTypes,
+    } = resolveProjections(scope, sel.items, projAgg, ptypes);
     // HAVING resolves against the same grouped scope (collect) — it may reference aggregates
     // (collected into the SAME specs, so their slots follow the projection's) and grouping keys;
     // a non-grouped column is 42803. It must be boolean (42804). Resolved after the projection so
@@ -3916,9 +5206,14 @@ export class Database {
     const aggSpecs = projAgg.specs;
     // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
     if (isAgg && sel.distinct) {
-      throw engineError("feature_not_supported", "SELECT DISTINCT with aggregates is not supported yet");
+      throw engineError(
+        "feature_not_supported",
+        "SELECT DISTINCT with aggregates is not supported yet",
+      );
     }
-    const filter = sel.filter ? resolveBooleanFilter(scope, sel.filter, ptypes) : null;
+    const filter = sel.filter
+      ? resolveBooleanFilter(scope, sel.filter, ptypes)
+      : null;
     // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
     // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
     // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
@@ -3927,11 +5222,15 @@ export class Database {
     // and 0A000 (§26).
     const order: OrderSlot[] = [];
     for (const key of sel.orderBy) {
-      const r = key.qualifier !== null
-        ? scope.resolveQualified(key.qualifier, key.column)
-        : scope.resolveBare(key.column);
+      const r =
+        key.qualifier !== null
+          ? scope.resolveQualified(key.qualifier, key.column)
+          : scope.resolveBare(key.column);
       if (r.level !== 0) {
-        throw engineError("feature_not_supported", "ORDER BY may not reference an outer query column");
+        throw engineError(
+          "feature_not_supported",
+          "ORDER BY may not reference an outer query column",
+        );
       }
       const idx = r.index;
       let slot = idx;
@@ -3939,7 +5238,11 @@ export class Database {
         slot = groupKeys.indexOf(idx);
         if (slot < 0) throw groupingErrorColumn(key.column);
       }
-      order.push({ idx: slot, descending: key.descending, nullsFirst: key.nullsFirst });
+      order.push({
+        idx: slot,
+        descending: key.descending,
+        nullsFirst: key.nullsFirst,
+      });
     }
 
     // SELECT DISTINCT restriction (spec/design/grammar.md §11): each ORDER BY key must appear
@@ -3975,7 +5278,13 @@ export class Database {
     // same parent chain, so a correlated reference in an ON predicate resolves outward (§26).
     const joins: PlanJoin[] = sel.joins.map((j, k) => {
       if (j.on === null) return { kind: j.kind, on: null };
-      const partial = new Scope(scope.rels.slice(0, k + 2), this, parent, true, ctes);
+      const partial = new Scope(
+        scope.rels.slice(0, k + 2),
+        this,
+        parent,
+        true,
+        ctes,
+      );
       return { kind: j.kind, on: resolveBooleanFilter(partial, j.on, ptypes) };
     });
 
@@ -3991,7 +5300,10 @@ export class Database {
     // (functions.md §10), so skip detection for it. A CTE reference is likewise a computed/buffered
     // source with no store PK (cte.md §5), so skip it too.
     const relBounds: (ScanBound | null)[] = rels.map((rel, i) =>
-      filter === null || srfPlans[i] !== undefined || rel.cte !== undefined || derivedPlans[i] !== undefined
+      filter === null ||
+      srfPlans[i] !== undefined ||
+      rel.cte !== undefined ||
+      derivedPlans[i] !== undefined
         ? null
         : detectScanBound(filter, rel),
     );
@@ -4019,12 +5331,15 @@ export class Database {
     for (const j of joins) if (j.on !== null) collectTouched(j.on, 0, touched);
     if (isAgg) {
       for (const gk of groupKeys) touched[gk] = true;
-      for (const s of aggSpecs) if (s.operand !== null) collectTouched(s.operand, 0, touched);
+      for (const s of aggSpecs)
+        if (s.operand !== null) collectTouched(s.operand, 0, touched);
     } else {
       for (const p of projections) collectTouched(p, 0, touched);
       for (const o of order) touched[o.idx] = true;
     }
-    const relMasks = planRels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
+    const relMasks = planRels.map((r) =>
+      touched.slice(r.offset, r.offset + r.colCount),
+    );
     return {
       kind: "select",
       rels: planRels,
@@ -4055,13 +5370,22 @@ export class Database {
   // integer type of the args (PG); a NULL-typed arg contributes no width. Its NAME follows
   // PostgreSQL's single-column function-alias rule: the table alias when one is given
   // (generate_series(1,5) AS g ⇒ column g), else the function name generate_series.
-  private resolveSRF(name: string, args: Expr[], alias: string | null, parent: Scope | null, ctes: CteBinding[], ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
+  private resolveSRF(
+    name: string,
+    args: Expr[],
+    alias: string | null,
+    parent: Scope | null,
+    ctes: CteBinding[],
+    ptypes: ParamTypes,
+  ): { table: Table; srf: SrfPlan } {
     // The args see only params/outer — never sibling FROM tables (non-LATERAL); CTE bindings are
     // inherited so an arg subquery can reference a CTE (cte.md §2).
     const argScope = new Scope([], this, parent, true, ctes);
     const lname = name.toLowerCase();
-    if (lname === "generate_series") return this.resolveGenerateSeries(args, alias, argScope, ptypes);
-    if (lname === "unnest") return this.resolveUnnest(args, alias, argScope, ptypes);
+    if (lname === "generate_series")
+      return this.resolveGenerateSeries(args, alias, argScope, ptypes);
+    if (lname === "unnest")
+      return this.resolveUnnest(args, alias, argScope, ptypes);
     throw engineError("undefined_function", "function does not exist: " + name);
   }
 
@@ -4069,8 +5393,14 @@ export class Database {
   // §10): 2 or 3 integer args (a wrong arity/type → 42883). The produced column is typed at the
   // PROMOTED integer type of the args (PG); a NULL-typed arg contributes no width. All-NULL defaults
   // i64.
-  private resolveGenerateSeries(args: Expr[], alias: string | null, argScope: Scope, ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
-    if (args.length !== 2 && args.length !== 3) throw noFuncOverload("generate_series");
+  private resolveGenerateSeries(
+    args: Expr[],
+    alias: string | null,
+    argScope: Scope,
+    ptypes: ParamTypes,
+  ): { table: Table; srf: SrfPlan } {
+    if (args.length !== 2 && args.length !== 3)
+      throw noFuncOverload("generate_series");
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const rargs: RExpr[] = [];
     let result: ScalarType | null = null;
@@ -4097,7 +5427,12 @@ export class Database {
   // unnest(composite[])): the synthetic column is typed at the bound element type directly
   // (typeFromResolved), so a composite array produces composite rows (an anonymous-composite element
   // has no catalog name → 0A000, not reachable from a typed array).
-  private resolveUnnest(args: Expr[], alias: string | null, argScope: Scope, ptypes: ParamTypes): { table: Table; srf: SrfPlan } {
+  private resolveUnnest(
+    args: Expr[],
+    alias: string | null,
+    argScope: Scope,
+    ptypes: ParamTypes,
+  ): { table: Table; srf: SrfPlan } {
     if (args.length !== 1) throw noFuncOverload("unnest");
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const { node, type } = resolve(argScope, args[0]!, null, forbidden, ptypes);
@@ -4124,14 +5459,20 @@ export class Database {
       const v = evalExpr(e, [], env, meter);
       if (v.kind === "int") return v.int;
       if (v.kind === "null") return null;
-      throw new Error("the resolver restricts generate_series args to integers");
+      throw new Error(
+        "the resolver restricts generate_series args to integers",
+      );
     };
     const start = evalInt(srf.args[0]!);
     const stop = evalInt(srf.args[1]!);
     const step = srf.args.length === 3 ? evalInt(srf.args[2]!) : 1n;
     // Any NULL argument yields zero rows (PG).
     if (start === null || stop === null || step === null) return [];
-    if (step === 0n) throw engineError("invalid_parameter_value", "step size cannot be equal to zero");
+    if (step === 0n)
+      throw engineError(
+        "invalid_parameter_value",
+        "step size cannot be equal to zero",
+      );
     const out: Row[] = [];
     let cur = start;
     for (;;) {
@@ -4158,7 +5499,8 @@ export class Database {
     const v = evalExpr(srf.args[0]!, [], env, meter);
     // A NULL array → zero rows (PG; the empty_on_null discipline).
     if (v.kind === "null") return [];
-    if (v.kind !== "array") throw new Error("the resolver restricts unnest's argument to an array");
+    if (v.kind !== "array")
+      throw new Error("the resolver restricts unnest's argument to an array");
     const out: Row[] = [];
     for (const e of v.elements) {
       meter.guard();
@@ -4180,7 +5522,12 @@ export class Database {
   // cost change. pageRead is the full block (the bound's node count); only the row reads short-circuit.
   // Rows match the eager path exactly: the offset..offset+limit slice of the primary-key-ordered
   // filtered rows.
-  private execStreamingLimit(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): SelectResult {
+  private execStreamingLimit(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): SelectResult {
     const store = this.readSnap().store(plan.rels[0]!.tableName);
 
     // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead block. This path is
@@ -4198,8 +5545,13 @@ export class Database {
       if (b === null) empty = true;
       else bound = b;
     }
-    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
-    meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
+    const su = empty
+      ? { pages: 0, slabs: 0 }
+      : store.overlapScanUnits(bound, plan.relMasks[0]!);
+    meter.charge(
+      COSTS.pageRead * BigInt(su.pages) +
+        COSTS.valueDecompress * BigInt(su.slabs),
+    );
 
     const limit = plan.limit!;
     const offset = plan.offset ?? 0n;
@@ -4212,7 +5564,10 @@ export class Database {
         // Materialize the touched columns if the lazy load left them unfetched
         // (large-values.md §14) — a fresh copy only when needed (resolveColumns).
         const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
+        if (
+          plan.filter !== null &&
+          !isTrue(evalExpr(plan.filter, row, env, meter))
+        ) {
           return true;
         }
         passed += 1n;
@@ -4222,7 +5577,12 @@ export class Database {
         return BigInt(out.length) < limit; // stop once the window is filled
       });
     }
-    return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.accrued };
+    return {
+      columnNames: plan.columnNames,
+      columnTypes: plan.columnTypes,
+      rows: out,
+      cost: meter.accrued,
+    };
   }
 
   // execStreamingSort is the streaming external sort for a single-table ORDER BY (spec/design/spill.md
@@ -4233,7 +5593,12 @@ export class Database {
   // operator_eval, and rowProduced per windowed row accrue — only the sort, which is unmetered
   // (cost.md §3), now spills. Gated (by the caller) to a single table, no join, non-aggregate,
   // non-DISTINCT, with an ORDER BY and no index bound.
-  private execStreamingSort(plan: SelectPlan, env: EvalEnv, meter: Meter, params: Value[]): SelectResult {
+  private execStreamingSort(
+    plan: SelectPlan,
+    env: EvalEnv,
+    meter: Meter,
+    params: Value[],
+  ): SelectResult {
     const store = this.readSnap().store(plan.rels[0]!.tableName);
 
     // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead + valueDecompress block
@@ -4248,8 +5613,13 @@ export class Database {
       if (b === null) empty = true;
       else bound = b;
     }
-    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
-    meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
+    const su = empty
+      ? { pages: 0, slabs: 0 }
+      : store.overlapScanUnits(bound, plan.relMasks[0]!);
+    meter.charge(
+      COSTS.pageRead * BigInt(su.pages) +
+        COSTS.valueDecompress * BigInt(su.slabs),
+    );
 
     // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits: every
     // in-range row is read (charging storageRowRead), its touched columns resolved (large-values.md
@@ -4261,7 +5631,10 @@ export class Database {
         meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
         meter.charge(COSTS.storageRowRead);
         const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
+        if (
+          plan.filter !== null &&
+          !isTrue(evalExpr(plan.filter, row, env, meter))
+        ) {
           return true;
         }
         sorter.push(row);
@@ -4275,7 +5648,8 @@ export class Database {
     const offset = plan.offset ?? 0n;
     const start = offset < total ? offset : total;
     let end = total;
-    if (plan.limit !== null && plan.limit < total - start) end = start + plan.limit;
+    if (plan.limit !== null && plan.limit < total - start)
+      end = start + plan.limit;
 
     const sorted = sorter.finish();
     try {
@@ -4288,7 +5662,12 @@ export class Database {
         meter.charge(COSTS.rowProduced);
         out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
       }
-      return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.accrued };
+      return {
+        columnNames: plan.columnNames,
+        columnTypes: plan.columnTypes,
+        rows: out,
+        cost: meter.accrued,
+      };
     } finally {
       sorted.close(); // a LIMIT may stop the merge early — release any undrained run files
     }
@@ -4316,7 +5695,14 @@ export class Database {
   // body / SRF args read that row as their immediate outer; a non-lateral relation is passed the
   // query's own outer and its parent=null body simply ignores it (a parent=null plan holds no
   // outerColumn, so the two are observably identical).
-  private materializeRel(plan: SelectPlan, ri: number, outer: Row[], baseEnv: EvalEnv, params: Value[], meter: Meter): Row[] {
+  private materializeRel(
+    plan: SelectPlan,
+    ri: number,
+    outer: Row[],
+    baseEnv: EvalEnv,
+    params: Value[],
+    meter: Meter,
+  ): Row[] {
     const rel = plan.rels[ri]!;
     const env: EvalEnv = { ...baseEnv, outer };
     // A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
@@ -4339,7 +5725,12 @@ export class Database {
         }
         return buf.slice();
       }
-      const r = this.execQueryPlan(env.ctes.plans[ci]!, outer, params, env.ctes);
+      const r = this.execQueryPlan(
+        env.ctes.plans[ci]!,
+        outer,
+        params,
+        env.ctes,
+      );
       meter.charge(r.cost);
       return r.rows;
     }
@@ -4360,15 +5751,31 @@ export class Database {
     let slabs = 0;
     const relBound = plan.relBounds[ri]!;
     if (relBound !== null && relBound.kind === "index") {
-      const r = this.indexBoundRows(rel.tableName, relBound.index, params, outer, plan.relMasks[ri]!);
+      const r = this.indexBoundRows(
+        rel.tableName,
+        relBound.index,
+        params,
+        outer,
+        plan.relMasks[ri]!,
+      );
       rows = r.rows;
       nodeCount = r.pages;
       slabs = r.slabs;
     } else if (relBound !== null && relBound.kind === "gin") {
       // Re-find the constant query Q in the WHERE filter (the same conjunct plan-time ginMatch
       // chose — gin.md §6); the @>/&& predicate also stays the residual filter downstream.
-      const m = plan.filter !== null ? ginMatch(plan.filter, relBound.gin.colGlobal) : null;
-      const r = this.ginBoundRows(rel.tableName, relBound.gin, m?.query ?? null, env, meter, plan.relMasks[ri]!);
+      const m =
+        plan.filter !== null
+          ? ginMatch(plan.filter, relBound.gin.colGlobal)
+          : null;
+      const r = this.ginBoundRows(
+        rel.tableName,
+        relBound.gin,
+        m?.query ?? null,
+        env,
+        meter,
+        plan.relMasks[ri]!,
+      );
       // SELECT discards the storage keys (UPDATE/DELETE keep them — gin.md §6).
       rows = r.entries.map((e) => e.row);
       nodeCount = r.pages;
@@ -4403,7 +5810,12 @@ export class Database {
     return tableRows;
   }
 
-  private execSelectPlan(plan: SelectPlan, outer: Row[], params: Value[], ctes: CteCtx): SelectResult {
+  private execSelectPlan(
+    plan: SelectPlan,
+    outer: Row[],
+    params: Value[],
+    ctes: CteCtx,
+  ): SelectResult {
     const env: EvalEnv = {
       params,
       outer,
@@ -4475,7 +5887,9 @@ export class Database {
     // CORRELATED LATERAL relation (§44) depends on the left-hand row, so it cannot be materialized up
     // front — an empty placeholder holds its slot and the join loop re-materializes it per left row.
     const materialized: Row[][] = plan.rels.map((rel, ri) =>
-      rel.lateral === true ? [] : this.materializeRel(plan, ri, outer, env, params, meter),
+      rel.lateral === true
+        ? []
+        : this.materializeRel(plan, ri, outer, env, params, meter),
     );
 
     // Left-deep nested-loop join. `running` holds the combined rows over the relations joined
@@ -4487,7 +5901,8 @@ export class Database {
     // no ON (no operator_eval — spec/design/cost.md §3). Output order is deterministic: running
     // order (outer) then right key order (inner), each unmatched left row after its (empty)
     // match run, all unmatched right rows last in right key order (CLAUDE.md §10).
-    const nullRow = (n: number): Row => Array.from({ length: n }, () => nullValue());
+    const nullRow = (n: number): Row =>
+      Array.from({ length: n }, () => nullValue());
     // A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
     // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
     let running: Row[] = plan.rels.length === 0 ? [[]] : materialized[0]!;
@@ -4508,7 +5923,14 @@ export class Database {
       // lateral is 42P10), so there is no unmatched-right emission.
       if (plan.rels[k + 1]!.lateral === true) {
         for (const left of running) {
-          const rightRows = this.materializeRel(plan, k + 1, [...outer, left], env, params, meter);
+          const rightRows = this.materializeRel(
+            plan,
+            k + 1,
+            [...outer, left],
+            env,
+            params,
+            meter,
+          );
           let leftMatched = false;
           for (const right of rightRows) {
             const combined = left.concat(right);
@@ -4517,7 +5939,8 @@ export class Database {
               leftMatched = true;
             }
           }
-          if (emitLeft && !leftMatched) next.push(left.concat(nullRow(rightPad)));
+          if (emitLeft && !leftMatched)
+            next.push(left.concat(nullRow(rightPad)));
         }
         running = next;
         continue;
@@ -4538,7 +5961,8 @@ export class Database {
       }
       if (emitRight) {
         for (let ri = 0; ri < rightRows.length; ri++) {
-          if (!rightMatched[ri]) next.push(nullRow(leftPad).concat(rightRows[ri]!));
+          if (!rightMatched[ri])
+            next.push(nullRow(leftPad).concat(rightRows[ri]!));
         }
       }
       running = next;
@@ -4548,7 +5972,11 @@ export class Database {
     // combined row's filter accrues operator_eval.
     const rows: Row[] = [];
     for (const row of running) {
-      if (plan.filter === null || isTrue(evalExpr(plan.filter, row, env, meter))) rows.push(row);
+      if (
+        plan.filter === null ||
+        isTrue(evalExpr(plan.filter, row, env, meter))
+      )
+        rows.push(row);
     }
 
     // ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
@@ -4559,7 +5987,12 @@ export class Database {
     if (!plan.isAgg && plan.order.length > 0) {
       rows.sort((a, b) => {
         for (const key of plan.order) {
-          const c = keyCmp(a[key.idx]!, b[key.idx]!, key.descending, key.nullsFirst);
+          const c = keyCmp(
+            a[key.idx]!,
+            b[key.idx]!,
+            key.descending,
+            key.nullsFirst,
+          );
           if (c !== 0) return c;
         }
         return 0;
@@ -4571,8 +6004,10 @@ export class Database {
     // (CLAUDE.md §8; grammar.md §9). The counts are already non-negative (parser).
     const windowBounds = (len: number): [number, number] => {
       const n = BigInt(len);
-      const start = plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
-      const end = plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
+      const start =
+        plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
+      const end =
+        plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
       return [Number(start), Number(end)];
     };
 
@@ -4591,7 +6026,8 @@ export class Database {
       // emits ONE row even over zero input; GROUP BY over an empty table creates no groups ->
       // zero rows. Each (row × aggregate) charges aggregateAccumulate; the bucketing/finalize is
       // unmetered (cost.md §3).
-      const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAcc(s.plan, s.floatWidth ?? "f64"));
+      const newAccs = (): Acc[] =>
+        plan.aggSpecs.map((s) => newAcc(s.plan, s.floatWidth ?? "f64"));
       const index = new Map<string, number>();
       const groups: { keys: Value[]; accs: Acc[] }[] = [];
       if (plan.groupKeys.length === 0) {
@@ -4611,23 +6047,36 @@ export class Database {
         const accs = groups[gi]!.accs;
         plan.aggSpecs.forEach((spec, i) => {
           meter.charge(COSTS.aggregateAccumulate);
-          const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
+          const v =
+            spec.operand === null
+              ? nullValue()
+              : evalExpr(spec.operand, row, env, meter);
           foldAcc(accs[i]!, v, meter);
         });
       }
       // Build one synthetic row per group: [group_key_values..., aggregate_results...].
-      let groupRows = groups.map((g) => [...g.keys, ...g.accs.map((a) => finalizeAcc(a))]);
+      let groupRows = groups.map((g) => [
+        ...g.keys,
+        ...g.accs.map((a) => finalizeAcc(a)),
+      ]);
       // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The predicate is
       // evaluated against each group's synthetic row (charging its operatorEvals per group);
       // only a TRUE result keeps the group. A dropped group charges no rowProduced (§8).
       if (plan.having !== null) {
-        groupRows = groupRows.filter((srow) => isTrue(evalExpr(plan.having!, srow, env, meter)));
+        groupRows = groupRows.filter((srow) =>
+          isTrue(evalExpr(plan.having!, srow, env, meter)),
+        );
       }
       // ORDER BY over the grouped output (keys are synthetic group-key slots).
       if (plan.order.length > 0) {
         groupRows.sort((a, b) => {
           for (const key of plan.order) {
-            const c = keyCmp(a[key.idx]!, b[key.idx]!, key.descending, key.nullsFirst);
+            const c = keyCmp(
+              a[key.idx]!,
+              b[key.idx]!,
+              key.descending,
+              key.nullsFirst,
+            );
             if (c !== 0) return c;
           }
           return 0;
@@ -4676,7 +6125,12 @@ export class Database {
     }
     // The scan/eval cost (correlated subqueries fold their per-row cost in via the evaluator;
     // globally-uncorrelated ones are folded once before exec, their cost added at runQueryExpr).
-    return { columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.accrued };
+    return {
+      columnNames: plan.columnNames,
+      columnTypes: plan.columnTypes,
+      rows: out,
+      cost: meter.accrued,
+    };
   }
 
   // ---- Uncorrelated subquery folding (spec/design/grammar.md §26) ----------------------
@@ -4689,7 +6143,12 @@ export class Database {
   // committed once-only cost — cost.md §3). A CORRELATED subquery is left in place; the evaluator
   // re-executes it per outer row. So after this pass the only surviving "subquery" nodes are correlated.
 
-  private foldUncorrelatedInPlan(plan: QueryPlan, bound: Value[], ctes: CteCtx, cost: { value: bigint }): void {
+  private foldUncorrelatedInPlan(
+    plan: QueryPlan,
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+  ): void {
     if (plan.kind === "select") {
       this.foldUncorrelatedInSelect(plan, bound, ctes, cost);
       return;
@@ -4708,31 +6167,51 @@ export class Database {
     this.foldUncorrelatedInPlan(plan.rhs, bound, ctes, cost);
   }
 
-  private foldUncorrelatedInSelect(sp: SelectPlan, bound: Value[], ctes: CteCtx, cost: { value: bigint }): void {
-    for (const j of sp.joins) if (j.on !== null) j.on = this.foldUncorrelatedInRExpr(j.on, bound, ctes, cost);
-    if (sp.filter !== null) sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost);
-    if (sp.having !== null) sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost);
+  private foldUncorrelatedInSelect(
+    sp: SelectPlan,
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+  ): void {
+    for (const j of sp.joins)
+      if (j.on !== null)
+        j.on = this.foldUncorrelatedInRExpr(j.on, bound, ctes, cost);
+    if (sp.filter !== null)
+      sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost);
+    if (sp.having !== null)
+      sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost);
     for (const s of sp.aggSpecs) {
-      if (s.operand !== null) s.operand = this.foldUncorrelatedInRExpr(s.operand, bound, ctes, cost);
+      if (s.operand !== null)
+        s.operand = this.foldUncorrelatedInRExpr(s.operand, bound, ctes, cost);
     }
-    sp.projections = sp.projections.map((p) => this.foldUncorrelatedInRExpr(p, bound, ctes, cost));
+    sp.projections = sp.projections.map((p) =>
+      this.foldUncorrelatedInRExpr(p, bound, ctes, cost),
+    );
     // A set-returning relation's arguments may themselves contain an (uncorrelated) subquery to
     // fold once before the generator runs (functions.md §10).
     for (const rel of sp.rels) {
       if (rel.srf !== undefined) {
-        rel.srf.args = rel.srf.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
+        rel.srf.args = rel.srf.args.map((a) =>
+          this.foldUncorrelatedInRExpr(a, bound, ctes, cost),
+        );
       }
     }
   }
 
   // foldUncorrelatedInRExpr folds this node if it is an uncorrelated "subquery", else recurses into
   // its children. It RETURNS the (possibly replaced) node; the caller reassigns the field.
-  private foldUncorrelatedInRExpr(e: RExpr, bound: Value[], ctes: CteCtx, cost: { value: bigint }): RExpr {
+  private foldUncorrelatedInRExpr(
+    e: RExpr,
+    bound: Value[],
+    ctes: CteCtx,
+    cost: { value: bigint },
+  ): RExpr {
     switch (e.kind) {
       case "subquery": {
         // Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
         // globally-uncorrelated subquery nested inside it is already a constant before we run it.
-        if (e.lhs !== null) e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
+        if (e.lhs !== null)
+          e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
         this.foldUncorrelatedInPlan(e.plan, bound, ctes, cost);
         if (queryPlanReferencesOuter(e.plan, 0)) return e; // correlated — re-run per outer row
         // Uncorrelated: execute ONCE and fold to a constant / inValues.
@@ -4745,7 +6224,9 @@ export class Database {
               "more than one row returned by a subquery used as an expression",
             );
           }
-          return valueToRExpr(r.rows.length === 1 ? r.rows[0]![0]! : nullValue());
+          return valueToRExpr(
+            r.rows.length === 1 ? r.rows[0]![0]! : nullValue(),
+          );
         }
         if (e.subKind === "exists") {
           return { kind: "constBool", value: r.rows.length > 0 !== e.negated };
@@ -4792,13 +6273,19 @@ export class Database {
       case "scalarFunc":
       case "arrayFunc":
       case "variadic":
-        e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
+        e.args = e.args.map((a) =>
+          this.foldUncorrelatedInRExpr(a, bound, ctes, cost),
+        );
         return e;
       case "row":
-        e.fields = e.fields.map((f) => this.foldUncorrelatedInRExpr(f, bound, ctes, cost));
+        e.fields = e.fields.map((f) =>
+          this.foldUncorrelatedInRExpr(f, bound, ctes, cost),
+        );
         return e;
       case "array":
-        e.elements = e.elements.map((el) => this.foldUncorrelatedInRExpr(el, bound, ctes, cost));
+        e.elements = e.elements.map((el) =>
+          this.foldUncorrelatedInRExpr(el, bound, ctes, cost),
+        );
         return e;
       case "field":
         e.base = this.foldUncorrelatedInRExpr(e.base, bound, ctes, cost);
@@ -4809,10 +6296,19 @@ export class Database {
           s.isSlice
             ? {
                 isSlice: true,
-                lower: s.lower === null ? null : this.foldUncorrelatedInRExpr(s.lower, bound, ctes, cost),
-                upper: s.upper === null ? null : this.foldUncorrelatedInRExpr(s.upper, bound, ctes, cost),
+                lower:
+                  s.lower === null
+                    ? null
+                    : this.foldUncorrelatedInRExpr(s.lower, bound, ctes, cost),
+                upper:
+                  s.upper === null
+                    ? null
+                    : this.foldUncorrelatedInRExpr(s.upper, bound, ctes, cost),
               }
-            : { isSlice: false, index: this.foldUncorrelatedInRExpr(s.index, bound, ctes, cost) },
+            : {
+                isSlice: false,
+                index: this.foldUncorrelatedInRExpr(s.index, bound, ctes, cost),
+              },
         );
         return e;
       case "inValues":
@@ -4837,7 +6333,11 @@ export class Database {
 // no-op charge, driven by the consuming for-of's first next()), so the accrued total never moves. The
 // consumer drains it fully in this slice (no short-circuit), keeping the laziness unobservable and the
 // cost identical to Go/Rust.
-function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Row> {
+function* scanSource(
+  rows: Row[],
+  nodeCount: number,
+  meter: Meter,
+): Generator<Row> {
   meter.charge(COSTS.pageRead * BigInt(nodeCount));
   for (const row of rows) {
     // Enforce the cost ceiling before pulling the next row (CLAUDE.md §13): a runaway scan (or a
@@ -4882,7 +6382,12 @@ type GinStrategy = "contains" | "overlaps" | "member" | "equal";
 // conjunct), the array ELEMENT type (for encode(term) — the term bytes), the operator
 // strategy, and the column's global scope index. The constant query Q is NOT stored; it is
 // re-found in plan.filter at exec time by ginMatch and evaluated there.
-type GinBound = { nameKey: string; elemType: ScalarType; strategy: GinStrategy; colGlobal: number };
+type GinBound = {
+  nameKey: string;
+  elemType: ScalarType;
+  strategy: GinStrategy;
+  colGlobal: number;
+};
 
 // IndexBound is the plan-time result of index analysis (indexes.md §5): the chosen index
 // (lowest lowercased name whose FIRST key column has an equality conjunct), that column's
@@ -4892,7 +6397,12 @@ type GinBound = { nameKey: string; elemType: ScalarType; strategy: GinStrategy; 
 // tailTypes is the REMAINING key components' types (columns[1..]): an admitted entry's
 // row-key suffix sits after every component slot, so the fetch skips these (each slot is
 // self-delimiting — a 0x01 NULL tag alone, or 0x00 + the type's fixed width).
-type IndexBound = { nameKey: string; colType: ScalarType; eqs: RExpr[]; tailTypes: ScalarType[] };
+type IndexBound = {
+  nameKey: string;
+  colType: ScalarType;
+  eqs: RExpr[];
+  tailTypes: ScalarType[];
+};
 
 // detectScanBound picks one relation's scan bound (cost.md §3; indexes.md §5): the
 // single-column PK bound first; else, among the relation's indexes (held in ascending
@@ -4902,7 +6412,11 @@ type IndexBound = { nameKey: string; colType: ScalarType; eqs: RExpr[]; tailType
 function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
   const pkLocal = primaryKeyIndex(rel.table);
   if (pkLocal >= 0) {
-    const bp = detectPkBound(filter, rel.offset + pkLocal, typeScalar(rel.table.columns[pkLocal]!.type));
+    const bp = detectPkBound(
+      filter,
+      rel.offset + pkLocal,
+      typeScalar(rel.table.columns[pkLocal]!.type),
+    );
     if (bp !== null) return { kind: "pk", pk: bp };
   }
   for (const idx of rel.table.indexes) {
@@ -4917,12 +6431,22 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
       for (const t of bp.terms) if (t.op === "eq") eqs.push(t.src);
     }
     if (eqs.length > 0) {
-      const tailTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
-      return { kind: "index", index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, tailTypes } };
+      const tailTypes = idx.columns
+        .slice(1)
+        .map((c) => typeScalar(rel.table.columns[c]!.type));
+      return {
+        kind: "index",
+        index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, tailTypes },
+      };
     }
   }
   // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
-  const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
+  const gb = detectGinBound(
+    filter,
+    rel.table.indexes,
+    rel.table.columns,
+    rel.offset,
+  );
   return gb !== null ? { kind: "gin", gin: gb } : null;
 }
 
@@ -4931,7 +6455,12 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
 // `col && const`, `const = ANY(col)`, or `col = const`). Factored out so the SELECT planner
 // (detectScanBound) and the UPDATE/DELETE scan both use the identical detection — the mutations
 // pass their own table's indexes/columns at offset 0.
-function detectGinBound(filter: RExpr | null, indexes: IndexDef[], columns: Column[], offset: number): GinBound | null {
+function detectGinBound(
+  filter: RExpr | null,
+  indexes: IndexDef[],
+  columns: Column[],
+  offset: number,
+): GinBound | null {
   if (filter === null) return null;
   for (const idx of indexes) {
     if (idx.kind !== "gin") continue;
@@ -4941,7 +6470,12 @@ function detectGinBound(filter: RExpr | null, indexes: IndexDef[], columns: Colu
     if (colType.kind !== "array") continue; // a GIN column is always an array (the gate); defensive
     const m = ginMatch(filter, colGlobal);
     if (m !== null) {
-      return { nameKey: idx.name.toLowerCase(), elemType: typeScalar(colType.elem), strategy: m.strategy, colGlobal };
+      return {
+        nameKey: idx.name.toLowerCase(),
+        elemType: typeScalar(colType.elem),
+        strategy: m.strategy,
+        colGlobal,
+      };
     }
   }
   return null;
@@ -4955,7 +6489,10 @@ function detectGinBound(filter: RExpr | null, indexes: IndexDef[], columns: Colu
 // column be ANY's array operand and c the scalar. Returns the strategy and the constant query
 // operand (the scalar c for "member", the array Q otherwise). Used at plan time (strategy) and exec
 // time (recover the operand from plan.filter), so the two agree on the same conjunct by construction.
-function ginMatch(filter: RExpr, colGlobal: number): { strategy: GinStrategy; query: RExpr } | null {
+function ginMatch(
+  filter: RExpr,
+  colGlobal: number,
+): { strategy: GinStrategy; query: RExpr } | null {
   if (filter.kind === "and") {
     return ginMatch(filter.lhs, colGlobal) ?? ginMatch(filter.rhs, colGlobal);
   }
@@ -4963,10 +6500,13 @@ function ginMatch(filter: RExpr, colGlobal: number): { strategy: GinStrategy; qu
     const a = filter.args[0]!;
     const b = filter.args[1]!;
     if (filter.func === "contains") {
-      if (isColumnRef(a, colGlobal) && rexprIsConstant(b)) return { strategy: "contains", query: b };
+      if (isColumnRef(a, colGlobal) && rexprIsConstant(b))
+        return { strategy: "contains", query: b };
     } else if (filter.func === "overlaps") {
-      if (isColumnRef(a, colGlobal) && rexprIsConstant(b)) return { strategy: "overlaps", query: b };
-      if (isColumnRef(b, colGlobal) && rexprIsConstant(a)) return { strategy: "overlaps", query: a };
+      if (isColumnRef(a, colGlobal) && rexprIsConstant(b))
+        return { strategy: "overlaps", query: b };
+      if (isColumnRef(b, colGlobal) && rexprIsConstant(a))
+        return { strategy: "overlaps", query: a };
     }
   }
   // `col = Q` — exact array equality (gin.md §6). Commutative: the column may be either operand, the
@@ -4974,8 +6514,10 @@ function ginMatch(filter: RExpr, colGlobal: number): { strategy: GinStrategy; qu
   // @>-superset gather + the residual =). <> is NOT matched (only "eq"). When the column is an array,
   // the other constant operand is necessarily an array too (resolve rejects an array/scalar =).
   if (filter.kind === "compare" && filter.op === "eq") {
-    if (isColumnRef(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs)) return { strategy: "equal", query: filter.rhs };
-    if (isColumnRef(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs)) return { strategy: "equal", query: filter.lhs };
+    if (isColumnRef(filter.lhs, colGlobal) && rexprIsConstant(filter.rhs))
+      return { strategy: "equal", query: filter.rhs };
+    if (isColumnRef(filter.rhs, colGlobal) && rexprIsConstant(filter.lhs))
+      return { strategy: "equal", query: filter.lhs };
   }
   // `c = ANY(col)` — the array spelling of membership (gin.md §6): the GIN column must be ANY's
   // ARRAY operand and c (the scalar lhs) a constant. Only = ANY (not = ALL, not any other
@@ -5027,7 +6569,11 @@ function rexprIsConstant(e: RExpr): boolean {
     case "like":
       return rexprIsConstant(e.lhs) && rexprIsConstant(e.rhs);
     case "case":
-      return e.arms.every((a) => rexprIsConstant(a.cond) && rexprIsConstant(a.result)) && rexprIsConstant(e.els);
+      return (
+        e.arms.every(
+          (a) => rexprIsConstant(a.cond) && rexprIsConstant(a.result),
+        ) && rexprIsConstant(e.els)
+      );
     case "scalarFunc":
     case "arrayFunc":
     case "variadic":
@@ -5039,10 +6585,7 @@ function rexprIsConstant(e: RExpr): boolean {
     default:
       // Every leaf constant (constInt/constArray/param/…) is constant; a subscript / any other node
       // is treated conservatively as non-constant (no GIN accel; the residual filter still applies).
-      return (
-        e.kind === "param" ||
-        e.kind.startsWith("const")
-      );
+      return e.kind === "param" || e.kind.startsWith("const");
   }
 }
 
@@ -5051,24 +6594,40 @@ function rexprIsConstant(e: RExpr): boolean {
 // order-preserving key bytes when present, the lone 0x01 for NULL (always tagged, even
 // for a NOT NULL column) — then the row's storage key as the suffix. Indexable types are
 // fixed-width and never spill, so the values are always resident (never unfetched).
-function indexEntryKey(columns: Column[], def: IndexDef, storageKey: Uint8Array, row: Row): Uint8Array {
+function indexEntryKey(
+  columns: Column[],
+  def: IndexDef,
+  storageKey: Uint8Array,
+  row: Row,
+): Uint8Array {
   const parts: Uint8Array[] = [];
   for (const ci of def.columns) {
     const v = row[ci]!;
     if (v.kind === "null") {
       parts.push(Uint8Array.of(0x01));
     } else if (v.kind === "int") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.int));
+      parts.push(
+        Uint8Array.of(0x00),
+        encodeInt(typeScalar(columns[ci]!.type), v.int),
+      );
     } else if (v.kind === "bool") {
       parts.push(Uint8Array.of(0x00), encodeBool(v.value));
     } else if (v.kind === "uuid") {
       parts.push(Uint8Array.of(0x00), v.bytes);
     } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.micros));
+      parts.push(
+        Uint8Array.of(0x00),
+        encodeInt(typeScalar(columns[ci]!.type), v.micros),
+      );
     } else if (v.kind === "date") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.days));
+      parts.push(
+        Uint8Array.of(0x00),
+        encodeInt(typeScalar(columns[ci]!.type), v.days),
+      );
     } else {
-      throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
+      throw new Error(
+        "an index column is a key-encodable type (CREATE INDEX gate)",
+      );
     }
   }
   parts.push(storageKey);
@@ -5086,7 +6645,12 @@ function indexEntryKey(columns: Column[], def: IndexDef, storageKey: Uint8Array,
 // one for an ordered (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL
 // element for a GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index
 // uniformly as "a row maps to a set of entries."
-function indexEntryKeys(columns: Column[], def: IndexDef, storageKey: Uint8Array, row: Row): Uint8Array[] {
+function indexEntryKeys(
+  columns: Column[],
+  def: IndexDef,
+  storageKey: Uint8Array,
+  row: Row,
+): Uint8Array[] {
   if (def.kind === "gin") return ginEntries(columns, def, storageKey, row);
   return [indexEntryKey(columns, def, storageKey, row)];
 }
@@ -5112,10 +6676,16 @@ function isGinElementType(elem: Type): boolean {
   );
 }
 
-function ginEntries(columns: Column[], def: IndexDef, storageKey: Uint8Array, row: Row): Uint8Array[] {
+function ginEntries(
+  columns: Column[],
+  def: IndexDef,
+  storageKey: Uint8Array,
+  row: Row,
+): Uint8Array[] {
   const ci = def.columns[0]!;
   const colType = columns[ci]!.type;
-  if (colType.kind !== "array") throw new Error("a GIN index column is an array (CREATE INDEX gate)");
+  if (colType.kind !== "array")
+    throw new Error("a GIN index column is an array (CREATE INDEX gate)");
   const elemTy = typeScalar(colType.elem);
   const v = row[ci]!;
   if (v.kind !== "array") return [];
@@ -5203,28 +6773,157 @@ function bytesDiff(a: Uint8Array[], b: Uint8Array[]): Uint8Array[] {
   return a.filter((x) => !b.some((y) => bytesEq(x, y)));
 }
 
+// encodePkKey is a row's PRIMARY-KEY STORAGE KEY (spec/design/encoding.md §2.3): the
+// concatenation of the members' bare encodings in key order — every keyable type is fixed-width,
+// so the concatenation is self-delimiting and byte comparison equals the tuple's logical order.
+// Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe (upsert.md §3); a PK
+// column is NOT NULL, so there is no presence tag.
+function encodePkKey(table: Table, pk: number[], row: Row): Uint8Array {
+  const parts: Uint8Array[] = [];
+  for (const i of pk) {
+    const pkv = row[i]!; // non-null: a PK member is NOT NULL
+    if (pkv.kind === "uuid") {
+      parts.push(pkv.bytes.slice());
+    } else if (pkv.kind === "bool") {
+      parts.push(encodeBool(pkv.value));
+    } else if (pkv.kind === "int") {
+      parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.int));
+    } else if (pkv.kind === "timestamp" || pkv.kind === "timestamptz") {
+      parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.micros));
+    } else if (pkv.kind === "date") {
+      parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.days));
+    } else {
+      throw engineError(
+        "data_corrupted",
+        "a primary key must be an integer, boolean, uuid, or timestamp value",
+      );
+    }
+  }
+  const total = parts.reduce((acc, b) => acc + b.length, 0);
+  const key = new Uint8Array(total);
+  let off = 0;
+  for (const b of parts) {
+    key.set(b, off);
+    off += b.length;
+  }
+  return key;
+}
+
+// Arbiter is which uniqueness constraint an ON CONFLICT arbitrates (spec/design/upsert.md §2):
+// the primary key (isPK), or a unique index by position in table.indexes (indexPos).
+type Arbiter = { isPK: true } | { isPK: false; indexPos: number };
+
+// ConflictPlan is a resolved ON CONFLICT clause (spec/design/upsert.md), built by resolveOnConflict.
+type ConflictPlan = {
+  // arb is the arbiter constraint; null = no target (legal only with DO NOTHING — any uniqueness
+  // conflict is then skipped).
+  arb: Arbiter | null;
+  doUpdate: boolean;
+  assignments: AssignPlan[];
+  filter: RExpr | null;
+};
+
+// resolveArbiter resolves an ON CONFLICT target into an Arbiter (spec/design/upsert.md §2): a
+// column list is matched as an order-independent SET against a unique index / the primary key (no
+// match → 42P10); ON CONSTRAINT name names a unique index or the synthesized <table>_pkey (miss →
+// 42704). A null target → null arbiter (legal only with DO NOTHING).
+function resolveArbiter(
+  table: Table,
+  target: ConflictTarget | null,
+): Arbiter | null {
+  if (target === null) return null;
+  const pk = pkIndices(table);
+  if (target.kind === "columns") {
+    const want = new Set<number>();
+    for (const c of target.columns) {
+      const idx = columnIndex(table, c);
+      if (idx < 0)
+        throw engineError("undefined_column", "column does not exist: " + c);
+      want.add(idx);
+    }
+    if (pk.length > 0 && sameIntSet(pk, want)) return { isPK: true };
+    for (let i = 0; i < table.indexes.length; i++) {
+      const def = table.indexes[i]!;
+      if (def.unique && sameIntSet(def.columns, want))
+        return { isPK: false, indexPos: i };
+    }
+    throw engineError(
+      "invalid_column_reference",
+      "there is no unique or exclusion constraint matching the ON CONFLICT specification",
+    );
+  }
+  const pkey = table.name.toLowerCase() + "_pkey";
+  if (pk.length > 0 && target.name.toLowerCase() === pkey)
+    return { isPK: true };
+  for (let i = 0; i < table.indexes.length; i++) {
+    const def = table.indexes[i]!;
+    if (def.unique && def.name.toLowerCase() === target.name.toLowerCase())
+      return { isPK: false, indexPos: i };
+  }
+  throw engineError(
+    "undefined_object",
+    `constraint ${target.name} for table ${table.name} does not exist`,
+  );
+}
+
+// sameIntSet reports whether the array's values (as a set) equal the given set.
+function sameIntSet(arr: number[], set: Set<number>): boolean {
+  const seen = new Set(arr);
+  if (seen.size !== set.size) return false;
+  for (const v of seen) if (!set.has(v)) return false;
+  return true;
+}
+
+// arbiterKey is the arbiter key of a candidate row (spec/design/upsert.md §3): the storage key for
+// a PK arbiter (never NULL), or the unique-index prefix for an index arbiter (null when a nullable
+// arbiter column is NULL — NULLS DISTINCT, so the row never conflicts).
+function arbiterKey(
+  arb: Arbiter,
+  table: Table,
+  pk: number[],
+  row: Row,
+): Uint8Array | null {
+  if (arb.isPK) return encodePkKey(table, pk, row);
+  return indexPrefixKey(table.columns, table.indexes[arb.indexPos]!, row);
+}
+
 // indexPrefixKey builds a row's UNIQUENESS PROBE KEY for one unique index
 // (spec/design/indexes.md §8): the §3 entry key's slot prefix — without the storage-key
 // suffix — or null when any component is NULL (NULLS DISTINCT: such a tuple never
 // conflicts). Two rows conflict iff they yield the same non-null prefix.
-function indexPrefixKey(columns: Column[], def: IndexDef, row: Row): Uint8Array | null {
+function indexPrefixKey(
+  columns: Column[],
+  def: IndexDef,
+  row: Row,
+): Uint8Array | null {
   const parts: Uint8Array[] = [];
   for (const ci of def.columns) {
     const v = row[ci]!;
     if (v.kind === "null") {
       return null;
     } else if (v.kind === "int") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.int));
+      parts.push(
+        Uint8Array.of(0x00),
+        encodeInt(typeScalar(columns[ci]!.type), v.int),
+      );
     } else if (v.kind === "bool") {
       parts.push(Uint8Array.of(0x00), encodeBool(v.value));
     } else if (v.kind === "uuid") {
       parts.push(Uint8Array.of(0x00), v.bytes);
     } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.micros));
+      parts.push(
+        Uint8Array.of(0x00),
+        encodeInt(typeScalar(columns[ci]!.type), v.micros),
+      );
     } else if (v.kind === "date") {
-      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.days));
+      parts.push(
+        Uint8Array.of(0x00),
+        encodeInt(typeScalar(columns[ci]!.type), v.days),
+      );
     } else {
-      throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
+      throw new Error(
+        "an index column is a key-encodable type (CREATE INDEX gate)",
+      );
     }
   }
   const total = parts.reduce((acc, b) => acc + b.length, 0);
@@ -5256,9 +6955,12 @@ function encodeKeyValue(ty: ScalarType, value: Value): Uint8Array {
   if (value.kind === "int") return encodeInt(ty, value.int);
   if (value.kind === "bool") return encodeBool(value.value);
   if (value.kind === "uuid") return value.bytes.slice();
-  if (value.kind === "timestamp" || value.kind === "timestamptz") return encodeInt(ty, value.micros);
+  if (value.kind === "timestamp" || value.kind === "timestamptz")
+    return encodeInt(ty, value.micros);
   if (value.kind === "date") return encodeInt(ty, value.days);
-  throw new Error("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)");
+  throw new Error(
+    "a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)",
+  );
 }
 
 // FkProbe is a built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look
@@ -5283,7 +6985,12 @@ function fkProbeBytes(p: FkProbe): Uint8Array {
 // `ordinals = fk.refColumns` (the row viewed as a parent). Returns null when any supplied value is
 // NULL (MATCH SIMPLE exempt — §6.3). The probe uses the parent's PK when the referenced set is the
 // PK, else the matching unique index (re-derived deterministically — §6.8).
-function fkProbe(fk: ForeignKey, parent: Table, row: Row, ordinals: number[]): FkProbe | null {
+function fkProbe(
+  fk: ForeignKey,
+  parent: Table,
+  row: Row,
+  ordinals: number[],
+): FkProbe | null {
   // MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
   for (const o of ordinals) {
     if (row[o]!.kind === "null") return null;
@@ -5303,14 +7010,20 @@ function fkProbe(fk: ForeignKey, parent: Table, row: Row, ordinals: number[]): F
     }
     return { kind: "pk", bytes: concatBytes(parts) };
   }
-  const idx = parent.indexes.find((i) => i.unique && sameSet(sortedUnique(i.columns), refSet))!;
+  const idx = parent.indexes.find(
+    (i) => i.unique && sameSet(sortedUnique(i.columns), refSet),
+  )!;
   const parts: Uint8Array[] = [];
   for (const pcol of idx.columns) {
     parts.push(Uint8Array.of(0x00));
     const ty = typeScalar(parent.columns[pcol]!.type);
     parts.push(encodeKeyValue(ty, valueFor(pcol)));
   }
-  return { kind: "unique", index: idx.name.toLowerCase(), prefix: concatBytes(parts) };
+  return {
+    kind: "unique",
+    index: idx.name.toLowerCase(),
+    prefix: concatBytes(parts),
+  };
 }
 
 // concatBytes concatenates a list of byte arrays into one (the key-build helper).
@@ -5347,8 +7060,10 @@ function sameSet(a: number[], b: number[]): boolean {
 // type), but the comparison is full structural for completeness, mirroring Rust's `ty == ty`.
 function fkTypesEqual(a: Type, b: Type): boolean {
   if (a.kind === "scalar" && b.kind === "scalar") return a.scalar === b.scalar;
-  if (a.kind === "composite" && b.kind === "composite") return a.name === b.name;
-  if (a.kind === "array" && b.kind === "array") return fkTypesEqual(a.elem, b.elem);
+  if (a.kind === "composite" && b.kind === "composite")
+    return a.name === b.name;
+  if (a.kind === "array" && b.kind === "array")
+    return fkTypesEqual(a.elem, b.elem);
   return false;
 }
 
@@ -5358,8 +7073,12 @@ function fkTypesEqual(a: Type, b: Type): boolean {
 function fkAction(a: RefAction, clause: string): FkAction {
   if (a === "noAction") return "noAction";
   if (a === "restrict") return "restrict";
-  const word = a === "cascade" ? "CASCADE" : a === "setNull" ? "SET NULL" : "SET DEFAULT";
-  throw engineError("feature_not_supported", "ON " + clause + " " + word + " is not supported");
+  const word =
+    a === "cascade" ? "CASCADE" : a === "setNull" ? "SET NULL" : "SET DEFAULT";
+  throw engineError(
+    "feature_not_supported",
+    "ON " + clause + " " + word + " is not supported",
+  );
 }
 
 // prefixSuccessor is the byte-successor of a prefix: the smallest byte string greater
@@ -5384,12 +7103,19 @@ type PkBound = { pkType: ScalarType; terms: BoundTerm[] };
 
 // BoundKey is the outcome of encoding a const-source into the PK key space: a usable key, a NULL const
 // (the comparison is 3VL-unknown ⇒ empty range), or an out-of-range integer (drop this half-bound).
-type BoundKey = { kind: "key"; key: Uint8Array } | { kind: "null" } | { kind: "outOfRange" };
+type BoundKey =
+  | { kind: "key"; key: Uint8Array }
+  | { kind: "null" }
+  | { kind: "outOfRange" };
 
 // detectPkBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction is
 // not a contiguous range) and collects every `pk <cmp> const-source` conjunct. null ⇒ full scan.
 // Conservative + sound: an unrecognized conjunct contributes no bound and stays in the residual filter.
-function detectPkBound(filter: RExpr, pkIdx: number, pkType: ScalarType): PkBound | null {
+function detectPkBound(
+  filter: RExpr,
+  pkIdx: number,
+  pkType: ScalarType,
+): PkBound | null {
   const terms: BoundTerm[] = [];
   const walk = (e: RExpr): void => {
     if (e.kind === "and") {
@@ -5408,12 +7134,25 @@ function detectPkBound(filter: RExpr, pkIdx: number, pkType: ScalarType): PkBoun
 // PK column ("column" at pkIdx — a correlated "outerColumn" is a different kind, so it never matches) on
 // one side and a const-source of the PK's own type on the other (a promoted comparison — e.g. intpk = 2.5
 // → a constDecimal — does not match, so it stays residual). The op is flipped when the PK is on the right.
-function asBoundTerm(e: RExpr, pkIdx: number, pkType: ScalarType): BoundTerm | null {
+function asBoundTerm(
+  e: RExpr,
+  pkIdx: number,
+  pkType: ScalarType,
+): BoundTerm | null {
   if (e.kind !== "compare") return null;
-  if (e.op !== "eq" && e.op !== "lt" && e.op !== "le" && e.op !== "gt" && e.op !== "ge") return null;
+  if (
+    e.op !== "eq" &&
+    e.op !== "lt" &&
+    e.op !== "le" &&
+    e.op !== "gt" &&
+    e.op !== "ge"
+  )
+    return null;
   const isPk = (x: RExpr): boolean => x.kind === "column" && x.index === pkIdx;
-  if (isPk(e.lhs) && isConstSource(e.rhs, pkType)) return { op: e.op, src: e.rhs };
-  if (isPk(e.rhs) && isConstSource(e.lhs, pkType)) return { op: flipCmp(e.op), src: e.lhs };
+  if (isPk(e.lhs) && isConstSource(e.rhs, pkType))
+    return { op: e.op, src: e.rhs };
+  if (isPk(e.rhs) && isConstSource(e.lhs, pkType))
+    return { op: flipCmp(e.op), src: e.lhs };
   return null;
 }
 
@@ -5468,7 +7207,11 @@ function flipCmp(op: BinaryOp): BinaryOp {
 // half-bound (a wider, still sound, scan).
 // outer carries the enclosing rows (innermost last) so a correlated "outerColumn" source resolves to
 // the current outer row's value; it is empty for a top-level statement.
-function buildKeyBound(bp: PkBound, params: Value[], outer: Row[]): KeyBound | null {
+function buildKeyBound(
+  bp: PkBound,
+  params: Value[],
+  outer: Row[],
+): KeyBound | null {
   const b = unboundedBound();
   for (const t of bp.terms) {
     const r = encodeBoundKey(bp.pkType, t.src, params, outer);
@@ -5501,12 +7244,19 @@ function buildKeyBound(bp: PkBound, params: Value[], outer: Row[]): KeyBound | n
 // encodeInt for integer/timestamp widths, the raw 16 bytes for uuid, the 1-byte bool-byte for boolean).
 // param/outerColumn resolve to a runtime Value first (the param table / the enclosing outer row) and
 // then encode through the shared path.
-function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[], outer: Row[]): BoundKey {
+function encodeBoundKey(
+  pkType: ScalarType,
+  src: RExpr,
+  params: Value[],
+  outer: Row[],
+): BoundKey {
   switch (src.kind) {
     case "constNull":
       return { kind: "null" };
     case "constInt":
-      return inRange(pkType, src.value) ? { kind: "key", key: encodeInt(pkType, src.value) } : { kind: "outOfRange" };
+      return inRange(pkType, src.value)
+        ? { kind: "key", key: encodeInt(pkType, src.value) }
+        : { kind: "outOfRange" };
     case "constBool":
       return { kind: "key", key: encodeBool(src.value) };
     case "constUuid":
@@ -5520,7 +7270,10 @@ function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[], outer: 
     case "outerColumn":
       // A correlated reference: column index of the enclosing row level hops out — the same indexing
       // the evaluator uses for "outerColumn" (innermost outer row is last).
-      return encodeValueKey(pkType, outer[outer.length - src.level]![src.index]!);
+      return encodeValueKey(
+        pkType,
+        outer[outer.length - src.level]![src.index]!,
+      );
     default:
       return { kind: "outOfRange" };
   }
@@ -5534,7 +7287,9 @@ function encodeValueKey(pkType: ScalarType, v: Value): BoundKey {
   if (v.kind === "bool") return { kind: "key", key: encodeBool(v.value) };
   if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
   if (v.kind === "int")
-    return inRange(pkType, v.int) ? { kind: "key", key: encodeInt(pkType, v.int) } : { kind: "outOfRange" };
+    return inRange(pkType, v.int)
+      ? { kind: "key", key: encodeInt(pkType, v.int) }
+      : { kind: "outOfRange" };
   if (v.kind === "date") return { kind: "key", key: encodeInt(pkType, v.days) };
   if (v.kind === "timestamp" || v.kind === "timestamptz")
     return { kind: "key", key: encodeInt(pkType, v.micros) };
@@ -5618,28 +7373,43 @@ function scanEntries(
 // or leave (correlated) it.
 function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
   if (plan.kind === "setOp") {
-    return queryPlanReferencesOuter(plan.lhs, depth) || queryPlanReferencesOuter(plan.rhs, depth);
+    return (
+      queryPlanReferencesOuter(plan.lhs, depth) ||
+      queryPlanReferencesOuter(plan.rhs, depth)
+    );
   }
   if (plan.kind === "values") {
     // A VALUES body is planned parent=null, so its values hold no outer reference of their own; a
     // folded-in subquery, however, may correlate to the target scope.
-    for (const row of plan.rows) for (const e of row) if (rexprReferencesOuter(e, depth)) return true;
+    for (const row of plan.rows)
+      for (const e of row) if (rexprReferencesOuter(e, depth)) return true;
     return false;
   }
-  for (const j of plan.joins) if (j.on !== null && rexprReferencesOuter(j.on, depth)) return true;
-  if (plan.filter !== null && rexprReferencesOuter(plan.filter, depth)) return true;
-  if (plan.having !== null && rexprReferencesOuter(plan.having, depth)) return true;
-  for (const s of plan.aggSpecs) if (s.operand !== null && rexprReferencesOuter(s.operand, depth)) return true;
-  for (const p of plan.projections) if (rexprReferencesOuter(p, depth)) return true;
+  for (const j of plan.joins)
+    if (j.on !== null && rexprReferencesOuter(j.on, depth)) return true;
+  if (plan.filter !== null && rexprReferencesOuter(plan.filter, depth))
+    return true;
+  if (plan.having !== null && rexprReferencesOuter(plan.having, depth))
+    return true;
+  for (const s of plan.aggSpecs)
+    if (s.operand !== null && rexprReferencesOuter(s.operand, depth))
+      return true;
+  for (const p of plan.projections)
+    if (rexprReferencesOuter(p, depth)) return true;
   // A set-returning relation's arguments may carry a correlated reference (an implicitly-lateral SRF
   // arg sees params / outer / an earlier sibling — functions.md §10, grammar.md §44), making the
   // enclosing query correlated. A LATERAL derived table's body is one frame deeper; a reference in it
   // back into this query's outer counts here too (§44).
   for (const rel of plan.rels) {
     if (rel.srf !== undefined) {
-      for (const a of rel.srf.args) if (rexprReferencesOuter(a, depth)) return true;
+      for (const a of rel.srf.args)
+        if (rexprReferencesOuter(a, depth)) return true;
     }
-    if (rel.derived !== undefined && queryPlanReferencesOuter(rel.derived, depth + 1)) return true;
+    if (
+      rel.derived !== undefined &&
+      queryPlanReferencesOuter(rel.derived, depth + 1)
+    )
+      return true;
   }
   return false;
 }
@@ -5657,7 +7427,10 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "inValues":
       return rexprReferencesOuter(e.lhs, depth);
     case "quantified":
-      return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.array, depth);
+      return (
+        rexprReferencesOuter(e.lhs, depth) ||
+        rexprReferencesOuter(e.array, depth)
+      );
     case "cast":
     case "neg":
     case "not":
@@ -5669,11 +7442,16 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "or":
     case "distinct":
     case "like":
-      return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth);
+      return (
+        rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth)
+      );
     case "case":
       return (
-        e.arms.some((arm) => rexprReferencesOuter(arm.cond, depth) || rexprReferencesOuter(arm.result, depth)) ||
-        rexprReferencesOuter(e.els, depth)
+        e.arms.some(
+          (arm) =>
+            rexprReferencesOuter(arm.cond, depth) ||
+            rexprReferencesOuter(arm.result, depth),
+        ) || rexprReferencesOuter(e.els, depth)
       );
     case "scalarFunc":
     case "arrayFunc":
@@ -5686,7 +7464,12 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "field":
       return rexprReferencesOuter(e.base, depth);
     case "subscript":
-      return rexprReferencesOuter(e.base, depth) || rSubscriptBounds(e.subscripts).some((b) => rexprReferencesOuter(b, depth));
+      return (
+        rexprReferencesOuter(e.base, depth) ||
+        rSubscriptBounds(e.subscripts).some((b) =>
+          rexprReferencesOuter(b, depth),
+        )
+      );
     default:
       return false; // leaves: column, param, const*
   }
@@ -5770,7 +7553,8 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       return;
     case "subscript":
       collectTouched(e.base, depth, touched);
-      for (const b of rSubscriptBounds(e.subscripts)) collectTouched(b, depth, touched);
+      for (const b of rSubscriptBounds(e.subscripts))
+        collectTouched(b, depth, touched);
       return;
     default: // leaves: param, const*
   }
@@ -5779,15 +7563,22 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
 // collectTouchedPlan walks a nested plan's expression surfaces for outer references back into
 // the target scope — the same five surfaces selectPlanReferencesOuter checks (slot lists like
 // group keys / ORDER BY index the nested plan's own rows and can never reach outward).
-function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]): void {
+function collectTouchedPlan(
+  plan: QueryPlan,
+  depth: number,
+  touched: boolean[],
+): void {
   if (plan.kind === "select") {
-    for (const j of plan.joins) if (j.on !== null) collectTouched(j.on, depth, touched);
+    for (const j of plan.joins)
+      if (j.on !== null) collectTouched(j.on, depth, touched);
     if (plan.filter !== null) collectTouched(plan.filter, depth, touched);
     if (plan.having !== null) collectTouched(plan.having, depth, touched);
-    for (const s of plan.aggSpecs) if (s.operand !== null) collectTouched(s.operand, depth, touched);
+    for (const s of plan.aggSpecs)
+      if (s.operand !== null) collectTouched(s.operand, depth, touched);
     for (const p of plan.projections) collectTouched(p, depth, touched);
   } else if (plan.kind === "values") {
-    for (const row of plan.rows) for (const e of row) collectTouched(e, depth, touched);
+    for (const row of plan.rows)
+      for (const e of row) collectTouched(e, depth, touched);
   } else {
     collectTouchedPlan(plan.lhs, depth, touched);
     collectTouchedPlan(plan.rhs, depth, touched);
@@ -5846,74 +7637,79 @@ function distinctRowKey(row: Value[]): string {
 // contain).
 function distinctValueKey(v: Value): string {
   {
-      switch (v.kind) {
-        case "composite":
-          // Length-prefix the field count and each field's key so a composite never collides with a
-          // scalar key and nested composites stay unambiguous.
-          return "c" + v.fields.length.toString() + ":" + v.fields.map((f) => distinctValueKey(f)).join(",");
-        case "array":
-          // An array keys structurally INCLUDING its shape (spec/design/array.md §5): the dims and
-          // lower bounds (so [2:4]={1,2,3} and {1,2,3} bucket apart — array_eq considers them), then
-          // each element's own key. NULL elements key as 'n' (btree equality — NULLs mutually equal).
-          return (
-            "a" +
-            v.dims.join(":") +
-            ";" +
-            v.lbounds.join(";") +
-            "=" +
-            v.elements.map((el) => distinctValueKey(el)).join(",")
-          );
-        case "null":
-          return "n";
-        case "int":
-          return "i" + v.int.toString();
-        case "bool":
-          return v.value ? "b1" : "b0";
-        case "text":
-          // Length-prefix the content so the separator byte cannot be confused with a text
-          // value that contains it (the value is arbitrary UTF-8).
-          return "t" + v.text.length.toString() + ":" + v.text;
-        case "decimal":
-          // Value-canonical key so 1.5 and 1.50 collapse to one DISTINCT bucket (decimal.md §5).
-          return "d" + v.dec.canonicalString();
-        case "bytea":
-          // A distinct 'y' tag over the hex form (collision-free), so a bytea never collides
-          // with a text value of the same bytes.
-          return "y" + renderByteaHex(v.bytes);
-        case "uuid":
-          // A distinct 'u' tag over the canonical form, so a uuid never collides with a
-          // bytea/text of the same bytes.
-          return "u" + renderUuid(v.bytes);
-        case "timestamp":
-          // The i64 microsecond instant under a distinct 's' tag: two literals for the same
-          // instant (12:00:00 and 12:00:00.0) share micros and bucket together; the infinity
-          // sentinels are ordinary int values with their own buckets.
-          return "s" + v.micros.toString();
-        case "timestamptz":
-          // The i64 UTC-instant micros under a distinct 'z' tag: offsets are normalized to UTC
-          // at parse, so +00 and +05-of-the-same-instant bucket together.
-          return "z" + v.micros.toString();
-        case "interval":
-          // The canonical 128-bit span as a decimal string under a distinct 'v' tag, so
-          // span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/
-          // GROUP BY bucket while each value renders its own fields (spec/design/interval.md §2).
-          return "v" + intervalSpan(v.iv).toString();
-        case "f32":
-        case "f64":
-          // The TOTAL-order canonical key so -0 and +0 collapse to one bucket and all NaNs to one
-          // (float.md §3): canonicalize -0 → +0, map every NaN to a single sentinel string. Distinct
-          // tags 'f'/'g' per width so a f32 never collides with a f64 of the same number
-          // (they are different typed columns; the tag keeps the key total). The number's toString
-          // is the shortest round-trip — unique per binary value, so distinct values get distinct
-          // keys after the -0/NaN normalization.
-          return (
-            (v.kind === "f32" ? "f" : "g") +
-            (Number.isNaN(v.value) ? "NaN" : renderFloat(canonFloat(v.value)))
-          );
-        default:
-          // unfetched never reaches a projected dedup row (the scan layer resolves touched columns).
-          throw new Error("BUG: unfetched large value escaped the storage layer");
-      }
+    switch (v.kind) {
+      case "composite":
+        // Length-prefix the field count and each field's key so a composite never collides with a
+        // scalar key and nested composites stay unambiguous.
+        return (
+          "c" +
+          v.fields.length.toString() +
+          ":" +
+          v.fields.map((f) => distinctValueKey(f)).join(",")
+        );
+      case "array":
+        // An array keys structurally INCLUDING its shape (spec/design/array.md §5): the dims and
+        // lower bounds (so [2:4]={1,2,3} and {1,2,3} bucket apart — array_eq considers them), then
+        // each element's own key. NULL elements key as 'n' (btree equality — NULLs mutually equal).
+        return (
+          "a" +
+          v.dims.join(":") +
+          ";" +
+          v.lbounds.join(";") +
+          "=" +
+          v.elements.map((el) => distinctValueKey(el)).join(",")
+        );
+      case "null":
+        return "n";
+      case "int":
+        return "i" + v.int.toString();
+      case "bool":
+        return v.value ? "b1" : "b0";
+      case "text":
+        // Length-prefix the content so the separator byte cannot be confused with a text
+        // value that contains it (the value is arbitrary UTF-8).
+        return "t" + v.text.length.toString() + ":" + v.text;
+      case "decimal":
+        // Value-canonical key so 1.5 and 1.50 collapse to one DISTINCT bucket (decimal.md §5).
+        return "d" + v.dec.canonicalString();
+      case "bytea":
+        // A distinct 'y' tag over the hex form (collision-free), so a bytea never collides
+        // with a text value of the same bytes.
+        return "y" + renderByteaHex(v.bytes);
+      case "uuid":
+        // A distinct 'u' tag over the canonical form, so a uuid never collides with a
+        // bytea/text of the same bytes.
+        return "u" + renderUuid(v.bytes);
+      case "timestamp":
+        // The i64 microsecond instant under a distinct 's' tag: two literals for the same
+        // instant (12:00:00 and 12:00:00.0) share micros and bucket together; the infinity
+        // sentinels are ordinary int values with their own buckets.
+        return "s" + v.micros.toString();
+      case "timestamptz":
+        // The i64 UTC-instant micros under a distinct 'z' tag: offsets are normalized to UTC
+        // at parse, so +00 and +05-of-the-same-instant bucket together.
+        return "z" + v.micros.toString();
+      case "interval":
+        // The canonical 128-bit span as a decimal string under a distinct 'v' tag, so
+        // span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/
+        // GROUP BY bucket while each value renders its own fields (spec/design/interval.md §2).
+        return "v" + intervalSpan(v.iv).toString();
+      case "f32":
+      case "f64":
+        // The TOTAL-order canonical key so -0 and +0 collapse to one bucket and all NaNs to one
+        // (float.md §3): canonicalize -0 → +0, map every NaN to a single sentinel string. Distinct
+        // tags 'f'/'g' per width so a f32 never collides with a f64 of the same number
+        // (they are different typed columns; the tag keeps the key total). The number's toString
+        // is the shortest round-trip — unique per binary value, so distinct values get distinct
+        // keys after the -0/NaN normalization.
+        return (
+          (v.kind === "f32" ? "f" : "g") +
+          (Number.isNaN(v.value) ? "NaN" : renderFloat(canonFloat(v.value)))
+        );
+      default:
+        // unfetched never reaches a projected dedup row (the scan layer resolves touched columns).
+        throw new Error("BUG: unfetched large value escaped the storage layer");
+    }
   }
 }
 
@@ -5948,7 +7744,11 @@ type ResolvedType =
   // type — rendered in the `# types:` output and the basis for cross-comparability — or null for an
   // anonymous ROW(...) result. `fields` are the resolved (name, type) pairs in declaration order
   // (the basis for field access — S4 — and structural assignability).
-  | { kind: "composite"; name: string | null; fields: { name: string; type: ResolvedType }[] }
+  | {
+      kind: "composite";
+      name: string | null;
+      fields: { name: string; type: ResolvedType }[];
+    }
   // An array type (spec/design/array.md §2), carrying its resolved element type. Two arrays are
   // comparable iff their element types are comparable; assignable to an array column of the same
   // element type.
@@ -6000,8 +7800,18 @@ type RExpr =
   // `base`. All-index access reads one element (NULL when the subscript count ≠ ndim or any index is
   // out of range); a slice (any spec a slice) returns a sub-array, with a scalar index i meaning 1:i.
   // A NULL array or any NULL bound yields NULL. One operator_eval per node.
-  | { kind: "subscript"; base: RExpr; subscripts: RSubscript[]; isSlice: boolean }
-  | { kind: "cast"; target: ScalarType; typmod: DecimalTypmod | null; operand: RExpr }
+  | {
+      kind: "subscript";
+      base: RExpr;
+      subscripts: RSubscript[];
+      isSlice: boolean;
+    }
+  | {
+      kind: "cast";
+      target: ScalarType;
+      typmod: DecimalTypmod | null;
+      operand: RExpr;
+    }
   | { kind: "neg"; result: ScalarType; operand: RExpr }
   | { kind: "not"; operand: RExpr }
   | { kind: "arith"; op: BinaryOp; result: ScalarType; lhs: RExpr; rhs: RExpr }
@@ -6011,7 +7821,12 @@ type RExpr =
   | { kind: "isNull"; operand: RExpr; negated: boolean }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
   | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean }
-  | { kind: "case"; arms: { cond: RExpr; result: RExpr }[]; els: RExpr; coerceDecimal: boolean }
+  | {
+      kind: "case";
+      arms: { cond: RExpr; result: RExpr }[];
+      els: RExpr;
+      coerceDecimal: boolean;
+    }
   // A scalar-function call (spec/design/functions.md §9, float.md §8), evaluated per row in any
   // context. `result` is the static result type — for abs over an integer/float it is the
   // operand's own type (range-checked / fround'd at that width), for round over int/decimal it is
@@ -6036,7 +7851,12 @@ type RExpr =
   // the call shape — false = the spread form (count `args`' null-ness directly, never NULL); true =
   // the VARIADIC-array form (one `args` operand — a NULL array → NULL, else count its flattened
   // elements' null-ness). Result is always i32.
-  | { kind: "variadic"; func: VariadicFuncName; args: RExpr[]; arrayForm: boolean }
+  | {
+      kind: "variadic";
+      func: VariadicFuncName;
+      args: RExpr[];
+      arrayForm: boolean;
+    }
   // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
   // row `level` hops out (1 = immediate parent). A leaf — reads from the outer-row environment.
   | { kind: "outerColumn"; level: number; index: number }
@@ -6059,7 +7879,13 @@ type RExpr =
   // A quantified array comparison `lhs op ANY/ALL(array)` (spec/design/array-functions.md §11) — the
   // array spelling of IN. At eval `lhs` is evaluated once, `array` once; then a 3-valued fold over the
   // array's flattened elements (ANY = OR-fold, ALL = AND-fold), charging per element like "inValues".
-  | { kind: "quantified"; op: BinaryOp; all: boolean; lhs: RExpr; array: RExpr };
+  | {
+      kind: "quantified";
+      op: BinaryOp;
+      all: boolean;
+      lhs: RExpr;
+      array: RExpr;
+    };
 
 // SubqueryKind selects which subquery form a "subquery" RExpr is (spec/design/grammar.md §26).
 type SubqueryKind = "scalar" | "exists" | "in" | "quantified";
@@ -6162,7 +7988,15 @@ type VariadicFuncName = "num_nulls" | "num_nonnulls";
 // re-materializes it ONCE PER combined left-hand row (with that row pushed as its immediate outer —
 // the correlated-subquery mechanism), rather than materializing it once. Always false for the first
 // relation; only a srf or derived relation is ever lateral.
-type PlanRel = { tableName: string; offset: number; colCount: number; srf?: SrfPlan; cte?: number; derived?: QueryPlan; lateral?: boolean };
+type PlanRel = {
+  tableName: string;
+  offset: number;
+  colCount: number;
+  srf?: SrfPlan;
+  cte?: number;
+  derived?: QueryPlan;
+  lateral?: boolean;
+};
 
 // SrfKind selects which set-returning function an SrfPlan is, picking the row generator at exec
 // (spec/design/functions.md §10, array-functions.md §9). The dispatch is hand-written per core.
@@ -6185,7 +8019,18 @@ type SrfPlan = { kind: SrfKind; args: RExpr[] };
 function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
   return {
     name: funcName,
-    columns: [{ name: alias ?? funcName, type: colTy, decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null, identity: null }],
+    columns: [
+      {
+        name: alias ?? funcName,
+        type: colTy,
+        decimal: null,
+        primaryKey: false,
+        notNull: false,
+        default: null,
+        defaultExpr: null,
+        identity: null,
+      },
+    ],
     pk: [],
     checks: [],
     indexes: [],
@@ -6350,7 +8195,11 @@ type AggPlan =
 
 // AggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
 // row against the real row). operand is null for COUNT(*).
-type AggSpec = { plan: AggPlan; operand: RExpr | null; floatWidth?: ScalarType };
+type AggSpec = {
+  plan: AggPlan;
+  operand: RExpr | null;
+  floatWidth?: ScalarType;
+};
 
 // AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
 // Forbidden mode (a funcCall is 42803; columns resolve normally); collecting === true is an
@@ -6472,7 +8321,9 @@ function finalizeAcc(a: Acc): Value {
     case "avg":
       // div cap-checks its (in-range) result; the over-cap-capable running sum is never surfaced
       // directly, so AVG matches PG even when SUM would overflow.
-      return a.count === 0n ? nullValue() : decimalValue(a.sumDec.div(Decimal.fromBigInt(a.count)));
+      return a.count === 0n
+        ? nullValue()
+        : decimalValue(a.sumDec.div(Decimal.fromBigInt(a.count)));
     case "sumFloat": {
       if (!a.seen) return nullValue(); // empty / all-NULL group → NULL
       const s = floatCanonicalSum(a.floats, a.floatWidth);
@@ -6574,13 +8425,19 @@ function exprHasAggregate(e: Expr): boolean {
     case "in":
       return exprHasAggregate(e.lhs) || e.list.some(exprHasAggregate);
     case "between":
-      return exprHasAggregate(e.lhs) || exprHasAggregate(e.lo) || exprHasAggregate(e.hi);
+      return (
+        exprHasAggregate(e.lhs) ||
+        exprHasAggregate(e.lo) ||
+        exprHasAggregate(e.hi)
+      );
     case "like":
       return exprHasAggregate(e.lhs) || exprHasAggregate(e.rhs);
     case "case":
       return (
         (e.operand !== null && exprHasAggregate(e.operand)) ||
-        e.whens.some((w) => exprHasAggregate(w.cond) || exprHasAggregate(w.result)) ||
+        e.whens.some(
+          (w) => exprHasAggregate(w.cond) || exprHasAggregate(w.result),
+        ) ||
         (e.els !== null && exprHasAggregate(e.els))
       );
     case "row":
@@ -6591,7 +8448,10 @@ function exprHasAggregate(e: Expr): boolean {
     case "fieldStar":
       return exprHasAggregate(e.base);
     case "subscript":
-      return exprHasAggregate(e.base) || astSubscriptExprs(e.subscripts).some(exprHasAggregate);
+      return (
+        exprHasAggregate(e.base) ||
+        astSubscriptExprs(e.subscripts).some(exprHasAggregate)
+      );
     case "quantified":
       return exprHasAggregate(e.lhs) || exprHasAggregate(e.array);
     default:
@@ -6606,13 +8466,22 @@ type NamedCheck = { name: string; node: RExpr };
 // evalChecks evaluates a row's CHECK constraints in name order (constraints.md §4.4):
 // TRUE and NULL pass; the first FALSE aborts with 23514 and PG's message. Shared by the
 // INSERT and UPDATE write paths.
-function evalChecks(checks: NamedCheck[], relation: string, row: Row, env: EvalEnv, meter: Meter): void {
+function evalChecks(
+  checks: NamedCheck[],
+  relation: string,
+  row: Row,
+  env: EvalEnv,
+  meter: Meter,
+): void {
   for (const c of checks) {
     const v = evalExpr(c.node, row, env, meter);
     if (v.kind === "bool" && !v.value) {
       throw engineError(
         "check_violation",
-        "new row for relation " + relation + " violates check constraint " + c.name,
+        "new row for relation " +
+          relation +
+          " violates check constraint " +
+          c.name,
       );
     }
   }
@@ -6629,12 +8498,21 @@ function rejectCheckStructure(e: Expr): void {
     case "exists":
     case "inSubquery":
     case "quantifiedSubquery":
-      throw engineError("feature_not_supported", "cannot use subquery in check constraint");
+      throw engineError(
+        "feature_not_supported",
+        "cannot use subquery in check constraint",
+      );
     case "param":
-      throw engineError("undefined_parameter", "there is no parameter $" + e.index.toString());
+      throw engineError(
+        "undefined_parameter",
+        "there is no parameter $" + e.index.toString(),
+      );
     case "funcCall":
       if (isAggregateName(e.name)) {
-        throw engineError("grouping_error", "aggregate functions are not allowed in check constraints");
+        throw engineError(
+          "grouping_error",
+          "aggregate functions are not allowed in check constraints",
+        );
       }
       for (const a of e.args) rejectCheckStructure(a);
       return;
@@ -6695,17 +8573,29 @@ function rejectDefaultStructure(e: Expr): void {
   switch (e.kind) {
     case "column":
     case "qualifiedColumn":
-      throw engineError("feature_not_supported", "cannot use column reference in DEFAULT expression");
+      throw engineError(
+        "feature_not_supported",
+        "cannot use column reference in DEFAULT expression",
+      );
     case "scalarSubquery":
     case "exists":
     case "inSubquery":
     case "quantifiedSubquery":
-      throw engineError("feature_not_supported", "cannot use subquery in DEFAULT expression");
+      throw engineError(
+        "feature_not_supported",
+        "cannot use subquery in DEFAULT expression",
+      );
     case "param":
-      throw engineError("undefined_parameter", "there is no parameter $" + e.index.toString());
+      throw engineError(
+        "undefined_parameter",
+        "there is no parameter $" + e.index.toString(),
+      );
     case "funcCall":
       if (isAggregateName(e.name)) {
-        throw engineError("grouping_error", "aggregate functions are not allowed in DEFAULT expressions");
+        throw engineError(
+          "grouping_error",
+          "aggregate functions are not allowed in DEFAULT expressions",
+        );
       }
       for (const a of e.args) rejectDefaultStructure(a);
       return;
@@ -6746,7 +8636,8 @@ function rejectDefaultStructure(e: Expr): void {
       return rejectDefaultStructure(e.base);
     case "subscript":
       rejectDefaultStructure(e.base);
-      for (const x of astSubscriptExprs(e.subscripts)) rejectDefaultStructure(x);
+      for (const x of astSubscriptExprs(e.subscripts))
+        rejectDefaultStructure(x);
       return;
     case "quantified":
       rejectDefaultStructure(e.lhs);
@@ -6838,7 +8729,10 @@ function resolveAggregate(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (!ag.collecting) {
-    throw engineError("grouping_error", "aggregate functions are not allowed here");
+    throw engineError(
+      "grouping_error",
+      "aggregate functions are not allowed here",
+    );
   }
   const name = e.name.toLowerCase();
   const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
@@ -6849,7 +8743,11 @@ function resolveAggregate(
   let floatWidth: ScalarType | undefined;
   if (e.star) {
     // Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
-    if (!aggregateHasStar(name)) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    if (!aggregateHasStar(name))
+      throw engineError(
+        "syntax_error",
+        "* is only valid as the argument of COUNT",
+      );
     plan = "countStar";
     operand = null;
     result = { kind: "int", ty: "i64" };
@@ -6858,7 +8756,10 @@ function resolveAggregate(
     // operand-family) overload exists (else 42883) and yields its result code; the plan + result
     // type follow from it (the PG widening). Each aggregate takes exactly one argument.
     if (e.args.length !== 1) {
-      throw engineError("undefined_function", "no aggregate function matches the given argument count");
+      throw engineError(
+        "undefined_function",
+        "no aggregate function matches the given argument count",
+      );
     }
     const r = resolve(scope, e.args[0], null, sub, params);
     operand = r.node;
@@ -6876,7 +8777,12 @@ function resolveAggregate(
 // aggregate context. In Forbidden mode it reads the real row directly; in collect mode it must
 // be a grouping key — resolved to its synthetic-row slot (its position among the group keys) —
 // else 42803.
-function collectColumn(scope: Scope, ag: AggCtx, idx: number, name: string): { node: RExpr; type: ResolvedType } {
+function collectColumn(
+  scope: Scope,
+  ag: AggCtx,
+  idx: number,
+  name: string,
+): { node: RExpr; type: ResolvedType } {
   const type = resolvedTypeOfCol(scope.columnAt(idx).type, scope.catalog);
   if (!ag.collecting) return { node: { kind: "column", index: idx }, type };
   const pos = ag.groupKeys.indexOf(idx);
@@ -6886,12 +8792,18 @@ function collectColumn(scope: Scope, ag: AggCtx, idx: number, name: string): { n
 
 // noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
 function noAggOverload(fn: string): EngineError {
-  return engineError("undefined_function", "no " + fn + " aggregate for that argument type");
+  return engineError(
+    "undefined_function",
+    "no " + fn + " aggregate for that argument type",
+  );
 }
 
 // noFuncOverload is 42883 — a scalar function over argument types it has no overload for.
 function noFuncOverload(fn: string): EngineError {
-  return engineError("undefined_function", "no " + fn + " function for those argument types");
+  return engineError(
+    "undefined_function",
+    "no " + fn + " function for those argument types",
+  );
 }
 
 // === Function registry (spec/design/extensibility.md §5) ============================
@@ -6958,13 +8870,18 @@ function isScalarFuncName(name: string): boolean {
 // isVariadicFuncName reports whether name (lowercased) is a VARIADIC scalar function
 // (array-functions.md §12) — a kind === "function" row with `variadic` set (num_nulls/num_nonnulls).
 function isVariadicFuncName(name: string): boolean {
-  return OPERATORS.some((o) => o.kind === "function" && o.variadic && o.name === name);
+  return OPERATORS.some(
+    (o) => o.kind === "function" && o.variadic && o.name === name,
+  );
 }
 
 // lookupScalarOverload returns the matched scalar-function overload row for name over the resolved
 // argument types: the kind === "function" catalog row whose argFamilies agree by arity + per-slot
 // family. undefined ⇒ no overload (42883). make_interval resolves on its own path (§11).
-function lookupScalarOverload(name: string, tys: ResolvedType[]): OperatorDesc | undefined {
+function lookupScalarOverload(
+  name: string,
+  tys: ResolvedType[],
+): OperatorDesc | undefined {
   return OPERATORS.find(
     (o) =>
       o.kind === "function" &&
@@ -6994,20 +8911,26 @@ function resolvedScalarType(t: ResolvedType): ScalarType {
 function scalarResultType(code: string, tys: ResolvedType[]): ScalarType {
   if (code === "promoted") return resolvedScalarType(tys[0]!);
   const ty = scalarTypeFromName(code);
-  if (ty === undefined) throw new Error("scalarResultType: unknown result code " + code);
+  if (ty === undefined)
+    throw new Error("scalarResultType: unknown result code " + code);
   return ty;
 }
 
 // aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
 // overload — only COUNT does. The data-driven replacement for the special-cased star arm.
 function aggregateHasStar(surface: string): boolean {
-  return AGGREGATES.some((a) => a.surface.toLowerCase() === surface && a.arg === "star");
+  return AGGREGATES.some(
+    (a) => a.surface.toLowerCase() === surface && a.arg === "star",
+  );
 }
 
 // lookupAggregateOverload returns the matched aggregate overload row for surface (lowercased) over
 // a single operand of resolved type t: the arg === "expr" catalog row whose lone argFamilies slot
 // matches. undefined ⇒ no overload (42883, e.g. SUM(text)). MIN/MAX/COUNT take "any".
-function lookupAggregateOverload(surface: string, t: ResolvedType): AggregateDesc | undefined {
+function lookupAggregateOverload(
+  surface: string,
+  t: ResolvedType,
+): AggregateDesc | undefined {
   return AGGREGATES.find(
     (a) =>
       a.surface.toLowerCase() === surface &&
@@ -7027,23 +8950,29 @@ function aggregatePlan(
   code: string,
   t: ResolvedType,
 ): [AggPlan, ResolvedType, ScalarType | undefined] {
-  if (surface === "count") return ["count", { kind: "int", ty: "i64" }, undefined];
+  if (surface === "count")
+    return ["count", { kind: "int", ty: "i64" }, undefined];
   if (surface === "sum" && code === "sum_widen") {
     // SUM(i16|i32) → i64; SUM(i64) → decimal (PG widening).
-    if (t.kind === "int" && t.ty === "i64") return ["sumDecimal", { kind: "decimal" }, undefined];
+    if (t.kind === "int" && t.ty === "i64")
+      return ["sumDecimal", { kind: "decimal" }, undefined];
     return ["sumInt", { kind: "int", ty: "i64" }, undefined];
   }
-  if (surface === "sum" && code === "decimal") return ["sumDecimal", { kind: "decimal" }, undefined];
+  if (surface === "sum" && code === "decimal")
+    return ["sumDecimal", { kind: "decimal" }, undefined];
   if (surface === "sum" && code === "same_as_input" && t.kind === "float") {
     // SUM/AVG over float stay the input width (the canonical-order fold — float.md §7).
     return ["sumFloat", { kind: "float", ty: t.ty }, t.ty];
   }
-  if (surface === "avg" && code === "decimal") return ["avg", { kind: "decimal" }, undefined];
+  if (surface === "avg" && code === "decimal")
+    return ["avg", { kind: "decimal" }, undefined];
   if (surface === "avg" && code === "same_as_input" && t.kind === "float") {
     return ["avgFloat", { kind: "float", ty: t.ty }, t.ty];
   }
-  if (surface === "min" && code === "same_as_input") return ["min", t, undefined];
-  if (surface === "max" && code === "same_as_input") return ["max", t, undefined];
+  if (surface === "min" && code === "same_as_input")
+    return ["min", t, undefined];
+  if (surface === "max" && code === "same_as_input")
+    return ["max", t, undefined];
   throw new Error(`aggregatePlan: unhandled (${surface}, ${code})`);
 }
 
@@ -7054,7 +8983,13 @@ function aggregatePlan(
 // declares parameter names (make_interval); on every other function it is 42883.
 function resolveFuncCall(
   scope: Scope,
-  e: { name: string; args: Expr[]; argNames: (string | null)[]; star: boolean; variadic: boolean },
+  e: {
+    name: string;
+    args: Expr[];
+    argNames: (string | null)[];
+    star: boolean;
+    variadic: boolean;
+  },
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
@@ -7067,7 +9002,8 @@ function resolveFuncCall(
     return resolveVariadicFunc(scope, e, ag, params);
   }
   // make_interval is the one named/defaulted function — it keeps its own resolver (§11).
-  if (lname === "make_interval") return resolveMakeInterval(scope, e, ag, params);
+  if (lname === "make_interval")
+    return resolveMakeInterval(scope, e, ag, params);
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
   // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
   if (isAggregateName(lname)) {
@@ -7093,7 +9029,10 @@ function resolveFuncCall(
 function rejectNamed(name: string, argNames: (string | null)[]): void {
   for (const n of argNames) {
     if (n !== null) {
-      throw engineError("undefined_function", 'function ' + name + ' has no parameter named "' + n + '"');
+      throw engineError(
+        "undefined_function",
+        "function " + name + ' has no parameter named "' + n + '"',
+      );
     }
   }
 }
@@ -7126,7 +9065,11 @@ function defaultExpr(lit: string): Expr {
 // + DEFAULTs, functions.md §11). Returns the positional Expr array of length desc.arity. Errors:
 // 42601 a positional arg after a named one (also caught at parse) or a duplicated name; 42883 an
 // unknown parameter name, too many arguments, or a missing non-defaulted slot (no overload).
-function normalizeNamedArgs(desc: OperatorDesc, args: Expr[], argNames: (string | null)[]): Expr[] {
+function normalizeNamedArgs(
+  desc: OperatorDesc,
+  args: Expr[],
+  argNames: (string | null)[],
+): Expr[] {
   const arity = desc.arity;
   const slots: (Expr | null)[] = new Array(arity).fill(null);
   const namesEmpty = argNames.length === 0;
@@ -7135,19 +9078,30 @@ function normalizeNamedArgs(desc: OperatorDesc, args: Expr[], argNames: (string 
     const nm = namesEmpty ? null : argNames[i];
     if (nm === null || nm === undefined) {
       if (seenNamed) {
-        throw engineError("syntax_error", "positional argument cannot follow named argument");
+        throw engineError(
+          "syntax_error",
+          "positional argument cannot follow named argument",
+        );
       }
       if (i >= arity) throw noFuncOverload(desc.name); // too many positional arguments
       slots[i] = args[i]!;
       continue;
     }
     seenNamed = true;
-    const idx = desc.argNames.findIndex((p) => p.toLowerCase() === nm.toLowerCase());
+    const idx = desc.argNames.findIndex(
+      (p) => p.toLowerCase() === nm.toLowerCase(),
+    );
     if (idx < 0) {
-      throw engineError("undefined_function", 'function ' + desc.name + ' has no parameter named "' + nm + '"');
+      throw engineError(
+        "undefined_function",
+        "function " + desc.name + ' has no parameter named "' + nm + '"',
+      );
     }
     if (slots[idx] !== null) {
-      throw engineError("syntax_error", 'argument name "' + nm + '" used more than once');
+      throw engineError(
+        "syntax_error",
+        'argument name "' + nm + '" used more than once',
+      );
     }
     slots[idx] = args[i]!;
   }
@@ -7177,7 +9131,11 @@ function resolveMakeInterval(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  if (e.star)
+    throw engineError(
+      "syntax_error",
+      "* is only valid as the argument of COUNT",
+    );
   const desc = scalarFuncDesc("make_interval");
   if (desc === undefined) throw new Error("make_interval is in the catalog");
   const positional = normalizeNamedArgs(desc, e.args, e.argNames);
@@ -7203,7 +9161,8 @@ function resolveMakeInterval(
 // (interval out of range), matching PG and the other cores.
 function f64ToMicros(secs: number): bigint {
   const p = secs * 1_000_000;
-  if (!Number.isFinite(p)) throw engineError("datetime_field_overflow", "interval out of range");
+  if (!Number.isFinite(p))
+    throw engineError("datetime_field_overflow", "interval out of range");
   const r = floatToIntHalfAway(p); // bigint, half-away-from-zero
   if (r < -9223372036854775808n || r > 9223372036854775807n) {
     throw engineError("datetime_field_overflow", "interval out of range");
@@ -7221,7 +9180,11 @@ function resolveScalarFunc(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  if (e.star)
+    throw engineError(
+      "syntax_error",
+      "* is only valid as the argument of COUNT",
+    );
   const name = e.name.toLowerCase() as ScalarFuncName;
   const rargs: RExpr[] = [];
   const tys: ResolvedType[] = [];
@@ -7257,7 +9220,10 @@ function scalarFuncNode(
   result: ScalarType,
   argWidth: ScalarType | undefined,
 ): { node: RExpr; type: ResolvedType } {
-  return { node: { kind: "scalarFunc", func, args, result, argWidth }, type: resolvedTypeOf(result) };
+  return {
+    node: { kind: "scalarFunc", func, args, result, argWidth },
+    type: resolvedTypeOf(result),
+  };
 }
 
 // resolveVariadicFunc resolves a VARIADIC scalar-function call (num_nulls/num_nonnulls —
@@ -7271,7 +9237,11 @@ function resolveVariadicFunc(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  if (e.star)
+    throw engineError(
+      "syntax_error",
+      "* is only valid as the argument of COUNT",
+    );
   const name = e.name.toLowerCase() as VariadicFuncName;
   const desc = scalarFuncDesc(name)!;
   const k = desc.arity; // declared parameter count (the last is variadic)
@@ -7288,10 +9258,14 @@ function resolveVariadicFunc(
         // the variadic (array) operand
         if (r.type.kind !== "array") {
           // A non-array operand (incl. a bare untyped NULL) is 42804 — PG's exact code.
-          throw engineError("datatype_mismatch", "VARIADIC argument must be an array");
+          throw engineError(
+            "datatype_mismatch",
+            "VARIADIC argument must be an array",
+          );
         }
         // "any" accepts any element type; a concrete variadic family must match.
-        if (varFamily !== "any" && !familyMatches(varFamily, r.type.elem)) throw noFuncOverload(name);
+        if (varFamily !== "any" && !familyMatches(varFamily, r.type.elem))
+          throw noFuncOverload(name);
       } else if (!familyMatches(desc.argFamilies[i]!, r.type)) {
         throw noFuncOverload(name);
       }
@@ -7311,7 +9285,10 @@ function resolveVariadicFunc(
   }
 
   const result = scalarResultType(desc.result, []);
-  return { node: { kind: "variadic", func: name, args: rargs, arrayForm: e.variadic }, type: resolvedTypeOf(result) };
+  return {
+    node: { kind: "variadic", func: name, args: rargs, arrayForm: e.variadic },
+    type: resolvedTypeOf(result),
+  };
 }
 
 // === Polymorphic array-function resolution (spec/design/array-functions.md §2) ======
@@ -7325,7 +9302,10 @@ function resolveVariadicFunc(
 // kind === "function" catalog row whose argFamilies mention anyarray/anyelement. Data-driven.
 function isArrayFuncName(name: string): boolean {
   return OPERATORS.some(
-    (o) => o.kind === "function" && o.name === name && o.argFamilies.some((f) => f === "anyarray" || f === "anyelement"),
+    (o) =>
+      o.kind === "function" &&
+      o.name === name &&
+      o.argFamilies.some((f) => f === "anyarray" || f === "anyelement"),
   );
 }
 
@@ -7334,12 +9314,20 @@ function isArrayFuncName(name: string): boolean {
 // everything else by kind.
 function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
   if (a.kind !== b.kind) return false;
-  if (a.kind === "int" || a.kind === "float") return a.ty === (b as { ty: ScalarType }).ty;
-  if (a.kind === "array") return resolvedTypeEqual(a.elem, (b as { elem: ResolvedType }).elem);
+  if (a.kind === "int" || a.kind === "float")
+    return a.ty === (b as { ty: ScalarType }).ty;
+  if (a.kind === "array")
+    return resolvedTypeEqual(a.elem, (b as { elem: ResolvedType }).elem);
   if (a.kind === "composite") {
-    const bc = b as { name: string | null; fields: { name: string; type: ResolvedType }[] };
-    if (a.name !== bc.name || a.fields.length !== bc.fields.length) return false;
-    return a.fields.every((f, i) => resolvedTypeEqual(f.type, bc.fields[i]!.type));
+    const bc = b as {
+      name: string | null;
+      fields: { name: string; type: ResolvedType }[];
+    };
+    if (a.name !== bc.name || a.fields.length !== bc.fields.length)
+      return false;
+    return a.fields.every((f, i) =>
+      resolvedTypeEqual(f.type, bc.fields[i]!.type),
+    );
   }
   return true;
 }
@@ -7348,7 +9336,10 @@ function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
 // argument types, returning { elem, matched }. When matched, elem is null if every polymorphic arg was
 // an untyped NULL (ELEM undeterminable). Three passes: anyarray (binds ELEM := the element type),
 // anyelement (may precede its binding array — array_prepend), then concrete family slots.
-function matchPoly(slots: readonly string[], tys: ResolvedType[]): { elem: ResolvedType | null; matched: boolean } {
+function matchPoly(
+  slots: readonly string[],
+  tys: ResolvedType[],
+): { elem: ResolvedType | null; matched: boolean } {
   let elem: ResolvedType | null = null;
   const unify = (x: ResolvedType): boolean => {
     if (elem === null) {
@@ -7373,7 +9364,11 @@ function matchPoly(slots: readonly string[], tys: ResolvedType[]): { elem: Resol
     }
   }
   for (let j = 0; j < slots.length; j++) {
-    if (slots[j] !== "anyarray" && slots[j] !== "anyelement" && !familyMatches(slots[j]!, tys[j]!)) {
+    if (
+      slots[j] !== "anyarray" &&
+      slots[j] !== "anyelement" &&
+      !familyMatches(slots[j]!, tys[j]!)
+    ) {
       return { elem: null, matched: false };
     }
   }
@@ -7397,18 +9392,23 @@ function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
   if (code.endsWith("[]")) {
     const base = code.slice(0, -2);
     const bty = scalarTypeFromName(base);
-    if (bty === undefined) throw new Error("polyResultType: unknown array element " + base);
+    if (bty === undefined)
+      throw new Error("polyResultType: unknown array element " + base);
     return { kind: "array", elem: resolvedTypeOf(bty) };
   }
   const ty = scalarTypeFromName(code);
-  if (ty === undefined) throw new Error("polyResultType: unknown result code " + code);
+  if (ty === undefined)
+    throw new Error("polyResultType: unknown result code " + code);
   return resolvedTypeOf(ty);
 }
 
 // indeterminatePoly is the 42P18 raised when an array function's polymorphic type cannot be
 // determined because every polymorphic argument was an untyped NULL (array_append(NULL, NULL)).
 function indeterminatePoly(): EngineError {
-  return engineError("indeterminate_datatype", "could not determine polymorphic type because input has type unknown");
+  return engineError(
+    "indeterminate_datatype",
+    "could not determine polymorphic type because input has type unknown",
+  );
 }
 
 // elemScalarHint is the element type's ScalarType, for the literal-adaptation hint
@@ -7456,11 +9456,18 @@ function resolveArrayFunc(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  if (e.star)
+    throw engineError(
+      "syntax_error",
+      "* is only valid as the argument of COUNT",
+    );
   const name = e.name.toLowerCase() as ArrayFuncName;
   // Each array-function name is single-overload; find its row by (name, arity). A wrong argument count
   // matches no overload (42883), exactly as a missing scalar overload does.
-  const desc = OPERATORS.find((o) => o.kind === "function" && o.name === name && o.arity === e.args.length);
+  const desc = OPERATORS.find(
+    (o) =>
+      o.kind === "function" && o.name === name && o.arity === e.args.length,
+  );
   if (!desc) throw noFuncOverload(name);
   const slots = desc.argFamilies;
 
@@ -7499,7 +9506,9 @@ function resolveArrayFunc(
 function groupingErrorColumn(name: string): EngineError {
   return engineError(
     "grouping_error",
-    "column " + name + " must appear in the GROUP BY clause or be used in an aggregate function",
+    "column " +
+      name +
+      " must appear in the GROUP BY clause or be used in an aggregate function",
   );
 }
 
@@ -7525,7 +9534,13 @@ function groupingErrorColumn(name: string): EngineError {
 // `cte` is set (to the CTE list index) when this relation is a reference to a CTE
 // (spec/design/cte.md) rather than a base table — its `table` is the binding's synthetic relation
 // and exec delivers its rows from the CteCtx. Undefined for a base table / SRF / pseudo-relation.
-type ScopeRel = { label: string; table: Table; offset: number; qualifierOnly?: boolean; cte?: number };
+type ScopeRel = {
+  label: string;
+  table: Table;
+  offset: number;
+  qualifierOnly?: boolean;
+  cte?: number;
+};
 
 // Resolved is how a column reference resolved against the scope CHAIN (spec/design/grammar.md
 // §26): level === 0 is a LOCAL column of this query (a flat index into the joined row); level >= 1
@@ -7570,7 +9585,12 @@ class Scope {
   // outer environment (the subquery's parent is this scope), an uncorrelated one folds once
   // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
   static single(catalog: Database, t: Table): Scope {
-    return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }], catalog, null, true);
+    return new Scope(
+      [{ label: t.name.toLowerCase(), table: t, offset: 0 }],
+      catalog,
+      null,
+      true,
+    );
   }
 
   // empty is the column-less scope a DEFAULT expression resolves against (constraints.md §2): a
@@ -7601,8 +9621,34 @@ class Scope {
       { label: "new", offset: newOffset },
     ]) {
       if (label !== pseudo.label) {
-        rels.push({ label: pseudo.label, table: t, offset: pseudo.offset, qualifierOnly: true });
+        rels.push({
+          label: pseudo.label,
+          table: t,
+          offset: pseudo.offset,
+          qualifierOnly: true,
+        });
       }
+    }
+    return new Scope(rels, catalog, null, true);
+  }
+
+  // onConflictExcluded is the scope a DO UPDATE's SET/WHERE resolve against
+  // (spec/design/upsert.md §5): the target table at offset 0 (bare and table-qualified references
+  // read the EXISTING conflicting row), plus `excluded` as a QUALIFIER-ONLY relation at offset n
+  // over the combined row [existing | proposed] (excluded.col reads the proposed row). A target
+  // table literally named `excluded` SHADOWS the pseudo-relation (PostgreSQL's rule, like the
+  // RETURNING old/new qualifiers).
+  static onConflictExcluded(catalog: Database, t: Table): Scope {
+    const n = t.columns.length;
+    const label = t.name.toLowerCase();
+    const rels: ScopeRel[] = [{ label, table: t, offset: 0 }];
+    if (label !== "excluded") {
+      rels.push({
+        label: "excluded",
+        table: t,
+        offset: n,
+        qualifierOnly: true,
+      });
     }
     return new Scope(rels, catalog, null, true);
   }
@@ -7646,7 +9692,8 @@ class Scope {
         return { level: 0, index: r.offset + local };
       }
     }
-    if (this.parent !== null) return outerOf(this.parent.resolveQualified(qualifier, name));
+    if (this.parent !== null)
+      return outerOf(this.parent.resolveQualified(qualifier, name));
     throw missingFromEntry(qualifier);
   }
 
@@ -7654,7 +9701,8 @@ class Scope {
   columnAt(flat: number): Column {
     for (const r of this.rels) {
       const n = r.table.columns.length;
-      if (flat >= r.offset && flat < r.offset + n) return r.table.columns[flat - r.offset]!;
+      if (flat >= r.offset && flat < r.offset + n)
+        return r.table.columns[flat - r.offset]!;
     }
     throw new Error("a resolved flat column index is always in range");
   }
@@ -7679,12 +9727,18 @@ function undefinedColumn(name: string): EngineError {
 
 // ambiguousColumn is 42702 — a bare column name that more than one relation in scope defines.
 function ambiguousColumn(name: string): EngineError {
-  return engineError("ambiguous_column", "column reference " + name + " is ambiguous");
+  return engineError(
+    "ambiguous_column",
+    "column reference " + name + " is ambiguous",
+  );
 }
 
 // missingFromEntry is 42P01 — a qualifier that names no relation in the FROM clause.
 function missingFromEntry(qualifier: string): EngineError {
-  return engineError("undefined_table", "missing FROM-clause entry for table " + qualifier);
+  return engineError(
+    "undefined_table",
+    "missing FROM-clause entry for table " + qualifier,
+  );
 }
 
 // resolvedTypeOf is the resolved (static) type of a column of scalar type ty.
@@ -7708,13 +9762,18 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
 // composite reference is guaranteed to resolve (CREATE TYPE / the two-pass load validated it).
 function resolvedTypeOfCol(ty: Type, db: Database): ResolvedType {
   if (ty.kind === "scalar") return resolvedTypeOf(ty.scalar);
-  if (ty.kind === "array") return { kind: "array", elem: resolvedTypeOfCol(ty.elem, db) };
+  if (ty.kind === "array")
+    return { kind: "array", elem: resolvedTypeOfCol(ty.elem, db) };
   const def = db.compositeType(ty.name);
-  if (def === undefined) throw new Error("composite type reference resolved at load / CREATE TYPE");
+  if (def === undefined)
+    throw new Error("composite type reference resolved at load / CREATE TYPE");
   return {
     kind: "composite",
     name: def.name,
-    fields: def.fields.map((f) => ({ name: f.name, type: resolvedTypeOfCol(f.type, db) })),
+    fields: def.fields.map((f) => ({
+      name: f.name,
+      type: resolvedTypeOfCol(f.type, db),
+    })),
   };
 }
 
@@ -7825,7 +9884,11 @@ function rtName(t: ResolvedType): string {
 // with MORE aliases is 42P10) or the body's own output names, typed from the planned body. The
 // relation has no primary key / constraints — it is read-only and its rows come from the CTE
 // context, never a store.
-function cteSyntheticTable(name: string, plan: QueryPlan, rename: string[] | null): Table {
+function cteSyntheticTable(
+  name: string,
+  plan: QueryPlan,
+  rename: string[] | null,
+): Table {
   const bodyTypes = plan.columnTypes;
   const bodyNames = plan.columnNames;
   let colNames: string[];
@@ -7887,7 +9950,10 @@ function typeFromResolved(rt: ResolvedType): Type {
       return scalarT("interval");
     case "composite":
       if (rt.name !== null) return compositeT(rt.name);
-      throw engineError("feature_not_supported", "an anonymous composite column in a CTE is not supported yet");
+      throw engineError(
+        "feature_not_supported",
+        "an anonymous composite column in a CTE is not supported yet",
+      );
     case "array":
       return arrayT(typeFromResolved(rt.elem));
   }
@@ -7930,10 +9996,17 @@ class ParamTypes {
 
 // unifyParamType unifies two inferred types for the same parameter: equal agrees; two integer
 // widths widen to the wider; any other mismatch is 42804 (spec/design/api.md §5).
-function unifyParamType(a: ScalarType, b: ScalarType, idx0: number): ScalarType {
+function unifyParamType(
+  a: ScalarType,
+  b: ScalarType,
+  idx0: number,
+): ScalarType {
   if (a === b) return a;
   if (isInteger(a) && isInteger(b)) return rank(a) >= rank(b) ? a : b;
-  throw engineError("datatype_mismatch", `inconsistent types inferred for parameter $${idx0 + 1}`);
+  throw engineError(
+    "datatype_mismatch",
+    `inconsistent types inferred for parameter $${idx0 + 1}`,
+  );
 }
 
 // bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
@@ -7946,14 +10019,19 @@ function bindParams(supplied: Value[], types: ScalarType[]): Value[] {
       `bind parameter count mismatch: statement expects ${types.length}, got ${supplied.length}`,
     );
   }
-  return types.map((ty, i) => storeValue(supplied[i]!, ty, null, false, `$${i + 1}`));
+  return types.map((ty, i) =>
+    storeValue(supplied[i]!, ty, null, false, `$${i + 1}`),
+  );
 }
 
 // rejectParamsForDDL throws 42601 if bind parameters are supplied to a CREATE/DROP TABLE (which
 // has no expressions to bind — spec/design/api.md §5).
 function rejectParamsForDDL(params: Value[]): void {
   if (params.length > 0) {
-    throw engineError("syntax_error", "bind parameters are not allowed in a DDL statement");
+    throw engineError(
+      "syntax_error",
+      "bind parameters are not allowed in a DDL statement",
+    );
   }
 }
 
@@ -7964,13 +10042,20 @@ function rejectParamsForDDL(params: Value[]): void {
 // range, MINVALUE ≤ MAXVALUE, and START in [min, max] (each 22023); a fresh sequence starts with
 // lastValue = start, isCalled = false. ownedBy carries the IDENTITY / serial owner link (undefined
 // for a plain CREATE SEQUENCE).
-function buildSequenceDef(name: string, options: SeqOptions, ownedBy: SeqOwner | undefined): SequenceDef {
+function buildSequenceDef(
+  name: string,
+  options: SeqOptions,
+  ownedBy: SeqOwner | undefined,
+): SequenceDef {
   // The value type (§14): `AS <type>` → the named type (22023 if not an integer type), else bigint.
   let dtype: SeqDataType = "bigint";
   if (options.dataType !== null) {
     const dt = seqDataTypeFromName(options.dataType);
     if (dt === undefined) {
-      throw engineError("invalid_parameter_value", "sequence type must be smallint, integer, or bigint");
+      throw engineError(
+        "invalid_parameter_value",
+        "sequence type must be smallint, integer, or bigint",
+      );
     }
     dtype = dt;
   }
@@ -7981,26 +10066,43 @@ function buildSequenceDef(name: string, options: SeqOptions, ownedBy: SeqOwner |
   }
   const cache = options.cache ?? 1n;
   if (cache < 1n) {
-    throw engineError("invalid_parameter_value", `CACHE (${cache}) must be greater than zero`);
+    throw engineError(
+      "invalid_parameter_value",
+      `CACHE (${cache}) must be greater than zero`,
+    );
   }
   const [defMin, defMax] = seqDataTypeDefaultBounds(dtype, increment);
   // An explicit MAXVALUE/MINVALUE outside the type range is 22023 — checked (MAX first, PG order)
   // BEFORE the MIN > MAX consistency check (§14.2).
-  if (options.maxValue !== null && options.maxValue.value !== null && options.maxValue.value > typeMax) {
+  if (
+    options.maxValue !== null &&
+    options.maxValue.value !== null &&
+    options.maxValue.value > typeMax
+  ) {
     throw engineError(
       "invalid_parameter_value",
       `MAXVALUE (${options.maxValue.value}) is out of range for sequence data type ${seqDataTypePgName(dtype)}`,
     );
   }
-  if (options.minValue !== null && options.minValue.value !== null && options.minValue.value < typeMin) {
+  if (
+    options.minValue !== null &&
+    options.minValue.value !== null &&
+    options.minValue.value < typeMin
+  ) {
     throw engineError(
       "invalid_parameter_value",
       `MINVALUE (${options.minValue.value}) is out of range for sequence data type ${seqDataTypePgName(dtype)}`,
     );
   }
   // `{ value: v }` MINVALUE v / `{ value: null }` NO MINVALUE / outer null unset → the type default.
-  const minValue = options.minValue !== null && options.minValue.value !== null ? options.minValue.value : defMin;
-  const maxValue = options.maxValue !== null && options.maxValue.value !== null ? options.maxValue.value : defMax;
+  const minValue =
+    options.minValue !== null && options.minValue.value !== null
+      ? options.minValue.value
+      : defMin;
+  const maxValue =
+    options.maxValue !== null && options.maxValue.value !== null
+      ? options.maxValue.value
+      : defMax;
   // PG requires MINVALUE strictly less than MAXVALUE (a one-value sequence is rejected); jed
   // previously allowed `==` — corrected here so CREATE and ALTER (sequences.md §15.2) agree with PG.
   if (minValue >= maxValue) {
@@ -8028,7 +10130,11 @@ function buildSequenceDef(name: string, options: SeqOptions, ownedBy: SeqOwner |
 
 // seqBoundCheckStart is PG's START-in-bounds cross-check (init_params): start ∈ [min, max], else
 // 22023 with PG's wording. Shared by CREATE (buildSequenceDef) and ALTER (applySeqAlter).
-function seqBoundCheckStart(start: bigint, minValue: bigint, maxValue: bigint): void {
+function seqBoundCheckStart(
+  start: bigint,
+  minValue: bigint,
+  maxValue: bigint,
+): void {
   if (start < minValue) {
     throw engineError(
       "invalid_parameter_value",
@@ -8045,7 +10151,11 @@ function seqBoundCheckStart(start: bigint, minValue: bigint, maxValue: bigint): 
 
 // seqBoundCheckLast is PG's last_value (RESTART) cross-check (init_params): the post-edit last_value ∈
 // [min, max], else 22023. PG uses the "RESTART value …" wording even with no RESTART written (§15.2).
-function seqBoundCheckLast(lastValue: bigint, minValue: bigint, maxValue: bigint): void {
+function seqBoundCheckLast(
+  lastValue: bigint,
+  minValue: bigint,
+  maxValue: bigint,
+): void {
   if (lastValue < minValue) {
     throw engineError(
       "invalid_parameter_value",
@@ -8073,13 +10183,19 @@ function applySeqAlter(
   const def = { ...existing };
   if (options.increment !== null) {
     if (options.increment === 0n) {
-      throw engineError("invalid_parameter_value", "INCREMENT must not be zero");
+      throw engineError(
+        "invalid_parameter_value",
+        "INCREMENT must not be zero",
+      );
     }
     def.increment = options.increment;
   }
   if (options.cache !== null) {
     if (options.cache < 1n) {
-      throw engineError("invalid_parameter_value", `CACHE (${options.cache}) must be greater than zero`);
+      throw engineError(
+        "invalid_parameter_value",
+        `CACHE (${options.cache}) must be greater than zero`,
+      );
     }
     def.cache = options.cache;
   }
@@ -8088,10 +10204,12 @@ function applySeqAlter(
   // unwritten bound is preserved (PG keeps it even when the sign flips).
   const [defMin, defMax] = seqDataTypeDefaultBounds("bigint", def.increment);
   if (options.minValue !== null) {
-    def.minValue = options.minValue.value === null ? defMin : options.minValue.value;
+    def.minValue =
+      options.minValue.value === null ? defMin : options.minValue.value;
   }
   if (options.maxValue !== null) {
-    def.maxValue = options.maxValue.value === null ? defMax : options.maxValue.value;
+    def.maxValue =
+      options.maxValue.value === null ? defMax : options.maxValue.value;
   }
   if (def.minValue >= def.maxValue) {
     throw engineError(
@@ -8170,14 +10288,19 @@ function stmtCallsSeqMutator(stmt: Statement): boolean {
     case "setOp":
       return setOpCallsSeqMutator(stmt);
     case "with":
-      return stmt.ctes.some((c) => queryCallsSeqMutator(c.query)) || queryCallsSeqMutator(stmt.body);
+      return (
+        stmt.ctes.some((c) => queryCallsSeqMutator(c.query)) ||
+        queryCallsSeqMutator(stmt.body)
+      );
     default:
       return false;
   }
 }
 
 function queryCallsSeqMutator(qe: QueryExpr): boolean {
-  return qe.kind === "setOp" ? setOpCallsSeqMutator(qe) : selectCallsSeqMutator(qe);
+  return qe.kind === "setOp"
+    ? setOpCallsSeqMutator(qe)
+    : selectCallsSeqMutator(qe);
 }
 
 function setOpCallsSeqMutator(so: SetOp): boolean {
@@ -8186,12 +10309,15 @@ function setOpCallsSeqMutator(so: SetOp): boolean {
 
 function selectCallsSeqMutator(s: Select): boolean {
   const itemCalls =
-    s.items.kind === "list" && s.items.items.some((i) => exprCallsSeqMutator(i.expr));
+    s.items.kind === "list" &&
+    s.items.items.some((i) => exprCallsSeqMutator(i.expr));
   return (
     itemCalls ||
     (s.from !== null && tableRefCallsSeqMutator(s.from)) ||
     s.joins.some(
-      (j) => tableRefCallsSeqMutator(j.table) || (j.on !== null && exprCallsSeqMutator(j.on)),
+      (j) =>
+        tableRefCallsSeqMutator(j.table) ||
+        (j.on !== null && exprCallsSeqMutator(j.on)),
     ) ||
     (s.filter !== null && exprCallsSeqMutator(s.filter)) ||
     s.groupBy.some(exprCallsSeqMutator) ||
@@ -8203,7 +10329,8 @@ function tableRefCallsSeqMutator(t: TableRef): boolean {
   return (
     (t.args !== null && t.args.some(exprCallsSeqMutator)) ||
     (t.subquery !== undefined && queryCallsSeqMutator(t.subquery)) ||
-    (t.values !== undefined && t.values.some((row) => row.some(exprCallsSeqMutator)))
+    (t.values !== undefined &&
+      t.values.some((row) => row.some(exprCallsSeqMutator)))
   );
 }
 
@@ -8213,7 +10340,9 @@ function exprCallsSeqMutator(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall": {
       const n = e.name.toLowerCase();
-      return n === "nextval" || n === "setval" || e.args.some(exprCallsSeqMutator);
+      return (
+        n === "nextval" || n === "setval" || e.args.some(exprCallsSeqMutator)
+      );
     }
     case "column":
     case "qualifiedColumn":
@@ -8251,12 +10380,16 @@ function exprCallsSeqMutator(e: Expr): boolean {
       return exprCallsSeqMutator(e.lhs) || e.list.some(exprCallsSeqMutator);
     case "between":
       return (
-        exprCallsSeqMutator(e.lhs) || exprCallsSeqMutator(e.lo) || exprCallsSeqMutator(e.hi)
+        exprCallsSeqMutator(e.lhs) ||
+        exprCallsSeqMutator(e.lo) ||
+        exprCallsSeqMutator(e.hi)
       );
     case "case":
       return (
         (e.operand !== null && exprCallsSeqMutator(e.operand)) ||
-        e.whens.some((w) => exprCallsSeqMutator(w.cond) || exprCallsSeqMutator(w.result)) ||
+        e.whens.some(
+          (w) => exprCallsSeqMutator(w.cond) || exprCallsSeqMutator(w.result),
+        ) ||
         (e.els !== null && exprCallsSeqMutator(e.els))
       );
     case "scalarSubquery":
@@ -8324,7 +10457,13 @@ function dmlOutcome(
   cost: bigint,
 ): Outcome {
   if (retNames !== null) {
-    return { kind: "query", columnNames: retNames, columnTypes: retTypes ?? [], rows: returned ?? [], cost };
+    return {
+      kind: "query",
+      columnNames: retNames,
+      columnTypes: retTypes ?? [],
+      rows: returned ?? [],
+      cost,
+    };
   }
   return { kind: "statement", cost, rowsAffected: affected };
 }
@@ -8344,7 +10483,10 @@ function resolveProjections(
     // (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
     // pseudo-relations, and that scope always also carries the real relation.
     if (scope.rels.every((r) => r.qualifierOnly)) {
-      throw engineError("syntax_error", "SELECT * with no tables specified is not valid");
+      throw engineError(
+        "syntax_error",
+        "SELECT * with no tables specified is not valid",
+      );
     }
     const nodes: RExpr[] = [];
     const names: string[] = [];
@@ -8374,7 +10516,9 @@ function resolveProjections(
       if (baseType.kind !== "composite") {
         throw engineError(
           "wrong_object_type",
-          "column notation .* applied to type " + rtName(baseType) + ", which is not a composite type",
+          "column notation .* applied to type " +
+            rtName(baseType) +
+            ", which is not a composite type",
         );
       }
       baseType.fields.forEach((f, i) => {
@@ -8427,9 +10571,19 @@ function outputName(scope: Scope, e: Expr): string {
 
 // resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an
 // untyped NULL, always unknown → no rows). An integer- or text-valued one is a 42804.
-function resolveBooleanFilter(scope: Scope, e: Expr, params: ParamTypes): RExpr {
+function resolveBooleanFilter(
+  scope: Scope,
+  e: Expr,
+  params: ParamTypes,
+): RExpr {
   // WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
-  const { node, type } = resolve(scope, e, null, { collecting: false, groupKeys: [], specs: [] }, params);
+  const { node, type } = resolve(
+    scope,
+    e,
+    null,
+    { collecting: false, groupKeys: [], specs: [] },
+    params,
+  );
   if (type.kind !== "bool" && type.kind !== "null") {
     throw typeError("argument of WHERE must be boolean");
   }
@@ -8447,7 +10601,10 @@ function resolveColumnRef(
   name: string,
 ): { node: RExpr; type: ResolvedType } {
   if (r.level === 0) return collectColumn(scope, ag, r.index, name);
-  return { node: { kind: "outerColumn", level: r.level, index: r.index }, type: resolvedTypeOfCol(scope.columnOf(r).type, scope.catalog) };
+  return {
+    node: { kind: "outerColumn", level: r.level, index: r.index },
+    type: resolvedTypeOfCol(scope.columnOf(r).type, scope.catalog),
+  };
 }
 
 // resolveFieldOf resolves a composite field selection `base.field` (spec/design/composite.md §S4)
@@ -8463,13 +10620,20 @@ function resolveFieldOf(
   if (baseType.kind !== "composite") {
     throw engineError(
       "wrong_object_type",
-      "column notation ." + field + " applied to type " + rtName(baseType) + ", which is not a composite type",
+      "column notation ." +
+        field +
+        " applied to type " +
+        rtName(baseType) +
+        ", which is not a composite type",
     );
   }
   const lower = field.toLowerCase();
   const idx = baseType.fields.findIndex((f) => f.name.toLowerCase() === lower);
   if (idx < 0) throw undefinedColumn(field);
-  return { node: { kind: "field", base: baseNode, index: idx }, type: baseType.fields[idx]!.type };
+  return {
+    node: { kind: "field", base: baseNode, index: idx },
+    type: baseType.fields[idx]!.type,
+  };
 }
 
 // planSubquery plans a subquery operand against the scope chain (§26). Rejects a non-SELECT context
@@ -8480,9 +10644,16 @@ function resolveFieldOf(
 // divergence from PostgreSQL, which defaults such a $N to text — grammar.md §26). The inner query is
 // resolved ONCE, with `scope` as its parent, so correlated references become outerColumn and errors
 // fire even over an empty outer.
-function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): QueryPlan {
+function planSubquery(
+  scope: Scope,
+  inner: QueryExpr,
+  params: ParamTypes,
+): QueryPlan {
   if (!scope.allowSubquery) {
-    throw engineError("feature_not_supported", "subqueries are only supported in a SELECT statement");
+    throw engineError(
+      "feature_not_supported",
+      "subqueries are only supported in a SELECT statement",
+    );
   }
   // The subquery inherits the enclosing scope's CTE bindings directly (cte.md §2) — visible at any
   // nesting depth without counting as a correlation level.
@@ -8512,14 +10683,19 @@ function resolve(
         nodes.push(node);
         fields.push({ name: "f" + (i + 1), type });
       }
-      return { node: { kind: "row", fields: nodes }, type: { kind: "composite", name: null, fields } };
+      return {
+        node: { kind: "row", fields: nodes },
+        type: { kind: "composite", name: null, fields },
+      };
     }
     case "array": {
       // An ARRAY[...] constructor (spec/design/array.md §1): resolve each element (natural type),
       // unify to a common element type, build an array node. A bare empty ARRAY[] has no element
       // type to infer — use '{}'::T[] instead (the cast supplies it).
       if (e.elements.length === 0) {
-        throw typeError("cannot determine the element type of an empty ARRAY[]; write '{}'::T[]");
+        throw typeError(
+          "cannot determine the element type of an empty ARRAY[]; write '{}'::T[]",
+        );
       }
       // An element-type hint (ctx) flows down to the elements so an array literal adapts its untyped
       // integer/decimal literals exactly as a scalar literal does — e.g. resolving ARRAY[7,8] with an
@@ -8537,9 +10713,15 @@ function resolve(
       // result type is the SAME array type (dimension-agnostic, §2/§4); otherwise a flat 1-D array.
       const common = unifyArrayElementTypes(elemTypes);
       if (common.kind === "array") {
-        return { node: { kind: "array", elements: nodes, nested: true }, type: common };
+        return {
+          node: { kind: "array", elements: nodes, nested: true },
+          type: common,
+        };
       }
-      return { node: { kind: "array", elements: nodes, nested: false }, type: { kind: "array", elem: common } };
+      return {
+        node: { kind: "array", elements: nodes, nested: false },
+        type: { kind: "array", elem: common },
+      };
     }
     case "column": {
       // Resolve against the scope CHAIN (§26). A Local match obeys the grouping rule; an Outer
@@ -8552,7 +10734,12 @@ function resolve(
       // PARENS-REQUIRED `(col).field` form (spec/design/composite.md §1/§S4), a fieldAccess node,
       // never this bare qualified-column path (PG raises 42P01 for the unparenthesized `col.field` /
       // `t.col.field` spellings).
-      return resolveColumnRef(scope, ag, scope.resolveQualified(e.qualifier, e.name), e.name);
+      return resolveColumnRef(
+        scope,
+        ag,
+        scope.resolveQualified(e.qualifier, e.name),
+        e.name,
+      );
     }
     case "fieldAccess": {
       // `(expr).field` — composite field selection (spec/design/composite.md §S4).
@@ -8562,7 +10749,10 @@ function resolve(
     case "fieldStar":
       // `(expr).*` — whole-row expansion is a projection-list construct only; in a scalar
       // expression position it is unsupported (PG rejects row expansion here — 0A000).
-      throw engineError("feature_not_supported", "row expansion (.*) is not supported in this context");
+      throw engineError(
+        "feature_not_supported",
+        "row expansion (.*) is not supported in this context",
+      );
     case "subscript": {
       // `base[..][..]` — array subscript (spec/design/array.md §6). The base must be an array (else
       // 42804). Each subscript bound is an integer (a literal adapts; a non-integer is 42804). If any
@@ -8570,12 +10760,16 @@ function resolve(
       // NULL → NULL is an evaluation-time rule, not a resolve error.
       const base = resolve(scope, e.base, null, ag, params);
       if (base.type.kind !== "array") {
-        throw typeError(`cannot subscript a value of type ${rtName(base.type)}, which is not an array`);
+        throw typeError(
+          `cannot subscript a value of type ${rtName(base.type)}, which is not an array`,
+        );
       }
       const resolveBound = (b: Expr): RExpr => {
         const r = resolve(scope, b, "i32", ag, params);
         if (r.type.kind !== "int" && r.type.kind !== "null") {
-          throw typeError(`array subscript must be an integer, not ${rtName(r.type)}`);
+          throw typeError(
+            `array subscript must be an integer, not ${rtName(r.type)}`,
+          );
         }
         return r.node;
       };
@@ -8593,7 +10787,15 @@ function resolve(
       });
       // A slice yields a sub-array (the array type); all-index access yields an element.
       const type = isSlice ? base.type : base.type.elem;
-      return { node: { kind: "subscript", base: base.node, subscripts: rsubs, isSlice }, type };
+      return {
+        node: {
+          kind: "subscript",
+          base: base.node,
+          subscripts: rsubs,
+          isSlice,
+        },
+        type,
+      };
     }
     case "param": {
       // A bind parameter is an adaptable operand (like an integer/string literal): it takes its
@@ -8601,7 +10803,8 @@ function resolve(
       // type (null = no context here; finalize 42P18s a parameter that never gets one).
       const idx0 = e.index - 1;
       params.note(idx0, ctx);
-      const type: ResolvedType = ctx !== null ? resolvedTypeOf(ctx) : { kind: "null" };
+      const type: ResolvedType =
+        ctx !== null ? resolvedTypeOf(ctx) : { kind: "null" };
       return { node: { kind: "param", index: idx0 }, type };
     }
     case "funcCall":
@@ -8614,7 +10817,8 @@ function resolve(
       // A composite type name (`addr '(Main,90210)'`) coerces the string via record_in
       // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
       const ct = scope.catalog.compositeType(e.typeName);
-      if (ct !== undefined) return coerceStringToComposite(e.text, ct, scope.catalog);
+      if (ct !== undefined)
+        return coerceStringToComposite(e.text, ct, scope.catalog);
       const [target] = resolveTypeAndTypmod(e.typeName, null);
       return coerceStringLiteral(e.text, target, null);
     }
@@ -8623,7 +10827,10 @@ function resolve(
         case "null":
           return { node: { kind: "constNull" }, type: { kind: "null" } };
         case "bool":
-          return { node: { kind: "constBool", value: e.literal.value }, type: { kind: "bool" } };
+          return {
+            node: { kind: "constBool", value: e.literal.value },
+            type: { kind: "bool" },
+          };
         case "text": {
           // A string literal is text by default (collation C). It adapts to a BYTEA or a UUID
           // context (types.md §6/§13/§14): decode the hex input (bytea) or the PG-flexible uuid
@@ -8633,25 +10840,37 @@ function resolve(
           // the datetime, 22007/22008 — spec/design/timestamp.md). Any other context keeps it text.
           if (ctx !== null && isBytea(ctx)) {
             return {
-              node: { kind: "constBytea", value: decodeByteaLiteral(e.literal.text) },
+              node: {
+                kind: "constBytea",
+                value: decodeByteaLiteral(e.literal.text),
+              },
               type: { kind: "bytea" },
             };
           }
           if (ctx !== null && isUuid(ctx)) {
             return {
-              node: { kind: "constUuid", value: decodeUuidLiteral(e.literal.text) },
+              node: {
+                kind: "constUuid",
+                value: decodeUuidLiteral(e.literal.text),
+              },
               type: { kind: "uuid" },
             };
           }
           if (ctx !== null && isTimestamp(ctx)) {
             return {
-              node: { kind: "constTimestamp", value: parseTimestamp(e.literal.text) },
+              node: {
+                kind: "constTimestamp",
+                value: parseTimestamp(e.literal.text),
+              },
               type: { kind: "timestamp" },
             };
           }
           if (ctx !== null && isTimestamptz(ctx)) {
             return {
-              node: { kind: "constTimestamptz", value: parseTimestamptz(e.literal.text) },
+              node: {
+                kind: "constTimestamptz",
+                value: parseTimestamptz(e.literal.text),
+              },
               type: { kind: "timestamptz" },
             };
           }
@@ -8666,11 +10885,17 @@ function resolve(
             // A string adapts to an INTERVAL context (parse the "unit + time" subset,
             // 22007/22008 — spec/design/interval.md), like timestamp adaptation.
             return {
-              node: { kind: "constInterval", value: parseInterval(e.literal.text) },
+              node: {
+                kind: "constInterval",
+                value: parseInterval(e.literal.text),
+              },
               type: { kind: "interval" },
             };
           }
-          return { node: { kind: "constText", value: e.literal.text }, type: { kind: "text" } };
+          return {
+            node: { kind: "constText", value: e.literal.text },
+            type: { kind: "text" },
+          };
         }
         case "decimal":
           // A decimal literal adapts to a FLOAT context (float.md §4): decimal → float at resolve
@@ -8680,7 +10905,10 @@ function resolve(
           if (ctx !== null && isFloat(ctx)) {
             return floatFromDecimalLiteral(e.literal.dec, ctx);
           }
-          return { node: { kind: "constDecimal", value: e.literal.dec.checkCap() }, type: { kind: "decimal" } };
+          return {
+            node: { kind: "constDecimal", value: e.literal.dec.checkCap() },
+            type: { kind: "decimal" },
+          };
         default: {
           // An integer literal adapts to an integer context or — like a decimal literal — a FLOAT
           // context (int → float at resolve; float.md §4). A non-numeric context (a text/decimal
@@ -8689,11 +10917,17 @@ function resolve(
           // range check.
           if (ctx !== null && isFloat(ctx)) {
             const n = roundToWidth(ctx, Number(e.literal.int));
-            return { node: { kind: "constFloat", ty: ctx, value: n }, type: { kind: "float", ty: ctx } };
+            return {
+              node: { kind: "constFloat", ty: ctx, value: n },
+              type: { kind: "float", ty: ctx },
+            };
           }
           const ty = ctx !== null && isInteger(ctx) ? ctx : "i64";
           if (!inRange(ty, e.literal.int)) throw overflow(ty);
-          return { node: { kind: "constInt", value: e.literal.int }, type: { kind: "int", ty } };
+          return {
+            node: { kind: "constInt", value: e.literal.int },
+            type: { kind: "int", ty },
+          };
         }
       }
     case "scalarSubquery": {
@@ -8703,10 +10937,19 @@ function resolve(
       // a correlated one is re-executed per outer row by the evaluator.
       const plan = planSubquery(scope, e.query, params);
       if (plan.columnTypes.length !== 1) {
-        throw engineError("syntax_error", "subquery must return only one column");
+        throw engineError(
+          "syntax_error",
+          "subquery must return only one column",
+        );
       }
       return {
-        node: { kind: "subquery", plan, subKind: "scalar", lhs: null, negated: false },
+        node: {
+          kind: "subquery",
+          plan,
+          subKind: "scalar",
+          lhs: null,
+          negated: false,
+        },
         type: plan.columnTypes[0]!,
       };
     }
@@ -8715,7 +10958,13 @@ function resolve(
       // parses as the unary NOT wrapping this, so negated here is always false.
       const plan = planSubquery(scope, e.query, params);
       return {
-        node: { kind: "subquery", plan, subKind: "exists", lhs: null, negated: false },
+        node: {
+          kind: "subquery",
+          plan,
+          subKind: "exists",
+          lhs: null,
+          negated: false,
+        },
         type: { kind: "bool" },
       };
     }
@@ -8730,7 +10979,13 @@ function resolve(
       }
       classifyComparable(lt, plan.columnTypes[0]!);
       return {
-        node: { kind: "subquery", plan, subKind: "in", lhs, negated: e.negated },
+        node: {
+          kind: "subquery",
+          plan,
+          subKind: "in",
+          lhs,
+          negated: e.negated,
+        },
         type: { kind: "bool" },
       };
     }
@@ -8753,7 +11008,15 @@ function resolve(
         );
       }
       return {
-        node: { kind: "subquery", plan, subKind: "quantified", lhs, negated: false, op: e.op, all: e.all },
+        node: {
+          kind: "subquery",
+          plan,
+          subKind: "quantified",
+          lhs,
+          negated: false,
+          op: e.op,
+          all: e.all,
+        },
         type: { kind: "bool" },
       };
     }
@@ -8764,7 +11027,10 @@ function resolve(
       if (e.typeName.endsWith("[]")) {
         const base = e.typeName.slice(0, -2);
         if (e.typeMod !== null) {
-          throw engineError("feature_not_supported", "a type modifier on an array type is not supported yet");
+          throw engineError(
+            "feature_not_supported",
+            "a type modifier on an array type is not supported yet",
+          );
         }
         const elemScalar = scalarTypeFromName(base);
         const baseComposite = scope.catalog.compositeType(base);
@@ -8782,12 +11048,21 @@ function resolve(
         }
         if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
           const val = coerceStringToArray(e.inner.literal.text, elemCol);
-          return { node: valueToRExpr(val), type: { kind: "array", elem: elemRt } };
+          return {
+            node: valueToRExpr(val),
+            type: { kind: "array", elem: elemRt },
+          };
         }
         if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
-          return { node: { kind: "constNull" }, type: { kind: "array", elem: elemRt } };
+          return {
+            node: { kind: "constNull" },
+            type: { kind: "array", elem: elemRt },
+          };
         }
-        throw engineError("feature_not_supported", "casting to an array type is only supported from a string literal this slice");
+        throw engineError(
+          "feature_not_supported",
+          "casting to an array type is only supported from a string literal this slice",
+        );
       }
       // A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
       // (spec/design/composite.md §8). A STRING LITERAL operand coerces via record_in (the
@@ -8798,20 +11073,39 @@ function resolve(
       const ct = scope.catalog.compositeType(e.typeName);
       if (ct !== undefined) {
         if (e.typeMod !== null) {
-          throw engineError("feature_not_supported", "a type modifier is not supported on a composite type");
+          throw engineError(
+            "feature_not_supported",
+            "a type modifier is not supported on a composite type",
+          );
         }
         if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-          return coerceStringToComposite(e.inner.literal.text, ct, scope.catalog);
+          return coerceStringToComposite(
+            e.inner.literal.text,
+            ct,
+            scope.catalog,
+          );
         }
         const inner = resolve(scope, e.inner, null, ag, params);
         if (inner.type.kind === "null") {
-          return { node: inner.node, type: resolvedTypeOfCol({ kind: "composite", name: ct.name }, scope.catalog) };
+          return {
+            node: inner.node,
+            type: resolvedTypeOfCol(
+              { kind: "composite", name: ct.name },
+              scope.catalog,
+            ),
+          };
         }
         // An identical named composite is the identity cast.
-        if (inner.type.kind === "composite" && inner.type.name?.toLowerCase() === ct.name.toLowerCase()) {
+        if (
+          inner.type.kind === "composite" &&
+          inner.type.name?.toLowerCase() === ct.name.toLowerCase()
+        ) {
           return inner;
         }
-        throw engineError("feature_not_supported", "casting to a composite type is only supported from a string literal");
+        throw engineError(
+          "feature_not_supported",
+          "casting to a composite type is only supported from a string literal",
+        );
       }
       const [target, typmod] = resolveTypeAndTypmod(e.typeName, e.typeMod);
       // A string LITERAL operand is coerced to the target at resolve — CAST('42' AS int), the same
@@ -8824,33 +11118,54 @@ function resolve(
       // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
       // casting TO text is a 0A000 this slice.
       if (isText(target)) {
-        throw engineError("feature_not_supported", "casting to text is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting to text is not supported yet",
+        );
       }
       // Boolean casts are likewise deferred (boolean⇄integer is a later cast slice —
       // spec/types/casts.toml): casting TO boolean is a 0A000 this slice. Without this guard
       // resolveTypeAndTypmod now returns boolean, so it must be caught here.
       if (isBool(target)) {
-        throw engineError("feature_not_supported", "casting to boolean is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting to boolean is not supported yet",
+        );
       }
       // bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
       if (isBytea(target)) {
-        throw engineError("feature_not_supported", "casting to bytea is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting to bytea is not supported yet",
+        );
       }
       // uuid casts are likewise deferred (types.md §5/§14): casting TO uuid is 0A000.
       if (isUuid(target)) {
-        throw engineError("feature_not_supported", "casting to uuid is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting to uuid is not supported yet",
+        );
       }
       // timestamp casts are deferred (spec/design/timestamp.md §6): casting TO a datetime is 0A000.
       if (isTimestamp(target) || isTimestamptz(target)) {
-        throw engineError("feature_not_supported", "casting to a timestamp type is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting to a timestamp type is not supported yet",
+        );
       }
       // interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000.
       if (isInterval(target)) {
-        throw engineError("feature_not_supported", "casting to an interval type is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting to an interval type is not supported yet",
+        );
       }
       // date casts are deferred (spec/design/date.md §5/§6): casting TO date is 0A000.
       if (isDate(target)) {
-        throw engineError("feature_not_supported", "casting to a date type is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting to a date type is not supported yet",
+        );
       }
       // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
       // `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
@@ -8864,31 +11179,55 @@ function resolve(
       }
       // Casting FROM text is likewise deferred (0A000).
       if (inner.type.kind === "text") {
-        throw engineError("feature_not_supported", "casting from text is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting from text is not supported yet",
+        );
       }
       // Casting FROM bytea is likewise deferred (0A000).
       if (inner.type.kind === "bytea") {
-        throw engineError("feature_not_supported", "casting from bytea is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting from bytea is not supported yet",
+        );
       }
       // Casting FROM uuid is likewise deferred (0A000).
       if (inner.type.kind === "uuid") {
-        throw engineError("feature_not_supported", "casting from uuid is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting from uuid is not supported yet",
+        );
       }
       // Casting FROM a timestamp is likewise deferred (0A000).
-      if (inner.type.kind === "timestamp" || inner.type.kind === "timestamptz") {
-        throw engineError("feature_not_supported", "casting from a timestamp type is not supported yet");
+      if (
+        inner.type.kind === "timestamp" ||
+        inner.type.kind === "timestamptz"
+      ) {
+        throw engineError(
+          "feature_not_supported",
+          "casting from a timestamp type is not supported yet",
+        );
       }
       // Casting FROM an interval is likewise deferred (0A000).
       if (inner.type.kind === "interval") {
-        throw engineError("feature_not_supported", "casting from an interval type is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting from an interval type is not supported yet",
+        );
       }
       // Casting FROM a date is likewise deferred (0A000; date↔timestamp unblocks the cross-family comparison — date.md §4/§6).
       if (inner.type.kind === "date") {
-        throw engineError("feature_not_supported", "casting from a date type is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting from a date type is not supported yet",
+        );
       }
       // Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
       if (inner.type.kind === "array") {
-        throw engineError("feature_not_supported", "casting an array value is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "casting an array value is not supported yet",
+        );
       }
       // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
       // decimal→decimal (re-scale), the float casts (int↔float, decimal↔float, float↔float — all
@@ -8899,28 +11238,44 @@ function resolve(
         : isFloat(target)
           ? { kind: "float", ty: target }
           : { kind: "int", ty: target };
-      return { node: { kind: "cast", target, typmod, operand: inner.node }, type: resultType };
+      return {
+        node: { kind: "cast", target, typmod, operand: inner.node },
+        type: resultType,
+      };
     }
     case "unary":
       if (e.op === "neg") {
         const { node, type } = resolve(scope, e.operand, ctx, ag, params);
         if (type.kind === "decimal") {
-          return { node: { kind: "neg", result: "decimal", operand: node }, type: { kind: "decimal" } };
+          return {
+            node: { kind: "neg", result: "decimal", operand: node },
+            type: { kind: "decimal" },
+          };
         }
         if (type.kind === "float") {
           // Unary minus on a float flips the sign bit (no overflow); a NaN/Inf operand passes
           // through per IEEE (-NaN is NaN, -Inf is -Inf) — float.md §5. result keeps the width.
-          return { node: { kind: "neg", result: type.ty, operand: node }, type: { kind: "float", ty: type.ty } };
+          return {
+            node: { kind: "neg", result: type.ty, operand: node },
+            type: { kind: "float", ty: type.ty },
+          };
         }
         if (type.kind === "interval") {
           // -interval (spec/design/interval.md §5).
-          return { node: { kind: "neg", result: "interval", operand: node }, type: { kind: "interval" } };
+          return {
+            node: { kind: "neg", result: "interval", operand: node },
+            type: { kind: "interval" },
+          };
         }
         let result: ScalarType;
         if (type.kind === "int") result = type.ty;
-        else if (type.kind === "null") result = "i64"; // -NULL = NULL
+        else if (type.kind === "null")
+          result = "i64"; // -NULL = NULL
         else throw typeError("unary minus requires a numeric operand");
-        return { node: { kind: "neg", result, operand: node }, type: { kind: "int", ty: result } };
+        return {
+          node: { kind: "neg", result, operand: node },
+          type: { kind: "int", ty: result },
+        };
       }
       {
         const { node, type } = resolve(scope, e.operand, null, ag, params);
@@ -8929,7 +11284,10 @@ function resolve(
       }
     case "isNull": {
       const { node } = resolve(scope, e.operand, null, ag, params);
-      return { node: { kind: "isNull", operand: node, negated: e.negated }, type: { kind: "bool" } };
+      return {
+        node: { kind: "isNull", operand: node, negated: e.negated },
+        type: { kind: "bool" },
+      };
     }
     case "isDistinct": {
       // NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a literal
@@ -8938,7 +11296,10 @@ function resolve(
       // is always a definite boolean (functions.md §3).
       const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
       classifyComparable(p.lt, p.rt);
-      return { node: { kind: "distinct", lhs: p.rl, rhs: p.rr, negated: e.negated }, type: { kind: "bool" } };
+      return {
+        node: { kind: "distinct", lhs: p.rl, rhs: p.rr, negated: e.negated },
+        type: { kind: "bool" },
+      };
     }
     case "binary":
       return resolveBinary(scope, e.op, e.lhs, e.rhs, ag, params);
@@ -8952,7 +11313,10 @@ function resolve(
       // constant (a leaf — no operator_eval, cost.md §3).
       if (e.list.length === 0) {
         resolve(scope, e.lhs, null, ag, params);
-        return { node: { kind: "constBool", value: e.negated }, type: { kind: "bool" } };
+        return {
+          node: { kind: "constBool", value: e.negated },
+          type: { kind: "bool" },
+        };
       }
       // Desugar to the OR-chain PostgreSQL DEFINES `IN` as: `x IN (a,b,c)` is
       // `x = a OR x = b OR x = c`; `NOT IN` is its negation (grammar.md §20). The list is
@@ -8964,7 +11328,10 @@ function resolve(
       let folded: Expr | null = null;
       for (const elem of e.list) {
         const eq: Expr = { kind: "binary", op: "eq", lhs: e.lhs, rhs: elem };
-        folded = folded === null ? eq : { kind: "binary", op: "or", lhs: folded, rhs: eq };
+        folded =
+          folded === null
+            ? eq
+            : { kind: "binary", op: "or", lhs: folded, rhs: eq };
       }
       // folded is non-null: the parser guarantees a non-empty list.
       let desugared = folded as Expr;
@@ -8994,7 +11361,10 @@ function resolve(
       const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
       requireTextOrNull(p.lt);
       requireTextOrNull(p.rt);
-      return { node: { kind: "like", lhs: p.rl, rhs: p.rr, negated: e.negated }, type: { kind: "bool" } };
+      return {
+        node: { kind: "like", lhs: p.rl, rhs: p.rr, negated: e.negated },
+        type: { kind: "bool" },
+      };
     }
     case "case": {
       // Resolve each branch's condition: searched form requires a boolean WHEN (42804
@@ -9006,7 +11376,12 @@ function resolve(
       for (const w of e.whens) {
         let cond: RExpr;
         if (e.operand !== null) {
-          const eq: Expr = { kind: "binary", op: "eq", lhs: e.operand, rhs: w.cond };
+          const eq: Expr = {
+            kind: "binary",
+            op: "eq",
+            lhs: e.operand,
+            rhs: w.cond,
+          };
           cond = resolve(scope, eq, null, ag, params).node;
         } else {
           const rc = resolve(scope, w.cond, null, ag, params);
@@ -9028,7 +11403,12 @@ function resolve(
       }
       const unified = unifyCaseTypes(resultTypes);
       return {
-        node: { kind: "case", arms, els, coerceDecimal: unified.kind === "decimal" },
+        node: {
+          kind: "case",
+          arms,
+          els,
+          coerceDecimal: unified.kind === "decimal",
+        },
         type: unified,
       };
     }
@@ -9058,7 +11438,10 @@ function resolveBinary(
       // before the ±-only temporal rule below.
       const scaled = intervalScaleResult(op, p.lt.kind, p.rt.kind);
       if (scaled !== undefined) {
-        return { node: { kind: "arith", op, result: scaled, lhs: p.rl, rhs: p.rr }, type: resolvedTypeOf(scaled) };
+        return {
+          node: { kind: "arith", op, result: scaled, lhs: p.rl, rhs: p.rr },
+          type: resolvedTypeOf(scaled),
+        };
       }
       // Temporal arithmetic (spec/design/interval.md §5): interval ± interval, timestamp[tz] ±
       // interval, interval + timestamp[tz], and timestamp[tz] − timestamp[tz] → interval. The
@@ -9066,7 +11449,10 @@ function resolveBinary(
       // any other combination is a 42804.
       const temporal = temporalArithResult(op, p.lt.kind, p.rt.kind);
       if (temporal !== undefined) {
-        return { node: { kind: "arith", op, result: temporal, lhs: p.rl, rhs: p.rr }, type: resolvedTypeOf(temporal) };
+        return {
+          node: { kind: "arith", op, result: temporal, lhs: p.rl, rhs: p.rr },
+          type: resolvedTypeOf(temporal),
+        };
       }
       // Float arithmetic (float.md §5): float ⊕ float → float for + - * / % (and unary - via the
       // neg path). A mixed-width pair PROMOTES to f64 (the higher rank), so the computation is
@@ -9076,20 +11462,31 @@ function resolveBinary(
       // ctxOf, so a literal+float pair is float×float here.
       if (p.lt.kind === "float" || p.rt.kind === "float") {
         if (p.lt.kind !== "float" || p.rt.kind !== "float") {
-          throw typeError("arithmetic operators require operands of the same family");
+          throw typeError(
+            "arithmetic operators require operands of the same family",
+          );
         }
         const result = promoteFloat(p.lt.ty, p.rt.ty);
         const lhsW = widenFloatTo(p.rl, p.lt.ty, result);
         const rhsW = widenFloatTo(p.rr, p.rt.ty, result);
-        return { node: { kind: "arith", op, result, lhs: lhsW, rhs: rhsW }, type: { kind: "float", ty: result } };
+        return {
+          node: { kind: "arith", op, result, lhs: lhsW, rhs: rhsW },
+          type: { kind: "float", ty: result },
+        };
       }
       requireNumericOperand(p.lt);
       requireNumericOperand(p.rt);
       if (p.lt.kind === "decimal" || p.rt.kind === "decimal") {
-        return { node: { kind: "arith", op, result: "decimal", lhs: p.rl, rhs: p.rr }, type: { kind: "decimal" } };
+        return {
+          node: { kind: "arith", op, result: "decimal", lhs: p.rl, rhs: p.rr },
+          type: { kind: "decimal" },
+        };
       }
       const result = promote(p.lt, p.rt);
-      return { node: { kind: "arith", op, result, lhs: p.rl, rhs: p.rr }, type: { kind: "int", ty: result } };
+      return {
+        node: { kind: "arith", op, result, lhs: p.rl, rhs: p.rr },
+        type: { kind: "int", ty: result },
+      };
     }
     case "eq":
     case "ne":
@@ -9112,7 +11509,10 @@ function resolveBinary(
         cl = widenFloatTo(p.rl, p.lt.ty, w);
         cr = widenFloatTo(p.rr, p.rt.ty, w);
       }
-      return { node: { kind: "compare", op, lhs: cl, rhs: cr }, type: { kind: "bool" } };
+      return {
+        node: { kind: "compare", op, lhs: cl, rhs: cr },
+        type: { kind: "bool" },
+      };
     }
     case "concat":
       return resolveConcat(scope, lhs, rhs, ag, params);
@@ -9128,7 +11528,10 @@ function resolveBinary(
       const r = resolve(scope, rhs, null, ag, params);
       requireBool(l.type, "AND/OR requires boolean operands");
       requireBool(r.type, "AND/OR requires boolean operands");
-      return { node: { kind: op === "and" ? "and" : "or", lhs: l.node, rhs: r.node }, type: { kind: "bool" } };
+      return {
+        node: { kind: op === "and" ? "and" : "or", lhs: l.node, rhs: r.node },
+        type: { kind: "bool" },
+      };
     }
   }
 }
@@ -9186,8 +11589,16 @@ function resolveConcat(
   // The matched overload's slot pattern selects the kernel; the operands stay in source order
   // (array_prepend's kernel already reads vals[0]=element, vals[1]=array).
   let func: ArrayFuncName;
-  if (chosen.argFamilies[0] === "anyarray" && chosen.argFamilies[1] === "anyarray") func = "array_cat";
-  else if (chosen.argFamilies[0] === "anyarray" && chosen.argFamilies[1] === "anyelement") func = "array_append";
+  if (
+    chosen.argFamilies[0] === "anyarray" &&
+    chosen.argFamilies[1] === "anyarray"
+  )
+    func = "array_cat";
+  else if (
+    chosen.argFamilies[0] === "anyarray" &&
+    chosen.argFamilies[1] === "anyelement"
+  )
+    func = "array_append";
   else func = "array_prepend";
   return { node: { kind: "arrayFunc", func, args: [rl.node, rr.node] }, type };
 }
@@ -9227,7 +11638,10 @@ function resolveContainment(
   // Both slots are anyarray: the element types must unify (a non-array / mismatch is 42883).
   const tys: ResolvedType[] = [rl.type, rr.type];
   if (!matchPoly(["anyarray", "anyarray"], tys).matched) throw noOverload();
-  return { node: { kind: "arrayFunc", func, args: [rl.node, rr.node] }, type: { kind: "bool" } };
+  return {
+    node: { kind: "arrayFunc", func, args: [rl.node, rr.node] },
+    type: { kind: "bool" },
+  };
 }
 
 // resolveQuantified resolves a quantified array comparison `x op ANY/SOME/ALL(arr)`
@@ -9272,7 +11686,10 @@ function resolveQuantified(
     );
   }
   if (ra.type.kind !== "array") {
-    throw engineError("wrong_object_type", "op ANY/ALL (array) requires array on right side");
+    throw engineError(
+      "wrong_object_type",
+      "op ANY/ALL (array) requires array on right side",
+    );
   }
   const elem = ra.type.elem;
   // `x` and the element type must be comparable; PG reports operator-not-found (42883) here, NOT the
@@ -9285,7 +11702,10 @@ function resolveQuantified(
       `operator does not exist: ${rtName(rl.type)} ${binaryOpSymbol(op)} ${rtName(elem)}`,
     );
   }
-  return { node: { kind: "quantified", op, all, lhs: rl.node, array: ra.node }, type: { kind: "bool" } };
+  return {
+    node: { kind: "quantified", op, all, lhs: rl.node, array: ra.node },
+    type: { kind: "bool" },
+  };
 }
 
 // binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
@@ -9389,7 +11809,9 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
     return;
   }
   if ((compL || compR) && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError("cannot compare a composite value with a value of a different type");
+    throw typeError(
+      "cannot compare a composite value with a value of a different type",
+    );
   }
   // Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff their
   // element types are comparable (recursively). A bare NULL is always comparable; an array vs any
@@ -9401,7 +11823,9 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
     return;
   }
   if ((arrL || arrR) && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError("cannot compare an array value with a value of a different type");
+    throw typeError(
+      "cannot compare an array value with a value of a different type",
+    );
   }
   // Boolean compares only with boolean (or NULL); boolean with a number/text is a mismatch.
   const boolL = lt.kind === "bool";
@@ -9421,7 +11845,9 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   const floatL = lt.kind === "float";
   const floatR = rt.kind === "float";
   if (floatL !== floatR && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError("cannot compare a float value with a value of a different type");
+    throw typeError(
+      "cannot compare a float value with a value of a different type",
+    );
   }
   // bytea compares only with bytea (or NULL); bytea with a number or text is a mismatch.
   const byteaL = lt.kind === "bytea";
@@ -9440,21 +11866,32 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   // is a 42804 type error (spec/design/timestamp.md §5).
   const tsL = lt.kind === "timestamp" || lt.kind === "timestamptz";
   const tsR = rt.kind === "timestamp" || rt.kind === "timestamptz";
-  if ((tsL || tsR) && lt.kind !== rt.kind && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError("cannot compare a timestamp value with a value of a different type");
+  if (
+    (tsL || tsR) &&
+    lt.kind !== rt.kind &&
+    lt.kind !== "null" &&
+    rt.kind !== "null"
+  ) {
+    throw typeError(
+      "cannot compare a timestamp value with a value of a different type",
+    );
   }
   // date compares only within its own family (or with NULL); date vs any other family — incl.
   // timestamp, which would need a cast — is a 42804 (date is a strict island, spec/design/date.md §4).
   const dateL = lt.kind === "date";
   const dateR = rt.kind === "date";
   if (dateL !== dateR && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError("cannot compare a date value with a value of a different type");
+    throw typeError(
+      "cannot compare a date value with a value of a different type",
+    );
   }
   // interval compares only with itself (or NULL); interval vs any other family is a 42804.
   const ivL = lt.kind === "interval";
   const ivR = rt.kind === "interval";
   if (ivL !== ivR && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError("cannot compare an interval value with a value of a different type");
+    throw typeError(
+      "cannot compare an interval value with a value of a different type",
+    );
   }
 }
 
@@ -9467,7 +11904,12 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
 // against an int/decimal sibling still resolves to decimal).
 function isAdaptableOperand(e: Expr): boolean {
   if (e.kind === "param") return true;
-  return e.kind === "literal" && (e.literal.kind === "int" || e.literal.kind === "decimal" || e.literal.kind === "text");
+  return (
+    e.kind === "literal" &&
+    (e.literal.kind === "int" ||
+      e.literal.kind === "decimal" ||
+      e.literal.kind === "text")
+  );
 }
 
 // ctxOf returns the type a sibling operand offers an adaptable operand. For an integer literal
@@ -9504,7 +11946,10 @@ function intTypeOf(t: ResolvedType): ScalarType | null {
 function decodeByteaLiteral(str: string): Uint8Array {
   const r = parseByteaHex(str);
   if ("error" in r) {
-    throw engineError("invalid_text_representation", "invalid input syntax for type bytea: " + r.error);
+    throw engineError(
+      "invalid_text_representation",
+      "invalid input syntax for type bytea: " + r.error,
+    );
   }
   return r.bytes;
 }
@@ -9515,7 +11960,10 @@ function decodeByteaLiteral(str: string): Uint8Array {
 function decodeUuidLiteral(str: string): Uint8Array {
   const r = parseUuid(str);
   if ("error" in r) {
-    throw engineError("invalid_text_representation", "invalid input syntax for type uuid: " + r.error);
+    throw engineError(
+      "invalid_text_representation",
+      "invalid input syntax for type uuid: " + r.error,
+    );
   }
   return r.bytes;
 }
@@ -9534,12 +11982,18 @@ const allAsciiDigits = (s: string): boolean => /^[0-9]+$/.test(s);
 // literal adapting to a float column is a float value, not a stored decimal. A magnitude beyond the
 // binary64 range becomes ±Infinity here — but a finite literal is meant, so an out-of-range literal
 // traps 22003 (the finite-overflow rule, §3) rather than silently yielding Infinity.
-function floatFromDecimalLiteral(d: Decimal, ty: ScalarType): { node: RExpr; type: ResolvedType } {
+function floatFromDecimalLiteral(
+  d: Decimal,
+  ty: ScalarType,
+): { node: RExpr; type: ResolvedType } {
   const exact = Number(d.render());
   if (!Number.isFinite(exact)) throw overflow(ty);
   const n = roundToWidth(ty, exact);
   if (!Number.isFinite(n)) throw overflow(ty); // f32 rounding pushed a finite double to ±Inf
-  return { node: { kind: "constFloat", ty, value: n }, type: { kind: "float", ty } };
+  return {
+    node: { kind: "constFloat", ty, value: n },
+    type: { kind: "float", ty },
+  };
 }
 
 // coerceStringLiteral coerces a string literal's content to the named scalar target at resolve —
@@ -9555,36 +12009,69 @@ function coerceStringLiteral(
 ): { node: RExpr; type: ResolvedType } {
   switch (target) {
     case "bytea":
-      return { node: { kind: "constBytea", value: decodeByteaLiteral(s) }, type: { kind: "bytea" } };
+      return {
+        node: { kind: "constBytea", value: decodeByteaLiteral(s) },
+        type: { kind: "bytea" },
+      };
     case "uuid":
-      return { node: { kind: "constUuid", value: decodeUuidLiteral(s) }, type: { kind: "uuid" } };
+      return {
+        node: { kind: "constUuid", value: decodeUuidLiteral(s) },
+        type: { kind: "uuid" },
+      };
     case "timestamp":
-      return { node: { kind: "constTimestamp", value: parseTimestamp(s) }, type: { kind: "timestamp" } };
+      return {
+        node: { kind: "constTimestamp", value: parseTimestamp(s) },
+        type: { kind: "timestamp" },
+      };
     case "timestamptz":
-      return { node: { kind: "constTimestamptz", value: parseTimestamptz(s) }, type: { kind: "timestamptz" } };
+      return {
+        node: { kind: "constTimestamptz", value: parseTimestamptz(s) },
+        type: { kind: "timestamptz" },
+      };
     case "date":
-      return { node: { kind: "constDate", value: parseDate(s) }, type: { kind: "date" } };
+      return {
+        node: { kind: "constDate", value: parseDate(s) },
+        type: { kind: "date" },
+      };
     case "interval":
-      return { node: { kind: "constInterval", value: parseInterval(s) }, type: { kind: "interval" } };
+      return {
+        node: { kind: "constInterval", value: parseInterval(s) },
+        type: { kind: "interval" },
+      };
     case "text":
       // text 'x' is identity — the string IS the value.
       return { node: { kind: "constText", value: s }, type: { kind: "text" } };
     case "boolean":
-      return { node: { kind: "constBool", value: parseBoolLiteral(s) }, type: { kind: "bool" } };
+      return {
+        node: { kind: "constBool", value: parseBoolLiteral(s) },
+        type: { kind: "bool" },
+      };
     case "f32":
     case "f64": {
       const n = parseFloatLiteral(s, target);
-      return { node: { kind: "constFloat", ty: target, value: n }, type: { kind: "float", ty: target } };
+      return {
+        node: { kind: "constFloat", ty: target, value: n },
+        type: { kind: "float", ty: target },
+      };
     }
     case "decimal": {
       let d = parseDecimalLiteral(s);
-      d = typmod !== null ? d.coerceToTypmod(typmod.precision, typmod.scale) : d.checkCap();
-      return { node: { kind: "constDecimal", value: d }, type: { kind: "decimal" } };
+      d =
+        typmod !== null
+          ? d.coerceToTypmod(typmod.precision, typmod.scale)
+          : d.checkCap();
+      return {
+        node: { kind: "constDecimal", value: d },
+        type: { kind: "decimal" },
+      };
     }
     default: {
       // i16 / i32 / i64
       const n = parseIntLiteral(s, target);
-      return { node: { kind: "constInt", value: n }, type: { kind: "int", ty: target } };
+      return {
+        node: { kind: "constInt", value: n },
+        type: { kind: "int", ty: target },
+      };
     }
   }
 }
@@ -9603,7 +12090,10 @@ function coerceStringToComposite(
   db: Database,
 ): { node: RExpr; type: ResolvedType } {
   const malformed = (): Error =>
-    engineError("invalid_text_representation", `malformed record literal: "${text}" for type ${ct.name}`);
+    engineError(
+      "invalid_text_representation",
+      `malformed record literal: "${text}" for type ${ct.name}`,
+    );
   const tokens = parseRecordTokens(text);
   if (tokens === null || tokens.length !== ct.fields.length) throw malformed();
   const nodes: RExpr[] = [];
@@ -9617,7 +12107,8 @@ function coerceStringToComposite(
       fieldTypes.push({ name: f.name, type: resolvedTypeOfCol(f.type, db) });
     } else if (f.type.kind === "composite") {
       const nested = db.compositeType(f.type.name);
-      if (nested === undefined) throw new Error("nested composite type resolved at CREATE TYPE / load");
+      if (nested === undefined)
+        throw new Error("nested composite type resolved at CREATE TYPE / load");
       const { node, type } = coerceStringToComposite(tok, nested, db);
       nodes.push(node);
       fieldTypes.push({ name: f.name, type });
@@ -9635,7 +12126,10 @@ function coerceStringToComposite(
       fieldTypes.push({ name: f.name, type });
     }
   }
-  return { node: { kind: "row", fields: nodes }, type: { kind: "composite", name: ct.name, fields: fieldTypes } };
+  return {
+    node: { kind: "row", fields: nodes },
+    type: { kind: "composite", name: ct.name, fields: fieldTypes },
+  };
 }
 
 // parseIntLiteral parses a string literal's content as a signed integer of type ty — the
@@ -9644,7 +12138,10 @@ function coerceStringToComposite(
 // (NO hex/octal/binary or underscores — 22P02, a documented PG divergence). Out of range → 22003.
 function parseIntLiteral(s: string, ty: ScalarType): bigint {
   const invalid = (): Error =>
-    engineError("invalid_text_representation", `invalid input syntax for type ${canonicalName(ty)}: "${s}"`);
+    engineError(
+      "invalid_text_representation",
+      `invalid input syntax for type ${canonicalName(ty)}: "${s}"`,
+    );
   let t = trimLit(s);
   let neg = false;
   if (t.startsWith("-")) {
@@ -9669,7 +12166,10 @@ function parseIntLiteral(s: string, ty: ScalarType): bigint {
 // Caller applies typmod / cap-check.
 function parseDecimalLiteral(s: string): Decimal {
   const invalid = (): Error =>
-    engineError("invalid_text_representation", `invalid input syntax for type numeric: "${s}"`);
+    engineError(
+      "invalid_text_representation",
+      `invalid input syntax for type numeric: "${s}"`,
+    );
   let t = trimLit(s);
   let neg = false;
   if (t.startsWith("-")) {
@@ -9751,7 +12251,10 @@ function parseBoolLiteral(s: string): boolean {
     case "0":
       return false;
     default:
-      throw engineError("invalid_text_representation", `invalid input syntax for type boolean: "${s}"`);
+      throw engineError(
+        "invalid_text_representation",
+        `invalid input syntax for type boolean: "${s}"`,
+      );
   }
 }
 
@@ -9760,7 +12263,8 @@ function parseBoolLiteral(s: string): boolean {
 // e-notation) or one of the special words. It is validated explicitly — NOT via parseFloat, which
 // is too lenient (it accepts "1.5xyz", leading junk after trim, etc.). Anchored to the whole
 // (trimmed) string so trailing junk is rejected → 22P02.
-const FLOAT_FINITE = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
+const FLOAT_FINITE =
+  /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
 
 // parseFloatLiteral parses a string literal's content as a float of type ty — the text→float
 // coercion for `float '1.5'` / `real '1e10'` / CAST('Infinity' AS f64) (float.md §4). Grammar:
@@ -9772,7 +12276,10 @@ const FLOAT_FINITE = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?
 // stored values — float.md §3).
 function parseFloatLiteral(s: string, ty: ScalarType): number {
   const invalid = (): Error =>
-    engineError("invalid_text_representation", `invalid input syntax for type ${canonicalName(ty)}: "${s}"`);
+    engineError(
+      "invalid_text_representation",
+      `invalid input syntax for type ${canonicalName(ty)}: "${s}"`,
+    );
   const t = trimLit(s);
   // Special words (case-insensitive), with an optional leading sign on the infinities.
   const lower = t.toLowerCase();
@@ -9792,7 +12299,8 @@ function parseFloatLiteral(s: string, ty: ScalarType): number {
       special = -Infinity;
       break;
   }
-  if (special !== undefined) return ty === "f32" ? Math.fround(special) : special;
+  if (special !== undefined)
+    return ty === "f32" ? Math.fround(special) : special;
   if (!FLOAT_GRAMMAR_OK(t)) throw invalid();
   // Number(...) does the IEEE-correct decimal→binary64 conversion (round-ties-to-even). The grammar
   // already rejected junk, so a NaN here would only come from an empty/degenerate string the regex
@@ -9817,7 +12325,9 @@ function FLOAT_GRAMMAR_OK(t: string): boolean {
 // comparison node sees both sides at one width. Identity when from === to. Implemented as a `cast`
 // RExpr (the evaluator's evalCast handles float→float widening), so no new node kind is needed.
 function widenFloatTo(node: RExpr, from: ScalarType, to: ScalarType): RExpr {
-  return from === to ? node : { kind: "cast", target: to, typmod: null, operand: node };
+  return from === to
+    ? node
+    : { kind: "cast", target: to, typmod: null, operand: node };
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the
@@ -9862,12 +12372,17 @@ type RtKind = ResolvedType["kind"];
 // interval * number, number * interval (commute), interval / number → interval. undefined when no
 // interval is involved (or the op is not * / /). number / interval and interval × interval return
 // undefined and fall to the ±-only temporal rule (which reports the 42804).
-function intervalScaleResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {
+function intervalScaleResult(
+  op: BinaryOp,
+  lt: RtKind,
+  rt: RtKind,
+): ScalarType | undefined {
   const lIv = lt === "interval";
   const rIv = rt === "interval";
   if (!lIv && !rIv) return undefined;
   const numeric = (k: RtKind) => k === "int" || k === "decimal" || k === "null";
-  if (op === "mul" && ((lIv && numeric(rt)) || (rIv && numeric(lt)))) return "interval";
+  if (op === "mul" && ((lIv && numeric(rt)) || (rIv && numeric(lt))))
+    return "interval";
   if (op === "div" && lIv && numeric(rt)) return "interval";
   return undefined;
 }
@@ -9879,17 +12394,39 @@ function factorToFraction(v: Value): [bigint, bigint] {
   throw typeError("internal: non-numeric interval-scale factor");
 }
 
-function temporalArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {
-  const temporal = (k: RtKind) => k === "interval" || k === "timestamp" || k === "timestamptz";
+function temporalArithResult(
+  op: BinaryOp,
+  lt: RtKind,
+  rt: RtKind,
+): ScalarType | undefined {
+  const temporal = (k: RtKind) =>
+    k === "interval" || k === "timestamp" || k === "timestamptz";
   if (!temporal(lt) && !temporal(rt)) return undefined;
   const l = lt === "null" ? rt : lt;
   const r = rt === "null" ? lt : rt;
-  if ((op === "add" || op === "sub") && l === "interval" && r === "interval") return "interval";
-  if (op === "add" && ((l === "timestamp" && r === "interval") || (l === "interval" && r === "timestamp"))) return "timestamp";
+  if ((op === "add" || op === "sub") && l === "interval" && r === "interval")
+    return "interval";
+  if (
+    op === "add" &&
+    ((l === "timestamp" && r === "interval") ||
+      (l === "interval" && r === "timestamp"))
+  )
+    return "timestamp";
   if (op === "sub" && l === "timestamp" && r === "interval") return "timestamp";
-  if (op === "add" && ((l === "timestamptz" && r === "interval") || (l === "interval" && r === "timestamptz"))) return "timestamptz";
-  if (op === "sub" && l === "timestamptz" && r === "interval") return "timestamptz";
-  if (op === "sub" && ((l === "timestamp" && r === "timestamp") || (l === "timestamptz" && r === "timestamptz"))) return "interval";
+  if (
+    op === "add" &&
+    ((l === "timestamptz" && r === "interval") ||
+      (l === "interval" && r === "timestamptz"))
+  )
+    return "timestamptz";
+  if (op === "sub" && l === "timestamptz" && r === "interval")
+    return "timestamptz";
+  if (
+    op === "sub" &&
+    ((l === "timestamp" && r === "timestamp") ||
+      (l === "timestamptz" && r === "timestamptz"))
+  )
+    return "interval";
   throw typeError("unsupported operand types for temporal arithmetic");
 }
 
@@ -9914,7 +12451,8 @@ function requireBool(t: ResolvedType, msg: string): void {
 // comparable with anything and makes the result NULL at eval). A non-text operand is a 42804
 // type error (spec/design/grammar.md §22).
 function requireTextOrNull(t: ResolvedType): void {
-  if (t.kind !== "text" && t.kind !== "null") throw typeError("LIKE requires text operands");
+  if (t.kind !== "text" && t.kind !== "null")
+    throw typeError("LIKE requires text operands");
 }
 
 // unifyArrayElementTypes unifies the element types of an ARRAY[...] constructor into one element
@@ -9927,12 +12465,14 @@ function unifyArrayElementTypes(types: ResolvedType[]): ResolvedType {
   if (nonNull.length === 0) return { kind: "text" };
   if (nonNull.every((t) => t.kind === "int")) {
     let acc = nonNull[0]!;
-    for (const t of nonNull.slice(1)) acc = { kind: "int", ty: promote(acc, t) };
+    for (const t of nonNull.slice(1))
+      acc = { kind: "int", ty: promote(acc, t) };
     return acc;
   }
   const first = nonNull[0]!;
   for (const t of nonNull.slice(1)) {
-    if (t.kind !== first.kind) throw typeError("array elements must all be of the same type");
+    if (t.kind !== first.kind)
+      throw typeError("array elements must all be of the same type");
   }
   return first;
 }
@@ -9997,7 +12537,11 @@ function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
     case "array_replace":
       return arrayReplaceValue(vals[0]!, vals[1]!, vals[2]!);
     case "array_position":
-      return arrayPositionValue(vals[0]!, vals[1]!, vals.length > 2 ? vals[2]! : null);
+      return arrayPositionValue(
+        vals[0]!,
+        vals[1]!,
+        vals.length > 2 ? vals[2]! : null,
+      );
     case "array_positions":
       return arrayPositionsValue(vals[0]!, vals[1]!);
     case "contains":
@@ -10027,7 +12571,9 @@ function strictElemEq(a: Value, b: Value): boolean {
 // whole-array operand → NULL. The empty array is contained by anything (a @> {} is true).
 function arrayContainsValue(a: Value, b: Value): Value {
   if (a.kind !== "array" || b.kind !== "array") return nullValue();
-  const contained = b.elements.every((eb) => a.elements.some((ea) => strictElemEq(ea, eb)));
+  const contained = b.elements.every((eb) =>
+    a.elements.some((ea) => strictElemEq(ea, eb)),
+  );
   return boolValue(contained);
 }
 
@@ -10036,7 +12582,9 @@ function arrayContainsValue(a: Value, b: Value): Value {
 // whole-array operand → NULL. The empty array overlaps nothing.
 function arrayOverlapsValue(a: Value, b: Value): Value {
   if (a.kind !== "array" || b.kind !== "array") return nullValue();
-  const overlaps = a.elements.some((ea) => b.elements.some((eb) => strictElemEq(ea, eb)));
+  const overlaps = a.elements.some((ea) =>
+    b.elements.some((eb) => strictElemEq(ea, eb)),
+  );
   return boolValue(overlaps);
 }
 
@@ -10046,7 +12594,10 @@ function arrayOverlapsValue(a: Value, b: Value): Value {
 function arrayRemoveValue(arr: Value, elem: Value): Value {
   if (arr.kind !== "array") return nullValue();
   if (arr.dims.length > 1) {
-    throw engineError("feature_not_supported", "removing elements from multidimensional arrays is not supported");
+    throw engineError(
+      "feature_not_supported",
+      "removing elements from multidimensional arrays is not supported",
+    );
   }
   const kept = arr.elements.filter((e) => !notDistinct(e, elem));
   if (kept.length === 0) return emptyArray();
@@ -10060,22 +12611,38 @@ function arrayRemoveValue(arr: Value, elem: Value): Value {
 function arrayReplaceValue(arr: Value, from: Value, to: Value): Value {
   if (arr.kind !== "array") return nullValue();
   const elements = arr.elements.map((e) => (notDistinct(e, from) ? to : e));
-  return { kind: "array", dims: [...arr.dims], lbounds: [...arr.lbounds], elements };
+  return {
+    kind: "array",
+    dims: [...arr.dims],
+    lbounds: [...arr.lbounds],
+    elements,
+  };
 }
 
 // arrayPositionValue is array_position(a, e[, start]) (array-functions.md §8): the SUBSCRIPT (in the
 // array's lower-bound space) of the first element NOT DISTINCT FROM e, NULL if absent. 1-D/empty only
 // (a multidimensional array is 0A000); the optional start is a subscript to begin at, and a NULL
 // start is 22004.
-function arrayPositionValue(arr: Value, elem: Value, start: Value | null): Value {
+function arrayPositionValue(
+  arr: Value,
+  elem: Value,
+  start: Value | null,
+): Value {
   if (arr.kind !== "array") return nullValue();
   if (arr.dims.length > 1) {
-    throw engineError("feature_not_supported", "searching for elements in multidimensional arrays is not supported");
+    throw engineError(
+      "feature_not_supported",
+      "searching for elements in multidimensional arrays is not supported",
+    );
   }
   const lb = arr.lbounds.length > 0 ? arr.lbounds[0]! : 1;
   let begin = 0;
   if (start !== null) {
-    if (start.kind === "null") throw engineError("null_value_not_allowed", "initial position must not be null");
+    if (start.kind === "null")
+      throw engineError(
+        "null_value_not_allowed",
+        "initial position must not be null",
+      );
     const off = Number((start as { int: bigint }).int) - lb;
     if (off > 0) begin = off;
   }
@@ -10091,12 +12658,16 @@ function arrayPositionValue(arr: Value, elem: Value, start: Value | null): Value
 function arrayPositionsValue(arr: Value, elem: Value): Value {
   if (arr.kind !== "array") return nullValue();
   if (arr.dims.length > 1) {
-    throw engineError("feature_not_supported", "searching for elements in multidimensional arrays is not supported");
+    throw engineError(
+      "feature_not_supported",
+      "searching for elements in multidimensional arrays is not supported",
+    );
   }
   const lb = arr.lbounds.length > 0 ? arr.lbounds[0]! : 1;
   const positions: Value[] = [];
   for (let i = 0; i < arr.elements.length; i++) {
-    if (notDistinct(arr.elements[i]!, elem)) positions.push(intValue(BigInt(lb + i)));
+    if (notDistinct(arr.elements[i]!, elem))
+      positions.push(intValue(BigInt(lb + i)));
   }
   return arrayValue(positions);
 }
@@ -10105,7 +12676,8 @@ function arrayPositionsValue(arr: Value, elem: Value): Value {
 // prefix — array-functions.md §3.1).
 function arrayDimsText(a: { dims: number[]; lbounds: number[] }): string {
   let s = "";
-  for (let d = 0; d < a.dims.length; d++) s += "[" + a.lbounds[d] + ":" + arrayUbound(a, d) + "]";
+  for (let d = 0; d < a.dims.length; d++)
+    s += "[" + a.lbounds[d] + ":" + arrayUbound(a, d) + "]";
   return s;
 }
 
@@ -10115,10 +12687,18 @@ function arrayDimsText(a: { dims: number[]; lbounds: number[] }): string {
 function arrayExtend(arr: Value, elem: Value, atEnd: boolean): Value {
   if (arr.kind !== "array" || arr.dims.length === 0) return arrayValue([elem]);
   if (arr.dims.length !== 1) {
-    throw engineError("data_exception", "argument must be empty or one-dimensional array");
+    throw engineError(
+      "data_exception",
+      "argument must be empty or one-dimensional array",
+    );
   }
   const elements = atEnd ? [...arr.elements, elem] : [elem, ...arr.elements];
-  return { kind: "array", dims: [arr.dims[0]! + 1], lbounds: [...arr.lbounds], elements };
+  return {
+    kind: "array",
+    dims: [arr.dims[0]! + 1],
+    lbounds: [...arr.lbounds],
+    elements,
+  };
 }
 
 // arrayCatValues is array_cat (array-functions.md §3.2): identity-aware concatenation along the outer
@@ -10133,8 +12713,13 @@ function arrayCatValues(a: Value, b: Value): Value {
   if (a.kind !== "array" || b.kind !== "array") return nullValue(); // unreachable (resolver gate)
   if (a.dims.length === 0) return b;
   if (b.dims.length === 0) return a;
-  const mismatch = () => engineError("array_subscript_error", "cannot concatenate incompatible arrays");
-  const eqInts = (x: number[], y: number[]): boolean => x.length === y.length && x.every((v, i) => v === y[i]);
+  const mismatch = () =>
+    engineError(
+      "array_subscript_error",
+      "cannot concatenate incompatible arrays",
+    );
+  const eqInts = (x: number[], y: number[]): boolean =>
+    x.length === y.length && x.every((v, i) => v === y[i]);
   const elements = [...a.elements, ...b.elements];
   const na = a.dims.length;
   const nb = b.dims.length;
@@ -10164,22 +12749,30 @@ function arrayCatValues(a: Value, b: Value): Value {
 // NULL sub-array or a sub-array of differing shape is a 2202E. Stacking empty sub-arrays yields the
 // empty array (PG: ARRAY['{}'::int[]] → {}).
 function buildNestedArray(subs: Value[]): Value {
-  const mismatch = "multidimensional arrays must have array expressions with matching dimensions";
+  const mismatch =
+    "multidimensional arrays must have array expressions with matching dimensions";
   const arrs = subs.map((sv) => {
     if (sv.kind === "array") return sv;
     if (sv.kind === "null") throw arraySubscriptErr(mismatch);
     throw typeError("internal: nested array constructor over a non-array");
   });
-  const eqNum = (a: number[], b: number[]): boolean => a.length === b.length && a.every((x, i) => x === b[i]);
+  const eqNum = (a: number[], b: number[]): boolean =>
+    a.length === b.length && a.every((x, i) => x === b[i]);
   const dims0 = arrs[0]!.dims;
   const lbounds0 = arrs[0]!.lbounds;
   for (const a of arrs.slice(1)) {
-    if (!eqNum(a.dims, dims0) || !eqNum(a.lbounds, lbounds0)) throw arraySubscriptErr(mismatch);
+    if (!eqNum(a.dims, dims0) || !eqNum(a.lbounds, lbounds0))
+      throw arraySubscriptErr(mismatch);
   }
   if (dims0.length === 0) return emptyArray(); // all sub-arrays empty → empty array
   const elements: Value[] = [];
   for (const a of arrs) elements.push(...a.elements);
-  return { kind: "array", dims: [arrs.length, ...dims0], lbounds: [1, ...lbounds0], elements };
+  return {
+    kind: "array",
+    dims: [arrs.length, ...dims0],
+    lbounds: [1, ...lbounds0],
+    elements,
+  };
 }
 
 // evalSubscript evaluates an array subscript `base[..][..]` (spec/design/array.md §6). A NULL array
@@ -10193,7 +12786,8 @@ function evalSubscript(
 ): Value {
   const base = evalExpr(e.base, row, env, m);
   if (base.kind === "null") return nullValue();
-  if (base.kind !== "array") throw typeError("internal: subscript on a non-array value");
+  if (base.kind !== "array")
+    throw typeError("internal: subscript on a non-array value");
   if (e.isSlice) {
     // Per-dimension (lower, upper); a scalar index i becomes 1:i (PG), an omitted bound defers to
     // the array's own bound (null lo/hi). A NULL bound → NULL.
@@ -10203,7 +12797,8 @@ function evalSubscript(
       if (!s.isSlice) {
         const v = evalExpr(s.index, row, env, m);
         if (v.kind === "null") return nullValue();
-        if (v.kind !== "int") throw typeError("internal: non-integer array subscript");
+        if (v.kind !== "int")
+          throw typeError("internal: non-integer array subscript");
         los.push(1n); // scalar i → 1:i
         his.push(v.int);
       } else {
@@ -10223,7 +12818,8 @@ function evalSubscript(
     if (s.isSlice) throw typeError("internal: slice spec in element access");
     const v = evalExpr(s.index, row, env, m);
     if (v.kind === "null") return nullValue();
-    if (v.kind !== "int") throw typeError("internal: non-integer array subscript");
+    if (v.kind !== "int")
+      throw typeError("internal: non-integer array subscript");
     idxs.push(v.int);
   }
   return arrayGetElement(base, idxs);
@@ -10231,18 +12827,27 @@ function evalSubscript(
 
 // evalOptBound evaluates an optional slice-bound expression: null expr → null (defer to the array
 // bound); a NULL value → "null" (the whole result is NULL); an integer → its bigint.
-function evalOptBound(e: RExpr | null, row: Row, env: EvalEnv, m: Meter): bigint | null | "null" {
+function evalOptBound(
+  e: RExpr | null,
+  row: Row,
+  env: EvalEnv,
+  m: Meter,
+): bigint | null | "null" {
   if (e === null) return null;
   const v = evalExpr(e, row, env, m);
   if (v.kind === "null") return "null";
-  if (v.kind !== "int") throw typeError("internal: non-integer array slice bound");
+  if (v.kind !== "int")
+    throw typeError("internal: non-integer array slice bound");
   return v.int;
 }
 
 // arrayGetElement reads a single array element by idxs (1-based per dimension, using the value's
 // lower bounds) — spec/design/array.md §6. NULL when the subscript count ≠ ndim or any index is out
 // of range.
-function arrayGetElement(a: { dims: number[]; lbounds: number[]; elements: Value[] }, idxs: bigint[]): Value {
+function arrayGetElement(
+  a: { dims: number[]; lbounds: number[]; elements: Value[] },
+  idxs: bigint[],
+): Value {
   const ndim = arrayNdim(a);
   if (idxs.length !== ndim || a.elements.length === 0) return nullValue();
   let flat = 0;
@@ -10289,14 +12894,16 @@ function arrayGetSlice(
   // Row-major strides over the SOURCE array.
   const strides: number[] = new Array(ndim);
   strides[ndim - 1] = 1;
-  for (let d = ndim - 2; d >= 0; d--) strides[d] = strides[d + 1]! * a.dims[d + 1]!;
+  for (let d = ndim - 2; d >= 0; d--)
+    strides[d] = strides[d + 1]! * a.dims[d + 1]!;
   let total = 1;
   for (const d of newDims) total *= d;
   const elements: Value[] = new Array(total);
   const counter: number[] = new Array(ndim).fill(0);
   for (let k = 0; k < total; k++) {
     let flat = 0;
-    for (let d = 0; d < ndim; d++) flat += (starts[d]! + counter[d]!) * strides[d]!;
+    for (let d = 0; d < ndim; d++)
+      flat += (starts[d]! + counter[d]!) * strides[d]!;
     elements[k] = a.elements[flat]!;
     for (let d = ndim - 1; d >= 0; d--) {
       counter[d]!++;
@@ -10304,7 +12911,12 @@ function arrayGetSlice(
       counter[d] = 0;
     }
   }
-  return { kind: "array", dims: newDims, lbounds: new Array(ndim).fill(1), elements };
+  return {
+    kind: "array",
+    dims: newDims,
+    lbounds: new Array(ndim).fill(1),
+    elements,
+  };
 }
 
 // unifyCaseTypes unifies a CASE's result-arm types (the THEN results + the ELSE, or "null" for an
@@ -10327,7 +12939,8 @@ function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
     // All integer: the widest via the promotion tower (width is unobservable in output — every
     // integer renders under the `I` tag — but the fold keeps the type precise).
     let acc = nonNull[0]!;
-    for (const t of nonNull.slice(1)) acc = { kind: "int", ty: promote(acc, t) };
+    for (const t of nonNull.slice(1))
+      acc = { kind: "int", ty: promote(acc, t) };
     return acc;
   }
   // All float: the widest via the float tower (f32 + f64 → f64). A float mixed with a
@@ -10335,13 +12948,15 @@ function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
   // island, no int/decimal reconciliation, float.md §6).
   if (nonNull.every((t) => t.kind === "float")) {
     let acc = (nonNull[0] as { kind: "float"; ty: ScalarType }).ty;
-    for (const t of nonNull.slice(1)) acc = promoteFloat(acc, (t as { ty: ScalarType }).ty);
+    for (const t of nonNull.slice(1))
+      acc = promoteFloat(acc, (t as { ty: ScalarType }).ty);
     return { kind: "float", ty: acc };
   }
   // Non-numeric: every arm must be the same family as the first (cross-family is 42804).
   const first = nonNull[0]!;
   for (const t of nonNull.slice(1)) {
-    if (t.kind !== first.kind) throw typeError("CASE result types must be compatible");
+    if (t.kind !== first.kind)
+      throw typeError("CASE result types must be compatible");
   }
   return first;
 }
@@ -10351,7 +12966,8 @@ function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
 // integer-width unification needs none (all integers are bigint), and an all-NULL CASE is text but
 // every arm evaluates to NULL anyway.
 function coerceCaseValue(v: Value, toDecimal: boolean): Value {
-  if (toDecimal && v.kind === "int") return decimalValue(Decimal.fromBigInt(v.int));
+  if (toDecimal && v.kind === "int")
+    return decimalValue(Decimal.fromBigInt(v.int));
   return v;
 }
 
@@ -10377,8 +12993,12 @@ function unifyValuesColumn(a: ResolvedType, b: ResolvedType): ResolvedType {
   if (a.kind === "null" && b.kind === "null") return { kind: "null" };
   if (a.kind === "null") return b;
   if (b.kind === "null") return a;
-  if (a.kind === "int" && b.kind === "int") return { kind: "int", ty: promote(a, b) };
-  if ((a.kind === "int" || a.kind === "decimal") && (b.kind === "int" || b.kind === "decimal")) {
+  if (a.kind === "int" && b.kind === "int")
+    return { kind: "int", ty: promote(a, b) };
+  if (
+    (a.kind === "int" || a.kind === "decimal") &&
+    (b.kind === "int" || b.kind === "decimal")
+  ) {
     return { kind: "decimal" };
   }
   if (a.kind === "float" && b.kind === "float" && a.ty === b.ty) return a;
@@ -10395,7 +13015,10 @@ function unifyValuesColumn(a: ResolvedType, b: ResolvedType): ResolvedType {
   ) {
     return a;
   }
-  throw engineError("datatype_mismatch", `VALUES types ${rtName(a)} and ${rtName(b)} cannot be matched`);
+  throw engineError(
+    "datatype_mismatch",
+    `VALUES types ${rtName(a)} and ${rtName(b)} cannot be matched`,
+  );
 }
 
 // scalarForParamHint is the scalar type to note a bind parameter at, given its VALUES column's
@@ -10430,18 +13053,27 @@ function scalarForParamHint(rt: ResolvedType): ScalarType | null {
   }
 }
 
-function unifySetopColumn(a: ResolvedType, b: ResolvedType, op: SetOpKind): ResolvedType {
+function unifySetopColumn(
+  a: ResolvedType,
+  b: ResolvedType,
+  op: SetOpKind,
+): ResolvedType {
   if (a.kind === "null" && b.kind === "null") return { kind: "null" };
   if (a.kind === "null") return b;
   if (b.kind === "null") return a;
-  if (a.kind === "int" && b.kind === "int") return { kind: "int", ty: promote(a, b) };
-  if ((a.kind === "int" || a.kind === "decimal") && (b.kind === "int" || b.kind === "decimal")) {
+  if (a.kind === "int" && b.kind === "int")
+    return { kind: "int", ty: promote(a, b) };
+  if (
+    (a.kind === "int" || a.kind === "decimal") &&
+    (b.kind === "int" || b.kind === "decimal")
+  ) {
     // at least one decimal (both-int handled above) -> decimal
     return { kind: "decimal" };
   }
   // Two floats unify to the widest (the float tower — f32 + f64 → f64; the narrower
   // operand's rows are widened in coerceSetopRows). float never reconciles with int/decimal.
-  if (a.kind === "float" && b.kind === "float") return { kind: "float", ty: promoteFloat(a.ty, b.ty) };
+  if (a.kind === "float" && b.kind === "float")
+    return { kind: "float", ty: promoteFloat(a.ty, b.ty) };
   if (a.kind === b.kind) return a;
   throw engineError(
     "datatype_mismatch",
@@ -10452,7 +13084,11 @@ function unifySetopColumn(a: ResolvedType, b: ResolvedType, op: SetOpKind): Reso
 // coerceSetopRows converts each row's values in place to the unified set-operation column types —
 // the only runtime change is integer -> decimal (a NULL stays NULL; integer-width promotion is a
 // value no-op since every integer is bigint). Same conversion coerceCaseValue uses for CASE.
-function coerceSetopRows(rows: Value[][], from: ResolvedType[], to: ResolvedType[]): void {
+function coerceSetopRows(
+  rows: Value[][],
+  from: ResolvedType[],
+  to: ResolvedType[],
+): void {
   for (let i = 0; i < to.length; i++) {
     if (from[i]!.kind === "int" && to[i]!.kind === "decimal") {
       for (const row of rows) {
@@ -10478,7 +13114,12 @@ function coerceSetopRows(rows: Value[][], from: ResolvedType[], to: ResolvedType
 // key is its FIRST occurrence scanning the LEFT operand then the right, and emitted rows keep that
 // left-then-right scan order — deterministic and identical across cores. (A later ORDER BY
 // re-sorts; without one, output order is unspecified and the corpus compares rowsort.)
-function combineSetop(op: SetOpKind, all: boolean, left: Value[][], right: Value[][]): Value[][] {
+function combineSetop(
+  op: SetOpKind,
+  all: boolean,
+  left: Value[][],
+  right: Value[][],
+): Value[][] {
   if (op === "union" && all) return left.concat(right);
   if (op === "union") {
     const seen = new Set<string>();
@@ -10558,10 +13199,19 @@ function combineSetop(op: SetOpKind, all: boolean, left: Value[][], right: Value
 // operation); an unknown name is 42703. Returns the output column index.
 function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
   if (key.qualifier !== null) {
-    throw engineError("undefined_table", "missing FROM-clause entry for table " + key.qualifier);
+    throw engineError(
+      "undefined_table",
+      "missing FROM-clause entry for table " + key.qualifier,
+    );
   }
-  const idx = names.findIndex((n) => n.toLowerCase() === key.column.toLowerCase());
-  if (idx < 0) throw engineError("undefined_column", "column " + key.column + " does not exist");
+  const idx = names.findIndex(
+    (n) => n.toLowerCase() === key.column.toLowerCase(),
+  );
+  if (idx < 0)
+    throw engineError(
+      "undefined_column",
+      "column " + key.column + " does not exist",
+    );
   return idx;
 }
 
@@ -10571,23 +13221,37 @@ function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
 // (or NULL). A decimal value into an integer column is NOT assignable (decimal→int is
 // explicit-CAST only). Any cross-family pair is a 42804 type error. Mirrors the INSERT literal
 // type-check, generalized to expressions.
-function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): void {
+function requireAssignable(
+  t: ResolvedType,
+  colTy: ScalarType,
+  col: string,
+): void {
   let ok: boolean;
   if (isInteger(colTy)) ok = t.kind === "int" || t.kind === "null";
-  else if (isDecimal(colTy)) ok = t.kind === "int" || t.kind === "decimal" || t.kind === "null";
+  else if (isDecimal(colTy))
+    ok = t.kind === "int" || t.kind === "decimal" || t.kind === "null";
   // A float column accepts a float value of EQUAL OR NARROWER width (f32 → f64 widening is
   // implicit; f64 → f32 needs an explicit CAST — float.md §6) or NULL. No int/decimal.
-  else if (isFloat(colTy)) ok = (t.kind === "float" && promoteFloat(t.ty, colTy) === colTy) || t.kind === "null";
+  else if (isFloat(colTy))
+    ok =
+      (t.kind === "float" && promoteFloat(t.ty, colTy) === colTy) ||
+      t.kind === "null";
   else if (isBool(colTy)) ok = t.kind === "bool" || t.kind === "null";
   else if (isBytea(colTy)) ok = t.kind === "bytea" || t.kind === "null";
   else if (isUuid(colTy)) ok = t.kind === "uuid" || t.kind === "null";
   else if (isTimestamp(colTy)) ok = t.kind === "timestamp" || t.kind === "null";
-  else if (isTimestamptz(colTy)) ok = t.kind === "timestamptz" || t.kind === "null";
+  else if (isTimestamptz(colTy))
+    ok = t.kind === "timestamptz" || t.kind === "null";
   else if (isInterval(colTy)) ok = t.kind === "interval" || t.kind === "null";
   else if (isDate(colTy)) ok = t.kind === "date" || t.kind === "null";
   else ok = t.kind === "text" || t.kind === "null";
   if (!ok) {
-    throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
+    throw typeError(
+      "cannot assign a value to column " +
+        col +
+        " of type " +
+        canonicalName(colTy),
+    );
   }
 }
 
@@ -10597,14 +13261,20 @@ function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): voi
 // decimal (validated to numeric(p,s) — 22023); on any other type it is 0A000 (varchar(n) and
 // other parameterized types are deferred — spec/design/grammar.md §14). Type-specific narrowings
 // (a text/boolean/decimal PRIMARY KEY, a CAST to text/boolean) are enforced at the call site.
-function resolveTypeAndTypmod(name: string, typeMod: TypeMod | null): [ScalarType, DecimalTypmod | null] {
+function resolveTypeAndTypmod(
+  name: string,
+  typeMod: TypeMod | null,
+): [ScalarType, DecimalTypmod | null] {
   const ty = scalarTypeFromName(name);
   if (ty === undefined) {
     throw engineError("undefined_object", "type does not exist: " + name);
   }
   if (typeMod === null) return [ty, null];
   if (!isDecimal(ty)) {
-    throw engineError("feature_not_supported", "a type modifier is not supported for type " + canonicalName(ty));
+    throw engineError(
+      "feature_not_supported",
+      "a type modifier is not supported for type " + canonicalName(ty),
+    );
   }
   return [ty, validateDecimalTypmod(typeMod)];
 }
@@ -10614,11 +13284,17 @@ function resolveTypeAndTypmod(name: string, typeMod: TypeMod | null): [ScalarTyp
 function validateDecimalTypmod(tm: TypeMod): DecimalTypmod {
   const p = tm.precision;
   if (p < 1n || p > BigInt(MAX_PRECISION)) {
-    throw engineError("invalid_parameter_value", `NUMERIC precision ${p} must be between 1 and ${MAX_PRECISION}`);
+    throw engineError(
+      "invalid_parameter_value",
+      `NUMERIC precision ${p} must be between 1 and ${MAX_PRECISION}`,
+    );
   }
   const s = tm.scale ?? 0n;
   if (s > p || s > BigInt(MAX_SCALE)) {
-    throw engineError("invalid_parameter_value", `NUMERIC scale ${s} must be between 0 and precision ${p}`);
+    throw engineError(
+      "invalid_parameter_value",
+      `NUMERIC scale ${s} must be between 0 and precision ${p}`,
+    );
   }
   return { precision: Number(p), scale: Number(s) };
 }
@@ -10628,11 +13304,20 @@ function validateDecimalTypmod(tm: TypeMod): DecimalTypmod {
 // integer into a decimal column widens (int→decimal) then coerces to the typmod; a decimal into
 // a decimal column coerces to the typmod (rounds, precision-checks → 22003); a boolean into a
 // boolean column is accepted as-is; a cross-family value (decimal→int, text→int, etc.) is 42804.
-function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, notNull: boolean, colName: string): Value {
+function storeValue(
+  v: Value,
+  colTy: ScalarType,
+  typmod: DecimalTypmod | null,
+  notNull: boolean,
+  colName: string,
+): Value {
   switch (v.kind) {
     case "null":
       if (notNull) {
-        throw engineError("not_null_violation", "null value in column " + colName + " violates not-null constraint");
+        throw engineError(
+          "not_null_violation",
+          "null value in column " + colName + " violates not-null constraint",
+        );
       }
       return nullValue();
     case "int":
@@ -10640,13 +13325,19 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
         if (!inRange(colTy, v.int)) throw overflow(colTy);
         return intValue(v.int);
       }
-      if (isDecimal(colTy)) return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
+      if (isDecimal(colTy))
+        return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
       // An integer LITERAL adapts to a float column (float.md §4 literal adaptation — INSERT VALUES /
       // DEFAULT bypass the expression resolver, so the adaptation lands here, like text→bytea). This
       // is literal adaptation, NOT an implicit cross-family cast of a value (storing a f64 into a
       // f32 is still rejected below). Out of binary range → 22003 (the finite-overflow rule).
       if (isFloat(colTy)) return makeFloat(colTy, Number(v.int));
-      throw typeError("cannot store an integer value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store an integer value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     case "decimal":
       if (isDecimal(colTy)) return decimalValue(coerceDecimal(v.dec, typmod));
       // A decimal LITERAL adapts to a float column (float.md §4): nearest binary, fround for f32.
@@ -10655,18 +13346,33 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
         if (!Number.isFinite(d)) throw overflow(colTy);
         return makeFloat(colTy, d);
       }
-      throw typeError("cannot store a decimal value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store a decimal value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     case "f32":
       // f32 into f32 stores as-is; into f64 widens losslessly (every binary32 is an
       // exact binary64 — float.md §2). Bits (incl -0/NaN) preserved. No cross-family store.
       if (colTy === "f32") return v;
       if (colTy === "f64") return float64Value(v.value);
-      throw typeError("cannot store a f32 value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store a f32 value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     case "f64":
       // f64 into f64 stores as-is. f64 → f32 is LOSSY (explicit cast required, not a
       // silent store) so it is rejected here (the resolver's assignableTo already gates it 42804).
       if (colTy === "f64") return v;
-      throw typeError("cannot store a f64 value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store a f64 value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     case "text":
       if (isText(colTy)) return v;
       // A string literal adapts to a bytea column, decoding the hex input (types.md §6/§13);
@@ -10676,39 +13382,82 @@ function storeValue(v: Value, colTy: ScalarType, typmod: DecimalTypmod | null, n
       if (isUuid(colTy)) return uuidValue(decodeUuidLiteral(v.text));
       // ... or to a timestamp column (spec/design/timestamp.md); bad input traps 22007/22008.
       if (isTimestamp(colTy)) return timestampValue(parseTimestamp(v.text));
-      if (isTimestamptz(colTy)) return timestamptzValue(parseTimestamptz(v.text));
+      if (isTimestamptz(colTy))
+        return timestamptzValue(parseTimestamptz(v.text));
       if (isDate(colTy)) return dateValue(parseDate(v.text));
       // ... or to an interval column (spec/design/interval.md); bad input traps 22007/22008.
       if (isInterval(colTy)) return intervalValue(parseInterval(v.text));
-      throw typeError("cannot store a text value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store a text value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     case "bytea":
       if (isBytea(colTy)) return v;
-      throw typeError("cannot store a bytea value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store a bytea value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     case "uuid":
       if (isUuid(colTy)) return v;
-      throw typeError("cannot store a uuid value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store a uuid value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     case "timestamp":
       if (isTimestamp(colTy)) return v;
-      throw typeError("cannot store a timestamp value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store a timestamp value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     case "timestamptz":
       if (isTimestamptz(colTy)) return v;
-      throw typeError("cannot store a timestamptz value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store a timestamptz value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     case "date":
       if (isDate(colTy)) return v;
-      throw typeError("cannot store a date value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store a date value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     case "interval":
       if (isInterval(colTy)) return v;
-      throw typeError("cannot store an interval value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store an interval value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
     default: // bool
       if (isBool(colTy)) return v;
-      throw typeError("cannot store a boolean value in " + canonicalName(colTy) + " column " + colName);
+      throw typeError(
+        "cannot store a boolean value in " +
+          canonicalName(colTy) +
+          " column " +
+          colName,
+      );
   }
 }
 
 // coerceDecimal coerces a decimal into a column's typmod: round to the declared scale and
 // precision-check (22003) for numeric(p,s); for an unconstrained numeric column just cap-check.
 function coerceDecimal(d: Decimal, typmod: DecimalTypmod | null): Decimal {
-  return typmod !== null ? d.coerceToTypmod(typmod.precision, typmod.scale) : d.checkCap();
+  return typmod !== null
+    ? d.coerceToTypmod(typmod.precision, typmod.scale)
+    : d.checkCap();
 }
 
 // literalToValue wraps a parsed literal as a runtime value (type-check/coercion is storeValue).
@@ -10730,8 +13479,15 @@ function literalToValue(lit: Literal): Value {
 // coerceForStore coerces a value into a column of resolved ColType (spec/design/composite.md §4):
 // a scalar dispatches to storeValue; a composite to storeComposite. The single store-coercion seam
 // the INSERT/UPDATE paths use.
-function coerceForStore(v: Value, ty: ColType, typmod: DecimalTypmod | null, notNull: boolean, colName: string): Value {
-  if (ty.kind === "scalar") return storeValue(v, ty.scalar, typmod, notNull, colName);
+function coerceForStore(
+  v: Value,
+  ty: ColType,
+  typmod: DecimalTypmod | null,
+  notNull: boolean,
+  colName: string,
+): Value {
+  if (ty.kind === "scalar")
+    return storeValue(v, ty.scalar, typmod, notNull, colName);
   if (ty.kind === "array") return storeArray(v, ty.elem, notNull, colName);
   return storeComposite(v, ty.name, ty.fields, notNull, colName);
 }
@@ -10739,19 +13495,31 @@ function coerceForStore(v: Value, ty: ColType, typmod: DecimalTypmod | null, not
 // storeArray coerces a value into an ARRAY column (spec/design/array.md §4): NULL honours NOT NULL
 // (23502); an array value coerces each element to the declared element type via coerceForStore (a
 // NULL element is allowed — array elements are nullable). Any other value is a 42804.
-function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
+function storeArray(
+  v: Value,
+  elem: ColType,
+  notNull: boolean,
+  colName: string,
+): Value {
   if (v.kind === "null") {
     if (notNull) {
-      throw engineError("not_null_violation", "null value in column " + colName + " violates not-null constraint");
+      throw engineError(
+        "not_null_violation",
+        "null value in column " + colName + " violates not-null constraint",
+      );
     }
     return nullValue();
   }
   if (v.kind !== "array") {
-    throw typeError("cannot store a non-array value in array column " + colName);
+    throw typeError(
+      "cannot store a non-array value in array column " + colName,
+    );
   }
   // Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[] deferred).
   // The shape (dims/lbounds) is preserved.
-  const out = v.elements.map((el) => coerceForStore(el, elem, null, false, colName));
+  const out = v.elements.map((el) =>
+    coerceForStore(el, elem, null, false, colName),
+  );
   return { kind: "array", dims: v.dims, lbounds: v.lbounds, elements: out };
 }
 
@@ -10759,18 +13527,40 @@ function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string):
 // NOT NULL (23502); a composite value must have exactly the declared field count (42804) and each
 // field is coerced to its declared field type via coerceForStore (recursing); any other value is a
 // 42804. A NULL field of a NOT NULL composite field traps 23502.
-function storeComposite(v: Value, typeName: string, fields: ColField[], notNull: boolean, colName: string): Value {
+function storeComposite(
+  v: Value,
+  typeName: string,
+  fields: ColField[],
+  notNull: boolean,
+  colName: string,
+): Value {
   if (v.kind === "null") {
     if (notNull) {
-      throw engineError("not_null_violation", "null value in column " + colName + " violates not-null constraint");
+      throw engineError(
+        "not_null_violation",
+        "null value in column " + colName + " violates not-null constraint",
+      );
     }
     return nullValue();
   }
   if (v.kind !== "composite") {
-    throw typeError("cannot store a non-record value in composite column " + colName + " (type " + typeName + ")");
+    throw typeError(
+      "cannot store a non-record value in composite column " +
+        colName +
+        " (type " +
+        typeName +
+        ")",
+    );
   }
   if (v.fields.length !== fields.length) {
-    throw typeError("row has " + v.fields.length + " fields but composite type " + typeName + " has " + fields.length);
+    throw typeError(
+      "row has " +
+        v.fields.length +
+        " fields but composite type " +
+        typeName +
+        " has " +
+        fields.length,
+    );
   }
   const out: Value[] = new Array(fields.length);
   for (let i = 0; i < fields.length; i++) {
@@ -10785,7 +13575,11 @@ function storeComposite(v: Value, typeName: string, fields: ColField[], notNull:
 // composite slot is a ROW(…) whose fields recurse against the composite's field types, or a bound
 // $N. The result is then fully coerced/range-checked by coerceForStore. DEFAULT is handled by the
 // caller at the top level (it is not a valid field inside a ROW(…)).
-function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): Value {
+function materializeInsertValue(
+  iv: InsertValue,
+  ty: ColType,
+  bound: Value[],
+): Value {
   if (ty.kind === "array") {
     switch (iv.kind) {
       case "array": {
@@ -10794,10 +13588,14 @@ function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): V
         // §4); otherwise each element materializes against the element type into a flat 1-D array. A
         // scalar mixed with an array sub-element errors 42804 (materialized against the array type).
         if (iv.elements.some((el) => el.kind === "array")) {
-          const subs = iv.elements.map((el) => materializeInsertValue(el, ty, bound));
+          const subs = iv.elements.map((el) =>
+            materializeInsertValue(el, ty, bound),
+          );
           return buildNestedArray(subs);
         }
-        const vals = iv.elements.map((el) => materializeInsertValue(el, ty.elem, bound));
+        const vals = iv.elements.map((el) =>
+          materializeInsertValue(el, ty.elem, bound),
+        );
         return arrayValue(vals);
       }
       case "param":
@@ -10807,11 +13605,15 @@ function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): V
       case "lit":
         // A bare string literal adapts to the array context via array_in (the same
         // string-adapts-to-context rule bytea/uuid use — spec/design/array.md §7).
-        if (iv.lit.kind === "text") return coerceStringToArray(iv.lit.text, ty.elem);
+        if (iv.lit.kind === "text")
+          return coerceStringToArray(iv.lit.text, ty.elem);
         if (iv.lit.kind === "null") return nullValue();
         throw typeError("cannot assign a scalar value to an array column");
       default: // default
-        throw engineError("syntax_error", "DEFAULT is not allowed inside ARRAY[...]");
+        throw engineError(
+          "syntax_error",
+          "DEFAULT is not allowed inside ARRAY[...]",
+        );
     }
   }
   if (ty.kind === "scalar") {
@@ -10821,31 +13623,65 @@ function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): V
       case "param":
         return bound[iv.index - 1]!;
       case "row":
-        throw typeError("cannot assign a record value to a " + canonicalName(ty.scalar) + " field");
+        throw typeError(
+          "cannot assign a record value to a " +
+            canonicalName(ty.scalar) +
+            " field",
+        );
       case "array":
-        throw typeError("cannot assign an array value to a " + canonicalName(ty.scalar) + " field");
+        throw typeError(
+          "cannot assign an array value to a " +
+            canonicalName(ty.scalar) +
+            " field",
+        );
       default: // default
-        throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
+        throw engineError(
+          "syntax_error",
+          "DEFAULT is not allowed inside ROW(...)",
+        );
     }
   }
   // ty is a composite column type.
   switch (iv.kind) {
     case "row": {
       if (iv.fields.length !== ty.fields.length) {
-        throw typeError("ROW has " + iv.fields.length + " fields but composite type " + ty.name + " has " + ty.fields.length);
+        throw typeError(
+          "ROW has " +
+            iv.fields.length +
+            " fields but composite type " +
+            ty.name +
+            " has " +
+            ty.fields.length,
+        );
       }
       const vals: Value[] = new Array(ty.fields.length);
-      for (let i = 0; i < ty.fields.length; i++) vals[i] = materializeInsertValue(iv.fields[i]!, ty.fields[i]!.type, bound);
+      for (let i = 0; i < ty.fields.length; i++)
+        vals[i] = materializeInsertValue(
+          iv.fields[i]!,
+          ty.fields[i]!.type,
+          bound,
+        );
       return compositeValue(vals);
     }
     case "param":
       return bound[iv.index - 1]!;
     case "lit":
-      throw typeError("cannot assign a scalar value to composite column (type " + ty.name + ")");
+      throw typeError(
+        "cannot assign a scalar value to composite column (type " +
+          ty.name +
+          ")",
+      );
     case "array":
-      throw typeError("cannot assign an array value to composite column (type " + ty.name + ")");
+      throw typeError(
+        "cannot assign an array value to composite column (type " +
+          ty.name +
+          ")",
+      );
     default: // default
-      throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
+      throw engineError(
+        "syntax_error",
+        "DEFAULT is not allowed inside ROW(...)",
+      );
   }
 }
 
@@ -10855,7 +13691,8 @@ function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): V
 function coerceStringToArray(s: string, elem: ColType): Value {
   const parsed: ArrayInResult = parseArrayLiteral(s);
   if (!parsed.ok) {
-    if (parsed.err === "boundflip") throw arraySubscriptErr("upper bound cannot be less than lower bound");
+    if (parsed.err === "boundflip")
+      throw arraySubscriptErr("upper bound cannot be less than lower bound");
     throw engineError("invalid_text_representation", "malformed array literal");
   }
   const vals = parsed.value.tokens.map((tok) => {
@@ -10864,7 +13701,12 @@ function coerceStringToArray(s: string, elem: ColType): Value {
     // via record_in — array-of-composite, spec/design/array.md §12 AC1 / §7).
     return coerceArrayElementText(tok, elem);
   });
-  return { kind: "array", dims: parsed.value.dims, lbounds: parsed.value.lbounds, elements: vals };
+  return {
+    kind: "array",
+    dims: parsed.value.dims,
+    lbounds: parsed.value.lbounds,
+    elements: vals,
+  };
 }
 
 // coerceArrayElementText coerces one array-element token to a Value against the element ColType (the
@@ -10884,15 +13726,22 @@ function coerceArrayElementText(tok: string, elem: ColType): Value {
 // parseRecordTokens and recursively coerced per field (a scalar field respects its decimal typmod).
 // Mirrors coerceStringToComposite but produces a Value directly and walks ColType (no Database). A
 // bad shape / field count is 22P02.
-function coerceRecordTextToValue(text: string, ct: { kind: "composite"; name: string; fields: ColField[] }): Value {
+function coerceRecordTextToValue(
+  text: string,
+  ct: { kind: "composite"; name: string; fields: ColField[] },
+): Value {
   const tokens = parseRecordTokens(text);
   if (tokens === null || tokens.length !== ct.fields.length) {
-    throw engineError("invalid_text_representation", `malformed record literal: "${text}" for type ${ct.name}`);
+    throw engineError(
+      "invalid_text_representation",
+      `malformed record literal: "${text}" for type ${ct.name}`,
+    );
   }
   const vals = tokens.map((tok, i) => {
     if (tok === null) return nullValue();
     const f = ct.fields[i]!;
-    if (f.type.kind === "composite") return coerceRecordTextToValue(tok, f.type);
+    if (f.type.kind === "composite")
+      return coerceRecordTextToValue(tok, f.type);
     if (f.type.kind === "array") return coerceStringToArray(tok, f.type.elem);
     const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod);
     return rexprConstToValue(node);
@@ -10934,7 +13783,10 @@ function rexprConstToValue(e: RExpr): Value {
 }
 
 function overflow(ty: ScalarType): Error {
-  return engineError("numeric_value_out_of_range", "value out of range for type " + canonicalName(ty));
+  return engineError(
+    "numeric_value_out_of_range",
+    "value out of range for type " + canonicalName(ty),
+  );
 }
 
 function typeError(msg: string): Error {
@@ -10957,7 +13809,12 @@ const I64_MIN = -9223372036854775808n;
 // = TRUE) independent of lv. Otherwise: a positive match -> TRUE; else a NULL element (or NULL lv)
 // -> NULL; else FALSE. NOT IN is the Kleene negation. Shared by the folded "inValues" node and the
 // correlated "subquery"/in eval.
-function inMembership(lv: Value, list: Value[], negated: boolean, m: Meter): Value {
+function inMembership(
+  lv: Value,
+  list: Value[],
+  negated: boolean,
+  m: Meter,
+): Value {
   if (list.length === 0) return { kind: "bool", value: negated };
   let anyMatch = false;
   let anyNull = false;
@@ -11024,7 +13881,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // fields (spec/design/composite.md §1, cost.md §9).
       m.charge(COSTS.operatorEval);
       const vals: Value[] = new Array(e.fields.length);
-      for (let i = 0; i < e.fields.length; i++) vals[i] = evalExpr(e.fields[i]!, row, env, m);
+      for (let i = 0; i < e.fields.length; i++)
+        vals[i] = evalExpr(e.fields[i]!, row, env, m);
       return compositeValue(vals);
     }
     case "array": {
@@ -11032,7 +13890,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // into one higher dimension (spec/design/array.md §4); otherwise a flat 1-D array.
       m.charge(COSTS.operatorEval);
       const elems: Value[] = new Array(e.elements.length);
-      for (let i = 0; i < e.elements.length; i++) elems[i] = evalExpr(e.elements[i]!, row, env, m);
+      for (let i = 0; i < e.elements.length; i++)
+        elems[i] = evalExpr(e.elements[i]!, row, env, m);
       return e.nested ? buildNestedArray(elems) : arrayValue(elems);
     }
     case "constArray":
@@ -11045,7 +13904,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       m.charge(COSTS.operatorEval);
       const base = evalExpr(e.base, row, env, m);
       if (base.kind === "null") return nullValue();
-      if (base.kind !== "composite") throw typeError("internal: field access on a non-composite value");
+      if (base.kind !== "composite")
+        throw typeError("internal: field access on a non-composite value");
       return base.fields[e.index]!;
     }
     case "subscript": {
@@ -11066,18 +13926,27 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
       if (isInterval(e.result)) {
-        if (v.kind !== "interval") throw typeError("internal: non-interval unary minus");
+        if (v.kind !== "interval")
+          throw typeError("internal: non-interval unary minus");
         return intervalValue(intervalNeg(v.iv));
       }
       if (isDecimal(e.result)) {
-        return decimalValue((v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec).negate());
+        return decimalValue(
+          (v.kind === "int"
+            ? Decimal.fromBigInt(v.int)
+            : (v as { dec: Decimal }).dec
+          ).negate(),
+        );
       }
       if (isFloat(e.result)) {
         // Negation flips the sign (no overflow); -NaN is NaN, -Inf is -Inf per IEEE. f32 stays
         // binary32 (negation never changes the width's representability, but fround keeps the path
         // uniform). float.md §5.
-        if (v.kind !== "f32" && v.kind !== "f64") throw typeError("internal: non-float unary minus");
-        return e.result === "f32" ? float32Value(-v.value) : float64Value(-v.value);
+        if (v.kind !== "f32" && v.kind !== "f64")
+          throw typeError("internal: non-float unary minus");
+        return e.result === "f32"
+          ? float32Value(-v.value)
+          : float64Value(-v.value);
       }
       if (v.kind !== "int") throw typeError("internal: boolean unary minus");
       const n = -v.int;
@@ -11100,7 +13969,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const numVal = a.kind === "interval" ? b : a;
         let [fnum, fden] = factorToFraction(numVal);
         if (e.op === "div") {
-          if (fnum === 0n) throw engineError("division_by_zero", "division by zero");
+          if (fnum === 0n)
+            throw engineError("division_by_zero", "division by zero");
           // interval / number = interval * (den/num); keep fden > 0.
           [fnum, fden] = fnum < 0n ? [-fden, -fnum] : [fden, fnum];
         }
@@ -11109,7 +13979,9 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (isInterval(e.result)) {
         // interval ± interval → interval; timestamp[tz] − timestamp[tz] → interval (§5).
         if (a.kind === "interval" && b.kind === "interval") {
-          return intervalValue(e.op === "add" ? intervalAdd(a.iv, b.iv) : intervalSub(a.iv, b.iv));
+          return intervalValue(
+            e.op === "add" ? intervalAdd(a.iv, b.iv) : intervalSub(a.iv, b.iv),
+          );
         }
         if (
           (a.kind === "timestamp" && b.kind === "timestamp") ||
@@ -11131,7 +14003,9 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           iv = (b as { iv: Interval }).iv;
         }
         const r = tsShift(instant, iv, e.op === "sub");
-        return isTimestamptz(e.result) ? timestamptzValue(r) : timestampValue(r);
+        return isTimestamptz(e.result)
+          ? timestamptzValue(r)
+          : timestampValue(r);
       }
       if (isDecimal(e.result)) {
         // Decimal arithmetic: widen any integer operand to decimal, then apply the op with
@@ -11140,7 +14014,9 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // work (spec/design/cost.md §3 "decimal_work").
         const da = toDecimal(a);
         const db = toDecimal(b);
-        m.charge(COSTS.decimalWork * BigInt(decimalArithWork(e.op, da, db) - 1));
+        m.charge(
+          COSTS.decimalWork * BigInt(decimalArithWork(e.op, da, db) - 1),
+        );
         m.guard();
         return decimalValue(evalDecimalArith(e.op, da, db));
       }
@@ -11148,12 +14024,16 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // Float arithmetic: the resolver promoted both operands to e.result's width (mixed-width
         // pairs were cast to f64), so both are the same float kind here. One IEEE op per node
         // (no FMA fusion — structural in the tree walker, float.md §5).
-        if ((a.kind !== "f32" && a.kind !== "f64") || (b.kind !== "f32" && b.kind !== "f64")) {
+        if (
+          (a.kind !== "f32" && a.kind !== "f64") ||
+          (b.kind !== "f32" && b.kind !== "f64")
+        ) {
           throw typeError("internal: non-float arithmetic");
         }
         return evalFloatArith(e.op, a.value, b.value, e.result);
       }
-      if (a.kind !== "int" || b.kind !== "int") throw typeError("internal: non-integer arithmetic");
+      if (a.kind !== "int" || b.kind !== "int")
+        throw typeError("internal: non-integer arithmetic");
       return evalArith(e.op, a.int, b.int, e.result);
     }
     case "compare": {
@@ -11219,12 +14099,16 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const pattern = evalExpr(e.rhs, row, env, m);
       // NULL propagates BEFORE the matcher runs, so a malformed pattern against a NULL operand
       // is still NULL, never 22025 (matches PG — grammar.md §22).
-      if (subject.kind === "null" || pattern.kind === "null") return nullValue();
+      if (subject.kind === "null" || pattern.kind === "null")
+        return nullValue();
       if (subject.kind !== "text" || pattern.kind !== "text") {
         throw new Error("unreachable: resolver requires text LIKE operands");
       }
       // negated carries NOT LIKE: matched !== negated flips the result for NOT LIKE.
-      return { kind: "bool", value: likeMatch(subject.text, pattern.text) !== e.negated };
+      return {
+        kind: "bool",
+        value: likeMatch(subject.text, pattern.text) !== e.negated,
+      };
     }
     case "case": {
       // CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are
@@ -11236,7 +14120,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       for (const arm of e.arms) {
         const cv = evalExpr(arm.cond, row, env, m);
         if (cv.kind === "bool" && cv.value) {
-          return coerceCaseValue(evalExpr(arm.result, row, env, m), e.coerceDecimal);
+          return coerceCaseValue(
+            evalExpr(arm.result, row, env, m),
+            e.coerceDecimal,
+          );
         }
       }
       return coerceCaseValue(evalExpr(e.els, row, env, m), e.coerceDecimal);
@@ -11259,18 +14146,30 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
         const secMicros = f64ToMicros((vals[6] as { value: number }).value);
         return intervalValue(
-          makeInterval(geti(0), geti(1), geti(2), geti(3), geti(4), geti(5), secMicros),
+          makeInterval(
+            geti(0),
+            geti(1),
+            geti(2),
+            geti(3),
+            geti(4),
+            geti(5),
+            secMicros,
+          ),
         );
       }
       // uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a non-RFC
       // variant (and, for the timestamp, any version other than 1/7). The NULL-input case is
       // already handled above.
       if (e.func === "uuid_extract_version") {
-        const ver = uuidExtractVersion((vals[0] as { bytes: Uint8Array }).bytes);
+        const ver = uuidExtractVersion(
+          (vals[0] as { bytes: Uint8Array }).bytes,
+        );
         return ver === null ? nullValue() : intValue(ver);
       }
       if (e.func === "uuid_extract_timestamp") {
-        const mc = uuidExtractTimestampMicros((vals[0] as { bytes: Uint8Array }).bytes);
+        const mc = uuidExtractTimestampMicros(
+          (vals[0] as { bytes: Uint8Array }).bytes,
+        );
         return mc === null ? nullValue() : timestamptzValue(mc);
       }
       // uuid generators (spec/design/entropy.md §3): draw from the per-statement seam (env.rng),
@@ -11282,7 +14181,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const clock = env.rng.statementClockMicros(env.seam);
         // The optional interval arg shifts the embedded instant via the existing calendar-aware
         // timestamptz arithmetic (entropy.md §4).
-        const shifted = vals.length === 1 ? tsShift(clock, (vals[0] as { iv: Interval }).iv, false) : clock;
+        const shifted =
+          vals.length === 1
+            ? tsShift(clock, (vals[0] as { iv: Interval }).iv, false)
+            : clock;
         return uuidValue(env.rng.uuidV7(env.seam, shifted));
       }
       // current-time functions (spec/design/entropy.md §5): now() reads the statement clock ONCE and
@@ -11299,18 +14201,27 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // state; currval is a pure session-state read. The NULL-arg case is handled above (propagates).
       if (e.func === "nextval") {
         m.charge(COSTS.sequenceAdvance);
-        return intValue(env.exec.seqNextval((vals[0] as { text: string }).text));
+        return intValue(
+          env.exec.seqNextval((vals[0] as { text: string }).text),
+        );
       }
       if (e.func === "currval") {
-        return intValue(env.exec.seqCurrval((vals[0] as { text: string }).text));
+        return intValue(
+          env.exec.seqCurrval((vals[0] as { text: string }).text),
+        );
       }
       // setval charges sequence_advance (it rewrites the catalog tuple, like nextval). Arity 2 →
       // isCalled defaults true; arity 3 → the boolean third argument.
       if (e.func === "setval") {
         m.charge(COSTS.sequenceAdvance);
-        const isCalled = vals.length > 2 ? (vals[2] as { value: boolean }).value : true;
+        const isCalled =
+          vals.length > 2 ? (vals[2] as { value: boolean }).value : true;
         return intValue(
-          env.exec.seqSetval((vals[0] as { text: string }).text, (vals[1] as { int: bigint }).int, isCalled),
+          env.exec.seqSetval(
+            (vals[0] as { text: string }).text,
+            (vals[1] as { int: bigint }).int,
+            isCalled,
+          ),
         );
       }
       if (e.func === "lastval") {
@@ -11328,7 +14239,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           return evalFloatPow(v0.value, v1.value, e.result);
         }
         // round(x, n): n is an int operand; the unary funcs ignore it.
-        const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
+        const places =
+          vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
         return evalFloatFunc(e.func, v0.value, places, e.result);
       }
       if (e.func === "abs") {
@@ -11343,8 +14255,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         return decimalValue((v0 as { dec: Decimal }).dec.abs());
       }
       // round
-      const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
-      const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
+      const d =
+        v0.kind === "int"
+          ? Decimal.fromBigInt(v0.int)
+          : (v0 as { dec: Decimal }).dec;
+      const places =
+        vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
       return decimalValue(d.roundPlaces(places));
     }
     case "arrayFunc": {
@@ -11367,7 +14283,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (e.arrayForm) {
         const v = evalExpr(e.args[0]!, row, env, m);
         if (v.kind === "null") return nullValue();
-        if (v.kind !== "array") throw new Error("resolver restricts a VARIADIC operand to an array");
+        if (v.kind !== "array")
+          throw new Error("resolver restricts a VARIADIC operand to an array");
         return intValue(BigInt(countNulls(v.elements, wantNulls)));
       }
       const vals: Value[] = [];
@@ -11431,9 +14348,16 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
 // FALSE) and ALL (all=true) the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE;
 // empty -> TRUE). Each element comparison charges one operator_eval (+ size-scaled decimal_work),
 // exactly like inMembership, so max_cost bounds the walk (54P01).
-function quantifiedMembership(op: BinaryOp, all: boolean, lv: Value, av: Value, m: Meter): Value {
+function quantifiedMembership(
+  op: BinaryOp,
+  all: boolean,
+  lv: Value,
+  av: Value,
+  m: Meter,
+): Value {
   if (av.kind === "null") return nullValue();
-  if (av.kind !== "array") throw new Error("BUG: the resolver requires an array right operand");
+  if (av.kind !== "array")
+    throw new Error("BUG: the resolver requires an array right operand");
   let anyNull = false;
   for (const e of av.elements) {
     m.charge(COSTS.operatorEval);
@@ -11532,7 +14456,10 @@ function likeMatch(subject: string, pattern: string): boolean {
     if (pi < p.length && p[pi] === "\\") {
       // Escape: the next pattern character must match the subject literally.
       if (pi + 1 >= p.length) {
-        throw engineError("invalid_escape_sequence", "LIKE pattern must not end with escape character");
+        throw engineError(
+          "invalid_escape_sequence",
+          "LIKE pattern must not end with escape character",
+        );
       }
       if (s[si] === p[pi + 1]) {
         si++;
@@ -11572,7 +14499,12 @@ function likeMatch(subject: string, pattern: string): boolean {
 // and 22003 if the result falls outside the declared result type (the i16+i16 →
 // i16 boundary — spec/design/functions.md §7). The MinInt64/-1 cases trap to match the
 // Rust/Go checked-op behaviour (bigint would not overflow on its own).
-function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Value {
+function evalArith(
+  op: BinaryOp,
+  x: bigint,
+  y: bigint,
+  result: ScalarType,
+): Value {
   let v: bigint;
   switch (op) {
     case "add":
@@ -11610,7 +14542,12 @@ function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Valu
 // the overflow check is then re-applied because fround can push a finite double past binary32 range.
 // `%` is IEEE remainder via JS `%` (which is fmod — truncated, dividend's sign), exact, never
 // overflows.
-function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType): Value {
+function evalFloatArith(
+  op: BinaryOp,
+  x: number,
+  y: number,
+  result: ScalarType,
+): Value {
   const f32 = result === "f32";
   const finiteInputs = Number.isFinite(x) && Number.isFinite(y);
   let r: number;
@@ -11626,11 +14563,13 @@ function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType):
       break;
     case "div":
       // x / 0 traps for every numerator except NaN, which propagates (NaN/0 = NaN, matching PG).
-      if (y === 0 && !Number.isNaN(x)) throw engineError("division_by_zero", "division by zero");
+      if (y === 0 && !Number.isNaN(x))
+        throw engineError("division_by_zero", "division by zero");
       r = x / y;
       break;
     default: // "mod"
-      if (y === 0 && !Number.isNaN(x)) throw engineError("division_by_zero", "division by zero");
+      if (y === 0 && !Number.isNaN(x))
+        throw engineError("division_by_zero", "division by zero");
       r = x % y; // JS % is fmod: truncated, takes the dividend's sign; exact, finite for finite x,y
       break;
   }
@@ -11647,7 +14586,12 @@ function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType):
 // propagates through the exact functions; the transcendentals call native Math.* (exempted — the R
 // tag absorbs cross-core ULP differences). Domain / overflow errors trap (float.md §8):
 //   sqrt(neg) → 22003; ln(0)/ln(neg) → 22003; exp overflow → 22003; sin/cos/tan never trap.
-function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: ScalarType): Value {
+function evalFloatFunc(
+  func: ScalarFuncName,
+  x: number,
+  places: number,
+  result: ScalarType,
+): Value {
   const out = (r: number): Value => {
     // result is f64 for all but abs; abs's result is the operand width, so fround for f32.
     if (result === "f32") {
@@ -11671,7 +14615,11 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
     case "sqrt":
       // sqrt(neg) is a DOMAIN error → 22003 (NaN stays input-only). sqrt(NaN)=NaN, sqrt(+Inf)=+Inf,
       // sqrt(-0)=-0 all propagate. IEEE mandates sqrt correctly-rounded, so it is in-contract.
-      if (x < 0) throw engineError("numeric_value_out_of_range", "cannot take square root of a negative number");
+      if (x < 0)
+        throw engineError(
+          "numeric_value_out_of_range",
+          "cannot take square root of a negative number",
+        );
       return out(Math.sqrt(x));
     case "exp": {
       // exp overflow (e.g. exp(710)) → 22003. A NaN/±Inf operand propagates (exp(+Inf)=+Inf,
@@ -11682,12 +14630,28 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
     }
     case "ln":
       // ln(0) → 22003; ln(neg) → 22003 (domain). ln(+Inf)=+Inf, ln(NaN)=NaN propagate.
-      if (x === 0) throw engineError("numeric_value_out_of_range", "cannot take logarithm of zero");
-      if (x < 0) throw engineError("numeric_value_out_of_range", "cannot take logarithm of a negative number");
+      if (x === 0)
+        throw engineError(
+          "numeric_value_out_of_range",
+          "cannot take logarithm of zero",
+        );
+      if (x < 0)
+        throw engineError(
+          "numeric_value_out_of_range",
+          "cannot take logarithm of a negative number",
+        );
       return out(Math.log(x));
     case "log10":
-      if (x === 0) throw engineError("numeric_value_out_of_range", "cannot take logarithm of zero");
-      if (x < 0) throw engineError("numeric_value_out_of_range", "cannot take logarithm of a negative number");
+      if (x === 0)
+        throw engineError(
+          "numeric_value_out_of_range",
+          "cannot take logarithm of zero",
+        );
+      if (x < 0)
+        throw engineError(
+          "numeric_value_out_of_range",
+          "cannot take logarithm of a negative number",
+        );
       return out(Math.log10(x));
     case "sin":
       return out(Math.sin(x));
@@ -11705,7 +14669,8 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
 // operand propagates per IEEE. result is f64 (the catalog), so no fround.
 function evalFloatPow(x: number, y: number, result: ScalarType): Value {
   const r = Math.pow(x, y);
-  if (Number.isFinite(x) && Number.isFinite(y) && !Number.isFinite(r)) throw overflow(result);
+  if (Number.isFinite(x) && Number.isFinite(y) && !Number.isFinite(r))
+    throw overflow(result);
   return result === "f32" ? float32Value(Math.fround(r)) : float64Value(r);
 }
 
@@ -11726,9 +14691,14 @@ function roundFloatHalfAway(x: number, places: number): number {
 // evalCast evaluates a (non-NULL) CAST to target. int→int range-checks (22003); int→decimal
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
-function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): Value {
+function evalCast(
+  v: Value,
+  target: ScalarType,
+  typmod: DecimalTypmod | null,
+): Value {
   if (v.kind === "int") {
-    if (isDecimal(target)) return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
+    if (isDecimal(target))
+      return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
     // int → float (explicit, lossy): nearest binary representable, then fround for f32. Exact
     // for |int| ≤ 2^53; a larger i64 may round. Never traps (float.md §6).
     if (isFloat(target)) return makeFloat(target, Number(v.int));
@@ -11769,7 +14739,9 @@ function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): V
     if (isDecimal(target)) {
       if (!Number.isFinite(v.value)) throw overflow(target);
       const exact =
-        v.kind === "f32" ? Decimal.exactFromFloat32(v.value) : Decimal.exactFromFloat64(v.value);
+        v.kind === "f32"
+          ? Decimal.exactFromFloat32(v.value)
+          : Decimal.exactFromFloat64(v.value);
       return decimalValue(coerceDecimal(exact, typmod));
     }
     throw typeError("internal: unsupported float cast target");
@@ -11834,9 +14806,12 @@ function decimalArithWork(op: BinaryOp, a: Decimal, b: Decimal): number {
 // aligned linear formula after int→decimal promotion; 1 (no charge) for any other pair,
 // including a NULL side, where no decimal compare runs (spec/design/cost.md §3 "decimal_work").
 function decimalCmpWork(a: Value, b: Value): number {
-  if (a.kind === "decimal" && b.kind === "decimal") return workLinear(a.dec, b.dec);
-  if (a.kind === "decimal" && b.kind === "int") return workLinear(a.dec, Decimal.fromBigInt(b.int));
-  if (a.kind === "int" && b.kind === "decimal") return workLinear(Decimal.fromBigInt(a.int), b.dec);
+  if (a.kind === "decimal" && b.kind === "decimal")
+    return workLinear(a.dec, b.dec);
+  if (a.kind === "decimal" && b.kind === "int")
+    return workLinear(a.dec, Decimal.fromBigInt(b.int));
+  if (a.kind === "int" && b.kind === "decimal")
+    return workLinear(Decimal.fromBigInt(a.int), b.dec);
   return 1;
 }
 
@@ -11859,7 +14834,10 @@ function evalDecimalArith(op: BinaryOp, a: Decimal, b: Decimal): Decimal {
 
 // or3 is three-valued OR (Kleene): used to build <= / >= from < / > and =, so a NULL
 // operand yields UNKNOWN rather than a wrong FALSE (CLAUDE.md §4).
-function or3(a: "true" | "false" | "unknown", b: "true" | "false" | "unknown"): "true" | "false" | "unknown" {
+function or3(
+  a: "true" | "false" | "unknown",
+  b: "true" | "false" | "unknown",
+): "true" | "false" | "unknown" {
   if (a === "true" || b === "true") return "true";
   if (a === "unknown" || b === "unknown") return "unknown";
   return "false";
@@ -11878,7 +14856,12 @@ function not3(a: ThreeValued): ThreeValued {
 // (descending), so an explicit NULLS FIRST|LAST overrides the direction default
 // (spec/design/grammar.md §10). The physical key order ratifies NULL as the largest value
 // (the PostgreSQL model), which surfaces as the parse-time default nullsFirst = descending.
-function keyCmp(a: Value, b: Value, descending: boolean, nullsFirst: boolean): number {
+function keyCmp(
+  a: Value,
+  b: Value,
+  descending: boolean,
+  nullsFirst: boolean,
+): number {
   if (a.kind === "null" && b.kind === "null") return 0;
   if (a.kind === "null") return nullsFirst ? -1 : 1;
   if (b.kind === "null") return nullsFirst ? 1 : -1;
@@ -11893,15 +14876,22 @@ function keyCmp(a: Value, b: Value, descending: boolean, nullsFirst: boolean): n
 // over a single typed column, so a mixed pair is unreachable from SELECT. NULLs are handled
 // by keyCmp before this is reached. Returns <0, 0, >0.
 function valueCmp(a: Value, b: Value): number {
-  if (a.kind === "int" && b.kind === "int") return a.int < b.int ? -1 : a.int > b.int ? 1 : 0;
-  if (a.kind === "decimal" && b.kind === "decimal") return a.dec.cmpValue(b.dec);
+  if (a.kind === "int" && b.kind === "int")
+    return a.int < b.int ? -1 : a.int > b.int ? 1 : 0;
+  if (a.kind === "decimal" && b.kind === "decimal")
+    return a.dec.cmpValue(b.dec);
   // Floats by the TOTAL order (-0 == +0, NaN == NaN, NaN largest — float.md §3). ORDER BY / MIN /
   // MAX / DISTINCT over a float column reach here with same-width values (one typed column).
-  if (a.kind === "f32" && b.kind === "f32") return floatTotalCmp(a.value, b.value);
-  if (a.kind === "f64" && b.kind === "f64") return floatTotalCmp(a.value, b.value);
-  if (a.kind === "text" && b.kind === "text") return compareTextC(a.text, b.text);
-  if (a.kind === "bytea" && b.kind === "bytea") return compareBytea(a.bytes, b.bytes);
-  if (a.kind === "uuid" && b.kind === "uuid") return compareBytea(a.bytes, b.bytes);
+  if (a.kind === "f32" && b.kind === "f32")
+    return floatTotalCmp(a.value, b.value);
+  if (a.kind === "f64" && b.kind === "f64")
+    return floatTotalCmp(a.value, b.value);
+  if (a.kind === "text" && b.kind === "text")
+    return compareTextC(a.text, b.text);
+  if (a.kind === "bytea" && b.kind === "bytea")
+    return compareBytea(a.bytes, b.bytes);
+  if (a.kind === "uuid" && b.kind === "uuid")
+    return compareBytea(a.bytes, b.bytes);
   if (a.kind === "bool" && b.kind === "bool") {
     return a.value === b.value ? 0 : a.value ? 1 : -1;
   }
@@ -11916,7 +14906,8 @@ function valueCmp(a: Value, b: Value): number {
     return a.days < b.days ? -1 : a.days > b.days ? 1 : 0;
   }
   // Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
-  if (a.kind === "interval" && b.kind === "interval") return intervalCmp(a.iv, b.iv);
+  if (a.kind === "interval" && b.kind === "interval")
+    return intervalCmp(a.iv, b.iv);
   // A composite sorts lexicographically, NULLs-last per field (the composite sort key —
   // spec/design/composite.md §5): the first non-equal field decides, recursing through keyCmp so
   // per-field NULL placement and nested composites are handled uniformly. The caller's descending
@@ -11928,7 +14919,11 @@ function valueCmp(a: Value, b: Value): number {
       const c = keyCmp(a.fields[i]!, b.fields[i]!, false, false);
       if (c !== 0) return c;
     }
-    return a.fields.length < b.fields.length ? -1 : a.fields.length > b.fields.length ? 1 : 0;
+    return a.fields.length < b.fields.length
+      ? -1
+      : a.fields.length > b.fields.length
+        ? 1
+        : 0;
   }
   // An array sorts by the PG array_cmp total order (spec/design/array.md §5): element-wise over the
   // flattened elements (NULLs-last per element, recursing through keyCmp), then fewer elements first,
@@ -11939,11 +14934,14 @@ function valueCmp(a: Value, b: Value): number {
       const c = keyCmp(a.elements[i]!, b.elements[i]!, false, false);
       if (c !== 0) return c;
     }
-    if (a.elements.length !== b.elements.length) return a.elements.length < b.elements.length ? -1 : 1;
-    if (a.dims.length !== b.dims.length) return a.dims.length < b.dims.length ? -1 : 1;
+    if (a.elements.length !== b.elements.length)
+      return a.elements.length < b.elements.length ? -1 : 1;
+    if (a.dims.length !== b.dims.length)
+      return a.dims.length < b.dims.length ? -1 : 1;
     for (let d = 0; d < a.dims.length; d++) {
       if (a.dims[d] !== b.dims[d]) return a.dims[d]! < b.dims[d]! ? -1 : 1;
-      if (a.lbounds[d] !== b.lbounds[d]) return a.lbounds[d]! < b.lbounds[d]! ? -1 : 1;
+      if (a.lbounds[d] !== b.lbounds[d])
+        return a.lbounds[d]! < b.lbounds[d]! ? -1 : 1;
     }
     return 0;
   }
