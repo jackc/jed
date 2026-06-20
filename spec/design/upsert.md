@@ -159,8 +159,10 @@ non-arbiter unique indexes (`23505`), and the FK child-side (`23503`).
 **`0A000`** (the standing `UPDATE` narrowing — the storage key never changes, CLAUDE.md §11
 step 6); assigning a **`GENERATED ALWAYS AS IDENTITY`** column is **`428C9`** (the standing
 `UPDATE` rule, sequences.md §13); `SET col = DEFAULT` is not supported (the `UPDATE`
-`SET = DEFAULT` follow-on is deferred too — the RHS is a general expression, so a bare
-`DEFAULT` keyword there is `42601`). An unknown `col` is `42703`.
+`SET = DEFAULT` follow-on is deferred too — the RHS is a general expression, and `DEFAULT` is
+not reserved (grammar.md §3), so a bare `DEFAULT` there resolves as a column reference →
+**`42703`**, a documented divergence from PG, which supports `SET col = DEFAULT`). An unknown
+`col` is also `42703`.
 
 ## 6. `RETURNING`
 

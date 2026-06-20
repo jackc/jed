@@ -659,7 +659,23 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         works. A bare `ALTER SEQUENCE s` is `42601`; `AS type`/`OWNED BY`/`OWNER TO`/`SET …` stay
         `0A000`. **No `format_version` change** (no golden moves). All three cores; `ddl/alter_sequence.test`;
         capability `ddl.alter_sequence`. → [sequences.md §15](spec/design/sequences.md) _(size: M)_
-- [ ] **`UPSERT` / `ON CONFLICT`**. _(size: M; deps: UNIQUE ✅, RETURNING ✅ — unblocked)_
+- [x] **`UPSERT` / `ON CONFLICT`** — `INSERT … ON CONFLICT [target] { DO NOTHING | DO UPDATE SET …
+      [WHERE …] }`: a candidate row that would violate a UNIQUE/PRIMARY KEY constraint takes the
+      conflict action instead of trapping `23505`. DO NOTHING skips it; DO UPDATE updates the
+      existing conflicting row, with the proposed row exposed as the qualifier-only `excluded`
+      pseudo-relation. The arbiter target is a column SET matched order-independently against a
+      unique index / the PK (no match `42P10`), or `ON CONSTRAINT name` (a unique-index name or the
+      synthesized `<table>_pkey`; miss `42704`); DO UPDATE requires a target (`42601` without one),
+      DO NOTHING may omit it (any conflict skipped). A non-arbiter conflict still traps `23505`; two
+      proposed rows sharing the arbiter key are `21000` under DO UPDATE, skipped under DO NOTHING.
+      Two-phase / all-or-nothing with sequential planning; RETURNING projects the affected
+      (inserted + updated) rows. No new error code (reuses existing), no on-disk format change. All
+      three cores + capability `dml.insert_on_conflict` + `dml/insert_on_conflict.test` (oracle-clean)
+      + per-core divergence/introspection tests. → [upsert.md](spec/design/upsert.md), grammar.md §46
+  - [ ] _follow-on:_ `DO UPDATE SET col = DEFAULT` (with the `UPDATE` `SET = DEFAULT` follow-on);
+        `INSERT INTO t AS alias` (the existing row is referenced by the table name today); the
+        partial-index `WHERE index_predicate` / `COLLATE`/opclass inference decorations; relaxing
+        the DO UPDATE PK-column assignment (`0A000`) with the UPDATE re-keying follow-on. → [upsert.md §10](spec/design/upsert.md)
 - [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
       `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).
       _(size: M; deps: transactions for clean re-keying)_
