@@ -171,6 +171,104 @@ func parseMaxSQLLengthDirective(line string) (int, bool) {
 	return n, true
 }
 
+// parsePrivSet parses a comma/whitespace-separated privilege list (SELECT, INSERT; EXECUTE; the
+// keyword ALL = the four table privileges; NONE = the empty set) into a jed.PrivilegeSet. Used by the
+// # default_privileges: / # grant: / # revoke: directives (spec/design/session.md §5.3).
+func parsePrivSet(list string) (jed.PrivilegeSet, bool) {
+	body := strings.TrimSpace(list)
+	if strings.EqualFold(body, "none") {
+		return jed.PrivSetEmpty, true
+	}
+	if strings.EqualFold(body, "all") {
+		return jed.PrivSetAllTable, true
+	}
+	set := jed.PrivSetEmpty
+	for _, tok := range strings.Split(body, ",") {
+		name := strings.TrimSpace(tok)
+		if name == "" {
+			continue
+		}
+		p, ok := jed.PrivilegeFromName(name)
+		if !ok {
+			return 0, false
+		}
+		set = set.With(p)
+	}
+	return set, true
+}
+
+// parseDefaultPrivilegesDirective parses a `# default_privileges: SELECT, INSERT` directive line
+// (spec/design/session.md §5.3): the table-privilege set granted to every table for the next record
+// (NONE / ALL accepted).
+func parseDefaultPrivilegesDirective(line string) (jed.PrivilegeSet, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "default_privileges:")
+	if !ok {
+		return 0, false
+	}
+	return parsePrivSet(rest)
+}
+
+// privDelta is a parsed `# grant:` / `# revoke:` directive: a privilege set and the lowercased
+// object it applies to.
+type privDelta struct {
+	privs  jed.PrivilegeSet
+	object string
+}
+
+// parsePrivDelta parses a `PRIVS ON object` body (after the grant:/revoke: prefix is stripped): the
+// privilege set and the single-word object name after the ON keyword (spec/design/session.md §5.3).
+func parsePrivDelta(body string) (privDelta, bool) {
+	lower := strings.ToLower(body)
+	idx := strings.Index(lower, " on ")
+	if idx < 0 {
+		return privDelta{}, false
+	}
+	privs, ok := parsePrivSet(body[:idx])
+	if !ok {
+		return privDelta{}, false
+	}
+	object := strings.TrimSpace(body[idx+4:])
+	if object == "" || len(strings.Fields(object)) != 1 {
+		return privDelta{}, false
+	}
+	return privDelta{privs: privs, object: object}, true
+}
+
+// parseGrantDirective parses a `# grant: PRIVS ON object` directive line (spec/design/session.md §5.3).
+func parseGrantDirective(line string) (privDelta, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "grant:")
+	if !ok {
+		return privDelta{}, false
+	}
+	return parsePrivDelta(rest)
+}
+
+// parseRevokeDirective parses a `# revoke: PRIVS ON object` directive line (spec/design/session.md §5.3).
+func parseRevokeDirective(line string) (privDelta, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "revoke:")
+	if !ok {
+		return privDelta{}, false
+	}
+	return parsePrivDelta(rest)
+}
+
+// parseAllowDDLDirective parses a `# allow_ddl: on|off` directive line (spec/design/session.md §5.3):
+// whether DDL is permitted on the session for the next record.
+func parseAllowDDLDirective(line string) (bool, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "allow_ddl:")
+	if !ok {
+		return false, false
+	}
+	switch strings.ToLower(strings.TrimSpace(rest)) {
+	case "on", "true", "yes":
+		return true, true
+	case "off", "false", "no":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
 // parseSeedDirective parses a `# seed: N` directive line (spec/design/entropy.md §6): the fixed
 // PRNG seed (uint64) to run the next record under, making the uuid generators cross-core identical.
 func parseSeedDirective(line string) (uint64, bool) {
@@ -296,6 +394,12 @@ func runFile(text string) error {
 	var pendingSeed *uint64
 	var pendingClock *int64
 	var pendingClockAdvance *clockAdvance
+	// The session privilege envelope for the next record (spec/design/session.md §5.3); reset after
+	// each record so a directive never leaks forward. grant/revoke accumulate across lines.
+	var pendingDefaultPrivileges *jed.PrivilegeSet
+	var pendingGrants []privDelta
+	var pendingRevokes []privDelta
+	var pendingAllowDDL *bool
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
@@ -311,6 +415,14 @@ func runFile(text string) error {
 				pendingMaxCost = &n
 			} else if n, ok := parseMaxSQLLengthDirective(line); ok {
 				pendingMaxSQLLength = &n
+			} else if p, ok := parseDefaultPrivilegesDirective(line); ok {
+				pendingDefaultPrivileges = &p
+			} else if g, ok := parseGrantDirective(line); ok {
+				pendingGrants = append(pendingGrants, g)
+			} else if r, ok := parseRevokeDirective(line); ok {
+				pendingRevokes = append(pendingRevokes, r)
+			} else if a, ok := parseAllowDDLDirective(line); ok {
+				pendingAllowDDL = &a
 			} else if s, ok := parseSeedDirective(line); ok {
 				pendingSeed = &s
 			} else if c, ok := parseClockDirective(line); ok {
@@ -366,6 +478,27 @@ func runFile(text string) error {
 		}
 		pendingClock = nil
 		pendingClockAdvance = nil
+		// Apply the per-record session privilege envelope (spec/design/session.md §5.3): reset to fully
+		// permissive (every table privilege, DDL allowed), then layer the pending directives, so a
+		// # default_privileges: / # grant: / # revoke: / # allow_ddl: decorates only its record and
+		// never leaks forward.
+		db.ResetPrivileges()
+		if pendingDefaultPrivileges != nil {
+			db.SetDefaultPrivileges(*pendingDefaultPrivileges)
+		}
+		for _, g := range pendingGrants {
+			db.Grant(g.privs, g.object)
+		}
+		for _, r := range pendingRevokes {
+			db.Revoke(r.privs, r.object)
+		}
+		if pendingAllowDDL != nil {
+			db.SetAllowDDL(*pendingAllowDDL)
+		}
+		pendingDefaultPrivileges = nil
+		pendingGrants = nil
+		pendingRevokes = nil
+		pendingAllowDDL = nil
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "statement":

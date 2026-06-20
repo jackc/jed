@@ -333,6 +333,13 @@ var SupportedCapabilities = []string{
 	// network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
 	// calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).
 	"resource.pure_builtins",
+	// Session privileges — the GRANT/REVOKE envelope (per-table SELECT/INSERT/UPDATE/DELETE +
+	// function EXECUTE), enforced at name resolution with 42501; the # default_privileges: /
+	// # grant: / # revoke: directives configure the session (session.md §5.3).
+	"session.privileges",
+	// DDL gate — the single allow_ddl session capability governing CREATE/DROP/ALTER; a denied
+	// schema change is 42501. The # allow_ddl: directive sets it (session.md §5.3).
+	"session.allow_ddl",
 	// Phase 5 — explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes,
 	// failed-block poisoning (spec/design/transactions.md §4, grammar.md §27).
 	"txn.explicit",

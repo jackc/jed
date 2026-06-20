@@ -128,6 +128,12 @@ const (
 	// column without OVERRIDING SYSTEM VALUE (an INSERT), or assigning one (an UPDATE)
 	// (spec/design/sequences.md §13).
 	GeneratedAlways
+	// InsufficientPrivilege is 42501 — the session's authorization envelope withheld the privilege a
+	// statement needs: a per-table SELECT/INSERT/UPDATE/DELETE, a function EXECUTE, or DDL permission
+	// (allow_ddl) (spec/design/session.md §5.3). PostgreSQL's own permission-denied code; jed enforces
+	// it from the host-configured session envelope rather than an in-database role catalog
+	// (CLAUDE.md §3) — checked at name resolution, after the object resolves (a missing object is 42P01).
+	InsufficientPrivilege
 	// FeatureNotSupported is 0A000 (not-yet-implemented surface).
 	FeatureNotSupported
 	// ProgramLimitExceeded is 54000 — the input SQL text exceeded the per-handle maxSQLLength byte
@@ -246,6 +252,8 @@ func (s SqlState) Code() string {
 		return "428C9"
 	case DependentObjectsStillExist:
 		return "2BP01"
+	case InsufficientPrivilege:
+		return "42501"
 	case FeatureNotSupported:
 		return "0A000"
 	case ProgramLimitExceeded:

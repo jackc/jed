@@ -572,6 +572,14 @@ type SessionOptions struct {
 	MaxCost      int64
 	MaxSQLLength int
 	WorkMem      int
+	// DefaultPrivileges is the table-privilege set granted to every table — the GRANT … ON ALL TABLES
+	// default (spec/design/session.md §5.3). nil ⇒ all four (the default), so a fresh session is
+	// unrestricted; PrivSetEmpty.With(PrivSelect) is a read-only session. A pointer so the zero
+	// SessionOptions stays permissive (the empty set is a meaningful, distinct value).
+	DefaultPrivileges *PrivilegeSet
+	// AllowDDL governs whether DDL (CREATE/DROP/ALTER) is permitted; a denied schema change is 42501
+	// (§5.3). nil ⇒ on (the default). A pointer so the zero SessionOptions allows DDL.
+	AllowDDL *bool
 }
 
 // TxStatus is the session transaction status (spec/design/session.md §2.2) — PostgreSQL's three
@@ -650,6 +658,14 @@ type Session struct {
 	pendingCurrval map[string]int64
 	// pendingLastName is the per-STATEMENT running lastval update → flushed into sessionLastName.
 	pendingLastName string
+	// privileges is the authorization envelope (spec/design/session.md §5.3): the GRANT/REVOKE-style
+	// per-object privilege model the host configures and the engine enforces (42501) at name
+	// resolution. A fresh session is fully permissive (every table privilege, every function EXECUTE).
+	privileges Privileges
+	// allowDDL governs whether DDL (CREATE/DROP/ALTER) is permitted on this session (§5.3); a denied
+	// schema change is 42501. Default on — jed has no schema/owner model, so this single boolean gates
+	// all DDL (the per-object CREATE/ownership privilege is a deferred follow-on).
+	allowDDL bool
 }
 
 // newSession builds a fresh default session: no open transaction, default settings, empty state.
@@ -666,11 +682,20 @@ func newSessionWithOptions(opts SessionOptions) Session {
 	if opts.WorkMem == 0 {
 		opts.WorkMem = DefaultWorkMem
 	}
-	return Session{
+	s := Session{
 		maxCost:      opts.MaxCost,
 		maxSQLLength: opts.MaxSQLLength,
 		workMem:      opts.WorkMem,
+		privileges:   newPrivileges(),
+		allowDDL:     true,
 	}
+	if opts.DefaultPrivileges != nil {
+		s.privileges.SetDefaultTable(*opts.DefaultPrivileges)
+	}
+	if opts.AllowDDL != nil {
+		s.allowDDL = *opts.AllowDDL
+	}
+	return s
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
@@ -748,6 +773,44 @@ func (db *Database) Path() string { return db.path }
 // is unlimited. The primary guard for safely evaluating untrusted, user-supplied queries; a handle
 // setting, not stored in the file.
 func (db *Database) SetMaxCost(limit int64) { db.session.maxCost = limit }
+
+// SetDefaultPrivileges replaces the default session's default table-privilege set — the
+// GRANT … ON ALL TABLES default (spec/design/session.md §5.3). PrivSetEmpty.With(PrivSelect) makes
+// the session read-only (a write resolves to 42501). A handle setting, not stored in the file.
+func (db *Database) SetDefaultPrivileges(privs PrivilegeSet) {
+	db.session.privileges.SetDefaultTable(privs)
+}
+
+// Grant grants privs on a specific object (table or function) on the default session, beyond the
+// default (§5.3).
+func (db *Database) Grant(privs PrivilegeSet, object string) {
+	db.session.privileges.Grant(privs, object)
+}
+
+// Revoke revokes privs from a specific object on the default session (revoke wins over grant and the
+// default, §5.3).
+func (db *Database) Revoke(privs PrivilegeSet, object string) {
+	db.session.privileges.Revoke(privs, object)
+}
+
+// ResetPrivileges resets the default session's authorization envelope to fully permissive — every
+// table privilege, no per-object delta, DDL allowed (§5.3). The conformance harness calls this before
+// each record so a # default_privileges: / # grant: / # revoke: / # allow_ddl: directive never leaks
+// past the record it decorates.
+func (db *Database) ResetPrivileges() {
+	db.session.privileges = newPrivileges()
+	db.session.allowDDL = true
+}
+
+// Privileges is read-only access to the default session's authorization envelope (§5.3).
+func (db *Database) Privileges() *Privileges { return &db.session.privileges }
+
+// SetAllowDDL sets whether DDL is permitted on the default session (§5.3); a denied schema change is
+// 42501.
+func (db *Database) SetAllowDDL(allow bool) { db.session.allowDDL = allow }
+
+// AllowDDL reports whether DDL is permitted on the default session.
+func (db *Database) AllowDDL() bool { return db.session.allowDDL }
 
 // SetMaxSQLLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
 // §13; spec/design/api.md §8). A statement whose text exceeds bytes is rejected with 54000 at
@@ -864,6 +927,23 @@ func (s *Session) SetMaxSQLLength(b int) { s.maxSQLLength = b }
 // WorkMem / SetWorkMem — the work-memory budget in bytes (0 ⇒ unlimited).
 func (s *Session) WorkMem() int     { return s.workMem }
 func (s *Session) SetWorkMem(b int) { s.workMem = b }
+
+// SetDefaultPrivileges replaces the default table-privilege set — the GRANT … ON ALL TABLES default
+// (§5.3). A read-only session is PrivSetEmpty.With(PrivSelect).
+func (s *Session) SetDefaultPrivileges(privs PrivilegeSet) { s.privileges.SetDefaultTable(privs) }
+
+// Grant grants privs on a specific object (table or function), beyond the default (§5.3).
+func (s *Session) Grant(privs PrivilegeSet, object string) { s.privileges.Grant(privs, object) }
+
+// Revoke revokes privs from a specific object (revoke wins over grant and the default, §5.3).
+func (s *Session) Revoke(privs PrivilegeSet, object string) { s.privileges.Revoke(privs, object) }
+
+// Privileges is read-only access to this session's authorization envelope (§5.3).
+func (s *Session) Privileges() *Privileges { return &s.privileges }
+
+// AllowDDL / SetAllowDDL — whether DDL is permitted on this session (§5.3); a denied change is 42501.
+func (s *Session) AllowDDL() bool         { return s.allowDDL }
+func (s *Session) SetAllowDDL(allow bool) { s.allowDDL = allow }
 
 // SetRandomSource / ClearRandomSource — the uuid-generator entropy seam (entropy.md §6).
 func (s *Session) SetRandomSource(f RandomSource) { s.seam.SetRandom(f) }
@@ -1478,6 +1558,389 @@ func exprCallsSeqMutator(e *Expr) bool {
 	}
 }
 
+// privTableReq is one (table, required privilege) pair collected from a statement.
+type privTableReq struct {
+	name string
+	priv Privilege
+}
+
+// privReq is the privilege requirements collected from one statement (spec/design/session.md §5.3):
+// the per-table privileges, the named functions (each needs EXECUTE), and whether the statement is
+// DDL (gated by allowDDL). Collected by an exhaustive AST walk (mirroring exprCallsSeqMutator).
+type privReq struct {
+	tables    []privTableReq
+	functions []string
+	isDDL     bool
+}
+
+func (r *privReq) needTable(name string, p Privilege) {
+	r.tables = append(r.tables, privTableReq{name: name, priv: p})
+}
+func (r *privReq) needFunction(name string) { r.functions = append(r.functions, name) }
+
+// checkPrivileges enforces the session's authorization envelope for stmt (spec/design/session.md
+// §5.3). A fully-permissive session (the default) needs no check. Otherwise DDL is gated by allowDDL,
+// and DML requires a per-table privilege for each table it reads (SELECT) or writes
+// (INSERT/UPDATE/DELETE) and EXECUTE for each named function it calls. Enforcement is at name
+// resolution: a table privilege is required only for a name that resolves to an existing catalog
+// table (a missing table stays 42P01; a CTE / derived-table label is statement-local, not a catalog
+// object). Missing privilege → 42501.
+func (db *Database) checkPrivileges(stmt Statement) error {
+	if db.session.allowDDL && db.session.privileges.IsPermissive() {
+		return nil
+	}
+	var req privReq
+	collectStmtPrivs(stmt, &req)
+	if req.isDDL && !db.session.allowDDL {
+		return NewError(InsufficientPrivilege, "permission denied: DDL is not permitted in this session")
+	}
+	snap := db.readSnap()
+	for _, t := range req.tables {
+		key := strings.ToLower(t.name)
+		// Only a name that resolves to an existing catalog table is privilege-checked; a missing one is
+		// left to raise 42P01 in execution (existence before authorization).
+		if _, ok := snap.table(key); ok && !db.session.privileges.AllowsTable(key, t.priv) {
+			return NewError(InsufficientPrivilege, "permission denied for table "+key)
+		}
+	}
+	for _, fn := range req.functions {
+		key := strings.ToLower(fn)
+		if !db.session.privileges.AllowsFunction(key) {
+			return NewError(InsufficientPrivilege, "permission denied for function "+key)
+		}
+	}
+	return nil
+}
+
+// collectStmtPrivs collects the privilege requirements of stmt (spec/design/session.md §5.3).
+// Transaction control carries none (handled before dispatch); DDL just sets isDDL.
+func collectStmtPrivs(stmt Statement, req *privReq) {
+	locals := map[string]bool{}
+	switch {
+	case stmt.CreateTable != nil, stmt.DropTable != nil, stmt.CreateIndex != nil, stmt.DropIndex != nil,
+		stmt.CreateType != nil, stmt.DropType != nil, stmt.CreateSequence != nil, stmt.DropSequence != nil,
+		stmt.AlterSequence != nil:
+		req.isDDL = true
+	case stmt.Insert != nil:
+		collectInsertPrivs(stmt.Insert, req, locals)
+	case stmt.Select != nil:
+		collectSelectPrivs(stmt.Select, req, locals)
+	case stmt.SetOp != nil:
+		collectSetopPrivs(stmt.SetOp, req, locals)
+	case stmt.With != nil:
+		collectWithPrivs(stmt.With, req, locals)
+	case stmt.Update != nil:
+		collectUpdatePrivs(stmt.Update, req, locals)
+	case stmt.Delete != nil:
+		collectDeletePrivs(stmt.Delete, req, locals)
+	}
+}
+
+func collectInsertPrivs(ins *Insert, req *privReq, locals map[string]bool) {
+	// The write target needs INSERT. A bare INSERT … VALUES reads nothing (the slots are literals /
+	// params), so it needs only INSERT; an INSERT … SELECT source needs SELECT on its tables.
+	req.needTable(ins.Table, PrivInsert)
+	if ins.Select != nil {
+		collectSelectPrivs(ins.Select, req, locals)
+	}
+	if ins.OnConflict != nil && ins.OnConflict.DoUpdate {
+		for i := range ins.OnConflict.Assignments {
+			collectExprPrivs(&ins.OnConflict.Assignments[i].Value, req, locals)
+		}
+		if ins.OnConflict.Filter != nil {
+			collectExprPrivs(ins.OnConflict.Filter, req, locals)
+		}
+	}
+	collectItemsPrivs(ins.Returning, req, locals)
+}
+
+func collectUpdatePrivs(upd *Update, req *privReq, locals map[string]bool) {
+	req.needTable(upd.Table, PrivUpdate)
+	// SELECT on the target if it reads any column — a WHERE, a RETURNING, or a column/subquery-
+	// referencing assignment RHS (a constant-only SET a = 1 with no WHERE/RETURNING reads nothing).
+	reads := upd.Filter != nil || upd.Returning != nil
+	for i := range upd.Assignments {
+		if exprReadsColumns(&upd.Assignments[i].Value) {
+			reads = true
+		}
+	}
+	if reads {
+		req.needTable(upd.Table, PrivSelect)
+	}
+	for i := range upd.Assignments {
+		collectExprPrivs(&upd.Assignments[i].Value, req, locals)
+	}
+	if upd.Filter != nil {
+		collectExprPrivs(upd.Filter, req, locals)
+	}
+	collectItemsPrivs(upd.Returning, req, locals)
+}
+
+func collectDeletePrivs(del *Delete, req *privReq, locals map[string]bool) {
+	req.needTable(del.Table, PrivDelete)
+	// DELETE reads the target's columns through a WHERE or a RETURNING.
+	if del.Filter != nil || del.Returning != nil {
+		req.needTable(del.Table, PrivSelect)
+	}
+	if del.Filter != nil {
+		collectExprPrivs(del.Filter, req, locals)
+	}
+	collectItemsPrivs(del.Returning, req, locals)
+}
+
+func collectQueryPrivs(qe *QueryExpr, req *privReq, locals map[string]bool) {
+	if qe.Select != nil {
+		collectSelectPrivs(qe.Select, req, locals)
+	} else if qe.SetOp != nil {
+		collectSetopPrivs(qe.SetOp, req, locals)
+	}
+}
+
+func collectSetopPrivs(so *SetOp, req *privReq, locals map[string]bool) {
+	collectQueryPrivs(&so.Lhs, req, locals)
+	collectQueryPrivs(&so.Rhs, req, locals)
+}
+
+func collectWithPrivs(wq *WithQuery, req *privReq, locals map[string]bool) {
+	// A CTE name shadows a base table inside the WITH (a FROM <cte> is not a catalog object), so it is
+	// added to the local scope and never privilege-checked. Forward-only visibility: each CTE body
+	// sees the CTE names declared before it.
+	scope := map[string]bool{}
+	for k := range locals {
+		scope[k] = true
+	}
+	for i := range wq.Ctes {
+		collectQueryPrivs(&wq.Ctes[i].Query, req, scope)
+		scope[strings.ToLower(wq.Ctes[i].Name)] = true
+	}
+	collectQueryPrivs(&wq.Body, req, scope)
+}
+
+func collectSelectPrivs(s *Select, req *privReq, locals map[string]bool) {
+	if s.From != nil {
+		collectTableRefPrivs(s.From, req, locals)
+	}
+	for i := range s.Joins {
+		collectTableRefPrivs(&s.Joins[i].Table, req, locals)
+		if s.Joins[i].On != nil {
+			collectExprPrivs(s.Joins[i].On, req, locals)
+		}
+	}
+	for i := range s.Items.Items {
+		collectExprPrivs(&s.Items.Items[i].Expr, req, locals)
+	}
+	if s.Filter != nil {
+		collectExprPrivs(s.Filter, req, locals)
+	}
+	for i := range s.GroupBy {
+		collectExprPrivs(&s.GroupBy[i], req, locals)
+	}
+	if s.Having != nil {
+		collectExprPrivs(s.Having, req, locals)
+	}
+}
+
+func collectTableRefPrivs(t *TableRef, req *privReq, locals map[string]bool) {
+	switch {
+	case t.IsFunc:
+		// A set-returning function used as a row source — EXECUTE on the function; its args are exprs.
+		req.needFunction(t.Name)
+		for _, a := range t.Args {
+			collectExprPrivs(a, req, locals)
+		}
+	case t.Subquery != nil:
+		collectQueryPrivs(t.Subquery, req, locals)
+	case t.Values != nil:
+		for _, row := range t.Values {
+			for _, e := range row {
+				collectExprPrivs(e, req, locals)
+			}
+		}
+	default:
+		// A base-table reference (not a CTE / derived-table label) — needs SELECT.
+		if !locals[strings.ToLower(t.Name)] {
+			req.needTable(t.Name, PrivSelect)
+		}
+	}
+}
+
+func collectItemsPrivs(items *SelectItems, req *privReq, locals map[string]bool) {
+	if items == nil {
+		return
+	}
+	for i := range items.Items {
+		collectExprPrivs(&items.Items[i].Expr, req, locals)
+	}
+}
+
+// collectExprPrivs is exhaustive over Expr (mirroring exprCallsSeqMutator): collect every named
+// function call (EXECUTE) and walk every subquery (its tables need SELECT).
+func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
+	switch e.Kind {
+	case ExprFuncCall:
+		req.needFunction(e.FuncCall.Name)
+		for _, a := range e.FuncCall.Args {
+			collectExprPrivs(a, req, locals)
+		}
+	case ExprColumn, ExprQualifiedColumn, ExprLiteral, ExprTypedLiteral, ExprParam:
+		// leaf — nothing to collect
+	case ExprRow, ExprArray:
+		for i := range e.RowItems {
+			collectExprPrivs(&e.RowItems[i], req, locals)
+		}
+	case ExprFieldAccess, ExprFieldStar:
+		collectExprPrivs(e.Base, req, locals)
+	case ExprSubscript:
+		collectExprPrivs(e.Base, req, locals)
+		for i := range e.Subscripts {
+			sub := &e.Subscripts[i]
+			if sub.Index != nil {
+				collectExprPrivs(sub.Index, req, locals)
+			}
+			if sub.Lower != nil {
+				collectExprPrivs(sub.Lower, req, locals)
+			}
+			if sub.Upper != nil {
+				collectExprPrivs(sub.Upper, req, locals)
+			}
+		}
+	case ExprCast:
+		collectExprPrivs(&e.Cast.Inner, req, locals)
+	case ExprUnary:
+		collectExprPrivs(&e.Unary.Operand, req, locals)
+	case ExprIsNull:
+		collectExprPrivs(&e.IsNullOf.Operand, req, locals)
+	case ExprBinary:
+		collectExprPrivs(&e.Binary.Lhs, req, locals)
+		collectExprPrivs(&e.Binary.Rhs, req, locals)
+	case ExprIsDistinct:
+		collectExprPrivs(&e.IsDistinct.Lhs, req, locals)
+		collectExprPrivs(&e.IsDistinct.Rhs, req, locals)
+	case ExprLike:
+		collectExprPrivs(&e.Like.Lhs, req, locals)
+		collectExprPrivs(&e.Like.Rhs, req, locals)
+	case ExprIn:
+		collectExprPrivs(&e.In.Lhs, req, locals)
+		for i := range e.In.List {
+			collectExprPrivs(&e.In.List[i], req, locals)
+		}
+	case ExprBetween:
+		collectExprPrivs(&e.Between.Lhs, req, locals)
+		collectExprPrivs(&e.Between.Lo, req, locals)
+		collectExprPrivs(&e.Between.Hi, req, locals)
+	case ExprCase:
+		if e.Case.Operand != nil {
+			collectExprPrivs(e.Case.Operand, req, locals)
+		}
+		for i := range e.Case.Whens {
+			collectExprPrivs(&e.Case.Whens[i].Cond, req, locals)
+			collectExprPrivs(&e.Case.Whens[i].Result, req, locals)
+		}
+		if e.Case.Els != nil {
+			collectExprPrivs(e.Case.Els, req, locals)
+		}
+	case ExprScalarSubquery, ExprExists:
+		collectQueryPrivs(e.Subquery, req, locals)
+	case ExprInSubquery:
+		collectExprPrivs(&e.InSubquery.Lhs, req, locals)
+		collectQueryPrivs(&e.InSubquery.Query, req, locals)
+	case ExprQuantifiedSubquery:
+		collectExprPrivs(&e.QuantifiedSubquery.Lhs, req, locals)
+		collectQueryPrivs(&e.QuantifiedSubquery.Query, req, locals)
+	case ExprQuantified:
+		collectExprPrivs(&e.Quantified.Lhs, req, locals)
+		collectExprPrivs(&e.Quantified.Array, req, locals)
+	}
+}
+
+// exprReadsColumns reports whether e reads a stored column or a subquery's rows — the trigger for an
+// UPDATE's SELECT requirement on its target (spec/design/session.md §5.3). A column reference or any
+// subquery counts; a pure constant / parameter expression does not. Exhaustive over Expr.
+func exprReadsColumns(e *Expr) bool {
+	switch e.Kind {
+	case ExprColumn, ExprQualifiedColumn:
+		return true
+	case ExprScalarSubquery, ExprExists, ExprInSubquery, ExprQuantifiedSubquery:
+		return true
+	case ExprLiteral, ExprTypedLiteral, ExprParam:
+		return false
+	case ExprRow, ExprArray:
+		for i := range e.RowItems {
+			if exprReadsColumns(&e.RowItems[i]) {
+				return true
+			}
+		}
+		return false
+	case ExprFieldAccess, ExprFieldStar:
+		return exprReadsColumns(e.Base)
+	case ExprSubscript:
+		if exprReadsColumns(e.Base) {
+			return true
+		}
+		for i := range e.Subscripts {
+			sub := &e.Subscripts[i]
+			if sub.Index != nil && exprReadsColumns(sub.Index) {
+				return true
+			}
+			if sub.Lower != nil && exprReadsColumns(sub.Lower) {
+				return true
+			}
+			if sub.Upper != nil && exprReadsColumns(sub.Upper) {
+				return true
+			}
+		}
+		return false
+	case ExprCast:
+		return exprReadsColumns(&e.Cast.Inner)
+	case ExprUnary:
+		return exprReadsColumns(&e.Unary.Operand)
+	case ExprIsNull:
+		return exprReadsColumns(&e.IsNullOf.Operand)
+	case ExprFuncCall:
+		for _, a := range e.FuncCall.Args {
+			if exprReadsColumns(a) {
+				return true
+			}
+		}
+		return false
+	case ExprBinary:
+		return exprReadsColumns(&e.Binary.Lhs) || exprReadsColumns(&e.Binary.Rhs)
+	case ExprIsDistinct:
+		return exprReadsColumns(&e.IsDistinct.Lhs) || exprReadsColumns(&e.IsDistinct.Rhs)
+	case ExprLike:
+		return exprReadsColumns(&e.Like.Lhs) || exprReadsColumns(&e.Like.Rhs)
+	case ExprIn:
+		if exprReadsColumns(&e.In.Lhs) {
+			return true
+		}
+		for i := range e.In.List {
+			if exprReadsColumns(&e.In.List[i]) {
+				return true
+			}
+		}
+		return false
+	case ExprBetween:
+		return exprReadsColumns(&e.Between.Lhs) || exprReadsColumns(&e.Between.Lo) || exprReadsColumns(&e.Between.Hi)
+	case ExprCase:
+		if e.Case.Operand != nil && exprReadsColumns(e.Case.Operand) {
+			return true
+		}
+		for i := range e.Case.Whens {
+			if exprReadsColumns(&e.Case.Whens[i].Cond) || exprReadsColumns(&e.Case.Whens[i].Result) {
+				return true
+			}
+		}
+		if e.Case.Els != nil && exprReadsColumns(e.Case.Els) {
+			return true
+		}
+		return false
+	case ExprQuantified:
+		return exprReadsColumns(&e.Quantified.Lhs) || exprReadsColumns(&e.Quantified.Array)
+	default:
+		return false
+	}
+}
+
 // stmtKind is a short label for a statement kind, for the 25006 read-only-violation message (the
 // message text is informational — never matched; spec/design/conformance.md §2).
 func stmtKind(stmt Statement) string {
@@ -1514,6 +1977,14 @@ func stmtKind(stmt Statement) string {
 // dispatchStmt routes one parsed statement to its executor. The autocommit transaction handling
 // (capture / durable commit / rollback-on-error) lives in ExecuteStmtParams.
 func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error) {
+	// Authorization (spec/design/session.md §5.3): enforce the session's privilege envelope before the
+	// statement runs — DDL gated by allowDDL, DML by per-table/per-function privileges, all 42501.
+	// Skipped on a fully-permissive session (the default), so the common path pays nothing. The
+	// physical access-mode gate (25006) is checked earlier in ExecuteStmtParams, so it wins when both
+	// apply.
+	if err := db.checkPrivileges(stmt); err != nil {
+		return Outcome{}, err
+	}
 	switch {
 	case stmt.CreateTable != nil:
 		if err := rejectParamsForDDL(params); err != nil {
