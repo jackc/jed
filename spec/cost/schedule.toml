@@ -183,3 +183,21 @@ event  = "one GIN posting-list entry visited during a GIN-bounded scan's term ga
 # proportional and a max_cost ceiling aborts it (54P01). Distinct from `storage_row_read` (charged
 # only per CANDIDATE row actually fetched after the combine) and from `page_read` (the index/table
 # tree NODE count). Charged at the identical per-entry point in every core (CLAUDE.md §8/§13).
+
+[[unit]]
+id     = "collate"
+weight = 1
+event  = "one code point processed while building a collation sort key for a collated comparison"
+# Landed with the COLLATE expression operator (../design/collation.md §11, ../design/cost.md §3
+# "collate"; collation slice 1c). A non-`C` collation orders text by its UCA sort key rather than
+# raw bytes; building that key is per-code-point work the byte comparator does not do. This unit
+# fires once per code point of EACH text operand of a collated ORDERING comparison (`< <= > >=`)
+# at the point the comparison is evaluated — so a collated `WHERE`/`SELECT` comparison over long
+# strings or many rows stays cost-proportional and a max_cost ceiling aborts it (54P01). It is
+# charged ONLY for the ordering comparisons that actually invoke the collation: `=`/`<>` under a
+# deterministic collation are byte-equality (../design/collation.md §7) and charge nothing beyond
+# their operator_eval; a `C`/default comparison charges nothing here. The ORDER BY sort itself is
+# UNMETERED like every sort (../design/cost.md §3, ../design/spill.md §6) — its input cardinality
+# is bounded by the upstream storage_row_read / row_produced — so the collate unit lives at the
+# expression-evaluation site, the one deterministic metering point (collation.md §11). Charged at
+# the identical per-code-point point in every core, so cost stays cross-core identical (§8/§13).

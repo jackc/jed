@@ -52,8 +52,9 @@ The core seam units, all weight `1`:
 `aggregate_accumulate` unit, [../cost/schedule.toml](../cost/schedule.toml), is metered in
 the aggregates path, the `value_compress`/`value_decompress` units — §3 "the compression
 units" — in the large-value codec paths, the `decimal_work` unit — §3 "`decimal_work`"
-— in the decimal arithmetic/comparison evaluations, and the `gin_entry` unit — §3
-"GIN-bounded scan" — in the GIN index gather.) The weights are uniform on purpose — phase 1 proves the seam reads
+— in the decimal arithmetic/comparison evaluations, the `gin_entry` unit — §3
+"GIN-bounded scan" — in the GIN index gather, and the `collate` unit — §3 "`collate`" —
+in a collated comparison's sort-key build.) The weights are uniform on purpose — phase 1 proves the seam reads
 cost from **data**; tuning the numbers later is a data-only change touching no executor code.
 
 ## 3. Accrual rules (the cross-core determinism contract)
@@ -385,6 +386,30 @@ build scan — `page_read` × the table's node count + `storage_row_read` per ro
 column's overflow-chain `page_read` / `value_decompress` if its values spilled (the build's touched
 set is the array column, which **can** be large — unlike the fixed-width ordered build); an empty
 table charges 0, `DROP INDEX` charges 0.
+
+### `collate` — a non-`C` collation's per-code-point sort-key work
+
+A non-`C` collation ([collation.md](collation.md)) orders text by its **UCA sort key** rather than
+raw bytes; building that key is per-code-point work the byte comparator does not do. The **`collate`**
+unit (weight 1) is charged at the **comparison-operator evaluation** site — the deterministic,
+cross-core-identical metering point:
+
+- A collated **ORDERING** comparison (`< <= > >=`, i.e. `RExpr::Compare` whose derived collation is a
+  loaded non-`C` table) over two **non-NULL text** operands charges `collate × (codepoints(lhs) +
+  codepoints(rhs))` — code points, **not** UTF-16 units or bytes (the cross-core count, collation.md
+  §6 / CLAUDE.md §8) — *in addition to* the node's one `operator_eval`. The charge is guarded
+  immediately, so a cost ceiling aborts a runaway collated comparison (54P01).
+- **`=`/`<>` charge no `collate`** even under a collation: deterministic-collation equality **is**
+  byte-identity (collation.md §7), so they take the plain `eq3` path. A `C` / default comparison
+  (collation `None`) charges nothing here either.
+- A **NULL** operand charges no `collate` (the comparison is Unknown before any sort key is built).
+- The **`ORDER BY` sort is unmetered**, like every sort ("What is NOT metered" below, spill.md §6):
+  a collated `ORDER BY` materializes its survivors and sorts them with a **decorate** sorter that
+  builds each row's sort key **exactly once** (no `O(n log n)` recompute), but charges no `collate` —
+  its input cardinality is already bounded by the upstream `storage_row_read` / `row_produced`. (The
+  set-operation sort path carries no `Meter` at all, so the comparison evaluator is the one
+  consistent, meterable site — collation.md §11.) Pinned cross-core by `# cost:` assertions in
+  `spec/conformance/suites/collation/collate.test`.
 
 **Bounded scan / JOIN — each base table bounded by its own PK predicate.** In a multi-table FROM
 each base table is materialized independently (see "JOIN" below), so each is bounded **on its own**

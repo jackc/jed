@@ -249,6 +249,32 @@ func Lex(sql string) ([]Token, error) {
 				return nil, NewError(SyntaxError, "unterminated string literal")
 			}
 			tokens = append(tokens, Token{Kind: TokStr, Word: string(sb)})
+		case c == '"':
+			// Double-quoted identifier (collation names, spec/design/collation.md §1). `""` is an
+			// embedded double quote; the content is kept VERBATIM (case-sensitive). `"` is ASCII, so
+			// copying raw bytes between quotes preserves UTF-8 validity. The parser rejects an empty
+			// name; an empty `""` lexes fine here.
+			i++ // consume the opening quote
+			var sb []byte
+			closed := false
+			for i < len(b) {
+				if b[i] == '"' {
+					if i+1 < len(b) && b[i+1] == '"' {
+						sb = append(sb, '"')
+						i += 2
+						continue
+					}
+					i++ // consume the closing quote
+					closed = true
+					break
+				}
+				sb = append(sb, b[i])
+				i++
+			}
+			if !closed {
+				return nil, NewError(SyntaxError, "unterminated quoted identifier")
+			}
+			tokens = append(tokens, Token{Kind: TokQuotedIdent, Word: string(sb)})
 		case isDigit(c):
 			// A numeric literal. Scan the integer digits; a following '.' and/or scientific
 			// e-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise an

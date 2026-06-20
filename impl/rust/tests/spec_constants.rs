@@ -454,6 +454,7 @@ fn cost_schedule_matches_spec() {
             "cte_scan_row" => COSTS.cte_scan_row,
             "sequence_advance" => COSTS.sequence_advance,
             "gin_entry" => COSTS.gin_entry,
+            "collate" => COSTS.collate,
             other => panic!("cost unit {other} has no COSTS field — update this cross-check"),
         }
     };

@@ -1923,6 +1923,14 @@ impl Parser {
         self.expect_keyword("by")?;
         loop {
             let (qualifier, column) = self.parse_column_ref()?;
+            // Optional `COLLATE "name"` on the sort key (`ORDER BY name COLLATE "en-US"`,
+            // spec/design/collation.md §1), between the column and the ASC/DESC direction (PG order).
+            let collation = if self.peek_keyword().as_deref() == Some("collate") {
+                self.advance();
+                Some(self.expect_collation_name()?)
+            } else {
+                None
+            };
             let descending = match self.peek_keyword().as_deref() {
                 Some("asc") => {
                     self.advance();
@@ -1960,6 +1968,7 @@ impl Parser {
             keys.push(OrderKey {
                 qualifier,
                 column,
+                collation,
                 descending,
                 nulls_first,
             });
@@ -2468,16 +2477,30 @@ impl Parser {
         loop {
             // each postfix `::`/`[…]`/`.field` wraps the base in one more AST level; deepen only
             // when a postfix actually follows (not on the terminating non-postfix token).
+            // `COLLATE "name"` is a postfix operator (spec/design/collation.md §1) sharing this
+            // rung with `::`/`[]`/`.field` — so it binds tighter than `||` and the comparisons
+            // (PG precedence) and chains left-to-right (`a::text COLLATE "C"`, `t.c COLLATE "x"`).
+            let is_collate = matches!(self.peek(), Token::Word(_))
+                && self.peek_keyword().as_deref() == Some("collate");
             let is_postfix = match self.peek() {
                 Token::DoubleColon | Token::LBracket => true,
                 Token::Dot => field_accessible,
-                _ => false,
+                _ => is_collate,
             };
             if !is_postfix {
                 break;
             }
             self.deepen()?;
             match self.peek() {
+                _ if is_collate => {
+                    self.advance(); // COLLATE
+                    let collation = self.expect_collation_name()?;
+                    expr = Expr::Collate {
+                        inner: Box::new(expr),
+                        collation,
+                    };
+                    field_accessible = false;
+                }
                 Token::DoubleColon => {
                     self.advance();
                     let base_type = self.expect_identifier()?;
@@ -2957,6 +2980,19 @@ impl Parser {
         }
     }
 
+    /// Consume a quoted collation name after `COLLATE` (spec/design/collation.md §1). The name is a
+    /// double-quoted identifier — case-sensitive and kept verbatim (`"C"`, `"en-US"`), so a bare
+    /// word is not accepted (it would case-fold). An empty name (`""`) is a 42601 syntax error.
+    fn expect_collation_name(&mut self) -> Result<String> {
+        match self.advance() {
+            Token::QuotedIdent(s) if !s.is_empty() => Ok(s),
+            Token::QuotedIdent(_) => Err(syntax("collation name may not be empty".to_string())),
+            other => Err(syntax(format!(
+                "expected a quoted collation name after COLLATE, found {other:?}"
+            ))),
+        }
+    }
+
     /// Require that all input has been consumed.
     pub fn expect_eof(&self) -> Result<()> {
         match self.peek() {
@@ -3000,6 +3036,9 @@ fn render_token(t: &Token) -> String {
             format!("{}.{}", &coeff[..split], &coeff[split..])
         }
         Token::Str(s) => format!("'{}'", s.replace('\'', "''")),
+        // A double-quoted identifier round-trips verbatim with `"` doubled (collation names in a
+        // persisted COLLATE expression, spec/design/collation.md §1).
+        Token::QuotedIdent(s) => format!("\"{}\"", s.replace('"', "\"\"")),
         Token::Param(n) => format!("${n}"),
         Token::Comma => ",".into(),
         Token::Dot => ".".into(),

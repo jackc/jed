@@ -1887,6 +1887,13 @@ class Parser {
     this.expectKeyword("by");
     for (;;) {
       const [qualifier, column] = this.parseColumnRef();
+      // Optional `COLLATE "name"` on the sort key (spec/design/collation.md §1), between the column
+      // and the ASC/DESC direction (PG order).
+      let collation: string | null = null;
+      if (this.peekKeyword() === "collate") {
+        this.advance();
+        collation = this.expectCollationName();
+      }
       let descending = false;
       if (this.peekKeyword() === "asc") {
         this.advance();
@@ -1912,7 +1919,7 @@ class Parser {
           );
         }
       }
-      keys.push({ qualifier, column, descending, nullsFirst });
+      keys.push({ qualifier, column, collation, descending, nullsFirst });
       if (this.peek().kind === "comma") {
         this.advance();
         continue;
@@ -2330,15 +2337,23 @@ class Parser {
     let expr = this.parsePrimary();
     for (;;) {
       const k = this.peek().kind;
-      // each postfix `::`/`[…]`/`.field` wraps the base in one more AST level; deepen only when a
-      // postfix actually follows (not on the terminating non-postfix token).
+      // each postfix `::`/`[…]`/`.field`/COLLATE wraps the base in one more AST level; deepen only
+      // when a postfix actually follows. COLLATE shares this rung so it binds tighter than || and the
+      // comparisons (PG precedence).
+      const isCollate = k === "word" && this.peekKeyword() === "collate";
       const isPostfix =
         k === "doubleColon" ||
         k === "lbracket" ||
-        (k === "dot" && fieldAccessible);
+        (k === "dot" && fieldAccessible) ||
+        isCollate;
       if (!isPostfix) break;
       this.deepen();
-      if (k === "doubleColon") {
+      if (isCollate) {
+        this.advance(); // COLLATE
+        const collation = this.expectCollationName();
+        expr = { kind: "collate", inner: expr, collation };
+        fieldAccessible = false;
+      } else if (k === "doubleColon") {
         this.advance();
         const baseType = this.expectIdentifier();
         const typeMod = this.parseTypeMod();
@@ -2729,6 +2744,23 @@ class Parser {
     return t.word!;
   }
 
+  // expectCollationName consumes a quoted collation name after COLLATE (spec/design/collation.md §1).
+  // The name is a double-quoted identifier — case-sensitive and kept verbatim ("C", "en-US") — so a
+  // bare word is not accepted (it would case-fold). An empty name ("") is a 42601 syntax error.
+  private expectCollationName(): string {
+    const t = this.advance();
+    if (t.kind !== "quotedIdent") {
+      throw engineError(
+        "syntax_error",
+        "expected a quoted collation name after COLLATE",
+      );
+    }
+    if (t.str === "") {
+      throw engineError("syntax_error", "collation name may not be empty");
+    }
+    return t.str!;
+  }
+
   expectEof(): void {
     if (this.peek().kind !== "eof") {
       throw engineError("syntax_error", "unexpected trailing input");
@@ -2771,6 +2803,10 @@ function renderToken(t: Token): string {
     }
     case "str":
       return "'" + t.str!.replaceAll("'", "''") + "'";
+    case "quotedIdent":
+      // A double-quoted identifier round-trips verbatim with `"` doubled (collation names in a
+      // persisted COLLATE expression, spec/design/collation.md §1).
+      return '"' + t.str!.replaceAll('"', '""') + '"';
     case "param":
       return "$" + t.paramIndex!.toString();
     case "comma":

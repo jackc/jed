@@ -2382,6 +2382,16 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 		if err != nil {
 			return err
 		}
+		// Optional `COLLATE "name"` on the sort key (spec/design/collation.md §1), between the
+		// column and the ASC/DESC direction (PG order).
+		collation := ""
+		if p.peekKeyword() == "collate" {
+			p.advance()
+			collation, err = p.expectCollationName()
+			if err != nil {
+				return err
+			}
+		}
 		descending := false
 		switch p.peekKeyword() {
 		case "asc":
@@ -2406,7 +2416,7 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 				return NewError(SyntaxError, "NULLS must be followed by FIRST or LAST")
 			}
 		}
-		sel.OrderBy = append(sel.OrderBy, OrderKey{Qualifier: qualifier, Column: col, Descending: descending, NullsFirst: nullsFirst})
+		sel.OrderBy = append(sel.OrderBy, OrderKey{Qualifier: qualifier, Column: col, Collation: collation, Descending: descending, NullsFirst: nullsFirst})
 		if p.peek().Kind == TokComma {
 			p.advance()
 			continue
@@ -3025,10 +3035,12 @@ func (p *Parser) parsePostfix() (Expr, error) {
 		return Expr{}, err
 	}
 	for {
-		// each postfix `::`/`[…]`/`.field` wraps the base in one more AST level; deepen only when
-		// a postfix actually follows (not on the terminating non-postfix token).
+		// each postfix `::`/`[…]`/`.field`/COLLATE wraps the base in one more AST level; deepen only
+		// when a postfix actually follows (not on the terminating non-postfix token). COLLATE shares
+		// this rung so it binds tighter than `||` and the comparisons (PG precedence).
+		isCollate := p.peek().Kind == TokWord && p.peekKeyword() == "collate"
 		isPostfix := p.peek().Kind == TokDoubleColon || p.peek().Kind == TokLBracket ||
-			(p.peek().Kind == TokDot && fieldAccessible)
+			(p.peek().Kind == TokDot && fieldAccessible) || isCollate
 		if !isPostfix {
 			p.depth = base0
 			return expr, nil
@@ -3037,6 +3049,14 @@ func (p *Parser) parsePostfix() (Expr, error) {
 			return Expr{}, err
 		}
 		switch {
+		case isCollate:
+			p.advance() // COLLATE
+			name, err := p.expectCollationName()
+			if err != nil {
+				return Expr{}, err
+			}
+			expr = Expr{Kind: ExprCollate, Collate: &CollateExpr{Inner: expr, Collation: name}}
+			fieldAccessible = false
 		case p.peek().Kind == TokDoubleColon:
 			p.advance()
 			typeName, err := p.expectIdentifier()
@@ -3551,6 +3571,20 @@ func (p *Parser) expectIdentifier() (string, error) {
 	return t.Word, nil
 }
 
+// expectCollationName consumes a quoted collation name after COLLATE (spec/design/collation.md §1).
+// The name is a double-quoted identifier — case-sensitive and kept verbatim ("C", "en-US") — so a
+// bare word is not accepted (it would case-fold). An empty name ("") is a 42601 syntax error.
+func (p *Parser) expectCollationName() (string, error) {
+	t := p.advance()
+	if t.Kind != TokQuotedIdent {
+		return "", NewError(SyntaxError, "expected a quoted collation name after COLLATE")
+	}
+	if t.Word == "" {
+		return "", NewError(SyntaxError, "collation name may not be empty")
+	}
+	return t.Word, nil
+}
+
 // expectEof requires that all input has been consumed.
 func (p *Parser) expectEof() error {
 	if p.peek().Kind != TokEof {
@@ -3616,6 +3650,10 @@ func renderToken(t Token) string {
 		return t.Word[:split] + "." + t.Word[split:]
 	case TokStr:
 		return "'" + strings.ReplaceAll(t.Word, "'", "''") + "'"
+	case TokQuotedIdent:
+		// A double-quoted identifier round-trips verbatim with `"` doubled (collation names in a
+		// persisted COLLATE expression, spec/design/collation.md §1).
+		return "\"" + strings.ReplaceAll(t.Word, "\"", "\"\"") + "\""
 	case TokParam:
 		return "$" + strconv.FormatUint(t.Int, 10)
 	case TokComma:

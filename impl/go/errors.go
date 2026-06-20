@@ -115,6 +115,11 @@ const (
 	// WrongObjectType is 42809 — DROP TABLE of an index name, DROP INDEX of a table name
 	// (spec/design/indexes.md §2).
 	WrongObjectType
+	// CollationMismatch is 42P21 — two DIFFERENT explicit collations combined in one comparison
+	// ('a' COLLATE "C" < 'b' COLLATE "en-US"; spec/design/collation.md §1/§7). PG's separate 42P22
+	// (indeterminate_collation — conflicting IMPLICIT collations) is reachable once per-column
+	// collations land in slice 1d.
+	CollationMismatch
 	// DependentObjectsStillExist is 2BP01 — DROP TYPE ... RESTRICT of a composite type a
 	// table column or another composite field still references (spec/design/composite.md §7).
 	DependentObjectsStillExist
@@ -251,6 +256,8 @@ func (s SqlState) Code() string {
 		return "42710"
 	case WrongObjectType:
 		return "42809"
+	case CollationMismatch:
+		return "42P21"
 	case NameTooLong:
 		return "42622"
 	case GeneratedAlways:

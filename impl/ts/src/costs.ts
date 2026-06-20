@@ -20,6 +20,7 @@ export interface CostSchedule {
   generatedRow: bigint;
   sequenceAdvance: bigint;
   ginEntry: bigint;
+  collate: bigint;
 }
 
 // The canonical cost schedule — weights accrued per unit during query execution.
@@ -36,4 +37,5 @@ export const COSTS: CostSchedule = {
   generatedRow: 1n,
   sequenceAdvance: 1n,
   ginEntry: 1n,
+  collate: 1n,
 };

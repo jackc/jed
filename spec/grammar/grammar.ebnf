@@ -599,7 +599,16 @@ select_item    ::= expr ("AS" identifier)?
  * of direction. "NULLS" not followed by FIRST | LAST is a syntax error (42601). */
 order_by       ::= "ORDER" "BY" sort_key ("," sort_key)*
 
-sort_key       ::= column_ref ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
+/* A sort_key may carry an explicit "COLLATE name" between the column and the direction
+ * (../design/collation.md §1): the column must be text (42804) and the collation must be
+ * loaded ("C" else db.ImportCollation, 42704); it orders this key by that collation's UCA
+ * sort key. */
+sort_key       ::= column_ref collate_clause? ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
+
+/* The COLLATE postfix operator: "name" is a double-quoted identifier (case-sensitive,
+ * e.g. "C", "en-US"). It binds at the postfix/typecast level (with "::", "[]", ".field"),
+ * so tighter than "||" and the comparisons (PostgreSQL precedence). ../design/collation.md §1. */
+collate_clause ::= "COLLATE" quoted_identifier
 
 /* LIMIT and OFFSET cap and skip output rows. They may appear in EITHER order, and
  * each clause AT MOST ONCE — a repeat (e.g. "LIMIT 1 LIMIT 2") is a syntax error
@@ -727,8 +736,13 @@ unary          ::= "-" unary
  * lookup is case-insensitive; an unknown field is 42703, a non-composite base 42809, ".*" in a
  * scalar position 0A000. NB: the grammar below writes the postfix uniformly, but the parens-required
  * rule is a hand-written-parser SEMANTIC gate (a "field_accessible" flag set true only for a
- * parenthesized primary and after each ".field"), not expressible as pure EBNF. */
-postfix        ::= primary ( "::" type_name | "." identifier | "." "*" | subscript )*
+ * parenthesized primary and after each ".field"), not expressible as pure EBNF.
+ *   COLLATE (../design/collation.md §1): "expr COLLATE name" sets an explicit collation on a text
+ * expression. It shares THIS postfix rung, so it binds tighter than "||" and the comparisons
+ * (PostgreSQL precedence) and chains left-to-right with "::"/"[]"/".field". The collation name is a
+ * double-quoted identifier (case-sensitive). A non-text inner is 42804; an unloaded name 42704;
+ * two different explicit collations in one comparison 42P21. */
+postfix        ::= primary ( "::" type_name | collate_clause | "." identifier | "." "*" | subscript )*
 
 /* ARRAY SUBSCRIPT (../design/array.md §6): one or more bracketed specs on any base — an index
  * "[i]" or a slice "[m:n]" (either bound omittable: "[:n]", "[m:]", "[:]"). Consecutive "[…]"
@@ -912,8 +926,14 @@ colon          ::= ":"
  * character other than a single quote. */
 string         ::= "'" ( char | "''" )* "'"
 
-/* Identifiers are ASCII only; there is no quoted-identifier syntax. */
+/* Bare identifiers are ASCII only and case-insensitive (callers fold them). */
 identifier     ::= (letter | "_") (letter | digit | "_")*
+
+/* A double-quoted identifier — case-sensitive, kept VERBATIM, an embedded `"` written by doubling
+ * it (`""`). Added for collation names (../design/collation.md §1); the ONLY parse position that
+ * consumes one today is COLLATE "name" (collate_clause), so a quoted identifier elsewhere is a 42601
+ * syntax error. `qchar` is any character other than a double quote. */
+quoted_identifier ::= "\"" ( qchar | "\"\"" )* "\""
 
 letter         ::= [A-Za-z]
 digit          ::= [0-9]

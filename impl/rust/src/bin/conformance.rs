@@ -105,6 +105,64 @@ fn suites_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/conformance/suites")
 }
 
+/// The repo's `spec/` directory — the root that `# load-collation:` fixture paths resolve against
+/// (spec/design/collation.md §10). `suites/` → `conformance/` → `spec/`.
+fn spec_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec")
+}
+
+/// Parse a `# load-collation: <name> = <fixture-path>[, <fixture-path>…]` directive body — the
+/// corpus's deterministic, host-free way to load a collation before the records that use it
+/// (spec/design/collation.md §10). Fixture paths are relative to `spec/` and concatenated
+/// (newline-joined) into one definition stream, then compiled + imported. Returns the collation
+/// name and its fixture paths, or None if this comment is not a load-collation directive.
+fn parse_load_collation_directive(rest: &str) -> Option<(String, Vec<String>)> {
+    let body = rest.trim_start().strip_prefix("load-collation:")?.trim();
+    let (name, files) = body.split_once('=')?;
+    let files: Vec<String> = files
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect();
+    if files.is_empty() {
+        return None;
+    }
+    Some((name.trim().to_string(), files))
+}
+
+/// Compile + import a collation named `name` from the `files` fixtures (relative to `spec/`) into
+/// `db` (spec/design/collation.md §4/§10). A read / compile / import failure fails the test file.
+fn load_collation(
+    db: &mut Database,
+    name: &str,
+    files: &[String],
+) -> std::result::Result<(), String> {
+    let mut def = String::new();
+    for f in files {
+        let text = std::fs::read_to_string(spec_dir().join(f))
+            .map_err(|e| format!("load-collation: cannot read fixture {f}: {e}"))?;
+        if !def.is_empty() {
+            def.push('\n');
+        }
+        def.push_str(&text);
+    }
+    let coll = jed::collation::compile_collation(name, &def).map_err(|e| {
+        format!(
+            "load-collation: compiling {name}: {} {}",
+            e.code(),
+            e.message
+        )
+    })?;
+    db.import_collation(coll).map_err(|e| {
+        format!(
+            "load-collation: importing {name}: {} {}",
+            e.code(),
+            e.message
+        )
+    })?;
+    Ok(())
+}
+
 fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -362,6 +420,13 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('#') {
+            // `# load-collation:` is an ACTION (load now), not a pending assertion: compile + import
+            // the named collation from its fixtures into this file's db before the records run
+            // (spec/design/collation.md §10).
+            if let Some((name, files)) = parse_load_collation_directive(rest) {
+                load_collation(&mut db, &name, &files)?;
+                continue;
+            }
             // `# cost:` / `# names:` / `# types:` bind to the next record; every other comment
             // is ignored.
             if let Some(n) = parse_cost_directive(rest) {

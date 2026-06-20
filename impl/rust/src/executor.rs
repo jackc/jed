@@ -16,6 +16,7 @@ use crate::catalog::{
     FkAction, ForeignKeyConstraint, IdentityKind, IndexDef, IndexKind, SeqDataType, SeqOwner,
     SequenceDef, Table, resolve_col_type,
 };
+use crate::collation::{self, Collation};
 use crate::cost::{Lifetime, Meter};
 use crate::costs::COSTS;
 use crate::date::parse_date;
@@ -166,6 +167,12 @@ pub struct Snapshot {
     /// (spec/fileformat/format.md, `entry_kind = 2`). The mutable counter (`last_value`/`is_called`)
     /// lives here, so `nextval` advances the working snapshot and rolls back with it (sequences.md §5).
     sequences: HashMap<String, SequenceDef>,
+    /// Loaded collations, keyed by their exact (CASE-SENSITIVE) name — collation names are quoted
+    /// identifiers (`"en-US"`, spec/design/collation.md §1). `C` is never stored (table-free, built
+    /// in). Imported by the host `db.import_collation` (slice 1c: in-memory only — no `format_version`
+    /// bump, no catalog entry yet; baking is slice 1d). `Arc` so a resolved comparison / sort key can
+    /// hold a cheap reference. Not serialized this slice.
+    collations: HashMap<String, std::sync::Arc<Collation>>,
 }
 
 impl Snapshot {
@@ -212,6 +219,19 @@ impl Snapshot {
     /// Remove a sequence (DROP SEQUENCE). The caller has checked it exists.
     pub(crate) fn remove_sequence(&mut self, key: &str) {
         self.sequences.remove(key);
+    }
+
+    /// Look up a loaded collation by its exact (case-sensitive) name. `C` is NOT here — it is
+    /// table-free and built in (spec/design/collation.md §1). `None` ⇒ not loaded (the resolver
+    /// raises 42704).
+    pub(crate) fn collation(&self, name: &str) -> Option<&std::sync::Arc<Collation>> {
+        self.collations.get(name)
+    }
+
+    /// Register a loaded collation (`db.import_collation`). Keyed by its exact name; the caller has
+    /// checked any same-name conflict (slice 1c: in-memory only, no persistence).
+    pub(crate) fn put_collation(&mut self, coll: std::sync::Arc<Collation>) {
+        self.collations.insert(coll.name.clone(), coll);
     }
 
     /// All sequences in ascending lowercased-name order — the on-disk emission order
@@ -1453,6 +1473,37 @@ impl Database {
     pub(crate) fn put_table(&mut self, table: Table) {
         let ps = self.page_size;
         self.working_mut().put_table(table, ps);
+    }
+
+    /// Import a collation into the database (the privileged host op `db.ImportCollation`,
+    /// spec/design/collation.md §4). The collation becomes usable by name in `COLLATE` / `ORDER BY`
+    /// (slice 1c: in-memory only — placed in the committed catalog, NOT yet persisted; the
+    /// `format_version` bump + baked snapshot are slice 1d). Idempotent by `(name, content-hash)`:
+    /// re-importing the identical table is a no-op success; importing a DIFFERENT table under a
+    /// name already in use is 42710 (it would invalidate any structure built under that name —
+    /// re-collation is the explicit path, §12). `C` is never imported (table-free, built in).
+    /// Returns the imported name.
+    pub fn import_collation(&mut self, coll: Collation) -> Result<String> {
+        if coll.name == "C" {
+            return Err(EngineError::new(
+                SqlState::DuplicateObject,
+                "the C collation is built in and cannot be imported",
+            ));
+        }
+        let name = coll.name.clone();
+        let hash = crate::format::crc32_ieee(&collation::serialize_table(&coll));
+        if let Some(existing) = self.committed.collation(&name) {
+            let existing_hash = crate::format::crc32_ieee(&collation::serialize_table(existing));
+            if existing_hash == hash {
+                return Ok(name); // idempotent — same (name, content) already loaded
+            }
+            return Err(EngineError::new(
+                SqlState::DuplicateObject,
+                format!("collation \"{name}\" is already loaded with different content"),
+            ));
+        }
+        self.committed.put_collation(std::sync::Arc::new(coll));
+        Ok(name)
     }
 
     /// Execute one parsed statement with no bind parameters.
@@ -5677,10 +5728,23 @@ impl Database {
 
         // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
         // operation): a qualified key is 42P01, an unknown name is 42703.
-        let mut order: Vec<(usize, bool, bool)> = Vec::with_capacity(so.order_by.len());
+        let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(so.order_by.len());
         for key in &so.order_by {
             let slot = resolve_setop_order_key(key, &column_names)?;
-            order.push((slot, key.descending, key.nulls_first));
+            // An explicit `COLLATE` on a set-operation ORDER BY key (spec/design/collation.md §1):
+            // the output column must be text (42804); the name resolves ("C", else loaded or 42704).
+            let coll = match &key.collation {
+                None => None,
+                Some(name) => {
+                    if column_types[slot] != ResolvedType::Text {
+                        return Err(type_error(
+                            "collations are not supported by this column's type".to_string(),
+                        ));
+                    }
+                    resolve_collation_name(self, name)?
+                }
+            };
+            order.push((slot, key.descending, key.nulls_first, coll));
         }
 
         Ok(SetOpPlan {
@@ -5844,15 +5908,7 @@ impl Database {
         let cost = left.cost + right.cost;
 
         if !plan.order.is_empty() {
-            rows.sort_by(|a, b| {
-                for &(idx, descending, nulls_first) in &plan.order {
-                    let ord = key_cmp(&a[idx], &b[idx], descending, nulls_first);
-                    if ord.is_ne() {
-                        return ord;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
+            sort_rows(&mut rows, &plan.order)?;
         }
 
         // LIMIT / OFFSET window — clamp in the integer domain (counts are non-negative, parser),
@@ -6179,7 +6235,7 @@ impl Database {
         // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain
         // query keys resolve against the FROM scope (a flat row index). An outer (correlated)
         // ORDER BY key — ordering by an enclosing-query constant — is degenerate and 0A000 (§26).
-        let mut order: Vec<(usize, bool, bool)> = Vec::with_capacity(sel.order_by.len());
+        let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(sel.order_by.len());
         for key in &sel.order_by {
             let r = match &key.qualifier {
                 Some(q) => scope.resolve_qualified(q, &key.column)?,
@@ -6194,6 +6250,19 @@ impl Database {
                     ));
                 }
             };
+            // An explicit `COLLATE` on the sort key (spec/design/collation.md §1): the column must be
+            // text (42804) and the name must resolve ("C" → byte order, else loaded or 42704).
+            let coll = match &key.collation {
+                None => None,
+                Some(name) => {
+                    if !scope.column_of(r).ty.is_text() {
+                        return Err(type_error(
+                            "collations are not supported by this column's type".to_string(),
+                        ));
+                    }
+                    resolve_collation_name(scope.catalog, name)?
+                }
+            };
             let slot = if is_agg {
                 group_keys
                     .iter()
@@ -6202,7 +6271,7 @@ impl Database {
             } else {
                 idx
             };
-            order.push((slot, key.descending, key.nulls_first));
+            order.push((slot, key.descending, key.nulls_first, coll));
         }
 
         // SELECT DISTINCT restriction (spec/design/grammar.md §11): once duplicates are
@@ -6232,7 +6301,7 @@ impl Database {
                         projected.insert(i);
                     }
                 }
-                if order.iter().any(|&(idx, _, _)| !projected.contains(&idx)) {
+                if order.iter().any(|(idx, ..)| !projected.contains(idx)) {
                     return Err(EngineError::new(
                         SqlState::InvalidColumnReference,
                         "for SELECT DISTINCT, ORDER BY expressions must appear in select list",
@@ -6315,8 +6384,8 @@ impl Database {
             for p in &projections {
                 collect_touched(p, 0, &mut touched);
             }
-            for &(slot, _, _) in &order {
-                touched[slot] = true;
+            for (slot, ..) in &order {
+                touched[*slot] = true;
             }
         }
         let rel_masks: Vec<Vec<bool>> = rels
@@ -6655,6 +6724,60 @@ impl Database {
         };
         meter.charge(COSTS.page_read * overlap as i64 + COSTS.value_decompress * slabs as i64);
 
+        // A collated ORDER BY cannot use the `C`-ordered Sorter / spill (collated keys are slice
+        // 1e), and collation is in-memory only this slice — so materialize the survivors and sort
+        // them with the collation-aware decorate sorter (spec/design/collation.md §8). The metered
+        // costs (storage_row_read per scanned row, row_produced per windowed output) are identical
+        // to the Sorter path; the sort itself is unmetered like every sort (cost.md §3).
+        if plan.order.iter().any(|(_, _, _, c)| c.is_some()) {
+            let mut rows: Vec<Row> = Vec::new();
+            if !empty {
+                store.scan_range(&bound, &mut |_key, row| {
+                    meter.guard()?;
+                    meter.charge(COSTS.storage_row_read);
+                    let resolved = if TableStore::needs_resolution(row, &plan.rel_masks[0]) {
+                        let mut r = row.clone();
+                        store.resolve_columns(&mut r, &plan.rel_masks[0])?;
+                        Some(r)
+                    } else {
+                        None
+                    };
+                    let row_ref = resolved.as_ref().unwrap_or(row);
+                    let keep = match &plan.filter {
+                        Some(f) => f.eval(row_ref, env, meter)?.is_true(),
+                        None => true,
+                    };
+                    if keep {
+                        rows.push(resolved.unwrap_or_else(|| row.clone()));
+                    }
+                    Ok(true)
+                })?;
+            }
+            sort_rows(&mut rows, &plan.order)?;
+            let total = rows.len() as i64;
+            let start = plan.offset.unwrap_or(0).min(total) as usize;
+            let end = match plan.limit {
+                Some(lim) if lim < total - start as i64 => start + lim as usize,
+                _ => total as usize,
+            };
+            let mut out: Vec<Vec<Value>> = Vec::with_capacity(end - start);
+            for row in &rows[start..end] {
+                meter.guard()?;
+                meter.charge(COSTS.row_produced);
+                let mut projected = Vec::with_capacity(plan.projections.len());
+                for p in &plan.projections {
+                    projected.push(p.eval(row, env, meter)?);
+                }
+                out.push(projected);
+            }
+            return Ok(SelectResult {
+                column_names: plan.column_names.clone(),
+                column_types: plan.column_types.clone(),
+                rows: out,
+                cost: meter.accrued,
+            });
+        }
+
         // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits:
         // every in-range row is read (charging storage_row_read), its touched columns resolved
         // (large-values.md §14), the WHERE applied (charging operator_eval), and a survivor pushed
@@ -6720,7 +6843,7 @@ impl Database {
     /// Spilling is enabled only for a **file-backed** database (an in-memory one has nowhere to
     /// spill — spill.md §2); spill runs live next to the database file (same filesystem, guaranteed
     /// writable), falling back to the system temp dir.
-    fn new_sorter(&self, order: &[(usize, bool, bool)]) -> crate::spill::Sorter {
+    fn new_sorter(&self, order: &[crate::spill::SortKey]) -> crate::spill::Sorter {
         let spill_dir = if self.paging.is_some() {
             let dir = self
                 .path
@@ -7068,15 +7191,7 @@ impl Database {
         // (Aggregate queries sort their GROUP rows in the aggregate branch below — not these
         // pre-aggregation rows — so the sort here is gated to plain queries.)
         if !plan.is_agg && !plan.order.is_empty() {
-            rows.sort_by(|a, b| {
-                for &(idx, descending, nulls_first) in &plan.order {
-                    let ord = key_cmp(&a[idx], &b[idx], descending, nulls_first);
-                    if ord.is_ne() {
-                        return ord;
-                    }
-                }
-                std::cmp::Ordering::Equal
-            });
+            sort_rows(&mut rows, &plan.order)?;
         }
 
         // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the integer
@@ -7167,15 +7282,7 @@ impl Database {
             }
             // ORDER BY over the grouped output (keys are synthetic group-key slots).
             if !plan.order.is_empty() {
-                group_rows.sort_by(|a, b| {
-                    for &(slot, descending, nulls_first) in &plan.order {
-                        let ord = key_cmp(&a[slot], &b[slot], descending, nulls_first);
-                        if ord.is_ne() {
-                            return ord;
-                        }
-                    }
-                    std::cmp::Ordering::Equal
-                });
+                sort_rows(&mut group_rows, &plan.order)?;
             }
             // Window + project; only an emitted row charges row_produced + projection cost.
             let (start, end) = window_bounds(group_rows.len());
@@ -8653,6 +8760,13 @@ enum RExpr {
         op: CmpOp,
         lhs: Box<RExpr>,
         rhs: Box<RExpr>,
+        /// The derived collation for this comparison (spec/design/collation.md §7). `None` is the
+        /// `C` / default byte order (the unchanged fast path); `Some` is a loaded non-`C` collation
+        /// that orders the ORDERING comparisons (`< <= > >=`) by its UCA sort key. `=`/`<>` are
+        /// byte-equality regardless (deterministic-collation equality IS byte-identity, §7), so the
+        /// collation only changes the ordering ops at eval — but it is derived (and conflict-checked,
+        /// 42P22) for every comparison op.
+        collation: Option<std::sync::Arc<Collation>>,
     },
     And(Box<RExpr>, Box<RExpr>),
     Or(Box<RExpr>, Box<RExpr>),
@@ -9145,7 +9259,7 @@ struct SelectPlan {
     agg_specs: Vec<AggSpec>,
     having: Option<RExpr>,
     /// (flat slot, descending, nulls_first) per ORDER BY key.
-    order: Vec<(usize, bool, bool)>,
+    order: Vec<crate::spill::SortKey>,
     projections: Vec<RExpr>,
     column_names: Vec<String>,
     column_types: Vec<ResolvedType>,
@@ -9410,6 +9524,7 @@ fn gin_match(filter: &RExpr, col_global: usize) -> Option<(GinStrategy, &RExpr)>
             op: CmpOp::Eq,
             lhs,
             rhs,
+            ..
         } => {
             if is_column(lhs, col_global) && rexpr_is_constant(rhs) {
                 Some((GinStrategy::Equal, rhs.as_ref()))
@@ -9788,7 +9903,17 @@ fn collect_bound_terms(e: &RExpr, pk_idx: usize, pk_type: ScalarType, terms: &mu
         // `<>` is not a contiguous range, so it never seeds an index/PK bound — it stays in the
         // residual filter (a full scan + filter). Skipping it here keeps the deterministic cost
         // identical to Go/TS, where `asBoundTerm` excludes it the same way.
-        RExpr::Compare { op, lhs, rhs } if !matches!(op, CmpOp::Ne) => {
+        // A collated comparison (`collation: Some`) is EXCLUDED: it orders by the collation's UCA
+        // sort key, but the PK/index B-tree is byte (`C`) ordered, so a byte-range bound would be
+        // wrong. It stays a full scan + the residual collated filter (spec/design/collation.md §8;
+        // collated keys are slice 1e). `=`/`<>` are byte-equality even under a collation, but
+        // excluding the whole collated form keeps the rule simple and cross-core identical.
+        RExpr::Compare {
+            op,
+            lhs,
+            rhs,
+            collation: None,
+        } if !matches!(op, CmpOp::Ne) => {
             let is_pk = |x: &RExpr| matches!(x, RExpr::Column(i) if *i == pk_idx);
             // The PK on either side (op flipped when it is on the right); the other side a
             // matching-type const-source. Anything else contributes no term.
@@ -9994,7 +10119,7 @@ struct SetOpPlan {
     column_names: Vec<String>,
     column_types: Vec<ResolvedType>,
     /// (output slot, descending, nulls_first) — the trailing ORDER BY resolved by output name.
-    order: Vec<(usize, bool, bool)>,
+    order: Vec<crate::spill::SortKey>,
     limit: Option<i64>,
     offset: Option<i64>,
 }
@@ -10355,6 +10480,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         | Expr::TypedLiteral { .. }
         | Expr::Param(_) => false,
         Expr::Cast { inner, .. } => expr_has_aggregate(inner),
+        Expr::Collate { inner, .. } => expr_has_aggregate(inner),
         Expr::Unary { operand, .. } => expr_has_aggregate(operand),
         Expr::IsNull { operand, .. } => expr_has_aggregate(operand),
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
@@ -10428,6 +10554,7 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. } => Ok(()),
         Expr::Cast { inner, .. } => reject_check_structure(inner),
+        Expr::Collate { inner, .. } => reject_check_structure(inner),
         Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
             reject_check_structure(operand)
         }
@@ -10513,6 +10640,7 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
         }
         Expr::Literal(_) | Expr::TypedLiteral { .. } => Ok(()),
         Expr::Cast { inner, .. } => reject_default_structure(inner),
+        Expr::Collate { inner, .. } => reject_default_structure(inner),
         Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
             reject_default_structure(operand)
         }
@@ -10585,7 +10713,7 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
         match e {
             Expr::Column(name) | Expr::QualifiedColumn { name, .. } => note(name),
             Expr::Literal(_) | Expr::TypedLiteral { .. } | Expr::Param(_) => {}
-            Expr::Cast { inner, .. } => walk(inner, columns, out),
+            Expr::Cast { inner, .. } | Expr::Collate { inner, .. } => walk(inner, columns, out),
             Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
                 walk(operand, columns, out)
             }
@@ -12699,9 +12827,9 @@ fn expr_calls_seq_mutator(e: &Expr) -> bool {
                     }
                 })
         }
-        Expr::Cast { inner, .. } | Expr::Unary { operand: inner, .. } => {
-            expr_calls_seq_mutator(inner)
-        }
+        Expr::Cast { inner, .. }
+        | Expr::Collate { inner, .. }
+        | Expr::Unary { operand: inner, .. } => expr_calls_seq_mutator(inner),
         Expr::IsNull { operand, .. } => expr_calls_seq_mutator(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -12952,9 +13080,9 @@ fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<String>) {
                 }
             }
         }
-        Expr::Cast { inner, .. } | Expr::Unary { operand: inner, .. } => {
-            collect_expr_privs(inner, req, locals)
-        }
+        Expr::Cast { inner, .. }
+        | Expr::Unary { operand: inner, .. }
+        | Expr::Collate { inner, .. } => collect_expr_privs(inner, req, locals),
         Expr::IsNull { operand, .. } => collect_expr_privs(operand, req, locals),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -13022,7 +13150,9 @@ fn expr_reads_columns(e: &Expr) -> bool {
                     }
                 })
         }
-        Expr::Cast { inner, .. } | Expr::Unary { operand: inner, .. } => expr_reads_columns(inner),
+        Expr::Cast { inner, .. }
+        | Expr::Unary { operand: inner, .. }
+        | Expr::Collate { inner, .. } => expr_reads_columns(inner),
         Expr::IsNull { operand, .. } => expr_reads_columns(operand),
         Expr::FuncCall { args, .. } => args.iter().any(expr_reads_columns),
         Expr::Binary { lhs, rhs, .. }
@@ -13553,6 +13683,25 @@ fn resolve(
                 },
                 ResolvedType::Bool,
             ))
+        }
+        // `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
+        // the inner expression, require a collatable (text) type (42804, PG-matching), and validate
+        // the named collation exists ("C" or loaded, else 42704). The node is a runtime PASSTHROUGH:
+        // a collation only changes the ORDERING comparisons / ORDER BY, derived from the AST at those
+        // sites (`explicit_collation` / `OrderKey.collation`), so resolving returns the inner resolved
+        // expr + type unchanged. The hint flows through (COLLATE never changes the type).
+        Expr::Collate { inner, collation } => {
+            let (rinner, ty) = resolve(scope, inner, ctx, agg, params)?;
+            if !matches!(ty, ResolvedType::Text | ResolvedType::Null) {
+                return Err(type_error(format!(
+                    "collations are not supported by type {}",
+                    ty.type_name()
+                )));
+            }
+            // Validate the name resolves (surfaces 42704 for an unknown collation); the value is
+            // recovered at the comparison/ORDER BY site, so it is discarded here.
+            resolve_collation_name(scope.catalog, collation)?;
+            Ok((rinner, ty))
         }
         Expr::Cast {
             inner,
@@ -14131,6 +14280,66 @@ fn resolve(
     }
 }
 
+/// Resolve a collation NAME to its loaded table (spec/design/collation.md §1). `C` is the built-in
+/// byte / code-point order → `None` (the unchanged fast path); any other name must be loaded
+/// (`db.import_collation`), else 42704.
+fn resolve_collation_name(
+    catalog: &Database,
+    name: &str,
+) -> Result<Option<std::sync::Arc<Collation>>> {
+    if name == "C" {
+        return Ok(None);
+    }
+    match catalog.read_snap().collation(name) {
+        Some(c) => Ok(Some(c.clone())),
+        None => Err(EngineError::new(
+            SqlState::UndefinedObject,
+            format!("collation \"{name}\" does not exist"),
+        )),
+    }
+}
+
+/// The single EXPLICIT collation an expression subtree forces, or `None` (spec/design/collation.md
+/// §1). In slice 1c the only source of an explicit collation is a `COLLATE` node (columns are
+/// implicitly `C`), so this finds the outermost COLLATE and, through the one text-combining operator
+/// `||`, detects an explicit-vs-explicit conflict (42P21). Propagation through CASE / COALESCE /
+/// function results is a deferred follow-on (they reset to the implicit default — a documented 1c
+/// narrowing, collation.md §14).
+fn explicit_collation(e: &Expr) -> Result<Option<String>> {
+    match e {
+        Expr::Collate { collation, .. } => Ok(Some(collation.clone())),
+        Expr::Binary {
+            op: BinaryOp::Concat,
+            lhs,
+            rhs,
+        } => combine_explicit(explicit_collation(lhs)?, explicit_collation(rhs)?),
+        _ => Ok(None),
+    }
+}
+
+/// Combine two operands' explicit collations (spec/design/collation.md §1/§7). Two DIFFERENT
+/// explicit collations are a conflict (42P21, the explicit-mismatch error PG raises); otherwise the
+/// single explicit collation, or `None` when neither operand forces one.
+fn combine_explicit(a: Option<String>, b: Option<String>) -> Result<Option<String>> {
+    match (a, b) {
+        (Some(x), Some(y)) if x != y => Err(EngineError::new(
+            SqlState::CollationMismatch,
+            format!("collation mismatch between explicit collations \"{x}\" and \"{y}\""),
+        )),
+        (Some(x), _) => Ok(Some(x)),
+        (None, b) => Ok(b),
+    }
+}
+
+/// Compare two non-NULL text values under a loaded collation (spec/design/collation.md §6/§7): order
+/// by the UCA sort keys, whose `memcmp` order IS the collation order. The caller charges the
+/// `collate` cost and handles NULLs.
+fn collated_cmp(coll: &Collation, a: &str, b: &str) -> Result<std::cmp::Ordering> {
+    let ka = collation::sort_key(coll, a)?;
+    let kb = collation::sort_key(coll, b)?;
+    Ok(ka.cmp(&kb))
+}
+
 fn resolve_binary(
     scope: &Scope,
     op: BinaryOp,
@@ -14280,11 +14489,29 @@ fn resolve_binary(
                 BinaryOp::Ge => CmpOp::Ge,
                 _ => unreachable!(),
             };
+            // Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text
+            // comparison is collatable; for any other operand family collation is irrelevant (and a
+            // COLLATE on a non-text operand was already rejected 42804 at the Collate node). The
+            // explicit collation is found by walking each AST operand; two DIFFERENT explicit
+            // collations conflict (42P21). In 1c every column is implicitly `C` (no per-column
+            // collation yet), so the only reachable conflict is explicit-vs-explicit.
+            let collation = if matches!(lt, ResolvedType::Text) && matches!(rt, ResolvedType::Text)
+            {
+                let lc = explicit_collation(lhs)?;
+                let rc = explicit_collation(rhs)?;
+                match combine_explicit(lc, rc)? {
+                    Some(name) => resolve_collation_name(scope.catalog, &name)?,
+                    None => None,
+                }
+            } else {
+                None
+            };
             Ok((
                 RExpr::Compare {
                     op: cop,
                     lhs: Box::new(rl),
                     rhs: Box::new(rr),
+                    collation,
                 },
                 ResolvedType::Bool,
             ))
@@ -17757,7 +17984,12 @@ impl RExpr {
                     }
                 }
             }
-            RExpr::Compare { op, lhs, rhs } => {
+            RExpr::Compare {
+                op,
+                lhs,
+                rhs,
+                collation,
+            } => {
                 m.charge(COSTS.operator_eval);
                 let a = lhs.eval(row, env, m)?;
                 let b = rhs.eval(row, env, m)?;
@@ -17765,6 +17997,31 @@ impl RExpr {
                 // node, even where `<=`/`>=` decompose internally (cost.md §3 "decimal_work").
                 m.charge(COSTS.decimal_work * ((decimal_cmp_work(&a, &b) - 1) as i64));
                 m.guard()?;
+                // A collated ORDERING comparison (`< <= > >=`) over two non-NULL text values orders
+                // by the collation's UCA sort key (spec/design/collation.md §7), charging the
+                // `collate` unit per code point of each operand (cost.md "collate"). `=`/`<>` are
+                // byte-equality even under a deterministic collation (§7), so they take the plain
+                // path and charge no collate. A NULL operand makes the result Unknown (no sort key).
+                if let (Some(coll), CmpOp::Lt | CmpOp::Gt | CmpOp::Le | CmpOp::Ge) = (collation, op)
+                {
+                    if let (Value::Text(x), Value::Text(y)) = (&a, &b) {
+                        m.charge(
+                            COSTS.collate * (x.chars().count() as i64 + y.chars().count() as i64),
+                        );
+                        m.guard()?;
+                        let ord = collated_cmp(coll, x, y)?;
+                        let res = match op {
+                            CmpOp::Lt => ord.is_lt(),
+                            CmpOp::Gt => ord.is_gt(),
+                            CmpOp::Le => ord.is_le(),
+                            CmpOp::Ge => ord.is_ge(),
+                            _ => unreachable!(),
+                        };
+                        return Ok(Value::Bool(res));
+                    }
+                    // Either operand NULL ⇒ Unknown (text comparison is 3-valued).
+                    return Ok(Value::Null);
+                }
                 let tv = match op {
                     CmpOp::Eq => a.eq3(&b),
                     CmpOp::Ne => a.eq3(&b).not(),
@@ -18814,6 +19071,104 @@ fn eval_decimal_arith(op: ArithOp, a: Decimal, b: Decimal) -> Result<Value> {
         ArithOp::Mod => a.rem(&b)?,
     };
     Ok(Value::Decimal(r))
+}
+
+/// Sort `rows` by the ORDER BY `order` keys (spec/design/grammar.md §10). The all-`C` fast path is a
+/// stable `sort_by` over the value comparator; if ANY key carries a collation, the collation-aware
+/// `sort_rows_collated` decorate-sorter runs instead (it can fail — an unmapped code point is 0A000).
+fn sort_rows(rows: &mut Vec<Row>, order: &[crate::spill::SortKey]) -> Result<()> {
+    if order.iter().any(|(_, _, _, c)| c.is_some()) {
+        return sort_rows_collated(rows, order);
+    }
+    rows.sort_by(|a, b| cmp_rows_by_order(a, b, order));
+    Ok(())
+}
+
+/// Compare two rows by the (all-`C`) ORDER BY keys — the first non-equal key decides; a full tie is
+/// Equal (the stable sort then keeps input order). Only used when no key is collated.
+fn cmp_rows_by_order(a: &Row, b: &Row, order: &[crate::spill::SortKey]) -> std::cmp::Ordering {
+    for (idx, descending, nulls_first, _coll) in order {
+        let ord = key_cmp(&a[*idx], &b[*idx], *descending, *nulls_first);
+        if ord != std::cmp::Ordering::Equal {
+            return ord;
+        }
+    }
+    std::cmp::Ordering::Equal
+}
+
+/// Sort `rows` when at least one ORDER BY key is collated (spec/design/collation.md §6/§8).
+/// Decorate-sort-undecorate: each collated key's UCA sort key is built ONCE per row up front
+/// (propagating a `sort_key` failure — e.g. 0A000 for an unmapped code point — at this deterministic
+/// per-row point, not inside the comparator), then the rows are sorted by the precomputed key bytes
+/// for collated slots and the value comparator for the rest. The sort is UNMETERED like every sort
+/// (cost.md §3); the `collate` cost is charged at the comparison evaluator (collation.md §11). A
+/// collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
+fn sort_rows_collated(rows: &mut Vec<Row>, order: &[crate::spill::SortKey]) -> Result<()> {
+    let mut decorated: Vec<(Vec<Option<Vec<u8>>>, Row)> = Vec::with_capacity(rows.len());
+    for row in rows.drain(..) {
+        let mut keys: Vec<Option<Vec<u8>>> = Vec::new();
+        for (idx, _, _, coll) in order {
+            if let Some(c) = coll {
+                let k = match &row[*idx] {
+                    Value::Text(s) => Some(collation::sort_key(c, s)?),
+                    _ => None, // NULL (a collated slot is text) — handled by NULL placement
+                };
+                keys.push(k);
+            }
+        }
+        decorated.push((keys, row));
+    }
+    decorated.sort_by(|a, b| cmp_decorated(a, b, order));
+    rows.extend(decorated.into_iter().map(|(_, row)| row));
+    Ok(())
+}
+
+/// Compare two decorated rows (precomputed collated-key bytes + the row) by the ORDER BY keys. A
+/// collated slot compares its precomputed sort-key bytes (NULL placement + the descending flip
+/// applied here, mirroring `key_cmp`); a non-collated slot compares the row values via `key_cmp`.
+fn cmp_decorated(
+    a: &(Vec<Option<Vec<u8>>>, Row),
+    b: &(Vec<Option<Vec<u8>>>, Row),
+    order: &[crate::spill::SortKey],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let (akeys, arow) = a;
+    let (bkeys, brow) = b;
+    let mut ci = 0usize; // advances once per collated slot (keys stored in slot order)
+    for (idx, descending, nulls_first, coll) in order {
+        let ord = if coll.is_some() {
+            let ak = &akeys[ci];
+            let bk = &bkeys[ci];
+            ci += 1;
+            match (ak, bk) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => {
+                    if *nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (Some(_), None) => {
+                    if *nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                (Some(x), Some(y)) => {
+                    let base = x.cmp(y);
+                    if *descending { base.reverse() } else { base }
+                }
+            }
+        } else {
+            key_cmp(&arow[*idx], &brow[*idx], *descending, *nulls_first)
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 /// One ORDER BY key's total-order comparison. NULL placement is governed by `nulls_first`

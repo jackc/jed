@@ -10,6 +10,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Statement executor (CLAUDE.md §10).
@@ -101,6 +102,11 @@ type Snapshot struct {
 	// (LastValue/IsCalled) lives here, so nextval advances the working snapshot and rolls back
 	// with it (sequences.md §5).
 	sequences map[string]*SequenceDef
+	// collations holds loaded collations, keyed by their exact (CASE-SENSITIVE) name — collation
+	// names are quoted identifiers ("en-US", spec/design/collation.md §1). C is never stored
+	// (table-free, built in). Imported by db.ImportCollation (slice 1c: in-memory only — no
+	// format_version bump, no catalog entry yet; baking is slice 1d). Not serialized this slice.
+	collations map[string]*Collation
 }
 
 // newSnapshot builds an empty snapshot.
@@ -111,6 +117,7 @@ func newSnapshot() *Snapshot {
 		stores:      make(map[string]*TableStore),
 		indexStores: make(map[string]*TableStore),
 		sequences:   make(map[string]*SequenceDef),
+		collations:  make(map[string]*Collation),
 	}
 }
 
@@ -141,7 +148,20 @@ func (s *Snapshot) clone() *Snapshot {
 	for k, v := range s.sequences {
 		sequences[k] = v
 	}
-	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences}
+	// Collations, like Table, are never mutated in place — only added — so the map copy is shallow
+	// (spec/design/collation.md §4).
+	collations := make(map[string]*Collation, len(s.collations))
+	for k, v := range s.collations {
+		collations[k] = v
+	}
+	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations}
+}
+
+// collation looks up a loaded collation by its exact (case-sensitive) name. C is NOT here — it is
+// table-free and built in (spec/design/collation.md §1). A nil result ⇒ not loaded (the resolver
+// raises 42704).
+func (s *Snapshot) collation(name string) *Collation {
+	return s.collations[name]
 }
 
 // table looks up a table definition by name (case-insensitive).
@@ -1044,6 +1064,28 @@ func (db *Database) putTable(t *Table) {
 	db.working().putTable(t, db.pageSize)
 }
 
+// ImportCollation imports a collation into the database (the privileged host op,
+// spec/design/collation.md §4). The collation becomes usable by name in COLLATE / ORDER BY (slice
+// 1c: in-memory only — placed in the committed catalog, NOT yet persisted; baking is slice 1d).
+// Idempotent by (name, content-hash): re-importing the identical table is a no-op success; importing
+// a DIFFERENT table under a name already in use is 42710 (re-collation is the explicit path, §12). C
+// is never imported (table-free, built in). Returns the imported name.
+func (db *Database) ImportCollation(coll *Collation) (string, error) {
+	if coll.Name == "C" {
+		return "", NewError(DuplicateObject, "the C collation is built in and cannot be imported")
+	}
+	hash := crc32IEEE(SerializeTable(coll))
+	if existing := db.committed.collation(coll.Name); existing != nil {
+		if crc32IEEE(SerializeTable(existing)) == hash {
+			return coll.Name, nil // idempotent — same (name, content) already loaded
+		}
+		return "", NewError(DuplicateObject,
+			fmt.Sprintf("collation %q is already loaded with different content", coll.Name))
+	}
+	db.committed.collations[coll.Name] = coll
+	return coll.Name, nil
+}
+
 // ExecuteStmt executes one parsed statement with no bind parameters.
 func (db *Database) ExecuteStmt(stmt Statement) (Outcome, error) {
 	return db.ExecuteStmtParams(stmt, nil)
@@ -1561,6 +1603,8 @@ func exprCallsSeqMutator(e *Expr) bool {
 		return false
 	case ExprCast:
 		return exprCallsSeqMutator(&e.Cast.Inner)
+	case ExprCollate:
+		return exprCallsSeqMutator(&e.Collate.Inner)
 	case ExprUnary:
 		return exprCallsSeqMutator(&e.Unary.Operand)
 	case ExprIsNull:
@@ -1874,6 +1918,8 @@ func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
 		}
 	case ExprCast:
 		collectExprPrivs(&e.Cast.Inner, req, locals)
+	case ExprCollate:
+		collectExprPrivs(&e.Collate.Inner, req, locals)
 	case ExprUnary:
 		collectExprPrivs(&e.Unary.Operand, req, locals)
 	case ExprIsNull:
@@ -1960,6 +2006,8 @@ func exprReadsColumns(e *Expr) bool {
 		return false
 	case ExprCast:
 		return exprReadsColumns(&e.Cast.Inner)
+	case ExprCollate:
+		return exprReadsColumns(&e.Collate.Inner)
 	case ExprUnary:
 		return exprReadsColumns(&e.Unary.Operand)
 	case ExprIsNull:
@@ -6187,7 +6235,18 @@ func (db *Database) planSetOp(so *SetOp, parent *scope, ctes []*cteBinding, ptyp
 		if err != nil {
 			return nil, err
 		}
-		order = append(order, orderSlot{idx: idx, descending: key.Descending, nullsFirst: key.NullsFirst})
+		// An explicit COLLATE on a set-operation ORDER BY key (spec/design/collation.md §1): the
+		// output column must be text (42804); the name resolves ("C", else loaded or 42704).
+		var coll *Collation
+		if key.Collation != "" {
+			if columnTypes[idx].kind != rtText {
+				return nil, typeError("collations are not supported by this column's type")
+			}
+			if coll, err = resolveCollationName(db, key.Collation); err != nil {
+				return nil, err
+			}
+		}
+		order = append(order, orderSlot{idx: idx, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
 	}
 
 	return &setOpPlan{
@@ -6217,15 +6276,9 @@ func (db *Database) execSetOpPlan(plan *setOpPlan, outer []Row, params []Value, 
 	cost := left.cost + right.cost
 
 	if len(plan.order) > 0 {
-		sort.SliceStable(rows, func(a, b int) bool {
-			for _, k := range plan.order {
-				c := keyCmp(rows[a][k.idx], rows[b][k.idx], k.descending, k.nullsFirst)
-				if c != 0 {
-					return c < 0
-				}
-			}
-			return false
-		})
+		if err := sortRows(rows, plan.order); err != nil {
+			return selectResult{}, err
+		}
 	}
 
 	n := int64(len(rows))
@@ -6850,6 +6903,17 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			return nil, NewError(FeatureNotSupported, "ORDER BY may not reference an outer query column")
 		}
 		idx := r.index
+		// An explicit COLLATE on the sort key (spec/design/collation.md §1): the column must be text
+		// (42804) and the name must resolve ("C" → byte order, else loaded or 42704).
+		var coll *Collation
+		if key.Collation != "" {
+			if !s.columnOf(r).Type.IsText() {
+				return nil, typeError("collations are not supported by this column's type")
+			}
+			if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {
+				return nil, err
+			}
+		}
 		slot := idx
 		if isAgg {
 			slot = -1
@@ -6863,7 +6927,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 				return nil, groupingErrorColumn(key.Column)
 			}
 		}
-		order = append(order, orderSlot{idx: slot, descending: key.Descending, nullsFirst: key.NullsFirst})
+		order = append(order, orderSlot{idx: slot, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
 	}
 
 	// SELECT DISTINCT restriction (spec/design/grammar.md §11): each ORDER BY key must appear
@@ -7812,6 +7876,12 @@ func asBoundTerm(e *rExpr, pkIdx int, pkType ScalarType) (boundTerm, bool) {
 	if e.kind != reCompare {
 		return boundTerm{}, false
 	}
+	// A collated comparison orders by the collation's UCA sort key, but the PK/index B-tree is byte
+	// (C) ordered, so a byte-range bound would be wrong — exclude it (it stays a full scan + the
+	// residual collated filter; spec/design/collation.md §8, collated keys are slice 1e).
+	if e.collation != nil {
+		return boundTerm{}, false
+	}
 	switch e.op {
 	case OpEq, OpLt, OpLe, OpGt, OpGe:
 	default:
@@ -8142,6 +8212,82 @@ func (db *Database) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Met
 		}
 	}
 	meter.Charge(Costs.PageRead*int64(overlap) + Costs.ValueDecompress*int64(slabs))
+
+	// A collated ORDER BY cannot use the C-ordered Sorter / spill (collated keys are slice 1e), and
+	// collation is in-memory only this slice — so materialize the survivors and sort them with the
+	// collation-aware decorate sorter (spec/design/collation.md §8). The metered costs
+	// (storage_row_read per scanned row, row_produced per windowed output) are identical to the
+	// Sorter path; the sort itself is unmetered like every sort (cost.md §3).
+	collated := false
+	for _, k := range plan.order {
+		if k.collation != nil {
+			collated = true
+			break
+		}
+	}
+	if collated {
+		var rows [][]Value
+		if !empty {
+			err := store.ScanRange(b, func(_ []byte, row Row) (bool, error) {
+				if err := meter.Guard(); err != nil {
+					return false, err
+				}
+				meter.Charge(Costs.StorageRowRead)
+				row, err := store.resolveColumns(row, plan.relMasks[0])
+				if err != nil {
+					return false, err
+				}
+				keep := true
+				if plan.filter != nil {
+					v, err := plan.filter.eval(row, env, meter)
+					if err != nil {
+						return false, err
+					}
+					keep = v.IsTrue()
+				}
+				if keep {
+					rows = append(rows, row)
+				}
+				return true, nil
+			})
+			if err != nil {
+				return selectResult{}, err
+			}
+		}
+		if err := sortRows(rows, plan.order); err != nil {
+			return selectResult{}, err
+		}
+		total := int64(len(rows))
+		start := int64(0)
+		if plan.offset != nil {
+			if *plan.offset < total {
+				start = *plan.offset
+			} else {
+				start = total
+			}
+		}
+		end := total
+		if plan.limit != nil && *plan.limit < total-start {
+			end = start + *plan.limit
+		}
+		out := make([][]Value, 0, end-start)
+		for i := start; i < end; i++ {
+			if err := meter.Guard(); err != nil {
+				return selectResult{}, err
+			}
+			meter.Charge(Costs.RowProduced)
+			projected := make([]Value, len(plan.projections))
+			for j, p := range plan.projections {
+				v, err := p.eval(rows[i], env, meter)
+				if err != nil {
+					return selectResult{}, err
+				}
+				projected[j] = v
+			}
+			out = append(out, projected)
+		}
+		return selectResult{columnNames: plan.columnNames, columnTypes: plan.columnTypes, rows: out, cost: meter.Accrued}, nil
+	}
 
 	// Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits:
 	// every in-range row is read (charging storage_row_read), its touched columns resolved
@@ -8582,15 +8728,9 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// GROUP rows in the aggregate branch below — not these pre-aggregation rows — so this is
 	// gated to plain queries.
 	if !plan.isAgg && len(plan.order) > 0 {
-		sort.SliceStable(rows, func(a, b int) bool {
-			for _, key := range plan.order {
-				c := keyCmp(rows[a][key.idx], rows[b][key.idx], key.descending, key.nullsFirst)
-				if c != 0 {
-					return c < 0
-				}
-			}
-			return false
-		})
+		if err := sortRows(rows, plan.order); err != nil {
+			return selectResult{}, err
+		}
 	}
 
 	// LIMIT / OFFSET window bounds over a result of n rows. Clamp in the i64 domain
@@ -8703,15 +8843,9 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 		}
 		// ORDER BY over the grouped output (keys are synthetic group-key slots).
 		if len(plan.order) > 0 {
-			sort.SliceStable(groupRows, func(a, b int) bool {
-				for _, key := range plan.order {
-					c := keyCmp(groupRows[a][key.idx], groupRows[b][key.idx], key.descending, key.nullsFirst)
-					if c != 0 {
-						return c < 0
-					}
-				}
-				return false
-			})
+			if err := sortRows(groupRows, plan.order); err != nil {
+				return selectResult{}, err
+			}
 		}
 		// Window + project; only an emitted row charges row_produced + its projection cost.
 		start, end := windowBounds(int64(len(groupRows)))
@@ -10048,6 +10182,12 @@ type rExpr struct {
 	rhs     *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
 	operand *rExpr         // reCast, reNeg, reNot, reIsNull
 	negated bool           // reIsNull, reDistinct
+	// collation is the derived collation of a reCompare (spec/design/collation.md §7). nil is the
+	// C / default byte order (the unchanged fast path); non-nil is a loaded collation that orders the
+	// ORDERING comparisons (< <= > >=) by its UCA sort key. =/<> stay byte-equality regardless
+	// (deterministic-collation equality IS byte-identity), but it is derived + conflict-checked
+	// (42P21) for every comparison op.
+	collation *Collation
 
 	// reCase: (condition, result) arms, the ELSE result (constNull for an implicit ELSE), and
 	// whether the unified result type is decimal (so integer results widen to decimal at eval).
@@ -10265,11 +10405,15 @@ type planJoin struct {
 	on   *rExpr
 }
 
-// orderSlot is a resolved ORDER BY key: a flat/synthetic slot + the per-key direction flags.
+// orderSlot is a resolved ORDER BY key: a flat/synthetic slot + the per-key direction flags + an
+// optional collation. A nil collation is the C/value order; a non-nil collation orders this key by
+// its UCA sort key (spec/design/collation.md §8) via the decorate sorter — it never reaches the
+// spill Sorter (collation is in-memory only this slice), which ignores the field.
 type orderSlot struct {
 	idx        int
 	descending bool
 	nullsFirst bool
+	collation  *Collation
 }
 
 // selectPlan is a resolved SELECT, executable against an outer-row environment (the execute half
@@ -10613,6 +10757,8 @@ func exprHasAggregate(e Expr) bool {
 		return false
 	case ExprCast:
 		return exprHasAggregate(e.Cast.Inner)
+	case ExprCollate:
+		return exprHasAggregate(e.Collate.Inner)
 	case ExprUnary:
 		return exprHasAggregate(e.Unary.Operand)
 	case ExprIsNull:
@@ -10702,6 +10848,8 @@ func rejectCheckStructure(e Expr) error {
 		return nil
 	case ExprCast:
 		return rejectCheckStructure(e.Cast.Inner)
+	case ExprCollate:
+		return rejectCheckStructure(e.Collate.Inner)
 	case ExprUnary:
 		return rejectCheckStructure(e.Unary.Operand)
 	case ExprIsNull:
@@ -10811,6 +10959,8 @@ func rejectDefaultStructure(e Expr) error {
 		return nil
 	case ExprCast:
 		return rejectDefaultStructure(e.Cast.Inner)
+	case ExprCollate:
+		return rejectDefaultStructure(e.Collate.Inner)
 	case ExprUnary:
 		return rejectDefaultStructure(e.Unary.Operand)
 	case ExprIsNull:
@@ -10916,6 +11066,8 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 			note(e.Column)
 		case ExprCast:
 			walk(e.Cast.Inner)
+		case ExprCollate:
+			walk(e.Collate.Inner)
 		case ExprUnary:
 			walk(e.Unary.Operand)
 		case ExprIsNull:
@@ -13421,6 +13573,24 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqIn, lhs: rlhs, negated: is.Negated}, resolvedType{kind: rtBool}, nil
+	case ExprCollate:
+		// `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
+		// the inner expression, require a collatable (text) type (42804, PG-matching), and validate
+		// the named collation exists ("C" or loaded, else 42704). A runtime PASSTHROUGH: a collation
+		// only changes the ORDERING comparisons / ORDER BY, derived from the AST at those sites
+		// (explicitCollation / OrderKey.Collation), so resolving returns the inner node + type
+		// unchanged. The hint flows through (COLLATE never changes the type).
+		inner, ty, err := resolve(s, e.Collate.Inner, ctx, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if ty.kind != rtText && ty.kind != rtNull {
+			return nil, resolvedType{}, typeError(fmt.Sprintf("collations are not supported by type %s", rtName(ty)))
+		}
+		if _, err := resolveCollationName(s.catalog, e.Collate.Collation); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return inner, ty, nil
 	case ExprCast:
 		// An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the
 		// string-literal form `'{…}'::T[]` and a bare NULL; every other array cast (runtime
@@ -13800,6 +13970,76 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 	}
 }
 
+// resolveCollationName resolves a collation NAME to its loaded table (spec/design/collation.md §1).
+// C is the built-in byte / code-point order → nil (the unchanged fast path); any other name must be
+// loaded (db.ImportCollation), else 42704.
+func resolveCollationName(catalog *Database, name string) (*Collation, error) {
+	if name == "C" {
+		return nil, nil
+	}
+	if c := catalog.readSnap().collation(name); c != nil {
+		return c, nil
+	}
+	return nil, NewError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
+}
+
+// explicitCollation returns the single EXPLICIT collation an expression subtree forces, or "" if it
+// forces none (spec/design/collation.md §1). In slice 1c the only source of an explicit collation is
+// a COLLATE node (columns are implicitly C), so this finds the outermost COLLATE and, through the one
+// text-combining operator || , detects an explicit-vs-explicit conflict (42P21). Propagation through
+// CASE / COALESCE / function results is a deferred follow-on (those reset to the implicit default — a
+// documented 1c narrowing, collation.md §14).
+func explicitCollation(e Expr) (string, error) {
+	switch e.Kind {
+	case ExprCollate:
+		return e.Collate.Collation, nil
+	case ExprBinary:
+		if e.Binary.Op == OpConcat {
+			l, err := explicitCollation(e.Binary.Lhs)
+			if err != nil {
+				return "", err
+			}
+			r, err := explicitCollation(e.Binary.Rhs)
+			if err != nil {
+				return "", err
+			}
+			return combineExplicit(l, r)
+		}
+		return "", nil
+	default:
+		return "", nil
+	}
+}
+
+// combineExplicit combines two operands' explicit collations (spec/design/collation.md §1/§7). Two
+// DIFFERENT explicit collations are a conflict (42P21, the explicit-mismatch error PG raises);
+// otherwise the single explicit collation, or "" when neither forces one.
+func combineExplicit(a, b string) (string, error) {
+	if a != "" && b != "" && a != b {
+		return "", NewError(CollationMismatch,
+			fmt.Sprintf("collation mismatch between explicit collations %q and %q", a, b))
+	}
+	if a != "" {
+		return a, nil
+	}
+	return b, nil
+}
+
+// collatedCmp compares two non-NULL text values under a loaded collation (spec/design/collation.md
+// §6/§7): order by the UCA sort keys, whose memcmp order IS the collation order. The caller charges
+// the collate cost and handles NULLs.
+func collatedCmp(coll *Collation, a, b string) (int, error) {
+	ka, err := SortKey(coll, a)
+	if err != nil {
+		return 0, err
+	}
+	kb, err := SortKey(coll, b)
+	if err != nil {
+		return 0, err
+	}
+	return bytes.Compare(ka, kb), nil
+}
+
 func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	switch b.Op {
 	case OpAdd, OpSub, OpMul, OpDiv, OpMod:
@@ -13878,7 +14118,32 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		if err := classifyComparable(lt, rt); err != nil {
 			return nil, resolvedType{}, err
 		}
-		return &rExpr{kind: reCompare, op: b.Op, lhs: rl, rhs: rr},
+		// Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text
+		// comparison is collatable; a COLLATE on a non-text operand was already rejected 42804 at the
+		// Collate node. The explicit collation is found by walking each AST operand; two DIFFERENT
+		// explicit collations conflict (42P21). In 1c every column is implicitly C, so the only
+		// reachable conflict is explicit-vs-explicit.
+		var coll *Collation
+		if lt.kind == rtText && rt.kind == rtText {
+			lc, err := explicitCollation(b.Lhs)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			rc, err := explicitCollation(b.Rhs)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			name, err := combineExplicit(lc, rc)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if name != "" {
+				if coll, err = resolveCollationName(s.catalog, name); err != nil {
+					return nil, resolvedType{}, err
+				}
+			}
+		}
+		return &rExpr{kind: reCompare, op: b.Op, lhs: rl, rhs: rr, collation: coll},
 			resolvedType{kind: rtBool}, nil
 	case OpConcat:
 		return resolveConcat(s, b.Lhs, b.Rhs, ag, params)
@@ -15851,6 +16116,35 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		if err := m.Guard(); err != nil {
 			return Value{}, err
 		}
+		// A collated ORDERING comparison (< <= > >=) over two non-NULL text values orders by the
+		// collation's UCA sort key (spec/design/collation.md §7), charging the collate unit per code
+		// point of each operand (cost.md "collate"). =/<> are byte-equality even under a deterministic
+		// collation (§7), so they take the plain path and charge no collate. A NULL operand makes the
+		// result Unknown (no sort key).
+		if e.collation != nil && (e.op == OpLt || e.op == OpGt || e.op == OpLe || e.op == OpGe) {
+			if a.Kind == ValText && b.Kind == ValText {
+				m.Charge(Costs.Collate * int64(utf8.RuneCountInString(a.Str)+utf8.RuneCountInString(b.Str)))
+				if err := m.Guard(); err != nil {
+					return Value{}, err
+				}
+				c, err := collatedCmp(e.collation, a.Str, b.Str)
+				if err != nil {
+					return Value{}, err
+				}
+				switch e.op {
+				case OpLt:
+					return BoolValue(c < 0), nil
+				case OpGt:
+					return BoolValue(c > 0), nil
+				case OpLe:
+					return BoolValue(c <= 0), nil
+				default: // OpGe
+					return BoolValue(c >= 0), nil
+				}
+			}
+			// Either operand NULL ⇒ Unknown (text comparison is three-valued).
+			return Value{Kind: ValNull}, nil
+		}
 		switch e.op {
 		case OpEq:
 			return from3(a.Eq3(b)), nil
@@ -16561,6 +16855,113 @@ func not3(a ThreeValued) ThreeValued {
 	default: // Unknown
 		return Unknown
 	}
+}
+
+// sortRows sorts rows by the ORDER BY keys (spec/design/grammar.md §10). The all-C fast path is a
+// stable sort over the value comparator; if ANY key carries a collation, the collation-aware
+// sortRowsCollated decorate sorter runs instead (it can fail — an unmapped code point is 0A000).
+// The row type is generic over Row (the scan path) and [][]Value (the setop / aggregate paths):
+// both have the core type []Value, so a single comparator family serves every sort site.
+func sortRows[R ~[]Value](rows []R, order []orderSlot) error {
+	for _, k := range order {
+		if k.collation != nil {
+			return sortRowsCollated(rows, order)
+		}
+	}
+	sort.SliceStable(rows, func(a, b int) bool { return cmpRowsByOrder(rows[a], rows[b], order) < 0 })
+	return nil
+}
+
+// cmpRowsByOrder compares two rows by the (all-C) ORDER BY keys — the first non-equal key decides; a
+// full tie is 0 (the stable sort then keeps input order). Only used when no key is collated.
+func cmpRowsByOrder[R ~[]Value](a, b R, order []orderSlot) int {
+	for _, k := range order {
+		if c := keyCmp(a[k.idx], b[k.idx], k.descending, k.nullsFirst); c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
+// sortRowsCollated sorts rows when at least one ORDER BY key is collated (spec/design/collation.md
+// §6/§8). Decorate-sort-undecorate: each collated key's UCA sort key is built ONCE per row up front
+// (propagating a SortKey failure — e.g. 0A000 for an unmapped code point — at this deterministic
+// per-row point, not inside the comparator), then the rows are sorted by the precomputed key bytes
+// for collated slots and the value comparator for the rest. The sort is UNMETERED like every sort
+// (cost.md §3); the collate cost is charged at the comparison evaluator (collation.md §11). A
+// collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
+func sortRowsCollated[R ~[]Value](rows []R, order []orderSlot) error {
+	type deco struct {
+		keys [][]byte // one per collated slot, in slot order; nil entry ⇒ a NULL value
+		row  R
+	}
+	d := make([]deco, len(rows))
+	for i, row := range rows {
+		var keys [][]byte
+		for _, k := range order {
+			if k.collation == nil {
+				continue
+			}
+			if row[k.idx].Kind == ValText {
+				sk, err := SortKey(k.collation, row[k.idx].Str)
+				if err != nil {
+					return err
+				}
+				keys = append(keys, sk)
+			} else {
+				keys = append(keys, nil) // NULL (a collated slot is text) — handled by NULL placement
+			}
+		}
+		d[i] = deco{keys: keys, row: row}
+	}
+	sort.SliceStable(d, func(a, b int) bool {
+		return cmpDecorated(d[a].keys, d[a].row, d[b].keys, d[b].row, order) < 0
+	})
+	for i := range d {
+		rows[i] = d[i].row
+	}
+	return nil
+}
+
+// cmpDecorated compares two decorated rows (precomputed collated-key bytes + the row) by the ORDER BY
+// keys. A collated slot compares its precomputed sort-key bytes (NULL placement + the descending flip
+// applied here, mirroring keyCmp); a non-collated slot compares the row values via keyCmp.
+func cmpDecorated[R ~[]Value](akeys [][]byte, arow R, bkeys [][]byte, brow R, order []orderSlot) int {
+	ci := 0 // advances once per collated slot (keys stored in slot order)
+	for _, k := range order {
+		var c int
+		if k.collation != nil {
+			ak, bk := akeys[ci], bkeys[ci]
+			ci++
+			switch {
+			case ak == nil && bk == nil:
+				c = 0
+			case ak == nil:
+				if k.nullsFirst {
+					c = -1
+				} else {
+					c = 1
+				}
+			case bk == nil:
+				if k.nullsFirst {
+					c = 1
+				} else {
+					c = -1
+				}
+			default:
+				c = bytes.Compare(ak, bk)
+				if k.descending {
+					c = -c
+				}
+			}
+		} else {
+			c = keyCmp(arow[k.idx], brow[k.idx], k.descending, k.nullsFirst)
+		}
+		if c != 0 {
+			return c
+		}
+	}
+	return 0
 }
 
 // keyCmp is one ORDER BY key's total-order comparison, returning <0, 0, >0. NULL placement

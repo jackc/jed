@@ -117,6 +117,11 @@ pub enum SqlState {
     /// 42809 — wrong object type: DROP TABLE of an index name, DROP INDEX of a table name
     /// (spec/design/indexes.md §2).
     WrongObjectType,
+    /// 42P21 — collation mismatch: two DIFFERENT explicit collations combined in one comparison
+    /// (`'a' COLLATE "C" < 'b' COLLATE "en-US"`; spec/design/collation.md §1/§7). PG's separate
+    /// 42P22 (indeterminate_collation — conflicting IMPLICIT collations) is reachable once
+    /// per-column collations land in slice 1d.
+    CollationMismatch,
     /// 2BP01 — dependent objects still exist: `DROP TYPE ... RESTRICT` of a composite type a
     /// column or another composite field still references (spec/design/composite.md §7).
     DependentObjectsStillExist,
@@ -215,6 +220,7 @@ impl SqlState {
             SqlState::UndefinedParameter => "42P02",
             SqlState::DuplicateObject => "42710",
             SqlState::WrongObjectType => "42809",
+            SqlState::CollationMismatch => "42P21",
             SqlState::NameTooLong => "42622",
             SqlState::GeneratedAlways => "428C9",
             SqlState::DependentObjectsStillExist => "2BP01",

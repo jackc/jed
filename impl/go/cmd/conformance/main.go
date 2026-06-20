@@ -105,6 +105,61 @@ func suitesDir() string {
 	}
 }
 
+// specDir is the repo's spec/ directory — the root that `# load-collation:` fixture paths resolve
+// against (spec/design/collation.md §10). suitesDir() is spec/conformance/suites.
+func specDir() string {
+	return filepath.Dir(filepath.Dir(suitesDir()))
+}
+
+// parseLoadCollationDirective parses a `# load-collation: <name> = <fixture>[, <fixture>…]` line —
+// the corpus's deterministic, host-free way to load a collation before the records that use it
+// (spec/design/collation.md §10). Fixture paths are relative to spec/ and concatenated (newline-
+// joined) into one definition stream. Returns the name and paths, or false if not this directive.
+func parseLoadCollationDirective(line string) (string, []string, bool) {
+	body, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "load-collation:")
+	if !ok {
+		return "", nil, false
+	}
+	name, files, ok := strings.Cut(body, "=")
+	if !ok {
+		return "", nil, false
+	}
+	var paths []string
+	for _, f := range strings.Split(files, ",") {
+		if f = strings.TrimSpace(f); f != "" {
+			paths = append(paths, f)
+		}
+	}
+	if len(paths) == 0 {
+		return "", nil, false
+	}
+	return strings.TrimSpace(name), paths, true
+}
+
+// loadCollation compiles + imports a collation named `name` from the `files` fixtures (relative to
+// spec/) into db (spec/design/collation.md §4/§10). A read / compile / import failure fails the test.
+func loadCollation(db *jed.Database, name string, files []string) error {
+	var def strings.Builder
+	for i, f := range files {
+		b, err := os.ReadFile(filepath.Join(specDir(), f))
+		if err != nil {
+			return fmt.Errorf("load-collation: cannot read fixture %s: %w", f, err)
+		}
+		if i > 0 {
+			def.WriteByte('\n')
+		}
+		def.Write(b)
+	}
+	coll, err := jed.CompileCollation(name, def.String())
+	if err != nil {
+		return fmt.Errorf("load-collation: compiling %s: %w", name, err)
+	}
+	if _, err := db.ImportCollation(coll); err != nil {
+		return fmt.Errorf("load-collation: importing %s: %w", name, err)
+	}
+	return nil
+}
+
 func parseRequires(text string) []string {
 	for _, line := range strings.Split(text, "\n") {
 		t := strings.TrimSpace(line)
@@ -425,6 +480,16 @@ func runFile(text string) error {
 			continue
 		}
 		if strings.HasPrefix(line, "#") {
+			// `# load-collation:` is an ACTION (load now), not a pending assertion: compile + import
+			// the named collation from its fixtures into this file's db before the records run
+			// (spec/design/collation.md §10).
+			if name, files, ok := parseLoadCollationDirective(line); ok {
+				if err := loadCollation(db, name, files); err != nil {
+					return err
+				}
+				i++
+				continue
+			}
 			// `# cost:` / `# names:` / `# types:` bind to the next record; every other comment
 			// is ignored.
 			if n, ok := parseCostDirective(line); ok {

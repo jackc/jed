@@ -68,7 +68,13 @@ import {
   resolveColType,
 } from "./catalog.ts";
 import { LifetimeBudget, Meter } from "./cost.ts";
+import {
+  type Collation,
+  serializeTable,
+  sortKey as collationSortKey,
+} from "./collation.ts";
 import { COSTS } from "./costs.ts";
+import { crc32Ieee } from "./format.ts";
 import {
   Decimal,
   decimalFromParts,
@@ -329,6 +335,12 @@ export class Snapshot {
   // it (sequences.md §5). SequenceDef objects are never mutated in place (only replaced/removed),
   // so the shallow Map copy in clone is safe.
   sequences: Map<string, SequenceDef>;
+  // collations holds loaded collations, keyed by their exact (CASE-SENSITIVE) name — collation names
+  // are quoted identifiers ("en-US", spec/design/collation.md §1). C is never stored (table-free,
+  // built in). Imported by db.importCollation (slice 1c: in-memory only — no format_version bump, no
+  // catalog entry yet; baking is slice 1d). Not serialized this slice. Collation objects are never
+  // mutated in place (only added), so the shallow Map copy in clone is safe.
+  collations: Map<string, Collation>;
 
   constructor(
     txid: bigint = 0n,
@@ -337,6 +349,7 @@ export class Snapshot {
     indexStores: Map<string, TableStore> = new Map(),
     types: Map<string, CompositeType> = new Map(),
     sequences: Map<string, SequenceDef> = new Map(),
+    collations: Map<string, Collation> = new Map(),
   ) {
     this.txid = txid;
     this.tables = tables;
@@ -344,11 +357,12 @@ export class Snapshot {
     this.indexStores = indexStores;
     this.types = types;
     this.sequences = sequences;
+    this.collations = collations;
   }
 
   // clone returns an independent copy: the catalog maps are shallow (Table / CompositeType /
-  // SequenceDef objects are never mutated in place — only added/removed) and each store is an O(1)
-  // persistent-map clone (pmap.ts).
+  // SequenceDef / Collation objects are never mutated in place — only added/removed) and each store
+  // is an O(1) persistent-map clone (pmap.ts).
   clone(): Snapshot {
     return new Snapshot(
       this.txid,
@@ -357,7 +371,14 @@ export class Snapshot {
       cloneStores(this.indexStores),
       new Map(this.types),
       new Map(this.sequences),
+      new Map(this.collations),
     );
+  }
+
+  // collation looks up a loaded collation by its exact (case-sensitive) name. C is NOT here — it is
+  // table-free and built in (spec/design/collation.md §1). undefined ⇒ not loaded (resolver → 42704).
+  collation(name: string): Collation | undefined {
+    return this.collations.get(name);
   }
 
   // table looks up a table definition by name (case-insensitive).
@@ -1381,6 +1402,13 @@ export class Database {
     return this.readSnap().compositeType(name);
   }
 
+  // collationByName looks up a loaded collation by its exact (case-sensitive) name in the visible
+  // snapshot (spec/design/collation.md §1); undefined if not loaded. Public so the free resolver can
+  // reach it (the readSnap seam is private), mirroring compositeType.
+  collationByName(name: string): Collation | undefined {
+    return this.readSnap().collation(name);
+  }
+
   // colTypeOf resolves a catalog Type into a self-contained ColType against the visible snapshot's
   // composite definitions (the codec/coercion tree — spec/design/composite.md §4). Used to coerce a
   // composite-element array literal (array-of-composite, array.md §12 AC1).
@@ -1401,6 +1429,34 @@ export class Database {
   // transactional — transactions.md §4.5).
   putTable(t: Table): void {
     this.working().putTable(t, this.pageSize);
+  }
+
+  // importCollation imports a collation into the database (the privileged host op,
+  // spec/design/collation.md §4). The collation becomes usable by name in COLLATE / ORDER BY (slice
+  // 1c: in-memory only — placed in the committed catalog, NOT yet persisted; baking is slice 1d).
+  // Idempotent by (name, content-hash): re-importing the identical table is a no-op success; importing
+  // a DIFFERENT table under a name already in use is 42710 (re-collation is the explicit path, §12). C
+  // is never imported (table-free, built in). Returns the imported name.
+  importCollation(coll: Collation): string {
+    if (coll.name === "C") {
+      throw engineError(
+        "duplicate_object",
+        "the C collation is built in and cannot be imported",
+      );
+    }
+    const hash = crc32Ieee(serializeTable(coll));
+    const existing = this.committed.collation(coll.name);
+    if (existing !== undefined) {
+      if (crc32Ieee(serializeTable(existing)) === hash) {
+        return coll.name; // idempotent — same (name, content) already loaded
+      }
+      throw engineError(
+        "duplicate_object",
+        `collation "${coll.name}" is already loaded with different content`,
+      );
+    }
+    this.committed.collations.set(coll.name, coll);
+    return coll.name;
   }
 
   // executeStmt executes one parsed statement with no bind parameters.
@@ -5272,11 +5328,24 @@ export class Database {
       unifySetopColumn(l, rhs.columnTypes[i]!, so.op),
     );
     const columnNames = lhs.columnNames;
-    const order: OrderSlot[] = so.orderBy.map((key) => ({
-      idx: resolveSetopOrderKey(key, columnNames),
-      descending: key.descending,
-      nullsFirst: key.nullsFirst,
-    }));
+    const order: OrderSlot[] = so.orderBy.map((key) => {
+      const idx = resolveSetopOrderKey(key, columnNames);
+      // An explicit COLLATE on a set-operation ORDER BY key (spec/design/collation.md §1): the output
+      // column must be text (42804); the name resolves ("C", else loaded or 42704).
+      let collation: Collation | null = null;
+      if (key.collation !== null) {
+        if (columnTypes[idx]!.kind !== "text") {
+          throw typeError("collations are not supported by this column's type");
+        }
+        collation = resolveCollationName(this, key.collation);
+      }
+      return {
+        idx,
+        descending: key.descending,
+        nullsFirst: key.nullsFirst,
+        collation,
+      };
+    });
     return {
       kind: "setOp",
       op: so.op,
@@ -5310,13 +5379,7 @@ export class Database {
     const cost = left.cost + right.cost;
 
     if (plan.order.length > 0) {
-      rows.sort((a, b) => {
-        for (const k of plan.order) {
-          const c = keyCmp(a[k.idx]!, b[k.idx]!, k.descending, k.nullsFirst);
-          if (c !== 0) return c;
-        }
-        return 0;
-      });
+      sortRows(rows, plan.order);
     }
 
     const n = BigInt(rows.length);
@@ -5665,6 +5728,15 @@ export class Database {
         );
       }
       const idx = r.index;
+      // An explicit COLLATE on the sort key (spec/design/collation.md §1): the column must be text
+      // (42804) and the name must resolve ("C" → byte order, else loaded or 42704).
+      let collation: Collation | null = null;
+      if (key.collation !== null) {
+        if (!typeIsText(scope.columnAt(idx).type)) {
+          throw typeError("collations are not supported by this column's type");
+        }
+        collation = resolveCollationName(scope.catalog, key.collation);
+      }
       let slot = idx;
       if (isAgg) {
         slot = groupKeys.indexOf(idx);
@@ -5674,6 +5746,7 @@ export class Database {
         idx: slot,
         descending: key.descending,
         nullsFirst: key.nullsFirst,
+        collation,
       });
     }
 
@@ -6053,6 +6126,51 @@ export class Database {
         COSTS.valueDecompress * BigInt(su.slabs),
     );
 
+    // A collated ORDER BY cannot use the C-ordered Sorter / spill (collated keys are slice 1e), and
+    // collation is in-memory only this slice — so materialize the survivors and sort them with the
+    // collation-aware decorate sorter (spec/design/collation.md §8). The metered costs (storageRowRead
+    // per scanned row, rowProduced per windowed output) are identical to the Sorter path; the sort
+    // itself is unmetered like every sort (cost.md §3).
+    if (plan.order.some((k) => k.collation !== null)) {
+      const rows: Row[] = [];
+      if (!empty) {
+        store.scanRange(bound, (_key, rawRow) => {
+          meter.guard();
+          meter.charge(COSTS.storageRowRead);
+          const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
+          if (
+            plan.filter !== null &&
+            !isTrue(evalExpr(plan.filter, row, env, meter))
+          ) {
+            return true;
+          }
+          rows.push(row);
+          return true;
+        });
+      }
+      sortRows(rows, plan.order);
+      const total = BigInt(rows.length);
+      const offset = plan.offset ?? 0n;
+      const start = offset < total ? offset : total;
+      let end = total;
+      if (plan.limit !== null && plan.limit < total - start) {
+        end = start + plan.limit;
+      }
+      const out: Value[][] = [];
+      for (let i = start; i < end; i++) {
+        const row = rows[Number(i)]!;
+        meter.guard();
+        meter.charge(COSTS.rowProduced);
+        out.push(plan.projections.map((p) => evalExpr(p, row, env, meter)));
+      }
+      return {
+        columnNames: plan.columnNames,
+        columnTypes: plan.columnTypes,
+        rows: out,
+        cost: meter.accrued,
+      };
+    }
+
     // Stream the scan → filter → sorter. ORDER BY is blocking, so the scan never short-circuits: every
     // in-range row is read (charging storageRowRead), its touched columns resolved (large-values.md
     // §14), the WHERE applied (charging operator_eval), and a survivor pushed into the sorter, which
@@ -6417,18 +6535,7 @@ export class Database {
     // sort their GROUP rows in the aggregate branch below — not these pre-aggregation rows — so
     // this is gated to plain queries.
     if (!plan.isAgg && plan.order.length > 0) {
-      rows.sort((a, b) => {
-        for (const key of plan.order) {
-          const c = keyCmp(
-            a[key.idx]!,
-            b[key.idx]!,
-            key.descending,
-            key.nullsFirst,
-          );
-          if (c !== 0) return c;
-        }
-        return 0;
-      });
+      sortRows(rows, plan.order);
     }
 
     // LIMIT / OFFSET window bounds over a result of `len` rows. Clamp in the bigint domain
@@ -6501,18 +6608,7 @@ export class Database {
       }
       // ORDER BY over the grouped output (keys are synthetic group-key slots).
       if (plan.order.length > 0) {
-        groupRows.sort((a, b) => {
-          for (const key of plan.order) {
-            const c = keyCmp(
-              a[key.idx]!,
-              b[key.idx]!,
-              key.descending,
-              key.nullsFirst,
-            );
-            if (c !== 0) return c;
-          }
-          return 0;
-        });
+        sortRows(groupRows, plan.order);
       }
       // Window + project; only an emitted row charges rowProduced + its projection cost.
       const [start, end] = windowBounds(groupRows.length);
@@ -7646,6 +7742,10 @@ function asBoundTerm(
   pkType: ScalarType,
 ): BoundTerm | null {
   if (e.kind !== "compare") return null;
+  // A collated comparison orders by the collation's UCA sort key, but the PK/index B-tree is byte (C)
+  // ordered, so a byte-range bound would be wrong — exclude it (it stays a full scan + the residual
+  // collated filter; spec/design/collation.md §8, collated keys are slice 1e).
+  if (e.collation !== null) return null;
   if (
     e.op !== "eq" &&
     e.op !== "lt" &&
@@ -8377,7 +8477,17 @@ type RExpr =
   | { kind: "neg"; result: ScalarType; operand: RExpr }
   | { kind: "not"; operand: RExpr }
   | { kind: "arith"; op: BinaryOp; result: ScalarType; lhs: RExpr; rhs: RExpr }
-  | { kind: "compare"; op: BinaryOp; lhs: RExpr; rhs: RExpr }
+  // The derived collation (spec/design/collation.md §7): null is the C / default byte order (the
+  // unchanged fast path); a non-null collation orders the ORDERING comparisons (< <= > >=) by its UCA
+  // sort key. =/<> stay byte-equality (deterministic-collation equality IS byte-identity), but it is
+  // derived + conflict-checked (42P21) for every comparison op.
+  | {
+      kind: "compare";
+      op: BinaryOp;
+      lhs: RExpr;
+      rhs: RExpr;
+      collation: Collation | null;
+    }
   | { kind: "and"; lhs: RExpr; rhs: RExpr }
   | { kind: "or"; lhs: RExpr; rhs: RExpr }
   | { kind: "isNull"; operand: RExpr; negated: boolean }
@@ -8671,8 +8781,16 @@ function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
 // right relation is rels[k+1].
 type PlanJoin = { kind: JoinKind; on: RExpr | null };
 
-// OrderSlot is a resolved ORDER BY key: a flat/synthetic slot + per-key direction flags.
-type OrderSlot = { idx: number; descending: boolean; nullsFirst: boolean };
+// OrderSlot is a resolved ORDER BY key: a flat/synthetic slot + per-key direction flags + an optional
+// collation. A null collation is the C/value order; a non-null collation orders this key by its UCA
+// sort key (spec/design/collation.md §8) via the decorate sorter — it never reaches the spill Sorter
+// (collation is in-memory only this slice), which ignores the field.
+type OrderSlot = {
+  idx: number;
+  descending: boolean;
+  nullsFirst: boolean;
+  collation: Collation | null;
+};
 
 // SelectPlan is a resolved SELECT, executable against an outer-row environment (the execute half
 // of the old runSelect, lifted to a value so a correlated subquery can re-run it per outer row).
@@ -9044,6 +9162,8 @@ function exprHasAggregate(e: Expr): boolean {
       return isAggregateName(e.name) || e.args.some(exprHasAggregate);
     case "cast":
       return exprHasAggregate(e.inner);
+    case "collate":
+      return exprHasAggregate(e.inner);
     case "unary":
       return exprHasAggregate(e.operand);
     case "isNull":
@@ -9147,6 +9267,8 @@ function rejectCheckStructure(e: Expr): void {
       return;
     case "cast":
       return rejectCheckStructure(e.inner);
+    case "collate":
+      return rejectCheckStructure(e.inner);
     case "unary":
     case "isNull":
       return rejectCheckStructure(e.operand);
@@ -9230,6 +9352,8 @@ function rejectDefaultStructure(e: Expr): void {
       return;
     case "cast":
       return rejectDefaultStructure(e.inner);
+    case "collate":
+      return rejectDefaultStructure(e.inner);
     case "unary":
     case "isNull":
       return rejectDefaultStructure(e.operand);
@@ -9295,6 +9419,8 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
         note(e.name);
         return;
       case "cast":
+        return walk(e.inner);
+      case "collate":
         return walk(e.inner);
       case "unary":
       case "isNull":
@@ -11209,6 +11335,8 @@ function exprCallsSeqMutator(e: Expr): boolean {
       );
     case "cast":
       return exprCallsSeqMutator(e.inner);
+    case "collate":
+      return exprCallsSeqMutator(e.inner);
     case "unary":
     case "isNull":
       return exprCallsSeqMutator(e.operand);
@@ -11424,6 +11552,7 @@ function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
       }
       break;
     case "cast":
+    case "collate":
       collectExprPrivs(e.inner, req, locals);
       break;
     case "unary":
@@ -11504,6 +11633,7 @@ function exprReadsColumns(e: Expr): boolean {
         )
       );
     case "cast":
+    case "collate":
       return exprReadsColumns(e.inner);
     case "unary":
     case "isNull":
@@ -12152,6 +12282,22 @@ function resolve(
         type: { kind: "bool" },
       };
     }
+    case "collate": {
+      // `expr COLLATE "name"` (spec/design/collation.md §1) — a postfix collation operator. Resolve
+      // the inner expression, require a collatable (text) type (42804, PG-matching), and validate the
+      // named collation exists ("C" or loaded, else 42704). A runtime PASSTHROUGH: a collation only
+      // changes the ORDERING comparisons / ORDER BY, derived from the AST at those sites
+      // (explicitCollation / OrderKey.collation), so resolving returns the inner node + type
+      // unchanged. The hint flows through (COLLATE never changes the type).
+      const r = resolve(scope, e.inner, ctx, ag, params);
+      if (r.type.kind !== "text" && r.type.kind !== "null") {
+        throw typeError(
+          `collations are not supported by type ${rtName(r.type)}`,
+        );
+      }
+      resolveCollationName(scope.catalog, e.collation); // surfaces 42704 for an unknown name
+      return r;
+    }
     case "cast": {
       // An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the string-literal
       // form `'{…}'::T[]` and a bare NULL; every other array cast (runtime text→array, array→text,
@@ -12591,6 +12737,54 @@ function resolve(
   }
 }
 
+// resolveCollationName resolves a collation NAME to its loaded table (spec/design/collation.md §1).
+// C is the built-in byte / code-point order → null (the unchanged fast path); any other name must be
+// loaded (db.importCollation), else 42704.
+function resolveCollationName(catalog: Database, name: string): Collation | null {
+  if (name === "C") return null;
+  const c = catalog.collationByName(name);
+  if (c === undefined) {
+    throw engineError(
+      "undefined_object",
+      `collation "${name}" does not exist`,
+    );
+  }
+  return c;
+}
+
+// explicitCollation returns the single EXPLICIT collation an expression subtree forces, or null
+// (spec/design/collation.md §1). In slice 1c the only source of an explicit collation is a collate
+// node (columns are implicitly C), so this finds the outermost COLLATE and, through the one
+// text-combining operator || , detects an explicit-vs-explicit conflict (42P21). Propagation through
+// CASE / COALESCE / function results is a deferred follow-on (collation.md §14).
+function explicitCollation(e: Expr): string | null {
+  if (e.kind === "collate") return e.collation;
+  if (e.kind === "binary" && e.op === "concat") {
+    return combineExplicit(explicitCollation(e.lhs), explicitCollation(e.rhs));
+  }
+  return null;
+}
+
+// combineExplicit combines two operands' explicit collations (spec/design/collation.md §1/§7). Two
+// DIFFERENT explicit collations are a conflict (42P21, the explicit-mismatch error PG raises);
+// otherwise the single explicit collation, or null when neither forces one.
+function combineExplicit(a: string | null, b: string | null): string | null {
+  if (a !== null && b !== null && a !== b) {
+    throw engineError(
+      "collation_mismatch",
+      `collation mismatch between explicit collations "${a}" and "${b}"`,
+    );
+  }
+  return a !== null ? a : b;
+}
+
+// collatedCmp compares two non-NULL text values under a loaded collation (spec/design/collation.md
+// §6/§7): order by the UCA sort keys, whose memcmp order IS the collation order. The caller charges
+// the collate cost and handles NULLs. Returns <0, 0, >0.
+function collatedCmp(coll: Collation, a: string, b: string): number {
+  return cmpBytes(collationSortKey(coll, a), collationSortKey(coll, b));
+}
+
 function resolveBinary(
   scope: Scope,
   op: BinaryOp,
@@ -12696,8 +12890,23 @@ function resolveBinary(
         cl = widenFloatTo(p.rl, p.lt.ty, w);
         cr = widenFloatTo(p.rr, p.rt.ty, w);
       }
+      // Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text
+      // comparison is collatable; a COLLATE on a non-text operand was already rejected 42804 at the
+      // collate node. The explicit collation is found by walking each AST operand; two DIFFERENT
+      // explicit collations conflict (42P21). In 1c every column is implicitly C, so the only
+      // reachable conflict is explicit-vs-explicit.
+      let collation: Collation | null = null;
+      if (p.lt.kind === "text" && p.rt.kind === "text") {
+        const name = combineExplicit(
+          explicitCollation(lhs),
+          explicitCollation(rhs),
+        );
+        if (name !== null) {
+          collation = resolveCollationName(scope.catalog, name);
+        }
+      }
       return {
-        node: { kind: "compare", op, lhs: cl, rhs: cr },
+        node: { kind: "compare", op, lhs: cl, rhs: cr, collation },
         type: { kind: "bool" },
       };
     }
@@ -15635,6 +15844,41 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // where <=/>= decompose internally (spec/design/cost.md §3 "decimal_work").
       m.charge(COSTS.decimalWork * BigInt(decimalCmpWork(a, b) - 1));
       m.guard();
+      // A collated ORDERING comparison (< <= > >=) over two non-NULL text values orders by the
+      // collation's UCA sort key (spec/design/collation.md §7), charging the collate unit per code
+      // point of each operand (cost.md "collate"). =/<> are byte-equality even under a deterministic
+      // collation (§7), so they take the plain path and charge no collate. A NULL operand ⇒ Unknown
+      // (no sort key). [...s] counts code points (NOT s.length — the UTF-16 trap, §8).
+      if (
+        e.collation !== null &&
+        (e.op === "lt" || e.op === "gt" || e.op === "le" || e.op === "ge")
+      ) {
+        if (a.kind === "text" && b.kind === "text") {
+          m.charge(
+            COSTS.collate *
+              BigInt([...a.text].length + [...b.text].length),
+          );
+          m.guard();
+          const c = collatedCmp(e.collation, a.text, b.text);
+          let res: boolean;
+          switch (e.op) {
+            case "lt":
+              res = c < 0;
+              break;
+            case "gt":
+              res = c > 0;
+              break;
+            case "le":
+              res = c <= 0;
+              break;
+            default: // "ge"
+              res = c >= 0;
+          }
+          return { kind: "bool", value: res };
+        }
+        // Either operand NULL ⇒ Unknown (text comparison is three-valued).
+        return { kind: "null" };
+      }
       switch (e.op) {
         case "eq":
           return from3(eq3(a, b));
@@ -16484,6 +16728,82 @@ function not3(a: ThreeValued): ThreeValued {
   if (a === "true") return "false";
   if (a === "false") return "true";
   return "unknown";
+}
+
+// sortRows sorts rows by the ORDER BY keys (spec/design/grammar.md §10). The all-C fast path is a
+// stable sort over the value comparator; if ANY key carries a collation, the collation-aware
+// sortRowsCollated decorate sorter runs instead (it can throw — an unmapped code point is 0A000).
+// (Array.prototype.sort is stable in modern engines — the runtime jed targets, spill.md §6.)
+function sortRows(rows: Row[], order: OrderSlot[]): void {
+  if (order.some((k) => k.collation !== null)) {
+    sortRowsCollated(rows, order);
+    return;
+  }
+  rows.sort((a, b) => cmpRowsByOrder(a, b, order));
+}
+
+// cmpRowsByOrder compares two rows by the (all-C) ORDER BY keys — the first non-equal key decides; a
+// full tie is 0 (the stable sort then keeps input order). Only used when no key is collated.
+function cmpRowsByOrder(a: Row, b: Row, order: OrderSlot[]): number {
+  for (const k of order) {
+    const c = keyCmp(a[k.idx]!, b[k.idx]!, k.descending, k.nullsFirst);
+    if (c !== 0) return c;
+  }
+  return 0;
+}
+
+// sortRowsCollated sorts rows when at least one ORDER BY key is collated (spec/design/collation.md
+// §6/§8). Decorate-sort-undecorate: each collated key's UCA sort key is built ONCE per row up front
+// (propagating a sortKey failure — e.g. 0A000 for an unmapped code point — at this deterministic
+// per-row point, not inside the comparator), then the rows are sorted by the precomputed key bytes
+// for collated slots and the value comparator for the rest. The sort is UNMETERED like every sort
+// (cost.md §3); the collate cost is charged at the comparison evaluator (collation.md §11). A
+// collated ORDER BY is in-memory only this slice, so this never spills (collated keys are slice 1e).
+function sortRowsCollated(rows: Row[], order: OrderSlot[]): void {
+  // (keys[i], row) per row; a keys entry is null for a NULL value, the sort-key bytes otherwise.
+  const deco: { keys: (Uint8Array | null)[]; row: Row }[] = rows.map((row) => {
+    const keys: (Uint8Array | null)[] = [];
+    for (const k of order) {
+      if (k.collation === null) continue;
+      const v = row[k.idx]!;
+      keys.push(v.kind === "text" ? collationSortKey(k.collation, v.text) : null);
+    }
+    return { keys, row };
+  });
+  deco.sort((a, b) => cmpDecorated(a.keys, a.row, b.keys, b.row, order));
+  for (let i = 0; i < deco.length; i++) rows[i] = deco[i]!.row;
+}
+
+// cmpDecorated compares two decorated rows (precomputed collated-key bytes + the row) by the ORDER BY
+// keys. A collated slot compares its precomputed sort-key bytes (NULL placement + the descending flip
+// applied here, mirroring keyCmp); a non-collated slot compares the row values via keyCmp.
+function cmpDecorated(
+  akeys: (Uint8Array | null)[],
+  arow: Row,
+  bkeys: (Uint8Array | null)[],
+  brow: Row,
+  order: OrderSlot[],
+): number {
+  let ci = 0; // advances once per collated slot (keys stored in slot order)
+  for (const k of order) {
+    let c: number;
+    if (k.collation !== null) {
+      const ak = akeys[ci] ?? null;
+      const bk = bkeys[ci] ?? null;
+      ci++;
+      if (ak === null && bk === null) c = 0;
+      else if (ak === null) c = k.nullsFirst ? -1 : 1;
+      else if (bk === null) c = k.nullsFirst ? 1 : -1;
+      else {
+        c = cmpBytes(ak, bk);
+        if (k.descending) c = -c;
+      }
+    } else {
+      c = keyCmp(arow[k.idx]!, brow[k.idx]!, k.descending, k.nullsFirst);
+    }
+    if (c !== 0) return c;
+  }
+  return 0;
 }
 
 // keyCmp is one ORDER BY key's total-order comparison, returning <0, 0, >0. NULL placement

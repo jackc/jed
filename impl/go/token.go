@@ -12,6 +12,11 @@ const (
 	// lexer strips the quotes and collapses each doubled '' to one ' (no backslash
 	// escapes — standard_conforming_strings, spec/design/types.md §11).
 	TokStr
+	// TokQuotedIdent is a double-quoted identifier's decoded content ("en-US", "C"): the lexer
+	// strips the surrounding " and collapses each doubled "" to one ". Unlike TokWord it is kept
+	// VERBATIM (case-sensitive). Used for collation names (spec/design/collation.md §1); the only
+	// parse position consuming one today is COLLATE "name", so it is a 42601 syntax error elsewhere.
+	TokQuotedIdent
 	// TokDecimal is a decimal literal (a numeric literal containing a '.'): Word holds the
 	// unscaled coefficient as a decimal-digit string (leading zeros allowed, no sign) and Int
 	// holds the scale (fractional digit count). 1.50 → ("150", 2). The sign is TokMinus; the

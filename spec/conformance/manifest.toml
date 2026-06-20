@@ -656,6 +656,10 @@ description = "The reader-liveness watermark — oldest_live_txid is the minimum
 id = "txn.gate_blocking"
 description = "The write-gate `blocks` annotation (Layer 2) — `open <sid> write blocks` asserts the single-writer gate is currently held, so the writer-open is queued rather than run (calling write() now would block the runner) and logically completes the instant the holding writer commits/rolls back: the equivalent serial order. Deterministic on every core (a single-threaded core queues the open; it never needs to truly block); the threaded cores additionally verify real blocking under the race detector. At most one writer may be blocked at a time (the single-writer model). spec/design/concurrency-testing.md §5"
 
+[[capability]]
+id = "expr.collate"
+description = "The COLLATE expression operator + ORDER BY … COLLATE + the host db.ImportCollation load (collation slice 1c, spec/design/collation.md §14). A host loads a collation (the `# load-collation: name = fixture` corpus directive compiles a spec/collation fixture and imports it in-memory); `expr COLLATE \"name\"` and `ORDER BY col COLLATE \"name\"` then order text by that collation's UCA sort key in the ordering comparisons (< <= > >=) — `=`/`<>` stay byte-equality (deterministic-collation equality is byte-identity). `\"C\"` is the built-in byte/code-point order. Errors: two different explicit collations conflict (42P21), an unloaded name is 42704, COLLATE on a non-text type is 42804. Charged by the `collate` cost unit (per code point of each ordering-comparison operand). In-memory only — no persistence/baking yet (that is slice 1d)"
+
 # --- profiles ----------------------------------------------------------------
 # A named bundle of capabilities = a conformance level. `includes` (optional)
 # inherits another profile's capabilities transitively, so profiles are cumulative.

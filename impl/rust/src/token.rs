@@ -13,6 +13,13 @@ pub enum Token {
     /// strips the surrounding quotes and collapses each doubled `''` to one `'`
     /// (standard_conforming_strings; no backslash escapes). See spec/design/types.md §11.
     Str(String),
+    /// A double-quoted identifier's decoded content (`"en-US"`, `"C"`). The lexer strips the
+    /// surrounding `"` and collapses each doubled `""` to one `"`; the content is preserved
+    /// VERBATIM (case-sensitive, hyphens allowed) — unlike a bare `Word`, which callers fold
+    /// case-insensitively. Used for collation names (spec/design/collation.md §1); the only
+    /// parse position that consumes one today is `COLLATE "name"`, so a quoted identifier
+    /// elsewhere is a 42601 syntax error.
+    QuotedIdent(String),
     /// A decimal literal (a numeric literal containing a `.`): the unscaled coefficient as a
     /// decimal-digit string (leading zeros allowed, no sign) and the scale (fractional digit
     /// count). `1.50` → `("150", 2)`, `.5` → `("5", 1)`, `1.` → `("1", 0)`. The sign is the

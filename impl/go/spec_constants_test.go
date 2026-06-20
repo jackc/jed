@@ -408,6 +408,8 @@ func TestCostScheduleMatchesSpec(t *testing.T) {
 			return Costs.SequenceAdvance
 		case "gin_entry":
 			return Costs.GinEntry
+		case "collate":
+			return Costs.Collate
 		default:
 			t.Fatalf("cost unit %q has no Costs field — update this cross-check", id)
 			return 0

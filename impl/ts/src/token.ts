@@ -5,6 +5,9 @@ export type TokenKind =
   | "int" // an integer literal's unsigned magnitude (the sign is "minus")
   | "decimal" // a decimal literal (a numeric literal with a "."); see `decDigits`/`decScale`
   | "str" // a single-quoted string literal's decoded content (the text type)
+  | "quotedIdent" // a double-quoted identifier's decoded content ("en-US", "C") — kept VERBATIM
+  //                (case-sensitive); used for collation names (spec/design/collation.md §1). The only
+  //                parse position that consumes one today is COLLATE "name", so it is a 42601 elsewhere.
   | "comma" // ,
   | "dot" // . — the separator of a qualified column reference (t.col); emitted only when a
   //         "." is NOT part of a numeric literal (spec/design/grammar.md §4/§15)
@@ -52,7 +55,7 @@ export type Token = {
   kind: TokenKind;
   word?: string;
   int?: bigint;
-  str?: string; // decoded content for "str"
+  str?: string; // decoded content for "str" and "quotedIdent"
   // For "decimal": the unscaled coefficient as a decimal-digit string (leading zeros allowed,
   // no sign) and the scale (fractional digit count). 1.50 → ("150", 2). The sign is "minus";
   // the cap check is at resolve (spec/design/grammar.md §14).

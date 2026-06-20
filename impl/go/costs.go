@@ -21,6 +21,7 @@ type CostSchedule struct {
 	GeneratedRow        int64
 	SequenceAdvance     int64
 	GinEntry            int64
+	Collate             int64
 }
 
 // Costs is the canonical cost schedule — weights accrued per unit during query execution.
@@ -37,4 +38,5 @@ var Costs = CostSchedule{
 	GeneratedRow:        1,
 	SequenceAdvance:     1,
 	GinEntry:            1,
+	Collate:             1,
 }

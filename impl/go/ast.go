@@ -616,6 +616,9 @@ const (
 	ExprParam
 	// ExprCast is CAST(inner AS type).
 	ExprCast
+	// ExprCollate is `expr COLLATE "name"` — the postfix collation operator
+	// (spec/design/collation.md §1).
+	ExprCollate
 	// ExprUnary is a unary operator applied to one operand.
 	ExprUnary
 	// ExprBinary is a binary operator over two operands.
@@ -763,14 +766,15 @@ const (
 // boolean-valued; arithmetic and columns/integer-literals are integer-valued.
 type Expr struct {
 	Kind        ExprKind
-	Column      string     // ExprColumn, ExprQualifiedColumn (the column name)
-	Qualifier   string     // ExprQualifiedColumn (the relation label)
-	Param       uint64     // ExprParam (the 1-based bind-parameter index)
-	Literal     *Literal   // ExprLiteral
-	TypeLitName string     // ExprTypedLiteral (the named type, e.g. "integer", "interval")
-	TypeLitText string     // ExprTypedLiteral (the literal's string, coerced to the type at resolve)
-	Cast        *CastExpr  // ExprCast
-	Unary       *UnaryExpr // ExprUnary
+	Column      string       // ExprColumn, ExprQualifiedColumn (the column name)
+	Qualifier   string       // ExprQualifiedColumn (the relation label)
+	Param       uint64       // ExprParam (the 1-based bind-parameter index)
+	Literal     *Literal     // ExprLiteral
+	TypeLitName string       // ExprTypedLiteral (the named type, e.g. "integer", "interval")
+	TypeLitText string       // ExprTypedLiteral (the literal's string, coerced to the type at resolve)
+	Cast        *CastExpr    // ExprCast
+	Collate     *CollateExpr // ExprCollate
+	Unary       *UnaryExpr   // ExprUnary
 	Binary      *BinaryExpr
 	IsNullOf    *IsNullExpr     // ExprIsNull
 	IsDistinct  *IsDistinctExpr // ExprIsDistinct
@@ -831,6 +835,17 @@ type CastExpr struct {
 	Inner    Expr
 	TypeName string
 	TypeMod  *TypeMod
+}
+
+// CollateExpr is `Inner COLLATE "Collation"` — the postfix collation operator
+// (spec/design/collation.md §1). It sets an EXPLICIT collation on a text expression for the
+// surrounding comparison / ORDER BY; it binds at the postfix/typecast level (tighter than || and
+// the comparisons — PG precedence). Collation is a quoted identifier (case-sensitive, e.g. "C",
+// "en-US"). A non-text Inner is 42804, an unloaded name 42704, two different explicit collations
+// in one comparison 42P21.
+type CollateExpr struct {
+	Inner     Expr
+	Collation string
 }
 
 // UnaryExpr is Op applied to Operand.
@@ -944,8 +959,13 @@ type CaseWhen struct {
 // (spec/design/grammar.md §10).
 type OrderKey struct {
 	// Qualifier is an optional relation qualifier (`ORDER BY t.a`); "" is a bare column.
-	Qualifier  string
-	Column     string
+	Qualifier string
+	Column    string
+	// Collation is an optional explicit `COLLATE "name"` on this sort key (spec/design/collation.md
+	// §1); "" means the column's collation (the database default, C, until slice 1d). A non-C name
+	// orders this key by that collation's UCA sort key; an unknown name is 42704, a non-text column
+	// with a COLLATE is 42804.
+	Collation  string
 	Descending bool
 	NullsFirst bool
 }

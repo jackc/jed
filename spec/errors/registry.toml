@@ -284,6 +284,16 @@ class = "syntax error or access rule violation"
 template = "there is no parameter ${index}"
 
 [[error]]
+code = "42P21"
+name = "collation_mismatch"
+class = "syntax error or access rule violation"
+# Two DIFFERENT explicit collations combined in one comparison/operator (spec/design/collation.md
+# §1/§7): `'a' COLLATE "C" < 'b' COLLATE "en-US"`. The collation slice's explicit-conflict error,
+# resolved by removing one COLLATE. (PG's separate 42P22 indeterminate_collation — conflicting
+# IMPLICIT collations — becomes reachable once per-column collations land in slice 1d.)
+template = "collation mismatch between explicit collations {left} and {right}"
+
+[[error]]
 code = "42710"
 name = "duplicate_object"
 class = "syntax error or access rule violation"

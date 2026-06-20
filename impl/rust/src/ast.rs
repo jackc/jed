@@ -686,6 +686,17 @@ pub enum Expr {
         /// An optional `numeric(p[,s])` type modifier on the CAST target.
         type_mod: Option<TypeMod>,
     },
+    /// `expr COLLATE "name"` — the postfix collation operator (spec/design/collation.md §1). Sets
+    /// an EXPLICIT collation on a text expression for the surrounding comparison / `ORDER BY`. Binds
+    /// at the postfix/typecast level (tighter than `||` and the comparisons — PG precedence). The
+    /// collation name is a quoted identifier (case-sensitive, e.g. `"C"`, `"en-US"`); `"C"` is always
+    /// available, any other must be loaded (`db.ImportCollation`) else 42704. Resolving over a
+    /// non-collatable (non-text) inner type is 42809; combining two different explicit collations in
+    /// one comparison is 42P22.
+    Collate {
+        inner: Box<Expr>,
+        collation: String,
+    },
     Unary {
         op: UnaryOp,
         operand: Box<Expr>,
@@ -867,6 +878,11 @@ pub struct OrderKey {
     /// An optional relation qualifier (`ORDER BY t.a`); `None` is a bare column.
     pub qualifier: Option<String>,
     pub column: String,
+    /// An optional explicit `COLLATE "name"` on this sort key (`ORDER BY name COLLATE "en-US"`,
+    /// spec/design/collation.md §1). `None` ⇒ the column's collation (the database default, `C`,
+    /// until per-column collation lands in slice 1d). A non-`C` name orders this key by that
+    /// collation's UCA sort key; an unknown name is 42704, a non-text column with a COLLATE is 42809.
+    pub collation: Option<String>,
     pub descending: bool,
     pub nulls_first: bool,
 }

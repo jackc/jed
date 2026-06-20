@@ -257,6 +257,31 @@ export function lex(sql: string): Token[] {
         throw engineError("syntax_error", "unterminated string literal");
       }
       tokens.push({ kind: "str", str: s });
+    } else if (c === '"') {
+      // Double-quoted identifier (collation names, spec/design/collation.md §1). `""` is an embedded
+      // double quote; the content is kept VERBATIM (case-sensitive). The parser rejects an empty
+      // name; an empty `""` lexes fine here.
+      i++; // consume the opening quote
+      let s = "";
+      let closed = false;
+      while (i < n) {
+        if (sql[i] === '"') {
+          if (i + 1 < n && sql[i + 1] === '"') {
+            s += '"';
+            i += 2;
+            continue;
+          }
+          i++; // consume the closing quote
+          closed = true;
+          break;
+        }
+        s += sql[i]!;
+        i++;
+      }
+      if (!closed) {
+        throw engineError("syntax_error", "unterminated quoted identifier");
+      }
+      tokens.push({ kind: "quotedIdent", str: s });
     } else if (isDigit(c)) {
       // A numeric literal. Scan the integer digits; a following "." and/or scientific
       // e-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise an

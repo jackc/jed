@@ -266,6 +266,36 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                     .map_err(|_| syntax("invalid UTF-8 in string literal".to_string()))?;
                 tokens.push(Token::Str(s));
             }
+            b'"' => {
+                // Double-quoted identifier (collation names, spec/design/collation.md §1). `""`
+                // is an embedded double quote; the content is kept VERBATIM (case-sensitive). The
+                // input is valid UTF-8 and `"` is ASCII, so copying raw bytes between quotes
+                // preserves UTF-8 validity. Empty (`""`) is allowed by the lexer; the parser
+                // rejects an empty collation name.
+                i += 1; // consume the opening quote
+                let mut buf: Vec<u8> = Vec::new();
+                loop {
+                    match bytes.get(i) {
+                        None => return Err(syntax("unterminated quoted identifier".to_string())),
+                        Some(&b'"') => {
+                            if bytes.get(i + 1) == Some(&b'"') {
+                                buf.push(b'"');
+                                i += 2;
+                            } else {
+                                i += 1; // consume the closing quote
+                                break;
+                            }
+                        }
+                        Some(&b) => {
+                            buf.push(b);
+                            i += 1;
+                        }
+                    }
+                }
+                let s = String::from_utf8(buf)
+                    .map_err(|_| syntax("invalid UTF-8 in quoted identifier".to_string()))?;
+                tokens.push(Token::QuotedIdent(s));
+            }
             b'0'..=b'9' => {
                 // A numeric literal. Scan the integer digits; a following `.` and/or scientific
                 // `e`-notation (`123.45`, `5e2`, `1.5e-3`) makes it a DECIMAL literal, otherwise

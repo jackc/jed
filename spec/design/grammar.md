@@ -46,8 +46,10 @@ case-insensitively (`SELECT` = `select` = `SeLeCt`). Two consequences the gramma
 encodes:
 
 - A keyword spelling is a **legal identifier** wherever the grammar expects one — e.g. a
-  column may be named `select`. There is no quoted-identifier escape because none is
-  needed yet.
+  column may be named `select`. There is no quoted-identifier escape for *identifiers* (a
+  bare keyword-as-name suffices). A double-quoted token (`Token::QuotedIdent`) **does** exist,
+  but only as a **collation name** after `COLLATE` (§47, [collation.md](collation.md) §1); it is
+  not a general identifier escape, so a `"…"` in any other position is a `42601` syntax error.
 - Keyword terminals in the grammar (`"SELECT"`, `"FROM"`, …) denote a case-insensitive
   match, while punctuation terminals (`"("`, `"="`) match literally.
 
@@ -119,7 +121,8 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   (the same literal-only narrowing `INSERT` makes). The two clauses may appear in either
   order, each at most once (§9). There is **no `LIMIT ALL`**, **no `OFFSET … ROWS` /
   `FETCH NEXT … ROWS ONLY`**, and **no SQLite `LIMIT off, cnt` comma form**.
-- **ASCII-only identifiers**, no quoted identifiers (§3).
+- **ASCII-only identifiers**; the one double-quoted token is a collation name after `COLLATE`,
+  not a general quoted-identifier escape (§3, §47).
 - **Literal forms.** Integer, **decimal** (`1.50`, `.5`, and scientific `e`-notation
   `1.5e3` / `5e2` / `1e-3` — §14), **single-quoted string** (the `text` type, `'alice'`, with
   `''` for an embedded quote), `TRUE`/`FALSE`, and `NULL`. `boolean` is now a storable column
@@ -2152,3 +2155,37 @@ the two-phase model). `RETURNING` projects the **affected** rows (inserted + upd
 disambiguated from an `INSERT ... SELECT` source by appearing after the complete source.
 Full behavior, the arbiter model, the `21000` rule, cost, and the PG divergences are in
 [upsert.md](upsert.md).
+
+## 47. `COLLATE` and `ORDER BY … COLLATE` ([collation.md](collation.md))
+
+`expr COLLATE "name"` is PostgreSQL's postfix collation operator: it yields the same value with an
+**explicit** collation for the surrounding comparison / sort ([collation.md](collation.md) §1). A
+collation must be **loaded** first (the host `db.ImportCollation`, or the corpus
+`# load-collation:` directive — slice 1c is in-memory only); `"C"` is the built-in byte /
+code-point order and is always available.
+
+**Precedence — the postfix / typecast rung.** COLLATE binds at the **same level as `::` / `[]` /
+`.field`** ([grammar.ebnf](../grammar/grammar.ebnf) `postfix`), so it is **tighter than `||` and the
+comparison operators** (PostgreSQL): `a || b COLLATE "x"` is `a || (b COLLATE "x")`, and
+`'a' < 'b' COLLATE "x"` is `'a' < ('b' COLLATE "x")`. It chains left-to-right with the other
+postfix operators (`a :: text COLLATE "x"` is `(a :: text) COLLATE "x"`). The parsers parse it in
+the same `parse_postfix` loop as `::`.
+
+**The name is a double-quoted identifier.** Collation names contain hyphens and are case-sensitive
+(`"en-US"`, `"C"`), so the lexer gained a `quoted_identifier` token (`Token::QuotedIdent`,
+case-sensitive, `""` an embedded quote — [grammar.ebnf](../grammar/grammar.ebnf) `quoted_identifier`).
+Today it is consumed **only** after `COLLATE` (in an expression or an `ORDER BY` key); a quoted
+identifier anywhere else is a `42601` syntax error.
+
+**`ORDER BY col COLLATE "name"`.** A sort key may carry an explicit COLLATE between the column and
+the `ASC`/`DESC` direction ([grammar.ebnf](../grammar/grammar.ebnf) `sort_key`). The key is then
+ordered by that collation's UCA sort key.
+
+**Resolution / errors** ([collation.md](collation.md) §1/§7): applying COLLATE to a non-text
+expression is `42804` (`datatype_mismatch`); naming an unloaded collation is `42704`
+(`undefined_object`); combining two **different explicit** collations in one comparison is `42P21`
+(`collation_mismatch`). (PG's `42P22` `indeterminate_collation` — conflicting *implicit* collations
+— is unreachable until per-column collations land at slice 1d, since every column is implicitly `C`
+this slice.) A non-`C` collation orders only the **ordering** comparisons (`< <= > >=`) and
+`ORDER BY` by its sort key; `=`/`<>` stay byte-equality (deterministic-collation equality is
+byte-identity — [collation.md](collation.md) §7).

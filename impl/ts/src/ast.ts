@@ -86,6 +86,12 @@ export type Expr =
   // context at resolve; the host binds a value at execute (spec/design/api.md §5).
   | { kind: "param"; index: number }
   | { kind: "cast"; inner: Expr; typeName: string; typeMod: TypeMod | null }
+  // expr COLLATE "name" — the postfix collation operator (spec/design/collation.md §1). Sets an
+  // EXPLICIT collation on a text expression for the surrounding comparison / ORDER BY; binds at the
+  // postfix/typecast level (tighter than || and the comparisons — PG precedence). `collation` is a
+  // quoted identifier (case-sensitive, e.g. "C", "en-US"). A non-text inner is 42804, an unloaded
+  // name 42704, two different explicit collations in one comparison 42P21.
+  | { kind: "collate"; inner: Expr; collation: string }
   | { kind: "unary"; op: UnaryOp; operand: Expr }
   | { kind: "binary"; op: BinaryOp; lhs: Expr; rhs: Expr }
   | { kind: "isNull"; operand: Expr; negated: boolean }
@@ -221,6 +227,10 @@ export type OrderKey = {
   // An optional relation qualifier (`ORDER BY t.a`); null is a bare column.
   qualifier: string | null;
   column: string;
+  // An optional explicit `COLLATE "name"` on this sort key (spec/design/collation.md §1); null means
+  // the column's collation (the database default, C, until slice 1d). A non-C name orders this key by
+  // that collation's UCA sort key; an unknown name is 42704, a non-text column with a COLLATE is 42804.
+  collation: string | null;
   descending: boolean;
   nullsFirst: boolean;
 };

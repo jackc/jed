@@ -18,6 +18,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 
+use crate::collation::Collation;
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::key_cmp;
@@ -31,8 +32,12 @@ use crate::value::{ArrayVal, RangeVal, Unfetched, Value};
 /// lowering it. A handle setting, never stored in the file.
 pub const DEFAULT_WORK_MEM: usize = 256 * 1024 * 1024;
 
-/// One `ORDER BY` key: a flat row index + its direction + NULL placement — mirrors `plan.order`.
-pub(crate) type SortKey = (usize, bool, bool);
+/// One `ORDER BY` key: a flat row index + its direction + NULL placement + an optional collation —
+/// mirrors `plan.order`. The collation (`Some` ⇒ a non-`C` UCA order) is handled OUTSIDE the spill
+/// sorter: a collated ORDER BY never reaches the `Sorter` (collation is in-memory only this slice
+/// and the executor routes a collated sort to its decorate sorter, spec/design/collation.md §8), so
+/// `cmp_rows` only ever sees `None` here and ignores the field.
+pub(crate) type SortKey = (usize, bool, bool, Option<Arc<Collation>>);
 
 /// A unique-per-process suffix for spill file names, so concurrent sorters never collide. Combined
 /// with the process id; the value is internal (it never affects results — spill.md §6).
@@ -117,8 +122,10 @@ impl Sorter {
     /// Stable comparator over the order keys: the first non-equal key decides; a full tie is
     /// `Equal` (the caller's sort is stable, so ties keep input order — spill.md §6).
     fn cmp_rows(keys: &[SortKey], a: &Row, b: &Row) -> Ordering {
-        for &(idx, descending, nulls_first) in keys {
-            let ord = key_cmp(&a[idx], &b[idx], descending, nulls_first);
+        // The collation field is always `None` here (a collated sort never uses this sorter — see
+        // the SortKey doc), so it is ignored: the C/value comparator orders every key.
+        for (idx, descending, nulls_first, _collation) in keys {
+            let ord = key_cmp(&a[*idx], &b[*idx], *descending, *nulls_first);
             if ord != Ordering::Equal {
                 return ord;
             }

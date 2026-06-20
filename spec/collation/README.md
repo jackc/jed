@@ -18,9 +18,12 @@
 > collation order — the bridge to jed's `memcmp` storage ([encoding.md §1](../design/encoding.md)).
 >
 > All multi-byte integers are **big-endian** (jed's on-disk convention; CLAUDE.md §2). Hex is
-> written `0xHHHH`. **Status: slice 1b landed — the `CompileCollation` compiler, the `sortKey`
-> executor, and the `SaveCollation`/`OpenCollation` artifact codec are implemented in all three
-> cores** (`impl/{rust,go,ts}`), host-free and byte-identical, pinned by the populated `vectors/`
+> written `0xHHHH`. **Status: slices 1b + 1c landed — the `CompileCollation` compiler, the `sortKey`
+> executor, and the `SaveCollation`/`OpenCollation` artifact codec** (1b, host-free and
+> byte-identical, pinned by the populated `vectors/`), **plus the first SQL surface** (1c: the
+> `COLLATE` operator + `ORDER BY … COLLATE`, `db.ImportCollation` in-memory, the `collate` cost
+> unit, and the `# load-collation:` corpus directive — `suites/collation/collate.test`) are
+> implemented in all three cores (`impl/{rust,go,ts}`)
 > ([../design/collation.md §14](../design/collation.md)). The dev fixture (§5) is a small
 > hand-authored subset; the version-pinned real DUCET + curated locale tailorings land with a
 > later slice (1f). The verification vectors (§6) are **populated** — produced by the Rust core
@@ -251,9 +254,15 @@ asserts the bytes:
 
 ## 7. Cost
 
-Sort-key generation will add a **`collate`** unit to the shared cost schedule
+Sort-key generation adds a **`collate`** unit to the shared cost schedule
 ([../design/cost.md](../design/cost.md)), charged **per code point** processed (table-bounded
-weight lookups; contractions/expansions bounded by the table), so a collated `ORDER BY` /
-comparison over a large input is cost-ceilinged like any other work (CLAUDE.md §13). **Deferred to
-1c**, when the executor is wired into query execution and there is a metering site to accrue it —
-slice 1b's `sortKey` is a pure function with no `Meter` threaded through it.
+weight lookups; contractions/expansions bounded by the table). **Landed in 1c**, charged at the
+**comparison-operator evaluation** site — the deterministic, cross-core-identical metering point:
+each ORDERING comparison (`< <= > >=`) under a collation accrues `collate × (codepoints(lhs) +
+codepoints(rhs))`, so a collated `WHERE` / `SELECT` comparison over a large input is cost-ceilinged
+like any other work (CLAUDE.md §13). `=`/`<>` charge nothing (deterministic-collation equality is
+byte-equality, §4). The **`ORDER BY` sort stays unmetered** like every sort
+([../design/cost.md §3](../design/cost.md), [../design/spill.md §6](../design/spill.md)) — its input
+cardinality is already bounded by the upstream per-row costs, and its decorate sorter builds each
+row's sort key exactly once (no `O(n log n)` recompute). Slice 1b's `sortKey` stayed a pure function
+with no `Meter`; 1c added the metering at the evaluator, the one place a `Meter` is threaded through.

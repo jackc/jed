@@ -7,6 +7,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
+import { compileCollation } from "../collation.ts";
 import {
   advancingClock,
   Database,
@@ -35,6 +36,42 @@ function suitesDir(): string {
     if (parent === dir) throw new Error("could not locate spec/conformance/suites");
     dir = parent;
   }
+}
+
+// specDir is the repo's spec/ directory — the root that `# load-collation:` fixture paths resolve
+// against (spec/design/collation.md §10). suitesDir() is spec/conformance/suites.
+function specDir(): string {
+  return dirname(dirname(suitesDir()));
+}
+
+// parseLoadCollationDirective parses a `# load-collation: <name> = <fixture>[, <fixture>…]` line —
+// the corpus's deterministic, host-free way to load a collation before the records that use it
+// (spec/design/collation.md §10). Fixture paths are relative to spec/ and concatenated (newline-
+// joined) into one definition stream. Returns [name, paths] or null if not this directive.
+function parseLoadCollationDirective(line: string): [string, string[]] | null {
+  const rest = line.slice(1).trim();
+  if (!rest.startsWith("load-collation:")) return null;
+  const body = rest.slice("load-collation:".length);
+  const eq = body.indexOf("=");
+  if (eq < 0) return null;
+  const name = body.slice(0, eq).trim();
+  const paths = body
+    .slice(eq + 1)
+    .split(",")
+    .map((f) => f.trim())
+    .filter((f) => f !== "");
+  if (paths.length === 0) return null;
+  return [name, paths];
+}
+
+// loadCollation compiles + imports a collation named `name` from the `files` fixtures (relative to
+// spec/) into db (spec/design/collation.md §4/§10). A read / compile / import failure throws (failing
+// the test).
+function loadCollation(db: Database, name: string, files: string[]): void {
+  const def = files
+    .map((f) => readFileSync(join(specDir(), f), "utf8"))
+    .join("\n");
+  db.importCollation(compileCollation(name, def));
 }
 
 function parseRequires(text: string): string[] {
@@ -407,6 +444,15 @@ function runFile(text: string): void {
       continue;
     }
     if (line.startsWith("#")) {
+      // `# load-collation:` is an ACTION (load now), not a pending assertion: compile + import the
+      // named collation from its fixtures into this file's db before the records run
+      // (spec/design/collation.md §10).
+      const lc = parseLoadCollationDirective(line);
+      if (lc !== null) {
+        loadCollation(db, lc[0], lc[1]);
+        c.i++;
+        continue;
+      }
       // `# cost:` / `# max_cost:` / `# names:` / `# types:` bind to the next record; every other
       // comment is ignored.
       const n = parseCostDirective(line);
