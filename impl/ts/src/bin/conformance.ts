@@ -200,6 +200,23 @@ function parseMaxCostDirective(line: string): bigint | null {
   }
 }
 
+// parseLifetimeMaxCostDirective parses a `# lifetime_max_cost: N` directive line. Returns the
+// per-SESSION cumulative cost budget, or null if not one. Unlike `# max_cost:` (per-record, reset
+// after each record), this is STICKY: it sets the session budget for the rest of the file (the
+// cumulative cost builds across records on the one Database the file runs against), so an ordered
+// statement sequence can drive the session to its budget and assert the 54P02 abort — what the
+// per-record `# cost:` directive cannot express (spec/design/session.md §5.4).
+function parseLifetimeMaxCostDirective(line: string): bigint | null {
+  const m = line.match(/^#\s*lifetime_max_cost:\s*(\S+)/);
+  if (!m) return null;
+  try {
+    const n = BigInt(m[1]!);
+    return n >= 0n ? n : null;
+  } catch {
+    return null;
+  }
+}
+
 // parseMaxSqlLengthDirective parses a `# max_sql_length: N` directive line. Returns the per-handle
 // input-size limit (bytes) to run the next record under, or null if not one. Mirrors `# max_cost:`:
 // it lets a record set a small cap and assert that an over-long statement aborts with 54000
@@ -393,6 +410,7 @@ function runFile(text: string): void {
       // `# cost:` / `# max_cost:` / `# names:` / `# types:` bind to the next record; every other
       // comment is ignored.
       const n = parseCostDirective(line);
+      const lmc = parseLifetimeMaxCostDirective(line);
       const mc = parseMaxCostDirective(line);
       const msl = parseMaxSqlLengthDirective(line);
       const dp = parseDefaultPrivilegesDirective(line);
@@ -404,6 +422,11 @@ function runFile(text: string): void {
       const ca = parseClockAdvanceDirective(line);
       if (n !== null) {
         pendingCost = n;
+      } else if (lmc !== null) {
+        // Sticky (spec/design/session.md §5.4): apply immediately and persistently — the session
+        // cumulative builds across records, so a later record can assert the 54P02 abort. Not a
+        // pending per-record directive (it must NOT reset between records).
+        db.setLifetimeMaxCost(lmc);
       } else if (mc !== null) {
         pendingMaxCost = mc;
       } else if (msl !== null) {

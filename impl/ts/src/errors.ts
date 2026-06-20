@@ -55,6 +55,7 @@ export type SqlState =
   | "program_limit_exceeded" // 54000 — input SQL exceeds the per-handle max_sql_length; input-size gate (cost.md §7)
   | "statement_too_complex" // 54001 — nesting depth exceeds MAX_EXPR_DEPTH; native-stack gate (cost.md §7)
   | "cost_limit_exceeded" // 54P01 — accrued cost reached the caller-set max_cost ceiling (cost.md §6)
+  | "session_cost_limit_exceeded" // 54P02 — the session's cumulative cost reached lifetime_max_cost (session.md §5.4)
   | "io_error" // 58030 — an I/O error from the host file layer (spec/design/api.md §2)
   | "undefined_file" // 58P01 — open of a database path that does not exist
   | "duplicate_file" // 58P02 — create of a database path that already exists
@@ -109,6 +110,7 @@ const CODES: Record<SqlState, string> = {
   program_limit_exceeded: "54000",
   statement_too_complex: "54001",
   cost_limit_exceeded: "54P01",
+  session_cost_limit_exceeded: "54P02",
   io_error: "58030",
   undefined_file: "58P01",
   duplicate_file: "58P02",

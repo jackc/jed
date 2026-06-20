@@ -67,7 +67,7 @@ import {
   primaryKeyIndex,
   resolveColType,
 } from "./catalog.ts";
-import { Meter } from "./cost.ts";
+import { LifetimeBudget, Meter } from "./cost.ts";
 import { COSTS } from "./costs.ts";
 import {
   Decimal,
@@ -708,6 +708,11 @@ type ActiveTx = {
 // via Session.setRandomSource / setClockSource, not here.
 export type SessionOptions = {
   maxCost?: bigint;
+  // The per-session cumulative cost budget (spec/design/session.md §5.4); absent ⇒ unlimited (the
+  // default). Bounds the whole session: the instant the session's running total reaches it, the
+  // in-flight statement aborts 54P02 (and once spent, every further statement is rejected at
+  // admission). Sibling to maxCost, which bounds one statement.
+  lifetimeMaxCost?: bigint;
   maxSqlLength?: number;
   workMem?: number;
   // The table-privilege set granted to every table — the GRANT … ON ALL TABLES default
@@ -743,6 +748,13 @@ export class Session {
   // The execution-cost ceiling (CLAUDE.md §13; api.md §8), or 0n for unlimited. Bounds every statement
   // run on this session: its Meter aborts 54P01 the instant accrued cost reaches it.
   maxCost: bigint;
+  // The per-session cumulative cost budget (spec/design/session.md §5.4) and the session's running
+  // CUMULATIVE cost, held together in a LifetimeBudget object shared (by reference) with every
+  // statement Meter, which live-charges into it — so partial cost of an aborted statement counts and
+  // the cumulative survives the swap (TS swaps the session object by reference). SESSION state, not
+  // snapshot state: the cumulative does NOT roll back with a transaction. The budget is 0n ⇒ unlimited
+  // (track-only); a statement aborts 54P02 the instant lifetime.total reaches lifetime.limit.
+  lifetime: LifetimeBudget;
   // The maximum input SQL length in bytes (CLAUDE.md §13; cost.md §7); 0 = unlimited; default
   // DEFAULT_MAX_SQL_LENGTH. Over-limit input is rejected 54000 at parse, before lexing.
   maxSqlLength: number;
@@ -777,6 +789,7 @@ export class Session {
   constructor(opts: SessionOptions = {}) {
     this.tx = null;
     this.maxCost = opts.maxCost ?? 0n;
+    this.lifetime = new LifetimeBudget(opts.lifetimeMaxCost ?? 0n);
     this.maxSqlLength = opts.maxSqlLength ?? DEFAULT_MAX_SQL_LENGTH;
     this.workMem = opts.workMem ?? DEFAULT_WORK_MEM;
     this.seam = new Seam();
@@ -829,6 +842,27 @@ export class Session {
   }
   setMaxCost(limit: bigint): void {
     this.maxCost = limit;
+  }
+  // setLifetimeMaxCost sets the per-session cumulative cost budget (spec/design/session.md §5.4);
+  // <= 0n ⇒ unlimited. A statement aborts 54P02 the instant the session's cumulative cost reaches it,
+  // and once spent every further statement is rejected 54P02 at admission.
+  setLifetimeMaxCost(limit: bigint): void {
+    this.lifetime.limit = limit;
+  }
+  // lifetimeMaxCost is the current per-session cumulative cost budget (0n ⇒ unlimited).
+  lifetimeMaxCost(): bigint {
+    return this.lifetime.limit;
+  }
+  // lifetimeCost is the session's running CUMULATIVE execution cost so far (spec/design/session.md
+  // §5.4) — the gauge the budget bounds. Tracked even when unlimited; survives a transaction rollback.
+  lifetimeCost(): bigint {
+    return this.lifetime.total;
+  }
+  // newMeter builds the Meter for a statement run on this session: the per-statement maxCost ceiling
+  // (54P01) plus the shared LifetimeBudget (54P02) the meter live-charges into. Every statement's
+  // meter is minted here, so all execution cost accrues into the cumulative.
+  newMeter(): Meter {
+    return new Meter(this.maxCost, this.lifetime);
   }
   setMaxSqlLength(bytes: number): void {
     this.maxSqlLength = bytes;
@@ -937,6 +971,28 @@ export class Database {
   // setting, not stored in the file.
   setMaxCost(limit: bigint): void {
     this.session.maxCost = limit;
+  }
+
+  // setLifetimeMaxCost sets the PER-SESSION cumulative cost budget on the default session
+  // (spec/design/session.md §5.4); limit <= 0n (the default) is unlimited. Where maxCost bounds one
+  // statement (54P01), this bounds the whole session: the instant the session's running cumulative
+  // cost reaches limit the in-flight statement aborts 54P02, and once spent every further statement is
+  // rejected 54P02 at admission. The multi-tenant / untrusted-host gate atop maxCost; a handle
+  // setting, not stored in the file.
+  setLifetimeMaxCost(limit: bigint): void {
+    this.session.lifetime.limit = limit;
+  }
+
+  // lifetimeMaxCost is the default session's per-session cumulative cost budget (0n ⇒ unlimited).
+  lifetimeMaxCost(): bigint {
+    return this.session.lifetime.limit;
+  }
+
+  // lifetimeCost is the default session's running CUMULATIVE execution cost so far
+  // (spec/design/session.md §5.4) — the gauge the lifetime_max_cost budget bounds. Tracked even when
+  // unlimited; survives a transaction rollback (session state, not snapshot state).
+  lifetimeCost(): bigint {
+    return this.session.lifetime.total;
   }
 
   // setDefaultPrivileges replaces the default session's default table-privilege set — the
@@ -1527,6 +1583,21 @@ export class Database {
   // resolution: a table privilege is required only for a name that resolves to an existing catalog
   // table (a missing table stays 42P01; a CTE / derived-table label is statement-local). Missing
   // privilege → 42501.
+  // checkLifetimeAdmission rejects a statement at admission when the session's lifetime cost budget is
+  // already spent (spec/design/session.md §5.4): if a budget is set and the session's cumulative cost
+  // has reached it, no further statement may run (it "cannot accrue") — 54P02. A no-op when the budget
+  // is unlimited (the default), so the common path pays one comparison.
+  private checkLifetimeAdmission(): void {
+    const limit = this.session.lifetime.limit;
+    const total = this.session.lifetime.total;
+    if (limit > 0n && total >= limit) {
+      throw engineError(
+        "session_cost_limit_exceeded",
+        `session exceeded the lifetime cost limit of ${limit} (accrued ${total})`,
+      );
+    }
+  }
+
   private checkPrivileges(stmt: Statement): void {
     if (this.session.allowDdl && this.session.privileges.isPermissive()) {
       return;
@@ -1557,6 +1628,12 @@ export class Database {
   }
 
   private dispatchStmt(stmt: Statement, params: Value[]): Outcome {
+    // Lifetime budget admission (spec/design/session.md §5.4): once the session's cumulative cost has
+    // reached lifetime_max_cost, every further statement is rejected 54P02 BEFORE it can accrue —
+    // checked ahead of privileges/existence, so an exhausted session runs nothing. A no-op when the
+    // budget is unlimited (the default). Transaction control (BEGIN/COMMIT/ROLLBACK) never reaches
+    // dispatch (handled earlier), so an exhausted session can still close out an open block.
+    this.checkLifetimeAdmission();
     // Authorization (spec/design/session.md §5.3): enforce the session's privilege envelope before the
     // statement runs — DDL gated by allowDdl, DML by per-table/per-function privileges, all 42501.
     // Skipped on a fully-permissive session (the default), so the common path pays nothing. The
@@ -2665,7 +2742,7 @@ export class Database {
     // row, with the indexed columns as the touched set (fixed-width — the chain/decompress
     // terms are structurally zero). An empty table charges 0. The entries are computed
     // here, against the pre-index store; the writes below are unmetered.
-    const meter = new Meter(this.session.maxCost);
+    const meter = this.session.newMeter();
     const mask = columns.map(() => false);
     for (const c of cols) mask[c] = true;
     const def: IndexDef = { name, columns: cols, unique: ci.unique, kind };
@@ -3268,7 +3345,7 @@ export class Database {
           ? this.resolveOnConflict(table, ins.onConflict, ptypes)
           : null;
       const bound = bindParams(params, ptypes.finalize());
-      const meter = new Meter(this.session.maxCost);
+      const meter = this.session.newMeter();
       const foldCost = { value: 0n };
       this.foldUncorrelatedInPlan(plan, bound, EMPTY_CTE_CTX, foldCost);
       // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
@@ -3416,7 +3493,7 @@ export class Database {
     // disposition plan's compression attempts for over-RECORD_MAX rows (value_compress) and the
     // RETURNING projection. The meter is created here (before materialization) so a
     // DEFAULT-keyword expression default charges it too.
-    const meter = new Meter(this.session.maxCost);
+    const meter = this.session.newMeter();
 
     // Materialize each row into its value-position-indexed candidates (length arity, checked
     // above), resolving each slot: a literal, a bound $N, or a DEFAULT keyword → that column's
@@ -4375,7 +4452,7 @@ export class Database {
     // per-row outer environment below (it pushes the current row, so `target.col` reads it). The
     // uncorrelated execution reads the pre-DELETE snapshot (keys are collected before mutating).
     // Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
-    const meter = new Meter(this.session.maxCost);
+    const meter = this.session.newMeter();
     if (filter !== null) {
       const cost = { value: 0n };
       filter = this.foldUncorrelatedInRExpr(filter, bound, EMPTY_CTE_CTX, cost);
@@ -4672,7 +4749,7 @@ export class Database {
     //
     // Phase 1: build + validate every matching row's new values; no writes yet. Each scanned row,
     // the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
-    const meter = new Meter(this.session.maxCost);
+    const meter = this.session.newMeter();
     const foldCost = { value: 0n };
     for (const p of plans)
       p.source = this.foldUncorrelatedInRExpr(
@@ -5347,7 +5424,7 @@ export class Database {
       ctes,
       exec: this,
     };
-    const meter = new Meter(this.session.maxCost);
+    const meter = this.session.newMeter();
     const rows: Value[][] = [];
     for (const row of plan.rows) {
       meter.guard(); // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -6182,7 +6259,7 @@ export class Database {
       ctes,
       exec: this,
     };
-    const meter = new Meter(this.session.maxCost);
+    const meter = this.session.newMeter();
 
     // LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no blocking
     // operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project and STOPS the
