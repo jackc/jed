@@ -5,6 +5,7 @@
 
 import { Database } from "./executor.ts";
 import type { Outcome } from "./executor.ts";
+import type { ScriptSummary } from "./split.ts";
 import type { Value } from "./value.ts";
 
 // SUPPORTED_CAPABILITIES lists the capabilities this core implements (spec/conformance:
@@ -371,6 +372,13 @@ export function executeParams(
   return db.executeStmtParams(db.parse(sql), params);
 }
 
+// executeScript runs a multi-statement SQL script against db's default session (spec/design/session.md
+// §4.2): split it, run each statement in order, discard the result rows, and return the O(1)
+// ScriptSummary. All-or-nothing when the session is Idle (the migration/import path).
+export function executeScript(db: Database, sql: string): ScriptSummary {
+  return db.executeScript(sql);
+}
+
 // --- public surface (re-exports) ---
 export {
   Database,
@@ -380,6 +388,8 @@ export {
   Snapshot,
 } from "./executor.ts";
 export type { Outcome, SessionOptions, TxStatus } from "./executor.ts";
+export { splitStatements } from "./split.ts";
+export type { ScriptSummary, StatementSpan } from "./split.ts";
 export { parseSQL } from "./parser.ts";
 export { EngineError, sqlStateCode } from "./errors.ts";
 export type { SqlState } from "./errors.ts";

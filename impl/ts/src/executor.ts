@@ -82,6 +82,7 @@ import {
 } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
 import { EngineError, engineError } from "./errors.ts";
+import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
 import { parseExpression, parseSQL } from "./parser.ts";
 import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
@@ -793,6 +794,12 @@ export class Session {
     return this.run(db, () => db.executeStmtParams(db.parse(sql), params));
   }
 
+  // executeScript runs a multi-statement script on this ADDITIONAL session against db, sharing
+  // committed storage and running sequentially via the swap (spec/design/session.md §2.1/§4.2).
+  executeScript(db: Database, sql: string): ScriptSummary {
+    return this.run(db, () => db.executeScript(sql));
+  }
+
   // status is this session's transaction status (Idle/Open/Failed, session.md §2.2).
   status(): TxStatus {
     return txStatusOf(this.tx);
@@ -1176,6 +1183,58 @@ export class Database {
   // active slot for the call. The bare Database keeps its long-lived default session.
   newSession(opts: SessionOptions = {}): Session {
     return new Session(opts);
+  }
+
+  // executeScript runs a multi-statement sql SCRIPT on the default session (spec/design/session.md
+  // §4.2): split it, run each statement in order, DISCARD the result rows (keeping only counts), and
+  // return the O(1) ScriptSummary. The dominant migration/import path — "run this script; I only
+  // care that it succeeded."
+  //
+  //   - Idle at entry  ⇒ the whole run is one implicit transaction, all-or-nothing: a statement
+  //     error rolls the wrapper back (nothing is committed) and rethrows that error.
+  //   - Open at entry  ⇒ the run joins that transaction (no wrapper, no auto-commit); a mid-run error
+  //     leaves the block Failed for the caller to roll back.
+  //   - In-script transaction control (BEGIN/COMMIT/ROLLBACK) is 0A000 — the implicit wrapper owns
+  //     the boundary (partitioning is deferred, session.md §11); a host that needs self-managed
+  //     transactions writes its own splitStatements loop instead.
+  executeScript(sql: string): ScriptSummary {
+    // We own an implicit wrapper iff the session is Idle at entry. beginTx(null) honors the handle's
+    // read-only mode (READ ONLY wrapper on a read-only handle — a write inside is 25006).
+    const ownsWrapper = !this.inTransaction();
+    if (ownsWrapper) this.beginTx(null);
+    try {
+      const summary = this.runScriptBody(sql);
+      if (ownsWrapper) this.commitTx(); // publish the all-or-nothing run
+      return summary;
+    } catch (e) {
+      if (ownsWrapper) this.rollbackTx(); // discard everything; rethrow the original error
+      throw e;
+    }
+  }
+
+  // runScriptBody splits sql and runs each statement on the current transaction, accumulating the
+  // ScriptSummary. Separated so executeScript's wrapper commit/rollback runs once on either path.
+  private runScriptBody(sql: string): ScriptSummary {
+    let statementsRun = 0;
+    let rowsAffectedTotal = 0;
+    let cost = 0n;
+    for (const span of splitStatements(sql)) {
+      const ast = this.parse(span.text);
+      // Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
+      // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
+      if (ast.kind === "begin" || ast.kind === "commit" || ast.kind === "rollback") {
+        throw engineError(
+          "feature_not_supported",
+          "transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; " +
+            "use splitStatements to run a self-managed multi-statement transaction",
+        );
+      }
+      const out = this.executeStmtParams(ast, []);
+      statementsRun++;
+      if (out.kind === "statement" && out.rowsAffected !== null) rowsAffectedTotal += out.rowsAffected;
+      cost += out.cost;
+    }
+    return { statementsRun, rowsAffectedTotal, cost };
   }
 
   // table looks up a table definition by name (case-insensitive) in the visible snapshot.
