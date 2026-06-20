@@ -2016,14 +2016,16 @@ export class Database {
       const ty = columns[idx]!.type;
       if (kind === "gin") {
         // GIN needs an operator class for the column type: only an array has one (else 42704),
-        // and this slice only the integer element types (else 0A000) — spec/design/gin.md §3.
+        // and only a FIXED-WIDTH KEY-ENCODABLE element type (else 0A000) — the GIN term IS that
+        // element's key encoding (gin.md §3/§4), so the admitted set is exactly the keyable scalars
+        // a PK / ordered-index key column accepts.
         if (ty.kind !== "array") {
           throw engineError(
             "undefined_object",
             "data type " + typeCanonicalName(ty) + " has no default operator class for access method gin",
           );
         }
-        if (!typeIsInteger(ty.elem)) {
+        if (!isGinElementType(ty.elem)) {
           throw engineError(
             "feature_not_supported",
             "a gin index on " + typeCanonicalName(ty) + " is not supported yet",
@@ -2377,32 +2379,39 @@ export class Database {
     // Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
     // §3): evaluate Q on a scratch meter. Q is a constant, so the empty row suffices.
     const qv = evalExpr(query, [], env, new Meter());
-    const terms: bigint[] = [];
+    // Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
+    // entries carry, so a term doubles as its posting-list prefix below. Encoding now lets us dedup
+    // distinct terms by bytes (a bijection: byte-dedup == value-dedup, byte-sort == value-sort)
+    // generically over every admitted element type.
+    const terms: Uint8Array[] = [];
     let hasNull = false;
     let isEmpty = false;
     if (gb.strategy === "member") {
       // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL c can equal no element,
-      // so the bound is provably empty (gin.md §6). c is in the element type's range by resolution
-      // (jed coerces c to the element type, rejecting an out-of-range constant 22003 before exec);
-      // inRange is a defensive guard against silently truncating an out-of-range value into a wrong
-      // term.
-      if (qv.kind !== "int" || !inRange(gb.elemType, qv.int)) return { entries: [], pages: 0, slabs: 0 };
-      terms.push(qv.int);
+      // so the bound is provably empty (gin.md §6). c is in the element type's domain by resolution
+      // (jed coerces c to the element type, rejecting an out-of-range integer constant 22003 before
+      // exec); inRange is a defensive guard against silently truncating an out-of-range integer into
+      // a wrong term.
+      if (qv.kind === "null") return { entries: [], pages: 0, slabs: 0 };
+      if (qv.kind === "int" && !inRange(gb.elemType, qv.int)) return { entries: [], pages: 0, slabs: 0 };
+      terms.push(encodeKeyValue(gb.elemType, qv));
     } else {
       if (qv.kind !== "array") return { entries: [], pages: 0, slabs: 0 }; // NULL/non-array → provably empty
-      const seen = new Set<bigint>();
+      const seen = new Set<string>();
       for (const el of qv.elements) {
-        if (el.kind === "int") {
-          if (!seen.has(el.int)) {
-            seen.add(el.int);
-            terms.push(el.int);
-          }
-        } else if (el.kind === "null") {
-          hasNull = true;
+        if (el.kind === "null") {
+          hasNull = true; // a NULL element carries no term
+          continue;
+        }
+        const t = encodeKeyValue(gb.elemType, el);
+        const k = byteKey(t);
+        if (!seen.has(k)) {
+          seen.add(k);
+          terms.push(t);
         }
       }
       isEmpty = qv.elements.length === 0;
-      terms.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+      terms.sort(cmpBytes);
     }
 
     if (gb.strategy === "contains") {
@@ -2435,8 +2444,7 @@ export class Database {
     let pages = 0;
     let entriesVisited = 0;
     const postings: Uint8Array[][] = [];
-    for (const t of terms) {
-      const prefix = encodeInt(gb.elemType, t);
+    for (const prefix of terms) {
       const b: KeyBound = { lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false };
       const scan = istore.rangeScanWithUnits(b, []);
       pages += scan.pages;
@@ -5057,6 +5065,22 @@ function indexEntryKeys(columns: Column[], def: IndexDef, storageKey: Uint8Array
 // NULL) and an empty payload. A NULL array column value and an empty array yield no entries (so
 // they appear in no posting list). Returned sorted by term (= encoded-byte order for the integer
 // element types). This slice: a single integer-element array column.
+// isGinElementType reports whether elem is an element type a GIN (array_ops) index admits — exactly
+// the fixed-width key-encodable scalars (the integers, boolean, uuid, date, timestamp, timestamptz;
+// spec/design/gin.md §3): a GIN term IS the element's order-preserving key encoding (§4), so this is
+// the same set a PRIMARY KEY / ordered-index key column accepts. Variable-width or not-yet-key-encoded
+// elements (text, decimal, bytea, interval, the floats) are 0A000.
+function isGinElementType(elem: Type): boolean {
+  return (
+    typeIsInteger(elem) ||
+    typeIsBoolean(elem) ||
+    typeIsUuid(elem) ||
+    typeIsTimestamp(elem) ||
+    typeIsTimestamptz(elem) ||
+    typeIsDate(elem)
+  );
+}
+
 function ginEntries(columns: Column[], def: IndexDef, storageKey: Uint8Array, row: Row): Uint8Array[] {
   const ci = def.columns[0]!;
   const colType = columns[ci]!.type;
@@ -5064,18 +5088,21 @@ function ginEntries(columns: Column[], def: IndexDef, storageKey: Uint8Array, ro
   const elemTy = typeScalar(colType.elem);
   const v = row[ci]!;
   if (v.kind !== "array") return [];
-  const seen = new Set<bigint>();
-  const vals: bigint[] = [];
+  // Dedup by the encoded term (the encoding is a bijection: byte-dedup == value-dedup, byte-sort ==
+  // value-sort) generically over every admitted element type.
+  const seen = new Set<string>();
+  const terms: Uint8Array[] = [];
   for (const el of v.elements) {
-    if (el.kind !== "int") continue; // a NULL element (or any non-integer — impossible) is no term
-    if (!seen.has(el.int)) {
-      seen.add(el.int);
-      vals.push(el.int);
+    if (el.kind === "null") continue; // a NULL element carries no term; a non-keyable element is impossible
+    const term = encodeKeyValue(elemTy, el);
+    const k = byteKey(term);
+    if (!seen.has(k)) {
+      seen.add(k);
+      terms.push(term);
     }
   }
-  vals.sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  return vals.map((n) => {
-    const term = encodeInt(elemTy, n);
+  terms.sort(cmpBytes);
+  return terms.map((term) => {
     const out = new Uint8Array(term.length + storageKey.length);
     out.set(term, 0);
     out.set(storageKey, term.length);

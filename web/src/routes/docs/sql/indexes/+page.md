@@ -119,9 +119,11 @@ Equality is stricter than containment — `tags = ARRAY[10, 20]` keeps only `gin
 
 GIN this release covers a focused surface (it grows from here):
 
-- **One column, integer-element arrays** — `i16[]`, `i32[]`, or `i64[]`. A multi-column GIN, or an
-  array of another element type (`text[]`, `numeric[]`, …), is rejected with `0A000` until its key
-  encoding lands.
+- **One column, an array of a key-encodable element type** — the integers (`i16[]`, `i32[]`,
+  `i64[]`), plus `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, and `boolean[]` (the same
+  element types an ordered index can key on — a GIN term *is* the element's key encoding). A
+  multi-column GIN, or an array of a not-yet-key-encoded element type (`text[]`, `numeric[]`, …), is
+  rejected with `0A000` until that encoding lands.
 - **`@>`, `&&`, `= ANY`, and array `=` only** — `<@` (contained-by) and `IN` over a scalar list
   still run, by full scan; they are not GIN-accelerated yet.
 - **No `UNIQUE`** — an inverted index has many entries per row, so `CREATE UNIQUE INDEX … USING gin`

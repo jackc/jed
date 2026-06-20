@@ -26,12 +26,14 @@ CREATE [UNIQUE] INDEX [name] ON table USING gin (col)
   ([indexes.md §2/§6](indexes.md)); only **how entries are derived from a row** and **how a
   query uses it** differ. The default kind (no `USING`, or `USING btree`) is the ordered
   B-tree; `USING gin` selects this one.
-- **One column, an integer-element array.** This slice indexes a single column of type
-  `i16[]` / `i32[]` / `i64[]` — the array element types whose order-preserving key
-  encoding is already exercised ([encoding.md §2.1](encoding.md)). A multi-column GIN, and
-  an array of any other element type (`text[]`, `decimal[]`, …), are `0A000` this slice
-  (§3, §10) — the same "lift it when its key encoding lands" narrowing the ordered index
-  makes for text/decimal keys.
+- **One column, a fixed-width-key-encodable-element array.** A single column whose element
+  type is one of the engine's keyable scalars — the integers (`i16[]` / `i32[]` / `i64[]`),
+  `boolean[]`, `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]` — i.e. exactly the element
+  types whose order-preserving key encoding has landed ([encoding.md §2.1](encoding.md)), the
+  *same set an ordered-index / `PRIMARY KEY` key column accepts*. A multi-column GIN, and an
+  array of a variable-width / not-yet-key-encoded element type (`text[]`, `decimal[]`,
+  `bytea[]`, `interval[]`, `f64[]`), are `0A000` this slice (§3, §10) — the same "lift it when
+  its key encoding lands" narrowing the ordered index makes for text/decimal keys.
 - **Accelerates `@>`, `&&`, `const = ANY(col)` membership, and array `=`.** A `WHERE`
   conjunct `col @> const` (contains), `col && const` (overlaps), `const = ANY(col)` (the
   array spelling of membership — semantically `col @> ARRAY[const]`), or `col = const`
@@ -125,9 +127,15 @@ like a type name.
    - a **non-array** column has no GIN operator class — **42704** (PG's "data type … has no
      default operator class for access method gin"; jed matches the code, house-style
      message);
-   - an array of a **non-integer element type** (`text[]`, `decimal[]`, …) is **0A000** this
-     slice (the lift-when-encoded narrowing — §1, §10; PG *would* build it, a documented
-     divergence recorded in the oracle override ledger).
+   - an array whose element type is **not a fixed-width key-encodable scalar** is **0A000**
+     this slice. The admitted element types are exactly the engine's keyable scalars — the
+     integers (`i16`/`i32`/`i64`), `boolean`, `uuid`, `date`, `timestamp`, `timestamptz` —
+     the *same set a `PRIMARY KEY` / ordered-index key column accepts*
+     ([indexes.md §1](indexes.md)), because a GIN term is exactly that key encoding (§4).
+     A **variable-width or not-yet-key-encoded** element type — `text[]`, `decimal[]`,
+     `bytea[]`, `interval[]`, `float`/`f64[]` (floats are kept out of the key/order path —
+     CLAUDE.md §8) — stays **0A000** (the lift-when-encoded narrowing — §1, §10; PG *would*
+     build it, a documented divergence recorded in the oracle override ledger).
 4. **`UNIQUE` with `USING gin`** is **0A000** (uniqueness is undefined for an inverted
    index — §1; PG raises `0A000` too: "access method gin does not support unique indexes").
 5. **More than one key column** with `USING gin` is **0A000** this slice (PG *would* build a
@@ -152,10 +160,15 @@ entry_key = encode_element(term) ‖ row_storage_key
 ```
 
 - `encode_element(term)` is the element type's order-preserving key encoding
-  ([encoding.md §2.1](encoding.md)) — fixed-width for the integer element types this slice,
-  so the term needs **no presence tag and no terminator** (a GIN term is never NULL — §2 —
-  and a fixed-width term self-delimits). The future variable-width element types reuse the
-  terminated/escaped encodings ([encoding.md §2.4–§2.6](encoding.md)) when they lift.
+  ([encoding.md §2.1](encoding.md)) — fixed-width for every element type this slice admits
+  (the integers, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz` — §3), so the term
+  needs **no presence tag and no terminator** (a GIN term is never NULL — §2 — and a
+  fixed-width term self-delimits). It is the *same* per-type key encoder a `PRIMARY KEY` /
+  ordered-index key column uses, so a `uuid[]` term is the 16 raw bytes, a `date[]` term the
+  i32 sign-flipped day count, a `timestamp[]` term the i64 sign-flipped microseconds — each
+  already byte-pinned by that type's key-encoding vectors and PK goldens. The future
+  variable-width element types reuse the terminated/escaped encodings
+  ([encoding.md §2.4–§2.6](encoding.md)) when they lift.
 - The **row storage key** (the encoded PK, or the synthetic-rowid key) is the **suffix**,
   exactly as in an ordered index: it makes every entry unique, names the row, and — since
   the fixed-width term self-delimits — is recovered by skipping the term. So all rows
@@ -336,8 +349,10 @@ final row order is governed by `ORDER BY` exactly as any scan (CLAUDE.md §8).
   none (auto-names are observable via `DROP INDEX`/collisions and the host catalog in
   per-core tests), as for the ordered index ([indexes.md §7](indexes.md)).
 - **Element-type subset** — PG's `array_ops` GIN indexes an array of any element type; jed
-  this slice covers the integer element types only, the rest `0A000` (§3) until their key
-  encoding lifts. A divergence on `text[]`/etc. (PG builds, jed `0A000`), oracle-override-ledgered.
+  covers the **fixed-width key-encodable** elements (the integers, `boolean`, `uuid`, `date`,
+  `timestamp`, `timestamptz` — §3), the variable-width / not-yet-key-encoded rest `0A000`
+  until their key encoding lifts. A divergence on `text[]`/`decimal[]`/etc. (PG builds, jed
+  `0A000`), oracle-override-ledgered.
 - **Single-column only** — PG supports multicolumn GIN; jed is `0A000` this slice (§3).
 - **`<@` / `IN` not accelerated** — PG's `array_ops` GIN also serves `<@` (via a broad scan +
   recheck); jed runs `<@` and `IN`-over-a-scalar-list by full scan this slice (a cost/plan
@@ -367,8 +382,12 @@ vertical slice with a NoREC obligation ([conformance.md §8](conformance.md)):
 - **More opclasses** — `jsonb_ops` (jsonb keys + scalar values as terms; the lossy-recheck
   path §2 already seats) and a future object/document type, each a new opclass behind the §2
   seam; `jsonb_path_ops` (path hashes) later still.
-- **More array element types** — `text[]`, `decimal[]`, `bytea[]`, … as their order-preserving
-  element key encodings lift ([encoding.md §2.4–§2.6](encoding.md)); composite-element arrays.
+- **More array element types** — the **fixed-width key-encodable** elements (`uuid`, `date`,
+  `timestamp`, `timestamptz`, `boolean`, alongside the integers) have **landed** (§3): the GIN
+  term is their existing key encoding, so the inverted core was unchanged — only the DDL gate
+  and the per-element encoder generalized. The **variable-width / not-yet-key-encoded** elements
+  — `text[]`, `decimal[]`, `bytea[]`, `interval[]` — remain `0A000` until their order-preserving
+  element key encodings lift ([encoding.md §2.4–§2.6](encoding.md)); composite-element arrays too.
 - **More operators** — `<@` (contained-by, a broad scan + recheck), `IN` membership over a
   scalar list. (`const = ANY(col)` membership and array `=` have landed — §1/§6.)
 - **Multi-column GIN**, correlated / array-column query operands, and the LIMIT-streaming

@@ -212,6 +212,32 @@ fn gin_array_table_db() -> Database {
     db
 }
 
+/// `i_tags_gin` over a `uuid[]` column (kind 1) — the non-integer GIN element-type golden
+/// (spec/design/gin.md §3/§4): each GIN term is the element's 16-byte `uuid-raw16` key encoding,
+/// so entries are `encode_uuid(term) ‖ storage_key` (empty payload), pinning that a uuid-element
+/// GIN index serializes byte-identically across cores. Rows mirror `gin_array_table_db`: term DEDUP
+/// (row 2's duplicate bb), an EMPTY and a NULL whole-value array (rows 3/4 → no entries), and a NULL
+/// element (row 5). An ordinary ordered index `i_n` sits beside it (kind 0).
+fn gin_uuid_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, tags uuid[], n i32)",
+    );
+    run(
+        &mut db,
+        "INSERT INTO t VALUES \
+         (1, '{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000cc}', 1), \
+         (2, '{00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000dd}', 2), \
+         (3, '{}', 3), \
+         (4, NULL, 4), \
+         (5, '{00000000-0000-0000-0000-0000000000aa,NULL,00000000-0000-0000-0000-0000000000ee}', 5)",
+    );
+    run(&mut db, "CREATE INDEX i_n ON t (n)");
+    run(&mut db, "CREATE INDEX i_tags_gin ON t USING gin (tags)");
+    db
+}
+
 /// A table with no primary key — exercises the stored synthetic i64 rowid key.
 fn nopk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
@@ -718,6 +744,7 @@ fn write_matches_goldens() {
         ("index_table.jed", index_table_db),
         ("unique_table.jed", unique_table_db),
         ("gin_array_table.jed", gin_array_table_db),
+        ("gin_uuid_table.jed", gin_uuid_table_db),
         ("fk_table.jed", fk_table_db),
         ("composite_type_table.jed", composite_type_table_db),
         ("nested_composite_table.jed", nested_composite_table_db),
@@ -767,6 +794,7 @@ fn read_goldens_reproduces_rows() {
         ("index_table.jed", index_table_db, "t"),
         ("unique_table.jed", unique_table_db, "t"),
         ("gin_array_table.jed", gin_array_table_db, "t"),
+        ("gin_uuid_table.jed", gin_uuid_table_db, "t"),
         ("fk_table.jed", fk_table_db, "c"),
         ("composite_type_table.jed", composite_type_table_db, "t"),
         ("nested_composite_table.jed", nested_composite_table_db, "t"),

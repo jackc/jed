@@ -125,6 +125,9 @@ var SupportedCapabilities = []string{
 	// target-row scan through the GIN index (PK-then-GIN-then-full), same end state as the full
 	// scan (spec/design/gin.md §6); the ordered-index bound stays SELECT-only.
 	"query.gin_mutation",
+	// GIN over non-integer fixed-width key-encodable element types (uuid/date/timestamp/
+	// timestamptz/boolean) — the gate lift + the shared key-value term encoder (gin.md §3/§4).
+	"query.gin_element_types",
 	"query.is_null",
 	"query.order_by",
 	// Richer ORDER BY — multiple keys, per-key ASC/DESC, per-key NULLS FIRST|LAST (grammar.md §10).

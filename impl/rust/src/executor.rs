@@ -2345,8 +2345,10 @@ impl Database {
                 }
                 IndexKind::Gin => {
                     // GIN needs an operator class for the column type: only an array has one (else
-                    // 42704, no default opclass), and this slice only the integer element types
-                    // (else 0A000) — spec/design/gin.md §3.
+                    // 42704, no default opclass), and only a FIXED-WIDTH KEY-ENCODABLE element type
+                    // (else 0A000) — the GIN term IS that element's key encoding (gin.md §3/§4), so
+                    // the admitted set is exactly the keyable scalars a PK / ordered-index key
+                    // column accepts (the integers, boolean, uuid, date, timestamp, timestamptz).
                     match ty.array_element() {
                         None => {
                             return Err(EngineError::new(
@@ -2357,7 +2359,7 @@ impl Database {
                                 ),
                             ));
                         }
-                        Some(elem) if !elem.is_integer() => {
+                        Some(elem) if !is_gin_element_type(&elem) => {
                             return Err(EngineError::new(
                                 SqlState::FeatureNotSupported,
                                 format!(
@@ -6519,20 +6521,26 @@ impl Database {
             Some(q) => q.eval(&[], env, &mut Meter::new())?,
             None => return Ok((Vec::new(), (0, 0))),
         };
-        let mut terms: Vec<i64> = Vec::new();
+        // Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
+        // entries carry, so a term doubles as its posting-list prefix below. Encoding now (vs. later)
+        // lets us dedup distinct terms by bytes (the encoding is a bijection: byte-dedup ==
+        // value-dedup, byte-sort == value-sort) generically over every admitted element type.
+        let mut terms: Vec<Vec<u8>> = Vec::new();
         let mut has_null = false;
         let mut is_empty = false;
         if gb.strategy == GinStrategy::Member {
             // `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL `c` can equal no
             // element, so the bound is provably empty (gin.md §6). `c` is in the element type's
-            // range by resolution (jed coerces `c` to the element type, rejecting an out-of-range
-            // constant 22003 before exec); the range check is a defensive guard against silently
-            // truncating an out-of-range value into a wrong term.
+            // domain by resolution (jed coerces `c` to the element type, rejecting an out-of-range
+            // integer constant 22003 before exec); the integer range check is a defensive guard
+            // against silently truncating an out-of-range value into a wrong term.
             match &qv {
+                Value::Null => return Ok((Vec::new(), (0, 0))),
                 Value::Int(n) if *n >= gb.elem_type.min() && *n <= gb.elem_type.max() => {
-                    terms.push(*n)
+                    terms.push(encode_key_value(gb.elem_type, &qv))
                 }
-                _ => return Ok((Vec::new(), (0, 0))),
+                Value::Int(_) => return Ok((Vec::new(), (0, 0))), // out-of-range guard
+                v => terms.push(encode_key_value(gb.elem_type, v)),
             }
         } else {
             let arr = match &qv {
@@ -6543,9 +6551,8 @@ impl Database {
             };
             for el in &arr.elements {
                 match el {
-                    Value::Int(n) => terms.push(*n),
-                    Value::Null => has_null = true,
-                    _ => {} // a non-integer element is impossible under the array_ops gate
+                    Value::Null => has_null = true, // a NULL element carries no term
+                    v => terms.push(encode_key_value(gb.elem_type, v)),
                 }
             }
             is_empty = arr.elements.is_empty();
@@ -6585,12 +6592,11 @@ impl Database {
         let mut pages = 0usize;
         let mut entries_visited = 0usize;
         let mut postings: Vec<Vec<Vec<u8>>> = Vec::with_capacity(terms.len());
-        for &t in &terms {
-            let prefix = encode_int(gb.elem_type, t);
+        for prefix in &terms {
             let bound = KeyBound {
                 lo: Some(prefix.clone()),
                 lo_inc: true,
-                hi: prefix_successor(&prefix),
+                hi: prefix_successor(prefix),
                 hi_inc: false,
             };
             let (es, p, _) = istore.range_scan_with_units(&bound, &[])?;
@@ -8126,12 +8132,26 @@ fn index_entry_keys(
     }
 }
 
+/// Is `elem` an element type a GIN (`array_ops`) index admits? Exactly the fixed-width
+/// key-encodable scalars — the integers, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`
+/// (spec/design/gin.md §3): the GIN term IS the element's order-preserving key encoding (§4), so
+/// this is the same set a `PRIMARY KEY` / ordered-index key column accepts. Variable-width or
+/// not-yet-key-encoded elements (`text`, `decimal`, `bytea`, `interval`, the floats) are 0A000.
+fn is_gin_element_type(elem: &Type) -> bool {
+    elem.is_integer()
+        || elem.is_bool()
+        || elem.is_uuid()
+        || elem.is_timestamp()
+        || elem.is_timestamptz()
+        || elem.is_date()
+}
+
 /// A GIN index's entry keys for one row (spec/design/gin.md §4): one entry per DISTINCT non-NULL
 /// array element — `encode_element(term) ‖ storage_key`, with NO presence tag (a term is never
 /// NULL) and an empty payload. A NULL array column value and an empty array both yield no entries
-/// (so they never appear in any posting list — correct for `@>`/`&&`). Returned sorted by term
-/// (= encoded-byte order for the integer element types), so the per-row order is deterministic.
-/// This slice: a single integer-element array column (`array_ops`).
+/// (so they never appear in any posting list — correct for `@>`/`&&`). Returned sorted by encoded
+/// term (= key-encoding byte order, which is order-preserving for every admitted element type), so
+/// the per-row order is deterministic. `array_ops` over any fixed-width key-encodable element type.
 fn gin_entries(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row) -> Vec<Vec<u8>> {
     let ci = def.columns[0];
     let elem_ty = columns[ci]
@@ -8139,20 +8159,22 @@ fn gin_entries(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row
         .array_element()
         .expect("a GIN index column is an array (CREATE INDEX gate)")
         .scalar();
-    let mut vals: Vec<i64> = Vec::new();
+    let mut terms: Vec<Vec<u8>> = Vec::new();
     if let Value::Array(arr) = &row[ci] {
         for el in &arr.elements {
-            if let Value::Int(n) = el {
-                vals.push(*n);
+            // a NULL element contributes no term; a non-keyable element is impossible under the gate
+            if !matches!(el, Value::Null) {
+                terms.push(encode_key_value(elem_ty, el));
             }
-            // a NULL element (or any non-integer — impossible under the gate) contributes no term
         }
     }
-    vals.sort_unstable();
-    vals.dedup();
-    vals.into_iter()
-        .map(|n| {
-            let mut entry = encode_int(elem_ty, n);
+    // Dedup by the encoded term: the encoding is a bijection, so byte-dedup == value-dedup, and
+    // byte-sort == value-sort (order-preserving). Each distinct term yields one entry.
+    terms.sort_unstable();
+    terms.dedup();
+    terms
+        .into_iter()
+        .map(|mut entry| {
             entry.extend_from_slice(storage_key);
             entry
         })

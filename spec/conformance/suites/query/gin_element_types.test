@@ -1,0 +1,206 @@
+# GIN over non-integer fixed-width key-encodable element types — a `USING gin` index, and every
+# GIN-bounded scan it accelerates (`@>`, `&&`, `= ANY`, array `=`, and the GIN-bounded UPDATE/DELETE),
+# now admit an array column whose element type is any of the engine's keyable scalars beyond the
+# integers: `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]` — the same set a PRIMARY
+# KEY / ordered-index key column accepts (spec/design/gin.md §3). A GIN term IS the element's
+# order-preserving key encoding (§4), so the inverted core (entry tree, gather, posting combine,
+# residual recheck, cost) is unchanged; only the CREATE INDEX gate and the per-element term encoder
+# generalized from integers to the shared key-value encoder. The rows, the end state, and the cost are
+# the integer case's — just over a wider element domain — and PostgreSQL agrees (its array_ops GIN is
+# element-generic too). This file pins the four strategies + a GIN-bounded DELETE over each new
+# element type. The element/array operands use the cross-engine forms (jed defers casting an ARRAY
+# constructor TO a type, PG won't coerce a bare string array): a `'{…}'` text literal for an INSERT
+# value (coerced to the column type), a `'{…}'::T[]` string-literal cast for an array operand, and a
+# `'…'::T` scalar cast for the `= ANY` operand.
+#
+# The `# cost:` assertions pin that the GIN bound — not a full scan — is taken; they are identical to
+# the integer case (same gather shape), cross-core identical (CLAUDE.md §8). Format:
+# ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.gin_index, query.gin_element_types, query.gin_scan, query.gin_any_eq, query.gin_array_eq, query.gin_mutation, dml.insert, dml.insert_multi_row, dml.delete, query.select, query.order_by, query.where_eq, func.array_containment, func.array_quantified, cast.operator, types.uuid, types.date, types.timestamp, types.boolean, types.i32, types.array, resource.cost_metering
+
+# ============================================================================
+# uuid[] — the headline non-integer element type. aa/bb/cc/dd/ee are five distinct uuids; rows hold
+# shared / disjoint / empty / NULL / single-element arrays (the same shape as the integer GIN tests).
+# ============================================================================
+
+statement ok
+CREATE TABLE u (id i32 PRIMARY KEY, tags uuid[])
+
+statement ok
+CREATE INDEX u_tags_gin ON u USING gin (tags)
+
+statement ok
+INSERT INTO u VALUES
+  (1, '{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000cc}'),
+  (2, '{00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000dd}'),
+  (3, '{00000000-0000-0000-0000-0000000000dd,00000000-0000-0000-0000-0000000000ee}'),
+  (4, '{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-0000000000bb}'),
+  (5, '{}'),
+  (6, NULL),
+  (7, '{00000000-0000-0000-0000-0000000000aa}')
+
+# @> (contains): rows whose tags contain BOTH aa and bb → ids 1, 4 (the two-posting-list intersection)
+# cost: 16
+query I nosort
+SELECT id FROM u WHERE tags @> '{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-0000000000bb}'::uuid[] ORDER BY id
+----
+1
+4
+
+# && (overlaps): rows sharing dd → ids 2, 3 (the posting-list union)
+# cost: 11
+query I nosort
+SELECT id FROM u WHERE tags && '{00000000-0000-0000-0000-0000000000dd}'::uuid[] ORDER BY id
+----
+2
+3
+
+# = ANY (membership): rows containing aa → ids 1, 4, 7 (a single-term @> gather)
+# cost: 19
+query I nosort
+SELECT id FROM u WHERE '00000000-0000-0000-0000-0000000000aa'::uuid = ANY(tags) ORDER BY id
+----
+1
+4
+7
+
+# = (exact array equality): tags exactly {aa,bb} → id 4 (the @>-superset gather + residual = — only
+# id 4, not id 1 which merely CONTAINS {aa,bb})
+# cost: 15
+query I nosort
+SELECT id FROM u WHERE tags = '{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-0000000000bb}'::uuid[] ORDER BY id
+----
+4
+
+# @> miss: no row contains ff → a real gather over the empty posting list, deletes/keeps nothing
+# cost: 1
+query I nosort
+SELECT id FROM u WHERE tags @> '{00000000-0000-0000-0000-0000000000ff}'::uuid[] ORDER BY id
+----
+
+# GIN-bounded DELETE: remove the rows containing dd → ids 2, 3; the index is maintained (a probe after
+# the delete finds dd in no surviving row)
+# cost: 12
+statement ok
+DELETE FROM u WHERE '00000000-0000-0000-0000-0000000000dd'::uuid = ANY(tags)
+
+# cost: 1
+query I nosort
+SELECT id FROM u WHERE '00000000-0000-0000-0000-0000000000dd'::uuid = ANY(tags) ORDER BY id
+----
+
+query I nosort
+SELECT id FROM u ORDER BY id
+----
+1
+4
+5
+6
+7
+
+# ============================================================================
+# date[] — the i32 sign-flipped day-count key encoding as a GIN term.
+# ============================================================================
+
+statement ok
+CREATE TABLE d (id i32 PRIMARY KEY, ds date[])
+
+statement ok
+CREATE INDEX d_ds_gin ON d USING gin (ds)
+
+statement ok
+INSERT INTO d VALUES
+  (1, '{2026-01-01,2026-02-02}'),
+  (2, '{2026-02-02,2026-03-03}'),
+  (3, '{2026-03-03}'),
+  (4, '{}')
+
+# @> (contains): rows holding 2026-02-02 → ids 1, 2
+# cost: 11
+query I nosort
+SELECT id FROM d WHERE ds @> '{2026-02-02}'::date[] ORDER BY id
+----
+1
+2
+
+# = ANY (membership): rows holding 2026-03-03 → ids 2, 3
+# cost: 14
+query I nosort
+SELECT id FROM d WHERE '2026-03-03'::date = ANY(ds) ORDER BY id
+----
+2
+3
+
+# && (overlaps): rows sharing 2026-01-01 or 2026-03-03 → ids 1, 2, 3
+# cost: 17
+query I nosort
+SELECT id FROM d WHERE ds && '{2026-01-01,2026-03-03}'::date[] ORDER BY id
+----
+1
+2
+3
+
+# ============================================================================
+# timestamp[] — the i64 sign-flipped microseconds key encoding as a GIN term.
+# ============================================================================
+
+statement ok
+CREATE TABLE ts (id i32 PRIMARY KEY, t timestamp[])
+
+statement ok
+CREATE INDEX ts_t_gin ON ts USING gin (t)
+
+statement ok
+INSERT INTO ts VALUES
+  (1, '{2026-01-01 00:00:00,2026-06-15 12:30:00}'),
+  (2, '{2026-06-15 12:30:00}'),
+  (3, '{2026-12-31 23:59:59}')
+
+# @> (contains): rows holding 2026-06-15 12:30:00 → ids 1, 2
+# cost: 11
+query I nosort
+SELECT id FROM ts WHERE t @> '{2026-06-15 12:30:00}'::timestamp[] ORDER BY id
+----
+1
+2
+
+# = (exact array equality): t exactly {2026-06-15 12:30:00} → id 2
+# cost: 10
+query I nosort
+SELECT id FROM ts WHERE t = '{2026-06-15 12:30:00}'::timestamp[] ORDER BY id
+----
+2
+
+# ============================================================================
+# boolean[] — the degenerate 1-byte key encoding (only two distinct terms), still a valid array_ops
+# element type.
+# ============================================================================
+
+statement ok
+CREATE TABLE b (id i32 PRIMARY KEY, flags boolean[])
+
+statement ok
+CREATE INDEX b_flags_gin ON b USING gin (flags)
+
+statement ok
+INSERT INTO b VALUES
+  (1, '{t,f}'),
+  (2, '{t}'),
+  (3, '{f}'),
+  (4, '{}')
+
+# = ANY (membership): rows holding true → ids 1, 2
+# cost: 13
+query I nosort
+SELECT id FROM b WHERE true = ANY(flags) ORDER BY id
+----
+1
+2
+
+# @> (contains): rows holding false → ids 1, 3
+# cost: 11
+query I nosort
+SELECT id FROM b WHERE flags @> '{f}'::boolean[] ORDER BY id
+----
+1
+3

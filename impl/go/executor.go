@@ -2428,12 +2428,14 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 			}
 		case IndexGin:
 			// GIN needs an operator class for the column type: only an array has one (else 42704),
-			// and this slice only the integer element types (else 0A000) — spec/design/gin.md §3.
+			// and only a FIXED-WIDTH KEY-ENCODABLE element type (else 0A000) — the GIN term IS that
+			// element's key encoding (gin.md §3/§4), so the admitted set is exactly the keyable
+			// scalars a PK / ordered-index key column accepts.
 			if ty.Array == nil {
 				return Outcome{}, NewError(UndefinedObject,
 					"data type "+ty.CanonicalName()+" has no default operator class for access method gin")
 			}
-			if elem, ok := ty.Array.AsScalar(); !ok || !elem.IsInteger() {
+			if elem, ok := ty.Array.AsScalar(); !ok || !isGinElementType(elem) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a gin index on "+ty.CanonicalName()+" is not supported yet")
 			}
@@ -2766,11 +2768,22 @@ func indexEntryKeys(columns []Column, def IndexDef, storageKey []byte, row Row) 
 	return [][]byte{indexEntryKey(columns, def, storageKey, row)}
 }
 
+// isGinElementType reports whether elem is an element type a GIN (array_ops) index admits —
+// exactly the fixed-width key-encodable scalars (the integers, boolean, uuid, date, timestamp,
+// timestamptz; spec/design/gin.md §3): a GIN term IS the element's order-preserving key encoding
+// (§4), so this is the same set a PRIMARY KEY / ordered-index key column accepts. Variable-width or
+// not-yet-key-encoded elements (text, decimal, bytea, interval, the floats) are 0A000.
+func isGinElementType(elem ScalarType) bool {
+	return elem.IsInteger() || elem.IsBool() || elem.IsUuid() ||
+		elem.IsTimestamp() || elem.IsTimestamptz() || elem.IsDate()
+}
+
 // ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per
 // DISTINCT non-NULL array element — encode(element) ‖ storage_key, NO presence tag (a term is never
 // NULL) and an empty payload. A NULL array column value and an empty array yield no entries (so
-// they appear in no posting list). Returned sorted by term (= encoded-byte order for the integer
-// element types). This slice: a single integer-element array column.
+// they appear in no posting list). Returned sorted by encoded term (= key-encoding byte order, which
+// is order-preserving for every admitted element type). array_ops over any fixed-width key-encodable
+// element type.
 func ginEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][]byte {
 	ci := def.Columns[0]
 	elemTy := columns[ci].Type.Array.ScalarTy()
@@ -2778,21 +2791,24 @@ func ginEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][]
 	if v.Kind != ValArray {
 		return nil
 	}
-	seen := make(map[int64]bool)
-	var vals []int64
+	// Dedup by the encoded term (the encoding is a bijection: byte-dedup == value-dedup, byte-sort
+	// == value-sort) generically over every admitted element type.
+	seen := make(map[string]bool)
+	var terms [][]byte
 	for _, el := range v.Array.Elements {
-		if el.Kind != ValInt {
-			continue // a NULL element (or any non-integer — impossible under the gate) is no term
+		if el.Kind == ValNull {
+			continue // a NULL element carries no term; a non-keyable element is impossible under the gate
 		}
-		if !seen[el.Int] {
-			seen[el.Int] = true
-			vals = append(vals, el.Int)
+		t := encodeKeyValue(elemTy, el)
+		if !seen[string(t)] {
+			seen[string(t)] = true
+			terms = append(terms, t)
 		}
 	}
-	slices.Sort(vals)
-	entries := make([][]byte, 0, len(vals))
-	for _, n := range vals {
-		entry := append(EncodeInt(elemTy, n), storageKey...)
+	slices.SortFunc(terms, bytes.Compare)
+	entries := make([][]byte, 0, len(terms))
+	for _, t := range terms {
+		entry := append(append([]byte{}, t...), storageKey...)
 		entries = append(entries, entry)
 	}
 	return entries
@@ -5913,37 +5929,44 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	var terms []int64
+	// Each term is the element's order-preserving key encoding (gin.md §4) — the SAME bytes the
+	// entries carry, so a term doubles as its posting-list prefix below. Encoding now lets us dedup
+	// distinct terms by bytes (a bijection: byte-dedup == value-dedup, byte-sort == value-sort)
+	// generically over every admitted element type.
+	var terms [][]byte
 	hasNull := false
 	isEmpty := false
 	if gb.strategy == ginMember {
 		// `c = ANY(col)`: the query operand is a SCALAR, not an array. A NULL c can equal no element,
-		// so the bound is provably empty (gin.md §6). c is in the element type's range by resolution
-		// (jed coerces c to the element type, rejecting an out-of-range constant 22003 before exec);
-		// InRange is a defensive guard against silently truncating an out-of-range value into a wrong
-		// term.
-		if qv.Kind != ValInt || !gb.elemType.InRange(qv.Int) {
+		// so the bound is provably empty (gin.md §6). c is in the element type's domain by resolution
+		// (jed coerces c to the element type, rejecting an out-of-range integer constant 22003 before
+		// exec); InRange is a defensive guard against silently truncating an out-of-range integer into
+		// a wrong term.
+		if qv.Kind == ValNull {
 			return nil, 0, 0, nil
 		}
-		terms = append(terms, qv.Int)
+		if qv.Kind == ValInt && !gb.elemType.InRange(qv.Int) {
+			return nil, 0, 0, nil // out-of-range guard
+		}
+		terms = append(terms, encodeKeyValue(gb.elemType, qv))
 	} else {
 		if qv.Kind != ValArray {
 			return nil, 0, 0, nil // a NULL whole-array (or non-array) query → provably empty
 		}
-		seen := make(map[int64]bool)
+		seen := make(map[string]bool)
 		for _, el := range qv.Array.Elements {
-			switch el.Kind {
-			case ValInt:
-				if !seen[el.Int] {
-					seen[el.Int] = true
-					terms = append(terms, el.Int)
-				}
-			case ValNull:
-				hasNull = true
+			if el.Kind == ValNull {
+				hasNull = true // a NULL element carries no term
+				continue
+			}
+			t := encodeKeyValue(gb.elemType, el)
+			if !seen[string(t)] {
+				seen[string(t)] = true
+				terms = append(terms, t)
 			}
 		}
 		isEmpty = len(qv.Array.Elements) == 0
-		slices.Sort(terms)
+		slices.SortFunc(terms, bytes.Compare)
 	}
 
 	switch gb.strategy {
@@ -5986,8 +6009,7 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 	termWidth := gb.elemType.WidthBytes()
 	entriesVisited := 0
 	postings := make([][][]byte, 0, len(terms))
-	for _, t := range terms {
-		prefix := EncodeInt(gb.elemType, t)
+	for _, prefix := range terms {
 		b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
 		es, p, _, e := istore.RangeScanWithUnits(b, nil)
 		if e != nil {

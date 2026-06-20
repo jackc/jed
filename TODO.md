@@ -572,13 +572,25 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         four strategies + the `@> '{}'` fallback + a miss, oracle-checked) + the `gin_mut` NoREC
         scenario (index-bound mutation vs `<@` full-scan mutation, same end state) + a `gin_delete`
         write-rollback bench + `/web` Indexes page. → [gin.md §6](spec/design/gin.md)
+  - [x] _follow-on — non-integer (fixed-width key-encodable) element types:_ a `USING gin` index, and
+        every GIN-bounded scan (`@>`/`&&`/`= ANY`/`=` and the GIN-bounded UPDATE/DELETE), now admit an
+        array column whose element type is any of the engine's keyable scalars beyond the integers —
+        `uuid[]`, `date[]`, `timestamp[]`, `timestamptz[]`, `boolean[]` (the same set a PK / ordered-index
+        key column accepts). A GIN term IS the element's order-preserving key encoding, so the inverted
+        core was unchanged: only the CREATE INDEX gate (a shared `is_gin_element_type` predicate) and the
+        per-element term encoder generalized from `encode_int` to the shared `encode_key_value` — the
+        bytes/rows/cost are the integer case's over a wider element domain. All three cores + capability
+        `query.gin_element_types` + `suites/query/gin_element_types.test` (the four strategies + a
+        GIN-bounded DELETE over each new type, cost-asserted, oracle-checked) + the `gin_uuid_table.jed`
+        byte golden (rust==go==ts==ruby) + `/web` Indexes page. No `format_version` bump (uuid/date/
+        timestamp key encodings are already on disk). → [gin.md §3/§4](spec/design/gin.md)
   - [ ] _follow-on (each its own slice):_ `<@` (contained-by, broad scan + recheck — blocked on the
-        index recording empty/NULL-array rows) / `IN` over a scalar list; non-integer element types
-        (as their key encodings lift) + composite-element arrays; multi-column GIN; correlated /
-        array-column query operands; the **ordered-index** equality bound for UPDATE/DELETE (mutations
-        use PK+GIN but not the ordered index yet); the LIMIT-streaming combination; posting-list run
-        compression; the **`jsonb_ops`** opclass (the lossy-recheck path the seam already seats) and a
-        future object/document opclass.
+        index recording empty/NULL-array rows) / `IN` over a scalar list; the **remaining** element
+        types (`text[]`, `decimal[]`, `bytea[]`, `interval[]` — as their key encodings lift) +
+        composite-element arrays; multi-column GIN; correlated / array-column query operands; the
+        **ordered-index** equality bound for UPDATE/DELETE (mutations use PK+GIN but not the ordered
+        index yet); the LIMIT-streaming combination; posting-list run compression; the **`jsonb_ops`**
+        opclass (the lossy-recheck path the seam already seats) and a future object/document opclass.
 - [x] **`RETURNING`** — `INSERT`/`UPDATE`/`DELETE … RETURNING <select_items>` projecting affected
       rows (INSERT stored / UPDATE new / DELETE old), evaluated after validation before any write;
       the PG-18 `old.`/`new.` row-version qualifiers landed as a follow-on.

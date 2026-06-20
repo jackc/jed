@@ -166,6 +166,28 @@ function ginArrayTableDB(): Database {
   return db;
 }
 
+// ginUuidTableDB has a GIN index over a uuid[] column (kind 1) — the non-integer GIN element-type
+// golden (spec/design/gin.md §3/§4): each GIN term is the element's 16-byte uuid-raw16 key encoding,
+// so entries are encode_uuid(term) ‖ storage_key (empty payload). Rows mirror ginArrayTableDB: term
+// dedup (row 2's duplicate bb), an empty and a NULL whole-value array (rows 3/4 → no entries), and a
+// NULL element (row 5). An ordinary ordered index i_n sits beside it (kind 0).
+function ginUuidTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, tags uuid[], n i32)");
+  run(
+    db,
+    "INSERT INTO t VALUES " +
+      "(1, '{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000cc}', 1), " +
+      "(2, '{00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000dd}', 2), " +
+      "(3, '{}', 3), " +
+      "(4, NULL, 4), " +
+      "(5, '{00000000-0000-0000-0000-0000000000aa,NULL,00000000-0000-0000-0000-0000000000ee}', 5)",
+  );
+  run(db, "CREATE INDEX i_n ON t (n)");
+  run(db, "CREATE INDEX i_tags_gin ON t USING gin (tags)");
+  return db;
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 function nopkTableDB(): Database {
   const db = goldenDb();
@@ -566,6 +588,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "index_table.jed", build: indexTableDB },
     { name: "unique_table.jed", build: uniqueTableDB },
     { name: "gin_array_table.jed", build: ginArrayTableDB },
+    { name: "gin_uuid_table.jed", build: ginUuidTableDB },
     { name: "fk_table.jed", build: fkTableDB },
     { name: "composite_type_table.jed", build: compositeTypeTableDB },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB },
@@ -615,6 +638,7 @@ test("read goldens reproduces rows", () => {
     { name: "index_table.jed", build: indexTableDB, table: "t" },
     { name: "unique_table.jed", build: uniqueTableDB, table: "t" },
     { name: "gin_array_table.jed", build: ginArrayTableDB, table: "t" },
+    { name: "gin_uuid_table.jed", build: ginUuidTableDB, table: "t" },
     { name: "fk_table.jed", build: fkTableDB, table: "c" },
     { name: "composite_type_table.jed", build: compositeTypeTableDB, table: "t" },
     { name: "nested_composite_table.jed", build: nestedCompositeTableDB, table: "t" },

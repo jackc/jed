@@ -547,6 +547,27 @@ GIN_ARRAY_TABLE = {
          [5, [10, nil, 50], 5]]
 }.freeze
 
+# A GIN index over a uuid[] column (the non-integer GIN element-type golden, spec/design/gin.md §3/§4):
+# each GIN term is the element's 16-byte uuid-raw16 key encoding, so the index entries are
+# encode_uuid(term) ‖ storage_key (empty payload) — pinning that a uuid-element GIN serializes
+# byte-identically across cores. The shape mirrors GIN_ARRAY_TABLE (an i_n ordered index beside the
+# GIN; term dedup in row 2's duplicate bb; an empty + a NULL whole-value array in rows 3/4; a NULL
+# element in row 5), with uuid terms in place of integers. No format_version bump (uuid is a
+# fixed-width key encoding already on disk).
+GIN_UUID_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("tags", "uuid[]"), col("n", "i32")],
+  indexes: [
+    { name: "i_n", cols: [2] },
+    { name: "i_tags_gin", cols: [1], kind: "gin" }
+  ],
+  rows: [[1, ["00000000-0000-0000-0000-0000000000aa", "00000000-0000-0000-0000-0000000000bb", "00000000-0000-0000-0000-0000000000cc"], 1],
+         [2, ["00000000-0000-0000-0000-0000000000bb", "00000000-0000-0000-0000-0000000000bb", "00000000-0000-0000-0000-0000000000dd"], 2],
+         [3, [], 3],
+         [4, nil, 4],
+         [5, ["00000000-0000-0000-0000-0000000000aa", nil, "00000000-0000-0000-0000-0000000000ee"], 5]]
+}.freeze
+
 # A composite type used as an ARRAY ELEMENT type (v10 — array-of-composite, spec/design/array.md §12
 # AC1): pins the catalog array-column entry with a COMPOSITE element descriptor (type_code 15, then
 # the element descriptor element_type_code 14 + name "addr", §3) AND the recursive value body — an
@@ -722,6 +743,7 @@ FIXTURES = [
   { file: "index_table.jed", page_size: 256, tables: [INDEX_TABLE] },
   { file: "unique_table.jed", page_size: 256, tables: [UNIQUE_TABLE] },
   { file: "gin_array_table.jed", page_size: 256, tables: [GIN_ARRAY_TABLE] },
+  { file: "gin_uuid_table.jed", page_size: 256, tables: [GIN_UUID_TABLE] },
   { file: "fk_table.jed", page_size: 256, tables: FK_TABLE[:tables] },
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,

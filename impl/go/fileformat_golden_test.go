@@ -181,6 +181,25 @@ func ginArrayTableDB(t *testing.T) *Database {
 	return db
 }
 
+// ginUuidTableDB has a GIN index over a uuid[] column (kind 1) — the non-integer GIN element-type
+// golden (spec/design/gin.md §3/§4): each GIN term is the element's 16-byte uuid-raw16 key encoding,
+// so entries are encode_uuid(term) ‖ storage_key (empty payload). Rows mirror ginArrayTableDB: term
+// dedup (row 2's duplicate bb), an empty and a NULL whole-value array (rows 3/4 → no entries), and a
+// NULL element (row 5). An ordinary ordered index i_n sits beside it (kind 0).
+func ginUuidTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, tags uuid[], n i32)")
+	run(t, db, "INSERT INTO t VALUES "+
+		"(1, '{00000000-0000-0000-0000-0000000000aa,00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000cc}', 1), "+
+		"(2, '{00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000bb,00000000-0000-0000-0000-0000000000dd}', 2), "+
+		"(3, '{}', 3), "+
+		"(4, NULL, 4), "+
+		"(5, '{00000000-0000-0000-0000-0000000000aa,NULL,00000000-0000-0000-0000-0000000000ee}', 5)")
+	run(t, db, "CREATE INDEX i_n ON t (n)")
+	run(t, db, "CREATE INDEX i_tags_gin ON t USING gin (tags)")
+	return db
+}
+
 // nopkTableDB has no primary key — exercises the stored synthetic i64 rowid key.
 func nopkTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
@@ -609,6 +628,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"index_table.jed", indexTableDB},
 		{"unique_table.jed", uniqueTableDB},
 		{"gin_array_table.jed", ginArrayTableDB},
+		{"gin_uuid_table.jed", ginUuidTableDB},
 		{"fk_table.jed", fkTableDB},
 		{"composite_type_table.jed", compositeTypeTableDB},
 		{"nested_composite_table.jed", nestedCompositeTableDB},
@@ -663,6 +683,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"index_table.jed", indexTableDB, "t"},
 		{"unique_table.jed", uniqueTableDB, "t"},
 		{"gin_array_table.jed", ginArrayTableDB, "t"},
+		{"gin_uuid_table.jed", ginUuidTableDB, "t"},
 		{"fk_table.jed", fkTableDB, "c"},
 		{"composite_type_table.jed", compositeTypeTableDB, "t"},
 		{"nested_composite_table.jed", nestedCompositeTableDB, "t"},
