@@ -586,6 +586,25 @@ The design is optimized for AI agents even more than for humans. In practice:
   consistent with "boring, explicit code over clever abstraction."
 - **Spec-first per subsystem.** A subsystem's design doc + the relevant corpus is what an
   agent needs to work it without holding the whole engine in context.
+- **Multiple agent instances; sync through `origin`, not just shared memory.** Several
+  Claude instances run in **separate devcontainers** that share the project memory directory
+  and `project-status.md` (one `/persist` volume) but **not** a git working tree — each
+  container's checkout drifts independently. `origin`
+  (`git@edi.jackchristensen.com:repos/jed.git`) is a **private hub** every container can
+  reach, so it is the propagation path. Standing convention (a deliberate, scoped exception
+  to the harness "push only when the user asks" default — it covers *feature branches to this
+  private origin only*, never `master` mid-slice and never a public remote): **push a feature
+  branch to `origin` promptly** — `git push -u origin <branch>` right after the first commit,
+  then `git push` after each subsequent one — so the work is fetchable everywhere and backed
+  up. **Merge to `master` only when green** (`rake ci` / verify) and **push `master`
+  immediately on merge**, so the master tip is never left local-only. **Memory references
+  *pushed* state:** a "landed / committed at `<hash>`" note means pushed, and must say so
+  (or explicitly "branch-only, NOT pushed — container-local") so the next instance knows
+  whether `git fetch` will find it. Before trusting or continuing another instance's work,
+  `git fetch origin` and verify against your own git (`git cat-file -t <hash>`, `git log`,
+  `git branch -a`) rather than the prose. **Worktrees do not solve this** — they share an
+  object store by absolute path on *one* filesystem, and `/workspaces` is container-local
+  (only `/persist` is shared), so a worktree made in one container is invisible in another.
 
 ---
 
