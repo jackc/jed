@@ -342,6 +342,32 @@ func parseAllowDDLDirective(line string) (bool, bool) {
 	}
 }
 
+// varPair is a session-variable (name, value) parsed from a # set: directive.
+type varPair struct{ name, value string }
+
+// parseSetDirective parses a `# set: name=value, name2=value2` directive line (spec/design/session.md
+// §6.1): the session variables to set for the next record (reset after, like # seed: / # grant:).
+// Each pair splits on the first `=`; names are dotted custom variables.
+func parseSetDirective(line string) ([]varPair, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "set:")
+	if !ok {
+		return nil, false
+	}
+	var pairs []varPair
+	for _, part := range strings.Split(rest, ",") {
+		part = strings.TrimSpace(part)
+		if part == "" {
+			continue
+		}
+		name, value, found := strings.Cut(part, "=")
+		if !found {
+			return nil, false
+		}
+		pairs = append(pairs, varPair{strings.TrimSpace(name), strings.TrimSpace(value)})
+	}
+	return pairs, true
+}
+
 // parseSeedDirective parses a `# seed: N` directive line (spec/design/entropy.md §6): the fixed
 // PRNG seed (uint64) to run the next record under, making the uuid generators cross-core identical.
 func parseSeedDirective(line string) (uint64, bool) {
@@ -473,6 +499,7 @@ func runFile(text string) error {
 	var pendingGrants []privDelta
 	var pendingRevokes []privDelta
 	var pendingAllowDDL *bool
+	var pendingVars []varPair
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
@@ -511,6 +538,8 @@ func runFile(text string) error {
 				pendingRevokes = append(pendingRevokes, r)
 			} else if a, ok := parseAllowDDLDirective(line); ok {
 				pendingAllowDDL = &a
+			} else if vars, ok := parseSetDirective(line); ok {
+				pendingVars = append(pendingVars, vars...)
 			} else if s, ok := parseSeedDirective(line); ok {
 				pendingSeed = &s
 			} else if c, ok := parseClockDirective(line); ok {
@@ -587,6 +616,15 @@ func runFile(text string) error {
 		pendingGrants = nil
 		pendingRevokes = nil
 		pendingAllowDDL = nil
+		// Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
+		// pending # set: pair, so a directive decorates only its record and never leaks forward.
+		db.ResetVars()
+		for _, v := range pendingVars {
+			if err := db.SetVar(v.name, v.value); err != nil {
+				return fmt.Errorf("# set: directive uses a non-dotted variable name %q: %w", v.name, err)
+			}
+		}
+		pendingVars = nil
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "statement":

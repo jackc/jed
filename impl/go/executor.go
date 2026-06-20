@@ -702,6 +702,24 @@ type Session struct {
 	// schema change is 42501. Default on — jed has no schema/owner model, so this single boolean gates
 	// all DDL (the per-object CREATE/ownership privilege is a deferred follow-on).
 	allowDDL bool
+	// vars are the session variables (spec/design/session.md §6.1): PostgreSQL's GUC model scoped to
+	// the session — a string→string map (PG GUCs are all text) the host sets (SetVar/ResetVar) and SQL
+	// reads with current_setting. Custom (dotted) names only in v1. SESSION state, not snapshot state:
+	// it does NOT roll back with a transaction (PG SET SESSION). The map is a reference type, so the
+	// activate() value swap keeps each session's own map (like the privilege envelope).
+	vars map[string]string
+}
+
+// requireCustomVarName validates + canonicalizes a session-variable name (spec/design/session.md
+// §6.1). A variable must be namespaced like a PostgreSQL custom GUC — a dotted name (myapp.tenant);
+// a non-dotted name would be a built-in setting, and v1 exposes none through this map (the time_zone
+// built-in is a separate slice), so it is 42704. Returns the case-folded (lowercase, PG GUC names are
+// case-insensitive) map key.
+func requireCustomVarName(name string) (string, error) {
+	if strings.Contains(name, ".") {
+		return strings.ToLower(name), nil
+	}
+	return "", NewError(UndefinedObject, "unrecognized configuration parameter: "+name)
 }
 
 // newSession builds a fresh default session: no open transaction, default settings, empty state.
@@ -726,6 +744,7 @@ func newSessionWithOptions(opts SessionOptions) Session {
 		workMem:         opts.WorkMem,
 		privileges:      newPrivileges(),
 		allowDDL:        true,
+		vars:            map[string]string{},
 	}
 	if opts.DefaultPrivileges != nil {
 		s.privileges.SetDefaultTable(*opts.DefaultPrivileges)
@@ -865,6 +884,21 @@ func (db *Database) SetAllowDDL(allow bool) { db.session.allowDDL = allow }
 
 // AllowDDL reports whether DDL is permitted on the default session.
 func (db *Database) AllowDDL() bool { return db.session.allowDDL }
+
+// SetVar sets a session variable on the default session (spec/design/session.md §6.1). Custom
+// variables must be namespaced (a dotted name); a non-dotted name is 42704. Read it back in SQL with
+// current_setting('name'[, missing_ok]).
+func (db *Database) SetVar(name, value string) error { return db.session.SetVar(name, value) }
+
+// ResetVar clears a session variable on the default session (§6.1); a non-dotted name is 42704.
+func (db *Database) ResetVar(name string) error { return db.session.ResetVar(name) }
+
+// Var reads a session variable's value on the default session (§6.1); ok is false if it is not set.
+func (db *Database) Var(name string) (string, bool) { return db.session.Var(name) }
+
+// ResetVars clears every session variable on the default session (§6.1) — PostgreSQL's RESET ALL for
+// the variable map (also the conformance harness # set: reset hook).
+func (db *Database) ResetVars() { db.session.ResetVars() }
 
 // SetMaxSQLLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
 // §13; spec/design/api.md §8). A statement whose text exceeds bytes is rejected with 54000 at
@@ -1017,6 +1051,45 @@ func (s *Session) Privileges() *Privileges { return &s.privileges }
 // AllowDDL / SetAllowDDL — whether DDL is permitted on this session (§5.3); a denied change is 42501.
 func (s *Session) AllowDDL() bool         { return s.allowDDL }
 func (s *Session) SetAllowDDL(allow bool) { s.allowDDL = allow }
+
+// SetVar sets a session variable (spec/design/session.md §6.1) — PostgreSQL's GUC model, scoped to
+// the session. Custom variables must be namespaced (a dotted name like myapp.tenant); a non-dotted
+// name is 42704 (no built-in setting is reachable through this map in v1 — the time_zone built-in is
+// its own slice). The name is case-insensitive (folded to lowercase, PG); the value is text. Session
+// state, not snapshot state — it does NOT roll back with a transaction.
+func (s *Session) SetVar(name, value string) error {
+	key, err := requireCustomVarName(name)
+	if err != nil {
+		return err
+	}
+	if s.vars == nil {
+		s.vars = map[string]string{}
+	}
+	s.vars[key] = value
+	return nil
+}
+
+// ResetVar clears a session variable (§6.1). A non-dotted name is 42704 (as for SetVar); an unset
+// name is a no-op success (PG RESET of an unset custom variable).
+func (s *Session) ResetVar(name string) error {
+	key, err := requireCustomVarName(name)
+	if err != nil {
+		return err
+	}
+	delete(s.vars, key)
+	return nil
+}
+
+// Var reads a session variable's value (§6.1); ok is false if it is not set. The host getter never
+// errors — it is the SQL current_setting read that raises 42704 on an unset name.
+func (s *Session) Var(name string) (string, bool) {
+	v, ok := s.vars[strings.ToLower(name)]
+	return v, ok
+}
+
+// ResetVars clears every session variable (§6.1) — PostgreSQL's RESET ALL for the variable map (also
+// the per-record reset hook the conformance harness's # set: directive uses).
+func (s *Session) ResetVars() { s.vars = map[string]string{} }
 
 // SetRandomSource / ClearRandomSource — the uuid-generator entropy seam (entropy.md §6).
 func (s *Session) SetRandomSource(f RandomSource) { s.seam.SetRandom(f) }
@@ -10080,6 +10153,10 @@ const (
 	sfCurrval
 	sfSetval
 	sfLastval
+	// session-variable read (spec/design/session.md §6.1): sfCurrentSetting(text[, bool]) → text reads
+	// the named session variable from the session's variable map. STABLE; 42704 on an unset name unless
+	// the two-arg missing_ok is true (→ NULL).
+	sfCurrentSetting
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -11362,6 +11439,9 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfSetval
 	case "lastval":
 		return sfLastval
+	// Session-variable read (spec/design/session.md §6.1): reads the session's variable map.
+	case "current_setting":
+		return sfCurrentSetting
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -16379,6 +16459,20 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return IntValue(n), nil
+		case sfCurrentSetting:
+			// current_setting (spec/design/session.md §6.1): read the named session variable from the
+			// session's variable map. The blanket NULL propagation above already returned NULL for a
+			// NULL name / missing_ok argument, so both are non-NULL here. An unset name is 42704 UNLESS
+			// the two-arg overload's missing_ok is true (→ NULL).
+			name := vals[0].Str
+			missingOK := len(vals) > 1 && vals[1].Bool
+			if v, ok := env.exec.session.vars[strings.ToLower(name)]; ok {
+				return TextValue(v), nil
+			}
+			if missingOK {
+				return NullValue(), nil
+			}
+			return Value{}, NewError(UndefinedObject, "unrecognized configuration parameter: "+name)
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).
