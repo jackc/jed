@@ -398,6 +398,80 @@ func DecimalFromCodec(neg bool, scale uint32, groups []uint16) Decimal {
 	return newDecimal(neg, scale, magFromNbase4(groups))
 }
 
+// EncodeKey returns the order-preserving KEY body for a decimal (method
+// decimal-order-preserving, spec/design/encoding.md §2.5). Self-delimiting; sorts byte-for-byte
+// under bytes.Compare identically to numeric value, INDEPENDENT of display scale — 1.5 and 1.50
+// produce identical bytes (they are equal, so a UNIQUE decimal index treats them as one). A PK is
+// NOT NULL, so the stored key is this bare body; the §2.2 nullable slot prepends the presence tag
+// and §2.3 descending inverts the whole component (both at the caller).
+//
+// Normalize the value to (sign, base-100 mantissa pairs, E) with value = 0.<pairs> × 100^E, then
+// emit: a sign/class byte (0x03 neg < 0x04 zero < 0x05 pos); the exponent E as a 4-byte
+// order-preserving int-be-signflip i32 (§2.1 — larger E sorts later for positives); the mantissa
+// pairs most-significant first, each as pair+1 ∈ [0x01, 0x64] (0x00 reserved for the terminator);
+// and a 0x00 terminator (a shorter mantissa sorts before one that extends it). For NEGATIVE values
+// the exponent, mantissa, and terminator are bitwise-complemented so "more negative" sorts first.
+func (d Decimal) EncodeKey() []byte {
+	// Zero is the single class byte 0x04 (neg 0x03 < zero 0x04 < pos 0x05).
+	if d.IsZero() {
+		return []byte{0x04}
+	}
+	// Significant digits (no leading zeros) and the base-10 decimal-point exponent:
+	// value = 0.<digits> × 10^decpt, with decpt = precision − scale.
+	digits := []byte(magToDecimalStr(d.Limbs))
+	decpt := int32(d.Precision()) - int32(d.Scale)
+	// Drop trailing zero digits (the least-significant ones): the mantissa keeps only its
+	// significant part and decpt is unchanged, so 1.50 ("150") collapses onto 1.5 ("15").
+	for len(digits) > 0 && digits[len(digits)-1] == '0' {
+		digits = digits[:len(digits)-1]
+	}
+	// Base-100 exponent E (value = 0.<pairs> × 100^E) and pair alignment: prepend a '0' when
+	// decpt is odd so the leading base-100 pair is "0 d1", then pad right to an even length.
+	e := floorDiv2(decpt + 1)
+	grouped := make([]byte, 0, len(digits)+2)
+	if mod2(decpt) == 1 {
+		grouped = append(grouped, '0')
+	}
+	grouped = append(grouped, digits...)
+	if len(grouped)%2 == 1 {
+		grouped = append(grouped, '0')
+	}
+	// Body: 4-byte order-preserving exponent ‖ mantissa pairs (pair+1) ‖ 0x00 terminator.
+	body := make([]byte, 0, 4+len(grouped)/2+1)
+	body = append(body, EncodeInt(Int32, int64(e))...)
+	for i := 0; i < len(grouped); i += 2 {
+		v := (grouped[i]-'0')*10 + (grouped[i+1] - '0')
+		body = append(body, v+1)
+	}
+	body = append(body, 0x00)
+	// Assemble with the sign/class byte; negatives complement the body (E+mantissa+terminator).
+	out := make([]byte, 0, 1+len(body))
+	if d.Neg {
+		out = append(out, 0x03)
+		for _, b := range body {
+			out = append(out, ^b)
+		}
+	} else {
+		out = append(out, 0x05)
+		out = append(out, body...)
+	}
+	return out
+}
+
+// floorDiv2 is floor(n/2) for any int32 (Go's / truncates toward zero, so negative odd n needs
+// the adjustment) — the order-preserving base-100 exponent math in EncodeKey.
+func floorDiv2(n int32) int32 {
+	if n >= 0 {
+		return n / 2
+	}
+	return -((-n + 1) / 2)
+}
+
+// mod2 is the Euclidean n mod 2 ∈ {0,1} for any int32 (so a negative odd decpt reads as odd).
+func mod2(n int32) int32 {
+	return ((n % 2) + 2) % 2
+}
+
 // selectDivScale is PG's select_div_scale (spec/design/decimal.md §4): >=16 significant
 // quotient digits, no fewer fractional digits than either input, in PG's base-10^4 units.
 func selectDivScale(a, b Decimal) uint32 {

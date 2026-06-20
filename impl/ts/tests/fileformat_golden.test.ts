@@ -299,6 +299,23 @@ function byteaPkTableDB(): Database {
   return db;
 }
 
+// decimalPkTableDB is the first golden with a VARIABLE-WIDTH SIGNED stored key — the
+// decimal-order-preserving encoding (encoding.md §2.5). The store sorts into numeric (= key)
+// order: -2.5 < -0.5 < 0 < 0.25 < 1.5 < 10 < 100.50; "100.50" stores scale 2 in its value body
+// but normalizes in the key. Must match spec/fileformat/verify.rb's DECIMAL_PK_TABLE.
+function decimalPkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (k decimal PRIMARY KEY, v i32)");
+  run(db, "INSERT INTO t VALUES (-2.5, 6)");
+  run(db, "INSERT INTO t VALUES (-0.5, 5)");
+  run(db, "INSERT INTO t VALUES (0, 4)");
+  run(db, "INSERT INTO t VALUES (0.25, 1)");
+  run(db, "INSERT INTO t VALUES (1.5, 2)");
+  run(db, "INSERT INTO t VALUES (10, 3)");
+  run(db, "INSERT INTO t VALUES (100.50, 7)");
+  return db;
+}
+
 // decimalTableDB has a decimal column — exercises the value codec's decimal branch (flags +
 // u16 scale + u16 ndigits + base-10^4 groups) and the catalog typmod: an unconstrained numeric
 // column `d` and a constrained numeric(10,2) column `m` (values already at scale 2, a no-op
@@ -623,6 +640,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "bytea_table.jed", build: byteaTableDB },
     { name: "text_pk_table.jed", build: textPkTableDB },
     { name: "bytea_pk_table.jed", build: byteaPkTableDB },
+    { name: "decimal_pk_table.jed", build: decimalPkTableDB },
     { name: "uuid_table.jed", build: uuidTableDB },
     { name: "default_table.jed", build: defaultTableDB },
     { name: "default_expr_table.jed", build: defaultExprTableDB },
@@ -676,6 +694,7 @@ test("read goldens reproduces rows", () => {
     { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
     { name: "text_pk_table.jed", build: textPkTableDB, table: "t" },
     { name: "bytea_pk_table.jed", build: byteaPkTableDB, table: "t" },
+    { name: "decimal_pk_table.jed", build: decimalPkTableDB, table: "t" },
     { name: "uuid_table.jed", build: uuidTableDB, table: "t" },
     { name: "default_table.jed", build: defaultTableDB, table: "t" },
     { name: "default_expr_table.jed", build: defaultExprTableDB, table: "t" },

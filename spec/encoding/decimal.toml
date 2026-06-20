@@ -1,0 +1,80 @@
+# Order-preserving key-encoding vectors for `decimal` — method `decimal-order-preserving`
+# (../design/encoding.md §2.5). The value is normalized to (sign, base-100 mantissa pairs, E)
+# with value = 0.<pairs> × 100^E, then emitted as: a sign/class byte (0x03 neg / 0x04 zero /
+# 0x05 pos), the exponent E as a 4-byte int-be-signflip i32, the mantissa pairs (pair+1 ∈
+# [0x01,0x64]) most-significant first, and a 0x00 terminator. Negatives complement the exponent,
+# mantissa, and terminator (not the class byte) so "more negative" sorts first. The encoding is
+# INDEPENDENT of display scale — 1.5 and 1.50 produce identical bytes (they are equal). A decimal
+# PRIMARY KEY stores the BARE body (NOT NULL, no presence tag); an index slot wraps it in the §2.2
+# nullable tag. Verified by verify.rb (round-trip-free: a key is never decoded back to a value, so
+# only encode + byte-exactness + strict order are checked).
+#
+# Each `value` is the decimal's canonical string. Groups are in ascending logical (= byte) order,
+# so the order invariant is a walk of the list.
+
+schema_version = 1
+
+# --- bare decimal key body (the PRIMARY KEY form) ----------------------------
+# A full ascending spread crossing the sign boundary, through zero, sub-1 magnitudes (negative
+# decpt), single- and multi-pair mantissas, and odd/even decpt — the strongest order proof.
+[[bare]]
+type = "decimal"
+cases = [
+  { value = "-99999999999999999999", bytes = "037ffffff59b9b9b9b9b9b9b9b9b9bff" },
+  { value = "-12345.6789",           bytes = "037ffffffcfde7d1bba5ff" },
+  { value = "-123",                  bytes = "037ffffffdfde7ff" },
+  { value = "-101",                  bytes = "037ffffffdfdfdff" },
+  { value = "-100",                  bytes = "037ffffffdfdff" },
+  { value = "-12",                   bytes = "037ffffffef2ff" },
+  { value = "-10",                   bytes = "037ffffffef4ff" },
+  { value = "-5",                    bytes = "037ffffffef9ff" },
+  { value = "-1.5",                  bytes = "037ffffffefdccff" },
+  { value = "-1",                    bytes = "037ffffffefdff" },
+  { value = "-0.5",                  bytes = "037fffffffccff" },
+  { value = "-0.05",                 bytes = "037ffffffff9ff" },
+  { value = "-0.001",                bytes = "0380000000f4ff" },
+  { value = "0",                     bytes = "04" },                 # zero: the single class byte
+  { value = "0.001",                 bytes = "057fffffff0b00" },
+  { value = "0.05",                  bytes = "05800000000600" },
+  { value = "0.5",                   bytes = "05800000003300" },
+  { value = "1",                     bytes = "05800000010200" },
+  { value = "1.5",                   bytes = "0580000001023300" },
+  { value = "5",                     bytes = "05800000010600" },
+  { value = "10",                    bytes = "05800000010b00" },
+  { value = "12",                    bytes = "05800000010d00" },
+  { value = "100",                   bytes = "05800000020200" },
+  { value = "101",                   bytes = "0580000002020200" },
+  { value = "123",                   bytes = "0580000002021800" },
+  { value = "12345.6789",            bytes = "058000000302182e445a00" },
+  { value = "99999999999999999999",  bytes = "058000000a6464646464646464646400" },
+]
+
+# --- nullable decimal slot (the secondary-index / composite-member form) ------
+# 0x00 present + the bare body, or the lone 0x01 for NULL (NULL sorts last ascending).
+[[nullable]]
+type = "decimal"
+cases = [
+  { value = "-1.5",   bytes = "00037ffffffefdccff" },
+  { value = "-0.001", bytes = "000380000000f4ff" },
+  { value = "0",      bytes = "0004" },
+  { value = "0.001",  bytes = "00057fffffff0b00" },
+  { value = "1.5",    bytes = "000580000001023300" },
+  { value = "100",    bytes = "0005800000020200" },
+  { null = true,      bytes = "01" },                  # NULL sorts last
+]
+
+# --- descending decimal slot -------------------------------------------------
+# Bitwise inversion of the nullable encoding (class byte + body); NULL lifts to first. Listed in
+# ascending byte order (= descending logical order) so the order invariant holds.
+[[descending]]
+type = "decimal"
+base = "nullable"
+cases = [
+  { null = true,      bytes = "fe" },                  # NULL sorts first under descending
+  { value = "100",    bytes = "fffa7ffffffdfdff" },
+  { value = "1.5",    bytes = "fffa7ffffffefdccff" },
+  { value = "0.001",  bytes = "fffa80000000f4ff" },
+  { value = "0",      bytes = "fffb" },
+  { value = "-0.001", bytes = "fffc7fffffff0b00" },
+  { value = "-1.5",   bytes = "fffc80000001023300" },
+]

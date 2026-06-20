@@ -1506,15 +1506,17 @@ impl Database {
                 // boolean (`bool-byte` §2.9), uuid (`uuid-raw16` §2.7), timestamp/timestamptz (i64
                 // `int-be-signflip`, spec/design/timestamp.md §6), date (i32, spec/design/date.md §5)
                 // — plus the variable-width `text`/`bytea` (`…-terminated-escape`, encoding.md
-                // §2.4/§2.6, self-delimiting so they compose in composite keys / index suffixes).
-                // Still rejected `0A000`: decimal/interval (later slices) and `float` (the principled
-                // determinism carve-out — determinism.md §4), plus the recursive containers
-                // composite/array/range. An oversized text/bytea key (one that can't fit a node) trips
-                // the existing RECORD_MAX oversized-item 0A000, mirroring PG's btree key-size limit.
+                // §2.4/§2.6) and `decimal` (`decimal-order-preserving` §2.5), all self-delimiting so
+                // they compose in composite keys / index suffixes. Still rejected `0A000`: interval
+                // (a later slice) and `float` (the principled determinism carve-out — determinism.md
+                // §4), plus the recursive containers composite/array/range. An oversized text/bytea/
+                // decimal key (one that can't fit a node) trips the existing RECORD_MAX oversized-item
+                // 0A000, mirroring PG's btree key-size limit.
                 if !ty.is_integer()
                     && !ty.is_bool()
                     && !ty.is_text()
                     && !ty.is_bytea()
+                    && !ty.is_decimal()
                     && !ty.is_uuid()
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
@@ -1744,6 +1746,7 @@ impl Database {
                     && !ty.is_bool()
                     && !ty.is_text()
                     && !ty.is_bytea()
+                    && !ty.is_decimal()
                     && !ty.is_uuid()
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
@@ -1794,6 +1797,7 @@ impl Database {
                     && !ty.is_bool()
                     && !ty.is_text()
                     && !ty.is_bytea()
+                    && !ty.is_decimal()
                     && !ty.is_uuid()
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
@@ -2367,6 +2371,7 @@ impl Database {
                         && !ty.is_bool()
                         && !ty.is_text()
                         && !ty.is_bytea()
+                        && !ty.is_decimal()
                         && !ty.is_uuid()
                         && !ty.is_timestamp()
                         && !ty.is_timestamptz()
@@ -8742,6 +8747,7 @@ enum BoundSrc {
     Date(i32),
     Text(String),
     Bytea(Vec<u8>),
+    Decimal(Decimal),
     Null,
     Param(usize),
     Outer { level: usize, index: usize },
@@ -9063,6 +9069,7 @@ fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: 
                     Value::Date(d) => out.extend_from_slice(&encode_int(ty, *d as i64)),
                     Value::Text(s) => out.extend_from_slice(&encode_terminated(s.as_bytes())),
                     Value::Bytea(b) => out.extend_from_slice(&encode_terminated(b)),
+                    Value::Decimal(d) => out.extend_from_slice(&d.encode_key()),
                     _ => {
                         unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
                     }
@@ -9092,9 +9099,10 @@ fn index_entry_keys(
 
 /// Is `elem` an element type a GIN (`array_ops`) index admits? Exactly the fixed-width
 /// key-encodable scalars — the integers, `boolean`, `uuid`, `date`, `timestamp`, `timestamptz`
-/// (spec/design/gin.md §3): the GIN term IS the element's order-preserving key encoding (§4), so
-/// this is the same set a `PRIMARY KEY` / ordered-index key column accepts. Variable-width or
-/// not-yet-key-encoded elements (`text`, `decimal`, `bytea`, `interval`, the floats) are 0A000.
+/// (spec/design/gin.md §3): the GIN term IS the element's order-preserving key encoding (§4) and a
+/// term carries no length/terminator framing, so only the FIXED-WIDTH keyables qualify. The
+/// VARIABLE-width keyables (`text`, `bytea`, `decimal`) — though valid ordered-index / PK keys — are
+/// 0A000 here, as are the not-yet-key-encoded `interval` and the floats.
 fn is_gin_element_type(elem: &Type) -> bool {
     elem.is_integer()
         || elem.is_bool()
@@ -9162,9 +9170,11 @@ fn encode_pk_key(pk: &[(usize, ScalarType)], row: &Row) -> Vec<u8> {
             // text / bytea: the variable-width `…-terminated-escape` body (encoding.md §2.4/§2.6).
             Value::Text(s) => k.extend_from_slice(&encode_terminated(s.as_bytes())),
             Value::Bytea(b) => k.extend_from_slice(&encode_terminated(b)),
+            // decimal: the variable-width `decimal-order-preserving` body (encoding.md §2.5).
+            Value::Decimal(d) => k.extend_from_slice(&d.encode_key()),
             Value::Null => unreachable!("primary key column is NOT NULL"),
-            Value::Decimal(_) | Value::Interval(_) | Value::Float32(_) | Value::Float64(_) => {
-                unreachable!("a decimal/interval/float primary key is rejected at CREATE TABLE")
+            Value::Interval(_) | Value::Float32(_) | Value::Float64(_) => {
+                unreachable!("an interval/float primary key is rejected at CREATE TABLE")
             }
             Value::Composite(_) => {
                 unreachable!("a composite primary key is rejected at CREATE TABLE")
@@ -9201,6 +9211,7 @@ fn index_prefix_key(columns: &[Column], def: &IndexDef, row: &Row) -> Option<Vec
                     Value::Date(d) => out.extend_from_slice(&encode_int(ty, *d as i64)),
                     Value::Text(s) => out.extend_from_slice(&encode_terminated(s.as_bytes())),
                     Value::Bytea(b) => out.extend_from_slice(&encode_terminated(b)),
+                    Value::Decimal(d) => out.extend_from_slice(&d.encode_key()),
                     _ => {
                         unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
                     }
@@ -9251,6 +9262,7 @@ fn encode_key_value(ty: ScalarType, value: &Value) -> Vec<u8> {
         Value::Date(d) => encode_int(ty, *d as i64),
         Value::Text(s) => encode_terminated(s.as_bytes()),
         Value::Bytea(b) => encode_terminated(b),
+        Value::Decimal(d) => d.encode_key(),
         _ => unreachable!("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)"),
     }
 }
@@ -9392,6 +9404,7 @@ fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
         RExpr::ConstDate(d) if pk_type.is_date() => Some(BoundSrc::Date(*d)),
         RExpr::ConstText(s) if pk_type.is_text() => Some(BoundSrc::Text(s.clone())),
         RExpr::ConstBytea(b) if pk_type.is_bytea() => Some(BoundSrc::Bytea(b.clone())),
+        RExpr::ConstDecimal(d) if pk_type.is_decimal() => Some(BoundSrc::Decimal(d.clone())),
         RExpr::OuterColumn { level, index } => Some(BoundSrc::Outer {
             level: *level,
             index: *index,
@@ -9468,6 +9481,7 @@ fn encode_bound_key(
         BoundSrc::Date(d) => BoundKey::Key(encode_int(pk_ty, *d as i64)),
         BoundSrc::Text(s) => BoundKey::Key(encode_terminated(s.as_bytes())),
         BoundSrc::Bytea(b) => BoundKey::Key(encode_terminated(b)),
+        BoundSrc::Decimal(d) => BoundKey::Key(d.encode_key()),
         BoundSrc::Param(i) => encode_value_key(pk_ty, &params[*i]),
         // A correlated reference: column `index` of the enclosing row `level` hops out — the same
         // indexing the evaluator uses for `RExpr::OuterColumn` (innermost outer row is last).
@@ -9496,6 +9510,7 @@ fn encode_value_key(pk_ty: ScalarType, v: &Value) -> BoundKey {
         Value::Date(d) => BoundKey::Key(encode_int(pk_ty, *d as i64)),
         Value::Text(s) => BoundKey::Key(encode_terminated(s.as_bytes())),
         Value::Bytea(b) => BoundKey::Key(encode_terminated(b)),
+        Value::Decimal(d) => BoundKey::Key(d.encode_key()),
         _ => BoundKey::OutOfRange,
     }
 }

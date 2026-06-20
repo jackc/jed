@@ -308,6 +308,23 @@ func byteaPKTableDB(t *testing.T) *Database {
 	return db
 }
 
+// decimalPKTableDB is the first golden with a VARIABLE-WIDTH SIGNED stored key — the
+// decimal-order-preserving encoding (encoding.md §2.5). The store sorts into numeric (= key)
+// order: -2.5 < -0.5 < 0 < 0.25 < 1.5 < 10 < 100.50; "100.50" stores scale 2 in its value body
+// but normalizes in the key. Must match spec/fileformat/verify.rb's DECIMAL_PK_TABLE.
+func decimalPKTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (k decimal PRIMARY KEY, v i32)")
+	run(t, db, "INSERT INTO t VALUES (-2.5, 6)")
+	run(t, db, "INSERT INTO t VALUES (-0.5, 5)")
+	run(t, db, "INSERT INTO t VALUES (0, 4)")
+	run(t, db, "INSERT INTO t VALUES (0.25, 1)")
+	run(t, db, "INSERT INTO t VALUES (1.5, 2)")
+	run(t, db, "INSERT INTO t VALUES (10, 3)")
+	run(t, db, "INSERT INTO t VALUES (100.50, 7)")
+	return db
+}
+
 // decimalTableDB has a decimal column — exercises the value codec's decimal branch (flags +
 // u16 scale + u16 ndigits + base-10^4 groups) and the catalog typmod: an unconstrained numeric
 // column `d` and a constrained numeric(10,2) column `m` (whose values are already at scale 2,
@@ -661,6 +678,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"bytea_table.jed", byteaTableDB},
 		{"text_pk_table.jed", textPKTableDB},
 		{"bytea_pk_table.jed", byteaPKTableDB},
+		{"decimal_pk_table.jed", decimalPKTableDB},
 		{"uuid_table.jed", uuidTableDB},
 		{"default_table.jed", defaultTableDB},
 		{"default_expr_table.jed", defaultExprTableDB},
@@ -719,6 +737,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"bytea_table.jed", byteaTableDB, "t"},
 		{"text_pk_table.jed", textPKTableDB, "t"},
 		{"bytea_pk_table.jed", byteaPKTableDB, "t"},
+		{"decimal_pk_table.jed", decimalPKTableDB, "t"},
 		{"uuid_table.jed", uuidTableDB, "t"},
 		{"default_table.jed", defaultTableDB, "t"},
 		{"default_expr_table.jed", defaultExprTableDB, "t"},

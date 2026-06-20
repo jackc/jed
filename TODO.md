@@ -145,7 +145,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Exact `decimal`** — *the* headline type: hand-rolled sign+coefficient+scale, round-half-away
       (settles the §8 rounding hotspot), PG result scales, first parameterized + first cross-family
       promotion; finite-only (documented PG divergence). → [decimal.md](spec/design/decimal.md)
-  - [ ] _follow-on:_ decimal in a PRIMARY KEY/index (`0A000`); negative / `s>p` scale typmods;
+  - [x] _follow-on:_ decimal in a PRIMARY KEY / ordered index / UNIQUE key — the order-preserving,
+        scale-independent `decimal-order-preserving` encoding ([encoding.md](spec/design/encoding.md)
+        §2.5; `1.5` and `1.50` index as one). → still deferred: negative / `s>p` scale typmods;
         `round(x,n)` and other decimal functions.
 - [x] **`timestamp` / `timestamptz`** — PG instant model, i64 µs, no tz database, `±infinity`
       first-class, timestamp PK supported. → [timestamp.md](spec/design/timestamp.md)
@@ -525,8 +527,8 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       → [indexes.md](spec/design/indexes.md)
   - [ ] _follow-on (each its own slice + NoREC obligation):_ index ranges / multi-column prefixes;
         index scans for UPDATE/DELETE (keep PK pushdown today); LIMIT-streaming combination;
-        non-key-encodable index types (text/decimal/bytea/interval/float keys — boolean has since
-        landed); expression/ordered/partial keys; `IF NOT EXISTS`.
+        not-yet-key-encodable index types (interval/float keys — boolean, text, bytea, and decimal
+        have since landed); expression/ordered/partial keys; `IF NOT EXISTS`.
 - [ ] **GIN inverted indexes** (`CREATE INDEX … USING gin`) — a second index *kind* beside the
       ordered B-tree, via a type-generic operator-class seam (extract-terms / extract-query /
       consistent). This slice: the **`array_ops`** opclass over a single integer-element array
@@ -593,8 +595,9 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         timestamp key encodings are already on disk). → [gin.md §3/§4](spec/design/gin.md)
   - [ ] _follow-on (each its own slice):_ `<@` (contained-by, broad scan + recheck — blocked on the
         index recording empty/NULL-array rows) / `IN` over a scalar list; the **remaining** element
-        types (`text[]`, `decimal[]`, `bytea[]`, `interval[]` — as their key encodings lift) +
-        composite-element arrays; multi-column GIN; correlated / array-column query operands; the
+        types — the VARIABLE-width keyables (`text[]`, `bytea[]`, `decimal[]`) need GIN term framing
+        (a term carries no length/terminator), and `interval[]`/`float[]` need their key encoding to
+        lift first — plus composite-element arrays; multi-column GIN; correlated / array-column query operands; the
         **ordered-index** equality bound for UPDATE/DELETE (mutations use PK+GIN but not the ordered
         index yet); the LIMIT-streaming combination; posting-list run compression; the **`jsonb_ops`**
         opclass (the lossy-recheck path the seam already seats) and a future object/document opclass.

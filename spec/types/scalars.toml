@@ -53,9 +53,10 @@ schema_version = 1
 #               byte-for-byte identically to logical order. width_bytes is omitted for the
 #               variable-width types (text, bytea, decimal) but PRESENT for the fixed-width
 #               non-integer keys uuid (16) and boolean (1). Exercised non-integer keys: uuid,
-#               boolean, the i64/i32-backed timestamp/timestamptz/date, and the variable-width
-#               text/bytea (their terminated-escape encoding self-delimits); decimal/interval/
-#               float remain authored-but-unexercised key methods.
+#               boolean, the i64/i32-backed timestamp/timestamptz/date, the variable-width
+#               text/bytea (their terminated-escape encoding self-delimits), and decimal
+#               (decimal-order-preserving §2.5, scale-independent); interval/float remain
+#               authored-but-unexercised key methods.
 # max_precision for decimal only: the maximum DECLARABLE precision p of numeric(p,s) —
 #               1000, PG's NUMERIC_MAX_PRECISION — and (as in PG) the display-scale clamp
 #               on a division result (../design/decimal.md §4). NOT a cap on what an
@@ -171,8 +172,8 @@ collation = "C"
 # the rounding decision CLAUDE.md §8 deferred. ALWAYS FINITE — no NaN/±Infinity (a
 # documented PG divergence: there is no float source and 0/0 traps 22012). Canonical id
 # is `decimal`; `numeric`/`dec` are accepted aliases. The order-preserving KEY encoding
-# (decimal-order-preserving) is authored (encoding.md §2.5) but UNEXERCISED this slice —
-# a decimal PRIMARY KEY is rejected 0A000 (the text-PK narrowing). No bits/min/max/rank
+# (decimal-order-preserving, encoding.md §2.5) is EXERCISED — decimal IS a valid PRIMARY KEY /
+# ordered index / UNIQUE key, scale-independent (1.5 and 1.50 index as one). No bits/min/max/rank
 # (decimal forms no integer-style promotion tower); no collation; no width_bytes
 # (variable-width). An UNCONSTRAINED value is bounded by PG's numeric-format caps
 # (max_int_digits / max_scale — ../design/decimal.md §2); these were lifted from the

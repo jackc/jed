@@ -351,6 +351,23 @@ fn bytea_pk_table_db() -> Database {
     db
 }
 
+/// A table with an (unconstrained) decimal PRIMARY KEY (the `decimal-order-preserving` key
+/// encoding, encoding.md §2.5) — the first variable-width SIGNED key. The store sorts into numeric
+/// (= key) order: -2.5 < -0.5 < 0 < 0.25 < 1.5 < 10 < 100.50; "100.50" stores scale 2 in its value
+/// body but normalizes in the key. Must match spec/fileformat/verify.rb's DECIMAL_PK_TABLE.
+fn decimal_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (k decimal PRIMARY KEY, v i32)");
+    run(&mut db, "INSERT INTO t VALUES (-2.5, 6)");
+    run(&mut db, "INSERT INTO t VALUES (-0.5, 5)");
+    run(&mut db, "INSERT INTO t VALUES (0, 4)");
+    run(&mut db, "INSERT INTO t VALUES (0.25, 1)");
+    run(&mut db, "INSERT INTO t VALUES (1.5, 2)");
+    run(&mut db, "INSERT INTO t VALUES (10, 3)");
+    run(&mut db, "INSERT INTO t VALUES (100.50, 7)");
+    db
+}
+
 /// A table with a decimal column — exercises the value codec's decimal branch (flags + u16
 /// scale + u16 ndigits + base-10⁴ groups) and the catalog typmod: an unconstrained `numeric`
 /// column `d` and a constrained `numeric(10,2)` column `m` (values already at scale 2, so a
@@ -781,6 +798,7 @@ fn write_matches_goldens() {
         ("bytea_table.jed", bytea_table_db),
         ("text_pk_table.jed", text_pk_table_db),
         ("bytea_pk_table.jed", bytea_pk_table_db),
+        ("decimal_pk_table.jed", decimal_pk_table_db),
         ("uuid_table.jed", uuid_table_db),
         ("default_table.jed", default_table_db),
         ("default_expr_table.jed", default_expr_table_db),
@@ -834,6 +852,7 @@ fn read_goldens_reproduces_rows() {
         ("bytea_table.jed", bytea_table_db, "t"),
         ("text_pk_table.jed", text_pk_table_db, "t"),
         ("bytea_pk_table.jed", bytea_pk_table_db, "t"),
+        ("decimal_pk_table.jed", decimal_pk_table_db, "t"),
         ("uuid_table.jed", uuid_table_db, "t"),
         ("default_table.jed", default_table_db, "t"),
         ("default_expr_table.jed", default_expr_table_db, "t"),

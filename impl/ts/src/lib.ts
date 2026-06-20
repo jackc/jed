@@ -257,8 +257,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // deferred (spec/design/types.md §9).
   "types.boolean_storable",
   // decimal / numeric scalar type — exact base-10, the first parameterized type
-  // (numeric(p,s)), comparison/ordering/casts/storage + arithmetic. Non-key column this
-  // slice (decimal PRIMARY KEY → 0A000).
+  // (numeric(p,s)), comparison/ordering/casts/storage + arithmetic. A valid PRIMARY KEY /
+  // ordered index / UNIQUE key via the scale-independent decimal-order-preserving encoding
+  // (encoding.md §2.5).
   "types.decimal",
   "expr.decimal_arithmetic",
   // bytea scalar type (variable-width raw bytes): storage, hex-input literals, and

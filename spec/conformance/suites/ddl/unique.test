@@ -76,8 +76,9 @@ statement error 42701
 CREATE TABLE e1 (a i32, UNIQUE (a, a))
 
 # a text UNIQUE member is now supported (the text-terminated-escape key encoding, encoding.md
-# §2.4) — the same as a text PK / index column; still-deferred types (decimal/interval/float/
-# composite/array/range) remain the 0A000 narrowing, covered in their type tests
+# §2.4) — the same as a text PK / index column; decimal (§2.5) is likewise supported, covered in
+# its type test. Still-deferred types (interval/float/composite/array/range) remain the 0A000
+# narrowing.
 statement ok
 CREATE TABLE e6 (a i32, s text UNIQUE)
 

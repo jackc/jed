@@ -309,3 +309,87 @@ func TestDecimalCostCeilingAbortsAheadOfBigMultiply(t *testing.T) {
 		t.Fatalf("want 54P01, got %v", err)
 	}
 }
+
+// TestDecimalEncodeKeyOrderPreserving checks that EncodeKey produces order-preserving keys
+// (byte-comparable order == numeric order) and is scale-independent (1.5 and 1.50 coincide).
+// A per-core byte-level test — the corpus cannot assert encoded key bytes (encoding.md §2.5).
+func TestDecimalEncodeKeyOrderPreserving(t *testing.T) {
+	ss := []string{
+		"-12345.6789", "-100", "-10", "-1.5", "-1", "-0.5", "-0.05", "-0.001",
+		"0", "0.001", "0.05", "0.5", "1", "1.5", "1.50", "5", "10", "12", "50",
+		"100", "101", "123", "1000", "12345.6789", "99999999999999999999",
+	}
+	// Values in ascending numeric order (ss is authored sorted, except the 1.5/1.50 duplicate).
+	byKey := make([]Decimal, len(ss))
+	for i, s := range ss {
+		byKey[i] = dec(s)
+	}
+	sortDecimalsByKey(byKey)
+	// The expected order is ss with the duplicate (1.5 == 1.50) collapsed in place; assert each
+	// adjacent pair is non-decreasing by CmpValue and that key order agrees.
+	for i := 1; i < len(byKey); i++ {
+		if byKey[i-1].CmpValue(byKey[i]) > 0 {
+			t.Fatalf("key order disagrees with value order at %d: %s before %s",
+				i, byKey[i-1].Render(), byKey[i].Render())
+		}
+	}
+	// Scale-independence: equal values produce identical key bytes.
+	for _, p := range [][2]string{{"1.5", "1.50"}, {"100", "100.00"}, {"0", "0.000"}} {
+		if !bytesEqual(dec(p[0]).EncodeKey(), dec(p[1]).EncodeKey()) {
+			t.Fatalf("scale-independence broken: %s vs %s", p[0], p[1])
+		}
+	}
+	// Zero is the single class byte; negatives sort below it, positives above.
+	if z := dec("0").EncodeKey(); len(z) != 1 || z[0] != 0x04 {
+		t.Fatalf("zero key = %v, want [4]", z)
+	}
+	if !(bytesCompare(dec("-1").EncodeKey(), dec("0").EncodeKey()) < 0) ||
+		!(bytesCompare(dec("0").EncodeKey(), dec("1").EncodeKey()) < 0) {
+		t.Fatalf("sign-class ordering broken")
+	}
+}
+
+func sortDecimalsByKey(ds []Decimal) {
+	for i := 1; i < len(ds); i++ {
+		for j := i; j > 0 && bytesCompare(ds[j-1].EncodeKey(), ds[j].EncodeKey()) > 0; j-- {
+			ds[j-1], ds[j] = ds[j], ds[j-1]
+		}
+	}
+}
+
+func bytesEqual(a, b []byte) bool { return bytesCompare(a, b) == 0 }
+
+func bytesCompare(a, b []byte) int {
+	for i := 0; i < len(a) && i < len(b); i++ {
+		if a[i] != b[i] {
+			if a[i] < b[i] {
+				return -1
+			}
+			return 1
+		}
+	}
+	switch {
+	case len(a) < len(b):
+		return -1
+	case len(a) > len(b):
+		return 1
+	}
+	return 0
+}
+
+// TestDecimalEncodeKeyExactBytes pins the exact key bytes — the cross-core contract (the same
+// literals are asserted in Rust and re-derived by spec/encoding/verify.rb).
+func TestDecimalEncodeKeyExactBytes(t *testing.T) {
+	want := map[string][]byte{
+		"0":    {0x04},
+		"1.5":  {0x05, 0x80, 0x00, 0x00, 0x01, 0x02, 0x33, 0x00},
+		"1.50": {0x05, 0x80, 0x00, 0x00, 0x01, 0x02, 0x33, 0x00},
+		"100":  {0x05, 0x80, 0x00, 0x00, 0x02, 0x02, 0x00},
+		"-1.5": {0x03, 0x7F, 0xFF, 0xFF, 0xFE, 0xFD, 0xCC, 0xFF},
+	}
+	for s, w := range want {
+		if got := dec(s).EncodeKey(); !bytesEqual(got, w) {
+			t.Errorf("EncodeKey(%s) = % x, want % x", s, got, w)
+		}
+	}
+}

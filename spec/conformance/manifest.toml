@@ -326,7 +326,7 @@ description = "storable boolean column: CREATE/INSERT/SELECT of false/true/NULL,
 
 [[capability]]
 id = "types.decimal"
-description = "decimal / numeric scalar type (exact base-10): the first parameterized type (numeric(p,s)), storage, literals, comparison/ordering, casts (int<->decimal). Non-key column this slice — a decimal PRIMARY KEY is rejected 0A000 (spec/design/decimal.md)"
+description = "decimal / numeric scalar type (exact base-10): the first parameterized type (numeric(p,s)), storage, literals, comparison/ordering, casts (int<->decimal). A valid PRIMARY KEY / ordered index / UNIQUE key via the order-preserving, scale-independent decimal-order-preserving encoding (1.5 and 1.50 index as one — spec/design/encoding.md §2.5, spec/design/decimal.md)"
 
 [[capability]]
 id = "expr.decimal_arithmetic"

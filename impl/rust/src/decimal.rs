@@ -422,6 +422,68 @@ impl Decimal {
     pub fn from_codec(neg: bool, scale: u32, groups: &[u16]) -> Decimal {
         Decimal::from_parts(neg, scale, mag_from_nbase4(groups))
     }
+
+    /// The order-preserving KEY body for a decimal (method `decimal-order-preserving`,
+    /// spec/design/encoding.md §2.5). Self-delimiting; sorts byte-for-byte under `memcmp`
+    /// identically to numeric value, **independent of display scale** — `1.5` and `1.50`
+    /// produce identical bytes (they are equal, so a UNIQUE decimal index treats them as one).
+    /// A PK is NOT NULL, so the stored key is this bare body; the §2.2 nullable slot prepends
+    /// the presence tag and §2.3 descending inverts the whole component (both at the caller).
+    ///
+    /// Normalize the value to `(sign, base-100 mantissa pairs, E)` with `value = 0.<pairs> ×
+    /// 100^E`, then emit: a sign/class byte (`0x03` neg `<` `0x04` zero `<` `0x05` pos); the
+    /// exponent `E` as a 4-byte order-preserving `int-be-signflip` `i32` (§2.1 — larger `E`
+    /// sorts later for positives); the mantissa pairs most-significant first, each as `pair+1`
+    /// ∈ `[0x01, 0x64]` (`0x00` reserved for the terminator); and a `0x00` terminator (a shorter
+    /// mantissa sorts before one that extends it). For NEGATIVE values the exponent, mantissa,
+    /// and terminator are **bitwise-complemented** so "more negative" sorts first.
+    pub fn encode_key(&self) -> Vec<u8> {
+        // Zero is the single class byte 0x04 (neg 0x03 < zero 0x04 < pos 0x05).
+        if self.is_zero() {
+            return vec![0x04];
+        }
+        // Significant digits (no leading zeros) and the base-10 decimal-point exponent:
+        // value = 0.<digits> × 10^decpt, with decpt = precision − scale.
+        let mut digits = mag_to_decimal_str(&self.limbs).into_bytes();
+        let decpt = self.precision() as i32 - self.scale as i32;
+        // Drop trailing zero digits (the least-significant ones): the mantissa keeps only its
+        // significant part and decpt is unchanged, so `1.50` ("150") collapses onto `1.5` ("15").
+        while digits.last() == Some(&b'0') {
+            digits.pop();
+        }
+        // Base-100 exponent E (value = 0.<pairs> × 100^E) and pair alignment: prepend a '0' when
+        // decpt is odd so the leading base-100 pair is "0 d1", then pad right to an even length.
+        let e = (decpt + 1).div_euclid(2);
+        let mut grouped: Vec<u8> = Vec::with_capacity(digits.len() + 2);
+        if decpt.rem_euclid(2) == 1 {
+            grouped.push(b'0');
+        }
+        grouped.extend_from_slice(&digits);
+        if grouped.len() % 2 == 1 {
+            grouped.push(b'0');
+        }
+        // Body: 4-byte order-preserving exponent ‖ mantissa pairs (pair+1) ‖ 0x00 terminator.
+        let mut body: Vec<u8> = Vec::with_capacity(4 + grouped.len() / 2 + 1);
+        body.extend_from_slice(&crate::encoding::encode_int(
+            crate::types::ScalarType::Int32,
+            e as i64,
+        ));
+        for pair in grouped.chunks(2) {
+            let v = (pair[0] - b'0') * 10 + (pair[1] - b'0');
+            body.push(v + 1);
+        }
+        body.push(0x00);
+        // Assemble with the sign/class byte; negatives complement the body (E+mantissa+terminator).
+        let mut out = Vec::with_capacity(1 + body.len());
+        if self.neg {
+            out.push(0x03);
+            out.extend(body.iter().map(|b| !b));
+        } else {
+            out.push(0x05);
+            out.extend_from_slice(&body);
+        }
+        out
+    }
 }
 
 // Value-canonical equality / hashing (1.5 == 1.50; spec/design/decimal.md §5).
@@ -966,6 +1028,79 @@ mod tests {
         assert_eq!(Decimal::from_i64(-7).render(), "-7");
         assert_eq!(Decimal::from_i64(i64::MIN).render(), "-9223372036854775808");
         assert_eq!(Decimal::from_i64(0).render(), "0");
+    }
+
+    #[test]
+    fn key_encoding_is_order_preserving() {
+        // A spread crossing the sign boundary, zero, sub-1 magnitudes, scale-equal duplicates,
+        // odd/even decpt, and many-digit values. Sorting by encode_key must equal cmp_value order.
+        let mut vals: Vec<Decimal> = [
+            "-12345.6789",
+            "-100",
+            "-10",
+            "-1.5",
+            "-1",
+            "-0.5",
+            "-0.05",
+            "-0.001",
+            "0",
+            "0.001",
+            "0.05",
+            "0.5",
+            "1",
+            "1.5",
+            "1.50",
+            "5",
+            "10",
+            "12",
+            "50",
+            "100",
+            "101",
+            "123",
+            "1000",
+            "12345.6789",
+            "99999999999999999999",
+        ]
+        .iter()
+        .map(|s| dec(s))
+        .collect();
+        // Sort a copy by the encoded key; it must match value order.
+        let mut by_key = vals.clone();
+        by_key.sort_by(|a, b| a.encode_key().cmp(&b.encode_key()));
+        vals.sort_by(|a, b| a.cmp_value(b));
+        let rk: Vec<String> = by_key.iter().map(|d| d.render()).collect();
+        let rv: Vec<String> = vals.iter().map(|d| d.render()).collect();
+        assert_eq!(rk, rv, "encode_key order must equal cmp_value order");
+
+        // Scale-independence: 1.5 and 1.50 are equal, so identical key bytes.
+        assert_eq!(dec("1.5").encode_key(), dec("1.50").encode_key());
+        assert_eq!(dec("100").encode_key(), dec("100.00").encode_key());
+        assert_eq!(dec("0").encode_key(), dec("0.000").encode_key());
+        // Zero is the single class byte; negatives sort below it, positives above.
+        assert_eq!(dec("0").encode_key(), vec![0x04]);
+        assert!(dec("-1").encode_key() < dec("0").encode_key());
+        assert!(dec("0").encode_key() < dec("1").encode_key());
+
+        // Exact byte vectors (the cross-core contract — Go/TS/Ruby must reproduce these):
+        // 1.5 = 0.[01][50] × 100^1: class 0x05, E=1 (i32 int-be-signflip), pairs 01+1/50+1, term.
+        assert_eq!(
+            dec("1.5").encode_key(),
+            vec![0x05, 0x80, 0x00, 0x00, 0x01, 0x02, 0x33, 0x00]
+        );
+        assert_eq!(
+            dec("1.50").encode_key(),
+            vec![0x05, 0x80, 0x00, 0x00, 0x01, 0x02, 0x33, 0x00]
+        );
+        // 100 = 0.[01] × 100^2: class 0x05, E=2, pair 01+1, term.
+        assert_eq!(
+            dec("100").encode_key(),
+            vec![0x05, 0x80, 0x00, 0x00, 0x02, 0x02, 0x00]
+        );
+        // -1.5: the 1.5 body bitwise-complemented under class 0x03.
+        assert_eq!(
+            dec("-1.5").encode_key(),
+            vec![0x03, 0x7F, 0xFF, 0xFF, 0xFE, 0xFD, 0xCC, 0xFF]
+        );
     }
 
     #[test]

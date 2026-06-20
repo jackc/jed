@@ -136,7 +136,7 @@ large to fit a node has an over-`RECORD_MAX` key (keys cannot spill to overflow 
 similarly). Stored text *values* still use the separate, simpler **value codec** (length-prefixed
 UTF-8, no order-preservation needed — [../fileformat/format.md](../fileformat/format.md)).
 
-### 2.5 Decimal — `decimal-order-preserving` (authored; unexercised this slice)
+### 2.5 Decimal — `decimal-order-preserving`
 
 `decimal` is variable-width and signed with a varying exponent, so its order-preserving key —
 like text's — must be self-delimiting and sort byte-for-byte by **numeric value**, independent
@@ -144,32 +144,59 @@ of stored display scale (`1.5` and `1.50` must encode identically — they are e
 follows CockroachDB's decimal encoding (CLAUDE.md §8/§12). Normalize the value first to
 `(sign, mantissa, E)` where the mantissa is the coefficient's significant decimal digits with
 **trailing zero digit-pairs removed** and `E` is the base-100 exponent of the most-significant
-digit-pair (value ≈ `0.dd dd … × 100^E`, mantissa in `[0.01, 1)`). Encode **ascending**:
+digit-pair (value = `0.dd dd … × 100^E`, mantissa in `[0.01, 1)`). The normalization, from the
+stored `(sign, coefficient-digits, scale)`: let `decpt = precision − scale` (the base-10
+decimal-point exponent — `value = 0.<digits> × 10^decpt`); strip trailing zero *digits* (decpt
+unchanged, since a trailing zero is least-significant); then `E = ⌊(decpt + 1) / 2⌋`, prepend a
+`'0'` digit when `decpt` is **odd** (so the leading base-100 pair is `0 d₁`), and pad the digit
+string right to an even length. Encode **ascending**:
 
 1. **Sign/class byte**: `0x03` negative, `0x04` zero, `0x05` positive — so
    `neg < zero < pos` by raw byte. (Zero is the single byte `0x04`; `0x02`/`0x06` are reserved
    should ±∞ ever be needed — decimal has neither, §12 of [types.md](types.md).)
-2. **Exponent `E`**, order-preserving: a bias+big-endian varint that sorts ascending, so for
-   positives a larger `E` (larger magnitude) sorts later.
+2. **Exponent `E`**: a **fixed-width 4-byte `int-be-signflip` `i32`** (§2.1), so it sorts
+   ascending and, for positives, a larger `E` (larger magnitude) sorts later. `i32` (not `i16`)
+   because `E` ranges over roughly `[−8192, 65536]` — `decpt` reaches `MAX_INT_DIGITS = 131072`
+   at scale 0 (`MAX_SCALE` on the negative side), which overflows an `i16`. (A bias+big-endian
+   *varint* would also sort, but a fixed `i32` is simpler, allocation-free, and the cross-core
+   byte contract is easier to pin — the deliberate refinement over CockroachDB's varint.)
 3. **Mantissa**: the digit-pairs most-significant first, each emitted as a byte in
    `[0x01, 0x64]` (`pair + 1`, reserving `0x00` for the terminator), so big-endian pair order
-   is `memcmp` order within an exponent.
+   is `memcmp` order within an exponent. (Stripping trailing zero *digits* before pairing means
+   no trailing `[00]` pair can arise — the last base-10 digit is nonzero — so "trailing zero
+   digit-pairs removed" holds by construction.)
 4. **Terminator `0x00`** (a shorter mantissa sorts before a longer one that extends it, since
    `0x00 <` any pair byte).
 
 For **negative** values steps 2–4 are **bitwise-complemented** (so "more negative" sorts
-first), the same mirror §2.3 uses for descending. This composes with the §2.2 nullable
+first), the same mirror §2.3 uses for descending; the sign/class byte itself is **not**
+complemented (it is chosen directly so `neg < zero < pos`). This composes with the §2.2 nullable
 presence tag (`0x00` present ‖ encoding, or `0x01` NULL) and the §2.3 descending inversion
 unchanged. Because the key encodes the **value, not the display scale**, `1.5` and `1.50`
-produce identical key bytes — they index as equal, matching `1.5 = 1.50`.
+produce identical key bytes — they index as equal, matching `1.5 = 1.50`. Worked bytes:
 
-**Status — authored, not yet exercised.** This slice keeps decimal out of keys: a decimal
-`PRIMARY KEY` is rejected `0A000` (a documented, relaxable narrowing — [types.md](types.md)
-§12), exactly as text's. No decimal key fixtures or executor key path exist yet; lifting the
-narrowing (decimal in a key / secondary index) adds `(value → bytes)` fixtures to
-[../encoding/](../encoding/) and the executor path then. Stored decimal *values* use the
-separate, simpler **value codec** (sign + scale + base-10⁴ groups, no order-preservation —
-[../fileformat/format.md](../fileformat/format.md)).
+| value | encoded key bytes |
+|---|---|
+| `0` (any scale) | `04` |
+| `1.5` = `1.50` | `05 80 00 00 01 02 33 00` |
+| `100` | `05 80 00 00 02 02 00` |
+| `-1.5` | `03 7F FF FF FE FD CC FF` |
+
+`1.5` = `0.[01][50] × 100¹`: class `05`, `E = 1` (`i32` sign-flip → `80 00 00 01`), pairs `01+1`
+and `50+1` (`02 33`), terminator `00`. `-1.5` is that body bitwise-complemented under class `03`.
+
+**Status — EXERCISED.** Like text (§2.4), `decimal` **is** a valid `PRIMARY KEY` / ordered
+secondary index / `UNIQUE` key — its variable-width `decimal-order-preserving` body is
+self-delimiting, so it composes in composite keys / index suffixes. A decimal PK stores the bare
+body (a PK is NOT NULL, so no presence tag); an index entry / composite member wraps it in the
+§2.2 nullable slot. Because the key encodes the value (not the scale), a `UNIQUE` decimal index
+treats `1.5` and `1.50` as one. The `(value → bytes)` vectors are in
+[../encoding/decimal.toml](../encoding/decimal.toml) and the on-disk image is pinned by the
+`decimal_pk_table.jed` golden ([../fileformat/format.md](../fileformat/format.md)). A decimal
+value too large to fit a node has an over-`RECORD_MAX` key (keys cannot spill), rejected `0A000`
+at the insert that stored it — the same node-fit narrowing as text. Stored decimal *values* still
+use the separate, simpler **value codec** (sign + scale + base-10⁴ groups, no order-preservation
+— [../fileformat/format.md](../fileformat/format.md)).
 
 ### 2.6 Bytea — `bytea-terminated-escape` (authored; unexercised this slice)
 
@@ -331,9 +358,10 @@ order with no comparator), proving the executor key path generalizes beyond inte
 concatenates its fixed-width components per §2.3, pinned by the `composite_pk_table.jed`
 golden. Nullable **secondary indexes** have since **landed** ([indexes.md](indexes.md),
 `index_table.jed` golden) — the first place §2.2's presence-tag sort order is load-bearing
-rather than spec-only — as have `timestamp`/`timestamptz` keys (the i64 rule) and `text`/`bytea`
-keys (the `…-terminated-escape` rules §2.4/§2.6). The remaining non-integer scalars (`decimal`,
-`float`, `interval`) add their own §2 key paths when their in-key narrowings lift.
+rather than spec-only — as have `timestamp`/`timestamptz` keys (the i64 rule), `text`/`bytea`
+keys (the `…-terminated-escape` rules §2.4/§2.6), and `decimal` keys (the
+`decimal-order-preserving` rule §2.5, `decimal_pk_table.jed`). The remaining non-integer scalars
+(`float`, `interval`) add their own §2 key paths when their in-key narrowings lift.
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)
 

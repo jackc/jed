@@ -63,8 +63,8 @@ reason = "jed: a type modifier on a non-decimal type is unsupported this slice (
 
 [[override]]
 file = "types/decimal.test"
-sql = "CREATE TABLE bad5 (k numeric PRIMARY KEY)"
-reason = "jed: a decimal PRIMARY KEY is rejected this slice (0A000), a documented narrowing (like text PK). PG allows a numeric primary key."
+sql = "SELECT k, n FROM dk"
+reason = "jed: a full scan iterates the decimal PRIMARY KEY in key (= numeric) order — -2.5 < 0 < 0.25 < 1.5 < 10 < 100.50 (encoding.md §2.5, decimal-order-preserving). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical (the values agree exactly — decimal key order is numeric order, so unlike text there is no collation divergence, only heap-vs-key)."
 
 [[override]]
 file = "expr/timestamp_arithmetic.test"
@@ -110,6 +110,11 @@ reason = "jed: assigning any primary-key member is the documented 0A000 narrowin
 file = "ddl/composite_pk.test"
 sql = "SELECT a, s FROM e6"
 reason = "jed: a full scan iterates in composite-PRIMARY-KEY order — a ascending, then the text member s in C/byte (code-point) order within each a (encoding.md §2.3/§2.4), so (1,'a'),(1,'aa'),(1,'b'),(2,'a'). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical."
+
+[[override]]
+file = "ddl/composite_pk.test"
+sql = "SELECT d, a FROM e7"
+reason = "jed: a full scan iterates in composite-PRIMARY-KEY order — a ascending, then the decimal member d in numeric order within each a (encoding.md §2.3/§2.5), so (1,-1.5),(1,0.5),(1,2),(2,-1.5). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical (numeric values agree exactly)."
 
 [[override]]
 file = "ddl/check.test"

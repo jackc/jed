@@ -136,8 +136,9 @@ SELECT a, b FROM e5 ORDER BY b
 20
 
 # a text member is now key-encodable (the text-terminated-escape encoding, encoding.md §2.4 —
-# self-delimiting, so it composes with the fixed-width members); types still without a key
-# encoding (decimal/interval/float/composite/array/range) remain the 0A000 narrowing
+# self-delimiting, so it composes with the fixed-width members); decimal (§2.5) is likewise
+# key-encodable. Types still without a key encoding (interval/float/composite/array/range) remain
+# the 0A000 narrowing.
 statement ok
 CREATE TABLE e6 (a i32, s text, PRIMARY KEY (a, s))
 
@@ -156,3 +157,24 @@ aa
 b
 2
 a
+
+# a decimal member composes with a fixed-width member: its variable-width decimal-order-preserving
+# body is self-delimiting (terminator), so the following column is unambiguous. Orders by a, then
+# by the numeric member d (-1.5 < 0.5 < 2).
+statement ok
+CREATE TABLE e7 (a i32, d numeric, PRIMARY KEY (a, d))
+
+statement ok
+INSERT INTO e7 VALUES (1, 2), (1, -1.5), (1, 0.5), (2, -1.5)
+
+query DI nosort
+SELECT d, a FROM e7
+----
+-1.5
+1
+0.5
+1
+2
+1
+-1.5
+2

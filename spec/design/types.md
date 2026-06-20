@@ -56,8 +56,9 @@ the other non-integer types still defer). The temporal types
 (`timestamp`/`timestamptz`/`interval`) and the binary floats (`f32`/`f64`) have since
 landed, each with its own design doc ([timestamp.md](timestamp.md), [interval.md](interval.md),
 [float.md](float.md)); `boolean`, `timestamp`, `timestamptz`, `date`, and the variable-width
-`text`/`bytea` (the `…-terminated-escape` key encoding, encoding.md §2.4/§2.6) join `uuid` as
-non-integer `PRIMARY KEY` types, while `decimal`/`interval`/`f32`/`f64` stay non-key for now. The remaining scalars (`json`/`jsonb`,
+`text`/`bytea` (the `…-terminated-escape` key encoding, encoding.md §2.4/§2.6) and `decimal`
+(the `decimal-order-preserving` encoding, encoding.md §2.5) join `uuid` as non-integer
+`PRIMARY KEY` types, while `interval`/`f32`/`f64` stay non-key for now. The remaining scalars (`json`/`jsonb`,
 and the composite `array` container) are still **deferred**. The float-formatting and NaN/∞
 decisions of CLAUDE.md §8 are now **settled** by the landed floats ([float.md](float.md)): they
 keep their own PG total order and the `R` render tag (ledgered in the determinism exceptions),
@@ -437,9 +438,10 @@ NULL = false`, `true OR NULL = true` — so `AND`/`OR` are `kleene`, not plain p
   digits — [decimal.md](decimal.md) §2) now that over-page values land via
   [large-values.md](large-values.md), with the size-scaled `decimal_work` cost unit bounding
   big-value arithmetic ([cost.md](cost.md) §3). Scientific `e`-notation literals have since
-  landed ([decimal.md](decimal.md) §6). Deferred sub-features: decimal in a key (`0A000`; the
-  order-preserving encoding is authored, [encoding.md](encoding.md) §2.5) and
-  negative/over-precision scale typmods.
+  landed ([decimal.md](decimal.md) §6). **Decimal in a key / `PRIMARY KEY`** — ✅ **supported:**
+  decimal **is** a valid `PRIMARY KEY`, ordered secondary index, and `UNIQUE` key via the
+  order-preserving, scale-independent `decimal-order-preserving` encoding ([encoding.md](encoding.md)
+  §2.5; `1.5` and `1.50` index as one). Deferred sub-feature: negative/over-precision scale typmods.
 - **`bytea`** — ✅ landed as the fourth storable non-integer scalar — variable-width raw bytes,
   unsigned byte-order comparison (§13). Its deferred sub-features (the traditional escape input
   format, bytea⇄other casts, binary functions, and bytea in keys) are enumerated in §13.
@@ -677,14 +679,14 @@ canonical RFC 4122 spelling — five lowercase-hex groups of 8-4-4-4-12 digits j
 string). Every core must emit the identical spelling (a CLAUDE.md §8 decision, like bytea's hex
 and boolean's `true`/`false`).
 
-**uuid IS a valid `PRIMARY KEY` — the first non-integer key.** Unlike text (§11), boolean (§9),
-decimal (§12), and bytea (§13) — all of which reject a PK `0A000` and leave their key encoding
-authored-but-unexercised — a `uuid` column **may be a `PRIMARY KEY`** this slice. Its
-order-preserving key encoding (`uuid-raw16`, encoding.md §2.7) is the bare 16 bytes: fixed-width,
-unsigned, no escape/terminator/sign-flip, so unsigned `memcmp` over the stored key bytes *is* the
-logical order and the sorted store iterates uuid PKs correctly with no comparator. This makes uuid
-the proof that the executor key path generalizes beyond integers (the narrowing lift those other
-types defer). A uuid PK is NOT NULL (every PK is), so its key carries no nullable presence tag.
+**uuid IS a valid `PRIMARY KEY` — the first non-integer key.** It led the lift that boolean (§9),
+text (§11), bytea (§13), and decimal (§12) have since joined (only `interval`/`f32`/`f64` still
+reject a PK `0A000` and leave their key encoding authored-but-unexercised). Its order-preserving
+key encoding (`uuid-raw16`, encoding.md §2.7) is the bare 16 bytes: fixed-width, unsigned, no
+escape/terminator/sign-flip, so unsigned `memcmp` over the stored key bytes *is* the logical order
+and the sorted store iterates uuid PKs correctly with no comparator. This made uuid the proof that
+the executor key path generalizes beyond integers (the narrowing lift those other types followed).
+A uuid PK is NOT NULL (every PK is), so its key carries no nullable presence tag.
 
 **On-disk.** Stable type code `8` (format.md). The stored value uses a **fixed 16-byte** body
 behind the presence tag — **no `u16` length prefix** (the width is implied by the type), the first

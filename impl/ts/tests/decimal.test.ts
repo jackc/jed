@@ -193,3 +193,38 @@ test("decimal cost ceiling aborts ahead of a big multiply", () => {
   db.setMaxCost(1000n);
   assert.equal(errCode(() => void execD(db, `SELECT ${big} * ${big} FROM t`)), "54P01");
 });
+
+// Decimal.encodeKey: order-preserving + scale-independent + the cross-core exact byte vectors
+// (the same literals are asserted in Rust/Go and re-derived by spec/encoding/verify.rb). A
+// per-core byte-level test — the corpus cannot assert encoded key bytes (encoding.md §2.5).
+test("decimal encodeKey is order-preserving and byte-exact", () => {
+  const cmpBytes = (a: Uint8Array, b: Uint8Array): number => {
+    const n = Math.min(a.length, b.length);
+    for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i]! - b[i]!;
+    return a.length - b.length;
+  };
+  const ss = [
+    "-12345.6789", "-100", "-10", "-1.5", "-1", "-0.5", "-0.05", "-0.001",
+    "0", "0.001", "0.05", "0.5", "1", "1.5", "1.50", "5", "10", "12", "50",
+    "100", "101", "123", "1000", "12345.6789", "99999999999999999999",
+  ];
+  const byKey = ss.map(dec).sort((a, b) => cmpBytes(a.encodeKey(), b.encodeKey()));
+  for (let i = 1; i < byKey.length; i++) {
+    assert.ok(byKey[i - 1]!.cmpValue(byKey[i]!) <= 0, `key order disagrees at ${i}`);
+  }
+  // Scale-independence: equal values produce identical key bytes.
+  for (const [a, b] of [["1.5", "1.50"], ["100", "100.00"], ["0", "0.000"]]) {
+    assert.deepEqual(dec(a!).encodeKey(), dec(b!).encodeKey(), `${a} vs ${b}`);
+  }
+  // Exact byte vectors — the cross-core contract.
+  const want: Record<string, number[]> = {
+    "0": [0x04],
+    "1.5": [0x05, 0x80, 0x00, 0x00, 0x01, 0x02, 0x33, 0x00],
+    "1.50": [0x05, 0x80, 0x00, 0x00, 0x01, 0x02, 0x33, 0x00],
+    "100": [0x05, 0x80, 0x00, 0x00, 0x02, 0x02, 0x00],
+    "-1.5": [0x03, 0x7f, 0xff, 0xff, 0xfe, 0xfd, 0xcc, 0xff],
+  };
+  for (const [s, w] of Object.entries(want)) {
+    assert.deepEqual([...dec(s).encodeKey()], w, `encodeKey(${s})`);
+  }
+});

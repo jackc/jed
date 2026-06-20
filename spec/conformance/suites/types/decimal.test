@@ -168,9 +168,71 @@ CREATE TABLE bad3 (x numeric(5,7))
 statement error 0A000
 CREATE TABLE bad4 (x i32(5))
 
-# a decimal PRIMARY KEY is rejected this slice (documented narrowing, like text PK): 0A000
-statement error 0A000
-CREATE TABLE bad5 (k numeric PRIMARY KEY)
+# --- decimal as a PRIMARY KEY (encoding.md §2.5: decimal-order-preserving) ---------------------
+# decimal IS a valid PRIMARY KEY — its order-preserving, scale-independent key encoding is
+# exercised here (the first variable-width SIGNED key).
+statement ok
+CREATE TABLE dk (k numeric PRIMARY KEY, n i32)
+
+# insert deliberately NOT in key order; the spread crosses the sign boundary, through zero, a
+# sub-1 fraction, and a trailing-zero value (100.50 stores scale 2 but normalizes in the key).
+statement ok
+INSERT INTO dk VALUES (1.5, 2), (-2.5, 6), (100.50, 7), (0, 4), (0.25, 1), (10, 3)
+
+# point lookup on the decimal PK (key-encoded equality) resolves the matching row
+query I nosort
+SELECT n FROM dk WHERE k = 1.5
+----
+2
+
+# the key encodes the VALUE, not the display scale: 1.50 finds the row stored as 1.5
+query I nosort
+SELECT n FROM dk WHERE k = 1.50
+----
+2
+
+# a full scan iterates in key (= numeric) order: -2.5 < 0 < 0.25 < 1.5 < 10 < 100.50
+query DI nosort
+SELECT k, n FROM dk
+----
+-2.5
+6
+0
+4
+0.25
+1
+1.5
+2
+10
+3
+100.50
+7
+
+# a duplicate decimal PK is a unique violation (23505)
+statement error 23505
+INSERT INTO dk VALUES (0.25, 9)
+
+# scale-independence: 1.50 equals the stored 1.5, so it conflicts too (23505) — they index as one
+statement error 23505
+INSERT INTO dk VALUES (1.50, 9)
+
+# a NULL decimal PK is rejected NOT NULL (23502)
+statement error 23502
+INSERT INTO dk VALUES (NULL, 9)
+
+# decimal is also a valid UNIQUE column and an ordered secondary-index key (the same lifted gate)
+statement ok
+CREATE TABLE du (id i32 PRIMARY KEY, amt numeric UNIQUE)
+
+statement ok
+INSERT INTO du VALUES (1, 3.14), (2, 2.5)
+
+# the UNIQUE decimal index treats 3.140 as equal to the stored 3.14 (scale-independent) — 23505
+statement error 23505
+INSERT INTO du VALUES (3, 3.140)
+
+statement ok
+CREATE INDEX du_amt ON du (amt)
 
 # --- DISTINCT collapses values equal across display scale --------------------------------------
 statement ok

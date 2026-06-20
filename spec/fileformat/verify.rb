@@ -322,6 +322,19 @@ BYTEA_PK_TABLE = {
          ["\x61\x61".b, 2], ["\x62".b, 3]]
 }.freeze
 
+# A table with an (unconstrained) decimal PRIMARY KEY (the decimal-order-preserving encoding,
+# encoding.md §2.5) — the first variable-width SIGNED key. Rows are in numeric (= key) order:
+# -2.5 < -0.5 < 0 < 0.25 < 1.5 < 10 < 100.50, exercising the sign boundary, zero (the single
+# class byte), a sub-1 fraction (negative decpt), odd/even decpt, and a trailing-zero value
+# ("100.50" stores scale 2 in its VALUE body but normalizes in the KEY). All values are distinct
+# (equal decimals would collide on the scale-independent key). The cores build this via
+#   CREATE TABLE t (k decimal PRIMARY KEY, v i32); INSERT the rows.
+DECIMAL_PK_TABLE = {
+  name: "t",
+  columns: [col("k", "decimal", pk: true), col("v", "i32")],
+  rows: [["-2.5", 6], ["-0.5", 5], ["0", 4], ["0.25", 1], ["1.5", 2], ["10", 3], ["100.50", 7]]
+}.freeze
+
 # A table exercising the DEFAULT column constraint on disk (format.md): the catalog flags bit2
 # + the column's pre-evaluated default value via the value codec, written AFTER the decimal
 # typmod. Covers an int default, a text default, a DEFAULT NULL (the lone 0x01 tag), a NOT NULL
@@ -791,6 +804,7 @@ FIXTURES = [
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
   { file: "text_pk_table.jed",   page_size: 256, tables: [TEXT_PK_TABLE] },
   { file: "bytea_pk_table.jed",  page_size: 256, tables: [BYTEA_PK_TABLE] },
+  { file: "decimal_pk_table.jed", page_size: 256, tables: [DECIMAL_PK_TABLE] },
   { file: "uuid_table.jed",      page_size: 256, tables: [UUID_TABLE] },
   { file: "default_table.jed",   page_size: 256, tables: [DEFAULT_TABLE] },
   { file: "default_expr_table.jed", page_size: 256, tables: [DEFAULT_EXPR_TABLE] },
@@ -882,17 +896,40 @@ def enc_terminated(content)
   out
 end
 
+# The BARE order-preserving KEY body for a decimal (decimal-order-preserving, encoding.md §2.5):
+# class byte (03 neg / 04 zero / 05 pos), the 4-byte int-be-signflip exponent E, the base-100
+# mantissa pairs (pair+1 ∈ [01,64]), and a 00 terminator; negatives complement E+mantissa+
+# terminator. Independent of display scale — 1.5 and 1.50 coincide. `s` is the decimal string.
+def encode_decimal_key(s)
+  d = parse_decimal(s)
+  return "\x04".b if d[:coeff].zero? # zero is the single class byte
+
+  digits = d[:coeff].to_s             # significant digits (leading zeros already stripped)
+  decpt = digits.length - d[:scale]   # value = 0.<digits> × 10^decpt
+  digits = digits.sub(/0+\z/, "")     # drop trailing zero digits (decpt unchanged)
+  e = (decpt + 1) / 2                  # Ruby integer / floors = ⌊(decpt+1)/2⌋
+  grouped = decpt.odd? ? "0#{digits}" : digits.dup
+  grouped << "0" if grouped.length.odd?
+  body = +"".b
+  body << encode_int(4, e)             # 4-byte order-preserving exponent
+  grouped.chars.each_slice(2) { |a, b| body << ((a.to_i * 10 + b.to_i) + 1) }
+  body << 0x00
+  d[:neg] ? "\x03".b + body.bytes.map { |b| b ^ 0xFF }.pack("C*") : "\x05".b + body
+end
+
 # The BARE order-preserving KEY body for one present (non-NULL) value of `type` — no presence
 # tag (callers add it for nullable index slots; a PK member is NOT NULL). uuid is the 16 raw
 # bytes (uuid-raw16, §2.7), boolean a single bool-byte (0x00 false / 0x01 true, §2.9), text/bytea
-# the variable-width …-terminated-escape body (§2.4/§2.6), every other keyable type the
-# sign-flipped fixed-width int encoding (timestamps reuse the i64 rule).
+# the variable-width …-terminated-escape body (§2.4/§2.6), decimal the decimal-order-preserving
+# body (§2.5), every other keyable type the sign-flipped fixed-width int encoding (timestamps
+# reuse the i64 rule).
 def key_body(type, v)
   case type
   when "uuid" then uuid_to_bytes(v)
   when "boolean" then (v ? "\x01".b : "\x00".b)
   when "text" then enc_terminated(v.b)
   when "bytea" then enc_terminated(v.b)
+  when "decimal" then encode_decimal_key(v)
   else encode_int(WIDTH.fetch(type), v)
   end
 end

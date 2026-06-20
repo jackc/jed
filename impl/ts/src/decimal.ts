@@ -9,6 +9,7 @@
 // Always finite (no NaN/±Infinity) and normalized (no high zero limbs, no negative zero).
 // Rounding is half away from zero (spec/design/decimal.md §3).
 
+import { encodeInt } from "./encoding.ts";
 import { engineError, type EngineError } from "./errors.ts";
 
 const BASE = 10000; // 10^4: a limb holds 4 digits; products fit JS safe integers
@@ -321,6 +322,50 @@ export class Decimal {
   // fromCodec is the inverse of toCodec (used on load).
   static fromCodec(neg: boolean, scale: number, groups: number[]): Decimal {
     return Decimal.fromParts(neg, scale, magTrim(groups.slice().reverse()));
+  }
+
+  // encodeKey returns the order-preserving KEY body for a decimal (method
+  // decimal-order-preserving, spec/design/encoding.md §2.5). Self-delimiting; sorts byte-for-byte
+  // identically to numeric value, INDEPENDENT of display scale — 1.5 and 1.50 produce identical
+  // bytes (they are equal, so a UNIQUE decimal index treats them as one). A PK is NOT NULL, so the
+  // stored key is this bare body; the §2.2 nullable slot prepends the presence tag and §2.3
+  // descending inverts the whole component (both at the caller).
+  //
+  // Normalize the value to (sign, base-100 mantissa pairs, E) with value = 0.<pairs> × 100^E, then
+  // emit: a sign/class byte (0x03 neg < 0x04 zero < 0x05 pos); the exponent E as a 4-byte
+  // order-preserving int-be-signflip i32 (§2.1 — larger E sorts later for positives); the mantissa
+  // pairs most-significant first, each as pair+1 ∈ [0x01, 0x64] (0x00 reserved for the terminator);
+  // and a 0x00 terminator (a shorter mantissa sorts before one that extends it). For NEGATIVE values
+  // the exponent, mantissa, and terminator are bitwise-complemented so "more negative" sorts first.
+  encodeKey(): Uint8Array {
+    // Zero is the single class byte 0x04 (neg 0x03 < zero 0x04 < pos 0x05).
+    if (this.isZero()) return new Uint8Array([0x04]);
+    // Significant digits (no leading zeros) and the base-10 decimal-point exponent:
+    // value = 0.<digits> × 10^decpt, with decpt = precision − scale.
+    let digits = magToDecimalStr(this.limbs);
+    const decpt = this.precision() - this.scale;
+    // Drop trailing zero digits (the least-significant ones): the mantissa keeps only its
+    // significant part and decpt is unchanged, so 1.50 ("150") collapses onto 1.5 ("15").
+    let end = digits.length;
+    while (end > 0 && digits.charCodeAt(end - 1) === 0x30) end--;
+    digits = digits.slice(0, end);
+    // Base-100 exponent E (value = 0.<pairs> × 100^E) and pair alignment: prepend a '0' when decpt
+    // is odd so the leading base-100 pair is "0 d1", then pad right to an even length.
+    const e = Math.floor((decpt + 1) / 2);
+    let grouped = ((decpt % 2) + 2) % 2 === 1 ? "0" + digits : digits;
+    if (grouped.length % 2 === 1) grouped += "0";
+    // Body: 4-byte order-preserving exponent ‖ mantissa pairs (pair+1) ‖ 0x00 terminator.
+    const expBytes = encodeInt("i32", BigInt(e));
+    const body: number[] = [];
+    for (let i = 0; i < expBytes.length; i++) body.push(expBytes[i]!);
+    for (let i = 0; i < grouped.length; i += 2) {
+      const v = (grouped.charCodeAt(i) - 0x30) * 10 + (grouped.charCodeAt(i + 1) - 0x30);
+      body.push(v + 1);
+    }
+    body.push(0x00);
+    // Assemble with the sign/class byte; negatives complement the body (E+mantissa+terminator).
+    if (this.neg) return Uint8Array.from([0x03, ...body.map((b) => b ^ 0xff)]);
+    return Uint8Array.from([0x05, ...body]);
   }
 }
 

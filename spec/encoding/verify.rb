@@ -93,6 +93,69 @@ def terminated_label(c)
   c.key?("value") ? c["value"].inspect : "\\x#{c['hex']}"
 end
 
+# Parse a decimal string "[-]int[.frac]" into (neg, significant-digits, scale) — the stored
+# (sign, coefficient-digits, scale) the cores carry. Significant digits strip LEADING zeros
+# (so "0.05" → digits "5", scale 2, precision 1); an all-zero coefficient gives "" (== zero).
+def parse_decimal(s)
+  neg = s.start_with?("-")
+  body = neg ? s[1..] : s
+  int_part, frac_part = body.split(".", 2)
+  frac_part ||= ""
+  digits = (int_part + frac_part).sub(/\A0+/, "")
+  [neg, digits, frac_part.length]
+end
+
+# decimal-order-preserving (encoding.md §2.5): normalize to (sign, base-100 mantissa pairs, E)
+# with value = 0.<pairs> × 100^E, then emit class byte (03 neg / 04 zero / 05 pos), the 4-byte
+# int-be-signflip exponent E, the mantissa pairs (pair+1 ∈ [01,64]), and a 00 terminator; negatives
+# complement E+mantissa+terminator. Independent of display scale — 1.5 and 1.50 coincide.
+def enc_decimal(s)
+  neg, digits, scale = parse_decimal(s)
+  return [0x04].pack("C") if digits.empty? # zero is the single class byte
+
+  decpt = digits.length - scale            # value = 0.<digits> × 10^decpt
+  digits = digits.sub(/0+\z/, "")          # drop trailing zero digits (decpt unchanged)
+  e = (decpt + 1) / 2                       # Ruby integer / floors = ⌊(decpt+1)/2⌋
+  grouped = decpt.odd? ? "0#{digits}" : digits.dup
+  grouped << "0" if grouped.length.odd?     # pad right to an even number of base-10 digits
+  body = +"".b
+  body << enc_bare(e, 4)                     # 4-byte order-preserving exponent
+  grouped.chars.each_slice(2) { |a, b| body << ((a.to_i * 10 + b.to_i) + 1) }
+  body << 0x00
+  neg ? [0x03].pack("C") + invert(body) : [0x05].pack("C") + body
+end
+
+def enc_decimal_nullable(c)
+  return [0x01].pack("C") if c["null"]
+
+  [0x00].pack("C") + enc_decimal(c["value"])
+end
+
+def decimal_label(c) = c["null"] ? "NULL" : c["value"]
+
+# Verify spec/encoding/decimal.toml: the same three invariants as the terminated-escape path
+# (byte-exact + strict order, minus round-trip — a key is never decoded back to a value).
+def check_decimal_file(filename)
+  data = TomlRB.load_file(File.join(__dir__, filename))
+  checked = 0
+  [["bare", ->(c) { enc_decimal(c["value"]) }],
+   ["nullable", ->(c) { enc_decimal_nullable(c) }],
+   ["descending", ->(c) { invert(enc_decimal_nullable(c)) }]].each do |kind, enc|
+    (data[kind] || []).each do |group|
+      rows = []
+      group["cases"].each do |c|
+        want = c["bytes"]
+        got = hex(enc.call(c))
+        fail!("#{kind} #{group['type']} #{decimal_label(c)}: encode=#{got} want=#{want}") unless got == want
+        rows << [decimal_label(c), [want].pack("H*").b]
+        checked += 1
+      end
+      check_order("#{kind} #{group['type']}", rows)
+    end
+  end
+  checked
+end
+
 # Verify one variable-width terminated-escape fixture file (text.toml / bytea.toml): the same
 # three invariants as the fixed-width path, minus round-trip (a key is never decoded back to a
 # value). Returns the number of vectors checked.
@@ -211,6 +274,10 @@ def main
   # their values are not fixed-WIDTH, so they take the dedicated terminated-escape path.
   checked += check_terminated_file("text.toml")
   checked += check_terminated_file("bytea.toml")
+
+  # Decimal: the variable-width decimal-order-preserving rule (§2.5) — its own file, its own
+  # value→bytes derivation (mantissa pairs + i32 exponent), not the WIDTH/terminated paths.
+  checked += check_decimal_file("decimal.toml")
 
   puts "OK: #{checked} vectors verified (round-trip + byte-exact + order)"
 end

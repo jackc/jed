@@ -122,6 +122,7 @@ import {
   typeCanonicalName,
   typeIsBoolean,
   typeIsBytea,
+  typeIsDecimal,
   typeIsInteger,
   typeIsText,
   typeIsTimestamp,
@@ -1464,17 +1465,19 @@ export class Database {
       if (def.primaryKey) {
         // Integers, boolean, and uuid may be a key. uuid is the first non-integer key type (fixed
         // uuid-raw16, spec/design/encoding.md §2.7) and boolean the second (fixed 1-byte bool-byte,
-        // §2.9). text/bytea are also allowed — their variable-width …-terminated-escape key encoding
-        // (§2.4/§2.6) is self-delimiting, so they compose in composite keys / index suffixes; an
-        // oversized text/bytea key trips the RECORD_MAX oversized-item 0A000 (PG's btree key limit).
-        // Still rejected 0A000: decimal/interval (later slices) and float (the determinism carve-out,
-        // determinism.md §4), plus the recursive containers composite/array/range. timestamp /
-        // timestamptz / date share the i64/i32 int-be-signflip key encoding (timestamp.md §6).
+        // §2.9). text/bytea (…-terminated-escape §2.4/§2.6) and decimal (decimal-order-preserving
+        // §2.5) are also allowed — their variable-width key encodings are self-delimiting, so they
+        // compose in composite keys / index suffixes; an oversized one trips the RECORD_MAX
+        // oversized-item 0A000 (PG's btree key limit). Still rejected 0A000: interval (a later slice)
+        // and float (the determinism carve-out, determinism.md §4), plus the recursive containers
+        // composite/array/range. timestamp / timestamptz / date share the i64/i32 int-be-signflip key
+        // encoding (timestamp.md §6).
         if (
           !typeIsInteger(colType) &&
           !typeIsBoolean(colType) &&
           !typeIsText(colType) &&
           !typeIsBytea(colType) &&
+          !typeIsDecimal(colType) &&
           !typeIsUuid(colType) &&
           !typeIsTimestamp(colType) &&
           !typeIsTimestamptz(colType) &&
@@ -1677,6 +1680,7 @@ export class Database {
           !typeIsBoolean(ty) &&
           !typeIsText(ty) &&
           !typeIsBytea(ty) &&
+          !typeIsDecimal(ty) &&
           !typeIsUuid(ty) &&
           !typeIsTimestamp(ty) &&
           !typeIsTimestamptz(ty) &&
@@ -1727,6 +1731,7 @@ export class Database {
           !typeIsBoolean(ty) &&
           !typeIsText(ty) &&
           !typeIsBytea(ty) &&
+          !typeIsDecimal(ty) &&
           !typeIsUuid(ty) &&
           !typeIsTimestamp(ty) &&
           !typeIsTimestamptz(ty) &&
@@ -2331,6 +2336,7 @@ export class Database {
         !typeIsBoolean(ty) &&
         !typeIsText(ty) &&
         !typeIsBytea(ty) &&
+        !typeIsDecimal(ty) &&
         !typeIsUuid(ty) &&
         !typeIsTimestamp(ty) &&
         !typeIsTimestamptz(ty)
@@ -6709,6 +6715,8 @@ function indexEntryKey(
       parts.push(Uint8Array.of(0x00), encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)));
     } else if (v.kind === "bytea") {
       parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
+    } else if (v.kind === "decimal") {
+      parts.push(Uint8Array.of(0x00), v.dec.encodeKey());
     } else {
       throw new Error(
         "an index column is a key-encodable type (CREATE INDEX gate)",
@@ -6747,9 +6755,10 @@ function indexEntryKeys(
 // element types). This slice: a single integer-element array column.
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits — exactly
 // the fixed-width key-encodable scalars (the integers, boolean, uuid, date, timestamp, timestamptz;
-// spec/design/gin.md §3): a GIN term IS the element's order-preserving key encoding (§4), so this is
-// the same set a PRIMARY KEY / ordered-index key column accepts. Variable-width or not-yet-key-encoded
-// elements (text, decimal, bytea, interval, the floats) are 0A000.
+// spec/design/gin.md §3): a GIN term IS the element's order-preserving key encoding (§4) and a term
+// carries no length/terminator framing, so only the FIXED-WIDTH keyables qualify. The variable-width
+// keyables (text, bytea, decimal) — valid ordered-index / PK keys — are 0A000 here, as are the
+// not-yet-key-encoded interval and the floats.
 function isGinElementType(elem: Type): boolean {
   return (
     typeIsInteger(elem) ||
@@ -6881,10 +6890,12 @@ function encodePkKey(table: Table, pk: number[], row: Row): Uint8Array {
       parts.push(encodeTerminated(SQL_BYTE_ENCODER.encode(pkv.text)));
     } else if (pkv.kind === "bytea") {
       parts.push(encodeTerminated(pkv.bytes));
+    } else if (pkv.kind === "decimal") {
+      parts.push(pkv.dec.encodeKey());
     } else {
       throw engineError(
         "data_corrupted",
-        "a primary key must be an integer, boolean, uuid, text, bytea, or timestamp value",
+        "a primary key must be an integer, boolean, uuid, text, bytea, decimal, or timestamp value",
       );
     }
   }
@@ -7013,6 +7024,8 @@ function indexPrefixKey(
       parts.push(Uint8Array.of(0x00), encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)));
     } else if (v.kind === "bytea") {
       parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
+    } else if (v.kind === "decimal") {
+      parts.push(Uint8Array.of(0x00), v.dec.encodeKey());
     } else {
       throw new Error(
         "an index column is a key-encodable type (CREATE INDEX gate)",
@@ -7053,6 +7066,7 @@ function encodeKeyValue(ty: ScalarType, value: Value): Uint8Array {
   if (value.kind === "date") return encodeInt(ty, value.days);
   if (value.kind === "text") return encodeTerminated(SQL_BYTE_ENCODER.encode(value.text));
   if (value.kind === "bytea") return encodeTerminated(value.bytes);
+  if (value.kind === "decimal") return value.dec.encodeKey();
   throw new Error(
     "a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)",
   );
@@ -7279,6 +7293,8 @@ function isConstSource(e: RExpr, pkType: ScalarType): boolean {
       return isText(pkType);
     case "constBytea":
       return isBytea(pkType);
+    case "constDecimal":
+      return isDecimal(pkType);
     default:
       return false;
   }
@@ -7368,6 +7384,8 @@ function encodeBoundKey(
       return { kind: "key", key: encodeTerminated(SQL_BYTE_ENCODER.encode(src.value)) };
     case "constBytea":
       return { kind: "key", key: encodeTerminated(src.value) };
+    case "constDecimal":
+      return { kind: "key", key: src.value.encodeKey() };
     case "param":
       return encodeValueKey(pkType, params[src.index]!);
     case "outerColumn":
@@ -7392,6 +7410,7 @@ function encodeValueKey(pkType: ScalarType, v: Value): BoundKey {
   if (v.kind === "text")
     return { kind: "key", key: encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)) };
   if (v.kind === "bytea") return { kind: "key", key: encodeTerminated(v.bytes) };
+  if (v.kind === "decimal") return { kind: "key", key: v.dec.encodeKey() };
   if (v.kind === "int")
     return inRange(pkType, v.int)
       ? { kind: "key", key: encodeInt(pkType, v.int) }
