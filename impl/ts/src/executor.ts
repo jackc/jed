@@ -762,6 +762,21 @@ function txStatusOf(tx: ActiveTx | null): TxStatus {
 // seam, and the currval/lastval session state. A Database holds one as its long-lived default session;
 // db.newSession mints additional independent ones that run sequentially on a single-threaded handle
 // (by swapping into the default slot for the duration of a call — TS objects swap by reference).
+// requireCustomVarName validates + canonicalizes a session-variable name (spec/design/session.md
+// §6.1). A variable must be namespaced like a PostgreSQL custom GUC — a dotted name (myapp.tenant); a
+// non-dotted name would be a built-in setting, and v1 exposes none through this map (the time_zone
+// built-in is a separate slice), so it is 42704. Returns the case-folded (lowercase, PG GUC names are
+// case-insensitive) map key.
+function requireCustomVarName(name: string): string {
+  if (name.includes(".")) {
+    return name.toLowerCase();
+  }
+  throw engineError(
+    "undefined_object",
+    "unrecognized configuration parameter: " + name,
+  );
+}
+
 export class Session {
   // The open transaction, or null under autocommit (transactions.md §4.1); the Idle/Open/Failed
   // status (session.md §2.2) is derived from this.
@@ -806,6 +821,12 @@ export class Session {
   // Whether DDL (CREATE/DROP/ALTER) is permitted on this session (§5.3); a denied schema change is
   // 42501. Default on — jed has no schema/owner model, so this single boolean gates all DDL.
   allowDdl: boolean;
+  // The session variables (spec/design/session.md §6.1): PostgreSQL's GUC model scoped to the session
+  // — a string→string map (PG GUCs are all text) the host sets (setVar/resetVar) and SQL reads with
+  // current_setting. Custom (dotted) names only in v1. SESSION state, not snapshot state: it does NOT
+  // roll back with a transaction (PG SET SESSION), and each session keeps its own map across the
+  // by-reference swap (like the privilege envelope).
+  vars: Map<string, string>;
 
   constructor(opts: SessionOptions = {}) {
     this.tx = null;
@@ -824,6 +845,7 @@ export class Session {
       this.privileges.setDefaultTable(opts.defaultPrivileges);
     }
     this.allowDdl = opts.allowDdl ?? true;
+    this.vars = new Map();
   }
 
   // run installs this session as db's active session, runs fn, and restores the default — the swap
@@ -907,6 +929,29 @@ export class Session {
   // setAllowDdl sets whether DDL is permitted on this session (§5.3); a denied change is 42501.
   setAllowDdl(allow: boolean): void {
     this.allowDdl = allow;
+  }
+  // setVar sets a session variable (spec/design/session.md §6.1) — PostgreSQL's GUC model, scoped to
+  // the session. Custom variables must be namespaced (a dotted name like myapp.tenant); a non-dotted
+  // name is 42704 (no built-in setting is reachable through this map in v1 — the time_zone built-in is
+  // its own slice). The name is case-insensitive (folded to lowercase, PG); the value is text. Session
+  // state, not snapshot state — it does NOT roll back with a transaction.
+  setVar(name: string, value: string): void {
+    this.vars.set(requireCustomVarName(name), value);
+  }
+  // resetVar clears a session variable (§6.1). A non-dotted name is 42704 (as for setVar); an unset
+  // name is a no-op (PG RESET of an unset custom variable).
+  resetVar(name: string): void {
+    this.vars.delete(requireCustomVarName(name));
+  }
+  // var reads a session variable's value (§6.1), or undefined if it is not set. The host getter never
+  // throws — it is the SQL current_setting read that raises 42704 on an unset name.
+  var(name: string): string | undefined {
+    return this.vars.get(name.toLowerCase());
+  }
+  // resetVars clears every session variable (§6.1) — PostgreSQL's RESET ALL for the variable map (also
+  // the per-record reset hook the conformance harness's # set: directive uses).
+  resetVars(): void {
+    this.vars.clear();
   }
   setRandomSource(f: RandomFill): void {
     this.seam.randomFill = f;
@@ -1055,6 +1100,29 @@ export class Database {
   // allowDdl reports whether DDL is permitted on the default session.
   allowDdl(): boolean {
     return this.session.allowDdl;
+  }
+
+  // setVar sets a session variable on the default session (spec/design/session.md §6.1). Custom
+  // variables must be namespaced (a dotted name); a non-dotted name throws 42704. Read it back in SQL
+  // with current_setting('name'[, missing_ok]).
+  setVar(name: string, value: string): void {
+    this.session.setVar(name, value);
+  }
+
+  // resetVar clears a session variable on the default session (§6.1); a non-dotted name throws 42704.
+  resetVar(name: string): void {
+    this.session.resetVar(name);
+  }
+
+  // var reads a session variable's value on the default session (§6.1), or undefined if it is not set.
+  var(name: string): string | undefined {
+    return this.session.var(name);
+  }
+
+  // resetVars clears every session variable on the default session (§6.1) — PostgreSQL's RESET ALL for
+  // the variable map (also the conformance harness # set: reset hook).
+  resetVars(): void {
+    this.session.resetVars();
   }
 
   // setMaxSqlLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
@@ -1376,7 +1444,11 @@ export class Database {
       const ast = this.parse(span.text);
       // Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
       // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
-      if (ast.kind === "begin" || ast.kind === "commit" || ast.kind === "rollback") {
+      if (
+        ast.kind === "begin" ||
+        ast.kind === "commit" ||
+        ast.kind === "rollback"
+      ) {
         throw engineError(
           "feature_not_supported",
           "transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; " +
@@ -1385,7 +1457,8 @@ export class Database {
       }
       const out = this.executeStmtParams(ast, []);
       statementsRun++;
-      if (out.kind === "statement" && out.rowsAffected !== null) rowsAffectedTotal += out.rowsAffected;
+      if (out.kind === "statement" && out.rowsAffected !== null)
+        rowsAffectedTotal += out.rowsAffected;
       cost += out.cost;
     }
     return { statementsRun, rowsAffectedTotal, cost };
@@ -1671,14 +1744,23 @@ export class Database {
       const key = t.name.toLowerCase();
       // Only a name that resolves to an existing catalog table is privilege-checked; a missing one is
       // left to raise 42P01 in execution (existence before authorization).
-      if (snap.table(key) !== undefined && !this.session.privileges.allowsTable(key, t.priv)) {
-        throw engineError("insufficient_privilege", "permission denied for table " + key);
+      if (
+        snap.table(key) !== undefined &&
+        !this.session.privileges.allowsTable(key, t.priv)
+      ) {
+        throw engineError(
+          "insufficient_privilege",
+          "permission denied for table " + key,
+        );
       }
     }
     for (const fn of req.functions) {
       const key = fn.toLowerCase();
       if (!this.session.privileges.allowsFunction(key)) {
-        throw engineError("insufficient_privilege", "permission denied for function " + key);
+        throw engineError(
+          "insufficient_privilege",
+          "permission denied for function " + key,
+        );
       }
     }
   }
@@ -1835,7 +1917,10 @@ export class Database {
         // inline. A range takes no typmod (numrange(10,2) is not a thing — the element is the
         // unconstrained subtype), so a type modifier is rejected.
         if (def.typeMod !== null) {
-          throw engineError("feature_not_supported", "a type modifier on a range type is not supported");
+          throw engineError(
+            "feature_not_supported",
+            "a type modifier on a range type is not supported",
+          );
         }
         const rdesc = rangeByName(def.typeName)!;
         colType = rangeT(scalarT(elementScalar(rdesc)));
@@ -1985,7 +2070,11 @@ export class Database {
         def_defaultExpr = { exprText, expr: parseExpression(exprText) };
         if (def.identity !== null)
           identityKind = def.identity.always ? "always" : "byDefault";
-      } else if (colType.kind === "composite" || colType.kind === "array" || colType.kind === "range") {
+      } else if (
+        colType.kind === "composite" ||
+        colType.kind === "array" ||
+        colType.kind === "range"
+      ) {
         // A DEFAULT on a composite-/array-typed column is not supported this slice (composite.md §12
         // / array.md §12); a range column is not storable at all yet (ranges.md §8 — unreachable,
         // CREATE TABLE rejects it).
@@ -2917,7 +3006,9 @@ export class Database {
         // is 0A000, not the 42704 below.
         throw engineError(
           "feature_not_supported",
-          "a range-typed composite field (" + f.typeName + ") is not supported yet",
+          "a range-typed composite field (" +
+            f.typeName +
+            ") is not supported yet",
         );
       } else if (this.compositeType(f.typeName) !== undefined) {
         if (f.typeMod !== null) {
@@ -3454,7 +3545,9 @@ export class Database {
           // is the supported input — spec/design/ranges.md §1), like array.
           throw engineError(
             "feature_not_supported",
-            "INSERT ... SELECT into range column " + col.name + " is not supported yet",
+            "INSERT ... SELECT into range column " +
+              col.name +
+              " is not supported yet",
           );
         }
         if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
@@ -4758,7 +4851,10 @@ export class Database {
       if (col.type.kind === "range") {
         // Updating a range column is deferred this slice (the storable column round-trips via INSERT
         // VALUES; assignment lands with the range operator surface) — reject it 0A000, like array.
-        throw engineError("feature_not_supported", "updating range column " + a.column + " is not supported yet");
+        throw engineError(
+          "feature_not_supported",
+          "updating range column " + a.column + " is not supported yet",
+        );
       }
       const targetScalar = col.type.scalar;
       // The RHS is a general expression evaluated against the OLD row; a literal operand
@@ -7172,7 +7268,10 @@ function indexEntryKey(
         encodeInt(typeScalar(columns[ci]!.type), v.days),
       );
     } else if (v.kind === "text") {
-      parts.push(Uint8Array.of(0x00), encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)));
+      parts.push(
+        Uint8Array.of(0x00),
+        encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)),
+      );
     } else if (v.kind === "bytea") {
       parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
     } else if (v.kind === "decimal") {
@@ -7492,7 +7591,10 @@ function indexPrefixKey(
         encodeInt(typeScalar(columns[ci]!.type), v.days),
       );
     } else if (v.kind === "text") {
-      parts.push(Uint8Array.of(0x00), encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)));
+      parts.push(
+        Uint8Array.of(0x00),
+        encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)),
+      );
     } else if (v.kind === "bytea") {
       parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
     } else if (v.kind === "decimal") {
@@ -7540,7 +7642,8 @@ function encodeKeyValue(ty: ScalarType, value: Value): Uint8Array {
   if (value.kind === "timestamp" || value.kind === "timestamptz")
     return encodeInt(ty, value.micros);
   if (value.kind === "date") return encodeInt(ty, value.days);
-  if (value.kind === "text") return encodeTerminated(SQL_BYTE_ENCODER.encode(value.text));
+  if (value.kind === "text")
+    return encodeTerminated(SQL_BYTE_ENCODER.encode(value.text));
   if (value.kind === "bytea") return encodeTerminated(value.bytes);
   if (value.kind === "decimal") return value.dec.encodeKey();
   if (value.kind === "interval") return intervalEncodeKey(value.iv);
@@ -7880,7 +7983,10 @@ function encodeBoundKey(
     case "constDate":
       return { kind: "key", key: encodeInt(pkType, src.value) };
     case "constText":
-      return { kind: "key", key: encodeTerminated(SQL_BYTE_ENCODER.encode(src.value)) };
+      return {
+        kind: "key",
+        key: encodeTerminated(SQL_BYTE_ENCODER.encode(src.value)),
+      };
     case "constBytea":
       return { kind: "key", key: encodeTerminated(src.value) };
     case "constDecimal":
@@ -7909,10 +8015,15 @@ function encodeValueKey(pkType: ScalarType, v: Value): BoundKey {
   if (v.kind === "bool") return { kind: "key", key: encodeBool(v.value) };
   if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
   if (v.kind === "text")
-    return { kind: "key", key: encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)) };
-  if (v.kind === "bytea") return { kind: "key", key: encodeTerminated(v.bytes) };
+    return {
+      kind: "key",
+      key: encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)),
+    };
+  if (v.kind === "bytea")
+    return { kind: "key", key: encodeTerminated(v.bytes) };
   if (v.kind === "decimal") return { kind: "key", key: v.dec.encodeKey() };
-  if (v.kind === "interval") return { kind: "key", key: intervalEncodeKey(v.iv) };
+  if (v.kind === "interval")
+    return { kind: "key", key: intervalEncodeKey(v.iv) };
   if (v.kind === "int")
     return inRange(pkType, v.int)
       ? { kind: "key", key: encodeInt(pkType, v.int) }
@@ -8630,7 +8741,11 @@ type ScalarFuncName =
   | "nextval"
   | "currval"
   | "setval"
-  | "lastval";
+  | "lastval"
+  // Session-variable read (spec/design/session.md §6.1): current_setting(text[, bool]) → text reads
+  // the named session variable from the session's variable map. STABLE; 42704 on an unset name unless
+  // the two-arg missing_ok is true (→ NULL).
+  | "current_setting";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -10296,7 +10411,12 @@ function resolveArrayFunc(
 // kind === "function" catalog row whose argFamilies mention anyrange (range-functions.md §1).
 // Data-driven, so a new range-function row wires here without touching this gate.
 function isRangeFuncName(name: string): boolean {
-  return OPERATORS.some((o) => o.kind === "function" && o.name === name && o.argFamilies.some((f) => f === "anyrange"));
+  return OPERATORS.some(
+    (o) =>
+      o.kind === "function" &&
+      o.name === name &&
+      o.argFamilies.some((f) => f === "anyrange"),
+  );
 }
 
 // rangeFuncId is the kernel id for range accessor name (each is single-arity, so the name selects
@@ -10312,7 +10432,9 @@ function rangeFuncId(name: string): RangeFuncName {
     case "upper_inf":
       return name;
     default:
-      throw new Error("rangeFuncId: " + name + " is not a catalog range function");
+      throw new Error(
+        "rangeFuncId: " + name + " is not a catalog range function",
+      );
   }
 }
 
@@ -10327,9 +10449,16 @@ function resolveRangeFunc(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  if (e.star)
+    throw engineError(
+      "syntax_error",
+      "* is only valid as the argument of COUNT",
+    );
   const name = e.name.toLowerCase();
-  const desc = OPERATORS.find((o) => o.kind === "function" && o.name === name && o.arity === e.args.length);
+  const desc = OPERATORS.find(
+    (o) =>
+      o.kind === "function" && o.name === name && o.arity === e.args.length,
+  );
   if (!desc) throw noFuncOverload(name);
   const slots = desc.argFamilies;
 
@@ -10349,7 +10478,10 @@ function resolveRangeFunc(
   if (name === "range_merge") {
     return { node: { kind: "rangeSetOp", op: "merge", args: rargs }, type };
   }
-  return { node: { kind: "rangeFunc", func: rangeFuncId(name), args: rargs }, type };
+  return {
+    node: { kind: "rangeFunc", func: rangeFuncId(name), args: rargs },
+    type,
+  };
 }
 
 // isRangeCtorName reports whether name (lowercased) is a range CONSTRUCTOR call
@@ -10401,7 +10533,11 @@ function resolveRangeCtor(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+  if (e.star)
+    throw engineError(
+      "syntax_error",
+      "* is only valid as the argument of COUNT",
+    );
   const name = e.name.toLowerCase();
   const desc = rangeByName(name);
   if (desc === undefined) throw new Error("isRangeCtorName gated the call");
@@ -10421,7 +10557,8 @@ function resolveRangeCtor(
       // The bounds-flags argument: TEXT (a NULL is allowed at resolve — the kernel traps it 22000
       // at eval, matching PG "flags argument must not be null").
       const r = resolve(scope, a, null, ag, params);
-      if (r.type.kind !== "text" && r.type.kind !== "null") throw noFuncOverload(name);
+      if (r.type.kind !== "text" && r.type.kind !== "null")
+        throw noFuncOverload(name);
       rargs.push(r.node);
     }
   }
@@ -10693,7 +10830,8 @@ function resolvedTypeOfCol(ty: Type, db: Database): ResolvedType {
   if (ty.kind === "scalar") return resolvedTypeOf(ty.scalar);
   if (ty.kind === "array")
     return { kind: "array", elem: resolvedTypeOfCol(ty.elem, db) };
-  if (ty.kind === "range") return { kind: "range", elem: resolvedTypeOfCol(ty.elem, db) };
+  if (ty.kind === "range")
+    return { kind: "range", elem: resolvedTypeOfCol(ty.elem, db) };
   const def = db.compositeType(ty.name);
   if (def === undefined)
     throw new Error("composite type reference resolved at load / CREATE TYPE");
@@ -10824,7 +10962,9 @@ function rtName(t: ResolvedType): string {
 // resolvedRangeElementScalar returns the scalar element type of a resolved range element. A range's
 // element is always one of the six scalar subtypes; undefined for anything else (never a valid
 // range). Used to name a range and to build its codec.
-function resolvedRangeElementScalar(elem: ResolvedType): ScalarType | undefined {
+function resolvedRangeElementScalar(
+  elem: ResolvedType,
+): ScalarType | undefined {
   switch (elem.kind) {
     case "int":
       return elem.ty;
@@ -10921,7 +11061,10 @@ function typeFromResolved(rt: ResolvedType): Type {
     case "range":
       // A range-typed CTE column is deferred (range columns are not storable yet — R2); the value
       // itself works in expression position, just not as a materialized column type.
-      throw engineError("feature_not_supported", "a range column in a CTE is not supported yet");
+      throw engineError(
+        "feature_not_supported",
+        "a range column in a CTE is not supported yet",
+      );
   }
 }
 
@@ -11421,7 +11564,11 @@ function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
   }
 }
 
-function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string>): void {
+function collectInsertPrivs(
+  ins: Insert,
+  req: PrivReq,
+  locals: Set<string>,
+): void {
   // The write target needs INSERT. A bare INSERT … VALUES reads nothing (the slots are literals /
   // params), so it needs only INSERT; an INSERT … SELECT source needs SELECT on its tables.
   req.tables.push({ name: ins.table, priv: "insert" });
@@ -11429,13 +11576,19 @@ function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string>): voi
     collectSelectPrivs(ins.source.select, req, locals);
   }
   if (ins.onConflict !== null && ins.onConflict.doUpdate) {
-    for (const a of ins.onConflict.assignments) collectExprPrivs(a.value, req, locals);
-    if (ins.onConflict.filter !== null) collectExprPrivs(ins.onConflict.filter, req, locals);
+    for (const a of ins.onConflict.assignments)
+      collectExprPrivs(a.value, req, locals);
+    if (ins.onConflict.filter !== null)
+      collectExprPrivs(ins.onConflict.filter, req, locals);
   }
   collectItemsPrivs(ins.returning, req, locals);
 }
 
-function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string>): void {
+function collectUpdatePrivs(
+  upd: Update,
+  req: PrivReq,
+  locals: Set<string>,
+): void {
   req.tables.push({ name: upd.table, priv: "update" });
   // SELECT on the target if it reads any column — a WHERE, a RETURNING, or a column/subquery-
   // referencing assignment RHS (a constant-only SET a = 1 with no WHERE/RETURNING reads nothing).
@@ -11449,7 +11602,11 @@ function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string>): voi
   collectItemsPrivs(upd.returning, req, locals);
 }
 
-function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string>): void {
+function collectDeletePrivs(
+  del: Delete,
+  req: PrivReq,
+  locals: Set<string>,
+): void {
   req.tables.push({ name: del.table, priv: "delete" });
   // DELETE reads the target's columns through a WHERE or a RETURNING.
   if (del.filter !== null || del.returning !== null) {
@@ -11459,7 +11616,11 @@ function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string>): voi
   collectItemsPrivs(del.returning, req, locals);
 }
 
-function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<string>): void {
+function collectQueryPrivs(
+  qe: QueryExpr,
+  req: PrivReq,
+  locals: Set<string>,
+): void {
   if (qe.kind === "setOp") collectSetOpPrivs(qe, req, locals);
   else collectSelectPrivs(qe, req, locals);
 }
@@ -11469,7 +11630,11 @@ function collectSetOpPrivs(so: SetOp, req: PrivReq, locals: Set<string>): void {
   collectQueryPrivs(so.rhs, req, locals);
 }
 
-function collectWithPrivs(wq: WithQuery, req: PrivReq, locals: Set<string>): void {
+function collectWithPrivs(
+  wq: WithQuery,
+  req: PrivReq,
+  locals: Set<string>,
+): void {
   // A CTE name shadows a base table inside the WITH (a FROM <cte> is not a catalog object), so it is
   // added to the local scope and never privilege-checked. Forward-only visibility: each CTE body sees
   // the CTE names declared before it.
@@ -11481,7 +11646,11 @@ function collectWithPrivs(wq: WithQuery, req: PrivReq, locals: Set<string>): voi
   collectQueryPrivs(wq.body, req, scope);
 }
 
-function collectSelectPrivs(s: Select, req: PrivReq, locals: Set<string>): void {
+function collectSelectPrivs(
+  s: Select,
+  req: PrivReq,
+  locals: Set<string>,
+): void {
   if (s.from !== null) collectTableRefPrivs(s.from, req, locals);
   for (const j of s.joins) {
     collectTableRefPrivs(j.table, req, locals);
@@ -11495,7 +11664,11 @@ function collectSelectPrivs(s: Select, req: PrivReq, locals: Set<string>): void 
   if (s.having !== null) collectExprPrivs(s.having, req, locals);
 }
 
-function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<string>): void {
+function collectTableRefPrivs(
+  t: TableRef,
+  req: PrivReq,
+  locals: Set<string>,
+): void {
   if (t.args !== null) {
     // A set-returning function used as a row source — EXECUTE on the function; its args are exprs.
     req.functions.push(t.name);
@@ -11503,14 +11676,19 @@ function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<string>): v
   } else if (t.subquery !== undefined) {
     collectQueryPrivs(t.subquery, req, locals);
   } else if (t.values !== undefined) {
-    for (const row of t.values) for (const e of row) collectExprPrivs(e, req, locals);
+    for (const row of t.values)
+      for (const e of row) collectExprPrivs(e, req, locals);
   } else if (!locals.has(t.name.toLowerCase())) {
     // A base-table reference (not a CTE / derived-table label) — needs SELECT.
     req.tables.push({ name: t.name, priv: "select" });
   }
 }
 
-function collectItemsPrivs(items: SelectItems | null, req: PrivReq, locals: Set<string>): void {
+function collectItemsPrivs(
+  items: SelectItems | null,
+  req: PrivReq,
+  locals: Set<string>,
+): void {
   if (items !== null && items.kind === "list") {
     for (const it of items.items) collectExprPrivs(it.expr, req, locals);
   }
@@ -11648,12 +11826,16 @@ function exprReadsColumns(e: Expr): boolean {
       return exprReadsColumns(e.lhs) || e.list.some(exprReadsColumns);
     case "between":
       return (
-        exprReadsColumns(e.lhs) || exprReadsColumns(e.lo) || exprReadsColumns(e.hi)
+        exprReadsColumns(e.lhs) ||
+        exprReadsColumns(e.lo) ||
+        exprReadsColumns(e.hi)
       );
     case "case":
       return (
         (e.operand !== null && exprReadsColumns(e.operand)) ||
-        e.whens.some((w) => exprReadsColumns(w.cond) || exprReadsColumns(w.result)) ||
+        e.whens.some(
+          (w) => exprReadsColumns(w.cond) || exprReadsColumns(w.result),
+        ) ||
         (e.els !== null && exprReadsColumns(e.els))
       );
     case "quantified":
@@ -12349,16 +12531,25 @@ function resolve(
         const rdesc = rangeByName(e.typeName);
         if (rdesc !== undefined) {
           if (e.typeMod !== null) {
-            throw engineError("feature_not_supported", "a type modifier on a range type is not supported");
+            throw engineError(
+              "feature_not_supported",
+              "a type modifier on a range type is not supported",
+            );
           }
           const elemRt = resolvedTypeOf(elementScalar(rdesc));
           if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
             return coerceStringToRangeExpr(e.inner.literal.text, rdesc);
           }
           if (e.inner.kind === "literal" && e.inner.literal.kind === "null") {
-            return { node: { kind: "constNull" }, type: { kind: "range", elem: elemRt } };
+            return {
+              node: { kind: "constNull" },
+              type: { kind: "range", elem: elemRt },
+            };
           }
-          throw engineError("feature_not_supported", "casting to a range type is only supported from a string literal this slice");
+          throw engineError(
+            "feature_not_supported",
+            "casting to a range type is only supported from a string literal this slice",
+          );
         }
       }
       // A composite cast target (`'(…)'::addr`) — a CREATE TYPE name, not a built-in scalar
@@ -13057,7 +13248,8 @@ function resolveSetOp(
   }
   // Both slots are anyarray: the element types must unify (a non-array / mismatch is 42883).
   const tys: ResolvedType[] = [rl.type, rr.type];
-  if (!matchPoly(["anyarray", "anyarray"], tys).matched) throw noSetOpOverload();
+  if (!matchPoly(["anyarray", "anyarray"], tys).matched)
+    throw noSetOpOverload();
   return {
     node: { kind: "arrayFunc", func, args: [rl.node, rr.node] },
     type: { kind: "bool" },
@@ -13084,7 +13276,9 @@ function rangeOpFor(op: BinaryOp): RangeOpName {
     case "adjacent":
       return "adjacent";
     default:
-      throw new Error("rangeOpFor is only called for the eight set/positional operators");
+      throw new Error(
+        "rangeOpFor is only called for the eight set/positional operators",
+      );
   }
 }
 
@@ -13111,19 +13305,44 @@ function resolveRangeOp(
   if (lt.kind === "range" && rt.kind === "range") {
     const le = resolvedRangeElementScalar(lt.elem);
     const re = resolvedRangeElementScalar(rt.elem);
-    if (le === undefined || re === undefined || le !== re) throw noSetOpOverload();
-    return { node: { kind: "rangeOp", op: rangeOpFor(op), args: [rl.node, rr.node], elem: le }, type: { kind: "bool" } };
+    if (le === undefined || re === undefined || le !== re)
+      throw noSetOpOverload();
+    return {
+      node: {
+        kind: "rangeOp",
+        op: rangeOpFor(op),
+        args: [rl.node, rr.node],
+        elem: le,
+      },
+      type: { kind: "bool" },
+    };
   }
   // range × NULL (a bare NULL is taken as a NULL range; eval yields NULL).
   if (lt.kind === "range" && rt.kind === "null") {
     const le = resolvedRangeElementScalar(lt.elem);
     if (le === undefined) throw noSetOpOverload();
-    return { node: { kind: "rangeOp", op: rangeOpFor(op), args: [rl.node, rr.node], elem: le }, type: { kind: "bool" } };
+    return {
+      node: {
+        kind: "rangeOp",
+        op: rangeOpFor(op),
+        args: [rl.node, rr.node],
+        elem: le,
+      },
+      type: { kind: "bool" },
+    };
   }
   if (lt.kind === "null" && rt.kind === "range") {
     const re = resolvedRangeElementScalar(rt.elem);
     if (re === undefined) throw noSetOpOverload();
-    return { node: { kind: "rangeOp", op: rangeOpFor(op), args: [rl.node, rr.node], elem: re }, type: { kind: "bool" } };
+    return {
+      node: {
+        kind: "rangeOp",
+        op: rangeOpFor(op),
+        args: [rl.node, rr.node],
+        elem: re,
+      },
+      type: { kind: "bool" },
+    };
   }
   // `range @> element` — the element overload of `@>` (the only operator with one). Re-resolve the
   // right operand with the range's element as the hint, then check it is assignable.
@@ -13132,7 +13351,15 @@ function resolveRangeOp(
     if (elem === undefined) throw noSetOpOverload();
     const re = resolve(scope, rhs, elem, ag, params);
     if (!rangeBoundAssignable(re.type, elem)) throw noSetOpOverload();
-    return { node: { kind: "rangeOp", op: "containsElem", args: [rl.node, re.node], elem }, type: { kind: "bool" } };
+    return {
+      node: {
+        kind: "rangeOp",
+        op: "containsElem",
+        args: [rl.node, re.node],
+        elem,
+      },
+      type: { kind: "bool" },
+    };
   }
   // `element <@ range` — the element overload of `<@`.
   if (rt.kind === "range" && op === "containedBy") {
@@ -13140,7 +13367,15 @@ function resolveRangeOp(
     if (elem === undefined) throw noSetOpOverload();
     const le = resolve(scope, lhs, elem, ag, params);
     if (!rangeBoundAssignable(le.type, elem)) throw noSetOpOverload();
-    return { node: { kind: "rangeOp", op: "elemContainedBy", args: [le.node, rr.node], elem }, type: { kind: "bool" } };
+    return {
+      node: {
+        kind: "rangeOp",
+        op: "elemContainedBy",
+        args: [le.node, rr.node],
+        elem,
+      },
+      type: { kind: "bool" },
+    };
   }
   throw noSetOpOverload();
 }
@@ -13163,7 +13398,8 @@ function resolveRangeSetOp(
   if (lt.kind === "range" && rt.kind === "range") {
     const le = resolvedRangeElementScalar(lt.elem);
     const re = resolvedRangeElementScalar(rt.elem);
-    if (le === undefined || re === undefined || le !== re) throw noSetOpOverload();
+    if (le === undefined || re === undefined || le !== re)
+      throw noSetOpOverload();
     elem = le;
   } else if (lt.kind === "range" && rt.kind === "null") {
     const le = resolvedRangeElementScalar(lt.elem);
@@ -13360,7 +13596,9 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
     return;
   }
   if ((rangeL || rangeR) && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError("cannot compare a range value with a value of a different type");
+    throw typeError(
+      "cannot compare a range value with a value of a different type",
+    );
   }
   // Composite comparison is element-wise row comparison (spec/design/composite.md §5): two
   // composites are comparable iff they have the SAME field count and each corresponding field
@@ -13571,10 +13809,16 @@ function floatFromDecimalLiteral(
 // ('[1,5)'::i32range / i32range '[1,5)'): parse, coerce each bound to the element type, then
 // canonicalize (spec/design/ranges.md §4/§5). Folds to a constRange. 22P02 malformed / 22000
 // lower>upper / 22003 canonicalize overflow.
-function coerceStringToRangeExpr(text: string, desc: RangeDesc): { node: RExpr; type: ResolvedType } {
+function coerceStringToRangeExpr(
+  text: string,
+  desc: RangeDesc,
+): { node: RExpr; type: ResolvedType } {
   const val = coerceStringToRange(text, desc);
   const elemRt = resolvedTypeOf(elementScalar(desc));
-  return { node: { kind: "constRange", value: val }, type: { kind: "range", elem: elemRt } };
+  return {
+    node: { kind: "constRange", value: val },
+    type: { kind: "range", elem: elemRt },
+  };
 }
 
 function coerceStringToRange(text: string, desc: RangeDesc): Value {
@@ -13718,7 +13962,9 @@ function coerceStringToComposite(
     } else if (f.type.kind === "range") {
       // A range field cannot occur: CREATE TYPE rejects a range field (range columns are not
       // storable yet — R2).
-      throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
+      throw new Error(
+        "a composite range field is rejected at CREATE TYPE (R2)",
+      );
     } else {
       const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal);
       nodes.push(node);
@@ -14195,7 +14441,8 @@ function evalRangeFunc(func: RangeFuncName, vals: Value[]): Value {
 // empty-normalize).
 function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
   const desc = rangeForElement(elem);
-  if (desc === undefined) throw new Error("a range constructor's elem has a range");
+  if (desc === undefined)
+    throw new Error("a range constructor's elem has a range");
   const lower = coerceRangeBound(vals[0]!, elem);
   const upper = coerceRangeBound(vals[1]!, elem);
   let lowerInc: boolean;
@@ -14206,7 +14453,10 @@ function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
     lowerInc = true;
     upperInc = false;
   } else if (flags.kind === "null") {
-    throw engineError("data_exception", "range constructor flags argument must not be null");
+    throw engineError(
+      "data_exception",
+      "range constructor flags argument must not be null",
+    );
   } else if (flags.kind === "text") {
     [lowerInc, upperInc] = parseBoundFlags(flags.text);
   } else {
@@ -14226,7 +14476,10 @@ function coerceRangeBound(v: Value, elem: ScalarType): Value | null {
 
 // expectRange extracts the range value the resolver guaranteed is a (non-NULL) range operand.
 function expectRange(v: Value): Value & { kind: "range" } {
-  if (v.kind !== "range") throw new Error("the range-operator resolver guarantees a range operand here");
+  if (v.kind !== "range")
+    throw new Error(
+      "the range-operator resolver guarantees a range operand here",
+    );
   return v;
 }
 
@@ -14235,7 +14488,12 @@ function expectRange(v: Value): Value & { kind: "range" } {
 // operators both operands are ranges; for the element overloads (containsElem/elemContainedBy) the
 // non-range operand is coerced to the range's element type `elem` (assignment-style, matching the
 // resolver's hint). The boolean kernels live in range.ts.
-function evalRangeOp(op: RangeOpName, l: Value, r: Value, elem: ScalarType): Value {
+function evalRangeOp(
+  op: RangeOpName,
+  l: Value,
+  r: Value,
+  elem: ScalarType,
+): Value {
   if (l.kind === "null" || r.kind === "null") return nullValue();
   let result: boolean;
   switch (op) {
@@ -15245,15 +15503,25 @@ function coerceForStore(
 // the value passes through; any other value is a 42804. An infinite bound is null and skipped;
 // bounds are never NULL here (a null bound is infinite, not NULL), so the element store is never
 // NOT NULL.
-function storeRange(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
+function storeRange(
+  v: Value,
+  elem: ColType,
+  notNull: boolean,
+  colName: string,
+): Value {
   if (v.kind === "null") {
     if (notNull) {
-      throw engineError("not_null_violation", "null value in column " + colName + " violates not-null constraint");
+      throw engineError(
+        "not_null_violation",
+        "null value in column " + colName + " violates not-null constraint",
+      );
     }
     return nullValue();
   }
   if (v.kind !== "range") {
-    throw typeError("cannot store a non-range value in range column " + colName);
+    throw typeError(
+      "cannot store a non-range value in range column " + colName,
+    );
   }
   if (v.empty) return v;
   const coerce = (b: Value | null): Value | null =>
@@ -15388,14 +15656,17 @@ function materializeInsertValue(
   if (ty.kind === "range") {
     // A range column's element is always a scalar; the descriptor (for canonicalization) is
     // re-derived from it (spec/design/ranges.md §3/§4).
-    if (ty.elem.kind !== "scalar") throw new Error("a range element is always a scalar (ranges.md §2)");
+    if (ty.elem.kind !== "scalar")
+      throw new Error("a range element is always a scalar (ranges.md §2)");
     const desc = rangeForElement(ty.elem.scalar);
-    if (desc === undefined) throw new Error("a range column's element always has a range type");
+    if (desc === undefined)
+      throw new Error("a range column's element always has a range type");
     switch (iv.kind) {
       case "lit":
         // A bare string literal adapts to the range context via range_in (the same
         // string-adapts-to-context rule array/bytea/uuid use — spec/design/ranges.md §5).
-        if (iv.lit.kind === "text") return coerceStringToRange(iv.lit.text, desc);
+        if (iv.lit.kind === "text")
+          return coerceStringToRange(iv.lit.text, desc);
         if (iv.lit.kind === "null") return nullValue();
         throw typeError("cannot assign a scalar value to a range column");
       case "param":
@@ -15405,7 +15676,10 @@ function materializeInsertValue(
       case "row":
         throw typeError("cannot assign a record value to a range column");
       default: // default
-        throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
+        throw engineError(
+          "syntax_error",
+          "DEFAULT is not allowed inside ROW(...)",
+        );
     }
   }
   if (ty.kind === "scalar") {
@@ -15511,7 +15785,8 @@ function coerceArrayElementText(tok: string, elem: ColType): Value {
   if (elem.kind === "array") return coerceStringToArray(tok, elem.elem);
   // A range element is unreachable: array-of-range is not a storable jed type (R2), so an array
   // element ColType is never a range.
-  if (elem.kind === "range") throw new Error("array-of-range is not a storable type (ranges.md §2)");
+  if (elem.kind === "range")
+    throw new Error("array-of-range is not a storable type (ranges.md §2)");
   const { node } = coerceStringLiteral(tok, elem.scalar, null);
   return rexprConstToValue(node);
 }
@@ -15539,7 +15814,10 @@ function coerceRecordTextToValue(
       return coerceRecordTextToValue(tok, f.type);
     if (f.type.kind === "array") return coerceStringToArray(tok, f.type.elem);
     // A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
-    if (f.type.kind === "range") throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
+    if (f.type.kind === "range")
+      throw new Error(
+        "a composite range field is rejected at CREATE TYPE (R2)",
+      );
     const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod);
     return rexprConstToValue(node);
   });
@@ -16061,6 +16339,26 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       if (e.func === "lastval") {
         return intValue(env.exec.seqLastval());
+      }
+      // current_setting (spec/design/session.md §6.1): read the named session variable from the
+      // session's variable map. The blanket NULL propagation above already returned NULL for a NULL
+      // name / missing_ok argument, so both are non-NULL here. An unset name is 42704 UNLESS the
+      // two-arg overload's missing_ok is true (→ NULL).
+      if (e.func === "current_setting") {
+        const name = (vals[0] as { text: string }).text;
+        const missingOk =
+          vals.length > 1 && (vals[1] as { value: boolean }).value;
+        const got = env.exec.session.vars.get(name.toLowerCase());
+        if (got !== undefined) {
+          return textValue(got);
+        }
+        if (missingOk) {
+          return nullValue();
+        }
+        throw engineError(
+          "undefined_object",
+          "unrecognized configuration parameter: " + name,
+        );
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

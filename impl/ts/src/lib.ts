@@ -355,6 +355,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // total reaches it; sibling to resource.cost_limit's per-statement 54P01. The sticky
   // # lifetime_max_cost: directive sets the budget for the rest of the file (session.md §5.4).
   "session.lifetime_cost",
+  // Session variables — PostgreSQL's GUC model scoped to the session: a string→string map the host
+  // sets (setVar/resetVar/var) and SQL reads with current_setting('name'[, missing_ok]). Custom
+  // (dotted) names only; an unset name is 42704 unless missing_ok. The # set: directive configures
+  // the session for the next record (session.md §6.1).
+  "session.variables",
   // Phase 5 — explicit transactions: BEGIN/COMMIT/ROLLBACK, READ ONLY/READ WRITE access modes,
   // failed-block poisoning (spec/design/transactions.md §4, grammar.md §27).
   "txn.explicit",
