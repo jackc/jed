@@ -205,4 +205,75 @@ impl Database {
     pub fn query(&mut self, sql: &str, params: &[Value]) -> Result<Rows> {
         Rows::from_outcome(Database::execute(self, sql, params)?)
     }
+
+    /// Run a multi-statement `sql` **script** on the default session (spec/design/session.md §4.2):
+    /// split it with [`split_statements`](crate::split::split_statements), run each statement in
+    /// order, **discard the result rows** (keeping only counts), and return the `O(1)`
+    /// [`ScriptSummary`] (`statements_run` / `rows_affected_total` / `cost`). The dominant
+    /// migration/import path — "run this script; I only care that it succeeded."
+    ///
+    /// - **`Idle` at entry** ⇒ the whole run is **one implicit transaction**, all-or-nothing: a
+    ///   statement error rolls the wrapper back (nothing is committed) and returns that error.
+    /// - **`Open` at entry** ⇒ the run **joins** that transaction (no wrapper, no auto-commit); a
+    ///   mid-run error leaves the block `Failed` for the caller to roll back.
+    /// - **In-script transaction control** (`BEGIN`/`COMMIT`/`ROLLBACK`) is **`0A000`** — the
+    ///   implicit wrapper owns the boundary (partitioning is deferred, session.md §11). A host that
+    ///   needs self-managed transactions writes its own `split_statements` loop instead.
+    pub fn execute_script(&mut self, sql: &str) -> Result<crate::executor::ScriptSummary> {
+        // We own an implicit wrapper iff the session is Idle at entry. `begin_tx(None)` honors the
+        // handle's read-only mode (READ ONLY wrapper on a read-only handle — a write inside is
+        // 25006, exactly like autocommit).
+        let owns_wrapper = !self.in_transaction();
+        if owns_wrapper {
+            self.begin_tx(None)?;
+        }
+        match self.run_script_body(sql) {
+            Ok(summary) => {
+                if owns_wrapper {
+                    self.commit()?; // publish the all-or-nothing run
+                }
+                Ok(summary)
+            }
+            Err(e) => {
+                if owns_wrapper {
+                    let _ = self.rollback(); // discard everything; surface the original error
+                }
+                Err(e)
+            }
+        }
+    }
+
+    /// The body of [`execute_script`](Database::execute_script): split, then run each statement on
+    /// the current transaction. Separated so the wrapper's commit/rollback in `execute_script` runs
+    /// on either the `Ok` or the `Err` path with no duplication.
+    fn run_script_body(&mut self, sql: &str) -> Result<crate::executor::ScriptSummary> {
+        use crate::ast::Statement;
+        let mut summary = crate::executor::ScriptSummary::default();
+        for span in crate::split::split_statements(sql) {
+            let ast = self.parse(span.text())?;
+            // Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
+            // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
+            if matches!(
+                ast,
+                Statement::Begin { .. } | Statement::Commit | Statement::Rollback
+            ) {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; \
+                     use split_statements to run a self-managed multi-statement transaction",
+                ));
+            }
+            let outcome = self.execute_stmt_params(ast, &[])?;
+            summary.statements_run += 1;
+            if let Outcome::Statement {
+                rows_affected: Some(n),
+                ..
+            } = &outcome
+            {
+                summary.rows_affected_total += *n;
+            }
+            summary.cost += outcome.cost();
+        }
+        Ok(summary)
+    }
 }

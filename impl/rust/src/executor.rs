@@ -89,6 +89,21 @@ impl Outcome {
     }
 }
 
+/// The `O(1)` summary of an `execute_script` run (spec/design/session.md §4.2). Carries only
+/// counts — never the result rows, which `execute_script` discards — so memory is bounded by
+/// construction regardless of how many rows the script's statements touch.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ScriptSummary {
+    /// How many statements ran (each non-empty span the splitter yielded).
+    pub statements_run: u64,
+    /// The sum of the DML command-tag counts (INSERT/UPDATE/DELETE rows affected). A `SELECT` or a
+    /// DDL/transaction-control statement contributes nothing.
+    pub rows_affected_total: i64,
+    /// The total accrued execution cost across every statement (the deterministic cost meter,
+    /// CLAUDE.md §13) — the figure a future `lifetime_max_cost` budget bounds.
+    pub cost: i64,
+}
+
 /// The full result of running a SELECT (`run_select`): the output column names and their
 /// resolved types, the rows in result order, and the accrued cost. Internal to the executor —
 /// `execute_select` drops the types into the public `Outcome::Query`, while `INSERT ... SELECT`
@@ -763,6 +778,14 @@ impl Session {
         f: impl FnOnce(&mut crate::api::Transaction) -> Result<R>,
     ) -> Result<R> {
         self.run(db, |db| db.update(f))
+    }
+
+    /// Run a multi-statement `sql` **script** on this session (spec/design/session.md §4.2): split
+    /// it, run each statement in order, discard result rows, and return the `O(1)` [`ScriptSummary`].
+    /// When this session is `Idle` the whole run is one implicit transaction (all-or-nothing); when
+    /// it is `Open` the run joins that transaction. In-script transaction control is `0A000`.
+    pub fn execute_script(&mut self, db: &mut Database, sql: &str) -> Result<ScriptSummary> {
+        self.run(db, |db| db.execute_script(sql))
     }
 
     /// The transaction status (`Idle`/`Open`/`Failed`, spec/design/session.md §2.2).

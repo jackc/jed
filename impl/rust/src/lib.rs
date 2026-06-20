@@ -35,6 +35,7 @@ mod recovery;
 pub mod seam;
 pub mod shared;
 pub mod spill;
+pub mod split;
 pub mod storage;
 pub mod timestamp;
 pub mod token;
@@ -46,13 +47,14 @@ pub use api::{PreparedStatement, Rows, Transaction};
 pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
-    DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Database, Outcome, Session, SessionOptions,
-    Snapshot, TxStatus,
+    DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Database, Outcome, ScriptSummary, Session,
+    SessionOptions, Snapshot, TxStatus,
 };
 pub use file::{DatabaseOptions, OpenOptions};
 pub use parser::Parser;
 pub use shared::{ReadHandle, SharedDb, WriteHandle};
 pub use spill::DEFAULT_WORK_MEM;
+pub use split::{SplitStatements, StatementSpan, split_statements};
 pub use value::Value;
 
 /// The capabilities this implementation currently supports (spec/conformance:
