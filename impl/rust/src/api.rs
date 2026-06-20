@@ -175,7 +175,7 @@ impl Database {
     /// through here (`execute`/`execute_params`/`prepare`/the read handle), so the per-handle
     /// limit has no hole. The byte length is `sql.len()` (Rust `&str` is UTF-8).
     pub(crate) fn parse(&self, sql: &str) -> Result<Statement> {
-        let max = self.max_sql_length;
+        let max = self.session.max_sql_length;
         if max > 0 && sql.len() > max {
             return Err(EngineError::new(
                 SqlState::ProgramLimitExceeded,

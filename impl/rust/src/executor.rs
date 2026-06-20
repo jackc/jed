@@ -560,9 +560,14 @@ impl Snapshot {
 pub struct Database {
     /// The last committed, immutable state — what fresh readers (and autocommit reads) see.
     pub(crate) committed: Snapshot,
-    /// The open transaction, if any. `None` is autocommit between statements (transactions.md
-    /// §4.1); a single-statement autocommit write opens one implicitly for its duration.
-    tx: Option<ActiveTx>,
+    /// The **default session** (spec/design/session.md §2.1): the per-connection state this handle
+    /// runs statements through — the open transaction (the `Idle`/`Open`/`Failed` machine, §2.2),
+    /// the relocated settings (`max_cost`, `max_sql_length`, `work_mem`, the entropy/clock seam),
+    /// and the `currval`/`lastval` session state. A bare `Database` IS committed storage + this one
+    /// long-lived stateful default session; the convenience methods (`execute`/`begin`/
+    /// `set_max_cost`/…) operate on it. `db.session(opts)` mints additional, independent sessions
+    /// (run sequentially on this single-threaded handle by swapping into this slot).
+    pub(crate) session: Session,
     /// The backing file path (`None` for an in-memory database). Set by the host API
     /// `open`/`create` (spec/design/api.md §2); `commit` writes here.
     pub(crate) path: Option<std::path::PathBuf>,
@@ -586,21 +591,6 @@ pub struct Database {
     /// every commit writes through it. `None` for an in-memory database (`persist` is then a no-op);
     /// set by `open`/`create`, dropped by `close`.
     pub(crate) paging: Option<std::sync::Arc<crate::paging::SharedPaging>>,
-    /// The caller-set execution-cost ceiling (CLAUDE.md §13; spec/design/api.md §8), or `0`
-    /// (the default) for **unlimited**. A positive value bounds every statement run on this
-    /// handle: each statement's [`Meter`](crate::cost::Meter) is built with this limit and
-    /// aborts with `54P01` the instant accrued cost reaches it. A handle setting (not stored
-    /// in the file), set by [`set_max_cost`](Database::set_max_cost); the primary guard for
-    /// safely evaluating untrusted, user-supplied queries.
-    pub(crate) max_cost: i64,
-    /// The maximum input SQL length, in **bytes**, accepted on this handle (CLAUDE.md §13;
-    /// spec/design/api.md §8, cost.md §7). Default [`DEFAULT_MAX_SQL_LENGTH`] (1 MiB); `0` ⇒
-    /// **unlimited** (a trusted caller's opt-out). A statement whose text exceeds it is rejected
-    /// with `54000` at [`parse`](Database::parse) — **before** lexing — so unbounded input cannot
-    /// exhaust parse memory/CPU (the §13 input-size gate, which the cost meter cannot catch
-    /// because parsing precedes metering). A handle setting (not stored in the file), set by
-    /// [`set_max_sql_length`](Database::set_max_sql_length).
-    pub(crate) max_sql_length: usize,
     /// Whether this handle was opened **read-only** (spec/design/api.md §2.1,
     /// [`crate::file::OpenOptions::read_only`]). A read-only handle behaves like PostgreSQL
     /// hot standby: every transaction defaults to READ ONLY, an explicit `BEGIN READ WRITE`
@@ -608,50 +598,223 @@ pub struct Database {
     /// publishes and the file is never written (it is opened without write access). Always
     /// `false` for an in-memory or normally-opened database.
     pub(crate) read_only: bool,
-    /// The work-memory budget in **bytes** (spec/design/spill.md §2, api.md §2.1): the memory a
-    /// single blocking operator (currently the `ORDER BY` external merge sort) may hold resident
-    /// before it spills sorted runs to disk. A handle setting (not stored in the file), set by
-    /// [`set_work_mem`](Database::set_work_mem); `0` ⇒ **unlimited** (never spill). It never changes
-    /// what a query observes (results + cost are invariant, spill.md §6) — only when an operator
-    /// spills. An **in-memory** database ignores it (no backing file to spill to — it stays fully
-    /// resident, like the buffer pool). Default [`DEFAULT_WORK_MEM`](crate::spill::DEFAULT_WORK_MEM).
+}
+
+/// The relocatable session settings (spec/design/session.md §3 — the bucket-A envelope subset that
+/// has landed in S1): the per-statement cost ceiling, the input-size limit, and the work-memory
+/// budget. Passed to [`Database::session`] to mint an additional session; an absent field takes its
+/// default. (The entropy/clock seam is injected via [`Session::set_random_source`] /
+/// [`Session::set_clock_source`], not here.)
+#[derive(Clone, Copy, Debug)]
+pub struct SessionOptions {
+    /// Execution-cost ceiling (CLAUDE.md §13); `0` ⇒ unlimited (the default).
+    pub max_cost: i64,
+    /// Maximum input SQL length in bytes; `0` ⇒ unlimited. Default [`DEFAULT_MAX_SQL_LENGTH`].
+    pub max_sql_length: usize,
+    /// Work-memory budget in bytes; `0` ⇒ unlimited (never spill). Default [`DEFAULT_WORK_MEM`].
+    pub work_mem: usize,
+}
+
+impl Default for SessionOptions {
+    fn default() -> Self {
+        SessionOptions {
+            max_cost: 0,
+            max_sql_length: DEFAULT_MAX_SQL_LENGTH,
+            work_mem: crate::spill::DEFAULT_WORK_MEM,
+        }
+    }
+}
+
+/// The session transaction status (spec/design/session.md §2.2) — PostgreSQL's three connection
+/// states, made explicit on the session and derived from the open transaction: no transaction ⇒
+/// `Idle` (autocommit); an open clean block ⇒ `Open`; an open block a statement aborted ⇒ `Failed`
+/// (only ROLLBACK/COMMIT accepted, everything else `25P02`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TxStatus {
+    Idle,
+    Open,
+    Failed,
+}
+
+impl TxStatus {
+    fn of(tx: &Option<ActiveTx>) -> TxStatus {
+        match tx {
+            None => TxStatus::Idle,
+            Some(t) if t.failed => TxStatus::Failed,
+            Some(_) => TxStatus::Open,
+        }
+    }
+}
+
+/// The per-connection **session** state (spec/design/session.md §2.1): the configured, stateful
+/// context a host runs statements through, un-fused from the committed storage on [`Database`]. It
+/// owns the open transaction (the `Idle`/`Open`/`Failed` machine), the relocated handle settings,
+/// the entropy/clock seam, and the `currval`/`lastval` session state. A [`Database`] holds one as
+/// its long-lived default session; [`Database::session`] mints additional independent ones that run
+/// sequentially on a single-threaded handle (by swapping into the default slot for a call).
+pub struct Session {
+    /// The open transaction, if any. `None` is autocommit between statements (transactions.md
+    /// §4.1); a single-statement autocommit write opens one implicitly for its duration. The
+    /// `Idle`/`Open`/`Failed` status (session.md §2.2) is derived from this ([`TxStatus::of`]).
+    pub(crate) tx: Option<ActiveTx>,
+    /// The execution-cost ceiling (CLAUDE.md §13; spec/design/api.md §8), or `0` for **unlimited**.
+    /// Bounds every statement run on this session: its [`Meter`](crate::cost::Meter) is built with
+    /// this limit and aborts `54P01` the instant accrued cost reaches it.
+    pub(crate) max_cost: i64,
+    /// The maximum input SQL length, in **bytes**, accepted on this session (CLAUDE.md §13; api.md
+    /// §8, cost.md §7). `0` ⇒ **unlimited**; default [`DEFAULT_MAX_SQL_LENGTH`] (1 MiB). An
+    /// over-limit statement is rejected `54000` at [`parse`](Database::parse), before lexing.
+    pub(crate) max_sql_length: usize,
+    /// The work-memory budget in **bytes** (spec/design/spill.md §2): the memory a blocking operator
+    /// (the `ORDER BY` external merge sort) holds resident before it spills. `0` ⇒ unlimited (never
+    /// spill); default [`DEFAULT_WORK_MEM`](crate::spill::DEFAULT_WORK_MEM). Never changes what a
+    /// query observes (spill.md §6); an in-memory database ignores it.
     pub(crate) work_mem: usize,
-    /// The entropy + clock seam for the uuid generators (spec/design/entropy.md): two host-injectable
-    /// functions (a random source + a clock), each defaulting to the platform primitive (OS CSPRNG
-    /// per value / wall clock). Set by [`set_random_source`](Database::set_random_source) /
-    /// [`set_clock_source`](Database::set_clock_source). Tests inject the provided
-    /// [`seeded_random_source`](crate::seam::seeded_random_source) + [`fixed_clock`](crate::seam::fixed_clock)
-    /// (the `# seed:` / `# clock:` directives) for exact cross-core output. A handle setting, not
-    /// stored in the file; does not affect a query that calls no generator.
+    /// The entropy + clock seam for the uuid generators / clock functions (spec/design/entropy.md):
+    /// two host-injectable functions (a random source + a clock), each defaulting to the platform
+    /// primitive. Tests inject `seeded_random_source` + `fixed_clock` (the `# seed:`/`# clock:`
+    /// directives) for byte-identical cross-core output.
     pub(crate) seam: crate::seam::Seam,
-    /// Per-handle **session** `currval` state (spec/design/sequences.md §6): the last value
-    /// `nextval`/`setval(…,true)` produced **in this session** for each sequence (lowercased name).
-    /// NOT part of the snapshot and NOT persisted — strictly session-local, as in PostgreSQL.
-    /// Updated when a sequence-advancing statement succeeds (flushing `pending_currval`); `currval`
-    /// of an unlisted sequence this session is `55000`.
-    session_seq: HashMap<String, i64>,
-    /// Per-handle **session** `lastval` state (spec/design/sequences.md §6): the lowercased **name**
-    /// of the sequence the most recent `nextval` (of **any** sequence) ran on — `None` before the
-    /// first `nextval`. `lastval()` returns the *current* session value of that sequence (PG: it
-    /// reads the last-used sequence's cached value), so a `setval` on that same sequence is
-    /// reflected; a `setval` never changes *which* sequence this points to. `55000` when `None`.
-    session_last_name: Option<String>,
-    /// Per-**statement** running sequence advances (spec/design/sequences.md §4), behind a `RefCell`
-    /// for interior mutability — `EvalEnv` borrows `&Database`, so a `nextval`/`setval` records its
-    /// advance here (seeded from the working snapshot on first touch), and later calls in the same
-    /// statement see the running state. On statement success it is flushed into the working snapshot
-    /// (so commit persists it); on error it is discarded (the transactional rollback of the advance,
-    /// sequences.md §5). Cleared at the start of every statement.
-    pending_seq: std::cell::RefCell<HashMap<String, SequenceDef>>,
-    /// Per-**statement** running `currval` updates (the names `nextval`/`setval(…,true)` touched
-    /// this statement → their produced value). Kept separate from `pending_seq` because `currval` is
-    /// updated by a *subset* of catalog mutations: `setval(…,false)` and `ALTER … RESTART` advance
-    /// the counter without defining `currval`. Flushed into `session_seq` on statement success.
-    pending_currval: std::cell::RefCell<HashMap<String, i64>>,
-    /// Per-**statement** running `lastval` update (the lowercased name of the most recent `nextval`
-    /// this statement, `None` if no `nextval` ran). `setval` never sets it. Flushed into
-    /// `session_last_name` on success.
-    pending_last_name: std::cell::RefCell<Option<String>>,
+    /// **Session** `currval` state (spec/design/sequences.md §6): the last value `nextval`/
+    /// `setval(…,true)` produced **in this session** for each sequence (lowercased name). NOT in the
+    /// snapshot and NOT persisted — strictly session-local, as in PostgreSQL.
+    pub(crate) session_seq: HashMap<String, i64>,
+    /// **Session** `lastval` state (sequences.md §6): the lowercased name of the sequence the most
+    /// recent `nextval` (of any sequence) ran on — `None` before the first `nextval`.
+    pub(crate) session_last_name: Option<String>,
+    /// Per-**statement** running sequence advances (sequences.md §4), behind a `RefCell` for interior
+    /// mutability (`EvalEnv` borrows `&Database`). Flushed into the working snapshot on statement
+    /// success; discarded on error (the transactional rollback of the advance, §5).
+    pub(crate) pending_seq: std::cell::RefCell<HashMap<String, SequenceDef>>,
+    /// Per-**statement** running `currval` updates → flushed into `session_seq` on success.
+    pub(crate) pending_currval: std::cell::RefCell<HashMap<String, i64>>,
+    /// Per-**statement** running `lastval` update → flushed into `session_last_name` on success.
+    pub(crate) pending_last_name: std::cell::RefCell<Option<String>>,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Session::new()
+    }
+}
+
+impl Session {
+    /// A fresh default session: no open transaction, default settings, empty sequence state.
+    pub fn new() -> Self {
+        Session::with_options(SessionOptions::default())
+    }
+
+    /// A fresh session configured from `opts` (spec/design/session.md §2.1); the rest of the
+    /// per-connection state (transaction, seam, sequence state) starts empty/default.
+    pub fn with_options(opts: SessionOptions) -> Self {
+        Session {
+            tx: None,
+            max_cost: opts.max_cost,
+            max_sql_length: opts.max_sql_length,
+            work_mem: opts.work_mem,
+            seam: crate::seam::Seam::default(),
+            session_seq: HashMap::new(),
+            session_last_name: None,
+            pending_seq: std::cell::RefCell::new(HashMap::new()),
+            pending_currval: std::cell::RefCell::new(HashMap::new()),
+            pending_last_name: std::cell::RefCell::new(None),
+        }
+    }
+
+    /// Run `f` with this session installed as `db`'s active session — the swap mechanism that lets an
+    /// additional session run sequentially on a single-threaded [`Database`] (spec/design/session.md
+    /// §2.1): swap this session into the default slot, run, swap back so this session carries forward
+    /// its mutated state and the default is restored.
+    fn run<R>(&mut self, db: &mut Database, f: impl FnOnce(&mut Database) -> R) -> R {
+        std::mem::swap(&mut db.session, self);
+        let r = f(db);
+        std::mem::swap(&mut db.session, self);
+        r
+    }
+
+    /// Run a (possibly mutating) statement on this session against `db`, binding `$N` params.
+    pub fn execute(&mut self, db: &mut Database, sql: &str, params: &[Value]) -> Result<Outcome> {
+        self.run(db, |db| db.execute(sql, params))
+    }
+
+    /// Run a **query** on this session against `db`, returning a row cursor.
+    pub fn query(
+        &mut self,
+        db: &mut Database,
+        sql: &str,
+        params: &[Value],
+    ) -> Result<crate::api::Rows> {
+        self.run(db, |db| db.query(sql, params))
+    }
+
+    /// Run `f` in a READ ONLY transaction on this session (auto-commit/rollback, §2.2).
+    pub fn view<R>(
+        &mut self,
+        db: &mut Database,
+        f: impl FnOnce(&mut crate::api::Transaction) -> Result<R>,
+    ) -> Result<R> {
+        self.run(db, |db| db.view(f))
+    }
+
+    /// Run `f` in a READ WRITE transaction on this session (auto-commit/rollback, §2.2).
+    pub fn update<R>(
+        &mut self,
+        db: &mut Database,
+        f: impl FnOnce(&mut crate::api::Transaction) -> Result<R>,
+    ) -> Result<R> {
+        self.run(db, |db| db.update(f))
+    }
+
+    /// The transaction status (`Idle`/`Open`/`Failed`, spec/design/session.md §2.2).
+    pub fn status(&self) -> TxStatus {
+        TxStatus::of(&self.tx)
+    }
+
+    /// Whether an explicit transaction block is open on this session.
+    pub fn in_transaction(&self) -> bool {
+        self.tx.is_some()
+    }
+
+    /// Set the execution-cost ceiling (§5.2); `<= 0` ⇒ unlimited.
+    pub fn set_max_cost(&mut self, limit: i64) {
+        self.max_cost = limit;
+    }
+    /// The current execution-cost ceiling.
+    pub fn max_cost(&self) -> i64 {
+        self.max_cost
+    }
+    /// Set the maximum input SQL length in bytes; `0` ⇒ unlimited.
+    pub fn set_max_sql_length(&mut self, bytes: usize) {
+        self.max_sql_length = bytes;
+    }
+    /// The current input-SQL byte limit.
+    pub fn max_sql_length(&self) -> usize {
+        self.max_sql_length
+    }
+    /// Set the work-memory budget in bytes; `0` ⇒ unlimited.
+    pub fn set_work_mem(&mut self, bytes: usize) {
+        self.work_mem = bytes;
+    }
+    /// The current work-memory budget.
+    pub fn work_mem(&self) -> usize {
+        self.work_mem
+    }
+    /// Inject a random source for the uuid generators (entropy.md §6).
+    pub fn set_random_source(&mut self, f: crate::seam::RandomSource) {
+        self.seam.set_random(f);
+    }
+    /// Clear the injected random source (return to the OS CSPRNG).
+    pub fn clear_random_source(&mut self) {
+        self.seam.clear_random();
+    }
+    /// Inject a clock source for `uuidv7` / the clock functions (entropy.md §6).
+    pub fn set_clock_source(&mut self, f: crate::seam::ClockSource) {
+        self.seam.set_clock(f);
+    }
+    /// Clear the injected clock source (return to the wall clock).
+    pub fn clear_clock_source(&mut self) {
+        self.seam.clear_clock();
+    }
 }
 
 /// An open transaction (spec/design/transactions.md §4.2). `writable` is the access mode — READ
@@ -660,7 +823,7 @@ pub struct Database {
 /// `working` is the transaction's snapshot: for a writable tx it is mutated in place and published
 /// at commit; for a read-only tx it is the committed snapshot pinned at BEGIN (read-your-snapshot,
 /// never mutated). Either way `committed` is untouched until commit, so ROLLBACK just drops this.
-struct ActiveTx {
+pub(crate) struct ActiveTx {
     writable: bool,
     failed: bool,
     working: Snapshot,
@@ -691,22 +854,13 @@ impl Database {
     pub fn with_page_size(page_size: u32) -> Self {
         Database {
             committed: Snapshot::default(),
-            tx: None,
             path: None,
             page_size,
             page_count: 0,
             free_pages: Vec::new(),
             paging: None,
-            max_cost: 0,
-            max_sql_length: DEFAULT_MAX_SQL_LENGTH,
             read_only: false,
-            work_mem: crate::spill::DEFAULT_WORK_MEM,
-            seam: crate::seam::Seam::default(),
-            session_seq: HashMap::new(),
-            session_last_name: None,
-            pending_seq: std::cell::RefCell::new(HashMap::new()),
-            pending_currval: std::cell::RefCell::new(HashMap::new()),
-            pending_last_name: std::cell::RefCell::new(None),
+            session: Session::new(),
         }
     }
 
@@ -718,29 +872,20 @@ impl Database {
     pub(crate) fn from_snapshot(snap: Snapshot) -> Self {
         Database {
             committed: snap,
-            tx: None,
             path: None,
             page_size: DEFAULT_PAGE_SIZE,
             page_count: 0,
             free_pages: Vec::new(),
             paging: None,
-            max_cost: 0,
-            max_sql_length: DEFAULT_MAX_SQL_LENGTH,
             read_only: false,
-            work_mem: crate::spill::DEFAULT_WORK_MEM,
-            seam: crate::seam::Seam::default(),
-            session_seq: HashMap::new(),
-            session_last_name: None,
-            pending_seq: std::cell::RefCell::new(HashMap::new()),
-            pending_currval: std::cell::RefCell::new(HashMap::new()),
-            pending_last_name: std::cell::RefCell::new(None),
+            session: Session::new(),
         }
     }
 
     /// The snapshot a read sees: the open transaction's `working` (read-your-writes for a
     /// writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
     fn read_snap(&self) -> &Snapshot {
-        match &self.tx {
+        match &self.session.tx {
             Some(tx) => &tx.working,
             None => &self.committed,
         }
@@ -751,6 +896,7 @@ impl Database {
     /// correct flow.
     fn working_mut(&mut self) -> &mut Snapshot {
         &mut self
+            .session
             .tx
             .as_mut()
             .expect("a write statement runs within a transaction")
@@ -770,7 +916,7 @@ impl Database {
     /// A missing sequence is 42P01; advancing past a bound without CYCLE is 2200H.
     fn seq_nextval(&self, name: &str) -> Result<i64> {
         let key = name.to_ascii_lowercase();
-        let mut pending = self.pending_seq.borrow_mut();
+        let mut pending = self.session.pending_seq.borrow_mut();
         let mut def = match pending.get(&key) {
             Some(d) => d.clone(),
             None => self.read_snap().sequence(name).cloned().ok_or_else(|| {
@@ -818,10 +964,11 @@ impl Database {
         pending.insert(key.clone(), def);
         // nextval defines this session's currval for the sequence AND makes it the lastval target
         // (the most-recent-nextval sequence; lastval then reads its current session value — §6).
-        self.pending_currval
+        self.session
+            .pending_currval
             .borrow_mut()
             .insert(key.clone(), result);
-        *self.pending_last_name.borrow_mut() = Some(key);
+        *self.session.pending_last_name.borrow_mut() = Some(key);
         Ok(result)
     }
 
@@ -832,7 +979,7 @@ impl Database {
     /// false` leaves `currval` untouched). `setval` never updates `lastval` (PG — §6).
     fn seq_setval(&self, name: &str, n: i64, is_called: bool) -> Result<i64> {
         let key = name.to_ascii_lowercase();
-        let mut pending = self.pending_seq.borrow_mut();
+        let mut pending = self.session.pending_seq.borrow_mut();
         let mut def = match pending.get(&key) {
             Some(d) => d.clone(),
             None => self.read_snap().sequence(name).cloned().ok_or_else(|| {
@@ -856,7 +1003,7 @@ impl Database {
         pending.insert(key.clone(), def);
         // currval is defined only when is_called (PG do_setval: elm->last_valid set iff iscalled).
         if is_called {
-            self.pending_currval.borrow_mut().insert(key, n);
+            self.session.pending_currval.borrow_mut().insert(key, n);
         }
         Ok(n)
     }
@@ -869,10 +1016,11 @@ impl Database {
     /// name and its value both honor the statement's running updates over the session state.
     fn seq_lastval(&self) -> Result<i64> {
         let name = self
+            .session
             .pending_last_name
             .borrow()
             .clone()
-            .or_else(|| self.session_last_name.clone());
+            .or_else(|| self.session.session_last_name.clone());
         let key = match name {
             Some(k) => k,
             None => {
@@ -882,10 +1030,10 @@ impl Database {
                 ));
             }
         };
-        if let Some(v) = self.pending_currval.borrow().get(&key) {
+        if let Some(v) = self.session.pending_currval.borrow().get(&key) {
             return Ok(*v);
         }
-        if let Some(v) = self.session_seq.get(&key) {
+        if let Some(v) = self.session.session_seq.get(&key) {
             return Ok(*v);
         }
         // A nextval always defines the sequence's session value, so a recorded last-name with no
@@ -908,10 +1056,10 @@ impl Database {
             ));
         }
         let key = name.to_ascii_lowercase();
-        if let Some(v) = self.pending_currval.borrow().get(&key) {
+        if let Some(v) = self.session.pending_currval.borrow().get(&key) {
             return Ok(*v);
         }
-        if let Some(v) = self.session_seq.get(&key) {
+        if let Some(v) = self.session.session_seq.get(&key) {
             return Ok(*v);
         }
         Err(EngineError::new(
@@ -927,16 +1075,16 @@ impl Database {
     /// state is instead discarded (cleared at the next statement), giving the transactional rollback
     /// of the advance (sequences.md §5).
     fn flush_pending_sequences(&mut self) {
-        let pending = std::mem::take(&mut *self.pending_seq.borrow_mut());
+        let pending = std::mem::take(&mut *self.session.pending_seq.borrow_mut());
         for def in pending.into_values() {
             self.working_mut().put_sequence(def);
         }
-        let currvals = std::mem::take(&mut *self.pending_currval.borrow_mut());
+        let currvals = std::mem::take(&mut *self.session.pending_currval.borrow_mut());
         for (key, v) in currvals {
-            self.session_seq.insert(key, v);
+            self.session.session_seq.insert(key, v);
         }
-        if let Some(name) = self.pending_last_name.borrow_mut().take() {
-            self.session_last_name = Some(name);
+        if let Some(name) = self.session.pending_last_name.borrow_mut().take() {
+            self.session.session_last_name = Some(name);
         }
     }
 
@@ -947,10 +1095,28 @@ impl Database {
         self.committed.txid
     }
 
-    /// Whether an explicit transaction block is currently open (spec/design/transactions.md
-    /// §4.2). False under autocommit. Used by the host `Transaction` surface (api.md §6).
+    /// Whether an explicit transaction block is currently open on the **default session**
+    /// (spec/design/transactions.md §4.2). False under autocommit. Used by the host `Transaction`
+    /// surface (api.md §6).
     pub fn in_transaction(&self) -> bool {
-        self.tx.is_some()
+        self.session.tx.is_some()
+    }
+
+    /// The default session's transaction status (`Idle`/`Open`/`Failed`, spec/design/session.md
+    /// §2.2) — the explicit three-state machine the convenience methods drive.
+    pub fn status(&self) -> TxStatus {
+        self.session.status()
+    }
+
+    /// Mint an **additional** independent session over this database (spec/design/session.md §2.1),
+    /// configured from `opts`. The new session has its own settings, transaction status, and
+    /// sequence state; the committed storage is shared. On a single-threaded handle, additional
+    /// sessions run **sequentially** — a statement is issued through [`Session::execute`] /
+    /// [`Session::query`] (which swaps the session into the active slot for the call). The bare
+    /// `Database` keeps its long-lived default session, so this is purely additive.
+    pub fn session(&self, opts: SessionOptions) -> Session {
+        let _ = self;
+        Session::with_options(opts)
     }
 
     /// Whether the open transaction has been aborted (a statement errored → it is in the failed
@@ -958,7 +1124,7 @@ impl Database {
     /// ([`crate::shared`]) reads this at commit to know whether to publish (a failed block
     /// publishes nothing — a failed COMMIT is a ROLLBACK, PostgreSQL).
     pub(crate) fn tx_failed(&self) -> bool {
-        self.tx.as_ref().is_some_and(|t| t.failed)
+        self.session.tx.as_ref().is_some_and(|t| t.failed)
     }
 
     /// The monotonic commit counter (spec/design/api.md §2): 0 for a fresh in-memory database,
@@ -987,7 +1153,7 @@ impl Database {
     /// `limit <= 0` (the default) is **unlimited**. The primary guard for safely evaluating
     /// untrusted, user-supplied queries; a handle setting, not stored in the file.
     pub fn set_max_cost(&mut self, limit: i64) {
-        self.max_cost = limit;
+        self.session.max_cost = limit;
     }
 
     /// Set the maximum input SQL length, in **bytes**, accepted on this handle (CLAUDE.md §13;
@@ -996,12 +1162,12 @@ impl Database {
     /// (a trusted caller's opt-out); the default is [`DEFAULT_MAX_SQL_LENGTH`] (1 MiB). A handle
     /// setting, not stored in the file (mirrors `set_max_cost`).
     pub fn set_max_sql_length(&mut self, bytes: usize) {
-        self.max_sql_length = bytes;
+        self.session.max_sql_length = bytes;
     }
 
     /// The current input-SQL byte limit (`0` ⇒ unlimited). See [`set_max_sql_length`](Database::set_max_sql_length).
     pub fn max_sql_length(&self) -> usize {
-        self.max_sql_length
+        self.session.max_sql_length
     }
 
     /// Whether this handle was opened read-only (spec/design/api.md §2.1): every transaction
@@ -1012,7 +1178,7 @@ impl Database {
 
     /// The current execution-cost ceiling (`0` ⇒ unlimited). See [`set_max_cost`](Database::set_max_cost).
     pub fn max_cost(&self) -> i64 {
-        self.max_cost
+        self.session.max_cost
     }
 
     /// Inject a random source for the uuid generators (spec/design/entropy.md §6) — the
@@ -1020,25 +1186,25 @@ impl Database {
     /// for a byte-identical cross-core stream (the conformance path; tests use the `# seed:`
     /// directive). A handle setting, not stored in the file.
     pub fn set_random_source(&mut self, f: crate::seam::RandomSource) {
-        self.seam.set_random(f);
+        self.session.seam.set_random(f);
     }
 
     /// Clear the injected random source: the generators return to the OS CSPRNG, drawn per value
     /// (production — unpredictable output).
     pub fn clear_random_source(&mut self) {
-        self.seam.clear_random();
+        self.session.seam.clear_random();
     }
 
     /// Inject a clock source for `uuidv7` (entropy.md §6) — e.g. [`fixed_clock`](crate::seam::fixed_clock)
     /// (the `# clock:` directive). After this, `uuidv7()` embeds the source's instant instead of the
     /// wall clock. A handle setting, not stored in the file.
     pub fn set_clock_source(&mut self, f: crate::seam::ClockSource) {
-        self.seam.set_clock(f);
+        self.session.seam.set_clock(f);
     }
 
     /// Clear the injected clock source: `uuidv7` returns to reading the wall clock (production).
     pub fn clear_clock_source(&mut self) {
-        self.seam.clear_clock();
+        self.session.seam.clear_clock();
     }
 
     /// Set the work-memory budget (in **bytes**) for blocking operators run on this handle
@@ -1048,12 +1214,12 @@ impl Database {
     /// invariant — spill.md §6), only when an operator spills; an in-memory database ignores it (no
     /// file to spill to). A handle setting, not stored in the file (mirrors `set_max_cost`).
     pub fn set_work_mem(&mut self, bytes: usize) {
-        self.work_mem = bytes;
+        self.session.work_mem = bytes;
     }
 
     /// The current work-memory budget in bytes (`0` ⇒ unlimited). See [`set_work_mem`](Database::set_work_mem).
     pub fn work_mem(&self) -> usize {
-        self.work_mem
+        self.session.work_mem
     }
 
     /// The backing file path, or `None` for an in-memory database.
@@ -1140,14 +1306,14 @@ impl Database {
         }
         // Fresh per-statement sequence-advance scratch (a prior statement's error may have left it
         // populated — it is discarded, not flushed, on error; sequences.md §5).
-        self.pending_seq.borrow_mut().clear();
-        self.pending_currval.borrow_mut().clear();
-        *self.pending_last_name.borrow_mut() = None;
+        self.session.pending_seq.borrow_mut().clear();
+        self.session.pending_currval.borrow_mut().clear();
+        *self.session.pending_last_name.borrow_mut() = None;
 
         // Inside an explicit block? Read the flags, dropping the borrow before dispatch.
-        if self.tx.is_some() {
+        if self.session.tx.is_some() {
             let (failed, writable) = {
-                let tx = self.tx.as_ref().expect("tx is open");
+                let tx = self.session.tx.as_ref().expect("tx is open");
                 (tx.failed, tx.writable)
             };
             if failed {
@@ -1173,7 +1339,7 @@ impl Database {
                 // them, ROLLBACK discards them with the rest of the working set (sequences.md §5).
                 self.flush_pending_sequences();
             } else {
-                self.tx.as_mut().expect("tx is open").failed = true;
+                self.session.tx.as_mut().expect("tx is open").failed = true;
             }
             return result;
         }
@@ -1197,12 +1363,12 @@ impl Database {
                 ),
             ));
         }
-        self.tx = Some(ActiveTx {
+        self.session.tx = Some(ActiveTx {
             writable: true,
             failed: false,
             working: self.committed.clone(),
-            saved_session_seq: self.session_seq.clone(),
-            saved_session_last_name: self.session_last_name.clone(),
+            saved_session_seq: self.session.session_seq.clone(),
+            saved_session_last_name: self.session.session_last_name.clone(),
         });
         match self.dispatch_stmt(stmt, params) {
             Ok(outcome) => {
@@ -1214,7 +1380,7 @@ impl Database {
             Err(e) => {
                 // The statement failed before any flush, so session state is untouched; restore
                 // from the captured copy anyway to keep the discard path uniform (sequences.md §6).
-                if let Some(tx) = self.tx.take() {
+                if let Some(tx) = self.session.tx.take() {
                     self.restore_session_state(tx);
                 }
                 Err(e)
@@ -1231,7 +1397,7 @@ impl Database {
     /// (read-your-snapshot, §4.3). Cheap: the persistent stores clone O(1) (pmap.rs) and the
     /// catalog is a shallow copy. `committed` is untouched until commit.
     pub(crate) fn begin_tx(&mut self, writable: Option<bool>) -> Result<Outcome> {
-        if self.tx.is_some() {
+        if self.session.tx.is_some() {
             return Err(EngineError::new(
                 SqlState::ActiveSqlTransaction,
                 "there is already a transaction in progress",
@@ -1243,12 +1409,12 @@ impl Database {
                 "cannot set transaction read-write mode on a read-only database",
             ));
         }
-        self.tx = Some(ActiveTx {
+        self.session.tx = Some(ActiveTx {
             writable: writable.unwrap_or(!self.read_only),
             failed: false,
             working: self.committed.clone(),
-            saved_session_seq: self.session_seq.clone(),
-            saved_session_last_name: self.session_last_name.clone(),
+            saved_session_seq: self.session.session_seq.clone(),
+            saved_session_last_name: self.session.session_last_name.clone(),
         });
         Ok(Outcome::Statement {
             cost: 0,
@@ -1260,8 +1426,8 @@ impl Database {
     /// captured copy (spec/design/sequences.md §5/§6) — the rollback of any in-block `nextval`/
     /// `setval` session updates. Called wherever a transaction is dropped without publishing.
     fn restore_session_state(&mut self, tx: ActiveTx) {
-        self.session_seq = tx.saved_session_seq;
-        self.session_last_name = tx.saved_session_last_name;
+        self.session.session_seq = tx.saved_session_seq;
+        self.session.session_last_name = tx.saved_session_last_name;
     }
 
     /// Commit the current transaction (spec/design/transactions.md §4.2). With no open block it is
@@ -1272,7 +1438,7 @@ impl Database {
     /// the §3 short commit window. A durable-write failure leaves `committed` untouched and
     /// propagates (the commit failed; the working set is discarded). Returns to autocommit.
     pub(crate) fn commit_tx(&mut self) -> Result<Outcome> {
-        let tx = match self.tx.take() {
+        let tx = match self.session.tx.take() {
             None => {
                 return Ok(Outcome::Statement {
                     cost: 0,
@@ -1312,7 +1478,7 @@ impl Database {
     /// `currval`/`lastval` session state, however, was updated in place by in-block `nextval`/
     /// `setval`, so it is restored from the block's captured copy (sequences.md §5/§6).
     pub(crate) fn rollback_tx(&mut self) -> Result<Outcome> {
-        if let Some(tx) = self.tx.take() {
+        if let Some(tx) = self.session.tx.take() {
             self.restore_session_state(tx);
         }
         Ok(Outcome::Statement {
@@ -2477,7 +2643,7 @@ impl Database {
         // row, with the indexed columns as the touched set (fixed-width — the chain/decompress
         // terms are structurally zero). An empty table charges 0. The entries are computed
         // here, against the pre-index store; the writes below are unmetered.
-        let mut meter = Meter::with_limit(self.max_cost);
+        let mut meter = Meter::with_limit(self.session.max_cost);
         let mut mask = vec![false; columns.len()];
         for &c in &cols {
             mask[c] = true;
@@ -3062,7 +3228,7 @@ impl Database {
                 // compression attempts for over-RECORD_MAX rows (value_compress) and the
                 // RETURNING projection. The meter is created here (before materialization) so a
                 // `DEFAULT`-keyword expression default charges it too.
-                let mut meter = Meter::with_limit(self.max_cost);
+                let mut meter = Meter::with_limit(self.session.max_cost);
 
                 // Materialize each row into its value-position-indexed candidates (length
                 // `arity`, checked above), resolving each slot: a literal, a bound `$N`, or a
@@ -3165,7 +3331,7 @@ impl Database {
                     None => None,
                 };
                 let bound = bind_params(params, &ptypes.finalize()?)?;
-                let mut meter = Meter::with_limit(self.max_cost);
+                let mut meter = Meter::with_limit(self.session.max_cost);
                 self.fold_uncorrelated_in_plan(
                     &mut plan,
                     &bound,
@@ -4351,7 +4517,7 @@ impl Database {
         // correlated one stays and re-runs per row via the per-row outer environment below.
         // The uncorrelated execution reads the pre-DELETE snapshot (we collect keys before
         // mutating), matching PostgreSQL.
-        let mut meter = Meter::with_limit(self.max_cost);
+        let mut meter = Meter::with_limit(self.session.max_cost);
         if let Some(f) = &mut filter {
             self.fold_uncorrelated_in_rexpr(f, &bound, CteCtx::empty(), &mut meter.accrued)?;
         }
@@ -4655,7 +4821,7 @@ impl Database {
         // cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and
         // re-runs per row via the outer environment. The uncorrelated execution reads the
         // pre-UPDATE snapshot (phase 1 only reads; phase 2 writes), matching PostgreSQL.
-        let mut meter = Meter::with_limit(self.max_cost);
+        let mut meter = Meter::with_limit(self.session.max_cost);
         for plan in &mut plans {
             self.fold_uncorrelated_in_rexpr(
                 &mut plan.source,
@@ -5363,7 +5529,7 @@ impl Database {
             rng: &stmt_rng,
             ctes,
         };
-        let mut meter = Meter::with_limit(self.max_cost);
+        let mut meter = Meter::with_limit(self.session.max_cost);
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(plan.rows.len());
         for row in &plan.rows {
             meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -6303,7 +6469,7 @@ impl Database {
         } else {
             None
         };
-        crate::spill::Sorter::new(order.to_vec(), self.work_mem, spill_dir)
+        crate::spill::Sorter::new(order.to_vec(), self.session.work_mem, spill_dir)
     }
 
     /// Materialize one FROM relation `ri` into its rows, given the current outer-row stack `outer`
@@ -6444,7 +6610,7 @@ impl Database {
             rng: &stmt_rng,
             ctes,
         };
-        let mut meter = Meter::with_limit(self.max_cost);
+        let mut meter = Meter::with_limit(self.session.max_cost);
 
         // LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no
         // blocking operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project
@@ -17176,13 +17342,13 @@ impl RExpr {
                     // NULL-arg case (uuidv7(NULL)) already returned NULL above.
                     ScalarFunc::Uuidv4 => {
                         let mut r = env.rng.get();
-                        let b = r.uuid_v4(&env.exec.seam)?;
+                        let b = r.uuid_v4(&env.exec.session.seam)?;
                         env.rng.set(r);
                         Ok(Value::Uuid(b))
                     }
                     ScalarFunc::Uuidv7 => {
                         let mut r = env.rng.get();
-                        let clock = r.statement_clock_micros(&env.exec.seam);
+                        let clock = r.statement_clock_micros(&env.exec.session.seam);
                         // The optional interval arg shifts the embedded instant via the existing
                         // calendar-aware timestamptz arithmetic (entropy.md §4).
                         let shifted = match vals.first() {
@@ -17194,7 +17360,7 @@ impl RExpr {
                             }
                             None => clock,
                         };
-                        let b = r.uuid_v7(&env.exec.seam, shifted)?;
+                        let b = r.uuid_v7(&env.exec.session.seam, shifted)?;
                         env.rng.set(r);
                         Ok(Value::Uuid(b))
                     }
@@ -17203,13 +17369,13 @@ impl RExpr {
                     // call (VOLATILE). Both return the seam's micros directly as timestamptz.
                     ScalarFunc::Now => {
                         let mut r = env.rng.get();
-                        let micros = r.statement_clock_micros(&env.exec.seam);
+                        let micros = r.statement_clock_micros(&env.exec.session.seam);
                         env.rng.set(r);
                         Ok(Value::Timestamptz(micros))
                     }
                     ScalarFunc::ClockTimestamp => {
                         let r = env.rng.get();
-                        let micros = r.clock_now_micros(&env.exec.seam);
+                        let micros = r.clock_now_micros(&env.exec.session.seam);
                         Ok(Value::Timestamptz(micros))
                     }
                     // Sequence value functions (spec/design/sequences.md §4/§6). nextval charges an

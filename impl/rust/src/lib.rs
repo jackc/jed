@@ -45,7 +45,10 @@ pub mod value;
 pub use api::{PreparedStatement, Rows, Transaction};
 pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
-pub use executor::{DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Database, Outcome, Snapshot};
+pub use executor::{
+    DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Database, Outcome, Session, SessionOptions,
+    Snapshot, TxStatus,
+};
 pub use file::{DatabaseOptions, OpenOptions};
 pub use parser::Parser;
 pub use shared::{ReadHandle, SharedDb, WriteHandle};

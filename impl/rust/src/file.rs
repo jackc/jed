@@ -141,7 +141,7 @@ impl Database {
         let mut db = Database::open_paged(pager, capacity)?;
         db.path = Some(path.to_path_buf());
         db.read_only = opts.read_only;
-        db.work_mem = opts.work_mem;
+        db.session.work_mem = opts.work_mem;
         Ok(db)
     }
 
