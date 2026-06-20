@@ -1,0 +1,18 @@
+# jed dev collation root — a small hand-authored DUCET subset (NOT the version-pinned real DUCET).
+# Format: Unicode allkeys.txt subset (spec/collation/README.md §1.1).
+#   <codepoint>(' '<codepoint>)* ';' <element>+ ('#' comment)?
+#   element = '[' ('.'|'*') l1 '.' l2 '.' l3 ']'   (16-bit hex weights; '*' = variable)
+# Weights are illustrative DUCET-style values: L1 by alphabetical order, L2 = 0020 base,
+# L3 = 0002 lowercase / 0008 uppercase. 'ä'/'Ä' = a's primary + a secondary accent CE
+# (an expansion), so under this root they sort *near a* by primary.
+@version 0.0.0-dev
+
+0020 ; [*0209.0020.0002]  # SPACE                       (variable)
+0061 ; [.1C47.0020.0002]  # a   LATIN SMALL LETTER A
+0041 ; [.1C47.0020.0008]  # A   LATIN CAPITAL LETTER A
+00E4 ; [.1C47.0020.0002][.0000.0047.0002]  # ä  a-primary + diaeresis secondary accent (expansion)
+00C4 ; [.1C47.0020.0008][.0000.0047.0002]  # Ä  A-primary + diaeresis secondary accent (expansion)
+0062 ; [.1C60.0020.0002]  # b   LATIN SMALL LETTER B
+0042 ; [.1C60.0020.0008]  # B   LATIN CAPITAL LETTER B
+007A ; [.1E0B.0020.0002]  # z   LATIN SMALL LETTER Z
+005A ; [.1E0B.0020.0008]  # Z   LATIN CAPITAL LETTER Z

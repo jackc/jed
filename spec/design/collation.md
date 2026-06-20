@@ -21,13 +21,17 @@
 > [determinism.md §3](determinism.md); the cost contract in [cost.md](cost.md); the
 > data-over-code framing in [extensibility.md §4.1](extensibility.md).
 >
-> **Status: design only — ratified spec-first, not yet implemented.** No core ships a
-> non-`C` collation today; `text` is `C` (byte / code-point order) and needs **zero data**
-> ([types.md §11](types.md)). This document is the design the implementation slices land
-> against (§14), authored ahead of code exactly as the text/decimal key-encoding rules were
-> ([encoding.md §2.4](encoding.md) "authored, not yet exercised"). It pins no `format_version`
-> or `type_code` number: the version bump and the new catalog `entry_kind` are claimed at the
-> implementation slice, against whatever the master tip is then.
+> **Status: design ratified; slice 1a (the byte-format foundation) authored; no core code yet.**
+> No core ships a non-`C` collation today; `text` is `C` (byte / code-point order) and needs
+> **zero data** ([types.md §11](types.md)). **Slice 1a** has landed the byte-format foundation in
+> [../collation/README.md](../collation/README.md) (the definition format, the compiled-table
+> layout, the `.coll` artifact, the sort key) plus the dev fixtures — authored ahead of code
+> exactly as the text/decimal key-encoding rules were ([encoding.md §2.4](encoding.md) "authored,
+> not yet exercised"). The implementation slices (§14) land against it. Two decisions are
+> **confirmed**: the definition format is the **UCA/CLDR standards** (DUCET `allkeys.txt` + LDML),
+> and the cores build **`CompileCollation` in-core first** (no external authoring tool). This doc
+> pins no `format_version` or `type_code` number: the version bump and the new catalog
+> `entry_kind` are claimed at slice 1d, against whatever the master tip is then.
 
 Collation is the rule for **ordering and equating** text, layered on the *encoding* (which
 maps characters to bytes — jed commits to UTF-8 everywhere). jed ships exactly one collation
@@ -291,8 +295,9 @@ table:
 2. **Multi-level weights / sort key.** Each element carries weights at levels: **L1 primary**
    (base letter — `a`=`A`=`á`), **L2 secondary** (accents — `a`<`á`), **L3 tertiary** (case —
    `a`<`A`), and a final **identical** level (code point, the `C` tie-break). Build the **sort
-   key** by concatenating all L1 weights, a separator, all L2, a separator, all L3, … then the
-   identical-level code points.
+   key** by concatenating all L1 weights, a separator, all L2, a separator, all L3, a separator,
+   then the identical level (the §2.4 C-key of the original string). Byte-exact in
+   [../collation/README.md §4](../collation/README.md).
 3. **Compare** by `memcmp` of sort keys — equal to the collation's logical order by
    construction. The sort key is the bridge to memcmp storage (§8).
 
@@ -342,13 +347,17 @@ key** (§6): the key bytes are *not* the raw UTF-8 (that is the `C` special case
 order by construction.
 
 The collated text key component (a new sub-section of [encoding.md §2](encoding.md), authored
-when the slice lands, mirroring §2.4):
+when the slice lands, mirroring §2.4); the byte-exact layout is pinned in
+[../collation/README.md §4](../collation/README.md):
 
 ```
-sortkey(L1) 0x00 sortkey(L2) 0x00 sortkey(L3) 0x00  ‖  C-key(original UTF-8 via §2.4)
+L1-weights ‖ 0x0000 ‖ L2-weights ‖ 0x0000 ‖ L3-weights ‖ 0x0000 ‖ C-key(original UTF-8 via §2.4)
 ```
 
-- The **level-separated sort key** orders the entry by the collation.
+- The **level-separated sort key** orders the entry by the collation. Weights are `u16`
+  big-endian and every emitted weight is `≥ 0x0001` (ignorable `0x0000` weights are skipped), so
+  the two-byte `0x0000` level separator sorts **before** any weight — a level that is a prefix of
+  another's sorts first ([../collation/README.md §4](../collation/README.md)).
 - The appended **`C`-key of the original string** ([encoding.md §2.4](encoding.md)) does two
   jobs at once: it is the **identical-level tie-break** (totality, §6) *and* it makes the
   original **recoverable from the key** — required for a `PRIMARY KEY`, since a sort key alone is
@@ -381,17 +390,20 @@ determinism and portability:
   is the same bytes in catalog framing.
 
 **`spec/collation/`** (a new spec data directory, parallel to `spec/encoding/`) holds the
-**pinned fixtures and byte vectors** — *repo data, not shipped in the binary* — used by the
-corpus and goldens:
+**byte-format spec, fixtures, and verification vectors** — *repo data, not shipped in the
+binary* — used by the corpus and goldens. The **byte formats are pinned in
+[../collation/README.md](../collation/README.md)** (the definition format §1, the compiled table
+§2, the `.coll` artifact §3, the sort key §4 — authored in slice 1a). The directory holds:
 
-- a pinned `(unicode_version, cldr_version)` for the fixtures,
-- a small **root definition fixture** + a handful of **tailoring fixtures** (`en-US`, `de`,
-  `fr`, `es`, `sv`, `da` — the last two for the sharp `å ä ö`/`æ ø` after-`z` cases that make
-  memorable tests),
+- the **definition format spec** (DUCET `allkeys.txt` subset + LDML tailoring subset) and the
+  pinned `(unicode_version, cldr_version)` of the real root when it lands,
+- a small **root definition fixture** + at least one **tailoring fixture** (the dev fixtures
+  `dev-root.allkeys` + `dev-nordic.ldml` in 1a; the curated `en-US`, `de`, `fr`, `es`, `sv`, `da`
+  set — the last two for the sharp `å ä ö`/`æ ø` after-`z` cases — as a follow-on),
 - the **saved artifacts** those definitions compile to (`.coll` files) — what the corpus
   `OpenCollation`s for a deterministic, host-free load,
 - **compiler vectors** — `(definition fixture) → (expected artifact / jed table bytes)`,
-- **executor / sort-key vectors** — `(table, string) → (sort-key bytes)`, the §8 byte-fixture
+- **executor / sort-key vectors** — `(collation, string) → (sort-key bytes)`, the §8 byte-fixture
   pattern (CLAUDE.md §8) and the primary cross-core contract for the algorithm.
 
 These exist so the corpus can load collations *deterministically* — `OpenCollation` (or
@@ -484,30 +496,46 @@ pays nothing.
 
 ## 14. Deferred narrowings and slice plan
 
-Each is a relaxable narrowing / its own follow-on, in rough dependency order:
+**Slice 1 — the compile + serialize + execute core — is itself decomposed into vertical
+sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
 
-1. **The compile + serialize + execute core** — `CompileCollation` (deterministic) and the
-   canonical definition format (§9), the **`Collation` artifact** with `SaveCollation`/
-   `OpenCollation` (§4), `db.ImportCollation`/`ExportCollation` (baked, §5), the compiler + UCA
-   executor (§6), the per-column + per-database default collation (§1/§5), the sort-key key
-   encoding (§8), the provenance description (§1/§5), and the artifact/compiler/sort-key/golden
-   fixtures (§9/§10). The load-bearing slice; one root definition is enough end to end, and the
-   corpus drives it host-free via `OpenCollation` from a fixture.
-2. **`ExtractHostCollation`** (the host seam, §4) — per core, per platform; tested per core
-   (§10); auto-fills the provenance description. Lands after slice 1 since the corpus never uses
-   it.
-3. **Reference mode** (name+hash, re-import + hash-check on open, §3) — the small-footprint
-   opt-out.
-4. **Curated tailorings** (`en-US`, `de`, `fr`, `es`, `sv`, `da`, §9) — fixtures + conformance
-   entries; no engine change.
-5. **`LIKE` / pattern matching under a non-`C` collation** (§7) — lift the byte-semantics
-   narrowing.
-6. **CLDR `shifted` variable weighting** per locale (§6) — refine away `non-ignorable`, pinned
-   to the oracle.
-7. **Nondeterministic collations** (case/accent-insensitive *equality*, §6) — the big one:
-   forces the UNIQUE-collision / DISTINCT / GROUP BY / hashing / pattern paths to be handled.
-8. **CJK (Han) collation** (§13 outlier) — a multi-MB tailoring; gate explicitly on the
-   per-file footprint trade.
+- **1a — byte-format foundation** ✅ *landed*: `spec/collation/` — the definition format (DUCET
+  `allkeys.txt` + LDML, §9), the compiled-table layout, the `.coll` artifact, and the sort key
+  ([../collation/README.md §1–§4](../collation/README.md)), plus the dev fixtures
+  (`dev-root.allkeys` + `dev-nordic.ldml`). Spec/data only, no core code.
+- **1b — `CompileCollation` + UCA executor**, all three cores (compiler-first, §6): parse a
+  definition → compiled table; generate sort keys; `SaveCollation`/`OpenCollation` round-trip.
+  Host-free, verified by the compiler + sort-key vectors (§9/§10) and the artifact round-trip. No
+  SQL surface, no persistence — the riskiest cross-core piece, isolated.
+- **1c — first end-to-end (in-memory)**: `COLLATE` grammar + resolver (collation derivation,
+  `42P22`, `42704`), `db.ImportCollation` into an **in-memory** database (no format change yet —
+  in-memory `commit` is a no-op, [api.md](api.md)), `ORDER BY … COLLATE` + collated comparison;
+  the corpus fixture-load directive that drives it deterministically (§10). The "it's alive"
+  milestone for collation.
+- **1d — on-disk baking**: the `format_version` bump + the `entry_kind` 3 snapshot + the
+  per-database default-collation field (§5); `db.ImportCollation` (baked) persisting,
+  `db.ExportCollation`, `db.SetDefaultCollation` + un-annotated-column inheritance (§1); the
+  provenance description persisted (§1/§5); a golden DB (`rust == go == ts == ruby`, §10).
+- **1e — collated keys**: the sort-key key encoding (§8) as a new [encoding.md](encoding.md)
+  sub-section, a collated text `PRIMARY KEY` / index / `UNIQUE`, byte fixtures + a golden with a
+  collated index.
+
+**Later follow-ons** (each its own slice, after slice 1):
+
+- **Host seam — `ExtractHostCollation`** (§4) — per core, per platform; tested per core (§10);
+  auto-fills the provenance description. The corpus never uses it.
+- **Reference mode** (name+hash, re-import + hash-check on open, §3) — the small-footprint
+  opt-out.
+- **Curated tailorings** (`en-US`, `de`, `fr`, `es`, `sv`, `da`, §9) and the **version-pinned
+  real DUCET** (replacing the dev fixture) — fixtures + conformance entries; no engine change.
+- **`LIKE` / pattern matching under a non-`C` collation** (§7) — lift the byte-semantics
+  narrowing.
+- **CLDR `shifted` variable weighting** per locale (§6) — refine away `non-ignorable`, pinned
+  to the oracle.
+- **Nondeterministic collations** (case/accent-insensitive *equality*, §6) — the big one:
+  forces the UNIQUE-collision / DISTINCT / GROUP BY / hashing / pattern paths to be handled.
+- **CJK (Han) collation** (§13 outlier) — a multi-MB tailoring; gate explicitly on the
+  per-file footprint trade.
 
 A SQL surface for loading (e.g. a privileged `CREATE COLLATION … FROM HOST | FROM DEFINITION`)
 is a possible later addition, but the **primary surface is the host API** (§1/§11): loading

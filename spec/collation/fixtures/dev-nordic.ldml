@@ -1,0 +1,9 @@
+# jed dev collation tailoring — Nordic-style, over dev-root.allkeys.
+# Format: LDML collation rule subset (spec/collation/README.md §1.2).
+#   & <anchor>  resets the position; then < (primary)  << (secondary)  <<< (tertiary)  = (identical)
+# Effect: move 'ä' (and 'Ä' as a tertiary case variant) to sort AFTER 'z' at the primary level,
+# the sharp Nordic case that visibly disagrees with the root (where 'ä' sorts near 'a').
+#
+# dev-root    :  ' ' < a < A < ä < Ä < b < B < z < Z
+# dev-nordic  :  ' ' < a < A < b < B < z < Z < ä < Ä
+&z < ä <<< Ä
