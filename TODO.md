@@ -931,14 +931,25 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         (`BEGIN`/`COMMIT`/`ROLLBACK`) is **`0A000`** — the implicit wrapper owns the boundary;
         PG-simple-query partitioning is deferred (session.md §11). No new error code, no format
         change, no capability flag. → [session.md §4](spec/design/session.md) _(§4)_
-  - [ ] **S3 — privileges (the GRANT/REVOKE model)** — per-table `SELECT`/`INSERT`/`UPDATE`/`DELETE`
-        + per-function `EXECUTE`, expressed as a session `default_privileges` set (granted to all
-        tables — replaces the read-only/read-write boolean) plus per-object `grant`/`revoke` deltas
-        (revoke wins), and an `allow_ddl` gate; enforced at name resolution with **`42501
-        insufficient_privilege`** (NOT RBAC — the host holds the grants, §3/§13; the physical
-        read-only file / `READ ONLY` txn `25006` gate stays orthogonal at the Database/txn layer).
-        Capabilities `session.privileges` / `session.allow_ddl`; `# default_privileges:` /
-        `# grant:` / `# revoke:` / `# allow_ddl:` directives. _(size: M; §5.3/§13)_
+  - [x] **S3 — privileges (the GRANT/REVOKE model)** — ✅ **landed (all 3 cores).** Per-table
+        `SELECT`/`INSERT`/`UPDATE`/`DELETE` + per-function `EXECUTE`, expressed as a session
+        `default_privileges` set (granted to all tables — replaces the read-only/read-write boolean)
+        plus per-object `grant`/`revoke` deltas (revoke wins), and an `allow_ddl` gate; collected by
+        an exhaustive per-statement AST walk (the `seq_mutator`-walk precedent) and enforced at the
+        executor's `dispatch_stmt` seam with **`42501 insufficient_privilege`** — DDL by `allow_ddl`,
+        a table privilege only for a name that **resolves to an existing catalog table** (a missing
+        table stays `42P01`; CTE/derived labels skipped), a function by `EXECUTE`. A fully-permissive
+        session (the default) skips the walk, so the common path is untouched (NOT RBAC — the host
+        holds the grants, §3/§13; the physical read-only file / `READ ONLY` txn `25006` gate stays
+        orthogonal at the Database/txn layer). New module `privileges.{rs,go,ts}` (`Privilege` /
+        `PrivilegeSet` bitset / `Privileges` envelope); registers `42501` in the registry; **no
+        on-disk format change** (the envelope is session state, never persisted). The SQL-observable
+        `42501` is **cross-core corpus-tested** (`suites/session/privileges.test`, jed-specific so not
+        oracle-checked), the host-API surface per-core unit tested (`privileges.rs`/`privileges_test.go`/
+        `privileges.test.ts`). Capabilities `session.privileges` / `session.allow_ddl`;
+        `# default_privileges:` / `# grant:` / `# revoke:` / `# allow_ddl:` directives. **v1 narrowing:**
+        function `EXECUTE` defaults on (deny-list via `revoke`); the allow-list (default-off) is
+        deferred (§11). Green: conformance 163/0 ×3, full suites. _(§5.3/§13)_
   - [ ] **S4 — session lifetime cost budget** — a per-session cumulative cost meter aborting with
         **`54P02 session_cost_limit_exceeded`** (new `P`-subclass code) when it reaches
         `lifetime_max_cost`; deterministic, pinned by an ordered multi-statement schedule. Registers

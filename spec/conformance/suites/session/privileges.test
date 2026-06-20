@@ -1,0 +1,150 @@
+# Session authorization — the GRANT/REVOKE privilege envelope (spec/design/session.md §5.3).
+# CLAUDE.md §3 deletes in-database users/roles, so authorization is NOT a permission catalog: the
+# host configures a per-object privilege envelope on the session and the engine mechanically
+# enforces it (42501) at name resolution. This behavior is jed-specific — the envelope is
+# host-configured, not reachable as SQL roles — so the suite is CROSS-CORE-checked (every core must
+# agree), NOT PostgreSQL-oracle-checked (it cannot reproduce the host envelope via the same SQL).
+#
+# Four stock-runner-ignored directives configure the session for the NEXT record and reset after
+# (like `# seed:` / `# max_cost:`): `# default_privileges: PRIVS` (the GRANT … ON ALL TABLES default,
+# NONE / ALL accepted), `# grant: PRIVS ON object`, `# revoke: PRIVS ON object` (revoke wins), and
+# `# allow_ddl: on|off`. Effective privilege for OP on object X is OP ∈ (default ∪ grant[X]) \
+# revoke[X]. Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.select_no_from, query.where_eq, query.cte, func.abs, types.i32, session.privileges, session.allow_ddl
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+# --- default_privileges scopes the four table privileges -----------------------------------------
+
+# A read-only envelope (the {SELECT} default) permits SELECT...
+# default_privileges: SELECT
+query I nosort
+SELECT v FROM t WHERE id = 1
+----
+10
+
+# ...but rejects every write with 42501.
+# default_privileges: SELECT
+statement error 42501
+INSERT INTO t VALUES (4, 40)
+
+# default_privileges: SELECT
+statement error 42501
+UPDATE t SET v = 0 WHERE id = 1
+
+# default_privileges: SELECT
+statement error 42501
+DELETE FROM t WHERE id = 1
+
+# An empty envelope (NONE) withholds SELECT too.
+# default_privileges: NONE
+statement error 42501
+SELECT v FROM t
+
+# A query that reads no catalog table is unaffected by the table envelope.
+# default_privileges: NONE
+query I nosort
+SELECT 1
+----
+1
+
+# A CTE name is statement-local, not a catalog object — it needs no table privilege.
+# default_privileges: NONE
+query I nosort
+WITH c AS (SELECT 1) SELECT * FROM c
+----
+1
+
+# --- grant adds privileges beyond the default ----------------------------------------------------
+
+# A bare INSERT (no read) needs only INSERT — granted over a NONE default, it succeeds.
+# default_privileges: NONE
+# grant: INSERT ON t
+statement ok
+INSERT INTO t VALUES (5, 50)
+
+# SELECT granted over NONE permits the read of the row just inserted.
+# default_privileges: NONE
+# grant: SELECT ON t
+query I nosort
+SELECT v FROM t WHERE id = 5
+----
+50
+
+# --- revoke wins over grant and the default ------------------------------------------------------
+
+# Revoking INSERT over the full default blocks the write...
+# revoke: INSERT ON t
+statement error 42501
+INSERT INTO t VALUES (6, 60)
+
+# ...and revoke beats a contradictory grant on the same object (deny wins, order-independent).
+# grant: INSERT ON t
+# revoke: INSERT ON t
+statement error 42501
+INSERT INTO t VALUES (6, 60)
+
+# Revoking SELECT blocks the read.
+# revoke: SELECT ON t
+statement error 42501
+SELECT v FROM t
+
+# --- the two privileges an UPDATE needs compose --------------------------------------------------
+
+# UPDATE both reads (WHERE) and writes, so it needs SELECT *and* UPDATE; UPDATE alone is rejected.
+# default_privileges: UPDATE
+statement error 42501
+UPDATE t SET v = 0 WHERE id = 1
+
+# With both privileges it succeeds.
+# default_privileges: SELECT, UPDATE
+statement ok
+UPDATE t SET v = 11 WHERE id = 1
+
+# --- existence is checked before authorization ---------------------------------------------------
+
+# A missing table is 42P01 even under an empty envelope — authorization gates only resolved objects.
+# default_privileges: NONE
+statement error 42P01
+SELECT * FROM does_not_exist
+
+# --- function EXECUTE ----------------------------------------------------------------------------
+
+# Functions default to EXECUTE granted on all.
+query I nosort
+SELECT abs(-5)
+----
+5
+
+# Revoking EXECUTE on a function blocks calls to it (the determinism-pinning use case).
+# revoke: EXECUTE ON abs
+statement error 42501
+SELECT abs(-5)
+
+# --- allow_ddl gates schema changes --------------------------------------------------------------
+
+# DDL denied → 42501, CREATE and DROP alike.
+# allow_ddl: off
+statement error 42501
+CREATE TABLE u (id i32 PRIMARY KEY)
+
+# allow_ddl: off
+statement error 42501
+DROP TABLE t
+
+# DML is unaffected by allow_ddl — only schema changes are gated.
+# allow_ddl: off
+query I nosort
+SELECT v FROM t WHERE id = 1
+----
+11
+
+# A constant-only UPDATE (no WHERE / RETURNING, a literal RHS) reads no column, so UPDATE alone
+# suffices — SELECT is not required. Last, since with no WHERE it rewrites every row.
+# default_privileges: UPDATE
+statement ok
+UPDATE t SET v = 99

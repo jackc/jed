@@ -596,6 +596,21 @@ description = "Fixed maximum composite-type nesting depth (MAX_COMPOSITE_DEPTH =
 id = "resource.pure_builtins"
 description = "The built-in function/operator surface is pure and side-effect-free, and the grammar exposes no host-reaching statement (CLAUDE.md §13 guarantee #2; spec/design/functions.md §13). The THIRD untrusted-query safety pillar: the first two BOUND a query (cost ceiling, nesting depth), this one bounds what it can REACH. No built-in touches the filesystem, network, process, or environment, and none adds nondeterminism outside the host-injected entropy/clock seam (uuidv4/uuidv7, now()/clock_timestamp()). Enforced as absence: a host-reaching function call is 42883 (undefined_function) and a host-reaching statement keyword is 42601 (syntax_error). A documented divergence from PostgreSQL (which provides pg_read_file/COPY/pg_sleep/current_setting/...), so not oracle-checked; pinned by suites/resource/no_escape_hatch.test."
 
+# Session authorization (spec/design/session.md §5.3, the bucket-A safety envelope) — the
+# GRANT/REVOKE privilege model, the §13 untrusted-query envelope made concrete. CLAUDE.md §3 deletes
+# in-database users/roles, so the host configures the envelope on the session and the engine
+# enforces it (42501) at name resolution. jed-specific (the envelope is host-configured, not
+# reachable as SQL roles), so cross-core-checked, NOT PostgreSQL-oracle-checked. The four
+# `# default_privileges:` / `# grant:` / `# revoke:` / `# allow_ddl:` corpus directives configure
+# the session for the next record (like `# seed:` / `# max_cost:`).
+[[capability]]
+id = "session.privileges"
+description = "Per-object GRANT/REVOKE authorization — per-table SELECT/INSERT/UPDATE/DELETE and per-function EXECUTE, enforced at name resolution with 42501 (insufficient_privilege) once a name resolves to an existing catalog object (a missing object stays 42P01) (spec/design/session.md §5.3). Three layers compose into the effective set for OP on object X: the default_privileges granted to every table (the GRANT … ON ALL TABLES default; a read-only session is {SELECT}), per-object grant (additions), and per-object revoke (removals) — OP ∈ (default ∪ grant[X]) \\ revoke[X], with revoke winning (deny is order-independent). A statement needs SELECT on every table it reads (FROM/JOIN, subqueries, an INSERT … SELECT source, an UPDATE/DELETE WHERE / RHS / RETURNING) and INSERT/UPDATE/DELETE on its write target (a bare INSERT … VALUES needs only INSERT; UPDATE t … WHERE needs UPDATE and SELECT), plus EXECUTE on every named function called (built-in operators are not gated). The `# default_privileges:` / `# grant:` / `# revoke:` directives configure the session for the next record. jed-specific (host-configured envelope, no SQL role catalog), so cross-core-checked, not oracle-checked. v1 narrowings: base-table + named-function names only (no per-column GRANT); function EXECUTE defaults on (the deny-list shape) — a default-off function allow-list is deferred."
+
+[[capability]]
+id = "session.allow_ddl"
+description = "The single DDL gate — a session capability `allow_ddl` (default on) governing CREATE/DROP/ALTER of tables, indexes, types, and sequences; a denied schema change is 42501 (spec/design/session.md §5.3). jed has no schema/owner model (CLAUDE.md §3), so all DDL folds under one boolean (a per-object CREATE/ownership privilege is a deferred follow-on). The `# allow_ddl: on|off` directive sets it for the next record. jed-specific (host-configured), so cross-core-checked, not oracle-checked. Builds on session.privileges."
+
 # Transaction control (Phase 5, spec/design/transactions.md §4). The SQL surface
 # BEGIN/COMMIT/ROLLBACK over the handle's single current transaction; tested by deterministic,
 # single-handle visibility sequences (the harness runs a whole .test file against one Database).

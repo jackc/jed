@@ -351,7 +351,10 @@ Deterministic and corpus-tested via the GRANT-shaped directives **`# default_pri
 **`# grant:`**, **`# revoke:`**, and **`# allow_ddl:`** (§6, §9). Capabilities: `session.privileges`
 (tables + functions), `session.allow_ddl`. **v1 narrowings (relax later):** base-table and
 named-function names only (not PG's per-*column* `GRANT`); `allow_ddl` is one boolean (no
-per-object CREATE/ownership privilege).
+per-object CREATE/ownership privilege); function `EXECUTE` defaults **on**, so only `revoke` disables
+a function (the deny-list — `revoke uuidv4`/`now()` to pin determinism). A function *allow-list*
+(default-off + per-function `grant`) is the symmetric shape but needs a function-default toggle the v1
+`SessionOptions` (which carries only the *table* `default_privileges`) does not expose; deferred (§11).
 
 ### 5.4 Session lifetime cost budget
 
@@ -517,10 +520,23 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
    `execute_script`'s atomicity rests on the already-corpus-covered transaction machinery, and the
    splitter adds no SQL semantics. v1 narrowing: an in-script `BEGIN`/`COMMIT`/`ROLLBACK` is `0A000`
    (partitioning is a §11 follow-on). No new capability flag (nothing in the corpus gates on it).
-3. **Privileges — the GRANT/REVOKE model** (§5.3) — per-table `SELECT`/`INSERT`/`UPDATE`/`DELETE`
-   + function `EXECUTE` + `allow_ddl`, resolve-time enforcement with `42501`. Capabilities
-   `session.privileges` / `session.allow_ddl`; the `# default_privileges:` / `# grant:` /
-   `# revoke:` / `# allow_ddl:` directives.
+3. **Privileges — the GRANT/REVOKE model** (§5.3) — ✅ **landed (all 3 cores).** Per-table
+   `SELECT`/`INSERT`/`UPDATE`/`DELETE` + function `EXECUTE` + `allow_ddl`, collected by an exhaustive
+   per-statement AST walk and enforced at the executor's `dispatch_stmt` seam with `42501` — DDL
+   gated by `allow_ddl`, each table privilege required only for a name that **resolves to an existing
+   catalog table** (a missing table stays `42P01`; a CTE / derived-table label is statement-local and
+   skipped), each named function needing `EXECUTE`. A fully-permissive session (the default) skips the
+   walk entirely, so the common path is untouched. The four `# default_privileges:` / `# grant:` /
+   `# revoke:` / `# allow_ddl:` directives configure the session per record (reset after, like
+   `# max_cost:`); the SQL-observable `42501` is **cross-core corpus-tested**
+   (`suites/session/privileges.test`, jed-specific so not oracle-checked), the host-API surface
+   (`grant`/`revoke`/`set_default_privileges`/`set_allow_ddl`, the additional-session envelope, the
+   `Privilege`/`PrivilegeSet` value API) **per-core unit tested**. Registers `42501` in the registry;
+   no on-disk format change (the envelope is session state, never persisted). Capabilities
+   `session.privileges` / `session.allow_ddl`. **v1 narrowing beyond §5.3's two:** function `EXECUTE`
+   defaults **on**, so only `revoke` disables a function (the deny-list — the determinism-pinning use
+   case); a function *allow-list* (default-off + per-function grant) needs a function-default toggle
+   the v1 option surface omits and is deferred (§11).
 4. **Lifetime cost budget** (§5.4) — the cumulative meter + `54P02` + the ordered-schedule corpus
    entries. Capability `session.lifetime_cost`; registers `54P02`.
 5. **Session variables** (§6.1, v1 scope) — the string map, host get/set, `current_setting()`,
@@ -556,6 +572,10 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
 - **Column-level privileges + a CREATE/ownership privilege** — PG has per-*column* `GRANT` and
   models DDL via `CREATE`-on-schema + ownership; v1 gates whole base-table + named-function names
   and folds all DDL under one `allow_ddl` boolean (§5.3).
+- **Function `EXECUTE` allow-list (default-off)** — v1 functions default `EXECUTE`-on, so only
+  `revoke` disables one (the deny-list, §5.3); the symmetric allow-list (default-off + per-function
+  `grant`) needs a function-level default toggle the v1 `SessionOptions` does not carry. A small
+  additive option when wanted.
 - **Per-statement setting overrides** — an options object on `execute`/`prepare` overriding a
   session setting for one call (the [api.md §8](api.md) "per-call override stays open" note),
   unchanged by this doc.

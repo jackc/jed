@@ -325,6 +325,20 @@ name = "generated_always"
 class = "syntax error or access rule violation"
 template = "{detail}"
 
+# 42501 insufficient_privilege — the session's authorization envelope (spec/design/session.md §5.3)
+# withheld a privilege a statement needs: a per-table SELECT/INSERT/UPDATE/DELETE on a table it
+# reads/writes, a function EXECUTE, or DDL permission (the `allow_ddl` gate). PostgreSQL's own
+# permission-denied code, but jed has no in-database role catalog (CLAUDE.md §3) — the *host*
+# configures the GRANT/REVOKE-shaped envelope on the session and the engine mechanically enforces
+# it at name resolution, after the name resolves to an existing catalog object (a missing object
+# stays 42P01). jed-specific surface (the envelope is host-configured, not reachable as SQL roles),
+# so it is cross-core-checked by the conformance corpus, not the PostgreSQL oracle.
+[[error]]
+code = "42501"
+name = "insufficient_privilege"
+class = "syntax error or access rule violation"
+template = "permission denied for {object}"
+
 # --- feature not supported (class 0A) ---------------------------------------
 [[error]]
 code = "0A000"
