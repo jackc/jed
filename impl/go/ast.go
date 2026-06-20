@@ -302,6 +302,11 @@ type ColumnDef struct {
 	// (spec/design/sequences.md §13). Desugars like serial (an owned sequence + a nextval default +
 	// NOT NULL) plus the persisted ALWAYS/BY DEFAULT distinction. nil = a non-identity column.
 	Identity *IdentitySpec
+	// Collation is an optional `COLLATE "name"` column modifier (spec/design/collation.md §1) — a
+	// quoted, case-sensitive collation name. Text-only (else 42804); the name must be loaded or "C"
+	// (else 42704). "" = no clause ⇒ inherit the per-database default. Frozen into the column at
+	// CREATE TABLE.
+	Collation string
 }
 
 // TypeMod is a parsed type modifier: a precision and an optional scale, as written

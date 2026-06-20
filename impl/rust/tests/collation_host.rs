@@ -111,12 +111,19 @@ fn per_column_collation_orders_implicitly() {
     // query — the whole point of per-column collations (collation.md §1). dev-root puts ä next to a.
     let mut db = Database::new();
     db.import_collation(dev_root()).unwrap();
-    execute(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\")").unwrap();
+    execute(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\")",
+    )
+    .unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
     let rows = texts(query(&mut db, "SELECT name FROM t ORDER BY name"));
     assert_eq!(rows, vec!["a", "ä", "z"]);
     // An explicit COLLATE "C" on the query overrides back to byte order (ä is a 2-byte UTF-8 → after z).
-    let rows = texts(query(&mut db, "SELECT name FROM t ORDER BY name COLLATE \"C\""));
+    let rows = texts(query(
+        &mut db,
+        "SELECT name FROM t ORDER BY name COLLATE \"C\"",
+    ));
     assert_eq!(rows, vec!["a", "z", "ä"]);
 }
 
@@ -173,10 +180,18 @@ fn default_collation_inherited_by_unannotated_column() {
     let mut db = Database::new();
     db.import_collation(dev_root()).unwrap();
     assert_eq!(db.default_collation(), "C");
-    execute(&mut db, "CREATE TABLE before (id i32 PRIMARY KEY, name text)").unwrap();
+    execute(
+        &mut db,
+        "CREATE TABLE before (id i32 PRIMARY KEY, name text)",
+    )
+    .unwrap();
     db.set_default_collation("dev-root").unwrap();
     assert_eq!(db.default_collation(), "dev-root");
-    execute(&mut db, "CREATE TABLE after (id i32 PRIMARY KEY, name text)").unwrap();
+    execute(
+        &mut db,
+        "CREATE TABLE after (id i32 PRIMARY KEY, name text)",
+    )
+    .unwrap();
     execute(&mut db, "INSERT INTO after VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
     // `after.name` inherited dev-root → ä sorts next to a even with no COLLATE clause.
     assert_eq!(
@@ -194,7 +209,10 @@ fn default_collation_inherited_by_unannotated_column() {
 #[test]
 fn set_default_unknown_is_42704() {
     let mut db = Database::new();
-    assert_eq!(db.set_default_collation("nope").unwrap_err().code(), "42704");
+    assert_eq!(
+        db.set_default_collation("nope").unwrap_err().code(),
+        "42704"
+    );
     // C always resolves (resets to byte order).
     db.set_default_collation("C").unwrap();
 }
@@ -233,7 +251,11 @@ fn baked_file_round_trip() {
         "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\", plain text)",
     )
     .unwrap();
-    execute(&mut db, "INSERT INTO t VALUES (1,'z','z'),(2,'ä','ä'),(3,'a','a')").unwrap();
+    execute(
+        &mut db,
+        "INSERT INTO t VALUES (1,'z','z'),(2,'ä','ä'),(3,'a','a')",
+    )
+    .unwrap();
     db.commit().unwrap();
     db.close().unwrap();
 

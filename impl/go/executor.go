@@ -104,9 +104,13 @@ type Snapshot struct {
 	sequences map[string]*SequenceDef
 	// collations holds loaded collations, keyed by their exact (CASE-SENSITIVE) name — collation
 	// names are quoted identifiers ("en-US", spec/design/collation.md §1). C is never stored
-	// (table-free, built in). Imported by db.ImportCollation (slice 1c: in-memory only — no
-	// format_version bump, no catalog entry yet; baking is slice 1d). Not serialized this slice.
+	// (table-free, built in). Imported by db.ImportCollation. Persisted as catalog entry_kind = 3
+	// baked snapshots (format_version 17, slice 1d — spec/fileformat/format.md).
 	collations map[string]*Collation
+	// defaultCollation is the per-database default collation name, or "" for C (collation.md §1/§5).
+	// An un-annotated text column inherits this at CREATE TABLE. Persisted as the is_default flag bit
+	// on that collation's entry_kind = 3 snapshot, restored on load.
+	defaultCollation string
 }
 
 // newSnapshot builds an empty snapshot.
@@ -154,7 +158,7 @@ func (s *Snapshot) clone() *Snapshot {
 	for k, v := range s.collations {
 		collations[k] = v
 	}
-	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations}
+	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation}
 }
 
 // collation looks up a loaded collation by its exact (case-sensitive) name. C is NOT here — it is
@@ -162,6 +166,21 @@ func (s *Snapshot) clone() *Snapshot {
 // raises 42704).
 func (s *Snapshot) collation(name string) *Collation {
 	return s.collations[name]
+}
+
+// collationsSorted returns all loaded collations in ascending (exact, case-sensitive) name order —
+// the on-disk emission order (spec/fileformat/format.md, entry_kind = 3) with no hash-iteration leak.
+func (s *Snapshot) collationsSorted() []*Collation {
+	keys := make([]string, 0, len(s.collations))
+	for k := range s.collations {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	out := make([]*Collation, len(keys))
+	for i, k := range keys {
+		out[i] = s.collations[k]
+	}
+	return out
 }
 
 // table looks up a table definition by name (case-insensitive).
@@ -1137,12 +1156,24 @@ func (db *Database) putTable(t *Table) {
 	db.working().putTable(t, db.pageSize)
 }
 
+// CollationInfo is introspection metadata for one loaded collation (db.Collations,
+// spec/design/collation.md §1). ContentHash is the CRC-32 of the compiled table (the reference-mode
+// stamp, §3/§4); Description is provenance, excluded from the hash.
+type CollationInfo struct {
+	Name           string
+	UnicodeVersion string
+	CLDRVersion    string
+	ContentHash    uint32
+	Description    string
+	IsDefault      bool
+}
+
 // ImportCollation imports a collation into the database (the privileged host op,
-// spec/design/collation.md §4). The collation becomes usable by name in COLLATE / ORDER BY (slice
-// 1c: in-memory only — placed in the committed catalog, NOT yet persisted; baking is slice 1d).
-// Idempotent by (name, content-hash): re-importing the identical table is a no-op success; importing
-// a DIFFERENT table under a name already in use is 42710 (re-collation is the explicit path, §12). C
-// is never imported (table-free, built in). Returns the imported name.
+// spec/design/collation.md §4). The collation becomes usable by name in COLLATE / ORDER BY and is
+// BAKED into the file at the next commit (catalog entry_kind = 3, format_version 17 — §5). Idempotent
+// by (name, content-hash): re-importing the identical table is a no-op success; importing a DIFFERENT
+// table under a name already in use is 42710 (re-collation is the explicit path, §12). C is never
+// imported (table-free, built in). Returns the imported name.
 func (db *Database) ImportCollation(coll *Collation) (string, error) {
 	if coll.Name == "C" {
 		return "", NewError(DuplicateObject, "the C collation is built in and cannot be imported")
@@ -1157,6 +1188,57 @@ func (db *Database) ImportCollation(coll *Collation) (string, error) {
 	}
 	db.committed.collations[coll.Name] = coll
 	return coll.Name, nil
+}
+
+// ExportCollation pulls a baked collation back out as a *Collation value (db.ExportCollation,
+// spec/design/collation.md §1). C is built in and has no table → 42704; an unloaded name is 42704.
+func (db *Database) ExportCollation(name string) (*Collation, error) {
+	if c := db.committed.collation(name); c != nil {
+		return c, nil
+	}
+	return nil, NewError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
+}
+
+// SetDefaultCollation sets the per-database default collation (db.SetDefaultCollation,
+// spec/design/collation.md §1). "C" resets to byte order; any other name must be a loaded collation
+// (else 42704). Persisted as the is_default flag on that collation's baked snapshot at the next commit.
+func (db *Database) SetDefaultCollation(name string) error {
+	if name == "C" {
+		db.committed.defaultCollation = ""
+		return nil
+	}
+	if db.committed.collation(name) == nil {
+		return NewError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
+	}
+	db.committed.defaultCollation = name
+	return nil
+}
+
+// DefaultCollation returns the per-database default collation name — "C" unless SetDefaultCollation
+// moved it (db.DefaultCollation, spec/design/collation.md §1).
+func (db *Database) DefaultCollation() string {
+	if db.committed.defaultCollation == "" {
+		return "C"
+	}
+	return db.committed.defaultCollation
+}
+
+// Collations introspects the loaded collations (db.Collations, spec/design/collation.md §1), in
+// ascending name order. C is built in and not listed.
+func (db *Database) Collations() []CollationInfo {
+	colls := db.committed.collationsSorted()
+	out := make([]CollationInfo, len(colls))
+	for i, c := range colls {
+		out[i] = CollationInfo{
+			Name:           c.Name,
+			UnicodeVersion: c.UnicodeVersion,
+			CLDRVersion:    c.CldrVersion,
+			ContentHash:    crc32IEEE(SerializeTable(c)),
+			Description:    c.Description,
+			IsDefault:      db.committed.defaultCollation == c.Name,
+		}
+	}
+	return out
 }
 
 // ExecuteStmt executes one parsed statement with no bind parameters.
@@ -2499,6 +2581,26 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				defaultExpr = &DefaultExpr{ExprText: def.Default.Text, Expr: def.Default.Expr}
 			}
 		}
+		// The column's effective collation, frozen now (spec/design/collation.md §1). An explicit
+		// COLLATE "name" is text-only (42804) and must name a loaded collation or C (42704); a text
+		// column without a clause inherits the per-database default. A C effective collation stores
+		// as "" (the fast path).
+		collation := ""
+		if def.Collation != "" {
+			if !colType.IsText() {
+				return Outcome{}, typeError(fmt.Sprintf(
+					"collations are not supported by type %s", colType.CanonicalName(),
+				))
+			}
+			if _, err := resolveCollationName(db, def.Collation); err != nil {
+				return Outcome{}, err
+			}
+			if def.Collation != "C" {
+				collation = def.Collation
+			}
+		} else if colType.IsText() {
+			collation = db.readSnap().defaultCollation
+		}
 		columns = append(columns, Column{
 			Name:       def.Name,
 			Type:       colType,
@@ -2509,6 +2611,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 			Default:     defaultVal,
 			DefaultExpr: defaultExpr,
 			Identity:    identityKind,
+			Collation:   collation,
 		})
 	}
 
@@ -6976,14 +7079,22 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			return nil, NewError(FeatureNotSupported, "ORDER BY may not reference an outer query column")
 		}
 		idx := r.index
-		// An explicit COLLATE on the sort key (spec/design/collation.md §1): the column must be text
-		// (42804) and the name must resolve ("C" → byte order, else loaded or 42704).
+		// The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
+		// text column (42804) and name a loaded collation ("C" → byte order, else 42704); absent a
+		// clause, the key inherits the column's frozen (implicit) collation — so `ORDER BY name` over
+		// an en-US column sorts by en-US (slice 1d). A single column can't conflict (no 42P22 here).
 		var coll *Collation
 		if key.Collation != "" {
 			if !s.columnOf(r).Type.IsText() {
-				return nil, typeError("collations are not supported by this column's type")
+				return nil, typeError(fmt.Sprintf(
+					"collations are not supported by type %s", s.columnOf(r).Type.CanonicalName(),
+				))
 			}
 			if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {
+				return nil, err
+			}
+		} else if cn := s.columnOf(r).Collation; cn != "" {
+			if coll, err = resolveCollationName(s.catalog, cn); err != nil {
 				return nil, err
 			}
 		}
@@ -14063,46 +14174,116 @@ func resolveCollationName(catalog *Database, name string) (*Collation, error) {
 	return nil, NewError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
 }
 
-// explicitCollation returns the single EXPLICIT collation an expression subtree forces, or "" if it
-// forces none (spec/design/collation.md §1). In slice 1c the only source of an explicit collation is
-// a COLLATE node (columns are implicitly C), so this finds the outermost COLLATE and, through the one
-// text-combining operator || , detects an explicit-vs-explicit conflict (42P21). Propagation through
-// CASE / COALESCE / function results is a deferred follow-on (those reset to the implicit default — a
-// documented 1c narrowing, collation.md §14).
-func explicitCollation(e Expr) (string, error) {
+// A text expression's collation derivation (spec/design/collation.md §1, PG's rules). kind:
+// derivNone (no collation — a non-text expr or a bare literal), derivImplicit (a column's frozen
+// collation — C counts as a distinct implicit collation), derivExplicit (an explicit COLLATE), or
+// derivIndeterminate (two different implicit collations met — 42P22 when consumed).
+const (
+	derivNone = iota
+	derivImplicit
+	derivExplicit
+	derivIndeterminate
+)
+
+type deriv struct {
+	name string
+	kind int
+}
+
+// deriveCollation derives the collation + derivation level of a (text) expression subtree. A COLLATE
+// is explicit; a column reference is implicit (its frozen collation, C if none); || combines its
+// operands. Every other shape resets to none (takes a neighbour's) — a documented narrowing (§14).
+func deriveCollation(s *scope, e Expr) (deriv, error) {
 	switch e.Kind {
 	case ExprCollate:
-		return e.Collate.Collation, nil
+		return deriv{name: e.Collate.Collation, kind: derivExplicit}, nil
+	case ExprColumn:
+		r, err := s.resolveBare(e.Column)
+		return columnDeriv(s, r, err), nil
+	case ExprQualifiedColumn:
+		r, err := s.resolveQualified(e.Qualifier, e.Column)
+		return columnDeriv(s, r, err), nil
 	case ExprBinary:
 		if e.Binary.Op == OpConcat {
-			l, err := explicitCollation(e.Binary.Lhs)
+			l, err := deriveCollation(s, e.Binary.Lhs)
 			if err != nil {
-				return "", err
+				return deriv{}, err
 			}
-			r, err := explicitCollation(e.Binary.Rhs)
+			r, err := deriveCollation(s, e.Binary.Rhs)
 			if err != nil {
-				return "", err
+				return deriv{}, err
 			}
-			return combineExplicit(l, r)
+			return combineDeriv(l, r)
 		}
-		return "", nil
+		return deriv{}, nil
 	default:
-		return "", nil
+		return deriv{}, nil
 	}
 }
 
-// combineExplicit combines two operands' explicit collations (spec/design/collation.md §1/§7). Two
-// DIFFERENT explicit collations are a conflict (42P21, the explicit-mismatch error PG raises);
-// otherwise the single explicit collation, or "" when neither forces one.
-func combineExplicit(a, b string) (string, error) {
-	if a != "" && b != "" && a != b {
-		return "", NewError(CollationMismatch,
-			fmt.Sprintf("collation mismatch between explicit collations %q and %q", a, b))
+// columnDeriv is the implicit derivation of a resolved column reference: a text column carries its
+// frozen collation (C → "C", a distinct implicit collation); a non-text or unresolvable reference
+// is derivNone.
+func columnDeriv(s *scope, r resolved, err error) deriv {
+	if err != nil {
+		return deriv{}
 	}
-	if a != "" {
+	col := s.columnOf(r)
+	if !col.Type.IsText() {
+		return deriv{}
+	}
+	name := col.Collation
+	if name == "" {
+		name = "C"
+	}
+	return deriv{name: name, kind: derivImplicit}
+}
+
+// combineDeriv combines two operands' derivations (spec/design/collation.md §1/§7, PG's rules).
+// Explicit dominates; two DIFFERENT explicit collations conflict eagerly (42P21); two different
+// implicit collations yield derivIndeterminate (deferred to 42P22 on use); explicit resolves it.
+func combineDeriv(a, b deriv) (deriv, error) {
+	if a.kind == derivExplicit && b.kind == derivExplicit {
+		if a.name != b.name {
+			return deriv{}, NewError(CollationMismatch,
+				fmt.Sprintf("collation mismatch between explicit collations %q and %q", a.name, b.name))
+		}
+		return a, nil
+	}
+	if a.kind == derivExplicit {
+		return a, nil
+	}
+	if b.kind == derivExplicit {
+		return b, nil
+	}
+	if a.kind == derivIndeterminate || b.kind == derivIndeterminate {
+		return deriv{kind: derivIndeterminate}, nil
+	}
+	if a.kind == derivImplicit && b.kind == derivImplicit {
+		if a.name == b.name {
+			return a, nil
+		}
+		return deriv{kind: derivIndeterminate}, nil
+	}
+	if a.kind == derivImplicit {
 		return a, nil
 	}
 	return b, nil
+}
+
+// resolveDeriv resolves a derivation to the concrete collation a comparison / ORDER BY uses. none
+// and C → nil (byte order, the fast path); a loaded name → its table (42704 if it vanished);
+// derivIndeterminate → 42P22 (the collation is required but ambiguous).
+func resolveDeriv(catalog *Database, d deriv) (*Collation, error) {
+	switch d.kind {
+	case derivIndeterminate:
+		return nil, NewError(IndeterminateCollation,
+			"could not determine which collation to use for string comparison")
+	case derivImplicit, derivExplicit:
+		return resolveCollationName(catalog, d.name)
+	default:
+		return nil, nil
+	}
 }
 
 // collatedCmp compares two non-NULL text values under a loaded collation (spec/design/collation.md
@@ -14200,27 +14381,27 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 		}
 		// Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text
 		// comparison is collatable; a COLLATE on a non-text operand was already rejected 42804 at the
-		// Collate node. The explicit collation is found by walking each AST operand; two DIFFERENT
-		// explicit collations conflict (42P21). In 1c every column is implicitly C, so the only
-		// reachable conflict is explicit-vs-explicit.
+		// Collate node. Each operand's derivation (explicit COLLATE / implicit column collation / none)
+		// is combined per PG's rules: two different EXPLICIT collations conflict (42P21); two different
+		// IMPLICIT collations are indeterminate (42P22 when consumed here). Derived for ALL comparison
+		// ops incl =/<> (PG raises the conflict regardless), even though =/<> ignore the collation at
+		// eval (byte equality, §7).
 		var coll *Collation
 		if lt.kind == rtText && rt.kind == rtText {
-			lc, err := explicitCollation(b.Lhs)
+			ld, err := deriveCollation(s, b.Lhs)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			rc, err := explicitCollation(b.Rhs)
+			rd, err := deriveCollation(s, b.Rhs)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			name, err := combineExplicit(lc, rc)
+			d, err := combineDeriv(ld, rd)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			if name != "" {
-				if coll, err = resolveCollationName(s.catalog, name); err != nil {
-					return nil, resolvedType{}, err
-				}
+			if coll, err = resolveDeriv(s.catalog, d); err != nil {
+				return nil, resolvedType{}, err
 			}
 		}
 		return &rExpr{kind: reCompare, op: b.Op, lhs: rl, rhs: rr, collation: coll},

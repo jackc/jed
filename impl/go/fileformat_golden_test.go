@@ -693,6 +693,25 @@ func identityTableDB(t *testing.T) *Database {
 	return db
 }
 
+// collationTableDB is a baked COLLATION (v17 — entry_kind 3 snapshot + per-column collations): the
+// dev-root collation imported + set as the per-database default (is_default), a column with explicit
+// COLLATE "dev-root" (flags bit6 + name), an un-annotated column inheriting the default (bit6 + name),
+// and an explicit COLLATE "C" column (no collation). Must match the Ruby reference's COLLATION_TABLE.
+func collationTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	if _, err := db.ImportCollation(devRoot(t)); err != nil {
+		t.Fatalf("import dev-root: %v", err)
+	}
+	if err := db.SetDefaultCollation("dev-root"); err != nil {
+		t.Fatalf("set default: %v", err)
+	}
+	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root", `+
+		`plain text, byteorder text COLLATE "C")`)
+	run(t, db, `INSERT INTO t VALUES (1, 'a', 'b', 'z')`)
+	run(t, db, `INSERT INTO t VALUES (2, 'z', 'a', 'a')`)
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -740,6 +759,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"sequence_table.jed", sequenceTableDB},
 		{"serial_table.jed", serialTableDB},
 		{"identity_table.jed", identityTableDB},
+		{"collation_table.jed", collationTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -801,6 +821,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"sequence_table.jed", sequenceTableDB, "t"},
 		{"serial_table.jed", serialTableDB, "t"},
 		{"identity_table.jed", identityTableDB, "t"},
+		{"collation_table.jed", collationTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

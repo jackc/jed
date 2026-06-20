@@ -637,6 +637,7 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 	notNull := false
 	var def *DefaultDef
 	var identity *IdentitySpec
+	collation := ""
 	for {
 		if p.atCheckConstraint() {
 			check, err := p.parseCheckConstraint()
@@ -747,6 +748,15 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 				))
 			}
 			identity = &IdentitySpec{Always: always, Options: options}
+		case "collate":
+			// COLLATE "name" in column position (spec/design/collation.md §1) — a quoted,
+			// case-sensitive collation name. Validity (text-only 42804, loaded name 42704) is
+			// checked at execution. A repeat keeps the last (like DEFAULT).
+			p.advance()
+			collation, err = p.expectCollationName()
+			if err != nil {
+				return ColumnDef{}, err
+			}
 		case "unique":
 			p.advance()
 			*uniques = append(*uniques, UniqueDef{Columns: []string{name}})
@@ -766,7 +776,7 @@ func (p *Parser) parseColumnDef(tableName string, checks *[]CheckDef, uniques *[
 				OnUpdate:   onUpdate,
 			})
 		default:
-			return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def, Identity: identity}, nil
+			return ColumnDef{Name: name, TypeName: typeName, TypeMod: typeMod, PrimaryKey: primaryKey, NotNull: notNull, Default: def, Identity: identity, Collation: collation}, nil
 		}
 	}
 }

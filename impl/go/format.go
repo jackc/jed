@@ -22,7 +22,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 16    // on-disk format version (16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion   uint16 = 17    // on-disk format version (17 = baked collations: a catalog entry_kind 3 collation snapshot — a flags byte is_default/reference + the LZ4-compressed .coll artifact — emitted after sequences and before tables, plus a per-column collation: column flags byte bit6 has_collation + a trailing name, spec/design/collation.md §5. 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -560,6 +560,10 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	for _, sq := range s.sequencesSorted() {
 		catEntries = append(catEntries, append([]byte{2}, sequenceEntryBytes(sq)...))
 	}
+	// Collation snapshots (kind 3, v17) — after sequences, before tables (spec/design/collation.md §5).
+	for _, c := range s.collationsSorted() {
+		catEntries = append(catEntries, append([]byte{3}, collationEntryBytes(c, s.defaultCollation == c.Name)...))
+	}
 	for ti, k := range keys {
 		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti])...))
 	}
@@ -762,6 +766,10 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 	for _, sq := range s.sequencesSorted() {
 		catEntries = append(catEntries, append([]byte{2}, sequenceEntryBytes(sq)...))
 	}
+	// Collation snapshots (kind 3, v17) — after sequences, before tables (spec/design/collation.md §5).
+	for _, c := range s.collationsSorted() {
+		catEntries = append(catEntries, append([]byte{3}, collationEntryBytes(c, s.defaultCollation == c.Name)...))
+	}
 	for ti, k := range keys {
 		catEntries = append(catEntries, append([]byte{0}, tableEntryBytes(s.tables[k], rootDataPage[ti], indexRoots[ti])...))
 	}
@@ -944,6 +952,19 @@ func LoadDatabase(image []byte) (*Database, error) {
 				snap.putSequence(sq)
 				continue
 			}
+			if kind == 3 {
+				// A collation snapshot (v17): the baked .coll artifact + an is_default flag
+				// (spec/design/collation.md §5). The default restores the per-database default.
+				coll, isDefault, err := decodeCollationEntry(pg.payload, &pos)
+				if err != nil {
+					return nil, err
+				}
+				if isDefault {
+					snap.defaultCollation = coll.Name
+				}
+				snap.collations[coll.Name] = coll
+				continue
+			}
 			if kind != 0 {
 				return nil, NewError(DataCorrupted, "unknown catalog entry kind")
 			}
@@ -1086,6 +1107,19 @@ func LoadDatabasePaged(pgr *pager, capacity int) (*Database, error) {
 					return nil, err
 				}
 				snap.putSequence(sq)
+				continue
+			}
+			if kind == 3 {
+				// A collation snapshot (v17): the baked .coll artifact + an is_default flag
+				// (spec/design/collation.md §5). The default restores the per-database default.
+				coll, isDefault, err := decodeCollationEntry(pg.payload, &pos)
+				if err != nil {
+					return nil, err
+				}
+				if isDefault {
+					snap.defaultCollation = coll.Name
+				}
+				snap.collations[coll.Name] = coll
 				continue
 			}
 			if kind != 0 {
@@ -1942,6 +1976,54 @@ func decodeSequenceEntry(buf []byte, pos *int) (*SequenceDef, error) {
 	}, nil
 }
 
+// collationEntryBytes serializes a collation-snapshot catalog entry's BODY (after its entry_kind = 3
+// byte, v17): a flags byte (bit0 is_default, bit1 reference — deferred, 0/baked this slice) + the
+// baked .coll artifact (u32 length + LZ4-compressed bytes). The artifact is byte-identical to
+// db.SaveCollation, so a golden doubles as an artifact fixture (spec/design/collation.md §5).
+func collationEntryBytes(c *Collation, isDefault bool) []byte {
+	var out []byte
+	var flags byte
+	if isDefault {
+		flags = 0b1
+	}
+	out = append(out, flags)
+	artifact := SaveCollation(c)
+	out = appendU32(out, uint32(len(artifact)))
+	out = append(out, artifact...)
+	return out
+}
+
+// decodeCollationEntry decodes a collation-snapshot entry's body (inverse of collationEntryBytes);
+// the caller has consumed the entry_kind byte. Returns the loaded collation + whether it is the
+// per-database default (the is_default flag bit).
+func decodeCollationEntry(buf []byte, pos *int) (*Collation, bool, error) {
+	flags, err := readU8(buf, pos)
+	if err != nil {
+		return nil, false, err
+	}
+	if flags&^uint8(0b11) != 0 {
+		return nil, false, NewError(DataCorrupted, "reserved collation flag set")
+	}
+	if flags&0b10 != 0 {
+		return nil, false, NewError(DataCorrupted, "reference-mode collation snapshots are not supported yet")
+	}
+	isDefault := flags&0b1 != 0
+	n, err := readU32(buf, pos)
+	if err != nil {
+		return nil, false, err
+	}
+	if *pos+int(n) > len(buf) {
+		return nil, false, NewError(DataCorrupted, "collation artifact truncated")
+	}
+	artifact := buf[*pos : *pos+int(n)]
+	*pos += int(n)
+	coll, err := OpenCollation(artifact)
+	if err != nil {
+		return nil, false, err
+	}
+	return coll, isDefault, nil
+}
+
 // tableEntryBytes builds one table's catalog entry (format.md). indexRoots is each
 // index's tree root page, parallel to table.Indexes.
 func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []byte {
@@ -2015,6 +2097,11 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 				flags |= 0b10_0000
 			}
 		}
+		// bit6 has_collation (v17) — a text column with a non-C effective collation
+		// (spec/design/collation.md §5); the name is appended after the default.
+		if col.Collation != "" {
+			flags |= 0b100_0000
+		}
 		out = append(out, flags)
 		// A decimal column appends its typmod (precision, scale) — only for type_code 6, so
 		// non-decimal entries are byte-unchanged (spec/fileformat/format.md). precision 0 =
@@ -2039,6 +2126,12 @@ func tableEntryBytes(table *Table, rootDataPage uint32, indexRoots []uint32) []b
 		} else if col.DefaultExpr != nil {
 			out = appendU16(out, uint16(len(col.DefaultExpr.ExprText)))
 			out = append(out, col.DefaultExpr.ExprText...)
+		}
+		// The effective collation name (v17, flags bit6) — last in the per-column entry, so a
+		// non-collated column is byte-unchanged (spec/design/collation.md §5).
+		if col.Collation != "" {
+			out = appendU16(out, uint16(len(col.Collation)))
+			out = append(out, col.Collation...)
 		}
 	}
 	// The primary key (v5): count, then the member column ordinals in KEY order
@@ -2443,12 +2536,12 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			return nil, 0, nil, err
 		}
 		// bit0 was the primary_key flag through v4; v5 retired it (the pk list below is
-		// the authority) and reserves it as must-be-zero. bits 6-7 are reserved (v15).
+		// the authority) and reserves it as must-be-zero. bit6 = has_collation (v17); bit7 reserved.
 		if flags&0b01 != 0 {
 			return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit0 set")
 		}
-		if flags&0b1100_0000 != 0 {
-			return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit (6/7) set")
+		if flags&0b1000_0000 != 0 {
+			return nil, 0, nil, NewError(DataCorrupted, "reserved column flag bit7 set")
 		}
 		// bit4 is_identity + bit5 identity_always (v15) — identity_always is meaningful only with
 		// is_identity (spec/design/sequences.md §13).
@@ -2509,6 +2602,15 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			}
 			defaultExpr = &DefaultExpr{ExprText: exprText, Expr: expr}
 		}
+		// The effective collation (v17, flags bit6) — appended last; a non-collated column has the
+		// bit clear and reads nothing (spec/design/collation.md §5).
+		collation := ""
+		if flags&0b100_0000 != 0 {
+			collation, err = readString(buf, pos)
+			if err != nil {
+				return nil, 0, nil, err
+			}
+		}
 		columns = append(columns, Column{
 			Name:    cname,
 			Type:    ScalarT(ty),
@@ -2518,6 +2620,7 @@ func decodeTableEntry(buf []byte, pos *int) (*Table, uint32, []uint32, error) {
 			Default:     defaultVal,
 			DefaultExpr: defaultExpr,
 			Identity:    identity,
+			Collation:   collation,
 		})
 	}
 	// The primary key (v5): member ordinals in KEY order. Each must name a real column,

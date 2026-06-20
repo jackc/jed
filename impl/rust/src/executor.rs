@@ -2356,7 +2356,11 @@ impl Database {
                     )));
                 }
                 resolve_collation_name(self, name)?; // validates loaded; 42704 if not
-                if name == "C" { None } else { Some(name.clone()) }
+                if name == "C" {
+                    None
+                } else {
+                    Some(name.clone())
+                }
             } else if ty.is_text() {
                 self.read_snap().default_collation().map(str::to_string)
             } else {
@@ -14766,7 +14770,8 @@ fn resolve_binary(
             // though `=`/`<>` ignore the collation at eval (byte equality, §7).
             let collation = if matches!(lt, ResolvedType::Text) && matches!(rt, ResolvedType::Text)
             {
-                let d = combine_deriv(derive_collation(scope, lhs)?, derive_collation(scope, rhs)?)?;
+                let d =
+                    combine_deriv(derive_collation(scope, lhs)?, derive_collation(scope, rhs)?)?;
                 resolve_deriv(scope.catalog, d)?
             } else {
                 None
