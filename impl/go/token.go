@@ -76,6 +76,17 @@ const (
 	// TokOverlaps is the "&&" array overlap operator (a && b — do a and b share an element). Two "&"
 	// scanned greedily; a lone "&" is a 42601 syntax error (no bitwise-and). spec/design/grammar.md §40.
 	TokOverlaps
+	// TokStrictlyLeft is the "<<" range strictly-left operator (a << b). Two "<". range-functions.md §3 (RF3).
+	TokStrictlyLeft
+	// TokStrictlyRight is the ">>" range strictly-right operator (a >> b). Two ">". range-functions.md §3 (RF3).
+	TokStrictlyRight
+	// TokNotExtendRight is the "&<" range not-extend-right operator (a &< b). "&" then "<". range-functions.md §3.
+	TokNotExtendRight
+	// TokNotExtendLeft is the "&>" range not-extend-left operator (a &> b). "&" then ">". range-functions.md §3.
+	TokNotExtendLeft
+	// TokAdjacent is the "-|-" range adjacency operator (a -|- b). "-" "|" "-", scanned greedily and
+	// checked BEFORE the "--" line comment. range-functions.md §3 (RF3).
+	TokAdjacent
 	// TokParam is a bind parameter $N — Int holds the 1-based index. The lexer rejects $0, a
 	// leading zero ($01), and $ with no following digit (42601). Bound by the host API, not the
 	// corpus (spec/design/api.md, grammar.md §5).

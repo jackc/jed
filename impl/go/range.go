@@ -322,23 +322,38 @@ func rangeTotalCmp(a, b *RangeVal) int {
 	return cmpBound(a.Upper, a.UpperInc, b.Upper, b.UpperInc, false)
 }
 
-// cmpBound compares two range bounds on the same side (lower-vs-lower or upper-vs-upper), PG
-// range_cmp_bounds. A nil value is the unbounded/infinite bound: an infinite lower is below any
-// finite lower, an infinite upper is above any finite upper. For equal finite values the inclusivity
-// breaks the tie, and the direction depends on the side: a lower bound sorts inclusive-before-
-// exclusive ([1 < (1), an upper bound sorts exclusive-before-inclusive (1) < 1]). isLower selects
-// that direction.
+// cmpBound compares two range bounds on the SAME side (lower-vs-lower or upper-vs-upper), PG
+// range_cmp_bounds. The same-side specialization of cmpBounds (both bounds carry the same isLower),
+// used by the total order; a nil value is the unbounded/infinite bound.
 func cmpBound(v1 *Value, inc1 bool, v2 *Value, inc2 bool, isLower bool) int {
+	return cmpBounds(v1, inc1, isLower, v2, inc2, isLower)
+}
+
+// cmpBounds is the general PG range_cmp_bounds: compare two range bounds that may be on DIFFERENT
+// sides — each carries its own value (nil = infinite), inclusivity, and isLower flag (the boolean
+// operators RF3 compare a lower against an upper). An infinite LOWER is below everything; an infinite
+// UPPER is above everything. For equal finite values only a differing inclusivity breaks the tie: the
+// exclusive bound sits just inside on its own side, so an exclusive LOWER sorts after (it starts
+// later) and an exclusive UPPER sorts before (it ends earlier). cmpBound (same-side) is the
+// lower1 == lower2 case.
+func cmpBounds(v1 *Value, inc1 bool, lower1 bool, v2 *Value, inc2 bool, lower2 bool) int {
 	switch {
 	case v1 == nil && v2 == nil:
-		return 0
+		switch {
+		case lower1 == lower2:
+			return 0
+		case lower1:
+			return -1
+		default:
+			return 1
+		}
 	case v1 == nil && v2 != nil:
-		if isLower {
+		if lower1 {
 			return -1
 		}
 		return 1
 	case v1 != nil && v2 == nil:
-		if isLower {
+		if lower2 {
 			return 1
 		}
 		return -1
@@ -346,22 +361,144 @@ func cmpBound(v1 *Value, inc1 bool, v2 *Value, inc2 bool, isLower bool) int {
 	if c := rangeElemCmp(*v1, *v2); c != 0 {
 		return c
 	}
-	// Equal values: an exclusive lower sorts after an inclusive lower; an exclusive upper sorts
-	// before an inclusive upper (the rest fall out of the both-equal cases).
+	// Equal values: only a differing inclusivity breaks the tie (PG range_cmp_bounds). The exclusive
+	// side decides — an exclusive lower sorts after, an exclusive upper before.
 	switch {
-	case inc1 == inc2:
-		return 0
-	case !inc1 && inc2:
-		if isLower {
-			return 1
-		}
-		return -1
-	default: // inc1 && !inc2
-		if isLower {
+	case inc1 && !inc2:
+		if lower2 {
 			return -1
 		}
 		return 1
+	case !inc1 && inc2:
+		if lower1 {
+			return 1
+		}
+		return -1
+	default:
+		return 0
 	}
+}
+
+// --- boolean operators (RF3, spec/design/range-functions.md §3) -------------
+// The eight PG range boolean operators, each a definite boolean over CANONICAL range values (never
+// 3-valued — like the total order, unlike composite; a NULL operand is short-circuited by the
+// evaluator before these are called). Containment/overlap/positional/adjacent, built on the general
+// bound comparison cmpBounds. Empty-range edges follow PG: the empty range contains nothing and is
+// contained by everything; it overlaps nothing and is neither before/after/adjacent to anything.
+
+// rangeContainsElem reports whether range r contains element value e (PG range_contains_elem). e is
+// already the range's element type (the resolver coerced it). The empty range contains nothing.
+func rangeContainsElem(r *RangeVal, e Value) bool {
+	if r.Empty {
+		return false
+	}
+	if r.Lower != nil {
+		switch rangeElemCmp(e, *r.Lower) {
+		case -1:
+			return false
+		case 0:
+			if !r.LowerInc {
+				return false
+			}
+		}
+	}
+	if r.Upper != nil {
+		switch rangeElemCmp(e, *r.Upper) {
+		case 1:
+			return false
+		case 0:
+			if !r.UpperInc {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// rangeContains reports whether range a contains range b (PG range_contains): the empty range is
+// contained by everything, and a non-empty b is contained only when a's lower bound is ≤ b's and a's
+// upper bound is ≥ b's (each in the cmpBounds sense).
+func rangeContains(a, b *RangeVal) bool {
+	if b.Empty {
+		return true
+	}
+	if a.Empty {
+		return false
+	}
+	return cmpBounds(a.Lower, a.LowerInc, true, b.Lower, b.LowerInc, true) <= 0 &&
+		cmpBounds(a.Upper, a.UpperInc, false, b.Upper, b.UpperInc, false) >= 0
+}
+
+// rangeOverlaps reports whether ranges a and b overlap, sharing at least one point (PG
+// range_overlaps). The empty range overlaps nothing. They overlap iff one range's lower bound lies
+// within the other.
+func rangeOverlaps(a, b *RangeVal) bool {
+	if a.Empty || b.Empty {
+		return false
+	}
+	return lowerWithin(a, b) || lowerWithin(b, a)
+}
+
+// lowerWithin reports whether the lower bound of x lies within y (x.lower ≥ y.lower and x.lower ≤
+// y.upper, in the cmpBounds sense) — the half-test of rangeOverlaps.
+func lowerWithin(x, y *RangeVal) bool {
+	return cmpBounds(x.Lower, x.LowerInc, true, y.Lower, y.LowerInc, true) >= 0 &&
+		cmpBounds(x.Lower, x.LowerInc, true, y.Upper, y.UpperInc, false) <= 0
+}
+
+// rangeBefore reports whether a is strictly left of b, every point of a below every point of b (PG
+// range_before): a's upper bound is below b's lower bound. The empty range is never strictly
+// left/right of anything.
+func rangeBefore(a, b *RangeVal) bool {
+	if a.Empty || b.Empty {
+		return false
+	}
+	return cmpBounds(a.Upper, a.UpperInc, false, b.Lower, b.LowerInc, true) < 0
+}
+
+// rangeAfter reports whether a is strictly right of b (PG range_after), i.e. b << a.
+func rangeAfter(a, b *RangeVal) bool {
+	return rangeBefore(b, a)
+}
+
+// rangeOverleft reports whether a does not extend to the right of b (a.upper ≤ b.upper; PG
+// range_overleft).
+func rangeOverleft(a, b *RangeVal) bool {
+	if a.Empty || b.Empty {
+		return false
+	}
+	return cmpBounds(a.Upper, a.UpperInc, false, b.Upper, b.UpperInc, false) <= 0
+}
+
+// rangeOverright reports whether a does not extend to the left of b (a.lower ≥ b.lower; PG
+// range_overright).
+func rangeOverright(a, b *RangeVal) bool {
+	if a.Empty || b.Empty {
+		return false
+	}
+	return cmpBounds(a.Lower, a.LowerInc, true, b.Lower, b.LowerInc, true) >= 0
+}
+
+// rangeAdjacent reports whether a and b are adjacent: they touch at exactly one boundary value with
+// complementary inclusivity (no gap, no overlap; PG range_adjacent). Over the CANONICAL representation
+// this is just "a's upper bound value equals b's lower bound value, exactly one inclusive, or vice
+// versa" — the discrete [) canonicalization already folded the integer/date step into the bounds.
+func rangeAdjacent(a, b *RangeVal) bool {
+	if a.Empty || b.Empty {
+		return false
+	}
+	return boundsTouch(a.Upper, a.UpperInc, b.Lower, b.LowerInc) ||
+		boundsTouch(b.Upper, b.UpperInc, a.Lower, a.LowerInc)
+}
+
+// boundsTouch reports whether a finite upper bound and a finite lower bound meet at one point with
+// complementary inclusivity (exactly one includes the shared value) — the adjacency condition. An
+// infinite bound never touches.
+func boundsTouch(upper *Value, upperInc bool, lower *Value, lowerInc bool) bool {
+	if upper == nil || lower == nil {
+		return false
+	}
+	return rangeElemCmp(*upper, *lower) == 0 && upperInc != lowerInc
 }
 
 // --- text output -----------------------------------------------------------

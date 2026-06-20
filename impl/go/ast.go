@@ -743,10 +743,19 @@ const (
 	OpConcat
 	// OpContains/OpContainedBy/OpOverlaps are the array containment/overlap operators `@>`/`<@`/`&&`
 	// (spec/design/array-functions.md §10): each `anyarray <op> anyarray → boolean`, resolved
-	// polymorphically.
+	// polymorphically. The range surface (spec/design/range-functions.md §3) reuses these three
+	// (range operands route to the range axis) and adds the five positional/adjacency operators below.
 	OpContains
 	OpContainedBy
 	OpOverlaps
+	// OpStrictlyLeft/OpStrictlyRight/OpNotExtendRight/OpNotExtendLeft/OpAdjacent are the range boolean
+	// operators `<<`/`>>`/`&<`/`&>`/`-|-` (spec/design/range-functions.md §3, RF3): range-only,
+	// `anyrange <op> anyrange → boolean`.
+	OpStrictlyLeft
+	OpStrictlyRight
+	OpNotExtendRight
+	OpNotExtendLeft
+	OpAdjacent
 )
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.

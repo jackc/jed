@@ -2475,6 +2475,138 @@ null           = "propagates"
 precedence     = 37
 errors         = []
 
+# --- the range boolean operators (../design/range-functions.md §3, RF3) ------------------------
+# The eight PostgreSQL range operators, KIND "containment" like the array ones and sharing their
+# precedence (37). `@>`/`<@`/`&&` are shared with the array surface — a RANGE operand routes to the
+# range axis (the hand-written resolve_set_op dispatches on operand type), and `@>`/`<@` add an
+# ELEMENT overload (range @> element, element <@ range; the element is coerced to the range's element
+# type). The other five (`<<` strictly-left, `>>` strictly-right, `&<` not-extend-right, `&>`
+# not-extend-left, `-|-` adjacent) are range-only, `anyrange <op> anyrange → boolean`. All return a
+# DEFINITE boolean (a range total order, never 3VL — empty ranges follow PG: the empty range contains
+# nothing and is contained by everything, overlaps nothing, is neither before/after/adjacent to
+# anything). STRICT (null = "propagates": a NULL operand → NULL). A range operand pairs only with a
+# range over the SAME element type (else 42883), matching PG's "operator does not exist".
+
+[[operator]]
+name           = "contains"
+symbol         = "@>"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "contains"
+symbol         = "@>"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyrange", "anyelement"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "contained_by"
+symbol         = "<@"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "contained_by"
+symbol         = "<@"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyelement", "anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "overlaps"
+symbol         = "&&"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "strictly_left"
+symbol         = "<<"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "strictly_right"
+symbol         = ">>"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "not_extend_right"
+symbol         = "&<"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "not_extend_left"
+symbol         = "&>"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
+[[operator]]
+name           = "adjacent"
+symbol         = "-|-"
+kind           = "containment"
+arity          = 2
+arg_families   = ["anyrange", "anyrange"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 37
+errors         = []
+
 # --- the range accessor functions (../design/range-functions.md §1, RF1) ----------------------
 # Pure readers of a range value's parts, polymorphic over the `anyrange` pseudo-family (a sibling
 # of `anyarray`/`anyelement`, §2): an `anyrange` slot matches any range argument and binds ELEM :=

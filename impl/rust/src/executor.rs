@@ -6987,6 +6987,7 @@ impl Database {
             | RExpr::ArrayFunc { args, .. }
             | RExpr::RangeFunc { args, .. }
             | RExpr::RangeCtor { args, .. }
+            | RExpr::RangeOp { args, .. }
             | RExpr::Variadic { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
@@ -8040,6 +8041,35 @@ enum RangeFunc {
     UpperInf,
 }
 
+/// The range BOOLEAN operators (spec/design/range-functions.md §3, RF3). Each is a binary infix
+/// operator returning a definite boolean (a NULL operand short-circuits to NULL at eval, like the
+/// array containment operators). `ContainsElem`/`ElemContainedBy` are the element overloads of
+/// `@>`/`<@` (the other operand is a bare element coerced to the range's element type); the rest are
+/// range-against-range. The kernels live in `range.rs`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RangeOp {
+    /// `a @> b` — range `a` contains range `b`.
+    Contains,
+    /// `r @> e` — range `r` contains element `e` (the element overload of `@>`).
+    ContainsElem,
+    /// `a <@ b` — range `a` is contained by range `b`.
+    ContainedBy,
+    /// `e <@ r` — element `e` is contained by range `r` (the element overload of `<@`).
+    ElemContainedBy,
+    /// `a && b` — ranges `a` and `b` overlap.
+    Overlaps,
+    /// `a << b` — `a` is strictly left of `b`.
+    Before,
+    /// `a >> b` — `a` is strictly right of `b`.
+    After,
+    /// `a &< b` — `a` does not extend to the right of `b`.
+    Overleft,
+    /// `a &> b` — `a` does not extend to the left of `b`.
+    Overright,
+    /// `a -|- b` — `a` and `b` are adjacent.
+    Adjacent,
+}
+
 /// The VARIADIC argument-counting functions (spec/design/array-functions.md §12). Distinct from
 /// [`ScalarFunc`] because they are non-strict (`null = "none"`, like [`ArrayFunc`]) and take either
 /// a spread of arguments or a single array via the `VARIADIC` keyword — the call form is carried on
@@ -8220,6 +8250,16 @@ enum RExpr {
     RangeCtor {
         elem: ScalarType,
         args: Vec<RExpr>,
+    },
+    /// A range BOOLEAN operator (spec/design/range-functions.md §3 — `@> <@ && << >> &< &> -|-`).
+    /// `args` are the two operands. STRICT: a NULL operand → NULL (handled in the eval arm). `elem`
+    /// is the range's element scalar — used only by the `ContainsElem`/`ElemContainedBy` element
+    /// overloads to coerce the bare-element operand to the range's element type at eval; unused (but
+    /// carried) for the range-against-range operators.
+    RangeOp {
+        op: RangeOp,
+        args: Vec<RExpr>,
+        elem: ScalarType,
     },
     /// A VARIADIC argument-counting call (spec/design/array-functions.md §12 — num_nulls/
     /// num_nonnulls). Non-strict (`null = "none"`): the kernel inspects null-ness itself, so there
@@ -8955,6 +8995,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RangeCtor { args, .. }
+        | RExpr::RangeOp { args, .. }
         | RExpr::Variadic { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
@@ -10268,6 +10309,7 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RangeCtor { args, .. }
+        | RExpr::RangeOp { args, .. }
         | RExpr::Variadic { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
@@ -10371,6 +10413,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::ArrayFunc { args, .. }
         | RExpr::RangeFunc { args, .. }
         | RExpr::RangeCtor { args, .. }
+        | RExpr::RangeOp { args, .. }
         | RExpr::Variadic { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);
@@ -13389,43 +13432,61 @@ fn resolve_binary(
             Ok((node, ResolvedType::Bool))
         }
         BinaryOp::Concat => resolve_concat(scope, lhs, rhs, agg, params),
-        BinaryOp::Contains => {
-            resolve_containment(scope, lhs, rhs, ArrayFunc::Contains, agg, params)
-        }
-        BinaryOp::ContainedBy => {
-            resolve_containment(scope, lhs, rhs, ArrayFunc::ContainedBy, agg, params)
-        }
-        BinaryOp::Overlaps => {
-            resolve_containment(scope, lhs, rhs, ArrayFunc::Overlaps, agg, params)
-        }
+        // The containment/overlap operators (@>/<@/&&, shared by arrays and ranges) and the five
+        // range-only positional/adjacency operators (<</>>/&</&>/-|-) all dispatch here: the operand
+        // type chooses the array axis (array-functions.md §10) or the range axis (range-functions.md §3).
+        BinaryOp::Contains
+        | BinaryOp::ContainedBy
+        | BinaryOp::Overlaps
+        | BinaryOp::StrictlyLeft
+        | BinaryOp::StrictlyRight
+        | BinaryOp::NotExtendRight
+        | BinaryOp::NotExtendLeft
+        | BinaryOp::Adjacent => resolve_set_op(scope, op, lhs, rhs, agg, params),
     }
 }
 
-/// Resolve an array containment/overlap operator `@>` / `<@` / `&&` (array-functions.md §10): a
-/// polymorphic `anyarray <op> anyarray → boolean`. Like `resolve_concat` (§8.1) it resolves both
-/// operands, adapts a bare literal `ARRAY[…]` to the first array operand's element type, then unifies
-/// the two element types over the single `(anyarray, anyarray)` overload — a non-array operand or an
-/// element-type mismatch is `42883`. The result is always boolean (so an all-untyped-NULL pair is
-/// NOT 42P18 — the type is determinable); the `func` kernel carries the operator. The operators are
-/// strict (`null = "propagates"`), so a NULL whole-array operand short-circuits to NULL at eval.
-fn resolve_containment(
+/// The "operator does not exist" error (42883) for a containment/positional operator whose operands
+/// are neither arrays of a common element type nor ranges of a common element type (matches PG).
+fn no_set_op_overload() -> EngineError {
+    EngineError::new(
+        SqlState::UndefinedFunction,
+        "operator does not exist: the operands are not arrays or ranges of a common element type",
+    )
+}
+
+/// Resolve a containment / overlap / positional operator (`@>` `<@` `&&` `<<` `>>` `&<` `&>` `-|-`),
+/// choosing the axis by operand type: an array operand → the array containment surface
+/// (array-functions.md §10, only `@>`/`<@`/`&&`); a range operand → the range boolean surface
+/// (range-functions.md §3). The result is always boolean (strict — a NULL operand short-circuits to
+/// NULL at eval). A non-array / non-range pair, or a positional operator on arrays, is 42883.
+fn resolve_set_op(
     scope: &Scope,
+    op: BinaryOp,
     lhs: &Expr,
     rhs: &Expr,
-    func: ArrayFunc,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
-    let no_overload = || {
-        EngineError::new(
-            SqlState::UndefinedFunction,
-            "operator does not exist: the containment/overlap operands are not arrays of a common element type",
-        )
-    };
-
     // Pass 1: resolve both operands with no hint.
-    let (mut rl, mut lt) = resolve(scope, lhs, None, agg, params)?;
-    let (mut rr, mut rt) = resolve(scope, rhs, None, agg, params)?;
+    let (rl, lt) = resolve(scope, lhs, None, agg, params)?;
+    let (rr, rt) = resolve(scope, rhs, None, agg, params)?;
+    // RANGE axis if either operand is a range. (The five positional operators are range-only; on a
+    // non-range pair they fall through to the array branch below, which rejects them as 42883.)
+    if matches!(lt, ResolvedType::Range(_)) || matches!(rt, ResolvedType::Range(_)) {
+        return resolve_range_op(scope, op, lhs, rhs, rl, lt, rr, rt, agg, params);
+    }
+
+    // ARRAY axis: only @>/<@/&& have an array overload (array-functions.md §10).
+    let func = match op {
+        BinaryOp::Contains => ArrayFunc::Contains,
+        BinaryOp::ContainedBy => ArrayFunc::ContainedBy,
+        BinaryOp::Overlaps => ArrayFunc::Overlaps,
+        // A positional/adjacency operator on non-range operands — no array overload exists.
+        _ => return Err(no_set_op_overload()),
+    };
+    let (mut rl, mut lt) = (rl, lt);
+    let (mut rr, mut rt) = (rr, rt);
     // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8), so a
     // bare `ARRAY[…]` constructor adapts to the column's element type (`xs @> ARRAY[20]`).
     let hint = match (&lt, &rt) {
@@ -13446,7 +13507,7 @@ fn resolve_containment(
 
     // Both slots are `anyarray`: the element types must unify (a non-array / mismatch is 42883).
     let tys = [lt, rt];
-    match_poly(&["anyarray", "anyarray"], &tys).ok_or_else(no_overload)?;
+    match_poly(&["anyarray", "anyarray"], &tys).ok_or_else(no_set_op_overload)?;
     Ok((
         RExpr::ArrayFunc {
             func,
@@ -13454,6 +13515,115 @@ fn resolve_containment(
         },
         ResolvedType::Bool,
     ))
+}
+
+/// Map a containment/positional `BinaryOp` to its range-against-range kernel (`RangeOp`).
+fn range_op_for(op: BinaryOp) -> RangeOp {
+    match op {
+        BinaryOp::Contains => RangeOp::Contains,
+        BinaryOp::ContainedBy => RangeOp::ContainedBy,
+        BinaryOp::Overlaps => RangeOp::Overlaps,
+        BinaryOp::StrictlyLeft => RangeOp::Before,
+        BinaryOp::StrictlyRight => RangeOp::After,
+        BinaryOp::NotExtendRight => RangeOp::Overleft,
+        BinaryOp::NotExtendLeft => RangeOp::Overright,
+        BinaryOp::Adjacent => RangeOp::Adjacent,
+        _ => unreachable!("range_op_for is only called for the eight set/positional operators"),
+    }
+}
+
+/// Resolve the RANGE axis of a containment/positional operator (range-functions.md §3), with both
+/// operands already resolved (pass 1). The overload is chosen by the operand types: range×range (the
+/// elements must match, else 42883) for every operator; the bare element overloads `range @> element`
+/// and `element <@ range` re-resolve the element operand with the range's element type as the hint and
+/// type-check assignability. A bare untyped `NULL` on one side is treated as a NULL range (the
+/// range×range overload; eval yields NULL). Anything else is 42883.
+#[allow(clippy::too_many_arguments)]
+fn resolve_range_op(
+    scope: &Scope,
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    rl: RExpr,
+    lt: ResolvedType,
+    rr: RExpr,
+    rt: ResolvedType,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    match (&lt, &rt) {
+        // range × range (or a bare NULL on one side, taken as a NULL range): the elements must match.
+        (ResolvedType::Range(le), ResolvedType::Range(re)) => {
+            if resolved_range_element_scalar(le) != resolved_range_element_scalar(re) {
+                return Err(no_set_op_overload());
+            }
+            let elem = resolved_range_element_scalar(le).expect("a range element is scalar");
+            Ok((
+                RExpr::RangeOp {
+                    op: range_op_for(op),
+                    args: vec![rl, rr],
+                    elem,
+                },
+                ResolvedType::Bool,
+            ))
+        }
+        (ResolvedType::Range(le), ResolvedType::Null) => {
+            let elem = resolved_range_element_scalar(le).expect("a range element is scalar");
+            Ok((
+                RExpr::RangeOp {
+                    op: range_op_for(op),
+                    args: vec![rl, rr],
+                    elem,
+                },
+                ResolvedType::Bool,
+            ))
+        }
+        (ResolvedType::Null, ResolvedType::Range(re)) => {
+            let elem = resolved_range_element_scalar(re).expect("a range element is scalar");
+            Ok((
+                RExpr::RangeOp {
+                    op: range_op_for(op),
+                    args: vec![rl, rr],
+                    elem,
+                },
+                ResolvedType::Bool,
+            ))
+        }
+        // `range @> element` — the element overload of `@>` (the only operator with one). Re-resolve
+        // the right operand with the range's element as the hint, then check it is assignable.
+        (ResolvedType::Range(le), _) if op == BinaryOp::Contains => {
+            let elem = resolved_range_element_scalar(le).expect("a range element is scalar");
+            let (re_node, re_ty) = resolve(scope, rhs, Some(elem), agg, params)?;
+            if !range_bound_assignable(&re_ty, elem) {
+                return Err(no_set_op_overload());
+            }
+            Ok((
+                RExpr::RangeOp {
+                    op: RangeOp::ContainsElem,
+                    args: vec![rl, re_node],
+                    elem,
+                },
+                ResolvedType::Bool,
+            ))
+        }
+        // `element <@ range` — the element overload of `<@`.
+        (_, ResolvedType::Range(re)) if op == BinaryOp::ContainedBy => {
+            let elem = resolved_range_element_scalar(re).expect("a range element is scalar");
+            let (le_node, le_ty) = resolve(scope, lhs, Some(elem), agg, params)?;
+            if !range_bound_assignable(&le_ty, elem) {
+                return Err(no_set_op_overload());
+            }
+            Ok((
+                RExpr::RangeOp {
+                    op: RangeOp::ElemContainedBy,
+                    args: vec![le_node, rr],
+                    elem,
+                },
+                ResolvedType::Bool,
+            ))
+        }
+        _ => Err(no_set_op_overload()),
+    }
 }
 
 /// Resolve a quantified array comparison `x op ANY/SOME/ALL(arr)` (array-functions.md §11): the
@@ -13566,6 +13736,11 @@ fn binary_op_symbol(op: BinaryOp) -> &'static str {
         BinaryOp::Contains => "@>",
         BinaryOp::ContainedBy => "<@",
         BinaryOp::Overlaps => "&&",
+        BinaryOp::StrictlyLeft => "<<",
+        BinaryOp::StrictlyRight => ">>",
+        BinaryOp::NotExtendRight => "&<",
+        BinaryOp::NotExtendLeft => "&>",
+        BinaryOp::Adjacent => "-|-",
     }
 }
 
@@ -14259,6 +14434,54 @@ fn coerce_range_bound(v: Value, elem: ScalarType) -> Result<Option<Value>> {
     match store_value(v, elem, None, false, "range bound")? {
         Value::Null => Ok(None),
         other => Ok(Some(other)),
+    }
+}
+
+/// Evaluate a range boolean operator (range-functions.md §3, RF3) over two already-evaluated operand
+/// values. STRICT: a NULL operand → NULL. For the range-against-range operators both operands are
+/// ranges; for the element overloads (`ContainsElem`/`ElemContainedBy`) the non-range operand is
+/// coerced to the range's element type `elem` (assignment-style, matching the resolver's hint). The
+/// boolean kernels live in `range.rs`.
+fn eval_range_op(op: RangeOp, l: &Value, r: &Value, elem: ScalarType) -> Result<Value> {
+    if matches!(l, Value::Null) || matches!(r, Value::Null) {
+        return Ok(Value::Null);
+    }
+    let result = match op {
+        // `range @> element`: l is the range, r the element (coerced to the range's element type).
+        RangeOp::ContainsElem => {
+            let e = store_value(r.clone(), elem, None, false, "range element")?;
+            crate::range::range_contains_elem(expect_range(l), &e)
+        }
+        // `element <@ range`: l is the element, r the range.
+        RangeOp::ElemContainedBy => {
+            let e = store_value(l.clone(), elem, None, false, "range element")?;
+            crate::range::range_contains_elem(expect_range(r), &e)
+        }
+        _ => {
+            let (a, b) = (expect_range(l), expect_range(r));
+            match op {
+                RangeOp::Contains => crate::range::range_contains(a, b),
+                RangeOp::ContainedBy => crate::range::range_contains(b, a),
+                RangeOp::Overlaps => crate::range::range_overlaps(a, b),
+                RangeOp::Before => crate::range::range_before(a, b),
+                RangeOp::After => crate::range::range_after(a, b),
+                RangeOp::Overleft => crate::range::range_overleft(a, b),
+                RangeOp::Overright => crate::range::range_overright(a, b),
+                RangeOp::Adjacent => crate::range::range_adjacent(a, b),
+                RangeOp::ContainsElem | RangeOp::ElemContainedBy => {
+                    unreachable!("element overloads handled above")
+                }
+            }
+        }
+    };
+    Ok(Value::Bool(result))
+}
+
+/// Extract the [`RangeVal`] from a value the resolver guaranteed is a (non-NULL) range operand.
+fn expect_range(v: &Value) -> &RangeVal {
+    match v {
+        Value::Range(rv) => rv,
+        _ => unreachable!("the range-operator resolver guarantees a range operand here"),
     }
 }
 
@@ -16915,6 +17138,15 @@ impl RExpr {
                     vals.push(a.eval(row, env, m)?);
                 }
                 eval_range_ctor(*elem, &vals)
+            }
+            // A range BOOLEAN operator (spec/design/range-functions.md §3). One operator_eval; the
+            // operands charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in
+            // `eval_range_op`.
+            RExpr::RangeOp { op, args, elem } => {
+                m.charge(COSTS.operator_eval);
+                let l = args[0].eval(row, env, m)?;
+                let r = args[1].eval(row, env, m)?;
+                eval_range_op(*op, &l, &r, *elem)
             }
             // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One
             // operator_eval (the per-element/arg count walk is unmetered, like the array

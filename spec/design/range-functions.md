@@ -3,8 +3,8 @@
 > The function/operator surface over the six range types (`spec/design/ranges.md` is the type
 > axis — value model, codec, comparison). Delivered in slices **RF1–RF4** (ranges.md §11).
 > Every behavior here is oracle-pinned against `postgres:18`. This doc grows one section per
-> slice; **RF1 (the accessor functions) and RF2 (the constructor functions) have landed; RF3–RF4
-> (the operator surface) are deferred.**
+> slice; **RF1 (accessors), RF2 (constructors), and RF3 (the boolean operators) have landed; RF4
+> (the set operators) is deferred.**
 
 The polymorphic machinery is shared with the array function surface (`array-functions.md` §2):
 one type variable **ELEM**, bound from the polymorphic argument slots and read back into the
@@ -135,9 +135,65 @@ hint, type-checks assignability, and emits a `RangeCtor { elem, args }` node. Th
 flags (default `[)`, or the parsed 3-arg text), and calls `finalize`. No on-disk change (RF2 is a
 query surface only).
 
-## 3. Boolean operators (RF3) — *deferred*
+## 3. Boolean operators (RF3)
 
-`@>` `<@` `&&` `<<` `>>` `&<` `&>` `-|-`.
+The eight PostgreSQL range boolean operators, each returning a **definite boolean** (a range total
+order, never composite's 3VL — like the comparison operators of ranges.md §6). All are **STRICT**:
+a SQL-`NULL` operand yields `NULL`. Catalog rows: `spec/functions/catalog.toml`
+(`kind = "containment"`, sharing `||`'s precedence 37).
+
+| Operator | Overloads | Meaning |
+|---|---|---|
+| `@>` | `(anyrange, anyrange)`, `(anyrange, anyelement)` | `a` contains range / element `b` |
+| `<@` | `(anyrange, anyrange)`, `(anyelement, anyrange)` | range / element `a` contained by `b` |
+| `&&` | `(anyrange, anyrange)` | `a` and `b` overlap (share a point) |
+| `<<` | `(anyrange, anyrange)` | `a` is strictly left of `b` |
+| `>>` | `(anyrange, anyrange)` | `a` is strictly right of `b` |
+| `&<` | `(anyrange, anyrange)` | `a` does not extend to the right of `b` |
+| `&>` | `(anyrange, anyrange)` | `a` does not extend to the left of `b` |
+| `-\|-` | `(anyrange, anyrange)` | `a` and `b` are adjacent |
+
+**Two axes, one dispatch.** `@>`/`<@`/`&&` are **shared with the array containment surface**
+(`array-functions.md` §10). The hand-written resolver (`resolve_set_op`) resolves both operands and
+dispatches by type: an **array** operand → the array axis; a **range** operand → the range axis
+(`resolve_range_op`). The five positional/adjacency operators are **range-only** (a non-range pair
+is `42883`). A range operand pairs only with a range over the **same element type** — a cross-element
+pair (`int4range @> int8range`) is `42883` (`operator does not exist`), matching PG. The downstream
+array GIN-scan planner (`gin_match`) is untouched: it keys off `ArrayFunc` nodes over a GIN-indexed
+*array* column, and a range operand produces a `RangeOp` node (ranges are not GIN-indexable), so it
+never mis-fires.
+
+**Element overloads.** `@>` and `<@` accept a bare **element** on the non-range side (`range @> 5`,
+`5 <@ range`). The element is resolved with the range's element type as the literal-adaptation hint
+and coerced assignment-style (reusing RF2's machinery), so `int4range(1,10) @> 5` adapts `5` to `i32`
+and `numrange(1,5) @> 5.0` compares decimals. A non-assignable element (a string for an integer
+range) is `42883`.
+
+**Empty-range edges (oracle-pinned).** The empty range **contains nothing** and is **contained by
+everything** (`'empty' @> r` is false; `r @> 'empty'` is true); it **overlaps nothing**; and it is
+**neither strictly-left/right of nor adjacent to** anything (the positional/adjacency operators
+return `false` whenever either operand is empty). These fall out of the kernels' explicit empty
+guards.
+
+**Adjacency.** Over the canonical representation, `a -|- b` reduces to "`a`'s upper bound value
+equals `b`'s lower bound value with **exactly one inclusive**, or vice versa" — the discrete `[)`
+canonicalization already folded the integer/date step into the bounds, so no separate discrete path
+is needed (`[1,5) -|- [5,9)` is adjacent; `[1,5] -|- [5,9)` overlaps so is not; `[1,5) -|- (5,9)`
+has a gap so is not).
+
+**New tokens (lexer).** `<<` `>>` `&<` `&>` `-|-` are added to the lexer, each scanned greedily.
+`-|-` is checked **before** the `--` line comment (its middle `|` keeps the two disjoint, but the
+order is explicit). jed has **no integer bit-shift**, so `<<`/`>>` are range-only — `5 << 2` is
+`42883` (`operator does not exist`), a documented divergence from PG (which computes `20`).
+
+**Per core.** New `BinaryOp` variants (`StrictlyLeft`/`StrictlyRight`/`NotExtendRight`/
+`NotExtendLeft`/`Adjacent`) parsed at the `parse_concat` rung; `resolve_set_op` (array-vs-range
+dispatch) + `resolve_range_op` (the range axis); a `RangeOp` node carrying the operator and the
+range's element scalar (for the element overloads' eval coercion); the eight boolean kernels in
+`range.rs` (`range_contains`/`range_contains_elem`/`range_overlaps`/`range_before`/`range_after`/
+`range_overleft`/`range_overright`/`range_adjacent`) over a general `cmp_bounds` (PG
+`range_cmp_bounds` generalized to compare a lower against an upper). No on-disk change (RF3 is a
+query surface only).
 
 ## 4. Set operators (RF4) — *deferred*
 

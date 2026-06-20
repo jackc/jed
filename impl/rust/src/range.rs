@@ -344,11 +344,8 @@ pub fn range_total_cmp(a: &RangeVal, b: &RangeVal) -> Ordering {
 }
 
 /// Compare two range bounds on the same side (lower-vs-lower or upper-vs-upper), PG
-/// `range_cmp_bounds`. A `None` value is the unbounded/infinite bound: an infinite **lower** is
-/// below any finite lower, an infinite **upper** is above any finite upper. For equal finite
-/// values the inclusivity breaks the tie, and the direction depends on the side: a lower bound
-/// sorts inclusive-before-exclusive (`[1` < `(1`), an upper bound sorts exclusive-before-inclusive
-/// (`1)` < `1]`). `is_lower` selects that direction.
+/// `range_cmp_bounds`. The same-side specialization of [`cmp_bounds`] (both bounds carry the same
+/// `is_lower`), used by the total order; a `None` value is the unbounded/infinite bound.
 fn cmp_bound(
     v1: Option<&Value>,
     inc1: bool,
@@ -356,17 +353,43 @@ fn cmp_bound(
     inc2: bool,
     is_lower: bool,
 ) -> Ordering {
+    cmp_bounds(v1, inc1, is_lower, v2, inc2, is_lower)
+}
+
+/// The general PG `range_cmp_bounds`: compare two range bounds that may be on DIFFERENT sides — each
+/// carries its own value (`None` = infinite), inclusivity, and `is_lower` flag (the boolean operators
+/// RF3 compare a lower against an upper). An infinite **lower** is below everything; an infinite
+/// **upper** is above everything. For equal finite values only a differing inclusivity breaks the tie:
+/// the exclusive bound sits just *inside* on its own side, so an exclusive LOWER sorts after (it
+/// starts later) and an exclusive UPPER sorts before (it ends earlier). `cmp_bound` (same-side) is the
+/// `is_lower1 == is_lower2` case.
+fn cmp_bounds(
+    v1: Option<&Value>,
+    inc1: bool,
+    lower1: bool,
+    v2: Option<&Value>,
+    inc2: bool,
+    lower2: bool,
+) -> Ordering {
     match (v1, v2) {
-        (None, None) => Ordering::Equal,
+        (None, None) => {
+            if lower1 == lower2 {
+                Ordering::Equal
+            } else if lower1 {
+                Ordering::Less
+            } else {
+                Ordering::Greater
+            }
+        }
         (None, Some(_)) => {
-            if is_lower {
+            if lower1 {
                 Ordering::Less
             } else {
                 Ordering::Greater
             }
         }
         (Some(_), None) => {
-            if is_lower {
+            if lower2 {
                 Ordering::Greater
             } else {
                 Ordering::Less
@@ -377,26 +400,202 @@ fn cmp_bound(
             if c != Ordering::Equal {
                 return c;
             }
-            // Equal values: an exclusive lower sorts after an inclusive lower; an exclusive upper
-            // sorts before an inclusive upper (the rest fall out of the both-equal cases).
+            // Equal values: only a differing inclusivity breaks the tie (PG range_cmp_bounds). The
+            // exclusive side decides — an exclusive lower sorts after, an exclusive upper before.
             match (inc1, inc2) {
-                (true, true) | (false, false) => Ordering::Equal,
-                (false, true) => {
-                    if is_lower {
-                        Ordering::Greater
-                    } else {
-                        Ordering::Less
-                    }
-                }
                 (true, false) => {
-                    if is_lower {
+                    if lower2 {
                         Ordering::Less
                     } else {
                         Ordering::Greater
                     }
                 }
+                (false, true) => {
+                    if lower1 {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                _ => Ordering::Equal,
             }
         }
+    }
+}
+
+// --- boolean operators (RF3, spec/design/range-functions.md §3) -------------
+// The eight PG range boolean operators, each a definite boolean over CANONICAL range values (never
+// 3-valued — like the total order, unlike composite; a NULL operand is short-circuited by the
+// evaluator before these are called). Containment/overlap/positional/adjacent, built on the general
+// bound comparison `cmp_bounds`. Empty-range edges follow PG: the empty range contains nothing and is
+// contained by everything; it overlaps nothing and is neither before/after/adjacent to anything.
+
+/// `r @> e` — does range `r` contain element value `e` (PG `range_contains_elem`). `e` is already the
+/// range's element type (the resolver coerced it). The empty range contains nothing.
+pub fn range_contains_elem(r: &RangeVal, e: &Value) -> bool {
+    if r.empty {
+        return false;
+    }
+    if let Some(lo) = r.lower.as_deref() {
+        match elem_cmp(e, lo) {
+            Ordering::Less => return false,
+            Ordering::Equal if !r.lower_inc => return false,
+            _ => {}
+        }
+    }
+    if let Some(hi) = r.upper.as_deref() {
+        match elem_cmp(e, hi) {
+            Ordering::Greater => return false,
+            Ordering::Equal if !r.upper_inc => return false,
+            _ => {}
+        }
+    }
+    true
+}
+
+/// `a @> b` — does range `a` contain range `b` (PG `range_contains`): the empty range is contained by
+/// everything, and a non-empty `b` is contained only when `a`'s lower bound is ≤ `b`'s and `a`'s upper
+/// bound is ≥ `b`'s (each in the `cmp_bounds` sense).
+pub fn range_contains(a: &RangeVal, b: &RangeVal) -> bool {
+    if b.empty {
+        return true;
+    }
+    if a.empty {
+        return false;
+    }
+    cmp_bounds(
+        a.lower.as_deref(),
+        a.lower_inc,
+        true,
+        b.lower.as_deref(),
+        b.lower_inc,
+        true,
+    ) != Ordering::Greater
+        && cmp_bounds(
+            a.upper.as_deref(),
+            a.upper_inc,
+            false,
+            b.upper.as_deref(),
+            b.upper_inc,
+            false,
+        ) != Ordering::Less
+}
+
+/// `a && b` — do ranges `a` and `b` overlap, sharing at least one point (PG `range_overlaps`). The
+/// empty range overlaps nothing. They overlap iff one range's lower bound lies within the other.
+pub fn range_overlaps(a: &RangeVal, b: &RangeVal) -> bool {
+    if a.empty || b.empty {
+        return false;
+    }
+    lower_within(a, b) || lower_within(b, a)
+}
+
+/// Whether the lower bound of `x` lies within `y` (x.lower ≥ y.lower and x.lower ≤ y.upper, in the
+/// `cmp_bounds` sense) — the half-test of [`range_overlaps`].
+fn lower_within(x: &RangeVal, y: &RangeVal) -> bool {
+    cmp_bounds(
+        x.lower.as_deref(),
+        x.lower_inc,
+        true,
+        y.lower.as_deref(),
+        y.lower_inc,
+        true,
+    ) != Ordering::Less
+        && cmp_bounds(
+            x.lower.as_deref(),
+            x.lower_inc,
+            true,
+            y.upper.as_deref(),
+            y.upper_inc,
+            false,
+        ) != Ordering::Greater
+}
+
+/// `a << b` — is `a` strictly left of `b`, every point of `a` below every point of `b` (PG
+/// `range_before`): `a`'s upper bound is below `b`'s lower bound. The empty range is never strictly
+/// left/right of anything.
+pub fn range_before(a: &RangeVal, b: &RangeVal) -> bool {
+    if a.empty || b.empty {
+        return false;
+    }
+    cmp_bounds(
+        a.upper.as_deref(),
+        a.upper_inc,
+        false,
+        b.lower.as_deref(),
+        b.lower_inc,
+        true,
+    ) == Ordering::Less
+}
+
+/// `a >> b` — is `a` strictly right of `b` (PG `range_after`), i.e. `b << a`.
+pub fn range_after(a: &RangeVal, b: &RangeVal) -> bool {
+    range_before(b, a)
+}
+
+/// `a &< b` — does `a` not extend to the right of `b` (a.upper ≤ b.upper; PG `range_overleft`).
+pub fn range_overleft(a: &RangeVal, b: &RangeVal) -> bool {
+    if a.empty || b.empty {
+        return false;
+    }
+    cmp_bounds(
+        a.upper.as_deref(),
+        a.upper_inc,
+        false,
+        b.upper.as_deref(),
+        b.upper_inc,
+        false,
+    ) != Ordering::Greater
+}
+
+/// `a &> b` — does `a` not extend to the left of `b` (a.lower ≥ b.lower; PG `range_overright`).
+pub fn range_overright(a: &RangeVal, b: &RangeVal) -> bool {
+    if a.empty || b.empty {
+        return false;
+    }
+    cmp_bounds(
+        a.lower.as_deref(),
+        a.lower_inc,
+        true,
+        b.lower.as_deref(),
+        b.lower_inc,
+        true,
+    ) != Ordering::Less
+}
+
+/// `a -|- b` — are `a` and `b` adjacent: they touch at exactly one boundary value with complementary
+/// inclusivity (no gap, no overlap; PG `range_adjacent`). Over the CANONICAL representation this is
+/// just "`a`'s upper bound value equals `b`'s lower bound value, exactly one inclusive, or vice
+/// versa" — the discrete `[)` canonicalization already folded the integer/date step into the bounds.
+pub fn range_adjacent(a: &RangeVal, b: &RangeVal) -> bool {
+    if a.empty || b.empty {
+        return false;
+    }
+    bounds_touch(
+        a.upper.as_deref(),
+        a.upper_inc,
+        b.lower.as_deref(),
+        b.lower_inc,
+    ) || bounds_touch(
+        b.upper.as_deref(),
+        b.upper_inc,
+        a.lower.as_deref(),
+        a.lower_inc,
+    )
+}
+
+/// Whether a finite upper bound and a finite lower bound meet at one point with complementary
+/// inclusivity (exactly one includes the shared value) — the adjacency condition. An infinite bound
+/// never touches.
+fn bounds_touch(
+    upper: Option<&Value>,
+    upper_inc: bool,
+    lower: Option<&Value>,
+    lower_inc: bool,
+) -> bool {
+    match (upper, lower) {
+        (Some(u), Some(l)) => elem_cmp(u, l) == Ordering::Equal && (upper_inc != lower_inc),
+        _ => false,
     }
 }
 

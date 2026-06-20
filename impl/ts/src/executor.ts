@@ -204,9 +204,17 @@ import {
   finalizeRange,
   parseBoundFlags,
   parseRangeText,
+  rangeAdjacent,
+  rangeAfter,
+  rangeBefore,
   rangeByName,
+  rangeContains,
+  rangeContainsElem,
   rangeForElement,
   rangeNameForElement,
+  rangeOverlaps,
+  rangeOverleft,
+  rangeOverright,
   rangeTotalCmp,
 } from "./range.ts";
 import type { RangeDesc } from "./ranges_gen.ts";
@@ -6326,6 +6334,7 @@ export class Database {
       case "arrayFunc":
       case "rangeFunc":
       case "rangeCtor":
+      case "rangeOp":
       case "variadic":
         e.args = e.args.map((a) =>
           this.foldUncorrelatedInRExpr(a, bound, ctes, cost),
@@ -6632,6 +6641,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "arrayFunc":
     case "rangeFunc":
     case "rangeCtor":
+    case "rangeOp":
     case "variadic":
       return e.args.every(rexprIsConstant);
     case "inValues":
@@ -7513,6 +7523,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "arrayFunc":
     case "rangeFunc":
     case "rangeCtor":
+    case "rangeOp":
     case "variadic":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
@@ -7599,6 +7610,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "arrayFunc":
     case "rangeFunc":
     case "rangeCtor":
+    case "rangeOp":
     case "variadic":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
@@ -7942,6 +7954,12 @@ type RExpr =
   // handled in the kernel. The kernel coerces each bound to `elem` (assignment-style), reads the
   // bounds flags, and finalizes (canonicalize / order-check / empty-normalize).
   | { kind: "rangeCtor"; elem: ScalarType; args: RExpr[] }
+  // A range BOOLEAN operator (spec/design/range-functions.md §3 — `@> <@ && << >> &< &> -|-`).
+  // `args` are the two operands. STRICT: a NULL operand → NULL (handled in the eval arm). `elem` is
+  // the range's element scalar — used only by the "containsElem"/"elemContainedBy" element overloads
+  // to coerce the bare-element operand to the range's element type at eval; unused (but carried) for
+  // the range-against-range operators.
+  | { kind: "rangeOp"; op: RangeOpName; args: RExpr[]; elem: ScalarType }
   // A VARIADIC argument-counting call (spec/design/array-functions.md §12 — num_nulls/num_nonnulls).
   // Non-strict (null = "none"), like "arrayFunc": no blanket NULL short-circuit. `arrayForm` records
   // the call shape — false = the spread form (count `args`' null-ness directly, never NULL); true =
@@ -8065,6 +8083,24 @@ type RangeFuncName =
   | "upper_inc"
   | "lower_inf"
   | "upper_inf";
+
+// RangeOpName is the internal identity of a range BOOLEAN operator node
+// (spec/design/range-functions.md §3, RF3). Each is a binary infix operator returning a definite
+// boolean (a NULL operand short-circuits to NULL at eval, like the array containment operators).
+// "containsElem"/"elemContainedBy" are the element overloads of @>/<@ (the other operand is a bare
+// element coerced to the range's element type); the rest are range-against-range. The kernels live in
+// range.ts.
+type RangeOpName =
+  | "contains" // a @> b — range a contains range b
+  | "containsElem" // r @> e — range r contains element e (the element overload of @>)
+  | "containedBy" // a <@ b — range a is contained by range b
+  | "elemContainedBy" // e <@ r — element e is contained by range r (the element overload of <@)
+  | "overlaps" // a && b — ranges a and b overlap
+  | "before" // a << b — a is strictly left of b
+  | "after" // a >> b — a is strictly right of b
+  | "overleft" // a &< b — a does not extend to the right of b
+  | "overright" // a &> b — a does not extend to the left of b
+  | "adjacent"; // a -|- b — a and b are adjacent
 
 // VariadicFuncName is the internal identity of a VARIADIC counting-function node
 // (spec/design/array-functions.md §12). Both return i32; the call form lives on the node.
@@ -11853,12 +11889,18 @@ function resolveBinary(
     }
     case "concat":
       return resolveConcat(scope, lhs, rhs, ag, params);
+    // The containment/overlap operators (@>/<@/&&, shared by arrays and ranges) and the five
+    // range-only positional/adjacency operators (<</>>/&</&>/-|-) all dispatch here: the operand
+    // type chooses the array axis (array-functions.md §10) or the range axis (range-functions.md §3).
     case "contains":
-      return resolveContainment(scope, lhs, rhs, "contains", ag, params);
     case "containedBy":
-      return resolveContainment(scope, lhs, rhs, "contained_by", ag, params);
     case "overlaps":
-      return resolveContainment(scope, lhs, rhs, "overlaps", ag, params);
+    case "strictlyLeft":
+    case "strictlyRight":
+    case "notExtendRight":
+    case "notExtendLeft":
+    case "adjacent":
+      return resolveSetOp(scope, op, lhs, rhs, ag, params);
     default: {
       // "and" | "or"
       const l = resolve(scope, lhs, null, ag, params);
@@ -11940,28 +11982,46 @@ function resolveConcat(
   return { node: { kind: "arrayFunc", func, args: [rl.node, rr.node] }, type };
 }
 
-// resolveContainment resolves an array containment/overlap operator `@>` / `<@` / `&&`
-// (array-functions.md §10): a polymorphic `anyarray <op> anyarray → boolean`. Like resolveConcat
-// (§8.1) it resolves both operands, adapts a bare literal ARRAY[…] to the first array operand's
-// element type, then unifies the two element types over the single (anyarray, anyarray) overload — a
-// non-array operand or an element-type mismatch is 42883. The result is always boolean (so an
-// all-untyped-NULL pair is NOT 42P18). The operators are strict (a NULL whole-array operand → NULL).
-function resolveContainment(
+// noSetOpOverload is the "operator does not exist" error (42883) for a containment/positional
+// operator whose operands are neither arrays of a common element type nor ranges of a common element
+// type (matches PG).
+function noSetOpOverload(): EngineError {
+  return engineError(
+    "undefined_function",
+    "operator does not exist: the operands are not arrays or ranges of a common element type",
+  );
+}
+
+// resolveSetOp resolves a containment / overlap / positional operator (`@>` `<@` `&&` `<<` `>>` `&<`
+// `&>` `-|-`), choosing the axis by operand type: an array operand → the array containment surface
+// (array-functions.md §10, only `@>`/`<@`/`&&`); a range operand → the range boolean surface
+// (range-functions.md §3). The result is always boolean (strict — a NULL operand short-circuits to
+// NULL at eval). A non-array / non-range pair, or a positional operator on arrays, is 42883.
+function resolveSetOp(
   scope: Scope,
+  op: BinaryOp,
   lhs: Expr,
   rhs: Expr,
-  func: ArrayFuncName,
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  const noOverload = (): EngineError =>
-    engineError(
-      "undefined_function",
-      "operator does not exist: the containment/overlap operands are not arrays of a common element type",
-    );
   // Pass 1: resolve both operands with no hint.
   let rl = resolve(scope, lhs, null, ag, params);
   let rr = resolve(scope, rhs, null, ag, params);
+  // RANGE axis if either operand is a range. (The five positional operators are range-only; on a
+  // non-range pair they fall through to the array branch below, which rejects them as 42883.)
+  if (rl.type.kind === "range" || rr.type.kind === "range") {
+    return resolveRangeOp(scope, op, lhs, rhs, rl, rr, ag, params);
+  }
+
+  // ARRAY axis: only @>/<@/&& have an array overload (array-functions.md §10).
+  let func: ArrayFuncName;
+  if (op === "contains") func = "contains";
+  else if (op === "containedBy") func = "contained_by";
+  else if (op === "overlaps") func = "overlaps";
+  // A positional/adjacency operator on non-range operands — no array overload exists.
+  else throw noSetOpOverload();
+
   // The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
   let hint: ScalarType | null = null;
   if (rl.type.kind === "array") hint = elemScalarHint(rl.type.elem);
@@ -11974,11 +12034,92 @@ function resolveContainment(
   }
   // Both slots are anyarray: the element types must unify (a non-array / mismatch is 42883).
   const tys: ResolvedType[] = [rl.type, rr.type];
-  if (!matchPoly(["anyarray", "anyarray"], tys).matched) throw noOverload();
+  if (!matchPoly(["anyarray", "anyarray"], tys).matched) throw noSetOpOverload();
   return {
     node: { kind: "arrayFunc", func, args: [rl.node, rr.node] },
     type: { kind: "bool" },
   };
+}
+
+// rangeOpFor maps a containment/positional BinaryOp to its range-against-range kernel (RangeOpName).
+function rangeOpFor(op: BinaryOp): RangeOpName {
+  switch (op) {
+    case "contains":
+      return "contains";
+    case "containedBy":
+      return "containedBy";
+    case "overlaps":
+      return "overlaps";
+    case "strictlyLeft":
+      return "before";
+    case "strictlyRight":
+      return "after";
+    case "notExtendRight":
+      return "overleft";
+    case "notExtendLeft":
+      return "overright";
+    case "adjacent":
+      return "adjacent";
+    default:
+      throw new Error("rangeOpFor is only called for the eight set/positional operators");
+  }
+}
+
+// resolveRangeOp resolves the RANGE axis of a containment/positional operator (range-functions.md §3),
+// with both operands already resolved (pass 1, to avoid double aggregate collection — only the element
+// operand re-resolves with the element hint). The overload is chosen by the operand types: range×range
+// (the elements must match, else 42883) for every operator; the bare element overloads `range @>
+// element` and `element <@ range` re-resolve the element operand with the range's element type as the
+// hint and type-check assignability. A bare untyped NULL on one side is treated as a NULL range (the
+// range×range overload; eval yields NULL). Anything else is 42883.
+function resolveRangeOp(
+  scope: Scope,
+  op: BinaryOp,
+  lhs: Expr,
+  rhs: Expr,
+  rl: { node: RExpr; type: ResolvedType },
+  rr: { node: RExpr; type: ResolvedType },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const lt = rl.type;
+  const rt = rr.type;
+  // range × range: the elements must match.
+  if (lt.kind === "range" && rt.kind === "range") {
+    const le = resolvedRangeElementScalar(lt.elem);
+    const re = resolvedRangeElementScalar(rt.elem);
+    if (le === undefined || re === undefined || le !== re) throw noSetOpOverload();
+    return { node: { kind: "rangeOp", op: rangeOpFor(op), args: [rl.node, rr.node], elem: le }, type: { kind: "bool" } };
+  }
+  // range × NULL (a bare NULL is taken as a NULL range; eval yields NULL).
+  if (lt.kind === "range" && rt.kind === "null") {
+    const le = resolvedRangeElementScalar(lt.elem);
+    if (le === undefined) throw noSetOpOverload();
+    return { node: { kind: "rangeOp", op: rangeOpFor(op), args: [rl.node, rr.node], elem: le }, type: { kind: "bool" } };
+  }
+  if (lt.kind === "null" && rt.kind === "range") {
+    const re = resolvedRangeElementScalar(rt.elem);
+    if (re === undefined) throw noSetOpOverload();
+    return { node: { kind: "rangeOp", op: rangeOpFor(op), args: [rl.node, rr.node], elem: re }, type: { kind: "bool" } };
+  }
+  // `range @> element` — the element overload of `@>` (the only operator with one). Re-resolve the
+  // right operand with the range's element as the hint, then check it is assignable.
+  if (lt.kind === "range" && op === "contains") {
+    const elem = resolvedRangeElementScalar(lt.elem);
+    if (elem === undefined) throw noSetOpOverload();
+    const re = resolve(scope, rhs, elem, ag, params);
+    if (!rangeBoundAssignable(re.type, elem)) throw noSetOpOverload();
+    return { node: { kind: "rangeOp", op: "containsElem", args: [rl.node, re.node], elem }, type: { kind: "bool" } };
+  }
+  // `element <@ range` — the element overload of `<@`.
+  if (rt.kind === "range" && op === "containedBy") {
+    const elem = resolvedRangeElementScalar(rt.elem);
+    if (elem === undefined) throw noSetOpOverload();
+    const le = resolve(scope, lhs, elem, ag, params);
+    if (!rangeBoundAssignable(le.type, elem)) throw noSetOpOverload();
+    return { node: { kind: "rangeOp", op: "elemContainedBy", args: [le.node, rr.node], elem }, type: { kind: "bool" } };
+  }
+  throw noSetOpOverload();
 }
 
 // resolveQuantified resolves a quantified array comparison `x op ANY/SOME/ALL(arr)`
@@ -12083,6 +12224,16 @@ function binaryOpSymbol(op: BinaryOp): string {
       return "<@";
     case "overlaps":
       return "&&";
+    case "strictlyLeft":
+      return "<<";
+    case "strictlyRight":
+      return ">>";
+    case "notExtendRight":
+      return "&<";
+    case "notExtendLeft":
+      return "&>";
+    case "adjacent":
+      return "-|-";
   }
 }
 
@@ -13005,6 +13156,61 @@ function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
 function coerceRangeBound(v: Value, elem: ScalarType): Value | null {
   const stored = storeValue(v, elem, null, false, "range bound");
   return stored.kind === "null" ? null : stored;
+}
+
+// expectRange extracts the range value the resolver guaranteed is a (non-NULL) range operand.
+function expectRange(v: Value): Value & { kind: "range" } {
+  if (v.kind !== "range") throw new Error("the range-operator resolver guarantees a range operand here");
+  return v;
+}
+
+// evalRangeOp evaluates a range boolean operator (range-functions.md §3, RF3) over two
+// already-evaluated operand values. STRICT: a NULL operand → NULL. For the range-against-range
+// operators both operands are ranges; for the element overloads (containsElem/elemContainedBy) the
+// non-range operand is coerced to the range's element type `elem` (assignment-style, matching the
+// resolver's hint). The boolean kernels live in range.ts.
+function evalRangeOp(op: RangeOpName, l: Value, r: Value, elem: ScalarType): Value {
+  if (l.kind === "null" || r.kind === "null") return nullValue();
+  let result: boolean;
+  switch (op) {
+    // `range @> element`: l is the range, r the element (coerced to the range's element type).
+    case "containsElem": {
+      const e = storeValue(r, elem, null, false, "range element");
+      result = rangeContainsElem(expectRange(l), e);
+      break;
+    }
+    // `element <@ range`: l is the element, r the range.
+    case "elemContainedBy": {
+      const e = storeValue(l, elem, null, false, "range element");
+      result = rangeContainsElem(expectRange(r), e);
+      break;
+    }
+    case "contains":
+      result = rangeContains(expectRange(l), expectRange(r));
+      break;
+    case "containedBy":
+      result = rangeContains(expectRange(r), expectRange(l));
+      break;
+    case "overlaps":
+      result = rangeOverlaps(expectRange(l), expectRange(r));
+      break;
+    case "before":
+      result = rangeBefore(expectRange(l), expectRange(r));
+      break;
+    case "after":
+      result = rangeAfter(expectRange(l), expectRange(r));
+      break;
+    case "overleft":
+      result = rangeOverleft(expectRange(l), expectRange(r));
+      break;
+    case "overright":
+      result = rangeOverright(expectRange(l), expectRange(r));
+      break;
+    case "adjacent":
+      result = rangeAdjacent(expectRange(l), expectRange(r));
+      break;
+  }
+  return boolValue(result);
 }
 
 // notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
@@ -14797,6 +15003,15 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const vals: Value[] = [];
       for (const a of e.args) vals.push(evalExpr(a, row, env, m));
       return evalRangeCtor(e.elem, vals);
+    }
+    case "rangeOp": {
+      // A range BOOLEAN operator (spec/design/range-functions.md §3, RF3). One operator_eval; the
+      // operands charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in
+      // evalRangeOp.
+      m.charge(COSTS.operatorEval);
+      const l = evalExpr(e.args[0]!, row, env, m);
+      const r = evalExpr(e.args[1]!, row, env, m);
+      return evalRangeOp(e.op, l, r, e.elem);
     }
     case "variadic": {
       // A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval

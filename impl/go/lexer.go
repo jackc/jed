@@ -78,10 +78,16 @@ func Lex(sql string) ([]Token, error) {
 			tokens = append(tokens, Token{Kind: TokPlus})
 			i++
 		case c == '-':
-			// `--` starts a line comment running to the end of the line; comments are
-			// whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
-			// string, even abutting a token (`1--2` is `1` — PG behavior).
-			if i+1 < len(b) && b[i+1] == '-' {
+			// `-|-` is the range adjacency operator (range-functions.md §3), scanned greedily and
+			// checked FIRST so it is never mistaken for `-` (Minus) `|-`. Its middle `|` keeps it
+			// disjoint from the `--` line comment (which needs a second `-`).
+			if i+2 < len(b) && b[i+1] == '|' && b[i+2] == '-' {
+				tokens = append(tokens, Token{Kind: TokAdjacent})
+				i += 3
+			} else if i+1 < len(b) && b[i+1] == '-' {
+				// `--` starts a line comment running to the end of the line; comments are
+				// whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
+				// string, even abutting a token (`1--2` is `1` — PG behavior).
 				i += 2
 				for i < len(b) && b[i] != '\n' && b[i] != '\r' {
 					i++
@@ -162,6 +168,10 @@ func Lex(sql string) ([]Token, error) {
 				// `<@` is the array contained-by operator (grammar.md §40), scanned greedily.
 				tokens = append(tokens, Token{Kind: TokContainedBy})
 				i += 2
+			} else if i+1 < len(b) && b[i+1] == '<' {
+				// `<<` is the range strictly-left operator (range-functions.md §3), scanned greedily.
+				tokens = append(tokens, Token{Kind: TokStrictlyLeft})
+				i += 2
 			} else {
 				tokens = append(tokens, Token{Kind: TokLt})
 				i++
@@ -185,10 +195,17 @@ func Lex(sql string) ([]Token, error) {
 				return nil, NewError(SyntaxError, "unexpected character '@'")
 			}
 		case c == '&':
-			// `&&` is the array overlap operator (grammar.md §40), scanned greedily as one token;
-			// a lone `&` is not part of jed's surface (no bitwise-and) — 42601.
+			// `&&` is the array overlap operator (grammar.md §40); `&<` (not-extend-right) and `&>`
+			// (not-extend-left) are the range positional operators (range-functions.md §3). Each
+			// scanned greedily; a lone `&` is not part of jed's surface (no bitwise-and) — 42601.
 			if i+1 < len(b) && b[i+1] == '&' {
 				tokens = append(tokens, Token{Kind: TokOverlaps})
+				i += 2
+			} else if i+1 < len(b) && b[i+1] == '<' {
+				tokens = append(tokens, Token{Kind: TokNotExtendRight})
+				i += 2
+			} else if i+1 < len(b) && b[i+1] == '>' {
+				tokens = append(tokens, Token{Kind: TokNotExtendLeft})
 				i += 2
 			} else {
 				return nil, NewError(SyntaxError, "unexpected character '&'")
@@ -196,6 +213,10 @@ func Lex(sql string) ([]Token, error) {
 		case c == '>':
 			if i+1 < len(b) && b[i+1] == '=' {
 				tokens = append(tokens, Token{Kind: TokGe})
+				i += 2
+			} else if i+1 < len(b) && b[i+1] == '>' {
+				// `>>` is the range strictly-right operator (range-functions.md §3), scanned greedily.
+				tokens = append(tokens, Token{Kind: TokStrictlyRight})
 				i += 2
 			} else {
 				tokens = append(tokens, Token{Kind: TokGt})

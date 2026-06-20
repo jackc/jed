@@ -69,6 +69,17 @@ pub enum Token {
     /// The `&&` array overlap operator (`a && b` — do `a` and `b` share an element). Two `&` scanned
     /// greedily; a lone `&` is a 42601 syntax error. See spec/design/grammar.md §40, array-functions.md §10.
     Overlaps,
+    /// The `<<` range strictly-left operator (`a << b`). Two `<`. See range-functions.md §3 (RF3).
+    StrictlyLeft,
+    /// The `>>` range strictly-right operator (`a >> b`). Two `>`. See range-functions.md §3 (RF3).
+    StrictlyRight,
+    /// The `&<` range not-extend-right operator (`a &< b`). `&` then `<`. See range-functions.md §3.
+    NotExtendRight,
+    /// The `&>` range not-extend-left operator (`a &> b`). `&` then `>`. See range-functions.md §3.
+    NotExtendLeft,
+    /// The `-|-` range adjacency operator (`a -|- b`). `-` `|` `-`, scanned greedily and checked
+    /// BEFORE the `--` line comment. See range-functions.md §3 (RF3).
+    Adjacent,
     /// End of input.
     Eof,
 }

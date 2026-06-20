@@ -82,10 +82,16 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 i += 1;
             }
             b'-' => {
-                // `--` starts a line comment running to the end of the line; comments are
-                // whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
-                // string, even abutting a token (`1--2` is `1` — PG behavior).
-                if bytes.get(i + 1) == Some(&b'-') {
+                // `-|-` is the range adjacency operator (range-functions.md §3), scanned greedily and
+                // checked FIRST so it is never mistaken for `-` (Minus) `|-`. Its middle `|` keeps it
+                // disjoint from the `--` line comment (which needs a second `-`).
+                if bytes.get(i + 1) == Some(&b'|') && bytes.get(i + 2) == Some(&b'-') {
+                    tokens.push(Token::Adjacent);
+                    i += 3;
+                } else if bytes.get(i + 1) == Some(&b'-') {
+                    // `--` starts a line comment running to the end of the line; comments are
+                    // whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
+                    // string, even abutting a token (`1--2` is `1` — PG behavior).
                     i += 2;
                     while i < bytes.len() && bytes[i] != b'\n' && bytes[i] != b'\r' {
                         i += 1;
@@ -171,6 +177,10 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                     // `<@` is the array contained-by operator (grammar.md §40), scanned greedily.
                     tokens.push(Token::ContainedBy);
                     i += 2;
+                } else if bytes.get(i + 1) == Some(&b'<') {
+                    // `<<` is the range strictly-left operator (range-functions.md §3), scanned greedily.
+                    tokens.push(Token::StrictlyLeft);
+                    i += 2;
                 } else {
                     tokens.push(Token::Lt);
                     i += 1;
@@ -197,10 +207,17 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 }
             }
             b'&' => {
-                // `&&` is the array overlap operator (grammar.md §40), scanned greedily as one
-                // token; a lone `&` is not part of jed's surface (no bitwise-and) — 42601.
+                // `&&` is the array overlap operator (grammar.md §40); `&<` (not-extend-right) and
+                // `&>` (not-extend-left) are the range positional operators (range-functions.md §3).
+                // Each scanned greedily; a lone `&` is not part of jed's surface (no bitwise-and) — 42601.
                 if bytes.get(i + 1) == Some(&b'&') {
                     tokens.push(Token::Overlaps);
+                    i += 2;
+                } else if bytes.get(i + 1) == Some(&b'<') {
+                    tokens.push(Token::NotExtendRight);
+                    i += 2;
+                } else if bytes.get(i + 1) == Some(&b'>') {
+                    tokens.push(Token::NotExtendLeft);
                     i += 2;
                 } else {
                     return Err(syntax("unexpected character '&'".to_string()));
@@ -209,6 +226,10 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
             b'>' => {
                 if i + 1 < bytes.len() && bytes[i + 1] == b'=' {
                     tokens.push(Token::Ge);
+                    i += 2;
+                } else if bytes.get(i + 1) == Some(&b'>') {
+                    // `>>` is the range strictly-right operator (range-functions.md §3), scanned greedily.
+                    tokens.push(Token::StrictlyRight);
                     i += 2;
                 } else {
                     tokens.push(Token::Gt);

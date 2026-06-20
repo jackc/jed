@@ -2218,6 +2218,11 @@ class Parser {
       else if (k === "contains") op = "contains";
       else if (k === "containedBy") op = "containedBy";
       else if (k === "overlaps") op = "overlaps";
+      else if (k === "strictlyLeft") op = "strictlyLeft";
+      else if (k === "strictlyRight") op = "strictlyRight";
+      else if (k === "notExtendRight") op = "notExtendRight";
+      else if (k === "notExtendLeft") op = "notExtendLeft";
+      else if (k === "adjacent") op = "adjacent";
       else {
         this.depth = base;
         return lhs;
@@ -2810,6 +2815,16 @@ function renderToken(t: Token): string {
       return "<@";
     case "overlaps":
       return "&&";
+    case "strictlyLeft":
+      return "<<";
+    case "strictlyRight":
+      return ">>";
+    case "notExtendRight":
+      return "&<";
+    case "notExtendLeft":
+      return "&>";
+    case "adjacent":
+      return "-|-";
     default: // "eof" — never inside the parentheses
       return "";
   }

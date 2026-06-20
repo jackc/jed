@@ -114,6 +114,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // i32range/i64range/numrange/tsrange/tstzrange/daterange (+ int4range/int8range aliases), each a
     // 2-arg (lo, hi) and 3-arg (lo, hi, bounds) overload; NULL bound → infinite, finalize/canonicalize.
     "func.range_constructors",
+    // Range boolean operators RF3 (range-functions.md §3): @> <@ && (shared with arrays, + the range
+    // @> element / element <@ range overloads) and the range-only << >> &< &> -|-, each
+    // anyrange<op>anyrange → boolean; STRICT, definite boolean, same-element-type operands.
+    "func.range_operators",
     // Array function/operator surface AF1 (array-functions.md): the polymorphic anyarray/anyelement
     // resolution + introspection (array_ndims/length/lower/upper/cardinality/dims) + builders
     // (array_append/prepend/cat).

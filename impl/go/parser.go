@@ -2876,6 +2876,16 @@ func (p *Parser) parseConcat() (Expr, error) {
 			op = OpContainedBy
 		case TokOverlaps:
 			op = OpOverlaps
+		case TokStrictlyLeft:
+			op = OpStrictlyLeft
+		case TokStrictlyRight:
+			op = OpStrictlyRight
+		case TokNotExtendRight:
+			op = OpNotExtendRight
+		case TokNotExtendLeft:
+			op = OpNotExtendLeft
+		case TokAdjacent:
+			op = OpAdjacent
 		default:
 			p.depth = base
 			return lhs, nil
@@ -3654,6 +3664,16 @@ func renderToken(t Token) string {
 		return "<@"
 	case TokOverlaps:
 		return "&&"
+	case TokStrictlyLeft:
+		return "<<"
+	case TokStrictlyRight:
+		return ">>"
+	case TokNotExtendRight:
+		return "&<"
+	case TokNotExtendLeft:
+		return "&>"
+	case TokAdjacent:
+		return "-|-"
 	default: // TokEof — never inside the parentheses
 		return ""
 	}

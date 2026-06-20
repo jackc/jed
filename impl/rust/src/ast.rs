@@ -842,9 +842,19 @@ pub enum BinaryOp {
     Concat,
     // array containment / overlap (spec/design/array-functions.md §10): `@>` contains, `<@`
     // contained-by, `&&` overlaps. Each `anyarray <op> anyarray → boolean`, resolved polymorphically.
+    // The range surface (spec/design/range-functions.md §3) reuses these three (range operands route
+    // to the range axis) and adds the five positional/adjacency operators below.
     Contains,
     ContainedBy,
     Overlaps,
+    // range boolean operators (spec/design/range-functions.md §3, RF3): `<<` strictly-left, `>>`
+    // strictly-right, `&<` not-extend-right, `&>` not-extend-left, `-|-` adjacent. Range-only,
+    // `anyrange <op> anyrange → boolean`.
+    StrictlyLeft,
+    StrictlyRight,
+    NotExtendRight,
+    NotExtendLeft,
+    Adjacent,
 }
 
 /// One ORDER BY sort key: a bare table column, a sort direction, and a resolved NULL

@@ -2351,6 +2351,11 @@ impl Parser {
                 Token::Contains => BinaryOp::Contains,
                 Token::ContainedBy => BinaryOp::ContainedBy,
                 Token::Overlaps => BinaryOp::Overlaps,
+                Token::StrictlyLeft => BinaryOp::StrictlyLeft,
+                Token::StrictlyRight => BinaryOp::StrictlyRight,
+                Token::NotExtendRight => BinaryOp::NotExtendRight,
+                Token::NotExtendLeft => BinaryOp::NotExtendLeft,
+                Token::Adjacent => BinaryOp::Adjacent,
                 _ => break,
             };
             self.deepen()?; // each chained operator is one more AST level
@@ -3020,6 +3025,11 @@ fn render_token(t: &Token) -> String {
         Token::Contains => "@>".into(),
         Token::ContainedBy => "<@".into(),
         Token::Overlaps => "&&".into(),
+        Token::StrictlyLeft => "<<".into(),
+        Token::StrictlyRight => ">>".into(),
+        Token::NotExtendRight => "&<".into(),
+        Token::NotExtendLeft => "&>".into(),
+        Token::Adjacent => "-|-".into(),
         Token::Eof => String::new(),
     }
 }

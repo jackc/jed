@@ -9037,6 +9037,12 @@ const (
 	// bound to relem (assignment-style), reads the bounds flags, and finalizes (canonicalize /
 	// order-check / empty-normalize).
 	reRangeCtor
+	// reRangeOp is a range BOOLEAN operator (spec/design/range-functions.md §3 — @> <@ && << >> &< &>
+	// -|-), evaluated per row. Its two operand nodes reuse `sargs`; `rop` selects the kernel. STRICT —
+	// a NULL operand → NULL (handled in the eval arm). `relem` carries the range's element scalar, used
+	// only by the roContainsElem/roElemContainedBy element overloads to coerce the bare-element operand
+	// to the range's element type at eval; unused (but carried) for the range-against-range operators.
+	reRangeOp
 	// reVariadic is a VARIADIC argument-counting call (spec/design/array-functions.md §12 —
 	// num_nulls/num_nonnulls). Non-strict (null = "none"): no blanket NULL short-circuit. Its
 	// argument nodes reuse `sargs`; `variadicArray` records the call shape (false = the spread form,
@@ -9188,6 +9194,26 @@ const (
 	rfUpperInf                  // upper_inf(anyrange) → boolean (false for the empty range)
 )
 
+// rangeOp selects a range BOOLEAN operator (spec/design/range-functions.md §3, RF3). Each is a binary
+// infix operator returning a definite boolean (a NULL operand short-circuits to NULL at eval, like the
+// array containment operators). roContainsElem/roElemContainedBy are the element overloads of @>/<@
+// (the other operand is a bare element coerced to the range's element type); the rest are
+// range-against-range. The kernels live in range.go.
+type rangeOp int
+
+const (
+	roContains        rangeOp = iota // a @> b — range a contains range b
+	roContainsElem                   // r @> e — range r contains element e (the element overload of @>)
+	roContainedBy                    // a <@ b — range a is contained by range b
+	roElemContainedBy                // e <@ r — element e is contained by range r (the element overload of <@)
+	roOverlaps                       // a && b — ranges a and b overlap
+	roBefore                         // a << b — a is strictly left of b
+	roAfter                          // a >> b — a is strictly right of b
+	roOverleft                       // a &< b — a does not extend to the right of b
+	roOverright                      // a &> b — a does not extend to the left of b
+	roAdjacent                       // a -|- b — a and b are adjacent
+)
+
 // variadicFunc selects a VARIADIC argument-counting function (spec/design/array-functions.md §12).
 // Both return i32; the call form (spread vs VARIADIC-array) lives on the rExpr node.
 type variadicFunc int
@@ -9238,8 +9264,11 @@ type rExpr struct {
 	// on the node — the kernel produces the result value from the operand (a range is self-describing).
 	rfunc rangeFunc
 	// reRangeCtor: the element scalar of the range being built (i32range → i32). The result range type
-	// is recovered from it (a bijection); the bound/flags argument nodes reuse `sargs`.
+	// is recovered from it (a bijection); the bound/flags argument nodes reuse `sargs`. reRangeOp also
+	// uses `relem` — the range's element scalar, for the element-overload coercion at eval.
 	relem ScalarType
+	// reRangeOp: the range boolean operator kernel. Its two operand nodes reuse `sargs`.
+	rop rangeOp
 	// reVariadic: the VARIADIC counting function and its call shape. Argument nodes reuse `sargs`;
 	// `variadicArray` true ⇒ the VARIADIC-array form (one array operand), false ⇒ the spread form.
 	vfunc         variadicFunc
@@ -10964,17 +10993,40 @@ func resolveConcat(s *scope, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rE
 	return &rExpr{kind: reArrayFunc, afunc: fn, sargs: []*rExpr{rl, rr}}, result, nil
 }
 
-// resolveContainment resolves an array containment/overlap operator `@>` / `<@` / `&&`
-// (array-functions.md §10): a polymorphic `anyarray <op> anyarray → boolean`. Like resolveConcat
-// (§8.1) it resolves both operands, adapts a bare literal ARRAY[…] to the first array operand's
-// element type, then unifies the two element types over the single (anyarray, anyarray) overload — a
-// non-array operand or an element-type mismatch is 42883. The result is always boolean (so an
-// all-untyped-NULL pair is NOT 42P18). The operators are strict (a NULL whole-array operand → NULL).
-func resolveContainment(s *scope, lhs, rhs Expr, fn arrayFunc, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
-	noOverload := func() error {
-		return NewError(UndefinedFunction,
-			"operator does not exist: the containment/overlap operands are not arrays of a common element type")
+// noSetOpOverload is the "operator does not exist" error (42883) for a containment/positional operator
+// whose operands are neither arrays of a common element type nor ranges of a common element type
+// (matches PG).
+func noSetOpOverload() error {
+	return NewError(UndefinedFunction,
+		"operator does not exist: the operands are not arrays or ranges of a common element type")
+}
+
+// setOpArrayFunc maps a containment/overlap BinaryOp to its array-axis kernel. The five positional/
+// adjacency operators have no array overload — ok is false (caller → 42883).
+func setOpArrayFunc(op BinaryOp) (arrayFunc, bool) {
+	switch op {
+	case OpContains:
+		return afContains, true
+	case OpContainedBy:
+		return afContainedBy, true
+	case OpOverlaps:
+		return afOverlaps, true
+	default:
+		return 0, false
 	}
+}
+
+// resolveSetOp resolves a containment / overlap / positional operator (`@>` `<@` `&&` `<<` `>>` `&<`
+// `&>` `-|-`), choosing the axis by operand type: an array operand → the array containment surface
+// (array-functions.md §10, only `@>`/`<@`/`&&`); a range operand → the range boolean surface
+// (range-functions.md §3). The result is always boolean (strict — a NULL operand short-circuits to
+// NULL at eval). A non-array / non-range pair, or a positional operator on arrays, is 42883.
+//
+// Like resolveConcat (§8.1) the array axis resolves both operands, adapts a bare literal ARRAY[…] to
+// the first array operand's element type, then unifies the two element types over the single
+// (anyarray, anyarray) overload. The result is always boolean (so an all-untyped-NULL pair is NOT
+// 42P18). The operators are strict (a NULL whole-array operand → NULL).
+func resolveSetOp(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	// Pass 1: resolve both operands with no hint.
 	rl, lt, err := resolve(s, lhs, nil, ag, params)
 	if err != nil {
@@ -10983,6 +11035,17 @@ func resolveContainment(s *scope, lhs, rhs Expr, fn arrayFunc, ag *aggCtx, param
 	rr, rt, err := resolve(s, rhs, nil, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
+	}
+	// RANGE axis if either operand is a range. (The five positional operators are range-only; on a
+	// non-range pair they fall through to the array branch below, which rejects them as 42883.)
+	if lt.kind == rtRange || rt.kind == rtRange {
+		return resolveRangeOp(s, op, lhs, rhs, rl, lt, rr, rt, ag, params)
+	}
+
+	// ARRAY axis: only @>/<@/&& have an array overload (array-functions.md §10).
+	fn, ok := setOpArrayFunc(op)
+	if !ok {
+		return nil, resolvedType{}, noSetOpOverload()
 	}
 	// The element hint comes from the FIRST operand that is an array (array-functions.md §5 #8).
 	var hint *ScalarType
@@ -11012,9 +11075,87 @@ func resolveContainment(s *scope, lhs, rhs Expr, fn arrayFunc, ag *aggCtx, param
 	// Both slots are anyarray: the element types must unify (a non-array / mismatch is 42883).
 	tys := []resolvedType{lt, rt}
 	if _, matched := matchPoly([]string{"anyarray", "anyarray"}, tys); !matched {
-		return nil, resolvedType{}, noOverload()
+		return nil, resolvedType{}, noSetOpOverload()
 	}
 	return &rExpr{kind: reArrayFunc, afunc: fn, sargs: []*rExpr{rl, rr}}, resolvedType{kind: rtBool}, nil
+}
+
+// rangeOpFor maps a containment/positional BinaryOp to its range-against-range kernel (rangeOp).
+func rangeOpFor(op BinaryOp) rangeOp {
+	switch op {
+	case OpContains:
+		return roContains
+	case OpContainedBy:
+		return roContainedBy
+	case OpOverlaps:
+		return roOverlaps
+	case OpStrictlyLeft:
+		return roBefore
+	case OpStrictlyRight:
+		return roAfter
+	case OpNotExtendRight:
+		return roOverleft
+	case OpNotExtendLeft:
+		return roOverright
+	default: // OpAdjacent
+		return roAdjacent
+	}
+}
+
+// resolveRangeOp resolves the RANGE axis of a containment/positional operator (range-functions.md §3),
+// with both operands already resolved (pass 1 — passed in so the element operand alone is re-resolved
+// with the element hint, never the whole pair, to avoid double-collecting aggregates). The overload is
+// chosen by the operand types: range×range (the elements must match, else 42883) for every operator;
+// the bare element overloads `range @> element` and `element <@ range` re-resolve the element operand
+// with the range's element type as the hint and type-check assignability. A bare untyped NULL on one
+// side is treated as a NULL range (the range×range overload; eval yields NULL). Anything else is 42883.
+func resolveRangeOp(s *scope, op BinaryOp, lhs, rhs Expr, rl *rExpr, lt resolvedType, rr *rExpr, rt resolvedType, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	switch {
+	// range × range (or a bare NULL on one side, taken as a NULL range): the elements must match.
+	case lt.kind == rtRange && rt.kind == rtRange:
+		le, _ := resolvedRangeElementScalar(lt.elem)
+		re, _ := resolvedRangeElementScalar(rt.elem)
+		if le != re {
+			return nil, resolvedType{}, noSetOpOverload()
+		}
+		return &rExpr{kind: reRangeOp, rop: rangeOpFor(op), relem: le, sargs: []*rExpr{rl, rr}},
+			resolvedType{kind: rtBool}, nil
+	case lt.kind == rtRange && rt.kind == rtNull:
+		elem, _ := resolvedRangeElementScalar(lt.elem)
+		return &rExpr{kind: reRangeOp, rop: rangeOpFor(op), relem: elem, sargs: []*rExpr{rl, rr}},
+			resolvedType{kind: rtBool}, nil
+	case lt.kind == rtNull && rt.kind == rtRange:
+		elem, _ := resolvedRangeElementScalar(rt.elem)
+		return &rExpr{kind: reRangeOp, rop: rangeOpFor(op), relem: elem, sargs: []*rExpr{rl, rr}},
+			resolvedType{kind: rtBool}, nil
+	// `range @> element` — the element overload of `@>` (the only operator with one). Re-resolve the
+	// right operand with the range's element as the hint, then check it is assignable.
+	case lt.kind == rtRange && op == OpContains:
+		elem, _ := resolvedRangeElementScalar(lt.elem)
+		reNode, reTy, err := resolve(s, rhs, &elem, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if !rangeBoundAssignable(reTy, elem) {
+			return nil, resolvedType{}, noSetOpOverload()
+		}
+		return &rExpr{kind: reRangeOp, rop: roContainsElem, relem: elem, sargs: []*rExpr{rl, reNode}},
+			resolvedType{kind: rtBool}, nil
+	// `element <@ range` — the element overload of `<@`.
+	case rt.kind == rtRange && op == OpContainedBy:
+		elem, _ := resolvedRangeElementScalar(rt.elem)
+		leNode, leTy, err := resolve(s, lhs, &elem, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if !rangeBoundAssignable(leTy, elem) {
+			return nil, resolvedType{}, noSetOpOverload()
+		}
+		return &rExpr{kind: reRangeOp, rop: roElemContainedBy, relem: elem, sargs: []*rExpr{leNode, rr}},
+			resolvedType{kind: rtBool}, nil
+	default:
+		return nil, resolvedType{}, noSetOpOverload()
+	}
 }
 
 // resolveQuantified resolves a quantified array comparison `x op ANY/SOME/ALL(arr)`
@@ -11134,8 +11275,18 @@ func binaryOpSymbol(op BinaryOp) string {
 		return "@>"
 	case OpContainedBy:
 		return "<@"
-	default: // OpOverlaps
+	case OpOverlaps:
 		return "&&"
+	case OpStrictlyLeft:
+		return "<<"
+	case OpStrictlyRight:
+		return ">>"
+	case OpNotExtendRight:
+		return "&<"
+	case OpNotExtendLeft:
+		return "&>"
+	default: // OpAdjacent
+		return "-|-"
 	}
 }
 
@@ -12845,12 +12996,12 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 			resolvedType{kind: rtBool}, nil
 	case OpConcat:
 		return resolveConcat(s, b.Lhs, b.Rhs, ag, params)
-	case OpContains:
-		return resolveContainment(s, b.Lhs, b.Rhs, afContains, ag, params)
-	case OpContainedBy:
-		return resolveContainment(s, b.Lhs, b.Rhs, afContainedBy, ag, params)
-	case OpOverlaps:
-		return resolveContainment(s, b.Lhs, b.Rhs, afOverlaps, ag, params)
+	// The containment/overlap operators (@>/<@/&&, shared by arrays and ranges) and the five
+	// range-only positional/adjacency operators (<</>>/&</&>/-|-) all dispatch here: the operand type
+	// chooses the array axis (array-functions.md §10) or the range axis (range-functions.md §3).
+	case OpContains, OpContainedBy, OpOverlaps,
+		OpStrictlyLeft, OpStrictlyRight, OpNotExtendRight, OpNotExtendLeft, OpAdjacent:
+		return resolveSetOp(s, b.Op, b.Lhs, b.Rhs, ag, params)
 	default: // OpAnd, OpOr
 		rl, lt, err := resolve(s, b.Lhs, nil, ag, params)
 		if err != nil {
@@ -13869,6 +14020,58 @@ func coerceRangeBound(v Value, elem ScalarType) (*Value, error) {
 	}
 	return &out, nil
 }
+
+// evalRangeOp evaluates a range boolean operator (range-functions.md §3, RF3) over two already-
+// evaluated operand values. STRICT: a NULL operand → NULL. For the range-against-range operators both
+// operands are ranges; for the element overloads (roContainsElem/roElemContainedBy) the non-range
+// operand is coerced to the range's element type elem (assignment-style, matching the resolver's hint).
+// The boolean kernels live in range.go.
+func evalRangeOp(op rangeOp, l, r Value, elem ScalarType) (Value, error) {
+	if l.Kind == ValNull || r.Kind == ValNull {
+		return NullValue(), nil
+	}
+	var result bool
+	switch op {
+	// `range @> element`: l is the range, r the element (coerced to the range's element type).
+	case roContainsElem:
+		e, err := storeValue(r, elem, nil, false, "range element")
+		if err != nil {
+			return Value{}, err
+		}
+		result = rangeContainsElem(expectRange(l), e)
+	// `element <@ range`: l is the element, r the range.
+	case roElemContainedBy:
+		e, err := storeValue(l, elem, nil, false, "range element")
+		if err != nil {
+			return Value{}, err
+		}
+		result = rangeContainsElem(expectRange(r), e)
+	default:
+		a, b := expectRange(l), expectRange(r)
+		switch op {
+		case roContains:
+			result = rangeContains(a, b)
+		case roContainedBy:
+			result = rangeContains(b, a)
+		case roOverlaps:
+			result = rangeOverlaps(a, b)
+		case roBefore:
+			result = rangeBefore(a, b)
+		case roAfter:
+			result = rangeAfter(a, b)
+		case roOverleft:
+			result = rangeOverleft(a, b)
+		case roOverright:
+			result = rangeOverright(a, b)
+		default: // roAdjacent
+			result = rangeAdjacent(a, b)
+		}
+	}
+	return BoolValue(result), nil
+}
+
+// expectRange extracts the *RangeVal from a value the resolver guaranteed is a (non-NULL) range operand.
+func expectRange(v Value) *RangeVal { return v.Range }
 
 // notDistinct is IS NOT DISTINCT FROM at the value level (array-functions.md §5 #10): jed's total
 // element comparator, so NULL equals NULL and a non-NULL never equals NULL.
@@ -15016,6 +15219,19 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			vals[i] = v
 		}
 		return evalRangeCtor(e.relem, vals)
+	case reRangeOp:
+		// A range BOOLEAN operator (spec/design/range-functions.md §3). One operator_eval; the operands
+		// charge their own evaluation. STRICT — a NULL operand short-circuits to NULL in evalRangeOp.
+		m.Charge(Costs.OperatorEval)
+		l, err := e.sargs[0].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		r, err := e.sargs[1].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		return evalRangeOp(e.rop, l, r, e.relem)
 	case reVariadic:
 		// A VARIADIC argument-counting call (spec/design/array-functions.md §12). One operator_eval
 		// (the per-element/arg count walk is unmetered, like the array introspectors §3.3);

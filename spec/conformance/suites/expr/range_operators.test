@@ -1,0 +1,175 @@
+# Range boolean operators (spec/design/range-functions.md §3, RF3): the eight PostgreSQL range
+# operators, each a DEFINITE boolean (a range total order, never 3VL). @> contains (range@>range,
+# range@>element), <@ contained-by (range<@range, element<@range), && overlaps, << strictly-left,
+# >> strictly-right, &< not-extend-right, &> not-extend-left, -|- adjacent. STRICT (a NULL operand →
+# NULL). Empty-range edges follow PG: the empty range contains nothing and is contained by
+# everything, overlaps nothing, and is neither before/after/adjacent to anything. Oracle-pinned vs
+# postgres:18. Format: ../../../design/conformance.md.
+# requires: query.select, types.range, types.i32, func.range_constructors, func.range_operators, resource.cost_metering
+
+# --- @> contains: range @> range ---
+
+# id, a@>b for assorted (a,b): proper-contains true; over-extending b false; self true; empty cases.
+query BBBBBB nosort
+SELECT
+  int4range(1,10) @> int4range(2,5),
+  int4range(1,10) @> int4range(2,15),
+  int4range(1,10) @> int4range(1,10),
+  int4range(1,10) @> int4range(5,10),
+  'empty'::int4range @> int4range(1,5),
+  int4range(1,5) @> 'empty'::int4range
+----
+true
+false
+true
+true
+false
+true
+
+# --- @> contains: range @> element (the element overload) ---
+
+# The lower bound is included ([1), the upper excluded (10)); an unbounded side contains everything
+# past it. The bare integer adapts to the range's element type.
+query BBBBB nosort
+SELECT
+  int4range(1,10) @> 5,
+  int4range(1,10) @> 1,
+  int4range(1,10) @> 10,
+  int4range(NULL,5) @> -100,
+  int4range(1,NULL) @> 1000000
+----
+true
+true
+false
+true
+true
+
+# A both-inclusive numrange includes its upper bound; the bare numeric adapts to the decimal element.
+query BB nosort
+SELECT numrange(1,5,'[]') @> 5.0, numrange(1,5) @> 5.0
+----
+true
+false
+
+# --- <@ contained-by: range <@ range, and element <@ range ---
+
+query BBBB nosort
+SELECT
+  int4range(2,5) <@ int4range(1,10),
+  int4range(1,15) <@ int4range(1,10),
+  5 <@ int4range(1,10),
+  10 <@ int4range(1,10)
+----
+true
+false
+true
+false
+
+# --- && overlaps ---
+
+# share an interior point true; touch-at-boundary false (5 excluded from [1,5)); disjoint false;
+# unbounded sides overlap; empty overlaps nothing.
+query BBBBB nosort
+SELECT
+  int4range(1,10) && int4range(5,15),
+  int4range(1,5) && int4range(5,10),
+  int4range(1,5) && int4range(6,10),
+  int4range(NULL,5) && int4range(3,NULL),
+  'empty'::int4range && int4range(1,5)
+----
+true
+false
+false
+true
+false
+
+# --- << strictly left / >> strictly right ---
+
+query BBBBB nosort
+SELECT
+  int4range(1,5) << int4range(10,20),
+  int4range(1,5) << int4range(5,10),
+  int4range(1,10) << int4range(5,20),
+  int4range(10,20) >> int4range(1,5),
+  int4range(1,NULL) << int4range(5,10)
+----
+true
+true
+false
+true
+false
+
+# --- &< not-extend-right / &> not-extend-left ---
+
+query BBBB nosort
+SELECT
+  int4range(1,10) &< int4range(5,10),
+  int4range(1,20) &< int4range(5,10),
+  int4range(7,20) &> int4range(5,10),
+  int4range(1,20) &> int4range(5,10)
+----
+true
+false
+true
+false
+
+# --- -|- adjacent ---
+
+# touch at one boundary with complementary inclusivity true; a gap or overlap false; continuous
+# ranges: both-inclusive at the shared point overlaps (not adjacent), both-exclusive leaves a gap.
+query BBBBB nosort
+SELECT
+  int4range(1,5) -|- int4range(5,10),
+  int4range(1,5) -|- int4range(6,10),
+  numrange(1,5,'[]') -|- numrange(5,10),
+  numrange(1,5) -|- numrange(5,10,'()'),
+  int4range(1,5) -|- int4range(5,NULL)
+----
+true
+false
+false
+false
+true
+
+# --- NULL propagation (STRICT): a NULL range operand → NULL ---
+
+query BBB nosort
+SELECT
+  (NULL::int4range @> int4range(1,5)),
+  (int4range(1,5) && NULL::int4range),
+  (NULL::int4range << int4range(1,5))
+----
+NULL
+NULL
+NULL
+
+# --- the operators as a WHERE predicate over a range column ---
+
+statement ok
+CREATE TABLE spans (id i32 PRIMARY KEY, r int4range)
+
+statement ok
+INSERT INTO spans VALUES (1, '[1,5)'), (2, '[10,20)'), (3, '[3,8)'), (4, '[100,200)'), (5, NULL)
+
+# rows whose span contains the point 4: [1,5) and [3,8).
+query I rowsort
+SELECT id FROM spans WHERE r @> 4
+----
+1
+3
+
+# rows whose span overlaps [4,11): [1,5), [10,20), [3,8).
+query I rowsort
+SELECT id FROM spans WHERE r && int4range(4,11)
+----
+1
+2
+3
+
+# rows strictly left of [50,60): [1,5), [10,20), [3,8).
+query I rowsort
+SELECT id FROM spans WHERE r << int4range(50,60)
+----
+1
+2
+3

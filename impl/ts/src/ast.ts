@@ -51,9 +51,19 @@ export type BinaryOp =
   | "concat"
   // contains/containedBy/overlaps are the array containment/overlap operators `@>`/`<@`/`&&`
   // (spec/design/array-functions.md §10): each `anyarray <op> anyarray → boolean`, polymorphic.
+  // They are SHARED with the range boolean surface (range-functions.md §3): a range operand routes
+  // to the range axis (`@>`/`<@` also gain the range/element overloads).
   | "contains"
   | "containedBy"
-  | "overlaps";
+  | "overlaps"
+  // strictlyLeft/strictlyRight/notExtendRight/notExtendLeft/adjacent are the range-ONLY positional
+  // and adjacency operators `<<`/`>>`/`&<`/`&>`/`-|-` (spec/design/range-functions.md §3): each
+  // `range <op> range → boolean`, a definite boolean. A non-range pair is 42883 (no array overload).
+  | "strictlyLeft"
+  | "strictlyRight"
+  | "notExtendRight"
+  | "notExtendLeft"
+  | "adjacent";
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.
 // The parser builds it via a precedence ladder (spec/grammar/grammar.ebnf `expr`). A

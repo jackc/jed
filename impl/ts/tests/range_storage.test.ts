@@ -126,3 +126,26 @@ test("range constructor divergences", () => {
   assert.equal(errCode(() => execute(db, "SELECT int4range(1)")), "42883");
   assert.equal(errCode(() => execute(db, "SELECT int4range(1, 2, '[]', 3)")), "42883");
 });
+
+// The range BOOLEAN operators (RF3) — the error cases the oracle corpus (which only carries
+// value-producing rows) cannot express, plus the one real divergence (spec/design/range-functions.md
+// §3). The agreeing value behavior of all eight operators lives in expr/range_operators.test.
+test("range operator divergences", () => {
+  const db = new Database();
+  // THE divergence: jed has no integer bit-shift, so the `<<` / `>>` tokens are RANGE-only. An
+  // integer `<<` / `>>` is "operator does not exist" (42883) — PostgreSQL would compute a bit shift
+  // (5 << 2 = 20). A documented divergence (jed owns its surface), so it cannot live in the corpus.
+  assert.equal(errCode(() => execute(db, "SELECT 5 << 2")), "42883");
+  assert.equal(errCode(() => execute(db, "SELECT 5 >> 2")), "42883");
+  // A range operator pairs only with a range over the SAME element type (this AGREES with PG's
+  // "operator does not exist" 42883, but an error row is awkward in the value-oriented corpus).
+  assert.equal(errCode(() => execute(db, "SELECT '[1,5)'::int4range @> '[1,5)'::int8range")), "42883");
+  assert.equal(errCode(() => execute(db, "SELECT '[1,5)'::int4range && '[1,5)'::int8range")), "42883");
+  // The positional operators have no element overload — `range << element` is 42883 (only @>/<@ take
+  // an element). And `-|-` on non-ranges is 42883 (it is range-only, like PG).
+  assert.equal(errCode(() => execute(db, "SELECT '[1,5)'::int4range << 5")), "42883");
+  assert.equal(errCode(() => execute(db, "SELECT 1 -|- 2")), "42883");
+  // `-|-` lexes greedily and is NOT confused with `-` then a comment / minus: this is the adjacency
+  // operator over two ranges (true here), proving the token won the `--` race.
+  assert.deepEqual(query(db, "SELECT '[1,5)'::int4range -|- '[5,9)'::int4range"), [["true"]]);
+});

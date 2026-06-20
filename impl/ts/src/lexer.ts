@@ -88,10 +88,16 @@ export function lex(sql: string): Token[] {
       tokens.push({ kind: "plus" });
       i++;
     } else if (c === "-") {
-      // `--` starts a line comment running to the end of the line; comments are
-      // whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
-      // string, even abutting a token (`1--2` is `1` — PG behavior).
-      if (i + 1 < n && sql[i + 1] === "-") {
+      // `-|-` is the range adjacency operator (range-functions.md §3), scanned greedily and
+      // checked FIRST so it is never mistaken for `-` (minus) `|-`. Its middle `|` keeps it
+      // disjoint from the `--` line comment (which needs a second `-`).
+      if (i + 2 < n && sql[i + 1] === "|" && sql[i + 2] === "-") {
+        tokens.push({ kind: "adjacent" });
+        i += 3;
+      } else if (i + 1 < n && sql[i + 1] === "-") {
+        // `--` starts a line comment running to the end of the line; comments are
+        // whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
+        // string, even abutting a token (`1--2` is `1` — PG behavior).
         i += 2;
         while (i < n && sql[i] !== "\n" && sql[i] !== "\r") {
           i++;
@@ -171,6 +177,10 @@ export function lex(sql: string): Token[] {
         // `<@` is the array contained-by operator (grammar.md §40), scanned greedily.
         tokens.push({ kind: "containedBy" });
         i += 2;
+      } else if (i + 1 < n && sql[i + 1] === "<") {
+        // `<<` is the range strictly-left operator (range-functions.md §3), scanned greedily.
+        tokens.push({ kind: "strictlyLeft" });
+        i += 2;
       } else {
         tokens.push({ kind: "lt" });
         i++;
@@ -194,10 +204,17 @@ export function lex(sql: string): Token[] {
         throw engineError("syntax_error", "unexpected character '@'");
       }
     } else if (c === "&") {
-      // `&&` is the array overlap operator (grammar.md §40), scanned greedily as one token;
-      // a lone `&` is not part of jed's surface (no bitwise-and) — 42601.
+      // `&&` is the array overlap operator (grammar.md §40); `&<` (not-extend-right) and `&>`
+      // (not-extend-left) are the range positional operators (range-functions.md §3). Each
+      // scanned greedily; a lone `&` is not part of jed's surface (no bitwise-and) — 42601.
       if (i + 1 < n && sql[i + 1] === "&") {
         tokens.push({ kind: "overlaps" });
+        i += 2;
+      } else if (i + 1 < n && sql[i + 1] === "<") {
+        tokens.push({ kind: "notExtendRight" });
+        i += 2;
+      } else if (i + 1 < n && sql[i + 1] === ">") {
+        tokens.push({ kind: "notExtendLeft" });
         i += 2;
       } else {
         throw engineError("syntax_error", "unexpected character '&'");
@@ -205,6 +222,10 @@ export function lex(sql: string): Token[] {
     } else if (c === ">") {
       if (i + 1 < n && sql[i + 1] === "=") {
         tokens.push({ kind: "ge" });
+        i += 2;
+      } else if (i + 1 < n && sql[i + 1] === ">") {
+        // `>>` is the range strictly-right operator (range-functions.md §3), scanned greedily.
+        tokens.push({ kind: "strictlyRight" });
         i += 2;
       } else {
         tokens.push({ kind: "gt" });

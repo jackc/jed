@@ -36,6 +36,12 @@ export type TokenKind =
   | "containedBy" // <@ — the array contained-by operator (a <@ b — is a contained by b) (grammar.md §40)
   | "overlaps" // && — the array overlap operator (a && b — do a and b share an element); two "&"
   //              scanned greedily, a lone "&" is a 42601 syntax error (spec/design/grammar.md §40)
+  | "strictlyLeft" // << — the range strictly-left operator (a << b). Two "<". See range-functions.md §3 (RF3).
+  | "strictlyRight" // >> — the range strictly-right operator (a >> b). Two ">". See range-functions.md §3 (RF3).
+  | "notExtendRight" // &< — the range not-extend-right operator (a &< b). "&" then "<". See range-functions.md §3.
+  | "notExtendLeft" // &> — the range not-extend-left operator (a &> b). "&" then ">". See range-functions.md §3.
+  | "adjacent" // -|- — the range adjacency operator (a -|- b). "-" "|" "-", scanned greedily and
+  //              checked BEFORE the "--" line comment. See range-functions.md §3 (RF3).
   | "param" // a bind parameter $N — `paramIndex` holds the 1-based index (spec/design/api.md §5)
   | "eof"; // end of input
 
