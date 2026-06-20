@@ -358,7 +358,8 @@ a function (the deny-list — `revoke uuidv4`/`now()` to pin determinism). A fun
 
 ### 5.4 Session lifetime cost budget
 
-`max_cost` bounds **one statement**; `lifetime_max_cost` bounds the **whole session**. The session
+✅ **Landed (all 3 cores, §10 slice 4).** `max_cost` bounds **one statement**; `lifetime_max_cost`
+bounds the **whole session**. The session
 holds a running cumulative cost total; **every** statement (autocommit, batch, or in a
 transaction) accrues its metered cost into it. Semantics, mirroring the per-statement ceiling so
 the two gates compose:
@@ -537,8 +538,20 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
    defaults **on**, so only `revoke` disables a function (the deny-list — the determinism-pinning use
    case); a function *allow-list* (default-off + per-function grant) needs a function-default toggle
    the v1 option surface omits and is deferred (§11).
-4. **Lifetime cost budget** (§5.4) — the cumulative meter + `54P02` + the ordered-schedule corpus
-   entries. Capability `session.lifetime_cost`; registers `54P02`.
+4. **Lifetime cost budget** (§5.4) — ✅ **landed (all 3 cores).** The session holds a running
+   cumulative cost total (`lifetime_cost`); the per-statement `Meter` live-charges into it through a
+   shared handle (`Rc<Cell<i64>>` / `*int64` / object reference), so **partial cost of an aborted
+   statement counts automatically** and the cumulative is **session state, not snapshot state** (it
+   does not roll back with a transaction). The instant the total reaches `lifetime_max_cost` the
+   in-flight statement aborts `54P02`; a statement aborts at whichever ceiling it reaches first (its
+   own `max_cost`/`54P01` or the session budget/`54P02`, the per-statement ceiling winning an exact
+   tie). Once the budget is spent, every further statement is rejected `54P02` at **admission**
+   (checked before privileges and before any work). The SQL-observable `54P02` (in-flight abort,
+   admission rejection, `54P01`-vs-`54P02` precedence) is **cross-core corpus-tested** via a sticky
+   `# lifetime_max_cost: N` directive over an ordered statement sequence on the one session
+   (`suites/session/lifetime_cost.test`); the gauge / setters / no-rollback / partial-cost host-API
+   surface is per-core unit tested. Capability `session.lifetime_cost`; registers `54P02`. No on-disk
+   format change (the cumulative is session state, never persisted).
 5. **Session variables** (§6.1, v1 scope) — the string map, host get/set, `current_setting()`,
    the `# set:` directive. Capability `session.variables`.
 6. **Session time zone slot** (§6.2) — the `time_zone` built-in (default `UTC`, offsets only),

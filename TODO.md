@@ -950,10 +950,23 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `# default_privileges:` / `# grant:` / `# revoke:` / `# allow_ddl:` directives. **v1 narrowing:**
         function `EXECUTE` defaults on (deny-list via `revoke`); the allow-list (default-off) is
         deferred (§11). Green: conformance 163/0 ×3, full suites. _(§5.3/§13)_
-  - [ ] **S4 — session lifetime cost budget** — a per-session cumulative cost meter aborting with
-        **`54P02 session_cost_limit_exceeded`** (new `P`-subclass code) when it reaches
-        `lifetime_max_cost`; deterministic, pinned by an ordered multi-statement schedule. Registers
-        `54P02`; capability `session.lifetime_cost`. _(size: M; §5.4/§13)_
+  - [x] **S4 — session lifetime cost budget** — ✅ **landed (all 3 cores).** A per-session cumulative
+        cost meter aborting with **`54P02 session_cost_limit_exceeded`** (new `P`-subclass code) the
+        instant the session's running total reaches `lifetime_max_cost`. Sibling to the per-statement
+        `max_cost`/`54P01`: a statement aborts at whichever ceiling it reaches first (the per-statement
+        ceiling wins an exact tie). Implemented by threading the session's cumulative total through the
+        per-statement `Meter` (a shared `Rc<Cell<i64>>` / `*int64` / object reference the meter
+        live-charges into), so **partial cost of an aborted statement counts automatically** and the
+        cumulative is **session state, not snapshot state** — it does NOT roll back with a `ROLLBACK`.
+        Once spent, every further statement is rejected `54P02` at **admission** (checked before
+        privileges, before any work). Host API: `db`/`session`.`{set_lifetime_max_cost, lifetime_cost,
+        lifetime_max_cost}` (the cumulative gauge + the budget setter). Registers `54P02`; capability
+        `session.lifetime_cost`. The SQL-observable `54P02` (in-flight abort, admission rejection, and
+        the `54P01`-vs-`54P02` precedence) is **cross-core corpus-tested** via a sticky
+        `# lifetime_max_cost: N` directive + an ordered statement sequence on the one session
+        (`suites/session/lifetime_cost.test`, jed-specific so not oracle-checked); the gauge + setters +
+        no-rollback + partial-cost host-API surface is per-core unit tested. **No on-disk format
+        change** (the cumulative is session state, never persisted). _(§5.4/§13)_
   - [ ] **S5 — session variables (v1)** — a string→string GUC map, host get/set + `current_setting()`
         read; namespaced custom vars; `# set:` directive. (`SET LOCAL` / full SQL `SET`/`SHOW` /
         `set_config()` deferred.) Capability `session.variables`. _(size: M; §6.1)_

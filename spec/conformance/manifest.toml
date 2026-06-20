@@ -611,6 +611,15 @@ description = "Per-object GRANT/REVOKE authorization — per-table SELECT/INSERT
 id = "session.allow_ddl"
 description = "The single DDL gate — a session capability `allow_ddl` (default on) governing CREATE/DROP/ALTER of tables, indexes, types, and sequences; a denied schema change is 42501 (spec/design/session.md §5.3). jed has no schema/owner model (CLAUDE.md §3), so all DDL folds under one boolean (a per-object CREATE/ownership privilege is a deferred follow-on). The `# allow_ddl: on|off` directive sets it for the next record. jed-specific (host-configured), so cross-core-checked, not oracle-checked. Builds on session.privileges."
 
+# Per-session cumulative cost budget (spec/design/session.md §5.4). Sibling to resource.cost_limit:
+# where `max_cost` bounds ONE statement (54P01), `lifetime_max_cost` bounds the whole SESSION (54P02).
+# The cumulative cost is session state that builds across records on the one Database the harness runs
+# a file against, so a sticky `# lifetime_max_cost: N` directive + an ordered statement sequence pins
+# the abort cross-core (the per-record `# cost:` cannot express a cumulative budget).
+[[capability]]
+id = "session.lifetime_cost"
+description = "Per-session cumulative cost budget — `lifetime_max_cost` bounds the SESSION's running cost total, aborting the in-flight statement with 54P02 (session_cost_limit_exceeded) the instant the cumulative reaches the budget (spec/design/session.md §5.4). Sibling to resource.cost_limit's per-statement `max_cost`/54P01; a statement aborts at whichever ceiling it reaches first. The budget is a hard, monotonic allowance: an aborted statement's partial cost still counts, and once it is spent every further statement is rejected 54P02 at admission (it cannot accrue). The cumulative is session state, not snapshot state, so it does NOT roll back with a transaction. The sticky `# lifetime_max_cost: N` directive sets the budget for the rest of the file (the cumulative builds across records on the one Database). jed-specific (PostgreSQL has no execution-cost budget), so cross-core-checked, not oracle-checked. Builds on resource.cost_metering."
+
 # Transaction control (Phase 5, spec/design/transactions.md §4). The SQL surface
 # BEGIN/COMMIT/ROLLBACK over the handle's single current transaction; tested by deterministic,
 # single-handle visibility sequences (the harness runs a whole .test file against one Database).

@@ -400,6 +400,24 @@ name = "cost_limit_exceeded"
 class = "program limit exceeded"
 template = "query exceeded the cost limit of {limit} (accrued {cost})"
 
+# 54P02 session_cost_limit_exceeded — a per-SESSION cumulative cost budget was exhausted
+# (spec/design/session.md §5.4). Sibling to 54P01: where 54P01 bounds ONE statement (`max_cost`),
+# 54P02 bounds the whole session (`lifetime_max_cost`) — the session holds a running cumulative cost
+# total into which every statement accrues, and the instant that total reaches the budget the
+# running statement aborts here. The budget is a hard, monotonic allowance: an aborted statement's
+# partial cost still counts (the work happened), and once it is spent every further statement is
+# rejected here at admission (it cannot accrue). The cumulative is SESSION state, not snapshot state,
+# so it does NOT roll back when a ROLLBACK undoes a statement's effects — the compute was spent
+# regardless. jed-specific (PostgreSQL has no execution-cost budget), another documented `P`-subclass
+# divergence (CLAUDE.md §1/§13), the multi-tenant/untrusted-host gate atop the per-statement 54P01.
+# Asserted by the conformance corpus (the session.lifetime_cost capability) since the abort point is
+# part of the cross-core contract (no reference impl, §2).
+[[error]]
+code = "54P02"
+name = "session_cost_limit_exceeded"
+class = "program limit exceeded"
+template = "session exceeded the lifetime cost limit of {limit} (accrued {cost})"
+
 # --- invalid object state (class 55) ----------------------------------------
 # currval/lastval before nextval has defined the value in this session
 # (../design/sequences.md §6).
