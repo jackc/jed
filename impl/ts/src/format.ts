@@ -13,6 +13,7 @@
 import type { Expr } from "./ast.ts";
 import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type FkAction, type ForeignKey, type IdentityKind, type IndexDef, type SeqOwner, type SequenceDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
+import { type Collation, openCollation, saveCollation } from "./collation.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
@@ -64,7 +65,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 16; // on-disk format version (16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 17; // on-disk format version (17 = baked collations: a catalog entry_kind 3 collation snapshot — a flags byte is_default/reference + the LZ4-compressed .coll artifact — emitted after sequences and before tables, plus a per-column collation: column flags byte bit6 has_collation + a trailing name, spec/design/collation.md §5. 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -892,6 +893,9 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
       flags |= 0b1_0000;
       if (col.identity === "always") flags |= 0b10_0000;
     }
+    // bit6 has_collation (v17) — a text column with a non-C effective collation
+    // (spec/design/collation.md §5); the name is appended after the default.
+    if (col.collation !== null) flags |= 0b100_0000;
     w.u8(flags);
     // A decimal column appends its typmod (precision, scale) — only for type_code 6, so
     // non-decimal entries are byte-unchanged (format.md). precision 0 = unconstrained numeric.
@@ -912,6 +916,13 @@ function tableEntryBytes(table: Table, rootDataPage: number, indexRoots: number[
       const et = UTF8.encode(col.defaultExpr.exprText);
       w.u16(et.length);
       w.bytes(et);
+    }
+    // The effective collation name (v17, flags bit6) — last in the per-column entry, so a
+    // non-collated column is byte-unchanged (spec/design/collation.md §5).
+    if (col.collation !== null) {
+      const cb = UTF8.encode(col.collation);
+      w.u16(cb.length);
+      w.bytes(cb);
     }
   }
   // The primary key (v5): count, then the member column ordinals in KEY order
@@ -1129,6 +1140,39 @@ function decodeSequenceEntry(buf: Uint8Array, cur: Cursor): SequenceDef {
   };
 }
 
+// collationEntryBytes serializes a collation-snapshot catalog entry's BODY (after its entry_kind = 3
+// byte, v17): a flags byte (bit0 is_default, bit1 reference — deferred, 0/baked) + the baked .coll
+// artifact (u32 length + LZ4-compressed bytes). The artifact is byte-identical to db.saveCollation,
+// so a golden doubles as an artifact fixture (spec/design/collation.md §5).
+function collationEntryBytes(c: Collation, isDefault: boolean): Uint8Array {
+  const w = new ByteWriter();
+  w.u8(isDefault ? 0b1 : 0);
+  const artifact = saveCollation(c);
+  w.u32(artifact.length);
+  w.bytes(artifact);
+  return w.toBytes();
+}
+
+// decodeCollationEntry decodes a collation-snapshot entry's body (inverse of collationEntryBytes);
+// the caller has consumed the entry_kind byte. Returns the loaded collation + whether it is the
+// per-database default (the is_default flag bit).
+function decodeCollationEntry(buf: Uint8Array, cur: Cursor): { coll: Collation; isDefault: boolean } {
+  const flags = readU8(buf, cur);
+  if ((flags & ~0b11) !== 0) {
+    throw engineError("data_corrupted", "reserved collation flag set");
+  }
+  if ((flags & 0b10) !== 0) {
+    throw engineError("data_corrupted", "reference-mode collation snapshots are not supported yet");
+  }
+  const len = readU32(buf, cur);
+  if (cur.pos + len > buf.length) {
+    throw engineError("data_corrupted", "collation artifact truncated");
+  }
+  const artifact = buf.subarray(cur.pos, cur.pos + len);
+  cur.pos += len;
+  return { coll: openCollation(artifact), isDefault: (flags & 0b1) !== 0 };
+}
+
 // pack greedily packs item sizes into pages of capacity `capacity`, returning groups of
 // item indices. Empty input yields one empty group. A single item larger than capacity
 // is unsupported (no overflow pages in step-5b).
@@ -1219,6 +1263,12 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   }
   for (const s of snap.sequencesSorted()) {
     catEntries.push(concat([Uint8Array.of(2), sequenceEntryBytes(s)]));
+  }
+  // Collation snapshots (kind 3, v17) — after sequences, before tables (spec/design/collation.md §5).
+  for (const c of snap.collationsSorted()) {
+    catEntries.push(
+      concat([Uint8Array.of(3), collationEntryBytes(c, snap.defaultCollation === c.name)]),
+    );
   }
   for (let ti = 0; ti < keys.length; ti++) {
     const t = snap.tables.get(keys[ti]!)!;
@@ -1400,6 +1450,12 @@ export function incrementalImage(
   for (const s of snap.sequencesSorted()) {
     catEntries.push(concat([Uint8Array.of(2), sequenceEntryBytes(s)]));
   }
+  // Collation snapshots (kind 3, v17) — after sequences, before tables (spec/design/collation.md §5).
+  for (const c of snap.collationsSorted()) {
+    catEntries.push(
+      concat([Uint8Array.of(3), collationEntryBytes(c, snap.defaultCollation === c.name)]),
+    );
+  }
   for (let ti = 0; ti < keys.length; ti++) {
     const t = snap.tables.get(keys[ti]!)!;
     catEntries.push(concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!)]));
@@ -1523,6 +1579,14 @@ export function loadDatabase(image: Uint8Array): Database {
       }
       if (kind === 2) {
         snap.putSequence(decodeSequenceEntry(pg.payload, cur));
+        continue;
+      }
+      if (kind === 3) {
+        // A collation snapshot (v17): the baked .coll artifact + an is_default flag
+        // (spec/design/collation.md §5); the default restores the per-database default.
+        const { coll, isDefault } = decodeCollationEntry(pg.payload, cur);
+        if (isDefault) snap.defaultCollation = coll.name;
+        snap.collations.set(coll.name, coll);
         continue;
       }
       if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
@@ -1651,6 +1715,14 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
       }
       if (kind === 2) {
         snap.putSequence(decodeSequenceEntry(pg.payload, cur));
+        continue;
+      }
+      if (kind === 3) {
+        // A collation snapshot (v17): the baked .coll artifact + an is_default flag
+        // (spec/design/collation.md §5); the default restores the per-database default.
+        const { coll, isDefault } = decodeCollationEntry(pg.payload, cur);
+        if (isDefault) snap.defaultCollation = coll.name;
+        snap.collations.set(coll.name, coll);
         continue;
       }
       if (kind !== 0) throw engineError("data_corrupted", "unknown catalog entry kind");
@@ -2064,6 +2136,7 @@ function decodeTableEntry(
         default: null,
         defaultExpr: null,
         identity: null,
+        collation: null,
       });
       continue;
     }
@@ -2083,6 +2156,7 @@ function decodeTableEntry(
         default: null,
         defaultExpr: null,
         identity: null,
+        collation: null,
       });
       continue;
     }
@@ -2103,6 +2177,7 @@ function decodeTableEntry(
         default: null,
         defaultExpr: null,
         identity: null,
+        collation: null,
       });
       continue;
     }
@@ -2112,12 +2187,12 @@ function decodeTableEntry(
     }
     const flags = readU8(buf, cur);
     // bit0 was the primary_key flag through v4; v5 retired it (the pk list below is the
-    // authority) and reserves it as must-be-zero. bits 6-7 are reserved (v15).
+    // authority) and reserves it as must-be-zero. bit6 = has_collation (v17); bit7 reserved.
     if ((flags & 0b01) !== 0) {
       throw engineError("data_corrupted", "reserved column flag bit0 set");
     }
-    if ((flags & 0b1100_0000) !== 0) {
-      throw engineError("data_corrupted", "reserved column flag bit (6/7) set");
+    if ((flags & 0b1000_0000) !== 0) {
+      throw engineError("data_corrupted", "reserved column flag bit7 set");
     }
     // bit4 is_identity + bit5 identity_always (v15) — identity_always is meaningful only with
     // is_identity (spec/design/sequences.md §13).
@@ -2155,6 +2230,9 @@ function decodeTableEntry(
       }
       colDefaultExpr = { exprText, expr };
     }
+    // The effective collation (v17, flags bit6) — appended last; a non-collated column has the bit
+    // clear and reads nothing (spec/design/collation.md §5).
+    const collation = (flags & 0b100_0000) !== 0 ? readString(buf, cur) : null;
     columns.push({
       name: cname,
       type: scalarT(ty),
@@ -2164,6 +2242,7 @@ function decodeTableEntry(
       default: colDefault,
       defaultExpr: colDefaultExpr,
       identity,
+      collation,
     });
   }
   // The primary key (v5): member ordinals in KEY order. Each must name a real column,

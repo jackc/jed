@@ -9,6 +9,7 @@ import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
 import { Database, execute } from "../src/lib.ts";
+import { compileCollation } from "../src/collation.ts";
 import { crc32Ieee, loadDatabase, toImage } from "../src/format.ts";
 import { scalarT } from "../src/types.ts";
 import { specPath } from "./tomlmini.ts";
@@ -658,6 +659,29 @@ function identityTableDB(): Database {
   return db;
 }
 
+// collationTableDB is a baked COLLATION (v17 — entry_kind 3 snapshot + per-column collations): the
+// dev-root collation imported + set as the per-database default (is_default), a column with explicit
+// COLLATE "dev-root" (flags bit6 + name), an un-annotated column inheriting the default (bit6 + name),
+// and an explicit COLLATE "C" column (no collation). Must match the Ruby reference's COLLATION_TABLE.
+function collationTableDB(): Database {
+  const db = goldenDb();
+  db.importCollation(
+    compileCollation(
+      "dev-root",
+      readFileSync(specPath("collation/fixtures/dev-root.allkeys"), "utf8"),
+    ),
+  );
+  db.setDefaultCollation("dev-root");
+  run(
+    db,
+    `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root", ` +
+      `plain text, byteorder text COLLATE "C")`,
+  );
+  run(db, `INSERT INTO t VALUES (1, 'a', 'b', 'z')`);
+  run(db, `INSERT INTO t VALUES (2, 'z', 'a', 'a')`);
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   const cases: { name: string; build: () => Database }[] = [
@@ -697,6 +721,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "sequence_table.jed", build: sequenceTableDB },
     { name: "serial_table.jed", build: serialTableDB },
     { name: "identity_table.jed", build: identityTableDB },
+    { name: "collation_table.jed", build: collationTableDB },
     { name: "array_table.jed", build: arrayTableDB },
     { name: "range_table.jed", build: rangeTableDB },
     { name: "range_pk_table.jed", build: rangePkTableDB },
@@ -753,6 +778,7 @@ test("read goldens reproduces rows", () => {
     { name: "sequence_table.jed", build: sequenceTableDB, table: "t" },
     { name: "serial_table.jed", build: serialTableDB, table: "t" },
     { name: "identity_table.jed", build: identityTableDB, table: "t" },
+    { name: "collation_table.jed", build: collationTableDB, table: "t" },
     { name: "array_table.jed", build: arrayTableDB, table: "t" },
     { name: "range_table.jed", build: rangeTableDB, table: "t" },
     { name: "range_pk_table.jed", build: rangePkTableDB, table: "t" },
@@ -783,8 +809,8 @@ test("read golden reconstructs catalog", () => {
   assert.equal(tbl!.name, "t");
   assert.equal(tbl!.columns.length, 2);
   const [id, v] = tbl!.columns;
-  assert.deepStrictEqual(id, { name: "id", type: scalarT("i32"), decimal: null, primaryKey: true, notNull: true, default: null, defaultExpr: null, identity: null });
-  assert.deepStrictEqual(v, { name: "v", type: scalarT("i16"), decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null, identity: null });
+  assert.deepStrictEqual(id, { name: "id", type: scalarT("i32"), decimal: null, primaryKey: true, notNull: true, default: null, defaultExpr: null, identity: null, collation: null });
+  assert.deepStrictEqual(v, { name: "v", type: scalarT("i16"), decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null, identity: null, collation: null });
   // A NULL value round-trips (id 3's v).
   const rows = loaded.rowsInKeyOrder("t");
   assert.deepStrictEqual(rows[2], [{ kind: "int", int: 3n }, { kind: "null" }]);

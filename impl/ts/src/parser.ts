@@ -549,6 +549,7 @@ class Parser {
     let notNull = false;
     let def: DefaultDef | null = null;
     let identity: IdentitySpec | null = null;
+    let collation: string | null = null;
     for (;;) {
       if (this.atCheckConstraint()) {
         checks.push(this.parseCheckConstraint());
@@ -638,6 +639,12 @@ class Parser {
           );
         }
         identity = { always, options };
+      } else if (kw === "collate") {
+        // COLLATE "name" in column position (spec/design/collation.md §1) — a quoted, case-sensitive
+        // collation name. Validity (text-only 42804, loaded name 42704) is checked at execution. A
+        // repeat keeps the last (like DEFAULT).
+        this.advance();
+        collation = this.expectCollationName();
       } else if (kw === "unique") {
         this.advance();
         uniques.push({ name: null, columns: [name] });
@@ -666,6 +673,7 @@ class Parser {
       notNull,
       default: def,
       identity,
+      collation,
     };
   }
 

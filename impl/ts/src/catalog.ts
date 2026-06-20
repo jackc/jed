@@ -36,6 +36,12 @@ export type Column = {
   // INSERT/UPDATE value is accepted (428C9). Persisted as two column flag bits (format_version 15:
   // bit4 is_identity, bit5 identity_always).
   identity: IdentityKind | null;
+  // The column's EFFECTIVE collation — null is C (byte / code-point order, the unchanged fast path),
+  // a non-empty name a loaded non-C collation (spec/design/collation.md §1). Frozen at CREATE TABLE:
+  // an explicit COLLATE "name", else the per-database default as of creation (PG-matching). Only a
+  // text column carries one. A column reference's IMPLICIT collation in the derivation (42P22);
+  // persisted as column flag bit6 + a trailing name (format_version 17).
+  collation: string | null;
 };
 
 // IdentityKind is the kind of an IDENTITY column (spec/design/sequences.md §13). "always"

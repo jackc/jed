@@ -48,6 +48,7 @@ export type SqlState =
   | "duplicate_object" // 42710 — a constraint name already taken on this table (constraints.md §4.3)
   | "wrong_object_type" // 42809 — DROP TABLE of an index name / DROP INDEX of a table name (indexes.md §2)
   | "collation_mismatch" // 42P21 — two different explicit collations in one comparison (collation.md §1/§7)
+  | "indeterminate_collation" // 42P22 — two different implicit collations meet with no explicit COLLATE (collation.md §1/§7)
   | "name_too_long" // 42622 — an identifier exceeds MAX_IDENTIFIER_LENGTH (63 bytes); lexer gate (cost.md §7)
   | "generated_always" // 428C9 — a write supplying an explicit value to a GENERATED ALWAYS identity column without OVERRIDING SYSTEM VALUE (an INSERT), or assigning one (an UPDATE) (sequences.md §13)
   | "dependent_objects_still_exist" // 2BP01 — DROP TYPE ... RESTRICT of a composite still referenced (composite.md §7)
@@ -104,6 +105,7 @@ const CODES: Record<SqlState, string> = {
   duplicate_object: "42710",
   wrong_object_type: "42809",
   collation_mismatch: "42P21",
+  indeterminate_collation: "42P22",
   name_too_long: "42622",
   generated_always: "428C9",
   dependent_objects_still_exist: "2BP01",

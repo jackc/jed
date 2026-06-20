@@ -305,6 +305,18 @@ function utf8ByteLength(s: string): number {
   return SQL_BYTE_ENCODER.encode(s).length;
 }
 
+// CollationInfo is introspection metadata for one loaded collation (db.collations,
+// spec/design/collation.md §1). contentHash is the CRC-32 of the compiled table (the reference-mode
+// stamp, §3/§4); description is provenance, excluded from the hash.
+export type CollationInfo = {
+  name: string;
+  unicodeVersion: string;
+  cldrVersion: string;
+  contentHash: number;
+  description: string;
+  isDefault: boolean;
+};
+
 // Snapshot is an immutable committed (or in-progress working) database state — the catalog + each
 // table's store + the commit counter (spec/design/transactions.md §2). The committed state is one
 // of these; a write transaction builds a new one from it (the persistent stores clone O(1) —
@@ -337,10 +349,14 @@ export class Snapshot {
   sequences: Map<string, SequenceDef>;
   // collations holds loaded collations, keyed by their exact (CASE-SENSITIVE) name — collation names
   // are quoted identifiers ("en-US", spec/design/collation.md §1). C is never stored (table-free,
-  // built in). Imported by db.importCollation (slice 1c: in-memory only — no format_version bump, no
-  // catalog entry yet; baking is slice 1d). Not serialized this slice. Collation objects are never
-  // mutated in place (only added), so the shallow Map copy in clone is safe.
+  // built in). Imported by db.importCollation. Persisted as catalog entry_kind = 3 baked snapshots
+  // (format_version 17, slice 1d). Collation objects are never mutated in place (only added), so the
+  // shallow Map copy in clone is safe.
   collations: Map<string, Collation>;
+  // defaultCollation is the per-database default collation name, or null for C (collation.md §1/§5).
+  // An un-annotated text column inherits this at CREATE TABLE. Persisted as the is_default flag bit
+  // on that collation's entry_kind = 3 snapshot, restored on load.
+  defaultCollation: string | null;
 
   constructor(
     txid: bigint = 0n,
@@ -350,6 +366,7 @@ export class Snapshot {
     types: Map<string, CompositeType> = new Map(),
     sequences: Map<string, SequenceDef> = new Map(),
     collations: Map<string, Collation> = new Map(),
+    defaultCollation: string | null = null,
   ) {
     this.txid = txid;
     this.tables = tables;
@@ -358,6 +375,7 @@ export class Snapshot {
     this.types = types;
     this.sequences = sequences;
     this.collations = collations;
+    this.defaultCollation = defaultCollation;
   }
 
   // clone returns an independent copy: the catalog maps are shallow (Table / CompositeType /
@@ -372,6 +390,7 @@ export class Snapshot {
       new Map(this.types),
       new Map(this.sequences),
       new Map(this.collations),
+      this.defaultCollation,
     );
   }
 
@@ -429,6 +448,12 @@ export class Snapshot {
   // order (spec/fileformat/format.md) and a deterministic order with no map-iteration leak (§8).
   sequencesSorted(): SequenceDef[] {
     return [...this.sequences.keys()].sort().map((k) => this.sequences.get(k)!);
+  }
+
+  // collationsSorted is all loaded collations in ascending (exact, case-sensitive) name order — the
+  // on-disk emission order (spec/fileformat/format.md, entry_kind = 3) with no map-iteration leak.
+  collationsSorted(): Collation[] {
+    return [...this.collations.keys()].sort().map((k) => this.collations.get(k)!);
   }
 
   // sequencesOwnedBy returns the lowercased keys of every sequence OWNED BY the table `name`
@@ -1505,11 +1530,11 @@ export class Database {
   }
 
   // importCollation imports a collation into the database (the privileged host op,
-  // spec/design/collation.md §4). The collation becomes usable by name in COLLATE / ORDER BY (slice
-  // 1c: in-memory only — placed in the committed catalog, NOT yet persisted; baking is slice 1d).
-  // Idempotent by (name, content-hash): re-importing the identical table is a no-op success; importing
-  // a DIFFERENT table under a name already in use is 42710 (re-collation is the explicit path, §12). C
-  // is never imported (table-free, built in). Returns the imported name.
+  // spec/design/collation.md §4). The collation becomes usable by name in COLLATE / ORDER BY and is
+  // BAKED into the file at the next commit (catalog entry_kind = 3, format_version 17 — §5). Idempotent
+  // by (name, content-hash): re-importing the identical table is a no-op success; importing a DIFFERENT
+  // table under a name already in use is 42710 (re-collation is the explicit path, §12). C is never
+  // imported (table-free, built in). Returns the imported name.
   importCollation(coll: Collation): string {
     if (coll.name === "C") {
       throw engineError(
@@ -1530,6 +1555,50 @@ export class Database {
     }
     this.committed.collations.set(coll.name, coll);
     return coll.name;
+  }
+
+  // exportCollation pulls a baked collation back out as a Collation value (db.exportCollation,
+  // spec/design/collation.md §1). C is built in and has no table → 42704; an unloaded name is 42704.
+  exportCollation(name: string): Collation {
+    const c = this.committed.collation(name);
+    if (c === undefined) {
+      throw engineError("undefined_object", `collation "${name}" does not exist`);
+    }
+    return c;
+  }
+
+  // setDefaultCollation sets the per-database default collation (db.setDefaultCollation,
+  // spec/design/collation.md §1). "C" resets to byte order; any other name must be loaded (else
+  // 42704). Persisted as the is_default flag on that collation's baked snapshot at the next commit.
+  setDefaultCollation(name: string): void {
+    if (name === "C") {
+      this.committed.defaultCollation = null;
+      return;
+    }
+    if (this.committed.collation(name) === undefined) {
+      throw engineError("undefined_object", `collation "${name}" does not exist`);
+    }
+    this.committed.defaultCollation = name;
+  }
+
+  // defaultCollation returns the per-database default collation name — "C" unless setDefaultCollation
+  // moved it (db.defaultCollation, spec/design/collation.md §1).
+  defaultCollation(): string {
+    return this.committed.defaultCollation ?? "C";
+  }
+
+  // collations introspects the loaded collations (db.collations, spec/design/collation.md §1), in
+  // ascending name order. C is built in and not listed.
+  collations(): CollationInfo[] {
+    const dflt = this.committed.defaultCollation;
+    return this.committed.collationsSorted().map((c) => ({
+      name: c.name,
+      unicodeVersion: c.unicodeVersion,
+      cldrVersion: c.cldrVersion,
+      contentHash: crc32Ieee(serializeTable(c)),
+      description: c.description,
+      isDefault: dflt === c.name,
+    }));
   }
 
   // executeStmt executes one parsed statement with no bind parameters.
@@ -2114,6 +2183,20 @@ export class Database {
           };
         }
       }
+      // The column's effective collation, frozen now (spec/design/collation.md §1). An explicit
+      // COLLATE "name" is text-only (42804) and must name a loaded collation or C (42704); a text
+      // column without a clause inherits the per-database default. A C effective collation stores as
+      // null (the fast path).
+      let collation: string | null = null;
+      if (def.collation !== null) {
+        if (!typeIsText(colType)) {
+          throw typeError(`collations are not supported by type ${typeCanonicalName(colType)}`);
+        }
+        resolveCollationName(this, def.collation); // validates loaded; 42704 if not
+        if (def.collation !== "C") collation = def.collation;
+      } else if (typeIsText(colType)) {
+        collation = this.readSnap().defaultCollation;
+      }
       columns.push({
         name: def.name,
         type: colType,
@@ -2128,6 +2211,7 @@ export class Database {
         default: def_default,
         defaultExpr: def_defaultExpr,
         identity: identityKind,
+        collation,
       });
     }
 
@@ -5824,14 +5908,21 @@ export class Database {
         );
       }
       const idx = r.index;
-      // An explicit COLLATE on the sort key (spec/design/collation.md §1): the column must be text
-      // (42804) and the name must resolve ("C" → byte order, else loaded or 42704).
+      // The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
+      // text column (42804) and name a loaded collation ("C" → byte order, else 42704); absent a
+      // clause, the key inherits the column's frozen (implicit) collation — so `ORDER BY name` over
+      // an en-US column sorts by en-US (slice 1d). A single column can't conflict (no 42P22 here).
       let collation: Collation | null = null;
       if (key.collation !== null) {
         if (!typeIsText(scope.columnAt(idx).type)) {
-          throw typeError("collations are not supported by this column's type");
+          throw typeError(
+            `collations are not supported by type ${typeCanonicalName(scope.columnAt(idx).type)}`,
+          );
         }
         collation = resolveCollationName(scope.catalog, key.collation);
+      } else {
+        const cn = scope.columnAt(idx).collation;
+        if (cn !== null) collation = resolveCollationName(scope.catalog, cn);
       }
       let slot = idx;
       if (isAgg) {
@@ -8883,6 +8974,7 @@ function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
         default: null,
         defaultExpr: null,
         identity: null,
+        collation: null,
       },
     ],
     pk: [],
@@ -11017,6 +11109,7 @@ function cteSyntheticTable(
     default: null,
     defaultExpr: null,
     identity: null,
+    collation: null,
   }));
   return { name, columns, pk: [], checks: [], indexes: [], fks: [] };
 }
@@ -12943,30 +13036,84 @@ function resolveCollationName(catalog: Database, name: string): Collation | null
   return c;
 }
 
-// explicitCollation returns the single EXPLICIT collation an expression subtree forces, or null
-// (spec/design/collation.md §1). In slice 1c the only source of an explicit collation is a collate
-// node (columns are implicitly C), so this finds the outermost COLLATE and, through the one
-// text-combining operator || , detects an explicit-vs-explicit conflict (42P21). Propagation through
-// CASE / COALESCE / function results is a deferred follow-on (collation.md §14).
-function explicitCollation(e: Expr): string | null {
-  if (e.kind === "collate") return e.collation;
-  if (e.kind === "binary" && e.op === "concat") {
-    return combineExplicit(explicitCollation(e.lhs), explicitCollation(e.rhs));
+// A text expression's collation derivation (spec/design/collation.md §1, PG's rules). "none" = no
+// collation (a non-text expr or a bare literal); "implicit" = a column's frozen collation (C counts
+// as a distinct implicit collation); "explicit" = an explicit COLLATE; "indeterminate" = two
+// different implicit collations met — 42P22 when consumed.
+type Deriv =
+  | { kind: "none" }
+  | { kind: "implicit"; name: string }
+  | { kind: "explicit"; name: string }
+  | { kind: "indeterminate" };
+
+// deriveCollation derives the collation + derivation level of a (text) expression subtree. A COLLATE
+// is explicit; a column reference is implicit (its frozen collation, C if none); || combines its
+// operands. Every other shape resets to none (takes a neighbour's) — a documented narrowing (§14).
+function deriveCollation(scope: Scope, e: Expr): Deriv {
+  if (e.kind === "collate") return { kind: "explicit", name: e.collation };
+  if (e.kind === "column") return columnDeriv(scope, () => scope.resolveBare(e.name));
+  if (e.kind === "qualifiedColumn") {
+    return columnDeriv(scope, () => scope.resolveQualified(e.qualifier, e.name));
   }
-  return null;
+  if (e.kind === "binary" && e.op === "concat") {
+    return combineDeriv(deriveCollation(scope, e.lhs), deriveCollation(scope, e.rhs));
+  }
+  return { kind: "none" };
 }
 
-// combineExplicit combines two operands' explicit collations (spec/design/collation.md §1/§7). Two
-// DIFFERENT explicit collations are a conflict (42P21, the explicit-mismatch error PG raises);
-// otherwise the single explicit collation, or null when neither forces one.
-function combineExplicit(a: string | null, b: string | null): string | null {
-  if (a !== null && b !== null && a !== b) {
+// columnDeriv is the implicit derivation of a resolved column reference: a text column carries its
+// frozen collation (C → "C", a distinct implicit collation); a non-text or unresolvable reference
+// is "none".
+function columnDeriv(scope: Scope, resolve: () => Resolved): Deriv {
+  let col: Column;
+  try {
+    col = scope.columnOf(resolve());
+  } catch {
+    return { kind: "none" };
+  }
+  if (!typeIsText(col.type)) return { kind: "none" };
+  return { kind: "implicit", name: col.collation ?? "C" };
+}
+
+// combineDeriv combines two operands' derivations (spec/design/collation.md §1/§7, PG's rules).
+// Explicit dominates; two DIFFERENT explicit collations conflict eagerly (42P21); two different
+// implicit collations yield "indeterminate" (deferred to 42P22 on use); explicit resolves it.
+function combineDeriv(a: Deriv, b: Deriv): Deriv {
+  if (a.kind === "explicit" && b.kind === "explicit") {
+    if (a.name !== b.name) {
+      throw engineError(
+        "collation_mismatch",
+        `collation mismatch between explicit collations "${a.name}" and "${b.name}"`,
+      );
+    }
+    return a;
+  }
+  if (a.kind === "explicit") return a;
+  if (b.kind === "explicit") return b;
+  if (a.kind === "indeterminate" || b.kind === "indeterminate") {
+    return { kind: "indeterminate" };
+  }
+  if (a.kind === "implicit" && b.kind === "implicit") {
+    return a.name === b.name ? a : { kind: "indeterminate" };
+  }
+  if (a.kind === "implicit") return a;
+  return b;
+}
+
+// resolveDeriv resolves a derivation to the concrete collation a comparison / ORDER BY uses. "none"
+// and C → null (byte order, the fast path); a loaded name → its table (42704 if it vanished);
+// "indeterminate" → 42P22 (the collation is required but ambiguous).
+function resolveDeriv(catalog: Database, d: Deriv): Collation | null {
+  if (d.kind === "indeterminate") {
     throw engineError(
-      "collation_mismatch",
-      `collation mismatch between explicit collations "${a}" and "${b}"`,
+      "indeterminate_collation",
+      "could not determine which collation to use for string comparison",
     );
   }
-  return a !== null ? a : b;
+  if (d.kind === "implicit" || d.kind === "explicit") {
+    return resolveCollationName(catalog, d.name);
+  }
+  return null;
 }
 
 // collatedCmp compares two non-NULL text values under a loaded collation (spec/design/collation.md
@@ -13083,18 +13230,15 @@ function resolveBinary(
       }
       // Derive the comparison's collation (spec/design/collation.md §1/§7). Only a text×text
       // comparison is collatable; a COLLATE on a non-text operand was already rejected 42804 at the
-      // collate node. The explicit collation is found by walking each AST operand; two DIFFERENT
-      // explicit collations conflict (42P21). In 1c every column is implicitly C, so the only
-      // reachable conflict is explicit-vs-explicit.
+      // collate node. Each operand's derivation (explicit COLLATE / implicit column collation / none)
+      // is combined per PG's rules: two different EXPLICIT collations conflict (42P21); two different
+      // IMPLICIT collations are indeterminate (42P22 when consumed here). Derived for ALL comparison
+      // ops incl =/<> (PG raises regardless), even though =/<> ignore the collation at eval (byte
+      // equality, §7).
       let collation: Collation | null = null;
       if (p.lt.kind === "text" && p.rt.kind === "text") {
-        const name = combineExplicit(
-          explicitCollation(lhs),
-          explicitCollation(rhs),
-        );
-        if (name !== null) {
-          collation = resolveCollationName(scope.catalog, name);
-        }
+        const d = combineDeriv(deriveCollation(scope, lhs), deriveCollation(scope, rhs));
+        collation = resolveDeriv(scope.catalog, d);
       }
       return {
         node: { kind: "compare", op, lhs: cl, rhs: cr, collation },
