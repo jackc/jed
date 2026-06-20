@@ -50,6 +50,7 @@ export type SqlState =
   | "name_too_long" // 42622 — an identifier exceeds MAX_IDENTIFIER_LENGTH (63 bytes); lexer gate (cost.md §7)
   | "generated_always" // 428C9 — a write supplying an explicit value to a GENERATED ALWAYS identity column without OVERRIDING SYSTEM VALUE (an INSERT), or assigning one (an UPDATE) (sequences.md §13)
   | "dependent_objects_still_exist" // 2BP01 — DROP TYPE ... RESTRICT of a composite still referenced (composite.md §7)
+  | "insufficient_privilege" // 42501 — the session envelope withheld a table SELECT/INSERT/UPDATE/DELETE, a function EXECUTE, or DDL permission (session.md §5.3)
   | "feature_not_supported" // 0A000
   | "program_limit_exceeded" // 54000 — input SQL exceeds the per-handle max_sql_length; input-size gate (cost.md §7)
   | "statement_too_complex" // 54001 — nesting depth exceeds MAX_EXPR_DEPTH; native-stack gate (cost.md §7)
@@ -103,6 +104,7 @@ const CODES: Record<SqlState, string> = {
   name_too_long: "42622",
   generated_always: "428C9",
   dependent_objects_still_exist: "2BP01",
+  insufficient_privilege: "42501",
   feature_not_supported: "0A000",
   program_limit_exceeded: "54000",
   statement_too_complex: "54001",

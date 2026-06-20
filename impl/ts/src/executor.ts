@@ -82,6 +82,7 @@ import {
 } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
 import { EngineError, engineError } from "./errors.ts";
+import { type Privilege, PrivilegeSet, Privileges } from "./privileges.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
 import { parseExpression, parseSQL } from "./parser.ts";
@@ -709,6 +710,12 @@ export type SessionOptions = {
   maxCost?: bigint;
   maxSqlLength?: number;
   workMem?: number;
+  // The table-privilege set granted to every table — the GRANT … ON ALL TABLES default
+  // (spec/design/session.md §5.3). Absent ⇒ all four (the default), so a fresh session is
+  // unrestricted; PrivilegeSet.empty().with("select") is a read-only session.
+  defaultPrivileges?: PrivilegeSet;
+  // Whether DDL (CREATE/DROP/ALTER) is permitted; a denied schema change is 42501 (§5.3). Absent ⇒ on.
+  allowDdl?: boolean;
 };
 
 // TxStatus is the session transaction status (spec/design/session.md §2.2) — PostgreSQL's three
@@ -759,6 +766,13 @@ export class Session {
   pendingCurrval: Map<string, bigint>;
   // Per-STATEMENT running lastval update → flushed into sessionLastName on success.
   pendingLastName: string | null;
+  // The authorization envelope (spec/design/session.md §5.3): the GRANT/REVOKE-style per-object
+  // privilege model the host configures and the engine enforces (42501) at name resolution. A fresh
+  // session is fully permissive (every table privilege, every function EXECUTE).
+  privileges: Privileges;
+  // Whether DDL (CREATE/DROP/ALTER) is permitted on this session (§5.3); a denied schema change is
+  // 42501. Default on — jed has no schema/owner model, so this single boolean gates all DDL.
+  allowDdl: boolean;
 
   constructor(opts: SessionOptions = {}) {
     this.tx = null;
@@ -771,6 +785,11 @@ export class Session {
     this.pendingSeq = new Map();
     this.pendingCurrval = new Map();
     this.pendingLastName = null;
+    this.privileges = new Privileges();
+    if (opts.defaultPrivileges !== undefined) {
+      this.privileges.setDefaultTable(opts.defaultPrivileges);
+    }
+    this.allowDdl = opts.allowDdl ?? true;
   }
 
   // run installs this session as db's active session, runs fn, and restores the default — the swap
@@ -816,6 +835,23 @@ export class Session {
   }
   setWorkMem(bytes: number): void {
     this.workMem = bytes;
+  }
+  // setDefaultPrivileges replaces the default table-privilege set — the GRANT … ON ALL TABLES default
+  // (§5.3). A read-only session is PrivilegeSet.empty().with("select").
+  setDefaultPrivileges(privs: PrivilegeSet): void {
+    this.privileges.setDefaultTable(privs);
+  }
+  // grant grants privs on a specific object (table or function), beyond the default (§5.3).
+  grant(privs: PrivilegeSet, object: string): void {
+    this.privileges.grant(privs, object);
+  }
+  // revoke revokes privs from a specific object (revoke wins over grant and the default, §5.3).
+  revoke(privs: PrivilegeSet, object: string): void {
+    this.privileges.revoke(privs, object);
+  }
+  // setAllowDdl sets whether DDL is permitted on this session (§5.3); a denied change is 42501.
+  setAllowDdl(allow: boolean): void {
+    this.allowDdl = allow;
   }
   setRandomSource(f: RandomFill): void {
     this.seam.randomFill = f;
@@ -901,6 +937,47 @@ export class Database {
   // setting, not stored in the file.
   setMaxCost(limit: bigint): void {
     this.session.maxCost = limit;
+  }
+
+  // setDefaultPrivileges replaces the default session's default table-privilege set — the
+  // GRANT … ON ALL TABLES default (spec/design/session.md §5.3). PrivilegeSet.empty().with("select")
+  // makes the session read-only (a write resolves to 42501). A handle setting, not stored in the file.
+  setDefaultPrivileges(privs: PrivilegeSet): void {
+    this.session.privileges.setDefaultTable(privs);
+  }
+
+  // grant grants privs on a specific object (table or function) on the default session (§5.3).
+  grant(privs: PrivilegeSet, object: string): void {
+    this.session.privileges.grant(privs, object);
+  }
+
+  // revoke revokes privs from a specific object on the default session (revoke wins, §5.3).
+  revoke(privs: PrivilegeSet, object: string): void {
+    this.session.privileges.revoke(privs, object);
+  }
+
+  // resetPrivileges resets the default session's authorization envelope to fully permissive — every
+  // table privilege, no per-object delta, DDL allowed (§5.3). The conformance harness calls this
+  // before each record so a # default_privileges: / # grant: / # revoke: / # allow_ddl: directive
+  // never leaks past the record it decorates.
+  resetPrivileges(): void {
+    this.session.privileges = new Privileges();
+    this.session.allowDdl = true;
+  }
+
+  // privileges is read-only access to the default session's authorization envelope (§5.3).
+  privileges(): Privileges {
+    return this.session.privileges;
+  }
+
+  // setAllowDdl sets whether DDL is permitted on the default session (§5.3); a denied change is 42501.
+  setAllowDdl(allow: boolean): void {
+    this.session.allowDdl = allow;
+  }
+
+  // allowDdl reports whether DDL is permitted on the default session.
+  allowDdl(): boolean {
+    return this.session.allowDdl;
   }
 
   // setMaxSqlLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
@@ -1443,7 +1520,49 @@ export class Database {
 
   // dispatchStmt routes one parsed statement to its executor. The autocommit transaction
   // handling (capture / durable commit / rollback-on-error) lives in executeStmtParams.
+  // checkPrivileges enforces the session's authorization envelope for stmt (spec/design/session.md
+  // §5.3). A fully-permissive session (the default) needs no check. Otherwise DDL is gated by
+  // allowDdl, and DML requires a per-table privilege for each table it reads (SELECT) or writes
+  // (INSERT/UPDATE/DELETE) and EXECUTE for each named function it calls. Enforcement is at name
+  // resolution: a table privilege is required only for a name that resolves to an existing catalog
+  // table (a missing table stays 42P01; a CTE / derived-table label is statement-local). Missing
+  // privilege → 42501.
+  private checkPrivileges(stmt: Statement): void {
+    if (this.session.allowDdl && this.session.privileges.isPermissive()) {
+      return;
+    }
+    const req: PrivReq = { tables: [], functions: [], isDdl: false };
+    collectStmtPrivs(stmt, req);
+    if (req.isDdl && !this.session.allowDdl) {
+      throw engineError(
+        "insufficient_privilege",
+        "permission denied: DDL is not permitted in this session",
+      );
+    }
+    const snap = this.readSnap();
+    for (const t of req.tables) {
+      const key = t.name.toLowerCase();
+      // Only a name that resolves to an existing catalog table is privilege-checked; a missing one is
+      // left to raise 42P01 in execution (existence before authorization).
+      if (snap.table(key) !== undefined && !this.session.privileges.allowsTable(key, t.priv)) {
+        throw engineError("insufficient_privilege", "permission denied for table " + key);
+      }
+    }
+    for (const fn of req.functions) {
+      const key = fn.toLowerCase();
+      if (!this.session.privileges.allowsFunction(key)) {
+        throw engineError("insufficient_privilege", "permission denied for function " + key);
+      }
+    }
+  }
+
   private dispatchStmt(stmt: Statement, params: Value[]): Outcome {
+    // Authorization (spec/design/session.md §5.3): enforce the session's privilege envelope before the
+    // statement runs — DDL gated by allowDdl, DML by per-table/per-function privileges, all 42501.
+    // Skipped on a fully-permissive session (the default), so the common path pays nothing. The
+    // physical access-mode gate (25006) is checked earlier in executeStmtParams, so it wins when both
+    // apply.
+    this.checkPrivileges(stmt);
     switch (stmt.kind) {
       case "createTable":
         rejectParamsForDDL(params);
@@ -11044,6 +11163,294 @@ function exprCallsSeqMutator(e: Expr): boolean {
       return exprCallsSeqMutator(e.lhs) || queryCallsSeqMutator(e.query);
     case "quantified":
       return exprCallsSeqMutator(e.lhs) || exprCallsSeqMutator(e.array);
+  }
+}
+
+// PrivReq is the privilege requirements collected from one statement (spec/design/session.md §5.3):
+// the per-table privileges (each (table, privilege) pair), the named functions (each needs EXECUTE),
+// and whether the statement is DDL (gated by allowDdl). Collected by an exhaustive AST walk
+// (mirroring exprCallsSeqMutator).
+type PrivReq = {
+  tables: { name: string; priv: Privilege }[];
+  functions: string[];
+  isDdl: boolean;
+};
+
+// collectStmtPrivs collects the privilege requirements of stmt (spec/design/session.md §5.3).
+// Transaction control carries none (handled before dispatch); DDL just sets isDdl.
+function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
+  const locals = new Set<string>();
+  switch (stmt.kind) {
+    case "createTable":
+    case "dropTable":
+    case "createIndex":
+    case "dropIndex":
+    case "createType":
+    case "dropType":
+    case "createSequence":
+    case "dropSequence":
+    case "alterSequence":
+      req.isDdl = true;
+      break;
+    case "insert":
+      collectInsertPrivs(stmt, req, locals);
+      break;
+    case "select":
+      collectSelectPrivs(stmt, req, locals);
+      break;
+    case "setOp":
+      collectSetOpPrivs(stmt, req, locals);
+      break;
+    case "with":
+      collectWithPrivs(stmt, req, locals);
+      break;
+    case "update":
+      collectUpdatePrivs(stmt, req, locals);
+      break;
+    case "delete":
+      collectDeletePrivs(stmt, req, locals);
+      break;
+    default:
+      // Transaction control (begin/commit/rollback) carries no privilege requirement.
+      break;
+  }
+}
+
+function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string>): void {
+  // The write target needs INSERT. A bare INSERT … VALUES reads nothing (the slots are literals /
+  // params), so it needs only INSERT; an INSERT … SELECT source needs SELECT on its tables.
+  req.tables.push({ name: ins.table, priv: "insert" });
+  if (ins.source.kind === "select") {
+    collectSelectPrivs(ins.source.select, req, locals);
+  }
+  if (ins.onConflict !== null && ins.onConflict.doUpdate) {
+    for (const a of ins.onConflict.assignments) collectExprPrivs(a.value, req, locals);
+    if (ins.onConflict.filter !== null) collectExprPrivs(ins.onConflict.filter, req, locals);
+  }
+  collectItemsPrivs(ins.returning, req, locals);
+}
+
+function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string>): void {
+  req.tables.push({ name: upd.table, priv: "update" });
+  // SELECT on the target if it reads any column — a WHERE, a RETURNING, or a column/subquery-
+  // referencing assignment RHS (a constant-only SET a = 1 with no WHERE/RETURNING reads nothing).
+  const reads =
+    upd.filter !== null ||
+    upd.returning !== null ||
+    upd.assignments.some((a) => exprReadsColumns(a.value));
+  if (reads) req.tables.push({ name: upd.table, priv: "select" });
+  for (const a of upd.assignments) collectExprPrivs(a.value, req, locals);
+  if (upd.filter !== null) collectExprPrivs(upd.filter, req, locals);
+  collectItemsPrivs(upd.returning, req, locals);
+}
+
+function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string>): void {
+  req.tables.push({ name: del.table, priv: "delete" });
+  // DELETE reads the target's columns through a WHERE or a RETURNING.
+  if (del.filter !== null || del.returning !== null) {
+    req.tables.push({ name: del.table, priv: "select" });
+  }
+  if (del.filter !== null) collectExprPrivs(del.filter, req, locals);
+  collectItemsPrivs(del.returning, req, locals);
+}
+
+function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<string>): void {
+  if (qe.kind === "setOp") collectSetOpPrivs(qe, req, locals);
+  else collectSelectPrivs(qe, req, locals);
+}
+
+function collectSetOpPrivs(so: SetOp, req: PrivReq, locals: Set<string>): void {
+  collectQueryPrivs(so.lhs, req, locals);
+  collectQueryPrivs(so.rhs, req, locals);
+}
+
+function collectWithPrivs(wq: WithQuery, req: PrivReq, locals: Set<string>): void {
+  // A CTE name shadows a base table inside the WITH (a FROM <cte> is not a catalog object), so it is
+  // added to the local scope and never privilege-checked. Forward-only visibility: each CTE body sees
+  // the CTE names declared before it.
+  const scope = new Set(locals);
+  for (const cte of wq.ctes) {
+    collectQueryPrivs(cte.query, req, scope);
+    scope.add(cte.name.toLowerCase());
+  }
+  collectQueryPrivs(wq.body, req, scope);
+}
+
+function collectSelectPrivs(s: Select, req: PrivReq, locals: Set<string>): void {
+  if (s.from !== null) collectTableRefPrivs(s.from, req, locals);
+  for (const j of s.joins) {
+    collectTableRefPrivs(j.table, req, locals);
+    if (j.on !== null) collectExprPrivs(j.on, req, locals);
+  }
+  if (s.items.kind === "list") {
+    for (const it of s.items.items) collectExprPrivs(it.expr, req, locals);
+  }
+  if (s.filter !== null) collectExprPrivs(s.filter, req, locals);
+  for (const g of s.groupBy) collectExprPrivs(g, req, locals);
+  if (s.having !== null) collectExprPrivs(s.having, req, locals);
+}
+
+function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<string>): void {
+  if (t.args !== null) {
+    // A set-returning function used as a row source — EXECUTE on the function; its args are exprs.
+    req.functions.push(t.name);
+    for (const a of t.args) collectExprPrivs(a, req, locals);
+  } else if (t.subquery !== undefined) {
+    collectQueryPrivs(t.subquery, req, locals);
+  } else if (t.values !== undefined) {
+    for (const row of t.values) for (const e of row) collectExprPrivs(e, req, locals);
+  } else if (!locals.has(t.name.toLowerCase())) {
+    // A base-table reference (not a CTE / derived-table label) — needs SELECT.
+    req.tables.push({ name: t.name, priv: "select" });
+  }
+}
+
+function collectItemsPrivs(items: SelectItems | null, req: PrivReq, locals: Set<string>): void {
+  if (items !== null && items.kind === "list") {
+    for (const it of items.items) collectExprPrivs(it.expr, req, locals);
+  }
+}
+
+// collectExprPrivs is exhaustive over Expr (mirroring exprCallsSeqMutator): collect every named
+// function call (EXECUTE) and walk every subquery (its tables need SELECT).
+function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
+  switch (e.kind) {
+    case "funcCall":
+      req.functions.push(e.name);
+      for (const a of e.args) collectExprPrivs(a, req, locals);
+      break;
+    case "column":
+    case "qualifiedColumn":
+    case "literal":
+    case "typedLiteral":
+    case "param":
+      break;
+    case "row":
+      for (const f of e.fields) collectExprPrivs(f, req, locals);
+      break;
+    case "array":
+      for (const el of e.elements) collectExprPrivs(el, req, locals);
+      break;
+    case "fieldAccess":
+    case "fieldStar":
+      collectExprPrivs(e.base, req, locals);
+      break;
+    case "subscript":
+      collectExprPrivs(e.base, req, locals);
+      for (const s of e.subscripts) {
+        if (s.isSlice) {
+          if (s.lower !== null) collectExprPrivs(s.lower, req, locals);
+          if (s.upper !== null) collectExprPrivs(s.upper, req, locals);
+        } else {
+          collectExprPrivs(s.index, req, locals);
+        }
+      }
+      break;
+    case "cast":
+      collectExprPrivs(e.inner, req, locals);
+      break;
+    case "unary":
+    case "isNull":
+      collectExprPrivs(e.operand, req, locals);
+      break;
+    case "binary":
+    case "isDistinct":
+    case "like":
+      collectExprPrivs(e.lhs, req, locals);
+      collectExprPrivs(e.rhs, req, locals);
+      break;
+    case "in":
+      collectExprPrivs(e.lhs, req, locals);
+      for (const x of e.list) collectExprPrivs(x, req, locals);
+      break;
+    case "between":
+      collectExprPrivs(e.lhs, req, locals);
+      collectExprPrivs(e.lo, req, locals);
+      collectExprPrivs(e.hi, req, locals);
+      break;
+    case "case":
+      if (e.operand !== null) collectExprPrivs(e.operand, req, locals);
+      for (const w of e.whens) {
+        collectExprPrivs(w.cond, req, locals);
+        collectExprPrivs(w.result, req, locals);
+      }
+      if (e.els !== null) collectExprPrivs(e.els, req, locals);
+      break;
+    case "scalarSubquery":
+    case "exists":
+      collectQueryPrivs(e.query, req, locals);
+      break;
+    case "inSubquery":
+    case "quantifiedSubquery":
+      collectExprPrivs(e.lhs, req, locals);
+      collectQueryPrivs(e.query, req, locals);
+      break;
+    case "quantified":
+      collectExprPrivs(e.lhs, req, locals);
+      collectExprPrivs(e.array, req, locals);
+      break;
+  }
+}
+
+// exprReadsColumns reports whether e reads a stored column or a subquery's rows — the trigger for an
+// UPDATE's SELECT requirement on its target (spec/design/session.md §5.3). A column reference or any
+// subquery counts; a pure constant / parameter expression does not. Exhaustive over Expr.
+function exprReadsColumns(e: Expr): boolean {
+  switch (e.kind) {
+    case "column":
+    case "qualifiedColumn":
+      return true;
+    case "scalarSubquery":
+    case "exists":
+    case "inSubquery":
+    case "quantifiedSubquery":
+      return true;
+    case "literal":
+    case "typedLiteral":
+    case "param":
+      return false;
+    case "row":
+      return e.fields.some(exprReadsColumns);
+    case "array":
+      return e.elements.some(exprReadsColumns);
+    case "fieldAccess":
+    case "fieldStar":
+      return exprReadsColumns(e.base);
+    case "subscript":
+      return (
+        exprReadsColumns(e.base) ||
+        e.subscripts.some((s) =>
+          s.isSlice
+            ? (s.lower !== null && exprReadsColumns(s.lower)) ||
+              (s.upper !== null && exprReadsColumns(s.upper))
+            : exprReadsColumns(s.index),
+        )
+      );
+    case "cast":
+      return exprReadsColumns(e.inner);
+    case "unary":
+    case "isNull":
+      return exprReadsColumns(e.operand);
+    case "funcCall":
+      return e.args.some(exprReadsColumns);
+    case "binary":
+    case "isDistinct":
+    case "like":
+      return exprReadsColumns(e.lhs) || exprReadsColumns(e.rhs);
+    case "in":
+      return exprReadsColumns(e.lhs) || e.list.some(exprReadsColumns);
+    case "between":
+      return (
+        exprReadsColumns(e.lhs) || exprReadsColumns(e.lo) || exprReadsColumns(e.hi)
+      );
+    case "case":
+      return (
+        (e.operand !== null && exprReadsColumns(e.operand)) ||
+        e.whens.some((w) => exprReadsColumns(w.cond) || exprReadsColumns(w.result)) ||
+        (e.els !== null && exprReadsColumns(e.els))
+      );
+    case "quantified":
+      return exprReadsColumns(e.lhs) || exprReadsColumns(e.array);
   }
 }
 

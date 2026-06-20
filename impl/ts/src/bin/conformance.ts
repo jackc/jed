@@ -15,6 +15,9 @@ import {
   execute,
   fixedClock,
   type Outcome,
+  type Privilege,
+  PrivilegeSet,
+  privilegeFromName,
   ReadHandle,
   render,
   seededRandomSource,
@@ -208,6 +211,71 @@ function parseMaxSqlLengthDirective(line: string): number | null {
   return Number.isInteger(n) && n >= 0 ? n : null;
 }
 
+// parsePrivSet parses a comma/whitespace-separated privilege list (SELECT, INSERT; EXECUTE; the
+// keyword ALL = the four table privileges; NONE = the empty set) into a PrivilegeSet. Used by the
+// # default_privileges: / # grant: / # revoke: directives (spec/design/session.md §5.3). Returns null
+// on an unknown privilege name.
+function parsePrivSet(list: string): PrivilegeSet | null {
+  const body = list.trim();
+  if (body.toUpperCase() === "NONE") return PrivilegeSet.empty();
+  if (body.toUpperCase() === "ALL") return PrivilegeSet.allTable();
+  let set = PrivilegeSet.empty();
+  for (const tok of body.split(",")) {
+    const name = tok.trim();
+    if (name === "") continue;
+    const p: Privilege | undefined = privilegeFromName(name);
+    if (p === undefined) return null;
+    set = set.with(p);
+  }
+  return set;
+}
+
+// parseDefaultPrivilegesDirective parses a `# default_privileges: SELECT, INSERT` directive line
+// (spec/design/session.md §5.3): the table-privilege set granted to every table for the next record.
+function parseDefaultPrivilegesDirective(line: string): PrivilegeSet | null {
+  const m = line.match(/^#\s*default_privileges:\s*(.+)$/);
+  if (!m) return null;
+  return parsePrivSet(m[1]!);
+}
+
+// A parsed `# grant:` / `# revoke:` directive: a privilege set and the lowercased object it targets.
+type PrivDelta = { privs: PrivilegeSet; object: string };
+
+// parsePrivDelta parses a `PRIVS ON object` body: the privilege set and the single-word object name
+// after the ON keyword (spec/design/session.md §5.3).
+function parsePrivDelta(body: string): PrivDelta | null {
+  const m = body.match(/^\s*(.+?)\s+[Oo][Nn]\s+(\S+)\s*$/);
+  if (!m) return null;
+  const privs = parsePrivSet(m[1]!);
+  if (privs === null) return null;
+  return { privs, object: m[2]! };
+}
+
+// parseGrantDirective parses a `# grant: PRIVS ON object` directive line (spec/design/session.md §5.3).
+function parseGrantDirective(line: string): PrivDelta | null {
+  const m = line.match(/^#\s*grant:\s*(.+)$/);
+  if (!m) return null;
+  return parsePrivDelta(m[1]!);
+}
+
+// parseRevokeDirective parses a `# revoke: PRIVS ON object` directive line (spec/design/session.md §5.3).
+function parseRevokeDirective(line: string): PrivDelta | null {
+  const m = line.match(/^#\s*revoke:\s*(.+)$/);
+  if (!m) return null;
+  return parsePrivDelta(m[1]!);
+}
+
+// parseAllowDdlDirective parses a `# allow_ddl: on|off` directive line (spec/design/session.md §5.3):
+// whether DDL is permitted on the session for the next record.
+function parseAllowDdlDirective(line: string): boolean | null {
+  const m = line.match(/^#\s*allow_ddl:\s*(\S+)/);
+  if (!m) return null;
+  const v = m[1]!.toLowerCase();
+  if (v === "on" || v === "true" || v === "yes") return true;
+  if (v === "off" || v === "false" || v === "no") return false;
+  return null;
+}
+
 // parseSeedDirective parses a `# seed: N` directive line (spec/design/entropy.md §6): the fixed
 // PRNG seed (u64) to run the next record under, making the uuid generators cross-core identical.
 function parseSeedDirective(line: string): bigint | null {
@@ -309,6 +377,12 @@ function runFile(text: string): void {
   let pendingSeed: bigint | null = null;
   let pendingClock: bigint | null = null;
   let pendingClockAdvance: [bigint, bigint] | null = null;
+  // The session privilege envelope for the next record (spec/design/session.md §5.3); reset after
+  // each record so a directive never leaks forward. grant/revoke accumulate across lines.
+  let pendingDefaultPrivileges: PrivilegeSet | null = null;
+  const pendingGrants: PrivDelta[] = [];
+  const pendingRevokes: PrivDelta[] = [];
+  let pendingAllowDdl: boolean | null = null;
   while (c.i < lines.length) {
     const line = lines[c.i]!.trim();
     if (line === "") {
@@ -321,6 +395,10 @@ function runFile(text: string): void {
       const n = parseCostDirective(line);
       const mc = parseMaxCostDirective(line);
       const msl = parseMaxSqlLengthDirective(line);
+      const dp = parseDefaultPrivilegesDirective(line);
+      const gr = parseGrantDirective(line);
+      const rv = parseRevokeDirective(line);
+      const ad = parseAllowDdlDirective(line);
       const sd = parseSeedDirective(line);
       const ck = parseClockDirective(line);
       const ca = parseClockAdvanceDirective(line);
@@ -330,6 +408,14 @@ function runFile(text: string): void {
         pendingMaxCost = mc;
       } else if (msl !== null) {
         pendingMaxSqlLength = msl;
+      } else if (dp !== null) {
+        pendingDefaultPrivileges = dp;
+      } else if (gr !== null) {
+        pendingGrants.push(gr);
+      } else if (rv !== null) {
+        pendingRevokes.push(rv);
+      } else if (ad !== null) {
+        pendingAllowDdl = ad;
       } else if (sd !== null) {
         pendingSeed = sd;
       } else if (ck !== null) {
@@ -378,6 +464,19 @@ function runFile(text: string): void {
     }
     pendingClock = null;
     pendingClockAdvance = null;
+    // Apply the per-record session privilege envelope (spec/design/session.md §5.3): reset to fully
+    // permissive (every table privilege, DDL allowed), then layer the pending directives, so a
+    // # default_privileges: / # grant: / # revoke: / # allow_ddl: decorates only its record and never
+    // leaks forward.
+    db.resetPrivileges();
+    if (pendingDefaultPrivileges !== null) db.setDefaultPrivileges(pendingDefaultPrivileges);
+    for (const g of pendingGrants) db.grant(g.privs, g.object);
+    for (const r of pendingRevokes) db.revoke(r.privs, r.object);
+    if (pendingAllowDdl !== null) db.setAllowDdl(pendingAllowDdl);
+    pendingDefaultPrivileges = null;
+    pendingGrants.length = 0;
+    pendingRevokes.length = 0;
+    pendingAllowDdl = null;
     const fields = line.split(/\s+/);
     if (fields[0] === "statement") {
       // `# names:` / `# types:` assert result columns, which a statement lacks.
