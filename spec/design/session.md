@@ -402,24 +402,30 @@ zone at the OS zone owns that determinism consequence (the host-extension bounda
 
 ### 6.1 Session variables
 
-PostgreSQL's GUC model, scoped to the session: a **string→string** map (PG GUCs are all text),
+✅ **Landed (all 3 cores, §10 slice 5).** PostgreSQL's GUC model, scoped to the session: a
+**string→string** map (PG GUCs are all text),
 
-- set via the host API (`session.set_var(name, value)` / `session.reset_var(name)`) and via SQL
-  `SET name = value` / `RESET name`,
-- read via `current_setting('name'[, missing_ok])`, `set_config('name', 'value', is_local)`, and
-  SQL `SHOW name`.
+- set via the host API (`session.set_var(name, value)` / `session.reset_var(name)`, read back with
+  `session.var(name) -> Option<String>`),
+- read in SQL via `current_setting('name'[, missing_ok])`.
 
 Custom variables must be **namespaced** (contain a `.`, e.g. `myapp.tenant`) like PG, to stay
-lexically disjoint from built-in settings; an unknown *built-in* setting is an error, an unknown
-*custom* (dotted) name reads as empty/`42704` unless `missing_ok`. Values affect results
-(`current_setting` returns them), so the corpus pins them with a **`# set: name=value, …`**
+lexically disjoint from built-in settings. In v1 there is **no built-in reachable through this map**
+(the `time_zone` built-in is its own slice, §6.2), so **only dotted names are settable** — `set_var`
+/ `reset_var` of a non-dotted name is **`42704`** (the unknown-built-in case, PG's `SET bogus = …`).
+`current_setting` on a name that is not set is **`42704`** (unrecognized configuration parameter)
+unless the two-arg overload passes `missing_ok = true`, which returns **NULL**; `current_setting(NULL)`
+is NULL (the function is **STABLE** and null-propagating). The host getter `var` never errors — an
+unset name reads as `None`. Variables are **session state, not snapshot state**, so they do **not**
+roll back with a transaction (PG `SET SESSION`; `SET LOCAL` is a deferred exception). Values affect
+results (`current_setting` returns them), so the corpus pins them with a **`# set: name=value, …`**
 directive (a stock-runner-ignored comment bound to the next record and reset after — like
 `# seed:`/`# clock:`). Capability: `session.variables`.
 
-**v1 scope (narrow hard, relax later):** the host-API get/set + `current_setting()` read + the
-built-in `time_zone` (§6.2). The full SQL `SET`/`RESET`/`SHOW` grammar, `set_config()`, and
-**`SET LOCAL`** transaction-scoped variables (which *do* roll back with their transaction) are
-follow-ons (§10).
+**v1 scope (narrow hard, relax later):** the host-API get/set + the `current_setting()` SQL read.
+The full SQL `SET`/`RESET`/`SHOW` grammar, `set_config()`, the `time_zone` built-in (§6.2, a separate
+slice), and **`SET LOCAL`** transaction-scoped variables (which *do* roll back with their transaction)
+are follow-ons (§10/§11).
 
 ### 6.2 Session time zone
 
@@ -552,8 +558,20 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
    (`suites/session/lifetime_cost.test`); the gauge / setters / no-rollback / partial-cost host-API
    surface is per-core unit tested. Capability `session.lifetime_cost`; registers `54P02`. No on-disk
    format change (the cumulative is session state, never persisted).
-5. **Session variables** (§6.1, v1 scope) — the string map, host get/set, `current_setting()`,
-   the `# set:` directive. Capability `session.variables`.
+5. **Session variables** (§6.1, v1 scope) — ✅ **landed (all 3 cores).** The session holds a
+   `string→string` map; the host sets it (`set_var`/`reset_var`, read back with `var`) and SQL reads
+   it with the new **`current_setting('name'[, missing_ok])`** built-in (two overloads, STABLE,
+   null-propagating — added to the function catalog and codegenned like every operator). Only dotted
+   (namespaced) custom names are settable in v1 — a non-dotted name is `42704` (the unknown-built-in
+   case, the `time_zone` built-in being slice 6); `current_setting` on an unset name is `42704` unless
+   `missing_ok` is true (→ NULL). The map is **session state, not snapshot state** (it does not roll
+   back with a transaction) and survives the additional-session swap (it is part of `Session`, like
+   the privilege envelope). The SQL-observable `current_setting` behavior is **cross-core
+   corpus-tested** via a per-record `# set: name=value, …` directive (`suites/session/variables.test`,
+   jed-specific so not oracle-checked); the host-API surface (`set_var`/`reset_var`/`var`, the
+   `42704`-on-non-dotted, additional-session isolation, the no-rollback) is **per-core unit tested**.
+   Reuses `42704` (no new error code); no on-disk format change (session state, never persisted). No
+   grammar change (the SQL `SET`/`SHOW` surface is a §11 follow-on). Capability `session.variables`.
 6. **Session time zone slot** (§6.2) — the `time_zone` built-in (default `UTC`, offsets only),
    the `# timezone:` directive. Capability `session.timezone`. (The consuming `timestamptz→date`
    cast is a separate later type slice.)

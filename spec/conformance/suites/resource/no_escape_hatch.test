@@ -19,7 +19,7 @@
 # current_setting, ...), so the oracle would "succeed" where jed must reject. This is a documented
 # divergence (CLAUDE.md §1/§13). The positive controls at the end prove the suite tests
 # absence-of-DANGER, not absence-of-functions: ordinary pure expressions still evaluate.
-# requires: ddl.create_table, ddl.primary_key, query.select, expr.arithmetic, types.i32, types.text, resource.pure_builtins
+# requires: ddl.create_table, ddl.primary_key, query.select, expr.arithmetic, types.i32, types.text, resource.pure_builtins, session.variables
 
 statement ok
 CREATE TABLE t (id i32 PRIMARY KEY, v i32)
@@ -55,11 +55,16 @@ SELECT pg_backend_pid()
 statement error 42883
 SELECT pg_terminate_backend(1)
 
-# --- Environment / session / config introspection: none of it is reachable (42883). ---
+# --- Environment / session / config introspection: none of it is reachable. ---
 
-statement error 42883
+# current_setting EXISTS (spec/design/session.md §6.1) but is a PURE, SAFE reader of the session's
+# own variable map — a string→string map the HOST explicitly sets. It cannot reach real host/server
+# config (PG's search_path, work_mem, …), so a built-in config name is simply not in the map: 42704
+# (unrecognized configuration parameter), the same as any unset variable — NOT a window onto the host.
+statement error 42704
 SELECT current_setting('search_path')
 
+# set_config (the WRITE side / SQL SET surface) does not exist at all — 42883.
 statement error 42883
 SELECT set_config('work_mem', '64MB', false)
 

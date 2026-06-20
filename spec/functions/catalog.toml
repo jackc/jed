@@ -2157,6 +2157,40 @@ null           = "propagates"
 errors         = ["55000"]
 volatility     = "volatile"
 
+# --- session setting functions (current_setting — ../design/session.md §6.1) -------------------
+# current_setting(name [, missing_ok]) reads a SESSION VARIABLE — a string→string GUC map the host
+# configures on the session (session.set_var / `# set:` directive; the SQL SET/SHOW surface is a
+# deferred follow-on, §6.1) — and returns its text value. The FIRST built-in to read the
+# session-variable seam (the "fourth host seam", §6). A custom variable is namespaced like PG (a
+# DOTTED name, e.g. myapp.tenant). An UNSET name is 42704 (unrecognized configuration parameter)
+# UNLESS the two-arg overload passes missing_ok = true, which returns NULL instead. STABLE (the value
+# is fixed for the duration of a statement, so a future optimizer may hoist it but not fold it at
+# plan time — it reads session state); null = "propagates", so current_setting(NULL) is NULL, exactly
+# like nextval(NULL). NOT oracle-imported: the value is configured through jed's host API / the
+# `# set:` harness directive, not reproducible via the same SQL against PostgreSQL, so expected output
+# is hand-authored (cross-core-checked). Two overloads (arity 1 / arity 2) like round/setval.
+[[operator]]
+name           = "current_setting"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["42704"]
+volatility     = "stable"
+
+[[operator]]
+name           = "current_setting"
+kind           = "function"
+arity          = 2
+arg_families   = ["text", "boolean"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = ["42704"]
+volatility     = "stable"
+
 # --- argument-counting functions (num_nulls/num_nonnulls — the VARIADIC surface) ---
 # PostgreSQL's NULL-counting functions, and the engine's FIRST VARIADIC functions
 # (../design/array-functions.md §12). Each declares ONE parameter, the VARIADIC "any" (variadic =
