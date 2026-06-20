@@ -50,6 +50,24 @@ test('the tables page enforces a FOREIGN KEY constraint live (23503) and resets 
 	await expect(panel.getByTestId('result-rows')).toContainText('Ada');
 });
 
+test('the tables page upserts with ON CONFLICT DO UPDATE (excluded) live', async ({ page }) => {
+	await page.goto('/docs/sql/tables/');
+	const panel = page.getByTestId('live-sql');
+	await expect(panel.getByTestId('result-rows')).toContainText('Ada');
+
+	// Account 1 already exists, so instead of a 23505 the row is updated: balance 100 + 100 = 200.
+	await panel
+		.getByTestId('sql-input')
+		.fill(
+			"INSERT INTO account VALUES (1, 'Ada', 100.00) ON CONFLICT (id) DO UPDATE SET balance = account.balance + excluded.balance RETURNING id, balance",
+		);
+	await panel.getByTestId('run-button').click();
+	await expect(panel.getByTestId('result-rows')).toContainText('200.00');
+
+	await panel.getByTestId('reset-button').click();
+	await expect(panel.getByTestId('result-rows')).toContainText('Ada');
+});
+
 test('the select page runs the LATERAL top-N-per-group demo live', async ({ page }) => {
 	await page.goto('/docs/sql/select/');
 	// Sixth LiveSql panel = the CROSS JOIN LATERAL demo: the priciest product of each category —

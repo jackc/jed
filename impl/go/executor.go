@@ -3094,7 +3094,8 @@ func resolveArbiter(table *Table, target *ConflictTarget) (*arbiter, error) {
 		}
 	}
 	return nil, NewError(UndefinedObject, fmt.Sprintf(
-		"constraint %s for table %s does not exist", target.Constraint, table.Name))
+		"constraint %s for table %s does not exist", target.Constraint, table.Name,
+	))
 }
 
 // sameIntSet reports whether the slice's values (as a set) equal the given set.

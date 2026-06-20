@@ -93,3 +93,30 @@ SELECT * FROM event;
 The column must be `smallint`, `integer`, or `bigint`, and is implicitly `NOT NULL`. You can tune the
 backing sequence inline — `GENERATED ALWAYS AS IDENTITY (START WITH 100 INCREMENT BY 5)` — and, as
 with `serial`, the owned sequence is named `event_id_seq` and is dropped with the table.
+
+## Upsert with `ON CONFLICT`
+
+Instead of trapping `23505` when an insert collides with a `PRIMARY KEY` or `UNIQUE` constraint, an
+`ON CONFLICT` clause takes a controlled action. **`DO NOTHING`** skips the offending row;
+**`DO UPDATE`** updates the existing conflicting row — the row you tried to insert is available as the
+special `excluded` relation, while a bare or table-qualified column reads the existing row. Run this
+in the panel above (after the `account` table exists):
+
+```sql
+INSERT INTO account VALUES (1, 'Ada', 100.00)
+  ON CONFLICT (id) DO UPDATE SET balance = account.balance + excluded.balance;
+SELECT id, owner, balance FROM account WHERE id = 1;
+```
+
+Account `1` already exists, so instead of erroring the row is updated — its balance becomes
+`100.00 + 100.00`. The parenthesised **conflict target** `(id)` names which unique constraint to
+arbitrate on (matched by column set; you can also write `ON CONSTRAINT account_pkey`). More to try:
+
+- **`DO NOTHING`** — `INSERT INTO account VALUES (1, 'Dup', 1) ON CONFLICT DO NOTHING;` succeeds and
+  changes nothing (with no target it skips a conflict on *any* unique constraint).
+- **A filtered update** — add `WHERE excluded.balance > account.balance` to a `DO UPDATE` to apply it
+  only when the proposed balance is larger; otherwise the row is left untouched.
+- **`RETURNING`** — append `RETURNING id, balance` to see the affected (inserted or updated) rows.
+
+A conflict on a constraint *other* than the arbiter still raises `23505`, and a single statement that
+would update the same existing row twice raises `21000`. The whole statement is all-or-nothing.
