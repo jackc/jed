@@ -130,6 +130,13 @@ pub enum SqlState {
     /// identity column without `OVERRIDING SYSTEM VALUE` (an INSERT), or assigning one (an UPDATE)
     /// (spec/design/sequences.md §13).
     GeneratedAlways,
+    /// 42501 — insufficient privilege: the session's authorization envelope withheld the privilege
+    /// a statement needs — a per-table `SELECT`/`INSERT`/`UPDATE`/`DELETE`, a function `EXECUTE`, or
+    /// DDL permission (`allow_ddl`) (spec/design/session.md §5.3). PostgreSQL's own
+    /// permission-denied code; jed enforces it from the host-configured session envelope rather than
+    /// an in-database role catalog (CLAUDE.md §3) — checked at name resolution, after the object
+    /// resolves (a missing object stays `42P01`).
+    InsufficientPrivilege,
     /// 0A000 — feature not supported (used by not-yet-implemented surface).
     FeatureNotSupported,
     /// 54000 — program limit exceeded: the input SQL text exceeded the per-handle `max_sql_length`
@@ -206,6 +213,7 @@ impl SqlState {
             SqlState::NameTooLong => "42622",
             SqlState::GeneratedAlways => "428C9",
             SqlState::DependentObjectsStillExist => "2BP01",
+            SqlState::InsufficientPrivilege => "42501",
             SqlState::FeatureNotSupported => "0A000",
             SqlState::ProgramLimitExceeded => "54000",
             SqlState::StatementTooComplex => "54001",

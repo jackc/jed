@@ -25,6 +25,7 @@ use crate::error::{EngineError, Result, SqlState};
 use crate::interval::{self, Interval, parse_interval};
 use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc};
 use crate::pmap::KeyBound;
+use crate::privileges::{Privilege, PrivilegeSet};
 use crate::storage::{Row, TableStore};
 use crate::timestamp::{parse_timestamp, parse_timestamptz};
 use crate::types::{DecimalTypmod, ScalarType, Type};
@@ -628,6 +629,14 @@ pub struct SessionOptions {
     pub max_sql_length: usize,
     /// Work-memory budget in bytes; `0` ⇒ unlimited (never spill). Default [`DEFAULT_WORK_MEM`].
     pub work_mem: usize,
+    /// The table-privilege set granted to **every** table — the `GRANT … ON ALL TABLES` default
+    /// (spec/design/session.md §5.3). Default: all four (`SELECT`/`INSERT`/`UPDATE`/`DELETE`), so a
+    /// fresh session is unrestricted; `{SELECT}` (via [`PrivilegeSet::EMPTY`]`.with(Select)`) is a
+    /// read-only session. Per-object adjustments are [`Session::grant`] / [`Session::revoke`].
+    pub default_privileges: PrivilegeSet,
+    /// Whether DDL (CREATE / DROP / ALTER of tables, indexes, types, sequences) is permitted; a
+    /// denied schema change is `42501` (session.md §5.3). Default **on**.
+    pub allow_ddl: bool,
 }
 
 impl Default for SessionOptions {
@@ -636,6 +645,8 @@ impl Default for SessionOptions {
             max_cost: 0,
             max_sql_length: DEFAULT_MAX_SQL_LENGTH,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
+            default_privileges: PrivilegeSet::ALL_TABLE,
+            allow_ddl: true,
         }
     }
 }
@@ -705,6 +716,14 @@ pub struct Session {
     pub(crate) pending_currval: std::cell::RefCell<HashMap<String, i64>>,
     /// Per-**statement** running `lastval` update → flushed into `session_last_name` on success.
     pub(crate) pending_last_name: std::cell::RefCell<Option<String>>,
+    /// The authorization envelope (spec/design/session.md §5.3): the GRANT/REVOKE-style per-object
+    /// privilege model the host configures and the engine enforces (`42501`) at name resolution. A
+    /// fresh session is fully permissive (every table privilege, every function `EXECUTE`).
+    pub(crate) privileges: crate::privileges::Privileges,
+    /// Whether DDL (CREATE / DROP / ALTER) is permitted on this session (session.md §5.3); a denied
+    /// schema change is `42501`. Default **on** — jed has no schema/owner model, so this single
+    /// boolean governs all DDL (the per-object CREATE/ownership privilege is a deferred follow-on).
+    pub(crate) allow_ddl: bool,
 }
 
 impl Default for Session {
@@ -722,6 +741,8 @@ impl Session {
     /// A fresh session configured from `opts` (spec/design/session.md §2.1); the rest of the
     /// per-connection state (transaction, seam, sequence state) starts empty/default.
     pub fn with_options(opts: SessionOptions) -> Self {
+        let mut privileges = crate::privileges::Privileges::default();
+        privileges.set_default_table(opts.default_privileges);
         Session {
             tx: None,
             max_cost: opts.max_cost,
@@ -733,6 +754,8 @@ impl Session {
             pending_seq: std::cell::RefCell::new(HashMap::new()),
             pending_currval: std::cell::RefCell::new(HashMap::new()),
             pending_last_name: std::cell::RefCell::new(None),
+            privileges,
+            allow_ddl: opts.allow_ddl,
         }
     }
 
@@ -821,6 +844,31 @@ impl Session {
     /// The current work-memory budget.
     pub fn work_mem(&self) -> usize {
         self.work_mem
+    }
+    /// Replace the default table-privilege set — the `GRANT … ON ALL TABLES` default (§5.3). A
+    /// read-only session is `PrivilegeSet::EMPTY.with(Privilege::Select)`.
+    pub fn set_default_privileges(&mut self, privs: PrivilegeSet) {
+        self.privileges.set_default_table(privs);
+    }
+    /// Grant `privs` on a specific object (table or function), beyond the default (§5.3).
+    pub fn grant(&mut self, privs: PrivilegeSet, object: &str) {
+        self.privileges.grant(privs, object);
+    }
+    /// Revoke `privs` from a specific object (revoke wins over grant and the default, §5.3).
+    pub fn revoke(&mut self, privs: PrivilegeSet, object: &str) {
+        self.privileges.revoke(privs, object);
+    }
+    /// Read-only access to the authorization envelope (§5.3).
+    pub fn privileges(&self) -> &crate::privileges::Privileges {
+        &self.privileges
+    }
+    /// Set whether DDL is permitted on this session (§5.3); a denied schema change is `42501`.
+    pub fn set_allow_ddl(&mut self, allow: bool) {
+        self.allow_ddl = allow;
+    }
+    /// Whether DDL is permitted on this session.
+    pub fn allow_ddl(&self) -> bool {
+        self.allow_ddl
     }
     /// Inject a random source for the uuid generators (entropy.md §6).
     pub fn set_random_source(&mut self, f: crate::seam::RandomSource) {
@@ -1179,6 +1227,49 @@ impl Database {
         self.session.max_cost = limit;
     }
 
+    /// Replace the default session's default table-privilege set — the `GRANT … ON ALL TABLES`
+    /// default (spec/design/session.md §5.3). `PrivilegeSet::EMPTY.with(Privilege::Select)` makes the
+    /// session read-only (a write resolves to `42501`). A handle setting, not stored in the file.
+    pub fn set_default_privileges(&mut self, privs: PrivilegeSet) {
+        self.session.privileges.set_default_table(privs);
+    }
+
+    /// Grant `privs` on a specific object (table or function) on the default session, beyond the
+    /// default (§5.3).
+    pub fn grant(&mut self, privs: PrivilegeSet, object: &str) {
+        self.session.privileges.grant(privs, object);
+    }
+
+    /// Revoke `privs` from a specific object on the default session (revoke wins over grant and the
+    /// default, §5.3).
+    pub fn revoke(&mut self, privs: PrivilegeSet, object: &str) {
+        self.session.privileges.revoke(privs, object);
+    }
+
+    /// Reset the default session's authorization envelope to fully permissive — every table
+    /// privilege, no per-object delta, DDL allowed (§5.3). The conformance harness calls this before
+    /// each record so a `# default_privileges:` / `# grant:` / `# revoke:` / `# allow_ddl:` directive
+    /// never leaks past the record it decorates.
+    pub fn reset_privileges(&mut self) {
+        self.session.privileges = crate::privileges::Privileges::default();
+        self.session.allow_ddl = true;
+    }
+
+    /// Read-only access to the default session's authorization envelope (§5.3).
+    pub fn privileges(&self) -> &crate::privileges::Privileges {
+        &self.session.privileges
+    }
+
+    /// Set whether DDL is permitted on the default session (§5.3); a denied schema change is `42501`.
+    pub fn set_allow_ddl(&mut self, allow: bool) {
+        self.session.allow_ddl = allow;
+    }
+
+    /// Whether DDL is permitted on the default session.
+    pub fn allow_ddl(&self) -> bool {
+        self.session.allow_ddl
+    }
+
     /// Set the maximum input SQL length, in **bytes**, accepted on this handle (CLAUDE.md §13;
     /// spec/design/api.md §8). A statement whose text exceeds `bytes` is rejected with `54000`
     /// at parse entry, before lexing — the §13 input-size gate (cost.md §7). `0` is **unlimited**
@@ -1510,9 +1601,66 @@ impl Database {
         })
     }
 
+    /// Enforce the session's authorization envelope for `stmt` (spec/design/session.md §5.3).
+    ///
+    /// A fully-permissive session (the default — every table privilege, no per-object delta, DDL
+    /// allowed) needs no check, so the common path returns immediately. Otherwise:
+    ///
+    /// - **DDL** (CREATE / DROP / ALTER) requires `allow_ddl`; denied ⇒ `42501`.
+    /// - **DML** requires a per-table privilege for each table it reads (`SELECT`) or writes
+    ///   (`INSERT`/`UPDATE`/`DELETE`) and `EXECUTE` for each named function it calls.
+    ///
+    /// Enforcement is at **name resolution**: a table privilege is required only for a name that
+    /// resolves to an **existing** catalog table (a missing table stays `42P01`, raised later in
+    /// execution; a CTE / derived-table label is statement-local, not a catalog object, and is
+    /// skipped). The requirements are collected in a deterministic source-walk order, so the same
+    /// statement aborts at the same point in every core (only the `42501` code is corpus-asserted;
+    /// the offending-object message is informational).
+    fn check_privileges(&self, stmt: &Statement) -> Result<()> {
+        if self.session.allow_ddl && self.session.privileges.is_permissive() {
+            return Ok(());
+        }
+        let mut req = PrivReq::default();
+        collect_stmt_privs(stmt, &mut req);
+        if req.is_ddl && !self.session.allow_ddl {
+            return Err(EngineError::new(
+                SqlState::InsufficientPrivilege,
+                "permission denied: DDL is not permitted in this session",
+            ));
+        }
+        let snap = self.read_snap();
+        for (name, priv_) in &req.tables {
+            let key = name.to_ascii_lowercase();
+            // Only a name that resolves to an existing catalog table is privilege-checked; a missing
+            // one is left to raise 42P01 in execution (existence before authorization).
+            if snap.table(&key).is_some() && !self.session.privileges.allows_table(&key, *priv_) {
+                return Err(EngineError::new(
+                    SqlState::InsufficientPrivilege,
+                    format!("permission denied for table {key}"),
+                ));
+            }
+        }
+        for name in &req.functions {
+            let key = name.to_ascii_lowercase();
+            if !self.session.privileges.allows_function(&key) {
+                return Err(EngineError::new(
+                    SqlState::InsufficientPrivilege,
+                    format!("permission denied for function {key}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
     /// (capture / durable commit / rollback-on-error) lives in `execute_stmt_params`.
     fn dispatch_stmt(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
+        // Authorization (spec/design/session.md §5.3): enforce the session's privilege envelope
+        // before the statement runs — DDL gated by `allow_ddl`, DML by per-table/per-function
+        // privileges, all `42501`. Skipped on a fully-permissive session (the default), so the
+        // common path pays nothing. The physical access-mode gate (`25006`) is checked earlier in
+        // `execute_stmt_params`, so it wins when both apply.
+        self.check_privileges(&stmt)?;
         match stmt {
             Statement::CreateTable(ct) => {
                 reject_params_for_ddl(params)?;
@@ -12489,6 +12637,323 @@ fn expr_calls_seq_mutator(e: &Expr) -> bool {
         Expr::Quantified { lhs, array, .. } => {
             expr_calls_seq_mutator(lhs) || expr_calls_seq_mutator(array)
         }
+    }
+}
+
+/// The privilege requirements collected from one statement (spec/design/session.md §5.3): the
+/// per-table privileges, the named functions (each needs `EXECUTE`), and whether the statement is
+/// DDL (gated by `allow_ddl`). Collected by an exhaustive AST walk (the `Expr` arm is compiler-
+/// enforced exhaustive, mirroring [`expr_calls_seq_mutator`]).
+#[derive(Default)]
+struct PrivReq {
+    /// `(table name, required privilege)` in source-walk order; deduplication is unnecessary (the
+    /// check is idempotent and a fully-permissive session never reaches the walk).
+    tables: Vec<(String, Privilege)>,
+    /// Named functions called (each requires `EXECUTE`), in source-walk order.
+    functions: Vec<String>,
+    /// Whether the statement is DDL (CREATE / DROP / ALTER) — gated by `allow_ddl`.
+    is_ddl: bool,
+}
+
+impl PrivReq {
+    fn need_table(&mut self, name: &str, p: Privilege) {
+        self.tables.push((name.to_string(), p));
+    }
+    fn need_function(&mut self, name: &str) {
+        self.functions.push(name.to_string());
+    }
+}
+
+/// Collect the privilege requirements of `stmt` (spec/design/session.md §5.3). Transaction control
+/// carries none (it is handled before dispatch); DDL just sets `is_ddl`.
+fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
+    let locals = HashSet::new();
+    match stmt {
+        Statement::CreateTable(_)
+        | Statement::DropTable(_)
+        | Statement::CreateIndex(_)
+        | Statement::DropIndex(_)
+        | Statement::CreateType(_)
+        | Statement::DropType(_)
+        | Statement::CreateSequence(_)
+        | Statement::DropSequence(_)
+        | Statement::AlterSequence(_) => req.is_ddl = true,
+        Statement::Insert(ins) => collect_insert_privs(ins, req, &locals),
+        Statement::Select(sel) => collect_select_privs(sel, req, &locals),
+        Statement::SetOp(so) => collect_setop_privs(so, req, &locals),
+        Statement::With(wq) => collect_with_privs(wq, req, &locals),
+        Statement::Update(upd) => collect_update_privs(upd, req, &locals),
+        Statement::Delete(del) => collect_delete_privs(del, req, &locals),
+        Statement::Begin { .. } | Statement::Commit | Statement::Rollback => {}
+    }
+}
+
+fn collect_insert_privs(ins: &Insert, req: &mut PrivReq, locals: &HashSet<String>) {
+    // The write target needs INSERT. A bare `INSERT … VALUES` reads nothing (the slots are literals
+    // / params), so it needs only INSERT; an `INSERT … SELECT` source needs SELECT on its tables.
+    req.need_table(&ins.table, Privilege::Insert);
+    if let InsertSource::Select(sel) = &ins.source {
+        collect_select_privs(sel, req, locals);
+    }
+    if let Some(oc) = &ins.on_conflict {
+        if let ConflictAction::DoUpdate {
+            assignments,
+            filter,
+        } = &oc.action
+        {
+            for a in assignments {
+                collect_expr_privs(&a.value, req, locals);
+            }
+            if let Some(f) = filter {
+                collect_expr_privs(f, req, locals);
+            }
+        }
+    }
+    collect_items_privs(&ins.returning, req, locals);
+}
+
+fn collect_update_privs(upd: &Update, req: &mut PrivReq, locals: &HashSet<String>) {
+    req.need_table(&upd.table, Privilege::Update);
+    // SELECT on the target if it reads any column — a WHERE, a RETURNING, or a column/subquery-
+    // referencing assignment RHS (a constant-only `SET a = 1` with no WHERE/RETURNING reads nothing).
+    let reads = upd.filter.is_some()
+        || upd.returning.is_some()
+        || upd.assignments.iter().any(|a| expr_reads_columns(&a.value));
+    if reads {
+        req.need_table(&upd.table, Privilege::Select);
+    }
+    for a in &upd.assignments {
+        collect_expr_privs(&a.value, req, locals);
+    }
+    if let Some(f) = &upd.filter {
+        collect_expr_privs(f, req, locals);
+    }
+    collect_items_privs(&upd.returning, req, locals);
+}
+
+fn collect_delete_privs(del: &Delete, req: &mut PrivReq, locals: &HashSet<String>) {
+    req.need_table(&del.table, Privilege::Delete);
+    // DELETE reads the target's columns through a WHERE or a RETURNING.
+    if del.filter.is_some() || del.returning.is_some() {
+        req.need_table(&del.table, Privilege::Select);
+    }
+    if let Some(f) = &del.filter {
+        collect_expr_privs(f, req, locals);
+    }
+    collect_items_privs(&del.returning, req, locals);
+}
+
+fn collect_query_privs(qe: &QueryExpr, req: &mut PrivReq, locals: &HashSet<String>) {
+    match qe {
+        QueryExpr::Select(s) => collect_select_privs(s, req, locals),
+        QueryExpr::SetOp(so) => collect_setop_privs(so, req, locals),
+    }
+}
+
+fn collect_setop_privs(so: &SetOp, req: &mut PrivReq, locals: &HashSet<String>) {
+    collect_query_privs(&so.lhs, req, locals);
+    collect_query_privs(&so.rhs, req, locals);
+}
+
+fn collect_with_privs(wq: &WithQuery, req: &mut PrivReq, locals: &HashSet<String>) {
+    // A CTE name shadows a base table inside the WITH (a `FROM <cte>` is not a catalog object), so
+    // it is added to the local scope and never privilege-checked. Forward-only visibility: each CTE
+    // body sees the CTE names declared before it.
+    let mut scope = locals.clone();
+    for cte in &wq.ctes {
+        collect_query_privs(&cte.query, req, &scope);
+        scope.insert(cte.name.to_ascii_lowercase());
+    }
+    collect_query_privs(&wq.body, req, &scope);
+}
+
+fn collect_select_privs(s: &Select, req: &mut PrivReq, locals: &HashSet<String>) {
+    if let Some(from) = &s.from {
+        collect_table_ref_privs(from, req, locals);
+    }
+    for j in &s.joins {
+        collect_table_ref_privs(&j.table, req, locals);
+        if let Some(on) = &j.on {
+            collect_expr_privs(on, req, locals);
+        }
+    }
+    if let SelectItems::Items(items) = &s.items {
+        for it in items {
+            collect_expr_privs(&it.expr, req, locals);
+        }
+    }
+    if let Some(f) = &s.filter {
+        collect_expr_privs(f, req, locals);
+    }
+    for g in &s.group_by {
+        collect_expr_privs(g, req, locals);
+    }
+    if let Some(h) = &s.having {
+        collect_expr_privs(h, req, locals);
+    }
+}
+
+fn collect_table_ref_privs(t: &TableRef, req: &mut PrivReq, locals: &HashSet<String>) {
+    if let Some(args) = &t.args {
+        // A set-returning function used as a row source — EXECUTE on the function; its args are exprs.
+        req.need_function(&t.name);
+        for a in args {
+            collect_expr_privs(a, req, locals);
+        }
+    } else if let Some(sub) = &t.subquery {
+        collect_query_privs(sub, req, locals);
+    } else if let Some(rows) = &t.values {
+        for e in rows.iter().flatten() {
+            collect_expr_privs(e, req, locals);
+        }
+    } else if !locals.contains(&t.name.to_ascii_lowercase()) {
+        // A base-table reference (not a CTE / derived-table label) — needs SELECT.
+        req.need_table(&t.name, Privilege::Select);
+    }
+}
+
+fn collect_items_privs(items: &Option<SelectItems>, req: &mut PrivReq, locals: &HashSet<String>) {
+    if let Some(SelectItems::Items(list)) = items {
+        for it in list {
+            collect_expr_privs(&it.expr, req, locals);
+        }
+    }
+}
+
+/// Exhaustive over `Expr` (compiler-enforced, mirroring [`expr_calls_seq_mutator`]): collect every
+/// named function call (`EXECUTE`) and walk every subquery (its tables need `SELECT`).
+fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<String>) {
+    match e {
+        Expr::FuncCall { name, args, .. } => {
+            req.need_function(name);
+            for a in args {
+                collect_expr_privs(a, req, locals);
+            }
+        }
+        Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::Param(_) => {}
+        Expr::Row(es) | Expr::Array(es) => {
+            for x in es {
+                collect_expr_privs(x, req, locals);
+            }
+        }
+        Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => {
+            collect_expr_privs(base, req, locals)
+        }
+        Expr::Subscript { base, subscripts } => {
+            collect_expr_privs(base, req, locals);
+            for s in subscripts {
+                match s {
+                    SubscriptSpec::Index(x) => collect_expr_privs(x, req, locals),
+                    SubscriptSpec::Slice(lo, hi) => {
+                        if let Some(x) = lo {
+                            collect_expr_privs(x, req, locals);
+                        }
+                        if let Some(x) = hi {
+                            collect_expr_privs(x, req, locals);
+                        }
+                    }
+                }
+            }
+        }
+        Expr::Cast { inner, .. } | Expr::Unary { operand: inner, .. } => {
+            collect_expr_privs(inner, req, locals)
+        }
+        Expr::IsNull { operand, .. } => collect_expr_privs(operand, req, locals),
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::Like { lhs, rhs, .. } => {
+            collect_expr_privs(lhs, req, locals);
+            collect_expr_privs(rhs, req, locals);
+        }
+        Expr::In { lhs, list, .. } => {
+            collect_expr_privs(lhs, req, locals);
+            for x in list {
+                collect_expr_privs(x, req, locals);
+            }
+        }
+        Expr::Between { lhs, lo, hi, .. } => {
+            collect_expr_privs(lhs, req, locals);
+            collect_expr_privs(lo, req, locals);
+            collect_expr_privs(hi, req, locals);
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            if let Some(x) = operand {
+                collect_expr_privs(x, req, locals);
+            }
+            for (c, r) in whens {
+                collect_expr_privs(c, req, locals);
+                collect_expr_privs(r, req, locals);
+            }
+            if let Some(x) = els {
+                collect_expr_privs(x, req, locals);
+            }
+        }
+        Expr::ScalarSubquery(q) | Expr::Exists(q) => collect_query_privs(q, req, locals),
+        Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
+            collect_expr_privs(lhs, req, locals);
+            collect_query_privs(query, req, locals);
+        }
+        Expr::Quantified { lhs, array, .. } => {
+            collect_expr_privs(lhs, req, locals);
+            collect_expr_privs(array, req, locals);
+        }
+    }
+}
+
+/// Whether `e` reads a stored column or a subquery's rows — the trigger for an UPDATE's `SELECT`
+/// requirement on its target (spec/design/session.md §5.3). A column reference (`Column` /
+/// `QualifiedColumn` / a field/subscript over one) or any subquery counts; a pure constant /
+/// parameter expression does not. Exhaustive over `Expr` (compiler-enforced).
+fn expr_reads_columns(e: &Expr) -> bool {
+    match e {
+        Expr::Column(_) | Expr::QualifiedColumn { .. } => true,
+        Expr::ScalarSubquery(_) | Expr::Exists(_) => true,
+        Expr::Literal(_) | Expr::TypedLiteral { .. } | Expr::Param(_) => false,
+        Expr::Row(es) | Expr::Array(es) => es.iter().any(expr_reads_columns),
+        Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_reads_columns(base),
+        Expr::Subscript { base, subscripts } => {
+            expr_reads_columns(base)
+                || subscripts.iter().any(|s| match s {
+                    SubscriptSpec::Index(x) => expr_reads_columns(x),
+                    SubscriptSpec::Slice(lo, hi) => {
+                        lo.as_ref().is_some_and(|x| expr_reads_columns(x))
+                            || hi.as_ref().is_some_and(|x| expr_reads_columns(x))
+                    }
+                })
+        }
+        Expr::Cast { inner, .. } | Expr::Unary { operand: inner, .. } => expr_reads_columns(inner),
+        Expr::IsNull { operand, .. } => expr_reads_columns(operand),
+        Expr::FuncCall { args, .. } => args.iter().any(expr_reads_columns),
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::Like { lhs, rhs, .. } => expr_reads_columns(lhs) || expr_reads_columns(rhs),
+        Expr::In { lhs, list, .. } => {
+            expr_reads_columns(lhs) || list.iter().any(expr_reads_columns)
+        }
+        Expr::Between { lhs, lo, hi, .. } => {
+            expr_reads_columns(lhs) || expr_reads_columns(lo) || expr_reads_columns(hi)
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            operand.as_ref().is_some_and(|x| expr_reads_columns(x))
+                || whens
+                    .iter()
+                    .any(|(c, r)| expr_reads_columns(c) || expr_reads_columns(r))
+                || els.as_ref().is_some_and(|x| expr_reads_columns(x))
+        }
+        Expr::InSubquery { .. } | Expr::QuantifiedSubquery { .. } => true,
+        Expr::Quantified { lhs, array, .. } => expr_reads_columns(lhs) || expr_reads_columns(array),
     }
 }
 

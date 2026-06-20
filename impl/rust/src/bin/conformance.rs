@@ -168,6 +168,69 @@ fn parse_max_sql_length_directive(rest: &str) -> Option<usize> {
         .ok()
 }
 
+/// Parse a comma/whitespace-separated privilege list (`SELECT, INSERT`, `EXECUTE`, the keyword
+/// `ALL` = the four table privileges, `NONE` = the empty set) into a [`PrivilegeSet`]. Used by the
+/// `# default_privileges:` / `# grant:` / `# revoke:` directives (spec/design/session.md §5.3).
+fn parse_priv_set(list: &str) -> Option<jed::PrivilegeSet> {
+    let body = list.trim();
+    if body.eq_ignore_ascii_case("none") {
+        return Some(jed::PrivilegeSet::EMPTY);
+    }
+    if body.eq_ignore_ascii_case("all") {
+        return Some(jed::PrivilegeSet::ALL_TABLE);
+    }
+    let mut set = jed::PrivilegeSet::EMPTY;
+    for tok in body.split(',') {
+        let name = tok.trim();
+        if name.is_empty() {
+            continue;
+        }
+        set = set.with(jed::Privilege::from_name(name)?);
+    }
+    Some(set)
+}
+
+/// Parse a `# default_privileges: SELECT, INSERT` directive body (spec/design/session.md §5.3): the
+/// table-privilege set granted to **every** table for the next record (`NONE` / `ALL` accepted).
+fn parse_default_privileges_directive(rest: &str) -> Option<jed::PrivilegeSet> {
+    parse_priv_set(rest.trim_start().strip_prefix("default_privileges:")?)
+}
+
+/// Parse a `# grant: PRIVS ON object` / `# revoke: PRIVS ON object` directive body (after the
+/// `grant:` / `revoke:` prefix is stripped): the privilege set and the lowercased object name. The
+/// object is the single word after the `ON` keyword (spec/design/session.md §5.3).
+fn parse_priv_delta(body: &str) -> Option<(jed::PrivilegeSet, String)> {
+    let lower = body.to_ascii_lowercase();
+    let on = lower.find(" on ")?;
+    let privs = parse_priv_set(&body[..on])?;
+    let object = body[on + 4..].trim();
+    if object.is_empty() || object.split_whitespace().count() != 1 {
+        return None;
+    }
+    Some((privs, object.to_string()))
+}
+
+/// Parse a `# grant: PRIVS ON object` directive body (spec/design/session.md §5.3).
+fn parse_grant_directive(rest: &str) -> Option<(jed::PrivilegeSet, String)> {
+    parse_priv_delta(rest.trim_start().strip_prefix("grant:")?)
+}
+
+/// Parse a `# revoke: PRIVS ON object` directive body (spec/design/session.md §5.3).
+fn parse_revoke_directive(rest: &str) -> Option<(jed::PrivilegeSet, String)> {
+    parse_priv_delta(rest.trim_start().strip_prefix("revoke:")?)
+}
+
+/// Parse a `# allow_ddl: on|off` directive body (spec/design/session.md §5.3): whether DDL is
+/// permitted on the session for the next record (`on`/`true` ⇒ allowed, `off`/`false` ⇒ denied).
+fn parse_allow_ddl_directive(rest: &str) -> Option<bool> {
+    let v = rest.trim_start().strip_prefix("allow_ddl:")?.trim();
+    match v.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" => Some(true),
+        "off" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
 /// Parse a `# seed: N` directive body (entropy.md §6): the fixed PRNG seed (u64) to run the next
 /// record under, making the volatile uuid generators deterministic + cross-core identical.
 fn parse_seed_directive(rest: &str) -> Option<u64> {
@@ -272,6 +335,12 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut pending_seed: Option<u64> = None;
     let mut pending_clock: Option<i64> = None;
     let mut pending_clock_advance: Option<(i64, i64)> = None;
+    // The session privilege envelope for the next record (spec/design/session.md §5.3); reset after
+    // each record so a directive never leaks forward. `grant`/`revoke` accumulate across lines.
+    let mut pending_default_privileges: Option<jed::PrivilegeSet> = None;
+    let mut pending_grants: Vec<(jed::PrivilegeSet, String)> = Vec::new();
+    let mut pending_revokes: Vec<(jed::PrivilegeSet, String)> = Vec::new();
+    let mut pending_allow_ddl: Option<bool> = None;
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -287,6 +356,14 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 pending_max_cost = Some(n);
             } else if let Some(n) = parse_max_sql_length_directive(rest) {
                 pending_max_sql_length = Some(n);
+            } else if let Some(p) = parse_default_privileges_directive(rest) {
+                pending_default_privileges = Some(p);
+            } else if let Some(g) = parse_grant_directive(rest) {
+                pending_grants.push(g);
+            } else if let Some(r) = parse_revoke_directive(rest) {
+                pending_revokes.push(r);
+            } else if let Some(a) = parse_allow_ddl_directive(rest) {
+                pending_allow_ddl = Some(a);
             } else if let Some(s) = parse_seed_directive(rest) {
                 pending_seed = Some(s);
             } else if let Some(c) = parse_clock_directive(rest) {
@@ -327,6 +404,23 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             }
             (None, Some(c)) => db.set_clock_source(jed::seam::fixed_clock(c)),
             (None, None) => db.clear_clock_source(),
+        }
+        // Apply the per-record session privilege envelope (spec/design/session.md §5.3): reset to
+        // fully permissive (every table privilege, DDL allowed), then layer the pending directives,
+        // so a `# default_privileges:` / `# grant:` / `# revoke:` / `# allow_ddl:` decorates only its
+        // record and never leaks forward.
+        db.reset_privileges();
+        if let Some(p) = pending_default_privileges.take() {
+            db.set_default_privileges(p);
+        }
+        for (privs, object) in pending_grants.drain(..) {
+            db.grant(privs, &object);
+        }
+        for (privs, object) in pending_revokes.drain(..) {
+            db.revoke(privs, &object);
+        }
+        if let Some(a) = pending_allow_ddl.take() {
+            db.set_allow_ddl(a);
         }
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();

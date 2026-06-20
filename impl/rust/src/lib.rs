@@ -28,6 +28,7 @@ pub mod pager;
 pub mod paging;
 pub mod parser;
 pub mod pmap;
+pub mod privileges;
 pub mod range;
 pub mod ranges_gen;
 #[cfg(test)]
@@ -52,6 +53,7 @@ pub use executor::{
 };
 pub use file::{DatabaseOptions, OpenOptions};
 pub use parser::Parser;
+pub use privileges::{Privilege, PrivilegeSet, Privileges};
 pub use shared::{ReadHandle, SharedDb, WriteHandle};
 pub use spill::DEFAULT_WORK_MEM;
 pub use split::{SplitStatements, StatementSpan, split_statements};
@@ -385,6 +387,13 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // over-long statement with 54000 at parse entry, before lexing; the `# max_sql_length:`
     // directive runs a record under a small cap (CLAUDE.md §13; cost.md §7, api.md §8).
     "resource.sql_length_limit",
+    // Session privileges — the GRANT/REVOKE envelope (per-table SELECT/INSERT/UPDATE/DELETE +
+    // function EXECUTE), enforced at name resolution with 42501; the `# default_privileges:` /
+    // `# grant:` / `# revoke:` directives configure the session (session.md §5.3).
+    "session.privileges",
+    // DDL gate — the single `allow_ddl` session capability governing CREATE/DROP/ALTER; a denied
+    // schema change is 42501. The `# allow_ddl:` directive sets it (session.md §5.3).
+    "session.allow_ddl",
     // Identifier-length limit — a fixed MAX_IDENTIFIER_LENGTH (63 bytes) checked at the lexer's
     // identifier production aborts an over-long name with 42622, on every parse path (cost.md §7).
     "resource.identifier_length_limit",
