@@ -16,7 +16,7 @@ use crate::catalog::{
     FkAction, ForeignKeyConstraint, IdentityKind, IndexDef, IndexKind, SeqDataType, SeqOwner,
     SequenceDef, Table, resolve_col_type,
 };
-use crate::cost::Meter;
+use crate::cost::{Lifetime, Meter};
 use crate::costs::COSTS;
 use crate::date::parse_date;
 use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
@@ -625,6 +625,11 @@ pub struct Database {
 pub struct SessionOptions {
     /// Execution-cost ceiling (CLAUDE.md §13); `0` ⇒ unlimited (the default).
     pub max_cost: i64,
+    /// Per-session cumulative cost budget (spec/design/session.md §5.4); `0` ⇒ unlimited (the
+    /// default). Bounds the whole session: the instant the session's running total reaches it, the
+    /// in-flight statement aborts `54P02` (and once spent, every further statement is rejected at
+    /// admission). Sibling to `max_cost`, which bounds one statement.
+    pub lifetime_max_cost: i64,
     /// Maximum input SQL length in bytes; `0` ⇒ unlimited. Default [`DEFAULT_MAX_SQL_LENGTH`].
     pub max_sql_length: usize,
     /// Work-memory budget in bytes; `0` ⇒ unlimited (never spill). Default [`DEFAULT_WORK_MEM`].
@@ -643,6 +648,7 @@ impl Default for SessionOptions {
     fn default() -> Self {
         SessionOptions {
             max_cost: 0,
+            lifetime_max_cost: 0,
             max_sql_length: DEFAULT_MAX_SQL_LENGTH,
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             default_privileges: PrivilegeSet::ALL_TABLE,
@@ -687,6 +693,17 @@ pub struct Session {
     /// Bounds every statement run on this session: its [`Meter`](crate::cost::Meter) is built with
     /// this limit and aborts `54P01` the instant accrued cost reaches it.
     pub(crate) max_cost: i64,
+    /// The per-session cumulative cost budget (spec/design/session.md §5.4), or `0` for
+    /// **unlimited**. Bounds the whole session: the instant [`lifetime_total`](Session::lifetime_total)
+    /// reaches it the in-flight statement aborts `54P02`, and once spent every further statement is
+    /// rejected `54P02` at admission. Sibling to [`max_cost`](Session::max_cost) (one statement).
+    pub(crate) lifetime_max_cost: i64,
+    /// The session's running **cumulative** execution cost (spec/design/session.md §5.4) — the gauge
+    /// `lifetime_cost()` reads and the `54P02` budget bounds. Shared (`Rc<Cell>`) with every statement
+    /// [`Meter`](crate::cost::Meter), which live-charges its units into it, so partial cost of an
+    /// aborted statement counts automatically. **Session state, not snapshot state**: it does NOT roll
+    /// back when a transaction rolls back (the compute was spent regardless).
+    pub(crate) lifetime_total: std::rc::Rc<std::cell::Cell<i64>>,
     /// The maximum input SQL length, in **bytes**, accepted on this session (CLAUDE.md §13; api.md
     /// §8, cost.md §7). `0` ⇒ **unlimited**; default [`DEFAULT_MAX_SQL_LENGTH`] (1 MiB). An
     /// over-limit statement is rejected `54000` at [`parse`](Database::parse), before lexing.
@@ -746,6 +763,8 @@ impl Session {
         Session {
             tx: None,
             max_cost: opts.max_cost,
+            lifetime_max_cost: opts.lifetime_max_cost,
+            lifetime_total: std::rc::Rc::new(std::cell::Cell::new(0)),
             max_sql_length: opts.max_sql_length,
             work_mem: opts.work_mem,
             seam: crate::seam::Seam::default(),
@@ -828,6 +847,34 @@ impl Session {
     /// The current execution-cost ceiling.
     pub fn max_cost(&self) -> i64 {
         self.max_cost
+    }
+    /// Set the per-session cumulative cost budget (spec/design/session.md §5.4); `<= 0` ⇒ unlimited.
+    /// Bounds the whole session: a statement aborts `54P02` the instant the session's cumulative cost
+    /// reaches `limit`, and once spent every further statement is rejected `54P02` at admission.
+    pub fn set_lifetime_max_cost(&mut self, limit: i64) {
+        self.lifetime_max_cost = limit;
+    }
+    /// The current per-session cumulative cost budget (`0` ⇒ unlimited).
+    pub fn lifetime_max_cost(&self) -> i64 {
+        self.lifetime_max_cost
+    }
+    /// The session's running **cumulative** execution cost so far (spec/design/session.md §5.4) — the
+    /// gauge the `lifetime_max_cost` budget bounds. Tracked even when the budget is unlimited; survives
+    /// a transaction rollback (session state, not snapshot state).
+    pub fn lifetime_cost(&self) -> i64 {
+        self.lifetime_total.get()
+    }
+    /// Build the [`Meter`](crate::cost::Meter) for a statement run on this session: the per-statement
+    /// `max_cost` ceiling (`54P01`) plus a handle to the session's cumulative total + budget (`54P02`).
+    /// Every statement's meter is minted here, so all execution cost live-charges into the cumulative.
+    pub(crate) fn new_meter(&self) -> Meter {
+        Meter::for_session(
+            self.max_cost,
+            Lifetime {
+                total: self.lifetime_total.clone(),
+                limit: self.lifetime_max_cost,
+            },
+        )
     }
     /// Set the maximum input SQL length in bytes; `0` ⇒ unlimited.
     pub fn set_max_sql_length(&mut self, bytes: usize) {
@@ -1227,6 +1274,29 @@ impl Database {
         self.session.max_cost = limit;
     }
 
+    /// Set the **per-session cumulative cost budget** on the default session (spec/design/session.md
+    /// §5.4); `limit <= 0` (the default) is **unlimited**. Where `max_cost` bounds one statement
+    /// (`54P01`), this bounds the whole session: the instant the session's running cumulative cost
+    /// reaches `limit` the in-flight statement aborts `54P02`, and once spent every further statement
+    /// is rejected `54P02` at admission. The multi-tenant / untrusted-host gate atop `max_cost`; a
+    /// handle setting, not stored in the file.
+    pub fn set_lifetime_max_cost(&mut self, limit: i64) {
+        self.session.lifetime_max_cost = limit;
+    }
+
+    /// The default session's per-session cumulative cost budget (`0` ⇒ unlimited).
+    /// See [`set_lifetime_max_cost`](Database::set_lifetime_max_cost).
+    pub fn lifetime_max_cost(&self) -> i64 {
+        self.session.lifetime_max_cost
+    }
+
+    /// The default session's running **cumulative** execution cost so far (spec/design/session.md
+    /// §5.4) — the gauge the `lifetime_max_cost` budget bounds. Tracked even when unlimited; survives
+    /// a transaction rollback (session state, not snapshot state).
+    pub fn lifetime_cost(&self) -> i64 {
+        self.session.lifetime_total.get()
+    }
+
     /// Replace the default session's default table-privilege set — the `GRANT … ON ALL TABLES`
     /// default (spec/design/session.md §5.3). `PrivilegeSet::EMPTY.with(Privilege::Select)` makes the
     /// session read-only (a write resolves to `42501`). A handle setting, not stored in the file.
@@ -1616,6 +1686,22 @@ impl Database {
     /// skipped). The requirements are collected in a deterministic source-walk order, so the same
     /// statement aborts at the same point in every core (only the `42501` code is corpus-asserted;
     /// the offending-object message is informational).
+    /// Reject a statement at **admission** when the session's lifetime cost budget is already spent
+    /// (spec/design/session.md §5.4): if a budget is set and the session's cumulative cost has reached
+    /// it, no further statement may run (it "cannot accrue") — `54P02`. A no-op when the budget is
+    /// unlimited (the default), so the common path pays one comparison.
+    fn check_lifetime_admission(&self) -> Result<()> {
+        let limit = self.session.lifetime_max_cost;
+        let total = self.session.lifetime_total.get();
+        if limit > 0 && total >= limit {
+            return Err(EngineError::new(
+                SqlState::SessionCostLimitExceeded,
+                format!("session exceeded the lifetime cost limit of {limit} (accrued {total})"),
+            ));
+        }
+        Ok(())
+    }
+
     fn check_privileges(&self, stmt: &Statement) -> Result<()> {
         if self.session.allow_ddl && self.session.privileges.is_permissive() {
             return Ok(());
@@ -1655,6 +1741,13 @@ impl Database {
     /// Dispatch one parsed statement to its executor. The autocommit transaction handling
     /// (capture / durable commit / rollback-on-error) lives in `execute_stmt_params`.
     fn dispatch_stmt(&mut self, stmt: Statement, params: &[Value]) -> Result<Outcome> {
+        // Lifetime budget admission (spec/design/session.md §5.4): once the session's cumulative cost
+        // has reached `lifetime_max_cost`, every further statement is rejected `54P02` **before it can
+        // accrue** — checked ahead of privileges/existence, so an exhausted session runs nothing. A
+        // no-op when the budget is unlimited (the default). Transaction control (BEGIN/COMMIT/ROLLBACK)
+        // never reaches dispatch (handled in `execute_stmt_params`), so an exhausted session can still
+        // close out an open block.
+        self.check_lifetime_admission()?;
         // Authorization (spec/design/session.md §5.3): enforce the session's privilege envelope
         // before the statement runs — DDL gated by `allow_ddl`, DML by per-table/per-function
         // privileges, all `42501`. Skipped on a fully-permissive session (the default), so the
@@ -2814,7 +2907,7 @@ impl Database {
         // row, with the indexed columns as the touched set (fixed-width — the chain/decompress
         // terms are structurally zero). An empty table charges 0. The entries are computed
         // here, against the pre-index store; the writes below are unmetered.
-        let mut meter = Meter::with_limit(self.session.max_cost);
+        let mut meter = self.session.new_meter();
         let mut mask = vec![false; columns.len()];
         for &c in &cols {
             mask[c] = true;
@@ -3399,7 +3492,7 @@ impl Database {
                 // compression attempts for over-RECORD_MAX rows (value_compress) and the
                 // RETURNING projection. The meter is created here (before materialization) so a
                 // `DEFAULT`-keyword expression default charges it too.
-                let mut meter = Meter::with_limit(self.session.max_cost);
+                let mut meter = self.session.new_meter();
 
                 // Materialize each row into its value-position-indexed candidates (length
                 // `arity`, checked above), resolving each slot: a literal, a bound `$N`, or a
@@ -3502,7 +3595,7 @@ impl Database {
                     None => None,
                 };
                 let bound = bind_params(params, &ptypes.finalize()?)?;
-                let mut meter = Meter::with_limit(self.session.max_cost);
+                let mut meter = self.session.new_meter();
                 self.fold_uncorrelated_in_plan(
                     &mut plan,
                     &bound,
@@ -4688,7 +4781,7 @@ impl Database {
         // correlated one stays and re-runs per row via the per-row outer environment below.
         // The uncorrelated execution reads the pre-DELETE snapshot (we collect keys before
         // mutating), matching PostgreSQL.
-        let mut meter = Meter::with_limit(self.session.max_cost);
+        let mut meter = self.session.new_meter();
         if let Some(f) = &mut filter {
             self.fold_uncorrelated_in_rexpr(f, &bound, CteCtx::empty(), &mut meter.accrued)?;
         }
@@ -4992,7 +5085,7 @@ impl Database {
         // cost is added a single time (grammar.md §26, cost.md §3); a correlated one stays and
         // re-runs per row via the outer environment. The uncorrelated execution reads the
         // pre-UPDATE snapshot (phase 1 only reads; phase 2 writes), matching PostgreSQL.
-        let mut meter = Meter::with_limit(self.session.max_cost);
+        let mut meter = self.session.new_meter();
         for plan in &mut plans {
             self.fold_uncorrelated_in_rexpr(
                 &mut plan.source,
@@ -5700,7 +5793,7 @@ impl Database {
             rng: &stmt_rng,
             ctes,
         };
-        let mut meter = Meter::with_limit(self.session.max_cost);
+        let mut meter = self.session.new_meter();
         let mut rows: Vec<Vec<Value>> = Vec::with_capacity(plan.rows.len());
         for row in &plan.rows {
             meter.guard()?; // enforce the cost ceiling per produced row (CLAUDE.md §13)
@@ -6781,7 +6874,7 @@ impl Database {
             rng: &stmt_rng,
             ctes,
         };
-        let mut meter = Meter::with_limit(self.session.max_cost);
+        let mut meter = self.session.new_meter();
 
         // LIMIT short-circuit (spec/design/cost.md §3): a single-table query with a LIMIT and no
         // blocking operator (no join, aggregate, DISTINCT, or ORDER BY) streams scan→filter→project

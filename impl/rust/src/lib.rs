@@ -394,6 +394,11 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // DDL gate — the single `allow_ddl` session capability governing CREATE/DROP/ALTER; a denied
     // schema change is 42501. The `# allow_ddl:` directive sets it (session.md §5.3).
     "session.allow_ddl",
+    // Session lifetime cost budget — a per-session cumulative cost budget `lifetime_max_cost`
+    // aborting the in-flight statement (and rejecting later ones at admission) with 54P02 once the
+    // session's running total reaches it; sibling to resource.cost_limit's per-statement 54P01. The
+    // sticky `# lifetime_max_cost:` directive sets the budget for the rest of the file (session.md §5.4).
+    "session.lifetime_cost",
     // Identifier-length limit — a fixed MAX_IDENTIFIER_LENGTH (63 bytes) checked at the lexer's
     // identifier production aborts an over-long name with 42622, on every parse path (cost.md §7).
     "resource.identifier_length_limit",

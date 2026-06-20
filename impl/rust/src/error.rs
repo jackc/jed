@@ -156,6 +156,11 @@ pub enum SqlState {
     /// `max_cost` ceiling and execution was aborted (CLAUDE.md §13; spec/design/cost.md §6).
     /// jed-specific (PostgreSQL has no execution-cost ceiling); class 54 program_limit_exceeded.
     CostLimitExceeded,
+    /// 54P02 — session cost limit exceeded: the session's cumulative execution cost reached the
+    /// caller-set `lifetime_max_cost` budget and the in-flight statement was aborted, or a further
+    /// statement was rejected at admission because the budget is already spent (spec/design/session.md
+    /// §5.4). Sibling to `54P01` (which bounds one statement); jed-specific, class 54.
+    SessionCostLimitExceeded,
     /// 58030 — I/O error from the host file layer (read/write/fsync/rename;
     /// spec/design/api.md §2).
     IoError,
@@ -218,6 +223,7 @@ impl SqlState {
             SqlState::ProgramLimitExceeded => "54000",
             SqlState::StatementTooComplex => "54001",
             SqlState::CostLimitExceeded => "54P01",
+            SqlState::SessionCostLimitExceeded => "54P02",
             SqlState::IoError => "58030",
             SqlState::UndefinedFile => "58P01",
             SqlState::DuplicateFile => "58P02",

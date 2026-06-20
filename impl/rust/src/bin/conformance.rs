@@ -155,6 +155,20 @@ fn parse_max_cost_directive(rest: &str) -> Option<i64> {
         .ok()
 }
 
+/// Parse a `# lifetime_max_cost: N` directive body. Returns the per-SESSION cumulative cost budget,
+/// or None if this comment is not a lifetime_max_cost directive. Unlike `# max_cost:` (per-record,
+/// reset after each record), this is **sticky**: it sets the session budget for the rest of the file
+/// (the cumulative cost builds across records on the one Database the file runs against), so an
+/// ordered statement sequence can drive the session to its budget and assert the `54P02` abort —
+/// what the per-record `# cost:` directive cannot express (spec/design/session.md §5.4).
+fn parse_lifetime_max_cost_directive(rest: &str) -> Option<i64> {
+    rest.trim_start()
+        .strip_prefix("lifetime_max_cost:")?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Parse a `# max_sql_length: N` directive body. Returns the per-handle input-size limit (bytes)
 /// to run the next record under, or None if this comment is not a max_sql_length directive.
 /// Mirrors `# max_cost:`: it lets a record set a *small* cap and assert that an over-long
@@ -352,6 +366,11 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             // is ignored.
             if let Some(n) = parse_cost_directive(rest) {
                 pending_cost = Some(n);
+            } else if let Some(n) = parse_lifetime_max_cost_directive(rest) {
+                // Sticky (spec/design/session.md §5.4): apply immediately and persistently — the
+                // session cumulative builds across records, so a later record can assert the 54P02
+                // abort. Not a pending per-record directive (it must NOT reset between records).
+                db.set_lifetime_max_cost(n);
             } else if let Some(n) = parse_max_cost_directive(rest) {
                 pending_max_cost = Some(n);
             } else if let Some(n) = parse_max_sql_length_directive(rest) {
@@ -535,6 +554,10 @@ fn rebaseline_file(text: &str) -> Option<String> {
         if let Some(rest) = trimmed.strip_prefix('#') {
             if parse_cost_directive(rest).is_some() {
                 pending_cost_line = Some(i);
+            } else if let Some(n) = parse_lifetime_max_cost_directive(rest) {
+                // Sticky session budget (spec/design/session.md §5.4): apply immediately so the DB
+                // state evolves identically to `run_file` (an aborting record writes nothing).
+                db.set_lifetime_max_cost(n);
             } else if let Some(n) = parse_max_cost_directive(rest) {
                 pending_max_cost = Some(n);
             } else if let Some(n) = parse_max_sql_length_directive(rest) {

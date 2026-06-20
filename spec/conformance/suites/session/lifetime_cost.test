@@ -1,0 +1,65 @@
+# Session lifetime cost budget — the per-session cumulative cost meter (spec/design/session.md §5.4).
+# Where `max_cost` bounds ONE statement (54P01, suites/resource/cost_limit.test), `lifetime_max_cost`
+# bounds the whole SESSION: the session holds a running cumulative cost total into which every
+# statement accrues, and the instant that total reaches the budget the in-flight statement aborts
+# 54P02 (session_cost_limit_exceeded). The budget is a hard, monotonic allowance — an aborted
+# statement's partial cost still counts, and once it is spent every further statement is rejected
+# 54P02 at ADMISSION (it cannot accrue). This is jed-specific (PostgreSQL has no execution-cost
+# budget), so the suite is CROSS-CORE-checked (every core meters the byte-identical cost, §2, so they
+# abort on the SAME schedule), NOT PostgreSQL-oracle-checked.
+#
+# The per-record `# cost:` directive cannot express a cumulative budget, so this suite uses a STICKY
+# `# lifetime_max_cost: N` directive: unlike `# max_cost:` it is NOT reset per record but sets the
+# session budget for the rest of the file, and the cumulative builds across records on the one
+# Database the file runs against (so an ordered statement sequence drives the session to its budget).
+# Costs are the deterministic unit schedule (spec/cost/schedule.toml): a FROM-less `SELECT 1` costs 1
+# (one row_produced) and each `+` adds one operator_eval, so `SELECT 1 + … + 1` over ten `1`s (nine
+# `+`) costs 10 (9 operator_eval + 1 row_produced).
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: query.select_no_from, expr.arithmetic, types.i32, resource.cost_metering, resource.cost_limit, session.lifetime_cost
+
+# --- a far budget leaves the per-statement max_cost as the binding gate (54P01) ------------------
+
+# The session budget is generous (far above any single statement), so a tight per-statement `max_cost`
+# is reached FIRST: this 11-cost statement aborts 54P01, not 54P02 (a statement aborts at whichever
+# ceiling it reaches first). Its partial cost (the 5 the max_cost admitted) still counts toward the
+# session budget — the cumulative is now 5.
+# lifetime_max_cost: 1000000
+# max_cost: 5
+statement error 54P01
+SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+
+# --- the session budget as the binding gate (54P02), cumulative across statements ----------------
+
+# Tighten the session budget to 30. The cumulative so far is 5 (the 54P01 partial above), so there is
+# room. With NO per-statement `max_cost` now, only the session budget can fire — every abort below is
+# unambiguously 54P02.
+# lifetime_max_cost: 30
+
+# cumulative 5 → 15: under budget, runs fine.
+# cost: 10
+query I
+SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+----
+10
+
+# cumulative 15 → 25: still under budget.
+# cost: 10
+query I
+SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+----
+10
+
+# cumulative 25 → would reach 35, but crosses the budget (30) MID-FLIGHT: the instant the running
+# total reaches 30 the statement aborts 54P02 (CLAUDE.md §13 "the instant accrued cost reaches it").
+statement error 54P02
+SELECT 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1
+
+# The aborted statement's partial cost counted, so the session budget is now spent: every further
+# statement is rejected 54P02 at ADMISSION, before it can accrue — even a trivial `SELECT 1`.
+statement error 54P02
+SELECT 1
+
+# ...and the rejection is permanent for the session — a second trivial statement is 54P02 too.
+statement error 54P02
+SELECT 1
