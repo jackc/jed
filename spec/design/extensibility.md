@@ -30,6 +30,19 @@
 > "Host-defined functions must contribute to the cost system"). When a section is ratified, make
 > the downstream edits in §11 in the same change.
 
+> **Governing principle — the host-extension boundary ([CLAUDE.md](../../CLAUDE.md) §13).** Read
+> this whole doc through one lens: jed's fundamental guarantees (cross-core byte-identity,
+> self-describing files, single-file storage, transaction boundaries, untrusted-query safety) bind
+> **jed's own engine and built-in surface**, not host extensions. A host may relax any of them for
+> its own extension as it judges appropriate and **owns the consequences** — the whole point is to
+> *enable* PostGIS-class extensibility, not to police it. So wherever this doc reads as jed
+> *enforcing* a guarantee on a host — the cost gate (§7), the `XX002` reopen failure (§4.3/§6),
+> taint containment (§8), the conformance harness (§9) — read it as a **safe default plus an
+> opt-in tool that protects jed's *core* guarantees and that the host may relax**, never a mandate
+> jed imposes on what the host builds. jed's job is the stable foundation and a clean seam; the
+> freedom above it is the host's. §2 (the line that *moves*, not vanishes) is this principle in
+> full.
+
 ---
 
 ## 1. The frame — jed already has the pg_type vtable, inlined as match-arms
@@ -83,9 +96,12 @@ honesty mechanism, and there is no reference implementation to defer to. The fou
 So the system/extension line does not disappear; it relocates from the type machinery to the
 **ownership of the determinism contract**:
 
-> Built-in: jed owns G2/G3. Host composite: G2/G3 hold by construction. Host scalar: the host
-> owns G2/G3, and jed provides the harness (§9) to discharge it plus the containment (§8) to
-> bound the damage if it is not discharged.
+> Built-in: jed owns G2/G3. Host composite: G2/G3 hold by construction. Host scalar: **the host
+> owns G2/G3** — jed offers the harness (§9) as an *opt-in tool* to prove it cross-core, and
+> containment (§8) as a *safe default* that keeps an undischarged relaxation from silently reaching
+> jed's *own* guarantees. Neither is a mandate on the host: a single-core host need not run the
+> harness, and a host may relax containment for its own surface and own the result (CLAUDE.md §13,
+> the host-extension boundary).
 
 **The mitigation that makes this livable: G2 only bites a host that ships its custom type on
 more than one core.** The overwhelmingly common embedder uses *one* language; for them the
@@ -184,7 +200,7 @@ carry beyond the catalog shape:
     *still* be non-cross-core (e.g. it calls the platform libm). Only a function declared *and
     harness-verified* cross-core-deterministic produces untainted results (§8).
 
-### 4.3 Host-defined core (scalar) types — reasonable, but gate it and tier it
+### 4.3 Host-defined core (scalar) types — reasonable; tier it, the host picks the tier
 
 The hard case: the host supplies text/bin/compare/key directly; jed derives nothing. Make host
 scalar types follow the **exact staging jed used for its own types**. Recall jed shipped each
@@ -327,7 +343,7 @@ and bump `format_version` when it lands.
 
 ---
 
-## 7. Cost — host code must be metered or it is not the untrusted surface
+## 7. Cost — metered, or it stays off jed's untrusted surface (the host can still run it unlimited)
 
 A host function (and a host type's `compare` / codec) is **opaque to the meter** by default — its
 code does not route through `Meter::charge` — which breaks two contracts at once: the
@@ -366,14 +382,19 @@ Host code is the ultimate nondeterminism risk, so it slots directly into the def
 2. **The host owns the ledger entry.** Built-in exceptions live in jed's
    [../conformance/determinism_exceptions.toml](../conformance/determinism_exceptions.toml); a host
    extension is a **host-owned** entry in the host's own extension ledger, stating the same fields
-   (surface, class, drops, blast_radius, test). jed's role is to *enforce containment*, not to
-   author the host's entry.
-3. **Containment is jed's job (the §4 invariant).** A tainted host value must not silently promote
-   into the deterministic surface: jed propagates the weakest-guarantee taint through expressions
-   and **refuses** (or marks as host-tainted) a tainted value reaching a `PRIMARY KEY`/index, an
+   (surface, class, drops, blast_radius, test). jed offers the containment *tooling*; it does not
+   author the host's entry or decide the host's risk appetite.
+3. **Containment is the safe default, not a mandate (the §4 invariant).** By default a tainted host
+   value does not silently promote into jed's deterministic surface: jed propagates the
+   weakest-guarantee taint through expressions and, by default, **fails closed and legibly** —
+   marking, or declining to silently flow, a tainted value reaching a `PRIMARY KEY`/index, an
    `ORDER BY … LIMIT` boundary, or a narrowing `CAST` that changes the row multiset — exactly the
-   discipline floats already follow ([determinism.md](determinism.md) §4). A query that touches no
-   host extension stays fully G1–G3.
+   discipline floats already follow ([determinism.md](determinism.md) §4). This default protects
+   **jed's own** cross-core guarantee over the rest of the database; it is **not** jed policing the
+   host. A host that wants the relaxation — e.g. its non-cross-core type *as* a `PRIMARY KEY`,
+   accepting that files using it are no longer cross-core-portable — may opt out for its own surface
+   and own that consequence (CLAUDE.md §13). A query that touches no host extension stays fully
+   G1–G3 regardless.
 4. **Single-core hosts are unaffected by G2.** Taint is about *cross-core* identity. On a single
    core, a host extension that is merely G1 (reproducible on that binary) is fine for everything
    except multi-core distribution — which that host does not do.
@@ -397,9 +418,9 @@ authors the cases instead of the spec.
   it ledgered an exception. A single-core host runs it on one core; a multi-core host runs it on
   all and *that* run is what discharges the G2/G3 obligation of §2.
 
-So the conformance story is: jed provides the harness, the byte-fixture format, and the
-containment enforcement; the host provides the cases and (for multi-core) runs them everywhere.
-This is §7/§8 with the authorship inverted, not a parallel system.
+So the conformance story is: jed provides the harness, the byte-fixture format, and containment as
+a safe default (§8); the host provides the cases and (for multi-core) runs them everywhere, and may
+relax what it owns. This is §7/§8 with the authorship inverted, not a parallel system.
 
 ---
 

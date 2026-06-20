@@ -349,7 +349,9 @@ These are the classic sources of silent divergence. Make explicit, documented
 decisions; they are miserable to retrofit. **Default tie-breaker: match PostgreSQL** (§1) —
 where one option matches PG behavior and nothing overriding argues against it, that is the
 decision (e.g. NULL sorts last / NULL is the largest value, `spec/design/encoding.md`). The
-biases below are where an overriding reason *does* steer away from PG.
+biases below are where an overriding reason *does* steer away from PG. These decisions bind
+jed's *own* cores; a **host extension** may ship a type or function that is not
+cross-core-identical and owns that consequence (the host-extension boundary, §13).
 
 - **Float formatting** — every language prints `f64` differently. Decision bias: keep
   binary floats **out of the comparison and text-output paths entirely**; lean on exact
@@ -446,7 +448,11 @@ biases below are where an overriding reason *does* steer away from PG.
   row-oriented now, with column-oriented or key-value stores as possible per-table
   alternatives later; or (b) a **low-level direct access API** beneath SQL (e.g.
   `value = getValue("tableName", key)`, direct row read/write). Whether either ships is
-  **undecided** — the requirement is to keep the seam open, not to build them now.
+  **undecided** — the requirement is to keep the seam open, not to build them now. These
+  guarantees — single file, no external/virtual row sources, a self-describing format — bind
+  jed's *own* storage; a **host extension** may relax them (an external or virtual-table-style
+  row source, a format that needs the host's code to reopen) as it judges appropriate, owning
+  the consequence (the host-extension boundary, §13).
 - **Leave the door open for encryption at rest (file-level).** The single-file format and
   the storage seam (storage.md §2) are kept so whole-file (or per-page) **encryption at
   rest** can be added later **without a reshape**. Not built now; the only present requirement
@@ -752,6 +758,30 @@ its consequences. The engine's one mechanical defense is the cost contract — a
 that does not declare its cost is admissible **only** on an unlimited (`max_cost = 0`) handle,
 never the untrusted-query surface (`spec/design/cost.md` §6). Purity and bounded-resources
 above are promises about *jed's* surface, not about arbitrary code a host bolts on.
+
+**Generalized — the host-extension boundary binds jed, not its hosts.** The exclusion above is
+**not special to safety; it is the shape of *every* fundamental guarantee.** jed's guarantees —
+cross-core byte-identity and determinism (§8/§10), **self-describing files** (any core reopens a
+database with no external code), **single-file storage with no external/virtual row sources**
+(§9), **atomic transaction boundaries** (§3), and **untrusted-query safety** (this section) — are
+promises about **jed's own engine and built-in surface.** They are vital and non-negotiable
+*there*, relaxed internally only through the documented ledger (e.g. `float`, §8). They are **not
+imposed on host extensions.** jed's role is to be a **stable, fully-guaranteed foundation** with a
+clean extension seam; a host may register an extension — a function, a type, an access method or
+virtual-table-style row source, an alternate physical layout — that **relaxes any of these
+guarantees as the host judges appropriate**: a type whose codec differs across cores, a database
+that needs the host's code to reopen, a row source backed by a CSV file or the network, a function
+that is nondeterministic or does I/O. That is the host's call and the host **owns the
+consequences** — when discussing host extensibility, **do not reflexively argue a host extension
+down on the core's guarantees.** Two limits keep the foundation stable: (1) jed's *own* surface
+never relaxes — the relaxation is the *host's*, scoped to the host's extension, and the core's
+guarantees over built-in data stay intact **by default**; (2) the boundary stays **legible** — jed
+marks where an extension has stepped outside a guarantee (a file needing host code to reopen fails
+closed and discoverably, `XX002`; a value from a nondeterministic host type is tainted, not silent)
+and offers containment (taint propagation, the cost gate) as **opt-in tools and safe defaults the
+host may relax**, never mandates jed imposes on what the host builds. Stable foundation,
+host-chosen freedom above it, a clear line between them. See
+[extensibility.md](spec/design/extensibility.md) §2.
 
 ### Memory safety — largely free, but a standing requirement
 
