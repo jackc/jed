@@ -135,9 +135,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         cast slice. _(size: S; §5)_
 - [x] **`text` + ONE collation (`C`)** — UTF-8 byte/code-point order, on-disk type code 4, first
       operator overload; the UTF-8-vs-UTF-16 ordering trap handled in TS. → [types.md §11](spec/design/types.md)
-  - [ ] _follow-on:_ text in a PRIMARY KEY/index (`0A000`, key encoding authored/unexercised);
-        `varchar(n)` length limits (`22001`); runtime non-literal text→T casts; string functions
-        (`||`, `length`, `lower`/`upper`, `substring`); multi-collation / ICU / `COLLATE`.
+  - [x] **text in a PRIMARY KEY/index/UNIQUE** — ✅ landed: the `text-terminated-escape` key
+        encoding (encoding.md §2.4) is exercised (the first variable-width non-integer key), with
+        byte fixtures (`spec/encoding/text.toml`) + the `text_pk_table.jed` golden; an oversized
+        text key is `0A000`. → [encoding.md §2.4](spec/design/encoding.md)
+  - [ ] _follow-on:_ `varchar(n)` length limits (`22001`); runtime non-literal text→T casts;
+        string functions (`||`, `length`, `lower`/`upper`, `substring`); multi-collation / ICU /
+        `COLLATE`.
 - [x] **Exact `decimal`** — *the* headline type: hand-rolled sign+coefficient+scale, round-half-away
       (settles the §8 rounding hotspot), PG result scales, first parameterized + first cross-family
       promotion; finite-only (documented PG divergence). → [decimal.md](spec/design/decimal.md)
@@ -172,8 +176,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         input; field qualifiers (`YEAR TO MONTH`) + `interval(p)`; `justify_*`/`EXTRACT`/`age`.
 - [x] **`bytea`** — variable-width bytes, unsigned byte order, `\x`-hex literals (`22P02` on bad
       hex), on-disk type code 7. → [types.md §13](spec/design/types.md)
-  - [ ] _follow-on:_ bytea PK/index (`0A000`); traditional escape input (`\nnn`); bytea⇄other casts;
-        binary functions (`length`, `||`, `substring`, `encode`/`decode`, `get_byte`).
+  - [x] **bytea PK/index/UNIQUE** — ✅ landed: the `bytea-terminated-escape` key encoding
+        (encoding.md §2.6, like text but over raw bytes — the embedded-0x00 escape is routinely
+        hit), with byte fixtures (`spec/encoding/bytea.toml`) + the `bytea_pk_table.jed` golden.
+  - [ ] _follow-on:_ traditional escape input (`\nnn`); bytea⇄other casts; binary functions
+        (`length`, `||`, `substring`, `encode`/`decode`, `get_byte`).
 - [x] **`uuid`** — fixed 16 bytes, PG-flexible input, canonical lowercase output, on-disk type code
       8; the **first non-integer `PRIMARY KEY`** (exercises `uuid-raw16` key encoding).
       → [types.md §14](spec/design/types.md)

@@ -297,6 +297,31 @@ UUID_TABLE = {
          ["ffffffff-ffff-ffff-ffff-ffffffffffff", "ffffffff-ffff-ffff-ffff-ffffffffffff"]]
 }.freeze
 
+# A table with a text PRIMARY KEY (the first VARIABLE-WIDTH non-integer stored key — the
+# text-terminated-escape encoding, encoding.md §2.4). The stored key is the bare terminated body
+# (a PK is NOT NULL, so no presence tag), pinning the cross-core text key bytes incl. the empty
+# string, uppercase-before-lowercase (C collation), and a 2-byte UTF-8 char. Rows are in key
+# (code-point / byte) order: "" < "Zeta"(0x5A) < "apple"(0x61) < "banana"(0x62) < "é"(0xC3). The
+# value column `v` is a nullable i32 (one NULL). The cores build this via
+#   CREATE TABLE t (k text PRIMARY KEY, v i32); INSERT the rows.
+TEXT_PK_TABLE = {
+  name: "t",
+  columns: [col("k", "text", pk: true), col("v", "i32")],
+  rows: [["", 4], ["Zeta", nil], ["apple", 2], ["banana", 3], ["é", 5]]
+}.freeze
+
+# A table with a bytea PRIMARY KEY (the bytea-terminated-escape encoding, encoding.md §2.6) — like
+# text but over raw bytes, so the embedded-0x00 escape (0x00 -> 0x00 0xFF) is exercised on disk.
+# Rows are in unsigned-byte (key) order: "" < \x00 < \x61 < \x6100ff62 < \x6161 < \x62. All values
+# are forced to ASCII-8BIT (.b). The cores build this via
+#   CREATE TABLE t (k bytea PRIMARY KEY, v i32); INSERT the rows.
+BYTEA_PK_TABLE = {
+  name: "t",
+  columns: [col("k", "bytea", pk: true), col("v", "i32")],
+  rows: [["".b, 5], ["\x00".b, 6], ["\x61".b, 1], ["\x61\x00\xFF\x62".b, 4],
+         ["\x61\x61".b, 2], ["\x62".b, 3]]
+}.freeze
+
 # A table exercising the DEFAULT column constraint on disk (format.md): the catalog flags bit2
 # + the column's pre-evaluated default value via the value codec, written AFTER the decimal
 # typmod. Covers an int default, a text default, a DEFAULT NULL (the lone 0x01 tag), a NOT NULL
@@ -764,6 +789,8 @@ FIXTURES = [
   { file: "bool_pk_table.jed",   page_size: 256, tables: [BOOL_PK_TABLE] },
   { file: "decimal_table.jed",   page_size: 256, tables: [DECIMAL_TABLE] },
   { file: "bytea_table.jed",     page_size: 256, tables: [BYTEA_TABLE] },
+  { file: "text_pk_table.jed",   page_size: 256, tables: [TEXT_PK_TABLE] },
+  { file: "bytea_pk_table.jed",  page_size: 256, tables: [BYTEA_PK_TABLE] },
   { file: "uuid_table.jed",      page_size: 256, tables: [UUID_TABLE] },
   { file: "default_table.jed",   page_size: 256, tables: [DEFAULT_TABLE] },
   { file: "default_expr_table.jed", page_size: 256, tables: [DEFAULT_EXPR_TABLE] },
@@ -842,14 +869,30 @@ def decode_int(width, bytes)
   bytes.bytes.reduce(0) { |acc, b| (acc << 8) | b } - (1 << (width * 8 - 1))
 end
 
+# text-terminated-escape / bytea-terminated-escape (encoding.md §2.4/§2.6): escape every 0x00 to
+# 0x00 0xFF, terminate with 0x00 0x01 — variable-width and self-delimiting. `content` is the value's
+# raw bytes (UTF-8 for text, raw for bytea).
+def enc_terminated(content)
+  out = +"".b
+  content.each_byte do |b|
+    out << b
+    out << 0xFF if b.zero?
+  end
+  out << 0x00 << 0x01
+  out
+end
+
 # The BARE order-preserving KEY body for one present (non-NULL) value of `type` — no presence
 # tag (callers add it for nullable index slots; a PK member is NOT NULL). uuid is the 16 raw
-# bytes (uuid-raw16, §2.7), boolean a single bool-byte (0x00 false / 0x01 true, §2.9), every
-# other keyable type the sign-flipped fixed-width int encoding (timestamps reuse the i64 rule).
+# bytes (uuid-raw16, §2.7), boolean a single bool-byte (0x00 false / 0x01 true, §2.9), text/bytea
+# the variable-width …-terminated-escape body (§2.4/§2.6), every other keyable type the
+# sign-flipped fixed-width int encoding (timestamps reuse the i64 rule).
 def key_body(type, v)
   case type
   when "uuid" then uuid_to_bytes(v)
   when "boolean" then (v ? "\x01".b : "\x00".b)
+  when "text" then enc_terminated(v.b)
+  when "bytea" then enc_terminated(v.b)
   else encode_int(WIDTH.fetch(type), v)
   end
 end

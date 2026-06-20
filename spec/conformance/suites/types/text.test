@@ -1,7 +1,8 @@
 # Text scalar type (spec/design/types.md §11): storage, single-quoted literals, equality,
 # ordering, and NULL — all under the one defined collation `C` (byte / code-point order over
-# UTF-8 = PostgreSQL `C`/POSIX). The empty string '' is a distinct, non-NULL value. text is a
-# NON-key column this slice — a text PRIMARY KEY is rejected 0A000 (a documented narrowing).
+# UTF-8 = PostgreSQL `C`/POSIX). The empty string '' is a distinct, non-NULL value. text IS a
+# valid PRIMARY KEY / index / UNIQUE key — its variable-width text-terminated-escape key
+# encoding (encoding.md §2.4) is self-delimiting and order-preserving (exercised below).
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.text, resource.cost_metering
 
@@ -95,9 +96,50 @@ INSERT INTO t VALUES ('seven', 'g')
 statement error 42804
 INSERT INTO t VALUES (7, 123)
 
-# text in a PRIMARY KEY is rejected this slice (documented narrowing): 0A000
-statement error 0A000
-CREATE TABLE bad (k text PRIMARY KEY)
+# --- text as a PRIMARY KEY (encoding.md §2.4: text-terminated-escape) ----------------
+# text IS a valid PRIMARY KEY — its order-preserving key encoding is exercised here.
+statement ok
+CREATE TABLE tk (k text PRIMARY KEY, n i32)
+
+# insert deliberately NOT in key order; '' is the smallest key, then code-point order. The
+# prefix case 'app' < 'apple' and the case ordering 'Banana' (B=0x42) < 'app'/'banana' both
+# matter (uppercase sorts before lowercase under the C collation).
+statement ok
+INSERT INTO tk VALUES ('banana', 1), ('apple', 2), ('app', 3), ('', 4), ('Banana', 5)
+
+# point lookup on the text PK (key-encoded equality) resolves the matching row
+query I nosort
+SELECT n FROM tk WHERE k = 'apple'
+----
+2
+
+# the empty string is a distinct, valid key (a zero-length terminated-escape body)
+query I nosort
+SELECT n FROM tk WHERE k = ''
+----
+4
+
+# a full scan iterates in key (byte) order — '' sorts first (excluded here since a blank
+# result row cannot be authored), then 'Banana' < 'app' < 'apple' < 'banana'
+query TI nosort
+SELECT k, n FROM tk WHERE k <> ''
+----
+Banana
+5
+app
+3
+apple
+2
+banana
+1
+
+# a duplicate text PK is a unique violation (23505)
+statement error 23505
+INSERT INTO tk VALUES ('apple', 9)
+
+# a NULL text PK is rejected NOT NULL (23502)
+statement error 23502
+INSERT INTO tk VALUES (NULL, 9)
 
 # --- ordering, the prefix case, and cost ------------------------------------
 statement ok

@@ -55,8 +55,9 @@ usable as a `PRIMARY KEY`** (its fixed-width key encoding is exercised, lifting 
 the other non-integer types still defer). The temporal types
 (`timestamp`/`timestamptz`/`interval`) and the binary floats (`f32`/`f64`) have since
 landed, each with its own design doc ([timestamp.md](timestamp.md), [interval.md](interval.md),
-[float.md](float.md)); `boolean`, `timestamp`, and `timestamptz` join `uuid` as non-integer
-`PRIMARY KEY` types, while `interval`/`f32`/`f64` stay non-key for now. The remaining scalars (`json`/`jsonb`,
+[float.md](float.md)); `boolean`, `timestamp`, `timestamptz`, `date`, and the variable-width
+`text`/`bytea` (the `…-terminated-escape` key encoding, encoding.md §2.4/§2.6) join `uuid` as
+non-integer `PRIMARY KEY` types, while `decimal`/`interval`/`f32`/`f64` stay non-key for now. The remaining scalars (`json`/`jsonb`,
 and the composite `array` container) are still **deferred**. The float-formatting and NaN/∞
 decisions of CLAUDE.md §8 are now **settled** by the landed floats ([float.md](float.md)): they
 keep their own PG total order and the `R` render tag (ledgered in the determinism exceptions),
@@ -509,10 +510,15 @@ several cores (Rust, Go, TS, …) disagree byte-for-byte, violating cross-core i
 tables as shared spec data (CLAUDE.md §5) — a large, deliberate later feature, exactly as §8
 files it.
 
+**Text in a key / `PRIMARY KEY`** — ✅ **supported.** text **is** a valid `PRIMARY KEY`, ordered
+secondary index, and `UNIQUE` key — the first *variable-width* non-integer key. Its
+order-preserving `text-terminated-escape` key encoding (encoding.md §2.4) is exercised, with
+byte fixtures ([../encoding/text.toml](../encoding/text.toml)) and the `text_pk_table.jed`
+golden. A text value too large to fit a node (its key cannot spill to overflow) is rejected
+`0A000` at insert — the same node-fit limit PostgreSQL's btree keys take.
+
 **Deferred text sub-features** (relaxable narrowings, each its own follow-up):
 
-- **Text in a key / `PRIMARY KEY`** — rejected `0A000` this slice; the order-preserving key
-  rule is authored (encoding.md §2.4) and the executor path + byte fixtures land when lifted.
 - **`varchar(n)` length limits** — `varchar`/`character varying`/`string` are accepted as
   aliases for **unbounded** `text`; a length parameter `varchar(n)` is not supported yet
   (rejected `0A000`). When added, an over-length value traps `22001` (string_data_right_truncation).
@@ -605,11 +611,14 @@ bytes (no UTF-8 validation, the one difference from text's branch) — because a
 needs to sort. The empty value is the tag plus a zero length. A value longer than `0xFFFF` bytes,
 like an oversized text value, trips the whole-image oversized-item `0A000` narrowing.
 
+**bytea in a key / `PRIMARY KEY`** — ✅ **supported**, exactly like text (§11): a valid
+`PRIMARY KEY` / ordered index / `UNIQUE` key via the order-preserving `bytea-terminated-escape`
+encoding (encoding.md §2.6), with byte fixtures ([../encoding/bytea.toml](../encoding/bytea.toml))
+and the `bytea_pk_table.jed` golden; the embedded-`0x00` escape is routinely exercised. An
+over-`RECORD_MAX` bytea key is rejected `0A000` (the same node-fit limit as text).
+
 **Deferred bytea sub-features** (relaxable narrowings, each its own follow-up):
 
-- **bytea in a key / `PRIMARY KEY`** — rejected `0A000` this slice, exactly matching the text-PK
-  narrowing (§11). The order-preserving key rule (`bytea-terminated-escape`) is authored
-  (encoding.md §2.6) and the executor path + byte fixtures land when lifted.
 - **The traditional escape input format** (`\047`, `\\`, literal printable bytes) — not accepted;
   the hex form `\x…` is the only input this slice. A deliberate, documented divergence from PG
   (which also accepts the escape format on input), justified by determinism and a smaller surface;

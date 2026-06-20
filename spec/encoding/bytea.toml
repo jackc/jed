@@ -1,0 +1,45 @@
+# Order-preserving key-encoding vectors for `bytea` — method `bytea-terminated-escape`
+# (../design/encoding.md §2.6). The value's RAW bytes (unsigned memcmp = the type's logical order),
+# with every 0x00 escaped to 0x00 0xFF and the whole value terminated by 0x00 0x01. Structurally
+# identical to text (§2.4); only step 1 differs (raw bytes, no UTF-8 / collation). The escape
+# matters more here — raw 0x00 bytes are common — so the embedded-0x00 case is routine. A bytea
+# PRIMARY KEY stores the BARE body (NOT NULL, no presence tag); an index slot adds the §2.2 tag.
+# Verified by verify.rb (encode + byte-exactness + strict order; keys are never decoded).
+#
+# Each `hex` is the value's raw bytes as a hex string. Groups are in ascending logical (= byte)
+# order so the order invariant is a walk of the list.
+
+schema_version = 1
+
+# --- bare bytea key body (the PRIMARY KEY form) ------------------------------
+[[bare]]
+type = "bytea"
+cases = [
+  { hex = "",          bytes = "0001" },           # empty: just the terminator
+  { hex = "00",        bytes = "00ff0001" },        # a lone NUL: escaped 00 -> 00 FF
+  { hex = "61",        bytes = "610001" },
+  { hex = "6100ff62",  bytes = "6100ffff620001" },  # embedded NUL escaped; sorts before "6161"
+  { hex = "6161",      bytes = "61610001" },         # prefix case: "61" < "6161"
+  { hex = "62",        bytes = "620001" },
+  { hex = "ff",        bytes = "ff0001" },           # the largest first byte
+]
+
+# --- nullable bytea slot (the secondary-index / composite-member form) -------
+[[nullable]]
+type = "bytea"
+cases = [
+  { hex = "",     bytes = "000001" },
+  { hex = "61",   bytes = "00610001" },
+  { null = true,  bytes = "01" },        # NULL sorts last
+]
+
+# --- descending bytea slot ---------------------------------------------------
+# Bitwise inversion of the nullable encoding; NULL lifts to first. Ascending byte order.
+[[descending]]
+type = "bytea"
+base = "nullable"
+cases = [
+  { null = true,  bytes = "fe" },        # NULL sorts first under descending
+  { hex = "61",   bytes = "ff9efffe" },
+  { hex = "",     bytes = "fffffe" },
+]

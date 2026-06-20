@@ -108,8 +108,8 @@ reason = "jed: assigning any primary-key member is the documented 0A000 narrowin
 
 [[override]]
 file = "ddl/composite_pk.test"
-sql = "CREATE TABLE e6 (a i32, s text, PRIMARY KEY (a, s))"
-reason = "jed: a text primary-key member is the same documented 0A000 narrowing as a single-column text PRIMARY KEY (types.md §11 — the text key encoding is authored but unexercised). PG allows text key columns."
+sql = "SELECT a, s FROM e6"
+reason = "jed: a full scan iterates in composite-PRIMARY-KEY order — a ascending, then the text member s in C/byte (code-point) order within each a (encoding.md §2.3/§2.4), so (1,'a'),(1,'aa'),(1,'b'),(2,'a'). With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical."
 
 [[override]]
 file = "ddl/check.test"
@@ -120,11 +120,6 @@ reason = "jed: the constraint keywords (check, constraint) are NOT reserved — 
 file = "ddl/check.test"
 sql = "INSERT INTO odd VALUES (1, 2)"
 reason = "jed: follows from the override above — the table `odd` (columns named check/constraint) exists in jed but its CREATE fails in PostgreSQL, so this INSERT cannot run on the oracle."
-
-[[override]]
-file = "ddl/create_index.test"
-sql = "CREATE INDEX i ON t (s)"
-reason = "jed: a text index key column is rejected this slice (0A000), the same documented narrowing as a text PRIMARY KEY (indexes.md §1). PG allows a text index."
 
 [[override]]
 file = "ddl/create_index.test"
@@ -160,11 +155,6 @@ reason = "jed: an index explicitly named `on` (the grammar.md §30 lookahead). P
 file = "ddl/create_index.test"
 sql = "DROP INDEX on"
 reason = "jed: dropping the index named `on`. PG reserves ON (42601)."
-
-[[override]]
-file = "ddl/unique.test"
-sql = "CREATE TABLE e6 (a i32, s text UNIQUE)"
-reason = "jed: a text UNIQUE member is rejected this slice (0A000), the same documented narrowing as a text PRIMARY KEY / index key column (constraints.md §5.1, indexes.md §1). PG allows text unique columns."
 
 [[override]]
 file = "ddl/unique.test"
@@ -600,8 +590,8 @@ reason = "jed: malformed bytea hex input (non-hex digit) is 22P02. PostgreSQL re
 
 [[override]]
 file = "types/bytea.test"
-sql = "CREATE TABLE bad (k bytea PRIMARY KEY)"
-reason = "jed: a bytea primary key is deferred this slice (0A000), like the text/decimal PK precedent. PostgreSQL allows a bytea primary key. A documented narrowing."
+sql = "SELECT k, n FROM bk"
+reason = "jed: a full scan iterates the bytea PRIMARY KEY in unsigned-byte (key) order — '' < '\\x61' < '\\x6100ff62' < '\\x6161' < '\\x62' (encoding.md §2.6, bytea-terminated-escape). bytea's byte order matches PostgreSQL's, but with no ORDER BY the row order is unspecified (CLAUDE.md §8) and PostgreSQL returns heap/insertion order, which differs. jed's committed PK-order rows are kept; the multiset is identical."
 
 # --- uuid: cross-type compare, string-into-int (strict typing).
 [[override]]
@@ -830,6 +820,11 @@ reason = "jed: text orders by the single defined `C` collation — UTF-8 byte / 
 file = "types/text.test"
 sql = "SELECT id FROM w ORDER BY s"
 reason = "jed: `C`/byte collation orders 'Z'(0x5A) < 'a' < 'aa' < 'ab' < 'b' < '😀' (an astral char sorts after all BMP chars by UTF-8 bytes). The oracle's en_US.utf8 locale collation orders these differently. A documented collation divergence (types.md §11, CLAUDE.md §8)."
+
+[[override]]
+file = "types/text.test"
+sql = "SELECT k, n FROM tk WHERE k <> ''"
+reason = "jed: a full scan iterates the text PRIMARY KEY in C/byte (code-point) order — 'Banana'(0x42) < 'app' < 'apple' < 'banana' (encoding.md §2.4, text-terminated-escape) — here filtered to drop the '' key. With no ORDER BY the row order is unspecified (CLAUDE.md §8); PostgreSQL returns heap/insertion order under its en_US.utf8 collation, which differs. jed's committed PK-order rows are kept; the multiset is identical."
 
 [[override]]
 file = "types/text.test"

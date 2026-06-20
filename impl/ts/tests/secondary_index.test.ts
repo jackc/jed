@@ -86,10 +86,12 @@ test("DDL errors match PostgreSQL", () => {
   // indexes.md §2); the relation namespace is shared with tables; DROP mismatches are
   // 42704/42809.
   const db = new Database();
-  run(db, "CREATE TABLE t (a i32 PRIMARY KEY, s text)");
+  run(db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)");
   assert.equal(errCode(() => run(db, "CREATE INDEX i ON nosuch (nope)")), "42P01");
   run(db, "CREATE INDEX taken ON t (a)");
   assert.equal(errCode(() => run(db, "CREATE INDEX taken ON t (nope)")), "42703");
+  // f64 is not key-encodable (the determinism carve-out, determinism.md §4); text/bytea ARE
+  // now valid index columns (encoding.md §2.4/§2.6, covered in ddl/create_index.test).
   assert.equal(errCode(() => run(db, "CREATE INDEX i ON t (s)")), "0A000");
   assert.equal(errCode(() => run(db, "CREATE INDEX taken ON t (a)")), "42P07");
   assert.equal(errCode(() => run(db, "CREATE INDEX t ON t (a)")), "42P07");

@@ -80,7 +80,7 @@ import {
   workMod,
   workMul,
 } from "./decimal.ts";
-import { encodeBool, encodeInt } from "./encoding.ts";
+import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
 import { EngineError, engineError } from "./errors.ts";
 import type { SharedPaging } from "./paging.ts";
 import { parseExpression, parseSQL } from "./parser.ts";
@@ -121,7 +121,9 @@ import {
   scalarTypeFromName,
   typeCanonicalName,
   typeIsBoolean,
+  typeIsBytea,
   typeIsInteger,
+  typeIsText,
   typeIsTimestamp,
   typeIsTimestamptz,
   typeIsDate,
@@ -1462,15 +1464,17 @@ export class Database {
       if (def.primaryKey) {
         // Integers, boolean, and uuid may be a key. uuid is the first non-integer key type (fixed
         // uuid-raw16, spec/design/encoding.md §2.7) and boolean the second (fixed 1-byte bool-byte,
-        // §2.9) — both exercised + byte-pinned. The remaining non-integer types' order-preserving
-        // key encodings (text §2.4, decimal §2.5, bytea §2.6, interval, float §2.8, composite §2.10)
-        // are authored but unexercised, so a text/decimal/bytea/interval/float/composite PRIMARY KEY
-        // is a documented 0A000 narrowing (types.md §11/§12/§13, composite.md §6), relaxable in a
-        // later in-key slice. timestamp / timestamptz are also allowed — they share the i64
-        // int-be-signflip key encoding (exercised + byte-pinned, spec/design/timestamp.md §6).
+        // §2.9). text/bytea are also allowed — their variable-width …-terminated-escape key encoding
+        // (§2.4/§2.6) is self-delimiting, so they compose in composite keys / index suffixes; an
+        // oversized text/bytea key trips the RECORD_MAX oversized-item 0A000 (PG's btree key limit).
+        // Still rejected 0A000: decimal/interval (later slices) and float (the determinism carve-out,
+        // determinism.md §4), plus the recursive containers composite/array/range. timestamp /
+        // timestamptz / date share the i64/i32 int-be-signflip key encoding (timestamp.md §6).
         if (
           !typeIsInteger(colType) &&
           !typeIsBoolean(colType) &&
+          !typeIsText(colType) &&
+          !typeIsBytea(colType) &&
           !typeIsUuid(colType) &&
           !typeIsTimestamp(colType) &&
           !typeIsTimestamptz(colType) &&
@@ -1671,6 +1675,8 @@ export class Database {
         if (
           !typeIsInteger(ty) &&
           !typeIsBoolean(ty) &&
+          !typeIsText(ty) &&
+          !typeIsBytea(ty) &&
           !typeIsUuid(ty) &&
           !typeIsTimestamp(ty) &&
           !typeIsTimestamptz(ty) &&
@@ -1719,6 +1725,8 @@ export class Database {
         if (
           !typeIsInteger(ty) &&
           !typeIsBoolean(ty) &&
+          !typeIsText(ty) &&
+          !typeIsBytea(ty) &&
           !typeIsUuid(ty) &&
           !typeIsTimestamp(ty) &&
           !typeIsTimestamptz(ty) &&
@@ -2321,6 +2329,8 @@ export class Database {
       } else if (
         !typeIsInteger(ty) &&
         !typeIsBoolean(ty) &&
+        !typeIsText(ty) &&
+        !typeIsBytea(ty) &&
         !typeIsUuid(ty) &&
         !typeIsTimestamp(ty) &&
         !typeIsTimestamptz(ty)
@@ -6695,6 +6705,10 @@ function indexEntryKey(
         Uint8Array.of(0x00),
         encodeInt(typeScalar(columns[ci]!.type), v.days),
       );
+    } else if (v.kind === "text") {
+      parts.push(Uint8Array.of(0x00), encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)));
+    } else if (v.kind === "bytea") {
+      parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
     } else {
       throw new Error(
         "an index column is a key-encodable type (CREATE INDEX gate)",
@@ -6863,10 +6877,14 @@ function encodePkKey(table: Table, pk: number[], row: Row): Uint8Array {
       parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.micros));
     } else if (pkv.kind === "date") {
       parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.days));
+    } else if (pkv.kind === "text") {
+      parts.push(encodeTerminated(SQL_BYTE_ENCODER.encode(pkv.text)));
+    } else if (pkv.kind === "bytea") {
+      parts.push(encodeTerminated(pkv.bytes));
     } else {
       throw engineError(
         "data_corrupted",
-        "a primary key must be an integer, boolean, uuid, or timestamp value",
+        "a primary key must be an integer, boolean, uuid, text, bytea, or timestamp value",
       );
     }
   }
@@ -6991,6 +7009,10 @@ function indexPrefixKey(
         Uint8Array.of(0x00),
         encodeInt(typeScalar(columns[ci]!.type), v.days),
       );
+    } else if (v.kind === "text") {
+      parts.push(Uint8Array.of(0x00), encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)));
+    } else if (v.kind === "bytea") {
+      parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
     } else {
       throw new Error(
         "an index column is a key-encodable type (CREATE INDEX gate)",
@@ -7029,6 +7051,8 @@ function encodeKeyValue(ty: ScalarType, value: Value): Uint8Array {
   if (value.kind === "timestamp" || value.kind === "timestamptz")
     return encodeInt(ty, value.micros);
   if (value.kind === "date") return encodeInt(ty, value.days);
+  if (value.kind === "text") return encodeTerminated(SQL_BYTE_ENCODER.encode(value.text));
+  if (value.kind === "bytea") return encodeTerminated(value.bytes);
   throw new Error(
     "a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)",
   );
@@ -7251,6 +7275,10 @@ function isConstSource(e: RExpr, pkType: ScalarType): boolean {
       return isTimestamptz(pkType);
     case "constDate":
       return isDate(pkType);
+    case "constText":
+      return isText(pkType);
+    case "constBytea":
+      return isBytea(pkType);
     default:
       return false;
   }
@@ -7336,6 +7364,10 @@ function encodeBoundKey(
     case "constTimestamptz":
     case "constDate":
       return { kind: "key", key: encodeInt(pkType, src.value) };
+    case "constText":
+      return { kind: "key", key: encodeTerminated(SQL_BYTE_ENCODER.encode(src.value)) };
+    case "constBytea":
+      return { kind: "key", key: encodeTerminated(src.value) };
     case "param":
       return encodeValueKey(pkType, params[src.index]!);
     case "outerColumn":
@@ -7357,6 +7389,9 @@ function encodeValueKey(pkType: ScalarType, v: Value): BoundKey {
   if (v.kind === "null") return { kind: "null" };
   if (v.kind === "bool") return { kind: "key", key: encodeBool(v.value) };
   if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
+  if (v.kind === "text")
+    return { kind: "key", key: encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)) };
+  if (v.kind === "bytea") return { kind: "key", key: encodeTerminated(v.bytes) };
   if (v.kind === "int")
     return inRange(pkType, v.int)
       ? { kind: "key", key: encodeInt(pkType, v.int) }

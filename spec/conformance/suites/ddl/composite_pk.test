@@ -135,6 +135,24 @@ SELECT a, b FROM e5 ORDER BY b
 1
 20
 
-# narrowing: every member must be of a key-encodable type (text is not yet — types.md §11)
-statement error 0A000
+# a text member is now key-encodable (the text-terminated-escape encoding, encoding.md §2.4 —
+# self-delimiting, so it composes with the fixed-width members); types still without a key
+# encoding (decimal/interval/float/composite/array/range) remain the 0A000 narrowing
+statement ok
 CREATE TABLE e6 (a i32, s text, PRIMARY KEY (a, s))
+
+statement ok
+INSERT INTO e6 VALUES (1, 'b'), (1, 'aa'), (1, 'a'), (2, 'a')
+
+# the composite key orders by a, then by the text member s in code-point order (a < aa < b)
+query IT nosort
+SELECT a, s FROM e6
+----
+1
+a
+1
+aa
+1
+b
+2
+a

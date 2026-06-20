@@ -73,6 +73,23 @@ export function encodeBool(value: boolean): Uint8Array {
   return new Uint8Array([value ? 0x01 : 0x00]);
 }
 
+// encodeTerminated encodes a non-null text/bytea value to its order-preserving key body (method
+// text-terminated-escape / bytea-terminated-escape, spec/design/encoding.md §2.4/§2.6). content is
+// the value's raw bytes — UTF-8 for text (the C collation, so byte order equals code-point order),
+// raw bytes for bytea. Variable-width, so it must be self-delimiting: escape every 0x00 to
+// 0x00 0xFF and terminate with 0x00 0x01. The terminator is the only place a 0x00 is followed by a
+// byte < 0xFF, so it sorts below any real continuation — a value sorts before any value that extends
+// it. A PK is NOT NULL, so the stored key is this bare body with no presence tag.
+export function encodeTerminated(content: Uint8Array): Uint8Array {
+  const out: number[] = [];
+  for (const b of content) {
+    out.push(b);
+    if (b === 0x00) out.push(0xff);
+  }
+  out.push(0x00, 0x01);
+  return Uint8Array.from(out);
+}
+
 // encodeNullable encodes a nullable key slot: a 1-byte presence tag (0x00 present, 0x01
 // NULL), with the value bytes following the tag when present. Because 0x00 < 0x01,
 // present values sort before NULL, so NULLs sort LAST in ascending order; descending

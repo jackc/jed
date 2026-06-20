@@ -1564,7 +1564,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+colType.CanonicalName()+" primary key is not supported yet")
 			}
-			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
+			if ty := colType.Scalar; !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -1738,7 +1738,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" primary key is not supported yet")
 			}
@@ -1782,7 +1782,7 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		}
 		for _, i := range indices {
 			ty := columns[i].Type
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" unique constraint member is not supported yet")
 			}
@@ -2544,7 +2544,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		ty := columns[idx].Type
 		switch kind {
 		case IndexBtree:
-			if !ty.IsInteger() && !ty.IsBool() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
+			if !ty.IsInteger() && !ty.IsBool() && !ty.IsText() && !ty.IsBytea() && !ty.IsUuid() && !ty.IsTimestamp() && !ty.IsTimestamptz() && !ty.IsDate() {
 				return Outcome{}, NewError(FeatureNotSupported,
 					"a "+ty.CanonicalName()+" index column is not supported yet")
 			}
@@ -2900,6 +2900,9 @@ func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) [
 		case ValTimestamp, ValTimestamptz, ValDate:
 			out = append(out, 0x00)
 			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
+		case ValText, ValBytea:
+			out = append(out, 0x00)
+			out = append(out, EncodeTerminated([]byte(v.Str))...)
 		default:
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
@@ -3007,6 +3010,9 @@ func indexPrefixKey(columns []Column, def IndexDef, row Row) ([]byte, bool) {
 		case ValTimestamp, ValTimestamptz, ValDate:
 			out = append(out, 0x00)
 			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
+		case ValText, ValBytea:
+			out = append(out, 0x00)
+			out = append(out, EncodeTerminated([]byte(v.Str))...)
 		default:
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
@@ -3033,10 +3039,11 @@ func uniqueProbeBound(prefix []byte) keyBound {
 // additionally validates output arity (42601) and per-column type assignability (42804) up front,
 // before any row is produced — so both fire even over an empty source.
 // encodePkKey is a row's PRIMARY-KEY STORAGE KEY (spec/design/encoding.md §2.3): the
-// concatenation of the members' bare encodings in key order — every keyable type is fixed-width,
-// so the concatenation is self-delimiting and bytes.Compare equals the tuple's logical order.
-// Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe (upsert.md §3); a PK
-// column is NOT NULL, so there is no presence tag.
+// concatenation of the members' bare encodings in key order. Each component is either
+// fixed-width or self-delimiting (text/bytea terminate, §2.4/§2.6), so the concatenation stays
+// self-delimiting and bytes.Compare equals the tuple's logical order. Shared by the INSERT
+// duplicate check and the ON CONFLICT arbiter probe (upsert.md §3); a PK column is NOT NULL, so
+// there is no presence tag.
 func encodePkKey(table *Table, pk []int, row Row) []byte {
 	var key []byte
 	for _, i := range pk {
@@ -3047,6 +3054,9 @@ func encodePkKey(table *Table, pk []int, row Row) []byte {
 		case table.Columns[i].Type.IsBool():
 			// boolean: the bare 1-byte bool-byte (encoding.md §2.9).
 			key = append(key, EncodeBool(row[i].Bool)...)
+		case table.Columns[i].Type.IsText() || table.Columns[i].Type.IsBytea():
+			// text / bytea: the variable-width …-terminated-escape body (encoding.md §2.4/§2.6).
+			key = append(key, EncodeTerminated([]byte(row[i].Str))...)
 		default:
 			// integers / timestamp / timestamptz / date: the fixed-width key codec.
 			key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
@@ -7093,6 +7103,10 @@ func isConstSource(e *rExpr, pkType ScalarType) bool {
 		return pkType.IsTimestamptz()
 	case reConstDate:
 		return pkType.IsDate()
+	case reConstText:
+		return pkType.IsText()
+	case reConstBytea:
+		return pkType.IsBytea()
 	}
 	return false
 }
@@ -7172,6 +7186,10 @@ func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row) 
 		return src.cBytea, false, true
 	case reConstTimestamp, reConstTimestamptz:
 		return EncodeInt(pkType, src.cInt), false, true
+	case reConstText:
+		return EncodeTerminated([]byte(src.cText)), false, true
+	case reConstBytea:
+		return EncodeTerminated(src.cBytea), false, true
 	case reParam:
 		return encodeValueKey(pkType, params[src.index])
 	case reOuterColumn:
@@ -7194,12 +7212,14 @@ func encodeValueKey(pkType ScalarType, v Value) (key []byte, isNull bool, ok boo
 		return EncodeBool(v.Bool), false, true
 	case pkType.IsUuid():
 		return []byte(v.Str), false, true
+	case pkType.IsText() || pkType.IsBytea():
+		return EncodeTerminated([]byte(v.Str)), false, true
 	case pkType.IsInteger():
 		if !pkType.InRange(v.Int) {
 			return nil, false, false
 		}
 		return EncodeInt(pkType, v.Int), false, true
-	default: // timestamp / timestamptz
+	default: // timestamp / timestamptz / date
 		return EncodeInt(pkType, v.Int), false, true
 	}
 }
@@ -16598,6 +16618,8 @@ func encodeKeyValue(ty ScalarType, value Value) []byte {
 		return []byte(value.Str)
 	case ValTimestamp, ValTimestamptz, ValDate:
 		return EncodeInt(ty, value.Int)
+	case ValText, ValBytea:
+		return EncodeTerminated([]byte(value.Str))
 	default:
 		panic("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)")
 	}

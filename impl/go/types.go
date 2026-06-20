@@ -423,6 +423,12 @@ func (t Type) IsDecimal() bool { return t.isScalar() && t.Scalar.IsDecimal() }
 // IsBool reports whether this is the scalar boolean type (false for a composite/array).
 func (t Type) IsBool() bool { return t.isScalar() && t.Scalar.IsBool() }
 
+// IsText reports whether this is the scalar text type (false for a composite/array).
+func (t Type) IsText() bool { return t.isScalar() && t.Scalar.IsText() }
+
+// IsBytea reports whether this is the scalar bytea type (false for a composite/array).
+func (t Type) IsBytea() bool { return t.isScalar() && t.Scalar.IsBytea() }
+
 // IsUuid reports whether this is the scalar uuid type (false for a composite/array).
 func (t Type) IsUuid() bool { return t.isScalar() && t.Scalar.IsUuid() }
 

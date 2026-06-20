@@ -145,8 +145,10 @@ func TestUniqueDDLErrorsMatchPostgres(t *testing.T) {
 	if code, _ := uqErr(t, db, "CREATE TABLE e1 (a i32, UNIQUE (a, a))"); code != "42701" {
 		t.Fatalf("dup member = %s", code)
 	}
-	if code, _ := uqErr(t, db, "CREATE TABLE e6 (a i32, s text UNIQUE)"); code != "0A000" {
-		t.Fatalf("text member = %s", code)
+	// f64 is not key-encodable (the determinism carve-out, determinism.md §4); text/bytea ARE
+	// now valid UNIQUE members (encoding.md §2.4/§2.6, covered in ddl/unique.test).
+	if code, _ := uqErr(t, db, "CREATE TABLE e6 (a i32, s f64 UNIQUE)"); code != "0A000" {
+		t.Fatalf("f64 member = %s", code)
 	}
 	// UNIQUE members resolve BEFORE any CHECK validates (PG: z1/z2), in either order.
 	if code, _ := uqErr(t, db, "CREATE TABLE z1 (a i32, CHECK (nosuch1 > 0), UNIQUE (nosuch2))"); code != "42703" {

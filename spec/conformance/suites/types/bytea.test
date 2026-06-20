@@ -1,8 +1,10 @@
 # Bytea scalar type (spec/design/types.md §12): storage, hex-input literals (\x...), equality,
 # ordering (UNSIGNED byte order = memcmp), and NULL. The empty byte string '\x' is a distinct,
-# non-NULL value. bytea is a NON-key column this slice — a bytea PRIMARY KEY is rejected 0A000.
-# A single-quoted literal adapts to a bytea context (§6); malformed hex traps 22P02. A literal
-# in a NON-bytea context is never decoded (it stays text). Format: ../../../design/conformance.md.
+# non-NULL value. bytea IS a valid PRIMARY KEY / index / UNIQUE key — its variable-width
+# bytea-terminated-escape key encoding (encoding.md §2.6) is self-delimiting and order-preserving
+# (exercised below, incl. the embedded-0x00 escape). A single-quoted literal adapts to a bytea
+# context (§6); malformed hex traps 22P02. A literal in a NON-bytea context is never decoded (it
+# stays text). Format: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.is_null, query.is_distinct_from, query.order_by, types.i32, types.text, types.bytea, resource.cost_metering
 
 statement ok
@@ -117,9 +119,47 @@ SELECT id FROM txt WHERE s = '\xzz'
 ----
 1
 
-# bytea in a PRIMARY KEY is rejected this slice (documented narrowing): 0A000
-statement error 0A000
-CREATE TABLE bad (k bytea PRIMARY KEY)
+# --- bytea as a PRIMARY KEY (encoding.md §2.6: bytea-terminated-escape) ---------------
+# bytea IS a valid PRIMARY KEY — its order-preserving key encoding is exercised here.
+statement ok
+CREATE TABLE bk (k bytea PRIMARY KEY, n i32)
+
+# insert NOT in key order; the empty '\x' is the smallest key, then UNSIGNED byte order. The
+# embedded-0x00 value '\x6100ff62' exercises the 0x00 → 0x00 0xFF escape, and '\x61' < '\x6161'
+# the prefix/length case.
+statement ok
+INSERT INTO bk VALUES ('\x61', 1), ('\x6161', 2), ('\x62', 3), ('\x6100ff62', 4), ('\x', 5)
+
+# point lookup on the bytea PK (key-encoded equality)
+query I nosort
+SELECT n FROM bk WHERE k = '\x6161'
+----
+2
+
+# a full scan iterates in unsigned byte (key) order. '\x6100ff62' sorts between '\x61' and
+# '\x6161': after the shared 0x61, its real 0x00 content byte beats '\x6161''s next 0x61 — the
+# escape keeps that 0x00 from masquerading as the terminator.
+query TI nosort
+SELECT k, n FROM bk
+----
+\x
+5
+\x61
+1
+\x6100ff62
+4
+\x6161
+2
+\x62
+3
+
+# a duplicate bytea PK is a unique violation (23505)
+statement error 23505
+INSERT INTO bk VALUES ('\x61', 9)
+
+# a NULL bytea PK is rejected NOT NULL (23502)
+statement error 23502
+INSERT INTO bk VALUES (NULL, 9)
 
 # --- ordering: UNSIGNED byte order, the prefix/length case, embedded 0x00, and cost --------
 statement ok

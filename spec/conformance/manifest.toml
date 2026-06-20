@@ -318,7 +318,7 @@ description = "i64 / bigint scalar type"
 
 [[capability]]
 id = "types.text"
-description = "text scalar type (variable-width UTF-8, collation C): storage, literals, and comparison/ordering. Non-key column only this slice — a text PRIMARY KEY is rejected 0A000 (spec/design/types.md §11)"
+description = "text scalar type (variable-width UTF-8, collation C): storage, literals, and comparison/ordering. text is ALSO a KEY type — a text PRIMARY KEY / composite-key member / secondary index / UNIQUE uses the variable-width text-terminated-escape key encoding (the first non-fixed-width key; spec/design/encoding.md §2.4), with point lookup, 23505 on a duplicate key, and 23502 on a NULL key; an oversized text key is 0A000 (spec/design/types.md §11)"
 
 [[capability]]
 id = "types.boolean_storable"
@@ -334,7 +334,7 @@ description = "Decimal arithmetic operators + - * / % and unary - with PostgreSQ
 
 [[capability]]
 id = "types.bytea"
-description = "bytea scalar type (variable-width raw bytes): storage, hex-input literals, and unsigned-byte comparison/ordering. Non-key column only this slice — a bytea PRIMARY KEY is rejected 0A000 (spec/design/types.md §13)"
+description = "bytea scalar type (variable-width raw bytes): storage, hex-input literals, and unsigned-byte comparison/ordering. bytea is ALSO a KEY type — a bytea PRIMARY KEY / composite-key member / secondary index / UNIQUE uses the variable-width bytea-terminated-escape key encoding (encoding.md §2.6; the embedded-0x00 escape is routinely exercised), with point lookup, 23505 on a duplicate key, and 23502 on a NULL key; an oversized bytea key is 0A000 (spec/design/types.md §13)"
 
 [[capability]]
 id = "types.uuid"

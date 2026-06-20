@@ -248,7 +248,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "types.i32",
   "types.i64",
   // text scalar type (variable-width UTF-8, collation C): storage, literals, and
-  // comparison/ordering. Non-key column only this slice (text PRIMARY KEY → 0A000).
+  // comparison/ordering. text is ALSO a key type — a text PRIMARY KEY / index / UNIQUE uses the
+  // variable-width text-terminated-escape key encoding (encoding.md §2.4).
   "types.text",
   // Storable boolean column: CREATE/INSERT/SELECT of false/true/NULL, boolean×boolean
   // comparison and ORDER BY. boolean is also keyable — a boolean PRIMARY KEY / index uses the
@@ -261,7 +262,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "types.decimal",
   "expr.decimal_arithmetic",
   // bytea scalar type (variable-width raw bytes): storage, hex-input literals, and
-  // unsigned-byte comparison/ordering. Non-key column only this slice (bytea PK → 0A000).
+  // unsigned-byte comparison/ordering. bytea is ALSO a key type — a bytea PRIMARY KEY / index /
+  // UNIQUE uses the variable-width bytea-terminated-escape key encoding (encoding.md §2.6).
   "types.bytea",
   // uuid scalar type (fixed 16-byte RFC 4122): storage, PG-flexible input literals, and
   // unsigned-byte comparison/ordering. The FIRST non-integer type usable as a PRIMARY KEY.

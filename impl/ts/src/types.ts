@@ -477,6 +477,12 @@ export function typeIsDecimal(t: Type): boolean {
 export function typeIsBoolean(t: Type): boolean {
   return t.kind === "scalar" && isBool(t.scalar);
 }
+export function typeIsText(t: Type): boolean {
+  return t.kind === "scalar" && isText(t.scalar);
+}
+export function typeIsBytea(t: Type): boolean {
+  return t.kind === "scalar" && isBytea(t.scalar);
+}
 export function typeIsUuid(t: Type): boolean {
   return t.kind === "scalar" && isUuid(t.scalar);
 }

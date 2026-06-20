@@ -320,6 +320,37 @@ fn bool_pk_table_db() -> Database {
     db
 }
 
+/// A table with a text PRIMARY KEY (the first golden with a VARIABLE-WIDTH non-integer stored
+/// key) — the `text-terminated-escape` key encoding (encoding.md §2.4). Rows go in via INSERT and
+/// the store sorts them into key (code-point / byte) order: "" < "Zeta"(0x5A) < "apple"(0x61) <
+/// "banana"(0x62) < "é"(0xC3). Must match spec/fileformat/verify.rb's TEXT_PK_TABLE.
+fn text_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (k text PRIMARY KEY, v i32)");
+    run(&mut db, "INSERT INTO t VALUES ('', 4)");
+    run(&mut db, "INSERT INTO t VALUES ('Zeta', NULL)");
+    run(&mut db, "INSERT INTO t VALUES ('apple', 2)");
+    run(&mut db, "INSERT INTO t VALUES ('banana', 3)");
+    run(&mut db, "INSERT INTO t VALUES ('é', 5)");
+    db
+}
+
+/// A table with a bytea PRIMARY KEY (the `bytea-terminated-escape` key encoding, encoding.md §2.6)
+/// — like text but over raw bytes, so the embedded-0x00 escape is exercised. The store sorts into
+/// unsigned-byte (key) order: '' < \x00 < \x61 < \x6100ff62 < \x6161 < \x62. Must match
+/// spec/fileformat/verify.rb's BYTEA_PK_TABLE.
+fn bytea_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (k bytea PRIMARY KEY, v i32)");
+    run(&mut db, r"INSERT INTO t VALUES ('\x', 5)");
+    run(&mut db, r"INSERT INTO t VALUES ('\x00', 6)");
+    run(&mut db, r"INSERT INTO t VALUES ('\x61', 1)");
+    run(&mut db, r"INSERT INTO t VALUES ('\x6100ff62', 4)");
+    run(&mut db, r"INSERT INTO t VALUES ('\x6161', 2)");
+    run(&mut db, r"INSERT INTO t VALUES ('\x62', 3)");
+    db
+}
+
 /// A table with a decimal column — exercises the value codec's decimal branch (flags + u16
 /// scale + u16 ndigits + base-10⁴ groups) and the catalog typmod: an unconstrained `numeric`
 /// column `d` and a constrained `numeric(10,2)` column `m` (values already at scale 2, so a
@@ -748,6 +779,8 @@ fn write_matches_goldens() {
         ("bool_pk_table.jed", bool_pk_table_db),
         ("decimal_table.jed", decimal_table_db),
         ("bytea_table.jed", bytea_table_db),
+        ("text_pk_table.jed", text_pk_table_db),
+        ("bytea_pk_table.jed", bytea_pk_table_db),
         ("uuid_table.jed", uuid_table_db),
         ("default_table.jed", default_table_db),
         ("default_expr_table.jed", default_expr_table_db),
@@ -799,6 +832,8 @@ fn read_goldens_reproduces_rows() {
         ("bool_pk_table.jed", bool_pk_table_db, "t"),
         ("decimal_table.jed", decimal_table_db, "t"),
         ("bytea_table.jed", bytea_table_db, "t"),
+        ("text_pk_table.jed", text_pk_table_db, "t"),
+        ("bytea_pk_table.jed", bytea_pk_table_db, "t"),
         ("uuid_table.jed", uuid_table_db, "t"),
         ("default_table.jed", default_table_db, "t"),
         ("default_expr_table.jed", default_expr_table_db, "t"),

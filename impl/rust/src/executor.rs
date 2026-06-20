@@ -20,7 +20,7 @@ use crate::cost::Meter;
 use crate::costs::COSTS;
 use crate::date::parse_date;
 use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
-use crate::encoding::{encode_bool, encode_int};
+use crate::encoding::{encode_bool, encode_int, encode_terminated};
 use crate::error::{EngineError, Result, SqlState};
 use crate::interval::{self, Interval, parse_interval};
 use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc};
@@ -1502,18 +1502,19 @@ impl Database {
                 ));
             };
             if def.primary_key {
-                // Integers, boolean, and uuid may be a key. uuid is the first non-integer key
-                // type (fixed `uuid-raw16`, spec/design/encoding.md §2.7) and boolean the second
-                // (fixed 1-byte `bool-byte`, §2.9) — both exercised + byte-pinned. The remaining
-                // non-integer types' order-preserving key encodings (text §2.4, decimal §2.5,
-                // bytea §2.6, interval, float §2.8) are authored but unexercised, so a
-                // text/decimal/bytea/interval/float PRIMARY KEY is a documented 0A000 narrowing
-                // (spec/design/types.md §11/§12/§13), relaxable in a later in-key slice.
-                // timestamp / timestamptz are also allowed — they share the i64 `int-be-signflip`
-                // key encoding (exercised + byte-pinned, spec/design/timestamp.md §6). date is
-                // likewise allowed — the i32 `int-be-signflip` key encoding (spec/design/date.md §5).
+                // The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
+                // boolean (`bool-byte` §2.9), uuid (`uuid-raw16` §2.7), timestamp/timestamptz (i64
+                // `int-be-signflip`, spec/design/timestamp.md §6), date (i32, spec/design/date.md §5)
+                // — plus the variable-width `text`/`bytea` (`…-terminated-escape`, encoding.md
+                // §2.4/§2.6, self-delimiting so they compose in composite keys / index suffixes).
+                // Still rejected `0A000`: decimal/interval (later slices) and `float` (the principled
+                // determinism carve-out — determinism.md §4), plus the recursive containers
+                // composite/array/range. An oversized text/bytea key (one that can't fit a node) trips
+                // the existing RECORD_MAX oversized-item 0A000, mirroring PG's btree key-size limit.
                 if !ty.is_integer()
                     && !ty.is_bool()
+                    && !ty.is_text()
+                    && !ty.is_bytea()
                     && !ty.is_uuid()
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
@@ -1741,6 +1742,8 @@ impl Database {
                 let ty = &columns[i].ty;
                 if !ty.is_integer()
                     && !ty.is_bool()
+                    && !ty.is_text()
+                    && !ty.is_bytea()
                     && !ty.is_uuid()
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
@@ -1789,6 +1792,8 @@ impl Database {
                 let ty = &columns[i].ty;
                 if !ty.is_integer()
                     && !ty.is_bool()
+                    && !ty.is_text()
+                    && !ty.is_bytea()
                     && !ty.is_uuid()
                     && !ty.is_timestamp()
                     && !ty.is_timestamptz()
@@ -2360,6 +2365,8 @@ impl Database {
                 IndexKind::Btree => {
                     if !ty.is_integer()
                         && !ty.is_bool()
+                        && !ty.is_text()
+                        && !ty.is_bytea()
                         && !ty.is_uuid()
                         && !ty.is_timestamp()
                         && !ty.is_timestamptz()
@@ -8733,6 +8740,8 @@ enum BoundSrc {
     Uuid([u8; 16]),
     Timestamp(i64),
     Date(i32),
+    Text(String),
+    Bytea(Vec<u8>),
     Null,
     Param(usize),
     Outer { level: usize, index: usize },
@@ -9032,8 +9041,10 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
 /// A secondary-index entry key (spec/design/indexes.md §3): each indexed column as the
 /// encoding.md §2.2 nullable slot — `0x00` + the type's bare order-preserving key bytes when
 /// present, the lone `0x01` for NULL (always tagged, even for a NOT NULL column) — then the
-/// row's storage key as the suffix. Indexable types are fixed-width and never spill, so the
-/// values are always resident (never `Unfetched`).
+/// row's storage key as the suffix. The indexed value is always resident (never `Unfetched`):
+/// a fixed-width type never spills, and a `text`/`bytea` value large enough to spill would
+/// produce an over-`RECORD_MAX` entry key, rejected `0A000` at the insert that stored it — so
+/// any value that actually reached the index is small enough to stay inline.
 fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row) -> Vec<u8> {
     let mut out = Vec::new();
     for &ci in &def.columns {
@@ -9050,6 +9061,8 @@ fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: 
                         out.extend_from_slice(&encode_int(ty, *m))
                     }
                     Value::Date(d) => out.extend_from_slice(&encode_int(ty, *d as i64)),
+                    Value::Text(s) => out.extend_from_slice(&encode_terminated(s.as_bytes())),
+                    Value::Bytea(b) => out.extend_from_slice(&encode_terminated(b)),
                     _ => {
                         unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
                     }
@@ -9146,16 +9159,12 @@ fn encode_pk_key(pk: &[(usize, ScalarType)], row: &Row) -> Vec<u8> {
             }
             // date: the i32 day codec (date.md §5).
             Value::Date(d) => k.extend_from_slice(&encode_int(pk_ty, *d as i64)),
+            // text / bytea: the variable-width `…-terminated-escape` body (encoding.md §2.4/§2.6).
+            Value::Text(s) => k.extend_from_slice(&encode_terminated(s.as_bytes())),
+            Value::Bytea(b) => k.extend_from_slice(&encode_terminated(b)),
             Value::Null => unreachable!("primary key column is NOT NULL"),
-            Value::Text(_)
-            | Value::Decimal(_)
-            | Value::Bytea(_)
-            | Value::Interval(_)
-            | Value::Float32(_)
-            | Value::Float64(_) => {
-                unreachable!(
-                    "a text/decimal/bytea/interval/float primary key is rejected at CREATE TABLE"
-                )
+            Value::Decimal(_) | Value::Interval(_) | Value::Float32(_) | Value::Float64(_) => {
+                unreachable!("a decimal/interval/float primary key is rejected at CREATE TABLE")
             }
             Value::Composite(_) => {
                 unreachable!("a composite primary key is rejected at CREATE TABLE")
@@ -9190,6 +9199,8 @@ fn index_prefix_key(columns: &[Column], def: &IndexDef, row: &Row) -> Option<Vec
                         out.extend_from_slice(&encode_int(ty, *m))
                     }
                     Value::Date(d) => out.extend_from_slice(&encode_int(ty, *d as i64)),
+                    Value::Text(s) => out.extend_from_slice(&encode_terminated(s.as_bytes())),
+                    Value::Bytea(b) => out.extend_from_slice(&encode_terminated(b)),
                     _ => {
                         unreachable!("an index column is a key-encodable type (CREATE INDEX gate)")
                     }
@@ -9238,6 +9249,8 @@ fn encode_key_value(ty: ScalarType, value: &Value) -> Vec<u8> {
         Value::Uuid(u) => u.to_vec(),
         Value::Timestamp(m) | Value::Timestamptz(m) => encode_int(ty, *m),
         Value::Date(d) => encode_int(ty, *d as i64),
+        Value::Text(s) => encode_terminated(s.as_bytes()),
+        Value::Bytea(b) => encode_terminated(b),
         _ => unreachable!("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)"),
     }
 }
@@ -9377,6 +9390,8 @@ fn const_source(e: &RExpr, pk_type: ScalarType) -> Option<BoundSrc> {
         RExpr::ConstTimestamp(m) if pk_type.is_timestamp() => Some(BoundSrc::Timestamp(*m)),
         RExpr::ConstTimestamptz(m) if pk_type.is_timestamptz() => Some(BoundSrc::Timestamp(*m)),
         RExpr::ConstDate(d) if pk_type.is_date() => Some(BoundSrc::Date(*d)),
+        RExpr::ConstText(s) if pk_type.is_text() => Some(BoundSrc::Text(s.clone())),
+        RExpr::ConstBytea(b) if pk_type.is_bytea() => Some(BoundSrc::Bytea(b.clone())),
         RExpr::OuterColumn { level, index } => Some(BoundSrc::Outer {
             level: *level,
             index: *index,
@@ -9451,6 +9466,8 @@ fn encode_bound_key(
         BoundSrc::Uuid(u) => BoundKey::Key(u.to_vec()),
         BoundSrc::Timestamp(m) => BoundKey::Key(encode_int(pk_ty, *m)),
         BoundSrc::Date(d) => BoundKey::Key(encode_int(pk_ty, *d as i64)),
+        BoundSrc::Text(s) => BoundKey::Key(encode_terminated(s.as_bytes())),
+        BoundSrc::Bytea(b) => BoundKey::Key(encode_terminated(b)),
         BoundSrc::Param(i) => encode_value_key(pk_ty, &params[*i]),
         // A correlated reference: column `index` of the enclosing row `level` hops out — the same
         // indexing the evaluator uses for `RExpr::OuterColumn` (innermost outer row is last).
@@ -9477,6 +9494,8 @@ fn encode_value_key(pk_ty: ScalarType, v: &Value) -> BoundKey {
         }
         Value::Timestamp(m) | Value::Timestamptz(m) => BoundKey::Key(encode_int(pk_ty, *m)),
         Value::Date(d) => BoundKey::Key(encode_int(pk_ty, *d as i64)),
+        Value::Text(s) => BoundKey::Key(encode_terminated(s.as_bytes())),
+        Value::Bytea(b) => BoundKey::Key(encode_terminated(b)),
         _ => BoundKey::OutOfRange,
     }
 }

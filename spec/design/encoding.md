@@ -123,14 +123,18 @@ The escape is what stops a literal `0x00` from masquerading as a terminator (`"a
 longer one, the correct mirror. The **nullable** slot is the §2.2 tag (`0x00` present ‖ the
 encoding above, or `0x01` for NULL).
 
-**Status — authored, not yet exercised.** This slice (`text` as a storable column) keeps text
-out of keys: a text PRIMARY KEY is rejected `0A000` (a documented, relaxable narrowing —
-[types.md §11](types.md)). So no `text` key fixtures or executor key path exist yet; the rule
-is recorded here as a property of the type, exactly as the `decimal`/`bytea`/`float` rules are
-recorded but unexercised (the `bool-byte` rule §2.9 has since *landed* and is exercised). Stored text *values* use a separate, simpler **value codec** (length-prefixed
+**Status — EXERCISED.** `text` **is** a valid `PRIMARY KEY` / ordered secondary index / `UNIQUE`
+key — the first *variable-width* non-integer key (uuid §2.7 and boolean §2.9 were fixed-width).
+A text PK stores the bare `text-terminated-escape` body (a PK is NOT NULL, so no presence tag);
+an index entry / composite-key member wraps it in the §2.2 nullable slot, and because the
+terminator makes it self-delimiting it composes with following components and the index
+storage-key suffix. The `(value → bytes)` vectors are in
+[../encoding/text.toml](../encoding/text.toml) and the on-disk image is pinned by the
+`text_pk_table.jed` golden ([../fileformat/format.md](../fileformat/format.md)). A text value too
+large to fit a node has an over-`RECORD_MAX` key (keys cannot spill to overflow pages), rejected
+`0A000` at the insert that stored it — the deliberate narrowing (PostgreSQL caps btree keys
+similarly). Stored text *values* still use the separate, simpler **value codec** (length-prefixed
 UTF-8, no order-preservation needed — [../fileformat/format.md](../fileformat/format.md)).
-Lifting the narrowing (text in a key / secondary index) adds the `(value → bytes)` fixtures to
-[../encoding/](../encoding/) and the executor path then.
 
 ### 2.5 Decimal — `decimal-order-preserving` (authored; unexercised this slice)
 
@@ -200,11 +204,14 @@ counterexample `\x6161 < \x62` works because content compares before any termina
 (`61 < 62`). **Descending** and the **nullable** slot are the §2.3 / §2.2 rules unchanged
 (whole-component bitwise inversion; the `0x00` present / `0x01` NULL tag).
 
-**Status — authored, not yet exercised.** Exactly like text (§2.4): a bytea `PRIMARY KEY` is
-rejected `0A000` this slice ([types.md §13](types.md)), so no bytea key fixtures or executor
-key path exist yet. Stored bytea *values* use the compact length-prefixed **value codec** (raw
-bytes, no order-preservation needed — [../fileformat/format.md](../fileformat/format.md)).
-Lifting the narrowing adds the `(value → bytes)` fixtures and the executor path then.
+**Status — EXERCISED.** Exactly like text (§2.4): `bytea` **is** a valid `PRIMARY KEY` / ordered
+index / `UNIQUE` key, storing the bare `bytea-terminated-escape` body. The escape matters *more*
+here — raw `0x00` bytes are common in binary data — so the embedded-`0x00` case is routinely hit.
+The `(value → bytes)` vectors are in [../encoding/bytea.toml](../encoding/bytea.toml) and the
+on-disk image is pinned by the `bytea_pk_table.jed` golden. An over-`RECORD_MAX` bytea key is
+rejected `0A000` (the same node-fit narrowing as text). Stored bytea *values* still use the
+compact length-prefixed **value codec** (raw bytes, no order-preservation needed —
+[../fileformat/format.md](../fileformat/format.md)).
 
 ### 2.7 UUID — `uuid-raw16` (the first EXERCISED non-integer key)
 
@@ -308,11 +315,13 @@ The bare integer rule is exercised by every stored key. The on-disk **value code
 ([../fileformat/format.md](../fileformat/format.md)) reuses the §2.2 nullable encoding to
 serialize each row value (the tag marks NULL); for a stored *value* the tag's sort order is
 irrelevant, but reusing one codec keeps key and value bytes consistent and is what lets the
-seam diverge cleanly if a future type ever needs distinct key/value forms. The text type is
-the first such divergence: text *values* are stored with a compact length-prefixed value codec
-(format.md), while the order-preserving text *key* rule (§2.4) is authored but unexercised —
-text is not yet allowed in a key. `bytea` (§2.6) is the same: raw-byte *values* stored via the
-compact value codec, the order-preserving *key* rule authored but unexercised. `uuid` (§2.7) is
+seam diverge cleanly if a future type ever needs distinct key/value forms. `text` is the first
+type where the key and value forms genuinely diverge: text *values* are stored with a compact
+length-prefixed value codec (format.md), while a text *key* uses the order-preserving
+`text-terminated-escape` rule (§2.4) — both now exercised (a text `PRIMARY KEY` / index /
+`UNIQUE`, pinned by `text_pk_table.jed`). `bytea` (§2.6) is the same: raw-byte *values* via the
+compact value codec, order-preserving *keys* via `bytea-terminated-escape`
+(`bytea_pk_table.jed`). `uuid` (§2.7) is
 the **exception and the first non-integer key actually exercised**: a uuid `PRIMARY KEY` stores
 the bare 16 bytes as its key (so the BTree/sorted store iterates uuid PKs in correct logical
 order with no comparator), proving the executor key path generalizes beyond integers. `boolean`
@@ -322,9 +331,9 @@ order with no comparator), proving the executor key path generalizes beyond inte
 concatenates its fixed-width components per §2.3, pinned by the `composite_pk_table.jed`
 golden. Nullable **secondary indexes** have since **landed** ([indexes.md](indexes.md),
 `index_table.jed` golden) — the first place §2.2's presence-tag sort order is load-bearing
-rather than spec-only — as have `timestamp`/`timestamptz` keys (the i64 rule). The remaining
-non-integer scalars (`decimal`, `text`, `bytea`, `float`, `interval`) add their own §2 key paths
-when their in-key narrowings lift.
+rather than spec-only — as have `timestamp`/`timestamptz` keys (the i64 rule) and `text`/`bytea`
+keys (the `…-terminated-escape` rules §2.4/§2.6). The remaining non-integer scalars (`decimal`,
+`float`, `interval`) add their own §2 key paths when their in-key narrowings lift.
 
 ## 4. NULL ordering — NULL is the largest value (the PostgreSQL model)
 

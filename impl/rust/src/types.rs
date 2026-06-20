@@ -456,6 +456,12 @@ impl Type {
     pub fn is_bool(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_bool())
     }
+    pub fn is_text(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_text())
+    }
+    pub fn is_bytea(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_bytea())
+    }
     pub fn is_uuid(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_uuid())
     }

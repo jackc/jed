@@ -60,6 +60,85 @@ def invert(bytes)
   bytes.bytes.map { |b| b ^ 0xFF }.pack("C*")
 end
 
+# text-terminated-escape / bytea-terminated-escape (encoding.md §2.4/§2.6): escape every 0x00 to
+# 0x00 0xFF, terminate with 0x00 0x01. `content` is the value's raw bytes (UTF-8 for text, raw for
+# bytea). Variable-width and self-delimiting; the bare PRIMARY-KEY body (no presence tag).
+def enc_terminated(content)
+  out = +"".b
+  content.each_byte do |b|
+    out << b
+    out << 0xFF if b.zero?
+  end
+  out << 0x00 << 0x01
+  out
+end
+
+# The raw content bytes of a terminated-escape case: a text `value` (UTF-8 string) or a bytea
+# `hex` string. NULL cases carry neither (handled by the slot encoder).
+def terminated_content(c)
+  return c["value"].b if c.key?("value")
+
+  [c["hex"]].pack("H*").b
+end
+
+def enc_terminated_nullable(c)
+  return [0x01].pack("C") if c["null"]
+
+  [0x00].pack("C") + enc_terminated(terminated_content(c))
+end
+
+def terminated_label(c)
+  return "NULL" if c["null"]
+
+  c.key?("value") ? c["value"].inspect : "\\x#{c['hex']}"
+end
+
+# Verify one variable-width terminated-escape fixture file (text.toml / bytea.toml): the same
+# three invariants as the fixed-width path, minus round-trip (a key is never decoded back to a
+# value). Returns the number of vectors checked.
+def check_terminated_file(filename)
+  data = TomlRB.load_file(File.join(__dir__, filename))
+  checked = 0
+
+  (data["bare"] || []).each do |group|
+    rows = []
+    group["cases"].each do |c|
+      want = c["bytes"]
+      got = hex(enc_terminated(terminated_content(c)))
+      fail!("bare #{group['type']} #{terminated_label(c)}: encode=#{got} want=#{want}") unless got == want
+      rows << [terminated_label(c), [want].pack("H*").b]
+      checked += 1
+    end
+    check_order("bare #{group['type']}", rows)
+  end
+
+  (data["nullable"] || []).each do |group|
+    rows = []
+    group["cases"].each do |c|
+      want = c["bytes"]
+      got = hex(enc_terminated_nullable(c))
+      fail!("nullable #{group['type']} #{terminated_label(c)}: encode=#{got} want=#{want}") unless got == want
+      rows << [terminated_label(c), [want].pack("H*").b]
+      checked += 1
+    end
+    check_order("nullable #{group['type']}", rows)
+  end
+
+  (data["descending"] || []).each do |group|
+    rows = []
+    group["cases"].each do |c|
+      want = c["bytes"]
+      got = hex(invert(enc_terminated_nullable(c)))
+      fail!("descending #{group['type']} #{terminated_label(c)}: encode=#{got} want=#{want}") unless got == want
+      rows << [terminated_label(c), [want].pack("H*").b]
+      checked += 1
+    end
+    check_order("descending #{group['type']}", rows)
+  end
+
+  checked
+end
+
 def hex(bytes) = bytes.unpack1("H*")
 
 def fail!(msg)
@@ -127,6 +206,11 @@ def main
     end
     check_order("descending #{t}", rows)
   end
+
+  # Variable-width terminated-escape vectors (text §2.4, bytea §2.6) live in their own files —
+  # their values are not fixed-WIDTH, so they take the dedicated terminated-escape path.
+  checked += check_terminated_file("text.toml")
+  checked += check_terminated_file("bytea.toml")
 
   puts "OK: #{checked} vectors verified (round-trip + byte-exact + order)"
 end

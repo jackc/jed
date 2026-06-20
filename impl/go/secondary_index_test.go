@@ -102,7 +102,7 @@ func TestIndexAutoNamingMatchesPostgres(t *testing.T) {
 // tables; DROP mismatches are 42704/42809.
 func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
 	db := NewDatabase()
-	siRun(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, s text)")
+	siRun(t, db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)")
 	if got := siErr(t, db, "CREATE INDEX i ON nosuch (nope)"); got != "42P01" {
 		t.Fatalf("missing table: %s", got)
 	}
@@ -110,8 +110,10 @@ func TestIndexDDLErrorsMatchPostgres(t *testing.T) {
 	if got := siErr(t, db, "CREATE INDEX taken ON t (nope)"); got != "42703" {
 		t.Fatalf("bad column before name collision: %s", got)
 	}
+	// f64 is not key-encodable (the determinism carve-out, determinism.md §4); text/bytea ARE
+	// now valid index columns (encoding.md §2.4/§2.6, covered in ddl/create_index.test).
 	if got := siErr(t, db, "CREATE INDEX i ON t (s)"); got != "0A000" {
-		t.Fatalf("text index column: %s", got)
+		t.Fatalf("f64 index column: %s", got)
 	}
 	if got := siErr(t, db, "CREATE INDEX taken ON t (a)"); got != "42P07" {
 		t.Fatalf("dup index name: %s", got)

@@ -269,6 +269,36 @@ function boolPkTableDB(): Database {
   return db;
 }
 
+// textPkTableDB is the first golden with a VARIABLE-WIDTH non-integer stored key — the
+// text-terminated-escape encoding (encoding.md §2.4). The store sorts rows into key (code-point /
+// byte) order: "" < "Zeta"(0x5A) < "apple"(0x61) < "banana"(0x62) < "é"(0xC3). Must match
+// spec/fileformat/verify.rb's TEXT_PK_TABLE.
+function textPkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (k text PRIMARY KEY, v i32)");
+  run(db, "INSERT INTO t VALUES ('', 4)");
+  run(db, "INSERT INTO t VALUES ('Zeta', NULL)");
+  run(db, "INSERT INTO t VALUES ('apple', 2)");
+  run(db, "INSERT INTO t VALUES ('banana', 3)");
+  run(db, "INSERT INTO t VALUES ('é', 5)");
+  return db;
+}
+
+// byteaPkTableDB is the bytea-terminated-escape key encoding (encoding.md §2.6) — like text but
+// over raw bytes, so the embedded-0x00 escape is exercised. The store sorts into unsigned-byte
+// (key) order: '' < \x00 < \x61 < \x6100ff62 < \x6161 < \x62. Must match BYTEA_PK_TABLE.
+function byteaPkTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (k bytea PRIMARY KEY, v i32)");
+  run(db, "INSERT INTO t VALUES ('\\x', 5)");
+  run(db, "INSERT INTO t VALUES ('\\x00', 6)");
+  run(db, "INSERT INTO t VALUES ('\\x61', 1)");
+  run(db, "INSERT INTO t VALUES ('\\x6100ff62', 4)");
+  run(db, "INSERT INTO t VALUES ('\\x6161', 2)");
+  run(db, "INSERT INTO t VALUES ('\\x62', 3)");
+  return db;
+}
+
 // decimalTableDB has a decimal column — exercises the value codec's decimal branch (flags +
 // u16 scale + u16 ndigits + base-10^4 groups) and the catalog typmod: an unconstrained numeric
 // column `d` and a constrained numeric(10,2) column `m` (values already at scale 2, a no-op
@@ -591,6 +621,8 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "bool_pk_table.jed", build: boolPkTableDB },
     { name: "decimal_table.jed", build: decimalTableDB },
     { name: "bytea_table.jed", build: byteaTableDB },
+    { name: "text_pk_table.jed", build: textPkTableDB },
+    { name: "bytea_pk_table.jed", build: byteaPkTableDB },
     { name: "uuid_table.jed", build: uuidTableDB },
     { name: "default_table.jed", build: defaultTableDB },
     { name: "default_expr_table.jed", build: defaultExprTableDB },
@@ -642,6 +674,8 @@ test("read goldens reproduces rows", () => {
     { name: "bool_pk_table.jed", build: boolPkTableDB, table: "t" },
     { name: "decimal_table.jed", build: decimalTableDB, table: "t" },
     { name: "bytea_table.jed", build: byteaTableDB, table: "t" },
+    { name: "text_pk_table.jed", build: textPkTableDB, table: "t" },
+    { name: "bytea_pk_table.jed", build: byteaPkTableDB, table: "t" },
     { name: "uuid_table.jed", build: uuidTableDB, table: "t" },
     { name: "default_table.jed", build: defaultTableDB, table: "t" },
     { name: "default_expr_table.jed", build: defaultExprTableDB, table: "t" },

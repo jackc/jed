@@ -98,7 +98,7 @@ fn auto_naming_matches_postgres() {
 #[test]
 fn ddl_errors_match_postgres() {
     let mut db = Database::new();
-    run(&mut db, "CREATE TABLE t (a i32 PRIMARY KEY, s text)");
+    run(&mut db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)");
     // Table existence first (even with a bad column).
     assert_eq!(
         err_code(&mut db, "CREATE INDEX i ON nosuch (nope)"),
@@ -107,7 +107,8 @@ fn ddl_errors_match_postgres() {
     // Column existence next — before the name-collision check (PG's order).
     run(&mut db, "CREATE INDEX taken ON t (a)");
     assert_eq!(err_code(&mut db, "CREATE INDEX taken ON t (nope)"), "42703");
-    // An unindexable column type is the 0A000 narrowing (same as a PK member).
+    // An unindexable column type is the 0A000 narrowing (f64 is not key-encodable — the
+    // determinism carve-out; text/bytea ARE now indexable, encoding.md §2.4/§2.6).
     assert_eq!(err_code(&mut db, "CREATE INDEX i ON t (s)"), "0A000");
     // Name collisions across the shared relation namespace: vs an index, vs a table,
     // and CREATE TABLE vs an index name.

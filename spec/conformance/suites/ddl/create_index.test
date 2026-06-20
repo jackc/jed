@@ -50,8 +50,11 @@ CREATE INDEX i ON t (nope)
 statement error 42703
 CREATE INDEX explicit_b ON t (nope)
 
-# a text key column is the documented 0A000 narrowing (the same as a PRIMARY KEY member)
-statement error 0A000
+# a text key column is now supported — its variable-width text-terminated-escape key encoding
+# (encoding.md §2.4) is self-delimiting, so it composes as a §3 index entry (the same as a text
+# PRIMARY KEY member); types still without a key encoding (decimal/interval/float/composite/
+# array/range) remain the 0A000 narrowing, covered in their type tests
+statement ok
 CREATE INDEX i ON t (s)
 
 # --- the shared relation namespace --------------------------------------------

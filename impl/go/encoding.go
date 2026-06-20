@@ -36,6 +36,25 @@ func EncodeBool(value bool) []byte {
 	return []byte{0x00}
 }
 
+// EncodeTerminated encodes a non-null text/bytea value to its order-preserving key body
+// (method text-terminated-escape / bytea-terminated-escape, spec/design/encoding.md
+// §2.4/§2.6). content is the value's raw bytes — UTF-8 for text (the C collation, so
+// bytes.Compare equals code-point order), raw bytes for bytea. Variable-width, so it must be
+// self-delimiting: escape every 0x00 to 0x00 0xFF and terminate with 0x00 0x01. The terminator
+// is the only place a 0x00 is followed by a byte < 0xFF, so it sorts below any real continuation
+// — a value sorts before any value that extends it. A PK is NOT NULL, so the stored key is this
+// bare body with no presence tag.
+func EncodeTerminated(content []byte) []byte {
+	out := make([]byte, 0, len(content)+2)
+	for _, b := range content {
+		out = append(out, b)
+		if b == 0x00 {
+			out = append(out, 0xFF)
+		}
+	}
+	return append(out, 0x00, 0x01)
+}
+
 // DecodeInt is the inverse of EncodeInt. len(b) must equal the type's width.
 func DecodeInt(t ScalarType, b []byte) int64 {
 	width := t.WidthBytes()

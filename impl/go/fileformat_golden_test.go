@@ -278,6 +278,36 @@ func boolPKTableDB(t *testing.T) *Database {
 	return db
 }
 
+// textPKTableDB is the first golden with a VARIABLE-WIDTH non-integer stored key — the
+// text-terminated-escape encoding (encoding.md §2.4). The store sorts rows into key (code-point /
+// byte) order: "" < "Zeta"(0x5A) < "apple"(0x61) < "banana"(0x62) < "é"(0xC3). Must match
+// spec/fileformat/verify.rb's TEXT_PK_TABLE.
+func textPKTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (k text PRIMARY KEY, v i32)")
+	run(t, db, "INSERT INTO t VALUES ('', 4)")
+	run(t, db, "INSERT INTO t VALUES ('Zeta', NULL)")
+	run(t, db, "INSERT INTO t VALUES ('apple', 2)")
+	run(t, db, "INSERT INTO t VALUES ('banana', 3)")
+	run(t, db, "INSERT INTO t VALUES ('é', 5)")
+	return db
+}
+
+// byteaPKTableDB is the bytea-terminated-escape key encoding (encoding.md §2.6) — like text but
+// over raw bytes, so the embedded-0x00 escape is exercised. The store sorts into unsigned-byte
+// (key) order: ” < \x00 < \x61 < \x6100ff62 < \x6161 < \x62. Must match BYTEA_PK_TABLE.
+func byteaPKTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (k bytea PRIMARY KEY, v i32)")
+	run(t, db, `INSERT INTO t VALUES ('\x', 5)`)
+	run(t, db, `INSERT INTO t VALUES ('\x00', 6)`)
+	run(t, db, `INSERT INTO t VALUES ('\x61', 1)`)
+	run(t, db, `INSERT INTO t VALUES ('\x6100ff62', 4)`)
+	run(t, db, `INSERT INTO t VALUES ('\x6161', 2)`)
+	run(t, db, `INSERT INTO t VALUES ('\x62', 3)`)
+	return db
+}
+
 // decimalTableDB has a decimal column — exercises the value codec's decimal branch (flags +
 // u16 scale + u16 ndigits + base-10^4 groups) and the catalog typmod: an unconstrained numeric
 // column `d` and a constrained numeric(10,2) column `m` (whose values are already at scale 2,
@@ -629,6 +659,8 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"bool_pk_table.jed", boolPKTableDB},
 		{"decimal_table.jed", decimalTableDB},
 		{"bytea_table.jed", byteaTableDB},
+		{"text_pk_table.jed", textPKTableDB},
+		{"bytea_pk_table.jed", byteaPKTableDB},
 		{"uuid_table.jed", uuidTableDB},
 		{"default_table.jed", defaultTableDB},
 		{"default_expr_table.jed", defaultExprTableDB},
@@ -685,6 +717,8 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"bool_pk_table.jed", boolPKTableDB, "t"},
 		{"decimal_table.jed", decimalTableDB, "t"},
 		{"bytea_table.jed", byteaTableDB, "t"},
+		{"text_pk_table.jed", textPKTableDB, "t"},
+		{"bytea_pk_table.jed", byteaPKTableDB, "t"},
 		{"uuid_table.jed", uuidTableDB, "t"},
 		{"default_table.jed", defaultTableDB, "t"},
 		{"default_expr_table.jed", defaultExprTableDB, "t"},

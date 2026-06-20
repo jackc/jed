@@ -133,12 +133,10 @@ fn ddl_errors_match_postgres_and_narrowings() {
         "stored order is the (b, a) tuple order"
     );
     execute(&mut db, "DROP TABLE t").unwrap();
-    // Narrowing: every member must be key-encodable (text is not, types.md §11).
+    // Narrowing: every member must be key-encodable (f64 is not — the determinism carve-out,
+    // determinism.md §4; text/bytea ARE now keyable, encoding.md §2.4/§2.6).
     assert_eq!(
-        err_code(
-            &mut db,
-            "CREATE TABLE t (a i32, s text, PRIMARY KEY (a, s))"
-        ),
+        err_code(&mut db, "CREATE TABLE t (a i32, s f64, PRIMARY KEY (a, s))"),
         "0A000"
     );
     // A single-column table constraint is the column-level form's equivalent.

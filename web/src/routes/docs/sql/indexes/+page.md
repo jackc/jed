@@ -63,8 +63,9 @@ keeps every index up to date on each `INSERT`, `UPDATE`, and `DELETE`.
 `CREATE INDEX [name] ON table (column)` builds an ordered B-tree over the column. It accelerates
 equality lookups — `WHERE column = …` — by seeking instead of scanning the whole table. The
 `PRIMARY KEY` is itself an index, and a `UNIQUE` constraint is backed by a unique index. The
-indexed column must be a key-encodable type (the integer widths, `boolean`, `uuid`, `timestamp`);
-indexing a `text` or `numeric` column is `0A000` until its key encoding lands.
+indexed column must be a key-encodable type (the integer widths, `boolean`, `uuid`, `timestamp`,
+`timestamptz`, `date`, and the variable-width `text`/`bytea`); indexing a `numeric`, `interval`,
+or `float` column is `0A000` until its key encoding lands.
 
 The `city` table below indexes its `region` code (`1` = Asia, `2` = Europe). Run the lookup, then
 edit the `WHERE` to `region = 2` — the index narrows the scan to the matching rows, and the result
