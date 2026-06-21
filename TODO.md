@@ -741,6 +741,24 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [ ] **Relax the UPDATE narrowings** — allow assigning a `PRIMARY KEY` column (currently
       `0A000`; means the storage key can change). Documented as relaxable (§11 step 6).
       _(size: M; deps: transactions for clean re-keying)_
+- [ ] **Temporary tables** — `CREATE [SHARED] [TEMP|TEMPORARY] TABLE` (+ `DROP`): relations that make
+      **zero writes to the database file** (held outside the serialized `Snapshot`, so no
+      `format_version` bump), bounded by a deterministic storage budget so they keep the
+      untrusted-SQL guarantee (§13). Two kinds: **session-local** (private to the session, no writer
+      gate, usable even by a read-only session) and **database-wide shared** (visible across sessions,
+      transactional + single-writer-gated, published at commit with a no-fsync second-root swap).
+      Namespace **precludes overlaps** (`42P07`; a PG divergence — no `pg_temp` shadowing). New code
+      **`54P03 temp_storage_limit_exceeded`** + settings `temp_buffers` (session) / `shared_temp_mem`
+      (global). **`allow_ddl` splits by relation kind** into `allow_ddl` (persistent) /
+      `allow_temp_ddl` / `allow_shared_temp_ddl` (the two new gates default to `allow_ddl`'s value;
+      untrusted-scratch = `allow_ddl off` + `allow_temp_ddl on`). Phased: **(1) session-local,
+      memory-only + `allow_temp_ddl`** → **(2) shared + `allow_shared_temp_ddl`** (needs the
+      concurrency schedule format) → **(3) spill-to-disk** (the resident→paged flip onto a temp
+      `BlockStore`; the seam is already open, CLAUDE.md §9). FK touching a temp table + `ON COMMIT
+      DELETE ROWS`/`DROP` deferred `0A000`. → [temp-tables.md](spec/design/temp-tables.md)
+      _(size: L; deps: session model (done), storage seam (done); spill in slice 3)_
+  - [ ] _follow-on:_ `ON COMMIT DELETE ROWS`/`DROP`; `IF NOT EXISTS`; `CREATE TEMP TABLE … AS SELECT`;
+        FKs among same-kind temp tables; temporary views. → [temp-tables.md §14](spec/design/temp-tables.md)
 
 ---
 

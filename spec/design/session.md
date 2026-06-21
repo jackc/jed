@@ -336,9 +336,17 @@ default-off + per-function `grant`"; a *deny-list* is "default-on + per-function
   pinning determinism (revoke `uuidv4`/`now()`) or disabling set-returning functions.
 
 **DDL** (CREATE / DROP / ALTER of tables, indexes, types, sequences) is **not** a per-table
-privilege — jed has no schema/owner model (§3) — so a single session capability **`allow_ddl`**
-(default **on**) governs it; a denied schema change is `42501`. A finer CREATE/ownership privilege
-is a deferred follow-on (§11).
+privilege — jed has no schema/owner model (§3) — so a session capability **`allow_ddl`**
+(default **on**) governs it; a denied schema change is `42501`. A finer per-object CREATE/ownership
+privilege is a deferred follow-on (§11), with **one split already designed**: temporary-table DDL
+(temp-tables.md §5). Because a temp table is bounded, never-durable scratch space a host *wants* to
+expose to an otherwise-untouching untrusted session, `allow_ddl` splits by the **kind** of relation
+the statement targets into three gates — **`allow_ddl`** (persistent DDL, the existing gate, name and
+default unchanged), **`allow_temp_ddl`** (session-local temp DDL), and **`allow_shared_temp_ddl`**
+(shared temp DDL). The two new gates **default to `allow_ddl`'s value**, so existing callers are
+unaffected and the §5.3 default-deny posture holds; the untrusted-scratch pattern is
+`allow_ddl = off` + explicit `allow_temp_ddl = on`. The gates land with the temp-table slices
+(`allow_temp_ddl` in slice 1, `allow_shared_temp_ddl` in slice 2).
 
 **Enforcement** is at **name resolution**, after a name resolves to a catalog object: a missing
 privilege raises **`42501 insufficient_privilege`** — PostgreSQL's own permission-denied code
