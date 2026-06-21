@@ -334,6 +334,33 @@ fn parse_temp_buffers_directive(rest: &str) -> Option<usize> {
         .ok()
 }
 
+/// Parse a `# allow_shared_temp_ddl: on|off` directive body (spec/design/temp-tables.md §5): whether
+/// DATABASE-WIDE shared temporary-table DDL is permitted for the next record. The shared-temp split
+/// of `allow_ddl`; per-record, reset after.
+fn parse_allow_shared_temp_ddl_directive(rest: &str) -> Option<bool> {
+    let v = rest
+        .trim_start()
+        .strip_prefix("allow_shared_temp_ddl:")?
+        .trim();
+    match v.to_ascii_lowercase().as_str() {
+        "on" | "true" | "yes" => Some(true),
+        "off" | "false" | "no" => Some(false),
+        _ => None,
+    }
+}
+
+/// Parse a `# shared_temp_mem: N` directive body (spec/design/temp-tables.md §7): the GLOBAL
+/// shared-temp storage budget (bytes) to run the next record under (`0` ⇒ unlimited). Mirrors
+/// `# temp_buffers:` — per-record, reset after — so a record can set a small budget and assert that an
+/// over-budget shared-temp write traps `54P03`.
+fn parse_shared_temp_mem_directive(rest: &str) -> Option<usize> {
+    rest.trim_start()
+        .strip_prefix("shared_temp_mem:")?
+        .trim()
+        .parse()
+        .ok()
+}
+
 /// Parse a `# set: name=value, name2=value2` directive body (spec/design/session.md §6.1): the
 /// session variables to set for the next record, returned as `(name, value)` pairs (or None if this
 /// comment is not a `set:` directive). Per-record (reset after), like `# seed:` / `# grant:`. Each
@@ -464,7 +491,9 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut pending_revokes: Vec<(jed::PrivilegeSet, String)> = Vec::new();
     let mut pending_allow_ddl: Option<bool> = None;
     let mut pending_allow_temp_ddl: Option<bool> = None;
+    let mut pending_allow_shared_temp_ddl: Option<bool> = None;
     let mut pending_temp_buffers: Option<usize> = None;
+    let mut pending_shared_temp_mem: Option<usize> = None;
     let mut pending_vars: Vec<(String, String)> = Vec::new();
 
     while let Some(line) = lines.next() {
@@ -501,8 +530,12 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 pending_revokes.push(r);
             } else if let Some(a) = parse_allow_ddl_directive(rest) {
                 pending_allow_ddl = Some(a);
+            } else if let Some(a) = parse_allow_shared_temp_ddl_directive(rest) {
+                pending_allow_shared_temp_ddl = Some(a);
             } else if let Some(a) = parse_allow_temp_ddl_directive(rest) {
                 pending_allow_temp_ddl = Some(a);
+            } else if let Some(n) = parse_shared_temp_mem_directive(rest) {
+                pending_shared_temp_mem = Some(n);
             } else if let Some(n) = parse_temp_buffers_directive(rest) {
                 pending_temp_buffers = Some(n);
             } else if let Some(vars) = parse_set_directive(rest) {
@@ -565,14 +598,18 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
         if let Some(a) = pending_allow_ddl.take() {
             db.set_allow_ddl(a);
         }
-        // `# allow_temp_ddl:` overrides the temp-DDL gate (temp-tables.md §5); `reset_privileges`
-        // above set it back to permissive, so this decorates only its record.
+        // `# allow_temp_ddl:` / `# allow_shared_temp_ddl:` override the temp-DDL gates (temp-tables.md
+        // §5); `reset_privileges` above set both back to permissive, so each decorates only its record.
         if let Some(a) = pending_allow_temp_ddl.take() {
             db.set_allow_temp_ddl(a);
         }
-        // Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (`0`), so a
-        // `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
+        if let Some(a) = pending_allow_shared_temp_ddl.take() {
+            db.set_allow_shared_temp_ddl(a);
+        }
+        // Apply the per-record temp-storage budgets (temp-tables.md §7); absent ⇒ unlimited (`0`), so a
+        // `# temp_buffers:` / `# shared_temp_mem:` directive never leaks past its record. Mirrors `# max_cost:`.
         db.set_temp_buffers(pending_temp_buffers.take().unwrap_or(0));
+        db.set_shared_temp_mem(pending_shared_temp_mem.take().unwrap_or(0));
         // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
         // pending `# set:` pair, so a directive decorates only its record and never leaks forward.
         db.reset_vars();

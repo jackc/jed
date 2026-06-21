@@ -1,0 +1,153 @@
+# Shared temporary tables — DATABASE-WIDE shared temp tables that make ZERO writes to the database
+# file (spec/design/temp-tables.md §4). They live in a Database-level shared-temp snapshot outside
+# the serialized catalog (no format_version change), share ONE set of rows across every session, and
+# — like session-local temps — support full CRUD + PK/UNIQUE/CHECK/NOT NULL/DEFAULT and PRECLUDE
+# namespace overlaps (a documented divergence from PostgreSQL's GLOBAL TEMPORARY / pg_temp shadowing,
+# §3/§4). So this suite is jed-specific: CROSS-CORE-checked, NOT PostgreSQL-oracle-checked. The
+# headline CROSS-SESSION visibility (one session sees another's shared rows) needs two handles, so it
+# lives in suites/concurrency/shared_temp.test; this file pins the single-handle surface (the constructs,
+# the namespace, the positional keyword, DROP, the 0A000 narrowings, and the allow_shared_temp_ddl gate).
+# requires: ddl.shared_temp_table, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.unique, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i32, session.allow_shared_temp_ddl
+
+# --- full CRUD on a shared temp table ---------------------------------------------------------
+
+statement ok
+CREATE SHARED TEMP TABLE s (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO s VALUES (1, 10), (2, 20), (3, 30)
+
+query I rowsort
+SELECT v FROM s
+----
+10
+20
+30
+
+# a point lookup uses the shared temp table's primary key
+query I nosort
+SELECT v FROM s WHERE id = 2
+----
+20
+
+statement ok
+UPDATE s SET v = 99 WHERE id = 1
+
+query I nosort
+SELECT v FROM s WHERE id = 1
+----
+99
+
+statement ok
+DELETE FROM s WHERE id = 3
+
+query I nosort
+SELECT id FROM s ORDER BY id
+----
+1
+2
+
+# SHARED TEMPORARY is the same as SHARED TEMP
+statement ok
+CREATE SHARED TEMPORARY TABLE s2 (id i32 PRIMARY KEY)
+
+# --- PRIMARY KEY + UNIQUE enforced on a shared temp table -------------------------------------
+
+statement ok
+CREATE SHARED TEMP TABLE su (id i32 PRIMARY KEY, e i32 UNIQUE)
+
+statement ok
+INSERT INTO su VALUES (1, 100)
+
+statement error 23505
+INSERT INTO su VALUES (1, 200)
+
+statement error 23505
+INSERT INTO su VALUES (2, 100)
+
+# --- SHARED must be followed by TEMP/TEMPORARY (a SHARED table is always temporary) -----------
+
+statement error 42601
+CREATE SHARED TABLE not_temp (id i32 PRIMARY KEY)
+
+# --- preclude-overlaps across ALL scopes (a PG divergence) ------------------------------------
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY)
+
+# a shared name colliding with an existing persistent relation is 42P07
+statement error 42P07
+CREATE SHARED TEMP TABLE p (id i32 PRIMARY KEY)
+
+# a persistent name colliding with an existing shared temp table is 42P07 (s still exists)
+statement error 42P07
+CREATE TABLE s (id i32 PRIMARY KEY)
+
+# a SESSION-LOCAL temp name colliding with an existing shared temp table is 42P07
+statement error 42P07
+CREATE TEMP TABLE s (id i32 PRIMARY KEY)
+
+# and a shared name colliding with an existing session-local temp table is 42P07
+statement ok
+CREATE TEMP TABLE local_t (id i32 PRIMARY KEY)
+
+statement error 42P07
+CREATE SHARED TEMP TABLE local_t (id i32 PRIMARY KEY)
+
+# --- SHARED is positional: a table NAMED "shared" is an ordinary persistent table -------------
+
+statement ok
+CREATE TABLE shared (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO shared VALUES (5, 50)
+
+query I nosort
+SELECT v FROM shared WHERE id = 5
+----
+50
+
+# --- DROP a shared temp table; afterwards it is gone (42P01) ----------------------------------
+
+statement ok
+DROP TABLE s
+
+statement error 42P01
+SELECT id FROM s
+
+# --- deferred narrowings on a shared temp table are clean 0A000 (temp-tables.md §8) -----------
+
+statement error 0A000
+CREATE SHARED TEMP TABLE bad (id serial PRIMARY KEY)
+
+statement error 0A000
+CREATE SHARED TEMP TABLE bad (id i32 PRIMARY KEY, pid i32 REFERENCES p)
+
+# --- the allow_shared_temp_ddl capability gate (temp-tables.md §5) ----------------------------
+
+# shared temp DDL is denied when allow_shared_temp_ddl is off
+# allow_shared_temp_ddl: off
+statement error 42501
+CREATE SHARED TEMP TABLE denied (id i32 PRIMARY KEY)
+
+# the gates are independent: granting SESSION-LOCAL temp DDL does NOT grant SHARED temp DDL —
+# a shared CREATE is still denied while allow_shared_temp_ddl is off...
+# allow_ddl: off
+# allow_temp_ddl: on
+# allow_shared_temp_ddl: off
+statement error 42501
+CREATE SHARED TEMP TABLE shared_denied (id i32 PRIMARY KEY)
+
+# ...while a session-local CREATE under the same restriction succeeds
+# allow_ddl: off
+# allow_temp_ddl: on
+# allow_shared_temp_ddl: off
+statement ok
+CREATE TEMP TABLE scratch (id i32 PRIMARY KEY)
+
+# and granting SHARED temp DDL alone (persistent + session-local withheld) allows a shared CREATE
+# allow_ddl: off
+# allow_temp_ddl: off
+# allow_shared_temp_ddl: on
+statement ok
+CREATE SHARED TEMP TABLE shared_scratch (id i32 PRIMARY KEY)

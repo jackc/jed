@@ -1,0 +1,78 @@
+# Shared temporary tables — CROSS-SESSION visibility (spec/design/temp-tables.md §4/§5,
+# concurrency-testing.md §4). This is the property that distinguishes a SHARED temp table from a
+# session-local one: its rows are visible to and writable by EVERY session of the open Database — yet
+# still never written to the file. The single-handle sqllogictest corpus cannot express two sessions,
+# so this lives in the concurrency schedule format: named read/write sessions over one SharedDb, an
+# explicit total order. Because shared-temp writes ride the single-writer gate and become visible only
+# at COMMIT (the two-root commit — a reader pins the file AND shared-temp roots together, §5), the
+# results depend only on commit order + pin-points, so the order below fully determines every output
+# and the file is deterministic on every core.
+#
+# What it pins, beyond the single-handle suites/ddl/shared_temp_table.test:
+#   - a session sees a shared temp table + rows another session created and committed;
+#   - a shared write is visible to other sessions only AFTER commit;
+#   - a reader pinned before a shared-temp commit keeps its snapshot (isolation across shared temp too);
+#   - DROP of a shared temp table is published like any other shared-temp commit.
+#
+# A core without the shared handle declares none of txn.shared/read_handle and SKIPS this file before
+# parsing any record (the capability gate, conformance.md §3).
+# format: concurrency
+# requires: txn.shared, txn.read_handle, ddl.shared_temp_table, ddl.create_table, ddl.primary_key, ddl.drop_table, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.i32
+
+# --- w creates a SHARED temp table and seeds it, committing version 1 -------
+open w write
+on w statement ok
+CREATE SHARED TEMP TABLE s (id i32 PRIMARY KEY, v i32)
+on w statement ok
+INSERT INTO s VALUES (1, 10), (2, 20)
+commit w
+expect version 1
+
+# --- a DIFFERENT session sees the shared table + its rows (the headline) ----
+open r read
+on r query I rowsort
+SELECT v FROM s
+----
+10
+20
+
+# r has pinned version 1; a second writer adds a row and commits version 2
+open w2 write
+on w2 statement ok
+INSERT INTO s VALUES (3, 30)
+commit w2
+expect version 2
+
+# the pinned reader r still sees ONLY its snapshot — snapshot isolation applies to shared temp too
+on r query I rowsort
+SELECT v FROM s
+----
+10
+20
+
+# a write through the read handle is rejected (25006) and does not poison it
+on r statement error 25006
+INSERT INTO s VALUES (99, 99)
+
+# a fresh reader sees all three rows (version 2)
+open r2 read
+on r2 query I rowsort
+SELECT v FROM s
+----
+10
+20
+30
+close r
+close r2
+
+# --- DROP of a shared temp table publishes like any commit; a fresh reader can't see it -------
+open w3 write
+on w3 statement ok
+DROP TABLE s
+commit w3
+expect version 3
+
+open r3 read
+on r3 statement error 42P01
+SELECT v FROM s
+close r3

@@ -1,0 +1,80 @@
+# Shared-temp storage budget — `shared_temp_mem` bounds the GLOBAL shared temporary-table bytes
+# (spec/design/temp-tables.md §7), the shared analogue of `temp_buffers` (resource.temp_budget). Shared
+# temp data is global (one set of rows across every session), so its budget is a Database-level
+# setting; an over-budget shared write aborts the same 54P03, measured in byte-identical on-disk record
+# bytes, checked per-statement — so the abort point is part of the CROSS-CORE contract (no reference
+# impl, §2). The `# shared_temp_mem: N` directive runs the next record under a byte budget (like
+# `# temp_buffers:`); 0/absent ⇒ unlimited. jed-specific, so cross-core-checked, not oracle-checked.
+# requires: ddl.shared_temp_table, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.i32, resource.shared_temp_budget
+
+statement ok
+CREATE SHARED TEMP TABLE s (id i32 PRIMARY KEY, v i32)
+
+# A tiny budget (8 bytes): any real row's on-disk record exceeds it, so the insert aborts 54P03.
+# shared_temp_mem: 8
+statement error 54P03
+INSERT INTO s VALUES (1, 1)
+
+# The over-budget insert rolled back — the table is still empty (nothing committed).
+query I rowsort
+SELECT id FROM s
+----
+
+# With no budget in force (unlimited), inserts succeed and persist.
+statement ok
+INSERT INTO s VALUES (1, 1), (2, 2), (3, 3)
+
+query I nosort
+SELECT id FROM s ORDER BY id
+----
+1
+2
+3
+
+# Re-imposing the tiny budget: the shared store is already over it (3 rows), so any further shared
+# write aborts 54P03 — and rolls back, leaving the three rows intact.
+# shared_temp_mem: 8
+statement error 54P03
+INSERT INTO s VALUES (4, 4)
+
+query I nosort
+SELECT id FROM s ORDER BY id
+----
+1
+2
+3
+
+# The shared budget bounds shared temp only — a session-local temp table is not bounded by it
+# (its budget is the separate per-session `temp_buffers`).
+statement ok
+CREATE TEMP TABLE lt (id i32 PRIMARY KEY)
+
+# shared_temp_mem: 8
+statement ok
+INSERT INTO lt VALUES (1), (2), (3), (4), (5)
+
+query I nosort
+SELECT id FROM lt ORDER BY id
+----
+1
+2
+3
+4
+5
+
+# ...and a persistent table is never bounded by it either.
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY)
+
+# shared_temp_mem: 8
+statement ok
+INSERT INTO p VALUES (1), (2), (3), (4), (5)
+
+query I nosort
+SELECT id FROM p ORDER BY id
+----
+1
+2
+3
+4
+5

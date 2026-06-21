@@ -11,9 +11,13 @@
 > this doc is the *why* and the precise behavior the three cores reproduce identically
 > (CLAUDE.md §2, §8). When a decision here changes, change the grammar and this doc in the same edit.
 >
-> **Status: design only.** No core implements this yet. The grammar production, the `54P03` code,
-> and the budget settings land *with* slice 1 (§13) — this doc is written first, spec-first
-> (CLAUDE.md §11).
+> **Status: slices 1–2 landed (all three cores).** Slice 1 (session-local temp tables, memory-only)
+> and slice 2 (database-wide `SHARED` temp tables — the `Database`-level temp snapshot, the two-root
+> commit, `allow_shared_temp_ddl`, `shared_temp_mem`, and cross-session visibility via the concurrency
+> schedule format) are implemented byte-identically in Rust, Go, and TS. The grammar production
+> (`table_scope`, now including `SHARED`), the `54P03` code, and the budget settings landed with their
+> slices. **Slice 3 (spill-to-disk, §6) remains deferred.** This doc was written first, spec-first
+> (CLAUDE.md §11), and tracks the implemented behavior.
 
 Temporary tables are jed's first relations whose lifetime is shorter than the database file's and
 whose data is **deliberately never durable**. They diverge from PostgreSQL in six recorded ways
@@ -330,18 +334,22 @@ The code lands in [../errors/registry.toml](../errors/registry.toml) with slice 
 The doc covers all of it; the **build is phased** (CLAUDE.md §10 vertical slices), session-local-first
 and memory-only per the design decision:
 
-- **Slice 1 — session-local temp tables, memory-only.** `CREATE [TEMP|TEMPORARY] TABLE` + `DROP`, the
+- **Slice 1 — session-local temp tables, memory-only (landed).** `CREATE [TEMP|TEMPORARY] TABLE` + `DROP`, the
   per-`Session` temp store, the namespace preclude-overlaps check (§3), the **`allow_temp_ddl`**
   capability split (§5), `temp_buffers` + `54P03`, constraints/indexes/`serial` (§8), cost (§9),
   dropped at session close. The grammar production (`table_scope` minus `SHARED`), the `54P03`
   registry entry, `allow_temp_ddl`, and `temp_buffers` land here. Driven by a new `ddl.temp_table`
   conformance capability; per-core unit tests for what the corpus can't reach (the §13 budget abort
   point, the no-file-write invariant, the namespace internals, the capability split).
-- **Slice 2 — shared temp tables.** The `SHARED` keyword, the **`allow_shared_temp_ddl`** capability
-  (§5), the `Database`-level temp snapshot, the two-root commit (§5), `shared_temp_mem`, and the
-  cross-session visibility tests — which need the **concurrency schedule format**
+- **Slice 2 — shared temp tables (landed).** The `SHARED` keyword, the **`allow_shared_temp_ddl`**
+  capability (§5), the `Database`-level temp snapshot, the two-root commit (§5), `shared_temp_mem`, and
+  the cross-session visibility tests — which need the **concurrency schedule format**
   (`# format: concurrency`, concurrency-testing.md), since cross-session visibility is exactly what
-  the single-handle sqllogictest corpus can't express.
+  the single-handle sqllogictest corpus can't express. The shared-temp snapshot is held on the shared
+  handle (`SharedDb`/`Shared` in the Rust core, and the per-core equivalent) under **one lock with the
+  file-snapshot root**, so a reader pins both atomically (no torn pin) and a writer publishes both in
+  one swap. On a single (non-shared) handle the shared-temp snapshot is a plain field on the handle,
+  visible to every session minted from it. Same constructs and 0A000 narrowings as slice 1.
 - **Slice 3 — spill-to-disk.** The temp `BlockStore` + the resident→paged flip (§6), the memory→disk
   budget split, the disk ceiling. Out-of-contract spill file (§10).
 

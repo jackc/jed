@@ -11,10 +11,12 @@
 //! Shape (the faithful §8 design):
 //! - [`SharedDb`] is a cheap clonable handle (`Arc<Shared>`); clones share one [`Shared`] core.
 //!   It is `Send + Sync`, so every thread holds its own clone.
-//! - [`Shared`] holds the published `committed` snapshot (an `Arc<Snapshot>` behind an `RwLock`),
-//!   the single-writer gate (a `Mutex<bool>` + `Condvar`, so a second writer **blocks**, bbolt
-//!   semantics), and the **live-reader registry** — the multiset of pinned snapshot versions
-//!   whose minimum is the reclamation watermark (transactions.md §8).
+//! - [`Shared`] holds the published committed roots — the file `Snapshot` **and** the database-wide
+//!   shared-temp `Snapshot` (temp-tables.md §5) — as two `Arc<Snapshot>`s behind ONE `RwLock` (so a
+//!   reader pins both atomically and a writer publishes both in one swap), the single-writer gate (a
+//!   `Mutex<bool>` + `Condvar`, so a second writer **blocks**, bbolt semantics), and the
+//!   **live-reader registry** — the multiset of pinned snapshot versions whose minimum is the
+//!   reclamation watermark (transactions.md §8).
 //! - [`ReadHandle`] pins the committed snapshot at `read()` (an `Arc` clone under a momentary
 //!   read lock — the only time a reader touches shared state), registers its version, and serves
 //!   reads from that pinned snapshot. A later commit publishes a *new* snapshot and never mutates
@@ -69,13 +71,28 @@ impl LiveRegistry {
     }
 }
 
+/// The two published committed roots (spec/design/temp-tables.md §5), held under ONE lock so a
+/// reader pins both atomically — no torn pin where a concurrent commit advances one root between the
+/// reader's two clones — and a writer publishes both in a single swap. The shared-temp root is never
+/// serialized (temp-tables.md §2); it rides the same commit discipline as the file root but as a pure
+/// in-memory pointer swap (no fsync, nothing written to the file).
+struct Roots {
+    /// The committed FILE snapshot — what fresh readers (and autocommit reads) see, and what is
+    /// (eventually) serialized.
+    committed: Arc<Snapshot>,
+    /// The committed DATABASE-WIDE shared-temp snapshot (temp-tables.md §4): the rows of every
+    /// `SHARED` temp table, visible to every session, NEVER serialized.
+    shared_temp: Arc<Snapshot>,
+}
+
 /// The thread-safe core shared by every [`SharedDb`] clone (CLAUDE.md §3). Holds the published
-/// committed snapshot, the single-writer gate, and the live-reader registry.
+/// committed roots, the single-writer gate, and the live-reader registry.
 struct Shared {
-    /// The published committed snapshot. A reader pins it by cloning the `Arc` under a momentary
-    /// read lock; a writer publishes a new one under a momentary write lock — the §3 short commit
-    /// window. The `RwLock` is held only for the pointer clone/swap, never for query work.
-    committed: RwLock<Arc<Snapshot>>,
+    /// The published committed roots (file + shared-temp). A reader pins both by cloning the two
+    /// `Arc`s under one momentary read lock; a writer publishes both under one momentary write lock —
+    /// the §3/§5 short commit window. The `RwLock` is held only for the pointer clone/swap, never for
+    /// query work.
+    roots: RwLock<Roots>,
     /// The single-writer gate: `true` while a write transaction is open. A second `write()` waits
     /// on the condvar until the holder commits or rolls back (CLAUDE.md §3 — at most one writer).
     writer_active: Mutex<bool>,
@@ -104,17 +121,25 @@ impl Shared {
         self.writer_free.notify_one();
     }
 
-    /// Pin the current committed snapshot (an `Arc` clone under a momentary read lock).
-    fn pin(&self) -> Arc<Snapshot> {
-        self.committed
-            .read()
-            .expect("committed lock not poisoned")
-            .clone()
+    /// Pin both committed roots atomically (an `Arc` clone of each under ONE momentary read lock) —
+    /// returns `(file snapshot, shared-temp snapshot)`. Atomic pinning is what makes a reader's view
+    /// consistent across persistent and shared-temp tables (temp-tables.md §5).
+    fn pin(&self) -> (Arc<Snapshot>, Arc<Snapshot>) {
+        let r = self.roots.read().expect("roots lock not poisoned");
+        (r.committed.clone(), r.shared_temp.clone())
     }
 
-    /// Publish `snap` as the new committed snapshot (the §3 commit window — a pointer swap).
-    fn publish(&self, snap: Arc<Snapshot>) {
-        *self.committed.write().expect("committed lock not poisoned") = snap;
+    /// The current published committed (file) version (the monotonic commit counter).
+    fn committed_version(&self) -> u64 {
+        self.roots.read().expect("roots lock not poisoned").committed.txid
+    }
+
+    /// Publish both new committed roots (the §3/§5 commit window — a pointer swap of each under one
+    /// write lock).
+    fn publish(&self, committed: Arc<Snapshot>, shared_temp: Arc<Snapshot>) {
+        let mut r = self.roots.write().expect("roots lock not poisoned");
+        r.committed = committed;
+        r.shared_temp = shared_temp;
     }
 }
 
@@ -133,7 +158,10 @@ impl SharedDb {
     /// A fresh, empty in-memory shared database (committed version 0).
     pub fn new_in_memory() -> SharedDb {
         SharedDb(Arc::new(Shared {
-            committed: RwLock::new(Arc::new(Snapshot::default())),
+            roots: RwLock::new(Roots {
+                committed: Arc::new(Snapshot::default()),
+                shared_temp: Arc::new(Snapshot::default()),
+            }),
             writer_active: Mutex::new(false),
             writer_free: Condvar::new(),
             live: Mutex::new(LiveRegistry::default()),
@@ -143,7 +171,7 @@ impl SharedDb {
     /// The committed version currently published (the monotonic commit counter, transactions.md
     /// §8). Advances by 1 on every `WriteHandle::commit`.
     pub fn version(&self) -> u64 {
-        self.0.pin().txid
+        self.0.committed_version()
     }
 
     /// The oldest still-live snapshot version (transactions.md §8) — the Phase-6 reclamation
@@ -160,17 +188,21 @@ impl SharedDb {
     /// for its life — lock-free, never blocked by and never blocking a writer — and `Drop`
     /// deregisters. A write attempted through it is `25006`.
     pub fn read(&self) -> ReadHandle {
-        let snap = self.0.pin();
+        let (snap, shared_temp) = self.0.pin();
         let version = snap.txid;
         self.0
             .live
             .lock()
             .expect("live lock not poisoned")
             .register(version);
+        let mut db = Database::from_snapshot((*snap).clone());
+        // Seed the handle with the pinned shared-temp snapshot (temp-tables.md §5): the reader sees the
+        // shared temp tables committed as of its pinned version, consistent with its file snapshot.
+        db.shared_temp_committed = (*shared_temp).clone();
         ReadHandle {
             shared: self.0.clone(),
             version,
-            db: Database::from_snapshot((*snap).clone()),
+            db,
         }
     }
 
@@ -180,9 +212,12 @@ impl SharedDb {
     /// writes, failed-block poisoning); `commit` publishes it, `rollback`/`Drop` discards it.
     pub fn write(&self) -> WriteHandle {
         self.0.acquire_writer();
-        let base = self.0.pin();
+        let (base, shared_temp) = self.0.pin();
         let base_version = base.txid;
         let mut db = Database::from_snapshot((*base).clone());
+        // Seed the handle with the pinned shared-temp snapshot before opening the block, so its
+        // `shared_temp_working` (cloned at begin_tx) is the latest committed shared temp (temp-tables.md §5).
+        db.shared_temp_committed = (*shared_temp).clone();
         db.begin_tx(Some(true))
             .expect("a fresh handle has no open transaction");
         WriteHandle {
@@ -278,11 +313,16 @@ impl WriteHandle {
     pub fn commit(mut self) -> Result<()> {
         self.done = true;
         let failed = self.db.tx_failed();
-        self.db.commit_tx()?; // inner in-memory swap: db.committed := working (or no-op if failed)
+        self.db.commit_tx()?; // inner in-memory swap: db.committed := working, shared_temp adopted (or no-op if failed)
         if !failed {
             let mut snap = std::mem::take(&mut self.db.committed);
             snap.txid = self.base_version + 1; // advance the shared version on every commit
-            self.shared.publish(Arc::new(snap));
+            // Publish BOTH roots in one swap (the two-root commit, temp-tables.md §5): the file
+            // snapshot and the shared-temp snapshot. The shared-temp swap is a pure in-memory pointer
+            // move — no fsync, nothing written to the file. A writer that did not touch shared temp
+            // republishes the unchanged shared-temp root (safe: single writer, it pinned that root).
+            let shared_temp = std::mem::take(&mut self.db.shared_temp_committed);
+            self.shared.publish(Arc::new(snap), Arc::new(shared_temp));
         }
         self.shared.release_writer();
         Ok(())

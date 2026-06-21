@@ -66,14 +66,18 @@ sql_statement  ::= create_table
  * TEMPORARY are synonyms and are NOT reserved (§3), recognized POSITIONALLY between CREATE and
  * TABLE: the word after TABLE is always the table name, so `CREATE TABLE temp (...)` is an ordinary
  * persistent table named "temp". A temp name may not collide with ANY relation visible to the
- * session — its own temps, or a persistent table/index/sequence — (42P07; jed PRECLUDES overlaps,
- * a documented divergence from PostgreSQL's pg_temp shadowing — temp-tables.md §3). CREATE/DROP of
- * a temp table is gated by the session's `allow_temp_ddl` capability, the temp-scoped split of
- * `allow_ddl` (42501 if denied — temp-tables.md §5). The database-wide SHARED form
- * (`CREATE SHARED TEMP TABLE`) and `ON COMMIT` are deferred to a later slice (temp-tables.md §1/§13). */
+ * session — its own temps, the shared temps, or a persistent table/index/sequence — (42P07; jed
+ * PRECLUDES overlaps, a documented divergence from PostgreSQL's pg_temp shadowing — temp-tables.md
+ * §3). The optional SHARED prefix makes a DATABASE-WIDE shared temp table — visible to and writable
+ * by every session of the open Database, sharing one set of rows, but still NEVER written to the
+ * file (temp-tables.md §4). SHARED is jed-specific and likewise not reserved; it must be immediately
+ * followed by TEMP/TEMPORARY (a stray `CREATE SHARED TABLE …` is 42601). CREATE/DROP of a
+ * session-local temp table is gated by `allow_temp_ddl`, of a shared temp table by
+ * `allow_shared_temp_ddl` — the temp-scoped splits of `allow_ddl` (42501 if denied — temp-tables.md
+ * §5). `ON COMMIT` is deferred to a later slice (temp-tables.md §1/§13). */
 create_table   ::= "CREATE" table_scope? "TABLE" identifier
                    "(" table_element ("," table_element)* ")"
-table_scope    ::= "TEMPORARY" | "TEMP"
+table_scope    ::= "SHARED"? ("TEMPORARY" | "TEMP")
 
 /* A table element is a column definition or a table-level constraint: the
  * composite-capable PRIMARY KEY list, an (optionally named) CHECK constraint, or an

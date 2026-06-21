@@ -455,16 +455,17 @@ template = "session exceeded the lifetime cost limit of {limit} (accrued {cost})
 # the lifetime budget (54P02) bounds CUMULATIVE work, but neither bounds bytes held BETWEEN cheap
 # statements, so an adversary could `CREATE TEMP TABLE t(x text); INSERT …; INSERT …;` and accrue
 # unbounded RAM at trivial per-statement cost. This is the §13 gate that closes that hole: a
-# per-session `temp_buffers` budget (session-local temp storage) and, in a later slice, a global
-# `shared_temp_mem` budget (shared temp storage) and the temp-spill disk ceiling. The budget is
+# per-session `temp_buffers` budget (session-local temp storage) and a global `shared_temp_mem` budget
+# (shared temp storage); the temp-spill disk ceiling joins them in a later slice. The budget is
 # measured in BYTE-IDENTICAL on-disk record bytes (`record_size`, summed over every temp table + index
 # store — NOT the per-core `work_mem` spill estimator), checked per-statement, so the abort point is a
 # pure function of (operations, budget) — identical across cores (§8), never dependent on the
 # allocator. jed-specific (PostgreSQL bounds temp storage only via nondeterministic
 # OS OOM / disk-full): a `P`-subclass code in class 54 alongside 54P01/54P02 (the deterministic,
 # host-configured ceilings), deliberately NOT PG's class 53 `insufficient_resources` (which denotes
-# actual, platform-dependent exhaustion). Asserted by the conformance corpus (the resource.temp_budget
-# capability), since the abort point is part of the cross-core contract (no reference impl, §2).
+# actual, platform-dependent exhaustion). Asserted by the conformance corpus (resource.temp_budget +
+# resource.shared_temp_budget), since the abort point is part of the cross-core contract (no reference
+# impl, §2).
 [[error]]
 code = "54P03"
 name = "temp_storage_limit_exceeded"
