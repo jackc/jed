@@ -292,6 +292,14 @@ export const DEFAULT_PAGE_SIZE = 8192;
 // setMaxSqlLength. Identical across cores (§8).
 export const DEFAULT_MAX_SQL_LENGTH = 1 << 20;
 
+// DEFAULT_TEMP_BUFFERS is the default per-session storage budget for SESSION-LOCAL temporary tables,
+// in BYTES (spec/design/temp-tables.md §7). Temp tables RETAIN bytes across statements, which neither
+// the per-statement cost ceiling (maxCost) nor the cumulative budget (lifetimeMaxCost) bounds, so
+// tempBuffers is the §13 gate that does: the instant a session's resident temp storage (byte-identical
+// on-disk record bytes) would exceed it, the write aborts 54P03. 0 ⇒ unlimited (a trusted handle).
+// Identical across cores (§8); the abort point is part of the cross-core contract.
+export const DEFAULT_TEMP_BUFFERS = 32 << 20;
+
 // MAX_COMPOSITE_DEPTH is the maximum composite-type nesting depth (CLAUDE.md §13; cost.md §7b). A
 // composite type's depth is the length of its deepest chain of nested composites, counting itself: a
 // row of scalars is depth 1, `CREATE TYPE b AS (x a)` is `1 + depth(a)`, and an array field counts
@@ -666,6 +674,22 @@ export class Snapshot {
     return this.indexStores.get(nameKey)!;
   }
 
+  // hasIndexStore reports whether this snapshot holds a store for the named index (lowercased key).
+  // Used to route index access to the session temp snapshot vs the main snapshot (temp-tables.md §2).
+  hasIndexStore(nameKey: string): boolean {
+    return this.indexStores.has(nameKey);
+  }
+
+  // storageBytes is the total on-disk record bytes of every table store + index store in this snapshot
+  // — the temp budget's deterministic footprint measure (spec/design/temp-tables.md §7), summed over
+  // the session temp snapshot. Iteration order does not matter (it is a sum).
+  storageBytes(): number {
+    let total = 0;
+    for (const st of this.stores.values()) total += st.storedBytes();
+    for (const st of this.indexStores.values()) total += st.storedBytes();
+    return total;
+  }
+
   // putIndex registers a new (empty) secondary index on tableKey: insert its definition
   // into the table's indexes in ascending lowercased-name order (the catalog/planner
   // order — spec/design/indexes.md §6) and create its zero-column store. The Table object
@@ -764,6 +788,16 @@ type ActiveTx = {
   // COMMIT) restores these, while a successful COMMIT keeps the advanced state.
   savedSessionSeq: Map<string, bigint>;
   savedSessionLastName: string | null;
+  // tempWorking is the transaction's working copy of the session's temp-table snapshot
+  // (spec/design/temp-tables.md §5): cloned from Session.tempCommitted at tx open, mutated by temp
+  // DDL/DML, adopted back into tempCommitted on a successful COMMIT and discarded on ROLLBACK. The
+  // temp analogue of working, kept SEPARATE so it is never serialized.
+  tempWorking: Snapshot;
+  // mainDirty is whether this transaction mutated the MAIN (persistent) snapshot — set by working().
+  // Drives the commit's persist decision so a transaction that touched ONLY temp tables makes zero
+  // file writes (temp-tables.md §2). tempDirty mirrors it for the temp snapshot.
+  mainDirty: boolean;
+  tempDirty: boolean;
 };
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
@@ -783,8 +817,18 @@ export type SessionOptions = {
   // (spec/design/session.md §5.3). Absent ⇒ all four (the default), so a fresh session is
   // unrestricted; PrivilegeSet.empty().with("select") is a read-only session.
   defaultPrivileges?: PrivilegeSet;
-  // Whether DDL (CREATE/DROP/ALTER) is permitted; a denied schema change is 42501 (§5.3). Absent ⇒ on.
+  // Whether PERSISTENT DDL (CREATE/DROP/ALTER of persistent relations) is permitted; a denied schema
+  // change is 42501 (§5.3). Absent ⇒ on. Its scope narrows with temporary tables (temp-tables.md §5):
+  // allowTempDdl is the temp-scoped sibling gate.
   allowDdl?: boolean;
+  // Whether SESSION-LOCAL temporary-table DDL is permitted (spec/design/temp-tables.md §5); a denied
+  // temp DDL is 42501. Absent ⇒ INHERIT allowDdl's value (back-compat: one gate governs all DDL). The
+  // untrusted-scratch pattern is allowDdl=false + allowTempDdl=true — private scratch tables only.
+  allowTempDdl?: boolean;
+  // The per-session storage budget for session-local temp tables, in BYTES (spec/design/temp-tables.md
+  // §7); 0 ⇒ unlimited; absent ⇒ the engine default (DEFAULT_TEMP_BUFFERS). An over-budget temp write
+  // aborts 54P03.
+  tempBuffers?: number;
 };
 
 // TxStatus is the session transaction status (spec/design/session.md §2.2) — PostgreSQL's three
@@ -861,9 +905,24 @@ export class Session {
   // privilege model the host configures and the engine enforces (42501) at name resolution. A fresh
   // session is fully permissive (every table privilege, every function EXECUTE).
   privileges: Privileges;
-  // Whether DDL (CREATE/DROP/ALTER) is permitted on this session (§5.3); a denied schema change is
-  // 42501. Default on — jed has no schema/owner model, so this single boolean gates all DDL.
+  // Whether PERSISTENT DDL (CREATE/DROP/ALTER of persistent relations) is permitted on this session
+  // (§5.3); a denied schema change is 42501. Default on. Its scope narrows with temporary tables
+  // (temp-tables.md §5): allowTempDdl is the temp-scoped sibling gate.
   allowDdl: boolean;
+  // Whether session-local TEMPORARY-table DDL is permitted (spec/design/temp-tables.md §5); a denied
+  // temp DDL is 42501. Resolved at construction from opts.allowTempDdl (defaulting to allowDdl's value).
+  allowTempDdl: boolean;
+  // The per-session temp-table storage budget in BYTES (temp-tables.md §7); 0 ⇒ unlimited. An
+  // over-budget temp write aborts 54P03.
+  tempBuffers: number;
+  // The session-local TEMPORARY-table catalog + stores (spec/design/temp-tables.md §2): a Snapshot
+  // holding only this session's temp tables, their stores, and their (UNIQUE) index stores. NEVER
+  // serialized — only Database.committed is written to the file, so a temp table makes ZERO file
+  // writes. Private to this Session (it carries across the by-reference session swap and is invisible
+  // to other sessions), dropped wholesale with the session. Transactional like the main snapshot: an
+  // open transaction clones it into ActiveTx.tempWorking, adopted on a successful COMMIT, discarded on
+  // ROLLBACK.
+  tempCommitted: Snapshot;
   // The session variables (spec/design/session.md §6.1): PostgreSQL's GUC model scoped to the session
   // — a string→string map (PG GUCs are all text) the host sets (setVar/resetVar) and SQL reads with
   // current_setting. Custom (dotted) names only in v1. SESSION state, not snapshot state: it does NOT
@@ -895,6 +954,10 @@ export class Session {
       this.privileges.setDefaultTable(opts.defaultPrivileges);
     }
     this.allowDdl = opts.allowDdl ?? true;
+    // Back-compat default-inheritance (temp-tables.md §5): an unset allowTempDdl takes allowDdl's value.
+    this.allowTempDdl = opts.allowTempDdl ?? this.allowDdl;
+    this.tempBuffers = opts.tempBuffers ?? DEFAULT_TEMP_BUFFERS;
+    this.tempCommitted = new Snapshot();
     this.vars = new Map();
     this.readPin = null;
   }
@@ -980,6 +1043,15 @@ export class Session {
   // setAllowDdl sets whether DDL is permitted on this session (§5.3); a denied change is 42501.
   setAllowDdl(allow: boolean): void {
     this.allowDdl = allow;
+  }
+  // setAllowTempDdl sets whether session-local temporary-table DDL is permitted (temp-tables.md §5).
+  setAllowTempDdl(allow: boolean): void {
+    this.allowTempDdl = allow;
+  }
+  // setTempBuffers sets the per-session temp-table storage budget in BYTES (temp-tables.md §7); 0 ⇒
+  // unlimited. An over-budget temp write aborts 54P03.
+  setTempBuffers(bytes: number): void {
+    this.tempBuffers = bytes;
   }
   // setVar sets a session variable (spec/design/session.md §6.1) — PostgreSQL's GUC model, scoped to
   // the session. Custom variables must be namespaced (a dotted name like myapp.tenant); a non-dotted
@@ -1136,6 +1208,9 @@ export class Database {
   resetPrivileges(): void {
     this.session.privileges = new Privileges();
     this.session.allowDdl = true;
+    // The temp-DDL gate is part of the authorization envelope (temp-tables.md §5); reset it with the
+    // rest so a # allow_temp_ddl: directive never leaks past its record. Default-inherits allowDdl=true.
+    this.session.allowTempDdl = true;
   }
 
   // privileges is read-only access to the default session's authorization envelope (§5.3).
@@ -1151,6 +1226,28 @@ export class Database {
   // allowDdl reports whether DDL is permitted on the default session.
   allowDdl(): boolean {
     return this.session.allowDdl;
+  }
+
+  // setAllowTempDdl sets whether session-local temporary-table DDL is permitted on the default session
+  // (spec/design/temp-tables.md §5) — the temp-scoped split of allowDdl; a denied temp DDL is 42501.
+  setAllowTempDdl(allow: boolean): void {
+    this.session.allowTempDdl = allow;
+  }
+
+  // allowTempDdl reports whether session-local temporary-table DDL is permitted on the default session.
+  allowTempDdl(): boolean {
+    return this.session.allowTempDdl;
+  }
+
+  // setTempBuffers sets the default session's per-session temp-table storage budget in BYTES
+  // (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
+  setTempBuffers(bytes: number): void {
+    this.session.tempBuffers = bytes;
+  }
+
+  // tempBuffers reports the default session's per-session temp-table storage budget (0 ⇒ unlimited).
+  tempBuffers(): number {
+    return this.session.tempBuffers;
   }
 
   // setVar sets a session variable on the default session (spec/design/session.md §6.1). Custom
@@ -1253,7 +1350,66 @@ export class Database {
   // working is the snapshot a write mutates — the open transaction's working. A write only ever
   // runs with a transaction open (autocommit opens one implicitly), so tx is non-null here.
   private working(): Snapshot {
+    // Mark the main image dirty so the commit knows to persist it; a temp-only transaction never
+    // reaches here (it writes via the temp funnels) and so makes zero file writes (temp-tables.md §2).
+    this.session.tx!.mainDirty = true;
     return this.session.tx!.working;
+  }
+
+  // tempSnap is the session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the open
+  // transaction's tempWorking, else the session's committed temp state. The temp analogue of readSnap
+  // (it does not consult readPin — a writable-CTE pins only the main snapshot).
+  private tempSnap(): Snapshot {
+    return this.session.tx !== null
+      ? this.session.tx.tempWorking
+      : this.session.tempCommitted;
+  }
+
+  // isTempTable reports whether name resolves to a SESSION-LOCAL temporary table in the visible temp
+  // snapshot (spec/design/temp-tables.md §3). Preclude-overlaps guarantees a name is temp XOR
+  // persistent, so this is the routing predicate the table/store funnels use.
+  private isTempTable(name: string): boolean {
+    return this.tempSnap().table(name) !== undefined;
+  }
+
+  // lkpTable resolves a table by name, temp-first then the visible main snapshot (temp-tables.md §3).
+  private lkpTable(name: string): Table | undefined {
+    return this.tempSnap().table(name) ?? this.readSnap().table(name);
+  }
+
+  // lkpStore returns a table's store for READS, routing to the session temp snapshot for a temp table
+  // (no dirty flag — reads never persist), else the visible main snapshot (temp-tables.md §2).
+  private lkpStore(name: string): TableStore {
+    return this.isTempTable(name)
+      ? this.tempSnap().store(name)
+      : this.readSnap().store(name);
+  }
+
+  // writeStore returns a table's store for MUTATION, routing a temp table's write to tempWorking (and
+  // flagging tempDirty) and a persistent write to working (which flags mainDirty) — so a temp-only
+  // transaction leaves the main image untouched (temp-tables.md §2).
+  private writeStore(name: string): TableStore {
+    if (this.isTempTable(name)) {
+      this.session.tx!.tempDirty = true;
+      return this.session.tx!.tempWorking.store(name);
+    }
+    return this.working().store(name);
+  }
+
+  // lkpIndexStore returns a secondary index's store for READS, temp-first (temp-tables.md §8).
+  private lkpIndexStore(nameKey: string): TableStore {
+    return this.tempSnap().hasIndexStore(nameKey)
+      ? this.tempSnap().indexStore(nameKey)
+      : this.readSnap().indexStore(nameKey);
+  }
+
+  // writeIndexStore returns a secondary index's store for MUTATION, temp-first (flagging the dirty bit).
+  private writeIndexStore(nameKey: string): TableStore {
+    if (this.tempSnap().hasIndexStore(nameKey)) {
+      this.session.tx!.tempDirty = true;
+      return this.session.tx!.tempWorking.indexStore(nameKey);
+    }
+    return this.working().indexStore(nameKey);
   }
 
   // columnCollations resolves each column's frozen collation (Column.collation, the name) to its
@@ -1434,6 +1590,9 @@ export class Database {
       writable,
       failed: false,
       working: this.committed.clone(),
+      tempWorking: this.session.tempCommitted.clone(),
+      mainDirty: false,
+      tempDirty: false,
       savedSessionSeq: new Map(this.session.sessionSeq),
       savedSessionLastName: this.session.sessionLastName,
     };
@@ -1707,6 +1866,10 @@ export class Database {
           );
         }
         const outcome = this.dispatchStmt(stmt, params);
+        // Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
+        // over-budget statement throws 54P03, which aborts the block (the staged temp rows roll back
+        // at ROLLBACK). A no-op for non-temp statements.
+        this.checkTempBudget();
         // Land any nextval advances into the block's working snapshot; COMMIT publishes them,
         // ROLLBACK discards them with the rest of the working set (sequences.md §5).
         this.flushPendingSequences();
@@ -1737,6 +1900,9 @@ export class Database {
     let outcome: Outcome;
     try {
       outcome = this.dispatchStmt(stmt, params);
+      // Enforce the temp-storage budget before committing (temp-tables.md §7): an over-budget temp
+      // write in this implicit transaction is discarded (rolling back temp + main) and surfaces 54P03.
+      this.checkTempBudget();
     } catch (e) {
       // The statement failed before any flush, so session state is untouched; restore from the
       // captured copy anyway to keep the discard path uniform (sequences.md §6).
@@ -1789,22 +1955,32 @@ export class Database {
     this.session.tx = null;
     if (tx.failed || !tx.writable) {
       // A failed or read-only block publishes nothing — a failed COMMIT is a ROLLBACK (PG), so any
-      // in-block session updates revert with the discarded working set (§5/§6).
+      // in-block session updates revert with the discarded working set (§5/§6). The discarded
+      // tempWorking rolls back temp changes too.
       this.restoreSessionState(tx);
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
     const working = tx.working;
-    // The txid advances for a durable database, signalled by the presence of a persistHook (the file
-    // and OPFS hosts set one; an in-memory database has none and stays at txid 0). Keyed on persistHook,
-    // not `path`: the OPFS host is durable but has no filesystem path (it leaves `path` null so the
-    // disk-spill in newSorterFor stays off), so `path` alone would wrongly hold its txid at the create
-    // value and reuse the same meta slot. For the file and in-memory hosts the two are equivalent
-    // (path and persistHook are set or unset together), so this is observably identical there.
-    if (this.persistHook !== null) working.txid = this.committed.txid + 1n;
-    // persistHook (if any) throws on an I/O failure before committed is swapped, so committed is
-    // left untouched (the commit failed; the working snapshot is discarded).
-    if (this.persistHook !== null) this.persistHook(this, working);
-    this.committed = working;
+    // Persist the main image when it changed; a temp-only transaction skips it entirely so a temp
+    // table makes ZERO file writes (spec/design/temp-tables.md §2). An empty block (neither dirty)
+    // still persists, preserving prior behavior. Temp state is adopted regardless — never serialized,
+    // only swapped into the session's committed temp snapshot.
+    if (tx.mainDirty || !tx.tempDirty) {
+      // The txid advances for a durable database, signalled by the presence of a persistHook (the file
+      // and OPFS hosts set one; an in-memory database has none and stays at txid 0). Keyed on persistHook,
+      // not `path`: the OPFS host is durable but has no filesystem path (it leaves `path` null so the
+      // disk-spill in newSorterFor stays off), so `path` alone would wrongly hold its txid at the create
+      // value and reuse the same meta slot. For the file and in-memory hosts the two are equivalent
+      // (path and persistHook are set or unset together), so this is observably identical there.
+      if (this.persistHook !== null) working.txid = this.committed.txid + 1n;
+      // persistHook (if any) throws on an I/O failure before committed is swapped, so committed is
+      // left untouched (the commit failed; the working snapshot is discarded).
+      if (this.persistHook !== null) this.persistHook(this, working);
+      this.committed = working;
+    }
+    // Adopt the transaction's temp changes into the session's committed temp snapshot (temp-tables.md
+    // §5) — the temp analogue of publishing committed, but purely in memory.
+    this.session.tempCommitted = tx.tempWorking;
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -1844,17 +2020,53 @@ export class Database {
     }
   }
 
+  // checkTempBudget enforces the per-session temp-table storage budget (tempBuffers, spec/design/
+  // temp-tables.md §7) — the §13 gate on RETAINED temp bytes. Checked after each temp-writing
+  // statement: if the session's temp footprint (byte-identical on-disk record bytes, summed over every
+  // temp table + index) EXCEEDS the budget, throw 54P03. The over-budget write is in tempWorking, so
+  // the abort discards it (autocommit) or fails the block (rolled back at ROLLBACK) — nothing commits.
+  // tempBuffers 0 ⇒ unlimited; a transaction that did not touch temp cannot have grown it, so the check
+  // self-gates on tempDirty and is a no-op for ordinary (persistent) statements. Within-statement bound
+  // is maxCost.
+  private checkTempBudget(): void {
+    const limit = this.session.tempBuffers;
+    if (limit === 0) return;
+    if (this.session.tx === null || !this.session.tx.tempDirty) return;
+    const used = this.tempSnap().storageBytes();
+    if (used > limit) {
+      throw engineError(
+        "temp_storage_limit_exceeded",
+        `temporary table storage exceeded the limit of ${limit} bytes`,
+      );
+    }
+  }
+
   private checkPrivileges(stmt: Statement): void {
-    if (this.session.allowDdl && this.session.privileges.isPermissive()) {
+    // Fast path: a session that allows ALL DDL (persistent + temp) and grants every privilege pays
+    // nothing. Both gates must be on, since temp DDL is now its own gate (temp-tables.md §5).
+    if (
+      this.session.allowDdl &&
+      this.session.allowTempDdl &&
+      this.session.privileges.isPermissive()
+    ) {
       return;
     }
-    const req: PrivReq = { tables: [], functions: [], isDdl: false };
+    const req: PrivReq = { tables: [], functions: [], isDdl: false, isTempDdl: false };
     collectStmtPrivs(stmt, req);
-    if (req.isDdl && !this.session.allowDdl) {
-      throw engineError(
-        "insufficient_privilege",
-        "permission denied: DDL is not permitted in this session",
-      );
+    if (req.isDdl) {
+      // Temp-table DDL is gated by allowTempDdl; all other DDL by allowDdl (temp-tables.md §5), so a
+      // host can grant bounded scratch tables to an untrusted session while withholding persistent
+      // schema changes. CREATE TEMP is known statically; a DROP of a temp table resolves the name.
+      const tempDdl =
+        req.isTempDdl ||
+        (stmt.kind === "dropTable" && this.isTempTable(stmt.name));
+      const allowed = tempDdl ? this.session.allowTempDdl : this.session.allowDdl;
+      if (!allowed) {
+        throw engineError(
+          "insufficient_privilege",
+          "permission denied: DDL is not permitted in this session",
+        );
+      }
     }
     const snap = this.readSnap();
     for (const t of req.tables) {
@@ -1956,8 +2168,20 @@ export class Database {
   // resolve left to right (unknown 42703, repeated 42701); then the jed narrowings — the
   // declaration-order rule and the per-member key-type gate — trap 0A000.
   private executeCreateTable(ct: CreateTable): Outcome {
+    // A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
+    // one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
+    // FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
+    // parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
+    // columns, serial/IDENTITY) are checked just before registration, once the columns are built.
+    if (ct.temp && ct.fks.length > 0) {
+      throw engineError(
+        "feature_not_supported",
+        "FOREIGN KEY on a temporary table is not yet supported",
+      );
+    }
     // The relation namespace is shared between tables and indexes (indexes.md §2), so a
-    // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
+    // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word. relationExists
+    // is temp-aware, so a temp name collides with temp + persistent alike (preclude-overlaps, §3).
     if (this.relationExists(ct.name)) {
       throw engineError(
         "duplicate_table",
@@ -2689,6 +2913,46 @@ export class Database {
     });
     table.fks = resolvedFks;
 
+    if (ct.temp) {
+      // Deferred narrowings on a temp table this slice (spec/design/temp-tables.md §8), each a clean
+      // 0A000: a serial/IDENTITY column (needs a temp OWNED sequence), a composite-typed column (needs
+      // the temp snapshot to carry the type catalog), and a collated column (needs the collation
+      // catalog). Plain scalar/array/range/decimal columns with PK / NOT NULL / DEFAULT / CHECK /
+      // UNIQUE are fully supported. With these out, the temp snapshot needs no types/collations catalog.
+      if (pendingSerials.length > 0) {
+        throw engineError(
+          "feature_not_supported",
+          "serial / IDENTITY column on a temporary table is not yet supported",
+        );
+      }
+      for (const c of table.columns) {
+        if (typeUsesComposite(c.type)) {
+          throw engineError(
+            "feature_not_supported",
+            `composite-typed column ${c.name} on a temporary table is not yet supported`,
+          );
+        }
+        if (c.collation !== null) {
+          throw engineError(
+            "feature_not_supported",
+            `COLLATE on temporary-table column ${c.name} is not yet supported`,
+          );
+        }
+      }
+      // Register into the session temp snapshot (tempWorking) — never the main image, so the table
+      // makes zero file writes (§2). Flag tempDirty so the commit can skip persisting the main image.
+      this.session.tx!.tempDirty = true;
+      const ts = this.tempSnap();
+      ts.putTable(table, this.pageSize);
+      for (const ix of table.indexes) {
+        ts.putIndexStore(
+          ix.name.toLowerCase(),
+          new TableStore(this.pageSize - 12, []), // 12 = PAGE_HEADER
+        );
+      }
+      return { kind: "statement", cost: 0n, rowsAffected: null };
+    }
+
     this.putTable(table);
     // The table is brand new (no rows), so each backing index store starts empty.
     for (const ix of table.indexes) {
@@ -2798,6 +3062,15 @@ export class Database {
   // Like CREATE TABLE it touches no rows and evaluates no expression tree (the store is
   // discarded wholesale), so it accrues zero cost.
   private executeDropTable(dt: DropTable): Outcome {
+    // A session-local temp table (spec/design/temp-tables.md): remove it from the session temp
+    // snapshot — never the main image, so DROP makes zero file writes. No FK-dependent check (a temp
+    // table is never an FK parent, §8) and no owned-sequence sweep (serial on temp is deferred, §8).
+    // The temp-DDL capability gate already ran at dispatch (§5).
+    if (this.isTempTable(dt.name)) {
+      this.session.tx!.tempDirty = true;
+      this.tempSnap().removeTable(dt.name.toLowerCase());
+      return { kind: "statement", cost: 0n, rowsAffected: null };
+    }
     if (!this.table(dt.name)) {
       // An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
       // anything else is the missing-table 42P01 the DML paths raise.
@@ -2839,9 +3112,14 @@ export class Database {
   // table OR an index OR a sequence — spec/design/indexes.md §2, sequences.md §2),
   // case-insensitively.
   private relationExists(name: string): boolean {
+    // Temp tables + their (UNIQUE) index names join the namespace too, so a name colliding with a temp
+    // relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md §3). this.table is
+    // persistent-only, so the temp snapshot is checked explicitly.
     return (
       this.table(name) !== undefined ||
+      this.tempSnap().table(name) !== undefined ||
       this.findIndex(name) !== null ||
+      this.tempSnap().findIndex(name) !== null ||
       this.readSnap().sequence(name) !== undefined
     );
   }
@@ -2851,7 +3129,7 @@ export class Database {
   // `parentTable` is the referenced table's name. Unmetered, like the PK/UNIQUE probes (cost.md §3).
   private fkProbeHits(probe: FkProbe, parentTable: string): boolean {
     if (probe.kind === "pk") {
-      return this.readSnap().store(parentTable).get(probe.bytes) !== undefined;
+      return this.lkpStore(parentTable).get(probe.bytes) !== undefined;
     }
     return (
       this.readSnap()
@@ -2877,7 +3155,7 @@ export class Database {
     // target is in the parent's stored-key byte space, so the child probe encodes a collated parent
     // key column with the PARENT's collation (§2.12).
     const parentColls = this.columnCollations(parent.columns);
-    for (const e of this.readSnap().store(childTable).entriesInKeyOrder()) {
+    for (const e of this.lkpStore(childTable).entriesInKeyOrder()) {
       if (exclude.has(e.key.join(","))) continue;
       const probe = fkProbe(fk, parent, parentColls, e.row, fk.columns);
       if (probe !== null && bytesEq(fkProbeBytes(probe), target)) return true;
@@ -2916,6 +3194,15 @@ export class Database {
   // index is then built by scanning the table once: page_read per node + storage_row_read
   // per row (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
   private executeCreateIndex(ci: CreateIndex): Outcome {
+    // A standalone CREATE INDEX on a temp table is deferred this slice (spec/design/temp-tables.md §8)
+    // — a temp table's UNIQUE constraints (in CREATE TEMP TABLE) are supported, but separate index DDL
+    // is a 0A000 follow-on. Checked before resolution so the message is clear.
+    if (this.isTempTable(ci.table)) {
+      throw engineError(
+        "feature_not_supported",
+        "CREATE INDEX on a temporary table is not yet supported",
+      );
+    }
     const table = this.table(ci.table);
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + ci.table);
@@ -3029,7 +3316,7 @@ export class Database {
     const mask = columns.map(() => false);
     for (const c of cols) mask[c] = true;
     const def: IndexDef = { name, columns: cols, unique: ci.unique, kind };
-    const store = this.readSnap().store(ci.table);
+    const store = this.lkpStore(ci.table);
     const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
     meter.charge(
       COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs),
@@ -3061,7 +3348,7 @@ export class Database {
 
     const nameKey = def.name.toLowerCase();
     this.working().putIndex(tableKey, def, this.pageSize);
-    const istore = this.working().indexStore(nameKey);
+    const istore = this.writeIndexStore(nameKey);
     // Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
     // so the built tree packs ~full instead of splintering under the storage-key order the
     // scan produced (random in entry-key space). Part of the byte contract — the sort fixes
@@ -3367,12 +3654,12 @@ export class Database {
       hi: prefixSuccessor(prefix),
       hiInc: false,
     };
-    const istore = this.readSnap().indexStore(ib.nameKey);
+    const istore = this.lkpIndexStore(ib.nameKey);
     // The index store has no payload columns, so its mask is empty and its fused scan
     // contributes only the index-tree page_read count (no spill/compress units).
     const iscan = istore.rangeScanWithUnits(b, []);
     let pages = iscan.pages;
-    const store = this.readSnap().store(tableName);
+    const store = this.lkpStore(tableName);
     let slabs = 0;
     const rows: Row[] = [];
     for (const e of iscan.entries) {
@@ -3412,7 +3699,7 @@ export class Database {
     meter: Meter,
     mask: boolean[],
   ): { entries: Entry[]; pages: number; slabs: number } {
-    const store = this.readSnap().store(tableName);
+    const store = this.lkpStore(tableName);
     if (query === null) return { entries: [], pages: 0, slabs: 0 };
     // Extract the query's terms (extract_query_terms) — a pure planning step, NOT metered (cost.md
     // §3): evaluate Q on a scratch meter. Q is a constant, so the empty row suffices.
@@ -3479,7 +3766,7 @@ export class Database {
     // Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
     // (gin.md §4). The entry is encode(term) ‖ storage_key; the fixed-width term self-delimits, so
     // the storage key is the suffix after termWidth bytes.
-    const istore = this.readSnap().indexStore(gb.nameKey);
+    const istore = this.lkpIndexStore(gb.nameKey);
     const termWidth = widthBytes(gb.elemType);
     let pages = 0;
     let entriesVisited = 0;
@@ -3533,14 +3820,14 @@ export class Database {
   // source additionally validates output arity (42601) and per-column type assignability (42804)
   // up front, before any row is produced — so both fire even over an empty source.
   private executeInsert(ins: Insert, params: Value[], ctx: CteCtx): Outcome {
-    const table = this.table(ins.table);
+    const table = this.lkpTable(ins.table); // temp-first (temp-tables.md §3)
     if (!table) {
       throw engineError(
         "undefined_table",
         "table does not exist: " + ins.table,
       );
     }
-    const store = this.working().store(ins.table);
+    const store = this.writeStore(ins.table);
     // The key members in key order — one for a single-column PK, several for a composite
     // (constraints.md §3), empty for a no-PK (rowid) table.
     const pk = pkIndices(table);
@@ -3898,7 +4185,7 @@ export class Database {
     // writable-cte.md §2; else working == read-your-writes), so a self-insert sees the pre-insert
     // state and an earlier sub-statement's staged key is invisible here (its collision is caught at
     // phase 2 — §7). The passed `store` is the working set the phase-2 inserts land in.
-    const readStore = this.readSnap().store(table.name);
+    const readStore = this.lkpStore(table.name);
     const prepared: { key: Uint8Array | null; row: Row }[] = [];
     const seenKeys = new Set<string>();
     // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
@@ -3975,7 +4262,7 @@ export class Database {
         const def = uniqDefs[u]!;
         const prefix = indexPrefixKey(table.columns, colls, def, row);
         if (prefix === null) continue;
-        const istore = this.readSnap().indexStore(def.name.toLowerCase());
+        const istore = this.lkpIndexStore(def.name.toLowerCase());
         const stored = istore.rangeEntries(uniqueProbeBound(prefix));
         const k = prefix.join(",");
         if (stored.length > 0 || seenPrefixes[u]!.has(k)) {
@@ -4080,7 +4367,7 @@ export class Database {
     }
     for (let k = 0; k < table.indexes.length; k++) {
       const def = table.indexes[k]!;
-      const istore = this.working().indexStore(def.name.toLowerCase());
+      const istore = this.writeIndexStore(def.name.toLowerCase());
       for (const ek of indexInserts[k]!) {
         if (!istore.insert(ek, [])) {
           // A cross-sub-statement unique-index collision under the read pin (as above).
@@ -4350,7 +4637,7 @@ export class Database {
     // Phase-1 existence/arbiter probes read the VISIBLE snapshot (the read pin under a data-modifying
     // WITH — writable-cte.md §2; else working == read-your-writes); the passed `store` is the working
     // set the phase-2 inserts/replaces land in.
-    const readStore = this.readSnap().store(table.name);
+    const readStore = this.lkpStore(table.name);
     // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
     // C-only / non-text table (the fast path).
     const colls = this.columnCollations(table.columns);
@@ -4528,7 +4815,7 @@ export class Database {
       const newRows = updates.map((u) => u.newRow).concat(inserts);
       for (const ix of uniqIdx) {
         const def = table.indexes[ix]!;
-        const istore = this.readSnap().indexStore(def.name.toLowerCase());
+        const istore = this.lkpIndexStore(def.name.toLowerCase());
         const batch = new Set<string>();
         for (const newRow of newRows) {
           const prefix = indexPrefixKey(table.columns, colls, def, newRow);
@@ -4713,7 +5000,7 @@ export class Database {
     }
     for (const u of updates) store.replace(u.key, u.newRow);
     for (let k = 0; k < table.indexes.length; k++) {
-      const istore = this.working().indexStore(
+      const istore = this.writeIndexStore(
         table.indexes[k]!.name.toLowerCase(),
       );
       for (const ek of indexAdds[k]!) {
@@ -4797,7 +5084,7 @@ export class Database {
   // matching rows (only a TRUE predicate matches — Kleene), then removes them. No WHERE
   // deletes every row. Keys are collected before mutating.
   private executeDelete(del: Delete, params: Value[], ctx: CteCtx): Outcome {
-    const table = this.table(del.table);
+    const table = this.lkpTable(del.table); // temp-first (temp-tables.md §3)
     if (!table) {
       throw engineError(
         "undefined_table",
@@ -4854,7 +5141,7 @@ export class Database {
     };
     // The SCAN reads the visible snapshot (the read pin under a data-modifying WITH — writable-cte.md
     // §2; else working == read-your-writes); the phase-2 REMOVAL writes the transaction's working set.
-    const store = this.readSnap().store(del.table);
+    const store = this.lkpStore(del.table);
     // matched collects (key, row) pairs before mutating; the rows feed phase 2's
     // index-entry removal (indexed columns are fixed-width and always resident).
     const matched: { key: Uint8Array; row: Row }[] = [];
@@ -4992,10 +5279,10 @@ export class Database {
         : null;
     // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
     // unmetered write work; an index removal cannot fail).
-    const writeStore = this.working().store(del.table);
+    const writeStore = this.writeStore(del.table);
     for (const m of matched) writeStore.remove(m.key);
     for (const def of table.indexes) {
-      const istore = this.working().indexStore(def.name.toLowerCase());
+      const istore = this.writeIndexStore(def.name.toLowerCase());
       for (const m of matched) {
         for (const ek of indexEntryKeys(table.columns, colls, def, m.key, m.row))
           istore.remove(ek);
@@ -5016,7 +5303,7 @@ export class Database {
   // Assigning a PRIMARY KEY column traps 0A000 (the storage key must not change this
   // slice); a duplicate target column traps 42701. No WHERE updates every row.
   private executeUpdate(upd: Update, params: Value[], ctx: CteCtx): Outcome {
-    const table = this.table(upd.table);
+    const table = this.lkpTable(upd.table); // temp-first (temp-tables.md §3)
     if (!table) {
       throw engineError(
         "undefined_table",
@@ -5163,7 +5450,7 @@ export class Database {
     // The SCAN + spilled-value reads + compress-cost weigh the visible snapshot (the read pin under a
     // data-modifying WITH — writable-cte.md §2; else working == read-your-writes); the phase-2 REPLACE
     // writes the transaction's working set.
-    const store = this.readSnap().store(upd.table);
+    const store = this.lkpStore(upd.table);
     // Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
     const updates: { key: Uint8Array; row: Row; oldRow: Row }[] = [];
     // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's, and
@@ -5269,7 +5556,7 @@ export class Database {
       const rewritten = new Set<string>(updates.map((u) => u.key.join(",")));
       for (const def of table.indexes) {
         if (!def.unique) continue;
-        const istore = this.readSnap().indexStore(def.name.toLowerCase());
+        const istore = this.lkpIndexStore(def.name.toLowerCase());
         const batch = new Set<string>();
         for (const u of updates) {
           const prefix = indexPrefixKey(table.columns, colls, def, u.row);
@@ -5440,10 +5727,10 @@ export class Database {
 
     // Phase 2: apply (keys unchanged — a PK column can't be assigned), then move the
     // changed index entries (unmetered write work; cannot fail). The REPLACE targets the working set.
-    const writeStore = this.working().store(upd.table);
+    const writeStore = this.writeStore(upd.table);
     for (const u of updates) writeStore.replace(u.key, u.row);
     for (let k = 0; k < table.indexes.length; k++) {
-      const istore = this.working().indexStore(
+      const istore = this.writeIndexStore(
         table.indexes[k]!.name.toLowerCase(),
       );
       for (const mv of indexMoves[k]!) {
@@ -5658,7 +5945,7 @@ export class Database {
     } else {
       throw new Error("planDmCte requires a data-modifying body");
     }
-    const tdef = this.table(tableName);
+    const tdef = this.lkpTable(tableName); // temp-first (temp-tables.md §3)
     if (tdef === undefined) {
       throw engineError(
         "undefined_table",
@@ -6405,7 +6692,7 @@ export class Database {
           t = ctes[ci]!.table;
           cteIdx = ci;
         } else {
-          const tbl = this.table(tref.name);
+          const tbl = this.lkpTable(tref.name); // temp-first (temp-tables.md §3)
           if (!tbl)
             throw engineError(
               "undefined_table",
@@ -6834,7 +7121,7 @@ export class Database {
     meter: Meter,
     params: Value[],
   ): SelectResult {
-    const store = this.readSnap().store(plan.rels[0]!.tableName);
+    const store = this.lkpStore(plan.rels[0]!.tableName);
 
     // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead block. This path is
     // single-table (gated below), so the only relation is relBounds[0]. A correlated bound resolves
@@ -6905,7 +7192,7 @@ export class Database {
     meter: Meter,
     params: Value[],
   ): SelectResult {
-    const store = this.readSnap().store(plan.rels[0]!.tableName);
+    const store = this.lkpStore(plan.rels[0]!.tableName);
 
     // Resolve the scan bound (the PK pushdown, if any) and charge the pageRead + valueDecompress block
     // up front — identical to the eager scan (cost.md §3). An INDEX bound never reaches here.
@@ -7097,7 +7384,7 @@ export class Database {
     // A base table: scan in primary-key order via a scanSource (the page_read block + per-row
     // storage_row_read accrue inside the generator — cost.md §3). A PK/index bound seeks/ranges
     // instead of a full walk; an empty bound reads nothing.
-    const store = this.readSnap().store(rel.tableName);
+    const store = this.lkpStore(rel.tableName);
     let rows: Row[];
     let nodeCount: number;
     let slabs = 0;
@@ -12763,7 +13050,20 @@ type PrivReq = {
   tables: { name: string; priv: Privilege }[];
   functions: string[];
   isDdl: boolean;
+  // isTempDdl is whether the DDL targets a SESSION-LOCAL temporary table (CREATE TEMP TABLE) — gated
+  // by allowTempDdl instead of allowDdl (spec/design/temp-tables.md §5). (DROP of a temp table joins
+  // this by resolving the name in checkPrivileges; today DROP TABLE alone stays persistent-gated.)
+  isTempDdl: boolean;
 };
+
+// typeUsesComposite reports whether a column type involves a composite type (directly, or as an array
+// element). A temp table with such a column is deferred this slice (spec/design/temp-tables.md §8)
+// because the session temp snapshot carries no composite-type catalog. Range elements are scalar-only.
+function typeUsesComposite(t: Type): boolean {
+  if (t.kind === "composite") return true;
+  if (t.kind === "array") return typeUsesComposite(t.elem);
+  return false;
+}
 
 // collectStmtPrivs collects the privilege requirements of stmt (spec/design/session.md §5.3).
 // Transaction control carries none (handled before dispatch); DDL just sets isDdl.
@@ -12771,6 +13071,10 @@ function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
   const locals = new Set<string>();
   switch (stmt.kind) {
     case "createTable":
+      req.isDdl = true;
+      // A session-local temp table's DDL is gated by allowTempDdl, not allowDdl (temp-tables.md §5).
+      req.isTempDdl = stmt.temp;
+      break;
     case "dropTable":
     case "createIndex":
     case "dropIndex":

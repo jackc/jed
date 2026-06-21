@@ -322,4 +322,10 @@ export class TableStore {
   len(): number {
     return this.rows.size;
   }
+
+  // storedBytes is the total on-disk record bytes this store holds — the deterministic,
+  // cross-core-identical footprint measure the temp-table budget sums (spec/design/temp-tables.md §7).
+  storedBytes(): number {
+    return this.rows.residentRecordBytes();
+  }
 }

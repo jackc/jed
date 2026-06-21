@@ -300,6 +300,23 @@ export class PMap {
     return count(this.root);
   }
 
+  // residentRecordBytes is the total on-disk record bytes stored in this tree — the sum of every
+  // entry's weight over every node (this is a B-tree: records live in interior nodes too, not only
+  // leaves). The deterministic, cross-core-identical measure of a temp table's storage footprint
+  // (spec/design/temp-tables.md §7; weight is the on-disk record_size, byte-identical across cores —
+  // §8). The tree is fully resident for a temp store (temp data never pages), so this never faults; an
+  // OnDisk child contributes 0 (defensive — temp stores have none).
+  residentRecordBytes(): number {
+    const walk = (n: PNode | null): number => {
+      if (n === null) return 0;
+      let here = 0;
+      for (const w of n.weights) here += w;
+      for (const c of n.children) if (c.node !== null) here += walk(c.node);
+      return here;
+    };
+    return walk(this.root);
+  }
+
   // rangeEntries returns the (key, row) pairs whose key lies within the bound, in ascending key order
   // — a bounded in-order traversal that binary-searches each node's child window (the children whose
   // separator span can overlap the bound — childWindow) and in-bound entry window (entryWindow), then

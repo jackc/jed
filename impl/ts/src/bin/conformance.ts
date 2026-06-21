@@ -347,6 +347,27 @@ function parseAllowDdlDirective(line: string): boolean | null {
   return null;
 }
 
+// parseAllowTempDdlDirective parses a `# allow_temp_ddl: on|off` directive line (spec/design/
+// temp-tables.md §5): whether session-local temporary-table DDL is permitted for the next record.
+function parseAllowTempDdlDirective(line: string): boolean | null {
+  const m = line.match(/^#\s*allow_temp_ddl:\s*(\S+)/);
+  if (!m) return null;
+  const v = m[1]!.toLowerCase();
+  if (v === "on" || v === "true" || v === "yes") return true;
+  if (v === "off" || v === "false" || v === "no") return false;
+  return null;
+}
+
+// parseTempBuffersDirective parses a `# temp_buffers: N` directive line (spec/design/temp-tables.md
+// §7): the per-session temp-table storage budget (bytes) to run the next record under (0 ⇒ unlimited).
+// Mirrors `# max_cost:` — per-record, reset after.
+function parseTempBuffersDirective(line: string): number | null {
+  const m = line.match(/^#\s*temp_buffers:\s*(\S+)/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) ? n : null;
+}
+
 // parseSetDirective parses a `# set: name=value, name2=value2` directive line (spec/design/session.md
 // §6.1): the session variables to set for the next record (reset after, like # seed: / # grant:).
 // Each pair splits on the first `=`; names are dotted custom variables.
@@ -485,6 +506,8 @@ function runFile(text: string): void {
   const pendingGrants: PrivDelta[] = [];
   const pendingRevokes: PrivDelta[] = [];
   let pendingAllowDdl: boolean | null = null;
+  let pendingAllowTempDdl: boolean | null = null;
+  let pendingTempBuffers: number | null = null;
   const pendingVars: Array<[string, string]> = [];
   while (c.i < lines.length) {
     const line = lines[c.i]!.trim();
@@ -512,6 +535,8 @@ function runFile(text: string): void {
       const gr = parseGrantDirective(line);
       const rv = parseRevokeDirective(line);
       const ad = parseAllowDdlDirective(line);
+      const atd = parseAllowTempDdlDirective(line);
+      const tb = parseTempBuffersDirective(line);
       const sv = parseSetDirective(line);
       const sd = parseSeedDirective(line);
       const ck = parseClockDirective(line);
@@ -535,6 +560,10 @@ function runFile(text: string): void {
         pendingRevokes.push(rv);
       } else if (ad !== null) {
         pendingAllowDdl = ad;
+      } else if (atd !== null) {
+        pendingAllowTempDdl = atd;
+      } else if (tb !== null) {
+        pendingTempBuffers = tb;
       } else if (sv !== null) {
         pendingVars.push(...sv);
       } else if (sd !== null) {
@@ -598,10 +627,18 @@ function runFile(text: string): void {
     for (const g of pendingGrants) db.grant(g.privs, g.object);
     for (const r of pendingRevokes) db.revoke(r.privs, r.object);
     if (pendingAllowDdl !== null) db.setAllowDdl(pendingAllowDdl);
+    // `# allow_temp_ddl:` overrides the temp-DDL gate (temp-tables.md §5); resetPrivileges above set it
+    // back to permissive, so this decorates only its record.
+    if (pendingAllowTempDdl !== null) db.setAllowTempDdl(pendingAllowTempDdl);
     pendingDefaultPrivileges = null;
     pendingGrants.length = 0;
     pendingRevokes.length = 0;
     pendingAllowDdl = null;
+    pendingAllowTempDdl = null;
+    // Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (0), so a
+    // `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
+    db.setTempBuffers(pendingTempBuffers ?? 0);
+    pendingTempBuffers = null;
     // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
     // pending # set: pair, so a directive decorates only its record and never leaks forward.
     db.resetVars();

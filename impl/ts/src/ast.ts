@@ -272,6 +272,12 @@ export type Assignment = { column: string; value: Expr };
 export type CreateTable = {
   kind: "createTable";
   name: string;
+  // temp is whether `TEMP` / `TEMPORARY` preceded `TABLE` — a SESSION-LOCAL temporary table
+  // (spec/design/temp-tables.md). A temp table makes ZERO writes to the database file (it lives
+  // outside the serialized snapshot), is private to the creating session, and is dropped at session
+  // close. Its DDL is gated by allowTempDdl rather than allowDdl (temp-tables.md §5). The
+  // database-wide SHARED form is a later slice (temp-tables.md §1/§13).
+  temp: boolean;
   columns: ColumnDef[];
   tablePks: string[][];
   // Every `[CONSTRAINT name] CHECK ( expr )` of the statement — column-level and

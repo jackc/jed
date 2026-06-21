@@ -295,6 +295,13 @@ class Parser {
   // resolved there (42703/42701/42P16).
   private parseCreateTable(): Statement {
     this.expectKeyword("create");
+    // An optional table_scope between CREATE and TABLE makes the table TEMPORARY
+    // (spec/design/temp-tables.md, grammar.ebnf `table_scope`). TEMP / TEMPORARY are synonyms and NOT
+    // reserved (§3): recognized positionally here — the word after TABLE is always the table name, so
+    // `CREATE TABLE temp (...)` is an ordinary persistent table named "temp".
+    const temp =
+      this.peekKeyword() === "temp" || this.peekKeyword() === "temporary";
+    if (temp) this.advance();
     this.expectKeyword("table");
     const name = this.expectIdentifier();
     this.expect("lparen");
@@ -332,6 +339,7 @@ class Parser {
     return {
       kind: "createTable",
       name,
+      temp,
       columns,
       tablePks,
       checks,
