@@ -1471,6 +1471,87 @@ export class Database {
     return this.sharedTempSnap().findIndex(name) !== null;
   }
 
+  // sequence resolves a sequence by name along the resolution walk session-local → shared → persistent
+  // (spec/design/sequences.md + temp-tables.md §8). Preclude-overlaps keeps a name in at most one scope
+  // (the shared relation namespace), so this is just "where the sequence lives". Every sequence READ
+  // (nextval/currval/setval resolution, DROP/ALTER SEQUENCE) goes through here, so a serial/IDENTITY
+  // column's OWNED temp sequence resolves exactly like a persistent one.
+  private sequence(name: string): SequenceDef | undefined {
+    return (
+      this.tempSnap().sequence(name) ??
+      this.sharedTempSnap().sequence(name) ??
+      this.readSnap().sequence(name)
+    );
+  }
+
+  // isTempSequence reports whether name is a sequence in the SESSION-LOCAL temp snapshot
+  // (temp-tables.md §8) — the sequence analogue of isTempTable. A temp sequence only ever arises from a
+  // serial/IDENTITY temp column (standalone CREATE SEQUENCE is always persistent), so it is always owned.
+  private isTempSequence(name: string): boolean {
+    return this.tempSnap().sequence(name) !== undefined;
+  }
+
+  // isSharedTempSequence reports whether name is a sequence in the DATABASE-WIDE shared temp snapshot
+  // (temp-tables.md §8) — checked AFTER session-local (the resolution walk).
+  private isSharedTempSequence(name: string): boolean {
+    return this.sharedTempSnap().sequence(name) !== undefined;
+  }
+
+  // putSequenceRouted stages a sequence def into whichever scope currently owns its name (flagging the
+  // matching dirty bit): session-local temp, shared temp, else the main working set. A serial/IDENTITY
+  // temp column's owned sequence advances (nextval flush) into its temp snapshot — like the table's
+  // rows, zero file writes (temp-tables.md §2); a brand-new persistent sequence is absent from both temp
+  // scopes and lands in the main image.
+  private putSequenceRouted(def: SequenceDef): void {
+    if (this.isTempSequence(def.name)) {
+      this.session.tx!.tempDirty = true;
+      this.session.tx!.tempWorking.putSequence(def);
+    } else if (this.isSharedTempSequence(def.name)) {
+      this.session.tx!.sharedTempDirty = true;
+      this.session.tx!.sharedTempWorking.putSequence(def);
+    } else {
+      this.working().putSequence(def);
+    }
+  }
+
+  // removeSequenceRouted removes a sequence from whichever scope owns its name (the routed analogue of
+  // putSequenceRouted). Used by DROP SEQUENCE and DROP TABLE's owned-sequence auto-drop.
+  private removeSequenceRouted(name: string): void {
+    const key = name.toLowerCase();
+    if (this.isTempSequence(name)) {
+      this.session.tx!.tempDirty = true;
+      this.session.tx!.tempWorking.removeSequence(key);
+    } else if (this.isSharedTempSequence(name)) {
+      this.session.tx!.sharedTempDirty = true;
+      this.session.tx!.sharedTempWorking.removeSequence(key);
+    } else {
+      this.working().removeSequence(key);
+    }
+  }
+
+  // setColumnDefaultExprRouted rewrites a column's stored DEFAULT expression in whichever scope owns the
+  // table — the routed analogue used by ALTER SEQUENCE … RENAME of an owned sequence (temp-tables.md §8),
+  // so a renamed owned TEMP sequence's nextval default is rewritten in the temp snapshot.
+  private setColumnDefaultExprRouted(
+    tableKey: string,
+    column: number,
+    de: DefaultExpr,
+  ): void {
+    if (this.isTempTable(tableKey)) {
+      this.session.tx!.tempDirty = true;
+      this.session.tx!.tempWorking.setColumnDefaultExpr(tableKey, column, de);
+    } else if (this.isSharedTempTable(tableKey)) {
+      this.session.tx!.sharedTempDirty = true;
+      this.session.tx!.sharedTempWorking.setColumnDefaultExpr(
+        tableKey,
+        column,
+        de,
+      );
+    } else {
+      this.working().setColumnDefaultExpr(tableKey, column, de);
+    }
+  }
+
   // lkpTable resolves a table by name along the resolution walk session-local → shared → persistent
   // (temp-tables.md §3). Preclude-overlaps keeps a name in at most one scope, so this is just "where it lives".
   private lkpTable(name: string): Table | undefined {
@@ -1552,7 +1633,7 @@ export class Database {
     const key = name.toLowerCase();
     let def = this.session.pendingSeq.get(key);
     if (def === undefined) {
-      const committed = this.readSnap().sequence(name);
+      const committed = this.sequence(name);
       if (committed === undefined) {
         throw engineError(
           "undefined_table",
@@ -1605,7 +1686,7 @@ export class Database {
     const key = name.toLowerCase();
     let def = this.session.pendingSeq.get(key);
     if (def === undefined) {
-      const committed = this.readSnap().sequence(name);
+      const committed = this.sequence(name);
       if (committed === undefined) {
         throw engineError(
           "undefined_table",
@@ -1660,7 +1741,7 @@ export class Database {
   // (42P01 if absent), then reads the running update this statement (pendingCurrval) else the session
   // value (sessionSeq); 55000 if it has not been defined this session.
   seqCurrval(name: string): bigint {
-    if (this.readSnap().sequence(name) === undefined) {
+    if (this.sequence(name) === undefined) {
       throw engineError("undefined_table", `relation does not exist: ${name}`);
     }
     const key = name.toLowerCase();
@@ -1682,7 +1763,9 @@ export class Database {
   // rollback of the advance (sequences.md §5).
   private flushPendingSequences(): void {
     for (const def of this.session.pendingSeq.values()) {
-      this.working().putSequence(def);
+      // Route each advance to its owning scope (temp-tables.md §8): a serial/IDENTITY temp column's
+      // owned sequence flushes into its temp snapshot (zero file writes), a persistent one into main.
+      this.putSequenceRouted(def);
     }
     for (const [key, v] of this.session.pendingCurrval) {
       this.session.sessionSeq.set(key, v);
@@ -2225,14 +2308,20 @@ export class Database {
         req.isSharedTempDdl ||
         (stmt.kind === "dropTable" && this.isSharedTempTable(stmt.name)) ||
         (stmt.kind === "createIndex" && this.isSharedTempTable(stmt.table)) ||
-        (stmt.kind === "dropIndex" && this.isSharedTempIndex(stmt.name))
+        (stmt.kind === "dropIndex" && this.isSharedTempIndex(stmt.name)) ||
+        (stmt.kind === "dropSequence" &&
+          stmt.names.some((n) => this.isSharedTempSequence(n))) ||
+        (stmt.kind === "alterSequence" && this.isSharedTempSequence(stmt.name))
       ) {
         allowed = this.session.allowSharedTempDdl;
       } else if (
         req.isTempDdl ||
         (stmt.kind === "dropTable" && this.isTempTable(stmt.name)) ||
         (stmt.kind === "createIndex" && this.isTempTable(stmt.table)) ||
-        (stmt.kind === "dropIndex" && this.isTempIndex(stmt.name))
+        (stmt.kind === "dropIndex" && this.isTempIndex(stmt.name)) ||
+        (stmt.kind === "dropSequence" &&
+          stmt.names.some((n) => this.isTempSequence(n))) ||
+        (stmt.kind === "alterSequence" && this.isTempSequence(stmt.name))
       ) {
         allowed = this.session.allowTempDdl;
       } else {
@@ -3094,16 +3183,10 @@ export class Database {
 
     if (ct.temp) {
       // Deferred narrowings on a temp table this slice (spec/design/temp-tables.md §8), each a clean
-      // 0A000: a serial/IDENTITY column (needs a temp OWNED sequence), a composite-typed column (needs
-      // the temp snapshot to carry the type catalog), and a collated column (needs the collation
-      // catalog). Plain scalar/array/range/decimal columns with PK / NOT NULL / DEFAULT / CHECK /
-      // UNIQUE are fully supported. With these out, the temp snapshot needs no types/collations catalog.
-      if (pendingSerials.length > 0) {
-        throw engineError(
-          "feature_not_supported",
-          "serial / IDENTITY column on a temporary table is not yet supported",
-        );
-      }
+      // 0A000: a composite-typed column (needs the temp snapshot to carry the type catalog) and a
+      // collated column (needs the collation catalog). Plain scalar/array/range/decimal columns with
+      // PK / NOT NULL / DEFAULT / CHECK / UNIQUE — and now serial/IDENTITY columns, whose OWNED
+      // sequence is staged into the same temp snapshot below — are fully supported.
       for (const c of table.columns) {
         if (typeUsesComposite(c.type)) {
           throw engineError(
@@ -3137,6 +3220,12 @@ export class Database {
           new TableStore(this.pageSize - 12, []), // 12 = PAGE_HEADER
         );
       }
+      // Stage each serial/IDENTITY column's OWNED sequence into the SAME temp snapshot
+      // (spec/design/sequences.md §12, temp-tables.md §8) — never the main image, so the sequence
+      // (like the table) makes zero file writes and is dropped with the table. The names were resolved
+      // collision-free during the column walk (relationExists is temp-aware); nextval resolves and
+      // advances them via the scope-aware sequence funnel.
+      for (const s of pendingSerials) ts.putSequence(s);
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
 
@@ -3251,16 +3340,22 @@ export class Database {
   private executeDropTable(dt: DropTable): Outcome {
     // A temp table (spec/design/temp-tables.md): remove it from the matching temp snapshot — never the
     // main image, so DROP makes zero file writes. No FK-dependent check (a temp table is never an FK
-    // parent, §8) and no owned-sequence sweep (serial on temp is deferred, §8). The temp-DDL capability
-    // gate already ran at dispatch (§5). Session-local first, then shared.
+    // parent, §8), but it DOES auto-drop every sequence OWNED BY the table — a serial/IDENTITY temp
+    // column's owned temp sequence (spec/design/sequences.md §12, temp-tables.md §8) — from the SAME
+    // temp snapshot. The temp-DDL capability gate already ran at dispatch (§5). Session-local first,
+    // then shared.
     if (this.isTempTable(dt.name)) {
       this.session.tx!.tempDirty = true;
-      this.tempSnap().removeTable(dt.name.toLowerCase());
+      const ts = this.tempSnap();
+      for (const sk of ts.sequencesOwnedBy(dt.name)) ts.removeSequence(sk);
+      ts.removeTable(dt.name.toLowerCase());
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
     if (this.isSharedTempTable(dt.name)) {
       this.session.tx!.sharedTempDirty = true;
-      this.sharedTempSnap().removeTable(dt.name.toLowerCase());
+      const ts = this.sharedTempSnap();
+      for (const sk of ts.sequencesOwnedBy(dt.name)) ts.removeSequence(sk);
+      ts.removeTable(dt.name.toLowerCase());
       return { kind: "statement", cost: 0n, rowsAffected: null };
     }
     if (!this.table(dt.name)) {
@@ -3314,7 +3409,9 @@ export class Database {
       this.findIndex(name) !== null ||
       this.tempSnap().findIndex(name) !== null ||
       this.sharedTempSnap().findIndex(name) !== null ||
-      this.readSnap().sequence(name) !== undefined
+      // The sequence funnel walks session-local → shared → persistent, so an owned TEMP sequence's
+      // name joins the namespace (temp-tables.md §8) — a collision with it is 42P07 too.
+      this.sequence(name) !== undefined
     );
   }
 
@@ -3750,7 +3847,7 @@ export class Database {
       // Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
       // column's default — so RESTRICT (the only mode this slice; CASCADE 0A000) is 2BP01
       // (spec/design/sequences.md §12).
-      const seq = this.readSnap().sequence(name);
+      const seq = this.sequence(name);
       if (seq === undefined) {
         if (ds.ifExists) continue;
         throw engineError(
@@ -3760,9 +3857,10 @@ export class Database {
       }
       if (seq.ownedBy !== undefined) {
         // The owning table is always present (its own DROP TABLE would auto-drop this sequence
-        // first), so the column name for the detail resolves.
+        // first), so the column name for the detail resolves. The scope-aware lkpTable finds an
+        // owned TEMP sequence's temp owner (temp-tables.md §8).
         const owner = seq.ownedBy;
-        const t = this.readSnap().table(owner.table);
+        const t = this.lkpTable(owner.table);
         const tableName = t?.name ?? owner.table;
         const colName = t?.columns[owner.column]?.name ?? "";
         throw engineError(
@@ -3770,7 +3868,9 @@ export class Database {
           `cannot drop sequence ${seq.name} because other objects depend on it: default value for column ${colName} of table ${tableName} depends on sequence ${seq.name}`,
         );
       }
-      this.working().removeSequence(name.toLowerCase());
+      // Not owned: remove from whichever scope owns it (a temp sequence is always owned, so this
+      // routed path is reached only for a plain persistent sequence — temp-tables.md §8).
+      this.removeSequenceRouted(name);
     }
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
@@ -3781,7 +3881,7 @@ export class Database {
   // change, the counter preserved unless RESTART); RENAME TO moves the catalog key. Touches no
   // session state (currval/lastval unchanged). A catalog write (the write path, transactional, §5).
   private executeAlterSequence(as: AlterSequence): Outcome {
-    const committed = this.readSnap().sequence(as.name);
+    const committed = this.sequence(as.name);
     if (committed === undefined) {
       if (as.ifExists)
         return { kind: "statement", cost: 0n, rowsAffected: null };
@@ -3806,7 +3906,7 @@ export class Database {
         as.action.options,
         as.action.restart,
       );
-      this.working().putSequence(newDef);
+      this.putSequenceRouted(newDef);
     }
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
@@ -3825,7 +3925,9 @@ export class Database {
     }
     if (existing.ownedBy !== undefined) {
       const exprText = `nextval ( '${newName.toLowerCase().replace(/'/g, "''")}' )`;
-      this.working().setColumnDefaultExpr(
+      // Route to the owner's scope so a renamed owned TEMP sequence rewrites its column default in the
+      // temp snapshot (temp-tables.md §8).
+      this.setColumnDefaultExprRouted(
         existing.ownedBy.table.toLowerCase(),
         existing.ownedBy.column,
         {
@@ -3834,8 +3936,20 @@ export class Database {
         },
       );
     }
-    this.working().removeSequence(existing.name.toLowerCase());
-    this.working().putSequence({ ...existing, name: newName });
+    // Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
+    // scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
+    let w: Snapshot;
+    if (this.isTempSequence(existing.name)) {
+      this.session.tx!.tempDirty = true;
+      w = this.session.tx!.tempWorking;
+    } else if (this.isSharedTempSequence(existing.name)) {
+      this.session.tx!.sharedTempDirty = true;
+      w = this.session.tx!.sharedTempWorking;
+    } else {
+      w = this.working();
+    }
+    w.removeSequence(existing.name.toLowerCase());
+    w.putSequence({ ...existing, name: newName });
   }
 
   // indexBoundRows executes an index equality bound (cost.md §3 "index-bounded scan"):

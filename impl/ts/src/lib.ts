@@ -27,9 +27,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // CREATE [TEMP|TEMPORARY] TABLE + DROP — session-local temporary tables that make zero writes to the
   // database file (held in a per-session temp snapshot outside the serialized catalog, no
   // format_version change). Full CRUD + PK/UNIQUE/CHECK/NOT NULL/DEFAULT, dropped at session close,
-  // preclude-overlaps (42P07), and standalone CREATE INDEX / DROP INDEX (the index in the temp
-  // snapshot, gated by the same allow_temp_ddl). Composite/collated columns, serial/IDENTITY, and FK
-  // on a temp table are deferred 0A000 (spec/design/temp-tables.md §8). Gate
+  // preclude-overlaps (42P07), standalone CREATE INDEX / DROP INDEX (the index in the temp snapshot,
+  // gated by the same allow_temp_ddl), and serial/IDENTITY columns (the OWNED sequence lives in the
+  // temp snapshot — zero file writes — and is auto-dropped with the table). Composite/collated columns
+  // and FK on a temp table are deferred 0A000 (spec/design/temp-tables.md §8). Gate
   // session.allow_temp_ddl; storage budget resource.temp_budget.
   "ddl.temp_table",
   // CREATE SHARED [TEMP|TEMPORARY] TABLE — database-wide shared temporary tables (visible to every

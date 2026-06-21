@@ -109,8 +109,25 @@ lives in the same in-memory temp snapshot, so it makes no writes to the file, is
 speed up queries, and is dropped with its table. Its DDL is gated by the same `allow_temp_ddl` /
 `allow_shared_temp_ddl` capability as the table.
 
+## Auto-numbered columns
+
+`serial` / `bigserial` / `smallserial` and `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` columns
+work on a temp table too (both session-local and shared), exactly as on a persistent table:
+
+```sql
+CREATE TEMP TABLE log (id bigserial PRIMARY KEY, msg text NOT NULL);
+INSERT INTO log (msg) VALUES ('first'), ('second');   -- id auto-numbers 1, 2
+```
+
+The auto-created backing sequence lives in the **same in-memory temp snapshot**, so — like the temp
+table's rows and indexes — it makes **zero writes to the file**, and it is dropped automatically when
+the table is (`DROP TABLE` removes both). It is reachable by its derived name (`nextval('log_id_seq')`,
+`currval`, `setval`), shares the relation namespace (a name collision is `42P07`), and — on a `SHARED`
+temp table — its counter is shared across sessions, so auto-numbering continues from where another
+session left off. Its DDL is gated by the same `allow_temp_ddl` / `allow_shared_temp_ddl` capability.
+
 ## Not yet supported on a temp table
 
-This first release keeps a few things off temp tables (both session-local and shared — each reported
-as `0A000`, *feature not supported*), to be lifted in later releases: `FOREIGN KEY` constraints,
-`serial` / `GENERATED AS IDENTITY` columns, and composite-typed and `COLLATE` columns.
+This release keeps a few things off temp tables (both session-local and shared — each reported as
+`0A000`, *feature not supported*), to be lifted in later releases: `FOREIGN KEY` constraints, and
+composite-typed and `COLLATE` columns.
