@@ -34,6 +34,12 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   with a name+hash **reference mode** opt-out, and an optional **provenance description**; the
   per-database default collation, sort-key key encoding, deterministic-vs-nondeterministic
   collations, and the slice plan.
+- [compatibility.md](compatibility.md) — compatibility & versioning (**UNRATIFIED PROPOSAL**, not a
+  spec — forward-looking):
+  the legible graded-open verdict (full / reduced-read-only / refused-with-a-reason), the in-file
+  requirements manifest, read-vs-write dependency tagging, the heap-scan read-degradation, and the
+  unification of collation skew + function drift; the model views / functional indexes / generated
+  columns / host functions register into (CLAUDE.md §13).
 - [storage.md](storage.md) — the storage seam: block interface, page model, and the
   root-pointer-swap commit model (CLAUDE.md §3/§9).
 - [hosts.md](hosts.md) — the formal storage-host (`BlockStore`) interface: the five-method

@@ -532,6 +532,15 @@ This inverts PostgreSQL's posture: PG's default path is "the OS/library moved, y
 corrupt, here is a `collversion` warning"; jed's default (baked) path is "nothing moved, the
 file carries its own order," and the version move is the rare, deliberate act.
 
+Collation version skew is one instance of a **general** problem — stored bytes produced by a
+versioned computation (a collation, a built-in function in a `DEFAULT`/functional index/generated
+column, a stored view). An **unratified proposal** ([compatibility.md](compatibility.md) — a sketch,
+not a spec) explores a cross-cutting model that would generalize this section: a per-file
+Unicode-version pin, a requirements manifest, and a graded **read-only heap-scan degradation** as a
+possible softening of the reference-mode hard-fail above. **Nothing there is decided**; the settled
+behavior is the baked/reference-mode model described in this section, and the on-disk policy remains
+clean-break exact-version ([../fileformat/format.md](../fileformat/format.md)).
+
 ## 13. Sizes
 
 The footprint that shaped §2/§3 (orders of magnitude):
