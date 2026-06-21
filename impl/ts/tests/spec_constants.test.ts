@@ -119,6 +119,7 @@ test("error codes are registered in spec/errors/registry.toml", () => {
     "duplicate_column",
     "invalid_table_definition",
     "indeterminate_datatype",
+    "invalid_recursion",
     "feature_not_supported",
     "statement_too_complex",
     "cost_limit_exceeded",

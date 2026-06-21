@@ -697,11 +697,15 @@ export type Cte = {
 // WithQuery is a top-level query prefixed by a WITH clause (spec/design/cte.md). `ctes` is the
 // non-empty list of common table expressions (each visible to later CTEs and to `body`); `body` is
 // the main query expression. Built only when a WITH is present — a plain query stays `Select`/
-// `SetOp`, so those paths are untouched (the SetOp precedent).
+// `SetOp`, so those paths are untouched (the SetOp precedent). `recursive` is the WITH RECURSIVE
+// flag (spec/design/recursive-cte.md): a flag on the whole list that ENABLES a CTE to reference
+// itself (lifting the forward-only 42P01); a CTE that does not reference itself is still an ordinary
+// non-recursive CTE.
 export type WithQuery = {
   kind: "with";
   ctes: Cte[];
   body: QueryExpr;
+  recursive: boolean;
 };
 
 // Statement is a parsed top-level statement. A lone SELECT stays `Select`; `SetOp` appears only

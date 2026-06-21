@@ -5446,6 +5446,11 @@ export class Database {
   private runWith(wq: WithQuery, params: Value[]): SelectResult {
     const ptypes = new ParamTypes();
     // (1) Plan each CTE body against the already-built prefix; build its synthetic relation.
+    //     Under WITH RECURSIVE (recursive-cte.md), a CTE that references its own name is RECURSIVE:
+    //     its binding is pushed BEFORE planning the recursive term, so the self-reference resolves to
+    //     it; the binding's `plan` is then the non-recursive (anchor) term and `recursive` carries
+    //     the recursive term. A non-self-referencing CTE (or any CTE in a non-RECURSIVE list) plans
+    //     as before — its name is NOT yet in scope for its own body (cte.md §2).
     const bindings: CteBinding[] = [];
     for (const cte of wq.ctes) {
       const lname = cte.name.toLowerCase();
@@ -5455,12 +5460,35 @@ export class Database {
           `WITH query name ${lname} specified more than once`,
         );
       }
+      const shape = wq.recursive
+        ? analyzeRecursiveCte(lname, cte.query)
+        : { recursive: false as const, unionAll: false };
+      if (shape.recursive) {
+        // The body is `anchor UNION[ALL] recursive_term` (analyzeRecursiveCte verified).
+        const so = cte.query as SetOp;
+        const anchorPlan = this.planQuery(so.lhs, null, bindings, ptypes);
+        const table = cteSyntheticTable(lname, anchorPlan, cte.columns);
+        bindings.push({
+          name: lname,
+          table,
+          plan: anchorPlan,
+          recursive: null,
+          hint: cte.materialized,
+          refs: 0,
+        });
+        const bi = bindings.length - 1;
+        const rhsPlan = this.planQuery(so.rhs, null, bindings, ptypes);
+        checkRecursiveColumnTypes(bindings[bi]!.plan, rhsPlan, lname);
+        bindings[bi]!.recursive = { plan: rhsPlan, unionAll: shape.unionAll };
+        continue;
+      }
       const plan = this.planQuery(cte.query, null, bindings, ptypes);
       const table = cteSyntheticTable(lname, plan, cte.columns);
       bindings.push({
         name: lname,
         table,
         plan,
+        recursive: null,
         hint: cte.materialized,
         refs: 0,
       });
@@ -5469,21 +5497,31 @@ export class Database {
     const plan = this.planQuery(wq.body, null, bindings, ptypes);
     const bound = bindParams(params, ptypes.finalize());
 
-    // (3) Per-CTE evaluation mode: MATERIALIZED hint or >=2 references -> materialize, else inline
-    //     (cost.md §3). An unreferenced CTE is planned (errors surfaced) but not run.
+    // (3) Per-CTE evaluation mode: a RECURSIVE CTE is ALWAYS materialized (the working-table method
+    //     requires it; [NOT] MATERIALIZED is inert — recursive-cte.md §1). Otherwise a MATERIALIZED
+    //     hint or >=2 references -> materialize, else inline (cost.md §3). An unreferenced
+    //     non-recursive CTE is planned (errors surfaced) but not run.
     const modes: CteMode[] = bindings.map((b) => {
+      if (b.recursive !== null) return "materialize";
       if (b.hint === true) return "materialize";
       if (b.hint === false) return "inline";
       return b.refs >= 2 ? "materialize" : "inline";
     });
     const plans: QueryPlan[] = bindings.map((b) => b.plan);
+    const recursives: (RecursiveTerm | null)[] = bindings.map((b) => b.recursive);
 
-    // (4) Materialize each referenced materialized CTE once, in list order, accruing cost. A later
-    //     body's inline/materialized reference to an earlier CTE sees the prefix context.
-    let totalCost = 0n;
+    // (4) Materialize each CTE once, in list order, accruing cost; a later body sees the earlier
+    //     buffers. A RECURSIVE CTE iterates to a fixpoint (its self-reference reads the working
+    //     table); the per-statement cost ceiling (54P01) bounds it — recursive-cte.md §5.
+    const totalCost = { value: 0n };
     const buffers: Row[][] = [];
     for (let i = 0; i < plans.length; i++) {
-      if (modes[i] === "materialize") {
+      const rt = recursives[i];
+      if (rt) {
+        buffers.push(
+          this.materializeRecursive(i, plans[i]!, rt, modes, plans, buffers, bound, totalCost),
+        );
+      } else if (modes[i] === "materialize") {
         // Earlier-only context (the prefix): a CTE body sees EARLIER CTEs, never itself or a later
         // one (forward-only visibility — cte.md §2).
         const ctx: CteCtx = {
@@ -5492,7 +5530,7 @@ export class Database {
           buffers,
         };
         const r = this.execQueryPlan(plans[i]!, [], bound, ctx);
-        totalCost += r.cost;
+        totalCost.value += r.cost;
         buffers.push(r.rows);
       } else {
         buffers.push([]);
@@ -5504,7 +5542,89 @@ export class Database {
     const subqueryCost = { value: 0n };
     this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
     const r = this.execQueryPlan(plan, [], bound, ctx);
-    return { ...r, cost: r.cost + subqueryCost.value + totalCost };
+    return { ...r, cost: r.cost + subqueryCost.value + totalCost.value };
+  }
+
+  // materializeRecursive materializes a RECURSIVE CTE by iterating to a fixpoint — the PostgreSQL
+  // working-table method (spec/design/recursive-cte.md §4). anchorPlan is the non-recursive term; rt
+  // the recursive term (which references this CTE, index ci). priorBuffers are the earlier CTEs'
+  // materialized rows (visible to both terms). totalCost accrues every term evaluation's cost and
+  // gates the per-statement ceiling between iterations, so a non-terminating recursion of cheap
+  // iterations still aborts 54P01 at the identical accrued cost in every core (recursive-cte.md §5).
+  private materializeRecursive(
+    ci: number,
+    anchorPlan: QueryPlan,
+    rt: RecursiveTerm,
+    modes: CteMode[],
+    plans: QueryPlan[],
+    priorBuffers: Row[][],
+    params: Value[],
+    totalCost: { value: bigint },
+  ): Row[] {
+    const maxCost = this.session.maxCost;
+    const guard = (total: bigint): void => {
+      if (maxCost > 0n && total >= maxCost) {
+        throw engineError(
+          "cost_limit_exceeded",
+          `query exceeded the cost limit of ${maxCost} (accrued ${total})`,
+        );
+      }
+    };
+    const anchorTypes = anchorPlan.columnTypes;
+    const rhsTypes = rt.plan.columnTypes;
+
+    // Evaluate the anchor: its rows seed both the result and the first working table.
+    const ar = this.execQueryPlan(anchorPlan, [], params, {
+      modes: modes.slice(0, ci),
+      plans: plans.slice(0, ci),
+      buffers: priorBuffers,
+    });
+    totalCost.value += ar.cost;
+    guard(totalCost.value);
+
+    // For UNION (distinct) a seen set drops rows duplicating any already-emitted row, keyed by the
+    // NULL-safe distinctRowKey the set operators use.
+    const seen = new Set<string>();
+    const keep = (row: Row): boolean => {
+      if (rt.unionAll) return true;
+      const k = distinctRowKey(row);
+      if (seen.has(k)) return false;
+      seen.add(k);
+      return true;
+    };
+    const result: Row[] = [];
+    let working: Row[] = [];
+    for (const row of ar.rows) {
+      if (keep(row)) {
+        result.push(row);
+        working.push(row);
+      }
+    }
+
+    // The recursive term scans the WORKING table through the CTE's own buffer slot (ci); the earlier
+    // CTEs keep their full buffers. Build the buffer array once and swap slot ci per iteration.
+    const rhsBuffers: Row[][] = priorBuffers.slice(0, ci);
+    rhsBuffers.push([]); // slot ci
+
+    while (working.length > 0) {
+      rhsBuffers[ci] = working;
+      working = [];
+      const rr = this.execQueryPlan(rt.plan, [], params, {
+        modes: modes.slice(0, ci + 1),
+        plans: plans.slice(0, ci + 1),
+        buffers: rhsBuffers,
+      });
+      totalCost.value += rr.cost;
+      guard(totalCost.value);
+      coerceSetopRows(rr.rows, rhsTypes, anchorTypes);
+      for (const row of rr.rows) {
+        if (keep(row)) {
+          result.push(row);
+          working.push(row);
+        }
+      }
+    }
+    return result;
   }
 
   // planQuery resolves a query expression into an owned QueryPlan against the scope chain (parent =
@@ -9175,10 +9295,16 @@ type CteMode = "inline" | "materialize";
 // body's output columns; `plan` is the planned body; `hint` is the [NOT] MATERIALIZED override
 // (true/false/null); `refs` counts the FROM references resolved to it during planning (the
 // inline-vs-materialize decision — cost.md §3).
+// For a RECURSIVE CTE (spec/design/recursive-cte.md) `plan` holds the non-recursive (anchor) term
+// (its column types fix the synthetic relation's) and `recursive` carries the recursive term + the
+// UNION ALL flag; the binding is in scope inside its own recursive term, so the self-reference
+// resolves to it.
+type RecursiveTerm = { plan: QueryPlan; unionAll: boolean };
 type CteBinding = {
   name: string;
   table: Table;
   plan: QueryPlan;
+  recursive: RecursiveTerm | null;
   hint: boolean | null;
   refs: number;
 };
@@ -11166,6 +11292,318 @@ function resolvedRangeElementScalar(
       return "date";
     default:
       return undefined;
+  }
+}
+
+// === WITH RECURSIVE analysis (spec/design/recursive-cte.md) ==========================
+//
+// A WITH RECURSIVE CTE is recursive iff its body references its own name (anywhere, deep). A
+// recursive CTE must take the well-formed shape `non_recursive_term UNION [ALL] recursive_term`
+// with the self-reference appearing exactly once, as a direct FROM/JOIN relation of the recursive
+// term. These structural checks mirror PostgreSQL's checkWellFormedRecursion, run on the parsed AST
+// before planning; the error surface is recursive-cte.md §6. The `name` argument is already
+// lowercased (the CTE's lname).
+
+// analyzeRecursiveCte classifies a CTE body for WITH RECURSIVE (recursive-cte.md §6). It returns
+// { recursive: false } when the body does not reference name (an ordinary CTE, even under
+// RECURSIVE); otherwise it validates the recursive shape and returns { recursive: true, unionAll },
+// or throws (42P19 for a malformed recursion, 0A000 for a deferred shape).
+function analyzeRecursiveCte(
+  name: string,
+  body: QueryExpr,
+): { recursive: boolean; unionAll: boolean } {
+  if (countSelfRefsQuery(body, name) === 0) {
+    return { recursive: false, unionAll: false };
+  }
+  if (body.kind !== "setOp" || body.op !== "union") {
+    throw engineError(
+      "invalid_recursion",
+      `recursive query "${name}" does not have the form non-recursive-term UNION [ALL] recursive-term`,
+    );
+  }
+  if (body.orderBy.length > 0) {
+    throw engineError(
+      "feature_not_supported",
+      "ORDER BY in a recursive query is not implemented",
+    );
+  }
+  if (body.limit !== null || body.offset !== null) {
+    throw engineError(
+      "feature_not_supported",
+      "LIMIT in a recursive query is not implemented",
+    );
+  }
+  if (countSelfRefsQuery(body.lhs, name) > 0) {
+    throw engineError(
+      "invalid_recursion",
+      `recursive reference to query "${name}" must not appear within its non-recursive term`,
+    );
+  }
+  if (body.rhs.kind !== "select") {
+    throw engineError(
+      "feature_not_supported",
+      "a set operation in the recursive term of a recursive query is not supported yet",
+    );
+  }
+  validateRecursiveTerm(name, body.rhs);
+  return { recursive: true, unionAll: body.all };
+}
+
+// validateRecursiveTerm validates the recursive term (the UNION's right SELECT) of a recursive CTE
+// (recursive-cte.md §6). The self-reference must appear exactly once, as a direct FROM/JOIN
+// relation, not on the nullable side of an outer join; the term must contain no aggregate. The
+// checks fire in PostgreSQL's order — a self-reference in a bad CONTEXT (a sublink, an outer join)
+// is reported as that context even when a valid FROM reference also exists.
+function validateRecursiveTerm(name: string, sel: Select): void {
+  if (countSublinkSelfRefs(sel, name) >= 1) {
+    throw engineError(
+      "invalid_recursion",
+      `recursive reference to query "${name}" must not appear within a subquery`,
+    );
+  }
+  if (countFromSubquerySelfRefs(sel, name) >= 1) {
+    throw engineError(
+      "feature_not_supported",
+      `recursive reference to query "${name}" inside a FROM subquery is not supported yet`,
+    );
+  }
+  const direct = countDirectFromSelfRefs(sel, name);
+  if (direct > 1) {
+    throw engineError(
+      "invalid_recursion",
+      `recursive reference to query "${name}" must not appear more than once`,
+    );
+  }
+  if (
+    itemsHaveAggregate(sel.items) ||
+    (sel.having !== null && exprHasAggregate(sel.having))
+  ) {
+    throw engineError(
+      "invalid_recursion",
+      "aggregate functions are not allowed in a recursive query's recursive term",
+    );
+  }
+  if (direct === 1 && directSelfRefOnNullableSide(sel, name)) {
+    throw engineError(
+      "invalid_recursion",
+      `recursive reference to query "${name}" must not appear within an outer join`,
+    );
+  }
+}
+
+// countSelfRefsQuery counts self-references to name anywhere in a query expression (deep — FROM
+// relations at every nesting level plus expression sublinks).
+function countSelfRefsQuery(qe: QueryExpr, name: string): number {
+  if (qe.kind === "select") return countSelfRefsSelect(qe, name);
+  return countSelfRefsQuery(qe.lhs, name) + countSelfRefsQuery(qe.rhs, name);
+}
+
+// countSelfRefsSelect counts self-references in a SELECT: its FROM relations (deep) plus all of its
+// expressions' sublinks.
+function countSelfRefsSelect(s: Select, name: string): number {
+  let n = 0;
+  for (const tref of fromRelations(s)) n += countSelfRefsTableref(tref, name);
+  for (const e of selectExprs(s)) n += countSelfRefsExpr(e, name);
+  return n;
+}
+
+// countSelfRefsTableref counts self-references reachable through one FROM relation: a plain table
+// reference with the matching name (+1), a derived-table subquery (recurse), or a table-function's
+// / VALUES' argument exprs.
+function countSelfRefsTableref(tref: TableRef, name: string): number {
+  if (isPlainRelation(tref)) return tref.name.toLowerCase() === name ? 1 : 0;
+  let n = 0;
+  if (tref.subquery !== undefined) n += countSelfRefsQuery(tref.subquery, name);
+  if (tref.args !== null && tref.args !== undefined) {
+    for (const a of tref.args) n += countSelfRefsExpr(a, name);
+  }
+  if (tref.values !== undefined) {
+    for (const row of tref.values) for (const e of row) n += countSelfRefsExpr(e, name);
+  }
+  return n;
+}
+
+// countSelfRefsExpr counts self-references inside an expression — only reachable through a sublink
+// (a subquery is an independent query whose own FROM may reference the CTE). The walk is exhaustive
+// (like exprHasAggregate).
+function countSelfRefsExpr(e: Expr, name: string): number {
+  switch (e.kind) {
+    case "scalarSubquery":
+    case "exists":
+      return countSelfRefsQuery(e.query, name);
+    case "inSubquery":
+    case "quantifiedSubquery":
+      return countSelfRefsExpr(e.lhs, name) + countSelfRefsQuery(e.query, name);
+    case "cast":
+    case "collate":
+      return countSelfRefsExpr(e.inner, name);
+    case "unary":
+    case "isNull":
+      return countSelfRefsExpr(e.operand, name);
+    case "binary":
+    case "isDistinct":
+    case "like":
+      return countSelfRefsExpr(e.lhs, name) + countSelfRefsExpr(e.rhs, name);
+    case "in":
+      return (
+        countSelfRefsExpr(e.lhs, name) +
+        e.list.reduce((a, x) => a + countSelfRefsExpr(x, name), 0)
+      );
+    case "between":
+      return (
+        countSelfRefsExpr(e.lhs, name) +
+        countSelfRefsExpr(e.lo, name) +
+        countSelfRefsExpr(e.hi, name)
+      );
+    case "case":
+      return (
+        (e.operand !== null ? countSelfRefsExpr(e.operand, name) : 0) +
+        e.whens.reduce(
+          (a, w) =>
+            a + countSelfRefsExpr(w.cond, name) + countSelfRefsExpr(w.result, name),
+          0,
+        ) +
+        (e.els !== null ? countSelfRefsExpr(e.els, name) : 0)
+      );
+    case "funcCall":
+      return e.args.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
+    case "row":
+      return e.fields.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
+    case "array":
+      return e.elements.reduce((a, x) => a + countSelfRefsExpr(x, name), 0);
+    case "fieldAccess":
+    case "fieldStar":
+      return countSelfRefsExpr(e.base, name);
+    case "subscript":
+      return (
+        countSelfRefsExpr(e.base, name) +
+        astSubscriptExprs(e.subscripts).reduce(
+          (a, x) => a + countSelfRefsExpr(x, name),
+          0,
+        )
+      );
+    case "quantified":
+      return countSelfRefsExpr(e.lhs, name) + countSelfRefsExpr(e.array, name);
+    default:
+      return 0;
+  }
+}
+
+// countDirectFromSelfRefs counts self-references that are DIRECT FROM/JOIN relations of this SELECT
+// (a plain table ref matching the name). This is the only valid position for a recursive reference.
+function countDirectFromSelfRefs(s: Select, name: string): number {
+  let n = 0;
+  for (const tref of fromRelations(s)) {
+    if (isPlainRelation(tref) && tref.name.toLowerCase() === name) n++;
+  }
+  return n;
+}
+
+// countFromSubquerySelfRefs counts self-references nested inside a FROM-position subquery /
+// table-function args / VALUES of this SELECT (the deferred 0A000 shape).
+function countFromSubquerySelfRefs(s: Select, name: string): number {
+  let n = 0;
+  for (const tref of fromRelations(s)) {
+    if (!isPlainRelation(tref)) n += countSelfRefsTableref(tref, name);
+  }
+  return n;
+}
+
+// countSublinkSelfRefs counts self-references reachable only through an expression sublink in this
+// SELECT's top-level expressions — the `within a subquery` position.
+function countSublinkSelfRefs(s: Select, name: string): number {
+  let n = 0;
+  for (const e of selectExprs(s)) n += countSelfRefsExpr(e, name);
+  return n;
+}
+
+// directSelfRefOnNullableSide reports whether the SELECT's single direct self-reference sits on the
+// NULLABLE side of an outer join — the position PostgreSQL rejects. The FROM is a left-deep chain:
+// relation 0 is `from`, relation i+1 is joins[i].table, combined by joins[i].kind. A LEFT/FULL join
+// makes its right operand nullable; a RIGHT/FULL join makes the whole accumulated left nullable.
+function directSelfRefOnNullableSide(s: Select, name: string): boolean {
+  const rels = fromRelations(s);
+  const nullable = new Array<boolean>(rels.length).fill(false);
+  for (let j = 0; j < s.joins.length; j++) {
+    const right = j + 1;
+    switch (s.joins[j]!.kind) {
+      case "left":
+        nullable[right] = true;
+        break;
+      case "right":
+        for (let i = 0; i <= j; i++) nullable[i] = true;
+        break;
+      case "full":
+        for (let i = 0; i <= right; i++) nullable[i] = true;
+        break;
+      default:
+        break;
+    }
+  }
+  return rels.some(
+    (tref, i) =>
+      isPlainRelation(tref) && tref.name.toLowerCase() === name && nullable[i]!,
+  );
+}
+
+// isPlainRelation reports whether a FROM relation is a plain table NAME — not a derived-table
+// subquery, a table function, or a VALUES body. Only a plain relation can resolve to a CTE.
+function isPlainRelation(tref: TableRef): boolean {
+  return (
+    (tref.args === null || tref.args === undefined) &&
+    tref.subquery === undefined &&
+    tref.values === undefined
+  );
+}
+
+// fromRelations returns the FROM relations of a SELECT in left-deep order: from (if present) then
+// each join's table.
+function fromRelations(s: Select): TableRef[] {
+  const rels: TableRef[] = [];
+  if (s.from !== null) rels.push(s.from);
+  for (const j of s.joins) rels.push(j.table);
+  return rels;
+}
+
+// selectExprs returns every top-level expression of a SELECT that can hold a sublink (select items,
+// WHERE, GROUP BY, HAVING, join ON conditions). ORDER BY keys are bare/qualified column references
+// (never expressions), so they carry no sublink.
+function selectExprs(s: Select): Expr[] {
+  const v: Expr[] = [];
+  if (s.items.kind === "list") for (const it of s.items.items) v.push(it.expr);
+  if (s.filter !== null) v.push(s.filter);
+  for (const g of s.groupBy) v.push(g);
+  if (s.having !== null) v.push(s.having);
+  for (const j of s.joins) if (j.on !== null) v.push(j.on);
+  return v;
+}
+
+// checkRecursiveColumnTypes checks a recursive CTE's column types (recursive-cte.md §2): the output
+// types are FIXED by the non-recursive (anchor) term, and the recursive term's columns must be
+// assignable to them — a literal adapts, an equal type passes, a WIDER type is 42804 (matching
+// PostgreSQL). Mechanically the would-be UNION unified type must EQUAL the anchor type; any widening
+// of the anchor is the error. An arity mismatch is 42601, like a plain UNION.
+function checkRecursiveColumnTypes(
+  anchor: QueryPlan,
+  recursive: QueryPlan,
+  name: string,
+): void {
+  const a = anchor.columnTypes;
+  const r = recursive.columnTypes;
+  if (a.length !== r.length) {
+    throw engineError(
+      "syntax_error",
+      "each UNION query must have the same number of columns",
+    );
+  }
+  for (let i = 0; i < a.length; i++) {
+    const unified = unifySetopColumn(a[i]!, r[i]!, "union");
+    if (rtName(unified) !== rtName(a[i]!)) {
+      throw engineError(
+        "datatype_mismatch",
+        `recursive query "${name}" column ${i + 1} has type ${rtName(a[i]!)} in non-recursive term but type ${rtName(unified)} overall`,
+      );
+    }
   }
 }
 

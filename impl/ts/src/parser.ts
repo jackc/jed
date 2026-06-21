@@ -1392,18 +1392,19 @@ class Parser {
 
   // parseWithStatement parses `query_statement ::= with_clause? query_expr` — a top-level query
   // prefixed by a WITH clause defining common table expressions (spec/design/cte.md). WITH RECURSIVE
-  // is deferred (0A000); the CTE bodies and the main body are WITH-less query_exprs (the
-  // top-level-only narrowing — a nested WITH surfaces as 42601 because a body must begin with
-  // SELECT).
+  // (spec/design/recursive-cte.md) sets the `recursive` flag and lets a CTE reference itself; the
+  // CTE bodies and the main body are WITH-less query_exprs (the top-level-only narrowing — a nested
+  // WITH surfaces as 42601 because a body must begin with SELECT).
   private parseWithStatement(): Statement {
     this.expectKeyword("with");
-    // `WITH RECURSIVE …` is deferred this slice. RECURSIVE in this position is the keyword (PG
-    // reserves it), so a CTE may not be named `recursive` — a documented narrowing (cte.md §6).
+    // `WITH RECURSIVE …` enables self-reference (recursive-cte.md). RECURSIVE in this position is
+    // the keyword (PG reserves it), so a CTE may not be named `recursive` — a documented narrowing.
+    // The flag governs the whole list; whether a given CTE is *actually* recursive is decided at
+    // planning by whether its body references its own name.
+    let recursive = false;
     if (this.peekKeyword() === "recursive") {
-      throw engineError(
-        "feature_not_supported",
-        "WITH RECURSIVE is not supported yet",
-      );
+      this.advance();
+      recursive = true;
     }
     const ctes: Cte[] = [];
     for (;;) {
@@ -1415,7 +1416,7 @@ class Parser {
       }
     }
     const body = this.parseQueryExprNode();
-    return { kind: "with", ctes, body };
+    return { kind: "with", ctes, body, recursive };
   }
 
   // parseCte parses one CTE: `identifier ("(" ident ("," ident)* ")")? "AS" ("NOT"? "MATERIALIZED")?

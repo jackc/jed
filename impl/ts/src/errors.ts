@@ -44,6 +44,7 @@ export type SqlState =
   | "grouping_error" // 42803 — non-aggregated column not in GROUP BY, or aggregate in WHERE/ON/nested
   | "undefined_function" // 42883 — an unknown function name in a call (aggregates.md §5)
   | "indeterminate_datatype" // 42P18 — a bind parameter $N whose type cannot be inferred (api.md §5)
+  | "invalid_recursion" // 42P19 — a WITH RECURSIVE CTE that references itself but is ill-formed (recursive-cte.md §6)
   | "undefined_parameter" // 42P02 — a bind parameter $N where none can exist (a CHECK expression)
   | "duplicate_object" // 42710 — a constraint name already taken on this table (constraints.md §4.3)
   | "wrong_object_type" // 42809 — DROP TABLE of an index name / DROP INDEX of a table name (indexes.md §2)
@@ -101,6 +102,7 @@ const CODES: Record<SqlState, string> = {
   grouping_error: "42803",
   undefined_function: "42883",
   indeterminate_datatype: "42P18",
+  invalid_recursion: "42P19",
   undefined_parameter: "42P02",
   duplicate_object: "42710",
   wrong_object_type: "42809",

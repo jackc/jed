@@ -210,6 +210,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // Non-recursive common table expressions — WITH name [(cols)] AS [NOT] MATERIALIZED (query)
   // [, ...] <query> (spec/design/cte.md).
   "query.cte",
+  // Recursive common table expressions — WITH RECURSIVE name [(cols)] AS (anchor UNION [ALL]
+  // recursive_term) <query>: the iterate-to-fixpoint (working-table) executor; cost-ceiling
+  // termination (spec/design/recursive-cte.md).
+  "query.cte_recursive",
   // Derived tables — FROM ( query_expr ) AS t: a parenthesized subquery as a FROM relation, the
   // parser surface over the CTE inline seam (an anonymous always-inlined single-ref CTE) —
   // spec/design/grammar.md §42.
