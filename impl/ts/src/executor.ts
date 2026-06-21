@@ -80,6 +80,7 @@ import {
   serializeTable,
   sortKey as collationSortKey,
   vendoredCollation,
+  vendoredCollationTables,
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
 import { crc32Ieee } from "./format.ts";
@@ -341,6 +342,22 @@ export type CollationInfo = {
   isDefault: boolean;
 };
 
+// vendoredCollations reports the collations VENDORED into this engine build — the build-global set
+// every database opened by this binary can use (spec/design/collation.md §4.2/§13). A property of the
+// BINARY, independent of any database; for the collations a particular database references, use
+// Database.collations. Ascending by name; isDefault is always false here (that is a per-database
+// property, not a build one). C is built in and not listed.
+export function vendoredCollations(): CollationInfo[] {
+  return vendoredCollationTables().map((c) => ({
+    name: c.name,
+    unicodeVersion: c.unicodeVersion,
+    cldrVersion: c.cldrVersion,
+    contentHash: crc32Ieee(serializeTable(c)),
+    description: c.description,
+    isDefault: false,
+  }));
+}
+
 // Snapshot is an immutable committed (or in-progress working) database state — the catalog + each
 // table's store + the commit counter (spec/design/transactions.md §2). The committed state is one
 // of these; a write transaction builds a new one from it (the persistent stores clone O(1) —
@@ -371,15 +388,16 @@ export class Snapshot {
   // it (sequences.md §5). SequenceDef objects are never mutated in place (only replaced/removed),
   // so the shallow Map copy in clone is safe.
   sequences: Map<string, SequenceDef>;
-  // collations holds loaded collations, keyed by their exact (CASE-SENSITIVE) name — collation names
-  // are quoted identifiers ("en-US", spec/design/collation.md §1). C is never stored (table-free,
-  // built in). Imported by db.importCollation. Persisted as catalog entry_kind = 3 baked snapshots
-  // (format_version 17, slice 1d). Collation objects are never mutated in place (only added), so the
-  // shallow Map copy in clone is safe.
+  // collations caches collations RESOLVED from the file's reference entries on open, keyed by their
+  // exact (CASE-SENSITIVE) name — collation names are quoted identifiers ("en-US",
+  // spec/design/collation.md §1). C is never stored (table-free, built in). Under the reference-only
+  // model (§4.2) the file holds only a metadata entry per collation the schema references; the table
+  // comes from the binary's vendored set (entry_kind = 3, format_version 18). Collation objects are
+  // never mutated in place (only added), so the shallow Map copy in clone is safe.
   collations: Map<string, Collation>;
   // defaultCollation is the per-database default collation name, or null for C (collation.md §1/§5).
   // An un-annotated text column inherits this at CREATE TABLE. Persisted as the is_default flag bit
-  // on that collation's entry_kind = 3 snapshot, restored on load.
+  // on that collation's entry_kind = 3 reference entry, restored on load.
   defaultCollation: string | null;
 
   constructor(
@@ -419,19 +437,13 @@ export class Snapshot {
   }
 
   // resolveCollation resolves a collation name for USE — query resolution and key encoding
-  // (spec/design/collation.md §2/§9). The database's referenced collations first, then the set
-  // VENDORED into this binary. undefined ⇒ neither has it (resolver → 42704). C is handled by the
-  // caller (built-in). This is the reference-only read path: a collation need not be baked into the
-  // file to be used — the file references it by name and the table comes from the vendored set.
+  // (spec/design/collation.md §2/§9). The collations the database has resolved (a cache populated on
+  // open from the file's reference entries, carrying their version pin) first, then the set VENDORED
+  // into this binary. undefined ⇒ neither has it (resolver → 42704). C is handled by the caller
+  // (built-in). This is the reference-only read path: a collation is never baked into the file — the
+  // file references it by name and the table comes from the vendored set.
   resolveCollation(name: string): Collation | undefined {
     return this.collations.get(name) ?? vendoredCollation(name);
-  }
-
-  // collation looks up a collation the database REFERENCES (imported / baked) by its exact
-  // (case-sensitive) name. C is NOT here — table-free and built in (spec/design/collation.md §1).
-  // undefined ⇒ not referenced by this database. Catalog-local only; for USE prefer resolveCollation.
-  collation(name: string): Collation | undefined {
-    return this.collations.get(name);
   }
 
   // table looks up a table definition by name (case-insensitive).
@@ -484,12 +496,31 @@ export class Snapshot {
     return [...this.sequences.keys()].sort().map((k) => this.sequences.get(k)!);
   }
 
-  // collationsSorted is all loaded collations in ascending (exact, case-sensitive) name order — the
-  // on-disk emission order (spec/fileformat/format.md, entry_kind = 3) with no map-iteration leak.
-  collationsSorted(): Collation[] {
-    return [...this.collations.keys()]
-      .sort()
-      .map((k) => this.collations.get(k)!);
+  // referencedCollations is the collations the database SCHEMA references — every column's frozen
+  // collation plus the per-database default — resolved (catalog-local set, then the binary's vendored
+  // set) and sorted by exact name. Under the reference-only model (spec/design/collation.md §2/§5)
+  // these, not an imported set, are what earn a metadata entry on disk: a collation is recorded
+  // because the schema uses it, regardless of whether it was ever passed to a (now-removed) import
+  // call. C columns (null collation) reference nothing. A referenced name this build does not vendor
+  // throws (the precursor to the slice-2d open-time verdict).
+  referencedCollations(): Collation[] {
+    const names = new Set<string>();
+    for (const t of this.tables.values()) {
+      for (const col of t.columns) {
+        if (col.collation !== null) names.add(col.collation);
+      }
+    }
+    if (this.defaultCollation !== null) names.add(this.defaultCollation);
+    return [...names].sort().map((name) => {
+      const c = this.resolveCollation(name);
+      if (c === undefined) {
+        throw engineError(
+          "undefined_object",
+          `collation "${name}" referenced by the schema is not vendored in this build`,
+        );
+      }
+      return c;
+    });
   }
 
   // sequencesOwnedBy returns the lowercased keys of every sequence OWNED BY the table `name`
@@ -1906,16 +1937,9 @@ export class Database {
     return this.readSnap().compositeType(name);
   }
 
-  // collationByName looks up a loaded collation by its exact (case-sensitive) name in the visible
-  // snapshot (spec/design/collation.md §1); undefined if not loaded. Public so the free resolver can
-  // reach it (the readSnap seam is private), mirroring compositeType.
-  collationByName(name: string): Collation | undefined {
-    return this.readSnap().collation(name);
-  }
-
-  // resolveCollationByName resolves a collation for USE — the database's referenced collations then
-  // the binary's vendored set (spec/design/collation.md §2/§9). The reference-only read path; mirrors
-  // collationByName but with the vendored fallback. undefined ⇒ neither has it (resolver → 42704).
+  // resolveCollationByName resolves a collation for USE — the database's resolved set then the
+  // binary's vendored set (spec/design/collation.md §2/§9). The reference-only read path; undefined ⇒
+  // neither has it (resolver → 42704).
   resolveCollationByName(name: string): Collation | undefined {
     return this.readSnap().resolveCollation(name);
   }
@@ -1942,56 +1966,20 @@ export class Database {
     this.working().putTable(t, this.pageSize);
   }
 
-  // importCollation imports a collation into the database (the privileged host op,
-  // spec/design/collation.md §4). The collation becomes usable by name in COLLATE / ORDER BY and is
-  // BAKED into the file at the next commit (catalog entry_kind = 3, format_version 17 — §5). Idempotent
-  // by (name, content-hash): re-importing the identical table is a no-op success; importing a DIFFERENT
-  // table under a name already in use is 42710 (re-collation is the explicit path, §12). C is never
-  // imported (table-free, built in). Returns the imported name.
-  importCollation(coll: Collation): string {
-    if (coll.name === "C") {
-      throw engineError(
-        "duplicate_object",
-        "the C collation is built in and cannot be imported",
-      );
-    }
-    const hash = crc32Ieee(serializeTable(coll));
-    const existing = this.committed.collation(coll.name);
-    if (existing !== undefined) {
-      if (crc32Ieee(serializeTable(existing)) === hash) {
-        return coll.name; // idempotent — same (name, content) already loaded
-      }
-      throw engineError(
-        "duplicate_object",
-        `collation "${coll.name}" is already loaded with different content`,
-      );
-    }
-    this.committed.collations.set(coll.name, coll);
-    return coll.name;
-  }
-
-  // exportCollation pulls a baked collation back out as a Collation value (db.exportCollation,
-  // spec/design/collation.md §1). C is built in and has no table → 42704; an unloaded name is 42704.
-  exportCollation(name: string): Collation {
-    const c = this.committed.collation(name);
-    if (c === undefined) {
-      throw engineError(
-        "undefined_object",
-        `collation "${name}" does not exist`,
-      );
-    }
-    return c;
-  }
+  // importCollation / exportCollation are GONE (the reference-only pivot, spec/design/collation.md
+  // §4.2): a collation is vendored into the binary and used by name, never loaded into a database.
+  // There is no runtime path that constructs or bakes a collation table.
 
   // setDefaultCollation sets the per-database default collation (db.setDefaultCollation,
-  // spec/design/collation.md §1). "C" resets to byte order; any other name must be loaded (else
-  // 42704). Persisted as the is_default flag on that collation's baked snapshot at the next commit.
+  // spec/design/collation.md §1). "C" resets to byte order; any other name must be a VENDORED
+  // collation (else 42704). Persisted as the is_default flag on that collation's reference entry at
+  // the next commit (the entry is emitted because the default references it — §5).
   setDefaultCollation(name: string): void {
     if (name === "C") {
       this.committed.defaultCollation = null;
       return;
     }
-    if (this.committed.collation(name) === undefined) {
+    if (this.committed.resolveCollation(name) === undefined) {
       throw engineError(
         "undefined_object",
         `collation "${name}" does not exist`,
@@ -2006,11 +1994,20 @@ export class Database {
     return this.committed.defaultCollation ?? "C";
   }
 
-  // collations introspects the loaded collations (db.collations, spec/design/collation.md §1), in
-  // ascending name order. C is built in and not listed.
+  // collations introspects the collations THIS DATABASE references (db.collations,
+  // spec/design/collation.md §4.2) — every collation its schema uses (a column's COLLATE, or the
+  // per-database default), in ascending name order. This is the per-file view; for the set VENDORED
+  // into the engine (build-global), use the free vendoredCollations(). C is built in and not listed.
   collations(): CollationInfo[] {
     const dflt = this.committed.defaultCollation;
-    return this.committed.collationsSorted().map((c) => ({
+    // referencedCollations resolves each referenced name (vendored, here always resolvable).
+    let refs: Collation[];
+    try {
+      refs = this.committed.referencedCollations();
+    } catch {
+      return [];
+    }
+    return refs.map((c) => ({
       name: c.name,
       unicodeVersion: c.unicodeVersion,
       cldrVersion: c.cldrVersion,
@@ -14896,9 +14893,10 @@ function resolve(
   }
 }
 
-// resolveCollationName resolves a collation NAME to its loaded table (spec/design/collation.md §1).
-// C is the built-in byte / code-point order → null (the unchanged fast path); any other name must be
-// loaded (db.importCollation), else 42704.
+// resolveCollationName resolves a collation NAME to its table (spec/design/collation.md §1). C is the
+// built-in byte / code-point order → null (the unchanged fast path); any other name resolves through
+// the reference-only read path (the database's resolved set, then the binary's vendored set), else
+// 42704.
 function resolveCollationName(
   catalog: Database,
   name: string,

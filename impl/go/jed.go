@@ -274,10 +274,10 @@ var SupportedCapabilities = []string{
 	// boolean ⇄ i32 casts (the boolean cast slice — spec/types/casts.toml, types.md §9): both
 	// directions explicit, i32 only (bool↔i16/i64 is a forbidden 42804).
 	"cast.bool_int",
-	// The COLLATE expression operator + ORDER BY … COLLATE + db.ImportCollation (collation slice
-	// 1c, spec/design/collation.md §14): a host-loaded collation orders text by its UCA sort key in
+	// The COLLATE expression operator + ORDER BY … COLLATE over a VENDORED collation (collation slice
+	// 1c, spec/design/collation.md §14): a vendored collation orders text by its UCA sort key in
 	// the ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704,
-	// non-text COLLATE 42804; the `collate` cost unit. In-memory only (no persistence yet).
+	// non-text COLLATE 42804; the `collate` cost unit.
 	"expr.collate",
 	// Per-column COLLATE in CREATE TABLE (collation slice 1d, spec/design/collation.md §1/§5): a
 	// column's effective collation is frozen at create (text-only 42804, loaded-or-C name 42704) and

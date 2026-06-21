@@ -1,102 +1,16 @@
 package jed
 
-// Collation host API (spec/design/collation.md §1/§4): db.ImportCollation (1c) plus the slice-1d
-// host surface — ExportCollation, SetDefaultCollation / DefaultCollation, Collations, per-database
-// default inheritance, and the baked file round-trip (format_version 17, entry_kind 3). These are the
-// host-API + persistence behaviors the conformance corpus cannot express (CLAUDE.md §10); the
-// in-memory SQL behavior lives in suites/collation/collate.test. Mirrors
-// impl/rust/tests/collation_host.rs and impl/ts/tests/collation_host.test.ts.
+// Collation host API + persistence (spec/design/collation.md §1/§4.2): the reference-only surface —
+// SetDefaultCollation / DefaultCollation, the per-file db.Collations (what the database REFERENCES)
+// vs the build-global VendoredCollations (what the engine VENDORS), per-column / per-database default
+// inheritance, collated keys, and the reference-only FILE ROUND-TRIP (format_version 18, entry_kind 3
+// metadata entries). These are the host-API + persistence behaviors the conformance corpus cannot
+// express (CLAUDE.md §10); the in-memory SQL behavior a collation drives (COLLATE / ORDER BY /
+// derivation / 42P21 / 42P22) lives in suites/collation/collate.test, which runs on every core. There
+// is NO ImportCollation: a collation is vendored into the binary and used by name (the reference-only
+// pivot, §4.2). Mirrors impl/rust/tests/collation_host.rs and impl/ts/tests/collation_host.test.ts.
 
-import (
-	"os"
-	"testing"
-)
-
-func devRoot(t *testing.T) *Collation {
-	t.Helper()
-	def, err := os.ReadFile(specPath(t, "collation/fixtures/dev-root.allkeys"))
-	if err != nil {
-		t.Fatalf("read dev-root: %v", err)
-	}
-	coll, err := CompileCollation("dev-root", string(def))
-	if err != nil {
-		t.Fatalf("compile dev-root: %v", err)
-	}
-	return coll
-}
-
-// devRootNamedButNordicTable returns a collation under the name "dev-root" but with the dev-nordic
-// table (a different content hash) — the conflicting import.
-func devRootNamedButNordicTable(t *testing.T) *Collation {
-	t.Helper()
-	def := collDefinition(t, []string{"collation/fixtures/dev-root.allkeys", "collation/fixtures/dev-nordic.ldml"})
-	coll, err := CompileCollation("dev-root", def)
-	if err != nil {
-		t.Fatalf("compile: %v", err)
-	}
-	return coll
-}
-
-func TestImportCollationThenUseInQuery(t *testing.T) {
-	db := NewDatabase()
-	if name, err := db.ImportCollation(devRoot(t)); err != nil || name != "dev-root" {
-		t.Fatalf("import: name=%q err=%v", name, err)
-	}
-	// The imported collation is usable by name: 'ä' < 'z' is true under dev-root (ä near a), the
-	// opposite of the C byte order where it is false.
-	rows := query(t, db, `SELECT 'ä' < 'z' COLLATE "dev-root"`)
-	if len(rows) != 1 || rows[0][0] != BoolValue(true) {
-		t.Fatalf("got %v, want [[true]]", rows)
-	}
-}
-
-func TestImportCollationIdempotent(t *testing.T) {
-	db := NewDatabase()
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("first import: %v", err)
-	}
-	// Re-importing the identical (name, content) collation is a no-op success.
-	if name, err := db.ImportCollation(devRoot(t)); err != nil || name != "dev-root" {
-		t.Fatalf("idempotent import: name=%q err=%v", name, err)
-	}
-}
-
-func TestImportCollationConflictIs42710(t *testing.T) {
-	db := NewDatabase()
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import: %v", err)
-	}
-	// A DIFFERENT table under a name already in use is a conflict (collation.md §4).
-	_, err := db.ImportCollation(devRootNamedButNordicTable(t))
-	if err == nil || err.(*EngineError).Code() != "42710" {
-		t.Fatalf("want 42710, got %v", err)
-	}
-}
-
-func TestImportCollationRejectsC(t *testing.T) {
-	db := NewDatabase()
-	// C is table-free and built in; it is never imported (collation.md §4).
-	def, _ := os.ReadFile(specPath(t, "collation/fixtures/dev-root.allkeys"))
-	c, err := CompileCollation("C", string(def))
-	if err != nil {
-		t.Fatalf("compile C: %v", err)
-	}
-	if _, err := db.ImportCollation(c); err == nil || err.(*EngineError).Code() != "42710" {
-		t.Fatalf("want 42710, got %v", err)
-	}
-}
-
-// ---- slice 1d ----
-
-func devNordic(t *testing.T) *Collation {
-	t.Helper()
-	def := collDefinition(t, []string{"collation/fixtures/dev-root.allkeys", "collation/fixtures/dev-nordic.ldml"})
-	coll, err := CompileCollation("dev-nordic", def)
-	if err != nil {
-		t.Fatalf("compile dev-nordic: %v", err)
-	}
-	return coll
-}
+import "testing"
 
 func texts(t *testing.T, rows [][]Value) []string {
 	t.Helper()
@@ -122,31 +36,81 @@ func eqStrings(a, b []string) bool {
 	return true
 }
 
-func TestPerColumnCollationOrdersImplicitly(t *testing.T) {
-	db := NewDatabase()
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import: %v", err)
+// ---- the vendored set (the engine-global build property) ----
+
+func TestVendoredCollationsIsTheDevFixtures(t *testing.T) {
+	// VendoredCollations reports what THIS BUILD provides — the dev fixture set, ascending by name, no
+	// IsDefault (a build property, not a per-db one). C is built in and never listed.
+	v := VendoredCollations()
+	names := make([]string, len(v))
+	for i, c := range v {
+		names[i] = c.Name
+		if c.IsDefault {
+			t.Fatalf("vendored %q must not be IsDefault", c.Name)
+		}
 	}
+	if !eqStrings(names, []string{"dev-nordic", "dev-root"}) {
+		t.Fatalf("vendored set: got %v, want [dev-nordic dev-root]", names)
+	}
+	if v[1].Name != "dev-root" || v[1].UnicodeVersion != "0.0.0-dev" {
+		t.Fatalf("dev-root entry: got %+v", v[1])
+	}
+	if VendoredCollation("dev-root") == nil {
+		t.Fatalf("dev-root should be vendored")
+	}
+	if VendoredCollation("C") != nil {
+		t.Fatalf("C must never be vendored")
+	}
+}
+
+// ---- using a vendored collation needs NO import ----
+
+func TestVendoredCollationUsedInAnExpression(t *testing.T) {
+	// COLLATE "dev-root" resolves from the binary's vendored set with no import: 'ä' < 'z' is true under
+	// dev-root (ä near a), the opposite of the C byte order where it is false. A transient query COLLATE
+	// does not make the database REFERENCE the collation, so db.Collations() stays empty.
+	db := NewDatabase()
+	if n := len(db.Collations()); n != 0 {
+		t.Fatalf("fresh db references %d collations, want 0", n)
+	}
+	rows := query(t, db, `SELECT 'ä' < 'z' COLLATE "dev-root"`)
+	if len(rows) != 1 || rows[0][0] != BoolValue(true) {
+		t.Fatalf("got %v, want [[true]]", rows)
+	}
+}
+
+func TestUnknownCollationIs42704(t *testing.T) {
+	// A collation neither vendored nor referenced is 42704 (the vendored fallback must not mask it).
+	db := NewDatabase()
+	if _, err := Execute(db, `SELECT 'x' COLLATE "no-such-collation"`); err == nil || err.(*EngineError).Code() != "42704" {
+		t.Fatalf("want 42704, got %v", err)
+	}
+}
+
+func TestPerColumnCollationOrdersImplicitlyAndIsReferenced(t *testing.T) {
+	// A column declared COLLATE "dev-root" (vendored, no import) sorts by that collation with no explicit
+	// COLLATE on the query — dev-root puts ä next to a. Because the SCHEMA now references dev-root,
+	// db.Collations() (the per-file view) lists exactly it.
+	db := NewDatabase()
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root")`)
 	run(t, db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`)
-	// No explicit COLLATE on the query: name sorts by its frozen dev-root collation (ä next to a).
 	if got := texts(t, query(t, db, `SELECT name FROM t ORDER BY name`)); !eqStrings(got, []string{"a", "ä", "z"}) {
 		t.Fatalf("implicit dev-root order: got %v", got)
 	}
-	// An explicit COLLATE "C" overrides back to byte order (ä is 2-byte UTF-8 → after z).
+	refs := db.Collations()
+	if len(refs) != 1 || refs[0].Name != "dev-root" || refs[0].IsDefault {
+		t.Fatalf("referenced set: got %+v", refs)
+	}
+	// An explicit COLLATE "C" on the query overrides back to byte order (ä is 2-byte UTF-8 → after z).
 	if got := texts(t, query(t, db, `SELECT name FROM t ORDER BY name COLLATE "C"`)); !eqStrings(got, []string{"a", "z", "ä"}) {
 		t.Fatalf("explicit C order: got %v", got)
 	}
 }
 
 func TestImplicitConflictIs42P22(t *testing.T) {
+	// Two columns with DIFFERENT implicit (vendored) collations compared with no explicit COLLATE →
+	// 42P22 (PG-matching). C counts as a distinct implicit collation, so dev-root vs C also conflicts.
 	db := NewDatabase()
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import dev-root: %v", err)
-	}
-	if _, err := db.ImportCollation(devNordic(t)); err != nil {
-		t.Fatalf("import dev-nordic: %v", err)
-	}
 	run(t, db, `CREATE TABLE t (a text COLLATE "dev-root", b text COLLATE "dev-nordic", c text COLLATE "C")`)
 	run(t, db, `INSERT INTO t VALUES ('a','z','b')`)
 	for _, sql := range []string{`SELECT a < b FROM t`, `SELECT a < c FROM t`} {
@@ -154,18 +118,23 @@ func TestImplicitConflictIs42P22(t *testing.T) {
 			t.Fatalf("%s: want 42P22, got %v", sql, err)
 		}
 	}
-	// An explicit COLLATE on one side breaks the tie: a='a' < (b='z') = true.
+	// An explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') = true.
 	rows := query(t, db, `SELECT a < b COLLATE "dev-root" FROM t`)
 	if len(rows) != 1 || rows[0][0] != BoolValue(true) {
 		t.Fatalf("explicit override: got %v", rows)
 	}
+	// The table references both vendored collations → db.Collations() lists them (sorted).
+	var names []string
+	for _, c := range db.Collations() {
+		names = append(names, c.Name)
+	}
+	if !eqStrings(names, []string{"dev-nordic", "dev-root"}) {
+		t.Fatalf("referenced names: got %v", names)
+	}
 }
 
-func TestCollateColumnErrors(t *testing.T) {
+func TestNonTextCollateIs42804UnknownName42704(t *testing.T) {
 	db := NewDatabase()
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import: %v", err)
-	}
 	if _, err := Execute(db, `CREATE TABLE t (a i32 COLLATE "dev-root")`); err == nil || err.(*EngineError).Code() != "42804" {
 		t.Fatalf("non-text COLLATE: want 42804, got %v", err)
 	}
@@ -174,11 +143,12 @@ func TestCollateColumnErrors(t *testing.T) {
 	}
 }
 
-func TestDefaultCollationInheritance(t *testing.T) {
+// ---- the per-database default (over the vendored set, no import) ----
+
+func TestDefaultCollationInheritedByUnannotatedColumn(t *testing.T) {
+	// SetDefaultCollation moves the per-database default to a VENDORED collation (no import); an
+	// un-annotated text column created AFTER inherits it (frozen), one created BEFORE keeps C.
 	db := NewDatabase()
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import: %v", err)
-	}
 	if db.DefaultCollation() != "C" {
 		t.Fatalf("fresh default: got %q", db.DefaultCollation())
 	}
@@ -191,60 +161,76 @@ func TestDefaultCollationInheritance(t *testing.T) {
 	}
 	run(t, db, `CREATE TABLE after (id i32 PRIMARY KEY, name text)`)
 	run(t, db, `INSERT INTO after VALUES (1,'z'),(2,'ä'),(3,'a')`)
+	// after.name inherited dev-root → ä sorts next to a even with no COLLATE clause.
 	if got := texts(t, query(t, db, `SELECT name FROM after ORDER BY name`)); !eqStrings(got, []string{"a", "ä", "z"}) {
 		t.Fatalf("after inherited dev-root: got %v", got)
 	}
+	// before.name was frozen at C → byte order.
 	run(t, db, `INSERT INTO before VALUES (1,'z'),(2,'ä'),(3,'a')`)
 	if got := texts(t, query(t, db, `SELECT name FROM before ORDER BY name`)); !eqStrings(got, []string{"a", "z", "ä"}) {
 		t.Fatalf("before frozen at C: got %v", got)
 	}
-	// SetDefaultCollation of an unloaded name is 42704; C always resolves.
+	// The default makes dev-root referenced (IsDefault true).
+	refs := db.Collations()
+	if len(refs) != 1 || !refs[0].IsDefault {
+		t.Fatalf("referenced set: got %+v", refs)
+	}
+}
+
+func TestSetDefaultUnknownIs42704(t *testing.T) {
+	db := NewDatabase()
 	if err := db.SetDefaultCollation("nope"); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("set default unknown: want 42704, got %v", err)
 	}
-	if err := db.SetDefaultCollation("C"); err != nil {
+	if err := db.SetDefaultCollation("C"); err != nil { // C always resolves (resets to byte order)
 		t.Fatalf("set default C: %v", err)
 	}
 }
 
-func TestExportAndIntrospect(t *testing.T) {
+// ---- collated keys (slice 1e, on-disk/internal — the corpus cannot express it) ----
+
+func TestCollatedPrimaryKeyStoredInCollationOrder(t *testing.T) {
+	// A collated text PRIMARY KEY's storage key is the UCA sort key (encoding.md §2.12), so the B-tree
+	// physically iterates in COLLATION order. dev-root (vendored, no import): a < A < b < Z; C bytes:
+	// A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
 	db := NewDatabase()
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import: %v", err)
+	run(t, db, `CREATE TABLE t (name text COLLATE "dev-root" PRIMARY KEY)`)
+	run(t, db, `INSERT INTO t VALUES ('Z'),('a'),('b'),('A')`)
+	if got := texts(t, query(t, db, `SELECT name FROM t`)); !eqStrings(got, []string{"a", "A", "b", "Z"}) {
+		t.Fatalf("collated PK stored order: got %v", got)
 	}
-	exported, err := db.ExportCollation("dev-root")
-	if err != nil || exported.Name != "dev-root" {
-		t.Fatalf("export: name=%v err=%v", exported, err)
-	}
-	db2 := NewDatabase()
-	if name, err := db2.ImportCollation(exported); err != nil || name != "dev-root" {
-		t.Fatalf("re-import exported: name=%q err=%v", name, err)
-	}
-	if _, err := db.ExportCollation("nope"); err == nil || err.(*EngineError).Code() != "42704" {
-		t.Fatalf("export unknown: want 42704, got %v", err)
-	}
-	if _, err := db.ExportCollation("C"); err == nil || err.(*EngineError).Code() != "42704" {
-		t.Fatalf("export C: want 42704, got %v", err)
-	}
-	if err := db.SetDefaultCollation("dev-root"); err != nil {
-		t.Fatalf("set default: %v", err)
-	}
-	infos := db.Collations()
-	if len(infos) != 1 || infos[0].Name != "dev-root" || !infos[0].IsDefault {
-		t.Fatalf("introspect: got %+v", infos)
+	run(t, db, `CREATE TABLE c (name text PRIMARY KEY)`)
+	run(t, db, `INSERT INTO c VALUES ('Z'),('a'),('b'),('A')`)
+	if got := texts(t, query(t, db, `SELECT name FROM c`)); !eqStrings(got, []string{"A", "Z", "a", "b"}) {
+		t.Fatalf("C PK stored order: got %v", got)
 	}
 }
 
-func TestBakedFileRoundTrip(t *testing.T) {
-	path := t.TempDir() + "/collation_baked.jed"
+func TestCollatedUniqueDedupsByByteIdentity(t *testing.T) {
+	// A collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A' are
+	// DISTINCT, both admitted — collation.md §7), like a C unique key; only a byte-duplicate violates.
+	db := NewDatabase()
+	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root" UNIQUE)`)
+	run(t, db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`)
+	if _, err := Execute(db, `INSERT INTO t VALUES (4,'a')`); err == nil || err.(*EngineError).Code() != "23505" {
+		t.Fatalf("collated UNIQUE duplicate: want 23505, got %v", err)
+	}
+	if got := texts(t, query(t, db, `SELECT name FROM t ORDER BY name`)); !eqStrings(got, []string{"a", "A", "b"}) {
+		t.Fatalf("collated UNIQUE order: got %v", got)
+	}
+}
+
+// ---- reference-only file round-trip (format_version 18) ----
+
+func TestReferenceOnlyFileRoundTrip(t *testing.T) {
+	// A collated table + the per-database default survive a close + paged reopen. The file stores only a
+	// metadata REFERENCE entry (no table); on reopen the table is resolved from the vendored set.
+	path := t.TempDir() + "/collation_refonly_roundtrip.jed"
 	db, err := Create(path, DatabaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import: %v", err)
-	}
-	if err := db.SetDefaultCollation("dev-root"); err != nil {
+	if err := db.SetDefaultCollation("dev-root"); err != nil { // vendored — no import
 		t.Fatalf("set default: %v", err)
 	}
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root", plain text)`)
@@ -263,123 +249,19 @@ func TestBakedFileRoundTrip(t *testing.T) {
 	if re.DefaultCollation() != "dev-root" {
 		t.Fatalf("reopened default: got %q", re.DefaultCollation())
 	}
-	if len(re.Collations()) != 1 {
-		t.Fatalf("reopened collations: got %d", len(re.Collations()))
+	// The database still references dev-root (per-file view) — resolved from the vendored set.
+	refs := re.Collations()
+	if len(refs) != 1 || refs[0].Name != "dev-root" || refs[0].UnicodeVersion != "0.0.0-dev" || !refs[0].IsDefault {
+		t.Fatalf("reopened referenced set: got %+v", refs)
 	}
 	if got := texts(t, query(t, re, `SELECT name FROM t ORDER BY name`)); !eqStrings(got, []string{"a", "ä", "z"}) {
 		t.Fatalf("reopened collated column: got %v", got)
 	}
-	// plain (un-annotated) inherited the default (dev-root) at create.
+	// plain (un-annotated) inherited the default (dev-root) at create → also dev-root order.
 	if got := texts(t, query(t, re, `SELECT plain FROM t ORDER BY plain`)); !eqStrings(got, []string{"a", "ä", "z"}) {
 		t.Fatalf("reopened inherited column: got %v", got)
 	}
 	if err := re.Close(); err != nil {
 		t.Fatalf("close re: %v", err)
-	}
-}
-
-// TestCollatedPrimaryKeyStoredInCollationOrder: slice 1e — a collated text PRIMARY KEY's storage
-// key is the UCA sort key (encoding.md §2.12), so the B-tree physically iterates in COLLATION order.
-// A no-ORDER-BY single-table scan returns jed's stored (key) order, so this asserts the *key* is
-// collated (distinct from the in-memory ORDER BY sorter 1c already had) — the on-disk/internal
-// property the corpus cannot express. dev-root: a < A < b < Z; C bytes: A < Z < a < b.
-func TestCollatedPrimaryKeyStoredInCollationOrder(t *testing.T) {
-	db := NewDatabase()
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import: %v", err)
-	}
-	run(t, db, `CREATE TABLE t (name text COLLATE "dev-root" PRIMARY KEY)`)
-	run(t, db, `INSERT INTO t VALUES ('Z'),('a'),('b'),('A')`)
-	if got := texts(t, query(t, db, `SELECT name FROM t`)); !eqStrings(got, []string{"a", "A", "b", "Z"}) {
-		t.Fatalf("collated PK stored order: got %v", got)
-	}
-	run(t, db, `CREATE TABLE c (name text PRIMARY KEY)`)
-	run(t, db, `INSERT INTO c VALUES ('Z'),('a'),('b'),('A')`)
-	if got := texts(t, query(t, db, `SELECT name FROM c`)); !eqStrings(got, []string{"A", "Z", "a", "b"}) {
-		t.Fatalf("C PK stored order: got %v", got)
-	}
-}
-
-// TestCollatedSecondaryIndexAndUniqueKeys: slice 1e — a collated UNIQUE key dedups by byte-identity
-// (a deterministic collation: 'a' and 'A' are DISTINCT, both admitted — collation.md §7), like a C
-// unique key, and ORDER BY a collated column uses its frozen collation with no explicit COLLATE.
-func TestCollatedSecondaryIndexAndUniqueKeys(t *testing.T) {
-	db := NewDatabase()
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import: %v", err)
-	}
-	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root" UNIQUE)`)
-	run(t, db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`)
-	if _, err := Execute(db, `INSERT INTO t VALUES (4,'a')`); err == nil || err.(*EngineError).Code() != "23505" {
-		t.Fatalf("collated UNIQUE duplicate: want 23505, got %v", err)
-	}
-	if got := texts(t, query(t, db, `SELECT name FROM t ORDER BY name`)); !eqStrings(got, []string{"a", "A", "b"}) {
-		t.Fatalf("collated UNIQUE order: got %v", got)
-	}
-}
-
-// ---- slice 2: vendored / reference-only read path (collation.md §2/§3/§9) ----
-//
-// In the reference-only model a collation is VENDORED into the binary, so it is usable WITHOUT any
-// db.ImportCollation — the database references it by name and the table comes from the vendored set.
-// These assert that no-import path directly (the corpus still imports, so it cannot express this —
-// CLAUDE.md §10). dev-root and dev-nordic are the vendored dev fixtures (§14, 2a). Mirrors
-// impl/rust/tests/collation_host.rs and impl/ts/tests/collation_host.test.ts.
-
-func TestVendoredCollationUsedWithoutImport(t *testing.T) {
-	// No import: COLLATE "dev-root" resolves from the binary's vendored set. 'ä' < 'z' is true under
-	// dev-root (ä near a), the opposite of C byte order — proving the vendored table is used.
-	db := NewDatabase()
-	if n := len(db.Collations()); n != 0 {
-		t.Fatalf("fresh db references %d collations, want 0", n)
-	}
-	rows := query(t, db, `SELECT 'ä' < 'z' COLLATE "dev-root"`)
-	if len(rows) != 1 || rows[0][0] != BoolValue(true) {
-		t.Fatalf("got %v, want [[true]]", rows)
-	}
-}
-
-func TestVendoredPerColumnCollationWithoutImport(t *testing.T) {
-	// A COLLATE "dev-root" column works with NO import: CREATE TABLE validation and the key encoder
-	// both fall back to the vendored set, so the collated ORDER BY uses dev-root order — ä between a
-	// and z.
-	db := NewDatabase()
-	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root")`)
-	run(t, db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`)
-	if got := texts(t, query(t, db, `SELECT name FROM t ORDER BY name`)); !eqStrings(got, []string{"a", "ä", "z"}) {
-		t.Fatalf("collated order: got %v", got)
-	}
-	// The database referenced dev-root by name but never baked it — Collations() (referenced set)
-	// stays empty; the table came from the vendored set.
-	if n := len(db.Collations()); n != 0 {
-		t.Fatalf("db references %d collations, want 0 (vendored, not baked)", n)
-	}
-}
-
-func TestUnknownCollationStill42704(t *testing.T) {
-	// The vendored fallback must not mask an unknown name: a collation neither referenced nor
-	// vendored is still 42704 (undefined_object).
-	db := NewDatabase()
-	_, err := Execute(db, `SELECT 'x' COLLATE "no-such-collation"`)
-	if err == nil || err.(*EngineError).Code() != "42704" {
-		t.Fatalf("want 42704, got %v", err)
-	}
-}
-
-func TestVendoredSetIsDevFixtures(t *testing.T) {
-	// The binary vendors the dev fixture set, ascending by name (deterministic, §8). C is never
-	// vendored (table-free, built in).
-	var names []string
-	for _, c := range VendoredCollations() {
-		names = append(names, c.Name)
-	}
-	if !eqStrings(names, []string{"dev-nordic", "dev-root"}) {
-		t.Fatalf("vendored set: got %v, want [dev-nordic dev-root]", names)
-	}
-	if VendoredCollation("dev-root") == nil {
-		t.Fatalf("dev-root should be vendored")
-	}
-	if VendoredCollation("C") != nil {
-		t.Fatalf("C must never be vendored")
 	}
 }

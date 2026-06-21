@@ -118,14 +118,16 @@ type Snapshot struct {
 	// (LastValue/IsCalled) lives here, so nextval advances the working snapshot and rolls back
 	// with it (sequences.md §5).
 	sequences map[string]*SequenceDef
-	// collations holds loaded collations, keyed by their exact (CASE-SENSITIVE) name — collation
-	// names are quoted identifiers ("en-US", spec/design/collation.md §1). C is never stored
-	// (table-free, built in). Imported by db.ImportCollation. Persisted as catalog entry_kind = 3
-	// baked snapshots (format_version 17, slice 1d — spec/fileformat/format.md).
+	// collations caches collations RESOLVED from the file's reference entries on open, keyed by their
+	// exact (CASE-SENSITIVE) name — collation names are quoted identifiers ("en-US",
+	// spec/design/collation.md §1). C is never stored (table-free, built in). Under the reference-only
+	// model (§4.2) the file holds only a metadata entry per collation the schema references; the table
+	// comes from the binary's vendored set (entry_kind = 3, format_version 18 —
+	// spec/fileformat/format.md).
 	collations map[string]*Collation
 	// defaultCollation is the per-database default collation name, or "" for C (collation.md §1/§5).
 	// An un-annotated text column inherits this at CREATE TABLE. Persisted as the is_default flag bit
-	// on that collation's entry_kind = 3 snapshot, restored on load.
+	// on that collation's entry_kind = 3 reference entry, restored on load.
 	defaultCollation string
 }
 
@@ -177,19 +179,12 @@ func (s *Snapshot) clone() *Snapshot {
 	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation}
 }
 
-// collation looks up a collation the database REFERENCES (imported / baked) by its exact
-// (case-sensitive) name. C is NOT here — it is table-free and built in (spec/design/collation.md §1).
-// A nil result ⇒ not referenced by this database. This is the catalog-local set only; for query USE
-// prefer resolveCollation, which also falls back to the binary's vendored set.
-func (s *Snapshot) collation(name string) *Collation {
-	return s.collations[name]
-}
-
 // resolveCollation resolves a collation name for USE — query resolution and key encoding
-// (spec/design/collation.md §2/§9). The database's referenced collations first, then the set
-// VENDORED into this binary. nil ⇒ neither has it (the resolver raises 42704). C is handled by the
-// caller (built-in). This is the reference-only read path: a collation need not be baked into the
-// file to be used — the file references it by name and the table comes from the vendored set.
+// (spec/design/collation.md §2/§9). The collations the database has resolved (a cache populated on
+// open from the file's reference entries, carrying their version pin) first, then the set VENDORED
+// into this binary. nil ⇒ neither has it (the resolver raises 42704). C is handled by the caller
+// (built-in). This is the reference-only read path: a collation is never baked into the file — the
+// file references it by name and the table comes from the vendored set.
 func (s *Snapshot) resolveCollation(name string) *Collation {
 	if c := s.collations[name]; c != nil {
 		return c
@@ -197,19 +192,40 @@ func (s *Snapshot) resolveCollation(name string) *Collation {
 	return VendoredCollation(name)
 }
 
-// collationsSorted returns all loaded collations in ascending (exact, case-sensitive) name order —
-// the on-disk emission order (spec/fileformat/format.md, entry_kind = 3) with no hash-iteration leak.
-func (s *Snapshot) collationsSorted() []*Collation {
-	keys := make([]string, 0, len(s.collations))
-	for k := range s.collations {
-		keys = append(keys, k)
+// referencedCollations returns the collations the database SCHEMA references — every column's frozen
+// collation plus the per-database default — resolved (catalog-local set, then the binary's vendored
+// set) and sorted by exact name. Under the reference-only model (spec/design/collation.md §2/§5)
+// these, not an imported set, are what earn a metadata entry on disk: a collation is recorded because
+// the schema uses it, regardless of whether it was ever passed to a (now-removed) import call. C
+// columns (empty Collation) reference nothing. A referenced name this build does not vendor is a bug
+// surfaced here (the precursor to the slice-2d open-time verdict).
+func (s *Snapshot) referencedCollations() ([]*Collation, error) {
+	names := map[string]struct{}{}
+	for _, t := range s.tables {
+		for _, col := range t.Columns {
+			if col.Collation != "" {
+				names[col.Collation] = struct{}{}
+			}
+		}
 	}
-	sort.Strings(keys)
-	out := make([]*Collation, len(keys))
-	for i, k := range keys {
-		out[i] = s.collations[k]
+	if s.defaultCollation != "" {
+		names[s.defaultCollation] = struct{}{}
 	}
-	return out
+	sorted := make([]string, 0, len(names))
+	for n := range names {
+		sorted = append(sorted, n)
+	}
+	sort.Strings(sorted)
+	out := make([]*Collation, len(sorted))
+	for i, name := range sorted {
+		c := s.resolveCollation(name)
+		if c == nil {
+			return nil, NewError(UndefinedObject,
+				fmt.Sprintf("collation %q referenced by the schema is not vendored in this build", name))
+		}
+		out[i] = c
+	}
+	return out, nil
 }
 
 // table looks up a table definition by name (case-insensitive).
@@ -1609,46 +1625,20 @@ type CollationInfo struct {
 	IsDefault      bool
 }
 
-// ImportCollation imports a collation into the database (the privileged host op,
-// spec/design/collation.md §4). The collation becomes usable by name in COLLATE / ORDER BY and is
-// BAKED into the file at the next commit (catalog entry_kind = 3, format_version 17 — §5). Idempotent
-// by (name, content-hash): re-importing the identical table is a no-op success; importing a DIFFERENT
-// table under a name already in use is 42710 (re-collation is the explicit path, §12). C is never
-// imported (table-free, built in). Returns the imported name.
-func (db *Database) ImportCollation(coll *Collation) (string, error) {
-	if coll.Name == "C" {
-		return "", NewError(DuplicateObject, "the C collation is built in and cannot be imported")
-	}
-	hash := crc32IEEE(SerializeTable(coll))
-	if existing := db.committed.collation(coll.Name); existing != nil {
-		if crc32IEEE(SerializeTable(existing)) == hash {
-			return coll.Name, nil // idempotent — same (name, content) already loaded
-		}
-		return "", NewError(DuplicateObject,
-			fmt.Sprintf("collation %q is already loaded with different content", coll.Name))
-	}
-	db.committed.collations[coll.Name] = coll
-	return coll.Name, nil
-}
-
-// ExportCollation pulls a baked collation back out as a *Collation value (db.ExportCollation,
-// spec/design/collation.md §1). C is built in and has no table → 42704; an unloaded name is 42704.
-func (db *Database) ExportCollation(name string) (*Collation, error) {
-	if c := db.committed.collation(name); c != nil {
-		return c, nil
-	}
-	return nil, NewError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
-}
+// ImportCollation / ExportCollation are GONE (the reference-only pivot, spec/design/collation.md
+// §4.2): a collation is vendored into the binary and used by name, never loaded into a database.
+// There is no runtime path that constructs or bakes a collation table.
 
 // SetDefaultCollation sets the per-database default collation (db.SetDefaultCollation,
-// spec/design/collation.md §1). "C" resets to byte order; any other name must be a loaded collation
-// (else 42704). Persisted as the is_default flag on that collation's baked snapshot at the next commit.
+// spec/design/collation.md §1). "C" resets to byte order; any other name must be a VENDORED collation
+// (else 42704). Persisted as the is_default flag on that collation's reference entry at the next
+// commit (the entry is emitted because the default references it — §5).
 func (db *Database) SetDefaultCollation(name string) error {
 	if name == "C" {
 		db.committed.defaultCollation = ""
 		return nil
 	}
-	if db.committed.collation(name) == nil {
+	if db.committed.resolveCollation(name) == nil {
 		return NewError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))
 	}
 	db.committed.defaultCollation = name
@@ -1664,10 +1654,17 @@ func (db *Database) DefaultCollation() string {
 	return db.committed.defaultCollation
 }
 
-// Collations introspects the loaded collations (db.Collations, spec/design/collation.md §1), in
-// ascending name order. C is built in and not listed.
+// Collations introspects the collations THIS DATABASE references (db.Collations,
+// spec/design/collation.md §4.2) — every collation its schema uses (a column's COLLATE, or the
+// per-database default), in ascending name order. This is the per-file view; for the set VENDORED
+// into the engine (build-global), use the package-level VendoredCollations. C is built in and not
+// listed.
 func (db *Database) Collations() []CollationInfo {
-	colls := db.committed.collationsSorted()
+	// referencedCollations resolves each referenced name (vendored, here always resolvable).
+	colls, err := db.committed.referencedCollations()
+	if err != nil {
+		return nil
+	}
 	out := make([]CollationInfo, len(colls))
 	for i, c := range colls {
 		out[i] = CollationInfo{
@@ -1677,6 +1674,27 @@ func (db *Database) Collations() []CollationInfo {
 			ContentHash:    crc32IEEE(SerializeTable(c)),
 			Description:    c.Description,
 			IsDefault:      db.committed.defaultCollation == c.Name,
+		}
+	}
+	return out
+}
+
+// VendoredCollations reports the collations VENDORED into this engine build — the build-global set
+// every database opened by this binary can use (spec/design/collation.md §4.2/§13). A property of the
+// BINARY, independent of any database; for the collations a particular database references, use
+// Database.Collations. Ascending by name; IsDefault is always false here (that is a per-database
+// property, not a build one). C is built in and not listed.
+func VendoredCollations() []CollationInfo {
+	colls := vendoredCollations()
+	out := make([]CollationInfo, len(colls))
+	for i, c := range colls {
+		out[i] = CollationInfo{
+			Name:           c.Name,
+			UnicodeVersion: c.UnicodeVersion,
+			CLDRVersion:    c.CldrVersion,
+			ContentHash:    crc32IEEE(SerializeTable(c)),
+			Description:    c.Description,
+			IsDefault:      false,
 		}
 	}
 	return out
@@ -16101,9 +16119,10 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 	}
 }
 
-// resolveCollationName resolves a collation NAME to its loaded table (spec/design/collation.md §1).
-// C is the built-in byte / code-point order → nil (the unchanged fast path); any other name must be
-// loaded (db.ImportCollation), else 42704.
+// resolveCollationName resolves a collation NAME to its table (spec/design/collation.md §1). C is the
+// built-in byte / code-point order → nil (the unchanged fast path); any other name resolves through
+// the reference-only read path (the database's resolved set, then the binary's vendored set), else
+// 42704.
 func resolveCollationName(catalog *Database, name string) (*Collation, error) {
 	if name == "C" {
 		return nil, nil

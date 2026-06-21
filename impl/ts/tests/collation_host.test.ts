@@ -1,23 +1,29 @@
-// Collation host API (spec/design/collation.md §1/§4): db.importCollation (1c) plus the slice-1d
-// host surface — exportCollation, setDefaultCollation / defaultCollation, collations, per-database
-// default inheritance, and the baked file round-trip (format_version 17, entry_kind 3). These are the
-// host-API + persistence behaviors the conformance corpus cannot express (CLAUDE.md §10); the
-// in-memory SQL behavior lives in suites/collation/collate.test. Mirrors
-// impl/rust/tests/collation_host.rs and impl/go/collation_host_test.go.
+// Collation host API + persistence (spec/design/collation.md §1/§4.2): the reference-only surface —
+// setDefaultCollation / defaultCollation, the per-file db.collations() (what the database REFERENCES)
+// vs the build-global vendoredCollations() (what the engine VENDORS), per-column / per-database
+// default inheritance, collated keys, and the reference-only FILE ROUND-TRIP (format_version 18,
+// entry_kind 3 metadata entries). These are the host-API + persistence behaviors the conformance
+// corpus cannot express (CLAUDE.md §10); the in-memory SQL behavior a collation drives (COLLATE /
+// ORDER BY / derivation / 42P21 / 42P22) lives in suites/collation/collate.test, which runs on every
+// core. There is NO importCollation: a collation is vendored into the binary and used by name (the
+// reference-only pivot, §4.2). Mirrors impl/rust/tests/collation_host.rs and
+// impl/go/collation_host_test.go.
 
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { close, commit, create, Database, execute, open } from "../src/lib.ts";
 import {
-  type Collation,
-  compileCollation,
-  vendoredCollation,
+  close,
+  commit,
+  create,
+  Database,
+  execute,
+  open,
   vendoredCollations,
-} from "../src/collation.ts";
-import { specPath } from "./tomlmini.ts";
+} from "../src/lib.ts";
+import { vendoredCollation } from "../src/collation.ts";
 import { errCode, query } from "./util.ts";
 
 // exec runs a statement (DDL / INSERT) whose outcome is not a query result.
@@ -25,79 +31,53 @@ function exec(db: Database, sql: string): void {
   execute(db, sql);
 }
 
-function devRoot(): Collation {
-  return compileCollation(
-    "dev-root",
-    readFileSync(specPath("collation/fixtures/dev-root.allkeys"), "utf8"),
+// ---- the vendored set (the engine-global build property) ----
+
+test("vendoredCollations is the dev fixtures", () => {
+  // vendoredCollations() reports what THIS BUILD provides — the dev fixture set, ascending by name, no
+  // isDefault (a build property, not a per-db one). C is built in and never listed.
+  const v = vendoredCollations();
+  assert.deepEqual(
+    v.map((c) => c.name),
+    ["dev-nordic", "dev-root"],
   );
-}
+  assert.ok(v.every((c) => !c.isDefault));
+  assert.equal(v[1]!.name, "dev-root");
+  assert.equal(v[1]!.unicodeVersion, "0.0.0-dev");
+  assert.notEqual(vendoredCollation("dev-root"), undefined);
+  assert.equal(vendoredCollation("C"), undefined);
+});
 
-// A collation under the name "dev-root" but with the dev-nordic table (a different content hash) —
-// the conflicting import.
-function devRootNamedButNordicTable(): Collation {
-  const def =
-    readFileSync(specPath("collation/fixtures/dev-root.allkeys"), "utf8") +
-    "\n" +
-    readFileSync(specPath("collation/fixtures/dev-nordic.ldml"), "utf8");
-  return compileCollation("dev-root", def);
-}
+// ---- using a vendored collation needs NO import ----
 
-test("importCollation then use in a query", () => {
+test("vendored collation used in an expression", () => {
+  // COLLATE "dev-root" resolves from the binary's vendored set with no import: 'ä' < 'z' is true under
+  // dev-root (ä near a), the opposite of the C byte order where it is false. A transient query COLLATE
+  // does not make the database REFERENCE the collation, so db.collations() stays empty.
   const db = new Database();
-  assert.equal(db.importCollation(devRoot()), "dev-root");
-  // The imported collation is usable by name: 'ä' < 'z' is true under dev-root (ä near a), the
-  // opposite of the C byte order where it is false.
+  assert.equal(db.collations().length, 0);
   assert.deepEqual(query(db, `SELECT 'ä' < 'z' COLLATE "dev-root"`), [["true"]]);
 });
 
-test("importCollation is idempotent by name and hash", () => {
+test("unknown collation is 42704", () => {
+  // A collation neither vendored nor referenced is 42704 (the vendored fallback must not mask it).
   const db = new Database();
-  db.importCollation(devRoot());
-  // Re-importing the identical (name, content) collation is a no-op success.
-  assert.equal(db.importCollation(devRoot()), "dev-root");
+  assert.equal(errCode(() => query(db, `SELECT 'x' COLLATE "no-such-collation"`)), "42704");
 });
 
-test("importCollation conflict (same name, different table) is 42710", () => {
+test("per-column collation orders implicitly and is referenced", () => {
+  // A column declared COLLATE "dev-root" (vendored, no import) sorts by that collation with no explicit
+  // COLLATE on the query — dev-root puts ä next to a. Because the SCHEMA now references dev-root,
+  // db.collations() (the per-file view) lists exactly it.
   const db = new Database();
-  db.importCollation(devRoot());
-  // A DIFFERENT table under a name already in use is a conflict (collation.md §4).
-  assert.equal(
-    errCode(() => db.importCollation(devRootNamedButNordicTable())),
-    "42710",
-  );
-});
-
-test("importing C is rejected", () => {
-  const db = new Database();
-  // C is table-free and built in; it is never imported (collation.md §4).
-  const c = compileCollation(
-    "C",
-    readFileSync(specPath("collation/fixtures/dev-root.allkeys"), "utf8"),
-  );
-  assert.equal(
-    errCode(() => db.importCollation(c)),
-    "42710",
-  );
-});
-
-// ---- slice 1d ----
-
-function devNordic(): Collation {
-  const def =
-    readFileSync(specPath("collation/fixtures/dev-root.allkeys"), "utf8") +
-    "\n" +
-    readFileSync(specPath("collation/fixtures/dev-nordic.ldml"), "utf8");
-  return compileCollation("dev-nordic", def);
-}
-
-test("per-column collation orders implicitly", () => {
-  const db = new Database();
-  db.importCollation(devRoot());
   exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root")`);
   exec(db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`);
-  // No explicit COLLATE: name sorts by its frozen dev-root collation (ä next to a).
   assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name`), [["a"], ["ä"], ["z"]]);
-  // An explicit COLLATE "C" overrides back to byte order (ä is 2-byte UTF-8 → after z).
+  const refs = db.collations();
+  assert.equal(refs.length, 1);
+  assert.equal(refs[0]!.name, "dev-root");
+  assert.equal(refs[0]!.isDefault, false); // referenced by a column, but not the db default
+  // An explicit COLLATE "C" on the query overrides back to byte order (ä is 2-byte UTF-8 → after z).
   assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name COLLATE "C"`), [
     ["a"],
     ["z"],
@@ -106,9 +86,9 @@ test("per-column collation orders implicitly", () => {
 });
 
 test("implicit conflict is 42P22", () => {
+  // Two columns with DIFFERENT implicit (vendored) collations compared with no explicit COLLATE →
+  // 42P22 (PG-matching). C counts as a distinct implicit collation, so dev-root vs C also conflicts.
   const db = new Database();
-  db.importCollation(devRoot());
-  db.importCollation(devNordic());
   exec(
     db,
     `CREATE TABLE t (a text COLLATE "dev-root", b text COLLATE "dev-nordic", c text COLLATE "C")`,
@@ -116,13 +96,17 @@ test("implicit conflict is 42P22", () => {
   exec(db, `INSERT INTO t VALUES ('a','z','b')`);
   assert.equal(errCode(() => query(db, `SELECT a < b FROM t`)), "42P22");
   assert.equal(errCode(() => query(db, `SELECT a < c FROM t`)), "42P22");
-  // An explicit COLLATE on one side breaks the tie: a='a' < (b='z') = true.
+  // An explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') = true.
   assert.deepEqual(query(db, `SELECT a < b COLLATE "dev-root" FROM t`), [["true"]]);
+  // The table references both vendored collations → db.collations() lists them (sorted).
+  assert.deepEqual(
+    db.collations().map((c) => c.name),
+    ["dev-nordic", "dev-root"],
+  );
 });
 
 test("COLLATE column errors (non-text 42804, unknown 42704)", () => {
   const db = new Database();
-  db.importCollation(devRoot());
   assert.equal(
     errCode(() => exec(db, `CREATE TABLE t (a i32 COLLATE "dev-root")`)),
     "42804",
@@ -133,69 +117,42 @@ test("COLLATE column errors (non-text 42804, unknown 42704)", () => {
   );
 });
 
-test("per-database default collation inheritance", () => {
+// ---- the per-database default (over the vendored set, no import) ----
+
+test("default collation inherited by unannotated column", () => {
+  // setDefaultCollation moves the per-database default to a VENDORED collation (no import); an
+  // un-annotated text column created AFTER inherits it (frozen), one created BEFORE keeps C.
   const db = new Database();
-  db.importCollation(devRoot());
   assert.equal(db.defaultCollation(), "C");
   exec(db, `CREATE TABLE before (id i32 PRIMARY KEY, name text)`);
   db.setDefaultCollation("dev-root");
   assert.equal(db.defaultCollation(), "dev-root");
   exec(db, `CREATE TABLE after (id i32 PRIMARY KEY, name text)`);
   exec(db, `INSERT INTO after VALUES (1,'z'),(2,'ä'),(3,'a')`);
+  // after.name inherited dev-root → ä sorts next to a even with no COLLATE clause.
   assert.deepEqual(query(db, `SELECT name FROM after ORDER BY name`), [["a"], ["ä"], ["z"]]);
+  // before.name was frozen at C → byte order.
   exec(db, `INSERT INTO before VALUES (1,'z'),(2,'ä'),(3,'a')`);
   assert.deepEqual(query(db, `SELECT name FROM before ORDER BY name`), [["a"], ["z"], ["ä"]]);
+  // The default makes dev-root referenced (isDefault true).
+  const refs = db.collations();
+  assert.equal(refs.length, 1);
+  assert.equal(refs[0]!.isDefault, true);
+});
+
+test("set default unknown is 42704", () => {
+  const db = new Database();
   assert.equal(errCode(() => db.setDefaultCollation("nope")), "42704");
-  db.setDefaultCollation("C");
+  db.setDefaultCollation("C"); // C always resolves (resets to byte order)
 });
 
-test("export round-trips and introspects", () => {
-  const db = new Database();
-  db.importCollation(devRoot());
-  const exported = db.exportCollation("dev-root");
-  assert.equal(exported.name, "dev-root");
-  const db2 = new Database();
-  assert.equal(db2.importCollation(exported), "dev-root");
-  assert.equal(errCode(() => db.exportCollation("nope")), "42704");
-  assert.equal(errCode(() => db.exportCollation("C")), "42704");
-  db.setDefaultCollation("dev-root");
-  const infos = db.collations();
-  assert.equal(infos.length, 1);
-  assert.equal(infos[0]!.name, "dev-root");
-  assert.equal(infos[0]!.isDefault, true);
-});
+// ---- collated keys (slice 1e, on-disk/internal — the corpus cannot express it) ----
 
-test("baked file round trip (format_version 17, entry_kind 3)", () => {
-  const dir = mkdtempSync(join(tmpdir(), "jed-coll-"));
-  const path = join(dir, "collation_baked.jed");
-  try {
-    const db = create(path, { pageSize: 256 });
-    db.importCollation(devRoot());
-    db.setDefaultCollation("dev-root");
-    exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root", plain text)`);
-    exec(db, `INSERT INTO t VALUES (1,'z','z'),(2,'ä','ä'),(3,'a','a')`);
-    commit(db);
-    close(db);
-
-    const re = open(path);
-    assert.equal(re.defaultCollation(), "dev-root");
-    assert.equal(re.collations().length, 1);
-    assert.deepEqual(query(re, `SELECT name FROM t ORDER BY name`), [["a"], ["ä"], ["z"]]);
-    // plain (un-annotated) inherited the default (dev-root) at create.
-    assert.deepEqual(query(re, `SELECT plain FROM t ORDER BY plain`), [["a"], ["ä"], ["z"]]);
-    close(re);
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
-});
-
-// slice 1e — a collated text PRIMARY KEY's storage key is the UCA sort key (encoding.md §2.12), so
-// the B-tree physically iterates in COLLATION order. A no-ORDER-BY single-table scan returns jed's
-// stored (key) order, so this asserts the *key* is collated (distinct from the in-memory ORDER BY
-// sorter 1c had). dev-root: a < A < b < Z; C bytes: A < Z < a < b.
 test("collated primary key stored in collation order", () => {
+  // A collated text PRIMARY KEY's storage key is the UCA sort key (encoding.md §2.12), so the B-tree
+  // physically iterates in COLLATION order. dev-root (vendored, no import): a < A < b < Z; C bytes:
+  // A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
   const db = new Database();
-  db.importCollation(devRoot());
   exec(db, `CREATE TABLE t (name text COLLATE "dev-root" PRIMARY KEY)`);
   exec(db, `INSERT INTO t VALUES ('Z'),('a'),('b'),('A')`);
   assert.deepEqual(query(db, `SELECT name FROM t`), [["a"], ["A"], ["b"], ["Z"]]);
@@ -204,67 +161,44 @@ test("collated primary key stored in collation order", () => {
   assert.deepEqual(query(db, `SELECT name FROM c`), [["A"], ["Z"], ["a"], ["b"]]);
 });
 
-// slice 1e — a collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A'
-// are DISTINCT, both admitted — collation.md §7), like a C unique key.
-test("collated secondary index and unique keys", () => {
+test("collated unique dedups by byte identity", () => {
+  // A collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A' are
+  // DISTINCT, both admitted — collation.md §7), like a C unique key; only a byte-duplicate violates.
   const db = new Database();
-  db.importCollation(devRoot());
-  exec(
-    db,
-    `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root" UNIQUE)`,
-  );
+  exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root" UNIQUE)`);
   exec(db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`);
   assert.equal(errCode(() => exec(db, `INSERT INTO t VALUES (4,'a')`)), "23505");
-  assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name`), [
-    ["a"],
-    ["A"],
-    ["b"],
-  ]);
+  assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name`), [["a"], ["A"], ["b"]]);
 });
 
-// ---- slice 2: vendored / reference-only read path (collation.md §2/§3/§9) ----
-//
-// In the reference-only model a collation is VENDORED into the binary, so it is usable WITHOUT any
-// db.importCollation — the database references it by name and the table comes from the vendored set.
-// These assert that no-import path directly (the corpus still imports, so it cannot express this —
-// CLAUDE.md §10). dev-root and dev-nordic are the vendored dev fixtures (§14, 2a). Mirrors
-// impl/rust/tests/collation_host.rs and impl/go/collation_host_test.go.
+// ---- reference-only file round-trip (format_version 18) ----
 
-test("vendored collation used without import", () => {
-  // No import: COLLATE "dev-root" resolves from the binary's vendored set. 'ä' < 'z' is true under
-  // dev-root (ä near a), the opposite of C byte order — proving the vendored table is used.
-  const db = new Database();
-  assert.equal(db.collations().length, 0); // nothing imported / referenced by this database
-  assert.deepEqual(query(db, `SELECT 'ä' < 'z' COLLATE "dev-root"`), [["true"]]);
-});
+test("reference-only file round trip (format_version 18, entry_kind 3)", () => {
+  // A collated table + the per-database default survive a close + paged reopen. The file stores only a
+  // metadata REFERENCE entry (no table); on reopen the table is resolved from the vendored set.
+  const dir = mkdtempSync(join(tmpdir(), "jed-coll-"));
+  const path = join(dir, "collation_refonly_roundtrip.jed");
+  try {
+    const db = create(path, { pageSize: 256 });
+    db.setDefaultCollation("dev-root"); // vendored — no import
+    exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root", plain text)`);
+    exec(db, `INSERT INTO t VALUES (1,'z','z'),(2,'ä','ä'),(3,'a','a')`);
+    commit(db);
+    close(db);
 
-test("vendored per-column collation without import", () => {
-  // A COLLATE "dev-root" column works with NO import: CREATE TABLE validation and the key encoder
-  // both fall back to the vendored set, so the collated ORDER BY uses dev-root order — ä between a
-  // and z.
-  const db = new Database();
-  exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root")`);
-  exec(db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`);
-  assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name`), [["a"], ["ä"], ["z"]]);
-  // The database referenced dev-root by name but never baked it — collations() (referenced set)
-  // stays empty; the table came from the vendored set.
-  assert.equal(db.collations().length, 0);
-});
-
-test("unknown collation is still 42704", () => {
-  // The vendored fallback must not mask an unknown name: a collation neither referenced nor vendored
-  // is still 42704 (undefined_object).
-  const db = new Database();
-  assert.equal(errCode(() => query(db, `SELECT 'x' COLLATE "no-such-collation"`)), "42704");
-});
-
-test("vendored set is the dev fixtures", () => {
-  // The binary vendors the dev fixture set, ascending by name (deterministic, §8). C is never
-  // vendored (table-free, built in).
-  assert.deepEqual(
-    vendoredCollations().map((c) => c.name),
-    ["dev-nordic", "dev-root"],
-  );
-  assert.notEqual(vendoredCollation("dev-root"), undefined);
-  assert.equal(vendoredCollation("C"), undefined);
+    const re = open(path);
+    assert.equal(re.defaultCollation(), "dev-root");
+    // The database still references dev-root (per-file view) — resolved from the vendored set.
+    const refs = re.collations();
+    assert.equal(refs.length, 1);
+    assert.equal(refs[0]!.name, "dev-root");
+    assert.equal(refs[0]!.unicodeVersion, "0.0.0-dev");
+    assert.equal(refs[0]!.isDefault, true);
+    assert.deepEqual(query(re, `SELECT name FROM t ORDER BY name`), [["a"], ["ä"], ["z"]]);
+    // plain (un-annotated) inherited the default (dev-root) at create → also dev-root order.
+    assert.deepEqual(query(re, `SELECT plain FROM t ORDER BY plain`), [["a"], ["ä"], ["z"]]);
+    close(re);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

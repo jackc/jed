@@ -1287,8 +1287,11 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   for (const s of snap.sequencesSorted()) {
     catEntries.push(concat([Uint8Array.of(2), sequenceEntryBytes(s)]));
   }
-  // Collation snapshots (kind 3, v17) — after sequences, before tables (spec/design/collation.md §5).
-  for (const c of snap.collationsSorted()) {
+  // Collation reference entries (kind 3, v18) — after sequences, before tables, so a collated table
+  // entry is read after the entry it references. Reference-only: emit one metadata entry per
+  // collation the SCHEMA references (columns + default), not an imported set
+  // (spec/design/collation.md §2/§5).
+  for (const c of snap.referencedCollations()) {
     catEntries.push(
       concat([Uint8Array.of(3), collationEntryBytes(c, snap.defaultCollation === c.name)]),
     );
@@ -1473,8 +1476,11 @@ export function incrementalImage(
   for (const s of snap.sequencesSorted()) {
     catEntries.push(concat([Uint8Array.of(2), sequenceEntryBytes(s)]));
   }
-  // Collation snapshots (kind 3, v17) — after sequences, before tables (spec/design/collation.md §5).
-  for (const c of snap.collationsSorted()) {
+  // Collation reference entries (kind 3, v18) — after sequences, before tables, so a collated table
+  // entry is read after the entry it references. Reference-only: emit one metadata entry per
+  // collation the SCHEMA references (columns + default), not an imported set
+  // (spec/design/collation.md §2/§5).
+  for (const c of snap.referencedCollations()) {
     catEntries.push(
       concat([Uint8Array.of(3), collationEntryBytes(c, snap.defaultCollation === c.name)]),
     );

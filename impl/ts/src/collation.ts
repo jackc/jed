@@ -530,9 +530,10 @@ export function vendoredCollation(name: string): Collation | undefined {
   return vendored().get(name);
 }
 
-// vendoredCollations returns every vendored collation, ascending by name — a deterministic order
-// with no hash-iteration leak (CLAUDE.md §8). Used by introspection (db.collations).
-export function vendoredCollations(): Collation[] {
+// vendoredCollationTables returns every vendored collation, ascending by name — a deterministic order
+// with no hash-iteration leak (CLAUDE.md §8). The raw tables; the public CollationInfo view is the
+// free vendoredCollations (executor.ts).
+export function vendoredCollationTables(): Collation[] {
   return [...vendored().values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 

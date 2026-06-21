@@ -105,12 +105,6 @@ func suitesDir() string {
 	}
 }
 
-// specDir is the repo's spec/ directory — the root that `# load-collation:` fixture paths resolve
-// against (spec/design/collation.md §10). suitesDir() is spec/conformance/suites.
-func specDir() string {
-	return filepath.Dir(filepath.Dir(suitesDir()))
-}
-
 // parseLoadCollationDirective parses a `# load-collation: <name> = <fixture>[, <fixture>…]` line —
 // the corpus's deterministic, host-free way to make a collation available before the records that
 // use it (spec/design/collation.md §10). In the reference-only model the named collation is normally
@@ -137,35 +131,17 @@ func parseLoadCollationDirective(line string) (string, []string, bool) {
 	return strings.TrimSpace(name), paths, true
 }
 
-// loadCollation makes a collation named `name` available to the records that follow
+// loadCollation asserts a collation named `name` is available to the records that follow
 // (spec/design/collation.md §2/§9/§10). In the reference-only model a collation is VENDORED into the
-// binary, so if `name` is vendored this is a no-op (the corpus exercises the vendored read path — no
-// import, nothing baked). Only a collation a build does not vendor falls back to compiling +
-// importing it from the `files` fixtures (the harness is test tooling, so the compile path is
-// allowed here). A read / compile / import failure fails the test.
-func loadCollation(db *jed.Database, name string, files []string) error {
+// binary; the directive only DECLARES the dependency, so this checks the build vendors it (no import,
+// nothing baked — the corpus exercises the pure vendored read path). A name this build does not vendor
+// fails the test, naming it (the directive's fixture paths are now a vestigial provenance note, not
+// loaded).
+func loadCollation(name string) error {
 	if jed.VendoredCollation(name) != nil {
-		return nil // vendored: usable as-is, the reference-only path
+		return nil
 	}
-	var def strings.Builder
-	for i, f := range files {
-		b, err := os.ReadFile(filepath.Join(specDir(), f))
-		if err != nil {
-			return fmt.Errorf("load-collation: cannot read fixture %s: %w", f, err)
-		}
-		if i > 0 {
-			def.WriteByte('\n')
-		}
-		def.Write(b)
-	}
-	coll, err := jed.CompileCollation(name, def.String())
-	if err != nil {
-		return fmt.Errorf("load-collation: compiling %s: %w", name, err)
-	}
-	if _, err := db.ImportCollation(coll); err != nil {
-		return fmt.Errorf("load-collation: importing %s: %w", name, err)
-	}
-	return nil
+	return fmt.Errorf("load-collation: collation %q is not vendored in this build", name)
 }
 
 func parseRequires(text string) []string {
@@ -585,11 +561,11 @@ func runFile(text string) error {
 			continue
 		}
 		if strings.HasPrefix(line, "#") {
-			// `# load-collation:` is an ACTION (make available now), not a pending assertion: ensure
-			// the named collation is available before the records run — vendored is a no-op, else
-			// compile + import from its fixtures (spec/design/collation.md §2/§9/§10).
-			if name, files, ok := parseLoadCollationDirective(line); ok {
-				if err := loadCollation(db, name, files); err != nil {
+			// `# load-collation:` is an ACTION (assert available now), not a pending assertion: the
+			// named collation must be vendored in this build before the records run
+			// (spec/design/collation.md §2/§9/§10).
+			if name, _, ok := parseLoadCollationDirective(line); ok {
+				if err := loadCollation(name); err != nil {
 					return err
 				}
 				i++

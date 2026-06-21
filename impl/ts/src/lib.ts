@@ -279,15 +279,15 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // boolean ⇄ i32 casts (the boolean cast slice — spec/types/casts.toml, types.md §9): both
   // directions explicit, i32 only (bool↔i16/i64 is a forbidden 42804).
   "cast.bool_int",
-  // The COLLATE expression operator + ORDER BY … COLLATE + db.importCollation (collation slice 1c,
-  // spec/design/collation.md §14): a host-loaded collation orders text by its UCA sort key in the
+  // The COLLATE expression operator + ORDER BY … COLLATE over a VENDORED collation (collation slice
+  // 1c, spec/design/collation.md §14): a vendored collation orders text by its UCA sort key in the
   // ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704, non-text
-  // COLLATE 42804; the `collate` cost unit. In-memory only (no persistence yet).
+  // COLLATE 42804; the `collate` cost unit.
   "expr.collate",
   // Per-column COLLATE in CREATE TABLE (collation slice 1d, spec/design/collation.md §1/§5): a
-  // column's effective collation is frozen at create (text-only 42804, loaded-or-C name 42704) and is
-  // its IMPLICIT collation — ORDER BY / comparisons use it with no explicit COLLATE; two different
-  // implicit collations conflict 42P22. Persisted via format_version 17 (goldens, not corpus).
+  // column's effective collation is frozen at create (text-only 42804, vendored-or-C name 42704) and
+  // is its IMPLICIT collation — ORDER BY / comparisons use it with no explicit COLLATE; two different
+  // implicit collations conflict 42P22. Persisted via format_version 18 (goldens, not corpus).
   "ddl.collate_column",
   "types.i16",
   "types.i32",
@@ -466,8 +466,9 @@ export {
   DEFAULT_PAGE_SIZE,
   Session,
   Snapshot,
+  vendoredCollations,
 } from "./executor.ts";
-export type { Outcome, SessionOptions, TxStatus } from "./executor.ts";
+export type { CollationInfo, Outcome, SessionOptions, TxStatus } from "./executor.ts";
 export { PrivilegeSet, Privileges, privilegeFromName } from "./privileges.ts";
 export type { Privilege } from "./privileges.ts";
 export { splitStatements } from "./split.ts";

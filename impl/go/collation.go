@@ -732,9 +732,10 @@ func VendoredCollation(name string) *Collation {
 	return vendored()[name]
 }
 
-// VendoredCollations returns every vendored collation, ascending by name — a deterministic order
-// with no hash-iteration leak (CLAUDE.md §8). Used by introspection (db.Collations).
-func VendoredCollations() []*Collation {
+// vendoredCollations returns every vendored collation, ascending by name — a deterministic order
+// with no hash-iteration leak (CLAUDE.md §8). The raw tables; the public CollationInfo view is the
+// package-level VendoredCollations (executor.go).
+func vendoredCollations() []*Collation {
 	m := vendored()
 	out := make([]*Collation, 0, len(m))
 	for _, c := range m {

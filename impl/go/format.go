@@ -568,8 +568,15 @@ func (s *Snapshot) ToImage(pageSize uint32, txid uint64) ([]byte, error) {
 	for _, sq := range s.sequencesSorted() {
 		catEntries = append(catEntries, append([]byte{2}, sequenceEntryBytes(sq)...))
 	}
-	// Collation snapshots (kind 3, v17) — after sequences, before tables (spec/design/collation.md §5).
-	for _, c := range s.collationsSorted() {
+	// Collation reference entries (kind 3, v18) — after sequences, before tables, so a collated table
+	// entry is read after the entry it references. Reference-only: emit one metadata entry per
+	// collation the SCHEMA references (columns + default), not an imported set
+	// (spec/design/collation.md §2/§5).
+	refColls, err := s.referencedCollations()
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range refColls {
 		catEntries = append(catEntries, append([]byte{3}, collationEntryBytes(c, s.defaultCollation == c.Name)...))
 	}
 	for ti, k := range keys {
@@ -774,8 +781,15 @@ func (s *Snapshot) incrementalImage(pageSize, startPage uint32, free []uint32, p
 	for _, sq := range s.sequencesSorted() {
 		catEntries = append(catEntries, append([]byte{2}, sequenceEntryBytes(sq)...))
 	}
-	// Collation snapshots (kind 3, v17) — after sequences, before tables (spec/design/collation.md §5).
-	for _, c := range s.collationsSorted() {
+	// Collation reference entries (kind 3, v18) — after sequences, before tables, so a collated table
+	// entry is read after the entry it references. Reference-only: emit one metadata entry per
+	// collation the SCHEMA references (columns + default), not an imported set
+	// (spec/design/collation.md §2/§5).
+	refColls, err := s.referencedCollations()
+	if err != nil {
+		return incrementalWrite{}, err
+	}
+	for _, c := range refColls {
 		catEntries = append(catEntries, append([]byte{3}, collationEntryBytes(c, s.defaultCollation == c.Name)...))
 	}
 	for ti, k := range keys {

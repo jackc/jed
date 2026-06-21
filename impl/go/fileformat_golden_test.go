@@ -693,16 +693,15 @@ func identityTableDB(t *testing.T) *Database {
 	return db
 }
 
-// collationTableDB is a baked COLLATION (v17 — entry_kind 3 snapshot + per-column collations): the
-// dev-root collation imported + set as the per-database default (is_default), a column with explicit
-// COLLATE "dev-root" (flags bit6 + name), an un-annotated column inheriting the default (bit6 + name),
-// and an explicit COLLATE "C" column (no collation). Must match the Ruby reference's COLLATION_TABLE.
+// collationTableDB is a reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column
+// collations): the vendored dev-root collation set as the per-database default (is_default), a column
+// with explicit COLLATE "dev-root" (flags bit6 + name), an un-annotated column inheriting the default
+// (bit6 + name), and an explicit COLLATE "C" column (no collation). dev-root is NOT imported — it is
+// vendored, and its metadata entry is emitted because the schema references it. Must match the Ruby
+// reference's COLLATION_TABLE.
 func collationTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import dev-root: %v", err)
-	}
-	if err := db.SetDefaultCollation("dev-root"); err != nil {
+	if err := db.SetDefaultCollation("dev-root"); err != nil { // vendored — no import
 		t.Fatalf("set default: %v", err)
 	}
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root", `+
@@ -714,13 +713,10 @@ func collationTableDB(t *testing.T) *Database {
 
 // collationPKTableDB: a collated text PRIMARY KEY + a collated secondary index (slice 1e,
 // encoding.md §2.12) — both keys store the dev-root UCA sort key, so the B-tree iterates in
-// collation order. The dev-root snapshot is baked (not the default). Must match the Ruby
-// reference's COLLATION_PK_TABLE.
+// collation order. dev-root is vendored (not the default; its entry is emitted because the columns
+// reference it). Must match the Ruby reference's COLLATION_PK_TABLE.
 func collationPKTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
-	if _, err := db.ImportCollation(devRoot(t)); err != nil {
-		t.Fatalf("import dev-root: %v", err)
-	}
 	run(t, db, `CREATE TABLE t (name text COLLATE "dev-root" PRIMARY KEY, tag text COLLATE "dev-root")`)
 	run(t, db, `CREATE INDEX t_tag_idx ON t (tag)`)
 	// Inserted out of collation order; stored in collation order ('a' < 'z' by the sort key).
