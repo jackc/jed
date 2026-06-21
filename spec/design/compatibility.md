@@ -22,10 +22,10 @@
 > dependency is write-time, not read-time**, so reads degrade to a heap-scan fallback instead of
 > failing. Collation version skew and built-in-function drift are **the same problem**
 > (stored bytes produced by a versioned computation) and get **one** solution here. This doc is
-> the cross-cutting contract that [collation.md](collation.md), [constraints.md](constraints.md)
-> (`DEFAULT` / generated columns), [indexes.md](indexes.md) (functional indexes), views, and the
-> host-function surface ([session.md](session.md), [extensibility.md §2](extensibility.md)) all
-> register into. The structural version layer is [../fileformat/format.md](../fileformat/format.md)
+> the cross-cutting contract that [collation.md](collation.md), [timezones.md](timezones.md)
+> (time-zone-dependent keys), [constraints.md](constraints.md) (`DEFAULT` / generated columns),
+> [indexes.md](indexes.md) (functional indexes), views, and the host-function surface
+> ([session.md](session.md), [extensibility.md §2](extensibility.md)) all register into. The structural version layer is [../fileformat/format.md](../fileformat/format.md)
 > (`format_version`); the legibility/host-boundary stance is CLAUDE.md §13; the cross-core
 > identity requirement is [determinism.md](determinism.md) (CLAUDE.md §2/§8).
 >
@@ -95,10 +95,20 @@ time.
 
 So jed does **not** build a bespoke collation-versioning mechanism and a separate
 function-versioning mechanism. It builds **one** discipline — version-tag the semantics, then
-freeze-or-degrade — and collation is its first instance ([collation.md](collation.md); §10
-here). Every built-in function carries a **semantics version** (bumped only when its output
-changes); every collation carries its `(unicode_version, cldr_version)`. Both flow through the
-same manifest and the same verdict.
+**reference-and-degrade** (or, where a value is genuinely stored, freeze) — and collation is its
+first instance ([collation.md](collation.md); §10 here). Every built-in function carries a
+**semantics version** (bumped only when its output changes); every collation carries its
+`(unicode_version, cldr_version)`. Both flow through the same manifest and the same verdict. (As of
+collation.md's reference-only pivot, collation does **not** freeze its tables into the file — they
+are **vendored into the binary** and the file references the version — making it the cleanest
+instance of the reference-and-degrade path; [timezones.md](timezones.md) does the same for tzdata.)
+
+A **time-zone-dependent stored key** is the same instance again: a functional index on
+`(ts AT TIME ZONE 'America/New_York')::date` stores keys produced by applying the IANA tzdata, so
+the **tzdata version** is the "computation version" and a tzdata bump stales those keys exactly as a
+CLDR reorder stales a collated index — while a *plain* `timestamptz` index is immune, because the
+stored value is UTC and its order uses no tz rule ([timezones.md §2/§5](timezones.md)). Same
+manifest, same verdict.
 
 ## 4. The two levers
 
@@ -143,9 +153,14 @@ Every fact a file's interpretation can rest on sits on this ladder, most-portabl
   binary of a compatible `format_version` (§13). The bedrock.
 - **Tier 1 — built-in scalar semantics.** Comparison/ordering, NULL/3VL, type codecs. Part of
   the spec contract; stable, changes only with a `format_version` bump. Portable.
-- **Tier 2 — versioned reference data.** Collation tables. Freezable (bake into the file) or
-  referenceable (`name`+version+hash); version handling lives in [collation.md §12](collation.md),
-  with the read-degradation softening of its current hard-fail proposed here (§8).
+- **Tier 2 — versioned reference data.** Collation tables; **IANA time-zone data**
+  ([timezones.md](timezones.md)); the Unicode property tables behind `lower`/`normalize`/regex. All
+  are **vendored into the binary at a pinned version** and **referenced** by the file (`name` +
+  version), never stored in it — the file records the version, the binary carries the data, and skew
+  between them is resolved by the graded verdict (§7/§8). Collation's version handling is
+  [collation.md §3/§12](collation.md) (its reference-only pivot makes it the worked instance, §10
+  here). Tz differs only in that its *base type is already version-independent* (UTC instants,
+  [timezones.md §2](timezones.md)), so only *derived* keys reach this tier.
 - **Tier 3 — built-in function semantics in stored expressions.** `DEFAULT`, functional indexes,
   generated columns, views that call built-ins. Gated by function *existence* and *semantics
   version*; read-portable per §4 except VIRTUAL/regular-view positions.
@@ -229,9 +244,9 @@ strategy — ignore every ordered structure and compute from values.
 - **Writes are disabled** for the object: a write would have to place a key into the distrusted
   order or evaluate the missing capability.
 
-This generalizes the read-only degradation proposed for collation version-skew — the softening
-of [collation.md §12](collation.md)'s current reference-mode hard-fail — to every Tier 2–3
-dependency.
+This is exactly the degradation [collation.md §12](collation.md) adopts for collation version-skew
+(its reference-only pivot), generalized to every Tier 2–3 dependency: a binary at a different
+vendored `(unicode, cldr)` heap-scans + recomputes rather than trusting a stale collated B-tree.
 
 **Open behavior (§12):** when the required capability is *entirely absent* (not merely a version
 mismatch) — e.g. the binary has no `de` at all and the query says `ORDER BY name COLLATE "de"` —
@@ -249,6 +264,11 @@ How each feature registers into the manifest, with its read/write tag and its fa
 - **Functional index** (future, [indexes.md](indexes.md)) — write-time for maintenance,
   optional for acceleration. Missing/ drifted function ⇒ index **not maintained, not used for
   acceleration**; base table reads via heap-scan; rebuild on re-establishment.
+- **Time-zone-dependent functional index / key** (future, [timezones.md §5](timezones.md)) —
+  write-time; a tzdata-version bump stales keys derived via `AT TIME ZONE 'const'` /
+  `date_trunc(…, 'zone')`. Same Tier-2 treatment as collation: pin one tzdata version per file,
+  version-stamp, degrade to heap-scan + rebuild on migration. Plain `timestamptz` keys are immune
+  (UTC, tz-free order), so only zone-derived keys register here.
 - **Generated column** (future, [constraints.md](constraints.md)) — **STORED** is write-time
   (value on disk, read-portable); **VIRTUAL** is read-time (computed on read, *not* portable —
   §11). Recommend **STORED-only** (§12).
@@ -276,15 +296,18 @@ Collation is Tier 2 and the first thing to exercise this model. The decisions re
   *all* its collations are that version, so two columns both `COLLATE "de"` can never disagree.
   Changing a file's version is a deliberate **migration** (rebuild collated indexes), never an
   accident of which binary touched it when.
-- **Bake or reference, with degradation.** *Bake* the compiled collation into the file (the
-  current default — [collation.md](collation.md) §3) for full read-write on any binary forever;
-  or *reference* it (`name`+version+hash) for small files, relying on the binary's vendored copy
-  and **degrading to read-only heap-scan** (§8) on mismatch instead of hard-failing.
-- **Vendor-vs-bake is the live decision (§12).** The size data (all non-CJK collation < ~2 MB,
-  and the universal Unicode property tables for `normalize`/`lower`/regex must be vendored
-  regardless — see the `lower`/`upper`/`normalize` work) argues for **vendoring collation in the
-  binary** as the *source* for new collations, while still baking into the file as the *freeze*.
-  The manifest + degradation here is what makes either choice safe.
+- **Reference-only, with degradation (settled).** [collation.md](collation.md) §3 pivoted to
+  **vendor the compiled tables into the binary** (at an embedder-chosen footprint tier) and have the
+  file **reference** them by `name` + version — it **never stores the table**. A binary at the file's
+  pinned version reads-writes fully; a binary at a different version (or a tier lacking the collation)
+  **degrades to read-only heap-scan** (§8) or refuses legibly — never silently re-orders. This is the
+  clean Tier-2 instance: no freeze path, no host-reimport hash, just reference + the graded verdict.
+- **Vendor-vs-bake is decided: vendor (settled).** The size data (all non-CJK collation < ~2 MB, and
+  the universal Unicode property tables for `normalize`/`lower`/regex are vendored regardless) means
+  storing tables per-file would not shrink the distribution — it would only duplicate vendored data
+  and add a cross-version-skew hazard. So collation is **vendored into the binary, referenced from the
+  file, never baked.** ([timezones.md](timezones.md) reaches the same conclusion for tzdata.) This
+  resolves the former open decision (§12).
 
 ## 11. The honest hard walls
 
@@ -314,14 +337,19 @@ triggering features land.
 - **Collation skew = function drift = one versioning discipline** (§3); semantics-version every
   built-in; pin one Unicode version per file (§10).
 - **Heap-scan read degradation** as the universal reduced mode (§8).
+- **Collation is vendored + reference-only, never baked** (§10) — settled in
+  [collation.md §3/§12](collation.md); the file references collations by `name` + `(unicode, cldr)`
+  version and the binary carries the (tiered) tables. tzdata follows the same shape
+  ([timezones.md](timezones.md)).
 - Lean toward **STORED-only generated columns** and **distinct host-vs-builtin marking** (§11).
 
 **Open (need a deliberate call before/at adoption):**
 
 1. **When to adopt** — this is the ≈1.0 on-disk-stability commitment; until then, clean-break is
    simpler and owes nothing (CLAUDE.md §1).
-2. **Bake vs vendor for collation** (§10) — and whether to vendor universal Unicode property
-   tables now (forced by `normalize`/`lower`/regex) and fold collation in alongside.
+2. **Whether to vendor universal Unicode property tables now** (forced by `normalize`/`lower`/regex)
+   on the same one-version-per-binary axis as collation (§10) — the *bake-vs-vendor* question is
+   settled (vendor); this is the remaining timing call.
 3. **`ORDER BY … COLLATE x` with `x` entirely absent** (§8) — error vs `C`-fallback.
 4. **Error-code shape** (§7) — register `XX002`; decide whether read-required built-in/collation
    gaps share it or get siblings; relation to `0A000`.
@@ -330,4 +358,5 @@ triggering features land.
 
 **Deferred features that will register here when built:** functional indexes
 ([indexes.md](indexes.md)), generated columns ([constraints.md](constraints.md)), views &
-materialized views, the host-function catalog ([session.md](session.md)).
+materialized views, the host-function catalog ([session.md](session.md)), and **time-zone-dependent
+keys** ([timezones.md](timezones.md) — the IANA tzdata version as a Tier-2 reference-data capability).

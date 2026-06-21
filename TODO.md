@@ -148,14 +148,20 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         string functions (`||`, `length`, `lower`/`upper`, `substring`).
   - [x] _follow-on:_ **linguistic collation (`COLLATE` / per-column / per-db default / UCA)** —
         ✅ **slice 1 (a–e) landed** ([collation.md](spec/design/collation.md)): jed-owned UCA
-        executor + compiler, no tables vendored in the binary; a collation is a first-class
-        **portable artifact** — produce (extract from host / compile / open) → save →
-        import/export — **baked into the db file** by default (zero index drift, self-describing)
-        with an optional **provenance description**; `COLLATE` expr/`ORDER BY`, per-column +
-        per-db default, and **collated keys** (UCA sort-key PRIMARY KEY/index/UNIQUE). Deterministic
-        collations only. Further locale/feature expansion (real DUCET + curated tailorings,
-        nondeterministic collations, host seam, reference mode, `LIKE` under non-`C`, CLDR
-        `shifted`, CJK) is recorded as **possibilities, not scheduled work** — collation.md §14.
+        executor + compiler; `COLLATE` expr/`ORDER BY`, per-column + per-db default, and **collated
+        keys** (UCA sort-key PRIMARY KEY/index/UNIQUE). Deterministic collations only.
+        - [ ] **slice 2 — reference-only / vendored-tier pivot** (design revised, **not yet built**):
+              flip from "vendor nothing, bake into the file by default" to **vendor the compiled
+              tables into each core** at an embedder-chosen footprint tier (`C`-only / non-CJK /
+              everything) and have the **file reference them by name + `(unicode, cldr)` version,
+              never baking a table**. `ExtractHostCollation`/`CompileCollation` become **build-time
+              tooling** (a pipeline: raw DUCET/CLDR → committed `.coll` → vendored), compiled out of
+              production; version skew handled by [compatibility.md](spec/design/compatibility.md)'s
+              manifest + graded verdict (read-only heap-scan / legible refusal). Removes the
+              format-17 baked snapshot (a format bump). Sub-slices 2a–2d in collation.md §14.
+        - [ ] Further locale/feature expansion (real DUCET + curated tailorings, nondeterministic
+              collations, `LIKE` under non-`C`, CLDR `shifted`, CJK tier-3 data) — **possibilities,
+              not scheduled work**, collation.md §14.
 - [x] **Exact `decimal`** — *the* headline type: hand-rolled sign+coefficient+scale, round-half-away
       (settles the §8 rounding hotspot), PG result scales, first parameterized + first cross-family
       promotion; finite-only (documented PG divergence). → [decimal.md](spec/design/decimal.md)
