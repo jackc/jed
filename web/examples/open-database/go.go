@@ -11,7 +11,7 @@ func main() {
 	// Open a database. A path creates a single-file database on disk; jed.NewDatabase() is a
 	// transient in-memory one. Writes accumulate until an explicit commit (close discards
 	// uncommitted changes).
-	db, err := jed.Create("people.jed", jed.DatabaseOptions{})
+	db, err := jed.Create("people.jed", jed.DatabaseOptions{PageSize: jed.DefaultPageSize})
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -27,8 +27,8 @@ func main() {
 	if err != nil {
 		log.Fatal(err)
 	}
-	for _, row := range rows.Rows {
-		fmt.Println(jed.Render(row[0]))
+	for rows.Next() {
+		fmt.Println(rows.Row()[0].Render())
 	}
 }
 
