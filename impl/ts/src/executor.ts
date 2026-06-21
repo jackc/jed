@@ -79,6 +79,7 @@ import {
   type Collation,
   serializeTable,
   sortKey as collationSortKey,
+  vendoredCollation,
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
 import { crc32Ieee } from "./format.ts";
@@ -401,8 +402,18 @@ export class Snapshot {
     );
   }
 
-  // collation looks up a loaded collation by its exact (case-sensitive) name. C is NOT here — it is
-  // table-free and built in (spec/design/collation.md §1). undefined ⇒ not loaded (resolver → 42704).
+  // resolveCollation resolves a collation name for USE — query resolution and key encoding
+  // (spec/design/collation.md §2/§9). The database's referenced collations first, then the set
+  // VENDORED into this binary. undefined ⇒ neither has it (resolver → 42704). C is handled by the
+  // caller (built-in). This is the reference-only read path: a collation need not be baked into the
+  // file to be used — the file references it by name and the table comes from the vendored set.
+  resolveCollation(name: string): Collation | undefined {
+    return this.collations.get(name) ?? vendoredCollation(name);
+  }
+
+  // collation looks up a collation the database REFERENCES (imported / baked) by its exact
+  // (case-sensitive) name. C is NOT here — table-free and built in (spec/design/collation.md §1).
+  // undefined ⇒ not referenced by this database. Catalog-local only; for USE prefer resolveCollation.
   collation(name: string): Collation | undefined {
     return this.collations.get(name);
   }
@@ -1251,7 +1262,7 @@ export class Database {
   private columnCollations(columns: Column[]): (Collation | null)[] {
     const snap = this.readSnap();
     return columns.map((c) =>
-      c.collation !== null ? (snap.collation(c.collation) ?? null) : null,
+      c.collation !== null ? (snap.resolveCollation(c.collation) ?? null) : null,
     );
   }
 
@@ -1535,6 +1546,13 @@ export class Database {
   // reach it (the readSnap seam is private), mirroring compositeType.
   collationByName(name: string): Collation | undefined {
     return this.readSnap().collation(name);
+  }
+
+  // resolveCollationByName resolves a collation for USE — the database's referenced collations then
+  // the binary's vendored set (spec/design/collation.md §2/§9). The reference-only read path; mirrors
+  // collationByName but with the vendored fallback. undefined ⇒ neither has it (resolver → 42704).
+  resolveCollationByName(name: string): Collation | undefined {
+    return this.readSnap().resolveCollation(name);
   }
 
   // colTypeOf resolves a catalog Type into a self-contained ColType against the visible snapshot's
@@ -14181,7 +14199,7 @@ function resolve(
 // loaded (db.importCollation), else 42704.
 function resolveCollationName(catalog: Database, name: string): Collation | null {
   if (name === "C") return null;
-  const c = catalog.collationByName(name);
+  const c = catalog.resolveCollationByName(name);
   if (c === undefined) {
     throw engineError(
       "undefined_object",

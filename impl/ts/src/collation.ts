@@ -17,6 +17,7 @@ import { engineError } from "./errors.ts";
 import { crc32Ieee } from "./format.ts";
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
 import { encodeTerminated } from "./encoding.ts";
+import { VENDORED_COLL } from "./collationdata/vendored.ts";
 
 // One collation element — a weight triple plus a flags byte. 7 bytes on disk
 // (spec/collation/README.md §2). A 0x0000 weight is ignorable at that level (skipped, §4).
@@ -496,6 +497,43 @@ export function openCollation(bytes: Uint8Array): Collation {
   if (crc32Ieee(table) !== hash) throw corruptErr("collation: artifact content hash mismatch");
   const [singles, contractions] = deserializeTable(table);
   return { name, unicodeVersion, cldrVersion, description, singles, contractions };
+}
+
+// --- Vendored collation set (spec/design/collation.md §2/§9) ------------------------------------
+//
+// In the reference-only model the engine reads collations from a set VENDORED into the binary, not
+// from the database file (the file only references a collation by name + version). Production
+// openCollations these embedded .coll artifacts once and serves every later use from them. This is
+// the dev fixture set (dev-root, dev-nordic); the real version-pinned DUCET + curated tailorings and
+// the embedder-chosen footprint tiers (§13) are later slices (§14, 2a/2f). The bytes are inlined as
+// base64 (browser-safe — no node:fs) in the generated collationdata/vendored.ts, synced from
+// spec/collation/fixtures by scripts/vendor_collations.rb and byte-identical across cores (§9/§10).
+
+let vendoredCache: Map<string, Collation> | null = null;
+
+function vendored(): Map<string, Collation> {
+  if (vendoredCache === null) {
+    vendoredCache = new Map();
+    for (const b64 of Object.values(VENDORED_COLL)) {
+      const bytes = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
+      const coll = openCollation(bytes);
+      vendoredCache.set(coll.name, coll);
+    }
+  }
+  return vendoredCache;
+}
+
+// vendoredCollation looks up a collation VENDORED into this binary by its exact (case-sensitive)
+// name (spec/design/collation.md §2/§9). undefined ⇒ not vendored. "C" is never here (table-free,
+// built in). The resolver consults the database's referenced collations first, then this set.
+export function vendoredCollation(name: string): Collation | undefined {
+  return vendored().get(name);
+}
+
+// vendoredCollations returns every vendored collation, ascending by name — a deterministic order
+// with no hash-iteration leak (CLAUDE.md §8). Used by introspection (db.collations).
+export function vendoredCollations(): Collation[] {
+  return [...vendored().values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
 function deserializeTable(table: Uint8Array): [SingleEntry[], ContractionEntry[]] {

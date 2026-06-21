@@ -11,7 +11,12 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { close, commit, create, Database, execute, open } from "../src/lib.ts";
-import { type Collation, compileCollation } from "../src/collation.ts";
+import {
+  type Collation,
+  compileCollation,
+  vendoredCollation,
+  vendoredCollations,
+} from "../src/collation.ts";
 import { specPath } from "./tomlmini.ts";
 import { errCode, query } from "./util.ts";
 
@@ -215,4 +220,51 @@ test("collated secondary index and unique keys", () => {
     ["A"],
     ["b"],
   ]);
+});
+
+// ---- slice 2: vendored / reference-only read path (collation.md §2/§3/§9) ----
+//
+// In the reference-only model a collation is VENDORED into the binary, so it is usable WITHOUT any
+// db.importCollation — the database references it by name and the table comes from the vendored set.
+// These assert that no-import path directly (the corpus still imports, so it cannot express this —
+// CLAUDE.md §10). dev-root and dev-nordic are the vendored dev fixtures (§14, 2a). Mirrors
+// impl/rust/tests/collation_host.rs and impl/go/collation_host_test.go.
+
+test("vendored collation used without import", () => {
+  // No import: COLLATE "dev-root" resolves from the binary's vendored set. 'ä' < 'z' is true under
+  // dev-root (ä near a), the opposite of C byte order — proving the vendored table is used.
+  const db = new Database();
+  assert.equal(db.collations().length, 0); // nothing imported / referenced by this database
+  assert.deepEqual(query(db, `SELECT 'ä' < 'z' COLLATE "dev-root"`), [["true"]]);
+});
+
+test("vendored per-column collation without import", () => {
+  // A COLLATE "dev-root" column works with NO import: CREATE TABLE validation and the key encoder
+  // both fall back to the vendored set, so the collated ORDER BY uses dev-root order — ä between a
+  // and z.
+  const db = new Database();
+  exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root")`);
+  exec(db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`);
+  assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name`), [["a"], ["ä"], ["z"]]);
+  // The database referenced dev-root by name but never baked it — collations() (referenced set)
+  // stays empty; the table came from the vendored set.
+  assert.equal(db.collations().length, 0);
+});
+
+test("unknown collation is still 42704", () => {
+  // The vendored fallback must not mask an unknown name: a collation neither referenced nor vendored
+  // is still 42704 (undefined_object).
+  const db = new Database();
+  assert.equal(errCode(() => query(db, `SELECT 'x' COLLATE "no-such-collation"`)), "42704");
+});
+
+test("vendored set is the dev fixtures", () => {
+  // The binary vendors the dev fixture set, ascending by name (deterministic, §8). C is never
+  // vendored (table-free, built in).
+  assert.deepEqual(
+    vendoredCollations().map((c) => c.name),
+    ["dev-nordic", "dev-root"],
+  );
+  assert.notEqual(vendoredCollation("dev-root"), undefined);
+  assert.equal(vendoredCollation("C"), undefined);
 });
