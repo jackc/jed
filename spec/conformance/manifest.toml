@@ -57,6 +57,10 @@ id = "ddl.drop_table"
 description = "DROP TABLE — remove a table (definition + rows) from the catalog; missing table is 42P01 (grammar.md §13)"
 
 [[capability]]
+id = "ddl.temp_table"
+description = "CREATE [TEMP|TEMPORARY] TABLE + DROP — session-local temporary tables that make ZERO writes to the database file (held in a per-session temp snapshot outside the serialized catalog, no format_version change — spec/design/temp-tables.md §2). Full CRUD (INSERT/SELECT/UPDATE/DELETE) + PRIMARY KEY / UNIQUE / CHECK / NOT NULL / DEFAULT, dropped at session close. TEMP/TEMPORARY are non-reserved, positional between CREATE and TABLE (a table named 'temp' stays persistent). Namespace PRECLUDES overlaps (a temp name colliding with temp OR persistent is 42P07; a documented PG divergence — no pg_temp shadowing — §3). Deferred on a temp table this slice, each 0A000 (§8): FOREIGN KEY, serial/IDENTITY, composite-typed columns, COLLATE columns, standalone CREATE INDEX. The DDL is gated by session.allow_temp_ddl; the storage footprint by resource.temp_budget. The database-wide SHARED form is a later slice (§1/§13)"
+
+[[capability]]
 id = "ddl.not_null"
 description = "NOT NULL column constraint — storing NULL (direct, defaulted, or omitted) traps 23502 (spec/design/constraints.md §1)"
 
@@ -609,6 +613,10 @@ id = "resource.composite_depth_limit"
 description = "Fixed maximum composite-type nesting depth (MAX_COMPOSITE_DEPTH = 32), enforced at the two producers of catalog types: a CREATE TYPE whose result would nest deeper than the limit aborts with 54001 (statement_too_complex), and a loaded catalog that exceeds it is rejected as corrupt with XX001 (data_corrupted) (CLAUDE.md §13; spec/design/cost.md §7b, composite.md §3). The third native-stack untrusted-query gate, completing resource.depth_limit's coverage: a chain of cheap CREATE TYPEs each nesting the previous (`a`, `b AS (x a)`, …) builds unbounded depth across MANY statements — which neither the per-statement input-size cap (resource.sql_length_limit) nor the parser nesting counter (resource.depth_limit) sees, because the depth is a property of the catalog graph, not any one statement's AST. Bounding it at the producer makes every derived recursive walk (value codec, comparator, record_out/record_in, resolve_col_type) transitively stack-safe. An array field counts as its element (array levels are not composite levels — composite_ref looks through one array level). A deterministic, cross-core-identical constant (a documented divergence from PG, which bounds composite nesting only by a runtime stack probe), so not oracle-checked. Builds on types.composite."
 
 [[capability]]
+id = "resource.temp_budget"
+description = "Temporary-table storage budget (spec/design/temp-tables.md §7) — the §13 gate on RETAINED temp bytes, the hazard no cost ceiling covers (max_cost bounds work per statement, lifetime_max_cost across statements; neither bounds bytes a temp table HOLDS between cheap statements). `temp_buffers` (a per-session byte budget, 0 ⇒ unlimited) bounds a session's total temp footprint; an over-budget temp write aborts 54P03 (temp_storage_limit_exceeded). Measured in BYTE-IDENTICAL on-disk record bytes (record_size, summed over every temp table + index store — NOT the per-core work_mem spill estimator), checked per-statement, so the abort point is a pure function of (operations, budget), identical across cores (§8). The over-budget write is staged, so the abort rolls it back (nothing commits); the within-statement bound stays max_cost. The `# temp_buffers: N` directive sets the per-record budget (like `# max_cost:`). jed-specific (PostgreSQL bounds temp storage only via nondeterministic OS limits), so cross-core-checked, not oracle-checked. Builds on ddl.temp_table."
+
+[[capability]]
 id = "resource.pure_builtins"
 description = "The built-in function/operator surface is pure and side-effect-free, and the grammar exposes no host-reaching statement (CLAUDE.md §13 guarantee #2; spec/design/functions.md §13). The THIRD untrusted-query safety pillar: the first two BOUND a query (cost ceiling, nesting depth), this one bounds what it can REACH. No built-in touches the filesystem, network, process, or environment, and none adds nondeterminism outside the host-injected entropy/clock seam (uuidv4/uuidv7, now()/clock_timestamp()). Enforced as absence: a host-reaching function call is 42883 (undefined_function) and a host-reaching statement keyword is 42601 (syntax_error). A documented divergence from PostgreSQL (which provides pg_read_file/COPY/pg_sleep/current_setting/...), so not oracle-checked; pinned by suites/resource/no_escape_hatch.test."
 
@@ -626,6 +634,10 @@ description = "Per-object GRANT/REVOKE authorization — per-table SELECT/INSERT
 [[capability]]
 id = "session.allow_ddl"
 description = "The single DDL gate — a session capability `allow_ddl` (default on) governing CREATE/DROP/ALTER of tables, indexes, types, and sequences; a denied schema change is 42501 (spec/design/session.md §5.3). jed has no schema/owner model (CLAUDE.md §3), so all DDL folds under one boolean (a per-object CREATE/ownership privilege is a deferred follow-on). The `# allow_ddl: on|off` directive sets it for the next record. jed-specific (host-configured), so cross-core-checked, not oracle-checked. Builds on session.privileges."
+
+[[capability]]
+id = "session.allow_temp_ddl"
+description = "The temp-scoped split of the DDL gate (spec/design/temp-tables.md §5) — `allow_temp_ddl` governs CREATE/DROP of a SESSION-LOCAL temporary table, independent of `allow_ddl` (which now scopes to persistent DDL). The split lets a host serve an untrusted session bounded scratch tables (allow_ddl off + allow_temp_ddl on) while withholding persistent schema changes; the two new gates (the other is allow_shared_temp_ddl, a later slice) default-inherit allow_ddl's value, so existing callers are unaffected. CREATE TEMP is gated statically; DROP of a temp table is gated by resolving the name. A denied temp DDL is 42501. The `# allow_temp_ddl: on|off` directive sets it for the next record. jed-specific (host-configured), so cross-core-checked, not oracle-checked. Builds on session.allow_ddl and ddl.temp_table."
 
 # Per-session cumulative cost budget (spec/design/session.md §5.4). Sibling to resource.cost_limit:
 # where `max_cost` bounds ONE statement (54P01), `lifetime_max_cost` bounds the whole SESSION (54P02).

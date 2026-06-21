@@ -1,0 +1,63 @@
+# Temp-table storage budget — `temp_buffers` bounds a session's RETAINED temporary-table bytes
+# (spec/design/temp-tables.md §7), the §13 hazard no cost ceiling covers (max_cost bounds work per
+# statement, lifetime_max_cost across statements; neither bounds bytes a temp table HOLDS between
+# cheap statements). An over-budget temp write aborts 54P03; the measure is byte-identical on-disk
+# record bytes, checked per-statement, so the abort point is part of the CROSS-CORE contract (no
+# reference impl, §2). The `# temp_buffers: N` directive runs the next record under a byte budget
+# (like `# max_cost:`); 0/absent ⇒ unlimited. jed-specific (PG bounds temp storage only via
+# nondeterministic OS limits), so cross-core-checked, not oracle-checked.
+# requires: ddl.temp_table, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.i32, resource.temp_budget
+
+statement ok
+CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32)
+
+# A tiny budget (8 bytes): any real row's on-disk record exceeds it, so the insert aborts 54P03.
+# temp_buffers: 8
+statement error 54P03
+INSERT INTO t VALUES (1, 1)
+
+# The over-budget insert rolled back — the table is still empty (nothing committed).
+query I rowsort
+SELECT id FROM t
+----
+
+# With no budget in force (unlimited), inserts succeed and persist.
+statement ok
+INSERT INTO t VALUES (1, 1), (2, 2), (3, 3)
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+
+# Re-imposing the tiny budget: the session is already over it (3 rows committed), so any further
+# temp write aborts 54P03 — and rolls back, leaving the three committed rows intact.
+# temp_buffers: 8
+statement error 54P03
+INSERT INTO t VALUES (4, 4)
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+3
+
+# The budget is per-session temp storage only — a persistent table is never bounded by it.
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY)
+
+# temp_buffers: 8
+statement ok
+INSERT INTO p VALUES (1), (2), (3), (4), (5)
+
+query I nosort
+SELECT id FROM p ORDER BY id
+----
+1
+2
+3
+4
+5

@@ -1,0 +1,125 @@
+# Temporary tables — SESSION-LOCAL temp tables that make ZERO writes to the database file
+# (spec/design/temp-tables.md). They live in a per-session temp snapshot outside the serialized
+# catalog, so there is no format_version change; they support full CRUD + PK/UNIQUE/CHECK/NOT NULL/
+# DEFAULT, are dropped at session close, and PRECLUDE namespace overlaps (a documented divergence
+# from PostgreSQL's pg_temp shadowing — §3), so this suite is jed-specific: CROSS-CORE-checked, NOT
+# PostgreSQL-oracle-checked (the divergences + the host-configured allow_temp_ddl gate cannot be
+# reproduced via the same SQL). Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.temp_table, ddl.create_table, ddl.primary_key, ddl.drop_table, ddl.unique, dml.insert, dml.insert_multi_row, dml.update, dml.delete, query.select, query.order_by, query.where_eq, types.i32, session.allow_temp_ddl
+
+# --- full CRUD on a session-local temp table --------------------------------------------------
+
+statement ok
+CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+query I rowsort
+SELECT v FROM t
+----
+10
+20
+30
+
+# a point lookup uses the temp table's primary key
+query I nosort
+SELECT v FROM t WHERE id = 2
+----
+20
+
+statement ok
+UPDATE t SET v = 99 WHERE id = 1
+
+query I nosort
+SELECT v FROM t WHERE id = 1
+----
+99
+
+statement ok
+DELETE FROM t WHERE id = 3
+
+query I nosort
+SELECT id FROM t ORDER BY id
+----
+1
+2
+
+# TEMPORARY is a synonym for TEMP
+statement ok
+CREATE TEMPORARY TABLE t2 (id i32 PRIMARY KEY)
+
+# --- PRIMARY KEY + UNIQUE enforced on a temp table --------------------------------------------
+
+statement ok
+CREATE TEMP TABLE u (id i32 PRIMARY KEY, e i32 UNIQUE)
+
+statement ok
+INSERT INTO u VALUES (1, 100)
+
+statement error 23505
+INSERT INTO u VALUES (1, 200)
+
+statement error 23505
+INSERT INTO u VALUES (2, 100)
+
+# --- preclude-overlaps (a PG divergence — no pg_temp shadowing) --------------------------------
+
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY)
+
+# a temp name colliding with an existing persistent relation is 42P07
+statement error 42P07
+CREATE TEMP TABLE p (id i32 PRIMARY KEY)
+
+# and a persistent name colliding with an existing temp table is 42P07 (t still exists)
+statement error 42P07
+CREATE TABLE t (id i32 PRIMARY KEY)
+
+# --- TEMP is positional: a table NAMED "temp" is an ordinary persistent table -----------------
+
+statement ok
+CREATE TABLE temp (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO temp VALUES (5, 50)
+
+query I nosort
+SELECT v FROM temp WHERE id = 5
+----
+50
+
+# --- DROP a temp table; afterwards it is gone (42P01) -----------------------------------------
+
+statement ok
+DROP TABLE t
+
+statement error 42P01
+SELECT id FROM t
+
+# --- deferred narrowings on a temp table are clean 0A000 (temp-tables.md §8) ------------------
+
+statement error 0A000
+CREATE TEMP TABLE bad (id serial PRIMARY KEY)
+
+statement error 0A000
+CREATE TEMP TABLE bad (id i32 PRIMARY KEY, pid i32 REFERENCES p)
+
+# --- the allow_temp_ddl capability gate (temp-tables.md §5) ------------------------------------
+
+# temp DDL is denied when allow_temp_ddl is off
+# allow_temp_ddl: off
+statement error 42501
+CREATE TEMP TABLE denied (id i32 PRIMARY KEY)
+
+# the untrusted-scratch split: persistent DDL withheld, temp DDL granted —
+# a persistent CREATE is denied...
+# allow_ddl: off
+statement error 42501
+CREATE TABLE persistent_denied (id i32 PRIMARY KEY)
+
+# ...while a temp CREATE under the same restriction succeeds
+# allow_ddl: off
+# allow_temp_ddl: on
+statement ok
+CREATE TEMP TABLE scratch (id i32 PRIMARY KEY)
