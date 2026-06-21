@@ -2160,9 +2160,10 @@ Full behavior, the arbiter model, the `21000` rule, cost, and the PG divergences
 ## 47. `COLLATE` and `ORDER BY … COLLATE` ([collation.md](collation.md))
 
 `expr COLLATE "name"` is PostgreSQL's postfix collation operator: it yields the same value with an
-**explicit** collation for the surrounding comparison / sort ([collation.md](collation.md) §1). A
-collation must be **loaded** first (the host `db.ImportCollation`, or the corpus
-`# load-collation:` directive); `"C"` is the built-in byte / code-point order and is always available.
+**explicit** collation for the surrounding comparison / sort ([collation.md](collation.md) §1). The
+named collation must be **vendored** into the binary ([collation.md](collation.md) §2/§9; the corpus
+`# load-collation:` directive declares the dependency); `"C"` is the built-in byte / code-point order
+and is always available.
 
 **Precedence — the postfix / typecast rung.** COLLATE binds at the **same level as `::` / `[]` /
 `.field`** ([grammar.ebnf](../grammar/grammar.ebnf) `postfix`), so it is **tighter than `||` and the

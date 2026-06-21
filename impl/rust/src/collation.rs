@@ -613,16 +613,15 @@ const VENDORED_COLL: &[(&str, &[u8])] = &[
     ),
 ];
 
-static VENDORED: std::sync::OnceLock<
-    std::collections::HashMap<String, std::sync::Arc<Collation>>,
-> = std::sync::OnceLock::new();
+static VENDORED: std::sync::OnceLock<std::collections::HashMap<String, std::sync::Arc<Collation>>> =
+    std::sync::OnceLock::new();
 
 fn vendored() -> &'static std::collections::HashMap<String, std::sync::Arc<Collation>> {
     VENDORED.get_or_init(|| {
         let mut m = std::collections::HashMap::new();
         for (label, bytes) in VENDORED_COLL {
-            let coll = open_collation(bytes)
-                .unwrap_or_else(|e| panic!("vendored collation {label}: {e}"));
+            let coll =
+                open_collation(bytes).unwrap_or_else(|e| panic!("vendored collation {label}: {e}"));
             m.insert(coll.name.clone(), std::sync::Arc::new(coll));
         }
         m

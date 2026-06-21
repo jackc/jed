@@ -1153,11 +1153,7 @@ impl Database {
         let snap = self.read_snap();
         columns
             .iter()
-            .map(|c| {
-                c.collation
-                    .as_ref()
-                    .and_then(|n| snap.resolve_collation(n))
-            })
+            .map(|c| c.collation.as_ref().and_then(|n| snap.resolve_collation(n)))
             .collect()
     }
 

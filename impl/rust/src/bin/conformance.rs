@@ -112,10 +112,10 @@ fn spec_dir() -> PathBuf {
 }
 
 /// Parse a `# load-collation: <name> = <fixture-path>[, <fixture-path>…]` directive body — the
-/// corpus's deterministic, host-free way to load a collation before the records that use it
-/// (spec/design/collation.md §10). Fixture paths are relative to `spec/` and concatenated
-/// (newline-joined) into one definition stream, then compiled + imported. Returns the collation
-/// name and its fixture paths, or None if this comment is not a load-collation directive.
+/// corpus's deterministic, host-free way to make a collation available before the records that use
+/// it (spec/design/collation.md §10). In the reference-only model the named collation is normally
+/// **vendored** (so the fixtures are an unused-but-documented fallback for a not-yet-vendored name,
+/// `load_collation`). Returns the collation name and its fixture paths, or None if not this directive.
 fn parse_load_collation_directive(rest: &str) -> Option<(String, Vec<String>)> {
     let body = rest.trim_start().strip_prefix("load-collation:")?.trim();
     let (name, files) = body.split_once('=')?;
@@ -130,13 +130,20 @@ fn parse_load_collation_directive(rest: &str) -> Option<(String, Vec<String>)> {
     Some((name.trim().to_string(), files))
 }
 
-/// Compile + import a collation named `name` from the `files` fixtures (relative to `spec/`) into
-/// `db` (spec/design/collation.md §4/§10). A read / compile / import failure fails the test file.
+/// Make a collation named `name` available to the records that follow (spec/design/collation.md
+/// §2/§9/§10). In the reference-only model a collation is **vendored into the binary**, so if `name`
+/// is vendored this is a no-op (the corpus exercises the vendored read path — no import, nothing
+/// baked). Only a collation a build does *not* vendor falls back to compiling + importing it from
+/// the `files` fixtures (the harness is test tooling, so the compile path is allowed here). A read /
+/// compile / import failure fails the test file.
 fn load_collation(
     db: &mut Database,
     name: &str,
     files: &[String],
 ) -> std::result::Result<(), String> {
+    if jed::collation::vendored_collation(name).is_some() {
+        return Ok(()); // vendored: usable as-is, the reference-only path
+    }
     let mut def = String::new();
     for f in files {
         let text = std::fs::read_to_string(spec_dir().join(f))
@@ -440,9 +447,9 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('#') {
-            // `# load-collation:` is an ACTION (load now), not a pending assertion: compile + import
-            // the named collation from its fixtures into this file's db before the records run
-            // (spec/design/collation.md §10).
+            // `# load-collation:` is an ACTION (make available now), not a pending assertion: ensure
+            // the named collation is available before the records run — vendored is a no-op, else
+            // compile + import from its fixtures (spec/design/collation.md §2/§9/§10).
             if let Some((name, files)) = parse_load_collation_directive(rest) {
                 load_collation(&mut db, &name, &files)?;
                 continue;

@@ -24,7 +24,11 @@
 > `COLLATE` operator + `ORDER BY … COLLATE`, `db.ImportCollation` in-memory, the `collate` cost
 > unit, and the `# load-collation:` corpus directive — `suites/collation/collate.test`) are
 > implemented in all three cores (`impl/{rust,go,ts}`)
-> ([../design/collation.md §14](../design/collation.md)). The dev fixture (§5) is a small
+> ([../design/collation.md §14](../design/collation.md)). **Reference-only pivot (slice 2):** the
+> compiled `.coll` artifacts here are **vendored into each core** and read at startup; a collation is
+> used by reference (the database file records only its name + version, never the table), and the
+> `# load-collation:` directive now declares which vendored collation a test needs rather than
+> importing one ([../design/collation.md §2/§9](../design/collation.md)). The dev fixture (§5) is a small
 > hand-authored subset; the version-pinned real DUCET + curated locale tailorings land with a
 > later slice (1f). The verification vectors (§6) are **populated** — produced by the Rust core
 > (`impl/rust/src/bin/gen_collation_vectors.rs`) and cross-confirmed byte-for-byte by Go and TS

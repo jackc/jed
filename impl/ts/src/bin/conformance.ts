@@ -7,7 +7,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
-import { compileCollation } from "../collation.ts";
+import { compileCollation, vendoredCollation } from "../collation.ts";
 import {
   advancingClock,
   Database,
@@ -46,9 +46,10 @@ function specDir(): string {
 }
 
 // parseLoadCollationDirective parses a `# load-collation: <name> = <fixture>[, <fixture>…]` line —
-// the corpus's deterministic, host-free way to load a collation before the records that use it
-// (spec/design/collation.md §10). Fixture paths are relative to spec/ and concatenated (newline-
-// joined) into one definition stream. Returns [name, paths] or null if not this directive.
+// the corpus's deterministic, host-free way to make a collation available before the records that use
+// it (spec/design/collation.md §10). In the reference-only model the named collation is normally
+// VENDORED (so the fixtures are an unused-but-documented fallback for a not-yet-vendored name,
+// loadCollation). Returns [name, paths] or null if not this directive.
 function parseLoadCollationDirective(line: string): [string, string[]] | null {
   const rest = line.slice(1).trim();
   if (!rest.startsWith("load-collation:")) return null;
@@ -65,10 +66,14 @@ function parseLoadCollationDirective(line: string): [string, string[]] | null {
   return [name, paths];
 }
 
-// loadCollation compiles + imports a collation named `name` from the `files` fixtures (relative to
-// spec/) into db (spec/design/collation.md §4/§10). A read / compile / import failure throws (failing
-// the test).
+// loadCollation makes a collation named `name` available to the records that follow
+// (spec/design/collation.md §2/§9/§10). In the reference-only model a collation is VENDORED into the
+// binary, so if `name` is vendored this is a no-op (the corpus exercises the vendored read path — no
+// import, nothing baked). Only a collation a build does not vendor falls back to compiling +
+// importing it from the `files` fixtures (the harness is test tooling, so the compile path is allowed
+// here). A read / compile / import failure throws (failing the test).
 function loadCollation(db: Database, name: string, files: string[]): void {
+  if (vendoredCollation(name) !== undefined) return; // vendored: usable as-is, the reference-only path
   const def = files
     .map((f) => readFileSync(join(specDir(), f), "utf8"))
     .join("\n");
@@ -488,9 +493,9 @@ function runFile(text: string): void {
       continue;
     }
     if (line.startsWith("#")) {
-      // `# load-collation:` is an ACTION (load now), not a pending assertion: compile + import the
-      // named collation from its fixtures into this file's db before the records run
-      // (spec/design/collation.md §10).
+      // `# load-collation:` is an ACTION (make available now), not a pending assertion: ensure the
+      // named collation is available before the records run — vendored is a no-op, else compile +
+      // import from its fixtures (spec/design/collation.md §2/§9/§10).
       const lc = parseLoadCollationDirective(line);
       if (lc !== null) {
         loadCollation(db, lc[0], lc[1]);

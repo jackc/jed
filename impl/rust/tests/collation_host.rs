@@ -388,7 +388,10 @@ fn vendored_set_is_the_dev_fixtures() {
         .iter()
         .map(|c| c.name.clone())
         .collect();
-    assert_eq!(names, vec!["dev-nordic".to_string(), "dev-root".to_string()]);
+    assert_eq!(
+        names,
+        vec!["dev-nordic".to_string(), "dev-root".to_string()]
+    );
     assert!(jed::collation::vendored_collation("dev-root").is_some());
     assert!(jed::collation::vendored_collation("C").is_none());
 }

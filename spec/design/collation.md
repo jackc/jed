@@ -671,19 +671,25 @@ sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
 > host-load* path (`db.ImportCollation` baking, the format-17 baked snapshot) is **superseded by the
 > reference-only pivot below** and is removed at that slice. The entries are kept as the build record.
 
-**Slice 2 — the reference-only / vendored-tier pivot** (this revision; **not yet built**), in
+**Slice 2 — the reference-only / vendored-tier pivot** (this revision; **in progress**), in
 dependency order, and landing with or behind the [compatibility.md](compatibility.md) manifest it
 leans on:
 
-- **2a — the build-time vendoring pipeline** (§9): `ExtractHostCollation`/`CompileCollation` move to
-  a build/tools target compiled out of the production engine; the committed `spec/collation/<ver>/`
-  `.coll` set becomes the source the cores embed; a `rake` task + CI reproducibility check (re-run
-  pipeline, diff committed `.coll`). The real version-pinned DUCET + curated non-CJK tailorings
-  (`en-US`, `de`, `fr`, `es`, `sv`, `da`) replace the dev fixtures, pinned `(unicode, cldr)`.
-- **2b — vendored read path + tiers** (§2/§13): production reads the embedded `.coll` at startup via
-  `OpenCollation`; the three build tiers (`C`-only / non-CJK / everything) gate which `.coll` are
-  embedded; remove `db.ImportCollation`/`ExportCollation`/`LoadHostCollation` from production, keep
-  `db.SetDefaultCollation`/`DefaultCollation`/`Collations`.
+- **2a — vendoring source + sync** ✅ *landed (dev set)*: `gen_collation_vectors` also writes the
+  `.coll` artifacts the cores embed (`spec/collation/fixtures/*.coll`); `scripts/vendor_collations.rb`
+  distributes them per core (Rust `include_bytes!`es spec/ directly; Go gets raw copies +
+  `//go:embed`; the browser-safe TS core gets a generated base64 module), with a `rake verify` drift
+  gate. **Still pending:** moving `ExtractHostCollation`/`CompileCollation` to a build/tools target
+  compiled *out of* production (§4.1), and the real version-pinned DUCET + curated non-CJK tailorings
+  (`en-US`, `de`, `fr`, `es`, `sv`, `da`) replacing the dev fixtures (the §9 pipeline proper).
+- **2b — vendored read path** ✅ *landed (all three cores)*: each core embeds the vendored `.coll`
+  and resolves a collation by name from it (`resolveCollation`: referenced set, then vendored), so a
+  collation is usable with **no import** — the database references it by name and the table comes from
+  the binary. The corpus `# load-collation:` directive now resolves the dev collations via the
+  vendored path (no import, nothing baked), proving the vendored bytes order identically cross-core.
+  **Still pending:** the three build tiers (`C`-only / non-CJK / everything, §13) gating which `.coll`
+  embed, and removing `db.ImportCollation`/`ExportCollation`/`LoadHostCollation` from production
+  (keeping `db.SetDefaultCollation`/`DefaultCollation`/`Collations`).
 - **2c — reference-only on disk** (§5): a `format_version` bump shrinks the `entry_kind` 3 entry to
   metadata-only (name + `(unicode, cldr)` + description + `is_default` [+ optional `.coll` hash]);
   the LZ4-compressed baked table is removed.

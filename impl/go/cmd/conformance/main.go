@@ -112,9 +112,10 @@ func specDir() string {
 }
 
 // parseLoadCollationDirective parses a `# load-collation: <name> = <fixture>[, <fixture>…]` line —
-// the corpus's deterministic, host-free way to load a collation before the records that use it
-// (spec/design/collation.md §10). Fixture paths are relative to spec/ and concatenated (newline-
-// joined) into one definition stream. Returns the name and paths, or false if not this directive.
+// the corpus's deterministic, host-free way to make a collation available before the records that
+// use it (spec/design/collation.md §10). In the reference-only model the named collation is normally
+// VENDORED (so the fixtures are an unused-but-documented fallback for a not-yet-vendored name,
+// loadCollation). Returns the name and paths, or false if not this directive.
 func parseLoadCollationDirective(line string) (string, []string, bool) {
 	body, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "load-collation:")
 	if !ok {
@@ -136,9 +137,16 @@ func parseLoadCollationDirective(line string) (string, []string, bool) {
 	return strings.TrimSpace(name), paths, true
 }
 
-// loadCollation compiles + imports a collation named `name` from the `files` fixtures (relative to
-// spec/) into db (spec/design/collation.md §4/§10). A read / compile / import failure fails the test.
+// loadCollation makes a collation named `name` available to the records that follow
+// (spec/design/collation.md §2/§9/§10). In the reference-only model a collation is VENDORED into the
+// binary, so if `name` is vendored this is a no-op (the corpus exercises the vendored read path — no
+// import, nothing baked). Only a collation a build does not vendor falls back to compiling +
+// importing it from the `files` fixtures (the harness is test tooling, so the compile path is
+// allowed here). A read / compile / import failure fails the test.
 func loadCollation(db *jed.Database, name string, files []string) error {
+	if jed.VendoredCollation(name) != nil {
+		return nil // vendored: usable as-is, the reference-only path
+	}
 	var def strings.Builder
 	for i, f := range files {
 		b, err := os.ReadFile(filepath.Join(specDir(), f))
@@ -507,9 +515,9 @@ func runFile(text string) error {
 			continue
 		}
 		if strings.HasPrefix(line, "#") {
-			// `# load-collation:` is an ACTION (load now), not a pending assertion: compile + import
-			// the named collation from its fixtures into this file's db before the records run
-			// (spec/design/collation.md §10).
+			// `# load-collation:` is an ACTION (make available now), not a pending assertion: ensure
+			// the named collation is available before the records run — vendored is a no-op, else
+			// compile + import from its fixtures (spec/design/collation.md §2/§9/§10).
 			if name, files, ok := parseLoadCollationDirective(line); ok {
 				if err := loadCollation(db, name, files); err != nil {
 					return err
