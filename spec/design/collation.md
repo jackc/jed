@@ -628,7 +628,9 @@ sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
   parent key encodes the probe with the **parent's** collation. The dev-collation unmapped-code-point
   case aborts a collated INSERT with `0A000`, the same code/point the comparison path raises.
 
-**Later follow-ons** (each its own slice, after slice 1):
+**Possible later follow-ons** — **none scheduled or committed**; recorded as candidate
+directions the slice-1 machinery leaves open, *not* a roadmap or a TODO list. Each would be its
+own slice if and when there is a reason to pursue it:
 
 - **Host seam — `ExtractHostCollation`** (§4) — per core, per platform; tested per core (§10);
   auto-fills the provenance description. The corpus never uses it.

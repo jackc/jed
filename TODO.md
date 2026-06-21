@@ -146,13 +146,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         text key is `0A000`. → [encoding.md §2.4](spec/design/encoding.md)
   - [ ] _follow-on:_ `varchar(n)` length limits (`22001`); runtime non-literal text→T casts;
         string functions (`||`, `length`, `lower`/`upper`, `substring`).
-  - [ ] _follow-on:_ **linguistic collation (`COLLATE` / per-column / per-db default / UCA)** —
-        design ratified in [collation.md](spec/design/collation.md): jed-owned UCA executor +
-        compiler, no tables vendored in the binary. A collation is a first-class **portable
-        artifact** — produce (extract from host / compile / open) → save → import/export — **baked
-        into the db file** by default (zero index drift, self-describing) with a small-footprint
-        name+hash **reference mode** and an optional **provenance description**; deterministic
-        collations first. Slice plan in collation.md §14.
+  - [x] _follow-on:_ **linguistic collation (`COLLATE` / per-column / per-db default / UCA)** —
+        ✅ **slice 1 (a–e) landed** ([collation.md](spec/design/collation.md)): jed-owned UCA
+        executor + compiler, no tables vendored in the binary; a collation is a first-class
+        **portable artifact** — produce (extract from host / compile / open) → save →
+        import/export — **baked into the db file** by default (zero index drift, self-describing)
+        with an optional **provenance description**; `COLLATE` expr/`ORDER BY`, per-column +
+        per-db default, and **collated keys** (UCA sort-key PRIMARY KEY/index/UNIQUE). Deterministic
+        collations only. Further locale/feature expansion (real DUCET + curated tailorings,
+        nondeterministic collations, host seam, reference mode, `LIKE` under non-`C`, CLDR
+        `shifted`, CJK) is recorded as **possibilities, not scheduled work** — collation.md §14.
 - [x] **Exact `decimal`** — *the* headline type: hand-rolled sign+coefficient+scale, round-half-away
       (settles the §8 rounding hotspot), PG result scales, first parameterized + first cross-family
       promotion; finite-only (documented PG divergence). → [decimal.md](spec/design/decimal.md)
