@@ -1381,6 +1381,20 @@ impl Database {
         self.shared_temp_read_snap().table(name).is_some()
     }
 
+    /// Whether `name` is a secondary index on a SESSION-LOCAL temp table (spec/design/temp-tables.md §8)
+    /// — the index analogue of [`is_temp_table`](Database::is_temp_table), used to gate (`allow_temp_ddl`)
+    /// and route a `DROP INDEX` of a temp index. Preclude-overlaps keeps an index name in one scope.
+    fn is_temp_index(&self, name: &str) -> bool {
+        self.temp_read_snap().find_index(name).is_some()
+    }
+
+    /// Whether `name` is a secondary index on a DATABASE-WIDE shared temp table (temp-tables.md §8) — the
+    /// index analogue of [`is_shared_temp_table`](Database::is_shared_temp_table); checked AFTER the
+    /// session-local index (the resolution walk).
+    fn is_shared_temp_index(&self, name: &str) -> bool {
+        self.shared_temp_read_snap().find_index(name).is_some()
+    }
+
     /// Enforce the per-session temp-table storage budget (`temp_buffers`, spec/design/temp-tables.md
     /// §7) — the §13 gate on RETAINED temp bytes. Checked after each temp-writing statement: if the
     /// session's temp footprint (byte-identical on-disk record bytes, summed over every temp table +
@@ -2365,16 +2379,21 @@ impl Database {
             // DDL is gated by the kind of relation it targets (temp-tables.md §5): a shared temp table
             // by `allow_shared_temp_ddl`, a session-local temp table by `allow_temp_ddl`, everything
             // else (persistent) by `allow_ddl`. The split lets a host grant bounded scratch tables to
-            // an untrusted session while withholding persistent (and shared) schema changes. CREATE is
-            // classified statically (`is_*_temp_ddl`); a DROP of a temp table by resolving the name —
-            // shared before session-local, the resolution-walk order (preclude-overlaps keeps a name in
-            // at most one scope, so the order never decides a real conflict).
+            // an untrusted session while withholding persistent (and shared) schema changes. A CREATE
+            // TABLE is classified statically (`is_*_temp_ddl`); the remaining temp-affecting DDL is
+            // classified by resolving the name — a DROP TABLE / CREATE INDEX by its target table, a DROP
+            // INDEX by the index — shared before session-local, the resolution-walk order (preclude-
+            // overlaps keeps a name in at most one scope, so the order never decides a real conflict).
             let allowed = if req.is_shared_temp_ddl
                 || matches!(stmt, Statement::DropTable(dt) if self.is_shared_temp_table(&dt.name))
+                || matches!(stmt, Statement::CreateIndex(ci) if self.is_shared_temp_table(&ci.table))
+                || matches!(stmt, Statement::DropIndex(di) if self.is_shared_temp_index(&di.name))
             {
                 self.session.allow_shared_temp_ddl
             } else if req.is_temp_ddl
                 || matches!(stmt, Statement::DropTable(dt) if self.is_temp_table(&dt.name))
+                || matches!(stmt, Statement::CreateIndex(ci) if self.is_temp_table(&ci.table))
+                || matches!(stmt, Statement::DropIndex(di) if self.is_temp_index(&di.name))
             {
                 self.session.allow_temp_ddl
             } else {
@@ -3557,16 +3576,11 @@ impl Database {
     /// built by scanning the table once: `page_read` per node + `storage_row_read` per row
     /// (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
     fn execute_create_index(&mut self, ci: CreateIndex) -> Result<Outcome> {
-        // A standalone CREATE INDEX on a temp table (session-local or shared) is deferred this slice
-        // (spec/design/temp-tables.md §8) — a temp table's UNIQUE constraints (declared in CREATE TEMP
-        // TABLE) are supported, but a separate index DDL is a 0A000 follow-on. Checked before
-        // resolution so the message is clear.
-        if self.is_temp_table(&ci.table) || self.is_shared_temp_table(&ci.table) {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "CREATE INDEX on a temporary table is not yet supported",
-            ));
-        }
+        // A standalone CREATE INDEX targets whichever scope owns the table — session-local temp, shared
+        // temp, or persistent (spec/design/temp-tables.md §8). The build below is scope-agnostic (the
+        // `table`/`store`/`index_store_mut` funnels route by the resolution walk; the cost meter, UNIQUE
+        // validation, naming/namespace collision, and the storage budget are all generic); only the
+        // catalog `put_index` write must target the owning snapshot, so the routing happens there.
         let table = self.table(&ci.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
@@ -3745,7 +3759,20 @@ impl Database {
 
         let name_key = def.name.to_ascii_lowercase();
         let ps = self.page_size;
-        self.working_mut().put_index(&table_key, def, ps);
+        // Register the index catalog entry + its (empty) store in the snapshot that owns the table
+        // (the resolution walk — temp-tables.md §2/§4/§8): a session-local temp table's index lives in
+        // the session temp snapshot, a shared temp table's in the database-wide shared one, so the index
+        // makes ZERO file writes for either (the dirty bit lets the commit skip the main image). The
+        // entry writes below then route through `index_store_mut`, which finds the new store in that same
+        // temp snapshot (`has_index_store`) and flags the matching dirty bit.
+        if self.is_temp_table(&ci.table) {
+            self.temp_working_mut().put_index(&table_key, def, ps);
+        } else if self.is_shared_temp_table(&ci.table) {
+            self.shared_temp_working_mut()
+                .put_index(&table_key, def, ps);
+        } else {
+            self.working_mut().put_index(&table_key, def, ps);
+        }
         let istore = self.index_store_mut(&name_key);
         // Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
         // so the built tree packs ~full instead of splintering under the storage-key order the
@@ -3765,23 +3792,44 @@ impl Database {
     }
 
     /// Run a DROP INDEX (spec/design/indexes.md §2): a table's name is 42809, a missing one
-    /// 42704. A pure catalog edit — zero cost, like DROP TABLE.
+    /// 42704. A pure catalog edit — zero cost, like DROP TABLE. The index is resolved along the
+    /// resolution walk (session-local → shared → persistent — temp-tables.md §8) and removed from the
+    /// snapshot that owns it, so dropping a temp table's index makes zero file writes.
     fn execute_drop_index(&mut self, di: DropIndex) -> Result<Outcome> {
+        // `table` covers all three scopes, so DROP INDEX naming a table is 42809 regardless of kind.
         if self.table(&di.name).is_some() {
             return Err(EngineError::new(
                 SqlState::WrongObjectType,
                 format!("{} is not an index", di.name),
             ));
         }
-        let Some((table_key, _)) = self.find_index(&di.name) else {
+        let name_key = di.name.to_ascii_lowercase();
+        if self.is_temp_index(&di.name) {
+            let table_key = self
+                .temp_read_snap()
+                .find_index(&di.name)
+                .unwrap()
+                .0
+                .to_string();
+            self.temp_working_mut().remove_index(&table_key, &name_key);
+        } else if self.is_shared_temp_index(&di.name) {
+            let table_key = self
+                .shared_temp_read_snap()
+                .find_index(&di.name)
+                .unwrap()
+                .0
+                .to_string();
+            self.shared_temp_working_mut()
+                .remove_index(&table_key, &name_key);
+        } else if let Some((table_key, _)) = self.find_index(&di.name) {
+            let table_key = table_key.to_string();
+            self.working_mut().remove_index(&table_key, &name_key);
+        } else {
             return Err(EngineError::new(
                 SqlState::UndefinedObject,
                 format!("index does not exist: {}", di.name),
             ));
-        };
-        let table_key = table_key.to_string();
-        let name_key = di.name.to_ascii_lowercase();
-        self.working_mut().remove_index(&table_key, &name_key);
+        }
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,

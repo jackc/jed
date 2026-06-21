@@ -1,0 +1,60 @@
+# Shared temporary-table INDEXES are CROSS-SESSION (spec/design/temp-tables.md §4/§5/§8,
+# concurrency-testing.md §4). A standalone CREATE INDEX on a SHARED temp table lives in the
+# database-wide shared snapshot, so — like the shared rows themselves — the index, and the
+# constraint it backs, is visible to and enforced for EVERY session once its creating transaction
+# commits. The single-handle suites/ddl/temp_index.test cannot express two sessions; this pins the
+# property it cannot: a UNIQUE index BUILT and committed by one session rejects a duplicate INSERT
+# from a DIFFERENT session (23505), and a DROP INDEX by one session is published to the rest.
+# Shared-temp writes ride the single-writer gate and become visible only at COMMIT (the two-root
+# commit, §5), so the order below fully determines every output and the file is deterministic on
+# every core. (A write session is a transaction block, so a statement error aborts it — each writer
+# below ends right after its asserted error, rolled back.)
+#
+# A core without the shared handle declares none of txn.shared/read_handle and SKIPS this file
+# before parsing any record (the capability gate, conformance.md §3).
+# format: concurrency
+# requires: txn.shared, txn.read_handle, ddl.shared_temp_table, ddl.create_table, ddl.primary_key, ddl.unique, ddl.secondary_index, dml.insert, dml.insert_multi_row, query.select, query.order_by, types.i32
+
+# --- w creates a SHARED temp table + a UNIQUE index on v, seeds two distinct rows, commits v1 ----
+open w write
+on w statement ok
+CREATE SHARED TEMP TABLE s (id i32 PRIMARY KEY, v i32)
+on w statement ok
+CREATE UNIQUE INDEX s_v_key ON s (v)
+on w statement ok
+INSERT INTO s VALUES (1, 10), (2, 20)
+commit w
+expect version 1
+
+# --- a DIFFERENT writer hits the unique index w committed: a duplicate v is 23505 (the headline) -
+open w2 write
+on w2 statement error 23505
+INSERT INTO s VALUES (3, 10)
+rollback w2
+
+# --- the rejected write left nothing: a fresh reader sees only w's two rows --------------------
+open r read
+on r query I rowsort
+SELECT v FROM s
+----
+10
+20
+close r
+
+# --- DROP INDEX by one session is published like any commit; the duplicate is then allowed -------
+open w3 write
+on w3 statement ok
+DROP INDEX s_v_key
+on w3 statement ok
+INSERT INTO s VALUES (3, 10)
+commit w3
+expect version 2
+
+open r2 read
+on r2 query I rowsort
+SELECT v FROM s
+----
+10
+10
+20
+close r2

@@ -104,9 +104,13 @@ temporary; a bare `CREATE SHARED TABLE …` is a syntax error `42601`). Its DDL 
 CREATE TABLE shared (id i32 PRIMARY KEY);    -- a persistent table called "shared"
 ```
 
+A standalone `CREATE INDEX` works on a temp table too (both session-local and shared) — the index
+lives in the same in-memory temp snapshot, so it makes no writes to the file, is built and used to
+speed up queries, and is dropped with its table. Its DDL is gated by the same `allow_temp_ddl` /
+`allow_shared_temp_ddl` capability as the table.
+
 ## Not yet supported on a temp table
 
 This first release keeps a few things off temp tables (both session-local and shared — each reported
 as `0A000`, *feature not supported*), to be lifted in later releases: `FOREIGN KEY` constraints,
-`serial` / `GENERATED AS IDENTITY` columns, composite-typed and `COLLATE` columns, and a standalone
-`CREATE INDEX` (a `UNIQUE` constraint in the `CREATE TEMP TABLE` itself is fine).
+`serial` / `GENERATED AS IDENTITY` columns, and composite-typed and `COLLATE` columns.

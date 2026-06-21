@@ -262,6 +262,19 @@ Temp tables reuse the full `table_element` machinery; everything is held in the 
 - **`PRIMARY KEY`, `UNIQUE`, `CHECK`, `NOT NULL`, `DEFAULT`** — fully supported, identical semantics
   to persistent tables. A temp table's secondary / unique indexes are in-memory B-trees in the temp
   store, never serialized.
+- **Standalone `CREATE INDEX` / `DROP INDEX`** — fully supported on a temp table (session-local and
+  `SHARED`), identical to a persistent table (indexes.md). The index lives in the matching in-memory
+  temp snapshot, so it makes **zero file writes** (no `format_version` change) and is dropped with its
+  table at session/database close; the build is metered (`page_read`/`storage_row_read`), the index is
+  maintained on every write, it shares the relation namespace (`42P07`), and the planner uses it to
+  bound a scan exactly as for a persistent table — the build/lookup funnels (`table` / `store` /
+  `index_store`) route by the resolution walk, and only the catalog `put_index`/`remove_index` write is
+  steered to the owning snapshot. The DDL is gated by the temp-scoped split: a session-local temp
+  table's index by `allow_temp_ddl`, a `SHARED` temp table's by `allow_shared_temp_ddl` (§5) — a
+  `CREATE INDEX` classified by resolving its target table, a `DROP INDEX` by resolving the index. A
+  `SHARED` temp index (and the constraint it backs) is visible to and enforced for every session after
+  its creating transaction commits (the two-root commit, §5). A `gin` index is admitted on the same
+  terms as a persistent table (an array column whose element type has a GIN opclass).
 - **`serial` / `GENERATED … AS IDENTITY`** — supported; the auto-created owned sequence is itself a
   **temp sequence** in the same temp store (session-local sequence for a session-local table; shared
   temp sequence for a shared table), so it too never touches the file. `nextval` on a temp sequence

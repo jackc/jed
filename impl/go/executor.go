@@ -1032,6 +1032,22 @@ func (db *Database) isSharedTempTable(name string) bool {
 	return ok
 }
 
+// isTempIndex reports whether name is a secondary index on a SESSION-LOCAL temp table
+// (spec/design/temp-tables.md §8) — the index analogue of isTempTable, used to gate (allowTempDDL)
+// and route a DROP INDEX of a temp index. Preclude-overlaps keeps an index name in one scope.
+func (db *Database) isTempIndex(name string) bool {
+	_, _, ok := db.tempSnap().findIndex(name)
+	return ok
+}
+
+// isSharedTempIndex reports whether name is a secondary index on a DATABASE-WIDE shared temp table
+// (temp-tables.md §8) — the index analogue of isSharedTempTable; checked AFTER the session-local
+// index (the resolution walk).
+func (db *Database) isSharedTempIndex(name string) bool {
+	_, _, ok := db.sharedTempSnap().findIndex(name)
+	return ok
+}
+
 // lkpTable resolves a table by name along the resolution walk session-local → shared → persistent
 // (temp-tables.md §3). Preclude-overlaps keeps a name in at most one scope, so this is just "where it lives".
 func (db *Database) lkpTable(name string) (*Table, bool) {
@@ -2301,13 +2317,20 @@ func (db *Database) checkPrivileges(stmt Statement) error {
 	if req.isDDL {
 		// DDL is gated by the kind of relation it targets (temp-tables.md §5): a shared temp table by
 		// allowSharedTempDDL, a session-local temp table by allowTempDDL, everything else (persistent) by
-		// allowDDL. CREATE is classified statically; a DROP of a temp table by resolving the name (shared
-		// before session-local — the resolution-walk order; preclude-overlaps keeps a name in one scope).
+		// allowDDL. A CREATE TABLE is classified statically; the rest by resolving the name — a DROP
+		// TABLE / CREATE INDEX by its target table, a DROP INDEX by the index — shared before
+		// session-local (the resolution-walk order; preclude-overlaps keeps a name in one scope).
 		var allowed bool
 		switch {
-		case req.isSharedTempDDL || (stmt.DropTable != nil && db.isSharedTempTable(stmt.DropTable.Name)):
+		case req.isSharedTempDDL ||
+			(stmt.DropTable != nil && db.isSharedTempTable(stmt.DropTable.Name)) ||
+			(stmt.CreateIndex != nil && db.isSharedTempTable(stmt.CreateIndex.Table)) ||
+			(stmt.DropIndex != nil && db.isSharedTempIndex(stmt.DropIndex.Name)):
 			allowed = db.session.allowSharedTempDDL
-		case req.isTempDDL || (stmt.DropTable != nil && db.isTempTable(stmt.DropTable.Name)):
+		case req.isTempDDL ||
+			(stmt.DropTable != nil && db.isTempTable(stmt.DropTable.Name)) ||
+			(stmt.CreateIndex != nil && db.isTempTable(stmt.CreateIndex.Table)) ||
+			(stmt.DropIndex != nil && db.isTempIndex(stmt.DropIndex.Name)):
 			allowed = db.session.allowTempDDL
 		default:
 			allowed = db.session.allowDDL
@@ -4003,13 +4026,12 @@ func (db *Database) relationExists(name string) bool {
 // built by scanning the table once: page_read per node + storage_row_read per row (the
 // metered build scan — cost.md §3); maintenance thereafter is unmetered.
 func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
-	// A standalone CREATE INDEX on a temp table is deferred this slice (spec/design/temp-tables.md §8)
-	// — a temp table's UNIQUE constraints (in CREATE TEMP TABLE) are supported, but separate index DDL
-	// is a 0A000 follow-on. Checked before resolution so the message is clear.
-	if db.isTempTable(ci.Table) || db.isSharedTempTable(ci.Table) {
-		return Outcome{}, NewError(FeatureNotSupported, "CREATE INDEX on a temporary table is not yet supported")
-	}
-	table, ok := db.Table(ci.Table)
+	// A standalone CREATE INDEX targets whichever scope owns the table — session-local temp, shared
+	// temp, or persistent (spec/design/temp-tables.md §8). The build below is scope-agnostic (the
+	// lkpTable/lkpStore/writeIndexStore funnels route by the resolution walk; the cost meter, UNIQUE
+	// validation, naming/namespace collision, and the storage budget are all generic); only the catalog
+	// putIndex write must target the owning snapshot, so the routing happens there.
+	table, ok := db.lkpTable(ci.Table)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ci.Table)
 	}
@@ -4140,7 +4162,21 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	}
 
 	nameKey := strings.ToLower(def.Name)
-	db.working().putIndex(tableKey, def, db.pageSize)
+	// Register the index catalog entry + its (empty) store in the snapshot that owns the table (the
+	// resolution walk — temp-tables.md §2/§4/§8): a session-local temp table's index lives in the
+	// session temp snapshot, a shared temp table's in the database-wide shared one, so the index makes
+	// ZERO file writes for either (the dirty bit lets the commit skip the main image). The entry writes
+	// below then route through writeIndexStore, which finds the new store in that same temp snapshot.
+	switch {
+	case db.isTempTable(ci.Table):
+		db.session.tx.tempDirty = true
+		db.session.tx.tempWorking.putIndex(tableKey, def, db.pageSize)
+	case db.isSharedTempTable(ci.Table):
+		db.session.tx.sharedTempDirty = true
+		db.session.tx.sharedTempWorking.putIndex(tableKey, def, db.pageSize)
+	default:
+		db.working().putIndex(tableKey, def, db.pageSize)
+	}
 	istore := db.writeIndexStore(nameKey)
 	// Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
 	// so the built tree packs ~full instead of splintering under the storage-key order the
@@ -4160,16 +4196,31 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 }
 
 // executeDropIndex runs a DROP INDEX (spec/design/indexes.md §2): a table's name is
-// 42809, a missing one 42704. A pure catalog edit — zero cost, like DROP TABLE.
+// 42809, a missing one 42704. A pure catalog edit — zero cost, like DROP TABLE. The index is
+// resolved along the resolution walk (session-local → shared → persistent — temp-tables.md §8) and
+// removed from the snapshot that owns it, so dropping a temp table's index makes zero file writes.
 func (db *Database) executeDropIndex(di *DropIndex) (Outcome, error) {
-	if _, ok := db.Table(di.Name); ok {
+	// lkpTable covers all three scopes, so DROP INDEX naming a table is 42809 regardless of kind.
+	if _, ok := db.lkpTable(di.Name); ok {
 		return Outcome{}, NewError(WrongObjectType, di.Name+" is not an index")
 	}
-	tableKey, _, ok := db.findIndex(di.Name)
-	if !ok {
-		return Outcome{}, NewError(UndefinedObject, "index does not exist: "+di.Name)
+	nameKey := strings.ToLower(di.Name)
+	switch {
+	case db.isTempIndex(di.Name):
+		tableKey, _, _ := db.tempSnap().findIndex(di.Name)
+		db.session.tx.tempDirty = true
+		db.session.tx.tempWorking.removeIndex(tableKey, nameKey)
+	case db.isSharedTempIndex(di.Name):
+		tableKey, _, _ := db.sharedTempSnap().findIndex(di.Name)
+		db.session.tx.sharedTempDirty = true
+		db.session.tx.sharedTempWorking.removeIndex(tableKey, nameKey)
+	default:
+		tableKey, _, ok := db.findIndex(di.Name)
+		if !ok {
+			return Outcome{}, NewError(UndefinedObject, "index does not exist: "+di.Name)
+		}
+		db.working().removeIndex(tableKey, nameKey)
 	}
-	db.working().removeIndex(tableKey, strings.ToLower(di.Name))
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 

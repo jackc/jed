@@ -1457,6 +1457,20 @@ export class Database {
     return this.sharedTempSnap().table(name) !== undefined;
   }
 
+  // isTempIndex reports whether name is a secondary index on a SESSION-LOCAL temp table
+  // (spec/design/temp-tables.md §8) — the index analogue of isTempTable, used to gate (allowTempDdl)
+  // and route a DROP INDEX of a temp index. Preclude-overlaps keeps an index name in one scope.
+  private isTempIndex(name: string): boolean {
+    return this.tempSnap().findIndex(name) !== null;
+  }
+
+  // isSharedTempIndex reports whether name is a secondary index on a DATABASE-WIDE shared temp table
+  // (temp-tables.md §8) — the index analogue of isSharedTempTable; checked AFTER the session-local
+  // index (the resolution walk).
+  private isSharedTempIndex(name: string): boolean {
+    return this.sharedTempSnap().findIndex(name) !== null;
+  }
+
   // lkpTable resolves a table by name along the resolution walk session-local → shared → persistent
   // (temp-tables.md §3). Preclude-overlaps keeps a name in at most one scope, so this is just "where it lives".
   private lkpTable(name: string): Table | undefined {
@@ -2203,17 +2217,22 @@ export class Database {
     if (req.isDdl) {
       // DDL is gated by the kind of relation it targets (temp-tables.md §5): a shared temp table by
       // allowSharedTempDdl, a session-local temp table by allowTempDdl, everything else (persistent) by
-      // allowDdl. CREATE is classified statically; a DROP of a temp table by resolving the name (shared
-      // before session-local — the resolution-walk order; preclude-overlaps keeps a name in one scope).
+      // allowDdl. A CREATE TABLE is classified statically; the rest by resolving the name — a DROP
+      // TABLE / CREATE INDEX by its target table, a DROP INDEX by the index — shared before
+      // session-local (the resolution-walk order; preclude-overlaps keeps a name in one scope).
       let allowed: boolean;
       if (
         req.isSharedTempDdl ||
-        (stmt.kind === "dropTable" && this.isSharedTempTable(stmt.name))
+        (stmt.kind === "dropTable" && this.isSharedTempTable(stmt.name)) ||
+        (stmt.kind === "createIndex" && this.isSharedTempTable(stmt.table)) ||
+        (stmt.kind === "dropIndex" && this.isSharedTempIndex(stmt.name))
       ) {
         allowed = this.session.allowSharedTempDdl;
       } else if (
         req.isTempDdl ||
-        (stmt.kind === "dropTable" && this.isTempTable(stmt.name))
+        (stmt.kind === "dropTable" && this.isTempTable(stmt.name)) ||
+        (stmt.kind === "createIndex" && this.isTempTable(stmt.table)) ||
+        (stmt.kind === "dropIndex" && this.isTempIndex(stmt.name))
       ) {
         allowed = this.session.allowTempDdl;
       } else {
@@ -3369,16 +3388,12 @@ export class Database {
   // index is then built by scanning the table once: page_read per node + storage_row_read
   // per row (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
   private executeCreateIndex(ci: CreateIndex): Outcome {
-    // A standalone CREATE INDEX on a temp table (session-local or shared) is deferred this slice
-    // (spec/design/temp-tables.md §8) — a temp table's UNIQUE constraints (in CREATE TEMP TABLE) are
-    // supported, but separate index DDL is a 0A000 follow-on. Checked before resolution.
-    if (this.isTempTable(ci.table) || this.isSharedTempTable(ci.table)) {
-      throw engineError(
-        "feature_not_supported",
-        "CREATE INDEX on a temporary table is not yet supported",
-      );
-    }
-    const table = this.table(ci.table);
+    // A standalone CREATE INDEX targets whichever scope owns the table — session-local temp, shared
+    // temp, or persistent (spec/design/temp-tables.md §8). The build below is scope-agnostic (the
+    // lkpTable/lkpStore/writeIndexStore funnels route by the resolution walk; the cost meter, UNIQUE
+    // validation, naming/namespace collision, and the storage budget are all generic); only the catalog
+    // putIndex write must target the owning snapshot, so the routing happens there.
+    const table = this.lkpTable(ci.table);
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + ci.table);
     }
@@ -3522,7 +3537,20 @@ export class Database {
     meter.guard();
 
     const nameKey = def.name.toLowerCase();
-    this.working().putIndex(tableKey, def, this.pageSize);
+    // Register the index catalog entry + its (empty) store in the snapshot that owns the table (the
+    // resolution walk — temp-tables.md §2/§4/§8): a session-local temp table's index lives in the
+    // session temp snapshot, a shared temp table's in the database-wide shared one, so the index makes
+    // ZERO file writes for either (the dirty bit lets the commit skip the main image). The entry writes
+    // below then route through writeIndexStore, which finds the new store in that same temp snapshot.
+    if (this.isTempTable(ci.table)) {
+      this.session.tx!.tempDirty = true;
+      this.session.tx!.tempWorking.putIndex(tableKey, def, this.pageSize);
+    } else if (this.isSharedTempTable(ci.table)) {
+      this.session.tx!.sharedTempDirty = true;
+      this.session.tx!.sharedTempWorking.putIndex(tableKey, def, this.pageSize);
+    } else {
+      this.working().putIndex(tableKey, def, this.pageSize);
+    }
     const istore = this.writeIndexStore(nameKey);
     // Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
     // so the built tree packs ~full instead of splintering under the storage-key order the
@@ -3538,16 +3566,33 @@ export class Database {
   }
 
   // executeDropIndex runs a DROP INDEX (spec/design/indexes.md §2): a table's name is
-  // 42809, a missing one 42704. A pure catalog edit — zero cost, like DROP TABLE.
+  // 42809, a missing one 42704. A pure catalog edit — zero cost, like DROP TABLE. The index is
+  // resolved along the resolution walk (session-local → shared → persistent — temp-tables.md §8) and
+  // removed from the snapshot that owns it, so dropping a temp table's index makes zero file writes.
   private executeDropIndex(di: DropIndex): Outcome {
-    if (this.table(di.name)) {
+    // lkpTable covers all three scopes, so DROP INDEX naming a table is 42809 regardless of kind.
+    if (this.lkpTable(di.name)) {
       throw engineError("wrong_object_type", di.name + " is not an index");
     }
-    const found = this.findIndex(di.name);
-    if (!found) {
-      throw engineError("undefined_object", "index does not exist: " + di.name);
+    const nameKey = di.name.toLowerCase();
+    if (this.isTempIndex(di.name)) {
+      const tableKey = this.tempSnap().findIndex(di.name)![0];
+      this.session.tx!.tempDirty = true;
+      this.session.tx!.tempWorking.removeIndex(tableKey, nameKey);
+    } else if (this.isSharedTempIndex(di.name)) {
+      const tableKey = this.sharedTempSnap().findIndex(di.name)![0];
+      this.session.tx!.sharedTempDirty = true;
+      this.session.tx!.sharedTempWorking.removeIndex(tableKey, nameKey);
+    } else {
+      const found = this.findIndex(di.name);
+      if (!found) {
+        throw engineError(
+          "undefined_object",
+          "index does not exist: " + di.name,
+        );
+      }
+      this.working().removeIndex(found[0], nameKey);
     }
-    this.working().removeIndex(found[0], di.name.toLowerCase());
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 

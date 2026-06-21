@@ -1,0 +1,165 @@
+# Standalone CREATE INDEX / DROP INDEX on a temporary table (spec/design/temp-tables.md §8) — the
+# lifted 0A000 narrowing: a temp table (session-local OR database-wide SHARED) now takes a separate
+# CREATE INDEX, exactly like a persistent one, and the index lives in the matching in-memory temp
+# snapshot — so it makes ZERO writes to the database file (no format_version change) and is dropped
+# with its table at session/database close. The index is BUILT and the planner USES it to bound a
+# scan (the cost cases below mirror query/index_scan.test on a temp table — identical rows, lower
+# cost), maintained on every write (the UNIQUE cases), and shares the relation namespace (42P07).
+# The temp index DDL is gated by the temp-scoped DDL split (allow_temp_ddl / allow_shared_temp_ddl,
+# §5). jed-specific (the temp divergences + the host-configured gate cannot be reproduced via the
+# same SQL on PostgreSQL), so this suite is CROSS-CORE-checked, NOT PostgreSQL-oracle-checked — the
+# cost is part of the cross-core contract (§8). Format: ../../../design/conformance.md.
+# requires: ddl.temp_table, ddl.shared_temp_table, ddl.create_table, ddl.primary_key, ddl.secondary_index, ddl.unique, ddl.drop_table, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.order_by, query.point_lookup, types.i32, session.allow_temp_ddl, session.allow_shared_temp_ddl, resource.cost_metering
+
+# --- a secondary index on a SESSION-LOCAL temp table is built AND used by the planner ----------
+# (the cost block mirrors query/index_scan.test on a temp table — same data, same costs)
+
+statement ok
+CREATE TEMP TABLE t (id i32 PRIMARY KEY, v i32, w i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 1), (2, 2, 2), (3, 3, 3), (4, 4, 4), (5, 0, 5), (6, 1, 6), (7, 2, 7), (8, 3, 8), (9, 4, 9), (10, 0, 10), (11, 1, 11), (12, 2, 12), (13, 3, 13), (14, 4, 14), (15, 0, 15), (16, 1, 16), (17, 2, 17), (18, 3, 18), (19, 4, 19), (20, 0, 20)
+
+# the full-scan baseline: page_read(1) + 20 rows + 20 filter evals + 4 produced = 45
+# cost: 45
+query I nosort
+SELECT id FROM t WHERE v = 3 ORDER BY id
+----
+3
+8
+13
+18
+
+# the build scan: page_read(1) + 20 storage_row_read = 21
+# cost: 21
+statement ok
+CREATE INDEX t_v_idx ON t (v)
+
+# the same query now index-bounds: index node(1) + 4 point lookups(4) + 4 rows
+# + 4 filter evals + 4 produced = 17 — identical rows, lower cost (the planner USES the temp index)
+# cost: 17
+query I nosort
+SELECT id FROM t WHERE v = 3 ORDER BY id
+----
+3
+8
+13
+18
+
+# --- a UNIQUE index on a temp table is maintained: build-over-duplicates + per-write 23505 -------
+
+# t.w is all-distinct, so a UNIQUE build over it succeeds
+statement ok
+CREATE UNIQUE INDEX t_w_key ON t (w)
+
+# a later INSERT that duplicates a w value violates the unique index (named in the error)
+statement error 23505
+INSERT INTO t VALUES (21, 9, 1)
+
+# a UNIQUE build OVER existing duplicates is rejected 23505 and creates nothing
+statement ok
+CREATE TEMP TABLE dup (id i32 PRIMARY KEY, g i32)
+
+statement ok
+INSERT INTO dup VALUES (1, 5), (2, 5), (3, 7)
+
+statement error 23505
+CREATE UNIQUE INDEX dup_g_key ON dup (g)
+
+# the rejected build created nothing, so a NON-unique index on the same column still succeeds
+statement ok
+CREATE INDEX dup_g_idx ON dup (g)
+
+# --- the index shares the relation namespace: collisions are 42P07 both ways -------------------
+
+# an index name colliding with an existing relation (the temp table t) is 42P07
+statement error 42P07
+CREATE INDEX t ON dup (g)
+
+# a temp table colliding with an existing index name (t_v_idx) is 42P07
+statement error 42P07
+CREATE TEMP TABLE t_v_idx (id i32 PRIMARY KEY)
+
+# --- DROP INDEX of a temp index works; the name is then free to reuse ---------------------------
+
+statement ok
+DROP INDEX t_v_idx
+
+# proof it was dropped: the same index name can be re-created
+statement ok
+CREATE INDEX t_v_idx ON t (v)
+
+# DROP INDEX of a missing index is 42704
+statement error 42704
+DROP INDEX no_such_index
+
+# DROP INDEX naming a TABLE (temp t) is 42809, not 42704 — table() covers all scopes
+statement error 42809
+DROP INDEX t
+
+# --- a secondary index on a DATABASE-WIDE SHARED temp table, same machinery ----------------------
+
+statement ok
+CREATE SHARED TEMP TABLE s (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO s VALUES (1, 10), (2, 20), (3, 10), (4, 20), (5, 10)
+
+statement ok
+CREATE INDEX s_v_idx ON s (v)
+
+# the shared temp index bounds the scan — same rows as a full scan
+query I nosort
+SELECT id FROM s WHERE v = 10 ORDER BY id
+----
+1
+3
+5
+
+# a UNIQUE index on a shared temp table is maintained too
+statement ok
+CREATE UNIQUE INDEX s_id_key ON s (id)
+
+statement error 23505
+INSERT INTO s VALUES (1, 99)
+
+statement ok
+DROP INDEX s_v_idx
+
+# --- the temp-scoped DDL gate covers temp index DDL (temp-tables.md §5) -------------------------
+
+# CREATE INDEX on a session-local temp table is denied when allow_temp_ddl is off
+# allow_temp_ddl: off
+statement error 42501
+CREATE INDEX t_w_idx2 ON t (w)
+
+# DROP INDEX of a session-local temp index is denied when allow_temp_ddl is off (gated by the index)
+# allow_temp_ddl: off
+statement error 42501
+DROP INDEX t_w_key
+
+# the untrusted-scratch split: persistent DDL withheld, temp DDL granted — a temp CREATE INDEX
+# succeeds even with allow_ddl off, as long as allow_temp_ddl is on
+# allow_ddl: off
+# allow_temp_ddl: on
+statement ok
+CREATE INDEX t_w_idx3 ON t (w)
+
+# ...while a persistent CREATE INDEX under the same restriction is denied 42501
+statement ok
+CREATE TABLE p (id i32 PRIMARY KEY, v i32)
+
+# allow_ddl: off
+# allow_temp_ddl: on
+statement error 42501
+CREATE INDEX p_v_idx ON p (v)
+
+# CREATE INDEX on a SHARED temp table is gated by allow_shared_temp_ddl (not allow_temp_ddl)
+# allow_shared_temp_ddl: off
+statement error 42501
+CREATE INDEX s_id_idx2 ON s (id)
+
+# DROP INDEX of a shared temp index is gated by allow_shared_temp_ddl too
+# allow_shared_temp_ddl: off
+statement error 42501
+DROP INDEX s_id_key
