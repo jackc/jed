@@ -1,10 +1,11 @@
 package jed
 
-// Common table expressions — WITH name [(cols)] AS [NOT] MATERIALIZED (query) [, …] <query>,
-// non-recursive (spec/design/cte.md). The row/name/error assertions and the inline/materialize
-// cost contract live in the shared conformance corpus (spec/conformance/suites/cte/*.test). What
-// remains here is the MATERIALIZED / NOT MATERIALIZED hint cost split (13/23), which the corpus
-// pins by rows but NOT by cost.
+// Common table expressions — WITH [RECURSIVE] name [(cols)] AS [NOT] MATERIALIZED (query) [, …]
+// <query> (spec/design/cte.md, spec/design/recursive-cte.md). The row/name/error assertions and the
+// inline/materialize cost contract live in the shared conformance corpus
+// (spec/conformance/suites/cte/*.test). What remains here is what the corpus cannot express: the
+// MATERIALIZED / NOT MATERIALIZED hint cost split (13/23), and — for WITH RECURSIVE — the
+// cost-ceiling termination of a non-terminating recursion (54P01) and the inert materialization hint.
 
 import "testing"
 
@@ -52,5 +53,53 @@ func TestCteMaterializedHintForcesBuffering(t *testing.T) {
 	if got := cteCost(t, db,
 		"WITH c AS NOT MATERIALIZED (SELECT id FROM t) SELECT a.id, b.id FROM c a CROSS JOIN c b"); got != 23 {
 		t.Errorf("NOT MATERIALIZED cost got %d want 23", got)
+	}
+}
+
+// A non-terminating recursion (UNION ALL with no stopping predicate) is bounded by the cost ceiling.
+// Each iteration is cheap (a 1-row working table), so this trips 54P01 ONLY through the CONTINUOUS
+// cross-iteration meter (recursive-cte.md §5) — the untrusted-query safety mechanism doing real
+// work. A per-iteration meter would never fire here, so the corpus cannot express it.
+func TestCteRecursiveUnboundedAbortsAtCostCeiling(t *testing.T) {
+	db := NewDatabase()
+	db.SetMaxCost(1000)
+	_, err := Execute(db, "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c")
+	if err == nil {
+		t.Fatal("an unbounded recursion must abort, not loop forever")
+	}
+	if ee, ok := err.(*EngineError); !ok || ee.Code() != "54P01" {
+		t.Fatalf("expected 54P01, got %v", err)
+	}
+}
+
+// A recursion whose total cost fits under the ceiling runs to completion (the ceiling bounds the
+// actual accrued cost, not a per-iteration figure); the 5-row counter accrues 29 (the corpus cost
+// contract).
+func TestCteRecursiveUnderCeilingSucceeds(t *testing.T) {
+	db := NewDatabase()
+	db.SetMaxCost(1000)
+	if got := cteCost(t, db,
+		"WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c"); got != 29 {
+		t.Errorf("recursive cost got %d want 29", got)
+	}
+}
+
+// A recursive CTE is ALWAYS materialized — NOT MATERIALIZED is inert (recursive-cte.md §1), so a
+// single-reference recursive CTE still iterates to a fixpoint (3 rows, cost 17) rather than inlining.
+func TestCteRecursiveHintIsInert(t *testing.T) {
+	db := NewDatabase()
+	for _, hint := range []string{"", "MATERIALIZED ", "NOT MATERIALIZED "} {
+		sql := "WITH RECURSIVE c(n) AS " + hint +
+			"(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n"
+		out, err := Execute(db, sql)
+		if err != nil {
+			t.Fatalf("hint %q: %v", hint, err)
+		}
+		if len(out.Rows) != 3 {
+			t.Errorf("hint %q: got %d rows want 3", hint, len(out.Rows))
+		}
+		if out.Cost != 17 {
+			t.Errorf("hint %q: cost got %d want 17", hint, out.Cost)
+		}
 	}
 }

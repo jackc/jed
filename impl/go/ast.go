@@ -572,10 +572,14 @@ type Cte struct {
 // WithQuery is a top-level query prefixed by a WITH clause (spec/design/cte.md). Ctes is the
 // non-empty list of common table expressions (each visible to later CTEs and to Body); Body is the
 // main query expression. Built only when a WITH is present — a plain query stays Statement{Select}
-// / Statement{SetOp}, so those paths are untouched (the SetOp precedent).
+// / Statement{SetOp}, so those paths are untouched (the SetOp precedent). Recursive is the
+// WITH RECURSIVE flag (spec/design/recursive-cte.md): a flag on the whole list that ENABLES a CTE
+// to reference itself (lifting the forward-only 42P01); a CTE that does not reference itself is
+// still an ordinary non-recursive CTE.
 type WithQuery struct {
-	Ctes []Cte
-	Body QueryExpr
+	Ctes      []Cte
+	Body      QueryExpr
+	Recursive bool
 }
 
 // SelectItems is either all columns (*) or a list of projected expressions.

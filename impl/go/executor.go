@@ -6333,6 +6333,11 @@ func (db *Database) executeWith(wq *WithQuery, params []Value) (Outcome, error) 
 func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error) {
 	ptypes := &paramTypes{}
 	// (1) Plan each CTE body against the already-built prefix; build its synthetic relation.
+	//     Under WITH RECURSIVE (recursive-cte.md), a CTE that references its own name is RECURSIVE:
+	//     its binding is pushed BEFORE planning the recursive term, so the self-reference resolves to
+	//     it; the binding's plan is then the non-recursive (anchor) term and recursive carries the
+	//     recursive term. A non-self-referencing CTE (or any CTE in a non-RECURSIVE list) plans as
+	//     before — its name is NOT yet in scope for its own body (cte.md §2).
 	bindings := make([]*cteBinding, 0, len(wq.Ctes))
 	for i := range wq.Ctes {
 		cte := &wq.Ctes[i]
@@ -6343,6 +6348,39 @@ func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error)
 					"WITH query name "+lname+" specified more than once")
 			}
 		}
+		isRecursive, unionAll := false, false
+		if wq.Recursive {
+			rec, ua, err := analyzeRecursiveCte(lname, cte.Query)
+			if err != nil {
+				return selectResult{}, err
+			}
+			isRecursive, unionAll = rec, ua
+		}
+		if isRecursive {
+			// The body is `anchor UNION[ALL] recursive_term` (analyzeRecursiveCte verified).
+			so := cte.Query.SetOp
+			anchorPlan, err := db.planQuery(so.Lhs, nil, bindings, ptypes)
+			if err != nil {
+				return selectResult{}, err
+			}
+			table, err := cteSyntheticTable(lname, &anchorPlan, cte.Columns)
+			if err != nil {
+				return selectResult{}, err
+			}
+			bindings = append(bindings, &cteBinding{
+				name: lname, table: table, plan: anchorPlan, hint: cte.Materialized,
+			})
+			bi := len(bindings) - 1
+			rhsPlan, err := db.planQuery(so.Rhs, nil, bindings, ptypes)
+			if err != nil {
+				return selectResult{}, err
+			}
+			if err := checkRecursiveColumnTypes(&bindings[bi].plan, &rhsPlan, lname); err != nil {
+				return selectResult{}, err
+			}
+			bindings[bi].recursive = &recursiveTerm{plan: rhsPlan, unionAll: unionAll}
+			continue
+		}
 		plan, err := db.planQuery(cte.Query, nil, bindings, ptypes)
 		if err != nil {
 			return selectResult{}, err
@@ -6352,11 +6390,7 @@ func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error)
 			return selectResult{}, err
 		}
 		bindings = append(bindings, &cteBinding{
-			name:  lname,
-			table: table,
-			plan:  plan,
-			hint:  cte.Materialized,
-			refs:  0,
+			name: lname, table: table, plan: plan, hint: cte.Materialized,
 		})
 	}
 	// (2) Plan the main body with all bindings visible.
@@ -6373,12 +6407,17 @@ func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error)
 		return selectResult{}, err
 	}
 
-	// (3) Per-CTE evaluation mode: MATERIALIZED hint or >=2 references -> Materialize, else Inline
-	//     (cost.md §3). An unreferenced CTE is planned (errors surfaced) but not run.
+	// (3) Per-CTE evaluation mode: a RECURSIVE CTE is ALWAYS materialized (the working-table method
+	//     requires it; [NOT] MATERIALIZED is inert — recursive-cte.md §1). Otherwise a MATERIALIZED
+	//     hint or >=2 references -> Materialize, else Inline (cost.md §3). An unreferenced
+	//     non-recursive CTE is planned (errors surfaced) but not run.
 	modes := make([]cteMode, len(bindings))
 	plans := make([]queryPlan, len(bindings))
+	recursives := make([]*recursiveTerm, len(bindings))
 	for i, b := range bindings {
 		switch {
+		case b.recursive != nil:
+			modes[i] = cteMaterialize
 		case b.hint != nil && *b.hint:
 			modes[i] = cteMaterialize
 		case b.hint != nil && !*b.hint:
@@ -6389,15 +6428,23 @@ func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error)
 			modes[i] = cteInline
 		}
 		plans[i] = b.plan
+		recursives[i] = b.recursive
 	}
 
-	// (4) Materialize each referenced materialized CTE once, in list order, accruing cost. A later
-	//     body's inline/materialized reference to an earlier CTE sees the prefix context.
+	// (4) Materialize each CTE once, in list order, accruing cost; a later body sees the earlier
+	//     buffers. A RECURSIVE CTE iterates to a fixpoint (its self-reference reads the working
+	//     table); the per-statement cost ceiling (54P01) bounds it — recursive-cte.md §5.
 	var totalCost int64
 	buffers := make([][]Row, 0, len(plans))
 	for i := range plans {
 		var buf []Row
-		if modes[i] == cteMaterialize {
+		switch {
+		case recursives[i] != nil:
+			buf, err = db.materializeRecursive(i, &plans[i], recursives[i], modes, plans, buffers, bound, &totalCost)
+			if err != nil {
+				return selectResult{}, err
+			}
+		case modes[i] == cteMaterialize:
 			ctx := cteCtx{modes: modes[:i], plans: plans[:i], buffers: buffers}
 			cplan := plans[i]
 			r, err := db.execQueryPlan(&cplan, nil, bound, ctx)
@@ -6422,6 +6469,415 @@ func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error)
 	}
 	r.cost += subqueryCost + totalCost
 	return r, nil
+}
+
+// materializeRecursive materializes a RECURSIVE CTE by iterating to a fixpoint — the PostgreSQL
+// working-table method (spec/design/recursive-cte.md §4). anchorPlan is the non-recursive term; rt
+// the recursive term (which references this CTE, index ci). priorBuffers are the earlier CTEs'
+// materialized rows (visible to both terms). totalCost accrues every term evaluation's cost and
+// gates the per-statement ceiling between iterations, so a non-terminating recursion of cheap
+// iterations still aborts 54P01 at the identical accrued cost in every core (recursive-cte.md §5).
+func (db *Database) materializeRecursive(ci int, anchorPlan *queryPlan, rt *recursiveTerm,
+	modes []cteMode, plans []queryPlan, priorBuffers [][]Row, params []Value, totalCost *int64,
+) ([]Row, error) {
+	maxCost := db.session.maxCost
+	guard := func(total int64) error {
+		if maxCost > 0 && total >= maxCost {
+			return NewError(CostLimitExceeded, fmt.Sprintf(
+				"query exceeded the cost limit of %d (accrued %d)", maxCost, total))
+		}
+		return nil
+	}
+	anchorTypes := anchorPlan.columnTypes()
+	rhsTypes := rt.plan.columnTypes()
+
+	// Evaluate the anchor: its rows seed both the result and the first working table.
+	ctx0 := cteCtx{modes: modes[:ci], plans: plans[:ci], buffers: priorBuffers}
+	ar, err := db.execQueryPlan(anchorPlan, nil, params, ctx0)
+	if err != nil {
+		return nil, err
+	}
+	*totalCost += ar.cost
+	if err := guard(*totalCost); err != nil {
+		return nil, err
+	}
+
+	// For UNION (distinct) a seen set drops rows duplicating any already-emitted row, keyed by the
+	// NULL-safe distinctRowKey the set operators use.
+	seen := map[string]bool{}
+	keep := func(row Row) bool {
+		if rt.unionAll {
+			return true
+		}
+		k := distinctRowKey(row)
+		if seen[k] {
+			return false
+		}
+		seen[k] = true
+		return true
+	}
+	var result, working []Row
+	for _, row := range ar.rows {
+		if keep(row) {
+			result = append(result, row)
+			working = append(working, row)
+		}
+	}
+
+	// The recursive term scans the WORKING table through the CTE's own buffer slot (ci); the earlier
+	// CTEs keep their full buffers. Build the buffer vec once and swap slot ci per iteration.
+	rhsBuffers := make([][]Row, ci+1)
+	copy(rhsBuffers, priorBuffers)
+
+	for len(working) > 0 {
+		rhsBuffers[ci] = working
+		working = nil
+		ctx := cteCtx{modes: modes[:ci+1], plans: plans[:ci+1], buffers: rhsBuffers}
+		cplan := rt.plan
+		rr, err := db.execQueryPlan(&cplan, nil, params, ctx)
+		if err != nil {
+			return nil, err
+		}
+		*totalCost += rr.cost
+		if err := guard(*totalCost); err != nil {
+			return nil, err
+		}
+		coerceSetopRows(rr.rows, rhsTypes, anchorTypes)
+		for _, vrow := range rr.rows {
+			row := Row(vrow)
+			if keep(row) {
+				result = append(result, row)
+				working = append(working, row)
+			}
+		}
+	}
+	return result, nil
+}
+
+// === WITH RECURSIVE analysis (spec/design/recursive-cte.md) ==========================
+//
+// A WITH RECURSIVE CTE is recursive iff its body references its own name (anywhere, deep). A
+// recursive CTE must take the well-formed shape `non_recursive_term UNION [ALL] recursive_term`
+// with the self-reference appearing exactly once, as a direct FROM/JOIN relation of the recursive
+// term. These structural checks mirror PostgreSQL's checkWellFormedRecursion, run on the parsed AST
+// before planning; the error surface is recursive-cte.md §6.
+
+// analyzeRecursiveCte classifies a CTE body for WITH RECURSIVE (recursive-cte.md §6). It returns
+// (false, _, nil) when the body does not reference name (an ordinary CTE, even under RECURSIVE);
+// otherwise it validates the recursive shape and returns (true, unionAll, nil), or an error (42P19
+// for a malformed recursion, 0A000 for a deferred shape).
+func analyzeRecursiveCte(name string, body QueryExpr) (bool, bool, error) {
+	if countSelfRefsQuery(body, name) == 0 {
+		return false, false, nil
+	}
+	so := body.SetOp
+	if so == nil || so.Op != SetOpUnion {
+		return false, false, NewError(InvalidRecursion, fmt.Sprintf(
+			"recursive query %q does not have the form non-recursive-term UNION [ALL] recursive-term", name))
+	}
+	if len(so.OrderBy) > 0 {
+		return false, false, NewError(FeatureNotSupported, "ORDER BY in a recursive query is not implemented")
+	}
+	if so.Limit != nil || so.Offset != nil {
+		return false, false, NewError(FeatureNotSupported, "LIMIT in a recursive query is not implemented")
+	}
+	if countSelfRefsQuery(so.Lhs, name) > 0 {
+		return false, false, NewError(InvalidRecursion, fmt.Sprintf(
+			"recursive reference to query %q must not appear within its non-recursive term", name))
+	}
+	if so.Rhs.Select == nil {
+		return false, false, NewError(FeatureNotSupported,
+			"a set operation in the recursive term of a recursive query is not supported yet")
+	}
+	if err := validateRecursiveTerm(name, so.Rhs.Select); err != nil {
+		return false, false, err
+	}
+	return true, so.All, nil
+}
+
+// validateRecursiveTerm validates the recursive term (the UNION's right SELECT) of a recursive CTE
+// (recursive-cte.md §6). The self-reference must appear exactly once, as a direct FROM/JOIN
+// relation, not on the nullable side of an outer join; the term must contain no aggregate. The
+// checks fire in PostgreSQL's order — a self-reference in a bad CONTEXT (a sublink, an outer join)
+// is reported as that context even when a valid FROM reference also exists.
+func validateRecursiveTerm(name string, sel *Select) error {
+	if countSublinkSelfRefs(sel, name) >= 1 {
+		return NewError(InvalidRecursion, fmt.Sprintf(
+			"recursive reference to query %q must not appear within a subquery", name))
+	}
+	if countFromSubquerySelfRefs(sel, name) >= 1 {
+		return NewError(FeatureNotSupported, fmt.Sprintf(
+			"recursive reference to query %q inside a FROM subquery is not supported yet", name))
+	}
+	direct := countDirectFromSelfRefs(sel, name)
+	if direct > 1 {
+		return NewError(InvalidRecursion, fmt.Sprintf(
+			"recursive reference to query %q must not appear more than once", name))
+	}
+	if itemsHaveAggregate(sel.Items) || (sel.Having != nil && exprHasAggregate(*sel.Having)) {
+		return NewError(InvalidRecursion,
+			"aggregate functions are not allowed in a recursive query's recursive term")
+	}
+	if direct == 1 && directSelfRefOnNullableSide(sel, name) {
+		return NewError(InvalidRecursion, fmt.Sprintf(
+			"recursive reference to query %q must not appear within an outer join", name))
+	}
+	return nil
+}
+
+// countSelfRefsQuery counts self-references to name anywhere in a query expression (deep — FROM
+// relations at every nesting level plus expression sublinks).
+func countSelfRefsQuery(qe QueryExpr, name string) int {
+	if qe.Select != nil {
+		return countSelfRefsSelect(qe.Select, name)
+	}
+	if qe.SetOp != nil {
+		return countSelfRefsQuery(qe.SetOp.Lhs, name) + countSelfRefsQuery(qe.SetOp.Rhs, name)
+	}
+	return 0
+}
+
+// countSelfRefsSelect counts self-references in a SELECT: its FROM relations (deep) plus all of its
+// expressions' sublinks.
+func countSelfRefsSelect(s *Select, name string) int {
+	n := 0
+	for _, tref := range fromRelations(s) {
+		n += countSelfRefsTableref(tref, name)
+	}
+	for _, e := range selectExprs(s) {
+		n += countSelfRefsExpr(e, name)
+	}
+	return n
+}
+
+// countSelfRefsTableref counts self-references reachable through one FROM relation: a plain table
+// reference with the matching name (+1), a derived-table subquery (recurse), or a table-function's
+// / VALUES' argument exprs.
+func countSelfRefsTableref(tref *TableRef, name string) int {
+	if isPlainRelation(tref) {
+		if strings.EqualFold(tref.Name, name) {
+			return 1
+		}
+		return 0
+	}
+	n := 0
+	if tref.Subquery != nil {
+		n += countSelfRefsQuery(*tref.Subquery, name)
+	}
+	for _, a := range tref.Args {
+		n += countSelfRefsExpr(*a, name)
+	}
+	for _, row := range tref.Values {
+		for _, e := range row {
+			n += countSelfRefsExpr(*e, name)
+		}
+	}
+	return n
+}
+
+// countSelfRefsExpr counts self-references inside an expression — only reachable through a sublink
+// (a subquery is an independent query whose own FROM may reference the CTE). The walk is exhaustive
+// (like exprHasAggregate).
+func countSelfRefsExpr(e Expr, name string) int {
+	switch e.Kind {
+	case ExprScalarSubquery, ExprExists:
+		return countSelfRefsQuery(*e.Subquery, name)
+	case ExprInSubquery:
+		return countSelfRefsExpr(e.InSubquery.Lhs, name) + countSelfRefsQuery(e.InSubquery.Query, name)
+	case ExprQuantifiedSubquery:
+		return countSelfRefsExpr(e.QuantifiedSubquery.Lhs, name) + countSelfRefsQuery(e.QuantifiedSubquery.Query, name)
+	case ExprCast:
+		return countSelfRefsExpr(e.Cast.Inner, name)
+	case ExprCollate:
+		return countSelfRefsExpr(e.Collate.Inner, name)
+	case ExprUnary:
+		return countSelfRefsExpr(e.Unary.Operand, name)
+	case ExprIsNull:
+		return countSelfRefsExpr(e.IsNullOf.Operand, name)
+	case ExprBinary:
+		return countSelfRefsExpr(e.Binary.Lhs, name) + countSelfRefsExpr(e.Binary.Rhs, name)
+	case ExprIsDistinct:
+		return countSelfRefsExpr(e.IsDistinct.Lhs, name) + countSelfRefsExpr(e.IsDistinct.Rhs, name)
+	case ExprIn:
+		n := countSelfRefsExpr(e.In.Lhs, name)
+		for _, x := range e.In.List {
+			n += countSelfRefsExpr(x, name)
+		}
+		return n
+	case ExprBetween:
+		return countSelfRefsExpr(e.Between.Lhs, name) + countSelfRefsExpr(e.Between.Lo, name) + countSelfRefsExpr(e.Between.Hi, name)
+	case ExprLike:
+		return countSelfRefsExpr(e.Like.Lhs, name) + countSelfRefsExpr(e.Like.Rhs, name)
+	case ExprCase:
+		n := 0
+		if e.Case.Operand != nil {
+			n += countSelfRefsExpr(*e.Case.Operand, name)
+		}
+		for _, w := range e.Case.Whens {
+			n += countSelfRefsExpr(w.Cond, name) + countSelfRefsExpr(w.Result, name)
+		}
+		if e.Case.Els != nil {
+			n += countSelfRefsExpr(*e.Case.Els, name)
+		}
+		return n
+	case ExprFuncCall:
+		n := 0
+		for _, a := range e.FuncCall.Args {
+			n += countSelfRefsExpr(*a, name)
+		}
+		return n
+	case ExprFieldAccess, ExprFieldStar:
+		return countSelfRefsExpr(*e.Base, name)
+	case ExprSubscript:
+		n := countSelfRefsExpr(*e.Base, name)
+		for _, sp := range e.Subscripts {
+			for _, x := range subscriptSpecExprs(sp) {
+				n += countSelfRefsExpr(*x, name)
+			}
+		}
+		return n
+	case ExprRow, ExprArray:
+		n := 0
+		for _, it := range e.RowItems {
+			n += countSelfRefsExpr(it, name)
+		}
+		return n
+	case ExprQuantified:
+		return countSelfRefsExpr(e.Quantified.Lhs, name) + countSelfRefsExpr(e.Quantified.Array, name)
+	default:
+		return 0
+	}
+}
+
+// countDirectFromSelfRefs counts self-references that are DIRECT FROM/JOIN relations of this SELECT
+// (a plain table ref matching the name). This is the only valid position for a recursive reference.
+func countDirectFromSelfRefs(s *Select, name string) int {
+	n := 0
+	for _, tref := range fromRelations(s) {
+		if isPlainRelation(tref) && strings.EqualFold(tref.Name, name) {
+			n++
+		}
+	}
+	return n
+}
+
+// countFromSubquerySelfRefs counts self-references nested inside a FROM-position subquery /
+// table-function args / VALUES of this SELECT (the deferred 0A000 shape).
+func countFromSubquerySelfRefs(s *Select, name string) int {
+	n := 0
+	for _, tref := range fromRelations(s) {
+		if !isPlainRelation(tref) {
+			n += countSelfRefsTableref(tref, name)
+		}
+	}
+	return n
+}
+
+// countSublinkSelfRefs counts self-references reachable only through an expression sublink in this
+// SELECT's top-level expressions — the `within a subquery` position.
+func countSublinkSelfRefs(s *Select, name string) int {
+	n := 0
+	for _, e := range selectExprs(s) {
+		n += countSelfRefsExpr(e, name)
+	}
+	return n
+}
+
+// directSelfRefOnNullableSide reports whether the SELECT's single direct self-reference sits on the
+// NULLABLE side of an outer join — the position PostgreSQL rejects. The FROM is a left-deep chain:
+// relation 0 is From, relation i+1 is Joins[i].Table, combined by Joins[i].Kind. A LEFT/FULL join
+// makes its right operand nullable; a RIGHT/FULL join makes the whole accumulated left nullable.
+func directSelfRefOnNullableSide(s *Select, name string) bool {
+	rels := fromRelations(s)
+	nullable := make([]bool, len(rels))
+	for j := range s.Joins {
+		right := j + 1
+		switch s.Joins[j].Kind {
+		case JoinLeft:
+			nullable[right] = true
+		case JoinRight:
+			for i := 0; i <= j; i++ {
+				nullable[i] = true
+			}
+		case JoinFull:
+			for i := 0; i <= right; i++ {
+				nullable[i] = true
+			}
+		}
+	}
+	for i, tref := range rels {
+		if isPlainRelation(tref) && strings.EqualFold(tref.Name, name) && nullable[i] {
+			return true
+		}
+	}
+	return false
+}
+
+// isPlainRelation reports whether a FROM relation is a plain table NAME — not a derived-table
+// subquery, a table function, or a VALUES body. Only a plain relation can resolve to a CTE.
+func isPlainRelation(tref *TableRef) bool {
+	return !tref.IsFunc && tref.Subquery == nil && tref.Values == nil
+}
+
+// fromRelations returns the FROM relations of a SELECT in left-deep order: From (if present) then
+// each join's table.
+func fromRelations(s *Select) []*TableRef {
+	rels := make([]*TableRef, 0, 1+len(s.Joins))
+	if s.From != nil {
+		rels = append(rels, s.From)
+	}
+	for i := range s.Joins {
+		rels = append(rels, &s.Joins[i].Table)
+	}
+	return rels
+}
+
+// selectExprs returns every top-level expression of a SELECT that can hold a sublink (select items,
+// WHERE, GROUP BY, HAVING, join ON conditions). ORDER BY keys are bare/qualified column references
+// (never expressions), so they carry no sublink.
+func selectExprs(s *Select) []Expr {
+	var v []Expr
+	for _, it := range s.Items.Items {
+		v = append(v, it.Expr)
+	}
+	if s.Filter != nil {
+		v = append(v, *s.Filter)
+	}
+	v = append(v, s.GroupBy...)
+	if s.Having != nil {
+		v = append(v, *s.Having)
+	}
+	for i := range s.Joins {
+		if s.Joins[i].On != nil {
+			v = append(v, *s.Joins[i].On)
+		}
+	}
+	return v
+}
+
+// checkRecursiveColumnTypes checks a recursive CTE's column types (recursive-cte.md §2): the output
+// types are FIXED by the non-recursive (anchor) term, and the recursive term's columns must be
+// assignable to them — a literal adapts, an equal type passes, a WIDER type is 42804 (matching
+// PostgreSQL). Mechanically the would-be UNION unified type must EQUAL the anchor type; any widening
+// of the anchor is the error. An arity mismatch is 42601, like a plain UNION.
+func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string) error {
+	a := anchor.columnTypes()
+	r := recursive.columnTypes()
+	if len(a) != len(r) {
+		return NewError(SyntaxError, "each UNION query must have the same number of columns")
+	}
+	for i := range a {
+		unified, err := unifySetopColumn(a[i], r[i], SetOpUnion)
+		if err != nil {
+			return err
+		}
+		if rtName(unified) != rtName(a[i]) {
+			return NewError(DatatypeMismatch, fmt.Sprintf(
+				"recursive query %q column %d has type %s in non-recursive term but type %s overall",
+				name, i+1, rtName(a[i]), rtName(unified)))
+		}
+	}
+	return nil
 }
 
 // cteSyntheticTable builds the synthetic relation a CTE reference resolves against
@@ -10742,12 +11198,26 @@ const (
 // synthetic relation exposing the body's output columns; plan is the planned body; hint is the
 // [NOT] MATERIALIZED override (nil = default); refs counts the FROM references resolved to it during
 // planning (the inline-vs-materialize decision — cost.md §3).
+//
+// For a RECURSIVE CTE (spec/design/recursive-cte.md) plan holds the non-recursive (anchor) term
+// (its column types fix the synthetic relation's) and recursive carries the recursive term + the
+// UNION ALL flag; the binding is in scope inside its own recursive term, so the self-reference
+// resolves to it.
 type cteBinding struct {
-	name  string
-	table *Table
-	plan  queryPlan
-	hint  *bool
-	refs  int
+	name      string
+	table     *Table
+	plan      queryPlan
+	recursive *recursiveTerm
+	hint      *bool
+	refs      int
+}
+
+// recursiveTerm is the recursive half of a WITH RECURSIVE CTE (spec/design/recursive-cte.md §4):
+// the planned recursive term (the UNION's right operand, which references the CTE once) and whether
+// the body is UNION ALL (keep every row) versus UNION (drop rows duplicating any already emitted).
+type recursiveTerm struct {
+	plan     queryPlan
+	unionAll bool
 }
 
 // cteCtx is the per-statement CTE execution context, threaded through exec* and evalEnv so a FROM

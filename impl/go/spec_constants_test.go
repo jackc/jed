@@ -198,7 +198,7 @@ func TestErrorCodesAreRegistered(t *testing.T) {
 		ActiveSqlTransaction, ReadOnlySqlTransaction, InFailedSqlTransaction,
 		SyntaxError, UndefinedTable, UndefinedColumn, UndefinedObject,
 		DatatypeMismatch, DuplicateTable, DuplicateColumn,
-		InvalidTableDefinition, IndeterminateDatatype, FeatureNotSupported,
+		InvalidTableDefinition, IndeterminateDatatype, InvalidRecursion, FeatureNotSupported,
 		NameTooLong, ProgramLimitExceeded, StatementTooComplex, CostLimitExceeded,
 		IoError, UndefinedFile, DuplicateFile, DataCorrupted,
 	} {

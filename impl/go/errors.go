@@ -106,6 +106,9 @@ const (
 	// IndeterminateDatatype is 42P18 — a bind parameter $N whose type cannot be inferred from
 	// context (spec/design/api.md §5).
 	IndeterminateDatatype
+	// InvalidRecursion is 42P19 — a WITH RECURSIVE CTE that references itself but is structurally
+	// ill-formed (spec/design/recursive-cte.md §6).
+	InvalidRecursion
 	// UndefinedParameter is 42P02 — a bind parameter $N where none can exist (a CHECK
 	// expression; spec/design/constraints.md §4.1).
 	UndefinedParameter
@@ -252,6 +255,8 @@ func (s SqlState) Code() string {
 		return "42883"
 	case IndeterminateDatatype:
 		return "42P18"
+	case InvalidRecursion:
+		return "42P19"
 	case UndefinedParameter:
 		return "42P02"
 	case DuplicateObject:

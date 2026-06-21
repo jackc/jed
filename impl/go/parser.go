@@ -1753,16 +1753,21 @@ func (p *Parser) parseQueryExprNode() (QueryExpr, error) {
 
 // parseWithStatement parses `query_statement ::= with_clause? query_expr` — a top-level query
 // prefixed by a WITH clause defining common table expressions (spec/design/cte.md). WITH RECURSIVE
-// is deferred (0A000); the CTE bodies and the main body are WITH-less query_exprs (the
-// top-level-only narrowing — a nested WITH surfaces as 42601 because a body must begin with SELECT).
+// (spec/design/recursive-cte.md) sets the Recursive flag and lets a CTE reference itself; the CTE
+// bodies and the main body are WITH-less query_exprs (the top-level-only narrowing — a nested WITH
+// surfaces as 42601 because a body must begin with SELECT).
 func (p *Parser) parseWithStatement() (Statement, error) {
 	if err := p.expectKeyword("with"); err != nil {
 		return Statement{}, err
 	}
-	// `WITH RECURSIVE …` is deferred this slice. RECURSIVE in this position is the keyword (PG
-	// reserves it), so a CTE may not be named `recursive` — a documented narrowing (cte.md §6).
+	// `WITH RECURSIVE …` enables self-reference (recursive-cte.md). RECURSIVE in this position is
+	// the keyword (PG reserves it), so a CTE may not be named `recursive` — a documented narrowing.
+	// The flag governs the whole list; whether a given CTE is *actually* recursive is decided at
+	// planning by whether its body references its own name.
+	recursive := false
 	if p.peekKeyword() == "recursive" {
-		return Statement{}, NewError(FeatureNotSupported, "WITH RECURSIVE is not supported yet")
+		p.advance()
+		recursive = true
 	}
 	var ctes []Cte
 	for {
@@ -1781,7 +1786,7 @@ func (p *Parser) parseWithStatement() (Statement, error) {
 	if err != nil {
 		return Statement{}, err
 	}
-	return Statement{With: &WithQuery{Ctes: ctes, Body: body}}, nil
+	return Statement{With: &WithQuery{Ctes: ctes, Body: body, Recursive: recursive}}, nil
 }
 
 // parseCte parses one common table expression
