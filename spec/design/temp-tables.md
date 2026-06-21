@@ -275,11 +275,24 @@ Temp tables reuse the full `table_element` machinery; everything is held in the 
   `SHARED` temp index (and the constraint it backs) is visible to and enforced for every session after
   its creating transaction commits (the two-root commit, §5). A `gin` index is admitted on the same
   terms as a persistent table (an array column whose element type has a GIN opclass).
-- **`serial` / `GENERATED … AS IDENTITY`** — supported; the auto-created owned sequence is itself a
-  **temp sequence** in the same temp store (session-local sequence for a session-local table; shared
-  temp sequence for a shared table), so it too never touches the file. `nextval` on a temp sequence
-  stays the transactional snapshot field it is for persistent sequences (sequences.md §5,
-  determinism.md §5).
+- **`serial` / `bigserial` / `smallserial` / `GENERATED … AS IDENTITY`** — fully supported on a temp
+  table (session-local and `SHARED`), identical desugaring and semantics to a persistent column
+  (sequences.md §12/§13). The auto-created **owned sequence** is itself a **temp sequence** staged into
+  the *same* temp snapshot (a session-local sequence for a session-local table; a shared-temp sequence
+  for a `SHARED` table), so — like the table's rows and indexes — it never touches the file (no
+  `format_version` change). Every sequence operation routes by a scope-aware **sequence funnel**
+  (session-local → shared → persistent), so `nextval` / `currval` / `setval` by name reach a temp
+  sequence, and `nextval` on it stays the transactional snapshot field it is for persistent sequences
+  (sequences.md §5, determinism.md §5). The owned temp sequence shares the relation namespace (a
+  collision with its derived `<table>_<col>_seq` name is `42P07`), is `2BP01` to `DROP SEQUENCE`
+  directly (the owner-link dependency), and is **auto-dropped with its table** (`DROP TABLE` sweeps
+  every sequence owned by it, from the owning temp snapshot). Only the catalog `put_sequence` /
+  `remove_sequence` write is steered to the owning snapshot; the build/advance/validation are
+  scope-agnostic. The DDL is gated by the temp-scoped split (§5): the `serial`/IDENTITY `CREATE TABLE`
+  by `allow_temp_ddl` / `allow_shared_temp_ddl` (classified statically), and a `DROP`/`ALTER SEQUENCE`
+  of a temp owned sequence by the same gate (classified by resolving the sequence). On a `SHARED` temp
+  table the owned sequence is cross-session: a session's advance is visible to every other session
+  after its transaction commits (the two-root commit, §5), so auto-numbering continues across sessions.
 - **`FOREIGN KEY` involving a temp table — `0A000` this slice (deferred).** A reference *between* a
   temp and a persistent table is semantically fraught (a permanent table outliving the temp it points
   at) and PG itself restricts it; jed defers all FK constraints touching a temp table in either

@@ -116,9 +116,8 @@ statement error 42P01
 SELECT id FROM s
 
 # --- deferred narrowings on a shared temp table are clean 0A000 (temp-tables.md §8) -----------
-
-statement error 0A000
-CREATE SHARED TEMP TABLE bad (id serial PRIMARY KEY)
+# (serial/IDENTITY on a shared temp table is now SUPPORTED — see ddl/temp_serial_identity.test; FK,
+# composite-typed, and COLLATE columns remain deferred.)
 
 statement error 0A000
 CREATE SHARED TEMP TABLE bad (id i32 PRIMARY KEY, pid i32 REFERENCES p)

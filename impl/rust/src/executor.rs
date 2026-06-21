@@ -1395,6 +1395,78 @@ impl Database {
         self.shared_temp_read_snap().find_index(name).is_some()
     }
 
+    /// Resolution walk for a sequence by name (spec/design/sequences.md + temp-tables.md §8):
+    /// session-local temp → shared temp → persistent. Preclude-overlaps keeps a name in at most one
+    /// scope (the shared relation namespace), so this is just "where the sequence lives". Every
+    /// sequence READ (nextval/currval/setval resolution, DROP/ALTER SEQUENCE) goes through here, so a
+    /// `serial`/IDENTITY column's OWNED temp sequence resolves exactly like a persistent one.
+    fn sequence(&self, name: &str) -> Option<&SequenceDef> {
+        if let Some(s) = self.temp_read_snap().sequence(name) {
+            return Some(s);
+        }
+        if let Some(s) = self.shared_temp_read_snap().sequence(name) {
+            return Some(s);
+        }
+        self.read_snap().sequence(name)
+    }
+
+    /// Whether `name` is a sequence in the SESSION-LOCAL temp snapshot (temp-tables.md §8) — the
+    /// sequence analogue of [`is_temp_table`](Database::is_temp_table). A temp sequence only ever
+    /// arises from a `serial`/IDENTITY temp column (standalone CREATE SEQUENCE is always persistent),
+    /// so it is always owned. Routes a sequence write/gate to the session-local scope.
+    fn is_temp_sequence(&self, name: &str) -> bool {
+        self.temp_read_snap().sequence(name).is_some()
+    }
+
+    /// Whether `name` is a sequence in the DATABASE-WIDE shared temp snapshot (temp-tables.md §8) —
+    /// checked AFTER session-local (the resolution walk).
+    fn is_shared_temp_sequence(&self, name: &str) -> bool {
+        self.shared_temp_read_snap().sequence(name).is_some()
+    }
+
+    /// Stage a sequence def into whichever scope currently owns its name (flagging the matching dirty
+    /// bit): session-local temp, shared temp, else the main working set. A `serial`/IDENTITY temp
+    /// column's owned sequence advances (`nextval` flush) into its temp snapshot, so the advance — like
+    /// the table's rows — makes zero file writes (temp-tables.md §2). A brand-new persistent sequence
+    /// is absent from both temp scopes and lands in the main image.
+    fn put_sequence_routed(&mut self, def: SequenceDef) {
+        if self.is_temp_sequence(&def.name) {
+            self.temp_working_mut().put_sequence(def);
+        } else if self.is_shared_temp_sequence(&def.name) {
+            self.shared_temp_working_mut().put_sequence(def);
+        } else {
+            self.working_mut().put_sequence(def);
+        }
+    }
+
+    /// Remove a sequence from whichever scope owns its name (the routed analogue of
+    /// [`put_sequence_routed`](Database::put_sequence_routed)). Used by `DROP SEQUENCE` and
+    /// `DROP TABLE`'s owned-sequence auto-drop.
+    fn remove_sequence_routed(&mut self, name: &str) {
+        let key = name.to_ascii_lowercase();
+        if self.is_temp_sequence(name) {
+            self.temp_working_mut().remove_sequence(&key);
+        } else if self.is_shared_temp_sequence(name) {
+            self.shared_temp_working_mut().remove_sequence(&key);
+        } else {
+            self.working_mut().remove_sequence(&key);
+        }
+    }
+
+    /// Rewrite a column's stored DEFAULT expression in whichever scope owns the table — the routed
+    /// analogue used by `ALTER SEQUENCE … RENAME` of an owned sequence (temp-tables.md §8), so a
+    /// renamed owned TEMP sequence's `nextval` default is rewritten in the temp snapshot.
+    fn set_column_default_expr_routed(&mut self, table: &str, col: usize, de: DefaultExpr) {
+        if self.is_temp_table(table) {
+            self.temp_working_mut().set_column_default_expr(table, col, de);
+        } else if self.is_shared_temp_table(table) {
+            self.shared_temp_working_mut()
+                .set_column_default_expr(table, col, de);
+        } else {
+            self.working_mut().set_column_default_expr(table, col, de);
+        }
+    }
+
     /// Enforce the per-session temp-table storage budget (`temp_buffers`, spec/design/temp-tables.md
     /// §7) — the §13 gate on RETAINED temp bytes. Checked after each temp-writing statement: if the
     /// session's temp footprint (byte-identical on-disk record bytes, summed over every temp table +
@@ -1466,7 +1538,7 @@ impl Database {
         let mut pending = self.session.pending_seq.borrow_mut();
         let mut def = match pending.get(&key) {
             Some(d) => d.clone(),
-            None => self.read_snap().sequence(name).cloned().ok_or_else(|| {
+            None => self.sequence(name).cloned().ok_or_else(|| {
                 EngineError::new(
                     SqlState::UndefinedTable,
                     format!("relation does not exist: {name}"),
@@ -1529,7 +1601,7 @@ impl Database {
         let mut pending = self.session.pending_seq.borrow_mut();
         let mut def = match pending.get(&key) {
             Some(d) => d.clone(),
-            None => self.read_snap().sequence(name).cloned().ok_or_else(|| {
+            None => self.sequence(name).cloned().ok_or_else(|| {
                 EngineError::new(
                     SqlState::UndefinedTable,
                     format!("relation does not exist: {name}"),
@@ -1596,7 +1668,7 @@ impl Database {
     /// (42P01 if absent), then reads the running update this statement (`pending_currval`) else the
     /// session value (`session_seq`); 55000 if it has not been defined this session.
     fn seq_currval(&self, name: &str) -> Result<i64> {
-        if self.read_snap().sequence(name).is_none() {
+        if self.sequence(name).is_none() {
             return Err(EngineError::new(
                 SqlState::UndefinedTable,
                 format!("relation does not exist: {name}"),
@@ -1624,7 +1696,10 @@ impl Database {
     fn flush_pending_sequences(&mut self) {
         let pending = std::mem::take(&mut *self.session.pending_seq.borrow_mut());
         for def in pending.into_values() {
-            self.working_mut().put_sequence(def);
+            // Route each advance to its owning scope (temp-tables.md §8): a `serial`/IDENTITY temp
+            // column's owned sequence flushes into its temp snapshot (zero file writes), a persistent
+            // one into the main image.
+            self.put_sequence_routed(def);
         }
         let currvals = std::mem::take(&mut *self.session.pending_currval.borrow_mut());
         for (key, v) in currvals {
@@ -2388,12 +2463,16 @@ impl Database {
                 || matches!(stmt, Statement::DropTable(dt) if self.is_shared_temp_table(&dt.name))
                 || matches!(stmt, Statement::CreateIndex(ci) if self.is_shared_temp_table(&ci.table))
                 || matches!(stmt, Statement::DropIndex(di) if self.is_shared_temp_index(&di.name))
+                || matches!(stmt, Statement::DropSequence(ds) if ds.names.iter().any(|n| self.is_shared_temp_sequence(n)))
+                || matches!(stmt, Statement::AlterSequence(als) if self.is_shared_temp_sequence(&als.name))
             {
                 self.session.allow_shared_temp_ddl
             } else if req.is_temp_ddl
                 || matches!(stmt, Statement::DropTable(dt) if self.is_temp_table(&dt.name))
                 || matches!(stmt, Statement::CreateIndex(ci) if self.is_temp_table(&ci.table))
                 || matches!(stmt, Statement::DropIndex(di) if self.is_temp_index(&di.name))
+                || matches!(stmt, Statement::DropSequence(ds) if ds.names.iter().any(|n| self.is_temp_sequence(n)))
+                || matches!(stmt, Statement::AlterSequence(als) if self.is_temp_sequence(&als.name))
             {
                 self.session.allow_temp_ddl
             } else {
@@ -3351,17 +3430,10 @@ impl Database {
 
         if ct.temp {
             // Deferred narrowings on a temp table this slice (spec/design/temp-tables.md §8), each a
-            // clean 0A000: a serial/IDENTITY column (needs a temp OWNED sequence), a composite-typed
-            // column (needs the temp snapshot to carry the type catalog), and a collated column
-            // (needs the collation catalog). Plain scalar/array/range/decimal columns with PK / NOT
-            // NULL / DEFAULT / CHECK / UNIQUE are fully supported. With these out, the temp snapshot
-            // needs no types/collations catalog, so it resolves cleanly with an empty one.
-            if !pending_serials.is_empty() {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "serial / IDENTITY column on a temporary table is not yet supported",
-                ));
-            }
+            // clean 0A000: a composite-typed column (needs the temp snapshot to carry the type catalog)
+            // and a collated column (needs the collation catalog). Plain scalar/array/range/decimal
+            // columns with PK / NOT NULL / DEFAULT / CHECK / UNIQUE — and now `serial`/IDENTITY columns,
+            // whose OWNED sequence is staged into the same temp snapshot below — are fully supported.
             if let Some(c) = table.columns.iter().find(|c| type_uses_composite(&c.ty)) {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
@@ -3393,6 +3465,14 @@ impl Database {
             tw.put_table(table, ps);
             for k in index_keys {
                 tw.put_index_store(k, TableStore::new(cap, Vec::new()));
+            }
+            // Stage each `serial`/IDENTITY column's OWNED sequence into the SAME temp snapshot
+            // (spec/design/sequences.md §12, temp-tables.md §8) — never the main image, so the
+            // sequence (like the table) makes zero file writes and is dropped with the table. The
+            // names were resolved collision-free during the column walk (`relation_exists` is
+            // temp-aware); `nextval` resolves and advances them via the scope-aware sequence funnel.
+            for s in pending_serials {
+                tw.put_sequence(s);
             }
             return Ok(Outcome::Statement {
                 cost: 0,
@@ -3520,19 +3600,31 @@ impl Database {
         }
         // A temp table (spec/design/temp-tables.md): remove it from the matching temp snapshot — never
         // the main image, so DROP makes zero file writes. No FK-dependent check (a temp table is never
-        // an FK parent, §8) and no owned-sequence sweep (serial on temp is deferred, §8). The temp-DDL
-        // capability gate already ran at dispatch (§5). Session-local first, then shared.
+        // an FK parent, §8), but it DOES auto-drop every sequence OWNED BY the table — a `serial`/
+        // IDENTITY temp column's owned temp sequence (spec/design/sequences.md §12, temp-tables.md §8)
+        // — from the SAME temp snapshot. The temp-DDL capability gate already ran at dispatch (§5).
+        // Session-local first, then shared.
         if self.is_temp_table(&dt.name) {
+            let owned = self.temp_read_snap().sequences_owned_by(&dt.name);
             let key = dt.name.to_ascii_lowercase();
-            self.temp_working_mut().remove_table(&key);
+            let w = self.temp_working_mut();
+            for sk in &owned {
+                w.remove_sequence(sk);
+            }
+            w.remove_table(&key);
             return Ok(Outcome::Statement {
                 cost: 0,
                 rows_affected: None,
             });
         }
         if self.is_shared_temp_table(&dt.name) {
+            let owned = self.shared_temp_read_snap().sequences_owned_by(&dt.name);
             let key = dt.name.to_ascii_lowercase();
-            self.shared_temp_working_mut().remove_table(&key);
+            let w = self.shared_temp_working_mut();
+            for sk in &owned {
+                w.remove_sequence(sk);
+            }
+            w.remove_table(&key);
             return Ok(Outcome::Statement {
                 cost: 0,
                 rows_affected: None,
@@ -4022,7 +4114,7 @@ impl Database {
             // column's default — so RESTRICT (the only mode this slice; CASCADE 0A000) is 2BP01
             // (spec/design/sequences.md §12). Clone the owner ref out so the snapshot borrow ends
             // before the working-snapshot mutation.
-            let owner = match self.read_snap().sequence(name) {
+            let owner = match self.sequence(name) {
                 None => {
                     if ds.if_exists {
                         continue;
@@ -4039,9 +4131,9 @@ impl Database {
             };
             if let Some((seq_name, owner_table, owner_col)) = owner {
                 // The owning table is always present (its own DROP TABLE would auto-drop this
-                // sequence first), so the column name for the detail resolves.
+                // sequence first), so the column name for the detail resolves. The scope-aware
+                // `table` funnel finds an owned TEMP sequence's temp owner (temp-tables.md §8).
                 let (col_name, table_name) = self
-                    .read_snap()
                     .table(&owner_table)
                     .map(|t| {
                         (
@@ -4059,8 +4151,9 @@ impl Database {
                     ),
                 ));
             }
-            let key = name.to_ascii_lowercase();
-            self.working_mut().remove_sequence(&key);
+            // Not owned: remove from whichever scope owns it (a temp sequence is always owned, so this
+            // routed path is reached only for a plain persistent sequence — temp-tables.md §8).
+            self.remove_sequence_routed(name);
         }
         Ok(Outcome::Statement {
             cost: 0,
@@ -4074,7 +4167,7 @@ impl Database {
     /// preserved unless `RESTART`); `RENAME TO` moves the catalog key. Touches no session state
     /// (`currval`/`lastval` unchanged). A catalog write (the write path, transactional, §5).
     fn execute_alter_sequence(&mut self, als: AlterSequence) -> Result<Outcome> {
-        let existing = match self.read_snap().sequence(&als.name) {
+        let existing = match self.sequence(&als.name) {
             Some(d) => d.clone(),
             None => {
                 if als.if_exists {
@@ -4100,7 +4193,7 @@ impl Database {
                     ));
                 }
                 let new_def = apply_seq_alter(&existing, &options, restart)?;
-                self.working_mut().put_sequence(new_def);
+                self.put_sequence_routed(new_def);
             }
             AlterSeqAction::Rename(new_name) => {
                 self.alter_sequence_rename(&existing, &new_name)?;
@@ -4133,17 +4226,30 @@ impl Database {
                 new_name.to_ascii_lowercase().replace('\'', "''")
             );
             let expr = crate::parser::parse_expression(&expr_text)?;
-            self.working_mut().set_column_default_expr(
+            // Route to the owner's scope so a renamed owned TEMP sequence rewrites its column default
+            // in the temp snapshot (temp-tables.md §8).
+            self.set_column_default_expr_routed(
                 &owner.table.to_ascii_lowercase(),
                 owner.column as usize,
                 DefaultExpr { expr_text, expr },
             );
         }
+        // Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
+        // scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
+        let is_temp = self.is_temp_sequence(&existing.name);
+        let is_shared = self.is_shared_temp_sequence(&existing.name);
         let old_key = existing.name.to_ascii_lowercase();
         let mut def = existing.clone();
         def.name = new_name.to_string();
-        self.working_mut().remove_sequence(&old_key);
-        self.working_mut().put_sequence(def);
+        let w = if is_temp {
+            self.temp_working_mut()
+        } else if is_shared {
+            self.shared_temp_working_mut()
+        } else {
+            self.working_mut()
+        };
+        w.remove_sequence(&old_key);
+        w.put_sequence(def);
         Ok(())
     }
 
@@ -9134,7 +9240,7 @@ impl Database {
             || self.find_index(name).is_some()
             || self.temp_read_snap().find_index(name).is_some()
             || self.shared_temp_read_snap().find_index(name).is_some()
-            || self.read_snap().sequence(name).is_some()
+            || self.sequence(name).is_some()
     }
 
     /// Choose the auto-generated name for a `serial` column's OWNED sequence (sequences.md §12),

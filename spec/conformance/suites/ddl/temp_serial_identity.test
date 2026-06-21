@@ -1,0 +1,202 @@
+# serial / IDENTITY columns on a temporary table (spec/design/temp-tables.md §8) — the lifted 0A000
+# narrowing: a temp table (session-local OR database-wide SHARED) now takes a `serial`/`bigserial`/
+# `smallserial` or `GENERATED { ALWAYS | BY DEFAULT } AS IDENTITY` column, exactly like a persistent
+# one. Its auto-created OWNED sequence (named <table>_<col>_seq) lives in the SAME in-memory temp
+# snapshot, so it makes ZERO writes to the database file (no format_version change) and is auto-dropped
+# with the table at session/database close. The sequence resolves and advances via the scope-aware
+# sequence funnel (so `nextval`/`currval`/`setval` by name reach it), shares the relation namespace
+# (42P07), is 2BP01 to drop directly (the owner-link dependency), and is gated by the temp-scoped DDL
+# split (allow_temp_ddl / allow_shared_temp_ddl, §5). The serial/IDENTITY semantics are identical to a
+# persistent column (the same desugaring, validated against PG in ddl/serial.test + ddl/identity.test);
+# this suite proves they hold in the temp scopes. jed-specific (the temp divergences + the SHARED kind +
+# the host-configured gate cannot be reproduced via the same SQL on PostgreSQL), so it is CROSS-CORE-
+# checked, NOT PostgreSQL-oracle-checked. Format: ../../../design/conformance.md.
+# requires: ddl.temp_table, ddl.shared_temp_table, ddl.serial, ddl.identity, ddl.sequence, func.sequence, ddl.create_table, ddl.drop_table, ddl.primary_key, dml.insert, dml.insert_column_list, dml.insert_multi_row, dml.update, query.select, query.where_eq, types.i32, types.i64, types.text, session.allow_temp_ddl, session.allow_shared_temp_ddl
+
+# --- serial on a SESSION-LOCAL temp table: the OWNED sequence lives in the temp snapshot ----------
+
+statement ok
+CREATE TEMP TABLE t (id serial PRIMARY KEY, v text)
+
+statement ok
+INSERT INTO t (v) VALUES ('a'), ('b')
+
+# auto-numbered from 1 via the owned temp sequence
+query IT rowsort
+SELECT id, v FROM t
+----
+1
+a
+2
+b
+
+# the owned sequence is reachable by its derived name <table>_<col>_seq and resolves in the temp
+# scope; it sits at 2 after the two inserts, so the next value is 3
+query I nosort
+SELECT nextval('t_id_seq')
+----
+3
+
+# currval reflects this session's last nextval on the temp sequence
+query I nosort
+SELECT currval('t_id_seq')
+----
+3
+
+# a further INSERT continues the auto-numbering from the (now 3) counter
+statement ok
+INSERT INTO t (v) VALUES ('c')
+
+query I nosort
+SELECT id FROM t WHERE v = 'c'
+----
+4
+
+# setval writes the temp sequence's counter directly (a pure sequence write — no rows — proving the
+# sequence-write routing reaches the temp scope, not just the INSERT store-write path)
+statement ok
+SELECT setval('t_id_seq', 100)
+
+query I nosort
+SELECT nextval('t_id_seq')
+----
+101
+
+# --- the owned temp sequence shares the relation namespace: collisions are 42P07 -----------------
+
+# a new SESSION-LOCAL temp table colliding with the owned temp sequence's name is 42P07
+statement error 42P07
+CREATE TEMP TABLE t_id_seq (x i32)
+
+# a PERSISTENT table colliding with the temp sequence's name is 42P07 too (relation_exists is scope-aware)
+statement error 42P07
+CREATE TABLE t_id_seq (x i32)
+
+# a CREATE SEQUENCE colliding with the temp sequence's name is 42P07
+statement error 42P07
+CREATE SEQUENCE t_id_seq
+
+# --- DROP SEQUENCE of an OWNED temp sequence is 2BP01 (the owner-link dependency, like persistent) -
+
+statement error 2BP01
+DROP SEQUENCE t_id_seq
+
+# --- IDENTITY on a session-local temp table: ALWAYS gating + OVERRIDING ---------------------------
+
+statement ok
+CREATE TEMP TABLE a (id int GENERATED ALWAYS AS IDENTITY PRIMARY KEY, v text)
+
+statement ok
+INSERT INTO a (v) VALUES ('x'), ('y')
+
+# the DEFAULT keyword always uses the identity sequence, even for GENERATED ALWAYS
+statement ok
+INSERT INTO a (id, v) VALUES (DEFAULT, 'z')
+
+query IT rowsort
+SELECT id, v FROM a
+----
+1
+x
+2
+y
+3
+z
+
+# an explicit (non-DEFAULT) value into a GENERATED ALWAYS column without OVERRIDING is 428C9
+statement error 428C9
+INSERT INTO a (id, v) VALUES (100, 'boom')
+
+# OVERRIDING SYSTEM VALUE lets the explicit value land
+statement ok
+INSERT INTO a (id, v) OVERRIDING SYSTEM VALUE VALUES (100, 'sys')
+
+query IT rowsort
+SELECT id, v FROM a
+----
+1
+x
+100
+sys
+2
+y
+3
+z
+
+# UPDATE of an ALWAYS identity column is 428C9 (checked before the PK-reassignment narrowing, §13.4)
+statement error 428C9
+UPDATE a SET id = 5 WHERE v = 'x'
+
+# --- DROP TABLE auto-drops the owned temp sequence; its name is then undefined and reusable --------
+
+statement ok
+DROP TABLE t
+
+# the owned sequence went with the table
+statement error 42P01
+SELECT nextval('t_id_seq')
+
+# and the freed name is reusable as an ordinary relation
+statement ok
+CREATE TEMP TABLE t_id_seq (x i32)
+
+statement ok
+DROP TABLE t_id_seq
+
+# --- serial on a DATABASE-WIDE SHARED temp table, the same machinery in the shared scope ----------
+
+statement ok
+CREATE SHARED TEMP TABLE c (id bigserial PRIMARY KEY, v text)
+
+statement ok
+INSERT INTO c (v) VALUES ('p'), ('q'), ('r')
+
+query IT rowsort
+SELECT id, v FROM c
+----
+1
+p
+2
+q
+3
+r
+
+# the shared temp owned sequence is reachable by name (resolves in the shared scope), now at 3
+query I nosort
+SELECT nextval('c_id_seq')
+----
+4
+
+# DROP SEQUENCE of the owned shared temp sequence is 2BP01
+statement error 2BP01
+DROP SEQUENCE c_id_seq
+
+# DROP TABLE auto-drops the owned shared temp sequence
+statement ok
+DROP TABLE c
+
+statement error 42P01
+SELECT nextval('c_id_seq')
+
+# --- the temp-scoped DDL gate covers serial/IDENTITY temp DDL (temp-tables.md §5) ----------------
+
+# a serial CREATE TEMP TABLE is denied when allow_temp_ddl is off
+# allow_temp_ddl: off
+statement error 42501
+CREATE TEMP TABLE g (id serial PRIMARY KEY)
+
+# the untrusted-scratch split: a serial temp table succeeds with allow_ddl off + allow_temp_ddl on
+# allow_ddl: off
+# allow_temp_ddl: on
+statement ok
+CREATE TEMP TABLE g (id serial PRIMARY KEY, v text)
+
+# DROP SEQUENCE of the owned temp sequence is gated by allow_temp_ddl (fires before the 2BP01)
+# allow_temp_ddl: off
+statement error 42501
+DROP SEQUENCE g_id_seq
+
+# a serial SHARED temp table is gated by allow_shared_temp_ddl (not allow_temp_ddl)
+# allow_shared_temp_ddl: off
+statement error 42501
+CREATE SHARED TEMP TABLE gs (id serial PRIMARY KEY)

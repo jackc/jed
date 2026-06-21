@@ -1,0 +1,44 @@
+# A serial column's OWNED sequence on a SHARED temp table is CROSS-SESSION (spec/design/temp-tables.md
+# §4/§5/§8, concurrency-testing.md §4). The auto-created sequence lives in the database-wide shared
+# snapshot — like the shared rows themselves — so once a creating/advancing transaction commits, the
+# advanced counter is visible to EVERY session: a DIFFERENT session's INSERT continues the
+# auto-numbering from where the first left off, rather than restarting at 1. The single-handle
+# suites/ddl/temp_serial_identity.test cannot express two sessions; this pins the property it cannot.
+# Shared-temp writes (rows AND the owned-sequence advance) ride the single-writer gate and become
+# visible only at COMMIT (the two-root commit, §5), so the order below fully determines every output
+# and the file is deterministic on every core.
+#
+# A core without the shared handle declares none of txn.shared/read_handle and SKIPS this file before
+# parsing any record (the capability gate, conformance.md §3).
+# format: concurrency
+# requires: txn.shared, txn.read_handle, ddl.shared_temp_table, ddl.serial, ddl.sequence, func.sequence, ddl.create_table, ddl.primary_key, dml.insert, dml.insert_column_list, dml.insert_multi_row, query.select, query.order_by, types.i32, types.text
+
+# --- w creates a SHARED temp table with a serial column, inserts two rows (sequence → 2), commits ---
+open w write
+on w statement ok
+CREATE SHARED TEMP TABLE s (id serial PRIMARY KEY, v text)
+on w statement ok
+INSERT INTO s (v) VALUES ('a'), ('b')
+commit w
+expect version 1
+
+# --- a DIFFERENT writer's INSERT continues the auto-numbering from the shared sequence (id 3, not 1):
+# the owned sequence sits in the shared snapshot, visible cross-session (the headline) -------------
+open w2 write
+on w2 statement ok
+INSERT INTO s (v) VALUES ('c')
+commit w2
+expect version 2
+
+# --- a fresh reader sees all three rows, auto-numbered 1,2,3 ACROSS the two sessions ---------------
+open r read
+on r query IT rowsort
+SELECT id, v FROM s
+----
+1
+a
+2
+b
+3
+c
+close r
