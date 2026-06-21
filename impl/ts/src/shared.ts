@@ -32,20 +32,28 @@ import { Rows, rowsFromOutcome } from "./api.ts";
 import { engineError } from "./errors.ts";
 import type { Value } from "./value.ts";
 
-// databaseFromSnapshot builds an in-memory handle whose committed state is `snap` (no file
-// backing). A read handle keeps one with no open transaction (reads hit committed = the pinned
+// databaseFromSnapshot builds an in-memory handle whose committed roots are `snap` (the file
+// snapshot) and `sharedTemp` (the database-wide shared-temp snapshot, temp-tables.md §5) — no file
+// backing. A read handle keeps one with no open transaction (reads hit committed = the pinned
 // snapshot); a write handle keeps one with an open READ WRITE block and publishes its working set.
-function databaseFromSnapshot(snap: Snapshot): Database {
+function databaseFromSnapshot(snap: Snapshot, sharedTemp: Snapshot): Database {
   const db = new Database();
   db.committed = snap;
+  db.sharedTempCommitted = sharedTemp;
   return db;
 }
 
 // SharedCore is the state shared by every handle minted from one SharedDb: the published committed
-// snapshot, the single-writer flag, and the live-reader registry (transactions.md §8). Not exported
-// — only the handles touch it.
+// roots (the file snapshot AND the database-wide shared-temp snapshot, temp-tables.md §5), the
+// single-writer flag, and the live-reader registry (transactions.md §8). Not exported — only the
+// handles touch it. (TS is single-threaded, so a handle reads both roots in one synchronous step:
+// there is no torn pin, hence no need for a combined holder object — two fields suffice.)
 class SharedCore {
   committed: Snapshot;
+  // sharedTempCommitted is the published shared-temp root (temp-tables.md §4): the rows of every
+  // SHARED temp table, visible to every handle, NEVER serialized. Published alongside `committed` by
+  // WriteHandle.commit — a pure in-memory swap (no fsync, nothing written to the file).
+  sharedTempCommitted: Snapshot;
   // live maps a pinned snapshot version to its reader refcount; its minimum key is the reclamation
   // watermark (several readers may pin the same version).
   live = new Map<bigint, number>();
@@ -54,6 +62,7 @@ class SharedCore {
 
   constructor(snap: Snapshot) {
     this.committed = snap;
+    this.sharedTempCommitted = new Snapshot();
   }
 
   register(version: bigint): void {
@@ -118,7 +127,10 @@ export class SharedDb {
   // un-ended handle discards it.
   write(): WriteHandle {
     if (this.core.writerActive) {
-      throw engineError("active_sql_transaction", "there is already a writer in progress");
+      throw engineError(
+        "active_sql_transaction",
+        "there is already a writer in progress",
+      );
     }
     this.core.writerActive = true;
     return new WriteHandle(this.core, this.core.committed);
@@ -135,7 +147,9 @@ export class ReadHandle {
   constructor(core: SharedCore, snap: Snapshot) {
     this.core = core;
     this.pinnedVersion = snap.txid;
-    this.db = databaseFromSnapshot(snap);
+    // Pin both roots together (temp-tables.md §5): the reader sees a consistent file + shared-temp
+    // view. Single-threaded JS reads both fields synchronously, so the pin is atomic.
+    this.db = databaseFromSnapshot(snap, core.sharedTempCommitted);
   }
 
   // query runs a read query against the pinned snapshot, returning a row cursor. A write statement
@@ -187,7 +201,9 @@ export class WriteHandle {
   constructor(core: SharedCore, base: Snapshot) {
     this.core = core;
     this.baseVersion = base.txid;
-    this.db = databaseFromSnapshot(base); // committed = immutable base; beginTx clones it to working
+    // committed/sharedTempCommitted = the immutable bases; beginTx clones them to working /
+    // sharedTempWorking. Both roots are pinned together (temp-tables.md §5).
+    this.db = databaseFromSnapshot(base, core.sharedTempCommitted);
     this.db.beginTx(true);
   }
 
@@ -199,7 +215,9 @@ export class WriteHandle {
 
   // query runs a query within this write transaction (read-your-writes against the working set).
   query(sql: string, params: Value[] = []): Rows {
-    return rowsFromOutcome(this.db.executeStmtParams(this.db.parse(sql), params));
+    return rowsFromOutcome(
+      this.db.executeStmtParams(this.db.parse(sql), params),
+    );
   }
 
   // commit publishes the working set as the new committed snapshot at the next version (the §3
@@ -209,11 +227,16 @@ export class WriteHandle {
     if (this.done) return;
     this.done = true;
     const failed = this.db.session.tx !== null && this.db.session.tx.failed;
-    this.db.commitTx(); // inner in-memory swap: db.committed := working (or no-op if failed)
+    this.db.commitTx(); // inner in-memory swap: committed := working, shared-temp adopted (or no-op if failed)
     if (!failed) {
       const snap = this.db.committed;
       snap.txid = this.baseVersion + 1n; // advance the shared version on every commit
+      // Publish BOTH roots (the two-root commit, temp-tables.md §5): the file snapshot and the
+      // shared-temp snapshot (a pure in-memory swap — no fsync, nothing written to the file). Single-
+      // threaded JS publishes both synchronously, so a reader never observes a torn pair. A writer
+      // that did not touch shared temp republishes the unchanged shared-temp root (it pinned it).
       this.core.committed = snap;
+      this.core.sharedTempCommitted = this.db.sharedTempCommitted;
     }
     this.core.writerActive = false;
   }

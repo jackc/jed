@@ -368,6 +368,28 @@ function parseTempBuffersDirective(line: string): number | null {
   return Number.isInteger(n) ? n : null;
 }
 
+// parseAllowSharedTempDdlDirective parses a `# allow_shared_temp_ddl: on|off` directive line
+// (spec/design/temp-tables.md §5): whether DATABASE-WIDE shared temporary-table DDL is permitted for
+// the next record.
+function parseAllowSharedTempDdlDirective(line: string): boolean | null {
+  const m = line.match(/^#\s*allow_shared_temp_ddl:\s*(\S+)/);
+  if (!m) return null;
+  const v = m[1]!.toLowerCase();
+  if (v === "on" || v === "true" || v === "yes") return true;
+  if (v === "off" || v === "false" || v === "no") return false;
+  return null;
+}
+
+// parseSharedTempMemDirective parses a `# shared_temp_mem: N` directive line (spec/design/temp-tables.md
+// §7): the GLOBAL shared-temp storage budget (bytes) to run the next record under (0 ⇒ unlimited).
+// Mirrors `# temp_buffers:` — per-record, reset after.
+function parseSharedTempMemDirective(line: string): number | null {
+  const m = line.match(/^#\s*shared_temp_mem:\s*(\S+)/);
+  if (!m) return null;
+  const n = Number(m[1]);
+  return Number.isInteger(n) ? n : null;
+}
+
 // parseSetDirective parses a `# set: name=value, name2=value2` directive line (spec/design/session.md
 // §6.1): the session variables to set for the next record (reset after, like # seed: / # grant:).
 // Each pair splits on the first `=`; names are dotted custom variables.
@@ -507,7 +529,9 @@ function runFile(text: string): void {
   const pendingRevokes: PrivDelta[] = [];
   let pendingAllowDdl: boolean | null = null;
   let pendingAllowTempDdl: boolean | null = null;
+  let pendingAllowSharedTempDdl: boolean | null = null;
   let pendingTempBuffers: number | null = null;
+  let pendingSharedTempMem: number | null = null;
   const pendingVars: Array<[string, string]> = [];
   while (c.i < lines.length) {
     const line = lines[c.i]!.trim();
@@ -536,7 +560,9 @@ function runFile(text: string): void {
       const rv = parseRevokeDirective(line);
       const ad = parseAllowDdlDirective(line);
       const atd = parseAllowTempDdlDirective(line);
+      const astd = parseAllowSharedTempDdlDirective(line);
       const tb = parseTempBuffersDirective(line);
+      const stm = parseSharedTempMemDirective(line);
       const sv = parseSetDirective(line);
       const sd = parseSeedDirective(line);
       const ck = parseClockDirective(line);
@@ -562,8 +588,12 @@ function runFile(text: string): void {
         pendingAllowDdl = ad;
       } else if (atd !== null) {
         pendingAllowTempDdl = atd;
+      } else if (astd !== null) {
+        pendingAllowSharedTempDdl = astd;
       } else if (tb !== null) {
         pendingTempBuffers = tb;
+      } else if (stm !== null) {
+        pendingSharedTempMem = stm;
       } else if (sv !== null) {
         pendingVars.push(...sv);
       } else if (sd !== null) {
@@ -627,18 +657,23 @@ function runFile(text: string): void {
     for (const g of pendingGrants) db.grant(g.privs, g.object);
     for (const r of pendingRevokes) db.revoke(r.privs, r.object);
     if (pendingAllowDdl !== null) db.setAllowDdl(pendingAllowDdl);
-    // `# allow_temp_ddl:` overrides the temp-DDL gate (temp-tables.md §5); resetPrivileges above set it
-    // back to permissive, so this decorates only its record.
+    // `# allow_temp_ddl:` / `# allow_shared_temp_ddl:` override the temp-DDL gates (temp-tables.md §5);
+    // resetPrivileges above set both back to permissive, so each decorates only its record.
     if (pendingAllowTempDdl !== null) db.setAllowTempDdl(pendingAllowTempDdl);
+    if (pendingAllowSharedTempDdl !== null)
+      db.setAllowSharedTempDdl(pendingAllowSharedTempDdl);
     pendingDefaultPrivileges = null;
     pendingGrants.length = 0;
     pendingRevokes.length = 0;
     pendingAllowDdl = null;
     pendingAllowTempDdl = null;
-    // Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (0), so a
-    // `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
+    pendingAllowSharedTempDdl = null;
+    // Apply the per-record temp-storage budgets (temp-tables.md §7); absent ⇒ unlimited (0), so a
+    // `# temp_buffers:` / `# shared_temp_mem:` directive never leaks past its record. Mirrors `# max_cost:`.
     db.setTempBuffers(pendingTempBuffers ?? 0);
     pendingTempBuffers = null;
+    db.setSharedTempMem(pendingSharedTempMem ?? 0);
+    pendingSharedTempMem = null;
     // Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
     // pending # set: pair, so a directive decorates only its record and never leaks forward.
     db.resetVars();

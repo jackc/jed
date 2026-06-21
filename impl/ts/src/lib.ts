@@ -31,6 +31,12 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // INDEX on a temp table are deferred 0A000 (spec/design/temp-tables.md §8). Gate
   // session.allow_temp_ddl; storage budget resource.temp_budget.
   "ddl.temp_table",
+  // CREATE SHARED [TEMP|TEMPORARY] TABLE — database-wide shared temporary tables (visible to every
+  // session of the open Database, sharing one set of rows), still making zero file writes (held in
+  // the Database-level shared-temp snapshot; the two-root commit, temp-tables.md §4/§5). Same feature
+  // set + 0A000 narrowings as ddl.temp_table; cross-session visibility tested via the concurrency
+  // schedule format. Gate session.allow_shared_temp_ddl; budget resource.shared_temp_budget.
+  "ddl.shared_temp_table",
   // CREATE INDEX / DROP INDEX — non-unique secondary indexes, maintained on every write
   // and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
   "ddl.secondary_index",
@@ -376,6 +382,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // on-disk record bytes, checked per-statement, so the abort is cross-core-identical. The
   // # temp_buffers: directive sets the per-record budget (spec/design/temp-tables.md §7).
   "resource.temp_budget",
+  // Shared-temp storage budget — shared_temp_mem bounds the GLOBAL shared temporary-table bytes (the
+  // shared analogue of resource.temp_budget); an over-budget shared write aborts the same 54P03.
+  // Measured identically (byte-identical on-disk record bytes), so cross-core-identical. The
+  // # shared_temp_mem: directive sets the per-record budget (spec/design/temp-tables.md §7).
+  "resource.shared_temp_budget",
   // Session privileges — the GRANT/REVOKE envelope (per-table SELECT/INSERT/UPDATE/DELETE + function
   // EXECUTE), enforced at name resolution with 42501; the # default_privileges: / # grant: /
   // # revoke: directives configure the session (session.md §5.3).
@@ -388,6 +399,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // untrusted session while withholding persistent DDL. The # allow_temp_ddl: directive sets it
   // (spec/design/temp-tables.md §5).
   "session.allow_temp_ddl",
+  // Shared-temp-DDL gate — the shared-temp-scoped split of allow_ddl: allow_shared_temp_ddl governs
+  // CREATE/DROP of a database-wide shared temp table (42501 if denied), independent of allow_ddl and
+  // allow_temp_ddl. The # allow_shared_temp_ddl: directive sets it (temp-tables.md §5).
+  "session.allow_shared_temp_ddl",
   // Session lifetime cost budget — a per-session cumulative cost budget lifetime_max_cost aborting the
   // in-flight statement (and rejecting later ones at admission) with 54P02 once the session's running
   // total reaches it; sibling to resource.cost_limit's per-statement 54P01. The sticky
