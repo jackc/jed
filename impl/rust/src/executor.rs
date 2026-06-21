@@ -5832,7 +5832,13 @@ impl Database {
     fn run_with(&self, wq: WithQuery, params: &[Value]) -> Result<SelectResult> {
         let mut ptypes = ParamTypes::default();
         // (1) Plan each CTE body against the already-built prefix; build its synthetic relation.
-        let mut bindings: Vec<CteBinding> = Vec::with_capacity(wq.ctes.len());
+        //     Under `WITH RECURSIVE` (recursive-cte.md), a CTE that references its own name is
+        //     RECURSIVE: its binding is pushed BEFORE planning the recursive term, so the
+        //     self-reference resolves to it; the binding's `plan` is then the non-recursive (anchor)
+        //     term and `recursive` carries the recursive term. A non-self-referencing CTE (or any
+        //     CTE in a non-`RECURSIVE` list) plans exactly as before — its name is NOT yet in scope
+        //     for its own body (so a same-named base table resolves there — cte.md §2).
+        let mut bindings: Vec<CteBinding> = Vec::new();
         for cte in &wq.ctes {
             let lname = cte.name.to_ascii_lowercase();
             if bindings.iter().any(|b| b.name == lname) {
@@ -5841,45 +5847,101 @@ impl Database {
                     format!("WITH query name {lname} specified more than once"),
                 ));
             }
-            let plan = self.plan_query(&cte.query, None, &bindings, &mut ptypes)?;
-            let table = cte_synthetic_table(&lname, &plan, cte.columns.as_deref())?;
-            bindings.push(CteBinding {
-                name: lname,
-                table,
-                plan,
-                hint: cte.materialized,
-                refs: std::cell::Cell::new(0),
-            });
+            let shape = if wq.recursive {
+                analyze_recursive_cte(&lname, &cte.query)?
+            } else {
+                CteShape::NonRecursive
+            };
+            match shape {
+                CteShape::Recursive { union_all } => {
+                    // The body is `anchor UNION[ALL] recursive_term` (analyze_recursive_cte verified).
+                    let (anchor, recursive) = match &cte.query {
+                        QueryExpr::SetOp(so) => (&so.lhs, &so.rhs),
+                        _ => unreachable!("analyze_recursive_cte ensures a UNION body"),
+                    };
+                    // Plan the anchor (self NOT in scope) — its column types fix the relation.
+                    let anchor_plan = self.plan_query(anchor, None, &bindings, &mut ptypes)?;
+                    let table = cte_synthetic_table(&lname, &anchor_plan, cte.columns.as_deref())?;
+                    bindings.push(CteBinding {
+                        name: lname,
+                        table,
+                        plan: anchor_plan,
+                        recursive: None,
+                        hint: cte.materialized,
+                        refs: std::cell::Cell::new(0),
+                    });
+                    // Plan the recursive term with the self-binding now visible.
+                    let i = bindings.len() - 1;
+                    let rhs_plan = self.plan_query(recursive, None, &bindings, &mut ptypes)?;
+                    check_recursive_column_types(&bindings[i].plan, &rhs_plan, &bindings[i].name)?;
+                    bindings[i].recursive = Some(RecursiveTerm {
+                        plan: rhs_plan,
+                        union_all,
+                    });
+                }
+                CteShape::NonRecursive => {
+                    let plan = self.plan_query(&cte.query, None, &bindings, &mut ptypes)?;
+                    let table = cte_synthetic_table(&lname, &plan, cte.columns.as_deref())?;
+                    bindings.push(CteBinding {
+                        name: lname,
+                        table,
+                        plan,
+                        recursive: None,
+                        hint: cte.materialized,
+                        refs: std::cell::Cell::new(0),
+                    });
+                }
+            }
         }
         // (2) Plan the main body with all bindings visible.
         let mut plan = self.plan_query(&wq.body, None, &bindings, &mut ptypes)?;
         let bound = bind_params(params, &ptypes.finalize()?)?;
 
-        // (3) Per-CTE evaluation mode: MATERIALIZED hint or >=2 references -> Materialize, else
-        //     Inline (cost.md §3). An unreferenced CTE is planned (errors surfaced) but not run.
+        // (3) Per-CTE evaluation mode: a RECURSIVE CTE is ALWAYS materialized (the working-table
+        //     method requires it; `[NOT] MATERIALIZED` is inert — recursive-cte.md §1). Otherwise a
+        //     MATERIALIZED hint or >=2 references -> Materialize, else Inline (cost.md §3). An
+        //     unreferenced non-recursive CTE is planned (errors surfaced) but not run.
         let modes: Vec<CteMode> = bindings
             .iter()
-            .map(|b| match b.hint {
-                Some(true) => CteMode::Materialize,
-                Some(false) => CteMode::Inline,
-                None if b.refs.get() >= 2 => CteMode::Materialize,
-                None => CteMode::Inline,
+            .map(|b| {
+                if b.recursive.is_some() {
+                    return CteMode::Materialize;
+                }
+                match b.hint {
+                    Some(true) => CteMode::Materialize,
+                    Some(false) => CteMode::Inline,
+                    None if b.refs.get() >= 2 => CteMode::Materialize,
+                    None => CteMode::Inline,
+                }
             })
             .collect();
-        let plans: Vec<QueryPlan> = bindings.into_iter().map(|b| b.plan).collect();
+        // Split the bindings into parallel vecs (consuming): `plans[i]` is the body / anchor plan
+        // (the inline path never touches a recursive CTE's `plans[i]`), `recursives[i]` the
+        // recursive term (Some => evaluate to a fixpoint).
+        let mut plans: Vec<QueryPlan> = Vec::with_capacity(bindings.len());
+        let mut recursives: Vec<Option<RecursiveTerm>> = Vec::with_capacity(bindings.len());
+        for b in bindings {
+            plans.push(b.plan);
+            recursives.push(b.recursive);
+        }
 
-        // (4) Materialize each referenced materialized CTE once, in list order, accruing cost. A
-        //     later body's inline/materialized reference to an earlier CTE sees the prefix context.
+        // (4) Materialize each CTE once, in list order, accruing cost; a later body sees the earlier
+        //     buffers. A RECURSIVE CTE iterates to a fixpoint (its self-reference reads the working
+        //     table); the per-statement cost ceiling (54P01) bounds it — recursive-cte.md §5.
         let mut total_cost: i64 = 0;
         let mut buffers: Vec<Vec<Row>> = Vec::with_capacity(plans.len());
-        for (i, p) in plans.iter().enumerate() {
-            let buf = if modes[i] == CteMode::Materialize {
+        for i in 0..plans.len() {
+            let buf = if let Some(rt) = &recursives[i] {
+                self.materialize_recursive(
+                    i, &plans[i], rt, &modes, &plans, &buffers, &bound, &mut total_cost,
+                )?
+            } else if modes[i] == CteMode::Materialize {
                 let ctx = CteCtx {
                     modes: &modes[..i],
                     plans: &plans[..i],
                     buffers: &buffers,
                 };
-                let r = self.exec_query_plan(p, &[], &bound, ctx)?;
+                let r = self.exec_query_plan(&plans[i], &[], &bound, ctx)?;
                 total_cost += r.cost;
                 r.rows
             } else {
@@ -5899,6 +5961,91 @@ impl Database {
         let mut r = self.exec_query_plan(&plan, &[], &bound, ctx)?;
         r.cost += subquery_cost + total_cost;
         Ok(r)
+    }
+
+    /// Materialize a RECURSIVE CTE by iterating to a fixpoint — the PostgreSQL working-table method
+    /// (recursive-cte.md §4). `anchor_plan` is the non-recursive term; `rt` the recursive term
+    /// (which references this CTE, index `ci`). `prior_buffers` are the earlier CTEs' materialized
+    /// rows (visible to both terms). `total_cost` accrues every term evaluation's cost and gates the
+    /// per-statement ceiling between iterations, so a non-terminating recursion of cheap iterations
+    /// still aborts `54P01` at the identical accrued cost in every core (recursive-cte.md §5).
+    #[allow(clippy::too_many_arguments)]
+    fn materialize_recursive(
+        &self,
+        ci: usize,
+        anchor_plan: &QueryPlan,
+        rt: &RecursiveTerm,
+        modes: &[CteMode],
+        plans: &[QueryPlan],
+        prior_buffers: &[Vec<Row>],
+        params: &[Value],
+        total_cost: &mut i64,
+    ) -> Result<Vec<Row>> {
+        let max_cost = self.session.max_cost();
+        let guard = |total: i64| -> Result<()> {
+            if max_cost > 0 && total >= max_cost {
+                return Err(EngineError::new(
+                    SqlState::CostLimitExceeded,
+                    format!("query exceeded the cost limit of {max_cost} (accrued {total})"),
+                ));
+            }
+            Ok(())
+        };
+        let anchor_types = anchor_plan.column_types().to_vec();
+        let rhs_types = rt.plan.column_types().to_vec();
+
+        // Evaluate the anchor: its rows seed both the result and the first working table.
+        let ar = {
+            let ctx = CteCtx {
+                modes: &modes[..ci],
+                plans: &plans[..ci],
+                buffers: prior_buffers,
+            };
+            self.exec_query_plan(anchor_plan, &[], params, ctx)?
+        };
+        *total_cost += ar.cost;
+        guard(*total_cost)?;
+
+        // For UNION (distinct) a `seen` set drops rows duplicating any already-emitted row.
+        let mut seen: HashSet<Row> = HashSet::new();
+        let mut result: Vec<Row> = Vec::new();
+        let mut working: Vec<Row> = Vec::new();
+        for row in ar.rows {
+            if rt.union_all || seen.insert(row.clone()) {
+                result.push(row.clone());
+                working.push(row);
+            }
+        }
+
+        // The recursive term scans the WORKING table through the CTE's own buffer slot (`ci`); the
+        // earlier CTEs keep their full buffers. Build the buffer vec once and swap slot `ci` per
+        // iteration.
+        let mut rhs_buffers: Vec<Vec<Row>> = prior_buffers.to_vec();
+        rhs_buffers.push(Vec::new()); // slot `ci`
+        debug_assert_eq!(rhs_buffers.len(), ci + 1);
+
+        while !working.is_empty() {
+            rhs_buffers[ci] = std::mem::take(&mut working);
+            let rr = {
+                let ctx = CteCtx {
+                    modes: &modes[..=ci],
+                    plans: &plans[..=ci],
+                    buffers: &rhs_buffers,
+                };
+                self.exec_query_plan(&rt.plan, &[], params, ctx)?
+            };
+            *total_cost += rr.cost;
+            guard(*total_cost)?;
+            let mut new_rows = rr.rows;
+            coerce_setop_rows(&mut new_rows, &rhs_types, &anchor_types);
+            for row in new_rows {
+                if rt.union_all || seen.insert(row.clone()) {
+                    result.push(row.clone());
+                    working.push(row);
+                }
+            }
+        }
+        Ok(result)
     }
 
     /// Run a lone `SELECT` — the entry point `execute_select` and `INSERT ... SELECT` use.
@@ -8347,12 +8494,26 @@ fn build_prefix_scope<'s>(
 /// for case-insensitive FROM matching; `table` is the synthetic relation exposing the body's output
 /// columns; `plan` is the planned body; `hint` is the `[NOT] MATERIALIZED` override; `refs` counts
 /// the FROM references resolved to it during planning (a `Cell` — planning borrows `&self`).
+///
+/// For a RECURSIVE CTE (spec/design/recursive-cte.md) `plan` holds the **non-recursive (anchor)
+/// term** (its column types fix the synthetic relation's) and `recursive` carries the recursive
+/// term + the `UNION ALL` flag; the binding is in scope inside its own recursive term, so the
+/// self-reference resolves to it (`refs` then counts the self-reference too).
 struct CteBinding {
     name: String,
     table: Box<Table>,
     plan: QueryPlan,
+    recursive: Option<RecursiveTerm>,
     hint: Option<bool>,
     refs: std::cell::Cell<usize>,
+}
+
+/// The recursive half of a `WITH RECURSIVE` CTE (spec/design/recursive-cte.md §4): the planned
+/// recursive term (the `UNION`'s right operand, which references the CTE once) and whether the body
+/// is `UNION ALL` (keep every row) versus `UNION` (drop rows duplicating any already emitted).
+struct RecursiveTerm {
+    plan: QueryPlan,
+    union_all: bool,
 }
 
 /// How a column reference resolved against the scope CHAIN (spec/design/grammar.md §26).
@@ -9264,6 +9425,336 @@ struct ValuesPlan {
     rows: Vec<Vec<RExpr>>,
     column_types: Vec<ResolvedType>,
     column_names: Vec<String>,
+}
+
+// === WITH RECURSIVE analysis (spec/design/recursive-cte.md) ==========================
+//
+// A `WITH RECURSIVE` CTE is *recursive* iff its body references its own name (anywhere, deep). A
+// recursive CTE must take the well-formed shape `non_recursive_term UNION [ALL] recursive_term`
+// with the self-reference appearing exactly once, as a direct FROM/JOIN relation of the recursive
+// term. These structural checks mirror PostgreSQL's `checkWellFormedRecursion`, run on the parsed
+// AST before planning; the error surface is recursive-cte.md §6.
+
+/// The recursiveness of a CTE in a `WITH RECURSIVE` list. `NonRecursive` = the body does not
+/// reference the CTE (an ordinary CTE, even under `RECURSIVE`). `Recursive` = the validated
+/// fixpoint shape, carrying the `UNION ALL` flag.
+enum CteShape {
+    NonRecursive,
+    Recursive { union_all: bool },
+}
+
+/// Classify a CTE body for `WITH RECURSIVE` (recursive-cte.md §6). Returns `NonRecursive` when the
+/// body does not reference `name`; otherwise validates the recursive shape and returns
+/// `Recursive { union_all }`, or an error (`42P19` for a malformed recursion, `0A000` for a
+/// deferred shape).
+fn analyze_recursive_cte(name: &str, body: &QueryExpr) -> Result<CteShape> {
+    if count_self_refs_query(body, name) == 0 {
+        return Ok(CteShape::NonRecursive);
+    }
+    // The body must be a top-level UNION / UNION ALL.
+    let so = match body {
+        QueryExpr::SetOp(so) if so.op == SetOpKind::Union => so,
+        _ => {
+            return Err(EngineError::new(
+                SqlState::InvalidRecursion,
+                format!(
+                    "recursive query \"{name}\" does not have the form non-recursive-term UNION [ALL] recursive-term"
+                ),
+            ));
+        }
+    };
+    // ORDER BY / LIMIT / OFFSET on a recursive query is not implemented (matching PostgreSQL).
+    if !so.order_by.is_empty() {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "ORDER BY in a recursive query is not implemented".to_string(),
+        ));
+    }
+    if so.limit.is_some() || so.offset.is_some() {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            "LIMIT in a recursive query is not implemented".to_string(),
+        ));
+    }
+    // The non-recursive (anchor) term — the UNION's left — must not reference the CTE.
+    if count_self_refs_query(&so.lhs, name) > 0 {
+        return Err(EngineError::new(
+            SqlState::InvalidRecursion,
+            format!(
+                "recursive reference to query \"{name}\" must not appear within its non-recursive term"
+            ),
+        ));
+    }
+    // The recursive term — the UNION's right — must be a plain SELECT (a set-operation recursive
+    // term is a jed narrowing, 0A000) referencing the CTE exactly once, in a valid position.
+    let rhs_sel = match &so.rhs {
+        QueryExpr::Select(s) => s,
+        QueryExpr::SetOp(_) => {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "a set operation in the recursive term of a recursive query is not supported yet"
+                    .to_string(),
+            ));
+        }
+    };
+    validate_recursive_term(name, rhs_sel)?;
+    Ok(CteShape::Recursive {
+        union_all: so.all,
+    })
+}
+
+/// Validate the recursive term (the UNION's right SELECT) of a recursive CTE (recursive-cte.md §6).
+/// The self-reference must appear exactly once, as a direct FROM/JOIN relation, not on the nullable
+/// side of an outer join; the term must contain no aggregate. The checks fire in PostgreSQL's order
+/// — a self-reference in a bad CONTEXT (a sublink, an outer join) is reported as that context even
+/// when a valid FROM reference also exists, so context checks precede the once-only count.
+fn validate_recursive_term(name: &str, sel: &Select) -> Result<()> {
+    // A self-reference inside an expression sublink is `within a subquery` (matching PostgreSQL),
+    // regardless of any valid FROM reference also present.
+    if count_sublink_self_refs(sel, name) >= 1 {
+        return Err(EngineError::new(
+            SqlState::InvalidRecursion,
+            format!("recursive reference to query \"{name}\" must not appear within a subquery"),
+        ));
+    }
+    // A self-reference nested inside a FROM derived table is a jed narrowing (0A000) — PostgreSQL
+    // allows `FROM (… c …)`.
+    if count_from_subquery_self_refs(sel, name) >= 1 {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            format!(
+                "recursive reference to query \"{name}\" inside a FROM subquery is not supported yet"
+            ),
+        ));
+    }
+    // The remaining self-references are all direct FROM/JOIN relations.
+    let direct = count_direct_from_self_refs(sel, name);
+    if direct > 1 {
+        return Err(EngineError::new(
+            SqlState::InvalidRecursion,
+            format!("recursive reference to query \"{name}\" must not appear more than once"),
+        ));
+    }
+    // An aggregate in the recursive term is rejected (matching PostgreSQL).
+    if items_have_aggregate(&sel.items)
+        || sel.having.as_ref().is_some_and(|h| expr_has_aggregate(h))
+    {
+        return Err(EngineError::new(
+            SqlState::InvalidRecursion,
+            "aggregate functions are not allowed in a recursive query's recursive term".to_string(),
+        ));
+    }
+    // A direct reference on the nullable side of an outer join is `within an outer join`.
+    if direct == 1 && direct_self_ref_on_nullable_side(sel, name) {
+        return Err(EngineError::new(
+            SqlState::InvalidRecursion,
+            format!("recursive reference to query \"{name}\" must not appear within an outer join"),
+        ));
+    }
+    Ok(())
+}
+
+/// Self-references reachable only through an expression sublink (a scalar/`IN`/`EXISTS`/quantified
+/// subquery) in this SELECT's top-level expressions — the `within a subquery` position.
+fn count_sublink_self_refs(s: &Select, name: &str) -> usize {
+    select_exprs(s)
+        .iter()
+        .map(|e| count_self_refs_expr(e, name))
+        .sum()
+}
+
+/// Check a recursive CTE's column types (recursive-cte.md §2): the output types are FIXED by the
+/// non-recursive (anchor) term, and the recursive term's columns must be assignable to them — a
+/// literal adapts, an equal type passes, a WIDER type is `42804` (matching PostgreSQL). Mechanically
+/// the would-be UNION unified type must EQUAL the anchor type; any widening of the anchor is the
+/// error. An arity mismatch is `42601`, like a plain UNION.
+fn check_recursive_column_types(
+    anchor: &QueryPlan,
+    recursive: &QueryPlan,
+    name: &str,
+) -> Result<()> {
+    let a = anchor.column_types();
+    let r = recursive.column_types();
+    if a.len() != r.len() {
+        return Err(EngineError::new(
+            SqlState::SyntaxError,
+            "each UNION query must have the same number of columns".to_string(),
+        ));
+    }
+    for (i, (at, rt)) in a.iter().zip(r.iter()).enumerate() {
+        let unified = unify_setop_column(at, rt, SetOpKind::Union)?;
+        if &unified != at {
+            return Err(EngineError::new(
+                SqlState::DatatypeMismatch,
+                format!(
+                    "recursive query \"{name}\" column {} has type {} in non-recursive term but type {} overall",
+                    i + 1,
+                    at.type_name(),
+                    unified.type_name(),
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Total self-references to `name` anywhere in a query expression (deep — FROM relations at every
+/// nesting level plus expression sublinks).
+fn count_self_refs_query(qe: &QueryExpr, name: &str) -> usize {
+    match qe {
+        QueryExpr::Select(s) => count_self_refs_select(s, name),
+        QueryExpr::SetOp(so) => {
+            count_self_refs_query(&so.lhs, name) + count_self_refs_query(&so.rhs, name)
+        }
+    }
+}
+
+/// Total self-references in a SELECT: its FROM relations (deep) plus all of its expressions' sublinks.
+fn count_self_refs_select(s: &Select, name: &str) -> usize {
+    let mut n = 0;
+    for tref in from_relations(s) {
+        n += count_self_refs_tableref(tref, name);
+    }
+    for e in select_exprs(s) {
+        n += count_self_refs_expr(e, name);
+    }
+    n
+}
+
+/// Self-references reachable through one FROM relation: a plain table reference with the matching
+/// name (+1), a derived-table subquery (recurse), or a table-function's / VALUES' argument exprs.
+fn count_self_refs_tableref(tref: &TableRef, name: &str) -> usize {
+    if is_plain_relation(tref) {
+        return usize::from(tref.name.eq_ignore_ascii_case(name));
+    }
+    let mut n = 0;
+    if let Some(sub) = &tref.subquery {
+        n += count_self_refs_query(sub, name);
+    }
+    if let Some(args) = &tref.args {
+        for a in args {
+            n += count_self_refs_expr(a, name);
+        }
+    }
+    if let Some(rows) = &tref.values {
+        for row in rows {
+            for e in row {
+                n += count_self_refs_expr(e, name);
+            }
+        }
+    }
+    n
+}
+
+/// Self-references inside an expression — only reachable through a sublink (a subquery is an
+/// independent query whose own FROM may reference the CTE). Walks every Expr variant to find the
+/// sublinks, then recurses into each sublink's query. The walk is exhaustive (like
+/// `expr_has_aggregate`) so a new Expr variant is a compile error here, not a silent miss.
+fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
+    let sub = |x: &Expr| count_self_refs_expr(x, name);
+    match e {
+        Expr::ScalarSubquery(q) | Expr::Exists(q) => count_self_refs_query(q, name),
+        Expr::InSubquery { lhs, query, .. } | Expr::QuantifiedSubquery { lhs, query, .. } => {
+            sub(lhs) + count_self_refs_query(query, name)
+        }
+        Expr::Column(_)
+        | Expr::QualifiedColumn { .. }
+        | Expr::Literal(_)
+        | Expr::TypedLiteral { .. }
+        | Expr::Param(_) => 0,
+        Expr::Row(items) | Expr::Array(items) => items.iter().map(sub).sum(),
+        Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => sub(base),
+        Expr::Subscript { base, subscripts } => {
+            sub(base)
+                + subscripts
+                    .iter()
+                    .flat_map(subscript_spec_exprs)
+                    .map(sub)
+                    .sum::<usize>()
+        }
+        Expr::Cast { inner, .. } | Expr::Collate { inner, .. } => sub(inner),
+        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => sub(operand),
+        Expr::Binary { lhs, rhs, .. }
+        | Expr::IsDistinctFrom { lhs, rhs, .. }
+        | Expr::Like { lhs, rhs, .. } => sub(lhs) + sub(rhs),
+        Expr::In { lhs, list, .. } => sub(lhs) + list.iter().map(sub).sum::<usize>(),
+        Expr::Quantified { lhs, array, .. } => sub(lhs) + sub(array),
+        Expr::Between { lhs, lo, hi, .. } => sub(lhs) + sub(lo) + sub(hi),
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            operand.as_deref().map_or(0, sub)
+                + whens.iter().map(|(c, r)| sub(c) + sub(r)).sum::<usize>()
+                + els.as_deref().map_or(0, sub)
+        }
+        Expr::FuncCall { args, .. } => args.iter().map(sub).sum(),
+    }
+}
+
+/// Self-references that are DIRECT FROM/JOIN relations of this SELECT (a plain table ref matching
+/// the name, not nested in a subquery). This is the only valid position for a recursive reference.
+fn count_direct_from_self_refs(s: &Select, name: &str) -> usize {
+    from_relations(s)
+        .filter(|tref| is_plain_relation(tref) && tref.name.eq_ignore_ascii_case(name))
+        .count()
+}
+
+/// Self-references nested inside a FROM-position subquery / table-function args / VALUES of this
+/// SELECT (the deferred `0A000` shape — PostgreSQL allows a self-reference in `FROM (… c …)`).
+fn count_from_subquery_self_refs(s: &Select, name: &str) -> usize {
+    from_relations(s)
+        .filter(|tref| !is_plain_relation(tref))
+        .map(|tref| count_self_refs_tableref(tref, name))
+        .sum()
+}
+
+/// Whether the SELECT's single direct self-reference sits on the NULLABLE side of an outer join —
+/// the position PostgreSQL rejects (`within an outer join`). The FROM is a left-deep chain: relation
+/// 0 is `from`, relation `i+1` is `joins[i].table`, combined by `joins[i].kind`. A LEFT/FULL join
+/// makes its right operand nullable; a RIGHT/FULL join makes the whole accumulated left nullable.
+fn direct_self_ref_on_nullable_side(s: &Select, name: &str) -> bool {
+    let rels: Vec<&TableRef> = from_relations(s).collect();
+    let mut nullable = vec![false; rels.len()];
+    for (j, jc) in s.joins.iter().enumerate() {
+        let right = j + 1;
+        match jc.kind {
+            JoinKind::Left => nullable[right] = true,
+            JoinKind::Right => nullable.iter_mut().take(right).for_each(|n| *n = true),
+            JoinKind::Full => nullable.iter_mut().take(right + 1).for_each(|n| *n = true),
+            JoinKind::Inner | JoinKind::Cross => {}
+        }
+    }
+    rels.iter().enumerate().any(|(i, tref)| {
+        is_plain_relation(tref) && tref.name.eq_ignore_ascii_case(name) && nullable[i]
+    })
+}
+
+/// A FROM relation that is a plain table NAME — not a derived-table subquery, a table function, or
+/// a VALUES body. Only a plain relation can resolve to a CTE.
+fn is_plain_relation(tref: &TableRef) -> bool {
+    tref.subquery.is_none() && tref.args.is_none() && tref.values.is_none()
+}
+
+/// The FROM relations of a SELECT in left-deep order: `from` (if present) then each join's table.
+fn from_relations(s: &Select) -> impl Iterator<Item = &TableRef> {
+    s.from.iter().chain(s.joins.iter().map(|j| &j.table))
+}
+
+/// Every top-level expression of a SELECT that can hold a sublink (select items, WHERE, GROUP BY,
+/// HAVING, join ON conditions) — for the sublink self-reference walk. ORDER BY keys are bare /
+/// qualified column references (never expressions — `OrderKey`), so they carry no sublink.
+fn select_exprs(s: &Select) -> Vec<&Expr> {
+    let mut v: Vec<&Expr> = Vec::new();
+    if let SelectItems::Items(items) = &s.items {
+        v.extend(items.iter().map(|it| &it.expr));
+    }
+    v.extend(s.filter.iter());
+    v.extend(s.group_by.iter());
+    v.extend(s.having.iter());
+    v.extend(s.joins.iter().filter_map(|j| j.on.as_ref()));
+    v
 }
 
 /// Build the synthetic relation a CTE reference resolves against (spec/design/cte.md §2): one

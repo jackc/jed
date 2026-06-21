@@ -1,8 +1,10 @@
-//! Common table expressions — `WITH name [(cols)] AS [NOT] MATERIALIZED (query) [, …] <query>`,
-//! non-recursive (spec/design/cte.md). The row/name/error assertions and the inline/materialize
-//! cost contract live in the shared conformance corpus (spec/conformance/suites/cte/*.test). What
-//! remains here is the MATERIALIZED / NOT MATERIALIZED hint cost split (13/23), which the corpus
-//! pins by rows but NOT by cost.
+//! Common table expressions — `WITH [RECURSIVE] name [(cols)] AS [NOT] MATERIALIZED (query) [, …]
+//! <query>` (spec/design/cte.md, spec/design/recursive-cte.md). The row/name/error assertions and
+//! the inline/materialize cost contract live in the shared conformance corpus
+//! (spec/conformance/suites/cte/*.test). What remains here is what the corpus cannot express: the
+//! MATERIALIZED / NOT MATERIALIZED hint cost split (13/23), and — for `WITH RECURSIVE` — the
+//! cost-ceiling termination of a non-terminating recursion (`54P01`, a host-API `max_cost`) and the
+//! inert materialization hint.
 
 use jed::{Database, execute};
 
@@ -49,4 +51,56 @@ fn materialized_hint_forces_buffering() {
         ),
         23
     );
+}
+
+/// A non-terminating recursion (`UNION ALL` with no stopping predicate) is bounded by the cost
+/// ceiling. Each iteration is cheap (a 1-row working table), so this trips `54P01` ONLY through the
+/// CONTINUOUS cross-iteration meter (recursive-cte.md §5) — the untrusted-query safety mechanism
+/// doing real work. A per-iteration meter would never fire here, so the corpus cannot express it.
+#[test]
+fn recursive_unbounded_aborts_at_cost_ceiling() {
+    let mut db = Database::new();
+    db.set_max_cost(1000);
+    let err = execute(
+        &mut db,
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c) SELECT n FROM c",
+    )
+    .expect_err("an unbounded recursion must abort, not loop forever");
+    assert_eq!(err.code(), "54P01", "got {}", err.message);
+}
+
+/// A recursion whose total cost fits under the ceiling runs to completion (the ceiling bounds the
+/// *actual* accrued cost, not a per-iteration figure).
+#[test]
+fn recursive_under_ceiling_succeeds() {
+    let mut db = Database::new();
+    // The 5-row counter accrues 29 (the corpus cost contract); a ceiling above it lets it through.
+    db.set_max_cost(1000);
+    let r = execute(
+        &mut db,
+        "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 5) SELECT n FROM c",
+    )
+    .expect("a terminating recursion under the ceiling must succeed");
+    assert_eq!(r.cost(), 29);
+}
+
+/// A recursive CTE is ALWAYS materialized — `NOT MATERIALIZED` is inert (recursive-cte.md §1), so a
+/// single-reference recursive CTE still iterates to a fixpoint rather than inlining its body.
+#[test]
+fn recursive_hint_is_inert() {
+    let mut db = Database::new();
+    for hint in ["", "MATERIALIZED ", "NOT MATERIALIZED "] {
+        let sql = format!(
+            "WITH RECURSIVE c(n) AS {hint}(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n"
+        );
+        let r = execute(&mut db, &sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
+        // Three rows regardless of the hint; the recursive cost is identical (the hint is ignored).
+        match r {
+            jed::Outcome::Query { rows, cost, .. } => {
+                assert_eq!(rows.len(), 3, "hint {hint:?}");
+                assert_eq!(cost, 17, "hint {hint:?} cost");
+            }
+            _ => panic!("expected a query result"),
+        }
+    }
 }

@@ -427,12 +427,21 @@ query_expr     ::= set_expr order_by? limit_offset?
  * where it is referenced.
  *   The WITH prefix attaches only at the STATEMENT top level this slice: a WITH inside a
  * parenthesized subquery or another CTE body is a documented narrowing (the body production is the
- * WITH-less query_expr). RECURSIVE (WITH RECURSIVE), data-modifying CTEs (WITH x AS (INSERT ...
- * RETURNING ...)), and WITH on UPDATE/DELETE are deferred follow-ons (RECURSIVE → 0A000). WITH /
- * MATERIALIZED are NOT reserved (§3). */
+ * WITH-less query_expr). Data-modifying CTEs (WITH x AS (INSERT ... RETURNING ...)) and WITH on
+ * UPDATE/DELETE are deferred follow-ons. WITH / MATERIALIZED are NOT reserved (§3).
+ *   "WITH RECURSIVE" (../design/recursive-cte.md) lets a CTE reference ITSELF: a recursive CTE's
+ * body must be a top-level "non_recursive_term UNION [ALL] recursive_term", the recursive term
+ * referencing the CTE name exactly once as a direct FROM/JOIN relation. Its column types are fixed
+ * by the non-recursive term (a wider recursive-term column is 42804); it is evaluated to a fixpoint
+ * (working-table method) and ALWAYS materialized ([NOT] MATERIALIZED is inert). Termination is the
+ * max_cost ceiling (54P01) — no fixed iteration cap, matching PG. A CTE in a RECURSIVE list that
+ * does NOT reference itself is an ordinary non-recursive CTE. Structural ill-formedness is 42P19
+ * (invalid_recursion); deferred shapes (ORDER BY/LIMIT in a recursive query, a set-op recursive
+ * term, a self-ref inside a FROM subquery, mutual recursion) are 0A000/42P01. RECURSIVE is the
+ * keyword right after WITH (PG reserves it, so a CTE may not be named "recursive"). */
 query_statement ::= with_clause? query_expr
 
-with_clause    ::= "WITH" cte ("," cte)*
+with_clause    ::= "WITH" "RECURSIVE"? cte ("," cte)*
 
 cte            ::= identifier ("(" identifier ("," identifier)* ")")?
                    "AS" ("NOT"? "MATERIALIZED")? "(" query_expr ")"

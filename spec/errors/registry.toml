@@ -278,6 +278,16 @@ class = "syntax error or access rule violation"
 template = "could not determine data type of parameter ${index}"
 
 [[error]]
+code = "42P19"
+name = "invalid_recursion"
+class = "syntax error or access rule violation"
+# A WITH RECURSIVE common table expression that references itself but is structurally ill-formed
+# (spec/design/recursive-cte.md §6): not of the form non-recursive-term UNION [ALL] recursive-term,
+# a self-reference in the wrong place (the non-recursive term, more than once, inside a sublink or
+# outer join), or an aggregate in the recursive term. Matches PostgreSQL.
+template = "{detail}"
+
+[[error]]
 code = "42P02"
 name = "undefined_parameter"
 class = "syntax error or access rule violation"

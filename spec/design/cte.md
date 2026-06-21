@@ -137,8 +137,10 @@ purely a query-plan construct — no `format_version` bump).
 
 **Deferred (unchanged from [TODO.md](../../TODO.md)):**
 
-- **`WITH RECURSIVE`** — the iterate-to-fixpoint executor and a termination story (the `54P01`
-  cost ceiling does real work there). The forward-only visibility rule (§2) is what this lifts.
+- ~~**`WITH RECURSIVE`**~~ — ✅ **landed** ([recursive-cte.md](recursive-cte.md)): the
+  iterate-to-fixpoint (working-table) executor, anchor-fixed column types (`42804`), the structural
+  `42P19` checks, and cost-ceiling termination (the `54P01` ceiling does real work there). It lifts
+  exactly the forward-only visibility rule (§2) — a recursive CTE sees its own name.
 - **Data-modifying CTEs** — `WITH x AS (INSERT … RETURNING …) …`.
 - **`WITH` on `UPDATE`/`DELETE`**, and **nested `WITH`** inside a subquery / CTE body.
 

@@ -313,16 +313,30 @@ file = "types/composite.test"
 sql = "SELECT ROW(1, 2) = ROW(1, 2, 3)"
 reason = "jed: comparing rows of different sizes is 42804 (datatype_mismatch — the comparison gate, composite.md §5). PostgreSQL raises 42601 (\"unequal number of entries in row expressions\"). A code-only divergence; both reject."
 
-# --- CTEs: two deferred narrowings jed rejects but PostgreSQL accepts (spec/design/cte.md §6).
-[[override]]
-file = "cte/errors.test"
-sql = "WITH RECURSIVE c AS (SELECT id FROM t) SELECT id FROM c"
-reason = "jed: WITH RECURSIVE is deferred this slice (0A000 — cte.md §6). PostgreSQL supports recursive CTEs and runs this (returning t's ids). A documented feature narrowing, not a behavior difference."
-
+# --- CTEs: a nested WITH is a deferred narrowing jed rejects but PostgreSQL accepts (cte.md §6).
+# (WITH RECURSIVE has since landed — spec/design/recursive-cte.md.)
 [[override]]
 file = "cte/errors.test"
 sql = "WITH a AS (WITH b AS (SELECT id FROM t) SELECT id FROM b) SELECT id FROM a"
 reason = "jed: a WITH attaches only at the statement top level this slice, so a nested WITH inside a CTE body is a 42601 syntax error (cte.md §1/§6 — the body is the WITH-less query_expr). PostgreSQL accepts a nested WITH and runs it. A documented surface narrowing."
+
+# --- recursive CTEs (spec/design/recursive-cte.md §6): three deferred shapes PostgreSQL accepts
+# but jed rejects (a set-op / FROM-subquery recursive term, and mutual recursion), recorded where
+# the recursive_errors.test corpus exercises them.
+[[override]]
+file = "cte/recursive_errors.test"
+sql = "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3 INTERSECT SELECT 99) SELECT n FROM c"
+reason = "jed: a set-operation recursive term is a deferred narrowing (0A000 — recursive-cte.md §6/§8). The recursive term `… INTERSECT SELECT 99` is the UNION's right operand (INTERSECT binds tighter), a SetOp the analyzer rejects. PostgreSQL accepts it and runs it. A documented feature narrowing."
+
+[[override]]
+file = "cte/recursive_errors.test"
+sql = "WITH RECURSIVE c(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM (SELECT n FROM c) s WHERE n < 3) SELECT n FROM c"
+reason = "jed: a recursive self-reference inside a FROM derived table is a deferred narrowing (0A000 — recursive-cte.md §6). PostgreSQL allows FROM (… c …) and runs it. A documented feature narrowing."
+
+[[override]]
+file = "cte/recursive_errors.test"
+sql = "WITH RECURSIVE a(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM b WHERE n < 3), b(n) AS (SELECT n FROM a) SELECT n FROM a"
+reason = "jed: mutual recursion surfaces via forward-only visibility as 42P01 (recursive reference to a later CTE is out of scope — recursive-cte.md §3). PostgreSQL detects mutual recursion specifically and raises 0A000 (mutual recursion between WITH items is not implemented). A documented error-code divergence for a case neither engine executes."
 
 # --- float math functions: argument resolution is `none` (catalog), so a bare integer or
 # decimal literal does NOT implicitly promote to the float family. PostgreSQL resolves these

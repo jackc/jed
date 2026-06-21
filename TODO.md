@@ -497,11 +497,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       A CTE name shadows a same-named catalog table except inside its own body; a duplicate name is
       `42712`, a self/forward reference `42P01`, too many rename aliases `42P10`, `WITH RECURSIVE`
       `0A000`. → [cte.md](spec/design/cte.md)
-  - [ ] _follow-on:_ **`WITH RECURSIVE`** (the iterate-to-fixpoint executor + a termination story —
-        the `54P01` cost ceiling does real work there); **data-modifying CTEs**
-        (`WITH x AS (INSERT … RETURNING …)`); **`WITH` on UPDATE/DELETE**; a **nested `WITH`** inside
-        a subquery or CTE body (top-level only this slice); and the inline derived-table **syntax**
-        `FROM (SELECT …) AS t` (the executor seam landed; only the parser surface remains).
+  - [x] **`WITH RECURSIVE`** — ✅ landed ([recursive-cte.md](spec/design/recursive-cte.md)): the
+        iterate-to-fixpoint (working-table) executor for a single self-referencing CTE of the form
+        `non_recursive_term UNION [ALL] recursive_term`, the recursive self-reference as a direct
+        `FROM`/`JOIN` relation (joinable to base tables / earlier CTEs), `UNION`/`UNION ALL`
+        semantics, anchor-fixed column types (a wider recursive-term column is `42804`), the
+        structural `42P19` (`invalid_recursion`) checks (matching PG), and **cost-ceiling
+        termination** (`54P01`, continuous cross-iteration metering — no fixed iteration cap, like
+        PG). A recursive CTE is always materialized (`[NOT] MATERIALIZED` inert). New capability
+        `query.cte_recursive`; no `format_version` bump. Narrowings (`0A000`/`42P01`): `ORDER
+        BY`/`LIMIT` in a recursive query, a set-op recursive term, a self-ref inside a `FROM`
+        subquery, mutual recursion, `SEARCH`/`CYCLE`.
+  - [ ] _follow-on:_ **data-modifying CTEs** (`WITH x AS (INSERT … RETURNING …)`); **`WITH` on
+        UPDATE/DELETE**; a **nested `WITH`** inside a subquery or CTE body (top-level only this
+        slice); recursive-CTE deferrals (`SEARCH`/`CYCLE`, a set-op / `FROM`-subquery recursive
+        term, mutual recursion).
 - [x] **Set-returning functions** — `generate_series(start, stop [, step])` in FROM position, a
       synthetic one-column relation, a new `generated_row` cost unit; integer variants (timestamp
       waits on interval composition). → [functions.md §10](spec/design/functions.md)

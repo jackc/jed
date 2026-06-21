@@ -588,10 +588,14 @@ pub struct Cte {
 /// list of common table expressions (each visible to later CTEs and to `body`); `body` is the
 /// main query expression. Built only when a `WITH` is present — a plain query stays
 /// `Statement::Select`/`Statement::SetOp`, so those paths are untouched (the `SetOp` precedent).
+/// `recursive` is the `WITH RECURSIVE` flag (spec/design/recursive-cte.md): a flag on the whole
+/// list that ENABLES a CTE to reference itself (lifting the forward-only `42P01`); a CTE that does
+/// not reference itself is still an ordinary non-recursive CTE.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WithQuery {
     pub ctes: Vec<Cte>,
     pub body: QueryExpr,
+    pub recursive: bool,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

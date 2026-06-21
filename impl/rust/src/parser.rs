@@ -1409,19 +1409,22 @@ impl Parser {
     }
 
     /// `query_statement ::= with_clause? query_expr` — a top-level query prefixed by a `WITH`
-    /// clause defining common table expressions (spec/design/cte.md). `WITH RECURSIVE` is deferred
-    /// (0A000); the CTE bodies and the main body are WITH-less `query_expr`s (the top-level-only
-    /// narrowing — a nested `WITH` surfaces as 42601 because a body must begin with `SELECT`).
+    /// clause defining common table expressions (spec/design/cte.md). `WITH RECURSIVE`
+    /// (spec/design/recursive-cte.md) sets the `recursive` flag and lets a CTE reference itself;
+    /// the CTE bodies and the main body are WITH-less `query_expr`s (the top-level-only narrowing —
+    /// a nested `WITH` surfaces as 42601 because a body must begin with `SELECT`).
     fn parse_with_statement(&mut self) -> Result<Statement> {
         self.expect_keyword("with")?;
-        // `WITH RECURSIVE …` is deferred this slice. RECURSIVE in this position is the keyword (PG
-        // reserves it), so a CTE may not be named `recursive` — a documented narrowing (cte.md §6).
-        if self.peek_keyword().as_deref() == Some("recursive") {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "WITH RECURSIVE is not supported yet",
-            ));
-        }
+        // `WITH RECURSIVE …` enables self-reference (recursive-cte.md). RECURSIVE in this position
+        // is the keyword (PG reserves it), so a CTE may not be named `recursive` — a documented
+        // narrowing. The flag governs the whole list; whether a given CTE is *actually* recursive
+        // is decided at planning by whether its body references its own name.
+        let recursive = if self.peek_keyword().as_deref() == Some("recursive") {
+            self.advance();
+            true
+        } else {
+            false
+        };
         let mut ctes = Vec::new();
         loop {
             ctes.push(self.parse_cte()?);
@@ -1432,7 +1435,11 @@ impl Parser {
             }
         }
         let body = self.parse_query_expr_node()?;
-        Ok(Statement::With(WithQuery { ctes, body }))
+        Ok(Statement::With(WithQuery {
+            ctes,
+            body,
+            recursive,
+        }))
     }
 
     /// `cte ::= identifier ("(" ident ("," ident)* ")")? "AS" ("NOT"? "MATERIALIZED")? "("

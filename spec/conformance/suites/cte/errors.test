@@ -1,6 +1,7 @@
 # Error surface of non-recursive common table expressions (spec/design/cte.md §4). Codes verified
-# against the live PostgreSQL 18 oracle, except the two deliberate jed narrowings recorded in
-# oracle_overrides.toml (WITH RECURSIVE and a nested WITH, both of which PostgreSQL accepts).
+# against the live PostgreSQL 18 oracle, except the deliberate jed narrowing recorded in
+# oracle_overrides.toml (a nested WITH, which PostgreSQL accepts). Recursive-CTE errors are in
+# recursive_errors.test.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.cte, types.i32
 
 statement ok
@@ -30,10 +31,6 @@ WITH c (a, b, x) AS (SELECT id, n FROM t) SELECT * FROM c
 # independent query, not correlated to the reference site).
 statement error 42703
 WITH c AS (SELECT missing FROM t) SELECT id FROM c
-
-# WITH RECURSIVE is deferred this slice: 0A000 (a documented divergence — PostgreSQL runs it).
-statement error 0A000
-WITH RECURSIVE c AS (SELECT id FROM t) SELECT id FROM c
 
 # A nested WITH (inside a CTE body) is the top-level-only narrowing: the body is the WITH-less
 # query_expr, so the inner WITH is a 42601 syntax error (a documented divergence — PG accepts it).

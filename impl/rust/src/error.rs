@@ -105,6 +105,11 @@ pub enum SqlState {
     /// 42883 — undefined function (an unknown function name in a call;
     /// spec/design/aggregates.md §5).
     UndefinedFunction,
+    /// 42P19 — invalid recursion: a `WITH RECURSIVE` CTE that references itself but is
+    /// structurally ill-formed (not `non-recursive-term UNION [ALL] recursive-term`, a
+    /// self-reference in the wrong place, or an aggregate in the recursive term;
+    /// spec/design/recursive-cte.md §6).
+    InvalidRecursion,
     /// 42P18 — indeterminate datatype: a bind parameter `$N` whose type cannot be inferred
     /// from context (spec/design/api.md §5).
     IndeterminateDatatype,
@@ -219,6 +224,7 @@ impl SqlState {
             SqlState::GroupingError => "42803",
             SqlState::UndefinedFunction => "42883",
             SqlState::IndeterminateDatatype => "42P18",
+            SqlState::InvalidRecursion => "42P19",
             SqlState::UndefinedParameter => "42P02",
             SqlState::DuplicateObject => "42710",
             SqlState::WrongObjectType => "42809",
