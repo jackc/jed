@@ -12,8 +12,9 @@ package jed
 //
 // Shape (the faithful §8 design):
 //   - SharedDB wraps a *sharedCore; it is safe to share and to copy by value (it is a pointer).
-//   - sharedCore holds the published committed snapshot (an atomic.Pointer[Snapshot] — readers pin
-//     it with a single lock-free Load, a writer publishes with a single Store), the single-writer
+//   - sharedCore holds the published committed roots — the file Snapshot AND the database-wide
+//     shared-temp Snapshot (temp-tables.md §5) — in ONE atomic.Pointer[roots] (so a reader pins both
+//     with a single lock-free Load and a writer publishes both with a single Store), the single-writer
 //     gate (a sync.Mutex held for the write transaction's life, so a second Write blocks — bbolt
 //     semantics), and the live-reader registry (pinned versions → the reclamation watermark, §8).
 //   - ReadHandle pins the committed snapshot at Read() (a lock-free Load) and registers its
@@ -36,13 +37,23 @@ import (
 	"sync/atomic"
 )
 
+// roots are the two published committed roots (spec/design/temp-tables.md §5): the file Snapshot AND
+// the database-wide shared-temp Snapshot. Held in ONE atomic.Pointer so a reader pins both with a
+// single lock-free Load (no torn pin where a concurrent commit advances one root between two Loads)
+// and a writer publishes both with a single Store. sharedTemp is never serialized — it rides the same
+// commit discipline as a pure in-memory swap (no fsync, nothing written to the file).
+type roots struct {
+	committed  *Snapshot // the committed FILE snapshot
+	sharedTemp *Snapshot // the committed shared-temp snapshot (never serialized)
+}
+
 // sharedCore is the goroutine-safe state shared by every handle minted from one SharedDB
-// (CLAUDE.md §3): the published committed snapshot, the single-writer gate, and the live registry.
+// (CLAUDE.md §3): the published committed roots, the single-writer gate, and the live registry.
 type sharedCore struct {
-	// committed is the published committed snapshot. A reader pins it with a lock-free Load; a
-	// writer publishes a new one with a single Store — the §3 short commit window. A published
-	// Snapshot is immutable, so concurrent readers of the loaded pointer never race.
-	committed atomic.Pointer[Snapshot]
+	// roots is the published committed roots (file + shared-temp). A reader pins both with a lock-free
+	// Load; a writer publishes new ones with a single Store — the §3/§5 short commit window. A
+	// published roots and its Snapshots are immutable, so concurrent readers never race.
+	roots atomic.Pointer[roots]
 	// writeMu is the single-writer gate: a goroutine holds it for its whole write transaction, so a
 	// second Write blocks until the holder commits or rolls back (CLAUDE.md §3 — at most one writer).
 	writeMu sync.Mutex
@@ -61,20 +72,20 @@ type SharedDB struct {
 // NewSharedDB builds a fresh, empty in-memory shared database (committed version 0).
 func NewSharedDB() *SharedDB {
 	c := &sharedCore{live: make(map[uint64]int)}
-	c.committed.Store(newSnapshot())
+	c.roots.Store(&roots{committed: newSnapshot(), sharedTemp: newSnapshot()})
 	return &SharedDB{core: c}
 }
 
 // Version is the committed version currently published (the monotonic commit counter,
 // transactions.md §8). Advances by 1 on every WriteHandle.Commit.
-func (s *SharedDB) Version() uint64 { return s.core.committed.Load().txid }
+func (s *SharedDB) Version() uint64 { return s.core.roots.Load().committed.txid }
 
 // OldestLiveTxid is the oldest still-live snapshot version (transactions.md §8) — the Phase-6
 // reclamation watermark. With live readers it is the minimum version any of them pinned; with none
 // it is the committed version (nothing older is reachable). The map scan is order-independent (a
 // minimum), so no hash-map iteration order leaks (CLAUDE.md §8).
 func (s *SharedDB) OldestLiveTxid() uint64 {
-	oldest := s.core.committed.Load().txid
+	oldest := s.core.roots.Load().committed.txid
 	s.core.liveMu.Lock()
 	defer s.core.liveMu.Unlock()
 	for v := range s.core.live {
@@ -90,13 +101,16 @@ func (s *SharedDB) OldestLiveTxid() uint64 {
 // that snapshot for its life — lock-free, never blocked by and never blocking a writer. The caller
 // must Close it to deregister (advancing the watermark), idiomatically `defer r.Close()`.
 func (s *SharedDB) Read() *ReadHandle {
-	snap := s.core.committed.Load()
+	rt := s.core.roots.Load()
+	snap := rt.committed
 	s.core.liveMu.Lock()
 	s.core.live[snap.txid]++
 	s.core.liveMu.Unlock()
 	// Reads never mutate the snapshot (a write through the handle is rejected before dispatch), so
-	// the handle's Database shares the immutable pinned snapshot directly — no clone.
-	return &ReadHandle{core: s.core, version: snap.txid, db: &Database{committed: snap, pageSize: DefaultPageSize, session: newSession()}}
+	// the handle's Database shares the immutable pinned snapshots directly — no clone. Both roots are
+	// pinned together (temp-tables.md §5), so the reader sees a consistent file + shared-temp view.
+	db := &Database{committed: snap, pageSize: DefaultPageSize, session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
+	return &ReadHandle{core: s.core, version: snap.txid, db: db}
 }
 
 // Write opens the write handle (transactions.md §10). Blocks until no other writer is active
@@ -105,9 +119,11 @@ func (s *SharedDB) Read() *ReadHandle {
 // Commit publishes the working set, Rollback / an un-ended handle discards it.
 func (s *SharedDB) Write() *WriteHandle {
 	s.core.writeMu.Lock()
-	base := s.core.committed.Load()
-	// committed is the immutable base (the writer mutates only working, which beginTx clones off it).
-	db := &Database{committed: base, pageSize: DefaultPageSize, session: newSession()}
+	rt := s.core.roots.Load()
+	base := rt.committed
+	// committed/sharedTemp are the immutable bases (the writer mutates only working / sharedTempWorking,
+	// which beginTx clones off them). Both roots are pinned together (temp-tables.md §5).
+	db := &Database{committed: base, pageSize: DefaultPageSize, session: newSession(), sharedTempCommitted: rt.sharedTemp, sharedTempMem: DefaultSharedTempMem}
 	_, _ = db.beginTx(true, true)
 	return &WriteHandle{core: s.core, db: db, baseVersion: base.txid}
 }
@@ -201,13 +217,17 @@ func (w *WriteHandle) Commit() error {
 	w.done = true
 	defer w.core.writeMu.Unlock()
 	failed := w.db.session.tx != nil && w.db.session.tx.failed
-	if _, err := w.db.commitTx(); err != nil { // inner in-memory swap: db.committed := working
+	if _, err := w.db.commitTx(); err != nil { // inner in-memory swap: committed := working, shared-temp adopted
 		return err
 	}
 	if !failed {
 		snap := w.db.committed
 		snap.txid = w.baseVersion + 1 // advance the shared version on every commit
-		w.core.committed.Store(snap)
+		// Publish BOTH roots in one Store (the two-root commit, temp-tables.md §5): the file snapshot
+		// and the shared-temp snapshot (a pure in-memory swap — no fsync, nothing written to the file).
+		// A writer that did not touch shared temp republishes the unchanged shared-temp root (safe:
+		// single writer, it pinned that root).
+		w.core.roots.Store(&roots{committed: snap, sharedTemp: w.db.sharedTempCommitted})
 	}
 	return nil
 }

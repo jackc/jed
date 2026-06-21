@@ -70,6 +70,14 @@ const DefaultMaxSQLLength = 1 << 20
 // Identical across cores (§8); the abort point is part of the cross-core contract.
 const DefaultTempBuffers = 32 << 20
 
+// DefaultSharedTempMem is the default GLOBAL storage budget for DATABASE-WIDE shared temporary tables,
+// in BYTES (spec/design/temp-tables.md §7). The shared-temp analogue of DefaultTempBuffers: shared
+// temp data is global (one set of rows across every session of the open Database), so its budget is a
+// Database-level setting (sharedTempMem) rather than per-session. An over-budget shared write aborts
+// the same 54P03. 0 ⇒ unlimited; measured identically (deterministic on-disk record bytes), so the
+// abort point is part of the cross-core contract.
+const DefaultSharedTempMem = 32 << 20
+
 // maxCompositeDepth is the maximum composite-type nesting depth (CLAUDE.md §13; spec/design/cost.md
 // §7b). A composite type's depth is the length of its deepest chain of nested composites, counting
 // itself: a row of scalars is depth 1, `CREATE TYPE b AS (x a)` is `1 + depth(a)`, and an array
@@ -642,6 +650,17 @@ type Database struct {
 	// opened without write access, so it is never written. Always false for an in-memory or
 	// normally-opened database.
 	readOnly bool
+	// sharedTempCommitted is the DATABASE-WIDE shared temporary-table snapshot (temp-tables.md §4):
+	// the committed rows of every SHARED temp table, held in memory and NEVER serialized — the shared
+	// analogue of session.tempCommitted, but on the handle (visible to every session minted from this
+	// Database) rather than per-session. On a single handle this is just a field; for the shared layer
+	// (shared.go) it is pinned from / published to the shared roots alongside committed (the two-root
+	// commit, §5). Born empty, gone at close — never recovered (divergence D5).
+	sharedTempCommitted *Snapshot
+	// sharedTempMem is the GLOBAL byte budget for shared temp storage (shared_temp_mem, §7); 0 ⇒
+	// unlimited. The shared analogue of session.tempBuffers, but Database-level (shared temp is
+	// global). An over-budget shared write aborts 54P03.
+	sharedTempMem int
 }
 
 // SessionOptions are the relocatable session settings (spec/design/session.md §3 — the bucket-A
@@ -673,6 +692,11 @@ type SessionOptions struct {
 	// (back-compat: a session left as-is behaves as before, one gate governing all DDL). The
 	// untrusted-scratch pattern is AllowDDL=false + AllowTempDDL=&true — private scratch tables only.
 	AllowTempDDL *bool
+	// AllowSharedTempDDL governs whether DATABASE-WIDE shared temporary-table DDL is permitted
+	// (spec/design/temp-tables.md §5); a denied shared-temp DDL is 42501. nil ⇒ INHERIT AllowDDL's
+	// value (back-compat, like AllowTempDDL). Shared-temp DDL mutates global state and charges the
+	// global budget, so it is the more privileged of the two temp gates.
+	AllowSharedTempDDL *bool
 	// TempBuffers is the per-session storage budget for session-local temp tables, in BYTES
 	// (spec/design/temp-tables.md §7); 0 ⇒ unlimited; nil ⇒ the engine default (DefaultTempBuffers).
 	// Bounds the RETAINED temp storage neither cost ceiling covers — an over-budget temp write aborts 54P03.
@@ -778,6 +802,11 @@ type Session struct {
 	// (spec/design/temp-tables.md §5); a denied temp DDL is 42501. Resolved at session creation from
 	// SessionOptions.AllowTempDDL (defaulting to allowDDL's value when unset).
 	allowTempDDL bool
+	// allowSharedTempDDL governs whether DATABASE-WIDE shared TEMPORARY-table DDL is permitted
+	// (spec/design/temp-tables.md §5); a denied shared-temp DDL is 42501. Resolved at session creation
+	// from SessionOptions.AllowSharedTempDDL (defaulting to allowDDL's value when unset). The more
+	// privileged of the two temp gates — shared-temp DDL is a global-state mutation.
+	allowSharedTempDDL bool
 	// tempBuffers is the per-session temp-table storage budget in BYTES (temp-tables.md §7); 0 ⇒
 	// unlimited. An over-budget temp write aborts 54P03.
 	tempBuffers int
@@ -848,11 +877,16 @@ func newSessionWithOptions(opts SessionOptions) Session {
 	if opts.AllowDDL != nil {
 		s.allowDDL = *opts.AllowDDL
 	}
-	// Back-compat default-inheritance (temp-tables.md §5): an unset AllowTempDDL takes allowDDL's value
-	// (resolved above), so a session configured before temp tables existed behaves exactly as it did.
+	// Back-compat default-inheritance (temp-tables.md §5): an unset AllowTempDDL / AllowSharedTempDDL
+	// takes allowDDL's value (resolved above), so a session configured before temp tables existed
+	// behaves exactly as it did (one gate governing all DDL).
 	s.allowTempDDL = s.allowDDL
 	if opts.AllowTempDDL != nil {
 		s.allowTempDDL = *opts.AllowTempDDL
+	}
+	s.allowSharedTempDDL = s.allowDDL
+	if opts.AllowSharedTempDDL != nil {
+		s.allowSharedTempDDL = *opts.AllowSharedTempDDL
 	}
 	if opts.TempBuffers != nil {
 		s.tempBuffers = *opts.TempBuffers
@@ -881,19 +915,29 @@ type activeTx struct {
 	// stores clone O(1)), mutated by temp DDL/DML, adopted back into tempCommitted on a successful COMMIT
 	// and discarded on ROLLBACK. The temp analogue of working, kept SEPARATE so it is never serialized.
 	tempWorking *Snapshot
+	// sharedTempWorking is the transaction's working copy of the DATABASE-WIDE shared temp-table
+	// snapshot (spec/design/temp-tables.md §5): cloned from Database.sharedTempCommitted at tx open,
+	// mutated by shared-temp DDL/DML, adopted back on a successful COMMIT and discarded on ROLLBACK.
+	// The shared analogue of tempWorking; for the shared layer the adopted state is then published to
+	// the shared root (the two-root commit, §5).
+	sharedTempWorking *Snapshot
 	// mainDirty is whether this transaction mutated the MAIN (persistent) snapshot — set by
 	// (*Database).workingMut. Drives the commit's persist decision so a transaction that touched ONLY
 	// temp tables makes zero file writes (temp-tables.md §2).
 	mainDirty bool
-	// tempDirty is whether this transaction mutated the TEMP snapshot — set by (*Database).tempWorkingMut.
-	// With mainDirty it decides whether COMMIT persists the main image (a temp-only commit skips it; an
-	// empty block still persists, preserving prior behavior).
+	// tempDirty is whether this transaction mutated the SESSION-LOCAL TEMP snapshot — set by the temp
+	// write funnels. With mainDirty/sharedTempDirty it decides whether COMMIT persists the main image
+	// (a pure-temp commit skips it; an empty block still persists, preserving prior behavior).
 	tempDirty bool
+	// sharedTempDirty is whether this transaction mutated the SHARED TEMP snapshot — set by the shared
+	// write funnels. Like tempDirty, a shared-temp-only commit makes zero file writes; it also charges
+	// the global sharedTempMem budget.
+	sharedTempDirty bool
 }
 
 // NewDatabase builds an empty in-memory database.
 func NewDatabase() *Database {
-	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize, session: newSession()}
+	return &Database{committed: newSnapshot(), pageSize: DefaultPageSize, session: newSession(), sharedTempCommitted: newSnapshot(), sharedTempMem: DefaultSharedTempMem}
 }
 
 // WithPageSize returns an in-memory handle that serializes at pageSize. The page-backed B-tree's
@@ -901,7 +945,7 @@ func NewDatabase() *Database {
 // the size it will serialize to — this builds fixtures / tests a non-default page size; a normal
 // in-memory database uses NewDatabase (the default page size).
 func WithPageSize(pageSize uint32) *Database {
-	return &Database{committed: newSnapshot(), pageSize: pageSize, session: newSession()}
+	return &Database{committed: newSnapshot(), pageSize: pageSize, session: newSession(), sharedTempCommitted: newSnapshot(), sharedTempMem: DefaultSharedTempMem}
 }
 
 // readSnap is the snapshot a read sees: the read pin if one is set (a data-modifying WITH statement
@@ -970,47 +1014,86 @@ func (db *Database) isTempTable(name string) bool {
 	return ok
 }
 
-// lkpTable resolves a table by name, temp-first then the visible main snapshot (temp-tables.md §3).
+// sharedTempSnap is the DATABASE-WIDE shared temp-table snapshot for READS (temp-tables.md §4/§5):
+// the open transaction's sharedTempWorking, else the handle's sharedTempCommitted. The shared
+// analogue of tempSnap.
+func (db *Database) sharedTempSnap() *Snapshot {
+	if db.session.tx != nil {
+		return db.session.tx.sharedTempWorking
+	}
+	return db.sharedTempCommitted
+}
+
+// isSharedTempTable reports whether name resolves to a DATABASE-WIDE shared temporary table in the
+// visible shared-temp snapshot (temp-tables.md §3). Checked AFTER session-local in the resolution
+// walk (session-local → shared → persistent); preclude-overlaps keeps a name in at most one scope.
+func (db *Database) isSharedTempTable(name string) bool {
+	_, ok := db.sharedTempSnap().table(name)
+	return ok
+}
+
+// lkpTable resolves a table by name along the resolution walk session-local → shared → persistent
+// (temp-tables.md §3). Preclude-overlaps keeps a name in at most one scope, so this is just "where it lives".
 func (db *Database) lkpTable(name string) (*Table, bool) {
 	if t, ok := db.tempSnap().table(name); ok {
+		return t, true
+	}
+	if t, ok := db.sharedTempSnap().table(name); ok {
 		return t, true
 	}
 	return db.readSnap().table(name)
 }
 
-// lkpStore returns a table's store for READS, routing to the session temp snapshot for a temp table
-// (no dirty flag — reads never persist), else the visible main snapshot (temp-tables.md §2).
+// lkpStore returns a table's store for READS, routing by the resolution walk (session-local temp →
+// shared temp → visible main snapshot — temp-tables.md §2/§4). No dirty flag — reads never persist.
 func (db *Database) lkpStore(name string) *TableStore {
 	if db.isTempTable(name) {
 		return db.tempSnap().store(name)
 	}
+	if db.isSharedTempTable(name) {
+		return db.sharedTempSnap().store(name)
+	}
 	return db.readSnap().store(name)
 }
 
-// writeStore returns a table's store for MUTATION, routing a temp table's write to tempWorking (and
-// flagging tempDirty) and a persistent write to working (which flags mainDirty) — so a temp-only
-// transaction leaves the main image untouched (temp-tables.md §2).
+// writeStore returns a table's store for MUTATION, routing a session-local temp write to tempWorking
+// (flagging tempDirty), a shared temp write to sharedTempWorking (flagging sharedTempDirty), and a
+// persistent write to working (which flags mainDirty) — so a pure-temp transaction leaves the main
+// image untouched (temp-tables.md §2).
 func (db *Database) writeStore(name string) *TableStore {
 	if db.isTempTable(name) {
 		db.session.tx.tempDirty = true
 		return db.session.tx.tempWorking.store(name)
 	}
+	if db.isSharedTempTable(name) {
+		db.session.tx.sharedTempDirty = true
+		return db.session.tx.sharedTempWorking.store(name)
+	}
 	return db.working().store(name)
 }
 
-// lkpIndexStore returns a secondary index's store for READS, temp-first (temp-tables.md §8).
+// lkpIndexStore returns a secondary index's store for READS, walking session-local → shared → main
+// (temp-tables.md §8).
 func (db *Database) lkpIndexStore(nameKey string) *TableStore {
 	if db.tempSnap().hasIndexStore(nameKey) {
 		return db.tempSnap().indexStore(nameKey)
 	}
+	if db.sharedTempSnap().hasIndexStore(nameKey) {
+		return db.sharedTempSnap().indexStore(nameKey)
+	}
 	return db.readSnap().indexStore(nameKey)
 }
 
-// writeIndexStore returns a secondary index's store for MUTATION, temp-first (flagging the dirty bit).
+// writeIndexStore returns a secondary index's store for MUTATION, walking session-local → shared →
+// main (flagging the matching dirty bit).
 func (db *Database) writeIndexStore(nameKey string) *TableStore {
 	if db.tempSnap().hasIndexStore(nameKey) {
 		db.session.tx.tempDirty = true
 		return db.session.tx.tempWorking.indexStore(nameKey)
+	}
+	if db.sharedTempSnap().hasIndexStore(nameKey) {
+		db.session.tx.sharedTempDirty = true
+		return db.session.tx.sharedTempWorking.indexStore(nameKey)
 	}
 	return db.working().indexStore(nameKey)
 }
@@ -1089,9 +1172,11 @@ func (db *Database) Revoke(privs PrivilegeSet, object string) {
 func (db *Database) ResetPrivileges() {
 	db.session.privileges = newPrivileges()
 	db.session.allowDDL = true
-	// The temp-DDL gate is part of the authorization envelope (temp-tables.md §5); reset it with the
-	// rest so a # allow_temp_ddl: directive never leaks past its record. Default-inherits allowDDL=true.
+	// The temp-DDL gates are part of the authorization envelope (temp-tables.md §5); reset them with
+	// the rest so a # allow_temp_ddl: / # allow_shared_temp_ddl: directive never leaks past its record.
+	// Default-inherit allowDDL=true.
 	db.session.allowTempDDL = true
+	db.session.allowSharedTempDDL = true
 }
 
 // Privileges is read-only access to the default session's authorization envelope (§5.3).
@@ -1111,12 +1196,28 @@ func (db *Database) SetAllowTempDDL(allow bool) { db.session.allowTempDDL = allo
 // AllowTempDDL reports whether session-local temporary-table DDL is permitted on the default session.
 func (db *Database) AllowTempDDL() bool { return db.session.allowTempDDL }
 
+// SetAllowSharedTempDDL sets whether DATABASE-WIDE shared temporary-table DDL is permitted on the
+// default session (spec/design/temp-tables.md §5) — the shared-temp split of AllowDDL, the more
+// privileged of the two temp gates; a denied shared-temp DDL is 42501.
+func (db *Database) SetAllowSharedTempDDL(allow bool) { db.session.allowSharedTempDDL = allow }
+
+// AllowSharedTempDDL reports whether shared temporary-table DDL is permitted on the default session.
+func (db *Database) AllowSharedTempDDL() bool { return db.session.allowSharedTempDDL }
+
 // SetTempBuffers sets the default session's per-session temp-table storage budget in BYTES
 // (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
 func (db *Database) SetTempBuffers(bytes int) { db.session.tempBuffers = bytes }
 
 // TempBuffers reports the default session's per-session temp-table storage budget (0 ⇒ unlimited).
 func (db *Database) TempBuffers() int { return db.session.tempBuffers }
+
+// SetSharedTempMem sets the GLOBAL shared-temp storage budget in BYTES (shared_temp_mem,
+// spec/design/temp-tables.md §7); 0 ⇒ unlimited. A Database-level setting (shared temp data is
+// global); an over-budget shared-temp write aborts 54P03.
+func (db *Database) SetSharedTempMem(bytes int) { db.sharedTempMem = bytes }
+
+// SharedTempMem reports the handle's shared-temp storage budget (0 ⇒ unlimited).
+func (db *Database) SharedTempMem() int { return db.sharedTempMem }
 
 // SetVar sets a session variable on the default session (spec/design/session.md §6.1). Custom
 // variables must be namespaced (a dotted name); a non-dotted name is 42704. Read it back in SQL with
@@ -1289,6 +1390,11 @@ func (s *Session) SetAllowDDL(allow bool) { s.allowDDL = allow }
 // session (spec/design/temp-tables.md §5); a denied temp DDL is 42501.
 func (s *Session) AllowTempDDL() bool         { return s.allowTempDDL }
 func (s *Session) SetAllowTempDDL(allow bool) { s.allowTempDDL = allow }
+
+// AllowSharedTempDDL / SetAllowSharedTempDDL — whether DATABASE-WIDE shared temporary-table DDL is
+// permitted on this session (spec/design/temp-tables.md §5); a denied shared-temp DDL is 42501.
+func (s *Session) AllowSharedTempDDL() bool         { return s.allowSharedTempDDL }
+func (s *Session) SetAllowSharedTempDDL(allow bool) { s.allowSharedTempDDL = allow }
 
 // TempBuffers / SetTempBuffers — the per-session temp-table storage budget in BYTES
 // (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
@@ -1520,11 +1626,15 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 		} else {
 			outcome, err = db.dispatchStmt(stmt, params)
 		}
-		// Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
-		// over-budget statement becomes a 54P03 error, which aborts the block (the staged temp rows
-		// roll back at ROLLBACK). A no-op for non-temp statements.
+		// Enforce the temp-storage budgets after a successful temp write (temp-tables.md §7): an
+		// over-budget statement (session-local tempBuffers OR global sharedTempMem) becomes a 54P03
+		// error, which aborts the block (the staged temp rows roll back at ROLLBACK). A no-op for
+		// non-temp statements.
 		if err == nil {
 			err = db.checkTempBudget()
+		}
+		if err == nil {
+			err = db.checkSharedTempBudget()
 		}
 		if err != nil {
 			db.session.tx.failed = true
@@ -1552,10 +1662,14 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 	}
 	db.session.tx = db.newTx(true)
 	outcome, err := db.dispatchStmt(stmt, params)
-	// Enforce the temp-storage budget before committing (temp-tables.md §7): an over-budget temp write
-	// in this implicit transaction is discarded (rolling back the temp + main changes) and surfaces 54P03.
+	// Enforce the temp-storage budgets before committing (temp-tables.md §7): an over-budget temp write
+	// in this implicit transaction (session-local tempBuffers OR global sharedTempMem) is discarded
+	// (rolling back the temp + main changes) and surfaces 54P03.
 	if err == nil {
 		err = db.checkTempBudget()
+	}
+	if err == nil {
+		err = db.checkSharedTempBudget()
 	}
 	if err != nil {
 		// The statement failed before any flush, so session state is untouched; restore from the
@@ -1608,6 +1722,7 @@ func (db *Database) newTx(writable bool) *activeTx {
 		writable:             writable,
 		working:              db.committed.clone(),
 		tempWorking:          db.session.tempCommitted.clone(),
+		sharedTempWorking:    db.sharedTempCommitted.clone(),
 		savedSessionSeq:      saved,
 		savedSessionLastName: db.session.sessionLastName,
 	}
@@ -1641,11 +1756,13 @@ func (db *Database) commitTx() (Outcome, error) {
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 	}
 	working := tx.working
-	// Persist the main image when it changed; a temp-only transaction skips it entirely so a temp
-	// table makes ZERO file writes (spec/design/temp-tables.md §2). An empty block (neither dirty)
-	// still persists, preserving prior behavior. Temp state is adopted regardless — never serialized,
-	// only swapped into the session's committed temp snapshot.
-	if tx.mainDirty || !tx.tempDirty {
+	// Persist the main image when it changed; a transaction that touched ONLY temp tables (session-
+	// local and/or shared) skips it entirely so a temp table makes ZERO file writes (temp-tables.md
+	// §2). An empty block (no kind dirty) still persists, preserving prior behavior. Temp state is
+	// adopted regardless — never serialized, only swapped into the in-memory committed temp snapshots
+	// (the shared root is then published by the shared layer — the two-root commit, §5).
+	pureTemp := !tx.mainDirty && (tx.tempDirty || tx.sharedTempDirty)
+	if !pureTemp {
 		if db.path != "" {
 			working.txid = db.committed.txid + 1
 		}
@@ -1655,6 +1772,7 @@ func (db *Database) commitTx() (Outcome, error) {
 		db.committed = working
 	}
 	db.session.tempCommitted = tx.tempWorking
+	db.sharedTempCommitted = tx.sharedTempWorking
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
@@ -2093,9 +2211,13 @@ type privReq struct {
 	functions []string
 	isDDL     bool
 	// isTempDDL is whether the DDL targets a SESSION-LOCAL temporary table (CREATE TEMP TABLE) — gated
-	// by allowTempDDL instead of allowDDL (spec/design/temp-tables.md §5). (DROP of a temp table joins
-	// this by resolving the name in checkPrivileges; today DROP TABLE alone stays persistent-gated.)
+	// by allowTempDDL instead of allowDDL (spec/design/temp-tables.md §5). Set only for a session-local
+	// CREATE TEMP (a SHARED create sets isSharedTempDDL); a DROP is classified by resolving the name.
 	isTempDDL bool
+	// isSharedTempDDL is whether the DDL targets a DATABASE-WIDE shared temporary table (CREATE SHARED
+	// TEMP TABLE) — gated by allowSharedTempDDL (temp-tables.md §5). A DROP of a shared temp table is
+	// classified by resolving the name.
+	isSharedTempDDL bool
 }
 
 func (r *privReq) needTable(name string, p Privilege) {
@@ -2148,22 +2270,47 @@ func (db *Database) checkTempBudget() error {
 	return nil
 }
 
+// checkSharedTempBudget enforces the GLOBAL shared-temp storage budget (shared_temp_mem,
+// spec/design/temp-tables.md §7) — the shared analogue of checkTempBudget, charged against the
+// Database-level budget over the shared-temp footprint. Self-gates on sharedTempDirty (a no-op for any
+// statement that did not write shared temp). The over-budget write is staged, so the abort rolls it back.
+func (db *Database) checkSharedTempBudget() error {
+	limit := db.sharedTempMem
+	if limit == 0 {
+		return nil
+	}
+	if db.session.tx == nil || !db.session.tx.sharedTempDirty {
+		return nil
+	}
+	if used := db.sharedTempSnap().storageBytes(); used > uint64(limit) {
+		return NewError(TempStorageLimitExceeded, fmt.Sprintf(
+			"shared temporary table storage exceeded the limit of %d bytes", limit,
+		))
+	}
+	return nil
+}
+
 func (db *Database) checkPrivileges(stmt Statement) error {
-	// Fast path: a session that allows ALL DDL (persistent + temp) and grants every privilege pays
-	// nothing. Both gates must be on, since temp DDL is now its own gate (temp-tables.md §5).
-	if db.session.allowDDL && db.session.allowTempDDL && db.session.privileges.IsPermissive() {
+	// Fast path: a session that allows ALL DDL (persistent + both temp kinds) and grants every
+	// privilege pays nothing. All three gates must be on, since temp DDL now has its own gates (§5).
+	if db.session.allowDDL && db.session.allowTempDDL && db.session.allowSharedTempDDL && db.session.privileges.IsPermissive() {
 		return nil
 	}
 	var req privReq
 	collectStmtPrivs(stmt, &req)
 	if req.isDDL {
-		// Temp-table DDL is gated by allowTempDDL; all other DDL by allowDDL (temp-tables.md §5), so a
-		// host can grant bounded scratch tables to an untrusted session while withholding persistent
-		// schema changes. CREATE TEMP is known statically; a DROP of a temp table resolves the name.
-		tempDDL := req.isTempDDL || (stmt.DropTable != nil && db.isTempTable(stmt.DropTable.Name))
-		allowed := db.session.allowDDL
-		if tempDDL {
+		// DDL is gated by the kind of relation it targets (temp-tables.md §5): a shared temp table by
+		// allowSharedTempDDL, a session-local temp table by allowTempDDL, everything else (persistent) by
+		// allowDDL. CREATE is classified statically; a DROP of a temp table by resolving the name (shared
+		// before session-local — the resolution-walk order; preclude-overlaps keeps a name in one scope).
+		var allowed bool
+		switch {
+		case req.isSharedTempDDL || (stmt.DropTable != nil && db.isSharedTempTable(stmt.DropTable.Name)):
+			allowed = db.session.allowSharedTempDDL
+		case req.isTempDDL || (stmt.DropTable != nil && db.isTempTable(stmt.DropTable.Name)):
 			allowed = db.session.allowTempDDL
+		default:
+			allowed = db.session.allowDDL
 		}
 		if !allowed {
 			return NewError(InsufficientPrivilege, "permission denied: DDL is not permitted in this session")
@@ -2207,8 +2354,10 @@ func collectStmtPrivs(stmt Statement, req *privReq) {
 	switch {
 	case stmt.CreateTable != nil:
 		req.isDDL = true
-		// A session-local temp table's DDL is gated by allowTempDDL, not allowDDL (temp-tables.md §5).
-		req.isTempDDL = stmt.CreateTable.Temp
+		// A temp table's DDL is gated by the temp-scoped split of allowDDL (temp-tables.md §5):
+		// allowSharedTempDDL for a SHARED table, allowTempDDL for a session-local one.
+		req.isSharedTempDDL = stmt.CreateTable.Shared
+		req.isTempDDL = stmt.CreateTable.Temp && !stmt.CreateTable.Shared
 	case stmt.DropTable != nil, stmt.CreateIndex != nil, stmt.DropIndex != nil,
 		stmt.CreateType != nil, stmt.DropType != nil, stmt.CreateSequence != nil, stmt.DropSequence != nil,
 		stmt.AlterSequence != nil:
@@ -3410,10 +3559,18 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 				return Outcome{}, NewError(FeatureNotSupported, "COLLATE on temporary-table column "+c.Name+" is not yet supported")
 			}
 		}
-		// Register into the session temp snapshot (tempWorking) — never the main image, so the table
-		// makes zero file writes (§2). Flag tempDirty so the commit can skip persisting the main image.
-		db.session.tx.tempDirty = true
-		ts := db.tempSnap()
+		// Register into the matching temp snapshot — never the main image, so the table makes zero file
+		// writes (§2). A SHARED table goes in the database-wide shared snapshot (visible to every
+		// session, §4); a plain temp table in the session-local one. Flag the matching dirty bit so the
+		// commit can skip persisting the main image.
+		var ts *Snapshot
+		if ct.Shared {
+			db.session.tx.sharedTempDirty = true
+			ts = db.session.tx.sharedTempWorking
+		} else {
+			db.session.tx.tempDirty = true
+			ts = db.session.tx.tempWorking
+		}
 		ts.putTable(table, db.pageSize)
 		for _, ix := range table.Indexes {
 			ts.putIndexStore(strings.ToLower(ix.Name), NewTableStore(int(db.pageSize)-12, nil)) // 12 = pageHeader
@@ -3526,13 +3683,18 @@ func evalChecks(checks []namedCheck, relation string, row Row, env *evalEnv, met
 // (spec/design/grammar.md §13). Like CREATE TABLE it touches no rows and evaluates no
 // expression tree (the store is discarded wholesale), so it accrues zero cost.
 func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
-	// A session-local temp table (spec/design/temp-tables.md): remove it from the session temp
-	// snapshot — never the main image, so DROP makes zero file writes. No FK-dependent check (a temp
-	// table is never an FK parent, §8) and no owned-sequence sweep (serial on temp is deferred, §8).
-	// The temp-DDL capability gate already ran at dispatch (§5).
+	// A temp table (spec/design/temp-tables.md): remove it from the matching temp snapshot — never the
+	// main image, so DROP makes zero file writes. No FK-dependent check (a temp table is never an FK
+	// parent, §8) and no owned-sequence sweep (serial on temp is deferred, §8). The temp-DDL capability
+	// gate already ran at dispatch (§5). Session-local first, then shared.
 	if db.isTempTable(dt.Name) {
 		db.session.tx.tempDirty = true
 		db.tempSnap().removeTable(strings.ToLower(dt.Name))
+		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	}
+	if db.isSharedTempTable(dt.Name) {
+		db.session.tx.sharedTempDirty = true
+		db.sharedTempSnap().removeTable(strings.ToLower(dt.Name))
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 	}
 	if _, ok := db.Table(dt.Name); !ok {
@@ -3808,19 +3970,25 @@ func (db *Database) findIndex(name string) (string, IndexDef, bool) {
 // relationExists reports whether name is taken in the shared relation namespace (a table
 // OR an index — spec/design/indexes.md §2), case-insensitively.
 func (db *Database) relationExists(name string) bool {
-	// Temp tables + their (UNIQUE) index names join the namespace too, so a name colliding with a temp
-	// relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md §3). db.Table is
-	// persistent-only, so the temp snapshot is checked explicitly.
+	// Temp tables (session-local AND shared) + their (UNIQUE) index names join the namespace too, so a
+	// name colliding with any temp relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md
+	// §3). db.Table is persistent-only, so both temp snapshots are checked explicitly.
 	if _, ok := db.Table(name); ok {
 		return true
 	}
 	if _, ok := db.tempSnap().table(name); ok {
 		return true
 	}
+	if _, ok := db.sharedTempSnap().table(name); ok {
+		return true
+	}
 	if _, _, ok := db.findIndex(name); ok {
 		return true
 	}
 	if _, _, ok := db.tempSnap().findIndex(name); ok {
+		return true
+	}
+	if _, _, ok := db.sharedTempSnap().findIndex(name); ok {
 		return true
 	}
 	return db.readSnap().sequence(name) != nil
@@ -3838,7 +4006,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	// A standalone CREATE INDEX on a temp table is deferred this slice (spec/design/temp-tables.md §8)
 	// — a temp table's UNIQUE constraints (in CREATE TEMP TABLE) are supported, but separate index DDL
 	// is a 0A000 follow-on. Checked before resolution so the message is clear.
-	if db.isTempTable(ci.Table) {
+	if db.isTempTable(ci.Table) || db.isSharedTempTable(ci.Table) {
 		return Outcome{}, NewError(FeatureNotSupported, "CREATE INDEX on a temporary table is not yet supported")
 	}
 	table, ok := db.Table(ci.Table)

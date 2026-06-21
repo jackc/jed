@@ -383,6 +383,39 @@ func parseTempBuffersDirective(line string) (int, bool) {
 	return n, true
 }
 
+// parseAllowSharedTempDDLDirective parses a `# allow_shared_temp_ddl: on|off` directive line
+// (spec/design/temp-tables.md §5): whether DATABASE-WIDE shared temporary-table DDL is permitted for
+// the next record.
+func parseAllowSharedTempDDLDirective(line string) (bool, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "allow_shared_temp_ddl:")
+	if !ok {
+		return false, false
+	}
+	switch strings.ToLower(strings.TrimSpace(rest)) {
+	case "on", "true", "yes":
+		return true, true
+	case "off", "false", "no":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// parseSharedTempMemDirective parses a `# shared_temp_mem: N` directive line (spec/design/temp-tables.md
+// §7): the GLOBAL shared-temp storage budget (bytes) to run the next record under (0 ⇒ unlimited).
+// Mirrors `# temp_buffers:` — per-record, reset after.
+func parseSharedTempMemDirective(line string) (int, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "shared_temp_mem:")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(rest))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // varPair is a session-variable (name, value) parsed from a # set: directive.
 type varPair struct{ name, value string }
 
@@ -541,7 +574,9 @@ func runFile(text string) error {
 	var pendingRevokes []privDelta
 	var pendingAllowDDL *bool
 	var pendingAllowTempDDL *bool
+	var pendingAllowSharedTempDDL *bool
 	var pendingTempBuffers *int
+	var pendingSharedTempMem *int
 	var pendingVars []varPair
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
@@ -581,8 +616,12 @@ func runFile(text string) error {
 				pendingRevokes = append(pendingRevokes, r)
 			} else if a, ok := parseAllowDDLDirective(line); ok {
 				pendingAllowDDL = &a
+			} else if a, ok := parseAllowSharedTempDDLDirective(line); ok {
+				pendingAllowSharedTempDDL = &a
 			} else if a, ok := parseAllowTempDDLDirective(line); ok {
 				pendingAllowTempDDL = &a
+			} else if n, ok := parseSharedTempMemDirective(line); ok {
+				pendingSharedTempMem = &n
 			} else if n, ok := parseTempBuffersDirective(line); ok {
 				pendingTempBuffers = &n
 			} else if vars, ok := parseSetDirective(line); ok {
@@ -659,24 +698,34 @@ func runFile(text string) error {
 		if pendingAllowDDL != nil {
 			db.SetAllowDDL(*pendingAllowDDL)
 		}
-		// `# allow_temp_ddl:` overrides the temp-DDL gate (temp-tables.md §5); ResetPrivileges above set
-		// it back to permissive, so this decorates only its record.
+		// `# allow_temp_ddl:` / `# allow_shared_temp_ddl:` override the temp-DDL gates (temp-tables.md
+		// §5); ResetPrivileges above set both back to permissive, so each decorates only its record.
 		if pendingAllowTempDDL != nil {
 			db.SetAllowTempDDL(*pendingAllowTempDDL)
+		}
+		if pendingAllowSharedTempDDL != nil {
+			db.SetAllowSharedTempDDL(*pendingAllowSharedTempDDL)
 		}
 		pendingDefaultPrivileges = nil
 		pendingGrants = nil
 		pendingRevokes = nil
 		pendingAllowDDL = nil
 		pendingAllowTempDDL = nil
-		// Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (0), so a
-		// `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
+		pendingAllowSharedTempDDL = nil
+		// Apply the per-record temp-storage budgets (temp-tables.md §7); absent ⇒ unlimited (0), so a
+		// `# temp_buffers:` / `# shared_temp_mem:` directive never leaks past its record. Mirrors `# max_cost:`.
 		tempBuffers := 0
 		if pendingTempBuffers != nil {
 			tempBuffers = *pendingTempBuffers
 		}
 		db.SetTempBuffers(tempBuffers)
 		pendingTempBuffers = nil
+		sharedTempMem := 0
+		if pendingSharedTempMem != nil {
+			sharedTempMem = *pendingSharedTempMem
+		}
+		db.SetSharedTempMem(sharedTempMem)
+		pendingSharedTempMem = nil
 		// Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
 		// pending # set: pair, so a directive decorates only its record and never leaks forward.
 		db.ResetVars()
