@@ -457,9 +457,10 @@ template = "session exceeded the lifetime cost limit of {limit} (accrued {cost})
 # unbounded RAM at trivial per-statement cost. This is the §13 gate that closes that hole: a
 # per-session `temp_buffers` budget (session-local temp storage) and, in a later slice, a global
 # `shared_temp_mem` budget (shared temp storage) and the temp-spill disk ceiling. The budget is
-# measured in the same DETERMINISTIC logical-byte estimator `work_mem` uses (spec/design/spill.md),
-# so the abort point is a pure function of (operations, budget) — identical across cores (§8), never
-# dependent on the allocator. jed-specific (PostgreSQL bounds temp storage only via nondeterministic
+# measured in BYTE-IDENTICAL on-disk record bytes (`record_size`, summed over every temp table + index
+# store — NOT the per-core `work_mem` spill estimator), checked per-statement, so the abort point is a
+# pure function of (operations, budget) — identical across cores (§8), never dependent on the
+# allocator. jed-specific (PostgreSQL bounds temp storage only via nondeterministic
 # OS OOM / disk-full): a `P`-subclass code in class 54 alongside 54P01/54P02 (the deterministic,
 # host-configured ceilings), deliberately NOT PG's class 53 `insufficient_resources` (which denotes
 # actual, platform-dependent exhaustion). Asserted by the conformance corpus (the resource.temp_budget

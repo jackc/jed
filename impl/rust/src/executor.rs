@@ -580,6 +580,15 @@ impl Snapshot {
         self.index_stores.contains_key(name_key)
     }
 
+    /// Total on-disk record bytes of every table store + index store in this snapshot — the temp
+    /// budget's deterministic footprint measure (spec/design/temp-tables.md §7), summed over the
+    /// session temp snapshot. Iteration order does not matter (it is a sum).
+    pub(crate) fn storage_bytes(&self) -> u64 {
+        let tables: u64 = self.stores.values().map(|s| s.stored_bytes()).sum();
+        let indexes: u64 = self.index_stores.values().map(|s| s.stored_bytes()).sum();
+        tables + indexes
+    }
+
     /// Register a new (empty) secondary index on `table_key`: insert its definition into the
     /// table's `indexes` in ascending lowercased-name order (the catalog/planner order —
     /// spec/design/indexes.md §6) and create its zero-column store.
@@ -1285,6 +1294,33 @@ impl Database {
         self.temp_read_snap().table(name).is_some()
     }
 
+    /// Enforce the per-session temp-table storage budget (`temp_buffers`, spec/design/temp-tables.md
+    /// §7) — the §13 gate on RETAINED temp bytes. Checked after each temp-writing statement: if the
+    /// session's temp footprint (byte-identical on-disk record bytes, summed over every temp table +
+    /// index) **exceeds** the budget, abort `54P03`. The over-budget write is in `temp_working`, so the
+    /// abort discards it (autocommit) or fails the block (rolled back at ROLLBACK) — nothing commits.
+    /// `temp_buffers = 0` is unlimited; a transaction that did not touch temp cannot have grown it, so
+    /// the check self-gates on `temp_dirty` and is a no-op for ordinary (persistent) statements. The
+    /// WITHIN-statement bound is `max_cost` (a single huge temp write hits the cost ceiling first).
+    fn check_temp_budget(&self) -> Result<()> {
+        let limit = self.session.temp_buffers;
+        if limit == 0 {
+            return Ok(());
+        }
+        let temp_dirty = self.session.tx.as_ref().is_some_and(|t| t.temp_dirty);
+        if !temp_dirty {
+            return Ok(());
+        }
+        let used = self.temp_read_snap().storage_bytes();
+        if used > limit as u64 {
+            return Err(EngineError::new(
+                SqlState::TempStorageLimitExceeded,
+                format!("temporary table storage exceeded the limit of {limit} bytes"),
+            ));
+        }
+        Ok(())
+    }
+
     /// The committed snapshot, immutable (spec/design/transactions.md §2). Exposed for the host
     /// `Transaction`/read surfaces and for the on-disk serializer.
     pub(crate) fn committed(&self) -> &Snapshot {
@@ -1930,6 +1966,10 @@ impl Database {
             } else {
                 self.dispatch_stmt(stmt, params)
             };
+            // Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
+            // over-budget statement becomes a `54P03` error, which aborts the block (the staged temp
+            // rows roll back at ROLLBACK). A no-op for non-temp statements.
+            let result = result.and_then(|out| self.check_temp_budget().map(|()| out));
             if result.is_ok() {
                 // Land any nextval advances into the block's working snapshot; COMMIT publishes
                 // them, ROLLBACK discards them with the rest of the working set (sequences.md §5).
@@ -1971,6 +2011,15 @@ impl Database {
         });
         match self.dispatch_stmt(stmt, params) {
             Ok(outcome) => {
+                // Enforce the temp-storage budget before committing (temp-tables.md §7): if this
+                // (implicit) transaction's temp write pushed the session over `temp_buffers`, discard
+                // the transaction (rolling back the over-budget temp + main changes) and surface 54P03.
+                if let Err(e) = self.check_temp_budget() {
+                    if let Some(tx) = self.session.tx.take() {
+                        self.restore_session_state(tx);
+                    }
+                    return Err(e);
+                }
                 // Persist any nextval advances into the working snapshot before publishing it
                 // (sequences.md §5); a non-sequence statement flushes nothing.
                 self.flush_pending_sequences();

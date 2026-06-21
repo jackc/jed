@@ -382,4 +382,10 @@ impl TableStore {
     pub fn is_empty(&self) -> bool {
         self.rows.is_empty()
     }
+
+    /// Total on-disk record bytes this store holds — the deterministic, cross-core-identical
+    /// footprint measure the temp-table budget sums (spec/design/temp-tables.md §7).
+    pub(crate) fn stored_bytes(&self) -> u64 {
+        self.rows.resident_record_bytes()
+    }
 }

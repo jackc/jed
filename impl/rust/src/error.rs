@@ -168,6 +168,11 @@ pub enum SqlState {
     /// `max_cost` ceiling and execution was aborted (CLAUDE.md §13; spec/design/cost.md §6).
     /// jed-specific (PostgreSQL has no execution-cost ceiling); class 54 program_limit_exceeded.
     CostLimitExceeded,
+    /// 54P03 — temp storage limit exceeded: a session's temporary-table storage reached the
+    /// `temp_buffers` byte budget (spec/design/temp-tables.md §7). The §13 gate on RETAINED temp
+    /// bytes (the cost ceilings bound work per/across statements, not bytes held between them);
+    /// measured in byte-identical on-disk record bytes, so the abort is cross-core-identical (§8).
+    TempStorageLimitExceeded,
     /// 54P02 — session cost limit exceeded: the session's cumulative execution cost reached the
     /// caller-set `lifetime_max_cost` budget and the in-flight statement was aborted, or a further
     /// statement was rejected at admission because the budget is already spent (spec/design/session.md
@@ -239,6 +244,7 @@ impl SqlState {
             SqlState::StatementTooComplex => "54001",
             SqlState::CostLimitExceeded => "54P01",
             SqlState::SessionCostLimitExceeded => "54P02",
+            SqlState::TempStorageLimitExceeded => "54P03",
             SqlState::IoError => "58030",
             SqlState::UndefinedFile => "58P01",
             SqlState::DuplicateFile => "58P02",

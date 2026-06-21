@@ -229,13 +229,21 @@ cost meter (the same way the depth gate is independent of the cost gate):
   sessions. `0` = unlimited. Default modest.
 
 **Determinism is the load-bearing requirement** (CLAUDE.md §8/§10, §13). The budget is measured in
-the **same deterministic logical-byte estimator** `work_mem` already uses for spill decisions
-(spill.md — a fixed per-value size, never the real allocator footprint). So "budget exceeded" fires
-at a point that is a **pure function of `(operations, budget)`**, identical across Rust/Go/TS, never
-dependent on allocator behavior, GC, or pointer width. Whether a temp table is resident or (later)
-spilled must **never** change query results or the deterministic cost — only the budget *error* and
-(later) spill *timing* are observable, and the error is itself deterministic and part of the
-cross-core contract. Exceeding either budget raises **`54P03 temp_storage_limit_exceeded`** (§11).
+**byte-identical on-disk record bytes** — the sum, over every temp table store *and* its index
+stores, of each stored record's on-disk encoding size (`record_size`, the exact weight the page B-tree
+splits on, byte-identical across cores by the §8 file-format contract). This is deliberately **not**
+the `work_mem` spill estimator: spill is out-of-contract (per-core, §10), so its estimate need not
+agree across cores, whereas `54P03` is **in**-contract — every core must abort at the same point. So
+"budget exceeded" is a **pure function of `(operations, budget)`**, identical across Rust/Go/TS, never
+dependent on allocator behavior, GC, or pointer width. **The check is per-statement:** after a
+statement that writes a temp table, the session's total temp footprint is summed and the statement
+aborts **`54P03 temp_storage_limit_exceeded`** if it *exceeds* `temp_buffers` (`0` ⇒ unlimited); the
+over-budget write is staged in `temp_working`, so the abort rolls it back (nothing commits). The
+**within-statement** bound is `max_cost` — a single huge temp write hits the cost ceiling first — so
+the two gates compose to bound temp resources both per-statement and across statements. Whether a temp
+table is resident or (later) spilled must **never** change query results or the deterministic cost —
+only the budget *error* (and, later, spill *timing*) is observable, and the error is itself
+deterministic and part of the cross-core contract.
 
 This keeps the untrusted-SQL story whole: a host serves untrusted SQL through a session that is
 `{SELECT}`-or-narrow-privileged, `max_cost`/`lifetime_max_cost`-capped, `max_sql_length`/depth-bounded

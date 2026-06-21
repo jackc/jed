@@ -398,6 +398,28 @@ impl PMap {
         self.root.as_deref().map(count).unwrap_or(0)
     }
 
+    /// Total on-disk record bytes stored in this tree — the sum of every entry's `weight` over every
+    /// node (this is a B-tree: records live in interior nodes too, not only leaves). The deterministic,
+    /// cross-core-identical measure of a temp table's storage footprint (spec/design/temp-tables.md §7;
+    /// `weight` is `format::record_size`, the byte-identical on-disk encoding size — §8). The tree is
+    /// fully resident for a temp store (temp data never pages), so this never faults; an `OnDisk` child
+    /// would contribute 0 (defensive — temp stores have none).
+    pub(crate) fn resident_record_bytes(&self) -> u64 {
+        fn walk(node: &Node) -> u64 {
+            let here: u64 = node.weights.iter().map(|&w| w as u64).sum();
+            let kids: u64 = node
+                .children
+                .iter()
+                .map(|c| match c {
+                    Child::Resident(n) => walk(n),
+                    Child::OnDisk(_) => 0,
+                })
+                .sum();
+            here + kids
+        }
+        self.root.as_deref().map(walk).unwrap_or(0)
+    }
+
     /// Iterate `(key, row)` pairs in ascending key order, yielding **owned** pairs. Eagerly walks
     /// the tree into a vector (the cost contract charges per row in the executor loop, not here —
     /// cost.md). Owned, not borrowed, because under demand paging (P6.4b) a leaf may be faulted in
