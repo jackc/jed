@@ -473,6 +473,7 @@ func appendString(b []byte, s string) []byte {
 	b = appendU16(b, uint16(len(s)))
 	return append(b, s...)
 }
+
 func appendU32(b []byte, v uint32) []byte {
 	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }

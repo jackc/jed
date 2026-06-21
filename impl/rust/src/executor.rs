@@ -3355,7 +3355,10 @@ impl Database {
             if let Some(c) = table.columns.iter().find(|c| c.collation.is_some()) {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
-                    format!("COLLATE on temporary-table column {} is not yet supported", c.name),
+                    format!(
+                        "COLLATE on temporary-table column {} is not yet supported",
+                        c.name
+                    ),
                 ));
             }
             // Register into the matching temp snapshot — never the main image, so the table makes zero

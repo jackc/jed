@@ -131,7 +131,11 @@ impl Shared {
 
     /// The current published committed (file) version (the monotonic commit counter).
     fn committed_version(&self) -> u64 {
-        self.roots.read().expect("roots lock not poisoned").committed.txid
+        self.roots
+            .read()
+            .expect("roots lock not poisoned")
+            .committed
+            .txid
     }
 
     /// Publish both new committed roots (the §3/§5 commit window — a pointer swap of each under one
