@@ -161,11 +161,24 @@ func (s *Snapshot) clone() *Snapshot {
 	return &Snapshot{txid: s.txid, tables: tables, types: types, stores: stores, indexStores: indexStores, sequences: sequences, collations: collations, defaultCollation: s.defaultCollation}
 }
 
-// collation looks up a loaded collation by its exact (case-sensitive) name. C is NOT here — it is
-// table-free and built in (spec/design/collation.md §1). A nil result ⇒ not loaded (the resolver
-// raises 42704).
+// collation looks up a collation the database REFERENCES (imported / baked) by its exact
+// (case-sensitive) name. C is NOT here — it is table-free and built in (spec/design/collation.md §1).
+// A nil result ⇒ not referenced by this database. This is the catalog-local set only; for query USE
+// prefer resolveCollation, which also falls back to the binary's vendored set.
 func (s *Snapshot) collation(name string) *Collation {
 	return s.collations[name]
+}
+
+// resolveCollation resolves a collation name for USE — query resolution and key encoding
+// (spec/design/collation.md §2/§9). The database's referenced collations first, then the set
+// VENDORED into this binary. nil ⇒ neither has it (the resolver raises 42704). C is handled by the
+// caller (built-in). This is the reference-only read path: a collation need not be baked into the
+// file to be used — the file references it by name and the table comes from the vendored set.
+func (s *Snapshot) resolveCollation(name string) *Collation {
+	if c := s.collations[name]; c != nil {
+		return c
+	}
+	return VendoredCollation(name)
 }
 
 // collationsSorted returns all loaded collations in ascending (exact, case-sensitive) name order —
@@ -834,7 +847,7 @@ func (db *Database) columnCollations(columns []Column) []*Collation {
 	out := make([]*Collation, len(columns))
 	for i := range columns {
 		if columns[i].Collation != "" {
-			out[i] = snap.collation(columns[i].Collation)
+			out[i] = snap.resolveCollation(columns[i].Collation)
 		}
 	}
 	return out
@@ -15422,7 +15435,7 @@ func resolveCollationName(catalog *Database, name string) (*Collation, error) {
 	if name == "C" {
 		return nil, nil
 	}
-	if c := catalog.readSnap().collation(name); c != nil {
+	if c := catalog.readSnap().resolveCollation(name); c != nil {
 		return c, nil
 	}
 	return nil, NewError(UndefinedObject, fmt.Sprintf("collation %q does not exist", name))

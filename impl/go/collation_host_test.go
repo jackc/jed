@@ -317,3 +317,69 @@ func TestCollatedSecondaryIndexAndUniqueKeys(t *testing.T) {
 		t.Fatalf("collated UNIQUE order: got %v", got)
 	}
 }
+
+// ---- slice 2: vendored / reference-only read path (collation.md §2/§3/§9) ----
+//
+// In the reference-only model a collation is VENDORED into the binary, so it is usable WITHOUT any
+// db.ImportCollation — the database references it by name and the table comes from the vendored set.
+// These assert that no-import path directly (the corpus still imports, so it cannot express this —
+// CLAUDE.md §10). dev-root and dev-nordic are the vendored dev fixtures (§14, 2a). Mirrors
+// impl/rust/tests/collation_host.rs and impl/ts/tests/collation_host.test.ts.
+
+func TestVendoredCollationUsedWithoutImport(t *testing.T) {
+	// No import: COLLATE "dev-root" resolves from the binary's vendored set. 'ä' < 'z' is true under
+	// dev-root (ä near a), the opposite of C byte order — proving the vendored table is used.
+	db := NewDatabase()
+	if n := len(db.Collations()); n != 0 {
+		t.Fatalf("fresh db references %d collations, want 0", n)
+	}
+	rows := query(t, db, `SELECT 'ä' < 'z' COLLATE "dev-root"`)
+	if len(rows) != 1 || rows[0][0] != BoolValue(true) {
+		t.Fatalf("got %v, want [[true]]", rows)
+	}
+}
+
+func TestVendoredPerColumnCollationWithoutImport(t *testing.T) {
+	// A COLLATE "dev-root" column works with NO import: CREATE TABLE validation and the key encoder
+	// both fall back to the vendored set, so the collated ORDER BY uses dev-root order — ä between a
+	// and z.
+	db := NewDatabase()
+	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root")`)
+	run(t, db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`)
+	if got := texts(t, query(t, db, `SELECT name FROM t ORDER BY name`)); !eqStrings(got, []string{"a", "ä", "z"}) {
+		t.Fatalf("collated order: got %v", got)
+	}
+	// The database referenced dev-root by name but never baked it — Collations() (referenced set)
+	// stays empty; the table came from the vendored set.
+	if n := len(db.Collations()); n != 0 {
+		t.Fatalf("db references %d collations, want 0 (vendored, not baked)", n)
+	}
+}
+
+func TestUnknownCollationStill42704(t *testing.T) {
+	// The vendored fallback must not mask an unknown name: a collation neither referenced nor
+	// vendored is still 42704 (undefined_object).
+	db := NewDatabase()
+	_, err := Execute(db, `SELECT 'x' COLLATE "no-such-collation"`)
+	if err == nil || err.(*EngineError).Code() != "42704" {
+		t.Fatalf("want 42704, got %v", err)
+	}
+}
+
+func TestVendoredSetIsDevFixtures(t *testing.T) {
+	// The binary vendors the dev fixture set, ascending by name (deterministic, §8). C is never
+	// vendored (table-free, built in).
+	var names []string
+	for _, c := range VendoredCollations() {
+		names = append(names, c.Name)
+	}
+	if !eqStrings(names, []string{"dev-nordic", "dev-root"}) {
+		t.Fatalf("vendored set: got %v, want [dev-nordic dev-root]", names)
+	}
+	if VendoredCollation("dev-root") == nil {
+		t.Fatalf("dev-root should be vendored")
+	}
+	if VendoredCollation("C") != nil {
+		t.Fatalf("C must never be vendored")
+	}
+}

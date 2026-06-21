@@ -132,6 +132,7 @@ task :verify do
     ["cost schedule", "spec/cost/verify.rb"],
     ["operator codegen (drift)", "scripts/gen_catalog.rb", "--check"],
     ["cost codegen (drift)", "scripts/gen_costs.rb", "--check"],
+    ["vendored collations (drift)", "scripts/vendor_collations.rb", "--check"],
   ]
   failures = []
   checks.each do |name, script, *args|

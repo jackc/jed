@@ -13,9 +13,12 @@ package jed
 // persistence, no host seam. Only deterministic collations and non-ignorable variable weighting.
 
 import (
+	"embed"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // Ce is one collation element — a weight triple plus a flags byte. 7 bytes on disk
@@ -677,6 +680,68 @@ func OpenCollation(bytes []byte) (*Collation, error) {
 		Singles:        singles,
 		Contractions:   contractions,
 	}, nil
+}
+
+// --- Vendored collation set (spec/design/collation.md §2/§9) ------------------------------------
+//
+// In the reference-only model the engine reads collations from a set VENDORED into the binary, not
+// from the database file (the file only references a collation by name + version). Production
+// OpenCollations these embedded .coll artifacts once at startup and serves every later use from
+// them. This is the dev fixture set (dev-root, dev-nordic); the real version-pinned DUCET + curated
+// tailorings and the embedder-chosen footprint tiers (§13) are later slices (§14, 2a/2f). The .coll
+// bytes are synced from spec/collation/fixtures by scripts/vendor_collations.rb (rake verify checks
+// drift) and are byte-identical across cores, so every core vendors the identical table (§9/§10).
+
+//go:embed collationdata/*.coll
+var vendoredFS embed.FS
+
+var (
+	vendoredOnce sync.Once
+	vendoredColl map[string]*Collation
+)
+
+func vendored() map[string]*Collation {
+	vendoredOnce.Do(func() {
+		vendoredColl = map[string]*Collation{}
+		entries, err := vendoredFS.ReadDir("collationdata")
+		if err != nil {
+			panic(fmt.Sprintf("vendored collations: %v", err))
+		}
+		for _, e := range entries {
+			if e.IsDir() || !strings.HasSuffix(e.Name(), ".coll") {
+				continue
+			}
+			b, err := vendoredFS.ReadFile("collationdata/" + e.Name())
+			if err != nil {
+				panic(fmt.Sprintf("vendored collation %s: %v", e.Name(), err))
+			}
+			coll, err := OpenCollation(b)
+			if err != nil {
+				panic(fmt.Sprintf("vendored collation %s: %v", e.Name(), err))
+			}
+			vendoredColl[coll.Name] = coll
+		}
+	})
+	return vendoredColl
+}
+
+// VendoredCollation looks up a collation VENDORED into this binary by its exact (case-sensitive)
+// name (spec/design/collation.md §2/§9). nil ⇒ not vendored. "C" is never here (table-free, built
+// in). The resolver consults the database's referenced collations first, then this set.
+func VendoredCollation(name string) *Collation {
+	return vendored()[name]
+}
+
+// VendoredCollations returns every vendored collation, ascending by name — a deterministic order
+// with no hash-iteration leak (CLAUDE.md §8). Used by introspection (db.Collations).
+func VendoredCollations() []*Collation {
+	m := vendored()
+	out := make([]*Collation, 0, len(m))
+	for _, c := range m {
+		out = append(out, c)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
+	return out
 }
 
 func deserializeTable(table []byte) ([]singleEntry, []contractionEntry, error) {
