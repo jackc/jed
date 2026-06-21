@@ -5933,7 +5933,14 @@ impl Database {
         for i in 0..plans.len() {
             let buf = if let Some(rt) = &recursives[i] {
                 self.materialize_recursive(
-                    i, &plans[i], rt, &modes, &plans, &buffers, &bound, &mut total_cost,
+                    i,
+                    &plans[i],
+                    rt,
+                    &modes,
+                    &plans,
+                    &buffers,
+                    &bound,
+                    &mut total_cost,
                 )?
             } else if modes[i] == CteMode::Materialize {
                 let ctx = CteCtx {
@@ -9498,9 +9505,7 @@ fn analyze_recursive_cte(name: &str, body: &QueryExpr) -> Result<CteShape> {
         }
     };
     validate_recursive_term(name, rhs_sel)?;
-    Ok(CteShape::Recursive {
-        union_all: so.all,
-    })
+    Ok(CteShape::Recursive { union_all: so.all })
 }
 
 /// Validate the recursive term (the UNION's right SELECT) of a recursive CTE (recursive-cte.md §6).

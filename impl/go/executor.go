@@ -6484,7 +6484,8 @@ func (db *Database) materializeRecursive(ci int, anchorPlan *queryPlan, rt *recu
 	guard := func(total int64) error {
 		if maxCost > 0 && total >= maxCost {
 			return NewError(CostLimitExceeded, fmt.Sprintf(
-				"query exceeded the cost limit of %d (accrued %d)", maxCost, total))
+				"query exceeded the cost limit of %d (accrued %d)", maxCost, total,
+			))
 		}
 		return nil
 	}
@@ -6573,7 +6574,8 @@ func analyzeRecursiveCte(name string, body QueryExpr) (bool, bool, error) {
 	so := body.SetOp
 	if so == nil || so.Op != SetOpUnion {
 		return false, false, NewError(InvalidRecursion, fmt.Sprintf(
-			"recursive query %q does not have the form non-recursive-term UNION [ALL] recursive-term", name))
+			"recursive query %q does not have the form non-recursive-term UNION [ALL] recursive-term", name,
+		))
 	}
 	if len(so.OrderBy) > 0 {
 		return false, false, NewError(FeatureNotSupported, "ORDER BY in a recursive query is not implemented")
@@ -6583,7 +6585,8 @@ func analyzeRecursiveCte(name string, body QueryExpr) (bool, bool, error) {
 	}
 	if countSelfRefsQuery(so.Lhs, name) > 0 {
 		return false, false, NewError(InvalidRecursion, fmt.Sprintf(
-			"recursive reference to query %q must not appear within its non-recursive term", name))
+			"recursive reference to query %q must not appear within its non-recursive term", name,
+		))
 	}
 	if so.Rhs.Select == nil {
 		return false, false, NewError(FeatureNotSupported,
@@ -6603,16 +6606,19 @@ func analyzeRecursiveCte(name string, body QueryExpr) (bool, bool, error) {
 func validateRecursiveTerm(name string, sel *Select) error {
 	if countSublinkSelfRefs(sel, name) >= 1 {
 		return NewError(InvalidRecursion, fmt.Sprintf(
-			"recursive reference to query %q must not appear within a subquery", name))
+			"recursive reference to query %q must not appear within a subquery", name,
+		))
 	}
 	if countFromSubquerySelfRefs(sel, name) >= 1 {
 		return NewError(FeatureNotSupported, fmt.Sprintf(
-			"recursive reference to query %q inside a FROM subquery is not supported yet", name))
+			"recursive reference to query %q inside a FROM subquery is not supported yet", name,
+		))
 	}
 	direct := countDirectFromSelfRefs(sel, name)
 	if direct > 1 {
 		return NewError(InvalidRecursion, fmt.Sprintf(
-			"recursive reference to query %q must not appear more than once", name))
+			"recursive reference to query %q must not appear more than once", name,
+		))
 	}
 	if itemsHaveAggregate(sel.Items) || (sel.Having != nil && exprHasAggregate(*sel.Having)) {
 		return NewError(InvalidRecursion,
@@ -6620,7 +6626,8 @@ func validateRecursiveTerm(name string, sel *Select) error {
 	}
 	if direct == 1 && directSelfRefOnNullableSide(sel, name) {
 		return NewError(InvalidRecursion, fmt.Sprintf(
-			"recursive reference to query %q must not appear within an outer join", name))
+			"recursive reference to query %q must not appear within an outer join", name,
+		))
 	}
 	return nil
 }
@@ -6874,7 +6881,8 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string) error 
 		if rtName(unified) != rtName(a[i]) {
 			return NewError(DatatypeMismatch, fmt.Sprintf(
 				"recursive query %q column %d has type %s in non-recursive term but type %s overall",
-				name, i+1, rtName(a[i]), rtName(unified)))
+				name, i+1, rtName(a[i]), rtName(unified),
+			))
 		}
 	}
 	return nil
