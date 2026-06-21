@@ -465,6 +465,76 @@ range is **not** a GIN element. The `(value → bytes)` vectors are in
 `range_pk_table.jed` golden. With range exercised, only `float` (the determinism carve-out §2.8) and
 the recursive **composite/array** containers remain `0A000` keys.
 
+### 2.12 Collated text — `text-collated-sortkey` (a key *form*, not a new type)
+
+A `text` column carrying a **non-`C` collation** ([collation.md](collation.md)) does not key by its
+raw UTF-8 bytes (the `C` rule §2.4) — that would store dictionary words in byte order, the whole
+point collation fixes. Instead the key body is the column collation's **UCA sort key**
+([../collation/README.md §4](../collation/README.md), [collation.md §8](collation.md)), whose
+`memcmp` order **is** the collation's logical order by construction:
+
+```
+sort_key = L1-weights ‖ 0x0000 ‖ L2-weights ‖ 0x0000 ‖ L3-weights ‖ 0x0000 ‖ Ckey(original)
+```
+
+This is **not a new key type** — `text` was already a key (§2.4) — but a per-column *form* selected
+by the column's frozen collation ([collation.md §1](collation.md)): a `C` text key uses §2.4
+verbatim (the unchanged fast path, zero collation data), a non-`C` text key uses the sort key. The
+executor reuses the *same* sort key the comparison/`ORDER BY` evaluator already emits (slice 1b), so
+one routine drives ordering everywhere.
+
+- **Self-delimiting + total + reversible — for free.** The sort key **appends the original string's
+  `C`-key** (the §2.4 `text-terminated-escape`) as its identical level. That trailer does three jobs
+  at once: it is the **identical-level tie-break** (totality — so a deterministic collation's
+  equality is byte-identity, [collation.md §6/§7](collation.md)); it makes the key **self-delimiting**
+  (it ends in the §2.4 terminator `0x00 0x01`, so the key composes in a composite key / index suffix
+  exactly like a plain text key); and it makes the original **recoverable from the key** — required
+  for a `PRIMARY KEY`. The level separators are `0x0000` and every emitted weight is `≥ 0x0001`, so a
+  level that is a prefix of another's sorts first (the `"a" < "ab"` behaviour at every level,
+  [../collation/README.md §4](../collation/README.md)).
+- **One uniform component encoding.** jed encodes a collated text key component as the **full** sort
+  key (identical level included) **everywhere** — PK body, secondary-index entry, `UNIQUE` probe
+  prefix. A secondary index could store `sort_key ‖ pk` *without* the identical level (the row is
+  fetched via the PK, [collation.md §8](collation.md)); jed keeps the trailer there too, so the
+  storage-key suffix only refines a genuine collation tie. The small redundancy (the trailer plus the
+  appended storage key) buys a single component codec and zero special-casing.
+- **Descending / nullable** reuse the existing whole-component rules unchanged: a descending collated
+  key is the §2.3 bitwise inversion of the whole sort key (trailer included), and an index /
+  composite member wraps the sort key in the §2.2 nullable slot (`0x00` present ‖ sort key, or `0x01`
+  NULL).
+
+Worked body for `"a"` under the dev-root collation ([../collation/README.md §5](../collation/README.md)),
+the value pinned in [../collation/vectors/sortkey.toml](../collation/vectors/sortkey.toml):
+
+```
+1C47   ‖ 0000 ‖ 0020 ‖ 0000 ‖ 0002 ‖ 0000 ‖ 61 00 01
+(L1: a)  (sep)  (L2)   (sep)  (L3)   (sep)  (identical: Ckey "a")
+```
+
+= `1C47 0000 0020 0000 0002 0000 61 00 01`. `"A"` differs only at L3 (`0008`) and the trailer
+(`41 00 01`), so it sorts immediately after `"a"` — the deterministic "adjacent, not equal" property,
+now realised in *stored* order.
+
+**Status — EXERCISED (slice 1e).** A non-`C` collated `text` column **is** a valid `PRIMARY KEY` /
+ordered secondary index / `UNIQUE` key — the keys store sort-key bytes, so the B-tree iterates in
+collation order with no runtime comparator. The collation table is **baked** into the file (slice 1d,
+[collation.md §3](collation.md)), so the key bytes are self-contained and cross-core byte-identical
+(`rust == go == ts == ruby`); the on-disk image is pinned by the `collation_pk_table.jed` golden
+([../fileformat/format.md](../fileformat/format.md)) and the key body bytes by
+[../collation/vectors/sortkey.toml](../collation/vectors/sortkey.toml). Two deliberate narrowings,
+both relaxable later and documented in [collation.md §8/§14](collation.md): (a) **point-lookup
+pushdown is deferred for a collated key** — a collated PK/index `WHERE k = …` / `k < …` full-scans +
+residual-filters (correct, just unindexed; the planner already excludes a collated comparison from a
+byte-range bound, since the B-tree is collation-ordered while the predicate would compute a byte
+bound) — matching the range-container precedent (§2.11); (b) **a collated key value whose UCA sort
+key would exceed a node** trips the existing over-`RECORD_MAX` oversized-item `0A000` (the sort key is
+~2–3× the source, so the cap bites sooner than for a `C` key — the documented price of one `memcmp`
+order). An unmapped code point under the (dev) collation fails the sort-key build (`0A000`) at the
+write, the same point and code the comparison path raises ([collation.md §6](collation.md)). Stored
+text *values* are unaffected — they still use the compact length-prefixed value codec
+([../fileformat/format.md](../fileformat/format.md)); only the *key* takes the collated form, the §3
+key/value seam diverging exactly as it does for `decimal` (§2.5) and `interval` (§2.10).
+
 ## 3. Where this is used today
 
 The bare integer rule is exercised by every stored key. The on-disk **value codec**
@@ -491,7 +561,10 @@ rather than spec-only — as have `timestamp`/`timestamptz` keys (the i64 rule),
 keys (the `…-terminated-escape` rules §2.4/§2.6), `decimal` keys (the
 `decimal-order-preserving` rule §2.5, `decimal_pk_table.jed`), `interval` keys (the
 `interval-span-i128` span rule §2.10, `interval_pk_table.jed`), and `range` keys (the recursive
-`range-bounds` container rule §2.11, `range_pk_table.jed` — the first *container* key). The lone
+`range-bounds` container rule §2.11, `range_pk_table.jed` — the first *container* key). A **non-`C`
+collated `text` key** (the `text-collated-sortkey` *form* §2.12) has since landed too — the same
+`text` key type, but its body is the column collation's baked UCA sort key rather than the raw UTF-8,
+pinned by the `collation_pk_table.jed` golden. The lone
 remaining non-integer scalar, `float`, adds its own §2 key path only if the determinism carve-out
 (§2.8) ever lifts; the recursive `composite`/`array` containers stay `0A000` keys.
 

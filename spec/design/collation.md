@@ -40,7 +40,12 @@
 > `db.ExportCollation` + `db.SetDefaultCollation`/`db.DefaultCollation` + `db.Collations`, per-column
 > `COLLATE` in `CREATE TABLE` with default inheritance frozen at create, the now-reachable
 > indeterminate-collation **`42P22`**, and the `collation_table.jed` golden (`rust == go == ts ==
-> ruby`). The remaining slice (§14) is **1e** (collated keys). Two decisions are **confirmed**: the
+> ruby`). **Slice 1e** landed **collated keys** (no `format_version` change): a non-`C` collated text
+> column is a valid `PRIMARY KEY` / ordered secondary index / `UNIQUE`, its stored key the column
+> collation's UCA sort key ([encoding.md §2.12](encoding.md)), so the B-tree iterates in collation
+> order with no runtime comparator — pinned by the `collation_pk_table.jed` golden (`rust == go == ts
+> == ruby`); point-lookup pushdown for a collated key is deferred (full scan + residual filter, §8/§14).
+> Two decisions are **confirmed**: the
 > definition format is the **UCA/CLDR standards** (DUCET `allkeys.txt` + LDML), and the cores build
 > **`CompileCollation` in-core first** (no external authoring tool).
 
@@ -401,6 +406,20 @@ original) — the documented price of keeping one `memcmp` order rather than a r
 The sort key is produced by the **baked** table (§5), so every core emits identical key bytes →
 byte-identical collated B-trees.
 
+**Two narrowings the slice-1e key path carries** ([encoding.md §2.12](encoding.md)), both relaxable:
+
+- **Point-lookup pushdown is deferred for a collated key.** A collated PK/index `WHERE k = 'x'` /
+  `k < 'm'` **full-scans + residual-filters** — correct, just unindexed, the same posture as a range
+  container key ([encoding.md §2.11](encoding.md)). The planner already excludes a *collated*
+  comparison from a byte-range index bound (it would compute a `C`-byte bound against a
+  collation-ordered B-tree — wrong), so this falls out for free: a `C` text key still pushes down; a
+  non-`C` one does not. (Equality pushdown is sound in principle — the sort key is injective via the
+  identical level — and is the obvious follow-on.)
+- **One uniform component codec.** A collated text key component is the **full** sort key (identical
+  level included) in every position — PK body, secondary-index entry, `UNIQUE` prefix. The
+  alternative `sort_key ‖ pk` (no identical level) for a secondary index is *also* correct but is not
+  taken: one codec, no special-casing, at the cost of a few redundant trailer bytes in the index.
+
 ## 9. The data: the host seam, the definition format, and the portable artifact
 
 The binary ships **no collation data** beyond `C` — only the compiler and executor code (§6),
@@ -590,9 +609,24 @@ sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
   (takes a neighbour's) — the same documented narrowing as 1c. Set-operation output columns do not
   yet propagate an implicit collation (an explicit `COLLATE` on a set-op ORDER BY key still works) — a
   deferred follow-on.
-- **1e — collated keys**: the sort-key key encoding (§8) as a new [encoding.md](encoding.md)
-  sub-section, a collated text `PRIMARY KEY` / index / `UNIQUE`, byte fixtures + a golden with a
-  collated index.
+- **1e — collated keys** ✅ *landed*: the sort-key key encoding as a new
+  [encoding.md §2.12](encoding.md) sub-section (`text-collated-sortkey`), a collated text
+  `PRIMARY KEY` / ordered secondary index / `UNIQUE` whose stored key is the column collation's UCA
+  sort key (so the B-tree iterates in collation order with no runtime comparator), in all three cores
+  + the Ruby reference. The key encoders thread a per-column resolved-collation slice; a non-`C` text
+  key component encodes via `sort_key` (which already appends the §2.4 C-key, so it is self-delimiting,
+  total, and reversible) instead of `text-terminated-escape`. No `format_version` change (the collated
+  snapshot/per-column collation landed in 1d; 1e only changes how a *key* is computed). Verified by the
+  `collation_pk_table.jed` golden (`rust == go == ts == ruby`, the key bytes pinned by
+  [../collation/vectors/sortkey.toml](../collation/vectors/sortkey.toml)) + corpus
+  (`suites/collation/collate.test`). Two refinements/narrowings, both recorded in §8: (a) **point-lookup
+  pushdown is deferred for a collated key** — a collated PK/index `WHERE` full-scans + residual-filters
+  (the planner already excludes a *collated* comparison from a byte-range bound, so a `C` text key still
+  pushes down and a non-`C` one does not); (b) **one uniform component codec** — the full sort key
+  (identical level included) is used in every key position (PK, index entry, `UNIQUE` prefix), the
+  secondary-index `sort_key ‖ pk`-without-identical-level alternative not taken. An FK over a collated
+  parent key encodes the probe with the **parent's** collation. The dev-collation unmapped-code-point
+  case aborts a collated INSERT with `0A000`, the same code/point the comparison path raises.
 
 **Later follow-ons** (each its own slice, after slice 1):
 

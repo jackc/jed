@@ -238,6 +238,62 @@ fn export_round_trips_and_introspects() {
 }
 
 #[test]
+fn collated_primary_key_is_stored_in_collation_order() {
+    // slice 1e: a collated text PRIMARY KEY's storage key is the UCA sort key (encoding.md §2.12),
+    // so the B-tree physically iterates in COLLATION order — not the C byte order. A no-ORDER-BY
+    // single-table scan returns jed's stored (key) order, so this asserts the *key* is collated
+    // (distinct from the in-memory ORDER BY sorter that 1c already had). On-disk/internal property
+    // the corpus cannot express (CLAUDE.md §10). dev-root: a < A < b < Z; C bytes: A < Z < a < b.
+    let mut db = Database::new();
+    db.import_collation(dev_root()).unwrap();
+    execute(
+        &mut db,
+        "CREATE TABLE t (name text COLLATE \"dev-root\" PRIMARY KEY)",
+    )
+    .unwrap();
+    execute(&mut db, "INSERT INTO t VALUES ('Z'),('a'),('b'),('A')").unwrap();
+    assert_eq!(
+        texts(query(&mut db, "SELECT name FROM t")),
+        vec!["a", "A", "b", "Z"]
+    );
+    // Contrast: a C-keyed table iterates in raw byte order.
+    execute(&mut db, "CREATE TABLE c (name text PRIMARY KEY)").unwrap();
+    execute(&mut db, "INSERT INTO c VALUES ('Z'),('a'),('b'),('A')").unwrap();
+    assert_eq!(
+        texts(query(&mut db, "SELECT name FROM c")),
+        vec!["A", "Z", "a", "b"]
+    );
+}
+
+#[test]
+fn collated_secondary_index_and_unique_keys() {
+    // slice 1e: a collated secondary index iterates by collation order (an unindexed-scan-equivalent
+    // result), and a collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and
+    // 'A' are DISTINCT, both admitted — collation.md §7), exactly like a C unique key.
+    let mut db = Database::new();
+    db.import_collation(dev_root()).unwrap();
+    execute(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\" UNIQUE)",
+    )
+    .unwrap();
+    // 'a' and 'A' are distinct under a deterministic collation → both accepted.
+    execute(&mut db, "INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')").unwrap();
+    // A duplicate (byte-identical) value violates the collated UNIQUE constraint.
+    assert_eq!(
+        execute(&mut db, "INSERT INTO t VALUES (4,'a')")
+            .unwrap_err()
+            .code(),
+        "23505"
+    );
+    // ORDER BY over the collated column is collation order even without an explicit COLLATE.
+    assert_eq!(
+        texts(query(&mut db, "SELECT name FROM t ORDER BY name")),
+        vec!["a", "A", "b"]
+    );
+}
+
+#[test]
 fn baked_file_round_trip() {
     // The full slice-1d persistence path: a collation + a collated table + the per-database default
     // are baked into the file (format_version 17, entry_kind 3) and survive a close + paged reopen.

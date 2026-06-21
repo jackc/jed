@@ -846,6 +846,23 @@ COLLATION_TABLE = {
              rows: [[1, "a", "b", "z"], [2, "z", "a", "a"]] }]
 }.freeze
 
+# A collated text PRIMARY KEY + a collated secondary index (slice 1e, encoding.md §2.12): both keys
+# store the dev-root UCA SORT KEY, not the raw UTF-8, so the B-tree iterates in COLLATION order. The
+# baked dev-root snapshot travels with the file (entry_kind 3). The key sort-key bytes are the pinned
+# spec/collation/vectors/sortkey.toml vectors (collated_sort_key). Must match the cores'
+# collation_pk_table_db (spec/design/collation.md §8).
+COLLATION_PK_TABLE = {
+  collations: [
+    { name: "dev-root", default: false,
+      artifact: File.binread(File.join(__dir__, "..", "collation", "fixtures", "dev-root.coll")) }
+  ],
+  tables: [{ name: "t",
+             columns: [col("name", "text", pk: true, collation: "dev-root"),
+                       col("tag", "text", collation: "dev-root")],
+             indexes: [{ name: "t_tag_idx", cols: [1] }],
+             rows: [["a", "b"], ["z", "a"]] }]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -900,6 +917,8 @@ FIXTURES = [
     sequences: IDENTITY_TABLE[:sequences], tables: IDENTITY_TABLE[:tables] },
   { file: "collation_table.jed", page_size: 256,
     collations: COLLATION_TABLE[:collations], tables: COLLATION_TABLE[:tables] },
+  { file: "collation_pk_table.jed", page_size: 256,
+    collations: COLLATION_PK_TABLE[:collations], tables: COLLATION_PK_TABLE[:tables] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
@@ -1016,14 +1035,50 @@ end
 # The BARE order-preserving KEY body for one present (non-NULL) value of `type` — no presence
 # tag (callers add it for nullable index slots; a PK member is NOT NULL). uuid is the 16 raw
 # bytes (uuid-raw16, §2.7), boolean a single bool-byte (0x00 false / 0x01 true, §2.9), text/bytea
-# the variable-width …-terminated-escape body (§2.4/§2.6), decimal the decimal-order-preserving
+# The collated text key body (text-collated-sortkey, encoding.md §2.12): the column collation's UCA
+# sort key for `string`, whose memcmp order IS the collation order. Ruby has no collation compiler
+# (the artifact is opaque, §collation_entry_bytes), so the reference reads the pinned cross-core
+# sort-key bytes from spec/collation/vectors/sortkey.toml rather than recomputing them — the same
+# bytes the cores emit (the sort key already appends the §2.4 C-key, so it is self-delimiting and
+# total). A golden may only use (collation, string) pairs that vector pins.
+def sortkey_vectors
+  @sortkey_vectors ||= begin
+    path = File.join(__dir__, "..", "collation", "vectors", "sortkey.toml")
+    map = {}
+    coll = nil
+    str = nil
+    File.foreach(path) do |line|
+      if (m = line.match(/^coll_name\s*=\s*"(.*)"\s*$/))
+        coll = m[1]
+      elsif (m = line.match(/^string\s*=\s*"(.*)"\s*$/))
+        str = m[1]
+      elsif (m = line.match(/^sortkey_hex\s*=\s*"([0-9a-fA-F]*)"\s*$/))
+        map[[coll, str]] = [m[1]].pack("H*").b
+      end
+    end
+    map
+  end
+end
+
+def collated_sort_key(coll_name, string)
+  sortkey_vectors.fetch([coll_name, string.dup.force_encoding("UTF-8")]) do
+    raise "no pinned sort-key vector for collation #{coll_name.inspect} string #{string.inspect}"
+  end
+end
+
+# The BARE order-preserving KEY body for one keyable value: uuid the raw 16 bytes, text/bytea
+# the variable-width …-terminated-escape body (§2.4/§2.6) — or, for a non-C collated text column,
+# the UCA sort key (text-collated-sortkey §2.12) — decimal the decimal-order-preserving
 # body (§2.5), interval the 16-byte interval-span-i128 span (§2.10), a range the recursive
 # range-bounds container key (§2.11), every other keyable type the sign-flipped fixed-width int
-# encoding (timestamps reuse the i64 rule).
-def key_body(type, v)
+# encoding (timestamps reuse the i64 rule). `collation` is the text column's frozen collation name
+# (nil ⇒ C / non-text — the fast path).
+def key_body(type, v, collation = nil)
   if (relem = range_elem(type))
     return encode_range_key(relem, v)
   end
+
+  return collated_sort_key(collation, v) if collation && type == "text"
 
   case type
   when "uuid" then uuid_to_bytes(v)
@@ -1453,7 +1508,9 @@ def table_entries(table)
     key = if pk_idxs.empty?
             encode_int(8, i)
           else
-            pk_idxs.map { |pi| key_body(table[:columns][pi][:type], row[pi]) }.join.b
+            pk_idxs.map do |pi|
+              key_body(table[:columns][pi][:type], row[pi], table[:columns][pi][:collation])
+            end.join.b
           end
     [key, row]
   end
@@ -1471,7 +1528,7 @@ def index_entry_key(table, ix, storage_key, row)
       out << "\x01".b
     else
       out << "\x00".b
-      out << key_body(table[:columns][ci][:type], v)
+      out << key_body(table[:columns][ci][:type], v, table[:columns][ci][:collation])
     end
   end
   out << storage_key

@@ -1118,6 +1118,23 @@ impl Database {
         }
     }
 
+    /// Resolve each column's frozen collation (`Column::collation`, the name) to its baked table,
+    /// indexed by column ordinal — `None` for a `C` / non-text column (the fast path). The key
+    /// encoders (§2.12) consult `colls[ci]` to pick a text column's key form. Returns owned `Arc`
+    /// clones (cheap), so the result outlives the snapshot borrow and composes with the mutable
+    /// store borrow that phase-2 writes hold (collations are immutable within a statement).
+    fn column_collations(&self, columns: &[Column]) -> Vec<Option<std::sync::Arc<Collation>>> {
+        let snap = self.read_snap();
+        columns
+            .iter()
+            .map(|c| {
+                c.collation
+                    .as_ref()
+                    .and_then(|n| snap.collation(n).cloned())
+            })
+            .collect()
+    }
+
     /// The working snapshot a write mutates — the open transaction's `working`. A write only ever
     /// runs with a transaction open (autocommit opens one implicitly), so this never panics in a
     /// correct flow.
@@ -3026,6 +3043,9 @@ impl Database {
         })?;
         let table_key = table.name.to_ascii_lowercase();
         let columns = table.columns.clone();
+        // Per-column frozen collations for the collated text key form (§2.12); `None` everywhere
+        // for a C-only / non-text table (the fast path).
+        let colls = self.column_collations(&columns);
         // Resolve the access method (spec/design/gin.md §3): the default / `btree` is the ordered
         // B-tree, `gin` a GIN inverted index; an unknown method is 42704. Resolved here (not in the
         // parser) so the error is the resolve-time undefined_object, after the table-exists check
@@ -3176,7 +3196,7 @@ impl Database {
             meter.guard()?; // enforce the cost ceiling per scanned row (CLAUDE.md §13)
             meter.charge(COSTS.storage_row_read);
             if def.unique
-                && let Some(prefix) = index_prefix_key(&columns, &def, &row)
+                && let Some(prefix) = index_prefix_key(&columns, &colls, &def, &row)?
                 && !seen_prefixes.insert(prefix)
             {
                 return Err(EngineError::new(
@@ -3187,7 +3207,7 @@ impl Database {
                     ),
                 ));
             }
-            entries.extend(index_entry_keys(&columns, &def, &key, &row));
+            entries.extend(index_entry_keys(&columns, &colls, &def, &key, &row)?);
         }
         meter.guard()?;
 
@@ -4008,6 +4028,9 @@ impl Database {
             .unwrap_or_else(|| (table.to_string(), Vec::new()));
         // The columns' resolved `ColType`s, for composite-aware store coercion (composite.md §4).
         let col_types: Vec<ColType> = self.store(table).col_types().to_vec();
+        // Per-column frozen collations for the collated text key form (§2.12), resolved once before
+        // any mutation; `None` everywhere for a C-only / non-text table (the fast path).
+        let colls = self.column_collations(columns);
         let mut prepared: Vec<(Option<Vec<u8>>, Row)> = Vec::with_capacity(rows.len());
         let mut seen_keys: HashSet<Vec<u8>> = HashSet::new();
         // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
@@ -4068,7 +4091,7 @@ impl Database {
                 // The composite key is the concatenation of the members' bare encodings in
                 // key order (encoding.md §2.3 — `encode_pk_key`); a single-column key is the
                 // one-member case of the same rule.
-                let k = encode_pk_key(pk, &row);
+                let k = encode_pk_key(pk, &colls, &row)?;
                 if seen_keys.contains(&k) || self.store(table).get(&k)?.is_some() {
                     // The PK's 23505 reports PostgreSQL's derived auto-name for the PK
                     // index, `<table>_pkey` — jed persists/reserves no such relation
@@ -4090,7 +4113,7 @@ impl Database {
             // match no existing entry and no earlier row of this batch. Unmetered
             // validation, like the PK duplicate check (cost.md §3).
             for (u, def) in uniq_defs.iter().enumerate() {
-                let Some(prefix) = index_prefix_key(columns, def, &row) else {
+                let Some(prefix) = index_prefix_key(columns, &colls, def, &row)? else {
                     continue;
                 };
                 let istore = self.index_store(&def.name.to_ascii_lowercase());
@@ -4134,20 +4157,24 @@ impl Database {
             let Some(parent) = self.table(&fk.ref_table) else {
                 continue;
             };
+            // The probe must match the parent's stored key, so a collated parent key column uses
+            // the PARENT's collation (§2.12).
+            let parent_colls = self.column_collations(&parent.columns);
             // Only a self-reference can satisfy against this statement's batch (a different parent
             // table is unchanged by this INSERT). Collect the parent keys the batch supplies.
             let batch: HashSet<Vec<u8>> = if fk.ref_table.eq_ignore_ascii_case(&relation) {
-                prepared
-                    .iter()
-                    .filter_map(|(_, r)| {
-                        fk_probe(fk, parent, r, &fk.ref_columns).map(|p| p.bytes().to_vec())
-                    })
-                    .collect()
+                let mut s = HashSet::new();
+                for (_, r) in &prepared {
+                    if let Some(p) = fk_probe(fk, parent, &parent_colls, r, &fk.ref_columns)? {
+                        s.insert(p.bytes().to_vec());
+                    }
+                }
+                s
             } else {
                 HashSet::new()
             };
             for (_, row) in &prepared {
-                let Some(probe) = fk_probe(fk, parent, row, &fk.columns) else {
+                let Some(probe) = fk_probe(fk, parent, &parent_colls, row, &fk.columns)? else {
                     continue; // a NULL local column → exempt (MATCH SIMPLE)
                 };
                 if batch.contains(probe.bytes()) {
@@ -4191,7 +4218,7 @@ impl Database {
         for (key, row) in prepared {
             let key = key.unwrap_or_else(|| encode_int(ScalarType::Int64, store.alloc_rowid()));
             for (k, def) in indexes.iter().enumerate() {
-                index_inserts[k].extend(index_entry_keys(columns, def, &key, &row));
+                index_inserts[k].extend(index_entry_keys(columns, &colls, def, &key, &row)?);
             }
             assert!(
                 store.insert(key, row)?,
@@ -4379,6 +4406,9 @@ impl Database {
             .map(|t| (t.name.clone(), t.indexes.clone()))
             .unwrap_or_else(|| (table.to_string(), Vec::new()));
         let col_types: Vec<ColType> = self.store(table).col_types().to_vec();
+        // Per-column frozen collations for the collated text key form (§2.12), resolved before any
+        // mutation; `None` everywhere for a C-only / non-text table (the fast path).
+        let colls = self.column_collations(columns);
         let uniq_idx: Vec<usize> = indexes
             .iter()
             .enumerate()
@@ -4419,14 +4449,19 @@ impl Database {
                 // No-target DO NOTHING: skip on ANY uniqueness conflict (committed OR an
                 // earlier planned insert); else insert (upsert.md §2/§3).
                 None => {
-                    let pkk = (!pk.is_empty()).then(|| encode_pk_key(pk, &row));
+                    let pkk = (!pk.is_empty())
+                        .then(|| encode_pk_key(pk, &colls, &row))
+                        .transpose()?;
                     let committed =
-                        self.row_conflicts_committed(table, columns, pk, &indexes, &row)?;
-                    let in_batch = pkk.as_ref().is_some_and(|k| ins_pk.contains(k))
-                        || uniq_idx.iter().enumerate().any(|(u, &ix)| {
-                            index_prefix_key(columns, &indexes[ix], &row)
-                                .is_some_and(|p| ins_prefixes[u].contains(&p))
-                        });
+                        self.row_conflicts_committed(table, columns, &colls, pk, &indexes, &row)?;
+                    let mut in_batch = pkk.as_ref().is_some_and(|k| ins_pk.contains(k));
+                    for (u, &ix) in uniq_idx.iter().enumerate() {
+                        if !in_batch
+                            && let Some(p) = index_prefix_key(columns, &colls, &indexes[ix], &row)?
+                        {
+                            in_batch = ins_prefixes[u].contains(&p);
+                        }
+                    }
                     if committed || in_batch {
                         continue; // skip
                     }
@@ -4434,7 +4469,7 @@ impl Database {
                         ins_pk.insert(k);
                     }
                     for (u, &ix) in uniq_idx.iter().enumerate() {
-                        if let Some(p) = index_prefix_key(columns, &indexes[ix], &row) {
+                        if let Some(p) = index_prefix_key(columns, &colls, &indexes[ix], &row)? {
                             ins_prefixes[u].insert(p);
                         }
                     }
@@ -4442,7 +4477,7 @@ impl Database {
                 }
                 // Arbiter present (DO UPDATE always; DO NOTHING with a target).
                 Some(arb) => {
-                    let Some(ak) = arbiter_key(arb, pk, columns, &indexes, &row) else {
+                    let Some(ak) = arbiter_key(arb, pk, &colls, columns, &indexes, &row)? else {
                         // A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
                         inserts.push(row);
                         continue;
@@ -4509,7 +4544,7 @@ impl Database {
         if !pk.is_empty() && !inserts.is_empty() {
             let mut seen: HashSet<Vec<u8>> = HashSet::new();
             for row in &inserts {
-                let k = encode_pk_key(pk, row);
+                let k = encode_pk_key(pk, &colls, row)?;
                 if self.store(table).get(&k)?.is_some() || !seen.insert(k) {
                     return Err(EngineError::new(
                         SqlState::UniqueViolation,
@@ -4532,7 +4567,7 @@ impl Database {
                 let istore = self.index_store(&def.name.to_ascii_lowercase());
                 let mut batch: HashSet<Vec<u8>> = HashSet::new();
                 for new_row in updates.iter().map(|(_, nr, _)| nr).chain(inserts.iter()) {
-                    let Some(prefix) = index_prefix_key(columns, def, new_row) else {
+                    let Some(prefix) = index_prefix_key(columns, &colls, def, new_row)? else {
                         continue;
                     };
                     let conflict = !batch.insert(prefix.clone())
@@ -4570,17 +4605,20 @@ impl Database {
             let Some(parent) = self.table(&fk.ref_table) else {
                 continue;
             };
+            // The probe matches the parent's stored key, so a collated parent key column uses the
+            // PARENT's collation (§2.12).
+            let parent_colls = self.column_collations(&parent.columns);
             let check_updates = fk.columns.iter().any(|c| assigned.contains(c));
             // End-state referenced keys this statement supplies, for a self-reference: from the
             // inserted rows and the updated NEW rows.
             let batch: HashSet<Vec<u8>> = if fk.ref_table.eq_ignore_ascii_case(&relation) {
-                inserts
-                    .iter()
-                    .chain(updates.iter().map(|(_, nr, _)| nr))
-                    .filter_map(|r| {
-                        fk_probe(fk, parent, r, &fk.ref_columns).map(|p| p.bytes().to_vec())
-                    })
-                    .collect()
+                let mut s = HashSet::new();
+                for r in inserts.iter().chain(updates.iter().map(|(_, nr, _)| nr)) {
+                    if let Some(p) = fk_probe(fk, parent, &parent_colls, r, &fk.ref_columns)? {
+                        s.insert(p.bytes().to_vec());
+                    }
+                }
+                s
             } else {
                 HashSet::new()
             };
@@ -4591,7 +4629,7 @@ impl Database {
                     .map(|(_, nr, _)| nr),
             );
             for row in to_check {
-                let Some(probe) = fk_probe(fk, parent, row, &fk.columns) else {
+                let Some(probe) = fk_probe(fk, parent, &parent_colls, row, &fk.columns)? else {
                     continue; // a NULL local column → exempt (MATCH SIMPLE)
                 };
                 if batch.contains(probe.bytes()) {
@@ -4619,17 +4657,21 @@ impl Database {
             let updated_keys: HashSet<Vec<u8>> =
                 updates.iter().map(|(k, _, _)| k.clone()).collect();
             for (child_table, fk) in &referencers {
-                let new_present: HashSet<Vec<u8>> = updates
-                    .iter()
-                    .filter_map(|(_, nr, _)| {
-                        fk_probe(fk, &parent, nr, &fk.ref_columns).map(|p| p.bytes().to_vec())
-                    })
-                    .collect();
+                // `parent` is the insert target itself, so its key columns use `colls` (§2.12).
+                let mut new_present: HashSet<Vec<u8>> = HashSet::new();
+                for (_, nr, _) in &updates {
+                    if let Some(p) = fk_probe(fk, &parent, &colls, nr, &fk.ref_columns)? {
+                        new_present.insert(p.bytes().to_vec());
+                    }
+                }
                 for (_, new_row, old_row) in &updates {
-                    let Some(old_probe) = fk_probe(fk, &parent, old_row, &fk.ref_columns) else {
+                    let Some(old_probe) = fk_probe(fk, &parent, &colls, old_row, &fk.ref_columns)?
+                    else {
                         continue;
                     };
-                    if let Some(new_probe) = fk_probe(fk, &parent, new_row, &fk.ref_columns) {
+                    if let Some(new_probe) =
+                        fk_probe(fk, &parent, &colls, new_row, &fk.ref_columns)?
+                    {
                         if new_probe.bytes() == old_probe.bytes() {
                             continue; // unchanged tuple
                         }
@@ -4668,7 +4710,7 @@ impl Database {
                 let kb: Vec<u8> = if pk.is_empty() {
                     placeholder.to_vec()
                 } else {
-                    encode_pk_key(pk, row)
+                    encode_pk_key(pk, &colls, row)?
                 };
                 cunits += store.write_compress_units(&kb, row) as i64;
             }
@@ -4709,10 +4751,10 @@ impl Database {
             let key = if pk.is_empty() {
                 encode_int(ScalarType::Int64, store.alloc_rowid())
             } else {
-                encode_pk_key(pk, &row)
+                encode_pk_key(pk, &colls, &row)?
             };
             for (k, def) in indexes.iter().enumerate() {
-                index_adds[k].extend(index_entry_keys(columns, def, &key, &row));
+                index_adds[k].extend(index_entry_keys(columns, &colls, def, &key, &row)?);
             }
             assert!(
                 store.insert(key, row)?,
@@ -4723,8 +4765,8 @@ impl Database {
             vec![Vec::new(); indexes.len()];
         for (key, new_row, old_row) in &updates {
             for (k, def) in indexes.iter().enumerate() {
-                let old_eks = index_entry_keys(columns, def, key, old_row);
-                let new_eks = index_entry_keys(columns, def, key, new_row);
+                let old_eks = index_entry_keys(columns, &colls, def, key, old_row)?;
+                let new_eks = index_entry_keys(columns, &colls, def, key, new_row)?;
                 let removals: Vec<Vec<u8>> = old_eks
                     .iter()
                     .filter(|e| !new_eks.contains(*e))
@@ -4807,15 +4849,21 @@ impl Database {
         &self,
         table: &str,
         columns: &[Column],
+        colls: &[Option<std::sync::Arc<Collation>>],
         pk: &[(usize, Type)],
         indexes: &[IndexDef],
         row: &Row,
     ) -> Result<bool> {
-        if !pk.is_empty() && self.store(table).get(&encode_pk_key(pk, row))?.is_some() {
+        if !pk.is_empty()
+            && self
+                .store(table)
+                .get(&encode_pk_key(pk, colls, row)?)?
+                .is_some()
+        {
             return Ok(true);
         }
         for def in indexes.iter().filter(|d| d.unique) {
-            let Some(prefix) = index_prefix_key(columns, def, row) else {
+            let Some(prefix) = index_prefix_key(columns, colls, def, row)? else {
                 continue;
             };
             if !self
@@ -5000,6 +5048,9 @@ impl Database {
         } else {
             table.columns.clone()
         };
+        // Per-column frozen collations (over the FULL table columns, so it indexes both the FK
+        // parent-side probe and the index-entry path) for the collated text key form (§2.12).
+        let colls = self.column_collations(&table.columns);
         // DELETE is single-table; resolve its WHERE against a one-relation scope. The
         // RETURNING projection resolves after it (PostgreSQL's analysis order), against the
         // same scope (grammar.md §32).
@@ -5150,7 +5201,8 @@ impl Database {
                     &empty
                 };
                 for (_, row) in &matched {
-                    let Some(probe) = fk_probe(fk, &parent, row, &fk.ref_columns) else {
+                    // `parent` is the delete target itself, so its key columns use `colls` (§2.12).
+                    let Some(probe) = fk_probe(fk, &parent, &colls, row, &fk.ref_columns)? else {
                         continue; // a NULL referenced value cannot be referenced (MATCH SIMPLE)
                     };
                     if self.fk_child_references(child_table, fk, &parent, probe.bytes(), exclude)? {
@@ -5186,7 +5238,7 @@ impl Database {
         for def in &indexes {
             let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
             for (k, row) in &matched {
-                for ek in index_entry_keys(&tcolumns, def, k, row) {
+                for ek in index_entry_keys(&tcolumns, &colls, def, k, row)? {
                     istore.remove(&ek)?;
                 }
             }
@@ -5243,6 +5295,9 @@ impl Database {
         } else {
             table.columns.clone()
         };
+        // Per-column frozen collations (over the FULL table columns) for the collated text key form
+        // (§2.12) — indexes both the FK probe and the index-entry move path.
+        let colls = self.column_collations(&table.columns);
         let mut ptypes = ParamTypes::default();
         let mut plans: Vec<AssignPlan> = Vec::with_capacity(upd.assignments.len());
         for a in &upd.assignments {
@@ -5482,7 +5537,7 @@ impl Database {
                 let istore = self.index_store(&def.name.to_ascii_lowercase());
                 let mut batch: HashSet<Vec<u8>> = HashSet::new();
                 for (_, new_row, _) in &updates {
-                    let Some(prefix) = index_prefix_key(&tcolumns, def, new_row) else {
+                    let Some(prefix) = index_prefix_key(&tcolumns, &colls, def, new_row)? else {
                         continue;
                     };
                     let conflict = !batch.insert(prefix.clone())
@@ -5520,18 +5575,23 @@ impl Database {
             let Some(parent) = self.table(&fk.ref_table) else {
                 continue;
             };
+            // The probe matches the parent's stored key, so a collated parent key column uses the
+            // PARENT's collation (§2.12).
+            let parent_colls = self.column_collations(&parent.columns);
             let batch: HashSet<Vec<u8>> = if fk.ref_table.eq_ignore_ascii_case(&relation) {
-                updates
-                    .iter()
-                    .filter_map(|(_, new_row, _)| {
-                        fk_probe(fk, parent, new_row, &fk.ref_columns).map(|p| p.bytes().to_vec())
-                    })
-                    .collect()
+                let mut s = HashSet::new();
+                for (_, new_row, _) in &updates {
+                    if let Some(p) = fk_probe(fk, parent, &parent_colls, new_row, &fk.ref_columns)?
+                    {
+                        s.insert(p.bytes().to_vec());
+                    }
+                }
+                s
             } else {
                 HashSet::new()
             };
             for (_, new_row, _) in &updates {
-                let Some(probe) = fk_probe(fk, parent, new_row, &fk.columns) else {
+                let Some(probe) = fk_probe(fk, parent, &parent_colls, new_row, &fk.columns)? else {
                     continue; // a NULL local column → exempt (MATCH SIMPLE)
                 };
                 if batch.contains(probe.bytes()) {
@@ -5566,24 +5626,28 @@ impl Database {
                 updates.iter().map(|(k, _, _)| k.clone()).collect();
             let empty: HashSet<Vec<u8>> = HashSet::new();
             for (child_table, fk) in &referencers {
+                // `parent` is the update target itself, so its key columns use `colls` (§2.12).
                 // The referenced tuples the updated rows now supply (so a swap re-supplies one).
-                let new_present: HashSet<Vec<u8>> = updates
-                    .iter()
-                    .filter_map(|(_, new_row, _)| {
-                        fk_probe(fk, &parent, new_row, &fk.ref_columns).map(|p| p.bytes().to_vec())
-                    })
-                    .collect();
+                let mut new_present: HashSet<Vec<u8>> = HashSet::new();
+                for (_, new_row, _) in &updates {
+                    if let Some(p) = fk_probe(fk, &parent, &colls, new_row, &fk.ref_columns)? {
+                        new_present.insert(p.bytes().to_vec());
+                    }
+                }
                 let exclude = if child_table.eq_ignore_ascii_case(&upd.table) {
                     &updated_keys
                 } else {
                     &empty
                 };
                 for (_, new_row, old_row) in &updates {
-                    let Some(old_probe) = fk_probe(fk, &parent, old_row, &fk.ref_columns) else {
+                    let Some(old_probe) = fk_probe(fk, &parent, &colls, old_row, &fk.ref_columns)?
+                    else {
                         continue; // a NULL old referenced value was referenced by nothing
                     };
                     // Unchanged tuples (incl. a NULL→ already skipped) do not disappear.
-                    if let Some(new_probe) = fk_probe(fk, &parent, new_row, &fk.ref_columns) {
+                    if let Some(new_probe) =
+                        fk_probe(fk, &parent, &colls, new_row, &fk.ref_columns)?
+                    {
                         if new_probe.bytes() == old_probe.bytes() {
                             continue;
                         }
@@ -5648,8 +5712,8 @@ impl Database {
                 // for GIN — gin.md §5). Remove old−new, insert new−old: a shared entry (an ordered
                 // key that did not change, or a GIN term present in both) is left untouched,
                 // keeping the copy-on-write dirty set byte-identical across cores.
-                let old_eks = index_entry_keys(&tcolumns, def, key, old_row);
-                let new_eks = index_entry_keys(&tcolumns, def, key, new_row);
+                let old_eks = index_entry_keys(&tcolumns, &colls, def, key, old_row)?;
+                let new_eks = index_entry_keys(&tcolumns, &colls, def, key, new_row)?;
                 let removals: Vec<Vec<u8>> = old_eks
                     .iter()
                     .filter(|e| !new_eks.contains(*e))
@@ -7869,11 +7933,14 @@ impl Database {
         target: &[u8],
         exclude: &HashSet<Vec<u8>>,
     ) -> Result<bool> {
+        // `target` is in the parent's stored-key byte space, so the child probe encodes a collated
+        // parent key column with the PARENT's collation (§2.12).
+        let parent_colls = self.column_collations(&parent.columns);
         for (k, row) in self.store(child_table).iter_entries()? {
             if exclude.contains(&k) {
                 continue;
             }
-            if let Some(probe) = fk_probe(fk, parent, &row, &fk.columns) {
+            if let Some(probe) = fk_probe(fk, parent, &parent_colls, &row, &fk.columns)? {
                 if probe.bytes() == target {
                     return Ok(true);
                 }
@@ -8060,15 +8127,24 @@ impl Database {
             // domain by resolution (jed coerces `c` to the element type, rejecting an out-of-range
             // integer constant 22003 before exec); the integer range check is a defensive guard
             // against silently truncating an out-of-range value into a wrong term.
+            // A GIN element is fixed-width (no text), so the term encoding never collates / fails.
+            let gin_term = |ty: ScalarType, v: &Value| -> Vec<u8> {
+                encode_key_value(ty, v, None)
+                    .expect("a GIN element key is infallible (fixed-width, no collation)")
+            };
             match &qv {
                 Value::Null => return Ok((Vec::new(), (0, 0))),
                 Value::Int(n) if *n >= gb.elem_type.min() && *n <= gb.elem_type.max() => {
-                    terms.push(encode_key_value(gb.elem_type, &qv))
+                    terms.push(gin_term(gb.elem_type, &qv))
                 }
                 Value::Int(_) => return Ok((Vec::new(), (0, 0))), // out-of-range guard
-                v => terms.push(encode_key_value(gb.elem_type, v)),
+                v => terms.push(gin_term(gb.elem_type, v)),
             }
         } else {
+            let gin_term = |ty: ScalarType, v: &Value| -> Vec<u8> {
+                encode_key_value(ty, v, None)
+                    .expect("a GIN element key is infallible (fixed-width, no collation)")
+            };
             let arr = match &qv {
                 // A NULL whole-array query is 3VL-NULL for every row → never TRUE (both @> and &&).
                 Value::Null => return Ok((Vec::new(), (0, 0))),
@@ -8078,7 +8154,7 @@ impl Database {
             for el in &arr.elements {
                 match el {
                     Value::Null => has_null = true, // a NULL element carries no term
-                    v => terms.push(encode_key_value(gb.elem_type, v)),
+                    v => terms.push(gin_term(gb.elem_type, v)),
                 }
             }
             is_empty = arr.elements.is_empty();
@@ -9831,36 +9907,45 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
 /// a fixed-width type never spills, and a `text`/`bytea` value large enough to spill would
 /// produce an over-`RECORD_MAX` entry key, rejected `0A000` at the insert that stored it — so
 /// any value that actually reached the index is small enough to stay inline.
-fn index_entry_key(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row) -> Vec<u8> {
+fn index_entry_key(
+    columns: &[Column],
+    colls: &[Option<std::sync::Arc<Collation>>],
+    def: &IndexDef,
+    storage_key: &[u8],
+    row: &Row,
+) -> Result<Vec<u8>> {
     let mut out = Vec::new();
     for &ci in &def.columns {
         match &row[ci] {
             Value::Null => out.push(0x01),
             v => {
-                // present tag, then the column type's order-preserving key (range-aware §2.11)
+                // present tag, then the column type's order-preserving key (range-aware §2.11,
+                // collated-text-aware §2.12)
                 out.push(0x00);
-                out.extend_from_slice(&encode_typed_key(&columns[ci].ty, v));
+                out.extend_from_slice(&encode_typed_key(&columns[ci].ty, v, colls[ci].as_deref())?);
             }
         }
     }
     out.extend_from_slice(storage_key);
-    out
+    Ok(out)
 }
 
 /// The index entries a row contributes (spec/design/gin.md §4/§5): exactly one for an ordered
 /// (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL element for a
 /// GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index uniformly as "a
-/// row maps to a set of entries."
+/// row maps to a set of entries." `colls` (column-ordinal-indexed) selects each text key column's
+/// collated form (§2.12); GIN elements are fixed-width, so a GIN index never collates.
 fn index_entry_keys(
     columns: &[Column],
+    colls: &[Option<std::sync::Arc<Collation>>],
     def: &IndexDef,
     storage_key: &[u8],
     row: &Row,
-) -> Vec<Vec<u8>> {
-    match def.kind {
-        IndexKind::Btree => vec![index_entry_key(columns, def, storage_key, row)],
+) -> Result<Vec<Vec<u8>>> {
+    Ok(match def.kind {
+        IndexKind::Btree => vec![index_entry_key(columns, colls, def, storage_key, row)?],
         IndexKind::Gin => gin_entries(columns, def, storage_key, row),
-    }
+    })
 }
 
 /// Is `elem` an element type a GIN (`array_ops`) index admits? The integers, `boolean`, `uuid`,
@@ -9898,7 +9983,12 @@ fn gin_entries(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row
         for el in &arr.elements {
             // a NULL element contributes no term; a non-keyable element is impossible under the gate
             if !matches!(el, Value::Null) {
-                terms.push(encode_key_value(elem_ty, el));
+                // a GIN element is fixed-width (is_gin_element_type excludes text), so it never
+                // collates and the key encoding is infallible.
+                terms.push(
+                    encode_key_value(elem_ty, el, None)
+                        .expect("a GIN element key is infallible (fixed-width, no collation)"),
+                );
             }
         }
     }
@@ -9923,32 +10013,45 @@ fn gin_entries(columns: &[Column], def: &IndexDef, storage_key: &[u8], row: &Row
 /// element codec, encoding.md §2.11); the tuple carries each member's full `Type` for that reason.
 /// Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe (spec/design/upsert.md §3);
 /// a PK column is NOT NULL, so there is no presence tag and no NULL arm. `float`/`composite`/`array`
-/// PKs are rejected at CREATE TABLE, so those value kinds never reach here.
-fn encode_pk_key(pk: &[(usize, Type)], row: &Row) -> Vec<u8> {
+/// PKs are rejected at CREATE TABLE, so those value kinds never reach here. `colls`
+/// (column-ordinal-indexed) selects a text PK member's collated form (§2.12); a non-`C` collated
+/// member can fail the sort-key build (`0A000`), propagated here.
+fn encode_pk_key(
+    pk: &[(usize, Type)],
+    colls: &[Option<std::sync::Arc<Collation>>],
+    row: &Row,
+) -> Result<Vec<u8>> {
     let mut k = Vec::new();
     for (i, pk_ty) in pk {
-        k.extend_from_slice(&encode_typed_key(pk_ty, &row[*i]));
+        k.extend_from_slice(&encode_typed_key(pk_ty, &row[*i], colls[*i].as_deref())?);
     }
-    k
+    Ok(k)
 }
 
 /// A row's UNIQUENESS PROBE KEY for one unique index (spec/design/indexes.md §8): the §3
 /// entry key's slot prefix — without the storage-key suffix — or `None` when any component
 /// is NULL (*NULLS DISTINCT*: such a tuple never conflicts). Two rows conflict iff they
-/// yield the same `Some` prefix.
-fn index_prefix_key(columns: &[Column], def: &IndexDef, row: &Row) -> Option<Vec<u8>> {
+/// yield the same `Some` prefix. `colls` (column-ordinal-indexed) selects each text column's
+/// collated form (§2.12).
+fn index_prefix_key(
+    columns: &[Column],
+    colls: &[Option<std::sync::Arc<Collation>>],
+    def: &IndexDef,
+    row: &Row,
+) -> Result<Option<Vec<u8>>> {
     let mut out = Vec::new();
     for &ci in &def.columns {
         match &row[ci] {
-            Value::Null => return None,
+            Value::Null => return Ok(None),
             v => {
-                // present tag, then the column type's order-preserving key (range-aware §2.11)
+                // present tag, then the column type's order-preserving key (range-aware §2.11,
+                // collated-text-aware §2.12)
                 out.push(0x00);
-                out.extend_from_slice(&encode_typed_key(&columns[ci].ty, v));
+                out.extend_from_slice(&encode_typed_key(&columns[ci].ty, v, colls[ci].as_deref())?);
             }
         }
     }
-    Some(out)
+    Ok(Some(out))
 }
 
 /// The half-open byte range `[prefix, byte-successor(prefix))` — every index entry whose
@@ -9981,20 +10084,27 @@ fn prefix_successor(p: &[u8]) -> Option<Vec<u8>> {
 
 /// The order-preserving key bytes for one keyable value (encoding.md §2), matching the PK / index
 /// encoders. `value` is non-NULL and of a keyable type (a foreign-key column always is — its type
-/// equals a PK/UNIQUE parent column, CREATE TABLE §6.2).
-fn encode_key_value(ty: ScalarType, value: &Value) -> Vec<u8> {
-    match value {
+/// equals a PK/UNIQUE parent column, CREATE TABLE §6.2). `coll` is the text component's frozen
+/// collation: `None` (the fast path, and every non-text type) keys a `text` by its raw UTF-8
+/// (`text-terminated-escape` §2.4); `Some(c)` keys it by the collation's UCA sort key
+/// (`text-collated-sortkey` §2.12), which can fail (`0A000`) on a code point the collation does not
+/// map — propagated, so a collated INSERT of an unmapped string aborts the write.
+fn encode_key_value(ty: ScalarType, value: &Value, coll: Option<&Collation>) -> Result<Vec<u8>> {
+    Ok(match value {
         Value::Int(n) => encode_int(ty, *n),
         Value::Bool(b) => encode_bool(*b),
         Value::Uuid(u) => u.to_vec(),
         Value::Timestamp(m) | Value::Timestamptz(m) => encode_int(ty, *m),
         Value::Date(d) => encode_int(ty, *d as i64),
-        Value::Text(s) => encode_terminated(s.as_bytes()),
+        Value::Text(s) => match coll {
+            Some(c) => collation::sort_key(c, s)?,
+            None => encode_terminated(s.as_bytes()),
+        },
         Value::Bytea(b) => encode_terminated(b),
         Value::Decimal(d) => d.encode_key(),
         Value::Interval(iv) => iv.encode_key(),
         _ => unreachable!("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)"),
-    }
+    })
 }
 
 /// The order-preserving key bytes for one keyable value given its column **`Type`** — the
@@ -10002,17 +10112,19 @@ fn encode_key_value(ty: ScalarType, value: &Value) -> Vec<u8> {
 /// recurses into the `range-bounds` container codec (encoding.md §2.11), pulling its element scalar
 /// from the column type; every other keyable value ignores the wrapper and dispatches on its scalar
 /// via [`encode_key_value`]. `value` is non-NULL (callers handle the NULL slot tag separately), and
-/// a range column always holds a `Value::Range`, so the scalar arm never sees a range type.
-fn encode_typed_key(ty: &Type, value: &Value) -> Vec<u8> {
+/// a range column always holds a `Value::Range`, so the scalar arm never sees a range type. `coll`
+/// selects a `text` column's key form (encoding.md §2.12); it never applies to a range element (no
+/// range subtype is text).
+fn encode_typed_key(ty: &Type, value: &Value, coll: Option<&Collation>) -> Result<Vec<u8>> {
     match value {
         Value::Range(rv) => {
             let elem = ty
                 .range_element()
                 .expect("a range key value has a range column type")
                 .scalar();
-            crate::range::encode_range_key(elem, rv)
+            Ok(crate::range::encode_range_key(elem, rv))
         }
-        _ => encode_key_value(ty.scalar(), value),
+        _ => encode_key_value(ty.scalar(), value, coll),
     }
 }
 
@@ -10047,12 +10159,13 @@ impl FkProbe {
 fn fk_probe(
     fk: &ForeignKeyConstraint,
     parent: &Table,
+    parent_colls: &[Option<std::sync::Arc<Collation>>],
     row: &Row,
     ordinals: &[usize],
-) -> Option<FkProbe> {
+) -> Result<Option<FkProbe>> {
     // MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
     if ordinals.iter().any(|&o| matches!(row[o], Value::Null)) {
-        return None;
+        return Ok(None);
     }
     // The value supplying parent column `pcol` (the fk pairing: ref_columns[i] ⇄ ordinals[i]).
     let value_for = |pcol: usize| -> &Value {
@@ -10063,13 +10176,19 @@ fn fk_probe(
             .expect("a parent key column is one of the FK's referenced columns");
         &row[ordinals[i]]
     };
+    // The probe must match the PARENT's stored key, so a collated parent key column is encoded with
+    // the PARENT's collation (encoding.md §2.12), independent of the child column's own collation.
     let ref_set = sorted_unique(&fk.ref_columns);
     if !parent.pk.is_empty() && sorted_unique(&parent.pk) == ref_set {
         let mut k = Vec::new();
         for &pcol in &parent.pk {
-            k.extend_from_slice(&encode_typed_key(&parent.columns[pcol].ty, value_for(pcol)));
+            k.extend_from_slice(&encode_typed_key(
+                &parent.columns[pcol].ty,
+                value_for(pcol),
+                parent_colls[pcol].as_deref(),
+            )?);
         }
-        Some(FkProbe::Pk(k))
+        Ok(Some(FkProbe::Pk(k)))
     } else {
         let idx = parent
             .indexes
@@ -10079,12 +10198,16 @@ fn fk_probe(
         let mut prefix = Vec::new();
         for &pcol in &idx.columns {
             prefix.push(0x00);
-            prefix.extend_from_slice(&encode_typed_key(&parent.columns[pcol].ty, value_for(pcol)));
+            prefix.extend_from_slice(&encode_typed_key(
+                &parent.columns[pcol].ty,
+                value_for(pcol),
+                parent_colls[pcol].as_deref(),
+            )?);
         }
-        Some(FkProbe::Unique {
+        Ok(Some(FkProbe::Unique {
             index: idx.name.to_ascii_lowercase(),
             prefix,
-        })
+        }))
     }
 }
 
@@ -17279,13 +17402,14 @@ fn resolve_arbiter(tdef: &Table, target: Option<&ConflictTarget>) -> Result<Opti
 fn arbiter_key(
     arb: &Arbiter,
     pk: &[(usize, Type)],
+    colls: &[Option<std::sync::Arc<Collation>>],
     columns: &[Column],
     indexes: &[IndexDef],
     row: &Row,
-) -> Option<Vec<u8>> {
+) -> Result<Option<Vec<u8>>> {
     match arb {
-        Arbiter::PrimaryKey => Some(encode_pk_key(pk, row)),
-        Arbiter::Index(i) => index_prefix_key(columns, &indexes[*i], row),
+        Arbiter::PrimaryKey => Ok(Some(encode_pk_key(pk, colls, row)?)),
+        Arbiter::Index(i) => index_prefix_key(columns, colls, &indexes[*i], row),
     }
 }
 

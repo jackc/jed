@@ -846,6 +846,23 @@ fn collation_table_db() -> Database {
     db
 }
 
+/// A collated text PRIMARY KEY + a collated secondary index (slice 1e, encoding.md §2.12): both keys
+/// store the dev-root UCA sort key, so the B-tree iterates in collation order. The dev-root snapshot
+/// is baked (not the default). Must match the Ruby reference's COLLATION_PK_TABLE.
+fn collation_pk_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    db.import_collation(dev_root_collation()).unwrap();
+    run(
+        &mut db,
+        "CREATE TABLE t (name text COLLATE \"dev-root\" PRIMARY KEY, tag text COLLATE \"dev-root\")",
+    );
+    run(&mut db, "CREATE INDEX t_tag_idx ON t (tag)");
+    // Inserted out of collation order; stored in collation order ('a' < 'z' by the sort key).
+    run(&mut db, "INSERT INTO t VALUES ('z', 'a')");
+    run(&mut db, "INSERT INTO t VALUES ('a', 'b')");
+    db
+}
+
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
@@ -895,6 +912,7 @@ fn write_matches_goldens() {
             composite_array_field_table_db,
         ),
         ("collation_table.jed", collation_table_db),
+        ("collation_pk_table.jed", collation_pk_table_db),
         ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
@@ -950,6 +968,7 @@ fn read_goldens_reproduces_rows() {
             "t",
         ),
         ("collation_table.jed", collation_table_db, "t"),
+        ("collation_pk_table.jed", collation_pk_table_db, "t"),
         ("serial_table.jed", serial_table_db, "t"),
         ("identity_table.jed", identity_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),
