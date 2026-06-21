@@ -1225,6 +1225,16 @@ export class Database {
     return this.session.tx!.working;
   }
 
+  // columnCollations resolves each column's frozen collation (Column.collation, the name) to its
+  // baked table, indexed by column ordinal — null for a C / non-text column (the fast path). The key
+  // encoders (§2.12) consult colls[ci] to pick a text column's key form.
+  private columnCollations(columns: Column[]): (Collation | null)[] {
+    const snap = this.readSnap();
+    return columns.map((c) =>
+      c.collation !== null ? (snap.collation(c.collation) ?? null) : null,
+    );
+  }
+
   // seqNextval is nextval('name') (spec/design/sequences.md §4): advance the named sequence and
   // return the new value. The running state lives in pendingSeq, seeded from the working snapshot on
   // first touch this statement, and is flushed into the working snapshot + sessionSeq on statement
@@ -2826,9 +2836,12 @@ export class Database {
     target: Uint8Array,
     exclude: Set<string>,
   ): boolean {
+    // target is in the parent's stored-key byte space, so the child probe encodes a collated parent
+    // key column with the PARENT's collation (§2.12).
+    const parentColls = this.columnCollations(parent.columns);
     for (const e of this.readSnap().store(childTable).entriesInKeyOrder()) {
       if (exclude.has(e.key.join(","))) continue;
-      const probe = fkProbe(fk, parent, e.row, fk.columns);
+      const probe = fkProbe(fk, parent, parentColls, e.row, fk.columns);
       if (probe !== null && bytesEq(fkProbeBytes(probe), target)) return true;
     }
     return false;
@@ -2871,6 +2884,9 @@ export class Database {
     }
     const tableKey = table.name.toLowerCase();
     const columns = table.columns;
+    // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
+    // C-only / non-text table (the fast path).
+    const colls = this.columnCollations(columns);
     // Resolve the access method (spec/design/gin.md §3): undefined / "btree" is the ordered
     // B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
     // parser) so the error is the resolve-time undefined_object, after the table-exists check.
@@ -2989,7 +3005,7 @@ export class Database {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
       if (def.unique) {
-        const prefix = indexPrefixKey(columns, def, e.row);
+        const prefix = indexPrefixKey(columns, colls, def, e.row);
         if (prefix !== null) {
           const k = prefix.join(",");
           if (seenPrefixes.has(k)) {
@@ -3001,7 +3017,7 @@ export class Database {
           seenPrefixes.add(k);
         }
       }
-      entries.push(...indexEntryKeys(columns, def, e.key, e.row));
+      entries.push(...indexEntryKeys(columns, colls, def, e.key, e.row));
     }
     meter.guard();
 
@@ -3379,7 +3395,8 @@ export class Database {
       if (qv.kind === "null") return { entries: [], pages: 0, slabs: 0 };
       if (qv.kind === "int" && !inRange(gb.elemType, qv.int))
         return { entries: [], pages: 0, slabs: 0 };
-      terms.push(encodeKeyValue(gb.elemType, qv));
+      // a GIN element is fixed-width (no text), so the term never collates.
+      terms.push(encodeKeyValue(gb.elemType, qv, null));
     } else {
       if (qv.kind !== "array") return { entries: [], pages: 0, slabs: 0 }; // NULL/non-array → provably empty
       const seen = new Set<string>();
@@ -3388,7 +3405,7 @@ export class Database {
           hasNull = true; // a NULL element carries no term
           continue;
         }
-        const t = encodeKeyValue(gb.elemType, el);
+        const t = encodeKeyValue(gb.elemType, el, null);
         const k = byteKey(t);
         if (!seen.has(k)) {
           seen.add(k);
@@ -3813,6 +3830,9 @@ export class Database {
     // The columns' resolved ColTypes (a scalar, or a composite resolved to its field tree), for
     // composite-aware store coercion (spec/design/composite.md §4).
     const colTypes = store.columnTypes();
+    // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
+    // C-only / non-text table (the fast path).
+    const colls = this.columnCollations(table.columns);
     const prepared: { key: Uint8Array | null; row: Row }[] = [];
     const seenKeys = new Set<string>();
     // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
@@ -3866,7 +3886,7 @@ export class Database {
       if (pk.length > 0) {
         // The composite key is the concatenation of the members' bare encodings in key order
         // (encoding.md §2.3 — encodePkKey); a single-column key is the one-member case.
-        key = encodePkKey(table, pk, row);
+        key = encodePkKey(table, pk, colls, row);
         // The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
         // `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
         const seen = key.join(",");
@@ -3887,7 +3907,7 @@ export class Database {
       // PK duplicate check (cost.md §3).
       for (let u = 0; u < uniqDefs.length; u++) {
         const def = uniqDefs[u]!;
-        const prefix = indexPrefixKey(table.columns, def, row);
+        const prefix = indexPrefixKey(table.columns, colls, def, row);
         if (prefix === null) continue;
         const istore = this.readSnap().indexStore(def.name.toLowerCase());
         const stored = istore.rangeEntries(uniqueProbeBound(prefix));
@@ -3919,17 +3939,20 @@ export class Database {
       // table — §6.10), so a consistent catalog always finds it.
       const parent = this.table(fk.refTable);
       if (parent === undefined) continue;
+      // The probe matches the parent's stored key, so a collated parent key column uses the
+      // PARENT's collation (§2.12).
+      const parentColls = this.columnCollations(parent.columns);
       // Only a self-reference can satisfy against this statement's batch (a different parent table
       // is unchanged by this INSERT). Collect the parent keys the batch supplies.
       const batch = new Set<string>();
       if (fk.refTable.toLowerCase() === relation.toLowerCase()) {
         for (const pr of prepared) {
-          const p = fkProbe(fk, parent, pr.row, fk.refColumns);
+          const p = fkProbe(fk, parent, parentColls, pr.row, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
         }
       }
       for (const pr of prepared) {
-        const probe = fkProbe(fk, parent, pr.row, fk.columns);
+        const probe = fkProbe(fk, parent, parentColls, pr.row, fk.columns);
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         if (!this.fkProbeHits(probe, fk.refTable)) {
@@ -3973,7 +3996,7 @@ export class Database {
       const key = pr.key ?? encodeInt("i64", store.allocRowid());
       for (let k = 0; k < table.indexes.length; k++) {
         indexInserts[k]!.push(
-          ...indexEntryKeys(table.columns, table.indexes[k]!, key, pr.row),
+          ...indexEntryKeys(table.columns, colls, table.indexes[k]!, key, pr.row),
         );
       }
       if (!store.insert(key, pr.row)) {
@@ -4120,13 +4143,17 @@ export class Database {
     store: TableStore,
     table: Table,
     pk: number[],
+    colls: (Collation | null)[],
     row: Row,
   ): boolean {
-    if (pk.length > 0 && store.get(encodePkKey(table, pk, row)) !== undefined)
+    if (
+      pk.length > 0 &&
+      store.get(encodePkKey(table, pk, colls, row)) !== undefined
+    )
       return true;
     for (const def of table.indexes) {
       if (!def.unique) continue;
-      const prefix = indexPrefixKey(table.columns, def, row);
+      const prefix = indexPrefixKey(table.columns, colls, def, row);
       if (prefix === null) continue;
       if (
         this.readSnap()
@@ -4238,6 +4265,9 @@ export class Database {
     const n = table.columns.length;
     const relation = table.name;
     const colTypes = store.columnTypes();
+    // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
+    // C-only / non-text table (the fast path).
+    const colls = this.columnCollations(table.columns);
     // The unique-index positions in table.indexes (no-target skip test + end-state pass).
     const uniqIdx: number[] = [];
     for (let i = 0; i < table.indexes.length; i++)
@@ -4289,14 +4319,21 @@ export class Database {
       if (plan.arb === null) {
         // No-target DO NOTHING: skip on ANY uniqueness conflict (committed OR an earlier planned
         // insert); else insert (upsert.md §2/§3).
-        const pkk = pk.length > 0 ? encodePkKey(table, pk, row) : null;
-        let conflictHit = this.rowConflictsCommitted(store, table, pk, row);
+        const pkk = pk.length > 0 ? encodePkKey(table, pk, colls, row) : null;
+        let conflictHit = this.rowConflictsCommitted(
+          store,
+          table,
+          pk,
+          colls,
+          row,
+        );
         if (!conflictHit && pkk !== null && insPk.has(pkk.join(",")))
           conflictHit = true;
         if (!conflictHit) {
           for (let u = 0; u < uniqIdx.length; u++) {
             const prefix = indexPrefixKey(
               table.columns,
+              colls,
               table.indexes[uniqIdx[u]!]!,
               row,
             );
@@ -4311,6 +4348,7 @@ export class Database {
         for (let u = 0; u < uniqIdx.length; u++) {
           const prefix = indexPrefixKey(
             table.columns,
+            colls,
             table.indexes[uniqIdx[u]!]!,
             row,
           );
@@ -4321,7 +4359,7 @@ export class Database {
       }
 
       // Arbiter present (DO UPDATE always; DO NOTHING with a target).
-      const ak = arbiterKey(plan.arb, table, pk, row);
+      const ak = arbiterKey(plan.arb, table, pk, colls, row);
       if (ak === null) {
         // A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
         inserts.push(row);
@@ -4383,7 +4421,7 @@ export class Database {
     if (pk.length > 0 && inserts.length > 0) {
       const seen = new Set<string>();
       for (const row of inserts) {
-        const k = encodePkKey(table, pk, row);
+        const k = encodePkKey(table, pk, colls, row);
         const ks = k.join(",");
         if (store.get(k) !== undefined || seen.has(ks)) {
           throw engineError(
@@ -4407,7 +4445,7 @@ export class Database {
         const istore = this.readSnap().indexStore(def.name.toLowerCase());
         const batch = new Set<string>();
         for (const newRow of newRows) {
-          const prefix = indexPrefixKey(table.columns, def, newRow);
+          const prefix = indexPrefixKey(table.columns, colls, def, newRow);
           if (prefix === null) continue;
           const k = prefix.join(",");
           const conflict =
@@ -4438,15 +4476,18 @@ export class Database {
     for (const fk of fks) {
       const parent = this.table(fk.refTable);
       if (parent === undefined) continue;
+      // The probe matches the parent's stored key, so a collated parent key column uses the
+      // PARENT's collation (§2.12).
+      const parentColls = this.columnCollations(parent.columns);
       const checkUpdates = fk.columns.some((c) => assigned.has(c));
       const batch = new Set<string>();
       if (fk.refTable.toLowerCase() === relation.toLowerCase()) {
         for (const row of inserts) {
-          const p = fkProbe(fk, parent, row, fk.refColumns);
+          const p = fkProbe(fk, parent, parentColls, row, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
         }
         for (const u of updates) {
-          const p = fkProbe(fk, parent, u.newRow, fk.refColumns);
+          const p = fkProbe(fk, parent, parentColls, u.newRow, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
         }
       }
@@ -4454,7 +4495,7 @@ export class Database {
         checkUpdates ? updates.map((u) => u.newRow) : [],
       );
       for (const row of toCheck) {
-        const probe = fkProbe(fk, parent, row, fk.columns);
+        const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         if (!this.fkProbeHits(probe, fk.refTable)) {
@@ -4476,15 +4517,16 @@ export class Database {
       const parent = this.table(relation)!;
       const updatedKeys = new Set<string>(updates.map((u) => u.key.join(",")));
       for (const { childTable, fk } of referencers) {
+        // parent is the insert target itself, so its key columns use colls (§2.12).
         const newPresent = new Set<string>();
         for (const u of updates) {
-          const p = fkProbe(fk, parent, u.newRow, fk.refColumns);
+          const p = fkProbe(fk, parent, colls, u.newRow, fk.refColumns);
           if (p !== null) newPresent.add(fkProbeBytes(p).join(","));
         }
         for (const u of updates) {
-          const oldProbe = fkProbe(fk, parent, u.oldRow, fk.refColumns);
+          const oldProbe = fkProbe(fk, parent, colls, u.oldRow, fk.refColumns);
           if (oldProbe === null) continue;
-          const newProbe = fkProbe(fk, parent, u.newRow, fk.refColumns);
+          const newProbe = fkProbe(fk, parent, colls, u.newRow, fk.refColumns);
           if (
             newProbe !== null &&
             bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))
@@ -4519,7 +4561,7 @@ export class Database {
     let cunits = 0n;
     const placeholder = new Uint8Array(8);
     for (const row of inserts) {
-      const kb = pk.length > 0 ? encodePkKey(table, pk, row) : placeholder;
+      const kb = pk.length > 0 ? encodePkKey(table, pk, colls, row) : placeholder;
       cunits += BigInt(store.writeCompressUnits(kb, row));
     }
     for (const u of updates)
@@ -4553,11 +4595,11 @@ export class Database {
     for (const row of inserts) {
       const key =
         pk.length > 0
-          ? encodePkKey(table, pk, row)
+          ? encodePkKey(table, pk, colls, row)
           : encodeInt("i64", store.allocRowid());
       for (let k = 0; k < table.indexes.length; k++) {
         indexAdds[k]!.push(
-          ...indexEntryKeys(table.columns, table.indexes[k]!, key, row),
+          ...indexEntryKeys(table.columns, colls, table.indexes[k]!, key, row),
         );
       }
       if (!store.insert(key, row))
@@ -4568,8 +4610,8 @@ export class Database {
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
         const def = table.indexes[k]!;
-        const oldEks = indexEntryKeys(table.columns, def, u.key, u.oldRow);
-        const newEks = indexEntryKeys(table.columns, def, u.key, u.newRow);
+        const oldEks = indexEntryKeys(table.columns, colls, def, u.key, u.oldRow);
+        const newEks = indexEntryKeys(table.columns, colls, def, u.key, u.newRow);
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0)
@@ -4666,6 +4708,9 @@ export class Database {
         "table does not exist: " + del.table,
       );
     }
+    // Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
+    // parent-side probe (parent is this table) and the index-entry path.
+    const colls = this.columnCollations(table.columns);
     // DELETE is single-table; resolve its WHERE against a one-relation scope. The RETURNING
     // projection resolves after it (PostgreSQL's analysis order), against the same scope
     // (grammar.md §32).
@@ -4805,7 +4850,8 @@ export class Database {
             ? deletedKeys
             : empty;
         for (const m of matched) {
-          const probe = fkProbe(fk, parent, m.row, fk.refColumns);
+          // parent is the delete target itself, so its key columns use colls (§2.12).
+          const probe = fkProbe(fk, parent, colls, m.row, fk.refColumns);
           if (probe === null) continue; // a NULL referenced value cannot be referenced (MATCH SIMPLE)
           if (
             this.fkChildReferences(
@@ -4849,7 +4895,7 @@ export class Database {
     for (const def of table.indexes) {
       const istore = this.working().indexStore(def.name.toLowerCase());
       for (const m of matched) {
-        for (const ek of indexEntryKeys(table.columns, def, m.key, m.row))
+        for (const ek of indexEntryKeys(table.columns, colls, def, m.key, m.row))
           istore.remove(ek);
       }
     }
@@ -4875,6 +4921,9 @@ export class Database {
         "table does not exist: " + upd.table,
       );
     }
+    // Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
+    // probe and the index-entry move path.
+    const colls = this.columnCollations(table.columns);
 
     // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
     // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
@@ -5125,7 +5174,7 @@ export class Database {
         const istore = this.readSnap().indexStore(def.name.toLowerCase());
         const batch = new Set<string>();
         for (const u of updates) {
-          const prefix = indexPrefixKey(table.columns, def, u.row);
+          const prefix = indexPrefixKey(table.columns, colls, def, u.row);
           if (prefix === null) continue;
           const k = prefix.join(",");
           const conflict =
@@ -5158,15 +5207,18 @@ export class Database {
       if (!fk.columns.some((c) => assigned.has(c))) continue; // this FK's local columns were not assigned
       const parent = this.table(fk.refTable);
       if (parent === undefined) continue;
+      // The probe matches the parent's stored key, so a collated parent key column uses the
+      // PARENT's collation (§2.12).
+      const parentColls = this.columnCollations(parent.columns);
       const batch = new Set<string>();
       if (fk.refTable.toLowerCase() === relation.toLowerCase()) {
         for (const u of updates) {
-          const p = fkProbe(fk, parent, u.row, fk.refColumns);
+          const p = fkProbe(fk, parent, parentColls, u.row, fk.refColumns);
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
         }
       }
       for (const u of updates) {
-        const probe = fkProbe(fk, parent, u.row, fk.columns);
+        const probe = fkProbe(fk, parent, parentColls, u.row, fk.columns);
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
         if (batch.has(fkProbeBytes(probe).join(","))) continue;
         if (!this.fkProbeHits(probe, fk.refTable)) {
@@ -5195,9 +5247,10 @@ export class Database {
       const empty = new Set<string>();
       for (const { childTable, fk } of updReferencers) {
         // The referenced tuples the updated rows now supply (so a swap re-supplies one).
+        // parent is the update target itself, so its key columns use colls (§2.12).
         const newPresent = new Set<string>();
         for (const u of updates) {
-          const p = fkProbe(fk, parent, u.row, fk.refColumns);
+          const p = fkProbe(fk, parent, colls, u.row, fk.refColumns);
           if (p !== null) newPresent.add(fkProbeBytes(p).join(","));
         }
         const exclude =
@@ -5205,10 +5258,10 @@ export class Database {
             ? updatedKeys
             : empty;
         for (const u of updates) {
-          const oldProbe = fkProbe(fk, parent, u.oldRow, fk.refColumns);
+          const oldProbe = fkProbe(fk, parent, colls, u.oldRow, fk.refColumns);
           if (oldProbe === null) continue; // a NULL old referenced value was referenced by nothing
           // Unchanged tuples (incl. a NULL → already skipped) do not disappear.
-          const newProbe = fkProbe(fk, parent, u.row, fk.refColumns);
+          const newProbe = fkProbe(fk, parent, colls, u.row, fk.refColumns);
           if (
             newProbe !== null &&
             bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))
@@ -5276,8 +5329,8 @@ export class Database {
         // The row's old and new entry SETS (one entry for an ordered index, one per term for GIN —
         // gin.md §5). Remove old−new, insert new−old: a shared entry is left untouched, keeping the
         // copy-on-write dirty set byte-identical across cores.
-        const oldEks = indexEntryKeys(table.columns, def, u.key, u.oldRow);
-        const newEks = indexEntryKeys(table.columns, def, u.key, u.row);
+        const oldEks = indexEntryKeys(table.columns, colls, def, u.key, u.oldRow);
+        const newEks = indexEntryKeys(table.columns, colls, def, u.key, u.row);
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0) {
@@ -7330,6 +7383,7 @@ function rexprIsConstant(e: RExpr): boolean {
 // fixed-width and never spill, so the values are always resident (never unfetched).
 function indexEntryKey(
   columns: Column[],
+  colls: (Collation | null)[],
   def: IndexDef,
   storageKey: Uint8Array,
   row: Row,
@@ -7359,10 +7413,8 @@ function indexEntryKey(
         encodeInt(typeScalar(columns[ci]!.type), v.days),
       );
     } else if (v.kind === "text") {
-      parts.push(
-        Uint8Array.of(0x00),
-        encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)),
-      );
+      // text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
+      parts.push(Uint8Array.of(0x00), collatedTextKey(colls[ci]!, v.text));
     } else if (v.kind === "bytea") {
       parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
     } else if (v.kind === "decimal") {
@@ -7371,7 +7423,10 @@ function indexEntryKey(
       parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
     } else if (v.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11)
-      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v));
+      parts.push(
+        Uint8Array.of(0x00),
+        encodeTypedKey(columns[ci]!.type, v, null),
+      );
     } else {
       throw new Error(
         "an index column is a key-encodable type (CREATE INDEX gate)",
@@ -7395,12 +7450,13 @@ function indexEntryKey(
 // uniformly as "a row maps to a set of entries."
 function indexEntryKeys(
   columns: Column[],
+  colls: (Collation | null)[],
   def: IndexDef,
   storageKey: Uint8Array,
   row: Row,
 ): Uint8Array[] {
   if (def.kind === "gin") return ginEntries(columns, def, storageKey, row);
-  return [indexEntryKey(columns, def, storageKey, row)];
+  return [indexEntryKey(columns, colls, def, storageKey, row)];
 }
 
 // ginEntries builds a GIN index's entry keys for one row (spec/design/gin.md §4): one entry per
@@ -7445,7 +7501,8 @@ function ginEntries(
   const terms: Uint8Array[] = [];
   for (const el of v.elements) {
     if (el.kind === "null") continue; // a NULL element carries no term; a non-keyable element is impossible
-    const term = encodeKeyValue(elemTy, el);
+    // a GIN element is fixed-width (isGinElementType excludes text), so it never collates.
+    const term = encodeKeyValue(elemTy, el, null);
     const k = byteKey(term);
     if (!seen.has(k)) {
       seen.add(k);
@@ -7528,7 +7585,12 @@ function bytesDiff(a: Uint8Array[], b: Uint8Array[]): Uint8Array[] {
 // so the concatenation is self-delimiting and byte comparison equals the tuple's logical order.
 // Shared by the INSERT duplicate check and the ON CONFLICT arbiter probe (upsert.md §3); a PK
 // column is NOT NULL, so there is no presence tag.
-function encodePkKey(table: Table, pk: number[], row: Row): Uint8Array {
+function encodePkKey(
+  table: Table,
+  pk: number[],
+  colls: (Collation | null)[],
+  row: Row,
+): Uint8Array {
   const parts: Uint8Array[] = [];
   for (const i of pk) {
     const pkv = row[i]!; // non-null: a PK member is NOT NULL
@@ -7543,7 +7605,8 @@ function encodePkKey(table: Table, pk: number[], row: Row): Uint8Array {
     } else if (pkv.kind === "date") {
       parts.push(encodeInt(typeScalar(table.columns[i]!.type), pkv.days));
     } else if (pkv.kind === "text") {
-      parts.push(encodeTerminated(SQL_BYTE_ENCODER.encode(pkv.text)));
+      // text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
+      parts.push(collatedTextKey(colls[i]!, pkv.text));
     } else if (pkv.kind === "bytea") {
       parts.push(encodeTerminated(pkv.bytes));
     } else if (pkv.kind === "decimal") {
@@ -7552,7 +7615,7 @@ function encodePkKey(table: Table, pk: number[], row: Row): Uint8Array {
       parts.push(intervalEncodeKey(pkv.iv));
     } else if (pkv.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11, the first container key)
-      parts.push(encodeTypedKey(table.columns[i]!.type, pkv));
+      parts.push(encodeTypedKey(table.columns[i]!.type, pkv, null));
     } else {
       throw engineError(
         "data_corrupted",
@@ -7642,10 +7705,16 @@ function arbiterKey(
   arb: Arbiter,
   table: Table,
   pk: number[],
+  colls: (Collation | null)[],
   row: Row,
 ): Uint8Array | null {
-  if (arb.isPK) return encodePkKey(table, pk, row);
-  return indexPrefixKey(table.columns, table.indexes[arb.indexPos]!, row);
+  if (arb.isPK) return encodePkKey(table, pk, colls, row);
+  return indexPrefixKey(
+    table.columns,
+    colls,
+    table.indexes[arb.indexPos]!,
+    row,
+  );
 }
 
 // indexPrefixKey builds a row's UNIQUENESS PROBE KEY for one unique index
@@ -7654,6 +7723,7 @@ function arbiterKey(
 // conflicts). Two rows conflict iff they yield the same non-null prefix.
 function indexPrefixKey(
   columns: Column[],
+  colls: (Collation | null)[],
   def: IndexDef,
   row: Row,
 ): Uint8Array | null {
@@ -7682,10 +7752,8 @@ function indexPrefixKey(
         encodeInt(typeScalar(columns[ci]!.type), v.days),
       );
     } else if (v.kind === "text") {
-      parts.push(
-        Uint8Array.of(0x00),
-        encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)),
-      );
+      // text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
+      parts.push(Uint8Array.of(0x00), collatedTextKey(colls[ci]!, v.text));
     } else if (v.kind === "bytea") {
       parts.push(Uint8Array.of(0x00), encodeTerminated(v.bytes));
     } else if (v.kind === "decimal") {
@@ -7694,7 +7762,10 @@ function indexPrefixKey(
       parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
     } else if (v.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11)
-      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v));
+      parts.push(
+        Uint8Array.of(0x00),
+        encodeTypedKey(columns[ci]!.type, v, null),
+      );
     } else {
       throw new Error(
         "an index column is a key-encodable type (CREATE INDEX gate)",
@@ -7726,15 +7797,28 @@ function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
 // encodeKeyValue is the order-preserving key bytes for one keyable value (encoding.md §2),
 // matching the PK / index encoders. `value` is non-NULL and of a keyable type (a foreign-key
 // column always is — its type equals a PK/UNIQUE parent column, CREATE TABLE §6.2).
-function encodeKeyValue(ty: ScalarType, value: Value): Uint8Array {
+// collatedTextKey is the order-preserving key body for a text value (encoding.md §2.12): the
+// collation's UCA sort key when coll is non-null (a non-C collated column), else the C
+// text-terminated-escape body (§2.4). The sort key throws (0A000) on a code point the collation does
+// not map — propagated, so a collated INSERT of an unmapped string aborts the write.
+function collatedTextKey(coll: Collation | null, s: string): Uint8Array {
+  return coll !== null
+    ? collationSortKey(coll, s)
+    : encodeTerminated(SQL_BYTE_ENCODER.encode(s));
+}
+
+function encodeKeyValue(
+  ty: ScalarType,
+  value: Value,
+  coll: Collation | null,
+): Uint8Array {
   if (value.kind === "int") return encodeInt(ty, value.int);
   if (value.kind === "bool") return encodeBool(value.value);
   if (value.kind === "uuid") return value.bytes.slice();
   if (value.kind === "timestamp" || value.kind === "timestamptz")
     return encodeInt(ty, value.micros);
   if (value.kind === "date") return encodeInt(ty, value.days);
-  if (value.kind === "text")
-    return encodeTerminated(SQL_BYTE_ENCODER.encode(value.text));
+  if (value.kind === "text") return collatedTextKey(coll, value.text);
   if (value.kind === "bytea") return encodeTerminated(value.bytes);
   if (value.kind === "decimal") return value.dec.encodeKey();
   if (value.kind === "interval") return intervalEncodeKey(value.iv);
@@ -7748,15 +7832,20 @@ function encodeKeyValue(ty: ScalarType, value: Value): Uint8Array {
 // recurses into the range-bounds container codec (encoding.md §2.11), pulling its element scalar from
 // the column type; every other keyable value ignores the wrapper and dispatches on its scalar via
 // encodeKeyValue. value is non-NULL (callers handle the NULL slot tag), and a range column always
-// holds a range value, so the scalar arm never sees a range type.
-function encodeTypedKey(ty: Type, value: Value): Uint8Array {
+// holds a range value, so the scalar arm never sees a range type. coll selects a text column's key
+// form (§2.12); it never applies to a range element (no range subtype is text).
+function encodeTypedKey(
+  ty: Type,
+  value: Value,
+  coll: Collation | null,
+): Uint8Array {
   if (value.kind === "range") {
     if (ty.kind !== "range") {
       throw new Error("a range key value has a range column type");
     }
     return encodeRangeKey(typeScalar(ty.elem), value);
   }
-  return encodeKeyValue(typeScalar(ty), value);
+  return encodeKeyValue(typeScalar(ty), value, coll);
 }
 
 // FkProbe is a built foreign-key probe (spec/design/constraints.md §6.4/§6.8): the bytes to look
@@ -7784,6 +7873,7 @@ function fkProbeBytes(p: FkProbe): Uint8Array {
 function fkProbe(
   fk: ForeignKey,
   parent: Table,
+  parentColls: (Collation | null)[],
   row: Row,
   ordinals: number[],
 ): FkProbe | null {
@@ -7796,12 +7886,16 @@ function fkProbe(
     const i = fk.refColumns.indexOf(pcol);
     return row[ordinals[i]!]!;
   };
+  // The probe must match the PARENT's stored key, so a collated parent key column uses the PARENT's
+  // collation (encoding.md §2.12), independent of the child column's own collation.
   const refSet = sortedUnique(fk.refColumns);
   const pkSet = sortedUnique(parent.pk);
   if (parent.pk.length > 0 && sameSet(pkSet, refSet)) {
     const parts: Uint8Array[] = [];
     for (const pcol of parent.pk) {
-      parts.push(encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol)));
+      parts.push(
+        encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!),
+      );
     }
     return { kind: "pk", bytes: concatBytes(parts) };
   }
@@ -7811,7 +7905,9 @@ function fkProbe(
   const parts: Uint8Array[] = [];
   for (const pcol of idx.columns) {
     parts.push(Uint8Array.of(0x00));
-    parts.push(encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol)));
+    parts.push(
+      encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!),
+    );
   }
   return {
     kind: "unique",

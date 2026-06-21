@@ -183,3 +183,36 @@ test("baked file round trip (format_version 17, entry_kind 3)", () => {
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// slice 1e — a collated text PRIMARY KEY's storage key is the UCA sort key (encoding.md §2.12), so
+// the B-tree physically iterates in COLLATION order. A no-ORDER-BY single-table scan returns jed's
+// stored (key) order, so this asserts the *key* is collated (distinct from the in-memory ORDER BY
+// sorter 1c had). dev-root: a < A < b < Z; C bytes: A < Z < a < b.
+test("collated primary key stored in collation order", () => {
+  const db = new Database();
+  db.importCollation(devRoot());
+  exec(db, `CREATE TABLE t (name text COLLATE "dev-root" PRIMARY KEY)`);
+  exec(db, `INSERT INTO t VALUES ('Z'),('a'),('b'),('A')`);
+  assert.deepEqual(query(db, `SELECT name FROM t`), [["a"], ["A"], ["b"], ["Z"]]);
+  exec(db, `CREATE TABLE c (name text PRIMARY KEY)`);
+  exec(db, `INSERT INTO c VALUES ('Z'),('a'),('b'),('A')`);
+  assert.deepEqual(query(db, `SELECT name FROM c`), [["A"], ["Z"], ["a"], ["b"]]);
+});
+
+// slice 1e — a collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A'
+// are DISTINCT, both admitted — collation.md §7), like a C unique key.
+test("collated secondary index and unique keys", () => {
+  const db = new Database();
+  db.importCollation(devRoot());
+  exec(
+    db,
+    `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root" UNIQUE)`,
+  );
+  exec(db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`);
+  assert.equal(errCode(() => exec(db, `INSERT INTO t VALUES (4,'a')`)), "23505");
+  assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name`), [
+    ["a"],
+    ["A"],
+    ["b"],
+  ]);
+});
