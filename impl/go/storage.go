@@ -354,3 +354,7 @@ func (s *TableStore) setTree(root *pnode, length int) { s.rows = fromLoaded(root
 
 // Len returns the row count.
 func (s *TableStore) Len() int { return s.rows.Len() }
+
+// storedBytes is the total on-disk record bytes this store holds — the deterministic,
+// cross-core-identical footprint measure the temp-table budget sums (spec/design/temp-tables.md §7).
+func (s *TableStore) storedBytes() uint64 { return s.rows.residentRecordBytes() }

@@ -62,6 +62,14 @@ const DefaultPageSize uint32 = 8192
 // SetMaxSQLLength. Identical across cores (§8).
 const DefaultMaxSQLLength = 1 << 20
 
+// DefaultTempBuffers is the default per-session storage budget for SESSION-LOCAL temporary tables, in
+// BYTES (spec/design/temp-tables.md §7). Temp tables RETAIN bytes across statements, which neither the
+// per-statement cost ceiling (maxCost) nor the cumulative budget (lifetimeMaxCost) bounds, so
+// tempBuffers is the §13 gate that does: the instant a session's resident temp storage (byte-identical
+// on-disk record bytes) would exceed it, the write aborts 54P03. 0 ⇒ unlimited (a trusted handle).
+// Identical across cores (§8); the abort point is part of the cross-core contract.
+const DefaultTempBuffers = 32 << 20
+
 // maxCompositeDepth is the maximum composite-type nesting depth (CLAUDE.md §13; spec/design/cost.md
 // §7b). A composite type's depth is the length of its deepest chain of nested composites, counting
 // itself: a row of scalars is depth 1, `CREATE TYPE b AS (x a)` is `1 + depth(a)`, and an array
@@ -495,6 +503,27 @@ func (s *Snapshot) removeTable(key string) {
 // the lowercased index name.
 func (s *Snapshot) indexStore(nameKey string) *TableStore { return s.indexStores[nameKey] }
 
+// hasIndexStore reports whether this snapshot holds a store for the named index (lowercased key).
+// Used to route index access to the session temp snapshot vs the main snapshot (temp-tables.md §2).
+func (s *Snapshot) hasIndexStore(nameKey string) bool {
+	_, ok := s.indexStores[nameKey]
+	return ok
+}
+
+// storageBytes is the total on-disk record bytes of every table store + index store in this snapshot
+// — the temp budget's deterministic footprint measure (spec/design/temp-tables.md §7), summed over
+// the session temp snapshot. Iteration order does not matter (it is a sum).
+func (s *Snapshot) storageBytes() uint64 {
+	var total uint64
+	for _, st := range s.stores {
+		total += st.storedBytes()
+	}
+	for _, st := range s.indexStores {
+		total += st.storedBytes()
+	}
+	return total
+}
+
 // putIndex registers a new (empty) secondary index on tableKey: insert its definition
 // into the table's Indexes in ascending lowercased-name order (the catalog/planner order —
 // spec/design/indexes.md §6) and create its zero-column store. The Table struct is
@@ -634,9 +663,20 @@ type SessionOptions struct {
 	// unrestricted; PrivSetEmpty.With(PrivSelect) is a read-only session. A pointer so the zero
 	// SessionOptions stays permissive (the empty set is a meaningful, distinct value).
 	DefaultPrivileges *PrivilegeSet
-	// AllowDDL governs whether DDL (CREATE/DROP/ALTER) is permitted; a denied schema change is 42501
-	// (§5.3). nil ⇒ on (the default). A pointer so the zero SessionOptions allows DDL.
+	// AllowDDL governs whether PERSISTENT DDL (CREATE/DROP/ALTER of persistent relations) is permitted;
+	// a denied schema change is 42501 (§5.3). nil ⇒ on (the default). A pointer so the zero
+	// SessionOptions allows DDL. Its scope narrows with temporary tables (temp-tables.md §5): AllowTempDDL
+	// is the temp-scoped sibling gate.
 	AllowDDL *bool
+	// AllowTempDDL governs whether SESSION-LOCAL temporary-table DDL is permitted
+	// (spec/design/temp-tables.md §5); a denied temp DDL is 42501. nil ⇒ INHERIT AllowDDL's value
+	// (back-compat: a session left as-is behaves as before, one gate governing all DDL). The
+	// untrusted-scratch pattern is AllowDDL=false + AllowTempDDL=&true — private scratch tables only.
+	AllowTempDDL *bool
+	// TempBuffers is the per-session storage budget for session-local temp tables, in BYTES
+	// (spec/design/temp-tables.md §7); 0 ⇒ unlimited; nil ⇒ the engine default (DefaultTempBuffers).
+	// Bounds the RETAINED temp storage neither cost ceiling covers — an over-budget temp write aborts 54P03.
+	TempBuffers *int
 }
 
 // TxStatus is the session transaction status (spec/design/session.md §2.2) — PostgreSQL's three
@@ -730,10 +770,25 @@ type Session struct {
 	// per-object privilege model the host configures and the engine enforces (42501) at name
 	// resolution. A fresh session is fully permissive (every table privilege, every function EXECUTE).
 	privileges Privileges
-	// allowDDL governs whether DDL (CREATE/DROP/ALTER) is permitted on this session (§5.3); a denied
-	// schema change is 42501. Default on — jed has no schema/owner model, so this single boolean gates
-	// all DDL (the per-object CREATE/ownership privilege is a deferred follow-on).
+	// allowDDL governs whether PERSISTENT DDL (CREATE/DROP/ALTER of persistent relations) is permitted
+	// on this session (§5.3); a denied schema change is 42501. Default on. Its scope narrows with
+	// temporary tables (temp-tables.md §5): allowTempDDL is the temp-scoped sibling gate.
 	allowDDL bool
+	// allowTempDDL governs whether session-local TEMPORARY-table DDL is permitted
+	// (spec/design/temp-tables.md §5); a denied temp DDL is 42501. Resolved at session creation from
+	// SessionOptions.AllowTempDDL (defaulting to allowDDL's value when unset).
+	allowTempDDL bool
+	// tempBuffers is the per-session temp-table storage budget in BYTES (temp-tables.md §7); 0 ⇒
+	// unlimited. An over-budget temp write aborts 54P03.
+	tempBuffers int
+	// tempCommitted is the session-local temporary-table catalog + stores (spec/design/temp-tables.md
+	// §2): a Snapshot holding only this session's temp tables, their stores, and their (UNIQUE) index
+	// stores. NEVER serialized — only Database.committed is written to the file, so a temp table makes
+	// ZERO file writes. Private to this Session (it carries across the additional-session swap and is
+	// invisible to other sessions), and dropped wholesale when the session is. Transactional like the
+	// main snapshot: an open transaction clones it into activeTx.tempWorking, which a successful COMMIT
+	// adopts back here and a ROLLBACK discards.
+	tempCommitted *Snapshot
 	// vars are the session variables (spec/design/session.md §6.1): PostgreSQL's GUC model scoped to
 	// the session — a string→string map (PG GUCs are all text) the host sets (SetVar/ResetVar) and SQL
 	// reads with current_setting. Custom (dotted) names only in v1. SESSION state, not snapshot state:
@@ -783,6 +838,8 @@ func newSessionWithOptions(opts SessionOptions) Session {
 		workMem:         opts.WorkMem,
 		privileges:      newPrivileges(),
 		allowDDL:        true,
+		tempBuffers:     DefaultTempBuffers,
+		tempCommitted:   newSnapshot(),
 		vars:            map[string]string{},
 	}
 	if opts.DefaultPrivileges != nil {
@@ -790,6 +847,15 @@ func newSessionWithOptions(opts SessionOptions) Session {
 	}
 	if opts.AllowDDL != nil {
 		s.allowDDL = *opts.AllowDDL
+	}
+	// Back-compat default-inheritance (temp-tables.md §5): an unset AllowTempDDL takes allowDDL's value
+	// (resolved above), so a session configured before temp tables existed behaves exactly as it did.
+	s.allowTempDDL = s.allowDDL
+	if opts.AllowTempDDL != nil {
+		s.allowTempDDL = *opts.AllowTempDDL
+	}
+	if opts.TempBuffers != nil {
+		s.tempBuffers = *opts.TempBuffers
 	}
 	return s
 }
@@ -810,6 +876,19 @@ type activeTx struct {
 	// failed/read-only COMMIT) restores these, while a successful COMMIT keeps the advanced state.
 	savedSessionSeq      map[string]int64
 	savedSessionLastName string
+	// tempWorking is the transaction's working copy of the session's temp-table snapshot
+	// (spec/design/temp-tables.md §5): cloned from Session.tempCommitted at tx open (cheap — persistent
+	// stores clone O(1)), mutated by temp DDL/DML, adopted back into tempCommitted on a successful COMMIT
+	// and discarded on ROLLBACK. The temp analogue of working, kept SEPARATE so it is never serialized.
+	tempWorking *Snapshot
+	// mainDirty is whether this transaction mutated the MAIN (persistent) snapshot — set by
+	// (*Database).workingMut. Drives the commit's persist decision so a transaction that touched ONLY
+	// temp tables makes zero file writes (temp-tables.md §2).
+	mainDirty bool
+	// tempDirty is whether this transaction mutated the TEMP snapshot — set by (*Database).tempWorkingMut.
+	// With mainDirty it decides whether COMMIT persists the main image (a temp-only commit skips it; an
+	// empty block still persists, preserving prior behavior).
+	tempDirty bool
 }
 
 // NewDatabase builds an empty in-memory database.
@@ -866,7 +945,75 @@ func collatedTextKey(coll *Collation, s string) ([]byte, error) {
 
 // working is the snapshot a write mutates — the open transaction's working. A write only ever runs
 // with a transaction open (autocommit opens one implicitly), so tx is non-nil here.
-func (db *Database) working() *Snapshot { return db.session.tx.working }
+func (db *Database) working() *Snapshot {
+	// Mark the main image dirty so the commit knows to persist it; a temp-only transaction never
+	// reaches here (it writes via the temp funnels) and so makes zero file writes (temp-tables.md §2).
+	db.session.tx.mainDirty = true
+	return db.session.tx.working
+}
+
+// tempSnap is the session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the open
+// transaction's tempWorking, else the session's committed temp state. The temp analogue of readSnap
+// (it does not consult readPin — a writable-CTE pins only the main snapshot).
+func (db *Database) tempSnap() *Snapshot {
+	if db.session.tx != nil {
+		return db.session.tx.tempWorking
+	}
+	return db.session.tempCommitted
+}
+
+// isTempTable reports whether name resolves to a SESSION-LOCAL temporary table in the visible temp
+// snapshot (spec/design/temp-tables.md §3). Preclude-overlaps guarantees a name is temp XOR
+// persistent, so this is the routing predicate the table/store funnels use.
+func (db *Database) isTempTable(name string) bool {
+	_, ok := db.tempSnap().table(name)
+	return ok
+}
+
+// lkpTable resolves a table by name, temp-first then the visible main snapshot (temp-tables.md §3).
+func (db *Database) lkpTable(name string) (*Table, bool) {
+	if t, ok := db.tempSnap().table(name); ok {
+		return t, true
+	}
+	return db.readSnap().table(name)
+}
+
+// lkpStore returns a table's store for READS, routing to the session temp snapshot for a temp table
+// (no dirty flag — reads never persist), else the visible main snapshot (temp-tables.md §2).
+func (db *Database) lkpStore(name string) *TableStore {
+	if db.isTempTable(name) {
+		return db.tempSnap().store(name)
+	}
+	return db.readSnap().store(name)
+}
+
+// writeStore returns a table's store for MUTATION, routing a temp table's write to tempWorking (and
+// flagging tempDirty) and a persistent write to working (which flags mainDirty) — so a temp-only
+// transaction leaves the main image untouched (temp-tables.md §2).
+func (db *Database) writeStore(name string) *TableStore {
+	if db.isTempTable(name) {
+		db.session.tx.tempDirty = true
+		return db.session.tx.tempWorking.store(name)
+	}
+	return db.working().store(name)
+}
+
+// lkpIndexStore returns a secondary index's store for READS, temp-first (temp-tables.md §8).
+func (db *Database) lkpIndexStore(nameKey string) *TableStore {
+	if db.tempSnap().hasIndexStore(nameKey) {
+		return db.tempSnap().indexStore(nameKey)
+	}
+	return db.readSnap().indexStore(nameKey)
+}
+
+// writeIndexStore returns a secondary index's store for MUTATION, temp-first (flagging the dirty bit).
+func (db *Database) writeIndexStore(nameKey string) *TableStore {
+	if db.tempSnap().hasIndexStore(nameKey) {
+		db.session.tx.tempDirty = true
+		return db.session.tx.tempWorking.indexStore(nameKey)
+	}
+	return db.working().indexStore(nameKey)
+}
 
 // InTransaction reports whether an explicit transaction block is currently open
 // (spec/design/transactions.md §4.2). False under autocommit. Used by the host Transaction surface.
@@ -942,6 +1089,9 @@ func (db *Database) Revoke(privs PrivilegeSet, object string) {
 func (db *Database) ResetPrivileges() {
 	db.session.privileges = newPrivileges()
 	db.session.allowDDL = true
+	// The temp-DDL gate is part of the authorization envelope (temp-tables.md §5); reset it with the
+	// rest so a # allow_temp_ddl: directive never leaks past its record. Default-inherits allowDDL=true.
+	db.session.allowTempDDL = true
 }
 
 // Privileges is read-only access to the default session's authorization envelope (§5.3).
@@ -953,6 +1103,20 @@ func (db *Database) SetAllowDDL(allow bool) { db.session.allowDDL = allow }
 
 // AllowDDL reports whether DDL is permitted on the default session.
 func (db *Database) AllowDDL() bool { return db.session.allowDDL }
+
+// SetAllowTempDDL sets whether session-local temporary-table DDL is permitted on the default session
+// (spec/design/temp-tables.md §5) — the temp-scoped split of AllowDDL; a denied temp DDL is 42501.
+func (db *Database) SetAllowTempDDL(allow bool) { db.session.allowTempDDL = allow }
+
+// AllowTempDDL reports whether session-local temporary-table DDL is permitted on the default session.
+func (db *Database) AllowTempDDL() bool { return db.session.allowTempDDL }
+
+// SetTempBuffers sets the default session's per-session temp-table storage budget in BYTES
+// (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
+func (db *Database) SetTempBuffers(bytes int) { db.session.tempBuffers = bytes }
+
+// TempBuffers reports the default session's per-session temp-table storage budget (0 ⇒ unlimited).
+func (db *Database) TempBuffers() int { return db.session.tempBuffers }
 
 // SetVar sets a session variable on the default session (spec/design/session.md §6.1). Custom
 // variables must be namespaced (a dotted name); a non-dotted name is 42704. Read it back in SQL with
@@ -1120,6 +1284,16 @@ func (s *Session) Privileges() *Privileges { return &s.privileges }
 // AllowDDL / SetAllowDDL — whether DDL is permitted on this session (§5.3); a denied change is 42501.
 func (s *Session) AllowDDL() bool         { return s.allowDDL }
 func (s *Session) SetAllowDDL(allow bool) { s.allowDDL = allow }
+
+// AllowTempDDL / SetAllowTempDDL — whether session-local temporary-table DDL is permitted on this
+// session (spec/design/temp-tables.md §5); a denied temp DDL is 42501.
+func (s *Session) AllowTempDDL() bool         { return s.allowTempDDL }
+func (s *Session) SetAllowTempDDL(allow bool) { s.allowTempDDL = allow }
+
+// TempBuffers / SetTempBuffers — the per-session temp-table storage budget in BYTES
+// (spec/design/temp-tables.md §7); 0 ⇒ unlimited. An over-budget temp write aborts 54P03.
+func (s *Session) TempBuffers() int         { return s.tempBuffers }
+func (s *Session) SetTempBuffers(bytes int) { s.tempBuffers = bytes }
 
 // SetVar sets a session variable (spec/design/session.md §6.1) — PostgreSQL's GUC model, scoped to
 // the session. Custom variables must be namespaced (a dotted name like myapp.tenant); a non-dotted
@@ -1346,6 +1520,12 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 		} else {
 			outcome, err = db.dispatchStmt(stmt, params)
 		}
+		// Enforce the temp-storage budget after a successful temp write (temp-tables.md §7): an
+		// over-budget statement becomes a 54P03 error, which aborts the block (the staged temp rows
+		// roll back at ROLLBACK). A no-op for non-temp statements.
+		if err == nil {
+			err = db.checkTempBudget()
+		}
 		if err != nil {
 			db.session.tx.failed = true
 			return Outcome{}, err
@@ -1372,6 +1552,11 @@ func (db *Database) ExecuteStmtParams(stmt Statement, params []Value) (Outcome, 
 	}
 	db.session.tx = db.newTx(true)
 	outcome, err := db.dispatchStmt(stmt, params)
+	// Enforce the temp-storage budget before committing (temp-tables.md §7): an over-budget temp write
+	// in this implicit transaction is discarded (rolling back the temp + main changes) and surfaces 54P03.
+	if err == nil {
+		err = db.checkTempBudget()
+	}
 	if err != nil {
 		// The statement failed before any flush, so session state is untouched; restore from the
 		// captured copy anyway to keep the discard path uniform (sequences.md §6).
@@ -1422,6 +1607,7 @@ func (db *Database) newTx(writable bool) *activeTx {
 	return &activeTx{
 		writable:             writable,
 		working:              db.committed.clone(),
+		tempWorking:          db.session.tempCommitted.clone(),
 		savedSessionSeq:      saved,
 		savedSessionLastName: db.session.sessionLastName,
 	}
@@ -1449,18 +1635,26 @@ func (db *Database) commitTx() (Outcome, error) {
 	db.session.tx = nil
 	if tx.failed || !tx.writable {
 		// A failed or read-only block publishes nothing — a failed COMMIT is a ROLLBACK (PG), so any
-		// in-block session updates revert with the discarded working set (§5/§6).
+		// in-block session updates revert with the discarded working set (§5/§6). The discarded
+		// tempWorking rolls back temp changes too (dropped with tx).
 		db.restoreSessionState(tx)
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 	}
 	working := tx.working
-	if db.path != "" {
-		working.txid = db.committed.txid + 1
+	// Persist the main image when it changed; a temp-only transaction skips it entirely so a temp
+	// table makes ZERO file writes (spec/design/temp-tables.md §2). An empty block (neither dirty)
+	// still persists, preserving prior behavior. Temp state is adopted regardless — never serialized,
+	// only swapped into the session's committed temp snapshot.
+	if tx.mainDirty || !tx.tempDirty {
+		if db.path != "" {
+			working.txid = db.committed.txid + 1
+		}
+		if err := db.persist(working); err != nil { // no-op for an in-memory database
+			return Outcome{}, err
+		}
+		db.committed = working
 	}
-	if err := db.persist(working); err != nil { // no-op for an in-memory database
-		return Outcome{}, err
-	}
-	db.committed = working
+	db.session.tempCommitted = tx.tempWorking
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
 
@@ -1898,6 +2092,10 @@ type privReq struct {
 	tables    []privTableReq
 	functions []string
 	isDDL     bool
+	// isTempDDL is whether the DDL targets a SESSION-LOCAL temporary table (CREATE TEMP TABLE) — gated
+	// by allowTempDDL instead of allowDDL (spec/design/temp-tables.md §5). (DROP of a temp table joins
+	// this by resolving the name in checkPrivileges; today DROP TABLE alone stays persistent-gated.)
+	isTempDDL bool
 }
 
 func (r *privReq) needTable(name string, p Privilege) {
@@ -1927,14 +2125,49 @@ func (db *Database) checkLifetimeAdmission() error {
 	return nil
 }
 
+// checkTempBudget enforces the per-session temp-table storage budget (tempBuffers, spec/design/
+// temp-tables.md §7) — the §13 gate on RETAINED temp bytes. Checked after each temp-writing statement:
+// if the session's temp footprint (byte-identical on-disk record bytes, summed over every temp table +
+// index) EXCEEDS the budget, abort 54P03. The over-budget write is in tempWorking, so the abort
+// discards it (autocommit) or fails the block (rolled back at ROLLBACK) — nothing commits. tempBuffers
+// 0 ⇒ unlimited; a transaction that did not touch temp cannot have grown it, so the check self-gates on
+// tempDirty and is a no-op for ordinary (persistent) statements. The WITHIN-statement bound is maxCost.
+func (db *Database) checkTempBudget() error {
+	limit := db.session.tempBuffers
+	if limit == 0 {
+		return nil
+	}
+	if db.session.tx == nil || !db.session.tx.tempDirty {
+		return nil
+	}
+	if used := db.tempSnap().storageBytes(); used > uint64(limit) {
+		return NewError(TempStorageLimitExceeded, fmt.Sprintf(
+			"temporary table storage exceeded the limit of %d bytes", limit,
+		))
+	}
+	return nil
+}
+
 func (db *Database) checkPrivileges(stmt Statement) error {
-	if db.session.allowDDL && db.session.privileges.IsPermissive() {
+	// Fast path: a session that allows ALL DDL (persistent + temp) and grants every privilege pays
+	// nothing. Both gates must be on, since temp DDL is now its own gate (temp-tables.md §5).
+	if db.session.allowDDL && db.session.allowTempDDL && db.session.privileges.IsPermissive() {
 		return nil
 	}
 	var req privReq
 	collectStmtPrivs(stmt, &req)
-	if req.isDDL && !db.session.allowDDL {
-		return NewError(InsufficientPrivilege, "permission denied: DDL is not permitted in this session")
+	if req.isDDL {
+		// Temp-table DDL is gated by allowTempDDL; all other DDL by allowDDL (temp-tables.md §5), so a
+		// host can grant bounded scratch tables to an untrusted session while withholding persistent
+		// schema changes. CREATE TEMP is known statically; a DROP of a temp table resolves the name.
+		tempDDL := req.isTempDDL || (stmt.DropTable != nil && db.isTempTable(stmt.DropTable.Name))
+		allowed := db.session.allowDDL
+		if tempDDL {
+			allowed = db.session.allowTempDDL
+		}
+		if !allowed {
+			return NewError(InsufficientPrivilege, "permission denied: DDL is not permitted in this session")
+		}
 	}
 	snap := db.readSnap()
 	for _, t := range req.tables {
@@ -1954,12 +2187,29 @@ func (db *Database) checkPrivileges(stmt Statement) error {
 	return nil
 }
 
+// typeUsesComposite reports whether a column type involves a composite type (directly, or as an array
+// element). A temp table with such a column is deferred this slice (spec/design/temp-tables.md §8)
+// because the session temp snapshot carries no composite-type catalog. Range elements are scalar-only.
+func typeUsesComposite(t Type) bool {
+	if t.Comp != nil {
+		return true
+	}
+	if t.Array != nil {
+		return typeUsesComposite(*t.Array)
+	}
+	return false
+}
+
 // collectStmtPrivs collects the privilege requirements of stmt (spec/design/session.md §5.3).
 // Transaction control carries none (handled before dispatch); DDL just sets isDDL.
 func collectStmtPrivs(stmt Statement, req *privReq) {
 	locals := map[string]bool{}
 	switch {
-	case stmt.CreateTable != nil, stmt.DropTable != nil, stmt.CreateIndex != nil, stmt.DropIndex != nil,
+	case stmt.CreateTable != nil:
+		req.isDDL = true
+		// A session-local temp table's DDL is gated by allowTempDDL, not allowDDL (temp-tables.md §5).
+		req.isTempDDL = stmt.CreateTable.Temp
+	case stmt.DropTable != nil, stmt.CreateIndex != nil, stmt.DropIndex != nil,
 		stmt.CreateType != nil, stmt.DropType != nil, stmt.CreateSequence != nil, stmt.DropSequence != nil,
 		stmt.AlterSequence != nil:
 		req.isDDL = true
@@ -2447,8 +2697,18 @@ func rejectParamsForDDL(params []Value) error {
 // left to right (unknown 42703, repeated 42701); then the jed narrowings — the
 // declaration-order rule and the per-member key-type gate — trap 0A000.
 func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
+	// A session-local temporary table (spec/design/temp-tables.md) is built exactly like a persistent
+	// one but registered into the session temp snapshot at the end (§2), so it makes zero file writes.
+	// FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE, before any persistent
+	// parent resolves, so the error is a clean 0A000. The other temp narrowings (composite/collated
+	// columns, serial/IDENTITY) are checked just before registration, once the columns are built.
+	if ct.Temp && len(ct.ForeignKeys) > 0 {
+		return Outcome{}, NewError(FeatureNotSupported, "FOREIGN KEY on a temporary table is not yet supported")
+	}
 	// The relation namespace is shared between tables and indexes (indexes.md §2), so a
 	// CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
+	// relationExists is temp-aware, so a temp name collides with temp + persistent alike (preclude-
+	// overlaps — temp-tables.md §3).
 	if db.relationExists(ct.Name) {
 		return Outcome{}, NewError(DuplicateTable, "relation already exists: "+ct.Name)
 	}
@@ -3133,6 +3393,34 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 	})
 	table.ForeignKeys = resolvedFks
 
+	if ct.Temp {
+		// Deferred narrowings on a temp table this slice (spec/design/temp-tables.md §8), each a clean
+		// 0A000: a serial/IDENTITY column (needs a temp OWNED sequence), a composite-typed column (needs
+		// the temp snapshot to carry the type catalog), and a collated column (needs the collation
+		// catalog). Plain scalar/array/range/decimal columns with PK / NOT NULL / DEFAULT / CHECK /
+		// UNIQUE are fully supported. With these out, the temp snapshot needs no types/collations catalog.
+		if len(pendingSerials) > 0 {
+			return Outcome{}, NewError(FeatureNotSupported, "serial / IDENTITY column on a temporary table is not yet supported")
+		}
+		for _, c := range table.Columns {
+			if typeUsesComposite(c.Type) {
+				return Outcome{}, NewError(FeatureNotSupported, "composite-typed column "+c.Name+" on a temporary table is not yet supported")
+			}
+			if c.Collation != "" {
+				return Outcome{}, NewError(FeatureNotSupported, "COLLATE on temporary-table column "+c.Name+" is not yet supported")
+			}
+		}
+		// Register into the session temp snapshot (tempWorking) — never the main image, so the table
+		// makes zero file writes (§2). Flag tempDirty so the commit can skip persisting the main image.
+		db.session.tx.tempDirty = true
+		ts := db.tempSnap()
+		ts.putTable(table, db.pageSize)
+		for _, ix := range table.Indexes {
+			ts.putIndexStore(strings.ToLower(ix.Name), NewTableStore(int(db.pageSize)-12, nil)) // 12 = pageHeader
+		}
+		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	}
+
 	db.putTable(table)
 	// The table is brand new (no rows), so each backing index store starts empty.
 	for _, ix := range table.Indexes {
@@ -3238,6 +3526,15 @@ func evalChecks(checks []namedCheck, relation string, row Row, env *evalEnv, met
 // (spec/design/grammar.md §13). Like CREATE TABLE it touches no rows and evaluates no
 // expression tree (the store is discarded wholesale), so it accrues zero cost.
 func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
+	// A session-local temp table (spec/design/temp-tables.md): remove it from the session temp
+	// snapshot — never the main image, so DROP makes zero file writes. No FK-dependent check (a temp
+	// table is never an FK parent, §8) and no owned-sequence sweep (serial on temp is deferred, §8).
+	// The temp-DDL capability gate already ran at dispatch (§5).
+	if db.isTempTable(dt.Name) {
+		db.session.tx.tempDirty = true
+		db.tempSnap().removeTable(strings.ToLower(dt.Name))
+		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
+	}
 	if _, ok := db.Table(dt.Name); !ok {
 		// An index's name is the wrong object kind (42809 — indexes.md §2, PG-probed);
 		// anything else is the missing-table 42P01 the DML paths raise.
@@ -3511,10 +3808,19 @@ func (db *Database) findIndex(name string) (string, IndexDef, bool) {
 // relationExists reports whether name is taken in the shared relation namespace (a table
 // OR an index — spec/design/indexes.md §2), case-insensitively.
 func (db *Database) relationExists(name string) bool {
+	// Temp tables + their (UNIQUE) index names join the namespace too, so a name colliding with a temp
+	// relation is also 42P07 (preclude-overlaps — spec/design/temp-tables.md §3). db.Table is
+	// persistent-only, so the temp snapshot is checked explicitly.
 	if _, ok := db.Table(name); ok {
 		return true
 	}
+	if _, ok := db.tempSnap().table(name); ok {
+		return true
+	}
 	if _, _, ok := db.findIndex(name); ok {
+		return true
+	}
+	if _, _, ok := db.tempSnap().findIndex(name); ok {
 		return true
 	}
 	return db.readSnap().sequence(name) != nil
@@ -3529,6 +3835,12 @@ func (db *Database) relationExists(name string) bool {
 // built by scanning the table once: page_read per node + storage_row_read per row (the
 // metered build scan — cost.md §3); maintenance thereafter is unmetered.
 func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
+	// A standalone CREATE INDEX on a temp table is deferred this slice (spec/design/temp-tables.md §8)
+	// — a temp table's UNIQUE constraints (in CREATE TEMP TABLE) are supported, but separate index DDL
+	// is a 0A000 follow-on. Checked before resolution so the message is clear.
+	if db.isTempTable(ci.Table) {
+		return Outcome{}, NewError(FeatureNotSupported, "CREATE INDEX on a temporary table is not yet supported")
+	}
 	table, ok := db.Table(ci.Table)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ci.Table)
@@ -3620,7 +3932,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		mask[c] = true
 	}
 	def := IndexDef{Name: name, Columns: cols, Unique: ci.Unique, Kind: kind}
-	store := db.readSnap().store(ci.Table)
+	store := db.lkpStore(ci.Table)
 	stored, nodes, slabs, err := store.ScanWithUnits(mask)
 	if err != nil {
 		return Outcome{}, err
@@ -3661,7 +3973,7 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 
 	nameKey := strings.ToLower(def.Name)
 	db.working().putIndex(tableKey, def, db.pageSize)
-	istore := db.working().indexStore(nameKey)
+	istore := db.writeIndexStore(nameKey)
 	// Insert sorted by entry key (indexes.md §1): every insert is then a right-edge append,
 	// so the built tree packs ~full instead of splintering under the storage-key order the
 	// scan produced (random in entry-key space). Part of the byte contract — the sort fixes
@@ -4331,7 +4643,7 @@ func (db *Database) arbiterExisting(arb *arbiter, store *TableStore, table *Tabl
 		return ak, row, true, nil
 	}
 	def := table.Indexes[arb.indexPos]
-	istore := db.readSnap().indexStore(strings.ToLower(def.Name))
+	istore := db.lkpIndexStore(strings.ToLower(def.Name))
 	entries, err := istore.RangeEntries(uniqueProbeBound(ak))
 	if err != nil {
 		return nil, nil, false, err
@@ -4380,7 +4692,7 @@ func (db *Database) rowConflictsCommitted(store *TableStore, table *Table, pk []
 		if !ok {
 			continue
 		}
-		entries, err := db.readSnap().indexStore(strings.ToLower(def.Name)).RangeEntries(uniqueProbeBound(prefix))
+		entries, err := db.lkpIndexStore(strings.ToLower(def.Name)).RangeEntries(uniqueProbeBound(prefix))
 		if err != nil {
 			return false, err
 		}
@@ -4392,11 +4704,11 @@ func (db *Database) rowConflictsCommitted(store *TableStore, table *Table, pk []
 }
 
 func (db *Database) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcome, error) {
-	table, ok := db.Table(ins.Table)
+	table, ok := db.lkpTable(ins.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ins.Table)
 	}
-	store := db.working().store(ins.Table)
+	store := db.writeStore(ins.Table) // routes a temp INSERT to tempWorking (temp-tables.md §2)
 	// The key members in key order — one for a single-column PK, several for a composite
 	// (constraints.md §3), empty for a no-PK (rowid) table.
 	pk := table.PKIndices()
@@ -4811,7 +5123,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			// (writable-cte.md §2) it sees the PRE-statement table, not an earlier sub-statement's
 			// staged rows; a cross-sub-statement key collision is caught in phase 2 below instead.
 			// readSnap == working for an ordinary INSERT, so this is unchanged there.
-			if _, exists, err := db.readSnap().store(table.Name).Get(key); err != nil {
+			if _, exists, err := db.lkpStore(table.Name).Get(key); err != nil {
 				return nil, err
 			} else if exists {
 				return nil, NewError(UniqueViolation,
@@ -4832,7 +5144,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			if !ok {
 				continue
 			}
-			istore := db.readSnap().indexStore(strings.ToLower(def.Name))
+			istore := db.lkpIndexStore(strings.ToLower(def.Name))
 			stored, err := istore.RangeEntries(uniqueProbeBound(prefix))
 			if err != nil {
 				return nil, err
@@ -4962,7 +5274,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		}
 	}
 	for k, def := range table.Indexes {
-		istore := db.working().indexStore(strings.ToLower(def.Name))
+		istore := db.writeIndexStore(strings.ToLower(def.Name))
 		for _, ek := range indexInserts[k] {
 			inserted, err := istore.Insert(ek, nil)
 			if err != nil {
@@ -5241,7 +5553,7 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 		newRows = append(newRows, inserts...)
 		for _, ix := range uniqIdx {
 			def := table.Indexes[ix]
-			istore := db.readSnap().indexStore(strings.ToLower(def.Name))
+			istore := db.lkpIndexStore(strings.ToLower(def.Name))
 			batch := make(map[string]struct{})
 			for _, newRow := range newRows {
 				prefix, ok, err := indexPrefixKey(table.Columns, colls, def, newRow)
@@ -5508,7 +5820,7 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 		}
 	}
 	for k, def := range table.Indexes {
-		istore := db.working().indexStore(strings.ToLower(def.Name))
+		istore := db.writeIndexStore(strings.ToLower(def.Name))
 		for _, ek := range indexAdds[k] {
 			inserted, err := istore.Insert(ek, nil)
 			if err != nil {
@@ -5621,7 +5933,7 @@ func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affect
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
 func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcome, error) {
-	table, ok := db.Table(del.Table)
+	table, ok := db.lkpTable(del.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
 	}
@@ -5683,8 +5995,8 @@ func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outc
 	// The scan reads the pin (readSnap) — under the writable-CTE read pin (writable-cte.md §2) a
 	// DELETE sees the PRE-statement rows, not an earlier sub-statement's table writes; phase 2 below
 	// writes into working. readSnap == working for an ordinary DELETE, so the scan is unchanged there.
-	store := db.readSnap().store(del.Table)
-	writeStore := db.working().store(del.Table)
+	store := db.lkpStore(del.Table)
+	writeStore := db.writeStore(del.Table)
 	// matched collects (key, row) pairs before mutating; the rows feed phase 2's
 	// index-entry removal (indexed columns are fixed-width and always resident).
 	type matchedRow struct {
@@ -5828,7 +6140,7 @@ func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outc
 		}
 	}
 	for _, def := range table.Indexes {
-		istore := db.working().indexStore(strings.ToLower(def.Name))
+		istore := db.writeIndexStore(strings.ToLower(def.Name))
 		for _, m := range matched {
 			eks, err := indexEntryKeys(table.Columns, colls, def, m.key, m.row)
 			if err != nil {
@@ -5851,7 +6163,7 @@ func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outc
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
 func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcome, error) {
-	table, ok := db.Table(upd.Table)
+	table, ok := db.lkpTable(upd.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+upd.Table)
 	}
@@ -5979,8 +6291,8 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 	// The scan + per-row column resolution read the pin (readSnap) — under the writable-CTE read pin
 	// (writable-cte.md §2) an UPDATE sees the PRE-statement rows; phase 2 below writes into working.
 	// readSnap == working for an ordinary UPDATE, so this is unchanged there.
-	store := db.readSnap().store(upd.Table)
-	writeStore := db.working().store(upd.Table)
+	store := db.lkpStore(upd.Table)
+	writeStore := db.writeStore(upd.Table)
 	// Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
 	type pending struct {
 		key    []byte
@@ -6115,7 +6427,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 			if !def.Unique {
 				continue
 			}
-			istore := db.readSnap().indexStore(strings.ToLower(def.Name))
+			istore := db.lkpIndexStore(strings.ToLower(def.Name))
 			batch := make(map[string]struct{})
 			for _, u := range updates {
 				prefix, ok, err := indexPrefixKey(table.Columns, colls, def, u.row)
@@ -6345,7 +6657,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 		}
 	}
 	for k, def := range table.Indexes {
-		istore := db.working().indexStore(strings.ToLower(def.Name))
+		istore := db.writeIndexStore(strings.ToLower(def.Name))
 		for _, mv := range indexMoves[k] {
 			for _, oldEk := range mv.removals {
 				if _, err := istore.Remove(oldEk); err != nil {
@@ -6371,7 +6683,11 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 // IterInKeyOrder directly (propagating fault errors); these callers are in-memory, where a scan never
 // faults, so the error is inert and panicking on it surfaces a genuine bug rather than hiding it.
 func (db *Database) RowsInKeyOrder(name string) []Row {
-	store, ok := db.readSnap().stores[strings.ToLower(name)]
+	snap := db.readSnap()
+	if db.isTempTable(name) { // temp tables live in the session temp snapshot (temp-tables.md §2)
+		snap = db.tempSnap()
+	}
+	store, ok := snap.stores[strings.ToLower(name)]
 	if !ok {
 		return nil
 	}
@@ -6540,7 +6856,7 @@ func (db *Database) planDmCte(lname string, body *CteBody, bindings []*cteBindin
 		tableName, returning, baseIsOld = body.Delete.Table, body.Delete.Returning, true
 		dm.delete = body.Delete
 	}
-	tdef, ok := db.Table(tableName)
+	tdef, ok := db.lkpTable(tableName) // temp-first (temp-tables.md §3)
 	if !ok {
 		return nil, nil, NewError(UndefinedTable, "table does not exist: "+tableName)
 	}
@@ -8128,7 +8444,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 				cteIdx = &idx
 				t = ctes[ci].table
 			} else {
-				tbl, ok := db.Table(tref.Name)
+				tbl, ok := db.lkpTable(tref.Name) // temp-first (temp-tables.md §3)
 				if !ok {
 					return nil, NewError(UndefinedTable, "table does not exist: "+tref.Name)
 				}
@@ -8954,14 +9270,14 @@ func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params 
 	// is every entry extending the prefix: [prefix, byte-successor(prefix)).
 	prefix := append([]byte{0x00}, agreed...)
 	b := keyBound{lo: prefix, loInc: true, hi: prefixSuccessor(prefix), hiInc: false}
-	istore := db.readSnap().indexStore(ib.nameKey)
+	istore := db.lkpIndexStore(ib.nameKey)
 	// The index store has no payload columns, so its mask is empty and its fused scan
 	// contributes only the index-tree page_read count (no spill/compress units).
 	entries, pages, _, err := istore.RangeScanWithUnits(b, nil)
 	if err != nil {
 		return nil, 0, 0, err
 	}
-	store := db.readSnap().store(tableName)
+	store := db.lkpStore(tableName)
 	for _, e := range entries {
 		// Skip the remaining key components (each self-delimiting — indexes.md §5);
 		// the suffix after them is the row's storage key (indexes.md §3).
@@ -9004,7 +9320,7 @@ func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params 
 // slabs) block. SELECT drops the keys; UPDATE/DELETE keep them to rewrite/remove the rows
 // (gin.md §6). GinEntry is charged inside (during the gather); the caller charges the block.
 func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExpr, env *evalEnv, meter *Meter, mask []bool) (out []Entry, pages, slabs int, err error) {
-	store := db.readSnap().store(tableName)
+	store := db.lkpStore(tableName)
 	if query == nil {
 		return nil, 0, 0, nil
 	}
@@ -9098,7 +9414,7 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 	// Gather each term's posting list: the entry range [encode(term), successor) of the GIN tree
 	// (gin.md §4). The entry is encode(term) ‖ storage_key; the fixed-width term self-delimits, so
 	// the storage key is the suffix after termWidth bytes.
-	istore := db.readSnap().indexStore(gb.nameKey)
+	istore := db.lkpIndexStore(gb.nameKey)
 	termWidth := gb.elemType.WidthBytes()
 	entriesVisited := 0
 	postings := make([][][]byte, 0, len(terms))
@@ -9491,7 +9807,7 @@ func boundEmpty(b keyBound) bool {
 // short-circuit; only the row reads do. Rows match the eager path exactly: the offset..offset+limit
 // slice of the primary-key-ordered filtered rows.
 func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
-	store := db.readSnap().store(plan.rels[0].tableName)
+	store := db.lkpStore(plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read block. A correlated
 	// bound resolves against env.outer (the enclosing rows).
@@ -9572,7 +9888,7 @@ func (db *Database) execStreamingLimit(plan *selectPlan, env *evalEnv, meter *Me
 // (cost.md §3), now spills. Gated (by the caller) to a single table, no join, non-aggregate,
 // non-DISTINCT, with an ORDER BY and no index bound.
 func (db *Database) execStreamingSort(plan *selectPlan, env *evalEnv, meter *Meter, params []Value) (selectResult, error) {
-	store := db.readSnap().store(plan.rels[0].tableName)
+	store := db.lkpStore(plan.rels[0].tableName)
 
 	// Resolve the scan bound (the PK pushdown, if any) and charge the page_read + value_decompress
 	// block up front — identical to the eager scan (cost.md §3). An INDEX bound never reaches here.
@@ -9835,7 +10151,7 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 	// A base table: scan in primary-key order via a scanSource (the page_read block + per-row
 	// storage_row_read accrue inside next() — cost.md §3). A PK/index bound seeks/ranges instead of a
 	// full walk; an empty bound reads nothing.
-	store := db.readSnap().store(rel.tableName)
+	store := db.lkpStore(rel.tableName)
 	var rows []Row
 	var nodeCount, slabs int
 	if sb := plan.relBounds[ri]; sb != nil && sb.index != nil {
@@ -19477,10 +19793,10 @@ func buildFkProbe(fk *ForeignKey, parent *Table, parentColls []*Collation, row R
 func (db *Database) fkProbeHits(probe fkProbe, parentTable string) (bool, error) {
 	switch probe.kind {
 	case fkProbePk:
-		_, ok, err := db.readSnap().store(parentTable).Get(probe.bytes)
+		_, ok, err := db.lkpStore(parentTable).Get(probe.bytes)
 		return ok, err
 	default: // fkProbeUnique
-		entries, err := db.readSnap().indexStore(probe.index).RangeEntries(uniqueProbeBound(probe.bytes))
+		entries, err := db.lkpIndexStore(probe.index).RangeEntries(uniqueProbeBound(probe.bytes))
 		if err != nil {
 			return false, err
 		}
@@ -19496,7 +19812,7 @@ func (db *Database) fkProbeHits(probe fkProbe, parentTable string) (bool, error)
 // whose child IS the table being mutated (so its deleted/updated rows must not count). parent is
 // the referenced table's catalog. Unmetered validation.
 func (db *Database) fkChildReferences(childTable string, fk *ForeignKey, parent *Table, target []byte, exclude map[string]struct{}) (bool, error) {
-	entries, err := db.readSnap().store(childTable).EntriesInKeyOrder()
+	entries, err := db.lkpStore(childTable).EntriesInKeyOrder()
 	if err != nil {
 		return false, err
 	}

@@ -55,7 +55,13 @@ type Rollback struct{}
 
 // CreateTable is a CREATE TABLE statement.
 type CreateTable struct {
-	Name    string
+	Name string
+	// Temp is whether `TEMP` / `TEMPORARY` preceded `TABLE` — a SESSION-LOCAL temporary table
+	// (spec/design/temp-tables.md). A temp table makes ZERO writes to the database file (it lives
+	// outside the serialized snapshot), is private to the creating session, and is dropped at session
+	// close. Its DDL is gated by allowTempDDL rather than allowDDL (temp-tables.md §5). The
+	// database-wide SHARED form is a later slice (temp-tables.md §1/§13).
+	Temp    bool
 	Columns []ColumnDef
 	// TablePKs is the table-level `PRIMARY KEY (a, b, …)` constraints, each a list of
 	// member column names in key order (spec/design/grammar.md §28). The parser collects

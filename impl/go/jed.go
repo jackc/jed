@@ -19,6 +19,13 @@ var SupportedCapabilities = []string{
 	"ddl.foreign_key",
 	// DROP TABLE — remove a table (definition + rows) from the catalog (grammar.md §13).
 	"ddl.drop_table",
+	// CREATE [TEMP|TEMPORARY] TABLE + DROP — session-local temporary tables that make zero writes to
+	// the database file (held in a per-session temp snapshot outside the serialized catalog, no
+	// format_version change). Full CRUD + PK/UNIQUE/CHECK/NOT NULL/DEFAULT, dropped at session close,
+	// preclude-overlaps (42P07). Composite/collated columns, serial/IDENTITY, FK, standalone CREATE
+	// INDEX on a temp table are deferred 0A000 (spec/design/temp-tables.md §8). Gate
+	// session.allow_temp_ddl; storage budget resource.temp_budget.
+	"ddl.temp_table",
 	// CREATE INDEX / DROP INDEX — non-unique secondary indexes, maintained on every write
 	// and used to bound SELECT scans (spec/design/indexes.md, grammar.md §30).
 	"ddl.secondary_index",
@@ -360,6 +367,11 @@ var SupportedCapabilities = []string{
 	// network, process, environment) or adds nondeterminism outside the entropy seam; escape-hatch
 	// calls are 42883 and escape-hatch statements 42601 (CLAUDE.md §13; functions.md §13).
 	"resource.pure_builtins",
+	// Temp-table storage budget — temp_buffers bounds a session's RETAINED temporary-table bytes (the
+	// hazard no cost ceiling covers); an over-budget temp write aborts 54P03. Measured in byte-identical
+	// on-disk record bytes, checked per-statement, so the abort is cross-core-identical. The
+	// # temp_buffers: directive sets the per-record budget (spec/design/temp-tables.md §7).
+	"resource.temp_budget",
 	// Session privileges — the GRANT/REVOKE envelope (per-table SELECT/INSERT/UPDATE/DELETE +
 	// function EXECUTE), enforced at name resolution with 42501; the # default_privileges: /
 	// # grant: / # revoke: directives configure the session (session.md §5.3).
@@ -367,6 +379,11 @@ var SupportedCapabilities = []string{
 	// DDL gate — the single allow_ddl session capability governing CREATE/DROP/ALTER; a denied
 	// schema change is 42501. The # allow_ddl: directive sets it (session.md §5.3).
 	"session.allow_ddl",
+	// Temp-DDL gate — the temp-scoped split of allow_ddl: allow_temp_ddl governs CREATE/DROP of a
+	// session-local temp table (42501 if denied), so a host can grant bounded scratch tables to an
+	// untrusted session while withholding persistent DDL. The # allow_temp_ddl: directive sets it
+	// (spec/design/temp-tables.md §5).
+	"session.allow_temp_ddl",
 	// Session lifetime cost budget — a per-session cumulative cost budget lifetime_max_cost aborting
 	// the in-flight statement (and rejecting later ones at admission) with 54P02 once the session's
 	// running total reaches it; sibling to resource.cost_limit's per-statement 54P01. The sticky

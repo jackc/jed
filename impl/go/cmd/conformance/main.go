@@ -350,6 +350,39 @@ func parseAllowDDLDirective(line string) (bool, bool) {
 	}
 }
 
+// parseAllowTempDDLDirective parses a `# allow_temp_ddl: on|off` directive line (spec/design/
+// temp-tables.md §5): whether session-local temporary-table DDL is permitted for the next record.
+func parseAllowTempDDLDirective(line string) (bool, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "allow_temp_ddl:")
+	if !ok {
+		return false, false
+	}
+	switch strings.ToLower(strings.TrimSpace(rest)) {
+	case "on", "true", "yes":
+		return true, true
+	case "off", "false", "no":
+		return false, true
+	default:
+		return false, false
+	}
+}
+
+// parseTempBuffersDirective parses a `# temp_buffers: N` directive line (spec/design/temp-tables.md
+// §7): the per-session temp-table storage budget (bytes) to run the next record under (0 ⇒ unlimited).
+// Mirrors `# max_cost:` — per-record, reset after — so a record can set a small budget and assert that
+// an over-budget temp write traps 54P03.
+func parseTempBuffersDirective(line string) (int, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "temp_buffers:")
+	if !ok {
+		return 0, false
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(rest))
+	if err != nil {
+		return 0, false
+	}
+	return n, true
+}
+
 // varPair is a session-variable (name, value) parsed from a # set: directive.
 type varPair struct{ name, value string }
 
@@ -507,6 +540,8 @@ func runFile(text string) error {
 	var pendingGrants []privDelta
 	var pendingRevokes []privDelta
 	var pendingAllowDDL *bool
+	var pendingAllowTempDDL *bool
+	var pendingTempBuffers *int
 	var pendingVars []varPair
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
@@ -546,6 +581,10 @@ func runFile(text string) error {
 				pendingRevokes = append(pendingRevokes, r)
 			} else if a, ok := parseAllowDDLDirective(line); ok {
 				pendingAllowDDL = &a
+			} else if a, ok := parseAllowTempDDLDirective(line); ok {
+				pendingAllowTempDDL = &a
+			} else if n, ok := parseTempBuffersDirective(line); ok {
+				pendingTempBuffers = &n
 			} else if vars, ok := parseSetDirective(line); ok {
 				pendingVars = append(pendingVars, vars...)
 			} else if s, ok := parseSeedDirective(line); ok {
@@ -620,10 +659,24 @@ func runFile(text string) error {
 		if pendingAllowDDL != nil {
 			db.SetAllowDDL(*pendingAllowDDL)
 		}
+		// `# allow_temp_ddl:` overrides the temp-DDL gate (temp-tables.md §5); ResetPrivileges above set
+		// it back to permissive, so this decorates only its record.
+		if pendingAllowTempDDL != nil {
+			db.SetAllowTempDDL(*pendingAllowTempDDL)
+		}
 		pendingDefaultPrivileges = nil
 		pendingGrants = nil
 		pendingRevokes = nil
 		pendingAllowDDL = nil
+		pendingAllowTempDDL = nil
+		// Apply the per-record temp-storage budget (temp-tables.md §7); absent ⇒ unlimited (0), so a
+		// `# temp_buffers:` directive never leaks past its record. Mirrors `# max_cost:`.
+		tempBuffers := 0
+		if pendingTempBuffers != nil {
+			tempBuffers = *pendingTempBuffers
+		}
+		db.SetTempBuffers(tempBuffers)
+		pendingTempBuffers = nil
 		// Apply the per-record session variables (spec/design/session.md §6.1): clear, then set each
 		// pending # set: pair, so a directive decorates only its record and never leaks forward.
 		db.ResetVars()

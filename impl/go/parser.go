@@ -299,6 +299,14 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	if err := p.expectKeyword("create"); err != nil {
 		return nil, err
 	}
+	// An optional table_scope between CREATE and TABLE makes the table TEMPORARY
+	// (spec/design/temp-tables.md, grammar.ebnf `table_scope`). TEMP / TEMPORARY are synonyms and NOT
+	// reserved (§3): recognized positionally here — the word after TABLE is always the table name, so
+	// `CREATE TABLE temp (...)` is an ordinary persistent table named "temp".
+	temp := p.peekKeyword() == "temp" || p.peekKeyword() == "temporary"
+	if temp {
+		p.advance()
+	}
 	if err := p.expectKeyword("table"); err != nil {
 		return nil, err
 	}
@@ -361,7 +369,7 @@ func (p *Parser) parseCreateTable() (*CreateTable, error) {
 	if len(columns) == 0 {
 		return nil, NewError(SyntaxError, "a table must have at least one column")
 	}
-	return &CreateTable{Name: name, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys}, nil
+	return &CreateTable{Name: name, Temp: temp, Columns: columns, TablePKs: tablePKs, Checks: checks, Uniques: uniques, ForeignKeys: foreignKeys}, nil
 }
 
 // atForeignKeyTableConstraint reports whether the cursor sits on a table-level FOREIGN KEY

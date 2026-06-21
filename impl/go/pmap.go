@@ -272,6 +272,32 @@ func (m *PMap) nodeCount() int {
 	return count(m.root)
 }
 
+// residentRecordBytes is the total on-disk record bytes stored in this tree — the sum of every
+// entry's weight over every node (this is a B-tree: records live in interior nodes too, not only
+// leaves). The deterministic, cross-core-identical measure of a temp table's storage footprint
+// (spec/design/temp-tables.md §7; weight is the on-disk record_size, byte-identical across cores —
+// §8). The tree is fully resident for a temp store (temp data never pages), so this never faults; an
+// OnDisk child would contribute 0 (defensive — temp stores have none).
+func (m *PMap) residentRecordBytes() uint64 {
+	var walk func(n *pnode) uint64
+	walk = func(n *pnode) uint64 {
+		if n == nil {
+			return 0
+		}
+		var here uint64
+		for _, w := range n.weights {
+			here += uint64(w)
+		}
+		for _, c := range n.children {
+			if c.node != nil {
+				here += walk(c.node)
+			}
+		}
+		return here
+	}
+	return walk(m.root)
+}
+
 // keyBound is a contiguous range of encoded keys — the form a primary-key predicate pushes down to
 // a bounded B-tree scan (spec/design/cost.md §3 "bounded scan / point lookup", encoding.md). lo/hi
 // are encoded key bytes; a nil endpoint is open on that side (−∞ / +∞), and the flags say whether

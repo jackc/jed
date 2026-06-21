@@ -168,6 +168,11 @@ const (
 	// statement was rejected at admission because the budget is already spent (spec/design/session.md
 	// §5.4). Sibling to 54P01 (which bounds one statement); jed-specific, class 54.
 	SessionCostLimitExceeded
+	// TempStorageLimitExceeded is 54P03 — a session's temporary-table storage reached the temp_buffers
+	// byte budget (spec/design/temp-tables.md §7). The §13 gate on RETAINED temp bytes (the cost
+	// ceilings bound work, not bytes held between statements); measured in byte-identical on-disk record
+	// bytes, so the abort is cross-core-identical (§8). jed-specific, class 54.
+	TempStorageLimitExceeded
 	// IoError is 58030 — an I/O error from the host file layer (spec/design/api.md §2).
 	IoError
 	// UndefinedFile is 58P01 — open of a database path that does not exist.
@@ -285,6 +290,8 @@ func (s SqlState) Code() string {
 		return "54P01"
 	case SessionCostLimitExceeded:
 		return "54P02"
+	case TempStorageLimitExceeded:
+		return "54P03"
 	case IoError:
 		return "58030"
 	case UndefinedFile:
