@@ -239,11 +239,24 @@ impl Snapshot {
         self.sequences.remove(key);
     }
 
-    /// Look up a loaded collation by its exact (case-sensitive) name. `C` is NOT here — it is
-    /// table-free and built in (spec/design/collation.md §1). `None` ⇒ not loaded (the resolver
-    /// raises 42704).
+    /// Look up a collation the database *references* (imported / baked) by its exact (case-sensitive)
+    /// name. `C` is NOT here — it is table-free and built in (spec/design/collation.md §1). `None` ⇒
+    /// not referenced by this database. This is the catalog-local set only; for query *use* prefer
+    /// `resolve_collation`, which also falls back to the binary's vendored set.
     pub(crate) fn collation(&self, name: &str) -> Option<&std::sync::Arc<Collation>> {
         self.collations.get(name)
+    }
+
+    /// Resolve a collation name for USE — query resolution and key encoding (spec/design/collation.md
+    /// §2/§9). The database's referenced collations first, then the set **vendored into this binary**.
+    /// `None` ⇒ neither has it (the resolver raises 42704). `C` is handled by the caller (built-in).
+    /// This is the reference-only read path: a collation need not be baked into the file to be used —
+    /// the file references it by name and the table comes from the binary's vendored set.
+    pub(crate) fn resolve_collation(&self, name: &str) -> Option<std::sync::Arc<Collation>> {
+        self.collations
+            .get(name)
+            .cloned()
+            .or_else(|| crate::collation::vendored_collation(name))
     }
 
     /// Register a loaded collation (`db.import_collation`). Keyed by its exact name; the caller has
@@ -1143,7 +1156,7 @@ impl Database {
             .map(|c| {
                 c.collation
                     .as_ref()
-                    .and_then(|n| snap.collation(n).cloned())
+                    .and_then(|n| snap.resolve_collation(n))
             })
             .collect()
     }
@@ -15747,8 +15760,8 @@ fn resolve_collation_name(
     if name == "C" {
         return Ok(None);
     }
-    match catalog.read_snap().collation(name) {
-        Some(c) => Ok(Some(c.clone())),
+    match catalog.read_snap().resolve_collation(name) {
+        Some(c) => Ok(Some(c)),
         None => Err(EngineError::new(
             SqlState::UndefinedObject,
             format!("collation \"{name}\" does not exist"),

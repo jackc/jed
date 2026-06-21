@@ -70,6 +70,15 @@ fn main() {
         let coll = compile(files, name);
         let table = serialize_table(&coll);
         let artifact = save_collation(&coll);
+        // The `.coll` artifact is ALSO the byte source each core vendors (spec/design/collation.md
+        // §9): write it next to the definition so the cores can `include_bytes!` it. The artifact
+        // is byte-identical to `db.SaveCollation` and to the `artifact_hex` vector emitted below.
+        std::fs::write(
+            Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(format!("../../spec/collation/fixtures/{name}.coll")),
+            &artifact,
+        )
+        .unwrap();
         let files_toml = files
             .iter()
             .map(|f| format!("\"{f}\""))

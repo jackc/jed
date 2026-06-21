@@ -332,3 +332,63 @@ fn baked_file_round_trip() {
     re.close().unwrap();
     let _ = std::fs::remove_file(&path);
 }
+
+// ---- slice 2: vendored / reference-only read path (collation.md §2/§3/§9) ----
+//
+// In the reference-only model a collation is **vendored into the binary**, so it is usable WITHOUT
+// any `db.import_collation` — the database references it by name and the table comes from the
+// vendored set. These assert that no-import path directly (the corpus still imports, so it cannot
+// express this — CLAUDE.md §10). dev-root and dev-nordic are the vendored dev fixtures (§14, 2a).
+
+#[test]
+fn vendored_collation_used_without_import() {
+    // No import: `COLLATE "dev-root"` resolves from the binary's vendored set. 'ä' < 'z' is true
+    // under dev-root (ä near a), the opposite of C byte order — proving the vendored table is used.
+    let mut db = Database::new();
+    assert_eq!(db.collations().len(), 0); // nothing imported / referenced by this database
+    let rows = query(&mut db, "SELECT 'ä' < 'z' COLLATE \"dev-root\"");
+    assert_eq!(rows, vec![vec![Value::Bool(true)]]);
+}
+
+#[test]
+fn vendored_per_column_collation_without_import() {
+    // A `COLLATE "dev-root"` column works with NO import: CREATE TABLE validation and the key
+    // encoder both fall back to the vendored set, so the collated ORDER BY (and the collated key)
+    // use dev-root order — ä between a and z.
+    let mut db = Database::new();
+    execute(
+        &mut db,
+        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\")",
+    )
+    .unwrap();
+    execute(&mut db, "INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
+    assert_eq!(
+        texts(query(&mut db, "SELECT name FROM t ORDER BY name")),
+        vec!["a", "ä", "z"]
+    );
+    // The database referenced dev-root by name but never baked it — collations() (referenced set)
+    // stays empty; the table came from the vendored set.
+    assert_eq!(db.collations().len(), 0);
+}
+
+#[test]
+fn unknown_collation_still_42704() {
+    // The vendored fallback must not mask an unknown name: a collation neither referenced nor
+    // vendored is still 42704 (undefined_object).
+    let mut db = Database::new();
+    let err = execute(&mut db, "SELECT 'x' COLLATE \"no-such-collation\"").unwrap_err();
+    assert_eq!(err.code(), "42704");
+}
+
+#[test]
+fn vendored_set_is_the_dev_fixtures() {
+    // The binary vendors the dev fixture set, ascending by name (deterministic, no hash-iteration
+    // leak — §8). `C` is never vendored (table-free, built in).
+    let names: Vec<String> = jed::collation::vendored_collations()
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    assert_eq!(names, vec!["dev-nordic".to_string(), "dev-root".to_string()]);
+    assert!(jed::collation::vendored_collation("dev-root").is_some());
+    assert!(jed::collation::vendored_collation("C").is_none());
+}

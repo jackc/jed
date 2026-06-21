@@ -590,6 +590,60 @@ pub fn open_collation(bytes: &[u8]) -> Result<Collation> {
     })
 }
 
+// --- Vendored collation set (spec/design/collation.md §2/§9) ------------------------------------
+//
+// In the reference-only model the engine reads collations from a set **vendored into the binary**,
+// not from the database file (the file only *references* a collation by name + version). Production
+// `OpenCollation`s these embedded `.coll` artifacts once at startup and serves every later use from
+// them. This is the dev fixture set (`dev-root`, `dev-nordic`); the real version-pinned DUCET +
+// curated tailorings and the embedder-chosen footprint tiers (§13) are later slices (§14, 2a/2f).
+// The `.coll` bytes are the same artifact `gen_collation_vectors` writes and `db.SaveCollation`
+// produces — byte-identical across cores, so every core vendors the identical table (§9/§10).
+
+/// The `(name, .coll bytes)` pairs compiled into this binary. The artifact's own embedded name is
+/// authoritative for the registry key (it always equals the label here).
+const VENDORED_COLL: &[(&str, &[u8])] = &[
+    (
+        "dev-root",
+        include_bytes!("../../../spec/collation/fixtures/dev-root.coll"),
+    ),
+    (
+        "dev-nordic",
+        include_bytes!("../../../spec/collation/fixtures/dev-nordic.coll"),
+    ),
+];
+
+static VENDORED: std::sync::OnceLock<
+    std::collections::HashMap<String, std::sync::Arc<Collation>>,
+> = std::sync::OnceLock::new();
+
+fn vendored() -> &'static std::collections::HashMap<String, std::sync::Arc<Collation>> {
+    VENDORED.get_or_init(|| {
+        let mut m = std::collections::HashMap::new();
+        for (label, bytes) in VENDORED_COLL {
+            let coll = open_collation(bytes)
+                .unwrap_or_else(|e| panic!("vendored collation {label}: {e}"));
+            m.insert(coll.name.clone(), std::sync::Arc::new(coll));
+        }
+        m
+    })
+}
+
+/// Look up a collation **vendored into this binary** by its exact (case-sensitive) name
+/// (spec/design/collation.md §2/§9). `None` ⇒ not vendored. `C` is never here (table-free, built
+/// in). The resolver consults the database's referenced collations first, then this set.
+pub fn vendored_collation(name: &str) -> Option<std::sync::Arc<Collation>> {
+    vendored().get(name).cloned()
+}
+
+/// Every vendored collation, ascending by name — a deterministic order with no hash-iteration leak
+/// (CLAUDE.md §8). Used by introspection (`db.Collations`).
+pub fn vendored_collations() -> Vec<std::sync::Arc<Collation>> {
+    let mut v: Vec<std::sync::Arc<Collation>> = vendored().values().cloned().collect();
+    v.sort_by(|a, b| a.name.cmp(&b.name));
+    v
+}
+
 #[allow(clippy::type_complexity)]
 fn deserialize_table(table: &[u8]) -> Result<(Vec<(u32, Vec<Ce>)>, Vec<(Vec<u32>, Vec<Ce>)>)> {
     let mut r = Reader { b: table, i: 0 };
