@@ -16,6 +16,7 @@ INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)
 # An INSERT-CTE projects its RETURNING rows forward as the relation `ins`; the main query scans
 # that buffer. The two rows are inserted (always to completion) before the SELECT runs.
 # names: id, v
+# cost: 6
 query II nosort
 WITH ins AS (INSERT INTO t VALUES (4, 40, 400), (5, 50, 500) RETURNING id, v)
 SELECT id, v FROM ins ORDER BY id
@@ -28,12 +29,14 @@ SELECT id, v FROM ins ORDER BY id
 # The shared-snapshot gotcha (PostgreSQL-verbatim): the MAIN query reads the PRE-statement `t`, so
 # count is 5 even though the CTE inserts a 6th row. The insert still lands.
 # names: c
+# cost: 13
 query I nosort
 WITH a AS (INSERT INTO t VALUES (6, 60, 600) RETURNING *) SELECT count(*) AS c FROM t
 ----
 5
 
 # ... and after the statement, the row really is there (6 rows now).
+# cost: 14
 query I nosort
 SELECT count(*) FROM t
 ----
@@ -41,6 +44,7 @@ SELECT count(*) FROM t
 
 # An UPDATE-CTE returns the NEW (post-assignment) rows; two rows match the range bound.
 # names: id, v
+# cost: 13
 query II nosort
 WITH u AS (UPDATE t SET v = v + 1 WHERE id <= 2 RETURNING id, v)
 SELECT id, v FROM u ORDER BY id
@@ -52,6 +56,7 @@ SELECT id, v FROM u ORDER BY id
 
 # A DELETE-CTE returns the deleted OLD row, fed to the main query (id 6 was added above).
 # names: id, v
+# cost: 6
 query II nosort
 WITH d AS (DELETE FROM t WHERE id = 6 RETURNING id, v) SELECT id, v FROM d
 ----
@@ -61,6 +66,7 @@ WITH d AS (DELETE FROM t WHERE id = 6 RETURNING id, v) SELECT id, v FROM d
 # A data-modifying CTE referenced TWICE is materialized once (it runs to completion once, its
 # buffer is re-scanned): the self-cross-join sees the two inserted ids paired four ways.
 # names: x, y
+# cost: 10
 query II rowsort
 WITH ins AS (INSERT INTO t VALUES (7, 70, 700), (8, 80, 800) RETURNING id)
 SELECT a.id AS x, b.id AS y FROM ins a CROSS JOIN ins b
@@ -80,6 +86,7 @@ statement ok
 CREATE TABLE dst (x i32)
 
 # names: x
+# cost: 15
 query I nosort
 WITH a AS (SELECT id FROM t WHERE id <= 2),
      b AS (INSERT INTO dst SELECT id FROM a RETURNING x)
@@ -90,6 +97,7 @@ SELECT x FROM b ORDER BY x
 
 # The column-rename list renames a data-modifying CTE's RETURNING output columns.
 # names: k
+# cost: 3
 query I nosort
 WITH ins (k) AS (INSERT INTO t VALUES (9, 90, 900) RETURNING id) SELECT k FROM ins
 ----
@@ -98,12 +106,14 @@ WITH ins (k) AS (INSERT INTO t VALUES (9, 90, 900) RETURNING id) SELECT k FROM i
 # A side-effect-only data-modifying CTE (no RETURNING), unreferenced, still runs to completion: the
 # SELECT primary returns its own row while the DELETE removes id 9.
 # names: ok
+# cost: 4
 query I nosort
 WITH d AS (DELETE FROM t WHERE id = 9) SELECT 1 AS ok
 ----
 1
 
 # ... id 9 is gone (the side-effect landed).
+# cost: 1
 query I rowsort
 SELECT id FROM t WHERE id = 9
 ----

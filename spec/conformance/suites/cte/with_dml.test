@@ -19,6 +19,7 @@ INSERT INTO inbox VALUES (1, 100), (2, 200), (3, 300)
 # A WITH clause feeding a DELETE primary: the CTE selects the ids to remove, the DELETE primary
 # removes them and RETURNINGs the deleted rows.
 # names: id, payload
+# cost: 26
 query II rowsort
 WITH old AS (SELECT id FROM inbox WHERE payload >= 200)
 DELETE FROM inbox WHERE id IN (SELECT id FROM old) RETURNING id, payload
@@ -29,6 +30,7 @@ DELETE FROM inbox WHERE id IN (SELECT id FROM old) RETURNING id, payload
 300
 
 # ... inbox now holds only id 1.
+# cost: 3
 query II nosort
 SELECT id, payload FROM inbox ORDER BY id
 ----
@@ -41,6 +43,7 @@ statement ok
 INSERT INTO inbox VALUES (2, 200), (3, 300)
 
 # names: id, payload
+# cost: 13
 query II rowsort
 WITH moved AS (DELETE FROM inbox WHERE id >= 2 RETURNING *)
 INSERT INTO archive SELECT * FROM moved RETURNING id, payload
@@ -51,11 +54,13 @@ INSERT INTO archive SELECT * FROM moved RETURNING id, payload
 300
 
 # ... inbox emptied of the moved rows, archive holds them.
+# cost: 3
 query I nosort
 SELECT id FROM inbox ORDER BY id
 ----
 1
 
+# cost: 5
 query II nosort
 SELECT id, payload FROM archive ORDER BY id
 ----
@@ -72,6 +77,7 @@ statement ok
 INSERT INTO acct VALUES (1, 50), (2, 80)
 
 # names: id, bal
+# cost: 16
 query II nosort
 WITH bump AS (SELECT id FROM acct WHERE bal < 60)
 UPDATE acct SET bal = bal + 1000 WHERE id IN (SELECT id FROM bump) RETURNING id, bal
@@ -91,6 +97,7 @@ statement ok
 INSERT INTO ev VALUES (1, 5)
 
 # names: eid
+# cost: 4
 query I nosort
 WITH ins AS (INSERT INTO ev VALUES (2, 9) RETURNING id)
 INSERT INTO evlog SELECT id FROM ins RETURNING eid
@@ -98,6 +105,7 @@ INSERT INTO evlog SELECT id FROM ins RETURNING eid
 2
 
 # ... both writes landed.
+# cost: 5
 query I nosort
 SELECT id FROM ev ORDER BY id
 ----
@@ -109,6 +117,7 @@ SELECT id FROM ev ORDER BY id
 statement ok
 WITH s AS (SELECT 42::int AS n) INSERT INTO evlog SELECT n FROM s
 
+# cost: 5
 query I nosort
 SELECT eid FROM evlog ORDER BY eid
 ----
