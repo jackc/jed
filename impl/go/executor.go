@@ -1048,6 +1048,101 @@ func (db *Database) isSharedTempIndex(name string) bool {
 	return ok
 }
 
+// sequence resolves a sequence by name along the resolution walk session-local → shared → persistent
+// (spec/design/sequences.md + temp-tables.md §8). Preclude-overlaps keeps a name in at most one scope
+// (the shared relation namespace), so this is just "where the sequence lives". Every sequence READ
+// (nextval/currval/setval resolution, DROP/ALTER SEQUENCE) goes through here, so a serial/IDENTITY
+// column's OWNED temp sequence resolves exactly like a persistent one.
+func (db *Database) sequence(name string) *SequenceDef {
+	if s := db.tempSnap().sequence(name); s != nil {
+		return s
+	}
+	if s := db.sharedTempSnap().sequence(name); s != nil {
+		return s
+	}
+	return db.readSnap().sequence(name)
+}
+
+// isTempSequence reports whether name is a sequence in the SESSION-LOCAL temp snapshot
+// (temp-tables.md §8) — the sequence analogue of isTempTable. A temp sequence only ever arises from a
+// serial/IDENTITY temp column (standalone CREATE SEQUENCE is always persistent), so it is always owned.
+func (db *Database) isTempSequence(name string) bool {
+	return db.tempSnap().sequence(name) != nil
+}
+
+// isSharedTempSequence reports whether name is a sequence in the DATABASE-WIDE shared temp snapshot
+// (temp-tables.md §8) — checked AFTER session-local (the resolution walk).
+func (db *Database) isSharedTempSequence(name string) bool {
+	return db.sharedTempSnap().sequence(name) != nil
+}
+
+// anyTempSequence / anySharedTempSequence report whether any name in a DROP SEQUENCE list is a
+// session-local / shared temp sequence — the gate classifiers for a temp DROP SEQUENCE (§5/§8).
+func (db *Database) anyTempSequence(names []string) bool {
+	for _, n := range names {
+		if db.isTempSequence(n) {
+			return true
+		}
+	}
+	return false
+}
+
+func (db *Database) anySharedTempSequence(names []string) bool {
+	for _, n := range names {
+		if db.isSharedTempSequence(n) {
+			return true
+		}
+	}
+	return false
+}
+
+// putSequenceRouted stages a sequence def into whichever scope currently owns its name (flagging the
+// matching dirty bit): session-local temp, shared temp, else the main working set. A serial/IDENTITY
+// temp column's owned sequence advances (nextval flush) into its temp snapshot — like the table's rows,
+// zero file writes (temp-tables.md §2); a brand-new persistent sequence is absent from both temp scopes
+// and lands in the main image.
+func (db *Database) putSequenceRouted(def *SequenceDef) {
+	if db.isTempSequence(def.Name) {
+		db.session.tx.tempDirty = true
+		db.session.tx.tempWorking.putSequence(def)
+	} else if db.isSharedTempSequence(def.Name) {
+		db.session.tx.sharedTempDirty = true
+		db.session.tx.sharedTempWorking.putSequence(def)
+	} else {
+		db.working().putSequence(def)
+	}
+}
+
+// removeSequenceRouted removes a sequence from whichever scope owns its name (the routed analogue of
+// putSequenceRouted). Used by DROP SEQUENCE and DROP TABLE's owned-sequence auto-drop.
+func (db *Database) removeSequenceRouted(name string) {
+	key := strings.ToLower(name)
+	if db.isTempSequence(name) {
+		db.session.tx.tempDirty = true
+		db.session.tx.tempWorking.removeSequence(key)
+	} else if db.isSharedTempSequence(name) {
+		db.session.tx.sharedTempDirty = true
+		db.session.tx.sharedTempWorking.removeSequence(key)
+	} else {
+		db.working().removeSequence(key)
+	}
+}
+
+// setColumnDefaultExprRouted rewrites a column's stored DEFAULT expression in whichever scope owns the
+// table — the routed analogue used by ALTER SEQUENCE … RENAME of an owned sequence (temp-tables.md §8),
+// so a renamed owned TEMP sequence's nextval default is rewritten in the temp snapshot.
+func (db *Database) setColumnDefaultExprRouted(tableKey string, column int, de *DefaultExpr) {
+	if db.isTempTable(tableKey) {
+		db.session.tx.tempDirty = true
+		db.session.tx.tempWorking.setColumnDefaultExpr(tableKey, column, de)
+	} else if db.isSharedTempTable(tableKey) {
+		db.session.tx.sharedTempDirty = true
+		db.session.tx.sharedTempWorking.setColumnDefaultExpr(tableKey, column, de)
+	} else {
+		db.working().setColumnDefaultExpr(tableKey, column, de)
+	}
+}
+
 // lkpTable resolves a table by name along the resolution walk session-local → shared → persistent
 // (temp-tables.md §3). Preclude-overlaps keeps a name in at most one scope, so this is just "where it lives".
 func (db *Database) lkpTable(name string) (*Table, bool) {
@@ -1817,12 +1912,12 @@ func (db *Database) seqNextval(name string) (int64, error) {
 	if db.session.pendingSeq != nil {
 		if d, ok := db.session.pendingSeq[key]; ok {
 			def = *d
-		} else if snapDef := db.readSnap().sequence(name); snapDef != nil {
+		} else if snapDef := db.sequence(name); snapDef != nil {
 			def = *snapDef
 		} else {
 			return 0, NewError(UndefinedTable, "relation does not exist: "+name)
 		}
-	} else if snapDef := db.readSnap().sequence(name); snapDef != nil {
+	} else if snapDef := db.sequence(name); snapDef != nil {
 		def = *snapDef
 	} else {
 		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
@@ -1882,7 +1977,7 @@ func (db *Database) seqSetval(name string, n int64, isCalled bool) (int64, error
 	var def SequenceDef
 	if d, ok := db.session.pendingSeq[key]; ok {
 		def = *d
-	} else if snapDef := db.readSnap().sequence(name); snapDef != nil {
+	} else if snapDef := db.sequence(name); snapDef != nil {
 		def = *snapDef
 	} else {
 		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
@@ -1914,7 +2009,7 @@ func (db *Database) seqSetval(name string, n int64, isCalled bool) (int64, error
 // catalog first (42P01 if absent), then reads the running update this statement (pendingCurrval)
 // else the session value (sessionSeq); 55000 if it has not been defined this session.
 func (db *Database) seqCurrval(name string) (int64, error) {
-	if db.readSnap().sequence(name) == nil {
+	if db.sequence(name) == nil {
 		return 0, NewError(UndefinedTable, "relation does not exist: "+name)
 	}
 	key := strings.ToLower(name)
@@ -1961,7 +2056,9 @@ func (db *Database) seqLastval() (int64, error) {
 // instead discarded (cleared at the next statement), giving the transactional rollback (§5).
 func (db *Database) flushPendingSequences() {
 	for _, def := range db.session.pendingSeq {
-		db.working().putSequence(def)
+		// Route each advance to its owning scope (temp-tables.md §8): a serial/IDENTITY temp column's
+		// owned sequence flushes into its temp snapshot (zero file writes), a persistent one into main.
+		db.putSequenceRouted(def)
 	}
 	if len(db.session.pendingCurrval) > 0 && db.session.sessionSeq == nil {
 		db.session.sessionSeq = make(map[string]int64)
@@ -2325,12 +2422,16 @@ func (db *Database) checkPrivileges(stmt Statement) error {
 		case req.isSharedTempDDL ||
 			(stmt.DropTable != nil && db.isSharedTempTable(stmt.DropTable.Name)) ||
 			(stmt.CreateIndex != nil && db.isSharedTempTable(stmt.CreateIndex.Table)) ||
-			(stmt.DropIndex != nil && db.isSharedTempIndex(stmt.DropIndex.Name)):
+			(stmt.DropIndex != nil && db.isSharedTempIndex(stmt.DropIndex.Name)) ||
+			(stmt.DropSequence != nil && db.anySharedTempSequence(stmt.DropSequence.Names)) ||
+			(stmt.AlterSequence != nil && db.isSharedTempSequence(stmt.AlterSequence.Name)):
 			allowed = db.session.allowSharedTempDDL
 		case req.isTempDDL ||
 			(stmt.DropTable != nil && db.isTempTable(stmt.DropTable.Name)) ||
 			(stmt.CreateIndex != nil && db.isTempTable(stmt.CreateIndex.Table)) ||
-			(stmt.DropIndex != nil && db.isTempIndex(stmt.DropIndex.Name)):
+			(stmt.DropIndex != nil && db.isTempIndex(stmt.DropIndex.Name)) ||
+			(stmt.DropSequence != nil && db.anyTempSequence(stmt.DropSequence.Names)) ||
+			(stmt.AlterSequence != nil && db.isTempSequence(stmt.AlterSequence.Name)):
 			allowed = db.session.allowTempDDL
 		default:
 			allowed = db.session.allowDDL
@@ -3567,13 +3668,10 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 
 	if ct.Temp {
 		// Deferred narrowings on a temp table this slice (spec/design/temp-tables.md §8), each a clean
-		// 0A000: a serial/IDENTITY column (needs a temp OWNED sequence), a composite-typed column (needs
-		// the temp snapshot to carry the type catalog), and a collated column (needs the collation
-		// catalog). Plain scalar/array/range/decimal columns with PK / NOT NULL / DEFAULT / CHECK /
-		// UNIQUE are fully supported. With these out, the temp snapshot needs no types/collations catalog.
-		if len(pendingSerials) > 0 {
-			return Outcome{}, NewError(FeatureNotSupported, "serial / IDENTITY column on a temporary table is not yet supported")
-		}
+		// 0A000: a composite-typed column (needs the temp snapshot to carry the type catalog) and a
+		// collated column (needs the collation catalog). Plain scalar/array/range/decimal columns with
+		// PK / NOT NULL / DEFAULT / CHECK / UNIQUE — and now serial/IDENTITY columns, whose OWNED
+		// sequence is staged into the same temp snapshot below — are fully supported.
 		for _, c := range table.Columns {
 			if typeUsesComposite(c.Type) {
 				return Outcome{}, NewError(FeatureNotSupported, "composite-typed column "+c.Name+" on a temporary table is not yet supported")
@@ -3597,6 +3695,14 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		ts.putTable(table, db.pageSize)
 		for _, ix := range table.Indexes {
 			ts.putIndexStore(strings.ToLower(ix.Name), NewTableStore(int(db.pageSize)-12, nil)) // 12 = pageHeader
+		}
+		// Stage each serial/IDENTITY column's OWNED sequence into the SAME temp snapshot
+		// (spec/design/sequences.md §12, temp-tables.md §8) — never the main image, so the sequence
+		// (like the table) makes zero file writes and is dropped with the table. The names were resolved
+		// collision-free during the column walk (relationExists is temp-aware); nextval resolves and
+		// advances them via the scope-aware sequence funnel.
+		for _, s := range pendingSerials {
+			ts.putSequence(s)
 		}
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 	}
@@ -3708,16 +3814,26 @@ func evalChecks(checks []namedCheck, relation string, row Row, env *evalEnv, met
 func (db *Database) executeDropTable(dt *DropTable) (Outcome, error) {
 	// A temp table (spec/design/temp-tables.md): remove it from the matching temp snapshot — never the
 	// main image, so DROP makes zero file writes. No FK-dependent check (a temp table is never an FK
-	// parent, §8) and no owned-sequence sweep (serial on temp is deferred, §8). The temp-DDL capability
-	// gate already ran at dispatch (§5). Session-local first, then shared.
+	// parent, §8), but it DOES auto-drop every sequence OWNED BY the table — a serial/IDENTITY temp
+	// column's owned temp sequence (spec/design/sequences.md §12, temp-tables.md §8) — from the SAME
+	// temp snapshot. The temp-DDL capability gate already ran at dispatch (§5). Session-local first,
+	// then shared.
 	if db.isTempTable(dt.Name) {
 		db.session.tx.tempDirty = true
-		db.tempSnap().removeTable(strings.ToLower(dt.Name))
+		ts := db.tempSnap()
+		for _, sk := range ts.sequencesOwnedBy(dt.Name) {
+			ts.removeSequence(sk)
+		}
+		ts.removeTable(strings.ToLower(dt.Name))
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 	}
 	if db.isSharedTempTable(dt.Name) {
 		db.session.tx.sharedTempDirty = true
-		db.sharedTempSnap().removeTable(strings.ToLower(dt.Name))
+		ts := db.sharedTempSnap()
+		for _, sk := range ts.sequencesOwnedBy(dt.Name) {
+			ts.removeSequence(sk)
+		}
+		ts.removeTable(strings.ToLower(dt.Name))
 		return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 	}
 	if _, ok := db.Table(dt.Name); !ok {
@@ -4014,7 +4130,9 @@ func (db *Database) relationExists(name string) bool {
 	if _, _, ok := db.sharedTempSnap().findIndex(name); ok {
 		return true
 	}
-	return db.readSnap().sequence(name) != nil
+	// The sequence funnel walks session-local → shared → persistent, so an owned TEMP sequence's name
+	// joins the namespace (temp-tables.md §8) — a collision with it is 42P07 too.
+	return db.sequence(name) != nil
 }
 
 // executeCreateIndex analyzes and runs a CREATE INDEX (spec/design/indexes.md §2).
@@ -4346,7 +4464,7 @@ func (db *Database) executeDropSequence(ds *DropSequence) (Outcome, error) {
 		// Missing → 42P01 (unless IF EXISTS). An OWNED (serial) sequence has a dependent — its
 		// column's default — so RESTRICT (the only mode this slice; CASCADE 0A000) is 2BP01
 		// (spec/design/sequences.md §12).
-		seq := db.readSnap().sequence(name)
+		seq := db.sequence(name)
 		if seq == nil {
 			if ds.IfExists {
 				continue
@@ -4354,10 +4472,11 @@ func (db *Database) executeDropSequence(ds *DropSequence) (Outcome, error) {
 			return Outcome{}, NewError(UndefinedTable, "sequence does not exist: "+name)
 		}
 		if seq.OwnedBy != nil {
-			// The owning table is always present (its own DROP TABLE would auto-drop this
-			// sequence first), so the column name for the detail resolves.
+			// The owning table is always present (its own DROP TABLE would auto-drop this sequence
+			// first), so the column name for the detail resolves. The scope-aware lkpTable finds an
+			// owned TEMP sequence's temp owner (temp-tables.md §8).
 			colName, tableName := "", seq.OwnedBy.Table
-			if t, ok := db.readSnap().table(seq.OwnedBy.Table); ok {
+			if t, ok := db.lkpTable(seq.OwnedBy.Table); ok {
 				tableName = t.Name
 				if int(seq.OwnedBy.Column) < len(t.Columns) {
 					colName = t.Columns[seq.OwnedBy.Column].Name
@@ -4368,7 +4487,9 @@ func (db *Database) executeDropSequence(ds *DropSequence) (Outcome, error) {
 				seq.Name, colName, tableName, seq.Name,
 			))
 		}
-		db.working().removeSequence(strings.ToLower(name))
+		// Not owned: remove from whichever scope owns it (a temp sequence is always owned, so this
+		// routed path is reached only for a plain persistent sequence — temp-tables.md §8).
+		db.removeSequenceRouted(name)
 	}
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
@@ -4379,7 +4500,7 @@ func (db *Database) executeDropSequence(ds *DropSequence) (Outcome, error) {
 // change, the counter preserved unless RESTART); RENAME TO moves the catalog key. Touches no session
 // state (currval/lastval unchanged). A catalog write (the write path, transactional, §5).
 func (db *Database) executeAlterSequence(as *AlterSequence) (Outcome, error) {
-	snapDef := db.readSnap().sequence(as.Name)
+	snapDef := db.sequence(as.Name)
 	if snapDef == nil {
 		if as.IfExists {
 			return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
@@ -4401,7 +4522,7 @@ func (db *Database) executeAlterSequence(as *AlterSequence) (Outcome, error) {
 		if err != nil {
 			return Outcome{}, err
 		}
-		db.working().putSequence(newDef)
+		db.putSequenceRouted(newDef)
 	}
 	return Outcome{Kind: OutcomeStatement, Cost: 0}, nil
 }
@@ -4421,13 +4542,30 @@ func (db *Database) alterSequenceRename(existing *SequenceDef, newName string) e
 		if err != nil {
 			return err
 		}
-		db.working().setColumnDefaultExpr(strings.ToLower(existing.OwnedBy.Table),
+		// Route to the owner's scope so a renamed owned TEMP sequence rewrites its column default in
+		// the temp snapshot (temp-tables.md §8).
+		db.setColumnDefaultExprRouted(strings.ToLower(existing.OwnedBy.Table),
 			int(existing.OwnedBy.Column), &DefaultExpr{ExprText: exprText, Expr: expr})
 	}
+	// Capture the owning scope BEFORE the remove: after dropping the old key the new name is in no
+	// scope, so a post-remove route would wrongly default to the main image (temp-tables.md §8).
+	isTemp := db.isTempSequence(existing.Name)
+	isShared := db.isSharedTempSequence(existing.Name)
 	def := *existing
 	def.Name = newName
-	db.working().removeSequence(strings.ToLower(existing.Name))
-	db.working().putSequence(&def)
+	var w *Snapshot
+	switch {
+	case isTemp:
+		db.session.tx.tempDirty = true
+		w = db.session.tx.tempWorking
+	case isShared:
+		db.session.tx.sharedTempDirty = true
+		w = db.session.tx.sharedTempWorking
+	default:
+		w = db.working()
+	}
+	w.removeSequence(strings.ToLower(existing.Name))
+	w.putSequence(&def)
 	return nil
 }
 
