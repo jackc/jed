@@ -48,6 +48,12 @@ pub enum Statement {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct CreateTable {
     pub name: String,
+    /// Whether `TEMP` / `TEMPORARY` preceded `TABLE` — a SESSION-LOCAL temporary table
+    /// (spec/design/temp-tables.md). A temp table makes ZERO writes to the database file (it lives
+    /// outside the serialized `Snapshot`), is private to the creating session, and is dropped at
+    /// session close. Its DDL is gated by `allow_temp_ddl` rather than `allow_ddl` (temp-tables.md
+    /// §5). The database-wide `SHARED` form is a later slice (temp-tables.md §1/§13).
+    pub temp: bool,
     pub columns: Vec<ColumnDef>,
     /// The table-level `PRIMARY KEY (a, b, …)` constraints, each a list of member column
     /// names in key order (spec/design/grammar.md §28). The parser collects every one it

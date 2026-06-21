@@ -141,6 +141,15 @@ pub const DEFAULT_PAGE_SIZE: u32 = 8192;
 /// [`Database::set_max_sql_length`]. Identical across cores (§8).
 pub const DEFAULT_MAX_SQL_LENGTH: usize = 1 << 20;
 
+/// The default per-session storage budget for SESSION-LOCAL temporary tables, in **bytes**
+/// (spec/design/temp-tables.md §7). Temp tables RETAIN bytes across statements, which neither the
+/// per-statement cost ceiling (`max_cost`) nor the cumulative budget (`lifetime_max_cost`) bounds, so
+/// `temp_buffers` is the §13 gate that does: the instant a session's resident temp storage (measured
+/// in the same deterministic logical-byte estimator `work_mem` uses) would exceed it, the write
+/// aborts `54P03`. `0` ⇒ unlimited (a trusted handle); the untrusted-scratch pattern leaves this at a
+/// modest default. Identical across cores (§8); the abort point is part of the cross-core contract.
+pub const DEFAULT_TEMP_BUFFERS: usize = 32 << 20;
+
 /// The maximum composite-type nesting depth (CLAUDE.md §13; spec/design/cost.md §7b). A composite
 /// type's depth is the length of its deepest chain of nested composites, counting itself: a row of
 /// scalars is depth 1, `CREATE TYPE b AS (x a)` is `1 + depth(a)`, and an array field counts as its
@@ -710,9 +719,22 @@ pub struct SessionOptions {
     /// fresh session is unrestricted; `{SELECT}` (via [`PrivilegeSet::EMPTY`]`.with(Select)`) is a
     /// read-only session. Per-object adjustments are [`Session::grant`] / [`Session::revoke`].
     pub default_privileges: PrivilegeSet,
-    /// Whether DDL (CREATE / DROP / ALTER of tables, indexes, types, sequences) is permitted; a
-    /// denied schema change is `42501` (session.md §5.3). Default **on**.
+    /// Whether **persistent** DDL (CREATE / DROP / ALTER of persistent tables, indexes, types,
+    /// sequences) is permitted; a denied schema change is `42501` (session.md §5.3). Default **on**.
+    /// Its scope narrows with temporary tables (temp-tables.md §5): it now governs *persistent* DDL
+    /// specifically, with `allow_temp_ddl` the temp-scoped sibling. Name + default unchanged, so
+    /// existing callers are unaffected.
     pub allow_ddl: bool,
+    /// Whether SESSION-LOCAL **temporary**-table DDL (`CREATE`/`DROP` of a temp table) is permitted
+    /// (spec/design/temp-tables.md §5); a denied temp DDL is `42501`. `None` ⇒ **inherit
+    /// `allow_ddl`'s value** (back-compat: a session left as-is behaves as before, one gate governing
+    /// all DDL). The untrusted-scratch pattern is `allow_ddl = false` + `allow_temp_ddl = Some(true)`
+    /// — private scratch tables only, everything else denied, the §5.3 default-deny posture intact.
+    pub allow_temp_ddl: Option<bool>,
+    /// The per-session storage budget for session-local temp tables, in **bytes**
+    /// (spec/design/temp-tables.md §7); `0` ⇒ unlimited. Default [`DEFAULT_TEMP_BUFFERS`]. Bounds the
+    /// RETAINED temp storage neither cost ceiling covers — an over-budget temp write aborts `54P03`.
+    pub temp_buffers: usize,
 }
 
 impl Default for SessionOptions {
@@ -724,6 +746,8 @@ impl Default for SessionOptions {
             work_mem: crate::spill::DEFAULT_WORK_MEM,
             default_privileges: PrivilegeSet::ALL_TABLE,
             allow_ddl: true,
+            allow_temp_ddl: None,
+            temp_buffers: DEFAULT_TEMP_BUFFERS,
         }
     }
 }
@@ -808,10 +832,17 @@ pub struct Session {
     /// privilege model the host configures and the engine enforces (`42501`) at name resolution. A
     /// fresh session is fully permissive (every table privilege, every function `EXECUTE`).
     pub(crate) privileges: crate::privileges::Privileges,
-    /// Whether DDL (CREATE / DROP / ALTER) is permitted on this session (session.md §5.3); a denied
-    /// schema change is `42501`. Default **on** — jed has no schema/owner model, so this single
-    /// boolean governs all DDL (the per-object CREATE/ownership privilege is a deferred follow-on).
+    /// Whether **persistent** DDL (CREATE / DROP / ALTER of persistent relations) is permitted on this
+    /// session (session.md §5.3); a denied schema change is `42501`. Default **on**. Its scope narrows
+    /// with temporary tables (temp-tables.md §5): `allow_temp_ddl` is the temp-scoped sibling gate.
     pub(crate) allow_ddl: bool,
+    /// Whether session-local **temporary**-table DDL is permitted (spec/design/temp-tables.md §5); a
+    /// denied temp DDL is `42501`. Resolved at session creation from
+    /// [`SessionOptions::allow_temp_ddl`] (defaulting to `allow_ddl`'s value when unset).
+    pub(crate) allow_temp_ddl: bool,
+    /// The per-session temp-table storage budget in **bytes** (spec/design/temp-tables.md §7); `0` ⇒
+    /// unlimited. An over-budget temp write aborts `54P03`.
+    pub(crate) temp_buffers: usize,
     /// The session variables (spec/design/session.md §6.1): PostgreSQL's GUC model scoped to the
     /// session — a `string→string` map (PG GUCs are all text) the host sets (`set_var`/`reset_var`)
     /// and SQL reads with `current_setting`. Custom (dotted) names only in v1. **Session state, not
@@ -875,6 +906,11 @@ impl Session {
             pending_last_name: std::cell::RefCell::new(None),
             privileges,
             allow_ddl: opts.allow_ddl,
+            // Back-compat default-inheritance (temp-tables.md §5): an unset `allow_temp_ddl` takes
+            // `allow_ddl`'s value, so a session configured before temp tables existed behaves exactly
+            // as it did (one gate governing all DDL).
+            allow_temp_ddl: opts.allow_temp_ddl.unwrap_or(opts.allow_ddl),
+            temp_buffers: opts.temp_buffers,
             vars: HashMap::new(),
             read_pin: None,
         }
@@ -993,6 +1029,22 @@ impl Session {
     /// The current work-memory budget.
     pub fn work_mem(&self) -> usize {
         self.work_mem
+    }
+    /// Set whether session-local temporary-table DDL is permitted (spec/design/temp-tables.md §5).
+    pub fn set_allow_temp_ddl(&mut self, allow: bool) {
+        self.allow_temp_ddl = allow;
+    }
+    /// Whether session-local temporary-table DDL is permitted on this session.
+    pub fn allow_temp_ddl(&self) -> bool {
+        self.allow_temp_ddl
+    }
+    /// Set the per-session temp-table storage budget in bytes; `0` ⇒ unlimited.
+    pub fn set_temp_buffers(&mut self, bytes: usize) {
+        self.temp_buffers = bytes;
+    }
+    /// The current per-session temp-table storage budget.
+    pub fn temp_buffers(&self) -> usize {
+        self.temp_buffers
     }
     /// Replace the default table-privilege set — the `GRANT … ON ALL TABLES` default (§5.3). A
     /// read-only session is `PrivilegeSet::EMPTY.with(Privilege::Select)`.
@@ -1471,6 +1523,10 @@ impl Database {
     pub fn reset_privileges(&mut self) {
         self.session.privileges = crate::privileges::Privileges::default();
         self.session.allow_ddl = true;
+        // The temp-DDL gate is part of the authorization envelope (temp-tables.md §5); reset it with
+        // the rest so a `# allow_temp_ddl:` directive never leaks past its record. Default-inherits the
+        // reset `allow_ddl = true`.
+        self.session.allow_temp_ddl = true;
     }
 
     /// Read-only access to the default session's authorization envelope (§5.3).
@@ -1486,6 +1542,31 @@ impl Database {
     /// Whether DDL is permitted on the default session.
     pub fn allow_ddl(&self) -> bool {
         self.session.allow_ddl
+    }
+
+    /// Set whether session-local temporary-table DDL is permitted on the default session
+    /// (spec/design/temp-tables.md §5); a denied temp DDL is `42501`. The temp-scoped split of
+    /// `allow_ddl` — a host may grant this while withholding persistent DDL (the untrusted-scratch
+    /// pattern). A handle setting, not stored in the file.
+    pub fn set_allow_temp_ddl(&mut self, allow: bool) {
+        self.session.allow_temp_ddl = allow;
+    }
+
+    /// Whether session-local temporary-table DDL is permitted on the default session.
+    pub fn allow_temp_ddl(&self) -> bool {
+        self.session.allow_temp_ddl
+    }
+
+    /// Set the default session's per-session temp-table storage budget in **bytes**
+    /// (spec/design/temp-tables.md §7); `0` ⇒ unlimited. An over-budget temp write aborts `54P03`. A
+    /// handle setting, not stored in the file.
+    pub fn set_temp_buffers(&mut self, bytes: usize) {
+        self.session.temp_buffers = bytes;
+    }
+
+    /// The default session's per-session temp-table storage budget (`0` ⇒ unlimited).
+    pub fn temp_buffers(&self) -> usize {
+        self.session.temp_buffers
     }
 
     /// Set a session variable on the default session (spec/design/session.md §6.1). Custom variables
@@ -1965,16 +2046,32 @@ impl Database {
     }
 
     fn check_privileges(&self, stmt: &Statement) -> Result<()> {
-        if self.session.allow_ddl && self.session.privileges.is_permissive() {
+        // Fast path: a session that allows ALL DDL (persistent + temp) and grants every privilege
+        // pays nothing. Both gates must be on, since temp DDL is now its own gate (temp-tables.md §5):
+        // a session with `allow_ddl` on but `allow_temp_ddl` off must still reach the detailed check.
+        if self.session.allow_ddl
+            && self.session.allow_temp_ddl
+            && self.session.privileges.is_permissive()
+        {
             return Ok(());
         }
         let mut req = PrivReq::default();
         collect_stmt_privs(stmt, &mut req);
-        if req.is_ddl && !self.session.allow_ddl {
-            return Err(EngineError::new(
-                SqlState::InsufficientPrivilege,
-                "permission denied: DDL is not permitted in this session",
-            ));
+        if req.is_ddl {
+            // Temp-table DDL is gated by `allow_temp_ddl`; all other DDL by `allow_ddl`
+            // (temp-tables.md §5). The two split so a host can grant bounded scratch tables to an
+            // untrusted session while withholding persistent schema changes.
+            let allowed = if req.is_temp_ddl {
+                self.session.allow_temp_ddl
+            } else {
+                self.session.allow_ddl
+            };
+            if !allowed {
+                return Err(EngineError::new(
+                    SqlState::InsufficientPrivilege,
+                    "permission denied: DDL is not permitted in this session",
+                ));
+            }
         }
         let snap = self.read_snap();
         for (name, priv_) in &req.tables {
@@ -2075,6 +2172,20 @@ impl Database {
     /// left to right (unknown 42703, repeated 42701); then the jed narrowings — the
     /// declaration-order rule and the per-member key-type gate — trap 0A000.
     fn execute_create_table(&mut self, ct: CreateTable) -> Result<Outcome> {
+        // Session-local temporary tables (spec/design/temp-tables.md): the surface (parser),
+        // the `allow_temp_ddl` capability split (§5), and the `temp_buffers` budget plumbing (§7)
+        // have landed; the storage routing — a per-session temp store outside the serialized
+        // Snapshot so a temp table makes zero file writes (§2), with name resolution, DML, and the
+        // 54P03 budget enforcement — is the next increment. Until then a temp CREATE is recognized
+        // but not yet executable, reported honestly (it must NEVER fall through to the persistent
+        // path below, which writes the file). The capability gate (§5) has already run at dispatch.
+        if ct.temp {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "session-local temporary tables are not yet executable \
+                 (surface + capability/budget plumbing landed; storage routing is the next increment)",
+            ));
+        }
         // The relation namespace is shared between tables and indexes (indexes.md §2), so a
         // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
         if self.relation_exists(&ct.name) {
@@ -14317,6 +14428,10 @@ struct PrivReq {
     functions: Vec<String>,
     /// Whether the statement is DDL (CREATE / DROP / ALTER) — gated by `allow_ddl`.
     is_ddl: bool,
+    /// Whether the DDL targets a SESSION-LOCAL temporary table (`CREATE TEMP TABLE`) — gated by
+    /// `allow_temp_ddl` instead of `allow_ddl` (spec/design/temp-tables.md §5). (`DROP` of a temp
+    /// table will join this once temp-name resolution lands; today `DROP TABLE` stays persistent-gated.)
+    is_temp_ddl: bool,
 }
 
 impl PrivReq {
@@ -14333,8 +14448,13 @@ impl PrivReq {
 fn collect_stmt_privs(stmt: &Statement, req: &mut PrivReq) {
     let locals = HashSet::new();
     match stmt {
-        Statement::CreateTable(_)
-        | Statement::DropTable(_)
+        Statement::CreateTable(ct) => {
+            req.is_ddl = true;
+            // A session-local temp table's DDL is gated by `allow_temp_ddl`, not `allow_ddl`
+            // (temp-tables.md §5).
+            req.is_temp_ddl = ct.temp;
+        }
+        Statement::DropTable(_)
         | Statement::CreateIndex(_)
         | Statement::DropIndex(_)
         | Statement::CreateType(_)

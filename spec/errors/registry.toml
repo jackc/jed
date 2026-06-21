@@ -449,6 +449,27 @@ name = "session_cost_limit_exceeded"
 class = "program limit exceeded"
 template = "session exceeded the lifetime cost limit of {limit} (accrued {cost})"
 
+# 54P03 temp_storage_limit_exceeded — a temporary table's storage exceeded its configured byte
+# budget (spec/design/temp-tables.md §7). Temp tables are the engine's first relations whose data is
+# RETAINED across statements yet never durable: the cost meter (54P01) bounds work PER STATEMENT and
+# the lifetime budget (54P02) bounds CUMULATIVE work, but neither bounds bytes held BETWEEN cheap
+# statements, so an adversary could `CREATE TEMP TABLE t(x text); INSERT …; INSERT …;` and accrue
+# unbounded RAM at trivial per-statement cost. This is the §13 gate that closes that hole: a
+# per-session `temp_buffers` budget (session-local temp storage) and, in a later slice, a global
+# `shared_temp_mem` budget (shared temp storage) and the temp-spill disk ceiling. The budget is
+# measured in the same DETERMINISTIC logical-byte estimator `work_mem` uses (spec/design/spill.md),
+# so the abort point is a pure function of (operations, budget) — identical across cores (§8), never
+# dependent on the allocator. jed-specific (PostgreSQL bounds temp storage only via nondeterministic
+# OS OOM / disk-full): a `P`-subclass code in class 54 alongside 54P01/54P02 (the deterministic,
+# host-configured ceilings), deliberately NOT PG's class 53 `insufficient_resources` (which denotes
+# actual, platform-dependent exhaustion). Asserted by the conformance corpus (the resource.temp_budget
+# capability), since the abort point is part of the cross-core contract (no reference impl, §2).
+[[error]]
+code = "54P03"
+name = "temp_storage_limit_exceeded"
+class = "program limit exceeded"
+template = "temporary table storage exceeded the limit of {limit} bytes"
+
 # --- invalid object state (class 55) ----------------------------------------
 # currval/lastval before nextval has defined the value in this session
 # (../design/sequences.md §6).
