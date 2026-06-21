@@ -690,9 +690,13 @@ leans on:
   **Still pending:** the three build tiers (`C`-only / non-CJK / everything, §13) gating which `.coll`
   embed, and removing `db.ImportCollation`/`ExportCollation`/`LoadHostCollation` from production
   (keeping `db.SetDefaultCollation`/`DefaultCollation`/`Collations`).
-- **2c — reference-only on disk** (§5): a `format_version` bump shrinks the `entry_kind` 3 entry to
-  metadata-only (name + `(unicode, cldr)` + description + `is_default` [+ optional `.coll` hash]);
-  the LZ4-compressed baked table is removed.
+- **2c — reference-only on disk** ✅ *landed (all three cores + Ruby)*: `format_version` 17 → **18**
+  shrinks the `entry_kind` 3 entry to **metadata only** — a flags byte (`is_default`) + name +
+  `(unicode_version, cldr_version)` pin + description; the LZ4-compressed baked table is gone. On open
+  the table is resolved from the **vendored** set by name; a name this build does not vendor fails
+  legibly (`42704`, the precursor to 2d's graded verdict). All 46 `.jed` goldens regenerated;
+  `rust == go == ts == ruby` byte-identical. **Still pending:** the optional `.coll` content hash as
+  open-time integrity defense.
 - **2d — the graded verdict for collation** (§3/§12): wire collation into the
   [compatibility.md](compatibility.md) manifest + open-time verdict (full / read-only heap-scan /
   legible refusal) and the `REINDEX`/`COLLATION UPGRADE` migration. Requires `XX002` registered

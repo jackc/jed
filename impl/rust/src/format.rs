@@ -35,10 +35,14 @@ use crate::value::{ArrayVal, RangeVal, Unfetched, Value};
 
 /// File magic — ASCII "JEDB" (the engine is named `jed`).
 const MAGIC: [u8; 4] = *b"JEDB";
-/// On-disk format version — 17 = baked collations (catalog `entry_kind = 3` collation snapshots — a
-/// flags byte `is_default`/`reference` + the LZ4-compressed `.coll` artifact; plus a per-column
-/// collation: flags-byte bit 6 `has_collation` + a trailing name — spec/design/collation.md §5,
-/// spec/fileformat/format.md). v16 = range columns (type_code 17 + an inline element-type descriptor in
+/// On-disk format version — 18 = reference-only collations (the reference-only pivot,
+/// spec/design/collation.md §2/§3/§5): the `entry_kind = 3` collation entry is now **metadata only**
+/// — a flags byte (`is_default`) + name + `(unicode_version, cldr_version)` version pin + description,
+/// with **no compiled table**. The table is vendored into the binary (§9) and resolved by name on
+/// open; the recorded version is the pin a future graded verdict checks (compatibility.md §7). The
+/// per-column collation (flags-byte bit 6 `has_collation` + a trailing name) is unchanged. This
+/// supersedes v17's baked snapshot (the LZ4-compressed `.coll` artifact is gone). v16 = range columns
+/// (type_code 17 + an inline element-type descriptor in
 /// the catalog, spec/design/ranges.md §3, and the compact range value body — a flags byte
 /// EMPTY/LB_INF/UB_INF/LB_INC/UB_INC followed by the present bound bodies, §4). v15 = IDENTITY columns
 /// (the column-entry flags byte gains bit4 `is_identity` + bit5 `identity_always`; an identity column
@@ -53,7 +57,7 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// expression-default flag; v7 added a per-page CRC-32 (header grew 12→16 bytes). Each bump is atomic
 /// across the Rust/Go/TS cores + the Ruby golden reference (every `.jed` golden's version byte + CRC
 /// changed together).
-const FORMAT_VERSION: u16 = 17;
+const FORMAT_VERSION: u16 = 18;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -2372,35 +2376,51 @@ fn decode_sequence_entry(buf: &[u8], pos: &mut usize) -> Result<SequenceDef> {
 /// spec/fileformat/format.md *Collation snapshot entry*. The artifact is byte-identical to
 /// `db.save_collation`, so a golden doubles as an artifact fixture.
 fn collation_entry_bytes(coll: &Collation, is_default: bool) -> Vec<u8> {
+    // Reference-only (format_version 18, collation.md §5): metadata ONLY — the `is_default` flag, the
+    // name, the `(unicode, cldr)` version pin, and the description. The compiled table is NOT stored;
+    // it is vendored into the binary (§2/§9) and resolved by name on open.
     let mut out = Vec::new();
     out.push(if is_default { 0b1u8 } else { 0 });
-    let artifact = crate::collation::save_collation(coll);
-    out.extend_from_slice(&(artifact.len() as u32).to_be_bytes());
-    out.extend_from_slice(&artifact);
+    push_string(&mut out, &coll.name);
+    push_string(&mut out, &coll.unicode_version);
+    push_string(&mut out, &coll.cldr_version);
+    push_string(&mut out, &coll.description);
     out
 }
 
-/// Decode a collation-snapshot entry's body (inverse of `collation_entry_bytes`); the caller has
-/// consumed the `entry_kind` byte. Returns the loaded collation and whether it is the per-database
-/// default (the `is_default` flag bit).
+/// Decode a collation reference entry's body (inverse of `collation_entry_bytes`); the caller has
+/// consumed the `entry_kind` byte. Reads the metadata, then resolves the compiled table from the
+/// binary's **vendored** set by name (§2/§9) — the table is no longer in the file. Returns the
+/// resolved collation and whether it is the per-database default (the `is_default` flag bit).
 fn decode_collation_entry(buf: &[u8], pos: &mut usize) -> Result<(Collation, bool)> {
     let flags = read_u8(buf, pos)?;
-    if flags & !0b11 != 0 {
+    if flags & !0b1 != 0 {
         return Err(corrupt("reserved collation flag set"));
     }
-    if flags & 0b10 != 0 {
-        return Err(corrupt(
-            "reference-mode collation snapshots are not supported yet",
-        ));
-    }
     let is_default = flags & 0b1 != 0;
-    let len = read_u32(buf, pos)? as usize;
-    let end = pos
-        .checked_add(len)
-        .filter(|e| *e <= buf.len())
-        .ok_or_else(|| corrupt("collation artifact truncated"))?;
-    let coll = crate::collation::open_collation(&buf[*pos..end])?;
-    *pos = end;
+    let name = read_string(buf, pos)?;
+    let unicode_version = read_string(buf, pos)?;
+    let cldr_version = read_string(buf, pos)?;
+    let description = read_string(buf, pos)?;
+    // The file records only the version PIN; the table comes from the vendored set. A name this build
+    // does not vendor is a legible failure (the precursor to the graded open-time verdict —
+    // compatibility.md §7 / collation.md §12, slice 2d, which will soften this to read-only degrade).
+    let vend = crate::collation::vendored_collation(&name).ok_or_else(|| {
+        EngineError::new(
+            SqlState::UndefinedObject,
+            format!(
+                "collation \"{name}\" (@ {unicode_version}/{cldr_version}) is not vendored in this build"
+            ),
+        )
+    })?;
+    let coll = Collation {
+        name,
+        unicode_version,
+        cldr_version,
+        description,
+        singles: vend.singles.clone(),
+        contractions: vend.contractions.clone(),
+    };
     Ok((coll, is_default))
 }
 
@@ -3173,6 +3193,13 @@ fn read_string(buf: &[u8], pos: &mut usize) -> Result<String> {
     let len = read_u16(buf, pos)? as usize;
     let bytes = take(buf, pos, len)?.to_vec();
     String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 name"))
+}
+
+/// Write a `u16`-length-prefixed UTF-8 string (the catalog's name/string encoding — the inverse of
+/// `read_string`).
+fn push_string(out: &mut Vec<u8>, s: &str) {
+    out.extend_from_slice(&(s.len() as u16).to_be_bytes());
+    out.extend_from_slice(s.as_bytes());
 }
 
 /// Read an 8-byte big-endian two's-complement i64 (the sequence-entry field encoding).

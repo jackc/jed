@@ -15,20 +15,22 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 17)
+## Version scope (`format_version` 18)
 
-The current on-disk version is **`format_version` 17** — **baked collations**
-([../design/collation.md §5](../design/collation.md)). A loaded collation is a new **kind-tagged
-catalog entry** (`entry_kind` 3 — the *Catalog* section below), emitted **after sequences and before
-tables** (*composites → sequences → collations → tables*): a **flags byte** (bit0 `is_default`, bit1
-`reference` — deferred, always 0/baked this slice) followed by the **baked `.coll` artifact** (a
-`u32` length + the LZ4-compressed compiled table — byte-identical to `db.SaveCollation`, so a golden
-doubles as an artifact fixture). The **per-database default collation** is the `is_default`-flagged
-snapshot (no separate header/meta field — `C` ⇒ none flagged). A **per-column collation** rides the
-column-entry **flags byte bit 6 `has_collation`**; when set, a trailing name (`u16` length + UTF-8)
-follows the default. A `C` (byte-order) column leaves the bit clear and writes nothing, so a
-non-collated table is byte-unchanged but for the version byte + meta CRC. A collation snapshot owns no
-B-tree. Each version is a **clean break** — older versions are **not read** (we are pre-1.0 and owe no
+The current on-disk version is **`format_version` 18** — **reference-only collations** (the
+reference-only pivot, [../design/collation.md §2/§5/§9](../design/collation.md)). A referenced
+collation is a **kind-tagged catalog entry** (`entry_kind` 3 — the *Catalog* section below), emitted
+**after sequences and before tables** (*composites → sequences → collations → tables*), and it is now
+**metadata only**: a **flags byte** (bit0 `is_default`) followed by the **name**, the
+**`(unicode_version, cldr_version)` version pin**, and the **description** — each a `u16` length +
+UTF-8. The **compiled table is NOT in the file**: it is **vendored into the binary** and resolved by
+name on open; the recorded version is the pin a future graded verdict checks. This **supersedes
+v17's baked snapshot** (the LZ4-compressed `.coll` artifact is gone). The **per-database default
+collation** is the `is_default`-flagged entry (no separate header/meta field — `C` ⇒ none flagged). A
+**per-column collation** rides the column-entry **flags byte bit 6 `has_collation`**; when set, a
+trailing name (`u16` length + UTF-8) follows the default. A `C` (byte-order) column leaves the bit
+clear and writes nothing, so a non-collated table is byte-unchanged but for the version byte + meta
+CRC. A collation entry owns no B-tree. Each version is a **clean break** — older versions are **not read** (we are pre-1.0 and owe no
 on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only** version 17.
 
 `format_version` 16 was **range columns**
@@ -342,9 +344,9 @@ B-tree root moves). Its **encoding is byte-identical to v1**; only its location 
 (`root_page`) and `root_data_page` now points at a **B-tree root node** instead of a record
 chain head.
 
-**Each catalog entry is kind-tagged (v9, extended v12/v17):** a leading `entry_kind` u8 — `0` = a
+**Each catalog entry is kind-tagged (v9, extended v12/v18):** a leading `entry_kind` u8 — `0` = a
 table entry, `1` = a composite-type entry ([../design/composite.md §3](../design/composite.md)), `2` =
-a sequence entry ([../design/sequences.md §3](../design/sequences.md)), `3` = a collation snapshot
+a sequence entry ([../design/sequences.md §3](../design/sequences.md)), `3` = a collation reference entry
 ([../design/collation.md §5](../design/collation.md)). Entries are emitted in kind order
 **composite-type (1), then sequence (2), then collation (3), then table (0)**, each group in ascending
 lowercased-name order (collations sort by their exact, case-sensitive name). Each page's `item_count` is the number of entries (of any kind) it holds;
@@ -514,26 +516,29 @@ no B-tree (no `root_data_page`), like a foreign key. The owner reference (`has_o
 so a reopened database still auto-drops the owned sequence on `DROP TABLE`; a plain `CREATE SEQUENCE`
 is non-owned (`has_owner = 0`, no tail).
 
-### Collation snapshot entry (`entry_kind = 3`, v17)
+### Collation reference entry (`entry_kind = 3`, v18)
 
-A collation snapshot records a host-imported, **baked** collation
-([../design/collation.md §5](../design/collation.md)). The entry is a flags byte plus the baked
-`.coll` artifact carried as opaque, length-prefixed bytes — the artifact is byte-identical to
-`db.SaveCollation`, so a `collation_table.jed` golden doubles as an artifact fixture:
+A collation reference entry records that the database **references** a collation, by name + version
+pin — it carries **no table** (the reference-only pivot, [../design/collation.md §2/§5/§9](../design/collation.md)).
+The compiled table is **vendored into the binary** (`spec/collation/fixtures/*.coll`) and resolved by
+name on open; the entry is metadata only:
 
 | field | encoding |
 |---|---|
 | `entry_kind` | u8 = `3` |
-| `flags` | u8 — bit0 `is_default` (this snapshot is the per-database default collation), bit1 `reference` (**reserved/deferred** — always 0/baked this slice; a set bit is `XX001`); bits 2–7 reserved 0 |
-| `artifact_len` | u32 — the baked artifact length in bytes |
-| `artifact` | `artifact_len` bytes — the `.coll` artifact (`JCOLL\0` magic + version + name/unicode/cldr/description strings + content hash + the LZ4-compressed compiled table; [../collation/README.md](../collation/README.md)) |
+| `flags` | u8 — bit0 `is_default` (this collation is the per-database default); bits 1–7 reserved 0 (a set reserved bit is `XX001`) |
+| `name` | u16 length + UTF-8 — the collation name (e.g. `dev-root`) |
+| `unicode_version` | u16 length + UTF-8 — the Unicode version pin the keys were built under |
+| `cldr_version` | u16 length + UTF-8 — the CLDR version pin (`""` if none) |
+| `description` | u16 length + UTF-8 — optional provenance (`""` if none) |
 
-A collation snapshot owns **no B-tree** (no `root_data_page`), like a sequence or foreign key. The
-**per-database default collation** is whichever snapshot carries `is_default` (`C` ⇒ none flagged);
-on load the engine restores it from that bit. Snapshots are emitted in ascending **case-sensitive
-name** order, after sequences and before tables, so a collated table entry is read after the snapshot
-it references. `db.SetDefaultCollation` flips the bit; `db.ExportCollation` returns the artifact bytes
-verbatim.
+On open the engine reads the metadata, resolves the table from the binary's **vendored** set by name,
+and (until the graded verdict of [../design/compatibility.md](../design/compatibility.md) lands) fails
+legibly — `42704` — if this build does not vendor that collation. A collation entry owns **no B-tree**
+(no `root_data_page`), like a sequence or foreign key. The **per-database default collation** is
+whichever entry carries `is_default` (`C` ⇒ none flagged); on load the engine restores it from that
+bit. Entries are emitted in ascending **case-sensitive name** order, after sequences and before tables,
+so a collated table entry is read after the entry it references. `db.SetDefaultCollation` flips the bit.
 
 ### Check-expression text
 

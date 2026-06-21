@@ -13,7 +13,7 @@
 import type { Expr } from "./ast.ts";
 import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type FkAction, type ForeignKey, type IdentityKind, type IndexDef, type SeqOwner, type SequenceDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
-import { type Collation, openCollation, saveCollation } from "./collation.ts";
+import { type Collation, vendoredCollation } from "./collation.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
@@ -65,7 +65,7 @@ import {
   uuidValue,
 } from "./value.ts";
 
-const FORMAT_VERSION = 17; // on-disk format version (17 = baked collations: a catalog entry_kind 3 collation snapshot — a flags byte is_default/reference + the LZ4-compressed .coll artifact — emitted after sequences and before tables, plus a per-column collation: column flags byte bit6 has_collation + a trailing name, spec/design/collation.md §5. 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 18; // on-disk format version (18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -1140,37 +1140,60 @@ function decodeSequenceEntry(buf: Uint8Array, cur: Cursor): SequenceDef {
   };
 }
 
-// collationEntryBytes serializes a collation-snapshot catalog entry's BODY (after its entry_kind = 3
-// byte, v17): a flags byte (bit0 is_default, bit1 reference — deferred, 0/baked) + the baked .coll
-// artifact (u32 length + LZ4-compressed bytes). The artifact is byte-identical to db.saveCollation,
-// so a golden doubles as an artifact fixture (spec/design/collation.md §5).
+// wstr writes a u16-length-prefixed UTF-8 string (the catalog's name/string encoding).
+function wstr(w: ByteWriter, s: string): void {
+  const b = UTF8.encode(s);
+  w.u16(b.length);
+  w.bytes(b);
+}
+
+// collationEntryBytes serializes a collation reference entry's BODY (after its entry_kind = 3 byte,
+// v18): a flags byte (bit0 is_default), then metadata ONLY — name + unicodeVersion + cldrVersion +
+// description, each u16-len + UTF-8. NO table: it is vendored into the binary and resolved by name on
+// open (spec/design/collation.md §2/§5/§9).
 function collationEntryBytes(c: Collation, isDefault: boolean): Uint8Array {
   const w = new ByteWriter();
   w.u8(isDefault ? 0b1 : 0);
-  const artifact = saveCollation(c);
-  w.u32(artifact.length);
-  w.bytes(artifact);
+  wstr(w, c.name);
+  wstr(w, c.unicodeVersion);
+  wstr(w, c.cldrVersion);
+  wstr(w, c.description);
   return w.toBytes();
 }
 
-// decodeCollationEntry decodes a collation-snapshot entry's body (inverse of collationEntryBytes);
-// the caller has consumed the entry_kind byte. Returns the loaded collation + whether it is the
-// per-database default (the is_default flag bit).
+// decodeCollationEntry decodes a collation reference entry's body (inverse of collationEntryBytes);
+// the caller has consumed the entry_kind byte. Reads the metadata, then resolves the compiled table
+// from the binary's VENDORED set by name (§2/§9) — the table is no longer in the file. Returns the
+// resolved collation + whether it is the per-database default (the is_default flag bit).
 function decodeCollationEntry(buf: Uint8Array, cur: Cursor): { coll: Collation; isDefault: boolean } {
   const flags = readU8(buf, cur);
-  if ((flags & ~0b11) !== 0) {
+  if ((flags & ~0b1) !== 0) {
     throw engineError("data_corrupted", "reserved collation flag set");
   }
-  if ((flags & 0b10) !== 0) {
-    throw engineError("data_corrupted", "reference-mode collation snapshots are not supported yet");
+  const isDefault = (flags & 0b1) !== 0;
+  const name = readString(buf, cur);
+  const unicode = readString(buf, cur);
+  const cldr = readString(buf, cur);
+  const desc = readString(buf, cur);
+  // The file records only the version PIN; the table comes from the vendored set. A name this build
+  // does not vendor is a legible failure (the precursor to the graded open-time verdict —
+  // compatibility.md §7 / collation.md §12, slice 2d, which will soften this to read-only degrade).
+  const vend = vendoredCollation(name);
+  if (vend === undefined) {
+    throw engineError(
+      "undefined_object",
+      `collation "${name}" (@ ${unicode}/${cldr}) is not vendored in this build`,
+    );
   }
-  const len = readU32(buf, cur);
-  if (cur.pos + len > buf.length) {
-    throw engineError("data_corrupted", "collation artifact truncated");
-  }
-  const artifact = buf.subarray(cur.pos, cur.pos + len);
-  cur.pos += len;
-  return { coll: openCollation(artifact), isDefault: (flags & 0b1) !== 0 };
+  const coll: Collation = {
+    name,
+    unicodeVersion: unicode,
+    cldrVersion: cldr,
+    description: desc,
+    singles: vend.singles,
+    contractions: vend.contractions,
+  };
+  return { coll, isDefault };
 }
 
 // pack greedily packs item sizes into pages of capacity `capacity`, returning groups of

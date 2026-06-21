@@ -14,13 +14,13 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 17 # format_version 17: baked collations — a catalog entry_kind 3 collation snapshot (a
-# flags byte: bit0 is_default, bit1 reference [deferred, 0 = baked]; then the baked `.coll` artifact
-# as u32 length + LZ4-compressed bytes), emitted after sequences and before tables; plus a per-column
-# collation — the column-entry flags byte gains bit6 has_collation, and when set a trailing name
-# (u16-len + UTF-8) after the default. C (no collation) leaves the bit clear and writes nothing, so a
-# non-collated table/column is byte-unchanged but for the meta version byte. The per-database default
-# collation rides the is_default flag on its snapshot (spec/design/collation.md §5). format_version 16
+VERSION = 18 # format_version 18: reference-only collations — the catalog entry_kind 3 collation
+# entry is now METADATA ONLY (a flags byte bit0 is_default; then name + unicode_version +
+# cldr_version + description, each u16-len + UTF-8), emitted after sequences and before tables. The
+# compiled table is NOT in the file — it is vendored into the binary and resolved by name on open
+# (spec/design/collation.md §2/§5/§9); the recorded version is the pin. This supersedes v17's baked
+# snapshot (the LZ4-compressed `.coll` artifact is gone). The per-column collation is unchanged (the
+# column-entry flags byte bit6 has_collation + a trailing name; C leaves it clear). format_version 16
 # was range columns — a column type can be a range (type_code 17 + an
 # inline element-type descriptor, one scalar code, spec/design/ranges.md §3), and a range value is a
 # flags byte (bit0 EMPTY, bit1 LB_INF, bit2 UB_INF, bit3 LB_INC, bit4 UB_INC) followed by the present
@@ -827,16 +827,16 @@ IDENTITY_TABLE = {
              rows: [[1, 1, "hi"]] }]
 }.freeze
 
-# collation_table (v17): a baked COLLATION snapshot (entry_kind 3) + per-column collations. The
-# dev-root collation is imported and set as the per-database default (the is_default flag); the baked
-# artifact is the committed spec/collation/fixtures/dev-root.coll (= db.SaveCollation, treated opaquely
-# here). `name` carries an explicit COLLATE "dev-root" (flags bit6 + name), `plain` is un-annotated and
-# inherits the default (also dev-root, frozen), and `byteorder` carries explicit COLLATE "C" → no
-# collation (bit6 clear). Must match the cores' collation_table_db (spec/design/collation.md §5).
+# collation_table (v18): a reference-only COLLATION entry (entry_kind 3) + per-column collations. The
+# dev-root collation is referenced and set as the per-database default (the is_default flag); the entry
+# is metadata only — name + version pin + description, NO table (the table is vendored into the binary,
+# spec/design/collation.md §2/§5/§9). dev-root's metadata comes from its @version record: unicode
+# "0.0.0-dev", no cldr, no description. `name` carries an explicit COLLATE "dev-root" (flags bit6 +
+# name), `plain` is un-annotated and inherits the default (also dev-root, frozen), and `byteorder`
+# carries explicit COLLATE "C" → no collation (bit6 clear). Must match the cores' collation_table_db.
 COLLATION_TABLE = {
   collations: [
-    { name: "dev-root", default: true,
-      artifact: File.binread(File.join(__dir__, "..", "collation", "fixtures", "dev-root.coll")) }
+    { name: "dev-root", default: true, unicode: "0.0.0-dev", cldr: "", desc: "" }
   ],
   tables: [{ name: "t",
              columns: [col("id", "i32", pk: true),
@@ -853,8 +853,7 @@ COLLATION_TABLE = {
 # collation_pk_table_db (spec/design/collation.md §8).
 COLLATION_PK_TABLE = {
   collations: [
-    { name: "dev-root", default: false,
-      artifact: File.binread(File.join(__dir__, "..", "collation", "fixtures", "dev-root.coll")) }
+    { name: "dev-root", default: false, unicode: "0.0.0-dev", cldr: "", desc: "" }
   ],
   tables: [{ name: "t",
              columns: [col("name", "text", pk: true, collation: "dev-root"),
@@ -1471,31 +1470,29 @@ def sequence_entry_bytes(s)
   out
 end
 
-# Serialize a collation-snapshot catalog entry's BODY (after its entry_kind = 3 byte, v17): a flags
-# byte (bit0 is_default, bit1 reference — deferred, 0/baked), then the baked `.coll` artifact (u32
-# length + LZ4-compressed bytes). The artifact is treated opaquely (Ruby has no collation compiler) —
-# it is byte-identical to db.SaveCollation (spec/design/collation.md §5, format.md *Collation entry*).
+# Serialize a collation reference entry's BODY (after its entry_kind = 3 byte, v18): a flags byte
+# (bit0 is_default), then the metadata — name + unicode_version + cldr_version + description, each
+# u16-len + UTF-8. NO table: it is vendored into the binary and resolved by name on open
+# (spec/design/collation.md §2/§5/§9, format.md *Collation entry*).
 def collation_entry_bytes(c)
   out = +"".b
   out << [c[:default] ? 0b1 : 0].pack("C")
-  out << u32(c[:artifact].bytesize) << c[:artifact].b
+  [c[:name], c[:unicode], c[:cldr], c[:desc]].each { |s| out << u16(s.bytesize) << s.b }
   out
 end
 
-# Decode a collation-snapshot entry's body (inverse of collation_entry_bytes); the caller has
-# consumed the entry_kind byte. The artifact is opaque (its name lives inside, prefixed after the
-# 6-byte JCOLL\0 magic + 2-byte version — read for the expected comparison).
+# Decode a collation reference entry's body (inverse of collation_entry_bytes); the caller has
+# consumed the entry_kind byte. Reads the metadata only — the table is not in the file.
 def decode_collation_entry(buf, pos)
   fb, pos = take(buf, pos, 1)
   f = fb.getbyte(0)
-  raise "reserved collation flag set" if (f & ~0b11) != 0
-  raise "reference-mode collation snapshots are not supported yet" if (f & 0b10) != 0
+  raise "reserved collation flag set" if (f & ~0b1) != 0
 
-  lb, pos = take(buf, pos, 4)
-  artifact, pos = take(buf, pos, lb.unpack1("N"))
-  nl = artifact.byteslice(8, 2).unpack1("n") # name length: after JCOLL\0 (6) + version (2)
-  name = artifact.byteslice(10, nl).force_encoding("UTF-8")
-  [{ name: name, default: (f & 0b1) != 0, artifact: artifact }, pos]
+  name, pos = take_str(buf, pos)
+  unicode, pos = take_str(buf, pos)
+  cldr, pos = take_str(buf, pos)
+  desc, pos = take_str(buf, pos)
+  [{ name: name, default: (f & 0b1) != 0, unicode: unicode, cldr: cldr, desc: desc }, pos]
 end
 
 # (key, row) pairs in stored (encoded-key) order. PK tables key on the PK member columns —
@@ -1911,6 +1908,13 @@ def take(buf, pos, n)
   raise "unexpected end of page data" if pos + n > buf.bytesize
 
   [buf.byteslice(pos, n), pos + n]
+end
+
+# Read a u16-length-prefixed UTF-8 string (the catalog's name/string encoding).
+def take_str(buf, pos)
+  nl, pos = take(buf, pos, 2)
+  s, pos = take(buf, pos, nl.unpack1("n"))
+  [s.force_encoding("UTF-8"), pos]
 end
 
 def read_meta(image, ps, slot)
@@ -2548,7 +2552,7 @@ end
 
 def expected_collations(fx)
   (fx[:collations] || []).sort_by { |c| c[:name] }
-                         .map { |c| { name: c[:name], default: !!c[:default], artifact: c[:artifact] } }
+                         .map { |c| { name: c[:name], default: !!c[:default], unicode: c[:unicode], cldr: c[:cldr], desc: c[:desc] } }
 end
 
 # The composite-type content a fixture should decode to (name-sorted, normalized fields).
@@ -2715,7 +2719,7 @@ def verify
     fail!("#{fx[:file]}: decoded #{decoded[:collations].size} collations, expected #{want_colls.size}") unless decoded[:collations].size == want_colls.size
     decoded[:collations].each_with_index do |c, i|
       unless content_equal?(c, want_colls[i])
-        fail!("#{fx[:file]}: collation #{i} mismatch\n  got:  #{c[:name].inspect} default=#{c[:default]}\n  want: #{want_colls[i][:name].inspect} default=#{want_colls[i][:default]}")
+        fail!("#{fx[:file]}: collation #{i} mismatch\n  got:  #{c.inspect}\n  want: #{want_colls[i].inspect}")
       end
     end
   end

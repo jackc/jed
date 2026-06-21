@@ -11,6 +11,7 @@ package jed
 import (
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"slices"
 	"sort"
@@ -22,7 +23,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 17    // on-disk format version (17 = baked collations: a catalog entry_kind 3 collation snapshot — a flags byte is_default/reference + the LZ4-compressed .coll artifact — emitted after sequences and before tables, plus a per-column collation: column flags byte bit6 has_collation + a trailing name, spec/design/collation.md §5. 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion   uint16 = 18    // on-disk format version (18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -466,6 +467,12 @@ func encodeScalar(ty ScalarType, v Value) []byte {
 }
 
 func appendU16(b []byte, v uint16) []byte { return append(b, byte(v>>8), byte(v)) }
+
+// appendString writes a u16-length-prefixed UTF-8 string (the catalog's name/string encoding).
+func appendString(b []byte, s string) []byte {
+	b = appendU16(b, uint16(len(s)))
+	return append(b, s...)
+}
 func appendU32(b []byte, v uint32) []byte {
 	return append(b, byte(v>>24), byte(v>>16), byte(v>>8), byte(v))
 }
@@ -1976,10 +1983,10 @@ func decodeSequenceEntry(buf []byte, pos *int) (*SequenceDef, error) {
 	}, nil
 }
 
-// collationEntryBytes serializes a collation-snapshot catalog entry's BODY (after its entry_kind = 3
-// byte, v17): a flags byte (bit0 is_default, bit1 reference — deferred, 0/baked this slice) + the
-// baked .coll artifact (u32 length + LZ4-compressed bytes). The artifact is byte-identical to
-// db.SaveCollation, so a golden doubles as an artifact fixture (spec/design/collation.md §5).
+// collationEntryBytes serializes a collation reference entry's BODY (after its entry_kind = 3 byte,
+// v18): a flags byte (bit0 is_default), then metadata ONLY — name + unicode_version + cldr_version +
+// description, each u16-len + UTF-8. NO table: it is vendored into the binary and resolved by name on
+// open (spec/design/collation.md §2/§5/§9).
 func collationEntryBytes(c *Collation, isDefault bool) []byte {
 	var out []byte
 	var flags byte
@@ -1987,39 +1994,57 @@ func collationEntryBytes(c *Collation, isDefault bool) []byte {
 		flags = 0b1
 	}
 	out = append(out, flags)
-	artifact := SaveCollation(c)
-	out = appendU32(out, uint32(len(artifact)))
-	out = append(out, artifact...)
+	out = appendString(out, c.Name)
+	out = appendString(out, c.UnicodeVersion)
+	out = appendString(out, c.CldrVersion)
+	out = appendString(out, c.Description)
 	return out
 }
 
-// decodeCollationEntry decodes a collation-snapshot entry's body (inverse of collationEntryBytes);
-// the caller has consumed the entry_kind byte. Returns the loaded collation + whether it is the
-// per-database default (the is_default flag bit).
+// decodeCollationEntry decodes a collation reference entry's body (inverse of collationEntryBytes);
+// the caller has consumed the entry_kind byte. Reads the metadata, then resolves the compiled table
+// from the binary's VENDORED set by name (§2/§9) — the table is no longer in the file. Returns the
+// resolved collation + whether it is the per-database default (the is_default flag bit).
 func decodeCollationEntry(buf []byte, pos *int) (*Collation, bool, error) {
 	flags, err := readU8(buf, pos)
 	if err != nil {
 		return nil, false, err
 	}
-	if flags&^uint8(0b11) != 0 {
+	if flags&^uint8(0b1) != 0 {
 		return nil, false, NewError(DataCorrupted, "reserved collation flag set")
 	}
-	if flags&0b10 != 0 {
-		return nil, false, NewError(DataCorrupted, "reference-mode collation snapshots are not supported yet")
-	}
 	isDefault := flags&0b1 != 0
-	n, err := readU32(buf, pos)
+	name, err := readString(buf, pos)
 	if err != nil {
 		return nil, false, err
 	}
-	if *pos+int(n) > len(buf) {
-		return nil, false, NewError(DataCorrupted, "collation artifact truncated")
-	}
-	artifact := buf[*pos : *pos+int(n)]
-	*pos += int(n)
-	coll, err := OpenCollation(artifact)
+	unicode, err := readString(buf, pos)
 	if err != nil {
 		return nil, false, err
+	}
+	cldr, err := readString(buf, pos)
+	if err != nil {
+		return nil, false, err
+	}
+	desc, err := readString(buf, pos)
+	if err != nil {
+		return nil, false, err
+	}
+	// The file records only the version PIN; the table comes from the vendored set. A name this build
+	// does not vendor is a legible failure (the precursor to the graded open-time verdict —
+	// compatibility.md §7 / collation.md §12, slice 2d, which will soften this to read-only degrade).
+	vend := VendoredCollation(name)
+	if vend == nil {
+		return nil, false, NewError(UndefinedObject,
+			fmt.Sprintf("collation %q (@ %s/%s) is not vendored in this build", name, unicode, cldr))
+	}
+	coll := &Collation{
+		Name:           name,
+		UnicodeVersion: unicode,
+		CldrVersion:    cldr,
+		Description:    desc,
+		Singles:        vend.Singles,
+		Contractions:   vend.Contractions,
 	}
 	return coll, isDefault, nil
 }
