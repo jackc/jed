@@ -1,0 +1,45 @@
+# Data-modifying CTE error surface (spec/design/writable-cte.md §5). The codes match the live
+# PostgreSQL 18 oracle: a FROM reference to a no-RETURNING data-modifying CTE is 0A000; a
+# data-modifying target that is not a base table is 42P01; two parts inserting the same key is
+# 23505. (The update/update and update/delete same-row divergences are jed's deterministic
+# last-write-wins and live in per-core unit tests, not this PG-clean corpus.)
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.delete, dml.returning, query.select, query.aggregates, query.union, query.select_star, query.cte, query.cte_data_modifying, dml.with_clause, types.i32
+
+statement ok
+CREATE TABLE e (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO e VALUES (1), (2)
+
+# A FROM reference to a data-modifying CTE that has no RETURNING clause is 0A000 — it produces no
+# columns. The error is raised at resolution (PostgreSQL: addRangeTableEntryForCTE), before any
+# execution, so e is not modified.
+statement error 0A000
+WITH d AS (DELETE FROM e WHERE id = 1) SELECT count(*) FROM d
+
+# ... e is untouched (the statement above errored before executing the DELETE).
+query I nosort
+SELECT count(*) FROM e
+----
+2
+
+# A data-modifying statement's target resolves against the catalog only: a CTE name with no base
+# table is 42P01 (a CTE is not a modifiable relation).
+statement error 42P01
+WITH x AS (SELECT 1) INSERT INTO x VALUES (1)
+
+# Two data-modifying parts inserting the same key collide: the second part's staged write meets the
+# first's, raising 23505 (the whole statement aborts all-or-nothing).
+statement ok
+CREATE TABLE k (id i32 PRIMARY KEY)
+
+statement error 23505
+WITH a AS (INSERT INTO k VALUES (1) RETURNING *),
+     b AS (INSERT INTO k VALUES (1) RETURNING *)
+SELECT * FROM a UNION ALL SELECT * FROM b
+
+# ... nothing was committed (k is still empty).
+query I nosort
+SELECT count(*) FROM k
+----
+0

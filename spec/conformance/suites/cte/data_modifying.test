@@ -1,0 +1,109 @@
+# Data-modifying (writable) CTEs (spec/design/writable-cte.md): a WITH item's body may be an
+# INSERT/UPDATE/DELETE with its own optional RETURNING, feeding its RETURNING rows forward as a
+# named relation. Every sub-statement of the WITH reads ONE pre-statement snapshot (a read pin) —
+# they cannot see each other's effects on the target tables, so data crosses ONLY via a CTE's
+# RETURNING buffer; the parts run in lexical order, each data-modifying CTE always to completion and
+# materialized, and the whole statement is one all-or-nothing transaction. Rows verified against the
+# live PostgreSQL 18 oracle.
+# requires: ddl.create_table, ddl.primary_key, ddl.column_default, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, query.select, query.select_star, query.column_alias, query.where_eq, query.comparison_order, query.order_by, query.aggregates, query.cross_join, query.table_alias, query.qualified_column, query.cte, query.cte_data_modifying, expr.arithmetic, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32 DEFAULT 7, w i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300)
+
+# An INSERT-CTE projects its RETURNING rows forward as the relation `ins`; the main query scans
+# that buffer. The two rows are inserted (always to completion) before the SELECT runs.
+# names: id, v
+query II nosort
+WITH ins AS (INSERT INTO t VALUES (4, 40, 400), (5, 50, 500) RETURNING id, v)
+SELECT id, v FROM ins ORDER BY id
+----
+4
+40
+5
+50
+
+# The shared-snapshot gotcha (PostgreSQL-verbatim): the MAIN query reads the PRE-statement `t`, so
+# count is 5 even though the CTE inserts a 6th row. The insert still lands.
+# names: c
+query I nosort
+WITH a AS (INSERT INTO t VALUES (6, 60, 600) RETURNING *) SELECT count(*) AS c FROM t
+----
+5
+
+# ... and after the statement, the row really is there (6 rows now).
+query I nosort
+SELECT count(*) FROM t
+----
+6
+
+# An UPDATE-CTE returns the NEW (post-assignment) rows; two rows match the range bound.
+# names: id, v
+query II nosort
+WITH u AS (UPDATE t SET v = v + 1 WHERE id <= 2 RETURNING id, v)
+SELECT id, v FROM u ORDER BY id
+----
+1
+11
+2
+21
+
+# A DELETE-CTE returns the deleted OLD row, fed to the main query (id 6 was added above).
+# names: id, v
+query II nosort
+WITH d AS (DELETE FROM t WHERE id = 6 RETURNING id, v) SELECT id, v FROM d
+----
+6
+60
+
+# A data-modifying CTE referenced TWICE is materialized once (it runs to completion once, its
+# buffer is re-scanned): the self-cross-join sees the two inserted ids paired four ways.
+# names: x, y
+query II rowsort
+WITH ins AS (INSERT INTO t VALUES (7, 70, 700), (8, 80, 800) RETURNING id)
+SELECT a.id AS x, b.id AS y FROM ins a CROSS JOIN ins b
+----
+7
+7
+7
+8
+8
+7
+8
+8
+
+# A data-modifying CTE's source query references an EARLIER CTE (the binding is in scope): the
+# INSERT reads CTE `a`, inserting its rows into dst, and returns them.
+statement ok
+CREATE TABLE dst (x i32)
+
+# names: x
+query I nosort
+WITH a AS (SELECT id FROM t WHERE id <= 2),
+     b AS (INSERT INTO dst SELECT id FROM a RETURNING x)
+SELECT x FROM b ORDER BY x
+----
+1
+2
+
+# The column-rename list renames a data-modifying CTE's RETURNING output columns.
+# names: k
+query I nosort
+WITH ins (k) AS (INSERT INTO t VALUES (9, 90, 900) RETURNING id) SELECT k FROM ins
+----
+9
+
+# A side-effect-only data-modifying CTE (no RETURNING), unreferenced, still runs to completion: the
+# SELECT primary returns its own row while the DELETE removes id 9.
+# names: ok
+query I nosort
+WITH d AS (DELETE FROM t WHERE id = 9) SELECT 1 AS ok
+----
+1
+
+# ... id 9 is gone (the side-effect landed).
+query I rowsort
+SELECT id FROM t WHERE id = 9
+----

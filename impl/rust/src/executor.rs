@@ -6,7 +6,8 @@
 
 use crate::ast::{
     AlterSeqAction, AlterSequence, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
-    CreateSequence, CreateTable, CreateType, Delete, DropIndex, DropSequence, DropTable, DropType,
+    CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
+    DropTable, DropType,
     Expr, Insert, InsertSource, InsertValue, JoinKind, Literal, OnConflict, OrderKey, Overriding,
     QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
     SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
@@ -805,6 +806,13 @@ pub struct Session {
     /// snapshot state**: it does NOT roll back with a transaction (PG `SET SESSION`), and it carries
     /// across the additional-session swap because it lives on `Session` (like the privilege envelope).
     pub(crate) vars: HashMap<String, String>,
+    /// The **read pin** for a data-modifying `WITH` statement (spec/design/writable-cte.md §2): the
+    /// single pre-statement snapshot every sub-statement reads, so the data-modifying CTEs and the
+    /// primary cannot observe each other's table writes (their writes still accumulate into the
+    /// transaction's `working`). Set by the writable-CTE orchestrator before the first sub-statement
+    /// runs and cleared when it finishes (success or error); `None` for every other statement, where
+    /// reads fall through to `working`/`committed` as usual ([`Database::read_snap`]).
+    pub(crate) read_pin: Option<Snapshot>,
 }
 
 /// Validate + canonicalize a session-variable name (spec/design/session.md §6.1). A variable must be
@@ -856,6 +864,7 @@ impl Session {
             privileges,
             allow_ddl: opts.allow_ddl,
             vars: HashMap::new(),
+            read_pin: None,
         }
     }
 
@@ -1109,9 +1118,14 @@ impl Database {
         }
     }
 
-    /// The snapshot a read sees: the open transaction's `working` (read-your-writes for a
-    /// writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
+    /// The snapshot a read sees: the **read pin** if one is set (a data-modifying `WITH` statement
+    /// pins the pre-statement snapshot so every sub-statement reads it — writable-cte.md §2), else
+    /// the open transaction's `working` (read-your-writes for a writable tx; the pinned snapshot for
+    /// a read-only tx), else the committed snapshot.
     fn read_snap(&self) -> &Snapshot {
+        if let Some(pin) = &self.session.read_pin {
+            return pin;
+        }
         match &self.session.tx {
             Some(tx) => &tx.working,
             None => &self.committed,
@@ -2031,12 +2045,12 @@ impl Database {
                 reject_params_for_ddl(params)?;
                 self.execute_alter_sequence(als)
             }
-            Statement::Insert(ins) => self.execute_insert(ins, params),
+            Statement::Insert(ins) => self.execute_insert(ins, params, CteCtx::empty()),
             Statement::Select(sel) => self.execute_select(sel, params),
             Statement::SetOp(so) => self.execute_set_op(so, params),
             Statement::With(wq) => self.execute_with(wq, params),
-            Statement::Update(upd) => self.execute_update(upd, params),
-            Statement::Delete(del) => self.execute_delete(del, params),
+            Statement::Update(upd) => self.execute_update(upd, params, CteCtx::empty()),
+            Statement::Delete(del) => self.execute_delete(del, params, CteCtx::empty()),
             // Transaction control is handled by `execute_stmt_params` before dispatch.
             Statement::Begin { .. } | Statement::Commit | Statement::Rollback => {
                 unreachable!("transaction control is handled before dispatch")
@@ -3579,7 +3593,7 @@ impl Database {
     /// the embedded query's accrued cost. The `SELECT` source additionally validates output
     /// arity (42601) and per-column type assignability (42804) **up front**, before any row is
     /// produced — so both fire even over an empty source.
-    fn execute_insert(&mut self, ins: Insert, params: &[Value]) -> Result<Outcome> {
+    fn execute_insert(&mut self, ins: Insert, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
         let Insert {
             table,
             columns: col_list,
@@ -3738,7 +3752,7 @@ impl Database {
                 // (grammar.md §32).
                 let ret = match &returning {
                     Some(items) => {
-                        Some(self.resolve_returning(&table, items, false, &mut ptypes)?)
+                        Some(self.resolve_returning(&table, items, false, ctx.bindings, &mut ptypes)?)
                     }
                     None => None,
                 };
@@ -3790,14 +3804,10 @@ impl Database {
                 let mut ret_nodes = ret;
                 if let Some((nodes, _, _)) = &mut ret_nodes {
                     // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3),
-                    // reading the pre-statement snapshot (grammar.md §32).
+                    // reading the pre-statement snapshot (grammar.md §32). They see the statement's
+                    // CTE bindings (writable-cte.md) via `ctx`.
                     for node in nodes {
-                        self.fold_uncorrelated_in_rexpr(
-                            node,
-                            &bound,
-                            CteCtx::empty(),
-                            &mut meter.accrued,
-                        )?;
+                        self.fold_uncorrelated_in_rexpr(node, &bound, ctx, &mut meter.accrued)?;
                     }
                 }
                 self.fold_conflict_plan(&mut conflict_plan, &bound, &mut meter.accrued)?;
@@ -3813,6 +3823,7 @@ impl Database {
                     conflict_plan.as_ref(),
                     ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice()),
                     &bound,
+                    ctx,
                     &mut meter,
                 )?;
                 Ok(match (ret_nodes, returned) {
@@ -3849,10 +3860,13 @@ impl Database {
                 // before phase 2 mutates the store (a self-insert reads the pre-insert
                 // snapshot — §24).
                 let mut ptypes = ParamTypes::default();
-                let mut plan = self.plan_query(&QueryExpr::Select(sel), None, &[], &mut ptypes)?;
+                // The source query (and the RETURNING sublinks) see the statement's CTE bindings
+                // (writable-cte.md) — the move-rows idiom INSERTs a SELECT over a CTE buffer.
+                let mut plan =
+                    self.plan_query(&QueryExpr::Select(sel), None, ctx.bindings, &mut ptypes)?;
                 let ret = match &returning {
                     Some(items) => {
-                        Some(self.resolve_returning(&table, items, false, &mut ptypes)?)
+                        Some(self.resolve_returning(&table, items, false, ctx.bindings, &mut ptypes)?)
                     }
                     None => None,
                 };
@@ -3862,25 +3876,15 @@ impl Database {
                 };
                 let bound = bind_params(params, &ptypes.finalize()?)?;
                 let mut meter = self.session.new_meter();
-                self.fold_uncorrelated_in_plan(
-                    &mut plan,
-                    &bound,
-                    CteCtx::empty(),
-                    &mut meter.accrued,
-                )?;
+                self.fold_uncorrelated_in_plan(&mut plan, &bound, ctx, &mut meter.accrued)?;
                 self.fold_conflict_plan(&mut conflict_plan, &bound, &mut meter.accrued)?;
                 let mut ret_nodes = ret;
                 if let Some((nodes, _, _)) = &mut ret_nodes {
                     for node in nodes {
-                        self.fold_uncorrelated_in_rexpr(
-                            node,
-                            &bound,
-                            CteCtx::empty(),
-                            &mut meter.accrued,
-                        )?;
+                        self.fold_uncorrelated_in_rexpr(node, &bound, ctx, &mut meter.accrued)?;
                     }
                 }
-                let q = self.exec_query_plan(&plan, &[], &bound, CteCtx::empty())?;
+                let q = self.exec_query_plan(&plan, &[], &bound, ctx)?;
 
                 // Arity: the SELECT's output column count must match the target — checked before
                 // any row is produced, so it fires even when the source returns zero rows.
@@ -3968,6 +3972,7 @@ impl Database {
                     conflict_plan.as_ref(),
                     ret_nodes.as_ref().map(|(nodes, _, _)| nodes.as_slice()),
                     &bound,
+                    ctx,
                     &mut meter,
                 )?;
                 Ok(match (ret_nodes, returned) {
@@ -4016,6 +4021,7 @@ impl Database {
         rows: Vec<Vec<Value>>,
         returning: Option<&[RExpr]>,
         params: &[Value],
+        ctes: CteCtx,
         meter: &mut Meter,
     ) -> Result<Option<Vec<Vec<Value>>>> {
         let n = columns.len();
@@ -4202,7 +4208,7 @@ impl Database {
         let returned = match returning {
             Some(nodes) => {
                 let prows: Vec<&Row> = prepared.iter().map(|(_, r)| r).collect();
-                Some(self.project_returning(nodes, &prows, None, params, meter)?)
+                Some(self.project_returning(nodes, &prows, None, params, ctes, meter)?)
             }
             None => None,
         };
@@ -4220,18 +4226,31 @@ impl Database {
             for (k, def) in indexes.iter().enumerate() {
                 index_inserts[k].extend(index_entry_keys(columns, &colls, def, &key, &row)?);
             }
-            assert!(
-                store.insert(key, row)?,
-                "pre-validated INSERT key must be unique"
-            );
+            if !store.insert(key, row)? {
+                // A collision here can only happen under the writable-CTE read pin
+                // (writable-cte.md §7): an EARLIER data-modifying sub-statement of the same `WITH`
+                // staged this key, which phase 1 (reading the pin) did not see. Matches
+                // PostgreSQL's unique violation; the whole statement aborts all-or-nothing. For a
+                // single statement, phase 1 already caught every duplicate, so this is never reached.
+                return Err(EngineError::new(
+                    SqlState::UniqueViolation,
+                    format!(
+                        "duplicate key value violates unique constraint: {}_pkey",
+                        relation.to_ascii_lowercase()
+                    ),
+                ));
+            }
         }
         for (k, def) in indexes.iter().enumerate() {
             let istore = self.index_store_mut(&def.name.to_ascii_lowercase());
             for ek in index_inserts[k].drain(..) {
-                assert!(
-                    istore.insert(ek, Vec::new())?,
-                    "index entry keys are unique (storage-key suffix)"
-                );
+                if !istore.insert(ek, Vec::new())? {
+                    // A cross-sub-statement unique-index collision under the read pin (as above).
+                    return Err(EngineError::new(
+                        SqlState::UniqueViolation,
+                        format!("duplicate key value violates unique constraint: {}", def.name),
+                    ));
+                }
             }
         }
         Ok(returned)
@@ -4398,6 +4417,7 @@ impl Database {
         plan: &ConflictPlan,
         returning: Option<&[RExpr]>,
         params: &[Value],
+        ctes: CteCtx,
         meter: &mut Meter,
     ) -> Result<(i64, Option<Vec<Vec<Value>>>)> {
         let n = columns.len();
@@ -4736,7 +4756,7 @@ impl Database {
                     prows.push(nr);
                     olds.push(or);
                 }
-                Some(self.project_returning(nodes, &prows, Some(&olds), params, meter)?)
+                Some(self.project_returning(nodes, &prows, Some(&olds), params, ctes, meter)?)
             }
             None => None,
         };
@@ -4921,6 +4941,7 @@ impl Database {
         conflict: Option<&ConflictPlan>,
         returning: Option<&[RExpr]>,
         params: &[Value],
+        ctes: CteCtx,
         meter: &mut Meter,
     ) -> Result<(i64, Option<Vec<Vec<Value>>>)> {
         match conflict {
@@ -4936,6 +4957,7 @@ impl Database {
                 plan,
                 returning,
                 params,
+                ctes,
                 meter,
             ),
             None => {
@@ -4951,6 +4973,7 @@ impl Database {
                     rows,
                     returning,
                     params,
+                    ctes,
                     meter,
                 )?;
                 Ok((inserted, returned))
@@ -4970,10 +4993,12 @@ impl Database {
         table: &str,
         items: &SelectItems,
         base_is_old: bool,
+        ctes: &[CteBinding],
         ptypes: &mut ParamTypes,
     ) -> Result<(Vec<RExpr>, Vec<String>, Vec<String>)> {
         let tdef = self.table(table).expect("INSERT target resolved above");
-        let scope = Scope::returning(self, tdef, base_is_old);
+        let mut scope = Scope::returning(self, tdef, base_is_old);
+        scope.ctes = ctes;
         let (nodes, names, types) =
             resolve_projections(&scope, items, &mut AggCtx::Forbidden, ptypes)?;
         Ok((nodes, names, type_names(&types)))
@@ -4993,6 +5018,7 @@ impl Database {
         rows: &[&Row],
         others: Option<&[&Row]>,
         params: &[Value],
+        ctes: CteCtx,
         meter: &mut Meter,
     ) -> Result<Vec<Vec<Value>>> {
         let stmt_rng = std::cell::Cell::new(crate::seam::StmtRng::new());
@@ -5001,7 +5027,7 @@ impl Database {
             params,
             outer: &[],
             rng: &stmt_rng,
-            ctes: CteCtx::empty(),
+            ctes,
         };
         let mut out = Vec::with_capacity(rows.len());
         for (i, &row) in rows.iter().enumerate() {
@@ -5025,7 +5051,7 @@ impl Database {
     /// the keys of matching rows (only a TRUE predicate matches — Kleene), then
     /// remove them. No WHERE deletes every row. Keys are collected before mutating
     /// so the map is not modified while iterating.
-    fn execute_delete(&mut self, del: Delete, params: &[Value]) -> Result<Outcome> {
+    fn execute_delete(&mut self, del: Delete, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
         let table = self.table(&del.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
@@ -5053,8 +5079,10 @@ impl Database {
         let colls = self.column_collations(&table.columns);
         // DELETE is single-table; resolve its WHERE against a one-relation scope. The
         // RETURNING projection resolves after it (PostgreSQL's analysis order), against the
-        // same scope (grammar.md §32).
-        let scope = Scope::single(self, table);
+        // same scope (grammar.md §32). The statement's CTE bindings (writable-cte.md) are visible
+        // so a WHERE / RETURNING sublink may reference an earlier CTE.
+        let mut scope = Scope::single(self, table);
+        scope.ctes = ctx.bindings;
         let mut ptypes = ParamTypes::default();
         let mut filter = match &del.filter {
             Some(p) => Some(resolve_boolean_filter(&scope, p, &mut ptypes)?),
@@ -5064,7 +5092,8 @@ impl Database {
         // (bare = `old.` = the deleted values; `new.` is the all-NULL side — grammar.md §32).
         let mut ret = match &del.returning {
             Some(items) => {
-                let rscope = Scope::returning(self, table, true);
+                let mut rscope = Scope::returning(self, table, true);
+                rscope.ctes = ctx.bindings;
                 let (nodes, names, types) =
                     resolve_projections(&rscope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
                 Some((nodes, names, type_names(&types)))
@@ -5080,11 +5109,11 @@ impl Database {
         // mutating), matching PostgreSQL.
         let mut meter = self.session.new_meter();
         if let Some(f) = &mut filter {
-            self.fold_uncorrelated_in_rexpr(f, &bound, CteCtx::empty(), &mut meter.accrued)?;
+            self.fold_uncorrelated_in_rexpr(f, &bound, ctx, &mut meter.accrued)?;
         }
         if let Some((nodes, _, _)) = &mut ret {
             for node in nodes {
-                self.fold_uncorrelated_in_rexpr(node, &bound, CteCtx::empty(), &mut meter.accrued)?;
+                self.fold_uncorrelated_in_rexpr(node, &bound, ctx, &mut meter.accrued)?;
             }
         }
 
@@ -5104,7 +5133,7 @@ impl Database {
             params: &bound,
             outer: &[],
             rng: &stmt_rng,
-            ctes: CteCtx::empty(),
+            ctes: ctx,
         };
         // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
         // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
@@ -5224,7 +5253,7 @@ impl Database {
         let returned = match &ret {
             Some((nodes, _, _)) => {
                 let prows: Vec<&Row> = matched.iter().map(|(_, r)| r).collect();
-                Some(self.project_returning(nodes, &prows, None, &bound, &mut meter)?)
+                Some(self.project_returning(nodes, &prows, None, &bound, ctx, &mut meter)?)
             }
             None => None,
         };
@@ -5263,7 +5292,7 @@ impl Database {
     /// writes. Phase 2 applies. Assigning a PRIMARY KEY column traps `0A000` (the
     /// storage key must not change this slice); a duplicate target column traps
     /// `42701`. No WHERE updates every row.
-    fn execute_update(&mut self, upd: Update, params: &[Value]) -> Result<Outcome> {
+    fn execute_update(&mut self, upd: Update, params: &[Value], ctx: CteCtx) -> Result<Outcome> {
         let table = self.table(&upd.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
@@ -5272,7 +5301,10 @@ impl Database {
         })?;
         // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
         // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
-        let scope = Scope::single(self, table);
+        // The statement's CTE bindings (writable-cte.md) are visible so a SET / WHERE / RETURNING
+        // sublink may reference an earlier CTE.
+        let mut scope = Scope::single(self, table);
+        scope.ctes = ctx.bindings;
 
         // Resolve assignments up front (fail fast, deterministic). The 0A000 guard covers
         // EVERY key member — for a composite PRIMARY KEY, assigning any member would change
@@ -5367,7 +5399,8 @@ impl Database {
         // `old.` reads the pre-update half of [base | other] (grammar.md §32).
         let mut ret = match &upd.returning {
             Some(items) => {
-                let rscope = Scope::returning(self, table, false);
+                let mut rscope = Scope::returning(self, table, false);
+                rscope.ctes = ctx.bindings;
                 let (nodes, names, types) =
                     resolve_projections(&rscope, items, &mut AggCtx::Forbidden, &mut ptypes)?;
                 Some((nodes, names, type_names(&types)))
@@ -5388,19 +5421,14 @@ impl Database {
         // pre-UPDATE snapshot (phase 1 only reads; phase 2 writes), matching PostgreSQL.
         let mut meter = self.session.new_meter();
         for plan in &mut plans {
-            self.fold_uncorrelated_in_rexpr(
-                &mut plan.source,
-                &bound,
-                CteCtx::empty(),
-                &mut meter.accrued,
-            )?;
+            self.fold_uncorrelated_in_rexpr(&mut plan.source, &bound, ctx, &mut meter.accrued)?;
         }
         if let Some(f) = &mut filter {
-            self.fold_uncorrelated_in_rexpr(f, &bound, CteCtx::empty(), &mut meter.accrued)?;
+            self.fold_uncorrelated_in_rexpr(f, &bound, ctx, &mut meter.accrued)?;
         }
         if let Some((nodes, _, _)) = &mut ret {
             for node in nodes {
-                self.fold_uncorrelated_in_rexpr(node, &bound, CteCtx::empty(), &mut meter.accrued)?;
+                self.fold_uncorrelated_in_rexpr(node, &bound, ctx, &mut meter.accrued)?;
             }
         }
 
@@ -5418,7 +5446,7 @@ impl Database {
             params: &bound,
             outer: &[],
             rng: &stmt_rng,
-            ctes: CteCtx::empty(),
+            ctes: ctx,
         };
         // A primary-key bound seeks/ranges instead of walking the whole B-tree (cost.md §3 "bounded
         // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
@@ -5694,7 +5722,7 @@ impl Database {
             Some((nodes, _, _)) => {
                 let prows: Vec<&Row> = updates.iter().map(|(_, new_row, _)| new_row).collect();
                 let olds: Vec<&Row> = updates.iter().map(|(_, _, old_row)| old_row).collect();
-                Some(self.project_returning(nodes, &prows, Some(&olds), &bound, &mut meter)?)
+                Some(self.project_returning(nodes, &prows, Some(&olds), &bound, ctx, &mut meter)?)
             }
             None => None,
         };
@@ -5794,6 +5822,13 @@ impl Database {
     /// Execute a `WITH` query (spec/design/cte.md) — the host-API entry point; `run_with` does the
     /// CTE orchestration.
     fn execute_with(&mut self, wq: WithQuery, params: &[Value]) -> Result<Outcome> {
+        // A WITH containing any data-modifying part (a data-modifying CTE or a data-modifying
+        // primary) runs through the writable-CTE orchestrator (spec/design/writable-cte.md): it
+        // pins the pre-statement snapshot and runs the parts in lexical order, all-or-nothing. A
+        // pure-query WITH keeps the existing read-only path (cte.md) unchanged.
+        if with_has_dml(&wq) {
+            return self.execute_with_dml(wq, params);
+        }
         let r = self.run_with(wq, params)?;
         Ok(Outcome::Query {
             column_names: r.column_names,
@@ -5821,25 +5856,23 @@ impl Database {
         Ok(r)
     }
 
-    /// Run a `WITH` query (spec/design/cte.md). The CTE orchestrator (the critique's `plan_with`):
-    /// (1) PLAN each CTE body in order against the prefix of earlier bindings (parent = None — a
-    /// body is an independent query, NOT correlated to a reference site), deriving each binding's
-    /// synthetic relation; (2) plan the main body with all bindings visible, threading the one
-    /// `ParamTypes` so `$N` infers statement-wide; (3) decide each CTE's mode from its reference
-    /// count + `[NOT] MATERIALIZED` hint; (4) MATERIALIZE each referenced materialized CTE once, in
-    /// list order, accruing its cost (a later body sees the earlier buffers); (5) fold + EXECUTE the
-    /// main body with the CTE context. Cost composes like set operations — a sum of the parts.
-    fn run_with(&self, wq: WithQuery, params: &[Value]) -> Result<SelectResult> {
-        let mut ptypes = ParamTypes::default();
-        // (1) Plan each CTE body against the already-built prefix; build its synthetic relation.
-        //     Under `WITH RECURSIVE` (recursive-cte.md), a CTE that references its own name is
-        //     RECURSIVE: its binding is pushed BEFORE planning the recursive term, so the
-        //     self-reference resolves to it; the binding's `plan` is then the non-recursive (anchor)
-        //     term and `recursive` carries the recursive term. A non-self-referencing CTE (or any
-        //     CTE in a non-`RECURSIVE` list) plans exactly as before — its name is NOT yet in scope
-        //     for its own body (so a same-named base table resolves there — cte.md §2).
+    /// Plan every CTE in a `WITH` list into bindings (spec/design/cte.md §2, writable-cte.md). Each
+    /// body is planned against the prefix of EARLIER bindings (parent = None — a body is an
+    /// independent query, NOT correlated to a reference site). Under `WITH RECURSIVE` a query CTE that
+    /// references its own name is the recursive shape (its binding is pushed BEFORE planning the
+    /// recursive term, so the self-reference resolves to it). A **data-modifying** CTE body resolves
+    /// only its `RETURNING` schema here (its effect runs later, in the orchestrator) — a data-modifying
+    /// body is never the recursive `UNION` shape, so it is always `NonRecursive`. The `refs` counters
+    /// are bumped as later query bodies / a query primary reference each binding (a data-modifying
+    /// part's references are static-counted by the orchestrator, since it is not planned here).
+    fn plan_cte_bindings(
+        &self,
+        ctes: &[Cte],
+        recursive: bool,
+        ptypes: &mut ParamTypes,
+    ) -> Result<Vec<CteBinding>> {
         let mut bindings: Vec<CteBinding> = Vec::new();
-        for cte in &wq.ctes {
+        for cte in ctes {
             let lname = cte.name.to_ascii_lowercase();
             if bindings.iter().any(|b| b.name == lname) {
                 return Err(EngineError::new(
@@ -5847,120 +5880,148 @@ impl Database {
                     format!("WITH query name {lname} specified more than once"),
                 ));
             }
-            let shape = if wq.recursive {
-                analyze_recursive_cte(&lname, &cte.query)?
-            } else {
-                CteShape::NonRecursive
+            let shape = match (recursive, cte.body.as_query()) {
+                (true, Some(q)) => analyze_recursive_cte(&lname, q)?,
+                _ => CteShape::NonRecursive,
             };
             match shape {
                 CteShape::Recursive { union_all } => {
                     // The body is `anchor UNION[ALL] recursive_term` (analyze_recursive_cte verified).
-                    let (anchor, recursive) = match &cte.query {
+                    let q = cte
+                        .body
+                        .as_query()
+                        .expect("a recursive shape implies a query body");
+                    let (anchor, recursive_term) = match q {
                         QueryExpr::SetOp(so) => (&so.lhs, &so.rhs),
                         _ => unreachable!("analyze_recursive_cte ensures a UNION body"),
                     };
                     // Plan the anchor (self NOT in scope) — its column types fix the relation.
-                    let anchor_plan = self.plan_query(anchor, None, &bindings, &mut ptypes)?;
+                    let anchor_plan = self.plan_query(anchor, None, &bindings, ptypes)?;
                     let table = cte_synthetic_table(&lname, &anchor_plan, cte.columns.as_deref())?;
                     bindings.push(CteBinding {
                         name: lname,
                         table,
-                        plan: anchor_plan,
+                        source: CteSource::Query(anchor_plan),
                         recursive: None,
                         hint: cte.materialized,
                         refs: std::cell::Cell::new(0),
                     });
                     // Plan the recursive term with the self-binding now visible.
                     let i = bindings.len() - 1;
-                    let rhs_plan = self.plan_query(recursive, None, &bindings, &mut ptypes)?;
-                    check_recursive_column_types(&bindings[i].plan, &rhs_plan, &bindings[i].name)?;
+                    let rhs_plan = self.plan_query(recursive_term, None, &bindings, ptypes)?;
+                    let CteSource::Query(anchor_ref) = &bindings[i].source else {
+                        unreachable!("the anchor binding was just pushed as a query source")
+                    };
+                    check_recursive_column_types(anchor_ref, &rhs_plan, &bindings[i].name)?;
                     bindings[i].recursive = Some(RecursiveTerm {
                         plan: rhs_plan,
                         union_all,
                     });
                 }
-                CteShape::NonRecursive => {
-                    let plan = self.plan_query(&cte.query, None, &bindings, &mut ptypes)?;
-                    let table = cte_synthetic_table(&lname, &plan, cte.columns.as_deref())?;
-                    bindings.push(CteBinding {
-                        name: lname,
-                        table,
-                        plan,
-                        recursive: None,
-                        hint: cte.materialized,
-                        refs: std::cell::Cell::new(0),
-                    });
-                }
+                CteShape::NonRecursive => match &cte.body {
+                    CteBody::Query(q) => {
+                        let plan = self.plan_query(q, None, &bindings, ptypes)?;
+                        let table = cte_synthetic_table(&lname, &plan, cte.columns.as_deref())?;
+                        bindings.push(CteBinding {
+                            name: lname,
+                            table,
+                            source: CteSource::Query(plan),
+                            recursive: None,
+                            hint: cte.materialized,
+                            refs: std::cell::Cell::new(0),
+                        });
+                    }
+                    dm_body => {
+                        // A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the
+                        // synthetic relation + capture the statement to run later.
+                        let (table, dm) = self.plan_dm_cte(
+                            &lname,
+                            dm_body,
+                            &bindings,
+                            cte.columns.as_deref(),
+                            ptypes,
+                        )?;
+                        bindings.push(CteBinding {
+                            name: lname,
+                            table,
+                            source: CteSource::Dml(dm),
+                            recursive: None,
+                            hint: cte.materialized,
+                            refs: std::cell::Cell::new(0),
+                        });
+                    }
+                },
             }
         }
-        // (2) Plan the main body with all bindings visible.
-        let mut plan = self.plan_query(&wq.body, None, &bindings, &mut ptypes)?;
-        let bound = bind_params(params, &ptypes.finalize()?)?;
+        Ok(bindings)
+    }
 
-        // (3) Per-CTE evaluation mode: a RECURSIVE CTE is ALWAYS materialized (the working-table
-        //     method requires it; `[NOT] MATERIALIZED` is inert — recursive-cte.md §1). Otherwise a
-        //     MATERIALIZED hint or >=2 references -> Materialize, else Inline (cost.md §3). An
-        //     unreferenced non-recursive CTE is planned (errors surfaced) but not run.
-        let modes: Vec<CteMode> = bindings
-            .iter()
-            .map(|b| {
-                if b.recursive.is_some() {
-                    return CteMode::Materialize;
-                }
-                match b.hint {
-                    Some(true) => CteMode::Materialize,
-                    Some(false) => CteMode::Inline,
-                    None if b.refs.get() >= 2 => CteMode::Materialize,
-                    None => CteMode::Inline,
-                }
-            })
-            .collect();
-        // Split the bindings into parallel vecs (consuming): `plans[i]` is the body / anchor plan
-        // (the inline path never touches a recursive CTE's `plans[i]`), `recursives[i]` the
-        // recursive term (Some => evaluate to a fixpoint).
-        let mut plans: Vec<QueryPlan> = Vec::with_capacity(bindings.len());
-        let mut recursives: Vec<Option<RecursiveTerm>> = Vec::with_capacity(bindings.len());
-        for b in bindings {
-            plans.push(b.plan);
-            recursives.push(b.recursive);
-        }
-
-        // (4) Materialize each CTE once, in list order, accruing cost; a later body sees the earlier
-        //     buffers. A RECURSIVE CTE iterates to a fixpoint (its self-reference reads the working
-        //     table); the per-statement cost ceiling (54P01) bounds it — recursive-cte.md §5.
-        let mut total_cost: i64 = 0;
-        let mut buffers: Vec<Vec<Row>> = Vec::with_capacity(plans.len());
-        for i in 0..plans.len() {
-            let buf = if let Some(rt) = &recursives[i] {
-                self.materialize_recursive(
-                    i,
-                    &plans[i],
-                    rt,
-                    &modes,
-                    &plans,
-                    &buffers,
-                    &bound,
-                    &mut total_cost,
-                )?
-            } else if modes[i] == CteMode::Materialize {
-                let ctx = CteCtx {
-                    modes: &modes[..i],
-                    plans: &plans[..i],
-                    buffers: &buffers,
-                };
-                let r = self.exec_query_plan(&plans[i], &[], &bound, ctx)?;
-                total_cost += r.cost;
-                r.rows
-            } else {
-                Vec::new()
+    /// Plan a data-modifying CTE body (spec/design/writable-cte.md): resolve its `RETURNING` schema
+    /// (against the EARLIER bindings, so a `RETURNING` sublink may reference an earlier CTE) to build
+    /// the synthetic relation, and capture the statement to execute later. A body with no `RETURNING`
+    /// yields a zero-column relation flagged `no_returning` (a FROM reference to it is `0A000`, §5).
+    /// The target must be a base table — a CTE name / missing table is `42P01` (§1).
+    fn plan_dm_cte(
+        &self,
+        lname: &str,
+        body: &CteBody,
+        bindings: &[CteBinding],
+        rename: Option<&[String]>,
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Box<Table>, DmCte)> {
+        let (table_name, returning, base_is_old, stmt): (&str, &Option<SelectItems>, bool, DmStmt) =
+            match body {
+                CteBody::Insert(ins) => (&ins.table, &ins.returning, false, DmStmt::Insert(ins.clone())),
+                CteBody::Update(upd) => (&upd.table, &upd.returning, false, DmStmt::Update(upd.clone())),
+                CteBody::Delete(del) => (&del.table, &del.returning, true, DmStmt::Delete(del.clone())),
+                CteBody::Query(_) => unreachable!("plan_dm_cte requires a data-modifying body"),
             };
-            buffers.push(buf);
+        let tdef = self.table(table_name).ok_or_else(|| {
+            EngineError::new(
+                SqlState::UndefinedTable,
+                format!("table does not exist: {table_name}"),
+            )
+        })?;
+        match returning {
+            None => {
+                let table = cte_synthetic_table_cols(lname, &[], &[], rename)?;
+                Ok((table, DmCte { stmt, no_returning: true }))
+            }
+            Some(items) => {
+                let mut scope = Scope::returning(self, tdef, base_is_old);
+                scope.ctes = bindings;
+                let (_, names, types) =
+                    resolve_projections(&scope, items, &mut AggCtx::Forbidden, ptypes)?;
+                let table = cte_synthetic_table_cols(lname, &names, &types, rename)?;
+                Ok((table, DmCte { stmt, no_returning: false }))
+            }
         }
+    }
 
+    /// Run a pure-query `WITH` (spec/design/cte.md) — the path for a `WITH` with no data-modifying
+    /// part (a data-modifying `WITH` goes through [`execute_with_dml`]). (1) PLAN every CTE binding
+    /// against the prefix; (2) plan the main body with all bindings visible; (3) decide each CTE's
+    /// mode from its reference count + `[NOT] MATERIALIZED` hint; (4) MATERIALIZE each referenced
+    /// materialized CTE once, in list order (a later body sees the earlier buffers); (5) fold +
+    /// EXECUTE the main body with the CTE context. Cost composes like set operations — a sum of the
+    /// parts.
+    fn run_with(&self, wq: WithQuery, params: &[Value]) -> Result<SelectResult> {
+        let mut ptypes = ParamTypes::default();
+        let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &mut ptypes)?;
+        // (2) Plan the main body with all bindings visible (the pure-query path always has a query
+        //     primary — a data-modifying primary routes to execute_with_dml).
+        let body_q = wq
+            .body
+            .as_query()
+            .expect("run_with is the pure-query path");
+        let mut plan = self.plan_query(body_q, None, &bindings, &mut ptypes)?;
+        let bound = bind_params(params, &ptypes.finalize()?)?;
+        let modes = cte_modes(&bindings);
+        let (buffers, total_cost) = self.materialize_ctes(&bindings, &modes, &bound)?;
         // (5) Fold + execute the main body against the full CTE context.
         let ctx = CteCtx {
             modes: &modes,
-            plans: &plans,
+            bindings: &bindings,
             buffers: &buffers,
         };
         let mut subquery_cost: i64 = 0;
@@ -5970,24 +6031,64 @@ impl Database {
         Ok(r)
     }
 
+    /// Materialize each CTE once, in list order (spec/design/cte.md §3) — the shared loop for the
+    /// pure-query and writable-CTE paths' query/recursive CTEs. A data-modifying CTE is NOT run here
+    /// (the orchestrator runs it for its effect — [`execute_with_dml`]); its buffer slot is left
+    /// empty for the orchestrator to fill. Returns the filled buffers + the accrued materialization
+    /// cost (a later body sees the earlier buffers).
+    fn materialize_ctes(
+        &self,
+        bindings: &[CteBinding],
+        modes: &[CteMode],
+        bound: &[Value],
+    ) -> Result<(Vec<Vec<Row>>, i64)> {
+        let mut total_cost: i64 = 0;
+        let mut buffers: Vec<Vec<Row>> = Vec::with_capacity(bindings.len());
+        for i in 0..bindings.len() {
+            let buf = if let Some(rt) = &bindings[i].recursive {
+                self.materialize_recursive(i, rt, modes, bindings, &buffers, bound, &mut total_cost)?
+            } else {
+                match &bindings[i].source {
+                    // A data-modifying CTE's buffer is filled by the orchestrator, not here.
+                    CteSource::Dml(_) => Vec::new(),
+                    CteSource::Query(plan) if modes[i] == CteMode::Materialize => {
+                        let ctx = CteCtx {
+                            modes: &modes[..i],
+                            bindings: &bindings[..i],
+                            buffers: &buffers,
+                        };
+                        let r = self.exec_query_plan(plan, &[], bound, ctx)?;
+                        total_cost += r.cost;
+                        r.rows
+                    }
+                    CteSource::Query(_) => Vec::new(),
+                }
+            };
+            buffers.push(buf);
+        }
+        Ok((buffers, total_cost))
+    }
+
     /// Materialize a RECURSIVE CTE by iterating to a fixpoint — the PostgreSQL working-table method
-    /// (recursive-cte.md §4). `anchor_plan` is the non-recursive term; `rt` the recursive term
-    /// (which references this CTE, index `ci`). `prior_buffers` are the earlier CTEs' materialized
-    /// rows (visible to both terms). `total_cost` accrues every term evaluation's cost and gates the
+    /// (recursive-cte.md §4). `rt` is the recursive term (which references this CTE, index `ci`); the
+    /// anchor is `bindings[ci].source`. `prior_buffers` are the earlier CTEs' materialized rows
+    /// (visible to both terms). `total_cost` accrues every term evaluation's cost and gates the
     /// per-statement ceiling between iterations, so a non-terminating recursion of cheap iterations
     /// still aborts `54P01` at the identical accrued cost in every core (recursive-cte.md §5).
     #[allow(clippy::too_many_arguments)]
     fn materialize_recursive(
         &self,
         ci: usize,
-        anchor_plan: &QueryPlan,
         rt: &RecursiveTerm,
         modes: &[CteMode],
-        plans: &[QueryPlan],
+        bindings: &[CteBinding],
         prior_buffers: &[Vec<Row>],
         params: &[Value],
         total_cost: &mut i64,
     ) -> Result<Vec<Row>> {
+        let CteSource::Query(anchor_plan) = &bindings[ci].source else {
+            unreachable!("a recursive CTE's anchor is a query plan")
+        };
         let max_cost = self.session.max_cost();
         let guard = |total: i64| -> Result<()> {
             if max_cost > 0 && total >= max_cost {
@@ -6005,7 +6106,7 @@ impl Database {
         let ar = {
             let ctx = CteCtx {
                 modes: &modes[..ci],
-                plans: &plans[..ci],
+                bindings: &bindings[..ci],
                 buffers: prior_buffers,
             };
             self.exec_query_plan(anchor_plan, &[], params, ctx)?
@@ -6036,7 +6137,7 @@ impl Database {
             let rr = {
                 let ctx = CteCtx {
                     modes: &modes[..=ci],
-                    plans: &plans[..=ci],
+                    bindings: &bindings[..=ci],
                     buffers: &rhs_buffers,
                 };
                 self.exec_query_plan(&rt.plan, &[], params, ctx)?
@@ -6053,6 +6154,174 @@ impl Database {
             }
         }
         Ok(result)
+    }
+
+    /// Run a data-modifying `WITH` statement (spec/design/writable-cte.md): a `WITH` containing a
+    /// data-modifying CTE and/or a data-modifying primary. It **pins the pre-statement snapshot** for
+    /// every sub-statement's reads (§2 — so the parts cannot see each other's table writes; data
+    /// crosses only via a CTE's `RETURNING` buffer), runs the parts in lexical order, and returns the
+    /// primary's result. The whole statement is one all-or-nothing transaction — the autocommit (or
+    /// block) wrapper publishes the accumulated `working` only if this returns `Ok` (§6).
+    fn execute_with_dml(&mut self, wq: WithQuery, params: &[Value]) -> Result<Outcome> {
+        // Pin the pre-statement snapshot. A write statement runs with a transaction open (autocommit
+        // opened one), and nothing is written yet, so the pin equals working == committed. Cleared on
+        // every exit path so the next statement reads normally.
+        let pin = self.read_snap().clone();
+        self.session.read_pin = Some(pin);
+        let result = self.run_with_dml(wq, params);
+        self.session.read_pin = None;
+        result
+    }
+
+    /// The body of [`execute_with_dml`], run under the read pin. Plans every CTE binding + the query
+    /// primary, runs the data-modifying CTEs / materialized query CTEs in list order, then the
+    /// primary — every read against the pin, every write into the transaction's `working`.
+    fn run_with_dml(&mut self, wq: WithQuery, params: &[Value]) -> Result<Outcome> {
+        let WithQuery {
+            ctes,
+            body,
+            recursive,
+        } = wq;
+        let mut ptypes = ParamTypes::default();
+        // (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
+        let bindings = self.plan_cte_bindings(&ctes, recursive, &mut ptypes)?;
+        // (2) Plan a query primary now (to bump refs + surface resolution errors, incl. a 0A000 FROM
+        //     reference to a no-RETURNING data-modifying CTE). A data-modifying primary is resolved
+        //     and run later (it sees the bindings via the threaded context); its references are
+        //     static-counted in (2b).
+        let mut primary_plan = match &body {
+            CteBody::Query(q) => Some(self.plan_query(q, None, &bindings, &mut ptypes)?),
+            _ => None,
+        };
+        // (2b) Add the references each NON-planned data-modifying part (a data-modifying CTE body, or
+        //      a data-modifying primary) contributes to each binding, so the inline-vs-materialize
+        //      decision is correct for a query CTE referenced only by a data-modifying part (§3).
+        //      Query bodies / a query primary were already plan-counted in (1)/(2).
+        for cte in &ctes {
+            if cte.body.is_data_modifying() {
+                for b in &bindings {
+                    b.refs.set(b.refs.get() + count_cte_refs_dml(&cte.body, &b.name));
+                }
+            }
+        }
+        if body.is_data_modifying() {
+            for b in &bindings {
+                b.refs.set(b.refs.get() + count_cte_refs_dml(&body, &b.name));
+            }
+        }
+        let bound = bind_params(params, &ptypes.finalize()?)?;
+        let modes = cte_modes(&bindings);
+
+        // (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its
+        //     effect + RETURNING buffer; the query/recursive CTEs use the shared materialize loop.
+        let mut total_cost: i64 = 0;
+        let mut buffers: Vec<Vec<Row>> = Vec::with_capacity(bindings.len());
+        for i in 0..bindings.len() {
+            let buf = if let Some(rt) = &bindings[i].recursive {
+                self.materialize_recursive(i, rt, &modes, &bindings, &buffers, &bound, &mut total_cost)?
+            } else if matches!(bindings[i].source, CteSource::Dml(_)) {
+                let ctx = CteCtx {
+                    modes: &modes[..i],
+                    bindings: &bindings[..i],
+                    buffers: &buffers,
+                };
+                let (rows, cost) = self.exec_dm_cte(i, &bindings, &bound, ctx)?;
+                total_cost += cost;
+                rows
+            } else if modes[i] == CteMode::Materialize {
+                let ctx = CteCtx {
+                    modes: &modes[..i],
+                    bindings: &bindings[..i],
+                    buffers: &buffers,
+                };
+                let CteSource::Query(plan) = &bindings[i].source else {
+                    unreachable!("the data-modifying arm was handled above")
+                };
+                let r = self.exec_query_plan(plan, &[], &bound, ctx)?;
+                total_cost += r.cost;
+                r.rows
+            } else {
+                Vec::new()
+            };
+            buffers.push(buf);
+        }
+
+        // (4) Execute the primary against the full CTE context, adding the materialization cost.
+        let outcome = match body {
+            CteBody::Query(_) => {
+                let mut plan = primary_plan.take().expect("a query primary was planned in (2)");
+                let ctx = CteCtx {
+                    modes: &modes,
+                    bindings: &bindings,
+                    buffers: &buffers,
+                };
+                let mut subquery_cost: i64 = 0;
+                self.fold_uncorrelated_in_plan(&mut plan, &bound, ctx, &mut subquery_cost)?;
+                let r = self.exec_query_plan(&plan, &[], &bound, ctx)?;
+                Outcome::Query {
+                    column_names: r.column_names,
+                    column_types: type_names(&r.column_types),
+                    rows: r.rows,
+                    cost: r.cost + subquery_cost,
+                }
+            }
+            CteBody::Insert(ins) => {
+                let ctx = CteCtx {
+                    modes: &modes,
+                    bindings: &bindings,
+                    buffers: &buffers,
+                };
+                self.execute_insert(*ins, params, ctx)?
+            }
+            CteBody::Update(upd) => {
+                let ctx = CteCtx {
+                    modes: &modes,
+                    bindings: &bindings,
+                    buffers: &buffers,
+                };
+                self.execute_update(*upd, params, ctx)?
+            }
+            CteBody::Delete(del) => {
+                let ctx = CteCtx {
+                    modes: &modes,
+                    bindings: &bindings,
+                    buffers: &buffers,
+                };
+                self.execute_delete(*del, params, ctx)?
+            }
+        };
+        Ok(add_outcome_cost(outcome, total_cost))
+    }
+
+    /// Execute a data-modifying CTE (spec/design/writable-cte.md §3): run the `INSERT`/`UPDATE`/
+    /// `DELETE` at binding `i` for its effect, with the earlier bindings/buffers in scope (so its
+    /// inner queries may reference an earlier CTE), and return its `RETURNING` rows (the buffer the
+    /// later parts scan) + its cost. A body with no `RETURNING` runs for its effect and buffers no
+    /// rows.
+    fn exec_dm_cte(
+        &mut self,
+        i: usize,
+        bindings: &[CteBinding],
+        params: &[Value],
+        ctx: CteCtx,
+    ) -> Result<(Vec<Row>, i64)> {
+        let stmt = match &bindings[i].source {
+            CteSource::Dml(dm) => match &dm.stmt {
+                DmStmt::Insert(ins) => DmStmt::Insert(ins.clone()),
+                DmStmt::Update(upd) => DmStmt::Update(upd.clone()),
+                DmStmt::Delete(del) => DmStmt::Delete(del.clone()),
+            },
+            CteSource::Query(_) => unreachable!("exec_dm_cte requires a data-modifying binding"),
+        };
+        let outcome = match stmt {
+            DmStmt::Insert(ins) => self.execute_insert(*ins, params, ctx)?,
+            DmStmt::Update(upd) => self.execute_update(*upd, params, ctx)?,
+            DmStmt::Delete(del) => self.execute_delete(*del, params, ctx)?,
+        };
+        Ok(match outcome {
+            Outcome::Query { rows, cost, .. } => (rows, cost),
+            Outcome::Statement { cost, .. } => (Vec::new(), cost),
+        })
     }
 
     /// Run a lone `SELECT` — the entry point `execute_select` and `INSERT ... SELECT` use.
@@ -6484,6 +6753,17 @@ impl Database {
                 let lname = tref.name.to_ascii_lowercase();
                 src = match ctes.iter().position(|b| b.name == lname) {
                     Some(ci) => {
+                        // A data-modifying CTE with no RETURNING produces no columns, so a FROM
+                        // reference to it is 0A000 (writable-cte.md §5; PostgreSQL's
+                        // addRangeTableEntryForCTE check), raised at resolution before any execution.
+                        if let CteSource::Dml(dm) = &ctes[ci].source {
+                            if dm.no_returning {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    format!("WITH query {lname} does not have a RETURNING clause"),
+                                ));
+                            }
+                        }
                         ctes[ci].refs.set(ctes[ci].refs.get() + 1);
                         RelSrc::Cte(&*ctes[ci].table, ci)
                     }
@@ -7326,7 +7606,12 @@ impl Database {
                     buf.clone()
                 }
                 CteMode::Inline => {
-                    let r = self.exec_query_plan(&env.ctes.plans[ci], outer, params, env.ctes)?;
+                    // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always
+                    // materialized (writable-cte.md §3), so its buffer was filled above.
+                    let CteSource::Query(plan) = &env.ctes.bindings[ci].source else {
+                        unreachable!("a data-modifying CTE is always materialized, never inlined")
+                    };
+                    let r = self.exec_query_plan(plan, outer, params, env.ctes)?;
                     meter.charge(r.cost);
                     r.rows
                 }
@@ -8499,20 +8784,45 @@ fn build_prefix_scope<'s>(
 /// A planned common table expression, owned by `plan_with` for the whole statement (so the scopes
 /// that borrow its synthetic `table` outlive it — spec/design/cte.md §A.2). `name` is lowercased
 /// for case-insensitive FROM matching; `table` is the synthetic relation exposing the body's output
-/// columns; `plan` is the planned body; `hint` is the `[NOT] MATERIALIZED` override; `refs` counts
-/// the FROM references resolved to it during planning (a `Cell` — planning borrows `&self`).
+/// columns; `source` is the planned body (a query plan, or — spec/design/writable-cte.md — a
+/// data-modifying statement); `hint` is the `[NOT] MATERIALIZED` override; `refs` counts the FROM
+/// references resolved to it during planning (a `Cell` — planning borrows `&self`).
 ///
-/// For a RECURSIVE CTE (spec/design/recursive-cte.md) `plan` holds the **non-recursive (anchor)
+/// For a RECURSIVE CTE (spec/design/recursive-cte.md) `source` holds the **non-recursive (anchor)
 /// term** (its column types fix the synthetic relation's) and `recursive` carries the recursive
 /// term + the `UNION ALL` flag; the binding is in scope inside its own recursive term, so the
 /// self-reference resolves to it (`refs` then counts the self-reference too).
 struct CteBinding {
     name: String,
     table: Box<Table>,
-    plan: QueryPlan,
+    source: CteSource,
     recursive: Option<RecursiveTerm>,
     hint: Option<bool>,
     refs: std::cell::Cell<usize>,
+}
+
+/// What a CTE binding evaluates to (spec/design/cte.md, writable-cte.md). A plain CTE holds a
+/// planned query body; a **data-modifying** CTE holds the statement to execute (for its effect +
+/// `RETURNING` buffer). A data-modifying CTE is always materialized (writable-cte.md §3), so the
+/// inline-execution path never touches a `Dml` source.
+enum CteSource {
+    Query(QueryPlan),
+    Dml(DmCte),
+}
+
+/// A data-modifying CTE's body (spec/design/writable-cte.md): the `INSERT`/`UPDATE`/`DELETE` to run
+/// (cloned from the AST, executed with the statement's CTE context threaded in) and whether it has
+/// no `RETURNING` clause — in which case a FROM reference to it is `0A000` (§5).
+struct DmCte {
+    stmt: DmStmt,
+    no_returning: bool,
+}
+
+/// A data-modifying statement in a writable-CTE position (a CTE body or the `WITH` primary).
+enum DmStmt {
+    Insert(Box<Insert>),
+    Update(Box<Update>),
+    Delete(Box<Delete>),
 }
 
 /// The recursive half of a `WITH RECURSIVE` CTE (spec/design/recursive-cte.md §4): the planned
@@ -9698,6 +10008,116 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
     }
 }
 
+/// Whether a `WITH` statement contains any data-modifying part — a data-modifying CTE body or a
+/// data-modifying primary (spec/design/writable-cte.md). Such a statement runs through the
+/// writable-CTE orchestrator (the read pin + lexical-order, all-or-nothing execution); a pure-query
+/// `WITH` keeps the [`Database::run_with`] path.
+fn with_has_dml(wq: &WithQuery) -> bool {
+    wq.body.is_data_modifying() || wq.ctes.iter().any(|c| c.body.is_data_modifying())
+}
+
+/// Each CTE binding's evaluation mode (spec/design/cte.md §3, writable-cte.md §3): a RECURSIVE or
+/// data-modifying CTE is ALWAYS materialized; otherwise a `MATERIALIZED` hint or ≥2 references →
+/// Materialize, else Inline.
+fn cte_modes(bindings: &[CteBinding]) -> Vec<CteMode> {
+    bindings
+        .iter()
+        .map(|b| {
+            if b.recursive.is_some() || matches!(b.source, CteSource::Dml(_)) {
+                return CteMode::Materialize;
+            }
+            match b.hint {
+                Some(true) => CteMode::Materialize,
+                Some(false) => CteMode::Inline,
+                None if b.refs.get() >= 2 => CteMode::Materialize,
+                None => CteMode::Inline,
+            }
+        })
+        .collect()
+}
+
+/// Add `extra` cost to an outcome (the writable-CTE orchestrator folds the materialization cost of
+/// the data-modifying / query CTEs into the primary's result — spec/design/writable-cte.md §8).
+fn add_outcome_cost(outcome: Outcome, extra: i64) -> Outcome {
+    match outcome {
+        Outcome::Query {
+            column_names,
+            column_types,
+            rows,
+            cost,
+        } => Outcome::Query {
+            column_names,
+            column_types,
+            rows,
+            cost: cost + extra,
+        },
+        Outcome::Statement {
+            cost,
+            rows_affected,
+        } => Outcome::Statement {
+            cost: cost + extra,
+            rows_affected,
+        },
+    }
+}
+
+/// References to CTE `name` reachable through a `cte_body`'s inner queries — the writable-CTE
+/// analogue of [`count_self_refs_query`] (spec/design/writable-cte.md §3). A query body delegates to
+/// the query counter; a data-modifying body counts the references in its source query / `WHERE` /
+/// `SET` RHSs / `ON CONFLICT` / `RETURNING` sublinks. Used by the orchestrator to count the
+/// references a NON-planned data-modifying part contributes to the inline-vs-materialize decision.
+fn count_cte_refs_dml(body: &CteBody, name: &str) -> usize {
+    match body {
+        CteBody::Query(q) => count_self_refs_query(q, name),
+        CteBody::Insert(ins) => {
+            let mut n = match &ins.source {
+                InsertSource::Select(sel) => count_self_refs_select(sel, name),
+                // VALUES slots hold literals / params / ROW / ARRAY (no sublinks this slice).
+                InsertSource::Values(_) => 0,
+            };
+            if let Some(oc) = &ins.on_conflict {
+                if let ConflictAction::DoUpdate { assignments, filter } = &oc.action {
+                    for a in assignments {
+                        n += count_self_refs_expr(&a.value, name);
+                    }
+                    if let Some(f) = filter {
+                        n += count_self_refs_expr(f, name);
+                    }
+                }
+            }
+            n + count_returning_refs(&ins.returning, name)
+        }
+        CteBody::Update(upd) => {
+            let mut n = 0;
+            for a in &upd.assignments {
+                n += count_self_refs_expr(&a.value, name);
+            }
+            if let Some(f) = &upd.filter {
+                n += count_self_refs_expr(f, name);
+            }
+            n + count_returning_refs(&upd.returning, name)
+        }
+        CteBody::Delete(del) => {
+            let mut n = 0;
+            if let Some(f) = &del.filter {
+                n += count_self_refs_expr(f, name);
+            }
+            n + count_returning_refs(&del.returning, name)
+        }
+    }
+}
+
+/// References to CTE `name` in a `RETURNING` item list's sublinks.
+fn count_returning_refs(returning: &Option<SelectItems>, name: &str) -> usize {
+    match returning {
+        Some(SelectItems::Items(items)) => items
+            .iter()
+            .map(|it| count_self_refs_expr(&it.expr, name))
+            .sum(),
+        _ => 0,
+    }
+}
+
 /// Self-references that are DIRECT FROM/JOIN relations of this SELECT (a plain table ref matching
 /// the name, not nested in a subquery). This is the only valid position for a recursive reference.
 fn count_direct_from_self_refs(s: &Select, name: &str) -> usize {
@@ -9771,8 +10191,18 @@ fn cte_synthetic_table(
     plan: &QueryPlan,
     rename: Option<&[String]>,
 ) -> Result<Box<Table>> {
-    let body_types = plan.column_types();
-    let body_names = plan.column_names();
+    cte_synthetic_table_cols(name, plan.column_names(), plan.column_types(), rename)
+}
+
+/// The shared core of [`cte_synthetic_table`], over explicit body column names + types — so a
+/// data-modifying CTE (whose "body output" is its `RETURNING` projection, not a `QueryPlan`) builds
+/// its synthetic relation the same way (spec/design/writable-cte.md §1).
+fn cte_synthetic_table_cols(
+    name: &str,
+    body_names: &[String],
+    body_types: &[ResolvedType],
+    rename: Option<&[String]>,
+) -> Result<Box<Table>> {
     let col_names: Vec<String> = match rename {
         // PostgreSQL allows FEWER aliases than the body has columns — the first `cols.len()` columns
         // take the aliases, the rest keep their body output names (a partial rename). Only MORE
@@ -9921,13 +10351,15 @@ enum CteMode {
 
 /// The per-statement CTE execution context, threaded through `exec_*` and `EvalEnv` so a FROM
 /// reference (any nesting depth) can deliver a CTE's rows (spec/design/cte.md §5). `modes` and
-/// `plans` are fixed after planning; `buffers` is filled before the main query runs — one slot per
-/// CTE in list order, holding the materialized rows of a `Materialize` CTE (an empty placeholder
-/// for an `Inline` one, whose body is run in place from `plans` instead).
+/// `bindings` are fixed after planning; `buffers` is filled before the main query runs — one slot
+/// per CTE in list order, holding the materialized rows of a `Materialize` CTE (an empty
+/// placeholder for an `Inline` one, whose body is run in place from `bindings[ci].source` instead).
+/// `bindings` also serves a data-modifying CTE's own inner queries, which resolve against the
+/// earlier bindings when the writable-CTE orchestrator executes them (writable-cte.md §2).
 #[derive(Clone, Copy)]
 struct CteCtx<'a> {
     modes: &'a [CteMode],
-    plans: &'a [QueryPlan],
+    bindings: &'a [CteBinding],
     buffers: &'a [Vec<Row>],
 }
 
@@ -9936,7 +10368,7 @@ impl CteCtx<'_> {
     fn empty() -> CteCtx<'static> {
         CteCtx {
             modes: &[],
-            plans: &[],
+            bindings: &[],
             buffers: &[],
         }
     }
@@ -13568,6 +14000,9 @@ pub(crate) fn stmt_is_write(stmt: &Statement) -> bool {
             | Statement::Update(_)
             | Statement::Delete(_)
     )
+    // A WITH statement with any data-modifying part is a write (it stages INSERT/UPDATE/DELETE
+    // effects — writable-cte.md): it must take the write gate, accumulate into `working`, and commit.
+    || matches!(stmt, Statement::With(wq) if with_has_dml(wq))
     // A read-shaped statement that calls a sequence-mutating function (nextval/setval) IS a write
     // (spec/design/sequences.md §4): it must take the write gate, stage the advance, and commit
     // (autocommit) — and is 25006 in a READ ONLY transaction, exactly like any other write.
@@ -13585,10 +14020,20 @@ fn stmt_calls_seq_mutator(stmt: &Statement) -> bool {
         Statement::Select(s) => select_calls_seq_mutator(s),
         Statement::SetOp(so) => setop_calls_seq_mutator(so),
         Statement::With(w) => {
-            w.ctes.iter().any(|c| query_calls_seq_mutator(&c.query))
-                || query_calls_seq_mutator(&w.body)
+            w.ctes.iter().any(|c| cte_body_calls_seq_mutator(&c.body))
+                || cte_body_calls_seq_mutator(&w.body)
         }
         _ => false,
+    }
+}
+
+/// Whether a `cte_body` calls a sequence-mutating function. A query body delegates to the query
+/// walk; a data-modifying body already makes the `WITH` a write (via [`with_has_dml`]), so this is
+/// not reached for it — it is treated as a write regardless (writable-cte.md).
+fn cte_body_calls_seq_mutator(body: &CteBody) -> bool {
+    match body {
+        CteBody::Query(q) => query_calls_seq_mutator(q),
+        _ => true,
     }
 }
 
@@ -13808,13 +14253,25 @@ fn collect_setop_privs(so: &SetOp, req: &mut PrivReq, locals: &HashSet<String>) 
 fn collect_with_privs(wq: &WithQuery, req: &mut PrivReq, locals: &HashSet<String>) {
     // A CTE name shadows a base table inside the WITH (a `FROM <cte>` is not a catalog object), so
     // it is added to the local scope and never privilege-checked. Forward-only visibility: each CTE
-    // body sees the CTE names declared before it.
+    // body sees the CTE names declared before it. A data-modifying body / primary needs the write
+    // privilege on its target table (writable-cte.md).
     let mut scope = locals.clone();
     for cte in &wq.ctes {
-        collect_query_privs(&cte.query, req, &scope);
+        collect_cte_body_privs(&cte.body, req, &scope);
         scope.insert(cte.name.to_ascii_lowercase());
     }
-    collect_query_privs(&wq.body, req, &scope);
+    collect_cte_body_privs(&wq.body, req, &scope);
+}
+
+/// Collect the privilege requirements of a `cte_body` — a query, or a data-modifying statement
+/// (spec/design/writable-cte.md) which needs the write privilege on its target.
+fn collect_cte_body_privs(body: &CteBody, req: &mut PrivReq, locals: &HashSet<String>) {
+    match body {
+        CteBody::Query(q) => collect_query_privs(q, req, locals),
+        CteBody::Insert(ins) => collect_insert_privs(ins, req, locals),
+        CteBody::Update(upd) => collect_update_privs(upd, req, locals),
+        CteBody::Delete(del) => collect_delete_privs(del, req, locals),
+    }
 }
 
 fn collect_select_privs(s: &Select, req: &mut PrivReq, locals: &HashSet<String>) {

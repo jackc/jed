@@ -2197,3 +2197,34 @@ collations — `C` counts as a distinct one) with no explicit COLLATE is `42P22`
 derived for **all** comparison ops including `=`/`<>` (PG raises it regardless). A non-`C` collation
 orders only the **ordering** comparisons (`< <= > >=`) and `ORDER BY` by its sort key; `=`/`<>` stay
 byte-equality (deterministic-collation equality is byte-identity — [collation.md](collation.md) §7).
+
+## 48. Data-modifying (writable) CTEs ([writable-cte.md](writable-cte.md))
+
+A `WITH` item's body, and the `WITH`-prefixed primary statement, may be an `INSERT` / `UPDATE` /
+`DELETE` ([grammar.ebnf](../grammar/grammar.ebnf) `cte_body`) — PostgreSQL's *writable CTE*. A
+data-modifying CTE feeds its `RETURNING` rows forward; the move-rows idiom is the canonical shape:
+
+```sql
+WITH moved AS (DELETE FROM inbox WHERE ready RETURNING *)
+INSERT INTO archive SELECT * FROM moved;
+```
+
+**Parsing.** `parse_cte`, after `AS [ [NOT] MATERIALIZED ] (`, peeks the body's leading keyword:
+`insert`/`update`/`delete` parse the data-modifying statement, anything else the WITH-less
+`query_expr` (the existing path). `parse_with_statement`'s primary peeks the same way after the CTE
+list. A `cte_body` is one parser nesting level (the `deepen`/`undeepen` guard, like a subquery), so
+deeply-nested writable CTEs still hit `54001`. Both the body's and the primary's `RETURNING` are the
+ordinary `returning_clause` (§32).
+
+**Semantics** (the full record is [writable-cte.md](writable-cte.md)): every sub-statement reads
+**one pre-statement snapshot** (a read pin — they cannot see each other's table writes; data crosses
+only via a CTE's `RETURNING` buffer), the parts run in **lexical order** (data-modifying CTEs first,
+each always to completion and materialized, then the primary), and the whole statement is **one
+all-or-nothing transaction**. The statement result is the **primary's** (a query result, an
+affected-row count, or the primary's `RETURNING` rows). A data-modifying CTE without `RETURNING`
+runs for its effect but a `FROM` reference to it is `0A000`; a data-modifying target resolves against
+the **catalog** (a CTE name as target with no base table is `42P01`); an insert/insert key clash
+between two parts is `23505`, while an update/update or update/delete of the same row is jed's
+deterministic last-write-wins (a documented divergence on a case PostgreSQL leaves unspecified —
+[writable-cte.md](writable-cte.md) §7). `WITH RECURSIVE` with a (non-self-referencing) data-modifying
+CTE is allowed (a data-modifying body is never the recursive `UNION` shape). No on-disk format change.

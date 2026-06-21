@@ -141,8 +141,14 @@ purely a query-plan construct — no `format_version` bump).
   iterate-to-fixpoint (working-table) executor, anchor-fixed column types (`42804`), the structural
   `42P19` checks, and cost-ceiling termination (the `54P01` ceiling does real work there). It lifts
   exactly the forward-only visibility rule (§2) — a recursive CTE sees its own name.
-- **Data-modifying CTEs** — `WITH x AS (INSERT … RETURNING …) …`.
-- **`WITH` on `UPDATE`/`DELETE`**, and **nested `WITH`** inside a subquery / CTE body.
+- ~~**Data-modifying CTEs**~~ — ✅ **landed** ([writable-cte.md](writable-cte.md)):
+  `WITH x AS (INSERT/UPDATE/DELETE … [RETURNING …]) …`. The body/scope machinery here is reused
+  unchanged; the new layer is the **shared pre-statement read pin** (every sub-statement reads the
+  one snapshot, data crosses only via `RETURNING` buffers), the **always-materialize-to-completion**
+  rule, and one all-or-nothing transaction.
+- ~~**`WITH` on `UPDATE`/`DELETE`**~~ — ✅ **landed** with the above ([writable-cte.md](writable-cte.md)):
+  the `WITH`-prefixed primary may be an `INSERT`/`UPDATE`/`DELETE`.
+- **Nested `WITH`** inside a subquery / CTE body remains deferred (the top-level-only narrowing, §1).
 
 **Landed since:**
 

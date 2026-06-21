@@ -666,6 +666,14 @@ seed carried forward, the same accrued-seed mechanism set operations use below) 
 meter that resets the ceiling, so the `54P01` abort point during materialization is cross-core
 identical (CLAUDE.md §8/§13).
 
+A **data-modifying CTE** ([writable-cte.md](writable-cte.md)) charges no new unit: it accrues its
+**intrinsic DML cost** once into the running total (the rows it scans / its expressions / one
+`row_produced` per `RETURNING` row — exactly a standalone `INSERT`/`UPDATE`/`DELETE`), and each
+reference to its buffer charges `cte_scan_row` per buffered row, like any materialized CTE. It is
+**always** materialized and runs to completion (even unreferenced — its scan/write-validation cost
+still accrues, so a side-effect-only one is not free); the meter stays continuous across every
+sub-statement of the `WITH`, so a `54P01` ceiling trips at the identical accrued cost in every core.
+
 ### Set operations — `lhs + rhs`, the combine unmetered
 
 A set operation ([grammar.md](grammar.md) §25) — `UNION`/`INTERSECT`/`EXCEPT`, each with an

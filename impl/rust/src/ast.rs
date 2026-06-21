@@ -570,18 +570,47 @@ pub struct SetOp {
     pub offset: Option<i64>,
 }
 
+/// The body of a CTE, or the `WITH`-prefixed primary statement (spec/design/writable-cte.md): an
+/// ordinary query expression, or a **data-modifying** statement (a writable CTE). The
+/// data-modifying variants are boxed to keep `CteBody` (and so `WithQuery` / `Statement`) small.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum CteBody {
+    Query(QueryExpr),
+    Insert(Box<Insert>),
+    Update(Box<Update>),
+    Delete(Box<Delete>),
+}
+
+impl CteBody {
+    /// The query expression, if this body is a plain query — `None` for a data-modifying body.
+    /// Used by the recursive-CTE analysis (only a query body can be a recursive `UNION`) and the
+    /// pure-query `WITH` path.
+    pub fn as_query(&self) -> Option<&QueryExpr> {
+        match self {
+            CteBody::Query(q) => Some(q),
+            _ => None,
+        }
+    }
+
+    /// Whether this body is a data-modifying statement (an `INSERT`/`UPDATE`/`DELETE`).
+    pub fn is_data_modifying(&self) -> bool {
+        !matches!(self, CteBody::Query(_))
+    }
+}
+
 /// One common table expression in a `WITH` list (spec/design/cte.md). A named, statement-local
-/// relation backed by a query. `columns` is the optional column-rename list (renames the body's
-/// output columns left to right; a count mismatch is 42P10). `materialized` is the explicit
-/// evaluation hint: `Some(true)` = `MATERIALIZED`, `Some(false)` = `NOT MATERIALIZED`, `None` =
-/// PostgreSQL's default (inline a single-reference CTE, materialize a multi-reference one —
-/// cost.md §3). The body is any `query_expr` (a SELECT or a set operation).
+/// relation backed by a query or (spec/design/writable-cte.md) a data-modifying statement.
+/// `columns` is the optional column-rename list (renames the body's output columns left to right;
+/// a count mismatch is 42P10). `materialized` is the explicit evaluation hint: `Some(true)` =
+/// `MATERIALIZED`, `Some(false)` = `NOT MATERIALIZED`, `None` = PostgreSQL's default (inline a
+/// single-reference CTE, materialize a multi-reference one — cost.md §3; a data-modifying CTE is
+/// always materialized, the hint inert). The body is a `cte_body`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct Cte {
     pub name: String,
     pub columns: Option<Vec<String>>,
     pub materialized: Option<bool>,
-    pub query: QueryExpr,
+    pub body: CteBody,
 }
 
 /// A top-level query prefixed by a `WITH` clause (spec/design/cte.md). `ctes` is the non-empty
@@ -594,7 +623,9 @@ pub struct Cte {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WithQuery {
     pub ctes: Vec<Cte>,
-    pub body: QueryExpr,
+    /// The main statement the CTEs prefix: a query, or (spec/design/writable-cte.md) a
+    /// data-modifying `INSERT`/`UPDATE`/`DELETE` primary.
+    pub body: CteBody,
     pub recursive: bool,
 }
 

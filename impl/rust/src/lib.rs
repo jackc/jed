@@ -276,6 +276,14 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // recursive_term) <query>: the iterate-to-fixpoint (working-table) executor; cost-ceiling
     // termination (spec/design/recursive-cte.md).
     "query.cte_recursive",
+    // Data-modifying (writable) CTEs — a WITH item's body may be an INSERT/UPDATE/DELETE with its
+    // own optional RETURNING, feeding its RETURNING rows forward; every sub-statement reads one
+    // pre-statement snapshot (a read pin), the parts run in lexical order all-or-nothing
+    // (spec/design/writable-cte.md).
+    "query.cte_data_modifying",
+    // WITH clause on a data-modifying primary — the WITH-prefixed statement may itself be an
+    // INSERT/UPDATE/DELETE (spec/design/writable-cte.md).
+    "dml.with_clause",
     // Derived tables — FROM ( query_expr ) AS t: a parenthesized subquery as a FROM relation, the
     // parser surface over the CTE inline seam (an anonymous always-inlined single-ref CTE) —
     // spec/design/grammar.md §42.

@@ -6,7 +6,8 @@
 
 use crate::ast::{
     AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction,
-    ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, DefaultDef, Delete,
+    ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef,
+    Delete,
     DropIndex, DropSequence, DropTable, DropType, Expr, ForeignKeyDef, IdentitySpec, Insert,
     InsertSource, InsertValue, JoinClause, JoinKind, Literal, OnConflict, OrderKey, Overriding,
     QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
@@ -1434,12 +1435,44 @@ impl Parser {
                 break;
             }
         }
-        let body = self.parse_query_expr_node()?;
+        // The primary may be a data-modifying statement (spec/design/writable-cte.md): a leading
+        // INSERT/UPDATE/DELETE keyword selects it, otherwise a WITH-less query_expr.
+        let body = self.parse_cte_body(false)?;
         Ok(Statement::With(WithQuery {
             ctes,
             body,
             recursive,
         }))
+    }
+
+    /// Parse a `cte_body` (spec/design/writable-cte.md): a data-modifying `INSERT`/`UPDATE`/`DELETE`
+    /// when one leads, otherwise a query. `parenthesized` is true for a CTE body inside `( … )`
+    /// (the closing `)` is the caller's), false for the `WITH` primary (it runs to end of
+    /// statement). A query body parsed here is the WITH-less `query_expr` (the top-level-only
+    /// nested-WITH narrowing — a nested `WITH` surfaces as a leftover `42601`).
+    fn parse_cte_body(&mut self, parenthesized: bool) -> Result<CteBody> {
+        let kw = self.peek_keyword();
+        if matches!(kw.as_deref(), Some("insert") | Some("update") | Some("delete")) {
+            // A parenthesized data-modifying body counts one nesting level, like parse_subquery does
+            // for a parenthesized query body (grammar.md §48); the primary (parenthesized = false)
+            // runs at the statement top level and does not.
+            if parenthesized {
+                self.deepen()?;
+            }
+            let body = match kw.as_deref() {
+                Some("insert") => CteBody::Insert(Box::new(self.parse_insert()?)),
+                Some("update") => CteBody::Update(Box::new(self.parse_update()?)),
+                _ => CteBody::Delete(Box::new(self.parse_delete()?)),
+            };
+            if parenthesized {
+                self.undeepen();
+            }
+            Ok(body)
+        } else if parenthesized {
+            Ok(CteBody::Query(self.parse_subquery()?))
+        } else {
+            Ok(CteBody::Query(self.parse_query_expr_node()?))
+        }
     }
 
     /// `cte ::= identifier ("(" ident ("," ident)* ")")? "AS" ("NOT"? "MATERIALIZED")? "("
@@ -1474,13 +1507,13 @@ impl Parser {
             _ => None,
         };
         self.expect(&Token::LParen)?;
-        let query = self.parse_subquery()?;
+        let body = self.parse_cte_body(true)?;
         self.expect(&Token::RParen)?;
         Ok(Cte {
             name,
             columns,
             materialized,
-            query,
+            body,
         })
     }
 

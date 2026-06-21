@@ -508,10 +508,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `query.cte_recursive`; no `format_version` bump. Narrowings (`0A000`/`42P01`): `ORDER
         BY`/`LIMIT` in a recursive query, a set-op recursive term, a self-ref inside a `FROM`
         subquery, mutual recursion, `SEARCH`/`CYCLE`.
-  - [ ] _follow-on:_ **data-modifying CTEs** (`WITH x AS (INSERT … RETURNING …)`); **`WITH` on
-        UPDATE/DELETE**; a **nested `WITH`** inside a subquery or CTE body (top-level only this
-        slice); recursive-CTE deferrals (`SEARCH`/`CYCLE`, a set-op / `FROM`-subquery recursive
-        term, mutual recursion).
+  - [x] **Data-modifying (writable) CTEs** — ✅ landed ([writable-cte.md](spec/design/writable-cte.md)):
+        a CTE body, and the `WITH`-prefixed primary, may be an `INSERT`/`UPDATE`/`DELETE` (with its
+        own optional `RETURNING`) — the move-rows / fan-out-write idioms. Every sub-statement reads
+        **one pre-statement snapshot** via a read pin (they cannot see each other's table writes;
+        data crosses only via a CTE's `RETURNING` buffer — PG-verbatim), the parts run in **lexical
+        order** (data-modifying CTEs first, each always to completion and materialized, then the
+        primary), and the whole statement is **one all-or-nothing transaction**. The statement result
+        is the primary's. A data-modifying CTE without `RETURNING` runs for its effect but a `FROM`
+        reference to it is `0A000`; a data-modifying target resolves against the catalog (a CTE name
+        as target is `42P01`); an insert/insert key clash is `23505`, while update/update or
+        update/delete of the same row is jed's deterministic last-write-wins (documented divergence —
+        PG-unspecified). New capabilities `query.cte_data_modifying` + `dml.with_clause`; no
+        `format_version` bump. Reuses existing error codes (`0A000`/`42P01`/`23505`).
+  - [ ] _follow-on:_ a **nested `WITH`** inside a subquery or CTE body (top-level only); recursive-CTE
+        deferrals (`SEARCH`/`CYCLE`, a set-op / `FROM`-subquery recursive term, mutual recursion).
 - [x] **Set-returning functions** — `generate_series(start, stop [, step])` in FROM position, a
       synthetic one-column relation, a new `generated_row` cost unit; integer variants (timestamp
       waits on interval composition). → [functions.md §10](spec/design/functions.md)

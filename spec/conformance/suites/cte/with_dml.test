@@ -1,0 +1,116 @@
+# WITH clause on a data-modifying primary (spec/design/writable-cte.md): the WITH-prefixed
+# statement may itself be an INSERT/UPDATE/DELETE with its own optional RETURNING. The CTEs are
+# visible to the primary exactly as to a query primary (its INSERT … SELECT source, UPDATE/DELETE
+# WHERE, SET right-hand sides, RETURNING subqueries), and the primary reads the same one
+# pre-statement snapshot as every CTE. The statement's result is the PRIMARY's (a query result, an
+# affected-row count, or the primary's own RETURNING rows). The primary runs LAST. Rows verified
+# against the live PostgreSQL 18 oracle.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, dml.insert_select, dml.update, dml.delete, dml.returning, dml.with_clause, query.select, query.select_star, query.column_alias, query.where_eq, query.comparison_order, query.order_by, query.subquery_in, query.cte, query.cte_data_modifying, expr.arithmetic, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE inbox (id i32 PRIMARY KEY, payload i32)
+
+statement ok
+CREATE TABLE archive (id i32 PRIMARY KEY, payload i32)
+
+statement ok
+INSERT INTO inbox VALUES (1, 100), (2, 200), (3, 300)
+
+# A WITH clause feeding a DELETE primary: the CTE selects the ids to remove, the DELETE primary
+# removes them and RETURNINGs the deleted rows.
+# names: id, payload
+query II rowsort
+WITH old AS (SELECT id FROM inbox WHERE payload >= 200)
+DELETE FROM inbox WHERE id IN (SELECT id FROM old) RETURNING id, payload
+----
+2
+200
+3
+300
+
+# ... inbox now holds only id 1.
+query II nosort
+SELECT id, payload FROM inbox ORDER BY id
+----
+1
+100
+
+# The move-rows idiom: a data-modifying CTE (DELETE … RETURNING) feeds an INSERT primary. Both
+# inbox and archive are observed pre-statement; `moved` carries the deleted rows into archive.
+statement ok
+INSERT INTO inbox VALUES (2, 200), (3, 300)
+
+# names: id, payload
+query II rowsort
+WITH moved AS (DELETE FROM inbox WHERE id >= 2 RETURNING *)
+INSERT INTO archive SELECT * FROM moved RETURNING id, payload
+----
+2
+200
+3
+300
+
+# ... inbox emptied of the moved rows, archive holds them.
+query I nosort
+SELECT id FROM inbox ORDER BY id
+----
+1
+
+query II nosort
+SELECT id, payload FROM archive ORDER BY id
+----
+2
+200
+3
+300
+
+# A WITH clause feeding an UPDATE primary.
+statement ok
+CREATE TABLE acct (id i32 PRIMARY KEY, bal i32)
+
+statement ok
+INSERT INTO acct VALUES (1, 50), (2, 80)
+
+# names: id, bal
+query II nosort
+WITH bump AS (SELECT id FROM acct WHERE bal < 60)
+UPDATE acct SET bal = bal + 1000 WHERE id IN (SELECT id FROM bump) RETURNING id, bal
+----
+1
+1050
+
+# A data-modifying CTE AND a data-modifying primary, both writing (the audit pattern): the INSERT
+# CTE adds an event, the INSERT primary logs its id.
+statement ok
+CREATE TABLE ev (id i32 PRIMARY KEY, kind i32)
+
+statement ok
+CREATE TABLE evlog (eid i32)
+
+statement ok
+INSERT INTO ev VALUES (1, 5)
+
+# names: eid
+query I nosort
+WITH ins AS (INSERT INTO ev VALUES (2, 9) RETURNING id)
+INSERT INTO evlog SELECT id FROM ins RETURNING eid
+----
+2
+
+# ... both writes landed.
+query I nosort
+SELECT id FROM ev ORDER BY id
+----
+1
+2
+
+# A WITH feeding an INSERT primary with NO RETURNING: the statement result is the affected-row
+# count (a statement, not a query); the effect is verified by a follow-up SELECT.
+statement ok
+WITH s AS (SELECT 42::int AS n) INSERT INTO evlog SELECT n FROM s
+
+query I nosort
+SELECT eid FROM evlog ORDER BY eid
+----
+2
+42
