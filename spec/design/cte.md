@@ -39,10 +39,11 @@ SELECT x, y FROM c CROSS JOIN a
 - A reference to a CTE in `FROM` works exactly like a table reference: bare or aliased
   (`FROM c AS k`), `SELECT *` expands its columns, qualified `c.x` works via the label mechanism.
 
-**Top-level only.** The `WITH` prefix attaches at the statement level. A `WITH` *inside* a
-parenthesized subquery or inside another CTE body is a documented narrowing this slice — the body
-production is the WITH-less `query_expr`, so a nested `WITH` surfaces as a leftover-token `42601`.
-CTE *references* inside nested subqueries are fully supported (§2).
+**Nested `WITH` is supported (§7).** Besides the statement top level, a `WITH` may prefix a
+*parenthesized* query expression — a subquery, a derived table, or another CTE's body
+(`spec/design/cte.md` §7). Its CTEs are visible only inside that nested query; the enclosing
+statement's CTE bindings are **not** inherited (a documented narrowing — §7). CTE *references*
+inside nested subqueries (without a nested `WITH`) are fully supported (§2).
 
 ## 2. Scope machinery
 
@@ -110,8 +111,8 @@ The deterministic cost formula for both paths is specified in [cost.md](cost.md)
 | Self / forward reference (non-recursive) | `42P01` | The name is not in scope yet; falls out of §2. |
 | MORE column-rename aliases than body columns | `42P10` | `invalid_column_reference`; fewer is a legal partial rename. |
 | Outer column referenced inside a body | `42703` / `42P01` | A body is not correlated (§2). |
-| `WITH RECURSIVE …` | `0A000` | Deferred (§6). |
-| Nested `WITH` (in a subquery / body) | `42601` | Top-level-only narrowing (§1); leftover token. |
+| Data-modifying CTE in a nested `WITH` | `0A000` | DML-`WITH` is top-level only (§7), matching PostgreSQL. |
+| Enclosing CTE referenced inside a nested `WITH` | `42P01` | The nested scope does not inherit enclosing CTEs (§7) — a documented divergence from PG. |
 
 ## 5. Cross-core determinism
 
@@ -148,10 +149,56 @@ purely a query-plan construct — no `format_version` bump).
   rule, and one all-or-nothing transaction.
 - ~~**`WITH` on `UPDATE`/`DELETE`**~~ — ✅ **landed** with the above ([writable-cte.md](writable-cte.md)):
   the `WITH`-prefixed primary may be an `INSERT`/`UPDATE`/`DELETE`.
-- **Nested `WITH`** inside a subquery / CTE body remains deferred (the top-level-only narrowing, §1).
+- ~~**Nested `WITH`** inside a subquery / CTE body~~ — ✅ **landed** (§7): a `WITH` may now prefix any
+  parenthesized query expression. The one residual narrowing is enclosing-CTE *visibility* (an inner
+  `WITH` does not inherit the enclosing statement's CTE bindings — §7), a documented follow-on.
 
 **Landed since:**
 
 - **Inline derived-table *syntax*** (`FROM (SELECT …) AS t`) — the parser surface over this slice's
   inline evaluation path (§3); a derived table is mechanically an anonymous, always-inlined
   single-reference CTE. See [grammar.md §42](grammar.md#42-derived-tables-from--query_expr--as-t).
+
+## 7. Nested `WITH` — a `WITH` inside a subquery / derived table / CTE body
+
+A `WITH` clause may prefix **any parenthesized query expression**, not only the statement top level:
+
+```
+SELECT * FROM (WITH r AS (SELECT 1 AS n) SELECT n FROM r) s          -- derived table
+WITH outer AS (WITH inner AS (SELECT 1) SELECT * FROM inner)         -- another CTE's body
+  SELECT * FROM outer
+SELECT (WITH c AS (SELECT count(*) k FROM t) SELECT k FROM c)        -- scalar subquery
+SELECT id FROM t WHERE n IN (WITH c AS (…) SELECT n FROM c)          -- IN / EXISTS / ANY/ALL subquery
+```
+
+A nested `WITH` is recognized by a shape-based lookahead — `WITH RECURSIVE …`, `WITH <name> ( …`, or
+`WITH <name> AS …` — so `with` stays a legal identifier elsewhere (`x IN (with)` is still a value
+list). It is reached at every position that already admits a parenthesized subquery: a derived table
+(`FROM ( … )`), a scalar subquery, `IN`/`EXISTS`/`ANY`/`ALL ( … )`, a set-operation operand, and a
+CTE body.
+
+**Own scope, no inheritance (the one narrowing).** A nested `WITH` establishes its **own** CTE scope.
+Inside it, the nested CTEs are visible — to each other (forward-only) and to the inner main query —
+with the full §2/§3 machinery (duplicate name `42712`, self/forward reference `42P01`, the
+column-rename list, `[NOT] MATERIALIZED`, and `WITH RECURSIVE`). But the **enclosing** statement's CTE
+bindings are **not** inherited: an enclosing CTE name referenced inside a nested `WITH` resolves to a
+base table (or `42P01` if none), *not* the enclosing CTE. PostgreSQL inherits them, so this is a
+**documented divergence** (per-core unit tests pin it); full enclosing-scope visibility is a scoped
+follow-on. Outside the nested `WITH`, the enclosing CTEs are intact — only the inner query loses
+visibility of them.
+
+**Planning & execution.** A nested `WITH` plans to a `QueryPlan::With { bindings, modes, body }`: the
+nested CTE bindings (planned against each other only, via the same `plan_cte_bindings`), their
+inline/materialize modes ([cost.md](cost.md) §3), and the inner body plan. At execution the node
+materializes its CTEs **once**, builds a fresh CTE context over them, and runs the body — the same
+materialize-then-execute shape as the top-level `run_with`, so the deterministic cost is identical
+across cores. A nested `WITH` adds **no** correlation frame: its body sees the same outer-row
+environment as the node's position (so a `LATERAL` derived-table body whose `WITH` wraps it still
+correlates to its left siblings), while the CTE bodies stay independent (`parent = None`).
+
+**Data-modifying CTEs stay top-level only.** A nested `WITH` whose CTE body is an
+`INSERT`/`UPDATE`/`DELETE` is rejected `0A000` (`is only supported at the top level`) — this
+*matches* PostgreSQL, which also restricts a data-modifying `WITH` to the outermost statement.
+
+No on-disk format change (a nested `WITH`, like every CTE construct, is purely a query-plan
+construct). Capability `query.cte_nested`.

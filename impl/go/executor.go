@@ -1711,6 +1711,15 @@ func queryCallsSeqMutator(qe *QueryExpr) bool {
 	if qe.SetOp != nil {
 		return setopCallsSeqMutator(qe.SetOp)
 	}
+	if qe.With != nil {
+		// A nested WITH's CTE bodies and main body may call a sequence mutator (cte.md §7).
+		for i := range qe.With.Ctes {
+			if cteBodyCallsSeqMutator(&qe.With.Ctes[i].Body) {
+				return true
+			}
+		}
+		return queryCallsSeqMutator(qe.With.Body)
+	}
 	return false
 }
 
@@ -2013,6 +2022,16 @@ func collectQueryPrivs(qe *QueryExpr, req *privReq, locals map[string]bool) {
 		collectSelectPrivs(qe.Select, req, locals)
 	} else if qe.SetOp != nil {
 		collectSetopPrivs(qe.SetOp, req, locals)
+	} else if qe.With != nil {
+		// A nested WITH establishes its own CTE scope (spec/design/cte.md §7): the enclosing locals
+		// are NOT inherited (an enclosing CTE name resolves to a base table inside, so it is
+		// privilege-checked), and the nested CTE names shadow base tables only within this node.
+		scope := map[string]bool{}
+		for i := range qe.With.Ctes {
+			collectCteBodyPrivs(&qe.With.Ctes[i].Body, req, scope)
+			scope[strings.ToLower(qe.With.Ctes[i].Name)] = true
+		}
+		collectQueryPrivs(qe.With.Body, req, scope)
 	}
 }
 
@@ -6888,6 +6907,10 @@ func analyzeRecursiveCte(name string, body QueryExpr) (bool, bool, error) {
 			"recursive reference to query %q must not appear within its non-recursive term", name,
 		))
 	}
+	if so.Rhs.With != nil {
+		return false, false, NewError(FeatureNotSupported,
+			"a nested WITH in the recursive term of a recursive query is not supported yet")
+	}
 	if so.Rhs.Select == nil {
 		return false, false, NewError(FeatureNotSupported,
 			"a set operation in the recursive term of a recursive query is not supported yet")
@@ -7443,11 +7466,43 @@ func (db *Database) planQuery(qe QueryExpr, parent *scope, ctes []*cteBinding, p
 		}
 		return queryPlan{sel: sp}, nil
 	}
+	if qe.With != nil {
+		wp, err := db.planWithExpr(qe.With, parent, ptypes)
+		if err != nil {
+			return queryPlan{}, err
+		}
+		return queryPlan{with: wp}, nil
+	}
 	sop, err := db.planSetOp(qe.SetOp, parent, ctes, ptypes)
 	if err != nil {
 		return queryPlan{}, err
 	}
 	return queryPlan{setop: sop}, nil
+}
+
+// planWithExpr plans a nested `WITH … query_expr` (spec/design/cte.md §7) into a withPlan. The
+// nested CTEs establish their OWN scope: the bodies and the inner main query see ONLY these CTEs
+// (and the catalog) — the enclosing statement's CTE bindings are NOT inherited (a documented
+// narrowing, cte.md §7), so planCteBindings and the body are planned without the outer ctes. The
+// inner main query keeps the enclosing parent (so a LATERAL derived-table body still correlates to
+// its left siblings), while the CTE bodies stay independent (parent=nil, inside planCteBindings). A
+// data-modifying CTE here is rejected 0A000 — PostgreSQL restricts a DML-WITH to the top level.
+func (db *Database) planWithExpr(we *WithExpr, parent *scope, ptypes *paramTypes) (*withPlan, error) {
+	for i := range we.Ctes {
+		if we.Ctes[i].Body.IsDataModifying() {
+			return nil, NewError(FeatureNotSupported,
+				fmt.Sprintf("WITH clause containing a data-modifying statement (%s) is only supported at the top level", we.Ctes[i].Name))
+		}
+	}
+	bindings, err := db.planCteBindings(we.Ctes, we.Recursive, ptypes)
+	if err != nil {
+		return nil, err
+	}
+	body, err := db.planQuery(*we.Body, parent, bindings, ptypes)
+	if err != nil {
+		return nil, err
+	}
+	return &withPlan{bindings: bindings, modes: cteModes(bindings), body: body}, nil
 }
 
 // execQueryPlan executes a resolved plan against an outer-row environment (outer = the enclosing
@@ -7460,7 +7515,30 @@ func (db *Database) execQueryPlan(plan *queryPlan, outer []Row, params []Value, 
 	if plan.values != nil {
 		return db.execValuesPlan(plan.values, outer, params, ctes)
 	}
+	if plan.with != nil {
+		return db.execWithPlan(plan.with, outer, params)
+	}
 	return db.execSetOpPlan(plan.setop, outer, params, ctes)
+}
+
+// execWithPlan executes a nested WITH plan (spec/design/cte.md §7): materialize its CTE bindings
+// once (in list order, charging their cost), build a FRESH CTE context over them (the nested CTEs
+// establish their own scope — the enclosing context is NOT chained in, the documented narrowing
+// §7), and run the inner body against it. The body still sees the outer row environment (so a
+// LATERAL nested-WITH derived-table body correlates to its left siblings). The materialization cost
+// folds into the body's cost — the same shape as the top-level runWith (cte.md §3).
+func (db *Database) execWithPlan(wp *withPlan, outer []Row, params []Value) (selectResult, error) {
+	buffers, totalCost, err := db.materializeCtes(wp.bindings, wp.modes, params)
+	if err != nil {
+		return selectResult{}, err
+	}
+	ctx := cteCtx{modes: wp.modes, bindings: wp.bindings, buffers: buffers}
+	r, err := db.execQueryPlan(&wp.body, outer, params, ctx)
+	if err != nil {
+		return selectResult{}, err
+	}
+	r.cost += totalCost
+	return r, nil
 }
 
 // planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
@@ -7489,12 +7567,7 @@ func (db *Database) planSetOp(so *SetOp, parent *scope, ctes []*cteBinding, ptyp
 		}
 		columnTypes[i] = t
 	}
-	var columnNames []string
-	if lhs.sel != nil {
-		columnNames = lhs.sel.columnNames
-	} else {
-		columnNames = lhs.setop.columnNames
-	}
+	columnNames := lhs.columnNames()
 
 	order := make([]orderSlot, 0, len(so.OrderBy))
 	for i := range so.OrderBy {
@@ -10246,6 +10319,14 @@ func (db *Database) foldUncorrelatedInPlan(plan *queryPlan, bound []Value, ctes 
 		}
 		return nil
 	}
+	if plan.with != nil {
+		// A nested WITH body is not folded here against the enclosing ctes — its inner subqueries
+		// reference the nested CTEs (a different scope, materialized only when the node runs), so
+		// they are left to the evaluator, exactly like a derived table's body (spec/design/cte.md
+		// §7). The whole nested-WITH subquery is itself folded by the caller if uncorrelated
+		// (executed once via execWithPlan).
+		return nil
+	}
 	if err := db.foldUncorrelatedInPlan(&plan.setop.lhs, bound, ctes, cost); err != nil {
 		return err
 	}
@@ -10409,6 +10490,11 @@ func queryPlanReferencesOuter(plan *queryPlan, depth int) bool {
 		}
 		return false
 	}
+	if plan.with != nil {
+		// A nested WITH adds no correlation frame: its body is at the same depth, and the CTE bodies
+		// are planned parent=nil (no outer reference), so only the body can correlate (cte.md §7).
+		return queryPlanReferencesOuter(&plan.with.body, depth)
+	}
 	return queryPlanReferencesOuter(&plan.setop.lhs, depth) || queryPlanReferencesOuter(&plan.setop.rhs, depth)
 }
 
@@ -10566,6 +10652,11 @@ func collectTouchedPlan(plan *queryPlan, depth int, touched []bool) {
 	if plan.setop != nil {
 		collectTouchedPlan(&plan.setop.lhs, depth, touched)
 		collectTouchedPlan(&plan.setop.rhs, depth, touched)
+	}
+	if plan.with != nil {
+		// A nested WITH's correlated references live in its body (the CTE bodies are parent=nil);
+		// recurse into the body at the same depth (spec/design/cte.md §7).
+		collectTouchedPlan(&plan.with.body, depth, touched)
 	}
 }
 
@@ -11568,6 +11659,17 @@ type queryPlan struct {
 	sel    *selectPlan
 	setop  *setOpPlan
 	values *valuesPlan
+	with   *withPlan
+}
+
+// withPlan is a planned nested `WITH … query_expr` (spec/design/cte.md §7): the nested CTE bindings
+// + their inline/materialize modes, and the inner query plan that references them. At execution the
+// bindings are materialized once and body runs against a fresh CTE context (they establish their
+// own scope — the enclosing context is NOT chained in, the documented narrowing §7).
+type withPlan struct {
+	bindings []*cteBinding
+	modes    []cteMode
+	body     queryPlan
 }
 
 // columnTypes returns the plan's output column types (for a subquery's plan-time column-count
@@ -11578,6 +11680,9 @@ func (p *queryPlan) columnTypes() []resolvedType {
 	}
 	if p.values != nil {
 		return p.values.columnTypes
+	}
+	if p.with != nil {
+		return p.with.body.columnTypes()
 	}
 	return p.setop.columnTypes
 }
@@ -11590,6 +11695,9 @@ func (p *queryPlan) columnNames() []string {
 	}
 	if p.values != nil {
 		return p.values.columnNames
+	}
+	if p.with != nil {
+		return p.with.body.columnNames()
 	}
 	return p.setop.columnNames
 }

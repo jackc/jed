@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { Database, EngineError, execute } from "../src/lib.ts";
-import { dbWith } from "./util.ts";
+import { dbWith, errCode, query } from "./util.ts";
 
 // A 3-row, single-node table t(id, n) = {(1,10),(2,20),(3,30)}.
 function t3(): Database {
@@ -84,4 +84,34 @@ test("WITH RECURSIVE materialization hint is inert", () => {
     assert.strictEqual(r.rows.length, 3, `hint ${JSON.stringify(hint)} rows`);
     assert.strictEqual(r.cost, 17n, `hint ${JSON.stringify(hint)} cost`);
   }
+});
+
+// The nested-WITH narrowing (spec/design/cte.md §7): a nested WITH establishes its OWN CTE scope and
+// does NOT inherit the enclosing statement's CTE bindings — a documented DIVERGENCE from PostgreSQL
+// (which inherits them), so it cannot live in the oracle corpus. Inside the nested WITH, an enclosing
+// CTE name with no base table is 42P01; one that shadows a base table reads the BASE TABLE (PG would
+// read the CTE).
+test("nested WITH does not inherit enclosing CTEs", () => {
+  // (a) No base table named e: the inner reference to the enclosing CTE e is unresolved -> 42P01.
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, n i32)",
+    "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+  ]);
+  assert.strictEqual(
+    errCode(() =>
+      execute(db, "WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s"),
+    ),
+    "42P01",
+  );
+
+  // (b) A base table e exists: inside the nested WITH the enclosing CTE e is invisible, so the
+  // reference resolves to the BASE TABLE (rows are the table's, not the CTE's). PG diverges.
+  const db2 = dbWith([
+    "CREATE TABLE e (v i32 PRIMARY KEY)",
+    "INSERT INTO e VALUES (7), (8)",
+  ]);
+  assert.deepEqual(
+    query(db2, "WITH e AS (SELECT 1 AS v) SELECT v FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s ORDER BY v"),
+    [["7"], ["8"]],
+  );
 });

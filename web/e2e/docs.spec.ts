@@ -95,34 +95,46 @@ test('the select page runs the WITH RECURSIVE series demo live', async ({ page }
 	await expect(panel.getByTestId('result-rows')).toContainText('5');
 });
 
+test('the select page runs the nested WITH demo live', async ({ page }) => {
+	await page.goto('/docs/sql/select/');
+	// Sixth LiveSql panel = the nested-WITH demo (spec/design/cte.md §7): a derived table whose body
+	// is `WITH cheap AS (… min(price) per category …) SELECT … WHERE cheapest <= 10` — office (1.50)
+	// and kitchen (9.99).
+	const panel = page.getByTestId('live-sql').nth(5);
+	await expect(panel.getByTestId('result-rows')).toContainText('office');
+	await expect(panel.getByTestId('result-rows')).toContainText('kitchen');
+	await expect(panel.getByTestId('result-rows')).toContainText('1.50');
+	await expect(panel.getByTestId('result-rows')).toContainText('9.99');
+});
+
 test('the select page runs the LATERAL top-N-per-group demo live', async ({ page }) => {
 	await page.goto('/docs/sql/select/');
-	// Eighth LiveSql panel = the CROSS JOIN LATERAL demo: the priciest product of each category —
+	// Ninth LiveSql panel = the CROSS JOIN LATERAL demo: the priciest product of each category —
 	// kitchen → Mug (12.50), office → Notebook (4.00); the dependent subquery re-runs per category.
-	const panel = page.getByTestId('live-sql').nth(7);
+	const panel = page.getByTestId('live-sql').nth(8);
 	await expect(panel.getByTestId('result-rows')).toContainText('Mug');
 	await expect(panel.getByTestId('result-rows')).toContainText('Notebook');
 });
 
 test('the select page runs the array containment operators live (@> / <@ / &&)', async ({ page }) => {
 	await page.goto('/docs/sql/select/');
-	// Tenth LiveSql panel = the @>/<@/&& demo; every column is true (the array sets contain/overlap).
-	const panel = page.getByTestId('live-sql').nth(9);
+	// Eleventh LiveSql panel = the @>/<@/&& demo; every column is true (the array sets contain/overlap).
+	const panel = page.getByTestId('live-sql').nth(10);
 	await expect(panel.getByTestId('result-rows')).toContainText('true');
 });
 
 test('the select page runs the ANY/ALL quantified comparisons live', async ({ page }) => {
 	await page.goto('/docs/sql/select/');
-	// Eleventh LiveSql panel = the = ANY / > ALL demo: any_match true, all_greater true, no_match false.
-	const panel = page.getByTestId('live-sql').nth(10);
+	// Twelfth LiveSql panel = the = ANY / > ALL demo: any_match true, all_greater true, no_match false.
+	const panel = page.getByTestId('live-sql').nth(11);
 	await expect(panel.getByTestId('result-rows')).toContainText('true');
 	await expect(panel.getByTestId('result-rows')).toContainText('false');
 });
 
 test('the select page runs the VARIADIC num_nulls demo live', async ({ page }) => {
 	await page.goto('/docs/sql/select/');
-	// Thirteenth LiveSql panel = the num_nulls demo: spread 1, variadic 1, non_nulls 2 (both forms agree).
-	const panel = page.getByTestId('live-sql').nth(12);
+	// Fourteenth LiveSql panel = the num_nulls demo: spread 1, variadic 1, non_nulls 2 (both forms agree).
+	const panel = page.getByTestId('live-sql').nth(13);
 	await expect(panel.getByTestId('result-rows')).toContainText('1');
 	await expect(panel.getByTestId('result-rows')).toContainText('2');
 });
@@ -131,9 +143,9 @@ test('the select page runs the array-of-composite demo live (field access into a
 	page,
 }) => {
 	await page.goto('/docs/sql/select/');
-	// Fourteenth LiveSql panel = the addr[] demo: row 1's first element renders (Main,90210), its street
+	// Fifteenth LiveSql panel = the addr[] demo: row 1's first element renders (Main,90210), its street
 	// is Main and zip 90210 — array-of-composite construction, subscript, and field access (§12 AC1).
-	const panel = page.getByTestId('live-sql').nth(13);
+	const panel = page.getByTestId('live-sql').nth(14);
 	await expect(panel.getByTestId('result-rows')).toContainText('(Main,90210)');
 	await expect(panel.getByTestId('result-rows')).toContainText('Main');
 	await expect(panel.getByTestId('result-rows')).toContainText('90210');
@@ -143,20 +155,20 @@ test('the select page runs the composite-with-array-field demo live (field acces
 	page,
 }) => {
 	await page.goto('/docs/sql/select/');
-	// Seventeenth LiveSql panel = the poly(name, pts i32[]) demo: row 1 renders its array field
+	// Eighteenth LiveSql panel = the poly(name, pts i32[]) demo: row 1 renders its array field
 	// {10,20,30}, (p).pts reads the whole array, and (p).pts[1] reads the first element 10 —
 	// a composite type with an array-typed field (array.md §12, the mirror of array-of-composite).
-	const panel = page.getByTestId('live-sql').nth(16);
+	const panel = page.getByTestId('live-sql').nth(17);
 	await expect(panel.getByTestId('result-rows')).toContainText('{10,20,30}');
 	await expect(panel.getByTestId('result-rows')).toContainText('10');
 });
 
 test('the select page runs the date demo live', async ({ page }) => {
 	await page.goto('/docs/sql/select/');
-	// Eighteenth LiveSql panel = the date demo: WHERE on_day < '2024-03-01' ORDER BY on_day keeps
+	// Nineteenth LiveSql panel = the date demo: WHERE on_day < '2024-03-01' ORDER BY on_day keeps
 	// only the two early dates, chronologically — review (2023-11-02) then launch (2024-01-15); the
 	// 2024-06-15 and infinity rows are filtered out (spec/design/date.md).
-	const panel = page.getByTestId('live-sql').nth(17);
+	const panel = page.getByTestId('live-sql').nth(18);
 	await expect(panel.getByTestId('result-rows')).toContainText('review');
 	await expect(panel.getByTestId('result-rows')).toContainText('launch');
 	await expect(panel.getByTestId('result-rows')).not.toContainText('kickoff');

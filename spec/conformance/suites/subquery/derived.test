@@ -226,11 +226,12 @@ SELECT * FROM (t JOIN t ON 1 = 1) AS x
 statement error 42702
 SELECT a FROM (SELECT id AS a, n AS a FROM t) AS d
 
-# A nested WITH inside the body -> 42601 (top-level-only narrowing; the body is the WITH-less
-# query_expr, so the WITH surfaces as a leftover token). DOCUMENTED DIVERGENCE: PostgreSQL 18 accepts
-# a WITH-prefixed subquery body (returns 1) — see oracle_overrides.toml.
-statement error 42601
+# A nested WITH inside a derived-table body is now supported (spec/design/cte.md §7) — see
+# cte/nested.test for the behavior. (Previously a top-level-only narrowing / 42601.)
+query I nosort
 SELECT * FROM (WITH c AS (SELECT 1 AS one) SELECT one FROM c) AS d
+----
+1
 
 # --- cost contract (spec/design/cost.md §3, the inline path) ---
 

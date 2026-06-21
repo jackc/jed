@@ -411,6 +411,15 @@ rollback       ::= "ROLLBACK" ("TRANSACTION" | "WORK")?
  * are NOT reserved (§3), disambiguated positionally. */
 query_expr     ::= set_expr order_by? limit_offset?
 
+/* A SUBQUERY expression — the body of a parenthesized query (a derived table, a scalar / IN /
+ * EXISTS / ANY/ALL subquery, a set-op operand, or a CTE body) — is a query_expr OPTIONALLY prefixed
+ * by its OWN with_clause: a NESTED WITH (../design/cte.md §7). The nested CTEs establish their own
+ * scope (visible only within this body; the enclosing statement's CTEs are NOT inherited — a
+ * documented divergence from PG). A nested WITH is recognized by the shape "WITH RECURSIVE …" /
+ * "WITH <name> (" / "WITH <name> AS" (so `with` stays a legal identifier elsewhere). A
+ * data-modifying CTE in a nested WITH is rejected 0A000 (DML-WITH is top-level only — matching PG). */
+subquery_expr  ::= with_clause? query_expr
+
 /* A query STATEMENT is a top-level query_expr optionally prefixed by a WITH clause defining one or
  * more common table expressions (../design/cte.md). A CTE is a named, statement-local relation the
  * FROM clause references like a table; the engine evaluates it by PostgreSQL's hybrid rule —
@@ -425,9 +434,10 @@ query_expr     ::= set_expr order_by? limit_offset?
  * the statement, EXCEPT inside its own body (the body resolves a same-named base table normally). A
  * duplicate CTE name in one list is 42712. A CTE body is an INDEPENDENT query — not correlated to
  * where it is referenced.
- *   The WITH prefix attaches only at the STATEMENT top level this slice: a WITH inside a
- * parenthesized subquery or another CTE body is a documented narrowing (the body production is the
- * WITH-less query_expr). DATA-MODIFYING CTEs and WITH on a data-modifying primary have landed
+ *   A WITH prefix attaches at the STATEMENT top level AND, as a NESTED WITH (subquery_expr,
+ * ../design/cte.md §7), to any parenthesized subquery / derived table / CTE body — establishing its
+ * own scope (enclosing CTEs not inherited). The top-level primary itself does not re-prefix a second
+ * WITH (a bare "WITH … WITH …" is a 42601). DATA-MODIFYING CTEs and WITH on a data-modifying primary have landed
  * (../design/writable-cte.md, grammar.md §48): a cte body, and the WITH primary, may be an INSERT/UPDATE/DELETE
  * (with its own optional RETURNING). Every sub-statement reads ONE pre-statement snapshot (they
  * cannot see each other's table writes — data crosses only via a CTE's RETURNING buffer); the parts
@@ -456,7 +466,7 @@ cte            ::= identifier ("(" identifier ("," identifier)* ")")?
  * data-modifying statement (the writable-CTE surface, ../design/writable-cte.md). A bare query
  * (no WITH) stays a plain query_expr / insert / update / delete at the statement level — this
  * production names only the positions a WITH clause governs. */
-cte_body       ::= query_expr | insert | update | delete
+cte_body       ::= subquery_expr | insert | update | delete
 
 set_expr       ::= intersect_expr (("UNION" | "EXCEPT") ("ALL" | "DISTINCT")? intersect_expr)*
 
@@ -557,7 +567,7 @@ table_ref      ::= "LATERAL"? derived_table derived_alias?
  * is a general expression resolved as a CONSTANT — non-LATERAL, so a column reference is 42703; an
  * aggregate is 42803; a $N with no inferable type is 42P18. All rows must have the same arity
  * (42601); the column types unify across rows like a set operation (42804 on a mismatch). */
-derived_table  ::= "(" (query_expr | values_body) ")"
+derived_table  ::= "(" (subquery_expr | values_body) ")"
 
 values_body    ::= "VALUES" values_row ("," values_row)*
 
@@ -705,13 +715,13 @@ not_expr       ::= "NOT" not_expr
  * "x = ANY(arr)" is true iff x equals some element, "x op ALL(arr)" iff x op holds for every
  * element, three-valued over a NULL element / a NULL x exactly like the IN-list membership. The
  * operand is EITHER a parenthesized `query_expr` — the SUBQUERY form "op ANY(SELECT …)"
- * (../design/array-functions.md §11.6, disambiguated by a leading "SELECT" after "(", folding over
+ * (../design/array-functions.md §11.6, disambiguated by a leading "SELECT" (or a nested "WITH", cte.md §7) after "(", folding over
  * the subquery's single column exactly as IN does) — OR a full `expr` resolving to an array (a
  * non-array right side is 42809). "SOME" is a synonym for "ANY". */
-comparison     ::= concat ( compare_op ( ("ANY" | "SOME" | "ALL") "(" ( query_expr | expr ) ")" | concat )
+comparison     ::= concat ( compare_op ( ("ANY" | "SOME" | "ALL") "(" ( subquery_expr | expr ) ")" | concat )
                             | "IS" "NOT"? "NULL"
                             | "IS" "NOT"? "DISTINCT" "FROM" concat
-                            | "NOT"? "IN" "(" ( query_expr | concat ("," concat)* ) ")"
+                            | "NOT"? "IN" "(" ( subquery_expr | concat ("," concat)* ) ")"
                             | "NOT"? "BETWEEN" concat "AND" concat
                             | "NOT"? "LIKE" concat )?
 
@@ -774,7 +784,7 @@ postfix        ::= primary ( "::" type_name | collate_clause | "." identifier | 
 subscript      ::= "[" ( a_expr [ ":" [ a_expr ] ] | ":" [ a_expr ] ) "]"
 
 /* A "(" begins either a parenthesized expression "(" expr ")" or a SCALAR SUBQUERY
- * "(" query_expr ")" (../design/grammar.md §26) — disambiguated by a leading "SELECT" after the
+ * "(" query_expr ")" (../design/grammar.md §26) — disambiguated by a leading "SELECT" (or a nested "WITH", cte.md §7) after the
  * "(". "EXISTS" "(" query_expr ")" is the existence predicate. Both subquery forms (and the
  * IN-subquery above) are UNCORRELATED this slice: a reference to an outer-query column, or a bind
  * parameter "$N", inside the subquery is a 0A000 (../design/grammar.md §26). */
@@ -788,8 +798,8 @@ primary        ::= number
                  | "CAST" "(" expr "AS" type_name ")"
                  | case_expr
                  | function_call
-                 | "EXISTS" "(" query_expr ")"
-                 | "(" ( query_expr | expr ) ")"
+                 | "EXISTS" "(" subquery_expr ")"
+                 | "(" ( subquery_expr | expr ) ")"
                  | column_ref
 
 /* CURRENT_TIMESTAMP is the SQL-standard BARE keyword (no parens) for the transaction/statement

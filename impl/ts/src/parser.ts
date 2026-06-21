@@ -31,6 +31,7 @@ import type {
   SelectItems,
   SeqOptions,
   SeqRestart,
+  SetOp,
   SetOpKind,
   Statement,
   SubscriptSpec,
@@ -1383,7 +1384,7 @@ class Parser {
   // optional trailing ORDER BY / LIMIT / OFFSET folded onto it. The shared core of parseQueryExpr
   // (which returns it as a Statement) and a WITH clause's main body. Unlike parseSubquery it opens
   // no new nesting level — the body is at the statement top level.
-  private parseQueryExprNode(): QueryExpr {
+  private parseQueryExprNode(): Select | SetOp {
     const node = this.parseSetExpr();
     const orderBy = this.parseOrderBy();
     const { limit, offset } = this.parseLimitOffsetClauses();
@@ -1500,17 +1501,80 @@ class Parser {
     // A nested scalar subquery / EXISTS / IN (SELECT …) is one query-nesting level deeper; the
     // guard also protects the parser's own stack against `(SELECT (SELECT … ))`.
     this.deepen();
+    // A leading WITH begins a nested common-table-expression query (spec/design/cte.md §7).
+    const node = this.atWithClause() ? this.parseWithQueryExpr() : this.parseSubqueryInner();
+    this.undeepen();
+    return node;
+  }
+
+  // parseSubqueryInner parses the non-WITH body of a subquery: a set-expression plus an optional
+  // trailing ORDER BY / LIMIT / OFFSET folded onto the node. Split out so a nested WITH's main query
+  // (parseWithQueryExpr) reuses it.
+  private parseSubqueryInner(): QueryExpr {
     const node = this.parseSetExpr();
     const orderBy = this.parseOrderBy();
     const { limit, offset } = this.parseLimitOffsetClauses();
-    this.undeepen();
     return { ...node, orderBy, limit, offset };
+  }
+
+  // parseWithQueryExpr parses a nested `WITH [RECURSIVE] cte (, cte)* query_expr` into a WithExpr
+  // (spec/design/cte.md §7). The CTE bodies reuse parseCte (so a CTE body may itself nest a WITH);
+  // the main query is a WITH-less query_expr. A data-modifying CTE body parses here but is rejected
+  // at planning (0A000, top-level-only — matching PostgreSQL).
+  private parseWithQueryExpr(): QueryExpr {
+    this.expectKeyword("with");
+    let recursive = false;
+    if (this.peekKeyword() === "recursive") {
+      this.advance();
+      recursive = true;
+    }
+    const ctes: Cte[] = [];
+    for (;;) {
+      ctes.push(this.parseCte());
+      if (this.peek().kind === "comma") {
+        this.advance();
+        continue;
+      }
+      break;
+    }
+    const body = this.parseSubqueryInner();
+    return { kind: "withExpr", ctes, recursive, body };
+  }
+
+  // isWithClauseAtOffset reports whether a WITH clause (`WITH RECURSIVE …`, `WITH <name> ( …`, or
+  // `WITH <name> AS …`) begins at this.pos + offset (spec/design/cte.md §7), as opposed to an
+  // ordinary expression or a column named `with`. The shape-based lookahead keeps the recognition
+  // unambiguous even where `with` is a legal identifier (e.g. `x IN (with)` is a value list).
+  private isWithClauseAtOffset(offset: number): boolean {
+    if (this.peekKeywordAt(offset) !== "with") return false;
+    if (this.peekKeywordAt(offset + 1) === "recursive") return true;
+    if (this.peekKindAt(offset + 1) === "word") {
+      return this.peekKindAt(offset + 2) === "lparen" || this.peekKeywordAt(offset + 2) === "as";
+    }
+    return false;
+  }
+
+  // isQueryStartAtOffset reports whether a query expression — a SELECT or a nested WITH clause
+  // (cte.md §7) — begins at this.pos + offset. The §26 leading-SELECT lookahead, extended with WITH.
+  private isQueryStartAtOffset(offset: number): boolean {
+    return this.peekKeywordAt(offset) === "select" || this.isWithClauseAtOffset(offset);
+  }
+
+  // atSubqueryStart reports whether the NEXT token begins a query expression (a SELECT or nested
+  // WITH) — the disambiguator at every subquery position.
+  private atSubqueryStart(): boolean {
+    return this.isQueryStartAtOffset(0);
+  }
+
+  // atWithClause reports whether the NEXT token begins a nested WITH clause (cte.md §7).
+  private atWithClause(): boolean {
+    return this.isWithClauseAtOffset(0);
   }
 
   // parseSetExpr parses the lower-precedence, left-associative UNION/EXCEPT level. INTERSECT binds
   // tighter (parsed inside parseIntersectExpr), so `a UNION b INTERSECT c` becomes
   // `a UNION (b INTERSECT c)`.
-  private parseSetExpr(): QueryExpr {
+  private parseSetExpr(): Select | SetOp {
     const base = this.depth;
     let left = this.parseIntersectExpr();
     for (;;) {
@@ -1540,7 +1604,7 @@ class Parser {
   }
 
   // parseIntersectExpr parses the higher-precedence, left-associative INTERSECT level.
-  private parseIntersectExpr(): QueryExpr {
+  private parseIntersectExpr(): Select | SetOp {
     const base = this.depth;
     let left: QueryExpr = this.parseSelectCore();
     while (this.peekKeyword() === "intersect") {
@@ -1796,7 +1860,8 @@ class Parser {
     let values: Expr[][] | undefined;
     if (this.peekKeyword() === "values") {
       values = this.parseValuesBody();
-    } else if (this.peekKeyword() === "select") {
+    } else if (this.atSubqueryStart()) {
+      // A leading SELECT, or a nested WITH (cte.md §7), is a query_expr body.
       body = this.parseSubquery();
     } else {
       throw engineError(
@@ -2180,8 +2245,9 @@ class Parser {
       this.advance();
       this.expect("lparen");
       // `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by a
-      // leading `SELECT`; otherwise a non-empty value list (`IN ()` is a 42601 syntax error).
-      if (this.peekKeyword() === "select") {
+      // leading `SELECT` (or a nested `WITH` — cte.md §7); otherwise a non-empty value list
+      // (`IN ()` is a 42601 syntax error).
+      if (this.atSubqueryStart()) {
         const query = this.parseSubquery();
         this.expect("rparen");
         return { kind: "inSubquery", lhs, query, negated: predNegated };
@@ -2242,9 +2308,9 @@ class Parser {
       this.advance(); // ANY / SOME / ALL
       this.expect("lparen");
       // A leading `SELECT` is the SUBQUERY form `op ANY/ALL(SELECT …)` — the subquery spelling of
-      // IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead; anything else is the
-      // array operand (§11.1).
-      if (this.peekKeyword() === "select") {
+      // IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead (or a nested `WITH` —
+      // cte.md §7); anything else is the array operand (§11.1).
+      if (this.atSubqueryStart()) {
         const query = this.parseSubquery();
         this.expect("rparen");
         return { kind: "quantifiedSubquery", op, all, lhs, query };
@@ -2470,8 +2536,8 @@ class Parser {
     if (this.peek().kind === "lparen") {
       this.advance();
       // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading `SELECT`
-      // after the `(`; otherwise this is a parenthesized expression.
-      if (this.peekKeyword() === "select") {
+      // (or a nested `WITH` — cte.md §7) after the `(`; otherwise a parenthesized expression.
+      if (this.atSubqueryStart()) {
         const query = this.parseSubquery();
         this.expect("rparen");
         return { kind: "scalarSubquery", query };
@@ -2481,11 +2547,12 @@ class Parser {
       return e;
     }
     // `EXISTS ( SELECT ... )` — the existence predicate (grammar.md §26). Recognized only when an
-    // open-paren + `SELECT` follows, so `exists` stays usable as a column / function name.
+    // open-paren + a query start (`SELECT`, or a nested `WITH` — cte.md §7) follows, so `exists`
+    // stays usable as a column / function name.
     if (
       this.peekKeyword() === "exists" &&
       this.tokens[this.pos + 1]?.kind === "lparen" &&
-      this.peekKeywordAt(2) === "select"
+      this.isQueryStartAtOffset(2)
     ) {
       this.advance(); // EXISTS
       this.expect("lparen");

@@ -35,6 +35,15 @@ SELECT name, price FROM kitchen ORDER BY price DESC;`;
 )
 SELECT n FROM series ORDER BY n;`;
 
+	const nestedWith = `SELECT category, cheapest
+FROM (
+  WITH cheap AS (
+    SELECT category, min(price) AS cheapest FROM product GROUP BY category
+  )
+  SELECT category, cheapest FROM cheap WHERE cheapest <= 10
+) AS s
+ORDER BY category;`;
+
 	const dataModifying = `WITH discounted AS (
   UPDATE product SET price = price * 0.9
   WHERE category = 'kitchen'
@@ -196,6 +205,20 @@ makes a cyclic graph walk terminate). The column types are fixed by the non-recu
 recursion with no stopping condition runs until it hits the statement's
 [cost ceiling](/docs/api/resource-limits) — set one when running untrusted queries. `SEARCH` /
 `CYCLE` clauses and mutual recursion are not yet supported.
+
+### Nested `WITH`
+
+A `WITH` clause may also prefix any **parenthesized** query — a subquery, a derived table, or another
+CTE's body — so you can scope helper CTEs to just the part of the statement that needs them. The
+nested CTEs (including `WITH RECURSIVE`) get the full machinery above:
+
+<LiveSql {seed} query={nestedWith} rows={2} />
+
+A nested `WITH` establishes its **own** scope: its CTEs are visible only inside that parenthesized
+query. One difference from PostgreSQL: a nested `WITH` does **not** inherit the *enclosing*
+statement's CTEs — an outer CTE name referenced inside an inner `WITH` resolves to a base table (or is
+an error), not the outer CTE. Data-modifying CTEs (`INSERT`/`UPDATE`/`DELETE`) stay top-level only, as
+in PostgreSQL.
 
 ## Derived tables (`FROM (SELECT …) AS t`)
 

@@ -40,6 +40,7 @@ import type {
   TableRef,
   TypeMod,
   Update,
+  WithExpr,
   WithQuery,
 } from "./ast.ts";
 import {
@@ -5929,7 +5930,11 @@ export class Database {
     // (4) Execute the primary against the full CTE context, adding the materialization cost.
     const ctx: CteCtx = { modes, bindings, buffers };
     let outcome: Outcome;
-    if (body.kind === "select" || body.kind === "setOp") {
+    if (
+      body.kind === "select" ||
+      body.kind === "setOp" ||
+      body.kind === "withExpr"
+    ) {
       const plan = primaryPlan!;
       const subqueryCost = { value: 0n };
       this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
@@ -5991,9 +5996,41 @@ export class Database {
     ctes: CteBinding[],
     ptypes: ParamTypes,
   ): QueryPlan {
-    return qe.kind === "select"
-      ? this.planSelect(qe, parent, ctes, ptypes)
-      : this.planSetOp(qe, parent, ctes, ptypes);
+    if (qe.kind === "select") return this.planSelect(qe, parent, ctes, ptypes);
+    if (qe.kind === "withExpr") return this.planWithExpr(qe, parent, ptypes);
+    return this.planSetOp(qe, parent, ctes, ptypes);
+  }
+
+  // planWithExpr plans a nested `WITH … query_expr` (spec/design/cte.md §7) into a WithPlan. The
+  // nested CTEs establish their OWN scope: the bodies and the inner main query see ONLY these CTEs
+  // (and the catalog) — the enclosing statement's CTE bindings are NOT inherited (a documented
+  // narrowing, cte.md §7), so planCteBindings and the body are planned without the outer ctes. The
+  // inner main query keeps the enclosing parent (so a LATERAL derived-table body still correlates to
+  // its left siblings), while the CTE bodies stay independent (parent=null, inside planCteBindings).
+  // A data-modifying CTE here is rejected 0A000 — PostgreSQL restricts a DML-WITH to the top level.
+  private planWithExpr(
+    we: WithExpr,
+    parent: Scope | null,
+    ptypes: ParamTypes,
+  ): WithPlan {
+    for (const c of we.ctes) {
+      if (cteBodyIsDataModifying(c.body)) {
+        throw engineError(
+          "feature_not_supported",
+          `WITH clause containing a data-modifying statement (${c.name}) is only supported at the top level`,
+        );
+      }
+    }
+    const bindings = this.planCteBindings(we.ctes, we.recursive, ptypes);
+    const body = this.planQuery(we.body, parent, bindings, ptypes);
+    return {
+      kind: "with",
+      bindings,
+      modes: cteModes(bindings),
+      body,
+      columnNames: body.columnNames,
+      columnTypes: body.columnTypes,
+    };
   }
 
   // execQueryPlan executes a resolved plan against an outer-row environment (outer = the enclosing
@@ -6009,7 +6046,30 @@ export class Database {
       return this.execSelectPlan(plan, outer, params, ctes);
     if (plan.kind === "values")
       return this.execValuesPlan(plan, outer, params, ctes);
+    if (plan.kind === "with") return this.execWithPlan(plan, outer, params);
     return this.execSetOpPlan(plan, outer, params, ctes);
+  }
+
+  // execWithPlan executes a nested WITH plan (spec/design/cte.md §7): materialize its CTE bindings
+  // once (in list order, charging their cost), build a FRESH CTE context over them (the nested CTEs
+  // establish their own scope — the enclosing context is NOT chained in, the documented narrowing
+  // §7), and run the inner body against it. The body still sees the outer row environment (so a
+  // LATERAL nested-WITH derived-table body correlates to its left siblings). The materialization cost
+  // folds into the body's cost — the same shape as the top-level runWith (cte.md §3).
+  private execWithPlan(plan: WithPlan, outer: Row[], params: Value[]): SelectResult {
+    const { buffers, totalCost } = this.materializeCtes(
+      plan.bindings,
+      plan.modes,
+      params,
+    );
+    const ctx: CteCtx = {
+      modes: plan.modes,
+      bindings: plan.bindings,
+      buffers,
+    };
+    const r = this.execQueryPlan(plan.body, outer, params, ctx);
+    r.cost += totalCost;
+    return r;
   }
 
   // planSetOp plans a set operation (spec/design/grammar.md §25): plan both operands with the same
@@ -7415,6 +7475,14 @@ export class Database {
       }
       return;
     }
+    if (plan.kind === "with") {
+      // A nested WITH body is not folded here against the enclosing ctes — its inner subqueries
+      // reference the nested CTEs (a different scope, materialized only when the node runs), so they
+      // are left to the evaluator, exactly like a derived table's body (spec/design/cte.md §7). The
+      // whole nested-WITH subquery is itself folded by the caller if uncorrelated (executed once via
+      // execWithPlan).
+      return;
+    }
     this.foldUncorrelatedInPlan(plan.lhs, bound, ctes, cost);
     this.foldUncorrelatedInPlan(plan.rhs, bound, ctes, cost);
   }
@@ -8798,6 +8866,11 @@ function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
       for (const e of row) if (rexprReferencesOuter(e, depth)) return true;
     return false;
   }
+  if (plan.kind === "with") {
+    // A nested WITH adds no correlation frame: its body is at the same depth, and the CTE bodies are
+    // planned parent=null (no outer reference), so only the body can correlate (cte.md §7).
+    return queryPlanReferencesOuter(plan.body, depth);
+  }
   for (const j of plan.joins)
     if (j.on !== null && rexprReferencesOuter(j.on, depth)) return true;
   if (plan.filter !== null && rexprReferencesOuter(plan.filter, depth))
@@ -9000,6 +9073,10 @@ function collectTouchedPlan(
   } else if (plan.kind === "values") {
     for (const row of plan.rows)
       for (const e of row) collectTouched(e, depth, touched);
+  } else if (plan.kind === "with") {
+    // A nested WITH's correlated references live in its body (the CTE bodies are parent=null);
+    // recurse into the body at the same depth (spec/design/cte.md §7).
+    collectTouchedPlan(plan.body, depth, touched);
   } else {
     collectTouchedPlan(plan.lhs, depth, touched);
     collectTouchedPlan(plan.rhs, depth, touched);
@@ -9639,9 +9716,24 @@ type ValuesPlan = {
   columnNames: string[];
 };
 
-// QueryPlan is a resolved query expression: a SELECT plan, a set-op plan, or a VALUES-body relation
-// (mirrors QueryExpr's bodies). A VALUES plan is only ever produced as a derived-table body.
-type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan;
+// WithPlan is a planned nested `WITH … query_expr` (spec/design/cte.md §7): the nested CTE bindings
+// + their inline/materialize modes, and the inner query plan that references them. At execution the
+// bindings are materialized once and `body` runs against a fresh CTE context (they establish their
+// own scope — the enclosing context is NOT chained in, the documented narrowing §7). columnTypes /
+// columnNames mirror the body's, so a WithPlan exposes its output columns like any other plan.
+type WithPlan = {
+  kind: "with";
+  bindings: CteBinding[];
+  modes: CteMode[];
+  body: QueryPlan;
+  columnNames: string[];
+  columnTypes: ResolvedType[];
+};
+
+// QueryPlan is a resolved query expression: a SELECT plan, a set-op plan, a VALUES-body relation, or
+// a nested WITH plan (mirrors QueryExpr's bodies). A VALUES plan is only ever produced as a
+// derived-table body.
+type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan | WithPlan;
 
 // CteMode is how a referenced CTE is evaluated (spec/design/cte.md §3, cost.md §3). Decided per CTE
 // from its reference count and [NOT] MATERIALIZED hint: a single-reference CTE is "inline", a
@@ -11722,6 +11814,12 @@ function analyzeRecursiveCte(
       `recursive reference to query "${name}" must not appear within its non-recursive term`,
     );
   }
+  if (body.rhs.kind === "withExpr") {
+    throw engineError(
+      "feature_not_supported",
+      "a nested WITH in the recursive term of a recursive query is not supported yet",
+    );
+  }
   if (body.rhs.kind !== "select") {
     throw engineError(
       "feature_not_supported",
@@ -11810,7 +11908,11 @@ function addOutcomeCost(outcome: Outcome, extra: bigint): Outcome {
 // RHSs / ON CONFLICT / RETURNING sublinks. Used by the orchestrator to count the references a
 // NON-planned data-modifying part contributes to the inline-vs-materialize decision.
 function countCteRefsDml(body: CteBody, name: string): number {
-  if (body.kind === "select" || body.kind === "setOp") {
+  if (
+    body.kind === "select" ||
+    body.kind === "setOp" ||
+    body.kind === "withExpr"
+  ) {
     return countSelfRefsQuery(body, name);
   }
   if (body.kind === "insert") {
@@ -11855,6 +11957,10 @@ function countReturningRefs(
 // relations at every nesting level plus expression sublinks).
 function countSelfRefsQuery(qe: QueryExpr, name: string): number {
   if (qe.kind === "select") return countSelfRefsSelect(qe, name);
+  // A nested WITH establishes its own CTE scope (spec/design/cte.md §7): an enclosing CTE name is
+  // NOT visible inside it (a reference there resolves to a base table / the nested CTE, never the
+  // enclosing one), so it contributes no self-reference to the enclosing name.
+  if (qe.kind === "withExpr") return 0;
   return countSelfRefsQuery(qe.lhs, name) + countSelfRefsQuery(qe.rhs, name);
 }
 
@@ -12520,9 +12626,13 @@ function cteBodyCallsSeqMutator(body: CteBody): boolean {
 }
 
 function queryCallsSeqMutator(qe: QueryExpr): boolean {
-  return qe.kind === "setOp"
-    ? setOpCallsSeqMutator(qe)
-    : selectCallsSeqMutator(qe);
+  if (qe.kind === "setOp") return setOpCallsSeqMutator(qe);
+  if (qe.kind === "withExpr") {
+    // A nested WITH's CTE bodies and main body may call a sequence mutator (cte.md §7).
+    for (const c of qe.ctes) if (cteBodyCallsSeqMutator(c.body)) return true;
+    return queryCallsSeqMutator(qe.body);
+  }
+  return selectCallsSeqMutator(qe);
 }
 
 function setOpCallsSeqMutator(so: SetOp): boolean {
@@ -12735,7 +12845,17 @@ function collectQueryPrivs(
   locals: Set<string>,
 ): void {
   if (qe.kind === "setOp") collectSetOpPrivs(qe, req, locals);
-  else collectSelectPrivs(qe, req, locals);
+  else if (qe.kind === "withExpr") {
+    // A nested WITH establishes its own CTE scope (spec/design/cte.md §7): the enclosing locals are
+    // NOT inherited (an enclosing CTE name resolves to a base table inside, so it is
+    // privilege-checked), and the nested CTE names shadow base tables only within this node.
+    const scope = new Set<string>();
+    for (const cte of qe.ctes) {
+      collectCteBodyPrivs(cte.body, req, scope);
+      scope.add(cte.name.toLowerCase());
+    }
+    collectQueryPrivs(qe.body, req, scope);
+  } else collectSelectPrivs(qe, req, locals);
 }
 
 function collectSetOpPrivs(so: SetOp, req: PrivReq, locals: Set<string>): void {

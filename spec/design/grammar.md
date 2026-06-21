@@ -1928,8 +1928,8 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
 | Duplicate explicit FROM label (alias collides) | `42712` | `duplicate_alias`; the general FROM-label rule (§15). Unaliased derived tables have no label and never collide. |
 | Ambiguous bare reference to a duplicated body output column | `42702` | Within one relation or across two (cte.md §2). |
 | Outer / sibling column referenced inside the body | `42703` / `42P01` | The body is not correlated / not LATERAL. |
-| Leading `(` in FROM not followed by `SELECT` or `VALUES` | `42601` | No parenthesized-join FROM this slice — a **documented divergence** (PG parses `(a JOIN b …)`; the override ledger records it). |
-| Nested `WITH` inside the body | `42601` | Top-level-only narrowing (§26, cte.md §1); leftover token — a **documented divergence** (PG 18 accepts a `WITH` body). |
+| Leading `(` in FROM not followed by `SELECT`, `VALUES`, or `WITH` | `42601` | No parenthesized-join FROM this slice — a **documented divergence** (PG parses `(a JOIN b …)`; the override ledger records it). |
+| Nested `WITH` inside the body | ✅ | **Landed** (cte.md §7): a derived-table body may be a `WITH`-prefixed query, establishing its own CTE scope. |
 | VALUES-body rows of differing arity | `42601` | `VALUES lists must all be the same length` (the §12 rule). |
 | VALUES-body columns whose row types do not unify | `42804` | `datatype_mismatch`, the set-operation unification rule (§25). |
 | Column reference / aggregate / no-context `$N` in a VALUES-body value | `42703` / `42803` / `42P18` | The body is a non-`LATERAL` constant relation (no FROM/outer row). |
@@ -1943,10 +1943,11 @@ by the body's own context (§26); a `$N` with no type context errors `42P18` as 
   (`parent = None`), the rule above.
 - **Parenthesized join / table-reference FROM** — `FROM (a JOIN b ON …) c`. A leading `(` not
   starting a `SELECT` is `42601`.
-- **A `WITH` *inside* the body** (nested `WITH`, `42601`) — the body production is the WITH-less
-  `query_expr` (`SELECT` / set op) or a `VALUES` list. *(The `VALUES` body itself has **landed** —
-  see "The VALUES body" above; its own residual narrowings are a trailing `ORDER BY`/`LIMIT` on the
-  body and general expressions in the `INSERT … VALUES` slot.)*
+- **A `WITH` *inside* the body** (nested `WITH`) — ✅ **landed** (cte.md §7): a derived-table body,
+  like any parenthesized subquery, may be a `WITH`-prefixed query (`subquery_expr`), establishing its
+  own CTE scope (the enclosing statement's CTEs are not inherited — a documented divergence). *(The
+  `VALUES` body itself has **landed** — see "The VALUES body" above; its own residual narrowings are a
+  trailing `ORDER BY`/`LIMIT` on the body and general expressions in the `INSERT … VALUES` slot.)*
 - **Top-level `UPDATE`/`DELETE` FROM** stays single-table (§15) — a derived table reaches them only
   inside a subquery.
 
@@ -2210,9 +2211,10 @@ INSERT INTO archive SELECT * FROM moved;
 ```
 
 **Parsing.** `parse_cte`, after `AS [ [NOT] MATERIALIZED ] (`, peeks the body's leading keyword:
-`insert`/`update`/`delete` parse the data-modifying statement, anything else the WITH-less
-`query_expr` (the existing path). `parse_with_statement`'s primary peeks the same way after the CTE
-list. A `cte_body` is one parser nesting level (the `deepen`/`undeepen` guard, like a subquery), so
+`insert`/`update`/`delete` parse the data-modifying statement, anything else a `subquery_expr` — a
+`query_expr` that may itself be `WITH`-prefixed (a nested `WITH`, cte.md §7). `parse_with_statement`'s
+top-level primary peeks the same way after the CTE list, but takes the plain `query_expr` (a
+re-prefixed top-level `WITH` is a `42601`). A `cte_body` is one parser nesting level (the `deepen`/`undeepen` guard, like a subquery), so
 deeply-nested writable CTEs still hit `54001`. Both the body's and the primary's `RETURNING` are the
 ordinary `returning_clause` (§32).
 

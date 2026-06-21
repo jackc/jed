@@ -9,7 +9,7 @@ use crate::ast::{
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
     DropTable, DropType, Expr, Insert, InsertSource, InsertValue, JoinKind, Literal, OnConflict,
     OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind,
-    Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
+    Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithExpr, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -6405,7 +6405,43 @@ impl Database {
             QueryExpr::SetOp(so) => Ok(QueryPlan::SetOp(Box::new(
                 self.plan_set_op(so, parent, ctes, ptypes)?,
             ))),
+            QueryExpr::With(we) => Ok(QueryPlan::With(Box::new(
+                self.plan_with_expr(we, parent, ptypes)?,
+            ))),
         }
+    }
+
+    /// Plan a nested `WITH … query_expr` (spec/design/cte.md §7) into a `WithPlan`. The nested CTEs
+    /// establish their OWN scope: the bodies and the inner main query see ONLY these CTEs (and the
+    /// catalog) — the enclosing statement's CTE bindings are NOT inherited (a documented narrowing,
+    /// cte.md §7), so `plan_cte_bindings` and the body are planned without the outer `ctes`. The
+    /// inner main query keeps the enclosing `parent` (so a `LATERAL` derived-table body still
+    /// correlates to its left siblings), while the CTE bodies stay independent (`parent = None`,
+    /// inside `plan_cte_bindings`). A data-modifying CTE here is rejected `0A000` — PostgreSQL
+    /// restricts a DML-`WITH` to the statement top level.
+    fn plan_with_expr<'a>(
+        &'a self,
+        we: &WithExpr,
+        parent: Option<&Scope<'a>>,
+        ptypes: &mut ParamTypes,
+    ) -> Result<WithPlan> {
+        if let Some(c) = we.ctes.iter().find(|c| c.body.is_data_modifying()) {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                format!(
+                    "WITH clause containing a data-modifying statement ({}) is only supported at the top level",
+                    c.name
+                ),
+            ));
+        }
+        let bindings = self.plan_cte_bindings(&we.ctes, we.recursive, ptypes)?;
+        let body = self.plan_query(&we.body, parent, &bindings, ptypes)?;
+        let modes = cte_modes(&bindings);
+        Ok(WithPlan {
+            bindings,
+            modes,
+            body,
+        })
     }
 
     /// Execute a resolved plan against an outer-row environment (`outer` = the enclosing rows,
@@ -6421,7 +6457,31 @@ impl Database {
             QueryPlan::Select(sp) => self.exec_select_plan(sp, outer, params, ctes),
             QueryPlan::SetOp(sop) => self.exec_set_op_plan(sop, outer, params, ctes),
             QueryPlan::Values(vp) => self.exec_values_plan(vp, outer, params, ctes),
+            QueryPlan::With(wp) => self.exec_with_plan(wp, outer, params),
         }
+    }
+
+    /// Execute a nested `WITH` plan (spec/design/cte.md §7): materialize its CTE bindings once (in
+    /// list order, charging their cost), build a FRESH CTE context over them (the nested CTEs
+    /// establish their own scope — the enclosing context is NOT chained in, the documented narrowing
+    /// §7), and run the inner body against it. The body still sees the `outer` row environment (so a
+    /// `LATERAL` nested-WITH derived-table body correlates to its left siblings). The materialization
+    /// cost folds into the body's cost — the same shape as the top-level `run_with` (cte.md §3).
+    fn exec_with_plan(
+        &self,
+        wp: &WithPlan,
+        outer: &[&[Value]],
+        params: &[Value],
+    ) -> Result<SelectResult> {
+        let (buffers, total_cost) = self.materialize_ctes(&wp.bindings, &wp.modes, params)?;
+        let ctx = CteCtx {
+            modes: &wp.modes,
+            bindings: &wp.bindings,
+            buffers: &buffers,
+        };
+        let mut r = self.exec_query_plan(&wp.body, outer, params, ctx)?;
+        r.cost += total_cost;
+        Ok(r)
     }
 
     /// Plan a set operation (spec/design/grammar.md §25): plan both operands with the same
@@ -6456,11 +6516,7 @@ impl Database {
             .zip(rhs.column_types().iter())
             .map(|(l, r)| unify_setop_column(l, r, so.op))
             .collect::<Result<_>>()?;
-        let column_names = match &lhs {
-            QueryPlan::Select(s) => s.column_names.clone(),
-            QueryPlan::SetOp(s) => s.column_names.clone(),
-            QueryPlan::Values(v) => v.column_names.clone(),
-        };
+        let column_names = lhs.column_names().to_vec();
 
         // Trailing ORDER BY resolves keys by OUTPUT column name (no relation scope after a set
         // operation): a qualified key is 42P01, an unknown name is 42703.
@@ -8147,6 +8203,12 @@ impl Database {
                 }
                 Ok(())
             }
+            // A nested `WITH` body is not folded here against the enclosing `ctes` — its inner
+            // subqueries reference the nested CTEs (a different scope, materialized only when the
+            // node runs), so they are left to the evaluator, exactly like a derived table's body
+            // (spec/design/cte.md §7). The whole nested-WITH subquery is itself folded by the caller
+            // if it is uncorrelated (executed once via `exec_with_plan`).
+            QueryPlan::With(_) => Ok(()),
         }
     }
 
@@ -9762,6 +9824,21 @@ enum QueryPlan {
     /// as a derived-table body (the parser admits `VALUES` solely there), so it never appears as a
     /// set-op operand or a subquery operand.
     Values(ValuesPlan),
+    /// A nested `WITH … query_expr` (spec/design/cte.md §7): the nested CTE bindings + their
+    /// inline/materialize modes, and the inner query plan that references them. Establishes its own
+    /// CTE scope at execution ([`exec_query_plan`] materializes the bindings and runs `body` against
+    /// them). The output columns are the body's. Boxed to keep `QueryPlan` small.
+    With(Box<WithPlan>),
+}
+
+/// A planned nested `WITH … query_expr` (spec/design/cte.md §7). `bindings` are the nested CTEs
+/// (planned against each other only — not the enclosing scope), `modes` their per-binding
+/// inline/materialize decision ([`cte_modes`]), and `body` the inner query that references them.
+/// At execution the bindings are materialized once and `body` runs against a fresh CTE context.
+struct WithPlan {
+    bindings: Vec<CteBinding>,
+    modes: Vec<CteMode>,
+    body: QueryPlan,
 }
 
 impl QueryPlan {
@@ -9772,6 +9849,7 @@ impl QueryPlan {
             QueryPlan::Select(s) => &s.column_types,
             QueryPlan::SetOp(s) => &s.column_types,
             QueryPlan::Values(v) => &v.column_types,
+            QueryPlan::With(w) => w.body.column_types(),
         }
     }
 
@@ -9782,6 +9860,7 @@ impl QueryPlan {
             QueryPlan::Select(s) => &s.column_names,
             QueryPlan::SetOp(s) => &s.column_names,
             QueryPlan::Values(v) => &v.column_names,
+            QueryPlan::With(w) => w.body.column_names(),
         }
     }
 }
@@ -9864,6 +9943,13 @@ fn analyze_recursive_cte(name: &str, body: &QueryExpr) -> Result<CteShape> {
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
                 "a set operation in the recursive term of a recursive query is not supported yet"
+                    .to_string(),
+            ));
+        }
+        QueryExpr::With(_) => {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "a nested WITH in the recursive term of a recursive query is not supported yet"
                     .to_string(),
             ));
         }
@@ -9975,6 +10061,10 @@ fn count_self_refs_query(qe: &QueryExpr, name: &str) -> usize {
         QueryExpr::SetOp(so) => {
             count_self_refs_query(&so.lhs, name) + count_self_refs_query(&so.rhs, name)
         }
+        // A nested `WITH` establishes its own CTE scope (spec/design/cte.md §7): an enclosing CTE
+        // name is NOT visible inside it (a reference there resolves to a base table / the nested
+        // CTE, never the enclosing one), so it contributes no self-reference to the enclosing name.
+        QueryExpr::With(_) => 0,
     }
 }
 
@@ -12166,6 +12256,10 @@ fn query_plan_references_outer(plan: &QueryPlan, depth: usize) -> bool {
             .iter()
             .flatten()
             .any(|e| rexpr_references_outer(e, depth)),
+        // A nested `WITH` adds no correlation frame: its body is at the same depth, and the CTE
+        // bodies are planned `parent = None` (they hold no outer reference), so only the body can
+        // correlate to an enclosing scope (spec/design/cte.md §7).
+        QueryPlan::With(wp) => query_plan_references_outer(&wp.body, depth),
     }
 }
 
@@ -12424,6 +12518,9 @@ fn collect_touched_plan(plan: &QueryPlan, depth: usize, touched: &mut [bool]) {
                 }
             }
         }
+        // A nested `WITH`'s correlated references live in its body (the CTE bodies are `parent =
+        // None`); recurse into the body at the same depth (spec/design/cte.md §7).
+        QueryPlan::With(wp) => collect_touched_plan(&wp.body, depth, touched),
     }
 }
 
@@ -14099,6 +14196,11 @@ fn query_calls_seq_mutator(qe: &QueryExpr) -> bool {
     match qe {
         QueryExpr::Select(s) => select_calls_seq_mutator(s),
         QueryExpr::SetOp(so) => setop_calls_seq_mutator(so),
+        // A nested `WITH`'s CTE bodies and main body may call a sequence mutator (cte.md §7).
+        QueryExpr::With(we) => {
+            we.ctes.iter().any(|c| cte_body_calls_seq_mutator(&c.body))
+                || query_calls_seq_mutator(&we.body)
+        }
     }
 }
 
@@ -14300,6 +14402,17 @@ fn collect_query_privs(qe: &QueryExpr, req: &mut PrivReq, locals: &HashSet<Strin
     match qe {
         QueryExpr::Select(s) => collect_select_privs(s, req, locals),
         QueryExpr::SetOp(so) => collect_setop_privs(so, req, locals),
+        // A nested `WITH` establishes its own CTE scope (spec/design/cte.md §7): the enclosing
+        // locals are NOT inherited (an enclosing CTE name resolves to a base table inside, so it is
+        // privilege-checked), and the nested CTE names shadow base tables only within this node.
+        QueryExpr::With(we) => {
+            let mut scope = HashSet::new();
+            for cte in &we.ctes {
+                collect_cte_body_privs(&cte.body, req, &scope);
+                scope.insert(cte.name.to_ascii_lowercase());
+            }
+            collect_query_privs(&we.body, req, &scope);
+        }
     }
 }
 

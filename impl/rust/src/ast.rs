@@ -542,6 +542,25 @@ pub struct Select {
 pub enum QueryExpr {
     Select(Box<Select>),
     SetOp(Box<SetOp>),
+    /// A nested `WITH` clause prefixing a query expression, in a subquery / derived-table / CTE-body
+    /// position (spec/design/cte.md §7) — as opposed to the top-level [`WithQuery`] (which may prefix
+    /// a data-modifying primary). The CTEs are visible only within this node's own body (and to each
+    /// other, forward-only); the enclosing statement's CTE bindings are NOT inherited — a documented
+    /// narrowing (cte.md §7). Boxed to keep the recursive `QueryExpr` type sized.
+    With(Box<WithExpr>),
+}
+
+/// A nested `WITH … query_expr` (spec/design/cte.md §7): the CTE list `ctes` (forward-only
+/// visibility; self-referencing when `recursive`) prefixing the inner query expression `body`. A
+/// data-modifying CTE here is rejected at planning (`0A000` — PostgreSQL restricts a DML-`WITH` to
+/// the statement top level). Built by the parser wherever a parenthesized query expression is
+/// expected; planned into a [`crate::executor`] `QueryPlan::With` that establishes its own CTE
+/// scope.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct WithExpr {
+    pub ctes: Vec<Cte>,
+    pub recursive: bool,
+    pub body: Box<QueryExpr>,
 }
 
 /// The three set operators (spec/design/grammar.md §25).

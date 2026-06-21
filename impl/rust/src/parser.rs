@@ -11,7 +11,7 @@ use crate::ast::{
     Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OnConflict, OrderKey,
     Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp,
     SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
-    Update, WithQuery,
+    Update, WithExpr, WithQuery,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -1382,6 +1382,10 @@ impl Parser {
         Ok(match self.parse_query_expr_node()? {
             QueryExpr::Select(sel) => Statement::Select(*sel),
             QueryExpr::SetOp(so) => Statement::SetOp(*so),
+            // `parse_set_expr` always begins with `parse_select_core`, so a top-level query_expr
+            // never yields a nested `WITH` (a leading `WITH` statement routes to
+            // `parse_with_statement`); the arm is for match exhaustiveness only.
+            QueryExpr::With(_) => unreachable!("a top-level query_expr never begins with WITH"),
         })
     }
 
@@ -1406,6 +1410,8 @@ impl Parser {
                 so.offset = offset;
                 QueryExpr::SetOp(so)
             }
+            // `parse_set_expr` never yields a nested `WITH`; passthrough for exhaustiveness.
+            QueryExpr::With(w) => QueryExpr::With(w),
         })
     }
 
@@ -1523,15 +1529,30 @@ impl Parser {
     /// Parse a parenthesized subquery's inner `query_expr` (grammar.md §26): a full set-expression
     /// plus an optional trailing `ORDER BY` / `LIMIT` / `OFFSET` folded onto the node. Mirrors
     /// `parse_query_expr` but yields a `QueryExpr` (the subquery operand) rather than a `Statement`.
-    /// The caller has already consumed the opening `(` and consumes the closing `)`.
+    /// The caller has already consumed the opening `(` and consumes the closing `)`. A leading
+    /// `WITH` begins a **nested** common-table-expression query (spec/design/cte.md §7), parsed into
+    /// a `QueryExpr::With`.
     fn parse_subquery(&mut self) -> Result<QueryExpr> {
         // A nested scalar subquery / EXISTS / IN (SELECT …) is one query-nesting level deeper;
         // the guard also protects the parser's own stack against `(SELECT (SELECT … ))`.
         self.deepen()?;
+        let result = if self.at_with_clause() {
+            self.parse_with_query_expr()?
+        } else {
+            self.parse_subquery_inner()?
+        };
+        self.undeepen();
+        Ok(result)
+    }
+
+    /// The non-`WITH` body of a subquery: a set-expression plus an optional trailing
+    /// `ORDER BY` / `LIMIT` / `OFFSET` folded onto the node. Split out so a nested `WITH`'s main
+    /// query (`parse_with_query_expr`) reuses it.
+    fn parse_subquery_inner(&mut self) -> Result<QueryExpr> {
         let node = self.parse_set_expr()?;
         let order_by = self.parse_order_by()?;
         let (limit, offset) = self.parse_limit_offset()?;
-        let result = match node {
+        Ok(match node {
             QueryExpr::Select(mut sel) => {
                 sel.order_by = order_by;
                 sel.limit = limit;
@@ -1544,9 +1565,80 @@ impl Parser {
                 so.offset = offset;
                 QueryExpr::SetOp(so)
             }
+            // `parse_set_expr` never yields a nested `WITH`; passthrough for exhaustiveness.
+            QueryExpr::With(w) => QueryExpr::With(w),
+        })
+    }
+
+    /// Whether a `SELECT` keyword sits at token index `idx`.
+    fn is_select_at(&self, idx: usize) -> bool {
+        matches!(self.tokens.get(idx), Some(Token::Word(w)) if w.eq_ignore_ascii_case("select"))
+    }
+
+    /// Whether a `WITH` clause (`WITH RECURSIVE …`, `WITH <name> ( …`, or `WITH <name> AS …`)
+    /// begins at token index `idx` (spec/design/cte.md §7), as opposed to an ordinary expression or
+    /// a column named `with`. The shape-based lookahead keeps the recognition unambiguous even where
+    /// `with` is a legal identifier (e.g. `x IN (with)` is a value list, not a nested WITH).
+    fn is_with_clause_at(&self, idx: usize) -> bool {
+        if !matches!(self.tokens.get(idx), Some(Token::Word(w)) if w.eq_ignore_ascii_case("with")) {
+            return false;
+        }
+        match self.tokens.get(idx + 1) {
+            Some(Token::Word(w)) if w.eq_ignore_ascii_case("recursive") => true,
+            Some(Token::Word(_)) => {
+                matches!(self.tokens.get(idx + 2), Some(Token::LParen))
+                    || matches!(self.tokens.get(idx + 2), Some(Token::Word(w)) if w.eq_ignore_ascii_case("as"))
+            }
+            _ => false,
+        }
+    }
+
+    /// Whether a query expression — a `SELECT` or a nested `WITH` clause (cte.md §7) — begins at
+    /// token index `idx`. The §26 leading-`SELECT` lookahead, extended with `WITH`.
+    fn is_query_start_at(&self, idx: usize) -> bool {
+        self.is_select_at(idx) || self.is_with_clause_at(idx)
+    }
+
+    /// Whether the NEXT token begins a query expression (a `SELECT` or nested `WITH`) — the
+    /// disambiguator at every subquery position (a scalar subquery `( … )`, `IN ( … )`,
+    /// `op ANY/ALL ( … )`).
+    fn at_subquery_start(&self) -> bool {
+        self.is_query_start_at(self.pos)
+    }
+
+    /// Whether the NEXT token begins a nested `WITH` clause (cte.md §7).
+    fn at_with_clause(&self) -> bool {
+        self.is_with_clause_at(self.pos)
+    }
+
+    /// Parse a nested `WITH [RECURSIVE] cte (, cte)* query_expr` into a `QueryExpr::With`
+    /// (spec/design/cte.md §7). The CTE bodies reuse `parse_cte` (so a CTE body may itself nest a
+    /// `WITH`); the main query is a WITH-less `query_expr` (a bare second `WITH` after the list is
+    /// not valid — a nested `WITH` reaches the body only through parentheses). A data-modifying CTE
+    /// body parses here but is rejected at planning (`0A000`, top-level-only — matching PostgreSQL).
+    fn parse_with_query_expr(&mut self) -> Result<QueryExpr> {
+        self.expect_keyword("with")?;
+        let recursive = if self.peek_keyword().as_deref() == Some("recursive") {
+            self.advance();
+            true
+        } else {
+            false
         };
-        self.undeepen();
-        Ok(result)
+        let mut ctes = Vec::new();
+        loop {
+            ctes.push(self.parse_cte()?);
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        let body = self.parse_subquery_inner()?;
+        Ok(QueryExpr::With(Box::new(WithExpr {
+            ctes,
+            recursive,
+            body: Box::new(body),
+        })))
     }
 
     /// `set_expr ::= intersect_expr (("UNION" | "EXCEPT") ("ALL"|"DISTINCT")? intersect_expr)*` —
@@ -1830,7 +1922,7 @@ impl Parser {
         // surfaces as a 42601 leftover token at the expected `)`).
         let (subquery, values) = if self.peek_keyword().as_deref() == Some("values") {
             (None, Some(self.parse_values_body()?))
-        } else if self.peek_keyword().as_deref() == Some("select") {
+        } else if self.at_subquery_start() {
             (Some(Box::new(self.parse_subquery()?)), None)
         } else {
             return Err(EngineError::new(
@@ -2299,9 +2391,9 @@ impl Parser {
             self.advance();
             self.expect(&Token::LParen)?;
             // `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by
-            // a leading `SELECT`; otherwise a non-empty value list (`IN ()` is rejected:
-            // parse_concat on `)` is 42601).
-            if self.peek_keyword().as_deref() == Some("select") {
+            // a leading `SELECT` (or a nested `WITH` — cte.md §7); otherwise a non-empty value list
+            // (`IN ()` is rejected: parse_concat on `)` is 42601).
+            if self.at_subquery_start() {
                 let q = self.parse_subquery()?;
                 self.expect(&Token::RParen)?;
                 return Ok(Expr::InSubquery {
@@ -2369,10 +2461,11 @@ impl Parser {
                 if let Some(all) = quant {
                     self.advance(); // ANY / SOME / ALL
                     self.expect(&Token::LParen)?;
-                    // A leading `SELECT` is the SUBQUERY form `op ANY/ALL(SELECT …)` — the subquery
-                    // spelling of IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead;
-                    // anything else is the array operand (§11.1).
-                    if self.peek_keyword().as_deref() == Some("select") {
+                    // A leading `SELECT` (or a nested `WITH` — cte.md §7) is the SUBQUERY form
+                    // `op ANY/ALL(SELECT …)` — the subquery spelling of IN (array-functions.md
+                    // §11.6), the §26 leading-`SELECT` lookahead; anything else is the array operand
+                    // (§11.1).
+                    if self.at_subquery_start() {
                         let query = self.parse_subquery()?;
                         self.expect(&Token::RParen)?;
                         return Ok(Expr::QuantifiedSubquery {
@@ -2641,8 +2734,9 @@ impl Parser {
         if matches!(self.peek(), Token::LParen) {
             self.advance();
             // `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
-            // `SELECT` after the `(`; otherwise this is a parenthesized expression.
-            if self.peek_keyword().as_deref() == Some("select") {
+            // `SELECT` (or a nested `WITH` — cte.md §7) after the `(`; otherwise this is a
+            // parenthesized expression.
+            if self.at_subquery_start() {
                 let q = self.parse_subquery()?;
                 self.expect(&Token::RParen)?;
                 return Ok(Expr::ScalarSubquery(Box::new(q)));
@@ -2652,10 +2746,11 @@ impl Parser {
             return Ok(e);
         }
         // `EXISTS ( SELECT ... )` — the existence predicate (grammar.md §26). Recognized only when
-        // an open-paren + `SELECT` follows, so `exists` stays usable as a column / function name.
+        // an open-paren + a query start (`SELECT`, or a nested `WITH` — cte.md §7) follows, so
+        // `exists` stays usable as a column / function name.
         if self.peek_keyword().as_deref() == Some("exists")
             && matches!(self.tokens.get(self.pos + 1), Some(Token::LParen))
-            && matches!(self.tokens.get(self.pos + 2), Some(Token::Word(w)) if w.eq_ignore_ascii_case("select"))
+            && self.is_query_start_at(self.pos + 2)
         {
             self.advance(); // EXISTS
             self.expect(&Token::LParen)?;

@@ -313,12 +313,8 @@ file = "types/composite.test"
 sql = "SELECT ROW(1, 2) = ROW(1, 2, 3)"
 reason = "jed: comparing rows of different sizes is 42804 (datatype_mismatch — the comparison gate, composite.md §5). PostgreSQL raises 42601 (\"unequal number of entries in row expressions\"). A code-only divergence; both reject."
 
-# --- CTEs: a nested WITH is a deferred narrowing jed rejects but PostgreSQL accepts (cte.md §6).
-# (WITH RECURSIVE has since landed — spec/design/recursive-cte.md.)
-[[override]]
-file = "cte/errors.test"
-sql = "WITH a AS (WITH b AS (SELECT id FROM t) SELECT id FROM b) SELECT id FROM a"
-reason = "jed: a WITH attaches only at the statement top level this slice, so a nested WITH inside a CTE body is a 42601 syntax error (cte.md §1/§6 — the body is the WITH-less query_expr). PostgreSQL accepts a nested WITH and runs it. A documented surface narrowing."
+# (Nested WITH has since landed — spec/design/cte.md §7 — so jed now accepts it like PostgreSQL; the
+# former cte/errors.test + subquery/derived.test override entries were removed with the feature.)
 
 # --- recursive CTEs (spec/design/recursive-cte.md §6): three deferred shapes PostgreSQL accepts
 # but jed rejects (a set-op / FROM-subquery recursive term, and mutual recursion), recorded where
@@ -424,10 +420,8 @@ file = "subquery/derived.test"
 sql = "SELECT * FROM (t JOIN t ON 1 = 1) AS x"
 reason = "jed: a parenthesized-join FROM is a deferred narrowing — a leading `(` in FROM not followed by SELECT is 42601 (grammar.md §42). PostgreSQL parses `(t JOIN t ON …)` as a parenthesized join and instead reports 42712 (the duplicate `t`). A deliberate surface narrowing; the row behavior of derived tables is unaffected."
 
-[[override]]
-file = "subquery/derived.test"
-sql = "SELECT * FROM (WITH c AS (SELECT 1 AS one) SELECT one FROM c) AS d"
-reason = "jed: a derived-table body is the WITH-less query_expr, so a nested WITH is 42601 (the top-level-only narrowing — grammar.md §42, cte.md §1; shared with the §26 subquery forms). PostgreSQL 18 accepts a WITH-prefixed subquery body and returns 1. A deliberate, documented narrowing."
+# (A nested WITH in a derived-table body has since landed — spec/design/cte.md §7 — so jed now accepts
+# it like PostgreSQL; its former override entry was removed with the feature.)
 
 # --- VALUES-body derived table (grammar.md §42): a trailing ORDER BY / LIMIT on the VALUES body is a
 # deferred narrowing, relaxable later.

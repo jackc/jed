@@ -521,8 +521,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         update/delete of the same row is jed's deterministic last-write-wins (documented divergence —
         PG-unspecified). New capabilities `query.cte_data_modifying` + `dml.with_clause`; no
         `format_version` bump. Reuses existing error codes (`0A000`/`42P01`/`23505`).
-  - [ ] _follow-on:_ a **nested `WITH`** inside a subquery or CTE body (top-level only); recursive-CTE
-        deferrals (`SEARCH`/`CYCLE`, a set-op / `FROM`-subquery recursive term, mutual recursion).
+  - [x] **Nested `WITH`** inside a subquery / derived table / CTE body — ✅ landed
+        ([cte.md §7](spec/design/cte.md)): a `WITH` may prefix any parenthesized query expression
+        (subquery, derived table, scalar/IN/EXISTS/ANY-ALL subquery, set-op body, CTE body), reached via
+        a shape-based `WITH`-lookahead. It plans to a `QueryPlan::With` that materializes its CTEs once
+        then runs the inner body against a fresh CTE context (the same deterministic
+        materialize-then-execute cost as the top-level `WITH`, byte-identical cross-core); the nested
+        CTEs get the full `query.cte`/`query.cte_recursive` machinery (forward visibility, `42712`,
+        `42P01`, rename `42P10`, `[NOT] MATERIALIZED`, `RECURSIVE`). A data-modifying CTE in a nested
+        `WITH` is `0A000` (top-level only — matching PG). New capability `query.cte_nested`; no
+        `format_version` bump; oracle-clean corpus (`suites/cte/nested.test`). **Divergence
+        (per-core unit tests):** the nested scope does NOT inherit the enclosing statement's CTE
+        bindings (an enclosing CTE name resolves to a base table / `42P01`, not the enclosing CTE — PG
+        inherits them); full enclosing-scope visibility is a scoped follow-on.
+    - [ ] _follow-on:_ a nested `WITH` **inheriting enclosing CTEs** (the residual visibility divergence
+          above); recursive-CTE deferrals (`SEARCH`/`CYCLE`, a set-op / `FROM`-subquery recursive term,
+          mutual recursion).
 - [x] **Set-returning functions** — `generate_series(start, stop [, step])` in FROM position, a
       synthetic one-column relation, a new `generated_row` cost unit; integer variants (timestamp
       waits on interval composition). → [functions.md §10](spec/design/functions.md)

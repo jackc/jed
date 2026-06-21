@@ -1910,6 +1910,25 @@ func (p *Parser) parseSubquery() (QueryExpr, error) {
 	if err := p.deepen(); err != nil {
 		return QueryExpr{}, err
 	}
+	var node QueryExpr
+	var err error
+	if p.atWithClause() {
+		// A leading WITH begins a nested common-table-expression query (spec/design/cte.md §7).
+		node, err = p.parseWithQueryExpr()
+	} else {
+		node, err = p.parseSubqueryInner()
+	}
+	if err != nil {
+		return QueryExpr{}, err
+	}
+	p.undeepen()
+	return node, nil
+}
+
+// parseSubqueryInner parses the non-WITH body of a subquery: a set-expression plus an optional
+// trailing ORDER BY / LIMIT / OFFSET folded onto the node. Split out so a nested WITH's main query
+// (parseWithQueryExpr) reuses it.
+func (p *Parser) parseSubqueryInner() (QueryExpr, error) {
 	node, err := p.parseSetExpr()
 	if err != nil {
 		return QueryExpr{}, err
@@ -1930,8 +1949,40 @@ func (p *Parser) parseSubquery() (QueryExpr, error) {
 		node.SetOp.Limit = trailing.Limit
 		node.SetOp.Offset = trailing.Offset
 	}
-	p.undeepen()
 	return node, nil
+}
+
+// parseWithQueryExpr parses a nested `WITH [RECURSIVE] cte (, cte)* query_expr` into a
+// QueryExpr{With} (spec/design/cte.md §7). The CTE bodies reuse parseCte (so a CTE body may itself
+// nest a WITH); the main query is a WITH-less query_expr. A data-modifying CTE body parses here but
+// is rejected at planning (0A000, top-level-only — matching PostgreSQL).
+func (p *Parser) parseWithQueryExpr() (QueryExpr, error) {
+	if err := p.expectKeyword("with"); err != nil {
+		return QueryExpr{}, err
+	}
+	recursive := false
+	if p.peekKeyword() == "recursive" {
+		p.advance()
+		recursive = true
+	}
+	var ctes []Cte
+	for {
+		cte, err := p.parseCte()
+		if err != nil {
+			return QueryExpr{}, err
+		}
+		ctes = append(ctes, cte)
+		if p.peek().Kind == TokComma {
+			p.advance()
+			continue
+		}
+		break
+	}
+	body, err := p.parseSubqueryInner()
+	if err != nil {
+		return QueryExpr{}, err
+	}
+	return QueryExpr{With: &WithExpr{Ctes: ctes, Recursive: recursive, Body: &body}}, nil
 }
 
 // parseSetExpr parses the lower-precedence, left-associative UNION/EXCEPT level. INTERSECT binds
@@ -2195,14 +2246,15 @@ func (p *Parser) parseDerivedTable() (TableRef, error) {
 	p.advance()
 	var body *QueryExpr
 	var values [][]*Expr
-	switch p.peekKeyword() {
-	case "values":
+	switch {
+	case p.peekKeyword() == "values":
 		v, err := p.parseValuesBody()
 		if err != nil {
 			return TableRef{}, err
 		}
 		values = v
-	case "select":
+	case p.atSubqueryStart():
+		// A leading SELECT, or a nested WITH (cte.md §7), is a query_expr body.
 		b, err := p.parseSubquery()
 		if err != nil {
 			return TableRef{}, err
@@ -2818,8 +2870,9 @@ func (p *Parser) parseComparison() (Expr, error) {
 			return Expr{}, err
 		}
 		// `IN (SELECT ...)` is the uncorrelated IN-subquery (grammar.md §26), disambiguated by a
-		// leading `SELECT`; otherwise a non-empty value list (`IN ()` is a 42601 syntax error).
-		if p.peekKeyword() == "select" {
+		// leading `SELECT` (or a nested `WITH` — cte.md §7); otherwise a non-empty value list
+		// (`IN ()` is a 42601 syntax error).
+		if p.atSubqueryStart() {
 			q, err := p.parseSubquery()
 			if err != nil {
 				return Expr{}, err
@@ -2902,9 +2955,9 @@ func (p *Parser) parseComparison() (Expr, error) {
 			return Expr{}, err
 		}
 		// A leading `SELECT` is the SUBQUERY form `op ANY/ALL(SELECT …)` — the subquery spelling of
-		// IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead; anything else is the
-		// array operand (§11.1).
-		if p.peekKeyword() == "select" {
+		// IN (array-functions.md §11.6), the §26 leading-`SELECT` lookahead (or a nested `WITH` —
+		// cte.md §7); anything else is the array operand (§11.1).
+		if p.atSubqueryStart() {
 			query, err := p.parseSubquery()
 			if err != nil {
 				return Expr{}, err
@@ -3218,8 +3271,8 @@ func (p *Parser) parsePrimary() (Expr, error) {
 	if p.peek().Kind == TokLParen {
 		p.advance()
 		// `(SELECT ...)` is a scalar subquery (grammar.md §26), disambiguated by a leading
-		// `SELECT` after the `(`; otherwise this is a parenthesized expression.
-		if p.peekKeyword() == "select" {
+		// `SELECT` (or a nested `WITH` — cte.md §7) after the `(`; otherwise a parenthesized expr.
+		if p.atSubqueryStart() {
 			q, err := p.parseSubquery()
 			if err != nil {
 				return Expr{}, err
@@ -3239,8 +3292,9 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		return e, nil
 	}
 	// `EXISTS ( SELECT ... )` — the existence predicate (grammar.md §26). Recognized only when an
-	// open-paren + `SELECT` follows, so `exists` stays usable as a column / function name.
-	if p.peekKeyword() == "exists" && p.peekKindAt(1) == TokLParen && p.peekKeywordAt(2) == "select" {
+	// open-paren + a query start (`SELECT`, or a nested `WITH` — cte.md §7) follows, so `exists`
+	// stays usable as a column / function name.
+	if p.peekKeyword() == "exists" && p.peekKindAt(1) == TokLParen && p.isQueryStartAtOffset(2) {
 		p.advance() // EXISTS
 		if err := p.expect(TokLParen); err != nil {
 			return Expr{}, err
@@ -3600,6 +3654,36 @@ func (p *Parser) peekKindAt(offset int) TokenKind {
 	}
 	return TokEof
 }
+
+// isWithClauseAtOffset reports whether a WITH clause (`WITH RECURSIVE …`, `WITH <name> ( …`, or
+// `WITH <name> AS …`) begins at p.pos+offset (spec/design/cte.md §7), as opposed to an ordinary
+// expression or a column named `with`. The shape-based lookahead keeps the recognition unambiguous
+// even where `with` is a legal identifier (e.g. `x IN (with)` is a value list, not a nested WITH).
+func (p *Parser) isWithClauseAtOffset(offset int) bool {
+	if p.peekKeywordAt(offset) != "with" {
+		return false
+	}
+	if p.peekKeywordAt(offset+1) == "recursive" {
+		return true
+	}
+	if p.peekKindAt(offset+1) == TokWord {
+		return p.peekKindAt(offset+2) == TokLParen || p.peekKeywordAt(offset+2) == "as"
+	}
+	return false
+}
+
+// isQueryStartAtOffset reports whether a query expression — a SELECT or a nested WITH clause
+// (cte.md §7) — begins at p.pos+offset. The §26 leading-SELECT lookahead, extended with WITH.
+func (p *Parser) isQueryStartAtOffset(offset int) bool {
+	return p.peekKeywordAt(offset) == "select" || p.isWithClauseAtOffset(offset)
+}
+
+// atSubqueryStart reports whether the NEXT token begins a query expression (a SELECT or nested
+// WITH) — the disambiguator at every subquery position.
+func (p *Parser) atSubqueryStart() bool { return p.isQueryStartAtOffset(0) }
+
+// atWithClause reports whether the NEXT token begins a nested WITH clause (cte.md §7).
+func (p *Parser) atWithClause() bool { return p.isWithClauseAtOffset(0) }
 
 // advance consumes and returns the current token.
 func (p *Parser) advance() Token {

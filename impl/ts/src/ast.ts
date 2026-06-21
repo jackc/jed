@@ -661,9 +661,24 @@ export type Rollback = { kind: "rollback" };
 // SetOpKind is the set operator (spec/design/grammar.md §25).
 export type SetOpKind = "union" | "intersect" | "except";
 
-// QueryExpr is the operand of a set operation (spec/design/grammar.md §25): either a single SELECT
-// core or a nested set operation, so a chain like `a UNION b INTERSECT c` forms a tree.
-export type QueryExpr = Select | SetOp;
+// QueryExpr is the operand of a set operation (spec/design/grammar.md §25): a single SELECT core, a
+// nested set operation (so a chain like `a UNION b INTERSECT c` forms a tree), or a nested WITH
+// clause (spec/design/cte.md §7).
+export type QueryExpr = Select | SetOp | WithExpr;
+
+// WithExpr is a nested `WITH … query_expr` (spec/design/cte.md §7): the CTE list `ctes` (forward-only
+// visibility; self-referencing when `recursive`) prefixing the inner query expression `body`, in a
+// subquery / derived-table / CTE-body position — as opposed to the top-level WithQuery (which may
+// prefix a data-modifying primary). The CTEs are visible only within `body` (and to each other); the
+// enclosing statement's CTE bindings are NOT inherited — a documented narrowing (cte.md §7). A
+// data-modifying CTE here is rejected at planning (0A000 — PostgreSQL restricts a DML-WITH to the
+// statement top level).
+export type WithExpr = {
+  kind: "withExpr";
+  ctes: Cte[];
+  recursive: boolean;
+  body: QueryExpr;
+};
 
 // SetOp combines two query expressions (spec/design/grammar.md §25). `all` is the ALL (multiset)
 // flag — false is the deduplicating default. The optional trailing ORDER BY / LIMIT / OFFSET apply
@@ -692,7 +707,7 @@ export type CteBody = QueryExpr | Insert | Update | Delete;
 // cteBodyAsQuery returns the query expression if `body` is a plain query, else null (a
 // data-modifying body). Only a query body can be a recursive UNION shape (writable-cte.md §3).
 export function cteBodyAsQuery(body: CteBody): QueryExpr | null {
-  return body.kind === "select" || body.kind === "setOp" ? body : null;
+  return body.kind === "select" || body.kind === "setOp" || body.kind === "withExpr" ? body : null;
 }
 
 // cteBodyIsDataModifying reports whether `body` is a data-modifying statement (INSERT/UPDATE/DELETE).

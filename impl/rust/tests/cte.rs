@@ -104,3 +104,40 @@ fn recursive_hint_is_inert() {
         }
     }
 }
+
+/// Nested-WITH narrowing (cte.md §7): a nested WITH establishes its OWN CTE scope and does NOT inherit
+/// the enclosing statement's CTE bindings — a documented DIVERGENCE from PostgreSQL (which inherits
+/// them), so it cannot live in the oracle corpus. Inside the nested WITH, an enclosing CTE name with
+/// no base table is `42P01`; one that shadows a base table reads the BASE TABLE (PG would read the CTE).
+#[test]
+fn nested_with_does_not_inherit_enclosing_ctes() {
+    // (a) No base table named `e`: the inner reference to the enclosing CTE `e` is unresolved → 42P01.
+    let mut db = t3();
+    let err = execute(
+        &mut db,
+        "WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s",
+    )
+    .expect_err("an enclosing CTE is invisible inside a nested WITH (cte.md §7)");
+    assert_eq!(err.code(), "42P01", "{}", err.message);
+
+    // (b) A base table `e` exists: inside the nested WITH the enclosing CTE `e` is invisible, so the
+    // reference resolves to the BASE TABLE (the rows are the table's, not the CTE's). PG diverges —
+    // it would read the enclosing CTE `e` (the single row 1).
+    let mut db = db_with(&[
+        "CREATE TABLE e (v i32 PRIMARY KEY)",
+        "INSERT INTO e VALUES (7), (8)",
+    ]);
+    let r = execute(
+        &mut db,
+        "WITH e AS (SELECT 1 AS v) SELECT v FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s ORDER BY v",
+    )
+    .expect("the base table e resolves inside the nested WITH");
+    match r {
+        jed::Outcome::Query { rows, .. } => assert_eq!(
+            rows,
+            vec![vec![jed::Value::Int(7)], vec![jed::Value::Int(8)]],
+            "the nested WITH reads the BASE TABLE e, not the enclosing CTE"
+        ),
+        _ => panic!("expected a query result"),
+    }
+}

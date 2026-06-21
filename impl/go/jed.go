@@ -205,6 +205,10 @@ var SupportedCapabilities = []string{
 	// Non-recursive common table expressions — WITH name [(cols)] AS [NOT] MATERIALIZED (query)
 	// [, ...] <query> (spec/design/cte.md).
 	"query.cte",
+	// Nested WITH — a WITH clause prefixing any parenthesized query expression (a subquery, derived
+	// table, scalar/IN/EXISTS/ANY-ALL subquery, set-op operand, or CTE body), establishing its own
+	// CTE scope (spec/design/cte.md §7).
+	"query.cte_nested",
 	// Recursive common table expressions — WITH RECURSIVE name [(cols)] AS (anchor UNION [ALL]
 	// recursive_term) <query>: the iterate-to-fixpoint (working-table) executor; cost-ceiling
 	// termination (spec/design/recursive-cte.md).

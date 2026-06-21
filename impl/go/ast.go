@@ -524,12 +524,26 @@ type Select struct {
 	Offset *int64
 }
 
-// QueryExpr is the operand of a set operation (spec/design/grammar.md §25): either a single
-// SELECT core or a nested set operation, so a chain like `a UNION b INTERSECT c` forms a tree.
-// Exactly one field is non-nil.
+// QueryExpr is the operand of a set operation (spec/design/grammar.md §25): a single SELECT core, a
+// nested set operation (so a chain like `a UNION b INTERSECT c` forms a tree), or a nested WITH
+// clause (spec/design/cte.md §7). Exactly one field is non-nil.
 type QueryExpr struct {
 	Select *Select
 	SetOp  *SetOp
+	With   *WithExpr
+}
+
+// WithExpr is a nested `WITH … query_expr` (spec/design/cte.md §7): the CTE list Ctes (forward-only
+// visibility; self-referencing when Recursive) prefixing the inner query expression Body, in a
+// subquery / derived-table / CTE-body position — as opposed to the top-level WithQuery (which may
+// prefix a data-modifying primary). The CTEs are visible only within Body (and to each other); the
+// enclosing statement's CTE bindings are NOT inherited — a documented narrowing (cte.md §7). A
+// data-modifying CTE here is rejected at planning (0A000 — PostgreSQL restricts a DML-WITH to the
+// statement top level).
+type WithExpr struct {
+	Ctes      []Cte
+	Recursive bool
+	Body      *QueryExpr
 }
 
 // SetOpKind is the set operator (spec/design/grammar.md §25).

@@ -1,0 +1,142 @@
+# Nested WITH (spec/design/cte.md §7): a WITH clause prefixing any PARENTHESIZED query expression —
+# a derived table, a scalar / IN / EXISTS / ANY subquery, a set-op body, or another CTE's body — not
+# only the statement top level. The nested CTEs establish their own scope (the full query.cte /
+# query.cte_recursive machinery), plan to a QueryPlan::With that materializes once then runs the inner
+# body, and add no correlation frame. A data-modifying CTE in a nested WITH is 0A000 (top-level only,
+# matching PostgreSQL). Rows verified against the live PostgreSQL 18 oracle; the cost assertions are
+# jed's deterministic cross-core contract (spec/design/cost.md §3). The enclosing-CTE-invisibility
+# DIVERGENCE (an inner WITH does not inherit enclosing CTEs) is in the per-core unit tests (it differs
+# from PG), not here.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_star, query.order_by, query.table_alias, query.qualified_column, query.cross_join, query.union, query.aggregates, query.subquery_scalar, query.subquery_in, query.subquery_exists, query.subquery_quantified, query.derived_table, query.cte, query.cte_nested, query.cte_recursive, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, n i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)
+
+# A nested WITH in a DERIVED TABLE: the inner CTE is single-reference → inlined. The inner nested-WITH
+# accrues 10 (the same as the top-level inline path — body c = page_read(1) + 3 storage_row_read + 3
+# row_produced = 7, then the inner main SELECT emits 3 rows = 3 row_produced); the outer derived table
+# then re-emits those 3 rows = +3 row_produced = 13.
+# names: x
+# cost: 13
+query I nosort
+SELECT x FROM (WITH c AS (SELECT n FROM t) SELECT n AS x FROM c) s ORDER BY x
+----
+10
+20
+30
+
+# SELECT * over the derived table whose body is a nested WITH.
+# names: n
+query I nosort
+SELECT * FROM (WITH c AS (SELECT n FROM t WHERE n > 10) SELECT n FROM c) s ORDER BY n
+----
+20
+30
+
+# A nested WITH inside ANOTHER CTE's body: outer_c's body is itself `WITH inner_c AS (...) SELECT ...`.
+# names: n
+query I nosort
+WITH outer_c AS (WITH inner_c AS (SELECT n FROM t WHERE n > 10) SELECT n FROM inner_c)
+SELECT n FROM outer_c ORDER BY n
+----
+20
+30
+
+# A nested WITH in a SCALAR subquery (the inner CTE aggregates).
+# names: total
+query I nosort
+SELECT (WITH c AS (SELECT count(*) AS k FROM t) SELECT k FROM c) AS total
+----
+3
+
+# A nested WITH in an IN subquery.
+# names: id
+query I nosort
+SELECT id FROM t WHERE n IN (WITH c AS (SELECT n FROM t WHERE n < 30) SELECT n FROM c) ORDER BY id
+----
+1
+2
+
+# A nested WITH in an EXISTS subquery (the inner CTE's rows decide existence).
+# names: id
+query I nosort
+SELECT id FROM t WHERE EXISTS (WITH c AS (SELECT n FROM t WHERE n > 25) SELECT n FROM c) ORDER BY id
+----
+1
+2
+3
+
+# A nested WITH in an ANY subquery — the array/subquery spelling of IN.
+# names: id
+query I nosort
+SELECT id FROM t WHERE n = ANY (WITH c AS (SELECT n FROM t WHERE n > 15) SELECT n FROM c) ORDER BY id
+----
+2
+3
+
+# The nested WITH's body may itself be a SET OPERATION.
+# names: n
+query I nosort
+SELECT n FROM (WITH c AS (SELECT 100 AS n UNION ALL SELECT 200) SELECT n FROM c) s ORDER BY n
+----
+100
+200
+
+# Multiple CTEs in the nested list with FORWARD visibility (b sees a).
+# names: m
+query I nosort
+SELECT m FROM (WITH a AS (SELECT n FROM t), b AS (SELECT n * 2 AS m FROM a) SELECT m FROM b) s ORDER BY m
+----
+20
+40
+60
+
+# The nested CTE's column-rename list renames the body's output columns.
+# names: x, y
+query II nosort
+SELECT x, y FROM (WITH c (x, y) AS (SELECT id, n FROM t) SELECT x, y FROM c) s ORDER BY x
+----
+1
+10
+2
+20
+3
+30
+
+# A MULTI-REFERENCE nested CTE materializes ONCE and is scanned per reference (cte_scan_row) — the
+# materialize-then-execute cost is the cross-core contract (spec/design/cost.md §3). The cost is
+# byte-identical across Rust / Go / TS.
+# names: cnt
+# cost: 24
+query I nosort
+SELECT cnt FROM (WITH c AS (SELECT n FROM t) SELECT count(*) AS cnt FROM c a CROSS JOIN c b) s
+----
+9
+
+# A nested WITH RECURSIVE inside a derived table (iterate to a fixpoint).
+# names: v
+query I nosort
+SELECT v FROM (WITH RECURSIVE r(v) AS (SELECT 1 UNION ALL SELECT v + 1 FROM r WHERE v < 3) SELECT v FROM r) s ORDER BY v
+----
+1
+2
+3
+
+# A DATA-MODIFYING CTE in a nested WITH is rejected — DML-WITH is top-level only (matching PostgreSQL).
+statement error 0A000
+SELECT x FROM (WITH c AS (INSERT INTO t VALUES (9, 90) RETURNING n) SELECT n AS x FROM c) s
+
+# A duplicate CTE name within one nested list is 42712.
+statement error 42712
+SELECT n FROM (WITH c AS (SELECT 1 AS n), c AS (SELECT 2 AS n) SELECT n FROM c) s
+
+# A self/forward reference inside a nested (non-recursive) WITH is 42P01 — the name is not in scope yet.
+statement error 42P01
+SELECT n FROM (WITH c AS (SELECT n FROM c) SELECT n FROM c) s
+
+# More column-rename aliases than the body has columns is 42P10.
+statement error 42P10
+SELECT a FROM (WITH c (a, b) AS (SELECT 1 AS x) SELECT a FROM c) s
