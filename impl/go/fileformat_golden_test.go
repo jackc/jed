@@ -712,6 +712,23 @@ func collationTableDB(t *testing.T) *Database {
 	return db
 }
 
+// collationPKTableDB: a collated text PRIMARY KEY + a collated secondary index (slice 1e,
+// encoding.md §2.12) — both keys store the dev-root UCA sort key, so the B-tree iterates in
+// collation order. The dev-root snapshot is baked (not the default). Must match the Ruby
+// reference's COLLATION_PK_TABLE.
+func collationPKTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	if _, err := db.ImportCollation(devRoot(t)); err != nil {
+		t.Fatalf("import dev-root: %v", err)
+	}
+	run(t, db, `CREATE TABLE t (name text COLLATE "dev-root" PRIMARY KEY, tag text COLLATE "dev-root")`)
+	run(t, db, `CREATE INDEX t_tag_idx ON t (tag)`)
+	// Inserted out of collation order; stored in collation order ('a' < 'z' by the sort key).
+	run(t, db, `INSERT INTO t VALUES ('z', 'a')`)
+	run(t, db, `INSERT INTO t VALUES ('a', 'b')`)
+	return db
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
 	cases := []struct {
@@ -760,6 +777,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"serial_table.jed", serialTableDB},
 		{"identity_table.jed", identityTableDB},
 		{"collation_table.jed", collationTableDB},
+		{"collation_pk_table.jed", collationPKTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -822,6 +840,7 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"serial_table.jed", serialTableDB, "t"},
 		{"identity_table.jed", identityTableDB, "t"},
 		{"collation_table.jed", collationTableDB, "t"},
+		{"collation_pk_table.jed", collationPKTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

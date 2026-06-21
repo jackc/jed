@@ -277,3 +277,43 @@ func TestBakedFileRoundTrip(t *testing.T) {
 		t.Fatalf("close re: %v", err)
 	}
 }
+
+// TestCollatedPrimaryKeyStoredInCollationOrder: slice 1e — a collated text PRIMARY KEY's storage
+// key is the UCA sort key (encoding.md §2.12), so the B-tree physically iterates in COLLATION order.
+// A no-ORDER-BY single-table scan returns jed's stored (key) order, so this asserts the *key* is
+// collated (distinct from the in-memory ORDER BY sorter 1c already had) — the on-disk/internal
+// property the corpus cannot express. dev-root: a < A < b < Z; C bytes: A < Z < a < b.
+func TestCollatedPrimaryKeyStoredInCollationOrder(t *testing.T) {
+	db := NewDatabase()
+	if _, err := db.ImportCollation(devRoot(t)); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	run(t, db, `CREATE TABLE t (name text COLLATE "dev-root" PRIMARY KEY)`)
+	run(t, db, `INSERT INTO t VALUES ('Z'),('a'),('b'),('A')`)
+	if got := texts(t, query(t, db, `SELECT name FROM t`)); !eqStrings(got, []string{"a", "A", "b", "Z"}) {
+		t.Fatalf("collated PK stored order: got %v", got)
+	}
+	run(t, db, `CREATE TABLE c (name text PRIMARY KEY)`)
+	run(t, db, `INSERT INTO c VALUES ('Z'),('a'),('b'),('A')`)
+	if got := texts(t, query(t, db, `SELECT name FROM c`)); !eqStrings(got, []string{"A", "Z", "a", "b"}) {
+		t.Fatalf("C PK stored order: got %v", got)
+	}
+}
+
+// TestCollatedSecondaryIndexAndUniqueKeys: slice 1e — a collated UNIQUE key dedups by byte-identity
+// (a deterministic collation: 'a' and 'A' are DISTINCT, both admitted — collation.md §7), like a C
+// unique key, and ORDER BY a collated column uses its frozen collation with no explicit COLLATE.
+func TestCollatedSecondaryIndexAndUniqueKeys(t *testing.T) {
+	db := NewDatabase()
+	if _, err := db.ImportCollation(devRoot(t)); err != nil {
+		t.Fatalf("import: %v", err)
+	}
+	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root" UNIQUE)`)
+	run(t, db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`)
+	if _, err := Execute(db, `INSERT INTO t VALUES (4,'a')`); err == nil || err.(*EngineError).Code() != "23505" {
+		t.Fatalf("collated UNIQUE duplicate: want 23505, got %v", err)
+	}
+	if got := texts(t, query(t, db, `SELECT name FROM t ORDER BY name`)); !eqStrings(got, []string{"a", "A", "b"}) {
+		t.Fatalf("collated UNIQUE order: got %v", got)
+	}
+}

@@ -814,6 +814,31 @@ func (db *Database) readSnap() *Snapshot {
 	return db.committed
 }
 
+// columnCollations resolves each column's frozen collation (Column.Collation, the name) to its
+// baked table, indexed by column ordinal — nil for a C / non-text column (the fast path). The key
+// encoders (§2.12) consult colls[ci] to pick a text column's key form.
+func (db *Database) columnCollations(columns []Column) []*Collation {
+	snap := db.readSnap()
+	out := make([]*Collation, len(columns))
+	for i := range columns {
+		if columns[i].Collation != "" {
+			out[i] = snap.collation(columns[i].Collation)
+		}
+	}
+	return out
+}
+
+// collatedTextKey is the order-preserving key body for a text value (encoding.md §2.12): the
+// collation's UCA sort key when coll is non-nil (a non-C collated column), else the C
+// text-terminated-escape body (§2.4). The sort key can fail (0A000) on a code point the collation
+// does not map — propagated, so a collated INSERT of an unmapped string aborts the write.
+func collatedTextKey(coll *Collation, s string) ([]byte, error) {
+	if coll != nil {
+		return SortKey(coll, s)
+	}
+	return EncodeTerminated([]byte(s)), nil
+}
+
 // working is the snapshot a write mutates — the open transaction's working. A write only ever runs
 // with a transaction open (autocommit opens one implicitly), so tx is non-nil here.
 func (db *Database) working() *Snapshot { return db.session.tx.working }
@@ -3433,6 +3458,9 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	}
 	tableKey := strings.ToLower(table.Name)
 	columns := table.Columns
+	// Per-column frozen collations for the collated text key form (§2.12); nil everywhere for a
+	// C-only / non-text table (the fast path).
+	colls := db.columnCollations(columns)
 	// Resolve the access method (spec/design/gin.md §3): the default / "btree" is the ordered
 	// B-tree, "gin" a GIN inverted index; an unknown method is 42704. Resolved here (not in the
 	// parser) so the error is the resolve-time undefined_object, after the table-exists check.
@@ -3532,7 +3560,11 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 		}
 		meter.Charge(Costs.StorageRowRead)
 		if def.Unique {
-			if prefix, ok := indexPrefixKey(columns, def, e.Row); ok {
+			prefix, ok, err := indexPrefixKey(columns, colls, def, e.Row)
+			if err != nil {
+				return Outcome{}, err
+			}
+			if ok {
 				if seenPrefixes[string(prefix)] {
 					return Outcome{}, NewError(UniqueViolation,
 						"duplicate key value violates unique constraint: "+def.Name)
@@ -3540,7 +3572,11 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 				seenPrefixes[string(prefix)] = true
 			}
 		}
-		entries = append(entries, indexEntryKeys(columns, def, e.Key, e.Row)...)
+		eks, err := indexEntryKeys(columns, colls, def, e.Key, e.Row)
+		if err != nil {
+			return Outcome{}, err
+		}
+		entries = append(entries, eks...)
 	}
 	if err := meter.Guard(); err != nil {
 		return Outcome{}, err
@@ -3792,7 +3828,7 @@ func (db *Database) alterSequenceRename(existing *SequenceDef, newName string) e
 // order-preserving key bytes when present, the lone 0x01 for NULL (always tagged, even
 // for a NOT NULL column) — then the row's storage key as the suffix. Indexable types are
 // fixed-width and never spill, so the values are always resident (never unfetched).
-func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) []byte {
+func indexEntryKey(columns []Column, colls []*Collation, def IndexDef, storageKey []byte, row Row) ([]byte, error) {
 	var out []byte
 	for _, ci := range def.Columns {
 		v := row[ci]
@@ -3811,7 +3847,15 @@ func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) [
 		case ValTimestamp, ValTimestamptz, ValDate:
 			out = append(out, 0x00)
 			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
-		case ValText, ValBytea:
+		case ValText:
+			// text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
+			b, err := collatedTextKey(colls[ci], v.Str)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, 0x00)
+			out = append(out, b...)
+		case ValBytea:
 			out = append(out, 0x00)
 			out = append(out, EncodeTerminated([]byte(v.Str))...)
 		case ValDecimal:
@@ -3830,18 +3874,23 @@ func indexEntryKey(columns []Column, def IndexDef, storageKey []byte, row Row) [
 		}
 	}
 	out = append(out, storageKey...)
-	return out
+	return out, nil
 }
 
 // indexEntryKeys returns the index entries a row contributes (spec/design/gin.md §4/§5): exactly
 // one for an ordered (B-tree) index — the §3 nullable-slot entry key — or one per DISTINCT non-NULL
 // element for a GIN index. Every write path (build, INSERT, DELETE, UPDATE) treats an index
-// uniformly as "a row maps to a set of entries."
-func indexEntryKeys(columns []Column, def IndexDef, storageKey []byte, row Row) [][]byte {
+// uniformly as "a row maps to a set of entries." colls (column-ordinal-indexed) selects each text
+// key column's collated form (§2.12); GIN elements are fixed-width, so a GIN index never collates.
+func indexEntryKeys(columns []Column, colls []*Collation, def IndexDef, storageKey []byte, row Row) ([][]byte, error) {
 	if def.Kind == IndexGin {
-		return ginEntries(columns, def, storageKey, row)
+		return ginEntries(columns, def, storageKey, row), nil
 	}
-	return [][]byte{indexEntryKey(columns, def, storageKey, row)}
+	ek, err := indexEntryKey(columns, colls, def, storageKey, row)
+	if err != nil {
+		return nil, err
+	}
+	return [][]byte{ek}, nil
 }
 
 // isGinElementType reports whether elem is an element type a GIN (array_ops) index admits —
@@ -3877,7 +3926,12 @@ func ginEntries(columns []Column, def IndexDef, storageKey []byte, row Row) [][]
 		if el.Kind == ValNull {
 			continue // a NULL element carries no term; a non-keyable element is impossible under the gate
 		}
-		t := encodeKeyValue(elemTy, el)
+		// a GIN element is fixed-width (isGinElementType excludes text), so it never collates and
+		// the key encoding is infallible.
+		t, err := encodeKeyValue(elemTy, el, nil)
+		if err != nil {
+			panic("a GIN element key is infallible (fixed-width, no collation)")
+		}
 		if !seen[string(t)] {
 			seen[string(t)] = true
 			terms = append(terms, t)
@@ -3915,13 +3969,13 @@ func bytesDiff(a, b [][]byte) [][]byte {
 // (spec/design/indexes.md §8): the §3 entry key's slot prefix — without the storage-key
 // suffix — or ok=false when any component is NULL (NULLS DISTINCT: such a tuple never
 // conflicts). Two rows conflict iff they yield the same prefix.
-func indexPrefixKey(columns []Column, def IndexDef, row Row) ([]byte, bool) {
+func indexPrefixKey(columns []Column, colls []*Collation, def IndexDef, row Row) ([]byte, bool, error) {
 	var out []byte
 	for _, ci := range def.Columns {
 		v := row[ci]
 		switch v.Kind {
 		case ValNull:
-			return nil, false
+			return nil, false, nil
 		case ValInt:
 			out = append(out, 0x00)
 			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
@@ -3934,7 +3988,15 @@ func indexPrefixKey(columns []Column, def IndexDef, row Row) ([]byte, bool) {
 		case ValTimestamp, ValTimestamptz, ValDate:
 			out = append(out, 0x00)
 			out = append(out, EncodeInt(columns[ci].Type.ScalarTy(), v.Int)...)
-		case ValText, ValBytea:
+		case ValText:
+			// text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
+			b, err := collatedTextKey(colls[ci], v.Str)
+			if err != nil {
+				return nil, false, err
+			}
+			out = append(out, 0x00)
+			out = append(out, b...)
+		case ValBytea:
 			out = append(out, 0x00)
 			out = append(out, EncodeTerminated([]byte(v.Str))...)
 		case ValDecimal:
@@ -3952,7 +4014,7 @@ func indexPrefixKey(columns []Column, def IndexDef, row Row) ([]byte, bool) {
 			panic("an index column is a key-encodable type (CREATE INDEX gate)")
 		}
 	}
-	return out, true
+	return out, true, nil
 }
 
 // uniqueProbeBound is the half-open byte range [prefix, byte-successor(prefix)) — every
@@ -3979,7 +4041,7 @@ func uniqueProbeBound(prefix []byte) keyBound {
 // self-delimiting and bytes.Compare equals the tuple's logical order. Shared by the INSERT
 // duplicate check and the ON CONFLICT arbiter probe (upsert.md §3); a PK column is NOT NULL, so
 // there is no presence tag.
-func encodePkKey(table *Table, pk []int, row Row) []byte {
+func encodePkKey(table *Table, pk []int, colls []*Collation, row Row) ([]byte, error) {
 	var key []byte
 	for _, i := range pk {
 		switch {
@@ -3989,8 +4051,16 @@ func encodePkKey(table *Table, pk []int, row Row) []byte {
 		case table.Columns[i].Type.IsBool():
 			// boolean: the bare 1-byte bool-byte (encoding.md §2.9).
 			key = append(key, EncodeBool(row[i].Bool)...)
-		case table.Columns[i].Type.IsText() || table.Columns[i].Type.IsBytea():
-			// text / bytea: the variable-width …-terminated-escape body (encoding.md §2.4/§2.6).
+		case table.Columns[i].Type.IsText():
+			// text: the C …-terminated-escape body (encoding.md §2.4), or the collation's UCA
+			// sort key for a non-C collated column (text-collated-sortkey, §2.12).
+			b, err := collatedTextKey(colls[i], row[i].Str)
+			if err != nil {
+				return nil, err
+			}
+			key = append(key, b...)
+		case table.Columns[i].Type.IsBytea():
+			// bytea: the variable-width bytea-terminated-escape body (encoding.md §2.6).
 			key = append(key, EncodeTerminated([]byte(row[i].Str))...)
 		case table.Columns[i].Type.IsDecimal():
 			// decimal: the variable-width decimal-order-preserving body (encoding.md §2.5).
@@ -4008,7 +4078,7 @@ func encodePkKey(table *Table, pk []int, row Row) []byte {
 			key = append(key, EncodeInt(table.Columns[i].Type.ScalarTy(), row[i].Int)...)
 		}
 	}
-	return key
+	return key, nil
 }
 
 // arbiter is which uniqueness constraint an ON CONFLICT arbitrates (spec/design/upsert.md §2):
@@ -4092,11 +4162,15 @@ func sameIntSet(s []int, set map[int]struct{}) bool {
 // arbiterKey is the arbiter key of a candidate row (spec/design/upsert.md §3): the storage key for
 // a PK arbiter (never NULL), or the unique-index prefix for an index arbiter (the bool is false
 // when a nullable arbiter column is NULL — NULLS DISTINCT, so the row never conflicts).
-func arbiterKey(arb *arbiter, table *Table, pk []int, row Row) ([]byte, bool) {
+func arbiterKey(arb *arbiter, table *Table, pk []int, colls []*Collation, row Row) ([]byte, bool, error) {
 	if arb.isPK {
-		return encodePkKey(table, pk, row), true
+		k, err := encodePkKey(table, pk, colls, row)
+		if err != nil {
+			return nil, false, err
+		}
+		return k, true, nil
 	}
-	return indexPrefixKey(table.Columns, table.Indexes[arb.indexPos], row)
+	return indexPrefixKey(table.Columns, colls, table.Indexes[arb.indexPos], row)
 }
 
 // resolveOnConflict resolves an ON CONFLICT clause (spec/design/upsert.md §2/§5) into a
@@ -4206,9 +4280,13 @@ func (db *Database) arbiterExisting(arb *arbiter, store *TableStore, table *Tabl
 // rowConflictsCommitted reports whether a candidate row conflicts with a COMMITTED row on the
 // primary key or any unique index (the no-target DO NOTHING skip test — spec/design/upsert.md §2).
 // NULLS DISTINCT: a unique tuple with any NULL component never conflicts.
-func (db *Database) rowConflictsCommitted(store *TableStore, table *Table, pk []int, row Row) (bool, error) {
+func (db *Database) rowConflictsCommitted(store *TableStore, table *Table, pk []int, colls []*Collation, row Row) (bool, error) {
 	if len(pk) > 0 {
-		if _, exists, err := store.Get(encodePkKey(table, pk, row)); err != nil {
+		k, err := encodePkKey(table, pk, colls, row)
+		if err != nil {
+			return false, err
+		}
+		if _, exists, err := store.Get(k); err != nil {
 			return false, err
 		} else if exists {
 			return true, nil
@@ -4218,7 +4296,10 @@ func (db *Database) rowConflictsCommitted(store *TableStore, table *Table, pk []
 		if !def.Unique {
 			continue
 		}
-		prefix, ok := indexPrefixKey(table.Columns, def, row)
+		prefix, ok, err := indexPrefixKey(table.Columns, colls, def, row)
+		if err != nil {
+			return false, err
+		}
 		if !ok {
 			continue
 		}
@@ -4566,6 +4647,9 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 // its $Ns. Returns the projected output rows, nil without a clause.
 func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, meter *Meter) ([][]Value, error) {
 	n := len(table.Columns)
+	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
+	// mutation; nil everywhere for a C-only / non-text table (the fast path).
+	colls := db.columnCollations(table.Columns)
 	type preparedRow struct {
 		key []byte // nil for a no-PK table (rowid allocated in phase 2)
 		row Row
@@ -4632,7 +4716,11 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			// The composite key is the concatenation of the members' bare encodings in key
 			// order (encoding.md §2.3 — encodePkKey); a single-column key is the one-member
 			// case of the same rule.
-			key = encodePkKey(table, pk, row)
+			k, err := encodePkKey(table, pk, colls, row)
+			if err != nil {
+				return nil, err
+			}
+			key = k
 			// The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
 			// `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
 			if _, dup := seenKeys[string(key)]; dup {
@@ -4653,7 +4741,10 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		// existing entry and no earlier row of this batch. Unmetered validation, like the
 		// PK duplicate check (cost.md §3).
 		for u, def := range uniqDefs {
-			prefix, ok := indexPrefixKey(table.Columns, def, row)
+			prefix, ok, err := indexPrefixKey(table.Columns, colls, def, row)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue
 			}
@@ -4693,18 +4784,28 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 		if !ok {
 			continue
 		}
+		// The probe matches the parent's stored key, so a collated parent key column uses the
+		// PARENT's collation (§2.12).
+		parentColls := db.columnCollations(parent.Columns)
 		// Only a self-reference can satisfy against this statement's batch (a different parent
 		// table is unchanged by this INSERT). Collect the parent keys the batch supplies.
 		batch := make(map[string]struct{})
 		if strings.EqualFold(fk.RefTable, relation) {
 			for _, pr := range prepared {
-				if probe, ok := buildFkProbe(fk, parent, pr.row, fk.RefColumns); ok {
+				probe, ok, err := buildFkProbe(fk, parent, parentColls, pr.row, fk.RefColumns)
+				if err != nil {
+					return nil, err
+				}
+				if ok {
 					batch[string(probe.bytes)] = struct{}{}
 				}
 			}
 		}
 		for _, pr := range prepared {
-			probe, ok := buildFkProbe(fk, parent, pr.row, fk.Columns)
+			probe, ok, err := buildFkProbe(fk, parent, parentColls, pr.row, fk.Columns)
+			if err != nil {
+				return nil, err
+			}
 			if !ok {
 				continue // a NULL local column → exempt (MATCH SIMPLE)
 			}
@@ -4756,7 +4857,11 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			key = EncodeInt(Int64, store.AllocRowid())
 		}
 		for k, def := range table.Indexes {
-			indexInserts[k] = append(indexInserts[k], indexEntryKeys(table.Columns, def, key, pr.row)...)
+			eks, err := indexEntryKeys(table.Columns, colls, def, key, pr.row)
+			if err != nil {
+				return nil, err
+			}
+			indexInserts[k] = append(indexInserts[k], eks...)
 		}
 		ok, err := store.Insert(key, pr.row)
 		if err != nil {
@@ -4823,6 +4928,9 @@ func (db *Database) runInsertRows(table *Table, store *TableStore, pk []int, che
 func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, meter *Meter) (int64, [][]Value, error) {
 	n := len(table.Columns)
 	relation := table.Name
+	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
+	// mutation; nil everywhere for a C-only / non-text table (the fast path).
+	colls := db.columnCollations(table.Columns)
 	// The unique-index positions in table.Indexes (for the no-target skip test + end-state pass).
 	var uniqIdx []int
 	for i, def := range table.Indexes {
@@ -4884,9 +4992,13 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 			// planned insert); else insert (upsert.md §2/§3).
 			var pkk []byte
 			if len(pk) > 0 {
-				pkk = encodePkKey(table, pk, row)
+				k, err := encodePkKey(table, pk, colls, row)
+				if err != nil {
+					return 0, nil, err
+				}
+				pkk = k
 			}
-			committed, err := db.rowConflictsCommitted(store, table, pk, row)
+			committed, err := db.rowConflictsCommitted(store, table, pk, colls, row)
 			if err != nil {
 				return 0, nil, err
 			}
@@ -4898,7 +5010,11 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 			}
 			if !inBatch {
 				for u, ix := range uniqIdx {
-					if prefix, ok := indexPrefixKey(table.Columns, table.Indexes[ix], row); ok {
+					prefix, ok, err := indexPrefixKey(table.Columns, colls, table.Indexes[ix], row)
+					if err != nil {
+						return 0, nil, err
+					}
+					if ok {
 						if _, dup := insPrefixes[u][string(prefix)]; dup {
 							inBatch = true
 							break
@@ -4913,7 +5029,11 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 				insPk[string(pkk)] = struct{}{}
 			}
 			for u, ix := range uniqIdx {
-				if prefix, ok := indexPrefixKey(table.Columns, table.Indexes[ix], row); ok {
+				prefix, ok, err := indexPrefixKey(table.Columns, colls, table.Indexes[ix], row)
+				if err != nil {
+					return 0, nil, err
+				}
+				if ok {
 					insPrefixes[u][string(prefix)] = struct{}{}
 				}
 			}
@@ -4922,7 +5042,10 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 		}
 
 		// Arbiter present (DO UPDATE always; DO NOTHING with a target).
-		ak, ok := arbiterKey(plan.arb, table, pk, row)
+		ak, ok, err := arbiterKey(plan.arb, table, pk, colls, row)
+		if err != nil {
+			return 0, nil, err
+		}
 		if !ok {
 			// A NULL-bearing arbiter key never conflicts (NULLS DISTINCT) — plain insert.
 			inserts = append(inserts, row)
@@ -4994,7 +5117,10 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 	if len(pk) > 0 && len(inserts) > 0 {
 		seen := make(map[string]struct{}, len(inserts))
 		for _, row := range inserts {
-			k := encodePkKey(table, pk, row)
+			k, err := encodePkKey(table, pk, colls, row)
+			if err != nil {
+				return 0, nil, err
+			}
 			if _, exists, err := store.Get(k); err != nil {
 				return 0, nil, err
 			} else if exists {
@@ -5026,7 +5152,10 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 			istore := db.readSnap().indexStore(strings.ToLower(def.Name))
 			batch := make(map[string]struct{})
 			for _, newRow := range newRows {
-				prefix, ok := indexPrefixKey(table.Columns, def, newRow)
+				prefix, ok, err := indexPrefixKey(table.Columns, colls, def, newRow)
+				if err != nil {
+					return 0, nil, err
+				}
 				if !ok {
 					continue
 				}
@@ -5069,6 +5198,9 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 		if !ok {
 			continue
 		}
+		// The probe matches the parent's stored key, so a collated parent key column uses the
+		// PARENT's collation (§2.12).
+		parentColls := db.columnCollations(parent.Columns)
 		checkUpdates := false
 		for _, c := range fk.Columns {
 			if _, ok := assigned[c]; ok {
@@ -5080,12 +5212,20 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 		batch := make(map[string]struct{})
 		if strings.EqualFold(fk.RefTable, relation) {
 			for _, row := range inserts {
-				if probe, ok := buildFkProbe(fk, parent, row, fk.RefColumns); ok {
+				probe, ok, err := buildFkProbe(fk, parent, parentColls, row, fk.RefColumns)
+				if err != nil {
+					return 0, nil, err
+				}
+				if ok {
 					batch[string(probe.bytes)] = struct{}{}
 				}
 			}
 			for _, u := range updates {
-				if probe, ok := buildFkProbe(fk, parent, u.newRow, fk.RefColumns); ok {
+				probe, ok, err := buildFkProbe(fk, parent, parentColls, u.newRow, fk.RefColumns)
+				if err != nil {
+					return 0, nil, err
+				}
+				if ok {
 					batch[string(probe.bytes)] = struct{}{}
 				}
 			}
@@ -5098,7 +5238,10 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 			}
 		}
 		for _, row := range toCheck {
-			probe, ok := buildFkProbe(fk, parent, row, fk.Columns)
+			probe, ok, err := buildFkProbe(fk, parent, parentColls, row, fk.Columns)
+			if err != nil {
+				return 0, nil, err
+			}
 			if !ok {
 				continue // a NULL local column → exempt (MATCH SIMPLE)
 			}
@@ -5127,18 +5270,30 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 		}
 		for ri := range referencers {
 			r := &referencers[ri]
+			// parent is the insert target itself, so its key columns use colls (§2.12).
 			newPresent := make(map[string]struct{})
 			for _, u := range updates {
-				if probe, ok := buildFkProbe(&r.fk, parent, u.newRow, r.fk.RefColumns); ok {
+				probe, ok, err := buildFkProbe(&r.fk, parent, colls, u.newRow, r.fk.RefColumns)
+				if err != nil {
+					return 0, nil, err
+				}
+				if ok {
 					newPresent[string(probe.bytes)] = struct{}{}
 				}
 			}
 			for _, u := range updates {
-				oldProbe, ok := buildFkProbe(&r.fk, parent, u.oldRow, r.fk.RefColumns)
+				oldProbe, ok, err := buildFkProbe(&r.fk, parent, colls, u.oldRow, r.fk.RefColumns)
+				if err != nil {
+					return 0, nil, err
+				}
 				if !ok {
 					continue
 				}
-				if newProbe, ok := buildFkProbe(&r.fk, parent, u.newRow, r.fk.RefColumns); ok {
+				newProbe, ok, err := buildFkProbe(&r.fk, parent, colls, u.newRow, r.fk.RefColumns)
+				if err != nil {
+					return 0, nil, err
+				}
+				if ok {
 					if bytes.Equal(newProbe.bytes, oldProbe.bytes) {
 						continue
 					}
@@ -5165,7 +5320,11 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 	for _, row := range inserts {
 		kb := placeholder
 		if len(pk) > 0 {
-			kb = encodePkKey(table, pk, row)
+			k, err := encodePkKey(table, pk, colls, row)
+			if err != nil {
+				return 0, nil, err
+			}
+			kb = k
 		}
 		cunits += int64(store.WriteCompressUnits(kb, row))
 	}
@@ -5209,12 +5368,20 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 	for _, row := range inserts {
 		var key []byte
 		if len(pk) > 0 {
-			key = encodePkKey(table, pk, row)
+			k, err := encodePkKey(table, pk, colls, row)
+			if err != nil {
+				return 0, nil, err
+			}
+			key = k
 		} else {
 			key = EncodeInt(Int64, store.AllocRowid())
 		}
 		for k, def := range table.Indexes {
-			indexAdds[k] = append(indexAdds[k], indexEntryKeys(table.Columns, def, key, row)...)
+			eks, err := indexEntryKeys(table.Columns, colls, def, key, row)
+			if err != nil {
+				return 0, nil, err
+			}
+			indexAdds[k] = append(indexAdds[k], eks...)
 		}
 		ok, err := store.Insert(key, row)
 		if err != nil {
@@ -5228,8 +5395,14 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 	indexMoves := make([][]indexMove, len(table.Indexes))
 	for _, u := range updates {
 		for k, def := range table.Indexes {
-			oldEks := indexEntryKeys(table.Columns, def, u.key, u.oldRow)
-			newEks := indexEntryKeys(table.Columns, def, u.key, u.newRow)
+			oldEks, err := indexEntryKeys(table.Columns, colls, def, u.key, u.oldRow)
+			if err != nil {
+				return 0, nil, err
+			}
+			newEks, err := indexEntryKeys(table.Columns, colls, def, u.key, u.newRow)
+			if err != nil {
+				return 0, nil, err
+			}
 			removals := bytesDiff(oldEks, newEks)
 			insertions := bytesDiff(newEks, oldEks)
 			if len(removals) > 0 || len(insertions) > 0 {
@@ -5359,6 +5532,9 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
 	}
+	// Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
+	// parent-side probe (parent is this table) and the index-entry path.
+	colls := db.columnCollations(table.Columns)
 	// DELETE is single-table; resolve its WHERE against a one-relation scope. The RETURNING
 	// projection resolves after it (PostgreSQL's analysis order), against the same scope
 	// (grammar.md §32).
@@ -5511,7 +5687,11 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 				exclude = deletedKeys
 			}
 			for _, m := range matched {
-				probe, ok := buildFkProbe(&r.fk, parent, m.row, r.fk.RefColumns)
+				// parent is the delete target itself, so its key columns use colls (§2.12).
+				probe, ok, err := buildFkProbe(&r.fk, parent, colls, m.row, r.fk.RefColumns)
+				if err != nil {
+					return Outcome{}, err
+				}
 				if !ok {
 					continue // a NULL referenced value cannot be referenced (MATCH SIMPLE)
 				}
@@ -5550,7 +5730,11 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	for _, def := range table.Indexes {
 		istore := db.working().indexStore(strings.ToLower(def.Name))
 		for _, m := range matched {
-			for _, ek := range indexEntryKeys(table.Columns, def, m.key, m.row) {
+			eks, err := indexEntryKeys(table.Columns, colls, def, m.key, m.row)
+			if err != nil {
+				return Outcome{}, err
+			}
+			for _, ek := range eks {
 				if _, err := istore.Remove(ek); err != nil {
 					return Outcome{}, err
 				}
@@ -5571,6 +5755,9 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+upd.Table)
 	}
+	// Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
+	// probe and the index-entry move path.
+	colls := db.columnCollations(table.Columns)
 	// UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
 	// shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
 	s := singleScope(db, table)
@@ -5824,7 +6011,10 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			istore := db.readSnap().indexStore(strings.ToLower(def.Name))
 			batch := make(map[string]struct{})
 			for _, u := range updates {
-				prefix, ok := indexPrefixKey(table.Columns, def, u.row)
+				prefix, ok, err := indexPrefixKey(table.Columns, colls, def, u.row)
+				if err != nil {
+					return Outcome{}, err
+				}
 				if !ok {
 					continue
 				}
@@ -5878,16 +6068,26 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		if !ok {
 			continue
 		}
+		// The probe matches the parent's stored key, so a collated parent key column uses the
+		// PARENT's collation (§2.12).
+		parentColls := db.columnCollations(parent.Columns)
 		batch := make(map[string]struct{})
 		if strings.EqualFold(fk.RefTable, relation) {
 			for _, u := range updates {
-				if probe, ok := buildFkProbe(fk, parent, u.row, fk.RefColumns); ok {
+				probe, ok, err := buildFkProbe(fk, parent, parentColls, u.row, fk.RefColumns)
+				if err != nil {
+					return Outcome{}, err
+				}
+				if ok {
 					batch[string(probe.bytes)] = struct{}{}
 				}
 			}
 		}
 		for _, u := range updates {
-			probe, ok := buildFkProbe(fk, parent, u.row, fk.Columns)
+			probe, ok, err := buildFkProbe(fk, parent, parentColls, u.row, fk.Columns)
+			if err != nil {
+				return Outcome{}, err
+			}
 			if !ok {
 				continue // a NULL local column → exempt (MATCH SIMPLE)
 			}
@@ -5922,10 +6122,15 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 		empty := map[string]struct{}{}
 		for ri := range referencers {
 			r := &referencers[ri]
+			// parent is the update target itself, so its key columns use colls (§2.12).
 			// The referenced tuples the updated rows now supply (so a swap re-supplies one).
 			newPresent := make(map[string]struct{})
 			for _, u := range updates {
-				if probe, ok := buildFkProbe(&r.fk, parent, u.row, r.fk.RefColumns); ok {
+				probe, ok, err := buildFkProbe(&r.fk, parent, colls, u.row, r.fk.RefColumns)
+				if err != nil {
+					return Outcome{}, err
+				}
+				if ok {
 					newPresent[string(probe.bytes)] = struct{}{}
 				}
 			}
@@ -5934,12 +6139,19 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 				exclude = updatedKeys
 			}
 			for _, u := range updates {
-				oldProbe, ok := buildFkProbe(&r.fk, parent, u.oldRow, r.fk.RefColumns)
+				oldProbe, ok, err := buildFkProbe(&r.fk, parent, colls, u.oldRow, r.fk.RefColumns)
+				if err != nil {
+					return Outcome{}, err
+				}
 				if !ok {
 					continue // a NULL old referenced value was referenced by nothing
 				}
 				// Unchanged tuples (incl. a NULL → already skipped) do not disappear.
-				if newProbe, ok := buildFkProbe(&r.fk, parent, u.row, r.fk.RefColumns); ok {
+				newProbe, ok, err := buildFkProbe(&r.fk, parent, colls, u.row, r.fk.RefColumns)
+				if err != nil {
+					return Outcome{}, err
+				}
+				if ok {
 					if bytes.Equal(newProbe.bytes, oldProbe.bytes) {
 						continue
 					}
@@ -6001,8 +6213,14 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			// The row's old and new entry SETS (one entry for an ordered index, one per term for
 			// GIN — gin.md §5). Remove old−new, insert new−old: a shared entry is left untouched,
 			// keeping the copy-on-write dirty set byte-identical across cores.
-			oldEks := indexEntryKeys(table.Columns, def, u.key, u.oldRow)
-			newEks := indexEntryKeys(table.Columns, def, u.key, u.row)
+			oldEks, err := indexEntryKeys(table.Columns, colls, def, u.key, u.oldRow)
+			if err != nil {
+				return Outcome{}, err
+			}
+			newEks, err := indexEntryKeys(table.Columns, colls, def, u.key, u.row)
+			if err != nil {
+				return Outcome{}, err
+			}
 			removals := bytesDiff(oldEks, newEks)
 			insertions := bytesDiff(newEks, oldEks)
 			if len(removals) > 0 || len(insertions) > 0 {
@@ -7848,7 +8066,12 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 		if qv.Kind == ValInt && !gb.elemType.InRange(qv.Int) {
 			return nil, 0, 0, nil // out-of-range guard
 		}
-		terms = append(terms, encodeKeyValue(gb.elemType, qv))
+		// a GIN element is fixed-width (isGinElementType excludes text), so the term never collates / fails
+		t, err := encodeKeyValue(gb.elemType, qv, nil)
+		if err != nil {
+			panic("a GIN element key is infallible (fixed-width, no collation)")
+		}
+		terms = append(terms, t)
 	} else {
 		if qv.Kind != ValArray {
 			return nil, 0, 0, nil // a NULL whole-array (or non-array) query → provably empty
@@ -7859,7 +8082,10 @@ func (db *Database) ginBoundRows(tableName string, gb *ginBoundPlan, query *rExp
 				hasNull = true // a NULL element carries no term
 				continue
 			}
-			t := encodeKeyValue(gb.elemType, el)
+			t, err := encodeKeyValue(gb.elemType, el, nil)
+			if err != nil {
+				panic("a GIN element key is infallible (fixed-width, no collation)")
+			}
 			if !seen[string(t)] {
 				seen[string(t)] = true
 				terms = append(terms, t)
@@ -18089,22 +18315,24 @@ func typesEqual(a, b Type) bool {
 // encodeKeyValue is the order-preserving key bytes for one keyable value (encoding.md §2),
 // matching the PK / index encoders. value is non-NULL and of a keyable type (a foreign-key
 // column always is — its type equals a PK/UNIQUE parent column, CREATE TABLE §6.2).
-func encodeKeyValue(ty ScalarType, value Value) []byte {
+func encodeKeyValue(ty ScalarType, value Value, coll *Collation) ([]byte, error) {
 	switch value.Kind {
 	case ValInt:
-		return EncodeInt(ty, value.Int)
+		return EncodeInt(ty, value.Int), nil
 	case ValBool:
-		return EncodeBool(value.Bool)
+		return EncodeBool(value.Bool), nil
 	case ValUuid:
-		return []byte(value.Str)
+		return []byte(value.Str), nil
 	case ValTimestamp, ValTimestamptz, ValDate:
-		return EncodeInt(ty, value.Int)
-	case ValText, ValBytea:
-		return EncodeTerminated([]byte(value.Str))
+		return EncodeInt(ty, value.Int), nil
+	case ValText:
+		return collatedTextKey(coll, value.Str)
+	case ValBytea:
+		return EncodeTerminated([]byte(value.Str)), nil
 	case ValDecimal:
-		return value.Dec.EncodeKey()
+		return value.Dec.EncodeKey(), nil
 	case ValInterval:
-		return value.Iv.EncodeKey()
+		return value.Iv.EncodeKey(), nil
 	default:
 		panic("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)")
 	}
@@ -18116,15 +18344,15 @@ func encodeKeyValue(ty ScalarType, value Value) []byte {
 // the column type; every other keyable value ignores the wrapper and dispatches on its scalar via
 // encodeKeyValue. value is non-NULL (callers handle the NULL slot tag), and a range column always
 // holds a ValRange, so the scalar arm never sees a range type.
-func encodeTypedKey(ty Type, value Value) []byte {
+func encodeTypedKey(ty Type, value Value, coll *Collation) ([]byte, error) {
 	if value.Kind == ValRange {
 		elem, ok := ty.RangeElement()
 		if !ok {
 			panic("a range key value has a range column type")
 		}
-		return encodeRangeKey(elem.ScalarTy(), value.Range)
+		return encodeRangeKey(elem.ScalarTy(), value.Range), nil
 	}
-	return encodeKeyValue(ty.ScalarTy(), value)
+	return encodeKeyValue(ty.ScalarTy(), value, coll)
 }
 
 // fkProbeKind tags which physical tree a built foreign-key probe addresses.
@@ -18152,11 +18380,11 @@ type fkProbe struct {
 // ordinals = fk.RefColumns (the row viewed as a parent). Returns ok=false when any supplied value
 // is NULL (MATCH SIMPLE exempt — §6.3). The probe uses the parent's PK when the referenced set is
 // the PK, else the matching unique index (re-derived deterministically — §6.8).
-func buildFkProbe(fk *ForeignKey, parent *Table, row Row, ordinals []int) (fkProbe, bool) {
+func buildFkProbe(fk *ForeignKey, parent *Table, parentColls []*Collation, row Row, ordinals []int) (fkProbe, bool, error) {
 	// MATCH SIMPLE: a NULL in any supplied (local/parent) column exempts the whole tuple.
 	for _, o := range ordinals {
 		if row[o].Kind == ValNull {
-			return fkProbe{}, false
+			return fkProbe{}, false, nil
 		}
 	}
 	// valueFor returns the value supplying parent column pcol (the fk pairing: RefColumns[i] ⇄
@@ -18165,13 +18393,19 @@ func buildFkProbe(fk *ForeignKey, parent *Table, row Row, ordinals []int) (fkPro
 		i := slices.Index(fk.RefColumns, pcol)
 		return row[ordinals[i]]
 	}
+	// The probe must match the PARENT's stored key, so a collated parent key column is encoded with
+	// the PARENT's collation (encoding.md §2.12), independent of the child column's own collation.
 	refSet := sortedUnique(fk.RefColumns)
 	if len(parent.PK) > 0 && slices.Equal(sortedUnique(parent.PK), refSet) {
 		var k []byte
 		for _, pcol := range parent.PK {
-			k = append(k, encodeTypedKey(parent.Columns[pcol].Type, valueFor(pcol))...)
+			b, err := encodeTypedKey(parent.Columns[pcol].Type, valueFor(pcol), parentColls[pcol])
+			if err != nil {
+				return fkProbe{}, false, err
+			}
+			k = append(k, b...)
 		}
-		return fkProbe{kind: fkProbePk, bytes: k}, true
+		return fkProbe{kind: fkProbePk, bytes: k}, true, nil
 	}
 	var idx *IndexDef
 	for i := range parent.Indexes {
@@ -18186,10 +18420,14 @@ func buildFkProbe(fk *ForeignKey, parent *Table, row Row, ordinals []int) (fkPro
 	}
 	var prefix []byte
 	for _, pcol := range idx.Columns {
+		b, err := encodeTypedKey(parent.Columns[pcol].Type, valueFor(pcol), parentColls[pcol])
+		if err != nil {
+			return fkProbe{}, false, err
+		}
 		prefix = append(prefix, 0x00)
-		prefix = append(prefix, encodeTypedKey(parent.Columns[pcol].Type, valueFor(pcol))...)
+		prefix = append(prefix, b...)
 	}
-	return fkProbe{kind: fkProbeUnique, bytes: prefix, index: strings.ToLower(idx.Name)}, true
+	return fkProbe{kind: fkProbeUnique, bytes: prefix, index: strings.ToLower(idx.Name)}, true, nil
 }
 
 // fkProbeHits reports whether the parent currently holds the key/prefix probe (committed +
@@ -18221,14 +18459,19 @@ func (db *Database) fkChildReferences(childTable string, fk *ForeignKey, parent 
 	if err != nil {
 		return false, err
 	}
+	// target is in the parent's stored-key byte space, so the child probe encodes a collated
+	// parent key column with the PARENT's collation (§2.12).
+	parentColls := db.columnCollations(parent.Columns)
 	for _, e := range entries {
 		if _, skip := exclude[string(e.Key)]; skip {
 			continue
 		}
-		if probe, ok := buildFkProbe(fk, parent, e.Row, fk.Columns); ok {
-			if bytes.Equal(probe.bytes, target) {
-				return true, nil
-			}
+		probe, ok, err := buildFkProbe(fk, parent, parentColls, e.Row, fk.Columns)
+		if err != nil {
+			return false, err
+		}
+		if ok && bytes.Equal(probe.bytes, target) {
+			return true, nil
 		}
 	}
 	return false, nil
