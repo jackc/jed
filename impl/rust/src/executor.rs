@@ -574,6 +574,12 @@ impl Snapshot {
             .expect("store exists for a resolved index")
     }
 
+    /// Whether this snapshot holds a store for the named index (lowercased key). Used to route
+    /// index access to the session temp snapshot vs the main snapshot (temp-tables.md §2).
+    pub(crate) fn has_index_store(&self, name_key: &str) -> bool {
+        self.index_stores.contains_key(name_key)
+    }
+
     /// Register a new (empty) secondary index on `table_key`: insert its definition into the
     /// table's `indexes` in ascending lowercased-name order (the catalog/planner order —
     /// spec/design/indexes.md §6) and create its zero-column store.
@@ -849,6 +855,15 @@ pub struct Session {
     /// snapshot state**: it does NOT roll back with a transaction (PG `SET SESSION`), and it carries
     /// across the additional-session swap because it lives on `Session` (like the privilege envelope).
     pub(crate) vars: HashMap<String, String>,
+    /// The session-local **temporary-table** catalog + stores (spec/design/temp-tables.md §2): a
+    /// `Snapshot` holding only this session's temp tables, their stores, and their (UNIQUE) index
+    /// stores. **Never serialized** — only [`Database::committed`] is written to the file, so a temp
+    /// table makes ZERO file writes (§2). Private to this `Session` (so it carries across the
+    /// additional-session swap and is invisible to other sessions — the [[session-design]] privacy),
+    /// and dropped wholesale when the session is. Transactional like the main snapshot: an open
+    /// transaction clones it into [`ActiveTx::temp_working`], which a successful COMMIT adopts back
+    /// here and a ROLLBACK discards.
+    pub(crate) temp_committed: Snapshot,
     /// The **read pin** for a data-modifying `WITH` statement (spec/design/writable-cte.md §2): the
     /// single pre-statement snapshot every sub-statement reads, so the data-modifying CTEs and the
     /// primary cannot observe each other's table writes (their writes still accumulate into the
@@ -911,6 +926,7 @@ impl Session {
             // as it did (one gate governing all DDL).
             allow_temp_ddl: opts.allow_temp_ddl.unwrap_or(opts.allow_ddl),
             temp_buffers: opts.temp_buffers,
+            temp_committed: Snapshot::default(),
             vars: HashMap::new(),
             read_pin: None,
         }
@@ -1134,6 +1150,20 @@ pub(crate) struct ActiveTx {
     /// restores these, while a successful COMMIT keeps the advanced state.
     saved_session_seq: HashMap<String, i64>,
     saved_session_last_name: Option<String>,
+    /// The transaction's working copy of the session's temp-table snapshot
+    /// (spec/design/temp-tables.md §5): cloned from [`Session::temp_committed`] at tx open (cheap —
+    /// persistent stores clone O(1)), mutated by temp DDL/DML, adopted back into `temp_committed` on a
+    /// successful COMMIT and discarded on ROLLBACK. The temp analogue of `working`, kept SEPARATE so
+    /// it is never serialized.
+    temp_working: Snapshot,
+    /// Whether this transaction mutated the **main** (persistent) snapshot — set by
+    /// [`Database::working_mut`]. Drives the commit's persist decision so a transaction that touched
+    /// ONLY temp tables makes zero file writes (temp-tables.md §2).
+    main_dirty: bool,
+    /// Whether this transaction mutated the **temp** snapshot — set by
+    /// [`Database::temp_working_mut`]. With `main_dirty` it decides whether COMMIT persists the main
+    /// image (a temp-only commit skips it; an empty block still persists, preserving prior behavior).
+    temp_dirty: bool,
 }
 
 impl Default for Database {
@@ -1213,12 +1243,46 @@ impl Database {
     /// runs with a transaction open (autocommit opens one implicitly), so this never panics in a
     /// correct flow.
     fn working_mut(&mut self) -> &mut Snapshot {
-        &mut self
+        let tx = self
             .session
             .tx
             .as_mut()
-            .expect("a write statement runs within a transaction")
-            .working
+            .expect("a write statement runs within a transaction");
+        // Mark the main image dirty so the commit knows to persist it; a temp-only transaction never
+        // reaches here and so makes zero file writes (spec/design/temp-tables.md §2).
+        tx.main_dirty = true;
+        &mut tx.working
+    }
+
+    /// The session's temp-table snapshot for READS (spec/design/temp-tables.md §2): the open
+    /// transaction's `temp_working`, else the session's committed temp state. The temp analogue of
+    /// [`read_snap`](Database::read_snap) (it does not consult `read_pin` — a writable-CTE pins only
+    /// the main snapshot).
+    fn temp_read_snap(&self) -> &Snapshot {
+        match &self.session.tx {
+            Some(tx) => &tx.temp_working,
+            None => &self.session.temp_committed,
+        }
+    }
+
+    /// The session's temp-table snapshot for WRITES — the open transaction's `temp_working`. A temp
+    /// write opens an (implicit autocommit) transaction just like a main write, so this is present;
+    /// it also flags `temp_dirty` so the commit can skip persisting the (unchanged) main image.
+    fn temp_working_mut(&mut self) -> &mut Snapshot {
+        let tx = self
+            .session
+            .tx
+            .as_mut()
+            .expect("a temp write statement runs within a transaction");
+        tx.temp_dirty = true;
+        &mut tx.temp_working
+    }
+
+    /// Whether `name` resolves to a SESSION-LOCAL temporary table in the visible temp snapshot
+    /// (spec/design/temp-tables.md §3). Preclude-overlaps guarantees a name is temp XOR persistent,
+    /// so this is the routing predicate the table/store funnels use.
+    fn is_temp_table(&self, name: &str) -> bool {
+        self.temp_read_snap().table(name).is_some()
     }
 
     /// The committed snapshot, immutable (spec/design/transactions.md §2). Exposed for the host
@@ -1663,9 +1727,14 @@ impl Database {
         self.path.as_deref()
     }
 
-    /// Look up a table definition by name (case-insensitive) in the currently-visible snapshot
-    /// (the open transaction's working set, else the committed state).
+    /// Look up a table definition by name (case-insensitive). Session-local temp tables resolve
+    /// FIRST (spec/design/temp-tables.md §3); preclude-overlaps guarantees a name is temp XOR
+    /// persistent, so this is just "where the table lives", not a precedence contest. Falls through
+    /// to the currently-visible main snapshot (the open transaction's working set, else committed).
     pub fn table(&self, name: &str) -> Option<&Table> {
+        if let Some(t) = self.temp_read_snap().table(name) {
+            return Some(t);
+        }
         self.read_snap().table(name)
     }
 
@@ -1896,6 +1965,9 @@ impl Database {
             working: self.committed.clone(),
             saved_session_seq: self.session.session_seq.clone(),
             saved_session_last_name: self.session.session_last_name.clone(),
+            temp_working: self.session.temp_committed.clone(),
+            main_dirty: false,
+            temp_dirty: false,
         });
         match self.dispatch_stmt(stmt, params) {
             Ok(outcome) => {
@@ -1942,6 +2014,9 @@ impl Database {
             working: self.committed.clone(),
             saved_session_seq: self.session.session_seq.clone(),
             saved_session_last_name: self.session.session_last_name.clone(),
+            temp_working: self.session.temp_committed.clone(),
+            main_dirty: false,
+            temp_dirty: false,
         });
         Ok(Outcome::Statement {
             cost: 0,
@@ -1976,22 +2051,35 @@ impl Database {
         };
         if tx.failed || !tx.writable {
             // A failed or read-only block publishes nothing — a failed COMMIT is a ROLLBACK (PG),
-            // so any in-block session updates revert with the discarded working set (§5/§6).
+            // so any in-block session updates revert with the discarded working set (§5/§6). The
+            // discarded `temp_working` rolls back temp changes too (dropped with `tx`).
             self.restore_session_state(tx);
             return Ok(Outcome::Statement {
                 cost: 0,
                 rows_affected: None,
             });
         }
+        let main_dirty = tx.main_dirty;
+        let temp_dirty = tx.temp_dirty;
+        let temp_working = tx.temp_working;
         let mut working = tx.working;
-        // The txid is the durable commit counter (spec/design/api.md §2): it advances only on a
-        // file-backed commit. An in-memory commit swaps the snapshot but leaves txid unchanged
-        // (an in-memory database stays at txid 0 — there is nothing to recover).
-        if self.path.is_some() {
-            working.txid = self.committed.txid + 1;
+        // Persist the main image when it changed; a temp-only transaction skips it entirely so a temp
+        // table makes ZERO file writes (spec/design/temp-tables.md §2). An empty block (neither dirty)
+        // still persists, preserving prior behavior. Temp state is adopted regardless — it is never
+        // serialized, only swapped into the session's committed temp snapshot.
+        if main_dirty || !temp_dirty {
+            // The txid is the durable commit counter (spec/design/api.md §2): it advances only on a
+            // file-backed commit. An in-memory commit swaps the snapshot but leaves txid unchanged
+            // (an in-memory database stays at txid 0 — there is nothing to recover).
+            if self.path.is_some() {
+                working.txid = self.committed.txid + 1;
+            }
+            self.persist(&working)?; // no-op for an in-memory database
+            self.committed = working;
         }
-        self.persist(&working)?; // no-op for an in-memory database
-        self.committed = working;
+        // Adopt the transaction's temp changes into the session's committed temp snapshot
+        // (temp-tables.md §5) — the temp analogue of publishing `committed`, but purely in memory.
+        self.session.temp_committed = temp_working;
         Ok(Outcome::Statement {
             cost: 0,
             rows_affected: None,
@@ -2060,8 +2148,11 @@ impl Database {
         if req.is_ddl {
             // Temp-table DDL is gated by `allow_temp_ddl`; all other DDL by `allow_ddl`
             // (temp-tables.md §5). The two split so a host can grant bounded scratch tables to an
-            // untrusted session while withholding persistent schema changes.
-            let allowed = if req.is_temp_ddl {
+            // untrusted session while withholding persistent schema changes. CREATE TEMP is known
+            // statically (`is_temp_ddl`); a DROP of a temp table is determined by resolving the name.
+            let temp_ddl = req.is_temp_ddl
+                || matches!(stmt, Statement::DropTable(dt) if self.is_temp_table(&dt.name));
+            let allowed = if temp_ddl {
                 self.session.allow_temp_ddl
             } else {
                 self.session.allow_ddl
@@ -2172,22 +2263,22 @@ impl Database {
     /// left to right (unknown 42703, repeated 42701); then the jed narrowings — the
     /// declaration-order rule and the per-member key-type gate — trap 0A000.
     fn execute_create_table(&mut self, ct: CreateTable) -> Result<Outcome> {
-        // Session-local temporary tables (spec/design/temp-tables.md): the surface (parser),
-        // the `allow_temp_ddl` capability split (§5), and the `temp_buffers` budget plumbing (§7)
-        // have landed; the storage routing — a per-session temp store outside the serialized
-        // Snapshot so a temp table makes zero file writes (§2), with name resolution, DML, and the
-        // 54P03 budget enforcement — is the next increment. Until then a temp CREATE is recognized
-        // but not yet executable, reported honestly (it must NEVER fall through to the persistent
-        // path below, which writes the file). The capability gate (§5) has already run at dispatch.
-        if ct.temp {
+        // A session-local temporary table (spec/design/temp-tables.md) is built exactly like a
+        // persistent one but registered into the session temp snapshot at the end (§2), so it makes
+        // zero file writes. FOREIGN KEY on a temp table is deferred this slice (§8) — rejected HERE,
+        // before any persistent parent resolves, so the error is a clean 0A000 (not a 42P01 from
+        // resolving a parent). The other temp narrowings (composite/collated columns, serial/IDENTITY)
+        // are checked just before registration, once the columns are built.
+        if ct.temp && !ct.foreign_keys.is_empty() {
             return Err(EngineError::new(
                 SqlState::FeatureNotSupported,
-                "session-local temporary tables are not yet executable \
-                 (surface + capability/budget plumbing landed; storage routing is the next increment)",
+                "FOREIGN KEY on a temporary table is not yet supported",
             ));
         }
         // The relation namespace is shared between tables and indexes (indexes.md §2), so a
         // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word.
+        // `relation_exists` is temp-aware, so a temp name collides with temp + persistent alike
+        // (preclude-overlaps — temp-tables.md §3).
         if self.relation_exists(&ct.name) {
             return Err(EngineError::new(
                 SqlState::DuplicateTable,
@@ -2859,12 +2950,15 @@ impl Database {
                 }
                 local.push(idx);
             }
-            // 2. Parent table — a self-reference resolves against the in-progress definition.
+            // 2. Parent table — a self-reference resolves against the in-progress definition. The
+            // parent must be PERSISTENT (resolve against the main snapshot, not the temp-aware funnel):
+            // a persistent table may not reference a temp parent, and a temp table has no FK at all
+            // (rejected above) — so a temp parent reads as "does not exist" here (temp-tables.md §8).
             let self_ref = fk.ref_table.eq_ignore_ascii_case(&table.name);
             let parent: &Table = if self_ref {
                 &table
             } else {
-                self.table(&fk.ref_table).ok_or_else(|| {
+                self.read_snap().table(&fk.ref_table).ok_or_else(|| {
                     EngineError::new(
                         SqlState::UndefinedTable,
                         format!("table does not exist: {}", fk.ref_table),
@@ -3010,9 +3104,53 @@ impl Database {
             .iter()
             .map(|i| i.name.to_ascii_lowercase())
             .collect();
-        self.put_table(table);
         // The table is brand new (no rows), so each backing index store starts empty.
         let cap = self.page_size as usize - 12; // PAGE_HEADER
+
+        if ct.temp {
+            // Deferred narrowings on a temp table this slice (spec/design/temp-tables.md §8), each a
+            // clean 0A000: a serial/IDENTITY column (needs a temp OWNED sequence), a composite-typed
+            // column (needs the temp snapshot to carry the type catalog), and a collated column
+            // (needs the collation catalog). Plain scalar/array/range/decimal columns with PK / NOT
+            // NULL / DEFAULT / CHECK / UNIQUE are fully supported. With these out, the temp snapshot
+            // needs no types/collations catalog, so it resolves cleanly with an empty one.
+            if !pending_serials.is_empty() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "serial / IDENTITY column on a temporary table is not yet supported",
+                ));
+            }
+            if let Some(c) = table.columns.iter().find(|c| type_uses_composite(&c.ty)) {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "composite-typed column {} on a temporary table is not yet supported",
+                        c.name
+                    ),
+                ));
+            }
+            if let Some(c) = table.columns.iter().find(|c| c.collation.is_some()) {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!("COLLATE on temporary-table column {} is not yet supported", c.name),
+                ));
+            }
+            // Register into the session temp snapshot (temp_working) — never the main image, so the
+            // table makes zero file writes (§2). page_size only weighs records for the (unused-for-
+            // resident) split heuristic.
+            let ps = self.page_size;
+            let tw = self.temp_working_mut();
+            tw.put_table(table, ps);
+            for k in index_keys {
+                tw.put_index_store(k, TableStore::new(cap, Vec::new()));
+            }
+            return Ok(Outcome::Statement {
+                cost: 0,
+                rows_affected: None,
+            });
+        }
+
+        self.put_table(table);
         for k in index_keys {
             self.working_mut()
                 .put_index_store(k, TableStore::new(cap, Vec::new()));
@@ -3130,6 +3268,18 @@ impl Database {
                 format!("table does not exist: {}", dt.name),
             ));
         }
+        // A session-local temp table (spec/design/temp-tables.md): remove it from the session temp
+        // snapshot — never the main image, so DROP makes zero file writes. No FK-dependent check (a
+        // temp table is never an FK parent, §8) and no owned-sequence sweep (serial on temp is
+        // deferred, §8). The temp-DDL capability gate already ran at dispatch (§5).
+        if self.is_temp_table(&dt.name) {
+            let key = dt.name.to_ascii_lowercase();
+            self.temp_working_mut().remove_table(&key);
+            return Ok(Outcome::Statement {
+                cost: 0,
+                rows_affected: None,
+            });
+        }
         // A table referenced by ANOTHER table's FOREIGN KEY cannot be dropped (2BP01 — there is no
         // DROP TABLE … CASCADE; a self-reference does not block — spec/design/constraints.md §6.10).
         if let Some(detail) = self.read_snap().foreign_key_dependent(&dt.name) {
@@ -3168,6 +3318,15 @@ impl Database {
     /// built by scanning the table once: `page_read` per node + `storage_row_read` per row
     /// (the metered build scan — cost.md §3); maintenance thereafter is unmetered.
     fn execute_create_index(&mut self, ci: CreateIndex) -> Result<Outcome> {
+        // A standalone CREATE INDEX on a temp table is deferred this slice (spec/design/temp-tables.md
+        // §8) — a temp table's UNIQUE constraints (declared in CREATE TEMP TABLE) are supported, but a
+        // separate index DDL is a 0A000 follow-on. Checked before resolution so the message is clear.
+        if self.is_temp_table(&ci.table) {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "CREATE INDEX on a temporary table is not yet supported",
+            ));
+        }
         let table = self.table(&ci.table).ok_or_else(|| {
             EngineError::new(
                 SqlState::UndefinedTable,
@@ -8557,26 +8716,38 @@ impl Database {
         }
     }
 
-    /// Shared read access to a table's store in the visible snapshot (the table is known to
-    /// exist) — the open transaction's working set, else the committed state.
+    /// Shared read access to a table's store (the table is known to exist). Routes to the session
+    /// temp snapshot for a temp table, else the visible main snapshot (temp-tables.md §2).
     fn store(&self, name: &str) -> &TableStore {
+        if self.is_temp_table(name) {
+            return self.temp_read_snap().store(name);
+        }
         self.read_snap().store(name)
     }
 
-    /// Mutable access to a table's store in the working snapshot (the table is known to exist;
-    /// a write runs within a transaction, so the working set is present).
+    /// Mutable access to a table's store (the table is known to exist; a write runs within a
+    /// transaction). Routes a temp table's write to `temp_working`, leaving the main image untouched.
     pub(crate) fn store_mut(&mut self, name: &str) -> &mut TableStore {
+        if self.is_temp_table(name) {
+            return self.temp_working_mut().store_mut(name);
+        }
         self.working_mut().store_mut(name)
     }
 
-    /// Shared read access to a secondary index's store in the visible snapshot (the index is
-    /// known to exist). `name_key` is the lowercased index name.
+    /// Shared read access to a secondary index's store (the index is known to exist). `name_key` is
+    /// the lowercased index name; a temp table's index lives in the temp snapshot (temp-tables.md §8).
     fn index_store(&self, name_key: &str) -> &TableStore {
+        if self.temp_read_snap().has_index_store(name_key) {
+            return self.temp_read_snap().index_store(name_key);
+        }
         self.read_snap().index_store(name_key)
     }
 
-    /// Mutable access to a secondary index's store in the working snapshot.
+    /// Mutable access to a secondary index's store; routes a temp table's index to `temp_working`.
     fn index_store_mut(&mut self, name_key: &str) -> &mut TableStore {
+        if self.temp_read_snap().has_index_store(name_key) {
+            return self.temp_working_mut().index_store_mut(name_key);
+        }
         self.working_mut().index_store_mut(name_key)
     }
 
@@ -8653,8 +8824,12 @@ impl Database {
     /// Whether `name` is taken in the shared relation namespace (a table OR an index —
     /// spec/design/indexes.md §2), case-insensitively.
     fn relation_exists(&self, name: &str) -> bool {
+        // `self.table` already covers temp tables (it resolves temp-first); the temp snapshot's
+        // index names join the namespace too, so a name colliding with a temp table's UNIQUE index is
+        // also 42P07 (preclude-overlaps — spec/design/temp-tables.md §3).
         self.table(name).is_some()
             || self.find_index(name).is_some()
+            || self.temp_read_snap().find_index(name).is_some()
             || self.read_snap().sequence(name).is_some()
     }
 
@@ -14440,6 +14615,17 @@ impl PrivReq {
     }
     fn need_function(&mut self, name: &str) {
         self.functions.push(name.to_string());
+    }
+}
+
+/// Whether a column type involves a composite type (directly, or as an array element). A temp table
+/// with such a column is deferred this slice (spec/design/temp-tables.md §8) because the session temp
+/// snapshot carries no composite-type catalog. Range elements are scalar-only, so a range never does.
+fn type_uses_composite(t: &Type) -> bool {
+    match t {
+        Type::Composite(_) => true,
+        Type::Array(elem) => type_uses_composite(elem),
+        Type::Scalar(_) | Type::Range(_) => false,
     }
 }
 
