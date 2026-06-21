@@ -79,6 +79,8 @@ test("WITH RECURSIVE materialization hint is inert", () => {
       db,
       `WITH RECURSIVE c(n) AS ${hint}(SELECT 1 UNION ALL SELECT n + 1 FROM c WHERE n < 3) SELECT n FROM c ORDER BY n`,
     );
+    assert.equal(r.kind, "query", `hint ${JSON.stringify(hint)} kind`);
+    if (r.kind !== "query") throw new Error("unreachable");
     assert.strictEqual(r.rows.length, 3, `hint ${JSON.stringify(hint)} rows`);
     assert.strictEqual(r.cost, 17n, `hint ${JSON.stringify(hint)} cost`);
   }

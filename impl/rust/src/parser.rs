@@ -7,11 +7,11 @@
 use crate::ast::{
     AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction,
     ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef,
-    Delete,
-    DropIndex, DropSequence, DropTable, DropType, Expr, ForeignKeyDef, IdentitySpec, Insert,
-    InsertSource, InsertValue, JoinClause, JoinKind, Literal, OnConflict, OrderKey, Overriding,
-    QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
-    SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef, Update, WithQuery,
+    Delete, DropIndex, DropSequence, DropTable, DropType, Expr, ForeignKeyDef, IdentitySpec,
+    Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OnConflict, OrderKey,
+    Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp,
+    SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
+    Update, WithQuery,
 };
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
@@ -1452,7 +1452,10 @@ impl Parser {
     /// nested-WITH narrowing — a nested `WITH` surfaces as a leftover `42601`).
     fn parse_cte_body(&mut self, parenthesized: bool) -> Result<CteBody> {
         let kw = self.peek_keyword();
-        if matches!(kw.as_deref(), Some("insert") | Some("update") | Some("delete")) {
+        if matches!(
+            kw.as_deref(),
+            Some("insert") | Some("update") | Some("delete")
+        ) {
             // A parenthesized data-modifying body counts one nesting level, like parse_subquery does
             // for a parenthesized query body (grammar.md §48); the primary (parenthesized = false)
             // runs at the statement top level and does not.

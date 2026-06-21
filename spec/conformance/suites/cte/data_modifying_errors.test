@@ -26,7 +26,7 @@ SELECT count(*) FROM e
 # A data-modifying statement's target resolves against the catalog only: a CTE name with no base
 # table is 42P01 (a CTE is not a modifiable relation).
 statement error 42P01
-WITH x AS (SELECT 1) INSERT INTO x VALUES (1)
+WITH cte_only AS (SELECT 1) INSERT INTO cte_only VALUES (1)
 
 # Two data-modifying parts inserting the same key collide: the second part's staged write meets the
 # first's, raising 23505 (the whole statement aborts all-or-nothing).

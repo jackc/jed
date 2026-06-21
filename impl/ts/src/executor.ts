@@ -12,6 +12,8 @@ import type {
   CreateTable,
   CreateType,
   ConflictTarget,
+  Cte,
+  CteBody,
   Delete,
   DropIndex,
   DropSequence,
@@ -40,7 +42,11 @@ import type {
   Update,
   WithQuery,
 } from "./ast.ts";
-import { emptySeqOptions } from "./ast.ts";
+import {
+  cteBodyAsQuery,
+  cteBodyIsDataModifying,
+  emptySeqOptions,
+} from "./ast.ts";
 import {
   type CheckConstraint,
   type ColField,
@@ -852,6 +858,13 @@ export class Session {
   // roll back with a transaction (PG SET SESSION), and each session keeps its own map across the
   // by-reference swap (like the privilege envelope).
   vars: Map<string, string>;
+  // The read pin for a data-modifying WITH statement (spec/design/writable-cte.md §2): the single
+  // pre-statement snapshot every sub-statement reads, so the data-modifying CTEs and the primary
+  // cannot observe each other's table writes (their writes still accumulate into the transaction's
+  // working). Set by the writable-CTE orchestrator before the first sub-statement runs and cleared
+  // when it finishes (success or error); null for every other statement, where reads fall through to
+  // working/committed as usual (readSnap).
+  readPin: Snapshot | null;
 
   constructor(opts: SessionOptions = {}) {
     this.tx = null;
@@ -871,6 +884,7 @@ export class Session {
     }
     this.allowDdl = opts.allowDdl ?? true;
     this.vars = new Map();
+    this.readPin = null;
   }
 
   // run installs this session as db's active session, runs fn, and restores the default — the swap
@@ -1213,9 +1227,14 @@ export class Database {
     this.session.workMem = bytes;
   }
 
-  // readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
-  // writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
+  // readSnap is the snapshot a read sees: the read pin if one is set (a data-modifying WITH statement
+  // pins the pre-statement snapshot so every sub-statement reads it — writable-cte.md §2), else the
+  // open transaction's working (read-your-writes for a writable tx; the pinned snapshot for a
+  // read-only tx), else the committed snapshot.
   private readSnap(): Snapshot {
+    if (this.session.readPin !== null) {
+      return this.session.readPin;
+    }
     return this.session.tx !== null ? this.session.tx.working : this.committed;
   }
 
@@ -1886,7 +1905,7 @@ export class Database {
         rejectParamsForDDL(params);
         return this.executeDropSequence(stmt);
       case "insert":
-        return this.executeInsert(stmt, params);
+        return this.executeInsert(stmt, params, EMPTY_CTE_CTX);
       case "select":
         return this.executeSelect(stmt, params);
       case "setOp":
@@ -1894,9 +1913,9 @@ export class Database {
       case "with":
         return this.executeWith(stmt, params);
       case "update":
-        return this.executeUpdate(stmt, params);
+        return this.executeUpdate(stmt, params, EMPTY_CTE_CTX);
       case "delete":
-        return this.executeDelete(stmt, params);
+        return this.executeDelete(stmt, params, EMPTY_CTE_CTX);
       default:
         // Transaction control (begin/commit/rollback) is handled by executeStmtParams before
         // dispatch; it never reaches here.
@@ -3494,7 +3513,7 @@ export class Database {
   // (literals + constant defaults), SELECT is the embedded query's accrued cost. The SELECT
   // source additionally validates output arity (42601) and per-column type assignability (42804)
   // up front, before any row is produced — so both fire even over an empty source.
-  private executeInsert(ins: Insert, params: Value[]): Outcome {
+  private executeInsert(ins: Insert, params: Value[], ctx: CteCtx): Outcome {
     const table = this.table(ins.table);
     if (!table) {
       throw engineError(
@@ -3583,10 +3602,23 @@ export class Database {
       // §5). The source returns OWNED rows, so a self-insert (INSERT INTO t SELECT ... FROM
       // t) reads the pre-insert snapshot, then writes.
       const ptypes = new ParamTypes();
-      const plan = this.planQuery(ins.source.select, null, [], ptypes);
+      // The source query (and the RETURNING sublinks) see the statement's CTE bindings
+      // (writable-cte.md) — the move-rows idiom INSERTs a SELECT over a CTE buffer.
+      const plan = this.planQuery(
+        ins.source.select,
+        null,
+        ctx.bindings,
+        ptypes,
+      );
       const ret =
         ins.returning !== null
-          ? this.resolveReturning(table, ins.returning, false, ptypes)
+          ? this.resolveReturning(
+              table,
+              ins.returning,
+              false,
+              ctx.bindings,
+              ptypes,
+            )
           : null;
       const cplan =
         ins.onConflict !== null
@@ -3595,17 +3627,18 @@ export class Database {
       const bound = bindParams(params, ptypes.finalize());
       const meter = this.session.newMeter();
       const foldCost = { value: 0n };
-      this.foldUncorrelatedInPlan(plan, bound, EMPTY_CTE_CTX, foldCost);
+      this.foldUncorrelatedInPlan(plan, bound, ctx, foldCost);
       // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
-      // pre-statement snapshot (grammar.md §32).
+      // pre-statement snapshot (grammar.md §32). They see the statement's CTE bindings
+      // (writable-cte.md) via `ctx`.
       if (ret !== null) {
         ret.nodes = ret.nodes.map((node) =>
-          this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost),
+          this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost),
         );
       }
       this.foldConflictPlan(cplan, bound, foldCost);
       meter.charge(foldCost.value);
-      const q = this.execQueryPlan(plan, [], bound, EMPTY_CTE_CTX);
+      const q = this.execQueryPlan(plan, [], bound, ctx);
       // Arity: the SELECT's output column count must match the target — checked before any row is
       // produced, so it fires even when the source returns zero rows.
       if (q.columnNames.length !== arity) {
@@ -3674,6 +3707,7 @@ export class Database {
         cplan,
         ret?.nodes ?? null,
         bound,
+        ctx,
         meter,
       );
       return dmlOutcome(
@@ -3728,7 +3762,13 @@ export class Database {
     // before binding/execution — a 42703 here beats a would-be 23505 (grammar.md §32).
     const ret =
       ins.returning !== null
-        ? this.resolveReturning(table, ins.returning, false, ptypes)
+        ? this.resolveReturning(
+            table,
+            ins.returning,
+            false,
+            ctx.bindings,
+            ptypes,
+          )
         : null;
     const cplan =
       ins.onConflict !== null
@@ -3773,7 +3813,7 @@ export class Database {
     const foldCost = { value: 0n };
     if (ret !== null) {
       ret.nodes = ret.nodes.map((node) =>
-        this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost),
+        this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost),
       );
     }
     this.foldConflictPlan(cplan, bound, foldCost);
@@ -3790,6 +3830,7 @@ export class Database {
       cplan,
       ret?.nodes ?? null,
       bound,
+      ctx,
       meter,
     );
     return dmlOutcome(
@@ -3824,6 +3865,7 @@ export class Database {
     rows: Value[][],
     returning: RExpr[] | null,
     params: Value[],
+    ctes: CteCtx,
     meter: Meter,
   ): Value[][] | null {
     const n = table.columns.length;
@@ -3833,6 +3875,11 @@ export class Database {
     // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
     // C-only / non-text table (the fast path).
     const colls = this.columnCollations(table.columns);
+    // Phase-1 existence probes read the VISIBLE snapshot (the read pin under a data-modifying WITH —
+    // writable-cte.md §2; else working == read-your-writes), so a self-insert sees the pre-insert
+    // state and an earlier sub-statement's staged key is invisible here (its collision is caught at
+    // phase 2 — §7). The passed `store` is the working set the phase-2 inserts land in.
+    const readStore = this.readSnap().store(table.name);
     const prepared: { key: Uint8Array | null; row: Row }[] = [];
     const seenKeys = new Set<string>();
     // Per UNIQUE index (catalog/name order), the prefixes earlier rows of this batch
@@ -3890,7 +3937,7 @@ export class Database {
         // The PK's 23505 reports PostgreSQL's derived auto-name for the PK index,
         // `<table>_pkey` — jed persists/reserves no such relation (constraints.md §5.4).
         const seen = key.join(",");
-        if (seenKeys.has(seen) || store.get(key) !== undefined) {
+        if (seenKeys.has(seen) || readStore.get(key) !== undefined) {
           throw engineError(
             "unique_violation",
             "duplicate key value violates unique constraint: " +
@@ -3981,6 +4028,7 @@ export class Database {
             prepared.map((pr) => pr.row),
             null,
             params,
+            ctes,
             meter,
           )
         : null;
@@ -4000,16 +4048,27 @@ export class Database {
         );
       }
       if (!store.insert(key, pr.row)) {
-        throw new Error("pre-validated INSERT key must be unique");
+        // A collision here can only happen under the writable-CTE read pin (writable-cte.md §7): an
+        // EARLIER data-modifying sub-statement of the same WITH staged this key, which phase 1
+        // (reading the pin) did not see. Matches PostgreSQL's unique violation; the whole statement
+        // aborts all-or-nothing. For a single statement, phase 1 already caught every duplicate, so
+        // this is never reached.
+        throw engineError(
+          "unique_violation",
+          `duplicate key value violates unique constraint: ${relation.toLowerCase()}_pkey`,
+        );
       }
     }
     for (let k = 0; k < table.indexes.length; k++) {
-      const istore = this.working().indexStore(
-        table.indexes[k]!.name.toLowerCase(),
-      );
+      const def = table.indexes[k]!;
+      const istore = this.working().indexStore(def.name.toLowerCase());
       for (const ek of indexInserts[k]!) {
         if (!istore.insert(ek, [])) {
-          throw new Error("index entry keys are unique (storage-key suffix)");
+          // A cross-sub-statement unique-index collision under the read pin (as above).
+          throw engineError(
+            "unique_violation",
+            `duplicate key value violates unique constraint: ${def.name}`,
+          );
         }
       }
     }
@@ -4208,6 +4267,7 @@ export class Database {
     conflict: ConflictPlan | null,
     returning: RExpr[] | null,
     params: Value[],
+    ctes: CteCtx,
     meter: Meter,
   ): { affected: number; returned: Value[][] | null } {
     if (conflict !== null) {
@@ -4223,6 +4283,7 @@ export class Database {
         conflict,
         returning,
         params,
+        ctes,
         meter,
       );
     }
@@ -4237,6 +4298,7 @@ export class Database {
       rows,
       returning,
       params,
+      ctes,
       meter,
     );
     return { affected: rows.length, returned };
@@ -4260,11 +4322,16 @@ export class Database {
     plan: ConflictPlan,
     returning: RExpr[] | null,
     params: Value[],
+    ctes: CteCtx,
     meter: Meter,
   ): { affected: number; returned: Value[][] | null } {
     const n = table.columns.length;
     const relation = table.name;
     const colTypes = store.columnTypes();
+    // Phase-1 existence/arbiter probes read the VISIBLE snapshot (the read pin under a data-modifying
+    // WITH — writable-cte.md §2; else working == read-your-writes); the passed `store` is the working
+    // set the phase-2 inserts/replaces land in.
+    const readStore = this.readSnap().store(table.name);
     // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
     // C-only / non-text table (the fast path).
     const colls = this.columnCollations(table.columns);
@@ -4377,7 +4444,7 @@ export class Database {
         continue; // DO NOTHING → skip
       }
       proposedArb.add(akKey);
-      const existing = this.arbiterExisting(plan.arb, store, table, ak);
+      const existing = this.arbiterExisting(plan.arb, readStore, table, ak);
       if (existing === null) {
         // No committed conflict on the arbiter → insert (a non-arbiter conflict is caught by the
         // end-state validation below).
@@ -4423,7 +4490,7 @@ export class Database {
       for (const row of inserts) {
         const k = encodePkKey(table, pk, colls, row);
         const ks = k.join(",");
-        if (store.get(k) !== undefined || seen.has(ks)) {
+        if (readStore.get(k) !== undefined || seen.has(ks)) {
           throw engineError(
             "unique_violation",
             "duplicate key value violates unique constraint: " +
@@ -4584,7 +4651,14 @@ export class Database {
         prows.push(u.newRow);
         olds.push(u.oldRow);
       }
-      returned = this.projectReturning(returning, prows, olds, params, meter);
+      returned = this.projectReturning(
+        returning,
+        prows,
+        olds,
+        params,
+        ctes,
+        meter,
+      );
     }
 
     const affected = inserts.length + updates.length;
@@ -4649,9 +4723,11 @@ export class Database {
     table: Table,
     items: SelectItems,
     baseIsOld: boolean,
+    ctes: CteBinding[],
     ptypes: ParamTypes,
   ): { nodes: RExpr[]; names: string[]; types: string[] } {
     const scope = Scope.returning(this, table, baseIsOld);
+    scope.ctes = ctes;
     const { nodes, names, types } = resolveProjections(
       scope,
       items,
@@ -4674,15 +4750,16 @@ export class Database {
     rows: Row[],
     others: Row[] | null,
     params: Value[],
+    ctes: CteCtx,
     meter: Meter,
   ): Value[][] {
     const env: EvalEnv = {
       params,
       outer: [],
-      runSubquery: (p, o) => this.execQueryPlan(p, o, params, EMPTY_CTE_CTX),
+      runSubquery: (p, o) => this.execQueryPlan(p, o, params, ctes),
       seam: this.session.seam,
       rng: new StmtRng(),
-      ctes: EMPTY_CTE_CTX,
+      ctes,
       exec: this,
     };
     const out: Value[][] = [];
@@ -4700,7 +4777,7 @@ export class Database {
   // executeDelete resolves the table and optional predicate, collects the keys of
   // matching rows (only a TRUE predicate matches — Kleene), then removes them. No WHERE
   // deletes every row. Keys are collected before mutating.
-  private executeDelete(del: Delete, params: Value[]): Outcome {
+  private executeDelete(del: Delete, params: Value[], ctx: CteCtx): Outcome {
     const table = this.table(del.table);
     if (!table) {
       throw engineError(
@@ -4713,15 +4790,17 @@ export class Database {
     const colls = this.columnCollations(table.columns);
     // DELETE is single-table; resolve its WHERE against a one-relation scope. The RETURNING
     // projection resolves after it (PostgreSQL's analysis order), against the same scope
-    // (grammar.md §32).
+    // (grammar.md §32). The statement's CTE bindings (writable-cte.md) are visible so a WHERE /
+    // RETURNING sublink may reference an earlier CTE.
     const scope = Scope.single(this, table);
+    scope.ctes = ctx.bindings;
     const ptypes = new ParamTypes();
     let filter = del.filter
       ? resolveBooleanFilter(scope, del.filter, ptypes)
       : null;
     const ret =
       del.returning !== null
-        ? this.resolveReturning(table, del.returning, true, ptypes)
+        ? this.resolveReturning(table, del.returning, true, ctx.bindings, ptypes)
         : null;
     const bound = bindParams(params, ptypes.finalize());
 
@@ -4733,7 +4812,7 @@ export class Database {
     const meter = this.session.newMeter();
     if (filter !== null) {
       const cost = { value: 0n };
-      filter = this.foldUncorrelatedInRExpr(filter, bound, EMPTY_CTE_CTX, cost);
+      filter = this.foldUncorrelatedInRExpr(filter, bound, ctx, cost);
       meter.charge(cost.value);
     }
     // Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
@@ -4741,20 +4820,22 @@ export class Database {
     if (ret !== null) {
       const cost = { value: 0n };
       ret.nodes = ret.nodes.map((node) =>
-        this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, cost),
+        this.foldUncorrelatedInRExpr(node, bound, ctx, cost),
       );
       meter.charge(cost.value);
     }
     const env: EvalEnv = {
       params: bound,
       outer: [],
-      runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+      runSubquery: (p, o) => this.execQueryPlan(p, o, bound, ctx),
       seam: this.session.seam,
       rng: new StmtRng(),
-      ctes: EMPTY_CTE_CTX,
+      ctes: ctx,
       exec: this,
     };
-    const store = this.working().store(del.table);
+    // The SCAN reads the visible snapshot (the read pin under a data-modifying WITH — writable-cte.md
+    // §2; else working == read-your-writes); the phase-2 REMOVAL writes the transaction's working set.
+    const store = this.readSnap().store(del.table);
     // matched collects (key, row) pairs before mutating; the rows feed phase 2's
     // index-entry removal (indexed columns are fixed-width and always resident).
     const matched: { key: Uint8Array; row: Row }[] = [];
@@ -4886,12 +4967,14 @@ export class Database {
             matched.map((m) => m.row),
             null,
             bound,
+            ctx,
             meter,
           )
         : null;
     // Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
     // unmetered write work; an index removal cannot fail).
-    for (const m of matched) store.remove(m.key);
+    const writeStore = this.working().store(del.table);
+    for (const m of matched) writeStore.remove(m.key);
     for (const def of table.indexes) {
       const istore = this.working().indexStore(def.name.toLowerCase());
       for (const m of matched) {
@@ -4913,7 +4996,7 @@ export class Database {
   // `SET a = b, b = a` swaps); a 22003/23502 aborts with no writes. Phase 2 applies.
   // Assigning a PRIMARY KEY column traps 0A000 (the storage key must not change this
   // slice); a duplicate target column traps 42701. No WHERE updates every row.
-  private executeUpdate(upd: Update, params: Value[]): Outcome {
+  private executeUpdate(upd: Update, params: Value[], ctx: CteCtx): Outcome {
     const table = this.table(upd.table);
     if (!table) {
       throw engineError(
@@ -4927,7 +5010,10 @@ export class Database {
 
     // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
     // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
+    // The statement's CTE bindings (writable-cte.md) are visible so a SET / WHERE / RETURNING
+    // sublink may reference an earlier CTE.
     const scope = Scope.single(this, table);
+    scope.ctes = ctx.bindings;
     const ptypes = new ParamTypes();
 
     // Resolve assignments up front (fail fast, deterministic).
@@ -5018,7 +5104,7 @@ export class Database {
     // one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
     const ret =
       upd.returning !== null
-        ? this.resolveReturning(table, upd.returning, false, ptypes)
+        ? this.resolveReturning(table, upd.returning, false, ctx.bindings, ptypes)
         : null;
     // The CHECK constraints, resolved once per statement in evaluation (name) order;
     // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
@@ -5037,35 +5123,28 @@ export class Database {
     const meter = this.session.newMeter();
     const foldCost = { value: 0n };
     for (const p of plans)
-      p.source = this.foldUncorrelatedInRExpr(
-        p.source,
-        bound,
-        EMPTY_CTE_CTX,
-        foldCost,
-      );
+      p.source = this.foldUncorrelatedInRExpr(p.source, bound, ctx, foldCost);
     if (filter !== null)
-      filter = this.foldUncorrelatedInRExpr(
-        filter,
-        bound,
-        EMPTY_CTE_CTX,
-        foldCost,
-      );
+      filter = this.foldUncorrelatedInRExpr(filter, bound, ctx, foldCost);
     if (ret !== null) {
       ret.nodes = ret.nodes.map((node) =>
-        this.foldUncorrelatedInRExpr(node, bound, EMPTY_CTE_CTX, foldCost),
+        this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost),
       );
     }
     meter.charge(foldCost.value);
     const env: EvalEnv = {
       params: bound,
       outer: [],
-      runSubquery: (p, o) => this.execQueryPlan(p, o, bound, EMPTY_CTE_CTX),
+      runSubquery: (p, o) => this.execQueryPlan(p, o, bound, ctx),
       seam: this.session.seam,
       rng: new StmtRng(),
-      ctes: EMPTY_CTE_CTX,
+      ctes: ctx,
       exec: this,
     };
-    const store = this.working().store(upd.table);
+    // The SCAN + spilled-value reads + compress-cost weigh the visible snapshot (the read pin under a
+    // data-modifying WITH — writable-cte.md §2; else working == read-your-writes); the phase-2 REPLACE
+    // writes the transaction's working set.
+    const store = this.readSnap().store(upd.table);
     // Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
     const updates: { key: Uint8Array; row: Row; oldRow: Row }[] = [];
     // UPDATE's touched set (cost.md §3): the filter's columns, every assignment SOURCE's, and
@@ -5312,6 +5391,7 @@ export class Database {
             updates.map((u) => u.row),
             updates.map((u) => u.oldRow),
             bound,
+            ctx,
             meter,
           )
         : null;
@@ -5340,8 +5420,9 @@ export class Database {
     }
 
     // Phase 2: apply (keys unchanged — a PK column can't be assigned), then move the
-    // changed index entries (unmetered write work; cannot fail).
-    for (const u of updates) store.replace(u.key, u.row);
+    // changed index entries (unmetered write work; cannot fail). The REPLACE targets the working set.
+    const writeStore = this.working().store(upd.table);
+    for (const u of updates) writeStore.replace(u.key, u.row);
     for (let k = 0; k < table.indexes.length; k++) {
       const istore = this.working().indexStore(
         table.indexes[k]!.name.toLowerCase(),
@@ -5422,6 +5503,13 @@ export class Database {
   // executeWith runs a WITH query (spec/design/cte.md) as a top-level statement: runWith, then wrap
   // as a query Outcome.
   private executeWith(wq: WithQuery, params: Value[]): Outcome {
+    // A WITH containing any data-modifying part (a data-modifying CTE or a data-modifying primary)
+    // runs through the writable-CTE orchestrator (spec/design/writable-cte.md): it pins the
+    // pre-statement snapshot and runs the parts in lexical order, all-or-nothing. A pure-query WITH
+    // keeps the existing read-only path (cte.md) unchanged.
+    if (withHasDml(wq)) {
+      return this.executeWithDml(wq, params);
+    }
     const r = this.runWith(wq, params);
     return {
       kind: "query",
@@ -5432,27 +5520,22 @@ export class Database {
     };
   }
 
-  // runWith runs a WITH query (spec/design/cte.md). The CTE orchestrator:
-  // (1) PLAN each CTE body in order against the prefix of earlier bindings (parent = null — a body
-  //     is an independent query, NOT correlated to a reference site), deriving each binding's
-  //     synthetic relation;
-  // (2) plan the main body with all bindings visible, threading the one ParamTypes so $N infers
-  //     statement-wide;
-  // (3) decide each CTE's mode from its reference count + [NOT] MATERIALIZED hint;
-  // (4) MATERIALIZE each referenced materialized CTE once, in list order, accruing its cost (a later
-  //     body sees the earlier buffers);
-  // (5) fold + EXECUTE the main body with the CTE context.
-  // Cost composes like set operations — a sum of the parts.
-  private runWith(wq: WithQuery, params: Value[]): SelectResult {
-    const ptypes = new ParamTypes();
-    // (1) Plan each CTE body against the already-built prefix; build its synthetic relation.
-    //     Under WITH RECURSIVE (recursive-cte.md), a CTE that references its own name is RECURSIVE:
-    //     its binding is pushed BEFORE planning the recursive term, so the self-reference resolves to
-    //     it; the binding's `plan` is then the non-recursive (anchor) term and `recursive` carries
-    //     the recursive term. A non-self-referencing CTE (or any CTE in a non-RECURSIVE list) plans
-    //     as before — its name is NOT yet in scope for its own body (cte.md §2).
+  // planCteBindings plans every CTE in a WITH list into bindings (spec/design/cte.md §2,
+  // writable-cte.md). Each body is planned against the prefix of EARLIER bindings (parent = null — a
+  // body is an independent query, NOT correlated to a reference site). Under WITH RECURSIVE a query
+  // CTE that references its own name is the recursive shape (its binding is pushed BEFORE planning the
+  // recursive term, so the self-reference resolves to it). A DATA-MODIFYING CTE body resolves only its
+  // RETURNING schema here (its effect runs later, in the orchestrator) — a data-modifying body is
+  // never the recursive UNION shape, so it is always non-recursive. The `refs` counters are bumped as
+  // later query bodies / a query primary reference each binding (a data-modifying part's references
+  // are static-counted by the orchestrator, since it is not planned here).
+  private planCteBindings(
+    ctes: Cte[],
+    recursive: boolean,
+    ptypes: ParamTypes,
+  ): CteBinding[] {
     const bindings: CteBinding[] = [];
-    for (const cte of wq.ctes) {
+    for (const cte of ctes) {
       const lname = cte.name.toLowerCase();
       if (bindings.some((b) => b.name === lname)) {
         throw engineError(
@@ -5460,107 +5543,223 @@ export class Database {
           `WITH query name ${lname} specified more than once`,
         );
       }
-      const shape = wq.recursive
-        ? analyzeRecursiveCte(lname, cte.query)
-        : { recursive: false as const, unionAll: false };
+      const bodyQuery = cteBodyAsQuery(cte.body);
+      const shape =
+        recursive && bodyQuery !== null
+          ? analyzeRecursiveCte(lname, bodyQuery)
+          : { recursive: false as const, unionAll: false };
       if (shape.recursive) {
         // The body is `anchor UNION[ALL] recursive_term` (analyzeRecursiveCte verified).
-        const so = cte.query as SetOp;
+        const so = bodyQuery as SetOp;
         const anchorPlan = this.planQuery(so.lhs, null, bindings, ptypes);
         const table = cteSyntheticTable(lname, anchorPlan, cte.columns);
         bindings.push({
           name: lname,
           table,
-          plan: anchorPlan,
+          source: { kind: "query", plan: anchorPlan },
           recursive: null,
           hint: cte.materialized,
           refs: 0,
         });
         const bi = bindings.length - 1;
         const rhsPlan = this.planQuery(so.rhs, null, bindings, ptypes);
-        checkRecursiveColumnTypes(bindings[bi]!.plan, rhsPlan, lname);
+        const anchorSrc = bindings[bi]!.source;
+        if (anchorSrc.kind !== "query") {
+          throw new Error("the anchor binding was just pushed as a query source");
+        }
+        checkRecursiveColumnTypes(anchorSrc.plan, rhsPlan, lname);
         bindings[bi]!.recursive = { plan: rhsPlan, unionAll: shape.unionAll };
         continue;
       }
-      const plan = this.planQuery(cte.query, null, bindings, ptypes);
-      const table = cteSyntheticTable(lname, plan, cte.columns);
-      bindings.push({
-        name: lname,
-        table,
-        plan,
-        recursive: null,
-        hint: cte.materialized,
-        refs: 0,
-      });
-    }
-    // (2) Plan the main body with all bindings visible.
-    const plan = this.planQuery(wq.body, null, bindings, ptypes);
-    const bound = bindParams(params, ptypes.finalize());
-
-    // (3) Per-CTE evaluation mode: a RECURSIVE CTE is ALWAYS materialized (the working-table method
-    //     requires it; [NOT] MATERIALIZED is inert — recursive-cte.md §1). Otherwise a MATERIALIZED
-    //     hint or >=2 references -> materialize, else inline (cost.md §3). An unreferenced
-    //     non-recursive CTE is planned (errors surfaced) but not run.
-    const modes: CteMode[] = bindings.map((b) => {
-      if (b.recursive !== null) return "materialize";
-      if (b.hint === true) return "materialize";
-      if (b.hint === false) return "inline";
-      return b.refs >= 2 ? "materialize" : "inline";
-    });
-    const plans: QueryPlan[] = bindings.map((b) => b.plan);
-    const recursives: (RecursiveTerm | null)[] = bindings.map((b) => b.recursive);
-
-    // (4) Materialize each CTE once, in list order, accruing cost; a later body sees the earlier
-    //     buffers. A RECURSIVE CTE iterates to a fixpoint (its self-reference reads the working
-    //     table); the per-statement cost ceiling (54P01) bounds it — recursive-cte.md §5.
-    const totalCost = { value: 0n };
-    const buffers: Row[][] = [];
-    for (let i = 0; i < plans.length; i++) {
-      const rt = recursives[i];
-      if (rt) {
-        buffers.push(
-          this.materializeRecursive(i, plans[i]!, rt, modes, plans, buffers, bound, totalCost),
-        );
-      } else if (modes[i] === "materialize") {
-        // Earlier-only context (the prefix): a CTE body sees EARLIER CTEs, never itself or a later
-        // one (forward-only visibility — cte.md §2).
-        const ctx: CteCtx = {
-          modes: modes.slice(0, i),
-          plans: plans.slice(0, i),
-          buffers,
-        };
-        const r = this.execQueryPlan(plans[i]!, [], bound, ctx);
-        totalCost.value += r.cost;
-        buffers.push(r.rows);
+      if (bodyQuery !== null) {
+        const plan = this.planQuery(bodyQuery, null, bindings, ptypes);
+        const table = cteSyntheticTable(lname, plan, cte.columns);
+        bindings.push({
+          name: lname,
+          table,
+          source: { kind: "query", plan },
+          recursive: null,
+          hint: cte.materialized,
+          refs: 0,
+        });
       } else {
-        buffers.push([]);
+        // A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the synthetic
+        // relation + capture the statement to run later.
+        const { table, dm } = this.planDmCte(
+          lname,
+          cte.body,
+          bindings,
+          cte.columns,
+          ptypes,
+        );
+        bindings.push({
+          name: lname,
+          table,
+          source: { kind: "dml", dm },
+          recursive: null,
+          hint: cte.materialized,
+          refs: 0,
+        });
       }
     }
+    return bindings;
+  }
+
+  // planDmCte plans a data-modifying CTE body (spec/design/writable-cte.md): resolve its RETURNING
+  // schema (against the EARLIER bindings, so a RETURNING sublink may reference an earlier CTE) to
+  // build the synthetic relation, and capture the statement to execute later. A body with no
+  // RETURNING yields a zero-column relation flagged noReturning (a FROM reference to it is 0A000,
+  // §5). The target must be a base table — a CTE name / missing table is 42P01 (§1).
+  private planDmCte(
+    lname: string,
+    body: CteBody,
+    bindings: CteBinding[],
+    rename: string[] | null,
+    ptypes: ParamTypes,
+  ): { table: Table; dm: DmCte } {
+    let tableName: string;
+    let returning: SelectItems | null;
+    let baseIsOld: boolean;
+    let stmt: DmStmt;
+    if (body.kind === "insert") {
+      tableName = body.table;
+      returning = body.returning;
+      baseIsOld = false;
+      stmt = body;
+    } else if (body.kind === "update") {
+      tableName = body.table;
+      returning = body.returning;
+      baseIsOld = false;
+      stmt = body;
+    } else if (body.kind === "delete") {
+      tableName = body.table;
+      returning = body.returning;
+      baseIsOld = true;
+      stmt = body;
+    } else {
+      throw new Error("planDmCte requires a data-modifying body");
+    }
+    const tdef = this.table(tableName);
+    if (tdef === undefined) {
+      throw engineError(
+        "undefined_table",
+        "table does not exist: " + tableName,
+      );
+    }
+    if (returning === null) {
+      const table = cteSyntheticTableCols(lname, [], [], rename);
+      return { table, dm: { stmt, noReturning: true } };
+    }
+    const scope = Scope.returning(this, tdef, baseIsOld);
+    scope.ctes = bindings;
+    const { names, types } = resolveProjections(
+      scope,
+      returning,
+      { collecting: false, groupKeys: [], specs: [] },
+      ptypes,
+    );
+    const table = cteSyntheticTableCols(lname, names, types, rename);
+    return { table, dm: { stmt, noReturning: false } };
+  }
+
+  // runWith runs a pure-query WITH (spec/design/cte.md) — the path for a WITH with no data-modifying
+  // part (a data-modifying WITH goes through executeWithDml). (1) PLAN every CTE binding against the
+  // prefix; (2) plan the main body with all bindings visible, threading the one ParamTypes so $N
+  // infers statement-wide; (3) decide each CTE's mode from its reference count + [NOT] MATERIALIZED
+  // hint; (4) MATERIALIZE each referenced materialized CTE once, in list order (a later body sees the
+  // earlier buffers); (5) fold + EXECUTE the main body with the CTE context. Cost composes like set
+  // operations — a sum of the parts.
+  private runWith(wq: WithQuery, params: Value[]): SelectResult {
+    const ptypes = new ParamTypes();
+    const bindings = this.planCteBindings(wq.ctes, wq.recursive, ptypes);
+    // (2) Plan the main body with all bindings visible (the pure-query path always has a query
+    //     primary — a data-modifying primary routes to executeWithDml).
+    const bodyQuery = cteBodyAsQuery(wq.body);
+    if (bodyQuery === null) {
+      throw new Error("runWith is the pure-query path");
+    }
+    const plan = this.planQuery(bodyQuery, null, bindings, ptypes);
+    const bound = bindParams(params, ptypes.finalize());
+    const modes = cteModes(bindings);
+    const { buffers, totalCost } = this.materializeCtes(bindings, modes, bound);
 
     // (5) Fold + execute the main body against the full CTE context.
-    const ctx: CteCtx = { modes, plans, buffers };
+    const ctx: CteCtx = { modes, bindings, buffers };
     const subqueryCost = { value: 0n };
     this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
     const r = this.execQueryPlan(plan, [], bound, ctx);
-    return { ...r, cost: r.cost + subqueryCost.value + totalCost.value };
+    return { ...r, cost: r.cost + subqueryCost.value + totalCost };
+  }
+
+  // materializeCtes materializes each CTE once, in list order (spec/design/cte.md §3) — the shared
+  // loop for the pure-query and writable-CTE paths' query/recursive CTEs. A data-modifying CTE is NOT
+  // run here (the orchestrator runs it for its effect — runWithDml); its buffer slot is left empty for
+  // the orchestrator to fill. Returns the filled buffers + the accrued materialization cost (a later
+  // body sees the earlier buffers).
+  private materializeCtes(
+    bindings: CteBinding[],
+    modes: CteMode[],
+    bound: Value[],
+  ): { buffers: Row[][]; totalCost: bigint } {
+    const totalCost = { value: 0n };
+    const buffers: Row[][] = [];
+    for (let i = 0; i < bindings.length; i++) {
+      const rt = bindings[i]!.recursive;
+      let buf: Row[];
+      if (rt) {
+        buf = this.materializeRecursive(
+          i,
+          rt,
+          modes,
+          bindings,
+          buffers,
+          bound,
+          totalCost,
+        );
+      } else if (bindings[i]!.source.kind === "dml") {
+        // A data-modifying CTE's buffer is filled by the orchestrator, not here.
+        buf = [];
+      } else if (modes[i] === "materialize") {
+        const ctx: CteCtx = {
+          modes: modes.slice(0, i),
+          bindings: bindings.slice(0, i),
+          buffers,
+        };
+        const src = bindings[i]!.source;
+        if (src.kind !== "query") {
+          throw new Error("the data-modifying arm was handled above");
+        }
+        const r = this.execQueryPlan(src.plan, [], bound, ctx);
+        totalCost.value += r.cost;
+        buf = r.rows;
+      } else {
+        buf = [];
+      }
+      buffers.push(buf);
+    }
+    return { buffers, totalCost: totalCost.value };
   }
 
   // materializeRecursive materializes a RECURSIVE CTE by iterating to a fixpoint — the PostgreSQL
-  // working-table method (spec/design/recursive-cte.md §4). anchorPlan is the non-recursive term; rt
-  // the recursive term (which references this CTE, index ci). priorBuffers are the earlier CTEs'
+  // working-table method (spec/design/recursive-cte.md §4). rt is the recursive term (which references
+  // this CTE, index ci); the anchor is bindings[ci].source. priorBuffers are the earlier CTEs'
   // materialized rows (visible to both terms). totalCost accrues every term evaluation's cost and
   // gates the per-statement ceiling between iterations, so a non-terminating recursion of cheap
   // iterations still aborts 54P01 at the identical accrued cost in every core (recursive-cte.md §5).
   private materializeRecursive(
     ci: number,
-    anchorPlan: QueryPlan,
     rt: RecursiveTerm,
     modes: CteMode[],
-    plans: QueryPlan[],
+    bindings: CteBinding[],
     priorBuffers: Row[][],
     params: Value[],
     totalCost: { value: bigint },
   ): Row[] {
+    const anchorSrc = bindings[ci]!.source;
+    if (anchorSrc.kind !== "query") {
+      throw new Error("a recursive CTE's anchor is a query plan");
+    }
+    const anchorPlan = anchorSrc.plan;
     const maxCost = this.session.maxCost;
     const guard = (total: bigint): void => {
       if (maxCost > 0n && total >= maxCost) {
@@ -5576,7 +5775,7 @@ export class Database {
     // Evaluate the anchor: its rows seed both the result and the first working table.
     const ar = this.execQueryPlan(anchorPlan, [], params, {
       modes: modes.slice(0, ci),
-      plans: plans.slice(0, ci),
+      bindings: bindings.slice(0, ci),
       buffers: priorBuffers,
     });
     totalCost.value += ar.cost;
@@ -5611,7 +5810,7 @@ export class Database {
       working = [];
       const rr = this.execQueryPlan(rt.plan, [], params, {
         modes: modes.slice(0, ci + 1),
-        plans: plans.slice(0, ci + 1),
+        bindings: bindings.slice(0, ci + 1),
         buffers: rhsBuffers,
       });
       totalCost.value += rr.cost;
@@ -5625,6 +5824,160 @@ export class Database {
       }
     }
     return result;
+  }
+
+  // executeWithDml runs a data-modifying WITH statement (spec/design/writable-cte.md): a WITH
+  // containing a data-modifying CTE and/or a data-modifying primary. It PINS the pre-statement
+  // snapshot for every sub-statement's reads (§2 — so the parts cannot see each other's table writes;
+  // data crosses only via a CTE's RETURNING buffer), runs the parts in lexical order, and returns the
+  // primary's result. The whole statement is one all-or-nothing transaction — the autocommit (or
+  // block) wrapper publishes the accumulated working only if this returns without throwing (§6).
+  private executeWithDml(wq: WithQuery, params: Value[]): Outcome {
+    // Pin the pre-statement snapshot. A write statement runs with a transaction open (autocommit
+    // opened one), and nothing is written yet, so the pin equals working == committed. Cleared on
+    // every exit path so the next statement reads normally.
+    const pin = this.readSnap().clone();
+    this.session.readPin = pin;
+    try {
+      return this.runWithDml(wq, params);
+    } finally {
+      this.session.readPin = null;
+    }
+  }
+
+  // runWithDml is the body of executeWithDml, run under the read pin. Plans every CTE binding + the
+  // query primary, runs the data-modifying CTEs / materialized query CTEs in list order, then the
+  // primary — every read against the pin, every write into the transaction's working.
+  private runWithDml(wq: WithQuery, params: Value[]): Outcome {
+    const { ctes, body, recursive } = wq;
+    const ptypes = new ParamTypes();
+    // (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
+    const bindings = this.planCteBindings(ctes, recursive, ptypes);
+    // (2) Plan a query primary now (to bump refs + surface resolution errors, incl. a 0A000 FROM
+    //     reference to a no-RETURNING data-modifying CTE). A data-modifying primary is resolved and
+    //     run later (it sees the bindings via the threaded context); its references are
+    //     static-counted in (2b).
+    const primaryQuery = cteBodyAsQuery(body);
+    const primaryPlan =
+      primaryQuery !== null
+        ? this.planQuery(primaryQuery, null, bindings, ptypes)
+        : null;
+    // (2b) Add the references each NON-planned data-modifying part (a data-modifying CTE body, or a
+    //      data-modifying primary) contributes to each binding, so the inline-vs-materialize decision
+    //      is correct for a query CTE referenced only by a data-modifying part (§3). Query bodies / a
+    //      query primary were already plan-counted in (1)/(2).
+    for (const cte of ctes) {
+      if (cteBodyIsDataModifying(cte.body)) {
+        for (const b of bindings) {
+          b.refs += countCteRefsDml(cte.body, b.name);
+        }
+      }
+    }
+    if (cteBodyIsDataModifying(body)) {
+      for (const b of bindings) {
+        b.refs += countCteRefsDml(body, b.name);
+      }
+    }
+    const bound = bindParams(params, ptypes.finalize());
+    const modes = cteModes(bindings);
+
+    // (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its
+    //     effect + RETURNING buffer; the query/recursive CTEs use the shared materialize loop.
+    const totalCost = { value: 0n };
+    const buffers: Row[][] = [];
+    for (let i = 0; i < bindings.length; i++) {
+      const rt = bindings[i]!.recursive;
+      let buf: Row[];
+      if (rt) {
+        buf = this.materializeRecursive(
+          i,
+          rt,
+          modes,
+          bindings,
+          buffers,
+          bound,
+          totalCost,
+        );
+      } else if (bindings[i]!.source.kind === "dml") {
+        const ctx: CteCtx = {
+          modes: modes.slice(0, i),
+          bindings: bindings.slice(0, i),
+          buffers,
+        };
+        const { rows, cost } = this.execDmCte(i, bindings, bound, ctx);
+        totalCost.value += cost;
+        buf = rows;
+      } else if (modes[i] === "materialize") {
+        const ctx: CteCtx = {
+          modes: modes.slice(0, i),
+          bindings: bindings.slice(0, i),
+          buffers,
+        };
+        const src = bindings[i]!.source;
+        if (src.kind !== "query") {
+          throw new Error("the data-modifying arm was handled above");
+        }
+        const r = this.execQueryPlan(src.plan, [], bound, ctx);
+        totalCost.value += r.cost;
+        buf = r.rows;
+      } else {
+        buf = [];
+      }
+      buffers.push(buf);
+    }
+
+    // (4) Execute the primary against the full CTE context, adding the materialization cost.
+    const ctx: CteCtx = { modes, bindings, buffers };
+    let outcome: Outcome;
+    if (body.kind === "select" || body.kind === "setOp") {
+      const plan = primaryPlan!;
+      const subqueryCost = { value: 0n };
+      this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
+      const r = this.execQueryPlan(plan, [], bound, ctx);
+      outcome = {
+        kind: "query",
+        columnNames: r.columnNames,
+        columnTypes: typeNames(r.columnTypes),
+        rows: r.rows,
+        cost: r.cost + subqueryCost.value,
+      };
+    } else if (body.kind === "insert") {
+      outcome = this.executeInsert(body, params, ctx);
+    } else if (body.kind === "update") {
+      outcome = this.executeUpdate(body, params, ctx);
+    } else {
+      outcome = this.executeDelete(body, params, ctx);
+    }
+    return addOutcomeCost(outcome, totalCost.value);
+  }
+
+  // execDmCte executes a data-modifying CTE (spec/design/writable-cte.md §3): run the
+  // INSERT/UPDATE/DELETE at binding i for its effect, with the earlier bindings/buffers in scope (so
+  // its inner queries may reference an earlier CTE), and return its RETURNING rows (the buffer the
+  // later parts scan) + its cost. A body with no RETURNING runs for its effect and buffers no rows.
+  private execDmCte(
+    i: number,
+    bindings: CteBinding[],
+    params: Value[],
+    ctx: CteCtx,
+  ): { rows: Row[]; cost: bigint } {
+    const src = bindings[i]!.source;
+    if (src.kind !== "dml") {
+      throw new Error("execDmCte requires a data-modifying binding");
+    }
+    const stmt = src.dm.stmt;
+    let outcome: Outcome;
+    if (stmt.kind === "insert") {
+      outcome = this.executeInsert(stmt, params, ctx);
+    } else if (stmt.kind === "update") {
+      outcome = this.executeUpdate(stmt, params, ctx);
+    } else {
+      outcome = this.executeDelete(stmt, params, ctx);
+    }
+    if (outcome.kind === "query") {
+      return { rows: outcome.rows, cost: outcome.cost };
+    }
+    return { rows: [], cost: outcome.cost };
   }
 
   // planQuery resolves a query expression into an owned QueryPlan against the scope chain (parent =
@@ -5960,6 +6313,16 @@ export class Database {
         const lname = tref.name.toLowerCase();
         const ci = ctes.findIndex((b) => b.name === lname);
         if (ci >= 0) {
+          // A data-modifying CTE with no RETURNING produces no columns, so a FROM reference to it is
+          // 0A000 (writable-cte.md §5; PostgreSQL's addRangeTableEntryForCTE check), raised at
+          // resolution before any execution.
+          const src = ctes[ci]!.source;
+          if (src.kind === "dml" && src.dm.noReturning) {
+            throw engineError(
+              "feature_not_supported",
+              `WITH query ${lname} does not have a RETURNING clause`,
+            );
+          }
           ctes[ci]!.refs += 1;
           t = ctes[ci]!.table;
           cteIdx = ci;
@@ -6635,12 +6998,13 @@ export class Database {
         }
         return buf.slice();
       }
-      const r = this.execQueryPlan(
-        env.ctes.plans[ci]!,
-        outer,
-        params,
-        env.ctes,
-      );
+      // Only a plain (query) CTE is ever inlined; a data-modifying CTE is always materialized
+      // (writable-cte.md §3), so its buffer was filled above.
+      const src = env.ctes.bindings[ci]!.source;
+      if (src.kind !== "query") {
+        throw new Error("a data-modifying CTE is always materialized, never inlined");
+      }
+      const r = this.execQueryPlan(src.plan, outer, params, env.ctes);
       meter.charge(r.cost);
       return r.rows;
     }
@@ -9289,13 +9653,14 @@ type QueryPlan = SelectPlan | SetOpPlan | ValuesPlan;
 //                  cte_scan_row per buffered row.
 type CteMode = "inline" | "materialize";
 
-// CteBinding is a planned common table expression (spec/design/cte.md), built by runWith for the
-// whole statement so the scopes that reference its synthetic `table` can see it. `name` is
+// CteBinding is a planned common table expression (spec/design/cte.md), built by planCteBindings for
+// the whole statement so the scopes that reference its synthetic `table` can see it. `name` is
 // lowercased for case-insensitive FROM matching; `table` is the synthetic relation exposing the
-// body's output columns; `plan` is the planned body; `hint` is the [NOT] MATERIALIZED override
-// (true/false/null); `refs` counts the FROM references resolved to it during planning (the
-// inline-vs-materialize decision — cost.md §3).
-// For a RECURSIVE CTE (spec/design/recursive-cte.md) `plan` holds the non-recursive (anchor) term
+// body's output columns; `source` is the planned body (a query plan, or — spec/design/writable-cte.md
+// — a data-modifying statement); `hint` is the [NOT] MATERIALIZED override (true/false/null); `refs`
+// counts the FROM references resolved to it during planning (the inline-vs-materialize decision —
+// cost.md §3).
+// For a RECURSIVE CTE (spec/design/recursive-cte.md) `source` holds the non-recursive (anchor) term
 // (its column types fix the synthetic relation's) and `recursive` carries the recursive term + the
 // UNION ALL flag; the binding is in scope inside its own recursive term, so the self-reference
 // resolves to it.
@@ -9303,20 +9668,38 @@ type RecursiveTerm = { plan: QueryPlan; unionAll: boolean };
 type CteBinding = {
   name: string;
   table: Table;
-  plan: QueryPlan;
+  source: CteSource;
   recursive: RecursiveTerm | null;
   hint: boolean | null;
   refs: number;
 };
 
+// CteSource is what a CTE binding evaluates to (spec/design/cte.md, writable-cte.md). A plain CTE
+// holds a planned query body; a DATA-MODIFYING CTE holds the statement to execute (for its effect +
+// RETURNING buffer). A data-modifying CTE is always materialized (writable-cte.md §3), so the
+// inline-execution path never touches a "dml" source.
+type CteSource =
+  | { kind: "query"; plan: QueryPlan }
+  | { kind: "dml"; dm: DmCte };
+
+// DmCte is a data-modifying CTE's body (spec/design/writable-cte.md): the INSERT/UPDATE/DELETE to run
+// (cloned from the AST, executed with the statement's CTE context threaded in) and whether it has no
+// RETURNING clause — in which case a FROM reference to it is 0A000 (§5).
+type DmCte = { stmt: DmStmt; noReturning: boolean };
+
+// DmStmt is a data-modifying statement in a writable-CTE position (a CTE body or the WITH primary).
+type DmStmt = Insert | Update | Delete;
+
 // CteCtx is the per-statement CTE execution context, threaded through exec_* and EvalEnv so a FROM
 // reference (any nesting depth) can deliver a CTE's rows (spec/design/cte.md §5). `modes` and
-// `plans` are fixed after planning; `buffers` is filled before the main query runs — one slot per
+// `bindings` are fixed after planning; `buffers` is filled before the main query runs — one slot per
 // CTE in list order, holding the materialized rows of a "materialize" CTE (an empty placeholder for
-// an "inline" one, whose body is run in place from `plans` instead). EMPTY_CTE_CTX is the empty
+// an "inline" one, whose body is run in place from `bindings[ci].source` instead). `bindings` also
+// serves a data-modifying CTE's own inner queries, which resolve against the earlier bindings when
+// the writable-CTE orchestrator executes them (writable-cte.md §2). EMPTY_CTE_CTX is the empty
 // context for every non-WITH execution path.
-type CteCtx = { modes: CteMode[]; plans: QueryPlan[]; buffers: Row[][] };
-const EMPTY_CTE_CTX: CteCtx = { modes: [], plans: [], buffers: [] };
+type CteCtx = { modes: CteMode[]; bindings: CteBinding[]; buffers: Row[][] };
+const EMPTY_CTE_CTX: CteCtx = { modes: [], bindings: [], buffers: [] };
 
 // EvalEnv is the environment threaded into the per-row evaluator (spec/design/grammar.md §26): the
 // bound parameters, the stack of enclosing rows (innermost LAST) a correlated reference reads, and
@@ -11391,6 +11774,83 @@ function validateRecursiveTerm(name: string, sel: Select): void {
   }
 }
 
+// withHasDml reports whether a WITH statement contains any data-modifying part — a data-modifying CTE
+// body or a data-modifying primary (spec/design/writable-cte.md). Such a statement runs through the
+// writable-CTE orchestrator (the read pin + lexical-order, all-or-nothing execution); a pure-query
+// WITH keeps the runWith path.
+function withHasDml(wq: WithQuery): boolean {
+  return (
+    cteBodyIsDataModifying(wq.body) ||
+    wq.ctes.some((c) => cteBodyIsDataModifying(c.body))
+  );
+}
+
+// cteModes computes each CTE binding's evaluation mode (spec/design/cte.md §3, writable-cte.md §3): a
+// RECURSIVE or data-modifying CTE is ALWAYS materialized; otherwise a MATERIALIZED hint or >=2
+// references → materialize, else inline.
+function cteModes(bindings: CteBinding[]): CteMode[] {
+  return bindings.map((b) => {
+    if (b.recursive !== null || b.source.kind === "dml") return "materialize";
+    if (b.hint === true) return "materialize";
+    if (b.hint === false) return "inline";
+    return b.refs >= 2 ? "materialize" : "inline";
+  });
+}
+
+// addOutcomeCost adds extra cost to an outcome (the writable-CTE orchestrator folds the
+// materialization cost of the data-modifying / query CTEs into the primary's result —
+// spec/design/writable-cte.md §8).
+function addOutcomeCost(outcome: Outcome, extra: bigint): Outcome {
+  return { ...outcome, cost: outcome.cost + extra };
+}
+
+// countCteRefsDml counts references to CTE `name` reachable through a cte_body's inner queries — the
+// writable-CTE analogue of countSelfRefsQuery (spec/design/writable-cte.md §3). A query body delegates
+// to the query counter; a data-modifying body counts the references in its source query / WHERE / SET
+// RHSs / ON CONFLICT / RETURNING sublinks. Used by the orchestrator to count the references a
+// NON-planned data-modifying part contributes to the inline-vs-materialize decision.
+function countCteRefsDml(body: CteBody, name: string): number {
+  if (body.kind === "select" || body.kind === "setOp") {
+    return countSelfRefsQuery(body, name);
+  }
+  if (body.kind === "insert") {
+    let n =
+      body.source.kind === "select"
+        ? countSelfRefsSelect(body.source.select, name)
+        : // VALUES slots hold literals / params / ROW / ARRAY (no sublinks this slice).
+          0;
+    if (body.onConflict !== null && body.onConflict.doUpdate) {
+      for (const a of body.onConflict.assignments)
+        n += countSelfRefsExpr(a.value, name);
+      if (body.onConflict.filter !== null)
+        n += countSelfRefsExpr(body.onConflict.filter, name);
+    }
+    return n + countReturningRefs(body.returning, name);
+  }
+  if (body.kind === "update") {
+    let n = 0;
+    for (const a of body.assignments) n += countSelfRefsExpr(a.value, name);
+    if (body.filter !== null) n += countSelfRefsExpr(body.filter, name);
+    return n + countReturningRefs(body.returning, name);
+  }
+  // delete
+  let n = 0;
+  if (body.filter !== null) n += countSelfRefsExpr(body.filter, name);
+  return n + countReturningRefs(body.returning, name);
+}
+
+// countReturningRefs counts references to CTE `name` in a RETURNING item list's sublinks.
+function countReturningRefs(
+  returning: SelectItems | null,
+  name: string,
+): number {
+  if (returning === null || returning.kind !== "list") return 0;
+  return returning.items.reduce(
+    (a, it) => a + countSelfRefsExpr(it.expr, name),
+    0,
+  );
+}
+
 // countSelfRefsQuery counts self-references to name anywhere in a query expression (deep — FROM
 // relations at every nesting level plus expression sublinks).
 function countSelfRefsQuery(qe: QueryExpr, name: string): number {
@@ -11617,8 +12077,23 @@ function cteSyntheticTable(
   plan: QueryPlan,
   rename: string[] | null,
 ): Table {
-  const bodyTypes = plan.columnTypes;
-  const bodyNames = plan.columnNames;
+  return cteSyntheticTableCols(
+    name,
+    plan.columnNames,
+    plan.columnTypes,
+    rename,
+  );
+}
+
+// cteSyntheticTableCols is the shared core of cteSyntheticTable, over explicit body column names +
+// types — so a data-modifying CTE (whose "body output" is its RETURNING projection, not a QueryPlan)
+// builds its synthetic relation the same way (spec/design/writable-cte.md §1).
+function cteSyntheticTableCols(
+  name: string,
+  bodyNames: string[],
+  bodyTypes: ResolvedType[],
+  rename: string[] | null,
+): Table {
   let colNames: string[];
   if (rename !== null) {
     // PostgreSQL allows FEWER aliases than the body has columns — the first `rename.length` columns
@@ -12005,6 +12480,9 @@ export function stmtIsWrite(stmt: Statement): boolean {
     stmt.kind === "insert" ||
     stmt.kind === "update" ||
     stmt.kind === "delete" ||
+    // A WITH statement with any data-modifying part is a write (it stages INSERT/UPDATE/DELETE effects
+    // — writable-cte.md): it must take the write gate, accumulate into working, and commit.
+    (stmt.kind === "with" && withHasDml(stmt)) ||
     // A read-shaped statement that calls nextval/setval IS a write (sequences.md §4): it must take
     // the write gate, stage the advance, and commit (autocommit) — and is 25006 in a READ ONLY
     // transaction, exactly like any other write.
@@ -12025,12 +12503,20 @@ function stmtCallsSeqMutator(stmt: Statement): boolean {
       return setOpCallsSeqMutator(stmt);
     case "with":
       return (
-        stmt.ctes.some((c) => queryCallsSeqMutator(c.query)) ||
-        queryCallsSeqMutator(stmt.body)
+        stmt.ctes.some((c) => cteBodyCallsSeqMutator(c.body)) ||
+        cteBodyCallsSeqMutator(stmt.body)
       );
     default:
       return false;
   }
+}
+
+// cteBodyCallsSeqMutator reports whether a cte_body calls a sequence-mutating function. A query body
+// delegates to the query walk; a data-modifying body already makes the WITH a write (via withHasDml),
+// so this is not reached for it — it is treated as a write regardless (writable-cte.md).
+function cteBodyCallsSeqMutator(body: CteBody): boolean {
+  const q = cteBodyAsQuery(body);
+  return q !== null ? queryCallsSeqMutator(q) : true;
 }
 
 function queryCallsSeqMutator(qe: QueryExpr): boolean {
@@ -12264,13 +12750,28 @@ function collectWithPrivs(
 ): void {
   // A CTE name shadows a base table inside the WITH (a FROM <cte> is not a catalog object), so it is
   // added to the local scope and never privilege-checked. Forward-only visibility: each CTE body sees
-  // the CTE names declared before it.
+  // the CTE names declared before it. A data-modifying body / primary needs the write privilege on
+  // its target table (writable-cte.md).
   const scope = new Set(locals);
   for (const cte of wq.ctes) {
-    collectQueryPrivs(cte.query, req, scope);
+    collectCteBodyPrivs(cte.body, req, scope);
     scope.add(cte.name.toLowerCase());
   }
-  collectQueryPrivs(wq.body, req, scope);
+  collectCteBodyPrivs(wq.body, req, scope);
+}
+
+// collectCteBodyPrivs collects the privilege requirements of a cte_body — a query, or a
+// data-modifying statement (spec/design/writable-cte.md) which needs the write privilege on its
+// target.
+function collectCteBodyPrivs(
+  body: CteBody,
+  req: PrivReq,
+  locals: Set<string>,
+): void {
+  if (body.kind === "insert") collectInsertPrivs(body, req, locals);
+  else if (body.kind === "update") collectUpdatePrivs(body, req, locals);
+  else if (body.kind === "delete") collectDeletePrivs(body, req, locals);
+  else collectQueryPrivs(body, req, locals);
 }
 
 function collectSelectPrivs(

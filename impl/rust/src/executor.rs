@@ -7,10 +7,9 @@
 use crate::ast::{
     AlterSeqAction, AlterSequence, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
-    DropTable, DropType,
-    Expr, Insert, InsertSource, InsertValue, JoinKind, Literal, OnConflict, OrderKey, Overriding,
-    QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind, Statement,
-    SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
+    DropTable, DropType, Expr, Insert, InsertSource, InsertValue, JoinKind, Literal, OnConflict,
+    OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp, SetOpKind,
+    Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -3751,9 +3750,13 @@ impl Database {
                 // order) and before binding/execution — a 42703 here beats a would-be 23505
                 // (grammar.md §32).
                 let ret = match &returning {
-                    Some(items) => {
-                        Some(self.resolve_returning(&table, items, false, ctx.bindings, &mut ptypes)?)
-                    }
+                    Some(items) => Some(self.resolve_returning(
+                        &table,
+                        items,
+                        false,
+                        ctx.bindings,
+                        &mut ptypes,
+                    )?),
                     None => None,
                 };
                 // Resolve the ON CONFLICT clause (its DO UPDATE SET/WHERE share this statement's
@@ -3865,9 +3868,13 @@ impl Database {
                 let mut plan =
                     self.plan_query(&QueryExpr::Select(sel), None, ctx.bindings, &mut ptypes)?;
                 let ret = match &returning {
-                    Some(items) => {
-                        Some(self.resolve_returning(&table, items, false, ctx.bindings, &mut ptypes)?)
-                    }
+                    Some(items) => Some(self.resolve_returning(
+                        &table,
+                        items,
+                        false,
+                        ctx.bindings,
+                        &mut ptypes,
+                    )?),
                     None => None,
                 };
                 let mut conflict_plan = match &on_conflict {
@@ -4248,7 +4255,10 @@ impl Database {
                     // A cross-sub-statement unique-index collision under the read pin (as above).
                     return Err(EngineError::new(
                         SqlState::UniqueViolation,
-                        format!("duplicate key value violates unique constraint: {}", def.name),
+                        format!(
+                            "duplicate key value violates unique constraint: {}",
+                            def.name
+                        ),
                     ));
                 }
             }
@@ -5971,9 +5981,24 @@ impl Database {
     ) -> Result<(Box<Table>, DmCte)> {
         let (table_name, returning, base_is_old, stmt): (&str, &Option<SelectItems>, bool, DmStmt) =
             match body {
-                CteBody::Insert(ins) => (&ins.table, &ins.returning, false, DmStmt::Insert(ins.clone())),
-                CteBody::Update(upd) => (&upd.table, &upd.returning, false, DmStmt::Update(upd.clone())),
-                CteBody::Delete(del) => (&del.table, &del.returning, true, DmStmt::Delete(del.clone())),
+                CteBody::Insert(ins) => (
+                    &ins.table,
+                    &ins.returning,
+                    false,
+                    DmStmt::Insert(ins.clone()),
+                ),
+                CteBody::Update(upd) => (
+                    &upd.table,
+                    &upd.returning,
+                    false,
+                    DmStmt::Update(upd.clone()),
+                ),
+                CteBody::Delete(del) => (
+                    &del.table,
+                    &del.returning,
+                    true,
+                    DmStmt::Delete(del.clone()),
+                ),
                 CteBody::Query(_) => unreachable!("plan_dm_cte requires a data-modifying body"),
             };
         let tdef = self.table(table_name).ok_or_else(|| {
@@ -5985,7 +6010,13 @@ impl Database {
         match returning {
             None => {
                 let table = cte_synthetic_table_cols(lname, &[], &[], rename)?;
-                Ok((table, DmCte { stmt, no_returning: true }))
+                Ok((
+                    table,
+                    DmCte {
+                        stmt,
+                        no_returning: true,
+                    },
+                ))
             }
             Some(items) => {
                 let mut scope = Scope::returning(self, tdef, base_is_old);
@@ -5993,7 +6024,13 @@ impl Database {
                 let (_, names, types) =
                     resolve_projections(&scope, items, &mut AggCtx::Forbidden, ptypes)?;
                 let table = cte_synthetic_table_cols(lname, &names, &types, rename)?;
-                Ok((table, DmCte { stmt, no_returning: false }))
+                Ok((
+                    table,
+                    DmCte {
+                        stmt,
+                        no_returning: false,
+                    },
+                ))
             }
         }
     }
@@ -6010,10 +6047,7 @@ impl Database {
         let bindings = self.plan_cte_bindings(&wq.ctes, wq.recursive, &mut ptypes)?;
         // (2) Plan the main body with all bindings visible (the pure-query path always has a query
         //     primary — a data-modifying primary routes to execute_with_dml).
-        let body_q = wq
-            .body
-            .as_query()
-            .expect("run_with is the pure-query path");
+        let body_q = wq.body.as_query().expect("run_with is the pure-query path");
         let mut plan = self.plan_query(body_q, None, &bindings, &mut ptypes)?;
         let bound = bind_params(params, &ptypes.finalize()?)?;
         let modes = cte_modes(&bindings);
@@ -6046,7 +6080,15 @@ impl Database {
         let mut buffers: Vec<Vec<Row>> = Vec::with_capacity(bindings.len());
         for i in 0..bindings.len() {
             let buf = if let Some(rt) = &bindings[i].recursive {
-                self.materialize_recursive(i, rt, modes, bindings, &buffers, bound, &mut total_cost)?
+                self.materialize_recursive(
+                    i,
+                    rt,
+                    modes,
+                    bindings,
+                    &buffers,
+                    bound,
+                    &mut total_cost,
+                )?
             } else {
                 match &bindings[i].source {
                     // A data-modifying CTE's buffer is filled by the orchestrator, not here.
@@ -6200,13 +6242,15 @@ impl Database {
         for cte in &ctes {
             if cte.body.is_data_modifying() {
                 for b in &bindings {
-                    b.refs.set(b.refs.get() + count_cte_refs_dml(&cte.body, &b.name));
+                    b.refs
+                        .set(b.refs.get() + count_cte_refs_dml(&cte.body, &b.name));
                 }
             }
         }
         if body.is_data_modifying() {
             for b in &bindings {
-                b.refs.set(b.refs.get() + count_cte_refs_dml(&body, &b.name));
+                b.refs
+                    .set(b.refs.get() + count_cte_refs_dml(&body, &b.name));
             }
         }
         let bound = bind_params(params, &ptypes.finalize()?)?;
@@ -6218,7 +6262,15 @@ impl Database {
         let mut buffers: Vec<Vec<Row>> = Vec::with_capacity(bindings.len());
         for i in 0..bindings.len() {
             let buf = if let Some(rt) = &bindings[i].recursive {
-                self.materialize_recursive(i, rt, &modes, &bindings, &buffers, &bound, &mut total_cost)?
+                self.materialize_recursive(
+                    i,
+                    rt,
+                    &modes,
+                    &bindings,
+                    &buffers,
+                    &bound,
+                    &mut total_cost,
+                )?
             } else if matches!(bindings[i].source, CteSource::Dml(_)) {
                 let ctx = CteCtx {
                     modes: &modes[..i],
@@ -6249,7 +6301,9 @@ impl Database {
         // (4) Execute the primary against the full CTE context, adding the materialization cost.
         let outcome = match body {
             CteBody::Query(_) => {
-                let mut plan = primary_plan.take().expect("a query primary was planned in (2)");
+                let mut plan = primary_plan
+                    .take()
+                    .expect("a query primary was planned in (2)");
                 let ctx = CteCtx {
                     modes: &modes,
                     bindings: &bindings,
@@ -10076,7 +10130,11 @@ fn count_cte_refs_dml(body: &CteBody, name: &str) -> usize {
                 InsertSource::Values(_) => 0,
             };
             if let Some(oc) = &ins.on_conflict {
-                if let ConflictAction::DoUpdate { assignments, filter } = &oc.action {
+                if let ConflictAction::DoUpdate {
+                    assignments,
+                    filter,
+                } = &oc.action
+                {
                     for a in assignments {
                         n += count_self_refs_expr(&a.value, name);
                     }

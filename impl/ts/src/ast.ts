@@ -681,30 +681,51 @@ export type SetOp = {
   offset: bigint | null;
 };
 
+// CteBody is the body of a CTE, or the WITH-prefixed primary statement (spec/design/writable-cte.md):
+// an ordinary query expression (a SELECT or set operation), or a DATA-MODIFYING statement (a writable
+// CTE — INSERT/UPDATE/DELETE). The variants are already disjoint by their `kind` tags (Select/SetOp
+// vs insert/update/delete), so the union needs no extra wrapper. `cteBodyAsQuery` returns the query
+// expression for a plain body (used by the recursive-CTE analysis and the pure-query WITH path);
+// `cteBodyIsDataModifying` reports whether a body is an INSERT/UPDATE/DELETE.
+export type CteBody = QueryExpr | Insert | Update | Delete;
+
+// cteBodyAsQuery returns the query expression if `body` is a plain query, else null (a
+// data-modifying body). Only a query body can be a recursive UNION shape (writable-cte.md §3).
+export function cteBodyAsQuery(body: CteBody): QueryExpr | null {
+  return body.kind === "select" || body.kind === "setOp" ? body : null;
+}
+
+// cteBodyIsDataModifying reports whether `body` is a data-modifying statement (INSERT/UPDATE/DELETE).
+export function cteBodyIsDataModifying(body: CteBody): boolean {
+  return body.kind === "insert" || body.kind === "update" || body.kind === "delete";
+}
+
 // Cte is one common table expression in a WITH list (spec/design/cte.md). A named, statement-local
-// relation backed by a query. `columns` is the optional column-rename list (renames the body's
-// output columns left to right; a count mismatch with MORE aliases is 42P10). `materialized` is the
-// explicit evaluation hint: true = MATERIALIZED, false = NOT MATERIALIZED, null = PostgreSQL's
-// default (inline a single-reference CTE, materialize a multi-reference one — cost.md §3). The body
-// is any query_expr (a SELECT or a set operation).
+// relation backed by a query or (spec/design/writable-cte.md) a data-modifying statement. `columns`
+// is the optional column-rename list (renames the body's output columns left to right; a count
+// mismatch with MORE aliases is 42P10). `materialized` is the explicit evaluation hint: true =
+// MATERIALIZED, false = NOT MATERIALIZED, null = PostgreSQL's default (inline a single-reference CTE,
+// materialize a multi-reference one — cost.md §3; a data-modifying CTE is always materialized, the
+// hint inert). The body is a cte_body.
 export type Cte = {
   name: string;
   columns: string[] | null;
   materialized: boolean | null;
-  query: QueryExpr;
+  body: CteBody;
 };
 
-// WithQuery is a top-level query prefixed by a WITH clause (spec/design/cte.md). `ctes` is the
+// WithQuery is a top-level statement prefixed by a WITH clause (spec/design/cte.md). `ctes` is the
 // non-empty list of common table expressions (each visible to later CTEs and to `body`); `body` is
-// the main query expression. Built only when a WITH is present — a plain query stays `Select`/
-// `SetOp`, so those paths are untouched (the SetOp precedent). `recursive` is the WITH RECURSIVE
-// flag (spec/design/recursive-cte.md): a flag on the whole list that ENABLES a CTE to reference
-// itself (lifting the forward-only 42P01); a CTE that does not reference itself is still an ordinary
+// the main statement — a query, or (spec/design/writable-cte.md) a data-modifying INSERT/UPDATE/DELETE
+// primary. Built only when a WITH is present — a plain query stays `Select`/`SetOp`, so those paths
+// are untouched (the SetOp precedent). `recursive` is the WITH RECURSIVE flag
+// (spec/design/recursive-cte.md): a flag on the whole list that ENABLES a CTE to reference itself
+// (lifting the forward-only 42P01); a CTE that does not reference itself is still an ordinary
 // non-recursive CTE.
 export type WithQuery = {
   kind: "with";
   ctes: Cte[];
-  body: QueryExpr;
+  body: CteBody;
   recursive: boolean;
 };
 

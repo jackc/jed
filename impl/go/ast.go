@@ -556,29 +556,49 @@ type SetOp struct {
 	Offset  *int64
 }
 
+// CteBody is the body of a CTE, or the WITH-prefixed primary statement
+// (spec/design/writable-cte.md): an ordinary query expression, or a data-modifying statement (a
+// writable CTE). Exactly one field is non-nil (the QueryExpr/InsertSource sum-type precedent); the
+// data-modifying variants carry the parsed INSERT/UPDATE/DELETE.
+type CteBody struct {
+	Query  *QueryExpr
+	Insert *Insert
+	Update *Update
+	Delete *Delete
+}
+
+// AsQuery returns the query expression when this body is a plain query, else nil — used by the
+// recursive-CTE analysis (only a query body can be a recursive UNION) and the pure-query WITH path.
+func (b *CteBody) AsQuery() *QueryExpr { return b.Query }
+
+// IsDataModifying reports whether this body is a data-modifying statement (INSERT/UPDATE/DELETE).
+func (b *CteBody) IsDataModifying() bool { return b.Query == nil }
+
 // Cte is one common table expression in a WITH list (spec/design/cte.md). A named, statement-local
-// relation backed by a query. Columns is the optional column-rename list (renames the body's output
-// columns left to right; a count mismatch is 42P10). Materialized is the explicit evaluation hint:
-// a non-nil pointer to true is MATERIALIZED, to false is NOT MATERIALIZED, nil is PostgreSQL's
-// default (inline a single-reference CTE, materialize a multi-reference one — cost.md §3). Query is
-// any query_expr (a SELECT or a set operation).
+// relation backed by a query or (spec/design/writable-cte.md) a data-modifying statement. Columns is
+// the optional column-rename list (renames the body's output columns left to right; a count mismatch
+// is 42P10). Materialized is the explicit evaluation hint: a non-nil pointer to true is MATERIALIZED,
+// to false is NOT MATERIALIZED, nil is PostgreSQL's default (inline a single-reference CTE,
+// materialize a multi-reference one — cost.md §3; a data-modifying CTE is always materialized, the
+// hint inert). Body is a cte_body.
 type Cte struct {
 	Name         string
 	Columns      []string
 	Materialized *bool
-	Query        QueryExpr
+	Body         CteBody
 }
 
-// WithQuery is a top-level query prefixed by a WITH clause (spec/design/cte.md). Ctes is the
+// WithQuery is a top-level statement prefixed by a WITH clause (spec/design/cte.md). Ctes is the
 // non-empty list of common table expressions (each visible to later CTEs and to Body); Body is the
-// main query expression. Built only when a WITH is present — a plain query stays Statement{Select}
-// / Statement{SetOp}, so those paths are untouched (the SetOp precedent). Recursive is the
-// WITH RECURSIVE flag (spec/design/recursive-cte.md): a flag on the whole list that ENABLES a CTE
-// to reference itself (lifting the forward-only 42P01); a CTE that does not reference itself is
-// still an ordinary non-recursive CTE.
+// main statement the CTEs prefix — a query, or (spec/design/writable-cte.md) a data-modifying
+// INSERT/UPDATE/DELETE primary. Built only when a WITH is present — a plain query stays
+// Statement{Select} / Statement{SetOp}, so those paths are untouched (the SetOp precedent).
+// Recursive is the WITH RECURSIVE flag (spec/design/recursive-cte.md): a flag on the whole list that
+// ENABLES a CTE to reference itself (lifting the forward-only 42P01); a CTE that does not reference
+// itself is still an ordinary non-recursive CTE.
 type WithQuery struct {
 	Ctes      []Cte
-	Body      QueryExpr
+	Body      CteBody
 	Recursive bool
 }
 

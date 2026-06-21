@@ -727,6 +727,13 @@ type Session struct {
 	// it does NOT roll back with a transaction (PG SET SESSION). The map is a reference type, so the
 	// activate() value swap keeps each session's own map (like the privilege envelope).
 	vars map[string]string
+	// readPin is the read pin for a data-modifying WITH statement (spec/design/writable-cte.md §2):
+	// the single pre-statement snapshot every sub-statement reads, so the data-modifying CTEs and the
+	// primary cannot observe each other's table writes (their writes still accumulate into the
+	// transaction's working). Set by the writable-CTE orchestrator before the first sub-statement runs
+	// and cleared when it finishes (success or error); nil for every other statement, where reads fall
+	// through to working/committed as usual (readSnap).
+	readPin *Snapshot
 }
 
 // requireCustomVarName validates + canonicalizes a session-variable name (spec/design/session.md
@@ -805,9 +812,14 @@ func WithPageSize(pageSize uint32) *Database {
 	return &Database{committed: newSnapshot(), pageSize: pageSize, session: newSession()}
 }
 
-// readSnap is the snapshot a read sees: the open transaction's working (read-your-writes for a
-// writable tx; the pinned snapshot for a read-only tx), else the committed snapshot.
+// readSnap is the snapshot a read sees: the read pin if one is set (a data-modifying WITH statement
+// pins the pre-statement snapshot so every sub-statement reads it — writable-cte.md §2), else the
+// open transaction's working (read-your-writes for a writable tx; the pinned snapshot for a
+// read-only tx), else the committed snapshot.
 func (db *Database) readSnap() *Snapshot {
+	if db.session.readPin != nil {
+		return db.session.readPin
+	}
 	if db.session.tx != nil {
 		return db.session.tx.working
 	}
@@ -1646,6 +1658,11 @@ func stmtIsWrite(stmt Statement) bool {
 		stmt.Insert != nil || stmt.Update != nil || stmt.Delete != nil {
 		return true
 	}
+	// A WITH statement with any data-modifying part is a write (it stages INSERT/UPDATE/DELETE effects
+	// — writable-cte.md): it must take the write gate, accumulate into working, and commit.
+	if stmt.With != nil && withHasDml(stmt.With) {
+		return true
+	}
 	// A read-shaped statement that calls a sequence-mutating function (nextval/setval) IS a write
 	// (spec/design/sequences.md §4): it must take the write gate, stage the advance, and commit
 	// (autocommit) — and is 25006 in a READ ONLY transaction, exactly like any other write.
@@ -1666,14 +1683,25 @@ func stmtCallsSeqMutator(stmt Statement) bool {
 		return setopCallsSeqMutator(stmt.SetOp)
 	case stmt.With != nil:
 		for i := range stmt.With.Ctes {
-			if queryCallsSeqMutator(&stmt.With.Ctes[i].Query) {
+			if cteBodyCallsSeqMutator(&stmt.With.Ctes[i].Body) {
 				return true
 			}
 		}
-		return queryCallsSeqMutator(&stmt.With.Body)
+		return cteBodyCallsSeqMutator(&stmt.With.Body)
 	default:
 		return false
 	}
+}
+
+// cteBodyCallsSeqMutator reports whether a cte_body calls a sequence-mutating function. A query body
+// delegates to the query walk; a data-modifying body already makes the WITH a write (via withHasDml),
+// so this is not reached for it via stmtCallsSeqMutator — it is treated as a write regardless
+// (writable-cte.md).
+func cteBodyCallsSeqMutator(body *CteBody) bool {
+	if body.Query != nil {
+		return queryCallsSeqMutator(body.Query)
+	}
+	return true
 }
 
 func queryCallsSeqMutator(qe *QueryExpr) bool {
@@ -1996,16 +2024,33 @@ func collectSetopPrivs(so *SetOp, req *privReq, locals map[string]bool) {
 func collectWithPrivs(wq *WithQuery, req *privReq, locals map[string]bool) {
 	// A CTE name shadows a base table inside the WITH (a FROM <cte> is not a catalog object), so it is
 	// added to the local scope and never privilege-checked. Forward-only visibility: each CTE body
-	// sees the CTE names declared before it.
+	// sees the CTE names declared before it. A data-modifying body / primary needs the write privilege
+	// on its target table (writable-cte.md).
 	scope := map[string]bool{}
 	for k := range locals {
 		scope[k] = true
 	}
 	for i := range wq.Ctes {
-		collectQueryPrivs(&wq.Ctes[i].Query, req, scope)
+		collectCteBodyPrivs(&wq.Ctes[i].Body, req, scope)
 		scope[strings.ToLower(wq.Ctes[i].Name)] = true
 	}
-	collectQueryPrivs(&wq.Body, req, scope)
+	collectCteBodyPrivs(&wq.Body, req, scope)
+}
+
+// collectCteBodyPrivs collects the privilege requirements of a cte_body — a query, or a
+// data-modifying statement (spec/design/writable-cte.md) which needs the write privilege on its
+// target.
+func collectCteBodyPrivs(body *CteBody, req *privReq, locals map[string]bool) {
+	switch {
+	case body.Query != nil:
+		collectQueryPrivs(body.Query, req, locals)
+	case body.Insert != nil:
+		collectInsertPrivs(body.Insert, req, locals)
+	case body.Update != nil:
+		collectUpdatePrivs(body.Update, req, locals)
+	default:
+		collectDeletePrivs(body.Delete, req, locals)
+	}
 }
 
 func collectSelectPrivs(s *Select, req *privReq, locals map[string]bool) {
@@ -2336,7 +2381,7 @@ func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error
 		}
 		return db.executeDropSequence(stmt.DropSequence)
 	case stmt.Insert != nil:
-		return db.executeInsert(stmt.Insert, params)
+		return db.executeInsert(stmt.Insert, params, cteCtx{})
 	case stmt.Select != nil:
 		return db.executeSelect(stmt.Select, params)
 	case stmt.SetOp != nil:
@@ -2344,9 +2389,9 @@ func (db *Database) dispatchStmt(stmt Statement, params []Value) (Outcome, error
 	case stmt.With != nil:
 		return db.executeWith(stmt.With, params)
 	case stmt.Update != nil:
-		return db.executeUpdate(stmt.Update, params)
+		return db.executeUpdate(stmt.Update, params, cteCtx{})
 	case stmt.Delete != nil:
-		return db.executeDelete(stmt.Delete, params)
+		return db.executeDelete(stmt.Delete, params, cteCtx{})
 	default:
 		return Outcome{}, NewError(SyntaxError, "empty statement")
 	}
@@ -4314,7 +4359,7 @@ func (db *Database) rowConflictsCommitted(store *TableStore, table *Table, pk []
 	return false, nil
 }
 
-func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) {
+func (db *Database) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outcome, error) {
 	table, ok := db.Table(ins.Table)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ins.Table)
@@ -4406,8 +4451,10 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		// so a $N shared by the source and the RETURNING list unifies statement-wide (api.md
 		// §5). The source returns OWNED rows, so a self-insert (INSERT INTO t SELECT ... FROM
 		// t) reads the pre-insert snapshot, then writes.
+		// The source query (and the RETURNING sublinks) see the statement's CTE bindings
+		// (writable-cte.md) — the move-rows idiom INSERTs a SELECT over a CTE buffer.
 		ptypes := &paramTypes{}
-		plan, err := db.planQuery(QueryExpr{Select: ins.Select}, nil, nil, ptypes)
+		plan, err := db.planQuery(QueryExpr{Select: ins.Select}, nil, ctx.bindings, ptypes)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -4415,7 +4462,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		var retNames []string
 		var retTypes []string
 		if ins.Returning != nil {
-			if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ptypes); err != nil {
+			if retNodes, retNames, retTypes, err = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes); err != nil {
 				return Outcome{}, err
 			}
 		}
@@ -4434,20 +4481,21 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 			return Outcome{}, err
 		}
 		meter := db.session.newMeter()
-		if err := db.foldUncorrelatedInPlan(&plan, bound, cteCtx{}, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInPlan(&plan, bound, ctx, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 		// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
-		// pre-statement snapshot (grammar.md §32).
+		// pre-statement snapshot (grammar.md §32). They see the statement's CTE bindings
+		// (writable-cte.md) via ctx.
 		for _, node := range retNodes {
-			if err := db.foldUncorrelatedInRExpr(node, bound, cteCtx{}, &meter.Accrued); err != nil {
+			if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
 				return Outcome{}, err
 			}
 		}
 		if err := db.foldConflictPlan(cplan, bound, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
-		q, err := db.execQueryPlan(&plan, nil, bound, cteCtx{})
+		q, err := db.execQueryPlan(&plan, nil, bound, ctx)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -4496,7 +4544,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		// RETURNING projection; storing the rows themselves stays unmetered. One meter keeps
 		// one ceiling over the whole statement.
 		meter.Charge(q.cost)
-		affected, returned, err := db.runInsertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, q.rows, cplan, retNodes, bound, meter)
+		affected, returned, err := db.runInsertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, q.rows, cplan, retNodes, bound, ctx, meter)
 		if err != nil {
 			return Outcome{}, err
 		}
@@ -4556,7 +4604,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 	var retTypes []string
 	if ins.Returning != nil {
 		var rerr error
-		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *ins.Returning, false, ptypes); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *ins.Returning, false, ctx.bindings, ptypes); rerr != nil {
 			return Outcome{}, rerr
 		}
 	}
@@ -4616,16 +4664,16 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 		rows = append(rows, rv)
 	}
 	// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
-	// pre-statement snapshot (grammar.md §32).
+	// pre-statement snapshot (grammar.md §32). They see the statement's CTE bindings via ctx.
 	for _, node := range retNodes {
-		if err := db.foldUncorrelatedInRExpr(node, bound, cteCtx{}, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
 	if err := db.foldConflictPlan(cplan, bound, &meter.Accrued); err != nil {
 		return Outcome{}, err
 	}
-	affected, returned, err := db.runInsertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, meter)
+	affected, returned, err := db.runInsertRows(table, store, pk, checks, defaultExprs, stmtRng, provided, rows, cplan, retNodes, bound, ctx, meter)
 	if err != nil {
 		return Outcome{}, err
 	}
@@ -4645,7 +4693,7 @@ func (db *Database) executeInsert(ins *Insert, params []Value) (Outcome, error) 
 // validated rows after every check passes and BEFORE phase 2 writes — so its subqueries
 // observe the pre-statement snapshot and a ceiling abort stays all-or-nothing; params feeds
 // its $Ns. Returns the projected output rows, nil without a clause.
-func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, meter *Meter) ([][]Value, error) {
+func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) ([][]Value, error) {
 	n := len(table.Columns)
 	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
 	// mutation; nil everywhere for a C-only / non-text table (the fast path).
@@ -4727,7 +4775,11 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 				return nil, NewError(UniqueViolation,
 					"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 			}
-			if _, exists, err := store.Get(key); err != nil {
+			// The duplicate probe reads the pin (readSnap) — under the writable-CTE read pin
+			// (writable-cte.md §2) it sees the PRE-statement table, not an earlier sub-statement's
+			// staged rows; a cross-sub-statement key collision is caught in phase 2 below instead.
+			// readSnap == working for an ordinary INSERT, so this is unchanged there.
+			if _, exists, err := db.readSnap().store(table.Name).Get(key); err != nil {
 				return nil, err
 			} else if exists {
 				return nil, NewError(UniqueViolation,
@@ -4839,7 +4891,7 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			prows[i] = prepared[i].row
 		}
 		var err error
-		if returned, err = db.projectReturning(returning, prows, nil, params, meter); err != nil {
+		if returned, err = db.projectReturning(returning, prows, nil, params, ctes, meter); err != nil {
 			return nil, err
 		}
 	}
@@ -4868,7 +4920,13 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 			return nil, err
 		}
 		if !ok {
-			panic("pre-validated INSERT key must be unique")
+			// A collision here can only happen under the writable-CTE read pin (writable-cte.md §7):
+			// an EARLIER data-modifying sub-statement of the same WITH staged this key, which phase 1
+			// (reading the pin) did not see. Matches PostgreSQL's unique violation; the whole statement
+			// aborts all-or-nothing. For a single statement, phase 1 already caught every duplicate, so
+			// this is never reached.
+			return nil, NewError(UniqueViolation,
+				"duplicate key value violates unique constraint: "+strings.ToLower(table.Name)+"_pkey")
 		}
 	}
 	for k, def := range table.Indexes {
@@ -4879,7 +4937,9 @@ func (db *Database) insertRows(table *Table, store *TableStore, pk []int, checks
 				return nil, err
 			}
 			if !inserted {
-				panic("index entry keys are unique (storage-key suffix)")
+				// A cross-sub-statement unique-index collision under the read pin (as above).
+				return nil, NewError(UniqueViolation,
+					"duplicate key value violates unique constraint: "+def.Name)
 			}
 		}
 	}
@@ -4908,11 +4968,11 @@ func (db *Database) foldConflictPlan(plan *conflictPlan, bound []Value, accrued 
 // runInsertRows dispatches the validated candidate rows to the plain or the ON CONFLICT insert
 // path, shared by both INSERT sources. Returns (rows affected, RETURNING rows): a plain insert
 // affects every candidate row; an ON CONFLICT may insert, update, or skip (spec/design/upsert.md §3).
-func (db *Database) runInsertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, meter *Meter) (int64, [][]Value, error) {
+func (db *Database) runInsertRows(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, conflict *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) (int64, [][]Value, error) {
 	if conflict != nil {
-		return db.insertRowsOnConflict(table, store, pk, checks, defaultExprs, rng, provided, rows, conflict, returning, params, meter)
+		return db.insertRowsOnConflict(table, store, pk, checks, defaultExprs, rng, provided, rows, conflict, returning, params, ctes, meter)
 	}
-	returned, err := db.insertRows(table, store, pk, checks, defaultExprs, rng, provided, rows, returning, params, meter)
+	returned, err := db.insertRows(table, store, pk, checks, defaultExprs, rng, provided, rows, returning, params, ctes, meter)
 	if err != nil {
 		return 0, nil, err
 	}
@@ -4925,7 +4985,7 @@ func (db *Database) runInsertRows(table *Table, store *TableStore, pk []int, che
 // inserts + updates are then validated against the statement END STATE (PK / unique / CHECK / FK)
 // before phase 2 writes anything (all-or-nothing). returning projects the AFFECTED rows (inserts
 // with an all-NULL old side, updates with their pre-update existing row).
-func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, meter *Meter) (int64, [][]Value, error) {
+func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []int, checks []namedCheck, defaultExprs []*rExpr, rng *StmtRng, provided []int, rows [][]Value, plan *conflictPlan, returning []*rExpr, params []Value, ctes cteCtx, meter *Meter) (int64, [][]Value, error) {
 	n := len(table.Columns)
 	relation := table.Name
 	// Per-column frozen collations for the collated text key form (§2.12), resolved before any
@@ -5355,7 +5415,7 @@ func (db *Database) insertRowsOnConflict(table *Table, store *TableStore, pk []i
 			olds = append(olds, u.oldRow)
 		}
 		var err error
-		if returned, err = db.projectReturning(returning, prows, olds, params, meter); err != nil {
+		if returned, err = db.projectReturning(returning, prows, olds, params, ctes, meter); err != nil {
 			return 0, nil, err
 		}
 	}
@@ -5462,8 +5522,9 @@ func defaultOrNull(col Column) Value {
 // The scope is the RETURNING scope (returningScope — the table at offset 0 plus the
 // old/new qualifier-only pseudo-relations over the [base | other] projection row, with
 // baseIsOld true for DELETE).
-func (db *Database) resolveReturning(table *Table, items SelectItems, baseIsOld bool, ptypes *paramTypes) ([]*rExpr, []string, []string, error) {
+func (db *Database) resolveReturning(table *Table, items SelectItems, baseIsOld bool, ctes []*cteBinding, ptypes *paramTypes) ([]*rExpr, []string, []string, error) {
 	s := returningScope(db, table, baseIsOld)
+	s.ctes = ctes
 	nodes, names, types, err := resolveProjections(s, items, &aggCtx{collecting: false}, ptypes)
 	if err != nil {
 		return nil, nil, nil, err
@@ -5479,8 +5540,8 @@ func (db *Database) resolveReturning(table *Table, items SelectItems, baseIsOld 
 // The evaluation row is the concatenation [base | other] the RETURNING scope resolved
 // against: others[i] is the row's opposite version (UPDATE's old rows), nil the all-NULL
 // row (INSERT's old side, DELETE's new side).
-func (db *Database) projectReturning(nodes []*rExpr, rows []Row, others []Row, params []Value, meter *Meter) ([][]Value, error) {
-	env := &evalEnv{exec: db, params: params, rng: newStmtRng()}
+func (db *Database) projectReturning(nodes []*rExpr, rows []Row, others []Row, params []Value, ctes cteCtx, meter *Meter) ([][]Value, error) {
+	env := &evalEnv{exec: db, params: params, rng: newStmtRng(), ctes: ctes}
 	out := make([][]Value, 0, len(rows))
 	for i, row := range rows {
 		if err := meter.Guard(); err != nil {
@@ -5527,7 +5588,7 @@ func dmlOutcome(retNames []string, retTypes []string, returned [][]Value, affect
 // collect the keys of matching rows (only a TRUE predicate matches — Kleene), then
 // remove them. No WHERE deletes every row. Keys are collected before mutating so the
 // map is not modified while iterating.
-func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) {
+func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outcome, error) {
 	table, ok := db.Table(del.Table)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
@@ -5537,8 +5598,10 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	colls := db.columnCollations(table.Columns)
 	// DELETE is single-table; resolve its WHERE against a one-relation scope. The RETURNING
 	// projection resolves after it (PostgreSQL's analysis order), against the same scope
-	// (grammar.md §32).
+	// (grammar.md §32). The statement's CTE bindings (writable-cte.md) are visible so a WHERE /
+	// RETURNING sublink may reference an earlier CTE.
 	s := singleScope(db, table)
+	s.ctes = ctx.bindings
 	ptypes := &paramTypes{}
 	var filter *rExpr
 	if del.Filter != nil {
@@ -5553,7 +5616,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	var retTypes []string
 	if del.Returning != nil {
 		var rerr error
-		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *del.Returning, true, ptypes); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *del.Returning, true, ctx.bindings, ptypes); rerr != nil {
 			return Outcome{}, rerr
 		}
 	}
@@ -5573,19 +5636,23 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 	// Each scanned row and each filter evaluation accrues cost (CLAUDE.md §13; cost.md §3).
 	meter := db.session.newMeter()
 	if filter != nil {
-		if err := db.foldUncorrelatedInRExpr(filter, bound, cteCtx{}, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(filter, bound, ctx, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
 	// Uncorrelated subqueries in the RETURNING list fold once (cost.md §3), reading the
 	// pre-statement snapshot (grammar.md §32).
 	for _, node := range retNodes {
-		if err := db.foldUncorrelatedInRExpr(node, bound, cteCtx{}, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
-	env := &evalEnv{exec: db, params: bound, rng: newStmtRng()}
-	store := db.working().store(del.Table)
+	env := &evalEnv{exec: db, params: bound, rng: newStmtRng(), ctes: ctx}
+	// The scan reads the pin (readSnap) — under the writable-CTE read pin (writable-cte.md §2) a
+	// DELETE sees the PRE-statement rows, not an earlier sub-statement's table writes; phase 2 below
+	// writes into working. readSnap == working for an ordinary DELETE, so the scan is unchanged there.
+	store := db.readSnap().store(del.Table)
+	writeStore := db.working().store(del.Table)
 	// matched collects (key, row) pairs before mutating; the rows feed phase 2's
 	// index-entry removal (indexed columns are fixed-width and always resident).
 	type matchedRow struct {
@@ -5716,14 +5783,15 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 		for i := range matched {
 			prows[i] = matched[i].row
 		}
-		if returned, err = db.projectReturning(retNodes, prows, nil, bound, meter); err != nil {
+		if returned, err = db.projectReturning(retNodes, prows, nil, bound, ctx, meter); err != nil {
 			return Outcome{}, err
 		}
 	}
 	// Phase 2: remove the rows, then their secondary-index entries (indexes.md §4 —
-	// unmetered write work; an index removal cannot fail).
+	// unmetered write work; an index removal cannot fail). Writes land in working (writeStore), even
+	// when the scan above read the pin.
 	for _, m := range matched {
-		if _, err := store.Remove(m.key); err != nil {
+		if _, err := writeStore.Remove(m.key); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -5750,7 +5818,7 @@ func (db *Database) executeDelete(del *Delete, params []Value) (Outcome, error) 
 // writes. Phase 2 applies. Assigning a PRIMARY KEY column traps 0A000 (the storage
 // key must not change this slice); a duplicate target column traps 42701. No WHERE
 // updates every row.
-func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) {
+func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outcome, error) {
 	table, ok := db.Table(upd.Table)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+upd.Table)
@@ -5759,8 +5827,11 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	// probe and the index-entry move path.
 	colls := db.columnCollations(table.Columns)
 	// UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
-	// shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
+	// shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine). The
+	// statement's CTE bindings (writable-cte.md) are visible so a SET / WHERE / RETURNING sublink may
+	// reference an earlier CTE.
 	s := singleScope(db, table)
+	s.ctes = ctx.bindings
 	ptypes := &paramTypes{}
 
 	// Resolve assignments up front (fail fast, deterministic). The 0A000 guard covers
@@ -5828,7 +5899,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	var retTypes []string
 	if upd.Returning != nil {
 		var rerr error
-		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *upd.Returning, false, ptypes); rerr != nil {
+		if retNodes, retNames, retTypes, rerr = db.resolveReturning(table, *upd.Returning, false, ctx.bindings, ptypes); rerr != nil {
 			return Outcome{}, rerr
 		}
 	}
@@ -5858,22 +5929,26 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	// the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
 	meter := db.session.newMeter()
 	for i := range plans {
-		if err := db.foldUncorrelatedInRExpr(plans[i].source, bound, cteCtx{}, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(plans[i].source, bound, ctx, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
 	if filter != nil {
-		if err := db.foldUncorrelatedInRExpr(filter, bound, cteCtx{}, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(filter, bound, ctx, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
 	for _, node := range retNodes {
-		if err := db.foldUncorrelatedInRExpr(node, bound, cteCtx{}, &meter.Accrued); err != nil {
+		if err := db.foldUncorrelatedInRExpr(node, bound, ctx, &meter.Accrued); err != nil {
 			return Outcome{}, err
 		}
 	}
-	env := &evalEnv{exec: db, params: bound, rng: newStmtRng()}
-	store := db.working().store(upd.Table)
+	env := &evalEnv{exec: db, params: bound, rng: newStmtRng(), ctes: ctx}
+	// The scan + per-row column resolution read the pin (readSnap) — under the writable-CTE read pin
+	// (writable-cte.md §2) an UPDATE sees the PRE-statement rows; phase 2 below writes into working.
+	// readSnap == working for an ordinary UPDATE, so this is unchanged there.
+	store := db.readSnap().store(upd.Table)
+	writeStore := db.working().store(upd.Table)
 	// Each entry is (key, new row, OLD row) — the old row feeds the index maintenance.
 	type pending struct {
 		key    []byte
@@ -6196,7 +6271,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 			prows[i] = updates[i].row
 			olds[i] = updates[i].oldRow
 		}
-		if returned, err = db.projectReturning(retNodes, prows, olds, bound, meter); err != nil {
+		if returned, err = db.projectReturning(retNodes, prows, olds, bound, ctx, meter); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -6230,9 +6305,10 @@ func (db *Database) executeUpdate(upd *Update, params []Value) (Outcome, error) 
 	}
 
 	// Phase 2: apply (keys unchanged — a PK column can't be assigned), then move the
-	// changed index entries (unmetered write work; cannot fail).
+	// changed index entries (unmetered write work; cannot fail). Writes land in working (writeStore),
+	// even when the scan above read the pin.
 	for _, u := range updates {
-		if err := store.Replace(u.key, u.row); err != nil {
+		if err := writeStore.Replace(u.key, u.row); err != nil {
 			return Outcome{}, err
 		}
 	}
@@ -6315,6 +6391,13 @@ func (db *Database) executeSetOp(so *SetOp, params []Value) (Outcome, error) {
 // executeWith runs a WITH query (spec/design/cte.md) — the host-API entry point; runWith does the
 // CTE orchestration.
 func (db *Database) executeWith(wq *WithQuery, params []Value) (Outcome, error) {
+	// A WITH containing any data-modifying part (a data-modifying CTE or a data-modifying primary)
+	// runs through the writable-CTE orchestrator (spec/design/writable-cte.md): it pins the
+	// pre-statement snapshot and runs the parts in lexical order, all-or-nothing. A pure-query WITH
+	// keeps the existing read-only path (cte.md) unchanged.
+	if withHasDml(wq) {
+		return db.executeWithDml(wq, params)
+	}
 	r, err := db.runWith(wq, params)
 	if err != nil {
 		return Outcome{}, err
@@ -6322,50 +6405,46 @@ func (db *Database) executeWith(wq *WithQuery, params []Value) (Outcome, error) 
 	return Outcome{Kind: OutcomeQuery, ColumnNames: r.columnNames, ColumnTypes: typeNames(r.columnTypes), Rows: r.rows, Cost: r.cost}, nil
 }
 
-// runWith runs a WITH query (spec/design/cte.md). The CTE orchestrator:
-// (1) PLAN each CTE body in order against the prefix of earlier bindings (parent = nil — a body is
-// an independent query, NOT correlated to a reference site), deriving each binding's synthetic
-// relation; (2) plan the main body with all bindings visible, threading the one paramTypes so $N
-// infers statement-wide; (3) decide each CTE's mode from its reference count + [NOT] MATERIALIZED
-// hint; (4) MATERIALIZE each referenced materialized CTE once, in list order, accruing its cost (a
-// later body sees the earlier buffers); (5) fold + EXECUTE the main body with the CTE context. Cost
-// composes like set operations — a sum of the parts.
-func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error) {
-	ptypes := &paramTypes{}
-	// (1) Plan each CTE body against the already-built prefix; build its synthetic relation.
-	//     Under WITH RECURSIVE (recursive-cte.md), a CTE that references its own name is RECURSIVE:
-	//     its binding is pushed BEFORE planning the recursive term, so the self-reference resolves to
-	//     it; the binding's plan is then the non-recursive (anchor) term and recursive carries the
-	//     recursive term. A non-self-referencing CTE (or any CTE in a non-RECURSIVE list) plans as
-	//     before — its name is NOT yet in scope for its own body (cte.md §2).
-	bindings := make([]*cteBinding, 0, len(wq.Ctes))
-	for i := range wq.Ctes {
-		cte := &wq.Ctes[i]
+// planCteBindings plans every CTE in a WITH list into bindings (spec/design/cte.md §2,
+// writable-cte.md). Each body is planned against the prefix of EARLIER bindings (parent = nil — a
+// body is an independent query, NOT correlated to a reference site). Under WITH RECURSIVE a query CTE
+// that references its own name is the recursive shape (its binding is pushed BEFORE planning the
+// recursive term, so the self-reference resolves to it). A data-modifying CTE body resolves only its
+// RETURNING schema here (its effect runs later, in the orchestrator) — a data-modifying body is never
+// the recursive UNION shape, so it is always non-recursive. The refs counters are bumped as later
+// query bodies / a query primary reference each binding (a data-modifying part's references are
+// static-counted by the orchestrator, since it is not planned here).
+func (db *Database) planCteBindings(ctes []Cte, recursive bool, ptypes *paramTypes) ([]*cteBinding, error) {
+	bindings := make([]*cteBinding, 0, len(ctes))
+	for i := range ctes {
+		cte := &ctes[i]
 		lname := strings.ToLower(cte.Name)
 		for _, b := range bindings {
 			if b.name == lname {
-				return selectResult{}, NewError(DuplicateAlias,
+				return nil, NewError(DuplicateAlias,
 					"WITH query name "+lname+" specified more than once")
 			}
 		}
 		isRecursive, unionAll := false, false
-		if wq.Recursive {
-			rec, ua, err := analyzeRecursiveCte(lname, cte.Query)
-			if err != nil {
-				return selectResult{}, err
+		if recursive {
+			if q := cte.Body.AsQuery(); q != nil {
+				rec, ua, err := analyzeRecursiveCte(lname, *q)
+				if err != nil {
+					return nil, err
+				}
+				isRecursive, unionAll = rec, ua
 			}
-			isRecursive, unionAll = rec, ua
 		}
 		if isRecursive {
 			// The body is `anchor UNION[ALL] recursive_term` (analyzeRecursiveCte verified).
-			so := cte.Query.SetOp
+			so := cte.Body.AsQuery().SetOp
 			anchorPlan, err := db.planQuery(so.Lhs, nil, bindings, ptypes)
 			if err != nil {
-				return selectResult{}, err
+				return nil, err
 			}
 			table, err := cteSyntheticTable(lname, &anchorPlan, cte.Columns)
 			if err != nil {
-				return selectResult{}, err
+				return nil, err
 			}
 			bindings = append(bindings, &cteBinding{
 				name: lname, table: table, plan: anchorPlan, hint: cte.Materialized,
@@ -6373,28 +6452,103 @@ func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error)
 			bi := len(bindings) - 1
 			rhsPlan, err := db.planQuery(so.Rhs, nil, bindings, ptypes)
 			if err != nil {
-				return selectResult{}, err
+				return nil, err
 			}
 			if err := checkRecursiveColumnTypes(&bindings[bi].plan, &rhsPlan, lname); err != nil {
-				return selectResult{}, err
+				return nil, err
 			}
 			bindings[bi].recursive = &recursiveTerm{plan: rhsPlan, unionAll: unionAll}
 			continue
 		}
-		plan, err := db.planQuery(cte.Query, nil, bindings, ptypes)
-		if err != nil {
-			return selectResult{}, err
+		if q := cte.Body.AsQuery(); q != nil {
+			plan, err := db.planQuery(*q, nil, bindings, ptypes)
+			if err != nil {
+				return nil, err
+			}
+			table, err := cteSyntheticTable(lname, &plan, cte.Columns)
+			if err != nil {
+				return nil, err
+			}
+			bindings = append(bindings, &cteBinding{
+				name: lname, table: table, plan: plan, hint: cte.Materialized,
+			})
+			continue
 		}
-		table, err := cteSyntheticTable(lname, &plan, cte.Columns)
+		// A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the synthetic
+		// relation + capture the statement to run later.
+		table, dm, err := db.planDmCte(lname, &cte.Body, bindings, cte.Columns, ptypes)
 		if err != nil {
-			return selectResult{}, err
+			return nil, err
 		}
 		bindings = append(bindings, &cteBinding{
-			name: lname, table: table, plan: plan, hint: cte.Materialized,
+			name: lname, table: table, dm: dm, hint: cte.Materialized,
 		})
 	}
-	// (2) Plan the main body with all bindings visible.
-	plan, err := db.planQuery(wq.Body, nil, bindings, ptypes)
+	return bindings, nil
+}
+
+// planDmCte plans a data-modifying CTE body (spec/design/writable-cte.md): resolve its RETURNING
+// schema (against the EARLIER bindings, so a RETURNING sublink may reference an earlier CTE) to build
+// the synthetic relation, and capture the statement to execute later. A body with no RETURNING yields
+// a zero-column relation flagged noReturning (a FROM reference to it is 0A000, §5). The target must
+// be a base table — a CTE name / missing table is 42P01 (§1).
+func (db *Database) planDmCte(lname string, body *CteBody, bindings []*cteBinding, rename []string, ptypes *paramTypes) (*Table, *dmCte, error) {
+	var tableName string
+	var returning *SelectItems
+	var baseIsOld bool
+	dm := &dmCte{}
+	switch {
+	case body.Insert != nil:
+		tableName, returning, baseIsOld = body.Insert.Table, body.Insert.Returning, false
+		dm.insert = body.Insert
+	case body.Update != nil:
+		tableName, returning, baseIsOld = body.Update.Table, body.Update.Returning, false
+		dm.update = body.Update
+	default:
+		tableName, returning, baseIsOld = body.Delete.Table, body.Delete.Returning, true
+		dm.delete = body.Delete
+	}
+	tdef, ok := db.Table(tableName)
+	if !ok {
+		return nil, nil, NewError(UndefinedTable, "table does not exist: "+tableName)
+	}
+	if returning == nil {
+		dm.noReturning = true
+		table, err := cteSyntheticTableCols(lname, nil, nil, rename)
+		if err != nil {
+			return nil, nil, err
+		}
+		return table, dm, nil
+	}
+	s := returningScope(db, tdef, baseIsOld)
+	s.ctes = bindings
+	_, names, types, err := resolveProjections(s, *returning, &aggCtx{collecting: false}, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	table, err := cteSyntheticTableCols(lname, names, types, rename)
+	if err != nil {
+		return nil, nil, err
+	}
+	return table, dm, nil
+}
+
+// runWith runs a pure-query WITH (spec/design/cte.md) — the path for a WITH with no data-modifying
+// part (a data-modifying WITH goes through executeWithDml). (1) PLAN every CTE binding against the
+// prefix; (2) plan the main body with all bindings visible; (3) decide each CTE's mode from its
+// reference count + [NOT] MATERIALIZED hint; (4) MATERIALIZE each referenced materialized CTE once,
+// in list order (a later body sees the earlier buffers); (5) fold + EXECUTE the main body with the
+// CTE context. Cost composes like set operations — a sum of the parts.
+func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error) {
+	ptypes := &paramTypes{}
+	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
+	if err != nil {
+		return selectResult{}, err
+	}
+	// (2) Plan the main body with all bindings visible (the pure-query path always has a query primary
+	//     — a data-modifying primary routes to executeWithDml).
+	bodyQ := wq.Body.AsQuery()
+	plan, err := db.planQuery(*bodyQ, nil, bindings, ptypes)
 	if err != nil {
 		return selectResult{}, err
 	}
@@ -6406,59 +6560,14 @@ func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error)
 	if err != nil {
 		return selectResult{}, err
 	}
-
-	// (3) Per-CTE evaluation mode: a RECURSIVE CTE is ALWAYS materialized (the working-table method
-	//     requires it; [NOT] MATERIALIZED is inert — recursive-cte.md §1). Otherwise a MATERIALIZED
-	//     hint or >=2 references -> Materialize, else Inline (cost.md §3). An unreferenced
-	//     non-recursive CTE is planned (errors surfaced) but not run.
-	modes := make([]cteMode, len(bindings))
-	plans := make([]queryPlan, len(bindings))
-	recursives := make([]*recursiveTerm, len(bindings))
-	for i, b := range bindings {
-		switch {
-		case b.recursive != nil:
-			modes[i] = cteMaterialize
-		case b.hint != nil && *b.hint:
-			modes[i] = cteMaterialize
-		case b.hint != nil && !*b.hint:
-			modes[i] = cteInline
-		case b.refs >= 2:
-			modes[i] = cteMaterialize
-		default:
-			modes[i] = cteInline
-		}
-		plans[i] = b.plan
-		recursives[i] = b.recursive
-	}
-
-	// (4) Materialize each CTE once, in list order, accruing cost; a later body sees the earlier
-	//     buffers. A RECURSIVE CTE iterates to a fixpoint (its self-reference reads the working
-	//     table); the per-statement cost ceiling (54P01) bounds it — recursive-cte.md §5.
-	var totalCost int64
-	buffers := make([][]Row, 0, len(plans))
-	for i := range plans {
-		var buf []Row
-		switch {
-		case recursives[i] != nil:
-			buf, err = db.materializeRecursive(i, &plans[i], recursives[i], modes, plans, buffers, bound, &totalCost)
-			if err != nil {
-				return selectResult{}, err
-			}
-		case modes[i] == cteMaterialize:
-			ctx := cteCtx{modes: modes[:i], plans: plans[:i], buffers: buffers}
-			cplan := plans[i]
-			r, err := db.execQueryPlan(&cplan, nil, bound, ctx)
-			if err != nil {
-				return selectResult{}, err
-			}
-			totalCost += r.cost
-			buf = rowsFromValues(r.rows)
-		}
-		buffers = append(buffers, buf)
+	modes := cteModes(bindings)
+	buffers, totalCost, err := db.materializeCtes(bindings, modes, bound)
+	if err != nil {
+		return selectResult{}, err
 	}
 
 	// (5) Fold + execute the main body against the full CTE context.
-	ctx := cteCtx{modes: modes, plans: plans, buffers: buffers}
+	ctx := cteCtx{modes: modes, bindings: bindings, buffers: buffers}
 	var subqueryCost int64
 	if err := db.foldUncorrelatedInPlan(&plan, bound, ctx, &subqueryCost); err != nil {
 		return selectResult{}, err
@@ -6471,15 +6580,50 @@ func (db *Database) runWith(wq *WithQuery, params []Value) (selectResult, error)
 	return r, nil
 }
 
+// materializeCtes materializes each CTE once, in list order (spec/design/cte.md §3) — the shared loop
+// for the pure-query and writable-CTE paths' query/recursive CTEs. A data-modifying CTE is NOT run
+// here (the orchestrator runs it for its effect — executeWithDml); its buffer slot is left empty for
+// the orchestrator to fill. Returns the filled buffers + the accrued materialization cost (a later
+// body sees the earlier buffers).
+func (db *Database) materializeCtes(bindings []*cteBinding, modes []cteMode, bound []Value) ([][]Row, int64, error) {
+	var totalCost int64
+	buffers := make([][]Row, 0, len(bindings))
+	for i := range bindings {
+		var buf []Row
+		switch {
+		case bindings[i].recursive != nil:
+			b, err := db.materializeRecursive(i, bindings[i].recursive, modes, bindings, buffers, bound, &totalCost)
+			if err != nil {
+				return nil, 0, err
+			}
+			buf = b
+		case bindings[i].isDml():
+			// A data-modifying CTE's buffer is filled by the orchestrator, not here.
+		case modes[i] == cteMaterialize:
+			ctx := cteCtx{modes: modes[:i], bindings: bindings[:i], buffers: buffers}
+			cplan := bindings[i].plan
+			r, err := db.execQueryPlan(&cplan, nil, bound, ctx)
+			if err != nil {
+				return nil, 0, err
+			}
+			totalCost += r.cost
+			buf = rowsFromValues(r.rows)
+		}
+		buffers = append(buffers, buf)
+	}
+	return buffers, totalCost, nil
+}
+
 // materializeRecursive materializes a RECURSIVE CTE by iterating to a fixpoint — the PostgreSQL
-// working-table method (spec/design/recursive-cte.md §4). anchorPlan is the non-recursive term; rt
-// the recursive term (which references this CTE, index ci). priorBuffers are the earlier CTEs'
-// materialized rows (visible to both terms). totalCost accrues every term evaluation's cost and
-// gates the per-statement ceiling between iterations, so a non-terminating recursion of cheap
-// iterations still aborts 54P01 at the identical accrued cost in every core (recursive-cte.md §5).
-func (db *Database) materializeRecursive(ci int, anchorPlan *queryPlan, rt *recursiveTerm,
-	modes []cteMode, plans []queryPlan, priorBuffers [][]Row, params []Value, totalCost *int64,
+// working-table method (spec/design/recursive-cte.md §4). rt is the recursive term (which references
+// this CTE, index ci); the anchor is bindings[ci].plan. priorBuffers are the earlier CTEs'
+// materialized rows (visible to both terms). totalCost accrues every term evaluation's cost and gates
+// the per-statement ceiling between iterations, so a non-terminating recursion of cheap iterations
+// still aborts 54P01 at the identical accrued cost in every core (recursive-cte.md §5).
+func (db *Database) materializeRecursive(ci int, rt *recursiveTerm,
+	modes []cteMode, bindings []*cteBinding, priorBuffers [][]Row, params []Value, totalCost *int64,
 ) ([]Row, error) {
+	anchorPlan := &bindings[ci].plan
 	maxCost := db.session.maxCost
 	guard := func(total int64) error {
 		if maxCost > 0 && total >= maxCost {
@@ -6493,7 +6637,7 @@ func (db *Database) materializeRecursive(ci int, anchorPlan *queryPlan, rt *recu
 	rhsTypes := rt.plan.columnTypes()
 
 	// Evaluate the anchor: its rows seed both the result and the first working table.
-	ctx0 := cteCtx{modes: modes[:ci], plans: plans[:ci], buffers: priorBuffers}
+	ctx0 := cteCtx{modes: modes[:ci], bindings: bindings[:ci], buffers: priorBuffers}
 	ar, err := db.execQueryPlan(anchorPlan, nil, params, ctx0)
 	if err != nil {
 		return nil, err
@@ -6533,7 +6677,7 @@ func (db *Database) materializeRecursive(ci int, anchorPlan *queryPlan, rt *recu
 	for len(working) > 0 {
 		rhsBuffers[ci] = working
 		working = nil
-		ctx := cteCtx{modes: modes[:ci+1], plans: plans[:ci+1], buffers: rhsBuffers}
+		ctx := cteCtx{modes: modes[:ci+1], bindings: bindings[:ci+1], buffers: rhsBuffers}
 		cplan := rt.plan
 		rr, err := db.execQueryPlan(&cplan, nil, params, ctx)
 		if err != nil {
@@ -6553,6 +6697,162 @@ func (db *Database) materializeRecursive(ci int, anchorPlan *queryPlan, rt *recu
 		}
 	}
 	return result, nil
+}
+
+// executeWithDml runs a data-modifying WITH statement (spec/design/writable-cte.md): a WITH
+// containing a data-modifying CTE and/or a data-modifying primary. It PINS the pre-statement snapshot
+// for every sub-statement's reads (§2 — so the parts cannot see each other's table writes; data
+// crosses only via a CTE's RETURNING buffer), runs the parts in lexical order, and returns the
+// primary's result. The whole statement is one all-or-nothing transaction — the autocommit (or block)
+// wrapper publishes the accumulated working only if this returns nil error (§6).
+func (db *Database) executeWithDml(wq *WithQuery, params []Value) (Outcome, error) {
+	// Pin the pre-statement snapshot. A write statement runs with a transaction open (autocommit
+	// opened one), and nothing is written yet, so the pin equals working == committed. Cleared on
+	// every exit path so the next statement reads normally.
+	db.session.readPin = db.readSnap().clone()
+	out, err := db.runWithDml(wq, params)
+	db.session.readPin = nil
+	return out, err
+}
+
+// runWithDml is the body of executeWithDml, run under the read pin. Plans every CTE binding + the
+// query primary, runs the data-modifying CTEs / materialized query CTEs in list order, then the
+// primary — every read against the pin, every write into the transaction's working.
+func (db *Database) runWithDml(wq *WithQuery, params []Value) (Outcome, error) {
+	ptypes := &paramTypes{}
+	// (1) Plan every CTE binding (query plans + data-modifying RETURNING schemas).
+	bindings, err := db.planCteBindings(wq.Ctes, wq.Recursive, ptypes)
+	if err != nil {
+		return Outcome{}, err
+	}
+	// (2) Plan a query primary now (to bump refs + surface resolution errors, incl. a 0A000 FROM
+	//     reference to a no-RETURNING data-modifying CTE). A data-modifying primary is resolved and
+	//     run later (it sees the bindings via the threaded context); its references are static-counted
+	//     in (2b).
+	var primaryPlan *queryPlan
+	if q := wq.Body.AsQuery(); q != nil {
+		p, perr := db.planQuery(*q, nil, bindings, ptypes)
+		if perr != nil {
+			return Outcome{}, perr
+		}
+		primaryPlan = &p
+	}
+	// (2b) Add the references each NON-planned data-modifying part (a data-modifying CTE body, or a
+	//      data-modifying primary) contributes to each binding, so the inline-vs-materialize decision
+	//      is correct for a query CTE referenced only by a data-modifying part (§3). Query bodies / a
+	//      query primary were already plan-counted in (1)/(2).
+	for i := range wq.Ctes {
+		if wq.Ctes[i].Body.IsDataModifying() {
+			for _, b := range bindings {
+				b.refs += countCteRefsDml(&wq.Ctes[i].Body, b.name)
+			}
+		}
+	}
+	if wq.Body.IsDataModifying() {
+		for _, b := range bindings {
+			b.refs += countCteRefsDml(&wq.Body, b.name)
+		}
+	}
+	ptys, err := ptypes.finalize()
+	if err != nil {
+		return Outcome{}, err
+	}
+	bound, err := bindParams(params, ptys)
+	if err != nil {
+		return Outcome{}, err
+	}
+	modes := cteModes(bindings)
+
+	// (3) Run each CTE in list order, filling its buffer. A data-modifying CTE executes for its effect
+	//     + RETURNING buffer; the query/recursive CTEs use the shared materialize loop's logic.
+	var totalCost int64
+	buffers := make([][]Row, 0, len(bindings))
+	for i := range bindings {
+		var buf []Row
+		switch {
+		case bindings[i].recursive != nil:
+			b, rerr := db.materializeRecursive(i, bindings[i].recursive, modes, bindings, buffers, bound, &totalCost)
+			if rerr != nil {
+				return Outcome{}, rerr
+			}
+			buf = b
+		case bindings[i].isDml():
+			ctx := cteCtx{modes: modes[:i], bindings: bindings[:i], buffers: buffers}
+			rows, cost, derr := db.execDmCte(i, bindings, bound, ctx)
+			if derr != nil {
+				return Outcome{}, derr
+			}
+			totalCost += cost
+			buf = rows
+		case modes[i] == cteMaterialize:
+			ctx := cteCtx{modes: modes[:i], bindings: bindings[:i], buffers: buffers}
+			cplan := bindings[i].plan
+			r, rerr := db.execQueryPlan(&cplan, nil, bound, ctx)
+			if rerr != nil {
+				return Outcome{}, rerr
+			}
+			totalCost += r.cost
+			buf = rowsFromValues(r.rows)
+		}
+		buffers = append(buffers, buf)
+	}
+
+	// (4) Execute the primary against the full CTE context, adding the materialization cost.
+	ctx := cteCtx{modes: modes, bindings: bindings, buffers: buffers}
+	var outcome Outcome
+	switch {
+	case wq.Body.AsQuery() != nil:
+		var subqueryCost int64
+		if err := db.foldUncorrelatedInPlan(primaryPlan, bound, ctx, &subqueryCost); err != nil {
+			return Outcome{}, err
+		}
+		r, rerr := db.execQueryPlan(primaryPlan, nil, bound, ctx)
+		if rerr != nil {
+			return Outcome{}, rerr
+		}
+		outcome = Outcome{
+			Kind:        OutcomeQuery,
+			ColumnNames: r.columnNames,
+			ColumnTypes: typeNames(r.columnTypes),
+			Rows:        r.rows,
+			Cost:        r.cost + subqueryCost,
+		}
+	case wq.Body.Insert != nil:
+		outcome, err = db.executeInsert(wq.Body.Insert, params, ctx)
+	case wq.Body.Update != nil:
+		outcome, err = db.executeUpdate(wq.Body.Update, params, ctx)
+	default:
+		outcome, err = db.executeDelete(wq.Body.Delete, params, ctx)
+	}
+	if err != nil {
+		return Outcome{}, err
+	}
+	return addOutcomeCost(outcome, totalCost), nil
+}
+
+// execDmCte executes a data-modifying CTE (spec/design/writable-cte.md §3): run the INSERT/UPDATE/
+// DELETE at binding i for its effect, with the earlier bindings/buffers in scope (so its inner
+// queries may reference an earlier CTE), and return its RETURNING rows (the buffer the later parts
+// scan) + its cost. A body with no RETURNING runs for its effect and buffers no rows.
+func (db *Database) execDmCte(i int, bindings []*cteBinding, params []Value, ctx cteCtx) ([]Row, int64, error) {
+	dm := bindings[i].dm
+	var outcome Outcome
+	var err error
+	switch {
+	case dm.insert != nil:
+		outcome, err = db.executeInsert(dm.insert, params, ctx)
+	case dm.update != nil:
+		outcome, err = db.executeUpdate(dm.update, params, ctx)
+	default:
+		outcome, err = db.executeDelete(dm.delete, params, ctx)
+	}
+	if err != nil {
+		return nil, 0, err
+	}
+	if outcome.Kind == OutcomeQuery {
+		return rowsFromValues(outcome.Rows), outcome.Cost, nil
+	}
+	return nil, outcome.Cost, nil
 }
 
 // === WITH RECURSIVE analysis (spec/design/recursive-cte.md) ==========================
@@ -6756,6 +7056,111 @@ func countSelfRefsExpr(e Expr, name string) int {
 	}
 }
 
+// withHasDml reports whether a WITH statement contains any data-modifying part — a data-modifying
+// CTE body or a data-modifying primary (spec/design/writable-cte.md). Such a statement runs through
+// the writable-CTE orchestrator (the read pin + lexical-order, all-or-nothing execution); a
+// pure-query WITH keeps the runWith path.
+func withHasDml(wq *WithQuery) bool {
+	if wq.Body.IsDataModifying() {
+		return true
+	}
+	for i := range wq.Ctes {
+		if wq.Ctes[i].Body.IsDataModifying() {
+			return true
+		}
+	}
+	return false
+}
+
+// cteModes returns each CTE binding's evaluation mode (spec/design/cte.md §3, writable-cte.md §3): a
+// RECURSIVE or data-modifying CTE is ALWAYS materialized; otherwise a MATERIALIZED hint or ≥2
+// references → Materialize, else Inline.
+func cteModes(bindings []*cteBinding) []cteMode {
+	modes := make([]cteMode, len(bindings))
+	for i, b := range bindings {
+		switch {
+		case b.recursive != nil || b.isDml():
+			modes[i] = cteMaterialize
+		case b.hint != nil && *b.hint:
+			modes[i] = cteMaterialize
+		case b.hint != nil && !*b.hint:
+			modes[i] = cteInline
+		case b.refs >= 2:
+			modes[i] = cteMaterialize
+		default:
+			modes[i] = cteInline
+		}
+	}
+	return modes
+}
+
+// addOutcomeCost adds extra cost to an outcome (the writable-CTE orchestrator folds the
+// materialization cost of the data-modifying / query CTEs into the primary's result —
+// spec/design/writable-cte.md §8).
+func addOutcomeCost(outcome Outcome, extra int64) Outcome {
+	outcome.Cost += extra
+	return outcome
+}
+
+// countCteRefsDml counts references to CTE name reachable through a cte_body's inner queries — the
+// writable-CTE analogue of countSelfRefsQuery (spec/design/writable-cte.md §3). A query body
+// delegates to the query counter; a data-modifying body counts the references in its source query /
+// WHERE / SET RHSs / ON CONFLICT / RETURNING sublinks. Used by the orchestrator to count the
+// references a NON-planned data-modifying part contributes to the inline-vs-materialize decision.
+func countCteRefsDml(body *CteBody, name string) int {
+	switch {
+	case body.Query != nil:
+		return countSelfRefsQuery(*body.Query, name)
+	case body.Insert != nil:
+		ins := body.Insert
+		n := 0
+		// VALUES slots hold literals / params / ROW / ARRAY (no sublinks this slice); only a SELECT
+		// source can reference a CTE.
+		if ins.Select != nil {
+			n += countSelfRefsSelect(ins.Select, name)
+		}
+		if ins.OnConflict != nil && ins.OnConflict.DoUpdate {
+			for i := range ins.OnConflict.Assignments {
+				n += countSelfRefsExpr(ins.OnConflict.Assignments[i].Value, name)
+			}
+			if ins.OnConflict.Filter != nil {
+				n += countSelfRefsExpr(*ins.OnConflict.Filter, name)
+			}
+		}
+		return n + countReturningRefs(ins.Returning, name)
+	case body.Update != nil:
+		upd := body.Update
+		n := 0
+		for i := range upd.Assignments {
+			n += countSelfRefsExpr(upd.Assignments[i].Value, name)
+		}
+		if upd.Filter != nil {
+			n += countSelfRefsExpr(*upd.Filter, name)
+		}
+		return n + countReturningRefs(upd.Returning, name)
+	default:
+		del := body.Delete
+		n := 0
+		if del.Filter != nil {
+			n += countSelfRefsExpr(*del.Filter, name)
+		}
+		return n + countReturningRefs(del.Returning, name)
+	}
+}
+
+// countReturningRefs counts references to CTE name in a RETURNING item list's sublinks (the star
+// form RETURNING * has no expressions, so it contributes none).
+func countReturningRefs(returning *SelectItems, name string) int {
+	if returning == nil || returning.All {
+		return 0
+	}
+	n := 0
+	for i := range returning.Items {
+		n += countSelfRefsExpr(returning.Items[i].Expr, name)
+	}
+	return n
+}
+
 // countDirectFromSelfRefs counts self-references that are DIRECT FROM/JOIN relations of this SELECT
 // (a plain table ref matching the name). This is the only valid position for a recursive reference.
 func countDirectFromSelfRefs(s *Select, name string) int {
@@ -6893,8 +7298,13 @@ func checkRecursiveColumnTypes(anchor, recursive *queryPlan, name string) error 
 // 42P10) or the body's own output names, typed from the planned body. The relation has no primary
 // key / constraints — it is read-only and its rows come from the CTE context, never a store.
 func cteSyntheticTable(name string, plan *queryPlan, rename []string) (*Table, error) {
-	bodyTypes := plan.columnTypes()
-	bodyNames := plan.columnNames()
+	return cteSyntheticTableCols(name, plan.columnNames(), plan.columnTypes(), rename)
+}
+
+// cteSyntheticTableCols is the shared core of cteSyntheticTable, over explicit body column names +
+// types — so a data-modifying CTE (whose "body output" is its RETURNING projection, not a queryPlan)
+// builds its synthetic relation the same way (spec/design/writable-cte.md §1).
+func cteSyntheticTableCols(name string, bodyNames []string, bodyTypes []resolvedType, rename []string) (*Table, error) {
 	var colNames []string
 	if rename != nil {
 		// PostgreSQL allows FEWER aliases than the body has columns — the first len(rename) columns
@@ -7620,6 +8030,13 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 				}
 			}
 			if ci >= 0 {
+				// A data-modifying CTE with no RETURNING produces no columns, so a FROM reference to
+				// it is 0A000 (writable-cte.md §5; PostgreSQL's addRangeTableEntryForCTE check), raised
+				// at resolution before any execution.
+				if ctes[ci].dm != nil && ctes[ci].dm.noReturning {
+					return nil, NewError(FeatureNotSupported,
+						"WITH query "+lname+" does not have a RETURNING clause")
+				}
 				ctes[ci].refs++
 				idx := ci
 				cteIdx = &idx
@@ -9306,7 +9723,9 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 			}
 			return append([]Row(nil), buf...), nil
 		case cteInline:
-			cplan := env.ctes.plans[ci]
+			// Only a plain (query) CTE is ever inlined; a data-modifying CTE is always materialized
+			// (writable-cte.md §3), so its buffer was filled above.
+			cplan := env.ctes.bindings[ci].plan
 			r, err := db.execQueryPlan(&cplan, outer, params, env.ctes)
 			if err != nil {
 				return nil, err
@@ -11203,21 +11622,42 @@ const (
 
 // cteBinding is a planned common table expression, owned by runWith for the whole statement
 // (spec/design/cte.md). name is lowercased for case-insensitive FROM matching; table is the
-// synthetic relation exposing the body's output columns; plan is the planned body; hint is the
-// [NOT] MATERIALIZED override (nil = default); refs counts the FROM references resolved to it during
-// planning (the inline-vs-materialize decision — cost.md §3).
+// synthetic relation exposing the body's output columns; source is the planned body (a query plan,
+// or — spec/design/writable-cte.md — a data-modifying statement); hint is the [NOT] MATERIALIZED
+// override (nil = default); refs counts the FROM references resolved to it during planning (the
+// inline-vs-materialize decision — cost.md §3).
 //
-// For a RECURSIVE CTE (spec/design/recursive-cte.md) plan holds the non-recursive (anchor) term
+// For a RECURSIVE CTE (spec/design/recursive-cte.md) source holds the non-recursive (anchor) term
 // (its column types fix the synthetic relation's) and recursive carries the recursive term + the
 // UNION ALL flag; the binding is in scope inside its own recursive term, so the self-reference
-// resolves to it.
+// resolves to it (refs then counts the self-reference too).
 type cteBinding struct {
-	name      string
-	table     *Table
-	plan      queryPlan
+	name  string
+	table *Table
+	// source is what this binding evaluates to (cte.md, writable-cte.md): a planned query body, or
+	// a data-modifying statement (dm non-nil). Exactly one of plan/dm is meaningful (selected by dm).
+	// A data-modifying CTE is always materialized (writable-cte.md §3), so the inline-execution path
+	// never touches a dm binding.
+	plan      queryPlan // valid when dm == nil
+	dm        *dmCte    // non-nil for a data-modifying CTE binding
 	recursive *recursiveTerm
 	hint      *bool
 	refs      int
+}
+
+// isDml reports whether this binding is a data-modifying CTE (its source is a statement, not a query
+// plan) — writable-cte.md.
+func (b *cteBinding) isDml() bool { return b.dm != nil }
+
+// dmCte is a data-modifying CTE's body (spec/design/writable-cte.md): the INSERT/UPDATE/DELETE to run
+// (cloned from the AST, executed with the statement's CTE context threaded in) and whether it has no
+// RETURNING clause — in which case a FROM reference to it is 0A000 (§5). Exactly one of
+// insert/update/delete is non-nil.
+type dmCte struct {
+	insert      *Insert
+	update      *Update
+	delete      *Delete
+	noReturning bool
 }
 
 // recursiveTerm is the recursive half of a WITH RECURSIVE CTE (spec/design/recursive-cte.md §4):
@@ -11229,15 +11669,17 @@ type recursiveTerm struct {
 }
 
 // cteCtx is the per-statement CTE execution context, threaded through exec* and evalEnv so a FROM
-// reference (any nesting depth) can deliver a CTE's rows (spec/design/cte.md §5). modes and plans
+// reference (any nesting depth) can deliver a CTE's rows (spec/design/cte.md §5). modes and bindings
 // are fixed after planning; buffers is filled before the main query runs — one slot per CTE in list
 // order, holding the materialized rows of a cteMaterialize CTE (an empty placeholder for a cteInline
-// one, whose body is run in place from plans instead). The zero value (all nil) is the empty
+// one, whose body is run in place from bindings[ci].plan instead). bindings also serves a
+// data-modifying CTE's own inner queries, which resolve against the earlier bindings when the
+// writable-CTE orchestrator executes them (writable-cte.md §2). The zero value (all nil) is the empty
 // context — no CTEs in scope (every non-WITH execution path).
 type cteCtx struct {
-	modes   []cteMode
-	plans   []queryPlan
-	buffers [][]Row
+	modes    []cteMode
+	bindings []*cteBinding
+	buffers  [][]Row
 }
 
 // planRel is one relation in a SELECT plan: the table name (looked up in the store at exec), the

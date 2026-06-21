@@ -101,7 +101,10 @@ fn data_modifying_cte_count_not_surfaced_under_select_primary() {
     );
     assert_eq!(r, vec![vec![Value::Int(3)]]);
     // ...and the insert still landed (always to completion, §3).
-    assert_eq!(rows(&mut db, "SELECT count(*) FROM t"), vec![vec![Value::Int(4)]]);
+    assert_eq!(
+        rows(&mut db, "SELECT count(*) FROM t"),
+        vec![vec![Value::Int(4)]]
+    );
 }
 
 // --- jed's deterministic last-write-wins on a same-row conflict (PG-unspecified, §7) ----------
@@ -120,9 +123,16 @@ fn same_row_two_updates_last_write_wins() {
               b AS (UPDATE t SET v = 200 WHERE id = 1 RETURNING v)
          SELECT v FROM a UNION ALL SELECT v FROM b",
     ));
-    assert_eq!(r, vec![100, 200], "both updates compute RETURNING from the pin");
+    assert_eq!(
+        r,
+        vec![100, 200],
+        "both updates compute RETURNING from the pin"
+    );
     // The committed value is the second (lexically later) write.
-    assert_eq!(rows(&mut db, "SELECT v FROM t WHERE id = 1"), vec![vec![Value::Int(200)]]);
+    assert_eq!(
+        rows(&mut db, "SELECT v FROM t WHERE id = 1"),
+        vec![vec![Value::Int(200)]]
+    );
 }
 
 #[test]
@@ -146,7 +156,11 @@ fn same_row_update_then_delete_delete_wins() {
               b AS (DELETE FROM t WHERE id = 1 RETURNING v)
          SELECT v FROM a UNION ALL SELECT v FROM b",
     ));
-    assert_eq!(r, vec![10, 100], "a returns the new value, b the pre-statement old value");
+    assert_eq!(
+        r,
+        vec![10, 100],
+        "a returns the new value, b the pre-statement old value"
+    );
     // id=1 is gone (the delete applied last).
     assert_eq!(i32s(rows(&mut db, "SELECT id FROM t")), vec![2, 3]);
 }

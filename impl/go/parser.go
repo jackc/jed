@@ -1782,11 +1782,62 @@ func (p *Parser) parseWithStatement() (Statement, error) {
 			break
 		}
 	}
-	body, err := p.parseQueryExprNode()
+	// The primary may be a data-modifying statement (spec/design/writable-cte.md): a leading
+	// INSERT/UPDATE/DELETE keyword selects it, otherwise a WITH-less query_expr.
+	body, err := p.parseCteBody(false)
 	if err != nil {
 		return Statement{}, err
 	}
 	return Statement{With: &WithQuery{Ctes: ctes, Body: body, Recursive: recursive}}, nil
+}
+
+// parseCteBody parses a cte_body (spec/design/writable-cte.md): a data-modifying
+// INSERT/UPDATE/DELETE when one leads, otherwise a query. parenthesized is true for a CTE body
+// inside ( … ) (the closing ) is the caller's), false for the WITH primary (it runs to end of
+// statement). A query body parsed here is the WITH-less query_expr (the top-level-only nested-WITH
+// narrowing — a nested WITH surfaces as a leftover 42601).
+func (p *Parser) parseCteBody(parenthesized bool) (CteBody, error) {
+	switch p.peekKeyword() {
+	case "insert", "update", "delete":
+		// A parenthesized data-modifying body counts one nesting level, like parseSubquery does for a
+		// parenthesized query body (grammar.md §48); the primary (parenthesized = false) runs at the
+		// statement top level and does not.
+		if parenthesized {
+			if err := p.deepen(); err != nil {
+				return CteBody{}, err
+			}
+		}
+		var body CteBody
+		var err error
+		switch p.peekKeyword() {
+		case "insert":
+			body.Insert, err = p.parseInsert()
+		case "update":
+			body.Update, err = p.parseUpdate()
+		default:
+			body.Delete, err = p.parseDelete()
+		}
+		if err != nil {
+			return CteBody{}, err
+		}
+		if parenthesized {
+			p.undeepen()
+		}
+		return body, nil
+	default:
+		if parenthesized {
+			q, err := p.parseSubquery()
+			if err != nil {
+				return CteBody{}, err
+			}
+			return CteBody{Query: &q}, nil
+		}
+		q, err := p.parseQueryExprNode()
+		if err != nil {
+			return CteBody{}, err
+		}
+		return CteBody{Query: &q}, nil
+	}
 }
 
 // parseCte parses one common table expression
@@ -1839,14 +1890,14 @@ func (p *Parser) parseCte() (Cte, error) {
 	if err := p.expect(TokLParen); err != nil {
 		return Cte{}, err
 	}
-	query, err := p.parseSubquery()
+	body, err := p.parseCteBody(true)
 	if err != nil {
 		return Cte{}, err
 	}
 	if err := p.expect(TokRParen); err != nil {
 		return Cte{}, err
 	}
-	return Cte{Name: name, Columns: columns, Materialized: materialized, Query: query}, nil
+	return Cte{Name: name, Columns: columns, Materialized: materialized, Body: body}, nil
 }
 
 // parseSubquery parses a parenthesized subquery's inner query_expr (grammar.md §26): a full

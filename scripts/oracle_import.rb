@@ -116,9 +116,14 @@ class OracleImport
         # A row-returning DML query record (INSERT/UPDATE/DELETE ... RETURNING —
         # grammar.md §32) mutates state like a `statement ok`, so its effects must reach
         # later records' replay prefix; SELECTs stay un-replayed (side-effect-free).
-        # Appended unconditionally, like `statement ok`: an overridden PG-failing DML
-        # query record must sit LAST in its file (conformance.md §5).
-        @applied << rewrite(sql.join) if sql.join =~ /\A\s*(insert|update|delete)\b/i
+        # A data-modifying WITH (writable-cte.md) is equally a write — it leads with WITH but
+        # contains an INSERT/UPDATE/DELETE — so it must replay too. Appended unconditionally, like
+        # `statement ok`: an overridden PG-failing DML query record must sit LAST (conformance.md §5).
+        joined = sql.join
+        is_dml_query = joined =~ /\A\s*(insert|update|delete)\b/i ||
+                       (joined =~ /\A\s*with\b/i &&
+                        joined =~ /\b(insert\s+into|update\b[\s\S]*\bset\b|delete\s+from)\b/i)
+        @applied << rewrite(joined) if is_dml_query
       else
         out << line # comment / blank / directive — pass through verbatim
         i += 1

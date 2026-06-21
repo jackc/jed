@@ -7,6 +7,7 @@ import type {
   BinaryOp,
   CheckDef,
   Cte,
+  CteBody,
   DefaultDef,
   ForeignKeyDef,
   RefAction,
@@ -1390,11 +1391,12 @@ class Parser {
     return { ...node, orderBy, limit, offset };
   }
 
-  // parseWithStatement parses `query_statement ::= with_clause? query_expr` — a top-level query
-  // prefixed by a WITH clause defining common table expressions (spec/design/cte.md). WITH RECURSIVE
-  // (spec/design/recursive-cte.md) sets the `recursive` flag and lets a CTE reference itself; the
-  // CTE bodies and the main body are WITH-less query_exprs (the top-level-only narrowing — a nested
-  // WITH surfaces as 42601 because a body must begin with SELECT).
+  // parseWithStatement parses `query_statement ::= with_clause? ( query_expr | insert | update |
+  // delete )` — a top-level statement prefixed by a WITH clause defining common table expressions
+  // (spec/design/cte.md, spec/design/writable-cte.md). WITH RECURSIVE (spec/design/recursive-cte.md)
+  // sets the `recursive` flag and lets a CTE reference itself; the CTE bodies and the main body are
+  // WITH-less cte_bodies (the top-level-only narrowing — a nested WITH surfaces as 42601 because a
+  // body must begin with SELECT/INSERT/UPDATE/DELETE).
   private parseWithStatement(): Statement {
     this.expectKeyword("with");
     // `WITH RECURSIVE …` enables self-reference (recursive-cte.md). RECURSIVE in this position is
@@ -1415,14 +1417,49 @@ class Parser {
         break;
       }
     }
-    const body = this.parseQueryExprNode();
+    // The primary may be a data-modifying statement (spec/design/writable-cte.md): a leading
+    // INSERT/UPDATE/DELETE keyword selects it, otherwise a WITH-less query_expr.
+    const body = this.parseCteBody(false);
     return { kind: "with", ctes, body, recursive };
   }
 
+  // parseCteBody parses a `cte_body` (spec/design/writable-cte.md): a data-modifying
+  // INSERT/UPDATE/DELETE when one leads, otherwise a query. `parenthesized` is true for a CTE body
+  // inside `( … )` (the closing `)` is the caller's), false for the WITH primary (it runs to end of
+  // statement). A query body parsed here is the WITH-less query_expr (the top-level-only nested-WITH
+  // narrowing — a nested `WITH` surfaces as a leftover 42601).
+  private parseCteBody(parenthesized: boolean): CteBody {
+    const kw = this.peekKeyword();
+    if (kw === "insert" || kw === "update" || kw === "delete") {
+      // A parenthesized data-modifying body counts one nesting level, like parseSubquery does for a
+      // parenthesized query body (grammar.md §48); the primary (parenthesized = false) runs at the
+      // statement top level and does not.
+      if (parenthesized) {
+        this.deepen();
+      }
+      let body: CteBody;
+      if (kw === "insert") {
+        body = this.parseInsert();
+      } else if (kw === "update") {
+        body = this.parseUpdate();
+      } else {
+        body = this.parseDelete();
+      }
+      if (parenthesized) {
+        this.undeepen();
+      }
+      return body;
+    } else if (parenthesized) {
+      return this.parseSubquery();
+    } else {
+      return this.parseQueryExprNode();
+    }
+  }
+
   // parseCte parses one CTE: `identifier ("(" ident ("," ident)* ")")? "AS" ("NOT"? "MATERIALIZED")?
-  // "(" query_expr ")"` (spec/design/cte.md). The optional column list renames the body's output
-  // columns; [NOT] MATERIALIZED is the explicit evaluation hint. The body reuses parseSubquery (one
-  // nesting level, trailing clauses allowed) between its parens.
+  // "(" cte_body ")"` (spec/design/cte.md, spec/design/writable-cte.md). The optional column list
+  // renames the body's output columns; [NOT] MATERIALIZED is the explicit evaluation hint. The body
+  // reuses parseCteBody (one nesting level, trailing clauses allowed) between its parens.
   private parseCte(): Cte {
     const name = this.expectIdentifier();
     let columns: string[] | null = null;
@@ -1450,9 +1487,9 @@ class Parser {
       materialized = false;
     }
     this.expect("lparen");
-    const query = this.parseSubquery();
+    const body = this.parseCteBody(true);
     this.expect("rparen");
-    return { name, columns, materialized, query };
+    return { name, columns, materialized, body };
   }
 
   // parseSubquery parses a parenthesized subquery's inner query_expr (grammar.md §26): a full
