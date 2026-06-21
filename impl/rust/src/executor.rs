@@ -1458,7 +1458,8 @@ impl Database {
     /// renamed owned TEMP sequence's `nextval` default is rewritten in the temp snapshot.
     fn set_column_default_expr_routed(&mut self, table: &str, col: usize, de: DefaultExpr) {
         if self.is_temp_table(table) {
-            self.temp_working_mut().set_column_default_expr(table, col, de);
+            self.temp_working_mut()
+                .set_column_default_expr(table, col, de);
         } else if self.is_shared_temp_table(table) {
             self.shared_temp_working_mut()
                 .set_column_default_expr(table, col, de);
