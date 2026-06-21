@@ -817,25 +817,15 @@ fn identity_table_db() -> Database {
     db
 }
 
-/// A baked COLLATION (v17 — entry_kind 3 snapshot + per-column collations): the dev-root collation
-/// imported and set as the per-database default (the `is_default` flag), a column with an explicit
-/// `COLLATE "dev-root"` (flags bit6 + name), an un-annotated column inheriting the default (bit6 +
-/// name), and an explicit `COLLATE "C"` column (no collation, bit6 clear). The baked snapshot is the
-/// `dev-root.coll` artifact (spec/collation/fixtures) wrapped in catalog framing. Must match the Ruby
-/// reference's COLLATION_TABLE (spec/fileformat/verify.rb), spec/design/collation.md §5.
-fn dev_root_collation() -> jed::collation::Collation {
-    let def = std::fs::read_to_string(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../spec/collation/fixtures/dev-root.allkeys"),
-    )
-    .unwrap();
-    jed::collation::compile_collation("dev-root", &def).unwrap()
-}
-
+/// A reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column collations): the
+/// vendored dev-root collation set as the per-database default (the `is_default` flag), a column with
+/// an explicit `COLLATE "dev-root"` (flags bit6 + name), an un-annotated column inheriting the default
+/// (bit6 + name), and an explicit `COLLATE "C"` column (no collation, bit6 clear). dev-root is NOT
+/// imported — it is vendored, and its metadata entry is emitted because the schema references it. Must
+/// match the Ruby reference's COLLATION_TABLE (spec/fileformat/verify.rb), spec/design/collation.md §5.
 fn collation_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    db.import_collation(dev_root_collation()).unwrap();
-    db.set_default_collation("dev-root").unwrap();
+    db.set_default_collation("dev-root").unwrap(); // vendored — no import
     run(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\", \
@@ -847,11 +837,11 @@ fn collation_table_db() -> Database {
 }
 
 /// A collated text PRIMARY KEY + a collated secondary index (slice 1e, encoding.md §2.12): both keys
-/// store the dev-root UCA sort key, so the B-tree iterates in collation order. The dev-root snapshot
-/// is baked (not the default). Must match the Ruby reference's COLLATION_PK_TABLE.
+/// store the dev-root UCA sort key, so the B-tree iterates in collation order. dev-root is vendored
+/// (not the default; its entry is emitted because the columns reference it). Must match the Ruby
+/// reference's COLLATION_PK_TABLE.
 fn collation_pk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    db.import_collation(dev_root_collation()).unwrap();
     run(
         &mut db,
         "CREATE TABLE t (name text COLLATE \"dev-root\" PRIMARY KEY, tag text COLLATE \"dev-root\")",

@@ -107,6 +107,25 @@ pub struct CollationInfo {
     pub is_default: bool,
 }
 
+/// The collations **vendored into this engine build** — the build-global set every database opened by
+/// this binary can use (spec/design/collation.md §4.2/§13). A property of the *binary*, independent of
+/// any database; for the collations a particular database *references*, use `Database::collations`.
+/// Ascending by name; `is_default` is always `false` here (that is a per-database property, not a
+/// build one). `C` is built in and not listed.
+pub fn vendored_collations() -> Vec<CollationInfo> {
+    collation::vendored_collations()
+        .into_iter()
+        .map(|c| CollationInfo {
+            name: c.name.clone(),
+            unicode_version: c.unicode_version.clone(),
+            cldr_version: c.cldr_version.clone(),
+            content_hash: crate::format::crc32_ieee(&collation::serialize_table(&c)),
+            description: c.description.clone(),
+            is_default: false,
+        })
+        .collect()
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScriptSummary {
     /// How many statements ran (each non-empty span the splitter yielded).
@@ -256,19 +275,12 @@ impl Snapshot {
         self.sequences.remove(key);
     }
 
-    /// Look up a collation the database *references* (imported / baked) by its exact (case-sensitive)
-    /// name. `C` is NOT here — it is table-free and built in (spec/design/collation.md §1). `None` ⇒
-    /// not referenced by this database. This is the catalog-local set only; for query *use* prefer
-    /// `resolve_collation`, which also falls back to the binary's vendored set.
-    pub(crate) fn collation(&self, name: &str) -> Option<&std::sync::Arc<Collation>> {
-        self.collations.get(name)
-    }
-
     /// Resolve a collation name for USE — query resolution and key encoding (spec/design/collation.md
-    /// §2/§9). The database's referenced collations first, then the set **vendored into this binary**.
-    /// `None` ⇒ neither has it (the resolver raises 42704). `C` is handled by the caller (built-in).
-    /// This is the reference-only read path: a collation need not be baked into the file to be used —
-    /// the file references it by name and the table comes from the binary's vendored set.
+    /// §2/§9). The collations the database has resolved (a cache populated on open from the file's
+    /// reference entries, carrying their version pin) first, then the set **vendored into this
+    /// binary**. `None` ⇒ neither has it (the resolver raises 42704). `C` is handled by the caller
+    /// (built-in). This is the reference-only read path: a collation is never baked into the file — the
+    /// file references it by name and the table comes from the vendored set.
     pub(crate) fn resolve_collation(&self, name: &str) -> Option<std::sync::Arc<Collation>> {
         self.collations
             .get(name)
@@ -276,19 +288,10 @@ impl Snapshot {
             .or_else(|| crate::collation::vendored_collation(name))
     }
 
-    /// Register a loaded collation (`db.import_collation`). Keyed by its exact name; the caller has
-    /// checked any same-name conflict.
+    /// Record a collation resolved from a file reference entry on open (its file metadata + the
+    /// vendored table), keyed by name, so later resolution preserves the file's version pin.
     pub(crate) fn put_collation(&mut self, coll: std::sync::Arc<Collation>) {
         self.collations.insert(coll.name.clone(), coll);
-    }
-
-    /// All loaded collations in ascending name order — the on-disk emission order
-    /// (spec/fileformat/format.md, `entry_kind = 3`) and a deterministic order with no
-    /// hash-iteration leak (CLAUDE.md §8). Sorted by the exact (case-sensitive) name.
-    pub(crate) fn collations_sorted(&self) -> Vec<&std::sync::Arc<Collation>> {
-        let mut keys: Vec<&String> = self.collations.keys().collect();
-        keys.sort();
-        keys.into_iter().map(|k| &self.collations[k]).collect()
     }
 
     /// The collations the database **schema references** — every column's frozen collation plus the
@@ -2081,60 +2084,21 @@ impl Database {
         self.working_mut().put_table(table, ps);
     }
 
-    /// Import a collation into the database (the privileged host op `db.ImportCollation`,
-    /// spec/design/collation.md §4). The collation becomes usable by name in `COLLATE` / `ORDER BY`
-    /// and is **baked** into the file at the next `commit` (catalog `entry_kind = 3`, `format_version`
-    /// 17 — §5). Idempotent by `(name, content-hash)`: re-importing the identical table is a no-op
-    /// success; importing a DIFFERENT table under a name already in use is 42710 (it would invalidate
-    /// any structure built under that name — re-collation is the explicit path, §12). `C` is never
-    /// imported (table-free, built in). Returns the imported name.
-    pub fn import_collation(&mut self, coll: Collation) -> Result<String> {
-        if coll.name == "C" {
-            return Err(EngineError::new(
-                SqlState::DuplicateObject,
-                "the C collation is built in and cannot be imported",
-            ));
-        }
-        let name = coll.name.clone();
-        let hash = crate::format::crc32_ieee(&collation::serialize_table(&coll));
-        if let Some(existing) = self.committed.collation(&name) {
-            let existing_hash = crate::format::crc32_ieee(&collation::serialize_table(existing));
-            if existing_hash == hash {
-                return Ok(name); // idempotent — same (name, content) already loaded
-            }
-            return Err(EngineError::new(
-                SqlState::DuplicateObject,
-                format!("collation \"{name}\" is already loaded with different content"),
-            ));
-        }
-        self.committed.put_collation(std::sync::Arc::new(coll));
-        Ok(name)
-    }
-
-    /// Export a baked collation back out as a `Collation` value (`db.ExportCollation`,
-    /// spec/design/collation.md §1). `C` is built in and has no table → 42704 (nothing to export);
-    /// an unloaded name is 42704. The returned value round-trips through `save_collation` /
-    /// `import_collation` byte-identically.
-    pub fn export_collation(&self, name: &str) -> Result<Collation> {
-        match self.committed.collation(name) {
-            Some(c) => Ok((**c).clone()),
-            None => Err(EngineError::new(
-                SqlState::UndefinedObject,
-                format!("collation \"{name}\" does not exist"),
-            )),
-        }
-    }
+    // `import_collation` / `export_collation` are GONE (the reference-only pivot,
+    // spec/design/collation.md §4.2): a collation is vendored into the binary and used by name, never
+    // loaded into a database. There is no runtime path that constructs or bakes a collation table.
 
     /// Set the per-database default collation (`db.SetDefaultCollation`, spec/design/collation.md
     /// §1). An un-annotated `text` column created afterward inherits it. The name must be `C` (resets
-    /// to byte order) or a loaded collation (else 42704). Persisted as the `is_default` flag on that
-    /// collation's baked snapshot at the next `commit`.
+    /// to byte order) or a **vendored** collation (else 42704). Persisted as the `is_default` flag on
+    /// that collation's reference entry at the next `commit` (the entry is emitted because the default
+    /// references it — §5).
     pub fn set_default_collation(&mut self, name: &str) -> Result<()> {
         if name == "C" {
             self.committed.set_default_collation(None);
             return Ok(());
         }
-        if self.committed.collation(name).is_none() {
+        if self.committed.resolve_collation(name).is_none() {
             return Err(EngineError::new(
                 SqlState::UndefinedObject,
                 format!("collation \"{name}\" does not exist"),
@@ -2153,19 +2117,24 @@ impl Database {
             .to_string()
     }
 
-    /// Introspect the loaded collations (`db.Collations`, spec/design/collation.md §1) — each as
-    /// `(name, unicode_version, cldr_version, content_hash, description, is_default)`, in ascending
-    /// name order. `C` is built in and not listed.
+    /// Introspect the collations **this database references** (`db.Collations`,
+    /// spec/design/collation.md §4.2) — every collation its schema uses (a column's `COLLATE`, or the
+    /// per-database default), each as `(name, unicode_version, cldr_version, content_hash,
+    /// description, is_default)`, in ascending name order. This is the *per-file* view; for the set
+    /// **vendored into the engine** (build-global), use the free `vendored_collations()`. `C` is built
+    /// in and not listed.
     pub fn collations(&self) -> Vec<CollationInfo> {
         let default = self.committed.default_collation();
+        // referenced_collations resolves each referenced name (vendored, here always resolvable).
         self.committed
-            .collations_sorted()
+            .referenced_collations()
+            .unwrap_or_default()
             .into_iter()
             .map(|c| CollationInfo {
                 name: c.name.clone(),
                 unicode_version: c.unicode_version.clone(),
                 cldr_version: c.cldr_version.clone(),
-                content_hash: crate::format::crc32_ieee(&collation::serialize_table(c)),
+                content_hash: crate::format::crc32_ieee(&collation::serialize_table(&c)),
                 description: c.description.clone(),
                 is_default: default == Some(c.name.as_str()),
             })

@@ -49,8 +49,8 @@ pub use api::{PreparedStatement, Rows, Transaction};
 pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
-    DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Database, Outcome, ScriptSummary, Session,
-    SessionOptions, Snapshot, TxStatus,
+    CollationInfo, DEFAULT_MAX_SQL_LENGTH, DEFAULT_PAGE_SIZE, Database, Outcome, ScriptSummary,
+    Session, SessionOptions, Snapshot, TxStatus, vendored_collations,
 };
 pub use file::{DatabaseOptions, OpenOptions};
 pub use parser::Parser;

@@ -105,12 +105,6 @@ fn suites_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/conformance/suites")
 }
 
-/// The repo's `spec/` directory — the root that `# load-collation:` fixture paths resolve against
-/// (spec/design/collation.md §10). `suites/` → `conformance/` → `spec/`.
-fn spec_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec")
-}
-
 /// Parse a `# load-collation: <name> = <fixture-path>[, <fixture-path>…]` directive body — the
 /// corpus's deterministic, host-free way to make a collation available before the records that use
 /// it (spec/design/collation.md §10). In the reference-only model the named collation is normally
@@ -130,44 +124,18 @@ fn parse_load_collation_directive(rest: &str) -> Option<(String, Vec<String>)> {
     Some((name.trim().to_string(), files))
 }
 
-/// Make a collation named `name` available to the records that follow (spec/design/collation.md
-/// §2/§9/§10). In the reference-only model a collation is **vendored into the binary**, so if `name`
-/// is vendored this is a no-op (the corpus exercises the vendored read path — no import, nothing
-/// baked). Only a collation a build does *not* vendor falls back to compiling + importing it from
-/// the `files` fixtures (the harness is test tooling, so the compile path is allowed here). A read /
-/// compile / import failure fails the test file.
-fn load_collation(
-    db: &mut Database,
-    name: &str,
-    files: &[String],
-) -> std::result::Result<(), String> {
+/// Assert a collation named `name` is available to the records that follow (spec/design/collation.md
+/// §2/§9/§10). In the reference-only model a collation is **vendored into the binary**; the directive
+/// only *declares the dependency*, so this checks the build vendors it (no import, nothing baked — the
+/// corpus exercises the pure vendored read path). A name this build does not vendor fails the test
+/// file, naming it (the directive's `files` are now a vestigial provenance note, not loaded).
+fn load_collation(name: &str) -> std::result::Result<(), String> {
     if jed::collation::vendored_collation(name).is_some() {
-        return Ok(()); // vendored: usable as-is, the reference-only path
+        return Ok(());
     }
-    let mut def = String::new();
-    for f in files {
-        let text = std::fs::read_to_string(spec_dir().join(f))
-            .map_err(|e| format!("load-collation: cannot read fixture {f}: {e}"))?;
-        if !def.is_empty() {
-            def.push('\n');
-        }
-        def.push_str(&text);
-    }
-    let coll = jed::collation::compile_collation(name, &def).map_err(|e| {
-        format!(
-            "load-collation: compiling {name}: {} {}",
-            e.code(),
-            e.message
-        )
-    })?;
-    db.import_collation(coll).map_err(|e| {
-        format!(
-            "load-collation: importing {name}: {} {}",
-            e.code(),
-            e.message
-        )
-    })?;
-    Ok(())
+    Err(format!(
+        "load-collation: collation \"{name}\" is not vendored in this build"
+    ))
 }
 
 fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) {
@@ -502,11 +470,11 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('#') {
-            // `# load-collation:` is an ACTION (make available now), not a pending assertion: ensure
-            // the named collation is available before the records run — vendored is a no-op, else
-            // compile + import from its fixtures (spec/design/collation.md §2/§9/§10).
-            if let Some((name, files)) = parse_load_collation_directive(rest) {
-                load_collation(&mut db, &name, &files)?;
+            // `# load-collation:` is an ACTION (assert available now), not a pending assertion: the
+            // named collation must be vendored in this build before the records run
+            // (spec/design/collation.md §2/§9/§10).
+            if let Some((name, _files)) = parse_load_collation_directive(rest) {
+                load_collation(&name)?;
                 continue;
             }
             // `# cost:` / `# names:` / `# types:` bind to the next record; every other comment
