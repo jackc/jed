@@ -35,6 +35,13 @@ SELECT name, price FROM kitchen ORDER BY price DESC;`;
 )
 SELECT n FROM series ORDER BY n;`;
 
+	const dataModifying = `WITH discounted AS (
+  UPDATE product SET price = price * 0.9
+  WHERE category = 'kitchen'
+  RETURNING name, price
+)
+SELECT name, price FROM discounted ORDER BY price;`;
+
 	const derived = `SELECT category, top
 FROM (SELECT category, max(price) AS top FROM product GROUP BY category) AS d
 WHERE top > 5
@@ -154,7 +161,26 @@ each is visible to later ones and to the main query:
 
 CTEs follow PostgreSQL's evaluation rule: a CTE referenced once is **inlined**, one referenced
 several times (or marked `MATERIALIZED`) runs once and its rows are **buffered** and reused. Add an
-optional column-rename list (`WITH t (a, b) AS (…)`). Data-modifying CTEs are not yet supported.
+optional column-rename list (`WITH t (a, b) AS (…)`).
+
+### Data-modifying CTEs
+
+A CTE's body — and the statement a `WITH` prefixes — may be an `INSERT`, `UPDATE`, or `DELETE`. Its
+`RETURNING` rows flow forward like any CTE's, so one statement can write and read its own changes:
+
+<LiveSql {seed} query={dataModifying} rows={2} />
+
+The canonical use is moving rows between tables atomically:
+
+```sql
+WITH moved AS (DELETE FROM inbox WHERE ready RETURNING *)
+INSERT INTO archive SELECT * FROM moved;
+```
+
+Every part of the statement reads **one pre-statement snapshot** — the parts cannot see each other's
+effects on the target tables, so data crosses only through a CTE's `RETURNING` buffer (`SELECT
+count(*) FROM inbox` next to the `DELETE` above still sees the rows). The data-modifying parts run
+once each, in order, and the whole statement is one all-or-nothing transaction.
 
 ### Recursive CTEs (`WITH RECURSIVE`)
 
