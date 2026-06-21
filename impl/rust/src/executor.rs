@@ -291,6 +291,40 @@ impl Snapshot {
         keys.into_iter().map(|k| &self.collations[k]).collect()
     }
 
+    /// The collations the database **schema references** — every column's frozen collation plus the
+    /// per-database default — resolved (catalog-local set, then the binary's vendored set) and sorted
+    /// by exact name. Under the reference-only model (spec/design/collation.md §2/§5) these, not an
+    /// imported set, are what earn a metadata entry on disk: a collation is recorded because the
+    /// schema uses it, regardless of whether it was ever passed to a (now-removed) import call. `C`
+    /// columns (`collation == None`) reference nothing. A referenced name this build does not vendor
+    /// is a bug surfaced here (the precursor to the slice-2d open-time verdict).
+    pub(crate) fn referenced_collations(&self) -> Result<Vec<std::sync::Arc<Collation>>> {
+        let mut names: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        for t in self.tables.values() {
+            for col in &t.columns {
+                if let Some(n) = &col.collation {
+                    names.insert(n.clone());
+                }
+            }
+        }
+        if let Some(d) = &self.default_collation {
+            names.insert(d.clone());
+        }
+        names
+            .into_iter()
+            .map(|name| {
+                self.resolve_collation(&name).ok_or_else(|| {
+                    EngineError::new(
+                        SqlState::UndefinedObject,
+                        format!(
+                            "collation \"{name}\" referenced by the schema is not vendored in this build"
+                        ),
+                    )
+                })
+            })
+            .collect()
+    }
+
     /// The per-database default collation name, or `None` for `C` (spec/design/collation.md §1).
     pub(crate) fn default_collation(&self) -> Option<&str> {
         self.default_collation.as_deref()

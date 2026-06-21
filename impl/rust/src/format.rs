@@ -870,13 +870,15 @@ impl Snapshot {
             e.extend_from_slice(&sequence_entry_bytes(s));
             cat_entries.push(e);
         }
-        // Collation snapshots (kind 3, v17) — after sequences, before tables, so a collated table
-        // entry is read after the snapshot it references (spec/design/collation.md §5).
+        // Collation reference entries (kind 3, v18) — after sequences, before tables, so a collated
+        // table entry is read after the entry it references. Reference-only: emit one metadata entry
+        // per collation the SCHEMA references (columns + default), not an imported set
+        // (spec/design/collation.md §2/§5).
         let default_coll = self.default_collation();
-        for coll in self.collations_sorted() {
+        for coll in self.referenced_collations()? {
             let mut e = vec![3u8];
             e.extend_from_slice(&collation_entry_bytes(
-                coll,
+                &coll,
                 default_coll == Some(coll.name.as_str()),
             ));
             cat_entries.push(e);
@@ -1145,13 +1147,15 @@ impl Snapshot {
             e.extend_from_slice(&sequence_entry_bytes(s));
             cat_entries.push(e);
         }
-        // Collation snapshots (kind 3, v17) — after sequences, before tables, so a collated table
-        // entry is read after the snapshot it references (spec/design/collation.md §5).
+        // Collation reference entries (kind 3, v18) — after sequences, before tables, so a collated
+        // table entry is read after the entry it references. Reference-only: emit one metadata entry
+        // per collation the SCHEMA references (columns + default), not an imported set
+        // (spec/design/collation.md §2/§5).
         let default_coll = self.default_collation();
-        for coll in self.collations_sorted() {
+        for coll in self.referenced_collations()? {
             let mut e = vec![3u8];
             e.extend_from_slice(&collation_entry_bytes(
-                coll,
+                &coll,
                 default_coll == Some(coll.name.as_str()),
             ));
             cat_entries.push(e);
