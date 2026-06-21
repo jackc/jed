@@ -28,6 +28,13 @@ ORDER BY price DESC;`;
 )
 SELECT name, price FROM kitchen ORDER BY price DESC;`;
 
+	const recursive = `WITH RECURSIVE series(n) AS (
+  SELECT 1
+  UNION ALL
+  SELECT n + 1 FROM series WHERE n < 5
+)
+SELECT n FROM series ORDER BY n;`;
+
 	const derived = `SELECT category, top
 FROM (SELECT category, max(price) AS top FROM product GROUP BY category) AS d
 WHERE top > 5
@@ -147,8 +154,22 @@ each is visible to later ones and to the main query:
 
 CTEs follow PostgreSQL's evaluation rule: a CTE referenced once is **inlined**, one referenced
 several times (or marked `MATERIALIZED`) runs once and its rows are **buffered** and reused. Add an
-optional column-rename list (`WITH t (a, b) AS (…)`). `WITH RECURSIVE` and data-modifying CTEs are
-not yet supported.
+optional column-rename list (`WITH t (a, b) AS (…)`). Data-modifying CTEs are not yet supported.
+
+### Recursive CTEs (`WITH RECURSIVE`)
+
+`WITH RECURSIVE` lets a CTE reference **itself**, computing a result by iterating to a fixpoint —
+hierarchy walks, graph reachability, generated series. The body is a `UNION`: the left side (the
+**non-recursive term**) seeds the result, and the right side (the **recursive term**) is re-evaluated
+against the rows the previous step produced until it yields none:
+
+<LiveSql {seed} query={recursive} rows={5} />
+
+`UNION ALL` keeps every row; `UNION` drops rows that duplicate one already produced (which is what
+makes a cyclic graph walk terminate). The column types are fixed by the non-recursive term. A
+recursion with no stopping condition runs until it hits the statement's
+[cost ceiling](/docs/api/resource-limits) — set one when running untrusted queries. `SEARCH` /
+`CYCLE` clauses and mutual recursion are not yet supported.
 
 ## Derived tables (`FROM (SELECT …) AS t`)
 
