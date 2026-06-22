@@ -2236,3 +2236,32 @@ between two parts is `23505`, while an update/update or update/delete of the sam
 deterministic last-write-wins (a documented divergence on a case PostgreSQL leaves unspecified —
 [writable-cte.md](writable-cte.md) §7). `WITH RECURSIVE` with a (non-self-referencing) data-modifying
 CTE is allowed (a data-modifying body is never the recursive `UNION` shape). No on-disk format change.
+
+## 49. `AT TIME ZONE` ([timezones.md](timezones.md))
+
+`expr AT TIME ZONE zone` is PostgreSQL's time-zone conversion operator, the single tz consumer the
+first slice ships ([timezones.md §6](timezones.md)). It converts between an instant and a wall-clock
+reading in `zone`, both directions:
+
+```sql
+SELECT ts AT TIME ZONE 'America/New_York'        -- timestamptz → timestamp (local wall clock in the zone)
+SELECT wall AT TIME ZONE 'Europe/Paris'          -- timestamp → timestamptz (interpret wall clock as in the zone)
+SELECT now() AT TIME ZONE 'UTC'                  -- UTC and fixed ±HH:MM offsets need no loaded data
+```
+
+- **Result type.** `timestamptz AT TIME ZONE zone → timestamp` (the zone-less local reading);
+  `timestamp AT TIME ZONE zone → timestamptz` (the UTC instant). Any other left operand type is
+  `42883` (no such operator). The `zone` operand is a **text** expression evaluated per row.
+- **Precedence.** `AT TIME ZONE` binds **tighter than the comparison operators and `||`, looser than
+  the additive/`::`/postfix operators** ([grammar.ebnf](../grammar/grammar.ebnf), matching PG): it is
+  parsed as a left-associative infix operator at PG's `AT` precedence rung, above `BETWEEN`/`IN` and
+  the comparisons. `a AT TIME ZONE z = b` parses as `(a AT TIME ZONE z) = b`.
+- **The `zone`** is a quoted **string literal or text expression** (not a bare identifier): `UTC` and
+  fixed numeric offsets `±HH`, `±HH:MM`, `±HH:MM:SS` are built-in and need no loaded data
+  ([timezones.md §3.2](timezones.md)); every **named IANA zone** must be provided by a **loaded `JTZ`
+  bundle** (the corpus `# load-timezone:` directive declares the dependency, [timezones.md §11](timezones.md)).
+- **Resolution / errors** ([timezones.md §6](timezones.md)): a zone name no loaded bundle provides (and
+  not a built-in `UTC`/offset) is **`22023`** (`invalid_parameter_value`, PG's "time zone not
+  recognized") — never a silent substitution. The `timestamp → timestamptz` direction at a DST gap /
+  overlap resolves the ambiguous wall clock to PostgreSQL's branch (oracle-pinned), never an error. The
+  operator is metered by the `timezone` cost unit ([timezones.md §10](timezones.md)).

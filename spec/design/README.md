@@ -40,6 +40,12 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   requirements manifest, read-vs-write dependency tagging, the heap-scan read-degradation, and the
   unification of collation skew + function drift; the model views / functional indexes / generated
   columns / host functions register into (CLAUDE.md §13).
+- [timezones.md](timezones.md) — time zones for `timestamptz` (design decided, not yet built):
+  the **host-loaded `JTZ` bundle** (manifest + per-zone **RFC 8536 TZif** sections + alias links,
+  byte format in [../tz/README.md](../tz/README.md)), the privileged `db.LoadTimeZoneData` seam, the
+  per-core TZif reader, and the single `AT TIME ZONE` consumer — copying collation's host-load model.
+  `timestamptz` is UTC, so plain indexes are tz-immune: **no format change, no skew verdict** until a
+  tz-derived key can be stored (latent into compatibility.md).
 - [storage.md](storage.md) — the storage seam: block interface, page model, and the
   root-pointer-swap commit model (CLAUDE.md §3/§9).
 - [hosts.md](hosts.md) — the formal storage-host (`BlockStore`) interface: the five-method

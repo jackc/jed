@@ -106,15 +106,19 @@ first instance ([collation.md](collation.md); §10 here). Every built-in functio
 **semantics version** (bumped only when its output changes); every collation carries its
 `(unicode_version, cldr_version)`. Both flow through the same manifest and the same verdict. (As of
 collation.md's reference-only pivot, collation does **not** freeze its tables into the file — they
-are **vendored into the binary** and the file references the version — making it the cleanest
-instance of the reference-and-degrade path; [timezones.md](timezones.md) does the same for tzdata.)
+are **host-loaded** (a `JUCD` bundle, [collation.md §9](collation.md)) and the file references the
+version — making it the cleanest instance of the reference-and-degrade path;
+[timezones.md](timezones.md) does the same for tzdata via a host-loaded `JTZ` bundle, differing only
+in that the tz *base type is already version-independent* so the file references nothing until a
+tz-*derived* key is stored, §3 below.)
 
 A **time-zone-dependent stored key** is the same instance again: a functional index on
 `(ts AT TIME ZONE 'America/New_York')::date` stores keys produced by applying the IANA tzdata, so
 the **tzdata version** is the "computation version" and a tzdata bump stales those keys exactly as a
 CLDR reorder stales a collated index — while a *plain* `timestamptz` index is immune, because the
-stored value is UTC and its order uses no tz rule ([timezones.md §2/§5](timezones.md)). Same
-manifest, same verdict.
+stored value is UTC and its order uses no tz rule ([timezones.md §2/§8](timezones.md)). Same
+manifest, same verdict — but **latent**, since jed cannot build a tz-derived stored key yet
+([timezones.md §8](timezones.md)).
 
 ## 4. The two levers
 
@@ -161,12 +165,14 @@ Every fact a file's interpretation can rest on sits on this ladder, most-portabl
   the spec contract; stable, changes only with a `format_version` bump. Portable.
 - **Tier 2 — versioned reference data.** Collation tables; **IANA time-zone data**
   ([timezones.md](timezones.md)); the Unicode property tables behind `lower`/`normalize`/regex. All
-  are **vendored into the binary at a pinned version** and **referenced** by the file (`name` +
-  version), never stored in it — the file records the version, the binary carries the data, and skew
-  between them is resolved by the graded verdict (§7/§8). Collation's version handling is
-  [collation.md §3/§12](collation.md) (its reference-only pivot makes it the worked instance, §10
-  here). Tz differs only in that its *base type is already version-independent* (UTC instants,
-  [timezones.md §2](timezones.md)), so only *derived* keys reach this tier.
+  are **host-loaded at a pinned version** (collation's `JUCD` bundle, [collation.md §9](collation.md);
+  tz's `JTZ` bundle, [timezones.md §4](timezones.md)) and **referenced** by the file (`name` +
+  version) *only where a stored key depends on them* — never stored in the file; the file records the
+  version, the host loads the data, and skew between them is resolved by the graded verdict (§7/§8).
+  Collation's version handling is [collation.md §3/§12](collation.md) (the worked instance, §10 here).
+  Tz differs in that its *base type is already version-independent* (UTC instants,
+  [timezones.md §2](timezones.md)), so only *derived* keys reach this tier — and none can be stored
+  yet, so tz's use of this tier is **latent** ([timezones.md §8](timezones.md)).
 - **Tier 3 — built-in function semantics in stored expressions.** `DEFAULT`, functional indexes,
   generated columns, views that call built-ins. Gated by function *existence* and *semantics
   version*; read-portable per §4 except VIRTUAL/regular-view positions.
@@ -273,11 +279,13 @@ How each feature registers into the manifest, with its read/write tag and its fa
 - **Functional index** (future, [indexes.md](indexes.md)) — write-time for maintenance,
   optional for acceleration. Missing/ drifted function ⇒ index **not maintained, not used for
   acceleration**; base table reads via heap-scan; rebuild on re-establishment.
-- **Time-zone-dependent functional index / key** (future, [timezones.md §5](timezones.md)) —
+- **Time-zone-dependent functional index / key** (future, [timezones.md §8](timezones.md)) —
   write-time; a tzdata-version bump stales keys derived via `AT TIME ZONE 'const'` /
-  `date_trunc(…, 'zone')`. Same Tier-2 treatment as collation: pin one tzdata version per file,
-  version-stamp, degrade to heap-scan + rebuild on migration. Plain `timestamptz` keys are immune
-  (UTC, tz-free order), so only zone-derived keys register here.
+  `date_trunc(…, 'zone')`. Same Tier-2 treatment as collation, with the host-loaded `JTZ` bundle
+  ([timezones.md §4](timezones.md)) once such keys exist: pin one tzdata version per file,
+  version-stamp, degrade to heap-scan + rebuild on migration. **Latent today** — jed cannot build
+  such a key yet ([indexes.md §1](indexes.md)). Plain `timestamptz` keys are immune (UTC, tz-free
+  order), so only zone-derived keys would register here.
 - **Generated column** (future, [constraints.md](constraints.md)) — **STORED** is write-time
   (value on disk, read-portable); **VIRTUAL** is read-time (computed on read, *not* portable —
   §11). Recommend **STORED-only** (§12).
@@ -321,9 +329,9 @@ Collation is Tier 2 and the first thing to exercise this model. The decisions re
   **referenced from the file, never baked**, and the table is delivered in a bundle the host loads
   (the footprint is the deployer's choice, not the build's; collation.md §13). The universal Unicode
   **property/casing** tables ride the **same bundle** on the same `(unicode_version)` axis (collation.md
-  §16), so casing and collation share one version pin. ([timezones.md](timezones.md) vendors tzdata for
-  the same determinism reason; whether it too becomes loadable is an open follow-on.) This resolves the
-  former open decision (§12).
+  §16), so casing and collation share one version pin. ([timezones.md](timezones.md) host-loads tzdata for
+  the same determinism reason — now decided as the `JTZ` bundle ([timezones.md §4](timezones.md)), its own
+  resolved follow-on.) This resolves the former open decision (§12).
 - **Casing is the same instance.** A functional index on `lower(x)` or a `GENERATED ALWAYS AS
   (lower(x))` column stores a versioned-casing result — including the **ASCII-baseline vs. Unicode-`X`
   regime** distinction (collation.md §16) — so it registers into this manifest exactly like a collated
@@ -358,10 +366,11 @@ triggering features land.
 - **Collation skew = function drift = one versioning discipline** (§3); semantics-version every
   built-in; pin one Unicode version per file (§10).
 - **Heap-scan read degradation** as the universal reduced mode (§8).
-- **Collation is vendored + reference-only, never baked** (§10) — settled in
-  [collation.md §3/§12](collation.md); the file references collations by `name` + `(unicode, cldr)`
-  version and the binary carries the (tiered) tables. tzdata follows the same shape
-  ([timezones.md](timezones.md)).
+- **Collation is host-loaded + reference-only, never baked** (§10) — settled in
+  [collation.md §3/§9/§12](collation.md); the file references collations by `name` + `(unicode, cldr)`
+  version and the host loads the tables (a `JUCD` bundle). tzdata follows the same host-loaded shape
+  (a `JTZ` bundle, [timezones.md §4](timezones.md)) — with the file referencing nothing until a
+  tz-derived key is stored ([timezones.md §2/§8](timezones.md)).
 - Lean toward **STORED-only generated columns** and **distinct host-vs-builtin marking** (§11).
 
 **Resolved by collation's slice 2d** ([collation.md §12/§14](collation.md) — the first implemented

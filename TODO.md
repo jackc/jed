@@ -173,9 +173,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ negative / `s>p` scale typmods; `round(x,n)` and other decimal functions.
 - [x] **`timestamp` / `timestamptz`** — PG instant model, i64 µs, no tz database, `±infinity`
       first-class, timestamp PK supported. → [timestamp.md](spec/design/timestamp.md)
-  - [ ] _follow-on:_ `EXTRACT`/`date_trunc`/`age`; separate `time` type; named-zone
-        `AT TIME ZONE`; timestamp⇄text/date casts; `timestamp(p)` precision typmods.
-        (`date` ✅ landed below.)
+  - [ ] **time-zone database + `AT TIME ZONE` (host-loaded `JTZ` bundle)** — design decided in
+        timezones.md, **not yet built** (copies collation's host-load model): a host loads IANA tzdata
+        as a **`JTZ` bundle** (manifest + per-zone **RFC 8536 TZif** sections + alias links) via a
+        privileged bytes/reader **`db.LoadTimeZoneData`**; the bare binary carries no tz data (`UTC` +
+        fixed `±HH:MM` offsets are built-in, the `C` analogue). Each core gets a small TZif reader
+        (`(zone, instant) → (offset, abbrev, dst)`, incl. the POSIX footer). Ships the **data plumbing +
+        the single `AT TIME ZONE` consumer** (both directions; unknown zone `22023`). **No
+        `format_version` bump** — `timestamptz` is UTC, so plain indexes are tz-immune; the
+        collation-style version-skew machinery stays **latent** until tz-derived stored keys (functional
+        indexes / STORED generated columns) exist (timezones.md §8 → compatibility.md then). New cost
+        unit `timezone`, new corpus directive `# load-timezone:`. → [timezones.md](spec/design/timezones.md),
+        [tz/README.md](spec/tz/README.md) (the JTZ + TZif byte formats).
+  - [ ] _further follow-on:_ `EXTRACT`/`date_trunc`/`age`; separate `time` type; timestamp⇄text/date
+        casts (and session-zone rendering); `timestamp(p)` precision typmods; the full conversion
+        surface (timezones.md §9). (`date` ✅ landed below.)
 - [x] **`date`** — a calendar date (i32 days since 1970-01-01, reusing timestamp's calendar core):
       strict ISO `YYYY-MM-DD` literals (string-adapt + `DATE '…'`) with BC era + `±infinity`, a date
       `PRIMARY KEY` (key encoding = i32; on-disk type code 16, no format bump); a **strict island** —
