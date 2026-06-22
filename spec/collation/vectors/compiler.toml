@@ -3,8 +3,8 @@
 # cross-confirmed byte-for-byte by all three cores (CLAUDE.md §8). Do not hand-edit.
 # Format: spec/collation/README.md §2/§3. def_files are concatenated (newline-joined)
 # then compiled under coll_name. Only the small DEV fixtures are pinned here; the real
-# vendored tables (unicode/es) are ~0.5 MB and are pinned by their embedded .coll +
-# the sort-key vectors instead (spec/design/collation.md §9/§10).
+# production tables (unicode/es) are ~0.5 MB and are pinned by the cores loading the JUCD
+# bundle + the sort-key vectors instead (spec/design/collation.md §9/§10).
 
 schema_version = 1
 

@@ -107,9 +107,9 @@ fn suites_dir() -> PathBuf {
 
 /// Parse a `# load-collation: <name> = <fixture-path>[, <fixture-path>…]` directive body — the
 /// corpus's deterministic, host-free way to make a collation available before the records that use
-/// it (spec/design/collation.md §10). In the reference-only model the named collation is normally
-/// **vendored** (so the fixtures are an unused-but-documented fallback for a not-yet-vendored name,
-/// `load_collation`). Returns the collation name and its fixture paths, or None if not this directive.
+/// it (spec/design/collation.md §10). The named collation is provided by the engine's loaded `JUCD`
+/// bundle (`load_collation` loads it); the fixture paths are now a documentary provenance note (the
+/// collation's source definitions), not loaded. Returns the collation name and paths, or None.
 fn parse_load_collation_directive(rest: &str) -> Option<(String, Vec<String>)> {
     let body = rest.trim_start().strip_prefix("load-collation:")?.trim();
     let (name, files) = body.split_once('=')?;
@@ -124,17 +124,23 @@ fn parse_load_collation_directive(rest: &str) -> Option<(String, Vec<String>)> {
     Some((name.trim().to_string(), files))
 }
 
-/// Assert a collation named `name` is available to the records that follow (spec/design/collation.md
-/// §2/§9/§10). In the reference-only model a collation is **vendored into the binary**; the directive
-/// only *declares the dependency*, so this checks the build vendors it (no import, nothing baked — the
-/// corpus exercises the pure vendored read path). A name this build does not vendor fails the test
-/// file, naming it (the directive's `files` are now a vestigial provenance note, not loaded).
+/// Make a collation named `name` available to the records that follow (spec/design/collation.md
+/// §2/§9/§10). The harness acts as the *host*: it loads jed's own pinned production `JUCD` bundle
+/// (spec/collation/fixtures/unicode.jucd) into the engine-global set via `db.LoadUnicodeData`
+/// (idempotent — the set is global), exactly as a production host would, then asserts the named
+/// collation now resolves. A name no loaded bundle provides fails the test file, naming it.
 fn load_collation(name: &str) -> std::result::Result<(), String> {
-    if jed::collation::vendored_collation(name).is_some() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/fixtures/unicode.jucd");
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("load-collation: read {}: {e}", path.display()))?;
+    jed::load_unicode_data(&bytes)
+        .map_err(|e| format!("load-collation: load unicode.jucd: {}", e.message))?;
+    if jed::collation::loaded_collation(name).is_some() {
         return Ok(());
     }
     Err(format!(
-        "load-collation: collation \"{name}\" is not vendored in this build"
+        "load-collation: collation \"{name}\" is not provided by the loaded bundle"
     ))
 }
 

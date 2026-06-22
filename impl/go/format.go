@@ -2045,21 +2045,22 @@ func decodeCollationEntry(buf []byte, pos *int) (*Collation, bool, error) {
 	if err != nil {
 		return nil, false, err
 	}
-	// The file records only the version PIN; the table comes from the vendored set. A name this build
-	// does not vendor is a legible failure (the precursor to the graded open-time verdict —
-	// compatibility.md §7 / collation.md §12, slice 2d, which will soften this to read-only degrade).
-	vend := VendoredCollation(name)
-	if vend == nil {
+	// The file records only the version PIN; the table comes from a loaded bundle (the host must have
+	// loaded one providing this collation before opening — collation.md §4/§9). A name no loaded bundle
+	// provides is a legible failure (the precursor to the graded open-time verdict — compatibility.md
+	// §7 / collation.md §12, slice 2d, which will soften this to read-only degrade).
+	loaded := LoadedCollation(name)
+	if loaded == nil {
 		return nil, false, NewError(UndefinedObject,
-			fmt.Sprintf("collation %q (@ %s/%s) is not vendored in this build", name, unicode, cldr))
+			fmt.Sprintf("collation %q (@ %s/%s) is not provided by a loaded bundle", name, unicode, cldr))
 	}
 	coll := &Collation{
 		Name:           name,
 		UnicodeVersion: unicode,
 		CldrVersion:    cldr,
 		Description:    desc,
-		Singles:        vend.Singles,
-		Contractions:   vend.Contractions,
+		Singles:        loaded.Singles,
+		Contractions:   loaded.Contractions,
 	}
 	return coll, isDefault, nil
 }

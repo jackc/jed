@@ -694,14 +694,14 @@ func identityTableDB(t *testing.T) *Database {
 }
 
 // collationTableDB is a reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column
-// collations): the vendored unicode collation (the real version-pinned CLDR-DUCET root, UCA/UCD
+// collations): the loaded unicode collation (the real version-pinned CLDR-DUCET root, UCA/UCD
 // 17.0.0) as the per-database default (is_default), a column with explicit COLLATE "unicode" (flags
 // bit6 + name), an un-annotated column inheriting the default (bit6 + name), and an explicit
-// COLLATE "C" column (no collation). unicode is NOT imported — it is vendored, and its metadata entry
-// is emitted because the schema references it. Must match the Ruby reference's COLLATION_TABLE.
+// COLLATE "C" column (no collation). unicode is NOT imported — it is provided by a loaded bundle, and
+// its metadata entry is emitted because the schema references it. Must match the Ruby COLLATION_TABLE.
 func collationTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
-	if err := db.SetDefaultCollation("unicode"); err != nil { // vendored — no import
+	if err := db.SetDefaultCollation("unicode"); err != nil { // loaded — no import
 		t.Fatalf("set default: %v", err)
 	}
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode", `+
@@ -713,7 +713,7 @@ func collationTableDB(t *testing.T) *Database {
 
 // collationPKTableDB: a collated text PRIMARY KEY + a collated secondary index (slice 1e,
 // encoding.md §2.12) — both keys store the unicode UCA sort key, so the B-tree iterates in
-// collation order. unicode is vendored (not the default; its entry is emitted because the columns
+// collation order. unicode is loaded (not the default; its entry is emitted because the columns
 // reference it). Must match the Ruby reference's COLLATION_PK_TABLE.
 func collationPKTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
@@ -727,6 +727,7 @@ func collationPKTableDB(t *testing.T) *Database {
 
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 func TestWriteMatchesGoldens(t *testing.T) {
+	loadFixtureBundle(t) // the unicode-collated goldens need the bundle loaded (collation.md §4)
 	cases := []struct {
 		name  string
 		build func(*testing.T) *Database
@@ -790,6 +791,7 @@ func TestWriteMatchesGoldens(t *testing.T) {
 // READ side: loading a golden reproduces the same rows the builder produced. The
 // torn-meta goldens must read through the valid slot to the pk_table content.
 func TestReadGoldensReproducesRows(t *testing.T) {
+	loadFixtureBundle(t) // the unicode-collated goldens open via a loaded bundle (collation.md §4)
 	cases := []struct {
 		name  string
 		build func(*testing.T) *Database

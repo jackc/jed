@@ -13,7 +13,6 @@ package jed
 // persistence, no host seam. Only deterministic collations and non-ignorable variable weighting.
 
 import (
-	"embed"
 	"fmt"
 	"sort"
 	"strconv"
@@ -688,66 +687,76 @@ func OpenCollation(bytes []byte) (*Collation, error) {
 	}, nil
 }
 
-// --- Vendored collation set (spec/design/collation.md §2/§9) ------------------------------------
+// --- The engine-global loaded collation set (spec/design/collation.md §4/§9) --------------------
 //
-// In the reference-only model the engine reads collations from a set VENDORED into the binary, not
-// from the database file (the file only references a collation by name + version). Production
-// OpenCollations these embedded .coll artifacts once at startup and serves every later use from
-// them. The vendored set is the real version-pinned data (spec/collation/17.0.0, UCA/UCD 17.0.0 /
-// CLDR 48): unicode is the CLDR-tailored DUCET root (the table ICU/PostgreSQL use), es is that root
-// plus the Spanish ñ tailoring. The footprint tiers (§13) and the broader tailoring set (sv/da/de —
-// needing the deferred LDML [before]/expansion features) are later slices (§14). The dev-* fixtures
-// are NOT vendored — they only drive the cross-core compiler/sort-key vectors. The .coll bytes are
-// synced from spec/collation/fixtures by scripts/vendor_collations.rb (rake verify checks drift) and
-// are byte-identical across cores, so every core vendors the identical table (§9/§10).
-
-//go:embed collationdata/*.coll
-var vendoredFS embed.FS
+// The bare binary carries NO Unicode data — no embedded .coll, no casing tables (§9/§16, the SQLite
+// model). All collations arrive at runtime: a host hands the engine a JUCD bundle's bytes via
+// LoadUnicodeData (db.LoadUnicodeData), the engine merges its root + per-locale deltas (§5.1) and
+// adds the resulting collations here. This set is PROCESS-GLOBAL — a property of the running engine,
+// not of one Database handle (the spec's "loaded set available to any database on this handle",
+// §4.2). Global is what lets a file REFERENCING a collation be opened after the bundle is loaded:
+// open resolves the referenced table from here (format.go), and open mints the handle, so the data
+// cannot live on the handle. "C" is never here (table-free, built in).
+//
+// The bytes are jed's OWN pinned tables (byte-identical across cores, §9/§10), so loading restores
+// no nondeterminism — a use stays pure regardless of where the host sourced the bytes (file / fetch
+// / compiled-in asset). The real version-pinned production bundle is
+// spec/collation/fixtures/unicode.jucd (unicode = the CLDR-DUCET root, es = root + the Spanish ñ
+// tailoring); the dev-* fixtures are not part of it (they only drive the cross-core vectors).
 
 var (
-	vendoredOnce sync.Once
-	vendoredColl map[string]*Collation
+	loadedMu   sync.RWMutex
+	loadedColl = map[string]*Collation{}
 )
 
-func vendored() map[string]*Collation {
-	vendoredOnce.Do(func() {
-		vendoredColl = map[string]*Collation{}
-		entries, err := vendoredFS.ReadDir("collationdata")
-		if err != nil {
-			panic(fmt.Sprintf("vendored collations: %v", err))
+// LoadUnicodeData loads a JUCD Unicode-data bundle's collations into the engine-global loaded set
+// (spec/design/collation.md §4/§9): parse the bundle, merge the root + each per-locale delta (§5.1),
+// and register every collation by name. ADDITIVE — a name already present is NOT replaced (the first
+// bundle to provide it wins; resolution is by name in load order, §4.2), so re-loading the same
+// bundle is an idempotent no-op. The property/casing section is parsed and validated but not yet
+// consumed (casing lands in slice 3e). A malformed bundle is XX001 (data_corrupted).
+//
+// This is the engine primitive behind db.LoadUnicodeData. Because the set is process-global it may
+// be called BEFORE opening any file (which is required: opening a file that references a collation
+// resolves its table from this set). Privileged host op — the engine reads no file path and reaches
+// no host data (§11); the host sources the bytes.
+func LoadUnicodeData(data []byte) error {
+	bundle, err := OpenBundle(data)
+	if err != nil {
+		return err
+	}
+	colls, _, err := LoadBundle(bundle)
+	if err != nil {
+		return err
+	}
+	loadedMu.Lock()
+	defer loadedMu.Unlock()
+	for _, c := range colls {
+		if _, ok := loadedColl[c.Name]; !ok {
+			loadedColl[c.Name] = c
 		}
-		for _, e := range entries {
-			if e.IsDir() || !strings.HasSuffix(e.Name(), ".coll") {
-				continue
-			}
-			b, err := vendoredFS.ReadFile("collationdata/" + e.Name())
-			if err != nil {
-				panic(fmt.Sprintf("vendored collation %s: %v", e.Name(), err))
-			}
-			coll, err := OpenCollation(b)
-			if err != nil {
-				panic(fmt.Sprintf("vendored collation %s: %v", e.Name(), err))
-			}
-			vendoredColl[coll.Name] = coll
-		}
-	})
-	return vendoredColl
+	}
+	return nil
 }
 
-// VendoredCollation looks up a collation VENDORED into this binary by its exact (case-sensitive)
-// name (spec/design/collation.md §2/§9). nil ⇒ not vendored. "C" is never here (table-free, built
-// in). The resolver consults the database's referenced collations first, then this set.
-func VendoredCollation(name string) *Collation {
-	return vendored()[name]
+// LoadedCollation looks up a collation in the engine-global LOADED set by its exact (case-sensitive)
+// name (spec/design/collation.md §4/§9). nil ⇒ no loaded bundle provides it. "C" is never here
+// (table-free, built in). The resolver consults the database's referenced collations first, then
+// this set.
+func LoadedCollation(name string) *Collation {
+	loadedMu.RLock()
+	defer loadedMu.RUnlock()
+	return loadedColl[name]
 }
 
-// vendoredCollations returns every vendored collation, ascending by name — a deterministic order
+// loadedCollationTables returns every loaded collation, ascending by name — a deterministic order
 // with no hash-iteration leak (CLAUDE.md §8). The raw tables; the public CollationInfo view is the
-// package-level VendoredCollations (executor.go).
-func vendoredCollations() []*Collation {
-	m := vendored()
-	out := make([]*Collation, 0, len(m))
-	for _, c := range m {
+// Database.LoadedCollations method (executor.go).
+func loadedCollationTables() []*Collation {
+	loadedMu.RLock()
+	defer loadedMu.RUnlock()
+	out := make([]*Collation, 0, len(loadedColl))
+	for _, c := range loadedColl {
 		out = append(out, c)
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })

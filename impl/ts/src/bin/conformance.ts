@@ -7,7 +7,7 @@
 import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
-import { vendoredCollation } from "../collation.ts";
+import { loadedCollation, loadUnicodeData } from "../collation.ts";
 import {
   advancingClock,
   Database,
@@ -27,15 +27,18 @@ import {
   type WriteHandle,
 } from "../lib.ts";
 
-function suitesDir(): string {
+function repoRoot(): string {
   let dir = import.meta.dirname; // .../impl/ts/src/bin
   for (;;) {
-    const candidate = join(dir, "spec", "conformance", "suites");
-    if (existsSync(candidate)) return candidate;
+    if (existsSync(join(dir, "spec", "conformance", "suites"))) return dir;
     const parent = dirname(dir);
     if (parent === dir) throw new Error("could not locate spec/conformance/suites");
     dir = parent;
   }
+}
+
+function suitesDir(): string {
+  return join(repoRoot(), "spec", "conformance", "suites");
 }
 
 // parseLoadCollationDirective parses a `# load-collation: <name> = <fixture>[, <fixture>…]` line —
@@ -59,14 +62,17 @@ function parseLoadCollationDirective(line: string): [string, string[]] | null {
   return [name, paths];
 }
 
-// loadCollation asserts a collation named `name` is available to the records that follow
-// (spec/design/collation.md §2/§9/§10). In the reference-only model a collation is VENDORED into the
-// binary; the directive only DECLARES the dependency, so this checks the build vendors it (no import,
-// nothing baked — the corpus exercises the pure vendored read path). A name this build does not vendor
-// throws, naming it (the directive's fixture paths are now a vestigial provenance note, not loaded).
+// loadCollation makes a collation named `name` available to the records that follow
+// (spec/design/collation.md §2/§9/§10). The harness acts as the HOST: it loads jed's own pinned
+// production JUCD bundle (spec/collation/fixtures/unicode.jucd) into the engine-global set via
+// db.loadUnicodeData (idempotent — the set is global), exactly as a production host would, then
+// asserts the named collation now resolves. A name no loaded bundle provides throws, naming it (the
+// directive's fixture paths are now a documentary provenance note, not loaded).
 function loadCollation(name: string): void {
-  if (vendoredCollation(name) !== undefined) return;
-  throw new Error(`load-collation: collation "${name}" is not vendored in this build`);
+  const path = join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd");
+  loadUnicodeData(readFileSync(path));
+  if (loadedCollation(name) !== undefined) return;
+  throw new Error(`load-collation: collation "${name}" is not provided by the loaded bundle`);
 }
 
 function parseRequires(text: string): string[] {

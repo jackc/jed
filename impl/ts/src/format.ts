@@ -29,7 +29,7 @@ import {
   pkIndices,
 } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
-import { type Collation, vendoredCollation } from "./collation.ts";
+import { type Collation, loadedCollation } from "./collation.ts";
 import { Decimal } from "./decimal.ts";
 import { decodeInt, decodeIntAt, encodeNullable } from "./encoding.ts";
 import { engineError } from "./errors.ts";
@@ -1213,14 +1213,15 @@ function decodeCollationEntry(
   const unicode = readString(buf, cur);
   const cldr = readString(buf, cur);
   const desc = readString(buf, cur);
-  // The file records only the version PIN; the table comes from the vendored set. A name this build
-  // does not vendor is a legible failure (the precursor to the graded open-time verdict —
-  // compatibility.md §7 / collation.md §12, slice 2d, which will soften this to read-only degrade).
-  const vend = vendoredCollation(name);
-  if (vend === undefined) {
+  // The file records only the version PIN; the table comes from a loaded bundle (the host must have
+  // loaded one providing this collation before opening — collation.md §4/§9). A name no loaded bundle
+  // provides is a legible failure (the precursor to the graded open-time verdict — compatibility.md
+  // §7 / collation.md §12, slice 2d, which will soften this to read-only degrade).
+  const loaded = loadedCollation(name);
+  if (loaded === undefined) {
     throw engineError(
       "undefined_object",
-      `collation "${name}" (@ ${unicode}/${cldr}) is not vendored in this build`,
+      `collation "${name}" (@ ${unicode}/${cldr}) is not provided by a loaded bundle`,
     );
   }
   const coll: Collation = {
@@ -1228,8 +1229,8 @@ function decodeCollationEntry(
     unicodeVersion: unicode,
     cldrVersion: cldr,
     description: desc,
-    singles: vend.singles,
-    contractions: vend.contractions,
+    singles: loaded.singles,
+    contractions: loaded.contractions,
   };
   return { coll, isDefault };
 }

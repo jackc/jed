@@ -134,7 +134,6 @@ task :verify do
     ["operator codegen (drift)", "scripts/gen_catalog.rb", "--check"],
     ["cost codegen (drift)", "scripts/gen_costs.rb", "--check"],
     ["error codegen (drift)", "scripts/gen_errors.rb", "--check"],
-    ["vendored collations (drift)", "scripts/vendor_collations.rb", "--check"],
   ]
   failures = []
   checks.each do |name, script, *args|
@@ -153,7 +152,7 @@ end
 #   go                — gofumpt (mise-pinned go tool); a stricter SUPERSET of gofmt (its output
 #                       is always gofmt-clean too), chosen because mise already pins it.
 #   impl/ts, bench/ts — biome (mise-pinned; biome.json at repo root). 2-space, lineWidth 100. The
-#                       four @generated TS files (operators/costs/ranges_gen/vendored) are EXCLUDED
+#                       @generated TS files (operators/costs/ranges_gen/sqlstate) are EXCLUDED
 #                       there, so the codegen drift check (`rake verify`) stays their single source
 #                       of truth. Biome's LINTER is on with a tailored ruleset (noNonNullAssertion /
 #                       useTemplate / noVoidTypeReturn OFF — deliberate engine idioms), but FORMAT

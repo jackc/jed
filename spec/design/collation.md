@@ -67,22 +67,32 @@
 > - **Landed since (slice 1f):** the **real version-pinned DUCET root** — `unicode`, the CLDR-tailored
 >   DUCET (UCA/UCD **17.0.0**, CLDR 48, `spec/collation/17.0.0/root.allkeys`, the table ICU/PostgreSQL
 >   use) — and `es` (root + the Spanish `&N<ñ<<<Ñ` tailoring) replace the `dev-*` fixtures in the
->   production **vendored** set, in all three cores + the Ruby reference (byte-identical `.coll`,
+>   production set (now shipped as the host-loaded `unicode.jucd`, §9), in all three cores + the Ruby
+>   reference (byte-identical `.coll`,
 >   oracle-clean against `postgres:18`'s ICU for the covered letters). The `dev-*` fixtures are
 >   retained **only** as the small cross-core compiler/sort-key vectors. CJK/implicit-weight ranges
 >   (tier-3) raise `0A000`; the embedder-chosen footprint tiers (§13) and the broader tailoring set
 >   (sv/da/de — needing the deferred LDML `[before]`/expansion/contraction features) remain follow-ons.
-> - **Not yet built:** **Slice 3** — the host-loaded `JUCD` bundle, the bytes/reader load seam, the
->   builder tool, root-sharing (root + deltas merged at load), and the ASCII-casing baseline
->   (§9/§13/§14/§16); implicit weights / the full CJK tier-3 root; the broader LDML tailoring features
->   (and the sv/da/de tailorings that need them); and the [compatibility.md](compatibility.md)
->   manifest/verdict that reference-only leans on (§2d). (The slice-2 "embedder-chosen footprint
->   tiers" are **superseded** by Slice 3's builder-tool bundle presets — §13.)
+> - **Landed (Slice 3 — host-loaded `JUCD` bundle):** the **bundle codec** (`JUCD`, §9 /
+>   [../collation/README.md §5](../collation/README.md)) with **root-sharing** (the DUCET root once +
+>   per-locale sparse deltas merged at load, byte-identical to the full `.coll` — the merge-identity
+>   vectors) in all three cores; the **bytes/reader load seam** `db.LoadUnicodeData` + introspection
+>   `db.LoadedCollations` (§4.2); and the real production bundle `spec/collation/fixtures/unicode.jucd`
+>   (root `unicode` + `es`) that the cores LOAD. The compile-time embed (`include_bytes!` /
+>   `//go:embed` / base64) is **gone** — the bare binary carries no Unicode data (the SQLite model,
+>   §16); embedding is now a host choice (the host hands the same bytes to `LoadUnicodeData`).
+> - **Not yet built (Slice 3 remainder):** the **builder CLI** (3b — `gen_collation_vectors` writes the
+>   one production bundle today; the preset-driven assembler is the follow-on) and the **ASCII-casing
+>   baseline + property section** (3e, §16, lands with `lower`/`upper`/`ILIKE`); implicit weights / the
+>   full CJK tier-3 root; the broader LDML tailoring features (and the sv/da/de tailorings that need
+>   them); and the [compatibility.md](compatibility.md) manifest/verdict that reference-only leans on
+>   (§2d). (The slice-2 "embedder-chosen footprint tiers" are **superseded** by Slice 3's builder-tool
+>   bundle presets — §13.)
 >
 > Two foundational choices are unchanged: the definition format is the **UCA/CLDR standards** (DUCET
 > `allkeys.txt` + LDML), and the `.coll` **compiled artifact is the one shared cross-core form** every
-> core embeds and reads (`OpenCollation`) — never a per-core compile (§9, the [timezones.md §3.3](timezones.md)
-> compiled-TZif precedent).
+> core loads (via the `JUCD` bundle) and reads (`OpenCollation`) — never a per-core compile (§9, the
+> [timezones.md §3.3](timezones.md) compiled-TZif precedent).
 
 Collation is the rule for **ordering and equating** text, layered on the *encoding* (which
 maps characters to bytes — jed commits to UTF-8 everywhere). jed ships exactly one collation
@@ -308,8 +318,15 @@ thereafter:
 - **`db.LoadUnicodeData(bytesOrReader)`** — privileged host op (not SQL-reachable, no path, no I/O in
   the engine, §11): parse a `JUCD` bundle, merge root + deltas (§9), and add its collations + property
   tables to the loaded set. **Additive** — multiple bundles may be loaded; resolution is by name in
-  load order (§9). The host sources the bytes (file / fetch / compiled-in asset), which is the whole
-  of the "self-contained binary vs. external file" choice — there is no engine-side mode.
+  load order (a name an earlier bundle already provides is kept, §9). The host sources the bytes (file
+  / fetch / compiled-in asset), which is the whole of the "self-contained binary vs. external file"
+  choice — there is no engine-side mode. The loaded set is **engine-global** (a property of the running
+  engine, not of one handle — "the loaded set available to any database on this handle"), which is what
+  lets a host load a bundle **before opening** a file that *references* one of its collations: open
+  resolves the referenced table from the loaded set (§5), and `open` mints the handle, so the data
+  cannot live on the handle. Each core therefore exposes the load as both the `db.` method here and an
+  engine-level call the host may invoke prior to `open` (Rust `jed::load_unicode_data`, Go
+  `jed.LoadUnicodeData`, TS `loadUnicodeData`); both populate the one engine-global set.
 - **`db.SetDefaultCollation(name)` / `db.DefaultCollation()`** set/read the per-database default
   (the name must be in a loaded bundle, else `42704`).
 - **`db.Collations()`** introspects **this database's referenced** collations; **`db.LoadedCollations()`**

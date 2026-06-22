@@ -107,25 +107,6 @@ pub struct CollationInfo {
     pub is_default: bool,
 }
 
-/// The collations **vendored into this engine build** — the build-global set every database opened by
-/// this binary can use (spec/design/collation.md §4.2/§13). A property of the *binary*, independent of
-/// any database; for the collations a particular database *references*, use `Database::collations`.
-/// Ascending by name; `is_default` is always `false` here (that is a per-database property, not a
-/// build one). `C` is built in and not listed.
-pub fn vendored_collations() -> Vec<CollationInfo> {
-    collation::vendored_collations()
-        .into_iter()
-        .map(|c| CollationInfo {
-            name: c.name.clone(),
-            unicode_version: c.unicode_version.clone(),
-            cldr_version: c.cldr_version.clone(),
-            content_hash: crate::format::crc32_ieee(&collation::serialize_table(&c)),
-            description: c.description.clone(),
-            is_default: false,
-        })
-        .collect()
-}
-
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct ScriptSummary {
     /// How many statements ran (each non-empty span the splitter yielded).
@@ -277,15 +258,15 @@ impl Snapshot {
 
     /// Resolve a collation name for USE — query resolution and key encoding (spec/design/collation.md
     /// §2/§9). The collations the database has resolved (a cache populated on open from the file's
-    /// reference entries, carrying their version pin) first, then the set **vendored into this
-    /// binary**. `None` ⇒ neither has it (the resolver raises 42704). `C` is handled by the caller
-    /// (built-in). This is the reference-only read path: a collation is never baked into the file — the
-    /// file references it by name and the table comes from the vendored set.
+    /// reference entries, carrying their version pin) first, then the engine-global **loaded** set
+    /// (`db.LoadUnicodeData`, §4). `None` ⇒ neither has it (the resolver raises 42704). `C` is handled
+    /// by the caller (built-in). This is the reference-only read path: a collation is never baked into
+    /// the file — the file references it by name and the table comes from a loaded bundle.
     pub(crate) fn resolve_collation(&self, name: &str) -> Option<std::sync::Arc<Collation>> {
         self.collations
             .get(name)
             .cloned()
-            .or_else(|| crate::collation::vendored_collation(name))
+            .or_else(|| crate::collation::loaded_collation(name))
     }
 
     /// Record a collation resolved from a file reference entry on open (its file metadata + the
@@ -320,7 +301,7 @@ impl Snapshot {
                     EngineError::new(
                         SqlState::UndefinedObject,
                         format!(
-                            "collation \"{name}\" referenced by the schema is not vendored in this build"
+                            "collation \"{name}\" referenced by the schema is not provided by a loaded bundle"
                         ),
                     )
                 })
@@ -2116,12 +2097,46 @@ impl Database {
     }
 
     // `import_collation` / `export_collation` are GONE (the reference-only pivot,
-    // spec/design/collation.md §4.2): a collation is vendored into the binary and used by name, never
-    // loaded into a database. There is no runtime path that constructs or bakes a collation table.
+    // spec/design/collation.md §4.2): a collation is provided by a host-loaded bundle and used by
+    // name, never loaded into a *database*. There is no runtime path that constructs or bakes a
+    // collation table — the only load is `load_unicode_data` of jed's own pinned bundle bytes.
+
+    /// Load a `JUCD` Unicode-data bundle (`db.LoadUnicodeData`, spec/design/collation.md §4.2): its
+    /// collations become resolvable by name for `COLLATE`, per-column collation, and `ORDER BY …
+    /// COLLATE`. The loaded set is **engine-global** (§9), so a bundle loaded through any handle is
+    /// visible everywhere — including to a later `Database::open` of a file that *references* one of
+    /// its collations. Privileged host op (not SQL-reachable, no path, no engine I/O — §11);
+    /// **additive** and idempotent for an already-loaded bundle. A malformed bundle is `XX001`.
+    /// (Mirrors the engine-global [`crate::collation::load_unicode_data`], which the host may call
+    /// before opening any file.)
+    pub fn load_unicode_data(&self, bytes: &[u8]) -> Result<()> {
+        crate::collation::load_unicode_data(bytes)
+    }
+
+    /// Introspect the engine-global **loaded** collation set (`db.LoadedCollations`,
+    /// spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
+    /// database on this handle, each as `(name, unicode_version, cldr_version, content_hash,
+    /// description, is_default)`, ascending by name. A property of the running *engine*, not of this
+    /// database; for the collations this database *references*, use [`Database::collations`].
+    /// `is_default` is always `false` here (that is a per-database property). `C` is built in and not
+    /// listed.
+    pub fn loaded_collations(&self) -> Vec<CollationInfo> {
+        collation::loaded_collation_tables()
+            .into_iter()
+            .map(|c| CollationInfo {
+                name: c.name.clone(),
+                unicode_version: c.unicode_version.clone(),
+                cldr_version: c.cldr_version.clone(),
+                content_hash: crate::format::crc32_ieee(&collation::serialize_table(&c)),
+                description: c.description.clone(),
+                is_default: false,
+            })
+            .collect()
+    }
 
     /// Set the per-database default collation (`db.SetDefaultCollation`, spec/design/collation.md
     /// §1). An un-annotated `text` column created afterward inherits it. The name must be `C` (resets
-    /// to byte order) or a **vendored** collation (else 42704). Persisted as the `is_default` flag on
+    /// to byte order) or a **loaded** collation (else 42704). Persisted as the `is_default` flag on
     /// that collation's reference entry at the next `commit` (the entry is emitted because the default
     /// references it — §5).
     pub fn set_default_collation(&mut self, name: &str) -> Result<()> {
@@ -2151,12 +2166,12 @@ impl Database {
     /// Introspect the collations **this database references** (`db.Collations`,
     /// spec/design/collation.md §4.2) — every collation its schema uses (a column's `COLLATE`, or the
     /// per-database default), each as `(name, unicode_version, cldr_version, content_hash,
-    /// description, is_default)`, in ascending name order. This is the *per-file* view; for the set
-    /// **vendored into the engine** (build-global), use the free `vendored_collations()`. `C` is built
-    /// in and not listed.
+    /// description, is_default)`, in ascending name order. This is the *per-file* view; for the
+    /// engine-global **loaded** set, use [`Database::loaded_collations`]. `C` is built in and not
+    /// listed.
     pub fn collations(&self) -> Vec<CollationInfo> {
         let default = self.committed.default_collation();
-        // referenced_collations resolves each referenced name (vendored, here always resolvable).
+        // referenced_collations resolves each referenced name (from a loaded bundle).
         self.committed
             .referenced_collations()
             .unwrap_or_default()

@@ -1,4 +1,4 @@
-//! Regeneration tool for the collation vendored artifacts + cross-core byte vectors, produced from
+//! Regeneration tool for the collation artifacts + cross-core byte vectors, produced from
 //! the Rust core and cross-confirmed by Go/TS (CLAUDE.md §8). UCA sort keys are not safely
 //! hand-authored (spec/collation/README.md §6), so the vectors are generated here and the case lists
 //! below are their source of truth. Run after changing a fixture/source or a byte format:
@@ -8,17 +8,19 @@
 //!   * DEV fixtures (`dev-root`, `dev-nordic`) — tiny hand-authored definitions that exercise the
 //!     compiler + executor (expansion, a tailoring, an astral code point) cheaply. They drive the
 //!     `compiler.toml` vectors (the cross-core compiler contract, small enough to inline as hex) and
-//!     their own sort-key vectors. NOT vendored into production.
-//!   * VENDORED collations (`unicode` = the real version-pinned CLDR-DUCET root, `es` = root + the
-//!     Spanish ñ tailoring) — the real production set (spec/collation/17.0.0/). Their compiled `.coll`
-//!     is written to spec/collation/fixtures/ and embedded into every core; `scripts/vendor_collations.rb`
-//!     distributes it. Their table is ~0.5 MB, far too large to inline in `compiler.toml`, so they are
-//!     pinned instead by (a) the byte-identical embedded `.coll` (the drift gate) and (b) their
-//!     sort-key vectors below (the executor contract, computed from the compiled table).
+//!     their own sort-key vectors. NOT part of the production bundle.
+//!   * The production `JUCD` bundle (`unicode.jucd`) — the DUCET root `unicode` once + the `es`
+//!     tailoring as a sparse delta (README §5), the bytes a host LOADS via `db.LoadUnicodeData`
+//!     (collation.md §4/§9, slice 3c). The per-collation `.coll` artifacts (`unicode.coll`/`es.coll`)
+//!     are kept as the builder's intermediate + the golden unit (§4.1); the bundle is built from the
+//!     same compiled tables and self-checks the load-time merge identity here. The tables are ~0.5 MB,
+//!     far too large to inline in `compiler.toml`, so the bundle is pinned instead by (a) the cores
+//!     reading it identically and (b) the sort-key vectors below (the executor contract, computed from
+//!     the compiled table, which the loaded bundle must reproduce byte-for-byte — README §5.1).
 
 use jed::collation::{
-    Collation, build_bundle, compile_collation, save_bundle, save_collation, serialize_table,
-    sort_key,
+    Collation, build_bundle, compile_collation, load_bundle, open_bundle, save_bundle,
+    save_collation, serialize_table, sort_key,
 };
 use std::path::Path;
 
@@ -78,8 +80,8 @@ fn main() {
             "dev-nordic",
         ),
     ];
-    // (def_files, coll_name) — the real version-pinned vendored set (their `.coll` is embedded).
-    let vendored: &[(&[&str], &str)] = &[
+    // (def_files, coll_name) — the real version-pinned production set (packed into unicode.jucd).
+    let production: &[(&[&str], &str)] = &[
         (&["collation/17.0.0/root.allkeys"], "unicode"),
         (
             &["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"],
@@ -87,8 +89,14 @@ fn main() {
         ),
     ];
 
-    // --- write the vendored .coll artifacts the cores embed (spec/design/collation.md §9) ---
-    for (files, name) in vendored {
+    // --- write the per-collation .coll intermediates (§4.1) + the production JUCD bundle the cores
+    //     LOAD via db.LoadUnicodeData (spec/design/collation.md §4/§9, slice 3c) ---
+    // The `.coll` artifacts stay the golden unit / builder intermediate; the bundle ships the DUCET
+    // root `unicode` once + the `es` tailoring as a sparse delta merged at load (README §5.1). No
+    // property/casing section yet (slice 3e). An empty description keeps the loaded collations'
+    // introspection identical to the compiled tables (compile_collation emits an empty description).
+    let mut compiled: Vec<Collation> = Vec::new();
+    for (files, name) in production {
         let coll = compile(files, name);
         let artifact = save_collation(&coll);
         std::fs::write(
@@ -96,6 +104,29 @@ fn main() {
             &artifact,
         )
         .unwrap();
+        compiled.push(coll);
+    }
+    {
+        let root = compiled
+            .iter()
+            .find(|c| c.name == "unicode")
+            .expect("unicode root");
+        let tailorings: Vec<&Collation> = compiled.iter().filter(|c| c.name != "unicode").collect();
+        let bundle = build_bundle(root, &tailorings, None, "");
+        let bytes = save_bundle(&bundle);
+        // self-check: open → load → merge reproduces each full `.coll` table byte-identically
+        // (README §5.1), so a stale bundle is caught at generation, not only by the cores' vectors.
+        let (colls, _property) = load_bundle(&open_bundle(&bytes).unwrap()).unwrap();
+        for full in &compiled {
+            let loaded = colls.iter().find(|c| c.name == full.name).unwrap();
+            assert_eq!(
+                serialize_table(loaded),
+                serialize_table(full),
+                "JUCD merge identity broken for {}",
+                full.name
+            );
+        }
+        std::fs::write(out_path("collation/fixtures/unicode.jucd"), &bytes).unwrap();
     }
 
     // --- compiler.toml — DEV fixtures only (small enough to pin as full hex) ---
@@ -116,9 +147,9 @@ fn main() {
         "# then compiled under coll_name. Only the small DEV fixtures are pinned here; the real\n",
     );
     out.push_str(
-        "# vendored tables (unicode/es) are ~0.5 MB and are pinned by their embedded .coll +\n",
+        "# production tables (unicode/es) are ~0.5 MB and are pinned by the cores loading the JUCD\n",
     );
-    out.push_str("# the sort-key vectors instead (spec/design/collation.md §9/§10).\n\n");
+    out.push_str("# bundle + the sort-key vectors instead (spec/design/collation.md §9/§10).\n\n");
     out.push_str("schema_version = 1\n");
     for (label, files, name) in dev {
         let coll = compile(files, name);
@@ -133,7 +164,7 @@ fn main() {
     }
     std::fs::write(out_path("collation/vectors/compiler.toml"), &out).unwrap();
 
-    // --- sortkey.toml — DEV fixtures + the real vendored collations ---
+    // --- sortkey.toml — DEV fixtures + the real production collations ---
     // Strings chosen per collation; the harness also asserts they appear in ascending sort-key order,
     // so they are emitted (below) in true collation order. The real-collation cases double as the
     // executor cross-core contract over the version-pinned table.
@@ -185,7 +216,7 @@ fn main() {
         "# UTF-16-vs-code-point trap (types.md §11). The `unicode`/`es` cases are over the real\n",
     );
     out.push_str(
-        "# version-pinned vendored table; the harness resolves them via the embedded .coll.\n\n",
+        "# version-pinned production table; the harness resolves them via the loaded JUCD bundle.\n\n",
     );
     out.push_str("schema_version = 1\n");
 
@@ -275,6 +306,6 @@ fn main() {
     }
 
     println!(
-        "wrote spec/collation/fixtures/{{unicode,es}}.coll + vectors/{{compiler,sortkey,bundle}}.toml"
+        "wrote spec/collation/fixtures/{{unicode,es}}.coll + unicode.jucd + vectors/{{compiler,sortkey,bundle}}.toml"
     );
 }

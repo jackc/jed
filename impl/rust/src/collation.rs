@@ -604,61 +604,78 @@ pub fn open_collation(bytes: &[u8]) -> Result<Collation> {
     })
 }
 
-// --- Vendored collation set (spec/design/collation.md §2/§9) ------------------------------------
+// --- The engine-global loaded collation set (spec/design/collation.md §4/§9) --------------------
 //
-// In the reference-only model the engine reads collations from a set **vendored into the binary**,
-// not from the database file (the file only *references* a collation by name + version). Production
-// `OpenCollation`s these embedded `.coll` artifacts once at startup and serves every later use from
-// them. The vendored set is the real version-pinned data (spec/collation/17.0.0, UCA/UCD 17.0.0 /
-// CLDR 48): `unicode` is the CLDR-tailored DUCET root (the table ICU/PostgreSQL use), `es` is that
-// root plus the Spanish ñ tailoring. The embedder-chosen footprint tiers (§13) and the broader
-// tailoring set (sv/da/de — needing the deferred LDML `[before]`/expansion features) are later
-// slices (§14). The `.coll` bytes are the same artifact `gen_collation_vectors` writes and
-// `db.SaveCollation` produces — byte-identical across cores, so every core vendors the identical
-// table (§9/§10). The `dev-*` fixtures are NOT vendored — they only drive the cross-core
-// compiler/sort-key vectors (spec/collation/vectors).
+// The bare binary carries **no** Unicode data — no embedded `.coll`, no casing tables (§9/§16, the
+// SQLite model). All collations arrive at runtime: a host hands the engine a `JUCD` bundle's bytes
+// via [`load_unicode_data`] (`db.LoadUnicodeData`), the engine merges its root + per-locale deltas
+// (§5.1) and adds the resulting collations here. This set is **process-global** — a property of the
+// running engine, not of one `Database` handle (the spec's "loaded set available to any database on
+// this handle", §4.2). Global is what lets a file *referencing* a collation be opened after the
+// bundle is loaded: open resolves the referenced table from here (format.rs), and `open` mints the
+// handle, so the data cannot live on the handle. `C` is never here (table-free, built in).
+//
+// The bytes are jed's **own pinned** tables (byte-identical across cores, §9/§10), so loading
+// restores no nondeterminism — a *use* stays pure regardless of where the host sourced the bytes
+// (file / fetch / compiled-in asset). The real version-pinned production bundle is
+// spec/collation/fixtures/unicode.jucd (`unicode` = the CLDR-DUCET root, `es` = root + the Spanish
+// ñ tailoring, UCA/UCD 17.0.0 / CLDR 48); the `dev-*` fixtures are not part of it (they only drive
+// the cross-core compiler/sort-key vectors).
 
-/// The `(name, .coll bytes)` pairs compiled into this binary. The artifact's own embedded name is
-/// authoritative for the registry key (it always equals the label here).
-const VENDORED_COLL: &[(&str, &[u8])] = &[
-    (
-        "unicode",
-        include_bytes!("../../../spec/collation/fixtures/unicode.coll"),
-    ),
-    (
-        "es",
-        include_bytes!("../../../spec/collation/fixtures/es.coll"),
-    ),
-];
+static LOADED: std::sync::OnceLock<
+    std::sync::RwLock<std::collections::BTreeMap<String, std::sync::Arc<Collation>>>,
+> = std::sync::OnceLock::new();
 
-static VENDORED: std::sync::OnceLock<std::collections::HashMap<String, std::sync::Arc<Collation>>> =
-    std::sync::OnceLock::new();
-
-fn vendored() -> &'static std::collections::HashMap<String, std::sync::Arc<Collation>> {
-    VENDORED.get_or_init(|| {
-        let mut m = std::collections::HashMap::new();
-        for (label, bytes) in VENDORED_COLL {
-            let coll =
-                open_collation(bytes).unwrap_or_else(|e| panic!("vendored collation {label}: {e}"));
-            m.insert(coll.name.clone(), std::sync::Arc::new(coll));
-        }
-        m
-    })
+fn loaded_set()
+-> &'static std::sync::RwLock<std::collections::BTreeMap<String, std::sync::Arc<Collation>>> {
+    LOADED.get_or_init(|| std::sync::RwLock::new(std::collections::BTreeMap::new()))
 }
 
-/// Look up a collation **vendored into this binary** by its exact (case-sensitive) name
-/// (spec/design/collation.md §2/§9). `None` ⇒ not vendored. `C` is never here (table-free, built
-/// in). The resolver consults the database's referenced collations first, then this set.
-pub fn vendored_collation(name: &str) -> Option<std::sync::Arc<Collation>> {
-    vendored().get(name).cloned()
+/// Load a `JUCD` Unicode-data bundle's collations into the engine-global loaded set (§4/§9): parse
+/// the bundle, merge the root + each per-locale delta (§5.1), and register every collation by name.
+/// **Additive** — a name already present is **not** replaced (the first bundle to provide it wins;
+/// resolution is by name in load order, §4.2), so re-loading the same bundle is an idempotent no-op.
+/// The property/casing section is parsed and validated but not yet consumed (casing lands in slice
+/// 3e). A malformed bundle is `XX001` (`data_corrupted`).
+///
+/// This is the engine primitive behind `db.LoadUnicodeData`. Because the set is process-global it
+/// may be called **before** opening any file (which is required: opening a file that references a
+/// collation resolves its table from this set). It is a privileged host op — the engine reads no
+/// file path and reaches no host data (§11); the host sources the bytes.
+pub fn load_unicode_data(bytes: &[u8]) -> Result<()> {
+    let bundle = open_bundle(bytes)?;
+    let (colls, _property) = load_bundle(&bundle)?;
+    let mut set = loaded_set()
+        .write()
+        .expect("loaded-collation lock poisoned");
+    for c in colls {
+        set.entry(c.name.clone())
+            .or_insert_with(|| std::sync::Arc::new(c));
+    }
+    Ok(())
 }
 
-/// Every vendored collation, ascending by name — a deterministic order with no hash-iteration leak
-/// (CLAUDE.md §8). Used by introspection (`db.Collations`).
-pub fn vendored_collations() -> Vec<std::sync::Arc<Collation>> {
-    let mut v: Vec<std::sync::Arc<Collation>> = vendored().values().cloned().collect();
-    v.sort_by(|a, b| a.name.cmp(&b.name));
-    v
+/// Look up a collation in the engine-global **loaded** set by its exact (case-sensitive) name
+/// (spec/design/collation.md §4/§9). `None` ⇒ no loaded bundle provides it. `C` is never here
+/// (table-free, built in). The resolver consults the database's referenced collations first, then
+/// this set.
+pub fn loaded_collation(name: &str) -> Option<std::sync::Arc<Collation>> {
+    loaded_set()
+        .read()
+        .expect("loaded-collation lock poisoned")
+        .get(name)
+        .cloned()
+}
+
+/// Every loaded collation, ascending by name — a deterministic order with no hash-iteration leak
+/// (CLAUDE.md §8; the `BTreeMap` is already key-ordered). Backs introspection (`db.LoadedCollations`).
+pub fn loaded_collation_tables() -> Vec<std::sync::Arc<Collation>> {
+    loaded_set()
+        .read()
+        .expect("loaded-collation lock poisoned")
+        .values()
+        .cloned()
+        .collect()
 }
 
 #[allow(clippy::type_complexity)]
@@ -1155,6 +1172,19 @@ fn deserialize_property(raw: &[u8]) -> Result<PropertyTable> {
 mod bundle_tests {
     use super::*;
 
+    /// Load the real version-pinned production bundle (spec/collation/fixtures/unicode.jucd) into the
+    /// engine-global set, then hand back its `unicode`/`es` collations — the production read path the
+    /// cores now take (no embed). Idempotent (the loaded set is global + first-wins).
+    fn real(name: &str) -> std::sync::Arc<Collation> {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../spec/collation/fixtures/unicode.jucd"
+        );
+        let bytes = std::fs::read(path).expect("read unicode.jucd fixture");
+        load_unicode_data(&bytes).expect("load unicode.jucd");
+        loaded_collation(name).unwrap_or_else(|| panic!("loaded collation {name}"))
+    }
+
     // A small synthetic property section so the casing codec is exercised before `lower`/`upper`
     // land (Slice 3e): ASCII 'a'<->'A' simple, plus ß -> SS full (SpecialCasing).
     fn sample_property() -> PropertyTable {
@@ -1171,8 +1201,8 @@ mod bundle_tests {
 
     #[test]
     fn bundle_round_trips_byte_identically_and_merge_reproduces_the_full_table() {
-        let root = vendored_collation("unicode").expect("vendored unicode root");
-        let es = vendored_collation("es").expect("vendored es");
+        let root = real("unicode");
+        let es = real("es");
 
         let bundle = build_bundle(&root, &[&es], Some(sample_property()), "test bundle");
 
@@ -1216,7 +1246,7 @@ mod bundle_tests {
 
     #[test]
     fn open_bundle_rejects_a_tampered_trailer() {
-        let root = vendored_collation("unicode").unwrap();
+        let root = real("unicode");
         let mut bytes = save_bundle(&build_bundle(&root, &[], None, ""));
         let n = bytes.len();
         bytes[n - 1] ^= 0xFF; // corrupt the trailing CRC

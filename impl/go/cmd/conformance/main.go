@@ -105,6 +105,23 @@ func suitesDir() string {
 	}
 }
 
+// repoRoot walks up from the working dir to the repo root (the dir containing spec/), so the harness
+// can locate jed's pinned collation bundle from anywhere under impl/go.
+func repoRoot() string {
+	wd, _ := os.Getwd()
+	dir := wd
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "spec", "conformance", "suites")); err == nil {
+			return dir
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return wd
+		}
+		dir = parent
+	}
+}
+
 // parseLoadCollationDirective parses a `# load-collation: <name> = <fixture>[, <fixture>…]` line —
 // the corpus's deterministic, host-free way to make a collation available before the records that
 // use it (spec/design/collation.md §10). In the reference-only model the named collation is normally
@@ -131,17 +148,25 @@ func parseLoadCollationDirective(line string) (string, []string, bool) {
 	return strings.TrimSpace(name), paths, true
 }
 
-// loadCollation asserts a collation named `name` is available to the records that follow
-// (spec/design/collation.md §2/§9/§10). In the reference-only model a collation is VENDORED into the
-// binary; the directive only DECLARES the dependency, so this checks the build vendors it (no import,
-// nothing baked — the corpus exercises the pure vendored read path). A name this build does not vendor
-// fails the test, naming it (the directive's fixture paths are now a vestigial provenance note, not
-// loaded).
+// loadCollation makes a collation named `name` available to the records that follow
+// (spec/design/collation.md §2/§9/§10). The harness acts as the HOST: it loads jed's own pinned
+// production JUCD bundle (spec/collation/fixtures/unicode.jucd) into the engine-global set via
+// db.LoadUnicodeData (idempotent — the set is global), exactly as a production host would, then
+// asserts the named collation now resolves. A name no loaded bundle provides fails the test, naming
+// it (the directive's fixture paths are now a documentary provenance note, not loaded).
 func loadCollation(name string) error {
-	if jed.VendoredCollation(name) != nil {
-		return nil
+	path := filepath.Join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("load-collation: read %s: %w", path, err)
 	}
-	return fmt.Errorf("load-collation: collation %q is not vendored in this build", name)
+	if err := jed.LoadUnicodeData(data); err != nil {
+		return fmt.Errorf("load-collation: load unicode.jucd: %w", err)
+	}
+	if jed.LoadedCollation(name) == nil {
+		return fmt.Errorf("load-collation: collation %q is not provided by the loaded bundle", name)
+	}
+	return nil
 }
 
 func parseRequires(text string) []string {

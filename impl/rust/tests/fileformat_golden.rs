@@ -24,6 +24,16 @@ fn fixture(name: &str) -> Vec<u8> {
     std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()))
 }
 
+/// Load jed's pinned production `JUCD` bundle into the engine-global set so the `unicode`-collated
+/// goldens build (set_default_collation / COLLATE) and read back (the file's reference entry resolves
+/// its table from a loaded bundle — collation.md §4/§9, slice 3c). Idempotent (global, first-wins).
+fn load_unicode() {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../../spec/collation/fixtures/unicode.jucd");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    jed::load_unicode_data(&bytes).expect("load unicode.jucd");
+}
+
 fn run(db: &mut Database, sql: &str) {
     execute(db, sql).unwrap_or_else(|e| panic!("{sql:?}: {}", e.message));
 }
@@ -857,6 +867,7 @@ fn collation_pk_table_db() -> Database {
 /// WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 #[test]
 fn write_matches_goldens() {
+    load_unicode(); // the unicode-collated goldens need the bundle loaded (collation.md §4)
     let cases: &[(&str, Builder)] = &[
         ("empty_db.jed", Database::new),
         ("overflow_table.jed", overflow_table_db),
@@ -916,6 +927,7 @@ fn write_matches_goldens() {
 /// torn-meta goldens must read through the valid slot to the pk_table content.
 #[test]
 fn read_goldens_reproduces_rows() {
+    load_unicode(); // the unicode-collated goldens open via a loaded bundle (collation.md §4)
     let cases: &[(&str, Builder, &str)] = &[
         ("one_table_empty.jed", one_table_empty_db, "t"),
         ("overflow_table.jed", overflow_table_db, "t"),

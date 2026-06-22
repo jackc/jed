@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { Database, execute, loadUnicodeData } from "../src/lib.ts";
 import { crc32Ieee, loadDatabase, toImage } from "../src/format.ts";
 import { scalarT } from "../src/types.ts";
 import { specPath } from "./tomlmini.ts";
@@ -19,6 +19,13 @@ const GOLDEN_PAGE_SIZE = 256;
 function fixture(name: string): Uint8Array {
   // Copy into a fresh, zero-offset Uint8Array (Node Buffers can be pool-backed slices).
   return new Uint8Array(readFileSync(specPath(`fileformat/fixtures/${name}`)));
+}
+
+// Load jed's pinned production JUCD bundle so the unicode-collated goldens build (setDefaultCollation
+// / COLLATE) and read back (the file's reference entry resolves its table from a loaded bundle —
+// collation.md §4/§9, slice 3c). Idempotent (the loaded set is global, first-wins).
+function loadUnicode(): void {
+  loadUnicodeData(new Uint8Array(readFileSync(specPath("collation/fixtures/unicode.jucd"))));
 }
 
 function run(db: Database, sql: string): void {
@@ -687,14 +694,14 @@ function identityTableDB(): Database {
 }
 
 // collationTableDB is a reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column
-// collations): the vendored unicode collation (the real version-pinned CLDR-DUCET root, UCA/UCD
+// collations): the loaded unicode collation (the real version-pinned CLDR-DUCET root, UCA/UCD
 // 17.0.0) as the per-database default (is_default), a column with explicit COLLATE "unicode" (flags
 // bit6 + name), an un-annotated column inheriting the default (bit6 + name), and an explicit
-// COLLATE "C" column (no collation). unicode is NOT imported — it is vendored, and its metadata entry
-// is emitted because the schema references it. Must match the Ruby reference's COLLATION_TABLE.
+// COLLATE "C" column (no collation). unicode is NOT imported — it is provided by a loaded bundle, and
+// its metadata entry is emitted because the schema references it. Must match the Ruby COLLATION_TABLE.
 function collationTableDB(): Database {
   const db = goldenDb();
-  db.setDefaultCollation("unicode"); // vendored — no import
+  db.setDefaultCollation("unicode"); // loaded — no import
   run(
     db,
     `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode", ` +
@@ -707,7 +714,7 @@ function collationTableDB(): Database {
 
 // collationPKTableDB: a collated text PRIMARY KEY + a collated secondary index (slice 1e,
 // encoding.md §2.12) — both keys store the unicode UCA sort key, so the B-tree iterates in
-// collation order. unicode is vendored (not the default; its entry is emitted because the columns
+// collation order. unicode is loaded (not the default; its entry is emitted because the columns
 // reference it). Must match the Ruby reference's COLLATION_PK_TABLE.
 function collationPKTableDB(): Database {
   const db = goldenDb();
@@ -721,6 +728,7 @@ function collationPKTableDB(): Database {
 
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
+  loadUnicode(); // the unicode-collated goldens need the bundle loaded (collation.md §4)
   const cases: { name: string; build: () => Database }[] = [
     { name: "empty_db.jed", build: () => goldenDb() },
     { name: "overflow_table.jed", build: overflowTableDB },
@@ -780,6 +788,7 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
 // READ side: loading a golden reproduces the same rows the builder produced. The
 // torn-meta goldens must read through the valid slot to the pk_table content.
 test("read goldens reproduces rows", () => {
+  loadUnicode(); // the unicode-collated goldens open via a loaded bundle (collation.md §4)
   const cases: { name: string; build: () => Database; table: string }[] = [
     { name: "one_table_empty.jed", build: oneTableEmptyDB, table: "t" },
     { name: "overflow_table.jed", build: overflowTableDB, table: "t" },

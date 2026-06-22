@@ -1,14 +1,16 @@
 package jed
 
-// Collation host API + persistence (spec/design/collation.md §1/§4.2): the reference-only surface —
-// SetDefaultCollation / DefaultCollation, the per-file db.Collations (what the database REFERENCES)
-// vs the build-global VendoredCollations (what the engine VENDORS), per-column / per-database default
-// inheritance, collated keys, and the reference-only FILE ROUND-TRIP (format_version 18, entry_kind 3
-// metadata entries). These are the host-API + persistence behaviors the conformance corpus cannot
-// express (CLAUDE.md §10); the in-memory SQL behavior a collation drives (COLLATE / ORDER BY /
-// derivation / 42P21 / 42P22) lives in suites/collation/collate.test, which runs on every core. There
-// is NO ImportCollation: a collation is vendored into the binary and used by name (the reference-only
-// pivot, §4.2). Mirrors impl/rust/tests/collation_host.rs and impl/ts/tests/collation_host.test.ts.
+// Collation host API + persistence (spec/design/collation.md §1/§4.2): the host-loaded surface —
+// LoadUnicodeData (the JUCD bundle load seam), SetDefaultCollation / DefaultCollation, the per-file
+// db.Collations (what the database REFERENCES) vs the engine-global db.LoadedCollations (what a loaded
+// bundle PROVIDES), per-column / per-database default inheritance, collated keys, and the
+// reference-only FILE ROUND-TRIP (format_version 18, entry_kind 3 metadata entries). These are the
+// host-API + persistence behaviors the conformance corpus cannot express (CLAUDE.md §10); the
+// in-memory SQL behavior a collation drives (COLLATE / ORDER BY / derivation / 42P21 / 42P22) lives in
+// suites/collation/collate.test, which runs on every core. There is NO ImportCollation: the bare
+// binary carries no Unicode data and the host loads jed's own pinned bundle bytes (the SQLite model,
+// §9/§16), then uses collations by name. Mirrors impl/rust/tests/collation_host.rs and
+// impl/ts/tests/collation_host.test.ts.
 
 import "testing"
 
@@ -36,40 +38,43 @@ func eqStrings(a, b []string) bool {
 	return true
 }
 
-// ---- the vendored set (the engine-global build property) ----
+// ---- the loaded set (the engine-global property a bundle provides) ----
 
-func TestVendoredCollationsIsTheRealSet(t *testing.T) {
-	// VendoredCollations reports what THIS BUILD provides — the real version-pinned set (es, unicode),
-	// ascending by name, no IsDefault (a build property, not a per-db one). C is built in and never
-	// listed. The pin is UCA/UCD 17.0.0 (spec/collation/17.0.0).
-	v := VendoredCollations()
+func TestLoadedCollationsIsTheRealSet(t *testing.T) {
+	// db.LoadedCollations reports what a loaded bundle PROVIDES — after loading jed's pinned production
+	// bundle, the real version-pinned set (es, unicode), ascending by name, no IsDefault (an engine
+	// property, not a per-db one). C is built in and never listed. The pin is UCA/UCD 17.0.0.
+	loadFixtureBundle(t)
+	db := NewDatabase()
+	v := db.LoadedCollations()
 	names := make([]string, len(v))
 	for i, c := range v {
 		names[i] = c.Name
 		if c.IsDefault {
-			t.Fatalf("vendored %q must not be IsDefault", c.Name)
+			t.Fatalf("loaded %q must not be IsDefault", c.Name)
 		}
 	}
 	if !eqStrings(names, []string{"es", "unicode"}) {
-		t.Fatalf("vendored set: got %v, want [es unicode]", names)
+		t.Fatalf("loaded set: got %v, want [es unicode]", names)
 	}
 	if v[1].Name != "unicode" || v[1].UnicodeVersion != "17.0.0" {
 		t.Fatalf("unicode entry: got %+v", v[1])
 	}
-	if VendoredCollation("unicode") == nil || VendoredCollation("es") == nil {
-		t.Fatalf("unicode and es should be vendored")
+	if LoadedCollation("unicode") == nil || LoadedCollation("es") == nil {
+		t.Fatalf("unicode and es should be loaded")
 	}
-	if VendoredCollation("C") != nil {
-		t.Fatalf("C must never be vendored")
+	if LoadedCollation("C") != nil {
+		t.Fatalf("C must never be loaded")
 	}
 }
 
-// ---- using a vendored collation needs NO import ----
+// ---- using a loaded collation needs NO import ----
 
-func TestVendoredCollationUsedInAnExpression(t *testing.T) {
-	// COLLATE "unicode" resolves from the binary's vendored set with no import: 'ä' < 'z' is true under
+func TestLoadedCollationUsedInAnExpression(t *testing.T) {
+	// COLLATE "unicode" resolves from the engine's loaded set with no import: 'ä' < 'z' is true under
 	// the root (ä near a), the opposite of the C byte order where it is false. A transient query COLLATE
 	// does not make the database REFERENCE the collation, so db.Collations() stays empty.
+	loadFixtureBundle(t)
 	db := NewDatabase()
 	if n := len(db.Collations()); n != 0 {
 		t.Fatalf("fresh db references %d collations, want 0", n)
@@ -83,6 +88,7 @@ func TestVendoredCollationUsedInAnExpression(t *testing.T) {
 func TestEsOrdersEnyeAsADistinctLetter(t *testing.T) {
 	// The es tailoring (&N<ñ<<<Ñ) makes ñ a distinct PRIMARY letter after n: 'nz' < 'ña' (n < ñ),
 	// whereas under the untailored root ñ is n+accent so 'ña' < 'nz'. The Spanish-collation headline.
+	loadFixtureBundle(t)
 	db := NewDatabase()
 	if rows := query(t, db, `SELECT 'nz' < 'ña' COLLATE "es"`); len(rows) != 1 || rows[0][0] != BoolValue(true) {
 		t.Fatalf("es 'nz' < 'ña': got %v, want [[true]]", rows)
@@ -93,7 +99,8 @@ func TestEsOrdersEnyeAsADistinctLetter(t *testing.T) {
 }
 
 func TestUnknownCollationIs42704(t *testing.T) {
-	// A collation neither vendored nor referenced is 42704 (the vendored fallback must not mask it).
+	// A collation neither loaded nor referenced is 42704 (the loaded-set fallback must not mask it).
+	loadFixtureBundle(t)
 	db := NewDatabase()
 	if _, err := Execute(db, `SELECT 'x' COLLATE "no-such-collation"`); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("want 42704, got %v", err)
@@ -101,9 +108,10 @@ func TestUnknownCollationIs42704(t *testing.T) {
 }
 
 func TestPerColumnCollationOrdersImplicitlyAndIsReferenced(t *testing.T) {
-	// A column declared COLLATE "unicode" (vendored, no import) sorts by that collation with no explicit
+	// A column declared COLLATE "unicode" (loaded, no import) sorts by that collation with no explicit
 	// COLLATE on the query — unicode puts ä next to a. Because the SCHEMA now references unicode,
 	// db.Collations() (the per-file view) lists exactly it.
+	loadFixtureBundle(t)
 	db := NewDatabase()
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode")`)
 	run(t, db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`)
@@ -121,8 +129,9 @@ func TestPerColumnCollationOrdersImplicitlyAndIsReferenced(t *testing.T) {
 }
 
 func TestImplicitConflictIs42P22(t *testing.T) {
-	// Two columns with DIFFERENT implicit (vendored) collations compared with no explicit COLLATE →
+	// Two columns with DIFFERENT implicit (loaded) collations compared with no explicit COLLATE →
 	// 42P22 (PG-matching). C counts as a distinct implicit collation, so unicode vs C also conflicts.
+	loadFixtureBundle(t)
 	db := NewDatabase()
 	run(t, db, `CREATE TABLE t (a text COLLATE "unicode", b text COLLATE "es", c text COLLATE "C")`)
 	run(t, db, `INSERT INTO t VALUES ('a','z','b')`)
@@ -136,7 +145,7 @@ func TestImplicitConflictIs42P22(t *testing.T) {
 	if len(rows) != 1 || rows[0][0] != BoolValue(true) {
 		t.Fatalf("explicit override: got %v", rows)
 	}
-	// The table references both vendored collations → db.Collations() lists them (sorted).
+	// The table references both loaded collations → db.Collations() lists them (sorted).
 	var names []string
 	for _, c := range db.Collations() {
 		names = append(names, c.Name)
@@ -147,6 +156,7 @@ func TestImplicitConflictIs42P22(t *testing.T) {
 }
 
 func TestNonTextCollateIs42804UnknownName42704(t *testing.T) {
+	loadFixtureBundle(t)
 	db := NewDatabase()
 	if _, err := Execute(db, `CREATE TABLE t (a i32 COLLATE "unicode")`); err == nil || err.(*EngineError).Code() != "42804" {
 		t.Fatalf("non-text COLLATE: want 42804, got %v", err)
@@ -156,11 +166,12 @@ func TestNonTextCollateIs42804UnknownName42704(t *testing.T) {
 	}
 }
 
-// ---- the per-database default (over the vendored set, no import) ----
+// ---- the per-database default (over the loaded set, no import) ----
 
 func TestDefaultCollationInheritedByUnannotatedColumn(t *testing.T) {
-	// SetDefaultCollation moves the per-database default to a VENDORED collation (no import); an
+	// SetDefaultCollation moves the per-database default to a LOADED collation (no import); an
 	// un-annotated text column created AFTER inherits it (frozen), one created BEFORE keeps C.
+	loadFixtureBundle(t)
 	db := NewDatabase()
 	if db.DefaultCollation() != "C" {
 		t.Fatalf("fresh default: got %q", db.DefaultCollation())
@@ -191,6 +202,7 @@ func TestDefaultCollationInheritedByUnannotatedColumn(t *testing.T) {
 }
 
 func TestSetDefaultUnknownIs42704(t *testing.T) {
+	loadFixtureBundle(t)
 	db := NewDatabase()
 	if err := db.SetDefaultCollation("nope"); err == nil || err.(*EngineError).Code() != "42704" {
 		t.Fatalf("set default unknown: want 42704, got %v", err)
@@ -204,8 +216,9 @@ func TestSetDefaultUnknownIs42704(t *testing.T) {
 
 func TestCollatedPrimaryKeyStoredInCollationOrder(t *testing.T) {
 	// A collated text PRIMARY KEY's storage key is the UCA sort key (encoding.md §2.12), so the B-tree
-	// physically iterates in COLLATION order. unicode (vendored, no import): a < A < b < Z; C bytes:
+	// physically iterates in COLLATION order. unicode (loaded, no import): a < A < b < Z; C bytes:
 	// A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
+	loadFixtureBundle(t)
 	db := NewDatabase()
 	run(t, db, `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY)`)
 	run(t, db, `INSERT INTO t VALUES ('Z'),('a'),('b'),('A')`)
@@ -222,6 +235,7 @@ func TestCollatedPrimaryKeyStoredInCollationOrder(t *testing.T) {
 func TestCollatedUniqueDedupsByByteIdentity(t *testing.T) {
 	// A collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A' are
 	// DISTINCT, both admitted — collation.md §7), like a C unique key; only a byte-duplicate violates.
+	loadFixtureBundle(t)
 	db := NewDatabase()
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode" UNIQUE)`)
 	run(t, db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`)
@@ -237,13 +251,15 @@ func TestCollatedUniqueDedupsByByteIdentity(t *testing.T) {
 
 func TestReferenceOnlyFileRoundTrip(t *testing.T) {
 	// A collated table + the per-database default survive a close + paged reopen. The file stores only a
-	// metadata REFERENCE entry (no table); on reopen the table is resolved from the vendored set.
+	// metadata REFERENCE entry (no table); on reopen the table is resolved from a loaded bundle (the host
+	// must have loaded one providing it BEFORE open — collation.md §4/§9).
+	loadFixtureBundle(t)
 	path := t.TempDir() + "/collation_refonly_roundtrip.jed"
 	db, err := Create(path, DatabaseOptions{PageSize: 256})
 	if err != nil {
 		t.Fatalf("create: %v", err)
 	}
-	if err := db.SetDefaultCollation("unicode"); err != nil { // vendored — no import
+	if err := db.SetDefaultCollation("unicode"); err != nil { // loaded — no import
 		t.Fatalf("set default: %v", err)
 	}
 	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode", plain text)`)
@@ -262,7 +278,7 @@ func TestReferenceOnlyFileRoundTrip(t *testing.T) {
 	if re.DefaultCollation() != "unicode" {
 		t.Fatalf("reopened default: got %q", re.DefaultCollation())
 	}
-	// The database still references unicode (per-file view) — resolved from the vendored set.
+	// The database still references unicode (per-file view) — resolved from a loaded bundle.
 	refs := re.Collations()
 	if len(refs) != 1 || refs[0].Name != "unicode" || refs[0].UnicodeVersion != "17.0.0" || !refs[0].IsDefault {
 		t.Fatalf("reopened referenced set: got %+v", refs)

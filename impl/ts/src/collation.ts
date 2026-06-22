@@ -17,7 +17,6 @@ import { engineError } from "./errors.ts";
 import { crc32Ieee } from "./format.ts";
 import { lz4Compress, lz4Decompress } from "./lz4.ts";
 import { encodeTerminated } from "./encoding.ts";
-import { VENDORED_COLL } from "./collationdata/vendored.ts";
 
 // One collation element — a weight triple plus a flags byte. 7 bytes on disk
 // (spec/collation/README.md §2). A 0x0000 weight is ignorable at that level (skipped, §4).
@@ -516,45 +515,56 @@ export function openCollation(bytes: Uint8Array): Collation {
   return { name, unicodeVersion, cldrVersion, description, singles, contractions };
 }
 
-// --- Vendored collation set (spec/design/collation.md §2/§9) ------------------------------------
+// --- The engine-global loaded collation set (spec/design/collation.md §4/§9) --------------------
 //
-// In the reference-only model the engine reads collations from a set VENDORED into the binary, not
-// from the database file (the file only references a collation by name + version). Production
-// openCollations these embedded .coll artifacts once and serves every later use from them. The
-// vendored set is the real version-pinned data (spec/collation/17.0.0, UCA/UCD 17.0.0 / CLDR 48):
-// unicode is the CLDR-tailored DUCET root (the table ICU/PostgreSQL use), es is that root plus the
-// Spanish ñ tailoring. The footprint tiers (§13) and the broader tailoring set (sv/da/de — needing
-// the deferred LDML [before]/expansion features) are later slices (§14). The dev-* fixtures are NOT
-// vendored — they only drive the cross-core compiler/sort-key vectors. The bytes are inlined as
-// base64 (browser-safe — no node:fs) in the generated collationdata/vendored.ts, synced from
-// spec/collation/fixtures by scripts/vendor_collations.rb and byte-identical across cores (§9/§10).
+// The bare binary carries NO Unicode data — no embedded .coll, no casing tables (§9/§16, the SQLite
+// model). All collations arrive at runtime: a host hands the engine a JUCD bundle's bytes via
+// loadUnicodeData (db.loadUnicodeData), the engine merges its root + per-locale deltas (§5.1) and
+// adds the resulting collations here. This set is PROCESS-GLOBAL (module-scoped) — a property of the
+// running engine, not of one Database handle (the spec's "loaded set available to any database on
+// this handle", §4.2). Global is what lets a file REFERENCING a collation be opened after the bundle
+// is loaded: open resolves the referenced table from here (format.ts), and open mints the handle, so
+// the data cannot live on the handle. "C" is never here (table-free, built in).
+//
+// The bytes are jed's OWN pinned tables (byte-identical across cores, §9/§10), so loading restores no
+// nondeterminism — a use stays pure regardless of where the host sourced the bytes (file / fetch /
+// compiled-in asset / fetched in the browser). The real version-pinned production bundle is
+// spec/collation/fixtures/unicode.jucd (unicode = the CLDR-DUCET root, es = root + the Spanish ñ
+// tailoring); the dev-* fixtures are not part of it (they only drive the cross-core vectors).
 
-let vendoredCache: Map<string, Collation> | null = null;
+const loadedColl = new Map<string, Collation>();
 
-function vendored(): Map<string, Collation> {
-  if (vendoredCache === null) {
-    vendoredCache = new Map();
-    for (const b64 of Object.values(VENDORED_COLL)) {
-      const bytes = Uint8Array.from(atob(b64), (ch) => ch.charCodeAt(0));
-      const coll = openCollation(bytes);
-      vendoredCache.set(coll.name, coll);
-    }
+// loadUnicodeData loads a JUCD Unicode-data bundle's collations into the engine-global loaded set
+// (spec/design/collation.md §4/§9): parse the bundle, merge the root + each per-locale delta (§5.1),
+// and register every collation by name. ADDITIVE — a name already present is NOT replaced (the first
+// bundle to provide it wins; resolution is by name in load order, §4.2), so re-loading the same
+// bundle is an idempotent no-op. The property/casing section is parsed and validated but not yet
+// consumed (casing lands in slice 3e). A malformed bundle is XX001 (data_corrupted).
+//
+// This is the engine primitive behind db.loadUnicodeData. Because the set is process-global it may be
+// called BEFORE opening any file (which is required: opening a file that references a collation
+// resolves its table from this set). Privileged host op — the engine reads no file path and reaches
+// no host data (§11); the host sources the bytes (browser-safe — Uint8Array, no node:fs).
+export function loadUnicodeData(data: Uint8Array): void {
+  const { collations } = loadBundle(openBundle(data));
+  for (const c of collations) {
+    if (!loadedColl.has(c.name)) loadedColl.set(c.name, c);
   }
-  return vendoredCache;
 }
 
-// vendoredCollation looks up a collation VENDORED into this binary by its exact (case-sensitive)
-// name (spec/design/collation.md §2/§9). undefined ⇒ not vendored. "C" is never here (table-free,
-// built in). The resolver consults the database's referenced collations first, then this set.
-export function vendoredCollation(name: string): Collation | undefined {
-  return vendored().get(name);
+// loadedCollation looks up a collation in the engine-global LOADED set by its exact (case-sensitive)
+// name (spec/design/collation.md §4/§9). undefined ⇒ no loaded bundle provides it. "C" is never here
+// (table-free, built in). The resolver consults the database's referenced collations first, then this
+// set.
+export function loadedCollation(name: string): Collation | undefined {
+  return loadedColl.get(name);
 }
 
-// vendoredCollationTables returns every vendored collation, ascending by name — a deterministic order
+// loadedCollationTables returns every loaded collation, ascending by name — a deterministic order
 // with no hash-iteration leak (CLAUDE.md §8). The raw tables; the public CollationInfo view is the
-// free vendoredCollations (executor.ts).
-export function vendoredCollationTables(): Collation[] {
-  return [...vendored().values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
+// Database.loadedCollations method (executor.ts).
+export function loadedCollationTables(): Collation[] {
+  return [...loadedColl.values()].sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 }
 
 function deserializeTable(table: Uint8Array): [SingleEntry[], ContractionEntry[]] {

@@ -72,10 +72,11 @@ import {
 import { LifetimeBudget, Meter } from "./cost.ts";
 import {
   type Collation,
+  loadedCollation,
+  loadedCollationTables,
+  loadUnicodeData as loadUnicodeDataGlobal,
   serializeTable,
   sortKey as collationSortKey,
-  vendoredCollation,
-  vendoredCollationTables,
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
 import { crc32Ieee } from "./format.ts";
@@ -326,22 +327,6 @@ export type CollationInfo = {
   isDefault: boolean;
 };
 
-// vendoredCollations reports the collations VENDORED into this engine build — the build-global set
-// every database opened by this binary can use (spec/design/collation.md §4.2/§13). A property of the
-// BINARY, independent of any database; for the collations a particular database references, use
-// Database.collations. Ascending by name; isDefault is always false here (that is a per-database
-// property, not a build one). C is built in and not listed.
-export function vendoredCollations(): CollationInfo[] {
-  return vendoredCollationTables().map((c) => ({
-    name: c.name,
-    unicodeVersion: c.unicodeVersion,
-    cldrVersion: c.cldrVersion,
-    contentHash: crc32Ieee(serializeTable(c)),
-    description: c.description,
-    isDefault: false,
-  }));
-}
-
 // Snapshot is an immutable committed (or in-progress working) database state — the catalog + each
 // table's store + the commit counter (spec/design/transactions.md §2). The committed state is one
 // of these; a write transaction builds a new one from it (the persistent stores clone O(1) —
@@ -422,12 +407,12 @@ export class Snapshot {
 
   // resolveCollation resolves a collation name for USE — query resolution and key encoding
   // (spec/design/collation.md §2/§9). The collations the database has resolved (a cache populated on
-  // open from the file's reference entries, carrying their version pin) first, then the set VENDORED
-  // into this binary. undefined ⇒ neither has it (resolver → 42704). C is handled by the caller
-  // (built-in). This is the reference-only read path: a collation is never baked into the file — the
-  // file references it by name and the table comes from the vendored set.
+  // open from the file's reference entries, carrying their version pin) first, then the engine-global
+  // LOADED set (db.loadUnicodeData, §4). undefined ⇒ neither has it (resolver → 42704). C is handled
+  // by the caller (built-in). This is the reference-only read path: a collation is never baked into
+  // the file — the file references it by name and the table comes from a loaded bundle.
   resolveCollation(name: string): Collation | undefined {
-    return this.collations.get(name) ?? vendoredCollation(name);
+    return this.collations.get(name) ?? loadedCollation(name);
   }
 
   // table looks up a table definition by name (case-insensitive).
@@ -500,7 +485,7 @@ export class Snapshot {
       if (c === undefined) {
         throw engineError(
           "undefined_object",
-          `collation "${name}" referenced by the schema is not vendored in this build`,
+          `collation "${name}" referenced by the schema is not provided by a loaded bundle`,
         );
       }
       return c;
@@ -1901,8 +1886,8 @@ export class Database {
   }
 
   // resolveCollationByName resolves a collation for USE — the database's resolved set then the
-  // binary's vendored set (spec/design/collation.md §2/§9). The reference-only read path; undefined ⇒
-  // neither has it (resolver → 42704).
+  // engine-global loaded set (spec/design/collation.md §2/§9). The reference-only read path; undefined
+  // ⇒ neither has it (resolver → 42704).
   resolveCollationByName(name: string): Collation | undefined {
     return this.readSnap().resolveCollation(name);
   }
@@ -1930,11 +1915,39 @@ export class Database {
   }
 
   // importCollation / exportCollation are GONE (the reference-only pivot, spec/design/collation.md
-  // §4.2): a collation is vendored into the binary and used by name, never loaded into a database.
-  // There is no runtime path that constructs or bakes a collation table.
+  // §4.2): a collation is provided by a host-loaded bundle and used by name, never loaded into a
+  // database. There is no runtime path that constructs or bakes a collation table — the only load is
+  // loadUnicodeData of jed's own pinned bundle bytes.
+
+  // loadUnicodeData loads a JUCD Unicode-data bundle (db.loadUnicodeData, spec/design/collation.md
+  // §4.2): its collations become resolvable by name for COLLATE, per-column collation, and ORDER BY …
+  // COLLATE. The loaded set is ENGINE-GLOBAL (§9), so a bundle loaded through any handle is visible
+  // everywhere — including to a later Database.open of a file that REFERENCES one of its collations.
+  // Privileged host op (not SQL-reachable, no path, no engine I/O — §11); ADDITIVE and idempotent for
+  // an already-loaded bundle. Browser-safe (Uint8Array, no node:fs). A malformed bundle is XX001.
+  // (Mirrors the free loadUnicodeData, which the host may call before opening any file.)
+  loadUnicodeData(data: Uint8Array): void {
+    loadUnicodeDataGlobal(data);
+  }
+
+  // loadedCollations introspects the engine-global LOADED collation set (db.loadedCollations,
+  // spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
+  // database on this handle, ascending by name. A property of the running ENGINE, not of this
+  // database; for the collations this database references, use Database.collations. isDefault is
+  // always false here (that is a per-database property). C is built in and not listed.
+  loadedCollations(): CollationInfo[] {
+    return loadedCollationTables().map((c) => ({
+      name: c.name,
+      unicodeVersion: c.unicodeVersion,
+      cldrVersion: c.cldrVersion,
+      contentHash: crc32Ieee(serializeTable(c)),
+      description: c.description,
+      isDefault: false,
+    }));
+  }
 
   // setDefaultCollation sets the per-database default collation (db.setDefaultCollation,
-  // spec/design/collation.md §1). "C" resets to byte order; any other name must be a VENDORED
+  // spec/design/collation.md §1). "C" resets to byte order; any other name must be a LOADED
   // collation (else 42704). Persisted as the is_default flag on that collation's reference entry at
   // the next commit (the entry is emitted because the default references it — §5).
   setDefaultCollation(name: string): void {
@@ -1956,11 +1969,11 @@ export class Database {
 
   // collations introspects the collations THIS DATABASE references (db.collations,
   // spec/design/collation.md §4.2) — every collation its schema uses (a column's COLLATE, or the
-  // per-database default), in ascending name order. This is the per-file view; for the set VENDORED
-  // into the engine (build-global), use the free vendoredCollations(). C is built in and not listed.
+  // per-database default), in ascending name order. This is the per-file view; for the engine-global
+  // LOADED set, use Database.loadedCollations. C is built in and not listed.
   collations(): CollationInfo[] {
     const dflt = this.committed.defaultCollation;
-    // referencedCollations resolves each referenced name (vendored, here always resolvable).
+    // referencedCollations resolves each referenced name (from a loaded bundle).
     let refs: Collation[];
     try {
       refs = this.committed.referencedCollations();

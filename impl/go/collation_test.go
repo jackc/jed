@@ -14,6 +14,20 @@ import (
 	"testing"
 )
 
+// loadFixtureBundle loads jed's pinned production JUCD bundle (spec/collation/fixtures/unicode.jucd)
+// into the engine-global loaded set — the production read path the cores now take (no embed).
+// Idempotent (the set is global + first-wins).
+func loadFixtureBundle(t *testing.T) {
+	t.Helper()
+	data, err := os.ReadFile(specPath(t, "collation/fixtures/unicode.jucd"))
+	if err != nil {
+		t.Fatalf("read unicode.jucd: %v", err)
+	}
+	if err := LoadUnicodeData(data); err != nil {
+		t.Fatalf("load unicode.jucd: %v", err)
+	}
+}
+
 func collDefinition(t *testing.T, files []string) string {
 	t.Helper()
 	parts := make([]string, 0, len(files))
@@ -67,6 +81,7 @@ func TestCollationCompilerMatchesVectors(t *testing.T) {
 }
 
 func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
+	loadFixtureBundle(t)
 	rows := readTomlTables(t, specPath(t, "collation/vectors/sortkey.toml"), "sortkey")
 	if len(rows) == 0 {
 		t.Fatal("no sortkey vectors")
@@ -79,10 +94,10 @@ func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
 		s := row.str("string")
 		want := row.str("sortkey_hex")
 		if collName != lastColl {
-			// The real version-pinned collations (unicode, es) resolve from the embedded .coll — the
-			// production read path — rather than recompiling their ~2.3 MB source. The small dev
-			// fixtures (not vendored) are compiled from their definition files.
-			if vc := vendored()[collName]; vc != nil {
+			// The real version-pinned collations (unicode, es) resolve from the loaded production
+			// bundle (the host-load read path), not by recompiling their ~2.3 MB source. The small dev
+			// fixtures (not in the bundle) fall back to compiling from their definition files.
+			if vc := LoadedCollation(collName); vc != nil {
 				coll = vc
 			} else {
 				c, err := CompileCollation(collName, collDefinition(t, row.strs("def_files")))

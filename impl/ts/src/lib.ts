@@ -457,13 +457,13 @@ export function executeScript(db: Database, sql: string): ScriptSummary {
 }
 
 // --- public surface (re-exports) ---
+export { loadUnicodeData } from "./collation.ts";
 export {
   Database,
   DEFAULT_MAX_SQL_LENGTH,
   DEFAULT_PAGE_SIZE,
   Session,
   Snapshot,
-  vendoredCollations,
 } from "./executor.ts";
 export type {
   CollationInfo,

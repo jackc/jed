@@ -5,11 +5,20 @@
 //! impl/go/collation_test.go and impl/ts/tests/collation.test.ts.
 
 use jed::collation::{
-    Collation, compile_collation, open_collation, save_collation, serialize_table, sort_key,
-    vendored_collation,
+    Collation, compile_collation, loaded_collation, open_collation, save_collation,
+    serialize_table, sort_key,
 };
 use std::path::Path;
 use std::sync::Arc;
+
+/// Load jed's pinned production `JUCD` bundle (spec/collation/fixtures/unicode.jucd) into the
+/// engine-global loaded set — the production read path the cores now take (no embed). Idempotent.
+fn load_fixture_bundle() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/fixtures/unicode.jucd");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    jed::load_unicode_data(&bytes).expect("load unicode.jucd");
+}
 
 fn spec(rel: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -70,6 +79,10 @@ fn sortkey_matches_vectors_and_is_strictly_ascending() {
     let vectors = v["sortkey"].as_array().expect("[[sortkey]] array");
     assert!(!vectors.is_empty(), "no sortkey vectors");
 
+    // The real version-pinned collations (`unicode`, `es`) resolve from the loaded production bundle
+    // (the host-load read path), not by recompiling their ~2.3 MB source; the small dev fixtures (not
+    // in the bundle) fall back to compiling from their definition files.
+    load_fixture_bundle();
     let mut last_coll = String::new();
     let mut coll: Option<Arc<Collation>> = None;
     let mut prev_key: Option<Vec<u8>> = None;
@@ -80,10 +93,7 @@ fn sortkey_matches_vectors_and_is_strictly_ascending() {
         let expected = vec["sortkey_hex"].as_str().unwrap();
 
         if coll_name != last_coll {
-            // The real version-pinned collations (`unicode`, `es`) are resolved from the embedded
-            // `.coll` — the production read path — rather than recompiling their ~2.3 MB source. The
-            // small dev fixtures (not vendored) are compiled from their definition files.
-            coll = Some(vendored_collation(coll_name).unwrap_or_else(|| {
+            coll = Some(loaded_collation(coll_name).unwrap_or_else(|| {
                 let def = definition(vec["def_files"].as_array().unwrap());
                 Arc::new(compile_collation(coll_name, &def).unwrap())
             }));

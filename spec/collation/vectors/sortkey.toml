@@ -5,7 +5,7 @@
 # collation the entries are in ascending sort order, so the harness also checks the
 # sort keys' memcmp order matches. Includes an astral case (😀, U+1F600) — the TS
 # UTF-16-vs-code-point trap (types.md §11). The `unicode`/`es` cases are over the real
-# version-pinned vendored table; the harness resolves them via the embedded .coll.
+# version-pinned production table; the harness resolves them via the loaded JUCD bundle.
 
 schema_version = 1
 

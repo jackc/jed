@@ -2406,14 +2406,15 @@ fn decode_collation_entry(buf: &[u8], pos: &mut usize) -> Result<(Collation, boo
     let unicode_version = read_string(buf, pos)?;
     let cldr_version = read_string(buf, pos)?;
     let description = read_string(buf, pos)?;
-    // The file records only the version PIN; the table comes from the vendored set. A name this build
-    // does not vendor is a legible failure (the precursor to the graded open-time verdict —
+    // The file records only the version PIN; the table comes from a loaded bundle (the host must have
+    // loaded one providing this collation before opening — collation.md §4/§9). A name no loaded
+    // bundle provides is a legible failure (the precursor to the graded open-time verdict —
     // compatibility.md §7 / collation.md §12, slice 2d, which will soften this to read-only degrade).
-    let vend = crate::collation::vendored_collation(&name).ok_or_else(|| {
+    let loaded = crate::collation::loaded_collation(&name).ok_or_else(|| {
         EngineError::new(
             SqlState::UndefinedObject,
             format!(
-                "collation \"{name}\" (@ {unicode_version}/{cldr_version}) is not vendored in this build"
+                "collation \"{name}\" (@ {unicode_version}/{cldr_version}) is not provided by a loaded bundle"
             ),
         )
     })?;
@@ -2422,8 +2423,8 @@ fn decode_collation_entry(buf: &[u8], pos: &mut usize) -> Result<(Collation, boo
         unicode_version,
         cldr_version,
         description,
-        singles: vend.singles.clone(),
-        contractions: vend.contractions.clone(),
+        singles: loaded.singles.clone(),
+        contractions: loaded.contractions.clone(),
     };
     Ok((coll, is_default))
 }

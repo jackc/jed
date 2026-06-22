@@ -181,15 +181,15 @@ func (s *Snapshot) clone() *Snapshot {
 
 // resolveCollation resolves a collation name for USE — query resolution and key encoding
 // (spec/design/collation.md §2/§9). The collations the database has resolved (a cache populated on
-// open from the file's reference entries, carrying their version pin) first, then the set VENDORED
-// into this binary. nil ⇒ neither has it (the resolver raises 42704). C is handled by the caller
-// (built-in). This is the reference-only read path: a collation is never baked into the file — the
-// file references it by name and the table comes from the vendored set.
+// open from the file's reference entries, carrying their version pin) first, then the engine-global
+// LOADED set (db.LoadUnicodeData, §4). nil ⇒ neither has it (the resolver raises 42704). C is handled
+// by the caller (built-in). This is the reference-only read path: a collation is never baked into the
+// file — the file references it by name and the table comes from a loaded bundle.
 func (s *Snapshot) resolveCollation(name string) *Collation {
 	if c := s.collations[name]; c != nil {
 		return c
 	}
-	return VendoredCollation(name)
+	return LoadedCollation(name)
 }
 
 // referencedCollations returns the collations the database SCHEMA references — every column's frozen
@@ -221,7 +221,7 @@ func (s *Snapshot) referencedCollations() ([]*Collation, error) {
 		c := s.resolveCollation(name)
 		if c == nil {
 			return nil, NewError(UndefinedObject,
-				fmt.Sprintf("collation %q referenced by the schema is not vendored in this build", name))
+				fmt.Sprintf("collation %q referenced by the schema is not provided by a loaded bundle", name))
 		}
 		out[i] = c
 	}
@@ -1654,11 +1654,44 @@ type CollationInfo struct {
 }
 
 // ImportCollation / ExportCollation are GONE (the reference-only pivot, spec/design/collation.md
-// §4.2): a collation is vendored into the binary and used by name, never loaded into a database.
-// There is no runtime path that constructs or bakes a collation table.
+// §4.2): a collation is provided by a host-loaded bundle and used by name, never loaded into a
+// database. There is no runtime path that constructs or bakes a collation table — the only load is
+// LoadUnicodeData of jed's own pinned bundle bytes.
+
+// LoadUnicodeData loads a JUCD Unicode-data bundle (db.LoadUnicodeData, spec/design/collation.md
+// §4.2): its collations become resolvable by name for COLLATE, per-column collation, and ORDER BY …
+// COLLATE. The loaded set is ENGINE-GLOBAL (§9), so a bundle loaded through any handle is visible
+// everywhere — including to a later Database.Open of a file that REFERENCES one of its collations.
+// Privileged host op (not SQL-reachable, no path, no engine I/O — §11); ADDITIVE and idempotent for
+// an already-loaded bundle. A malformed bundle is XX001. (Mirrors the package-level LoadUnicodeData,
+// which the host may call before opening any file.)
+func (db *Database) LoadUnicodeData(data []byte) error {
+	return LoadUnicodeData(data)
+}
+
+// LoadedCollations introspects the engine-global LOADED collation set (db.LoadedCollations,
+// spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
+// database on this handle, ascending by name. A property of the running ENGINE, not of this database;
+// for the collations this database references, use Database.Collations. IsDefault is always false here
+// (that is a per-database property). C is built in and not listed.
+func (db *Database) LoadedCollations() []CollationInfo {
+	colls := loadedCollationTables()
+	out := make([]CollationInfo, len(colls))
+	for i, c := range colls {
+		out[i] = CollationInfo{
+			Name:           c.Name,
+			UnicodeVersion: c.UnicodeVersion,
+			CLDRVersion:    c.CldrVersion,
+			ContentHash:    crc32IEEE(SerializeTable(c)),
+			Description:    c.Description,
+			IsDefault:      false,
+		}
+	}
+	return out
+}
 
 // SetDefaultCollation sets the per-database default collation (db.SetDefaultCollation,
-// spec/design/collation.md §1). "C" resets to byte order; any other name must be a VENDORED collation
+// spec/design/collation.md §1). "C" resets to byte order; any other name must be a LOADED collation
 // (else 42704). Persisted as the is_default flag on that collation's reference entry at the next
 // commit (the entry is emitted because the default references it — §5).
 func (db *Database) SetDefaultCollation(name string) error {
@@ -1684,11 +1717,10 @@ func (db *Database) DefaultCollation() string {
 
 // Collations introspects the collations THIS DATABASE references (db.Collations,
 // spec/design/collation.md §4.2) — every collation its schema uses (a column's COLLATE, or the
-// per-database default), in ascending name order. This is the per-file view; for the set VENDORED
-// into the engine (build-global), use the package-level VendoredCollations. C is built in and not
-// listed.
+// per-database default), in ascending name order. This is the per-file view; for the engine-global
+// LOADED set, use Database.LoadedCollations. C is built in and not listed.
 func (db *Database) Collations() []CollationInfo {
-	// referencedCollations resolves each referenced name (vendored, here always resolvable).
+	// referencedCollations resolves each referenced name (from a loaded bundle).
 	colls, err := db.committed.referencedCollations()
 	if err != nil {
 		return nil
@@ -1702,27 +1734,6 @@ func (db *Database) Collations() []CollationInfo {
 			ContentHash:    crc32IEEE(SerializeTable(c)),
 			Description:    c.Description,
 			IsDefault:      db.committed.defaultCollation == c.Name,
-		}
-	}
-	return out
-}
-
-// VendoredCollations reports the collations VENDORED into this engine build — the build-global set
-// every database opened by this binary can use (spec/design/collation.md §4.2/§13). A property of the
-// BINARY, independent of any database; for the collations a particular database references, use
-// Database.Collations. Ascending by name; IsDefault is always false here (that is a per-database
-// property, not a build one). C is built in and not listed.
-func VendoredCollations() []CollationInfo {
-	colls := vendoredCollations()
-	out := make([]CollationInfo, len(colls))
-	for i, c := range colls {
-		out[i] = CollationInfo{
-			Name:           c.Name,
-			UnicodeVersion: c.UnicodeVersion,
-			CLDRVersion:    c.CldrVersion,
-			ContentHash:    crc32IEEE(SerializeTable(c)),
-			Description:    c.Description,
-			IsDefault:      false,
 		}
 	}
 	return out

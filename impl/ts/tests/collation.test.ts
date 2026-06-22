@@ -10,19 +10,26 @@ import {
   buildBundle,
   compileCollation,
   loadBundle,
+  loadedCollation,
+  loadUnicodeData,
   openBundle,
   openCollation,
   saveBundle,
   saveCollation,
   serializeTable,
   sortKey,
-  vendoredCollation,
 } from "../src/collation.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
 import { bytesToHex } from "./util.ts";
 
 function definition(files: string[]): string {
   return files.map((f) => readFileSync(specPath(f), "utf8")).join("\n");
+}
+
+// Load jed's pinned production JUCD bundle (spec/collation/fixtures/unicode.jucd) into the
+// engine-global loaded set — the production read path the cores now take (no embed). Idempotent.
+function loadFixtureBundle(): void {
+  loadUnicodeData(readFileSync(specPath("collation/fixtures/unicode.jucd")));
 }
 
 function cmpBytes(a: Uint8Array, b: Uint8Array): number {
@@ -51,6 +58,10 @@ test("collation compiler matches the pinned vectors", () => {
 });
 
 test("collation sort keys match vectors and are strictly ascending", () => {
+  // The real version-pinned collations (unicode, es) resolve from the loaded production bundle (the
+  // host-load read path), not by recompiling their ~2.3 MB source; the small dev fixtures (not in the
+  // bundle) fall back to compiling from their definition files.
+  loadFixtureBundle();
   const rows = readTomlTables(specPath("collation/vectors/sortkey.toml"), "sortkey");
   assert.ok(rows.length > 0, "no sortkey vectors");
 
@@ -63,12 +74,8 @@ test("collation sort keys match vectors and are strictly ascending", () => {
     const s = row.str("string");
     const want = row.str("sortkey_hex");
     if (collName !== lastColl) {
-      // The real version-pinned collations (unicode, es) resolve from the embedded .coll — the
-      // production read path — rather than recompiling their ~2.3 MB source. The small dev fixtures
-      // (not vendored) are compiled from their definition files.
       coll =
-        vendoredCollation(collName) ??
-        compileCollation(collName, definition(row.strs("def_files")));
+        loadedCollation(collName) ?? compileCollation(collName, definition(row.strs("def_files")));
       lastColl = collName;
       prev = null;
     }

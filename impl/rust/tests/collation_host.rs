@@ -1,20 +1,31 @@
-//! Collation host API + persistence (spec/design/collation.md §1/§4.2): the reference-only surface —
-//! `set_default_collation` / `default_collation`, the per-file `db.collations()` (what the database
-//! REFERENCES) vs the build-global `jed::vendored_collations()` (what the engine VENDORS), per-column
-//! / per-database default inheritance, collated keys, and the reference-only **file round-trip**
-//! (`format_version` 18, `entry_kind = 3` metadata entries). These are the host-API + persistence
-//! behaviors the conformance corpus cannot express (CLAUDE.md §10); the in-memory SQL behavior a
-//! collation drives (COLLATE / ORDER BY / derivation / 42P21 / 42P22) lives in
-//! suites/collation/collate.test, which runs on every core. There is **no `import_collation`**: a
-//! collation is vendored into the binary and used by name (the reference-only pivot, §4.2). Mirrored
-//! by impl/go/collation_host_test.go and impl/ts/tests/collation_host.test.ts.
+//! Collation host API + persistence (spec/design/collation.md §1/§4.2): the host-loaded surface —
+//! `load_unicode_data` (the `JUCD` bundle load seam), `set_default_collation` / `default_collation`,
+//! the per-file `db.collations()` (what the database REFERENCES) vs the engine-global
+//! `db.loaded_collations()` (what a loaded bundle PROVIDES), per-column / per-database default
+//! inheritance, collated keys, and the reference-only **file round-trip** (`format_version` 18,
+//! `entry_kind = 3` metadata entries). These are the host-API + persistence behaviors the conformance
+//! corpus cannot express (CLAUDE.md §10); the in-memory SQL behavior a collation drives (COLLATE /
+//! ORDER BY / derivation / 42P21 / 42P22) lives in suites/collation/collate.test, which runs on every
+//! core. There is **no `import_collation`**: the bare binary carries no Unicode data and the host
+//! loads jed's own pinned bundle bytes (the SQLite model, §9/§16), then uses collations by name.
+//! Mirrored by impl/go/collation_host_test.go and impl/ts/tests/collation_host.test.ts.
 
 use jed::value::Value;
 use jed::{Database, DatabaseOptions, Outcome, execute};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 fn tmp(name: &str) -> PathBuf {
     std::env::temp_dir().join(name)
+}
+
+/// Load jed's pinned production `JUCD` bundle (spec/collation/fixtures/unicode.jucd) into the
+/// engine-global loaded set — what a production host does once at startup via `db.LoadUnicodeData`
+/// before opening files / running collated queries (collation.md §4). Idempotent (global, first-wins).
+fn load_unicode() {
+    let path =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/fixtures/unicode.jucd");
+    let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    jed::load_unicode_data(&bytes).expect("load unicode.jucd");
 }
 
 fn query(db: &mut Database, sql: &str) -> Vec<Vec<Value>> {
@@ -33,31 +44,35 @@ fn texts(rows: Vec<Vec<Value>>) -> Vec<String> {
         .collect()
 }
 
-// ---- the vendored set (the engine-global build property) ----
+// ---- the loaded set (the engine-global property a bundle provides) ----
 
 #[test]
-fn vendored_collations_is_the_real_set() {
-    // `jed::vendored_collations()` reports what THIS BUILD provides — the real version-pinned set
-    // (`es`, `unicode`), ascending by name, no `is_default` (a build property, not a per-db one). `C`
-    // is built in and never listed. The pin is UCA/UCD 17.0.0 (spec/collation/17.0.0).
-    let v = jed::vendored_collations();
+fn loaded_collations_is_the_real_set() {
+    // `db.loaded_collations()` reports what a loaded bundle PROVIDES — after loading jed's pinned
+    // production bundle, the real version-pinned set (`es`, `unicode`), ascending by name, no
+    // `is_default` (an engine property, not a per-db one). `C` is built in and never listed. The pin
+    // is UCA/UCD 17.0.0 (spec/collation/17.0.0).
+    load_unicode();
+    let db = Database::new();
+    let v = db.loaded_collations();
     let names: Vec<&str> = v.iter().map(|c| c.name.as_str()).collect();
     assert_eq!(names, vec!["es", "unicode"]);
     assert!(v.iter().all(|c| !c.is_default));
     assert_eq!(v[1].name, "unicode");
     assert_eq!(v[1].unicode_version, "17.0.0");
-    assert!(jed::collation::vendored_collation("unicode").is_some());
-    assert!(jed::collation::vendored_collation("es").is_some());
-    assert!(jed::collation::vendored_collation("C").is_none());
+    assert!(jed::collation::loaded_collation("unicode").is_some());
+    assert!(jed::collation::loaded_collation("es").is_some());
+    assert!(jed::collation::loaded_collation("C").is_none());
 }
 
-// ---- using a vendored collation needs NO import ----
+// ---- using a loaded collation needs NO import ----
 
 #[test]
-fn vendored_collation_used_in_an_expression() {
-    // `COLLATE "unicode"` resolves from the binary's vendored set with no import: 'ä' < 'z' is true
+fn loaded_collation_used_in_an_expression() {
+    // `COLLATE "unicode"` resolves from the engine's loaded set with no import: 'ä' < 'z' is true
     // under the root (ä sorts near a), the opposite of the C byte order where it is false. A transient
     // query COLLATE does not make the database REFERENCE the collation, so db.collations() stays empty.
+    load_unicode();
     let mut db = Database::new();
     assert_eq!(db.collations().len(), 0);
     assert_eq!(
@@ -70,6 +85,7 @@ fn vendored_collation_used_in_an_expression() {
 fn es_orders_enye_as_a_distinct_letter() {
     // The `es` tailoring (&N<ñ<<<Ñ) makes ñ a distinct PRIMARY letter after n: 'nz' < 'ña' (n < ñ),
     // whereas under the untailored root ñ is n+accent so 'ña' < 'nz'. The Spanish-collation headline.
+    load_unicode();
     let mut db = Database::new();
     assert_eq!(
         query(&mut db, "SELECT 'nz' < 'ña' COLLATE \"es\""),
@@ -83,7 +99,8 @@ fn es_orders_enye_as_a_distinct_letter() {
 
 #[test]
 fn unknown_collation_is_42704() {
-    // A collation neither vendored nor referenced is 42704 (the vendored fallback must not mask it).
+    // A collation neither loaded nor referenced is 42704 (the loaded-set fallback must not mask it).
+    load_unicode();
     let mut db = Database::new();
     assert_eq!(
         execute(&mut db, "SELECT 'x' COLLATE \"no-such-collation\"")
@@ -95,9 +112,10 @@ fn unknown_collation_is_42704() {
 
 #[test]
 fn per_column_collation_orders_implicitly_and_is_referenced() {
-    // A column declared `COLLATE "unicode"` (vendored, no import) sorts by that collation with no
+    // A column declared `COLLATE "unicode"` (loaded, no import) sorts by that collation with no
     // explicit COLLATE on the query — unicode puts ä next to a. Because the SCHEMA now references
     // unicode, db.collations() (the per-file view) lists exactly it.
+    load_unicode();
     let mut db = Database::new();
     execute(
         &mut db,
@@ -125,8 +143,9 @@ fn per_column_collation_orders_implicitly_and_is_referenced() {
 
 #[test]
 fn implicit_conflict_is_42p22() {
-    // Two columns with DIFFERENT implicit (vendored) collations compared with no explicit COLLATE →
+    // Two columns with DIFFERENT implicit (loaded) collations compared with no explicit COLLATE →
     // 42P22 (PG-matching). C counts as a distinct implicit collation, so unicode vs C also conflicts.
+    load_unicode();
     let mut db = Database::new();
     execute(
         &mut db,
@@ -154,6 +173,7 @@ fn implicit_conflict_is_42p22() {
 
 #[test]
 fn non_text_collate_is_42804_unknown_name_42704() {
+    load_unicode();
     let mut db = Database::new();
     assert_eq!(
         execute(&mut db, "CREATE TABLE t (a i32 COLLATE \"unicode\")")
@@ -169,12 +189,13 @@ fn non_text_collate_is_42804_unknown_name_42704() {
     );
 }
 
-// ---- the per-database default (over the vendored set, no import) ----
+// ---- the per-database default (over the loaded set, no import) ----
 
 #[test]
 fn default_collation_inherited_by_unannotated_column() {
-    // set_default_collation moves the per-database default to a VENDORED collation (no import); an
+    // set_default_collation moves the per-database default to a LOADED collation (no import); an
     // un-annotated text column created AFTER inherits it (frozen), one created BEFORE keeps C.
+    load_unicode();
     let mut db = Database::new();
     assert_eq!(db.default_collation(), "C");
     execute(
@@ -209,6 +230,7 @@ fn default_collation_inherited_by_unannotated_column() {
 
 #[test]
 fn set_default_unknown_is_42704() {
+    load_unicode();
     let mut db = Database::new();
     assert_eq!(
         db.set_default_collation("nope").unwrap_err().code(),
@@ -222,8 +244,9 @@ fn set_default_unknown_is_42704() {
 #[test]
 fn collated_primary_key_is_stored_in_collation_order() {
     // A collated text PRIMARY KEY's storage key is the UCA sort key (encoding.md §2.12), so the B-tree
-    // physically iterates in COLLATION order. unicode (vendored, no import): a < A < b < Z; C bytes:
+    // physically iterates in COLLATION order. unicode (loaded, no import): a < A < b < Z; C bytes:
     // A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
+    load_unicode();
     let mut db = Database::new();
     execute(
         &mut db,
@@ -247,6 +270,7 @@ fn collated_primary_key_is_stored_in_collation_order() {
 fn collated_unique_dedups_by_byte_identity() {
     // A collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A' are
     // DISTINCT, both admitted — collation.md §7), like a C unique key; only a byte-duplicate violates.
+    load_unicode();
     let mut db = Database::new();
     execute(
         &mut db,
@@ -271,11 +295,13 @@ fn collated_unique_dedups_by_byte_identity() {
 #[test]
 fn reference_only_file_round_trip() {
     // A collated table + the per-database default survive a close + paged reopen. The file stores only
-    // a metadata REFERENCE entry (no table); on reopen the table is resolved from the vendored set.
+    // a metadata REFERENCE entry (no table); on reopen the table is resolved from a loaded bundle (the
+    // host must have loaded one providing it BEFORE open — collation.md §4/§9).
+    load_unicode();
     let path = tmp("collation_refonly_roundtrip.jed");
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
-    db.set_default_collation("unicode").unwrap(); // vendored — no import
+    db.set_default_collation("unicode").unwrap(); // loaded — no import
     execute(
         &mut db,
         "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\", plain text)",

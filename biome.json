@@ -31,8 +31,7 @@
       "!impl/ts/src/operators.ts",
       "!impl/ts/src/costs.ts",
       "!impl/ts/src/ranges_gen.ts",
-      "!impl/ts/src/sqlstate.ts",
-      "!impl/ts/src/collationdata/vendored.ts"
+      "!impl/ts/src/sqlstate.ts"
     ]
   }
 }
