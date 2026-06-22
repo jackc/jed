@@ -9,18 +9,18 @@
 //!     compiler + executor (expansion, a tailoring, an astral code point) cheaply. They drive the
 //!     `compiler.toml` vectors (the cross-core compiler contract, small enough to inline as hex) and
 //!     their own sort-key vectors. NOT part of the production bundle.
-//!   * The production `JUCD` bundle (`unicode.jucd`) — the DUCET root `unicode` once + the `es`
-//!     tailoring as a sparse delta (README §5), the bytes a host LOADS via `db.LoadUnicodeData`
-//!     (collation.md §4/§9, slice 3c). The per-collation `.coll` artifacts (`unicode.coll`/`es.coll`)
-//!     are kept as the builder's intermediate + the golden unit (§4.1); the bundle is built from the
-//!     same compiled tables and self-checks the load-time merge identity here. The tables are ~0.5 MB,
-//!     far too large to inline in `compiler.toml`, so the bundle is pinned instead by (a) the cores
-//!     reading it identically and (b) the sort-key vectors below (the executor contract, computed from
-//!     the compiled table, which the loaded bundle must reproduce byte-for-byte — README §5.1).
+//!   * The real version-pinned production collations (`unicode` = the CLDR-DUCET root, `es` = root +
+//!     the Spanish ñ tailoring) — their compiled `.coll` artifacts (`unicode.coll`/`es.coll`) are the
+//!     builder's input + the golden unit (§4.1). This tool is the *compiler* (source → `.coll` +
+//!     vectors); the *assembler* `build_collation_bundle` packs the `.coll` set into the shippable
+//!     `JUCD` bundle (run it after this when the `.coll` set changes). The tables are ~0.5 MB, far too
+//!     large to inline in `compiler.toml`, so they are pinned instead by (a) the cores reading the
+//!     bundle identically and (b) the sort-key vectors below (the executor contract, computed from the
+//!     compiled table, which the loaded bundle must reproduce byte-for-byte — README §5.1).
 
 use jed::collation::{
-    Collation, build_bundle, compile_collation, load_bundle, open_bundle, save_bundle,
-    save_collation, serialize_table, sort_key,
+    Collation, build_bundle, compile_collation, save_bundle, save_collation, serialize_table,
+    sort_key,
 };
 use std::path::Path;
 
@@ -89,13 +89,11 @@ fn main() {
         ),
     ];
 
-    // --- write the per-collation .coll intermediates (§4.1) + the production JUCD bundle the cores
-    //     LOAD via db.LoadUnicodeData (spec/design/collation.md §4/§9, slice 3c) ---
-    // The `.coll` artifacts stay the golden unit / builder intermediate; the bundle ships the DUCET
-    // root `unicode` once + the `es` tailoring as a sparse delta merged at load (README §5.1). No
-    // property/casing section yet (slice 3e). An empty description keeps the loaded collations'
-    // introspection identical to the compiled tables (compile_collation emits an empty description).
-    let mut compiled: Vec<Collation> = Vec::new();
+    // --- write the per-collation .coll artifacts (spec/design/collation.md §4.1) ---
+    // These are the compiler's output and the builder's input: `build_collation_bundle` assembles them
+    // into the shippable `JUCD` bundle (spec/collation/fixtures/unicode.jucd). This tool is the
+    // *compiler* (source → .coll + vectors); that one is the *assembler* (.coll → JUCD). Run the
+    // builder after this when the `.coll` set changes (a Unicode bump / a new tailoring).
     for (files, name) in production {
         let coll = compile(files, name);
         let artifact = save_collation(&coll);
@@ -104,29 +102,6 @@ fn main() {
             &artifact,
         )
         .unwrap();
-        compiled.push(coll);
-    }
-    {
-        let root = compiled
-            .iter()
-            .find(|c| c.name == "unicode")
-            .expect("unicode root");
-        let tailorings: Vec<&Collation> = compiled.iter().filter(|c| c.name != "unicode").collect();
-        let bundle = build_bundle(root, &tailorings, None, "");
-        let bytes = save_bundle(&bundle);
-        // self-check: open → load → merge reproduces each full `.coll` table byte-identically
-        // (README §5.1), so a stale bundle is caught at generation, not only by the cores' vectors.
-        let (colls, _property) = load_bundle(&open_bundle(&bytes).unwrap()).unwrap();
-        for full in &compiled {
-            let loaded = colls.iter().find(|c| c.name == full.name).unwrap();
-            assert_eq!(
-                serialize_table(loaded),
-                serialize_table(full),
-                "JUCD merge identity broken for {}",
-                full.name
-            );
-        }
-        std::fs::write(out_path("collation/fixtures/unicode.jucd"), &bytes).unwrap();
     }
 
     // --- compiler.toml — DEV fixtures only (small enough to pin as full hex) ---
@@ -306,6 +281,7 @@ fn main() {
     }
 
     println!(
-        "wrote spec/collation/fixtures/{{unicode,es}}.coll + unicode.jucd + vectors/{{compiler,sortkey,bundle}}.toml"
+        "wrote spec/collation/fixtures/{{unicode,es}}.coll + vectors/{{compiler,sortkey,bundle}}.toml \
+         (run build_collation_bundle to assemble unicode.jucd)"
     );
 }

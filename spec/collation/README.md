@@ -231,7 +231,10 @@ tables and the Unicode property/casing data ([../design/collation.md §16](../de
 **sections**, so a loader takes only what it needs: a `casing-only` host loads just the property
 section; a browser loads the manifest + root, then a locale's delta on demand. It reuses jed's existing
 conventions verbatim — big-endian, `str` = `u16` length + UTF-8, CRC-32/IEEE, LZ4-block bodies
-([../fileformat/lz4.md](../fileformat/lz4.md)).
+([../fileformat/lz4.md](../fileformat/lz4.md)). The bundle is produced by the build-time **builder
+tool** `impl/rust/src/bin/build_collation_bundle.rs` (the assembler half of the §4.1 pipeline — it
+reads the committed `.coll` set and packs a root + sparse deltas per `--preset`); the canonical
+production bundle is `fixtures/unicode.jucd`.
 
 ```
 bundle {

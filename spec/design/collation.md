@@ -77,13 +77,15 @@
 >   [../collation/README.md §5](../collation/README.md)) with **root-sharing** (the DUCET root once +
 >   per-locale sparse deltas merged at load, byte-identical to the full `.coll` — the merge-identity
 >   vectors) in all three cores; the **bytes/reader load seam** `db.LoadUnicodeData` + introspection
->   `db.LoadedCollations` (§4.2); and the real production bundle `spec/collation/fixtures/unicode.jucd`
->   (root `unicode` + `es`) that the cores LOAD. The compile-time embed (`include_bytes!` /
->   `//go:embed` / base64) is **gone** — the bare binary carries no Unicode data (the SQLite model,
->   §16); embedding is now a host choice (the host hands the same bytes to `LoadUnicodeData`).
-> - **Not yet built (Slice 3 remainder):** the **builder CLI** (3b — `gen_collation_vectors` writes the
->   one production bundle today; the preset-driven assembler is the follow-on) and the **ASCII-casing
->   baseline + property section** (3e, §16, lands with `lower`/`upper`/`ILIKE`); implicit weights / the
+>   `db.LoadedCollations` (§4.2); the **builder tool** `build_collation_bundle` (3b — `--preset`
+>   non-CJK/everything/casing-only + `--out`, the preset-driven assembler that produces the shippable
+>   bundle, §4.1); and the real production bundle `spec/collation/fixtures/unicode.jucd` (root `unicode`
+>   + `es`) that the cores LOAD. The compile-time embed (`include_bytes!` / `//go:embed` / base64) is
+>   **gone** — the bare binary carries no Unicode data (the SQLite model, §16); embedding is now a host
+>   choice (the host hands the same bytes to `LoadUnicodeData`).
+> - **Not yet built (Slice 3 remainder):** the **ASCII-casing baseline + property section** (3e, §16,
+>   lands with `lower`/`upper`/`ILIKE` — the builder's `casing-only` preset is wired but awaits this
+>   data); implicit weights / the
 >   full CJK tier-3 root; the broader LDML tailoring features (and the sv/da/de tailorings that need
 >   them); and the [compatibility.md](compatibility.md) manifest/verdict that reference-only leans on
 >   (§2d). (The slice-2 "embedder-chosen footprint tiers" are **superseded** by Slice 3's builder-tool
@@ -308,6 +310,11 @@ version bump or when a tailoring is added — never in a shipped engine:
   `.coll` tables into the shippable **`JUCD` bundle** (§9): a shared DUCET **root** section, per-locale
   tailoring **deltas** against it, and the Unicode **property/casing** section, with presets
   (`casing-only` / non-CJK / everything, §13). Deterministic; its bundle bytes are a §10 byte fixture.
+  Landed as `impl/rust/src/bin/build_collation_bundle.rs` (`--preset` / `--out`; reads the committed
+  `.coll` set, self-checks the merge identity, writes the bundle) — Rust-only build-time tooling, like
+  the compiler `gen_collation_vectors` (the other cores only *load* the bundle, §4.2). It writes the
+  canonical `spec/collation/fixtures/unicode.jucd` at `non-cjk`; `casing-only` awaits the property
+  section (§16, slice 3e).
 
 ### 4.2 Production surface
 
@@ -845,22 +852,24 @@ host-supplied `JUCD` bundle (§9/§13), and casing follows collation out of the 
 **delivery** change — the `.coll` / table / executor / sort-key encoding and the `format_version` 18
 file entry are all retained (§5), so the on-disk goldens do not move.
 
-- **3a — `JUCD` bundle byte-format spec + vectors:** author
+- **3a — `JUCD` bundle byte-format spec + vectors** ✅ **landed:** authored
   [../collation/README.md §5](../collation/README.md) (header, manifest, property/root/tailoring
   sections, the sparse-delta representation, the load-time `merge`), plus the bundle round-trip and
-  the `merge(root, delta).table == full.table` vectors (§10). Spec/data only, no core code.
-- **3b — the builder tool:** assemble selected `.coll` tables (+ the property section, §16) into a
-  `JUCD` bundle (shared root + deltas), with the `casing-only` / non-CJK / everything presets (§13).
-  Build-time tooling, compiled out of production (§4.1).
-- **3c — the load seam:** `db.LoadUnicodeData(bytesOrReader)` in all three cores (privileged,
-  bytes/reader, **not** SQL-reachable, no engine I/O — §11, [api.md §10](api.md));
-  `resolveCollation` searches the **loaded** set (in load order) instead of a compiled-in embed;
-  remove the unconditional `include_bytes!` / `//go:embed` / base64 embed (embedding becomes a host
-  choice — the host hands the same bytes to `LoadUnicodeData`). `db.Collations` (referenced) +
-  `db.LoadedCollations` (loaded set).
-- **3d — root + delta + load-time merge:** the cross-core byte-identity piece (§9) — the bundle ships
-  the root once + per-locale deltas, and `LoadUnicodeData` merges them into the table the executor
-  already expects, gated by the `merge == full` vectors (§10).
+  the `merge(root, delta).table == full.table` vectors (§10).
+- **3b — the builder tool** ✅ **landed** (the casing half awaits 3e): `build_collation_bundle`
+  assembles the committed `.coll` set into a `JUCD` bundle (shared root + deltas), with `--preset`
+  `casing-only` / non-CJK / everything (§13) and `--out`; it writes the canonical
+  `spec/collation/fixtures/unicode.jucd` at `non-cjk`. Rust-only build-time tooling, compiled out of
+  production (§4.1). `casing-only` is recognized but deferred — its property section is 3e (§16).
+- **3c — the load seam** ✅ **landed:** `db.LoadUnicodeData(bytesOrReader)` in all three cores
+  (privileged, bytes/reader, **not** SQL-reachable, no engine I/O — §11, [api.md §10](api.md));
+  `resolveCollation` searches the engine-global **loaded** set (in load order) instead of a compiled-in
+  embed; the unconditional `include_bytes!` / `//go:embed` / base64 embed is **removed** (embedding is
+  now a host choice — the host hands the same bytes to `LoadUnicodeData`). `db.Collations` (referenced)
+  + `db.LoadedCollations` (loaded set).
+- **3d — root + delta + load-time merge** ✅ **landed:** the cross-core byte-identity piece (§9) — the
+  bundle ships the root once + per-locale deltas, and `LoadUnicodeData` merges them into the table the
+  executor already expects, gated by the `merge == full` vectors (§10).
 - **3e — the ASCII-casing baseline + property section** (§16): the bare binary's ASCII `lower`/`upper`
   (and `ILIKE`), consuming the loaded property section for full Unicode casing — pure greenfield (no
   casing function exists today, [functions.md §9](functions.md)). Lands with or after the
