@@ -437,6 +437,11 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // a writer is open throws 25001, shared.ts), so it models the block by queuing rather than truly
   // blocking, which still defines + verifies the canonical result the threaded cores reproduce.
   "txn.gate_blocking",
+  // The conformance harness can run a file against a PRE-BUILT database image named by a file-level
+  // `# fixture:` directive (instead of a fresh DB), so the corpus can exercise on-disk state SQL
+  // cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
+  // §12/§14, spec/design/conformance.md). Reconstructed in memory via loadDatabase.
+  "harness.fixture_open",
 ];
 
 // execute parses and executes one SQL statement against db (no bind parameters).

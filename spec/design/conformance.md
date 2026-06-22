@@ -87,6 +87,23 @@ Conventions, fixed here so every implementation renders identically:
   The asserted type is the resolved **scalar** type — for `decimal` the unconstrained `decimal`,
   **not** the `numeric(p,s)` typmod (the resolved expression type does not carry the display
   typmod; §7 records that finer granularity as deferred). Coverage: `suites/types/result_types.test`.
+- **`# fixture:` header** — an optional `# fixture: <spec-relative-path>` comment that makes the
+  whole file run against a **pre-built on-disk database image** instead of the default fresh
+  in-memory database. The harness loads the image (relative to `spec/`) via the in-memory
+  open-from-bytes path — `Database::from_image` / `LoadDatabase` / `loadDatabase` — read-**write**,
+  then runs the file's records against it. This exists for state that **SQL cannot construct**: the
+  engine always pins the loaded collation version and always builds a correct index, so a
+  version-**skewed** collation pin paired with a wrong-for-loaded index can only come from a
+  hand-authored fixture (the byte-pinned goldens in [../fileformat/fixtures/](../fileformat/fixtures/),
+  authored declaratively in [verify.rb](../fileformat/verify.rb)). The directive appears in the
+  header (before any record); when present the harness loads jed's production `JUCD` bundle first, so
+  a referenced collation resolves on open (a skewed pin resolves to a *different* loaded version —
+  the point). Gated by the **`harness.fixture_open`** capability (§3), so a core whose harness has
+  not yet implemented it skips the file cleanly rather than mis-parsing the directive as a comment
+  and running against an empty DB. It is a stock-runner-ignored comment (§1.1) — but unlike the
+  stock runner, which would just see an empty database, our harness substitutes the image. Coverage:
+  the collation version-skew read-safety regression `suites/collation/skew.test` /
+  `skew_full.test` ([collation.md](collation.md) §12/§14).
 
 ### 1.1 Why stay format-compatible
 

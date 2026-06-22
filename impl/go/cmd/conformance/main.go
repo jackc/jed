@@ -169,6 +169,46 @@ func loadCollation(name string) error {
 	return nil
 }
 
+// parseFixtureDirective parses a file-level `# fixture: <spec-relative-path>` line — the corpus's way
+// to run a file against a PRE-BUILT database image instead of a fresh database, so a test can exercise
+// on-disk state SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded index — the
+// skew read-safety regression, spec/design/collation.md §12/§14). The path is relative to spec/.
+// Gated by the harness.fixture_open capability. Returns the path, or false if not this directive.
+func parseFixtureDirective(line string) (string, bool) {
+	body, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "fixture:")
+	if !ok {
+		return "", false
+	}
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return "", false
+	}
+	return body, true
+}
+
+// openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
+// spec/). The harness acts as the host: it first loads jed's pinned production bundle so any
+// referenced collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which
+// is the point), then reconstructs the database in memory via LoadDatabase. The handle is read-WRITE
+// so a write against a skewed table exercises the real XX002 guard (collation.md §12), not a
+// read-only-handle error.
+func openFixture(rel string) (*jed.Database, error) {
+	bundle := filepath.Join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd")
+	if data, err := os.ReadFile(bundle); err == nil {
+		_ = jed.LoadUnicodeData(data) // idempotent: the loaded set is engine-global
+	}
+	path := filepath.Join(repoRoot(), "spec", rel)
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("fixture: read %s: %w", path, err)
+	}
+	db, err := jed.LoadDatabase(data)
+	if err != nil {
+		return nil, fmt.Errorf("fixture: open %s: %w", rel, err)
+	}
+	return db, nil
+}
+
 func parseRequires(text string) []string {
 	for _, line := range strings.Split(text, "\n") {
 		t := strings.TrimSpace(line)
@@ -593,6 +633,17 @@ func runFile(text string) error {
 				if err := loadCollation(name); err != nil {
 					return err
 				}
+				i++
+				continue
+			}
+			// `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh NewDatabase()
+			// above — appears in the header before any record (spec/design/conformance.md).
+			if rel, ok := parseFixtureDirective(line); ok {
+				fixtureDB, err := openFixture(rel)
+				if err != nil {
+					return err
+				}
+				db = fixtureDB
 				i++
 				continue
 			}

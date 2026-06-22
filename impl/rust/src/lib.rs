@@ -503,6 +503,11 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // under the race detector (shared.rs `acquire_writer`/`release_writer`) — the one concurrency path
     // the sequential walk never exercises.
     "txn.gate_blocking",
+    // The conformance harness can run a file against a PRE-BUILT database image named by a file-level
+    // `# fixture:` directive (instead of a fresh DB), so the corpus can exercise on-disk state SQL
+    // cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
+    // §12/§14, spec/design/conformance.md). Reconstructed in memory via `Database::from_image`.
+    "harness.fixture_open",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

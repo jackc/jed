@@ -863,6 +863,45 @@ COLLATION_PK_TABLE = {
              rows: [["a", "b"], ["z", "a"]] }]
 }.freeze
 
+# collation_skew_corrupt (v18): a version-SKEWED collated table — the read-safety regression fixture
+# for the deferred collated-index pushdown follow-on (spec/design/collation.md §8/§12/§14). The
+# `unicode` reference entry is pinned to a BOGUS 9999.0.0 (≠ the loaded 17.0.0 bundle), so on open the
+# collation's verdict is Skewed and `t` is READ-ONLY (XX002 on any write — collation.md §12). Its
+# secondary index `t_name_idx` over the COLLATE "unicode" column is deliberately authored with C /
+# BYTE-ORDER keys (key_collation: "C") — i.e. WRONG for the loaded unicode order. Today every collated
+# operation heap-scans + recomputes against the LOADED table (collated keys never push down, §8), so
+# the index is never consulted and reads are correct DESPITE the wrong index. The day collated-index
+# pushdown lands (§14, "the obvious follow-on"), a query that would use this index MUST bypass/rebuild
+# a skewed one or it returns wrong rows — suites/collation/skew.test is the tripwire (green today, red
+# the instant a skewed index is trusted). Rows pinned so unicode-order (a < ä < b < … < z < Z) and
+# byte-order (Z < a < b < ä) disagree on the SET, not just the order, of `name >= 'b'`.
+COLLATION_SKEW_CORRUPT_TABLE = {
+  collations: [
+    { name: "unicode", default: false, unicode: "9999.0.0", cldr: "", desc: "" }
+  ],
+  tables: [{ name: "t",
+             columns: [col("id", "i32", pk: true),
+                       col("name", "text", collation: "unicode")],
+             indexes: [{ name: "t_name_idx", cols: [1], key_collation: "C" }],
+             rows: [[1, "a"], [2, "Z"], [3, "ä"], [4, "b"]] }]
+}.freeze
+
+# collation_skew_twin (v18): the NON-skewed twin of COLLATION_SKEW_CORRUPT — identical schema + rows,
+# but the `unicode` pin MATCHES the loaded bundle (17.0.0 → verdict Full, read-write) and `t_name_idx`
+# stores the CORRECT unicode UCA sort keys. The same query is correct today (full scan) AND stays
+# correct once collated-index pushdown uses this index. The contrast is the point: a CORRECT collated
+# index is safe to push down to; a SKEWED one is not. suites/collation/skew_full.test asserts it.
+COLLATION_SKEW_TWIN_TABLE = {
+  collations: [
+    { name: "unicode", default: false, unicode: "17.0.0", cldr: "", desc: "" }
+  ],
+  tables: [{ name: "t",
+             columns: [col("id", "i32", pk: true),
+                       col("name", "text", collation: "unicode")],
+             indexes: [{ name: "t_name_idx", cols: [1] }],
+             rows: [[1, "a"], [2, "Z"], [3, "ä"], [4, "b"]] }]
+}.freeze
+
 FIXTURES = [
   { file: "empty_db.jed",        page_size: 256, tables: [] },
   { file: "overflow_table.jed",  page_size: 256, tables: [OVERFLOW_TABLE] },
@@ -919,6 +958,10 @@ FIXTURES = [
     collations: COLLATION_TABLE[:collations], tables: COLLATION_TABLE[:tables] },
   { file: "collation_pk_table.jed", page_size: 256,
     collations: COLLATION_PK_TABLE[:collations], tables: COLLATION_PK_TABLE[:tables] },
+  { file: "collation_skew_corrupt.jed", page_size: 256,
+    collations: COLLATION_SKEW_CORRUPT_TABLE[:collations], tables: COLLATION_SKEW_CORRUPT_TABLE[:tables] },
+  { file: "collation_skew_twin.jed", page_size: 256,
+    collations: COLLATION_SKEW_TWIN_TABLE[:collations], tables: COLLATION_SKEW_TWIN_TABLE[:tables] },
   { file: "tall_tree.jed",       page_size: 256, tables: [TALL_TREE] },
   # Torn-write fallback: same image as pk_table, with one meta slot's CRC smashed.
   { file: "torn_meta_slot0.jed", page_size: 256, tables: [PK_TABLE], corrupt_slot: 0 },
@@ -1526,7 +1569,14 @@ def index_entry_key(table, ix, storage_key, row)
       out << "\x01".b
     else
       out << "\x00".b
-      out << key_body(table[:columns][ci][:type], v, table[:columns][ci][:collation])
+      # A fixture may force a non-collation ("C" / byte-order) key encoding for an index over a
+      # COLLATE-annotated column via `key_collation: "C"`, to author a version-SKEWED index whose
+      # stored order is deliberately WRONG for the loaded collation (the skew read-safety regression
+      # fixture, spec/design/collation.md §12/§14). Absent the override, the index keys use the
+      # column's frozen collation, as every other fixture does.
+      coll = ix.key?(:key_collation) ? ix[:key_collation] : table[:columns][ci][:collation]
+      coll = nil if coll == "C"
+      out << key_body(table[:columns][ci][:type], v, coll)
     end
   end
   out << storage_key

@@ -15,6 +15,7 @@ import {
   EngineError,
   execute,
   fixedClock,
+  loadDatabase,
   type Outcome,
   type Privilege,
   PrivilegeSet,
@@ -73,6 +74,30 @@ function loadCollation(name: string): void {
   loadUnicodeData(readFileSync(path));
   if (loadedCollation(name) !== undefined) return;
   throw new Error(`load-collation: collation "${name}" is not provided by the loaded bundle`);
+}
+
+// parseFixtureDirective parses a file-level `# fixture: <spec-relative-path>` line — the corpus's way
+// to run a file against a PRE-BUILT database image instead of a fresh database, so a test can exercise
+// on-disk state SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded index — the
+// skew read-safety regression, spec/design/collation.md §12/§14). The path is relative to spec/.
+// Gated by the harness.fixture_open capability. Returns the path, or null if not this directive.
+function parseFixtureDirective(line: string): string | null {
+  const rest = line.replace(/^#/, "").trim();
+  if (!rest.startsWith("fixture:")) return null;
+  const body = rest.slice("fixture:".length).trim();
+  return body === "" ? null : body;
+}
+
+// openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
+// spec/). The harness acts as the host: it first loads jed's pinned production bundle so any
+// referenced collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which
+// is the point), then reconstructs the database in memory via loadDatabase. The handle is read-WRITE
+// so a write against a skewed table exercises the real XX002 guard (collation.md §12), not a
+// read-only-handle error.
+function openFixture(rel: string): Database {
+  const bundle = join(repoRoot(), "spec", "collation", "fixtures", "unicode.jucd");
+  if (existsSync(bundle)) loadUnicodeData(readFileSync(bundle)); // idempotent: the set is engine-global
+  return loadDatabase(readFileSync(join(repoRoot(), "spec", rel)));
 }
 
 function parseRequires(text: string): string[] {
@@ -479,7 +504,7 @@ function assertTypes(expected: string[] | null, actual: string[], sql: string): 
 
 // runFile runs all records in one .test file against a fresh database.
 function runFile(text: string): void {
-  const db = new Database();
+  let db = new Database();
   const lines = text.split("\n");
   const c: Cursor = { i: 0 };
   // A `# cost: N` / `# names: ...` / `# types: ...` / `# max_cost: N` directive sets these; the
@@ -516,6 +541,14 @@ function runFile(text: string): void {
       const lc = parseLoadCollationDirective(line);
       if (lc !== null) {
         loadCollation(lc[0]);
+        c.i++;
+        continue;
+      }
+      // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `new Database()`
+      // above — appears in the header before any record (spec/design/conformance.md).
+      const fx = parseFixtureDirective(line);
+      if (fx !== null) {
+        db = openFixture(fx);
         c.i++;
         continue;
       }

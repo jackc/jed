@@ -430,6 +430,11 @@ var SupportedCapabilities = []string{
 	// stepped-threaded mode additionally drives + verifies the *real* blocking writeMu acquire under
 	// the race detector (shared.go) — the one concurrency path the sequential walk never exercises.
 	"txn.gate_blocking",
+	// The conformance harness can run a file against a PRE-BUILT database image named by a file-level
+	// `# fixture:` directive (instead of a fresh DB), so the corpus can exercise on-disk state SQL
+	// cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
+	// §12/§14, spec/design/conformance.md). Reconstructed in memory via LoadDatabase.
+	"harness.fixture_open",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

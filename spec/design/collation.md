@@ -508,7 +508,10 @@ same `(unicode, cldr)` version emits identical key bytes → byte-identical coll
   comparison from a byte-range index bound (it would compute a `C`-byte bound against a
   collation-ordered B-tree — wrong), so this falls out for free: a `C` text key still pushes down; a
   non-`C` one does not. (Equality pushdown is sound in principle — the sort key is injective via the
-  identical level — and is the obvious follow-on.)
+  identical level — and is the obvious follow-on.) **When that follow-on lands it must first exclude a
+  *version-skewed* index** (§12 — a skewed index's keys are at the file's pinned version, wrong for
+  the loaded one): the shared regression `suites/collation/skew.test` is green only because this
+  narrowing keeps the index unread, and it turns red the instant pushdown trusts a skewed index.
 - **One uniform component codec.** A collated text key component is the **full** sort key (identical
   level included) in every position — PK body, secondary-index entry, `UNIQUE` prefix. The
   alternative `sort_key ‖ pk` (no identical level) for a secondary index is *also* correct but is not
@@ -876,6 +879,20 @@ leans on:
   opposite — host-OS-drift, §15), so the behavior is verified by **per-core unit tests** (the verdict
   is a deterministic pure function — every core computes the identical verdict, the §10 cross-core
   contract — and the write-block + read-correctness), not the oracle corpus (CLAUDE.md §10).
+
+  **The read-safety invariant is also pinned by a shared corpus tripwire**
+  (`suites/collation/skew.test`, with the non-skewed twin `skew_full.test`): a **pre-built database
+  image** — a version-skewed `unicode` pin (a bogus `9999.0.0`) over a secondary index whose stored
+  keys are deliberately **wrong for the loaded collation** — opened via the new file-level
+  **`# fixture:`** harness directive (capability `harness.fixture_open`,
+  [conformance.md §1](conformance.md), authored byte-pinned in
+  [../fileformat/verify.rb](../fileformat/verify.rb)). The fixture exists because SQL **cannot**
+  build this state (the engine always pins the loaded version and builds a correct index). The test
+  asserts a query that *would* be served by that index returns the correct loaded-collation rows —
+  **green today** (the index is never consulted: collated keys never push down, §8 — below), and it
+  goes **red** the day collated-index pushdown lands without first bypassing/rebuilding a skewed
+  index. It is the cross-core guard that the "obvious follow-on" (§8 / encoding.md §2.12) cannot
+  silently break read safety; the twin shows a *correct* collated index is safe to push down to.
 - **2e — real version-pinned root + first tailoring** ✅ *landed (all three cores + Ruby)*: the
   `dev-*` fixtures are replaced in the production **vendored** set by the real CLDR-tailored DUCET
   root — `unicode` (UCA/UCD **17.0.0**, CLDR 48, `spec/collation/17.0.0/root.allkeys` ≈ the CLDR

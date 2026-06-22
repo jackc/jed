@@ -144,6 +144,36 @@ fn load_collation(name: &str) -> std::result::Result<(), String> {
     ))
 }
 
+/// Parse a file-level `# fixture: <spec-relative-path>` directive — the corpus's way to run a file
+/// against a PRE-BUILT database image instead of a fresh `Database::new()`, so a test can exercise
+/// on-disk state that SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded
+/// index — the skew read-safety regression, spec/design/collation.md §12/§14). The path is relative
+/// to `spec/`. Gated by the `harness.fixture_open` capability. Returns the path, or None.
+fn parse_fixture_directive(rest: &str) -> Option<String> {
+    let body = rest.trim_start().strip_prefix("fixture:")?.trim();
+    (!body.is_empty()).then(|| body.to_string())
+}
+
+/// Open the pre-built database image named by a `# fixture:` directive (path relative to `spec/`).
+/// The harness acts as the host: it first loads jed's pinned production bundle so any referenced
+/// collation resolves on open (a skewed pin still resolves — to a *different* version, which is the
+/// point), then reconstructs the database in memory via `from_image`. The handle is read-WRITE so a
+/// write against a skewed table exercises the real XX002 guard (collation.md §12), not a
+/// read-only-handle error.
+fn open_fixture(rel: &str) -> std::result::Result<Database, String> {
+    let bundle =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/fixtures/unicode.jucd");
+    if let Ok(bytes) = std::fs::read(&bundle) {
+        let _ = jed::load_unicode_data(&bytes); // idempotent: the loaded set is engine-global
+    }
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../spec")
+        .join(rel);
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("fixture: read {}: {e}", path.display()))?;
+    Database::from_image(&bytes).map_err(|e| format!("fixture: open {rel}: {}", e.message))
+}
+
 fn collect_tests(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
@@ -483,6 +513,12 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 load_collation(&name)?;
                 continue;
             }
+            // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `Database::new()`
+            // above — appears in the header before any record (spec/design/conformance.md).
+            if let Some(rel) = parse_fixture_directive(rest) {
+                db = open_fixture(&rel)?;
+                continue;
+            }
             // `# cost:` / `# names:` / `# types:` bind to the next record; every other comment
             // is ignored.
             if let Some(n) = parse_cost_directive(rest) {
@@ -702,7 +738,11 @@ fn rebaseline_file(text: &str) -> Option<String> {
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('#') {
-            if parse_cost_directive(rest).is_some() {
+            if let Some(rel) = parse_fixture_directive(rest) {
+                // Mirror `run_file`: a fixture file evolves DB state from the pre-built image, not a
+                // fresh DB, so the cost walk sees the same starting state.
+                db = open_fixture(&rel).ok()?;
+            } else if parse_cost_directive(rest).is_some() {
                 pending_cost_line = Some(i);
             } else if let Some(n) = parse_lifetime_max_cost_directive(rest) {
                 // Sticky session budget (spec/design/session.md §5.4): apply immediately so the DB
