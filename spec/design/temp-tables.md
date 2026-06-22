@@ -293,6 +293,24 @@ Temp tables reuse the full `table_element` machinery; everything is held in the 
   of a temp owned sequence by the same gate (classified by resolving the sequence). On a `SHARED` temp
   table the owned sequence is cross-session: a session's advance is visible to every other session
   after its transaction commits (the two-root commit, §5), so auto-numbering continues across sessions.
+- **Composite-typed columns** — fully supported on a temp table (session-local and `SHARED`), identical
+  semantics to a persistent column (composite.md): `ROW(…)` / `'(…)'::type` construction, `record_out`
+  rendering, field access, and the element-wise comparison / ordering all behave exactly as on a
+  persistent table. The key fact is that a composite **type** is *always persistent* — `CREATE TYPE` is
+  persistent DDL, so the type lives in the main image and a temp table only **references** it (a temp
+  table can never define one). The deferral existed only because `put_table` resolves a column's
+  `Type::Composite` reference into its `ColType` codec/coercion tree against the **snapshot's own** type
+  catalog, and a temp snapshot's is empty; the fix resolves the temp table's `ColType`s against the
+  **main** snapshot's type catalog at staging time. The resulting tree is **fully self-contained**
+  (composite.md §4), so the temp store needs nothing from the catalog per row — no temp snapshot carries
+  a type catalog, and the table still makes **zero file writes**. A composite column is **storable but
+  never keyable**, so it cannot be a `PRIMARY KEY` (`0A000`, the same scope-agnostic key gate as a
+  persistent table, §6). `DROP TYPE` of a type a temp table references is `2BP01`: the dependency check
+  is **scope-aware** — it scans the main image *and* the visible session-local + shared temp snapshots,
+  so a temp table's reference blocks the drop exactly as a persistent column's does (a `SHARED` temp
+  table's reference blocks it for every session; another session's private session-local reference is
+  invisible by design — and its self-contained `ColType` keeps working regardless). The DDL is gated by
+  the temp-scoped split (§5) like any temp `CREATE TABLE`.
 - **`FOREIGN KEY` involving a temp table — `0A000` this slice (deferred).** A reference *between* a
   temp and a persistent table is semantically fraught (a permanent table outliving the temp it points
   at) and PG itself restricts it; jed defers all FK constraints touching a temp table in either

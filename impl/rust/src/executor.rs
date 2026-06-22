@@ -576,8 +576,6 @@ impl Snapshot {
     /// the page payload `cap` (= `page_size − 12`) and the column types so the page-backed B-tree
     /// can weigh records for its size-driven split (spec/fileformat/format.md).
     pub(crate) fn put_table(&mut self, table: Table, page_size: u32) {
-        let key = table.name.to_ascii_lowercase();
-        let cap = page_size as usize - 12; // PAGE_HEADER
         // Resolve each column's `ColType` against the (already-registered) composite-type catalog
         // — the codec/coercion tree the store keeps so neither re-walks the type catalog per row
         // (spec/design/composite.md §4). Composite types are registered before any table (the
@@ -588,6 +586,24 @@ impl Snapshot {
             .iter()
             .map(|c| resolve_col_type(&c.ty, &self.types))
             .collect();
+        self.put_table_resolved(table, col_types, page_size);
+    }
+
+    /// Register a table whose column `ColType`s are **already resolved** — used when staging a TEMP
+    /// table (spec/design/temp-tables.md §8): a temp table's composite columns must resolve against
+    /// the MAIN snapshot's type catalog (composites are never temp — `CREATE TYPE` is persistent),
+    /// not this (temp) snapshot's empty `types` map. The resolved [`ColType`] tree is fully
+    /// self-contained (spec/design/composite.md §4), so the store needs nothing from the catalog
+    /// thereafter. The plain [`put_table`](Snapshot::put_table) resolves against `self.types` and
+    /// delegates here.
+    pub(crate) fn put_table_resolved(
+        &mut self,
+        table: Table,
+        col_types: Vec<ColType>,
+        page_size: u32,
+    ) {
+        let key = table.name.to_ascii_lowercase();
+        let cap = page_size as usize - 12; // PAGE_HEADER
         self.stores
             .insert(key.clone(), TableStore::new(cap, col_types));
         self.tables.insert(key, table);
@@ -1416,6 +1432,21 @@ impl Database {
     /// session-local → shared → persistent); preclude-overlaps keeps a name in at most one scope.
     fn is_shared_temp_table(&self, name: &str) -> bool {
         self.shared_temp_read_snap().table(name).is_some()
+    }
+
+    /// The `DROP TYPE … RESTRICT` dependency check across EVERY visible scope (spec/design/temp-tables.md
+    /// §8): the main image (tables + composite fields), then the visible session-local and shared temp
+    /// snapshots (their tables). A composite type is always persistent, but a TEMP table column may
+    /// reference it, so dropping the type while such a temp table exists is 2BP01 — matching the
+    /// persistent case (PostgreSQL blocks the drop). A session sees only its own session-local temp
+    /// tables plus the shared ones, so the check is scoped to what is visible (another session's
+    /// private temp table is invisible by design — and its resolved [`ColType`] is self-contained, so it
+    /// keeps working regardless).
+    fn composite_dependent_any(&self, name: &str) -> Option<String> {
+        self.read_snap()
+            .composite_dependent(name)
+            .or_else(|| self.temp_read_snap().composite_dependent(name))
+            .or_else(|| self.shared_temp_read_snap().composite_dependent(name))
     }
 
     /// Whether `name` is a secondary index on a SESSION-LOCAL temp table (spec/design/temp-tables.md §8)
@@ -3433,20 +3464,12 @@ impl Database {
         let cap = self.page_size as usize - 12; // PAGE_HEADER
 
         if ct.temp {
-            // Deferred narrowings on a temp table this slice (spec/design/temp-tables.md §8), each a
-            // clean 0A000: a composite-typed column (needs the temp snapshot to carry the type catalog)
-            // and a collated column (needs the collation catalog). Plain scalar/array/range/decimal
-            // columns with PK / NOT NULL / DEFAULT / CHECK / UNIQUE — and now `serial`/IDENTITY columns,
-            // whose OWNED sequence is staged into the same temp snapshot below — are fully supported.
-            if let Some(c) = table.columns.iter().find(|c| type_uses_composite(&c.ty)) {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    format!(
-                        "composite-typed column {} on a temporary table is not yet supported",
-                        c.name
-                    ),
-                ));
-            }
+            // Deferred narrowing on a temp table this slice (spec/design/temp-tables.md §8), a clean
+            // 0A000: a collated column (needs the temp snapshot to carry the collation catalog). Plain
+            // scalar/array/range/decimal columns with PK / NOT NULL / DEFAULT / CHECK / UNIQUE,
+            // `serial`/IDENTITY columns (the OWNED sequence is staged into the same temp snapshot
+            // below), and COMPOSITE-typed columns (resolved against the MAIN type catalog just below)
+            // are fully supported.
             if let Some(c) = table.columns.iter().find(|c| c.collation.is_some()) {
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
@@ -3456,6 +3479,20 @@ impl Database {
                     ),
                 ));
             }
+            // Resolve each column's `ColType` against the MAIN snapshot's composite-type catalog
+            // (spec/design/temp-tables.md §8): composites are always persistent (`CREATE TYPE` is
+            // persistent DDL), so the temp snapshot's own `types` map is empty — resolving there would
+            // panic on a composite reference. Done here, against `read_snap()`, BEFORE the temp mutable
+            // borrow; the resulting `ColType` tree is self-contained, so the temp store needs nothing
+            // from the catalog after this (composite.md §4).
+            let col_types: Vec<ColType> = {
+                let main = self.read_snap();
+                table
+                    .columns
+                    .iter()
+                    .map(|c| resolve_col_type(&c.ty, &main.types))
+                    .collect()
+            };
             // Register into the matching temp snapshot — never the main image, so the table makes zero
             // file writes (§2). A `SHARED` table goes in the database-wide shared snapshot (visible to
             // every session, §4); a plain temp table in the session-local one. page_size only weighs
@@ -3466,7 +3503,7 @@ impl Database {
             } else {
                 self.temp_working_mut()
             };
-            tw.put_table(table, ps);
+            tw.put_table_resolved(table, col_types, ps);
             for k in index_keys {
                 tw.put_index_store(k, TableStore::new(cap, Vec::new()));
             }
@@ -4068,7 +4105,7 @@ impl Database {
                 format!("type does not exist: {}", dt.name),
             ));
         }
-        if let Some(dep) = self.read_snap().composite_dependent(&dt.name) {
+        if let Some(dep) = self.composite_dependent_any(&dt.name) {
             return Err(EngineError::new(
                 SqlState::DependentObjectsStillExist,
                 format!(
@@ -15034,17 +15071,6 @@ impl PrivReq {
     }
     fn need_function(&mut self, name: &str) {
         self.functions.push(name.to_string());
-    }
-}
-
-/// Whether a column type involves a composite type (directly, or as an array element). A temp table
-/// with such a column is deferred this slice (spec/design/temp-tables.md §8) because the session temp
-/// snapshot carries no composite-type catalog. Range elements are scalar-only, so a range never does.
-fn type_uses_composite(t: &Type) -> bool {
-    match t {
-        Type::Composite(_) => true,
-        Type::Array(elem) => type_uses_composite(elem),
-        Type::Scalar(_) | Type::Range(_) => false,
     }
 }
 

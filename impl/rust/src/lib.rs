@@ -88,10 +88,12 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // CREATE [TEMP|TEMPORARY] TABLE — session-local temporary tables that make zero writes to the
     // database file (held in the session temp snapshot), with full CRUD, PK/UNIQUE/CHECK/NOT NULL/
     // DEFAULT, preclude-overlaps (42P07), DROP, standalone CREATE INDEX / DROP INDEX (the index in the
-    // temp snapshot, gated by the same allow_temp_ddl), and serial/IDENTITY columns (the OWNED sequence
-    // lives in the temp snapshot — zero file writes — and is auto-dropped with the table). Composite/
-    // collated columns and FK on a temp table are deferred 0A000 (spec/design/temp-tables.md §8). The
-    // capability gate is session.allow_temp_ddl; the storage budget is resource.temp_budget.
+    // temp snapshot, gated by the same allow_temp_ddl), serial/IDENTITY columns (the OWNED sequence
+    // lives in the temp snapshot — zero file writes — and is auto-dropped with the table), and
+    // composite-typed columns (resolved against the persistent type catalog; DROP TYPE of a referenced
+    // type is 2BP01). Collated columns and FK on a temp table are deferred 0A000
+    // (spec/design/temp-tables.md §8). The capability gate is session.allow_temp_ddl; the storage budget
+    // is resource.temp_budget.
     "ddl.temp_table",
     // CREATE SHARED [TEMP|TEMPORARY] TABLE — database-wide shared temporary tables (visible to every
     // session of the open Database, sharing one set of rows), still making zero file writes (held in
