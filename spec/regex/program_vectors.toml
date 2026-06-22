@@ -1,0 +1,182 @@
+# Regex compile-determinism vectors — (pattern[, flags]) -> compiled NFA program.
+# THE cross-core lowering contract (../design/regex.md §3, README.md). Every core must emit this
+# exact instruction listing; `count` (= prog.length) is the `regex_compile` cost. Hand-authored from
+# the §3.2 wrapper + §3.3 lowering; the per-core harness renders its program and asserts equality.
+#
+# Every program is wrapped (§3.2):
+#   0: split 3 1   (lazy .*? prefix — unanchored, leftmost)
+#   1: any
+#   2: jmp 0
+#   3: save 0      (group 0 opens)
+#   <body>
+#   save 1         (group 0 closes)
+#   match
+
+schema_version = 1
+
+# --- literal + concatenation -------------------------------------------------
+[[case]]
+pattern = "a"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "char 97", "save 1", "match"]
+count = 7
+
+[[case]]
+pattern = "ab"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "char 97", "char 98", "save 1", "match"]
+count = 8
+
+# Empty pattern — matches empty at position 0; body emits nothing.
+[[case]]
+pattern = ""
+prog = ["split 3 1", "any", "jmp 0", "save 0", "save 1", "match"]
+count = 6
+
+# --- anchors -----------------------------------------------------------------
+[[case]]
+pattern = "^a$"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "assertstart", "char 97", "assertend", "save 1", "match"]
+count = 9
+
+# --- alternation (right-associative binary fold) -----------------------------
+[[case]]
+pattern = "a|b"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "split 5 7", "char 97", "jmp 8", "char 98", "save 1", "match"]
+count = 10
+
+# a|b|c  ==  a|(b|c). Both alternation arms jump to the alternation's END = the `save 1` at 11
+# (NOT `match` at 12 — skipping save 1 would drop group 0's closing capture).
+[[case]]
+pattern = "a|b|c"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "split 5 7", "char 97", "jmp 11", "split 8 10", "char 98", "jmp 11", "char 99", "save 1", "match"]
+count = 13
+
+# --- quantifiers (greedy) ----------------------------------------------------
+[[case]]
+pattern = "a*"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "split 5 7", "char 97", "jmp 4", "save 1", "match"]
+count = 9
+
+[[case]]
+pattern = "a+"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "char 97", "split 4 6", "save 1", "match"]
+count = 8
+
+[[case]]
+pattern = "a?"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "split 5 6", "char 97", "save 1", "match"]
+count = 8
+
+# --- quantifiers (lazy — swapped split arms) ---------------------------------
+[[case]]
+pattern = "a*?"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "split 7 5", "char 97", "jmp 4", "save 1", "match"]
+count = 9
+
+[[case]]
+pattern = "a+?"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "char 97", "split 6 4", "save 1", "match"]
+count = 8
+
+[[case]]
+pattern = "a??"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "split 6 5", "char 97", "save 1", "match"]
+count = 8
+
+# --- bounded repetition (unrolled, §3.3) -------------------------------------
+[[case]]
+pattern = "a{2}"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "char 97", "char 97", "save 1", "match"]
+count = 8
+
+# {1,2} = one mandatory copy + one greedy-optional copy
+[[case]]
+pattern = "a{1,2}"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "char 97", "split 6 7", "char 97", "save 1", "match"]
+count = 9
+
+# {2,} = two mandatory copies + a star of one more
+[[case]]
+pattern = "a{2,}"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "char 97", "char 97", "split 7 9", "char 97", "jmp 6", "save 1", "match"]
+count = 11
+
+# {0,0} emits nothing — same shape as the empty pattern body
+[[case]]
+pattern = "a{0,0}"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "save 1", "match"]
+count = 6
+
+# --- groups ------------------------------------------------------------------
+# Capturing group 1 -> save slots 2,3.
+[[case]]
+pattern = "(a)"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "save 2", "char 97", "save 3", "save 1", "match"]
+count = 9
+
+# Non-capturing group emits the body directly (no Save).
+[[case]]
+pattern = "(?:a)"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "char 97", "save 1", "match"]
+count = 7
+
+# Two capturing groups -> slots 2,3 then 4,5.
+[[case]]
+pattern = "(a)(b)"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "save 2", "char 97", "save 3", "save 4", "char 98", "save 5", "save 1", "match"]
+count = 12
+
+# --- any + classes -----------------------------------------------------------
+[[case]]
+pattern = "."
+prog = ["split 3 1", "any", "jmp 0", "save 0", "any", "save 1", "match"]
+count = 7
+
+[[case]]
+pattern = "[a-c]"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "class 0", "save 1", "match"]
+count = 7
+classes = ["97-99"]
+
+# Negated class.
+[[case]]
+pattern = "[^0-9]"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "class 0", "save 1", "match"]
+count = 7
+classes = ["^48-57"]
+
+# \d is the predefined digit class [0-9].
+[[case]]
+pattern = "\\d"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "class 0", "save 1", "match"]
+count = 7
+classes = ["48-57"]
+
+# Two class occurrences get two table entries (no dedup, §3.1).
+[[case]]
+pattern = "[a-c][a-c]"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "class 0", "class 1", "save 1", "match"]
+count = 8
+classes = ["97-99", "97-99"]
+
+# --- case-insensitive folding (flags = "i") ----------------------------------
+# 'A' folded to 'a' before compiling -> identical to pattern "a".
+[[case]]
+pattern = "A"
+flags = "i"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "char 97", "save 1", "match"]
+count = 7
+
+# --- escaped metacharacters --------------------------------------------------
+# \. is a literal dot (code point 46), not Any.
+[[case]]
+pattern = "\\."
+prog = ["split 3 1", "any", "jmp 0", "save 0", "char 46", "save 1", "match"]
+count = 7
+
+# --- a small ReDoS-shaped pattern still compiles to a tiny program -----------
+# (a+)+ — the classic catastrophic-backtracking pattern; here it is just a few instructions and
+# the Pike VM runs it in linear time (regex.md §6). group 1 -> slots 2,3.
+[[case]]
+pattern = "(a+)+"
+prog = ["split 3 1", "any", "jmp 0", "save 0", "save 2", "char 97", "split 5 7", "save 3", "split 4 9", "save 1", "match"]
+count = 11

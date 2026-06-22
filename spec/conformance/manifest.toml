@@ -551,6 +551,14 @@ id = "expr.ilike"
 description = "text ILIKE / NOT ILIKE — case-insensitive LIKE (spec/design/collation.md §16, grammar.md §22). Same contract as LIKE; the matcher simple-lowercases (1:1) both operands first — ASCII-only when no Unicode property bundle is loaded, full simple Unicode mappings when one is. % matches any run, _ one code point, default \\ escape; NULL propagates; non-text 42804; trailing-escape 22025. Builds on expr.like"
 
 [[capability]]
+id = "expr.regex_match"
+description = "text ~ pattern / text !~ pattern — regular-expression match (case-sensitive), jed's RE2-able subset (spec/design/regex.md, grammar.md §22b), NOT PostgreSQL-flavor-compatible. UNANCHORED (matches a substring; anchor with ^/$). Pattern surface: literals, . (any code point except newline), classes [...]/[^...], \\d \\w \\s + negations, anchors ^ $, alternation |, groups (...)/(?:...), quantifiers * + ? {n} {n,} {n,m} greedy + lazy, leftmost-first greedy semantics. Hand-written Pike VM (linear-time, no backtracking). text×text→boolean, NULL propagates, non-text 42804, malformed pattern 2201B. !~ is the AST-negated form. Code-point (not UTF-16) iteration"
+
+[[capability]]
+id = "expr.regex_imatch"
+description = "text ~* pattern / text !~* pattern — case-insensitive regular-expression match. Same contract as expr.regex_match; both operands simple-lowercased first (the ILIKE mechanism, spec/design/collation.md §16) — ASCII baseline without a Unicode property bundle, full simple mappings with one. Builds on expr.regex_match"
+
+[[capability]]
 id = "expr.case"
 description = "CASE expression (searched + simple forms): lazy first-match evaluation (later arms not evaluated — the one short-circuit exception); searched WHEN must be boolean (42804); result-arm types unify to a common type (numeric promote; cross-family 42804; all-NULL → text); no match + no ELSE → NULL; output name ?column? (spec/design/grammar.md §23)"
 
@@ -623,6 +631,10 @@ description = "Fixed maximum identifier length (MAX_IDENTIFIER_LENGTH = 63 bytes
 [[capability]]
 id = "resource.composite_depth_limit"
 description = "Fixed maximum composite-type nesting depth (MAX_COMPOSITE_DEPTH = 32), enforced at the two producers of catalog types: a CREATE TYPE whose result would nest deeper than the limit aborts with 54001 (statement_too_complex), and a loaded catalog that exceeds it is rejected as corrupt with XX001 (data_corrupted) (CLAUDE.md §13; spec/design/cost.md §7b, composite.md §3). The third native-stack untrusted-query gate, completing resource.depth_limit's coverage: a chain of cheap CREATE TYPEs each nesting the previous (`a`, `b AS (x a)`, …) builds unbounded depth across MANY statements — which neither the per-statement input-size cap (resource.sql_length_limit) nor the parser nesting counter (resource.depth_limit) sees, because the depth is a property of the catalog graph, not any one statement's AST. Bounding it at the producer makes every derived recursive walk (value codec, comparator, record_out/record_in, resolve_col_type) transitively stack-safe. An array field counts as its element (array levels are not composite levels — composite_ref looks through one array level). A deterministic, cross-core-identical constant (a documented divergence from PG, which bounds composite nesting only by a runtime stack probe), so not oracle-checked. Builds on types.composite."
+
+[[capability]]
+id = "resource.regex_program_limit"
+description = "Fixed maximum regex compiled-program size (MAX_REGEX_PROGRAM = 32768 NFA instructions), enforced at the pattern compiler: a well-formed pattern whose compiled program would exceed the cap — chiefly via bounded-repetition {n,m} unroll (`(a{1000}){1000}`) — aborts with 54001 (statement_too_complex), checked PROJECTIVELY before the oversized program is allocated (CLAUDE.md §13; spec/design/cost.md §7c, regex.md §6). The fourth native-stack/allocation-bound untrusted-query gate, the regex sibling of resource.composite_depth_limit: it protects the UNLIMITED handle (max_cost = 0) where the regex_compile cost ceiling cannot reach. A MALFORMED pattern is 2201B instead (invalid_regular_expression). A deterministic, cross-core-identical constant (jed-specific — PG bounds regex size differently), so not oracle-checked. Builds on expr.regex_match."
 
 [[capability]]
 id = "resource.temp_budget"

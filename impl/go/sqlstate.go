@@ -39,6 +39,8 @@ const (
 	InvalidParameterValue
 	// InvalidEscapeSequence is 22025 — LIKE pattern must not end with escape character.
 	InvalidEscapeSequence
+	// InvalidRegularExpression is 2201B — invalid regular expression: {detail}.
+	InvalidRegularExpression
 	// ArraySubscriptError is 2202E — {detail}.
 	ArraySubscriptError
 	// InvalidTextRepresentation is 22P02 — invalid input syntax for type {type}: {detail}.
@@ -160,6 +162,8 @@ func (s SqlState) Code() string {
 		return "22023"
 	case InvalidEscapeSequence:
 		return "22025"
+	case InvalidRegularExpression:
+		return "2201B"
 	case ArraySubscriptError:
 		return "2202E"
 	case InvalidTextRepresentation:
@@ -280,6 +284,7 @@ var Errors = []ErrorDesc{
 	{Code: "2201X", Name: "invalid_row_count_in_offset_clause", Class: "data exception"},
 	{Code: "22023", Name: "invalid_parameter_value", Class: "data exception"},
 	{Code: "22025", Name: "invalid_escape_sequence", Class: "data exception"},
+	{Code: "2201B", Name: "invalid_regular_expression", Class: "data exception"},
 	{Code: "2202E", Name: "array_subscript_error", Class: "data exception"},
 	{Code: "22P02", Name: "invalid_text_representation", Class: "data exception"},
 	{Code: "23502", Name: "not_null_violation", Class: "integrity constraint violation"},

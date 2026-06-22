@@ -1,0 +1,243 @@
+# Regex execution + step-cost vectors — (pattern[, flags], input) -> match result, capture spans,
+# regex_step cost. The cross-core EXECUTION contract (../design/regex.md §4/§9, README.md). Each core
+# runs the Pike VM and asserts identical `matched`, `caps` (code-point [start,end] per group; group 0
+# is the whole match), and `steps` (= the regex_step cost). Generated from the first conformant core
+# and audited against the VM spec; like the on-disk goldens it is then the pinned contract.
+#
+# `caps` is empty `[]` when `matched = false`. `flags = "i"` folds BOTH pattern and input with simple
+# lowercasing (the ~* / ILIKE mechanism) before running, so offsets are into the folded subject.
+
+schema_version = 1
+
+[[case]]
+pattern = "a"
+input = "a"
+matched = true
+caps = [[0, 1]]
+steps = 11
+
+[[case]]
+pattern = "a"
+input = "xay"
+matched = true
+caps = [[1, 2]]
+steps = 16
+
+# No match: the lazy `.*?` prefix still runs at each position (linear), so a miss has a cost too.
+[[case]]
+pattern = "a"
+input = "z"
+matched = false
+caps = []
+steps = 9
+
+# Unanchored — matches a substring (`b` inside `abc`), unlike LIKE.
+[[case]]
+pattern = "b"
+input = "abc"
+matched = true
+caps = [[1, 2]]
+steps = 16
+
+# Empty pattern matches the empty string at position 0.
+[[case]]
+pattern = ""
+input = "x"
+matched = true
+caps = [[0, 0]]
+steps = 5
+
+[[case]]
+pattern = "^a$"
+input = "a"
+matched = true
+caps = [[0, 1]]
+steps = 13
+
+[[case]]
+pattern = "^a$"
+input = "ab"
+matched = false
+caps = []
+steps = 16
+
+[[case]]
+pattern = "a|b"
+input = "b"
+matched = true
+caps = [[0, 1]]
+steps = 15
+
+[[case]]
+pattern = "a|b|c"
+input = "c"
+matched = true
+caps = [[0, 1]]
+steps = 19
+
+# Greedy star takes the whole run.
+[[case]]
+pattern = "a*"
+input = "aaa"
+matched = true
+caps = [[0, 3]]
+steps = 22
+
+[[case]]
+pattern = "a+"
+input = "b"
+matched = false
+caps = []
+steps = 9
+
+[[case]]
+pattern = "a?b"
+input = "b"
+matched = true
+caps = [[0, 1]]
+steps = 15
+
+[[case]]
+pattern = "a{2}"
+input = "aa"
+matched = true
+caps = [[0, 2]]
+steps = 18
+
+# Greedy `{1,2}` takes 2 of the 3 a's, leftmost.
+[[case]]
+pattern = "a{1,2}"
+input = "aaa"
+matched = true
+caps = [[0, 2]]
+steps = 15
+
+[[case]]
+pattern = "a{2,}"
+input = "aaaa"
+matched = true
+caps = [[0, 4]]
+steps = 30
+
+[[case]]
+pattern = "."
+input = "x"
+matched = true
+caps = [[0, 1]]
+steps = 11
+
+# `.` does NOT match newline (single-line default).
+[[case]]
+pattern = "."
+input = "\n"
+matched = false
+caps = []
+steps = 4
+
+[[case]]
+pattern = "a.c"
+input = "abc"
+matched = true
+caps = [[0, 3]]
+steps = 23
+
+[[case]]
+pattern = "[a-c]+"
+input = "xbca"
+matched = true
+caps = [[1, 4]]
+steps = 25
+
+[[case]]
+pattern = "[^0-9]"
+input = "5a"
+matched = true
+caps = [[1, 2]]
+steps = 16
+
+[[case]]
+pattern = "\\d{3}"
+input = "ab123"
+matched = true
+caps = [[2, 5]]
+steps = 36
+
+[[case]]
+pattern = "\\w+"
+input = " foo_1 "
+matched = true
+caps = [[1, 6]]
+steps = 33
+
+# Capturing group: group 0 = whole match, group 1 = the alternation's match.
+[[case]]
+pattern = "(foo|bar)baz"
+input = "xbarbazy"
+matched = true
+caps = [[1, 7], [1, 4]]
+steps = 73
+
+[[case]]
+pattern = "a(b+)c"
+input = "xabbbcx"
+matched = true
+caps = [[1, 6], [2, 5]]
+steps = 50
+
+[[case]]
+pattern = "(a)(b)"
+input = "ab"
+matched = true
+caps = [[0, 2], [0, 1], [1, 2]]
+steps = 23
+
+# The classic ReDoS pattern over a non-matching input: LINEAR (111 steps for 10 a's + `!`), not
+# exponential — the whole point of the Pike VM (regex.md §6).
+[[case]]
+pattern = "(a+)+$"
+input = "aaaaaaaaaa!"
+matched = false
+caps = []
+steps = 111
+
+# Case-insensitive: 'A' folds to 'a'.
+[[case]]
+pattern = "A"
+flags = "i"
+input = "a"
+matched = true
+caps = [[0, 1]]
+steps = 11
+
+[[case]]
+pattern = "FOO"
+flags = "i"
+input = "the foo"
+matched = true
+caps = [[4, 7]]
+steps = 43
+
+[[case]]
+pattern = "[a-z]+"
+flags = "i"
+input = "ABC"
+matched = true
+caps = [[0, 3]]
+steps = 20
+
+# Code-point offsets — the astral 😀 is ONE code point, so the spans count code points, not UTF-16
+# units (a core iterating UTF-16 would get [2,4] and diverge).
+[[case]]
+pattern = "😀x"
+input = "z😀xz"
+matched = true
+caps = [[1, 3]]
+steps = 22
+
+# `_` is a LITERAL underscore in regex (not the LIKE single-char wildcard), so it does not match 😀.
+[[case]]
+pattern = "_x"
+input = "😀x"
+matched = false
+caps = []
+steps = 14

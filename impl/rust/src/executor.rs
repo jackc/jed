@@ -9349,7 +9349,8 @@ impl Database {
             RExpr::Arith { lhs, rhs, .. }
             | RExpr::Compare { lhs, rhs, .. }
             | RExpr::Distinct { lhs, rhs, .. }
-            | RExpr::Like { lhs, rhs, .. } => {
+            | RExpr::Like { lhs, rhs, .. }
+            | RExpr::Regex { lhs, rhs, .. } => {
                 self.fold_uncorrelated_in_rexpr(lhs, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(rhs, bound, ctes, cost)
             }
@@ -10700,6 +10701,22 @@ enum RExpr {
         negated: bool,
         insensitive: bool,
     },
+    /// `lhs ~ rhs` / `~*` / `!~` / `!~*` — regular-expression match (regex.md). Both operands
+    /// resolve to text (or NULL); a NULL operand makes the result NULL (before the matcher runs).
+    /// Matched by the hand-written Pike VM (regex.rs) over Unicode code points; `negated` carries
+    /// `!~`/`!~*`, `insensitive` carries `~*`/`!~*` (both operands simple-lowercased like ILIKE).
+    /// `program` holds the precompiled NFA for a CONSTANT pattern (compiled once at resolve, the
+    /// `col ~ 'literal'` case — regex.md §5); `None` means the pattern is non-constant and compiled
+    /// per row at eval. `compile_charged` is the one-shot flag that charges a precompiled program's
+    /// `regex_compile` cost once per statement execution (on first eval), not per row.
+    Regex {
+        lhs: Box<RExpr>,
+        rhs: Box<RExpr>,
+        negated: bool,
+        insensitive: bool,
+        program: Option<crate::regex::Program>,
+        compile_charged: std::cell::Cell<bool>,
+    },
     /// `upper(text)` / `lower(text)` — Unicode case folding (collation.md §16). `upper` selects the
     /// direction. Folds via the engine-global property table when a bundle is loaded, else the ASCII
     /// baseline (fold `a–z`/`A–Z`, pass other code points through). A NULL operand propagates.
@@ -11186,7 +11203,8 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
         Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => sub(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
-        | Expr::Like { lhs, rhs, .. } => sub(lhs) + sub(rhs),
+        | Expr::Like { lhs, rhs, .. }
+        | Expr::Regex { lhs, rhs, .. } => sub(lhs) + sub(rhs),
         Expr::In { lhs, list, .. } => sub(lhs) + list.iter().map(sub).sum::<usize>(),
         Expr::Quantified { lhs, array, .. } => sub(lhs) + sub(array),
         Expr::Between { lhs, lo, hi, .. } => sub(lhs) + sub(lo) + sub(hi),
@@ -12078,6 +12096,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
         | RExpr::Like { lhs, rhs, .. }
+        | RExpr::Regex { lhs, rhs, .. }
         | RExpr::And(lhs, rhs)
         | RExpr::Or(lhs, rhs) => rexpr_is_constant(lhs) && rexpr_is_constant(rhs),
         RExpr::IsNull { operand, .. } => rexpr_is_constant(operand),
@@ -13070,7 +13089,9 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::Between { lhs, lo, hi, .. } => {
             expr_has_aggregate(lhs) || expr_has_aggregate(lo) || expr_has_aggregate(hi)
         }
-        Expr::Like { lhs, rhs, .. } => expr_has_aggregate(lhs) || expr_has_aggregate(rhs),
+        Expr::Like { lhs, rhs, .. } | Expr::Regex { lhs, rhs, .. } => {
+            expr_has_aggregate(lhs) || expr_has_aggregate(rhs)
+        }
         Expr::Row(items) | Expr::Array(items) => items.iter().any(expr_has_aggregate),
         Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => expr_has_aggregate(base),
         Expr::Subscript { base, subscripts } => {
@@ -13137,7 +13158,8 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
-        | Expr::Like { lhs, rhs, .. } => {
+        | Expr::Like { lhs, rhs, .. }
+        | Expr::Regex { lhs, rhs, .. } => {
             reject_check_structure(lhs)?;
             reject_check_structure(rhs)
         }
@@ -13223,7 +13245,8 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
         }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
-        | Expr::Like { lhs, rhs, .. } => {
+        | Expr::Like { lhs, rhs, .. }
+        | Expr::Regex { lhs, rhs, .. } => {
             reject_default_structure(lhs)?;
             reject_default_structure(rhs)
         }
@@ -13296,7 +13319,8 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
             }
             Expr::Binary { lhs, rhs, .. }
             | Expr::IsDistinctFrom { lhs, rhs, .. }
-            | Expr::Like { lhs, rhs, .. } => {
+            | Expr::Like { lhs, rhs, .. }
+            | Expr::Regex { lhs, rhs, .. } => {
                 walk(lhs, columns, out);
                 walk(rhs, columns, out);
             }
@@ -13494,7 +13518,8 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
-        | RExpr::Like { lhs, rhs, .. } => {
+        | RExpr::Like { lhs, rhs, .. }
+        | RExpr::Regex { lhs, rhs, .. } => {
             rexpr_references_outer(lhs, depth) || rexpr_references_outer(rhs, depth)
         }
         RExpr::And(l, r) | RExpr::Or(l, r) => {
@@ -13600,7 +13625,8 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
-        | RExpr::Like { lhs, rhs, .. } => {
+        | RExpr::Like { lhs, rhs, .. }
+        | RExpr::Regex { lhs, rhs, .. } => {
             collect_touched(lhs, depth, touched);
             collect_touched(rhs, depth, touched);
         }
@@ -15548,7 +15574,10 @@ fn expr_calls_seq_mutator(e: &Expr) -> bool {
         Expr::IsNull { operand, .. } => expr_calls_seq_mutator(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
-        | Expr::Like { lhs, rhs, .. } => expr_calls_seq_mutator(lhs) || expr_calls_seq_mutator(rhs),
+        | Expr::Like { lhs, rhs, .. }
+        | Expr::Regex { lhs, rhs, .. } => {
+            expr_calls_seq_mutator(lhs) || expr_calls_seq_mutator(rhs)
+        }
         Expr::In { lhs, list, .. } => {
             expr_calls_seq_mutator(lhs) || list.iter().any(expr_calls_seq_mutator)
         }
@@ -15839,7 +15868,8 @@ fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<String>) {
         Expr::IsNull { operand, .. } => collect_expr_privs(operand, req, locals),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
-        | Expr::Like { lhs, rhs, .. } => {
+        | Expr::Like { lhs, rhs, .. }
+        | Expr::Regex { lhs, rhs, .. } => {
             collect_expr_privs(lhs, req, locals);
             collect_expr_privs(rhs, req, locals);
         }
@@ -15910,7 +15940,8 @@ fn expr_reads_columns(e: &Expr) -> bool {
         Expr::FuncCall { args, .. } => args.iter().any(expr_reads_columns),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
-        | Expr::Like { lhs, rhs, .. } => expr_reads_columns(lhs) || expr_reads_columns(rhs),
+        | Expr::Like { lhs, rhs, .. }
+        | Expr::Regex { lhs, rhs, .. } => expr_reads_columns(lhs) || expr_reads_columns(rhs),
         Expr::In { lhs, list, .. } => {
             expr_reads_columns(lhs) || list.iter().any(expr_reads_columns)
         }
@@ -16989,6 +17020,46 @@ fn resolve(
                     rhs: Box::new(rr),
                     negated: *negated,
                     insensitive: *insensitive,
+                },
+                ResolvedType::Bool,
+            ))
+        }
+        Expr::Regex {
+            lhs,
+            rhs,
+            negated,
+            insensitive,
+        } => {
+            // ~ / ~* / !~ / !~* — text×text → boolean (grammar.md §22b, regex.md). Same operand
+            // typing as LIKE: resolve the pair, require both text (or a bare NULL); non-text 42804.
+            let (rl, lt, rr, rt) = resolve_operand_pair(scope, lhs, rhs, agg, params)?;
+            require_text_or_null(&lt)?;
+            require_text_or_null(&rt)?;
+            // Precompile a CONSTANT pattern ONCE (regex.md §5); a non-constant pattern compiles per
+            // row at eval. For ~* the constant is case-folded before compiling (the ILIKE
+            // mechanism); the subject is folded per row at eval. A malformed pattern surfaces 2201B
+            // (and an oversized one 54001) here, at resolve, for the constant case.
+            let program = if let RExpr::ConstText(pat) = &rr {
+                let folded;
+                let pat_ref = if *insensitive {
+                    let prop = crate::collation::loaded_property();
+                    folded = crate::collation::fold_lower_simple(pat, prop.as_deref());
+                    folded.as_str()
+                } else {
+                    pat.as_str()
+                };
+                Some(crate::regex::compile(pat_ref)?)
+            } else {
+                None
+            };
+            Ok((
+                RExpr::Regex {
+                    lhs: Box::new(rl),
+                    rhs: Box::new(rr),
+                    negated: *negated,
+                    insensitive: *insensitive,
+                    program,
+                    compile_charged: std::cell::Cell::new(false),
                 },
                 ResolvedType::Bool,
             ))
@@ -20918,6 +20989,70 @@ impl RExpr {
                     like_match(s, p)?
                 };
                 // `negated` carries NOT LIKE/ILIKE: matched != negated flips for the NOT form.
+                Ok(Value::Bool(matched != *negated))
+            }
+            RExpr::Regex {
+                lhs,
+                rhs,
+                negated,
+                insensitive,
+                program,
+                compile_charged,
+            } => {
+                m.charge(COSTS.operator_eval);
+                let subject = lhs.eval(row, env, m)?;
+                let pattern = rhs.eval(row, env, m)?;
+                // NULL propagates BEFORE the matcher runs (regex.md §1) — a malformed pattern
+                // against a NULL operand is still NULL, never 2201B.
+                if matches!(subject, Value::Null) || matches!(pattern, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let (s, p) = match (&subject, &pattern) {
+                    (Value::Text(s), Value::Text(p)) => (s.as_str(), p.as_str()),
+                    _ => unreachable!("resolver requires text regex operands"),
+                };
+                // ~* (insensitive): simple-lowercase under the engine casing regime (collation.md
+                // §16). The subject is folded here; the constant pattern was folded at resolve, a
+                // non-constant pattern is folded below before compiling.
+                let prop = if *insensitive {
+                    crate::collation::loaded_property()
+                } else {
+                    None
+                };
+                let subj_folded;
+                let subj_chars: Vec<char> = if *insensitive {
+                    subj_folded = crate::collation::fold_lower_simple(s, prop.as_deref());
+                    subj_folded.chars().collect()
+                } else {
+                    s.chars().collect()
+                };
+                let matched = match program {
+                    Some(prog) => {
+                        // Constant precompiled pattern: charge its regex_compile cost ONCE per
+                        // statement execution (on first eval), not per row (regex.md §5).
+                        if !compile_charged.get() {
+                            compile_charged.set(true);
+                            m.charge(COSTS.regex_compile * prog.ninst() as i64);
+                            m.guard()?;
+                        }
+                        prog.is_match(&subj_chars, m)?
+                    }
+                    None => {
+                        // Non-constant pattern: compile now (charging regex_compile) and run.
+                        let pat_folded;
+                        let pat_ref = if *insensitive {
+                            pat_folded = crate::collation::fold_lower_simple(p, prop.as_deref());
+                            pat_folded.as_str()
+                        } else {
+                            p
+                        };
+                        let prog = crate::regex::compile(pat_ref)?;
+                        m.charge(COSTS.regex_compile * prog.ninst() as i64);
+                        m.guard()?;
+                        prog.is_match(&subj_chars, m)?
+                    }
+                };
+                // `negated` carries !~ / !~*: matched != negated flips for the negated form.
                 Ok(Value::Bool(matched != *negated))
             }
             RExpr::Casing { upper, arg } => {

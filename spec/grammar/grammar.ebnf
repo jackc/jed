@@ -741,9 +741,19 @@ comparison     ::= concat ( compare_op ( ("ANY" | "SOME" | "ALL") "(" ( subquery
                             | "IS" "NOT"? "DISTINCT" "FROM" concat
                             | "NOT"? "IN" "(" ( subquery_expr | concat ("," concat)* ) ")"
                             | "NOT"? "BETWEEN" concat "AND" concat
-                            | "NOT"? ("LIKE" | "ILIKE") concat )?
+                            | "NOT"? ("LIKE" | "ILIKE") concat
+                            | regex_op concat )?
 
 compare_op     ::= "=" | "<" | ">" | "<=" | ">=" | "<>" | "!="   /* "<>" and "!=" are one not-equal operator; the lexer folds "!=" to "<>" */
+
+/* Regular-expression match (../design/grammar.md §22b, ../design/regex.md). PUNCTUATION operators at
+ * the comparison level (precedence 35, like LIKE) — NOT in `compare_op` (they are text-pattern
+ * operators returning boolean, not value comparisons): `~` matches, `~*` matches case-insensitively,
+ * `!~`/`!~*` are their negations (carried on the AST `Regex.negated` flag, like NOT LIKE — there is
+ * no `NOT ~` keyword spelling). The lexer reads these as single tokens: `~*`/`!~*` are one token, and
+ * the `!` arm must try `!~`/`!~*` before falling to the lone-`!` error (and before `!=` → `<>`). The
+ * pattern operand is a `concat` expression (same rung as LIKE's). */
+regex_op       ::= "~" | "~*" | "!~" | "!~*"
 
 /* The "any other operator" rung (../design/array-functions.md §8/§10) — PostgreSQL's precedence
  * level shared by `||` and the array containment/overlap operators, all left-associative and

@@ -1,0 +1,41 @@
+# Regex compiled-program size limit (CLAUDE.md §13; spec/design/cost.md §7c, regex.md §6). The
+# FOURTH native-stack/allocation-bound untrusted-query gate (after the cost ceiling, the parser
+# depth limit, and the composite-depth limit): a WELL-FORMED pattern whose compiled NFA program
+# would exceed MAX_REGEX_PROGRAM (32768 instructions, after {n,m} unroll) aborts `54001`
+# (statement_too_complex) at compile, checked PROJECTIVELY — before the oversized program is
+# allocated. This protects the UNLIMITED handle (max_cost = 0), where the `regex_compile` cost
+# ceiling cannot reach. A MALFORMED pattern is `2201B` instead (expr/regex.test).
+#
+# The limit is a deterministic, cross-core-IDENTICAL constant — the SAME pattern is accepted or
+# rejected with 54001 in every core (CLAUDE.md §8) — so this suite is the cross-core contract; it is
+# jed-specific, so it is NOT oracle-checked. The pattern is a constant, so the bound is checked at
+# resolve (no rows produced, no match cost metered) for the over-limit cases.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, expr.regex_match, types.i32, types.text, resource.regex_program_limit, resource.cost_metering
+
+statement ok
+CREATE TABLE one (id i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO one VALUES (1)
+
+# `a{32762}` unrolls to 32762 `Char` instructions; with the 6-instruction wrapper (regex.md §3.2) the
+# program is exactly 32768 = MAX_REGEX_PROGRAM — the LARGEST allowed. It compiles and runs normally
+# ('a' has no run of 32762 a's, so no match).
+query B nosort
+SELECT 'a' ~ 'a{32762}' FROM one
+----
+false
+
+# One instruction more (`a{32763}` -> 32769 > 32768) exceeds the cap and aborts 54001 at compile.
+statement error 54001
+SELECT 'a' ~ 'a{32763}' FROM one
+
+# Nested bounded repetition MULTIPLIES: `(a{1000}){1000}` would be ~10^6 instructions; the projective
+# check aborts 54001 long before that allocates (it never materializes the program).
+statement error 54001
+SELECT 'a' ~ '(a{1000}){1000}' FROM one
+
+# A wildly over-large single interval is rejected the same way (the count is saturated at the cap, so
+# parsing it cannot overflow either).
+statement error 54001
+SELECT 'a' ~ 'a{9999999999}' FROM one

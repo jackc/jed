@@ -892,6 +892,50 @@ operator (one `[[operator]]` catalog row, `name = "like"`, text×text → boolea
   the match loop itself is unmetered, like `eq3` and the `ORDER BY` sort. Output name for a
   bare `SELECT s LIKE …` is `?column?` (§8).
 
+## 22b. `~` / `~*` / `!~` / `!~*` — regular-expression match
+
+`s ~ pattern` is the **regular-expression match**: TRUE iff `pattern` matches somewhere in subject
+`s`. It extends `comparison` with `regex_op concat` (precedence 35, the LIKE slot), where
+`regex_op` is one of `~` `~*` `!~` `!~*`. The flavor is jed's own **RE2-able subset**
+([regex.md](regex.md)), deliberately **not** PostgreSQL-compatible — the *overriding reason* is
+determinism + untrusted-query safety (the engine is a linear-time **Pike VM**, immune to ReDoS,
+[regex.md](regex.md) §4/§6). `SIMILAR TO`, backreferences, and lookaround are excluded.
+
+- **Punctuation operators, two base + two negations.** `~` is case-sensitive match, `~*`
+  case-insensitive (two `[[operator]]` rows, `regex_match`/`regex_imatch`, symbols `~`/`~*`).
+  `!~`/`!~*` are their **negations**, carried on the AST `Regex.negated` flag (the `NOT LIKE`
+  precedent — no separate row, and no `NOT ~` keyword spelling). Each is a genuine operator with a
+  dedicated resolved node (`Regex`) and the hand-written matcher, like LIKE — *not* desugared.
+- **Unanchored — matches a SUBSTRING.** Unlike `LIKE` (whole-subject), `s ~ p` is TRUE iff `p`
+  matches any substring of `s`: `'abc' ~ 'b'` is TRUE, `'abc' ~ '^b'` FALSE. Anchor with `^`/`$`
+  for whole-string. (Implemented by an implicit lazy `.*?` program prefix, regex.md §3.2.)
+- **Text only / NULL propagates.** Both operands must be `text`; a non-text operand is **42804**
+  (`compare.toml` lists only text×text). NULL on either side yields NULL (`null = "propagates"`),
+  short-circuiting **before** the matcher — so a malformed pattern against a NULL subject is NULL,
+  not an error (the LIKE rule).
+- **`~*` — case-insensitive** via the **ILIKE mechanism** ([collation.md §16](collation.md)): both
+  operands are simple-lowercased (1:1; ASCII baseline without a Unicode property bundle, full simple
+  mappings with one) before compiling/matching. So `'FOO' ~* 'f.o'` is TRUE.
+- **Code-point matching — a §8 determinism surface.** `.`, classes, and quantifiers count one
+  **Unicode code point** (not byte, not UTF-16 unit) — every core iterates by code point (Rust
+  `chars()`, Go `[]rune`, **TS `Array.from`/spread**), pinned by an astral-character conformance case.
+- **Pattern grammar (the RE2 subset, regex.md §2):** literals, `.` (any code point except `\n`),
+  classes `[...]`/`[^...]`, `\d \w \s` (+ negations), anchors `^ $`, alternation `|`, groups
+  `(...)`/`(?:...)`, quantifiers `* + ? {n} {n,} {n,m}` (greedy + lazy `?`-suffixed), with
+  leftmost-first greedy semantics. Excluded (each handled per regex.md §2): backreferences,
+  lookaround, named groups, inline flags.
+- **Errors.** A **malformed** pattern (unbalanced `(`/`[`, trailing `\`, unknown escape, bare
+  quantifier, `{n,m}` with `m<n`) is **2201B** (`invalid_regular_expression`); a **well-formed but
+  too-large** compiled program (> `MAX_REGEX_PROGRAM`, 32768 instrs after `{n,m}` unroll) is
+  **54001** (`statement_too_complex`, regex.md §6). For a constant pattern both surface at resolve;
+  for a per-row pattern, at eval.
+- **Lexer note.** `~*`/`!~*` are single tokens; the `!` arm must match `!~`/`!~*` *before* the
+  lone-`!` error and the `!=`→`<>` fold (regex.md, grammar.ebnf `regex_op`).
+- **Cost** ([cost.md](cost.md) §3): one `operator_eval` for the `Regex` node, plus `regex_compile`
+  (`|program|`, once for a constant pattern — §5) and `regex_step` (per Pike-VM thread-step) — the
+  per-step work LIKE's matcher leaves unmetered (regex is program × input, LIKE input alone). Output
+  name for a bare `SELECT s ~ …` is `?column?` (§8).
+
 ## 23. `CASE`
 
 `CASE` is the SQL conditional expression, a primary like `CAST`

@@ -2466,6 +2466,27 @@ impl Parser {
                 insensitive,
             });
         }
+        // `~` / `~*` / `!~` / `!~*` — regular-expression match (grammar.md §22b, regex.md). These are
+        // PUNCTUATION operators (not keywords), so `negated`/`insensitive` come from the token itself;
+        // there is no `NOT ~` keyword form (`NOT x ~ p` is the prefix-NOT over the whole match, taken
+        // a level up by parse_not). The pattern is one CONCAT expression, like LIKE's.
+        let regex = match self.peek() {
+            Token::Tilde => Some((false, false)),
+            Token::TildeStar => Some((false, true)),
+            Token::BangTilde => Some((true, false)),
+            Token::BangTildeStar => Some((true, true)),
+            _ => None,
+        };
+        if let Some((rx_negated, rx_insensitive)) = regex {
+            self.advance();
+            let rhs = self.parse_concat()?;
+            return Ok(Expr::Regex {
+                lhs: Box::new(lhs),
+                rhs: Box::new(rhs),
+                negated: rx_negated,
+                insensitive: rx_insensitive,
+            });
+        }
         let op = match self.peek() {
             Token::Eq => Some(BinaryOp::Eq),
             Token::Ne => Some(BinaryOp::Ne),
@@ -3278,6 +3299,10 @@ fn render_token(t: &Token) -> String {
         Token::NotExtendRight => "&<".into(),
         Token::NotExtendLeft => "&>".into(),
         Token::Adjacent => "-|-".into(),
+        Token::Tilde => "~".into(),
+        Token::TildeStar => "~*".into(),
+        Token::BangTilde => "!~".into(),
+        Token::BangTildeStar => "!~*".into(),
         Token::Eof => String::new(),
     }
 }

@@ -22,6 +22,8 @@ export interface CostSchedule {
   ginEntry: bigint;
   collate: bigint;
   timezone: bigint;
+  regexCompile: bigint;
+  regexStep: bigint;
 }
 
 // The canonical cost schedule — weights accrued per unit during query execution.
@@ -40,4 +42,6 @@ export const COSTS: CostSchedule = {
   ginEntry: 1n,
   collate: 1n,
   timezone: 1n,
+  regexCompile: 1n,
+  regexStep: 1n,
 };

@@ -36,6 +36,8 @@ pub enum SqlState {
     InvalidParameterValue,
     /// 22025 — LIKE pattern must not end with escape character
     InvalidEscapeSequence,
+    /// 2201B — invalid regular expression: {detail}
+    InvalidRegularExpression,
     /// 2202E — {detail}
     ArraySubscriptError,
     /// 22P02 — invalid input syntax for type {type}: {detail}
@@ -146,6 +148,7 @@ impl SqlState {
             SqlState::InvalidRowCountInOffsetClause => "2201X",
             SqlState::InvalidParameterValue => "22023",
             SqlState::InvalidEscapeSequence => "22025",
+            SqlState::InvalidRegularExpression => "2201B",
             SqlState::ArraySubscriptError => "2202E",
             SqlState::InvalidTextRepresentation => "22P02",
             SqlState::NotNullViolation => "23502",
@@ -220,6 +223,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "2201X", name: "invalid_row_count_in_offset_clause", class: "data exception" },
     ErrorDesc { code: "22023", name: "invalid_parameter_value", class: "data exception" },
     ErrorDesc { code: "22025", name: "invalid_escape_sequence", class: "data exception" },
+    ErrorDesc { code: "2201B", name: "invalid_regular_expression", class: "data exception" },
     ErrorDesc { code: "2202E", name: "array_subscript_error", class: "data exception" },
     ErrorDesc { code: "22P02", name: "invalid_text_representation", class: "data exception" },
     ErrorDesc { code: "23502", name: "not_null_violation", class: "integrity constraint violation" },

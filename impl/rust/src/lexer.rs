@@ -187,13 +187,32 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 }
             }
             b'!' => {
-                // `!=` is the PostgreSQL alias for `<>` (grammar.md §4); both fold to `Token::Ne`.
-                // A lone `!` is not part of jed's surface (no factorial / boolean-not) — 42601.
-                if bytes.get(i + 1) == Some(&b'=') {
+                // `!~*` / `!~` are the negated regex match operators (grammar.md §22b), checked
+                // greedily BEFORE the `!=`→`Ne` alias and the lone-`!` error. `!=` is the
+                // PostgreSQL alias for `<>` (grammar.md §4); both fold to `Token::Ne`. A lone `!`
+                // is not part of jed's surface (no factorial / boolean-not) — 42601.
+                if bytes.get(i + 1) == Some(&b'~') && bytes.get(i + 2) == Some(&b'*') {
+                    tokens.push(Token::BangTildeStar);
+                    i += 3;
+                } else if bytes.get(i + 1) == Some(&b'~') {
+                    tokens.push(Token::BangTilde);
+                    i += 2;
+                } else if bytes.get(i + 1) == Some(&b'=') {
                     tokens.push(Token::Ne);
                     i += 2;
                 } else {
                     return Err(syntax("unexpected character '!'".to_string()));
+                }
+            }
+            b'~' => {
+                // `~*` is the case-insensitive regex match operator (grammar.md §22b), scanned
+                // greedily as one token (never `~` `Star`); a bare `~` is the case-sensitive form.
+                if bytes.get(i + 1) == Some(&b'*') {
+                    tokens.push(Token::TildeStar);
+                    i += 2;
+                } else {
+                    tokens.push(Token::Tilde);
+                    i += 1;
                 }
             }
             b'@' => {

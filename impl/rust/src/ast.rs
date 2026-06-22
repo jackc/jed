@@ -821,6 +821,17 @@ pub enum Expr {
         negated: bool,
         insensitive: bool,
     },
+    /// `lhs ~ rhs` / `~*` / `!~` / `!~*` — regular-expression match (grammar.md §22b, regex.md).
+    /// jed's own RE2-able flavor (not PostgreSQL-compatible), matched by a hand-written linear-time
+    /// Pike VM. UNANCHORED (matches a substring). Both operands must be text; NULL propagates.
+    /// `negated` carries `!~`/`!~*`; `insensitive` carries `~*`/`!~*` (case-insensitive, both sides
+    /// simple-lowercased like ILIKE — collation.md §16).
+    Regex {
+        lhs: Box<Expr>,
+        rhs: Box<Expr>,
+        negated: bool,
+        insensitive: bool,
+    },
     /// A `CASE` expression (grammar.md §23). Searched form: `operand` is `None`, each `whens`
     /// condition must be boolean. Simple form: `operand` is `Some(x)`, each branch matches when
     /// `x = val`. `whens` is `(condition_or_value, result)` pairs (≥1). `els` is the `ELSE`

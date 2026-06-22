@@ -260,6 +260,34 @@ The rules:
   none, where they were already unmetered). The quadratic operations are the attack
   surface; they are what scales.
 
+### `regex_compile` / `regex_step` — regular-expression compile and match
+
+Regular expressions ([regex.md](regex.md)) are a hand-written **Pike-VM** NFA simulation — the
+RE2-style design chosen precisely so matching is **linear in the input with no backtracking**, an
+untrusted-query safety property that holds *independent of* the cost meter (§13). But the work is
+still real and an attacker can still drive it (a large pattern, a long subject, a deeply-unrolled
+`{n,m}`), so it is metered by two units, both accrued like `decimal_work` (charge, then guard):
+
+- **`regex_compile`** fires once per NFA instruction **emitted** while compiling a pattern, so the
+  charge equals the program length `|program|`. `{n,m}` is **unrolled** at compile (regex.md §3.3),
+  so a quadratic-expansion pattern (`(a{1000}){1000}`) accrues `regex_compile` proportional to the
+  expansion and a ceiling aborts it. A **constant** pattern (the `col ~ 'literal'` case) compiles
+  **once** — charged `|program|` units at statement-execution start, *not* per row (the
+  precompilation contract, regex.md §5); a per-row pattern charges `|program|` per compile.
+- **`regex_step`** fires once per Pike-VM **thread-step** — each instruction dispatched in the main
+  consume loop or the epsilon-closure. The per-position **dedup-by-pc** bounds the threads at any
+  input position to `≤ |program|`, so total `regex_step ≤ |program| × (|input| + 1)` — linear, the
+  RE2 bound. Guarded once per input position, so a runaway match aborts `54P01` deterministically.
+
+The `~`/`~*`/`!~`/`!~*` node charges **one** `operator_eval` for the whole match (the LIKE
+precedent), and `regex_step` on top — which is the per-step work LIKE's matcher leaves unmetered
+(LIKE is linear in the input *alone*; regex in program × input, so it needs the explicit unit). A
+**well-formed but too-large** program — one exceeding `MAX_REGEX_PROGRAM` (32768 instructions) — is
+the third structural-complexity trigger of `54001` (§7/§7b), checked *projectively* at compile so
+the *unlimited* handle (`max_cost = 0`) is protected where the ceiling cannot reach. The two units'
+counts are pinned cross-core by `spec/regex/{program,match}_vectors.toml` and the `# cost:` corpus
+directives, so the accrued cost and abort points are identical in every core (§8/§13).
+
 ### Bounded scan / point lookup — the pages a primary-key predicate touches
 
 A **single-table** WHERE on the **primary key** does not need the whole tree. Because the key
@@ -1112,3 +1140,21 @@ exercising `resolve_col_type` 32 levels deep), `c33` aborts `54001`, depth is **
 sum** (two depth-31 fields are still depth 32), and an **array field counts as its element** (a
 `c32[]` field is depth 33, rejected). Gated by `resource.composite_depth_limit`; jed-specific, so
 **not** oracle-checked.
+
+## 7c. Regex compiled-program size limit (landed)
+
+The **third** structural-complexity trigger of `54001` ([regex.md](regex.md) §6). A regular
+expression compiles to a flat NFA bytecode program (§ "`regex_compile` / `regex_step`" above), and
+**bounded repetition `{n,m}` is unrolled** at compile (regex.md §3.3) — so a small *pattern* can
+describe a very large *program* (`(a{1000}){1000}` ≈ 10⁶ instructions). The `regex_compile` cost
+unit bounds this on a cost-limited handle (the ceiling aborts `54P01`), but the **unlimited** handle
+(`max_cost = 0`, the trusted path) has no ceiling — so, exactly like `MAX_EXPR_DEPTH` (§7) and
+`MAX_COMPOSITE_DEPTH` (§7b), a fixed **`MAX_REGEX_PROGRAM = 32768`** instruction cap is enforced at
+the producer (the pattern compiler), aborting `54001` *projectively* — before the oversized program
+is allocated, by checking the projected size of each `{n,m}` unroll rather than overrunning memory
+and counting after. `2201B` (`invalid_regular_expression`) remains for a *malformed* pattern;
+`54001` is for a *well-formed but too-large* one. `32768` sits far above any real pattern yet bounds
+both the native allocation and the per-input-position O(|program|) match work. A deterministic,
+cross-core constant (§8) — pinned in `impl/go/spec_constants_test.go` and the
+[../conformance/suites/resource/regex_program_limit.test](../conformance/suites/resource/regex_program_limit.test)
+boundary entry (gated by `resource.regex_program_limit`; jed-specific, **not** oracle-checked).

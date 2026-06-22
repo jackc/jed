@@ -22,6 +22,7 @@ export type SqlState =
   | "invalid_row_count_in_offset_clause" // 2201X — OFFSET must not be negative
   | "invalid_parameter_value" // 22023 — invalid parameter value: {detail}
   | "invalid_escape_sequence" // 22025 — LIKE pattern must not end with escape character
+  | "invalid_regular_expression" // 2201B — invalid regular expression: {detail}
   | "array_subscript_error" // 2202E — {detail}
   | "invalid_text_representation" // 22P02 — invalid input syntax for type {type}: {detail}
   | "not_null_violation" // 23502 — null value in column {name} violates not-null constraint
@@ -82,6 +83,7 @@ const CODES: Record<SqlState, string> = {
   invalid_row_count_in_offset_clause: "2201X",
   invalid_parameter_value: "22023",
   invalid_escape_sequence: "22025",
+  invalid_regular_expression: "2201B",
   array_subscript_error: "2202E",
   invalid_text_representation: "22P02",
   not_null_violation: "23502",
@@ -158,6 +160,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "2201X", name: "invalid_row_count_in_offset_clause", class: "data exception" },
   { code: "22023", name: "invalid_parameter_value", class: "data exception" },
   { code: "22025", name: "invalid_escape_sequence", class: "data exception" },
+  { code: "2201B", name: "invalid_regular_expression", class: "data exception" },
   { code: "2202E", name: "array_subscript_error", class: "data exception" },
   { code: "22P02", name: "invalid_text_representation", class: "data exception" },
   { code: "23502", name: "not_null_violation", class: "integrity constraint violation" },

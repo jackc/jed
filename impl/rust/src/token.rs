@@ -87,6 +87,18 @@ pub enum Token {
     /// The `-|-` range adjacency operator (`a -|- b`). `-` `|` `-`, scanned greedily and checked
     /// BEFORE the `--` line comment. See range-functions.md §3 (RF3).
     Adjacent,
+    /// The `~` regular-expression match operator (`s ~ p` — case-sensitive). See
+    /// spec/design/grammar.md §22b, regex.md.
+    Tilde,
+    /// The `~*` case-insensitive regex match operator (`s ~* p`). `~` then `*`, scanned greedily
+    /// (so `~*` is one token, never `~` `Star`). See grammar.md §22b.
+    TildeStar,
+    /// The `!~` negated regex match operator (`s !~ p`). `!` then `~`, scanned greedily and checked
+    /// in the `!` arm BEFORE `!=`→`Ne` and the lone-`!` error. See grammar.md §22b.
+    BangTilde,
+    /// The `!~*` negated case-insensitive regex match operator (`s !~* p`). `!` `~` `*`, scanned
+    /// greedily. See grammar.md §22b.
+    BangTildeStar,
     /// End of input.
     Eof,
 }

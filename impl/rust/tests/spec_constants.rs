@@ -475,6 +475,8 @@ fn cost_schedule_matches_spec() {
             "gin_entry" => COSTS.gin_entry,
             "collate" => COSTS.collate,
             "timezone" => COSTS.timezone,
+            "regex_compile" => COSTS.regex_compile,
+            "regex_step" => COSTS.regex_step,
             other => panic!("cost unit {other} has no COSTS field — update this cross-check"),
         }
     };

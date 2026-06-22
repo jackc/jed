@@ -390,6 +390,41 @@ null           = "propagates"
 precedence     = 35
 errors         = ["22025"]
 
+# Regular-expression match — `~` (case-sensitive) and `~*` (case-insensitive), with `!~`/`!~*` their
+# negations (carried by the AST `negated` flag, the NOT-LIKE precedent — not separate rows). Unlike
+# LIKE these are PUNCTUATION operators (a `symbol`), and unlike LIKE the match is UNANCHORED — `~`
+# is TRUE iff the pattern matches some SUBSTRING (anchor with ^/$). The flavor is jed's own RE2-able
+# subset (../design/regex.md), NOT PostgreSQL-compatible; SIMILAR TO and backreferences/lookaround
+# are excluded. text×text → boolean, null = "propagates" (a NULL operand → NULL, never the pattern
+# error), a non-text operand is 42804 (compare.toml lists only text×text). A malformed pattern is
+# 2201B; a well-formed-but-too-large compiled program is 54001 (../design/regex.md §6/§7). `~*`
+# simple-lowercases both operands first (the ILIKE mechanism, collation.md §16). Binds at the
+# comparison level (precedence 35), non-associative. Matching is hand-written per core (a Pike VM,
+# regex.md §4), resolved directly as the AST `Regex` node (like LIKE), not via overload dispatch.
+[[operator]]
+name           = "regex_match"
+symbol         = "~"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = ["2201B"]
+
+[[operator]]
+name           = "regex_imatch"
+symbol         = "~*"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = ["2201B"]
+
 # --- comparison operators (boolean) ------------------------------------------
 # The boolean-family OVERLOAD of the comparisons above: the same operator names/symbols
 # (`=` < > <= >=, and IS [NOT] DISTINCT FROM) applied to boolean × boolean. arg_resolution

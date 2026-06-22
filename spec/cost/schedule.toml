@@ -214,3 +214,37 @@ event  = "one AT TIME ZONE conversion (an RFC 8536 reader lookup)"
 # ceiling aborts it (54P01). A built-in `UTC`/fixed-offset conversion still charges the unit (one
 # lookup's worth) so cost does not depend on whether a bundle is loaded. Charged at the identical
 # point in every core, so cost stays cross-core identical (§8/§13).
+
+[[unit]]
+id     = "regex_compile"
+weight = 1
+event  = "one NFA instruction emitted while compiling a regular-expression pattern"
+# Landed with regular expressions (../design/regex.md §3/§6, ../design/cost.md §3 "regex compile/step").
+# A regex pattern compiles to a flat NFA bytecode program (Pike VM); this unit fires once per
+# instruction EMITTED, so the charge equals the program's instruction count |program|. It bounds the
+# compile work an untrusted query can drive — chiefly bounded-repetition unroll (`(a{1000}){1000}`
+# expands the program quadratically, regex.md §3.3) — so a max_cost ceiling aborts a pathological
+# pattern (54P01) before the program materializes; a VALID but too-large program is additionally
+# capped structurally at MAX_REGEX_PROGRAM (54001), the gate that protects an UNLIMITED handle
+# (regex.md §6). A CONSTANT pattern (`col ~ 'literal'`) compiles ONCE — charged |program| units at
+# statement-execution start, never per row (the precompilation contract, regex.md §5); a non-constant
+# pattern charges |program| each time it is compiled (per row), genuine repeated work. Charged BEFORE
+# the program is used and immediately guarded (the `decimal_work` discipline). Every core compiles the
+# identical program (../regex/program_vectors.toml), so the count is cross-core identical (§8/§13).
+
+[[unit]]
+id     = "regex_step"
+weight = 1
+event  = "one Pike-VM thread-step taken while matching a regular expression"
+# Landed with regular expressions (../design/regex.md §4/§6, ../design/cost.md §3 "regex compile/step").
+# The Pike VM simulates all NFA threads in lockstep over the input, one code point at a time; this unit
+# fires once per instruction DISPATCHED — both in the main consume loop and in the epsilon-closure
+# (add_thread) — with the per-position dedup-by-pc bounding the work to <= |program| threads per input
+# position, so total regex_step <= |program| * (|input| + 1): LINEAR in the input, no backtracking
+# (the RE2 guarantee, regex.md §4). It meters the match work an untrusted query can drive (a long
+# subject * a large pattern) and a max_cost ceiling aborts it (54P01); guarded once per input position
+# so the abort point is deterministic. DISTINCT from operator_eval (the `~`/`~*` node charges ONE
+# operator_eval for the whole match, like LIKE) — regex_step is the per-thread-step work LIKE's matcher
+# leaves unmetered (../design/cost.md §3 "regex compile/step"; LIKE is linear in input alone, regex in
+# program * input). Charged at the identical per-step point in every core (../regex/match_vectors.toml),
+# so the accrued cost and the abort point are cross-core identical (§8/§13).

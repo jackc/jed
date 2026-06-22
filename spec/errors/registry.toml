@@ -98,6 +98,19 @@ name = "invalid_escape_sequence"
 class = "data exception"
 template = "LIKE pattern must not end with escape character"
 
+# A malformed regular-expression pattern given to `~`/`~*`/`!~`/`!~*` or a regexp_* function
+# (../design/regex.md §7): unbalanced parenthesis/bracket, a trailing backslash, an unknown
+# alphabetic escape, a quantifier with no operand, or a `{n,m}` with m<n. Borrows PostgreSQL's
+# SQLSTATE for the same condition (the 22025/LIKE precedent of reusing a PG code for the analogous
+# condition). The {detail} is a DETERMINISTIC, enumerated short phrase — part of the cross-core
+# contract (no reference impl, §2), so the detail strings are fixed in regex.md §7, not free text.
+# A WELL-FORMED but too-large compiled program is 54001 (statement_too_complex), not this code.
+[[error]]
+code = "2201B"
+name = "invalid_regular_expression"
+class = "data exception"
+template = "invalid regular expression: {detail}"
+
 [[error]]
 code = "2202E"
 name = "array_subscript_error"
@@ -409,9 +422,13 @@ template = "SQL statement exceeds the maximum length of {max} bytes"
 # (build-/platform-dependent). A SECOND trigger is the composite-type nesting-depth gate
 # (spec/design/cost.md §7b): a CREATE TYPE whose result would nest deeper than MAX_COMPOSITE_DEPTH
 # (32) raises 54001 too — the same native-stack hazard reached via the catalog graph rather than a
-# single statement's AST (a corrupt over-deep file is XX001, not 54001). Asserted by the conformance
-# corpus (the resource.depth_limit and resource.composite_depth_limit capabilities), since the abort
-# point is part of the cross-core contract (no reference impl, §2).
+# single statement's AST (a corrupt over-deep file is XX001, not 54001). A THIRD trigger is the
+# regex compiled-program size cap (spec/design/cost.md §7c, regex.md §6): a well-formed pattern
+# whose compiled NFA program would exceed MAX_REGEX_PROGRAM (32768 instructions, after {n,m} unroll)
+# aborts 54001 at compile — the same native-stack/allocation-bound structural-complexity gate reached
+# via pattern size (a MALFORMED pattern is 2201B instead). Asserted by the conformance corpus (the
+# resource.depth_limit, resource.composite_depth_limit and resource.regex_program_limit capabilities),
+# since the abort point is part of the cross-core contract (no reference impl, §2).
 [[error]]
 code = "54001"
 name = "statement_too_complex"
