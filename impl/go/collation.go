@@ -766,6 +766,24 @@ func LoadedCollation(name string) *Collation {
 	return loadedColl[name]
 }
 
+// VersionSkew is the slice-2d version-skew verdict (spec/design/collation.md §12, compatibility.md
+// §7): given a collation name and the (unicode, cldr) version the FILE pinned its keys under (§5),
+// it returns (loadedUnicode, loadedCldr, true) when a loaded bundle provides name at a DIFFERENT
+// version — the object using it is read-only (XX002 on write) — else ("", "", false) (Full: the same
+// version, or no loaded table to disagree). A pure, total comparison so EVERY core computes the
+// identical verdict (the §10 cross-core contract). The read side never consults this — a skewed read
+// recomputes against the loaded table (the heap-scan fallback, compatibility.md §8).
+func VersionSkew(name, fileUnicode, fileCldr string) (loadedUnicode, loadedCldr string, skewed bool) {
+	loaded := LoadedCollation(name)
+	if loaded == nil {
+		return "", "", false
+	}
+	if loaded.UnicodeVersion != fileUnicode || loaded.CldrVersion != fileCldr {
+		return loaded.UnicodeVersion, loaded.CldrVersion, true
+	}
+	return "", "", false
+}
+
 // loadedCollationTables returns every loaded collation, ascending by name — a deterministic order
 // with no hash-iteration leak (CLAUDE.md §8). The raw tables; the public CollationInfo view is the
 // Database.LoadedCollations method (executor.go).

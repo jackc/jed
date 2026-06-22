@@ -2408,13 +2408,15 @@ fn decode_collation_entry(buf: &[u8], pos: &mut usize) -> Result<(Collation, boo
     let description = read_string(buf, pos)?;
     // The file records only the version PIN; the table comes from a loaded bundle (the host must have
     // loaded one providing this collation before opening — collation.md §4/§9). A name no loaded
-    // bundle provides is a legible failure (the precursor to the graded open-time verdict —
-    // compatibility.md §7 / collation.md §12, slice 2d, which will soften this to read-only degrade).
+    // bundle provides at all is the graded verdict's **legible refusal** (slice 2d, collation.md §12 /
+    // compatibility.md §7): the open is refused with XX002 naming the collation + version, rather than
+    // degrading the rest of the database (the conservative resolution of compatibility.md §12 open #3 —
+    // a *version-skewed* collation, by contrast, opens and is enforced read-only at write time §14).
     let loaded = crate::collation::loaded_collation(&name).ok_or_else(|| {
         EngineError::new(
-            SqlState::UndefinedObject,
+            SqlState::CollationVersionMismatch,
             format!(
-                "collation \"{name}\" (@ {unicode_version}/{cldr_version}) is not provided by a loaded bundle"
+                "collation \"{name}\" (@ {unicode_version}/{cldr_version}) is not provided by any loaded bundle"
             ),
         )
     })?;
@@ -3223,6 +3225,31 @@ mod tests {
     #[test]
     fn crc32_known_vector() {
         assert_eq!(crc32_ieee(b"123456789"), 0xCBF4_3926);
+    }
+
+    #[test]
+    fn collation_open_refuses_absent_reference() {
+        // A file that references a collation NO loaded bundle provides is the graded verdict's
+        // legible refusal (spec/design/collation.md §12, slice 2d): decoding the reference entry
+        // fails with XX002 (collation_version_mismatch) naming it + its version, rather than the old
+        // bare 42704. "zz-absent-collation" is never in any bundle, so this is independent of the
+        // engine-global loaded set (no bundle load needed). A *version-skewed* collation, by
+        // contrast, decodes fine and is enforced read-only at write time (executor skew_tests).
+        let coll = Collation {
+            name: "zz-absent-collation".to_string(),
+            unicode_version: "17.0.0".to_string(),
+            cldr_version: "48".to_string(),
+            description: String::new(),
+            singles: Vec::new(),
+            contractions: Vec::new(),
+        };
+        let bytes = collation_entry_bytes(&coll, false);
+        let mut pos = 0;
+        let err =
+            decode_collation_entry(&bytes, &mut pos).expect_err("absent reference must refuse");
+        assert_eq!(err.code(), "XX002");
+        assert!(err.message.contains("zz-absent-collation"));
+        assert!(err.message.contains("17.0.0/48"));
     }
 
     #[test]

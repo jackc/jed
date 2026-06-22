@@ -129,6 +129,8 @@ const (
 	DuplicateFile
 	// DataCorrupted is XX001 — on-disk database file is malformed: {detail}.
 	DataCorrupted
+	// CollationVersionMismatch is XX002 — collation version mismatch: {detail}.
+	CollationVersionMismatch
 )
 
 // Code returns the canonical SQLSTATE string.
@@ -248,6 +250,8 @@ func (s SqlState) Code() string {
 		return "58P02"
 	case DataCorrupted:
 		return "XX001"
+	case CollationVersionMismatch:
+		return "XX002"
 	default:
 		return "XX000"
 	}
@@ -321,4 +325,5 @@ var Errors = []ErrorDesc{
 	{Code: "58P01", Name: "undefined_file", Class: "system error"},
 	{Code: "58P02", Name: "duplicate_file", Class: "system error"},
 	{Code: "XX001", Name: "data_corrupted", Class: "internal error"},
+	{Code: "XX002", Name: "collation_version_mismatch", Class: "internal error"},
 }

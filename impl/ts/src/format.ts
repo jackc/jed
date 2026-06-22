@@ -1215,13 +1215,15 @@ function decodeCollationEntry(
   const desc = readString(buf, cur);
   // The file records only the version PIN; the table comes from a loaded bundle (the host must have
   // loaded one providing this collation before opening — collation.md §4/§9). A name no loaded bundle
-  // provides is a legible failure (the precursor to the graded open-time verdict — compatibility.md
-  // §7 / collation.md §12, slice 2d, which will soften this to read-only degrade).
+  // provides at all is the graded verdict's legible refusal (slice 2d, collation.md §12 /
+  // compatibility.md §7): the open is refused with XX002 naming the collation + version, rather than
+  // degrading the rest of the database (the conservative resolution of compatibility.md §12 open #3 —
+  // a version-skewed collation, by contrast, opens and is enforced read-only at write time §14).
   const loaded = loadedCollation(name);
   if (loaded === undefined) {
     throw engineError(
-      "undefined_object",
-      `collation "${name}" (@ ${unicode}/${cldr}) is not provided by a loaded bundle`,
+      "collation_version_mismatch",
+      `collation "${name}" (@ ${unicode}/${cldr}) is not provided by any loaded bundle`,
     );
   }
   const coll: Collation = {

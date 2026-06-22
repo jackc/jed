@@ -66,7 +66,8 @@ export type SqlState =
   | "io_error" // 58030 — I/O error: {detail}
   | "undefined_file" // 58P01 — database file does not exist: {path}
   | "duplicate_file" // 58P02 — database file already exists: {path}
-  | "data_corrupted"; // XX001 — on-disk database file is malformed: {detail}
+  | "data_corrupted" // XX001 — on-disk database file is malformed: {detail}
+  | "collation_version_mismatch"; // XX002 — collation version mismatch: {detail}
 
 const CODES: Record<SqlState, string> = {
   cardinality_violation: "21000",
@@ -126,6 +127,7 @@ const CODES: Record<SqlState, string> = {
   undefined_file: "58P01",
   duplicate_file: "58P02",
   data_corrupted: "XX001",
+  collation_version_mismatch: "XX002",
 };
 
 // sqlStateCode returns the canonical SQLSTATE string for a state.
@@ -201,4 +203,5 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "58P01", name: "undefined_file", class: "system error" },
   { code: "58P02", name: "duplicate_file", class: "system error" },
   { code: "XX001", name: "data_corrupted", class: "internal error" },
+  { code: "XX002", name: "collation_version_mismatch", class: "internal error" },
 ];

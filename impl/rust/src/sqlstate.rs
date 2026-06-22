@@ -126,6 +126,8 @@ pub enum SqlState {
     DuplicateFile,
     /// XX001 — on-disk database file is malformed: {detail}
     DataCorrupted,
+    /// XX002 — collation version mismatch: {detail}
+    CollationVersionMismatch,
 }
 
 impl SqlState {
@@ -189,6 +191,7 @@ impl SqlState {
             SqlState::UndefinedFile => "58P01",
             SqlState::DuplicateFile => "58P02",
             SqlState::DataCorrupted => "XX001",
+            SqlState::CollationVersionMismatch => "XX002",
         }
     }
 }
@@ -262,4 +265,5 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "58P01", name: "undefined_file", class: "system error" },
     ErrorDesc { code: "58P02", name: "duplicate_file", class: "system error" },
     ErrorDesc { code: "XX001", name: "data_corrupted", class: "internal error" },
+    ErrorDesc { code: "XX002", name: "collation_version_mismatch", class: "internal error" },
 ];

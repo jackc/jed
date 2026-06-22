@@ -94,9 +94,23 @@ impl Outcome {
 /// The `O(1)` summary of an `execute_script` run (spec/design/session.md §4.2). Carries only
 /// counts — never the result rows, which `execute_script` discards — so memory is bounded by
 /// construction regardless of how many rows the script's statements touch.
+/// The slice-2d version-skew verdict for one referenced collation (spec/design/collation.md §12,
+/// compatibility.md §7). `Full` ⇒ a loaded bundle provides the name at the file's pinned
+/// `(unicode, cldr)`, so the collation's objects are read-write. `Skewed` ⇒ a loaded bundle provides
+/// the name at a **different** version, so its objects are **read-only** (reads recompute against the
+/// loaded table — the heap-scan fallback; a write raises `XX002`). A pure comparison of the file pin
+/// (§5) vs the loaded set — every core computes the identical verdict (the §10 cross-core contract).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CollationVerdict {
+    Full,
+    Skewed,
+}
+
 /// Introspection metadata for one loaded collation (`db.Collations`, spec/design/collation.md §1).
 /// `content_hash` is the CRC-32 of the compiled table (the reference-mode stamp, §3/§4); the
-/// `description` is provenance, excluded from the hash.
+/// `description` is provenance, excluded from the hash. `verdict` is the slice-2d version-skew
+/// verdict (§12) — `Full` for the engine-global loaded set (it IS the reference); for a database's
+/// *referenced* collations it is `Skewed` when the file's pin differs from the loaded bundle's.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CollationInfo {
     pub name: String,
@@ -105,6 +119,7 @@ pub struct CollationInfo {
     pub content_hash: u32,
     pub description: String,
     pub is_default: bool,
+    pub verdict: CollationVerdict,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -273,6 +288,28 @@ impl Snapshot {
     /// vendored table), keyed by name, so later resolution preserves the file's version pin.
     pub(crate) fn put_collation(&mut self, coll: std::sync::Arc<Collation>) {
         self.collations.insert(coll.name.clone(), coll);
+    }
+
+    /// The slice-2d version-skew verdict for a referenced collation (spec/design/collation.md §12):
+    /// `Some((file_unicode, file_cldr, loaded_unicode, loaded_cldr))` if this database's keys were
+    /// built under a different `(unicode, cldr)` than the loaded bundle provides — the object that
+    /// uses it is read-only (`XX002` on write). `None` ⇒ `Full` (same version, or this collation has
+    /// no catalog-local file pin so it is freshly the loaded version — an in-memory-only database).
+    /// A pure comparison of the file pin already in the catalog (§5) vs the engine-global loaded set;
+    /// `loaded_collation` is `Some` post-open (open refuses an absent reference), so a missing loaded
+    /// table is not skew. The `Snapshot`-level wiring of `collation::version_skew`.
+    pub(crate) fn collation_skew(&self, name: &str) -> Option<(String, String, String, String)> {
+        let cat = self.collations.get(name)?;
+        crate::collation::version_skew(name, &cat.unicode_version, &cat.cldr_version).map(
+            |(lu, lc)| {
+                (
+                    cat.unicode_version.clone(),
+                    cat.cldr_version.clone(),
+                    lu,
+                    lc,
+                )
+            },
+        )
     }
 
     /// The collations the database **schema references** — every column's frozen collation plus the
@@ -1339,6 +1376,33 @@ impl Database {
             .collect()
     }
 
+    /// Refuse a WRITE that would maintain a collated B-tree under a **version-skewed** collation
+    /// (the slice-2d verdict, spec/design/collation.md §12/§14): if any of `columns` carries a
+    /// collation the file pinned to a different `(unicode, cldr)` than the loaded bundle provides,
+    /// inserting/updating/deleting/index-building would mix two orderings in one tree and corrupt it,
+    /// so the whole table is **read-only** until a REINDEX migration (deferred) rebuilds + re-pins it.
+    /// `XX002`, naming the collation + both versions. Reads never call this — they recompute against
+    /// the loaded table (the heap-scan fallback, compatibility.md §8). Per-table granularity: one
+    /// skewed column collation makes the table read-only (finer per-index gating is a follow-on).
+    fn ensure_collations_writable(&self, columns: &[Column]) -> Result<()> {
+        let snap = self.read_snap();
+        for c in columns {
+            if let Some(name) = &c.collation
+                && let Some((fu, fc, lu, lc)) = snap.collation_skew(name)
+            {
+                return Err(EngineError::new(
+                    SqlState::CollationVersionMismatch,
+                    format!(
+                        "collation \"{name}\" version mismatch: this database's keys were built under \
+                         {fu}/{fc} but the loaded bundle is {lu}/{lc}; tables using it are read-only \
+                         until a REINDEX migration rebuilds them"
+                    ),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     /// The working snapshot a write mutates — the open transaction's `working`. A write only ever
     /// runs with a transaction open (autocommit opens one implicitly), so this never panics in a
     /// correct flow.
@@ -2130,6 +2194,8 @@ impl Database {
                 content_hash: crate::format::crc32_ieee(&collation::serialize_table(&c)),
                 description: c.description.clone(),
                 is_default: false,
+                // The loaded set IS the version reference — it can never be skewed against itself.
+                verdict: CollationVerdict::Full,
             })
             .collect()
     }
@@ -2183,6 +2249,13 @@ impl Database {
                 content_hash: crate::format::crc32_ieee(&collation::serialize_table(&c)),
                 description: c.description.clone(),
                 is_default: default == Some(c.name.as_str()),
+                // The slice-2d verdict: Skewed when the file's pin differs from the loaded bundle's
+                // version (the object is read-only), else Full (collation.md §12).
+                verdict: if self.committed.collation_skew(&c.name).is_some() {
+                    CollationVerdict::Skewed
+                } else {
+                    CollationVerdict::Full
+                },
             })
             .collect()
     }
@@ -3737,6 +3810,9 @@ impl Database {
         })?;
         let table_key = table.name.to_ascii_lowercase();
         let columns = table.columns.clone();
+        // Refuse building a collated index on a version-skewed table (slice 2d, collation.md §12,
+        // XX002): the new B-tree would be pinned inconsistently with the file's other structures.
+        self.ensure_collations_writable(&columns)?;
         // Per-column frozen collations for the collated text key form (§2.12); `None` everywhere
         // for a C-only / non-text table (the fast path).
         let colls = self.column_collations(&columns);
@@ -4342,6 +4418,9 @@ impl Database {
         // borrow so phase 1 can read the store (dup-key check) and phase 2 can mutate it.
         let table_name = tdef.name.clone();
         let columns: Vec<Column> = tdef.columns.clone();
+        // Refuse the write if any of this table's collated keys are version-skewed (slice 2d): a
+        // maintained B-tree would mix two orderings (collation.md §12, XX002).
+        self.ensure_collations_writable(&columns)?;
         // The key members in key order — one for a single-column PK, several for a
         // composite (constraints.md §3), empty for a no-PK (rowid) table. The full `Type` is
         // captured (not just a scalar) so a range PK member carries its element subtype into the
@@ -5797,6 +5876,9 @@ impl Database {
                 format!("table does not exist: {}", del.table),
             )
         })?;
+        // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002):
+        // a DELETE must locate + remove a stored key, which a skewed encoding cannot match.
+        self.ensure_collations_writable(&table.columns)?;
         // Capture the PK (index, type) now, by value, so the primary-key pushdown can be detected
         // after the `table` borrow ends (the mutate path takes `&mut self`). The index
         // definitions (and the columns their entry keys read) feed phase 2's maintenance
@@ -6038,6 +6120,9 @@ impl Database {
                 format!("table does not exist: {}", upd.table),
             )
         })?;
+        // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002):
+        // an UPDATE re-encodes + re-places keys, which a skewed encoding would corrupt.
+        self.ensure_collations_writable(&table.columns)?;
         // UPDATE is single-table; the RHS / WHERE resolve against a one-relation scope so the
         // shared resolver serves it too (a qualified `WHERE t.a` against the sole table is fine).
         // The statement's CTE bindings (writable-cte.md) are visible so a SET / WHERE / RETURNING
@@ -21843,6 +21928,113 @@ mod registry_tests {
                 let lname = a.surface.to_ascii_lowercase();
                 let _ = aggregate_plan(&lname, found.result, &probe);
             }
+        }
+    }
+}
+
+#[cfg(test)]
+mod skew_tests {
+    // The slice-2d collation version-skew verdict (spec/design/collation.md §12/§14): the open-time
+    // comparison + the read-only write-block. Skew has NO PostgreSQL analog (PG's collversion is the
+    // opposite, host-OS-drift, §15), so it is a documented PG divergence verified by per-core unit
+    // tests, not the oracle corpus (CLAUDE.md §10). White-box (it injects a file-pin/loaded-version
+    // mismatch a public API cannot manufacture — a fresh file pins the loaded version). Mirrored by
+    // impl/go/collation_host_test.go and impl/ts/tests/collation_host.test.ts.
+    use super::*;
+    use std::sync::Arc;
+
+    fn load_bundle() {
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../spec/collation/fixtures/unicode.jucd");
+        let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read unicode.jucd: {e}"));
+        crate::load_unicode_data(&bytes).expect("load unicode.jucd");
+    }
+
+    /// The pure verdict (`collation::version_skew`) — the cross-core contract (every core computes
+    /// the identical result): same version as the loaded bundle ⇒ `None` (Full); a different pin ⇒
+    /// `Some(loaded versions)` (Skewed); an unloaded name ⇒ `None` (the absent case is refused at
+    /// open, not a skew verdict).
+    #[test]
+    fn version_skew_pure_verdict() {
+        load_bundle();
+        let loaded = crate::collation::loaded_collation("unicode").expect("unicode loaded");
+        assert_eq!(
+            crate::collation::version_skew(
+                "unicode",
+                &loaded.unicode_version,
+                &loaded.cldr_version
+            ),
+            None,
+            "same version is Full"
+        );
+        assert_eq!(
+            crate::collation::version_skew("unicode", "0.0.0", "0"),
+            Some((loaded.unicode_version.clone(), loaded.cldr_version.clone())),
+            "a different pin is Skewed and reports the loaded version"
+        );
+        assert_eq!(
+            crate::collation::version_skew("zz-not-loaded", "1", "1"),
+            None,
+            "an unloaded name yields no skew verdict (absent ⇒ refused at open)"
+        );
+    }
+
+    /// A `unicode`-collated PK table is read-write while Full; once its `unicode` reference is pinned
+    /// to a different version than the loaded bundle (the open-time state of a file built under an
+    /// older bundle), the table degrades to **read-only**: reads still return the rows (the heap-scan
+    /// fallback recomputes against the loaded table), every write raises `XX002`, and the skew is
+    /// legible via `db.collations()`.
+    #[test]
+    fn skewed_collation_blocks_writes_reads_ok() {
+        load_bundle();
+        let mut db = Database::new();
+        crate::execute(
+            &mut db,
+            "CREATE TABLE t (x text COLLATE \"unicode\" PRIMARY KEY)",
+        )
+        .unwrap();
+        crate::execute(&mut db, "INSERT INTO t VALUES ('b'), ('a')").unwrap();
+        // Full so far: a write succeeds and every referenced collation reports Full.
+        crate::execute(&mut db, "INSERT INTO t VALUES ('c')").unwrap();
+        assert!(
+            db.collations()
+                .iter()
+                .all(|c| c.verdict == CollationVerdict::Full),
+            "all Full before skew injection"
+        );
+
+        // Inject skew: the file pinned `unicode` to an older version than the loaded bundle. This is
+        // exactly the catalog state `Database::open` produces for a file built under a prior bundle —
+        // a catalog-local collation whose pin differs from the loaded set (collation.md §5/§12).
+        let loaded = crate::collation::loaded_collation("unicode").unwrap();
+        let mut skewed = (*loaded).clone();
+        skewed.unicode_version = "0.0.0".to_string();
+        db.committed.put_collation(Arc::new(skewed));
+
+        // The verdict is now Skewed and visible via introspection (the file's pin is reported).
+        let info = db.collations();
+        let uni = info
+            .iter()
+            .find(|c| c.name == "unicode")
+            .expect("unicode referenced");
+        assert_eq!(uni.verdict, CollationVerdict::Skewed);
+        assert_eq!(uni.unicode_version, "0.0.0");
+
+        // Reads still work — all three rows come back (values are version-independent §4.1).
+        match crate::execute(&mut db, "SELECT x FROM t ORDER BY x COLLATE \"unicode\"").unwrap() {
+            Outcome::Query { rows, .. } => assert_eq!(rows.len(), 3),
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // Every write is refused with XX002.
+        for sql in [
+            "INSERT INTO t VALUES ('d')",
+            "UPDATE t SET x = 'z' WHERE x = 'a'",
+            "DELETE FROM t WHERE x = 'a'",
+            "CREATE INDEX t_x ON t (x)",
+        ] {
+            let err = crate::execute(&mut db, sql).expect_err(sql);
+            assert_eq!(err.code(), "XX002", "{sql} must be XX002");
         }
     }
 }

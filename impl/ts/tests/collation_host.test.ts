@@ -15,7 +15,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { loadedCollation } from "../src/collation.ts";
+import { loadedCollation, versionSkew } from "../src/collation.ts";
 import { close, commit, create, Database, execute, loadUnicodeData, open } from "../src/lib.ts";
 import { specPath } from "./tomlmini.ts";
 import { errCode, query } from "./util.ts";
@@ -236,5 +236,70 @@ test("reference-only file round trip (format_version 18, entry_kind 3)", () => {
     close(re);
   } finally {
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- slice 2d: the graded version-skew verdict (spec/design/collation.md §12/§14) ----
+// Skew has NO PostgreSQL analog (PG's collversion is the opposite, host-OS-drift, §15), so it is a
+// documented PG divergence tested per-core, not in the oracle corpus (CLAUDE.md §10). Mirrors
+// impl/rust skew_tests and impl/go/collation_host_test.go. (The absent-at-open refusal — an entirely
+// unloaded referenced collation → XX002 — is a structurally-identical 1-line decode change covered by
+// the Rust + Go decode unit tests; TS does not export the internal entry codec, and the write-block
+// below already exercises XX002 in this core.)
+
+test("collation version-skew verdict (pure)", () => {
+  // The pure verdict (versionSkew) — the cross-core contract (every core computes the identical
+  // result): same version ⇒ undefined (Full); a different pin ⇒ the loaded version (Skewed); an
+  // unloaded name ⇒ undefined (the absent case is refused at open, not a skew verdict).
+  loadFixtureBundle();
+  const loaded = loadedCollation("unicode");
+  assert.notEqual(loaded, undefined);
+  assert.equal(versionSkew("unicode", loaded!.unicodeVersion, loaded!.cldrVersion), undefined);
+  assert.deepEqual(versionSkew("unicode", "0.0.0", "0"), [
+    loaded!.unicodeVersion,
+    loaded!.cldrVersion,
+  ]);
+  assert.equal(versionSkew("zz-not-loaded", "1", "1"), undefined);
+});
+
+test("a version-skewed collation blocks writes but reads still work", () => {
+  // A unicode-collated PK table is read-write while Full; once its unicode reference is pinned to a
+  // different version than the loaded bundle (the open-time state of a file built under an older
+  // bundle), the table degrades to read-only: reads still return the rows (the heap-scan fallback),
+  // every write raises XX002, and the skew is legible via db.collations().
+  loadFixtureBundle();
+  const db = new Database();
+  exec(db, `CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`);
+  exec(db, `INSERT INTO t VALUES ('b'), ('a')`);
+  exec(db, `INSERT INTO t VALUES ('c')`); // Full → succeeds
+  assert.ok(db.collations().every((c) => c.verdict === "full"));
+
+  // Inject skew: the file pinned unicode to an older version than the loaded bundle. This is exactly
+  // the catalog state Database.open produces for a file built under a prior bundle (collation.md
+  // §5/§12). collations is a public Snapshot field; we clone so the engine-global loaded set is intact.
+  const loaded = loadedCollation("unicode")!;
+  db.committed.collations.set("unicode", { ...loaded, unicodeVersion: "0.0.0" });
+
+  // The verdict is now Skewed and visible via introspection (the file's pin is reported).
+  const uni = db.collations().find((c) => c.name === "unicode");
+  assert.notEqual(uni, undefined);
+  assert.equal(uni!.verdict, "skewed");
+  assert.equal(uni!.unicodeVersion, "0.0.0");
+
+  // Reads still work — all three rows come back (values are version-independent §4.1).
+  assert.equal(query(db, `SELECT x FROM t ORDER BY x COLLATE "unicode"`).length, 3);
+
+  // Every write is refused with XX002.
+  for (const sql of [
+    `INSERT INTO t VALUES ('d')`,
+    `UPDATE t SET x = 'z' WHERE x = 'a'`,
+    `DELETE FROM t WHERE x = 'a'`,
+    `CREATE INDEX t_x ON t (x)`,
+  ]) {
+    assert.equal(
+      errCode(() => exec(db, sql)),
+      "XX002",
+      sql,
+    );
   }
 });

@@ -763,6 +763,23 @@ pub fn loaded_collation(name: &str) -> Option<std::sync::Arc<Collation>> {
         .cloned()
 }
 
+/// The slice-2d version-skew verdict (spec/design/collation.md §12, compatibility.md §7): given a
+/// collation `name` and the `(unicode, cldr)` version the FILE pinned its keys under (§5), return
+/// `Some((loaded_unicode, loaded_cldr))` when a loaded bundle provides `name` at a **different**
+/// version — the object using it is read-only (`XX002` on write) — else `None` (`Full`: the same
+/// version, or no loaded table to disagree). A pure, total comparison with no host or global-state
+/// side effect beyond the read of the engine-global loaded set, so **every core computes the
+/// identical verdict** (the §10 cross-core contract). The read side never consults this — a skewed
+/// read recomputes against the loaded table (the heap-scan fallback, compatibility.md §8).
+pub fn version_skew(name: &str, file_unicode: &str, file_cldr: &str) -> Option<(String, String)> {
+    let loaded = loaded_collation(name)?;
+    if loaded.unicode_version != file_unicode || loaded.cldr_version != file_cldr {
+        Some((loaded.unicode_version.clone(), loaded.cldr_version.clone()))
+    } else {
+        None
+    }
+}
+
 // ============================================================================================
 // Casing kernels (spec/design/collation.md §16) — the production `upper`/`lower`/`ILIKE` folds.
 //

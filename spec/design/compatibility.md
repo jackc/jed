@@ -29,12 +29,18 @@
 > (`format_version`); the legibility/host-boundary stance is CLAUDE.md §13; the cross-core
 > identity requirement is [determinism.md](determinism.md) (CLAUDE.md §2/§8).
 >
-> **Status: UNRATIFIED PROPOSAL — nothing here is decided or implemented.** This is *not* a
-> specification; it is a candidate model recorded for discussion. The **current, actual** on-disk
-> policy is a **clean break, exact-version-only** read (a reader accepts *only* the current
-> `format_version`, [../fileformat/format.md](../fileformat/format.md) — justified pre-1.0: "we
-> own our surface", CLAUDE.md §1) and that remains the spec until and unless this proposal is
-> adopted. The doc sketches a model jed *could* adopt if/when it commits to on-disk stability
+> **Status: UNRATIFIED PROPOSAL for the *general* manifest (§6) — but its first concrete instance,
+> the graded collation version-skew verdict, has LANDED** ([collation.md §12/§14](collation.md),
+> slice 2d, all three cores: `XX002` registered; an open-time per-collation comparison degrades a
+> version-skewed object to read-only and refuses an absent one). That instance needed **no** general
+> manifest structure — it is a pure comparison of the version pin already in the file — so §6's
+> manifest, the per-object granularity machinery, and adoption for the *other* triggering features
+> (functional indexes, generated columns, views, host functions) all **remain a proposal.** This is
+> *not* a specification for those; it is a candidate model recorded for discussion. The **current,
+> actual** on-disk policy is otherwise a **clean break, exact-version-only** read (a reader accepts
+> *only* the current `format_version`, [../fileformat/format.md](../fileformat/format.md) — justified
+> pre-1.0: "we own our surface", CLAUDE.md §1) and that remains the spec until and unless this
+> proposal is adopted. The doc sketches a model jed *could* adopt if/when it commits to on-disk stability
 > (≈1.0). It is written now, ahead of the features that would trigger it (functional indexes,
 > generated columns, materialized views, collation versioning), only so that — *should it be
 > adopted* — those features can register into a single manifest rather than being retrofitted.
@@ -222,11 +228,14 @@ data, not prose). Per object, the verdict is one of:
   (`requires host function "geo_distance"` / `requires builtin "foo" semantics ≥ 18` / `requires
   collation "de" @ (15.0, 44)`). The *rest* of the database is unaffected (§6.3).
 
-> **`XX002` is reserved in CLAUDE.md §13 ("a file needing host code to reopen fails closed and
-> discoverably, `XX002`") but is not yet in [../errors/registry.toml](../errors/registry.toml).**
-> Registering it (and deciding whether read-required built-in/collation gaps share it or get
-> sibling codes) is part of adopting this model (§12). `XX001` (`data_corrupted`) already exists;
-> `0A000` (`feature_not_supported`) is the existing code for an unsupported *construct*.
+> **`XX002` (`collation_version_mismatch`) is now registered** in
+> [../errors/registry.toml](../errors/registry.toml) (the CLAUDE.md §13 "fails closed and
+> discoverably" code), landed with collation's graded verdict (the first implemented instance —
+> [collation.md §12/§14](collation.md), slice 2d). It deliberately diverges from PostgreSQL's
+> `XX002` (`index_corrupted`), which jed has no concept of. **Open decision #4 is resolved toward
+> *siblings*:** `XX002` is **collation-specific for now**; a future read-required built-in / host
+> gap gets its own sibling code rather than overloading this one. `XX001` (`data_corrupted`) already
+> exists; `0A000` (`feature_not_supported`) is the existing code for an unsupported *construct*.
 
 ## 8. Degradation semantics (the heap-scan fallback)
 
@@ -352,17 +361,28 @@ triggering features land.
   ([timezones.md](timezones.md)).
 - Lean toward **STORED-only generated columns** and **distinct host-vs-builtin marking** (§11).
 
+**Resolved by collation's slice 2d** ([collation.md §12/§14](collation.md) — the first implemented
+instance, though the *general* manifest (§6) remains a proposal):
+
+- **#3 — entirely-absent referenced collation:** **refuse the open** (`XX002`, naming the collation +
+  version), the conservative choice — never silently substitute an ordering the user did not ask for,
+  and the per-object "open succeeds, degrade to read-only" path is deferred (it needs the in-memory
+  table to tolerate having no data). A *version-skewed* (name present, different version) collation
+  *does* degrade per-object to read-only, since its loaded table exists to recompute against.
+- **#4 — error-code shape:** `XX002` registered (`collation_version_mismatch`), **siblings not
+  sharing** — collation-specific now; future built-in/host gaps get their own codes.
+
 **Open (need a deliberate call before/at adoption):**
 
-1. **When to adopt** — this is the ≈1.0 on-disk-stability commitment; until then, clean-break is
-   simpler and owes nothing (CLAUDE.md §1).
+1. **When to adopt** *the general manifest* — this is the ≈1.0 on-disk-stability commitment; until
+   then, clean-break is simpler and owes nothing (CLAUDE.md §1). (Collation's verdict landed as a
+   **pure on-demand comparison** of the per-collation version pin already in the file — it needed no
+   general manifest structure, so adopting §6 in full is still open.)
 2. **Whether to vendor universal Unicode property tables now** (forced by `normalize`/`lower`/regex)
    on the same one-version-per-binary axis as collation (§10) — the *bake-vs-vendor* question is
-   settled (vendor); this is the remaining timing call.
-3. **`ORDER BY … COLLATE x` with `x` entirely absent** (§8) — error vs `C`-fallback.
-4. **Error-code shape** (§7) — register `XX002`; decide whether read-required built-in/collation
-   gaps share it or get siblings; relation to `0A000`.
-5. **Manifest encoding & location** (§6.2) — the permanently-parseable framing, and how a
+   settled (vendor); this is the remaining timing call. *(Update: the property/casing section landed
+   in the loaded bundle, [collation.md §16](collation.md) slice 3e.)*
+3. **Manifest encoding & location** (§6.2) — the permanently-parseable framing, and how a
    too-old binary degrades to the structural refusal.
 
 **Deferred features that will register here when built:** functional indexes

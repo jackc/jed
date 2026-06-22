@@ -80,6 +80,7 @@ import {
   loadUnicodeData as loadUnicodeDataGlobal,
   serializeTable,
   sortKey as collationSortKey,
+  versionSkew,
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
 import { crc32Ieee } from "./format.ts";
@@ -318,9 +319,19 @@ function utf8ByteLength(s: string): number {
   return SQL_BYTE_ENCODER.encode(s).length;
 }
 
+// CollationVerdict is the slice-2d version-skew verdict for one referenced collation
+// (spec/design/collation.md §12, compatibility.md §7). "full" ⇒ a loaded bundle provides the name at
+// the file's pinned (unicode, cldr), so the collation's objects are read-write. "skewed" ⇒ a loaded
+// bundle provides it at a DIFFERENT version, so its objects are read-only (reads recompute against the
+// loaded table — the heap-scan fallback; a write raises XX002). A pure comparison of the file pin (§5)
+// vs the loaded set — every core computes the identical verdict (the §10 cross-core contract).
+export type CollationVerdict = "full" | "skewed";
+
 // CollationInfo is introspection metadata for one loaded collation (db.collations,
 // spec/design/collation.md §1). contentHash is the CRC-32 of the compiled table (the reference-mode
-// stamp, §3/§4); description is provenance, excluded from the hash.
+// stamp, §3/§4); description is provenance, excluded from the hash. verdict is the slice-2d
+// version-skew verdict (§12) — "full" for the engine-global loaded set (it IS the reference); for a
+// database's referenced collations it is "skewed" when the file's pin differs from the loaded bundle's.
 export type CollationInfo = {
   name: string;
   unicodeVersion: string;
@@ -328,6 +339,7 @@ export type CollationInfo = {
   contentHash: number;
   description: string;
   isDefault: boolean;
+  verdict: CollationVerdict;
 };
 
 // Snapshot is an immutable committed (or in-progress working) database state — the catalog + each
@@ -416,6 +428,20 @@ export class Snapshot {
   // the file — the file references it by name and the table comes from a loaded bundle.
   resolveCollation(name: string): Collation | undefined {
     return this.collations.get(name) ?? loadedCollation(name);
+  }
+
+  // collationSkew is the slice-2d version-skew verdict for a referenced collation (collation.md §12):
+  // [fileUnicode, fileCldr, loadedUnicode, loadedCldr] when this database's keys were built under a
+  // different (unicode, cldr) than the loaded bundle provides — the object using it is read-only
+  // (XX002 on write) — else undefined (Full: same version, or this collation has no catalog-local file
+  // pin so it is freshly the loaded version, an in-memory-only database). A pure comparison of the file
+  // pin already in the catalog (§5) vs the engine-global loaded set; the Snapshot wiring of versionSkew.
+  collationSkew(name: string): [string, string, string, string] | undefined {
+    const cat = this.collations.get(name);
+    if (cat === undefined) return undefined;
+    const loaded = versionSkew(name, cat.unicodeVersion, cat.cldrVersion);
+    if (loaded === undefined) return undefined;
+    return [cat.unicodeVersion, cat.cldrVersion, loaded[0], loaded[1]];
   }
 
   // table looks up a table definition by name (case-insensitive).
@@ -1616,6 +1642,30 @@ export class Database {
     );
   }
 
+  // ensureCollationsWritable refuses a WRITE that would maintain a collated B-tree under a
+  // version-skewed collation (the slice-2d verdict, spec/design/collation.md §12/§14): if any of
+  // columns carries a collation the file pinned to a different (unicode, cldr) than the loaded bundle
+  // provides, an insert/update/delete/index-build would mix two orderings in one tree and corrupt it,
+  // so the whole table is read-only until a REINDEX migration (deferred) rebuilds + re-pins it. XX002,
+  // naming the collation + both versions. Reads never call this — they recompute against the loaded
+  // table (the heap-scan fallback, compatibility.md §8). Per-table granularity: one skewed column
+  // collation makes the table read-only (finer per-index gating is a follow-on).
+  private ensureCollationsWritable(columns: Column[]): void {
+    const snap = this.readSnap();
+    for (const c of columns) {
+      if (c.collation === null) continue;
+      const skew = snap.collationSkew(c.collation);
+      if (skew !== undefined) {
+        const [fu, fc, lu, lc] = skew;
+        throw engineError(
+          "collation_version_mismatch",
+          `collation "${c.collation}" version mismatch: this database's keys were built under ${fu}/${fc} ` +
+            `but the loaded bundle is ${lu}/${lc}; tables using it are read-only until a REINDEX migration rebuilds them`,
+        );
+      }
+    }
+  }
+
   // seqNextval is nextval('name') (spec/design/sequences.md §4): advance the named sequence and
   // return the new value. The running state lives in pendingSeq, seeded from the working snapshot on
   // first touch this statement, and is flushed into the working snapshot + sessionSeq on statement
@@ -1946,6 +1996,8 @@ export class Database {
       contentHash: crc32Ieee(serializeTable(c)),
       description: c.description,
       isDefault: false,
+      // The loaded set IS the version reference — it can never be skewed against itself.
+      verdict: "full" as const,
     }));
   }
 
@@ -1990,6 +2042,11 @@ export class Database {
       contentHash: crc32Ieee(serializeTable(c)),
       description: c.description,
       isDefault: dflt === c.name,
+      // The slice-2d verdict: "skewed" when the file's pin differs from the loaded bundle's version
+      // (the object is read-only), else "full" (collation.md §12).
+      verdict: (this.committed.collationSkew(c.name) !== undefined
+        ? "skewed"
+        : "full") as CollationVerdict,
     }));
   }
 
@@ -3363,6 +3420,9 @@ export class Database {
     }
     const tableKey = table.name.toLowerCase();
     const columns = table.columns;
+    // Refuse building a collated index on a version-skewed table (slice 2d, collation.md §12, XX002):
+    // the new B-tree would be pinned inconsistently with the file's other structures.
+    this.ensureCollationsWritable(columns);
     // Per-column frozen collations for the collated text key form (§2.12); null everywhere for a
     // C-only / non-text table (the fast path).
     const colls = this.columnCollations(columns);
@@ -3965,6 +4025,9 @@ export class Database {
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + ins.table);
     }
+    // Refuse the write if any of this table's collated keys are version-skewed (slice 2d): a
+    // maintained B-tree would mix two orderings (collation.md §12, XX002).
+    this.ensureCollationsWritable(table.columns);
     const store = this.writeStore(ins.table);
     // The key members in key order — one for a single-column PK, several for a composite
     // (constraints.md §3), empty for a no-PK (rowid) table.
@@ -5065,6 +5128,9 @@ export class Database {
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + del.table);
     }
+    // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): a
+    // DELETE must locate + remove a stored key, which a skewed encoding cannot match.
+    this.ensureCollationsWritable(table.columns);
     // Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
     // parent-side probe (parent is this table) and the index-entry path.
     const colls = this.columnCollations(table.columns);
@@ -5248,6 +5314,9 @@ export class Database {
     if (!table) {
       throw engineError("undefined_table", "table does not exist: " + upd.table);
     }
+    // Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): an
+    // UPDATE re-encodes + re-places keys, which a skewed encoding would corrupt.
+    this.ensureCollationsWritable(table.columns);
     // Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
     // probe and the index-entry move path.
     const colls = this.columnCollations(table.columns);

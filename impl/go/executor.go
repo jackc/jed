@@ -192,6 +192,25 @@ func (s *Snapshot) resolveCollation(name string) *Collation {
 	return LoadedCollation(name)
 }
 
+// collationSkew is the slice-2d version-skew verdict for a referenced collation (collation.md §12):
+// (fileUnicode, fileCldr, loadedUnicode, loadedCldr, true) when this database's keys were built under
+// a different (unicode, cldr) than the loaded bundle provides — the object using it is read-only
+// (XX002 on write) — else skewed=false (Full: same version, or this collation has no catalog-local
+// file pin so it is freshly the loaded version, an in-memory-only database). A pure comparison of the
+// file pin already in the catalog (§5) vs the engine-global loaded set; the Snapshot wiring of
+// collation.VersionSkew.
+func (s *Snapshot) collationSkew(name string) (fileU, fileC, loadedU, loadedC string, skewed bool) {
+	cat := s.collations[name]
+	if cat == nil {
+		return "", "", "", "", false
+	}
+	lu, lc, sk := VersionSkew(name, cat.UnicodeVersion, cat.CldrVersion)
+	if !sk {
+		return "", "", "", "", false
+	}
+	return cat.UnicodeVersion, cat.CldrVersion, lu, lc, true
+}
+
 // referencedCollations returns the collations the database SCHEMA references — every column's frozen
 // collation plus the per-database default — resolved (catalog-local set, then the binary's vendored
 // set) and sorted by exact name. Under the reference-only model (spec/design/collation.md §2/§5)
@@ -991,6 +1010,31 @@ func (db *Database) readSnap() *Snapshot {
 // columnCollations resolves each column's frozen collation (Column.Collation, the name) to its
 // baked table, indexed by column ordinal — nil for a C / non-text column (the fast path). The key
 // encoders (§2.12) consult colls[ci] to pick a text column's key form.
+func (db *Database) ensureCollationsWritable(columns []Column) error {
+	// Refuse a WRITE that would maintain a collated B-tree under a version-skewed collation (the
+	// slice-2d verdict, spec/design/collation.md §12/§14): if any of columns carries a collation the
+	// file pinned to a different (unicode, cldr) than the loaded bundle provides, an
+	// insert/update/delete/index-build would mix two orderings in one tree and corrupt it, so the
+	// whole table is read-only until a REINDEX migration (deferred) rebuilds + re-pins it. XX002,
+	// naming the collation + both versions. Reads never call this — they recompute against the loaded
+	// table (the heap-scan fallback, compatibility.md §8). Per-table granularity: one skewed column
+	// collation makes the table read-only (finer per-index gating is a follow-on).
+	snap := db.readSnap()
+	for i := range columns {
+		if columns[i].Collation == "" {
+			continue
+		}
+		if fu, fc, lu, lc, skewed := snap.collationSkew(columns[i].Collation); skewed {
+			return NewError(CollationVersionMismatch, fmt.Sprintf(
+				"collation %q version mismatch: this database's keys were built under %s/%s but the "+
+					"loaded bundle is %s/%s; tables using it are read-only until a REINDEX migration rebuilds them",
+				columns[i].Collation, fu, fc, lu, lc,
+			))
+		}
+	}
+	return nil
+}
+
 func (db *Database) columnCollations(columns []Column) []*Collation {
 	snap := db.readSnap()
 	out := make([]*Collation, len(columns))
@@ -1641,9 +1685,25 @@ func (db *Database) putTable(t *Table) {
 	db.working().putTable(t, db.pageSize)
 }
 
+// CollationVerdict is the slice-2d version-skew verdict for one referenced collation
+// (spec/design/collation.md §12, compatibility.md §7). VerdictFull ⇒ a loaded bundle provides the
+// name at the file's pinned (unicode, cldr), so the collation's objects are read-write. VerdictSkewed
+// ⇒ a loaded bundle provides it at a DIFFERENT version, so its objects are read-only (reads recompute
+// against the loaded table — the heap-scan fallback; a write raises XX002). A pure comparison of the
+// file pin (§5) vs the loaded set — every core computes the identical verdict (the §10 contract).
+type CollationVerdict int
+
+const (
+	VerdictFull CollationVerdict = iota
+	VerdictSkewed
+)
+
 // CollationInfo is introspection metadata for one loaded collation (db.Collations,
 // spec/design/collation.md §1). ContentHash is the CRC-32 of the compiled table (the reference-mode
-// stamp, §3/§4); Description is provenance, excluded from the hash.
+// stamp, §3/§4); Description is provenance, excluded from the hash. Verdict is the slice-2d
+// version-skew verdict (§12) — VerdictFull for the engine-global loaded set (it IS the reference);
+// for a database's referenced collations it is VerdictSkewed when the file's pin differs from the
+// loaded bundle's.
 type CollationInfo struct {
 	Name           string
 	UnicodeVersion string
@@ -1651,6 +1711,7 @@ type CollationInfo struct {
 	ContentHash    uint32
 	Description    string
 	IsDefault      bool
+	Verdict        CollationVerdict
 }
 
 // ImportCollation / ExportCollation are GONE (the reference-only pivot, spec/design/collation.md
@@ -1685,6 +1746,8 @@ func (db *Database) LoadedCollations() []CollationInfo {
 			ContentHash:    crc32IEEE(SerializeTable(c)),
 			Description:    c.Description,
 			IsDefault:      false,
+			// The loaded set IS the version reference — it can never be skewed against itself.
+			Verdict: VerdictFull,
 		}
 	}
 	return out
@@ -1727,6 +1790,12 @@ func (db *Database) Collations() []CollationInfo {
 	}
 	out := make([]CollationInfo, len(colls))
 	for i, c := range colls {
+		verdict := VerdictFull
+		// The slice-2d verdict: Skewed when the file's pin differs from the loaded bundle's version
+		// (the object is read-only), else Full (collation.md §12).
+		if _, _, _, _, skewed := db.committed.collationSkew(c.Name); skewed {
+			verdict = VerdictSkewed
+		}
 		out[i] = CollationInfo{
 			Name:           c.Name,
 			UnicodeVersion: c.UnicodeVersion,
@@ -1734,6 +1803,7 @@ func (db *Database) Collations() []CollationInfo {
 			ContentHash:    crc32IEEE(SerializeTable(c)),
 			Description:    c.Description,
 			IsDefault:      db.committed.defaultCollation == c.Name,
+			Verdict:        verdict,
 		}
 	}
 	return out
@@ -4206,6 +4276,11 @@ func (db *Database) executeCreateIndex(ci *CreateIndex) (Outcome, error) {
 	}
 	tableKey := strings.ToLower(table.Name)
 	columns := table.Columns
+	// Refuse building a collated index on a version-skewed table (slice 2d, collation.md §12, XX002):
+	// the new B-tree would be pinned inconsistently with the file's other structures.
+	if err := db.ensureCollationsWritable(columns); err != nil {
+		return Outcome{}, err
+	}
 	// Per-column frozen collations for the collated text key form (§2.12); nil everywhere for a
 	// C-only / non-text table (the fast path).
 	colls := db.columnCollations(columns)
@@ -5115,6 +5190,11 @@ func (db *Database) executeInsert(ins *Insert, params []Value, ctx cteCtx) (Outc
 	table, ok := db.lkpTable(ins.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+ins.Table)
+	}
+	// Refuse the write if any of this table's collated keys are version-skewed (slice 2d): a
+	// maintained B-tree would mix two orderings (collation.md §12, XX002).
+	if err := db.ensureCollationsWritable(table.Columns); err != nil {
+		return Outcome{}, err
 	}
 	store := db.writeStore(ins.Table) // routes a temp INSERT to tempWorking (temp-tables.md §2)
 	// The key members in key order — one for a single-column PK, several for a composite
@@ -6345,6 +6425,11 @@ func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outc
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+del.Table)
 	}
+	// Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): a
+	// DELETE must locate + remove a stored key, which a skewed encoding cannot match.
+	if err := db.ensureCollationsWritable(table.Columns); err != nil {
+		return Outcome{}, err
+	}
 	// Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
 	// parent-side probe (parent is this table) and the index-entry path.
 	colls := db.columnCollations(table.Columns)
@@ -6574,6 +6659,11 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 	table, ok := db.lkpTable(upd.Table) // temp-first (temp-tables.md §3)
 	if !ok {
 		return Outcome{}, NewError(UndefinedTable, "table does not exist: "+upd.Table)
+	}
+	// Refuse the write if any collated key is version-skewed (slice 2d, collation.md §12, XX002): an
+	// UPDATE re-encodes + re-places keys, which a skewed encoding would corrupt.
+	if err := db.ensureCollationsWritable(table.Columns); err != nil {
+		return Outcome{}, err
 	}
 	// Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
 	// probe and the index-entry move path.

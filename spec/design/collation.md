@@ -87,12 +87,21 @@
 >   `lower(text)` (the text overload of the range accessors) and `ILIKE` in all three cores; the
 >   property/casing section is populated (UCD 17.0.0 case mappings, [../collation/17.0.0/casing.txt](../collation/17.0.0/casing.txt))
 >   and rides `unicode.jucd` + the `casing-only` preset (§16/§13). The bare binary folds ASCII only.
+> - **Landed (Slice 2d — the graded version-skew verdict):** collation is the **first implemented
+>   instance** of [compatibility.md](compatibility.md)'s graded open-time verdict (§12/§14). `XX002`
+>   (`collation_version_mismatch`) is registered; on open, each referenced collation's file-pinned
+>   `(unicode, cldr)` is compared to the loaded bundle's — **same version** reads-writes normally,
+>   **different version** leaves the object **read-only** (reads recompute against the loaded table,
+>   the heap-scan fallback that is jed's *existing* collated execution path; a write that would mix two
+>   orderings in one B-tree is refused `XX002`), and an **entirely absent** referenced collation
+>   **refuses the open** `XX002` (was `42704`). No `format_version` bump — the verdict is a pure
+>   comparison of data already in the file (§5) + the loaded set. The `REINDEX`/`COLLATION UPGRADE`
+>   migration that clears a skew is a **follow-on**.
 > - **Not yet built (Slice 3 remainder):** `initcap` (word-boundary titlecasing) + `normalize`/regex
 >   (deferred property sub-tables); implicit weights / the full CJK tier-3 root; the broader LDML
->   tailoring features (and the sv/da/de tailorings that need them); and the
->   [compatibility.md](compatibility.md) manifest/verdict that reference-only leans on (§2d). (The
->   slice-2 "embedder-chosen footprint tiers" are **superseded** by Slice 3's builder-tool bundle
->   presets — §13.)
+>   tailoring features (and the sv/da/de tailorings that need them); the `REINDEX`/`COLLATION UPGRADE`
+>   migration (the 2d follow-on that rebuilds + re-pins a skewed table). (The slice-2 "embedder-chosen
+>   footprint tiers" are **superseded** by Slice 3's builder-tool bundle presets — §13.)
 >
 > Two foundational choices are unchanged: the definition format is the **UCA/CLDR standards** (DUCET
 > `allkeys.txt` + LDML), and the `.coll` **compiled artifact is the one shared cross-core form** every
@@ -646,6 +655,13 @@ Collation is a §8 divergence hotspot handled by the established machinery:
 
 ## 12. Migration and version adoption
 
+> **Status: the graded verdict LANDED (Slice 2d, all three cores).** The three cases below are
+> implemented as a pure on-demand comparison of the file's pin (§5) against the loaded bundle's
+> version — `XX002` registered, no `format_version` bump (§14 2d for the full scope + the two
+> deliberate narrowings: an *absent* referenced collation refuses the open rather than degrading
+> per-object, and the `REINDEX`/`COLLATION UPGRADE` step is a follow-on, so a skewed table is
+> read-only until it lands).
+
 The reference-only model (§3) keeps a jed upgrade from *silently* breaking a file, while pinning +
 the graded verdict make any genuine version move legible:
 
@@ -826,10 +842,40 @@ leans on:
   legibly (`42704`, the precursor to 2d's graded verdict). All 46 `.jed` goldens regenerated;
   `rust == go == ts == ruby` byte-identical. **Still pending:** the optional `.coll` content hash as
   open-time integrity defense.
-- **2d — the graded verdict for collation** (§3/§12): wire collation into the
-  [compatibility.md](compatibility.md) manifest + open-time verdict (full / read-only heap-scan /
-  legible refusal) and the `REINDEX`/`COLLATION UPGRADE` migration. Requires `XX002` registered
-  ([compatibility.md §7](compatibility.md)).
+- **2d — the graded verdict for collation** ✅ *landed (all three cores)*: collation is the **first
+  implemented instance** of [compatibility.md](compatibility.md)'s graded open-time verdict. `XX002`
+  (`collation_version_mismatch`) is registered ([compatibility.md §7](compatibility.md), the
+  CLAUDE.md §13 "fails closed and discoverably" code). The verdict is a **pure on-demand comparison**
+  — the file already pins `(unicode_version, cldr_version)` per referenced collation (§5) and the
+  loaded bundle carries its own, so no new stored state and no `format_version` bump. Per referenced
+  collation: **`Full`** (loaded bundle provides the name at the **same** version → behaves exactly as
+  before) / **`Skewed`** (name present, **different** version). Enforcement, per object = per table:
+  - **Reads always work** — jed already executes *every* collated operation by heap-scan + in-memory
+    recompute against the **loaded** table (collated keys never push down — the 1e narrowing §8; a
+    collated `ORDER BY` always materializes + re-sorts §1c), so a skewed read is already
+    correct-for-the-loaded-version. The "read-only heap-scan degradation" of
+    [compatibility.md §8](compatibility.md) is therefore the *existing* execution path, not new code.
+  - **Writes to a `Skewed` table are refused (`XX002`).** Inserting/updating/deleting would encode
+    keys under the loaded version into a B-tree built under the file's pinned version — mixing two
+    orderings in one tree corrupts it. A table is read-only if its PK, any text column, or any index
+    references a `Skewed` collation; the error names the collation + both versions. **Per-table
+    granularity** (a `C`-PK table with one skewed secondary index is wholly read-only — finer
+    per-index gating is a follow-on).
+  - **The per-database default's verdict** is reported via `db.Collations()` (a `verdict` field added
+    to `CollationInfo`), so skew is legible before a write fails.
+
+  **Two narrowings, both deliberate (relaxable later):** (a) an **entirely absent** referenced
+  collation (no loaded bundle provides the name) **refuses the whole open** with `XX002` (was a bare
+  `42704`) rather than opening the rest of the database read-only — the conservative resolution of
+  [compatibility.md §12](compatibility.md) open decision #3, since the per-object "open succeeds,
+  degrade" path would need the in-memory table to tolerate having no data. (b) The
+  **`REINDEX`/`ALTER … COLLATION UPGRADE` migration** that rebuilds a skewed table's collated keys
+  against the loaded version and re-pins the stamp — clearing the skew so the table is read-write
+  again — is **split to a follow-on**; until it lands a skewed file is read-only (a host can still
+  rebuild by recreating). Skew has **no PostgreSQL analog** (PG's `collversion` posture is the
+  opposite — host-OS-drift, §15), so the behavior is verified by **per-core unit tests** (the verdict
+  is a deterministic pure function — every core computes the identical verdict, the §10 cross-core
+  contract — and the write-block + read-correctness), not the oracle corpus (CLAUDE.md §10).
 - **2e — real version-pinned root + first tailoring** ✅ *landed (all three cores + Ruby)*: the
   `dev-*` fixtures are replaced in the production **vendored** set by the real CLDR-tailored DUCET
   root — `unicode` (UCA/UCD **17.0.0**, CLDR 48, `spec/collation/17.0.0/root.allkeys` ≈ the CLDR

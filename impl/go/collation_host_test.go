@@ -12,7 +12,10 @@ package jed
 // §9/§16), then uses collations by name. Mirrors impl/rust/tests/collation_host.rs and
 // impl/ts/tests/collation_host.test.ts.
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 func texts(t *testing.T, rows [][]Value) []string {
 	t.Helper()
@@ -292,5 +295,117 @@ func TestReferenceOnlyFileRoundTrip(t *testing.T) {
 	}
 	if err := re.Close(); err != nil {
 		t.Fatalf("close re: %v", err)
+	}
+}
+
+// ---- slice 2d: the graded version-skew verdict (spec/design/collation.md §12/§14) ----
+// Skew has NO PostgreSQL analog (PG's collversion is the opposite, host-OS-drift, §15), so it is a
+// documented PG divergence tested per-core, not in the oracle corpus (CLAUDE.md §10). White-box (it
+// injects a file-pin/loaded-version mismatch a public API cannot manufacture — a fresh file pins the
+// loaded version). Mirrors impl/rust skew_tests and impl/ts/tests/collation_host.test.ts.
+
+func TestCollationVersionSkewVerdict(t *testing.T) {
+	// The pure verdict (VersionSkew) — the cross-core contract (every core computes the identical
+	// result): same version ⇒ Full; a different pin ⇒ Skewed (reporting the loaded version); an
+	// unloaded name ⇒ no skew verdict (the absent case is refused at open, not a skew).
+	loadFixtureBundle(t)
+	loaded := LoadedCollation("unicode")
+	if loaded == nil {
+		t.Fatal("unicode must be loaded")
+	}
+	if _, _, skewed := VersionSkew("unicode", loaded.UnicodeVersion, loaded.CldrVersion); skewed {
+		t.Fatal("same version must be Full")
+	}
+	lu, lc, skewed := VersionSkew("unicode", "0.0.0", "0")
+	if !skewed || lu != loaded.UnicodeVersion || lc != loaded.CldrVersion {
+		t.Fatalf("a different pin must be Skewed reporting the loaded version: got (%q,%q,%v)", lu, lc, skewed)
+	}
+	if _, _, skewed := VersionSkew("zz-not-loaded", "1", "1"); skewed {
+		t.Fatal("an unloaded name must yield no skew verdict")
+	}
+}
+
+func TestSkewedCollationBlocksWrites(t *testing.T) {
+	// A unicode-collated PK table is read-write while Full; once its unicode reference is pinned to a
+	// different version than the loaded bundle (the open-time state of a file built under an older
+	// bundle), the table degrades to read-only: reads still return the rows (the heap-scan fallback),
+	// every write raises XX002, and the skew is legible via db.Collations.
+	loadFixtureBundle(t)
+	db := NewDatabase()
+	for _, sql := range []string{
+		`CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`,
+		`INSERT INTO t VALUES ('b'), ('a')`,
+		`INSERT INTO t VALUES ('c')`, // Full → succeeds
+	} {
+		if _, err := Execute(db, sql); err != nil {
+			t.Fatalf("%s: unexpected error %v", sql, err)
+		}
+	}
+	for _, c := range db.Collations() {
+		if c.Verdict != VerdictFull {
+			t.Fatalf("%q must be Full before skew injection, got %v", c.Name, c.Verdict)
+		}
+	}
+
+	// Inject skew: the file pinned unicode to an older version than the loaded bundle. This is exactly
+	// the catalog state Open produces for a file built under a prior bundle (collation.md §5/§12).
+	loaded := LoadedCollation("unicode")
+	skewed := *loaded
+	skewed.UnicodeVersion = "0.0.0"
+	db.committed.collations["unicode"] = &skewed
+
+	// The verdict is now Skewed and visible via introspection (the file's pin is reported).
+	found := false
+	for _, c := range db.Collations() {
+		if c.Name == "unicode" {
+			found = true
+			if c.Verdict != VerdictSkewed {
+				t.Fatalf("unicode verdict: got %v, want Skewed", c.Verdict)
+			}
+			if c.UnicodeVersion != "0.0.0" {
+				t.Fatalf("unicode pin: got %q, want 0.0.0", c.UnicodeVersion)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("unicode must be referenced")
+	}
+
+	// Reads still work — all three rows come back (values are version-independent §4.1).
+	out, err := Execute(db, `SELECT x FROM t ORDER BY x COLLATE "unicode"`)
+	if err != nil {
+		t.Fatalf("read after skew: %v", err)
+	}
+	if len(out.Rows) != 3 {
+		t.Fatalf("read after skew: got %d rows, want 3", len(out.Rows))
+	}
+
+	// Every write is refused with XX002.
+	for _, sql := range []string{
+		`INSERT INTO t VALUES ('d')`,
+		`UPDATE t SET x = 'z' WHERE x = 'a'`,
+		`DELETE FROM t WHERE x = 'a'`,
+		`CREATE INDEX t_x ON t (x)`,
+	} {
+		if _, err := Execute(db, sql); err == nil || err.(*EngineError).Code() != "XX002" {
+			t.Fatalf("%s: want XX002, got %v", sql, err)
+		}
+	}
+}
+
+func TestCollationOpenRefusesAbsent(t *testing.T) {
+	// A file that references a collation NO loaded bundle provides is the graded verdict's legible
+	// refusal (collation.md §12, slice 2d): decoding the reference entry fails with XX002 naming it +
+	// its version, rather than the old bare 42704. "zz-absent-collation" is never in any bundle, so
+	// this is independent of the engine-global loaded set (no bundle load needed).
+	coll := &Collation{Name: "zz-absent-collation", UnicodeVersion: "17.0.0", CldrVersion: "48"}
+	buf := collationEntryBytes(coll, false)
+	pos := 0
+	_, _, err := decodeCollationEntry(buf, &pos)
+	if err == nil || err.(*EngineError).Code() != "XX002" {
+		t.Fatalf("absent reference: want XX002, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "zz-absent-collation") || !strings.Contains(err.Error(), "17.0.0/48") {
+		t.Fatalf("message should name the collation + version: %v", err)
 	}
 }

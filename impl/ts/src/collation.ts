@@ -574,6 +574,26 @@ export function loadedCollation(name: string): Collation | undefined {
   return loadedColl.get(name);
 }
 
+// versionSkew is the slice-2d version-skew verdict (spec/design/collation.md §12, compatibility.md
+// §7): given a collation name and the (unicode, cldr) version the FILE pinned its keys under (§5), it
+// returns [loadedUnicode, loadedCldr] when a loaded bundle provides name at a DIFFERENT version — the
+// object using it is read-only (XX002 on write) — else undefined (Full: the same version, or no
+// loaded table to disagree). A pure, total comparison so EVERY core computes the identical verdict
+// (the §10 cross-core contract). The read side never consults this — a skewed read recomputes against
+// the loaded table (the heap-scan fallback, compatibility.md §8).
+export function versionSkew(
+  name: string,
+  fileUnicode: string,
+  fileCldr: string,
+): [string, string] | undefined {
+  const loaded = loadedColl.get(name);
+  if (loaded === undefined) return undefined;
+  if (loaded.unicodeVersion !== fileUnicode || loaded.cldrVersion !== fileCldr) {
+    return [loaded.unicodeVersion, loaded.cldrVersion];
+  }
+  return undefined;
+}
+
 // loadedCollationTables returns every loaded collation, ascending by name — a deterministic order
 // with no hash-iteration leak (CLAUDE.md §8). The raw tables; the public CollationInfo view is the
 // Database.loadedCollations method (executor.ts).
