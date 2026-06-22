@@ -104,6 +104,62 @@ fn sortkey_matches_vectors_and_is_strictly_ascending() {
 }
 
 #[test]
+fn bundle_vectors_round_trip_and_merge() {
+    use jed::collation::{build_bundle, load_bundle, open_bundle, save_bundle};
+    let v: toml::Value = toml::from_str(&spec("collation/vectors/bundle.toml")).unwrap();
+    let bundles = v["bundle"].as_array().expect("[[bundle]] array");
+    assert!(!bundles.is_empty(), "no bundle vectors");
+
+    for b in bundles {
+        // Rebuild the bundle from def_files (build_bundle: shared root + per-locale deltas).
+        let root_name = b["root_name"].as_str().unwrap();
+        let root =
+            compile_collation(root_name, &definition(b["root_def_files"].as_array().unwrap()))
+                .unwrap();
+        let tailorings: Vec<Collation> = b["tailoring"]
+            .as_array()
+            .expect("tailoring array")
+            .iter()
+            .map(|t| {
+                compile_collation(
+                    t["name"].as_str().unwrap(),
+                    &definition(t["def_files"].as_array().unwrap()),
+                )
+                .unwrap()
+            })
+            .collect();
+        let refs: Vec<&Collation> = tailorings.iter().collect();
+
+        let bundle = build_bundle(&root, &refs, None, b["description"].as_str().unwrap());
+        let bytes = save_bundle(&bundle);
+        let expected = b["bundle_hex"].as_str().unwrap();
+        assert_eq!(hex(&bytes), expected, "bundle bytes");
+
+        // open → save round-trip is byte-identical.
+        let reopened = open_bundle(&bytes).unwrap();
+        assert_eq!(hex(&save_bundle(&reopened)), expected, "bundle open→save");
+
+        // Load-time merge reproduces each full tailoring table (§5.1), and the root is unchanged.
+        let (colls, _property) = load_bundle(&reopened).unwrap();
+        let loaded_root = colls.iter().find(|c| c.name == root_name).unwrap();
+        assert_eq!(
+            serialize_table(loaded_root),
+            serialize_table(&root),
+            "root table changed through the bundle"
+        );
+        for t in &tailorings {
+            let loaded = colls.iter().find(|c| c.name == t.name).unwrap();
+            assert_eq!(
+                serialize_table(loaded),
+                serialize_table(t),
+                "merge(root, {}-delta) is not byte-identical to the full table",
+                t.name
+            );
+        }
+    }
+}
+
+#[test]
 fn open_rejects_a_tampered_artifact() {
     let coll = compile_collation("dev-root", &spec("collation/fixtures/dev-root.allkeys")).unwrap();
     let mut artifact = save_collation(&coll);
