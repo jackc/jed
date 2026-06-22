@@ -1,0 +1,17 @@
+# Build output and generated trees
+build/
+.svelte-kit/
+node_modules/
+
+# Lockfile is npm-managed
+package-lock.json
+
+# Markdown docs are mdsvex (Svelte + frontmatter) — leave prose to the author,
+# not Prettier's markdown parser. Re-enable if/when an mdsvex-aware path exists.
+**/*.md
+**/*.svx
+
+# Per-language example snippets Prettier has no parser for (rust.rs / go.go).
+# (Prettier skips unknown extensions anyway; listed here for intent.)
+examples/**/*.rs
+examples/**/*.go

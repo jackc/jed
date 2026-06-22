@@ -1,0 +1,25 @@
+{
+  "$schema": "https://biomejs.dev/schemas/2.5.0/schema.json",
+  "vcs": { "enabled": true, "clientKind": "git", "useIgnoreFile": true },
+  "formatter": {
+    "enabled": true,
+    "indentStyle": "space",
+    "indentWidth": 2,
+    "lineWidth": 100
+  },
+  "linter": { "enabled": false },
+  "assist": { "enabled": false },
+  "files": {
+    "includes": [
+      "impl/ts/**/*.ts",
+      "impl/ts/**/*.js",
+      "bench/ts/**/*.ts",
+      "bench/ts/**/*.js",
+      "!**/node_modules/**",
+      "!impl/ts/src/operators.ts",
+      "!impl/ts/src/costs.ts",
+      "!impl/ts/src/ranges_gen.ts",
+      "!impl/ts/src/collationdata/vendored.ts"
+    ]
+  }
+}

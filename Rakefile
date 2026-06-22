@@ -143,25 +143,46 @@ task :verify do
   puts "\nAll spec checks passed."
 end
 
-# fmt — formatting gate for the language cores. The formatters are pinned in mise.toml
-# (rust 1.92.0 ships rustfmt; gofumpt pinned as a go tool), so they are reproducible across
-# contributors; this task is what makes that pin load-bearing. Without a check, formatting
-# silently drifts from the pinned tools (it had, in BOTH cores, before this gate). Rust uses
-# rustfmt (`cargo fmt`); Go uses gofumpt — a stricter SUPERSET of gofmt (gofumpt output is
-# always gofmt-clean too) — chosen over plain gofmt because mise already pins it.
-# TypeScript has no formatter configured (`tsc --noEmit` is a TYPE check, run via
-# `npm run typecheck` in impl/ts), so it is intentionally out of scope. Kept SEPARATE from
-# `verify`, which is deliberately toolchain-light (spec data only, no cargo/go needed).
+# fmt — formatting gate for every core + the web module. The formatters are VERSION-PINNED so
+# they are reproducible across contributors; this task is what makes the pins load-bearing.
+# Without a check, formatting silently drifts from the pinned tools (it had, in BOTH the Rust
+# and Go cores, before this gate). The pins, one per surface:
+#   rust              — rustfmt (ships with rust 1.92.0, mise-pinned); `cargo fmt`.
+#   go                — gofumpt (mise-pinned go tool); a stricter SUPERSET of gofmt (its output
+#                       is always gofmt-clean too), chosen because mise already pins it.
+#   impl/ts, bench/ts — biome (mise-pinned; biome.json at repo root). Formatter-only: the linter
+#                       and assist are OFF in biome.json, so `biome check` is purely a format
+#                       check. 2-space, lineWidth 100. The four @generated TS files
+#                       (operators/costs/ranges_gen/vendored) are EXCLUDED there, so the codegen
+#                       drift check (`rake verify`) stays the single source of truth for them.
+#   web               — prettier + prettier-plugin-svelte (npm devDeps, pinned EXACT in
+#                       web/package.json + lockfile). Formatter output changes between versions,
+#                       so the exact pin is the reproducibility guarantee here — the npm analogue
+#                       of the mise pins above. Config: web/.prettierrc.json (2-space; the
+#                       single-quote / no-trailing-comma SvelteKit idiom is preserved). Markdown
+#                       (mdsvex) is left to the author via web/.prettierignore. Self-bootstraps
+#                       web deps with `npm ci` when node_modules is missing — the bench:* idiom.
+# `tsc --noEmit` stays a separate TYPE check (`npm run typecheck` in impl/ts), not a formatter.
+# Kept SEPARATE from `verify`, which is deliberately toolchain-light (spec data only — no
+# cargo/go/biome/npm needed).
 RUST_MANIFEST = File.join(__dir__, "impl/rust/Cargo.toml")
 CLI_MANIFEST  = File.join(__dir__, "cli/Cargo.toml")
 GO_DIR        = File.join(__dir__, "impl/go")
+TS_CORE_DIRS  = %w[impl/ts bench/ts] # biome (mise-pinned); biome.json scopes paths + excludes generated
+WEB_DIR       = "web"                # prettier (npm-pinned); reuses web's format / format:check scripts
 
 # The Go files gofumpt would rewrite. `gofumpt -l` exits 0 even when files differ, so the
 # signal is the printed file list, not the exit status.
 def gofumpt_unformatted = capture("gofumpt", "-l", GO_DIR).first.split("\n").map(&:strip).reject(&:empty?)
 
+# Install web's npm deps (prettier lives here) only when missing — the same self-bootstrap the
+# bench:* tasks use. `npm ci` is reproducible from the committed lockfile.
+def npm_install_web
+  sh "npm", "ci", "--silent", "--prefix", WEB_DIR unless File.directory?("#{WEB_DIR}/node_modules")
+end
+
 namespace :fmt do
-  desc "Check Rust + Go formatting against the mise-pinned toolchains (the gate)"
+  desc "Check Rust + Go + TypeScript (cores) + web formatting against the pinned tools (the gate)"
   task :check do
     failures = []
 
@@ -182,20 +203,30 @@ namespace :fmt do
       failures << "go"
     end
 
+    puts "ts:   biome check #{TS_CORE_DIRS.join(' ')}"
+    failures << "ts" unless system("biome", "check", *TS_CORE_DIRS)
+
+    puts "web:  prettier --check #{WEB_DIR}"
+    npm_install_web
+    failures << "web" unless system("npm", "run", "--silent", "--prefix", WEB_DIR, "format:check")
+
     abort "fmt: needs formatting in #{failures.join(', ')} — run `rake fmt:fix`" unless failures.empty?
-    puts "\nFormatting clean (rust + go)."
+    puts "\nFormatting clean (rust + go + ts + web)."
   end
 
-  desc "Rewrite Rust + Go sources in place with the pinned formatters"
+  desc "Rewrite Rust + Go + TypeScript (cores) + web sources in place with the pinned formatters"
   task :fix do
     sh "cargo", "fmt", "--manifest-path", RUST_MANIFEST
     sh "cargo", "fmt", "--manifest-path", CLI_MANIFEST
     sh "gofumpt", "-w", GO_DIR
+    sh "biome", "check", "--write", *TS_CORE_DIRS
+    npm_install_web
+    sh "npm", "run", "--silent", "--prefix", WEB_DIR, "format"
   end
 end
 
 # Bare `rake fmt` runs the gate; `rake fmt:fix` applies it.
-desc "Check formatting of the language cores (alias for fmt:check)"
+desc "Check formatting of the cores + web (alias for fmt:check)"
 task fmt: "fmt:check"
 
 # codegen — the "middle path" (CLAUDE.md §5): (re)generate per-language source from the
