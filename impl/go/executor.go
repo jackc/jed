@@ -1857,6 +1857,23 @@ func (db *Database) LoadUnicodeData(data []byte) error {
 	return LoadUnicodeData(data)
 }
 
+// LoadTimeZoneData loads a JTZ time-zone bundle into the engine-global loaded set
+// (db.LoadTimeZoneData, spec/design/timezones.md §3.3). The bytes are jed's own pinned TZif (RFC
+// 8536) wrapped in a manifest; the loaded zones become usable by AT TIME ZONE. Like the collation
+// seam, this is a privileged host op (not SQL-reachable, no path, no engine I/O — §10), additive and
+// idempotent, engine-global so it may be called before open. A malformed bundle is XX001. (UTC and
+// fixed offsets are built in and need no load.)
+func (db *Database) LoadTimeZoneData(data []byte) error {
+	return LoadTimeZoneData(data)
+}
+
+// LoadedTimeZones introspects the engine-global loaded zone set (db.LoadedTimeZones, timezones.md
+// §3.3) — every named zone (and alias) a loaded bundle provides, ascending by name. A property of the
+// running engine, not of this database. UTC and fixed offsets are built in and not listed.
+func (db *Database) LoadedTimeZones() []TimeZoneInfo {
+	return LoadedTimeZones()
+}
+
 // LoadedCollations introspects the engine-global LOADED collation set (db.LoadedCollations,
 // spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
 // database on this handle, ascending by name. A property of the running ENGINE, not of this database;
@@ -12395,6 +12412,12 @@ const (
 	// reCasing is upper(text)/lower(text) — Unicode case folding (collation.md §16). casingUpper
 	// selects the direction; folds via the engine-global property table or the ASCII baseline.
 	reCasing
+	// reAtTimeZone is `value AT TIME ZONE zone` (grammar.md §49, timezones.md §6), desugared from the
+	// operator and a bare timezone(zone, value) call. lhs is the zone (text), rhs the value;
+	// atTzToTimestamptz selects the direction (false: timestamptz→timestamp; true: timestamp→
+	// timestamptz). Reads the engine-global loaded zone set; unknown zone 22023, NULL propagates,
+	// ±infinity passes through.
+	reAtTimeZone
 	reCase
 	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
 	// evaluated per row in any context.
@@ -12651,6 +12674,9 @@ type rExpr struct {
 	// collation.md §16.
 	insensitive bool
 	casingUpper bool
+	// atTzToTimestamptz selects the AT TIME ZONE direction (reAtTimeZone): false is timestamptz→
+	// timestamp, true is timestamp→timestamptz (timezones.md §6).
+	atTzToTimestamptz bool
 	// collation is the derived collation of a reCompare (spec/design/collation.md §7). nil is the
 	// C / default byte order (the unchanged fast path); non-nil is a loaded collation that orders the
 	// ORDERING comparisons (< <= > >=) by its UCA sort key. =/<> stay byte-equality regardless
@@ -14290,6 +14316,40 @@ func resolveLowerUpper(s *scope, name string, fc *FuncCallExpr, ag *aggCtx, para
 	}
 }
 
+// resolveTimezone resolves timezone(zone, value) — the desugar of `value AT TIME ZONE zone`
+// (timezones.md §6). zone must be text (else 42804); the result family is the OTHER timestamp family
+// of value: timestamptz → timestamp (render the instant locally) and timestamp → timestamptz
+// (interpret the wall clock in the zone). Any other value family — or an untyped/NULL value, which
+// cannot pick an overload — is 42883.
+func resolveTimezone(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if len(fc.Args) != 2 {
+		return nil, resolvedType{}, noFuncOverload("timezone")
+	}
+	textHint := Text
+	zoneR, zoneT, err := resolve(s, *fc.Args[0], &textHint, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	if zoneT.kind != rtText && zoneT.kind != rtNull {
+		return nil, resolvedType{}, NewError(DatatypeMismatch, "AT TIME ZONE zone must be text")
+	}
+	valueR, valueT, err := resolve(s, *fc.Args[1], nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	var toTimestamptz bool
+	var result resolvedType
+	switch valueT.kind {
+	case rtTimestamptz:
+		toTimestamptz, result = false, resolvedType{kind: rtTimestamp}
+	case rtTimestamp:
+		toTimestamptz, result = true, resolvedType{kind: rtTimestamptz}
+	default:
+		return nil, resolvedType{}, noFuncOverload("timezone")
+	}
+	return &rExpr{kind: reAtTimeZone, lhs: zoneR, rhs: valueR, atTzToTimestamptz: toTimestamptz}, result, nil
+}
+
 // resolveRangeFunc resolves a polymorphic range accessor over the anyrange pseudo-family
 // (range-functions.md §1). Simpler than resolveArrayFunc — the accessors take a single anyrange arg
 // with no anyelement arg, so there is no element-hint literal adaptation. lower/upper resolve to ELEM
@@ -14945,6 +15005,18 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		return resolveLowerUpper(s, name, fc, ag, params)
+	}
+	// timezone(zone, value) is the desugar of `value AT TIME ZONE zone` (grammar.md §49, timezones.md
+	// §6) and a callable function. Overloaded on the value's family (timestamptz → timestamp,
+	// timestamp → timestamptz), so it resolves before the generic by-name dispatch. functions.md §9
+	if name == "timezone" {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		return resolveTimezone(s, fc, ag, params)
 	}
 	// Otherwise the registry (the catalog descriptor tables) decides whether the name is an
 	// aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -18863,6 +18935,40 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return NullValue(), nil
 		}
 		return TextValue(FoldCase(v.Str, e.casingUpper, LoadedProperty())), nil
+	case reAtTimeZone:
+		m.Charge(Costs.OperatorEval)
+		zv, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		vv, err := e.rhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if zv.Kind == ValNull || vv.Kind == ValNull {
+			return NullValue(), nil
+		}
+		m.Charge(Costs.Timezone)
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		micros := vv.Int
+		// ±infinity passes through unchanged (PG): no zone offset applies, zone not validated.
+		if micros == PosInfinity || micros == NegInfinity {
+			if e.atTzToTimestamptz {
+				return TimestamptzValue(micros), nil
+			}
+			return TimestampValue(micros), nil
+		}
+		zr, ok := ResolveZone(zv.Str)
+		if !ok {
+			return Value{}, NewError(InvalidParameterValue,
+				fmt.Sprintf("time zone %q not recognized", zv.Str))
+		}
+		if e.atTzToTimestamptz {
+			return TimestamptzValue(LocalToInstantMicros(zr, micros)), nil
+		}
+		return TimestampValue(InstantToLocalMicros(zr, micros)), nil
 	case reCase:
 		// CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are
 		// evaluated in order and evaluation STOPS at the first TRUE — a FALSE or NULL/UNKNOWN

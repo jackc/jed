@@ -169,6 +169,36 @@ func loadCollation(name string) error {
 	return nil
 }
 
+// parseLoadTimezoneDirective parses a `# load-timezone: [<zone>]` line — the corpus's host-free way to
+// make the IANA time-zone data available before the records that use AT TIME ZONE (timezones.md §11).
+// Returns the (possibly empty) zone name, or false if not this directive.
+func parseLoadTimezoneDirective(line string) (string, bool) {
+	body, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "load-timezone:")
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(body), true
+}
+
+// loadTimezone makes the IANA time zones available to the records that follow (timezones.md §3.3/§11).
+// The harness acts as the HOST: it loads jed's pinned production JTZ bundle (spec/tz/fixtures/tzdata.jtz)
+// into the engine-global set via db.LoadTimeZoneData (idempotent — the set is global), then, if a zone
+// name was given, asserts it now resolves. A named zone no loaded bundle provides fails the test.
+func loadTimezone(name string) error {
+	path := filepath.Join(repoRoot(), "spec", "tz", "fixtures", "tzdata.jtz")
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return fmt.Errorf("load-timezone: read %s: %w", path, err)
+	}
+	if err := jed.LoadTimeZoneData(data); err != nil {
+		return fmt.Errorf("load-timezone: load tzdata.jtz: %w", err)
+	}
+	if _, ok := jed.ResolveZone(name); name != "" && !ok {
+		return fmt.Errorf("load-timezone: zone %q is not provided by the loaded bundle", name)
+	}
+	return nil
+}
+
 // parseFixtureDirective parses a file-level `# fixture: <spec-relative-path>` line — the corpus's way
 // to run a file against a PRE-BUILT database image instead of a fresh database, so a test can exercise
 // on-disk state SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded index — the
@@ -639,6 +669,16 @@ func runFile(text string) error {
 			// (spec/design/collation.md §2/§9/§10).
 			if name, _, ok := parseLoadCollationDirective(line); ok {
 				if err := loadCollation(name); err != nil {
+					return err
+				}
+				i++
+				continue
+			}
+			// `# load-timezone: [<zone>]` is an ACTION: load jed's pinned JTZ bundle into the
+			// engine-global set (and optionally assert a zone resolves) before the records that use
+			// AT TIME ZONE (timezones.md §11).
+			if name, ok := parseLoadTimezoneDirective(line); ok {
+				if err := loadTimezone(name); err != nil {
 					return err
 				}
 				i++

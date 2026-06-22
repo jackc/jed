@@ -45,7 +45,7 @@ fn bundle_matches_the_pinned_vectors() {
     let bytes = bundle_bytes();
     let parsed = open_bundle(&bytes).expect("open tzdata.jtz");
     let v: toml::Value = toml::from_str(&spec("tz/vectors/bundle.toml")).unwrap();
-    let b = &v["bundle"];
+    let b = &v["bundle"].as_array().expect("[[bundle]] array")[0];
 
     assert_eq!(parsed.tzdata_version, b["tzdata_version"].as_str().unwrap());
 
@@ -58,19 +58,16 @@ fn bundle_matches_the_pinned_vectors() {
     let got_zones: Vec<&str> = parsed.zones.iter().map(|(n, _)| n.as_str()).collect();
     assert_eq!(got_zones, want_zones, "zone manifest");
 
-    let want_links: Vec<(&str, &str)> = b["links"]
+    let want_links: Vec<String> = b["links"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|l| {
-            let a = l.as_array().unwrap();
-            (a[0].as_str().unwrap(), a[1].as_str().unwrap())
-        })
+        .map(|l| l.as_str().unwrap().to_string())
         .collect();
-    let got_links: Vec<(&str, &str)> = parsed
+    let got_links: Vec<String> = parsed
         .links
         .iter()
-        .map(|(a, t)| (a.as_str(), t.as_str()))
+        .map(|(a, t)| format!("{a}={t}"))
         .collect();
     assert_eq!(got_links, want_links, "link table");
 

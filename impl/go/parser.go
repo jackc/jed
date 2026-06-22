@@ -3082,7 +3082,7 @@ func (p *Parser) parseAdditive() (Expr, error) {
 
 func (p *Parser) parseMultiplicative() (Expr, error) {
 	base := p.depth
-	lhs, err := p.parseUnary()
+	lhs, err := p.parseAtTimeZone()
 	if err != nil {
 		return Expr{}, err
 	}
@@ -3103,12 +3103,45 @@ func (p *Parser) parseMultiplicative() (Expr, error) {
 			return Expr{}, err
 		}
 		p.advance()
-		rhs, err := p.parseUnary()
+		rhs, err := p.parseAtTimeZone()
 		if err != nil {
 			return Expr{}, err
 		}
 		lhs = binaryExpr(op, lhs, rhs)
 	}
+}
+
+// parseAtTimeZone parses the `AT TIME ZONE` rung (grammar.md §49, timezones.md §6): a
+// left-associative infix operator binding tighter than `* / %`, additive, and the comparisons, looser
+// than COLLATE / `::` / unary minus (PostgreSQL's %left AT). `value AT TIME ZONE zone` desugars to the
+// function call `timezone(zone, value)` — PostgreSQL's own implementation — so the resolver/evaluator/
+// cost have one path for the operator and the bare call. AT/TIME/ZONE are non-reserved (matched as a
+// three-token sequence), so a bare column named at/time/zone is unaffected.
+func (p *Parser) parseAtTimeZone() (Expr, error) {
+	base := p.depth
+	lhs, err := p.parseUnary()
+	if err != nil {
+		return Expr{}, err
+	}
+	for p.peekKeyword() == "at" && p.peekKeywordAt(1) == "time" && p.peekKeywordAt(2) == "zone" {
+		if err := p.deepen(); err != nil { // each chained AT TIME ZONE is one more AST level
+			return Expr{}, err
+		}
+		p.advance() // AT
+		p.advance() // TIME
+		p.advance() // ZONE
+		zone, err := p.parseUnary()
+		if err != nil {
+			return Expr{}, err
+		}
+		prev := lhs // capture before reassigning, so the &-of-value stays stable
+		lhs = Expr{Kind: ExprFuncCall, FuncCall: &FuncCallExpr{
+			Name: "timezone",
+			Args: []*Expr{&zone, &prev},
+		}}
+	}
+	p.depth = base
+	return lhs, nil
 }
 
 func (p *Parser) parseUnary() (Expr, error) {

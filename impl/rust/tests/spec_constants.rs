@@ -474,6 +474,7 @@ fn cost_schedule_matches_spec() {
             "sequence_advance" => COSTS.sequence_advance,
             "gin_entry" => COSTS.gin_entry,
             "collate" => COSTS.collate,
+            "timezone" => COSTS.timezone,
             other => panic!("cost unit {other} has no COSTS field — update this cross-check"),
         }
     };
