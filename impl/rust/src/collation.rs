@@ -833,8 +833,16 @@ pub fn save_bundle(b: &Bundle) -> Vec<u8> {
         .map(|s| {
             let (kind, name, raw) = match s {
                 Section::Property(p) => (0u8, String::new(), serialize_property(p)),
-                Section::Root(e) => (1u8, e.name.clone(), serialize_entries(&e.singles, &e.contractions)),
-                Section::Tailoring(e) => (2u8, e.name.clone(), serialize_entries(&e.singles, &e.contractions)),
+                Section::Root(e) => (
+                    1u8,
+                    e.name.clone(),
+                    serialize_entries(&e.singles, &e.contractions),
+                ),
+                Section::Tailoring(e) => (
+                    2u8,
+                    e.name.clone(),
+                    serialize_entries(&e.singles, &e.contractions),
+                ),
             };
             Packed {
                 kind,
@@ -856,8 +864,10 @@ pub fn save_bundle(b: &Bundle) -> Vec<u8> {
 
     // Manifest length is fixed once the names are known, so body offsets can be computed up front.
     // Per entry: kind(1) + name(2+len) + hash(4) + raw_len(4) + comp_len(4) + offset(4).
-    let manifest_len: usize =
-        2 + packed.iter().map(|p| 1 + 2 + p.name.len() + 4 + 4 + 4 + 4).sum::<usize>();
+    let manifest_len: usize = 2 + packed
+        .iter()
+        .map(|p| 1 + 2 + p.name.len() + 4 + 4 + 4 + 4)
+        .sum::<usize>();
     let body_start = header.len() + manifest_len;
 
     let mut manifest = Vec::with_capacity(manifest_len);
@@ -1040,7 +1050,10 @@ pub fn build_bundle(
 /// ascending by code point and contractions lexicographic by sequence — the §2 total order — making
 /// the result byte-identical to the fully-resolved `.coll` table.
 #[allow(clippy::type_complexity)]
-fn merge_onto_root(root: &Entries, delta: &Entries) -> (Vec<(u32, Vec<Ce>)>, Vec<(Vec<u32>, Vec<Ce>)>) {
+fn merge_onto_root(
+    root: &Entries,
+    delta: &Entries,
+) -> (Vec<(u32, Vec<Ce>)>, Vec<(Vec<u32>, Vec<Ce>)>) {
     use std::collections::BTreeMap;
     let mut singles: BTreeMap<u32, Vec<Ce>> = root.singles.iter().cloned().collect();
     for (cp, ces) in &delta.singles {
@@ -1050,7 +1063,10 @@ fn merge_onto_root(root: &Entries, delta: &Entries) -> (Vec<(u32, Vec<Ce>)>, Vec
     for (seq, ces) in &delta.contractions {
         contractions.insert(seq.clone(), ces.clone());
     }
-    (singles.into_iter().collect(), contractions.into_iter().collect())
+    (
+        singles.into_iter().collect(),
+        contractions.into_iter().collect(),
+    )
 }
 
 /// The sparse override (README §5): the `full` table's singles/contractions that the `root` lacks or
@@ -1164,7 +1180,11 @@ mod bundle_tests {
         let bytes = save_bundle(&bundle);
         let reopened = open_bundle(&bytes).expect("open_bundle");
         assert_eq!(reopened, bundle, "parsed bundle differs from the built one");
-        assert_eq!(save_bundle(&reopened), bytes, "bundle round-trip not byte-identical");
+        assert_eq!(
+            save_bundle(&reopened),
+            bytes,
+            "bundle round-trip not byte-identical"
+        );
 
         // Load -> the root is usable, and the tailoring merges back to the full `.coll` table.
         let (colls, property) = load_bundle(&bundle).expect("load_bundle");

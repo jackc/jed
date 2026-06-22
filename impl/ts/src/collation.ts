@@ -423,16 +423,22 @@ function pushU32(out: number[], v: number): void {
 
 // serializeTable serializes the compiled table (§2) — the bytes the content hash covers.
 export function serializeTable(coll: Collation): Uint8Array {
+  return serializeEntries(coll.singles, coll.contractions);
+}
+
+// serializeEntries writes the §2 table-entry bytes — shared by the .coll artifact (a full table)
+// and the JUCD bundle's root / tailoring sections (a full table or a sparse override, README §2/§5).
+function serializeEntries(singles: SingleEntry[], contractions: ContractionEntry[]): Uint8Array {
   const out: number[] = [];
   out.push(1); // layout_version
-  pushU32(out, coll.singles.length);
-  pushU32(out, coll.contractions.length);
-  for (const s of coll.singles) {
+  pushU32(out, singles.length);
+  pushU32(out, contractions.length);
+  for (const s of singles) {
     pushU32(out, s.cp);
     out.push(s.ces.length);
     for (const c of s.ces) pushCe(out, c);
   }
-  for (const c of coll.contractions) {
+  for (const c of contractions) {
     out.push(c.seq.length);
     for (const cp of c.seq) pushU32(out, cp);
     out.push(c.ces.length);
@@ -607,4 +613,364 @@ class Reader {
     const n = this.u16();
     return new TextDecoder().decode(this.take(n));
   }
+  // cps reads a u8-length-prefixed run of u32 code points (the JUCD property section, README §5).
+  cps(): number[] {
+    const n = this.u8();
+    const out: number[] = [];
+    for (let j = 0; j < n; j++) out.push(this.u32());
+    return out;
+  }
+}
+
+// ============================================================================================
+// The JUCD Unicode-data bundle (spec/collation/README.md §5) — the host-loaded container.
+// A manifest-indexed container of sections: the Unicode property/casing tables, the shared DUCET
+// root (a full §2 table, stored once, and itself a usable collation under its name), and per-locale
+// tailoring sections (sparse overrides merged onto the root at load — §5.1). Mirror of
+// impl/rust/src/collation.rs; byte-identical by construction (CLAUDE.md §8).
+// ============================================================================================
+
+// A simple 1:1 case mapping (a field equal to cp is the identity mapping).
+export interface SimpleCase {
+  cp: number;
+  upper: number;
+  lower: number;
+  title: number;
+}
+
+// A full (multi-code-point) case mapping (README §5). Conditional/locale context is reserved.
+export interface SpecialCasing {
+  cp: number;
+  upper: number[];
+  lower: number[];
+  title: number[];
+}
+
+// The Unicode property/casing data (README §5). First cut: case mappings only (normalization is a
+// reserved later sub-table). simple is ascending by code point; special likewise.
+export interface PropertyTable {
+  simple: SimpleCase[];
+  special: SpecialCasing[];
+}
+
+// A §2 table — a full table for a root, a sparse override for a tailoring — plus the collation name
+// the manifest records.
+interface BundleEntries {
+  name: string;
+  singles: SingleEntry[];
+  contractions: ContractionEntry[];
+}
+
+// One bundle section: the property tables (kind 0), the shared root (kind 1), or a per-locale
+// override (kind 2).
+export type Section =
+  | { kind: 0; property: PropertyTable }
+  | { kind: 1; entries: BundleEntries }
+  | { kind: 2; entries: BundleEntries };
+
+// A parsed JUCD bundle (README §5): the shared header version axis + its sections.
+export interface Bundle {
+  unicodeVersion: string;
+  cldrVersion: string;
+  description: string;
+  sections: Section[];
+}
+
+// saveBundle serializes a JUCD bundle (README §5): header, manifest (a TOC with per-section
+// offsets), the LZ4-compressed section bodies, and a trailing CRC-32 over everything before it.
+export function saveBundle(b: Bundle): Uint8Array {
+  interface Packed {
+    kind: number;
+    name: string;
+    hash: number;
+    rawLen: number;
+    comp: Uint8Array;
+  }
+  const packed: Packed[] = b.sections.map((s) => {
+    let kind: number;
+    let name: string;
+    let raw: Uint8Array;
+    if (s.kind === 0) {
+      kind = 0;
+      name = "";
+      raw = serializeProperty(s.property);
+    } else {
+      kind = s.kind;
+      name = s.entries.name;
+      raw = serializeEntries(s.entries.singles, s.entries.contractions);
+    }
+    return { kind, name, hash: crc32Ieee(raw), rawLen: raw.length, comp: lz4Compress(raw) };
+  });
+
+  const header: number[] = [];
+  header.push(0x4a, 0x55, 0x43, 0x44, 0x00, 0x00); // "JUCD\0\0" magic
+  pushU16(header, 1); // format_version
+  pushStr(header, b.unicodeVersion);
+  pushStr(header, b.cldrVersion);
+  pushStr(header, b.description);
+
+  // Manifest length is fixed once the names are known (per entry: kind 1 + name 2+len + hash 4 +
+  // raw_len 4 + comp_len 4 + offset 4), so the body offsets can be computed up front.
+  let manifestLen = 2;
+  for (const p of packed) manifestLen += 1 + 2 + UTF8.encode(p.name).length + 4 + 4 + 4 + 4;
+  const bodyStart = header.length + manifestLen;
+
+  const manifest: number[] = [];
+  pushU16(manifest, packed.length);
+  let off = bodyStart;
+  for (const p of packed) {
+    manifest.push(p.kind);
+    pushStr(manifest, p.name);
+    pushU32(manifest, p.hash);
+    pushU32(manifest, p.rawLen);
+    pushU32(manifest, p.comp.length);
+    pushU32(manifest, off);
+    off += p.comp.length;
+  }
+
+  const out: number[] = [...header, ...manifest];
+  for (const p of packed) for (const x of p.comp) out.push(x);
+  const crc = crc32Ieee(Uint8Array.from(out));
+  pushU32(out, crc);
+  return Uint8Array.from(out);
+}
+
+// openBundle reads a JUCD bundle (README §5). Verifies the trailing CRC, the magic, the format
+// version, and each section's content hash; a malformed bundle is XX001 (data_corrupted).
+export function openBundle(data: Uint8Array): Bundle {
+  if (data.length < 4) throw corruptErr("bundle: truncated");
+  const body = data.subarray(0, data.length - 4);
+  const want =
+    ((data[data.length - 4] << 24) |
+      (data[data.length - 3] << 16) |
+      (data[data.length - 2] << 8) |
+      data[data.length - 1]) >>>
+    0;
+  if (crc32Ieee(body) !== want) throw corruptErr("bundle: trailer checksum mismatch");
+
+  const r = new Reader(data);
+  const magic = r.take(6);
+  if (
+    !(
+      magic[0] === 0x4a &&
+      magic[1] === 0x55 &&
+      magic[2] === 0x43 &&
+      magic[3] === 0x44 &&
+      magic[4] === 0x00 &&
+      magic[5] === 0x00
+    )
+  ) {
+    throw corruptErr("bundle: bad magic");
+  }
+  const fmt = r.u16();
+  if (fmt !== 1) throw corruptErr(`bundle: unsupported format_version ${fmt}`);
+  const unicodeVersion = r.str();
+  const cldrVersion = r.str();
+  const description = r.str();
+  const count = r.u16();
+
+  interface M {
+    kind: number;
+    name: string;
+    hash: number;
+    rawLen: number;
+    compLen: number;
+    offset: number;
+  }
+  const ms: M[] = [];
+  for (let i = 0; i < count; i++) {
+    // Object property values are evaluated in source order, so the reads stay in byte order.
+    ms.push({
+      kind: r.u8(),
+      name: r.str(),
+      hash: r.u32(),
+      rawLen: r.u32(),
+      compLen: r.u32(),
+      offset: r.u32(),
+    });
+  }
+
+  const sections: Section[] = [];
+  for (const m of ms) {
+    if (m.offset > body.length || m.offset + m.compLen > body.length) {
+      throw corruptErr("bundle: section body out of range");
+    }
+    const raw = lz4Decompress(data.subarray(m.offset, m.offset + m.compLen), m.rawLen);
+    if (crc32Ieee(raw) !== m.hash) throw corruptErr("bundle: section content hash mismatch");
+    if (m.kind === 0) {
+      sections.push({ kind: 0, property: deserializeProperty(raw) });
+    } else if (m.kind === 1 || m.kind === 2) {
+      const [singles, contractions] = deserializeTable(raw);
+      sections.push({ kind: m.kind, entries: { name: m.name, singles, contractions } });
+    } else {
+      throw corruptErr(`bundle: unknown section kind ${m.kind}`);
+    }
+  }
+  return { unicodeVersion, cldrVersion, description, sections };
+}
+
+// loadBundle loads a bundle (README §5.1): the root section is a usable collation; each tailoring is
+// merged onto the root (byte-identical to its fully-resolved .coll table). Every collation takes the
+// bundle header's (unicode, cldr) version + description.
+export function loadBundle(b: Bundle): {
+  collations: Collation[];
+  property: PropertyTable | undefined;
+} {
+  let root: BundleEntries | undefined;
+  for (const s of b.sections) {
+    if (s.kind === 1) {
+      root = s.entries;
+      break;
+    }
+  }
+  const mk = (
+    name: string,
+    singles: SingleEntry[],
+    contractions: ContractionEntry[],
+  ): Collation => ({
+    name,
+    unicodeVersion: b.unicodeVersion,
+    cldrVersion: b.cldrVersion,
+    description: b.description,
+    singles,
+    contractions,
+  });
+  const collations: Collation[] = [];
+  let property: PropertyTable | undefined;
+  if (root) collations.push(mk(root.name, root.singles, root.contractions));
+  for (const s of b.sections) {
+    if (s.kind === 0) {
+      property = s.property;
+    } else if (s.kind === 2) {
+      if (!root) throw corruptErr("bundle: tailoring without a root section");
+      const [singles, contractions] = mergeOntoRoot(root, s.entries);
+      collations.push(mk(s.entries.name, singles, contractions));
+    }
+  }
+  return { collations, property };
+}
+
+// buildBundle builds a JUCD bundle (README §5) from a root collation, per-locale tailorings (each
+// diffed against the root into a sparse override), and an optional property table — the builder
+// tool's core. The header (unicode, cldr) version is the root's.
+export function buildBundle(
+  root: Collation,
+  tailorings: Collation[],
+  property: PropertyTable | undefined,
+  description: string,
+): Bundle {
+  const sections: Section[] = [];
+  if (property) sections.push({ kind: 0, property });
+  sections.push({
+    kind: 1,
+    entries: { name: root.name, singles: root.singles, contractions: root.contractions },
+  });
+  for (const t of tailorings) {
+    const [singles, contractions] = diffAgainstRoot(t, root);
+    sections.push({ kind: 2, entries: { name: t.name, singles, contractions } });
+  }
+  return {
+    unicodeVersion: root.unicodeVersion,
+    cldrVersion: root.cldrVersion,
+    description,
+    sections,
+  };
+}
+
+// mergeOntoRoot merges a tailoring's sparse override onto the root table (README §5.1): start from
+// the root maps, replace-or-add each override by key, re-sort (ascending by code point / lexicographic
+// by sequence — the §2 total order), so the result is byte-identical to the full .coll table.
+function mergeOntoRoot(
+  root: BundleEntries,
+  delta: BundleEntries,
+): [SingleEntry[], ContractionEntry[]] {
+  const singleByCp = new Map<number, Ce[]>();
+  for (const s of root.singles) singleByCp.set(s.cp, s.ces);
+  for (const s of delta.singles) singleByCp.set(s.cp, s.ces);
+  const singles: SingleEntry[] = [...singleByCp.entries()].map(([cp, ces]) => ({ cp, ces }));
+  singles.sort((a, b) => a.cp - b.cp);
+
+  const contrByKey = new Map<string, ContractionEntry>();
+  for (const c of root.contractions) contrByKey.set(seqKey(c.seq), c);
+  for (const c of delta.contractions) contrByKey.set(seqKey(c.seq), c);
+  const contractions = [...contrByKey.values()];
+  contractions.sort((a, b) => compareSeq(a.seq, b.seq));
+  return [singles, contractions];
+}
+
+// diffAgainstRoot is the sparse override (README §5): the full table's singles/contractions that the
+// root lacks or maps differently. The current LDML subset only adds or replaces (no removals), so
+// applying this back onto the root reproduces the full table (§5.1).
+function diffAgainstRoot(full: Collation, root: Collation): [SingleEntry[], ContractionEntry[]] {
+  const rootSingles = new Map<number, Ce[]>();
+  for (const s of root.singles) rootSingles.set(s.cp, s.ces);
+  const singles = full.singles.filter((s) => {
+    const rc = rootSingles.get(s.cp);
+    return rc === undefined || !equalCes(rc, s.ces);
+  });
+  const rootContr = new Map<string, Ce[]>();
+  for (const c of root.contractions) rootContr.set(seqKey(c.seq), c.ces);
+  const contractions = full.contractions.filter((c) => {
+    const rc = rootContr.get(seqKey(c.seq));
+    return rc === undefined || !equalCes(rc, c.ces);
+  });
+  return [singles, contractions];
+}
+
+function equalCes(a: Ce[], b: Ce[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i++) {
+    const x = a[i];
+    const y = b[i];
+    if (x.flags !== y.flags || x.l1 !== y.l1 || x.l2 !== y.l2 || x.l3 !== y.l3) return false;
+  }
+  return true;
+}
+
+function compareSeq(a: number[], b: number[]): number {
+  const n = Math.min(a.length, b.length);
+  for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i] - b[i];
+  return a.length - b.length;
+}
+
+function serializeProperty(p: PropertyTable): Uint8Array {
+  const out: number[] = [1]; // layout_version
+  pushU32(out, p.simple.length);
+  for (const s of p.simple) {
+    pushU32(out, s.cp);
+    pushU32(out, s.upper);
+    pushU32(out, s.lower);
+    pushU32(out, s.title);
+  }
+  pushU32(out, p.special.length);
+  for (const sc of p.special) {
+    pushU32(out, sc.cp);
+    pushCps(out, sc.upper);
+    pushCps(out, sc.lower);
+    pushCps(out, sc.title);
+  }
+  return Uint8Array.from(out);
+}
+
+function pushCps(out: number[], cps: number[]): void {
+  out.push(cps.length);
+  for (const cp of cps) pushU32(out, cp);
+}
+
+function deserializeProperty(raw: Uint8Array): PropertyTable {
+  const r = new Reader(raw);
+  const layout = r.u8();
+  if (layout !== 1) throw corruptErr(`bundle: unsupported property layout_version ${layout}`);
+  const numSimple = r.u32();
+  const simple: SimpleCase[] = [];
+  for (let n = 0; n < numSimple; n++) {
+    simple.push({ cp: r.u32(), upper: r.u32(), lower: r.u32(), title: r.u32() });
+  }
+  const numSpecial = r.u32();
+  const special: SpecialCasing[] = [];
+  for (let n = 0; n < numSpecial; n++) {
+    special.push({ cp: r.u32(), upper: r.cps(), lower: r.cps(), title: r.cps() });
+  }
+  if (r.pos !== raw.length) throw corruptErr("bundle: trailing bytes after property table");
+  return { simple, special };
 }

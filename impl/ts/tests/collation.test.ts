@@ -7,8 +7,12 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import {
+  buildBundle,
   compileCollation,
+  loadBundle,
+  openBundle,
   openCollation,
+  saveBundle,
   saveCollation,
   serializeTable,
   sortKey,
@@ -77,6 +81,47 @@ test("collation sort keys match vectors and are strictly ascending", () => {
       );
     }
     prev = key;
+  }
+});
+
+test("collation JUCD bundle vectors round-trip and merge", () => {
+  const rows = readTomlTables(specPath("collation/vectors/bundle.toml"), "bundle");
+  assert.ok(rows.length > 0, "no bundle vectors");
+  for (const row of rows) {
+    const rootName = row.str("root_name");
+    const root = compileCollation(rootName, definition(row.strs("root_def_files")));
+    // Flat layout: tailoring_def_files[i] is the i-th tailoring's files joined by '|'.
+    const names = row.strs("tailoring_names");
+    const defs = row.strs("tailoring_def_files");
+    assert.equal(names.length, defs.length, "tailoring_names/def_files length mismatch");
+    const tailorings = names.map((n, i) => compileCollation(n, definition(defs[i].split("|"))));
+
+    const bundle = buildBundle(root, tailorings, undefined, row.str("description"));
+    const enc = saveBundle(bundle);
+    const want = row.str("bundle_hex");
+    assert.equal(bytesToHex(enc), want, "bundle bytes");
+
+    const reopened = openBundle(enc);
+    assert.equal(bytesToHex(saveBundle(reopened)), want, "bundle open→save round-trip");
+
+    const { collations } = loadBundle(reopened);
+    const find = (name: string) => {
+      const c = collations.find((x) => x.name === name);
+      assert.ok(c, `loaded bundle missing collation ${name}`);
+      return c!;
+    };
+    assert.equal(
+      bytesToHex(serializeTable(find(rootName))),
+      bytesToHex(serializeTable(root)),
+      "root table changed through the bundle",
+    );
+    for (const t of tailorings) {
+      assert.equal(
+        bytesToHex(serializeTable(find(t.name))),
+        bytesToHex(serializeTable(t)),
+        `merge identity for ${t.name}`,
+      );
+    }
   }
 });
 

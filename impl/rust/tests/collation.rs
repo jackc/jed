@@ -113,19 +113,26 @@ fn bundle_vectors_round_trip_and_merge() {
     for b in bundles {
         // Rebuild the bundle from def_files (build_bundle: shared root + per-locale deltas).
         let root_name = b["root_name"].as_str().unwrap();
-        let root =
-            compile_collation(root_name, &definition(b["root_def_files"].as_array().unwrap()))
-                .unwrap();
-        let tailorings: Vec<Collation> = b["tailoring"]
-            .as_array()
-            .expect("tailoring array")
+        let root = compile_collation(
+            root_name,
+            &definition(b["root_def_files"].as_array().unwrap()),
+        )
+        .unwrap();
+        // Flat layout: tailoring_def_files[i] is the i-th tailoring's files joined by '|'.
+        let names = b["tailoring_names"].as_array().unwrap();
+        let defs = b["tailoring_def_files"].as_array().unwrap();
+        let tailorings: Vec<Collation> = names
             .iter()
-            .map(|t| {
-                compile_collation(
-                    t["name"].as_str().unwrap(),
-                    &definition(t["def_files"].as_array().unwrap()),
-                )
-                .unwrap()
+            .zip(defs)
+            .map(|(n, d)| {
+                let def = d
+                    .as_str()
+                    .unwrap()
+                    .split('|')
+                    .map(spec)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                compile_collation(n.as_str().unwrap(), &def).unwrap()
             })
             .collect();
         let refs: Vec<&Collation> = tailorings.iter().collect();

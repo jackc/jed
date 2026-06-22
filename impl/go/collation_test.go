@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"os"
 	"reflect"
+	"strings"
 	"testing"
 )
 
@@ -104,6 +105,71 @@ func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
 			t.Errorf("%s: %q must sort strictly after the previous entry", collName, s)
 		}
 		prev = key
+	}
+}
+
+func TestCollationBundleVectorsRoundTripAndMerge(t *testing.T) {
+	rows := readTomlTables(t, specPath(t, "collation/vectors/bundle.toml"), "bundle")
+	if len(rows) == 0 {
+		t.Fatal("no bundle vectors")
+	}
+	for _, row := range rows {
+		rootName := row.str("root_name")
+		root, err := CompileCollation(rootName, collDefinition(t, row.strs("root_def_files")))
+		if err != nil {
+			t.Fatalf("%s: compile root: %v", rootName, err)
+		}
+		// Flat layout: tailoring_def_files[i] is the i-th tailoring's files joined by '|'.
+		names := row.strs("tailoring_names")
+		defs := row.strs("tailoring_def_files")
+		if len(names) != len(defs) {
+			t.Fatalf("tailoring_names/tailoring_def_files length mismatch")
+		}
+		tailorings := make([]*Collation, len(names))
+		for i, n := range names {
+			c, err := CompileCollation(n, collDefinition(t, strings.Split(defs[i], "|")))
+			if err != nil {
+				t.Fatalf("%s: compile tailoring: %v", n, err)
+			}
+			tailorings[i] = c
+		}
+
+		bundle := BuildBundle(root, tailorings, nil, row.str("description"))
+		enc := SaveBundle(bundle)
+		want := row.str("bundle_hex")
+		if got := hex.EncodeToString(enc); got != want {
+			t.Errorf("bundle bytes\n got %s\nwant %s", got, want)
+		}
+
+		reopened, err := OpenBundle(enc)
+		if err != nil {
+			t.Fatalf("open bundle: %v", err)
+		}
+		if got := hex.EncodeToString(SaveBundle(reopened)); got != want {
+			t.Errorf("bundle open→save round-trip mismatch")
+		}
+
+		colls, _, err := LoadBundle(reopened)
+		if err != nil {
+			t.Fatalf("load bundle: %v", err)
+		}
+		find := func(name string) *Collation {
+			for _, c := range colls {
+				if c.Name == name {
+					return c
+				}
+			}
+			t.Fatalf("loaded bundle missing collation %q", name)
+			return nil
+		}
+		if !bytes.Equal(SerializeTable(find(rootName)), SerializeTable(root)) {
+			t.Errorf("root table changed through the bundle")
+		}
+		for _, tl := range tailorings {
+			if !bytes.Equal(SerializeTable(find(tl.Name)), SerializeTable(tl)) {
+				t.Errorf("merge identity failed for %s", tl.Name)
+			}
+		}
 	}
 }
 

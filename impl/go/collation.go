@@ -549,18 +549,24 @@ func equalSeq(a, b []uint32) bool {
 
 // SerializeTable serializes the compiled table (§2) — the bytes the content hash covers.
 func SerializeTable(coll *Collation) []byte {
+	return serializeEntries(coll.Singles, coll.Contractions)
+}
+
+// serializeEntries writes the §2 table-entry bytes — shared by the .coll artifact (a full table)
+// and the JUCD bundle's root / tailoring sections (a full table or a sparse override, README §2/§5).
+func serializeEntries(singles []singleEntry, contractions []contractionEntry) []byte {
 	var out []byte
 	out = append(out, 1) // layout_version
-	out = appendU32(out, uint32(len(coll.Singles)))
-	out = appendU32(out, uint32(len(coll.Contractions)))
-	for _, s := range coll.Singles {
+	out = appendU32(out, uint32(len(singles)))
+	out = appendU32(out, uint32(len(contractions)))
+	for _, s := range singles {
 		out = appendU32(out, s.cp)
 		out = append(out, byte(len(s.ces)))
 		for _, c := range s.ces {
 			out = pushCe(out, c)
 		}
 	}
-	for _, c := range coll.Contractions {
+	for _, c := range contractions {
 		out = append(out, byte(len(c.seq)))
 		for _, cp := range c.seq {
 			out = appendU32(out, cp)
@@ -881,6 +887,23 @@ func (r *reader) str() (string, error) {
 	return string(s), nil
 }
 
+// cps reads a u8-length-prefixed run of u32 code points (the JUCD property section, README §5).
+func (r *reader) cps() ([]uint32, error) {
+	n, err := r.u8()
+	if err != nil {
+		return nil, err
+	}
+	cps := make([]uint32, 0, n)
+	for j := byte(0); j < n; j++ {
+		cp, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		cps = append(cps, cp)
+	}
+	return cps, nil
+}
+
 // --- sorting (insertion sort; the dev tables are tiny — a real index/lookup is a follow-on) ---
 
 func sortSingles(s []singleEntry) {
@@ -906,4 +929,452 @@ func seqLess(a, b []uint32) bool {
 		}
 	}
 	return len(a) < len(b)
+}
+
+// ============================================================================================
+// The JUCD Unicode-data bundle (spec/collation/README.md §5) — the host-loaded container.
+// A manifest-indexed container of sections: the Unicode property/casing tables, the shared DUCET
+// root (a full §2 table, stored once, and itself a usable collation under its name), and per-locale
+// tailoring sections (sparse overrides merged onto the root at load — §5.1). Mirror of
+// impl/rust/src/collation.rs; byte-identical by construction (CLAUDE.md §8).
+// ============================================================================================
+
+// SimpleCase is a simple 1:1 case mapping (a field equal to Cp is the identity mapping).
+type SimpleCase struct{ Cp, Upper, Lower, Title uint32 }
+
+// SpecialCasing is a full (multi-code-point) case mapping (README §5). Conditional/locale context
+// is reserved.
+type SpecialCasing struct {
+	Cp    uint32
+	Upper []uint32
+	Lower []uint32
+	Title []uint32
+}
+
+// PropertyTable is the Unicode property/casing data (README §5). First cut: case mappings only
+// (normalization is a reserved later sub-table). Simple is ascending by code point; Special likewise.
+type PropertyTable struct {
+	Simple  []SimpleCase
+	Special []SpecialCasing
+}
+
+// bundleEntries is a §2 table — a full table for a root, a sparse override for a tailoring — plus
+// the collation name the manifest records.
+type bundleEntries struct {
+	name         string
+	singles      []singleEntry
+	contractions []contractionEntry
+}
+
+const (
+	sectionProperty  byte = 0
+	sectionRoot      byte = 1
+	sectionTailoring byte = 2
+)
+
+// Section is one bundle section: the property tables (Kind 0), the shared root (Kind 1), or a
+// per-locale override (Kind 2). Exactly one of Property / Entries is set, per Kind.
+type Section struct {
+	Kind     byte
+	Property *PropertyTable
+	Entries  *bundleEntries
+}
+
+// Bundle is a parsed JUCD bundle (README §5): the shared header version axis + its sections.
+type Bundle struct {
+	UnicodeVersion string
+	CldrVersion    string
+	Description    string
+	Sections       []Section
+}
+
+var bundleMagic = []byte{'J', 'U', 'C', 'D', 0, 0}
+
+// SaveBundle serializes a JUCD bundle (README §5): header, manifest (a TOC with per-section
+// offsets), the LZ4-compressed section bodies, and a trailing CRC-32 over everything before it.
+func SaveBundle(b *Bundle) []byte {
+	type packed struct {
+		kind   byte
+		name   string
+		hash   uint32
+		rawLen uint32
+		comp   []byte
+	}
+	ps := make([]packed, 0, len(b.Sections))
+	for _, s := range b.Sections {
+		var kind byte
+		var name string
+		var raw []byte
+		switch s.Kind {
+		case sectionProperty:
+			kind, name, raw = sectionProperty, "", serializeProperty(s.Property)
+		case sectionRoot:
+			kind, name, raw = sectionRoot, s.Entries.name, serializeEntries(s.Entries.singles, s.Entries.contractions)
+		case sectionTailoring:
+			kind, name, raw = sectionTailoring, s.Entries.name, serializeEntries(s.Entries.singles, s.Entries.contractions)
+		}
+		ps = append(ps, packed{kind, name, crc32IEEE(raw), uint32(len(raw)), lz4Compress(raw)})
+	}
+
+	var header []byte
+	header = append(header, bundleMagic...)
+	header = appendU16(header, 1) // format_version
+	header = pushStr(header, b.UnicodeVersion)
+	header = pushStr(header, b.CldrVersion)
+	header = pushStr(header, b.Description)
+
+	// Manifest length is fixed once the names are known (per entry: kind 1 + name 2+len + hash 4 +
+	// raw_len 4 + comp_len 4 + offset 4), so the body offsets can be computed up front.
+	manifestLen := 2
+	for _, p := range ps {
+		manifestLen += 1 + 2 + len(p.name) + 4 + 4 + 4 + 4
+	}
+	bodyStart := len(header) + manifestLen
+
+	manifest := make([]byte, 0, manifestLen)
+	manifest = appendU16(manifest, uint16(len(ps)))
+	off := bodyStart
+	for _, p := range ps {
+		manifest = append(manifest, p.kind)
+		manifest = pushStr(manifest, p.name)
+		manifest = appendU32(manifest, p.hash)
+		manifest = appendU32(manifest, p.rawLen)
+		manifest = appendU32(manifest, uint32(len(p.comp)))
+		manifest = appendU32(manifest, uint32(off))
+		off += len(p.comp)
+	}
+
+	out := append(header, manifest...)
+	for _, p := range ps {
+		out = append(out, p.comp...)
+	}
+	out = appendU32(out, crc32IEEE(out))
+	return out
+}
+
+// OpenBundle reads a JUCD bundle (README §5). Verifies the trailing CRC, the magic, the format
+// version, and each section's content hash; a malformed bundle is XX001 (data_corrupted).
+func OpenBundle(data []byte) (*Bundle, error) {
+	if len(data) < 4 {
+		return nil, corruptErr("bundle: truncated")
+	}
+	body := data[:len(data)-4]
+	want := uint32(data[len(data)-4])<<24 | uint32(data[len(data)-3])<<16 | uint32(data[len(data)-2])<<8 | uint32(data[len(data)-1])
+	if crc32IEEE(body) != want {
+		return nil, corruptErr("bundle: trailer checksum mismatch")
+	}
+
+	r := &reader{b: data}
+	magic, err := r.take(6)
+	if err != nil {
+		return nil, err
+	}
+	if string(magic) != "JUCD\x00\x00" {
+		return nil, corruptErr("bundle: bad magic")
+	}
+	fmtVer, err := r.u16()
+	if err != nil {
+		return nil, err
+	}
+	if fmtVer != 1 {
+		return nil, corruptErr("bundle: unsupported format_version %d", fmtVer)
+	}
+	uv, err := r.str()
+	if err != nil {
+		return nil, err
+	}
+	cldr, err := r.str()
+	if err != nil {
+		return nil, err
+	}
+	desc, err := r.str()
+	if err != nil {
+		return nil, err
+	}
+	count, err := r.u16()
+	if err != nil {
+		return nil, err
+	}
+
+	type entry struct {
+		kind                    byte
+		name                    string
+		hash                    uint32
+		rawLen, compLen, offset int
+	}
+	es := make([]entry, 0, count)
+	for i := uint16(0); i < count; i++ {
+		kind, err := r.u8()
+		if err != nil {
+			return nil, err
+		}
+		name, err := r.str()
+		if err != nil {
+			return nil, err
+		}
+		hash, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		rawLen, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		compLen, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		offset, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		es = append(es, entry{kind, name, hash, int(rawLen), int(compLen), int(offset)})
+	}
+
+	sections := make([]Section, 0, count)
+	for _, e := range es {
+		if e.offset > len(body) || e.offset+e.compLen > len(body) {
+			return nil, corruptErr("bundle: section body out of range")
+		}
+		raw, err := lz4Decompress(data[e.offset:e.offset+e.compLen], e.rawLen)
+		if err != nil {
+			return nil, err
+		}
+		if crc32IEEE(raw) != e.hash {
+			return nil, corruptErr("bundle: section content hash mismatch")
+		}
+		switch e.kind {
+		case sectionProperty:
+			p, err := deserializeProperty(raw)
+			if err != nil {
+				return nil, err
+			}
+			sections = append(sections, Section{Kind: sectionProperty, Property: p})
+		case sectionRoot, sectionTailoring:
+			singles, contractions, err := deserializeTable(raw)
+			if err != nil {
+				return nil, err
+			}
+			sections = append(sections, Section{Kind: e.kind, Entries: &bundleEntries{e.name, singles, contractions}})
+		default:
+			return nil, corruptErr("bundle: unknown section kind %d", e.kind)
+		}
+	}
+	return &Bundle{uv, cldr, desc, sections}, nil
+}
+
+// LoadBundle loads a bundle (README §5.1): the root section is a usable collation; each tailoring is
+// merged onto the root (byte-identical to its fully-resolved .coll table). Every collation takes the
+// bundle header's (unicode, cldr) version + description. Returns the collations and the optional
+// property table.
+func LoadBundle(b *Bundle) ([]*Collation, *PropertyTable, error) {
+	var root *bundleEntries
+	for i := range b.Sections {
+		if b.Sections[i].Kind == sectionRoot {
+			root = b.Sections[i].Entries
+			break
+		}
+	}
+	mk := func(name string, singles []singleEntry, contractions []contractionEntry) *Collation {
+		return &Collation{
+			Name: name, UnicodeVersion: b.UnicodeVersion, CldrVersion: b.CldrVersion,
+			Description: b.Description, Singles: singles, Contractions: contractions,
+		}
+	}
+	var colls []*Collation
+	var property *PropertyTable
+	if root != nil {
+		colls = append(colls, mk(root.name, root.singles, root.contractions))
+	}
+	for i := range b.Sections {
+		s := &b.Sections[i]
+		switch s.Kind {
+		case sectionProperty:
+			property = s.Property
+		case sectionTailoring:
+			if root == nil {
+				return nil, nil, corruptErr("bundle: tailoring without a root section")
+			}
+			singles, contractions := mergeOntoRoot(root, s.Entries)
+			colls = append(colls, mk(s.Entries.name, singles, contractions))
+		}
+	}
+	return colls, property, nil
+}
+
+// BuildBundle builds a JUCD bundle (README §5) from a root collation, per-locale tailorings (each
+// diffed against the root into a sparse override), and an optional property table — the builder
+// tool's core. The header (unicode, cldr) version is the root's.
+func BuildBundle(root *Collation, tailorings []*Collation, property *PropertyTable, description string) *Bundle {
+	var sections []Section
+	if property != nil {
+		sections = append(sections, Section{Kind: sectionProperty, Property: property})
+	}
+	sections = append(sections, Section{Kind: sectionRoot, Entries: &bundleEntries{root.Name, root.Singles, root.Contractions}})
+	for _, t := range tailorings {
+		singles, contractions := diffAgainstRoot(t, root)
+		sections = append(sections, Section{Kind: sectionTailoring, Entries: &bundleEntries{t.Name, singles, contractions}})
+	}
+	return &Bundle{root.UnicodeVersion, root.CldrVersion, description, sections}
+}
+
+// mergeOntoRoot merges a tailoring's sparse override onto the root table (README §5.1): start from
+// the root maps, replace-or-add each override by key, re-sort (ascending by code point / lexicographic
+// by sequence — the §2 total order), so the result is byte-identical to the full .coll table.
+func mergeOntoRoot(root, delta *bundleEntries) ([]singleEntry, []contractionEntry) {
+	singleByCp := make(map[uint32][]Ce, len(root.singles)+len(delta.singles))
+	for _, s := range root.singles {
+		singleByCp[s.cp] = s.ces
+	}
+	for _, s := range delta.singles {
+		singleByCp[s.cp] = s.ces
+	}
+	singles := make([]singleEntry, 0, len(singleByCp))
+	for cp, ces := range singleByCp {
+		singles = append(singles, singleEntry{cp, ces})
+	}
+	sort.Slice(singles, func(i, j int) bool { return singles[i].cp < singles[j].cp })
+
+	contrByKey := make(map[string]contractionEntry, len(root.contractions)+len(delta.contractions))
+	for _, c := range root.contractions {
+		contrByKey[seqKey(c.seq)] = c
+	}
+	for _, c := range delta.contractions {
+		contrByKey[seqKey(c.seq)] = c
+	}
+	contractions := make([]contractionEntry, 0, len(contrByKey))
+	for _, c := range contrByKey {
+		contractions = append(contractions, c)
+	}
+	sort.Slice(contractions, func(i, j int) bool { return seqLess(contractions[i].seq, contractions[j].seq) })
+	return singles, contractions
+}
+
+// diffAgainstRoot is the sparse override (README §5): the full table's singles/contractions that the
+// root lacks or maps differently. The current LDML subset only adds or replaces (no removals), so
+// applying this back onto the root reproduces the full table (§5.1).
+func diffAgainstRoot(full, root *Collation) ([]singleEntry, []contractionEntry) {
+	rootSingles := make(map[uint32][]Ce, len(root.Singles))
+	for _, s := range root.Singles {
+		rootSingles[s.cp] = s.ces
+	}
+	var singles []singleEntry
+	for _, s := range full.Singles {
+		if rc, ok := rootSingles[s.cp]; !ok || !equalCes(rc, s.ces) {
+			singles = append(singles, s)
+		}
+	}
+	rootContr := make(map[string][]Ce, len(root.Contractions))
+	for _, c := range root.Contractions {
+		rootContr[seqKey(c.seq)] = c.ces
+	}
+	var contractions []contractionEntry
+	for _, c := range full.Contractions {
+		if rc, ok := rootContr[seqKey(c.seq)]; !ok || !equalCes(rc, c.ces) {
+			contractions = append(contractions, c)
+		}
+	}
+	return singles, contractions
+}
+
+func equalCes(a, b []Ce) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func serializeProperty(p *PropertyTable) []byte {
+	out := []byte{1} // layout_version
+	out = appendU32(out, uint32(len(p.Simple)))
+	for _, s := range p.Simple {
+		out = appendU32(out, s.Cp)
+		out = appendU32(out, s.Upper)
+		out = appendU32(out, s.Lower)
+		out = appendU32(out, s.Title)
+	}
+	out = appendU32(out, uint32(len(p.Special)))
+	for _, sc := range p.Special {
+		out = appendU32(out, sc.Cp)
+		out = pushCps(out, sc.Upper)
+		out = pushCps(out, sc.Lower)
+		out = pushCps(out, sc.Title)
+	}
+	return out
+}
+
+func pushCps(out []byte, cps []uint32) []byte {
+	out = append(out, byte(len(cps)))
+	for _, cp := range cps {
+		out = appendU32(out, cp)
+	}
+	return out
+}
+
+func deserializeProperty(raw []byte) (*PropertyTable, error) {
+	r := &reader{b: raw}
+	layout, err := r.u8()
+	if err != nil {
+		return nil, err
+	}
+	if layout != 1 {
+		return nil, corruptErr("bundle: unsupported property layout_version %d", layout)
+	}
+	numSimple, err := r.u32()
+	if err != nil {
+		return nil, err
+	}
+	var simple []SimpleCase
+	for n := uint32(0); n < numSimple; n++ {
+		cp, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		up, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		lo, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		ti, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		simple = append(simple, SimpleCase{cp, up, lo, ti})
+	}
+	numSpecial, err := r.u32()
+	if err != nil {
+		return nil, err
+	}
+	var special []SpecialCasing
+	for n := uint32(0); n < numSpecial; n++ {
+		cp, err := r.u32()
+		if err != nil {
+			return nil, err
+		}
+		up, err := r.cps()
+		if err != nil {
+			return nil, err
+		}
+		lo, err := r.cps()
+		if err != nil {
+			return nil, err
+		}
+		ti, err := r.cps()
+		if err != nil {
+			return nil, err
+		}
+		special = append(special, SpecialCasing{cp, up, lo, ti})
+	}
+	if r.i != len(r.b) {
+		return nil, corruptErr("bundle: trailing bytes after property table")
+	}
+	return &PropertyTable{simple, special}, nil
 }
