@@ -1,0 +1,89 @@
+# Collated key pushdown — equality + range bounds over a NON-`C` collated PRIMARY KEY / secondary
+# index now push down to the B-tree (spec/design/collation.md §8, encoding.md §2.12). The slice-1e
+# narrowing that excluded a collated comparison from an index/PK bound is LIFTED: a collated key
+# stores the UCA sort key, whose `memcmp` order IS the collation order, so the probe is encoded as
+# the SAME sort key and seeks/ranges the tree exactly as a `C` key does (the query/point_lookup.test
+# mechanism, applied to a collated key). Two correctness guards, both exercised below:
+#   - the comparison's resolved collation must MATCH the key column's frozen collation — else its
+#     order disagrees with the stored keys; an explicit `COLLATE "C"` (byte order) over a `unicode`
+#     column does NOT push down (the contrast at the end);
+#   - a version-SKEWED collated index is NEVER seeked — it stays a full heap-scan that recomputes
+#     against the loaded table (the read-safety rule §12). That case is the sibling tripwire
+#     suites/collation/skew.test (skewed → full scan) / skew_full.test (Full → safe to seek).
+#
+# Engagement is pinned the cost way (the query/point_lookup.test model): a pushed-down query reads
+# only the rows in range, not the whole table. All units weigh 1, so for every record:
+#   cost = page_read (visited B-tree nodes) + storage_row_read (rows in range) + filter
+#          operator_evals (per scanned row) + row_produced + projection operator_evals,
+# and for an ORDERING comparison (`< <= > >=`) the residual filter ALSO charges
+# `collate × (codepoints(lhs) + codepoints(rhs))` per scanned row (collation.md §11); `=`/`<>`
+# charge no collate (deterministic-collation equality is byte-identity, §7). The drop is the
+# CROSS-CORE contract (Rust == Go == TS) — a full scan of each query would cost strictly more.
+#
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.point_lookup, expr.collate, ddl.collate_column, ddl.secondary_index, types.i32, types.text, resource.cost_metering
+
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+statement ok
+CREATE TABLE cp (name text COLLATE "unicode" PRIMARY KEY)
+
+statement ok
+INSERT INTO cp VALUES ('a'), ('A'), ('b'), ('z')
+
+# unicode order: a < A < b < z (lowercase before uppercase at the tertiary level; both before b).
+
+# Collated PK equality: `name = 'A'` seeks the single sort-key leaf entry and reads ONLY that row,
+# not all four. (`=` is byte-equality, so no collate is charged.) A full scan would cost more.
+# cost: 4
+query T nosort
+SELECT name FROM cp WHERE name = 'A'
+----
+A
+
+# Collated PK equality MISS: `name = 'q'` seeks the leaf to confirm absence but reads no row.
+# cost: 1
+query T nosort
+SELECT name FROM cp WHERE name = 'q'
+----
+
+# Collated PK range: `name < 'b'` ranges (−∞, sortkey('b')) → the rows a, A (z sorts after b). The
+# residual `<` is an ordering comparison, so each scanned row also charges collate.
+# cost: 11
+query T nosort
+SELECT name FROM cp WHERE name < 'b' ORDER BY name
+----
+a
+A
+
+# CONTRAST — an explicit `COLLATE "C"` orders by raw bytes, disagreeing with the column's unicode
+# key, so the comparison does NOT match the key's collation and does NOT push down: a full scan.
+# Byte-equality still finds the exact-byte 'A'. The higher cost vs the first query is the proof that
+# the collation-match gate (not a blanket "any text comparison pushes down") is what admits the seek.
+# cost: 10
+query T nosort
+SELECT name FROM cp WHERE name = 'A' COLLATE "C"
+----
+A
+
+# Collated SECONDARY INDEX equality: `name = 'A'` seeks the index by sortkey('A') and fetches the one
+# row by its PK — not a four-row table scan. page_read counts the index leaf plus the fetched row's leaf.
+statement ok
+CREATE TABLE ci (id i32 PRIMARY KEY, name text COLLATE "unicode")
+
+statement ok
+CREATE INDEX ci_name ON ci (name)
+
+statement ok
+INSERT INTO ci VALUES (1, 'a'), (2, 'A'), (3, 'b'), (4, 'z')
+
+# cost: 5
+query I nosort
+SELECT id FROM ci WHERE name = 'A'
+----
+2
+
+# The index equality miss reads nothing past the index leaf.
+# cost: 1
+query I nosort
+SELECT id FROM ci WHERE name = 'q'
+----

@@ -285,8 +285,9 @@ false
 # Collated KEYS (slice 1e) — a non-C collated text column is a valid PRIMARY KEY / UNIQUE / index.
 # Its stored key is the UCA sort key (encoding.md §2.12), so the B-tree orders by collation. A
 # deterministic collation's equality is byte-identity (§7), so 'a' and 'A' are DISTINCT keys (both
-# admitted) and a byte-duplicate violates the constraint. Point lookups full-scan + residual-filter
-# (pushdown is deferred for a collated key — §2.12), but the rows are still found correctly.
+# admitted) and a byte-duplicate violates the constraint. Equality + range predicates on a collated
+# key now PUSH DOWN (the sort-key probe seeks/ranges the B-tree — §8); the cost proof of that engaging
+# is suites/collation/collated_pushdown.test. Here we only pin the rows are correct either way.
 # ============================================================================================
 
 # a collated text PRIMARY KEY admits 'a' and 'A' (distinct under a deterministic collation)
@@ -309,7 +310,7 @@ z
 statement error 23505
 INSERT INTO k1 VALUES ('a')
 
-# a point lookup on the collated PK finds the row (= is byte-equality; full scan + residual filter)
+# a point lookup on the collated PK finds the row (= is byte-equality; pushed down via the sort-key probe)
 query T nosort
 SELECT name FROM k1 WHERE name = 'A'
 ----

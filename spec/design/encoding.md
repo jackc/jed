@@ -521,12 +521,15 @@ collation order with no runtime comparator. The collation table is **baked** int
 [collation.md §3](collation.md)), so the key bytes are self-contained and cross-core byte-identical
 (`rust == go == ts == ruby`); the on-disk image is pinned by the `collation_pk_table.jed` golden
 ([../fileformat/format.md](../fileformat/format.md)) and the key body bytes by
-[../collation/vectors/sortkey.toml](../collation/vectors/sortkey.toml). Two deliberate narrowings,
-both relaxable later and documented in [collation.md §8/§14](collation.md): (a) **point-lookup
-pushdown is deferred for a collated key** — a collated PK/index `WHERE k = …` / `k < …` full-scans +
-residual-filters (correct, just unindexed; the planner already excludes a collated comparison from a
-byte-range bound, since the B-tree is collation-ordered while the predicate would compute a byte
-bound) — matching the range-container precedent (§2.11); (b) **a collated key value whose UCA sort
+[../collation/vectors/sortkey.toml](../collation/vectors/sortkey.toml). Two key-path notes,
+documented in [collation.md §8/§14](collation.md): (a) **collated-key pushdown is a skew-aware bound
+(✅ landed)** — a collated PK/index `WHERE k = …` / `k < …` pushes down by encoding the probe as the
+column collation's UCA sort key (the stored key form), so it seeks/range-scans exactly as a `C` key
+does (equality sound via the injective identical level, ordering via the sort key's `memcmp` order),
+gated on the comparison's collation MATCHING the key column's frozen collation and on the collation
+being non-skewed (a *version-skewed* index is never seeked — the read-safety rule, collation.md §12;
+the slice-1e key path originally deferred this, contributing no bound, which is what
+`suites/collation/skew.test` guards); (b) **a collated key value whose UCA sort
 key would exceed a node** trips the existing over-`RECORD_MAX` oversized-item `0A000` (the sort key is
 ~2–3× the source, so the cap bites sooner than for a `C` key — the documented price of one `memcmp`
 order). An unmapped code point under the (dev) collation fails the sort-key build (`0A000`) at the

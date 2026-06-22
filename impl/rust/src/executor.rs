@@ -5960,7 +5960,15 @@ impl Database {
         // scan"); an empty bound deletes nothing. The whole WHERE stays the residual filter below.
         // page_read per visited node (block, before the rows), then storage_row_read per scanned row.
         let pk_bound = match (&filter, pk_info) {
-            (Some(f), Some((pk_idx, pk_ty))) => detect_pk_bound(f, pk_idx, pk_ty),
+            // A collated `Skewed` PK refuses pushdown (`key_collation_ctx` → `None`) — though a
+            // skewed table's write is already refused `XX002` upstream (`ensure_collations_writable`),
+            // so this is reached only for a `C` or `Full`-collated PK (collation.md §8/§12).
+            (Some(f), Some((pk_idx, pk_ty))) => {
+                match key_collation_ctx(self, &table.columns[pk_idx]) {
+                    Some(coll) => detect_pk_bound(f, pk_idx, pk_ty, coll),
+                    None => None,
+                }
+            }
             _ => None,
         };
         // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct
@@ -6276,7 +6284,12 @@ impl Database {
         // scan"); an empty bound updates nothing. The whole WHERE stays the residual filter below.
         // page_read per visited node (block, before the rows), then storage_row_read per scanned row.
         let pk_bound = match (&filter, pk_info) {
-            (Some(f), Some((pk_i, pk_ty))) => detect_pk_bound(f, pk_i, pk_ty),
+            // A collated `Skewed` PK refuses pushdown (`key_collation_ctx` → `None`); a skewed
+            // table's write is already refused `XX002` upstream, so this is a `C`/`Full`-collated PK.
+            (Some(f), Some((pk_i, pk_ty))) => match key_collation_ctx(self, &table.columns[pk_i]) {
+                Some(coll) => detect_pk_bound(f, pk_i, pk_ty, coll),
+                None => None,
+            },
             _ => None,
         };
         // GIN bound (gin.md §6): when no PK bound applies, a GIN-accelerable WHERE conjunct
@@ -7843,7 +7856,7 @@ impl Database {
             .map(|(i, rel)| match (&filter, &srf_meta[i], &derived_meta[i]) {
                 // A scan bound applies only to a base table — a set-returning function or a derived
                 // table is a computed source with no store to seek (functions.md §10, §42).
-                (Some(f), None, None) => detect_scan_bound(f, rel),
+                (Some(f), None, None) => detect_scan_bound(f, rel, scope.catalog),
                 _ => None,
             })
             .collect();
@@ -9435,7 +9448,7 @@ impl Database {
         // integer can equal no stored value — all provably empty.
         let mut agreed: Option<Vec<u8>> = None;
         for src in &ib.eqs {
-            let k = match encode_bound_key(ib.col_type, src, params, outer) {
+            let k = match encode_bound_key(ib.col_type, src, params, outer, ib.coll.as_deref()) {
                 BoundKey::Null | BoundKey::OutOfRange => return Ok((Vec::new(), (0, 0))),
                 BoundKey::Key(k) => k,
             };
@@ -11543,6 +11556,12 @@ struct BoundTerm {
 struct PkBound {
     pk_type: ScalarType,
     terms: Vec<BoundTerm>,
+    /// The key column's resolved collation when it is collated AND `Full` (loaded version matches
+    /// the file's pin) — the probe encodes via this collation's UCA sort key (encoding.md §2.12), so
+    /// it seeks the same key FORM the B-tree stores (spec/design/collation.md §8). `None` for a `C`
+    /// (raw-byte) key. A `Skewed` collated key never produces a `PkBound` at all (`key_collation_ctx`
+    /// refuses the bound — collation.md §12), so this is `Some` only for a safe-to-seek collated key.
+    coll: Option<std::sync::Arc<Collation>>,
 }
 
 /// A per-relation scan bound (cost.md §3): a primary-key range, a secondary-index
@@ -11600,6 +11619,11 @@ struct IndexBound {
     name_key: String,
     col_type: ScalarType,
     eqs: Vec<BoundSrc>,
+    /// The leading key column's resolved collation when it is collated AND `Full` — the equality
+    /// probe encodes via its UCA sort key (encoding.md §2.12) to match the index's stored key form
+    /// (spec/design/collation.md §8). `None` for a `C` (raw-byte) column. A `Skewed` collated index
+    /// never produces an `IndexBound` (`key_collation_ctx` refuses it — collation.md §12).
+    coll: Option<std::sync::Arc<Collation>>,
     /// The REMAINING key components' types (`columns[1..]`): an admitted entry's row-key
     /// suffix sits after every component slot, so the fetch skips these (each slot is
     /// self-delimiting — a `0x01` NULL tag alone, or `0x00` + the type's fixed width).
@@ -11620,12 +11644,16 @@ enum BoundKey {
 /// relation's indexes (held in ascending lowercased-name order — the deterministic
 /// tie-break), the first whose FIRST key column has at least one equality conjunct against
 /// a type-matched const-source; else `None` (full scan).
-fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
+fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Database) -> Option<ScanBound> {
     if let Some(b) = rel.table.primary_key_index().and_then(|pk_local| {
         // Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
         // deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
         let sty = rel.table.columns[pk_local].ty.as_scalar()?;
-        detect_pk_bound(filter, rel.offset + pk_local, sty)
+        // The PK column's key collation form (collation.md §8/§12): `Some(None)` = `C` (raw-byte
+        // key); `Some(Some(coll))` = collated AND `Full` (push via the sort key); `None` = collated
+        // but `Skewed` ⇒ refuse pushdown (full heap-scan recompute — the read-safety rule §12).
+        let coll = key_collation_ctx(catalog, &rel.table.columns[pk_local])?;
+        detect_pk_bound(filter, rel.offset + pk_local, sty, coll)
     }) {
         return Some(ScanBound::Pk(b));
     }
@@ -11648,8 +11676,21 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
         {
             continue;
         }
+        // The leading column's key collation form (as for the PK above). A `Skewed` collated index
+        // is skipped (`None`) — its stored keys are at the file's pinned version, wrong for the
+        // loaded one, so it must not be seeked (collation.md §12; the regression tripwire
+        // suites/collation/skew.test). A `C` or `Full`-collated index is admissible.
+        let Some(coll) = key_collation_ctx(catalog, &rel.table.columns[ci]) else {
+            continue;
+        };
         let mut terms = Vec::new();
-        collect_bound_terms(filter, rel.offset + ci, ty, &mut terms);
+        collect_bound_terms(
+            filter,
+            rel.offset + ci,
+            ty,
+            coll.as_ref().map(|c| c.name.as_str()),
+            &mut terms,
+        );
         let eqs: Vec<BoundSrc> = terms
             .into_iter()
             .filter(|t| matches!(t.op, CmpOp::Eq))
@@ -11660,6 +11701,7 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
                 name_key: idx.name.to_ascii_lowercase(),
                 col_type: ty,
                 eqs,
+                coll,
                 tail_types: idx.columns[1..]
                     .iter()
                     .map(|&c| rel.table.columns[c].ty.scalar())
@@ -11669,6 +11711,37 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel) -> Option<ScanBound> {
     }
     // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
     detect_gin_bound(filter, &rel.table.indexes, &rel.table.columns, rel.offset).map(ScanBound::Gin)
+}
+
+/// The collation a key over `col` is STORED under, deciding whether — and how — a comparison bound
+/// may push down to that key (spec/design/collation.md §8/§12). Three outcomes:
+///   - `Some(None)`       — `col` is `C` (or non-text): the key is raw bytes (encoding.md §2.4),
+///                          always pushable, the unchanged fast path.
+///   - `Some(Some(coll))` — `col` is collated and the collation is `Full` (its file pin matches the
+///                          loaded bundle): the key is the UCA sort key (encoding.md §2.12), pushable
+///                          using `coll` to encode the probe in the same form.
+///   - `None`             — `col` is collated but `Skewed` (the file's keys are at a DIFFERENT
+///                          `(unicode, cldr)` than the loaded bundle provides): pushdown is REFUSED.
+///                          The scan stays a full heap-scan that recomputes against the LOADED table
+///                          (the read-safety rule §12; seeking a loaded-version probe in a
+///                          file-version B-tree would mis-match — the regression tripwire
+///                          suites/collation/skew.test stays green only because this refuses). An
+///                          unresolvable collation likewise refuses rather than mis-encoding.
+fn key_collation_ctx(
+    catalog: &Database,
+    col: &Column,
+) -> Option<Option<std::sync::Arc<Collation>>> {
+    match &col.collation {
+        None => Some(None),
+        Some(name) => {
+            let snap = catalog.read_snap();
+            if snap.collation_skew(name).is_some() {
+                None
+            } else {
+                snap.resolve_collation(name).map(Some)
+            }
+        }
+    }
 }
 
 /// Detect a GIN-bounded scan over `columns`/`indexes` (gin.md §6): the lowest-named GIN index
@@ -12149,36 +12222,64 @@ fn fk_probe(
 /// contiguous range) and collect every `pk <cmp> const-source` conjunct. `None` ⇒ no usable bound
 /// (full scan). Conservative + sound: an unrecognized conjunct contributes no bound and stays in the
 /// residual filter.
-fn detect_pk_bound(filter: &RExpr, pk_idx: usize, pk_type: ScalarType) -> Option<PkBound> {
+fn detect_pk_bound(
+    filter: &RExpr,
+    pk_idx: usize,
+    pk_type: ScalarType,
+    coll: Option<std::sync::Arc<Collation>>,
+) -> Option<PkBound> {
     let mut terms = Vec::new();
-    collect_bound_terms(filter, pk_idx, pk_type, &mut terms);
+    collect_bound_terms(
+        filter,
+        pk_idx,
+        pk_type,
+        coll.as_ref().map(|c| c.name.as_str()),
+        &mut terms,
+    );
     if terms.is_empty() {
         None
     } else {
-        Some(PkBound { pk_type, terms })
+        Some(PkBound {
+            pk_type,
+            terms,
+            coll,
+        })
     }
 }
 
-fn collect_bound_terms(e: &RExpr, pk_idx: usize, pk_type: ScalarType, terms: &mut Vec<BoundTerm>) {
+fn collect_bound_terms(
+    e: &RExpr,
+    pk_idx: usize,
+    pk_type: ScalarType,
+    col_coll: Option<&str>,
+    terms: &mut Vec<BoundTerm>,
+) {
     match e {
         RExpr::And(l, r) => {
-            collect_bound_terms(l, pk_idx, pk_type, terms);
-            collect_bound_terms(r, pk_idx, pk_type, terms);
+            collect_bound_terms(l, pk_idx, pk_type, col_coll, terms);
+            collect_bound_terms(r, pk_idx, pk_type, col_coll, terms);
         }
         // `<>` is not a contiguous range, so it never seeds an index/PK bound — it stays in the
         // residual filter (a full scan + filter). Skipping it here keeps the deterministic cost
         // identical to Go/TS, where `asBoundTerm` excludes it the same way.
-        // A collated comparison (`collation: Some`) is EXCLUDED: it orders by the collation's UCA
-        // sort key, but the PK/index B-tree is byte (`C`) ordered, so a byte-range bound would be
-        // wrong. It stays a full scan + the residual collated filter (spec/design/collation.md §8;
-        // collated keys are slice 1e). `=`/`<>` are byte-equality even under a collation, but
-        // excluding the whole collated form keeps the rule simple and cross-core identical.
+        // A comparison bounds the key only when ITS resolved collation matches the key column's
+        // frozen collation (`col_coll`) — so the comparison orders text the SAME way the B-tree is
+        // keyed (spec/design/collation.md §8). `C` key ⇔ a `C`/byte comparison (both `None`); a
+        // collated key ⇔ a comparison under the SAME collation (the column's implicit collation, or
+        // an explicit `COLLATE "<that name>"`). A comparison under a DIFFERENT collation —
+        // `name COLLATE "C"` over a `unicode` column, `COLLATE "de"` over `unicode` — does NOT
+        // match: its order disagrees with the stored keys, so it stays a full scan + residual
+        // filter. (A *skewed* collated key never reaches here — `key_collation_ctx` refuses the
+        // whole bound, §12.) The probe is then encoded in the key column's form (sort key for a
+        // collated `Full` column — `build_key_bound`/`index_bound_rows`).
         RExpr::Compare {
             op,
             lhs,
             rhs,
-            collation: None,
-        } if !matches!(op, CmpOp::Ne) => {
+            collation,
+        } if !matches!(op, CmpOp::Ne)
+            && collation.as_ref().map(|c| c.name.as_str()) == col_coll =>
+        {
             let is_pk = |x: &RExpr| matches!(x, RExpr::Column(i) if *i == pk_idx);
             // The PK on either side (op flipped when it is on the right); the other side a
             // matching-type const-source. Anything else contributes no term.
@@ -12248,7 +12349,7 @@ fn flip_cmp(op: CmpOp) -> CmpOp {
 fn build_key_bound(bp: &PkBound, params: &[Value], outer: &[&[Value]]) -> Option<KeyBound> {
     let mut b = KeyBound::unbounded();
     for t in &bp.terms {
-        let key = match encode_bound_key(bp.pk_type, &t.src, params, outer) {
+        let key = match encode_bound_key(bp.pk_type, &t.src, params, outer, bp.coll.as_deref()) {
             BoundKey::Null => return None,
             BoundKey::OutOfRange => continue,
             BoundKey::Key(k) => k,
@@ -12280,6 +12381,7 @@ fn encode_bound_key(
     src: &BoundSrc,
     params: &[Value],
     outer: &[&[Value]],
+    coll: Option<&Collation>,
 ) -> BoundKey {
     match src {
         BoundSrc::Null => BoundKey::Null,
@@ -12294,23 +12396,42 @@ fn encode_bound_key(
         BoundSrc::Uuid(u) => BoundKey::Key(u.to_vec()),
         BoundSrc::Timestamp(m) => BoundKey::Key(encode_int(pk_ty, *m)),
         BoundSrc::Date(d) => BoundKey::Key(encode_int(pk_ty, *d as i64)),
-        BoundSrc::Text(s) => BoundKey::Key(encode_terminated(s.as_bytes())),
+        BoundSrc::Text(s) => encode_text_bound(s, coll),
         BoundSrc::Bytea(b) => BoundKey::Key(encode_terminated(b)),
         BoundSrc::Decimal(d) => BoundKey::Key(d.encode_key()),
         BoundSrc::Interval(iv) => BoundKey::Key(iv.encode_key()),
-        BoundSrc::Param(i) => encode_value_key(pk_ty, &params[*i]),
+        BoundSrc::Param(i) => encode_value_key(pk_ty, &params[*i], coll),
         // A correlated reference: column `index` of the enclosing row `level` hops out — the same
         // indexing the evaluator uses for `RExpr::OuterColumn` (innermost outer row is last).
         BoundSrc::Outer { level, index } => {
-            encode_value_key(pk_ty, &outer[outer.len() - level][*index])
+            encode_value_key(pk_ty, &outer[outer.len() - level][*index], coll)
         }
+    }
+}
+
+/// Encode a `text` probe into a key bound: the raw `text-terminated-escape` bytes for a `C` key
+/// (`coll == None`, the fast path, encoding.md §2.4), or the collation's UCA sort key
+/// (`text-collated-sortkey`, §2.12) for a `Full`-collated key. A sort-key build that fails on an
+/// unmapped code point (the `0A000` the write/compare path raises, collation.md §6) becomes
+/// `OutOfRange` here: the probe matches no stored (always-mapped) key, so the term contributes no
+/// bound and the scan widens to a full scan + residual filter — which reproduces the exact
+/// non-pushdown answer (empty for `=`, since equality is byte-identity §7; the `0A000` for an
+/// ordering compare iff any row is actually scanned). Deterministic and identical across cores.
+fn encode_text_bound(s: &str, coll: Option<&Collation>) -> BoundKey {
+    match coll {
+        Some(c) => match collation::sort_key(c, s) {
+            Ok(k) => BoundKey::Key(k),
+            Err(_) => BoundKey::OutOfRange,
+        },
+        None => BoundKey::Key(encode_terminated(s.as_bytes())),
     }
 }
 
 /// Encode a runtime `Value` (a bound param or a resolved outer column) into the PK's storage key.
 /// A NULL value makes the comparison 3VL-unknown (an empty range); a value of a kind no key can
-/// hold (or an integer outside the PK width) drops its half-bound, widening — still sound.
-fn encode_value_key(pk_ty: ScalarType, v: &Value) -> BoundKey {
+/// hold (or an integer outside the PK width) drops its half-bound, widening — still sound. `coll`
+/// selects a `text` value's key form (collated sort key vs raw bytes — `encode_text_bound`).
+fn encode_value_key(pk_ty: ScalarType, v: &Value, coll: Option<&Collation>) -> BoundKey {
     match v {
         Value::Null => BoundKey::Null,
         Value::Bool(b) => BoundKey::Key(encode_bool(*b)),
@@ -12324,7 +12445,7 @@ fn encode_value_key(pk_ty: ScalarType, v: &Value) -> BoundKey {
         }
         Value::Timestamp(m) | Value::Timestamptz(m) => BoundKey::Key(encode_int(pk_ty, *m)),
         Value::Date(d) => BoundKey::Key(encode_int(pk_ty, *d as i64)),
-        Value::Text(s) => BoundKey::Key(encode_terminated(s.as_bytes())),
+        Value::Text(s) => encode_text_bound(s, coll),
         Value::Bytea(b) => BoundKey::Key(encode_terminated(b)),
         Value::Decimal(d) => BoundKey::Key(d.encode_key()),
         Value::Interval(iv) => BoundKey::Key(iv.encode_key()),

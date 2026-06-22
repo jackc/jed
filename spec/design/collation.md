@@ -500,18 +500,24 @@ original) — the documented price of keeping one `memcmp` order rather than a r
 The sort key is produced by the **loaded** table (§2/§9), so every core with a loaded bundle at the
 same `(unicode, cldr)` version emits identical key bytes → byte-identical collated B-trees.
 
-**Two narrowings the slice-1e key path carries** ([encoding.md §2.12](encoding.md)), both relaxable:
+**Key-path notes** ([encoding.md §2.12](encoding.md)):
 
-- **Point-lookup pushdown is deferred for a collated key.** A collated PK/index `WHERE k = 'x'` /
-  `k < 'm'` **full-scans + residual-filters** — correct, just unindexed, the same posture as a range
-  container key ([encoding.md §2.11](encoding.md)). The planner already excludes a *collated*
-  comparison from a byte-range index bound (it would compute a `C`-byte bound against a
-  collation-ordered B-tree — wrong), so this falls out for free: a `C` text key still pushes down; a
-  non-`C` one does not. (Equality pushdown is sound in principle — the sort key is injective via the
-  identical level — and is the obvious follow-on.) **When that follow-on lands it must first exclude a
-  *version-skewed* index** (§12 — a skewed index's keys are at the file's pinned version, wrong for
-  the loaded one): the shared regression `suites/collation/skew.test` is green only because this
-  narrowing keeps the index unread, and it turns red the instant pushdown trusts a skewed index.
+- **Collated-key pushdown is a skew-aware index/PK bound (✅ landed).** A collated PK/index
+  `WHERE k = 'x'` / `k < 'm'` now **pushes down**: the comparison's probe is encoded as the column
+  collation's **UCA sort key** (the same key form the B-tree stores), so it seeks/range-scans exactly
+  as a `C` key does — equality is sound because the sort key is injective via the identical level,
+  ordering because the sort key's `memcmp` order *is* the collation order. The whole `WHERE` stays the
+  residual filter, so results are unchanged; only the cost drops (pinned cross-core by
+  `suites/collation/collated_pushdown.test`). **Two guards keep it correct:** (a) the comparison's
+  resolved collation must **match** the key column's frozen collation — an explicit `COLLATE "C"` (or
+  any *other* collation) over a non-`C` column orders differently from the stored keys, so it does
+  **not** push down (a full scan + residual); (b) a **version-skewed** collated index is **never
+  seeked** — its stored keys are at the file's pinned version, wrong for the loaded one (§12), so the
+  planner refuses the bound and the scan stays a full heap-scan that recomputes against the loaded
+  table. The shared regression `suites/collation/skew.test` (skewed → full scan) / `skew_full.test`
+  (Full → safe to seek) is the cross-core proof that guard (b) holds: it would turn red the instant
+  pushdown trusted a skewed index. (The slice-1e key path originally *deferred* this — a collated
+  comparison contributed no bound — which is why the tripwire was authored ahead of the lift.)
 - **One uniform component codec.** A collated text key component is the **full** sort key (identical
   level included) in every position — PK body, secondary-index entry, `UNIQUE` prefix. The
   alternative `sort_key ‖ pk` (no identical level) for a secondary index is *also* correct but is not
@@ -807,9 +813,9 @@ sub-slices**, each independently testable (CLAUDE.md §10), in dependency order:
   `collation_pk_table.jed` golden (`rust == go == ts == ruby`, the key bytes pinned by
   [../collation/vectors/sortkey.toml](../collation/vectors/sortkey.toml)) + corpus
   (`suites/collation/collate.test`). Two refinements/narrowings, both recorded in §8: (a) **point-lookup
-  pushdown is deferred for a collated key** — a collated PK/index `WHERE` full-scans + residual-filters
-  (the planner already excludes a *collated* comparison from a byte-range bound, so a `C` text key still
-  pushes down and a non-`C` one does not); (b) **one uniform component codec** — the full sort key
+  pushdown was deferred for a collated key** in 1e — a collated PK/index `WHERE` full-scanned +
+  residual-filtered (the planner excluded a *collated* comparison from a bound) — **since lifted** to a
+  skew-aware collated bound (§8/§14, the "Collated-index pushdown" slice); (b) **one uniform component codec** — the full sort key
   (identical level included) is used in every key position (PK, index entry, `UNIQUE` prefix), the
   secondary-index `sort_key ‖ pk`-without-identical-level alternative not taken. An FK over a collated
   parent key encodes the probe with the **parent's** collation. The dev-collation unmapped-code-point
@@ -853,10 +859,13 @@ leans on:
   loaded bundle carries its own, so no new stored state and no `format_version` bump. Per referenced
   collation: **`Full`** (loaded bundle provides the name at the **same** version → behaves exactly as
   before) / **`Skewed`** (name present, **different** version). Enforcement, per object = per table:
-  - **Reads always work** — jed already executes *every* collated operation by heap-scan + in-memory
-    recompute against the **loaded** table (collated keys never push down — the 1e narrowing §8; a
-    collated `ORDER BY` always materializes + re-sorts §1c), so a skewed read is already
-    correct-for-the-loaded-version. The "read-only heap-scan degradation" of
+  - **Reads always work** — a `Skewed` collated key is **never seeked**: the planner refuses to push
+    a bound down to it (§8 — its stored keys are at the file's version, wrong for the loaded one), so
+    the scan stays a heap-scan that recomputes against the **loaded** table, and a collated `ORDER BY`
+    always materializes + re-sorts (§1c). So a skewed read is correct-for-the-loaded-version. (This is
+    the read-safety rule the collated-index-pushdown lift (§8/§14) preserves by gating on the verdict;
+    before the lift *no* collated key pushed down, so the property held a fortiori — the `skew.test`
+    tripwire guards it either way.) The "read-only heap-scan degradation" of
     [compatibility.md §8](compatibility.md) is therefore the *existing* execution path, not new code.
   - **Writes to a `Skewed` table are refused (`XX002`).** Inserting/updating/deleting would encode
     keys under the loaded version into a B-tree built under the file's pinned version — mixing two
@@ -888,11 +897,12 @@ leans on:
   [conformance.md §1](conformance.md), authored byte-pinned in
   [../fileformat/verify.rb](../fileformat/verify.rb)). The fixture exists because SQL **cannot**
   build this state (the engine always pins the loaded version and builds a correct index). The test
-  asserts a query that *would* be served by that index returns the correct loaded-collation rows —
-  **green today** (the index is never consulted: collated keys never push down, §8 — below), and it
-  goes **red** the day collated-index pushdown lands without first bypassing/rebuilding a skewed
-  index. It is the cross-core guard that the "obvious follow-on" (§8 / encoding.md §2.12) cannot
-  silently break read safety; the twin shows a *correct* collated index is safe to push down to.
+  asserts a query that *would* be served by that index returns the correct loaded-collation rows.
+  **It stayed green when collated-index pushdown landed** (the skew slice below) because the lift
+  makes the planner refuse a *skewed* collated index — it is never consulted, so the scan recomputes
+  against the loaded table (§8). The test was authored *ahead* of the lift precisely so it would go
+  **red** had pushdown trusted a skewed index; the twin `skew_full.test` shows a *correct* (Full)
+  collated index is safe to seek. (Authored byte-pinned because SQL cannot build a skewed file.)
 - **2e — real version-pinned root + first tailoring** ✅ *landed (all three cores + Ruby)*: the
   `dev-*` fixtures are replaced in the production **vendored** set by the real CLDR-tailored DUCET
   root — `unicode` (UCA/UCD **17.0.0**, CLDR 48, `spec/collation/17.0.0/root.allkeys` ≈ the CLDR
@@ -910,6 +920,19 @@ leans on:
   tiers (§13), implicit weights / the CJK tier-3 root, and the broader tailorings (sv/da/de needing the
   deferred LDML `[before]`/expansion/contraction features + a real weight allocator — the dense
   insertions exhaust the current midpoint allocator).
+
+- **Collated-index pushdown** ✅ *landed (all three cores)*: the slice-1e narrowing that excluded a
+  collated comparison from an index/PK bound (§8) is **lifted** — equality and range bounds over a
+  non-`C` collated PRIMARY KEY / secondary index now push down, encoding the probe as the column
+  collation's UCA sort key (the stored key form, encoding.md §2.12) so the seek/range-scan matches
+  the B-tree exactly. Two guards: (a) the comparison's resolved collation must **match** the key
+  column's frozen collation (a `COLLATE "C"`/other-collation override does not push down); (b) a
+  **version-skewed** collated index is **never seeked** (§12) — the planner refuses the bound and the
+  scan stays a full heap-scan recompute, which is what kept the 2d tripwire `suites/collation/skew.test`
+  green through the lift. Engagement + the cross-core cost contract are pinned by
+  `suites/collation/collated_pushdown.test` (PK eq/range/miss, the index eq, and the `COLLATE "C"`
+  full-scan contrast); a probe whose sort key cannot be built (an unmapped code point, `0A000`)
+  contributes no bound, widening to a full scan + residual so behavior matches the non-pushdown path.
 
 **Slice 3 — host-loaded Unicode-data bundle** (this revision; **not yet built**), in dependency
 order. This **supersedes** the slice-2 "footprint tiers / `include_bytes!` embed" still-pending items

@@ -3845,7 +3845,7 @@ export class Database {
     // integer can equal no stored value — all provably empty.
     let agreed: Uint8Array | null = null;
     for (const src of ib.eqs) {
-      const bk = encodeBoundKey(ib.colType, src, params, outer);
+      const bk = encodeBoundKey(ib.colType, src, params, outer, ib.coll);
       if (bk.kind !== "key") return { rows: [], pages: 0, slabs: 0 };
       if (agreed === null) agreed = bk.key;
       else if (!bytesEq(agreed, bk.key)) return { rows: [], pages: 0, slabs: 0 };
@@ -5200,7 +5200,7 @@ export class Database {
     // (empty rows), never a bare statement (grammar.md §32). The whole WHERE stays the
     // residual filter below. page_read per visited node (block, before the rows), then
     // storageRowRead per scanned row.
-    const mb = mutationPkBound(table, filter);
+    const mb = mutationPkBound(table, filter, this.readSnap());
     let entries: Entry[] | null;
     let overlap: number;
     let slabs: number;
@@ -5470,7 +5470,7 @@ export class Database {
     // (empty rows), never a bare statement (grammar.md §32). The whole WHERE stays the
     // residual filter below. page_read per visited node (block, before the rows), then
     // storageRowRead per scanned row.
-    const mb = mutationPkBound(table, filter);
+    const mb = mutationPkBound(table, filter, this.readSnap());
     let entries: Entry[] | null;
     let overlap: number;
     let slabs: number;
@@ -6763,7 +6763,7 @@ export class Database {
       rel.cte !== undefined ||
       derivedPlans[i] !== undefined
         ? null
-        : detectScanBound(filter, rel),
+        : detectScanBound(filter, rel, this.readSnap()),
     );
 
     // Assemble the owned plan (table NAMES + offsets/widths replace the scope's tables, so the
@@ -7817,6 +7817,11 @@ type IndexBound = {
   nameKey: string;
   colType: ScalarType;
   eqs: RExpr[];
+  // coll is the leading key column's resolved collation when it is collated AND Full — the equality
+  // probe encodes via its UCA sort key (encoding.md §2.12) to match the index's stored key form
+  // (spec/design/collation.md §8). null for a C (raw-byte) column. A Skewed collated index never
+  // produces an IndexBound (keyCollationCtx refuses it — collation.md §12).
+  coll: Collation | null;
   tailTypes: ScalarType[];
 };
 
@@ -7825,15 +7830,21 @@ type IndexBound = {
 // lowercased-name order — the deterministic tie-break), the first whose FIRST key column
 // has at least one equality conjunct against a type-matched const-source; else null
 // (full scan).
-function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
+function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBound | null {
   const pkLocal = primaryKeyIndex(rel.table);
   if (pkLocal >= 0) {
     // Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
     // deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
     const sty = typeAsScalar(rel.table.columns[pkLocal]!.type);
     if (sty !== undefined) {
-      const bp = detectPkBound(filter, rel.offset + pkLocal, sty);
-      if (bp !== null) return { kind: "pk", pk: bp };
+      // The PK column's key collation form (collation.md §8/§12): null ⇒ collated but Skewed ⇒
+      // refuse pushdown (full heap-scan recompute — the read-safety rule §12); else { coll } where
+      // coll is null (C, raw-byte key) or the Full-collated table (push via the sort key).
+      const ctx = keyCollationCtx(snap, rel.table.columns[pkLocal]!);
+      if (ctx !== null) {
+        const bp = detectPkBound(filter, rel.offset + pkLocal, sty, ctx.coll);
+        if (bp !== null) return { kind: "pk", pk: bp };
+      }
     }
   }
   for (const idx of rel.table.indexes) {
@@ -7848,7 +7859,12 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
     if (idx.columns.slice(1).some((c) => typeAsScalar(rel.table.columns[c]!.type) === undefined)) {
       continue;
     }
-    const bp = detectPkBound(filter, rel.offset + ci, ty);
+    // The leading column's key collation form (as for the PK above). A Skewed collated index is
+    // skipped (ctx === null) — its stored keys are at the file's pinned version, wrong for the
+    // loaded one, so it must not be seeked (collation.md §12; the tripwire suites/collation/skew.test).
+    const ctx = keyCollationCtx(snap, rel.table.columns[ci]!);
+    if (ctx === null) continue;
+    const bp = detectPkBound(filter, rel.offset + ci, ty, ctx.coll);
     const eqs: RExpr[] = [];
     if (bp !== null) {
       for (const t of bp.terms) if (t.op === "eq") eqs.push(t.src);
@@ -7857,13 +7873,32 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
       const tailTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
       return {
         kind: "index",
-        index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, tailTypes },
+        index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, coll: ctx.coll, tailTypes },
       };
     }
   }
   // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
   const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
   return gb !== null ? { kind: "gin", gin: gb } : null;
+}
+
+// keyCollationCtx reports the collation a key over col is STORED under, deciding whether — and how —
+// a comparison bound may push down to that key (spec/design/collation.md §8/§12). Three outcomes:
+//   - { coll: null }  — col is C (or non-text): the key is raw bytes (encoding.md §2.4), always
+//     pushable, the unchanged fast path.
+//   - { coll }        — col is collated and the collation is Full (its file pin matches the loaded
+//     bundle): the key is the UCA sort key (encoding.md §2.12), pushable using coll to encode the
+//     probe in the same form.
+//   - null            — col is collated but Skewed (its file pin differs from the loaded bundle):
+//     push is REFUSED. The scan stays a full heap-scan that recomputes against the LOADED table (the
+//     read-safety rule §12; seeking a loaded-version probe in a file-version B-tree would mis-match —
+//     the tripwire suites/collation/skew.test stays green only because this refuses). An unresolvable
+//     collation likewise refuses rather than mis-encoding.
+function keyCollationCtx(snap: Snapshot, col: Column): { coll: Collation | null } | null {
+  if (col.collation === null) return { coll: null };
+  if (snap.collationSkew(col.collation) !== undefined) return null;
+  const c = snap.resolveCollation(col.collation);
+  return c !== undefined ? { coll: c } : null;
 }
 
 // detectGinBound detects a GIN-bounded scan over columns/indexes (gin.md §6): the lowest-named GIN
@@ -8561,7 +8596,11 @@ type BoundTerm = { op: BinaryOp; src: RExpr };
 
 // PkBound is the plan-time result of PK analysis: the PK's storage type + the bound terms. The concrete
 // key range is built per execution by buildKeyBound.
-type PkBound = { pkType: ScalarType; terms: BoundTerm[] };
+// coll is the key column's resolved collation when it is collated AND Full (loaded version matches
+// the file pin) — the probe encodes via this collation's UCA sort key (encoding.md §2.12), seeking
+// the same key FORM the B-tree stores (spec/design/collation.md §8). null for a C (raw-byte) key. A
+// Skewed collated key never produces a PkBound (keyCollationCtx refuses the bound — collation.md §12).
+type PkBound = { pkType: ScalarType; terms: BoundTerm[]; coll: Collation | null };
 
 // BoundKey is the outcome of encoding a const-source into the PK key space: a usable key, a NULL const
 // (the comparison is 3VL-unknown ⇒ empty range), or an out-of-range integer (drop this half-bound).
@@ -8570,7 +8609,13 @@ type BoundKey = { kind: "key"; key: Uint8Array } | { kind: "null" } | { kind: "o
 // detectPkBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction is
 // not a contiguous range) and collects every `pk <cmp> const-source` conjunct. null ⇒ full scan.
 // Conservative + sound: an unrecognized conjunct contributes no bound and stays in the residual filter.
-function detectPkBound(filter: RExpr, pkIdx: number, pkType: ScalarType): PkBound | null {
+function detectPkBound(
+  filter: RExpr,
+  pkIdx: number,
+  pkType: ScalarType,
+  coll: Collation | null,
+): PkBound | null {
+  const colColl = coll !== null ? coll.name : null;
   const terms: BoundTerm[] = [];
   const walk = (e: RExpr): void => {
     if (e.kind === "and") {
@@ -8578,23 +8623,35 @@ function detectPkBound(filter: RExpr, pkIdx: number, pkType: ScalarType): PkBoun
       walk(e.rhs);
       return;
     }
-    const t = asBoundTerm(e, pkIdx, pkType);
+    const t = asBoundTerm(e, pkIdx, pkType, colColl);
     if (t !== null) terms.push(t);
   };
   walk(filter);
-  return terms.length === 0 ? null : { pkType, terms };
+  return terms.length === 0 ? null : { pkType, terms, coll };
 }
 
 // asBoundTerm recognizes a single PK comparison conjunct: a comparison (=,<,<=,>,>=) with the bare LOCAL
 // PK column ("column" at pkIdx — a correlated "outerColumn" is a different kind, so it never matches) on
 // one side and a const-source of the PK's own type on the other (a promoted comparison — e.g. intpk = 2.5
 // → a constDecimal — does not match, so it stays residual). The op is flipped when the PK is on the right.
-function asBoundTerm(e: RExpr, pkIdx: number, pkType: ScalarType): BoundTerm | null {
+function asBoundTerm(
+  e: RExpr,
+  pkIdx: number,
+  pkType: ScalarType,
+  colColl: string | null,
+): BoundTerm | null {
   if (e.kind !== "compare") return null;
-  // A collated comparison orders by the collation's UCA sort key, but the PK/index B-tree is byte (C)
-  // ordered, so a byte-range bound would be wrong — exclude it (it stays a full scan + the residual
-  // collated filter; spec/design/collation.md §8, collated keys are slice 1e).
-  if (e.collation !== null) return null;
+  // A comparison bounds the key only when ITS resolved collation matches the key column's frozen
+  // collation (colColl) — so the comparison orders text the SAME way the B-tree is keyed
+  // (spec/design/collation.md §8). C key ⇔ a C/byte comparison (both null); a collated key ⇔ a
+  // comparison under the SAME collation (the column's implicit collation, or an explicit
+  // COLLATE "<that name>"). A comparison under a DIFFERENT collation — name COLLATE "C" over a
+  // unicode column, COLLATE "de" over unicode — does NOT match: its order disagrees with the stored
+  // keys, so it stays a full scan + residual filter. (A *skewed* collated key never reaches here —
+  // keyCollationCtx refuses the whole bound, §12.) The probe is then encoded in the key column's
+  // form (sort key for a Full-collated column — buildKeyBound/indexBoundRows).
+  const cmpColl = e.collation !== null ? e.collation.name : null;
+  if (cmpColl !== colColl) return null;
   if (e.op !== "eq" && e.op !== "lt" && e.op !== "le" && e.op !== "gt" && e.op !== "ge")
     return null;
   const isPk = (x: RExpr): boolean => x.kind === "column" && x.index === pkIdx;
@@ -8665,7 +8722,7 @@ function flipCmp(op: BinaryOp): BinaryOp {
 function buildKeyBound(bp: PkBound, params: Value[], outer: Row[]): KeyBound | null {
   const b = unboundedBound();
   for (const t of bp.terms) {
-    const r = encodeBoundKey(bp.pkType, t.src, params, outer);
+    const r = encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll);
     if (r.kind === "null") return null;
     if (r.kind === "outOfRange") continue;
     const key = r.key;
@@ -8695,7 +8752,13 @@ function buildKeyBound(bp: PkBound, params: Value[], outer: Row[]): KeyBound | n
 // encodeInt for integer/timestamp widths, the raw 16 bytes for uuid, the 1-byte bool-byte for boolean).
 // param/outerColumn resolve to a runtime Value first (the param table / the enclosing outer row) and
 // then encode through the shared path.
-function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[], outer: Row[]): BoundKey {
+function encodeBoundKey(
+  pkType: ScalarType,
+  src: RExpr,
+  params: Value[],
+  outer: Row[],
+  coll: Collation | null,
+): BoundKey {
   switch (src.kind) {
     case "constNull":
       return { kind: "null" };
@@ -8712,10 +8775,7 @@ function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[], outer: 
     case "constDate":
       return { kind: "key", key: encodeInt(pkType, src.value) };
     case "constText":
-      return {
-        kind: "key",
-        key: encodeTerminated(SQL_BYTE_ENCODER.encode(src.value)),
-      };
+      return encodeTextBound(src.value, coll);
     case "constBytea":
       return { kind: "key", key: encodeTerminated(src.value) };
     case "constDecimal":
@@ -8723,28 +8783,42 @@ function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[], outer: 
     case "constInterval":
       return { kind: "key", key: intervalEncodeKey(src.value) };
     case "param":
-      return encodeValueKey(pkType, params[src.index]!);
+      return encodeValueKey(pkType, params[src.index]!, coll);
     case "outerColumn":
       // A correlated reference: column index of the enclosing row level hops out — the same indexing
       // the evaluator uses for "outerColumn" (innermost outer row is last).
-      return encodeValueKey(pkType, outer[outer.length - src.level]![src.index]!);
+      return encodeValueKey(pkType, outer[outer.length - src.level]![src.index]!, coll);
     default:
       return { kind: "outOfRange" };
   }
 }
 
+// encodeTextBound encodes a text probe into a key bound: the raw text-terminated-escape bytes for a C
+// key (coll === null, the fast path, encoding.md §2.4), or the collation's UCA sort key
+// (text-collated-sortkey, §2.12) for a Full-collated key. A sort-key build that fails on an unmapped
+// code point (the 0A000 the write/compare path raises, collation.md §6) becomes outOfRange here: the
+// probe matches no stored (always-mapped) key, so the term contributes no bound and the scan widens
+// to a full scan + residual filter — which reproduces the exact non-pushdown answer (empty for =,
+// since equality is byte-identity §7; the 0A000 for an ordering compare iff any row is scanned).
+// Identical across cores (mirrors Rust encode_text_bound / Go encodeTextBound).
+function encodeTextBound(s: string, coll: Collation | null): BoundKey {
+  if (coll === null) return { kind: "key", key: encodeTerminated(SQL_BYTE_ENCODER.encode(s)) };
+  try {
+    return { kind: "key", key: collationSortKey(coll, s) };
+  } catch {
+    return { kind: "outOfRange" };
+  }
+}
+
 // encodeValueKey encodes a runtime Value (a bound param or a resolved outer column) into the PK's storage
 // key. A NULL value makes the comparison 3VL-unknown (an empty range); a value of a kind no key can hold
-// (or an integer outside the PK width) drops its half-bound, widening — still sound.
-function encodeValueKey(pkType: ScalarType, v: Value): BoundKey {
+// (or an integer outside the PK width) drops its half-bound, widening — still sound. coll selects a text
+// value's key form (collated sort key vs raw bytes — encodeTextBound).
+function encodeValueKey(pkType: ScalarType, v: Value, coll: Collation | null): BoundKey {
   if (v.kind === "null") return { kind: "null" };
   if (v.kind === "bool") return { kind: "key", key: encodeBool(v.value) };
   if (v.kind === "uuid") return { kind: "key", key: v.bytes.slice() };
-  if (v.kind === "text")
-    return {
-      kind: "key",
-      key: encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)),
-    };
+  if (v.kind === "text") return encodeTextBound(v.text, coll);
   if (v.kind === "bytea") return { kind: "key", key: encodeTerminated(v.bytes) };
   if (v.kind === "decimal") return { kind: "key", key: v.dec.encodeKey() };
   if (v.kind === "interval") return { kind: "key", key: intervalEncodeKey(v.iv) };
@@ -8799,7 +8873,7 @@ function boundEmpty(b: KeyBound): boolean {
 }
 
 // mutationPkBound detects a single-table UPDATE/DELETE's PK pushdown bound; null ⇒ full scan.
-function mutationPkBound(table: Table, filter: RExpr | null): PkBound | null {
+function mutationPkBound(table: Table, filter: RExpr | null, snap: Snapshot): PkBound | null {
   if (filter === null) return null;
   const pkIdx = primaryKeyIndex(table);
   if (pkIdx < 0) return null;
@@ -8807,7 +8881,12 @@ function mutationPkBound(table: Table, filter: RExpr | null): PkBound | null {
   // §10), so a range PK WHERE k = … full-scans + residual-filters.
   const sty = typeAsScalar(table.columns[pkIdx]!.type);
   if (sty === undefined) return null;
-  return detectPkBound(filter, pkIdx, sty);
+  // A collated Skewed PK refuses pushdown (ctx === null) — though a skewed table's write is already
+  // refused XX002 upstream (ensureCollationsWritable), so this is reached only for a C or
+  // Full-collated PK (collation.md §8/§12).
+  const ctx = keyCollationCtx(snap, table.columns[pkIdx]!);
+  if (ctx === null) return null;
+  return detectPkBound(filter, pkIdx, sty, ctx.coll);
 }
 
 // scanEntries returns the (key,row) entries a mutation scans + the page_read node count: a primary-key

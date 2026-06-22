@@ -6518,7 +6518,7 @@ func (db *Database) executeDelete(del *Delete, params []Value, ctx cteCtx) (Outc
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
 	var entries []Entry
 	var overlap, slabs int
-	if bp := pkBoundFor(table, filter); bp != nil {
+	if bp := db.pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
 		kb, empty := db.buildKeyBound(bp, bound, nil)
 		if empty {
@@ -6831,7 +6831,7 @@ func (db *Database) executeUpdate(upd *Update, params []Value, ctx cteCtx) (Outc
 	// page_read per visited node (block, before the rows), then storage_row_read per scanned row.
 	var entries []Entry
 	var overlap, slabs int
-	if bp := pkBoundFor(table, filter); bp != nil {
+	if bp := db.pkBoundFor(table, filter); bp != nil {
 		// Top-level statement: no enclosing query, so the bound never has a correlated source.
 		kb, empty := db.buildKeyBound(bp, bound, nil)
 		if empty {
@@ -9055,7 +9055,7 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			if srfPlans[i] != nil || derivedPlans[i] != nil {
 				continue
 			}
-			relBounds[i] = detectScanBound(filter, rel)
+			relBounds[i] = detectScanBound(filter, rel, db)
 		}
 	}
 	// ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
@@ -9482,6 +9482,12 @@ type boundTerm struct {
 type pkBoundPlan struct {
 	pkType ScalarType
 	terms  []boundTerm
+	// coll is the key column's resolved collation when it is collated AND Full (loaded version
+	// matches the file pin) — the probe encodes via this collation's UCA sort key (encoding.md
+	// §2.12), seeking the same key FORM the B-tree stores (spec/design/collation.md §8). nil for a
+	// C (raw-byte) key. A Skewed collated key never produces a pkBoundPlan (keyCollationCtx refuses
+	// the bound — collation.md §12).
+	coll *Collation
 }
 
 // scanBound is a per-relation scan bound (cost.md §3): a primary-key range, a
@@ -9536,6 +9542,11 @@ type indexBoundPlan struct {
 	nameKey string // the index store's key — the lowercased index name
 	colType ScalarType
 	eqs     []*rExpr
+	// coll is the leading key column's resolved collation when it is collated AND Full — the
+	// equality probe encodes via its UCA sort key (encoding.md §2.12) to match the index's stored
+	// key form (spec/design/collation.md §8). nil for a C (raw-byte) column. A Skewed collated index
+	// never produces an indexBoundPlan (keyCollationCtx refuses it — collation.md §12).
+	coll *Collation
 	// tailTypes is the REMAINING key components' types (columns[1:]): an admitted
 	// entry's row-key suffix sits after every component slot, so the fetch skips these
 	// (each slot is self-delimiting — a 0x01 NULL tag alone, or 0x00 + the type's fixed
@@ -9548,13 +9559,18 @@ type indexBoundPlan struct {
 // lowercased-name order — the deterministic tie-break), the first whose FIRST key column
 // has at least one equality conjunct against a type-matched const-source; else nil (full
 // scan).
-func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
+func detectScanBound(filter *rExpr, rel scopeRel, db *Database) *scanBound {
 	if pkLocal := rel.table.PrimaryKeyIndex(); pkLocal >= 0 {
 		// Ordered-equality pushdown is scalar-only; a non-scalar (range) PK skips it (point-lookup
 		// deferred for containers — ranges.md §10), falling through to a full scan + residual filter.
 		if sty, ok := rel.table.Columns[pkLocal].Type.AsScalar(); ok {
-			if bp := detectPKBound(filter, rel.offset+pkLocal, sty); bp != nil {
-				return &scanBound{pk: bp}
+			// The PK column's key collation form (collation.md §8/§12): push=false ⇒ collated but
+			// Skewed ⇒ refuse pushdown (full heap-scan recompute — the read-safety rule §12); else
+			// coll is nil (C, raw-byte key) or the Full-collated table (push via the sort key).
+			if coll, push := db.keyCollationCtx(rel.table.Columns[pkLocal]); push {
+				if bp := detectPKBound(filter, rel.offset+pkLocal, sty, coll); bp != nil {
+					return &scanBound{pk: bp}
+				}
 			}
 		}
 	}
@@ -9582,8 +9598,15 @@ func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 		if nonScalarTail {
 			continue
 		}
+		// The leading column's key collation form (as for the PK above). A Skewed collated index is
+		// skipped (push=false) — its stored keys are at the file's pinned version, wrong for the
+		// loaded one, so it must not be seeked (collation.md §12; the tripwire suites/collation/skew.test).
+		coll, push := db.keyCollationCtx(rel.table.Columns[ci])
+		if !push {
+			continue
+		}
 		var eqs []*rExpr
-		if bp := detectPKBound(filter, rel.offset+ci, ty); bp != nil {
+		if bp := detectPKBound(filter, rel.offset+ci, ty, coll); bp != nil {
 			for _, t := range bp.terms {
 				if t.op == OpEq {
 					eqs = append(eqs, t.src)
@@ -9596,7 +9619,7 @@ func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 				tail = append(tail, rel.table.Columns[c].Type.ScalarTy())
 			}
 			return &scanBound{index: &indexBoundPlan{
-				nameKey: strings.ToLower(idx.Name), colType: ty, eqs: eqs, tailTypes: tail,
+				nameKey: strings.ToLower(idx.Name), colType: ty, eqs: eqs, coll: coll, tailTypes: tail,
 			}}
 		}
 	}
@@ -9605,6 +9628,32 @@ func detectScanBound(filter *rExpr, rel scopeRel) *scanBound {
 		return &scanBound{gin: gb}
 	}
 	return nil
+}
+
+// keyCollationCtx reports the collation a key over col is STORED under, deciding whether — and how —
+// a comparison bound may push down to that key (spec/design/collation.md §8/§12). Three outcomes:
+//   - (nil, true)  — col is C (or non-text): the key is raw bytes (encoding.md §2.4), always
+//     pushable, the unchanged fast path.
+//   - (coll, true) — col is collated and the collation is Full (its file pin matches the loaded
+//     bundle): the key is the UCA sort key (encoding.md §2.12), pushable using coll to encode the
+//     probe in the same form.
+//   - (nil, false) — col is collated but Skewed (its file pin differs from the loaded bundle): push
+//     is REFUSED. The scan stays a full heap-scan that recomputes against the LOADED table (the
+//     read-safety rule §12; seeking a loaded-version probe in a file-version B-tree would mis-match —
+//     the tripwire suites/collation/skew.test stays green only because this refuses). An
+//     unresolvable collation likewise refuses rather than mis-encoding.
+func (db *Database) keyCollationCtx(col Column) (*Collation, bool) {
+	if col.Collation == "" {
+		return nil, true
+	}
+	snap := db.readSnap()
+	if _, _, _, _, skewed := snap.collationSkew(col.Collation); skewed {
+		return nil, false
+	}
+	if c := snap.resolveCollation(col.Collation); c != nil {
+		return c, true
+	}
+	return nil, false
 }
 
 // detectGinBound detects a GIN-bounded scan over columns/indexes (gin.md §6): the lowest-named
@@ -9754,7 +9803,7 @@ func (db *Database) indexBoundRows(tableName string, ib *indexBoundPlan, params 
 	// integer can equal no stored value — all provably empty.
 	var agreed []byte
 	for _, src := range ib.eqs {
-		key, isNull, ok := encodeBoundKey(ib.colType, src, params, outer)
+		key, isNull, ok := encodeBoundKey(ib.colType, src, params, outer, ib.coll)
 		if isNull || !ok {
 			return nil, 0, 0, nil
 		}
@@ -10017,7 +10066,7 @@ func prefixSuccessor(p []byte) []byte {
 }
 
 // pkBoundFor detects a single-table mutation's (UPDATE/DELETE) PK pushdown bound; nil ⇒ full scan.
-func pkBoundFor(table *Table, filter *rExpr) *pkBoundPlan {
+func (db *Database) pkBoundFor(table *Table, filter *rExpr) *pkBoundPlan {
 	if filter == nil {
 		return nil
 	}
@@ -10031,14 +10080,26 @@ func pkBoundFor(table *Table, filter *rExpr) *pkBoundPlan {
 	if !ok {
 		return nil
 	}
-	return detectPKBound(filter, pkIdx, sty)
+	// A collated Skewed PK refuses pushdown (push=false) — though a skewed table's write is already
+	// refused XX002 upstream (ensureCollationsWritable), so this is reached only for a C or
+	// Full-collated PK (collation.md §8/§12).
+	coll, push := db.keyCollationCtx(table.Columns[pkIdx])
+	if !push {
+		return nil
+	}
+	return detectPKBound(filter, pkIdx, sty, coll)
 }
 
 // detectPKBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction
 // is not a contiguous range) and collects every `pk <cmp> const-source` conjunct. Returns nil when
 // none exist (⇒ full scan). Conservative + sound: an unrecognized conjunct contributes no bound and
-// stays in the residual filter.
-func detectPKBound(filter *rExpr, pkIdx int, pkType ScalarType) *pkBoundPlan {
+// stays in the residual filter. coll is the key column's collation when collated AND Full (nil for a
+// C key); a comparison's own collation must match it for the comparison to seed a bound.
+func detectPKBound(filter *rExpr, pkIdx int, pkType ScalarType, coll *Collation) *pkBoundPlan {
+	colColl := ""
+	if coll != nil {
+		colColl = coll.Name
+	}
 	var terms []boundTerm
 	var walk func(e *rExpr)
 	walk = func(e *rExpr) {
@@ -10047,7 +10108,7 @@ func detectPKBound(filter *rExpr, pkIdx int, pkType ScalarType) *pkBoundPlan {
 			walk(e.rhs)
 			return
 		}
-		if t, ok := asBoundTerm(e, pkIdx, pkType); ok {
+		if t, ok := asBoundTerm(e, pkIdx, pkType, colColl); ok {
 			terms = append(terms, t)
 		}
 	}
@@ -10055,7 +10116,7 @@ func detectPKBound(filter *rExpr, pkIdx int, pkType ScalarType) *pkBoundPlan {
 	if len(terms) == 0 {
 		return nil
 	}
-	return &pkBoundPlan{pkType: pkType, terms: terms}
+	return &pkBoundPlan{pkType: pkType, terms: terms, coll: coll}
 }
 
 // asBoundTerm recognizes a single PK comparison conjunct: a comparison (=,<,<=,>,>=) with the bare
@@ -10063,14 +10124,24 @@ func detectPKBound(filter *rExpr, pkIdx int, pkType ScalarType) *pkBoundPlan {
 // matches) on one side and a const-source of the PK's own type on the other (a promoted comparison
 // — e.g. intpk = 2.5 → a reConstDecimal — does not match, so it stays residual). The op is flipped
 // when the PK is on the right.
-func asBoundTerm(e *rExpr, pkIdx int, pkType ScalarType) (boundTerm, bool) {
+func asBoundTerm(e *rExpr, pkIdx int, pkType ScalarType, colColl string) (boundTerm, bool) {
 	if e.kind != reCompare {
 		return boundTerm{}, false
 	}
-	// A collated comparison orders by the collation's UCA sort key, but the PK/index B-tree is byte
-	// (C) ordered, so a byte-range bound would be wrong — exclude it (it stays a full scan + the
-	// residual collated filter; spec/design/collation.md §8, collated keys are slice 1e).
+	// A comparison bounds the key only when ITS resolved collation matches the key column's frozen
+	// collation (colColl) — so the comparison orders text the SAME way the B-tree is keyed
+	// (spec/design/collation.md §8). C key ⇔ a C/byte comparison (both empty); a collated key ⇔ a
+	// comparison under the SAME collation (the column's implicit collation, or an explicit
+	// COLLATE "<that name>"). A comparison under a DIFFERENT collation — name COLLATE "C" over a
+	// unicode column, COLLATE "de" over unicode — does NOT match: its order disagrees with the
+	// stored keys, so it stays a full scan + residual filter. (A *skewed* collated key never reaches
+	// here — keyCollationCtx refuses the whole bound, §12.) The probe is then encoded in the key
+	// column's form (sort key for a Full-collated column — buildKeyBound/indexBoundRows).
+	cmpColl := ""
 	if e.collation != nil {
+		cmpColl = e.collation.Name
+	}
+	if cmpColl != colColl {
 		return boundTerm{}, false
 	}
 	switch e.op {
@@ -10151,7 +10222,7 @@ func flipCompare(op BinaryOp) BinaryOp {
 func (db *Database) buildKeyBound(bp *pkBoundPlan, params []Value, outer []Row) (keyBound, bool) {
 	b := unboundedBound()
 	for _, t := range bp.terms {
-		key, isNull, ok := encodeBoundKey(bp.pkType, t.src, params, outer)
+		key, isNull, ok := encodeBoundKey(bp.pkType, t.src, params, outer, bp.coll)
 		if isNull {
 			return keyBound{}, true
 		}
@@ -10184,7 +10255,7 @@ func (db *Database) buildKeyBound(bp *pkBoundPlan, params []Value, outer []Row) 
 // type's range (no key can equal it), so the caller drops this bound. reParam/reOuterColumn resolve
 // to a runtime Value first (the param table / the enclosing outer row) and then encode through the
 // shared path.
-func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row) (key []byte, isNull bool, ok bool) {
+func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row, coll *Collation) (key []byte, isNull bool, ok bool) {
 	switch src.kind {
 	case reConstNull:
 		return nil, true, false
@@ -10200,7 +10271,7 @@ func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row) 
 	case reConstTimestamp, reConstTimestamptz:
 		return EncodeInt(pkType, src.cInt), false, true
 	case reConstText:
-		return EncodeTerminated([]byte(src.cText)), false, true
+		return encodeTextBound(src.cText, coll)
 	case reConstBytea:
 		return EncodeTerminated(src.cBytea), false, true
 	case reConstDecimal:
@@ -10208,19 +10279,39 @@ func encodeBoundKey(pkType ScalarType, src *rExpr, params []Value, outer []Row) 
 	case reConstInterval:
 		return src.cIv.EncodeKey(), false, true
 	case reParam:
-		return encodeValueKey(pkType, params[src.index])
+		return encodeValueKey(pkType, params[src.index], coll)
 	case reOuterColumn:
 		// A correlated reference: column index of the enclosing row level hops out — the same
 		// indexing the evaluator uses for reOuterColumn (innermost outer row is last).
-		return encodeValueKey(pkType, outer[len(outer)-src.level][src.index])
+		return encodeValueKey(pkType, outer[len(outer)-src.level][src.index], coll)
 	}
 	return nil, false, false
 }
 
+// encodeTextBound encodes a text probe into a key bound: the raw text-terminated-escape bytes for a
+// C key (coll == nil, the fast path, encoding.md §2.4), or the collation's UCA sort key
+// (text-collated-sortkey, §2.12) for a Full-collated key. A sort-key build that fails on an unmapped
+// code point (the 0A000 the write/compare path raises, collation.md §6) yields ok=false here: the
+// probe matches no stored (always-mapped) key, so the term contributes no bound and the scan widens
+// to a full scan + residual filter — which reproduces the exact non-pushdown answer (empty for =,
+// since equality is byte-identity §7; the 0A000 for an ordering compare iff any row is scanned).
+// Identical across cores (mirrors Rust encode_text_bound / TS encodeTextBound).
+func encodeTextBound(s string, coll *Collation) (key []byte, isNull bool, ok bool) {
+	if coll == nil {
+		return EncodeTerminated([]byte(s)), false, true
+	}
+	k, err := SortKey(coll, s)
+	if err != nil {
+		return nil, false, false
+	}
+	return k, false, true
+}
+
 // encodeValueKey encodes a runtime Value (a bound param or a resolved outer column) into the PK's
 // storage key. isNull ⇒ the value is NULL (a 3VL-empty range); ok=false (not null) ⇒ an integer
-// outside the PK width, so the caller drops this half-bound (a wider, still sound, scan).
-func encodeValueKey(pkType ScalarType, v Value) (key []byte, isNull bool, ok bool) {
+// outside the PK width, so the caller drops this half-bound (a wider, still sound, scan). coll
+// selects a text value's key form (collated sort key vs raw bytes — encodeTextBound).
+func encodeValueKey(pkType ScalarType, v Value, coll *Collation) (key []byte, isNull bool, ok bool) {
 	if v.IsNull() {
 		return nil, true, false
 	}
@@ -10229,7 +10320,9 @@ func encodeValueKey(pkType ScalarType, v Value) (key []byte, isNull bool, ok boo
 		return EncodeBool(v.Bool), false, true
 	case pkType.IsUuid():
 		return []byte(v.Str), false, true
-	case pkType.IsText() || pkType.IsBytea():
+	case pkType.IsText():
+		return encodeTextBound(v.Str, coll)
+	case pkType.IsBytea():
 		return EncodeTerminated([]byte(v.Str)), false, true
 	case pkType.IsDecimal():
 		if v.Kind != ValDecimal {
