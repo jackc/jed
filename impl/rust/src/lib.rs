@@ -322,6 +322,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // spec/design/functions.md §9.
     "func.abs",
     "func.round",
+    "func.casing",
     // Named-argument notation + DEFAULT parameter values, via make_interval — functions.md §11.
     "func.named_arguments",
     // Pure uuid extractors (uuid_extract_version/_timestamp) — functions.md §12.
@@ -419,6 +420,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "expr.in_list",
     "expr.between",
     "expr.like",
+    "expr.ilike",
     "expr.case",
     // Cost-accounting seam — the harness asserts the deterministic, cross-core-identical
     // accrued cost via the `# cost:` directive (CLAUDE.md §13).

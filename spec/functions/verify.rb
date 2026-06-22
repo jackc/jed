@@ -147,8 +147,9 @@ def main
     # A comparison spelled with punctuation (= < > <= >=) must carry its `symbol` (catches
     # a forgotten spelling). Keyword-form comparisons have no punctuation symbol — exempt
     # them, like null tests: the NULL-safe comparisons (IS [NOT] DISTINCT FROM,
-    # null = "null_safe") and the keyword pattern operator LIKE (name "like").
-    keyword_comparison = op["null"] == "null_safe" || op["name"] == "like"
+    # null = "null_safe") and the keyword pattern operators LIKE / ILIKE.
+    keyword_comparison =
+      op["null"] == "null_safe" || op["name"] == "like" || op["name"] == "ilike"
     if kind == "comparison" && !keyword_comparison && !op.key?("symbol")
       fail!("operator #{id}: comparison must have a `symbol`")
     end

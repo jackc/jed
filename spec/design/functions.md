@@ -205,13 +205,15 @@ Reserved values and kinds still to be authored spec-first with their own executo
 ([../../TODO.md](../../TODO.md)):
 
 - The `function` kind is now **substantially authored**: `abs`/`round` (§9), `make_interval`
-  with named + `DEFAULT` arguments (§11), and the uuid extractors/generators + clock functions
-  (§12) all landed as `[[operator]]` rows with `kind = "function"`, plus `generate_series` as a
-  `set_returning` row (§10). Further scalar functions — `ceil`, `floor`, `mod`, `sign`, the
-  text `length`/`lower`/`upper`, and the like — are follow-on slices that reuse the same mold. When
-  `lower`/`upper`/`initcap` (and `ILIKE`) land they **fold ASCII only** by default and consult the
-  **loaded Unicode property tables** for full Unicode casing — the SQLite-style baseline, with no
-  casing table built into the engine ([collation.md §16](collation.md)).
+  with named + `DEFAULT` arguments (§11), the uuid extractors/generators + clock functions
+  (§12), and the text casing functions **`lower(text)`/`upper(text)`** (collation Slice 3e) all
+  landed as `[[operator]]` rows with `kind = "function"`, plus `generate_series` as a
+  `set_returning` row (§10). `lower`/`upper` are **overloaded** — the same names are the range
+  accessors (range → element); the resolver branches on the argument type. They **fold ASCII only**
+  by default and consult the **loaded Unicode property tables** for full Unicode casing — the
+  SQLite-style baseline, with no casing table built into the engine ([collation.md §16](collation.md));
+  `ILIKE` (case-insensitive `LIKE`) folds the same way. Further scalar functions — `ceil`, `floor`,
+  `mod`, `sign`, the text `length`, `initcap`, and the like — are follow-on slices that reuse the mold.
 
 **The polymorphic array functions are authored (`kind = "function"`, over `anyarray`/`anyelement`).**
 AF1 — `array_ndims`/`array_length`/`array_lower`/`array_upper`/`cardinality`/`array_dims` and the

@@ -361,10 +361,26 @@ errors         = []
 # `NOT LIKE` is its negation (carried by the AST, not a separate operator). A pattern that
 # ENDS in a lone escape char, reached during matching while subject remains, traps 22025
 # (../design/grammar.md §22; verified against PostgreSQL 18). text vs a non-text operand is a
-# 42804 (compare.toml lists only text×text). Deferred: ESCAPE clause, ILIKE, SIMILAR TO.
+# 42804 (compare.toml lists only text×text). ILIKE is the case-insensitive form (below); the
+# ESCAPE clause and SIMILAR TO remain deferred.
 
 [[operator]]
 name           = "like"
+kind           = "comparison"
+arity          = 2
+arg_families   = ["text", "text"]
+arg_resolution = "none"
+result         = "boolean"
+null           = "propagates"
+precedence     = 35
+errors         = ["22025"]
+
+# ILIKE — case-insensitive LIKE (collation.md §16). Identical contract to LIKE; the matcher
+# simple-lowercases (1:1, ASCII baseline when no Unicode property bundle is loaded; full simple
+# Unicode mappings when one is) both operands before matching, so `_`/length semantics survive.
+# `NOT ILIKE` is its negation (carried by the AST). Same keyword-operator shape as `like`.
+[[operator]]
+name           = "ilike"
 kind           = "comparison"
 arity          = 2
 arg_families   = ["text", "text"]
@@ -2650,8 +2666,10 @@ errors         = []
 # (ELEM), or NULL when the range is empty or unbounded on that side; the four `_inc`/`_inf` readers +
 # `isempty` return boolean. For the empty range: isempty = true, every other reader is false / NULL.
 # For an infinite bound: lower/upper = NULL, the *_inf reader = true, the *_inc reader = false (an
-# infinite bound is never inclusive). Oracle-pinned vs postgres:18. (jed has no string lower/upper —
-# these names are range-only here, a documented divergence from PG's overloaded lower(text)/upper(text).)
+# infinite bound is never inclusive). Oracle-pinned vs postgres:18. `lower`/`upper` are OVERLOADED:
+# the range accessors here plus the text casing functions below (text → text, collation.md §16) — the
+# resolver branches on the argument type (a range → the accessor, text → casing), matching PG's
+# overloaded lower(text)/upper(text). (Earlier jed had only the range forms.)
 
 [[operator]]
 name           = "lower"
@@ -2670,6 +2688,33 @@ arity          = 1
 arg_families   = ["anyrange"]
 arg_resolution = "none"
 result         = "anyelement"
+null           = "propagates"
+errors         = []
+
+# --- the text casing functions (../design/collation.md §16, Slice 3e) -------------------------
+# `lower(text)`/`upper(text)` — Unicode case folding, the text OVERLOAD of the range accessors above
+# (the resolver picks by argument type). With no Unicode property bundle loaded they fold ASCII only
+# and pass other code points through (the SQLite default, version-independent); with a bundle's
+# property section loaded they fold via the full Unicode case mappings incl. SpecialCasing (`ß`→`SS`).
+# STRICT (null = "propagates"). Pure (the casing tables are jed's own pinned bytes — no host read, no
+# determinism-ledger entry). `initcap` is a deferred follow-on (needs word-boundary titlecasing).
+[[operator]]
+name           = "lower"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "upper"
+kind           = "function"
+arity          = 1
+arg_families   = ["text"]
+arg_resolution = "none"
+result         = "text"
 null           = "propagates"
 errors         = []
 

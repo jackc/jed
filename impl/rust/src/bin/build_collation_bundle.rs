@@ -16,7 +16,8 @@
 //! → SaveCollation(.coll) → builder(.coll → JUCD)` (§4.1).
 
 use jed::collation::{
-    Collation, build_bundle, load_bundle, open_bundle, open_collation, save_bundle, serialize_table,
+    Bundle, Collation, PropertyTable, Section, build_bundle, compile_casing, load_bundle,
+    open_bundle, open_collation, save_bundle, serialize_table,
 };
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -57,8 +58,12 @@ enum Preset {
     Everything,
 }
 
+fn collation_dir() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation")
+}
+
 fn fixtures_dir() -> PathBuf {
-    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/fixtures")
+    collation_dir().join("fixtures")
 }
 
 /// Read + deserialize a committed `.coll` artifact.
@@ -66,6 +71,25 @@ fn open_fixture(coll: &str) -> Collation {
     let path = fixtures_dir().join(coll);
     let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
     open_collation(&bytes).unwrap_or_else(|e| panic!("open {}: {}", path.display(), e.message))
+}
+
+/// Compile the committed casing source into the property section, plus the `@version` it pins (the
+/// bundle header axis for a property-only `casing-only` bundle, §16). The source is the casing
+/// analogue of the `.coll` set: a build-time input, never read by the production engine.
+fn read_casing() -> (PropertyTable, String) {
+    let path = collation_dir().join("17.0.0/casing.txt");
+    let text =
+        std::fs::read_to_string(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    let version = text
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("@version")
+                .map(|v| v.trim().to_string())
+        })
+        .unwrap_or_default();
+    let prop = compile_casing(&text).unwrap_or_else(|e| panic!("compile casing: {}", e.message));
+    (prop, version)
 }
 
 fn main() -> ExitCode {
@@ -101,22 +125,41 @@ fn main() -> ExitCode {
             }
         }
     }
-    let out = out.unwrap_or_else(|| fixtures_dir().join("unicode.jucd"));
-
     // The property/casing section is the only content of `casing-only` and rides every other preset
-    // too (§13/§16). It is authored in slice 3e; until then there is no casing data to pack.
-    let property = None; // slice 3e (§16)
+    // too (§13/§16) — one `(unicode_version)` axis keeps casing and collation from mismatching.
+    let (property, casing_version) = read_casing();
 
     if matches!(preset, Preset::CasingOnly) {
-        // No collations, and no property/casing data yet — a casing-only bundle would be empty.
-        // Recognize the preset (the framework is complete) but defer to slice 3e rather than ship a
-        // misleading empty property section.
+        // A property-only bundle: the casing tables, no collation root/tailorings (§13). Its header
+        // version is the casing source's `@version`.
+        let out = out.unwrap_or_else(|| fixtures_dir().join("casing.jucd"));
+        let bundle = Bundle {
+            unicode_version: casing_version,
+            cldr_version: String::new(),
+            description: String::new(),
+            sections: vec![Section::Property(property.clone())],
+        };
+        let bytes = save_bundle(&bundle);
+        // Self-check: open → load reproduces the property table.
+        let (_colls, loaded) =
+            load_bundle(&open_bundle(&bytes).expect("open_bundle")).expect("load");
+        assert_eq!(
+            loaded.as_ref(),
+            Some(&property),
+            "casing-only: loaded property table differs from the compiled one"
+        );
+        std::fs::write(&out, &bytes).unwrap_or_else(|e| panic!("write {}: {e}", out.display()));
         println!(
-            "casing-only: the Unicode property/casing section lands in slice 3e (collation.md §16); \
-             nothing to assemble yet — not written."
+            "wrote {} ({} bytes): property/casing only ({} simple + {} special mappings)",
+            out.display(),
+            bytes.len(),
+            property.simple.len(),
+            property.special.len()
         );
         return ExitCode::SUCCESS;
     }
+
+    let out = out.unwrap_or_else(|| fixtures_dir().join("unicode.jucd"));
 
     // Select root + tailorings for the preset, opening each from its committed `.coll`.
     let keep_cjk = matches!(preset, Preset::Everything);
@@ -135,7 +178,7 @@ fn main() -> ExitCode {
     // Assemble: a shared root + sparse per-locale deltas (build_bundle diffs each tailoring against
     // the root, §5.1). Empty description keeps the loaded collations' introspection identical to the
     // compiled tables (gen emits an empty description).
-    let bundle = build_bundle(&root, &refs, property, "");
+    let bundle = build_bundle(&root, &refs, Some(property), "");
     let bytes = save_bundle(&bundle);
 
     // Self-check the merge identity (§5.1): open → load → merge reproduces each full `.coll` table

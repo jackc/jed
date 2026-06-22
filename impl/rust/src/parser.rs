@@ -2405,7 +2405,7 @@ impl Parser {
         let negated = self.peek_keyword().as_deref() == Some("not")
             && matches!(
                 self.peek_keyword_at(1).as_deref(),
-                Some("in") | Some("between") | Some("like")
+                Some("in") | Some("between") | Some("like") | Some("ilike")
             );
         if negated {
             self.advance(); // NOT
@@ -2453,13 +2453,17 @@ impl Parser {
                 negated,
             });
         }
-        if self.peek_keyword().as_deref() == Some("like") {
+        // LIKE / ILIKE (case-insensitive) — grammar.md §22. Both bind at the comparison level; the
+        // pattern is one CONCAT expression. `ilike` is just another peeked keyword (no lexer change).
+        if matches!(self.peek_keyword().as_deref(), Some("like") | Some("ilike")) {
+            let insensitive = self.peek_keyword().as_deref() == Some("ilike");
             self.advance();
             let rhs = self.parse_concat()?;
             return Ok(Expr::Like {
                 lhs: Box::new(lhs),
                 rhs: Box::new(rhs),
                 negated,
+                insensitive,
             });
         }
         let op = match self.peek() {

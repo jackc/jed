@@ -280,7 +280,12 @@ bundle {
 
 - **A `root` section payload is the §2 compiled table bytes verbatim.**
 - **A `property` section payload** is the Unicode casing table (the first cut ships **case mappings
-  only**; normalization is reserved — [../design/collation.md §16](../design/collation.md)):
+  only**; normalization is reserved — [../design/collation.md §16](../design/collation.md)). It is
+  compiled (build-time, `compile_casing`) from the compact, committed source
+  [17.0.0/casing.txt](17.0.0/casing.txt) — `@version` then `CP ; UPPER ; LOWER ; TITLE` simple lines
+  (`-` = identity) and an `@special` section of unconditional full mappings (`ß` → `SS`) — and packed
+  into the bundle by the builder (`build_collation_bundle`, §4.1). Backs `upper`/`lower`/`ILIKE`
+  ([../design/collation.md §16](../design/collation.md)):
 
   ```
   property_payload {

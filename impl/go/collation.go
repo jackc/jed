@@ -707,14 +707,19 @@ func OpenCollation(bytes []byte) (*Collation, error) {
 var (
 	loadedMu   sync.RWMutex
 	loadedColl = map[string]*Collation{}
+	// loadedProp is the engine-global Unicode property/casing table (spec/design/collation.md §16),
+	// nil until a bundle carrying a property section is loaded. Its presence is the binary "casing
+	// regime" the C/ASCII baseline flips on: nil ⇒ casing is ASCII-only, table-free, version-free.
+	// FIRST-WINS, like loadedColl.
+	loadedProp *PropertyTable
 )
 
-// LoadUnicodeData loads a JUCD Unicode-data bundle's collations into the engine-global loaded set
+// LoadUnicodeData loads a JUCD Unicode-data bundle into the engine-global loaded set
 // (spec/design/collation.md §4/§9): parse the bundle, merge the root + each per-locale delta (§5.1),
-// and register every collation by name. ADDITIVE — a name already present is NOT replaced (the first
-// bundle to provide it wins; resolution is by name in load order, §4.2), so re-loading the same
-// bundle is an idempotent no-op. The property/casing section is parsed and validated but not yet
-// consumed (casing lands in slice 3e). A malformed bundle is XX001 (data_corrupted).
+// register every collation by name, and store the property/casing section (§16). ADDITIVE /
+// FIRST-WINS — a collation name already present is NOT replaced (the first bundle to provide it wins;
+// resolution is by name in load order, §4.2), and a property table is only stored if none is loaded
+// yet, so re-loading the same bundle is an idempotent no-op. A malformed bundle is XX001.
 //
 // This is the engine primitive behind db.LoadUnicodeData. Because the set is process-global it may
 // be called BEFORE opening any file (which is required: opening a file that references a collation
@@ -725,7 +730,7 @@ func LoadUnicodeData(data []byte) error {
 	if err != nil {
 		return err
 	}
-	colls, _, err := LoadBundle(bundle)
+	colls, prop, err := LoadBundle(bundle)
 	if err != nil {
 		return err
 	}
@@ -736,7 +741,19 @@ func LoadUnicodeData(data []byte) error {
 			loadedColl[c.Name] = c
 		}
 	}
+	if prop != nil && loadedProp == nil {
+		loadedProp = prop
+	}
 	return nil
+}
+
+// LoadedProperty returns the engine-global property/casing table, or nil if no bundle providing one
+// has been loaded (§16) — nil ⇒ the ASCII-casing baseline. The casing functions look this up ONCE per
+// evaluation and pass it to the pure kernels below, which keeps the un-loaded (ASCII) regime testable.
+func LoadedProperty() *PropertyTable {
+	loadedMu.RLock()
+	defer loadedMu.RUnlock()
+	return loadedProp
 }
 
 // LoadedCollation looks up a collation in the engine-global LOADED set by its exact (case-sensitive)
@@ -965,6 +982,106 @@ type SpecialCasing struct {
 type PropertyTable struct {
 	Simple  []SimpleCase
 	Special []SpecialCasing
+}
+
+// ============================================================================================
+// Casing kernels (spec/design/collation.md §16) — the production upper/lower/ILIKE folds. Each
+// takes the resolved property table EXPLICITLY (nil ⇒ the ASCII baseline), so the evaluator does the
+// one engine-global LoadedProperty() lookup and the kernels stay pure — which makes the un-loaded
+// (ASCII) regime deterministically unit-testable. Cross-core byte-identical given identical input
+// (the corpus pins it incl. an astral cased letter, the TS UTF-16 trap; Go ranges over runes).
+// ============================================================================================
+
+// FoldCase folds a string's case. p == nil is the ASCII baseline (fold a–z/A–Z, pass other code
+// points through — the SQLite default, version-independent). A non-nil p folds via the loaded Unicode
+// tables — full mappings incl. SpecialCasing expansions (ß→SS). upper selects the direction. Backs
+// the upper(text)/lower(text) functions (functions.md §9).
+func FoldCase(s string, upper bool, p *PropertyTable) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		if p == nil {
+			b.WriteRune(asciiFold(r, upper))
+			continue
+		}
+		cp := uint32(r)
+		if sc := propLookupSpecial(p, cp); sc != nil {
+			seq := sc.Lower
+			if upper {
+				seq = sc.Upper
+			}
+			for _, m := range seq {
+				b.WriteRune(runeOr(m, r))
+			}
+		} else if sm, ok := propLookupSimple(p, cp); ok {
+			m := sm.Lower
+			if upper {
+				m = sm.Upper
+			}
+			b.WriteRune(runeOr(m, r))
+		} else {
+			b.WriteRune(r)
+		}
+	}
+	return b.String()
+}
+
+// FoldLowerSimple folds to lowercase for case-insensitive matching (ILIKE) — SIMPLE 1:1 mappings
+// only (never the expanding SpecialCasing forms), so every code point stays one code point and the
+// matcher's _/length semantics are preserved (grammar.md §22). ASCII baseline when p == nil.
+func FoldLowerSimple(s string, p *PropertyTable) string {
+	var b strings.Builder
+	b.Grow(len(s))
+	for _, r := range s {
+		switch {
+		case p == nil:
+			b.WriteRune(asciiFold(r, false))
+		default:
+			if sm, ok := propLookupSimple(p, uint32(r)); ok {
+				b.WriteRune(runeOr(sm.Lower, r))
+			} else {
+				b.WriteRune(r)
+			}
+		}
+	}
+	return b.String()
+}
+
+// asciiFold folds a single rune ASCII-only (a–z/A–Z), passing every other code point through.
+func asciiFold(r rune, upper bool) rune {
+	if upper {
+		if r >= 'a' && r <= 'z' {
+			return r - 32
+		}
+	} else if r >= 'A' && r <= 'Z' {
+		return r + 32
+	}
+	return r
+}
+
+// runeOr converts a mapped code point to a rune, falling back to src if it is not a valid Unicode
+// scalar value (impossible in vetted casing data; the guard mirrors Rust's char::from_u32 fallback).
+func runeOr(cp uint32, src rune) rune {
+	if cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF) {
+		return src
+	}
+	return rune(cp)
+}
+
+func propLookupSimple(p *PropertyTable, cp uint32) (SimpleCase, bool) {
+	i := sort.Search(len(p.Simple), func(i int) bool { return p.Simple[i].Cp >= cp })
+	if i < len(p.Simple) && p.Simple[i].Cp == cp {
+		return p.Simple[i], true
+	}
+	return SimpleCase{}, false
+}
+
+func propLookupSpecial(p *PropertyTable, cp uint32) *SpecialCasing {
+	i := sort.Search(len(p.Special), func(i int) bool { return p.Special[i].Cp >= cp })
+	if i < len(p.Special) && p.Special[i].Cp == cp {
+		return &p.Special[i]
+	}
+	return nil
 }
 
 // bundleEntries is a §2 table — a full table for a root, a sparse override for a tailoring — plus

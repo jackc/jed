@@ -12055,6 +12055,9 @@ const (
 	reIsNull
 	reDistinct
 	reLike
+	// reCasing is upper(text)/lower(text) — Unicode case folding (collation.md §16). casingUpper
+	// selects the direction; folds via the engine-global property table or the ASCII baseline.
+	reCasing
 	reCase
 	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
 	// evaluated per row in any context.
@@ -12305,8 +12308,12 @@ type rExpr struct {
 	typmod  *DecimalTypmod // reCast: a decimal target's numeric(p,s) typmod
 	lhs     *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
 	rhs     *rExpr         // reArith, reCompare, reAnd, reOr, reDistinct
-	operand *rExpr         // reCast, reNeg, reNot, reIsNull
+	operand *rExpr         // reCast, reNeg, reNot, reIsNull, reCasing
 	negated bool           // reIsNull, reDistinct
+	// insensitive carries ILIKE (reLike); casingUpper selects upper vs lower (reCasing) — both
+	// collation.md §16.
+	insensitive bool
+	casingUpper bool
 	// collation is the derived collation of a reCompare (spec/design/collation.md §7). nil is the
 	// C / default byte order (the unchanged fast path); non-nil is a loaded collation that orders the
 	// ORDERING comparisons (< <= > >=) by its UCA sort key. =/<> stay byte-equality regardless
@@ -13921,6 +13928,31 @@ func rangeFuncID(name string) rangeFunc {
 	}
 }
 
+// resolveLowerUpper resolves lower/upper, overloaded across the range accessors and the text casing
+// functions (functions.md §9, collation.md §16). The single argument resolves once (offering text as
+// the literal-adaptation hint, so a bare NULL / untyped $1 adapts to text — the common case; a typed
+// range keeps its range type and ignores the scalar hint). A text/NULL argument folds case (reCasing,
+// result text); a range argument is the bound accessor (reRangeFunc, result the element type);
+// anything else is 42883 (no overload).
+func resolveLowerUpper(s *scope, name string, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if len(fc.Args) != 1 {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	textHint := Text
+	r, t, err := resolve(s, *fc.Args[0], &textHint, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	switch t.kind {
+	case rtText, rtNull:
+		return &rExpr{kind: reCasing, operand: r, casingUpper: name == "upper"}, resolvedType{kind: rtText}, nil
+	case rtRange:
+		return &rExpr{kind: reRangeFunc, rfunc: rangeFuncID(name), sargs: []*rExpr{r}}, *t.elem, nil
+	default:
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+}
+
 // resolveRangeFunc resolves a polymorphic range accessor over the anyrange pseudo-family
 // (range-functions.md §1). Simpler than resolveArrayFunc — the accessors take a single anyrange arg
 // with no anyelement arg, so there is no element-hint literal adaptation. lower/upper resolve to ELEM
@@ -14564,6 +14596,18 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 	// make_interval is the one named/defaulted function — it keeps its own resolver (§11).
 	if name == "make_interval" {
 		return resolveMakeInterval(s, fc, ag, params)
+	}
+	// lower/upper are overloaded across the range accessors (range → element) and the text casing
+	// functions (text → text, collation.md §16). Resolve the single argument once and branch on its
+	// type, BEFORE the by-name kind dispatch (which would force the range path for both). functions.md §9
+	if name == "lower" || name == "upper" {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		return resolveLowerUpper(s, name, fc, ag, params)
 	}
 	// Otherwise the registry (the catalog descriptor tables) decides whether the name is an
 	// aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -16090,7 +16134,7 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if err := requireTextOrNull(rt); err != nil {
 			return nil, resolvedType{}, err
 		}
-		return &rExpr{kind: reLike, lhs: rl, rhs: rr, negated: e.Like.Negated},
+		return &rExpr{kind: reLike, lhs: rl, rhs: rr, negated: e.Like.Negated, insensitive: e.Like.Insensitive},
 			resolvedType{kind: rtBool}, nil
 	case ExprCase:
 		// Resolve each branch's condition: searched form requires a boolean WHEN (42804
@@ -18458,12 +18502,30 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		if subject.Kind == ValNull || pattern.Kind == ValNull {
 			return NullValue(), nil
 		}
-		matched, err := likeMatch(subject.Str, pattern.Str)
+		sub, pat := subject.Str, pattern.Str
+		// ILIKE: simple-lowercase both sides under the engine casing regime (collation.md §16)
+		// before matching — 1:1 folding so _/length semantics survive.
+		if e.insensitive {
+			prop := LoadedProperty()
+			sub = FoldLowerSimple(sub, prop)
+			pat = FoldLowerSimple(pat, prop)
+		}
+		matched, err := likeMatch(sub, pat)
 		if err != nil {
 			return Value{}, err
 		}
-		// negated carries NOT LIKE: matched != negated flips the result for NOT LIKE.
+		// negated carries NOT LIKE/ILIKE: matched != negated flips for the NOT form.
 		return BoolValue(matched != e.negated), nil
+	case reCasing:
+		m.Charge(Costs.OperatorEval)
+		v, err := e.operand.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if v.Kind == ValNull {
+			return NullValue(), nil
+		}
+		return TextValue(FoldCase(v.Str, e.casingUpper, LoadedProperty())), nil
 	case reCase:
 		// CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are
 		// evaluated in order and evaluation STOPS at the first TRUE — a FALSE or NULL/UNKNOWN

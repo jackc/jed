@@ -547,6 +547,10 @@ id = "expr.like"
 description = "text LIKE pattern / NOT LIKE — % matches any run, _ one code point, default \\ escape; text×text→boolean, NULL propagates, non-text 42804; a pattern ending in a lone escape reached during matching is 22025; code-point (not UTF-16) iteration (spec/design/grammar.md §22)"
 
 [[capability]]
+id = "expr.ilike"
+description = "text ILIKE / NOT ILIKE — case-insensitive LIKE (spec/design/collation.md §16, grammar.md §22). Same contract as LIKE; the matcher simple-lowercases (1:1) both operands first — ASCII-only when no Unicode property bundle is loaded, full simple Unicode mappings when one is. % matches any run, _ one code point, default \\ escape; NULL propagates; non-text 42804; trailing-escape 22025. Builds on expr.like"
+
+[[capability]]
 id = "expr.case"
 description = "CASE expression (searched + simple forms): lazy first-match evaluation (later arms not evaluated — the one short-circuit exception); searched WHEN must be boolean (42804); result-arm types unify to a common type (numeric promote; cross-family 42804; all-NULL → text); no match + no ELSE → NULL; output name ?column? (spec/design/grammar.md §23)"
 
@@ -564,6 +568,10 @@ description = "abs(x) scalar function — abs(i16|i32|i64) → same int type (ab
 [[capability]]
 id = "func.round"
 description = "round(x[, n]) scalar function — numeric/integer → numeric, half-away-from-zero to scale 0 or n places; integer overloads return numeric (PG round(5)); NULL propagates (spec/design/functions.md §9)"
+
+[[capability]]
+id = "func.casing"
+description = "lower(text) / upper(text) — Unicode case folding (spec/design/collation.md §16), the text OVERLOAD of the range accessors (the resolver branches on the argument type). With no property bundle loaded they fold ASCII a–z/A–Z only and pass other code points through (the SQLite default, version-independent); with a bundle's property section loaded they fold via the full Unicode case mappings incl. SpecialCasing (ß→SS, a divergence from glibc's 1:1 — unit-tested, not oracle). text → text, NULL propagates; one operator_eval. Builds on types.text"
 
 [[capability]]
 id = "func.named_arguments"

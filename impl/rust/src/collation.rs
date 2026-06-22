@@ -144,6 +144,69 @@ pub fn compile_collation(name: &str, definition: &str) -> Result<Collation> {
     })
 }
 
+/// Compile the compact casing source (spec/collation/README.md §5, spec/collation/17.0.0/casing.txt)
+/// into a `PropertyTable` — **build-time tooling** (the builder + the vector generator), like
+/// `compile_collation`; the production cores never call it (they load the compiled property section
+/// from a bundle, §4.2). Two line-dispatched sections: simple 1:1 mappings (`CP ; UPPER ; LOWER ;
+/// TITLE`), then `@special` full (multi-code-point) **unconditional** mappings (`CP ; UPPER… ; LOWER…
+/// ; TITLE…`). `-` is the identity mapping. Deterministic and host-free.
+pub fn compile_casing(text: &str) -> Result<PropertyTable> {
+    let mut simple: Vec<(u32, u32, u32, u32)> = Vec::new();
+    let mut special: Vec<SpecialCasing> = Vec::new();
+    let mut in_special = false;
+    for raw in text.lines() {
+        let line = strip_comment(raw).trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('@') {
+            // @special switches sections; @version is the bundle header's, not the table's.
+            if rest.split_whitespace().next() == Some("special") {
+                in_special = true;
+            }
+            continue;
+        }
+        let mut fields = line.split(';');
+        let cp = parse_hex(fields.next().unwrap_or(""))?;
+        if in_special {
+            let upper = casing_seq_field(fields.next(), cp)?;
+            let lower = casing_seq_field(fields.next(), cp)?;
+            let title = casing_seq_field(fields.next(), cp)?;
+            special.push(SpecialCasing {
+                cp,
+                upper,
+                lower,
+                title,
+            });
+        } else {
+            let upper = casing_simple_field(fields.next(), cp)?;
+            let lower = casing_simple_field(fields.next(), cp)?;
+            let title = casing_simple_field(fields.next(), cp)?;
+            simple.push((cp, upper, lower, title));
+        }
+    }
+    // Sort so the serialized property bytes are deterministic regardless of source order (README §5).
+    simple.sort_by_key(|(cp, ..)| *cp);
+    special.sort_by_key(|sc| sc.cp);
+    Ok(PropertyTable { simple, special })
+}
+
+/// One simple-mapping field: `-` (or absent) is the identity (the code point itself), else a hex CP.
+fn casing_simple_field(tok: Option<&str>, cp: u32) -> Result<u32> {
+    match tok.map(str::trim) {
+        Some("-") | None | Some("") => Ok(cp),
+        Some(s) => parse_hex(s),
+    }
+}
+
+/// One full-mapping field: `-` (or absent) is the identity (`[cp]`), else a space-separated CP list.
+fn casing_seq_field(tok: Option<&str>, cp: u32) -> Result<Vec<u32>> {
+    match tok.map(str::trim) {
+        Some("-") | None | Some("") => Ok(vec![cp]),
+        Some(s) => s.split_whitespace().map(parse_hex).collect(),
+    }
+}
+
 /// Strip a trailing `# comment` (the whole rest of the line). Definitions have no string literals,
 /// so a bare `#` always starts a comment.
 fn strip_comment(line: &str) -> &str {
@@ -631,12 +694,25 @@ fn loaded_set()
     LOADED.get_or_init(|| std::sync::RwLock::new(std::collections::BTreeMap::new()))
 }
 
-/// Load a `JUCD` Unicode-data bundle's collations into the engine-global loaded set (§4/§9): parse
-/// the bundle, merge the root + each per-locale delta (§5.1), and register every collation by name.
-/// **Additive** — a name already present is **not** replaced (the first bundle to provide it wins;
-/// resolution is by name in load order, §4.2), so re-loading the same bundle is an idempotent no-op.
-/// The property/casing section is parsed and validated but not yet consumed (casing lands in slice
-/// 3e). A malformed bundle is `XX001` (`data_corrupted`).
+/// The engine-global Unicode property/casing table (spec/design/collation.md §16). `None` until a
+/// bundle carrying a property section is loaded; thereafter the casing functions (`upper`/`lower`/
+/// `ILIKE`) fold via it. **First-wins**, like the collation set. Its presence is the binary "casing
+/// regime" the `C`/ASCII baseline (§16) flips on: with `None` casing is ASCII-only, table-free, and
+/// version-independent.
+static LOADED_PROPERTY: std::sync::OnceLock<
+    std::sync::RwLock<Option<std::sync::Arc<PropertyTable>>>,
+> = std::sync::OnceLock::new();
+
+fn property_slot() -> &'static std::sync::RwLock<Option<std::sync::Arc<PropertyTable>>> {
+    LOADED_PROPERTY.get_or_init(|| std::sync::RwLock::new(None))
+}
+
+/// Load a `JUCD` Unicode-data bundle into the engine-global loaded set (§4/§9): parse the bundle,
+/// merge the root + each per-locale delta (§5.1), register every collation by name, and store the
+/// **property/casing** section (§16). **Additive / first-wins** — a collation name already present is
+/// **not** replaced (the first bundle to provide it wins; resolution is by name in load order, §4.2),
+/// and a property table is only stored if none is loaded yet, so re-loading the same bundle is an
+/// idempotent no-op. A malformed bundle is `XX001` (`data_corrupted`).
 ///
 /// This is the engine primitive behind `db.LoadUnicodeData`. Because the set is process-global it
 /// may be called **before** opening any file (which is required: opening a file that references a
@@ -644,15 +720,35 @@ fn loaded_set()
 /// file path and reaches no host data (§11); the host sources the bytes.
 pub fn load_unicode_data(bytes: &[u8]) -> Result<()> {
     let bundle = open_bundle(bytes)?;
-    let (colls, _property) = load_bundle(&bundle)?;
-    let mut set = loaded_set()
-        .write()
-        .expect("loaded-collation lock poisoned");
-    for c in colls {
-        set.entry(c.name.clone())
-            .or_insert_with(|| std::sync::Arc::new(c));
+    let (colls, property) = load_bundle(&bundle)?;
+    {
+        let mut set = loaded_set()
+            .write()
+            .expect("loaded-collation lock poisoned");
+        for c in colls {
+            set.entry(c.name.clone())
+                .or_insert_with(|| std::sync::Arc::new(c));
+        }
+    }
+    if let Some(p) = property {
+        let mut slot = property_slot()
+            .write()
+            .expect("loaded-property lock poisoned");
+        if slot.is_none() {
+            *slot = Some(std::sync::Arc::new(p));
+        }
     }
     Ok(())
+}
+
+/// The engine-global property/casing table, if a bundle providing one has been loaded (§16). `None` ⇒
+/// the ASCII-casing baseline. The casing functions look this up **once per evaluation** and pass it to
+/// the pure kernels below, which is what keeps the un-loaded (ASCII) regime deterministically testable.
+pub fn loaded_property() -> Option<std::sync::Arc<PropertyTable>> {
+    property_slot()
+        .read()
+        .expect("loaded-property lock poisoned")
+        .clone()
 }
 
 /// Look up a collation in the engine-global **loaded** set by its exact (case-sensitive) name
@@ -665,6 +761,88 @@ pub fn loaded_collation(name: &str) -> Option<std::sync::Arc<Collation>> {
         .expect("loaded-collation lock poisoned")
         .get(name)
         .cloned()
+}
+
+// ============================================================================================
+// Casing kernels (spec/design/collation.md §16) — the production `upper`/`lower`/`ILIKE` folds.
+//
+// Each takes the resolved property table EXPLICITLY (`None` ⇒ the ASCII baseline), so the evaluator
+// does the one engine-global `loaded_property()` lookup and the kernels stay pure functions — which
+// is what makes the un-loaded (ASCII) regime deterministically unit-testable despite the global set.
+// Cross-core byte-identical given identical input (the casing vectors pin it, §10), including the TS
+// UTF-16-vs-code-point trap (an astral cased letter like Deseret U+10428).
+// ============================================================================================
+
+/// Fold a string's case. `prop = None` is the **ASCII baseline** (fold `a–z`/`A–Z`, pass every other
+/// code point through — the SQLite default, version-independent). `prop = Some(table)` folds via the
+/// loaded Unicode tables — full case mappings including SpecialCasing expansions (`ß`→`SS`). `upper`
+/// selects the direction. Backs the `upper(text)` / `lower(text)` functions ([functions.md §9]).
+pub fn fold_case(s: &str, upper: bool, prop: Option<&PropertyTable>) -> String {
+    match prop {
+        None => s
+            .chars()
+            .map(|c| {
+                if upper {
+                    c.to_ascii_uppercase()
+                } else {
+                    c.to_ascii_lowercase()
+                }
+            })
+            .collect(),
+        Some(p) => {
+            let mut out = String::new();
+            for c in s.chars() {
+                let cp = c as u32;
+                if let Some(sc) = prop_lookup_special(p, cp) {
+                    push_mapped(&mut out, if upper { &sc.upper } else { &sc.lower }, c);
+                } else if let Some((_, up, lo, _)) = prop_lookup_simple(p, cp) {
+                    let m = if upper { up } else { lo };
+                    out.push(char::from_u32(m).unwrap_or(c));
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+    }
+}
+
+/// Fold to lowercase for case-insensitive matching (`ILIKE`) — **simple 1:1 mappings only** (never the
+/// expanding SpecialCasing forms), so every code point stays one code point and the matcher's `_` /
+/// length semantics are preserved (grammar.md §22). ASCII baseline when `prop` is `None`.
+pub fn fold_lower_simple(s: &str, prop: Option<&PropertyTable>) -> String {
+    match prop {
+        None => s.chars().map(|c| c.to_ascii_lowercase()).collect(),
+        Some(p) => s
+            .chars()
+            .map(|c| match prop_lookup_simple(p, c as u32) {
+                Some((_, _, lo, _)) => char::from_u32(lo).unwrap_or(c),
+                None => c,
+            })
+            .collect(),
+    }
+}
+
+/// Append a mapped code-point sequence as chars (a non-char-scalar value is impossible in vetted
+/// Unicode casing data; fall back to the source char if one ever appears).
+fn push_mapped(out: &mut String, seq: &[u32], src: char) {
+    for &cp in seq {
+        out.push(char::from_u32(cp).unwrap_or(src));
+    }
+}
+
+fn prop_lookup_simple(p: &PropertyTable, cp: u32) -> Option<(u32, u32, u32, u32)> {
+    p.simple
+        .binary_search_by_key(&cp, |(c, ..)| *c)
+        .ok()
+        .map(|i| p.simple[i])
+}
+
+fn prop_lookup_special(p: &PropertyTable, cp: u32) -> Option<&SpecialCasing> {
+    p.special
+        .binary_search_by_key(&cp, |sc| sc.cp)
+        .ok()
+        .map(|i| &p.special[i])
 }
 
 /// Every loaded collation, ascending by name — a deterministic order with no hash-iteration leak
@@ -1251,5 +1429,68 @@ mod bundle_tests {
         let n = bytes.len();
         bytes[n - 1] ^= 0xFF; // corrupt the trailing CRC
         assert!(open_bundle(&bytes).is_err());
+    }
+}
+
+#[cfg(test)]
+mod casing_tests {
+    // The casing kernels' DIVERGENCES from the PostgreSQL/glibc oracle (collation.md §16) — what the
+    // oracle corpus cannot express (CLAUDE.md §10): the ASCII baseline (non-ASCII passes through, where
+    // glibc folds) and full SpecialCasing (ß→SS, where glibc gives ß). Both call the pure kernels with
+    // an EXPLICIT property table, so they are deterministic regardless of the engine-global loaded set.
+    use super::*;
+
+    // A small property table: ASCII a/A, é/É (simple), and ß→SS (special, no simple form). Sorted
+    // ascending by code point (the §5 binary-search contract).
+    fn prop() -> PropertyTable {
+        PropertyTable {
+            simple: vec![
+                (0x41, 0x41, 0x61, 0x41), // A → a
+                (0x61, 0x41, 0x61, 0x41), // a → A
+                (0xC9, 0xC9, 0xE9, 0xC9), // É → é
+                (0xE9, 0xC9, 0xE9, 0xC9), // é → É
+            ],
+            special: vec![SpecialCasing {
+                cp: 0xDF, // ß: upper SS, lower identity, title Ss
+                upper: vec![0x53, 0x53],
+                lower: vec![0xDF],
+                title: vec![0x53, 0x73],
+            }],
+        }
+    }
+
+    #[test]
+    fn ascii_baseline_passes_non_ascii_through() {
+        // No property loaded ⇒ fold ASCII only, pass the rest through (the SQLite default; a divergence
+        // from glibc, which would fold é/É).
+        assert_eq!(fold_case("café", true, None), "CAFé");
+        assert_eq!(fold_case("CAFÉ", false, None), "cafÉ");
+        assert_eq!(fold_case("Hello, World!", true, None), "HELLO, WORLD!");
+        assert_eq!(fold_case("ß", true, None), "ß"); // ASCII baseline never expands
+    }
+
+    #[test]
+    fn unicode_folds_via_the_property_table() {
+        // The synthetic table covers a/A and é/É (simple) + ß (special); use only those letters.
+        let p = prop();
+        assert_eq!(fold_case("aé", true, Some(&p)), "AÉ");
+        assert_eq!(fold_case("AÉ", false, Some(&p)), "aé");
+        // Full SpecialCasing expansion ß→SS — the deliberate divergence from glibc's 1:1 ß.
+        assert_eq!(fold_case("ß", true, Some(&p)), "SS");
+        assert_eq!(fold_case("aßa", true, Some(&p)), "ASSA");
+        assert_eq!(fold_case("ß", false, Some(&p)), "ß"); // lower of ß is identity
+        // A code point not in the table is identity (no mapping).
+        assert_eq!(fold_case("z", true, Some(&p)), "z");
+    }
+
+    #[test]
+    fn fold_lower_simple_never_expands() {
+        let p = prop();
+        // ILIKE folding is simple-only: ß has no simple lower, so it stays one code point (it does NOT
+        // become "ss"), keeping the matcher's _/length invariant.
+        assert_eq!(fold_lower_simple("ß", Some(&p)), "ß");
+        assert_eq!(fold_lower_simple("É", Some(&p)), "é");
+        assert_eq!(fold_lower_simple("HELLO", None), "hello");
+        assert_eq!(fold_lower_simple("É", None), "É"); // ASCII baseline passthrough
     }
 }

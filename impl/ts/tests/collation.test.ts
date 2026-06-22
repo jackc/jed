@@ -9,11 +9,14 @@ import { readFileSync } from "node:fs";
 import {
   buildBundle,
   compileCollation,
+  foldCase,
+  foldLowerSimple,
   loadBundle,
   loadedCollation,
   loadUnicodeData,
   openBundle,
   openCollation,
+  type PropertyTable,
   saveBundle,
   saveCollation,
   serializeTable,
@@ -141,4 +144,35 @@ test("openCollation rejects a tampered artifact", () => {
     (e: Error) => /XX001/.test(String(e)) || /corrupt/.test(String(e)),
     "tampered artifact must be data_corrupted",
   );
+});
+
+// The casing kernels' DIVERGENCES from the PG/glibc oracle (collation.md §16) — what the oracle corpus
+// cannot express (CLAUDE.md §10): the ASCII baseline (non-ASCII passes through) and full SpecialCasing
+// (ß→SS). The kernels take an EXPLICIT property table, so the un-loaded (ASCII) regime is deterministic
+// regardless of the engine-global loaded set. Mirrors collation.rs casing_tests / collation_test.go.
+test("casing kernels: ASCII baseline, full Unicode, and simple-only ILIKE folding", () => {
+  const p: PropertyTable = {
+    simple: [
+      { cp: 0x41, upper: 0x41, lower: 0x61, title: 0x41 }, // A
+      { cp: 0x61, upper: 0x41, lower: 0x61, title: 0x41 }, // a
+      { cp: 0xc9, upper: 0xc9, lower: 0xe9, title: 0xc9 }, // É
+      { cp: 0xe9, upper: 0xc9, lower: 0xe9, title: 0xc9 }, // é
+    ],
+    special: [{ cp: 0xdf, upper: [0x53, 0x53], lower: [0xdf], title: [0x53, 0x73] }],
+  };
+  // ASCII baseline (undefined property): fold a–z/A–Z, pass the rest through.
+  assert.equal(foldCase("café", true, undefined), "CAFé");
+  assert.equal(foldCase("CAFÉ", false, undefined), "cafÉ");
+  assert.equal(foldCase("ß", true, undefined), "ß");
+  // Full Unicode via the property table.
+  assert.equal(foldCase("aé", true, p), "AÉ");
+  assert.equal(foldCase("AÉ", false, p), "aé");
+  assert.equal(foldCase("ß", true, p), "SS"); // SpecialCasing expansion — the glibc divergence
+  assert.equal(foldCase("aßa", true, p), "ASSA");
+  assert.equal(foldCase("z", true, p), "z"); // not in the table → identity
+  // ILIKE folding is simple-only (never expands): ß stays one code point.
+  assert.equal(foldLowerSimple("ß", p), "ß");
+  assert.equal(foldLowerSimple("É", p), "é");
+  assert.equal(foldLowerSimple("HELLO", undefined), "hello");
+  assert.equal(foldLowerSimple("É", undefined), "É");
 });

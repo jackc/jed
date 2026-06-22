@@ -2877,7 +2877,8 @@ func (p *Parser) parseComparison() (Expr, error) {
 	// by one of these postfix-predicate keywords (two-token lookahead; the prefix `NOT` was
 	// already taken by parseNot). Non-associative, at the comparison level (grammar.md §20-§21).
 	predNegated := p.peekKeyword() == "not" &&
-		(p.peekKeywordAt(1) == "in" || p.peekKeywordAt(1) == "between" || p.peekKeywordAt(1) == "like")
+		(p.peekKeywordAt(1) == "in" || p.peekKeywordAt(1) == "between" ||
+			p.peekKeywordAt(1) == "like" || p.peekKeywordAt(1) == "ilike")
 	if predNegated {
 		p.advance() // NOT
 	}
@@ -2937,13 +2938,15 @@ func (p *Parser) parseComparison() (Expr, error) {
 		}
 		return Expr{Kind: ExprBetween, Between: &BetweenExpr{Lhs: lhs, Lo: lo, Hi: hi, Negated: predNegated}}, nil
 	}
-	if p.peekKeyword() == "like" {
+	// LIKE / ILIKE (case-insensitive) — grammar.md §22. `ilike` is just another peeked keyword.
+	if p.peekKeyword() == "like" || p.peekKeyword() == "ilike" {
+		insensitive := p.peekKeyword() == "ilike"
 		p.advance()
 		rhs, err := p.parseConcat()
 		if err != nil {
 			return Expr{}, err
 		}
-		return Expr{Kind: ExprLike, Like: &LikeExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated}}, nil
+		return Expr{Kind: ExprLike, Like: &LikeExpr{Lhs: lhs, Rhs: rhs, Negated: predNegated, Insensitive: insensitive}}, nil
 	}
 	var op BinaryOp
 	switch p.peek().Kind {

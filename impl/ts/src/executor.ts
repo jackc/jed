@@ -72,8 +72,11 @@ import {
 import { LifetimeBudget, Meter } from "./cost.ts";
 import {
   type Collation,
+  foldCase,
+  foldLowerSimple,
   loadedCollation,
   loadedCollationTables,
+  loadedProperty,
   loadUnicodeData as loadUnicodeDataGlobal,
   serializeTable,
   sortKey as collationSortKey,
@@ -7610,6 +7613,9 @@ export class Database {
         e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
         e.rhs = this.foldUncorrelatedInRExpr(e.rhs, bound, ctes, cost);
         return e;
+      case "casing":
+        e.arg = this.foldUncorrelatedInRExpr(e.arg, bound, ctes, cost);
+        return e;
       case "case":
         e.arms = e.arms.map((arm) => ({
           cond: this.foldUncorrelatedInRExpr(arm.cond, bound, ctes, cost),
@@ -7909,6 +7915,8 @@ function rexprIsConstant(e: RExpr): boolean {
     case "distinct":
     case "like":
       return rexprIsConstant(e.lhs) && rexprIsConstant(e.rhs);
+    case "casing":
+      return rexprIsConstant(e.arg);
     case "case":
       return (
         e.arms.every((a) => rexprIsConstant(a.cond) && rexprIsConstant(a.result)) &&
@@ -8821,6 +8829,8 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "distinct":
     case "like":
       return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth);
+    case "casing":
+      return rexprReferencesOuter(e.arg, depth);
     case "case":
       return (
         e.arms.some(
@@ -8905,6 +8915,9 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "like":
       collectTouched(e.lhs, depth, touched);
       collectTouched(e.rhs, depth, touched);
+      return;
+    case "casing":
+      collectTouched(e.arg, depth, touched);
       return;
     case "case":
       for (const arm of e.arms) {
@@ -9225,7 +9238,10 @@ type RExpr =
   | { kind: "or"; lhs: RExpr; rhs: RExpr }
   | { kind: "isNull"; operand: RExpr; negated: boolean }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
-  | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean }
+  | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean; insensitive: boolean }
+  // upper(text)/lower(text) — Unicode case folding (collation.md §16). upper selects the direction;
+  // folds via the engine-global property table or the ASCII baseline. A NULL operand propagates.
+  | { kind: "casing"; upper: boolean; arg: RExpr }
   | {
       kind: "case";
       arms: { cond: RExpr; result: RExpr }[];
@@ -10483,6 +10499,14 @@ function resolveFuncCall(
   }
   // make_interval is the one named/defaulted function — it keeps its own resolver (§11).
   if (lname === "make_interval") return resolveMakeInterval(scope, e, ag, params);
+  // lower/upper are overloaded across the range accessors (range → element) and the text casing
+  // functions (text → text, collation.md §16). Resolve the single argument once and branch on its
+  // type, BEFORE the by-name kind dispatch (which would force the range path for both). functions.md §9
+  if (lname === "lower" || lname === "upper") {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    return resolveLowerUpper(scope, lname, e, ag, params);
+  }
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
   // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
   if (isAggregateName(lname)) {
@@ -10997,6 +11021,36 @@ function rangeFuncId(name: string): RangeFuncName {
     default:
       throw new Error("rangeFuncId: " + name + " is not a catalog range function");
   }
+}
+
+// resolveLowerUpper resolves lower/upper, overloaded across the range accessors and the text casing
+// functions (functions.md §9, collation.md §16). The single argument resolves once (offering "text" as
+// the literal-adaptation hint, so a bare NULL / untyped $1 adapts to text — the common case; a typed
+// range keeps its range type and ignores the scalar hint). A text/NULL argument folds case ("casing",
+// result text); a range argument is the bound accessor ("rangeFunc", result the element type);
+// anything else is 42883 (no overload).
+function resolveLowerUpper(
+  scope: Scope,
+  name: string,
+  e: { name: string; args: Expr[] },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.args.length !== 1) throw noFuncOverload(name);
+  const r = resolve(scope, e.args[0], "text", ag, params);
+  if (r.type.kind === "text" || r.type.kind === "null") {
+    return {
+      node: { kind: "casing", upper: name === "upper", arg: r.node },
+      type: { kind: "text" },
+    };
+  }
+  if (r.type.kind === "range") {
+    return {
+      node: { kind: "rangeFunc", func: rangeFuncId(name), args: [r.node] },
+      type: r.type.elem,
+    };
+  }
+  throw noFuncOverload(name);
 }
 
 // resolveRangeFunc resolves a polymorphic range accessor over the anyrange pseudo-family
@@ -13665,14 +13719,20 @@ function resolve(
       return resolve(scope, desugared, ctx, ag, params);
     }
     case "like": {
-      // LIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal stays
-      // text), then require BOTH operands be text (or a bare NULL); a non-text operand is 42804.
-      // We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
+      // LIKE / ILIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal
+      // stays text), then require BOTH operands be text (or a bare NULL); a non-text operand is
+      // 42804. We do NOT use classifyComparable here — it would wrongly accept bytea×bytea.
       const p = resolveOperandPair(scope, e.lhs, e.rhs, ag, params);
       requireTextOrNull(p.lt);
       requireTextOrNull(p.rt);
       return {
-        node: { kind: "like", lhs: p.rl, rhs: p.rr, negated: e.negated },
+        node: {
+          kind: "like",
+          lhs: p.rl,
+          rhs: p.rr,
+          negated: e.negated,
+          insensitive: e.insensitive,
+        },
         type: { kind: "bool" },
       };
     }
@@ -16760,11 +16820,26 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (subject.kind !== "text" || pattern.kind !== "text") {
         throw new Error("unreachable: resolver requires text LIKE operands");
       }
-      // negated carries NOT LIKE: matched !== negated flips the result for NOT LIKE.
-      return {
-        kind: "bool",
-        value: likeMatch(subject.text, pattern.text) !== e.negated,
-      };
+      let sub = subject.text;
+      let pat = pattern.text;
+      // ILIKE: simple-lowercase both sides under the engine casing regime (collation.md §16) before
+      // matching — 1:1 folding so the matcher's _/length semantics survive.
+      if (e.insensitive) {
+        const prop = loadedProperty();
+        sub = foldLowerSimple(sub, prop);
+        pat = foldLowerSimple(pat, prop);
+      }
+      // negated carries NOT LIKE/ILIKE: matched !== negated flips for the NOT form.
+      return { kind: "bool", value: likeMatch(sub, pat) !== e.negated };
+    }
+    case "casing": {
+      m.charge(COSTS.operatorEval);
+      const v = evalExpr(e.arg, row, env, m);
+      if (v.kind === "null") return nullValue();
+      if (v.kind !== "text") {
+        throw new Error("unreachable: resolver requires text upper/lower operand");
+      }
+      return textValue(foldCase(v.text, e.upper, loadedProperty()));
     }
     case "case": {
       // CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are

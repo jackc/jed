@@ -712,8 +712,9 @@ not_expr       ::= "NOT" not_expr
  * "a IS DISTINCT FROM (b + 1)". The leading "IS" is shared: after "IS" "NOT"? the
  * parser dispatches on "NULL" vs "DISTINCT".
  *   "NOT"? "IN" "(" ... ")" is the membership predicate (../design/grammar.md §20),
- * "NOT"? "BETWEEN" lo "AND" hi is the range predicate (§21), and "NOT"? "LIKE" pattern is the
- * text pattern match (§22) — all at the comparison level. A "NOT" before "IN"/"BETWEEN"/"LIKE"
+ * "NOT"? "BETWEEN" lo "AND" hi is the range predicate (§21), and "NOT"? ("LIKE" | "ILIKE") pattern is
+ * the text pattern match (§22, ILIKE = case-insensitive, collation.md §16) — all at the comparison
+ * level. A "NOT" before "IN"/"BETWEEN"/"LIKE"/"ILIKE"
  * is the predicate negation; the parsers take it with a two-token lookahead (the prefix "NOT"
  * was already consumed by not_expr) and only when the predicate keyword follows. The IN operand
  * is EITHER a parenthesized query_expr (the uncorrelated IN-subquery, §26 — disambiguated by a
@@ -740,7 +741,7 @@ comparison     ::= concat ( compare_op ( ("ANY" | "SOME" | "ALL") "(" ( subquery
                             | "IS" "NOT"? "DISTINCT" "FROM" concat
                             | "NOT"? "IN" "(" ( subquery_expr | concat ("," concat)* ) ")"
                             | "NOT"? "BETWEEN" concat "AND" concat
-                            | "NOT"? "LIKE" concat )?
+                            | "NOT"? ("LIKE" | "ILIKE") concat )?
 
 compare_op     ::= "=" | "<" | ">" | "<=" | ">=" | "<>" | "!="   /* "<>" and "!=" are one not-equal operator; the lexer folds "!=" to "<>" */
 

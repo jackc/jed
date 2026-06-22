@@ -813,11 +813,13 @@ pub enum Expr {
     /// `lhs LIKE rhs` / `lhs NOT LIKE rhs` — text pattern match (grammar.md §22). `%` matches
     /// any run of characters, `_` one code point, with the default `\` escape. Both operands
     /// must be text; NULL propagates. A genuine operator (not desugared) with a hand-written
-    /// matcher. `negated` carries the NOT keyword.
+    /// matcher. `negated` carries the NOT keyword; `insensitive` carries `ILIKE` (case-insensitive
+    /// matching, both sides simple-lowercased under the casing regime — collation.md §16).
     Like {
         lhs: Box<Expr>,
         rhs: Box<Expr>,
         negated: bool,
+        insensitive: bool,
     },
     /// A `CASE` expression (grammar.md §23). Searched form: `operand` is `None`, each `whens`
     /// condition must be boolean. Simple form: `operand` is `Some(x)`, each branch matches when

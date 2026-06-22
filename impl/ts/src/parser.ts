@@ -2168,7 +2168,8 @@ class Parser {
       this.peekKeyword() === "not" &&
       (this.peekKeywordAt(1) === "in" ||
         this.peekKeywordAt(1) === "between" ||
-        this.peekKeywordAt(1) === "like");
+        this.peekKeywordAt(1) === "like" ||
+        this.peekKeywordAt(1) === "ilike");
     if (predNegated) {
       this.advance(); // NOT
     }
@@ -2202,10 +2203,12 @@ class Parser {
       const hi = this.parseConcat();
       return { kind: "between", lhs, lo, hi, negated: predNegated };
     }
-    if (this.peekKeyword() === "like") {
+    // LIKE / ILIKE (case-insensitive) — grammar.md §22. `ilike` is just another peeked keyword.
+    if (this.peekKeyword() === "like" || this.peekKeyword() === "ilike") {
+      const insensitive = this.peekKeyword() === "ilike";
       this.advance();
       const rhs = this.parseConcat();
-      return { kind: "like", lhs, rhs, negated: predNegated };
+      return { kind: "like", lhs, rhs, negated: predNegated, insensitive };
     }
     let op: BinaryOp;
     switch (this.peek().kind) {

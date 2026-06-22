@@ -534,22 +534,36 @@ export function openCollation(bytes: Uint8Array): Collation {
 
 const loadedColl = new Map<string, Collation>();
 
-// loadUnicodeData loads a JUCD Unicode-data bundle's collations into the engine-global loaded set
+// loadedProp is the engine-global Unicode property/casing table (spec/design/collation.md §16),
+// undefined until a bundle carrying a property section is loaded. Its presence is the binary "casing
+// regime" the C/ASCII baseline flips on: undefined ⇒ casing is ASCII-only, table-free, version-free.
+// FIRST-WINS, like loadedColl. (Module-scoped, so a let with a private accessor.)
+let loadedProp: PropertyTable | undefined;
+
+// loadUnicodeData loads a JUCD Unicode-data bundle into the engine-global loaded set
 // (spec/design/collation.md §4/§9): parse the bundle, merge the root + each per-locale delta (§5.1),
-// and register every collation by name. ADDITIVE — a name already present is NOT replaced (the first
-// bundle to provide it wins; resolution is by name in load order, §4.2), so re-loading the same
-// bundle is an idempotent no-op. The property/casing section is parsed and validated but not yet
-// consumed (casing lands in slice 3e). A malformed bundle is XX001 (data_corrupted).
+// register every collation by name, and store the property/casing section (§16). ADDITIVE /
+// FIRST-WINS — a collation name already present is NOT replaced (the first bundle to provide it wins;
+// resolution is by name in load order, §4.2), and a property table is only stored if none is loaded
+// yet, so re-loading the same bundle is an idempotent no-op. A malformed bundle is XX001.
 //
 // This is the engine primitive behind db.loadUnicodeData. Because the set is process-global it may be
 // called BEFORE opening any file (which is required: opening a file that references a collation
 // resolves its table from this set). Privileged host op — the engine reads no file path and reaches
 // no host data (§11); the host sources the bytes (browser-safe — Uint8Array, no node:fs).
 export function loadUnicodeData(data: Uint8Array): void {
-  const { collations } = loadBundle(openBundle(data));
+  const { collations, property } = loadBundle(openBundle(data));
   for (const c of collations) {
     if (!loadedColl.has(c.name)) loadedColl.set(c.name, c);
   }
+  if (property !== undefined && loadedProp === undefined) loadedProp = property;
+}
+
+// loadedProperty returns the engine-global property/casing table, or undefined if no bundle providing
+// one has been loaded (§16) — undefined ⇒ the ASCII-casing baseline. The casing functions look this up
+// ONCE per evaluation and pass it to the pure kernels below, which keeps the un-loaded regime testable.
+export function loadedProperty(): PropertyTable | undefined {
+  return loadedProp;
 }
 
 // loadedCollation looks up a collation in the engine-global LOADED set by its exact (case-sensitive)
@@ -661,6 +675,86 @@ export interface SpecialCasing {
 export interface PropertyTable {
   simple: SimpleCase[];
   special: SpecialCasing[];
+}
+
+// ============================================================================================
+// Casing kernels (spec/design/collation.md §16) — the production upper/lower/ILIKE folds. Each takes
+// the resolved property table EXPLICITLY (undefined ⇒ the ASCII baseline), so the evaluator does the
+// one engine-global loadedProperty() lookup and the kernels stay pure — making the un-loaded (ASCII)
+// regime deterministically testable. CODE-POINT iteration (for...of / fromCodePoint), so an astral
+// cased letter folds correctly despite TS's UTF-16 strings (the cross-core trap, types.md §11).
+// ============================================================================================
+
+// foldCase folds a string's case. prop === undefined is the ASCII baseline (fold a–z/A–Z, pass other
+// code points through — the SQLite default, version-independent). A defined prop folds via the loaded
+// Unicode tables — full mappings incl. SpecialCasing expansions (ß→SS). upper selects the direction.
+// Backs the upper(text)/lower(text) functions (functions.md §9).
+export function foldCase(s: string, upper: boolean, prop: PropertyTable | undefined): string {
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0)!;
+    if (prop === undefined) {
+      out += asciiFold(ch, cp, upper);
+      continue;
+    }
+    const sc = propLookupSpecial(prop, cp);
+    if (sc !== undefined) {
+      for (const m of upper ? sc.upper : sc.lower) out += String.fromCodePoint(m);
+      continue;
+    }
+    const sm = propLookupSimple(prop, cp);
+    out += sm !== undefined ? String.fromCodePoint(upper ? sm.upper : sm.lower) : ch;
+  }
+  return out;
+}
+
+// foldLowerSimple folds to lowercase for case-insensitive matching (ILIKE) — SIMPLE 1:1 mappings only
+// (never the expanding SpecialCasing forms), so every code point stays one code point and the
+// matcher's _/length semantics are preserved (grammar.md §22). ASCII baseline when prop is undefined.
+export function foldLowerSimple(s: string, prop: PropertyTable | undefined): string {
+  let out = "";
+  for (const ch of s) {
+    const cp = ch.codePointAt(0)!;
+    if (prop === undefined) {
+      out += asciiFold(ch, cp, false);
+      continue;
+    }
+    const sm = propLookupSimple(prop, cp);
+    out += sm !== undefined ? String.fromCodePoint(sm.lower) : ch;
+  }
+  return out;
+}
+
+// asciiFold folds ASCII a–z/A–Z only, returning the source character for any other code point.
+function asciiFold(ch: string, cp: number, upper: boolean): string {
+  if (upper) {
+    if (cp >= 0x61 && cp <= 0x7a) return String.fromCodePoint(cp - 32);
+  } else if (cp >= 0x41 && cp <= 0x5a) {
+    return String.fromCodePoint(cp + 32);
+  }
+  return ch;
+}
+
+function propLookupSimple(p: PropertyTable, cp: number): SimpleCase | undefined {
+  let lo = 0;
+  let hi = p.simple.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (p.simple[mid].cp < cp) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < p.simple.length && p.simple[lo].cp === cp ? p.simple[lo] : undefined;
+}
+
+function propLookupSpecial(p: PropertyTable, cp: number): SpecialCasing | undefined {
+  let lo = 0;
+  let hi = p.special.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (p.special[mid].cp < cp) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo < p.special.length && p.special[lo].cp === cp ? p.special[lo] : undefined;
 }
 
 // A §2 table — a full table for a root, a sparse override for a tailoring — plus the collation name

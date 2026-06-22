@@ -869,7 +869,12 @@ operator (one `[[operator]]` catalog row, `name = "like"`, text×text → boolea
   (`'a' LIKE '\a'` is TRUE). String literals have no backslash escapes
   (`standard_conforming_strings`, §3 / [types.md](types.md) §11), so a `\` written in a
   pattern literal is a literal backslash byte the matcher then interprets. The explicit
-  `ESCAPE 'c'` clause, `ILIKE`, and `SIMILAR TO` are deferred (relaxable later).
+  `ESCAPE 'c'` clause and `SIMILAR TO` are deferred (relaxable later).
+- **`ILIKE` — case-insensitive `LIKE`** (collation Slice 3e). `x ILIKE p` / `x NOT ILIKE p` is `LIKE`
+  with both operands **simple-lowercased** first — ASCII-only when no Unicode property bundle is
+  loaded, full simple (1:1) Unicode mappings when one is ([collation.md §16](collation.md)). Simple
+  1:1 folding (never the expanding `ß`→`SS` form) keeps `_`/length semantics intact. Same precedence,
+  NULL propagation, `22025` trailing-escape, and non-text `42804` as `LIKE`.
 - **Code-point matching — a §8 determinism surface.** `_` matches one **Unicode code point**,
   not one byte and not one UTF-16 unit, so `'😀x' LIKE '_x'` is TRUE. Every core iterates the
   subject and pattern by code point (Rust `chars()`, Go `[]rune`, **TS `Array.from` / spread —

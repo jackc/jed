@@ -983,11 +983,13 @@ type BetweenExpr struct {
 // LikeExpr is `Lhs LIKE Rhs` / `Lhs NOT LIKE Rhs` — a text pattern match (spec/design/grammar.md
 // §22). `%` matches any run of characters, `_` one code point, with the default `\` escape. Both
 // operands must be text; NULL propagates. A genuine operator (not desugared) with a hand-written
-// matcher. Negated carries the NOT keyword.
+// matcher. Negated carries the NOT keyword; Insensitive carries ILIKE (case-insensitive matching,
+// both sides simple-lowercased under the casing regime — collation.md §16).
 type LikeExpr struct {
-	Lhs     Expr
-	Rhs     Expr
-	Negated bool
+	Lhs         Expr
+	Rhs         Expr
+	Negated     bool
+	Insensitive bool
 }
 
 // CaseExpr is a CASE expression (spec/design/grammar.md §23). Searched form: Operand is nil and

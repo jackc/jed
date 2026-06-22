@@ -9077,6 +9077,7 @@ impl Database {
                 self.fold_uncorrelated_in_rexpr(operand, bound, ctes, cost)
             }
             RExpr::Not(x) => self.fold_uncorrelated_in_rexpr(x, bound, ctes, cost),
+            RExpr::Casing { arg, .. } => self.fold_uncorrelated_in_rexpr(arg, bound, ctes, cost),
             RExpr::Arith { lhs, rhs, .. }
             | RExpr::Compare { lhs, rhs, .. }
             | RExpr::Distinct { lhs, rhs, .. }
@@ -10422,11 +10423,21 @@ enum RExpr {
     /// `lhs LIKE rhs` / `lhs NOT LIKE rhs` — text pattern match (grammar.md §22). Both operands
     /// resolve to text (or NULL); a NULL operand makes the result NULL. The matcher runs over
     /// Unicode code points and traps 22025 on a pattern ending in a lone escape reached during
-    /// matching. `negated` carries the NOT keyword (NOT LIKE = the negation of the match).
+    /// matching. `negated` carries the NOT keyword (NOT LIKE = the negation of the match);
+    /// `insensitive` carries `ILIKE` — both operands are simple-lowercased (collation.md §16)
+    /// under the engine casing regime before matching.
     Like {
         lhs: Box<RExpr>,
         rhs: Box<RExpr>,
         negated: bool,
+        insensitive: bool,
+    },
+    /// `upper(text)` / `lower(text)` — Unicode case folding (collation.md §16). `upper` selects the
+    /// direction. Folds via the engine-global property table when a bundle is loaded, else the ASCII
+    /// baseline (fold `a–z`/`A–Z`, pass other code points through). A NULL operand propagates.
+    Casing {
+        upper: bool,
+        arg: Box<RExpr>,
     },
     /// A resolved `CASE` (grammar.md §23). `arms` is `(condition, result)` pairs — the condition
     /// is the searched boolean predicate, or the simple form's resolved `operand = value`
@@ -11713,6 +11724,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         RExpr::Cast { inner, .. } => rexpr_is_constant(inner),
         RExpr::Neg { operand, .. } => rexpr_is_constant(operand),
         RExpr::Not(x) => rexpr_is_constant(x),
+        RExpr::Casing { arg, .. } => rexpr_is_constant(arg),
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
@@ -13078,6 +13090,7 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         RExpr::Cast { inner, .. } => rexpr_references_outer(inner, depth),
         RExpr::Neg { operand, .. } => rexpr_references_outer(operand, depth),
         RExpr::Not(x) => rexpr_references_outer(x, depth),
+        RExpr::Casing { arg, .. } => rexpr_references_outer(arg, depth),
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
@@ -13179,6 +13192,7 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         RExpr::Cast { inner, .. } => collect_touched(inner, depth, touched),
         RExpr::Neg { operand, .. } => collect_touched(operand, depth, touched),
         RExpr::Not(x) => collect_touched(x, depth, touched),
+        RExpr::Casing { arg, .. } => collect_touched(arg, depth, touched),
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
@@ -13781,6 +13795,42 @@ fn resolve_range_func(
     ))
 }
 
+/// Resolve `lower`/`upper`, overloaded across the range accessors and the text casing functions
+/// (functions.md §9, collation.md §16). The single argument resolves once (offering `text` as the
+/// literal-adaptation hint, so a bare NULL / untyped `$1` adapts to text — the common case; a typed
+/// range expression keeps its range type and ignores the scalar hint). A **text/NULL** argument folds
+/// case (`RExpr::Casing`, result `text`); a **range** argument is the bound accessor (`RExpr::RangeFunc`,
+/// result the range's element type); anything else is `42883` (no overload).
+fn resolve_lower_upper(
+    scope: &Scope,
+    name: &str, // "lower" | "upper", already lowercased
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if args.len() != 1 {
+        return Err(no_func_overload(name));
+    }
+    let (r, t) = resolve(scope, &args[0], Some(ScalarType::Text), agg, params)?;
+    match t {
+        ResolvedType::Text | ResolvedType::Null => Ok((
+            RExpr::Casing {
+                upper: name == "upper",
+                arg: Box::new(r),
+            },
+            ResolvedType::Text,
+        )),
+        ResolvedType::Range(elem) => Ok((
+            RExpr::RangeFunc {
+                func: range_func_id(name),
+                args: vec![r],
+            },
+            *elem, // lower(anyrange)/upper(anyrange) return the element type
+        )),
+        _ => Err(no_func_overload(name)),
+    }
+}
+
 /// Whether `name` (case-insensitive) is a range CONSTRUCTOR call (range-functions.md §2): a call
 /// whose name is a range type name or alias (`i32range`/`int4range`/`numrange`/…). The constructor
 /// functions are the only ones whose name is a range type name, so `range::range_by_name` resolving
@@ -14045,6 +14095,20 @@ fn resolve_func_call(
     // make_interval is the one named/defaulted function — it keeps its own resolver (§11).
     if lname == "make_interval" {
         return resolve_make_interval(scope, args, arg_names, star, agg, params);
+    }
+    // lower/upper are overloaded across TWO families: the range accessors (range → element,
+    // range-functions.md §1) and the text casing functions (text → text, collation.md §16). Resolve
+    // the single argument once and branch on its type, BEFORE the by-name kind dispatch (which would
+    // force the range path for both). (functions.md §9)
+    if lname == "lower" || lname == "upper" {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_lower_upper(scope, &lname, args, agg, params);
     }
     // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -16450,8 +16514,13 @@ fn resolve(
             }
             resolve(scope, &desugared, ctx, agg, params)
         }
-        Expr::Like { lhs, rhs, negated } => {
-            // LIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal
+        Expr::Like {
+            lhs,
+            rhs,
+            negated,
+            insensitive,
+        } => {
+            // LIKE / ILIKE is text×text → boolean (grammar.md §22). Resolve the pair (a string literal
             // stays text), then require BOTH operands be text (or a bare NULL); a non-text
             // operand is 42804. We do NOT use classify_comparable here — it would wrongly accept
             // bytea×bytea, which LIKE does not define.
@@ -16463,6 +16532,7 @@ fn resolve(
                     lhs: Box::new(rl),
                     rhs: Box::new(rr),
                     negated: *negated,
+                    insensitive: *insensitive,
                 },
                 ResolvedType::Bool,
             ))
@@ -20362,7 +20432,12 @@ impl RExpr {
                 // discipline, functions.md §3).
                 Ok(Value::Bool(same == *negated))
             }
-            RExpr::Like { lhs, rhs, negated } => {
+            RExpr::Like {
+                lhs,
+                rhs,
+                negated,
+                insensitive,
+            } => {
                 m.charge(COSTS.operator_eval);
                 let subject = lhs.eval(row, env, m)?;
                 let pattern = rhs.eval(row, env, m)?;
@@ -20375,9 +20450,34 @@ impl RExpr {
                     (Value::Text(s), Value::Text(p)) => (s.as_str(), p.as_str()),
                     _ => unreachable!("resolver requires text LIKE operands"),
                 };
-                let matched = like_match(s, p)?;
-                // `negated` carries NOT LIKE: matched != negated flips the result for NOT LIKE.
+                // ILIKE: simple-lowercase both sides under the engine casing regime (collation.md
+                // §16) before matching — 1:1 folding so `_`/length semantics survive.
+                let matched = if *insensitive {
+                    let prop = crate::collation::loaded_property();
+                    let p_ref = prop.as_deref();
+                    let s = crate::collation::fold_lower_simple(s, p_ref);
+                    let p = crate::collation::fold_lower_simple(p, p_ref);
+                    like_match(&s, &p)?
+                } else {
+                    like_match(s, p)?
+                };
+                // `negated` carries NOT LIKE/ILIKE: matched != negated flips for the NOT form.
                 Ok(Value::Bool(matched != *negated))
+            }
+            RExpr::Casing { upper, arg } => {
+                m.charge(COSTS.operator_eval);
+                match arg.eval(row, env, m)? {
+                    Value::Null => Ok(Value::Null),
+                    Value::Text(s) => {
+                        let prop = crate::collation::loaded_property();
+                        Ok(Value::Text(crate::collation::fold_case(
+                            &s,
+                            *upper,
+                            prop.as_deref(),
+                        )))
+                    }
+                    _ => unreachable!("resolver restricts upper/lower to text operands"),
+                }
             }
             RExpr::Case {
                 arms,

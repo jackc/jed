@@ -203,3 +203,43 @@ func TestCollationOpenRejectsTamperedArtifact(t *testing.T) {
 		t.Fatalf("want XX001, got %v", err)
 	}
 }
+
+// TestCasingKernels pins the casing kernels' DIVERGENCES from the PG/glibc oracle (collation.md §16) —
+// what the oracle corpus cannot express (CLAUDE.md §10): the ASCII baseline (non-ASCII passes through)
+// and full SpecialCasing (ß→SS). The kernels take an EXPLICIT property table, so the un-loaded (ASCII)
+// regime is deterministic regardless of the engine-global loaded set. Mirrors collation.rs casing_tests.
+func TestCasingKernels(t *testing.T) {
+	p := &PropertyTable{
+		Simple: []SimpleCase{
+			{0x41, 0x41, 0x61, 0x41}, // A
+			{0x61, 0x41, 0x61, 0x41}, // a
+			{0xC9, 0xC9, 0xE9, 0xC9}, // É
+			{0xE9, 0xC9, 0xE9, 0xC9}, // é
+		},
+		Special: []SpecialCasing{{Cp: 0xDF, Upper: []uint32{0x53, 0x53}, Lower: []uint32{0xDF}, Title: []uint32{0x53, 0x73}}},
+	}
+	cases := []struct {
+		got, want string
+	}{
+		// ASCII baseline (nil property): fold a–z/A–Z, pass the rest through.
+		{FoldCase("café", true, nil), "CAFé"},
+		{FoldCase("CAFÉ", false, nil), "cafÉ"},
+		{FoldCase("ß", true, nil), "ß"},
+		// Full Unicode via the property table.
+		{FoldCase("aé", true, p), "AÉ"},
+		{FoldCase("AÉ", false, p), "aé"},
+		{FoldCase("ß", true, p), "SS"}, // SpecialCasing expansion — the glibc divergence
+		{FoldCase("aßa", true, p), "ASSA"},
+		{FoldCase("z", true, p), "z"}, // not in the table → identity
+		// ILIKE folding is simple-only (never expands): ß stays one code point.
+		{FoldLowerSimple("ß", p), "ß"},
+		{FoldLowerSimple("É", p), "é"},
+		{FoldLowerSimple("HELLO", nil), "hello"},
+		{FoldLowerSimple("É", nil), "É"},
+	}
+	for i, c := range cases {
+		if c.got != c.want {
+			t.Errorf("case %d: got %q want %q", i, c.got, c.want)
+		}
+	}
+}

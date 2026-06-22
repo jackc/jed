@@ -1,0 +1,174 @@
+# Text casing — lower(text) / upper(text) and ILIKE (spec/design/collation.md §16, Slice 3e). Casing
+# follows collation OUT of the bare binary: the engine ships no Unicode case tables; a host loads them
+# in a JUCD bundle's PROPERTY section (the same bundle that carries the collation root). This file
+# loads `unicode` (which carries the property section), so it runs in the FULL-UNICODE regime — and
+# the SIMPLE case mappings it checks (café→CAFÉ, ñ, Greek, Cyrillic) match the live postgres:18 oracle
+# (glibc handles 1:1 mappings the same way). The ASCII baseline (no bundle → fold ASCII only, pass the
+# rest through) and the EXPANDING special-casing (ß→SS — Unicode, where glibc gives ß) are deliberate
+# divergences and live in the per-core unit tests, not here.
+#
+# lower/upper are the TEXT overload of the range accessors `lower`/`upper`; the resolver branches on the
+# argument type (text → casing, range → the bound accessor — range_functions.test covers the range form).
+# ILIKE is case-insensitive LIKE: both operands are simple-lowercased (1:1) before matching.
+#
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.order_by, types.i32, types.text, null.three_valued, func.casing, expr.like, expr.ilike, types.range
+
+# Loading `unicode` also loads the bundle's property/casing section (one (unicode_version) axis).
+# load-collation: unicode = collation/17.0.0/root.allkeys
+
+# ============================================================================================
+# upper / lower — ASCII (regime-independent: same result with or without a bundle)
+# ============================================================================================
+
+query T nosort
+SELECT upper('hello world')
+----
+HELLO WORLD
+
+query T nosort
+SELECT lower('HELLO WORLD')
+----
+hello world
+
+# Non-letters pass through; digits/punctuation unchanged.
+query TT nosort
+SELECT upper('Hello123!'), lower('Hello123!')
+----
+HELLO123!
+hello123!
+
+# ============================================================================================
+# upper / lower — full Unicode (the loaded property section). Simple mappings, oracle-clean.
+# ============================================================================================
+
+# Latin-1 / Latin Extended accents.
+query TT nosort
+SELECT upper('café résumé'), lower('CAFÉ RÉSUMÉ')
+----
+CAFÉ RÉSUMÉ
+café résumé
+
+query TT nosort
+SELECT upper('Ñoño'), lower('ÑOÑO')
+----
+ÑOÑO
+ñoño
+
+# Greek.
+query TT nosort
+SELECT upper('Σοφία'), lower('ΣΟΦΊΑ')
+----
+ΣΟΦΊΑ
+σοφία
+
+# Cyrillic.
+query TT nosort
+SELECT upper('Москва'), lower('МОСКВА')
+----
+МОСКВА
+москва
+
+# Astral (Deseret, U+10400/U+10428) — a cased letter outside the BMP. The cross-core trap: TS
+# strings are UTF-16, so folding must iterate CODE POINTS, not surrogate units (types.md §11).
+query TT nosort
+SELECT upper('𐐨'), lower('𐐀')
+----
+𐐀
+𐐨
+
+# ============================================================================================
+# NULL propagation
+# ============================================================================================
+
+# A bare NULL adapts to text in a casing argument slot (the resolver offers text as the hint), so
+# upper/lower(NULL) is a text NULL — no ::text cast needed (jed has none yet).
+query BB nosort
+SELECT upper(NULL) IS NULL, lower(NULL) IS NULL
+----
+true
+true
+
+# ============================================================================================
+# upper / lower over a column — projection, WHERE, ORDER BY
+# ============================================================================================
+
+statement ok
+CREATE TABLE people (id i32 PRIMARY KEY, name text)
+
+statement ok
+INSERT INTO people VALUES (1, 'Alice'), (2, 'BOB'), (3, 'café'), (4, 'Çelik')
+
+query T rowsort
+SELECT lower(name) FROM people
+----
+alice
+bob
+café
+çelik
+
+# Case-folded equality match (a column folded to lower in WHERE).
+query I rowsort
+SELECT id FROM people WHERE lower(name) = 'bob'
+----
+2
+
+# upper() per row, ordered by the integer PK (text ORDER BY is collation-sensitive — ordered by id
+# here so the result is deterministic and oracle-clean regardless of the database collation).
+query T nosort
+SELECT upper(name) FROM people ORDER BY id
+----
+ALICE
+BOB
+CAFÉ
+ÇELIK
+
+# ============================================================================================
+# ILIKE — case-insensitive pattern match (ASCII)
+# ============================================================================================
+
+query BBB nosort
+SELECT 'Hello' ILIKE 'hello', 'Hello' ILIKE 'h%o', 'HELLO' ILIKE '_ello'
+----
+true
+true
+true
+
+query BB nosort
+SELECT 'Hello' ILIKE 'xyz', 'Hello' NOT ILIKE 'HELLO'
+----
+false
+false
+
+# ILIKE over a column.
+query I rowsort
+SELECT id FROM people WHERE name ILIKE 'b%'
+----
+2
+
+# ============================================================================================
+# ILIKE — case-insensitive across simple Unicode case pairs (oracle-clean)
+# ============================================================================================
+
+query BBB nosort
+SELECT 'café' ILIKE 'CAFÉ', 'CAFÉ' ILIKE 'café', 'résumé' ILIKE 'RÉSUMÉ'
+----
+true
+true
+true
+
+query BB nosort
+SELECT 'Çelik' ILIKE 'çel%', 'ÑOÑO' ILIKE 'ñoño'
+----
+true
+true
+
+# ============================================================================================
+# Errors — a non-text argument has no lower/upper overload (42883); ILIKE on non-text is 42804
+# ============================================================================================
+
+statement error 42883
+SELECT upper(5)
+
+statement error 42804
+SELECT 5 ILIKE '5'

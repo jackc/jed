@@ -83,13 +83,16 @@
 >   + `es`) that the cores LOAD. The compile-time embed (`include_bytes!` / `//go:embed` / base64) is
 >   **gone** — the bare binary carries no Unicode data (the SQLite model, §16); embedding is now a host
 >   choice (the host hands the same bytes to `LoadUnicodeData`).
-> - **Not yet built (Slice 3 remainder):** the **ASCII-casing baseline + property section** (3e, §16,
->   lands with `lower`/`upper`/`ILIKE` — the builder's `casing-only` preset is wired but awaits this
->   data); implicit weights / the
->   full CJK tier-3 root; the broader LDML tailoring features (and the sv/da/de tailorings that need
->   them); and the [compatibility.md](compatibility.md) manifest/verdict that reference-only leans on
->   (§2d). (The slice-2 "embedder-chosen footprint tiers" are **superseded** by Slice 3's builder-tool
->   bundle presets — §13.)
+> - **Landed (Slice 3e — casing):** the **ASCII-casing baseline + property section** — `upper(text)`/
+>   `lower(text)` (the text overload of the range accessors) and `ILIKE` in all three cores; the
+>   property/casing section is populated (UCD 17.0.0 case mappings, [../collation/17.0.0/casing.txt](../collation/17.0.0/casing.txt))
+>   and rides `unicode.jucd` + the `casing-only` preset (§16/§13). The bare binary folds ASCII only.
+> - **Not yet built (Slice 3 remainder):** `initcap` (word-boundary titlecasing) + `normalize`/regex
+>   (deferred property sub-tables); implicit weights / the full CJK tier-3 root; the broader LDML
+>   tailoring features (and the sv/da/de tailorings that need them); and the
+>   [compatibility.md](compatibility.md) manifest/verdict that reference-only leans on (§2d). (The
+>   slice-2 "embedder-chosen footprint tiers" are **superseded** by Slice 3's builder-tool bundle
+>   presets — §13.)
 >
 > Two foundational choices are unchanged: the definition format is the **UCA/CLDR standards** (DUCET
 > `allkeys.txt` + LDML), and the `.coll` **compiled artifact is the one shared cross-core form** every
@@ -870,10 +873,15 @@ file entry are all retained (§5), so the on-disk goldens do not move.
 - **3d — root + delta + load-time merge** ✅ **landed:** the cross-core byte-identity piece (§9) — the
   bundle ships the root once + per-locale deltas, and `LoadUnicodeData` merges them into the table the
   executor already expects, gated by the `merge == full` vectors (§10).
-- **3e — the ASCII-casing baseline + property section** (§16): the bare binary's ASCII `lower`/`upper`
-  (and `ILIKE`), consuming the loaded property section for full Unicode casing — pure greenfield (no
-  casing function exists today, [functions.md §9](functions.md)). Lands with or after the
-  string-function slice.
+- **3e — the ASCII-casing baseline + property section** ✅ **landed:** `upper(text)`/`lower(text)`
+  (the text overload of the range accessors — the resolver branches on the argument type) and `ILIKE`
+  in all three cores, with the casing kernels taking the resolved property table explicitly so the
+  ASCII baseline stays deterministically testable (§16). The bundle's **property/casing section** is
+  populated from [../collation/17.0.0/casing.txt](../collation/17.0.0/casing.txt) (UCD 17.0.0 simple +
+  unconditional special mappings) via `compile_casing` + the builder (§4.1); the bare binary still
+  carries none (the ASCII baseline). Simple casing is oracle-clean vs `postgres:18`; the expanding
+  SpecialCasing (`ß`→`SS`) and the ASCII-baseline passthrough are documented divergences from glibc,
+  in per-core unit tests (§15, CLAUDE.md §10). `initcap` (word-boundary titlecasing) remains deferred.
 
 Slice 3 lands **with or behind** the [compatibility.md](compatibility.md) manifest (§2d) for the
 graded version-skew verdict, exactly as reference-only did.
@@ -946,11 +954,13 @@ tables; they ride the loaded bundle.** This is the SQLite model — stock SQLite
 and Unicode casing is the optional ICU extension — and it is what lets a `C`/ASCII-only database pin
 **no Unicode version at all** (§3).
 
-> **Status: design only.** No casing function exists yet — `upper`/`lower`/`initcap`/`ILIKE` are
-> deferred ([functions.md §9](functions.md); the only `lower`/`upper` in the catalog today are *range*
-> accessors). This section fixes the contract those functions will implement when they land
-> (Slice 3e, §14), so the bare-binary behavior and the bundle's property section are decided
-> spec-first, not discovered during implementation.
+> **Status: LANDED (Slice 3e).** `upper(text)`/`lower(text)` and `ILIKE` are implemented in all three
+> cores ([functions.md §9](functions.md)); `lower`/`upper` are now the **text overload** of the range
+> accessors (the resolver branches on the argument type). The bundle's **property/casing section** is
+> populated — compiled from [../collation/17.0.0/casing.txt](../collation/17.0.0/casing.txt) (UCD 17.0.0
+> case mappings: 2933 simple + 103 unconditional special) and packed into `unicode.jucd` by the builder
+> (§4.1). `initcap` (word-boundary titlecasing) and `normalize`/regex remain deferred follow-ons. The
+> contract below is what the cores implement.
 
 - **The ASCII baseline (built in, table-free, eternal).** With **no** property section loaded,
   `upper`/`lower` fold **ASCII `a`–`z`/`A`–`Z` only** and pass every other code point through
