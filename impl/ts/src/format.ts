@@ -27,7 +27,6 @@ import {
   type SequenceDef,
   type Table,
   pkIndices,
-  resolveColType,
 } from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
 import { type Collation, vendoredCollation } from "./collation.ts";
@@ -1081,7 +1080,7 @@ function decodeCompositeTypeEntry(buf: Uint8Array, cur: Cursor): CompositeType {
   for (let i = 0; i < fieldCount; i++) {
     const fname = readString(buf, cur);
     const tc = readU8(buf, cur);
-    let fty;
+    let fty: Type;
     let decimal: DecimalTypmod | null = null;
     if (tc === 14) {
       const tn = readString(buf, cur);

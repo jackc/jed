@@ -475,7 +475,7 @@ function exactFromBits(
   const neg = bits >> BigInt(expBits + mantBits) !== 0n;
   const expMask = (1n << BigInt(expBits)) - 1n;
   const mantMask = (1n << BigInt(mantBits)) - 1n;
-  let biasedExp = Number((bits >> BigInt(mantBits)) & expMask);
+  const biasedExp = Number((bits >> BigInt(mantBits)) & expMask);
   let mant = bits & mantMask;
   let exp: number;
   if (biasedExp === 0) {

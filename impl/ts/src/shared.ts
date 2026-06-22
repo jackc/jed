@@ -28,7 +28,7 @@
 // a reference copy, not a deep clone.
 
 import { Database, Snapshot, stmtIsWrite, type Outcome } from "./executor.ts";
-import { Rows, rowsFromOutcome } from "./api.ts";
+import { type Rows, rowsFromOutcome } from "./api.ts";
 import { engineError } from "./errors.ts";
 import type { Value } from "./value.ts";
 

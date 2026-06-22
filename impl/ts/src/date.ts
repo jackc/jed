@@ -8,7 +8,7 @@
 // ever computed, so a date spans a wider range than the i64-µs timestamp. The day count is held
 // as `bigint` (the TS core's uniform-integer discipline), converted to i32 at the codec boundary.
 
-import { EngineError } from "./errors.ts";
+import type { EngineError } from "./errors.ts";
 import {
   civilFromDays,
   type Cur,

@@ -728,7 +728,7 @@ class Parser {
     // Optional `USING <method>` between the table name and the column list (PG order — gin.md §3,
     // grammar.md §30). Not reserved (positional); the method is resolved at execution (42704 if
     // unknown), not here.
-    let using: string | undefined = undefined;
+    let using: string | undefined;
     if (this.peekKeyword() === "using") {
       this.advance();
       using = this.expectIdentifier();

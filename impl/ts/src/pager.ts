@@ -11,7 +11,7 @@
 // fault-injection seam (spec/design/storage.md §7) lives here, not in the host — it tests the commit
 // recipe, which is host-independent (hosts.md §3).
 
-import { type BlockStore } from "./blockstore.ts";
+import type { BlockStore } from "./blockstore.ts";
 import { type EngineError, engineError } from "./errors.ts";
 
 // PREALLOC_CHUNK_BYTES is the file-growth step — ~1 MiB worth of pages preallocated at once. Growing

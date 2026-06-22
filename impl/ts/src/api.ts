@@ -4,7 +4,7 @@
 // import cycle). Thin wrappers over the parser + executor — the conformance contract still binds.
 
 import type { Statement } from "./ast.ts";
-import { Database, type Outcome } from "./executor.ts";
+import type { Database, Outcome } from "./executor.ts";
 import { engineError } from "./errors.ts";
 import type { Value } from "./value.ts";
 

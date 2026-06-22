@@ -19,12 +19,12 @@ import {
   type Privilege,
   PrivilegeSet,
   privilegeFromName,
-  ReadHandle,
+  type ReadHandle,
   render,
   seededRandomSource,
   SharedDb,
   SUPPORTED_CAPABILITIES,
-  WriteHandle,
+  type WriteHandle,
 } from "../lib.ts";
 
 function suitesDir(): string {

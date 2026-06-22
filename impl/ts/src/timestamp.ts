@@ -8,7 +8,7 @@
 // `/` (which truncates toward zero, like Rust/Go) paired with the Hinnant -399/-146096
 // adjustment; the instant↔civil decomposition uses the floorDiv/floorMod helpers below.
 
-import { engineError, EngineError } from "./errors.ts";
+import { engineError, type EngineError } from "./errors.ts";
 
 // NEG_INFINITY is the -infinity sentinel (the smallest i64; sorts before every finite instant).
 export const NEG_INFINITY = -9223372036854775808n;

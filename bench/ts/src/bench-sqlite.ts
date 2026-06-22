@@ -4,7 +4,7 @@
 
 import { mkdtempSync, rmSync, existsSync } from "node:fs";
 import { join } from "node:path";
-import { DatabaseSync, StatementSync } from "node:sqlite";
+import { DatabaseSync, type StatementSync } from "node:sqlite";
 
 import {
   type Arg,

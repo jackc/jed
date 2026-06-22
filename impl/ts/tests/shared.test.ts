@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { EngineError, ReadHandle, SharedDb } from "../src/lib.ts";
+import { EngineError, type ReadHandle, SharedDb } from "../src/lib.ts";
 
 // count runs SELECT count(*) FROM t against a read handle and returns the bigint count.
 function count(r: ReadHandle): bigint {

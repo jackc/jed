@@ -10,7 +10,7 @@ import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, Database, execute, open, toImage } from "../src/lib.ts";
+import { close, create, type Database, execute, open, toImage } from "../src/lib.ts";
 
 function tmpDir(): string {
   return mkdtempSync(join(tmpdir(), "jed-"));

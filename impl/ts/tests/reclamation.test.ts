@@ -12,7 +12,7 @@ import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, Database, execute, open } from "../src/lib.ts";
+import { close, create, type Database, execute, open } from "../src/lib.ts";
 
 const PS = 256;
 

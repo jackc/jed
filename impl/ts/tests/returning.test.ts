@@ -7,7 +7,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute, executeParams, intValue, render } from "../src/lib.ts";
+import { type Database, execute, executeParams, intValue, render } from "../src/lib.ts";
 import { dbWith, errCode } from "./util.ts";
 
 function setup() {

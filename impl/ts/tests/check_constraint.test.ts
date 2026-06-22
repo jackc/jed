@@ -8,7 +8,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { EngineError } from "../src/errors.ts";
-import { Database, execute } from "../src/lib.ts";
+import { type Database, execute } from "../src/lib.ts";
 import { loadDatabase, toImage } from "../src/format.ts";
 import { dbWith, errCode } from "./util.ts";
 

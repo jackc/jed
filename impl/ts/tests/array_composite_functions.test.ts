@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { type Database, execute } from "../src/lib.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 function addrDb(): Database {

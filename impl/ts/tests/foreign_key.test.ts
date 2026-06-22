@@ -8,7 +8,7 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { Database, execute } from "../src/lib.ts";
+import { type Database, execute } from "../src/lib.ts";
 import { dbWith, errCode } from "./util.ts";
 
 function fkNames(db: Database, table: string): string[] {

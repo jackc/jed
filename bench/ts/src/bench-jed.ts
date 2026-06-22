@@ -6,8 +6,8 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 
 import {
-  Database,
-  PreparedStatement,
+  type Database,
+  type PreparedStatement,
   create,
   executeParams,
   open,

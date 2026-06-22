@@ -3,7 +3,7 @@
 // — no build step. i64 is exact (uniform bigint); the on-disk format is byte-identical
 // to the Rust and Go cores (CLAUDE.md §8).
 
-import { Database } from "./executor.ts";
+import type { Database } from "./executor.ts";
 import type { Outcome } from "./executor.ts";
 import type { ScriptSummary } from "./split.ts";
 import type { Value } from "./value.ts";

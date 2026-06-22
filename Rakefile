@@ -150,11 +150,14 @@ end
 #   rust              — rustfmt (ships with rust 1.92.0, mise-pinned); `cargo fmt`.
 #   go                — gofumpt (mise-pinned go tool); a stricter SUPERSET of gofmt (its output
 #                       is always gofmt-clean too), chosen because mise already pins it.
-#   impl/ts, bench/ts — biome (mise-pinned; biome.json at repo root). Formatter-only: the linter
-#                       and assist are OFF in biome.json, so `biome check` is purely a format
-#                       check. 2-space, lineWidth 100. The four @generated TS files
-#                       (operators/costs/ranges_gen/vendored) are EXCLUDED there, so the codegen
-#                       drift check (`rake verify`) stays the single source of truth for them.
+#   impl/ts, bench/ts — biome (mise-pinned; biome.json at repo root). 2-space, lineWidth 100. The
+#                       four @generated TS files (operators/costs/ranges_gen/vendored) are EXCLUDED
+#                       there, so the codegen drift check (`rake verify`) stays their single source
+#                       of truth. Biome's LINTER is on with a tailored ruleset (noNonNullAssertion /
+#                       useTemplate / noVoidTypeReturn OFF — deliberate engine idioms), but FORMAT
+#                       and LINT are split into separate gates: `rake fmt` runs `biome format`
+#                       (format only), `rake lint` runs `biome lint` — so a lint finding never
+#                       blocks the formatter, and vice versa.
 #   web               — prettier + prettier-plugin-svelte (npm devDeps, pinned EXACT in
 #                       web/package.json + lockfile). Formatter output changes between versions,
 #                       so the exact pin is the reproducibility guarantee here — the npm analogue
@@ -203,8 +206,8 @@ namespace :fmt do
       failures << "go"
     end
 
-    puts "ts:   biome check #{TS_CORE_DIRS.join(' ')}"
-    failures << "ts" unless system("biome", "check", *TS_CORE_DIRS)
+    puts "ts:   biome format #{TS_CORE_DIRS.join(' ')}"
+    failures << "ts" unless system("biome", "format", *TS_CORE_DIRS)
 
     puts "web:  prettier --check #{WEB_DIR}"
     npm_install_web
@@ -219,7 +222,7 @@ namespace :fmt do
     sh "cargo", "fmt", "--manifest-path", RUST_MANIFEST
     sh "cargo", "fmt", "--manifest-path", CLI_MANIFEST
     sh "gofumpt", "-w", GO_DIR
-    sh "biome", "check", "--write", *TS_CORE_DIRS
+    sh "biome", "format", "--write", *TS_CORE_DIRS
     npm_install_web
     sh "npm", "run", "--silent", "--prefix", WEB_DIR, "format"
   end
@@ -228,6 +231,29 @@ end
 # Bare `rake fmt` runs the gate; `rake fmt:fix` applies it.
 desc "Check formatting of the cores + web (alias for fmt:check)"
 task fmt: "fmt:check"
+
+# lint — the Biome linter for the TS cores, kept deliberately SEPARATE from fmt (above) so a lint
+# finding never blocks the formatter and vice versa. The tailored ruleset lives in biome.json;
+# `biome lint` exits non-zero only on ERRORS, so the few advisory warnings (currently 5
+# useOptionalChain suggestions, left as a matter of taste) are surfaced without failing the gate.
+# Scope is the TS cores only: web is prettier-only here, with its own `npm run check` (svelte-check)
+# as the web type gate (outside rake ci); the @generated files stay excluded via biome.json.
+namespace :lint do
+  desc "Lint the TypeScript cores with Biome's tailored ruleset (errors fail; warnings advise)"
+  task :check do
+    puts "ts:   biome lint #{TS_CORE_DIRS.join(' ')}"
+    abort "lint: Biome reported errors — `rake lint:fix` applies the safe ones" unless system("biome", "lint", *TS_CORE_DIRS)
+  end
+
+  desc "Apply Biome's SAFE lint fixes to the TS cores (unsafe fixes stay per-rule + manual)"
+  task :fix do
+    sh "biome", "lint", "--write", *TS_CORE_DIRS
+  end
+end
+
+# Bare `rake lint` runs the gate; `rake lint:fix` applies the safe fixes.
+desc "Lint the TypeScript cores with Biome (alias for lint:check)"
+task lint: "lint:check"
 
 # codegen — the "middle path" (CLAUDE.md §5): (re)generate per-language source from the
 # canonical spec data tables: the operator descriptor tables from spec/functions/catalog.toml
@@ -449,11 +475,11 @@ task :stress, [:filter] do |_, args|
   aggregate_stress(dir)
 end
 
-# ci — the aggregate gate. Chains the toolchain-light spec checks, the formatter gate, the
-# CLI's tests, and the metamorphic sweep, so one command reproduces what CI enforces. Each
-# is `sh`/task-failure propagating, so `rake ci` exits non-zero on the first failure.
-desc "CI gate: spec data checks + core formatting + CLI tests + the NoREC/TLP sweep + reducer self-test"
-task ci: %w[verify fmt cli:test] do
+# ci — the aggregate gate. Chains the toolchain-light spec checks, the formatter gate, the TS
+# linter, the CLI's tests, and the metamorphic sweep, so one command reproduces what CI enforces.
+# Each is `sh`/task-failure propagating, so `rake ci` exits non-zero on the first failure.
+desc "CI gate: spec data checks + core formatting + TS lint + CLI tests + the NoREC/TLP sweep + reducer self-test"
+task ci: %w[verify fmt lint cli:test] do
   Rake::Task["corpus:norec_sweep"].invoke
   Rake::Task["corpus:reduce_selftest"].invoke
 end

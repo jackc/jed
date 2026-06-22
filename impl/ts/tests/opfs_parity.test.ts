@@ -15,7 +15,7 @@ import { test } from "node:test";
 import { close, create, EngineError, execute, open, render } from "../src/lib.ts";
 import type { Value } from "../src/lib.ts";
 import { createOpfsWithHandle, closeOpfs, openOpfsWithHandle } from "../src/opfs.ts";
-import { OpfsBlockStore, type SyncAccessHandle } from "../src/opfsblockstore.ts";
+import type { SyncAccessHandle } from "../src/opfsblockstore.ts";
 import { bytesEqual } from "./util.ts";
 import { specPath } from "./tomlmini.ts";
 

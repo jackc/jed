@@ -7,7 +7,19 @@
     "indentWidth": 2,
     "lineWidth": 100
   },
-  "linter": { "enabled": false },
+  "linter": {
+    "enabled": true,
+    "rules": {
+      "recommended": true,
+      "style": {
+        "noNonNullAssertion": "off",
+        "useTemplate": "off"
+      },
+      "correctness": {
+        "noVoidTypeReturn": "off"
+      }
+    }
+  },
   "assist": { "enabled": false },
   "files": {
     "includes": [

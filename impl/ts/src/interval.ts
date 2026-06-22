@@ -7,7 +7,7 @@
 // the render format must be byte-identical across the Rust/Go/TS cores. ALL cascade/span math is
 // `bigint` (JS `number` is f64 — loses i64 precision), matching Rust's i128 and Go's big.Int.
 
-import { engineError, EngineError } from "./errors.ts";
+import { engineError, type EngineError } from "./errors.ts";
 import {
   civilFromMicros,
   daysFromCivil,

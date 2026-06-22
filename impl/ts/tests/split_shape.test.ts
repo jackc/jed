@@ -13,7 +13,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { Database, create, execute } from "../src/lib.ts";
+import { type Database, create, execute } from "../src/lib.ts";
 
 function cost(db: Database, sql: string): bigint {
   return execute(db, sql).cost;

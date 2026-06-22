@@ -26,7 +26,6 @@ import type {
   Literal,
   OnConflict,
   OrderKey,
-  Overriding,
   QueryExpr,
   RefAction,
   SeqOptions,
@@ -92,8 +91,8 @@ import {
   workMul,
 } from "./decimal.ts";
 import { encodeBool, encodeInt, encodeTerminated } from "./encoding.ts";
-import { EngineError, engineError } from "./errors.ts";
-import { type Privilege, PrivilegeSet, Privileges } from "./privileges.ts";
+import { type EngineError, engineError } from "./errors.ts";
+import { type Privilege, type PrivilegeSet, Privileges } from "./privileges.ts";
 import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
 import { parseExpression, parseSQL } from "./parser.ts";
@@ -108,7 +107,6 @@ import {
   arrayT,
   compositeRefName,
   compositeT,
-  isCompositeType,
   inRange,
   isBool,
   isBytea,
@@ -9005,95 +9003,90 @@ function distinctRowKey(row: Value[]): string {
 // §5). Shared by distinctRowKey (which joins the per-field keys with a separator no scalar key can
 // contain).
 function distinctValueKey(v: Value): string {
-  {
-    switch (v.kind) {
-      case "composite":
-        // Length-prefix the field count and each field's key so a composite never collides with a
-        // scalar key and nested composites stay unambiguous.
-        return (
-          "c" +
-          v.fields.length.toString() +
-          ":" +
-          v.fields.map((f) => distinctValueKey(f)).join(",")
-        );
-      case "array":
-        // An array keys structurally INCLUDING its shape (spec/design/array.md §5): the dims and
-        // lower bounds (so [2:4]={1,2,3} and {1,2,3} bucket apart — array_eq considers them), then
-        // each element's own key. NULL elements key as 'n' (btree equality — NULLs mutually equal).
-        return (
-          "a" +
-          v.dims.join(":") +
-          ";" +
-          v.lbounds.join(";") +
-          "=" +
-          v.elements.map((el) => distinctValueKey(el)).join(",")
-        );
-      case "range":
-        // A range keys structurally over its CANONICAL form (spec/design/ranges.md §6): the empty
-        // flag, the inclusivity flags, and each bound's own key (an infinite/null bound keys as
-        // 'n', like a NULL array element). Two equal canonical ranges have identical fields, so
-        // this buckets exactly like the range_cmp equality. The 'r' tag + flag chars keep it
-        // collision-free against scalar/array keys.
-        if (v.empty) return "re";
-        return (
-          "r" +
-          (v.lowerInc ? "[" : "(") +
-          (v.upperInc ? "]" : ")") +
-          (v.lower === null ? "n" : distinctValueKey(v.lower)) +
-          "," +
-          (v.upper === null ? "n" : distinctValueKey(v.upper))
-        );
-      case "null":
-        return "n";
-      case "int":
-        return "i" + v.int.toString();
-      case "bool":
-        return v.value ? "b1" : "b0";
-      case "text":
-        // Length-prefix the content so the separator byte cannot be confused with a text
-        // value that contains it (the value is arbitrary UTF-8).
-        return "t" + v.text.length.toString() + ":" + v.text;
-      case "decimal":
-        // Value-canonical key so 1.5 and 1.50 collapse to one DISTINCT bucket (decimal.md §5).
-        return "d" + v.dec.canonicalString();
-      case "bytea":
-        // A distinct 'y' tag over the hex form (collision-free), so a bytea never collides
-        // with a text value of the same bytes.
-        return "y" + renderByteaHex(v.bytes);
-      case "uuid":
-        // A distinct 'u' tag over the canonical form, so a uuid never collides with a
-        // bytea/text of the same bytes.
-        return "u" + renderUuid(v.bytes);
-      case "timestamp":
-        // The i64 microsecond instant under a distinct 's' tag: two literals for the same
-        // instant (12:00:00 and 12:00:00.0) share micros and bucket together; the infinity
-        // sentinels are ordinary int values with their own buckets.
-        return "s" + v.micros.toString();
-      case "timestamptz":
-        // The i64 UTC-instant micros under a distinct 'z' tag: offsets are normalized to UTC
-        // at parse, so +00 and +05-of-the-same-instant bucket together.
-        return "z" + v.micros.toString();
-      case "interval":
-        // The canonical 128-bit span as a decimal string under a distinct 'v' tag, so
-        // span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/
-        // GROUP BY bucket while each value renders its own fields (spec/design/interval.md §2).
-        return "v" + intervalSpan(v.iv).toString();
-      case "f32":
-      case "f64":
-        // The TOTAL-order canonical key so -0 and +0 collapse to one bucket and all NaNs to one
-        // (float.md §3): canonicalize -0 → +0, map every NaN to a single sentinel string. Distinct
-        // tags 'f'/'g' per width so a f32 never collides with a f64 of the same number
-        // (they are different typed columns; the tag keeps the key total). The number's toString
-        // is the shortest round-trip — unique per binary value, so distinct values get distinct
-        // keys after the -0/NaN normalization.
-        return (
-          (v.kind === "f32" ? "f" : "g") +
-          (Number.isNaN(v.value) ? "NaN" : renderFloat(canonFloat(v.value)))
-        );
-      default:
-        // unfetched never reaches a projected dedup row (the scan layer resolves touched columns).
-        throw new Error("BUG: unfetched large value escaped the storage layer");
-    }
+  switch (v.kind) {
+    case "composite":
+      // Length-prefix the field count and each field's key so a composite never collides with a
+      // scalar key and nested composites stay unambiguous.
+      return (
+        "c" + v.fields.length.toString() + ":" + v.fields.map((f) => distinctValueKey(f)).join(",")
+      );
+    case "array":
+      // An array keys structurally INCLUDING its shape (spec/design/array.md §5): the dims and
+      // lower bounds (so [2:4]={1,2,3} and {1,2,3} bucket apart — array_eq considers them), then
+      // each element's own key. NULL elements key as 'n' (btree equality — NULLs mutually equal).
+      return (
+        "a" +
+        v.dims.join(":") +
+        ";" +
+        v.lbounds.join(";") +
+        "=" +
+        v.elements.map((el) => distinctValueKey(el)).join(",")
+      );
+    case "range":
+      // A range keys structurally over its CANONICAL form (spec/design/ranges.md §6): the empty
+      // flag, the inclusivity flags, and each bound's own key (an infinite/null bound keys as
+      // 'n', like a NULL array element). Two equal canonical ranges have identical fields, so
+      // this buckets exactly like the range_cmp equality. The 'r' tag + flag chars keep it
+      // collision-free against scalar/array keys.
+      if (v.empty) return "re";
+      return (
+        "r" +
+        (v.lowerInc ? "[" : "(") +
+        (v.upperInc ? "]" : ")") +
+        (v.lower === null ? "n" : distinctValueKey(v.lower)) +
+        "," +
+        (v.upper === null ? "n" : distinctValueKey(v.upper))
+      );
+    case "null":
+      return "n";
+    case "int":
+      return "i" + v.int.toString();
+    case "bool":
+      return v.value ? "b1" : "b0";
+    case "text":
+      // Length-prefix the content so the separator byte cannot be confused with a text
+      // value that contains it (the value is arbitrary UTF-8).
+      return "t" + v.text.length.toString() + ":" + v.text;
+    case "decimal":
+      // Value-canonical key so 1.5 and 1.50 collapse to one DISTINCT bucket (decimal.md §5).
+      return "d" + v.dec.canonicalString();
+    case "bytea":
+      // A distinct 'y' tag over the hex form (collision-free), so a bytea never collides
+      // with a text value of the same bytes.
+      return "y" + renderByteaHex(v.bytes);
+    case "uuid":
+      // A distinct 'u' tag over the canonical form, so a uuid never collides with a
+      // bytea/text of the same bytes.
+      return "u" + renderUuid(v.bytes);
+    case "timestamp":
+      // The i64 microsecond instant under a distinct 's' tag: two literals for the same
+      // instant (12:00:00 and 12:00:00.0) share micros and bucket together; the infinity
+      // sentinels are ordinary int values with their own buckets.
+      return "s" + v.micros.toString();
+    case "timestamptz":
+      // The i64 UTC-instant micros under a distinct 'z' tag: offsets are normalized to UTC
+      // at parse, so +00 and +05-of-the-same-instant bucket together.
+      return "z" + v.micros.toString();
+    case "interval":
+      // The canonical 128-bit span as a decimal string under a distinct 'v' tag, so
+      // span-equal intervals ('1 mon' / '30 days' / '720:00:00') collapse to one DISTINCT/
+      // GROUP BY bucket while each value renders its own fields (spec/design/interval.md §2).
+      return "v" + intervalSpan(v.iv).toString();
+    case "f32":
+    case "f64":
+      // The TOTAL-order canonical key so -0 and +0 collapse to one bucket and all NaNs to one
+      // (float.md §3): canonicalize -0 → +0, map every NaN to a single sentinel string. Distinct
+      // tags 'f'/'g' per width so a f32 never collides with a f64 of the same number
+      // (they are different typed columns; the tag keeps the key total). The number's toString
+      // is the shortest round-trip — unique per binary value, so distinct values get distinct
+      // keys after the -0/NaN normalization.
+      return (
+        (v.kind === "f32" ? "f" : "g") +
+        (Number.isNaN(v.value) ? "NaN" : renderFloat(canonFloat(v.value)))
+      );
+    default:
+      // unfetched never reaches a projected dedup row (the scan layer resolves touched columns).
+      throw new Error("BUG: unfetched large value escaped the storage layer");
   }
 }
 
@@ -17309,7 +17302,7 @@ function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: 
 // exempted), trapping 22003 on a finite-input overflow to ±Inf (e.g. pow(10, 400)); a NaN/±Inf
 // operand propagates per IEEE. result is f64 (the catalog), so no fround.
 function evalFloatPow(x: number, y: number, result: ScalarType): Value {
-  const r = Math.pow(x, y);
+  const r = x ** y;
   if (Number.isFinite(x) && Number.isFinite(y) && !Number.isFinite(r)) throw overflow(result);
   return result === "f32" ? float32Value(Math.fround(r)) : float64Value(r);
 }
