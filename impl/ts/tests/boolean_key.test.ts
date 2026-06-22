@@ -32,7 +32,10 @@ test("boolean composite primary key", () => {
     "INSERT INTO t VALUES (1, TRUE, 10), (1, FALSE, 20), (2, FALSE, 30)",
   ]);
   // (1,FALSE) and (1,TRUE) are distinct keys; the same (a,b) again conflicts.
-  assert.equal(errCode(() => execute(db, "INSERT INTO t VALUES (1, TRUE, 99)")), "23505");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO t VALUES (1, TRUE, 99)")),
+    "23505",
+  );
   // Key order: a ascending, then b false<true within an a-group.
   assert.deepEqual(query(db, "SELECT a, b FROM t"), [
     ["1", "false"],

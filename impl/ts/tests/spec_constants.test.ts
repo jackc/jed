@@ -70,9 +70,17 @@ test("scalar types match spec/types/scalars.toml", () => {
   for (const name of ["decimal", "numeric", "dec"]) {
     assert.equal(scalarTypeFromName(name), "decimal", `${name} resolves to decimal`);
   }
-  assert.equal(decimal!.big("max_precision"), BigInt(MAX_PRECISION), "max_precision matches module");
+  assert.equal(
+    decimal!.big("max_precision"),
+    BigInt(MAX_PRECISION),
+    "max_precision matches module",
+  );
   assert.equal(decimal!.big("max_scale"), BigInt(MAX_SCALE), "max_scale matches module");
-  assert.equal(decimal!.big("max_int_digits"), BigInt(MAX_INT_DIGITS), "max_int_digits matches module");
+  assert.equal(
+    decimal!.big("max_int_digits"),
+    BigInt(MAX_INT_DIGITS),
+    "max_int_digits matches module",
+  );
 
   // uuid: storable, the uuid family, fixed-width (the first non-integer with a width_bytes).
   // Its on-disk width (16) is a cross-core contract, so cross-check it against the spec.
@@ -157,7 +165,11 @@ test("operators match spec/functions/catalog.toml", () => {
     assert.equal(d.argResolution, row.str("arg_resolution"), `${name}: arg_resolution`);
     assert.equal(d.result, row.str("result"), `${name}: result`);
     assert.equal(d.null, row.str("null"), `${name}: null`);
-    assert.equal(d.precedence, row.has("precedence") ? row.num("precedence") : 0, `${name}: precedence`);
+    assert.equal(
+      d.precedence,
+      row.has("precedence") ? row.num("precedence") : 0,
+      `${name}: precedence`,
+    );
     assert.deepEqual([...d.argFamilies], row.strs("arg_families"), `${name}: argFamilies`);
     assert.deepEqual([...d.errors], row.strs("errors"), `${name}: errors`);
     // Optional named/default-argument metadata (functions.md §11); absent ⇒ empty array.
@@ -204,7 +216,11 @@ test("set-returning functions match spec/functions/catalog.toml", () => {
     const name = row.str("name");
     const arity = Number(row.big("arity"));
     const desc = SET_RETURNING.find((d) => d.name === name && d.arity === arity);
-    assert.notEqual(desc, undefined, `generated table missing set_returning ${name}/arity-${arity}`);
+    assert.notEqual(
+      desc,
+      undefined,
+      `generated table missing set_returning ${name}/arity-${arity}`,
+    );
     const d = desc!;
     assert.equal(row.str("kind"), "set_returning", `${name}: kind`);
     assert.equal(d.surface, row.str("surface"), `${name}: surface`);
@@ -276,7 +292,10 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
     // A range CONSTRUCTOR (range-functions.md §2): no scalar kernel id — the kernel is evalRangeCtor,
     // reached from the resolver. Its result is a concrete range id (e.g. "i32range").
     if (rangeByName(o.name) !== undefined) {
-      assert.ok(rangeByName(o.result) !== undefined, `range constructor ${o.name} has non-range result code ${o.result}`);
+      assert.ok(
+        rangeByName(o.result) !== undefined,
+        `range constructor ${o.name} has non-range result code ${o.result}`,
+      );
       continue;
     }
     // range_merge is the SET range function (range-functions.md §4): result `anyrange`, and NO scalar
@@ -286,7 +305,8 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
       assert.equal(o.result, "anyrange", "range_merge result code");
       continue;
     }
-    const concreteArray = o.result.endsWith("[]") && scalarTypeFromName(o.result.slice(0, -2)) !== undefined;
+    const concreteArray =
+      o.result.endsWith("[]") && scalarTypeFromName(o.result.slice(0, -2)) !== undefined;
     const ok =
       o.result === "promoted" ||
       o.result === "anyarray" ||
@@ -297,6 +317,9 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
   }
   const AGG_RESULT_CODES = new Set(["i64", "decimal", "sum_widen", "same_as_input"]);
   for (const a of AGGREGATES) {
-    assert.ok(AGG_RESULT_CODES.has(a.result), `aggregate ${a.name} has unhandled result code ${a.result}`);
+    assert.ok(
+      AGG_RESULT_CODES.has(a.result),
+      `aggregate ${a.name} has unhandled result code ${a.result}`,
+    );
   }
 });

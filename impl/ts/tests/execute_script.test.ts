@@ -44,7 +44,11 @@ test("script is all-or-nothing on error", () => {
   const db = new Database();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)");
   assert.strictEqual(
-    code(() => db.executeScript("INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (1)")),
+    code(() =>
+      db.executeScript(
+        "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (1)",
+      ),
+    ),
     "23505",
   );
   assert.strictEqual(db.status(), "Idle");
@@ -78,7 +82,11 @@ test("in-script transaction control is 0A000 and rolls the run back", () => {
     "INSERT INTO t VALUES (1); BEGIN; INSERT INTO t VALUES (2)",
     "INSERT INTO t VALUES (1); ROLLBACK",
   ]) {
-    assert.strictEqual(code(() => db.executeScript(script)), "0A000", script);
+    assert.strictEqual(
+      code(() => db.executeScript(script)),
+      "0A000",
+      script,
+    );
     assert.strictEqual(db.status(), "Idle");
     assert.deepStrictEqual(countRows(db), [[intValue(0n)]], script); // wrapper rolled back
   }

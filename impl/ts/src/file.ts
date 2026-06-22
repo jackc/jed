@@ -5,7 +5,15 @@
 // just the dirty pages, published by alternating the meta slot (spec/fileformat/format.md, P6.1 part
 // B) — the block seam below pwrites pages (writeSync at a position) into the open file.
 
-import { closeSync, existsSync, fsyncSync, openSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  fsyncSync,
+  openSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { dirname } from "node:path";
 
 import { FileBlockStore } from "./fileblockstore.ts";
@@ -43,7 +51,10 @@ export function create(path: string, opts: DatabaseOptions = {}): Database {
   } catch (e) {
     throw ioError(e);
   }
-  db.paging = new SharedPaging(Pager.fromStore(new FileBlockStore(fd)), cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize)); // valid header
+  db.paging = new SharedPaging(
+    Pager.fromStore(new FileBlockStore(fd)),
+    cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize),
+  ); // valid header
   db.spillSink = new FileSpillSink(dirname(path)); // ORDER BY spills next to the database file (spill.md §4)
   return db;
 }

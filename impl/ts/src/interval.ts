@@ -8,7 +8,13 @@
 // `bigint` (JS `number` is f64 — loses i64 precision), matching Rust's i128 and Go's big.Int.
 
 import { engineError, EngineError } from "./errors.ts";
-import { civilFromMicros, daysFromCivil, daysInMonth, NEG_INFINITY, POS_INFINITY } from "./timestamp.ts";
+import {
+  civilFromMicros,
+  daysFromCivil,
+  daysInMonth,
+  NEG_INFINITY,
+  POS_INFINITY,
+} from "./timestamp.ts";
 
 const MICROS_PER_SEC = 1_000_000n;
 // Microseconds in one day — the canonical "1 day = 24 h" span weight.
@@ -112,7 +118,12 @@ export function makeInterval(
   const hm = checkedI64(hours * 60n + mins); // total minutes
   const sec = checkedI64(hm * 60n); // total seconds
   const micros = checkedI64(checkedI64(sec * MICROS_PER_SEC) + secMicros);
-  if (monthsTotal < I32_MIN || monthsTotal > I32_MAX || daysTotal < I32_MIN || daysTotal > I32_MAX) {
+  if (
+    monthsTotal < I32_MIN ||
+    monthsTotal > I32_MAX ||
+    daysTotal < I32_MIN ||
+    daysTotal > I32_MAX
+  ) {
     throw intervalFieldOverflow("interval out of range");
   }
   return { months: Number(monthsTotal), days: Number(daysTotal), micros };
@@ -181,7 +192,14 @@ export function mulByFraction(iv: Interval, fnum: bigint, fden: bigint): Interva
   const timeNum = u * fn + (dayFrac + mrdFrac) * MICROS_PER_DAY;
   const rTime = roundDivBig(timeNum, fd);
 
-  if (rMonth < I32_MIN || rMonth > I32_MAX || rDay < I32_MIN || rDay > I32_MAX || rTime < I64_MIN || rTime > I64_MAX) {
+  if (
+    rMonth < I32_MIN ||
+    rMonth > I32_MAX ||
+    rDay < I32_MIN ||
+    rDay > I32_MAX ||
+    rTime < I64_MIN ||
+    rTime > I64_MAX
+  ) {
     throw intervalFieldOverflow("interval out of range");
   }
   return { months: Number(rMonth), days: Number(rDay), micros: rTime };
@@ -234,7 +252,8 @@ export function tsDiff(a: bigint, b: bigint): Interval {
   const micros = a - b;
   const days = micros / MICROS_PER_DAY; // trunc toward zero
   const rem = micros % MICROS_PER_DAY;
-  if (days < -2147483648n || days > 2147483647n) throw intervalFieldOverflow("interval out of range");
+  if (days < -2147483648n || days > 2147483647n)
+    throw intervalFieldOverflow("interval out of range");
   return { months: 0, days: Number(days), micros: rem };
 }
 
@@ -457,7 +476,11 @@ function parseTime(acc: Acc, c: Cursor, neg: boolean, hour: bigint): void {
       fracUs = readFracUs(c);
     }
   }
-  let total = hour * 3600n * MICROS_PER_SEC + minute * 60n * MICROS_PER_SEC + second * MICROS_PER_SEC + fracUs;
+  let total =
+    hour * 3600n * MICROS_PER_SEC +
+    minute * 60n * MICROS_PER_SEC +
+    second * MICROS_PER_SEC +
+    fracUs;
   if (neg) total = -total;
   acc.micros = addChecked(acc.micros, total);
 }

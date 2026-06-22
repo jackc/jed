@@ -119,7 +119,11 @@ test("RETURNING error codes", () => {
     ["SELECT v FROM t returning", "42601"],
   ];
   for (const [sql, code] of cases) {
-    assert.equal(errCode(() => execute(db, sql)), code, sql);
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      code,
+      sql,
+    );
   }
   // Nothing above wrote anything.
   assert.deepStrictEqual(rows(db, "SELECT count(*) FROM t"), [["3"]]);
@@ -138,7 +142,10 @@ test("RETURNING subqueries observe the pre-statement snapshot", () => {
   );
   // ... an UPDATE's subquery sees pre-update values (sum over old v: 10+20+30) ...
   assert.deepStrictEqual(
-    rows(db, "UPDATE t SET v = 0 WHERE id = 1 RETURNING (SELECT sum(v) FROM t WHERE w IS NOT NULL)"),
+    rows(
+      db,
+      "UPDATE t SET v = 0 WHERE id = 1 RETURNING (SELECT sum(v) FROM t WHERE w IS NOT NULL)",
+    ),
     [["60"]],
   );
   // ... and a DELETE's sees the row still present (5 rows live at this point).
@@ -184,7 +191,10 @@ test("RETURNING subquery costs: fold once vs correlated per returned row", () =>
   // bounded count (page 1 + row 1 + filter 1 + accumulate 1 + row_produced 1 = 5).
   db = setup();
   assert.equal(
-    cost(db, "DELETE FROM t WHERE id = 1 RETURNING (SELECT count(*) FROM t AS s WHERE s.id = t.id)"),
+    cost(
+      db,
+      "DELETE FROM t WHERE id = 1 RETURNING (SELECT count(*) FROM t AS s WHERE s.id = t.id)",
+    ),
     10n,
   );
 });
@@ -208,10 +218,15 @@ test("$N binds in the RETURNING list", () => {
   const o = executeParams(db, "INSERT INTO t VALUES (80, 3, 0) RETURNING v + $1", [intValue(5n)]);
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("unreachable");
-  assert.deepStrictEqual(o.rows.map((r) => r.map(render)), [["8"]]);
+  assert.deepStrictEqual(
+    o.rows.map((r) => r.map(render)),
+    [["8"]],
+  );
   // A parameter no context types is 42P18.
   assert.equal(
-    errCode(() => executeParams(db, "INSERT INTO t VALUES (81, 3, 0) RETURNING $1", [intValue(5n)])),
+    errCode(() =>
+      executeParams(db, "INSERT INTO t VALUES (81, 3, 0) RETURNING $1", [intValue(5n)]),
+    ),
     "42P18",
   );
 });
@@ -221,8 +236,7 @@ test("RETURNING grows the touched set", () => {
   // (the §32 touched-set rule). 100_000 raw bytes at page_size 8192 (C = 8180):
   // ceil(100000/8180) = 13 slabs.
   const big = `INSERT INTO big VALUES (1, 0, '${"x".repeat(100_000)}')`;
-  const fresh = () =>
-    dbWith(["CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)", big]);
+  const fresh = () => dbWith(["CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)", big]);
   // RETURNING only fixed-width columns: no decompression (page 1 + row 1 + filter 1 +
   // row_produced 1).
   assert.equal(cost(fresh(), "DELETE FROM big WHERE id = 1 RETURNING id, w"), 4n);
@@ -247,7 +261,10 @@ test("RETURNING in transactions", () => {
   assert.deepStrictEqual(rows(db, "SELECT count(*) FROM t"), [["3"]]);
   // A write statement stays a write statement: 25006 in a READ ONLY block.
   execute(db, "BEGIN READ ONLY");
-  assert.equal(errCode(() => execute(db, "DELETE FROM t WHERE id = 1 RETURNING id")), "25006");
+  assert.equal(
+    errCode(() => execute(db, "DELETE FROM t WHERE id = 1 RETURNING id")),
+    "25006",
+  );
   execute(db, "ROLLBACK");
 });
 
@@ -335,8 +352,7 @@ test("old/new touched-set sides", () => {
   // column is assigned; a DELETE's new.col is the constant NULL row and reads nothing.
   // Compressed 100k text at page_size 8192 = 13 slabs.
   const big = `INSERT INTO big VALUES (1, 0, '${"x".repeat(100_000)}')`;
-  const fresh = () =>
-    dbWith(["CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)", big]);
+  const fresh = () => dbWith(["CREATE TABLE big (id i32 PRIMARY KEY, w i32, t text)", big]);
   // RETURNING the ASSIGNED column's old version forces the decompress the new version
   // avoided (4 there): 3-unit bounded scan + 13 value_decompress + row_produced (the
   // shrunken rewrite attempts no compression).
@@ -349,6 +365,9 @@ test("old/new touched-set sides", () => {
   const o = execute(db, "DELETE FROM big WHERE id = 1 RETURNING new.t");
   assert.equal(o.kind, "query");
   if (o.kind !== "query") throw new Error("unreachable");
-  assert.deepStrictEqual(o.rows.map((r) => r.map(render)), [["NULL"]]);
+  assert.deepStrictEqual(
+    o.rows.map((r) => r.map(render)),
+    [["NULL"]],
+  );
   assert.equal(o.cost, 4n);
 });

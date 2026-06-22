@@ -8,11 +8,23 @@ test("splitmix64 pinned vectors", () => {
   const cases: [bigint, bigint[]][] = [
     [
       1n,
-      [0x910a2dec89025cc1n, 0xbeeb8da1658eec67n, 0xf893a2eefb32555en, 0x71c18690ee42c90bn, 0x71bb54d8d101b5b9n],
+      [
+        0x910a2dec89025cc1n,
+        0xbeeb8da1658eec67n,
+        0xf893a2eefb32555en,
+        0x71c18690ee42c90bn,
+        0x71bb54d8d101b5b9n,
+      ],
     ],
     [
       1234567n,
-      [0x599ed017fb08fc85n, 0x2c73f08458540fa5n, 0x883ebce5a3f27c77n, 0x3fbef740e9177b3fn, 0xe3b8346708cb5ecdn],
+      [
+        0x599ed017fb08fc85n,
+        0x2c73f08458540fa5n,
+        0x883ebce5a3f27c77n,
+        0x3fbef740e9177b3fn,
+        0xe3b8346708cb5ecdn,
+      ],
     ],
   ];
   for (const [seed, want] of cases) {

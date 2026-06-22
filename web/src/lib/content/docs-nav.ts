@@ -7,37 +7,37 @@ export type DocLink = { title: string; href: string };
 export type DocSection = { title: string; links: DocLink[] };
 
 export const DOCS_NAV: readonly DocSection[] = [
-	{
-		title: 'Getting started',
-		links: [{ title: 'Introduction', href: '/docs/' }]
-	},
-	{
-		title: 'Embedding API',
-		links: [
-			{ title: 'Opening a database', href: '/docs/api/opening-a-database/' },
-			{ title: 'Transactions', href: '/docs/api/transactions/' },
-			{ title: 'Running scripts', href: '/docs/api/scripts/' },
-			{ title: 'Authorization', href: '/docs/api/authorization/' },
-			{ title: 'Resource limits', href: '/docs/api/resource-limits/' },
-			{ title: 'Session variables', href: '/docs/api/session-variables/' }
-		]
-	},
-	{
-		title: 'SQL',
-		links: [
-			{ title: 'Types', href: '/docs/sql/types/' },
-			{ title: 'Tables & constraints', href: '/docs/sql/tables/' },
-			{ title: 'Temporary tables', href: '/docs/sql/temp-tables/' },
-			{ title: 'Indexes', href: '/docs/sql/indexes/' },
-			{ title: 'Querying', href: '/docs/sql/select/' }
-		]
-	},
-	{
-		title: 'Reference',
-		links: [
-			{ title: 'Types', href: '/docs/reference/types/' },
-			{ title: 'Functions & operators', href: '/docs/reference/functions/' },
-			{ title: 'Error codes', href: '/docs/reference/errors/' }
-		]
-	}
+  {
+    title: 'Getting started',
+    links: [{ title: 'Introduction', href: '/docs/' }]
+  },
+  {
+    title: 'Embedding API',
+    links: [
+      { title: 'Opening a database', href: '/docs/api/opening-a-database/' },
+      { title: 'Transactions', href: '/docs/api/transactions/' },
+      { title: 'Running scripts', href: '/docs/api/scripts/' },
+      { title: 'Authorization', href: '/docs/api/authorization/' },
+      { title: 'Resource limits', href: '/docs/api/resource-limits/' },
+      { title: 'Session variables', href: '/docs/api/session-variables/' }
+    ]
+  },
+  {
+    title: 'SQL',
+    links: [
+      { title: 'Types', href: '/docs/sql/types/' },
+      { title: 'Tables & constraints', href: '/docs/sql/tables/' },
+      { title: 'Temporary tables', href: '/docs/sql/temp-tables/' },
+      { title: 'Indexes', href: '/docs/sql/indexes/' },
+      { title: 'Querying', href: '/docs/sql/select/' }
+    ]
+  },
+  {
+    title: 'Reference',
+    links: [
+      { title: 'Types', href: '/docs/reference/types/' },
+      { title: 'Functions & operators', href: '/docs/reference/functions/' },
+      { title: 'Error codes', href: '/docs/reference/errors/' }
+    ]
+  }
 ];

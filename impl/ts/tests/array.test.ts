@@ -44,7 +44,9 @@ test("AC1: composite-element array round-trips literal + ARRAY[ROW(…)] constru
   // Subscript → the composite element (record_out, no braces); field access; slice → addr[].
   assert.deepStrictEqual(query(db, "SELECT items[1] FROM t WHERE id = 1"), [["(Main,90210)"]]);
   assert.deepStrictEqual(query(db, "SELECT (items[2]).street FROM t WHERE id = 1"), [["Side"]]);
-  assert.deepStrictEqual(query(db, "SELECT items[1:1] FROM t WHERE id = 1"), [[`{"(Main,90210)"}`]]);
+  assert.deepStrictEqual(query(db, "SELECT items[1:1] FROM t WHERE id = 1"), [
+    [`{"(Main,90210)"}`],
+  ]);
 });
 
 test("AC1: an addr[] column survives a whole-image round-trip", () => {
@@ -77,7 +79,10 @@ test("AC1: composite element NULL-field ordering operators are definite (the tot
   );
   // A NULL field sorts after a present field.
   assert.deepStrictEqual(
-    query(db, `SELECT '{"(a,)"}'::addr[] > '{"(a,1)"}'::addr[], '{"(a,1)"}'::addr[] < '{"(a,)"}'::addr[]`),
+    query(
+      db,
+      `SELECT '{"(a,)"}'::addr[] > '{"(a,1)"}'::addr[], '{"(a,1)"}'::addr[] < '{"(a,)"}'::addr[]`,
+    ),
     [["true", "true"]],
   );
 });
@@ -85,5 +90,8 @@ test("AC1: composite element NULL-field ordering operators are definite (the tot
 test("AC1: a composite-element array is still never keyable (0A000)", () => {
   const db = new Database();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
-  assert.strictEqual(errCode(() => run(db, "CREATE TABLE t (items addr[] PRIMARY KEY)")), "0A000");
+  assert.strictEqual(
+    errCode(() => run(db, "CREATE TABLE t (items addr[] PRIMARY KEY)")),
+    "0A000",
+  );
 });

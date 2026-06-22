@@ -211,7 +211,12 @@ export function finalizeRange(
   }
   // Empty normalization: equal finite bounds that are not both inclusive contain no points. For
   // discrete ranges the canonical `[)` form already makes a one-point range `[x,x)` land here.
-  if (lower !== null && upper !== null && rangeElemCmp(lower, upper) === 0 && !(lowerInc && upperInc)) {
+  if (
+    lower !== null &&
+    upper !== null &&
+    rangeElemCmp(lower, upper) === 0 &&
+    !(lowerInc && upperInc)
+  ) {
     return emptyRangeValue();
   }
   return rangeValue(lower, upper, lowerInc, upperInc);
@@ -604,7 +609,21 @@ export function rangeOut(v: Value & { kind: "range" }): string {
   return out;
 }
 
-const RANGE_SPECIAL = new Set([" ", "\t", "\n", "\r", "\f", "\v", ",", "[", "]", "(", ")", '"', "\\"]);
+const RANGE_SPECIAL = new Set([
+  " ",
+  "\t",
+  "\n",
+  "\r",
+  "\f",
+  "\v",
+  ",",
+  "[",
+  "]",
+  "(",
+  ")",
+  '"',
+  "\\",
+]);
 
 // quoteBound double-quotes a bound's rendered text if it needs it (PG range_out quoting): empty, or
 // containing whitespace or any of , [ ] ( ) " \. Inside, " → "" and \ → \\.

@@ -19,12 +19,7 @@ import { join } from "node:path";
 
 import { parse as parseToml } from "smol-toml";
 
-import {
-  type ReadHandle,
-  SharedDb,
-  type WriteHandle,
-  render,
-} from "../../../impl/ts/src/lib.ts";
+import { type ReadHandle, SharedDb, type WriteHandle, render } from "../../../impl/ts/src/lib.ts";
 
 import { Checksum, Prng } from "./lib.ts";
 

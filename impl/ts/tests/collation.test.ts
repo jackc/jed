@@ -62,14 +62,19 @@ test("collation sort keys match vectors and are strictly ascending", () => {
       // The real version-pinned collations (unicode, es) resolve from the embedded .coll — the
       // production read path — rather than recompiling their ~2.3 MB source. The small dev fixtures
       // (not vendored) are compiled from their definition files.
-      coll = vendoredCollation(collName) ?? compileCollation(collName, definition(row.strs("def_files")));
+      coll =
+        vendoredCollation(collName) ??
+        compileCollation(collName, definition(row.strs("def_files")));
       lastColl = collName;
       prev = null;
     }
     const key = sortKey(coll!, s);
     assert.equal(bytesToHex(key), want, `${collName} ${JSON.stringify(s)}: sort key`);
     if (prev !== null) {
-      assert.ok(cmpBytes(prev, key) < 0, `${collName}: ${JSON.stringify(s)} must sort strictly after the previous entry`);
+      assert.ok(
+        cmpBytes(prev, key) < 0,
+        `${collName}: ${JSON.stringify(s)} must sort strictly after the previous entry`,
+      );
     }
     prev = key;
   }

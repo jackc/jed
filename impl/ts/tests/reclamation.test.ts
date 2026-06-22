@@ -92,14 +92,22 @@ test("reopening reclaims dead pages so a later churn reuses them", () => {
 
     // The very first post-reopen commit reuses a free page rather than extending the high-water.
     execute(db2, `UPDATE t SET pad = 'b0-${pad}' WHERE id = 15`);
-    assert.equal(pageCountOf(db2), pcAfterChurn1, "the first commit after reopen reuses a dead page");
+    assert.equal(
+      pageCountOf(db2),
+      pcAfterChurn1,
+      "the first commit after reopen reuses a dead page",
+    );
 
     // A whole second churn — shorter than the first, so the reclaimed pool covers it — does not grow
     // the high-water: the page count after equals the count after the first churn.
     for (let k = 1; k < 40; k++) {
       execute(db2, `UPDATE t SET pad = 'b${k}-${pad}' WHERE id = 15`);
     }
-    assert.equal(pageCountOf(db2), pcAfterChurn1, "reusing reclaimed pages, the churn does not grow the high-water");
+    assert.equal(
+      pageCountOf(db2),
+      pcAfterChurn1,
+      "reusing reclaimed pages, the churn does not grow the high-water",
+    );
 
     // And the data is exactly right (reuse never clobbered a live page).
     assert.equal(padOf(db2, 15), `b39-${pad}`);

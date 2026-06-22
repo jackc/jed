@@ -47,7 +47,10 @@ function seed(path: string): { db: Database; prior: bigint } {
 function insertWithFault(db: Database, f: CommitFault): void {
   if (db.paging === null) throw new Error("expected a file-backed database");
   db.paging.armFault(f);
-  assert.throws(() => execute(db, "INSERT INTO t VALUES (3)"), "expected the injected commit crash");
+  assert.throws(
+    () => execute(db, "INSERT INTO t VALUES (3)"),
+    "expected the injected commit crash",
+  );
   close(db);
 }
 
@@ -194,7 +197,11 @@ test("recovery then free-list reuse stays consistent", () => {
     close(db2);
 
     db2 = open(path);
-    assert.deepEqual(idsSorted(db2), [2n, 3n, 4n, 5n], "post-recovery commits are durable and correct");
+    assert.deepEqual(
+      idsSorted(db2),
+      [2n, 3n, 4n, 5n],
+      "post-recovery commits are durable and correct",
+    );
 
     // A second churn round reuses the reconstructed free-list rather than growing the file unbounded.
     execute(db2, "DELETE FROM t WHERE id = 2");

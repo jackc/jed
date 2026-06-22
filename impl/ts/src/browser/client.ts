@@ -26,7 +26,9 @@ export class OpfsError extends Error {
   }
 }
 
-type Reply = { id: number; ok: true; result: unknown } | { id: number; ok: false; error: { code: string; message: string } };
+type Reply =
+  | { id: number; ok: true; result: unknown }
+  | { id: number; ok: false; error: { code: string; message: string } };
 type Pending = { resolve: (v: unknown) => void; reject: (e: unknown) => void };
 
 // OpfsDatabase is an open OPFS-backed database, driven through the worker. Create one with
@@ -66,7 +68,11 @@ export class OpfsDatabase {
   // query runs a SELECT (or RETURNING / set operation) and returns its rendered rows + columns + cost.
   async query(sql: string): Promise<QueryResult> {
     const r = (await this.call("run", { sql })) as { kind: string } & QueryResult;
-    if (r.kind !== "query") throw new OpfsError("XX000", "query() called on a statement that produces no rows; use execute");
+    if (r.kind !== "query")
+      throw new OpfsError(
+        "XX000",
+        "query() called on a statement that produces no rows; use execute",
+      );
     return { columnNames: r.columnNames, rows: r.rows, cost: r.cost };
   }
 

@@ -594,7 +594,9 @@ export interface ParsedArray {
 
 // ArrayInResult is parseArrayLiteral's result: a parsed array, or a classified failure —
 // "malformed" (→ 22P02) or "boundflip" (a declared [l:u] with u<l → 2202E).
-export type ArrayInResult = { ok: true; value: ParsedArray } | { ok: false; err: "malformed" | "boundflip" };
+export type ArrayInResult =
+  | { ok: true; value: ParsedArray }
+  | { ok: false; err: "malformed" | "boundflip" };
 
 // ArrNode is a parsed brace node: a leaf scalar token (leaf, null = the NULL token) or a braced level.
 type ArrNode = { leaf: string | null; isLeaf: true } | { children: ArrNode[]; isLeaf: false };
@@ -652,7 +654,8 @@ export function parseArrayLiteral(input: string): ArrayInResult {
   if (prefixDims.length === 0) {
     lbounds = dims.map(() => 1);
   } else {
-    if (prefixDims.length !== dims.length || prefixDims.some((d, i) => d !== dims[i])) return malformed;
+    if (prefixDims.length !== dims.length || prefixDims.some((d, i) => d !== dims[i]))
+      return malformed;
     lbounds = prefixLb;
   }
   return { ok: true, value: { dims, lbounds, tokens } };
@@ -778,7 +781,8 @@ function nodeDims(node: ArrNode): number[] | null {
   if (child0 === null) return null;
   for (const c of node.children.slice(1)) {
     const cd = nodeDims(c);
-    if (cd === null || cd.length !== child0.length || cd.some((d, i) => d !== child0[i])) return null;
+    if (cd === null || cd.length !== child0.length || cd.some((d, i) => d !== child0[i]))
+      return null;
   }
   return [node.children.length, ...child0];
 }
@@ -974,7 +978,8 @@ function arrayTotalCmp(a: ArrayShape, b: ArrayShape): number {
     const c = elemTotalCmp(a.elements[i]!, b.elements[i]!);
     if (c !== 0) return c;
   }
-  if (a.elements.length !== b.elements.length) return a.elements.length < b.elements.length ? -1 : 1;
+  if (a.elements.length !== b.elements.length)
+    return a.elements.length < b.elements.length ? -1 : 1;
   if (a.dims.length !== b.dims.length) return a.dims.length < b.dims.length ? -1 : 1;
   for (let d = 0; d < a.dims.length; d++) {
     if (a.dims[d] !== b.dims[d]) return a.dims[d]! < b.dims[d]! ? -1 : 1;
@@ -995,7 +1000,8 @@ function elemTotalCmp(x: Value, y: Value): number {
   if (xn && yn) return 0;
   if (xn) return 1; // NULL sorts last
   if (yn) return -1;
-  if (x.kind === "composite" && y.kind === "composite") return compositeTotalCmp(x.fields, y.fields);
+  if (x.kind === "composite" && y.kind === "composite")
+    return compositeTotalCmp(x.fields, y.fields);
   if (x.kind === "array" && y.kind === "array") return arrayTotalCmp(x, y);
   if (eq3(x, y) === "true") return 0;
   return lt3(x, y) === "true" ? -1 : 1;
@@ -1054,7 +1060,8 @@ export function lt3(a: Value, b: Value): ThreeValued {
   // Composite `<` is lexicographic with PG row-comparison NULL propagation (spec/design/composite.md
   // §5): the first field that is not equal decides via its own `<`; a field whose `=` is UNKNOWN (a
   // NULL operand) makes the whole comparison UNKNOWN; all-equal rows are not `<`.
-  if (a.kind === "composite" && b.kind === "composite") return compositeOrder3(a.fields, b.fields, false);
+  if (a.kind === "composite" && b.kind === "composite")
+    return compositeOrder3(a.fields, b.fields, false);
   // Array `<` uses the PG array_cmp total order (spec/design/array.md §5): element-wise, NULL after
   // every non-NULL, shorter prefix first. Always definite.
   if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a, b) < 0);
@@ -1086,7 +1093,8 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "date" && b.kind === "date") return bool3(a.days > b.days);
   if (a.kind === "interval" && b.kind === "interval") return bool3(intervalCmp(a.iv, b.iv) > 0);
   // Composite `>` — the lexicographic mirror of `<` (spec/design/composite.md §5).
-  if (a.kind === "composite" && b.kind === "composite") return compositeOrder3(a.fields, b.fields, true);
+  if (a.kind === "composite" && b.kind === "composite")
+    return compositeOrder3(a.fields, b.fields, true);
   // Array `>` — the total-order mirror of `<` (spec/design/array.md §5).
   if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a, b) > 0);
   // Range `>` — the total-order mirror of `<` (spec/design/ranges.md §6).

@@ -122,7 +122,10 @@ export class Pager {
       throw engineError("data_corrupted", "database file smaller than a meta header");
     }
     const header = store.readAt(0, 12);
-    const pageSize = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(8, false);
+    const pageSize = new DataView(header.buffer, header.byteOffset, header.byteLength).getUint32(
+      8,
+      false,
+    );
     if (pageSize === 0) {
       throw engineError("data_corrupted", "zero page size in meta header");
     }

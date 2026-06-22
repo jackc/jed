@@ -445,11 +445,7 @@ export function execute(db: Database, sql: string): Outcome {
 // executeParams parses and executes one SQL statement against db, binding params to its $N
 // placeholders (spec/design/api.md §5). A count mismatch is 42601; a parameter whose type cannot
 // be inferred is 42P18; a bound value out of range / of the wrong family fails like a literal.
-export function executeParams(
-  db: Database,
-  sql: string,
-  params: Value[],
-): Outcome {
+export function executeParams(db: Database, sql: string, params: Value[]): Outcome {
   return db.executeStmtParams(db.parse(sql), params);
 }
 

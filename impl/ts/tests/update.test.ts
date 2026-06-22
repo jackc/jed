@@ -17,6 +17,12 @@ function setup() {
 }
 
 test("unknown column traps 42703; missing table traps 42P01", () => {
-  assert.equal(errCode(() => execute(setup(), "UPDATE t SET nope = 1")), "42703");
-  assert.equal(errCode(() => execute(new Database(), "UPDATE nope SET a = 1")), "42P01");
+  assert.equal(
+    errCode(() => execute(setup(), "UPDATE t SET nope = 1")),
+    "42703",
+  );
+  assert.equal(
+    errCode(() => execute(new Database(), "UPDATE nope SET a = 1")),
+    "42P01",
+  );
 });

@@ -93,5 +93,10 @@ test("@> / && — errors", () => {
     ["SELECT 1 @ 2", "42601"], // lone @ — no unary-@
     ["SELECT 1 & 2", "42601"], // lone & — no bitwise-and
   ];
-  for (const [sql, want] of cases) assert.equal(errCode(() => execute(db, sql)), want, sql);
+  for (const [sql, want] of cases)
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      want,
+      sql,
+    );
 });

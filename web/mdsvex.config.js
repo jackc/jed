@@ -9,8 +9,8 @@ import { defineMDSveXConfig as defineConfig } from 'mdsvex';
  * at build time, the language selector toggles which is shown — zero highlighter JS shipped).
  */
 const config = defineConfig({
-	extensions: ['.svx', '.md'],
-	smartypants: { dashes: 'oldschool' }
+  extensions: ['.svx', '.md'],
+  smartypants: { dashes: 'oldschool' }
 });
 
 export default config;

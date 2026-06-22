@@ -239,7 +239,8 @@ function parseDatetime(input: string, applyOffset: boolean, typeName: string): b
   if (year < 1n || year > 999_999n) throw fieldOverflow("year out of range");
   if (month < 1n || month > 12n) throw fieldOverflow("month out of range");
   const astro = bc ? 1n - year : year;
-  if (day < 1n || day > daysInMonth(astro, month)) throw fieldOverflow("day out of range for month");
+  if (day < 1n || day > daysInMonth(astro, month))
+    throw fieldOverflow("day out of range for month");
   const extraDay = hour === 24n && minute === 0n && second === 0n && micro === 0n;
   if (hour > 23n && !extraDay) throw fieldOverflow("hour out of range");
   if (minute > 59n) throw fieldOverflow("minute out of range");

@@ -160,10 +160,7 @@ test("INSERT enforcement", () => {
   assert.equal(dup.code, "23505");
   assert.match(dup.message, /t_v_key/);
   // An in-batch duplicate (two-phase: nothing stored).
-  assert.equal(
-    errInfo(() => run(db, "INSERT INTO t VALUES (3, 30, 1), (4, 30, 2)")).code,
-    "23505",
-  );
+  assert.equal(errInfo(() => run(db, "INSERT INTO t VALUES (3, 30, 1), (4, 30, 2)")).code, "23505");
   assert.deepEqual(ids(db, "SELECT id FROM t ORDER BY id"), [1n, 2n]);
   // NULLS DISTINCT: any number of NULLs coexist, and a NULL component exempts the
   // multi-column tuple — (100, NULL) twice is fine even though w matches.

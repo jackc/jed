@@ -97,7 +97,10 @@ test("range scan crosses leaf boundaries", () => {
   const got = ids(db, "SELECT id FROM t WHERE id >= 300 AND id <= 700 ORDER BY id");
   assert.strictEqual(got.length, 401);
   for (let i = 0; i < got.length; i++) assert.strictEqual(got[i], 300 + i);
-  assert.deepStrictEqual(ids(db, "SELECT id FROM t WHERE id > 996 ORDER BY id"), [997, 998, 999, 1000]);
+  assert.deepStrictEqual(
+    ids(db, "SELECT id FROM t WHERE id > 996 ORDER BY id"),
+    [997, 998, 999, 1000],
+  );
   // Contradictory bound: empty, cost 0.
   assert.deepStrictEqual(ids(db, "SELECT id FROM t WHERE id > 700 AND id < 300"), []);
   assert.strictEqual(cost(db, "SELECT id FROM t WHERE id > 700 AND id < 300"), 0n);
@@ -110,7 +113,10 @@ test("LIMIT short-circuit is sublinear", () => {
   const point = cost(db, "SELECT v FROM t LIMIT 5");
   const full = cost(db, "SELECT v FROM t");
   assert.ok(point < full, `LIMIT cost ${point} should be far below full-scan ${full}`);
-  assert.ok(point <= 20n, `LIMIT 5 cost ${point} should be sublinear (≈ limit + node count), not ~1000`);
+  assert.ok(
+    point <= 20n,
+    `LIMIT 5 cost ${point} should be sublinear (≈ limit + node count), not ~1000`,
+  );
   assert.deepStrictEqual(ids(db, "SELECT v FROM t LIMIT 3 OFFSET 10"), [11, 12, 13]);
 
   // Trap windowing: streaming projects ONLY the windowed rows, so a later trapping row is never

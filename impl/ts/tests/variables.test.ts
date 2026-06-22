@@ -90,10 +90,7 @@ test("missing_ok turns the unset error into NULL", () => {
     code(() => execute(db, "SELECT current_setting('myapp.unset')")),
     "42704",
   );
-  assert.equal(
-    scalar(db, "SELECT current_setting('myapp.unset', true)").kind,
-    "null",
-  );
+  assert.equal(scalar(db, "SELECT current_setting('myapp.unset', true)").kind, "null");
   // false behaves like the one-arg form.
   assert.equal(
     code(() => execute(db, "SELECT current_setting('myapp.unset', false)")),
@@ -108,10 +105,7 @@ test("a NULL name propagates to NULL", () => {
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, n text)");
   execute(db, "INSERT INTO t VALUES (1, NULL)");
   db.setVar("myapp.x", "set");
-  assert.equal(
-    scalar(db, "SELECT current_setting(n) FROM t WHERE id = 1").kind,
-    "null",
-  );
+  assert.equal(scalar(db, "SELECT current_setting(n) FROM t WHERE id = 1").kind, "null");
 });
 
 test("variables are session state, not snapshot state", () => {

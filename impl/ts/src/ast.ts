@@ -214,9 +214,7 @@ export type SubscriptSpec =
 export type SelectItem = { expr: Expr; alias: string | null };
 
 // SelectItems is either all columns (*) or a list of projected expressions.
-export type SelectItems =
-  | { kind: "all" }
-  | { kind: "list"; items: SelectItem[] };
+export type SelectItems = { kind: "all" } | { kind: "list"; items: SelectItem[] };
 
 // OrderKey is one ORDER BY sort key: a bare table column, a sort direction, and a resolved
 // NULL placement. nullsFirst is resolved at parse time — an explicit NULLS FIRST|LAST, else
@@ -308,12 +306,7 @@ export type CreateTable = {
 // RefAction is a referential action for `ON DELETE` / `ON UPDATE` (spec/design/constraints.md
 // §6.6). Only "noAction" (the default) and "restrict" are supported — identical in jed (no
 // deferrable constraints); the write-actions parse but are rejected 0A000 at CREATE TABLE.
-export type RefAction =
-  | "noAction"
-  | "restrict"
-  | "cascade"
-  | "setNull"
-  | "setDefault";
+export type RefAction = "noAction" | "restrict" | "cascade" | "setNull" | "setDefault";
 
 // ForeignKeyDef is one parsed `FOREIGN KEY` / `REFERENCES` constraint (spec/design/grammar.md
 // §43): the optional explicit CONSTRAINT name (null = unnamed), the local (referencing) column
@@ -509,9 +502,7 @@ export type Insert = {
   // The optional `OVERRIDING { SYSTEM | USER } VALUE` clause (spec/design/sequences.md §13),
   // governing IDENTITY columns. null is the default (no override).
   overriding: Overriding | null;
-  source:
-    | { kind: "values"; rows: InsertValue[][] }
-    | { kind: "select"; select: Select };
+  source: { kind: "values"; rows: InsertValue[][] } | { kind: "select"; select: Select };
   // The optional ON CONFLICT clause (UPSERT — spec/design/upsert.md), between the source and
   // RETURNING. Null = no clause (a conflict traps 23505 as usual).
   onConflict: OnConflict | null;
@@ -719,18 +710,12 @@ export type CteBody = QueryExpr | Insert | Update | Delete;
 // cteBodyAsQuery returns the query expression if `body` is a plain query, else null (a
 // data-modifying body). Only a query body can be a recursive UNION shape (writable-cte.md §3).
 export function cteBodyAsQuery(body: CteBody): QueryExpr | null {
-  return body.kind === "select" ||
-    body.kind === "setOp" ||
-    body.kind === "withExpr"
-    ? body
-    : null;
+  return body.kind === "select" || body.kind === "setOp" || body.kind === "withExpr" ? body : null;
 }
 
 // cteBodyIsDataModifying reports whether `body` is a data-modifying statement (INSERT/UPDATE/DELETE).
 export function cteBodyIsDataModifying(body: CteBody): boolean {
-  return (
-    body.kind === "insert" || body.kind === "update" || body.kind === "delete"
-  );
+  return body.kind === "insert" || body.kind === "update" || body.kind === "delete";
 }
 
 // Cte is one common table expression in a WITH list (spec/design/cte.md). A named, statement-local

@@ -66,7 +66,10 @@ test("a single-row commit appends only the dirty path", () => {
       appended < wholePages,
       `an incremental commit (${appended} pages) must not rewrite the whole ${wholePages}-page tree`,
     );
-    assert.ok(appended <= 8, `the dirty path is bounded by tree height, not table size (got ${appended})`);
+    assert.ok(
+      appended <= 8,
+      `the dirty path is bounded by tree height, not table size (got ${appended})`,
+    );
 
     // And it reopens to the full, correct contents (leaked pages and all).
     close(db);
@@ -188,8 +191,15 @@ test("a commit preallocates file growth in chunks and reuses the slack", () => {
 
     const logical = db.pageCount * db.pageSize;
     const physical = statSync(path).size;
-    assert.ok(db.pageCount > 128, `the batch should span more than one chunk's worth of pages (got ${db.pageCount})`);
-    assert.equal(physical % CHUNK, 0, `physical file should grow in whole chunks (got ${physical})`);
+    assert.ok(
+      db.pageCount > 128,
+      `the batch should span more than one chunk's worth of pages (got ${db.pageCount})`,
+    );
+    assert.equal(
+      physical % CHUNK,
+      0,
+      `physical file should grow in whole chunks (got ${physical})`,
+    );
     assert.ok(
       physical >= logical && physical >= CHUNK,
       `preallocation should run ahead of the ${logical}-byte committed image (physical ${physical})`,
@@ -205,7 +215,11 @@ test("a commit preallocates file growth in chunks and reuses the slack", () => {
     // A small commit fits within the preallocated slack, so the physical file does not grow at all —
     // the steady-state metadata-free commit path.
     execute(db2, `INSERT INTO t VALUES (1000, '${pad}')`);
-    assert.equal(statSync(path).size, physicalBefore, "a commit within the slack reuses it without growing the file");
+    assert.equal(
+      statSync(path).size,
+      physicalBefore,
+      "a commit within the slack reuses it without growing the file",
+    );
     close(db2);
 
     // And the extra row is durable.

@@ -97,7 +97,10 @@ test("untouched columns charge nothing", () => {
   // Projection-only touch ...
   assert.strictEqual(cost(db, "SELECT id FROM spill"), cost(db, "SELECT id FROM control"));
   // ... an aggregate touches only its argument (count(*) touches nothing) ...
-  assert.strictEqual(cost(db, "SELECT count(*) FROM spill"), cost(db, "SELECT count(*) FROM control"));
+  assert.strictEqual(
+    cost(db, "SELECT count(*) FROM spill"),
+    cost(db, "SELECT count(*) FROM control"),
+  );
   // ... a WHERE reference is a touch even when only `id` is projected ...
   assert.strictEqual(
     cost(db, "SELECT id FROM spill WHERE body = 'nope'"),

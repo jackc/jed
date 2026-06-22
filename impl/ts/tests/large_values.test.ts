@@ -49,7 +49,10 @@ function bigValueDB(): Database {
 test("external value spans an overflow chain and round-trips byte-identically", () => {
   const db = bigValueDB();
   const image = toImage(db, 256, 1n);
-  assert.ok(countPageType(image, 256, PAGE_OVERFLOW) >= 2, "a large value spans several overflow pages");
+  assert.ok(
+    countPageType(image, 256, PAGE_OVERFLOW) >= 2,
+    "a large value spans several overflow pages",
+  );
 
   const loaded = loadDatabase(image);
   // Re-serialization is byte-identical (deterministic spill + chain allocation).
@@ -65,7 +68,11 @@ test("small values never spill", () => {
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i16)");
   execute(db, "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)");
   const image = toImage(db, 256, 1n);
-  assert.equal(countPageType(image, 256, PAGE_OVERFLOW), 0, "inline-fitting values are never externalized");
+  assert.equal(
+    countPageType(image, 256, PAGE_OVERFLOW),
+    0,
+    "inline-fitting values are never externalized",
+  );
 });
 
 test("load reclaims only dead overflow pages", () => {
@@ -75,7 +82,10 @@ test("load reclaims only dead overflow pages", () => {
   assert.ok(ovf >= 2);
   // Live chain pages are reachable, so they are NOT on the free-list (else a later commit would
   // reuse a still-referenced page).
-  assert.ok(loaded.freePages.length < ovf, `live overflow pages (${ovf}) must not be free (${loaded.freePages.length})`);
+  assert.ok(
+    loaded.freePages.length < ovf,
+    `live overflow pages (${ovf}) must not be free (${loaded.freePages.length})`,
+  );
 });
 
 test("external value through the default demand-paged file path, with reclamation", () => {
@@ -111,7 +121,10 @@ test("external value through the default demand-paged file path, with reclamatio
     execute(db, `INSERT INTO t VALUES (3, '${big}')`);
     const after = db.pageCount;
     close(db);
-    assert.ok(after <= before + 3, `re-insert did not reuse reclaimed pages (pageCount ${before} → ${after})`);
+    assert.ok(
+      after <= before + 3,
+      `re-insert did not reuse reclaimed pages (pageCount ${before} → ${after})`,
+    );
 
     // Final correctness through the paged path.
     db = open(path);

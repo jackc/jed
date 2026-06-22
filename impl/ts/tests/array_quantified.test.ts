@@ -80,9 +80,18 @@ test("column / literal adaptation", () => {
 test("errors", () => {
   const db = new Database();
   // A non-array right side is 42809.
-  assert.equal(errCode(() => execute(db, "SELECT 1 = ANY(5)")), "42809");
+  assert.equal(
+    errCode(() => execute(db, "SELECT 1 = ANY(5)")),
+    "42809",
+  );
   // An incomparable element type is 42883.
-  assert.equal(errCode(() => execute(db, "SELECT 1 = ANY(ARRAY['a','b'])")), "42883");
+  assert.equal(
+    errCode(() => execute(db, "SELECT 1 = ANY(ARRAY['a','b'])")),
+    "42883",
+  );
   // A bare untyped NULL array operand is 42P18.
-  assert.equal(errCode(() => execute(db, "SELECT 1 = ANY(NULL)")), "42P18");
+  assert.equal(
+    errCode(() => execute(db, "SELECT 1 = ANY(NULL)")),
+    "42P18",
+  );
 });

@@ -44,9 +44,15 @@ test("failed block is the Failed state", () => {
   // ROLLBACK/COMMIT is 25P02 (§2.2 / transactions.md §6), and ROLLBACK returns to Idle.
   const db = new Database();
   execute(db, "BEGIN");
-  assert.strictEqual(code(() => execute(db, "SELECT * FROM missing")), "42P01");
+  assert.strictEqual(
+    code(() => execute(db, "SELECT * FROM missing")),
+    "42P01",
+  );
   assert.strictEqual(db.status(), "Failed");
-  assert.strictEqual(code(() => execute(db, "SELECT 1")), "25P02");
+  assert.strictEqual(
+    code(() => execute(db, "SELECT 1")),
+    "25P02",
+  );
   execute(db, "ROLLBACK");
   assert.strictEqual(db.status(), "Idle");
 });
@@ -87,7 +93,10 @@ test("additional session cost ceiling is enforced via swap", () => {
   execute(db, "SELECT * FROM t"); // default: unlimited
 
   const s = db.newSession({ maxCost: 1n });
-  assert.strictEqual(code(() => s.execute(db, "SELECT * FROM t")), "54P01");
+  assert.strictEqual(
+    code(() => s.execute(db, "SELECT * FROM t")),
+    "54P01",
+  );
 
   execute(db, "SELECT * FROM t"); // default unaffected
   assert.strictEqual(db.session.maxCost, 0n);

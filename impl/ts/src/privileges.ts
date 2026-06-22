@@ -62,7 +62,10 @@ export class PrivilegeSet {
   // The four table DML privileges — the default table envelope (GRANT … ON ALL TABLES).
   static allTable(): PrivilegeSet {
     return new PrivilegeSet(
-      privilegeBit("select") | privilegeBit("insert") | privilegeBit("update") | privilegeBit("delete"),
+      privilegeBit("select") |
+        privilegeBit("insert") |
+        privilegeBit("update") |
+        privilegeBit("delete"),
     );
   }
   // Just EXECUTE — the default function envelope (GRANT EXECUTE ON ALL FUNCTIONS).

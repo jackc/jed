@@ -43,11 +43,7 @@ import type {
   WithExpr,
   WithQuery,
 } from "./ast.ts";
-import {
-  cteBodyAsQuery,
-  cteBodyIsDataModifying,
-  emptySeqOptions,
-} from "./ast.ts";
+import { cteBodyAsQuery, cteBodyIsDataModifying, emptySeqOptions } from "./ast.ts";
 import {
   type CheckConstraint,
   type ColField,
@@ -102,12 +98,7 @@ import { type ScriptSummary, splitStatements } from "./split.ts";
 import type { SharedPaging } from "./paging.ts";
 import { parseExpression, parseSQL } from "./parser.ts";
 import { type KeyBound, compareBytes, unboundedBound } from "./pmap.ts";
-import {
-  DEFAULT_WORK_MEM,
-  type RowCompare,
-  type SpillSink,
-  Sorter,
-} from "./spill.ts";
+import { DEFAULT_WORK_MEM, type RowCompare, type SpillSink, Sorter } from "./spill.ts";
 import { type Entry, type Row, TableStore } from "./storage.ts";
 import {
   type DecimalTypmod,
@@ -171,12 +162,7 @@ import {
   tsDiff,
   tsShift,
 } from "./interval.ts";
-import {
-  AGGREGATES,
-  type AggregateDesc,
-  OPERATORS,
-  type OperatorDesc,
-} from "./operators.ts";
+import { AGGREGATES, type AggregateDesc, OPERATORS, type OperatorDesc } from "./operators.ts";
 import {
   type Value,
   type ArrayInResult,
@@ -531,8 +517,7 @@ export class Snapshot {
     const lower = name.toLowerCase();
     const keys: string[] = [];
     for (const [k, s] of this.sequences) {
-      if (s.ownedBy !== undefined && s.ownedBy.table.toLowerCase() === lower)
-        keys.push(k);
+      if (s.ownedBy !== undefined && s.ownedBy.table.toLowerCase() === lower) keys.push(k);
     }
     return keys.sort();
   }
@@ -622,10 +607,7 @@ export class Snapshot {
       }
       const c = color.get(key) ?? 0;
       if (c === 1) {
-        throw engineError(
-          "data_corrupted",
-          `composite type definition cycle through ${key}`,
-        );
+        throw engineError("data_corrupted", `composite type definition cycle through ${key}`);
       }
       if (c === 2) return cache.get(key) ?? 1;
       color.set(key, 1);
@@ -634,8 +616,7 @@ export class Snapshot {
       if (ct) {
         for (const f of ct.fields) {
           const r = compositeRefName(f.type);
-          if (r !== null)
-            child = Math.max(child, visit(r.toLowerCase(), levelsAbove + 1));
+          if (r !== null) child = Math.max(child, visit(r.toLowerCase(), levelsAbove + 1));
         }
       }
       const depth = 1 + child;
@@ -671,8 +652,7 @@ export class Snapshot {
     let depth = 1;
     if (def) {
       let child = 0;
-      for (const f of def.fields)
-        child = Math.max(child, this.compositeTypeDepth(f.type, cache));
+      for (const f of def.fields) child = Math.max(child, this.compositeTypeDepth(f.type, cache));
       depth = 1 + child;
     }
     cache.set(key, depth);
@@ -712,9 +692,7 @@ export class Snapshot {
   // TABLE — the indexes have no independent life, spec/design/indexes.md §2).
   removeTable(key: string): void {
     const t = this.tables.get(key);
-    if (t)
-      for (const idx of t.indexes)
-        this.indexStores.delete(idx.name.toLowerCase());
+    if (t) for (const idx of t.indexes) this.indexStores.delete(idx.name.toLowerCase());
     this.tables.delete(key);
     this.stores.delete(key);
   }
@@ -756,11 +734,7 @@ export class Snapshot {
         break;
       }
     }
-    const indexes = [
-      ...old.indexes.slice(0, pos),
-      def,
-      ...old.indexes.slice(pos),
-    ];
+    const indexes = [...old.indexes.slice(0, pos), def, ...old.indexes.slice(pos)];
     this.tables.set(tableKey, { ...old, indexes });
   }
 
@@ -769,16 +743,10 @@ export class Snapshot {
   // (spec/design/sequences.md §15.3), leaving the table's rows/store untouched. The Table and its
   // columns array are re-allocated (catalog Tables are never mutated in place — snapshots share
   // them). A no-op if the table or column ordinal is absent.
-  setColumnDefaultExpr(
-    tableKey: string,
-    column: number,
-    defaultExpr: DefaultExpr,
-  ): void {
+  setColumnDefaultExpr(tableKey: string, column: number, defaultExpr: DefaultExpr): void {
     const old = this.tables.get(tableKey);
     if (old === undefined || column < 0 || column >= old.columns.length) return;
-    const columns = old.columns.map((c, i) =>
-      i === column ? { ...c, defaultExpr } : c,
-    );
+    const columns = old.columns.map((c, i) => (i === column ? { ...c, defaultExpr } : c));
     this.tables.set(tableKey, { ...old, columns });
   }
 
@@ -794,9 +762,7 @@ export class Snapshot {
   removeIndex(tableKey: string, nameKey: string): void {
     const old = this.tables.get(tableKey);
     if (old) {
-      const indexes = old.indexes.filter(
-        (ix) => ix.name.toLowerCase() !== nameKey,
-      );
+      const indexes = old.indexes.filter((ix) => ix.name.toLowerCase() !== nameKey);
       this.tables.set(tableKey, { ...old, indexes });
     }
     this.indexStores.delete(nameKey);
@@ -922,10 +888,7 @@ function requireCustomVarName(name: string): string {
   if (name.includes(".")) {
     return name.toLowerCase();
   }
-  throw engineError(
-    "undefined_object",
-    "unrecognized configuration parameter: " + name,
-  );
+  throw engineError("undefined_object", "unrecognized configuration parameter: " + name);
 }
 
 export class Session {
@@ -1470,18 +1433,14 @@ export class Database {
   // transaction's tempWorking, else the session's committed temp state. The temp analogue of readSnap
   // (it does not consult readPin — a writable-CTE pins only the main snapshot).
   private tempSnap(): Snapshot {
-    return this.session.tx !== null
-      ? this.session.tx.tempWorking
-      : this.session.tempCommitted;
+    return this.session.tx !== null ? this.session.tx.tempWorking : this.session.tempCommitted;
   }
 
   // sharedTempSnap is the DATABASE-WIDE shared temp-table snapshot for READS (temp-tables.md §4/§5):
   // the open transaction's sharedTempWorking, else the handle's sharedTempCommitted. The shared
   // analogue of tempSnap.
   private sharedTempSnap(): Snapshot {
-    return this.session.tx !== null
-      ? this.session.tx.sharedTempWorking
-      : this.sharedTempCommitted;
+    return this.session.tx !== null ? this.session.tx.sharedTempWorking : this.sharedTempCommitted;
   }
 
   // isTempTable reports whether name resolves to a SESSION-LOCAL temporary table in the visible temp
@@ -1589,21 +1548,13 @@ export class Database {
   // setColumnDefaultExprRouted rewrites a column's stored DEFAULT expression in whichever scope owns the
   // table — the routed analogue used by ALTER SEQUENCE … RENAME of an owned sequence (temp-tables.md §8),
   // so a renamed owned TEMP sequence's nextval default is rewritten in the temp snapshot.
-  private setColumnDefaultExprRouted(
-    tableKey: string,
-    column: number,
-    de: DefaultExpr,
-  ): void {
+  private setColumnDefaultExprRouted(tableKey: string, column: number, de: DefaultExpr): void {
     if (this.isTempTable(tableKey)) {
       this.session.tx!.tempDirty = true;
       this.session.tx!.tempWorking.setColumnDefaultExpr(tableKey, column, de);
     } else if (this.isSharedTempTable(tableKey)) {
       this.session.tx!.sharedTempDirty = true;
-      this.session.tx!.sharedTempWorking.setColumnDefaultExpr(
-        tableKey,
-        column,
-        de,
-      );
+      this.session.tx!.sharedTempWorking.setColumnDefaultExpr(tableKey, column, de);
     } else {
       this.working().setColumnDefaultExpr(tableKey, column, de);
     }
@@ -1675,9 +1626,7 @@ export class Database {
   private columnCollations(columns: Column[]): (Collation | null)[] {
     const snap = this.readSnap();
     return columns.map((c) =>
-      c.collation !== null
-        ? (snap.resolveCollation(c.collation) ?? null)
-        : null,
+      c.collation !== null ? (snap.resolveCollation(c.collation) ?? null) : null,
     );
   }
 
@@ -1692,10 +1641,7 @@ export class Database {
     if (def === undefined) {
       const committed = this.sequence(name);
       if (committed === undefined) {
-        throw engineError(
-          "undefined_table",
-          `relation does not exist: ${name}`,
-        );
+        throw engineError("undefined_table", `relation does not exist: ${name}`);
       }
       def = { ...committed };
     } else {
@@ -1745,10 +1691,7 @@ export class Database {
     if (def === undefined) {
       const committed = this.sequence(name);
       if (committed === undefined) {
-        throw engineError(
-          "undefined_table",
-          `relation does not exist: ${name}`,
-        );
+        throw engineError("undefined_table", `relation does not exist: ${name}`);
       }
       def = { ...committed };
     } else {
@@ -1932,11 +1875,7 @@ export class Database {
       const ast = this.parse(span.text);
       // Transaction control inside a script is the v1 narrowing (session.md §4.2): the implicit
       // wrapper owns the boundary, so BEGIN/COMMIT/ROLLBACK is 0A000 (partitioning deferred).
-      if (
-        ast.kind === "begin" ||
-        ast.kind === "commit" ||
-        ast.kind === "rollback"
-      ) {
+      if (ast.kind === "begin" || ast.kind === "commit" || ast.kind === "rollback") {
         throw engineError(
           "feature_not_supported",
           "transaction control (BEGIN/COMMIT/ROLLBACK) is not supported inside execute_script; " +
@@ -2006,10 +1945,7 @@ export class Database {
       return;
     }
     if (this.committed.resolveCollation(name) === undefined) {
-      throw engineError(
-        "undefined_object",
-        `collation "${name}" does not exist`,
-      );
+      throw engineError("undefined_object", `collation "${name}" does not exist`);
     }
     this.committed.defaultCollation = name;
   }
@@ -2165,10 +2101,7 @@ export class Database {
   // until commit.
   beginTx(writable: boolean | null): Outcome {
     if (this.session.tx !== null) {
-      throw engineError(
-        "active_sql_transaction",
-        "there is already a transaction in progress",
-      );
+      throw engineError("active_sql_transaction", "there is already a transaction in progress");
     }
     if (writable === true && this.readOnly) {
       throw engineError(
@@ -2332,8 +2265,7 @@ export class Database {
         (stmt.kind === "dropTable" && this.isSharedTempTable(stmt.name)) ||
         (stmt.kind === "createIndex" && this.isSharedTempTable(stmt.table)) ||
         (stmt.kind === "dropIndex" && this.isSharedTempIndex(stmt.name)) ||
-        (stmt.kind === "dropSequence" &&
-          stmt.names.some((n) => this.isSharedTempSequence(n))) ||
+        (stmt.kind === "dropSequence" && stmt.names.some((n) => this.isSharedTempSequence(n))) ||
         (stmt.kind === "alterSequence" && this.isSharedTempSequence(stmt.name))
       ) {
         allowed = this.session.allowSharedTempDdl;
@@ -2342,8 +2274,7 @@ export class Database {
         (stmt.kind === "dropTable" && this.isTempTable(stmt.name)) ||
         (stmt.kind === "createIndex" && this.isTempTable(stmt.table)) ||
         (stmt.kind === "dropIndex" && this.isTempIndex(stmt.name)) ||
-        (stmt.kind === "dropSequence" &&
-          stmt.names.some((n) => this.isTempSequence(n))) ||
+        (stmt.kind === "dropSequence" && stmt.names.some((n) => this.isTempSequence(n))) ||
         (stmt.kind === "alterSequence" && this.isTempSequence(stmt.name))
       ) {
         allowed = this.session.allowTempDdl;
@@ -2362,23 +2293,14 @@ export class Database {
       const key = t.name.toLowerCase();
       // Only a name that resolves to an existing catalog table is privilege-checked; a missing one is
       // left to raise 42P01 in execution (existence before authorization).
-      if (
-        snap.table(key) !== undefined &&
-        !this.session.privileges.allowsTable(key, t.priv)
-      ) {
-        throw engineError(
-          "insufficient_privilege",
-          "permission denied for table " + key,
-        );
+      if (snap.table(key) !== undefined && !this.session.privileges.allowsTable(key, t.priv)) {
+        throw engineError("insufficient_privilege", "permission denied for table " + key);
       }
     }
     for (const fn of req.functions) {
       const key = fn.toLowerCase();
       if (!this.session.privileges.allowsFunction(key)) {
-        throw engineError(
-          "insufficient_privilege",
-          "permission denied for function " + key,
-        );
+        throw engineError("insufficient_privilege", "permission denied for function " + key);
       }
     }
   }
@@ -2472,10 +2394,7 @@ export class Database {
     // CREATE TABLE colliding with either kind is the same 42P07 — PG's "relation" word. relationExists
     // is temp-aware, so a temp name collides with temp + persistent alike (preclude-overlaps, §3).
     if (this.relationExists(ct.name)) {
-      throw engineError(
-        "duplicate_table",
-        "relation already exists: " + ct.name,
-      );
+      throw engineError("duplicate_table", "relation already exists: " + ct.name);
     }
 
     const columns: Column[] = [];
@@ -2491,10 +2410,7 @@ export class Database {
     for (const def of ct.columns) {
       for (const c of columns) {
         if (c.name.toLowerCase() === def.name.toLowerCase()) {
-          throw engineError(
-            "duplicate_column",
-            "duplicate column name: " + def.name,
-          );
+          throw engineError("duplicate_column", "duplicate column name: " + def.name);
         }
       }
       // Resolve the column type: a built-in scalar, or a user-defined composite referenced by name
@@ -2563,17 +2479,13 @@ export class Database {
         if (def.typeMod !== null) {
           throw engineError(
             "feature_not_supported",
-            "a type modifier is not supported for composite type " +
-              def.typeName,
+            "a type modifier is not supported for composite type " + def.typeName,
           );
         }
         colType = compositeT(ctype.name);
         decimal = null;
       } else {
-        throw engineError(
-          "undefined_object",
-          "type does not exist: " + def.typeName,
-        );
+        throw engineError("undefined_object", "type does not exist: " + def.typeName);
       }
       if (def.primaryKey) {
         // Integers, boolean, and uuid may be a key. uuid is the first non-integer key type (fixed
@@ -2601,9 +2513,7 @@ export class Database {
         ) {
           throw engineError(
             "feature_not_supported",
-            "a " +
-              typeCanonicalName(colType) +
-              " primary key is not supported yet",
+            "a " + typeCanonicalName(colType) + " primary key is not supported yet",
           );
         }
         if (pkSeen) {
@@ -2643,10 +2553,7 @@ export class Database {
         // Conflicts (42601, sequences.md §13.2). An explicit DEFAULT — or a serial type, itself a
         // synthesized default — alongside IDENTITY is "both default and identity"; a serial column
         // with its own explicit DEFAULT is "multiple default values" (the S3 message, unchanged).
-        if (
-          def.identity !== null &&
-          (def.default !== null || serialKind !== undefined)
-        ) {
+        if (def.identity !== null && (def.default !== null || serialKind !== undefined)) {
           throw engineError(
             "syntax_error",
             `both default and identity specified for column ${def.name} of table ${ct.name}`,
@@ -2661,14 +2568,9 @@ export class Database {
         // Create the OWNED sequence — a default ascending i64 for serial, or the IDENTITY column's
         // `( seq_options )` (defaulting the same way) — and synthesize the DEFAULT nextval(...)
         // expression default (format_version 8 mechanism).
-        const seqName = this.chooseSerialSeqName(
-          ct.name,
-          def.name,
-          pendingSerials,
-        );
+        const seqName = this.chooseSerialSeqName(ct.name, def.name, pendingSerials);
         const owner: SeqOwner = { table: ct.name, column: columns.length }; // this column's ordinal
-        const opts =
-          def.identity !== null ? def.identity.options : emptySeqOptions();
+        const opts = def.identity !== null ? def.identity.options : emptySeqOptions();
         // The owned sequence's data type follows the column (§14): serial → the pseudo-type,
         // identity → the column type. An explicit `AS` inside the identity `( … )` options conflicts
         // with that — 42601 (PG: "conflicting or redundant options"). serial carries no parsed
@@ -2678,17 +2580,11 @@ export class Database {
         }
         // serial fixes the scalar to its pseudo-type; identity's column type is a gated integer
         // scalar (typeIsInteger above), so colType is always a scalar in the identity branch.
-        const seqScalar =
-          serialKind ??
-          (colType.kind === "scalar" ? colType.scalar : undefined);
-        const seqDtype =
-          seqScalar === undefined ? undefined : seqDataTypeForScalar(seqScalar);
+        const seqScalar = serialKind ?? (colType.kind === "scalar" ? colType.scalar : undefined);
+        const seqDtype = seqScalar === undefined ? undefined : seqDataTypeForScalar(seqScalar);
         if (seqDtype === undefined) {
           // Unreachable: a serial / identity column is i16/i32/i64 (gated above).
-          throw engineError(
-            "invalid_parameter_value",
-            "serial / identity column is i16/i32/i64",
-          );
+          throw engineError("invalid_parameter_value", "serial / identity column is i16/i32/i64");
         }
         opts.dataType = seqDtype;
         pendingSerials.push(buildSequenceDef(seqName, opts, owner));
@@ -2698,8 +2594,7 @@ export class Database {
         // identifier-derived name, so the quoting is always safe.
         const exprText = `nextval ( '${seqName.replace(/'/g, "''")}' )`;
         def_defaultExpr = { exprText, expr: parseExpression(exprText) };
-        if (def.identity !== null)
-          identityKind = def.identity.always ? "always" : "byDefault";
+        if (def.identity !== null) identityKind = def.identity.always ? "always" : "byDefault";
       } else if (
         colType.kind === "composite" ||
         colType.kind === "array" ||
@@ -2751,9 +2646,7 @@ export class Database {
       let collation: string | null = null;
       if (def.collation !== null) {
         if (!typeIsText(colType)) {
-          throw typeError(
-            `collations are not supported by type ${typeCanonicalName(colType)}`,
-          );
+          throw typeError(`collations are not supported by type ${typeCanonicalName(colType)}`);
         }
         resolveCollationName(this, def.collation); // validates loaded; 42704 if not
         if (def.collation !== "C") collation = def.collation;
@@ -2766,11 +2659,7 @@ export class Database {
         decimal,
         primaryKey: def.primaryKey,
         // PRIMARY KEY ⇒ NOT NULL; a serial or IDENTITY column is NOT NULL too (sequences.md §12/§13).
-        notNull:
-          def.primaryKey ||
-          def.notNull ||
-          serialKind !== undefined ||
-          def.identity !== null,
+        notNull: def.primaryKey || def.notNull || serialKind !== undefined || def.identity !== null,
         default: def_default,
         defaultExpr: def_defaultExpr,
         identity: identityKind,
@@ -2797,10 +2686,7 @@ export class Database {
         const lower = name.toLowerCase();
         const idx = columns.findIndex((c) => c.name.toLowerCase() === lower);
         if (idx < 0) {
-          throw engineError(
-            "undefined_column",
-            "column " + name + " named in key does not exist",
-          );
+          throw engineError("undefined_column", "column " + name + " named in key does not exist");
         }
         if (indices.includes(idx)) {
           throw engineError(
@@ -2850,10 +2736,7 @@ export class Database {
         const lower = cname.toLowerCase();
         const idx = columns.findIndex((c) => c.name.toLowerCase() === lower);
         if (idx < 0) {
-          throw engineError(
-            "undefined_column",
-            "column " + cname + " named in key does not exist",
-          );
+          throw engineError("undefined_column", "column " + cname + " named in key does not exist");
         }
         if (indices.includes(idx)) {
           throw engineError(
@@ -2880,9 +2763,7 @@ export class Database {
         ) {
           throw engineError(
             "feature_not_supported",
-            "a " +
-              typeCanonicalName(ty) +
-              " unique constraint member is not supported yet",
+            "a " + typeCanonicalName(ty) + " unique constraint member is not supported yet",
           );
         }
       }
@@ -2934,11 +2815,7 @@ export class Database {
         if (nameTaken(def.name)) {
           throw engineError(
             "duplicate_object",
-            "constraint " +
-              def.name +
-              " for relation " +
-              table.name +
-              " already exists",
+            "constraint " + def.name + " for relation " + table.name + " already exists",
           );
         }
         name = def.name;
@@ -2946,14 +2823,10 @@ export class Database {
         const cols = checkReferencedColumns(def.expr, columns);
         const base =
           cols.length === 1
-            ? table.name.toLowerCase() +
-              "_" +
-              columns[cols[0]!]!.name.toLowerCase() +
-              "_check"
+            ? table.name.toLowerCase() + "_" + columns[cols[0]!]!.name.toLowerCase() + "_check"
             : table.name.toLowerCase() + "_check";
         name = base;
-        for (let suffix = 1; nameTaken(name); suffix++)
-          name = base + suffix.toString();
+        for (let suffix = 1; nameTaken(name); suffix++) name = base + suffix.toString();
       }
       checks.push({ name, exprText: def.text, expr: def.expr });
     }
@@ -2996,19 +2869,12 @@ export class Database {
       let name: string;
       if (ru.name !== null) {
         if (relationTaken(ru.name)) {
-          throw engineError(
-            "duplicate_table",
-            "relation already exists: " + ru.name,
-          );
+          throw engineError("duplicate_table", "relation already exists: " + ru.name);
         }
         if (checkNameTaken(ru.name)) {
           throw engineError(
             "duplicate_object",
-            "constraint " +
-              ru.name +
-              " for relation " +
-              table.name +
-              " already exists",
+            "constraint " + ru.name + " for relation " + table.name + " already exists",
           );
         }
         name = ru.name;
@@ -3017,19 +2883,13 @@ export class Database {
         for (const i of ru.cols) base += "_" + columns[i]!.name.toLowerCase();
         base += "_key";
         name = base;
-        for (
-          let suffix = 1;
-          relationTaken(name) || checkNameTaken(name);
-          suffix++
-        ) {
+        for (let suffix = 1; relationTaken(name) || checkNameTaken(name); suffix++) {
           name = base + suffix.toString();
         }
       }
       // Insert in catalog (ascending lowercased-name) order — indexes.md §6.
       const nameKey = name.toLowerCase();
-      let pos = table.indexes.findIndex(
-        (ix) => ix.name.toLowerCase() > nameKey,
-      );
+      let pos = table.indexes.findIndex((ix) => ix.name.toLowerCase() > nameKey);
       if (pos < 0) pos = table.indexes.length;
       table.indexes.splice(pos, 0, {
         name,
@@ -3055,10 +2915,7 @@ export class Database {
       for (const cname of fk.columns) {
         const idx = columnIndex(table, cname);
         if (idx < 0) {
-          throw engineError(
-            "undefined_column",
-            "column " + cname + " named in key does not exist",
-          );
+          throw engineError("undefined_column", "column " + cname + " named in key does not exist");
         }
         if (local.includes(idx)) {
           throw engineError(
@@ -3076,10 +2933,7 @@ export class Database {
       } else {
         const found = this.table(fk.refTable);
         if (found === undefined) {
-          throw engineError(
-            "undefined_table",
-            "table does not exist: " + fk.refTable,
-          );
+          throw engineError("undefined_table", "table does not exist: " + fk.refTable);
         }
         parent = found;
       }
@@ -3131,22 +2985,16 @@ export class Database {
         if (nameTakenFk(fk.name)) {
           throw engineError(
             "duplicate_object",
-            "constraint " +
-              fk.name +
-              " for relation " +
-              table.name +
-              " already exists",
+            "constraint " + fk.name + " for relation " + table.name + " already exists",
           );
         }
         fkName = fk.name;
       } else {
         let base = table.name.toLowerCase();
-        for (const i of local)
-          base += "_" + table.columns[i]!.name.toLowerCase();
+        for (const i of local) base += "_" + table.columns[i]!.name.toLowerCase();
         base += "_fkey";
         fkName = base;
-        for (let suffix = 1; nameTakenFk(fkName); suffix++)
-          fkName = base + suffix.toString();
+        for (let suffix = 1; nameTakenFk(fkName); suffix++) fkName = base + suffix.toString();
       }
       // 6. Reject the unsupported write-actions (§6.6).
       const onDelete = fkAction(fk.onDelete, "DELETE");
@@ -3155,14 +3003,11 @@ export class Database {
       const refSet = sortedUnique(refs);
       const matchesUnique =
         (parent.pk.length > 0 && sameSet(sortedUnique(parent.pk), refSet)) ||
-        parent.indexes.some(
-          (i) => i.unique && sameSet(sortedUnique(i.columns), refSet),
-        );
+        parent.indexes.some((i) => i.unique && sameSet(sortedUnique(i.columns), refSet));
       if (!matchesUnique) {
         throw engineError(
           "invalid_foreign_key",
-          "there is no unique constraint matching given keys for referenced table " +
-            parent.name,
+          "there is no unique constraint matching given keys for referenced table " + parent.name,
         );
       }
       // 8. Same-type pairing (§6.2). Because the referenced columns are a PK/UNIQUE key they are
@@ -3224,9 +3069,7 @@ export class Database {
       // reference. The resulting ColType tree is self-contained, so the temp store needs nothing from
       // the catalog after this (composite.md §4).
       const mainTypes = this.readSnap().types;
-      const colTypes = table.columns.map((c) =>
-        resolveColType(c.type, mainTypes),
-      );
+      const colTypes = table.columns.map((c) => resolveColType(c.type, mainTypes));
       // Register into the matching temp snapshot — never the main image, so the table makes zero file
       // writes (§2). A SHARED table goes in the database-wide shared snapshot (visible to every
       // session, §4); a plain temp table in the session-local one. Flag the matching dirty bit so the
@@ -3276,11 +3119,7 @@ export class Database {
   // smallest integer suffix 1, 2, … appended until the name is free in the relation namespace — not
   // taken by an existing relation, not equal to the table being created, and not already chosen by
   // an earlier serial column of the same statement (pending). All-lowercase identifier-derived.
-  private chooseSerialSeqName(
-    table: string,
-    column: string,
-    pending: SequenceDef[],
-  ): string {
+  private chooseSerialSeqName(table: string, column: string, pending: SequenceDef[]): string {
     const base = `${table.toLowerCase()}_${column.toLowerCase()}_seq`;
     const taken = (c: string): boolean =>
       this.relationExists(c) ||
@@ -3338,12 +3177,7 @@ export class Database {
   // per-statement seam/clock (rng) and metered (operator_eval per node). Reused by the VALUES
   // materialization (a DEFAULT keyword) and insertRows (an omitted column), sharing ONE StmtRng
   // so a multi-row DEFAULT uuidv7() stays monotonic. defaultRExpr is null for a constant/no default.
-  private evalDefault(
-    col: Column,
-    defaultRExpr: RExpr | null,
-    rng: StmtRng,
-    meter: Meter,
-  ): Value {
+  private evalDefault(col: Column, defaultRExpr: RExpr | null, rng: StmtRng, meter: Meter): Value {
     if (defaultRExpr === null) return col.default ?? nullValue();
     meter.guard();
     const env: EvalEnv = {
@@ -3399,10 +3233,7 @@ export class Database {
       const canonical = this.table(dt.name)?.name ?? dt.name;
       throw engineError(
         "dependent_objects_still_exist",
-        "cannot drop table " +
-          canonical +
-          " because other objects depend on it: " +
-          detail,
+        "cannot drop table " + canonical + " because other objects depend on it: " + detail,
       );
     }
     // Auto-drop every sequence OWNED BY this table — the serial columns' sequences
@@ -3449,9 +3280,8 @@ export class Database {
       return this.lkpStore(parentTable).get(probe.bytes) !== undefined;
     }
     return (
-      this.readSnap()
-        .indexStore(probe.index)
-        .rangeEntries(uniqueProbeBound(probe.prefix)).length > 0
+      this.readSnap().indexStore(probe.index).rangeEntries(uniqueProbeBound(probe.prefix)).length >
+      0
     );
   }
 
@@ -3485,9 +3315,7 @@ export class Database {
   // parent DELETE/UPDATE must not strand (spec/design/constraints.md §6.5). Sorted by (lowercased
   // child table, FK name) for a deterministic report order. The FK objects are the snapshot's
   // (the caller probes stores without mutating the catalog).
-  private fkReferencers(
-    parentName: string,
-  ): { childTable: string; fk: ForeignKey }[] {
+  private fkReferencers(parentName: string): { childTable: string; fk: ForeignKey }[] {
     const snap = this.readSnap();
     const key = parentName.toLowerCase();
     const out: { childTable: string; fk: ForeignKey }[] = [];
@@ -3495,8 +3323,7 @@ export class Database {
     for (const tk of tkeys) {
       const t = snap.tables.get(tk)!;
       for (const fk of t.fks) {
-        if (fk.refTable.toLowerCase() === key)
-          out.push({ childTable: t.name, fk });
+        if (fk.refTable.toLowerCase() === key) out.push({ childTable: t.name, fk });
       }
     }
     return out;
@@ -3532,11 +3359,7 @@ export class Database {
     let kind: "btree" | "gin";
     if (method === "btree") kind = "btree";
     else if (method === "gin") kind = "gin";
-    else
-      throw engineError(
-        "undefined_object",
-        "access method does not exist: " + ci.using,
-      );
+    else throw engineError("undefined_object", "access method does not exist: " + ci.using);
     const cols: number[] = [];
     for (const name of ci.columns) {
       const idx = columnIndex(table, name);
@@ -3595,19 +3418,13 @@ export class Database {
         );
       }
       if (cols.length !== 1) {
-        throw engineError(
-          "feature_not_supported",
-          "a multi-column gin index is not supported yet",
-        );
+        throw engineError("feature_not_supported", "a multi-column gin index is not supported yet");
       }
     }
     let name: string;
     if (ci.name !== null) {
       if (this.relationExists(ci.name)) {
-        throw engineError(
-          "duplicate_table",
-          "relation already exists: " + ci.name,
-        );
+        throw engineError("duplicate_table", "relation already exists: " + ci.name);
       }
       name = ci.name;
     } else {
@@ -3617,8 +3434,7 @@ export class Database {
       for (const cn of ci.columns) base += "_" + cn.toLowerCase();
       base += "_idx";
       name = base;
-      for (let suffix = 1; this.relationExists(name); suffix++)
-        name = base + suffix.toString();
+      for (let suffix = 1; this.relationExists(name); suffix++) name = base + suffix.toString();
     }
 
     // The build scan (cost.md §3): page_read per table-tree node + storage_row_read per
@@ -3631,9 +3447,7 @@ export class Database {
     const def: IndexDef = { name, columns: cols, unique: ci.unique, kind };
     const store = this.lkpStore(ci.table);
     const { entries: stored, pages: nodes, slabs } = store.scanWithUnits(mask);
-    meter.charge(
-      COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs),
-    );
+    meter.charge(COSTS.pageRead * BigInt(nodes) + COSTS.valueDecompress * BigInt(slabs));
     const entries: Uint8Array[] = [];
     // A UNIQUE build verifies the existing rows before the index is registered
     // (indexes.md §8): two rows sharing a fully-non-NULL key tuple — i.e. an exempt-free
@@ -3709,10 +3523,7 @@ export class Database {
     } else {
       const found = this.findIndex(di.name);
       if (!found) {
-        throw engineError(
-          "undefined_object",
-          "index does not exist: " + di.name,
-        );
+        throw engineError("undefined_object", "index does not exist: " + di.name);
       }
       this.working().removeIndex(found[0], nameKey);
     }
@@ -3726,10 +3537,7 @@ export class Database {
   // composites only.
   private executeCreateType(ct: CreateType): Outcome {
     if (this.compositeType(ct.name) !== undefined) {
-      throw engineError(
-        "duplicate_object",
-        "type " + ct.name + " already exists",
-      );
+      throw engineError("duplicate_object", "type " + ct.name + " already exists");
     }
     const fields: CompositeField[] = [];
     for (const f of ct.fields) {
@@ -3774,9 +3582,7 @@ export class Database {
         // is 0A000, not the 42704 below.
         throw engineError(
           "feature_not_supported",
-          "a range-typed composite field (" +
-            f.typeName +
-            ") is not supported yet",
+          "a range-typed composite field (" + f.typeName + ") is not supported yet",
         );
       } else if (this.compositeType(f.typeName) !== undefined) {
         if (f.typeMod !== null) {
@@ -3787,10 +3593,7 @@ export class Database {
         }
         fty = compositeT(f.typeName);
       } else {
-        throw engineError(
-          "undefined_object",
-          "type does not exist: " + f.typeName,
-        );
+        throw engineError("undefined_object", "type does not exist: " + f.typeName);
       }
       fields.push({
         name: f.name,
@@ -3809,10 +3612,7 @@ export class Database {
     const cache = new Map<string, number>();
     let maxField = 0;
     for (const f of fields)
-      maxField = Math.max(
-        maxField,
-        this.readSnap().compositeTypeDepth(f.type, cache),
-      );
+      maxField = Math.max(maxField, this.readSnap().compositeTypeDepth(f.type, cache));
     const depth = 1 + maxField;
     if (depth > MAX_COMPOSITE_DEPTH) {
       throw engineError(
@@ -3829,18 +3629,14 @@ export class Database {
   // field still references the type, 2BP01; otherwise remove it from the catalog.
   private executeDropType(dt: DropType): Outcome {
     if (this.compositeType(dt.name) === undefined) {
-      if (dt.ifExists)
-        return { kind: "statement", cost: 0n, rowsAffected: null };
+      if (dt.ifExists) return { kind: "statement", cost: 0n, rowsAffected: null };
       throw engineError("undefined_object", "type does not exist: " + dt.name);
     }
     const dep = this.compositeDependentAny(dt.name);
     if (dep !== null) {
       throw engineError(
         "dependent_objects_still_exist",
-        "cannot drop type " +
-          dt.name +
-          " because other objects depend on it: " +
-          dep,
+        "cannot drop type " + dt.name + " because other objects depend on it: " + dep,
       );
     }
     this.working().removeType(dt.name.toLowerCase());
@@ -3852,16 +3648,10 @@ export class Database {
   // reject a relation-namespace collision (42P07 unless IF NOT EXISTS), and register the sequence.
   private executeCreateSequence(cs: CreateSequence): Outcome {
     if (this.relationExists(cs.name)) {
-      if (cs.ifNotExists)
-        return { kind: "statement", cost: 0n, rowsAffected: null };
-      throw engineError(
-        "duplicate_table",
-        `relation already exists: ${cs.name}`,
-      );
+      if (cs.ifNotExists) return { kind: "statement", cost: 0n, rowsAffected: null };
+      throw engineError("duplicate_table", `relation already exists: ${cs.name}`);
     }
-    this.working().putSequence(
-      buildSequenceDef(cs.name, cs.options, undefined),
-    );
+    this.working().putSequence(buildSequenceDef(cs.name, cs.options, undefined));
     return { kind: "statement", cost: 0n, rowsAffected: null };
   }
 
@@ -3876,10 +3666,7 @@ export class Database {
       const seq = this.sequence(name);
       if (seq === undefined) {
         if (ds.ifExists) continue;
-        throw engineError(
-          "undefined_table",
-          `sequence does not exist: ${name}`,
-        );
+        throw engineError("undefined_table", `sequence does not exist: ${name}`);
       }
       if (seq.ownedBy !== undefined) {
         // The owning table is always present (its own DROP TABLE would auto-drop this sequence
@@ -3909,12 +3696,8 @@ export class Database {
   private executeAlterSequence(as: AlterSequence): Outcome {
     const committed = this.sequence(as.name);
     if (committed === undefined) {
-      if (as.ifExists)
-        return { kind: "statement", cost: 0n, rowsAffected: null };
-      throw engineError(
-        "undefined_table",
-        `relation does not exist: ${as.name}`,
-      );
+      if (as.ifExists) return { kind: "statement", cost: 0n, rowsAffected: null };
+      throw engineError("undefined_table", `relation does not exist: ${as.name}`);
     }
     if (as.action.kind === "rename") {
       this.alterSequenceRename(committed, as.action.newName);
@@ -3922,16 +3705,9 @@ export class Database {
       // AS type on ALTER is 0A000 — the value type is not persisted (sequences.md §14.4), so the
       // original type for re-deriving a default bound is gone.
       if (as.action.options.dataType !== null) {
-        throw engineError(
-          "feature_not_supported",
-          "ALTER SEQUENCE ... AS type is not supported",
-        );
+        throw engineError("feature_not_supported", "ALTER SEQUENCE ... AS type is not supported");
       }
-      const newDef = applySeqAlter(
-        committed,
-        as.action.options,
-        as.action.restart,
-      );
+      const newDef = applySeqAlter(committed, as.action.options, as.action.restart);
       this.putSequenceRouted(newDef);
     }
     return { kind: "statement", cost: 0n, rowsAffected: null };
@@ -3944,10 +3720,7 @@ export class Database {
   // renamed sequence (jed resolves the sequence by name, unlike PG's OID reference).
   private alterSequenceRename(existing: SequenceDef, newName: string): void {
     if (this.relationExists(newName)) {
-      throw engineError(
-        "duplicate_table",
-        `relation already exists: ${newName}`,
-      );
+      throw engineError("duplicate_table", `relation already exists: ${newName}`);
     }
     if (existing.ownedBy !== undefined) {
       const exprText = `nextval ( '${newName.toLowerCase().replace(/'/g, "''")}' )`;
@@ -4001,8 +3774,7 @@ export class Database {
       const bk = encodeBoundKey(ib.colType, src, params, outer);
       if (bk.kind !== "key") return { rows: [], pages: 0, slabs: 0 };
       if (agreed === null) agreed = bk.key;
-      else if (!bytesEq(agreed, bk.key))
-        return { rows: [], pages: 0, slabs: 0 };
+      else if (!bytesEq(agreed, bk.key)) return { rows: [], pages: 0, slabs: 0 };
     }
     // The entry-key prefix: the §2.2 present tag + the value's bare key bytes. The range
     // is every entry extending the prefix: [prefix, byte-successor(prefix)).
@@ -4033,8 +3805,7 @@ export class Database {
       const u = store.getWithUnits(rowKey, mask);
       pages += u.pages;
       slabs += u.slabs;
-      if (u.row === undefined)
-        throw new Error("an index entry references a stored row");
+      if (u.row === undefined) throw new Error("an index entry references a stored row");
       rows.push(u.row);
     }
     return { rows, pages, slabs };
@@ -4150,10 +3921,7 @@ export class Database {
     // intersection; = ANY (member) is a single term, so its intersection is that lone posting list;
     // array = (equal) gathers the same superset as @> over Q's distinct non-NULL terms (the residual
     // = makes it exact downstream); && ANY → union.
-    const cand =
-      gb.strategy === "overlaps"
-        ? unionPostings(postings)
-        : intersectPostings(postings);
+    const cand = gb.strategy === "overlaps" ? unionPostings(postings) : intersectPostings(postings);
 
     let slabs = 0;
     const entries: Entry[] = [];
@@ -4161,8 +3929,7 @@ export class Database {
       const u = store.getWithUnits(key, mask);
       pages += u.pages;
       slabs += u.slabs;
-      if (u.row === undefined)
-        throw new Error("a GIN entry references a stored row");
+      if (u.row === undefined) throw new Error("a GIN entry references a stored row");
       entries.push({ key, row: u.row });
     }
     return { entries, pages, slabs };
@@ -4182,10 +3949,7 @@ export class Database {
   private executeInsert(ins: Insert, params: Value[], ctx: CteCtx): Outcome {
     const table = this.lkpTable(ins.table); // temp-first (temp-tables.md §3)
     if (!table) {
-      throw engineError(
-        "undefined_table",
-        "table does not exist: " + ins.table,
-      );
+      throw engineError("undefined_table", "table does not exist: " + ins.table);
     }
     const store = this.writeStore(ins.table);
     // The key members in key order — one for a single-column PK, several for a composite
@@ -4270,26 +4034,13 @@ export class Database {
       const ptypes = new ParamTypes();
       // The source query (and the RETURNING sublinks) see the statement's CTE bindings
       // (writable-cte.md) — the move-rows idiom INSERTs a SELECT over a CTE buffer.
-      const plan = this.planQuery(
-        ins.source.select,
-        null,
-        ctx.bindings,
-        ptypes,
-      );
+      const plan = this.planQuery(ins.source.select, null, ctx.bindings, ptypes);
       const ret =
         ins.returning !== null
-          ? this.resolveReturning(
-              table,
-              ins.returning,
-              false,
-              ctx.bindings,
-              ptypes,
-            )
+          ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes)
           : null;
       const cplan =
-        ins.onConflict !== null
-          ? this.resolveOnConflict(table, ins.onConflict, ptypes)
-          : null;
+        ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ptypes) : null;
       const bound = bindParams(params, ptypes.finalize());
       const meter = this.session.newMeter();
       const foldCost = { value: 0n };
@@ -4327,17 +4078,13 @@ export class Database {
         if (col.type.kind === "composite") {
           throw engineError(
             "feature_not_supported",
-            "INSERT ... SELECT into composite column " +
-              col.name +
-              " is not supported yet",
+            "INSERT ... SELECT into composite column " + col.name + " is not supported yet",
           );
         }
         if (col.type.kind === "array") {
           throw engineError(
             "feature_not_supported",
-            "INSERT ... SELECT into array column " +
-              col.name +
-              " is not supported yet",
+            "INSERT ... SELECT into array column " + col.name + " is not supported yet",
           );
         }
         if (col.type.kind === "range") {
@@ -4345,9 +4092,7 @@ export class Database {
           // is the supported input — spec/design/ranges.md §1), like array.
           throw engineError(
             "feature_not_supported",
-            "INSERT ... SELECT into range column " +
-              col.name +
-              " is not supported yet",
+            "INSERT ... SELECT into range column " + col.name + " is not supported yet",
           );
         }
         if (!assignableTo(q.columnTypes[p]!, col.type.scalar)) {
@@ -4376,13 +4121,7 @@ export class Database {
         ctx,
         meter,
       );
-      return dmlOutcome(
-        ret?.names ?? null,
-        ret?.types ?? null,
-        returned,
-        affected,
-        meter.accrued,
-      );
+      return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, affected, meter.accrued);
     }
 
     // VALUES source. A $N in a VALUES slot is typed as its TARGET COLUMN's type. Collect those
@@ -4392,8 +4131,7 @@ export class Database {
     const ptypes = new ParamTypes();
     for (const values of rowsIn) {
       if (values.length !== arity) {
-        const which =
-          ins.columns !== null ? "target columns are" : "columns are";
+        const which = ins.columns !== null ? "target columns are" : "columns are";
         throw engineError(
           "syntax_error",
           `INSERT row has ${values.length} values but ${arity} ${which} expected for table ${table.name}`,
@@ -4428,18 +4166,10 @@ export class Database {
     // before binding/execution — a 42703 here beats a would-be 23505 (grammar.md §32).
     const ret =
       ins.returning !== null
-        ? this.resolveReturning(
-            table,
-            ins.returning,
-            false,
-            ctx.bindings,
-            ptypes,
-          )
+        ? this.resolveReturning(table, ins.returning, false, ctx.bindings, ptypes)
         : null;
     const cplan =
-      ins.onConflict !== null
-        ? this.resolveOnConflict(table, ins.onConflict, ptypes)
-        : null;
+      ins.onConflict !== null ? this.resolveOnConflict(table, ins.onConflict, ptypes) : null;
     const bound = bindParams(params, ptypes.finalize());
 
     // INSERT ... VALUES reads no rows; with only literal values and constant defaults it
@@ -4468,8 +4198,7 @@ export class Database {
           // (composite-aware — composite.md §1/§4); coerceForStore in insertRows then range-checks.
           if (iv.kind === "default")
             rv[p] = this.evalDefault(col, defaultExprs[i]!, stmtRng, meter);
-          else
-            rv[p] = materializeInsertValue(iv, store.columnTypes()[i]!, bound);
+          else rv[p] = materializeInsertValue(iv, store.columnTypes()[i]!, bound);
         }
       }
       rows.push(rv);
@@ -4478,9 +4207,7 @@ export class Database {
     // (cost.md §3), reading the pre-statement snapshot (grammar.md §32).
     const foldCost = { value: 0n };
     if (ret !== null) {
-      ret.nodes = ret.nodes.map((node) =>
-        this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost),
-      );
+      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost));
     }
     this.foldConflictPlan(cplan, bound, foldCost);
     meter.charge(foldCost.value);
@@ -4499,13 +4226,7 @@ export class Database {
       ctx,
       meter,
     );
-    return dmlOutcome(
-      ret?.names ?? null,
-      ret?.types ?? null,
-      returned,
-      affected,
-      meter.accrued,
-    );
+    return dmlOutcome(ret?.names ?? null, ret?.types ?? null, returned, affected, meter.accrued);
   }
 
   // insertRows runs phase 1 + phase 2 of an INSERT, shared by the VALUES and SELECT sources. Each
@@ -4563,16 +4284,8 @@ export class Database {
         // charges operator_eval for an expression default; a constant (or no default → NULL) is
         // free.
         const candidate: Value =
-          p >= 0
-            ? values[p]!
-            : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-        row[i] = coerceForStore(
-          candidate,
-          colTypes[i]!,
-          col.decimal,
-          col.notNull,
-          col.name,
-        );
+          p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
+        row[i] = coerceForStore(candidate, colTypes[i]!, col.decimal, col.notNull, col.name);
       }
 
       // CHECK constraints, in name order, on the fully-coerced candidate row — after NOT
@@ -4606,9 +4319,7 @@ export class Database {
         if (seenKeys.has(seen) || readStore.get(key) !== undefined) {
           throw engineError(
             "unique_violation",
-            "duplicate key value violates unique constraint: " +
-              table.name.toLowerCase() +
-              "_pkey",
+            "duplicate key value violates unique constraint: " + table.name.toLowerCase() + "_pkey",
           );
         }
         seenKeys.add(seen);
@@ -4671,10 +4382,7 @@ export class Database {
         if (!this.fkProbeHits(probe, fk.refTable)) {
           throw engineError(
             "foreign_key_violation",
-            "insert or update on table " +
-              relation +
-              " violates foreign key constraint " +
-              fk.name,
+            "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
           );
         }
       }
@@ -4710,13 +4418,7 @@ export class Database {
       const key = pr.key ?? encodeInt("i64", store.allocRowid());
       for (let k = 0; k < table.indexes.length; k++) {
         indexInserts[k]!.push(
-          ...indexEntryKeys(
-            table.columns,
-            colls,
-            table.indexes[k]!,
-            key,
-            pr.row,
-          ),
+          ...indexEntryKeys(table.columns, colls, table.indexes[k]!, key, pr.row),
         );
       }
       if (!store.insert(key, pr.row)) {
@@ -4751,11 +4453,7 @@ export class Database {
   // ConflictPlan: the arbiter, plus — for DO UPDATE — the resolved SET assignment plans and the
   // optional WHERE filter, both resolved against the [existing | excluded] scope. Threads the
   // statement ptypes so a $N in a SET/WHERE unifies with the rest of the INSERT.
-  private resolveOnConflict(
-    table: Table,
-    oc: OnConflict,
-    ptypes: ParamTypes,
-  ): ConflictPlan {
+  private resolveOnConflict(table: Table, oc: OnConflict, ptypes: ParamTypes): ConflictPlan {
     const arb = resolveArbiter(table, oc.target);
     if (!oc.doUpdate) {
       return { arb, doUpdate: false, assignments: [], filter: null };
@@ -4772,16 +4470,9 @@ export class Database {
     const plans: AssignPlan[] = [];
     for (const a of oc.assignments) {
       const idx = columnIndex(table, a.column);
-      if (idx < 0)
-        throw engineError(
-          "undefined_column",
-          "column does not exist: " + a.column,
-        );
+      if (idx < 0) throw engineError("undefined_column", "column does not exist: " + a.column);
       if (table.columns[idx]!.identity === "always") {
-        throw engineError(
-          "generated_always",
-          `column ${a.column} can only be updated to DEFAULT`,
-        );
+        throw engineError("generated_always", `column ${a.column} can only be updated to DEFAULT`);
       }
       if (pkMembers.includes(idx)) {
         throw engineError(
@@ -4791,10 +4482,7 @@ export class Database {
       }
       for (const p of plans) {
         if (p.idx === idx) {
-          throw engineError(
-            "duplicate_column",
-            "column " + a.column + " assigned more than once",
-          );
+          throw engineError("duplicate_column", "column " + a.column + " assigned more than once");
         }
       }
       const col = table.columns[idx]!;
@@ -4834,10 +4522,7 @@ export class Database {
         source: node,
       });
     }
-    const filter =
-      oc.filter !== null
-        ? resolveBooleanFilter(scope, oc.filter, ptypes)
-        : null;
+    const filter = oc.filter !== null ? resolveBooleanFilter(scope, oc.filter, ptypes) : null;
     return { arb, doUpdate: true, assignments: plans, filter };
   }
 
@@ -4862,8 +4547,7 @@ export class Database {
     if (entries.length === 0) return null;
     const suffix = entries[0]!.key.slice(ak.length);
     const row = store.get(suffix);
-    if (row === undefined)
-      throw new Error("a unique-index entry points at a live row");
+    if (row === undefined) throw new Error("a unique-index entry points at a live row");
     return { key: suffix, row: store.resolveAll(row) };
   }
 
@@ -4877,19 +4561,14 @@ export class Database {
     colls: (Collation | null)[],
     row: Row,
   ): boolean {
-    if (
-      pk.length > 0 &&
-      store.get(encodePkKey(table, pk, colls, row)) !== undefined
-    )
-      return true;
+    if (pk.length > 0 && store.get(encodePkKey(table, pk, colls, row)) !== undefined) return true;
     for (const def of table.indexes) {
       if (!def.unique) continue;
       const prefix = indexPrefixKey(table.columns, colls, def, row);
       if (prefix === null) continue;
       if (
-        this.readSnap()
-          .indexStore(def.name.toLowerCase())
-          .rangeEntries(uniqueProbeBound(prefix)).length > 0
+        this.readSnap().indexStore(def.name.toLowerCase()).rangeEntries(uniqueProbeBound(prefix))
+          .length > 0
       ) {
         return true;
       }
@@ -4907,20 +4586,10 @@ export class Database {
     if (plan === null || !plan.doUpdate) return;
     plan.assignments = plan.assignments.map((ap) => ({
       ...ap,
-      source: this.foldUncorrelatedInRExpr(
-        ap.source,
-        bound,
-        EMPTY_CTE_CTX,
-        foldCost,
-      ),
+      source: this.foldUncorrelatedInRExpr(ap.source, bound, EMPTY_CTE_CTX, foldCost),
     }));
     if (plan.filter !== null) {
-      plan.filter = this.foldUncorrelatedInRExpr(
-        plan.filter,
-        bound,
-        EMPTY_CTE_CTX,
-        foldCost,
-      );
+      plan.filter = this.foldUncorrelatedInRExpr(plan.filter, bound, EMPTY_CTE_CTX, foldCost);
     }
   }
 
@@ -5009,8 +4678,7 @@ export class Database {
     const colls = this.columnCollations(table.columns);
     // The unique-index positions in table.indexes (no-target skip test + end-state pass).
     const uniqIdx: number[] = [];
-    for (let i = 0; i < table.indexes.length; i++)
-      if (table.indexes[i]!.unique) uniqIdx.push(i);
+    for (let i = 0; i < table.indexes.length; i++) if (table.indexes[i]!.unique) uniqIdx.push(i);
 
     const inserts: Row[] = [];
     const updates: { key: Uint8Array; newRow: Row; oldRow: Row }[] = [];
@@ -5039,16 +4707,8 @@ export class Database {
         const col = table.columns[i]!;
         const p = provided[i]!;
         const candidate: Value =
-          p >= 0
-            ? values[p]!
-            : this.evalDefault(col, defaultExprs[i]!, rng, meter);
-        row[i] = coerceForStore(
-          candidate,
-          colTypes[i]!,
-          col.decimal,
-          col.notNull,
-          col.name,
-        );
+          p >= 0 ? values[p]! : this.evalDefault(col, defaultExprs[i]!, rng, meter);
+        row[i] = coerceForStore(candidate, colTypes[i]!, col.decimal, col.notNull, col.name);
       }
       if (checks.length > 0) {
         meter.guard();
@@ -5059,23 +4719,11 @@ export class Database {
         // No-target DO NOTHING: skip on ANY uniqueness conflict (committed OR an earlier planned
         // insert); else insert (upsert.md §2/§3).
         const pkk = pk.length > 0 ? encodePkKey(table, pk, colls, row) : null;
-        let conflictHit = this.rowConflictsCommitted(
-          store,
-          table,
-          pk,
-          colls,
-          row,
-        );
-        if (!conflictHit && pkk !== null && insPk.has(pkk.join(",")))
-          conflictHit = true;
+        let conflictHit = this.rowConflictsCommitted(store, table, pk, colls, row);
+        if (!conflictHit && pkk !== null && insPk.has(pkk.join(","))) conflictHit = true;
         if (!conflictHit) {
           for (let u = 0; u < uniqIdx.length; u++) {
-            const prefix = indexPrefixKey(
-              table.columns,
-              colls,
-              table.indexes[uniqIdx[u]!]!,
-              row,
-            );
+            const prefix = indexPrefixKey(table.columns, colls, table.indexes[uniqIdx[u]!]!, row);
             if (prefix !== null && insPrefixes[u]!.has(prefix.join(","))) {
               conflictHit = true;
               break;
@@ -5085,12 +4733,7 @@ export class Database {
         if (conflictHit) continue; // skip
         if (pkk !== null) insPk.add(pkk.join(","));
         for (let u = 0; u < uniqIdx.length; u++) {
-          const prefix = indexPrefixKey(
-            table.columns,
-            colls,
-            table.indexes[uniqIdx[u]!]!,
-            row,
-          );
+          const prefix = indexPrefixKey(table.columns, colls, table.indexes[uniqIdx[u]!]!, row);
           if (prefix !== null) insPrefixes[u]!.add(prefix.join(","));
         }
         inserts.push(row);
@@ -5137,20 +4780,12 @@ export class Database {
       };
       // An optional WHERE that is not TRUE skips the update (existing row unchanged, not returned)
       // — but the arbiter key was already proposed, so a second row still trips §4.
-      if (
-        plan.filter !== null &&
-        !isTrue(evalExpr(plan.filter, combined, env, meter))
-      )
-        continue;
+      if (plan.filter !== null && !isTrue(evalExpr(plan.filter, combined, env, meter))) continue;
       const newRow = existing.row.slice();
       for (const ap of plan.assignments) {
-        newRow[ap.idx] = checkAssign(
-          ap,
-          evalExpr(ap.source, combined, env, meter),
-        );
+        newRow[ap.idx] = checkAssign(ap, evalExpr(ap.source, combined, env, meter));
       }
-      if (checks.length > 0)
-        evalChecks(checks, relation, newRow, checkEnv(), meter);
+      if (checks.length > 0) evalChecks(checks, relation, newRow, checkEnv(), meter);
       updates.push({ key: existing.key, newRow, oldRow: existing.row });
     }
 
@@ -5165,9 +4800,7 @@ export class Database {
         if (readStore.get(k) !== undefined || seen.has(ks)) {
           throw engineError(
             "unique_violation",
-            "duplicate key value violates unique constraint: " +
-              relation.toLowerCase() +
-              "_pkey",
+            "duplicate key value violates unique constraint: " + relation.toLowerCase() + "_pkey",
           );
         }
         seen.add(ks);
@@ -5191,9 +4824,7 @@ export class Database {
             batch.has(k) ||
             istore
               .rangeEntries(uniqueProbeBound(prefix))
-              .some(
-                (e) => !rewritten.has(e.key.slice(prefix.length).join(",")),
-              );
+              .some((e) => !rewritten.has(e.key.slice(prefix.length).join(",")));
           if (conflict) {
             throw engineError(
               "unique_violation",
@@ -5208,9 +4839,7 @@ export class Database {
     // FOREIGN KEY child-side (constraints.md §6.4): each inserted row, and each updated row that
     // assigned an FK local column, must reference an existing parent key — the committed parent
     // state plus (for a self-reference) the statement's end state.
-    const assigned = new Set<number>(
-      plan.doUpdate ? plan.assignments.map((a) => a.idx) : [],
-    );
+    const assigned = new Set<number>(plan.doUpdate ? plan.assignments.map((a) => a.idx) : []);
     const fks = this.table(relation)?.fks ?? [];
     for (const fk of fks) {
       const parent = this.table(fk.refTable);
@@ -5230,9 +4859,7 @@ export class Database {
           if (p !== null) batch.add(fkProbeBytes(p).join(","));
         }
       }
-      const toCheck = inserts.concat(
-        checkUpdates ? updates.map((u) => u.newRow) : [],
-      );
+      const toCheck = inserts.concat(checkUpdates ? updates.map((u) => u.newRow) : []);
       for (const row of toCheck) {
         const probe = fkProbe(fk, parent, parentColls, row, fk.columns);
         if (probe === null) continue; // a NULL local column → exempt (MATCH SIMPLE)
@@ -5240,10 +4867,7 @@ export class Database {
         if (!this.fkProbeHits(probe, fk.refTable)) {
           throw engineError(
             "foreign_key_violation",
-            "insert or update on table " +
-              relation +
-              " violates foreign key constraint " +
-              fk.name,
+            "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
           );
         }
       }
@@ -5266,21 +4890,10 @@ export class Database {
           const oldProbe = fkProbe(fk, parent, colls, u.oldRow, fk.refColumns);
           if (oldProbe === null) continue;
           const newProbe = fkProbe(fk, parent, colls, u.newRow, fk.refColumns);
-          if (
-            newProbe !== null &&
-            bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))
-          )
+          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe)))
             continue;
           if (newPresent.has(fkProbeBytes(oldProbe).join(","))) continue;
-          if (
-            this.fkChildReferences(
-              childTable,
-              fk,
-              parent,
-              fkProbeBytes(oldProbe),
-              updatedKeys,
-            )
-          ) {
+          if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), updatedKeys)) {
             throw engineError(
               "foreign_key_violation",
               "update or delete on table " +
@@ -5300,12 +4913,10 @@ export class Database {
     let cunits = 0n;
     const placeholder = new Uint8Array(8);
     for (const row of inserts) {
-      const kb =
-        pk.length > 0 ? encodePkKey(table, pk, colls, row) : placeholder;
+      const kb = pk.length > 0 ? encodePkKey(table, pk, colls, row) : placeholder;
       cunits += BigInt(store.writeCompressUnits(kb, row));
     }
-    for (const u of updates)
-      cunits += BigInt(store.writeCompressUnits(u.key, u.newRow));
+    for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.key, u.newRow));
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
 
@@ -5324,14 +4935,7 @@ export class Database {
         prows.push(u.newRow);
         olds.push(u.oldRow);
       }
-      returned = this.projectReturning(
-        returning,
-        prows,
-        olds,
-        params,
-        ctes,
-        meter,
-      );
+      returned = this.projectReturning(returning, prows, olds, params, ctes, meter);
     }
 
     const affected = inserts.length + updates.length;
@@ -5341,36 +4945,20 @@ export class Database {
     const indexAdds: Uint8Array[][] = table.indexes.map(() => []);
     for (const row of inserts) {
       const key =
-        pk.length > 0
-          ? encodePkKey(table, pk, colls, row)
-          : encodeInt("i64", store.allocRowid());
+        pk.length > 0 ? encodePkKey(table, pk, colls, row) : encodeInt("i64", store.allocRowid());
       for (let k = 0; k < table.indexes.length; k++) {
-        indexAdds[k]!.push(
-          ...indexEntryKeys(table.columns, colls, table.indexes[k]!, key, row),
-        );
+        indexAdds[k]!.push(...indexEntryKeys(table.columns, colls, table.indexes[k]!, key, row));
       }
-      if (!store.insert(key, row))
-        throw new Error("pre-validated INSERT key must be unique");
+      if (!store.insert(key, row)) throw new Error("pre-validated INSERT key must be unique");
     }
-    const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] =
-      table.indexes.map(() => []);
+    const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] = table.indexes.map(
+      () => [],
+    );
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
         const def = table.indexes[k]!;
-        const oldEks = indexEntryKeys(
-          table.columns,
-          colls,
-          def,
-          u.key,
-          u.oldRow,
-        );
-        const newEks = indexEntryKeys(
-          table.columns,
-          colls,
-          def,
-          u.key,
-          u.newRow,
-        );
+        const oldEks = indexEntryKeys(table.columns, colls, def, u.key, u.oldRow);
+        const newEks = indexEntryKeys(table.columns, colls, def, u.key, u.newRow);
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
         if (removals.length > 0 || insertions.length > 0)
@@ -5449,9 +5037,7 @@ export class Database {
     rows.forEach((row, i) => {
       meter.guard();
       meter.charge(COSTS.rowProduced);
-      const combined = row.concat(
-        others !== null ? others[i]! : row.map(() => nullValue()),
-      );
+      const combined = row.concat(others !== null ? others[i]! : row.map(() => nullValue()));
       out.push(nodes.map((node) => evalExpr(node, combined, env, meter)));
     });
     return out;
@@ -5463,10 +5049,7 @@ export class Database {
   private executeDelete(del: Delete, params: Value[], ctx: CteCtx): Outcome {
     const table = this.lkpTable(del.table); // temp-first (temp-tables.md §3)
     if (!table) {
-      throw engineError(
-        "undefined_table",
-        "table does not exist: " + del.table,
-      );
+      throw engineError("undefined_table", "table does not exist: " + del.table);
     }
     // Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
     // parent-side probe (parent is this table) and the index-entry path.
@@ -5478,18 +5061,10 @@ export class Database {
     const scope = Scope.single(this, table);
     scope.ctes = ctx.bindings;
     const ptypes = new ParamTypes();
-    let filter = del.filter
-      ? resolveBooleanFilter(scope, del.filter, ptypes)
-      : null;
+    let filter = del.filter ? resolveBooleanFilter(scope, del.filter, ptypes) : null;
     const ret =
       del.returning !== null
-        ? this.resolveReturning(
-            table,
-            del.returning,
-            true,
-            ctx.bindings,
-            ptypes,
-          )
+        ? this.resolveReturning(table, del.returning, true, ctx.bindings, ptypes)
         : null;
     const bound = bindParams(params, ptypes.finalize());
 
@@ -5508,9 +5083,7 @@ export class Database {
     // pre-statement snapshot (grammar.md §32).
     if (ret !== null) {
       const cost = { value: 0n };
-      ret.nodes = ret.nodes.map((node) =>
-        this.foldUncorrelatedInRExpr(node, bound, ctx, cost),
-      );
+      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, ctx, cost));
       meter.charge(cost.value);
     }
     const env: EvalEnv = {
@@ -5536,9 +5109,7 @@ export class Database {
     const mask: boolean[] = new Array(table.columns.length).fill(false);
     if (filter !== null) collectTouched(filter, 0, mask);
     if (ret !== null) {
-      const retMask: boolean[] = new Array(2 * table.columns.length).fill(
-        false,
-      );
+      const retMask: boolean[] = new Array(2 * table.columns.length).fill(false);
       for (const node of ret.nodes) collectTouched(node, 0, retMask);
       for (let i = 0; i < mask.length; i++) {
         if (retMask[i]) mask[i] = true;
@@ -5563,14 +5134,7 @@ export class Database {
       const gb = detectGinBound(filter, table.indexes, table.columns, 0);
       if (gb !== null) {
         const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
-        const r = this.ginBoundRows(
-          del.table,
-          gb,
-          m?.query ?? null,
-          env,
-          meter,
-          mask,
-        );
+        const r = this.ginBoundRows(del.table, gb, m?.query ?? null, env, meter, mask);
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -5582,16 +5146,8 @@ export class Database {
       }
     }
     if (entries === null)
-      return dmlOutcome(
-        ret?.names ?? null,
-        ret?.types ?? null,
-        null,
-        0,
-        meter.accrued,
-      ); // empty bound
-    meter.charge(
-      COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs),
-    );
+      return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
+    meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       // A WHERE arithmetic can throw (22003/22012); the throw propagates naturally.
@@ -5615,23 +5171,12 @@ export class Database {
       const deletedKeys = new Set<string>(matched.map((m) => m.key.join(",")));
       const empty = new Set<string>();
       for (const { childTable, fk } of delReferencers) {
-        const exclude =
-          childTable.toLowerCase() === del.table.toLowerCase()
-            ? deletedKeys
-            : empty;
+        const exclude = childTable.toLowerCase() === del.table.toLowerCase() ? deletedKeys : empty;
         for (const m of matched) {
           // parent is the delete target itself, so its key columns use colls (§2.12).
           const probe = fkProbe(fk, parent, colls, m.row, fk.refColumns);
           if (probe === null) continue; // a NULL referenced value cannot be referenced (MATCH SIMPLE)
-          if (
-            this.fkChildReferences(
-              childTable,
-              fk,
-              parent,
-              fkProbeBytes(probe),
-              exclude,
-            )
-          ) {
+          if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(probe), exclude)) {
             throw engineError(
               "foreign_key_violation",
               "update or delete on table " +
@@ -5667,14 +5212,7 @@ export class Database {
     for (const def of table.indexes) {
       const istore = this.writeIndexStore(def.name.toLowerCase());
       for (const m of matched) {
-        for (const ek of indexEntryKeys(
-          table.columns,
-          colls,
-          def,
-          m.key,
-          m.row,
-        ))
-          istore.remove(ek);
+        for (const ek of indexEntryKeys(table.columns, colls, def, m.key, m.row)) istore.remove(ek);
       }
     }
     return dmlOutcome(
@@ -5694,10 +5232,7 @@ export class Database {
   private executeUpdate(upd: Update, params: Value[], ctx: CteCtx): Outcome {
     const table = this.lkpTable(upd.table); // temp-first (temp-tables.md §3)
     if (!table) {
-      throw engineError(
-        "undefined_table",
-        "table does not exist: " + upd.table,
-      );
+      throw engineError("undefined_table", "table does not exist: " + upd.table);
     }
     // Per-column frozen collations for the collated text key form (§2.12) — indexes both the FK
     // probe and the index-entry move path.
@@ -5719,19 +5254,13 @@ export class Database {
     for (const a of upd.assignments) {
       const idx = columnIndex(table, a.column);
       if (idx < 0) {
-        throw engineError(
-          "undefined_column",
-          "column does not exist: " + a.column,
-        );
+        throw engineError("undefined_column", "column does not exist: " + a.column);
       }
       // A GENERATED ALWAYS identity column can only be set to DEFAULT (sequences.md §13.4); jed's
       // UPDATE has no `= DEFAULT` form, so any assignment is 428C9. Ordered before the PK-narrowing
       // 0A000 so an ALWAYS identity PRIMARY KEY reports 428C9 (PG's code).
       if (table.columns[idx]!.identity === "always") {
-        throw engineError(
-          "generated_always",
-          `column ${a.column} can only be updated to DEFAULT`,
-        );
+        throw engineError("generated_always", `column ${a.column} can only be updated to DEFAULT`);
       }
       if (pkMembers.includes(idx)) {
         throw engineError(
@@ -5741,10 +5270,7 @@ export class Database {
       }
       for (const p of plans) {
         if (p.idx === idx) {
-          throw engineError(
-            "duplicate_column",
-            "column " + a.column + " assigned more than once",
-          );
+          throw engineError("duplicate_column", "column " + a.column + " assigned more than once");
         }
       }
       const col = table.columns[idx]!;
@@ -5792,20 +5318,12 @@ export class Database {
       });
     }
 
-    let filter = upd.filter
-      ? resolveBooleanFilter(scope, upd.filter, ptypes)
-      : null;
+    let filter = upd.filter ? resolveBooleanFilter(scope, upd.filter, ptypes) : null;
     // The RETURNING projection resolves last (PostgreSQL's analysis order), against the same
     // one-relation scope; it evaluates each matched row's NEW values (grammar.md §32).
     const ret =
       upd.returning !== null
-        ? this.resolveReturning(
-            table,
-            upd.returning,
-            false,
-            ctx.bindings,
-            ptypes,
-          )
+        ? this.resolveReturning(table, upd.returning, false, ctx.bindings, ptypes)
         : null;
     // The CHECK constraints, resolved once per statement in evaluation (name) order;
     // phase 1 evaluates them on each post-assignment row (constraints.md §4.4).
@@ -5823,14 +5341,10 @@ export class Database {
     // the filter, and each assignment RHS accrue cost (the phase-2 writes do not — cost.md §3).
     const meter = this.session.newMeter();
     const foldCost = { value: 0n };
-    for (const p of plans)
-      p.source = this.foldUncorrelatedInRExpr(p.source, bound, ctx, foldCost);
-    if (filter !== null)
-      filter = this.foldUncorrelatedInRExpr(filter, bound, ctx, foldCost);
+    for (const p of plans) p.source = this.foldUncorrelatedInRExpr(p.source, bound, ctx, foldCost);
+    if (filter !== null) filter = this.foldUncorrelatedInRExpr(filter, bound, ctx, foldCost);
     if (ret !== null) {
-      ret.nodes = ret.nodes.map((node) =>
-        this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost),
-      );
+      ret.nodes = ret.nodes.map((node) => this.foldUncorrelatedInRExpr(node, bound, ctx, foldCost));
     }
     meter.charge(foldCost.value);
     const env: EvalEnv = {
@@ -5886,14 +5400,7 @@ export class Database {
       const gb = detectGinBound(filter, table.indexes, table.columns, 0);
       if (gb !== null) {
         const m = filter !== null ? ginMatch(filter, gb.colGlobal) : null;
-        const r = this.ginBoundRows(
-          upd.table,
-          gb,
-          m?.query ?? null,
-          env,
-          meter,
-          mask,
-        );
+        const r = this.ginBoundRows(upd.table, gb, m?.query ?? null, env, meter, mask);
         entries = r.entries;
         overlap = r.pages;
         slabs = r.slabs;
@@ -5905,24 +5412,15 @@ export class Database {
       }
     }
     if (entries === null)
-      return dmlOutcome(
-        ret?.names ?? null,
-        ret?.types ?? null,
-        null,
-        0,
-        meter.accrued,
-      ); // empty bound
-    meter.charge(
-      COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs),
-    );
+      return dmlOutcome(ret?.names ?? null, ret?.types ?? null, null, 0, meter.accrued); // empty bound
+    meter.charge(COSTS.pageRead * BigInt(overlap) + COSTS.valueDecompress * BigInt(slabs));
     for (const e of entries) {
       meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
       meter.charge(COSTS.storageRowRead);
       // Materialize the filter's + assignment sources' columns if the lazy load left them
       // unfetched — exactly the touched set the block above charged (large-values.md §14).
       const row = store.resolveColumns(e.row, mask);
-      if (filter !== null && !isTrue(evalExpr(filter, row, env, meter)))
-        continue;
+      if (filter !== null && !isTrue(evalExpr(filter, row, env, meter))) continue;
       const newRow = row.slice();
       for (const p of plans) {
         newRow[p.idx] = checkAssign(p, evalExpr(p.source, row, env, meter));
@@ -5961,9 +5459,7 @@ export class Database {
             batch.has(k) ||
             istore
               .rangeEntries(uniqueProbeBound(prefix))
-              .some(
-                (e) => !rewritten.has(e.key.slice(prefix.length).join(",")),
-              );
+              .some((e) => !rewritten.has(e.key.slice(prefix.length).join(",")));
           if (conflict) {
             throw engineError(
               "unique_violation",
@@ -6004,10 +5500,7 @@ export class Database {
         if (!this.fkProbeHits(probe, fk.refTable)) {
           throw engineError(
             "foreign_key_violation",
-            "insert or update on table " +
-              relation +
-              " violates foreign key constraint " +
-              fk.name,
+            "insert or update on table " + relation + " violates foreign key constraint " + fk.name,
           );
         }
       }
@@ -6033,31 +5526,17 @@ export class Database {
           const p = fkProbe(fk, parent, colls, u.row, fk.refColumns);
           if (p !== null) newPresent.add(fkProbeBytes(p).join(","));
         }
-        const exclude =
-          childTable.toLowerCase() === upd.table.toLowerCase()
-            ? updatedKeys
-            : empty;
+        const exclude = childTable.toLowerCase() === upd.table.toLowerCase() ? updatedKeys : empty;
         for (const u of updates) {
           const oldProbe = fkProbe(fk, parent, colls, u.oldRow, fk.refColumns);
           if (oldProbe === null) continue; // a NULL old referenced value was referenced by nothing
           // Unchanged tuples (incl. a NULL → already skipped) do not disappear.
           const newProbe = fkProbe(fk, parent, colls, u.row, fk.refColumns);
-          if (
-            newProbe !== null &&
-            bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe))
-          )
+          if (newProbe !== null && bytesEq(fkProbeBytes(newProbe), fkProbeBytes(oldProbe)))
             continue;
           // Re-supplied by another updated row (e.g. a value swap) → not disappearing.
           if (newPresent.has(fkProbeBytes(oldProbe).join(","))) continue;
-          if (
-            this.fkChildReferences(
-              childTable,
-              fk,
-              parent,
-              fkProbeBytes(oldProbe),
-              exclude,
-            )
-          ) {
+          if (this.fkChildReferences(childTable, fk, parent, fkProbeBytes(oldProbe), exclude)) {
             throw engineError(
               "foreign_key_violation",
               "update or delete on table " +
@@ -6076,8 +5555,7 @@ export class Database {
     // — meter the attempts (value_compress, cost.md §3) and enforce the ceiling BEFORE phase 2
     // writes anything, preserving all-or-nothing.
     let cunits = 0n;
-    for (const u of updates)
-      cunits += BigInt(store.writeCompressUnits(u.key, u.row));
+    for (const u of updates) cunits += BigInt(store.writeCompressUnits(u.key, u.row));
     meter.charge(COSTS.valueCompress * cunits);
     meter.guard();
 
@@ -6102,21 +5580,16 @@ export class Database {
     // copy-on-write dirty set, and so the commit's written pages, byte-identical across
     // cores). The storage key cannot change (PK assignment is rejected), so the suffix is
     // stable.
-    const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] =
-      table.indexes.map(() => []);
+    const indexMoves: { removals: Uint8Array[]; insertions: Uint8Array[] }[][] = table.indexes.map(
+      () => [],
+    );
     for (const u of updates) {
       for (let k = 0; k < table.indexes.length; k++) {
         const def = table.indexes[k]!;
         // The row's old and new entry SETS (one entry for an ordered index, one per term for GIN —
         // gin.md §5). Remove old−new, insert new−old: a shared entry is left untouched, keeping the
         // copy-on-write dirty set byte-identical across cores.
-        const oldEks = indexEntryKeys(
-          table.columns,
-          colls,
-          def,
-          u.key,
-          u.oldRow,
-        );
+        const oldEks = indexEntryKeys(table.columns, colls, def, u.key, u.oldRow);
         const newEks = indexEntryKeys(table.columns, colls, def, u.key, u.row);
         const removals = bytesDiff(oldEks, newEks);
         const insertions = bytesDiff(newEks, oldEks);
@@ -6234,19 +5707,12 @@ export class Database {
   // never the recursive UNION shape, so it is always non-recursive. The `refs` counters are bumped as
   // later query bodies / a query primary reference each binding (a data-modifying part's references
   // are static-counted by the orchestrator, since it is not planned here).
-  private planCteBindings(
-    ctes: Cte[],
-    recursive: boolean,
-    ptypes: ParamTypes,
-  ): CteBinding[] {
+  private planCteBindings(ctes: Cte[], recursive: boolean, ptypes: ParamTypes): CteBinding[] {
     const bindings: CteBinding[] = [];
     for (const cte of ctes) {
       const lname = cte.name.toLowerCase();
       if (bindings.some((b) => b.name === lname)) {
-        throw engineError(
-          "duplicate_alias",
-          `WITH query name ${lname} specified more than once`,
-        );
+        throw engineError("duplicate_alias", `WITH query name ${lname} specified more than once`);
       }
       const bodyQuery = cteBodyAsQuery(cte.body);
       const shape =
@@ -6270,9 +5736,7 @@ export class Database {
         const rhsPlan = this.planQuery(so.rhs, null, bindings, ptypes);
         const anchorSrc = bindings[bi]!.source;
         if (anchorSrc.kind !== "query") {
-          throw new Error(
-            "the anchor binding was just pushed as a query source",
-          );
+          throw new Error("the anchor binding was just pushed as a query source");
         }
         checkRecursiveColumnTypes(anchorSrc.plan, rhsPlan, lname);
         bindings[bi]!.recursive = { plan: rhsPlan, unionAll: shape.unionAll };
@@ -6292,13 +5756,7 @@ export class Database {
       } else {
         // A data-modifying CTE (writable-cte.md): resolve its RETURNING schema for the synthetic
         // relation + capture the statement to run later.
-        const { table, dm } = this.planDmCte(
-          lname,
-          cte.body,
-          bindings,
-          cte.columns,
-          ptypes,
-        );
+        const { table, dm } = this.planDmCte(lname, cte.body, bindings, cte.columns, ptypes);
         bindings.push({
           name: lname,
           table,
@@ -6348,10 +5806,7 @@ export class Database {
     }
     const tdef = this.lkpTable(tableName); // temp-first (temp-tables.md §3)
     if (tdef === undefined) {
-      throw engineError(
-        "undefined_table",
-        "table does not exist: " + tableName,
-      );
+      throw engineError("undefined_table", "table does not exist: " + tableName);
     }
     if (returning === null) {
       const table = cteSyntheticTableCols(lname, [], [], rename);
@@ -6414,15 +5869,7 @@ export class Database {
       const rt = bindings[i]!.recursive;
       let buf: Row[];
       if (rt) {
-        buf = this.materializeRecursive(
-          i,
-          rt,
-          modes,
-          bindings,
-          buffers,
-          bound,
-          totalCost,
-        );
+        buf = this.materializeRecursive(i, rt, modes, bindings, buffers, bound, totalCost);
       } else if (bindings[i]!.source.kind === "dml") {
         // A data-modifying CTE's buffer is filled by the orchestrator, not here.
         buf = [];
@@ -6566,9 +6013,7 @@ export class Database {
     //     static-counted in (2b).
     const primaryQuery = cteBodyAsQuery(body);
     const primaryPlan =
-      primaryQuery !== null
-        ? this.planQuery(primaryQuery, null, bindings, ptypes)
-        : null;
+      primaryQuery !== null ? this.planQuery(primaryQuery, null, bindings, ptypes) : null;
     // (2b) Add the references each NON-planned data-modifying part (a data-modifying CTE body, or a
     //      data-modifying primary) contributes to each binding, so the inline-vs-materialize decision
     //      is correct for a query CTE referenced only by a data-modifying part (§3). Query bodies / a
@@ -6596,15 +6041,7 @@ export class Database {
       const rt = bindings[i]!.recursive;
       let buf: Row[];
       if (rt) {
-        buf = this.materializeRecursive(
-          i,
-          rt,
-          modes,
-          bindings,
-          buffers,
-          bound,
-          totalCost,
-        );
+        buf = this.materializeRecursive(i, rt, modes, bindings, buffers, bound, totalCost);
       } else if (bindings[i]!.source.kind === "dml") {
         const ctx: CteCtx = {
           modes: modes.slice(0, i),
@@ -6636,11 +6073,7 @@ export class Database {
     // (4) Execute the primary against the full CTE context, adding the materialization cost.
     const ctx: CteCtx = { modes, bindings, buffers };
     let outcome: Outcome;
-    if (
-      body.kind === "select" ||
-      body.kind === "setOp" ||
-      body.kind === "withExpr"
-    ) {
+    if (body.kind === "select" || body.kind === "setOp" || body.kind === "withExpr") {
       const plan = primaryPlan!;
       const subqueryCost = { value: 0n };
       this.foldUncorrelatedInPlan(plan, bound, ctx, subqueryCost);
@@ -6714,11 +6147,7 @@ export class Database {
   // inner main query keeps the enclosing parent (so a LATERAL derived-table body still correlates to
   // its left siblings), while the CTE bodies stay independent (parent=null, inside planCteBindings).
   // A data-modifying CTE here is rejected 0A000 — PostgreSQL restricts a DML-WITH to the top level.
-  private planWithExpr(
-    we: WithExpr,
-    parent: Scope | null,
-    ptypes: ParamTypes,
-  ): WithPlan {
+  private planWithExpr(we: WithExpr, parent: Scope | null, ptypes: ParamTypes): WithPlan {
     for (const c of we.ctes) {
       if (cteBodyIsDataModifying(c.body)) {
         throw engineError(
@@ -6748,10 +6177,8 @@ export class Database {
     params: Value[],
     ctes: CteCtx,
   ): SelectResult {
-    if (plan.kind === "select")
-      return this.execSelectPlan(plan, outer, params, ctes);
-    if (plan.kind === "values")
-      return this.execValuesPlan(plan, outer, params, ctes);
+    if (plan.kind === "select") return this.execSelectPlan(plan, outer, params, ctes);
+    if (plan.kind === "values") return this.execValuesPlan(plan, outer, params, ctes);
     if (plan.kind === "with") return this.execWithPlan(plan, outer, params);
     return this.execSetOpPlan(plan, outer, params, ctes);
   }
@@ -6762,16 +6189,8 @@ export class Database {
   // §7), and run the inner body against it. The body still sees the outer row environment (so a
   // LATERAL nested-WITH derived-table body correlates to its left siblings). The materialization cost
   // folds into the body's cost — the same shape as the top-level runWith (cte.md §3).
-  private execWithPlan(
-    plan: WithPlan,
-    outer: Row[],
-    params: Value[],
-  ): SelectResult {
-    const { buffers, totalCost } = this.materializeCtes(
-      plan.bindings,
-      plan.modes,
-      params,
-    );
+  private execWithPlan(plan: WithPlan, outer: Row[], params: Value[]): SelectResult {
+    const { buffers, totalCost } = this.materializeCtes(plan.bindings, plan.modes, params);
     const ctx: CteCtx = {
       modes: plan.modes,
       bindings: plan.bindings,
@@ -6860,8 +6279,7 @@ export class Database {
 
     const n = BigInt(rows.length);
     const start = plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
-    const end =
-      plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
+    const end = plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
     rows = rows.slice(Number(start), Number(end));
 
     return {
@@ -6900,10 +6318,7 @@ export class Database {
     const colParams: number[][] = Array.from({ length: arity }, () => []);
     rows.forEach((row, ri) => {
       if (row.length !== arity) {
-        throw engineError(
-          "syntax_error",
-          "VALUES lists must all be the same length",
-        );
+        throw engineError("syntax_error", "VALUES lists must all be the same length");
       }
       const resolvedRow: RExpr[] = [];
       row.forEach((val, ci) => {
@@ -6930,10 +6345,7 @@ export class Database {
     }
     // PostgreSQL names a VALUES relation's columns column1, column2, … ; the derived table's optional
     // column-rename list overrides them at the synthetic relation (cteSyntheticTable).
-    const columnNames = Array.from(
-      { length: arity },
-      (_, i) => `column${i + 1}`,
-    );
+    const columnNames = Array.from({ length: arity }, (_, i) => `column${i + 1}`);
     return {
       kind: "values",
       rows: resolvedRows,
@@ -7014,8 +6426,7 @@ export class Database {
     // (§42). For a LATERAL item (§44) the body / SRF args resolve against the PREFIX of relations to
     // its left (a dependent join), so the build runs in FROM order and a prefix scope over the
     // already-resolved rels is handed to the body.
-    const tableRefs =
-      sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
+    const tableRefs = sel.from === null ? [] : [sel.from, ...sel.joins.map((j) => j.table)];
     const rels: ScopeRel[] = [];
     const srfPlans: (SrfPlan | undefined)[] = []; // aligned with rels; undefined = a base table
     const derivedPlans: (QueryPlan | undefined)[] = []; // aligned with rels; non-undefined = derived
@@ -7032,20 +6443,16 @@ export class Database {
       let cteIdx: number | undefined;
       let derived: QueryPlan | undefined;
       let lateral = false;
-      const isDerived =
-        tref.subquery !== undefined || tref.values !== undefined;
+      const isDerived = tref.subquery !== undefined || tref.values !== undefined;
       // A FROM item is lateral-ELIGIBLE when it can see earlier siblings: a derived table / VALUES
       // body explicitly marked LATERAL, or ANY table function (implicitly lateral — §44). The first
       // item (i === 0) has no earlier sibling, so it is never lateral; an SRF there resolves against
       // `parent` (the enclosing query) exactly as before.
-      const lateralEligible =
-        i > 0 && ((isDerived && tref.lateral === true) || tref.args !== null);
+      const lateralEligible = i > 0 && ((isDerived && tref.lateral === true) || tref.args !== null);
       // The prefix scope a LATERAL item resolves against: the relations to its left, chained to the
       // enclosing query's parent (so a sibling column correlates as Outer{level=1}, an enclosing one
       // deeper). null when not lateral-eligible.
-      const lateralParent = lateralEligible
-        ? new Scope([...rels], this, parent, true, ctes)
-        : null;
+      const lateralParent = lateralEligible ? new Scope([...rels], this, parent, true, ctes) : null;
       if (isDerived) {
         // Plan the body. LATERAL → parent is the prefix scope (a sibling/outer column correlates);
         // otherwise an INDEPENDENT query (parent=null, §42). A LATERAL VALUES body resolves its
@@ -7064,18 +6471,10 @@ export class Database {
         // scope (a sibling column then correlates); at i==0 against `parent` (the enclosing query /
         // params), unchanged (functions.md §10).
         const srfParent = lateralEligible ? lateralParent : parent;
-        const r = this.resolveSRF(
-          tref.name,
-          tref.args,
-          tref.alias,
-          srfParent,
-          ctes,
-          ptypes,
-        );
+        const r = this.resolveSRF(tref.name, tref.args, tref.alias, srfParent, ctes, ptypes);
         t = r.table;
         srf = r.srf;
-        lateral =
-          lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
+        lateral = lateralEligible && r.srf.args.some((a) => rexprReferencesOuter(a, 0));
       } else {
         // A plain FROM name (not an SRF call) may resolve to a CTE, which SHADOWS a catalog table of
         // the same name (cte.md §2); lookup is case-insensitive. A hit bumps the binding's reference
@@ -7098,21 +6497,13 @@ export class Database {
           cteIdx = ci;
         } else {
           const tbl = this.lkpTable(tref.name); // temp-first (temp-tables.md §3)
-          if (!tbl)
-            throw engineError(
-              "undefined_table",
-              "table does not exist: " + tref.name,
-            );
+          if (!tbl) throw engineError("undefined_table", "table does not exist: " + tref.name);
           t = tbl;
         }
       }
       // RIGHT/FULL JOIN to a CORRELATED lateral item is rejected (§44): the right side cannot be both
       // kept whole and evaluated per left row. (i ≥ 1 here, so the item carries a join kind.)
-      if (
-        lateral &&
-        (sel.joins[i - 1]!.kind === "right" ||
-          sel.joins[i - 1]!.kind === "full")
-      ) {
+      if (lateral && (sel.joins[i - 1]!.kind === "right" || sel.joins[i - 1]!.kind === "full")) {
         throw engineError(
           "invalid_column_reference",
           "invalid reference to FROM-clause entry for a LATERAL item: the combining JOIN type must be INNER or LEFT",
@@ -7124,10 +6515,7 @@ export class Database {
       // resolve, and stay ambiguous via resolveBare). Every other relation has a non-empty label.
       if (label !== "") {
         if (seenLabels.has(label)) {
-          throw engineError(
-            "duplicate_alias",
-            "table name " + label + " specified more than once",
-          );
+          throw engineError("duplicate_alias", "table name " + label + " specified more than once");
         }
         seenLabels.add(label);
       }
@@ -7162,10 +6550,7 @@ export class Database {
     // mode (columns normal). Output names per grammar.md §8.
     // GROUP BY, an aggregate in the select list, OR a HAVING clause all make this an aggregate
     // query (HAVING alone groups the whole table — grammar.md §19).
-    const isAgg =
-      groupKeys.length > 0 ||
-      itemsHaveAggregate(sel.items) ||
-      sel.having !== null;
+    const isAgg = groupKeys.length > 0 || itemsHaveAggregate(sel.items) || sel.having !== null;
     const projAgg: AggCtx = { collecting: isAgg, groupKeys, specs: [] };
     const {
       nodes: projections,
@@ -7192,9 +6577,7 @@ export class Database {
         "SELECT DISTINCT with aggregates is not supported yet",
       );
     }
-    const filter = sel.filter
-      ? resolveBooleanFilter(scope, sel.filter, ptypes)
-      : null;
+    const filter = sel.filter ? resolveBooleanFilter(scope, sel.filter, ptypes) : null;
     // ORDER BY resolution. In an aggregate query a key resolves against the GROUP KEYS — a
     // grouping column gives its synthetic-row slot, a non-grouping column is 42803 (the
     // grouping-error rule, grammar.md §18); the sort runs on the group rows. In a plain query
@@ -7276,13 +6659,7 @@ export class Database {
     // same parent chain, so a correlated reference in an ON predicate resolves outward (§26).
     const joins: PlanJoin[] = sel.joins.map((j, k) => {
       if (j.on === null) return { kind: j.kind, on: null };
-      const partial = new Scope(
-        scope.rels.slice(0, k + 2),
-        this,
-        parent,
-        true,
-        ctes,
-      );
+      const partial = new Scope(scope.rels.slice(0, k + 2), this, parent, true, ctes);
       return { kind: j.kind, on: resolveBooleanFilter(partial, j.on, ptypes) };
     });
 
@@ -7329,15 +6706,12 @@ export class Database {
     for (const j of joins) if (j.on !== null) collectTouched(j.on, 0, touched);
     if (isAgg) {
       for (const gk of groupKeys) touched[gk] = true;
-      for (const s of aggSpecs)
-        if (s.operand !== null) collectTouched(s.operand, 0, touched);
+      for (const s of aggSpecs) if (s.operand !== null) collectTouched(s.operand, 0, touched);
     } else {
       for (const p of projections) collectTouched(p, 0, touched);
       for (const o of order) touched[o.idx] = true;
     }
-    const relMasks = planRels.map((r) =>
-      touched.slice(r.offset, r.offset + r.colCount),
-    );
+    const relMasks = planRels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
     return {
       kind: "select",
       rels: planRels,
@@ -7382,8 +6756,7 @@ export class Database {
     const lname = name.toLowerCase();
     if (lname === "generate_series")
       return this.resolveGenerateSeries(args, alias, argScope, ptypes);
-    if (lname === "unnest")
-      return this.resolveUnnest(args, alias, argScope, ptypes);
+    if (lname === "unnest") return this.resolveUnnest(args, alias, argScope, ptypes);
     throw engineError("undefined_function", "function does not exist: " + name);
   }
 
@@ -7397,8 +6770,7 @@ export class Database {
     argScope: Scope,
     ptypes: ParamTypes,
   ): { table: Table; srf: SrfPlan } {
-    if (args.length !== 2 && args.length !== 3)
-      throw noFuncOverload("generate_series");
+    if (args.length !== 2 && args.length !== 3) throw noFuncOverload("generate_series");
     const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const rargs: RExpr[] = [];
     let result: ScalarType | null = null;
@@ -7457,9 +6829,7 @@ export class Database {
       const v = evalExpr(e, [], env, meter);
       if (v.kind === "int") return v.int;
       if (v.kind === "null") return null;
-      throw new Error(
-        "the resolver restricts generate_series args to integers",
-      );
+      throw new Error("the resolver restricts generate_series args to integers");
     };
     const start = evalInt(srf.args[0]!);
     const stop = evalInt(srf.args[1]!);
@@ -7467,10 +6837,7 @@ export class Database {
     // Any NULL argument yields zero rows (PG).
     if (start === null || stop === null || step === null) return [];
     if (step === 0n)
-      throw engineError(
-        "invalid_parameter_value",
-        "step size cannot be equal to zero",
-      );
+      throw engineError("invalid_parameter_value", "step size cannot be equal to zero");
     const out: Row[] = [];
     let cur = start;
     for (;;) {
@@ -7497,8 +6864,7 @@ export class Database {
     const v = evalExpr(srf.args[0]!, [], env, meter);
     // A NULL array → zero rows (PG; the empty_on_null discipline).
     if (v.kind === "null") return [];
-    if (v.kind !== "array")
-      throw new Error("the resolver restricts unnest's argument to an array");
+    if (v.kind !== "array") throw new Error("the resolver restricts unnest's argument to an array");
     const out: Row[] = [];
     for (const e of v.elements) {
       meter.guard();
@@ -7543,13 +6909,8 @@ export class Database {
       if (b === null) empty = true;
       else bound = b;
     }
-    const su = empty
-      ? { pages: 0, slabs: 0 }
-      : store.overlapScanUnits(bound, plan.relMasks[0]!);
-    meter.charge(
-      COSTS.pageRead * BigInt(su.pages) +
-        COSTS.valueDecompress * BigInt(su.slabs),
-    );
+    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
+    meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
 
     const limit = plan.limit!;
     const offset = plan.offset ?? 0n;
@@ -7562,10 +6923,7 @@ export class Database {
         // Materialize the touched columns if the lazy load left them unfetched
         // (large-values.md §14) — a fresh copy only when needed (resolveColumns).
         const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-        if (
-          plan.filter !== null &&
-          !isTrue(evalExpr(plan.filter, row, env, meter))
-        ) {
+        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
           return true;
         }
         passed += 1n;
@@ -7611,13 +6969,8 @@ export class Database {
       if (b === null) empty = true;
       else bound = b;
     }
-    const su = empty
-      ? { pages: 0, slabs: 0 }
-      : store.overlapScanUnits(bound, plan.relMasks[0]!);
-    meter.charge(
-      COSTS.pageRead * BigInt(su.pages) +
-        COSTS.valueDecompress * BigInt(su.slabs),
-    );
+    const su = empty ? { pages: 0, slabs: 0 } : store.overlapScanUnits(bound, plan.relMasks[0]!);
+    meter.charge(COSTS.pageRead * BigInt(su.pages) + COSTS.valueDecompress * BigInt(su.slabs));
 
     // A collated ORDER BY cannot use the C-ordered Sorter / spill (collated keys are slice 1e), and
     // collation is in-memory only this slice — so materialize the survivors and sort them with the
@@ -7631,10 +6984,7 @@ export class Database {
           meter.guard();
           meter.charge(COSTS.storageRowRead);
           const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-          if (
-            plan.filter !== null &&
-            !isTrue(evalExpr(plan.filter, row, env, meter))
-          ) {
+          if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
             return true;
           }
           rows.push(row);
@@ -7674,10 +7024,7 @@ export class Database {
         meter.guard(); // enforce the cost ceiling per scanned row (CLAUDE.md §13)
         meter.charge(COSTS.storageRowRead);
         const row = store.resolveColumns(rawRow, plan.relMasks[0]!);
-        if (
-          plan.filter !== null &&
-          !isTrue(evalExpr(plan.filter, row, env, meter))
-        ) {
+        if (plan.filter !== null && !isTrue(evalExpr(plan.filter, row, env, meter))) {
           return true;
         }
         sorter.push(row);
@@ -7691,8 +7038,7 @@ export class Database {
     const offset = plan.offset ?? 0n;
     const start = offset < total ? offset : total;
     let end = total;
-    if (plan.limit !== null && plan.limit < total - start)
-      end = start + plan.limit;
+    if (plan.limit !== null && plan.limit < total - start) end = start + plan.limit;
 
     const sorted = sorter.finish();
     try {
@@ -7772,9 +7118,7 @@ export class Database {
       // (writable-cte.md §3), so its buffer was filled above.
       const src = env.ctes.bindings[ci]!.source;
       if (src.kind !== "query") {
-        throw new Error(
-          "a data-modifying CTE is always materialized, never inlined",
-        );
+        throw new Error("a data-modifying CTE is always materialized, never inlined");
       }
       const r = this.execQueryPlan(src.plan, outer, params, env.ctes);
       meter.charge(r.cost);
@@ -7810,10 +7154,7 @@ export class Database {
     } else if (relBound !== null && relBound.kind === "gin") {
       // Re-find the constant query Q in the WHERE filter (the same conjunct plan-time ginMatch
       // chose — gin.md §6); the @>/&& predicate also stays the residual filter downstream.
-      const m =
-        plan.filter !== null
-          ? ginMatch(plan.filter, relBound.gin.colGlobal)
-          : null;
+      const m = plan.filter !== null ? ginMatch(plan.filter, relBound.gin.colGlobal) : null;
       const r = this.ginBoundRows(
         rel.tableName,
         relBound.gin,
@@ -7933,9 +7274,7 @@ export class Database {
     // CORRELATED LATERAL relation (§44) depends on the left-hand row, so it cannot be materialized up
     // front — an empty placeholder holds its slot and the join loop re-materializes it per left row.
     const materialized: Row[][] = plan.rels.map((rel, ri) =>
-      rel.lateral === true
-        ? []
-        : this.materializeRel(plan, ri, outer, env, params, meter),
+      rel.lateral === true ? [] : this.materializeRel(plan, ri, outer, env, params, meter),
     );
 
     // Left-deep nested-loop join. `running` holds the combined rows over the relations joined
@@ -7947,8 +7286,7 @@ export class Database {
     // no ON (no operator_eval — spec/design/cost.md §3). Output order is deterministic: running
     // order (outer) then right key order (inner), each unmatched left row after its (empty)
     // match run, all unmatched right rows last in right key order (CLAUDE.md §10).
-    const nullRow = (n: number): Row =>
-      Array.from({ length: n }, () => nullValue());
+    const nullRow = (n: number): Row => Array.from({ length: n }, () => nullValue());
     // A FROM-less SELECT has no relations: seed `running` with ONE virtual zero-column row
     // instead of a table's rows (grammar.md §34). No scan ran, so no scan cost accrued.
     let running: Row[] = plan.rels.length === 0 ? [[]] : materialized[0]!;
@@ -7969,14 +7307,7 @@ export class Database {
       // lateral is 42P10), so there is no unmatched-right emission.
       if (plan.rels[k + 1]!.lateral === true) {
         for (const left of running) {
-          const rightRows = this.materializeRel(
-            plan,
-            k + 1,
-            [...outer, left],
-            env,
-            params,
-            meter,
-          );
+          const rightRows = this.materializeRel(plan, k + 1, [...outer, left], env, params, meter);
           let leftMatched = false;
           for (const right of rightRows) {
             const combined = left.concat(right);
@@ -7985,8 +7316,7 @@ export class Database {
               leftMatched = true;
             }
           }
-          if (emitLeft && !leftMatched)
-            next.push(left.concat(nullRow(rightPad)));
+          if (emitLeft && !leftMatched) next.push(left.concat(nullRow(rightPad)));
         }
         running = next;
         continue;
@@ -8007,8 +7337,7 @@ export class Database {
       }
       if (emitRight) {
         for (let ri = 0; ri < rightRows.length; ri++) {
-          if (!rightMatched[ri])
-            next.push(nullRow(leftPad).concat(rightRows[ri]!));
+          if (!rightMatched[ri]) next.push(nullRow(leftPad).concat(rightRows[ri]!));
         }
       }
       running = next;
@@ -8018,11 +7347,7 @@ export class Database {
     // combined row's filter accrues operator_eval.
     const rows: Row[] = [];
     for (const row of running) {
-      if (
-        plan.filter === null ||
-        isTrue(evalExpr(plan.filter, row, env, meter))
-      )
-        rows.push(row);
+      if (plan.filter === null || isTrue(evalExpr(plan.filter, row, env, meter))) rows.push(row);
     }
 
     // ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
@@ -8039,10 +7364,8 @@ export class Database {
     // (CLAUDE.md §8; grammar.md §9). The counts are already non-negative (parser).
     const windowBounds = (len: number): [number, number] => {
       const n = BigInt(len);
-      const start =
-        plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
-      const end =
-        plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
+      const start = plan.offset === null ? 0n : plan.offset < n ? plan.offset : n;
+      const end = plan.limit !== null && plan.limit < n - start ? start + plan.limit : n;
       return [Number(start), Number(end)];
     };
 
@@ -8061,8 +7384,7 @@ export class Database {
       // emits ONE row even over zero input; GROUP BY over an empty table creates no groups ->
       // zero rows. Each (row × aggregate) charges aggregateAccumulate; the bucketing/finalize is
       // unmetered (cost.md §3).
-      const newAccs = (): Acc[] =>
-        plan.aggSpecs.map((s) => newAcc(s.plan, s.floatWidth ?? "f64"));
+      const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAcc(s.plan, s.floatWidth ?? "f64"));
       const index = new Map<string, number>();
       const groups: { keys: Value[]; accs: Acc[] }[] = [];
       if (plan.groupKeys.length === 0) {
@@ -8082,25 +7404,17 @@ export class Database {
         const accs = groups[gi]!.accs;
         plan.aggSpecs.forEach((spec, i) => {
           meter.charge(COSTS.aggregateAccumulate);
-          const v =
-            spec.operand === null
-              ? nullValue()
-              : evalExpr(spec.operand, row, env, meter);
+          const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
           foldAcc(accs[i]!, v, meter);
         });
       }
       // Build one synthetic row per group: [group_key_values..., aggregate_results...].
-      let groupRows = groups.map((g) => [
-        ...g.keys,
-        ...g.accs.map((a) => finalizeAcc(a)),
-      ]);
+      let groupRows = groups.map((g) => [...g.keys, ...g.accs.map((a) => finalizeAcc(a))]);
       // HAVING: filter the grouped rows (after aggregation, before ORDER BY). The predicate is
       // evaluated against each group's synthetic row (charging its operatorEvals per group);
       // only a TRUE result keeps the group. A dropped group charges no rowProduced (§8).
       if (plan.having !== null) {
-        groupRows = groupRows.filter((srow) =>
-          isTrue(evalExpr(plan.having!, srow, env, meter)),
-        );
+        groupRows = groupRows.filter((srow) => isTrue(evalExpr(plan.having!, srow, env, meter)));
       }
       // ORDER BY over the grouped output (keys are synthetic group-key slots).
       if (plan.order.length > 0) {
@@ -8206,26 +7520,19 @@ export class Database {
     cost: { value: bigint },
   ): void {
     for (const j of sp.joins)
-      if (j.on !== null)
-        j.on = this.foldUncorrelatedInRExpr(j.on, bound, ctes, cost);
-    if (sp.filter !== null)
-      sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost);
-    if (sp.having !== null)
-      sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost);
+      if (j.on !== null) j.on = this.foldUncorrelatedInRExpr(j.on, bound, ctes, cost);
+    if (sp.filter !== null) sp.filter = this.foldUncorrelatedInRExpr(sp.filter, bound, ctes, cost);
+    if (sp.having !== null) sp.having = this.foldUncorrelatedInRExpr(sp.having, bound, ctes, cost);
     for (const s of sp.aggSpecs) {
       if (s.operand !== null)
         s.operand = this.foldUncorrelatedInRExpr(s.operand, bound, ctes, cost);
     }
-    sp.projections = sp.projections.map((p) =>
-      this.foldUncorrelatedInRExpr(p, bound, ctes, cost),
-    );
+    sp.projections = sp.projections.map((p) => this.foldUncorrelatedInRExpr(p, bound, ctes, cost));
     // A set-returning relation's arguments may themselves contain an (uncorrelated) subquery to
     // fold once before the generator runs (functions.md §10).
     for (const rel of sp.rels) {
       if (rel.srf !== undefined) {
-        rel.srf.args = rel.srf.args.map((a) =>
-          this.foldUncorrelatedInRExpr(a, bound, ctes, cost),
-        );
+        rel.srf.args = rel.srf.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
       }
     }
   }
@@ -8242,8 +7549,7 @@ export class Database {
       case "subquery": {
         // Bottom-up: fold within this subquery's own sub-plan (and its IN lhs) first, so a
         // globally-uncorrelated subquery nested inside it is already a constant before we run it.
-        if (e.lhs !== null)
-          e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
+        if (e.lhs !== null) e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
         this.foldUncorrelatedInPlan(e.plan, bound, ctes, cost);
         if (queryPlanReferencesOuter(e.plan, 0)) return e; // correlated — re-run per outer row
         // Uncorrelated: execute ONCE and fold to a constant / inValues.
@@ -8256,9 +7562,7 @@ export class Database {
               "more than one row returned by a subquery used as an expression",
             );
           }
-          return valueToRExpr(
-            r.rows.length === 1 ? r.rows[0]![0]! : nullValue(),
-          );
+          return valueToRExpr(r.rows.length === 1 ? r.rows[0]![0]! : nullValue());
         }
         if (e.subKind === "exists") {
           return { kind: "constBool", value: r.rows.length > 0 !== e.negated };
@@ -8309,19 +7613,13 @@ export class Database {
       case "rangeOp":
       case "rangeSetOp":
       case "variadic":
-        e.args = e.args.map((a) =>
-          this.foldUncorrelatedInRExpr(a, bound, ctes, cost),
-        );
+        e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
         return e;
       case "row":
-        e.fields = e.fields.map((f) =>
-          this.foldUncorrelatedInRExpr(f, bound, ctes, cost),
-        );
+        e.fields = e.fields.map((f) => this.foldUncorrelatedInRExpr(f, bound, ctes, cost));
         return e;
       case "array":
-        e.elements = e.elements.map((el) =>
-          this.foldUncorrelatedInRExpr(el, bound, ctes, cost),
-        );
+        e.elements = e.elements.map((el) => this.foldUncorrelatedInRExpr(el, bound, ctes, cost));
         return e;
       case "field":
         e.base = this.foldUncorrelatedInRExpr(e.base, bound, ctes, cost);
@@ -8369,11 +7667,7 @@ export class Database {
 // no-op charge, driven by the consuming for-of's first next()), so the accrued total never moves. The
 // consumer drains it fully in this slice (no short-circuit), keeping the laziness unobservable and the
 // cost identical to Go/Rust.
-function* scanSource(
-  rows: Row[],
-  nodeCount: number,
-  meter: Meter,
-): Generator<Row> {
+function* scanSource(rows: Row[], nodeCount: number, meter: Meter): Generator<Row> {
   meter.charge(COSTS.pageRead * BigInt(nodeCount));
   for (const row of rows) {
     // Enforce the cost ceiling before pulling the next row (CLAUDE.md §13): a runaway scan (or a
@@ -8465,11 +7759,7 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
     // point-lookup is deferred for containers (ranges.md §10); the index is still maintained.
     const ty = typeAsScalar(rel.table.columns[ci]!.type);
     if (ty === undefined) continue;
-    if (
-      idx.columns
-        .slice(1)
-        .some((c) => typeAsScalar(rel.table.columns[c]!.type) === undefined)
-    ) {
+    if (idx.columns.slice(1).some((c) => typeAsScalar(rel.table.columns[c]!.type) === undefined)) {
       continue;
     }
     const bp = detectPkBound(filter, rel.offset + ci, ty);
@@ -8478,9 +7768,7 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
       for (const t of bp.terms) if (t.op === "eq") eqs.push(t.src);
     }
     if (eqs.length > 0) {
-      const tailTypes = idx.columns
-        .slice(1)
-        .map((c) => typeScalar(rel.table.columns[c]!.type));
+      const tailTypes = idx.columns.slice(1).map((c) => typeScalar(rel.table.columns[c]!.type));
       return {
         kind: "index",
         index: { nameKey: idx.name.toLowerCase(), colType: ty, eqs, tailTypes },
@@ -8488,12 +7776,7 @@ function detectScanBound(filter: RExpr, rel: ScopeRel): ScanBound | null {
     }
   }
   // GIN bound (gin.md §6) — after the PK and ordered-index equality bounds.
-  const gb = detectGinBound(
-    filter,
-    rel.table.indexes,
-    rel.table.columns,
-    rel.offset,
-  );
+  const gb = detectGinBound(filter, rel.table.indexes, rel.table.columns, rel.offset);
   return gb !== null ? { kind: "gin", gin: gb } : null;
 }
 
@@ -8617,9 +7900,8 @@ function rexprIsConstant(e: RExpr): boolean {
       return rexprIsConstant(e.lhs) && rexprIsConstant(e.rhs);
     case "case":
       return (
-        e.arms.every(
-          (a) => rexprIsConstant(a.cond) && rexprIsConstant(a.result),
-        ) && rexprIsConstant(e.els)
+        e.arms.every((a) => rexprIsConstant(a.cond) && rexprIsConstant(a.result)) &&
+        rexprIsConstant(e.els)
       );
     case "scalarFunc":
     case "arrayFunc":
@@ -8658,24 +7940,15 @@ function indexEntryKey(
     if (v.kind === "null") {
       parts.push(Uint8Array.of(0x01));
     } else if (v.kind === "int") {
-      parts.push(
-        Uint8Array.of(0x00),
-        encodeInt(typeScalar(columns[ci]!.type), v.int),
-      );
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.int));
     } else if (v.kind === "bool") {
       parts.push(Uint8Array.of(0x00), encodeBool(v.value));
     } else if (v.kind === "uuid") {
       parts.push(Uint8Array.of(0x00), v.bytes);
     } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
-      parts.push(
-        Uint8Array.of(0x00),
-        encodeInt(typeScalar(columns[ci]!.type), v.micros),
-      );
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.micros));
     } else if (v.kind === "date") {
-      parts.push(
-        Uint8Array.of(0x00),
-        encodeInt(typeScalar(columns[ci]!.type), v.days),
-      );
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.days));
     } else if (v.kind === "text") {
       // text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
       parts.push(Uint8Array.of(0x00), collatedTextKey(colls[ci]!, v.text));
@@ -8687,14 +7960,9 @@ function indexEntryKey(
       parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
     } else if (v.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11)
-      parts.push(
-        Uint8Array.of(0x00),
-        encodeTypedKey(columns[ci]!.type, v, null),
-      );
+      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
     } else {
-      throw new Error(
-        "an index column is a key-encodable type (CREATE INDEX gate)",
-      );
+      throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
     }
   }
   parts.push(storageKey);
@@ -8915,25 +8183,20 @@ type ConflictPlan = {
 // column list is matched as an order-independent SET against a unique index / the primary key (no
 // match → 42P10); ON CONSTRAINT name names a unique index or the synthesized <table>_pkey (miss →
 // 42704). A null target → null arbiter (legal only with DO NOTHING).
-function resolveArbiter(
-  table: Table,
-  target: ConflictTarget | null,
-): Arbiter | null {
+function resolveArbiter(table: Table, target: ConflictTarget | null): Arbiter | null {
   if (target === null) return null;
   const pk = pkIndices(table);
   if (target.kind === "columns") {
     const want = new Set<number>();
     for (const c of target.columns) {
       const idx = columnIndex(table, c);
-      if (idx < 0)
-        throw engineError("undefined_column", "column does not exist: " + c);
+      if (idx < 0) throw engineError("undefined_column", "column does not exist: " + c);
       want.add(idx);
     }
     if (pk.length > 0 && sameIntSet(pk, want)) return { isPK: true };
     for (let i = 0; i < table.indexes.length; i++) {
       const def = table.indexes[i]!;
-      if (def.unique && sameIntSet(def.columns, want))
-        return { isPK: false, indexPos: i };
+      if (def.unique && sameIntSet(def.columns, want)) return { isPK: false, indexPos: i };
     }
     throw engineError(
       "invalid_column_reference",
@@ -8941,8 +8204,7 @@ function resolveArbiter(
     );
   }
   const pkey = table.name.toLowerCase() + "_pkey";
-  if (pk.length > 0 && target.name.toLowerCase() === pkey)
-    return { isPK: true };
+  if (pk.length > 0 && target.name.toLowerCase() === pkey) return { isPK: true };
   for (let i = 0; i < table.indexes.length; i++) {
     const def = table.indexes[i]!;
     if (def.unique && def.name.toLowerCase() === target.name.toLowerCase())
@@ -8973,12 +8235,7 @@ function arbiterKey(
   row: Row,
 ): Uint8Array | null {
   if (arb.isPK) return encodePkKey(table, pk, colls, row);
-  return indexPrefixKey(
-    table.columns,
-    colls,
-    table.indexes[arb.indexPos]!,
-    row,
-  );
+  return indexPrefixKey(table.columns, colls, table.indexes[arb.indexPos]!, row);
 }
 
 // indexPrefixKey builds a row's UNIQUENESS PROBE KEY for one unique index
@@ -8997,24 +8254,15 @@ function indexPrefixKey(
     if (v.kind === "null") {
       return null;
     } else if (v.kind === "int") {
-      parts.push(
-        Uint8Array.of(0x00),
-        encodeInt(typeScalar(columns[ci]!.type), v.int),
-      );
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.int));
     } else if (v.kind === "bool") {
       parts.push(Uint8Array.of(0x00), encodeBool(v.value));
     } else if (v.kind === "uuid") {
       parts.push(Uint8Array.of(0x00), v.bytes);
     } else if (v.kind === "timestamp" || v.kind === "timestamptz") {
-      parts.push(
-        Uint8Array.of(0x00),
-        encodeInt(typeScalar(columns[ci]!.type), v.micros),
-      );
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.micros));
     } else if (v.kind === "date") {
-      parts.push(
-        Uint8Array.of(0x00),
-        encodeInt(typeScalar(columns[ci]!.type), v.days),
-      );
+      parts.push(Uint8Array.of(0x00), encodeInt(typeScalar(columns[ci]!.type), v.days));
     } else if (v.kind === "text") {
       // text: C terminated-escape (§2.4) or the collated UCA sort key (§2.12).
       parts.push(Uint8Array.of(0x00), collatedTextKey(colls[ci]!, v.text));
@@ -9026,14 +8274,9 @@ function indexPrefixKey(
       parts.push(Uint8Array.of(0x00), intervalEncodeKey(v.iv));
     } else if (v.kind === "range") {
       // the recursive range-bounds container key (encoding.md §2.11)
-      parts.push(
-        Uint8Array.of(0x00),
-        encodeTypedKey(columns[ci]!.type, v, null),
-      );
+      parts.push(Uint8Array.of(0x00), encodeTypedKey(columns[ci]!.type, v, null));
     } else {
-      throw new Error(
-        "an index column is a key-encodable type (CREATE INDEX gate)",
-      );
+      throw new Error("an index column is a key-encodable type (CREATE INDEX gate)");
     }
   }
   const total = parts.reduce((acc, b) => acc + b.length, 0);
@@ -9066,16 +8309,10 @@ function bytesEq(a: Uint8Array, b: Uint8Array): boolean {
 // text-terminated-escape body (§2.4). The sort key throws (0A000) on a code point the collation does
 // not map — propagated, so a collated INSERT of an unmapped string aborts the write.
 function collatedTextKey(coll: Collation | null, s: string): Uint8Array {
-  return coll !== null
-    ? collationSortKey(coll, s)
-    : encodeTerminated(SQL_BYTE_ENCODER.encode(s));
+  return coll !== null ? collationSortKey(coll, s) : encodeTerminated(SQL_BYTE_ENCODER.encode(s));
 }
 
-function encodeKeyValue(
-  ty: ScalarType,
-  value: Value,
-  coll: Collation | null,
-): Uint8Array {
+function encodeKeyValue(ty: ScalarType, value: Value, coll: Collation | null): Uint8Array {
   if (value.kind === "int") return encodeInt(ty, value.int);
   if (value.kind === "bool") return encodeBool(value.value);
   if (value.kind === "uuid") return value.bytes.slice();
@@ -9086,9 +8323,7 @@ function encodeKeyValue(
   if (value.kind === "bytea") return encodeTerminated(value.bytes);
   if (value.kind === "decimal") return value.dec.encodeKey();
   if (value.kind === "interval") return intervalEncodeKey(value.iv);
-  throw new Error(
-    "a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)",
-  );
+  throw new Error("a foreign-key column is a key-encodable type (CREATE TABLE §6.2 gate)");
 }
 
 // encodeTypedKey is the order-preserving key bytes for one keyable value given its column Type — the
@@ -9098,11 +8333,7 @@ function encodeKeyValue(
 // encodeKeyValue. value is non-NULL (callers handle the NULL slot tag), and a range column always
 // holds a range value, so the scalar arm never sees a range type. coll selects a text column's key
 // form (§2.12); it never applies to a range element (no range subtype is text).
-function encodeTypedKey(
-  ty: Type,
-  value: Value,
-  coll: Collation | null,
-): Uint8Array {
+function encodeTypedKey(ty: Type, value: Value, coll: Collation | null): Uint8Array {
   if (value.kind === "range") {
     if (ty.kind !== "range") {
       throw new Error("a range key value has a range column type");
@@ -9157,29 +8388,15 @@ function fkProbe(
   if (parent.pk.length > 0 && sameSet(pkSet, refSet)) {
     const parts: Uint8Array[] = [];
     for (const pcol of parent.pk) {
-      parts.push(
-        encodeTypedKey(
-          parent.columns[pcol]!.type,
-          valueFor(pcol),
-          parentColls[pcol]!,
-        ),
-      );
+      parts.push(encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!));
     }
     return { kind: "pk", bytes: concatBytes(parts) };
   }
-  const idx = parent.indexes.find(
-    (i) => i.unique && sameSet(sortedUnique(i.columns), refSet),
-  )!;
+  const idx = parent.indexes.find((i) => i.unique && sameSet(sortedUnique(i.columns), refSet))!;
   const parts: Uint8Array[] = [];
   for (const pcol of idx.columns) {
     parts.push(Uint8Array.of(0x00));
-    parts.push(
-      encodeTypedKey(
-        parent.columns[pcol]!.type,
-        valueFor(pcol),
-        parentColls[pcol]!,
-      ),
-    );
+    parts.push(encodeTypedKey(parent.columns[pcol]!.type, valueFor(pcol), parentColls[pcol]!));
   }
   return {
     kind: "unique",
@@ -9222,12 +8439,9 @@ function sameSet(a: number[], b: number[]): boolean {
 // type), but the comparison is full structural for completeness, mirroring Rust's `ty == ty`.
 function fkTypesEqual(a: Type, b: Type): boolean {
   if (a.kind === "scalar" && b.kind === "scalar") return a.scalar === b.scalar;
-  if (a.kind === "composite" && b.kind === "composite")
-    return a.name === b.name;
-  if (a.kind === "array" && b.kind === "array")
-    return fkTypesEqual(a.elem, b.elem);
-  if (a.kind === "range" && b.kind === "range")
-    return fkTypesEqual(a.elem, b.elem);
+  if (a.kind === "composite" && b.kind === "composite") return a.name === b.name;
+  if (a.kind === "array" && b.kind === "array") return fkTypesEqual(a.elem, b.elem);
+  if (a.kind === "range" && b.kind === "range") return fkTypesEqual(a.elem, b.elem);
   return false;
 }
 
@@ -9237,12 +8451,8 @@ function fkTypesEqual(a: Type, b: Type): boolean {
 function fkAction(a: RefAction, clause: string): FkAction {
   if (a === "noAction") return "noAction";
   if (a === "restrict") return "restrict";
-  const word =
-    a === "cascade" ? "CASCADE" : a === "setNull" ? "SET NULL" : "SET DEFAULT";
-  throw engineError(
-    "feature_not_supported",
-    "ON " + clause + " " + word + " is not supported",
-  );
+  const word = a === "cascade" ? "CASCADE" : a === "setNull" ? "SET NULL" : "SET DEFAULT";
+  throw engineError("feature_not_supported", "ON " + clause + " " + word + " is not supported");
 }
 
 // prefixSuccessor is the byte-successor of a prefix: the smallest byte string greater
@@ -9267,19 +8477,12 @@ type PkBound = { pkType: ScalarType; terms: BoundTerm[] };
 
 // BoundKey is the outcome of encoding a const-source into the PK key space: a usable key, a NULL const
 // (the comparison is 3VL-unknown ⇒ empty range), or an out-of-range integer (drop this half-bound).
-type BoundKey =
-  | { kind: "key"; key: Uint8Array }
-  | { kind: "null" }
-  | { kind: "outOfRange" };
+type BoundKey = { kind: "key"; key: Uint8Array } | { kind: "null" } | { kind: "outOfRange" };
 
 // detectPkBound flattens the WHERE's top-level AND-chain (an OR is never descended — a disjunction is
 // not a contiguous range) and collects every `pk <cmp> const-source` conjunct. null ⇒ full scan.
 // Conservative + sound: an unrecognized conjunct contributes no bound and stays in the residual filter.
-function detectPkBound(
-  filter: RExpr,
-  pkIdx: number,
-  pkType: ScalarType,
-): PkBound | null {
+function detectPkBound(filter: RExpr, pkIdx: number, pkType: ScalarType): PkBound | null {
   const terms: BoundTerm[] = [];
   const walk = (e: RExpr): void => {
     if (e.kind === "and") {
@@ -9298,29 +8501,17 @@ function detectPkBound(
 // PK column ("column" at pkIdx — a correlated "outerColumn" is a different kind, so it never matches) on
 // one side and a const-source of the PK's own type on the other (a promoted comparison — e.g. intpk = 2.5
 // → a constDecimal — does not match, so it stays residual). The op is flipped when the PK is on the right.
-function asBoundTerm(
-  e: RExpr,
-  pkIdx: number,
-  pkType: ScalarType,
-): BoundTerm | null {
+function asBoundTerm(e: RExpr, pkIdx: number, pkType: ScalarType): BoundTerm | null {
   if (e.kind !== "compare") return null;
   // A collated comparison orders by the collation's UCA sort key, but the PK/index B-tree is byte (C)
   // ordered, so a byte-range bound would be wrong — exclude it (it stays a full scan + the residual
   // collated filter; spec/design/collation.md §8, collated keys are slice 1e).
   if (e.collation !== null) return null;
-  if (
-    e.op !== "eq" &&
-    e.op !== "lt" &&
-    e.op !== "le" &&
-    e.op !== "gt" &&
-    e.op !== "ge"
-  )
+  if (e.op !== "eq" && e.op !== "lt" && e.op !== "le" && e.op !== "gt" && e.op !== "ge")
     return null;
   const isPk = (x: RExpr): boolean => x.kind === "column" && x.index === pkIdx;
-  if (isPk(e.lhs) && isConstSource(e.rhs, pkType))
-    return { op: e.op, src: e.rhs };
-  if (isPk(e.rhs) && isConstSource(e.lhs, pkType))
-    return { op: flipCmp(e.op), src: e.lhs };
+  if (isPk(e.lhs) && isConstSource(e.rhs, pkType)) return { op: e.op, src: e.rhs };
+  if (isPk(e.rhs) && isConstSource(e.lhs, pkType)) return { op: flipCmp(e.op), src: e.lhs };
   return null;
 }
 
@@ -9383,11 +8574,7 @@ function flipCmp(op: BinaryOp): BinaryOp {
 // half-bound (a wider, still sound, scan).
 // outer carries the enclosing rows (innermost last) so a correlated "outerColumn" source resolves to
 // the current outer row's value; it is empty for a top-level statement.
-function buildKeyBound(
-  bp: PkBound,
-  params: Value[],
-  outer: Row[],
-): KeyBound | null {
+function buildKeyBound(bp: PkBound, params: Value[], outer: Row[]): KeyBound | null {
   const b = unboundedBound();
   for (const t of bp.terms) {
     const r = encodeBoundKey(bp.pkType, t.src, params, outer);
@@ -9420,12 +8607,7 @@ function buildKeyBound(
 // encodeInt for integer/timestamp widths, the raw 16 bytes for uuid, the 1-byte bool-byte for boolean).
 // param/outerColumn resolve to a runtime Value first (the param table / the enclosing outer row) and
 // then encode through the shared path.
-function encodeBoundKey(
-  pkType: ScalarType,
-  src: RExpr,
-  params: Value[],
-  outer: Row[],
-): BoundKey {
+function encodeBoundKey(pkType: ScalarType, src: RExpr, params: Value[], outer: Row[]): BoundKey {
   switch (src.kind) {
     case "constNull":
       return { kind: "null" };
@@ -9457,10 +8639,7 @@ function encodeBoundKey(
     case "outerColumn":
       // A correlated reference: column index of the enclosing row level hops out — the same indexing
       // the evaluator uses for "outerColumn" (innermost outer row is last).
-      return encodeValueKey(
-        pkType,
-        outer[outer.length - src.level]![src.index]!,
-      );
+      return encodeValueKey(pkType, outer[outer.length - src.level]![src.index]!);
     default:
       return { kind: "outOfRange" };
   }
@@ -9478,11 +8657,9 @@ function encodeValueKey(pkType: ScalarType, v: Value): BoundKey {
       kind: "key",
       key: encodeTerminated(SQL_BYTE_ENCODER.encode(v.text)),
     };
-  if (v.kind === "bytea")
-    return { kind: "key", key: encodeTerminated(v.bytes) };
+  if (v.kind === "bytea") return { kind: "key", key: encodeTerminated(v.bytes) };
   if (v.kind === "decimal") return { kind: "key", key: v.dec.encodeKey() };
-  if (v.kind === "interval")
-    return { kind: "key", key: intervalEncodeKey(v.iv) };
+  if (v.kind === "interval") return { kind: "key", key: intervalEncodeKey(v.iv) };
   if (v.kind === "int")
     return inRange(pkType, v.int)
       ? { kind: "key", key: encodeInt(pkType, v.int) }
@@ -9574,10 +8751,7 @@ function scanEntries(
 // or leave (correlated) it.
 function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
   if (plan.kind === "setOp") {
-    return (
-      queryPlanReferencesOuter(plan.lhs, depth) ||
-      queryPlanReferencesOuter(plan.rhs, depth)
-    );
+    return queryPlanReferencesOuter(plan.lhs, depth) || queryPlanReferencesOuter(plan.rhs, depth);
   }
   if (plan.kind === "values") {
     // A VALUES body is planned parent=null, so its values hold no outer reference of their own; a
@@ -9591,31 +8765,21 @@ function queryPlanReferencesOuter(plan: QueryPlan, depth: number): boolean {
     // planned parent=null (no outer reference), so only the body can correlate (cte.md §7).
     return queryPlanReferencesOuter(plan.body, depth);
   }
-  for (const j of plan.joins)
-    if (j.on !== null && rexprReferencesOuter(j.on, depth)) return true;
-  if (plan.filter !== null && rexprReferencesOuter(plan.filter, depth))
-    return true;
-  if (plan.having !== null && rexprReferencesOuter(plan.having, depth))
-    return true;
+  for (const j of plan.joins) if (j.on !== null && rexprReferencesOuter(j.on, depth)) return true;
+  if (plan.filter !== null && rexprReferencesOuter(plan.filter, depth)) return true;
+  if (plan.having !== null && rexprReferencesOuter(plan.having, depth)) return true;
   for (const s of plan.aggSpecs)
-    if (s.operand !== null && rexprReferencesOuter(s.operand, depth))
-      return true;
-  for (const p of plan.projections)
-    if (rexprReferencesOuter(p, depth)) return true;
+    if (s.operand !== null && rexprReferencesOuter(s.operand, depth)) return true;
+  for (const p of plan.projections) if (rexprReferencesOuter(p, depth)) return true;
   // A set-returning relation's arguments may carry a correlated reference (an implicitly-lateral SRF
   // arg sees params / outer / an earlier sibling — functions.md §10, grammar.md §44), making the
   // enclosing query correlated. A LATERAL derived table's body is one frame deeper; a reference in it
   // back into this query's outer counts here too (§44).
   for (const rel of plan.rels) {
     if (rel.srf !== undefined) {
-      for (const a of rel.srf.args)
-        if (rexprReferencesOuter(a, depth)) return true;
+      for (const a of rel.srf.args) if (rexprReferencesOuter(a, depth)) return true;
     }
-    if (
-      rel.derived !== undefined &&
-      queryPlanReferencesOuter(rel.derived, depth + 1)
-    )
-      return true;
+    if (rel.derived !== undefined && queryPlanReferencesOuter(rel.derived, depth + 1)) return true;
   }
   return false;
 }
@@ -9633,10 +8797,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "inValues":
       return rexprReferencesOuter(e.lhs, depth);
     case "quantified":
-      return (
-        rexprReferencesOuter(e.lhs, depth) ||
-        rexprReferencesOuter(e.array, depth)
-      );
+      return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.array, depth);
     case "cast":
     case "neg":
     case "not":
@@ -9648,15 +8809,11 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "or":
     case "distinct":
     case "like":
-      return (
-        rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth)
-      );
+      return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth);
     case "case":
       return (
         e.arms.some(
-          (arm) =>
-            rexprReferencesOuter(arm.cond, depth) ||
-            rexprReferencesOuter(arm.result, depth),
+          (arm) => rexprReferencesOuter(arm.cond, depth) || rexprReferencesOuter(arm.result, depth),
         ) || rexprReferencesOuter(e.els, depth)
       );
     case "scalarFunc":
@@ -9676,9 +8833,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "subscript":
       return (
         rexprReferencesOuter(e.base, depth) ||
-        rSubscriptBounds(e.subscripts).some((b) =>
-          rexprReferencesOuter(b, depth),
-        )
+        rSubscriptBounds(e.subscripts).some((b) => rexprReferencesOuter(b, depth))
       );
     default:
       return false; // leaves: column, param, const*
@@ -9767,8 +8922,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       return;
     case "subscript":
       collectTouched(e.base, depth, touched);
-      for (const b of rSubscriptBounds(e.subscripts))
-        collectTouched(b, depth, touched);
+      for (const b of rSubscriptBounds(e.subscripts)) collectTouched(b, depth, touched);
       return;
     default: // leaves: param, const*
   }
@@ -9777,22 +8931,16 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
 // collectTouchedPlan walks a nested plan's expression surfaces for outer references back into
 // the target scope — the same five surfaces selectPlanReferencesOuter checks (slot lists like
 // group keys / ORDER BY index the nested plan's own rows and can never reach outward).
-function collectTouchedPlan(
-  plan: QueryPlan,
-  depth: number,
-  touched: boolean[],
-): void {
+function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]): void {
   if (plan.kind === "select") {
-    for (const j of plan.joins)
-      if (j.on !== null) collectTouched(j.on, depth, touched);
+    for (const j of plan.joins) if (j.on !== null) collectTouched(j.on, depth, touched);
     if (plan.filter !== null) collectTouched(plan.filter, depth, touched);
     if (plan.having !== null) collectTouched(plan.having, depth, touched);
     for (const s of plan.aggSpecs)
       if (s.operand !== null) collectTouched(s.operand, depth, touched);
     for (const p of plan.projections) collectTouched(p, depth, touched);
   } else if (plan.kind === "values") {
-    for (const row of plan.rows)
-      for (const e of row) collectTouched(e, depth, touched);
+    for (const row of plan.rows) for (const e of row) collectTouched(e, depth, touched);
   } else if (plan.kind === "with") {
     // A nested WITH's correlated references live in its body (the CTE bodies are parent=null);
     // recurse into the body at the same depth (spec/design/cte.md §7).
@@ -10490,9 +9638,7 @@ type CteBinding = {
 // holds a planned query body; a DATA-MODIFYING CTE holds the statement to execute (for its effect +
 // RETURNING buffer). A data-modifying CTE is always materialized (writable-cte.md §3), so the
 // inline-execution path never touches a "dml" source.
-type CteSource =
-  | { kind: "query"; plan: QueryPlan }
-  | { kind: "dml"; dm: DmCte };
+type CteSource = { kind: "query"; plan: QueryPlan } | { kind: "dml"; dm: DmCte };
 
 // DmCte is a data-modifying CTE's body (spec/design/writable-cte.md): the INSERT/UPDATE/DELETE to run
 // (cloned from the AST, executed with the statement's CTE context threaded in) and whether it has no
@@ -10692,9 +9838,7 @@ function finalizeAcc(a: Acc): Value {
     case "avg":
       // div cap-checks its (in-range) result; the over-cap-capable running sum is never surfaced
       // directly, so AVG matches PG even when SUM would overflow.
-      return a.count === 0n
-        ? nullValue()
-        : decimalValue(a.sumDec.div(Decimal.fromBigInt(a.count)));
+      return a.count === 0n ? nullValue() : decimalValue(a.sumDec.div(Decimal.fromBigInt(a.count)));
     case "sumFloat": {
       if (!a.seen) return nullValue(); // empty / all-NULL group → NULL
       const s = floatCanonicalSum(a.floats, a.floatWidth);
@@ -10798,19 +9942,13 @@ function exprHasAggregate(e: Expr): boolean {
     case "in":
       return exprHasAggregate(e.lhs) || e.list.some(exprHasAggregate);
     case "between":
-      return (
-        exprHasAggregate(e.lhs) ||
-        exprHasAggregate(e.lo) ||
-        exprHasAggregate(e.hi)
-      );
+      return exprHasAggregate(e.lhs) || exprHasAggregate(e.lo) || exprHasAggregate(e.hi);
     case "like":
       return exprHasAggregate(e.lhs) || exprHasAggregate(e.rhs);
     case "case":
       return (
         (e.operand !== null && exprHasAggregate(e.operand)) ||
-        e.whens.some(
-          (w) => exprHasAggregate(w.cond) || exprHasAggregate(w.result),
-        ) ||
+        e.whens.some((w) => exprHasAggregate(w.cond) || exprHasAggregate(w.result)) ||
         (e.els !== null && exprHasAggregate(e.els))
       );
     case "row":
@@ -10821,10 +9959,7 @@ function exprHasAggregate(e: Expr): boolean {
     case "fieldStar":
       return exprHasAggregate(e.base);
     case "subscript":
-      return (
-        exprHasAggregate(e.base) ||
-        astSubscriptExprs(e.subscripts).some(exprHasAggregate)
-      );
+      return exprHasAggregate(e.base) || astSubscriptExprs(e.subscripts).some(exprHasAggregate);
     case "quantified":
       return exprHasAggregate(e.lhs) || exprHasAggregate(e.array);
     default:
@@ -10851,10 +9986,7 @@ function evalChecks(
     if (v.kind === "bool" && !v.value) {
       throw engineError(
         "check_violation",
-        "new row for relation " +
-          relation +
-          " violates check constraint " +
-          c.name,
+        "new row for relation " + relation + " violates check constraint " + c.name,
       );
     }
   }
@@ -10871,15 +10003,9 @@ function rejectCheckStructure(e: Expr): void {
     case "exists":
     case "inSubquery":
     case "quantifiedSubquery":
-      throw engineError(
-        "feature_not_supported",
-        "cannot use subquery in check constraint",
-      );
+      throw engineError("feature_not_supported", "cannot use subquery in check constraint");
     case "param":
-      throw engineError(
-        "undefined_parameter",
-        "there is no parameter $" + e.index.toString(),
-      );
+      throw engineError("undefined_parameter", "there is no parameter $" + e.index.toString());
     case "funcCall":
       if (isAggregateName(e.name)) {
         throw engineError(
@@ -10956,15 +10082,9 @@ function rejectDefaultStructure(e: Expr): void {
     case "exists":
     case "inSubquery":
     case "quantifiedSubquery":
-      throw engineError(
-        "feature_not_supported",
-        "cannot use subquery in DEFAULT expression",
-      );
+      throw engineError("feature_not_supported", "cannot use subquery in DEFAULT expression");
     case "param":
-      throw engineError(
-        "undefined_parameter",
-        "there is no parameter $" + e.index.toString(),
-      );
+      throw engineError("undefined_parameter", "there is no parameter $" + e.index.toString());
     case "funcCall":
       if (isAggregateName(e.name)) {
         throw engineError(
@@ -11013,8 +10133,7 @@ function rejectDefaultStructure(e: Expr): void {
       return rejectDefaultStructure(e.base);
     case "subscript":
       rejectDefaultStructure(e.base);
-      for (const x of astSubscriptExprs(e.subscripts))
-        rejectDefaultStructure(x);
+      for (const x of astSubscriptExprs(e.subscripts)) rejectDefaultStructure(x);
       return;
     case "quantified":
       rejectDefaultStructure(e.lhs);
@@ -11108,10 +10227,7 @@ function resolveAggregate(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (!ag.collecting) {
-    throw engineError(
-      "grouping_error",
-      "aggregate functions are not allowed here",
-    );
+    throw engineError("grouping_error", "aggregate functions are not allowed here");
   }
   const name = e.name.toLowerCase();
   const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
@@ -11123,10 +10239,7 @@ function resolveAggregate(
   if (e.star) {
     // Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
     if (!aggregateHasStar(name))
-      throw engineError(
-        "syntax_error",
-        "* is only valid as the argument of COUNT",
-      );
+      throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     plan = "countStar";
     operand = null;
     result = { kind: "int", ty: "i64" };
@@ -11171,18 +10284,12 @@ function collectColumn(
 
 // noAggOverload is 42883 — an aggregate over an operand family it has no overload for.
 function noAggOverload(fn: string): EngineError {
-  return engineError(
-    "undefined_function",
-    "no " + fn + " aggregate for that argument type",
-  );
+  return engineError("undefined_function", "no " + fn + " aggregate for that argument type");
 }
 
 // noFuncOverload is 42883 — a scalar function over argument types it has no overload for.
 function noFuncOverload(fn: string): EngineError {
-  return engineError(
-    "undefined_function",
-    "no " + fn + " function for those argument types",
-  );
+  return engineError("undefined_function", "no " + fn + " function for those argument types");
 }
 
 // === Function registry (spec/design/extensibility.md §5) ============================
@@ -11253,18 +10360,13 @@ function isScalarFuncName(name: string): boolean {
 // isVariadicFuncName reports whether name (lowercased) is a VARIADIC scalar function
 // (array-functions.md §12) — a kind === "function" row with `variadic` set (num_nulls/num_nonnulls).
 function isVariadicFuncName(name: string): boolean {
-  return OPERATORS.some(
-    (o) => o.kind === "function" && o.variadic && o.name === name,
-  );
+  return OPERATORS.some((o) => o.kind === "function" && o.variadic && o.name === name);
 }
 
 // lookupScalarOverload returns the matched scalar-function overload row for name over the resolved
 // argument types: the kind === "function" catalog row whose argFamilies agree by arity + per-slot
 // family. undefined ⇒ no overload (42883). make_interval resolves on its own path (§11).
-function lookupScalarOverload(
-  name: string,
-  tys: ResolvedType[],
-): OperatorDesc | undefined {
+function lookupScalarOverload(name: string, tys: ResolvedType[]): OperatorDesc | undefined {
   return OPERATORS.find(
     (o) =>
       o.kind === "function" &&
@@ -11294,26 +10396,20 @@ function resolvedScalarType(t: ResolvedType): ScalarType {
 function scalarResultType(code: string, tys: ResolvedType[]): ScalarType {
   if (code === "promoted") return resolvedScalarType(tys[0]!);
   const ty = scalarTypeFromName(code);
-  if (ty === undefined)
-    throw new Error("scalarResultType: unknown result code " + code);
+  if (ty === undefined) throw new Error("scalarResultType: unknown result code " + code);
   return ty;
 }
 
 // aggregateHasStar reports whether aggregate surface (lowercased) has a COUNT(*)-style star
 // overload — only COUNT does. The data-driven replacement for the special-cased star arm.
 function aggregateHasStar(surface: string): boolean {
-  return AGGREGATES.some(
-    (a) => a.surface.toLowerCase() === surface && a.arg === "star",
-  );
+  return AGGREGATES.some((a) => a.surface.toLowerCase() === surface && a.arg === "star");
 }
 
 // lookupAggregateOverload returns the matched aggregate overload row for surface (lowercased) over
 // a single operand of resolved type t: the arg === "expr" catalog row whose lone argFamilies slot
 // matches. undefined ⇒ no overload (42883, e.g. SUM(text)). MIN/MAX/COUNT take "any".
-function lookupAggregateOverload(
-  surface: string,
-  t: ResolvedType,
-): AggregateDesc | undefined {
+function lookupAggregateOverload(surface: string, t: ResolvedType): AggregateDesc | undefined {
   return AGGREGATES.find(
     (a) =>
       a.surface.toLowerCase() === surface &&
@@ -11333,12 +10429,10 @@ function aggregatePlan(
   code: string,
   t: ResolvedType,
 ): [AggPlan, ResolvedType, ScalarType | undefined] {
-  if (surface === "count")
-    return ["count", { kind: "int", ty: "i64" }, undefined];
+  if (surface === "count") return ["count", { kind: "int", ty: "i64" }, undefined];
   if (surface === "sum" && code === "sum_widen") {
     // SUM(i16|i32) → i64; SUM(i64) → decimal (PG widening).
-    if (t.kind === "int" && t.ty === "i64")
-      return ["sumDecimal", { kind: "decimal" }, undefined];
+    if (t.kind === "int" && t.ty === "i64") return ["sumDecimal", { kind: "decimal" }, undefined];
     return ["sumInt", { kind: "int", ty: "i64" }, undefined];
   }
   if (surface === "sum" && code === "decimal")
@@ -11347,15 +10441,12 @@ function aggregatePlan(
     // SUM/AVG over float stay the input width (the canonical-order fold — float.md §7).
     return ["sumFloat", { kind: "float", ty: t.ty }, t.ty];
   }
-  if (surface === "avg" && code === "decimal")
-    return ["avg", { kind: "decimal" }, undefined];
+  if (surface === "avg" && code === "decimal") return ["avg", { kind: "decimal" }, undefined];
   if (surface === "avg" && code === "same_as_input" && t.kind === "float") {
     return ["avgFloat", { kind: "float", ty: t.ty }, t.ty];
   }
-  if (surface === "min" && code === "same_as_input")
-    return ["min", t, undefined];
-  if (surface === "max" && code === "same_as_input")
-    return ["max", t, undefined];
+  if (surface === "min" && code === "same_as_input") return ["min", t, undefined];
+  if (surface === "max" && code === "same_as_input") return ["max", t, undefined];
   throw new Error(`aggregatePlan: unhandled (${surface}, ${code})`);
 }
 
@@ -11385,8 +10476,7 @@ function resolveFuncCall(
     return resolveVariadicFunc(scope, e, ag, params);
   }
   // make_interval is the one named/defaulted function — it keeps its own resolver (§11).
-  if (lname === "make_interval")
-    return resolveMakeInterval(scope, e, ag, params);
+  if (lname === "make_interval") return resolveMakeInterval(scope, e, ag, params);
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
   // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
   if (isAggregateName(lname)) {
@@ -11462,11 +10552,7 @@ function defaultExpr(lit: string): Expr {
 // + DEFAULTs, functions.md §11). Returns the positional Expr array of length desc.arity. Errors:
 // 42601 a positional arg after a named one (also caught at parse) or a duplicated name; 42883 an
 // unknown parameter name, too many arguments, or a missing non-defaulted slot (no overload).
-function normalizeNamedArgs(
-  desc: OperatorDesc,
-  args: Expr[],
-  argNames: (string | null)[],
-): Expr[] {
+function normalizeNamedArgs(desc: OperatorDesc, args: Expr[], argNames: (string | null)[]): Expr[] {
   const arity = desc.arity;
   const slots: (Expr | null)[] = new Array(arity).fill(null);
   const namesEmpty = argNames.length === 0;
@@ -11475,19 +10561,14 @@ function normalizeNamedArgs(
     const nm = namesEmpty ? null : argNames[i];
     if (nm === null || nm === undefined) {
       if (seenNamed) {
-        throw engineError(
-          "syntax_error",
-          "positional argument cannot follow named argument",
-        );
+        throw engineError("syntax_error", "positional argument cannot follow named argument");
       }
       if (i >= arity) throw noFuncOverload(desc.name); // too many positional arguments
       slots[i] = args[i]!;
       continue;
     }
     seenNamed = true;
-    const idx = desc.argNames.findIndex(
-      (p) => p.toLowerCase() === nm.toLowerCase(),
-    );
+    const idx = desc.argNames.findIndex((p) => p.toLowerCase() === nm.toLowerCase());
     if (idx < 0) {
       throw engineError(
         "undefined_function",
@@ -11495,10 +10576,7 @@ function normalizeNamedArgs(
       );
     }
     if (slots[idx] !== null) {
-      throw engineError(
-        "syntax_error",
-        'argument name "' + nm + '" used more than once',
-      );
+      throw engineError("syntax_error", 'argument name "' + nm + '" used more than once');
     }
     slots[idx] = args[i]!;
   }
@@ -11528,11 +10606,7 @@ function resolveMakeInterval(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star)
-    throw engineError(
-      "syntax_error",
-      "* is only valid as the argument of COUNT",
-    );
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
   const desc = scalarFuncDesc("make_interval");
   if (desc === undefined) throw new Error("make_interval is in the catalog");
   const positional = normalizeNamedArgs(desc, e.args, e.argNames);
@@ -11558,8 +10632,7 @@ function resolveMakeInterval(
 // (interval out of range), matching PG and the other cores.
 function f64ToMicros(secs: number): bigint {
   const p = secs * 1_000_000;
-  if (!Number.isFinite(p))
-    throw engineError("datetime_field_overflow", "interval out of range");
+  if (!Number.isFinite(p)) throw engineError("datetime_field_overflow", "interval out of range");
   const r = floatToIntHalfAway(p); // bigint, half-away-from-zero
   if (r < -9223372036854775808n || r > 9223372036854775807n) {
     throw engineError("datetime_field_overflow", "interval out of range");
@@ -11577,11 +10650,7 @@ function resolveScalarFunc(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star)
-    throw engineError(
-      "syntax_error",
-      "* is only valid as the argument of COUNT",
-    );
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
   const name = e.name.toLowerCase() as ScalarFuncName;
   const rargs: RExpr[] = [];
   const tys: ResolvedType[] = [];
@@ -11634,11 +10703,7 @@ function resolveVariadicFunc(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star)
-    throw engineError(
-      "syntax_error",
-      "* is only valid as the argument of COUNT",
-    );
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
   const name = e.name.toLowerCase() as VariadicFuncName;
   const desc = scalarFuncDesc(name)!;
   const k = desc.arity; // declared parameter count (the last is variadic)
@@ -11655,10 +10720,7 @@ function resolveVariadicFunc(
         // the variadic (array) operand
         if (r.type.kind !== "array") {
           // A non-array operand (incl. a bare untyped NULL) is 42804 — PG's exact code.
-          throw engineError(
-            "datatype_mismatch",
-            "VARIADIC argument must be an array",
-          );
+          throw engineError("datatype_mismatch", "VARIADIC argument must be an array");
         }
         // "any" accepts any element type; a concrete variadic family must match.
         if (varFamily !== "any" && !familyMatches(varFamily, r.type.elem))
@@ -11711,8 +10773,7 @@ function isArrayFuncName(name: string): boolean {
 // everything else by kind.
 function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
   if (a.kind !== b.kind) return false;
-  if (a.kind === "int" || a.kind === "float")
-    return a.ty === (b as { ty: ScalarType }).ty;
+  if (a.kind === "int" || a.kind === "float") return a.ty === (b as { ty: ScalarType }).ty;
   if (a.kind === "array" || a.kind === "range")
     return resolvedTypeEqual(a.elem, (b as { elem: ResolvedType }).elem);
   if (a.kind === "composite") {
@@ -11720,11 +10781,8 @@ function resolvedTypeEqual(a: ResolvedType, b: ResolvedType): boolean {
       name: string | null;
       fields: { name: string; type: ResolvedType }[];
     };
-    if (a.name !== bc.name || a.fields.length !== bc.fields.length)
-      return false;
-    return a.fields.every((f, i) =>
-      resolvedTypeEqual(f.type, bc.fields[i]!.type),
-    );
+    if (a.name !== bc.name || a.fields.length !== bc.fields.length) return false;
+    return a.fields.every((f, i) => resolvedTypeEqual(f.type, bc.fields[i]!.type));
   }
   return true;
 }
@@ -11806,13 +10864,11 @@ function polyResultType(code: string, elem: ResolvedType | null): ResolvedType {
   if (code.endsWith("[]")) {
     const base = code.slice(0, -2);
     const bty = scalarTypeFromName(base);
-    if (bty === undefined)
-      throw new Error("polyResultType: unknown array element " + base);
+    if (bty === undefined) throw new Error("polyResultType: unknown array element " + base);
     return { kind: "array", elem: resolvedTypeOf(bty) };
   }
   const ty = scalarTypeFromName(code);
-  if (ty === undefined)
-    throw new Error("polyResultType: unknown result code " + code);
+  if (ty === undefined) throw new Error("polyResultType: unknown result code " + code);
   return resolvedTypeOf(ty);
 }
 
@@ -11870,17 +10926,12 @@ function resolveArrayFunc(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star)
-    throw engineError(
-      "syntax_error",
-      "* is only valid as the argument of COUNT",
-    );
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
   const name = e.name.toLowerCase() as ArrayFuncName;
   // Each array-function name is single-overload; find its row by (name, arity). A wrong argument count
   // matches no overload (42883), exactly as a missing scalar overload does.
   const desc = OPERATORS.find(
-    (o) =>
-      o.kind === "function" && o.name === name && o.arity === e.args.length,
+    (o) => o.kind === "function" && o.name === name && o.arity === e.args.length,
   );
   if (!desc) throw noFuncOverload(name);
   const slots = desc.argFamilies;
@@ -11921,10 +10972,7 @@ function resolveArrayFunc(
 // Data-driven, so a new range-function row wires here without touching this gate.
 function isRangeFuncName(name: string): boolean {
   return OPERATORS.some(
-    (o) =>
-      o.kind === "function" &&
-      o.name === name &&
-      o.argFamilies.some((f) => f === "anyrange"),
+    (o) => o.kind === "function" && o.name === name && o.argFamilies.some((f) => f === "anyrange"),
   );
 }
 
@@ -11941,9 +10989,7 @@ function rangeFuncId(name: string): RangeFuncName {
     case "upper_inf":
       return name;
     default:
-      throw new Error(
-        "rangeFuncId: " + name + " is not a catalog range function",
-      );
+      throw new Error("rangeFuncId: " + name + " is not a catalog range function");
   }
 }
 
@@ -11958,15 +11004,10 @@ function resolveRangeFunc(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star)
-    throw engineError(
-      "syntax_error",
-      "* is only valid as the argument of COUNT",
-    );
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
   const name = e.name.toLowerCase();
   const desc = OPERATORS.find(
-    (o) =>
-      o.kind === "function" && o.name === name && o.arity === e.args.length,
+    (o) => o.kind === "function" && o.name === name && o.arity === e.args.length,
   );
   if (!desc) throw noFuncOverload(name);
   const slots = desc.argFamilies;
@@ -12042,11 +11083,7 @@ function resolveRangeCtor(
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
-  if (e.star)
-    throw engineError(
-      "syntax_error",
-      "* is only valid as the argument of COUNT",
-    );
+  if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
   const name = e.name.toLowerCase();
   const desc = rangeByName(name);
   if (desc === undefined) throw new Error("isRangeCtorName gated the call");
@@ -12066,8 +11103,7 @@ function resolveRangeCtor(
       // The bounds-flags argument: TEXT (a NULL is allowed at resolve — the kernel traps it 22000
       // at eval, matching PG "flags argument must not be null").
       const r = resolve(scope, a, null, ag, params);
-      if (r.type.kind !== "text" && r.type.kind !== "null")
-        throw noFuncOverload(name);
+      if (r.type.kind !== "text" && r.type.kind !== "null") throw noFuncOverload(name);
       rargs.push(r.node);
     }
   }
@@ -12081,9 +11117,7 @@ function resolveRangeCtor(
 function groupingErrorColumn(name: string): EngineError {
   return engineError(
     "grouping_error",
-    "column " +
-      name +
-      " must appear in the GROUP BY clause or be used in an aggregate function",
+    "column " + name + " must appear in the GROUP BY clause or be used in an aggregate function",
   );
 }
 
@@ -12160,12 +11194,7 @@ class Scope {
   // outer environment (the subquery's parent is this scope), an uncorrelated one folds once
   // (spec/design/grammar.md §26). SELECT builds its own scope in planSelect.
   static single(catalog: Database, t: Table): Scope {
-    return new Scope(
-      [{ label: t.name.toLowerCase(), table: t, offset: 0 }],
-      catalog,
-      null,
-      true,
-    );
+    return new Scope([{ label: t.name.toLowerCase(), table: t, offset: 0 }], catalog, null, true);
   }
 
   // empty is the column-less scope a DEFAULT expression resolves against (constraints.md §2): a
@@ -12267,8 +11296,7 @@ class Scope {
         return { level: 0, index: r.offset + local };
       }
     }
-    if (this.parent !== null)
-      return outerOf(this.parent.resolveQualified(qualifier, name));
+    if (this.parent !== null) return outerOf(this.parent.resolveQualified(qualifier, name));
     throw missingFromEntry(qualifier);
   }
 
@@ -12276,8 +11304,7 @@ class Scope {
   columnAt(flat: number): Column {
     for (const r of this.rels) {
       const n = r.table.columns.length;
-      if (flat >= r.offset && flat < r.offset + n)
-        return r.table.columns[flat - r.offset]!;
+      if (flat >= r.offset && flat < r.offset + n) return r.table.columns[flat - r.offset]!;
     }
     throw new Error("a resolved flat column index is always in range");
   }
@@ -12302,18 +11329,12 @@ function undefinedColumn(name: string): EngineError {
 
 // ambiguousColumn is 42702 — a bare column name that more than one relation in scope defines.
 function ambiguousColumn(name: string): EngineError {
-  return engineError(
-    "ambiguous_column",
-    "column reference " + name + " is ambiguous",
-  );
+  return engineError("ambiguous_column", "column reference " + name + " is ambiguous");
 }
 
 // missingFromEntry is 42P01 — a qualifier that names no relation in the FROM clause.
 function missingFromEntry(qualifier: string): EngineError {
-  return engineError(
-    "undefined_table",
-    "missing FROM-clause entry for table " + qualifier,
-  );
+  return engineError("undefined_table", "missing FROM-clause entry for table " + qualifier);
 }
 
 // resolvedTypeOf is the resolved (static) type of a column of scalar type ty.
@@ -12337,13 +11358,10 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
 // composite reference is guaranteed to resolve (CREATE TYPE / the two-pass load validated it).
 function resolvedTypeOfCol(ty: Type, db: Database): ResolvedType {
   if (ty.kind === "scalar") return resolvedTypeOf(ty.scalar);
-  if (ty.kind === "array")
-    return { kind: "array", elem: resolvedTypeOfCol(ty.elem, db) };
-  if (ty.kind === "range")
-    return { kind: "range", elem: resolvedTypeOfCol(ty.elem, db) };
+  if (ty.kind === "array") return { kind: "array", elem: resolvedTypeOfCol(ty.elem, db) };
+  if (ty.kind === "range") return { kind: "range", elem: resolvedTypeOfCol(ty.elem, db) };
   const def = db.compositeType(ty.name);
-  if (def === undefined)
-    throw new Error("composite type reference resolved at load / CREATE TYPE");
+  if (def === undefined) throw new Error("composite type reference resolved at load / CREATE TYPE");
   return {
     kind: "composite",
     name: def.name,
@@ -12471,9 +11489,7 @@ function rtName(t: ResolvedType): string {
 // resolvedRangeElementScalar returns the scalar element type of a resolved range element. A range's
 // element is always one of the six scalar subtypes; undefined for anything else (never a valid
 // range). Used to name a range and to build its codec.
-function resolvedRangeElementScalar(
-  elem: ResolvedType,
-): ScalarType | undefined {
+function resolvedRangeElementScalar(elem: ResolvedType): ScalarType | undefined {
   switch (elem.kind) {
     case "int":
       return elem.ty;
@@ -12517,16 +11533,10 @@ function analyzeRecursiveCte(
     );
   }
   if (body.orderBy.length > 0) {
-    throw engineError(
-      "feature_not_supported",
-      "ORDER BY in a recursive query is not implemented",
-    );
+    throw engineError("feature_not_supported", "ORDER BY in a recursive query is not implemented");
   }
   if (body.limit !== null || body.offset !== null) {
-    throw engineError(
-      "feature_not_supported",
-      "LIMIT in a recursive query is not implemented",
-    );
+    throw engineError("feature_not_supported", "LIMIT in a recursive query is not implemented");
   }
   if (countSelfRefsQuery(body.lhs, name) > 0) {
     throw engineError(
@@ -12575,10 +11585,7 @@ function validateRecursiveTerm(name: string, sel: Select): void {
       `recursive reference to query "${name}" must not appear more than once`,
     );
   }
-  if (
-    itemsHaveAggregate(sel.items) ||
-    (sel.having !== null && exprHasAggregate(sel.having))
-  ) {
+  if (itemsHaveAggregate(sel.items) || (sel.having !== null && exprHasAggregate(sel.having))) {
     throw engineError(
       "invalid_recursion",
       "aggregate functions are not allowed in a recursive query's recursive term",
@@ -12597,10 +11604,7 @@ function validateRecursiveTerm(name: string, sel: Select): void {
 // writable-CTE orchestrator (the read pin + lexical-order, all-or-nothing execution); a pure-query
 // WITH keeps the runWith path.
 function withHasDml(wq: WithQuery): boolean {
-  return (
-    cteBodyIsDataModifying(wq.body) ||
-    wq.ctes.some((c) => cteBodyIsDataModifying(c.body))
-  );
+  return cteBodyIsDataModifying(wq.body) || wq.ctes.some((c) => cteBodyIsDataModifying(c.body));
 }
 
 // cteModes computes each CTE binding's evaluation mode (spec/design/cte.md §3, writable-cte.md §3): a
@@ -12628,11 +11632,7 @@ function addOutcomeCost(outcome: Outcome, extra: bigint): Outcome {
 // RHSs / ON CONFLICT / RETURNING sublinks. Used by the orchestrator to count the references a
 // NON-planned data-modifying part contributes to the inline-vs-materialize decision.
 function countCteRefsDml(body: CteBody, name: string): number {
-  if (
-    body.kind === "select" ||
-    body.kind === "setOp" ||
-    body.kind === "withExpr"
-  ) {
+  if (body.kind === "select" || body.kind === "setOp" || body.kind === "withExpr") {
     return countSelfRefsQuery(body, name);
   }
   if (body.kind === "insert") {
@@ -12642,10 +11642,8 @@ function countCteRefsDml(body: CteBody, name: string): number {
         : // VALUES slots hold literals / params / ROW / ARRAY (no sublinks this slice).
           0;
     if (body.onConflict !== null && body.onConflict.doUpdate) {
-      for (const a of body.onConflict.assignments)
-        n += countSelfRefsExpr(a.value, name);
-      if (body.onConflict.filter !== null)
-        n += countSelfRefsExpr(body.onConflict.filter, name);
+      for (const a of body.onConflict.assignments) n += countSelfRefsExpr(a.value, name);
+      if (body.onConflict.filter !== null) n += countSelfRefsExpr(body.onConflict.filter, name);
     }
     return n + countReturningRefs(body.returning, name);
   }
@@ -12662,15 +11660,9 @@ function countCteRefsDml(body: CteBody, name: string): number {
 }
 
 // countReturningRefs counts references to CTE `name` in a RETURNING item list's sublinks.
-function countReturningRefs(
-  returning: SelectItems | null,
-  name: string,
-): number {
+function countReturningRefs(returning: SelectItems | null, name: string): number {
   if (returning === null || returning.kind !== "list") return 0;
-  return returning.items.reduce(
-    (a, it) => a + countSelfRefsExpr(it.expr, name),
-    0,
-  );
+  return returning.items.reduce((a, it) => a + countSelfRefsExpr(it.expr, name), 0);
 }
 
 // countSelfRefsQuery counts self-references to name anywhere in a query expression (deep — FROM
@@ -12704,8 +11696,7 @@ function countSelfRefsTableref(tref: TableRef, name: string): number {
     for (const a of tref.args) n += countSelfRefsExpr(a, name);
   }
   if (tref.values !== undefined) {
-    for (const row of tref.values)
-      for (const e of row) n += countSelfRefsExpr(e, name);
+    for (const row of tref.values) for (const e of row) n += countSelfRefsExpr(e, name);
   }
   return n;
 }
@@ -12733,8 +11724,7 @@ function countSelfRefsExpr(e: Expr, name: string): number {
       return countSelfRefsExpr(e.lhs, name) + countSelfRefsExpr(e.rhs, name);
     case "in":
       return (
-        countSelfRefsExpr(e.lhs, name) +
-        e.list.reduce((a, x) => a + countSelfRefsExpr(x, name), 0)
+        countSelfRefsExpr(e.lhs, name) + e.list.reduce((a, x) => a + countSelfRefsExpr(x, name), 0)
       );
     case "between":
       return (
@@ -12746,10 +11736,7 @@ function countSelfRefsExpr(e: Expr, name: string): number {
       return (
         (e.operand !== null ? countSelfRefsExpr(e.operand, name) : 0) +
         e.whens.reduce(
-          (a, w) =>
-            a +
-            countSelfRefsExpr(w.cond, name) +
-            countSelfRefsExpr(w.result, name),
+          (a, w) => a + countSelfRefsExpr(w.cond, name) + countSelfRefsExpr(w.result, name),
           0,
         ) +
         (e.els !== null ? countSelfRefsExpr(e.els, name) : 0)
@@ -12766,10 +11753,7 @@ function countSelfRefsExpr(e: Expr, name: string): number {
     case "subscript":
       return (
         countSelfRefsExpr(e.base, name) +
-        astSubscriptExprs(e.subscripts).reduce(
-          (a, x) => a + countSelfRefsExpr(x, name),
-          0,
-        )
+        astSubscriptExprs(e.subscripts).reduce((a, x) => a + countSelfRefsExpr(x, name), 0)
       );
     case "quantified":
       return countSelfRefsExpr(e.lhs, name) + countSelfRefsExpr(e.array, name);
@@ -12830,8 +11814,7 @@ function directSelfRefOnNullableSide(s: Select, name: string): boolean {
     }
   }
   return rels.some(
-    (tref, i) =>
-      isPlainRelation(tref) && tref.name.toLowerCase() === name && nullable[i]!,
+    (tref, i) => isPlainRelation(tref) && tref.name.toLowerCase() === name && nullable[i]!,
   );
 }
 
@@ -12872,18 +11855,11 @@ function selectExprs(s: Select): Expr[] {
 // assignable to them — a literal adapts, an equal type passes, a WIDER type is 42804 (matching
 // PostgreSQL). Mechanically the would-be UNION unified type must EQUAL the anchor type; any widening
 // of the anchor is the error. An arity mismatch is 42601, like a plain UNION.
-function checkRecursiveColumnTypes(
-  anchor: QueryPlan,
-  recursive: QueryPlan,
-  name: string,
-): void {
+function checkRecursiveColumnTypes(anchor: QueryPlan, recursive: QueryPlan, name: string): void {
   const a = anchor.columnTypes;
   const r = recursive.columnTypes;
   if (a.length !== r.length) {
-    throw engineError(
-      "syntax_error",
-      "each UNION query must have the same number of columns",
-    );
+    throw engineError("syntax_error", "each UNION query must have the same number of columns");
   }
   for (let i = 0; i < a.length; i++) {
     const unified = unifySetopColumn(a[i]!, r[i]!, "union");
@@ -12901,17 +11877,8 @@ function checkRecursiveColumnTypes(
 // with MORE aliases is 42P10) or the body's own output names, typed from the planned body. The
 // relation has no primary key / constraints — it is read-only and its rows come from the CTE
 // context, never a store.
-function cteSyntheticTable(
-  name: string,
-  plan: QueryPlan,
-  rename: string[] | null,
-): Table {
-  return cteSyntheticTableCols(
-    name,
-    plan.columnNames,
-    plan.columnTypes,
-    rename,
-  );
+function cteSyntheticTable(name: string, plan: QueryPlan, rename: string[] | null): Table {
+  return cteSyntheticTableCols(name, plan.columnNames, plan.columnTypes, rename);
 }
 
 // cteSyntheticTableCols is the shared core of cteSyntheticTable, over explicit body column names +
@@ -12992,10 +11959,7 @@ function typeFromResolved(rt: ResolvedType): Type {
     case "range":
       // A range-typed CTE column is deferred (range columns are not storable yet — R2); the value
       // itself works in expression position, just not as a materialized column type.
-      throw engineError(
-        "feature_not_supported",
-        "a range column in a CTE is not supported yet",
-      );
+      throw engineError("feature_not_supported", "a range column in a CTE is not supported yet");
   }
 }
 
@@ -13036,17 +12000,10 @@ class ParamTypes {
 
 // unifyParamType unifies two inferred types for the same parameter: equal agrees; two integer
 // widths widen to the wider; any other mismatch is 42804 (spec/design/api.md §5).
-function unifyParamType(
-  a: ScalarType,
-  b: ScalarType,
-  idx0: number,
-): ScalarType {
+function unifyParamType(a: ScalarType, b: ScalarType, idx0: number): ScalarType {
   if (a === b) return a;
   if (isInteger(a) && isInteger(b)) return rank(a) >= rank(b) ? a : b;
-  throw engineError(
-    "datatype_mismatch",
-    `inconsistent types inferred for parameter $${idx0 + 1}`,
-  );
+  throw engineError("datatype_mismatch", `inconsistent types inferred for parameter $${idx0 + 1}`);
 }
 
 // bindParams coerces each supplied bind value to its inferred parameter type, two-phase /
@@ -13059,19 +12016,14 @@ function bindParams(supplied: Value[], types: ScalarType[]): Value[] {
       `bind parameter count mismatch: statement expects ${types.length}, got ${supplied.length}`,
     );
   }
-  return types.map((ty, i) =>
-    storeValue(supplied[i]!, ty, null, false, `$${i + 1}`),
-  );
+  return types.map((ty, i) => storeValue(supplied[i]!, ty, null, false, `$${i + 1}`));
 }
 
 // rejectParamsForDDL throws 42601 if bind parameters are supplied to a CREATE/DROP TABLE (which
 // has no expressions to bind — spec/design/api.md §5).
 function rejectParamsForDDL(params: Value[]): void {
   if (params.length > 0) {
-    throw engineError(
-      "syntax_error",
-      "bind parameters are not allowed in a DDL statement",
-    );
+    throw engineError("syntax_error", "bind parameters are not allowed in a DDL statement");
   }
 }
 
@@ -13106,10 +12058,7 @@ function buildSequenceDef(
   }
   const cache = options.cache ?? 1n;
   if (cache < 1n) {
-    throw engineError(
-      "invalid_parameter_value",
-      `CACHE (${cache}) must be greater than zero`,
-    );
+    throw engineError("invalid_parameter_value", `CACHE (${cache}) must be greater than zero`);
   }
   const [defMin, defMax] = seqDataTypeDefaultBounds(dtype, increment);
   // An explicit MAXVALUE/MINVALUE outside the type range is 22023 — checked (MAX first, PG order)
@@ -13136,13 +12085,9 @@ function buildSequenceDef(
   }
   // `{ value: v }` MINVALUE v / `{ value: null }` NO MINVALUE / outer null unset → the type default.
   const minValue =
-    options.minValue !== null && options.minValue.value !== null
-      ? options.minValue.value
-      : defMin;
+    options.minValue !== null && options.minValue.value !== null ? options.minValue.value : defMin;
   const maxValue =
-    options.maxValue !== null && options.maxValue.value !== null
-      ? options.maxValue.value
-      : defMax;
+    options.maxValue !== null && options.maxValue.value !== null ? options.maxValue.value : defMax;
   // PG requires MINVALUE strictly less than MAXVALUE (a one-value sequence is rejected); jed
   // previously allowed `==` — corrected here so CREATE and ALTER (sequences.md §15.2) agree with PG.
   if (minValue >= maxValue) {
@@ -13170,11 +12115,7 @@ function buildSequenceDef(
 
 // seqBoundCheckStart is PG's START-in-bounds cross-check (init_params): start ∈ [min, max], else
 // 22023 with PG's wording. Shared by CREATE (buildSequenceDef) and ALTER (applySeqAlter).
-function seqBoundCheckStart(
-  start: bigint,
-  minValue: bigint,
-  maxValue: bigint,
-): void {
+function seqBoundCheckStart(start: bigint, minValue: bigint, maxValue: bigint): void {
   if (start < minValue) {
     throw engineError(
       "invalid_parameter_value",
@@ -13191,11 +12132,7 @@ function seqBoundCheckStart(
 
 // seqBoundCheckLast is PG's last_value (RESTART) cross-check (init_params): the post-edit last_value ∈
 // [min, max], else 22023. PG uses the "RESTART value …" wording even with no RESTART written (§15.2).
-function seqBoundCheckLast(
-  lastValue: bigint,
-  minValue: bigint,
-  maxValue: bigint,
-): void {
+function seqBoundCheckLast(lastValue: bigint, minValue: bigint, maxValue: bigint): void {
   if (lastValue < minValue) {
     throw engineError(
       "invalid_parameter_value",
@@ -13223,10 +12160,7 @@ function applySeqAlter(
   const def = { ...existing };
   if (options.increment !== null) {
     if (options.increment === 0n) {
-      throw engineError(
-        "invalid_parameter_value",
-        "INCREMENT must not be zero",
-      );
+      throw engineError("invalid_parameter_value", "INCREMENT must not be zero");
     }
     def.increment = options.increment;
   }
@@ -13244,12 +12178,10 @@ function applySeqAlter(
   // unwritten bound is preserved (PG keeps it even when the sign flips).
   const [defMin, defMax] = seqDataTypeDefaultBounds("bigint", def.increment);
   if (options.minValue !== null) {
-    def.minValue =
-      options.minValue.value === null ? defMin : options.minValue.value;
+    def.minValue = options.minValue.value === null ? defMin : options.minValue.value;
   }
   if (options.maxValue !== null) {
-    def.maxValue =
-      options.maxValue.value === null ? defMax : options.maxValue.value;
+    def.maxValue = options.maxValue.value === null ? defMax : options.maxValue.value;
   }
   if (def.minValue >= def.maxValue) {
     throw engineError(
@@ -13332,8 +12264,7 @@ function stmtCallsSeqMutator(stmt: Statement): boolean {
       return setOpCallsSeqMutator(stmt);
     case "with":
       return (
-        stmt.ctes.some((c) => cteBodyCallsSeqMutator(c.body)) ||
-        cteBodyCallsSeqMutator(stmt.body)
+        stmt.ctes.some((c) => cteBodyCallsSeqMutator(c.body)) || cteBodyCallsSeqMutator(stmt.body)
       );
     default:
       return false;
@@ -13364,15 +12295,12 @@ function setOpCallsSeqMutator(so: SetOp): boolean {
 
 function selectCallsSeqMutator(s: Select): boolean {
   const itemCalls =
-    s.items.kind === "list" &&
-    s.items.items.some((i) => exprCallsSeqMutator(i.expr));
+    s.items.kind === "list" && s.items.items.some((i) => exprCallsSeqMutator(i.expr));
   return (
     itemCalls ||
     (s.from !== null && tableRefCallsSeqMutator(s.from)) ||
     s.joins.some(
-      (j) =>
-        tableRefCallsSeqMutator(j.table) ||
-        (j.on !== null && exprCallsSeqMutator(j.on)),
+      (j) => tableRefCallsSeqMutator(j.table) || (j.on !== null && exprCallsSeqMutator(j.on)),
     ) ||
     (s.filter !== null && exprCallsSeqMutator(s.filter)) ||
     s.groupBy.some(exprCallsSeqMutator) ||
@@ -13384,8 +12312,7 @@ function tableRefCallsSeqMutator(t: TableRef): boolean {
   return (
     (t.args !== null && t.args.some(exprCallsSeqMutator)) ||
     (t.subquery !== undefined && queryCallsSeqMutator(t.subquery)) ||
-    (t.values !== undefined &&
-      t.values.some((row) => row.some(exprCallsSeqMutator)))
+    (t.values !== undefined && t.values.some((row) => row.some(exprCallsSeqMutator)))
   );
 }
 
@@ -13395,9 +12322,7 @@ function exprCallsSeqMutator(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall": {
       const n = e.name.toLowerCase();
-      return (
-        n === "nextval" || n === "setval" || e.args.some(exprCallsSeqMutator)
-      );
+      return n === "nextval" || n === "setval" || e.args.some(exprCallsSeqMutator);
     }
     case "column":
     case "qualifiedColumn":
@@ -13436,17 +12361,11 @@ function exprCallsSeqMutator(e: Expr): boolean {
     case "in":
       return exprCallsSeqMutator(e.lhs) || e.list.some(exprCallsSeqMutator);
     case "between":
-      return (
-        exprCallsSeqMutator(e.lhs) ||
-        exprCallsSeqMutator(e.lo) ||
-        exprCallsSeqMutator(e.hi)
-      );
+      return exprCallsSeqMutator(e.lhs) || exprCallsSeqMutator(e.lo) || exprCallsSeqMutator(e.hi);
     case "case":
       return (
         (e.operand !== null && exprCallsSeqMutator(e.operand)) ||
-        e.whens.some(
-          (w) => exprCallsSeqMutator(w.cond) || exprCallsSeqMutator(w.result),
-        ) ||
+        e.whens.some((w) => exprCallsSeqMutator(w.cond) || exprCallsSeqMutator(w.result)) ||
         (e.els !== null && exprCallsSeqMutator(e.els))
       );
     case "scalarSubquery":
@@ -13524,11 +12443,7 @@ function collectStmtPrivs(stmt: Statement, req: PrivReq): void {
   }
 }
 
-function collectInsertPrivs(
-  ins: Insert,
-  req: PrivReq,
-  locals: Set<string>,
-): void {
+function collectInsertPrivs(ins: Insert, req: PrivReq, locals: Set<string>): void {
   // The write target needs INSERT. A bare INSERT … VALUES reads nothing (the slots are literals /
   // params), so it needs only INSERT; an INSERT … SELECT source needs SELECT on its tables.
   req.tables.push({ name: ins.table, priv: "insert" });
@@ -13536,19 +12451,13 @@ function collectInsertPrivs(
     collectSelectPrivs(ins.source.select, req, locals);
   }
   if (ins.onConflict !== null && ins.onConflict.doUpdate) {
-    for (const a of ins.onConflict.assignments)
-      collectExprPrivs(a.value, req, locals);
-    if (ins.onConflict.filter !== null)
-      collectExprPrivs(ins.onConflict.filter, req, locals);
+    for (const a of ins.onConflict.assignments) collectExprPrivs(a.value, req, locals);
+    if (ins.onConflict.filter !== null) collectExprPrivs(ins.onConflict.filter, req, locals);
   }
   collectItemsPrivs(ins.returning, req, locals);
 }
 
-function collectUpdatePrivs(
-  upd: Update,
-  req: PrivReq,
-  locals: Set<string>,
-): void {
+function collectUpdatePrivs(upd: Update, req: PrivReq, locals: Set<string>): void {
   req.tables.push({ name: upd.table, priv: "update" });
   // SELECT on the target if it reads any column — a WHERE, a RETURNING, or a column/subquery-
   // referencing assignment RHS (a constant-only SET a = 1 with no WHERE/RETURNING reads nothing).
@@ -13562,11 +12471,7 @@ function collectUpdatePrivs(
   collectItemsPrivs(upd.returning, req, locals);
 }
 
-function collectDeletePrivs(
-  del: Delete,
-  req: PrivReq,
-  locals: Set<string>,
-): void {
+function collectDeletePrivs(del: Delete, req: PrivReq, locals: Set<string>): void {
   req.tables.push({ name: del.table, priv: "delete" });
   // DELETE reads the target's columns through a WHERE or a RETURNING.
   if (del.filter !== null || del.returning !== null) {
@@ -13576,11 +12481,7 @@ function collectDeletePrivs(
   collectItemsPrivs(del.returning, req, locals);
 }
 
-function collectQueryPrivs(
-  qe: QueryExpr,
-  req: PrivReq,
-  locals: Set<string>,
-): void {
+function collectQueryPrivs(qe: QueryExpr, req: PrivReq, locals: Set<string>): void {
   if (qe.kind === "setOp") collectSetOpPrivs(qe, req, locals);
   else if (qe.kind === "withExpr") {
     // A nested WITH establishes its own CTE scope (spec/design/cte.md §7): the enclosing locals are
@@ -13600,11 +12501,7 @@ function collectSetOpPrivs(so: SetOp, req: PrivReq, locals: Set<string>): void {
   collectQueryPrivs(so.rhs, req, locals);
 }
 
-function collectWithPrivs(
-  wq: WithQuery,
-  req: PrivReq,
-  locals: Set<string>,
-): void {
+function collectWithPrivs(wq: WithQuery, req: PrivReq, locals: Set<string>): void {
   // A CTE name shadows a base table inside the WITH (a FROM <cte> is not a catalog object), so it is
   // added to the local scope and never privilege-checked. Forward-only visibility: each CTE body sees
   // the CTE names declared before it. A data-modifying body / primary needs the write privilege on
@@ -13620,22 +12517,14 @@ function collectWithPrivs(
 // collectCteBodyPrivs collects the privilege requirements of a cte_body — a query, or a
 // data-modifying statement (spec/design/writable-cte.md) which needs the write privilege on its
 // target.
-function collectCteBodyPrivs(
-  body: CteBody,
-  req: PrivReq,
-  locals: Set<string>,
-): void {
+function collectCteBodyPrivs(body: CteBody, req: PrivReq, locals: Set<string>): void {
   if (body.kind === "insert") collectInsertPrivs(body, req, locals);
   else if (body.kind === "update") collectUpdatePrivs(body, req, locals);
   else if (body.kind === "delete") collectDeletePrivs(body, req, locals);
   else collectQueryPrivs(body, req, locals);
 }
 
-function collectSelectPrivs(
-  s: Select,
-  req: PrivReq,
-  locals: Set<string>,
-): void {
+function collectSelectPrivs(s: Select, req: PrivReq, locals: Set<string>): void {
   if (s.from !== null) collectTableRefPrivs(s.from, req, locals);
   for (const j of s.joins) {
     collectTableRefPrivs(j.table, req, locals);
@@ -13649,11 +12538,7 @@ function collectSelectPrivs(
   if (s.having !== null) collectExprPrivs(s.having, req, locals);
 }
 
-function collectTableRefPrivs(
-  t: TableRef,
-  req: PrivReq,
-  locals: Set<string>,
-): void {
+function collectTableRefPrivs(t: TableRef, req: PrivReq, locals: Set<string>): void {
   if (t.args !== null) {
     // A set-returning function used as a row source — EXECUTE on the function; its args are exprs.
     req.functions.push(t.name);
@@ -13661,19 +12546,14 @@ function collectTableRefPrivs(
   } else if (t.subquery !== undefined) {
     collectQueryPrivs(t.subquery, req, locals);
   } else if (t.values !== undefined) {
-    for (const row of t.values)
-      for (const e of row) collectExprPrivs(e, req, locals);
+    for (const row of t.values) for (const e of row) collectExprPrivs(e, req, locals);
   } else if (!locals.has(t.name.toLowerCase())) {
     // A base-table reference (not a CTE / derived-table label) — needs SELECT.
     req.tables.push({ name: t.name, priv: "select" });
   }
 }
 
-function collectItemsPrivs(
-  items: SelectItems | null,
-  req: PrivReq,
-  locals: Set<string>,
-): void {
+function collectItemsPrivs(items: SelectItems | null, req: PrivReq, locals: Set<string>): void {
   if (items !== null && items.kind === "list") {
     for (const it of items.items) collectExprPrivs(it.expr, req, locals);
   }
@@ -13810,17 +12690,11 @@ function exprReadsColumns(e: Expr): boolean {
     case "in":
       return exprReadsColumns(e.lhs) || e.list.some(exprReadsColumns);
     case "between":
-      return (
-        exprReadsColumns(e.lhs) ||
-        exprReadsColumns(e.lo) ||
-        exprReadsColumns(e.hi)
-      );
+      return exprReadsColumns(e.lhs) || exprReadsColumns(e.lo) || exprReadsColumns(e.hi);
     case "case":
       return (
         (e.operand !== null && exprReadsColumns(e.operand)) ||
-        e.whens.some(
-          (w) => exprReadsColumns(w.cond) || exprReadsColumns(w.result),
-        ) ||
+        e.whens.some((w) => exprReadsColumns(w.cond) || exprReadsColumns(w.result)) ||
         (e.els !== null && exprReadsColumns(e.els))
       );
     case "quantified":
@@ -13908,10 +12782,7 @@ function resolveProjections(
     // (grammar.md §34). Qualifier-only rels don't count: they are RETURNING's old/new
     // pseudo-relations, and that scope always also carries the real relation.
     if (scope.rels.every((r) => r.qualifierOnly)) {
-      throw engineError(
-        "syntax_error",
-        "SELECT * with no tables specified is not valid",
-      );
+      throw engineError("syntax_error", "SELECT * with no tables specified is not valid");
     }
     const nodes: RExpr[] = [];
     const names: string[] = [];
@@ -13996,11 +12867,7 @@ function outputName(scope: Scope, e: Expr): string {
 
 // resolveBooleanFilter resolves a WHERE / ON expression; it must resolve to boolean (or an
 // untyped NULL, always unknown → no rows). An integer- or text-valued one is a 42804.
-function resolveBooleanFilter(
-  scope: Scope,
-  e: Expr,
-  params: ParamTypes,
-): RExpr {
+function resolveBooleanFilter(scope: Scope, e: Expr, params: ParamTypes): RExpr {
   // WHERE / ON filters run before any grouping, so an aggregate here is 42803 (Forbidden).
   const { node, type } = resolve(
     scope,
@@ -14069,11 +12936,7 @@ function resolveFieldOf(
 // divergence from PostgreSQL, which defaults such a $N to text — grammar.md §26). The inner query is
 // resolved ONCE, with `scope` as its parent, so correlated references become outerColumn and errors
 // fire even over an empty outer.
-function planSubquery(
-  scope: Scope,
-  inner: QueryExpr,
-  params: ParamTypes,
-): QueryPlan {
+function planSubquery(scope: Scope, inner: QueryExpr, params: ParamTypes): QueryPlan {
   if (!scope.allowSubquery) {
     throw engineError(
       "feature_not_supported",
@@ -14118,9 +12981,7 @@ function resolve(
       // unify to a common element type, build an array node. A bare empty ARRAY[] has no element
       // type to infer — use '{}'::T[] instead (the cast supplies it).
       if (e.elements.length === 0) {
-        throw typeError(
-          "cannot determine the element type of an empty ARRAY[]; write '{}'::T[]",
-        );
+        throw typeError("cannot determine the element type of an empty ARRAY[]; write '{}'::T[]");
       }
       // An element-type hint (ctx) flows down to the elements so an array literal adapts its untyped
       // integer/decimal literals exactly as a scalar literal does — e.g. resolving ARRAY[7,8] with an
@@ -14159,12 +13020,7 @@ function resolve(
       // PARENS-REQUIRED `(col).field` form (spec/design/composite.md §1/§S4), a fieldAccess node,
       // never this bare qualified-column path (PG raises 42P01 for the unparenthesized `col.field` /
       // `t.col.field` spellings).
-      return resolveColumnRef(
-        scope,
-        ag,
-        scope.resolveQualified(e.qualifier, e.name),
-        e.name,
-      );
+      return resolveColumnRef(scope, ag, scope.resolveQualified(e.qualifier, e.name), e.name);
     }
     case "fieldAccess": {
       // `(expr).field` — composite field selection (spec/design/composite.md §S4).
@@ -14192,9 +13048,7 @@ function resolve(
       const resolveBound = (b: Expr): RExpr => {
         const r = resolve(scope, b, "i32", ag, params);
         if (r.type.kind !== "int" && r.type.kind !== "null") {
-          throw typeError(
-            `array subscript must be an integer, not ${rtName(r.type)}`,
-          );
+          throw typeError(`array subscript must be an integer, not ${rtName(r.type)}`);
         }
         return r.node;
       };
@@ -14228,8 +13082,7 @@ function resolve(
       // type (null = no context here; finalize 42P18s a parameter that never gets one).
       const idx0 = e.index - 1;
       params.note(idx0, ctx);
-      const type: ResolvedType =
-        ctx !== null ? resolvedTypeOf(ctx) : { kind: "null" };
+      const type: ResolvedType = ctx !== null ? resolvedTypeOf(ctx) : { kind: "null" };
       return { node: { kind: "param", index: idx0 }, type };
     }
     case "funcCall":
@@ -14242,8 +13095,7 @@ function resolve(
       // A composite type name (`addr '(Main,90210)'`) coerces the string via record_in
       // (spec/design/composite.md §8) — the same primitive as `'(…)'::addr`.
       const ct = scope.catalog.compositeType(e.typeName);
-      if (ct !== undefined)
-        return coerceStringToComposite(e.text, ct, scope.catalog);
+      if (ct !== undefined) return coerceStringToComposite(e.text, ct, scope.catalog);
       // A range type name (`i32range '[1,5)'`, `int4range '…'`) coerces the string via range_in
       // against the element type (spec/design/ranges.md §5) — the same primitive as the cast.
       const rdesc = rangeByName(e.typeName);
@@ -14366,10 +13218,7 @@ function resolve(
       // a correlated one is re-executed per outer row by the evaluator.
       const plan = planSubquery(scope, e.query, params);
       if (plan.columnTypes.length !== 1) {
-        throw engineError(
-          "syntax_error",
-          "subquery must return only one column",
-        );
+        throw engineError("syntax_error", "subquery must return only one column");
       }
       return {
         node: {
@@ -14458,9 +13307,7 @@ function resolve(
       // unchanged. The hint flows through (COLLATE never changes the type).
       const r = resolve(scope, e.inner, ctx, ag, params);
       if (r.type.kind !== "text" && r.type.kind !== "null") {
-        throw typeError(
-          `collations are not supported by type ${rtName(r.type)}`,
-        );
+        throw typeError(`collations are not supported by type ${rtName(r.type)}`);
       }
       resolveCollationName(scope.catalog, e.collation); // surfaces 42704 for an unknown name
       return r;
@@ -14552,20 +13399,13 @@ function resolve(
           );
         }
         if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
-          return coerceStringToComposite(
-            e.inner.literal.text,
-            ct,
-            scope.catalog,
-          );
+          return coerceStringToComposite(e.inner.literal.text, ct, scope.catalog);
         }
         const inner = resolve(scope, e.inner, null, ag, params);
         if (inner.type.kind === "null") {
           return {
             node: inner.node,
-            type: resolvedTypeOfCol(
-              { kind: "composite", name: ct.name },
-              scope.catalog,
-            ),
+            type: resolvedTypeOfCol({ kind: "composite", name: ct.name }, scope.catalog),
           };
         }
         // An identical named composite is the identity cast.
@@ -14591,27 +13431,18 @@ function resolve(
       // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
       // casting TO text is a 0A000 this slice.
       if (isText(target)) {
-        throw engineError(
-          "feature_not_supported",
-          "casting to text is not supported yet",
-        );
+        throw engineError("feature_not_supported", "casting to text is not supported yet");
       }
       // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
       // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 / NULL
       // / bool source is castable), so it is handled AFTER the inner is resolved, below.
       // bytea casts are likewise deferred (types.md §5/§13): casting TO bytea is 0A000.
       if (isBytea(target)) {
-        throw engineError(
-          "feature_not_supported",
-          "casting to bytea is not supported yet",
-        );
+        throw engineError("feature_not_supported", "casting to bytea is not supported yet");
       }
       // uuid casts are likewise deferred (types.md §5/§14): casting TO uuid is 0A000.
       if (isUuid(target)) {
-        throw engineError(
-          "feature_not_supported",
-          "casting to uuid is not supported yet",
-        );
+        throw engineError("feature_not_supported", "casting to uuid is not supported yet");
       }
       // timestamp casts are deferred (spec/design/timestamp.md §6): casting TO a datetime is 0A000.
       if (isTimestamp(target) || isTimestamptz(target)) {
@@ -14629,10 +13460,7 @@ function resolve(
       }
       // date casts are deferred (spec/design/date.md §5/§6): casting TO date is 0A000.
       if (isDate(target)) {
-        throw engineError(
-          "feature_not_supported",
-          "casting to a date type is not supported yet",
-        );
+        throw engineError("feature_not_supported", "casting to a date type is not supported yet");
       }
       // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
       // `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
@@ -14643,8 +13471,7 @@ function resolve(
       // literal operand adapts to i32 (CAST(5 AS boolean) / 5::boolean), matching PG. A column/
       // expression keeps its own type; a literal beyond i32 range then traps 22003 (PG 42846 — a
       // documented divergence).
-      const innerCtx =
-        e.inner.kind === "param" ? target : isBool(target) ? "i32" : null;
+      const innerCtx = e.inner.kind === "param" ? target : isBool(target) ? "i32" : null;
       const inner = resolve(scope, e.inner, innerCtx, ag, params);
       // The boolean cast slice (spec/types/casts.toml, types.md §9): PG ties boolean↔integer to i32
       // ONLY and makes both directions explicit. A boolean TARGET takes an i32 / NULL / bool source
@@ -14677,30 +13504,18 @@ function resolve(
       }
       // Casting FROM text is likewise deferred (0A000).
       if (inner.type.kind === "text") {
-        throw engineError(
-          "feature_not_supported",
-          "casting from text is not supported yet",
-        );
+        throw engineError("feature_not_supported", "casting from text is not supported yet");
       }
       // Casting FROM bytea is likewise deferred (0A000).
       if (inner.type.kind === "bytea") {
-        throw engineError(
-          "feature_not_supported",
-          "casting from bytea is not supported yet",
-        );
+        throw engineError("feature_not_supported", "casting from bytea is not supported yet");
       }
       // Casting FROM uuid is likewise deferred (0A000).
       if (inner.type.kind === "uuid") {
-        throw engineError(
-          "feature_not_supported",
-          "casting from uuid is not supported yet",
-        );
+        throw engineError("feature_not_supported", "casting from uuid is not supported yet");
       }
       // Casting FROM a timestamp is likewise deferred (0A000).
-      if (
-        inner.type.kind === "timestamp" ||
-        inner.type.kind === "timestamptz"
-      ) {
+      if (inner.type.kind === "timestamp" || inner.type.kind === "timestamptz") {
         throw engineError(
           "feature_not_supported",
           "casting from a timestamp type is not supported yet",
@@ -14715,17 +13530,11 @@ function resolve(
       }
       // Casting FROM a date is likewise deferred (0A000; date↔timestamp unblocks the cross-family comparison — date.md §4/§6).
       if (inner.type.kind === "date") {
-        throw engineError(
-          "feature_not_supported",
-          "casting from a date type is not supported yet",
-        );
+        throw engineError("feature_not_supported", "casting from a date type is not supported yet");
       }
       // Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
       if (inner.type.kind === "array") {
-        throw engineError(
-          "feature_not_supported",
-          "casting an array value is not supported yet",
-        );
+        throw engineError("feature_not_supported", "casting an array value is not supported yet");
       }
       // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
       // decimal→decimal (re-scale), the float casts (int↔float, decimal↔float, float↔float — all
@@ -14826,10 +13635,7 @@ function resolve(
       let folded: Expr | null = null;
       for (const elem of e.list) {
         const eq: Expr = { kind: "binary", op: "eq", lhs: e.lhs, rhs: elem };
-        folded =
-          folded === null
-            ? eq
-            : { kind: "binary", op: "or", lhs: folded, rhs: eq };
+        folded = folded === null ? eq : { kind: "binary", op: "or", lhs: folded, rhs: eq };
       }
       // folded is non-null: the parser guarantees a non-empty list.
       let desugared = folded as Expr;
@@ -14917,10 +13723,7 @@ function resolve(
 // built-in byte / code-point order → null (the unchanged fast path); any other name resolves through
 // the reference-only read path (the database's resolved set, then the binary's vendored set), else
 // 42704.
-function resolveCollationName(
-  catalog: Database,
-  name: string,
-): Collation | null {
+function resolveCollationName(catalog: Database, name: string): Collation | null {
   if (name === "C") return null;
   const c = catalog.resolveCollationByName(name);
   if (c === undefined) {
@@ -14944,18 +13747,12 @@ type Deriv =
 // operands. Every other shape resets to none (takes a neighbour's) — a documented narrowing (§14).
 function deriveCollation(scope: Scope, e: Expr): Deriv {
   if (e.kind === "collate") return { kind: "explicit", name: e.collation };
-  if (e.kind === "column")
-    return columnDeriv(scope, () => scope.resolveBare(e.name));
+  if (e.kind === "column") return columnDeriv(scope, () => scope.resolveBare(e.name));
   if (e.kind === "qualifiedColumn") {
-    return columnDeriv(scope, () =>
-      scope.resolveQualified(e.qualifier, e.name),
-    );
+    return columnDeriv(scope, () => scope.resolveQualified(e.qualifier, e.name));
   }
   if (e.kind === "binary" && e.op === "concat") {
-    return combineDeriv(
-      deriveCollation(scope, e.lhs),
-      deriveCollation(scope, e.rhs),
-    );
+    return combineDeriv(deriveCollation(scope, e.lhs), deriveCollation(scope, e.rhs));
   }
   return { kind: "none" };
 }
@@ -15080,9 +13877,7 @@ function resolveBinary(
       // ctxOf, so a literal+float pair is float×float here.
       if (p.lt.kind === "float" || p.rt.kind === "float") {
         if (p.lt.kind !== "float" || p.rt.kind !== "float") {
-          throw typeError(
-            "arithmetic operators require operands of the same family",
-          );
+          throw typeError("arithmetic operators require operands of the same family");
         }
         const result = promoteFloat(p.lt.ty, p.rt.ty);
         const lhsW = widenFloatTo(p.rl, p.lt.ty, result);
@@ -15136,10 +13931,7 @@ function resolveBinary(
       // equality, §7).
       let collation: Collation | null = null;
       if (p.lt.kind === "text" && p.rt.kind === "text") {
-        const d = combineDeriv(
-          deriveCollation(scope, lhs),
-          deriveCollation(scope, rhs),
-        );
+        const d = combineDeriv(deriveCollation(scope, lhs), deriveCollation(scope, rhs));
         collation = resolveDeriv(scope.catalog, d);
       }
       return {
@@ -15228,15 +14020,9 @@ function resolveConcat(
   // The matched overload's slot pattern selects the kernel; the operands stay in source order
   // (array_prepend's kernel already reads vals[0]=element, vals[1]=array).
   let func: ArrayFuncName;
-  if (
-    chosen.argFamilies[0] === "anyarray" &&
-    chosen.argFamilies[1] === "anyarray"
-  )
+  if (chosen.argFamilies[0] === "anyarray" && chosen.argFamilies[1] === "anyarray")
     func = "array_cat";
-  else if (
-    chosen.argFamilies[0] === "anyarray" &&
-    chosen.argFamilies[1] === "anyelement"
-  )
+  else if (chosen.argFamilies[0] === "anyarray" && chosen.argFamilies[1] === "anyelement")
     func = "array_append";
   else func = "array_prepend";
   return { node: { kind: "arrayFunc", func, args: [rl.node, rr.node] }, type };
@@ -15294,8 +14080,7 @@ function resolveSetOp(
   }
   // Both slots are anyarray: the element types must unify (a non-array / mismatch is 42883).
   const tys: ResolvedType[] = [rl.type, rr.type];
-  if (!matchPoly(["anyarray", "anyarray"], tys).matched)
-    throw noSetOpOverload();
+  if (!matchPoly(["anyarray", "anyarray"], tys).matched) throw noSetOpOverload();
   return {
     node: { kind: "arrayFunc", func, args: [rl.node, rr.node] },
     type: { kind: "bool" },
@@ -15322,9 +14107,7 @@ function rangeOpFor(op: BinaryOp): RangeOpName {
     case "adjacent":
       return "adjacent";
     default:
-      throw new Error(
-        "rangeOpFor is only called for the eight set/positional operators",
-      );
+      throw new Error("rangeOpFor is only called for the eight set/positional operators");
   }
 }
 
@@ -15351,8 +14134,7 @@ function resolveRangeOp(
   if (lt.kind === "range" && rt.kind === "range") {
     const le = resolvedRangeElementScalar(lt.elem);
     const re = resolvedRangeElementScalar(rt.elem);
-    if (le === undefined || re === undefined || le !== re)
-      throw noSetOpOverload();
+    if (le === undefined || re === undefined || le !== re) throw noSetOpOverload();
     return {
       node: {
         kind: "rangeOp",
@@ -15444,8 +14226,7 @@ function resolveRangeSetOp(
   if (lt.kind === "range" && rt.kind === "range") {
     const le = resolvedRangeElementScalar(lt.elem);
     const re = resolvedRangeElementScalar(rt.elem);
-    if (le === undefined || re === undefined || le !== re)
-      throw noSetOpOverload();
+    if (le === undefined || re === undefined || le !== re) throw noSetOpOverload();
     elem = le;
   } else if (lt.kind === "range" && rt.kind === "null") {
     const le = resolvedRangeElementScalar(lt.elem);
@@ -15512,10 +14293,7 @@ function resolveQuantified(
     );
   }
   if (ra.type.kind !== "array") {
-    throw engineError(
-      "wrong_object_type",
-      "op ANY/ALL (array) requires array on right side",
-    );
+    throw engineError("wrong_object_type", "op ANY/ALL (array) requires array on right side");
   }
   const elem = ra.type.elem;
   // `x` and the element type must be comparable; PG reports operator-not-found (42883) here, NOT the
@@ -15642,9 +14420,7 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
     return;
   }
   if ((rangeL || rangeR) && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError(
-      "cannot compare a range value with a value of a different type",
-    );
+    throw typeError("cannot compare a range value with a value of a different type");
   }
   // Composite comparison is element-wise row comparison (spec/design/composite.md §5): two
   // composites are comparable iff they have the SAME field count and each corresponding field
@@ -15664,9 +14440,7 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
     return;
   }
   if ((compL || compR) && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError(
-      "cannot compare a composite value with a value of a different type",
-    );
+    throw typeError("cannot compare a composite value with a value of a different type");
   }
   // Array comparison is element-wise (spec/design/array.md §5): two arrays are comparable iff their
   // element types are comparable (recursively). A bare NULL is always comparable; an array vs any
@@ -15678,9 +14452,7 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
     return;
   }
   if ((arrL || arrR) && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError(
-      "cannot compare an array value with a value of a different type",
-    );
+    throw typeError("cannot compare an array value with a value of a different type");
   }
   // Boolean compares only with boolean (or NULL); boolean with a number/text is a mismatch.
   const boolL = lt.kind === "bool";
@@ -15700,9 +14472,7 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   const floatL = lt.kind === "float";
   const floatR = rt.kind === "float";
   if (floatL !== floatR && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError(
-      "cannot compare a float value with a value of a different type",
-    );
+    throw typeError("cannot compare a float value with a value of a different type");
   }
   // bytea compares only with bytea (or NULL); bytea with a number or text is a mismatch.
   const byteaL = lt.kind === "bytea";
@@ -15721,32 +14491,21 @@ function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
   // is a 42804 type error (spec/design/timestamp.md §5).
   const tsL = lt.kind === "timestamp" || lt.kind === "timestamptz";
   const tsR = rt.kind === "timestamp" || rt.kind === "timestamptz";
-  if (
-    (tsL || tsR) &&
-    lt.kind !== rt.kind &&
-    lt.kind !== "null" &&
-    rt.kind !== "null"
-  ) {
-    throw typeError(
-      "cannot compare a timestamp value with a value of a different type",
-    );
+  if ((tsL || tsR) && lt.kind !== rt.kind && lt.kind !== "null" && rt.kind !== "null") {
+    throw typeError("cannot compare a timestamp value with a value of a different type");
   }
   // date compares only within its own family (or with NULL); date vs any other family — incl.
   // timestamp, which would need a cast — is a 42804 (date is a strict island, spec/design/date.md §4).
   const dateL = lt.kind === "date";
   const dateR = rt.kind === "date";
   if (dateL !== dateR && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError(
-      "cannot compare a date value with a value of a different type",
-    );
+    throw typeError("cannot compare a date value with a value of a different type");
   }
   // interval compares only with itself (or NULL); interval vs any other family is a 42804.
   const ivL = lt.kind === "interval";
   const ivR = rt.kind === "interval";
   if (ivL !== ivR && lt.kind !== "null" && rt.kind !== "null") {
-    throw typeError(
-      "cannot compare an interval value with a value of a different type",
-    );
+    throw typeError("cannot compare an interval value with a value of a different type");
   }
 }
 
@@ -15761,9 +14520,7 @@ function isAdaptableOperand(e: Expr): boolean {
   if (e.kind === "param") return true;
   return (
     e.kind === "literal" &&
-    (e.literal.kind === "int" ||
-      e.literal.kind === "decimal" ||
-      e.literal.kind === "text")
+    (e.literal.kind === "int" || e.literal.kind === "decimal" || e.literal.kind === "text")
   );
 }
 
@@ -15837,10 +14594,7 @@ const allAsciiDigits = (s: string): boolean => /^[0-9]+$/.test(s);
 // literal adapting to a float column is a float value, not a stored decimal. A magnitude beyond the
 // binary64 range becomes ±Infinity here — but a finite literal is meant, so an out-of-range literal
 // traps 22003 (the finite-overflow rule, §3) rather than silently yielding Infinity.
-function floatFromDecimalLiteral(
-  d: Decimal,
-  ty: ScalarType,
-): { node: RExpr; type: ResolvedType } {
+function floatFromDecimalLiteral(d: Decimal, ty: ScalarType): { node: RExpr; type: ResolvedType } {
   const exact = Number(d.render());
   if (!Number.isFinite(exact)) throw overflow(ty);
   const n = roundToWidth(ty, exact);
@@ -15941,10 +14695,7 @@ function coerceStringLiteral(
     }
     case "decimal": {
       let d = parseDecimalLiteral(s);
-      d =
-        typmod !== null
-          ? d.coerceToTypmod(typmod.precision, typmod.scale)
-          : d.checkCap();
+      d = typmod !== null ? d.coerceToTypmod(typmod.precision, typmod.scale) : d.checkCap();
       return {
         node: { kind: "constDecimal", value: d },
         type: { kind: "decimal" },
@@ -16008,9 +14759,7 @@ function coerceStringToComposite(
     } else if (f.type.kind === "range") {
       // A range field cannot occur: CREATE TYPE rejects a range field (range columns are not
       // storable yet — R2).
-      throw new Error(
-        "a composite range field is rejected at CREATE TYPE (R2)",
-      );
+      throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
     } else {
       const { node, type } = coerceStringLiteral(tok, f.type.scalar, f.decimal);
       nodes.push(node);
@@ -16057,10 +14806,7 @@ function parseIntLiteral(s: string, ty: ScalarType): bigint {
 // Caller applies typmod / cap-check.
 function parseDecimalLiteral(s: string): Decimal {
   const invalid = (): Error =>
-    engineError(
-      "invalid_text_representation",
-      `invalid input syntax for type numeric: "${s}"`,
-    );
+    engineError("invalid_text_representation", `invalid input syntax for type numeric: "${s}"`);
   let t = trimLit(s);
   let neg = false;
   if (t.startsWith("-")) {
@@ -16154,8 +14900,7 @@ function parseBoolLiteral(s: string): boolean {
 // e-notation) or one of the special words. It is validated explicitly — NOT via parseFloat, which
 // is too lenient (it accepts "1.5xyz", leading junk after trim, etc.). Anchored to the whole
 // (trimmed) string so trailing junk is rejected → 22P02.
-const FLOAT_FINITE =
-  /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
+const FLOAT_FINITE = /^[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?$/;
 
 // parseFloatLiteral parses a string literal's content as a float of type ty — the text→float
 // coercion for `float '1.5'` / `real '1e10'` / CAST('Infinity' AS f64) (float.md §4). Grammar:
@@ -16190,8 +14935,7 @@ function parseFloatLiteral(s: string, ty: ScalarType): number {
       special = -Infinity;
       break;
   }
-  if (special !== undefined)
-    return ty === "f32" ? Math.fround(special) : special;
+  if (special !== undefined) return ty === "f32" ? Math.fround(special) : special;
   if (!FLOAT_GRAMMAR_OK(t)) throw invalid();
   // Number(...) does the IEEE-correct decimal→binary64 conversion (round-ties-to-even). The grammar
   // already rejected junk, so a NaN here would only come from an empty/degenerate string the regex
@@ -16216,9 +14960,7 @@ function FLOAT_GRAMMAR_OK(t: string): boolean {
 // comparison node sees both sides at one width. Identity when from === to. Implemented as a `cast`
 // RExpr (the evaluator's evalCast handles float→float widening), so no new node kind is needed.
 function widenFloatTo(node: RExpr, from: ScalarType, to: ScalarType): RExpr {
-  return from === to
-    ? node
-    : { kind: "cast", target: to, typmod: null, operand: node };
+  return from === to ? node : { kind: "cast", target: to, typmod: null, operand: node };
 }
 
 // promote is the promotion-tower result type of two arithmetic operands: the
@@ -16267,17 +15009,12 @@ type RtKind = ResolvedType["kind"];
 // interval * number, number * interval (commute), interval / number → interval. undefined when no
 // interval is involved (or the op is not * / /). number / interval and interval × interval return
 // undefined and fall to the ±-only temporal rule (which reports the 42804).
-function intervalScaleResult(
-  op: BinaryOp,
-  lt: RtKind,
-  rt: RtKind,
-): ScalarType | undefined {
+function intervalScaleResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {
   const lIv = lt === "interval";
   const rIv = rt === "interval";
   if (!lIv && !rIv) return undefined;
   const numeric = (k: RtKind) => k === "int" || k === "decimal" || k === "null";
-  if (op === "mul" && ((lIv && numeric(rt)) || (rIv && numeric(lt))))
-    return "interval";
+  if (op === "mul" && ((lIv && numeric(rt)) || (rIv && numeric(lt)))) return "interval";
   if (op === "div" && lIv && numeric(rt)) return "interval";
   return undefined;
 }
@@ -16289,37 +15026,27 @@ function factorToFraction(v: Value): [bigint, bigint] {
   throw typeError("internal: non-numeric interval-scale factor");
 }
 
-function temporalArithResult(
-  op: BinaryOp,
-  lt: RtKind,
-  rt: RtKind,
-): ScalarType | undefined {
-  const temporal = (k: RtKind) =>
-    k === "interval" || k === "timestamp" || k === "timestamptz";
+function temporalArithResult(op: BinaryOp, lt: RtKind, rt: RtKind): ScalarType | undefined {
+  const temporal = (k: RtKind) => k === "interval" || k === "timestamp" || k === "timestamptz";
   if (!temporal(lt) && !temporal(rt)) return undefined;
   const l = lt === "null" ? rt : lt;
   const r = rt === "null" ? lt : rt;
-  if ((op === "add" || op === "sub") && l === "interval" && r === "interval")
-    return "interval";
+  if ((op === "add" || op === "sub") && l === "interval" && r === "interval") return "interval";
   if (
     op === "add" &&
-    ((l === "timestamp" && r === "interval") ||
-      (l === "interval" && r === "timestamp"))
+    ((l === "timestamp" && r === "interval") || (l === "interval" && r === "timestamp"))
   )
     return "timestamp";
   if (op === "sub" && l === "timestamp" && r === "interval") return "timestamp";
   if (
     op === "add" &&
-    ((l === "timestamptz" && r === "interval") ||
-      (l === "interval" && r === "timestamptz"))
+    ((l === "timestamptz" && r === "interval") || (l === "interval" && r === "timestamptz"))
   )
     return "timestamptz";
-  if (op === "sub" && l === "timestamptz" && r === "interval")
-    return "timestamptz";
+  if (op === "sub" && l === "timestamptz" && r === "interval") return "timestamptz";
   if (
     op === "sub" &&
-    ((l === "timestamp" && r === "timestamp") ||
-      (l === "timestamptz" && r === "timestamptz"))
+    ((l === "timestamp" && r === "timestamp") || (l === "timestamptz" && r === "timestamptz"))
   )
     return "interval";
   throw typeError("unsupported operand types for temporal arithmetic");
@@ -16347,8 +15074,7 @@ function requireBool(t: ResolvedType, msg: string): void {
 // comparable with anything and makes the result NULL at eval). A non-text operand is a 42804
 // type error (spec/design/grammar.md §22).
 function requireTextOrNull(t: ResolvedType): void {
-  if (t.kind !== "text" && t.kind !== "null")
-    throw typeError("LIKE requires text operands");
+  if (t.kind !== "text" && t.kind !== "null") throw typeError("LIKE requires text operands");
 }
 
 // unifyArrayElementTypes unifies the element types of an ARRAY[...] constructor into one element
@@ -16361,14 +15087,12 @@ function unifyArrayElementTypes(types: ResolvedType[]): ResolvedType {
   if (nonNull.length === 0) return { kind: "text" };
   if (nonNull.every((t) => t.kind === "int")) {
     let acc = nonNull[0]!;
-    for (const t of nonNull.slice(1))
-      acc = { kind: "int", ty: promote(acc, t) };
+    for (const t of nonNull.slice(1)) acc = { kind: "int", ty: promote(acc, t) };
     return acc;
   }
   const first = nonNull[0]!;
   for (const t of nonNull.slice(1)) {
-    if (t.kind !== first.kind)
-      throw typeError("array elements must all be of the same type");
+    if (t.kind !== first.kind) throw typeError("array elements must all be of the same type");
   }
   return first;
 }
@@ -16433,11 +15157,7 @@ function evalArrayFunc(func: ArrayFuncName, vals: Value[]): Value {
     case "array_replace":
       return arrayReplaceValue(vals[0]!, vals[1]!, vals[2]!);
     case "array_position":
-      return arrayPositionValue(
-        vals[0]!,
-        vals[1]!,
-        vals.length > 2 ? vals[2]! : null,
-      );
+      return arrayPositionValue(vals[0]!, vals[1]!, vals.length > 2 ? vals[2]! : null);
     case "array_positions":
       return arrayPositionsValue(vals[0]!, vals[1]!);
     case "contains":
@@ -16487,8 +15207,7 @@ function evalRangeFunc(func: RangeFuncName, vals: Value[]): Value {
 // empty-normalize).
 function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
   const desc = rangeForElement(elem);
-  if (desc === undefined)
-    throw new Error("a range constructor's elem has a range");
+  if (desc === undefined) throw new Error("a range constructor's elem has a range");
   const lower = coerceRangeBound(vals[0]!, elem);
   const upper = coerceRangeBound(vals[1]!, elem);
   let lowerInc: boolean;
@@ -16499,10 +15218,7 @@ function evalRangeCtor(elem: ScalarType, vals: Value[]): Value {
     lowerInc = true;
     upperInc = false;
   } else if (flags.kind === "null") {
-    throw engineError(
-      "data_exception",
-      "range constructor flags argument must not be null",
-    );
+    throw engineError("data_exception", "range constructor flags argument must not be null");
   } else if (flags.kind === "text") {
     [lowerInc, upperInc] = parseBoundFlags(flags.text);
   } else {
@@ -16523,9 +15239,7 @@ function coerceRangeBound(v: Value, elem: ScalarType): Value | null {
 // expectRange extracts the range value the resolver guaranteed is a (non-NULL) range operand.
 function expectRange(v: Value): Value & { kind: "range" } {
   if (v.kind !== "range")
-    throw new Error(
-      "the range-operator resolver guarantees a range operand here",
-    );
+    throw new Error("the range-operator resolver guarantees a range operand here");
   return v;
 }
 
@@ -16534,12 +15248,7 @@ function expectRange(v: Value): Value & { kind: "range" } {
 // operators both operands are ranges; for the element overloads (containsElem/elemContainedBy) the
 // non-range operand is coerced to the range's element type `elem` (assignment-style, matching the
 // resolver's hint). The boolean kernels live in range.ts.
-function evalRangeOp(
-  op: RangeOpName,
-  l: Value,
-  r: Value,
-  elem: ScalarType,
-): Value {
+function evalRangeOp(op: RangeOpName, l: Value, r: Value, elem: ScalarType): Value {
   if (l.kind === "null" || r.kind === "null") return nullValue();
   let result: boolean;
   switch (op) {
@@ -16620,9 +15329,7 @@ function strictElemEq(a: Value, b: Value): boolean {
 // whole-array operand → NULL. The empty array is contained by anything (a @> {} is true).
 function arrayContainsValue(a: Value, b: Value): Value {
   if (a.kind !== "array" || b.kind !== "array") return nullValue();
-  const contained = b.elements.every((eb) =>
-    a.elements.some((ea) => strictElemEq(ea, eb)),
-  );
+  const contained = b.elements.every((eb) => a.elements.some((ea) => strictElemEq(ea, eb)));
   return boolValue(contained);
 }
 
@@ -16631,9 +15338,7 @@ function arrayContainsValue(a: Value, b: Value): Value {
 // whole-array operand → NULL. The empty array overlaps nothing.
 function arrayOverlapsValue(a: Value, b: Value): Value {
   if (a.kind !== "array" || b.kind !== "array") return nullValue();
-  const overlaps = a.elements.some((ea) =>
-    b.elements.some((eb) => strictElemEq(ea, eb)),
-  );
+  const overlaps = a.elements.some((ea) => b.elements.some((eb) => strictElemEq(ea, eb)));
   return boolValue(overlaps);
 }
 
@@ -16672,11 +15377,7 @@ function arrayReplaceValue(arr: Value, from: Value, to: Value): Value {
 // array's lower-bound space) of the first element NOT DISTINCT FROM e, NULL if absent. 1-D/empty only
 // (a multidimensional array is 0A000); the optional start is a subscript to begin at, and a NULL
 // start is 22004.
-function arrayPositionValue(
-  arr: Value,
-  elem: Value,
-  start: Value | null,
-): Value {
+function arrayPositionValue(arr: Value, elem: Value, start: Value | null): Value {
   if (arr.kind !== "array") return nullValue();
   if (arr.dims.length > 1) {
     throw engineError(
@@ -16688,10 +15389,7 @@ function arrayPositionValue(
   let begin = 0;
   if (start !== null) {
     if (start.kind === "null")
-      throw engineError(
-        "null_value_not_allowed",
-        "initial position must not be null",
-      );
+      throw engineError("null_value_not_allowed", "initial position must not be null");
     const off = Number((start as { int: bigint }).int) - lb;
     if (off > 0) begin = off;
   }
@@ -16715,8 +15413,7 @@ function arrayPositionsValue(arr: Value, elem: Value): Value {
   const lb = arr.lbounds.length > 0 ? arr.lbounds[0]! : 1;
   const positions: Value[] = [];
   for (let i = 0; i < arr.elements.length; i++) {
-    if (notDistinct(arr.elements[i]!, elem))
-      positions.push(intValue(BigInt(lb + i)));
+    if (notDistinct(arr.elements[i]!, elem)) positions.push(intValue(BigInt(lb + i)));
   }
   return arrayValue(positions);
 }
@@ -16725,8 +15422,7 @@ function arrayPositionsValue(arr: Value, elem: Value): Value {
 // prefix — array-functions.md §3.1).
 function arrayDimsText(a: { dims: number[]; lbounds: number[] }): string {
   let s = "";
-  for (let d = 0; d < a.dims.length; d++)
-    s += "[" + a.lbounds[d] + ":" + arrayUbound(a, d) + "]";
+  for (let d = 0; d < a.dims.length; d++) s += "[" + a.lbounds[d] + ":" + arrayUbound(a, d) + "]";
   return s;
 }
 
@@ -16736,10 +15432,7 @@ function arrayDimsText(a: { dims: number[]; lbounds: number[] }): string {
 function arrayExtend(arr: Value, elem: Value, atEnd: boolean): Value {
   if (arr.kind !== "array" || arr.dims.length === 0) return arrayValue([elem]);
   if (arr.dims.length !== 1) {
-    throw engineError(
-      "data_exception",
-      "argument must be empty or one-dimensional array",
-    );
+    throw engineError("data_exception", "argument must be empty or one-dimensional array");
   }
   const elements = atEnd ? [...arr.elements, elem] : [elem, ...arr.elements];
   return {
@@ -16763,10 +15456,7 @@ function arrayCatValues(a: Value, b: Value): Value {
   if (a.dims.length === 0) return b;
   if (b.dims.length === 0) return a;
   const mismatch = () =>
-    engineError(
-      "array_subscript_error",
-      "cannot concatenate incompatible arrays",
-    );
+    engineError("array_subscript_error", "cannot concatenate incompatible arrays");
   const eqInts = (x: number[], y: number[]): boolean =>
     x.length === y.length && x.every((v, i) => v === y[i]);
   const elements = [...a.elements, ...b.elements];
@@ -16798,8 +15488,7 @@ function arrayCatValues(a: Value, b: Value): Value {
 // NULL sub-array or a sub-array of differing shape is a 2202E. Stacking empty sub-arrays yields the
 // empty array (PG: ARRAY['{}'::int[]] → {}).
 function buildNestedArray(subs: Value[]): Value {
-  const mismatch =
-    "multidimensional arrays must have array expressions with matching dimensions";
+  const mismatch = "multidimensional arrays must have array expressions with matching dimensions";
   const arrs = subs.map((sv) => {
     if (sv.kind === "array") return sv;
     if (sv.kind === "null") throw arraySubscriptErr(mismatch);
@@ -16810,8 +15499,7 @@ function buildNestedArray(subs: Value[]): Value {
   const dims0 = arrs[0]!.dims;
   const lbounds0 = arrs[0]!.lbounds;
   for (const a of arrs.slice(1)) {
-    if (!eqNum(a.dims, dims0) || !eqNum(a.lbounds, lbounds0))
-      throw arraySubscriptErr(mismatch);
+    if (!eqNum(a.dims, dims0) || !eqNum(a.lbounds, lbounds0)) throw arraySubscriptErr(mismatch);
   }
   if (dims0.length === 0) return emptyArray(); // all sub-arrays empty → empty array
   const elements: Value[] = [];
@@ -16835,8 +15523,7 @@ function evalSubscript(
 ): Value {
   const base = evalExpr(e.base, row, env, m);
   if (base.kind === "null") return nullValue();
-  if (base.kind !== "array")
-    throw typeError("internal: subscript on a non-array value");
+  if (base.kind !== "array") throw typeError("internal: subscript on a non-array value");
   if (e.isSlice) {
     // Per-dimension (lower, upper); a scalar index i becomes 1:i (PG), an omitted bound defers to
     // the array's own bound (null lo/hi). A NULL bound → NULL.
@@ -16846,8 +15533,7 @@ function evalSubscript(
       if (!s.isSlice) {
         const v = evalExpr(s.index, row, env, m);
         if (v.kind === "null") return nullValue();
-        if (v.kind !== "int")
-          throw typeError("internal: non-integer array subscript");
+        if (v.kind !== "int") throw typeError("internal: non-integer array subscript");
         los.push(1n); // scalar i → 1:i
         his.push(v.int);
       } else {
@@ -16867,8 +15553,7 @@ function evalSubscript(
     if (s.isSlice) throw typeError("internal: slice spec in element access");
     const v = evalExpr(s.index, row, env, m);
     if (v.kind === "null") return nullValue();
-    if (v.kind !== "int")
-      throw typeError("internal: non-integer array subscript");
+    if (v.kind !== "int") throw typeError("internal: non-integer array subscript");
     idxs.push(v.int);
   }
   return arrayGetElement(base, idxs);
@@ -16876,17 +15561,11 @@ function evalSubscript(
 
 // evalOptBound evaluates an optional slice-bound expression: null expr → null (defer to the array
 // bound); a NULL value → "null" (the whole result is NULL); an integer → its bigint.
-function evalOptBound(
-  e: RExpr | null,
-  row: Row,
-  env: EvalEnv,
-  m: Meter,
-): bigint | null | "null" {
+function evalOptBound(e: RExpr | null, row: Row, env: EvalEnv, m: Meter): bigint | null | "null" {
   if (e === null) return null;
   const v = evalExpr(e, row, env, m);
   if (v.kind === "null") return "null";
-  if (v.kind !== "int")
-    throw typeError("internal: non-integer array slice bound");
+  if (v.kind !== "int") throw typeError("internal: non-integer array slice bound");
   return v.int;
 }
 
@@ -16943,16 +15622,14 @@ function arrayGetSlice(
   // Row-major strides over the SOURCE array.
   const strides: number[] = new Array(ndim);
   strides[ndim - 1] = 1;
-  for (let d = ndim - 2; d >= 0; d--)
-    strides[d] = strides[d + 1]! * a.dims[d + 1]!;
+  for (let d = ndim - 2; d >= 0; d--) strides[d] = strides[d + 1]! * a.dims[d + 1]!;
   let total = 1;
   for (const d of newDims) total *= d;
   const elements: Value[] = new Array(total);
   const counter: number[] = new Array(ndim).fill(0);
   for (let k = 0; k < total; k++) {
     let flat = 0;
-    for (let d = 0; d < ndim; d++)
-      flat += (starts[d]! + counter[d]!) * strides[d]!;
+    for (let d = 0; d < ndim; d++) flat += (starts[d]! + counter[d]!) * strides[d]!;
     elements[k] = a.elements[flat]!;
     for (let d = ndim - 1; d >= 0; d--) {
       counter[d]!++;
@@ -16988,8 +15665,7 @@ function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
     // All integer: the widest via the promotion tower (width is unobservable in output — every
     // integer renders under the `I` tag — but the fold keeps the type precise).
     let acc = nonNull[0]!;
-    for (const t of nonNull.slice(1))
-      acc = { kind: "int", ty: promote(acc, t) };
+    for (const t of nonNull.slice(1)) acc = { kind: "int", ty: promote(acc, t) };
     return acc;
   }
   // All float: the widest via the float tower (f32 + f64 → f64). A float mixed with a
@@ -16997,15 +15673,13 @@ function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
   // island, no int/decimal reconciliation, float.md §6).
   if (nonNull.every((t) => t.kind === "float")) {
     let acc = (nonNull[0] as { kind: "float"; ty: ScalarType }).ty;
-    for (const t of nonNull.slice(1))
-      acc = promoteFloat(acc, (t as { ty: ScalarType }).ty);
+    for (const t of nonNull.slice(1)) acc = promoteFloat(acc, (t as { ty: ScalarType }).ty);
     return { kind: "float", ty: acc };
   }
   // Non-numeric: every arm must be the same family as the first (cross-family is 42804).
   const first = nonNull[0]!;
   for (const t of nonNull.slice(1)) {
-    if (t.kind !== first.kind)
-      throw typeError("CASE result types must be compatible");
+    if (t.kind !== first.kind) throw typeError("CASE result types must be compatible");
   }
   return first;
 }
@@ -17015,8 +15689,7 @@ function unifyCaseTypes(arms: ResolvedType[]): ResolvedType {
 // integer-width unification needs none (all integers are bigint), and an all-NULL CASE is text but
 // every arm evaluates to NULL anyway.
 function coerceCaseValue(v: Value, toDecimal: boolean): Value {
-  if (toDecimal && v.kind === "int")
-    return decimalValue(Decimal.fromBigInt(v.int));
+  if (toDecimal && v.kind === "int") return decimalValue(Decimal.fromBigInt(v.int));
   return v;
 }
 
@@ -17042,12 +15715,8 @@ function unifyValuesColumn(a: ResolvedType, b: ResolvedType): ResolvedType {
   if (a.kind === "null" && b.kind === "null") return { kind: "null" };
   if (a.kind === "null") return b;
   if (b.kind === "null") return a;
-  if (a.kind === "int" && b.kind === "int")
-    return { kind: "int", ty: promote(a, b) };
-  if (
-    (a.kind === "int" || a.kind === "decimal") &&
-    (b.kind === "int" || b.kind === "decimal")
-  ) {
+  if (a.kind === "int" && b.kind === "int") return { kind: "int", ty: promote(a, b) };
+  if ((a.kind === "int" || a.kind === "decimal") && (b.kind === "int" || b.kind === "decimal")) {
     return { kind: "decimal" };
   }
   if (a.kind === "float" && b.kind === "float" && a.ty === b.ty) return a;
@@ -17102,20 +15771,12 @@ function scalarForParamHint(rt: ResolvedType): ScalarType | null {
   }
 }
 
-function unifySetopColumn(
-  a: ResolvedType,
-  b: ResolvedType,
-  op: SetOpKind,
-): ResolvedType {
+function unifySetopColumn(a: ResolvedType, b: ResolvedType, op: SetOpKind): ResolvedType {
   if (a.kind === "null" && b.kind === "null") return { kind: "null" };
   if (a.kind === "null") return b;
   if (b.kind === "null") return a;
-  if (a.kind === "int" && b.kind === "int")
-    return { kind: "int", ty: promote(a, b) };
-  if (
-    (a.kind === "int" || a.kind === "decimal") &&
-    (b.kind === "int" || b.kind === "decimal")
-  ) {
+  if (a.kind === "int" && b.kind === "int") return { kind: "int", ty: promote(a, b) };
+  if ((a.kind === "int" || a.kind === "decimal") && (b.kind === "int" || b.kind === "decimal")) {
     // at least one decimal (both-int handled above) -> decimal
     return { kind: "decimal" };
   }
@@ -17133,11 +15794,7 @@ function unifySetopColumn(
 // coerceSetopRows converts each row's values in place to the unified set-operation column types —
 // the only runtime change is integer -> decimal (a NULL stays NULL; integer-width promotion is a
 // value no-op since every integer is bigint). Same conversion coerceCaseValue uses for CASE.
-function coerceSetopRows(
-  rows: Value[][],
-  from: ResolvedType[],
-  to: ResolvedType[],
-): void {
+function coerceSetopRows(rows: Value[][], from: ResolvedType[], to: ResolvedType[]): void {
   for (let i = 0; i < to.length; i++) {
     if (from[i]!.kind === "int" && to[i]!.kind === "decimal") {
       for (const row of rows) {
@@ -17163,12 +15820,7 @@ function coerceSetopRows(
 // key is its FIRST occurrence scanning the LEFT operand then the right, and emitted rows keep that
 // left-then-right scan order — deterministic and identical across cores. (A later ORDER BY
 // re-sorts; without one, output order is unspecified and the corpus compares rowsort.)
-function combineSetop(
-  op: SetOpKind,
-  all: boolean,
-  left: Value[][],
-  right: Value[][],
-): Value[][] {
+function combineSetop(op: SetOpKind, all: boolean, left: Value[][], right: Value[][]): Value[][] {
   if (op === "union" && all) return left.concat(right);
   if (op === "union") {
     const seen = new Set<string>();
@@ -17248,19 +15900,10 @@ function combineSetop(
 // operation); an unknown name is 42703. Returns the output column index.
 function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
   if (key.qualifier !== null) {
-    throw engineError(
-      "undefined_table",
-      "missing FROM-clause entry for table " + key.qualifier,
-    );
+    throw engineError("undefined_table", "missing FROM-clause entry for table " + key.qualifier);
   }
-  const idx = names.findIndex(
-    (n) => n.toLowerCase() === key.column.toLowerCase(),
-  );
-  if (idx < 0)
-    throw engineError(
-      "undefined_column",
-      "column " + key.column + " does not exist",
-    );
+  const idx = names.findIndex((n) => n.toLowerCase() === key.column.toLowerCase());
+  if (idx < 0) throw engineError("undefined_column", "column " + key.column + " does not exist");
   return idx;
 }
 
@@ -17270,37 +15913,24 @@ function resolveSetopOrderKey(key: OrderKey, names: string[]): number {
 // (or NULL). A decimal value into an integer column is NOT assignable (decimal→int is
 // explicit-CAST only). Any cross-family pair is a 42804 type error. Mirrors the INSERT literal
 // type-check, generalized to expressions.
-function requireAssignable(
-  t: ResolvedType,
-  colTy: ScalarType,
-  col: string,
-): void {
+function requireAssignable(t: ResolvedType, colTy: ScalarType, col: string): void {
   let ok: boolean;
   if (isInteger(colTy)) ok = t.kind === "int" || t.kind === "null";
-  else if (isDecimal(colTy))
-    ok = t.kind === "int" || t.kind === "decimal" || t.kind === "null";
+  else if (isDecimal(colTy)) ok = t.kind === "int" || t.kind === "decimal" || t.kind === "null";
   // A float column accepts a float value of EQUAL OR NARROWER width (f32 → f64 widening is
   // implicit; f64 → f32 needs an explicit CAST — float.md §6) or NULL. No int/decimal.
   else if (isFloat(colTy))
-    ok =
-      (t.kind === "float" && promoteFloat(t.ty, colTy) === colTy) ||
-      t.kind === "null";
+    ok = (t.kind === "float" && promoteFloat(t.ty, colTy) === colTy) || t.kind === "null";
   else if (isBool(colTy)) ok = t.kind === "bool" || t.kind === "null";
   else if (isBytea(colTy)) ok = t.kind === "bytea" || t.kind === "null";
   else if (isUuid(colTy)) ok = t.kind === "uuid" || t.kind === "null";
   else if (isTimestamp(colTy)) ok = t.kind === "timestamp" || t.kind === "null";
-  else if (isTimestamptz(colTy))
-    ok = t.kind === "timestamptz" || t.kind === "null";
+  else if (isTimestamptz(colTy)) ok = t.kind === "timestamptz" || t.kind === "null";
   else if (isInterval(colTy)) ok = t.kind === "interval" || t.kind === "null";
   else if (isDate(colTy)) ok = t.kind === "date" || t.kind === "null";
   else ok = t.kind === "text" || t.kind === "null";
   if (!ok) {
-    throw typeError(
-      "cannot assign a value to column " +
-        col +
-        " of type " +
-        canonicalName(colTy),
-    );
+    throw typeError("cannot assign a value to column " + col + " of type " + canonicalName(colTy));
   }
 }
 
@@ -17374,18 +16004,14 @@ function storeValue(
         if (!inRange(colTy, v.int)) throw overflow(colTy);
         return intValue(v.int);
       }
-      if (isDecimal(colTy))
-        return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
+      if (isDecimal(colTy)) return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
       // An integer LITERAL adapts to a float column (float.md §4 literal adaptation — INSERT VALUES /
       // DEFAULT bypass the expression resolver, so the adaptation lands here, like text→bytea). This
       // is literal adaptation, NOT an implicit cross-family cast of a value (storing a f64 into a
       // f32 is still rejected below). Out of binary range → 22003 (the finite-overflow rule).
       if (isFloat(colTy)) return makeFloat(colTy, Number(v.int));
       throw typeError(
-        "cannot store an integer value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
+        "cannot store an integer value in " + canonicalName(colTy) + " column " + colName,
       );
     case "decimal":
       if (isDecimal(colTy)) return decimalValue(coerceDecimal(v.dec, typmod));
@@ -17396,32 +16022,19 @@ function storeValue(
         return makeFloat(colTy, d);
       }
       throw typeError(
-        "cannot store a decimal value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
+        "cannot store a decimal value in " + canonicalName(colTy) + " column " + colName,
       );
     case "f32":
       // f32 into f32 stores as-is; into f64 widens losslessly (every binary32 is an
       // exact binary64 — float.md §2). Bits (incl -0/NaN) preserved. No cross-family store.
       if (colTy === "f32") return v;
       if (colTy === "f64") return float64Value(v.value);
-      throw typeError(
-        "cannot store a f32 value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
-      );
+      throw typeError("cannot store a f32 value in " + canonicalName(colTy) + " column " + colName);
     case "f64":
       // f64 into f64 stores as-is. f64 → f32 is LOSSY (explicit cast required, not a
       // silent store) so it is rejected here (the resolver's assignableTo already gates it 42804).
       if (colTy === "f64") return v;
-      throw typeError(
-        "cannot store a f64 value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
-      );
+      throw typeError("cannot store a f64 value in " + canonicalName(colTy) + " column " + colName);
     case "text":
       if (isText(colTy)) return v;
       // A string literal adapts to a bytea column, decoding the hex input (types.md §6/§13);
@@ -17431,72 +16044,47 @@ function storeValue(
       if (isUuid(colTy)) return uuidValue(decodeUuidLiteral(v.text));
       // ... or to a timestamp column (spec/design/timestamp.md); bad input traps 22007/22008.
       if (isTimestamp(colTy)) return timestampValue(parseTimestamp(v.text));
-      if (isTimestamptz(colTy))
-        return timestamptzValue(parseTimestamptz(v.text));
+      if (isTimestamptz(colTy)) return timestamptzValue(parseTimestamptz(v.text));
       if (isDate(colTy)) return dateValue(parseDate(v.text));
       // ... or to an interval column (spec/design/interval.md); bad input traps 22007/22008.
       if (isInterval(colTy)) return intervalValue(parseInterval(v.text));
       throw typeError(
-        "cannot store a text value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
+        "cannot store a text value in " + canonicalName(colTy) + " column " + colName,
       );
     case "bytea":
       if (isBytea(colTy)) return v;
       throw typeError(
-        "cannot store a bytea value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
+        "cannot store a bytea value in " + canonicalName(colTy) + " column " + colName,
       );
     case "uuid":
       if (isUuid(colTy)) return v;
       throw typeError(
-        "cannot store a uuid value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
+        "cannot store a uuid value in " + canonicalName(colTy) + " column " + colName,
       );
     case "timestamp":
       if (isTimestamp(colTy)) return v;
       throw typeError(
-        "cannot store a timestamp value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
+        "cannot store a timestamp value in " + canonicalName(colTy) + " column " + colName,
       );
     case "timestamptz":
       if (isTimestamptz(colTy)) return v;
       throw typeError(
-        "cannot store a timestamptz value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
+        "cannot store a timestamptz value in " + canonicalName(colTy) + " column " + colName,
       );
     case "date":
       if (isDate(colTy)) return v;
       throw typeError(
-        "cannot store a date value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
+        "cannot store a date value in " + canonicalName(colTy) + " column " + colName,
       );
     case "interval":
       if (isInterval(colTy)) return v;
       throw typeError(
-        "cannot store an interval value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
+        "cannot store an interval value in " + canonicalName(colTy) + " column " + colName,
       );
     default: // bool
       if (isBool(colTy)) return v;
       throw typeError(
-        "cannot store a boolean value in " +
-          canonicalName(colTy) +
-          " column " +
-          colName,
+        "cannot store a boolean value in " + canonicalName(colTy) + " column " + colName,
       );
   }
 }
@@ -17504,9 +16092,7 @@ function storeValue(
 // coerceDecimal coerces a decimal into a column's typmod: round to the declared scale and
 // precision-check (22003) for numeric(p,s); for an unconstrained numeric column just cap-check.
 function coerceDecimal(d: Decimal, typmod: DecimalTypmod | null): Decimal {
-  return typmod !== null
-    ? d.coerceToTypmod(typmod.precision, typmod.scale)
-    : d.checkCap();
+  return typmod !== null ? d.coerceToTypmod(typmod.precision, typmod.scale) : d.checkCap();
 }
 
 // literalToValue wraps a parsed literal as a runtime value (type-check/coercion is storeValue).
@@ -17535,8 +16121,7 @@ function coerceForStore(
   notNull: boolean,
   colName: string,
 ): Value {
-  if (ty.kind === "scalar")
-    return storeValue(v, ty.scalar, typmod, notNull, colName);
+  if (ty.kind === "scalar") return storeValue(v, ty.scalar, typmod, notNull, colName);
   if (ty.kind === "array") return storeArray(v, ty.elem, notNull, colName);
   if (ty.kind === "range") return storeRange(v, ty.elem, notNull, colName);
   return storeComposite(v, ty.name, ty.fields, notNull, colName);
@@ -17549,12 +16134,7 @@ function coerceForStore(
 // the value passes through; any other value is a 42804. An infinite bound is null and skipped;
 // bounds are never NULL here (a null bound is infinite, not NULL), so the element store is never
 // NOT NULL.
-function storeRange(
-  v: Value,
-  elem: ColType,
-  notNull: boolean,
-  colName: string,
-): Value {
+function storeRange(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
   if (v.kind === "null") {
     if (notNull) {
       throw engineError(
@@ -17565,9 +16145,7 @@ function storeRange(
     return nullValue();
   }
   if (v.kind !== "range") {
-    throw typeError(
-      "cannot store a non-range value in range column " + colName,
-    );
+    throw typeError("cannot store a non-range value in range column " + colName);
   }
   if (v.empty) return v;
   const coerce = (b: Value | null): Value | null =>
@@ -17578,12 +16156,7 @@ function storeRange(
 // storeArray coerces a value into an ARRAY column (spec/design/array.md §4): NULL honours NOT NULL
 // (23502); an array value coerces each element to the declared element type via coerceForStore (a
 // NULL element is allowed — array elements are nullable). Any other value is a 42804.
-function storeArray(
-  v: Value,
-  elem: ColType,
-  notNull: boolean,
-  colName: string,
-): Value {
+function storeArray(v: Value, elem: ColType, notNull: boolean, colName: string): Value {
   if (v.kind === "null") {
     if (notNull) {
       throw engineError(
@@ -17594,15 +16167,11 @@ function storeArray(
     return nullValue();
   }
   if (v.kind !== "array") {
-    throw typeError(
-      "cannot store a non-array value in array column " + colName,
-    );
+    throw typeError("cannot store a non-array value in array column " + colName);
   }
   // Elements are nullable; the element typmod is unconstrained this slice (numeric(p,s)[] deferred).
   // The shape (dims/lbounds) is preserved.
-  const out = v.elements.map((el) =>
-    coerceForStore(el, elem, null, false, colName),
-  );
+  const out = v.elements.map((el) => coerceForStore(el, elem, null, false, colName));
   return { kind: "array", dims: v.dims, lbounds: v.lbounds, elements: out };
 }
 
@@ -17628,11 +16197,7 @@ function storeComposite(
   }
   if (v.kind !== "composite") {
     throw typeError(
-      "cannot store a non-record value in composite column " +
-        colName +
-        " (type " +
-        typeName +
-        ")",
+      "cannot store a non-record value in composite column " + colName + " (type " + typeName + ")",
     );
   }
   if (v.fields.length !== fields.length) {
@@ -17658,11 +16223,7 @@ function storeComposite(
 // composite slot is a ROW(…) whose fields recurse against the composite's field types, or a bound
 // $N. The result is then fully coerced/range-checked by coerceForStore. DEFAULT is handled by the
 // caller at the top level (it is not a valid field inside a ROW(…)).
-function materializeInsertValue(
-  iv: InsertValue,
-  ty: ColType,
-  bound: Value[],
-): Value {
+function materializeInsertValue(iv: InsertValue, ty: ColType, bound: Value[]): Value {
   if (ty.kind === "array") {
     switch (iv.kind) {
       case "array": {
@@ -17671,14 +16232,10 @@ function materializeInsertValue(
         // §4); otherwise each element materializes against the element type into a flat 1-D array. A
         // scalar mixed with an array sub-element errors 42804 (materialized against the array type).
         if (iv.elements.some((el) => el.kind === "array")) {
-          const subs = iv.elements.map((el) =>
-            materializeInsertValue(el, ty, bound),
-          );
+          const subs = iv.elements.map((el) => materializeInsertValue(el, ty, bound));
           return buildNestedArray(subs);
         }
-        const vals = iv.elements.map((el) =>
-          materializeInsertValue(el, ty.elem, bound),
-        );
+        const vals = iv.elements.map((el) => materializeInsertValue(el, ty.elem, bound));
         return arrayValue(vals);
       }
       case "param":
@@ -17688,15 +16245,11 @@ function materializeInsertValue(
       case "lit":
         // A bare string literal adapts to the array context via array_in (the same
         // string-adapts-to-context rule bytea/uuid use — spec/design/array.md §7).
-        if (iv.lit.kind === "text")
-          return coerceStringToArray(iv.lit.text, ty.elem);
+        if (iv.lit.kind === "text") return coerceStringToArray(iv.lit.text, ty.elem);
         if (iv.lit.kind === "null") return nullValue();
         throw typeError("cannot assign a scalar value to an array column");
       default: // default
-        throw engineError(
-          "syntax_error",
-          "DEFAULT is not allowed inside ARRAY[...]",
-        );
+        throw engineError("syntax_error", "DEFAULT is not allowed inside ARRAY[...]");
     }
   }
   if (ty.kind === "range") {
@@ -17705,14 +16258,12 @@ function materializeInsertValue(
     if (ty.elem.kind !== "scalar")
       throw new Error("a range element is always a scalar (ranges.md §2)");
     const desc = rangeForElement(ty.elem.scalar);
-    if (desc === undefined)
-      throw new Error("a range column's element always has a range type");
+    if (desc === undefined) throw new Error("a range column's element always has a range type");
     switch (iv.kind) {
       case "lit":
         // A bare string literal adapts to the range context via range_in (the same
         // string-adapts-to-context rule array/bytea/uuid use — spec/design/ranges.md §5).
-        if (iv.lit.kind === "text")
-          return coerceStringToRange(iv.lit.text, desc);
+        if (iv.lit.kind === "text") return coerceStringToRange(iv.lit.text, desc);
         if (iv.lit.kind === "null") return nullValue();
         throw typeError("cannot assign a scalar value to a range column");
       case "param":
@@ -17722,10 +16273,7 @@ function materializeInsertValue(
       case "row":
         throw typeError("cannot assign a record value to a range column");
       default: // default
-        throw engineError(
-          "syntax_error",
-          "DEFAULT is not allowed inside ROW(...)",
-        );
+        throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
     }
   }
   if (ty.kind === "scalar") {
@@ -17735,22 +16283,11 @@ function materializeInsertValue(
       case "param":
         return bound[iv.index - 1]!;
       case "row":
-        throw typeError(
-          "cannot assign a record value to a " +
-            canonicalName(ty.scalar) +
-            " field",
-        );
+        throw typeError("cannot assign a record value to a " + canonicalName(ty.scalar) + " field");
       case "array":
-        throw typeError(
-          "cannot assign an array value to a " +
-            canonicalName(ty.scalar) +
-            " field",
-        );
+        throw typeError("cannot assign an array value to a " + canonicalName(ty.scalar) + " field");
       default: // default
-        throw engineError(
-          "syntax_error",
-          "DEFAULT is not allowed inside ROW(...)",
-        );
+        throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
     }
   }
   // ty is a composite column type.
@@ -17768,32 +16305,17 @@ function materializeInsertValue(
       }
       const vals: Value[] = new Array(ty.fields.length);
       for (let i = 0; i < ty.fields.length; i++)
-        vals[i] = materializeInsertValue(
-          iv.fields[i]!,
-          ty.fields[i]!.type,
-          bound,
-        );
+        vals[i] = materializeInsertValue(iv.fields[i]!, ty.fields[i]!.type, bound);
       return compositeValue(vals);
     }
     case "param":
       return bound[iv.index - 1]!;
     case "lit":
-      throw typeError(
-        "cannot assign a scalar value to composite column (type " +
-          ty.name +
-          ")",
-      );
+      throw typeError("cannot assign a scalar value to composite column (type " + ty.name + ")");
     case "array":
-      throw typeError(
-        "cannot assign an array value to composite column (type " +
-          ty.name +
-          ")",
-      );
+      throw typeError("cannot assign an array value to composite column (type " + ty.name + ")");
     default: // default
-      throw engineError(
-        "syntax_error",
-        "DEFAULT is not allowed inside ROW(...)",
-      );
+      throw engineError("syntax_error", "DEFAULT is not allowed inside ROW(...)");
   }
 }
 
@@ -17856,14 +16378,11 @@ function coerceRecordTextToValue(
   const vals = tokens.map((tok, i) => {
     if (tok === null) return nullValue();
     const f = ct.fields[i]!;
-    if (f.type.kind === "composite")
-      return coerceRecordTextToValue(tok, f.type);
+    if (f.type.kind === "composite") return coerceRecordTextToValue(tok, f.type);
     if (f.type.kind === "array") return coerceStringToArray(tok, f.type.elem);
     // A composite range field is unreachable: CREATE TYPE rejects a range field (R2).
     if (f.type.kind === "range")
-      throw new Error(
-        "a composite range field is rejected at CREATE TYPE (R2)",
-      );
+      throw new Error("a composite range field is rejected at CREATE TYPE (R2)");
     const { node } = coerceStringLiteral(tok, f.type.scalar, f.typmod);
     return rexprConstToValue(node);
   });
@@ -17930,12 +16449,7 @@ const I64_MIN = -9223372036854775808n;
 // = TRUE) independent of lv. Otherwise: a positive match -> TRUE; else a NULL element (or NULL lv)
 // -> NULL; else FALSE. NOT IN is the Kleene negation. Shared by the folded "inValues" node and the
 // correlated "subquery"/in eval.
-function inMembership(
-  lv: Value,
-  list: Value[],
-  negated: boolean,
-  m: Meter,
-): Value {
+function inMembership(lv: Value, list: Value[], negated: boolean, m: Meter): Value {
   if (list.length === 0) return { kind: "bool", value: negated };
   let anyMatch = false;
   let anyNull = false;
@@ -18002,8 +16516,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // fields (spec/design/composite.md §1, cost.md §9).
       m.charge(COSTS.operatorEval);
       const vals: Value[] = new Array(e.fields.length);
-      for (let i = 0; i < e.fields.length; i++)
-        vals[i] = evalExpr(e.fields[i]!, row, env, m);
+      for (let i = 0; i < e.fields.length; i++) vals[i] = evalExpr(e.fields[i]!, row, env, m);
       return compositeValue(vals);
     }
     case "array": {
@@ -18011,8 +16524,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // into one higher dimension (spec/design/array.md §4); otherwise a flat 1-D array.
       m.charge(COSTS.operatorEval);
       const elems: Value[] = new Array(e.elements.length);
-      for (let i = 0; i < e.elements.length; i++)
-        elems[i] = evalExpr(e.elements[i]!, row, env, m);
+      for (let i = 0; i < e.elements.length; i++) elems[i] = evalExpr(e.elements[i]!, row, env, m);
       return e.nested ? buildNestedArray(elems) : arrayValue(elems);
     }
     case "constArray":
@@ -18050,16 +16562,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const v = evalExpr(e.operand, row, env, m);
       if (v.kind === "null") return nullValue();
       if (isInterval(e.result)) {
-        if (v.kind !== "interval")
-          throw typeError("internal: non-interval unary minus");
+        if (v.kind !== "interval") throw typeError("internal: non-interval unary minus");
         return intervalValue(intervalNeg(v.iv));
       }
       if (isDecimal(e.result)) {
         return decimalValue(
-          (v.kind === "int"
-            ? Decimal.fromBigInt(v.int)
-            : (v as { dec: Decimal }).dec
-          ).negate(),
+          (v.kind === "int" ? Decimal.fromBigInt(v.int) : (v as { dec: Decimal }).dec).negate(),
         );
       }
       if (isFloat(e.result)) {
@@ -18068,9 +16576,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // uniform). float.md §5.
         if (v.kind !== "f32" && v.kind !== "f64")
           throw typeError("internal: non-float unary minus");
-        return e.result === "f32"
-          ? float32Value(-v.value)
-          : float64Value(-v.value);
+        return e.result === "f32" ? float32Value(-v.value) : float64Value(-v.value);
       }
       if (v.kind !== "int") throw typeError("internal: boolean unary minus");
       const n = -v.int;
@@ -18093,8 +16599,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const numVal = a.kind === "interval" ? b : a;
         let [fnum, fden] = factorToFraction(numVal);
         if (e.op === "div") {
-          if (fnum === 0n)
-            throw engineError("division_by_zero", "division by zero");
+          if (fnum === 0n) throw engineError("division_by_zero", "division by zero");
           // interval / number = interval * (den/num); keep fden > 0.
           [fnum, fden] = fnum < 0n ? [-fden, -fnum] : [fden, fnum];
         }
@@ -18103,9 +16608,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       if (isInterval(e.result)) {
         // interval ± interval → interval; timestamp[tz] − timestamp[tz] → interval (§5).
         if (a.kind === "interval" && b.kind === "interval") {
-          return intervalValue(
-            e.op === "add" ? intervalAdd(a.iv, b.iv) : intervalSub(a.iv, b.iv),
-          );
+          return intervalValue(e.op === "add" ? intervalAdd(a.iv, b.iv) : intervalSub(a.iv, b.iv));
         }
         if (
           (a.kind === "timestamp" && b.kind === "timestamp") ||
@@ -18127,9 +16630,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           iv = (b as { iv: Interval }).iv;
         }
         const r = tsShift(instant, iv, e.op === "sub");
-        return isTimestamptz(e.result)
-          ? timestamptzValue(r)
-          : timestampValue(r);
+        return isTimestamptz(e.result) ? timestamptzValue(r) : timestampValue(r);
       }
       if (isDecimal(e.result)) {
         // Decimal arithmetic: widen any integer operand to decimal, then apply the op with
@@ -18138,9 +16639,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // work (spec/design/cost.md §3 "decimal_work").
         const da = toDecimal(a);
         const db = toDecimal(b);
-        m.charge(
-          COSTS.decimalWork * BigInt(decimalArithWork(e.op, da, db) - 1),
-        );
+        m.charge(COSTS.decimalWork * BigInt(decimalArithWork(e.op, da, db) - 1));
         m.guard();
         return decimalValue(evalDecimalArith(e.op, da, db));
       }
@@ -18148,16 +16647,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // Float arithmetic: the resolver promoted both operands to e.result's width (mixed-width
         // pairs were cast to f64), so both are the same float kind here. One IEEE op per node
         // (no FMA fusion — structural in the tree walker, float.md §5).
-        if (
-          (a.kind !== "f32" && a.kind !== "f64") ||
-          (b.kind !== "f32" && b.kind !== "f64")
-        ) {
+        if ((a.kind !== "f32" && a.kind !== "f64") || (b.kind !== "f32" && b.kind !== "f64")) {
           throw typeError("internal: non-float arithmetic");
         }
         return evalFloatArith(e.op, a.value, b.value, e.result);
       }
-      if (a.kind !== "int" || b.kind !== "int")
-        throw typeError("internal: non-integer arithmetic");
+      if (a.kind !== "int" || b.kind !== "int") throw typeError("internal: non-integer arithmetic");
       return evalArith(e.op, a.int, b.int, e.result);
     }
     case "compare": {
@@ -18178,9 +16673,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         (e.op === "lt" || e.op === "gt" || e.op === "le" || e.op === "ge")
       ) {
         if (a.kind === "text" && b.kind === "text") {
-          m.charge(
-            COSTS.collate * BigInt([...a.text].length + [...b.text].length),
-          );
+          m.charge(COSTS.collate * BigInt([...a.text].length + [...b.text].length));
           m.guard();
           const c = collatedCmp(e.collation, a.text, b.text);
           let res: boolean;
@@ -18257,8 +16750,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const pattern = evalExpr(e.rhs, row, env, m);
       // NULL propagates BEFORE the matcher runs, so a malformed pattern against a NULL operand
       // is still NULL, never 22025 (matches PG — grammar.md §22).
-      if (subject.kind === "null" || pattern.kind === "null")
-        return nullValue();
+      if (subject.kind === "null" || pattern.kind === "null") return nullValue();
       if (subject.kind !== "text" || pattern.kind !== "text") {
         throw new Error("unreachable: resolver requires text LIKE operands");
       }
@@ -18278,10 +16770,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       for (const arm of e.arms) {
         const cv = evalExpr(arm.cond, row, env, m);
         if (cv.kind === "bool" && cv.value) {
-          return coerceCaseValue(
-            evalExpr(arm.result, row, env, m),
-            e.coerceDecimal,
-          );
+          return coerceCaseValue(evalExpr(arm.result, row, env, m), e.coerceDecimal);
         }
       }
       return coerceCaseValue(evalExpr(e.els, row, env, m), e.coerceDecimal);
@@ -18304,30 +16793,18 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         const geti = (k: number): bigint => (vals[k] as { int: bigint }).int;
         const secMicros = f64ToMicros((vals[6] as { value: number }).value);
         return intervalValue(
-          makeInterval(
-            geti(0),
-            geti(1),
-            geti(2),
-            geti(3),
-            geti(4),
-            geti(5),
-            secMicros,
-          ),
+          makeInterval(geti(0), geti(1), geti(2), geti(3), geti(4), geti(5), secMicros),
         );
       }
       // uuid extractors (spec/design/functions.md §12): pure bit inspection; NULL for a non-RFC
       // variant (and, for the timestamp, any version other than 1/7). The NULL-input case is
       // already handled above.
       if (e.func === "uuid_extract_version") {
-        const ver = uuidExtractVersion(
-          (vals[0] as { bytes: Uint8Array }).bytes,
-        );
+        const ver = uuidExtractVersion((vals[0] as { bytes: Uint8Array }).bytes);
         return ver === null ? nullValue() : intValue(ver);
       }
       if (e.func === "uuid_extract_timestamp") {
-        const mc = uuidExtractTimestampMicros(
-          (vals[0] as { bytes: Uint8Array }).bytes,
-        );
+        const mc = uuidExtractTimestampMicros((vals[0] as { bytes: Uint8Array }).bytes);
         return mc === null ? nullValue() : timestamptzValue(mc);
       }
       // uuid generators (spec/design/entropy.md §3): draw from the per-statement seam (env.rng),
@@ -18340,9 +16817,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // The optional interval arg shifts the embedded instant via the existing calendar-aware
         // timestamptz arithmetic (entropy.md §4).
         const shifted =
-          vals.length === 1
-            ? tsShift(clock, (vals[0] as { iv: Interval }).iv, false)
-            : clock;
+          vals.length === 1 ? tsShift(clock, (vals[0] as { iv: Interval }).iv, false) : clock;
         return uuidValue(env.rng.uuidV7(env.seam, shifted));
       }
       // current-time functions (spec/design/entropy.md §5): now() reads the statement clock ONCE and
@@ -18359,21 +16834,16 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // state; currval is a pure session-state read. The NULL-arg case is handled above (propagates).
       if (e.func === "nextval") {
         m.charge(COSTS.sequenceAdvance);
-        return intValue(
-          env.exec.seqNextval((vals[0] as { text: string }).text),
-        );
+        return intValue(env.exec.seqNextval((vals[0] as { text: string }).text));
       }
       if (e.func === "currval") {
-        return intValue(
-          env.exec.seqCurrval((vals[0] as { text: string }).text),
-        );
+        return intValue(env.exec.seqCurrval((vals[0] as { text: string }).text));
       }
       // setval charges sequence_advance (it rewrites the catalog tuple, like nextval). Arity 2 →
       // isCalled defaults true; arity 3 → the boolean third argument.
       if (e.func === "setval") {
         m.charge(COSTS.sequenceAdvance);
-        const isCalled =
-          vals.length > 2 ? (vals[2] as { value: boolean }).value : true;
+        const isCalled = vals.length > 2 ? (vals[2] as { value: boolean }).value : true;
         return intValue(
           env.exec.seqSetval(
             (vals[0] as { text: string }).text,
@@ -18391,8 +16861,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // two-arg overload's missing_ok is true (→ NULL).
       if (e.func === "current_setting") {
         const name = (vals[0] as { text: string }).text;
-        const missingOk =
-          vals.length > 1 && (vals[1] as { value: boolean }).value;
+        const missingOk = vals.length > 1 && (vals[1] as { value: boolean }).value;
         const got = env.exec.session.vars.get(name.toLowerCase());
         if (got !== undefined) {
           return textValue(got);
@@ -18400,10 +16869,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         if (missingOk) {
           return nullValue();
         }
-        throw engineError(
-          "undefined_object",
-          "unrecognized configuration parameter: " + name,
-        );
+        throw engineError("undefined_object", "unrecognized configuration parameter: " + name);
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the
@@ -18417,8 +16883,7 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           return evalFloatPow(v0.value, v1.value, e.result);
         }
         // round(x, n): n is an int operand; the unary funcs ignore it.
-        const places =
-          vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
+        const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
         return evalFloatFunc(e.func, v0.value, places, e.result);
       }
       if (e.func === "abs") {
@@ -18433,12 +16898,8 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         return decimalValue((v0 as { dec: Decimal }).dec.abs());
       }
       // round
-      const d =
-        v0.kind === "int"
-          ? Decimal.fromBigInt(v0.int)
-          : (v0 as { dec: Decimal }).dec;
-      const places =
-        vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
+      const d = v0.kind === "int" ? Decimal.fromBigInt(v0.int) : (v0 as { dec: Decimal }).dec;
+      const places = vals.length > 1 ? Number((vals[1] as { int: bigint }).int) : 0;
       return decimalValue(d.roundPlaces(places));
     }
     case "arrayFunc": {
@@ -18560,16 +17021,9 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
 // FALSE) and ALL (all=true) the AND-fold (FALSE if any is FALSE, else NULL if any is NULL, else TRUE;
 // empty -> TRUE). Each element comparison charges one operator_eval (+ size-scaled decimal_work),
 // exactly like inMembership, so max_cost bounds the walk (54P01).
-function quantifiedMembership(
-  op: BinaryOp,
-  all: boolean,
-  lv: Value,
-  av: Value,
-  m: Meter,
-): Value {
+function quantifiedMembership(op: BinaryOp, all: boolean, lv: Value, av: Value, m: Meter): Value {
   if (av.kind === "null") return nullValue();
-  if (av.kind !== "array")
-    throw new Error("BUG: the resolver requires an array right operand");
+  if (av.kind !== "array") throw new Error("BUG: the resolver requires an array right operand");
   let anyNull = false;
   for (const e of av.elements) {
     m.charge(COSTS.operatorEval);
@@ -18711,12 +17165,7 @@ function likeMatch(subject: string, pattern: string): boolean {
 // and 22003 if the result falls outside the declared result type (the i16+i16 →
 // i16 boundary — spec/design/functions.md §7). The MinInt64/-1 cases trap to match the
 // Rust/Go checked-op behaviour (bigint would not overflow on its own).
-function evalArith(
-  op: BinaryOp,
-  x: bigint,
-  y: bigint,
-  result: ScalarType,
-): Value {
+function evalArith(op: BinaryOp, x: bigint, y: bigint, result: ScalarType): Value {
   let v: bigint;
   switch (op) {
     case "add":
@@ -18754,12 +17203,7 @@ function evalArith(
 // the overflow check is then re-applied because fround can push a finite double past binary32 range.
 // `%` is IEEE remainder via JS `%` (which is fmod — truncated, dividend's sign), exact, never
 // overflows.
-function evalFloatArith(
-  op: BinaryOp,
-  x: number,
-  y: number,
-  result: ScalarType,
-): Value {
+function evalFloatArith(op: BinaryOp, x: number, y: number, result: ScalarType): Value {
   const f32 = result === "f32";
   const finiteInputs = Number.isFinite(x) && Number.isFinite(y);
   let r: number;
@@ -18775,13 +17219,11 @@ function evalFloatArith(
       break;
     case "div":
       // x / 0 traps for every numerator except NaN, which propagates (NaN/0 = NaN, matching PG).
-      if (y === 0 && !Number.isNaN(x))
-        throw engineError("division_by_zero", "division by zero");
+      if (y === 0 && !Number.isNaN(x)) throw engineError("division_by_zero", "division by zero");
       r = x / y;
       break;
     default: // "mod"
-      if (y === 0 && !Number.isNaN(x))
-        throw engineError("division_by_zero", "division by zero");
+      if (y === 0 && !Number.isNaN(x)) throw engineError("division_by_zero", "division by zero");
       r = x % y; // JS % is fmod: truncated, takes the dividend's sign; exact, finite for finite x,y
       break;
   }
@@ -18798,12 +17240,7 @@ function evalFloatArith(
 // propagates through the exact functions; the transcendentals call native Math.* (exempted — the R
 // tag absorbs cross-core ULP differences). Domain / overflow errors trap (float.md §8):
 //   sqrt(neg) → 22003; ln(0)/ln(neg) → 22003; exp overflow → 22003; sin/cos/tan never trap.
-function evalFloatFunc(
-  func: ScalarFuncName,
-  x: number,
-  places: number,
-  result: ScalarType,
-): Value {
+function evalFloatFunc(func: ScalarFuncName, x: number, places: number, result: ScalarType): Value {
   const out = (r: number): Value => {
     // result is f64 for all but abs; abs's result is the operand width, so fround for f32.
     if (result === "f32") {
@@ -18842,11 +17279,7 @@ function evalFloatFunc(
     }
     case "ln":
       // ln(0) → 22003; ln(neg) → 22003 (domain). ln(+Inf)=+Inf, ln(NaN)=NaN propagate.
-      if (x === 0)
-        throw engineError(
-          "numeric_value_out_of_range",
-          "cannot take logarithm of zero",
-        );
+      if (x === 0) throw engineError("numeric_value_out_of_range", "cannot take logarithm of zero");
       if (x < 0)
         throw engineError(
           "numeric_value_out_of_range",
@@ -18854,11 +17287,7 @@ function evalFloatFunc(
         );
       return out(Math.log(x));
     case "log10":
-      if (x === 0)
-        throw engineError(
-          "numeric_value_out_of_range",
-          "cannot take logarithm of zero",
-        );
+      if (x === 0) throw engineError("numeric_value_out_of_range", "cannot take logarithm of zero");
       if (x < 0)
         throw engineError(
           "numeric_value_out_of_range",
@@ -18881,8 +17310,7 @@ function evalFloatFunc(
 // operand propagates per IEEE. result is f64 (the catalog), so no fround.
 function evalFloatPow(x: number, y: number, result: ScalarType): Value {
   const r = Math.pow(x, y);
-  if (Number.isFinite(x) && Number.isFinite(y) && !Number.isFinite(r))
-    throw overflow(result);
+  if (Number.isFinite(x) && Number.isFinite(y) && !Number.isFinite(r)) throw overflow(result);
   return result === "f32" ? float32Value(Math.fround(r)) : float64Value(r);
 }
 
@@ -18903,11 +17331,7 @@ function roundFloatHalfAway(x: number, places: number): number {
 // evalCast evaluates a (non-NULL) CAST to target. int→int range-checks (22003); int→decimal
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
-function evalCast(
-  v: Value,
-  target: ScalarType,
-  typmod: DecimalTypmod | null,
-): Value {
+function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): Value {
   if (v.kind === "bool") {
     // boolean → boolean is the identity cast (`x::boolean` on a boolean). boolean → i32 (the
     // boolean cast slice, casts.toml): true → 1, false → 0. The resolver guarantees the only
@@ -18919,8 +17343,7 @@ function evalCast(
     // i32 → boolean (the boolean cast slice, casts.toml): 0 → false, any nonzero (incl. negative)
     // → true. The resolver guarantees the source is i32, so v.int is already in i32 range.
     if (isBool(target)) return boolValue(v.int !== 0n);
-    if (isDecimal(target))
-      return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
+    if (isDecimal(target)) return decimalValue(coerceDecimal(Decimal.fromBigInt(v.int), typmod));
     // int → float (explicit, lossy): nearest binary representable, then fround for f32. Exact
     // for |int| ≤ 2^53; a larger i64 may round. Never traps (float.md §6).
     if (isFloat(target)) return makeFloat(target, Number(v.int));
@@ -18961,9 +17384,7 @@ function evalCast(
     if (isDecimal(target)) {
       if (!Number.isFinite(v.value)) throw overflow(target);
       const exact =
-        v.kind === "f32"
-          ? Decimal.exactFromFloat32(v.value)
-          : Decimal.exactFromFloat64(v.value);
+        v.kind === "f32" ? Decimal.exactFromFloat32(v.value) : Decimal.exactFromFloat64(v.value);
       return decimalValue(coerceDecimal(exact, typmod));
     }
     throw typeError("internal: unsupported float cast target");
@@ -19028,12 +17449,9 @@ function decimalArithWork(op: BinaryOp, a: Decimal, b: Decimal): number {
 // aligned linear formula after int→decimal promotion; 1 (no charge) for any other pair,
 // including a NULL side, where no decimal compare runs (spec/design/cost.md §3 "decimal_work").
 function decimalCmpWork(a: Value, b: Value): number {
-  if (a.kind === "decimal" && b.kind === "decimal")
-    return workLinear(a.dec, b.dec);
-  if (a.kind === "decimal" && b.kind === "int")
-    return workLinear(a.dec, Decimal.fromBigInt(b.int));
-  if (a.kind === "int" && b.kind === "decimal")
-    return workLinear(Decimal.fromBigInt(a.int), b.dec);
+  if (a.kind === "decimal" && b.kind === "decimal") return workLinear(a.dec, b.dec);
+  if (a.kind === "decimal" && b.kind === "int") return workLinear(a.dec, Decimal.fromBigInt(b.int));
+  if (a.kind === "int" && b.kind === "decimal") return workLinear(Decimal.fromBigInt(a.int), b.dec);
   return 1;
 }
 
@@ -19109,9 +17527,7 @@ function sortRowsCollated(rows: Row[], order: OrderSlot[]): void {
     for (const k of order) {
       if (k.collation === null) continue;
       const v = row[k.idx]!;
-      keys.push(
-        v.kind === "text" ? collationSortKey(k.collation, v.text) : null,
-      );
+      keys.push(v.kind === "text" ? collationSortKey(k.collation, v.text) : null);
     }
     return { keys, row };
   });
@@ -19156,12 +17572,7 @@ function cmpDecorated(
 // (descending), so an explicit NULLS FIRST|LAST overrides the direction default
 // (spec/design/grammar.md §10). The physical key order ratifies NULL as the largest value
 // (the PostgreSQL model), which surfaces as the parse-time default nullsFirst = descending.
-function keyCmp(
-  a: Value,
-  b: Value,
-  descending: boolean,
-  nullsFirst: boolean,
-): number {
+function keyCmp(a: Value, b: Value, descending: boolean, nullsFirst: boolean): number {
   if (a.kind === "null" && b.kind === "null") return 0;
   if (a.kind === "null") return nullsFirst ? -1 : 1;
   if (b.kind === "null") return nullsFirst ? 1 : -1;
@@ -19176,22 +17587,15 @@ function keyCmp(
 // over a single typed column, so a mixed pair is unreachable from SELECT. NULLs are handled
 // by keyCmp before this is reached. Returns <0, 0, >0.
 function valueCmp(a: Value, b: Value): number {
-  if (a.kind === "int" && b.kind === "int")
-    return a.int < b.int ? -1 : a.int > b.int ? 1 : 0;
-  if (a.kind === "decimal" && b.kind === "decimal")
-    return a.dec.cmpValue(b.dec);
+  if (a.kind === "int" && b.kind === "int") return a.int < b.int ? -1 : a.int > b.int ? 1 : 0;
+  if (a.kind === "decimal" && b.kind === "decimal") return a.dec.cmpValue(b.dec);
   // Floats by the TOTAL order (-0 == +0, NaN == NaN, NaN largest — float.md §3). ORDER BY / MIN /
   // MAX / DISTINCT over a float column reach here with same-width values (one typed column).
-  if (a.kind === "f32" && b.kind === "f32")
-    return floatTotalCmp(a.value, b.value);
-  if (a.kind === "f64" && b.kind === "f64")
-    return floatTotalCmp(a.value, b.value);
-  if (a.kind === "text" && b.kind === "text")
-    return compareTextC(a.text, b.text);
-  if (a.kind === "bytea" && b.kind === "bytea")
-    return compareBytea(a.bytes, b.bytes);
-  if (a.kind === "uuid" && b.kind === "uuid")
-    return compareBytea(a.bytes, b.bytes);
+  if (a.kind === "f32" && b.kind === "f32") return floatTotalCmp(a.value, b.value);
+  if (a.kind === "f64" && b.kind === "f64") return floatTotalCmp(a.value, b.value);
+  if (a.kind === "text" && b.kind === "text") return compareTextC(a.text, b.text);
+  if (a.kind === "bytea" && b.kind === "bytea") return compareBytea(a.bytes, b.bytes);
+  if (a.kind === "uuid" && b.kind === "uuid") return compareBytea(a.bytes, b.bytes);
   if (a.kind === "bool" && b.kind === "bool") {
     return a.value === b.value ? 0 : a.value ? 1 : -1;
   }
@@ -19206,8 +17610,7 @@ function valueCmp(a: Value, b: Value): number {
     return a.days < b.days ? -1 : a.days > b.days ? 1 : 0;
   }
   // Intervals order by the canonical 128-bit span (spec/design/interval.md §2).
-  if (a.kind === "interval" && b.kind === "interval")
-    return intervalCmp(a.iv, b.iv);
+  if (a.kind === "interval" && b.kind === "interval") return intervalCmp(a.iv, b.iv);
   // A composite sorts lexicographically, NULLs-last per field (the composite sort key —
   // spec/design/composite.md §5): the first non-equal field decides, recursing through keyCmp so
   // per-field NULL placement and nested composites are handled uniformly. The caller's descending
@@ -19219,11 +17622,7 @@ function valueCmp(a: Value, b: Value): number {
       const c = keyCmp(a.fields[i]!, b.fields[i]!, false, false);
       if (c !== 0) return c;
     }
-    return a.fields.length < b.fields.length
-      ? -1
-      : a.fields.length > b.fields.length
-        ? 1
-        : 0;
+    return a.fields.length < b.fields.length ? -1 : a.fields.length > b.fields.length ? 1 : 0;
   }
   // An array sorts by the PG array_cmp total order (spec/design/array.md §5): element-wise over the
   // flattened elements (NULLs-last per element, recursing through keyCmp), then fewer elements first,
@@ -19236,12 +17635,10 @@ function valueCmp(a: Value, b: Value): number {
     }
     if (a.elements.length !== b.elements.length)
       return a.elements.length < b.elements.length ? -1 : 1;
-    if (a.dims.length !== b.dims.length)
-      return a.dims.length < b.dims.length ? -1 : 1;
+    if (a.dims.length !== b.dims.length) return a.dims.length < b.dims.length ? -1 : 1;
     for (let d = 0; d < a.dims.length; d++) {
       if (a.dims[d] !== b.dims[d]) return a.dims[d]! < b.dims[d]! ? -1 : 1;
-      if (a.lbounds[d] !== b.lbounds[d])
-        return a.lbounds[d]! < b.lbounds[d]! ? -1 : 1;
+      if (a.lbounds[d] !== b.lbounds[d]) return a.lbounds[d]! < b.lbounds[d]! ? -1 : 1;
     }
     return 0;
   }

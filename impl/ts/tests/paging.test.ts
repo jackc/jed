@@ -8,7 +8,15 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
-import { close, create, EngineError, execute, loadDatabase, open, residentLeaves } from "../src/lib.ts";
+import {
+  close,
+  create,
+  EngineError,
+  execute,
+  loadDatabase,
+  open,
+  residentLeaves,
+} from "../src/lib.ts";
 import type { Value } from "../src/lib.ts";
 
 function intOf(v: Value): bigint {
@@ -36,7 +44,10 @@ test("demand paging: scans + mutates correctly with bounded residency", () => {
     // A PK table's skeleton load faults no leaves (it reads them only to count rows, uncached), so the
     // pool starts empty — and the file holds many pages.
     assert.equal(residentLeaves(db2), 0, "skeleton load caches no leaf");
-    assert.ok(db2.pageCount > CAP * 5, `file has many more pages (${db2.pageCount}) than the budget`);
+    assert.ok(
+      db2.pageCount > CAP * 5,
+      `file has many more pages (${db2.pageCount}) than the budget`,
+    );
 
     // A full scan faults every leaf through the bounded pool: results exact, residency bounded.
     const rows = db2.rowsInKeyOrder("t");
@@ -45,7 +56,10 @@ test("demand paging: scans + mutates correctly with bounded residency", () => {
       assert.equal(intOf(rows[i]![0]!), BigInt(i));
       assert.equal(intOf(rows[i]![1]!), BigInt(i * 2));
     }
-    assert.ok(residentLeaves(db2) <= CAP, `resident leaves ${residentLeaves(db2)} exceed budget ${CAP}`);
+    assert.ok(
+      residentLeaves(db2) <= CAP,
+      `resident leaves ${residentLeaves(db2)} exceed budget ${CAP}`,
+    );
     close(db2);
 
     // Mutate through the pool (each statement faults the leaf it touches), reopen, verify.
@@ -91,7 +105,10 @@ test("memory budget: bounds residency under repeated lookups on a large file", (
 
     const db2 = open(path, { cacheBytes: CAP * 256 });
     // The data dwarfs the budget: far more pages than CAP, yet nothing resident until a read.
-    assert.ok(db2.pageCount > CAP * 20, `file (${db2.pageCount} pages) should dwarf the ${CAP}-page budget`);
+    assert.ok(
+      db2.pageCount > CAP * 20,
+      `file (${db2.pageCount} pages) should dwarf the ${CAP}-page budget`,
+    );
     assert.equal(residentLeaves(db2), 0);
 
     // A spread of point queries (each a full scan, no index) repeatedly faults leaves through the
@@ -103,7 +120,10 @@ test("memory budget: bounds residency under repeated lookups on a large file", (
         assert.equal(o.rows.length, 1);
         assert.equal(intOf(o.rows[0]![0]!), BigInt(k + 1));
       }
-      assert.ok(residentLeaves(db2) <= CAP, `resident ${residentLeaves(db2)} exceeds budget ${CAP} at k=${k}`);
+      assert.ok(
+        residentLeaves(db2) <= CAP,
+        `resident ${residentLeaves(db2)} exceeds budget ${CAP} at k=${k}`,
+      );
     }
     close(db2);
   } finally {

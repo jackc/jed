@@ -22,7 +22,10 @@ function rows1(ns: number[]): string[][] {
 
 test("step of zero is invalid_parameter_value (22023)", () => {
   const db = new Database();
-  assert.equal(errCode(() => execute(db, "SELECT * FROM generate_series(1, 5, 0)")), "22023");
+  assert.equal(
+    errCode(() => execute(db, "SELECT * FROM generate_series(1, 5, 0)")),
+    "22023",
+  );
 });
 
 test("alias forms and qualified column", () => {
@@ -33,7 +36,10 @@ test("alias forms and qualified column", () => {
   assert.equal(out.kind, "query");
   if (out.kind === "query") assert.deepStrictEqual(out.columnNames, ["g"]);
   assert.deepStrictEqual(query(db, "SELECT g.g FROM generate_series(1, 3) AS g"), rows1([1, 2, 3]));
-  assert.equal(errCode(() => execute(db, "SELECT g.generate_series FROM generate_series(1, 3) AS g")), "42703");
+  assert.equal(
+    errCode(() => execute(db, "SELECT g.generate_series FROM generate_series(1, 3) AS g")),
+    "42703",
+  );
   assert.deepStrictEqual(
     query(db, "SELECT generate_series.generate_series FROM generate_series(1, 2)"),
     rows1([1, 2]),
@@ -45,7 +51,10 @@ test("$N parameter argument", () => {
   const out = executeParams(db, "SELECT * FROM generate_series(1, $1)", [intValue(3n)]);
   assert.equal(out.kind, "query");
   if (out.kind !== "query") return;
-  assert.deepStrictEqual(out.rows.map((r) => r.map((v) => v.kind === "int" ? String(v.int) : "?")), [["1"], ["2"], ["3"]]);
+  assert.deepStrictEqual(
+    out.rows.map((r) => r.map((v) => (v.kind === "int" ? String(v.int) : "?"))),
+    [["1"], ["2"], ["3"]],
+  );
 });
 
 test("a sibling reference works (an SRF is implicitly lateral, grammar.md §44)", () => {
@@ -62,7 +71,10 @@ test("generated_row cost and the maxCost ceiling", () => {
   const db = new Database();
   assert.equal(cost(db, "SELECT * FROM generate_series(1, 4)"), 8n);
   db.setMaxCost(50n);
-  assert.equal(errCode(() => execute(db, "SELECT * FROM generate_series(1, 1000000000)")), "54P01");
+  assert.equal(
+    errCode(() => execute(db, "SELECT * FROM generate_series(1, 1000000000)")),
+    "54P01",
+  );
   db.setMaxCost(0n);
 });
 
@@ -86,9 +98,24 @@ test("i64 overflow while stepping stops cleanly (bigint parity)", () => {
 
 test("deferred-form and bad-call errors", () => {
   const db = new Database();
-  assert.equal(errCode(() => execute(db, "SELECT generate_series(1, 5)")), "42883"); // SELECT-list SRF deferred
-  assert.equal(errCode(() => execute(db, "SELECT * FROM generate_series(1, 5) AS g(n)")), "0A000"); // column-alias list
-  assert.equal(errCode(() => execute(db, "SELECT * FROM generate_series(1)")), "42883"); // wrong arity
-  assert.equal(errCode(() => execute(db, "SELECT * FROM generate_series('a', 5)")), "42883"); // non-integer arg
-  assert.equal(errCode(() => execute(db, "SELECT * FROM nope(1, 5)")), "42883"); // unknown table function
+  assert.equal(
+    errCode(() => execute(db, "SELECT generate_series(1, 5)")),
+    "42883",
+  ); // SELECT-list SRF deferred
+  assert.equal(
+    errCode(() => execute(db, "SELECT * FROM generate_series(1, 5) AS g(n)")),
+    "0A000",
+  ); // column-alias list
+  assert.equal(
+    errCode(() => execute(db, "SELECT * FROM generate_series(1)")),
+    "42883",
+  ); // wrong arity
+  assert.equal(
+    errCode(() => execute(db, "SELECT * FROM generate_series('a', 5)")),
+    "42883",
+  ); // non-integer arg
+  assert.equal(
+    errCode(() => execute(db, "SELECT * FROM nope(1, 5)")),
+    "42883",
+  ); // unknown table function
 });

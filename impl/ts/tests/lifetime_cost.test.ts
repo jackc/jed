@@ -45,11 +45,20 @@ test("budget aborts in flight then rejects at admission", () => {
   execute(db, "SELECT 1"); // cumulative 2
   // The third SELECT 1 drives the cumulative to 3 and aborts 54P02; its partial cost counts, so the
   // cumulative is now exactly the budget.
-  assert.equal(code(() => execute(db, "SELECT 1")), "54P02");
+  assert.equal(
+    code(() => execute(db, "SELECT 1")),
+    "54P02",
+  );
   assert.equal(db.lifetimeCost(), 3n);
   // Spent: every further statement is rejected at admission — even a trivial one, even a write.
-  assert.equal(code(() => execute(db, "SELECT 1")), "54P02");
-  assert.equal(code(() => execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)")), "54P02");
+  assert.equal(
+    code(() => execute(db, "SELECT 1")),
+    "54P02",
+  );
+  assert.equal(
+    code(() => execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)")),
+    "54P02",
+  );
 });
 
 test("partial cost of an aborted statement counts", () => {
@@ -57,7 +66,10 @@ test("partial cost of an aborted statement counts", () => {
   // (up to the budget) still counts — the cumulative lands exactly at the budget (unit charges are 1).
   const db = new Database();
   db.setLifetimeMaxCost(3n);
-  assert.equal(code(() => execute(db, COST5)), "54P02"); // would cost 5; aborts at 3
+  assert.equal(
+    code(() => execute(db, COST5)),
+    "54P02",
+  ); // would cost 5; aborts at 3
   assert.equal(db.lifetimeCost(), 3n);
 });
 
@@ -75,7 +87,10 @@ test("the cumulative is session state and does not roll back", () => {
   execute(db, "ROLLBACK");
   // The table is gone (data rolled back) but the cumulative is unchanged (compute was spent).
   assert.equal(db.lifetimeCost(), beforeRollback);
-  assert.equal(code(() => execute(db, "SELECT v FROM t")), "42P01"); // table really did roll back
+  assert.equal(
+    code(() => execute(db, "SELECT v FROM t")),
+    "42P01",
+  ); // table really did roll back
   // And the cumulative keeps building from there.
   execute(db, "SELECT 1");
   assert.equal(db.lifetimeCost(), beforeRollback + 1n);
@@ -88,14 +103,20 @@ test("a statement aborts at whichever ceiling it reaches first", () => {
   const db = new Database();
   db.setLifetimeMaxCost(1000n);
   db.setMaxCost(3n);
-  assert.equal(code(() => execute(db, COST5)), "54P01"); // max_cost 3 before the far budget
+  assert.equal(
+    code(() => execute(db, COST5)),
+    "54P01",
+  ); // max_cost 3 before the far budget
   assert.equal(db.lifetimeCost(), 3n); // the 54P01 partial counted toward the session
 
   // Now the session budget is the nearer ceiling: a tight budget, the per-statement ceiling far.
   const db2 = new Database();
   db2.setLifetimeMaxCost(3n);
   db2.setMaxCost(1000n);
-  assert.equal(code(() => execute(db2, COST5)), "54P02"); // the budget is reached first
+  assert.equal(
+    code(() => execute(db2, COST5)),
+    "54P02",
+  ); // the budget is reached first
 });
 
 test("an exact tie breaks to the per-statement ceiling", () => {
@@ -104,7 +125,10 @@ test("an exact tie breaks to the per-statement ceiling", () => {
   const db = new Database();
   db.setLifetimeMaxCost(3n);
   db.setMaxCost(3n);
-  assert.equal(code(() => execute(db, COST5)), "54P01");
+  assert.equal(
+    code(() => execute(db, COST5)),
+    "54P01",
+  );
 });
 
 test("an additional session carries its own budget", () => {
@@ -117,7 +141,10 @@ test("an additional session carries its own budget", () => {
   const budgeted = db.newSession({ lifetimeMaxCost: 2n });
   budgeted.execute(db, "SELECT 1"); // its cumulative 1
   // Its second statement drives its own budget to 2 and aborts 54P02 — independent of the default.
-  assert.equal(code(() => budgeted.execute(db, "SELECT 1")), "54P02");
+  assert.equal(
+    code(() => budgeted.execute(db, "SELECT 1")),
+    "54P02",
+  );
   assert.equal(budgeted.lifetimeCost(), 2n);
 
   // The default session is untouched by the additional session's budget — it still runs, and its
@@ -133,9 +160,15 @@ test("admission is checked before existence and privileges", () => {
   const db = new Database();
   db.setLifetimeMaxCost(1n);
   // SELECT 1 costs 1, reaching the budget — it aborts 54P02 (and spends the budget).
-  assert.equal(code(() => execute(db, "SELECT 1")), "54P02");
+  assert.equal(
+    code(() => execute(db, "SELECT 1")),
+    "54P02",
+  );
   // Now exhausted: a missing table is rejected at admission (54P02) before the 42P01 existence check,
   // and likewise a restricted privilege envelope is never consulted.
   db.setDefaultPrivileges(PrivilegeSet.empty().with("select"));
-  assert.equal(code(() => execute(db, "SELECT * FROM does_not_exist")), "54P02");
+  assert.equal(
+    code(() => execute(db, "SELECT * FROM does_not_exist")),
+    "54P02",
+  );
 });

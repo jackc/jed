@@ -17,15 +17,15 @@ import mdsvexConfig from './mdsvex.config.js';
  *   which pull `node:fs` and cannot load in the browser.
  */
 const config = {
-	extensions: ['.svelte', '.svx', '.md'],
-	preprocess: [vitePreprocess(), mdsvex(mdsvexConfig)],
-	kit: {
-		adapter: adapter({ strict: true }),
-		paths: { base: process.env.BASE_PATH || '' },
-		alias: {
-			$jed: '../impl/ts/src'
-		}
-	}
+  extensions: ['.svelte', '.svx', '.md'],
+  preprocess: [vitePreprocess(), mdsvex(mdsvexConfig)],
+  kit: {
+    adapter: adapter({ strict: true }),
+    paths: { base: process.env.BASE_PATH || '' },
+    alias: {
+      $jed: '../impl/ts/src'
+    }
+  }
 };
 
 export default config;

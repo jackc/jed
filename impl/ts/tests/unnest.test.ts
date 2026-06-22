@@ -48,8 +48,14 @@ test("unnest of the empty array or a NULL array yields zero rows", () => {
 
 test("unnest alias renames the single column", () => {
   const db = new Database();
-  assert.deepStrictEqual(query(db, "SELECT g.g FROM unnest(ARRAY[7,8]) AS g ORDER BY g.g"), rows1([7, 8]));
-  assert.equal(errCode(() => execute(db, "SELECT g.unnest FROM unnest(ARRAY[7,8]) AS g")), "42703");
+  assert.deepStrictEqual(
+    query(db, "SELECT g.g FROM unnest(ARRAY[7,8]) AS g ORDER BY g.g"),
+    rows1([7, 8]),
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT g.unnest FROM unnest(ARRAY[7,8]) AS g")),
+    "42703",
+  );
 });
 
 test("unnest takes a correlated outer column AND an earlier sibling (implicitly lateral, §44)", () => {
@@ -61,12 +67,20 @@ test("unnest takes a correlated outer column AND an earlier sibling (implicitly 
   // the subquery's sole/first FROM item, so its args see the enclosing query — functions.md §10).
   assert.deepStrictEqual(
     query(db, "SELECT id, (SELECT count(*) FROM unnest(o.xs)) AS n FROM t o ORDER BY id"),
-    [["1", "2"], ["2", "1"], ["3", "0"], ["4", "0"]],
+    [
+      ["1", "2"],
+      ["2", "1"],
+      ["3", "0"],
+      ["4", "0"],
+    ],
   );
   // A sibling FROM table's column IS now in scope (an SRF is implicitly lateral, grammar.md §44; the
   // rows are pinned by suites/joins/lateral.test). Here we assert the prior 42703/42P01 rejection is
   // lifted: the bare and qualified forms succeed and explode each row (NULL/empty → no rows ⇒ 3 rows).
-  for (const sql of ["SELECT id, u FROM t CROSS JOIN unnest(xs) AS u", "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u"]) {
+  for (const sql of [
+    "SELECT id, u FROM t CROSS JOIN unnest(xs) AS u",
+    "SELECT id, u FROM t CROSS JOIN unnest(t.xs) AS u",
+  ]) {
     const out = execute(db, sql);
     assert.equal(out.kind, "query");
     if (out.kind !== "query") return;
@@ -76,12 +90,26 @@ test("unnest takes a correlated outer column AND an earlier sibling (implicitly 
 
 test("unnest strictness + deferred-form errors", () => {
   const db = new Database();
-  for (const sql of ["SELECT * FROM unnest(5)", "SELECT * FROM unnest('hi')", "SELECT * FROM unnest(ARRAY[1], ARRAY[2])"]) {
-    assert.equal(errCode(() => execute(db, sql)), "42883", sql);
+  for (const sql of [
+    "SELECT * FROM unnest(5)",
+    "SELECT * FROM unnest('hi')",
+    "SELECT * FROM unnest(ARRAY[1], ARRAY[2])",
+  ]) {
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      "42883",
+      sql,
+    );
   }
   // A bare untyped NULL is indeterminate (jed's polymorphic posture); the SELECT-list SRF is deferred.
-  assert.equal(errCode(() => execute(db, "SELECT * FROM unnest(NULL)")), "42P18");
-  assert.equal(errCode(() => execute(db, "SELECT unnest(ARRAY[1,2,3])")), "42883");
+  assert.equal(
+    errCode(() => execute(db, "SELECT * FROM unnest(NULL)")),
+    "42P18",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT unnest(ARRAY[1,2,3])")),
+    "42883",
+  );
 });
 
 test("unnest generated_row cost and the maxCost ceiling", () => {
@@ -92,6 +120,9 @@ test("unnest generated_row cost and the maxCost ceiling", () => {
   // the whole thing materializes — the guard fires mid-generation, like generate_series.
   const big = Array.from({ length: 1000 }, (_, i) => String(i + 1)).join(",");
   db.setMaxCost(50n);
-  assert.equal(errCode(() => execute(db, `SELECT * FROM unnest('{${big}}'::i32[])`)), "54P01");
+  assert.equal(
+    errCode(() => execute(db, `SELECT * FROM unnest('{${big}}'::i32[])`)),
+    "54P01",
+  );
   db.setMaxCost(0n);
 });

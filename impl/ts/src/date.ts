@@ -112,7 +112,8 @@ export function parseDate(input: string): bigint {
   if (year < 1n || year > 9_999_999n) throw fieldOverflow("year out of range");
   if (month < 1n || month > 12n) throw fieldOverflow("month out of range");
   const astro = bc ? 1n - year : year;
-  if (day < 1n || day > daysInMonth(astro, month)) throw fieldOverflow("day out of range for month");
+  if (day < 1n || day > daysInMonth(astro, month))
+    throw fieldOverflow("day out of range for month");
   // hour 0..23, plus exactly 24:00:00 (a valid end-of-day; unlike timestamp it does NOT advance
   // the date — the day comes from the date fields directly).
   const allow24 = hour === 24n && minute === 0n && second === 0n && micro === 0n;

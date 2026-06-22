@@ -24,8 +24,7 @@ function rows(db: Database, sql: string): string[][] {
 // affected runs sql (which must yield a statement result) and returns its affected-row count.
 function affected(db: Database, sql: string): number | null {
   const o = execute(db, sql);
-  if (o.kind !== "statement")
-    throw new Error(`expected a statement result for ${sql}`);
+  if (o.kind !== "statement") throw new Error(`expected a statement result for ${sql}`);
   return o.rowsAffected;
 }
 

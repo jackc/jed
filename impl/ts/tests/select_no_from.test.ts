@@ -107,19 +107,37 @@ test("SELECT * with no tables is 42601 with PostgreSQL's message", () => {
 
 test("bare columns resolve nothing", () => {
   const db = new Database();
-  assert.equal(errCode(() => execute(db, "SELECT nope")), "42703");
+  assert.equal(
+    errCode(() => execute(db, "SELECT nope")),
+    "42703",
+  );
   // The DISTINCT two-token lookahead is unchanged: at end of input the word is a column
   // reference, not the modifier (grammar.md §34 — previously died at the FROM expect).
-  assert.equal(errCode(() => execute(db, "SELECT distinct")), "42703");
-  assert.equal(errCode(() => execute(db, "SELECT from")), "42703");
+  assert.equal(
+    errCode(() => execute(db, "SELECT distinct")),
+    "42703",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT from")),
+    "42703",
+  );
   // GROUP BY / ORDER BY keys are table columns only — always 42703 on a lone FROM-less SELECT.
-  assert.equal(errCode(() => execute(db, "SELECT 1 GROUP BY nope")), "42703");
-  assert.equal(errCode(() => execute(db, "SELECT 1 ORDER BY nope")), "42703");
+  assert.equal(
+    errCode(() => execute(db, "SELECT 1 GROUP BY nope")),
+    "42703",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT 1 ORDER BY nope")),
+    "42703",
+  );
 });
 
 test("an untyped $1 is 42P18; a sibling operand types it", () => {
   const db = new Database();
-  assert.equal(errCode(() => executeParams(db, "SELECT $1", [intValue(7n)])), "42P18");
+  assert.equal(
+    errCode(() => executeParams(db, "SELECT $1", [intValue(7n)])),
+    "42P18",
+  );
   // The sibling-operand rule (grammar.md §5) works without a FROM.
   const out = executeParams(db, "SELECT $1 + 1", [intValue(7n)]);
   assert.equal(out.kind, "query");

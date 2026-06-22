@@ -10,13 +10,13 @@ import { DEFAULT_LANG, isLangId, type LangId } from '$lib/content/languages.ts';
 const STORAGE_KEY = 'jed:lang';
 
 function initial(): LangId {
-	if (!browser) return DEFAULT_LANG;
-	const stored = localStorage.getItem(STORAGE_KEY);
-	return isLangId(stored) ? stored : DEFAULT_LANG;
+  if (!browser) return DEFAULT_LANG;
+  const stored = localStorage.getItem(STORAGE_KEY);
+  return isLangId(stored) ? stored : DEFAULT_LANG;
 }
 
 export const lang = writable<LangId>(initial());
 
 if (browser) {
-	lang.subscribe((value) => localStorage.setItem(STORAGE_KEY, value));
+  lang.subscribe((value) => localStorage.setItem(STORAGE_KEY, value));
 }

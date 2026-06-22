@@ -79,17 +79,27 @@ test("a $N inside a subquery, typed by an inner context", () => {
   // $1 typed by `b.k = $1` (inner) AND correlated to the outer a.k: survive iff some b.k equals
   // both $1 and a.k. a.k ∈ {10,20,30}, b.k ∈ {20,30,40}; with $1=20 only a.id=2 survives.
   assert.deepStrictEqual(
-    idsP(db, "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = $1 AND b.k = a.k) ORDER BY id", [intValue(20n)]),
+    idsP(
+      db,
+      "SELECT id FROM a WHERE EXISTS (SELECT 1 FROM b WHERE b.k = $1 AND b.k = a.k) ORDER BY id",
+      [intValue(20n)],
+    ),
     [2n],
   );
   // $1 typed by `b.id = $1` inside an IN subquery (b.id=1 -> b.k=20 -> a.id=2).
   assert.deepStrictEqual(
-    idsP(db, "SELECT id FROM a WHERE k IN (SELECT b.k FROM b WHERE b.id = $1) ORDER BY id", [intValue(1n)]),
+    idsP(db, "SELECT id FROM a WHERE k IN (SELECT b.k FROM b WHERE b.id = $1) ORDER BY id", [
+      intValue(1n),
+    ]),
     [2n],
   );
   // The same $1 used OUTSIDE and INSIDE the subquery — one statement-wide inference.
   assert.deepStrictEqual(
-    idsP(db, "SELECT id FROM a WHERE k > $1 AND EXISTS (SELECT 1 FROM b WHERE b.k = $1 + 10) ORDER BY id", [intValue(10n)]),
+    idsP(
+      db,
+      "SELECT id FROM a WHERE k > $1 AND EXISTS (SELECT 1 FROM b WHERE b.k = $1 + 10) ORDER BY id",
+      [intValue(10n)],
+    ),
     [2n, 3n],
   );
 });

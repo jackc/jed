@@ -63,19 +63,30 @@ test("an unterminated block comment is 42601", () => {
     "SELECT v FROM t /* outer /* inner */ still open",
     "SELECT v FROM t /*/", // the close cannot overlap the open
   ]) {
-    assert.equal(errCode(() => execute(db, sql)), "42601", sql);
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      "42601",
+      sql,
+    );
   }
 });
 
 test("a stray close is not comment syntax", () => {
   const db = setup();
   // `*/` with no opener lexes as `*` `/` and fails at parse.
-  assert.equal(errCode(() => execute(db, "SELECT v */ 1 FROM t")), "42601");
+  assert.equal(
+    errCode(() => execute(db, "SELECT v */ 1 FROM t")),
+    "42601",
+  );
 });
 
 test("comment-only input is no statement", () => {
   const db = setup();
   for (const sql of ["-- nothing here", "/* nothing here */", "  /* a */ -- b"]) {
-    assert.equal(errCode(() => execute(db, sql)), "42601", sql);
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      "42601",
+      sql,
+    );
   }
 });

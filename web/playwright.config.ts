@@ -9,20 +9,20 @@ import { defineConfig, devices } from '@playwright/test';
 const PORT = 4173;
 
 export default defineConfig({
-	testDir: 'e2e',
-	// OPFS files are origin-scoped; keep specs from racing the exclusive handle.
-	fullyParallel: false,
-	workers: 1,
-	use: { baseURL: `http://localhost:${PORT}` },
-	projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
-	// Build (incl. the Pagefind index), then serve the `build/` artifact WHOLESALE via a tiny static
-	// server (e2e/serve.mjs) — faithful to GitHub Pages, and unlike `vite preview` it serves the
-	// post-build Pagefind files, so search is testable. reuseExistingServer keeps local iteration
-	// fast; CI always builds fresh.
-	webServer: {
-		command: `npm run build && PORT=${PORT} node e2e/serve.mjs`,
-		url: `http://localhost:${PORT}`,
-		reuseExistingServer: !process.env.CI,
-		timeout: 120_000
-	}
+  testDir: 'e2e',
+  // OPFS files are origin-scoped; keep specs from racing the exclusive handle.
+  fullyParallel: false,
+  workers: 1,
+  use: { baseURL: `http://localhost:${PORT}` },
+  projects: [{ name: 'chromium', use: { ...devices['Desktop Chrome'] } }],
+  // Build (incl. the Pagefind index), then serve the `build/` artifact WHOLESALE via a tiny static
+  // server (e2e/serve.mjs) — faithful to GitHub Pages, and unlike `vite preview` it serves the
+  // post-build Pagefind files, so search is testable. reuseExistingServer keeps local iteration
+  // fast; CI always builds fresh.
+  webServer: {
+    command: `npm run build && PORT=${PORT} node e2e/serve.mjs`,
+    url: `http://localhost:${PORT}`,
+    reuseExistingServer: !process.env.CI,
+    timeout: 120_000
+  }
 });

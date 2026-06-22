@@ -5,15 +5,15 @@
    the CodeMirror editor, and Shiki code blocks opt out with `not-prose` so utilities/typography
    don't fight their own styling. Theme tokens for the (clean, minimal) jed brand: */
 @theme {
-	--color-jed-ink: #0f172a;
-	--color-jed-accent: #2563eb;
-	--color-jed-muted: #64748b;
+  --color-jed-ink: #0f172a;
+  --color-jed-accent: #2563eb;
+  --color-jed-muted: #64748b;
 }
 
 :root {
-	color-scheme: light;
+  color-scheme: light;
 }
 
 html {
-	scroll-behavior: smooth;
+  scroll-behavior: smooth;
 }

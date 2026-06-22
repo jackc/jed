@@ -63,7 +63,10 @@ export class Rows implements Iterable<Value[]> {
 
 export function rowsFromOutcome(out: Outcome): Rows {
   if (out.kind !== "query") {
-    throw engineError("syntax_error", "query called on a statement that produces no rows; use execute");
+    throw engineError(
+      "syntax_error",
+      "query called on a statement that produces no rows; use execute",
+    );
   }
   return new Rows(out.columnNames, out.rows, out.cost);
 }

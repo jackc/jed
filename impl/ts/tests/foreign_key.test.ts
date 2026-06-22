@@ -37,8 +37,14 @@ test("FK naming and catalog order", () => {
 // type (42804), where PG allows any comparable pair (e.g. i32 ↔ i64) — constraints.md §6.7.
 test("FK strict same-type pairing (42804)", () => {
   const db = dbWith(["CREATE TABLE p (id i32 PRIMARY KEY)"]);
-  assert.equal(errCode(() => execute(db, "CREATE TABLE c1 (x i64 REFERENCES p)")), "42804");
-  assert.equal(errCode(() => execute(db, "CREATE TABLE c2 (x text REFERENCES p)")), "42804");
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE c1 (x i64 REFERENCES p)")),
+    "42804",
+  );
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE c2 (x text REFERENCES p)")),
+    "42804",
+  );
   execute(db, "CREATE TABLE c3 (x i32 REFERENCES p)"); // same type — accepted
 });
 
@@ -46,9 +52,18 @@ test("FK strict same-type pairing (42804)", () => {
 // RESTRICT are accepted (constraints.md §6.6).
 test("FK referential actions narrowed (0A000)", () => {
   const db = dbWith(["CREATE TABLE p (id i32 PRIMARY KEY)"]);
-  assert.equal(errCode(() => execute(db, "CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)")), "0A000");
-  assert.equal(errCode(() => execute(db, "CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)")), "0A000");
-  assert.equal(errCode(() => execute(db, "CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)")), "0A000");
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE c1 (x i32 REFERENCES p ON DELETE CASCADE)")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE c2 (x i32 REFERENCES p ON UPDATE SET NULL)")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE c3 (x i32 REFERENCES p ON DELETE SET DEFAULT)")),
+    "0A000",
+  );
   execute(db, "CREATE TABLE c4 (x i32 REFERENCES p ON DELETE NO ACTION ON UPDATE RESTRICT)");
 });
 
@@ -63,5 +78,8 @@ test("FK parent UPDATE end-state swap allowed", () => {
     "INSERT INTO c VALUES (10, 100), (11, 200)",
   ]);
   execute(db, "UPDATE p SET code = CASE code WHEN 100 THEN 200 ELSE 100 END"); // swap — end state valid
-  assert.equal(errCode(() => execute(db, "UPDATE p SET code = 999 WHERE id = 1")), "23503");
+  assert.equal(
+    errCode(() => execute(db, "UPDATE p SET code = 999 WHERE id = 1")),
+    "23503",
+  );
 });

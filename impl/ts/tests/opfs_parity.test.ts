@@ -126,7 +126,10 @@ test("OPFS host: write parity with the Node fs host (create + incremental commit
       fsBytes.length,
       `OPFS image (${opfsBytes.length}B) and Node fs image (${fsBytes.length}B) differ in length`,
     );
-    assert.ok(bytesEqual(opfsBytes, fsBytes), "OPFS bytes must be byte-identical to the Node fs host's");
+    assert.ok(
+      bytesEqual(opfsBytes, fsBytes),
+      "OPFS bytes must be byte-identical to the Node fs host's",
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -185,7 +188,11 @@ test("OPFS host: a file written through OPFS opens via the Node fs host (round-t
     const fsRows = fsdb.rowsInKeyOrder("t").map((r) => r.map(render));
     close(fsdb);
 
-    assert.deepEqual(fsRows, opfsRows, "the Node host must read the OPFS-written file into identical rows");
+    assert.deepEqual(
+      fsRows,
+      opfsRows,
+      "the Node host must read the OPFS-written file into identical rows",
+    );
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -231,5 +238,9 @@ test("OPFS host: create rejects an invalid page size before touching the handle 
     if (e instanceof EngineError) code = e.code();
   }
   assert.equal(code, "0A000", "non-power-of-two page size is feature_not_supported");
-  assert.equal(handle.getSize(), 0, "a rejected create leaves the handle untouched (write-in-place safety)");
+  assert.equal(
+    handle.getSize(),
+    0,
+    "a rejected create leaves the handle untouched (write-in-place safety)",
+  );
 });

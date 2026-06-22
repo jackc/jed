@@ -11,7 +11,24 @@
 // big-endian via DataView (never host order); CRC-32 hand-rolled (>>> 0 for unsigned).
 
 import type { Expr } from "./ast.ts";
-import { type CheckConstraint, type ColField, type ColType, type Column, type CompositeField, type CompositeType, type DefaultExpr, type FkAction, type ForeignKey, type IdentityKind, type IndexDef, type SeqOwner, type SequenceDef, type Table, pkIndices, resolveColType } from "./catalog.ts";
+import {
+  type CheckConstraint,
+  type ColField,
+  type ColType,
+  type Column,
+  type CompositeField,
+  type CompositeType,
+  type DefaultExpr,
+  type FkAction,
+  type ForeignKey,
+  type IdentityKind,
+  type IndexDef,
+  type SeqOwner,
+  type SequenceDef,
+  type Table,
+  pkIndices,
+  resolveColType,
+} from "./catalog.ts";
 import { parseExpression } from "./parser.ts";
 import { type Collation, vendoredCollation } from "./collation.ts";
 import { Decimal } from "./decimal.ts";
@@ -302,7 +319,10 @@ function encodeValue(ty: ColType, v: Value): Uint8Array {
 // ndim is the dimension count and each dimension records its length and lower bound (multidim +
 // custom lower bounds — spec/design/array.md §12). The bitmap (MSB-first, like composite) is present
 // iff any element is NULL; a NULL element contributes zero body bytes.
-function encodeArrayBody(elem: ColType, a: { dims: number[]; lbounds: number[]; elements: Value[] }): Uint8Array {
+function encodeArrayBody(
+  elem: ColType,
+  a: { dims: number[]; lbounds: number[]; elements: Value[] },
+): Uint8Array {
   const elems = a.elements;
   if (elems.length === 0) return Uint8Array.of(0, 0); // ndim 0, flags 0 (empty array)
   let hasNulls = false;
@@ -569,7 +589,12 @@ type RecordPlan = {
 // beats their pointer, moving the bytes pass 1 chose (compressed → a 0x04 chain of the
 // compressed block) until the record fits. Shared by the serializer and recordSize (the B-tree
 // split weight): in-memory node boundaries must match the serialized pages.
-function planDispositions(colTypes: ColType[], key: Uint8Array, row: Row, capacity: number): RecordPlan {
+function planDispositions(
+  colTypes: ColType[],
+  key: Uint8Array,
+  row: Row,
+  capacity: number,
+): RecordPlan {
   const inline = colTypes.map((ty, i) => encodeValue(ty, row[i]!).length);
   const plan: RecordPlan = {
     disp: new Array<ValueDisp>(colTypes.length).fill("inline"),
@@ -640,7 +665,12 @@ function planDispositions(colTypes: ColType[], key: Uint8Array, row: Row, capaci
 // its compressed inline form, an externalized one its fixed pointer size (large-values.md
 // §12/§13). Must equal what the serializer produces, so in-memory node boundaries match
 // serialized page boundaries.
-export function recordSize(colTypes: ColType[], key: Uint8Array, row: Row, capacity: number): number {
+export function recordSize(
+  colTypes: ColType[],
+  key: Uint8Array,
+  row: Row,
+  capacity: number,
+): number {
   return planDispositions(colTypes, key, row, capacity).size;
 }
 
@@ -717,7 +747,8 @@ export function recordCompressUnits(
 // leading presence tag, i.e. the null bitmap + present-field bodies (spec/design/composite.md §4).
 // Only spillable types reach here.
 function valuePayload(ty: ColType, v: Value): Uint8Array {
-  if (ty.kind === "composite" && v.kind === "composite") return encodeCompositeBody(ty.fields, v.fields);
+  if (ty.kind === "composite" && v.kind === "composite")
+    return encodeCompositeBody(ty.fields, v.fields);
   // An array's payload is its body (the ndim/flags/dims header + bitmap + element bodies); a large
   // array spills through the same overflow + LZ4 path (spec/design/array.md §4).
   if (ty.kind === "array" && v.kind === "array") return encodeArrayBody(ty.elem, v);
@@ -832,7 +863,12 @@ function writeOverflowChain(
     const lo = j * capacity;
     const hi = Math.min(lo + capacity, payload.length);
     const nextPage = j + 1 < n ? indices[j + 1]! : 0;
-    ovf.push({ index: indices[j]!, itemCount: hi - lo, nextPage, payload: payload.subarray(lo, hi) });
+    ovf.push({
+      index: indices[j]!,
+      itemCount: hi - lo,
+      nextPage,
+      payload: payload.subarray(lo, hi),
+    });
   }
   return indices[0]!;
 }
@@ -1165,7 +1201,10 @@ function collationEntryBytes(c: Collation, isDefault: boolean): Uint8Array {
 // the caller has consumed the entry_kind byte. Reads the metadata, then resolves the compiled table
 // from the binary's VENDORED set by name (§2/§9) — the table is no longer in the file. Returns the
 // resolved collation + whether it is the per-database default (the is_default flag bit).
-function decodeCollationEntry(buf: Uint8Array, cur: Cursor): { coll: Collation; isDefault: boolean } {
+function decodeCollationEntry(
+  buf: Uint8Array,
+  cur: Cursor,
+): { coll: Collation; isDefault: boolean } {
   const flags = readU8(buf, cur);
   if ((flags & ~0b1) !== 0) {
     throw engineError("data_corrupted", "reserved collation flag set");
@@ -1298,7 +1337,9 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
   }
   for (let ti = 0; ti < keys.length; ti++) {
     const t = snap.tables.get(keys[ti]!)!;
-    catEntries.push(concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!)]));
+    catEntries.push(
+      concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!)]),
+    );
   }
   const entrySizes = catEntries.map((e) => e.length);
   const catGroups = pack(entrySizes, capacity);
@@ -1330,7 +1371,13 @@ export function toImage(src: Database | Snapshot, pageSize: number, txid: bigint
 
 // BodyPage is one serialized page awaiting write: its index, type, key count, chain link, payload.
 // nextPage is 0 for B-tree nodes and the chain link for overflow pages (large-values.md §12).
-type BodyPage = { index: number; pageType: number; itemCount: number; nextPage: number; payload: Uint8Array };
+type BodyPage = {
+  index: number;
+  pageType: number;
+  itemCount: number;
+  nextPage: number;
+  payload: Uint8Array;
+};
 
 // serializeNode serializes one node and its subtree post-order, appending each to `body`, and
 // returns this node's assigned page index and the next free index. A leaf's payload is its records;
@@ -1349,7 +1396,8 @@ function serializeNode(
     // database (create's empty image, the golden generator) — a paged file commits incrementally via
     // serializeDirty. An OnDisk child would carry a page id from a different layout, so it must not
     // appear here.
-    if (c.node === null) throw engineError("data_corrupted", "whole-image serialize hit an OnDisk leaf");
+    if (c.node === null)
+      throw engineError("data_corrupted", "whole-image serialize hit an OnDisk leaf");
     const r = serializeNode(c.node, colTypes, capacity, nextIndex, body);
     childPages.push(r.index);
     nextIndex = r.next;
@@ -1372,11 +1420,20 @@ function serializeNode(
   }
   const payload = w.toBytes();
   if (payload.length > capacity) {
-    throw engineError("feature_not_supported", "a record larger than the per-row limit is not supported");
+    throw engineError(
+      "feature_not_supported",
+      "a record larger than the per-row limit is not supported",
+    );
   }
   body.push({ index, pageType, itemCount: n.keys.length, nextPage: 0, payload });
   for (const o of ovf) {
-    body.push({ index: o.index, pageType: PAGE_OVERFLOW, itemCount: o.itemCount, nextPage: o.nextPage, payload: o.payload });
+    body.push({
+      index: o.index,
+      pageType: PAGE_OVERFLOW,
+      itemCount: o.itemCount,
+      nextPage: o.nextPage,
+      payload: o.payload,
+    });
   }
   return { index, next: nextIndex };
 }
@@ -1449,7 +1506,15 @@ export function incrementalImage(
     const store = snap.stores.get(keys[ti]!)!;
     const root = store.treeRoot();
     if (root !== null) {
-      rootDataPage[ti] = serializeDirty(root, store.columnTypes(), capacity, ps, alloc, pages, paging);
+      rootDataPage[ti] = serializeDirty(
+        root,
+        store.columnTypes(),
+        capacity,
+        ps,
+        alloc,
+        pages,
+        paging,
+      );
     }
     // The table's index trees follow its data tree, in catalog (name) order — only their
     // dirty nodes are written, like any tree (spec/fileformat/format.md "Allocation &
@@ -1487,7 +1552,9 @@ export function incrementalImage(
   }
   for (let ti = 0; ti < keys.length; ti++) {
     const t = snap.tables.get(keys[ti]!)!;
-    catEntries.push(concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!)]));
+    catEntries.push(
+      concat([Uint8Array.of(0), tableEntryBytes(t, rootDataPage[ti]!, indexRoots[ti]!)]),
+    );
   }
   const entrySizes = catEntries.map((e) => e.length);
   const catGroups = pack(entrySizes, capacity);
@@ -1497,7 +1564,10 @@ export function incrementalImage(
     const group = catGroups[gi]!;
     const nextPage = gi + 1 < catGroups.length ? catPages[gi + 1]! : 0;
     const parts = group.map((ei) => catEntries[ei]!);
-    pages.push({ index: catPages[gi]!, bytes: makePage(ps, PAGE_CATALOG, group.length, nextPage, concat(parts)) });
+    pages.push({
+      index: catPages[gi]!,
+      bytes: makePage(ps, PAGE_CATALOG, group.length, nextPage, concat(parts)),
+    });
   }
 
   return { pages, rootPage: catRoot, pageCount: alloc.next, freeRemaining: alloc.remaining() };
@@ -1510,9 +1580,12 @@ export function incrementalImage(
 // resolution builds a fresh copy, never mutating the shared tree's row.
 function resolveForEncode(row: Row, colTypes: ColType[], paging: SharedPaging | null): Row {
   if (!row.some((v) => v.kind === "unfetched")) return row;
-  if (paging === null) throw engineError("data_corrupted", "unfetched large value with no pager at commit");
+  if (paging === null)
+    throw engineError("data_corrupted", "unfetched large value with no pager at commit");
   const fetch = (p: number): Uint8Array => paging.readBlock(p);
-  return row.map((v, i) => (v.kind === "unfetched" ? resolveUnfetched(colTypes[i]!, v.ref, fetch) : v));
+  return row.map((v, i) =>
+    v.kind === "unfetched" ? resolveUnfetched(colTypes[i]!, v.ref, fetch) : v,
+  );
 }
 
 // serializeDirty assigns a page to one dirty node (and its dirty descendants) post-order, appending
@@ -1537,7 +1610,11 @@ function serializeDirty(
   for (const c of n.children) {
     // A resident child recurses (dirty descendants get pages); an OnDisk child is a clean leaf already
     // durable at its page — keep it, write nothing (the incremental-commit win).
-    childPages.push(c.node === null ? c.page : serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, paging));
+    childPages.push(
+      c.node === null
+        ? c.page
+        : serializeDirty(c.node, colTypes, capacity, ps, alloc, pages, paging),
+    );
   }
   const w = new ByteWriter();
   let pageType = PAGE_LEAF;
@@ -1554,17 +1631,32 @@ function serializeDirty(
   const ovf: OverflowPageOut[] = [];
   const take = (): number => alloc.take();
   for (let i = 0; i < n.keys.length; i++) {
-    w.bytes(encodeRecord(colTypes, n.keys[i]!, resolveForEncode(n.vals[i]!, colTypes, paging), capacity, take, ovf));
+    w.bytes(
+      encodeRecord(
+        colTypes,
+        n.keys[i]!,
+        resolveForEncode(n.vals[i]!, colTypes, paging),
+        capacity,
+        take,
+        ovf,
+      ),
+    );
   }
   const payload = w.toBytes();
   if (payload.length > capacity) {
-    throw engineError("feature_not_supported", "a record larger than the per-row limit is not supported");
+    throw engineError(
+      "feature_not_supported",
+      "a record larger than the per-row limit is not supported",
+    );
   }
   const index = alloc.take();
   n.page = index;
   pages.push({ index, bytes: makePage(ps, pageType, n.keys.length, 0, payload) });
   for (const o of ovf) {
-    pages.push({ index: o.index, bytes: makePage(ps, PAGE_OVERFLOW, o.itemCount, o.nextPage, o.payload) });
+    pages.push({
+      index: o.index,
+      bytes: makePage(ps, PAGE_OVERFLOW, o.itemCount, o.nextPage, o.payload),
+    });
   }
   return index;
 }
@@ -1682,7 +1774,12 @@ export function anySpillable(colTypes: ColType[]): boolean {
 // the paged-open free-list reconstruction; it decodes each leaf lazily and follows its chains by
 // HEADERS only (chainPages — large-values.md §14), so opening a file never materializes or
 // decompresses a large value.
-function collectLeafOverflow(paging: SharedPaging, pageIdx: number, colTypes: ColType[], reached: Set<number>): void {
+function collectLeafOverflow(
+  paging: SharedPaging,
+  pageIdx: number,
+  colTypes: ColType[],
+  reached: Set<number>,
+): void {
   const pg = parsePage(paging.readBlock(pageIdx));
   if (pg.pageType === PAGE_LEAF) {
     const fetch = (p: number): Uint8Array => paging.readBlock(p);
@@ -1731,7 +1828,8 @@ export function loadDatabasePaged(paging: SharedPaging): Database {
   while (catPage !== 0) {
     reached.add(catPage);
     const pg = parsePage(paging.readBlock(catPage));
-    if (pg.pageType !== PAGE_CATALOG) throw engineError("data_corrupted", "expected a catalog page");
+    if (pg.pageType !== PAGE_CATALOG)
+      throw engineError("data_corrupted", "expected a catalog page");
     const cur = { pos: 0 };
     for (let i = 0; i < pg.itemCount; i++) {
       // Each catalog entry is kind-tagged (v9/v12): 1 = a composite-type entry (registered now; its
@@ -1934,7 +2032,12 @@ function readTree(
 // only content. toImage copies it into both slots; an incremental commit pwrites it to the alternate
 // slot (file.ts). Single-sources the meta byte layout (spec/fileformat/format.md). Reserved bytes are
 // left zero and are covered by the CRC over [0, 32).
-export function metaPage(pageSize: number, txid: bigint, root: number, pageCount: number): Uint8Array {
+export function metaPage(
+  pageSize: number,
+  txid: bigint,
+  root: number,
+  pageCount: number,
+): Uint8Array {
   const p = new Uint8Array(pageSize);
   const dv = new DataView(p.buffer);
   p[0] = 0x4a; // 'J'
@@ -2005,7 +2108,14 @@ type Meta = { txid: bigint; rootPage: number; pageCount: number };
 function readMeta(image: Uint8Array, dv: DataView, ps: number, slot: number): Meta | null {
   const off = slot * ps;
   if (off + ps > image.length) return null;
-  if (!(image[off] === 0x4a && image[off + 1] === 0x45 && image[off + 2] === 0x44 && image[off + 3] === 0x42)) {
+  if (
+    !(
+      image[off] === 0x4a &&
+      image[off + 1] === 0x45 &&
+      image[off + 2] === 0x44 &&
+      image[off + 3] === 0x42
+    )
+  ) {
     return null;
   }
   if (dv.getUint16(off + 4, false) !== FORMAT_VERSION) return null;
@@ -2032,7 +2142,8 @@ function readMeta(image: Uint8Array, dv: DataView, ps: number, slot: number): Me
 function parseMeta(block: Uint8Array): Meta | null {
   if (block.length < 36) return null;
   const dv = new DataView(block.buffer, block.byteOffset, block.byteLength);
-  if (!(block[0] === 0x4a && block[1] === 0x45 && block[2] === 0x44 && block[3] === 0x42)) return null;
+  if (!(block[0] === 0x4a && block[1] === 0x45 && block[2] === 0x44 && block[3] === 0x42))
+    return null;
   if (dv.getUint16(4, false) !== FORMAT_VERSION) return null;
   if (
     block[6] !== 0 ||
@@ -2095,7 +2206,8 @@ function pageBlock(image: Uint8Array, ps: number, index: number): Uint8Array {
 // demand-paged loader and fault path use (a page read through the pager is exactly one block);
 // readPage slices it out of a whole image.
 function parsePage(block: Uint8Array): Page {
-  if (block.length < PAGE_HEADER) throw engineError("data_corrupted", "page shorter than its header");
+  if (block.length < PAGE_HEADER)
+    throw engineError("data_corrupted", "page shorter than its header");
   const dv = new DataView(block.buffer, block.byteOffset, block.byteLength);
   // Verify the per-page checksum (v7) before trusting any header field (format.md *Page header*).
   if (pageCrc(block) !== dv.getUint32(12, false)) {
@@ -2118,7 +2230,8 @@ function parsePage(block: Uint8Array): Page {
 // recordSize).
 export function decodeLeafNode(block: Uint8Array, page: number, colTypes: ColType[]): PNode {
   const pg = parsePage(block);
-  if (pg.pageType !== PAGE_LEAF) throw engineError("data_corrupted", "demand-paged a non-leaf page");
+  if (pg.pageType !== PAGE_LEAF)
+    throw engineError("data_corrupted", "demand-paged a non-leaf page");
   const keys: Uint8Array[] = [];
   const vals: Row[] = [];
   const weights: number[] = [];
@@ -2247,7 +2360,8 @@ function decodeTableEntry(
       throw engineError("data_corrupted", "column has both a constant and an expression default");
     }
     // A constant default is a scalar value (this branch is the scalar type path).
-    const colDefault = (flags & 0b100) !== 0 ? readValue({ kind: "scalar", scalar: ty }, buf, cur, null, []) : null;
+    const colDefault =
+      (flags & 0b100) !== 0 ? readValue({ kind: "scalar", scalar: ty }, buf, cur, null, []) : null;
     let colDefaultExpr: DefaultExpr | null = null;
     if ((flags & 0b1000) !== 0) {
       const exprText = readString(buf, cur);
@@ -2255,7 +2369,10 @@ function decodeTableEntry(
       try {
         expr = parseExpression(exprText);
       } catch (e) {
-        throw engineError("data_corrupted", "stored default expression does not parse: " + String(e));
+        throw engineError(
+          "data_corrupted",
+          "stored default expression does not parse: " + String(e),
+        );
       }
       colDefaultExpr = { exprText, expr };
     }
@@ -2360,7 +2477,10 @@ function decodeTableEntry(
     const refTable = readString(buf, cur);
     const rc = readU16(buf, cur);
     if (rc !== lc) {
-      throw engineError("data_corrupted", "foreign-key referencing/referenced column count mismatch");
+      throw engineError(
+        "data_corrupted",
+        "foreign-key referencing/referenced column count mismatch",
+      );
     }
     const refCols: number[] = [];
     for (let j = 0; j < rc; j++) refCols.push(readU16(buf, cur));
@@ -2395,19 +2515,34 @@ function readValueLazy(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
   if (tag === TAG_EXTERNAL) {
     const first = readU32(buf, cur);
     const len = readU32(buf, cur);
-    return { kind: "unfetched", ref: { form: TAG_EXTERNAL, firstPage: first, storedLen: len, rawLen: 0, comp: undefined } };
+    return {
+      kind: "unfetched",
+      ref: { form: TAG_EXTERNAL, firstPage: first, storedLen: len, rawLen: 0, comp: undefined },
+    };
   }
   if (tag === TAG_INLINE_COMP) {
     const rawLen = readU32(buf, cur);
     const compLen = readU16(buf, cur);
     const comp = take(buf, cur, compLen).slice(); // copy out of the borrowed page slice
-    return { kind: "unfetched", ref: { form: TAG_INLINE_COMP, firstPage: 0, storedLen: 0, rawLen, comp } };
+    return {
+      kind: "unfetched",
+      ref: { form: TAG_INLINE_COMP, firstPage: 0, storedLen: 0, rawLen, comp },
+    };
   }
   if (tag === TAG_EXTERNAL_COMP) {
     const first = readU32(buf, cur);
     const stored = readU32(buf, cur);
     const rawLen = readU32(buf, cur);
-    return { kind: "unfetched", ref: { form: TAG_EXTERNAL_COMP, firstPage: first, storedLen: stored, rawLen, comp: undefined } };
+    return {
+      kind: "unfetched",
+      ref: {
+        form: TAG_EXTERNAL_COMP,
+        firstPage: first,
+        storedLen: stored,
+        rawLen,
+        comp: undefined,
+      },
+    };
   }
   throw engineError("data_corrupted", "invalid value presence tag");
 }
@@ -2435,7 +2570,11 @@ function decodeRecordLazy(
 // (spec/design/large-values.md §14): gather the overflow chain through `fetch` for an external
 // form, decompress a compressed one, and reconstruct by column type. Decompression errors are
 // data_corrupted, surfaced only when the value is actually touched.
-export function resolveUnfetched(ty: ColType, ref: Unfetched, fetch: (page: number) => Uint8Array): Value {
+export function resolveUnfetched(
+  ty: ColType,
+  ref: Unfetched,
+  fetch: (page: number) => Uint8Array,
+): Value {
   const sink: number[] = [];
   if (ref.form === TAG_EXTERNAL) {
     return valueFromPayload(ty, readOverflowChain(ref.firstPage, ref.storedLen, fetch, sink));
@@ -2459,10 +2598,12 @@ function chainPages(first: number, length: number, fetch: (page: number) => Uint
   let gathered = 0;
   let p = first;
   while (gathered < length) {
-    if (p === 0) throw engineError("data_corrupted", "overflow chain ended before the value length");
+    if (p === 0)
+      throw engineError("data_corrupted", "overflow chain ended before the value length");
     out.push(p);
     const pg = parsePage(fetch(p));
-    if (pg.pageType !== PAGE_OVERFLOW) throw engineError("data_corrupted", "expected an overflow page");
+    if (pg.pageType !== PAGE_OVERFLOW)
+      throw engineError("data_corrupted", "expected an overflow page");
     const n = pg.itemCount;
     if (n === 0 || n > pg.payload.length || gathered + n > length) {
       throw engineError("data_corrupted", "overflow page slab out of range");
@@ -2518,7 +2659,8 @@ function readValue(
   if (tag === TAG_EXTERNAL) {
     const first = readU32(buf, cur);
     const len = readU32(buf, cur);
-    if (fetch === null) throw engineError("data_corrupted", "external value with no overflow reader");
+    if (fetch === null)
+      throw engineError("data_corrupted", "external value with no overflow reader");
     return valueFromPayload(ty, readOverflowChain(first, len, fetch, ovfOut));
   }
   if (tag === TAG_INLINE_COMP) {
@@ -2531,7 +2673,8 @@ function readValue(
     const first = readU32(buf, cur);
     const stored = readU32(buf, cur);
     const rawLen = readU32(buf, cur);
-    if (fetch === null) throw engineError("data_corrupted", "external value with no overflow reader");
+    if (fetch === null)
+      throw engineError("data_corrupted", "external value with no overflow reader");
     const comp = readOverflowChain(first, stored, fetch, ovfOut);
     return valueFromPayload(ty, lz4Decompress(comp, rawLen));
   }
@@ -2555,7 +2698,8 @@ function readInlineBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
 // rebuild the range value faithfully from the bits present.
 function readRangeBody(elem: ColType, buf: Uint8Array, cur: Cursor): Value {
   const flags = readU8(buf, cur);
-  if ((flags & ~0x1f) !== 0) throw engineError("data_corrupted", "range flags has a reserved bit set");
+  if ((flags & ~0x1f) !== 0)
+    throw engineError("data_corrupted", "range flags has a reserved bit set");
   if ((flags & 0x01) !== 0) return emptyRangeValue();
   const lbInf = (flags & 0x02) !== 0;
   const ubInf = (flags & 0x04) !== 0;
@@ -2572,7 +2716,8 @@ function readArrayBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
   if (ty.kind !== "array") throw engineError("data_corrupted", "readArrayBody on a non-array type");
   const ndim = readU8(buf, cur);
   const flags = readU8(buf, cur);
-  if ((flags & ~0x01) !== 0) throw engineError("data_corrupted", "array flags has a reserved bit set");
+  if ((flags & ~0x01) !== 0)
+    throw engineError("data_corrupted", "array flags has a reserved bit set");
   if (ndim === 0) return emptyArray(); // empty array
   if (ndim > 6) throw engineError("data_corrupted", "array ndim exceeds the maximum of 6");
   const dims: number[] = new Array(ndim);
@@ -2600,7 +2745,8 @@ function readArrayBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
 // spec/design/composite.md §4). A field whose bitmap bit is set is NULL and consumes no body bytes;
 // otherwise its body is read recursively (no per-field presence tag).
 function readCompositeBody(ty: ColType, buf: Uint8Array, cur: Cursor): Value {
-  if (ty.kind !== "composite") throw engineError("data_corrupted", "readCompositeBody on a non-composite type");
+  if (ty.kind !== "composite")
+    throw engineError("data_corrupted", "readCompositeBody on a non-composite type");
   const fields = ty.fields;
   const nbytes = Math.ceil(fields.length / 8);
   const bitmap = take(buf, cur, nbytes);
@@ -2709,10 +2855,12 @@ function readOverflowChain(
   let got = 0;
   let p = first;
   while (got < length) {
-    if (p === 0) throw engineError("data_corrupted", "overflow chain ended before the value length");
+    if (p === 0)
+      throw engineError("data_corrupted", "overflow chain ended before the value length");
     visited.push(p);
     const pg = parsePage(fetch(p));
-    if (pg.pageType !== PAGE_OVERFLOW) throw engineError("data_corrupted", "expected an overflow page");
+    if (pg.pageType !== PAGE_OVERFLOW)
+      throw engineError("data_corrupted", "expected an overflow page");
     const n = pg.itemCount;
     if (n === 0 || n > pg.payload.length || got + n > length) {
       throw engineError("data_corrupted", "overflow page slab out of range");

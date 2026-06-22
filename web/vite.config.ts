@@ -20,12 +20,12 @@ const examplesDir = fileURLToPath(new URL('./examples', import.meta.url));
 const specDir = fileURLToPath(new URL('../spec', import.meta.url));
 
 export default defineConfig({
-	plugins: [tailwindcss(), jedExamples(examplesDir), jedSpec(specDir), sveltekit()],
-	worker: { format: 'es' },
-	// `host: true` binds to 0.0.0.0 so the dev/preview server is reachable through a devcontainer's
-	// (or any container's) forwarded port from the host — the default localhost-only bind is not.
-	// strictPort: fail loudly if the port is taken rather than silently moving to 5174 (which the
-	// devcontainer wouldn't be forwarding), so the forwarded port is deterministic.
-	server: { host: true, port: 5173, strictPort: true, fs: { allow: ['..'] } },
-	preview: { host: true, port: 4173, strictPort: true }
+  plugins: [tailwindcss(), jedExamples(examplesDir), jedSpec(specDir), sveltekit()],
+  worker: { format: 'es' },
+  // `host: true` binds to 0.0.0.0 so the dev/preview server is reachable through a devcontainer's
+  // (or any container's) forwarded port from the host — the default localhost-only bind is not.
+  // strictPort: fail loudly if the port is taken rather than silently moving to 5174 (which the
+  // devcontainer wouldn't be forwarding), so the forwarded port is deterministic.
+  server: { host: true, port: 5173, strictPort: true, fs: { allow: ['..'] } },
+  preview: { host: true, port: 4173, strictPort: true }
 });

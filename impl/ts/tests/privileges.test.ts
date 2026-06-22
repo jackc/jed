@@ -35,9 +35,18 @@ test("setDefaultPrivileges makes a read-only session", () => {
   execute(db, "INSERT INTO t VALUES (1, 10)");
   db.setDefaultPrivileges(PrivilegeSet.empty().with("select"));
   execute(db, "SELECT v FROM t WHERE id = 1");
-  assert.equal(code(() => execute(db, "INSERT INTO t VALUES (2, 20)")), "42501");
-  assert.equal(code(() => execute(db, "UPDATE t SET v = 0 WHERE id = 1")), "42501");
-  assert.equal(code(() => execute(db, "DELETE FROM t WHERE id = 1")), "42501");
+  assert.equal(
+    code(() => execute(db, "INSERT INTO t VALUES (2, 20)")),
+    "42501",
+  );
+  assert.equal(
+    code(() => execute(db, "UPDATE t SET v = 0 WHERE id = 1")),
+    "42501",
+  );
+  assert.equal(
+    code(() => execute(db, "DELETE FROM t WHERE id = 1")),
+    "42501",
+  );
 });
 
 test("grant adds and revoke wins", () => {
@@ -50,7 +59,10 @@ test("grant adds and revoke wins", () => {
 
   // Revoking what was granted denies it (deny wins regardless of the grant).
   db.revoke(PrivilegeSet.empty().with("insert"), "t");
-  assert.equal(code(() => execute(db, "INSERT INTO t VALUES (2, 20)")), "42501");
+  assert.equal(
+    code(() => execute(db, "INSERT INTO t VALUES (2, 20)")),
+    "42501",
+  );
   assert.equal(db.privileges().allowsTable("t", "insert"), false);
 });
 
@@ -58,8 +70,14 @@ test("allow_ddl gate is independent of table privileges", () => {
   const db = new Database();
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)");
   db.setAllowDdl(false);
-  assert.equal(code(() => execute(db, "CREATE TABLE u (id i32 PRIMARY KEY)")), "42501");
-  assert.equal(code(() => execute(db, "DROP TABLE t")), "42501");
+  assert.equal(
+    code(() => execute(db, "CREATE TABLE u (id i32 PRIMARY KEY)")),
+    "42501",
+  );
+  assert.equal(
+    code(() => execute(db, "DROP TABLE t")),
+    "42501",
+  );
   execute(db, "INSERT INTO t VALUES (1, 10)"); // DML untouched
 });
 
@@ -69,7 +87,10 @@ test("function EXECUTE is revocable", () => {
   execute(db, "SELECT abs(-5)");
   db.revoke(PrivilegeSet.empty().with("execute"), "abs");
   assert.equal(db.privileges().allowsFunction("abs"), false);
-  assert.equal(code(() => execute(db, "SELECT abs(-5)")), "42501");
+  assert.equal(
+    code(() => execute(db, "SELECT abs(-5)")),
+    "42501",
+  );
   execute(db, "SELECT 1 + 2"); // the + operator is not a named function — never gated
 });
 
@@ -95,5 +116,8 @@ test("an additional session carries its own envelope", () => {
 test("a missing object is 42P01, not authorization", () => {
   const db = new Database();
   db.setDefaultPrivileges(PrivilegeSet.empty());
-  assert.equal(code(() => execute(db, "SELECT * FROM does_not_exist")), "42P01");
+  assert.equal(
+    code(() => execute(db, "SELECT * FROM does_not_exist")),
+    "42P01",
+  );
 });

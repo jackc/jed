@@ -27,7 +27,11 @@ test("timestamp vectors (parse/render byte-identical to Rust/Go)", () => {
   for (const c of cases) {
     if (c.section === "parse") {
       const got = tsParse(c.typ, c.fields.input!);
-      assert.equal(got, BigInt(c.fields.micros!), `${c.typ} parse ${JSON.stringify(c.fields.input)}`);
+      assert.equal(
+        got,
+        BigInt(c.fields.micros!),
+        `${c.typ} parse ${JSON.stringify(c.fields.input)}`,
+      );
     } else if (c.section === "parse_error") {
       let code = "";
       try {

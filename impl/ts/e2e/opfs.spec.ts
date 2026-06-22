@@ -37,7 +37,9 @@ test("committed data survives a full page reload (real OPFS durability)", async 
   expect(read).toEqual(EXPECTED);
 });
 
-test("opening an absent database raises the structured 58P01 across the worker boundary", async ({ page }) => {
+test("opening an absent database raises the structured 58P01 across the worker boundary", async ({
+  page,
+}) => {
   await page.goto("/");
   const code = await page.evaluate(() => window.jed.errorScenario("does-not-exist.jed"));
   expect(code).toBe("58P01"); // undefined_file — the structured-error contract survives postMessage

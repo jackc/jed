@@ -33,8 +33,7 @@ function suitesDir(): string {
     const candidate = join(dir, "spec", "conformance", "suites");
     if (existsSync(candidate)) return candidate;
     const parent = dirname(dir);
-    if (parent === dir)
-      throw new Error("could not locate spec/conformance/suites");
+    if (parent === dir) throw new Error("could not locate spec/conformance/suites");
     dir = parent;
   }
 }
@@ -187,26 +186,15 @@ function floatCellsEqual(expected: string, actual: string): boolean {
 // cellsEqual compares one result cell against its expected value, selecting the comparator by the
 // column's coltype tag: an `R` (real/float) column compares by PARSED VALUE within a tolerance
 // (floatCellsEqual); every other tag compares by exact string (the bit-exact, in-contract surface).
-function cellsEqual(
-  coltype: string,
-  expected: string,
-  actual: string,
-): boolean {
-  return coltype === "R"
-    ? floatCellsEqual(expected, actual)
-    : expected === actual;
+function cellsEqual(coltype: string, expected: string, actual: string): boolean {
+  return coltype === "R" ? floatCellsEqual(expected, actual) : expected === actual;
 }
 
 // rowsEqual compares the actual vs expected flat cell arrays column-aware: a flat index's column is
 // (index mod cols), whose coltype tag picks the comparator. Used after applySort has aligned both
 // arrays (the R tag's tolerance only ever loosens equality, so sorting by string then comparing
 // tolerantly is sound for the float renders the corpus produces).
-function rowsEqual(
-  coltypes: string,
-  cols: number,
-  actual: string[],
-  expected: string[],
-): boolean {
+function rowsEqual(coltypes: string, cols: number, actual: string[], expected: string[]): boolean {
   if (actual.length !== expected.length) return false;
   for (let i = 0; i < actual.length; i++) {
     const col = cols > 0 ? i % cols : 0;
@@ -435,15 +423,9 @@ function parseClockAdvanceDirective(line: string): [bigint, bigint] | null {
 }
 
 // assertCost checks the accrued execution cost matches a pending `# cost:` directive.
-function assertCost(
-  expected: bigint | null,
-  actual: bigint,
-  sql: string,
-): void {
+function assertCost(expected: bigint | null, actual: bigint, sql: string): void {
   if (expected !== null && expected !== actual) {
-    throw new Error(
-      `cost mismatch: expected ${expected}, got ${actual}\n  SQL: ${sql}`,
-    );
+    throw new Error(`cost mismatch: expected ${expected}, got ${actual}\n  SQL: ${sql}`);
   }
 }
 
@@ -459,11 +441,7 @@ function parseNamesDirective(line: string): string[] | null {
 }
 
 // assertNames checks the query's output column names match a pending `# names:` directive.
-function assertNames(
-  expected: string[] | null,
-  actual: string[],
-  sql: string,
-): void {
+function assertNames(expected: string[] | null, actual: string[], sql: string): void {
   if (expected !== null && !arrEq(expected, actual)) {
     throw new Error(
       `column-name mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(expected)}\n  actual:   ${JSON.stringify(actual)}`,
@@ -485,11 +463,7 @@ function parseTypesDirective(line: string): string[] | null {
 }
 
 // assertTypes checks the query's output column types match a pending `# types:` directive.
-function assertTypes(
-  expected: string[] | null,
-  actual: string[],
-  sql: string,
-): void {
+function assertTypes(expected: string[] | null, actual: string[], sql: string): void {
   if (expected !== null && !arrEq(expected, actual)) {
     throw new Error(
       `column-type mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(expected)}\n  actual:   ${JSON.stringify(actual)}`,
@@ -620,16 +594,13 @@ function runFile(text: string): void {
     pendingMaxSqlLength = null;
     // Apply the per-record entropy seed + statement clock for the uuid generators (entropy.md §6);
     // absent ⇒ cleared (OS entropy / wall clock), so a directive never leaks forward.
-    if (pendingSeed !== null)
-      db.setRandomSource(seededRandomSource(pendingSeed));
+    if (pendingSeed !== null) db.setRandomSource(seededRandomSource(pendingSeed));
     else db.clearRandomSource();
     pendingSeed = null;
     // `# clock_advance:` (an advancing clock) takes precedence over `# clock:` (a fixed one); a
     // record uses at most one. Absent ⇒ cleared, so a clock directive never leaks forward.
     if (pendingClockAdvance !== null) {
-      db.setClockSource(
-        advancingClock(pendingClockAdvance[0], pendingClockAdvance[1]),
-      );
+      db.setClockSource(advancingClock(pendingClockAdvance[0], pendingClockAdvance[1]));
     } else if (pendingClock !== null) {
       db.setClockSource(fixedClock(pendingClock));
     } else {
@@ -642,16 +613,14 @@ function runFile(text: string): void {
     // # default_privileges: / # grant: / # revoke: / # allow_ddl: decorates only its record and never
     // leaks forward.
     db.resetPrivileges();
-    if (pendingDefaultPrivileges !== null)
-      db.setDefaultPrivileges(pendingDefaultPrivileges);
+    if (pendingDefaultPrivileges !== null) db.setDefaultPrivileges(pendingDefaultPrivileges);
     for (const g of pendingGrants) db.grant(g.privs, g.object);
     for (const r of pendingRevokes) db.revoke(r.privs, r.object);
     if (pendingAllowDdl !== null) db.setAllowDdl(pendingAllowDdl);
     // `# allow_temp_ddl:` / `# allow_shared_temp_ddl:` override the temp-DDL gates (temp-tables.md §5);
     // resetPrivileges above set both back to permissive, so each decorates only its record.
     if (pendingAllowTempDdl !== null) db.setAllowTempDdl(pendingAllowTempDdl);
-    if (pendingAllowSharedTempDdl !== null)
-      db.setAllowSharedTempDdl(pendingAllowSharedTempDdl);
+    if (pendingAllowSharedTempDdl !== null) db.setAllowSharedTempDdl(pendingAllowSharedTempDdl);
     pendingDefaultPrivileges = null;
     pendingGrants.length = 0;
     pendingRevokes.length = 0;
@@ -690,23 +659,17 @@ function runFile(text: string): void {
       }
       if (expect === "ok") {
         if (err !== null) {
-          throw new Error(
-            `statement expected ok, got error ${msgOf(err)}\n  SQL: ${sql}`,
-          );
+          throw new Error(`statement expected ok, got error ${msgOf(err)}\n  SQL: ${sql}`);
         }
         assertCost(expectedCost, outcome!.cost, sql);
       } else if (expect === "error") {
         const want = fields[2] ?? "";
         if (err === null) {
-          throw new Error(
-            `statement expected error ${want}, but it succeeded\n  SQL: ${sql}`,
-          );
+          throw new Error(`statement expected error ${want}, but it succeeded\n  SQL: ${sql}`);
         }
         const got = codeOf(err);
         if (got !== want) {
-          throw new Error(
-            `statement expected error ${want}, got ${got}\n  SQL: ${sql}`,
-          );
+          throw new Error(`statement expected error ${want}, got ${got}\n  SQL: ${sql}`);
         }
       } else {
         throw new Error(`unknown statement kind "${expect}"`);
@@ -742,16 +705,8 @@ function runFile(text: string): void {
         );
       }
       assertCost(expectedCost, outcome.cost, sql);
-      assertNames(
-        expectedNames,
-        outcome.kind === "query" ? outcome.columnNames : [],
-        sql,
-      );
-      assertTypes(
-        expectedTypes,
-        outcome.kind === "query" ? outcome.columnTypes : [],
-        sql,
-      );
+      assertNames(expectedNames, outcome.kind === "query" ? outcome.columnNames : [], sql);
+      assertTypes(expectedTypes, outcome.kind === "query" ? outcome.columnTypes : [], sql);
     } else {
       throw new Error(`unknown record kind "${fields[0]}"`);
     }
@@ -776,8 +731,7 @@ function isConcurrencyFormat(text: string): boolean {
     const t = raw.trim();
     if (!t.startsWith("#")) continue;
     const rest = t.slice(1).trim();
-    if (rest.startsWith("format:"))
-      return rest.slice("format:".length).trim() === "concurrency";
+    if (rest.startsWith("format:")) return rest.slice("format:".length).trim() === "concurrency";
   }
   return false;
 }
@@ -794,14 +748,7 @@ function sessionExecute(s: CSession, sql: string): Outcome {
 // concurrencyDirectives are the line-leading keywords that bound a record body. Unlike the
 // sequential format, a schedule does not separate records with blank lines, so an `on` record's SQL
 // (and a query's expected rows) runs until the next directive, a blank line, or a comment.
-const concurrencyDirectives = new Set([
-  "open",
-  "on",
-  "commit",
-  "rollback",
-  "close",
-  "expect",
-]);
+const concurrencyDirectives = new Set(["open", "on", "commit", "rollback", "close", "expect"]);
 
 // isBoundary reports whether line ends the current record body: blank, a comment, or the start of
 // the next schedule directive.
@@ -824,10 +771,7 @@ function takeConcurrencySQL(lines: string[], c: Cursor): string {
 
 // takeConcurrencyQuery reads a query body: SQL up to the `----` separator, then expected rows up to
 // the next record boundary.
-function takeConcurrencyQuery(
-  lines: string[],
-  c: Cursor,
-): { sql: string; expected: string[] } {
+function takeConcurrencyQuery(lines: string[], c: Cursor): { sql: string; expected: string[] } {
   const body: string[] = [];
   while (c.i < lines.length) {
     if (lines[c.i]!.trim() === "----") {
@@ -865,9 +809,7 @@ function runConcurrencyRecord(
     }
     if (expect === "ok") {
       if (err !== null) {
-        throw new Error(
-          `[${sid}] statement expected ok, got error ${msgOf(err)}\n  SQL: ${sql}`,
-        );
+        throw new Error(`[${sid}] statement expected ok, got error ${msgOf(err)}\n  SQL: ${sql}`);
       }
     } else if (expect === "error") {
       const want = rec[2] ?? "";
@@ -878,9 +820,7 @@ function runConcurrencyRecord(
       }
       const got = codeOf(err);
       if (got !== want) {
-        throw new Error(
-          `[${sid}] statement expected error ${want}, got ${got}\n  SQL: ${sql}`,
-        );
+        throw new Error(`[${sid}] statement expected error ${want}, got ${got}\n  SQL: ${sql}`);
       }
     } else {
       throw new Error(`[${sid}] unknown statement kind "${expect}"`);
@@ -898,9 +838,7 @@ function runConcurrencyRecord(
     const cols = coltypes.length === 0 ? 1 : coltypes.length;
     const actual = renderOutcome(outcome, cols, sortmode);
     const exp = applySort(expected, cols, sortmode);
-    const ok = coltypes.includes("R")
-      ? rowsEqual(coltypes, cols, actual, exp)
-      : arrEq(actual, exp);
+    const ok = coltypes.includes("R") ? rowsEqual(coltypes, cols, actual, exp) : arrEq(actual, exp);
     if (!ok) {
       throw new Error(
         `[${sid}] query result mismatch\n  SQL: ${sql}\n  expected: ${JSON.stringify(exp)}\n  actual:   ${JSON.stringify(actual)}`,
@@ -914,8 +852,7 @@ function runConcurrencyRecord(
 // endSession ends a session: commit/rollback a write session, close a read session.
 function endSession(kind: string, s: CSession): void {
   if (kind === "close") {
-    if (!s.read)
-      throw new Error("close of a write session (use commit/rollback)");
+    if (!s.read) throw new Error("close of a write session (use commit/rollback)");
     s.read.close();
   } else if (kind === "commit") {
     if (!s.write) throw new Error("commit of a read session (use close)");
@@ -951,27 +888,21 @@ function runConcurrencyFile(text: string): void {
     const fields = line.split(/\s+/);
     switch (fields[0]) {
       case "open": {
-        if (fields.length < 3)
-          throw new Error(`open needs \`<sid> read|write [blocks]\`: ${line}`);
+        if (fields.length < 3) throw new Error(`open needs \`<sid> read|write [blocks]\`: ${line}`);
         const sid = fields[1]!;
         const mode = fields[2]!;
         // An optional 4th token is the Layer 2 `blocks` annotation (writer-open on a held gate).
         let blocksAnn = false;
         if (fields.length > 3) {
           if (fields[3] !== "blocks") {
-            throw new Error(
-              `unknown open annotation "${fields[3]}" (want \`blocks\`): ${line}`,
-            );
+            throw new Error(`unknown open annotation "${fields[3]}" (want \`blocks\`): ${line}`);
           }
           blocksAnn = true;
         }
-        if (sessions.has(sid) || sid === blocked)
-          throw new Error(`session "${sid}" already open`);
+        if (sessions.has(sid) || sid === blocked) throw new Error(`session "${sid}" already open`);
         if (mode === "read") {
           if (blocksAnn)
-            throw new Error(
-              `open ${sid}: \`blocks\` is only valid for a write session`,
-            );
+            throw new Error(`open ${sid}: \`blocks\` is only valid for a write session`);
           sessions.set(sid, { read: db.read() }); // readers never take the gate
         } else if (mode === "write") {
           if (blocksAnn) {
@@ -1006,13 +937,10 @@ function runConcurrencyFile(text: string): void {
       case "commit":
       case "rollback":
       case "close": {
-        if (fields.length < 2)
-          throw new Error(`${fields[0]} needs a session id: ${line}`);
+        if (fields.length < 2) throw new Error(`${fields[0]} needs a session id: ${line}`);
         const sid = fields[1]!;
         if (sid === blocked) {
-          throw new Error(
-            `${fields[0]} of "${sid}" while it is blocked on the writer gate`,
-          );
+          throw new Error(`${fields[0]} of "${sid}" while it is blocked on the writer gate`);
         }
         const s = sessions.get(sid);
         if (!s) throw new Error(`${fields[0]} of unknown session "${sid}"`);
@@ -1033,27 +961,20 @@ function runConcurrencyFile(text: string): void {
         break;
       }
       case "expect": {
-        if (fields.length < 3)
-          throw new Error(`expect needs \`version|oldest_live <n>\`: ${line}`);
+        if (fields.length < 3) throw new Error(`expect needs \`version|oldest_live <n>\`: ${line}`);
         const want = BigInt(fields[2]!);
         let got: bigint;
         if (fields[1] === "version") got = db.version;
         else if (fields[1] === "oldest_live") got = db.oldestLiveTxid();
-        else
-          throw new Error(
-            `unknown expect kind "${fields[1]}" (want version|oldest_live)`,
-          );
-        if (got !== want)
-          throw new Error(`expect ${fields[1]} ${want}, got ${got}`);
+        else throw new Error(`unknown expect kind "${fields[1]}" (want version|oldest_live)`);
+        if (got !== want) throw new Error(`expect ${fields[1]} ${want}, got ${got}`);
         c.i++;
         break;
       }
       case "on": {
-        if (fields.length < 3)
-          throw new Error(`on needs \`<sid> <record>\`: ${line}`);
+        if (fields.length < 3) throw new Error(`on needs \`<sid> <record>\`: ${line}`);
         const sid = fields[1]!;
-        if (sid === blocked)
-          throw new Error(`on "${sid}" while it is blocked on the writer gate`);
+        if (sid === blocked) throw new Error(`on "${sid}" while it is blocked on the writer gate`);
         const s = sessions.get(sid);
         if (!s) throw new Error(`on unknown session "${sid}"`);
         c.i++;
@@ -1068,9 +989,7 @@ function runConcurrencyFile(text: string): void {
     // Deterministic message; Map iteration order is insertion order but we sort to never leak it.
     const open = [...sessions.keys()];
     if (blocked !== "") open.push(blocked);
-    throw new Error(
-      `file ended with sessions still open: ${open.sort().join(", ")}`,
-    );
+    throw new Error(`file ended with sessions still open: ${open.sort().join(", ")}`);
   }
 }
 

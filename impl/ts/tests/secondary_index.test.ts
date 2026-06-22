@@ -87,20 +87,50 @@ test("DDL errors match PostgreSQL", () => {
   // 42704/42809.
   const db = new Database();
   run(db, "CREATE TABLE t (a i32 PRIMARY KEY, s f64)");
-  assert.equal(errCode(() => run(db, "CREATE INDEX i ON nosuch (nope)")), "42P01");
+  assert.equal(
+    errCode(() => run(db, "CREATE INDEX i ON nosuch (nope)")),
+    "42P01",
+  );
   run(db, "CREATE INDEX taken ON t (a)");
-  assert.equal(errCode(() => run(db, "CREATE INDEX taken ON t (nope)")), "42703");
+  assert.equal(
+    errCode(() => run(db, "CREATE INDEX taken ON t (nope)")),
+    "42703",
+  );
   // f64 is not key-encodable (the determinism carve-out, determinism.md §4); text/bytea ARE
   // now valid index columns (encoding.md §2.4/§2.6, covered in ddl/create_index.test).
-  assert.equal(errCode(() => run(db, "CREATE INDEX i ON t (s)")), "0A000");
-  assert.equal(errCode(() => run(db, "CREATE INDEX taken ON t (a)")), "42P07");
-  assert.equal(errCode(() => run(db, "CREATE INDEX t ON t (a)")), "42P07");
-  assert.equal(errCode(() => run(db, "CREATE TABLE taken (x i32)")), "42P07");
-  assert.equal(errCode(() => run(db, "DROP INDEX nosuch")), "42704");
-  assert.equal(errCode(() => run(db, "DROP INDEX t")), "42809");
-  assert.equal(errCode(() => run(db, "DROP TABLE taken")), "42809");
+  assert.equal(
+    errCode(() => run(db, "CREATE INDEX i ON t (s)")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => run(db, "CREATE INDEX taken ON t (a)")),
+    "42P07",
+  );
+  assert.equal(
+    errCode(() => run(db, "CREATE INDEX t ON t (a)")),
+    "42P07",
+  );
+  assert.equal(
+    errCode(() => run(db, "CREATE TABLE taken (x i32)")),
+    "42P07",
+  );
+  assert.equal(
+    errCode(() => run(db, "DROP INDEX nosuch")),
+    "42704",
+  );
+  assert.equal(
+    errCode(() => run(db, "DROP INDEX t")),
+    "42809",
+  );
+  assert.equal(
+    errCode(() => run(db, "DROP TABLE taken")),
+    "42809",
+  );
   run(db, "DROP INDEX taken");
-  assert.equal(errCode(() => run(db, "DROP INDEX taken")), "42704");
+  assert.equal(
+    errCode(() => run(db, "DROP INDEX taken")),
+    "42704",
+  );
   run(db, "CREATE INDEX taken ON t (a)");
   run(db, "DROP TABLE t");
   run(db, "CREATE TABLE taken (x i32)"); // DROP TABLE freed its index names
@@ -158,7 +188,13 @@ test("round-trips through the on-disk image", () => {
   assert.deepEqual(t.indexes[0]!.columns, [1]);
   assert.equal(cost(loaded, "SELECT id FROM t WHERE v = 3"), 17n);
   run(loaded, "UPDATE t SET v = 3 WHERE id = 100");
-  assert.deepEqual(ids(loaded, "SELECT id FROM t WHERE v = 3 ORDER BY id"), [3n, 8n, 13n, 18n, 100n]);
+  assert.deepEqual(ids(loaded, "SELECT id FROM t WHERE v = 3 ORDER BY id"), [
+    3n,
+    8n,
+    13n,
+    18n,
+    100n,
+  ]);
 });
 
 test("index DDL is transactional", () => {
@@ -209,7 +245,10 @@ test("CREATE INDEX honors the cost ceiling", () => {
   // registers nothing (CLAUDE.md §13).
   const db = db20();
   db.setMaxCost(10n);
-  assert.equal(errCode(() => run(db, "CREATE INDEX t_v_idx ON t (v)")), "54P01");
+  assert.equal(
+    errCode(() => run(db, "CREATE INDEX t_v_idx ON t (v)")),
+    "54P01",
+  );
   db.setMaxCost(0n);
   assert.equal(db.table("t")!.indexes.length, 0);
   run(db, "CREATE INDEX t_v_idx ON t (v)");

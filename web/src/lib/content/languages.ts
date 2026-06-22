@@ -10,13 +10,13 @@ export type Language = { id: LangId; label: string };
 
 // Order = display order in the selector. Rust first (the priority core, CLAUDE.md §2).
 export const LANGUAGES: readonly Language[] = [
-	{ id: 'rust', label: 'Rust' },
-	{ id: 'go', label: 'Go' },
-	{ id: 'ts', label: 'TypeScript' }
+  { id: 'rust', label: 'Rust' },
+  { id: 'go', label: 'Go' },
+  { id: 'ts', label: 'TypeScript' }
 ];
 
 export const DEFAULT_LANG: LangId = 'rust';
 
 export function isLangId(v: unknown): v is LangId {
-	return typeof v === 'string' && LANGUAGES.some((l) => l.id === v);
+  return typeof v === 'string' && LANGUAGES.some((l) => l.id === v);
 }

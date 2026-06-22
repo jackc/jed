@@ -41,7 +41,10 @@ test("semicolon in a string is not a boundary", () => {
 
 test("semicolon in a comment is not a boundary", () => {
   assert.deepStrictEqual(texts("SELECT 1 -- a; b\n; SELECT 2"), ["SELECT 1", "SELECT 2"]);
-  assert.deepStrictEqual(texts("SELECT /* a; b */ 1; SELECT 2"), ["SELECT /* a; b */ 1", "SELECT 2"]);
+  assert.deepStrictEqual(texts("SELECT /* a; b */ 1; SELECT 2"), [
+    "SELECT /* a; b */ 1",
+    "SELECT 2",
+  ]);
   assert.deepStrictEqual(texts("SELECT /* /* ; */ */ 1"), ["SELECT /* /* ; */ */ 1"]);
 });
 
@@ -62,5 +65,9 @@ test("trailing whitespace trimmed, interior comment kept", () => {
 });
 
 test("no trailing semicolon still yields the last statement", () => {
-  assert.deepStrictEqual(texts("SELECT 1; SELECT 2; SELECT 3"), ["SELECT 1", "SELECT 2", "SELECT 3"]);
+  assert.deepStrictEqual(texts("SELECT 1; SELECT 2; SELECT 3"), [
+    "SELECT 1",
+    "SELECT 2",
+    "SELECT 3",
+  ]);
 });

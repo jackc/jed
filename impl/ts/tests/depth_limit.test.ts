@@ -84,7 +84,11 @@ test("every nesting vector aborts, not crashes", () => {
     `SELECT 1${" UNION ALL SELECT 1".repeat(n)}`,
   ];
   for (const sql of vectors) {
-    assert.strictEqual(codeOf(db, sql), "54001", `a ${n}-deep vector should be 54001: ${sql.slice(0, 40)}…`);
+    assert.strictEqual(
+      codeOf(db, sql),
+      "54001",
+      `a ${n}-deep vector should be 54001: ${sql.slice(0, 40)}…`,
+    );
   }
 });
 

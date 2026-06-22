@@ -25,7 +25,11 @@ test("bool → non-i32 integer is forbidden (42804)", () => {
     "SELECT CAST(FALSE AS smallint)",
     "SELECT TRUE::bigint",
   ]) {
-    assert.equal(errCode(() => execute(db, sql)), "42804", sql);
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      "42804",
+      sql,
+    );
   }
 });
 
@@ -40,7 +44,11 @@ test("non-i32 integer → bool is forbidden (42804)", () => {
     "SELECT CAST(s AS boolean) FROM t WHERE id = 1",
     "SELECT b::boolean FROM t WHERE id = 1",
   ]) {
-    assert.equal(errCode(() => execute(db, sql)), "42804", sql);
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      "42804",
+      sql,
+    );
   }
 });
 
@@ -48,11 +56,12 @@ test("non-i32 integer → bool is forbidden (42804)", () => {
 // traps 22003 (PG reports 42846 — it types the literal as int8 first). A documented divergence.
 test("integer literal beyond i32 range → bool overflows (22003)", () => {
   const db = dbWith([]);
-  for (const sql of [
-    "SELECT CAST(5000000000 AS boolean)",
-    "SELECT 5000000000::boolean",
-  ]) {
-    assert.equal(errCode(() => execute(db, sql)), "22003", sql);
+  for (const sql of ["SELECT CAST(5000000000 AS boolean)", "SELECT 5000000000::boolean"]) {
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      "22003",
+      sql,
+    );
   }
 });
 

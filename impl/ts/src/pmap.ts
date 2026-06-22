@@ -56,7 +56,8 @@ export interface LeafSource {
 // tree builds no OnDisk ref, and every file-backed traversal supplies a source), so it throws.
 function resolveChild(c: Child, src: LeafSource | null): PNode {
   if (c.node !== null) return c.node;
-  if (src === null) throw new Error(`demand-paged leaf ${c.page} reached with no buffer-pool source`);
+  if (src === null)
+    throw new Error(`demand-paged leaf ${c.page} reached with no buffer-pool source`);
   return src.loadLeaf(c.page);
 }
 
@@ -150,7 +151,11 @@ function entryWindow(b: KeyBound, n: PNode): [number, number] {
   const first =
     b.lo === null ? 0 : b.loInc ? lowerBoundGE(n.keys, b.lo) : lowerBoundGT(n.keys, b.lo);
   let last =
-    b.hi === null ? n.keys.length : b.hiInc ? lowerBoundGT(n.keys, b.hi) : lowerBoundGE(n.keys, b.hi);
+    b.hi === null
+      ? n.keys.length
+      : b.hiInc
+        ? lowerBoundGT(n.keys, b.hi)
+        : lowerBoundGE(n.keys, b.hi);
   if (last < first) last = first;
   return [first, last];
 }
@@ -211,7 +216,13 @@ export class PMap {
   // capacity. Returns the previous row if key was present (an overwrite, size unchanged), else
   // undefined (a new insert, which grows the size). An overwrite can change the weight, so it too
   // may overflow and split.
-  insert(key: Uint8Array, val: Row, weight: number, cap: number, src: LeafSource | null): Row | undefined {
+  insert(
+    key: Uint8Array,
+    val: Row,
+    weight: number,
+    cap: number,
+    src: LeafSource | null,
+  ): Row | undefined {
     if (this.root === null) {
       this.root = { keys: [key], vals: [val], weights: [weight], children: [], page: 0 };
       this.length++;
@@ -391,7 +402,11 @@ export class PMap {
   // spec/design/cost.md §3 "LIMIT short-circuit"). Streams one row at a time (no array), so a bounded
   // result holds ~one leaf resident. An eval error propagates as a thrown exception. Windowed like
   // rangeEntries, including the separator-equal-to-an-inclusive-lo edge emitted before the descent.
-  scanRange(b: KeyBound, src: LeafSource | null, visit: (key: Uint8Array, row: Row) => boolean): void {
+  scanRange(
+    b: KeyBound,
+    src: LeafSource | null,
+    visit: (key: Uint8Array, row: Row) => boolean,
+  ): void {
     const walk = (n: PNode): boolean => {
       const [ef, el] = entryWindow(b, n);
       if (isLeaf(n)) {
@@ -509,7 +524,14 @@ function nodeInsert(
     ctx.replaced = true;
     vals[index] = val;
     weights[index] = weight;
-    return build(n.keys.slice(), vals, weights, n.children.slice(), cap, index === n.keys.length - 1);
+    return build(
+      n.keys.slice(),
+      vals,
+      weights,
+      n.children.slice(),
+      cap,
+      index === n.keys.length - 1,
+    );
   }
   if (isLeaf(n)) {
     return build(
@@ -527,7 +549,15 @@ function nodeInsert(
   if (sub.whole !== null) {
     const children = n.children.slice();
     children[index] = residentRef(sub.whole);
-    return { whole: { keys: n.keys.slice(), vals: n.vals.slice(), weights: n.weights.slice(), children, page: 0 } };
+    return {
+      whole: {
+        keys: n.keys.slice(),
+        vals: n.vals.slice(),
+        weights: n.weights.slice(),
+        children,
+        page: 0,
+      },
+    };
   }
   const keys = insertAt(n.keys, index, sub.midK);
   const vals = insertAt(n.vals, index, sub.midV);
@@ -559,7 +589,13 @@ function nodeRemove(n: PNode, key: Uint8Array, src: LeafSource | null, cap: numb
       const removed = n.vals[index];
       return {
         ok: true,
-        node: { keys: removeAt(n.keys, index), vals: removeAt(n.vals, index), weights: removeAt(n.weights, index), children: [], page: 0 },
+        node: {
+          keys: removeAt(n.keys, index),
+          vals: removeAt(n.vals, index),
+          weights: removeAt(n.weights, index),
+          children: [],
+          page: 0,
+        },
         removed,
       };
     }
@@ -586,7 +622,13 @@ function nodeRemove(n: PNode, key: Uint8Array, src: LeafSource | null, cap: numb
   if (!res.ok) return { ok: false, node: n, removed: undefined };
   const children = n.children.slice();
   children[index] = residentRef(res.node);
-  const rebuilt: PNode = { keys: n.keys.slice(), vals: n.vals.slice(), weights: n.weights.slice(), children, page: 0 };
+  const rebuilt: PNode = {
+    keys: n.keys.slice(),
+    vals: n.vals.slice(),
+    weights: n.weights.slice(),
+    children,
+    page: 0,
+  };
   return { ok: true, node: rebalanceChild(rebuilt, index, src, cap), removed: res.removed };
 }
 

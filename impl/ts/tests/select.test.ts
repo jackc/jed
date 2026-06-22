@@ -33,5 +33,8 @@ test("LIMIT/OFFSET window reduces produced cost (slice before projection)", () =
 });
 
 test("unknown column traps 42703", () => {
-  assert.equal(errCode(() => execute(seed(), "SELECT nope FROM t")), "42703");
+  assert.equal(
+    errCode(() => execute(seed(), "SELECT nope FROM t")),
+    "42703",
+  );
 });

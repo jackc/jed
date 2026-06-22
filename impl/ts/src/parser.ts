@@ -174,31 +174,25 @@ class Parser {
       // §30; UNIQUE needs no lookahead of its own — after CREATE the next word being
       // UNIQUE can only be CREATE UNIQUE INDEX).
       case "create":
-        if (
-          this.peekKeywordAt(1) === "index" ||
-          this.peekKeywordAt(1) === "unique"
-        ) {
+        if (this.peekKeywordAt(1) === "index" || this.peekKeywordAt(1) === "unique") {
           return this.parseCreateIndex();
         }
         // CREATE TYPE — a 2-token lookahead keeps TYPE non-reserved (the CREATE UNIQUE INDEX
         // precedent — composite.md §1).
         if (this.peekKeywordAt(1) === "type") return this.parseCreateType();
         // CREATE SEQUENCE — a 2-token lookahead keeps SEQUENCE non-reserved (sequences.md §1).
-        if (this.peekKeywordAt(1) === "sequence")
-          return this.parseCreateSequence();
+        if (this.peekKeywordAt(1) === "sequence") return this.parseCreateSequence();
         return this.parseCreateTable();
       case "drop":
         if (this.peekKeywordAt(1) === "index") return this.parseDropIndex();
         if (this.peekKeywordAt(1) === "type") return this.parseDropType();
-        if (this.peekKeywordAt(1) === "sequence")
-          return this.parseDropSequence();
+        if (this.peekKeywordAt(1) === "sequence") return this.parseDropSequence();
         return this.parseDropTable();
       // ALTER SEQUENCE — the only ALTER statement this slice (sequences.md §4). A 2-token lookahead
       // recognizes it; any other `ALTER …` (TABLE, SYSTEM, …) is not a statement keyword jed knows
       // and falls through to the generic unknown-keyword 42601 (the no-escape-hatch surface).
       case "alter":
-        if (this.peekKeywordAt(1) === "sequence")
-          return this.parseAlterSequence();
+        if (this.peekKeywordAt(1) === "sequence") return this.parseAlterSequence();
         throw engineError("syntax_error", "unexpected keyword 'alter'");
       case "insert":
         return this.parseInsert();
@@ -223,10 +217,7 @@ class Parser {
       case "":
         throw engineError("syntax_error", "expected a SQL statement");
       default:
-        throw engineError(
-          "syntax_error",
-          `unexpected keyword '${this.peekKeyword()}'`,
-        );
+        throw engineError("syntax_error", `unexpected keyword '${this.peekKeyword()}'`);
     }
   }
 
@@ -303,14 +294,10 @@ class Parser {
     // TEMP/TEMPORARY (a stray `CREATE SHARED TABLE …` is 42601); so shared always has temp===true.
     const shared = this.peekKeyword() === "shared";
     if (shared) this.advance();
-    const temp =
-      this.peekKeyword() === "temp" || this.peekKeyword() === "temporary";
+    const temp = this.peekKeyword() === "temp" || this.peekKeyword() === "temporary";
     if (temp) this.advance();
     if (shared && !temp) {
-      throw engineError(
-        "syntax_error",
-        "SHARED must be followed by TEMP or TEMPORARY",
-      );
+      throw engineError("syntax_error", "SHARED must be followed by TEMP or TEMPORARY");
     }
     this.expectKeyword("table");
     const name = this.expectIdentifier();
@@ -341,10 +328,7 @@ class Parser {
       throw engineError("syntax_error", "expected ',' or ')'");
     }
     if (columns.length === 0) {
-      throw engineError(
-        "syntax_error",
-        "a table must have at least one column",
-      );
+      throw engineError("syntax_error", "a table must have at least one column");
     }
     return {
       kind: "createTable",
@@ -365,8 +349,7 @@ class Parser {
   // would need a type named "key" (none exists), so the lookahead loses nothing (the PRIMARY KEY
   // precedent).
   private atForeignKeyTableConstraint(): boolean {
-    if (this.peekKeyword() === "foreign" && this.peekKeywordAt(1) === "key")
-      return true;
+    if (this.peekKeyword() === "foreign" && this.peekKeywordAt(1) === "key") return true;
     return (
       this.peekKeyword() === "constraint" &&
       this.peekKeywordAt(2) === "foreign" &&
@@ -387,8 +370,7 @@ class Parser {
     this.expectKeyword("foreign");
     this.expectKeyword("key");
     const columns = this.parsePkColumnList();
-    const { refTable, refColumns, onDelete, onUpdate } =
-      this.parseReferencesClause();
+    const { refTable, refColumns, onDelete, onUpdate } = this.parseReferencesClause();
     return { name, columns, refTable, refColumns, onDelete, onUpdate };
   }
 
@@ -404,8 +386,7 @@ class Parser {
   } {
     this.expectKeyword("references");
     const refTable = this.expectIdentifier();
-    const refColumns =
-      this.peek().kind === "lparen" ? this.parsePkColumnList() : null;
+    const refColumns = this.peek().kind === "lparen" ? this.parsePkColumnList() : null;
     let onDelete: RefAction = "noAction";
     let onUpdate: RefAction = "noAction";
     let seenDelete = false;
@@ -415,20 +396,12 @@ class Parser {
       const kw = this.peekKeyword();
       if (kw === "delete") {
         this.advance();
-        if (seenDelete)
-          throw engineError(
-            "syntax_error",
-            "ON DELETE specified more than once",
-          );
+        if (seenDelete) throw engineError("syntax_error", "ON DELETE specified more than once");
         seenDelete = true;
         onDelete = this.parseReferentialAction();
       } else if (kw === "update") {
         this.advance();
-        if (seenUpdate)
-          throw engineError(
-            "syntax_error",
-            "ON UPDATE specified more than once",
-          );
+        if (seenUpdate) throw engineError("syntax_error", "ON UPDATE specified more than once");
         seenUpdate = true;
         onUpdate = this.parseReferentialAction();
       } else {
@@ -480,11 +453,8 @@ class Parser {
   // "unique" is followed by a type name (an identifier, never "("), so the lookahead
   // loses nothing.
   private atUniqueTableConstraint(): boolean {
-    if (this.peekKeyword() === "unique" && this.peekKindAt(1) === "lparen")
-      return true;
-    return (
-      this.peekKeyword() === "constraint" && this.peekKeywordAt(2) === "unique"
-    );
+    if (this.peekKeyword() === "unique" && this.peekKindAt(1) === "lparen") return true;
+    return this.peekKeyword() === "constraint" && this.peekKeywordAt(2) === "unique";
   }
 
   // parseUniqueTableConstraint parses one table-level `[CONSTRAINT name] UNIQUE ( col [,
@@ -505,8 +475,7 @@ class Parser {
   // The keywords stay non-reserved — a column named "check"/"constraint" is followed by a
   // type name (an identifier, never "("), so the lookahead loses nothing.
   private atCheckConstraint(): boolean {
-    if (this.peekKeyword() === "check" && this.peekKindAt(1) === "lparen")
-      return true;
+    if (this.peekKeyword() === "check" && this.peekKindAt(1) === "lparen") return true;
     return (
       this.peekKeyword() === "constraint" &&
       this.peekKeywordAt(2) === "check" &&
@@ -578,10 +547,7 @@ class Parser {
       }
       // CONSTRAINT <name> UNIQUE in column position (the named one-member form;
       // CONSTRAINT <name> CHECK ( was caught above).
-      if (
-        this.peekKeyword() === "constraint" &&
-        this.peekKeywordAt(2) === "unique"
-      ) {
+      if (this.peekKeyword() === "constraint" && this.peekKeywordAt(2) === "unique") {
         this.advance();
         const cname = this.expectIdentifier();
         this.expectKeyword("unique");
@@ -589,14 +555,10 @@ class Parser {
         continue;
       }
       // CONSTRAINT <name> REFERENCES … in column position (the named one-member FK).
-      if (
-        this.peekKeyword() === "constraint" &&
-        this.peekKeywordAt(2) === "references"
-      ) {
+      if (this.peekKeyword() === "constraint" && this.peekKeywordAt(2) === "references") {
         this.advance();
         const cname = this.expectIdentifier();
-        const { refTable, refColumns, onDelete, onUpdate } =
-          this.parseReferencesClause();
+        const { refTable, refColumns, onDelete, onUpdate } = this.parseReferencesClause();
         fks.push({
           name: cname,
           columns: [name],
@@ -650,9 +612,7 @@ class Parser {
         this.expectKeyword("as");
         this.expectKeyword("identity");
         const options =
-          this.peek().kind === "lparen"
-            ? this.parseSequenceOptions(true)
-            : emptySeqOptions();
+          this.peek().kind === "lparen" ? this.parseSequenceOptions(true) : emptySeqOptions();
         if (identity !== null) {
           throw engineError(
             "syntax_error",
@@ -672,8 +632,7 @@ class Parser {
       } else if (kw === "references") {
         // The column-level one-member FK: `REFERENCES parent [(col)] [actions]`.
         // parseReferencesClause consumes the REFERENCES keyword itself.
-        const { refTable, refColumns, onDelete, onUpdate } =
-          this.parseReferencesClause();
+        const { refTable, refColumns, onDelete, onUpdate } = this.parseReferencesClause();
         fks.push({
           name: null,
           columns: [name],
@@ -731,8 +690,7 @@ class Parser {
 
   private expectTypmodInt(): bigint {
     const t = this.advance();
-    if (t.kind !== "int")
-      throw engineError("syntax_error", "expected an integer type modifier");
+    if (t.kind !== "int") throw engineError("syntax_error", "expected an integer type modifier");
     return t.int!;
   }
 
@@ -782,10 +740,7 @@ class Parser {
       const tok = this.advance();
       if (tok.kind === "comma") continue;
       if (tok.kind === "rparen") break;
-      throw engineError(
-        "syntax_error",
-        `expected ',' or ')', found ${tok.kind}`,
-      );
+      throw engineError("syntax_error", `expected ',' or ')', found ${tok.kind}`);
     }
     return { kind: "createIndex", name, table, columns, unique, using };
   }
@@ -827,10 +782,7 @@ class Parser {
       const tok = this.advance();
       if (tok.kind === "comma") continue;
       if (tok.kind === "rparen") break;
-      throw engineError(
-        "syntax_error",
-        `expected ',' or ')', found ${tok.kind}`,
-      );
+      throw engineError("syntax_error", `expected ',' or ')', found ${tok.kind}`);
     }
     return { kind: "createType", name, fields };
   }
@@ -858,10 +810,7 @@ class Parser {
       cascade = true;
     }
     if (cascade) {
-      throw engineError(
-        "feature_not_supported",
-        "DROP TYPE ... CASCADE is not supported",
-      );
+      throw engineError("feature_not_supported", "DROP TYPE ... CASCADE is not supported");
     }
     return { kind: "dropType", name, ifExists };
   }
@@ -1029,10 +978,7 @@ class Parser {
       cascade = true;
     }
     if (cascade) {
-      throw engineError(
-        "feature_not_supported",
-        "DROP SEQUENCE ... CASCADE is not supported",
-      );
+      throw engineError("feature_not_supported", "DROP SEQUENCE ... CASCADE is not supported");
     }
     return { kind: "dropSequence", names, ifExists };
   }
@@ -1068,18 +1014,12 @@ class Parser {
       case "owned":
       case "owner":
       case "set":
-        throw engineError(
-          "feature_not_supported",
-          "this ALTER SEQUENCE action is not supported",
-        );
+        throw engineError("feature_not_supported", "this ALTER SEQUENCE action is not supported");
       default: {
         const { options, restart } = this.parseSeqOptionsInner(false, true);
         // ≥ 1 action required: a bare ALTER SEQUENCE s (no option, no RESTART) is 42601.
         if (restart === null && !seqOptionsHasAny(options)) {
-          throw engineError(
-            "syntax_error",
-            "ALTER SEQUENCE requires at least one action",
-          );
+          throw engineError("syntax_error", "ALTER SEQUENCE requires at least one action");
         }
         return {
           kind: "alterSequence",
@@ -1110,8 +1050,7 @@ class Parser {
 
   // dupCheck raises 42601 when an option appeared twice.
   private dupCheck(already: boolean, opt: string): void {
-    if (already)
-      throw engineError("syntax_error", `${opt} specified more than once`);
+    if (already) throw engineError("syntax_error", `${opt} specified more than once`);
   }
 
   // parseSignedIntLiteral parses a signed integer literal (`-? INT`) as a bigint — the sequence-
@@ -1129,10 +1068,7 @@ class Parser {
     }
     const v = neg ? -t.int! : t.int!;
     if (v < -9223372036854775808n || v > 9223372036854775807n) {
-      throw engineError(
-        "numeric_value_out_of_range",
-        "sequence parameter out of i64 range",
-      );
+      throw engineError("numeric_value_out_of_range", "sequence parameter out of i64 range");
     }
     return v;
   }
@@ -1298,10 +1234,7 @@ class Parser {
       throw engineError("syntax_error", "expected ',' or ')'");
     }
     if (values.length === 0) {
-      throw engineError(
-        "syntax_error",
-        "a VALUES row must have at least one value",
-      );
+      throw engineError("syntax_error", "a VALUES row must have at least one value");
     }
     return values;
   }
@@ -1325,10 +1258,7 @@ class Parser {
           const t = this.advance();
           if (t.kind === "comma") continue;
           if (t.kind === "rparen") break;
-          throw engineError(
-            "syntax_error",
-            `expected ',' or ')', found ${t.kind}`,
-          );
+          throw engineError("syntax_error", `expected ',' or ')', found ${t.kind}`);
         }
       } else {
         this.advance(); // the empty ROW() — consume ')'
@@ -1346,10 +1276,7 @@ class Parser {
           const t = this.advance();
           if (t.kind === "comma") continue;
           if (t.kind === "rbracket") break;
-          throw engineError(
-            "syntax_error",
-            `expected ',' or ']', found ${t.kind}`,
-          );
+          throw engineError("syntax_error", `expected ',' or ']', found ${t.kind}`);
         }
       } else {
         this.advance(); // the empty ARRAY[] — consume ']'
@@ -1498,10 +1425,7 @@ class Parser {
     if (this.peekKeyword() === "materialized") {
       this.advance();
       materialized = true;
-    } else if (
-      this.peekKeyword() === "not" &&
-      this.peekKeywordAt(1) === "materialized"
-    ) {
+    } else if (this.peekKeyword() === "not" && this.peekKeywordAt(1) === "materialized") {
       this.advance();
       this.advance();
       materialized = false;
@@ -1521,9 +1445,7 @@ class Parser {
     // guard also protects the parser's own stack against `(SELECT (SELECT … ))`.
     this.deepen();
     // A leading WITH begins a nested common-table-expression query (spec/design/cte.md §7).
-    const node = this.atWithClause()
-      ? this.parseWithQueryExpr()
-      : this.parseSubqueryInner();
+    const node = this.atWithClause() ? this.parseWithQueryExpr() : this.parseSubqueryInner();
     this.undeepen();
     return node;
   }
@@ -1570,10 +1492,7 @@ class Parser {
     if (this.peekKeywordAt(offset) !== "with") return false;
     if (this.peekKeywordAt(offset + 1) === "recursive") return true;
     if (this.peekKindAt(offset + 1) === "word") {
-      return (
-        this.peekKindAt(offset + 2) === "lparen" ||
-        this.peekKeywordAt(offset + 2) === "as"
-      );
+      return this.peekKindAt(offset + 2) === "lparen" || this.peekKeywordAt(offset + 2) === "as";
     }
     return false;
   }
@@ -1581,10 +1500,7 @@ class Parser {
   // isQueryStartAtOffset reports whether a query expression — a SELECT or a nested WITH clause
   // (cte.md §7) — begins at this.pos + offset. The §26 leading-SELECT lookahead, extended with WITH.
   private isQueryStartAtOffset(offset: number): boolean {
-    return (
-      this.peekKeywordAt(offset) === "select" ||
-      this.isWithClauseAtOffset(offset)
-    );
+    return this.peekKeywordAt(offset) === "select" || this.isWithClauseAtOffset(offset);
   }
 
   // atSubqueryStart reports whether the NEXT token begins a query expression (a SELECT or nested
@@ -1680,13 +1596,11 @@ class Parser {
     for (;;) {
       const kw = this.peekKeyword();
       if (kw === "limit") {
-        if (limit !== null)
-          throw engineError("syntax_error", "duplicate LIMIT clause");
+        if (limit !== null) throw engineError("syntax_error", "duplicate LIMIT clause");
         this.advance();
         limit = this.parseCount(true);
       } else if (kw === "offset") {
-        if (offset !== null)
-          throw engineError("syntax_error", "duplicate OFFSET clause");
+        if (offset !== null) throw engineError("syntax_error", "duplicate OFFSET clause");
         this.advance();
         offset = this.parseCount(false);
       } else {
@@ -1724,8 +1638,7 @@ class Parser {
     if (this.peekKeyword() === "distinct") {
       const next = this.tokens[this.pos + 1]!;
       const modifier =
-        next.kind !== "eof" &&
-        !(next.kind === "word" && lower(next.word!) === "from");
+        next.kind !== "eof" && !(next.kind === "word" && lower(next.word!) === "from");
       if (modifier) {
         this.advance();
         distinct = true;
@@ -2051,10 +1964,7 @@ class Parser {
           this.advance();
           nullsFirst = false;
         } else {
-          throw engineError(
-            "syntax_error",
-            "NULLS must be followed by FIRST or LAST",
-          );
+          throw engineError("syntax_error", "NULLS must be followed by FIRST or LAST");
         }
       }
       keys.push({ qualifier, column, collation, descending, nullsFirst });
@@ -2084,14 +1994,8 @@ class Parser {
     const v = foldInt(t.int!, negate);
     if (v < 0n) {
       throw isLimit
-        ? engineError(
-            "invalid_row_count_in_limit_clause",
-            "LIMIT must not be negative",
-          )
-        : engineError(
-            "invalid_row_count_in_offset_clause",
-            "OFFSET must not be negative",
-          );
+        ? engineError("invalid_row_count_in_limit_clause", "LIMIT must not be negative")
+        : engineError("invalid_row_count_in_offset_clause", "OFFSET must not be negative");
     }
     return v;
   }
@@ -2422,19 +2326,13 @@ class Parser {
       // when a `::` immediately follows: `::` binds tighter than unary minus (PostgreSQL),
       // so `-N::T` is `-(N::T)` — the cast applies to the unsigned magnitude first
       // (grammar.md §37). A one-token lookahead on the token AFTER the literal.
-      if (
-        this.peek().kind === "int" &&
-        this.tokens[this.pos + 1]?.kind !== "doubleColon"
-      ) {
+      if (this.peek().kind === "int" && this.tokens[this.pos + 1]?.kind !== "doubleColon") {
         const v = foldInt(this.advance().int!, true);
         return { kind: "literal", literal: { kind: "int", int: v } };
       }
       // Fold unary-minus of a decimal literal into one negative decimal literal (decimal
       // negation never overflows). Same `::` suppression.
-      if (
-        this.peek().kind === "decimal" &&
-        this.tokens[this.pos + 1]?.kind !== "doubleColon"
-      ) {
+      if (this.peek().kind === "decimal" && this.tokens[this.pos + 1]?.kind !== "doubleColon") {
         const t = this.advance();
         return {
           kind: "literal",
@@ -2481,10 +2379,7 @@ class Parser {
       // comparisons (PG precedence).
       const isCollate = k === "word" && this.peekKeyword() === "collate";
       const isPostfix =
-        k === "doubleColon" ||
-        k === "lbracket" ||
-        (k === "dot" && fieldAccessible) ||
-        isCollate;
+        k === "doubleColon" || k === "lbracket" || (k === "dot" && fieldAccessible) || isCollate;
       if (!isPostfix) break;
       this.deepen();
       if (isCollate) {
@@ -2496,9 +2391,7 @@ class Parser {
         this.advance();
         const baseType = this.expectIdentifier();
         const typeMod = this.parseTypeMod();
-        const typeName = this.consumeArrayBrackets()
-          ? baseType + "[]"
-          : baseType;
+        const typeName = this.consumeArrayBrackets() ? baseType + "[]" : baseType;
         expr = { kind: "cast", inner: expr, typeName, typeMod };
         fieldAccessible = false;
       } else if (k === "lbracket") {
@@ -2525,10 +2418,7 @@ class Parser {
           } else {
             // Index form: a bare `[]` (no index, no colon) is a syntax error.
             if (lower === null) {
-              throw engineError(
-                "syntax_error",
-                "array subscript requires an index",
-              );
+              throw engineError("syntax_error", "array subscript requires an index");
             }
             this.expect("rbracket");
             subscripts.push({ isSlice: false, index: lower });
@@ -2600,10 +2490,7 @@ class Parser {
           const t = this.advance();
           if (t.kind === "comma") continue;
           if (t.kind === "rparen") break;
-          throw engineError(
-            "syntax_error",
-            `expected ',' or ')', found ${t.kind}`,
-          );
+          throw engineError("syntax_error", `expected ',' or ')', found ${t.kind}`);
         }
       } else {
         this.advance(); // the empty ROW() — consume ')'
@@ -2622,10 +2509,7 @@ class Parser {
           const t = this.advance();
           if (t.kind === "comma") continue;
           if (t.kind === "rbracket") break;
-          throw engineError(
-            "syntax_error",
-            `expected ',' or ']', found ${t.kind}`,
-          );
+          throw engineError("syntax_error", `expected ',' or ']', found ${t.kind}`);
         }
       } else {
         this.advance(); // the empty ARRAY[] — consume ']'
@@ -2675,10 +2559,7 @@ class Parser {
         whens.push({ cond, result });
       }
       if (whens.length === 0) {
-        throw engineError(
-          "syntax_error",
-          "CASE requires at least one WHEN clause",
-        );
+        throw engineError("syntax_error", "CASE requires at least one WHEN clause");
       }
       let els: Expr | null = null;
       if (this.peekKeyword() === "else") {
@@ -2730,10 +2611,7 @@ class Parser {
       // literals above. Pure sugar: desugar to a `now()` call so resolution / execution / cost /
       // volatility are entirely shared (spec/design/functions.md §12). Not fired when followed by
       // `(` (a precision typmod, deferred) so that form resolves normally (42883).
-      if (
-        w === "current_timestamp" &&
-        this.tokens[this.pos + 1]?.kind !== "lparen"
-      ) {
+      if (w === "current_timestamp" && this.tokens[this.pos + 1]?.kind !== "lparen") {
         this.advance();
         return {
           kind: "funcCall",
@@ -2772,10 +2650,7 @@ class Parser {
     this.expect("lparen");
     // DISTINCT inside a function call (COUNT(DISTINCT x)) is deferred — reject at parse.
     if (this.peekKeyword() === "distinct") {
-      throw engineError(
-        "syntax_error",
-        "DISTINCT inside an aggregate is not supported yet",
-      );
+      throw engineError("syntax_error", "DISTINCT inside an aggregate is not supported yet");
     }
     const args: Expr[] = [];
     const names: (string | null)[] = [];
@@ -2799,10 +2674,7 @@ class Parser {
           names.push(null);
           // A VARIADIC argument must be the last (PostgreSQL, 42601).
           if (this.peek().kind === "comma") {
-            throw engineError(
-              "syntax_error",
-              "VARIADIC argument must be the last argument",
-            );
+            throw engineError("syntax_error", "VARIADIC argument must be the last argument");
           }
           break;
         }
@@ -2815,10 +2687,7 @@ class Parser {
           anyNamed = true;
         } else if (anyNamed) {
           // A positional argument may not follow a named one (PostgreSQL, 42601).
-          throw engineError(
-            "syntax_error",
-            "positional argument cannot follow named argument",
-          );
+          throw engineError("syntax_error", "positional argument cannot follow named argument");
         }
         args.push(this.parseExpr());
         names.push(argName);
@@ -2890,10 +2759,7 @@ class Parser {
   private expectCollationName(): string {
     const t = this.advance();
     if (t.kind !== "quotedIdent") {
-      throw engineError(
-        "syntax_error",
-        "expected a quoted collation name after COLLATE",
-      );
+      throw engineError("syntax_error", "expected a quoted collation name after COLLATE");
     }
     if (t.str === "") {
       throw engineError("syntax_error", "collation name may not be empty");

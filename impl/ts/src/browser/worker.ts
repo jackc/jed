@@ -12,7 +12,13 @@
 
 import { EngineError } from "../errors.ts";
 import type { Database, Outcome } from "../executor.ts";
-import { closeOpfs, createOpfs, type DatabaseOptions, type OpenOptions, openOpfs } from "../opfs.ts";
+import {
+  closeOpfs,
+  createOpfs,
+  type DatabaseOptions,
+  type OpenOptions,
+  openOpfs,
+} from "../opfs.ts";
 import { parseSQL } from "../parser.ts";
 import { render } from "../value.ts";
 

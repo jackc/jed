@@ -54,7 +54,9 @@ export class SharedPaging {
     // Lazy decode (spec/design/large-values.md §14): an external/compressed value stays an
     // unfetched reference — no chain read, no decompression. The scan layer resolves the
     // columns a query touches through readBlock below.
-    return this.pool.getOrLoad(page, () => decodeLeafNode(this.pager.readBlock(page), page, colTypes));
+    return this.pool.getOrLoad(page, () =>
+      decodeLeafNode(this.pager.readBlock(page), page, colTypes),
+    );
   }
 
   // readBlock reads one page through the pager — the demand-paged loader reads the meta, catalog, and

@@ -61,8 +61,14 @@ function compositePKTableDB(): Database {
   const db = goldenDb();
   run(db, "CREATE TABLE t (a i32, b i16, v i16, PRIMARY KEY (a, b))");
   for (const [a, b, v] of [
-    [-2, 5, 10], [1, 1, 20], [1, 2, 30], [1, 3, 40],
-    [2, 0, 50], [2, 1, 60], [3, 7, 70], [3, 9, 80],
+    [-2, 5, 10],
+    [1, 1, 20],
+    [1, 2, 30],
+    [1, 3, 40],
+    [2, 0, 50],
+    [2, 1, 60],
+    [3, 7, 70],
+    [3, 9, 80],
   ]) {
     run(db, `INSERT INTO t VALUES (${a}, ${b}, ${v})`);
   }
@@ -76,11 +82,17 @@ function compositePKTableDB(): Database {
 // (price_range < t_b_check < t_note_check).
 function checkTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (a int PRIMARY KEY, b int CHECK (b > 0), price numeric(8,2), " +
-    "CONSTRAINT price_range CHECK (price >= 0.50 AND price <= 9999.99), note text, " +
-    "CHECK (note = 'ok' OR note = 'a''b'))");
-  run(db, "INSERT INTO t VALUES (1, 5, 1.00, 'ok'), (2, NULL, 9999.99, 'a''b'), " +
-    "(3, 100, 0.50, 'ok')");
+  run(
+    db,
+    "CREATE TABLE t (a int PRIMARY KEY, b int CHECK (b > 0), price numeric(8,2), " +
+      "CONSTRAINT price_range CHECK (price >= 0.50 AND price <= 9999.99), note text, " +
+      "CHECK (note = 'ok' OR note = 'a''b'))",
+  );
+  run(
+    db,
+    "INSERT INTO t VALUES (1, 5, 1.00, 'ok'), (2, NULL, 9999.99, 'a''b'), " +
+      "(3, 100, 0.50, 'ok')",
+  );
   return db;
 }
 
@@ -94,8 +106,11 @@ function indexTableDB(): Database {
   run(db, "CREATE TABLE t (a i32, b i32, u uuid, PRIMARY KEY (b, a))");
   run(db, "CREATE INDEX i_u ON t (u)");
   run(db, "CREATE INDEX ON t (a, b)");
-  run(db, "INSERT INTO t VALUES (1, 10, '550e8400-e29b-41d4-a716-446655440000'), " +
-    "(2, 10, NULL), (3, 20, '00000000-0000-0000-0000-000000000000')");
+  run(
+    db,
+    "INSERT INTO t VALUES (1, 10, '550e8400-e29b-41d4-a716-446655440000'), " +
+      "(2, 10, NULL), (3, 20, '00000000-0000-0000-0000-000000000000')",
+  );
   return db;
 }
 
@@ -105,8 +120,11 @@ function indexTableDB(): Database {
 // INDEX uq, and the plain index nu (flags 0 beside flags 1).
 function uniqueTableDB(): Database {
   const db = goldenDb();
-  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32, " +
-    "UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))");
+  run(
+    db,
+    "CREATE TABLE t (id i32 PRIMARY KEY, v i32, w i32, " +
+      "UNIQUE (v), CONSTRAINT wv UNIQUE (w, v))",
+  );
   run(db, "CREATE INDEX nu ON t (v)");
   run(db, "CREATE UNIQUE INDEX uq ON t (w)");
   run(db, "INSERT INTO t VALUES (1, 10, 100), (2, NULL, 200), (3, NULL, 300)");
@@ -123,11 +141,14 @@ function fkTableDB(): Database {
   const db = goldenDb();
   run(db, "CREATE TABLE p (pid i32 PRIMARY KEY, code i32 UNIQUE, a i32, b i32, UNIQUE (a, b))");
   run(db, "INSERT INTO p VALUES (1, 100, 10, 20), (2, 200, 30, 40)");
-  run(db, "CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32, " +
-    "FOREIGN KEY (pid) REFERENCES p (pid), " +
-    "CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), " +
-    "FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT, " +
-    "FOREIGN KEY (mgr) REFERENCES c (id))");
+  run(
+    db,
+    "CREATE TABLE c (id i32 PRIMARY KEY, pid i32, pcode i32, x i32, y i32, mgr i32, " +
+      "FOREIGN KEY (pid) REFERENCES p (pid), " +
+      "CONSTRAINT c_code_fk FOREIGN KEY (pcode) REFERENCES p (code), " +
+      "FOREIGN KEY (x, y) REFERENCES p (a, b) ON DELETE RESTRICT, " +
+      "FOREIGN KEY (mgr) REFERENCES c (id))",
+  );
   run(db, "INSERT INTO c VALUES (10, 1, 100, 10, 20, NULL), (11, 2, 200, 30, 40, 10)");
   return db;
 }
@@ -225,7 +246,11 @@ function ginUuidTableDB(): Database {
 function nopkTableDB(): Database {
   const db = goldenDb();
   run(db, "CREATE TABLE r (a i16, b i64)");
-  for (const [a, b] of [[7, 70], [8, 80], [9, 90]]) {
+  for (const [a, b] of [
+    [7, 70],
+    [8, 80],
+    [9, 90],
+  ]) {
     run(db, `INSERT INTO r VALUES (${a}, ${b})`);
   }
   return db;
@@ -338,8 +363,11 @@ function decimalPkTableDB(): Database {
 function decimalTableDB(): Database {
   const db = goldenDb();
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric, m numeric(10,2))");
-  run(db, "INSERT INTO t VALUES (1, 1.50, 1.50), (2, -12345.6789, -12.34), " +
-    "(3, 0.00, 0.00), (4, 100000000.000001, 100.00), (5, NULL, NULL)");
+  run(
+    db,
+    "INSERT INTO t VALUES (1, 1.50, 1.50), (2, -12345.6789, -12.34), " +
+      "(3, 0.00, 0.00), (4, 100000000.000001, 100.00), (5, NULL, NULL)",
+  );
   return db;
 }
 
@@ -683,10 +711,7 @@ function collationTableDB(): Database {
 // reference it). Must match the Ruby reference's COLLATION_PK_TABLE.
 function collationPKTableDB(): Database {
   const db = goldenDb();
-  run(
-    db,
-    `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY, tag text COLLATE "unicode")`,
-  );
+  run(db, `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY, tag text COLLATE "unicode")`);
   run(db, `CREATE INDEX t_tag_idx ON t (tag)`);
   // Inserted out of collation order; stored in collation order ('a' < 'z' by the sort key).
   run(db, `INSERT INTO t VALUES ('z', 'a')`);
@@ -823,8 +848,28 @@ test("read golden reconstructs catalog", () => {
   assert.equal(tbl!.name, "t");
   assert.equal(tbl!.columns.length, 2);
   const [id, v] = tbl!.columns;
-  assert.deepStrictEqual(id, { name: "id", type: scalarT("i32"), decimal: null, primaryKey: true, notNull: true, default: null, defaultExpr: null, identity: null, collation: null });
-  assert.deepStrictEqual(v, { name: "v", type: scalarT("i16"), decimal: null, primaryKey: false, notNull: false, default: null, defaultExpr: null, identity: null, collation: null });
+  assert.deepStrictEqual(id, {
+    name: "id",
+    type: scalarT("i32"),
+    decimal: null,
+    primaryKey: true,
+    notNull: true,
+    default: null,
+    defaultExpr: null,
+    identity: null,
+    collation: null,
+  });
+  assert.deepStrictEqual(v, {
+    name: "v",
+    type: scalarT("i16"),
+    decimal: null,
+    primaryKey: false,
+    notNull: false,
+    default: null,
+    defaultExpr: null,
+    identity: null,
+    collation: null,
+  });
   // A NULL value round-trips (id 3's v).
   const rows = loaded.rowsInKeyOrder("t");
   assert.deepStrictEqual(rows[2], [{ kind: "int", int: 3n }, { kind: "null" }]);

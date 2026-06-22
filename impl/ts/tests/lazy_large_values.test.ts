@@ -60,7 +60,11 @@ function corruptOverflowPayloads(path: string): void {
     if (bytes[i * PAGE_SIZE] === PAGE_OVERFLOW) {
       bytes.fill(0xff, i * PAGE_SIZE + 16, (i + 1) * PAGE_SIZE);
       const page = bytes.subarray(i * PAGE_SIZE, (i + 1) * PAGE_SIZE);
-      new DataView(page.buffer, page.byteOffset, page.byteLength).setUint32(12, pageCrc(page), false);
+      new DataView(page.buffer, page.byteOffset, page.byteLength).setUint32(
+        12,
+        pageCrc(page),
+        false,
+      );
       corrupted++;
     }
   }
@@ -97,7 +101,11 @@ test("lazy: chains are read only when touched", () => {
     // Touching the spilled column reads the chain: the corruption surfaces as XX001 —
     // non-UTF-8 for the external-plain text, a malformed LZ4 block for external-compressed.
     for (const id of [1, 2]) {
-      assert.equal(errCode(() => execute(db, `SELECT body FROM t WHERE id = ${id}`)), "XX001", `id ${id}`);
+      assert.equal(
+        errCode(() => execute(db, `SELECT body FROM t WHERE id = ${id}`)),
+        "XX001",
+        `id ${id}`,
+      );
     }
 
     // The inline-compressed and plain rows live in the (uncorrupted) leaf: still exact.
@@ -118,7 +126,12 @@ test("lazy: values round-trip exactly through the paged path", () => {
     close(db);
     db = open(path);
     const got = rowsOf(db, "SELECT body FROM t").map((r) => render(r[0]));
-    assert.deepEqual(got, [fillerText(600), fillerText(200) + "y".repeat(200), "x".repeat(600), "tiny"]);
+    assert.deepEqual(got, [
+      fillerText(600),
+      fillerText(200) + "y".repeat(200),
+      "x".repeat(600),
+      "tiny",
+    ]);
     close(db);
   } finally {
     rmSync(dir, { recursive: true, force: true });

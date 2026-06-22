@@ -43,7 +43,10 @@ test("no-PK multi-row INSERT keeps insertion order; a failed batch stores nothin
   execute(db, "INSERT INTO log VALUES (30), (10), (20)");
   assert.deepStrictEqual(query(db, "SELECT a FROM log"), [["30"], ["10"], ["20"]]);
   // A failing batch (second row overflows) stores neither row.
-  assert.equal(errCode(() => execute(db, "INSERT INTO log VALUES (40), (99999)")), "22003");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO log VALUES (40), (99999)")),
+    "22003",
+  );
   assert.deepStrictEqual(query(db, "SELECT a FROM log"), [["30"], ["10"], ["20"]]);
 });
 

@@ -14,15 +14,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import {
-  close,
-  commit,
-  create,
-  Database,
-  execute,
-  open,
-  vendoredCollations,
-} from "../src/lib.ts";
+import { close, commit, create, Database, execute, open, vendoredCollations } from "../src/lib.ts";
 import { vendoredCollation } from "../src/collation.ts";
 import { errCode, query } from "./util.ts";
 
@@ -72,7 +64,10 @@ test("es orders ñ as a distinct letter", () => {
 test("unknown collation is 42704", () => {
   // A collation neither vendored nor referenced is 42704 (the vendored fallback must not mask it).
   const db = new Database();
-  assert.equal(errCode(() => query(db, `SELECT 'x' COLLATE "no-such-collation"`)), "42704");
+  assert.equal(
+    errCode(() => query(db, `SELECT 'x' COLLATE "no-such-collation"`)),
+    "42704",
+  );
 });
 
 test("per-column collation orders implicitly and is referenced", () => {
@@ -99,13 +94,16 @@ test("implicit conflict is 42P22", () => {
   // Two columns with DIFFERENT implicit (vendored) collations compared with no explicit COLLATE →
   // 42P22 (PG-matching). C counts as a distinct implicit collation, so unicode vs C also conflicts.
   const db = new Database();
-  exec(
-    db,
-    `CREATE TABLE t (a text COLLATE "unicode", b text COLLATE "es", c text COLLATE "C")`,
-  );
+  exec(db, `CREATE TABLE t (a text COLLATE "unicode", b text COLLATE "es", c text COLLATE "C")`);
   exec(db, `INSERT INTO t VALUES ('a','z','b')`);
-  assert.equal(errCode(() => query(db, `SELECT a < b FROM t`)), "42P22");
-  assert.equal(errCode(() => query(db, `SELECT a < c FROM t`)), "42P22");
+  assert.equal(
+    errCode(() => query(db, `SELECT a < b FROM t`)),
+    "42P22",
+  );
+  assert.equal(
+    errCode(() => query(db, `SELECT a < c FROM t`)),
+    "42P22",
+  );
   // An explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') = true.
   assert.deepEqual(query(db, `SELECT a < b COLLATE "unicode" FROM t`), [["true"]]);
   // The table references both vendored collations → db.collations() lists them (sorted).
@@ -152,7 +150,10 @@ test("default collation inherited by unannotated column", () => {
 
 test("set default unknown is 42704", () => {
   const db = new Database();
-  assert.equal(errCode(() => db.setDefaultCollation("nope")), "42704");
+  assert.equal(
+    errCode(() => db.setDefaultCollation("nope")),
+    "42704",
+  );
   db.setDefaultCollation("C"); // C always resolves (resets to byte order)
 });
 
@@ -177,7 +178,10 @@ test("collated unique dedups by byte identity", () => {
   const db = new Database();
   exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode" UNIQUE)`);
   exec(db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`);
-  assert.equal(errCode(() => exec(db, `INSERT INTO t VALUES (4,'a')`)), "23505");
+  assert.equal(
+    errCode(() => exec(db, `INSERT INTO t VALUES (4,'a')`)),
+    "23505",
+  );
   assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name`), [["a"], ["A"], ["b"]]);
 });
 

@@ -223,7 +223,9 @@ export function widthBytes(t: ScalarType): number {
     case "bytea":
       throw new Error("bytea is variable-width; widthBytes is integer-only");
     case "interval":
-      throw new Error("interval is not serialized through the integer codec; widthBytes is integer-only");
+      throw new Error(
+        "interval is not serialized through the integer codec; widthBytes is integer-only",
+      );
     // A date is a fixed-width 4-byte i32 day count (reuses the i32 codec — it is a key this
     // slice, like timestamp; spec/design/date.md).
     case "date":
@@ -423,14 +425,10 @@ export function compositeRefName(t: Type): string | null {
 export function typeScalar(t: Type): ScalarType {
   if (t.kind === "scalar") return t.scalar;
   if (t.kind === "array") {
-    throw new Error(
-      "array type used where a scalar was expected (spec/design/array.md)",
-    );
+    throw new Error("array type used where a scalar was expected (spec/design/array.md)");
   }
   if (t.kind === "range") {
-    throw new Error(
-      "range type used where a scalar was expected (spec/design/ranges.md)",
-    );
+    throw new Error("range type used where a scalar was expected (spec/design/ranges.md)");
   }
   throw new Error(
     `composite type ${t.name} used where a scalar was expected; the composite path must branch before this point (spec/design/composite.md)`,

@@ -15,8 +15,7 @@ import {
 } from "../src/interval.ts";
 import { readIntervalCases, specPath } from "./tomlmini.ts";
 
-const hex = (b: Uint8Array) =>
-  Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
+const hex = (b: Uint8Array) => Array.from(b, (x) => x.toString(16).padStart(2, "0")).join("");
 const cmpBytes = (a: Uint8Array, b: Uint8Array) => {
   const n = Math.min(a.length, b.length);
   for (let i = 0; i < n; i++) if (a[i] !== b[i]) return a[i]! - b[i]!;
@@ -29,9 +28,17 @@ test("interval vectors (parse/render byte-identical to Rust/Go)", () => {
   for (const c of cases) {
     if (c.section === "parse") {
       const got = parseInterval(c.fields.input!);
-      assert.equal(got.months, Number(c.fields.months), `parse ${JSON.stringify(c.fields.input)} months`);
+      assert.equal(
+        got.months,
+        Number(c.fields.months),
+        `parse ${JSON.stringify(c.fields.input)} months`,
+      );
       assert.equal(got.days, Number(c.fields.days), `parse ${JSON.stringify(c.fields.input)} days`);
-      assert.equal(got.micros, BigInt(c.fields.micros!), `parse ${JSON.stringify(c.fields.input)} micros`);
+      assert.equal(
+        got.micros,
+        BigInt(c.fields.micros!),
+        `parse ${JSON.stringify(c.fields.input)} micros`,
+      );
     } else if (c.section === "parse_error") {
       let code = "";
       try {
@@ -88,9 +95,7 @@ test("interval encodeKey is order-preserving and byte-exact", () => {
     iv(1, 0, 0n),
     iv(1200, 0, 0n),
   ];
-  const byKey = [...ordered].sort((a, b) =>
-    cmpBytes(intervalEncodeKey(a), intervalEncodeKey(b)),
-  );
+  const byKey = [...ordered].sort((a, b) => cmpBytes(intervalEncodeKey(a), intervalEncodeKey(b)));
   for (let i = 0; i < ordered.length; i++) {
     assert.equal(
       intervalSpan(byKey[i]!),

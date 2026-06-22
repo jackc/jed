@@ -276,7 +276,12 @@ export type ColType =
 // ColField is one resolved field of a composite ColType — its name, recursively-resolved type, the
 // decimal typmod (when the field is decimal), and declared nullability (mirrors CompositeField, but
 // with the type fully resolved for the codec/coercion path).
-export type ColField = { name: string; type: ColType; typmod: DecimalTypmod | null; notNull: boolean };
+export type ColField = {
+  name: string;
+  type: ColType;
+  typmod: DecimalTypmod | null;
+  notNull: boolean;
+};
 
 // resolveColType resolves a catalog Type into a self-contained ColType against the database's
 // composite definitions (keyed by lowercased name, the Snapshot.types map). A composite reference

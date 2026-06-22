@@ -54,7 +54,10 @@ test("correlated EXISTS seek is sublinear", () => {
   // pushdown seeks instead, so it is an order of magnitude cheaper.
   assert.ok(seek * 10n < scan, `correlated seek ${seek} should be far below full re-scan ${scan}`);
   // Sublinear in the inner size: 5 outer rows, each ≈ a point lookup (height + a row), not ~1000.
-  assert.ok(seek <= 400n, `correlated seek ${seek} should be sublinear (≈ outer × height), not ~5000`);
+  assert.ok(
+    seek <= 400n,
+    `correlated seek ${seek} should be sublinear (≈ outer × height), not ~5000`,
+  );
 });
 
 test("correlated scalar seek matches unbounded rows", () => {
@@ -67,7 +70,10 @@ test("correlated scalar seek matches unbounded rows", () => {
 
   const seek = cost(db, bounded);
   const scan = cost(db, unbounded);
-  assert.ok(seek * 10n < scan, `correlated scalar seek ${seek} should be far below full re-scan ${scan}`);
+  assert.ok(
+    seek * 10n < scan,
+    `correlated scalar seek ${seek} should be far below full re-scan ${scan}`,
+  );
 });
 
 test("correlated miss and NULL outer seek nothing", () => {
@@ -77,5 +83,8 @@ test("correlated miss and NULL outer seek nothing", () => {
   execute(db, "INSERT INTO o VALUES (6, 999999), (7, NULL)");
   const q = "SELECT o.id FROM o WHERE EXISTS (SELECT 1 FROM inr WHERE inr.id = o.k)";
   assert.deepStrictEqual(ids(db, q), [1, 2, 3, 4, 5]);
-  assert.ok(cost(db, q) <= 500n, "seek cost should stay sublinear with a miss and a NULL outer row");
+  assert.ok(
+    cost(db, q) <= 500n,
+    "seek cost should stay sublinear with a miss and a NULL outer row",
+  );
 });

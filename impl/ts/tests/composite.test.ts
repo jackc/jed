@@ -64,14 +64,23 @@ test("composite values persist through the on-disk image", () => {
 test("DROP TYPE ... CASCADE is 0A000", () => {
   const db = new Database();
   run(db, "CREATE TYPE addr AS (a i32)");
-  assert.equal(errCode(() => run(db, "DROP TYPE addr CASCADE")), "0A000");
+  assert.equal(
+    errCode(() => run(db, "DROP TYPE addr CASCADE")),
+    "0A000",
+  );
 });
 
 test("nested type self- or forward-reference is 42704", () => {
   const db = new Database();
   // Forward reference (point not yet defined) — and self-reference — are unknown types.
-  assert.equal(errCode(() => run(db, "CREATE TYPE line AS (a point)")), "42704");
-  assert.equal(errCode(() => run(db, "CREATE TYPE t AS (a t)")), "42704");
+  assert.equal(
+    errCode(() => run(db, "CREATE TYPE line AS (a point)")),
+    "42704",
+  );
+  assert.equal(
+    errCode(() => run(db, "CREATE TYPE t AS (a t)")),
+    "42704",
+  );
 });
 
 // Round-trip through the on-disk image: a composite type (and a nested one) survives serialize →
@@ -108,7 +117,9 @@ test("field access selects a field", () => {
   run(db, "CREATE TABLE person (id i32 PRIMARY KEY, home addr)");
   run(db, "INSERT INTO person VALUES (1, ROW('Main', 90210))");
   // Parenthesized-column field access.
-  assert.deepStrictEqual(query(db, "SELECT (home).zip, (home).street FROM person"), [["90210", "Main"]]);
+  assert.deepStrictEqual(query(db, "SELECT (home).zip, (home).street FROM person"), [
+    ["90210", "Main"],
+  ]);
   // Field access on an anonymous ROW(…) literal (fields named f1, f2, …), no FROM.
   assert.deepStrictEqual(query(db, "SELECT (ROW('x', 7)).f2"), [["7"]]);
 });
@@ -206,14 +217,19 @@ test("composite with an array-of-composite field (homes addr[])", () => {
   run(db, `INSERT INTO t VALUES (1, ROW('jo', '{"(Main,1)","(Oak,2)"}'))`);
   const image = toImage(db, 256, 1n);
   const loaded = loadDatabase(image);
-  assert.deepStrictEqual(query(loaded, "SELECT (who).homes[1] FROM t WHERE id = 1"), [["(Main,1)"]]);
+  assert.deepStrictEqual(query(loaded, "SELECT (who).homes[1] FROM t WHERE id = 1"), [
+    ["(Main,1)"],
+  ]);
 });
 
 test("DROP TYPE is blocked by an array-typed field dependent", () => {
   const db = new Database();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TYPE person AS (name text, homes addr[])");
-  assert.equal(errCode(() => run(db, "DROP TYPE addr")), "2BP01");
+  assert.equal(
+    errCode(() => run(db, "DROP TYPE addr")),
+    "2BP01",
+  );
   run(db, "DROP TYPE person");
   run(db, "DROP TYPE addr");
 });
@@ -222,11 +238,20 @@ test("DROP TYPE is blocked by an array-typed column dependent", () => {
   const db = new Database();
   run(db, "CREATE TYPE addr AS (street text, zip i32)");
   run(db, "CREATE TABLE t (id i32 PRIMARY KEY, items addr[])");
-  assert.equal(errCode(() => run(db, "DROP TYPE addr")), "2BP01");
+  assert.equal(
+    errCode(() => run(db, "DROP TYPE addr")),
+    "2BP01",
+  );
 });
 
 test("array field errors: typmod 0A000, unknown element 42704", () => {
   const db = new Database();
-  assert.equal(errCode(() => run(db, "CREATE TYPE t AS (xs decimal(10,2)[])")), "0A000");
-  assert.equal(errCode(() => run(db, "CREATE TYPE t2 AS (xs nope[])")), "42704");
+  assert.equal(
+    errCode(() => run(db, "CREATE TYPE t AS (xs decimal(10,2)[])")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => run(db, "CREATE TYPE t2 AS (xs nope[])")),
+    "42704",
+  );
 });

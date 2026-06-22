@@ -39,7 +39,11 @@ export const EXP_LIMIT = MAX_INT_DIGITS + MAX_SCALE + 2;
 // the value still reads coefficient × 10^(-scale). Shared by the lexer (bare 1.5e3) and the
 // text→decimal coercion (numeric '1.5e3') so both spell the SAME value (spec/design/grammar.md §14);
 // the result is fed to Decimal.fromDigitsScale and cap-checked at resolve.
-export function decimalFromParts(intPart: string, frac: string, exp: number | null): [string, number] {
+export function decimalFromParts(
+  intPart: string,
+  frac: string,
+  exp: number | null,
+): [string, number] {
   const fracLen = frac.length;
   if (exp === null) return [intPart + frac, fracLen];
   const effScale = fracLen - exp;

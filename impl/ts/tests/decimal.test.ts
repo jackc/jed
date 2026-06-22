@@ -26,8 +26,14 @@ function dec(s: string): Decimal {
 
 test("decimal render preserves display scale", () => {
   const cases: Record<string, string> = {
-    "1.50": "1.50", "1.5": "1.5", "0.00": "0.00", "0": "0",
-    "-0.013": "-0.013", "123": "123", ".5": "0.5", "100": "100",
+    "1.50": "1.50",
+    "1.5": "1.5",
+    "0.00": "0.00",
+    "0": "0",
+    "-0.013": "-0.013",
+    "123": "123",
+    ".5": "0.5",
+    "100": "100",
   };
   for (const [inp, want] of Object.entries(cases)) {
     assert.equal(dec(inp).render(), want, inp);
@@ -84,9 +90,12 @@ test("decimal modulo", () => {
 
 test("decimal rounding half away from zero", () => {
   const cases: [string, number, string][] = [
-    ["0.125", 2, "0.13"], ["-0.125", 2, "-0.13"],
-    ["2.5", 0, "3"], ["-2.5", 0, "-3"],
-    ["2.45", 1, "2.5"], ["9.5", 0, "10"],
+    ["0.125", 2, "0.13"],
+    ["-0.125", 2, "-0.13"],
+    ["2.5", 0, "3"],
+    ["-2.5", 0, "-3"],
+    ["2.45", 1, "2.5"],
+    ["9.5", 0, "10"],
   ];
   for (const [inp, scale, want] of cases) {
     assert.equal(dec(inp).roundToScale(scale).render(), want, `round(${inp},${scale})`);
@@ -94,8 +103,14 @@ test("decimal rounding half away from zero", () => {
 });
 
 test("decimal div/mod by zero traps 22012", () => {
-  assert.equal(errCode(() => void dec("1").div(dec("0"))), "22012");
-  assert.equal(errCode(() => void dec("1").rem(dec("0"))), "22012");
+  assert.equal(
+    errCode(() => void dec("1").div(dec("0"))),
+    "22012",
+  );
+  assert.equal(
+    errCode(() => void dec("1").rem(dec("0"))),
+    "22012",
+  );
 });
 
 test("decimal to i64 rounds half away", () => {
@@ -191,7 +206,10 @@ test("decimal cost ceiling aborts ahead of a big multiply", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)"]);
   const big = "9".repeat(20000) + ".5";
   db.setMaxCost(1000n);
-  assert.equal(errCode(() => void execD(db, `SELECT ${big} * ${big} FROM t`)), "54P01");
+  assert.equal(
+    errCode(() => void execD(db, `SELECT ${big} * ${big} FROM t`)),
+    "54P01",
+  );
 });
 
 // Decimal.encodeKey: order-preserving + scale-independent + the cross-core exact byte vectors
@@ -204,16 +222,42 @@ test("decimal encodeKey is order-preserving and byte-exact", () => {
     return a.length - b.length;
   };
   const ss = [
-    "-12345.6789", "-100", "-10", "-1.5", "-1", "-0.5", "-0.05", "-0.001",
-    "0", "0.001", "0.05", "0.5", "1", "1.5", "1.50", "5", "10", "12", "50",
-    "100", "101", "123", "1000", "12345.6789", "99999999999999999999",
+    "-12345.6789",
+    "-100",
+    "-10",
+    "-1.5",
+    "-1",
+    "-0.5",
+    "-0.05",
+    "-0.001",
+    "0",
+    "0.001",
+    "0.05",
+    "0.5",
+    "1",
+    "1.5",
+    "1.50",
+    "5",
+    "10",
+    "12",
+    "50",
+    "100",
+    "101",
+    "123",
+    "1000",
+    "12345.6789",
+    "99999999999999999999",
   ];
   const byKey = ss.map(dec).sort((a, b) => cmpBytes(a.encodeKey(), b.encodeKey()));
   for (let i = 1; i < byKey.length; i++) {
     assert.ok(byKey[i - 1]!.cmpValue(byKey[i]!) <= 0, `key order disagrees at ${i}`);
   }
   // Scale-independence: equal values produce identical key bytes.
-  for (const [a, b] of [["1.5", "1.50"], ["100", "100.00"], ["0", "0.000"]]) {
+  for (const [a, b] of [
+    ["1.5", "1.50"],
+    ["100", "100.00"],
+    ["0", "0.000"],
+  ]) {
     assert.deepEqual(dec(a!).encodeKey(), dec(b!).encodeKey(), `${a} vs ${b}`);
   }
   // Exact byte vectors — the cross-core contract.

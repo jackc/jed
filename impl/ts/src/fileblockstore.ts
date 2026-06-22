@@ -7,7 +7,15 @@
 // errors here exactly as the inlined pager did before the extraction; the host program layer (file.ts)
 // maps them at its boundaries.
 
-import { closeSync, fdatasyncSync, fstatSync, fsyncSync, ftruncateSync, readSync, writeSync } from "node:fs";
+import {
+  closeSync,
+  fdatasyncSync,
+  fstatSync,
+  fsyncSync,
+  ftruncateSync,
+  readSync,
+  writeSync,
+} from "node:fs";
 import type { BlockStore } from "./blockstore.ts";
 
 export class FileBlockStore implements BlockStore {

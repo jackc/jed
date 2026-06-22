@@ -53,8 +53,7 @@ export function decodeIntAt(t: ScalarType, b: Uint8Array, off: number): bigint {
   const width = widthBytes(t);
   if (width === 8) {
     const hi = ((b[off]! << 24) | (b[off + 1]! << 16) | (b[off + 2]! << 8) | b[off + 3]!) >>> 0;
-    const lo =
-      ((b[off + 4]! << 24) | (b[off + 5]! << 16) | (b[off + 6]! << 8) | b[off + 7]!) >>> 0;
+    const lo = ((b[off + 4]! << 24) | (b[off + 5]! << 16) | (b[off + 6]! << 8) | b[off + 7]!) >>> 0;
     return ((BigInt(hi) << 32n) | BigInt(lo)) - 9223372036854775808n;
   }
   let u = 0;

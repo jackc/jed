@@ -214,7 +214,8 @@ function applyTailoring(
   }
   let i = 1;
   while (i < toks.length) {
-    if (toks[i].op === undefined) throw syntaxErr(`collation: expected a relation operator: ${line}`);
+    if (toks[i].op === undefined)
+      throw syntaxErr(`collation: expected a relation operator: ${line}`);
     const op = toks[i].op!;
     i++;
     if (i >= toks.length || toks[i].op !== undefined) {
@@ -356,7 +357,8 @@ export function sortKey(coll: Collation, s: string): Uint8Array {
 
 function collationElements(coll: Collation, cps: number[]): Ce[] {
   let maxContraction = 0;
-  for (const c of coll.contractions) if (c.seq.length > maxContraction) maxContraction = c.seq.length;
+  for (const c of coll.contractions)
+    if (c.seq.length > maxContraction) maxContraction = c.seq.length;
   const out: Ce[] = [];
   let i = 0;
   while (i < cps.length) {
@@ -479,7 +481,16 @@ function pushStr(out: number[], s: string): void {
 export function openCollation(bytes: Uint8Array): Collation {
   const r = new Reader(bytes);
   const magic = r.take(6);
-  if (!(magic[0] === 0x4a && magic[1] === 0x43 && magic[2] === 0x4f && magic[3] === 0x4c && magic[4] === 0x4c && magic[5] === 0x00)) {
+  if (
+    !(
+      magic[0] === 0x4a &&
+      magic[1] === 0x43 &&
+      magic[2] === 0x4f &&
+      magic[3] === 0x4c &&
+      magic[4] === 0x4c &&
+      magic[5] === 0x00
+    )
+  ) {
     throw corruptErr("collation: bad artifact magic");
   }
   const fmt = r.u16();
@@ -588,7 +599,8 @@ class Reader {
   ces(): Ce[] {
     const n = this.u8();
     const ces: Ce[] = [];
-    for (let j = 0; j < n; j++) ces.push({ flags: this.u8(), l1: this.u16(), l2: this.u16(), l3: this.u16() });
+    for (let j = 0; j < n; j++)
+      ces.push({ flags: this.u8(), l1: this.u16(), l2: this.u16(), l3: this.u16() });
     return ces;
   }
   str(): string {

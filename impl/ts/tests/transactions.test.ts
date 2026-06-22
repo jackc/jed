@@ -105,7 +105,10 @@ test("nested begin is 25001", () => {
   const tx = begin(db, true);
   tx.execute("INSERT INTO t VALUES (1)");
   // a SQL BEGIN inside an already-open transaction is 25001
-  assert.equal(codeOf(() => tx.execute("BEGIN")), "25001");
+  assert.equal(
+    codeOf(() => tx.execute("BEGIN")),
+    "25001",
+  );
   tx.commit();
   assert.equal(rowCount(db, "t"), 1);
 });

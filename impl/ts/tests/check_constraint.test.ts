@@ -53,7 +53,10 @@ test("auto-naming matches PostgreSQL", () => {
 
 test("DDL errors match PostgreSQL", () => {
   const db = dbWith([]);
-  assert.equal(errCode(() => execute(db, "CREATE TABLE x (a int CHECK (a + 1))")), "42804");
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE x (a int CHECK (a + 1))")),
+    "42804",
+  );
   // Subqueries — scalar, EXISTS, IN — are rejected structurally, before any resolution
   // (the inner table need not exist).
   for (const sql of [
@@ -71,8 +74,14 @@ test("DDL errors match PostgreSQL", () => {
   e = errInfo(() => execute(db, "CREATE TABLE x (a int CHECK (a > $1))"));
   assert.equal(e.code, "42P02");
   assert.equal(e.message, "there is no parameter $1");
-  assert.equal(errCode(() => execute(db, "CREATE TABLE x (a int CHECK (nope > 0))")), "42703");
-  assert.equal(errCode(() => execute(db, "CREATE TABLE x (a int CHECK (other.a > 0))")), "42P01");
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE x (a int CHECK (nope > 0))")),
+    "42703",
+  );
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE x (a int CHECK (other.a > 0))")),
+    "42P01",
+  );
   // A forward reference is fine (checks resolve after all columns are known); so is a
   // reference qualified by this table's name.
   execute(db, "CREATE TABLE fwd (CHECK (b > 0), b int)");
@@ -100,14 +109,20 @@ test("DDL errors match PostgreSQL", () => {
   // earlier ones.
   assert.equal(
     errCode(() =>
-      execute(db, "CREATE TABLE td (a int CONSTRAINT cc CHECK (a > 0), CONSTRAINT cc CHECK (nope > 0))"),
+      execute(
+        db,
+        "CREATE TABLE td (a int CONSTRAINT cc CHECK (a > 0), CONSTRAINT cc CHECK (nope > 0))",
+      ),
     ),
     "42703",
   );
   // The DEFAULT is NOT checked against CHECK at CREATE TABLE.
   execute(db, "CREATE TABLE t7 (a int DEFAULT -5 CHECK (a > 0))");
   // CHECK () is a syntax error.
-  assert.equal(errCode(() => execute(db, "CREATE TABLE x (a int, CHECK ())")), "42601");
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE x (a int, CHECK ())")),
+    "42601",
+  );
   // Columns may be NAMED check / constraint (the keywords stay non-reserved).
   execute(db, "CREATE TABLE odd (check int, constraint i16)");
   execute(db, "INSERT INTO odd VALUES (1, 2)");
@@ -134,13 +149,22 @@ test("violations match PostgreSQL order", () => {
   // NULL passes a check (UNKNOWN is not FALSE).
   execute(db, "INSERT INTO t VALUES (NULL, NULL)");
   // NOT NULL fires before CHECK on the same row.
-  assert.equal(errCode(() => execute(db, "INSERT INTO tn VALUES (NULL)")), "23502");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO tn VALUES (NULL)")),
+    "23502",
+  );
   // CHECK fires before the duplicate-key check.
   execute(db, "INSERT INTO tu VALUES (1, 5)");
-  assert.equal(errCode(() => execute(db, "INSERT INTO tu VALUES (1, -1)")), "23514");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO tu VALUES (1, -1)")),
+    "23514",
+  );
   // A runtime error inside a check propagates as itself.
   execute(db, "CREATE TABLE dz (a int CHECK (10 / a > 0))");
-  assert.equal(errCode(() => execute(db, "INSERT INTO dz VALUES (0)")), "22012");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO dz VALUES (0)")),
+    "22012",
+  );
 });
 
 test("two-phase pass and defaults", () => {
@@ -151,13 +175,22 @@ test("two-phase pass and defaults", () => {
     "CREATE TABLE t7 (a int DEFAULT -5 CHECK (a > 0), b int)",
   ]);
   // Multi-row INSERT: the second row violates → nothing stored.
-  assert.equal(errCode(() => execute(db, "INSERT INTO t VALUES (1), (-1)")), "23514");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO t VALUES (1), (-1)")),
+    "23514",
+  );
   assert.equal(db.rowsInKeyOrder("t").length, 0);
   // INSERT ... SELECT flows through the same per-row checks.
-  assert.equal(errCode(() => execute(db, "INSERT INTO t SELECT v FROM src")), "23514");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO t SELECT v FROM src")),
+    "23514",
+  );
   // UPDATE: a later row violates → no row changes.
   execute(db, "INSERT INTO t VALUES (1), (2)");
-  assert.equal(errCode(() => execute(db, "UPDATE t SET a = a - 1")), "23514");
+  assert.equal(
+    errCode(() => execute(db, "UPDATE t SET a = a - 1")),
+    "23514",
+  );
   const rows = db.rowsInKeyOrder("t");
   assert.equal(rows.length, 2);
   assert.deepEqual(
@@ -168,8 +201,14 @@ test("two-phase pass and defaults", () => {
   execute(db, "UPDATE t SET a = a + 10");
   // The stored default is evaluated per row like any value: a check-violating default
   // traps 23514 at INSERT, not CREATE.
-  assert.equal(errCode(() => execute(db, "INSERT INTO t7 VALUES (DEFAULT, 1)")), "23514");
-  assert.equal(errCode(() => execute(db, "INSERT INTO t7 (b) VALUES (1)")), "23514");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO t7 VALUES (DEFAULT, 1)")),
+    "23514",
+  );
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO t7 (b) VALUES (1)")),
+    "23514",
+  );
   execute(db, "INSERT INTO t7 VALUES (2, 1)");
 });
 
@@ -188,7 +227,11 @@ test("the full expression surface works inside a check", () => {
     "INSERT INTO e VALUES (1, FALSE, 'a', 1.00)",
     "INSERT INTO e VALUES (1, TRUE, 'c', 1.00)",
   ]) {
-    assert.equal(errCode(() => execute(db, sql)), "23514", sql);
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      "23514",
+      sql,
+    );
   }
   const e = errInfo(() => execute(db, "INSERT INTO e VALUES (1, TRUE, 'a', 0.49)"));
   assert.ok(e.message.endsWith("price_pos"), e.message);
@@ -207,7 +250,10 @@ test("check evaluation is metered", () => {
   assert.equal(o.cost, 10n);
   // The ceiling aborts mid-validation deterministically.
   db.setMaxCost(2n);
-  assert.equal(errCode(() => execute(db, "INSERT INTO c VALUES (4), (5), (6)")), "54P01");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO c VALUES (4), (5), (6)")),
+    "54P01",
+  );
   db.setMaxCost(0n);
   assert.equal(db.rowsInKeyOrder("c").length, 3);
 });
@@ -233,8 +279,14 @@ test("round-trips through the on-disk image", () => {
   const e = errInfo(() => execute(loaded, "INSERT INTO t VALUES (4, -1, 1.00, 'ok')"));
   assert.equal(e.code, "23514");
   assert.equal(e.message, "new row for relation t violates check constraint t_b_check");
-  assert.equal(errCode(() => execute(loaded, "INSERT INTO t VALUES (4, 1, 0.10, 'ok')")), "23514");
-  assert.equal(errCode(() => execute(loaded, "INSERT INTO t VALUES (4, 1, 1.00, 'nope')")), "23514");
+  assert.equal(
+    errCode(() => execute(loaded, "INSERT INTO t VALUES (4, 1, 0.10, 'ok')")),
+    "23514",
+  );
+  assert.equal(
+    errCode(() => execute(loaded, "INSERT INTO t VALUES (4, 1, 1.00, 'nope')")),
+    "23514",
+  );
   execute(loaded, "INSERT INTO t VALUES (4, 1, 1.00, 'a''b')");
   // A second generation (load → image → load) is byte-stable: the text is written back
   // verbatim.
@@ -255,5 +307,8 @@ test("round-trips through the on-disk image", () => {
   assert.ok(at >= 0, "stored check text not found in image");
   const corrupt = image.slice();
   corrupt[at + 4] = "(".charCodeAt(0);
-  assert.equal(errCode(() => loadDatabase(corrupt)), "XX001");
+  assert.equal(
+    errCode(() => loadDatabase(corrupt)),
+    "XX001",
+  );
 });

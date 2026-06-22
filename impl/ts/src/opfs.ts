@@ -39,7 +39,10 @@ export type OpenOptions = { cacheBytes?: number; readOnly?: boolean; workMem?: n
 // from-scratch image in place + flush, then adopts the handle as the open pager so later commits write
 // through the seam incrementally (api.md §3, hosts.md §5). toImage validates the page size (0A000 if out
 // of range / not a power of two) BEFORE any write, so an invalid page size leaves the handle untouched.
-export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOptions = {}): Database {
+export function createOpfsWithHandle(
+  handle: SyncAccessHandle,
+  opts: DatabaseOptions = {},
+): Database {
   const db = new Database();
   db.pageSize = opts.pageSize ?? DEFAULT_PAGE_SIZE;
   db.committed.txid = 1n; // the initial empty image is committed as txid 1
@@ -53,7 +56,10 @@ export function createOpfsWithHandle(handle: SyncAccessHandle, opts: DatabaseOpt
   // Adopt the just-written handle as the open pager + buffer pool, so later commits write through the
   // seam without re-acquiring (spec/design/pager.md). Pager.fromStore reads the page size from the meta
   // header just written.
-  db.paging = new SharedPaging(Pager.fromStore(new OpfsBlockStore(handle)), cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize));
+  db.paging = new SharedPaging(
+    Pager.fromStore(new OpfsBlockStore(handle)),
+    cacheLeaves(DEFAULT_CACHE_BYTES, db.pageSize),
+  );
   return db;
 }
 
@@ -114,7 +120,10 @@ function opfsStorage(): OpfsStorageManager {
   // structural OpfsStorageManager — so go through unknown. Works the same under Node/WebWorker libs.
   const nav = (globalThis as unknown as { navigator?: { storage?: OpfsStorageManager } }).navigator;
   if (nav?.storage === undefined) {
-    throw engineError("feature_not_supported", "OPFS is not available in this environment (browser/worker only)");
+    throw engineError(
+      "feature_not_supported",
+      "OPFS is not available in this environment (browser/worker only)",
+    );
   }
   return nav.storage;
 }

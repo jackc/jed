@@ -83,20 +83,32 @@ test("AF7 unnest(composite[])", () => {
   const out = qOut(db, `SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])`);
   assert.deepStrictEqual(out.columnNames, ["unnest"]);
   assert.deepStrictEqual(out.columnTypes, ["addr"]);
-  assert.deepStrictEqual(col(db, `SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])`), ["(a,1)", "(b,2)"]);
+  assert.deepStrictEqual(col(db, `SELECT * FROM unnest('{"(a,1)","(b,2)"}'::addr[])`), [
+    "(a,1)",
+    "(b,2)",
+  ]);
   // A NULL element → a NULL row; empty/NULL array → zero rows.
-  assert.deepStrictEqual(col(db, `SELECT * FROM unnest('{"(a,1)",NULL}'::addr[])`), ["(a,1)", "NULL"]);
+  assert.deepStrictEqual(col(db, `SELECT * FROM unnest('{"(a,1)",NULL}'::addr[])`), [
+    "(a,1)",
+    "NULL",
+  ]);
   assert.equal(val(db, `SELECT count(*) FROM unnest('{}'::addr[])`), "0");
   assert.equal(val(db, `SELECT count(*) FROM unnest(NULL::addr[])`), "0");
   // Field access into the composite output column.
-  assert.deepStrictEqual(col(db, `SELECT (u).zip FROM unnest('{"(a,1)","(b,2)"}'::addr[]) AS u`), ["1", "2"]);
+  assert.deepStrictEqual(col(db, `SELECT (u).zip FROM unnest('{"(a,1)","(b,2)"}'::addr[]) AS u`), [
+    "1",
+    "2",
+  ]);
   // ORDER BY the whole composite column (the composite total order).
   assert.deepStrictEqual(
     col(db, `SELECT * FROM unnest('{"(b,2)","(a,1)"}'::addr[]) AS u ORDER BY u`),
     ["(a,1)", "(b,2)"],
   );
   // A non-array argument is still 42883.
-  assert.equal(errCode(() => execute(db, `SELECT * FROM unnest('(a,1)'::addr)`)), "42883");
+  assert.equal(
+    errCode(() => execute(db, `SELECT * FROM unnest('(a,1)'::addr)`)),
+    "42883",
+  );
 });
 
 // The jed extension: ARRAY[ROW(…)] under a composite-column context (not in the PG corpus).

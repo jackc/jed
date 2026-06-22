@@ -15,7 +15,14 @@ import type { ColType } from "./catalog.ts";
 import { PMap, pmapFromLoaded, unboundedBound } from "./pmap.ts";
 import type { KeyBound, LeafSource, PNode } from "./pmap.ts";
 import type { SharedPaging } from "./paging.ts";
-import { resolveUnfetched, anySpillable, anySpillableMasked, recordCompressUnits, recordScanUnits, recordSize } from "./format.ts";
+import {
+  resolveUnfetched,
+  anySpillable,
+  anySpillableMasked,
+  recordCompressUnits,
+  recordScanUnits,
+  recordSize,
+} from "./format.ts";
 
 // Row is a stored row: one value per column, in column order.
 export type Row = Value[];
@@ -289,7 +296,10 @@ export class TableStore {
   // this on a row it is about to re-store (UPDATE), so the stored row is fully resident and its
   // weight/disposition re-plan exactly like an eager writer's (large-values.md §14).
   resolveAll(row: Row): Row {
-    return this.resolveColumns(row, this.colTypes.map(() => true));
+    return this.resolveColumns(
+      row,
+      this.colTypes.map(() => true),
+    );
   }
 
   // scanRange streams the rows whose primary key lies within b to visit, in key order, stopping

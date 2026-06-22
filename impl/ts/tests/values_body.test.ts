@@ -30,21 +30,26 @@ function cost(db: Database, sql: string): bigint {
 
 test("VALUES body — basic shape and default column name", () => {
   const db = new Database();
-  assert.deepStrictEqual(query(db, "SELECT column1 FROM (VALUES (1), (2), (3)) AS v ORDER BY column1"), [
-    ["1"],
-    ["2"],
-    ["3"],
-  ]);
+  assert.deepStrictEqual(
+    query(db, "SELECT column1 FROM (VALUES (1), (2), (3)) AS v ORDER BY column1"),
+    [["1"], ["2"], ["3"]],
+  );
   assert.deepStrictEqual(names(db, "SELECT * FROM (VALUES (1), (2)) AS v"), ["column1"]);
 });
 
 test("VALUES body — multi-column default names and rename list", () => {
   const db = new Database();
-  assert.deepStrictEqual(names(db, "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v"), ["column1", "column2"]);
+  assert.deepStrictEqual(names(db, "SELECT * FROM (VALUES (1, 'a'), (2, 'b')) AS v"), [
+    "column1",
+    "column2",
+  ]);
   assert.deepStrictEqual(names(db, "SELECT * FROM (VALUES (1, 'a')) AS v(n, s)"), ["n", "s"]);
   // A partial rename keeps the trailing body name.
   assert.deepStrictEqual(names(db, "SELECT * FROM (VALUES (1, 'a')) AS v(n)"), ["n", "column2"]);
-  assert.deepStrictEqual(query(db, "SELECT v.n FROM (VALUES (7), (8)) AS v(n) ORDER BY v.n"), [["7"], ["8"]]);
+  assert.deepStrictEqual(query(db, "SELECT v.n FROM (VALUES (7), (8)) AS v(n) ORDER BY v.n"), [
+    ["7"],
+    ["8"],
+  ]);
 });
 
 test("VALUES body — per-column type unification across rows", () => {
@@ -53,10 +58,10 @@ test("VALUES body — per-column type unification across rows", () => {
   assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (2)) AS v"), ["i64"]);
   // int + decimal -> decimal; the int value coerces.
   assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (2.5)) AS v"), ["decimal"]);
-  assert.deepStrictEqual(query(db, "SELECT column1 FROM (VALUES (1), (2.5)) AS v ORDER BY column1"), [
-    ["1"],
-    ["2.5"],
-  ]);
+  assert.deepStrictEqual(
+    query(db, "SELECT column1 FROM (VALUES (1), (2.5)) AS v ORDER BY column1"),
+    [["1"], ["2.5"]],
+  );
   // anything + NULL keeps the other type.
   assert.deepStrictEqual(types(db, "SELECT column1 FROM (VALUES (1), (NULL)) AS v"), ["i64"]);
   // an all-NULL column is text (unknown -> text).
@@ -65,7 +70,9 @@ test("VALUES body — per-column type unification across rows", () => {
 
 test("VALUES body — a $N is typed by its sibling rows", () => {
   const db = new Database();
-  const o = executeParams(db, "SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1", [intValue(7n)]);
+  const o = executeParams(db, "SELECT column1 FROM (VALUES (1), ($1)) AS v ORDER BY column1", [
+    intValue(7n),
+  ]);
   if (o.kind !== "query") throw new Error("expected a query");
   assert.deepStrictEqual(
     o.rows.map((r) => r.map((v) => (v.kind === "int" ? v.int.toString() : "?"))),

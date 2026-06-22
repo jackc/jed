@@ -13,7 +13,13 @@ import { test } from "node:test";
 import { Decimal } from "../src/decimal.ts";
 import { loadDatabase, toImage } from "../src/format.ts";
 import { create, Database, execute } from "../src/lib.ts";
-import { canonFloat, float32Value, float64Value, floatTotalCmp, renderFloat } from "../src/value.ts";
+import {
+  canonFloat,
+  float32Value,
+  float64Value,
+  floatTotalCmp,
+  renderFloat,
+} from "../src/value.ts";
 import { dbWith, errCode, query } from "./util.ts";
 
 const GOLDEN_PAGE_SIZE = 256;
@@ -151,17 +157,28 @@ test("typed-literal float parse: e-notation, signs, specials; reject junk/range"
   assert.deepEqual(query(db, "SELECT float '1.5e3', float '-3E-2', float '.5', float '7.'"), [
     ["1500", "-0.03", "0.5", "7"],
   ]);
-  assert.deepEqual(query(db, "SELECT float 'Infinity', float '-inf', float '+Infinity', float 'NaN'"), [
-    ["Infinity", "-Infinity", "Infinity", "NaN"],
-  ]);
+  assert.deepEqual(
+    query(db, "SELECT float 'Infinity', float '-inf', float '+Infinity', float 'NaN'"),
+    [["Infinity", "-Infinity", "Infinity", "NaN"]],
+  );
   // Malformed → 22P02 (NOT parseFloat-lenient): trailing junk, empty, words.
   for (const bad of ["1.5xyz", "", "1.2.3", "abc", "0x10", "1e"]) {
-    assert.equal(errCode(() => void execute(db, `SELECT float '${bad}'`)), "22P02", bad);
+    assert.equal(
+      errCode(() => void execute(db, `SELECT float '${bad}'`)),
+      "22P02",
+      bad,
+    );
   }
   // Out of binary64 range → 22003.
-  assert.equal(errCode(() => void execute(db, "SELECT float '1e400'")), "22003");
+  assert.equal(
+    errCode(() => void execute(db, "SELECT float '1e400'")),
+    "22003",
+  );
   // Finite literal beyond f32 range → 22003.
-  assert.equal(errCode(() => void execute(db, "SELECT real '1e40'")), "22003");
+  assert.equal(
+    errCode(() => void execute(db, "SELECT real '1e40'")),
+    "22003",
+  );
 });
 
 test("decimal/integer literal adapts to a float context", () => {
@@ -248,7 +265,10 @@ test("f64 value into a f32 column needs an explicit cast (42804)", () => {
     "CREATE TABLE dst (id int PRIMARY KEY, x f32)",
   ]);
   // f64 → f32 is lossy/explicit; INSERT ... SELECT of a f64 column into f32 is 42804.
-  assert.equal(errCode(() => void execute(db, "INSERT INTO dst SELECT id, a FROM src")), "42804");
+  assert.equal(
+    errCode(() => void execute(db, "INSERT INTO dst SELECT id, a FROM src")),
+    "42804",
+  );
   // f32 → f64 widening IS allowed (lossless).
   const db2 = dbWith([
     "CREATE TABLE src2 (id int PRIMARY KEY, b f32)",

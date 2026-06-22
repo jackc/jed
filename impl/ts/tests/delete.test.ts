@@ -7,5 +7,8 @@ import { Database, execute } from "../src/lib.ts";
 import { errCode } from "./util.ts";
 
 test("delete from a missing table traps 42P01", () => {
-  assert.equal(errCode(() => execute(new Database(), "DELETE FROM nope")), "42P01");
+  assert.equal(
+    errCode(() => execute(new Database(), "DELETE FROM nope")),
+    "42P01",
+  );
 });

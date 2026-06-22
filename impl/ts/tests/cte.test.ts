@@ -33,7 +33,10 @@ test("MATERIALIZED / NOT MATERIALIZED hints force the mode", () => {
   // NOT MATERIALIZED forces a two-reference CTE to inline (each reference re-runs the body): two
   // bodies (2x7) + 9 row_produced = 23 (vs the materialized 22).
   assert.strictEqual(
-    cost(db, "WITH c AS NOT MATERIALIZED (SELECT id FROM t) SELECT a.id, b.id FROM c a CROSS JOIN c b"),
+    cost(
+      db,
+      "WITH c AS NOT MATERIALIZED (SELECT id FROM t) SELECT a.id, b.id FROM c a CROSS JOIN c b",
+    ),
     23n,
   );
 });
@@ -99,19 +102,22 @@ test("nested WITH does not inherit enclosing CTEs", () => {
   ]);
   assert.strictEqual(
     errCode(() =>
-      execute(db, "WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s"),
+      execute(
+        db,
+        "WITH e AS (SELECT 1 AS v) SELECT * FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s",
+      ),
     ),
     "42P01",
   );
 
   // (b) A base table e exists: inside the nested WITH the enclosing CTE e is invisible, so the
   // reference resolves to the BASE TABLE (rows are the table's, not the CTE's). PG diverges.
-  const db2 = dbWith([
-    "CREATE TABLE e (v i32 PRIMARY KEY)",
-    "INSERT INTO e VALUES (7), (8)",
-  ]);
+  const db2 = dbWith(["CREATE TABLE e (v i32 PRIMARY KEY)", "INSERT INTO e VALUES (7), (8)"]);
   assert.deepEqual(
-    query(db2, "WITH e AS (SELECT 1 AS v) SELECT v FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s ORDER BY v"),
+    query(
+      db2,
+      "WITH e AS (SELECT 1 AS v) SELECT v FROM (WITH ic AS (SELECT v FROM e) SELECT v FROM ic) s ORDER BY v",
+    ),
     [["7"], ["8"]],
   );
 });

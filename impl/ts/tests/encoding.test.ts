@@ -63,7 +63,11 @@ test("encoding vectors match spec/encoding/integers.toml", () => {
           got = invertBytes(nullableUuid(c));
           break;
       }
-      assert.equal(bytesToHex(got!), c.bytes, `${c.kind} uuid value=${c.strValue} null=${c.isNull}`);
+      assert.equal(
+        bytesToHex(got!),
+        c.bytes,
+        `${c.kind} uuid value=${c.strValue} null=${c.isNull}`,
+      );
       checked++;
       continue;
     }
@@ -81,7 +85,11 @@ test("encoding vectors match spec/encoding/integers.toml", () => {
           got = invertBytes(nullableBool(c));
           break;
       }
-      assert.equal(bytesToHex(got!), c.bytes, `${c.kind} boolean value=${c.boolValue} null=${c.isNull}`);
+      assert.equal(
+        bytesToHex(got!),
+        c.bytes,
+        `${c.kind} boolean value=${c.boolValue} null=${c.isNull}`,
+      );
       checked++;
       continue;
     }
@@ -97,11 +105,7 @@ test("encoding vectors match spec/encoding/integers.toml", () => {
         got = invertBytes(encodeNullable(st!, c.isNull ? null : c.value));
         break;
     }
-    assert.equal(
-      bytesToHex(got!),
-      c.bytes,
-      `${c.kind} ${c.typ} value=${c.value} null=${c.isNull}`,
-    );
+    assert.equal(bytesToHex(got!), c.bytes, `${c.kind} ${c.typ} value=${c.value} null=${c.isNull}`);
     checked++;
   }
   assert.ok(checked > 0, "no encoding cases parsed");

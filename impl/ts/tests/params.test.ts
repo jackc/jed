@@ -41,7 +41,10 @@ test("WHERE pk = $1 point lookup", () => {
 });
 
 test("param adopts narrow column type and traps overflow", () => {
-  const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, s i16)", "INSERT INTO t VALUES (1, 100)"]);
+  const db = dbWith([
+    "CREATE TABLE t (id i32 PRIMARY KEY, s i16)",
+    "INSERT INTO t VALUES (1, 100)",
+  ]);
   assert.equal(paramErrCode(db, "SELECT id FROM t WHERE s = $1", [intValue(100000n)]), "22003");
   assert.deepStrictEqual(ints(rows(db, "SELECT id FROM t WHERE s = $1", [intValue(100n)])), [1n]);
 });
@@ -57,12 +60,18 @@ test("INSERT VALUES params round-trip", () => {
 
 test("INSERT param NULL into NOT NULL traps 23502", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, name text NOT NULL)"]);
-  assert.equal(paramErrCode(db, "INSERT INTO t VALUES ($1, $2)", [intValue(1n), nullValue()]), "23502");
+  assert.equal(
+    paramErrCode(db, "INSERT INTO t VALUES ($1, $2)", [intValue(1n), nullValue()]),
+    "23502",
+  );
 });
 
 test("INSERT param wrong family traps 42804", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY, n i32)"]);
-  assert.equal(paramErrCode(db, "INSERT INTO t VALUES ($1, $2)", [intValue(1n), text("x")]), "42804");
+  assert.equal(
+    paramErrCode(db, "INSERT INTO t VALUES ($1, $2)", [intValue(1n), text("x")]),
+    "42804",
+  );
 });
 
 test("UPDATE SET and WHERE params", () => {
@@ -96,20 +105,30 @@ test("bare SELECT $1 is indeterminate 42P18", () => {
 test("gap in param indices is 42P18", () => {
   const db = dbWith(["CREATE TABLE t (a i32 PRIMARY KEY, b i32)"]);
   assert.equal(
-    paramErrCode(db, "SELECT a FROM t WHERE a = $1 OR b = $3", [intValue(1n), intValue(2n), intValue(3n)]),
+    paramErrCode(db, "SELECT a FROM t WHERE a = $1 OR b = $3", [
+      intValue(1n),
+      intValue(2n),
+      intValue(3n),
+    ]),
     "42P18",
   );
 });
 
 test("conflicting inference is 42804", () => {
   const db = dbWith(["CREATE TABLE t (a i32 PRIMARY KEY, name text)"]);
-  assert.equal(paramErrCode(db, "SELECT a FROM t WHERE a = $1 OR name = $1", [intValue(1n)]), "42804");
+  assert.equal(
+    paramErrCode(db, "SELECT a FROM t WHERE a = $1 OR name = $1", [intValue(1n)]),
+    "42804",
+  );
 });
 
 test("count mismatch is 42601", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)", "INSERT INTO t VALUES (1)"]);
   assert.equal(paramErrCode(db, "SELECT id FROM t WHERE id = $1", []), "42601");
-  assert.equal(paramErrCode(db, "SELECT id FROM t WHERE id = $1", [intValue(1n), intValue(2n)]), "42601");
+  assert.equal(
+    paramErrCode(db, "SELECT id FROM t WHERE id = $1", [intValue(1n), intValue(2n)]),
+    "42601",
+  );
 });
 
 test("NULL param three-valued", () => {

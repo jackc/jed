@@ -526,7 +526,13 @@ function readValue(r: SpillByteReader): Value {
     case 9:
       return {
         kind: "unfetched",
-        ref: { form: 0x02, firstPage: readU32(r), storedLen: readU32(r), rawLen: 0, comp: undefined },
+        ref: {
+          form: 0x02,
+          firstPage: readU32(r),
+          storedLen: readU32(r),
+          rawLen: 0,
+          comp: undefined,
+        },
       };
     case 10: {
       const rawLen = readU32(r);
@@ -536,7 +542,13 @@ function readValue(r: SpillByteReader): Value {
     case 11:
       return {
         kind: "unfetched",
-        ref: { form: 0x04, firstPage: readU32(r), storedLen: readU32(r), rawLen: readU32(r), comp: undefined },
+        ref: {
+          form: 0x04,
+          firstPage: readU32(r),
+          storedLen: readU32(r),
+          rawLen: readU32(r),
+          comp: undefined,
+        },
       };
     case 12: {
       const months = readU32(r) | 0; // signed i32

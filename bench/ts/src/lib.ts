@@ -158,7 +158,10 @@ function strList(v: unknown): string[] {
 }
 
 export function loadCorpus(corpusDir: string): Bench[] {
-  const doc = parseToml(readFileSync(`${corpusDir}/benchmarks.toml`, "utf8")) as Record<string, unknown>;
+  const doc = parseToml(readFileSync(`${corpusDir}/benchmarks.toml`, "utf8")) as Record<
+    string,
+    unknown
+  >;
   if (num(doc.schema_version) !== 1) {
     throw new Error("benchmarks.toml: unsupported schema_version");
   }
@@ -198,7 +201,10 @@ export function loadCorpus(corpusDir: string): Bench[] {
 // --- datasets (datasets.toml — only the committed row counts the harness needs) ---
 
 export function datasetTableRows(corpusDir: string, dataset: string, table: string): bigint {
-  const doc = parseToml(readFileSync(`${corpusDir}/datasets.toml`, "utf8")) as Record<string, unknown>;
+  const doc = parseToml(readFileSync(`${corpusDir}/datasets.toml`, "utf8")) as Record<
+    string,
+    unknown
+  >;
   for (const ds of doc.dataset as Record<string, unknown>[]) {
     if (str(ds.name) !== dataset) continue;
     for (const t of (ds.table as Record<string, unknown>[] | undefined) ?? []) {
@@ -211,7 +217,9 @@ export function datasetTableRows(corpusDir: string, dataset: string, table: stri
 // --- fingerprint (benchmarks.md §5) ---
 
 export function corpusFingerprint(corpusDir: string): string {
-  return createHash("sha256").update(readFileSync(`${corpusDir}/datasets.toml`)).digest("hex");
+  return createHash("sha256")
+    .update(readFileSync(`${corpusDir}/datasets.toml`))
+    .digest("hex");
 }
 
 export function readSidecar(dataDir: string, dataset: string, engine: string): string {
@@ -307,14 +315,21 @@ interface ResultLine {
   started_at: string;
 }
 
-export async function run(cfg: Config, corpusDir: string, dataDir: string, filter: string): Promise<ResultLine[]> {
+export async function run(
+  cfg: Config,
+  corpusDir: string,
+  dataDir: string,
+  filter: string,
+): Promise<ResultLine[]> {
   const benches = loadCorpus(corpusDir);
   const want = corpusFingerprint(corpusDir);
   const results: ResultLine[] = [];
   for (const b of benches) {
     if (filter !== "" && !b.name.includes(filter)) continue;
     if (!runsOn(b, cfg.engine)) continue;
-    process.stderr.write(`${cfg.engine}/${cfg.lang}/${cfg.variant}: ${b.name} (${b.dataset}) ...\n`);
+    process.stderr.write(
+      `${cfg.engine}/${cfg.lang}/${cfg.variant}: ${b.name} (${b.dataset}) ...\n`,
+    );
     try {
       results.push(await runOne(cfg, b, corpusDir, dataDir, want));
     } catch (e) {
@@ -324,7 +339,13 @@ export async function run(cfg: Config, corpusDir: string, dataDir: string, filte
   return results;
 }
 
-async function runOne(cfg: Config, b: Bench, corpusDir: string, dataDir: string, want: string): Promise<ResultLine> {
+async function runOne(
+  cfg: Config,
+  b: Bench,
+  corpusDir: string,
+  dataDir: string,
+  want: string,
+): Promise<ResultLine> {
   const startedAt = new Date().toISOString().replace(/\.\d{3}Z$/, "Z");
   const eng = await cfg.open(dataDir, b.dataset);
   try {
@@ -439,7 +460,9 @@ function insertTable(sql: string): string {
 export async function mainWith(cfg: Config): Promise<void> {
   const args = process.argv.slice(2);
   if (args.length < 3 || args.length > 4) {
-    process.stderr.write(`usage: bench-${cfg.engine} <corpus_dir> <data_dir> <out_path> [name_filter]\n`);
+    process.stderr.write(
+      `usage: bench-${cfg.engine} <corpus_dir> <data_dir> <out_path> [name_filter]\n`,
+    );
     process.exit(2);
   }
   try {

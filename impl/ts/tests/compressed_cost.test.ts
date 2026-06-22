@@ -67,9 +67,15 @@ test("bounded scan charges only admitted values and LIMIT does not lower", () =>
     cost(db, "SELECT * FROM control WHERE id = 1") + SLABS_600,
   );
   // ... the one that admits only the inline record pays nothing extra ...
-  assert.equal(cost(db, "SELECT * FROM comp WHERE id = 2"), cost(db, "SELECT * FROM control WHERE id = 2"));
+  assert.equal(
+    cost(db, "SELECT * FROM comp WHERE id = 2"),
+    cost(db, "SELECT * FROM control WHERE id = 2"),
+  );
   // ... and LIMIT does not lower the up-front block (cost.md §3 "LIMIT short-circuit").
-  assert.equal(cost(db, "SELECT * FROM comp LIMIT 1"), cost(db, "SELECT * FROM control LIMIT 1") + SLABS_600);
+  assert.equal(
+    cost(db, "SELECT * FROM comp LIMIT 1"),
+    cost(db, "SELECT * FROM control LIMIT 1") + SLABS_600,
+  );
 });
 
 test("INSERT meters compress attempts, adopted or rejected", () => {
@@ -100,10 +106,18 @@ test("decimal payloads compress too", () => {
   const db = smallPageDb();
   const digits = "12".repeat(400) + ".5";
   execute(db, "CREATE TABLE t (id i32 PRIMARY KEY, d numeric)");
-  assert.equal(cost(db, `INSERT INTO t VALUES (1, ${digits})`), 2n, "the compress attempt is metered");
+  assert.equal(
+    cost(db, `INSERT INTO t VALUES (1, ${digits})`),
+    2n,
+    "the compress attempt is metered",
+  );
   execute(db, "CREATE TABLE control (id i32 PRIMARY KEY, d numeric)");
   execute(db, "INSERT INTO control VALUES (1, 7)");
-  assert.equal(cost(db, "SELECT * FROM t"), cost(db, "SELECT * FROM control") + 2n, "the decompress slabs are metered");
+  assert.equal(
+    cost(db, "SELECT * FROM t"),
+    cost(db, "SELECT * FROM control") + 2n,
+    "the decompress slabs are metered",
+  );
 });
 
 test("untouched compressed columns charge no slabs", () => {
@@ -112,7 +126,10 @@ test("untouched compressed columns charge no slabs", () => {
   const db = twoTables();
   assert.equal(cost(db, "SELECT id FROM comp"), cost(db, "SELECT id FROM control"));
   assert.equal(cost(db, "SELECT count(*) FROM comp"), cost(db, "SELECT count(*) FROM control"));
-  assert.equal(cost(db, "SELECT min(body) FROM comp"), cost(db, "SELECT min(body) FROM control") + SLABS_600);
+  assert.equal(
+    cost(db, "SELECT min(body) FROM comp"),
+    cost(db, "SELECT min(body) FROM control") + SLABS_600,
+  );
 });
 
 test("a correlated outer reference is a touch", () => {
@@ -123,7 +140,13 @@ test("a correlated outer reference is a touch", () => {
   const db = twoTables();
   execute(db, "CREATE TABLE probe (id i32 PRIMARY KEY, body text)");
   execute(db, "INSERT INTO probe VALUES (1, 'small')");
-  const comp = cost(db, "SELECT id FROM comp WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = comp.body)");
-  const control = cost(db, "SELECT id FROM control WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = control.body)");
+  const comp = cost(
+    db,
+    "SELECT id FROM comp WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = comp.body)",
+  );
+  const control = cost(
+    db,
+    "SELECT id FROM control WHERE EXISTS (SELECT 1 FROM probe WHERE probe.body = control.body)",
+  );
   assert.equal(comp, control + SLABS_600);
 });

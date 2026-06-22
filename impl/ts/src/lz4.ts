@@ -34,7 +34,14 @@ function emitLength(out: number[], n: number): void {
   out.push(n);
 }
 
-function emitSequence(out: number[], src: Uint8Array, litFrom: number, litTo: number, offset: number, mlen: number): void {
+function emitSequence(
+  out: number[],
+  src: Uint8Array,
+  litFrom: number,
+  litTo: number,
+  offset: number,
+  mlen: number,
+): void {
   const lit = litTo - litFrom;
   const ml = mlen - MIN_MATCH;
   out.push((Math.min(lit, 15) << 4) | Math.min(ml, 15));

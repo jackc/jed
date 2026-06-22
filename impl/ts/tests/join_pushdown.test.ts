@@ -51,7 +51,10 @@ test("join pushdown bounds one side sublinear", () => {
   const scan = cost(db, unbounded);
   // The non-PK predicate full-scans all ~1000 a rows; the PK pushdown materializes one a row.
   assert.ok(seek * 10n < scan, `bounded join ${seek} should be far below full-scan join ${scan}`);
-  assert.ok(seek <= 60n, `bounded join ${seek} should be sublinear (seek a + scan small b), not ~1000`);
+  assert.ok(
+    seek <= 60n,
+    `bounded join ${seek} should be sublinear (seek a + scan small b), not ~1000`,
+  );
 });
 
 test("join pushdown miss collapses to empty", () => {

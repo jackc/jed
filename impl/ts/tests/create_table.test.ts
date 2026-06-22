@@ -22,9 +22,7 @@ test("create table then describe via the catalog", () => {
 });
 
 test("SQL-standard type aliases resolve to canonical types", () => {
-  const db = dbWith([
-    "CREATE TABLE t (a smallint, b int, c integer, d bigint)",
-  ]);
+  const db = dbWith(["CREATE TABLE t (a smallint, b int, c integer, d bigint)"]);
   assert.deepStrictEqual(
     db.table("t")!.columns.map((c) => typeScalar(c.type)),
     ["i16", "i32", "i32", "i64"],
@@ -39,7 +37,10 @@ test("case-insensitive table lookup", () => {
 
 test("duplicate table name traps 42P07", () => {
   const db = dbWith(["CREATE TABLE t (id i32 PRIMARY KEY)"]);
-  assert.equal(errCode(() => execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)")), "42P07");
+  assert.equal(
+    errCode(() => execute(db, "CREATE TABLE t (id i32 PRIMARY KEY)")),
+    "42P07",
+  );
 });
 
 test("duplicate column name traps 42701", () => {

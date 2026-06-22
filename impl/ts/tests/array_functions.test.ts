@@ -40,5 +40,10 @@ test("error cases", () => {
     ["SELECT array_length(5, 1)", "42883"],
     ["SELECT array_append(ARRAY[1,2], 'x')", "42883"],
   ];
-  for (const [sql, want] of cases) assert.equal(errCode(() => execute(db, sql)), want, sql);
+  for (const [sql, want] of cases)
+    assert.equal(
+      errCode(() => execute(db, sql)),
+      want,
+      sql,
+    );
 });

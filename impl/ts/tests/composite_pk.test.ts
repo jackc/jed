@@ -58,7 +58,10 @@ test("uniqueness is over the whole tuple", () => {
     "INSERT INTO t VALUES (1, 1)",
   ]);
   execute(db, "INSERT INTO t VALUES (1, 2)"); // shared prefix: distinct row
-  assert.equal(errCode(() => execute(db, "INSERT INTO t VALUES (1, 1)")), "23505");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO t VALUES (1, 1)")),
+    "23505",
+  );
   assert.equal(
     errCode(() => execute(db, "INSERT INTO t VALUES (5, 5), (5, 5)")),
     "23505",
@@ -80,7 +83,11 @@ test("DDL errors mirror PostgreSQL plus the jed narrowings", () => {
     ["CREATE TABLE t (a i32, s f64, PRIMARY KEY (a, s))", "0A000"],
   ];
   for (const [sql, want] of cases) {
-    assert.equal(errCode(() => execute(new Database(), sql)), want, sql);
+    assert.equal(
+      errCode(() => execute(new Database(), sql)),
+      want,
+      sql,
+    );
   }
   // The list order is the KEY order — it may differ from declaration order (the original
   // 0A000 narrowing was lifted by the v5 catalog reshape, constraints.md §3): the table
@@ -107,10 +114,22 @@ test("members are NOT NULL and UPDATE may not assign one", () => {
     "CREATE TABLE t (a i32, b i32, v i16, PRIMARY KEY (a, b))",
     "INSERT INTO t VALUES (1, 1, 10)",
   ]);
-  assert.equal(errCode(() => execute(db, "INSERT INTO t VALUES (1, NULL, 5)")), "23502");
-  assert.equal(errCode(() => execute(db, "INSERT INTO t (a, v) VALUES (2, 5)")), "23502");
-  assert.equal(errCode(() => execute(db, "UPDATE t SET a = 9")), "0A000");
-  assert.equal(errCode(() => execute(db, "UPDATE t SET b = 9")), "0A000");
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO t VALUES (1, NULL, 5)")),
+    "23502",
+  );
+  assert.equal(
+    errCode(() => execute(db, "INSERT INTO t (a, v) VALUES (2, 5)")),
+    "23502",
+  );
+  assert.equal(
+    errCode(() => execute(db, "UPDATE t SET a = 9")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "UPDATE t SET b = 9")),
+    "0A000",
+  );
   execute(db, "UPDATE t SET v = 11"); // non-member updates fine
 });
 
@@ -149,7 +168,10 @@ test("round-trips through the on-disk image as a keyed table", () => {
     [2n, 1n],
   ]);
 
-  assert.equal(errCode(() => execute(loaded, "INSERT INTO t VALUES (1, 2, 99)")), "23505");
+  assert.equal(
+    errCode(() => execute(loaded, "INSERT INTO t VALUES (1, 2, 99)")),
+    "23505",
+  );
   execute(loaded, "INSERT INTO t VALUES (2, 2, 50)");
   assert.equal(loaded.rowsInKeyOrder("t").length, 4);
 });

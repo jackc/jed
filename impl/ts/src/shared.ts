@@ -127,10 +127,7 @@ export class SharedDb {
   // un-ended handle discards it.
   write(): WriteHandle {
     if (this.core.writerActive) {
-      throw engineError(
-        "active_sql_transaction",
-        "there is already a writer in progress",
-      );
+      throw engineError("active_sql_transaction", "there is already a writer in progress");
     }
     this.core.writerActive = true;
     return new WriteHandle(this.core, this.core.committed);
@@ -215,9 +212,7 @@ export class WriteHandle {
 
   // query runs a query within this write transaction (read-your-writes against the working set).
   query(sql: string, params: Value[] = []): Rows {
-    return rowsFromOutcome(
-      this.db.executeStmtParams(this.db.parse(sql), params),
-    );
+    return rowsFromOutcome(this.db.executeStmtParams(this.db.parse(sql), params));
   }
 
   // commit publishes the working set as the new committed snapshot at the next version (the §3

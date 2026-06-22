@@ -13,47 +13,47 @@ const PORT = Number(process.env.PORT || 4173);
 const BASE = process.env.BASE || '';
 
 const TYPES = {
-	'.html': 'text/html; charset=utf-8',
-	'.js': 'text/javascript; charset=utf-8',
-	'.mjs': 'text/javascript; charset=utf-8',
-	'.css': 'text/css; charset=utf-8',
-	'.json': 'application/json; charset=utf-8',
-	'.svg': 'image/svg+xml',
-	'.ico': 'image/x-icon',
-	'.wasm': 'application/wasm',
-	'.woff2': 'font/woff2',
-	'.txt': 'text/plain; charset=utf-8'
+  '.html': 'text/html; charset=utf-8',
+  '.js': 'text/javascript; charset=utf-8',
+  '.mjs': 'text/javascript; charset=utf-8',
+  '.css': 'text/css; charset=utf-8',
+  '.json': 'application/json; charset=utf-8',
+  '.svg': 'image/svg+xml',
+  '.ico': 'image/x-icon',
+  '.wasm': 'application/wasm',
+  '.woff2': 'font/woff2',
+  '.txt': 'text/plain; charset=utf-8'
 };
 
 const server = createServer(async (req, res) => {
-	try {
-		let path = decodeURIComponent((req.url ?? '/').split('?')[0]);
-		if (BASE && path.startsWith(BASE)) path = path.slice(BASE.length) || '/';
-		else if (BASE && path !== '/') {
-			res.writeHead(404);
-			return res.end('not found');
-		}
-		let file = new URL('.' + path, ROOT);
-		const s = await stat(file).catch(() => null);
-		if (s?.isDirectory()) {
-			if (!path.endsWith('/')) {
-				res.writeHead(301, { location: path + '/' });
-				return res.end();
-			}
-			file = new URL('index.html', file);
-		} else if (!s && extname(path) === '') {
-			// Extension-less route -> its prerendered index.html (trailingSlash: 'always').
-			file = new URL('.' + (path.endsWith('/') ? path : path + '/') + 'index.html', ROOT);
-		}
-		const body = await readFile(file);
-		res.writeHead(200, {
-			'content-type': TYPES[extname(file.pathname)] ?? 'application/octet-stream'
-		});
-		res.end(body);
-	} catch {
-		res.writeHead(404, { 'content-type': 'text/plain' });
-		res.end('not found');
-	}
+  try {
+    let path = decodeURIComponent((req.url ?? '/').split('?')[0]);
+    if (BASE && path.startsWith(BASE)) path = path.slice(BASE.length) || '/';
+    else if (BASE && path !== '/') {
+      res.writeHead(404);
+      return res.end('not found');
+    }
+    let file = new URL('.' + path, ROOT);
+    const s = await stat(file).catch(() => null);
+    if (s?.isDirectory()) {
+      if (!path.endsWith('/')) {
+        res.writeHead(301, { location: path + '/' });
+        return res.end();
+      }
+      file = new URL('index.html', file);
+    } else if (!s && extname(path) === '') {
+      // Extension-less route -> its prerendered index.html (trailingSlash: 'always').
+      file = new URL('.' + (path.endsWith('/') ? path : path + '/') + 'index.html', ROOT);
+    }
+    const body = await readFile(file);
+    res.writeHead(200, {
+      'content-type': TYPES[extname(file.pathname)] ?? 'application/octet-stream'
+    });
+    res.end(body);
+  } catch {
+    res.writeHead(404, { 'content-type': 'text/plain' });
+    res.end('not found');
+  }
 });
 
 server.listen(PORT, () => console.log(`static server serving build/ on http://localhost:${PORT}`));

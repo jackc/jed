@@ -64,7 +64,9 @@ class PgEngine implements Engine {
 
   async storedFingerprint(): Promise<string> {
     try {
-      const result = await this.sql.unsafe("SELECT value FROM _bench_meta WHERE key = 'fingerprint'").values();
+      const result = await this.sql
+        .unsafe("SELECT value FROM _bench_meta WHERE key = 'fingerprint'")
+        .values();
       return result.length > 0 ? (result[0][0] as string) : "";
     } catch {
       return ""; // absent table reads as no fingerprint → stale
