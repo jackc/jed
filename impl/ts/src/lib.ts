@@ -28,9 +28,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // database file (held in a per-session temp snapshot outside the serialized catalog, no
   // format_version change). Full CRUD + PK/UNIQUE/CHECK/NOT NULL/DEFAULT, dropped at session close,
   // preclude-overlaps (42P07), standalone CREATE INDEX / DROP INDEX (the index in the temp snapshot,
-  // gated by the same allow_temp_ddl), and serial/IDENTITY columns (the OWNED sequence lives in the
-  // temp snapshot — zero file writes — and is auto-dropped with the table). Composite/collated columns
-  // and FK on a temp table are deferred 0A000 (spec/design/temp-tables.md §8). Gate
+  // gated by the same allow_temp_ddl), serial/IDENTITY columns (the OWNED sequence lives in the temp
+  // snapshot — zero file writes — and is auto-dropped with the table), and composite-typed columns
+  // (resolved against the persistent type catalog; DROP TYPE of a referenced type is 2BP01). Collated
+  // columns and FK on a temp table are deferred 0A000 (spec/design/temp-tables.md §8). Gate
   // session.allow_temp_ddl; storage budget resource.temp_budget.
   "ddl.temp_table",
   // CREATE SHARED [TEMP|TEMPORARY] TABLE — database-wide shared temporary tables (visible to every
@@ -468,7 +469,12 @@ export {
   Snapshot,
   vendoredCollations,
 } from "./executor.ts";
-export type { CollationInfo, Outcome, SessionOptions, TxStatus } from "./executor.ts";
+export type {
+  CollationInfo,
+  Outcome,
+  SessionOptions,
+  TxStatus,
+} from "./executor.ts";
 export { PrivilegeSet, Privileges, privilegeFromName } from "./privileges.ts";
 export type { Privilege } from "./privileges.ts";
 export { splitStatements } from "./split.ts";

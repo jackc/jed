@@ -688,12 +688,22 @@ export class Snapshot {
   // page_size − 12) and the column types so the page-backed B-tree can weigh records for its
   // size-driven split (spec/fileformat/format.md).
   putTable(t: Table, pageSize: number): void {
-    const key = t.name.toLowerCase();
     // Resolve each column's ColType against the (already-registered) composite-type catalog —
     // self-contained codec/coercion trees the store carries, so the value codec never re-walks the
     // type catalog per row (spec/design/composite.md §4). Composite types are registered before any
     // table (the types-first catalog emission order), so resolveColType always resolves.
     const colTypes = t.columns.map((c) => resolveColType(c.type, this.types));
+    this.putTableResolved(t, colTypes, pageSize);
+  }
+
+  // putTableResolved registers a table whose column ColTypes are ALREADY resolved — used when staging
+  // a TEMP table (spec/design/temp-tables.md §8): a temp table's composite columns must resolve against
+  // the MAIN snapshot's type catalog (composites are never temp — CREATE TYPE is persistent), not this
+  // (temp) snapshot's empty types map. The resolved ColType tree is fully self-contained
+  // (spec/design/composite.md §4), so the store needs nothing from the catalog thereafter. The plain
+  // putTable resolves against this.types and delegates here.
+  putTableResolved(t: Table, colTypes: ColType[], pageSize: number): void {
+    const key = t.name.toLowerCase();
     this.stores.set(key, new TableStore(pageSize - 12, colTypes)); // 12 = PAGE_HEADER
     this.tables.set(key, t);
   }
@@ -1486,6 +1496,22 @@ export class Database {
   // walk (session-local → shared → persistent); preclude-overlaps keeps a name in at most one scope.
   private isSharedTempTable(name: string): boolean {
     return this.sharedTempSnap().table(name) !== undefined;
+  }
+
+  // compositeDependentAny is the DROP TYPE … RESTRICT dependency check across EVERY visible scope
+  // (spec/design/temp-tables.md §8): the main image (tables + composite fields), then the visible
+  // session-local and shared temp snapshots (their tables). A composite type is always persistent, but
+  // a TEMP table column may reference it, so dropping the type while such a temp table exists is 2BP01
+  // — matching the persistent case (PostgreSQL blocks the drop). A session sees only its own
+  // session-local temp tables plus the shared ones, so the check is scoped to what is visible (another
+  // session's private temp table is invisible by design — and its resolved ColType is self-contained,
+  // so it keeps working regardless).
+  private compositeDependentAny(name: string): string | null {
+    return (
+      this.readSnap().compositeDependent(name) ??
+      this.tempSnap().compositeDependent(name) ??
+      this.sharedTempSnap().compositeDependent(name)
+    );
   }
 
   // isTempIndex reports whether name is a secondary index on a SESSION-LOCAL temp table
@@ -3179,18 +3205,12 @@ export class Database {
     table.fks = resolvedFks;
 
     if (ct.temp) {
-      // Deferred narrowings on a temp table this slice (spec/design/temp-tables.md §8), each a clean
-      // 0A000: a composite-typed column (needs the temp snapshot to carry the type catalog) and a
-      // collated column (needs the collation catalog). Plain scalar/array/range/decimal columns with
-      // PK / NOT NULL / DEFAULT / CHECK / UNIQUE — and now serial/IDENTITY columns, whose OWNED
-      // sequence is staged into the same temp snapshot below — are fully supported.
+      // Deferred narrowing on a temp table this slice (spec/design/temp-tables.md §8), a clean 0A000:
+      // a collated column (needs the temp snapshot to carry the collation catalog). Plain
+      // scalar/array/range/decimal columns with PK / NOT NULL / DEFAULT / CHECK / UNIQUE,
+      // serial/IDENTITY columns (the OWNED sequence is staged into the same temp snapshot below), and
+      // COMPOSITE-typed columns (resolved against the MAIN type catalog just below) are fully supported.
       for (const c of table.columns) {
-        if (typeUsesComposite(c.type)) {
-          throw engineError(
-            "feature_not_supported",
-            `composite-typed column ${c.name} on a temporary table is not yet supported`,
-          );
-        }
         if (c.collation !== null) {
           throw engineError(
             "feature_not_supported",
@@ -3198,6 +3218,15 @@ export class Database {
           );
         }
       }
+      // Resolve each column's ColType against the MAIN snapshot's composite-type catalog
+      // (spec/design/temp-tables.md §8): composites are always persistent (CREATE TYPE is persistent
+      // DDL), so the temp snapshot's own types map is empty — resolving there would miss a composite
+      // reference. The resulting ColType tree is self-contained, so the temp store needs nothing from
+      // the catalog after this (composite.md §4).
+      const mainTypes = this.readSnap().types;
+      const colTypes = table.columns.map((c) =>
+        resolveColType(c.type, mainTypes),
+      );
       // Register into the matching temp snapshot — never the main image, so the table makes zero file
       // writes (§2). A SHARED table goes in the database-wide shared snapshot (visible to every
       // session, §4); a plain temp table in the session-local one. Flag the matching dirty bit so the
@@ -3210,7 +3239,7 @@ export class Database {
         this.session.tx!.tempDirty = true;
         ts = this.session.tx!.tempWorking;
       }
-      ts.putTable(table, this.pageSize);
+      ts.putTableResolved(table, colTypes, this.pageSize);
       for (const ix of table.indexes) {
         ts.putIndexStore(
           ix.name.toLowerCase(),
@@ -3804,7 +3833,7 @@ export class Database {
         return { kind: "statement", cost: 0n, rowsAffected: null };
       throw engineError("undefined_object", "type does not exist: " + dt.name);
     }
-    const dep = this.readSnap().compositeDependent(dt.name);
+    const dep = this.compositeDependentAny(dt.name);
     if (dep !== null) {
       throw engineError(
         "dependent_objects_still_exist",
@@ -13448,15 +13477,6 @@ type PrivReq = {
   // classified by resolving the name.
   isSharedTempDdl: boolean;
 };
-
-// typeUsesComposite reports whether a column type involves a composite type (directly, or as an array
-// element). A temp table with such a column is deferred this slice (spec/design/temp-tables.md §8)
-// because the session temp snapshot carries no composite-type catalog. Range elements are scalar-only.
-function typeUsesComposite(t: Type): boolean {
-  if (t.kind === "composite") return true;
-  if (t.kind === "array") return typeUsesComposite(t.elem);
-  return false;
-}
 
 // collectStmtPrivs collects the privilege requirements of stmt (spec/design/session.md §5.3).
 // Transaction control carries none (handled before dispatch); DDL just sets isDdl.

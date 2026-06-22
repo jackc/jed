@@ -126,8 +126,28 @@ the table is (`DROP TABLE` removes both). It is reachable by its derived name (`
 temp table — its counter is shared across sessions, so auto-numbering continues from where another
 session left off. Its DDL is gated by the same `allow_temp_ddl` / `allow_shared_temp_ddl` capability.
 
+## Composite-typed columns
+
+A column of a user-defined composite (row) type works on a temp table too (both session-local and
+shared), exactly as on a persistent table:
+
+```sql
+CREATE TYPE addr AS (street text, zip i32);
+CREATE TEMP TABLE person (id i32 PRIMARY KEY, home addr);
+INSERT INTO person VALUES (1, ROW('Main', 90210));
+SELECT (home).zip FROM person WHERE id = 1;   -- 90210
+```
+
+The composite **type** itself is always permanent — `CREATE TYPE` is ordinary persistent DDL — and a
+temp table only **references** it. The column's storage codec is resolved against the type catalog when
+the table is created and is self-contained thereafter, so a temp table with a composite column still
+makes **zero writes to the file**. `ROW(...)` construction, rendering, field access, and
+comparison/ordering all behave exactly as on a persistent column. Because a composite value is never a
+key, a composite column cannot be a `PRIMARY KEY` (`0A000`). Dropping a type that a temp table still
+references is blocked (`2BP01`), just as for a permanent table.
+
 ## Not yet supported on a temp table
 
 This release keeps a few things off temp tables (both session-local and shared — each reported as
-`0A000`, *feature not supported*), to be lifted in later releases: `FOREIGN KEY` constraints, and
-composite-typed and `COLLATE` columns.
+`0A000`, *feature not supported*), to be lifted in later releases: `FOREIGN KEY` constraints and
+`COLLATE` columns.
