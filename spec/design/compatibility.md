@@ -296,18 +296,27 @@ Collation is Tier 2 and the first thing to exercise this model. The decisions re
   *all* its collations are that version, so two columns both `COLLATE "de"` can never disagree.
   Changing a file's version is a deliberate **migration** (rebuild collated indexes), never an
   accident of which binary touched it when.
-- **Reference-only, with degradation (settled).** [collation.md](collation.md) §3 pivoted to
-  **vendor the compiled tables into the binary** (at an embedder-chosen footprint tier) and have the
-  file **reference** them by `name` + version — it **never stores the table**. A binary at the file's
-  pinned version reads-writes fully; a binary at a different version (or a tier lacking the collation)
-  **degrades to read-only heap-scan** (§8) or refuses legibly — never silently re-orders. This is the
-  clean Tier-2 instance: no freeze path, no host-reimport hash, just reference + the graded verdict.
-- **Vendor-vs-bake is decided: vendor (settled).** The size data (all non-CJK collation < ~2 MB, and
-  the universal Unicode property tables for `normalize`/`lower`/regex are vendored regardless) means
-  storing tables per-file would not shrink the distribution — it would only duplicate vendored data
-  and add a cross-version-skew hazard. So collation is **vendored into the binary, referenced from the
-  file, never baked.** ([timezones.md](timezones.md) reaches the same conclusion for tzdata.) This
-  resolves the former open decision (§12).
+- **Reference-only, with degradation (settled).** [collation.md](collation.md) §3 has the file
+  **reference** its collations by `name` + version and **never store the table**; the table itself is
+  **loaded from a host-supplied `JUCD` bundle** (collation.md §9 — Slice 3 supersedes the slice-2
+  "vendor into the binary at a footprint tier" delivery, but the reference-only *on-disk* posture is
+  unchanged). A binary with a loaded bundle at the file's pinned version reads-writes fully; with a
+  bundle at a different version (or none providing the collation) it **degrades to read-only
+  heap-scan** (§8) or refuses legibly — never silently re-orders. This is the clean Tier-2 instance:
+  no freeze path, no host-reimport hash, just reference + the graded verdict.
+- **Delivery is decided: a host-loaded bundle (Slice 3).** Storing tables per-file would not shrink
+  the distribution — it would only duplicate data and add a cross-version-skew hazard — so collation is
+  **referenced from the file, never baked**, and the table is delivered in a bundle the host loads
+  (the footprint is the deployer's choice, not the build's; collation.md §13). The universal Unicode
+  **property/casing** tables ride the **same bundle** on the same `(unicode_version)` axis (collation.md
+  §16), so casing and collation share one version pin. ([timezones.md](timezones.md) vendors tzdata for
+  the same determinism reason; whether it too becomes loadable is an open follow-on.) This resolves the
+  former open decision (§12).
+- **Casing is the same instance.** A functional index on `lower(x)` or a `GENERATED ALWAYS AS
+  (lower(x))` column stores a versioned-casing result — including the **ASCII-baseline vs. Unicode-`X`
+  regime** distinction (collation.md §16) — so it registers into this manifest exactly like a collated
+  index (write-time dependency, §9), degrading to the heap-scan verdict on a regime/version change
+  rather than silently re-folding.
 
 ## 11. The honest hard walls
 

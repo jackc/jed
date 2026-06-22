@@ -151,6 +151,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
               production; version skew handled by [compatibility.md](spec/design/compatibility.md)'s
               manifest + graded verdict (read-only heap-scan / legible refusal). Removes the
               format-17 baked snapshot (a format bump). Sub-slices 2a–2d in collation.md §14.
+              **(Update: 2a/2b/2c/2e have since landed — `format_version 18`, real Unicode-17 root +
+              `es`; only 2d (graded verdict) is pending. See collation.md §14.)**
+        - [ ] **slice 3 — host-loaded Unicode-data bundle** (design landed in collation.md, **not yet
+              built**): the bare binary becomes **pure `C` / ASCII**; collation tables + Unicode casing
+              are **loaded from a host-supplied `JUCD` bundle** (one shared DUCET root + per-locale
+              deltas + a property/casing section, merged at load) via a privileged bytes/reader
+              `db.LoadUnicodeData`, instead of being compiled into each core. The slice-2 footprint
+              *tiers* become **builder-tool bundle presets** (`casing-only` / non-CJK / everything). A
+              **delivery** change only — no `format_version` bump, on-disk goldens unchanged. Sub-slices
+              3a–3e + the `JUCD` byte format ([collation/README.md §5](spec/collation/README.md)) in
+              collation.md §14; lands with/behind the compatibility.md manifest (as 2d).
         - [ ] Further locale/feature expansion (real DUCET + curated tailorings, nondeterministic
               collations, `LIKE` under non-`C`, CLDR `shifted`, CJK tier-3 data) — **possibilities,
               not scheduled work**, collation.md §14.

@@ -44,6 +44,14 @@ pager.
 > `SpillSink` seam with the Node spill backing in `spillfile.ts`; Web Crypto for the entropy default) —
 > the same interface/impl discipline as this `BlockStore` split. It is a TS-only host (Rust/Go have no
 > browser target).
+>
+> **A second host-supplied-bytes path (not a `BlockStore`).** Collation / Unicode-casing data follows
+> the same *host supplies bytes, the engine consumes them* principle but is **not** part of this
+> byte-device seam: a host hands the engine a pinned **Unicode-data bundle** via the handle-scoped,
+> privileged `db.LoadUnicodeData(bytesOrReader)` ([collation.md §4/§9](collation.md)) — bytes/reader,
+> never a path, so the engine still does no I/O. It is closer to the entropy/clock seam
+> ([entropy.md](entropy.md)) — a host-injected input on the `Database` handle — than to the per-page
+> `BlockStore`. A bare engine with no bundle loaded is `C` collation + ASCII casing only.
 
 ## 2. The interface
 

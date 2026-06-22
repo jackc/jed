@@ -323,6 +323,7 @@ only and the engine has no wire protocol).
 | set input-size limit (§8) | `db.set_max_sql_length(bytes)` | `db.SetMaxSQLLength(bytes)` | `db.setMaxSqlLength(bytes)` |
 | inject random source (§10) | `db.set_random_source(f)` / `db.clear_random_source()` | `db.SetRandomSource(f)` / `db.ClearRandomSource()` | `db.setRandomSource(f)` / `db.clearRandomSource()` |
 | inject clock source (§10) | `db.set_clock_source(f)` / `db.clear_clock_source()` | `db.SetClockSource(f)` / `db.ClearClockSource()` | `db.setClockSource(f)` / `db.clearClockSource()` |
+| load Unicode data (collation.md §4) | `db.load_unicode_data(r)` | `db.LoadUnicodeData(r)` | `db.loadUnicodeData(bytes)` |
 | table lookup (catalog) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*Table, bool)` | `db.table(name): Table \| undefined` |
 | table names (catalog) | `db.table_names() -> Vec<String>` | `db.TableNames() []string` | `db.tableNames(): string[]` |
 
@@ -464,3 +465,13 @@ Defaults (unset) read **OS entropy per value** and the **wall clock**: Go `crypt
 `SystemTime`. Neither setting changes what a non-generator query observes; a generator's *cost* is
 invariant to both (one `operator_eval` per call). An out-of-range injected clock makes `uuidv7`
 trap `22008`.
+
+**Unicode-data load (a separate, load-time seam).** Collation tables and Unicode casing data are not
+built into the engine — a host loads them via **`db.load_unicode_data(bytesOrReader)`** (privileged,
+bytes or a reader, **never a path**, **not** SQL-reachable), handing the engine a pinned `JUCD`
+bundle's bytes ([collation.md §4/§9](collation.md)). Unlike the entropy/clock seam this is **not** a
+per-query draw and introduces no nondeterminism — the bytes are jed's own pinned data; like the
+storage seam, the host owns where they come from (a file, a fetch, or a compiled-in `include_bytes!` /
+`//go:embed` / bundled asset) and the engine does no I/O. A bare binary with no bundle loaded is `C`
+collation + ASCII casing only ([collation.md §16](collation.md)). It is a handle setting, additive
+across calls, never a per-statement argument.

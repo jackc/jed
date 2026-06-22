@@ -88,10 +88,12 @@ deliberately keeps **inside** the deterministic contract by paying for it elsewh
   exception.
 - **Collation / Unicode version.** The ICU-version-dependent-ordering trap
   ([types.md](types.md) §11) is exactly an exception jed refuses: it ships one fixed `C`
-  collation precisely so ordering is table-free and version-independent. If linguistic
-  collation ever lands it must **vendor + version-pin** the UCA/CLDR tables as shared spec
-  data (CLAUDE.md §5), turning it back into deterministic data — never a sanctioned
-  exception.
+  collation precisely so ordering is table-free and version-independent. Linguistic collation
+  has since landed ([collation.md](collation.md)) on exactly this footing: it **version-pins**
+  the UCA/CLDR tables as jed's own shared spec data (CLAUDE.md §5) and the engine reads only
+  those pinned bytes — whether compiled in or **loaded from a host-supplied bundle**
+  (collation.md §9), the bytes are identical — turning it back into deterministic data, never a
+  sanctioned exception.
 - **Hash / iteration order.** This is **never** sanctioned — it is a *forbidden leak*
   (CLAUDE.md §8). The distinction from class **U** is sharp: no-`ORDER BY` leaves the row
   *sequence* unasserted while the *multiset* stays exact; an iteration-order leak would

@@ -1,7 +1,7 @@
 # Collation data formats
 
 > The byte-level formats the collation feature ([../design/collation.md](../design/collation.md))
-> consumes and produces, plus the dev fixtures and verification vectors. Three formats are pinned
+> consumes and produces, plus the dev fixtures and verification vectors. Four formats are pinned
 > here, decided **spec-first before coding** (CLAUDE.md §8 — these are "miserable to retrofit"):
 >
 > 1. **The definition format** — what `CompileCollation` parses (§1): the Unicode **DUCET
@@ -9,10 +9,12 @@
 >    ([../design/collation.md §9](../design/collation.md)).
 > 2. **The compiled jed table** — what the UCA executor runs on (§2): a byte-pinned, sorted,
 >    self-describing binary table. Cross-core byte-identical by construction (CLAUDE.md §8).
-> 3. **The portable `.coll` artifact** — the shippable container (§3): magic + metadata +
->    provenance + the LZ4-compressed table; `SaveCollation`/`OpenCollation` are its
->    writer/reader and `ImportCollation` bakes it into a database
+> 3. **The portable `.coll` artifact** — the shippable per-collation container (§3): magic + metadata +
+>    provenance + the LZ4-compressed table; `SaveCollation`/`OpenCollation` are its writer/reader
 >    ([../design/collation.md §4](../design/collation.md)).
+> 4. **The `JUCD` bundle** — the runtime-loaded multi-collation container (§5): a manifest + a shared
+>    DUCET **root** + per-locale tailoring **deltas** + the Unicode **property/casing** section, what a
+>    host hands `db.LoadUnicodeData` (Slice 3, [../design/collation.md §13/§14](../design/collation.md)).
 >
 > The **sort key** the executor emits (§4) is the byte string whose `memcmp` order *is* the
 > collation order — the bridge to jed's `memcmp` storage ([encoding.md §1](../design/encoding.md)).
@@ -31,12 +33,15 @@
 > importing one ([../design/collation.md §2/§9](../design/collation.md)). **Slice 2e landed the real
 > version-pinned data:** the production **vendored** set is now the real CLDR-tailored DUCET — `unicode`
 > (UCA/UCD **17.0.0**, CLDR 48, [17.0.0/root.allkeys](17.0.0/root.allkeys)) and `es` (root + `&N<ñ<<<Ñ`).
-> The dev fixture (§5) is **no longer vendored** — it survives only as the small hand-authored
-> compiler/sort-key **vectors** (§6). Implicit weights / the CJK tier-3 root and the broader locale
+> The dev fixture (§6) is **no longer vendored** — it survives only as the small hand-authored
+> compiler/sort-key **vectors** (§7). Implicit weights / the CJK tier-3 root and the broader locale
 > tailorings (sv/da/de — needing the deferred LDML features) remain follow-ons. The verification
-> vectors (§6) are **populated** — produced by the Rust core
+> vectors (§7) are **populated** — produced by the Rust core
 > (`impl/rust/src/bin/gen_collation_vectors.rs`) and cross-confirmed byte-for-byte by Go and TS
-> (UCA sort keys are not safely hand-authored; §6).
+> (UCA sort keys are not safely hand-authored; §7). **Slice 3 (host-loaded bundle, proposed —
+> [../design/collation.md §14](../design/collation.md)):** the compiled `.coll` tables are packed by a
+> builder tool into a **`JUCD` bundle** (§5) a host *loads* at runtime, rather than being compiled into
+> each core; the bundle shares one DUCET root across locales (per-locale deltas merged at load, §5.1).
 
 ## 1. The definition format (`CompileCollation` input)
 
@@ -142,10 +147,11 @@ ce {                           # one collation element, 7 bytes
 
 ## 3. The portable `.coll` artifact (`SaveCollation` / `OpenCollation`)
 
-The shippable, DB-independent container. A baked catalog snapshot
-([../design/collation.md §5](../design/collation.md)) is **these same bytes** in catalog
-framing, so a golden DB with a baked collation doubles as an artifact golden, and
-`ExportCollation` is a near-copy.
+The shippable, DB-independent **per-collation** container — the unit the build pipeline produces and
+the builder tool packs into a `JUCD` bundle (§5). (Under the earlier baked model a catalog snapshot was
+these same bytes in catalog framing; since slice 2c the on-disk entry is metadata-only
+([../design/collation.md §5](../design/collation.md)) and the table is **loaded from a bundle**, not
+baked — so there is no `ImportCollation`/`ExportCollation`.)
 
 ```
 artifact {
@@ -205,8 +211,8 @@ this section pins the **bytes**, refining the conceptual sketch in
 sort_key = L1-weights ‖ 0x0000 ‖ L2-weights ‖ 0x0000 ‖ L3-weights ‖ 0x0000 ‖ Ckey(original)
 ```
 
-**Worked sketch** (dev-root §5; weights illustrative — the exact bytes are pinned as vectors in
-1b, §6). `"a"` = CE `[.1C47.0020.0002]`, code point U+0061, §2.4 C-key `61 00 01`:
+**Worked sketch** (dev-root §6; weights illustrative — the exact bytes are pinned as vectors in
+1b, §7). `"a"` = CE `[.1C47.0020.0002]`, code point U+0061, §2.4 C-key `61 00 01`:
 
 ```
 1C47        ‖ 0000 ‖ 0020   ‖ 0000 ‖ 0002   ‖ 0000 ‖ 61 00 01
@@ -216,11 +222,112 @@ sort_key = L1-weights ‖ 0x0000 ‖ L2-weights ‖ 0x0000 ‖ L3-weights ‖ 0x
 `"A"` differs only at L3 (`0008` vs `0002`) and at the identical level, so it sorts immediately
 after `"a"` — exactly the deterministic-collation "adjacent, not equal" property.
 
-## 5. The minimal dev fixture
+## 5. The `JUCD` bundle (the shippable Unicode-data container)
+
+The container a host **loads** at runtime via `db.LoadUnicodeData`
+([../design/collation.md §4](../design/collation.md)) — the production delivery vehicle for the §2
+tables and the Unicode property/casing data ([../design/collation.md §16](../design/collation.md)).
+**One Unicode version per bundle.** It is a **manifest-indexed container** of independently-addressable
+**sections**, so a loader takes only what it needs: a `casing-only` host loads just the property
+section; a browser loads the manifest + root, then a locale's delta on demand. It reuses jed's existing
+conventions verbatim — big-endian, `str` = `u16` length + UTF-8, CRC-32/IEEE, LZ4-block bodies
+([../fileformat/lz4.md](../fileformat/lz4.md)).
+
+```
+bundle {
+  u8[6]   magic                 # "JUCD\0\0"  (0x4A 0x55 0x43 0x44 0x00 0x00)
+  u16     format_version        # = 1
+  str     unicode_version       # e.g. "17.0.0"   (the single version axis spanning collation + casing)
+  str     cldr_version          # e.g. "48"       ("" if none / a property-only bundle)
+  str     description           # builder/provenance identity ("" = none; excluded from section hashes)
+  u16     section_count
+  manifest[section_count] {     # the table of contents — sections are addressable without reading bodies
+    u8    kind                  # 0 = property/casing, 1 = root, 2 = tailoring
+    str   name                  # "" for property and root; the collation name (e.g. "es") for a tailoring
+    u32   content_hash          # CRC-32/IEEE over this section's UNCOMPRESSED payload
+    u32   uncompressed_len      # payload length before compression
+    u32   compressed_len        # length of this section's LZ4 block in the body region
+    u32   body_offset           # byte offset of this section's LZ4 block from the start of the bundle
+  }
+  u8[...] body                  # the section LZ4 blocks, in manifest order (each: spec/fileformat/lz4.md)
+  u32     bundle_crc            # CRC-32/IEEE over everything above (header + manifest + bodies)
+}
+```
+
+- **At most one `root` section** (the shared DUCET §2 table, stored **once**); **at most one
+  `property` section**; **any number of `tailoring` sections**, each naming the collation it defines.
+  A bundle with only a property section is the `casing-only` preset
+  ([../design/collation.md §13](../design/collation.md)).
+- **A `tailoring` section is a SPARSE override of the root**, not a full table — this is what lets the
+  root be shared. It reuses the §2 `single` / `contraction` records, but each is an **add-or-replace**
+  against the root keyed by code point / sequence:
+
+  ```
+  tailoring_payload {
+    u8    layout_version            # = 1
+    u32   num_single_overrides      # §2 `single` records that ADD or REPLACE a root mapping, ascending by code point
+    single[num_single_overrides]
+    u32   num_contraction_overrides
+    contraction[num_contraction_overrides]   # §2 `contraction` records, ascending by sequence
+    # (a removal/tombstone form is reserved; the current LDML subset (§1.2) only adds or replaces)
+  }
+  ```
+
+- **A `root` section payload is the §2 compiled table bytes verbatim.**
+- **A `property` section payload** is the Unicode casing table (the first cut ships **case mappings
+  only**; normalization is reserved — [../design/collation.md §16](../design/collation.md)):
+
+  ```
+  property_payload {
+    u8    layout_version            # = 1
+    u32   num_simple                # simple case mappings, ascending by code point
+    simple[num_simple] {
+      u32 codepoint
+      u32 upper                     # simple uppercase (== codepoint if identity)
+      u32 lower                     # simple lowercase
+      u32 title                     # simple titlecase
+    }
+    u32   num_special               # SpecialCasing (full) entries, ascending by code point
+    special[num_special] {
+      u32 codepoint
+      u8  upper_len; u32 upper[upper_len]
+      u8  lower_len; u32 lower[lower_len]
+      u8  title_len; u32 title[title_len]
+      # (conditional/locale context — final-sigma, Turkish dotted-I — reserved; first cut: unconditional only)
+    }
+    # (normalization: combining class + decomposition tables — RESERVED, a later property sub-table)
+  }
+  ```
+
+### 5.1 Load-time merge (`root` + `tailoring` → the §2 table)
+
+Because a tailoring is sparse, `db.LoadUnicodeData` reconstructs the table the executor (§2/§4) expects
+by a **deterministic, spec'd merge** — the executor itself is unchanged:
+
+1. Start from the **root** section's `single` / `contraction` maps.
+2. Apply each override entry: **replace** the root entry with the same key, or **add** it if absent.
+3. **Re-sort** `single[]` ascending by code point and `contraction[]` lexicographically (the §2 total
+   order).
+
+The result is **byte-identical to the fully-resolved `<locale>.coll` table** the build produced for
+that locale (§3) — so `OpenCollation(merge(root, delta))` equals `OpenCollation(<locale>.coll)`. That
+equality is the **merge-identity vector** (§7): `merge(root, es-delta).table == es-full.table`. The
+merge is the one new cross-core routine Slice 3 adds; like the executor it is hand-written per core and
+byte-pinned by vectors (CLAUDE.md §5/§8).
+
+### 5.2 Why a container with a manifest
+
+One artifact + one load call (distribution), while the manifest gives **selective load** (casing-only;
+root + one delta; lazy fetch) and **root-sharing** (the ~0.3 MB root stored once, so a 10-locale bundle
+is ~0.4 MB, not ~3 MB — [../design/collation.md §13](../design/collation.md)). This mirrors ICU's single
+`.dat` + table-of-contents, the time-zone-bundle precedent, and jed's own "one file" storage ethos —
+and keeps casing and collation on one `(unicode_version)` axis so they cannot mismatch.
+
+## 6. The minimal dev fixture
 
 > **Role since slice 2e:** the dev fixtures are **no longer vendored into production** — the real
 > version-pinned root (`unicode`) + `es` are ([17.0.0/](17.0.0/), [../design/collation.md §14](../design/collation.md)).
-> The dev fixtures survive **only** as the small cross-core compiler/sort-key **vectors** (§6): tiny,
+> The dev fixtures survive **only** as the small cross-core compiler/sort-key **vectors** (§7): tiny,
 > hand-auditable definitions that pin the compiler + executor (expansion, a tailoring, an astral code
 > point) without the full ~2.3 MB DUCET.
 
@@ -232,11 +339,11 @@ tailoring that moves a letter's *primary* position:
 - [fixtures/dev-root.allkeys](fixtures/dev-root.allkeys) — `SPACE a A b B z Z ä Ä 😀` with
   DUCET-style weights (`ä`/`Ä` = `a`'s primary + a secondary accent CE, so they sort *near a*;
   `😀` = U+1F600, mapped with a high primary so it sorts last — its purpose is to exercise
-  **code-point** iteration, the TS UTF-16 trap §6, not ordering).
+  **code-point** iteration, the TS UTF-16 trap §7, not ordering).
 - [fixtures/dev-nordic.ldml](fixtures/dev-nordic.ldml) — `&z < ä <<< Ä`, so under this tailoring
   `ä`/`Ä` sort *after z* (the sharp Nordic case that visibly disagrees with the root).
 
-Expected orderings (the bytes are pinned in `vectors/sortkey.toml`, §6; oracle-checkable in a
+Expected orderings (the bytes are pinned in `vectors/sortkey.toml`, §7; oracle-checkable in a
 later slice against `postgres:18` for the locales that map to a real PG collation). Note that the
 multi-character a-words sort *within* the a-group, before `b`:
 
@@ -245,7 +352,7 @@ dev-root     :  ' ' < a < A < ä < Ä < aa < ab < az < a😀 < b < B < z < Z < �
 dev-nordic   :  ' ' < a < A < b < B < z < Z < ä < Ä < 😀                          (ä after z, by tailoring)
 ```
 
-## 6. Verification vectors (populated, slice 1b)
+## 7. Verification vectors (populated, slice 1b)
 
 The cross-core contract (CLAUDE.md §8), the collation analogue of the
 [encoding.md](../design/encoding.md) key vectors. **Populated in 1b**: produced by the Rust core
@@ -263,10 +370,18 @@ asserts the bytes:
   contract; entries are in ascending collation order so the harness also asserts the keys'
   `memcmp` order is strictly increasing. Includes an astral-character case (`😀` U+1F600, the TS
   UTF-16-vs-code-point trap, [types.md §11](../design/types.md)).
-- A **golden DB** with a baked collation snapshot + a collated index lands in 1d/1e
-  (`rust == go == ts == ruby`), doubling as an artifact golden (§3).
+- A **golden DB** with a referenced-collation catalog entry + a collated index
+  (`rust == go == ts == ruby`) pins the metadata-only on-disk entry and the collated B-tree key bytes
+  ([../design/collation.md §5/§10](../design/collation.md)). (Slice 2c shrank the former baked snapshot
+  to this metadata-only entry; Slice 3 leaves it byte-for-byte unchanged — delivery moves, the stored
+  bytes do not.)
+- **`vectors/bundle.toml` (Slice 3a)** — the `JUCD` bundle (§5): `(bundle bytes) → (parsed manifest +
+  per-section round-trip)` (`Open`∘`Save` byte-exact on every core) and the **merge identity**
+  `merge(root, delta).table == full.table` (§5.1), so the load-time root+delta merge is a cross-core
+  byte contract, not per-core code. The existing `compiler.toml` table/artifact bytes are reused as the
+  merge target.
 
-## 7. Cost
+## 8. Cost
 
 Sort-key generation adds a **`collate`** unit to the shared cost schedule
 ([../design/cost.md](../design/cost.md)), charged **per code point** processed (table-bounded
