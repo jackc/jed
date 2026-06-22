@@ -504,18 +504,25 @@ fn lookup_contraction<'a>(coll: &'a Collation, seq: &[u32]) -> Option<&'a [Ce]> 
 
 /// Serialize the compiled table (§2) — the bytes the content hash covers and the artifact carries.
 pub fn serialize_table(coll: &Collation) -> Vec<u8> {
+    serialize_entries(&coll.singles, &coll.contractions)
+}
+
+/// The §2 table-entry bytes (layout_version + singles + contractions). Shared by the `.coll`
+/// artifact (a full table) and the `JUCD` bundle's root / tailoring sections (a full table or a
+/// sparse override — both use this layout, spec/collation/README.md §2/§5).
+fn serialize_entries(singles: &[(u32, Vec<Ce>)], contractions: &[(Vec<u32>, Vec<Ce>)]) -> Vec<u8> {
     let mut out = Vec::new();
     out.push(1u8); // layout_version
-    out.extend_from_slice(&(coll.singles.len() as u32).to_be_bytes());
-    out.extend_from_slice(&(coll.contractions.len() as u32).to_be_bytes());
-    for (cp, ces) in &coll.singles {
+    out.extend_from_slice(&(singles.len() as u32).to_be_bytes());
+    out.extend_from_slice(&(contractions.len() as u32).to_be_bytes());
+    for (cp, ces) in singles {
         out.extend_from_slice(&cp.to_be_bytes());
         out.push(ces.len() as u8);
         for ce in ces {
             push_ce(&mut out, ce);
         }
     }
-    for (seq, ces) in &coll.contractions {
+    for (seq, ces) in contractions {
         out.push(seq.len() as u8);
         for cp in seq {
             out.extend_from_slice(&cp.to_be_bytes());
@@ -735,5 +742,464 @@ impl<'a> Reader<'a> {
         let n = self.u16()? as usize;
         let s = self.take(n)?;
         String::from_utf8(s.to_vec()).map_err(|_| corrupt("collation: artifact string not UTF-8"))
+    }
+    /// A `u8`-length-prefixed run of `u32` code points (the JUCD property section, README §5).
+    fn cps(&mut self) -> Result<Vec<u32>> {
+        let n = self.u8()? as usize;
+        let mut v = Vec::with_capacity(n);
+        for _ in 0..n {
+            v.push(self.u32()?);
+        }
+        Ok(v)
+    }
+}
+
+// ============================================================================================
+// The JUCD Unicode-data bundle (spec/collation/README.md §5) — the host-loaded container.
+//
+// A manifest-indexed container of sections: the Unicode property/casing tables, the shared DUCET
+// root (a full §2 table, stored once, and itself a usable collation under its name), and per-locale
+// tailoring sections (sparse overrides merged onto the root at load — §5.1). The host hands these
+// bytes to `db.LoadUnicodeData`; the engine never reads a file path (collation.md §4/§9/§11). Build
+// is the inverse: pack a root + per-locale diffs (+ property) into a bundle. Reuses the `.coll`
+// conventions verbatim — big-endian, u16-len strings, CRC-32/IEEE, LZ4 bodies.
+// ============================================================================================
+
+/// Unicode property/casing data (README §5). First cut: case mappings only (normalization is a
+/// reserved later sub-table). `simple` is ascending by code point; `special` (full / SpecialCasing)
+/// likewise.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct PropertyTable {
+    /// `(codepoint, upper, lower, title)` simple 1:1 mappings (a field equal to the code point is
+    /// the identity mapping).
+    pub simple: Vec<(u32, u32, u32, u32)>,
+    /// Full (multi-code-point) case mappings — `ß` → `SS`, etc.
+    pub special: Vec<SpecialCasing>,
+}
+
+/// One SpecialCasing (full case mapping) entry (README §5). Conditional/locale context is reserved.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SpecialCasing {
+    pub cp: u32,
+    pub upper: Vec<u32>,
+    pub lower: Vec<u32>,
+    pub title: Vec<u32>,
+}
+
+/// The §2 table entries (singles + contractions) — a full table for a root, a sparse override for a
+/// tailoring — plus the collation `name` the manifest records.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Entries {
+    pub name: String,
+    pub singles: Vec<(u32, Vec<Ce>)>,
+    pub contractions: Vec<(Vec<u32>, Vec<Ce>)>,
+}
+
+/// One bundle section (README §5): the property tables, the shared root, or a per-locale override.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Section {
+    /// `kind 0` — Unicode property/casing tables (no collation name).
+    Property(PropertyTable),
+    /// `kind 1` — the shared DUCET root: a full §2 table and a usable collation under its name.
+    Root(Entries),
+    /// `kind 2` — a per-locale sparse override against the root, merged at load (§5.1).
+    Tailoring(Entries),
+}
+
+/// A parsed `JUCD` bundle (README §5): the shared header version axis + its sections.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Bundle {
+    pub unicode_version: String,
+    pub cldr_version: String,
+    pub description: String,
+    pub sections: Vec<Section>,
+}
+
+const BUNDLE_MAGIC: &[u8; 6] = b"JUCD\0\0";
+
+/// Serialize a `JUCD` bundle (README §5): header, manifest (a table of contents with per-section
+/// offsets), the LZ4-compressed section bodies, and a trailing CRC-32 over everything before it.
+pub fn save_bundle(b: &Bundle) -> Vec<u8> {
+    struct Packed {
+        kind: u8,
+        name: String,
+        hash: u32,
+        raw_len: u32,
+        comp: Vec<u8>,
+    }
+    let packed: Vec<Packed> = b
+        .sections
+        .iter()
+        .map(|s| {
+            let (kind, name, raw) = match s {
+                Section::Property(p) => (0u8, String::new(), serialize_property(p)),
+                Section::Root(e) => (1u8, e.name.clone(), serialize_entries(&e.singles, &e.contractions)),
+                Section::Tailoring(e) => (2u8, e.name.clone(), serialize_entries(&e.singles, &e.contractions)),
+            };
+            Packed {
+                kind,
+                name,
+                hash: crc32_ieee(&raw),
+                raw_len: raw.len() as u32,
+                comp: lz4::compress(&raw),
+            }
+        })
+        .collect();
+
+    // Header.
+    let mut header = Vec::new();
+    header.extend_from_slice(BUNDLE_MAGIC);
+    header.extend_from_slice(&1u16.to_be_bytes()); // format_version
+    push_str(&mut header, &b.unicode_version);
+    push_str(&mut header, &b.cldr_version);
+    push_str(&mut header, &b.description);
+
+    // Manifest length is fixed once the names are known, so body offsets can be computed up front.
+    // Per entry: kind(1) + name(2+len) + hash(4) + raw_len(4) + comp_len(4) + offset(4).
+    let manifest_len: usize =
+        2 + packed.iter().map(|p| 1 + 2 + p.name.len() + 4 + 4 + 4 + 4).sum::<usize>();
+    let body_start = header.len() + manifest_len;
+
+    let mut manifest = Vec::with_capacity(manifest_len);
+    manifest.extend_from_slice(&(packed.len() as u16).to_be_bytes());
+    let mut off = body_start;
+    for p in &packed {
+        manifest.push(p.kind);
+        push_str(&mut manifest, &p.name);
+        manifest.extend_from_slice(&p.hash.to_be_bytes());
+        manifest.extend_from_slice(&p.raw_len.to_be_bytes());
+        manifest.extend_from_slice(&(p.comp.len() as u32).to_be_bytes());
+        manifest.extend_from_slice(&(off as u32).to_be_bytes());
+        off += p.comp.len();
+    }
+    debug_assert_eq!(manifest.len(), manifest_len);
+
+    let mut out = header;
+    out.extend_from_slice(&manifest);
+    for p in &packed {
+        out.extend_from_slice(&p.comp);
+    }
+    let crc = crc32_ieee(&out);
+    out.extend_from_slice(&crc.to_be_bytes());
+    out
+}
+
+/// Read a `JUCD` bundle (README §5). Verifies the trailing CRC, the magic, the format version, and
+/// each section's content hash; a malformed bundle is `XX001` (data_corrupted).
+pub fn open_bundle(bytes: &[u8]) -> Result<Bundle> {
+    if bytes.len() < 4 {
+        return Err(corrupt("bundle: truncated"));
+    }
+    let (body, trailer) = bytes.split_at(bytes.len() - 4);
+    let want = u32::from_be_bytes([trailer[0], trailer[1], trailer[2], trailer[3]]);
+    if crc32_ieee(body) != want {
+        return Err(corrupt("bundle: trailer checksum mismatch"));
+    }
+
+    let mut r = Reader { b: bytes, i: 0 };
+    if r.take(6)? != BUNDLE_MAGIC {
+        return Err(corrupt("bundle: bad magic"));
+    }
+    let fmt = r.u16()?;
+    if fmt != 1 {
+        return Err(corrupt(format!("bundle: unsupported format_version {fmt}")));
+    }
+    let unicode_version = r.str()?;
+    let cldr_version = r.str()?;
+    let description = r.str()?;
+    let count = r.u16()? as usize;
+
+    struct M {
+        kind: u8,
+        name: String,
+        hash: u32,
+        raw_len: usize,
+        comp_len: usize,
+        offset: usize,
+    }
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        entries.push(M {
+            kind: r.u8()?,
+            name: r.str()?,
+            hash: r.u32()?,
+            raw_len: r.u32()? as usize,
+            comp_len: r.u32()? as usize,
+            offset: r.u32()? as usize,
+        });
+    }
+
+    let mut sections = Vec::with_capacity(count);
+    for m in &entries {
+        if m.offset > body.len() || m.offset + m.comp_len > body.len() {
+            return Err(corrupt("bundle: section body out of range"));
+        }
+        let raw = lz4::decompress(&bytes[m.offset..m.offset + m.comp_len], m.raw_len)?;
+        if crc32_ieee(&raw) != m.hash {
+            return Err(corrupt("bundle: section content hash mismatch"));
+        }
+        sections.push(match m.kind {
+            0 => Section::Property(deserialize_property(&raw)?),
+            1 | 2 => {
+                let (singles, contractions) = deserialize_table(&raw)?;
+                let e = Entries {
+                    name: m.name.clone(),
+                    singles,
+                    contractions,
+                };
+                if m.kind == 1 {
+                    Section::Root(e)
+                } else {
+                    Section::Tailoring(e)
+                }
+            }
+            k => return Err(corrupt(format!("bundle: unknown section kind {k}"))),
+        });
+    }
+    Ok(Bundle {
+        unicode_version,
+        cldr_version,
+        description,
+        sections,
+    })
+}
+
+/// Load a bundle (README §5.1): the root section is a usable collation; each tailoring is **merged**
+/// onto the root (byte-identical to its fully-resolved `.coll` table). Every collation takes the
+/// bundle header's `(unicode, cldr)` version + description. Returns the collations and the optional
+/// property table.
+pub fn load_bundle(b: &Bundle) -> Result<(Vec<Collation>, Option<PropertyTable>)> {
+    let root = b.sections.iter().find_map(|s| match s {
+        Section::Root(e) => Some(e),
+        _ => None,
+    });
+    let mk = |name: &str, singles, contractions| Collation {
+        name: name.to_string(),
+        unicode_version: b.unicode_version.clone(),
+        cldr_version: b.cldr_version.clone(),
+        description: b.description.clone(),
+        singles,
+        contractions,
+    };
+
+    let mut colls = Vec::new();
+    let mut property = None;
+    if let Some(r) = root {
+        colls.push(mk(&r.name, r.singles.clone(), r.contractions.clone()));
+    }
+    for s in &b.sections {
+        match s {
+            Section::Property(p) => property = Some(p.clone()),
+            Section::Tailoring(t) => {
+                let r = root.ok_or_else(|| corrupt("bundle: tailoring without a root section"))?;
+                let (singles, contractions) = merge_onto_root(r, t);
+                colls.push(mk(&t.name, singles, contractions));
+            }
+            Section::Root(_) => {}
+        }
+    }
+    Ok((colls, property))
+}
+
+/// Build a `JUCD` bundle (README §5) from a `root` collation, per-locale `tailorings` (each diffed
+/// against the root into a sparse override), and an optional `property` table — the builder tool's
+/// core. The header `(unicode, cldr)` version is the root's.
+pub fn build_bundle(
+    root: &Collation,
+    tailorings: &[&Collation],
+    property: Option<PropertyTable>,
+    description: &str,
+) -> Bundle {
+    let mut sections = Vec::new();
+    if let Some(p) = property {
+        sections.push(Section::Property(p));
+    }
+    sections.push(Section::Root(Entries {
+        name: root.name.clone(),
+        singles: root.singles.clone(),
+        contractions: root.contractions.clone(),
+    }));
+    for t in tailorings {
+        let (singles, contractions) = diff_against_root(t, root);
+        sections.push(Section::Tailoring(Entries {
+            name: t.name.clone(),
+            singles,
+            contractions,
+        }));
+    }
+    Bundle {
+        unicode_version: root.unicode_version.clone(),
+        cldr_version: root.cldr_version.clone(),
+        description: description.to_string(),
+        sections,
+    }
+}
+
+/// Merge a tailoring's sparse override onto the root table (README §5.1): start from the root maps,
+/// replace-or-add each override by key, re-sort. The re-sort uses `BTreeMap`, so singles come out
+/// ascending by code point and contractions lexicographic by sequence — the §2 total order — making
+/// the result byte-identical to the fully-resolved `.coll` table.
+#[allow(clippy::type_complexity)]
+fn merge_onto_root(root: &Entries, delta: &Entries) -> (Vec<(u32, Vec<Ce>)>, Vec<(Vec<u32>, Vec<Ce>)>) {
+    use std::collections::BTreeMap;
+    let mut singles: BTreeMap<u32, Vec<Ce>> = root.singles.iter().cloned().collect();
+    for (cp, ces) in &delta.singles {
+        singles.insert(*cp, ces.clone());
+    }
+    let mut contractions: BTreeMap<Vec<u32>, Vec<Ce>> = root.contractions.iter().cloned().collect();
+    for (seq, ces) in &delta.contractions {
+        contractions.insert(seq.clone(), ces.clone());
+    }
+    (singles.into_iter().collect(), contractions.into_iter().collect())
+}
+
+/// The sparse override (README §5): the `full` table's singles/contractions that the `root` lacks or
+/// maps differently. The current LDML subset only adds or replaces (no removals), so applying this
+/// back onto the root reproduces `full` exactly (§5.1).
+#[allow(clippy::type_complexity)]
+fn diff_against_root(
+    full: &Collation,
+    root: &Collation,
+) -> (Vec<(u32, Vec<Ce>)>, Vec<(Vec<u32>, Vec<Ce>)>) {
+    use std::collections::HashMap;
+    let root_singles: HashMap<u32, Vec<Ce>> = root.singles.iter().cloned().collect();
+    let singles = full
+        .singles
+        .iter()
+        .filter(|entry| root_singles.get(&entry.0) != Some(&entry.1))
+        .cloned()
+        .collect();
+    let root_contractions: HashMap<Vec<u32>, Vec<Ce>> = root.contractions.iter().cloned().collect();
+    let contractions = full
+        .contractions
+        .iter()
+        .filter(|entry| root_contractions.get(&entry.0) != Some(&entry.1))
+        .cloned()
+        .collect();
+    (singles, contractions)
+}
+
+fn serialize_property(p: &PropertyTable) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.push(1u8); // layout_version
+    out.extend_from_slice(&(p.simple.len() as u32).to_be_bytes());
+    for (cp, u, l, t) in &p.simple {
+        out.extend_from_slice(&cp.to_be_bytes());
+        out.extend_from_slice(&u.to_be_bytes());
+        out.extend_from_slice(&l.to_be_bytes());
+        out.extend_from_slice(&t.to_be_bytes());
+    }
+    out.extend_from_slice(&(p.special.len() as u32).to_be_bytes());
+    for sc in &p.special {
+        out.extend_from_slice(&sc.cp.to_be_bytes());
+        push_cps(&mut out, &sc.upper);
+        push_cps(&mut out, &sc.lower);
+        push_cps(&mut out, &sc.title);
+    }
+    out
+}
+
+fn push_cps(out: &mut Vec<u8>, cps: &[u32]) {
+    out.push(cps.len() as u8);
+    for cp in cps {
+        out.extend_from_slice(&cp.to_be_bytes());
+    }
+}
+
+fn deserialize_property(raw: &[u8]) -> Result<PropertyTable> {
+    let mut r = Reader { b: raw, i: 0 };
+    let layout = r.u8()?;
+    if layout != 1 {
+        return Err(corrupt(format!(
+            "bundle: unsupported property layout_version {layout}"
+        )));
+    }
+    let num_simple = r.u32()? as usize;
+    let mut simple = Vec::with_capacity(num_simple);
+    for _ in 0..num_simple {
+        simple.push((r.u32()?, r.u32()?, r.u32()?, r.u32()?));
+    }
+    let num_special = r.u32()? as usize;
+    let mut special = Vec::with_capacity(num_special);
+    for _ in 0..num_special {
+        special.push(SpecialCasing {
+            cp: r.u32()?,
+            upper: r.cps()?,
+            lower: r.cps()?,
+            title: r.cps()?,
+        });
+    }
+    if r.i != r.b.len() {
+        return Err(corrupt("bundle: trailing bytes after property table"));
+    }
+    Ok(PropertyTable { simple, special })
+}
+
+#[cfg(test)]
+mod bundle_tests {
+    use super::*;
+
+    // A small synthetic property section so the casing codec is exercised before `lower`/`upper`
+    // land (Slice 3e): ASCII 'a'<->'A' simple, plus ß -> SS full (SpecialCasing).
+    fn sample_property() -> PropertyTable {
+        PropertyTable {
+            simple: vec![(0x61, 0x41, 0x61, 0x41), (0x41, 0x41, 0x61, 0x41)],
+            special: vec![SpecialCasing {
+                cp: 0x00DF, // ß
+                upper: vec![0x53, 0x53],
+                lower: vec![0x00DF],
+                title: vec![0x53, 0x73],
+            }],
+        }
+    }
+
+    #[test]
+    fn bundle_round_trips_byte_identically_and_merge_reproduces_the_full_table() {
+        let root = vendored_collation("unicode").expect("vendored unicode root");
+        let es = vendored_collation("es").expect("vendored es");
+
+        let bundle = build_bundle(&root, &[&es], Some(sample_property()), "test bundle");
+
+        // Save -> open -> save reproduces the bytes, and the parsed bundle equals the input.
+        let bytes = save_bundle(&bundle);
+        let reopened = open_bundle(&bytes).expect("open_bundle");
+        assert_eq!(reopened, bundle, "parsed bundle differs from the built one");
+        assert_eq!(save_bundle(&reopened), bytes, "bundle round-trip not byte-identical");
+
+        // Load -> the root is usable, and the tailoring merges back to the full `.coll` table.
+        let (colls, property) = load_bundle(&bundle).expect("load_bundle");
+        let loaded_unicode = colls.iter().find(|c| c.name == "unicode").expect("unicode");
+        let loaded_es = colls.iter().find(|c| c.name == "es").expect("es");
+        assert_eq!(
+            serialize_table(loaded_unicode),
+            serialize_table(&root),
+            "root table changed through the bundle"
+        );
+        assert_eq!(
+            serialize_table(loaded_es),
+            serialize_table(&es),
+            "merge(root, es-delta) is not byte-identical to the full es table"
+        );
+        assert_eq!(property.as_ref(), Some(&sample_property()));
+
+        // The es delta is sparse — far smaller than the full es table (root-sharing pays off).
+        let es_delta_singles = match &bundle.sections[2] {
+            Section::Tailoring(e) => e.singles.len(),
+            _ => panic!("expected a tailoring section at index 2"),
+        };
+        assert!(
+            es_delta_singles < es.singles.len(),
+            "es delta ({es_delta_singles}) should be sparse vs the full table ({})",
+            es.singles.len()
+        );
+    }
+
+    #[test]
+    fn open_bundle_rejects_a_tampered_trailer() {
+        let root = vendored_collation("unicode").unwrap();
+        let mut bytes = save_bundle(&build_bundle(&root, &[], None, ""));
+        let n = bytes.len();
+        bytes[n - 1] ^= 0xFF; // corrupt the trailing CRC
+        assert!(open_bundle(&bytes).is_err());
     }
 }

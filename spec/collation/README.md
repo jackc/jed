@@ -243,7 +243,8 @@ bundle {
   u16     section_count
   manifest[section_count] {     # the table of contents — sections are addressable without reading bodies
     u8    kind                  # 0 = property/casing, 1 = root, 2 = tailoring
-    str   name                  # "" for property and root; the collation name (e.g. "es") for a tailoring
+    str   name                  # "" for property; the root collation name (e.g. "unicode") for root;
+                                # the collation name (e.g. "es") for a tailoring
     u32   content_hash          # CRC-32/IEEE over this section's UNCOMPRESSED payload
     u32   uncompressed_len      # payload length before compression
     u32   compressed_len        # length of this section's LZ4 block in the body region
@@ -254,8 +255,9 @@ bundle {
 }
 ```
 
-- **At most one `root` section** (the shared DUCET §2 table, stored **once**); **at most one
-  `property` section**; **any number of `tailoring` sections**, each naming the collation it defines.
+- **At most one `root` section** (the shared DUCET §2 table, stored **once**, and itself a usable
+  collation under its manifest name — e.g. `unicode`); **at most one `property` section**; **any number
+  of `tailoring` sections**, each naming the collation it defines (merged onto the root at load, §5.1).
   A bundle with only a property section is the `casing-only` preset
   ([../design/collation.md §13](../design/collation.md)).
 - **A `tailoring` section is a SPARSE override of the root**, not a full table — this is what lets the
