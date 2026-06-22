@@ -818,17 +818,18 @@ fn identity_table_db() -> Database {
 }
 
 /// A reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column collations): the
-/// vendored dev-root collation set as the per-database default (the `is_default` flag), a column with
-/// an explicit `COLLATE "dev-root"` (flags bit6 + name), an un-annotated column inheriting the default
-/// (bit6 + name), and an explicit `COLLATE "C"` column (no collation, bit6 clear). dev-root is NOT
-/// imported — it is vendored, and its metadata entry is emitted because the schema references it. Must
-/// match the Ruby reference's COLLATION_TABLE (spec/fileformat/verify.rb), spec/design/collation.md §5.
+/// vendored `unicode` collation (the real version-pinned CLDR-DUCET root, UCA/UCD 17.0.0) as the
+/// per-database default (the `is_default` flag), a column with an explicit `COLLATE "unicode"` (flags
+/// bit6 + name), an un-annotated column inheriting the default (bit6 + name), and an explicit
+/// `COLLATE "C"` column (no collation, bit6 clear). `unicode` is NOT imported — it is vendored, and
+/// its metadata entry is emitted because the schema references it. Must match the Ruby reference's
+/// COLLATION_TABLE (spec/fileformat/verify.rb), spec/design/collation.md §5.
 fn collation_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
-    db.set_default_collation("dev-root").unwrap(); // vendored — no import
+    db.set_default_collation("unicode").unwrap(); // vendored — no import
     run(
         &mut db,
-        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\", \
+        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\", \
          plain text, byteorder text COLLATE \"C\")",
     );
     run(&mut db, "INSERT INTO t VALUES (1, 'a', 'b', 'z')");
@@ -837,14 +838,14 @@ fn collation_table_db() -> Database {
 }
 
 /// A collated text PRIMARY KEY + a collated secondary index (slice 1e, encoding.md §2.12): both keys
-/// store the dev-root UCA sort key, so the B-tree iterates in collation order. dev-root is vendored
+/// store the `unicode` UCA sort key, so the B-tree iterates in collation order. `unicode` is vendored
 /// (not the default; its entry is emitted because the columns reference it). Must match the Ruby
 /// reference's COLLATION_PK_TABLE.
 fn collation_pk_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
         &mut db,
-        "CREATE TABLE t (name text COLLATE \"dev-root\" PRIMARY KEY, tag text COLLATE \"dev-root\")",
+        "CREATE TABLE t (name text COLLATE \"unicode\" PRIMARY KEY, tag text COLLATE \"unicode\")",
     );
     run(&mut db, "CREATE INDEX t_tag_idx ON t (tag)");
     // Inserted out of collation order; stored in collation order ('a' < 'z' by the sort key).

@@ -1,0 +1,7 @@
+# jed collation tailoring — Spanish (es), over the version-pinned root (spec/collation/17.0.0/root.allkeys).
+# Source: CLDR 48 common/collation/es.xml <collation type="standard">. Format: LDML rule subset
+# (spec/collation/README.md §1.2). Effect: ñ/Ñ sort as a distinct PRIMARY letter immediately after n,
+# the canonical modern-Spanish ordering (n < ñ < o) — the one real "simple" tailoring that fits the
+# current single-character rule subset (de-phonebook / sv / da need &[before], multi-char anchors,
+# and expansions, deferred to the LDML-features follow-on).
+&N<ñ<<<Ñ

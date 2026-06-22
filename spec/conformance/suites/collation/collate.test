@@ -1,24 +1,23 @@
-# Linguistic collation, slice 1c — the COLLATE expression operator, ORDER BY … COLLATE, and a
-# vendored collation (spec/design/collation.md §1/§6/§7/§14). A collation is VENDORED into the binary
-# (reference-only model, collation.md §2/§9); the `# load-collation:` directive just declares which
-# vendored collation a test needs (a no-op when it is vendored, as the dev collations are; it falls
-# back to compiling the named spec/collation fixture only for a not-yet-vendored name — collation.md
-# §10). `expr COLLATE "name"` and `ORDER BY col COLLATE "name"` then
-# order text by that collation's UCA sort key in the ordering comparisons (< <= > >=). `=`/`<>` stay
-# byte-equality (deterministic-collation equality IS byte-identity — §7). `"C"` is the built-in
-# byte / code-point order. The dev fixtures (collation/fixtures, NOT the real DUCET) map only the
-# small alphabet a/A/b/B/z/Z/ä/Ä/😀 + SPACE, so every collated value below uses only those.
+# Linguistic collation — the COLLATE expression operator, ORDER BY … COLLATE, and the real
+# version-pinned vendored collations (spec/design/collation.md §1/§6/§7/§14). A collation is VENDORED
+# into the binary (reference-only model, collation.md §2/§9); the `# load-collation:` directive just
+# declares which vendored collation a test needs (a no-op assertion when it is vendored — the harness
+# only checks the build vendors it, never compiling the fixture path). `expr COLLATE "name"` and
+# `ORDER BY col COLLATE "name"` order text by that collation's UCA sort key in the ordering
+# comparisons (< <= > >=). `=`/`<>` stay byte-equality (deterministic-collation equality IS
+# byte-identity — §7). `"C"` is the built-in byte / code-point order.
 #
-# Two dev collations with deliberately different order (collation/README.md §5):
-#   dev-root   : a < A < ä < Ä < … < b < … < z   (ä sorts near a, by primary)
-#   dev-nordic : a < A < b < B < z < Z < ä       (&z < ä — ä sorts after z)
+# The vendored set is the real CLDR-DUCET data (UCA/UCD 17.0.0, spec/collation/17.0.0):
+#   unicode : the CLDR-tailored DUCET root — a < A < ä < … < n < ñ < o < … < z   (ä near a; ñ = n+accent)
+#   es      : root + the Spanish tailoring &N<ñ<<<Ñ — ñ is a DISTINCT primary letter after n, so a
+#             whole-letter word boundary appears: 'nz' < 'ña' (every n-word sorts before every ñ-word)
 # and built-in C (byte order): A(0x41) < a(0x61) < b < z < ä(0xC3A4).
 #
 # Format + the `requires` gate: ../../../design/conformance.md.
 # requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.select_no_from, query.where_eq, query.comparison_order, query.order_by, types.i32, types.text, null.three_valued, expr.collate, ddl.collate_column, ddl.unique, ddl.secondary_index, resource.cost_metering
 
-# load-collation: dev-root = collation/fixtures/dev-root.allkeys
-# load-collation: dev-nordic = collation/fixtures/dev-root.allkeys, collation/fixtures/dev-nordic.ldml
+# load-collation: unicode = collation/17.0.0/root.allkeys
+# load-collation: es = collation/17.0.0/root.allkeys, collation/17.0.0/es.ldml
 
 # ============================================================================================
 # COLLATE on an ordering comparison — the collation flips the answer vs C
@@ -30,21 +29,27 @@ SELECT 'ä' < 'z'
 ----
 false
 
-# dev-root: ä sorts near a, so ä < z is TRUE (COLLATE on one operand sets the comparison collation)
+# unicode: ä sorts near a, so ä < z is TRUE (COLLATE on one operand sets the comparison collation)
 query B nosort
-SELECT 'ä' < 'z' COLLATE "dev-root"
+SELECT 'ä' < 'z' COLLATE "unicode"
 ----
 true
 
-# dev-nordic: ä sorts AFTER z, so ä < z is FALSE again — a different collation, a different answer
+# es treats ñ as a distinct letter after n, so 'nz' < 'ña' is TRUE (every n-word precedes every ñ-word)
 query B nosort
-SELECT 'ä' < 'z' COLLATE "dev-nordic"
+SELECT 'nz' < 'ña' COLLATE "es"
+----
+true
+
+# … but under the untailored root ñ is just n+accent, so 'ña' sorts among the n-words: 'nz' < 'ña' FALSE
+query B nosort
+SELECT 'nz' < 'ña' COLLATE "unicode"
 ----
 false
 
 # COLLATE on the left operand works the same (explicit collation propagates to the comparison)
 query B nosort
-SELECT 'ä' COLLATE "dev-root" < 'z'
+SELECT 'ä' COLLATE "unicode" < 'z'
 ----
 true
 
@@ -54,15 +59,15 @@ SELECT 'A' < 'a'
 ----
 true
 
-# … but dev-root orders lowercase before uppercase (a < A): A < a is FALSE
+# … but unicode orders lowercase before uppercase (a < A): A < a is FALSE
 query B nosort
-SELECT 'A' < 'a' COLLATE "dev-root"
+SELECT 'A' < 'a' COLLATE "unicode"
 ----
 false
 
-# <= / >= honor the collation too (ä <= z under dev-root)
+# <= / >= honor the collation too (ä <= z under unicode)
 query B nosort
-SELECT 'ä' >= 'z' COLLATE "dev-root"
+SELECT 'ä' >= 'z' COLLATE "unicode"
 ----
 false
 
@@ -72,28 +77,28 @@ false
 # ============================================================================================
 
 query B nosort
-SELECT 'a' = 'a' COLLATE "dev-root"
+SELECT 'a' = 'a' COLLATE "unicode"
 ----
 true
 
 query B nosort
-SELECT 'a' = 'A' COLLATE "dev-root"
+SELECT 'a' = 'A' COLLATE "unicode"
 ----
 false
 
 query B nosort
-SELECT 'a' <> 'A' COLLATE "dev-nordic"
+SELECT 'a' <> 'A' COLLATE "es"
 ----
 true
 
 # A NULL operand makes a collated ordering comparison UNKNOWN (three-valued, IS NULL → true)
 query B nosort
-SELECT ('a' < NULL COLLATE "dev-root") IS NULL
+SELECT ('a' < NULL COLLATE "unicode") IS NULL
 ----
 true
 
 # ============================================================================================
-# ORDER BY … COLLATE — the same rows in three different orders
+# ORDER BY … COLLATE — the same rows in different orders
 # ============================================================================================
 
 statement ok
@@ -112,25 +117,15 @@ SELECT id FROM people ORDER BY name
 4
 5
 
-# dev-root: a < A < ä < b < z → ids 1, 2, 5, 3, 4
+# unicode: a < A < ä < b < z → ids 1, 2, 5, 3, 4
 query I nosort
-SELECT id FROM people ORDER BY name COLLATE "dev-root"
+SELECT id FROM people ORDER BY name COLLATE "unicode"
 ----
 1
 2
 5
 3
 4
-
-# dev-nordic: a < A < b < z < ä → ids 1, 2, 3, 4, 5
-query I nosort
-SELECT id FROM people ORDER BY name COLLATE "dev-nordic"
-----
-1
-2
-3
-4
-5
 
 # explicit COLLATE "C" overrides back to byte order (= the un-annotated order)
 query I nosort
@@ -142,9 +137,9 @@ SELECT id FROM people ORDER BY name COLLATE "C"
 4
 5
 
-# DESC under a collation reverses the collated order (dev-root descending → z, b, ä, A, a)
+# DESC under a collation reverses the collated order (unicode descending → z, b, ä, A, a)
 query I nosort
-SELECT id FROM people ORDER BY name COLLATE "dev-root" DESC
+SELECT id FROM people ORDER BY name COLLATE "unicode" DESC
 ----
 4
 3
@@ -152,11 +147,33 @@ SELECT id FROM people ORDER BY name COLLATE "dev-root" DESC
 2
 1
 
+# unicode vs es on the SAME rows: 'ña' is n+accent under the root (sorts before 'nz') but a distinct
+# ñ-letter under es (sorts after every n-word) — the ordering literally swaps.
+statement ok
+CREATE TABLE w (id i32 PRIMARY KEY, s text)
+
+statement ok
+INSERT INTO w VALUES (1, 'nz'), (2, 'ña')
+
+# unicode: ñ = n+accent, so 'ña' < 'nz' → ids 2, 1
+query I nosort
+SELECT id FROM w ORDER BY s COLLATE "unicode"
+----
+2
+1
+
+# es: ñ is a distinct letter after n, so 'nz' < 'ña' → ids 1, 2
+query I nosort
+SELECT id FROM w ORDER BY s COLLATE "es"
+----
+1
+2
+
 # ============================================================================================
 # Errors
 # ============================================================================================
 
-# an unloaded collation name is 42704 (undefined_object)
+# an unvendored collation name is 42704 (undefined_object)
 statement error 42704
 SELECT 'a' < 'b' COLLATE "no_such_collation"
 
@@ -166,17 +183,17 @@ SELECT 1 COLLATE "C"
 
 # two DIFFERENT explicit collations in one comparison conflict — 42P21 (collation_mismatch)
 statement error 42P21
-SELECT 'a' COLLATE "dev-root" < 'b' COLLATE "dev-nordic"
+SELECT 'a' COLLATE "unicode" < 'b' COLLATE "es"
 
 # the SAME explicit collation on both sides is NOT a conflict
 query B nosort
-SELECT 'a' COLLATE "dev-root" < 'b' COLLATE "dev-root"
+SELECT 'a' COLLATE "unicode" < 'b' COLLATE "unicode"
 ----
 true
 
 # ORDER BY a non-text column with COLLATE is 42804
 statement error 42804
-SELECT id FROM people ORDER BY id COLLATE "dev-root"
+SELECT id FROM people ORDER BY id COLLATE "unicode"
 
 # ============================================================================================
 # Per-column COLLATE (slice 1d) — a column's collation is frozen at CREATE TABLE and becomes its
@@ -184,12 +201,12 @@ SELECT id FROM people ORDER BY id COLLATE "dev-root"
 # ============================================================================================
 
 statement ok
-CREATE TABLE c1 (id i32 PRIMARY KEY, name text COLLATE "dev-root")
+CREATE TABLE c1 (id i32 PRIMARY KEY, name text COLLATE "unicode")
 
 statement ok
 INSERT INTO c1 VALUES (1, 'a'), (2, 'A'), (3, 'b'), (4, 'z'), (5, 'ä')
 
-# ORDER BY with NO explicit COLLATE uses the column's frozen dev-root collation → a < A < ä < b < z
+# ORDER BY with NO explicit COLLATE uses the column's frozen unicode collation → a < A < ä < b < z
 query I nosort
 SELECT id FROM c1 ORDER BY name
 ----
@@ -210,7 +227,7 @@ SELECT id FROM c1 ORDER BY name COLLATE "C"
 5
 
 # a comparison against a literal uses the column's implicit collation (the literal takes its
-# neighbour's): ä < z is TRUE under the column's dev-root
+# neighbour's): ä < z is TRUE under the column's unicode collation
 query I rowsort
 SELECT id FROM c1 WHERE name < 'b'
 ----
@@ -219,9 +236,9 @@ SELECT id FROM c1 WHERE name < 'b'
 5
 
 # two columns with DIFFERENT implicit collations, compared with no explicit COLLATE → 42P22
-# (indeterminate_collation). C counts as a distinct implicit collation, so dev-root vs C conflicts.
+# (indeterminate_collation). C counts as a distinct implicit collation, so unicode vs C conflicts.
 statement ok
-CREATE TABLE c2 (a text COLLATE "dev-root", b text COLLATE "dev-nordic", c text COLLATE "C")
+CREATE TABLE c2 (a text COLLATE "unicode", b text COLLATE "es", c text COLLATE "C")
 
 statement ok
 INSERT INTO c2 VALUES ('a', 'z', 'b')
@@ -232,17 +249,17 @@ SELECT a < b FROM c2
 statement error 42P22
 SELECT a < c FROM c2
 
-# an explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') under dev-root = true
+# an explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') under unicode = true
 query B nosort
-SELECT a < b COLLATE "dev-root" FROM c2
+SELECT a < b COLLATE "unicode" FROM c2
 ----
 true
 
 # COLLATE on a non-text column in CREATE TABLE is 42804 (datatype_mismatch)
 statement error 42804
-CREATE TABLE bad1 (a i32 COLLATE "dev-root")
+CREATE TABLE bad1 (a i32 COLLATE "unicode")
 
-# an unloaded collation name in a column COLLATE is 42704 (undefined_object)
+# an unvendored collation name in a column COLLATE is 42704 (undefined_object)
 statement error 42704
 CREATE TABLE bad2 (a text COLLATE "no_such_collation")
 
@@ -253,7 +270,7 @@ CREATE TABLE bad2 (a text COLLATE "no_such_collation")
 
 # cost: 6
 query B nosort
-SELECT 'aä' < 'az' COLLATE "dev-root"
+SELECT 'aä' < 'az' COLLATE "unicode"
 ----
 true
 
@@ -274,7 +291,7 @@ false
 
 # a collated text PRIMARY KEY admits 'a' and 'A' (distinct under a deterministic collation)
 statement ok
-CREATE TABLE k1 (name text COLLATE "dev-root" PRIMARY KEY)
+CREATE TABLE k1 (name text COLLATE "unicode" PRIMARY KEY)
 
 statement ok
 INSERT INTO k1 VALUES ('z'), ('a'), ('b'), ('A')
@@ -307,7 +324,7 @@ a
 
 # a collated UNIQUE constraint: distinct byte values admitted, a byte-duplicate rejected
 statement ok
-CREATE TABLE k2 (id i32 PRIMARY KEY, name text COLLATE "dev-root" UNIQUE)
+CREATE TABLE k2 (id i32 PRIMARY KEY, name text COLLATE "unicode" UNIQUE)
 
 statement ok
 INSERT INTO k2 VALUES (1, 'a'), (2, 'A'), (3, 'b')
@@ -316,9 +333,9 @@ statement error 23505
 INSERT INTO k2 VALUES (4, 'a')
 
 # a collated SECONDARY INDEX — ORDER BY the indexed column uses its frozen collation
-# dev-root: a < A < ä < z, so ids → 2, 4, 3, 1
+# unicode: a < A < ä < z, so ids → 2, 4, 3, 1
 statement ok
-CREATE TABLE k3 (id i32 PRIMARY KEY, name text COLLATE "dev-root")
+CREATE TABLE k3 (id i32 PRIMARY KEY, name text COLLATE "unicode")
 
 statement ok
 CREATE INDEX k3_name ON k3 (name)

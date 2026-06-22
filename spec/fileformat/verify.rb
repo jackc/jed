@@ -828,36 +828,37 @@ IDENTITY_TABLE = {
 }.freeze
 
 # collation_table (v18): a reference-only COLLATION entry (entry_kind 3) + per-column collations. The
-# dev-root collation is referenced and set as the per-database default (the is_default flag); the entry
-# is metadata only — name + version pin + description, NO table (the table is vendored into the binary,
-# spec/design/collation.md §2/§5/§9). dev-root's metadata comes from its @version record: unicode
-# "0.0.0-dev", no cldr, no description. `name` carries an explicit COLLATE "dev-root" (flags bit6 +
-# name), `plain` is un-annotated and inherits the default (also dev-root, frozen), and `byteorder`
-# carries explicit COLLATE "C" → no collation (bit6 clear). Must match the cores' collation_table_db.
+# real `unicode` collation (the version-pinned CLDR-DUCET root, UCA/UCD 17.0.0) is referenced and set
+# as the per-database default (the is_default flag); the entry is metadata only — name + version pin +
+# description, NO table (the table is vendored into the binary, spec/design/collation.md §2/§5/§9).
+# `unicode`'s metadata comes from its @version record: unicode "17.0.0", no cldr record, no
+# description. `name` carries an explicit COLLATE "unicode" (flags bit6 + name), `plain` is
+# un-annotated and inherits the default (also unicode, frozen), and `byteorder` carries explicit
+# COLLATE "C" → no collation (bit6 clear). Must match the cores' collation_table_db.
 COLLATION_TABLE = {
   collations: [
-    { name: "dev-root", default: true, unicode: "0.0.0-dev", cldr: "", desc: "" }
+    { name: "unicode", default: true, unicode: "17.0.0", cldr: "", desc: "" }
   ],
   tables: [{ name: "t",
              columns: [col("id", "i32", pk: true),
-                       col("name", "text", collation: "dev-root"),
-                       col("plain", "text", collation: "dev-root"),
+                       col("name", "text", collation: "unicode"),
+                       col("plain", "text", collation: "unicode"),
                        col("byteorder", "text", collation: nil)],
              rows: [[1, "a", "b", "z"], [2, "z", "a", "a"]] }]
 }.freeze
 
 # A collated text PRIMARY KEY + a collated secondary index (slice 1e, encoding.md §2.12): both keys
-# store the dev-root UCA SORT KEY, not the raw UTF-8, so the B-tree iterates in COLLATION order. The
-# baked dev-root snapshot travels with the file (entry_kind 3). The key sort-key bytes are the pinned
-# spec/collation/vectors/sortkey.toml vectors (collated_sort_key). Must match the cores'
+# store the `unicode` UCA SORT KEY, not the raw UTF-8, so the B-tree iterates in COLLATION order. The
+# reference-only `unicode` metadata entry travels with the file (entry_kind 3). The key sort-key bytes
+# are the pinned spec/collation/vectors/sortkey.toml vectors (collated_sort_key). Must match the cores'
 # collation_pk_table_db (spec/design/collation.md §8).
 COLLATION_PK_TABLE = {
   collations: [
-    { name: "dev-root", default: false, unicode: "0.0.0-dev", cldr: "", desc: "" }
+    { name: "unicode", default: false, unicode: "17.0.0", cldr: "", desc: "" }
   ],
   tables: [{ name: "t",
-             columns: [col("name", "text", pk: true, collation: "dev-root"),
-                       col("tag", "text", collation: "dev-root")],
+             columns: [col("name", "text", pk: true, collation: "unicode"),
+                       col("tag", "text", collation: "unicode")],
              indexes: [{ name: "t_tag_idx", cols: [1] }],
              rows: [["a", "b"], ["z", "a"]] }]
 }.freeze

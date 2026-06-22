@@ -5,9 +5,11 @@
 //! impl/go/collation_test.go and impl/ts/tests/collation.test.ts.
 
 use jed::collation::{
-    compile_collation, open_collation, save_collation, serialize_table, sort_key,
+    Collation, compile_collation, open_collation, save_collation, serialize_table, sort_key,
+    vendored_collation,
 };
 use std::path::Path;
+use std::sync::Arc;
 
 fn spec(rel: &str) -> String {
     let path = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -69,7 +71,7 @@ fn sortkey_matches_vectors_and_is_strictly_ascending() {
     assert!(!vectors.is_empty(), "no sortkey vectors");
 
     let mut last_coll = String::new();
-    let mut coll = None;
+    let mut coll: Option<Arc<Collation>> = None;
     let mut prev_key: Option<Vec<u8>> = None;
 
     for vec in vectors {
@@ -78,8 +80,13 @@ fn sortkey_matches_vectors_and_is_strictly_ascending() {
         let expected = vec["sortkey_hex"].as_str().unwrap();
 
         if coll_name != last_coll {
-            let def = definition(vec["def_files"].as_array().unwrap());
-            coll = Some(compile_collation(coll_name, &def).unwrap());
+            // The real version-pinned collations (`unicode`, `es`) are resolved from the embedded
+            // `.coll` — the production read path — rather than recompiling their ~2.3 MB source. The
+            // small dev fixtures (not vendored) are compiled from their definition files.
+            coll = Some(vendored_collation(coll_name).unwrap_or_else(|| {
+                let def = definition(vec["def_files"].as_array().unwrap());
+                Arc::new(compile_collation(coll_name, &def).unwrap())
+            }));
             last_coll = coll_name.to_string();
             prev_key = None;
         }

@@ -12,6 +12,7 @@ import {
   saveCollation,
   serializeTable,
   sortKey,
+  vendoredCollation,
 } from "../src/collation.ts";
 import { readTomlTables, specPath } from "./tomlmini.ts";
 import { bytesToHex } from "./util.ts";
@@ -58,7 +59,10 @@ test("collation sort keys match vectors and are strictly ascending", () => {
     const s = row.str("string");
     const want = row.str("sortkey_hex");
     if (collName !== lastColl) {
-      coll = compileCollation(collName, definition(row.strs("def_files")));
+      // The real version-pinned collations (unicode, es) resolve from the embedded .coll — the
+      // production read path — rather than recompiling their ~2.3 MB source. The small dev fixtures
+      // (not vendored) are compiled from their definition files.
+      coll = vendoredCollation(collName) ?? compileCollation(collName, definition(row.strs("def_files")));
       lastColl = collName;
       prev = null;
     }

@@ -4,7 +4,8 @@
 # (CLAUDE.md §8). Do not hand-edit. Format: spec/collation/README.md §4. Within one
 # collation the entries are in ascending sort order, so the harness also checks the
 # sort keys' memcmp order matches. Includes an astral case (😀, U+1F600) — the TS
-# UTF-16-vs-code-point trap (types.md §11).
+# UTF-16-vs-code-point trap (types.md §11). The `unicode`/`es` cases are over the real
+# version-pinned vendored table; the harness resolves them via the embedded .coll.
 
 schema_version = 1
 
@@ -151,3 +152,135 @@ coll_name = "dev-nordic"
 def_files = ["collation/fixtures/dev-root.allkeys", "collation/fixtures/dev-nordic.ldml"]
 string = "😀"
 sortkey_hex = "400000000020000000020000f09f98800001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "😀"
+sortkey_hex = "1caa00000020000000020000f09f98800001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "a"
+sortkey_hex = "23ec00000020000000020000610001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "A"
+sortkey_hex = "23ec00000020000000080000410001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "ä"
+sortkey_hex = "23ec00000020002b0000000200020000c3a40001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "b"
+sortkey_hex = "240600000020000000020000620001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "é"
+sortkey_hex = "24530000002000240000000200020000c3a90001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "n"
+sortkey_hex = "2571000000200000000200006e0001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "ñ"
+sortkey_hex = "257100000020002d0000000200020000c3b10001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "ña"
+sortkey_hex = "257123ec00000020002d002000000002000200020000c3b1610001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "nz"
+sortkey_hex = "257126ee00000020002000000002000200006e7a0001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "o"
+sortkey_hex = "2598000000200000000200006f0001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "z"
+sortkey_hex = "26ee000000200000000200007a0001"
+
+[[sortkey]]
+coll_name = "unicode"
+def_files = ["collation/17.0.0/root.allkeys"]
+string = "Z"
+sortkey_hex = "26ee000000200000000800005a0001"
+
+[[sortkey]]
+coll_name = "es"
+def_files = ["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"]
+string = "a"
+sortkey_hex = "23ec00000020000000020000610001"
+
+[[sortkey]]
+coll_name = "es"
+def_files = ["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"]
+string = "n"
+sortkey_hex = "2571000000200000000200006e0001"
+
+[[sortkey]]
+coll_name = "es"
+def_files = ["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"]
+string = "N"
+sortkey_hex = "2571000000200000000800004e0001"
+
+[[sortkey]]
+coll_name = "es"
+def_files = ["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"]
+string = "nz"
+sortkey_hex = "257126ee00000020002000000002000200006e7a0001"
+
+[[sortkey]]
+coll_name = "es"
+def_files = ["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"]
+string = "ñ"
+sortkey_hex = "257300000020000000020000c3b10001"
+
+[[sortkey]]
+coll_name = "es"
+def_files = ["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"]
+string = "Ñ"
+sortkey_hex = "257300000020000000080000c3910001"
+
+[[sortkey]]
+coll_name = "es"
+def_files = ["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"]
+string = "ña"
+sortkey_hex = "257323ec0000002000200000000200020000c3b1610001"
+
+[[sortkey]]
+coll_name = "es"
+def_files = ["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"]
+string = "o"
+sortkey_hex = "2598000000200000000200006f0001"
+
+[[sortkey]]
+coll_name = "es"
+def_files = ["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"]
+string = "z"
+sortkey_hex = "26ee000000200000000200007a0001"

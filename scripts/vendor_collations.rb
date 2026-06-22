@@ -31,10 +31,13 @@ def b64(bytes) = [bytes].pack("m0")
 ROOT = File.expand_path("..", __dir__)
 SRC  = File.join(ROOT, "spec/collation/fixtures")
 
-# The dev fixture set vendored today (collation.md §14, slice 2a). The real version-pinned DUCET +
-# curated tailorings and the embedder-chosen footprint tiers (§13) replace this in a later slice.
-# `stem => file` — the stem is the registry key the cores parse back to the artifact's own name.
-COLLATIONS = { "dev-root" => "dev-root.coll", "dev-nordic" => "dev-nordic.coll" }.freeze
+# The real version-pinned vendored set (collation.md §9/§14): `unicode` = the CLDR-tailored DUCET root
+# (UCA/UCD 17.0.0, spec/collation/17.0.0), `es` = root + the Spanish ñ tailoring. The embedder-chosen
+# footprint tiers (§13) and the broader tailoring set (sv/da/de — needing the deferred LDML
+# `[before]`/expansion features) are later slices. The `dev-*` fixtures are NOT vendored — they only
+# drive the cross-core compiler/sort-key vectors. `stem => file` — the stem is the registry key the
+# cores parse back to the artifact's own embedded name.
+COLLATIONS = { "unicode" => "unicode.coll", "es" => "es.coll" }.freeze
 
 GO_DIR = "impl/go/collationdata"          # raw `.coll` copies (//go:embed)
 TS_MODULE = "impl/ts/src/collationdata/vendored.ts" # generated base64 module (browser-safe)

@@ -43,10 +43,17 @@
 >   `LoadHostCollation`); and **the host seam in the running engine** — `ExtractHostCollation` and
 >   `CompileCollation` become **build-time tooling** that regenerates the vendored `.coll` set (§9),
 >   compiled out of the production engine.
-> - **Not yet built:** the build-time vendoring pipeline, the real version-pinned DUCET + curated
->   tailorings (still the §14 follow-on), and the [compatibility.md](compatibility.md)
->   manifest/verdict that reference-only leans on — so until those land, `C` remains the only
->   collation a production build actually carries.
+> - **Landed since (slice 1f):** the **real version-pinned DUCET root** — `unicode`, the CLDR-tailored
+>   DUCET (UCA/UCD **17.0.0**, CLDR 48, `spec/collation/17.0.0/root.allkeys`, the table ICU/PostgreSQL
+>   use) — and `es` (root + the Spanish `&N<ñ<<<Ñ` tailoring) replace the `dev-*` fixtures in the
+>   production **vendored** set, in all three cores + the Ruby reference (byte-identical `.coll`,
+>   oracle-clean against `postgres:18`'s ICU for the covered letters). The `dev-*` fixtures are
+>   retained **only** as the small cross-core compiler/sort-key vectors. CJK/implicit-weight ranges
+>   (tier-3) raise `0A000`; the embedder-chosen footprint tiers (§13) and the broader tailoring set
+>   (sv/da/de — needing the deferred LDML `[before]`/expansion/contraction features) remain follow-ons.
+> - **Not yet built:** the embedder-chosen footprint tiers (§13), implicit weights / the full CJK
+>   tier-3 root, the broader LDML tailoring features (and the sv/da/de tailorings that need them), and
+>   the [compatibility.md](compatibility.md) manifest/verdict that reference-only leans on (§2d).
 >
 > Two foundational choices are unchanged: the definition format is the **UCA/CLDR standards** (DUCET
 > `allkeys.txt` + LDML), and the `.coll` **compiled artifact is the one shared cross-core form** every
@@ -567,7 +574,10 @@ is adopted the on-disk policy remains clean-break exact-version
 ## 13. Sizes — the three vendoring tiers
 
 The footprint is now a **binary build choice**, not a per-file cost (§3). The embedder picks one of
-three **cumulative tiers** at build/link time; the file carries only metadata regardless.
+three **cumulative tiers** at build/link time; the file carries only metadata regardless. *(The tier
+**mechanism** is not built yet — slice 2e vendors the real root unconditionally, so every current
+build carries the `unicode` root + `es` (~0.3 MB each, the tier-2 column below); the build flag that
+gates which `.coll` embed is a follow-on, §14.)*
 
 | Tier | Vendored collation data | Compiled size (LZ4) |
 |---|---|---|
@@ -680,8 +690,7 @@ leans on:
   distributes them per core (Rust `include_bytes!`es spec/ directly; Go gets raw copies +
   `//go:embed`; the browser-safe TS core gets a generated base64 module), with a `rake verify` drift
   gate. **Still pending:** moving `ExtractHostCollation`/`CompileCollation` to a build/tools target
-  compiled *out of* production (§4.1), and the real version-pinned DUCET + curated non-CJK tailorings
-  (`en-US`, `de`, `fr`, `es`, `sv`, `da`) replacing the dev fixtures (the §9 pipeline proper).
+  compiled *out of* production (§4.1).
 - **2b — vendored read path** ✅ *landed (all three cores)*: each core embeds the vendored `.coll`
   and resolves a collation by name from it (`resolveCollation`: referenced set, then vendored), so a
   collation is usable with **no import** — the database references it by name and the table comes from
@@ -701,6 +710,23 @@ leans on:
   [compatibility.md](compatibility.md) manifest + open-time verdict (full / read-only heap-scan /
   legible refusal) and the `REINDEX`/`COLLATION UPGRADE` migration. Requires `XX002` registered
   ([compatibility.md §7](compatibility.md)).
+- **2e — real version-pinned root + first tailoring** ✅ *landed (all three cores + Ruby)*: the
+  `dev-*` fixtures are replaced in the production **vendored** set by the real CLDR-tailored DUCET
+  root — `unicode` (UCA/UCD **17.0.0**, CLDR 48, `spec/collation/17.0.0/root.allkeys` ≈ the CLDR
+  `allkeys_CLDR.txt`, the table ICU/PostgreSQL actually use) — plus `es` (root + `&N<ñ<<<Ñ`, the one
+  CLDR tailoring that fits the current single-character rule subset). The compiler's working map went
+  `Vec → HashMap` so it ingests the ~39 k-mapping root in O(n) (build-time only; the output is sorted,
+  so the `.coll` bytes and the dev vectors are unchanged). The `.coll` (~0.3 MB each, the §13 tier-2
+  budget) is embedded by every core (Rust `include_bytes!`, Go `//go:embed`, TS base64) and is
+  byte-identical; the `dev-*` fixtures survive **only** as the small `compiler.toml`/`sortkey.toml`
+  vectors. Orderings are oracle-checked against `postgres:18`'s ICU (`ä` near `a`, lowercase before
+  uppercase, `es`: `'nz' < 'ña'` — ñ a distinct letter; root: `'ña' < 'nz'` — ñ = n+accent). Pinned to
+  Unicode 17.0 (the current version; what PostgreSQL 19's ICU will use) — the curated common code
+  points are version-stable, so the orderings still match the live oracle's ICU 16.0. CJK and other
+  `@implicitweights` ranges raise `0A000` (implicit weights deferred). **Still pending:** the footprint
+  tiers (§13), implicit weights / the CJK tier-3 root, and the broader tailorings (sv/da/de needing the
+  deferred LDML `[before]`/expansion/contraction features + a real weight allocator — the dense
+  insertions exhaust the current midpoint allocator).
 
 **Possible later follow-ons** — **none scheduled or committed**; recorded as candidate
 directions the machinery leaves open, *not* a roadmap or a TODO list. Each would be its

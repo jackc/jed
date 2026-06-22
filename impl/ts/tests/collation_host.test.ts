@@ -33,30 +33,40 @@ function exec(db: Database, sql: string): void {
 
 // ---- the vendored set (the engine-global build property) ----
 
-test("vendoredCollations is the dev fixtures", () => {
-  // vendoredCollations() reports what THIS BUILD provides — the dev fixture set, ascending by name, no
-  // isDefault (a build property, not a per-db one). C is built in and never listed.
+test("vendoredCollations is the real set", () => {
+  // vendoredCollations() reports what THIS BUILD provides — the real version-pinned set (es, unicode),
+  // ascending by name, no isDefault (a build property, not a per-db one). C is built in and never
+  // listed. The pin is UCA/UCD 17.0.0 (spec/collation/17.0.0).
   const v = vendoredCollations();
   assert.deepEqual(
     v.map((c) => c.name),
-    ["dev-nordic", "dev-root"],
+    ["es", "unicode"],
   );
   assert.ok(v.every((c) => !c.isDefault));
-  assert.equal(v[1]!.name, "dev-root");
-  assert.equal(v[1]!.unicodeVersion, "0.0.0-dev");
-  assert.notEqual(vendoredCollation("dev-root"), undefined);
+  assert.equal(v[1]!.name, "unicode");
+  assert.equal(v[1]!.unicodeVersion, "17.0.0");
+  assert.notEqual(vendoredCollation("unicode"), undefined);
+  assert.notEqual(vendoredCollation("es"), undefined);
   assert.equal(vendoredCollation("C"), undefined);
 });
 
 // ---- using a vendored collation needs NO import ----
 
 test("vendored collation used in an expression", () => {
-  // COLLATE "dev-root" resolves from the binary's vendored set with no import: 'ä' < 'z' is true under
-  // dev-root (ä near a), the opposite of the C byte order where it is false. A transient query COLLATE
+  // COLLATE "unicode" resolves from the binary's vendored set with no import: 'ä' < 'z' is true under
+  // the root (ä near a), the opposite of the C byte order where it is false. A transient query COLLATE
   // does not make the database REFERENCE the collation, so db.collations() stays empty.
   const db = new Database();
   assert.equal(db.collations().length, 0);
-  assert.deepEqual(query(db, `SELECT 'ä' < 'z' COLLATE "dev-root"`), [["true"]]);
+  assert.deepEqual(query(db, `SELECT 'ä' < 'z' COLLATE "unicode"`), [["true"]]);
+});
+
+test("es orders ñ as a distinct letter", () => {
+  // The es tailoring (&N<ñ<<<Ñ) makes ñ a distinct PRIMARY letter after n: 'nz' < 'ña' (n < ñ),
+  // whereas under the untailored root ñ is n+accent so 'ña' < 'nz'. The Spanish-collation headline.
+  const db = new Database();
+  assert.deepEqual(query(db, `SELECT 'nz' < 'ña' COLLATE "es"`), [["true"]]);
+  assert.deepEqual(query(db, `SELECT 'nz' < 'ña' COLLATE "unicode"`), [["false"]]);
 });
 
 test("unknown collation is 42704", () => {
@@ -66,16 +76,16 @@ test("unknown collation is 42704", () => {
 });
 
 test("per-column collation orders implicitly and is referenced", () => {
-  // A column declared COLLATE "dev-root" (vendored, no import) sorts by that collation with no explicit
-  // COLLATE on the query — dev-root puts ä next to a. Because the SCHEMA now references dev-root,
+  // A column declared COLLATE "unicode" (vendored, no import) sorts by that collation with no explicit
+  // COLLATE on the query — unicode puts ä next to a. Because the SCHEMA now references unicode,
   // db.collations() (the per-file view) lists exactly it.
   const db = new Database();
-  exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root")`);
+  exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode")`);
   exec(db, `INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')`);
   assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name`), [["a"], ["ä"], ["z"]]);
   const refs = db.collations();
   assert.equal(refs.length, 1);
-  assert.equal(refs[0]!.name, "dev-root");
+  assert.equal(refs[0]!.name, "unicode");
   assert.equal(refs[0]!.isDefault, false); // referenced by a column, but not the db default
   // An explicit COLLATE "C" on the query overrides back to byte order (ä is 2-byte UTF-8 → after z).
   assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name COLLATE "C"`), [
@@ -87,28 +97,28 @@ test("per-column collation orders implicitly and is referenced", () => {
 
 test("implicit conflict is 42P22", () => {
   // Two columns with DIFFERENT implicit (vendored) collations compared with no explicit COLLATE →
-  // 42P22 (PG-matching). C counts as a distinct implicit collation, so dev-root vs C also conflicts.
+  // 42P22 (PG-matching). C counts as a distinct implicit collation, so unicode vs C also conflicts.
   const db = new Database();
   exec(
     db,
-    `CREATE TABLE t (a text COLLATE "dev-root", b text COLLATE "dev-nordic", c text COLLATE "C")`,
+    `CREATE TABLE t (a text COLLATE "unicode", b text COLLATE "es", c text COLLATE "C")`,
   );
   exec(db, `INSERT INTO t VALUES ('a','z','b')`);
   assert.equal(errCode(() => query(db, `SELECT a < b FROM t`)), "42P22");
   assert.equal(errCode(() => query(db, `SELECT a < c FROM t`)), "42P22");
   // An explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') = true.
-  assert.deepEqual(query(db, `SELECT a < b COLLATE "dev-root" FROM t`), [["true"]]);
+  assert.deepEqual(query(db, `SELECT a < b COLLATE "unicode" FROM t`), [["true"]]);
   // The table references both vendored collations → db.collations() lists them (sorted).
   assert.deepEqual(
     db.collations().map((c) => c.name),
-    ["dev-nordic", "dev-root"],
+    ["es", "unicode"],
   );
 });
 
 test("COLLATE column errors (non-text 42804, unknown 42704)", () => {
   const db = new Database();
   assert.equal(
-    errCode(() => exec(db, `CREATE TABLE t (a i32 COLLATE "dev-root")`)),
+    errCode(() => exec(db, `CREATE TABLE t (a i32 COLLATE "unicode")`)),
     "42804",
   );
   assert.equal(
@@ -125,16 +135,16 @@ test("default collation inherited by unannotated column", () => {
   const db = new Database();
   assert.equal(db.defaultCollation(), "C");
   exec(db, `CREATE TABLE before (id i32 PRIMARY KEY, name text)`);
-  db.setDefaultCollation("dev-root");
-  assert.equal(db.defaultCollation(), "dev-root");
+  db.setDefaultCollation("unicode");
+  assert.equal(db.defaultCollation(), "unicode");
   exec(db, `CREATE TABLE after (id i32 PRIMARY KEY, name text)`);
   exec(db, `INSERT INTO after VALUES (1,'z'),(2,'ä'),(3,'a')`);
-  // after.name inherited dev-root → ä sorts next to a even with no COLLATE clause.
+  // after.name inherited unicode → ä sorts next to a even with no COLLATE clause.
   assert.deepEqual(query(db, `SELECT name FROM after ORDER BY name`), [["a"], ["ä"], ["z"]]);
   // before.name was frozen at C → byte order.
   exec(db, `INSERT INTO before VALUES (1,'z'),(2,'ä'),(3,'a')`);
   assert.deepEqual(query(db, `SELECT name FROM before ORDER BY name`), [["a"], ["z"], ["ä"]]);
-  // The default makes dev-root referenced (isDefault true).
+  // The default makes unicode referenced (isDefault true).
   const refs = db.collations();
   assert.equal(refs.length, 1);
   assert.equal(refs[0]!.isDefault, true);
@@ -150,10 +160,10 @@ test("set default unknown is 42704", () => {
 
 test("collated primary key stored in collation order", () => {
   // A collated text PRIMARY KEY's storage key is the UCA sort key (encoding.md §2.12), so the B-tree
-  // physically iterates in COLLATION order. dev-root (vendored, no import): a < A < b < Z; C bytes:
+  // physically iterates in COLLATION order. unicode (vendored, no import): a < A < b < Z; C bytes:
   // A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
   const db = new Database();
-  exec(db, `CREATE TABLE t (name text COLLATE "dev-root" PRIMARY KEY)`);
+  exec(db, `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY)`);
   exec(db, `INSERT INTO t VALUES ('Z'),('a'),('b'),('A')`);
   assert.deepEqual(query(db, `SELECT name FROM t`), [["a"], ["A"], ["b"], ["Z"]]);
   exec(db, `CREATE TABLE c (name text PRIMARY KEY)`);
@@ -165,7 +175,7 @@ test("collated unique dedups by byte identity", () => {
   // A collated UNIQUE key dedups by byte-identity (a deterministic collation: 'a' and 'A' are
   // DISTINCT, both admitted — collation.md §7), like a C unique key; only a byte-duplicate violates.
   const db = new Database();
-  exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root" UNIQUE)`);
+  exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode" UNIQUE)`);
   exec(db, `INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')`);
   assert.equal(errCode(() => exec(db, `INSERT INTO t VALUES (4,'a')`)), "23505");
   assert.deepEqual(query(db, `SELECT name FROM t ORDER BY name`), [["a"], ["A"], ["b"]]);
@@ -180,22 +190,22 @@ test("reference-only file round trip (format_version 18, entry_kind 3)", () => {
   const path = join(dir, "collation_refonly_roundtrip.jed");
   try {
     const db = create(path, { pageSize: 256 });
-    db.setDefaultCollation("dev-root"); // vendored — no import
-    exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root", plain text)`);
+    db.setDefaultCollation("unicode"); // vendored — no import
+    exec(db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode", plain text)`);
     exec(db, `INSERT INTO t VALUES (1,'z','z'),(2,'ä','ä'),(3,'a','a')`);
     commit(db);
     close(db);
 
     const re = open(path);
-    assert.equal(re.defaultCollation(), "dev-root");
-    // The database still references dev-root (per-file view) — resolved from the vendored set.
+    assert.equal(re.defaultCollation(), "unicode");
+    // The database still references unicode (per-file view) — resolved from the vendored set.
     const refs = re.collations();
     assert.equal(refs.length, 1);
-    assert.equal(refs[0]!.name, "dev-root");
-    assert.equal(refs[0]!.unicodeVersion, "0.0.0-dev");
+    assert.equal(refs[0]!.name, "unicode");
+    assert.equal(refs[0]!.unicodeVersion, "17.0.0");
     assert.equal(refs[0]!.isDefault, true);
     assert.deepEqual(query(re, `SELECT name FROM t ORDER BY name`), [["a"], ["ä"], ["z"]]);
-    // plain (un-annotated) inherited the default (dev-root) at create → also dev-root order.
+    // plain (un-annotated) inherited the default (unicode) at create → also unicode order.
     assert.deepEqual(query(re, `SELECT plain FROM t ORDER BY plain`), [["a"], ["ä"], ["z"]]);
     close(re);
   } finally {

@@ -36,16 +36,18 @@ fn texts(rows: Vec<Vec<Value>>) -> Vec<String> {
 // ---- the vendored set (the engine-global build property) ----
 
 #[test]
-fn vendored_collations_is_the_dev_fixtures() {
-    // `jed::vendored_collations()` reports what THIS BUILD provides — the dev fixture set, ascending by
-    // name, no `is_default` (a build property, not a per-db one). `C` is built in and never listed.
+fn vendored_collations_is_the_real_set() {
+    // `jed::vendored_collations()` reports what THIS BUILD provides — the real version-pinned set
+    // (`es`, `unicode`), ascending by name, no `is_default` (a build property, not a per-db one). `C`
+    // is built in and never listed. The pin is UCA/UCD 17.0.0 (spec/collation/17.0.0).
     let v = jed::vendored_collations();
     let names: Vec<&str> = v.iter().map(|c| c.name.as_str()).collect();
-    assert_eq!(names, vec!["dev-nordic", "dev-root"]);
+    assert_eq!(names, vec!["es", "unicode"]);
     assert!(v.iter().all(|c| !c.is_default));
-    assert_eq!(v[1].name, "dev-root");
-    assert_eq!(v[1].unicode_version, "0.0.0-dev");
-    assert!(jed::collation::vendored_collation("dev-root").is_some());
+    assert_eq!(v[1].name, "unicode");
+    assert_eq!(v[1].unicode_version, "17.0.0");
+    assert!(jed::collation::vendored_collation("unicode").is_some());
+    assert!(jed::collation::vendored_collation("es").is_some());
     assert!(jed::collation::vendored_collation("C").is_none());
 }
 
@@ -53,14 +55,29 @@ fn vendored_collations_is_the_dev_fixtures() {
 
 #[test]
 fn vendored_collation_used_in_an_expression() {
-    // `COLLATE "dev-root"` resolves from the binary's vendored set with no import: 'ä' < 'z' is true
-    // under dev-root (ä near a), the opposite of the C byte order where it is false. A transient query
-    // COLLATE does not make the database REFERENCE the collation, so db.collations() stays empty.
+    // `COLLATE "unicode"` resolves from the binary's vendored set with no import: 'ä' < 'z' is true
+    // under the root (ä sorts near a), the opposite of the C byte order where it is false. A transient
+    // query COLLATE does not make the database REFERENCE the collation, so db.collations() stays empty.
     let mut db = Database::new();
     assert_eq!(db.collations().len(), 0);
     assert_eq!(
-        query(&mut db, "SELECT 'ä' < 'z' COLLATE \"dev-root\""),
+        query(&mut db, "SELECT 'ä' < 'z' COLLATE \"unicode\""),
         vec![vec![Value::Bool(true)]]
+    );
+}
+
+#[test]
+fn es_orders_enye_as_a_distinct_letter() {
+    // The `es` tailoring (&N<ñ<<<Ñ) makes ñ a distinct PRIMARY letter after n: 'nz' < 'ña' (n < ñ),
+    // whereas under the untailored root ñ is n+accent so 'ña' < 'nz'. The Spanish-collation headline.
+    let mut db = Database::new();
+    assert_eq!(
+        query(&mut db, "SELECT 'nz' < 'ña' COLLATE \"es\""),
+        vec![vec![Value::Bool(true)]]
+    );
+    assert_eq!(
+        query(&mut db, "SELECT 'nz' < 'ña' COLLATE \"unicode\""),
+        vec![vec![Value::Bool(false)]]
     );
 }
 
@@ -78,13 +95,13 @@ fn unknown_collation_is_42704() {
 
 #[test]
 fn per_column_collation_orders_implicitly_and_is_referenced() {
-    // A column declared `COLLATE "dev-root"` (vendored, no import) sorts by that collation with no
-    // explicit COLLATE on the query — dev-root puts ä next to a. Because the SCHEMA now references
-    // dev-root, db.collations() (the per-file view) lists exactly it.
+    // A column declared `COLLATE "unicode"` (vendored, no import) sorts by that collation with no
+    // explicit COLLATE on the query — unicode puts ä next to a. Because the SCHEMA now references
+    // unicode, db.collations() (the per-file view) lists exactly it.
     let mut db = Database::new();
     execute(
         &mut db,
-        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\")",
+        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\")",
     )
     .unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
@@ -94,7 +111,7 @@ fn per_column_collation_orders_implicitly_and_is_referenced() {
     );
     let refs = db.collations();
     assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].name, "dev-root");
+    assert_eq!(refs[0].name, "unicode");
     assert!(!refs[0].is_default); // referenced by a column, but not the db default
     // An explicit COLLATE "C" on the query overrides back to byte order (ä is 2-byte UTF-8 → after z).
     assert_eq!(
@@ -109,11 +126,11 @@ fn per_column_collation_orders_implicitly_and_is_referenced() {
 #[test]
 fn implicit_conflict_is_42p22() {
     // Two columns with DIFFERENT implicit (vendored) collations compared with no explicit COLLATE →
-    // 42P22 (PG-matching). C counts as a distinct implicit collation, so dev-root vs C also conflicts.
+    // 42P22 (PG-matching). C counts as a distinct implicit collation, so unicode vs C also conflicts.
     let mut db = Database::new();
     execute(
         &mut db,
-        "CREATE TABLE t (a text COLLATE \"dev-root\", b text COLLATE \"dev-nordic\", c text COLLATE \"C\")",
+        "CREATE TABLE t (a text COLLATE \"unicode\", b text COLLATE \"es\", c text COLLATE \"C\")",
     )
     .unwrap();
     execute(&mut db, "INSERT INTO t VALUES ('a','z','b')").unwrap();
@@ -127,22 +144,19 @@ fn implicit_conflict_is_42p22() {
     );
     // An explicit COLLATE on one side breaks the tie (no error): a='a' < (b='z') = true.
     assert_eq!(
-        query(&mut db, "SELECT a < b COLLATE \"dev-root\" FROM t"),
+        query(&mut db, "SELECT a < b COLLATE \"unicode\" FROM t"),
         vec![vec![Value::Bool(true)]]
     );
     // The table references both vendored collations → db.collations() lists them (sorted).
     let names: Vec<String> = db.collations().into_iter().map(|c| c.name).collect();
-    assert_eq!(
-        names,
-        vec!["dev-nordic".to_string(), "dev-root".to_string()]
-    );
+    assert_eq!(names, vec!["es".to_string(), "unicode".to_string()]);
 }
 
 #[test]
 fn non_text_collate_is_42804_unknown_name_42704() {
     let mut db = Database::new();
     assert_eq!(
-        execute(&mut db, "CREATE TABLE t (a i32 COLLATE \"dev-root\")")
+        execute(&mut db, "CREATE TABLE t (a i32 COLLATE \"unicode\")")
             .unwrap_err()
             .code(),
         "42804"
@@ -168,15 +182,15 @@ fn default_collation_inherited_by_unannotated_column() {
         "CREATE TABLE before (id i32 PRIMARY KEY, name text)",
     )
     .unwrap();
-    db.set_default_collation("dev-root").unwrap();
-    assert_eq!(db.default_collation(), "dev-root");
+    db.set_default_collation("unicode").unwrap();
+    assert_eq!(db.default_collation(), "unicode");
     execute(
         &mut db,
         "CREATE TABLE after (id i32 PRIMARY KEY, name text)",
     )
     .unwrap();
     execute(&mut db, "INSERT INTO after VALUES (1,'z'),(2,'ä'),(3,'a')").unwrap();
-    // `after.name` inherited dev-root → ä sorts next to a even with no COLLATE clause.
+    // `after.name` inherited unicode → ä sorts next to a even with no COLLATE clause.
     assert_eq!(
         texts(query(&mut db, "SELECT name FROM after ORDER BY name")),
         vec!["a", "ä", "z"]
@@ -187,7 +201,7 @@ fn default_collation_inherited_by_unannotated_column() {
         texts(query(&mut db, "SELECT name FROM before ORDER BY name")),
         vec!["a", "z", "ä"]
     );
-    // The default makes dev-root referenced (is_default true).
+    // The default makes unicode referenced (is_default true).
     let refs = db.collations();
     assert_eq!(refs.len(), 1);
     assert!(refs[0].is_default);
@@ -208,12 +222,12 @@ fn set_default_unknown_is_42704() {
 #[test]
 fn collated_primary_key_is_stored_in_collation_order() {
     // A collated text PRIMARY KEY's storage key is the UCA sort key (encoding.md §2.12), so the B-tree
-    // physically iterates in COLLATION order. dev-root (vendored, no import): a < A < b < Z; C bytes:
+    // physically iterates in COLLATION order. unicode (vendored, no import): a < A < b < Z; C bytes:
     // A < Z < a < b. A no-ORDER-BY single-table scan returns jed's stored (key) order.
     let mut db = Database::new();
     execute(
         &mut db,
-        "CREATE TABLE t (name text COLLATE \"dev-root\" PRIMARY KEY)",
+        "CREATE TABLE t (name text COLLATE \"unicode\" PRIMARY KEY)",
     )
     .unwrap();
     execute(&mut db, "INSERT INTO t VALUES ('Z'),('a'),('b'),('A')").unwrap();
@@ -236,7 +250,7 @@ fn collated_unique_dedups_by_byte_identity() {
     let mut db = Database::new();
     execute(
         &mut db,
-        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\" UNIQUE)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\" UNIQUE)",
     )
     .unwrap();
     execute(&mut db, "INSERT INTO t VALUES (1,'a'),(2,'A'),(3,'b')").unwrap();
@@ -261,10 +275,10 @@ fn reference_only_file_round_trip() {
     let path = tmp("collation_refonly_roundtrip.jed");
     let _ = std::fs::remove_file(&path);
     let mut db = Database::create(&path, DatabaseOptions { page_size: 256 }).unwrap();
-    db.set_default_collation("dev-root").unwrap(); // vendored — no import
+    db.set_default_collation("unicode").unwrap(); // vendored — no import
     execute(
         &mut db,
-        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"dev-root\", plain text)",
+        "CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE \"unicode\", plain text)",
     )
     .unwrap();
     execute(
@@ -276,18 +290,18 @@ fn reference_only_file_round_trip() {
     db.close().unwrap();
 
     let mut re = Database::open(&path).unwrap();
-    assert_eq!(re.default_collation(), "dev-root");
-    // The database still references dev-root (per-file view) — resolved from the vendored set.
+    assert_eq!(re.default_collation(), "unicode");
+    // The database still references unicode (per-file view) — resolved from the vendored set.
     let refs = re.collations();
     assert_eq!(refs.len(), 1);
-    assert_eq!(refs[0].name, "dev-root");
-    assert_eq!(refs[0].unicode_version, "0.0.0-dev");
+    assert_eq!(refs[0].name, "unicode");
+    assert_eq!(refs[0].unicode_version, "17.0.0");
     assert!(refs[0].is_default);
     assert_eq!(
         texts(query(&mut re, "SELECT name FROM t ORDER BY name")),
         vec!["a", "ä", "z"]
     );
-    // `plain` (un-annotated) inherited the default (dev-root) at create → also dev-root order.
+    // `plain` (un-annotated) inherited the default (unicode) at create → also unicode order.
     assert_eq!(
         texts(query(&mut re, "SELECT plain FROM t ORDER BY plain")),
         vec!["a", "ä", "z"]

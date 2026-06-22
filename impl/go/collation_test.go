@@ -78,11 +78,18 @@ func TestCollationSortKeyMatchesVectorsAndIsAscending(t *testing.T) {
 		s := row.str("string")
 		want := row.str("sortkey_hex")
 		if collName != lastColl {
-			c, err := CompileCollation(collName, collDefinition(t, row.strs("def_files")))
-			if err != nil {
-				t.Fatalf("%s: compile: %v", collName, err)
+			// The real version-pinned collations (unicode, es) resolve from the embedded .coll — the
+			// production read path — rather than recompiling their ~2.3 MB source. The small dev
+			// fixtures (not vendored) are compiled from their definition files.
+			if vc := vendored()[collName]; vc != nil {
+				coll = vc
+			} else {
+				c, err := CompileCollation(collName, collDefinition(t, row.strs("def_files")))
+				if err != nil {
+					t.Fatalf("%s: compile: %v", collName, err)
+				}
+				coll = c
 			}
-			coll = c
 			lastColl = collName
 			prev = nil
 		}

@@ -659,17 +659,17 @@ function identityTableDB(): Database {
 }
 
 // collationTableDB is a reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column
-// collations): the vendored dev-root collation set as the per-database default (is_default), a column
-// with explicit COLLATE "dev-root" (flags bit6 + name), an un-annotated column inheriting the default
-// (bit6 + name), and an explicit COLLATE "C" column (no collation). dev-root is NOT imported — it is
-// vendored, and its metadata entry is emitted because the schema references it. Must match the Ruby
-// reference's COLLATION_TABLE.
+// collations): the vendored unicode collation (the real version-pinned CLDR-DUCET root, UCA/UCD
+// 17.0.0) as the per-database default (is_default), a column with explicit COLLATE "unicode" (flags
+// bit6 + name), an un-annotated column inheriting the default (bit6 + name), and an explicit
+// COLLATE "C" column (no collation). unicode is NOT imported — it is vendored, and its metadata entry
+// is emitted because the schema references it. Must match the Ruby reference's COLLATION_TABLE.
 function collationTableDB(): Database {
   const db = goldenDb();
-  db.setDefaultCollation("dev-root"); // vendored — no import
+  db.setDefaultCollation("unicode"); // vendored — no import
   run(
     db,
-    `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root", ` +
+    `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode", ` +
       `plain text, byteorder text COLLATE "C")`,
   );
   run(db, `INSERT INTO t VALUES (1, 'a', 'b', 'z')`);
@@ -678,14 +678,14 @@ function collationTableDB(): Database {
 }
 
 // collationPKTableDB: a collated text PRIMARY KEY + a collated secondary index (slice 1e,
-// encoding.md §2.12) — both keys store the dev-root UCA sort key, so the B-tree iterates in
-// collation order. dev-root is vendored (not the default; its entry is emitted because the columns
+// encoding.md §2.12) — both keys store the unicode UCA sort key, so the B-tree iterates in
+// collation order. unicode is vendored (not the default; its entry is emitted because the columns
 // reference it). Must match the Ruby reference's COLLATION_PK_TABLE.
 function collationPKTableDB(): Database {
   const db = goldenDb();
   run(
     db,
-    `CREATE TABLE t (name text COLLATE "dev-root" PRIMARY KEY, tag text COLLATE "dev-root")`,
+    `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY, tag text COLLATE "unicode")`,
   );
   run(db, `CREATE INDEX t_tag_idx ON t (tag)`);
   // Inserted out of collation order; stored in collation order ('a' < 'z' by the sort key).

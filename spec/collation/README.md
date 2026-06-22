@@ -28,9 +28,13 @@
 > compiled `.coll` artifacts here are **vendored into each core** and read at startup; a collation is
 > used by reference (the database file records only its name + version, never the table), and the
 > `# load-collation:` directive now declares which vendored collation a test needs rather than
-> importing one ([../design/collation.md §2/§9](../design/collation.md)). The dev fixture (§5) is a small
-> hand-authored subset; the version-pinned real DUCET + curated locale tailorings land with a
-> later slice (1f). The verification vectors (§6) are **populated** — produced by the Rust core
+> importing one ([../design/collation.md §2/§9](../design/collation.md)). **Slice 2e landed the real
+> version-pinned data:** the production **vendored** set is now the real CLDR-tailored DUCET — `unicode`
+> (UCA/UCD **17.0.0**, CLDR 48, [17.0.0/root.allkeys](17.0.0/root.allkeys)) and `es` (root + `&N<ñ<<<Ñ`).
+> The dev fixture (§5) is **no longer vendored** — it survives only as the small hand-authored
+> compiler/sort-key **vectors** (§6). Implicit weights / the CJK tier-3 root and the broader locale
+> tailorings (sv/da/de — needing the deferred LDML features) remain follow-ons. The verification
+> vectors (§6) are **populated** — produced by the Rust core
 > (`impl/rust/src/bin/gen_collation_vectors.rs`) and cross-confirmed byte-for-byte by Go and TS
 > (UCA sort keys are not safely hand-authored; §6).
 
@@ -213,6 +217,12 @@ sort_key = L1-weights ‖ 0x0000 ‖ L2-weights ‖ 0x0000 ‖ L3-weights ‖ 0x
 after `"a"` — exactly the deterministic-collation "adjacent, not equal" property.
 
 ## 5. The minimal dev fixture
+
+> **Role since slice 2e:** the dev fixtures are **no longer vendored into production** — the real
+> version-pinned root (`unicode`) + `es` are ([17.0.0/](17.0.0/), [../design/collation.md §14](../design/collation.md)).
+> The dev fixtures survive **only** as the small cross-core compiler/sort-key **vectors** (§6): tiny,
+> hand-auditable definitions that pin the compiler + executor (expansion, a tailoring, an astral code
+> point) without the full ~2.3 MB DUCET.
 
 A small hand-authored subset to exercise the formats end to end in 1a/1b without the full
 ~2 MB DUCET. It is **dev data, not the version-pinned real DUCET** — illustrative DUCET-style

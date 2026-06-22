@@ -694,17 +694,17 @@ func identityTableDB(t *testing.T) *Database {
 }
 
 // collationTableDB is a reference-only COLLATION (v18 — entry_kind 3 metadata entry + per-column
-// collations): the vendored dev-root collation set as the per-database default (is_default), a column
-// with explicit COLLATE "dev-root" (flags bit6 + name), an un-annotated column inheriting the default
-// (bit6 + name), and an explicit COLLATE "C" column (no collation). dev-root is NOT imported — it is
-// vendored, and its metadata entry is emitted because the schema references it. Must match the Ruby
-// reference's COLLATION_TABLE.
+// collations): the vendored unicode collation (the real version-pinned CLDR-DUCET root, UCA/UCD
+// 17.0.0) as the per-database default (is_default), a column with explicit COLLATE "unicode" (flags
+// bit6 + name), an un-annotated column inheriting the default (bit6 + name), and an explicit
+// COLLATE "C" column (no collation). unicode is NOT imported — it is vendored, and its metadata entry
+// is emitted because the schema references it. Must match the Ruby reference's COLLATION_TABLE.
 func collationTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
-	if err := db.SetDefaultCollation("dev-root"); err != nil { // vendored — no import
+	if err := db.SetDefaultCollation("unicode"); err != nil { // vendored — no import
 		t.Fatalf("set default: %v", err)
 	}
-	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "dev-root", `+
+	run(t, db, `CREATE TABLE t (id i32 PRIMARY KEY, name text COLLATE "unicode", `+
 		`plain text, byteorder text COLLATE "C")`)
 	run(t, db, `INSERT INTO t VALUES (1, 'a', 'b', 'z')`)
 	run(t, db, `INSERT INTO t VALUES (2, 'z', 'a', 'a')`)
@@ -712,12 +712,12 @@ func collationTableDB(t *testing.T) *Database {
 }
 
 // collationPKTableDB: a collated text PRIMARY KEY + a collated secondary index (slice 1e,
-// encoding.md §2.12) — both keys store the dev-root UCA sort key, so the B-tree iterates in
-// collation order. dev-root is vendored (not the default; its entry is emitted because the columns
+// encoding.md §2.12) — both keys store the unicode UCA sort key, so the B-tree iterates in
+// collation order. unicode is vendored (not the default; its entry is emitted because the columns
 // reference it). Must match the Ruby reference's COLLATION_PK_TABLE.
 func collationPKTableDB(t *testing.T) *Database {
 	db := WithPageSize(goldenPageSize)
-	run(t, db, `CREATE TABLE t (name text COLLATE "dev-root" PRIMARY KEY, tag text COLLATE "dev-root")`)
+	run(t, db, `CREATE TABLE t (name text COLLATE "unicode" PRIMARY KEY, tag text COLLATE "unicode")`)
 	run(t, db, `CREATE INDEX t_tag_idx ON t (tag)`)
 	// Inserted out of collation order; stored in collation order ('a' < 'z' by the sort key).
 	run(t, db, `INSERT INTO t VALUES ('z', 'a')`)

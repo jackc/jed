@@ -503,9 +503,12 @@ export function openCollation(bytes: Uint8Array): Collation {
 //
 // In the reference-only model the engine reads collations from a set VENDORED into the binary, not
 // from the database file (the file only references a collation by name + version). Production
-// openCollations these embedded .coll artifacts once and serves every later use from them. This is
-// the dev fixture set (dev-root, dev-nordic); the real version-pinned DUCET + curated tailorings and
-// the embedder-chosen footprint tiers (§13) are later slices (§14, 2a/2f). The bytes are inlined as
+// openCollations these embedded .coll artifacts once and serves every later use from them. The
+// vendored set is the real version-pinned data (spec/collation/17.0.0, UCA/UCD 17.0.0 / CLDR 48):
+// unicode is the CLDR-tailored DUCET root (the table ICU/PostgreSQL use), es is that root plus the
+// Spanish ñ tailoring. The footprint tiers (§13) and the broader tailoring set (sv/da/de — needing
+// the deferred LDML [before]/expansion features) are later slices (§14). The dev-* fixtures are NOT
+// vendored — they only drive the cross-core compiler/sort-key vectors. The bytes are inlined as
 // base64 (browser-safe — no node:fs) in the generated collationdata/vendored.ts, synced from
 // spec/collation/fixtures by scripts/vendor_collations.rb and byte-identical across cores (§9/§10).
 

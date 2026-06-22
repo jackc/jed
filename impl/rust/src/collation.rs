@@ -92,8 +92,10 @@ fn corrupt(msg: impl Into<String>) -> EngineError {
 pub fn compile_collation(name: &str, definition: &str) -> Result<Collation> {
     let mut unicode_version = String::new();
     let cldr_version = String::new();
-    // working map: code-point sequence → CEs. A single code point has len-1 key.
-    let mut map: Vec<(Vec<u32>, Vec<Ce>)> = Vec::new();
+    // working map: code-point sequence → CEs (a single code point is a len-1 key). A hash map keeps
+    // compilation O(n) over the ~39k mappings of the real DUCET root; the output is sorted below, so
+    // no iteration order leaks into the table bytes (CLAUDE.md §8).
+    let mut map: std::collections::HashMap<Vec<u32>, Vec<Ce>> = std::collections::HashMap::new();
 
     for raw in definition.lines() {
         let line = strip_comment(raw).trim();
@@ -151,7 +153,7 @@ fn strip_comment(line: &str) -> &str {
     }
 }
 
-fn parse_mapping(map: &mut Vec<(Vec<u32>, Vec<Ce>)>, line: &str) -> Result<()> {
+fn parse_mapping(map: &mut std::collections::HashMap<Vec<u32>, Vec<Ce>>, line: &str) -> Result<()> {
     let (cps_part, ces_part) = line
         .split_once(';')
         .ok_or_else(|| syntax(format!("collation: mapping line has no ';': {line}")))?;
@@ -214,19 +216,15 @@ fn parse_elements(s: &str) -> Result<Vec<Ce>> {
 /// Insert or replace a mapping. `replace` distinguishes a tailoring redefinition (allowed) from a
 /// duplicate in the root (an error).
 fn set_mapping(
-    map: &mut Vec<(Vec<u32>, Vec<Ce>)>,
+    map: &mut std::collections::HashMap<Vec<u32>, Vec<Ce>>,
     seq: Vec<u32>,
     ces: Vec<Ce>,
     replace: bool,
 ) -> Result<()> {
-    if let Some(slot) = map.iter_mut().find(|(s, _)| *s == seq) {
-        if !replace {
-            return Err(syntax(format!("collation: duplicate mapping for {seq:?}")));
-        }
-        slot.1 = ces;
-    } else {
-        map.push((seq, ces));
+    if map.contains_key(&seq) && !replace {
+        return Err(syntax(format!("collation: duplicate mapping for {seq:?}")));
     }
+    map.insert(seq, ces);
     Ok(())
 }
 
@@ -234,7 +232,10 @@ fn set_mapping(
 
 /// Apply one LDML rule line: `&anchor REL target (REL target)*` where REL ∈ `<` `<<` `<<<` `=`.
 /// Single-character anchor/targets only in slice 1b (multi-char contractions in rules deferred).
-fn apply_tailoring(map: &mut Vec<(Vec<u32>, Vec<Ce>)>, line: &str) -> Result<()> {
+fn apply_tailoring(
+    map: &mut std::collections::HashMap<Vec<u32>, Vec<Ce>>,
+    line: &str,
+) -> Result<()> {
     let body = line.strip_prefix('&').unwrap().trim();
     let toks = tokenize_rule(body)?;
     // toks alternate: char, op, char, op, char, … — first is the anchor.
@@ -322,14 +323,17 @@ fn tokenize_rule(s: &str) -> Result<Vec<Tok>> {
 }
 
 /// The CE of a single-code-point mapping with exactly one element (a tailoring anchor must be one).
-fn single_ce(map: &[(Vec<u32>, Vec<Ce>)], cp: u32) -> Option<Ce> {
-    map.iter()
-        .find(|(s, _)| s.as_slice() == [cp])
-        .and_then(|(_, ces)| if ces.len() == 1 { Some(ces[0]) } else { None })
+fn single_ce(map: &std::collections::HashMap<Vec<u32>, Vec<Ce>>, cp: u32) -> Option<Ce> {
+    map.get(&vec![cp])
+        .and_then(|ces| if ces.len() == 1 { Some(ces[0]) } else { None })
 }
 
 /// Allocate a fresh CE placed *after* `cur` at the given relation level, using the dev allocator.
-fn alloc_after(map: &[(Vec<u32>, Vec<Ce>)], cur: Ce, rel: Rel) -> Result<Ce> {
+fn alloc_after(
+    map: &std::collections::HashMap<Vec<u32>, Vec<Ce>>,
+    cur: Ce,
+    rel: Rel,
+) -> Result<Ce> {
     match rel {
         Rel::Identical => Ok(cur),
         Rel::Primary => {
@@ -363,9 +367,12 @@ fn alloc_after(map: &[(Vec<u32>, Vec<Ce>)], cur: Ce, rel: Rel) -> Result<Ce> {
 }
 
 /// The smallest weight strictly above `cur`, per `f`, across every CE in the table.
-fn min_weight_above(map: &[(Vec<u32>, Vec<Ce>)], f: impl Fn(&Ce) -> Option<u16>) -> Option<u16> {
+fn min_weight_above(
+    map: &std::collections::HashMap<Vec<u32>, Vec<Ce>>,
+    f: impl Fn(&Ce) -> Option<u16>,
+) -> Option<u16> {
     let mut best: Option<u16> = None;
-    for (_, ces) in map {
+    for ces in map.values() {
         for ce in ces {
             if let Some(w) = f(ce) {
                 best = Some(best.map_or(w, |b| b.min(w)));
@@ -595,21 +602,25 @@ pub fn open_collation(bytes: &[u8]) -> Result<Collation> {
 // In the reference-only model the engine reads collations from a set **vendored into the binary**,
 // not from the database file (the file only *references* a collation by name + version). Production
 // `OpenCollation`s these embedded `.coll` artifacts once at startup and serves every later use from
-// them. This is the dev fixture set (`dev-root`, `dev-nordic`); the real version-pinned DUCET +
-// curated tailorings and the embedder-chosen footprint tiers (§13) are later slices (§14, 2a/2f).
-// The `.coll` bytes are the same artifact `gen_collation_vectors` writes and `db.SaveCollation`
-// produces — byte-identical across cores, so every core vendors the identical table (§9/§10).
+// them. The vendored set is the real version-pinned data (spec/collation/17.0.0, UCA/UCD 17.0.0 /
+// CLDR 48): `unicode` is the CLDR-tailored DUCET root (the table ICU/PostgreSQL use), `es` is that
+// root plus the Spanish ñ tailoring. The embedder-chosen footprint tiers (§13) and the broader
+// tailoring set (sv/da/de — needing the deferred LDML `[before]`/expansion features) are later
+// slices (§14). The `.coll` bytes are the same artifact `gen_collation_vectors` writes and
+// `db.SaveCollation` produces — byte-identical across cores, so every core vendors the identical
+// table (§9/§10). The `dev-*` fixtures are NOT vendored — they only drive the cross-core
+// compiler/sort-key vectors (spec/collation/vectors).
 
 /// The `(name, .coll bytes)` pairs compiled into this binary. The artifact's own embedded name is
 /// authoritative for the registry key (it always equals the label here).
 const VENDORED_COLL: &[(&str, &[u8])] = &[
     (
-        "dev-root",
-        include_bytes!("../../../spec/collation/fixtures/dev-root.coll"),
+        "unicode",
+        include_bytes!("../../../spec/collation/fixtures/unicode.coll"),
     ),
     (
-        "dev-nordic",
-        include_bytes!("../../../spec/collation/fixtures/dev-nordic.coll"),
+        "es",
+        include_bytes!("../../../spec/collation/fixtures/es.coll"),
     ),
 ];
 

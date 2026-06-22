@@ -1,8 +1,20 @@
-//! Regeneration tool for spec/collation/vectors/{compiler,sortkey}.toml — the cross-core byte
-//! vectors, produced from the Rust core and cross-confirmed by Go/TS (CLAUDE.md §8). UCA sort keys
-//! are not safely hand-authored (spec/collation/README.md §6), so the vectors are generated here
-//! and the case lists below are their source of truth. Run after changing a fixture or a byte
-//! format:  cargo run --bin gen_collation_vectors  — then re-run all three cores' suites.
+//! Regeneration tool for the collation vendored artifacts + cross-core byte vectors, produced from
+//! the Rust core and cross-confirmed by Go/TS (CLAUDE.md §8). UCA sort keys are not safely
+//! hand-authored (spec/collation/README.md §6), so the vectors are generated here and the case lists
+//! below are their source of truth. Run after changing a fixture/source or a byte format:
+//!   cargo run --release --bin gen_collation_vectors   — then re-run all three cores' suites.
+//!
+//! Two collation families (spec/design/collation.md §9/§14):
+//!   * DEV fixtures (`dev-root`, `dev-nordic`) — tiny hand-authored definitions that exercise the
+//!     compiler + executor (expansion, a tailoring, an astral code point) cheaply. They drive the
+//!     `compiler.toml` vectors (the cross-core compiler contract, small enough to inline as hex) and
+//!     their own sort-key vectors. NOT vendored into production.
+//!   * VENDORED collations (`unicode` = the real version-pinned CLDR-DUCET root, `es` = root + the
+//!     Spanish ñ tailoring) — the real production set (spec/collation/17.0.0/). Their compiled `.coll`
+//!     is written to spec/collation/fixtures/ and embedded into every core; `scripts/vendor_collations.rb`
+//!     distributes it. Their table is ~0.5 MB, far too large to inline in `compiler.toml`, so they are
+//!     pinned instead by (a) the byte-identical embedded `.coll` (the drift gate) and (b) their
+//!     sort-key vectors below (the executor contract, computed from the compiled table).
 
 use jed::collation::{Collation, compile_collation, save_collation, serialize_table, sort_key};
 use std::path::Path;
@@ -27,14 +39,28 @@ fn compile(def_files: &[&str], name: &str) -> Collation {
     compile_collation(name, &def).unwrap()
 }
 
+fn files_toml(files: &[&str]) -> String {
+    files
+        .iter()
+        .map(|f| format!("\"{f}\""))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn esc(s: &str) -> String {
     // TOML basic-string escaping for the values we use (only embedded NUL would need it; none do).
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+fn out_path(rel: &str) -> std::path::PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../spec")
+        .join(rel)
+}
+
 fn main() {
-    // (label, def_files, coll_name)
-    let colls: &[(&str, &[&str], &str)] = &[
+    // (label, def_files, coll_name) — the small hand-authored compiler/executor fixtures.
+    let dev: &[(&str, &[&str], &str)] = &[
         (
             "dev-root",
             &["collation/fixtures/dev-root.allkeys"],
@@ -49,8 +75,27 @@ fn main() {
             "dev-nordic",
         ),
     ];
+    // (def_files, coll_name) — the real version-pinned vendored set (their `.coll` is embedded).
+    let vendored: &[(&[&str], &str)] = &[
+        (&["collation/17.0.0/root.allkeys"], "unicode"),
+        (
+            &["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"],
+            "es",
+        ),
+    ];
 
-    // --- compiler.toml ---
+    // --- write the vendored .coll artifacts the cores embed (spec/design/collation.md §9) ---
+    for (files, name) in vendored {
+        let coll = compile(files, name);
+        let artifact = save_collation(&coll);
+        std::fs::write(
+            out_path(&format!("collation/fixtures/{name}.coll")),
+            &artifact,
+        )
+        .unwrap();
+    }
+
+    // --- compiler.toml — DEV fixtures only (small enough to pin as full hex) ---
     let mut out = String::new();
     out.push_str(
         "# Collation compiler vectors — (definition fixtures) → (compiled table §2 / .coll\n",
@@ -64,43 +109,32 @@ fn main() {
     out.push_str(
         "# Format: spec/collation/README.md §2/§3. def_files are concatenated (newline-joined)\n",
     );
-    out.push_str("# then compiled under coll_name.\n\n");
+    out.push_str(
+        "# then compiled under coll_name. Only the small DEV fixtures are pinned here; the real\n",
+    );
+    out.push_str(
+        "# vendored tables (unicode/es) are ~0.5 MB and are pinned by their embedded .coll +\n",
+    );
+    out.push_str("# the sort-key vectors instead (spec/design/collation.md §9/§10).\n\n");
     out.push_str("schema_version = 1\n");
-    for (label, files, name) in colls {
+    for (label, files, name) in dev {
         let coll = compile(files, name);
         let table = serialize_table(&coll);
         let artifact = save_collation(&coll);
-        // The `.coll` artifact is ALSO the byte source each core vendors (spec/design/collation.md
-        // §9): write it next to the definition so the cores can `include_bytes!` it. The artifact
-        // is byte-identical to `db.SaveCollation` and to the `artifact_hex` vector emitted below.
-        std::fs::write(
-            Path::new(env!("CARGO_MANIFEST_DIR"))
-                .join(format!("../../spec/collation/fixtures/{name}.coll")),
-            &artifact,
-        )
-        .unwrap();
-        let files_toml = files
-            .iter()
-            .map(|f| format!("\"{f}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
         out.push_str("\n[[compiler]]\n");
         out.push_str(&format!("name = \"{label}\"\n"));
         out.push_str(&format!("coll_name = \"{name}\"\n"));
-        out.push_str(&format!("def_files = [{files_toml}]\n"));
+        out.push_str(&format!("def_files = [{}]\n", files_toml(files)));
         out.push_str(&format!("table_hex = \"{}\"\n", hex(&table)));
         out.push_str(&format!("artifact_hex = \"{}\"\n", hex(&artifact)));
     }
-    std::fs::write(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/vectors/compiler.toml"),
-        &out,
-    )
-    .unwrap();
+    std::fs::write(out_path("collation/vectors/compiler.toml"), &out).unwrap();
 
-    // --- sortkey.toml ---
-    // Strings chosen per collation; the harness also asserts they appear in ascending sort-key
-    // order, so each list MUST be in the collation's expected logical order.
-    let cases: &[(&str, &[&str])] = &[
+    // --- sortkey.toml — DEV fixtures + the real vendored collations ---
+    // Strings chosen per collation; the harness also asserts they appear in ascending sort-key order,
+    // so they are emitted (below) in true collation order. The real-collation cases double as the
+    // executor cross-core contract over the version-pinned table.
+    let dev_cases: &[(&str, &[&str])] = &[
         (
             "dev-root",
             &[
@@ -112,6 +146,23 @@ fn main() {
             &[" ", "a", "A", "b", "B", "z", "Z", "ä", "Ä", "😀"],
         ),
     ];
+    // unicode (root): letters order by DUCET primary (ä near a, ñ near n), astral sorts low.
+    // es: ñ is a distinct PRIMARY letter after n (n < N < nz < ñ < Ñ < ña < o) — the Spanish contrast.
+    let real_cases: &[(&[&str], &str, &[&str])] = &[
+        (
+            &["collation/17.0.0/root.allkeys"],
+            "unicode",
+            &[
+                "a", "A", "ä", "b", "z", "Z", "é", "n", "ñ", "o", "😀", "ña", "nz",
+            ],
+        ),
+        (
+            &["collation/17.0.0/root.allkeys", "collation/17.0.0/es.ldml"],
+            "es",
+            &["a", "n", "N", "nz", "ñ", "Ñ", "ña", "o", "z"],
+        ),
+    ];
+
     let mut out = String::new();
     out.push_str("# Collation executor (sort-key) vectors — (collation, string) → (sort-key §4)\n");
     out.push_str("# bytes, the primary cross-core contract for the algorithm. GENERATED by\n");
@@ -127,36 +178,40 @@ fn main() {
     out.push_str(
         "# sort keys' memcmp order matches. Includes an astral case (😀, U+1F600) — the TS\n",
     );
-    out.push_str("# UTF-16-vs-code-point trap (types.md §11).\n\n");
+    out.push_str(
+        "# UTF-16-vs-code-point trap (types.md §11). The `unicode`/`es` cases are over the real\n",
+    );
+    out.push_str(
+        "# version-pinned vendored table; the harness resolves them via the embedded .coll.\n\n",
+    );
     out.push_str("schema_version = 1\n");
-    for (name, strings) in cases {
-        let files = colls.iter().find(|(_, _, n)| n == name).unwrap().1;
-        let coll = compile(files, name);
-        let files_toml = files
-            .iter()
-            .map(|f| format!("\"{f}\""))
-            .collect::<Vec<_>>()
-            .join(", ");
-        // emit in true sort-key (collation) order so the harness can assert strict ascending —
-        // e.g. the multi-char a-words sort *within* the a-group, before "b".
+
+    let mut emit = |coll: &Collation, files: &[&str], name: &str, strings: &[&str]| {
         let mut keyed: Vec<(&str, Vec<u8>)> = strings
             .iter()
-            .map(|s| (*s, sort_key(&coll, s).unwrap()))
+            .map(|s| (*s, sort_key(coll, s).unwrap()))
             .collect();
         keyed.sort_by(|a, b| a.1.cmp(&b.1));
         for (s, key) in keyed {
             out.push_str("\n[[sortkey]]\n");
             out.push_str(&format!("coll_name = \"{name}\"\n"));
-            out.push_str(&format!("def_files = [{files_toml}]\n"));
+            out.push_str(&format!("def_files = [{}]\n", files_toml(files)));
             out.push_str(&format!("string = \"{}\"\n", esc(s)));
             out.push_str(&format!("sortkey_hex = \"{}\"\n", hex(&key)));
         }
+    };
+    for (name, strings) in dev_cases {
+        let files = dev.iter().find(|(_, _, n)| n == name).unwrap().1;
+        let coll = compile(files, name);
+        emit(&coll, files, name, strings);
     }
-    std::fs::write(
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/collation/vectors/sortkey.toml"),
-        &out,
-    )
-    .unwrap();
+    for (files, name, strings) in real_cases {
+        let coll = compile(files, name);
+        emit(&coll, files, name, strings);
+    }
+    std::fs::write(out_path("collation/vectors/sortkey.toml"), &out).unwrap();
 
-    println!("wrote spec/collation/vectors/compiler.toml and sortkey.toml");
+    println!(
+        "wrote spec/collation/fixtures/{{unicode,es}}.coll + vectors/{{compiler,sortkey}}.toml"
+    );
 }

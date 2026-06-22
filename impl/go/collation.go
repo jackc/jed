@@ -687,10 +687,13 @@ func OpenCollation(bytes []byte) (*Collation, error) {
 // In the reference-only model the engine reads collations from a set VENDORED into the binary, not
 // from the database file (the file only references a collation by name + version). Production
 // OpenCollations these embedded .coll artifacts once at startup and serves every later use from
-// them. This is the dev fixture set (dev-root, dev-nordic); the real version-pinned DUCET + curated
-// tailorings and the embedder-chosen footprint tiers (§13) are later slices (§14, 2a/2f). The .coll
-// bytes are synced from spec/collation/fixtures by scripts/vendor_collations.rb (rake verify checks
-// drift) and are byte-identical across cores, so every core vendors the identical table (§9/§10).
+// them. The vendored set is the real version-pinned data (spec/collation/17.0.0, UCA/UCD 17.0.0 /
+// CLDR 48): unicode is the CLDR-tailored DUCET root (the table ICU/PostgreSQL use), es is that root
+// plus the Spanish ñ tailoring. The footprint tiers (§13) and the broader tailoring set (sv/da/de —
+// needing the deferred LDML [before]/expansion features) are later slices (§14). The dev-* fixtures
+// are NOT vendored — they only drive the cross-core compiler/sort-key vectors. The .coll bytes are
+// synced from spec/collation/fixtures by scripts/vendor_collations.rb (rake verify checks drift) and
+// are byte-identical across cores, so every core vendors the identical table (§9/§10).
 
 //go:embed collationdata/*.coll
 var vendoredFS embed.FS
