@@ -247,6 +247,133 @@ func (s *Snapshot) referencedCollations() ([]*Collation, error) {
 	return out, nil
 }
 
+// upgradeCollations is the REINDEX / COLLATION UPGRADE migration (spec/design/collation.md §12):
+// rebuild every collated key stored under a version-SKEWED collation against the LOADED table and
+// advance that collation's pin to the loaded version — clearing the skew so the affected tables are
+// read-write again and their collated indexes regain pushdown (a Full index, encoding.md §2.12).
+// Returns the number of collations re-pinned (0 ⇒ nothing skewed, a no-op).
+//
+// Whole-database, per-collation pin: the pin is ONE entry per collation NAME (§5), so a collation's
+// pin may advance only once every key under it is rebuilt — else a not-yet-rebuilt table would
+// falsely read as Full (corruption). The caller swaps the result in atomically. resolveCollation
+// already yields the loaded table data (the file entry carries the file pin but loaded
+// singles/contractions), so re-encoding produces loaded-version sort keys; the re-pin realigns the label.
+func (s *Snapshot) upgradeCollations(pageSize uint32) (int, error) {
+	refs, err := s.referencedCollations()
+	if err != nil {
+		return 0, err
+	}
+	skewed := map[string]bool{}
+	for _, c := range refs {
+		if _, _, _, _, sk := s.collationSkew(c.Name); sk {
+			skewed[c.Name] = true
+		}
+	}
+	if len(skewed) == 0 {
+		return 0, nil
+	}
+	isSkewed := func(coll string) bool { return coll != "" && skewed[coll] }
+
+	// Sorted table order (no map-iteration leak, CLAUDE.md §8; the per-table rebuilds are independent
+	// and the re-pin is order-free, so the result is order-invariant regardless).
+	tableKeys := make([]string, 0, len(s.tables))
+	for k := range s.tables {
+		tableKeys = append(tableKeys, k)
+	}
+	sort.Strings(tableKeys)
+	for _, key := range tableKeys {
+		table := s.tables[key]
+		// A collated PK re-encode moves every storage key ⇒ a full table rewrite, and an index entry
+		// carries the storage key as its suffix (indexes.md §3) ⇒ every index of the table is rebuilt.
+		// Else only the indexes whose own key columns use a skewed collation are rebuilt.
+		pkSkewed := false
+		for _, i := range table.PK {
+			if isSkewed(table.Columns[i].Collation) {
+				pkSkewed = true
+				break
+			}
+		}
+		var indexes []IndexDef
+		for _, idx := range table.Indexes {
+			affected := pkSkewed
+			for _, c := range idx.Columns {
+				if isSkewed(table.Columns[c].Collation) {
+					affected = true
+				}
+			}
+			if affected {
+				indexes = append(indexes, idx)
+			}
+		}
+		if !pkSkewed && len(indexes) == 0 {
+			continue
+		}
+		colls := make([]*Collation, len(table.Columns))
+		for i, c := range table.Columns {
+			if c.Collation != "" {
+				colls[i] = s.resolveCollation(c.Collation)
+			}
+		}
+		// Read every (storage key, row) pair, fully materialized (a spilled non-key value must
+		// survive a rewrite; a collated key column never spills — §2.12 narrowing b).
+		entries, err := s.store(table.Name).EntriesInKeyOrder()
+		if err != nil {
+			return 0, err
+		}
+		for i := range entries {
+			r, err := s.store(table.Name).resolveAll(entries[i].Row)
+			if err != nil {
+				return 0, err
+			}
+			entries[i].Row = r
+		}
+		// The NEW storage key per row: re-encoded under the loaded collation if the PK moved, else
+		// the existing key (unchanged — includes a synthetic-rowid table, which has no PK).
+		if pkSkewed {
+			for i := range entries {
+				k, err := encodePkKey(table, table.PK, colls, entries[i].Row)
+				if err != nil {
+					return 0, err
+				}
+				entries[i].Key = k
+			}
+			s.putTable(table, pageSize) // fresh empty store (+ re-register the same table)
+			for _, e := range entries {
+				if _, err := s.store(table.Name).Insert(e.Key, e.Row); err != nil {
+					return 0, err
+				}
+			}
+		}
+		// Rebuild each affected index store from the (re-keyed) rows.
+		c := int(pageSize) - 12 // pageHeader
+		for _, def := range indexes {
+			var ekeys [][]byte
+			for _, e := range entries {
+				eks, err := indexEntryKeys(table.Columns, colls, def, e.Key, e.Row)
+				if err != nil {
+					return 0, err
+				}
+				ekeys = append(ekeys, eks...)
+			}
+			sort.Slice(ekeys, func(a, b int) bool { return bytes.Compare(ekeys[a], ekeys[b]) < 0 })
+			fresh := NewTableStore(c, nil)
+			for _, ek := range ekeys {
+				if _, err := fresh.Insert(ek, Row{}); err != nil {
+					return 0, err
+				}
+			}
+			s.putIndexStore(strings.ToLower(def.Name), fresh)
+		}
+	}
+	// Advance each skewed collation's pin to the loaded version.
+	for name := range skewed {
+		if loaded := LoadedCollation(name); loaded != nil {
+			s.collations[name] = loaded
+		}
+	}
+	return len(skewed), nil
+}
+
 // table looks up a table definition by name (case-insensitive).
 func (s *Snapshot) table(name string) (*Table, bool) {
 	t, ok := s.tables[strings.ToLower(name)]
@@ -1757,6 +1884,27 @@ func (db *Database) LoadedCollations() []CollationInfo {
 // spec/design/collation.md §1). "C" resets to byte order; any other name must be a LOADED collation
 // (else 42704). Persisted as the is_default flag on that collation's reference entry at the next
 // commit (the entry is emitted because the default references it — §5).
+// UpgradeCollations adopts a newly-loaded Unicode version for this database's skewed collations
+// (the REINDEX / COLLATION UPGRADE migration, spec/design/collation.md §12). A privileged host op
+// like SetDefaultCollation — NOT SQL-reachable, so an untrusted query can never trigger it
+// (CLAUDE.md §13). For every collation whose file pin differs from the loaded bundle (Skewed) it
+// rebuilds the collated keys (PK + indexes) under the loaded table and re-pins the stamp, clearing
+// the skew so the affected tables are read-write again and regain collated-index pushdown.
+// Whole-database + atomic (the rebuild stages in a snapshot clone swapped in only on success);
+// idempotent (no skew ⇒ a no-op returning 0). Persisted by the next explicit Commit. Returns the
+// number of collations re-pinned.
+func (db *Database) UpgradeCollations() (int, error) {
+	work := db.committed.clone()
+	n, err := work.upgradeCollations(db.pageSize)
+	if err != nil {
+		return 0, err
+	}
+	if n > 0 {
+		db.committed = work
+	}
+	return n, nil
+}
+
 func (db *Database) SetDefaultCollation(name string) error {
 	if name == "C" {
 		db.committed.defaultCollation = ""

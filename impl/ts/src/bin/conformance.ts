@@ -88,6 +88,14 @@ function parseFixtureDirective(line: string): string | null {
   return body === "" ? null : body;
 }
 
+// parseUpgradeCollationsDirective reports whether the line is a `# upgrade-collations:` directive — a
+// file-level ACTION that runs the COLLATION UPGRADE migration (db.upgradeCollations) on the running
+// database, clearing a version-skew so the records after it run against the migrated (read-write)
+// state (spec/design/collation.md §12; capability harness.upgrade_collations).
+function parseUpgradeCollationsDirective(line: string): boolean {
+  return line.replace(/^#/, "").trim().startsWith("upgrade-collations:");
+}
+
 // openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
 // spec/). The harness acts as the host: it first loads jed's pinned production bundle so any
 // referenced collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which
@@ -549,6 +557,14 @@ function runFile(text: string): void {
       const fx = parseFixtureDirective(line);
       if (fx !== null) {
         db = openFixture(fx);
+        c.i++;
+        continue;
+      }
+      // `# upgrade-collations:` (file-level) runs the COLLATION UPGRADE migration on the running DB —
+      // the privileged host op (db.upgradeCollations) that clears a version-skew (collation.md §12);
+      // the records after it assert the table is read-write again.
+      if (parseUpgradeCollationsDirective(line)) {
+        db.upgradeCollations();
         c.i++;
         continue;
       }

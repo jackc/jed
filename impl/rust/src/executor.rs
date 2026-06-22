@@ -346,6 +346,135 @@ impl Snapshot {
             .collect()
     }
 
+    /// The REINDEX / COLLATION UPGRADE migration (spec/design/collation.md §12): rebuild every
+    /// collated key stored under a version-**skewed** collation against the **loaded** table and
+    /// advance that collation's pin to the loaded version — clearing the skew so the affected tables
+    /// are read-write again and their collated indexes regain pushdown (a `Full` index,
+    /// encoding.md §2.12). Returns the number of collations re-pinned (`0` ⇒ nothing was skewed, a
+    /// no-op).
+    ///
+    /// **Whole-database, per-collation pin.** The pin is **one entry per collation NAME** (§5), so a
+    /// collation's pin may advance only once **every** key under it (across all tables) is rebuilt —
+    /// else a not-yet-rebuilt table would falsely read as `Full` (silent corruption). This rebuilds
+    /// all skewed collations' keys and re-pins them together; the caller swaps the result in atomically
+    /// (one root publish). Adoption is **explicit** — never automatic on open (§12).
+    ///
+    /// `resolve_collation` already yields the loaded table data (the file entry carries the file
+    /// *pin* but the loaded singles/contractions — `decode_collation_entry`), so re-encoding a key
+    /// produces **loaded-version** sort keys; the re-pin only realigns the version label.
+    pub(crate) fn upgrade_collations(&mut self, page_size: u32) -> Result<usize> {
+        // 1. The skewed set: referenced collations whose file pin differs from the loaded version.
+        let skewed: std::collections::BTreeSet<String> = self
+            .referenced_collations()?
+            .into_iter()
+            .filter(|c| self.collation_skew(&c.name).is_some())
+            .map(|c| c.name.clone())
+            .collect();
+        if skewed.is_empty() {
+            return Ok(0);
+        }
+        let is_skewed = |coll: &Option<String>| coll.as_ref().is_some_and(|n| skewed.contains(n));
+
+        // 2. Rebuild each affected table's collated trees under the loaded collations. Sorted table
+        // order so no HashMap iteration order leaks (CLAUDE.md §8); the per-table rebuilds are
+        // independent and the re-pin is order-free, so the result is order-invariant regardless, but
+        // the sort keeps it manifestly so.
+        let mut table_keys: Vec<String> = self.tables.keys().cloned().collect();
+        table_keys.sort();
+        for key in table_keys {
+            let table = self
+                .tables
+                .get(&key)
+                .expect("table key from this map")
+                .clone();
+            // A collated PK key is re-encoded ⇒ every row's storage key moves ⇒ a full table rewrite,
+            // and since an index entry carries the storage key as its suffix (indexes.md §3) every
+            // index of the table must be rebuilt too. Otherwise only the indexes whose own key
+            // columns use a skewed collation are rebuilt (the table store keeps its keys). A skewed
+            // collation used ONLY by a non-key column needs no rebuild — values are version-independent.
+            let pk_skewed = table
+                .pk
+                .iter()
+                .any(|&i| is_skewed(&table.columns[i].collation));
+            let indexes: Vec<IndexDef> = table
+                .indexes
+                .iter()
+                .filter(|idx| {
+                    pk_skewed
+                        || idx
+                            .columns
+                            .iter()
+                            .any(|&c| is_skewed(&table.columns[c].collation))
+                })
+                .cloned()
+                .collect();
+            if !pk_skewed && indexes.is_empty() {
+                continue;
+            }
+            // The per-column collations resolved against the LOADED set (the table data is loaded;
+            // only the pin label is the file version) — what re-encodes each key to the loaded version.
+            let colls: Vec<Option<std::sync::Arc<Collation>>> = table
+                .columns
+                .iter()
+                .map(|c| c.collation.as_ref().and_then(|n| self.resolve_collation(n)))
+                .collect();
+            let pk: Vec<(usize, Type)> = table
+                .pk
+                .iter()
+                .map(|&i| (i, table.columns[i].ty.clone()))
+                .collect();
+            // Read every (storage key, row) pair, fully materialized (a spilled non-key value must
+            // survive a table rewrite). A collated key column never spills (§2.12 narrowing b), so
+            // the keys are always inline.
+            let mut entries: Vec<(Vec<u8>, Row)> = {
+                let store = self.store(&key);
+                let mut es = store.iter_entries()?;
+                for (_, row) in &mut es {
+                    store.resolve_all(row)?;
+                }
+                es
+            };
+            // The NEW storage key per row: re-encoded under the loaded collation if the PK moved,
+            // else the existing key (unchanged — includes a synthetic rowid table, which has no PK).
+            for (k, row) in &mut entries {
+                if pk_skewed {
+                    *k = encode_pk_key(&pk, &colls, row)?;
+                }
+            }
+            // 2a. Re-key the table store (fresh empty store via `put_table`, then re-insert).
+            if pk_skewed {
+                self.put_table(table.clone(), page_size);
+                for (k, row) in &entries {
+                    self.store_mut(&key).insert(k.clone(), row.clone())?;
+                }
+            }
+            // 2b. Rebuild each affected index store from the (re-keyed) rows.
+            let cap = page_size as usize - 12; // PAGE_HEADER
+            for def in &indexes {
+                let mut ekeys: Vec<Vec<u8>> = Vec::new();
+                for (k, row) in &entries {
+                    ekeys.extend(index_entry_keys(&table.columns, &colls, def, k, row)?);
+                }
+                ekeys.sort_unstable();
+                let mut fresh = TableStore::new(cap, Vec::new());
+                for ek in ekeys {
+                    fresh.insert(ek, Vec::new())?;
+                }
+                self.put_index_store(def.name.to_ascii_lowercase(), fresh);
+            }
+        }
+
+        // 3. Advance each skewed collation's pin to the loaded version (realign the label to the
+        // table data already in use). `referenced_collations` then resolves the advanced pin and the
+        // commit persists it; `collation_skew` now returns `None` (Full) for each.
+        for name in &skewed {
+            if let Some(loaded) = crate::collation::loaded_collation(name) {
+                self.put_collation(loaded);
+            }
+        }
+        Ok(skewed.len())
+    }
+
     /// The per-database default collation name, or `None` for `C` (spec/design/collation.md §1).
     pub(crate) fn default_collation(&self) -> Option<&str> {
         self.default_collation.as_deref()
@@ -2218,6 +2347,25 @@ impl Database {
         }
         self.committed.set_default_collation(Some(name.to_string()));
         Ok(())
+    }
+
+    /// Adopt a newly-loaded Unicode version for this database's skewed collations
+    /// (`db.UpgradeCollations` — the REINDEX / COLLATION UPGRADE migration, spec/design/collation.md
+    /// §12). A **privileged host op** like [`Database::set_default_collation`] — **not** SQL-reachable,
+    /// so an untrusted query can never trigger it (CLAUDE.md §13). For every collation whose file pin
+    /// differs from the loaded bundle (`Skewed`), it rebuilds the collated keys (PK + indexes) under
+    /// the loaded table and re-pins the stamp, clearing the skew so the affected tables are read-write
+    /// again and regain collated-index pushdown. Whole-database + atomic (the rebuild stages in a
+    /// snapshot clone swapped in only on success); idempotent (no skew ⇒ a no-op returning `0`). The
+    /// change is persisted by the next explicit [`Database::commit`]. Returns the number of collations
+    /// re-pinned.
+    pub fn upgrade_collations(&mut self) -> Result<usize> {
+        let mut work = self.committed.clone();
+        let n = work.upgrade_collations(self.page_size)?;
+        if n > 0 {
+            self.committed = work;
+        }
+        Ok(n)
     }
 
     /// The per-database default collation name — `"C"` (byte order) unless `set_default_collation`
@@ -22157,5 +22305,56 @@ mod skew_tests {
             let err = crate::execute(&mut db, sql).expect_err(sql);
             assert_eq!(err.code(), "XX002", "{sql} must be XX002");
         }
+    }
+
+    /// The COLLATION UPGRADE migration (`db.upgrade_collations`, collation.md §12) clears the skew:
+    /// after it the collation's pin is the loaded version, `db.collations()` reports Full, and the
+    /// table is read-write again. Asserts the internal state the shared corpus
+    /// (`suites/collation/collation_upgrade.test`) cannot read — the verdict-flip + the re-pin count —
+    /// plus idempotence (a second upgrade re-pins nothing). The skew injection mirrors the test above.
+    #[test]
+    fn upgrade_clears_skew() {
+        load_bundle();
+        let mut db = Database::new();
+        crate::execute(
+            &mut db,
+            "CREATE TABLE t (x text COLLATE \"unicode\" PRIMARY KEY)",
+        )
+        .unwrap();
+        crate::execute(&mut db, "INSERT INTO t VALUES ('b'), ('a')").unwrap();
+        // Inject skew (a file built under a prior bundle), as in the test above.
+        let loaded = crate::collation::loaded_collation("unicode").unwrap();
+        let mut skewed = (*loaded).clone();
+        skewed.unicode_version = "0.0.0".to_string();
+        db.committed.put_collation(Arc::new(skewed));
+        assert_eq!(
+            db.collations()
+                .iter()
+                .find(|c| c.name == "unicode")
+                .unwrap()
+                .verdict,
+            CollationVerdict::Skewed,
+            "skewed before upgrade"
+        );
+
+        // The migration re-pins the one skewed collation and rebuilds its (collated PK) table.
+        assert_eq!(
+            db.upgrade_collations().unwrap(),
+            1,
+            "one collation re-pinned"
+        );
+
+        // The verdict is now Full, the pin advanced to the loaded version, and writes succeed again.
+        let uni = db
+            .collations()
+            .into_iter()
+            .find(|c| c.name == "unicode")
+            .expect("unicode referenced");
+        assert_eq!(uni.verdict, CollationVerdict::Full, "Full after upgrade");
+        assert_eq!(uni.unicode_version, loaded.unicode_version);
+        crate::execute(&mut db, "INSERT INTO t VALUES ('c')").expect("writable after upgrade");
+
+        // Idempotent: nothing is skewed now, so a second upgrade re-pins zero collations.
+        assert_eq!(db.upgrade_collations().unwrap(), 0, "idempotent no-op");
     }
 }

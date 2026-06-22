@@ -105,6 +105,17 @@ Conventions, fixed here so every implementation renders identically:
   the collation version-skew read-safety regression `suites/collation/skew.test` /
   `skew_full.test` ([collation.md](collation.md) §12/§14).
 
+- **`# upgrade-collations:` action** — a file-level `# upgrade-collations:` comment that runs the
+  **COLLATION UPGRADE migration** (`db.upgrade_collations()`) on the running database mid-file — the
+  privileged host op that clears a version-skew by rebuilding the skewed collated keys against the
+  loaded version and re-pinning the stamp ([collation.md §12](collation.md)). It is an *action*, like
+  `# load-collation:` (it runs when read, binds to no record), not a pending assertion. Paired with
+  `# fixture:` it lets a shared corpus test drive the full **skew → migrate → writable** arc on a
+  pre-built skewed image: assert a write is `XX002` (still skewed), `# upgrade-collations:`, then
+  assert the same write succeeds and a query is served correctly (and cheaply — pushdown) by the
+  rebuilt index. Gated by the **`harness.upgrade_collations`** capability (§3) so an unimplementing
+  core skips the file cleanly. Coverage: `suites/collation/collation_upgrade.test`.
+
 ### 1.1 Why stay format-compatible
 
 CLAUDE.md §12 keeps `sqllogictest-rs` checked out as a reference runner for `impl/rust`'s

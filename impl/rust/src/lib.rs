@@ -508,6 +508,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
     // §12/§14, spec/design/conformance.md). Reconstructed in memory via `Database::from_image`.
     "harness.fixture_open",
+    // The `# upgrade-collations:` directive runs the COLLATION UPGRADE migration
+    // (`db.upgrade_collations`) on the running DB — clears a version-skew so a corpus test can drive
+    // skew→migrate→writable end to end (spec/design/collation.md §12).
+    "harness.upgrade_collations",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

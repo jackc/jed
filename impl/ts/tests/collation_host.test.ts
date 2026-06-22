@@ -303,3 +303,24 @@ test("a version-skewed collation blocks writes but reads still work", () => {
     );
   }
 });
+
+test("upgradeCollations clears the skew", () => {
+  // The COLLATION UPGRADE migration (db.upgradeCollations, collation.md §12) clears the skew: after
+  // it the collation's pin is the loaded version, db.collations() reports Full, and the table is
+  // read-write again. Asserts the internal state the shared corpus
+  // (suites/collation/collation_upgrade.test) cannot read — the verdict-flip + the re-pin count —
+  // plus idempotence. The skew injection mirrors the test above.
+  loadFixtureBundle();
+  const db = new Database();
+  exec(db, `CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`);
+  exec(db, `INSERT INTO t VALUES ('b'), ('a')`);
+  const loaded = loadedCollation("unicode")!;
+  db.committed.collations.set("unicode", { ...loaded, unicodeVersion: "0.0.0" });
+
+  assert.equal(db.upgradeCollations(), 1); // one collation re-pinned
+  const uni = db.collations().find((c) => c.name === "unicode");
+  assert.equal(uni!.verdict, "full");
+  assert.equal(uni!.unicodeVersion, loaded.unicodeVersion);
+  exec(db, `INSERT INTO t VALUES ('c')`); // writable after upgrade
+  assert.equal(db.upgradeCollations(), 0); // idempotent no-op
+});

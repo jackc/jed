@@ -442,6 +442,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // cannot construct — e.g. the version-skew read-safety regression (spec/design/collation.md
   // §12/§14, spec/design/conformance.md). Reconstructed in memory via loadDatabase.
   "harness.fixture_open",
+  // The `# upgrade-collations:` directive runs the COLLATION UPGRADE migration
+  // (db.upgradeCollations) on the running DB — clears a version-skew so a corpus test can drive
+  // skew→migrate→writable end to end (spec/design/collation.md §12).
+  "harness.upgrade_collations",
 ];
 
 // execute parses and executes one SQL statement against db (no bind parameters).

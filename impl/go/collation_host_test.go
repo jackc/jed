@@ -393,6 +393,52 @@ func TestSkewedCollationBlocksWrites(t *testing.T) {
 	}
 }
 
+func TestUpgradeCollationsClearsSkew(t *testing.T) {
+	// The COLLATION UPGRADE migration (db.UpgradeCollations, collation.md §12) clears the skew: after
+	// it the collation's pin is the loaded version, db.Collations reports Full, and the table is
+	// read-write again. Asserts the internal state the shared corpus
+	// (suites/collation/collation_upgrade.test) cannot read — the verdict-flip + the re-pin count —
+	// plus idempotence. The skew injection mirrors TestSkewedCollationBlocksWrites.
+	loadFixtureBundle(t)
+	db := NewDatabase()
+	for _, sql := range []string{
+		`CREATE TABLE t (x text COLLATE "unicode" PRIMARY KEY)`,
+		`INSERT INTO t VALUES ('b'), ('a')`,
+	} {
+		if _, err := Execute(db, sql); err != nil {
+			t.Fatalf("%s: unexpected error %v", sql, err)
+		}
+	}
+	loaded := LoadedCollation("unicode")
+	skewed := *loaded
+	skewed.UnicodeVersion = "0.0.0"
+	db.committed.collations["unicode"] = &skewed
+
+	n, err := db.UpgradeCollations()
+	if err != nil {
+		t.Fatalf("upgrade: %v", err)
+	}
+	if n != 1 {
+		t.Fatalf("re-pinned: got %d, want 1", n)
+	}
+	for _, c := range db.Collations() {
+		if c.Name == "unicode" {
+			if c.Verdict != VerdictFull {
+				t.Fatalf("unicode verdict after upgrade: got %v, want Full", c.Verdict)
+			}
+			if c.UnicodeVersion != loaded.UnicodeVersion {
+				t.Fatalf("unicode pin after upgrade: got %q, want %q", c.UnicodeVersion, loaded.UnicodeVersion)
+			}
+		}
+	}
+	if _, err := Execute(db, `INSERT INTO t VALUES ('c')`); err != nil {
+		t.Fatalf("writable after upgrade: %v", err)
+	}
+	if n, err := db.UpgradeCollations(); err != nil || n != 0 {
+		t.Fatalf("idempotent no-op: got (%d, %v), want (0, nil)", n, err)
+	}
+}
+
 func TestCollationOpenRefusesAbsent(t *testing.T) {
 	// A file that references a collation NO loaded bundle provides is the graded verdict's legible
 	// refusal (collation.md §12, slice 2d): decoding the reference entry fails with XX002 naming it +

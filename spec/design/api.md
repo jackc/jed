@@ -324,6 +324,7 @@ only and the engine has no wire protocol).
 | inject random source (§10) | `db.set_random_source(f)` / `db.clear_random_source()` | `db.SetRandomSource(f)` / `db.ClearRandomSource()` | `db.setRandomSource(f)` / `db.clearRandomSource()` |
 | inject clock source (§10) | `db.set_clock_source(f)` / `db.clear_clock_source()` | `db.SetClockSource(f)` / `db.ClearClockSource()` | `db.setClockSource(f)` / `db.clearClockSource()` |
 | load Unicode data (collation.md §4) | `db.load_unicode_data(r)` | `db.LoadUnicodeData(r)` | `db.loadUnicodeData(bytes)` |
+| upgrade collations — clear a version-skew (collation.md §12) | `db.upgrade_collations() -> usize` | `db.UpgradeCollations() (int, error)` | `db.upgradeCollations(): number` |
 | table lookup (catalog) | `db.table(name) -> Option<&Table>` | `db.Table(name) (*Table, bool)` | `db.table(name): Table \| undefined` |
 | table names (catalog) | `db.table_names() -> Vec<String>` | `db.TableNames() []string` | `db.tableNames(): string[]` |
 
@@ -474,4 +475,8 @@ per-query draw and introduces no nondeterminism — the bytes are jed's own pinn
 storage seam, the host owns where they come from (a file, a fetch, or a compiled-in `include_bytes!` /
 `//go:embed` / bundled asset) and the engine does no I/O. A bare binary with no bundle loaded is `C`
 collation + ASCII casing only ([collation.md §16](collation.md)). It is a handle setting, additive
-across calls, never a per-statement argument.
+across calls, never a per-statement argument. The sibling **`db.upgrade_collations()`** is the same
+kind of privileged, not-SQL-reachable host op: after loading a *newer* bundle, it adopts that version
+for this database — rebuilding the collated keys whose pin is now skewed and re-pinning the stamp, so
+the affected tables are read-write again ([collation.md §12](collation.md)). Whole-database, atomic,
+idempotent (returns the count of collations re-pinned; persisted by the next explicit `commit`).

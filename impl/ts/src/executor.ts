@@ -521,6 +521,73 @@ export class Snapshot {
     });
   }
 
+  // upgradeCollations is the REINDEX / COLLATION UPGRADE migration (spec/design/collation.md §12):
+  // rebuild every collated key stored under a version-SKEWED collation against the LOADED table and
+  // advance that collation's pin to the loaded version — clearing the skew so the affected tables are
+  // read-write again and their collated indexes regain pushdown (a Full index, encoding.md §2.12).
+  // Returns the number of collations re-pinned (0 ⇒ nothing skewed, a no-op).
+  //
+  // Whole-database, per-collation pin: the pin is ONE entry per collation NAME (§5), so a collation's
+  // pin may advance only once every key under it is rebuilt — else a not-yet-rebuilt table would
+  // falsely read as Full (corruption). The caller swaps the result in atomically. resolveCollation
+  // already yields the loaded table data (the file entry carries the file pin but loaded
+  // singles/contractions), so re-encoding produces loaded-version sort keys; the re-pin realigns the label.
+  upgradeCollations(pageSize: number): number {
+    const skewed = new Set<string>();
+    for (const c of this.referencedCollations()) {
+      if (this.collationSkew(c.name) !== undefined) skewed.add(c.name);
+    }
+    if (skewed.size === 0) return 0;
+    const isSkewed = (coll: string | null): boolean => coll !== null && skewed.has(coll);
+
+    // Sorted table order (no Map-iteration leak, CLAUDE.md §8; the per-table rebuilds are independent
+    // and the re-pin is order-free, so the result is order-invariant regardless).
+    for (const key of [...this.tables.keys()].sort()) {
+      const table = this.tables.get(key)!;
+      // A collated PK re-encode moves every storage key ⇒ a full table rewrite, and an index entry
+      // carries the storage key as its suffix (indexes.md §3) ⇒ every index of the table is rebuilt.
+      // Else only the indexes whose own key columns use a skewed collation are rebuilt.
+      const pkSkewed = table.pk.some((i) => isSkewed(table.columns[i]!.collation));
+      const indexes = table.indexes.filter(
+        (idx) => pkSkewed || idx.columns.some((c) => isSkewed(table.columns[c]!.collation)),
+      );
+      if (!pkSkewed && indexes.length === 0) continue;
+      const colls: (Collation | null)[] = table.columns.map((c) =>
+        c.collation !== null ? (this.resolveCollation(c.collation) ?? null) : null,
+      );
+      // Read every (storage key, row) pair, fully materialized (a spilled non-key value must survive
+      // a rewrite; a collated key column never spills — §2.12 narrowing b).
+      const store = this.store(table.name);
+      const entries: Entry[] = store
+        .entriesInKeyOrder()
+        .map((e) => ({ key: e.key, row: store.resolveAll(e.row) }));
+      // The NEW storage key per row: re-encoded under the loaded collation if the PK moved, else the
+      // existing key (unchanged — includes a synthetic-rowid table, which has no PK).
+      if (pkSkewed) {
+        for (const e of entries) e.key = encodePkKey(table, table.pk, colls, e.row);
+        this.putTable(table, pageSize); // fresh empty store (+ re-register the same table)
+        const fresh = this.store(table.name);
+        for (const e of entries) fresh.insert(e.key, e.row);
+      }
+      // Rebuild each affected index store from the (re-keyed) rows.
+      for (const def of indexes) {
+        const ekeys: Uint8Array[] = [];
+        for (const e of entries)
+          ekeys.push(...indexEntryKeys(table.columns, colls, def, e.key, e.row));
+        ekeys.sort(compareBytes);
+        const fresh = new TableStore(pageSize - 12, []); // 12 = PAGE_HEADER
+        for (const ek of ekeys) fresh.insert(ek, []);
+        this.putIndexStore(def.name.toLowerCase(), fresh);
+      }
+    }
+    // Advance each skewed collation's pin to the loaded version.
+    for (const name of skewed) {
+      const loaded = loadedCollation(name);
+      if (loaded !== undefined) this.collations.set(name, loaded);
+    }
+    return skewed.size;
+  }
+
   // sequencesOwnedBy returns the lowercased keys of every sequence OWNED BY the table `name`
   // (case-insensitive) — the serial-created sequences DROP TABLE must auto-drop
   // (spec/design/sequences.md §12). Sorted so the auto-drop is deterministic (no map-iteration
@@ -2020,6 +2087,22 @@ export class Database {
   // moved it (db.defaultCollation, spec/design/collation.md §1).
   defaultCollation(): string {
     return this.committed.defaultCollation ?? "C";
+  }
+
+  // upgradeCollations adopts a newly-loaded Unicode version for this database's skewed collations
+  // (the REINDEX / COLLATION UPGRADE migration, spec/design/collation.md §12). A privileged host op
+  // like setDefaultCollation — NOT SQL-reachable, so an untrusted query can never trigger it
+  // (CLAUDE.md §13). For every collation whose file pin differs from the loaded bundle (Skewed) it
+  // rebuilds the collated keys (PK + indexes) under the loaded table and re-pins the stamp, clearing
+  // the skew so the affected tables are read-write again and regain collated-index pushdown.
+  // Whole-database + atomic (the rebuild stages in a snapshot clone swapped in only on success);
+  // idempotent (no skew ⇒ a no-op returning 0). Persisted by the next explicit commit. Returns the
+  // number of collations re-pinned.
+  upgradeCollations(): number {
+    const work = this.committed.clone();
+    const n = work.upgradeCollations(this.pageSize);
+    if (n > 0) this.committed = work;
+    return n;
   }
 
   // collations introspects the collations THIS DATABASE references (db.collations,

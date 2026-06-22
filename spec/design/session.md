@@ -348,6 +348,12 @@ unaffected and the §5.3 default-deny posture holds; the untrusted-scratch patte
 `allow_ddl = off` + explicit `allow_temp_ddl = on`. The gates land with the temp-table slices
 (`allow_temp_ddl` in slice 1, `allow_shared_temp_ddl` in slice 2).
 
+The capability envelope governs the **SQL surface** only. Privileged **host-API** maintenance ops —
+`db.load_unicode_data`, `db.set_default_collation`, and `db.upgrade_collations()` (the COLLATION
+UPGRADE migration, [collation.md §12](collation.md)) — are **not SQL-reachable**, so they sit
+**outside** this envelope entirely: no `allow_ddl` gate applies, and an untrusted query can never
+trigger them ([collation.md §11](collation.md), CLAUDE.md §13). The host decides when to call them.
+
 **Enforcement** is at **name resolution**, after a name resolves to a catalog object: a missing
 privilege raises **`42501 insufficient_privilege`** — PostgreSQL's own permission-denied code
 (messages "permission denied for table t" / "for function f"), matched on the canonical

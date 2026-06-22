@@ -95,12 +95,14 @@
 >   the heap-scan fallback that is jed's *existing* collated execution path; a write that would mix two
 >   orderings in one B-tree is refused `XX002`), and an **entirely absent** referenced collation
 >   **refuses the open** `XX002` (was `42704`). No `format_version` bump — the verdict is a pure
->   comparison of data already in the file (§5) + the loaded set. The `REINDEX`/`COLLATION UPGRADE`
->   migration that clears a skew is a **follow-on**.
+>   comparison of data already in the file (§5) + the loaded set.
+> - **Landed since (collated-index pushdown + COLLATION UPGRADE):** a collated PK/index now **pushes
+>   down** equality + range bounds, skew-aware (§8); and the **`db.upgrade_collations()`** host op
+>   clears a version-skew (rebuilds the skewed collated keys against the loaded version + re-pins),
+>   so a skewed table is read-only only until that one explicit call (§12).
 > - **Not yet built (Slice 3 remainder):** `initcap` (word-boundary titlecasing) + `normalize`/regex
 >   (deferred property sub-tables); implicit weights / the full CJK tier-3 root; the broader LDML
->   tailoring features (and the sv/da/de tailorings that need them); the `REINDEX`/`COLLATION UPGRADE`
->   migration (the 2d follow-on that rebuilds + re-pins a skewed table). (The slice-2 "embedder-chosen
+>   tailoring features (and the sv/da/de tailorings that need them). (The slice-2 "embedder-chosen
 >   footprint tiers" are **superseded** by Slice 3's builder-tool bundle presets — §13.)
 >
 > Two foundational choices are unchanged: the definition format is the **UCA/CLDR standards** (DUCET
@@ -664,12 +666,14 @@ Collation is a §8 divergence hotspot handled by the established machinery:
 
 ## 12. Migration and version adoption
 
-> **Status: the graded verdict LANDED (Slice 2d, all three cores).** The three cases below are
-> implemented as a pure on-demand comparison of the file's pin (§5) against the loaded bundle's
-> version — `XX002` registered, no `format_version` bump (§14 2d for the full scope + the two
-> deliberate narrowings: an *absent* referenced collation refuses the open rather than degrading
-> per-object, and the `REINDEX`/`COLLATION UPGRADE` step is a follow-on, so a skewed table is
-> read-only until it lands).
+> **Status: the graded verdict LANDED (Slice 2d) and the COLLATION UPGRADE migration LANDED (all
+> three cores).** The three cases below are implemented as a pure on-demand comparison of the file's
+> pin (§5) against the loaded bundle's version — `XX002` registered, no `format_version` bump. The
+> migration that clears a skew (third bullet) is now real: the privileged host op
+> `db.upgrade_collations()` rebuilds the skewed collated keys against the loaded version + re-pins, so
+> a skewed table is read-only only **until that one explicit call**, no longer "until you recreate it"
+> (§14 — "Collated-index pushdown" / the migration slice). One deliberate narrowing remains: an
+> *absent* referenced collation refuses the open rather than degrading per-object.
 
 The reference-only model (§3) keeps a jed upgrade from *silently* breaking a file, while pinning +
 the graded verdict make any genuine version move legible:
@@ -684,13 +688,23 @@ the graded verdict make any genuine version move legible:
   index is not used for acceleration and not maintained — or, for an entirely absent read-required
   dependency, **refuses legibly** naming the missing collation + version. The optional `.coll` hash
   (§5) catches a *mis-built* bundle that carries wrong bytes under the right version label.
-- **Adopting a newer Unicode/CLDR version is explicit and opt-in.** Loading a bundle built on the new
-  version + a `REINDEX` (or an `ALTER … COLLATION UPGRADE`-style op, named at the slice) rebuilds the
-  affected indexes against the newly-loaded table and re-pins the stamp. The user chooses when to pay
-  the re-sort; nothing forces it. (This is the concrete cost reference-only adds over the old
-  bake-forever model: after a jed Unicode bump an old file is **read-only until REINDEX** on the new
-  binary, rather than fully usable forever — accepted because the data stays readable, the
-  degradation is legible, and collation versions move rarely.)
+- **Adopting a newer Unicode/CLDR version is explicit and opt-in (✅ landed).** Loading a bundle built
+  on the new version + the **`db.upgrade_collations()`** host op rebuilds the affected collated keys
+  against the newly-loaded table and re-pins the stamp, clearing the skew so the table is read-write
+  again and its collated indexes regain pushdown (§8). The user chooses when to pay the re-sort;
+  nothing forces it (never automatic on open). (This is the concrete cost reference-only adds over the
+  old bake-forever model: after a jed Unicode bump an old file is **read-only until
+  `upgrade_collations()`** on the new binary, rather than fully usable forever — accepted because the
+  data stays readable, the degradation is legible, and collation versions move rarely.) The migration
+  is a **privileged host op** (like `db.LoadUnicodeData` — §4.2/§11), **not SQL-reachable**: an
+  untrusted query can never trigger it (CLAUDE.md §13), and the host that loaded the new bundle is the
+  natural actor. It is **whole-database, per-collation**: the pin is one entry per collation name (§5),
+  so a collation's pin may advance only once *every* key under it is rebuilt (else a not-yet-rebuilt
+  table would falsely read as `Full`) — so one call rebuilds all skewed collations' keys and re-pins
+  them together, atomically. Mechanics: a collated **PK** re-encode moves every storage key (a full
+  table rewrite) and cascades to every index of the table (the entry's storage-key suffix changed,
+  encoding.md §2.12); a skewed **secondary** index is rebuilt alone; a skewed collation used only by a
+  non-key column needs no rebuild (values are version-independent, [compatibility.md §4.1](compatibility.md)).
 
 This is still a sharp contrast with PostgreSQL: PG depends on the **host OS's** ICU/glibc, which
 drifts *silently* under an OS upgrade and may corrupt an index with only a `collversion` warning.
@@ -881,10 +895,10 @@ leans on:
   `42704`) rather than opening the rest of the database read-only — the conservative resolution of
   [compatibility.md §12](compatibility.md) open decision #3, since the per-object "open succeeds,
   degrade" path would need the in-memory table to tolerate having no data. (b) The
-  **`REINDEX`/`ALTER … COLLATION UPGRADE` migration** that rebuilds a skewed table's collated keys
-  against the loaded version and re-pins the stamp — clearing the skew so the table is read-write
-  again — is **split to a follow-on**; until it lands a skewed file is read-only (a host can still
-  rebuild by recreating). Skew has **no PostgreSQL analog** (PG's `collversion` posture is the
+  **COLLATION UPGRADE migration** that rebuilds a skewed table's collated keys against the loaded
+  version and re-pins the stamp — clearing the skew so the table is read-write again — was split to a
+  follow-on and **has since landed** (the migration slice below: the host op `db.upgrade_collations()`).
+  Skew has **no PostgreSQL analog** (PG's `collversion` posture is the
   opposite — host-OS-drift, §15), so the behavior is verified by **per-core unit tests** (the verdict
   is a deterministic pure function — every core computes the identical verdict, the §10 cross-core
   contract — and the write-block + read-correctness), not the oracle corpus (CLAUDE.md §10).
@@ -933,6 +947,25 @@ leans on:
   `suites/collation/collated_pushdown.test` (PK eq/range/miss, the index eq, and the `COLLATE "C"`
   full-scan contrast); a probe whose sort key cannot be built (an unmapped code point, `0A000`)
   contributes no bound, widening to a full scan + residual so behavior matches the non-pushdown path.
+
+- **COLLATION UPGRADE migration** ✅ *landed (all three cores)*: the 2d follow-on that clears a
+  version-skew. A **privileged host op** `db.upgrade_collations()` (Rust `upgrade_collations`, Go
+  `UpgradeCollations`, TS `upgradeCollations`) — **not SQL-reachable** (an untrusted query can never
+  trigger it, CLAUDE.md §13), like `db.LoadUnicodeData`. For every collation whose file pin differs
+  from the loaded bundle (`Skewed`) it rebuilds the collated keys under the loaded table and re-pins
+  the stamp, clearing the skew so the affected tables are read-write again and their collated indexes
+  regain pushdown. **Whole-database, per-collation, atomic** (the pin is one entry per name §5, so all
+  keys under a collation are rebuilt before its pin advances — else a not-yet-rebuilt table would
+  falsely read `Full`; the rebuild stages in a snapshot clone swapped in only on success); idempotent
+  (no skew ⇒ `0` re-pinned). Mechanics: a collated **PK** re-encode rewrites the table + cascades to
+  all its indexes (storage-key suffix moved); a skewed **secondary** index is rebuilt alone; a non-key
+  collated column needs no rebuild (values are version-independent). No `format_version` bump (re-pin
+  + rebuilt trees are normal v18 writes; persisted by the next explicit `commit`). The shared corpus
+  `suites/collation/collation_upgrade.test` drives the full arc on the skewed fixture — write `XX002`
+  → `# upgrade-collations:` (the new harness directive, capability `harness.upgrade_collations`,
+  conformance.md §1) → the same write succeeds + the query is served by the rebuilt index (cost drops
+  from the heap scan to the index seek). The internal verdict-flip + the re-pin count are per-core unit
+  tests (the introspection the corpus cannot read — CLAUDE.md §10).
 
 **Slice 3 — host-loaded Unicode-data bundle** (this revision; **not yet built**), in dependency
 order. This **supersedes** the slice-2 "footprint tiers / `include_bytes!` embed" still-pending items

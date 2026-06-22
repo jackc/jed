@@ -186,6 +186,14 @@ func parseFixtureDirective(line string) (string, bool) {
 	return body, true
 }
 
+// parseUpgradeCollationsDirective reports whether the line is a `# upgrade-collations:` directive — a
+// file-level ACTION that runs the COLLATION UPGRADE migration (db.UpgradeCollations) on the running
+// database, clearing a version-skew so the records after it run against the migrated (read-write)
+// state (spec/design/collation.md §12; capability harness.upgrade_collations).
+func parseUpgradeCollationsDirective(line string) bool {
+	return strings.HasPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "upgrade-collations:")
+}
+
 // openFixture opens the pre-built database image named by a `# fixture:` directive (path relative to
 // spec/). The harness acts as the host: it first loads jed's pinned production bundle so any
 // referenced collation resolves on open (a skewed pin still resolves — to a DIFFERENT version, which
@@ -644,6 +652,16 @@ func runFile(text string) error {
 					return err
 				}
 				db = fixtureDB
+				i++
+				continue
+			}
+			// `# upgrade-collations:` (file-level) runs the COLLATION UPGRADE migration on the running
+			// DB — the privileged host op (db.UpgradeCollations) that clears a version-skew
+			// (collation.md §12); the records after it assert the table is read-write again.
+			if parseUpgradeCollationsDirective(line) {
+				if _, err := db.UpgradeCollations(); err != nil {
+					return fmt.Errorf("upgrade-collations: %s", err.Error())
+				}
 				i++
 				continue
 			}

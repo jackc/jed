@@ -303,8 +303,11 @@ Collation is Tier 2 and the first thing to exercise this model. The decisions re
 
 - **One Unicode version pinned per file.** The file records `(unicode_version, cldr_version)`;
   *all* its collations are that version, so two columns both `COLLATE "de"` can never disagree.
-  Changing a file's version is a deliberate **migration** (rebuild collated indexes), never an
-  accident of which binary touched it when.
+  Changing a file's version is a deliberate **migration** (rebuild collated keys + re-pin), never an
+  accident of which binary touched it when. **This migration is now real** — the privileged host op
+  `db.upgrade_collations()` ([collation.md §12](collation.md)) — so the "rebuild on migration"
+  degradation-recovery this model assumes is implemented for the collation instance, not just
+  described.
 - **Reference-only, with degradation (settled).** [collation.md](collation.md) §3 has the file
   **reference** its collations by `name` + version and **never store the table**; the table itself is
   **loaded from a host-supplied `JUCD` bundle** (collation.md §9 — Slice 3 supersedes the slice-2

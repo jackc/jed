@@ -154,6 +154,14 @@ fn parse_fixture_directive(rest: &str) -> Option<String> {
     (!body.is_empty()).then(|| body.to_string())
 }
 
+/// Recognize the `# upgrade-collations:` directive body (any/empty body after the prefix). A
+/// file-level ACTION that runs the COLLATION UPGRADE migration (`db.upgrade_collations`) on the
+/// running database — the privileged host op a test drives to clear a version-skew and assert the
+/// table is read-write again (spec/design/collation.md §12; capability `harness.upgrade_collations`).
+fn parse_upgrade_collations_directive(rest: &str) -> bool {
+    rest.trim_start().starts_with("upgrade-collations:")
+}
+
 /// Open the pre-built database image named by a `# fixture:` directive (path relative to `spec/`).
 /// The harness acts as the host: it first loads jed's pinned production bundle so any referenced
 /// collation resolves on open (a skewed pin still resolves — to a *different* version, which is the
@@ -519,6 +527,14 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 db = open_fixture(&rel)?;
                 continue;
             }
+            // `# upgrade-collations:` (file-level) runs the COLLATION UPGRADE migration on the running
+            // DB — the privileged host op (`db.upgrade_collations`) that clears a version-skew
+            // (collation.md §12); the records after it assert the table is read-write again.
+            if parse_upgrade_collations_directive(rest) {
+                db.upgrade_collations()
+                    .map_err(|e| format!("upgrade-collations: {}", e.message))?;
+                continue;
+            }
             // `# cost:` / `# names:` / `# types:` bind to the next record; every other comment
             // is ignored.
             if let Some(n) = parse_cost_directive(rest) {
@@ -742,6 +758,10 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 // Mirror `run_file`: a fixture file evolves DB state from the pre-built image, not a
                 // fresh DB, so the cost walk sees the same starting state.
                 db = open_fixture(&rel).ok()?;
+            } else if parse_upgrade_collations_directive(rest) {
+                // Mirror `run_file`: clear a version-skew so the post-upgrade records run against the
+                // migrated (read-write) state.
+                db.upgrade_collations().ok()?;
             } else if parse_cost_directive(rest).is_some() {
                 pending_cost_line = Some(i);
             } else if let Some(n) = parse_lifetime_max_cost_directive(rest) {
