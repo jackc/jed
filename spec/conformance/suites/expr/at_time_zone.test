@@ -1,0 +1,140 @@
+# AT TIME ZONE — time-zone conversion for timestamptz/timestamp (spec/design/timezones.md §6,
+# grammar.md §49). `value AT TIME ZONE zone` converts between an instant and a local wall-clock
+# reading, both directions:
+#   timestamptz AT TIME ZONE zone -> timestamp    (render the UTC instant as local in the zone)
+#   timestamp   AT TIME ZONE zone -> timestamptz  (interpret the wall clock as in the zone -> UTC)
+#
+# The IANA tz data is HOST-LOADED: the bare binary carries none (UTC + fixed offsets are built in).
+# The `# load-timezone:` directive loads jed's pinned JTZ bundle (spec/tz/fixtures/tzdata.jtz,
+# IANA tzdata 2026a — Etc/UTC, America/New_York, Europe/Paris, Asia/Kolkata, Australia/Lord_Howe,
+# link US/Eastern -> America/New_York), exactly as a production host would. Oracle-checked against
+# postgres:18 (PGHOST socket). All values verified against PG.
+#
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: query.select, query.select_no_from, types.timestamp, types.timestamptz, expr.at_time_zone, resource.cost_metering
+
+# load-timezone: America/New_York
+
+# ============================================================================================
+# timestamptz -> timestamp : render the UTC instant as the local wall clock in the zone
+# ============================================================================================
+
+# EST (standard, UTC-5): 12:00 UTC -> 07:00 local
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'America/New_York'
+----
+2024-01-15 07:00:00
+
+# EDT (daylight, UTC-4): 12:00 UTC -> 08:00 local
+query T nosort
+SELECT timestamptz '2024-07-15 12:00:00+00' AT TIME ZONE 'America/New_York'
+----
+2024-07-15 08:00:00
+
+# Asia/Kolkata is a non-hour offset (+05:30) with no DST: 12:00 UTC -> 17:30 local
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'Asia/Kolkata'
+----
+2024-01-15 17:30:00
+
+# Australia/Lord_Howe runs a 30-minute DST step; southern summer is +11:00: 12:00 UTC -> 23:00 local
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'Australia/Lord_Howe'
+----
+2024-01-15 23:00:00
+
+# Past the last explicit transition (2099) the POSIX footer governs — still EDT in July
+query T nosort
+SELECT timestamptz '2099-07-01 12:00:00+00' AT TIME ZONE 'America/New_York'
+----
+2099-07-01 08:00:00
+
+# An alias (US/Eastern -> America/New_York) resolves to its target's rules
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'US/Eastern'
+----
+2024-01-15 07:00:00
+
+# UTC is built in (no loaded data needed) — the instant renders unchanged
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'UTC'
+----
+2024-01-15 12:00:00
+
+# A fixed numeric offset uses the POSIX sign convention (positive = WEST), matching PG:
+# '+05:30' means UTC-5:30, so 12:00 UTC -> 06:30 local
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE '+05:30'
+----
+2024-01-15 06:30:00
+
+# ============================================================================================
+# timestamp -> timestamptz : interpret the wall clock as local in the zone, producing the UTC instant
+# (rendered in UTC, the +00 suffix). Round-trips the EST case above.
+# ============================================================================================
+
+query T nosort
+SELECT timestamp '2024-01-15 07:00:00' AT TIME ZONE 'America/New_York'
+----
+2024-01-15 12:00:00+00
+
+# EDT direction
+query T nosort
+SELECT timestamp '2024-07-15 08:00:00' AT TIME ZONE 'America/New_York'
+----
+2024-07-15 12:00:00+00
+
+# ============================================================================================
+# Precedence: AT TIME ZONE binds tighter than the comparison operators (grammar.md §49)
+# ============================================================================================
+
+# (ts AT TIME ZONE 'UTC') = timestamp '...'  — parses without parens, true
+query B nosort
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'UTC' = timestamp '2024-01-15 12:00:00'
+----
+true
+
+# ============================================================================================
+# NULL propagation and ±infinity passthrough
+# ============================================================================================
+
+# A NULL zone -> NULL (the value is not even consulted)
+query B nosort
+SELECT (timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE NULL) IS NULL
+----
+true
+
+# ±infinity passes through unchanged (no offset applies), and the zone is not validated
+query T nosort
+SELECT timestamptz 'infinity' AT TIME ZONE 'America/New_York'
+----
+infinity
+
+query T nosort
+SELECT timestamptz '-infinity' AT TIME ZONE 'UTC'
+----
+-infinity
+
+# ============================================================================================
+# Errors
+# ============================================================================================
+
+# An unknown zone name is 22023 (invalid_parameter_value), PG's "time zone not recognized" — never
+# a silent substitution (timezones.md §6)
+statement error 22023
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'Mars/Phobos'
+
+# A non-text zone is 42804 (datatype_mismatch)
+statement error 42804
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 12345
+
+# ============================================================================================
+# Cost: each conversion charges the `timezone` unit at the evaluation site (cost.md, §10).
+# The exact value is pinned cross-core (rebaselined by the Rust harness).
+# ============================================================================================
+
+# cost: 3
+query T nosort
+SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'America/New_York'
+----
+2024-01-15 07:00:00

@@ -144,6 +144,33 @@ fn load_collation(name: &str) -> std::result::Result<(), String> {
     ))
 }
 
+/// Parse a `# load-timezone: [<zone>]` directive body — the corpus's host-free way to make the IANA
+/// time-zone data available before the records that use `AT TIME ZONE` (timezones.md §11). Loads
+/// jed's pinned `JTZ` bundle; an optional zone name is asserted to resolve. Returns the (possibly
+/// empty) zone name, or None if not this directive.
+fn parse_load_timezone_directive(rest: &str) -> Option<String> {
+    let body = rest.trim_start().strip_prefix("load-timezone:")?.trim();
+    Some(body.to_string())
+}
+
+/// Make the IANA time zones available to the records that follow (timezones.md §3.3/§11). The harness
+/// acts as the *host*: it loads jed's pinned production `JTZ` bundle (spec/tz/fixtures/tzdata.jtz)
+/// into the engine-global set via `db.LoadTimeZoneData` (idempotent — the set is global), then, if a
+/// zone name was given, asserts it now resolves. A named zone no loaded bundle provides fails the file.
+fn load_timezone(name: &str) -> std::result::Result<(), String> {
+    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/tz/fixtures/tzdata.jtz");
+    let bytes = std::fs::read(&path)
+        .map_err(|e| format!("load-timezone: read {}: {e}", path.display()))?;
+    jed::load_time_zone_data(&bytes)
+        .map_err(|e| format!("load-timezone: load tzdata.jtz: {}", e.message))?;
+    if name.is_empty() || jed::timezone::resolve_zone(name).is_some() {
+        return Ok(());
+    }
+    Err(format!(
+        "load-timezone: zone \"{name}\" is not provided by the loaded bundle"
+    ))
+}
+
 /// Parse a file-level `# fixture: <spec-relative-path>` directive — the corpus's way to run a file
 /// against a PRE-BUILT database image instead of a fresh `Database::new()`, so a test can exercise
 /// on-disk state that SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded
@@ -519,6 +546,13 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             // (spec/design/collation.md §2/§9/§10).
             if let Some((name, _files)) = parse_load_collation_directive(rest) {
                 load_collation(&name)?;
+                continue;
+            }
+            // `# load-timezone: [<zone>]` is an ACTION: load jed's pinned `JTZ` bundle into the
+            // engine-global set (and optionally assert a zone resolves) before the records that use
+            // `AT TIME ZONE` (timezones.md §11).
+            if let Some(name) = parse_load_timezone_directive(rest) {
+                load_timezone(&name)?;
                 continue;
             }
             // `# fixture:` (file-level) opens a PRE-BUILT image in place of the fresh `Database::new()`

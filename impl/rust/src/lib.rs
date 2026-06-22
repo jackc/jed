@@ -41,6 +41,7 @@ pub mod split;
 pub mod sqlstate;
 pub mod storage;
 pub mod timestamp;
+pub mod timezone;
 pub mod token;
 pub mod types;
 pub mod uuid;
@@ -48,6 +49,7 @@ pub mod value;
 
 pub use api::{PreparedStatement, Rows, Transaction};
 pub use collation::load_unicode_data;
+pub use timezone::load_time_zone_data;
 pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
@@ -350,6 +352,13 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // the ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704,
     // non-text COLLATE 42804; the `collate` cost unit. In-memory only (no persistence yet).
     "expr.collate",
+    // The `AT TIME ZONE` operator (and the `timezone(zone, value)` function it desugars to) +
+    // host-loaded IANA time-zone data (spec/design/timezones.md §6, grammar.md §49): convert
+    // timestamptz↔timestamp through a named zone or fixed offset. A zone is provided by a host-loaded
+    // `JTZ` bundle (the `# load-timezone:` directive loads jed's pinned spec/tz/fixtures/tzdata.jtz);
+    // `UTC` and fixed offsets are built in. Unknown zone 22023, non-text zone 42804; the `timezone`
+    // cost unit. No on-disk change (timestamptz is UTC — §2).
+    "expr.at_time_zone",
     // Per-column COLLATE in CREATE TABLE (collation slice 1d, spec/design/collation.md §1/§5): a
     // column's effective collation is frozen at create (text-only 42804, loaded-or-C name 42704) and
     // is its IMPLICIT collation — ORDER BY / comparisons use it with no explicit COLLATE; two

@@ -1,0 +1,137 @@
+# Time-zone reader vectors — (zone, instant) → (utoff_secs, abbrev, is_dst), the
+# primary cross-core contract for the RFC 8536 reader (spec/tz/README.md §4). GENERATED
+# by impl/rust/src/bin/gen_timezone_vectors.rs; cross-confirmed by all three cores
+# (CLAUDE.md §8). Do not hand-edit. Each core loads spec/tz/fixtures/tzdata.jtz, resolves
+# the zone, and asserts offset_at(instant). Covers standard/daylight, a transition
+# boundary, before-first/after-last (footer), a non-hour offset, a sub-hour DST step, a
+# southern (start>end) footer, an alias, and built-in fixed offsets.
+
+schema_version = 1
+
+[[case]]
+# fixed UTC
+zone = "Etc/UTC"
+instant_micros = 1705320000000000
+utoff_secs = 0
+abbrev = "UTC"
+is_dst = false
+
+[[case]]
+# EST (standard)
+zone = "America/New_York"
+instant_micros = 1705320000000000
+utoff_secs = -18000
+abbrev = "EST"
+is_dst = false
+
+[[case]]
+# EDT (daylight)
+zone = "America/New_York"
+instant_micros = 1721044800000000
+utoff_secs = -14400
+abbrev = "EDT"
+is_dst = true
+
+[[case]]
+# 1s before spring-forward → EST
+zone = "America/New_York"
+instant_micros = 1710053999000000
+utoff_secs = -18000
+abbrev = "EST"
+is_dst = false
+
+[[case]]
+# spring-forward boundary → EDT
+zone = "America/New_York"
+instant_micros = 1710054000000000
+utoff_secs = -14400
+abbrev = "EDT"
+is_dst = true
+
+[[case]]
+# before first transition (LMT)
+zone = "America/New_York"
+instant_micros = -5364662400000000
+utoff_secs = -17762
+abbrev = "LMT"
+is_dst = false
+
+[[case]]
+# past last transition → footer EDT
+zone = "America/New_York"
+instant_micros = 4086590400000000
+utoff_secs = -14400
+abbrev = "EDT"
+is_dst = true
+
+[[case]]
+# past last transition → footer EST
+zone = "America/New_York"
+instant_micros = 4070952000000000
+utoff_secs = -18000
+abbrev = "EST"
+is_dst = false
+
+[[case]]
+# IST +05:30 (non-hour, no DST)
+zone = "Asia/Kolkata"
+instant_micros = 1705320000000000
+utoff_secs = 19800
+abbrev = "IST"
+is_dst = false
+
+[[case]]
+# IST +05:30 footer
+zone = "Asia/Kolkata"
+instant_micros = 4072161600000000
+utoff_secs = 19800
+abbrev = "IST"
+is_dst = false
+
+[[case]]
+# southern summer → +11:00 DST
+zone = "Australia/Lord_Howe"
+instant_micros = 1705320000000000
+utoff_secs = 39600
+abbrev = "+11"
+is_dst = true
+
+[[case]]
+# southern winter → +10:30 std
+zone = "Australia/Lord_Howe"
+instant_micros = 1721044800000000
+utoff_secs = 37800
+abbrev = "+1030"
+is_dst = false
+
+[[case]]
+# footer southern summer (start>end)
+zone = "Australia/Lord_Howe"
+instant_micros = 4072161600000000
+utoff_secs = 39600
+abbrev = "+11"
+is_dst = true
+
+[[case]]
+# alias → America/New_York EST
+zone = "US/Eastern"
+instant_micros = 1705320000000000
+utoff_secs = -18000
+abbrev = "EST"
+is_dst = false
+
+[[case]]
+# fixed offset +05:30
+zone = "+05:30"
+instant_micros = 1705320000000000
+utoff_secs = -19800
+abbrev = "-05:30"
+is_dst = false
+
+[[case]]
+# fixed offset -08:00
+zone = "-08:00"
+instant_micros = 1705320000000000
+utoff_secs = 28800
+abbrev = "+08:00"
+is_dst = false

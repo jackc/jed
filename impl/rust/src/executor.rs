@@ -2306,6 +2306,24 @@ impl Database {
         crate::collation::load_unicode_data(bytes)
     }
 
+    /// Load a `JTZ` time-zone bundle into the engine-global loaded set (`db.LoadTimeZoneData`,
+    /// spec/design/timezones.md §3.3). The bytes are jed's own pinned TZif (RFC 8536) wrapped in a
+    /// manifest; the loaded zones become usable by `AT TIME ZONE`. Like the collation seam, this is a
+    /// privileged host op (not SQL-reachable, no path, no engine I/O — §10), **additive** and
+    /// idempotent for an already-loaded bundle, engine-global so it may be called before `open`. A
+    /// malformed bundle is `XX001`. (`UTC` and fixed offsets are built in and need no load.)
+    pub fn load_time_zone_data(&self, bytes: &[u8]) -> Result<()> {
+        crate::timezone::load_time_zone_data(bytes)
+    }
+
+    /// Introspect the engine-global **loaded** zone set (`db.LoadedTimeZones`, timezones.md §3.3) —
+    /// every named zone (and alias) a loaded bundle provides, each as `(name, tzdata_version)`,
+    /// ascending by name. A property of the running engine, not of this database. `UTC` and fixed
+    /// offsets are built in and not listed.
+    pub fn loaded_time_zones(&self) -> Vec<crate::timezone::TimeZoneInfo> {
+        crate::timezone::loaded_time_zones()
+    }
+
     /// Introspect the engine-global **loaded** collation set (`db.LoadedCollations`,
     /// spec/design/collation.md §4.2) — every collation a loaded bundle provides, available to any
     /// database on this handle, each as `(name, unicode_version, cldr_version, content_hash,
@@ -9324,6 +9342,10 @@ impl Database {
             }
             RExpr::Not(x) => self.fold_uncorrelated_in_rexpr(x, bound, ctes, cost),
             RExpr::Casing { arg, .. } => self.fold_uncorrelated_in_rexpr(arg, bound, ctes, cost),
+            RExpr::AtTimeZone { zone, value, .. } => {
+                self.fold_uncorrelated_in_rexpr(zone, bound, ctes, cost)?;
+                self.fold_uncorrelated_in_rexpr(value, bound, ctes, cost)
+            }
             RExpr::Arith { lhs, rhs, .. }
             | RExpr::Compare { lhs, rhs, .. }
             | RExpr::Distinct { lhs, rhs, .. }
@@ -10685,6 +10707,17 @@ enum RExpr {
         upper: bool,
         arg: Box<RExpr>,
     },
+    /// `value AT TIME ZONE zone` (grammar.md §49, timezones.md §6) — desugared from the operator and
+    /// from a bare `timezone(zone, value)` call. `to_timestamptz` selects the direction: `false` is
+    /// `timestamptz → timestamp` (render the UTC instant as the local wall clock in `zone`); `true`
+    /// is `timestamp → timestamptz` (interpret the wall clock as in `zone`, producing the UTC
+    /// instant). Reads the engine-global loaded zone set (timezone.rs); an unknown zone is `22023`,
+    /// a NULL operand propagates. `±infinity` passes through unchanged.
+    AtTimeZone {
+        zone: Box<RExpr>,
+        value: Box<RExpr>,
+        to_timestamptz: bool,
+    },
     /// A resolved `CASE` (grammar.md §23). `arms` is `(condition, result)` pairs — the condition
     /// is the searched boolean predicate, or the simple form's resolved `operand = value`
     /// equality. `els` is the ELSE result (`ConstNull` for an implicit ELSE). Evaluated lazily:
@@ -12038,6 +12071,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         RExpr::Neg { operand, .. } => rexpr_is_constant(operand),
         RExpr::Not(x) => rexpr_is_constant(x),
         RExpr::Casing { arg, .. } => rexpr_is_constant(arg),
+        RExpr::AtTimeZone { zone, value, .. } => rexpr_is_constant(zone) && rexpr_is_constant(value),
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
@@ -13452,6 +13486,9 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         RExpr::Neg { operand, .. } => rexpr_references_outer(operand, depth),
         RExpr::Not(x) => rexpr_references_outer(x, depth),
         RExpr::Casing { arg, .. } => rexpr_references_outer(arg, depth),
+        RExpr::AtTimeZone { zone, value, .. } => {
+            rexpr_references_outer(zone, depth) || rexpr_references_outer(value, depth)
+        }
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
@@ -13554,6 +13591,10 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         RExpr::Neg { operand, .. } => collect_touched(operand, depth, touched),
         RExpr::Not(x) => collect_touched(x, depth, touched),
         RExpr::Casing { arg, .. } => collect_touched(arg, depth, touched),
+        RExpr::AtTimeZone { zone, value, .. } => {
+            collect_touched(zone, depth, touched);
+            collect_touched(value, depth, touched);
+        }
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
@@ -14192,6 +14233,48 @@ fn resolve_lower_upper(
     }
 }
 
+/// Resolve `timezone(zone, value)` — the desugar of `value AT TIME ZONE zone` (timezones.md §6).
+/// `zone` must be text (else `42804`); the result family is the OTHER timestamp family of `value`:
+/// `timestamptz` → `timestamp` (render the instant locally) and `timestamp` → `timestamptz`
+/// (interpret the wall clock in the zone). Any other `value` family — or an untyped/NULL value, which
+/// cannot pick an overload — is `42883`.
+fn resolve_timezone(
+    scope: &Scope,
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if args.len() != 2 {
+        return Err(no_func_overload("timezone"));
+    }
+    // args[0] = zone (text), args[1] = value (timestamp/timestamptz). The AT TIME ZONE desugar puts
+    // the zone first, matching PostgreSQL's `timezone(text, timestamptz)` signature.
+    let (zone_r, zone_t) = resolve(scope, &args[0], Some(ScalarType::Text), agg, params)?;
+    match zone_t {
+        ResolvedType::Text | ResolvedType::Null => {}
+        _ => {
+            return Err(EngineError::new(
+                SqlState::DatatypeMismatch,
+                "AT TIME ZONE zone must be text",
+            ));
+        }
+    }
+    let (value_r, value_t) = resolve(scope, &args[1], None, agg, params)?;
+    let (to_timestamptz, result) = match value_t {
+        ResolvedType::Timestamptz => (false, ResolvedType::Timestamp),
+        ResolvedType::Timestamp => (true, ResolvedType::Timestamptz),
+        _ => return Err(no_func_overload("timezone")),
+    };
+    Ok((
+        RExpr::AtTimeZone {
+            zone: Box::new(zone_r),
+            value: Box::new(value_r),
+            to_timestamptz,
+        },
+        result,
+    ))
+}
+
 /// Whether `name` (case-insensitive) is a range CONSTRUCTOR call (range-functions.md §2): a call
 /// whose name is a range type name or alias (`i32range`/`int4range`/`numrange`/…). The constructor
 /// functions are the only ones whose name is a range type name, so `range::range_by_name` resolving
@@ -14470,6 +14553,20 @@ fn resolve_func_call(
             ));
         }
         return resolve_lower_upper(scope, &lname, args, agg, params);
+    }
+    // `timezone(zone, value)` is the desugar of `value AT TIME ZONE zone` (grammar.md §49,
+    // timezones.md §6) and a callable function in its own right. It is overloaded on the value's
+    // family (timestamptz → timestamp, timestamp → timestamptz), so it resolves before the generic
+    // by-name dispatch (which has no such polymorphism). (functions.md §9)
+    if lname == "timezone" {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_timezone(scope, args, agg, params);
     }
     // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -20839,6 +20936,48 @@ impl RExpr {
                     }
                     _ => unreachable!("resolver restricts upper/lower to text operands"),
                 }
+            }
+            RExpr::AtTimeZone {
+                zone,
+                value,
+                to_timestamptz,
+            } => {
+                m.charge(COSTS.operator_eval);
+                let zv = zone.eval(row, env, m)?;
+                let vv = value.eval(row, env, m)?;
+                if matches!(zv, Value::Null) || matches!(vv, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                let zone_str = match &zv {
+                    Value::Text(s) => s.as_str(),
+                    _ => unreachable!("resolver requires a text zone"),
+                };
+                let micros = match vv {
+                    Value::Timestamp(m) | Value::Timestamptz(m) => m,
+                    _ => unreachable!("resolver requires a timestamp/timestamptz value"),
+                };
+                m.charge(COSTS.timezone);
+                m.guard()?;
+                // ±infinity passes through unchanged (PG): no zone offset applies.
+                if micros == crate::timestamp::POS_INFINITY || micros == crate::timestamp::NEG_INFINITY
+                {
+                    return Ok(if *to_timestamptz {
+                        Value::Timestamptz(micros)
+                    } else {
+                        Value::Timestamp(micros)
+                    });
+                }
+                let zr = crate::timezone::resolve_zone(zone_str).ok_or_else(|| {
+                    EngineError::new(
+                        SqlState::InvalidParameterValue,
+                        format!("time zone \"{zone_str}\" not recognized"),
+                    )
+                })?;
+                Ok(if *to_timestamptz {
+                    Value::Timestamptz(crate::timezone::local_to_instant_micros(&zr, micros))
+                } else {
+                    Value::Timestamp(crate::timezone::instant_to_local_micros(&zr, micros))
+                })
             }
             RExpr::Case {
                 arms,

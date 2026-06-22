@@ -2568,7 +2568,7 @@ impl Parser {
 
     fn parse_multiplicative(&mut self) -> Result<Expr> {
         let base = self.depth;
-        let mut lhs = self.parse_unary()?;
+        let mut lhs = self.parse_at_time_zone()?;
         loop {
             let op = match self.peek() {
                 Token::Star => BinaryOp::Mul,
@@ -2578,11 +2578,46 @@ impl Parser {
             };
             self.deepen()?; // each chained * / % is one more AST level
             self.advance();
-            let rhs = self.parse_unary()?;
+            let rhs = self.parse_at_time_zone()?;
             lhs = binary(op, lhs, rhs);
         }
         self.depth = base;
         Ok(lhs)
+    }
+
+    /// The `AT TIME ZONE` rung (grammar.md §49, [timezones.md](../design/timezones.md) §6): a
+    /// left-associative infix operator binding **tighter than `* / %`, additive, and the comparisons,
+    /// looser than `COLLATE` / `::` / unary minus** (PostgreSQL's `%left AT`). `value AT TIME ZONE
+    /// zone` desugars at parse time to the function call `timezone(zone, value)` — PostgreSQL's own
+    /// implementation — so the resolver/evaluator/cost have one path for the operator and the bare
+    /// `timezone(...)` call. `AT`/`TIME`/`ZONE` are non-reserved words (matched as a three-token
+    /// sequence, never reserved), so a bare column named `at`/`time`/`zone` is unaffected.
+    fn parse_at_time_zone(&mut self) -> Result<Expr> {
+        let base = self.depth;
+        let mut lhs = self.parse_unary()?;
+        while self.peek_at_time_zone() {
+            self.deepen()?; // each chained AT TIME ZONE is one more AST level
+            self.advance(); // AT
+            self.advance(); // TIME
+            self.advance(); // ZONE
+            let zone = self.parse_unary()?;
+            lhs = Expr::FuncCall {
+                name: "timezone".to_string(),
+                args: vec![zone, lhs],
+                arg_names: None,
+                star: false,
+                variadic: false,
+            };
+        }
+        self.depth = base;
+        Ok(lhs)
+    }
+
+    /// Whether the next three tokens are the words `AT TIME ZONE` (case-insensitive).
+    fn peek_at_time_zone(&self) -> bool {
+        matches!(self.tokens.get(self.pos), Some(Token::Word(a)) if a.eq_ignore_ascii_case("at"))
+            && matches!(self.tokens.get(self.pos + 1), Some(Token::Word(b)) if b.eq_ignore_ascii_case("time"))
+            && matches!(self.tokens.get(self.pos + 2), Some(Token::Word(c)) if c.eq_ignore_ascii_case("zone"))
     }
 
     fn parse_unary(&mut self) -> Result<Expr> {

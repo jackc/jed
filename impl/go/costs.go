@@ -22,6 +22,7 @@ type CostSchedule struct {
 	SequenceAdvance     int64
 	GinEntry            int64
 	Collate             int64
+	Timezone            int64
 }
 
 // Costs is the canonical cost schedule — weights accrued per unit during query execution.
@@ -39,4 +40,5 @@ var Costs = CostSchedule{
 	SequenceAdvance:     1,
 	GinEntry:            1,
 	Collate:             1,
+	Timezone:            1,
 }

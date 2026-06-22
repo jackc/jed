@@ -20,6 +20,7 @@ pub struct CostSchedule {
     pub sequence_advance: i64,
     pub gin_entry: i64,
     pub collate: i64,
+    pub timezone: i64,
 }
 
 /// The canonical cost schedule — weights accrued per unit during query execution.
@@ -37,4 +38,5 @@ pub const COSTS: CostSchedule = CostSchedule {
     sequence_advance: 1,
     gin_entry: 1,
     collate: 1,
+    timezone: 1,
 };

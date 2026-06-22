@@ -201,3 +201,16 @@ event  = "one code point processed while building a collation sort key for a col
 # is bounded by the upstream storage_row_read / row_produced — so the collate unit lives at the
 # expression-evaluation site, the one deterministic metering point (collation.md §11). Charged at
 # the identical per-code-point point in every core, so cost stays cross-core identical (§8/§13).
+
+[[unit]]
+id     = "timezone"
+weight = 1
+event  = "one AT TIME ZONE conversion (an RFC 8536 reader lookup)"
+# Landed with the AT TIME ZONE operator (../design/timezones.md §10, spec/tz/README.md §8). A
+# conversion looks the instant up in a loaded zone's TZif transition table (a bounded binary search
+# plus a bounded POSIX-footer evaluation) — bounded work the bare comparison does not do. Fires once
+# per conversion at the operator's evaluation site (the deterministic, cross-core-identical metering
+# point — like `collate`), so an AT TIME ZONE over many rows stays cost-proportional and a max_cost
+# ceiling aborts it (54P01). A built-in `UTC`/fixed-offset conversion still charges the unit (one
+# lookup's worth) so cost does not depend on whether a bundle is loaded. Charged at the identical
+# point in every core, so cost stays cross-core identical (§8/§13).
