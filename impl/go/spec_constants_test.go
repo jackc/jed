@@ -183,34 +183,32 @@ func mustType(t *testing.T, name string) ScalarType {
 }
 
 func TestErrorCodesAreRegistered(t *testing.T) {
-	tables := readTomlTables(t, specPath(t, "errors/registry.toml"), "error")
-	codes := map[string]string{} // code -> name
-	for _, row := range tables {
-		codes[row.str("code")] = row.str("name")
+	// The generated SqlState table (codegen middle path, CLAUDE.md §5) must match the canonical
+	// registry. The drift gate (`rake verify`) pins the generated file; this test additionally
+	// compiles the generated Errors slice in and asserts it matches registry.toml row-for-row
+	// (the enum is not iterable, so the cross-check walks Errors).
+	rows := readTomlTables(t, specPath(t, "errors/registry.toml"), "error")
+	if len(rows) != len(Errors) {
+		t.Fatalf("error count: registry %d, generated %d", len(rows), len(Errors))
 	}
-	for _, st := range []SqlState{
-		DataException,
-		NumericValueOutOfRange, InvalidDatetimeFormat, DatetimeFieldOverflow,
-		DivisionByZero, InvalidParameterValue, ArraySubscriptError,
-		InvalidRowCountInLimitClause, InvalidRowCountInOffsetClause,
-		NotNullViolation, UniqueViolation, CheckViolation,
-		UndefinedParameter, DuplicateObject, WrongObjectType,
-		ActiveSqlTransaction, ReadOnlySqlTransaction, InFailedSqlTransaction,
-		SyntaxError, UndefinedTable, UndefinedColumn, UndefinedObject,
-		DatatypeMismatch, DuplicateTable, DuplicateColumn,
-		InvalidTableDefinition, IndeterminateDatatype, InvalidRecursion, FeatureNotSupported,
-		NameTooLong, ProgramLimitExceeded, StatementTooComplex, CostLimitExceeded,
-		IoError, UndefinedFile, DuplicateFile, DataCorrupted,
-	} {
-		if _, ok := codes[st.Code()]; !ok {
-			t.Errorf("code %s missing from registry", st.Code())
+	for i, row := range rows {
+		d := Errors[i]
+		if d.Code != row.str("code") {
+			t.Errorf("row %d code: got %q, want %q", i, d.Code, row.str("code"))
+		}
+		if d.Name != row.str("name") {
+			t.Errorf("%s name: got %q, want %q", d.Code, d.Name, row.str("name"))
+		}
+		if d.Class != row.str("class") {
+			t.Errorf("%s class: got %q, want %q", d.Code, d.Class, row.str("class"))
 		}
 	}
-	if codes["22003"] != "numeric_value_out_of_range" {
-		t.Errorf("22003 name mismatch: %q", codes["22003"])
-	}
+	// Spot-check that the enum's Code() agrees with the data.
 	if NumericValueOutOfRange.Code() != "22003" {
 		t.Errorf("NumericValueOutOfRange code mismatch")
+	}
+	if DivisionByZero.Code() != "22012" {
+		t.Errorf("DivisionByZero code mismatch")
 	}
 }
 

@@ -38,6 +38,7 @@ pub mod seam;
 pub mod shared;
 pub mod spill;
 pub mod split;
+pub mod sqlstate;
 pub mod storage;
 pub mod timestamp;
 pub mod token;

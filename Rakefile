@@ -132,6 +132,7 @@ task :verify do
     ["cost schedule", "spec/cost/verify.rb"],
     ["operator codegen (drift)", "scripts/gen_catalog.rb", "--check"],
     ["cost codegen (drift)", "scripts/gen_costs.rb", "--check"],
+    ["error codegen (drift)", "scripts/gen_errors.rb", "--check"],
     ["vendored collations (drift)", "scripts/vendor_collations.rb", "--check"],
   ]
   failures = []
@@ -256,12 +257,12 @@ desc "Lint the TypeScript cores with Biome (alias for lint:check)"
 task lint: "lint:check"
 
 # codegen — the "middle path" (CLAUDE.md §5): (re)generate per-language source from the
-# canonical spec data tables: the operator descriptor tables from spec/functions/catalog.toml
-# and the cost-unit schedule from spec/cost/schedule.toml. `rake verify` fails if any of the
-# checked-in generated files are stale.
+# canonical spec data tables: the operator descriptor tables from spec/functions/catalog.toml,
+# the cost-unit schedule from spec/cost/schedule.toml, and the SqlState enum + code mapping from
+# spec/errors/registry.toml. `rake verify` fails if any of the checked-in generated files are stale.
 desc "Generate per-language source from the spec data tables (codegen middle path)"
 task :codegen do
-  generators = ["scripts/gen_catalog.rb", "scripts/gen_costs.rb"]
+  generators = ["scripts/gen_catalog.rb", "scripts/gen_costs.rb", "scripts/gen_errors.rb"]
   failures = generators.reject { |g| system(RbConfig.ruby, g) }
   abort "codegen failed for #{failures.join(', ')}" unless failures.empty?
 end

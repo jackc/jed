@@ -56,6 +56,10 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       parser/executor/evaluator stay hand-written), drift-gated by `rake verify`.
       → [gen_catalog.rb](scripts/gen_catalog.rb), [codegen.md](spec/design/codegen.md)
   - [ ] _follow-on:_ extend the generator to types/errors.
+    - [x] **errors** — `SqlState` enum + code mapping + `ERRORS` table generated per core from
+          [registry.toml](spec/errors/registry.toml); hand-written `EngineError` scaffolding
+          consumes it. Drift-gated by `rake verify`. → [gen_errors.rb](scripts/gen_errors.rb)
+    - [ ] **types** — scalars (ragged fields + enum identity threaded through the codec) remain.
 - [x] **Resolve integer-literal typing** — context-adaptive untyped constants (adapt to the
       column/CAST target, trap `22003` out of range, default i64). → [types.md §6](spec/design/types.md)
 - [x] **General expression evaluator** — unified recursive `Expr` (Column/Literal/Cast/Unary/

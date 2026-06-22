@@ -5,6 +5,7 @@
 use jed::costs::COSTS;
 use jed::error::SqlState;
 use jed::operators::{AGGREGATES, OPERATORS, SET_RETURNING};
+use jed::sqlstate::ERRORS;
 use jed::types::ScalarType;
 use std::path::Path;
 
@@ -165,68 +166,36 @@ fn scalar_types_match_spec() {
 
 #[test]
 fn error_codes_are_registered() {
+    // The generated SqlState table (codegen middle path, CLAUDE.md §5) must match the canonical
+    // registry. The drift gate (`rake verify`) pins the generated file byte-for-byte; this test
+    // additionally COMPILES the generated `ERRORS` slice into the crate and asserts it matches
+    // registry.toml row-for-row — a genuinely compiled-and-verified artifact (like
+    // operators_match_spec). The enum is not iterable, so the cross-check walks `ERRORS`.
     let v: toml::Value = toml::from_str(&spec("errors/registry.toml")).unwrap();
-    let codes: std::collections::BTreeSet<String> = v["error"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e["code"].as_str().unwrap().to_string())
-        .collect();
+    let rows = v["error"].as_array().expect("[[error]] array");
+    assert_eq!(rows.len(), ERRORS.len(), "error count");
 
-    // Every SQLSTATE the core can raise must exist in the registry.
-    for st in [
-        SqlState::DataException,
-        SqlState::NumericValueOutOfRange,
-        SqlState::InvalidDatetimeFormat,
-        SqlState::DatetimeFieldOverflow,
-        SqlState::DivisionByZero,
-        SqlState::InvalidParameterValue,
-        SqlState::ArraySubscriptError,
-        SqlState::NotNullViolation,
-        SqlState::UniqueViolation,
-        SqlState::CheckViolation,
-        SqlState::UndefinedParameter,
-        SqlState::DuplicateObject,
-        SqlState::WrongObjectType,
-        SqlState::ActiveSqlTransaction,
-        SqlState::ReadOnlySqlTransaction,
-        SqlState::InFailedSqlTransaction,
-        SqlState::SyntaxError,
-        SqlState::UndefinedTable,
-        SqlState::UndefinedColumn,
-        SqlState::UndefinedObject,
-        SqlState::DatatypeMismatch,
-        SqlState::DuplicateTable,
-        SqlState::DuplicateColumn,
-        SqlState::InvalidTableDefinition,
-        SqlState::IndeterminateDatatype,
-        SqlState::FeatureNotSupported,
-        SqlState::StatementTooComplex,
-        SqlState::CostLimitExceeded,
-        SqlState::IoError,
-        SqlState::UndefinedFile,
-        SqlState::DuplicateFile,
-        SqlState::DataCorrupted,
-    ] {
-        assert!(
-            codes.contains(st.code()),
-            "code {} missing from registry",
-            st.code()
+    for (row, desc) in rows.iter().zip(ERRORS.iter()) {
+        assert_eq!(desc.code, row["code"].as_str().unwrap(), "code");
+        assert_eq!(
+            desc.name,
+            row["name"].as_str().unwrap(),
+            "{} name",
+            desc.code
+        );
+        assert_eq!(
+            desc.class,
+            row["class"].as_str().unwrap(),
+            "{} class",
+            desc.code
         );
     }
 
-    // The integer-overflow code the corpus matches on, by name (CLAUDE.md §8).
-    let overflow = v["error"]
-        .as_array()
-        .unwrap()
-        .iter()
-        .find(|e| e["code"].as_str() == Some("22003"))
-        .expect("22003 in registry");
-    assert_eq!(
-        overflow["name"].as_str(),
-        Some("numeric_value_out_of_range")
-    );
+    // Spot-check that the enum's code() agrees with the data — ties the type-safe enum to the
+    // table (the integer-overflow code the corpus matches on by name, CLAUDE.md §8).
     assert_eq!(SqlState::NumericValueOutOfRange.code(), "22003");
+    assert_eq!(SqlState::DivisionByZero.code(), "22012");
+    assert_eq!(SqlState::FeatureNotSupported.code(), "0A000");
 }
 
 #[test]

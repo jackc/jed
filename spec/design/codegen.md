@@ -28,8 +28,10 @@ Spec data reaches the cores three possible ways:
 The **function/operator catalog** is the first surface to take the codegen path: it is the
 one CLAUDE.md §5 singles out ("the function catalog especially"), and it is about to grow
 (arithmetic, logical connectives, `IS [NOT] DISTINCT FROM`, named functions), so the
-mechanical cost is real. Scalar types and error codes stay hand-mirrored for now; extending
-the generator to them later is the natural next step (§5 below).
+mechanical cost is real. **Error codes have since taken the same path** (the `SqlState` enum +
+its code mapping are generated from [../errors/registry.toml](../errors/registry.toml) —
+[../../scripts/gen_errors.rb](../../scripts/gen_errors.rb), §5 below). Scalar types stay
+hand-mirrored for now; extending the generator to them is the remaining next step (§5).
 
 ## 2. The boundary: what is generated, what is not
 
@@ -85,10 +87,21 @@ eval *logic* they dispatch to stays hand-written (§2).
 
 ## 5. Forward
 
-- Extend the generator to **scalar types and error codes**, replacing their hand-mirror
-  (§1 option 2) so all three cores' type/error tables become generated. At that point the
-  impl READMEs' claim that this data arrives "via build-time codegen" is literally true for
-  every table.
+- **Error codes — done** ([../../scripts/gen_errors.rb](../../scripts/gen_errors.rb)). The
+  `SqlState` enum, its `code()` mapping, and an iterable `ERRORS` descriptor table are generated
+  per core from [../errors/registry.toml](../errors/registry.toml) (each variant carries its
+  registry `template` as a one-line doc); the hand-written `EngineError` scaffolding (message
+  assembly, Display/Error rendering, the raise sites) consumes it. The same drift gate + per-core
+  cross-check (§3) apply, and the generated `sqlstate.{rs,go,ts}` sit beside the hand-written
+  `error.rs`/`errors.go`/`errors.ts` (which re-export `SqlState`, so consumers' import paths are
+  unchanged). The boundary (§2) holds: the enum is data; nothing that *interprets* an error is
+  generated.
+- **Scalar types — remaining.** Extend the generator to the scalar set, replacing its hand-mirror
+  (§1 option 2). Harder than errors: `scalars.toml` is ragged (integer-only / decimal-only /
+  text-only fields) and `ScalarType`'s variant identity is threaded through the codec/comparator,
+  so codegen emits the *attribute table* while the enum + per-variant logic stay hand-written and
+  consume it by `id`. When that lands too, the impl READMEs' claim that this data arrives "via
+  build-time codegen" is literally true for every table.
 - As the catalog gains `arithmetic` / `logical` / `function` kinds and fields (`cost`,
   `precedence` — see [functions.md](functions.md) §6), the generator emits them with no
   schema change here: it copies whatever fields the catalog defines.

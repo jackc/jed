@@ -4,7 +4,8 @@
 
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { type SqlState, sqlStateCode } from "../src/errors.ts";
+import { sqlStateCode } from "../src/errors.ts";
+import { ERRORS } from "../src/sqlstate.ts";
 import {
   type ScalarType,
   canonicalName,
@@ -94,55 +95,20 @@ test("scalar types match spec/types/scalars.toml", () => {
 });
 
 test("error codes are registered in spec/errors/registry.toml", () => {
+  // The generated SqlState union + code mapping (codegen middle path, CLAUDE.md §5) must match
+  // the canonical registry. The drift gate (`rake verify`) pins the generated file; this test
+  // additionally walks the compiled-in ERRORS table against registry.toml row-for-row.
   const rows = readTomlTables(specPath("errors/registry.toml"), "error");
-  const codes = new Map<string, string>(); // code -> name
-  for (const row of rows) codes.set(row.str("code"), row.str("name"));
-
-  const states: SqlState[] = [
-    "numeric_value_out_of_range",
-    "invalid_datetime_format",
-    "datetime_field_overflow",
-    "division_by_zero",
-    "invalid_parameter_value",
-    "sequence_generator_limit_exceeded",
-    "object_not_in_prerequisite_state",
-    "array_subscript_error",
-    "invalid_row_count_in_limit_clause",
-    "invalid_row_count_in_offset_clause",
-    "not_null_violation",
-    "unique_violation",
-    "check_violation",
-    "undefined_parameter",
-    "duplicate_object",
-    "wrong_object_type",
-    "active_sql_transaction",
-    "read_only_sql_transaction",
-    "in_failed_sql_transaction",
-    "syntax_error",
-    "undefined_table",
-    "undefined_column",
-    "undefined_object",
-    "datatype_mismatch",
-    "duplicate_table",
-    "duplicate_column",
-    "invalid_table_definition",
-    "indeterminate_datatype",
-    "invalid_recursion",
-    "feature_not_supported",
-    "statement_too_complex",
-    "cost_limit_exceeded",
-    "io_error",
-    "undefined_file",
-    "duplicate_file",
-    "data_corrupted",
-  ];
-  for (const st of states) {
-    assert.ok(codes.has(sqlStateCode(st)), `code ${sqlStateCode(st)} missing from registry`);
-    // The union member is the registry's snake_case name; cross-check that too.
-    assert.equal(codes.get(sqlStateCode(st)), st, `name for ${sqlStateCode(st)}`);
+  assert.equal(rows.length, ERRORS.length, "error count");
+  for (const [i, row] of rows.entries()) {
+    const d = ERRORS[i];
+    assert.equal(d.code, row.str("code"), "code");
+    assert.equal(d.name, row.str("name"), `name for ${d.code}`);
+    assert.equal(d.class, row.str("class"), `class for ${d.code}`);
   }
-  assert.equal(codes.get("22003"), "numeric_value_out_of_range");
+  // Spot-check that the union's code mapping agrees with the data.
   assert.equal(sqlStateCode("numeric_value_out_of_range"), "22003");
+  assert.equal(sqlStateCode("division_by_zero"), "22012");
 });
 
 test("operators match spec/functions/catalog.toml", () => {
