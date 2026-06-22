@@ -22,6 +22,7 @@
 # the guard with `-c safe.bareRepository=all`. The git_bare helper does both.
 
 require "bundler/setup" # load the gems pinned in Gemfile.lock (rake, toml-rb)
+require "digest"        # lockfile content hashing for the npm bootstrap staleness check
 require "fileutils"
 
 # Each entry is one reference repo. `ref` is the branch/tag checked out into the
@@ -165,7 +166,8 @@ end
 #                       of the mise pins above. Config: web/.prettierrc.json (2-space; the
 #                       single-quote / no-trailing-comma SvelteKit idiom is preserved). Markdown
 #                       (mdsvex) is left to the author via web/.prettierignore. Self-bootstraps
-#                       web deps with `npm ci` when node_modules is missing — the bench:* idiom.
+#                       web deps with `npm ci` — reinstalling whenever the lockfile changes, not
+#                       only when node_modules is missing (npm_ci_if_stale; the bench:* idiom too).
 # `tsc --noEmit` stays a separate TYPE check (`npm run typecheck` in impl/ts), not a formatter.
 # Kept SEPARATE from `verify`, which is deliberately toolchain-light (spec data only — no
 # cargo/go/biome/npm needed).
@@ -179,10 +181,23 @@ WEB_DIR       = "web"                # prettier (npm-pinned); reuses web's forma
 # signal is the printed file list, not the exit status.
 def gofumpt_unformatted = capture("gofumpt", "-l", GO_DIR).first.split("\n").map(&:strip).reject(&:empty?)
 
-# Install web's npm deps (prettier lives here) only when missing — the same self-bootstrap the
-# bench:* tasks use. `npm ci` is reproducible from the committed lockfile.
-def npm_install_web
-  sh "npm", "ci", "--silent", "--prefix", WEB_DIR unless File.directory?("#{WEB_DIR}/node_modules")
+# Bootstrap an npm project's deps with `npm ci` (reproducible from its committed lockfile —
+# CLAUDE.md §14), reinstalling whenever they are STALE — not only when node_modules is absent.
+# Stale = node_modules missing, OR package-lock.json changed since the last install (a new /
+# updated / removed dependency). We stamp the lockfile's content hash inside node_modules after
+# each successful install and compare against it; hashing the CONTENT (not the mtime) keeps the
+# check correct across git checkouts, and the stamp is wiped whenever node_modules is (including
+# by `npm ci` itself, which removes it first). Without this the gate silently skips the install
+# when the lockfile grows a dependency — the `prettier: not found` foot-gun.
+def npm_ci_if_stale(dir)
+  modules = "#{dir}/node_modules"
+  lock = "#{dir}/package-lock.json"
+  stamp = "#{modules}/.jed-deps-stamp"
+  want = File.exist?(lock) ? Digest::SHA256.file(lock).hexdigest : ""
+  return if File.directory?(modules) && File.exist?(stamp) && File.read(stamp) == want
+
+  sh "npm", "ci", "--silent", "--prefix", dir
+  File.write(stamp, want)
 end
 
 namespace :fmt do
@@ -211,7 +226,7 @@ namespace :fmt do
     failures << "ts" unless system("biome", "format", *TS_CORE_DIRS)
 
     puts "web:  prettier --check #{WEB_DIR}"
-    npm_install_web
+    npm_ci_if_stale(WEB_DIR)
     failures << "web" unless system("npm", "run", "--silent", "--prefix", WEB_DIR, "format:check")
 
     abort "fmt: needs formatting in #{failures.join(', ')} — run `rake fmt:fix`" unless failures.empty?
@@ -224,7 +239,7 @@ namespace :fmt do
     sh "cargo", "fmt", "--manifest-path", CLI_MANIFEST
     sh "gofumpt", "-w", GO_DIR
     sh "biome", "format", "--write", *TS_CORE_DIRS
-    npm_install_web
+    npm_ci_if_stale(WEB_DIR)
     sh "npm", "run", "--silent", "--prefix", WEB_DIR, "format"
   end
 end
@@ -364,7 +379,7 @@ namespace :bench do
     sh({ "CGO_ENABLED" => "0" }, "go", "build", "-o", "bin/", *pure, chdir: "bench/go")
     sh({ "CGO_ENABLED" => "1" }, "go", "build", "-o", "bin/", "./cmd/bench-sqlite-cgo", chdir: "bench/go")
     sh "cargo", "build", "--release", "--quiet", "--manifest-path", "bench/rust/Cargo.toml"
-    sh "npm", "ci", "--silent", "--prefix", "bench/ts" unless File.directory?("bench/ts/node_modules")
+    npm_ci_if_stale("bench/ts")
   end
 
   desc "Generate/refresh the benchmark databases (fingerprint-gated; [force] to override)"
@@ -469,7 +484,7 @@ task :stress, [:filter] do |_, args|
   sh("bench/rust/target/release/stress", STRESS_DIR, File.join(dir, "rust.jsonl"), *filter) { |_ok, _res| }
 
   puts "ts:   node src/stress.ts (the seeded-sequential interleaver)"
-  sh "npm", "ci", "--silent", "--prefix", "bench/ts" unless File.directory?("bench/ts/node_modules")
+  npm_ci_if_stale("bench/ts")
   sh("node", "bench/ts/src/stress.ts", STRESS_DIR, File.join(dir, "ts.jsonl"), *filter) { |_ok, _res| }
 
   puts
