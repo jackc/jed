@@ -11818,10 +11818,17 @@ fn detect_scan_bound(filter: &RExpr, rel: &ScopeRel, catalog: &Database) -> Opti
         let Some(ty) = rel.table.columns[ci].ty.as_scalar() else {
             continue;
         };
-        if idx.columns[1..]
-            .iter()
-            .any(|&c| rel.table.columns[c].ty.as_scalar().is_none())
-        {
+        // The tail-slot skip in `index_bound_rows` advances over each trailing key component by
+        // its FIXED width (`width_bytes`), which exists only for the fixed-width scalars. A tail
+        // column that is non-scalar (range/array/composite) OR a variable-width scalar
+        // (text/decimal/bytea/interval) has no fixed width, so the index cannot pushdown: fall
+        // through to the full scan + residual filter (rows identical, just no index bound).
+        if idx.columns[1..].iter().any(|&c| {
+            rel.table.columns[c]
+                .ty
+                .as_scalar()
+                .is_none_or(|s| !s.is_fixed_width())
+        }) {
             continue;
         }
         // The leading column's key collation form (as for the PK above). A `Skewed` collated index

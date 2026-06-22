@@ -9736,14 +9736,20 @@ func detectScanBound(filter *rExpr, rel scopeRel, db *Database) *scanBound {
 		if !ok {
 			continue
 		}
-		nonScalarTail := false
+		// The tail-slot skip in indexBoundRows advances over each trailing key component by its
+		// FIXED width (WidthBytes), which exists only for the fixed-width scalars. A tail column
+		// that is non-scalar (range/array/composite) OR a variable-width scalar (text/decimal/
+		// bytea/interval) has no fixed width, so the index cannot pushdown: fall through to the
+		// full scan + residual filter (rows identical, just no index bound).
+		unskippableTail := false
 		for _, c := range idx.Columns[1:] {
-			if _, ok := rel.table.Columns[c].Type.AsScalar(); !ok {
-				nonScalarTail = true
+			s, ok := rel.table.Columns[c].Type.AsScalar()
+			if !ok || !s.IsFixedWidth() {
+				unskippableTail = true
 				break
 			}
 		}
-		if nonScalarTail {
+		if unskippableTail {
 			continue
 		}
 		// The leading column's key collation form (as for the PK above). A Skewed collated index is

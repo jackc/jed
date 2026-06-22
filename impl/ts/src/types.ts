@@ -233,6 +233,15 @@ export function widthBytes(t: ScalarType): number {
   }
 }
 
+// isFixedWidth reports whether this scalar has a fixed KEY-encoding width — i.e. exactly the types
+// widthBytes returns a value for (rather than throwing), the complement of the variable-width
+// text/decimal/bytea/interval. These two MUST agree: any caller that skips a key component by
+// widthBytes (the index tail-slot skip, executor.ts) is sound only when this returns true, so the
+// index-bound pushdown gates on it (a variable-width tail column ⇒ no pushdown, full scan instead).
+export function isFixedWidth(t: ScalarType): boolean {
+  return t !== "text" && t !== "decimal" && t !== "bytea" && t !== "interval";
+}
+
 // minOf is the inclusive minimum value (integer-only).
 export function minOf(t: ScalarType): bigint {
   switch (t) {

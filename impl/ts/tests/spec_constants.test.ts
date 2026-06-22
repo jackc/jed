@@ -7,8 +7,10 @@ import { test } from "node:test";
 import { sqlStateCode } from "../src/errors.ts";
 import { ERRORS } from "../src/sqlstate.ts";
 import {
+  ALL_SCALAR_TYPES,
   type ScalarType,
   canonicalName,
+  isFixedWidth,
   maxOf,
   minOf,
   rank,
@@ -287,5 +289,43 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
       AGG_RESULT_CODES.has(a.result),
       `aggregate ${a.name} has unhandled result code ${a.result}`,
     );
+  }
+});
+
+test("isFixedWidth partitions the widthBytes domain", () => {
+  // The index tail-slot skip (executor.ts indexBoundRows) advances over each trailing key
+  // component by widthBytes, which THROWS on the variable-width scalars. detectScanBound must
+  // therefore exclude a variable-width tail column from the index-bound pushdown — it gates on
+  // isFixedWidth. So isFixedWidth MUST be true exactly when widthBytes does not throw; this pins
+  // the two partitions together so a newly-added type cannot drift them apart (the latent gap this
+  // guards against — a throw on a multi-column index with a text/decimal/bytea/interval trailing
+  // key column under an equality on the leading column).
+  for (const t of ALL_SCALAR_TYPES) {
+    let widthOk = true;
+    try {
+      widthBytes(t);
+    } catch {
+      widthOk = false;
+    }
+    assert.equal(isFixedWidth(t), widthOk, `${t}: isFixedWidth must match the widthBytes domain`);
+  }
+  // The concrete partition, spelled out so the intent is legible and all 14 types are accounted
+  // for (4 variable-width + 10 fixed-width).
+  for (const t of ["text", "decimal", "bytea", "interval"] as const) {
+    assert.equal(isFixedWidth(t), false, `${t} is variable-width`);
+  }
+  for (const t of [
+    "i16",
+    "i32",
+    "i64",
+    "boolean",
+    "uuid",
+    "timestamp",
+    "timestamptz",
+    "f32",
+    "f64",
+    "date",
+  ] as const) {
+    assert.equal(isFixedWidth(t), true, `${t} is fixed-width`);
   }
 });

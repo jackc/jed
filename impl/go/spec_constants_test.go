@@ -535,3 +535,31 @@ func TestRegistryCoversCatalog(t *testing.T) {
 		_, _ = aggregatePlan(surface, found.Result, pt) // panics if (surface,result) unhandled
 	}
 }
+
+// TestIsFixedWidthPartitionsWidthBytes pins IsFixedWidth to the WidthBytes domain. The index
+// tail-slot skip (executor.go indexBoundRows) advances over each trailing key component by
+// WidthBytes, which returns 0 for the variable-width scalars (mis-parsing the row key).
+// detectScanBound must therefore exclude a variable-width tail column from the index-bound
+// pushdown — it gates on IsFixedWidth. So IsFixedWidth MUST be true exactly when WidthBytes is
+// nonzero; this pins the two partitions together so a newly-added type cannot drift them apart
+// (the latent gap this guards against — a mis-parsed key on a multi-column index with a
+// text/decimal/bytea/interval trailing key column under an equality on the leading column).
+func TestIsFixedWidthPartitionsWidthBytes(t *testing.T) {
+	for _, st := range AllScalarTypes() {
+		if got, want := st.IsFixedWidth(), st.WidthBytes() != 0; got != want {
+			t.Errorf("%v: IsFixedWidth=%v but WidthBytes=%d", st, got, st.WidthBytes())
+		}
+	}
+	// The concrete partition, spelled out so the intent is legible and all 14 types are accounted
+	// for (4 variable-width + 10 fixed-width).
+	for _, st := range []ScalarType{Text, DecimalType, Bytea, IntervalType} {
+		if st.IsFixedWidth() {
+			t.Errorf("%v should be variable-width", st)
+		}
+	}
+	for _, st := range []ScalarType{Int16, Int32, Int64, Bool, Uuid, Timestamp, Timestamptz, Float32, Float64, Date} {
+		if !st.IsFixedWidth() {
+			t.Errorf("%v should be fixed-width", st)
+		}
+	}
+}

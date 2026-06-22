@@ -165,6 +165,56 @@ fn scalar_types_match_spec() {
 }
 
 #[test]
+fn is_fixed_width_partitions_width_bytes_domain() {
+    // The index tail-slot skip (executor.rs `index_bound_rows`) advances over each trailing key
+    // component by `width_bytes`, which PANICS on the variable-width scalars. `detect_scan_bound`
+    // must therefore exclude a variable-width tail column from the index-bound pushdown — it gates
+    // on `is_fixed_width`. So `is_fixed_width` MUST be true exactly when `width_bytes` does not
+    // panic; this pins the two partitions together so a newly-added type cannot drift them apart
+    // (the latent gap this guards against — a panic on a multi-column index with a text/decimal/
+    // bytea/interval trailing key column under an equality on the leading column).
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {})); // silence the expected width_bytes panics
+    let domain: Vec<(ScalarType, bool)> = ScalarType::all()
+        .into_iter()
+        .map(|st| (st, std::panic::catch_unwind(|| st.width_bytes()).is_ok()))
+        .collect();
+    std::panic::set_hook(prev);
+    for (st, width_ok) in domain {
+        assert_eq!(
+            st.is_fixed_width(),
+            width_ok,
+            "{st:?}: is_fixed_width must match whether width_bytes is defined"
+        );
+    }
+
+    // The concrete partition, spelled out so the intent is legible and all 14 types are accounted
+    // for (4 variable-width + 10 fixed-width).
+    for st in [
+        ScalarType::Text,
+        ScalarType::Decimal,
+        ScalarType::Bytea,
+        ScalarType::Interval,
+    ] {
+        assert!(!st.is_fixed_width(), "{st:?} is variable-width");
+    }
+    for st in [
+        ScalarType::Int16,
+        ScalarType::Int32,
+        ScalarType::Int64,
+        ScalarType::Bool,
+        ScalarType::Uuid,
+        ScalarType::Timestamp,
+        ScalarType::Timestamptz,
+        ScalarType::Float32,
+        ScalarType::Float64,
+        ScalarType::Date,
+    ] {
+        assert!(st.is_fixed_width(), "{st:?} is fixed-width");
+    }
+}
+
+#[test]
 fn error_codes_are_registered() {
     // The generated SqlState table (codegen middle path, CLAUDE.md §5) must match the canonical
     // registry. The drift gate (`rake verify`) pins the generated file byte-for-byte; this test

@@ -145,6 +145,7 @@ import {
   typeAsScalar,
   typeScalar,
   widthBytes,
+  isFixedWidth,
 } from "./types.ts";
 import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
 import { parseDate } from "./date.ts";
@@ -7939,7 +7940,17 @@ function detectScanBound(filter: RExpr, rel: ScopeRel, snap: Snapshot): ScanBoun
     // point-lookup is deferred for containers (ranges.md §10); the index is still maintained.
     const ty = typeAsScalar(rel.table.columns[ci]!.type);
     if (ty === undefined) continue;
-    if (idx.columns.slice(1).some((c) => typeAsScalar(rel.table.columns[c]!.type) === undefined)) {
+    // The tail-slot skip in indexBoundRows advances over each trailing key component by its FIXED
+    // width (widthBytes), which exists only for the fixed-width scalars. A tail column that is
+    // non-scalar (range/array/composite) OR a variable-width scalar (text/decimal/bytea/interval)
+    // has no fixed width, so the index cannot pushdown: fall through to the full scan + residual
+    // filter (rows identical, just no index bound).
+    if (
+      idx.columns.slice(1).some((c) => {
+        const ts = typeAsScalar(rel.table.columns[c]!.type);
+        return ts === undefined || !isFixedWidth(ts);
+      })
+    ) {
       continue;
     }
     // The leading column's key collation form (as for the PK above). A Skewed collated index is

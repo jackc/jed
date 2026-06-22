@@ -225,6 +225,21 @@ func (t ScalarType) WidthBytes() int {
 	}
 }
 
+// IsFixedWidth reports whether this scalar has a fixed KEY-encoding width — i.e. exactly the types
+// WidthBytes returns a nonzero value for, the complement of the variable-width text/decimal/bytea/
+// interval. These two MUST agree: any caller that skips a key component by WidthBytes (the index
+// tail-slot skip, executor.go) is sound only when this returns true, so the index-bound pushdown
+// gates on it (a variable-width tail column ⇒ no pushdown, full scan instead). Were the skip to run
+// over a variable-width tail it would advance by WidthBytes()==0 and mis-parse the row's key.
+func (t ScalarType) IsFixedWidth() bool {
+	switch t {
+	case Text, DecimalType, Bytea, IntervalType:
+		return false
+	default:
+		return true
+	}
+}
+
 // Min is the inclusive minimum value.
 func (t ScalarType) Min() int64 {
 	switch t {

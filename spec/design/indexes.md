@@ -175,6 +175,19 @@ bound (no multi-column prefix), **equality only** (no index range scans), `UPDAT
 streaming short-circuit does not combine** with an index bound (an index-bounded scan
 with LIMIT takes the eager path — its cost reads the full admitted set).
 
+An index is **eligible for the bound only when all of its trailing key columns are
+fixed-width** — the tail-skip above recovers the row's storage key by advancing over each
+trailing component by its component type's *fixed* width, which a **non-scalar**
+(range/array/composite) or a **variable-width scalar** (`text` / `decimal` / `bytea` /
+`interval`) tail column does not have. A multi-column index with such a tail column is
+therefore **not used for the bound**: the query takes the full scan + residual filter
+(rows identical, only the cost differs — `query/index_scan_vartail.test` pins this the cost
+way, and the fixed-width-tail control proves the gate is precise). The **leading** bound
+column itself may be variable-width — its value is matched as the encoded prefix
+`0x00 ‖ encode(value)`, never skipped by width (`collation/collated_pushdown.test`). Lifting
+this is a follow-on: skip a variable-width tail by its self-delimiting length, not a fixed
+width.
+
 ### Cost (the cross-core contract — cost.md §3)
 
 An index-bounded scan accrues, in place of the full-scan block:

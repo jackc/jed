@@ -209,6 +209,18 @@ impl ScalarType {
         }
     }
 
+    /// Whether this scalar has a fixed KEY-encoding width — i.e. exactly the types `width_bytes`
+    /// returns a value for, the complement of the variable-width `text`/`decimal`/`bytea`/`interval`.
+    /// These two MUST agree: any caller that skips a key component by `width_bytes` (the index
+    /// tail-slot skip, executor.rs) is sound only when this returns true, so the index-bound
+    /// pushdown gates on it (a variable-width tail column ⇒ no pushdown, full scan instead).
+    pub fn is_fixed_width(self) -> bool {
+        !matches!(
+            self,
+            ScalarType::Text | ScalarType::Decimal | ScalarType::Bytea | ScalarType::Interval
+        )
+    }
+
     /// Inclusive minimum value (integer-only).
     pub fn min(self) -> i64 {
         match self {
