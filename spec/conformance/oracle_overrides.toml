@@ -969,3 +969,10 @@ reason = "jed: a multi-column GIN index is 0A000 this slice (gin.md §3/§10 —
 file = "ddl/create_gin_index.test"
 sql = "CREATE INDEX i ON t USING gin (notes)"
 reason = "jed: a GIN over a non-integer element array (text[]) is 0A000 this slice (gin.md §3/§10 — the array_ops opclass covers the integer element types only, the same lift-when-encoded narrowing as a text ordered key). PostgreSQL builds a text[] GIN and the CREATE succeeds. A deliberate, documented narrowing; relaxable when the text element key encoding lifts."
+
+# --- regex `~` non-text operand: jed reports 42804 (the same text-operator type error it gives
+# `5 LIKE '5'`); PostgreSQL resolves `~` through its operator catalog and reports 42883.
+[[override]]
+file = "expr/regex.test"
+sql = "SELECT 5 ~ '5' FROM one"
+reason = "jed: a non-text operand to the `~` regex operator is a 42804 datatype mismatch (regex.md §7, compare.toml lists only text×text — the SAME 42804 jed gives `5 LIKE '5'`). PostgreSQL resolves `~` through its operator catalog and reports 42883 (no `integer ~ unknown` operator). Both reject; a documented error-class divergence, the same shape as the interval ± non-interval cases above."
