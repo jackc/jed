@@ -2861,6 +2861,33 @@ impl Parser {
                 type_mod,
             });
         }
+        // `EXTRACT(field FROM source)` (grammar.md §50, timezones.md §9.2). Recognized only when
+        // `extract` is immediately followed by `(`, so `extract` stays usable as a column / function
+        // name otherwise (the one-token lookahead, §8). The field is an identifier or a string
+        // literal (lowercased); the source is any expression.
+        if self.peek_keyword().as_deref() == Some("extract")
+            && matches!(self.peek_at(1), Token::LParen)
+        {
+            self.advance(); // EXTRACT
+            self.expect(&Token::LParen)?;
+            let field = match self.peek() {
+                Token::Str(_) => {
+                    if let Token::Str(s) = self.advance() {
+                        s
+                    } else {
+                        unreachable!()
+                    }
+                }
+                _ => self.expect_identifier()?,
+            };
+            self.expect_keyword("from")?;
+            let source = self.parse_expr()?;
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::Extract {
+                field: field.to_ascii_lowercase(),
+                source: Box::new(source),
+            });
+        }
         // `ROW(e1, e2, …)` composite constructor (spec/design/composite.md §1). Recognized when
         // `ROW` is immediately followed by `(`, so `row` stays usable as a column / function name
         // otherwise. The bare `(a, b)` form is deferred (`0A000`); only the keyword form parses.

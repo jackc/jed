@@ -64,6 +64,8 @@ class OracleImport
     @applied = []                 # PG-rewritten SQL of statements known to succeed
     @warnings = []
     @overrides = load_overrides
+    @tz = "UTC"        # the session zone for the CURRENT record (the `# timezone:` directive)
+    @next_tz = nil     # a pending `# timezone:` set by a comment, consumed by the next record
   end
 
   # Documented jed-vs-PG divergences for THIS file: a set of normalized SQL strings whose
@@ -90,6 +92,14 @@ class OracleImport
     i = 0
     while i < @lines.size
       line = @lines[i]
+      # Consume any pending `# timezone:` directive for THIS record (per-record, like jed's harness):
+      # the session zone PG decomposes a timestamptz in. Set to UTC otherwise so a directive never
+      # leaks forward (timezones.md §9.4). Records that are comments/blank don't consume it.
+      record_start = line =~ /^(statement|query)\s/
+      if record_start
+        @tz = @next_tz || "UTC"
+        @next_tz = nil
+      end
       case line
       when /^statement\s+ok\s*$/
         sql, i = take_sql(i + 1)
@@ -125,6 +135,12 @@ class OracleImport
                         joined =~ /\b(insert\s+into|update\b[\s\S]*\bset\b|delete\s+from)\b/i)
         @applied << rewrite(joined) if is_dml_query
       else
+        # A `# timezone: <zone>` directive sets the session zone for the next record (timezones.md
+        # §9.4); record it so `run` issues a matching `SET LOCAL TimeZone`. `# load-timezone:` is a
+        # no-op for the oracle (PG ships the full IANA db natively). Other comments pass through.
+        if line =~ /^#\s*timezone:\s*(\S+)/
+          @next_tz = Regexp.last_match(1)
+        end
         out << line # comment / blank / directive — pass through verbatim
         i += 1
       end
@@ -163,10 +179,12 @@ class OracleImport
     args = PSQL.dup
     args += ["-F", fieldsep] if fieldsep
     script = +"BEGIN;\n"
-    # Pin the session zone so timestamptz renders as UTC (+00), matching jed's instant model
-    # (timestamp.md): jed always emits UTC, PG emits in the session TimeZone. SET LOCAL is scoped
-    # to this rolled-back transaction. Zoneless `timestamp` output is tz-independent already.
-    script << "SET LOCAL TimeZone='UTC';\n"
+    # Pin the session zone to the record's `# timezone:` (default UTC). jed renders a timestamptz in
+    # UTC regardless of the slot (the rendering follow-on, timezones.md §9.5), so a record OUTPUTTING
+    # a timestamptz must be authored under UTC (or rendered via AT TIME ZONE 'UTC') to match; the
+    # zone-DEPENDENT computation of date_trunc/EXTRACT/casts runs in the same zone PG uses. SET LOCAL
+    # is scoped to this rolled-back transaction.
+    script << "SET LOCAL TimeZone='#{@tz}';\n"
     @applied.each { |s| script << s.rstrip << ";\n" unless s.strip.empty? }
     script << "\\echo @@@S\n" << body << "\n\\echo @@@E\n" << "ROLLBACK;\n"
     out, err, = Open3.capture3(*args, stdin_data: script)
@@ -284,10 +302,12 @@ class OracleImport
 
   def value_script(pg_sql)
     script = +"BEGIN;\n"
-    # Pin the session zone so timestamptz renders as UTC (+00), matching jed's instant model
-    # (timestamp.md): jed always emits UTC, PG emits in the session TimeZone. SET LOCAL is scoped
-    # to this rolled-back transaction. Zoneless `timestamp` output is tz-independent already.
-    script << "SET LOCAL TimeZone='UTC';\n"
+    # Pin the session zone to the record's `# timezone:` (default UTC). jed renders a timestamptz in
+    # UTC regardless of the slot (the rendering follow-on, timezones.md §9.5), so a record OUTPUTTING
+    # a timestamptz must be authored under UTC (or rendered via AT TIME ZONE 'UTC') to match; the
+    # zone-DEPENDENT computation of date_trunc/EXTRACT/casts runs in the same zone PG uses. SET LOCAL
+    # is scoped to this rolled-back transaction.
+    script << "SET LOCAL TimeZone='#{@tz}';\n"
     @applied.each { |s| script << s.rstrip << ";\n" unless s.strip.empty? }
     script << "\\echo @@@S\n" << pg_sql << ";\n" << "\\echo @@@E\n" << "ROLLBACK;\n"
     script

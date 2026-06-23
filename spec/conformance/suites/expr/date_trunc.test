@@ -1,0 +1,182 @@
+# date_trunc — truncate a datetime down to a unit (spec/design/timezones.md §9.1, grammar.md §50).
+# 2-arg over timestamp -> timestamp, timestamptz -> timestamptz (in the SESSION zone), interval ->
+# interval; 3-arg date_trunc(unit, timestamptz, zone) -> timestamptz truncates in the explicit zone.
+# `unit` is a runtime text value (case-insensitive; an unrecognized unit is 22023 at eval). A `date`
+# argument is 42883 (no implicit date->timestamp cast — a documented jed divergence). Oracle-checked
+# against postgres:18; a timestamptz OUTPUT under a non-UTC session is rendered via AT TIME ZONE 'UTC'
+# (jed renders a timestamptz in UTC regardless of the slot — the rendering follow-on, §9.5).
+#
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: query.select, query.select_no_from, types.timestamp, types.timestamptz, types.interval, expr.date_trunc, expr.at_time_zone, session.timezone
+
+# ============================================================================================
+# timestamp (zone-free): truncate the stored wall clock
+# ============================================================================================
+
+query T nosort
+SELECT date_trunc('microseconds', timestamp '2024-08-15 13:47:23.456789')
+----
+2024-08-15 13:47:23.456789
+
+query T nosort
+SELECT date_trunc('milliseconds', timestamp '2024-08-15 13:47:23.456789')
+----
+2024-08-15 13:47:23.456
+
+query T nosort
+SELECT date_trunc('second', timestamp '2024-08-15 13:47:23.456789')
+----
+2024-08-15 13:47:23
+
+query T nosort
+SELECT date_trunc('minute', timestamp '2024-08-15 13:47:23.456789')
+----
+2024-08-15 13:47:00
+
+query T nosort
+SELECT date_trunc('hour', timestamp '2024-08-15 13:47:23.456789')
+----
+2024-08-15 13:00:00
+
+query T nosort
+SELECT date_trunc('day', timestamp '2024-08-15 13:47:23.456789')
+----
+2024-08-15 00:00:00
+
+# week truncates back to Monday (2024-08-15 is a Thursday)
+query T nosort
+SELECT date_trunc('week', timestamp '2024-08-15 13:47:23')
+----
+2024-08-12 00:00:00
+
+query T nosort
+SELECT date_trunc('month', timestamp '2024-08-15 13:47:23')
+----
+2024-08-01 00:00:00
+
+query T nosort
+SELECT date_trunc('quarter', timestamp '2024-08-15 13:47:23')
+----
+2024-07-01 00:00:00
+
+query T nosort
+SELECT date_trunc('year', timestamp '2024-08-15 13:47:23')
+----
+2024-01-01 00:00:00
+
+query T nosort
+SELECT date_trunc('decade', timestamp '2024-08-15 13:47:23')
+----
+2020-01-01 00:00:00
+
+query T nosort
+SELECT date_trunc('century', timestamp '2024-08-15 13:47:23')
+----
+2001-01-01 00:00:00
+
+query T nosort
+SELECT date_trunc('millennium', timestamp '2024-08-15 13:47:23')
+----
+2001-01-01 00:00:00
+
+# the unit is case-insensitive
+query T nosort
+SELECT date_trunc('HOUR', timestamp '2024-08-15 13:47:23')
+----
+2024-08-15 13:00:00
+
+# ±infinity passes through unchanged
+query T nosort
+SELECT date_trunc('day', timestamp 'infinity')
+----
+infinity
+
+# ============================================================================================
+# interval (zone-free): truncate the components; `week` is unsupported (0A000)
+# ============================================================================================
+
+query T nosort
+SELECT date_trunc('hour', interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+3 years 5 mons 17 days 13:00:00
+
+query T nosort
+SELECT date_trunc('day', interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+3 years 5 mons 17 days
+
+query T nosort
+SELECT date_trunc('month', interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+3 years 5 mons
+
+query T nosort
+SELECT date_trunc('quarter', interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+3 years 3 mons
+
+query T nosort
+SELECT date_trunc('year', interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+3 years
+
+statement error 0A000
+SELECT date_trunc('week', interval '3 days')
+
+# ============================================================================================
+# timestamptz, 2-arg, under the SESSION zone (default UTC): truncate the instant in UTC
+# ============================================================================================
+
+query T nosort
+SELECT date_trunc('day', timestamptz '2024-03-15 13:47:23+00')
+----
+2024-03-15 00:00:00+00
+
+query T nosort
+SELECT date_trunc('hour', timestamptz '2024-03-15 13:47:23.456+00')
+----
+2024-03-15 13:00:00+00
+
+# ============================================================================================
+# timestamptz, 2-arg, under a non-UTC session zone: the truncation boundary is the LOCAL midnight.
+# The result is a timestamptz (rendered via AT TIME ZONE 'UTC' to a zone-free timestamp — §9.5):
+# 02:30 UTC on 2024-03-15 is 22:30 on the 14th in New York (EDT -04), so the day truncates to
+# 2024-03-14 00:00 local = 2024-03-14 04:00 UTC.
+# ============================================================================================
+
+# timezone: America/New_York
+query T nosort
+SELECT date_trunc('day', timestamptz '2024-03-15 02:30:00+00') AT TIME ZONE 'UTC'
+----
+2024-03-14 04:00:00
+
+# ============================================================================================
+# timestamptz, 3-arg, explicit zone (session UTC, so the result renders UTC): truncate in the zone
+# ============================================================================================
+
+query T nosort
+SELECT date_trunc('day', timestamptz '2024-03-15 02:30:00+00', 'America/New_York')
+----
+2024-03-14 04:00:00+00
+
+# an unknown explicit zone is 22023
+statement error 22023
+SELECT date_trunc('day', timestamptz '2024-03-15 02:30:00+00', 'Mars/Phobos')
+
+# ============================================================================================
+# Errors and NULL
+# ============================================================================================
+
+# an unrecognized unit is 22023 (at eval)
+statement error 22023
+SELECT date_trunc('nope', timestamp '2024-01-01 00:00:00')
+
+# a date argument has no overload — jed has no implicit date->timestamp cast (PG accepts it)
+statement error 42883
+SELECT date_trunc('day', date '2024-03-15')
+
+# a NULL unit / value propagates to NULL
+query T nosort
+SELECT date_trunc(NULL, timestamp '2024-08-15 13:00:00')
+----
+NULL

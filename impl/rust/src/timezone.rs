@@ -779,14 +779,55 @@ pub fn instant_to_local_micros(zr: &ZoneRef, instant_micros: i64) -> i64 {
 }
 
 /// `timestamp AT TIME ZONE zone` (§4): interpret the wall-clock reading (micros) as local in `zone`,
-/// producing the UTC instant — `instant = wall − utoff`. Two-probe resolution: guess the offset from
-/// the wall clock read as if UT, then re-read at the guessed instant. Correct for every unambiguous
-/// time; at a DST gap/overlap the branch matches PostgreSQL (oracle-pinned, timezones.md §6).
+/// producing the UTC instant — `instant = wall − utoff`. The offset is chosen by
+/// [`determine_local_offset`], matching PostgreSQL's `DetermineTimeZoneOffset` at a DST gap/overlap
+/// (oracle-pinned, timezones.md §6).
 pub fn local_to_instant_micros(zr: &ZoneRef, wall_micros: i64) -> i64 {
     let wall_secs = wall_micros.div_euclid(1_000_000);
-    let off1 = offset_at_ref(zr, wall_secs).utoff as i64;
-    let off2 = offset_at_ref(zr, wall_secs - off1).utoff as i64;
-    wall_micros - off2 * 1_000_000
+    let chosen = determine_local_offset(zr, wall_secs);
+    wall_micros - chosen * 1_000_000
+}
+
+/// Choose the UT offset (seconds) to interpret a wall-clock `wall_secs` reading with, matching
+/// PostgreSQL's `DetermineTimeZoneOffset` (src/timezone/pgtz.c) at a DST boundary. For a normal time
+/// both candidate offsets agree; for a spring-forward GAP (a nonexistent wall clock) PG uses the
+/// *before* (earlier) offset; for a fall-back OVERLAP (a doubled wall clock) PG uses the *after*
+/// (later) offset. A fixed-offset zone has no boundary, so the single offset is returned.
+fn determine_local_offset(zr: &ZoneRef, wall_secs: i64) -> i64 {
+    const DAY: i64 = 86_400;
+    // The offsets a day before / after `wall_secs` (taken as if UTC). A DST transition is never less
+    // than a day apart, so at most one boundary lies in this 2-day window; if both ends agree there
+    // is no boundary near `wall_secs` and the time is unambiguous.
+    let off_lo = offset_at_ref(zr, wall_secs - DAY).utoff as i64;
+    let off_hi = offset_at_ref(zr, wall_secs + DAY).utoff as i64;
+    if off_lo == off_hi {
+        return off_lo;
+    }
+    // Binary-search the boundary: the smallest instant in (wall-DAY, wall+DAY] whose offset is no
+    // longer `off_lo` (i.e. has become `off_hi`).
+    let mut lo = wall_secs - DAY;
+    let mut hi = wall_secs + DAY;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if offset_at_ref(zr, mid).utoff as i64 == off_lo {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    let boundary = lo;
+    let beforetime = wall_secs - off_lo;
+    let aftertime = wall_secs - off_hi;
+    let before_side = beforetime < boundary;
+    let after_side = aftertime < boundary;
+    if before_side == after_side {
+        // Both candidate instants fall on the same side of the boundary — an ordinary time.
+        if before_side { off_lo } else { off_hi }
+    } else if beforetime > aftertime {
+        off_lo // gap: the before (earlier) offset
+    } else {
+        off_hi // overlap: the after (later) offset
+    }
 }
 
 /// Parse a fixed numeric offset `[+|-]HH[:MM[:SS]]` (the WHOLE string). Requires a leading sign so it

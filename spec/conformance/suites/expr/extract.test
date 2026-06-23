@@ -1,0 +1,273 @@
+# EXTRACT(field FROM source) — a single datetime field as numeric (spec/design/timezones.md §9.2,
+# grammar.md §50). The field is syntactic (identifier or string literal, case-insensitive), validated
+# at resolve. Source is timestamp / timestamptz / date / interval; the field-validity matrix matches
+# PostgreSQL (an unsupported field for the type is 0A000, an unrecognized field is 22023). For a
+# timestamptz source every field is computed in the SESSION zone except `epoch`. Oracle-checked
+# against postgres:18. (Divergences — `julian`, `date_part`, EXTRACT of ±infinity — are per-core unit
+# tests, not here: the oracle corpus is PG-clean.)
+#
+# Format + the `requires` gate: ../../../design/conformance.md.
+# requires: query.select, query.select_no_from, types.timestamp, types.timestamptz, types.date, types.interval, expr.extract, session.timezone
+
+# ============================================================================================
+# timestamp: every supported field of 2024-03-15 13:47:23.456789
+# ============================================================================================
+
+query D nosort
+SELECT EXTRACT(microseconds FROM timestamp '2024-03-15 13:47:23.456789')
+----
+23456789
+
+query D nosort
+SELECT EXTRACT(milliseconds FROM timestamp '2024-03-15 13:47:23.456789')
+----
+23456.789
+
+query D nosort
+SELECT EXTRACT(second FROM timestamp '2024-03-15 13:47:23.456789')
+----
+23.456789
+
+query D nosort
+SELECT EXTRACT(minute FROM timestamp '2024-03-15 13:47:23.456789')
+----
+47
+
+query D nosort
+SELECT EXTRACT(hour FROM timestamp '2024-03-15 13:47:23.456789')
+----
+13
+
+query D nosort
+SELECT EXTRACT(day FROM timestamp '2024-03-15 13:47:23.456789')
+----
+15
+
+query D nosort
+SELECT EXTRACT(month FROM timestamp '2024-03-15 13:47:23.456789')
+----
+3
+
+query D nosort
+SELECT EXTRACT(quarter FROM timestamp '2024-03-15 13:47:23.456789')
+----
+1
+
+query D nosort
+SELECT EXTRACT(year FROM timestamp '2024-03-15 13:47:23.456789')
+----
+2024
+
+query D nosort
+SELECT EXTRACT(decade FROM timestamp '2024-03-15 13:47:23.456789')
+----
+202
+
+query D nosort
+SELECT EXTRACT(century FROM timestamp '2024-03-15 13:47:23.456789')
+----
+21
+
+query D nosort
+SELECT EXTRACT(millennium FROM timestamp '2024-03-15 13:47:23.456789')
+----
+3
+
+query D nosort
+SELECT EXTRACT(week FROM timestamp '2024-03-15 13:47:23.456789')
+----
+11
+
+query D nosort
+SELECT EXTRACT(dow FROM timestamp '2024-03-15 13:47:23.456789')
+----
+5
+
+query D nosort
+SELECT EXTRACT(isodow FROM timestamp '2024-03-15 13:47:23.456789')
+----
+5
+
+query D nosort
+SELECT EXTRACT(doy FROM timestamp '2024-03-15 13:47:23.456789')
+----
+75
+
+query D nosort
+SELECT EXTRACT(isoyear FROM timestamp '2024-03-15 13:47:23.456789')
+----
+2024
+
+query D nosort
+SELECT EXTRACT(epoch FROM timestamp '2024-03-15 13:47:23.456789')
+----
+1710510443.456789
+
+# the field accepts a string literal too, and is case-insensitive
+query D nosort
+SELECT EXTRACT('DOW' FROM timestamp '2024-03-15 13:47:23')
+----
+5
+
+# whole-second scales (PG fixes the scale: second=6, milliseconds=3, microseconds=0)
+query D nosort
+SELECT EXTRACT(second FROM timestamp '2024-01-01 00:00:23')
+----
+23.000000
+
+query D nosort
+SELECT EXTRACT(milliseconds FROM timestamp '2024-01-01 00:00:23')
+----
+23000.000
+
+# ISO week edges: 2024-12-30 (Mon) is ISO week 1 of 2025; 2023-01-01 (Sun) is week 52 of 2022
+query DD nosort
+SELECT EXTRACT(week FROM timestamp '2024-12-30 00:00:00'), EXTRACT(isoyear FROM timestamp '2024-12-30 00:00:00')
+----
+1
+2025
+
+query DDD nosort
+SELECT EXTRACT(week FROM timestamp '2023-01-01 00:00:00'), EXTRACT(isoyear FROM timestamp '2023-01-01 00:00:00'), EXTRACT(isodow FROM timestamp '2023-01-01 00:00:00')
+----
+52
+2022
+7
+
+# ============================================================================================
+# date: the calendar fields; time fields (and timezone*) are 0A000 (PG: "not supported for date")
+# ============================================================================================
+
+query DDD nosort
+SELECT EXTRACT(year FROM date '2024-03-15'), EXTRACT(month FROM date '2024-03-15'), EXTRACT(day FROM date '2024-03-15')
+----
+2024
+3
+15
+
+query DDD nosort
+SELECT EXTRACT(dow FROM date '2024-03-15'), EXTRACT(doy FROM date '2024-03-15'), EXTRACT(quarter FROM date '2024-03-15')
+----
+5
+75
+1
+
+query D nosort
+SELECT EXTRACT(epoch FROM date '2024-01-01')
+----
+1704067200
+
+statement error 0A000
+SELECT EXTRACT(hour FROM date '2024-03-15')
+
+statement error 0A000
+SELECT EXTRACT(second FROM date '2024-03-15')
+
+statement error 0A000
+SELECT EXTRACT(timezone FROM date '2024-03-15')
+
+# ============================================================================================
+# interval: the component fields; dow/doy/isodow/isoyear/timezone* are 0A000
+# ============================================================================================
+
+query D nosort
+SELECT EXTRACT(day FROM interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+17
+
+query D nosort
+SELECT EXTRACT(hour FROM interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+13
+
+query D nosort
+SELECT EXTRACT(minute FROM interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+47
+
+query D nosort
+SELECT EXTRACT(second FROM interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+23.456789
+
+query D nosort
+SELECT EXTRACT(month FROM interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+5
+
+query D nosort
+SELECT EXTRACT(year FROM interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+3
+
+query D nosort
+SELECT EXTRACT(quarter FROM interval '5 mons')
+----
+2
+
+query D nosort
+SELECT EXTRACT(week FROM interval '17 days')
+----
+2
+
+query D nosort
+SELECT EXTRACT(decade FROM interval '140 years')
+----
+14
+
+query D nosort
+SELECT EXTRACT(epoch FROM interval '3 years 5 mons 17 days 13:47:23.456789')
+----
+109151243.456789
+
+# a 25-hour interval's hour field is 25 (the time component is not normalized into days)
+query DD nosort
+SELECT EXTRACT(hour FROM interval '25:00:00'), EXTRACT(day FROM interval '25:00:00')
+----
+25
+0
+
+statement error 0A000
+SELECT EXTRACT(dow FROM interval '3 days')
+
+# ============================================================================================
+# timestamptz under a non-UTC session zone: the wall-clock fields shift; epoch is zone-independent
+# (02:30 UTC on 2024-03-15 is 22:30 on the 14th in New York, EDT -04).
+# ============================================================================================
+
+# timezone: America/New_York
+query DD nosort
+SELECT EXTRACT(hour FROM timestamptz '2024-03-15 02:30:00+00'), EXTRACT(day FROM timestamptz '2024-03-15 02:30:00+00')
+----
+22
+14
+
+# epoch is the instant — independent of the session zone
+# timezone: America/New_York
+query D nosort
+SELECT EXTRACT(epoch FROM timestamptz '2024-03-15 02:30:00+00')
+----
+1710469800.000000
+
+# the timezone* fields report the session zone's offset at that instant (July -> EDT -04)
+# timezone: America/New_York
+query DDD nosort
+SELECT EXTRACT(timezone FROM timestamptz '2024-07-15 12:00:00+00'), EXTRACT(timezone_hour FROM timestamptz '2024-07-15 12:00:00+00'), EXTRACT(timezone_minute FROM timestamptz '2024-07-15 12:00:00+00')
+----
+-14400
+-4
+0
+
+# ============================================================================================
+# Errors and NULL
+# ============================================================================================
+
+# an unrecognized field is 22023
+statement error 22023
+SELECT EXTRACT(bogus FROM timestamp '2024-03-15 00:00:00')
+
+# a NULL source propagates to NULL
+query D nosort
+SELECT EXTRACT(hour FROM CAST(NULL AS timestamp))
+----
+NULL

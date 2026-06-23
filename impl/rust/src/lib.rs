@@ -15,6 +15,7 @@ pub mod collation;
 pub mod cost;
 pub mod costs;
 pub mod date;
+pub mod datetime_fn;
 pub mod decimal;
 pub mod encoding;
 pub mod error;
@@ -366,6 +367,14 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // `UTC` and fixed offsets are built in. Unknown zone 22023, non-text zone 42883; the `timezone`
     // cost unit. No on-disk change (timestamptz is UTC — §2).
     "expr.at_time_zone",
+    // The tz conversion surface (spec/design/timezones.md §9): date_trunc / EXTRACT / the cross-
+    // family datetime casts, all consuming the session `time_zone` slot (the zone a timestamptz is
+    // decomposed in). date_part / julian / text-casts / make_timestamptz deferred; rendering stays
+    // UTC (§9.5).
+    "expr.date_trunc",
+    "expr.extract",
+    "cast.datetime",
+    "session.timezone",
     // Per-column COLLATE in CREATE TABLE (collation slice 1d, spec/design/collation.md §1/§5): a
     // column's effective collation is frozen at create (text-only 42804, loaded-or-C name 42704) and
     // is its IMPLICIT collation — ORDER BY / comparisons use it with no explicit COLLATE; two

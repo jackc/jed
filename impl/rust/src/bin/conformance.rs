@@ -171,6 +171,15 @@ fn load_timezone(name: &str) -> std::result::Result<(), String> {
     ))
 }
 
+/// Parse a `# timezone: <zone>` directive body (spec/design/session.md §6.2, timezones.md §9.4): the
+/// SESSION time zone for the next record (the zone a `timestamptz` decomposes in). Per-record (reset
+/// to `UTC` after), like `# set:`. A named zone must already be loaded (`# load-timezone:`). Distinct
+/// from `# load-timezone:` (which loads the bundle). Returns the zone, or None if not this directive.
+fn parse_timezone_directive(rest: &str) -> Option<String> {
+    let body = rest.trim_start().strip_prefix("timezone:")?.trim();
+    Some(body.to_string())
+}
+
 /// Parse a file-level `# fixture: <spec-relative-path>` directive — the corpus's way to run a file
 /// against a PRE-BUILT database image instead of a fresh `Database::new()`, so a test can exercise
 /// on-disk state that SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded
@@ -534,6 +543,7 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
     let mut pending_temp_buffers: Option<usize> = None;
     let mut pending_shared_temp_mem: Option<usize> = None;
     let mut pending_vars: Vec<(String, String)> = Vec::new();
+    let mut pending_timezone: Option<String> = None;
 
     while let Some(line) = lines.next() {
         let trimmed = line.trim();
@@ -600,6 +610,8 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
                 pending_temp_buffers = Some(n);
             } else if let Some(vars) = parse_set_directive(rest) {
                 pending_vars.extend(vars);
+            } else if let Some(z) = parse_timezone_directive(rest) {
+                pending_timezone = Some(z);
             } else if let Some(s) = parse_seed_directive(rest) {
                 pending_seed = Some(s);
             } else if let Some(c) = parse_clock_directive(rest) {
@@ -677,6 +689,11 @@ fn run_file(text: &str) -> std::result::Result<(), String> {
             db.set_var(&name, &value)
                 .expect("# set: directive uses a dotted (custom) variable name");
         }
+        // Apply the per-record session time zone (spec/design/session.md §6.2, timezones.md §9.4):
+        // reset to UTC, then set the pending `# timezone:` zone, so a directive decorates only its
+        // record and never leaks forward. A named zone must already be loaded (`# load-timezone:`).
+        db.set_time_zone(pending_timezone.take().as_deref().unwrap_or("UTC"))
+            .unwrap_or_else(|e| panic!("# timezone: {}", e.message));
         let mut parts = trimmed.split_whitespace();
         let kind = parts.next().unwrap();
         match kind {
@@ -792,6 +809,14 @@ fn rebaseline_file(text: &str) -> Option<String> {
                 // Mirror `run_file`: a fixture file evolves DB state from the pre-built image, not a
                 // fresh DB, so the cost walk sees the same starting state.
                 db = open_fixture(&rel).ok()?;
+            } else if let Some(name) = parse_load_timezone_directive(rest) {
+                // Mirror `run_file`: load the bundle so a named-zone record runs (and accrues cost)
+                // during the cost walk (timezones.md §11).
+                load_timezone(&name).ok()?;
+            } else if let Some(z) = parse_timezone_directive(rest) {
+                // The session zone does not change cost (zone-agnostic), but set it so the record
+                // re-executes identically to `run_file`.
+                db.set_time_zone(&z).ok()?;
             } else if parse_upgrade_collations_directive(rest) {
                 // Mirror `run_file`: clear a version-skew so the post-upgrade records run against the
                 // migrated (read-write) state.

@@ -936,7 +936,7 @@ pub struct Database {
 /// budget. Passed to [`Database::session`] to mint an additional session; an absent field takes its
 /// default. (The entropy/clock seam is injected via [`Session::set_random_source`] /
 /// [`Session::set_clock_source`], not here.)
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub struct SessionOptions {
     /// Execution-cost ceiling (CLAUDE.md §13); `0` ⇒ unlimited (the default).
     pub max_cost: i64,
@@ -975,6 +975,13 @@ pub struct SessionOptions {
     /// (spec/design/temp-tables.md §7); `0` ⇒ unlimited. Default [`DEFAULT_TEMP_BUFFERS`]. Bounds the
     /// RETAINED temp storage neither cost ceiling covers — an over-budget temp write aborts `54P03`.
     pub temp_buffers: usize,
+    /// The session **time zone** (spec/design/session.md §6.2, timezones.md §9.4): the zone a
+    /// `timestamptz` is decomposed *in* by `date_trunc` / `EXTRACT` / the cross-family datetime casts.
+    /// Default `"UTC"`. Accepts `UTC`, a fixed `±HH:MM` offset, or a **named** IANA zone a loaded
+    /// `JTZ` bundle provides; a name no bundle provides is rejected (`22023`) when the session is minted
+    /// — the resolved zone is cached on the [`Session`]. (An invalid value here falls back to `UTC`
+    /// rather than failing the mint; use [`Session::set_time_zone`] for the validated setter.)
+    pub time_zone: String,
 }
 
 impl Default for SessionOptions {
@@ -989,6 +996,7 @@ impl Default for SessionOptions {
             allow_temp_ddl: None,
             allow_shared_temp_ddl: None,
             temp_buffers: DEFAULT_TEMP_BUFFERS,
+            time_zone: "UTC".to_string(),
         }
     }
 }
@@ -1095,6 +1103,12 @@ pub struct Session {
     /// snapshot state**: it does NOT roll back with a transaction (PG `SET SESSION`), and it carries
     /// across the additional-session swap because it lives on `Session` (like the privilege envelope).
     pub(crate) vars: HashMap<String, String>,
+    /// The resolved session **time zone** (spec/design/session.md §6.2, timezones.md §9.4): the zone a
+    /// `timestamptz` is decomposed *in* by `date_trunc` / `EXTRACT` / the cross-family casts. Resolved
+    /// once (from [`SessionOptions::time_zone`] at mint, or [`Session::set_time_zone`]) to a cheap
+    /// [`crate::timezone::ZoneRef`] (`UTC` = `Fixed(0)`); the evaluator reads it via the active session.
+    /// **Session state** — carries across the additional-session swap, no storage effect.
+    pub(crate) time_zone: crate::timezone::ZoneRef,
     /// The session-local **temporary-table** catalog + stores (spec/design/temp-tables.md §2): a
     /// `Snapshot` holding only this session's temp tables, their stores, and their (UNIQUE) index
     /// stores. **Never serialized** — only [`Database::committed`] is written to the file, so a temp
@@ -1171,7 +1185,28 @@ impl Session {
             temp_buffers: opts.temp_buffers,
             temp_committed: Snapshot::default(),
             vars: HashMap::new(),
+            // Resolve the configured zone once; an invalid value falls back to UTC at mint (the
+            // validated path is `set_time_zone`, which surfaces 22023). timezones.md §9.4.
+            time_zone: crate::timezone::resolve_zone(&opts.time_zone)
+                .unwrap_or(crate::timezone::ZoneRef::Fixed(0)),
             read_pin: None,
+        }
+    }
+
+    /// Set the session **time zone** (spec/design/session.md §6.2, timezones.md §9.4): the zone a
+    /// `timestamptz` is decomposed *in*. Accepts `UTC`, a fixed `±HH:MM` offset, or a named IANA zone
+    /// a loaded `JTZ` bundle provides; a name no bundle provides (and not a built-in) is **`22023`**
+    /// (`invalid_parameter_value`), the value unchanged. The resolved zone is cached on the session.
+    pub fn set_time_zone(&mut self, zone: &str) -> Result<()> {
+        match crate::timezone::resolve_zone(zone) {
+            Some(zr) => {
+                self.time_zone = zr;
+                Ok(())
+            }
+            None => Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!("time zone \"{zone}\" not recognized"),
+            )),
         }
     }
 
@@ -2151,6 +2186,14 @@ impl Database {
     /// Clear a session variable on the default session (§6.1); a non-dotted name is `42704`.
     pub fn reset_var(&mut self, name: &str) -> Result<()> {
         self.session.reset_var(name)
+    }
+
+    /// Set the **time zone** on the default session (spec/design/session.md §6.2, timezones.md §9.4):
+    /// the zone a `timestamptz` is decomposed *in* by `date_trunc` / `EXTRACT` / the cross-family
+    /// casts. Accepts `UTC`, a fixed `±HH:MM` offset, or a named IANA zone a loaded `JTZ` bundle
+    /// provides; otherwise `22023`.
+    pub fn set_time_zone(&mut self, zone: &str) -> Result<()> {
+        self.session.set_time_zone(zone)
     }
 
     /// Read a session variable's value on the default session (§6.1), or `None` if it is not set.
@@ -9377,6 +9420,20 @@ impl Database {
                 self.fold_uncorrelated_in_rexpr(zone, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(value, bound, ctes, cost)
             }
+            RExpr::DateTrunc { unit, value, zone } => {
+                self.fold_uncorrelated_in_rexpr(unit, bound, ctes, cost)?;
+                self.fold_uncorrelated_in_rexpr(value, bound, ctes, cost)?;
+                if let Some(z) = zone {
+                    self.fold_uncorrelated_in_rexpr(z, bound, ctes, cost)?;
+                }
+                Ok(())
+            }
+            RExpr::Extract { value, .. } => {
+                self.fold_uncorrelated_in_rexpr(value, bound, ctes, cost)
+            }
+            RExpr::DateConvert { inner, .. } => {
+                self.fold_uncorrelated_in_rexpr(inner, bound, ctes, cost)
+            }
             RExpr::Arith { lhs, rhs, .. }
             | RExpr::Compare { lhs, rhs, .. }
             | RExpr::Distinct { lhs, rhs, .. }
@@ -10777,6 +10834,31 @@ enum RExpr {
         value: Box<RExpr>,
         to_timestamptz: bool,
     },
+    /// `date_trunc(unit, value[, zone])` (timezones.md §9.1) — truncate `value` down to `unit`.
+    /// `unit` is a runtime text expression (case-insensitive; an unrecognized unit is `22023` at
+    /// eval). For a `timestamptz` `value` the truncation is in `zone` (the 3-arg form) or the session
+    /// zone (`zone = None`, the 2-arg form), charging the `timezone` unit; for `timestamp`/`interval`
+    /// it is zone-free. The result family is the `value` family (the runtime `Value` dispatches).
+    DateTrunc {
+        unit: Box<RExpr>,
+        value: Box<RExpr>,
+        zone: Option<Box<RExpr>>,
+    },
+    /// `EXTRACT(field FROM value)` (timezones.md §9.2) — the `numeric` value of `field` (lowercased,
+    /// validated at resolve). For a `timestamptz` `value`, every field but `epoch` is computed in the
+    /// session zone (charging `timezone`); the `timezone*` fields read the session offset.
+    Extract {
+        field: String,
+        value: Box<RExpr>,
+    },
+    /// A cross-family datetime cast (timezones.md §9.3) to `to` (`timestamp`/`timestamptz`/`date`)
+    /// from another datetime family — the runtime `Value` carries the source family. Casts crossing
+    /// the `timestamptz` boundary consult the session zone (charging `timezone`); `±infinity` and
+    /// NULL pass through. `to` is one of `Timestamp` / `Timestamptz` / `Date`.
+    DateConvert {
+        inner: Box<RExpr>,
+        to: ScalarType,
+    },
     /// A resolved `CASE` (grammar.md §23). `arms` is `(condition, result)` pairs — the condition
     /// is the searched boolean predicate, or the simple form's resolved `operand = value`
     /// equality. `els` is the ELSE result (`ConstNull` for an implicit ELSE). Evaluated lazily:
@@ -11253,7 +11335,9 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
                     .map(sub)
                     .sum::<usize>()
         }
-        Expr::Cast { inner, .. } | Expr::Collate { inner, .. } => sub(inner),
+        Expr::Cast { inner, .. }
+        | Expr::Collate { inner, .. }
+        | Expr::Extract { source: inner, .. } => sub(inner),
         Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => sub(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -12202,6 +12286,13 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         RExpr::AtTimeZone { zone, value, .. } => {
             rexpr_is_constant(zone) && rexpr_is_constant(value)
         }
+        RExpr::DateTrunc { unit, value, zone } => {
+            rexpr_is_constant(unit)
+                && rexpr_is_constant(value)
+                && zone.as_ref().is_none_or(|z| rexpr_is_constant(z))
+        }
+        RExpr::Extract { value, .. } => rexpr_is_constant(value),
+        RExpr::DateConvert { inner, .. } => rexpr_is_constant(inner),
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
@@ -13186,7 +13277,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. }
         | Expr::Param(_) => false,
-        Expr::Cast { inner, .. } => expr_has_aggregate(inner),
+        Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => expr_has_aggregate(inner),
         Expr::Collate { inner, .. } => expr_has_aggregate(inner),
         Expr::Unary { operand, .. } => expr_has_aggregate(operand),
         Expr::IsNull { operand, .. } => expr_has_aggregate(operand),
@@ -13262,7 +13353,9 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
         | Expr::TypedLiteral { .. } => Ok(()),
-        Expr::Cast { inner, .. } => reject_check_structure(inner),
+        Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => {
+            reject_check_structure(inner)
+        }
         Expr::Collate { inner, .. } => reject_check_structure(inner),
         Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
             reject_check_structure(operand)
@@ -13349,7 +13442,9 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
             args.iter().try_for_each(reject_default_structure)
         }
         Expr::Literal(_) | Expr::TypedLiteral { .. } => Ok(()),
-        Expr::Cast { inner, .. } => reject_default_structure(inner),
+        Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => {
+            reject_default_structure(inner)
+        }
         Expr::Collate { inner, .. } => reject_default_structure(inner),
         Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
             reject_default_structure(operand)
@@ -13424,7 +13519,9 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
         match e {
             Expr::Column(name) | Expr::QualifiedColumn { name, .. } => note(name),
             Expr::Literal(_) | Expr::TypedLiteral { .. } | Expr::Param(_) => {}
-            Expr::Cast { inner, .. } | Expr::Collate { inner, .. } => walk(inner, columns, out),
+            Expr::Cast { inner, .. }
+            | Expr::Collate { inner, .. }
+            | Expr::Extract { source: inner, .. } => walk(inner, columns, out),
             Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
                 walk(operand, columns, out)
             }
@@ -13626,6 +13723,15 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         RExpr::AtTimeZone { zone, value, .. } => {
             rexpr_references_outer(zone, depth) || rexpr_references_outer(value, depth)
         }
+        RExpr::DateTrunc { unit, value, zone } => {
+            rexpr_references_outer(unit, depth)
+                || rexpr_references_outer(value, depth)
+                || zone
+                    .as_ref()
+                    .is_some_and(|z| rexpr_references_outer(z, depth))
+        }
+        RExpr::Extract { value, .. } => rexpr_references_outer(value, depth),
+        RExpr::DateConvert { inner, .. } => rexpr_references_outer(inner, depth),
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
@@ -13734,6 +13840,15 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             collect_touched(zone, depth, touched);
             collect_touched(value, depth, touched);
         }
+        RExpr::DateTrunc { unit, value, zone } => {
+            collect_touched(unit, depth, touched);
+            collect_touched(value, depth, touched);
+            if let Some(z) = zone {
+                collect_touched(z, depth, touched);
+            }
+        }
+        RExpr::Extract { value, .. } => collect_touched(value, depth, touched),
+        RExpr::DateConvert { inner, .. } => collect_touched(inner, depth, touched),
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
@@ -14412,6 +14527,54 @@ fn resolve_timezone(
     ))
 }
 
+/// Resolve `date_trunc(unit, value[, zone])` (timezones.md §9.1). `unit` is text (a runtime value,
+/// validated at eval); `value` is `timestamp` / `timestamptz` / `interval`; the optional `zone` (text)
+/// is the 3-arg form, valid **only** for a `timestamptz` value. The result family is the `value`
+/// family. A non-text unit/zone, a non-datetime value, or the 3-arg form on a non-`timestamptz` value
+/// is `42883` (no such overload — PG-matching; a `date` value also has no overload, jed having no
+/// implicit `date`→`timestamp` cast).
+fn resolve_date_trunc(
+    scope: &Scope,
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if args.len() != 2 && args.len() != 3 {
+        return Err(no_func_overload("date_trunc"));
+    }
+    let (unit_r, unit_t) = resolve(scope, &args[0], Some(ScalarType::Text), agg, params)?;
+    let (value_r, value_t) = resolve(scope, &args[1], None, agg, params)?;
+    if !matches!(unit_t, ResolvedType::Text | ResolvedType::Null) {
+        return Err(no_func_overload("date_trunc"));
+    }
+    let result = match value_t {
+        ResolvedType::Timestamp | ResolvedType::Timestamptz | ResolvedType::Interval => value_t,
+        _ => return Err(no_func_overload("date_trunc")),
+    };
+    let zone = if args.len() == 3 {
+        // The 3-arg form is `date_trunc(text, timestamptz, text)` only (PG): a 3-arg call on a
+        // timestamp/interval value is "no such function".
+        if !matches!(result, ResolvedType::Timestamptz) {
+            return Err(no_func_overload("date_trunc"));
+        }
+        let (zone_r, zone_t) = resolve(scope, &args[2], Some(ScalarType::Text), agg, params)?;
+        if !matches!(zone_t, ResolvedType::Text | ResolvedType::Null) {
+            return Err(no_func_overload("date_trunc"));
+        }
+        Some(Box::new(zone_r))
+    } else {
+        None
+    };
+    Ok((
+        RExpr::DateTrunc {
+            unit: Box::new(unit_r),
+            value: Box::new(value_r),
+            zone,
+        },
+        result,
+    ))
+}
+
 /// Whether `name` (case-insensitive) is a range CONSTRUCTOR call (range-functions.md §2): a call
 /// whose name is a range type name or alias (`i32range`/`int4range`/`numrange`/…). The constructor
 /// functions are the only ones whose name is a range type name, so `range::range_by_name` resolving
@@ -14704,6 +14867,19 @@ fn resolve_func_call(
             ));
         }
         return resolve_timezone(scope, args, agg, params);
+    }
+    // `date_trunc(unit, value[, zone])` (timezones.md §9.1) — polymorphic on the value family (the
+    // result type is the value type) + an optional 3rd zone arg only on a timestamptz, so it resolves
+    // before the generic by-name dispatch (which has no such polymorphism).
+    if lname == "date_trunc" {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_date_trunc(scope, args, agg, params);
     }
     // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -15754,6 +15930,7 @@ fn expr_calls_seq_mutator(e: &Expr) -> bool {
         }
         Expr::Cast { inner, .. }
         | Expr::Collate { inner, .. }
+        | Expr::Extract { source: inner, .. }
         | Expr::Unary { operand: inner, .. } => expr_calls_seq_mutator(inner),
         Expr::IsNull { operand, .. } => expr_calls_seq_mutator(operand),
         Expr::Binary { lhs, rhs, .. }
@@ -16048,7 +16225,8 @@ fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<String>) {
         }
         Expr::Cast { inner, .. }
         | Expr::Unary { operand: inner, .. }
-        | Expr::Collate { inner, .. } => collect_expr_privs(inner, req, locals),
+        | Expr::Collate { inner, .. }
+        | Expr::Extract { source: inner, .. } => collect_expr_privs(inner, req, locals),
         Expr::IsNull { operand, .. } => collect_expr_privs(operand, req, locals),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -16119,7 +16297,8 @@ fn expr_reads_columns(e: &Expr) -> bool {
         }
         Expr::Cast { inner, .. }
         | Expr::Unary { operand: inner, .. }
-        | Expr::Collate { inner, .. } => expr_reads_columns(inner),
+        | Expr::Collate { inner, .. }
+        | Expr::Extract { source: inner, .. } => expr_reads_columns(inner),
         Expr::IsNull { operand, .. } => expr_reads_columns(operand),
         Expr::FuncCall { args, .. } => args.iter().any(expr_reads_columns),
         Expr::Binary { lhs, rhs, .. }
@@ -16671,6 +16850,50 @@ fn resolve(
             resolve_collation_name(scope.catalog, collation)?;
             Ok((rinner, ty))
         }
+        // `EXTRACT(field FROM source)` (timezones.md §9.2, grammar.md §50). The field is SYNTACTIC and
+        // validated at RESOLVE (not per row): an unsupported field for the source type is `0A000`, an
+        // unrecognized field is `22023` — surfaced by probing the kernel with a zero value of the
+        // source's family. The source must be a datetime type (else `42883`); the result is `numeric`.
+        Expr::Extract { field, source } => {
+            use crate::datetime_fn::{ExtractSrc, extract_field};
+            let (src_r, src_t) = resolve(scope, source, None, agg, params)?;
+            // A NULL source has no resolvable family; the value propagates to NULL at eval (the field
+            // is not validated — a documented narrow edge vs. PG, which still errors on a bad field).
+            if !matches!(src_t, ResolvedType::Null) {
+                let probe = match src_t {
+                    ResolvedType::Timestamp => ExtractSrc::Timestamp(0),
+                    ResolvedType::Timestamptz => ExtractSrc::Timestamptz {
+                        instant: 0,
+                        local: 0,
+                        offset_secs: 0,
+                    },
+                    ResolvedType::Date => ExtractSrc::Date(0),
+                    ResolvedType::Interval => ExtractSrc::Interval(crate::interval::Interval {
+                        months: 0,
+                        days: 0,
+                        micros: 0,
+                    }),
+                    _ => {
+                        return Err(EngineError::new(
+                            SqlState::UndefinedFunction,
+                            format!(
+                                "function extract(text, {}) does not exist",
+                                src_t.type_name()
+                            ),
+                        ));
+                    }
+                };
+                // Validate field-for-type (0A000 / 22023); the value is discarded.
+                extract_field(field, probe)?;
+            }
+            Ok((
+                RExpr::Extract {
+                    field: field.clone(),
+                    value: Box::new(src_r),
+                },
+                ResolvedType::Decimal,
+            ))
+        }
         Expr::Cast {
             inner,
             type_name,
@@ -16787,6 +17010,44 @@ fn resolve(
             if let Expr::Literal(Literal::Text(s)) = inner.as_ref() {
                 return coerce_string_literal(s, target, typmod);
             }
+            // Cross-family datetime casts (timezones.md §9.3): a `timestamp`/`timestamptz`/`date`
+            // TARGET from another datetime family. A same-family cast is the identity; a cross-family
+            // cast becomes a `DateConvert` node (the zone-crossing ones read the session zone at eval);
+            // any non-datetime source is the deferred `0A000`. `text`-literal operands and bind params
+            // are handled above / just below. A `NULL` operand adapts to the target.
+            if target.is_timestamp() || target.is_timestamptz() || target.is_date() {
+                if matches!(inner.as_ref(), Expr::Param(_)) {
+                    // `$1::timestamp` declares the parameter as the target type (the cast-target
+                    // parameter-typing case, api.md §5), exactly like the generic path below.
+                    let (rinner, _) = resolve(scope, inner, Some(target), agg, params)?;
+                    return Ok((rinner, resolved_type_of(target)));
+                }
+                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                let to_rt = resolved_type_of(target);
+                return match ity {
+                    ResolvedType::Null => Ok((rinner, to_rt)),
+                    ResolvedType::Timestamp if target.is_timestamp() => Ok((rinner, ity)),
+                    ResolvedType::Timestamptz if target.is_timestamptz() => Ok((rinner, ity)),
+                    ResolvedType::Date if target.is_date() => Ok((rinner, ity)),
+                    ResolvedType::Timestamp | ResolvedType::Timestamptz | ResolvedType::Date => {
+                        Ok((
+                            RExpr::DateConvert {
+                                inner: Box::new(rinner),
+                                to: target,
+                            },
+                            to_rt,
+                        ))
+                    }
+                    _ => Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "cannot cast {} to {}",
+                            ity.type_name(),
+                            target.canonical_name()
+                        ),
+                    )),
+                };
+            }
             // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
             // casting TO text is a 0A000 this slice.
             if target.is_text() {
@@ -16813,14 +17074,10 @@ fn resolve(
                     "casting to uuid is not supported yet",
                 ));
             }
-            // timestamp casts are deferred (spec/design/timestamp.md §6): casting TO a datetime
-            // is 0A000 (a string lands in a timestamp column by literal adaptation, not a CAST).
-            if target.is_timestamp() || target.is_timestamptz() {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "casting to a timestamp type is not supported yet",
-                ));
-            }
+            // The timestamp/timestamptz/date cross-family cast matrix is handled above (the
+            // `DateConvert` block — timezones.md §9.3). `text`↔datetime casts (a string lands in a
+            // datetime column by literal adaptation, not a CAST) stay deferred and fall through to the
+            // generic logic below (which rejects a non-datetime source to a datetime target 0A000).
             // interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000
             // (a string lands in an interval column by literal adaptation / the INTERVAL '...'
             // keyword literal, not a CAST).
@@ -16828,15 +17085,6 @@ fn resolve(
                 return Err(EngineError::new(
                     SqlState::FeatureNotSupported,
                     "casting to an interval type is not supported yet",
-                ));
-            }
-            // date casts are deferred (spec/design/date.md §5/§6): casting TO date is 0A000 (a
-            // string lands in a date column by literal adaptation / the DATE '...' keyword literal,
-            // not a CAST).
-            if target.is_date() {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "casting to a date type is not supported yet",
                 ));
             }
             // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int`
@@ -20732,6 +20980,92 @@ fn rexpr_const_to_value(node: &RExpr) -> Result<Value> {
     })
 }
 
+/// Evaluate a cross-family datetime cast (timezones.md §9.3) of the non-NULL value `v` to `to`
+/// (`Timestamp`/`Timestamptz`/`Date`). The casts crossing the `timestamptz` boundary consult the
+/// session zone (charging `timezone`); the others are zone-free. `±infinity` maps to the target's
+/// own sentinel. The `(source family, to)` pair is guaranteed cross-family by the resolver.
+fn eval_date_convert(v: Value, to: ScalarType, env: &EvalEnv, m: &mut Meter) -> Result<Value> {
+    use crate::timestamp::{NEG_INFINITY as TS_NEG, POS_INFINITY as TS_POS};
+    const MICROS_PER_DAY: i64 = 86_400 * 1_000_000;
+    // Map a finite/infinite timestamp-micros to a date (days), preserving the ±inf sentinels.
+    let micros_to_date = |mc: i64| -> Value {
+        if mc == TS_POS {
+            Value::Date(crate::date::POS_INFINITY)
+        } else if mc == TS_NEG {
+            Value::Date(crate::date::NEG_INFINITY)
+        } else {
+            Value::Date(mc.div_euclid(MICROS_PER_DAY) as i32)
+        }
+    };
+    // Midnight-of-a-date as timestamp-micros, preserving the ±inf sentinels.
+    let date_to_micros = |d: i32| -> i64 {
+        if d == crate::date::POS_INFINITY {
+            TS_POS
+        } else if d == crate::date::NEG_INFINITY {
+            TS_NEG
+        } else {
+            d as i64 * MICROS_PER_DAY
+        }
+    };
+    let is_inf = |mc: i64| mc == TS_POS || mc == TS_NEG;
+    match (v, to) {
+        // timestamp -> date (zone-free): the date part.
+        (Value::Timestamp(mc), ScalarType::Date) => Ok(micros_to_date(mc)),
+        // date -> timestamp (zone-free): midnight.
+        (Value::Date(d), ScalarType::Timestamp) => Ok(Value::Timestamp(date_to_micros(d))),
+        // timestamptz -> timestamp: render the instant in the session zone.
+        (Value::Timestamptz(mc), ScalarType::Timestamp) => {
+            if is_inf(mc) {
+                return Ok(Value::Timestamp(mc));
+            }
+            let zr = env.exec.session.time_zone.clone();
+            m.charge(COSTS.timezone);
+            m.guard()?;
+            Ok(Value::Timestamp(crate::timezone::instant_to_local_micros(
+                &zr, mc,
+            )))
+        }
+        // timestamp -> timestamptz: interpret the wall clock in the session zone.
+        (Value::Timestamp(mc), ScalarType::Timestamptz) => {
+            if is_inf(mc) {
+                return Ok(Value::Timestamptz(mc));
+            }
+            let zr = env.exec.session.time_zone.clone();
+            m.charge(COSTS.timezone);
+            m.guard()?;
+            Ok(Value::Timestamptz(
+                crate::timezone::local_to_instant_micros(&zr, mc),
+            ))
+        }
+        // timestamptz -> date: the date of the session-zone wall clock.
+        (Value::Timestamptz(mc), ScalarType::Date) => {
+            if is_inf(mc) {
+                return Ok(micros_to_date(mc));
+            }
+            let zr = env.exec.session.time_zone.clone();
+            m.charge(COSTS.timezone);
+            m.guard()?;
+            Ok(micros_to_date(crate::timezone::instant_to_local_micros(
+                &zr, mc,
+            )))
+        }
+        // date -> timestamptz: midnight in the session zone -> the instant.
+        (Value::Date(d), ScalarType::Timestamptz) => {
+            let mid = date_to_micros(d);
+            if is_inf(mid) {
+                return Ok(Value::Timestamptz(mid));
+            }
+            let zr = env.exec.session.time_zone.clone();
+            m.charge(COSTS.timezone);
+            m.guard()?;
+            Ok(Value::Timestamptz(
+                crate::timezone::local_to_instant_micros(&zr, mid),
+            ))
+        }
+        _ => unreachable!("resolver restricts DateConvert to cross-family datetime casts"),
+    }
+}
+
 impl RExpr {
     /// Evaluate against a row, accruing cost into `m`. Returns a `Value` (which may be a
     /// boolean for comparisons/connectives). Arithmetic traps 22003 on overflow and 22012
@@ -21395,6 +21729,113 @@ impl RExpr {
                 } else {
                     Value::Timestamp(crate::timezone::instant_to_local_micros(&zr, micros))
                 })
+            }
+            RExpr::DateTrunc { unit, value, zone } => {
+                m.charge(COSTS.operator_eval);
+                let uv = unit.eval(row, env, m)?;
+                let vv = value.eval(row, env, m)?;
+                let zv = match zone {
+                    Some(z) => Some(z.eval(row, env, m)?),
+                    None => None,
+                };
+                if matches!(uv, Value::Null)
+                    || matches!(vv, Value::Null)
+                    || matches!(zv, Some(Value::Null))
+                {
+                    return Ok(Value::Null);
+                }
+                let unit_s = match &uv {
+                    Value::Text(s) => s.as_str(),
+                    _ => unreachable!("resolver requires a text unit"),
+                };
+                match vv {
+                    Value::Timestamp(mc) => Ok(Value::Timestamp(
+                        crate::datetime_fn::date_trunc_micros(unit_s, mc)?,
+                    )),
+                    Value::Interval(iv) => Ok(Value::Interval(
+                        crate::datetime_fn::date_trunc_interval(unit_s, iv)?,
+                    )),
+                    Value::Timestamptz(mc) => {
+                        // ±infinity passes through (PG), no zone consulted.
+                        if mc == crate::timestamp::POS_INFINITY
+                            || mc == crate::timestamp::NEG_INFINITY
+                        {
+                            // Still validate the unit (an unrecognized unit is 22023 even at ±inf).
+                            crate::datetime_fn::date_trunc_micros(unit_s, mc)?;
+                            return Ok(Value::Timestamptz(mc));
+                        }
+                        // Truncate in the explicit zone (3-arg) or the session zone (2-arg).
+                        let zr = match &zv {
+                            Some(Value::Text(s)) => {
+                                crate::timezone::resolve_zone(s).ok_or_else(|| {
+                                    EngineError::new(
+                                        SqlState::InvalidParameterValue,
+                                        format!("time zone \"{s}\" not recognized"),
+                                    )
+                                })?
+                            }
+                            Some(_) => unreachable!("resolver requires a text zone"),
+                            None => env.exec.session.time_zone.clone(),
+                        };
+                        m.charge(COSTS.timezone);
+                        m.guard()?;
+                        let local = crate::timezone::instant_to_local_micros(&zr, mc);
+                        let trunc = crate::datetime_fn::date_trunc_micros(unit_s, local)?;
+                        Ok(Value::Timestamptz(
+                            crate::timezone::local_to_instant_micros(&zr, trunc),
+                        ))
+                    }
+                    _ => unreachable!("resolver restricts date_trunc to ts/tstz/interval"),
+                }
+            }
+            RExpr::Extract { field, value } => {
+                m.charge(COSTS.operator_eval);
+                let vv = value.eval(row, env, m)?;
+                use crate::datetime_fn::ExtractSrc;
+                let src = match vv {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Timestamp(mc) => ExtractSrc::Timestamp(mc),
+                    Value::Date(d) => ExtractSrc::Date(d),
+                    Value::Interval(iv) => ExtractSrc::Interval(iv),
+                    Value::Timestamptz(mc) => {
+                        // `epoch` is zone-independent (the instant); every other field decomposes in
+                        // the session zone — so only the zone-consulting fields charge `timezone`.
+                        if field == "epoch"
+                            || mc == crate::timestamp::POS_INFINITY
+                            || mc == crate::timestamp::NEG_INFINITY
+                        {
+                            ExtractSrc::Timestamptz {
+                                instant: mc,
+                                local: mc,
+                                offset_secs: 0,
+                            }
+                        } else {
+                            let zr = env.exec.session.time_zone.clone();
+                            m.charge(COSTS.timezone);
+                            m.guard()?;
+                            let local = crate::timezone::instant_to_local_micros(&zr, mc);
+                            let off =
+                                crate::timezone::offset_at_ref(&zr, mc.div_euclid(1_000_000)).utoff;
+                            ExtractSrc::Timestamptz {
+                                instant: mc,
+                                local,
+                                offset_secs: off as i64,
+                            }
+                        }
+                    }
+                    _ => unreachable!("resolver restricts EXTRACT to ts/tstz/date/interval"),
+                };
+                Ok(Value::Decimal(crate::datetime_fn::extract_field(
+                    field, src,
+                )?))
+            }
+            RExpr::DateConvert { inner, to } => {
+                m.charge(COSTS.operator_eval);
+                let v = inner.eval(row, env, m)?;
+                if matches!(v, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                eval_date_convert(v, *to, env, m)
             }
             RExpr::Case {
                 arms,

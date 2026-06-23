@@ -757,6 +757,14 @@ pub enum Expr {
         /// An optional `numeric(p[,s])` type modifier on the CAST target.
         type_mod: Option<TypeMod>,
     },
+    /// `EXTRACT(field FROM source)` (spec/design/timezones.md §9.2, grammar.md §50) — the datetime
+    /// field special form. `field` is the syntactic field name (an identifier or a string literal,
+    /// lowercased here); `source` is the datetime expression. Distinct from a function call because
+    /// of the `field FROM source` syntax; resolves to a `numeric` value.
+    Extract {
+        field: String,
+        source: Box<Expr>,
+    },
     /// `expr COLLATE "name"` — the postfix collation operator (spec/design/collation.md §1). Sets
     /// an EXPLICIT collation on a text expression for the surrounding comparison / `ORDER BY`. Binds
     /// at the postfix/typecast level (tighter than `||` and the comparisons — PG precedence). The
