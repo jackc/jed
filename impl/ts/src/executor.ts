@@ -165,6 +165,7 @@ import {
   typeIsDecimal,
   typeIsFloat,
   typeIsInteger,
+  typeIsJson,
   typeIsText,
   typeIsTimestamp,
   typeIsTimestamptz,
@@ -6892,6 +6893,14 @@ export class Database {
             "GROUP BY may not reference an outer query column",
           );
         }
+        // `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md §5),
+        // so GROUP BY a json column is 42883. jsonb IS groupable.
+        if (typeIsJson(scope.columnAt(r.index).type)) {
+          throw engineError(
+            "undefined_function",
+            "could not identify an equality operator for type json",
+          );
+        }
         if (!groupKeys.includes(r.index)) groupKeys.push(r.index);
         return r.index;
       }),
@@ -6959,6 +6968,15 @@ export class Database {
     const windowSpecs: WindowSpec[] = projAgg.window?.windowSpecs ?? [];
     const windowKeys: RExpr[] = projAgg.window?.windowKeys ?? [];
     const hasWindow = windowSpecs.length > 0;
+    // SELECT DISTINCT dedups the projected rows by equality, but `json` has no equality operator
+    // (PG ships no opclass — spec/design/json.md §5), so a json output column under DISTINCT is
+    // 42883. jsonb IS distinguishable (its btree equality, §5).
+    if (sel.distinct && columnTypes.some((t) => t.kind === "json")) {
+      throw engineError(
+        "undefined_function",
+        "could not identify an equality operator for type json",
+      );
+    }
     // HAVING resolves in collect mode with window functions FORBIDDEN (42P20 — HAVING runs BEFORE the
     // window stage, window.md §7), continuing the aggregate specs so its aggregates slot after the
     // projection's. It must be boolean (42804). A HAVING aggregate, like a projection one, is part of
@@ -7054,6 +7072,14 @@ export class Database {
         throw engineError(
           "feature_not_supported",
           "ORDER BY may not reference an outer query column",
+        );
+      }
+      // `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
+      // ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
+      if (typeIsJson(scope.columnAt(r.index).type)) {
+        throw engineError(
+          "undefined_function",
+          "could not identify an ordering operator for type json",
         );
       }
       const idx = r.index;
@@ -16758,6 +16784,24 @@ function resolveOperandPair(
 // a boolean with a non-boolean, is a 42804 type error — comparison is overloaded across these
 // families but never compares across them.
 function classifyComparable(lt: ResolvedType, rt: ResolvedType): void {
+  // json is NOT comparable: PostgreSQL ships no btree/hash operator class for `json`, so jed matches
+  // it (spec/design/json.md §5). ANY json comparison — even json × json, json × jsonb, or json × a
+  // bare NULL — is 42883 (operator does not exist), distinct from the cross-family 42804 other types
+  // use. Must precede the jsonb arms so json × jsonb is 42883.
+  if (lt.kind === "json" || rt.kind === "json") {
+    throw engineError("undefined_function", "operator does not exist: json is not comparable");
+  }
+  // jsonb IS comparable — PostgreSQL's total btree order (spec/design/json.md §5) — but only with
+  // another jsonb (or a bare NULL). jsonb vs any other family is 42804 (jed's cross-family
+  // convention, like uuid/bytea/range; a documented divergence from PG's 42883).
+  const jsonbL = lt.kind === "jsonb";
+  const jsonbR = rt.kind === "jsonb";
+  if (jsonbL || jsonbR) {
+    if ((jsonbL && jsonbR) || (jsonbL && rt.kind === "null") || (lt.kind === "null" && jsonbR)) {
+      return;
+    }
+    throw typeError("cannot compare a jsonb value with a value of a different type");
+  }
   // Range comparison is the PG range_cmp total order (spec/design/ranges.md §6). Two ranges are
   // comparable iff they are over the SAME element type — i32range × i32range only, never
   // i32range × i64range or i32range × i32 (no implicit cross-element range comparison this slice;

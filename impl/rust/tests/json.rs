@@ -65,6 +65,22 @@ fn jsonb_index_and_unique_are_unsupported() {
     );
 }
 
+/// A `jsonb` comparison with a NON-jsonb family is `42804` (jed's cross-family convention, like
+/// uuid/bytea/range) — a documented divergence from PostgreSQL, which reports `42883` (operator
+/// does not exist: jsonb = integer). The agreeing json-non-comparable behavior (always 42883) and
+/// jsonb × jsonb ordering live in suites/json/json_compare.test.
+#[test]
+fn jsonb_cross_family_comparison_is_42804() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)");
+    // jsonb vs an integer / a real text value (not an adaptable string literal): 42804.
+    assert_eq!(err(&mut db, "SELECT id FROM t WHERE b = 5"), "42804");
+    assert_eq!(
+        err(&mut db, "SELECT id FROM t WHERE b = 'x'::text"),
+        "42804"
+    );
+}
+
 /// A large `jsonb` document (a long string node well past `RECORD_MAX`) spills onto an overflow
 /// chain and round-trips through a whole-image serialize + reload — exercising `is_spillable`,
 /// `value_payload`, and `value_from_payload` for the jsonb body (the tree decoded from a fresh

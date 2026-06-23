@@ -319,8 +319,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `json_table.jed` byte-identical `rust == go == ts == ruby`. A jsonb/json `PRIMARY KEY`/index/`UNIQUE`
         is `0A000` (the order-preserving jsonb key authored but unexercised — encoding.md §2.13; per-core
         divergence tests). All three cores, capabilities `types.jsonb` / `types.json`, oracle-clean. → json.md §2/§4/§11
-  - [ ] **J2** — `jsonb` comparison/ordering (PG btree order; `ORDER BY`/`DISTINCT`/`GROUP BY`);
-        `json` non-comparable (`42883`). → json.md §5
+  - [x] **J2** — ✅ `jsonb` comparison/ordering — PG's total btree order (type rank Object>Array>
+        Boolean>Number>String>Null, then per-kind; containers compare COUNT-first) driving
+        `=`/`<>`/`<`/`<=`/`>`/`>=`/`ORDER BY`/`DISTINCT`/`GROUP BY`; a bare string literal adapts to a
+        jsonb sibling; jsonb compares only with jsonb (else `42804`). `json` is NOT comparable — every
+        json `=`/`<`/`ORDER BY`/`DISTINCT`/`GROUP BY` and a jsonb×json comparison is `42883` (matches
+        PG's code). Resolver-only (the recursive comparator was front-loaded in J0/J1); also fixed a
+        latent `resolved_type_of` gap (a jsonb column had resolved to `Int`). All three cores,
+        capability `types.jsonb_compare`, oracle-clean. → json.md §5
   - [ ] **J3** — casts (`json↔jsonb`, `json`/`jsonb`→`text`, runtime `text`→`json`/`jsonb`). → json.md §6
   - [ ] **J4 / J5 / J6** — operators: accessors `-> ->> #> #>>` / containment `@> <@ ? ?| ?&` /
         mutation `|| - #-`. → json-sql-functions.md §1

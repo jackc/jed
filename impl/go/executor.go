@@ -9357,6 +9357,11 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			if r.level != 0 {
 				return nil, NewError(FeatureNotSupported, "GROUP BY may not reference an outer query column")
 			}
+			// `json` has no equality operator (PG ships no hash/btree opclass — spec/design/json.md §5),
+			// so GROUP BY a json column is 42883. jsonb IS groupable.
+			if s.columnOf(r).Type.IsJson() {
+				return nil, NewError(UndefinedFunction, "could not identify an equality operator for type json")
+			}
 			found := false
 			for _, gk := range groupKeys {
 				if gk == r.index {
@@ -9431,6 +9436,16 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	windowKeys := projAgg.windowKeys
 	groupingSpecs := projAgg.groupingSpecs
 	hasWindow := len(windowSpecs) > 0
+	// SELECT DISTINCT dedups the projected rows by equality, but `json` has no equality operator
+	// (PG ships no opclass — spec/design/json.md §5), so a json output column under DISTINCT is
+	// 42883. jsonb IS distinguishable (its btree equality, §5).
+	if sel.Distinct {
+		for _, t := range columnTypes {
+			if t.kind == rtJson {
+				return nil, NewError(UndefinedFunction, "could not identify an equality operator for type json")
+			}
+		}
+	}
 	// HAVING resolves in collect mode with window functions FORBIDDEN (42P20 — HAVING runs BEFORE the
 	// window stage, window.md §7), continuing the aggregate specs (and GROUPING() calls) so they slot
 	// after the projection's. It must be boolean (42804). A HAVING aggregate, like a projection one, is
@@ -9580,6 +9595,11 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		}
 		if r.level != 0 {
 			return nil, NewError(FeatureNotSupported, "ORDER BY may not reference an outer query column")
+		}
+		// `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
+		// ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
+		if s.columnOf(r).Type.IsJson() {
+			return nil, NewError(UndefinedFunction, "could not identify an ordering operator for type json")
 		}
 		idx := r.index
 		// The sort key's collation (spec/design/collation.md §1/§7). An explicit COLLATE must be on a
@@ -18392,6 +18412,23 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 					return nil, resolvedType{}, err
 				}
 				return &rExpr{kind: reConstInterval, cIv: iv}, resolvedType{kind: rtInterval}, nil
+			case ctx != nil && ctx.IsJson():
+				// A string literal adapts to a json context (the sibling of a json column / a json
+				// cast), so `jsoncol = '{"a":1}'` compares json × json; malformed → 22P02
+				// (spec/design/json.md §4). json validates + stores verbatim.
+				if err := validateJSON(e.Literal.Str); err != nil {
+					return nil, resolvedType{}, err
+				}
+				return &rExpr{kind: reConstJson, cText: e.Literal.Str}, resolvedType{kind: rtJson}, nil
+			case ctx != nil && ctx.IsJsonb():
+				// A string literal adapts to a jsonb context (the sibling of a jsonb column / a jsonb
+				// cast), so `jsonbcol = '{"a":1}'` compares jsonb × jsonb; malformed → 22P02
+				// (spec/design/json.md §2). jsonb canonicalizes.
+				node, err := jsonbIn(e.Literal.Str)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return &rExpr{kind: reConstJsonb, cJsonb: &node}, resolvedType{kind: rtJsonb}, nil
 			}
 			return &rExpr{kind: reConstText, cText: e.Literal.Str}, resolvedType{kind: rtText}, nil
 		case LiteralDecimal:
@@ -19387,6 +19424,23 @@ func temporalArithResult(op BinaryOp, lt, rt rtKind) (st ScalarType, isTemporal 
 // a boolean with a non-boolean, is a 42804 type error — comparison is overloaded across these
 // families but never compares across them.
 func classifyComparable(lt, rt resolvedType) error {
+	// json is NOT comparable: PostgreSQL ships no btree/hash operator class for `json`, so jed
+	// matches it (spec/design/json.md §5). ANY json comparison — even json × json, json × jsonb,
+	// or json × a bare NULL — is 42883 (operator does not exist), distinct from the cross-family
+	// 42804 other types use. Must precede the jsonb arms so json × jsonb is 42883.
+	if lt.kind == rtJson || rt.kind == rtJson {
+		return NewError(UndefinedFunction, "operator does not exist: json is not comparable")
+	}
+	// jsonb IS comparable — PostgreSQL's total btree order (spec/design/json.md §5) — but only with
+	// another jsonb (or a bare NULL). jsonb vs any other family is 42804 (jed's cross-family
+	// convention, like uuid/bytea/range; a documented divergence from PG's 42883).
+	jsonbL, jsonbR := lt.kind == rtJsonb, rt.kind == rtJsonb
+	if jsonbL || jsonbR {
+		if (jsonbL && jsonbR) || (jsonbL && rt.kind == rtNull) || (lt.kind == rtNull && jsonbR) {
+			return nil
+		}
+		return typeError("cannot compare a jsonb value with a value of a different type")
+	}
 	// Composite comparison is element-wise row comparison (spec/design/composite.md §5): two
 	// composites are comparable iff they have the SAME field count and each corresponding field
 	// pair is itself comparable (recursively — a nested composite recurses here, an anonymous

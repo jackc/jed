@@ -8117,6 +8117,14 @@ impl Database {
                         ));
                     }
                 };
+                // `json` has no equality operator (PG ships no hash/btree opclass —
+                // spec/design/json.md §5), so GROUP BY a json column is 42883. jsonb IS groupable.
+                if scope.column_of(r).ty.is_json() {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedFunction,
+                        "could not identify an equality operator for type json",
+                    ));
+                }
                 if !group_keys.contains(&idx) {
                     group_keys.push(idx);
                 }
@@ -8223,6 +8231,15 @@ impl Database {
             AggCtx::Forbidden => (Vec::new(), Vec::new(), Vec::new()),
         };
         let has_window = !window_specs.is_empty();
+        // SELECT DISTINCT dedups the projected rows by equality, but `json` has no equality
+        // operator (PG ships no opclass — spec/design/json.md §5), so a json output column under
+        // DISTINCT is 42883. jsonb IS distinguishable (its btree equality, §5).
+        if sel.distinct && column_types.iter().any(|t| matches!(t, ResolvedType::Json)) {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                "could not identify an equality operator for type json",
+            ));
+        }
         // HAVING resolves in `Collect` mode — it may reference aggregates (collected into the SAME
         // `agg_specs`, so their slots follow the projection's) and grouping keys, a non-grouped column
         // is 42803, and a window function is 42P20 (HAVING runs BEFORE the window stage — window.md
@@ -8392,6 +8409,14 @@ impl Database {
                     ));
                 }
             };
+            // `json` has no ordering operator (PG ships no btree opclass — spec/design/json.md §5):
+            // ORDER BY a json column is 42883. jsonb IS orderable (its btree total order, §5).
+            if scope.column_of(r).ty.is_json() {
+                return Err(EngineError::new(
+                    SqlState::UndefinedFunction,
+                    "could not identify an ordering operator for type json",
+                ));
+            }
             // The sort key's collation (spec/design/collation.md §1/§7). An explicit `COLLATE` must
             // be on a text column (42804) and name a loaded collation ("C" → byte order, else 42704);
             // absent a clause, the key inherits the column's frozen (implicit) collation — so
@@ -18190,6 +18215,10 @@ fn resolved_type_of(ty: ScalarType) -> ResolvedType {
         ResolvedType::Interval
     } else if ty.is_date() {
         ResolvedType::Date
+    } else if ty.is_json() {
+        ResolvedType::Json
+    } else if ty.is_jsonb() {
+        ResolvedType::Jsonb
     } else if ty.is_float() {
         ResolvedType::Float(ty)
     } else {
@@ -18583,6 +18612,17 @@ fn resolve(
                 Some(t) if t.is_interval() => Ok((
                     RExpr::ConstInterval(parse_interval(s)?),
                     ResolvedType::Interval,
+                )),
+                // A string literal adapts to a json/jsonb context (the sibling of a jsonb column /
+                // a jsonb cast), so `jsonbcol = '{"a":1}'` compares jsonb × jsonb; malformed → 22P02
+                // (spec/design/json.md §2/§4). json validates + stores verbatim; jsonb canonicalizes.
+                Some(t) if t.is_json() => {
+                    json::validate_json(s)?;
+                    Ok((RExpr::ConstJson(s.clone()), ResolvedType::Json))
+                }
+                Some(t) if t.is_jsonb() => Ok((
+                    RExpr::ConstJsonb(Box::new(json::jsonb_in(s)?)),
+                    ResolvedType::Jsonb,
                 )),
                 _ => Ok((RExpr::ConstText(s.clone()), ResolvedType::Text)),
             }
@@ -20337,10 +20377,25 @@ fn require_numeric_operand(ty: &ResolvedType) -> Result<()> {
 /// across these families but never compares across them.
 fn classify_comparable(lt: &ResolvedType, rt: &ResolvedType) -> Result<()> {
     use ResolvedType::{
-        Array, Bool, Bytea, Composite, Date, Decimal, Float, Int, Interval, Null, Range, Text,
-        Timestamp, Timestamptz, Uuid,
+        Array, Bool, Bytea, Composite, Date, Decimal, Float, Int, Interval, Json, Jsonb, Null,
+        Range, Text, Timestamp, Timestamptz, Uuid,
     };
     match (lt, rt) {
+        // json is NOT comparable: PostgreSQL ships no btree/hash operator class for `json`, so jed
+        // matches it (spec/design/json.md §5). ANY json comparison — even json × json, json × jsonb,
+        // or json × a bare NULL — is `42883` (operator does not exist), distinct from the
+        // cross-family `42804` other types use. Must precede the jsonb arms so json × jsonb is 42883.
+        (Json, _) | (_, Json) => Err(EngineError::new(
+            SqlState::UndefinedFunction,
+            "operator does not exist: json is not comparable",
+        )),
+        // jsonb IS comparable — PostgreSQL's total btree order (spec/design/json.md §5) — but only
+        // with another jsonb (or a bare NULL). jsonb vs any other family is `42804` (jed's
+        // cross-family convention, like uuid/bytea/range; a documented divergence from PG's 42883).
+        (Jsonb, Jsonb) | (Jsonb, Null) | (Null, Jsonb) => Ok(()),
+        (Jsonb, _) | (_, Jsonb) => Err(type_error(
+            "cannot compare a jsonb value with a value of a different type",
+        )),
         // Range comparison is the PG `range_cmp` total order (spec/design/ranges.md §6). Two ranges
         // are comparable iff they are over the **same element type** — `i32range × i32range` only,
         // never `i32range × i64range` or `i32range × i32` (no implicit cross-element range

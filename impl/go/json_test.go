@@ -62,6 +62,22 @@ func TestJsonbIndexAndUniqueAreUnsupported(t *testing.T) {
 	}
 }
 
+// TestJsonbCrossFamilyComparisonIs42804: a jsonb comparison with a NON-jsonb family is 42804 (jed's
+// cross-family convention, like uuid/bytea/range) — a documented divergence from PostgreSQL, which
+// reports 42883 (operator does not exist: jsonb = integer). The agreeing json-non-comparable
+// behavior (always 42883) and jsonb × jsonb ordering live in suites/json/json_compare.test.
+func TestJsonbCrossFamilyComparisonIs42804(t *testing.T) {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)")
+	// jsonb vs an integer / a real text value (not an adaptable string literal): 42804.
+	if got := errJSON(t, db, "SELECT id FROM t WHERE b = 5"); got != "42804" {
+		t.Errorf("jsonb = int: got %s, want 42804", got)
+	}
+	if got := errJSON(t, db, "SELECT id FROM t WHERE b = 'x'::text"); got != "42804" {
+		t.Errorf("jsonb = text: got %s, want 42804", got)
+	}
+}
+
 // TestLargeJsonbSpillsAndRoundTrips: a large jsonb document (a long string node well past
 // RECORD_MAX) spills onto an overflow chain and round-trips through a whole-image serialize + reload
 // — exercising the jsonb body's spill/value_payload/value_from_payload (the tree decoded from a

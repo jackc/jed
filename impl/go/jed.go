@@ -501,6 +501,9 @@ var SupportedCapabilities = []string{
 	"types.jsonb",
 	// Storable json column (J1b) — verbatim text value body (type_code 18), golden json_table.jed.
 	"types.json",
+	// jsonb comparison/ordering (J2) — PG total btree order driving =/<>/</<=/>/>=/ORDER BY/
+	// DISTINCT/GROUP BY; json non-comparable → 42883 (spec/design/json.md §5).
+	"types.jsonb_compare",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

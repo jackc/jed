@@ -1,0 +1,123 @@
+# jsonb comparison & ordering; json non-comparable (J2, spec/design/json.md §5). `jsonb` has
+# PostgreSQL's TOTAL btree order — a definite boolean (no SQL NULLs inside a document): the outermost
+# key is the type rank Object > Array > Boolean > Number > String > Null; within a type, booleans
+# false<true, numbers by exact value, strings by collation-C byte order, and arrays/objects compare
+# element/member COUNT first then element-wise. One comparator drives both `<` and `ORDER BY`, so
+# they agree. `=` `<>` `<` `<=` `>` `>=` / ORDER BY / DISTINCT / GROUP BY all work on jsonb. `json` is
+# NOT comparable (PG ships no opclass): every json comparison / ORDER BY / DISTINCT / GROUP BY is
+# 42883, and a jsonb × json comparison is 42883 too. Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.where_eq, query.comparison_order, query.order_by, query.distinct, query.aggregates, query.group_by, types.jsonb, types.json, types.jsonb_compare
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)
+
+statement ok
+INSERT INTO t VALUES
+  (1, '[3,2,1]'), (2, '"a"'), (3, '42'), (4, '{"x":1}'), (5, 'null'),
+  (6, 'true'), (7, '[1,2]'), (8, '{"a":1,"b":2}'), (9, '"a"')
+
+# The full jsonb btree order (type rank first, then count-first for containers): null < "a" < 42 <
+# true < [1,2] < [3,2,1] < {"x":1} < {"a":1,"b":2}. Ties broken by id.
+query I nosort
+SELECT id FROM t ORDER BY b, id
+----
+5
+2
+9
+3
+6
+7
+1
+4
+8
+
+# A bare string literal adapts to jsonb so the WHERE compares jsonb × jsonb (canonicalized).
+query I nosort
+SELECT id FROM t WHERE b = '"a"' ORDER BY id
+----
+2
+9
+
+# Ordering predicates: count-first for arrays/objects, exact numbers, byte-order strings, false<true.
+query B nosort
+SELECT '[1,2]'::jsonb < '[1,2,3]'::jsonb
+----
+true
+
+query B nosort
+SELECT '{"a":1}'::jsonb < '{"a":1,"b":2}'::jsonb
+----
+true
+
+query BBB nosort
+SELECT '1'::jsonb < '2'::jsonb, 'false'::jsonb < 'true'::jsonb, '"a"'::jsonb < '"b"'::jsonb
+----
+true
+true
+true
+
+# Type-rank cross-kind: a Number outranks a String, an Object outranks everything.
+query BBB nosort
+SELECT '1'::jsonb > '"zzz"'::jsonb, '{}'::jsonb > '[1,2,3]'::jsonb, 'null'::jsonb < 'false'::jsonb
+----
+true
+true
+true
+
+# DISTINCT over jsonb (canonical equality: the two '"a"' rows collapse to one; 8 distinct values,
+# returned in btree order).
+query T nosort
+SELECT DISTINCT b FROM t ORDER BY b
+----
+null
+"a"
+42
+true
+[1, 2]
+[3, 2, 1]
+{"x": 1}
+{"a": 1, "b": 2}
+
+query TI rowsort
+SELECT b, count(*) FROM t GROUP BY b
+----
+"a"
+2
+42
+1
+[1, 2]
+1
+[3, 2, 1]
+1
+null
+1
+true
+1
+{"a": 1, "b": 2}
+1
+{"x": 1}
+1
+
+# --- json is NOT comparable: every comparison / ordering / dedup is 42883 -----------------------
+statement ok
+CREATE TABLE j (id i32 PRIMARY KEY, doc json)
+
+statement ok
+INSERT INTO j VALUES (1, '{}'), (2, '[]')
+
+statement error 42883
+SELECT id FROM j WHERE doc = '{}'
+
+statement error 42883
+SELECT id FROM j ORDER BY doc
+
+statement error 42883
+SELECT DISTINCT doc FROM j
+
+statement error 42883
+SELECT doc FROM j GROUP BY doc
+
+# A jsonb × json comparison is also 42883 (json has no operator at all).
+statement error 42883
+SELECT '{}'::jsonb = '{}'::json
