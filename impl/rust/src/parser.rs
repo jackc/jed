@@ -2756,6 +2756,12 @@ impl Parser {
                 Token::NotExtendRight => BinaryOp::NotExtendRight,
                 Token::NotExtendLeft => BinaryOp::NotExtendLeft,
                 Token::Adjacent => BinaryOp::Adjacent,
+                // The jsonb accessor operators (json-sql-functions.md §1) — "any other operator"
+                // precedence, same level as `@>`/`||`, left-associative (`doc -> 'a' -> 'b'`).
+                Token::Arrow => BinaryOp::JsonGet,
+                Token::ArrowText => BinaryOp::JsonGetText,
+                Token::HashArrow => BinaryOp::JsonGetPath,
+                Token::HashArrowText => BinaryOp::JsonGetPathText,
                 _ => break,
             };
             self.deepen()?; // each chained operator is one more AST level
@@ -3703,6 +3709,10 @@ fn render_token(t: &Token) -> String {
         Token::NotExtendRight => "&<".into(),
         Token::NotExtendLeft => "&>".into(),
         Token::Adjacent => "-|-".into(),
+        Token::Arrow => "->".into(),
+        Token::ArrowText => "->>".into(),
+        Token::HashArrow => "#>".into(),
+        Token::HashArrowText => "#>>".into(),
         Token::Tilde => "~".into(),
         Token::TildeStar => "~*".into(),
         Token::BangTilde => "!~".into(),

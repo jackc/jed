@@ -84,6 +84,15 @@ func Lex(sql string) ([]Token, error) {
 			if i+2 < len(b) && b[i+1] == '|' && b[i+2] == '-' {
 				tokens = append(tokens, Token{Kind: TokAdjacent})
 				i += 3
+			} else if i+2 < len(b) && b[i+1] == '>' && b[i+2] == '>' {
+				// `->>` is the jsonb accessor-as-text operator (json-sql-functions.md §1),
+				// scanned greedily BEFORE `->` so it is never `-> >`.
+				tokens = append(tokens, Token{Kind: TokArrowText})
+				i += 3
+			} else if i+1 < len(b) && b[i+1] == '>' {
+				// `->` is the jsonb accessor operator (json-sql-functions.md §1).
+				tokens = append(tokens, Token{Kind: TokArrow})
+				i += 2
 			} else if i+1 < len(b) && b[i+1] == '-' {
 				// `--` starts a line comment running to the end of the line; comments are
 				// whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
@@ -210,6 +219,19 @@ func Lex(sql string) ([]Token, error) {
 				i += 2
 			} else {
 				return nil, NewError(SyntaxError, "unexpected character '@'")
+			}
+		case c == '#':
+			// `#>>` / `#>` are the jsonb get-at-path operators (json-sql-functions.md §1), scanned
+			// greedily (`#>>` before `#>`). `#-` (delete-at-path) is a J6 follow-on. A lone `#` is not
+			// part of jed's surface — 42601.
+			if i+2 < len(b) && b[i+1] == '>' && b[i+2] == '>' {
+				tokens = append(tokens, Token{Kind: TokHashArrowText})
+				i += 3
+			} else if i+1 < len(b) && b[i+1] == '>' {
+				tokens = append(tokens, Token{Kind: TokHashArrow})
+				i += 2
+			} else {
+				return nil, NewError(SyntaxError, "unexpected character '#'")
 			}
 		case c == '&':
 			// `&&` is the array overlap operator (grammar.md §40); `&<` (not-extend-right) and `&>`

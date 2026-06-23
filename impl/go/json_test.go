@@ -96,6 +96,26 @@ func TestInvalidJSONCastSourceIs42804(t *testing.T) {
 	}
 }
 
+// TestJSONAccessorOperatorsAreDeferred: the `json` overloads of the accessor operators
+// (`-> ->> #> #>>`) are a deferred 0A000 follow-on — they would have to preserve the verbatim
+// sub-text (json.md §4), unlike the jsonb operators that work over the canonical node tree.
+// PostgreSQL supports them, so this is a documented divergence (the jsonb operators are oracle-clean
+// in suites/json/json_access.test). Mirrors impl/rust/tests/json.rs.
+func TestJSONAccessorOperatorsAreDeferred(t *testing.T) {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)")
+	run(t, db, `INSERT INTO t VALUES (1, '{"a":1}')`)
+	if got := errJSON(t, db, "SELECT j -> 'a' FROM t"); got != "0A000" {
+		t.Errorf("j -> 'a': got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT j ->> 'a' FROM t"); got != "0A000" {
+		t.Errorf("j ->> 'a': got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT j #> '{a}' FROM t"); got != "0A000" {
+		t.Errorf("j #> '{a}': got %s, want 0A000", got)
+	}
+}
+
 // TestLargeJsonbSpillsAndRoundTrips: a large jsonb document (a long string node well past
 // RECORD_MAX) spills onto an overflow chain and round-trips through a whole-image serialize + reload
 // — exercising the jsonb body's spill/value_payload/value_from_payload (the tree decoded from a

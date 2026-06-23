@@ -67,6 +67,15 @@ pub enum Token {
     /// The `||` array concatenation operator (`a || b`). Two `|` scanned greedily; a lone `|` is a
     /// 42601 syntax error (jed has no bitwise-or). See spec/design/grammar.md §39, array-functions.md §8.
     Concat,
+    /// The `->` jsonb accessor operator (`doc -> 'key'` / `doc -> 0`). `-` then `>`, scanned greedily.
+    /// See spec/design/json-sql-functions.md §1.
+    Arrow,
+    /// The `->>` jsonb accessor-as-text operator (`doc ->> 'key'`). `-` then `>>`, scanned greedily.
+    ArrowText,
+    /// The `#>` jsonb get-at-path operator (`doc #> '{a,b}'`). `#` then `>`, scanned greedily.
+    HashArrow,
+    /// The `#>>` jsonb get-at-path-as-text operator (`doc #>> '{a,b}'`). `#` then `>>`, scanned greedily.
+    HashArrowText,
     /// The `@>` array containment operator (`a @> b` — does `a` contain `b`). `@` then `>`, scanned
     /// greedily; a lone `@` is a 42601 syntax error. See spec/design/grammar.md §40, array-functions.md §10.
     Contains,

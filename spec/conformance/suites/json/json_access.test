@@ -1,0 +1,75 @@
+# jsonb accessor operators (J4, spec/design/json-sql-functions.md §1): `->` field-by-key /
+# element-by-index → jsonb, `->>` the same as text, `#>` get-at-text[]-path → jsonb, `#>>` the path
+# as text. A missing key / out-of-range or non-integer index / wrong container kind yields SQL NULL;
+# a negative index counts from the array end; a JSON null sub-value renders as SQL NULL under
+# `->>`/`#>>` (and as the `null` node under `->`). The operators are 'any other operator' precedence
+# (left-associative; `doc ->> 'a' = '1'` parses as `(doc ->> 'a') = '1'`); the `#>`/`#>>` path is a
+# text[] (a bare '{a,b}' literal adapts). NULL base/arg → SQL NULL (strict). The `json` overloads are
+# a deferred 0A000 follow-on (a per-core test). Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.where_eq, types.jsonb, func.jsonb_access
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, b jsonb)
+
+statement ok
+INSERT INTO t VALUES (1, '{"a": 1, "tags": ["x", "y"], "n": null, "o": {"k": [7, 8]}}')
+
+# -> field by key → jsonb (canonical); a missing key → SQL NULL.
+query TTT nosort
+SELECT b -> 'a', b -> 'tags', b -> 'missing' FROM t
+----
+1
+["x", "y"]
+NULL
+
+# ->> field as text: a number → its digits, a container → canonical text, a JSON null → SQL NULL.
+query TTT nosort
+SELECT b ->> 'a', b ->> 'tags', b ->> 'n' FROM t
+----
+1
+["x", "y"]
+NULL
+
+# Chained accessors (left-associative); -> by integer index; a negative index from the end.
+query TTT nosort
+SELECT b -> 'tags' -> 1, (b -> 'tags') ->> 0, (b -> 'tags') ->> -1 FROM t
+----
+"y"
+x
+y
+
+# #> / #>> get at a text[] path (object keys + an array index); a missing step → SQL NULL.
+query TTT nosort
+SELECT b #> '{o,k,1}', b #>> '{o,k,1}', b #> '{o,missing}' FROM t
+----
+8
+8
+NULL
+
+# An out-of-range index, a key on a non-object, and an index on a non-array all → SQL NULL.
+query TTT nosort
+SELECT '[10,20,30]'::jsonb -> 5, '5'::jsonb -> 'a', '{"a":1}'::jsonb -> 0
+----
+NULL
+NULL
+NULL
+
+# Precedence: the accessor binds tighter than `=`, so `b ->> 'a' = '1'` is `(b ->> 'a') = '1'`.
+query I nosort
+SELECT id FROM t WHERE b ->> 'a' = '1'
+----
+1
+
+# A NULL base or argument propagates (the operators are strict).
+query TT nosort
+SELECT (NULL::jsonb) -> 'a', b -> (NULL::text) FROM t
+----
+NULL
+NULL
+
+# An empty path returns the whole document (PG).
+query B nosort
+SELECT b #> '{}' = b FROM t
+----
+true

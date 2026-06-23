@@ -3276,6 +3276,16 @@ func (p *Parser) parseConcat() (Expr, error) {
 			op = OpNotExtendLeft
 		case TokAdjacent:
 			op = OpAdjacent
+		// The jsonb accessor operators (json-sql-functions.md §1) — "any other operator" precedence,
+		// same level as `@>`/`||`, left-associative (`doc -> 'a' -> 'b'`).
+		case TokArrow:
+			op = OpJsonGet
+		case TokArrowText:
+			op = OpJsonGetText
+		case TokHashArrow:
+			op = OpJsonGetPath
+		case TokHashArrowText:
+			op = OpJsonGetPathText
 		default:
 			p.depth = base
 			return lhs, nil
@@ -4401,6 +4411,14 @@ func renderToken(t Token) string {
 		return "&>"
 	case TokAdjacent:
 		return "-|-"
+	case TokArrow:
+		return "->"
+	case TokArrowText:
+		return "->>"
+	case TokHashArrow:
+		return "#>"
+	case TokHashArrowText:
+		return "#>>"
 	case TokTilde:
 		return "~"
 	case TokTildeStar:

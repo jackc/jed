@@ -34,6 +34,14 @@ export type TokenKind =
   //              chars scanned greedily after "=", the legacy ":=" is not jed's surface (grammar.md §17)
   | "concat" // || — the array concatenation operator (a || b); two "|" scanned greedily, a lone
   //              "|" is a 42601 syntax error (jed has no bitwise-or) (spec/design/grammar.md §39)
+  | "arrow" // -> — the jsonb accessor operator (doc -> 'key' / doc -> 0); "-" then ">", scanned
+  //              greedily (spec/design/json-sql-functions.md §1)
+  | "arrowText" // ->> — the jsonb accessor-as-text operator (doc ->> 'key'); "-" then ">>", scanned
+  //              greedily BEFORE "->" (spec/design/json-sql-functions.md §1)
+  | "hashArrow" // #> — the jsonb get-at-path operator (doc #> '{a,b}'); "#" then ">", scanned
+  //              greedily (spec/design/json-sql-functions.md §1)
+  | "hashArrowText" // #>> — the jsonb get-at-path-as-text operator (doc #>> '{a,b}'); "#" then ">>",
+  //              scanned greedily (spec/design/json-sql-functions.md §1)
   | "contains" // @> — the array containment operator (a @> b — does a contain b); "@" then ">"
   //              scanned greedily, a lone "@" is a 42601 syntax error (spec/design/grammar.md §40)
   | "containedBy" // <@ — the array contained-by operator (a <@ b — is a contained by b) (grammar.md §40)

@@ -534,6 +534,73 @@ fn write_node(node: &JsonNode, out: &mut String) {
     }
 }
 
+// ---------------------------------------------------------------------------------------------
+// Accessor operators (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1) — jsonb kernels over
+// the canonical node tree. (The `json` overloads, which preserve the verbatim sub-text, are a
+// deferred follow-on — json.md §4.)
+// ---------------------------------------------------------------------------------------------
+
+/// `jsonb -> text`: an object field by key. `None` (→ SQL NULL) if the node is not an object or
+/// the key is absent. A duplicate-key object cannot occur (jsonb is canonical, unique keys).
+pub fn get_field<'a>(node: &'a JsonNode, key: &str) -> Option<&'a JsonNode> {
+    match node {
+        JsonNode::Object(members) => members.iter().find(|(k, _)| k == key).map(|(_, v)| v),
+        _ => None,
+    }
+}
+
+/// `jsonb -> int`: an array element by index (a negative index counts from the end). `None`
+/// (→ SQL NULL) if the node is not an array or the index is out of range.
+pub fn get_index(node: &JsonNode, idx: i64) -> Option<&JsonNode> {
+    match node {
+        JsonNode::Array(elems) => {
+            let len = elems.len() as i64;
+            let i = if idx < 0 { len + idx } else { idx };
+            if i >= 0 && i < len {
+                Some(&elems[i as usize])
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+/// `jsonb #> text[]`: navigate a path of text steps. At each step an object uses the step as a
+/// key; an array parses the step as an integer index (a non-integer or out-of-range step → `None`).
+/// An empty path returns the whole node (PG). `None` (→ SQL NULL) if any step fails.
+pub fn get_path<'a>(node: &'a JsonNode, path: &[String]) -> Option<&'a JsonNode> {
+    let mut cur = node;
+    for step in path {
+        cur = match cur {
+            JsonNode::Object(members) => members.iter().find(|(k, _)| k == step).map(|(_, v)| v)?,
+            JsonNode::Array(elems) => {
+                let idx: i64 = step.trim().parse().ok()?;
+                let len = elems.len() as i64;
+                let i = if idx < 0 { len + idx } else { idx };
+                if i >= 0 && i < len {
+                    &elems[i as usize]
+                } else {
+                    return None;
+                }
+            }
+            _ => return None,
+        };
+    }
+    Some(cur)
+}
+
+/// The `->>` / `#>>` text rendering of an accessed node: a STRING node yields its raw content
+/// (unescaped); a JSON `null` node yields SQL NULL (`None`); every other node yields its canonical
+/// `jsonb_out` text.
+pub fn node_to_text(node: &JsonNode) -> Option<String> {
+    match node {
+        JsonNode::Null => None,
+        JsonNode::String(s) => Some(s.clone()),
+        other => Some(jsonb_out(other)),
+    }
+}
+
 /// JSON-escape a string the way PG `escape_json` does: quote, escape `"` and `\`, the short
 /// escapes for `\b \f \n \r \t`, other control chars (< 0x20) as `\u00XX`; `/` is NOT escaped
 /// and non-ASCII is emitted as raw UTF-8.

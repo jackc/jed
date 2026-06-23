@@ -88,6 +88,15 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 if bytes.get(i + 1) == Some(&b'|') && bytes.get(i + 2) == Some(&b'-') {
                     tokens.push(Token::Adjacent);
                     i += 3;
+                } else if bytes.get(i + 1) == Some(&b'>') && bytes.get(i + 2) == Some(&b'>') {
+                    // `->>` is the jsonb accessor-as-text operator (json-sql-functions.md §1),
+                    // scanned greedily BEFORE `->` so it is never `-> >`.
+                    tokens.push(Token::ArrowText);
+                    i += 3;
+                } else if bytes.get(i + 1) == Some(&b'>') {
+                    // `->` is the jsonb accessor operator (json-sql-functions.md §1).
+                    tokens.push(Token::Arrow);
+                    i += 2;
                 } else if bytes.get(i + 1) == Some(&b'-') {
                     // `--` starts a line comment running to the end of the line; comments are
                     // whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
@@ -253,6 +262,20 @@ pub fn lex(sql: &str) -> Result<Vec<Token>> {
                 } else {
                     tokens.push(Token::Gt);
                     i += 1;
+                }
+            }
+            b'#' => {
+                // `#>>` / `#>` are the jsonb get-at-path operators (json-sql-functions.md §1),
+                // scanned greedily (`#>>` before `#>`). `#-` (delete-at-path) is a J6 follow-on.
+                // A lone `#` is not part of jed's surface — 42601.
+                if bytes.get(i + 1) == Some(&b'>') && bytes.get(i + 2) == Some(&b'>') {
+                    tokens.push(Token::HashArrowText);
+                    i += 3;
+                } else if bytes.get(i + 1) == Some(&b'>') {
+                    tokens.push(Token::HashArrow);
+                    i += 2;
+                } else {
+                    return Err(syntax("unexpected character '#'".to_string()));
                 }
             }
             b'\'' => {

@@ -84,6 +84,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The JSON cast matrix (J3) — runtime json↔jsonb, json/jsonb→text, text→json/jsonb
   // (spec/design/json.md §6.1).
   "types.json_casts",
+  // jsonb accessor operators (J4) — `->` `->>` `#>` `#>>` (json-sql-functions.md §1).
+  "func.jsonb_access",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
   // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
   "func.range_accessors",

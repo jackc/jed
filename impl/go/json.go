@@ -701,3 +701,84 @@ func writeJSONString(s string, out *strings.Builder) {
 	}
 	out.WriteByte('"')
 }
+
+// ---------------------------------------------------------------------------------------------
+// Accessor operators (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1) — jsonb kernels over
+// the canonical node tree. (The `json` overloads, which preserve the verbatim sub-text, are a
+// deferred follow-on — json.md §4.)
+// ---------------------------------------------------------------------------------------------
+
+// jsonGetField is `jsonb -> text`: an object field by key. nil (→ SQL NULL) if the node is not an
+// object or the key is absent. A duplicate-key object cannot occur (jsonb is canonical, unique keys).
+func jsonGetField(node *JsonNode, key string) *JsonNode {
+	if node.Kind != JObject {
+		return nil
+	}
+	for i := range node.Obj {
+		if node.Obj[i].Key == key {
+			return &node.Obj[i].Val
+		}
+	}
+	return nil
+}
+
+// jsonGetIndex is `jsonb -> int`: an array element by index (a negative index counts from the end).
+// nil (→ SQL NULL) if the node is not an array or the index is out of range.
+func jsonGetIndex(node *JsonNode, idx int64) *JsonNode {
+	if node.Kind != JArray {
+		return nil
+	}
+	length := int64(len(node.Arr))
+	i := idx
+	if i < 0 {
+		i = length + i
+	}
+	if i >= 0 && i < length {
+		return &node.Arr[i]
+	}
+	return nil
+}
+
+// jsonGetPath is `jsonb #> text[]`: navigate a path of text steps. At each step an object uses the
+// step as a key; an array parses the step as an integer index (a non-integer or out-of-range step →
+// nil). An empty path returns the whole node (PG). nil (→ SQL NULL) if any step fails.
+func jsonGetPath(node *JsonNode, path []string) *JsonNode {
+	cur := node
+	for _, step := range path {
+		switch cur.Kind {
+		case JObject:
+			next := jsonGetField(cur, step)
+			if next == nil {
+				return nil
+			}
+			cur = next
+		case JArray:
+			idx, err := strconv.ParseInt(strings.TrimSpace(step), 10, 64)
+			if err != nil {
+				return nil
+			}
+			next := jsonGetIndex(cur, idx)
+			if next == nil {
+				return nil
+			}
+			cur = next
+		default:
+			return nil
+		}
+	}
+	return cur
+}
+
+// jsonNodeToText is the `->>` / `#>>` text rendering of an accessed node: a STRING node yields its
+// raw content (unescaped); a JSON `null` node yields SQL NULL (ok=false); every other node yields its
+// canonical jsonb_out text.
+func jsonNodeToText(node *JsonNode) (string, bool) {
+	switch node.Kind {
+	case JNull:
+		return "", false
+	case JString:
+		return node.S, true
+	default:
+		return jsonbOut(node), true
+	}
+}

@@ -2489,6 +2489,12 @@ class Parser {
       else if (k === "notExtendRight") op = "notExtendRight";
       else if (k === "notExtendLeft") op = "notExtendLeft";
       else if (k === "adjacent") op = "adjacent";
+      // The jsonb accessor operators (json-sql-functions.md §1) — "any other operator" precedence,
+      // same level as `@>`/`||`, left-associative (`doc -> 'a' -> 'b'`).
+      else if (k === "arrow") op = "jsonGet";
+      else if (k === "arrowText") op = "jsonGetText";
+      else if (k === "hashArrow") op = "jsonGetPath";
+      else if (k === "hashArrowText") op = "jsonGetPathText";
       else {
         this.depth = base;
         return lhs;
@@ -3306,6 +3312,14 @@ function renderToken(t: Token): string {
       return "&>";
     case "adjacent":
       return "-|-";
+    case "arrow":
+      return "->";
+    case "arrowText":
+      return "->>";
+    case "hashArrow":
+      return "#>";
+    case "hashArrowText":
+      return "#>>";
     case "tilde":
       return "~";
     case "tildeStar":

@@ -13311,6 +13311,23 @@ const (
 	// a NULL index, or an out-of-bounds index yields NULL (PG — never an error). One operator_eval
 	// per node.
 	reSubscript
+	// reJsonGet is a jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1, J4).
+	// `jgop` selects field/index vs path and text-vs-jsonb; `lhs` evaluates to a jsonb document; `rhs` is
+	// the key (text), array index (integer), or path (`text[]`). The result is jsonb (`-> #>`) or text
+	// (`->> #>>`), and is SQL NULL when the access misses (or when base/arg is NULL — the operators are
+	// strict).
+	reJsonGet
+)
+
+// jsonGetOp selects which jsonb accessor operator an reJsonGet node applies
+// (spec/design/json-sql-functions.md §1).
+type jsonGetOp int
+
+const (
+	jgArrow         jsonGetOp = iota // `->` — field by key (text arg) or element by index (integer arg); result jsonb.
+	jgArrowText                      // `->>` — same access, rendered as text.
+	jgHashArrow                      // `#>` — get at a `text[]` path; result jsonb.
+	jgHashArrowText                  // `#>>` — get at a `text[]` path, rendered as text.
 )
 
 // subqueryKind selects which subquery form an reSubquery node is (spec/design/grammar.md §26).
@@ -13560,6 +13577,10 @@ type rExpr struct {
 	// reConstJsonb: a folded jsonb constant — the canonical node tree (parsed + canonicalized at
 	// resolve). A reConstJson holds its verbatim text in cText (no extra field).
 	cJsonb *JsonNode
+
+	// reJsonGet: the jsonb accessor operator (`-> ->> #> #>>`). `lhs` is the jsonb base, `rhs` the
+	// key/index/path argument (spec/design/json-sql-functions.md §1).
+	jgop jsonGetOp
 
 	// reQuantified: `lhs` is the scalar, `rhs` the array node, `op` the comparison, `quantAll`
 	// selects ALL (true) vs ANY/SOME (false) (spec/design/array-functions.md §11).
@@ -17083,6 +17104,101 @@ func resolveQuantifiedSubquery(s *scope, q *QuantifiedSubqueryExpr, ag *aggCtx, 
 	return &rExpr{kind: reSubquery, subPlan: &plan, subKind: sqQuantified, op: q.Op, quantAll: q.All, lhs: rlhs}, resolvedType{kind: rtBool}, nil
 }
 
+// resolveJSONAccess resolves a jsonb accessor operator (`-> ->> #> #>>`,
+// spec/design/json-sql-functions.md §1). The base must be `jsonb` (a `json` base is the deferred
+// 0A000 follow-on — json.md §4; any other base is 42883). For `->`/`->>` the argument is a key
+// (`text`) or an array index (`integer`); for `#>`/`#>>` it is a `text[]` path (a bare string literal
+// `'{a,b}'` adapts via array_in). The result is `jsonb` (`-> #>`) or `text` (`->> #>>`); a missing
+// access yields SQL NULL at eval.
+func resolveJSONAccess(s *scope, op BinaryOp, lhs, rhs Expr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	rbase, baseTy, err := resolve(s, lhs, nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	// The base must be jsonb. json is a documented deferred follow-on (its operators preserve the
+	// verbatim sub-text — json.md §4); any other base type has no such operator (42883).
+	switch baseTy.kind {
+	case rtJsonb:
+	case rtJson:
+		return nil, resolvedType{}, NewError(FeatureNotSupported,
+			"json accessor operators are not supported yet; cast to jsonb")
+	case rtNull:
+		// a NULL base propagates (the access is NULL)
+	default:
+		return nil, resolvedType{}, NewError(UndefinedFunction,
+			fmt.Sprintf("operator does not exist: %s %s ...", rtName(baseTy), jsonOpSymbol(op)))
+	}
+	var jop jsonGetOp
+	var result resolvedType
+	var path bool
+	switch op {
+	case OpJsonGet:
+		jop, result, path = jgArrow, resolvedType{kind: rtJsonb}, false
+	case OpJsonGetText:
+		jop, result, path = jgArrowText, resolvedType{kind: rtText}, false
+	case OpJsonGetPath:
+		jop, result, path = jgHashArrow, resolvedType{kind: rtJsonb}, true
+	default: // OpJsonGetPathText
+		jop, result, path = jgHashArrowText, resolvedType{kind: rtText}, true
+	}
+	var rarg *rExpr
+	if path {
+		// `#>` / `#>>` take a text[] path. A bare string literal `'{a,b}'` adapts via array_in;
+		// otherwise the resolved argument must be a text[] (else 42883).
+		if rhs.Kind == ExprLiteral && rhs.Literal != nil && rhs.Literal.Kind == LiteralText {
+			val, err := coerceStringToArray(rhs.Literal.Str, ScalarColType(Text))
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			rarg = valueToRExpr(val)
+		} else {
+			ra, argTy, err := resolve(s, rhs, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			switch {
+			case argTy.kind == rtArray && argTy.elem != nil && argTy.elem.kind == rtText:
+			case argTy.kind == rtNull:
+			default:
+				return nil, resolvedType{}, NewError(UndefinedFunction,
+					"the #> / #>> path argument must be text[]")
+			}
+			rarg = ra
+		}
+	} else {
+		// `->` / `->>` take a key (text) or an array index (integer). A string literal stays text;
+		// an integer literal stays integer; no adaptation is needed.
+		ra, argTy, err := resolve(s, rhs, nil, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		switch argTy.kind {
+		case rtText, rtInt, rtNull:
+		default:
+			return nil, resolvedType{}, NewError(UndefinedFunction,
+				fmt.Sprintf("operator does not exist: jsonb %s %s", jsonOpSymbol(op), rtName(argTy)))
+		}
+		rarg = ra
+	}
+	return &rExpr{kind: reJsonGet, jgop: jop, lhs: rbase, rhs: rarg}, result, nil
+}
+
+// jsonOpSymbol is the display symbol for a jsonb accessor operator, for error messages.
+func jsonOpSymbol(op BinaryOp) string {
+	switch op {
+	case OpJsonGet:
+		return "->"
+	case OpJsonGetText:
+		return "->>"
+	case OpJsonGetPath:
+		return "#>"
+	case OpJsonGetPathText:
+		return "#>>"
+	default:
+		return "?"
+	}
+}
+
 // binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
 // `operator does not exist` message (only the comparison operators reach resolveQuantified).
 func binaryOpSymbol(op BinaryOp) string {
@@ -17129,8 +17245,16 @@ func binaryOpSymbol(op BinaryOp) string {
 		return "&<"
 	case OpNotExtendLeft:
 		return "&>"
-	default: // OpAdjacent
+	case OpAdjacent:
 		return "-|-"
+	case OpJsonGet:
+		return "->"
+	case OpJsonGetText:
+		return "->>"
+	case OpJsonGetPath:
+		return "#>"
+	default: // OpJsonGetPathText
+		return "#>>"
 	}
 }
 
@@ -19320,6 +19444,9 @@ func resolveBinary(s *scope, b *BinaryExpr, ag *aggCtx, params *paramTypes) (*rE
 	case OpContains, OpContainedBy, OpOverlaps,
 		OpStrictlyLeft, OpStrictlyRight, OpNotExtendRight, OpNotExtendLeft, OpAdjacent:
 		return resolveSetOp(s, b.Op, b.Lhs, b.Rhs, ag, params)
+	// The jsonb accessor operators (spec/design/json-sql-functions.md §1, J4).
+	case OpJsonGet, OpJsonGetText, OpJsonGetPath, OpJsonGetPathText:
+		return resolveJSONAccess(s, b.Op, b.Lhs, b.Rhs, ag, params)
 	default: // OpAnd, OpOr
 		rl, lt, err := resolve(s, b.Lhs, nil, ag, params)
 		if err != nil {
@@ -21446,6 +21573,67 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return from3(or3(a.Lt3(b), a.Eq3(b))), nil
 		default: // OpGe
 			return from3(or3(a.Gt3(b), a.Eq3(b))), nil
+		}
+	case reJsonGet:
+		// A jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1). One
+		// operator_eval; the operands charge their own. The operators are STRICT — a NULL base or
+		// argument propagates to SQL NULL.
+		m.Charge(Costs.OperatorEval)
+		bv, err := e.lhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		av, err := e.rhs.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		if bv.Kind == ValNull || av.Kind == ValNull {
+			return NullValue(), nil
+		}
+		node := bv.Json // resolver guarantees a jsonb base for an accessor operator
+		// Locate the accessed node: a key (text) / index (int) for `-> ->>`, or a text[] path for
+		// `#> #>>`. A NULL element inside the path array misses (PG).
+		var accessed *JsonNode
+		switch e.jgop {
+		case jgArrow, jgArrowText:
+			if av.Kind == ValText {
+				accessed = jsonGetField(node, av.Str)
+			} else { // ValInt — resolver guarantees a text/int arg for -> / ->>
+				accessed = jsonGetIndex(node, av.Int)
+			}
+		default: // jgHashArrow, jgHashArrowText — a text[] path
+			arr := av.Array
+			steps := make([]string, 0, len(arr.Elements))
+			nullStep := false
+			for _, el := range arr.Elements {
+				if el.Kind == ValNull {
+					nullStep = true
+					break
+				}
+				steps = append(steps, el.Str) // a text[] path has text/NULL elements
+			}
+			if nullStep {
+				accessed = nil
+			} else {
+				accessed = jsonGetPath(node, steps)
+			}
+		}
+		// `-> #>` return the node as jsonb; `->> #>>` render it as text (a JSON null or a missing
+		// access → SQL NULL).
+		if accessed == nil {
+			return NullValue(), nil
+		}
+		switch e.jgop {
+		case jgArrow, jgHashArrow:
+			return JsonbValue(*accessed), nil
+		default: // jgArrowText, jgHashArrowText
+			if s, ok := jsonNodeToText(accessed); ok {
+				return TextValue(s), nil
+			}
+			return NullValue(), nil
 		}
 	case reAnd:
 		m.Charge(Costs.OperatorEval)

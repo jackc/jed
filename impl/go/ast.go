@@ -880,6 +880,14 @@ const (
 	OpNotExtendRight
 	OpNotExtendLeft
 	OpAdjacent
+	// OpJsonGet/OpJsonGetText/OpJsonGetPath/OpJsonGetPathText are the jsonb accessor operators
+	// `->`/`->>`/`#>`/`#>>` (spec/design/json-sql-functions.md §1, J4): `->` get field/element,
+	// `->>` get as text, `#>` get at path, `#>>` get at path as text. The result type and the
+	// field-vs-index split are decided at resolve from the operand types.
+	OpJsonGet
+	OpJsonGetText
+	OpJsonGetPath
+	OpJsonGetPathText
 )
 
 // Expr is a general expression, shared by the SELECT list, WHERE, and UPDATE ... SET.

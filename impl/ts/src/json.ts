@@ -612,3 +612,75 @@ export function writeJsonString(s: string, out: string[]): void {
   }
   out.push('"');
 }
+
+// ---------------------------------------------------------------------------------------------
+// Accessor operators (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1) — jsonb kernels over
+// the canonical node tree. (The `json` overloads, which preserve the verbatim sub-text, are a
+// deferred follow-on — json.md §4.)
+// ---------------------------------------------------------------------------------------------
+
+// getField is `jsonb -> text`: an object field by key. null (→ SQL NULL) if the node is not an
+// object or the key is absent. A duplicate-key object cannot occur (jsonb is canonical, unique keys).
+export function getField(node: JsonNode, key: string): JsonNode | null {
+  if (node.kind !== "object") return null;
+  for (const m of node.members) {
+    if (m.key === key) return m.value;
+  }
+  return null;
+}
+
+// getIndex is `jsonb -> int`: an array element by index (a negative index counts from the end). null
+// (→ SQL NULL) if the node is not an array or the index is out of range. `idx` is a bigint (the TS
+// core's integer representation — CLAUDE.md §2).
+export function getIndex(node: JsonNode, idx: bigint): JsonNode | null {
+  if (node.kind !== "array") return null;
+  const len = BigInt(node.elements.length);
+  const i = idx < 0n ? len + idx : idx;
+  if (i >= 0n && i < len) return node.elements[Number(i)]!;
+  return null;
+}
+
+// getPath is `jsonb #> text[]`: navigate a path of text steps. At each step an object uses the step
+// as a key; an array parses the step as an integer index (a non-integer or out-of-range step → null).
+// An empty path returns the whole node (PG). null (→ SQL NULL) if any step fails.
+export function getPath(node: JsonNode, path: string[]): JsonNode | null {
+  let cur: JsonNode = node;
+  for (const step of path) {
+    if (cur.kind === "object") {
+      const next = getField(cur, step);
+      if (next === null) return null;
+      cur = next;
+    } else if (cur.kind === "array") {
+      const idx = parseIntStep(step);
+      if (idx === null) return null;
+      const next = getIndex(cur, idx);
+      if (next === null) return null;
+      cur = next;
+    } else {
+      return null;
+    }
+  }
+  return cur;
+}
+
+// parseIntStep parses a #>-path step as a base-10 integer index (the Rust `step.trim().parse()` /
+// Go `strconv.ParseInt(TrimSpace(...))` analogue): leading/trailing ASCII whitespace is trimmed, an
+// optional leading sign is allowed, and the remainder must be all digits. null on a non-integer.
+function parseIntStep(step: string): bigint | null {
+  const t = step.trim();
+  if (!/^[+-]?[0-9]+$/.test(t)) return null;
+  try {
+    return BigInt(t);
+  } catch {
+    return null;
+  }
+}
+
+// nodeToText is the `->>` / `#>>` text rendering of an accessed node: a STRING node yields its raw
+// content (unescaped); a JSON `null` node yields SQL NULL (null); every other node yields its
+// canonical jsonb_out text.
+export function nodeToText(node: JsonNode): string | null {
+  if (node.kind === "null") return null;
+  if (node.kind === "string") return node.value;
+  return jsonbOut(node);
+}

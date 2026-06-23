@@ -9888,6 +9888,10 @@ impl Database {
                 self.fold_uncorrelated_in_rexpr(l, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(r, bound, ctes, cost)
             }
+            RExpr::JsonGet { base, arg, .. } => {
+                self.fold_uncorrelated_in_rexpr(base, bound, ctes, cost)?;
+                self.fold_uncorrelated_in_rexpr(arg, bound, ctes, cost)
+            }
             RExpr::IsNull { operand, .. } => {
                 self.fold_uncorrelated_in_rexpr(operand, bound, ctes, cost)
             }
@@ -11144,6 +11148,19 @@ enum RSubscript {
 /// A resolved expression: a tree over fixed column indices, ready to evaluate against
 /// a row. Arithmetic nodes carry their (promotion-tower) result type so the computed
 /// value can be range-checked against it (the i16+i16 → i16 boundary).
+/// Which jsonb accessor operator a [`RExpr::JsonGet`] applies (spec/design/json-sql-functions.md §1).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JsonGetOp {
+    /// `->` — field by key (text arg) or element by index (integer arg); result jsonb.
+    Arrow,
+    /// `->>` — same access, rendered as text.
+    ArrowText,
+    /// `#>` — get at a `text[]` path; result jsonb.
+    HashArrow,
+    /// `#>>` — get at a `text[]` path, rendered as text.
+    HashArrowText,
+}
+
 enum RExpr {
     Column(usize),
     ConstInt(i64),
@@ -11243,6 +11260,15 @@ enum RExpr {
     },
     And(Box<RExpr>, Box<RExpr>),
     Or(Box<RExpr>, Box<RExpr>),
+    /// A jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1, J4). `op`
+    /// selects field/index vs path and text-vs-jsonb; `base` evaluates to a jsonb document; `arg` is
+    /// the key (text), array index (integer), or path (`text[]`). The result is jsonb (`-> #>`) or
+    /// text (`->> #>>`), and is SQL NULL when the access misses (or when base/arg is NULL).
+    JsonGet {
+        op: JsonGetOp,
+        base: Box<RExpr>,
+        arg: Box<RExpr>,
+    },
     IsNull {
         operand: Box<RExpr>,
         negated: bool,
@@ -12813,6 +12839,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::Regex { lhs, rhs, .. }
         | RExpr::And(lhs, rhs)
         | RExpr::Or(lhs, rhs) => rexpr_is_constant(lhs) && rexpr_is_constant(rhs),
+        RExpr::JsonGet { base, arg, .. } => rexpr_is_constant(base) && rexpr_is_constant(arg),
         RExpr::IsNull { operand, .. } => rexpr_is_constant(operand),
         RExpr::Case { arms, els, .. } => {
             arms.iter()
@@ -14690,6 +14717,9 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::Regex { lhs, rhs, .. } => {
             rexpr_references_outer(lhs, depth) || rexpr_references_outer(rhs, depth)
         }
+        RExpr::JsonGet { base, arg, .. } => {
+            rexpr_references_outer(base, depth) || rexpr_references_outer(arg, depth)
+        }
         RExpr::And(l, r) | RExpr::Or(l, r) => {
             rexpr_references_outer(l, depth) || rexpr_references_outer(r, depth)
         }
@@ -14812,6 +14842,10 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::Regex { lhs, rhs, .. } => {
             collect_touched(lhs, depth, touched);
             collect_touched(rhs, depth, touched);
+        }
+        RExpr::JsonGet { base, arg, .. } => {
+            collect_touched(base, depth, touched);
+            collect_touched(arg, depth, touched);
         }
         RExpr::And(l, r) | RExpr::Or(l, r) => {
             collect_touched(l, depth, touched);
@@ -19819,6 +19853,114 @@ fn resolve_binary(
         | BinaryOp::NotExtendRight
         | BinaryOp::NotExtendLeft
         | BinaryOp::Adjacent => resolve_set_op(scope, op, lhs, rhs, agg, params),
+        // The jsonb accessor operators (spec/design/json-sql-functions.md §1, J4).
+        BinaryOp::JsonGet
+        | BinaryOp::JsonGetText
+        | BinaryOp::JsonGetPath
+        | BinaryOp::JsonGetPathText => resolve_json_access(scope, op, lhs, rhs, agg, params),
+    }
+}
+
+/// Resolve a jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1). The
+/// base must be `jsonb` (a `json` base is the deferred 0A000 follow-on — json.md §4; any other base
+/// is 42883). For `->`/`->>` the argument is a key (`text`) or an array index (`integer`); for
+/// `#>`/`#>>` it is a `text[]` path (a bare string literal `'{a,b}'` adapts via `array_in`). The
+/// result is `jsonb` (`-> #>`) or `text` (`->> #>>`); a missing access yields SQL NULL at eval.
+fn resolve_json_access(
+    scope: &Scope,
+    op: BinaryOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    let (rbase, base_ty) = resolve(scope, lhs, None, agg, params)?;
+    // The base must be jsonb. json is a documented deferred follow-on (its operators preserve the
+    // verbatim sub-text — json.md §4); any other base type has no such operator (42883).
+    match base_ty {
+        ResolvedType::Jsonb => {}
+        ResolvedType::Json => {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "json accessor operators are not supported yet; cast to jsonb",
+            ));
+        }
+        ResolvedType::Null => {} // a NULL base propagates (the access is NULL)
+        _ => {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                format!(
+                    "operator does not exist: {} {} ...",
+                    base_ty.type_name(),
+                    json_op_symbol(op)
+                ),
+            ));
+        }
+    }
+    let (jop, result, path) = match op {
+        BinaryOp::JsonGet => (JsonGetOp::Arrow, ResolvedType::Jsonb, false),
+        BinaryOp::JsonGetText => (JsonGetOp::ArrowText, ResolvedType::Text, false),
+        BinaryOp::JsonGetPath => (JsonGetOp::HashArrow, ResolvedType::Jsonb, true),
+        BinaryOp::JsonGetPathText => (JsonGetOp::HashArrowText, ResolvedType::Text, true),
+        _ => unreachable!("resolve_json_access only handles the four accessor operators"),
+    };
+    let rarg = if path {
+        // `#>` / `#>>` take a text[] path. A bare string literal `'{a,b}'` adapts via array_in;
+        // otherwise the resolved argument must be a text[] (else 42883).
+        if let Expr::Literal(Literal::Text(s)) = rhs {
+            let val = coerce_string_to_array(s, &ColType::Scalar(ScalarType::Text))?;
+            value_to_rexpr(&val)
+        } else {
+            let (rarg, arg_ty) = resolve(scope, rhs, None, agg, params)?;
+            match arg_ty {
+                ResolvedType::Array(elem) if matches!(*elem, ResolvedType::Text) => {}
+                ResolvedType::Null => {}
+                _ => {
+                    return Err(EngineError::new(
+                        SqlState::UndefinedFunction,
+                        "the #> / #>> path argument must be text[]",
+                    ));
+                }
+            }
+            rarg
+        }
+    } else {
+        // `->` / `->>` take a key (text) or an array index (integer). A string literal stays text;
+        // an integer literal stays integer; no adaptation is needed.
+        let (rarg, arg_ty) = resolve(scope, rhs, None, agg, params)?;
+        match arg_ty {
+            ResolvedType::Text | ResolvedType::Int(_) | ResolvedType::Null => {}
+            _ => {
+                return Err(EngineError::new(
+                    SqlState::UndefinedFunction,
+                    format!(
+                        "operator does not exist: jsonb {} {}",
+                        json_op_symbol(op),
+                        arg_ty.type_name()
+                    ),
+                ));
+            }
+        }
+        rarg
+    };
+    Ok((
+        RExpr::JsonGet {
+            op: jop,
+            base: Box::new(rbase),
+            arg: Box::new(rarg),
+        },
+        result,
+    ))
+}
+
+/// The display symbol for a jsonb accessor operator, for error messages.
+fn json_op_symbol(op: BinaryOp) -> &'static str {
+    match op {
+        BinaryOp::JsonGet => "->",
+        BinaryOp::JsonGetText => "->>",
+        BinaryOp::JsonGetPath => "#>",
+        BinaryOp::JsonGetPathText => "#>>",
+        _ => "?",
     }
 }
 
@@ -20164,6 +20306,10 @@ fn binary_op_symbol(op: BinaryOp) -> &'static str {
         BinaryOp::NotExtendRight => "&<",
         BinaryOp::NotExtendLeft => "&>",
         BinaryOp::Adjacent => "-|-",
+        BinaryOp::JsonGet => "->",
+        BinaryOp::JsonGetText => "->>",
+        BinaryOp::JsonGetPath => "#>",
+        BinaryOp::JsonGetPathText => "#>>",
     }
 }
 
@@ -23507,6 +23653,63 @@ impl RExpr {
                     CmpOp::Ge => a.gt3(&b).or(a.eq3(&b)),
                 };
                 Ok(from3(tv))
+            }
+            RExpr::JsonGet { op, base, arg } => {
+                m.charge(COSTS.operator_eval);
+                let bv = base.eval(row, env, m)?;
+                let av = arg.eval(row, env, m)?;
+                m.guard()?;
+                // A NULL base or argument propagates to SQL NULL (the operators are strict).
+                let node = match &bv {
+                    Value::Null => return Ok(Value::Null),
+                    Value::Jsonb(n) => n,
+                    _ => unreachable!("resolver guarantees a jsonb base for an accessor operator"),
+                };
+                if matches!(av, Value::Null) {
+                    return Ok(Value::Null);
+                }
+                // Locate the accessed node: a key (text) / index (int) for `-> ->>`, or a text[]
+                // path for `#> #>>`. A NULL element inside the path array misses (PG).
+                let accessed: Option<&JsonNode> = match op {
+                    JsonGetOp::Arrow | JsonGetOp::ArrowText => match &av {
+                        Value::Text(k) => json::get_field(node, k),
+                        Value::Int(i) => json::get_index(node, *i),
+                        _ => unreachable!("resolver guarantees a text/int arg for -> / ->>"),
+                    },
+                    JsonGetOp::HashArrow | JsonGetOp::HashArrowText => match &av {
+                        Value::Array(arr) => {
+                            let mut steps: Vec<String> = Vec::with_capacity(arr.elements.len());
+                            let mut null_step = false;
+                            for e in &arr.elements {
+                                match e {
+                                    Value::Text(s) => steps.push(s.clone()),
+                                    Value::Null => {
+                                        null_step = true;
+                                        break;
+                                    }
+                                    _ => unreachable!("a text[] path has text/NULL elements"),
+                                }
+                            }
+                            if null_step {
+                                None
+                            } else {
+                                json::get_path(node, &steps)
+                            }
+                        }
+                        _ => unreachable!("resolver guarantees a text[] arg for #> / #>>"),
+                    },
+                };
+                // `-> #>` return the node as jsonb; `->> #>>` render it as text (a JSON null or a
+                // missing access → SQL NULL).
+                match (op, accessed) {
+                    (_, None) => Ok(Value::Null),
+                    (JsonGetOp::Arrow | JsonGetOp::HashArrow, Some(n)) => {
+                        Ok(Value::Jsonb(n.clone()))
+                    }
+                    (JsonGetOp::ArrowText | JsonGetOp::HashArrowText, Some(n)) => {
+                        Ok(json::node_to_text(n).map_or(Value::Null, Value::Text))
+                    }
+                }
             }
             RExpr::And(l, r) => {
                 m.charge(COSTS.operator_eval);

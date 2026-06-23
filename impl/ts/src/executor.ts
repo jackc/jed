@@ -252,7 +252,17 @@ import {
   jsonValue,
   jsonbValue,
 } from "./value.ts";
-import { type JsonNode, jsonNodeCmp, jsonbIn, jsonbOut, validateJson } from "./json.ts";
+import {
+  type JsonNode,
+  getField,
+  getIndex,
+  getPath,
+  jsonNodeCmp,
+  jsonbIn,
+  jsonbOut,
+  nodeToText,
+  validateJson,
+} from "./json.ts";
 import {
   elementScalar,
   finalizeRange,
@@ -8197,6 +8207,10 @@ export class Database {
         e.lhs = this.foldUncorrelatedInRExpr(e.lhs, bound, ctes, cost);
         e.rhs = this.foldUncorrelatedInRExpr(e.rhs, bound, ctes, cost);
         return e;
+      case "jsonGet":
+        e.base = this.foldUncorrelatedInRExpr(e.base, bound, ctes, cost);
+        e.arg = this.foldUncorrelatedInRExpr(e.arg, bound, ctes, cost);
+        return e;
       case "casing":
         e.arg = this.foldUncorrelatedInRExpr(e.arg, bound, ctes, cost);
         return e;
@@ -8598,6 +8612,8 @@ function rexprIsConstant(e: RExpr): boolean {
     case "like":
     case "regex":
       return rexprIsConstant(e.lhs) && rexprIsConstant(e.rhs);
+    case "jsonGet":
+      return rexprIsConstant(e.base) && rexprIsConstant(e.arg);
     case "casing":
       return rexprIsConstant(e.arg);
     case "atTimeZone":
@@ -9570,6 +9586,8 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "like":
     case "regex":
       return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth);
+    case "jsonGet":
+      return rexprReferencesOuter(e.base, depth) || rexprReferencesOuter(e.arg, depth);
     case "casing":
       return rexprReferencesOuter(e.arg, depth);
     case "atTimeZone":
@@ -9673,6 +9691,10 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "regex":
       collectTouched(e.lhs, depth, touched);
       collectTouched(e.rhs, depth, touched);
+      return;
+    case "jsonGet":
+      collectTouched(e.base, depth, touched);
+      collectTouched(e.arg, depth, touched);
       return;
     case "casing":
       collectTouched(e.arg, depth, touched);
@@ -10260,6 +10282,11 @@ type RExpr =
     }
   | { kind: "and"; lhs: RExpr; rhs: RExpr }
   | { kind: "or"; lhs: RExpr; rhs: RExpr }
+  // A jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1, J4). `op`
+  // selects field/index vs path and text-vs-jsonb; `base` evaluates to a jsonb document; `arg` is
+  // the key (text), array index (integer), or path (`text[]`). The result is jsonb (`-> #>`) or
+  // text (`->> #>>`), and is SQL NULL when the access misses (or when base/arg is NULL — strict).
+  | { kind: "jsonGet"; op: JsonGetOp; base: RExpr; arg: RExpr }
   | { kind: "isNull"; operand: RExpr; negated: boolean }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
   | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean; insensitive: boolean }
@@ -10396,6 +10423,13 @@ type RExpr =
 
 // SubqueryKind selects which subquery form a "subquery" RExpr is (spec/design/grammar.md §26).
 type SubqueryKind = "scalar" | "exists" | "in" | "quantified";
+
+// JsonGetOp selects which jsonb accessor operator a "jsonGet" RExpr applies
+// (spec/design/json-sql-functions.md §1): "arrow" `->` — field by key (text arg) or element by
+// index (integer arg), result jsonb; "arrowText" `->>` — same access, rendered as text; "hashArrow"
+// `#>` — get at a `text[]` path, result jsonb; "hashArrowText" `#>>` — get at a `text[]` path,
+// rendered as text.
+type JsonGetOp = "arrow" | "arrowText" | "hashArrow" | "hashArrowText";
 
 // ScalarFuncName is the internal identity of a scalar-function node. abs/round span int/decimal
 // AND float overloads; the rest (ceil…tan) are float-only (spec/design/float.md §8). The
@@ -16364,6 +16398,12 @@ function resolveBinary(
     case "notExtendLeft":
     case "adjacent":
       return resolveSetOp(scope, op, lhs, rhs, ag, params);
+    // The jsonb accessor operators (spec/design/json-sql-functions.md §1, J4).
+    case "jsonGet":
+    case "jsonGetText":
+    case "jsonGetPath":
+    case "jsonGetPathText":
+      return resolveJsonAccess(scope, op, lhs, rhs, ag, params);
     default: {
       // "and" | "or"
       const l = resolve(scope, lhs, null, ag, params);
@@ -16496,6 +16536,111 @@ function resolveSetOp(
     node: { kind: "arrayFunc", func, args: [rl.node, rr.node] },
     type: { kind: "bool" },
   };
+}
+
+// resolveJsonAccess resolves a jsonb accessor operator (`-> ->> #> #>>`,
+// spec/design/json-sql-functions.md §1). The base must be `jsonb` (a `json` base is the deferred
+// 0A000 follow-on — json.md §4; any other base is 42883). For `->`/`->>` the argument is a key
+// (`text`) or an array index (`integer`); for `#>`/`#>>` it is a `text[]` path (a bare string
+// literal `'{a,b}'` adapts via array_in). The result is `jsonb` (`-> #>`) or `text` (`->> #>>`); a
+// missing access yields SQL NULL at eval.
+function resolveJsonAccess(
+  scope: Scope,
+  op: BinaryOp,
+  lhs: Expr,
+  rhs: Expr,
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  const rbase = resolve(scope, lhs, null, ag, params);
+  // The base must be jsonb. json is a documented deferred follow-on (its operators preserve the
+  // verbatim sub-text — json.md §4); any other base type has no such operator (42883).
+  switch (rbase.type.kind) {
+    case "jsonb":
+      break;
+    case "json":
+      throw engineError(
+        "feature_not_supported",
+        "json accessor operators are not supported yet; cast to jsonb",
+      );
+    case "null":
+      break; // a NULL base propagates (the access is NULL)
+    default:
+      throw engineError(
+        "undefined_function",
+        `operator does not exist: ${rtName(rbase.type)} ${jsonOpSymbol(op)} ...`,
+      );
+  }
+  let jop: JsonGetOp;
+  let result: ResolvedType;
+  let path: boolean;
+  switch (op) {
+    case "jsonGet":
+      jop = "arrow";
+      result = { kind: "jsonb" };
+      path = false;
+      break;
+    case "jsonGetText":
+      jop = "arrowText";
+      result = { kind: "text" };
+      path = false;
+      break;
+    case "jsonGetPath":
+      jop = "hashArrow";
+      result = { kind: "jsonb" };
+      path = true;
+      break;
+    default: // "jsonGetPathText"
+      jop = "hashArrowText";
+      result = { kind: "text" };
+      path = true;
+      break;
+  }
+  let rarg: RExpr;
+  if (path) {
+    // `#>` / `#>>` take a text[] path. A bare string literal `'{a,b}'` adapts via array_in;
+    // otherwise the resolved argument must be a text[] (else 42883).
+    if (rhs.kind === "literal" && rhs.literal.kind === "text") {
+      const val = coerceStringToArray(rhs.literal.text, { kind: "scalar", scalar: "text" });
+      rarg = valueToRExpr(val);
+    } else {
+      const ra = resolve(scope, rhs, null, ag, params);
+      const argTy = ra.type;
+      if (!(argTy.kind === "array" && argTy.elem.kind === "text") && argTy.kind !== "null") {
+        throw engineError("undefined_function", "the #> / #>> path argument must be text[]");
+      }
+      rarg = ra.node;
+    }
+  } else {
+    // `->` / `->>` take a key (text) or an array index (integer). A string literal stays text;
+    // an integer literal stays integer; no adaptation is needed.
+    const ra = resolve(scope, rhs, null, ag, params);
+    const argTy = ra.type;
+    if (argTy.kind !== "text" && argTy.kind !== "int" && argTy.kind !== "null") {
+      throw engineError(
+        "undefined_function",
+        `operator does not exist: jsonb ${jsonOpSymbol(op)} ${rtName(argTy)}`,
+      );
+    }
+    rarg = ra.node;
+  }
+  return { node: { kind: "jsonGet", op: jop, base: rbase.node, arg: rarg }, type: result };
+}
+
+// jsonOpSymbol is the display symbol for a jsonb accessor operator, for error messages.
+function jsonOpSymbol(op: BinaryOp): string {
+  switch (op) {
+    case "jsonGet":
+      return "->";
+    case "jsonGetText":
+      return "->>";
+    case "jsonGetPath":
+      return "#>";
+    case "jsonGetPathText":
+      return "#>>";
+    default:
+      return "?";
+  }
 }
 
 // rangeOpFor maps a containment/positional BinaryOp to its range-against-range kernel (RangeOpName).
@@ -16771,6 +16916,14 @@ function binaryOpSymbol(op: BinaryOp): string {
       return "&>";
     case "adjacent":
       return "-|-";
+    case "jsonGet":
+      return "->";
+    case "jsonGetText":
+      return "->>";
+    case "jsonGetPath":
+      return "#>";
+    case "jsonGetPathText":
+      return "#>>";
   }
 }
 
@@ -19243,6 +19396,51 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const a = evalExpr(e.lhs, row, env, m);
       const b = evalExpr(e.rhs, row, env, m);
       return boolOr(a, b);
+    }
+    case "jsonGet": {
+      // A jsonb accessor operator (`-> ->> #> #>>`, spec/design/json-sql-functions.md §1). One
+      // operator_eval; the operands charge their own. The operators are STRICT — a NULL base or
+      // argument propagates to SQL NULL.
+      m.charge(COSTS.operatorEval);
+      const bv = evalExpr(e.base, row, env, m);
+      const av = evalExpr(e.arg, row, env, m);
+      m.guard();
+      if (bv.kind === "null" || av.kind === "null") return nullValue();
+      if (bv.kind !== "jsonb")
+        throw new Error("resolver guarantees a jsonb base for an accessor operator");
+      const node = bv.node;
+      // Locate the accessed node: a key (text) / index (int) for `-> ->>`, or a text[] path for
+      // `#> #>>`. A NULL element inside the path array misses (PG).
+      let accessed: JsonNode | null;
+      if (e.op === "arrow" || e.op === "arrowText") {
+        if (av.kind === "text") {
+          accessed = getField(node, av.text);
+        } else if (av.kind === "int") {
+          accessed = getIndex(node, av.int);
+        } else {
+          throw new Error("resolver guarantees a text/int arg for -> / ->>");
+        }
+      } else {
+        // `#> #>>` — a text[] path.
+        if (av.kind !== "array") throw new Error("resolver guarantees a text[] arg for #> / #>>");
+        const steps: string[] = [];
+        let nullStep = false;
+        for (const el of av.elements) {
+          if (el.kind === "null") {
+            nullStep = true;
+            break;
+          }
+          if (el.kind !== "text") throw new Error("a text[] path has text/NULL elements");
+          steps.push(el.text);
+        }
+        accessed = nullStep ? null : getPath(node, steps);
+      }
+      // `-> #>` return the node as jsonb; `->> #>>` render it as text (a JSON null or a missing
+      // access → SQL NULL).
+      if (accessed === null) return nullValue();
+      if (e.op === "arrow" || e.op === "hashArrow") return jsonbValue(accessed);
+      const t = nodeToText(accessed);
+      return t === null ? nullValue() : textValue(t);
     }
     case "isNull": {
       m.charge(COSTS.operatorEval);

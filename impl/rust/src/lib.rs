@@ -596,6 +596,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // The JSON cast matrix (J3) — runtime json↔jsonb, json/jsonb→text, text→json/jsonb
     // (spec/design/json.md §6.1).
     "types.json_casts",
+    // jsonb accessor operators (J4) — `->` `->>` `#>` `#>>` (json-sql-functions.md §1).
+    "func.jsonb_access",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

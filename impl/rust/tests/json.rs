@@ -93,6 +93,20 @@ fn invalid_json_cast_source_is_42804() {
     assert_eq!(err(&mut db, "SELECT true::jsonb"), "42804");
 }
 
+/// The `json` overloads of the accessor operators (`-> ->> #> #>>`) are a deferred `0A000`
+/// follow-on — they would have to preserve the verbatim sub-text (json.md §4), unlike the jsonb
+/// operators that work over the canonical node tree. PostgreSQL supports them, so this is a
+/// documented divergence (the jsonb operators are oracle-clean in suites/json/json_access.test).
+#[test]
+fn json_accessor_operators_are_deferred() {
+    let mut db = Database::new();
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)");
+    run(&mut db, "INSERT INTO t VALUES (1, '{\"a\":1}')");
+    assert_eq!(err(&mut db, "SELECT j -> 'a' FROM t"), "0A000");
+    assert_eq!(err(&mut db, "SELECT j ->> 'a' FROM t"), "0A000");
+    assert_eq!(err(&mut db, "SELECT j #> '{a}' FROM t"), "0A000");
+}
+
 /// A large `jsonb` document (a long string node well past `RECORD_MAX`) spills onto an overflow
 /// chain and round-trips through a whole-image serialize + reload — exercising `is_spillable`,
 /// `value_payload`, and `value_from_payload` for the jsonb body (the tree decoded from a fresh

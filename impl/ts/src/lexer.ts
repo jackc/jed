@@ -94,6 +94,15 @@ export function lex(sql: string): Token[] {
       if (i + 2 < n && sql[i + 1] === "|" && sql[i + 2] === "-") {
         tokens.push({ kind: "adjacent" });
         i += 3;
+      } else if (i + 2 < n && sql[i + 1] === ">" && sql[i + 2] === ">") {
+        // `->>` is the jsonb accessor-as-text operator (json-sql-functions.md §1), scanned
+        // greedily BEFORE `->` so it is never `-> >`.
+        tokens.push({ kind: "arrowText" });
+        i += 3;
+      } else if (i + 1 < n && sql[i + 1] === ">") {
+        // `->` is the jsonb accessor operator (json-sql-functions.md §1).
+        tokens.push({ kind: "arrow" });
+        i += 2;
       } else if (i + 1 < n && sql[i + 1] === "-") {
         // `--` starts a line comment running to the end of the line; comments are
         // whitespace (grammar.md §33). Two hyphens ALWAYS start a comment outside a
@@ -219,6 +228,19 @@ export function lex(sql: string): Token[] {
         i += 2;
       } else {
         throw engineError("syntax_error", "unexpected character '@'");
+      }
+    } else if (c === "#") {
+      // `#>>` / `#>` are the jsonb get-at-path operators (json-sql-functions.md §1), scanned
+      // greedily (`#>>` before `#>`). `#-` (delete-at-path) is a J6 follow-on. A lone `#` is not
+      // part of jed's surface — 42601.
+      if (i + 2 < n && sql[i + 1] === ">" && sql[i + 2] === ">") {
+        tokens.push({ kind: "hashArrowText" });
+        i += 3;
+      } else if (i + 1 < n && sql[i + 1] === ">") {
+        tokens.push({ kind: "hashArrow" });
+        i += 2;
+      } else {
+        throw engineError("syntax_error", "unexpected character '#'");
       }
     } else if (c === "&") {
       // `&&` is the array overlap operator (grammar.md §40); `&<` (not-extend-right) and `&>`
