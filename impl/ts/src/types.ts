@@ -23,7 +23,9 @@ export type ScalarType =
   | "timestamp"
   | "timestamptz"
   | "interval"
-  | "date";
+  | "date"
+  | "json"
+  | "jsonb";
 
 export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "i16",
@@ -40,6 +42,8 @@ export const ALL_SCALAR_TYPES: readonly ScalarType[] = [
   "timestamptz",
   "interval",
   "date",
+  "json",
+  "jsonb",
 ];
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. precision >= 1;
@@ -96,6 +100,16 @@ export function isInterval(t: ScalarType): boolean {
 // isDate reports whether this is the date (calendar date) type (spec/design/date.md).
 export function isDate(t: ScalarType): boolean {
   return t === "date";
+}
+
+// isJson reports whether this is the verbatim-text json type (spec/design/json.md §4).
+export function isJson(t: ScalarType): boolean {
+  return t === "json";
+}
+
+// isJsonb reports whether this is the canonicalized-binary jsonb type (spec/design/json.md §2).
+export function isJsonb(t: ScalarType): boolean {
+  return t === "jsonb";
 }
 
 // isInteger reports whether this is one of the fixed-width signed integer types.
@@ -178,6 +192,10 @@ export function scalarTypeFromName(name: string): ScalarType | undefined {
       return "interval";
     case "date":
       return "date";
+    case "json":
+      return "json";
+    case "jsonb":
+      return "jsonb";
     default:
       return undefined;
   }
@@ -230,6 +248,12 @@ export function widthBytes(t: ScalarType): number {
     // slice, like timestamp; spec/design/date.md).
     case "date":
       return 4;
+    // json/jsonb are variable-width / non-key (spec/design/json.md): they carry their own length
+    // (verbatim text / tagged-node body), like text/bytea, and throw here.
+    case "json":
+      throw new Error("json is variable-width; widthBytes is integer-only");
+    case "jsonb":
+      throw new Error("jsonb is variable-width; widthBytes is integer-only");
   }
 }
 
@@ -239,7 +263,14 @@ export function widthBytes(t: ScalarType): number {
 // widthBytes (the index tail-slot skip, executor.ts) is sound only when this returns true, so the
 // index-bound pushdown gates on it (a variable-width tail column ⇒ no pushdown, full scan instead).
 export function isFixedWidth(t: ScalarType): boolean {
-  return t !== "text" && t !== "decimal" && t !== "bytea" && t !== "interval";
+  return (
+    t !== "text" &&
+    t !== "decimal" &&
+    t !== "bytea" &&
+    t !== "interval" &&
+    t !== "json" &&
+    t !== "jsonb"
+  );
 }
 
 // minOf is the inclusive minimum value (integer-only).
@@ -271,6 +302,10 @@ export function minOf(t: ScalarType): bigint {
       throw new Error("interval has no integer range");
     case "date":
       throw new Error("date has no integer range");
+    case "json":
+      throw new Error("json has no integer range");
+    case "jsonb":
+      throw new Error("jsonb has no integer range");
   }
 }
 
@@ -303,6 +338,10 @@ export function maxOf(t: ScalarType): bigint {
       throw new Error("interval has no integer range");
     case "date":
       throw new Error("date has no integer range");
+    case "json":
+      throw new Error("json has no integer range");
+    case "jsonb":
+      throw new Error("jsonb has no integer range");
   }
 }
 
@@ -336,6 +375,10 @@ export function rank(t: ScalarType): number {
       throw new Error("interval has no promotion rank");
     case "date":
       throw new Error("date has no promotion rank");
+    case "json":
+      throw new Error("json has no promotion rank");
+    case "jsonb":
+      throw new Error("jsonb has no promotion rank");
   }
 }
 
@@ -510,4 +553,10 @@ export function typeIsInterval(t: Type): boolean {
 }
 export function typeIsRange(t: Type): boolean {
   return t.kind === "range";
+}
+export function typeIsJson(t: Type): boolean {
+  return t.kind === "scalar" && isJson(t.scalar);
+}
+export function typeIsJsonb(t: Type): boolean {
+  return t.kind === "scalar" && isJsonb(t.scalar);
 }

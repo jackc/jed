@@ -53,6 +53,14 @@ const (
 	// (spec/design/date.md). Reuses timestamp's calendar core; stored as a 4-byte order-preserving
 	// i32 body (type code 16). A key this slice (the i32 key encoding is exercised).
 	Date
+	// Json is JSON text stored VERBATIM (spec/design/json.md §4): validated well-formed, the original
+	// bytes preserved (whitespace, key order, duplicate keys). On-disk type code 18. Variable-width,
+	// NOT comparable (PG ships no btree/hash opclass — §5), never a key.
+	Json
+	// Jsonb is canonicalized binary JSON (spec/design/json.md §2): parsed to a tagged-node tree
+	// (numbers exact Decimal, object keys deduped last-wins + sorted), stored compactly. On-disk type
+	// code 19. Variable-width; comparable by PG's total btree order (§5); not a key this slice.
+	Jsonb
 )
 
 // DecimalTypmod is a decimal column's numeric(precision, scale) type modifier. Precision >= 1;
@@ -94,6 +102,10 @@ func (t ScalarType) CanonicalName() string {
 		return "f64"
 	case Date:
 		return "date"
+	case Json:
+		return "json"
+	case Jsonb:
+		return "jsonb"
 	default:
 		return "?"
 	}
@@ -144,6 +156,10 @@ func ScalarTypeFromName(name string) (ScalarType, bool) {
 		return Float64, true
 	case "date":
 		return Date, true
+	case "json":
+		return Json, true
+	case "jsonb":
+		return Jsonb, true
 	default:
 		return 0, false
 	}
@@ -175,6 +191,12 @@ func (t ScalarType) IsInterval() bool { return t == IntervalType }
 
 // IsDate reports whether this is the date (calendar date) type.
 func (t ScalarType) IsDate() bool { return t == Date }
+
+// IsJson reports whether this is the verbatim-text json type.
+func (t ScalarType) IsJson() bool { return t == Json }
+
+// IsJsonb reports whether this is the canonicalized-binary jsonb type.
+func (t ScalarType) IsJsonb() bool { return t == Jsonb }
 
 // IsFloat32 reports whether this is the binary32 float type (real).
 func (t ScalarType) IsFloat32() bool { return t == Float32 }
@@ -233,7 +255,7 @@ func (t ScalarType) WidthBytes() int {
 // over a variable-width tail it would advance by WidthBytes()==0 and mis-parse the row's key.
 func (t ScalarType) IsFixedWidth() bool {
 	switch t {
-	case Text, DecimalType, Bytea, IntervalType:
+	case Text, DecimalType, Bytea, IntervalType, Json, Jsonb:
 		return false
 	default:
 		return true
@@ -291,7 +313,7 @@ func (t ScalarType) InRange(v int64) bool {
 
 // AllScalarTypes returns every type, for exhaustive iteration in tests.
 func AllScalarTypes() []ScalarType {
-	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType, Float32, Float64, Date}
+	return []ScalarType{Int16, Int32, Int64, Text, Bool, DecimalType, Bytea, Uuid, Timestamp, Timestamptz, IntervalType, Float32, Float64, Date, Json, Jsonb}
 }
 
 // Type is a column / value type: either a built-in ScalarType or a reference to a user-defined
@@ -461,3 +483,9 @@ func (t Type) IsDate() bool { return t.isScalar() && t.Scalar.IsDate() }
 
 // IsInterval reports whether this is the scalar interval type (false for a composite/array).
 func (t Type) IsInterval() bool { return t.isScalar() && t.Scalar.IsInterval() }
+
+// IsJson reports whether this is the scalar json type (false for a composite/array).
+func (t Type) IsJson() bool { return t.isScalar() && t.Scalar.IsJson() }
+
+// IsJsonb reports whether this is the scalar jsonb type (false for a composite/array).
+func (t Type) IsJsonb() bool { return t.isScalar() && t.Scalar.IsJsonb() }

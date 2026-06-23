@@ -12,6 +12,7 @@
 use crate::date;
 use crate::decimal::Decimal;
 use crate::interval::{self, Interval};
+use crate::json::{self, JsonNode};
 use crate::timestamp;
 
 /// A runtime value: SQL NULL, an integer, a boolean, a text string, a decimal, or a byte string.
@@ -85,6 +86,17 @@ pub enum Value {
     /// form is structural — `PartialEq`/`Eq`/`Hash` (DISTINCT/GROUP BY) and the total-order
     /// `range_cmp` (R3) derive over the bound `Value`s' own canonical `Eq`/`Hash`.
     Range(RangeVal),
+    /// A `json` value — JSON text stored VERBATIM (spec/design/json.md §4): the original UTF-8
+    /// text, preserving whitespace, key order, and duplicate keys. NOT comparable (PG ships no
+    /// btree/hash opclass — §5); `eq3`/`lt3`/`gt3` never reach it (the resolver maps any
+    /// comparison attempt to 42883). Rendered verbatim (`json_out`).
+    Json(String),
+    /// A `jsonb` value — the canonical tagged-node tree ([`JsonNode`], spec/design/json.md §2):
+    /// numbers exact `Decimal`, object keys deduped + sorted. Comparable by PG's total btree
+    /// order (§5); `PartialEq`/`Eq`/`Hash` (DISTINCT/GROUP BY) are the structural derive, which
+    /// is consistent with `JsonNode::cmp == Equal` (the canonical form makes structural equality
+    /// the value equality). Rendered canonically (`jsonb_out`).
+    Jsonb(JsonNode),
     /// An **unfetched** large-value reference (spec/design/large-values.md §14): a stored
     /// external/compressed value loaded as its on-disk pointer instead of being materialized.
     /// Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -297,6 +309,13 @@ impl PartialEq for Value {
             // discrete ranges are stored canonical (`[)`), so `[1,5)` == `[1,4]` over i32range
             // (both canonicalize to `[1,5)`). The bound `Value`s use their own canonical equality.
             (Value::Range(a), Value::Range(b)) => a == b,
+            // jsonb equality is structural over the canonical tree (consistent with `JsonNode::cmp
+            // == Equal` — the canonical form makes structural equality the value equality, §5).
+            (Value::Jsonb(a), Value::Jsonb(b)) => a == b,
+            // json is not comparable (§5); a `json = json` never resolves (42883). Provide a
+            // value-level equality (verbatim text) only so DISTINCT/Hash containers don't panic —
+            // it is never reached through SQL.
+            (Value::Json(a), Value::Json(b)) => a == b,
             (Value::Unfetched(a), Value::Unfetched(b)) => a == b,
             _ => false,
         }
@@ -338,6 +357,9 @@ impl std::hash::Hash for Value {
             // Hash the canonical form (consistent with the structural `PartialEq`); the discriminant
             // tag above separates a range from a scalar bound value.
             Value::Range(r) => r.hash(state),
+            // Hash the canonical tree / verbatim text (consistent with the structural `PartialEq`).
+            Value::Jsonb(n) => n.hash(state),
+            Value::Json(s) => s.hash(state),
             Value::Unfetched(u) => u.hash(state),
         }
     }
@@ -442,6 +464,10 @@ impl Value {
             // inclusivity, an omitted bound for infinite, and per-bound quoting where the element
             // text has special chars (e.g. a tsrange bound's space — spec/design/ranges.md §5).
             Value::Range(r) => crate::range::range_out(r),
+            // json renders its stored bytes verbatim (`json_out` — the identity, §4).
+            Value::Json(s) => s.clone(),
+            // jsonb renders the canonical PG text (`jsonb_out` — §6.2).
+            Value::Jsonb(n) => json::jsonb_out(n),
             Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
         }
     }
@@ -513,6 +539,9 @@ impl Value {
             // always definite (spec/design/ranges.md §6). `range_total_cmp == Equal` agrees with
             // this structural `==` (the stored form is canonical).
             (Value::Range(a), Value::Range(b)) => bool3(a == b),
+            // jsonb `=` is structural over the canonical tree — always definite (PG btree, not
+            // 3VL; no SQL NULLs inside a document, §5). Consistent with `JsonNode::cmp == Equal`.
+            (Value::Jsonb(a), Value::Jsonb(b)) => bool3(a == b),
             // Poisoned (large-values.md §14): an unfetched value must never be compared —
             // falling through to UNKNOWN here would silently read it as NULL.
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
@@ -560,6 +589,9 @@ impl Value {
             (Value::Range(a), Value::Range(b)) => {
                 bool3(crate::range::range_total_cmp(a, b) == std::cmp::Ordering::Less)
             }
+            // jsonb `<` uses PG's total btree order (spec/design/json.md §5): type rank, then
+            // per-kind ordering (containers by count first). Always definite, never UNKNOWN.
+            (Value::Jsonb(a), Value::Jsonb(b)) => bool3(a.cmp(b) == std::cmp::Ordering::Less),
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
                 panic!("BUG: unfetched large value escaped the storage layer")
             }
@@ -598,6 +630,8 @@ impl Value {
             (Value::Range(a), Value::Range(b)) => {
                 bool3(crate::range::range_total_cmp(a, b) == std::cmp::Ordering::Greater)
             }
+            // jsonb `>` — the total-order mirror of `<` (spec/design/json.md §5).
+            (Value::Jsonb(a), Value::Jsonb(b)) => bool3(a.cmp(b) == std::cmp::Ordering::Greater),
             (Value::Unfetched(_), _) | (_, Value::Unfetched(_)) => {
                 panic!("BUG: unfetched large value escaped the storage layer")
             }

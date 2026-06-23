@@ -23,6 +23,7 @@ pub mod executor;
 pub mod file;
 pub mod format;
 pub mod interval;
+pub mod json;
 pub mod lexer;
 pub mod lz4;
 pub mod operators;
@@ -580,6 +581,10 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // (`db.upgrade_collations`) on the running DB — clears a version-skew so a corpus test can drive
     // skew→migrate→writable end to end (spec/design/collation.md §12).
     "harness.upgrade_collations",
+    // json/jsonb literal-only surface (J0, spec/design/json.md §12): json_in/out + jsonb_in/out +
+    // the '…'::json / '…'::jsonb literal cast + jsonb_out canonicalization. No storable column yet
+    // (a json/jsonb column is 0A000 until J1).
+    "types.jsonb_literal",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

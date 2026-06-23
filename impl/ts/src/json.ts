@@ -1,0 +1,614 @@
+// JSON document types (spec/design/json.md): `json` (validated, stored verbatim as text) and
+// `jsonb` (parsed, canonicalized, stored as a compact tagged-node tree). Numbers are exact
+// `Decimal` (PG `numeric`, never binary float — CLAUDE.md §8); strings are UTF-8 `text`; `jsonb`
+// objects keep their keys in a canonical sorted order (length-then-bytewise) with duplicates
+// resolved last-wins, so the in-memory tree and the on-disk bytes are a pure function of the value
+// (no hashmap-iteration-order leak — §2.3).
+//
+// Hand-written per CLAUDE.md §5 (a recursive tree codec/comparator/parser is irreducibly
+// per-language), cross-checked across cores by the conformance corpus + golden fixtures. The
+// TS-core hazards (CLAUDE.md §2): JSON numbers become the exact `Decimal` via decimalFromParts /
+// Decimal.fromDigitsScale — NEVER parseFloat/Number (JS numbers are f64); object-key sort and string
+// comparison are over UTF-8 BYTES (a JS string is UTF-16, so we compare its TextEncoder bytes, the
+// same C-collation byte order text uses), and the parser iterates over UTF-8 bytes.
+
+import { Decimal, EXP_LIMIT, decimalFromParts } from "./decimal.ts";
+import { engineError } from "./errors.ts";
+
+// JsonNode is a `jsonb` node — the in-memory canonical tree (spec/design/json.md §2). Object members
+// are kept in canonical key order (shorter key first, ties bytewise) with duplicates removed
+// (last-wins), so the structural form IS the correct value-level equality (consistent with
+// jsonNodeCmp == 0 — §5). JSON `null` is the concrete `null` node, wholly distinct from a SQL NULL
+// `jsonb` value. Modeled as a discriminated union (keyed on `kind`, like Value); free-function
+// helpers below, never methods (the boring/explicit style — CLAUDE.md §10).
+export type JsonNode =
+  | { kind: "null" }
+  | { kind: "bool"; value: boolean }
+  // A JSON number, held EXACTLY as a Decimal (PG numeric); no binary float ever appears.
+  | { kind: "number"; dec: Decimal }
+  | { kind: "string"; value: string }
+  | { kind: "array"; elements: JsonNode[] }
+  // An object's members. For a `jsonb` node these are in canonical key order with unique keys (the
+  // canonicalizer's invariant); a `json`-on-demand parse (§4) keeps input order + dupes.
+  | { kind: "object"; members: JsonMember[] };
+
+// JsonMember is one object member: a key string and its value node.
+export interface JsonMember {
+  key: string;
+  value: JsonNode;
+}
+
+const UTF8 = new TextEncoder();
+
+// utf8Bytes is the UTF-8 byte encoding of a string — the unit the canonical key sort and the jsonb
+// string comparison operate over (NOT JS UTF-16 code units; CLAUDE.md §2 string hazard).
+function utf8Bytes(s: string): Uint8Array {
+  return UTF8.encode(s);
+}
+
+// byteCmp compares two byte arrays lexicographically (unsigned), <0/0/>0.
+function byteCmp(a: Uint8Array, b: Uint8Array): number {
+  const n = a.length < b.length ? a.length : b.length;
+  for (let i = 0; i < n; i++) {
+    if (a[i] !== b[i]) return a[i]! < b[i]! ? -1 : 1;
+  }
+  return a.length === b.length ? 0 : a.length < b.length ? -1 : 1;
+}
+
+// typeRank is the PG jsonb type-rank discriminator (spec/design/json.md §5): the outermost ordering
+// key. Object > Array > Boolean > Number > String > Null.
+function typeRank(n: JsonNode): number {
+  switch (n.kind) {
+    case "null":
+      return 0;
+    case "string":
+      return 1;
+    case "number":
+      return 2;
+    case "bool":
+      return 3;
+    case "array":
+      return 4;
+    case "object":
+      return 5;
+  }
+}
+
+// jsonNodeCmp is the PG jsonb total btree order (spec/design/json.md §5). A definite ordering (no
+// SQL NULLs inside a document), driving both `<` and `ORDER BY` from one comparator so they agree by
+// construction. Type rank first; within a type: booleans false<true, numbers by Decimal value,
+// strings by collation-`C` UTF-8 byte order, arrays/objects by element/member COUNT first (PG
+// compares container length before contents) then element-wise. Returns <0, 0, >0.
+export function jsonNodeCmp(a: JsonNode, b: JsonNode): number {
+  const ra = typeRank(a);
+  const rb = typeRank(b);
+  if (ra !== rb) return ra < rb ? -1 : 1;
+  switch (a.kind) {
+    case "null":
+      return 0;
+    case "bool": {
+      const bb = b as { kind: "bool"; value: boolean };
+      // false < true.
+      return a.value === bb.value ? 0 : a.value ? 1 : -1;
+    }
+    case "number":
+      return a.dec.cmpValue((b as { kind: "number"; dec: Decimal }).dec);
+    case "string":
+      return byteCmp(utf8Bytes(a.value), utf8Bytes((b as { kind: "string"; value: string }).value));
+    case "array": {
+      const be = (b as { kind: "array"; elements: JsonNode[] }).elements;
+      if (a.elements.length !== be.length) return a.elements.length < be.length ? -1 : 1;
+      for (let i = 0; i < a.elements.length; i++) {
+        const c = jsonNodeCmp(a.elements[i]!, be[i]!);
+        if (c !== 0) return c;
+      }
+      return 0;
+    }
+    case "object": {
+      const bm = (b as { kind: "object"; members: JsonMember[] }).members;
+      if (a.members.length !== bm.length) return a.members.length < bm.length ? -1 : 1;
+      // Members are in canonical key order in both; compare keys then values pairwise.
+      for (let i = 0; i < a.members.length; i++) {
+        const kc = keyCmp(a.members[i]!.key, bm[i]!.key);
+        if (kc !== 0) return kc;
+        const vc = jsonNodeCmp(a.members[i]!.value, bm[i]!.value);
+        if (vc !== 0) return vc;
+      }
+      return 0;
+    }
+  }
+}
+
+// keyCmp is the canonical object-key order (spec/design/json.md §2.3): shorter key first, ties broken
+// bytewise (over UTF-8 BYTES) — PostgreSQL's jsonb key order. The canonicalizer sorts by this and the
+// comparator compares keys by this.
+export function keyCmp(a: string, b: string): number {
+  const ba = utf8Bytes(a);
+  const bb = utf8Bytes(b);
+  if (ba.length !== bb.length) return ba.length < bb.length ? -1 : 1;
+  return byteCmp(ba, bb);
+}
+
+// ---------------------------------------------------------------------------------------------
+// Parsing (RFC 8259). `jsonbIn` canonicalizes; `validateJson` validates and the caller stores
+// verbatim.
+// ---------------------------------------------------------------------------------------------
+
+function malformed(detail: string): Error {
+  return engineError(
+    "invalid_text_representation",
+    "invalid input syntax for type json: " + detail,
+  );
+}
+
+// jsonbIn parses + canonicalizes JSON text into a jsonb node tree (`jsonb_in` — spec/design/json.md
+// §6.2): numbers → Decimal, object keys deduped last-wins then sorted length-then-bytewise.
+// Malformed input → 22P02.
+export function jsonbIn(input: string): JsonNode {
+  return new JsonParser(UTF8.encode(input), true).parseDocument();
+}
+
+// validateJson validates JSON text well-formedness (`json_in` — spec/design/json.md §4); the caller
+// stores the original bytes verbatim. Malformed input → 22P02.
+export function validateJson(input: string): void {
+  new JsonParser(UTF8.encode(input), false).parseDocument();
+}
+
+// parsePreservingJson parses JSON text into a node tree WITHOUT canonicalizing (object key order +
+// duplicates preserved) — the on-demand structural parse a `json` operator needs
+// (spec/design/json.md §4).
+export function parsePreservingJson(input: string): JsonNode {
+  return new JsonParser(UTF8.encode(input), false).parseDocument();
+}
+
+// utf8Len is the UTF-8 lead-byte length (1..4). A continuation/invalid lead byte returns 1 so the
+// copy path's decode check rejects it.
+function utf8Len(lead: number): number {
+  if (lead < 0x80) return 1;
+  if (lead >>> 5 === 0b110) return 2;
+  if (lead >>> 4 === 0b1110) return 3;
+  if (lead >>> 3 === 0b11110) return 4;
+  return 1;
+}
+
+const ASCII_DECODER = new TextDecoder("utf-8", { fatal: true });
+
+class JsonParser {
+  private buf: Uint8Array;
+  private pos = 0;
+  // canonicalize: when true (jsonb), objects dedup last-wins and sort keys; when false (json
+  // validation / on-demand parse), members are kept in input order with duplicates.
+  private canonicalize: boolean;
+
+  constructor(buf: Uint8Array, canonicalize: boolean) {
+    this.buf = buf;
+    this.canonicalize = canonicalize;
+  }
+
+  // parseDocument: a full JSON document — one value, surrounded by optional whitespace, nothing
+  // trailing.
+  parseDocument(): JsonNode {
+    this.skipWs();
+    const node = this.parseValue();
+    this.skipWs();
+    if (this.pos !== this.buf.length) {
+      throw malformed("trailing characters after JSON value");
+    }
+    return node;
+  }
+
+  private skipWs(): void {
+    while (this.pos < this.buf.length) {
+      const c = this.buf[this.pos]!;
+      if (c === 0x20 || c === 0x09 || c === 0x0a || c === 0x0d) this.pos++;
+      else break;
+    }
+  }
+
+  // peek returns the current byte, or -1 at end of input.
+  private peek(): number {
+    return this.pos < this.buf.length ? this.buf[this.pos]! : -1;
+  }
+
+  private parseValue(): JsonNode {
+    const c = this.peek();
+    if (c === -1) throw malformed("unexpected end of input");
+    if (c === 0x7b /* { */) return this.parseObject();
+    if (c === 0x5b /* [ */) return this.parseArray();
+    if (c === 0x22 /* " */) return { kind: "string", value: this.parseString() };
+    if (c === 0x74 /* t */) {
+      this.expectKeyword("true");
+      return { kind: "bool", value: true };
+    }
+    if (c === 0x66 /* f */) {
+      this.expectKeyword("false");
+      return { kind: "bool", value: false };
+    }
+    if (c === 0x6e /* n */) {
+      this.expectKeyword("null");
+      return { kind: "null" };
+    }
+    if (c === 0x2d /* - */ || (c >= 0x30 && c <= 0x39)) return this.parseNumber();
+    throw malformed("unexpected character '" + String.fromCharCode(c) + "'");
+  }
+
+  private expectKeyword(kw: string): void {
+    const end = this.pos + kw.length;
+    if (end <= this.buf.length) {
+      let ok = true;
+      for (let i = 0; i < kw.length; i++) {
+        if (this.buf[this.pos + i] !== kw.charCodeAt(i)) {
+          ok = false;
+          break;
+        }
+      }
+      if (ok) {
+        this.pos = end;
+        return;
+      }
+    }
+    throw malformed("expected '" + kw + "'");
+  }
+
+  private parseObject(): JsonNode {
+    this.pos++; // consume '{'
+    let members: JsonMember[] = [];
+    this.skipWs();
+    if (this.peek() === 0x7d /* } */) {
+      this.pos++;
+      return { kind: "object", members };
+    }
+    for (;;) {
+      this.skipWs();
+      if (this.peek() !== 0x22 /* " */) throw malformed("expected string key in object");
+      const key = this.parseString();
+      this.skipWs();
+      if (this.peek() !== 0x3a /* : */) throw malformed("expected ':' after object key");
+      this.pos++;
+      this.skipWs();
+      const value = this.parseValue();
+      members.push({ key, value });
+      this.skipWs();
+      const c = this.peek();
+      if (c === 0x2c /* , */) {
+        this.pos++;
+      } else if (c === 0x7d /* } */) {
+        this.pos++;
+        break;
+      } else {
+        throw malformed("expected ',' or '}' in object");
+      }
+    }
+    if (this.canonicalize) members = canonicalizeObject(members);
+    return { kind: "object", members };
+  }
+
+  private parseArray(): JsonNode {
+    this.pos++; // consume '['
+    const elements: JsonNode[] = [];
+    this.skipWs();
+    if (this.peek() === 0x5d /* ] */) {
+      this.pos++;
+      return { kind: "array", elements };
+    }
+    for (;;) {
+      this.skipWs();
+      elements.push(this.parseValue());
+      this.skipWs();
+      const c = this.peek();
+      if (c === 0x2c /* , */) {
+        this.pos++;
+      } else if (c === 0x5d /* ] */) {
+        this.pos++;
+        break;
+      } else {
+        throw malformed("expected ',' or ']' in array");
+      }
+    }
+    return { kind: "array", elements };
+  }
+
+  // parseString parses a JSON string token (the leading `"` is at this.pos), decoding escapes to the
+  // actual UTF-8 content. RFC 8259: `\" \\ \/ \b \f \n \r \t` and `\uXXXX` (with surrogate pairs).
+  // Unescaped control characters (< 0x20) are rejected.
+  private parseString(): string {
+    this.pos++; // consume opening '"'
+    let out = "";
+    for (;;) {
+      const c = this.peek();
+      if (c === -1) throw malformed("unterminated string");
+      if (c === 0x22 /* " */) {
+        this.pos++;
+        return out;
+      }
+      if (c === 0x5c /* \ */) {
+        this.pos++;
+        const e = this.peek();
+        if (e === -1) throw malformed("unterminated escape");
+        switch (e) {
+          case 0x22: // "
+            out += '"';
+            break;
+          case 0x5c: // backslash
+            out += "\\";
+            break;
+          case 0x2f: // /
+            out += "/";
+            break;
+          case 0x62: // b
+            out += "\b";
+            break;
+          case 0x66: // f
+            out += "\f";
+            break;
+          case 0x6e: // n
+            out += "\n";
+            break;
+          case 0x72: // r
+            out += "\r";
+            break;
+          case 0x74: // t
+            out += "\t";
+            break;
+          case 0x75: {
+            // u
+            this.pos++;
+            const cp = this.parseHex4();
+            // Surrogate pair handling (UTF-16 escapes).
+            if (cp >= 0xd800 && cp <= 0xdbff) {
+              // High surrogate: must be followed by \uDC00..\uDFFF.
+              if (this.peek() !== 0x5c) throw malformed("unpaired high surrogate in \\u escape");
+              this.pos++;
+              if (this.peek() !== 0x75) throw malformed("unpaired high surrogate in \\u escape");
+              this.pos++;
+              const lo = this.parseHex4();
+              if (lo < 0xdc00 || lo > 0xdfff) {
+                throw malformed("invalid low surrogate in \\u escape");
+              }
+              const combined = 0x10000 + (((cp - 0xd800) << 10) | (lo - 0xdc00));
+              out += String.fromCodePoint(combined);
+            } else if (cp >= 0xdc00 && cp <= 0xdfff) {
+              throw malformed("unpaired low surrogate in \\u escape");
+            } else {
+              out += String.fromCodePoint(cp);
+            }
+            continue; // parseHex4 already advanced pos past the 4 digits
+          }
+          default:
+            throw malformed("invalid escape sequence");
+        }
+        this.pos++;
+      } else if (c <= 0x1f) {
+        throw malformed("control character in string must be escaped");
+      } else {
+        // Copy one UTF-8 code point verbatim. Determine its byte length, decode-check it (fatal), and
+        // append the decoded text.
+        const len = utf8Len(c);
+        const end = this.pos + len;
+        if (end > this.buf.length) throw malformed("truncated UTF-8 sequence in string");
+        try {
+          out += ASCII_DECODER.decode(this.buf.subarray(this.pos, end));
+        } catch {
+          throw malformed("invalid UTF-8 in string");
+        }
+        this.pos = end;
+      }
+    }
+  }
+
+  // parseHex4 reads exactly four hex digits as a code-unit (the cursor is just past `\u`).
+  private parseHex4(): number {
+    if (this.pos + 4 > this.buf.length) throw malformed("truncated \\u escape");
+    let v = 0;
+    for (let i = 0; i < 4; i++) {
+      const d = this.buf[this.pos + i]!;
+      let nib: number;
+      if (d >= 0x30 && d <= 0x39)
+        nib = d - 0x30; // 0-9
+      else if (d >= 0x61 && d <= 0x66)
+        nib = d - 0x61 + 10; // a-f
+      else if (d >= 0x41 && d <= 0x46)
+        nib = d - 0x41 + 10; // A-F
+      else throw malformed("invalid hex digit in \\u escape");
+      v = (v << 4) | nib;
+    }
+    this.pos += 4;
+    return v;
+  }
+
+  // parseNumber parses a JSON number token (RFC 8259 grammar) into an exact Decimal. No leading zeros
+  // (`01` is malformed), a `.` requires fractional digits, `e`/`E` an exponent. The value is built via
+  // the shared decimal-from-parts path so a jsonb number reads identically to a numeric literal (`1e2`
+  // → `100`, `1.50` keeps scale 2). An out-of-cap magnitude → 22003.
+  private parseNumber(): JsonNode {
+    const start = this.pos;
+    let neg = false;
+    if (this.peek() === 0x2d /* - */) {
+      this.pos++;
+      neg = true;
+    }
+    // Integer part: `0` alone, or a nonzero digit followed by more digits.
+    const c = this.peek();
+    if (c === 0x30 /* 0 */) {
+      this.pos++;
+    } else if (c >= 0x31 && c <= 0x39) {
+      while (this.isDigit(this.peek())) this.pos++;
+    } else {
+      throw malformed("invalid number");
+    }
+    const intEnd = this.pos;
+    const intPart = this.asciiSlice(start + (neg ? 1 : 0), intEnd);
+
+    // Fractional part.
+    let frac = "";
+    if (this.peek() === 0x2e /* . */) {
+      this.pos++;
+      const fs = this.pos;
+      while (this.isDigit(this.peek())) this.pos++;
+      if (this.pos === fs) throw malformed("expected digits after decimal point");
+      frac = this.asciiSlice(fs, this.pos);
+    }
+
+    // Exponent.
+    let exp: number | null = null;
+    const ec = this.peek();
+    if (ec === 0x65 /* e */ || ec === 0x45 /* E */) {
+      this.pos++;
+      let esign = 1;
+      const sc = this.peek();
+      if (sc === 0x2d /* - */) {
+        this.pos++;
+        esign = -1;
+      } else if (sc === 0x2b /* + */) {
+        this.pos++;
+      }
+      const es = this.pos;
+      let mag = 0;
+      while (this.isDigit(this.peek())) {
+        const d = this.buf[this.pos]! - 0x30;
+        // Clamp to the decimal exponent limit while scanning (decimal.ts EXP_LIMIT); an exponent this
+        // large already drives the value past the caps → 22003.
+        mag = Math.min(mag * 10 + d, EXP_LIMIT);
+        this.pos++;
+      }
+      if (this.pos === es) throw malformed("expected digits in exponent");
+      exp = esign * mag;
+    }
+
+    const [digits, scale] = decimalFromParts(intPart, frac, exp);
+    const d = Decimal.fromDigitsScale(neg, digits, scale).checkCap();
+    return { kind: "number", dec: d };
+  }
+
+  private isDigit(c: number): boolean {
+    return c >= 0x30 && c <= 0x39;
+  }
+
+  // asciiSlice returns the ASCII text of buf[from, to) (a number token is pure ASCII).
+  private asciiSlice(from: number, to: number): string {
+    let s = "";
+    for (let i = from; i < to; i++) s += String.fromCharCode(this.buf[i]!);
+    return s;
+  }
+}
+
+// canonicalizeObject canonicalizes object members (spec/design/json.md §2.3): drop duplicate keys
+// keeping the LAST occurrence (PG jsonb last-wins), then sort the survivors length-then-bytewise.
+// Done before sorting so the stored object has unique keys in canonical order — a pure function of
+// input.
+function canonicalizeObject(members: JsonMember[]): JsonMember[] {
+  // Last-wins dedup, preserving the value of the last occurrence (re-sort follows so first-
+  // appearance order is irrelevant).
+  const out: JsonMember[] = [];
+  for (const m of members) {
+    let found = false;
+    for (let i = 0; i < out.length; i++) {
+      if (out[i]!.key === m.key) {
+        out[i]!.value = m.value;
+        found = true;
+        break;
+      }
+    }
+    if (!found) out.push(m);
+  }
+  // Insertion sort by canonical key order (small objects; a stable, dependency-free sort that is
+  // byte-identical across cores).
+  for (let i = 1; i < out.length; i++) {
+    for (let j = i; j > 0 && keyCmp(out[j]!.key, out[j - 1]!.key) < 0; j--) {
+      const tmp = out[j]!;
+      out[j] = out[j - 1]!;
+      out[j - 1] = tmp;
+    }
+  }
+  return out;
+}
+
+// ---------------------------------------------------------------------------------------------
+// Output (`jsonbOut` — the canonical PG render). `json_out` is the stored verbatim text.
+// ---------------------------------------------------------------------------------------------
+
+// jsonbOut renders a jsonb node to the canonical PG text (spec/design/json.md §6.2): one space after
+// each `:` and `,`, keys in canonical order, numbers via the Decimal renderer (scale preserved),
+// strings JSON-escaped, `true`/`false`/`null` lowercase.
+export function jsonbOut(node: JsonNode): string {
+  const parts: string[] = [];
+  writeNode(node, parts);
+  return parts.join("");
+}
+
+function writeNode(node: JsonNode, out: string[]): void {
+  switch (node.kind) {
+    case "null":
+      out.push("null");
+      break;
+    case "bool":
+      out.push(node.value ? "true" : "false");
+      break;
+    case "number":
+      out.push(node.dec.render());
+      break;
+    case "string":
+      writeJsonString(node.value, out);
+      break;
+    case "array":
+      out.push("[");
+      for (let i = 0; i < node.elements.length; i++) {
+        if (i > 0) out.push(", ");
+        writeNode(node.elements[i]!, out);
+      }
+      out.push("]");
+      break;
+    case "object":
+      out.push("{");
+      for (let i = 0; i < node.members.length; i++) {
+        if (i > 0) out.push(", ");
+        writeJsonString(node.members[i]!.key, out);
+        out.push(": ");
+        writeNode(node.members[i]!.value, out);
+      }
+      out.push("}");
+      break;
+  }
+}
+
+// writeJsonString JSON-escapes a string the way PG escape_json does: quote, escape `"` and `\`, the
+// short escapes for `\b \f \n \r \t`, other control chars (< 0x20) as `\u00XX` (lowercase hex); `/`
+// is NOT escaped and non-ASCII is emitted as raw UTF-8. Iterates by code point (the escape decision
+// is per-character) while sorting/comparison stays bytewise.
+export function writeJsonString(s: string, out: string[]): void {
+  out.push('"');
+  for (const ch of s) {
+    switch (ch) {
+      case '"':
+        out.push('\\"');
+        break;
+      case "\\":
+        out.push("\\\\");
+        break;
+      case "\b":
+        out.push("\\b");
+        break;
+      case "\f":
+        out.push("\\f");
+        break;
+      case "\n":
+        out.push("\\n");
+        break;
+      case "\r":
+        out.push("\\r");
+        break;
+      case "\t":
+        out.push("\\t");
+        break;
+      default: {
+        const code = ch.codePointAt(0)!;
+        if (code < 0x20) {
+          out.push("\\u" + code.toString(16).padStart(4, "0"));
+        } else {
+          out.push(ch);
+        }
+      }
+    }
+  }
+  out.push('"');
+}

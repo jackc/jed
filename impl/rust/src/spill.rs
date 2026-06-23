@@ -23,6 +23,7 @@ use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::key_cmp;
 use crate::interval::Interval;
+use crate::json;
 use crate::storage::Row;
 use crate::value::{ArrayVal, RangeVal, Unfetched, Value};
 
@@ -469,6 +470,18 @@ fn write_value<W: Write>(w: &mut W, v: &Value) -> io::Result<()> {
             }
             Ok(())
         }
+        // json — tag 19: the verbatim text. jsonb — tag 20: the canonical text (jsonb_out →
+        // jsonb_in round-trips exactly, since the output is canonical). Internal merge-sort scratch
+        // format only (spec/design/json.md); a json/jsonb column can ride a spilling sort as a
+        // carried (jsonb also a key) column, so it must spill faithfully.
+        Value::Json(s) => {
+            w.write_all(&[19])?;
+            write_bytes(w, s.as_bytes())
+        }
+        Value::Jsonb(n) => {
+            w.write_all(&[20])?;
+            write_bytes(w, json::jsonb_out(n).as_bytes())
+        }
         // An untouched large-value reference rides along to the output unread (spill.md §4); spill
         // it opaquely (the pointer/inline block) so it round-trips, never resolving it.
         Value::Unfetched(Unfetched::External { first_page, len }) => {
@@ -647,6 +660,17 @@ fn read_value<R: Read>(r: &mut R) -> io::Result<Value> {
                     upper_inc: flags & 0x10 != 0,
                 })
             }
+        }
+        19 => Value::Json(
+            String::from_utf8(read_bytes(r)?)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad utf-8 in spill"))?,
+        ),
+        20 => {
+            let text = String::from_utf8(read_bytes(r)?)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad utf-8 in spill"))?;
+            let node = json::jsonb_in(&text)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "bad jsonb in spill"))?;
+            Value::Jsonb(node)
         }
         _ => {
             return Err(io::Error::new(

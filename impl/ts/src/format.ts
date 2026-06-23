@@ -149,6 +149,11 @@ function typeCodeForScalar(ty: ScalarType): number {
       return 13;
     case "date":
       return 16;
+    // 14 (composite) / 15 (array) / 17 (range) are container element-type codes, not scalars.
+    case "json":
+      return 18;
+    case "jsonb":
+      return 19;
   }
 }
 
@@ -183,6 +188,10 @@ function scalarForTypeCode(code: number): ScalarType | undefined {
       return "f32";
     case 16:
       return "date";
+    case 18:
+      return "json";
+    case 19:
+      return "jsonb";
     default:
       return undefined;
   }
@@ -498,6 +507,13 @@ function encodeScalar(ty: ScalarType, v: Value): Uint8Array {
     if (Number.isNaN(v.value)) dv.setUint32(1, 0x7fc00000, false);
     else dv.setFloat32(1, v.value, false); // big-endian
     return out;
+  }
+  if (v.kind === "json" || v.kind === "jsonb") {
+    // json/jsonb columns are not storable until J1 (gated 0A000 at CREATE TABLE in J0), so a
+    // json/jsonb value never reaches the codec this slice; J1 adds the §2/§4 bodies here.
+    throw new Error(
+      "BUG: a json/jsonb value reached the scalar codec (J0 has no json/jsonb columns)",
+    );
   }
   if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");
   return encodeNullable(ty, v.int);

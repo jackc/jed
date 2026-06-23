@@ -151,6 +151,8 @@ import {
   isTimestamptz,
   isInterval,
   isDate,
+  isJson,
+  isJsonb,
   promoteFloat,
   rangeT,
   rank,
@@ -169,6 +171,8 @@ import {
   typeIsDate,
   typeIsInterval,
   typeIsRange,
+  typeIsJson,
+  typeIsJsonb,
   typeIsUuid,
   typeAsScalar,
   typeScalar,
@@ -246,7 +250,10 @@ import {
   timestamptzValue,
   intervalValue,
   dateValue,
+  jsonValue,
+  jsonbValue,
 } from "./value.ts";
+import { type JsonNode, jsonNodeCmp, jsonbIn, jsonbOut, validateJson } from "./json.ts";
 import {
   elementScalar,
   finalizeRange,
@@ -2731,6 +2738,17 @@ export class Database {
         decimal = null;
       } else {
         throw engineError("undefined_object", "type does not exist: " + def.typeName);
+      }
+      // J0: the json/jsonb types exist for literals/casts but a storable COLUMN is deferred to J1
+      // (the format bump + value codec) — spec/design/json.md §12. Mirrors the array S0→S2 and
+      // composite S2→column staging.
+      if (typeIsJson(colType) || typeIsJsonb(colType)) {
+        throw engineError(
+          "feature_not_supported",
+          "a " +
+            typeCanonicalName(colType) +
+            " column is not yet supported (json/jsonb is literal-only this slice)",
+        );
       }
       if (def.primaryKey) {
         // Integers, boolean, and uuid may be a key. uuid is the first non-integer key type (fixed
@@ -9965,6 +9983,10 @@ function valueToRExpr(v: Value): RExpr {
       return { kind: "constDate", value: v.days };
     case "interval":
       return { kind: "constInterval", value: v.iv };
+    case "json":
+      return { kind: "constJson", value: v.text };
+    case "jsonb":
+      return { kind: "constJsonb", value: v.node };
     case "composite":
       // A folded composite constant: fold each field and wrap in a ROW node so eval rebuilds the
       // composite value (spec/design/composite.md).
@@ -10029,6 +10051,14 @@ function distinctValueKey(v: Value): string {
         "," +
         (v.upper === null ? "n" : distinctValueKey(v.upper))
       );
+    case "json":
+      // json keys verbatim under a distinct 'j' tag (json is not SQL-comparable, but a value-level
+      // dedup key keeps a DISTINCT over a json literal collision-free — spec/design/json.md §4).
+      return "j" + v.text.length.toString() + ":" + v.text;
+    case "jsonb":
+      // jsonb keys by its canonical render under a distinct 'J' tag — the canonical form makes the
+      // text a pure function of the value, so jsonNodeCmp-equal values share a key (§5).
+      return "J" + jsonbOut(v.node);
     case "null":
       return "n";
     case "int":
@@ -10109,6 +10139,12 @@ type ResolvedType =
   | { kind: "timestamptz" } // UTC instant; does not compare/cast to timestamp
   | { kind: "date" } // calendar date (i32 days); strict island, no compare/cast to timestamp
   | { kind: "interval" } // a span; compares only with itself, by the canonical span
+  // The json family (verbatim text — spec/design/json.md §4). NOT comparable (PG ships no btree/hash
+  // opclass — §5): a comparison/ORDER BY/DISTINCT on json resolves to 42883.
+  | { kind: "json" }
+  // The jsonb family (canonical binary — spec/design/json.md §2). Comparable with itself by PG's
+  // total btree order (§5).
+  | { kind: "jsonb" }
   // A composite (row) type (spec/design/composite.md §5). `name` is non-null for a named catalog
   // type — rendered in the `# types:` output and the basis for cross-comparability — or null for an
   // anonymous ROW(...) result. `fields` are the resolved (name, type) pairs in declaration order
@@ -10154,6 +10190,12 @@ type RExpr =
   | { kind: "constTimestamptz"; value: bigint }
   | { kind: "constDate"; value: bigint }
   | { kind: "constInterval"; value: Interval }
+  // A json constant — JSON text stored VERBATIM (spec/design/json.md §4), validated well-formed at
+  // resolve.
+  | { kind: "constJson"; value: string }
+  // A jsonb constant — the canonical tagged-node tree (spec/design/json.md §2), parsed + canonicalized
+  // at resolve.
+  | { kind: "constJsonb"; value: JsonNode }
   | { kind: "constNull" }
   // A ROW(...) constructor (spec/design/composite.md §1): evaluate each field and assemble a
   // composite value. Also the folded form of a composite constant (valueToRExpr wraps each field's
@@ -12249,6 +12291,10 @@ function argFamily(t: ResolvedType): string | null {
       return "date";
     case "interval":
       return "interval";
+    case "json":
+      return "json";
+    case "jsonb":
+      return "jsonb";
     case "composite":
       // No catalog function takes a composite this slice; it matches no concrete family (only the
       // wildcard "any" slot, via familyMatches) — spec/design/composite.md.
@@ -12931,6 +12977,10 @@ function elemScalarHint(t: ResolvedType): ScalarType | null {
       return "date";
     case "interval":
       return "interval";
+    case "json":
+      return "json";
+    case "jsonb":
+      return "jsonb";
     default:
       return null;
   }
@@ -13475,6 +13525,8 @@ function resolvedTypeOf(ty: ScalarType): ResolvedType {
   if (isTimestamptz(ty)) return { kind: "timestamptz" };
   if (isDate(ty)) return { kind: "date" };
   if (isInterval(ty)) return { kind: "interval" };
+  if (isJson(ty)) return { kind: "json" };
+  if (isJsonb(ty)) return { kind: "jsonb" };
   return { kind: "int", ty };
 }
 
@@ -13557,6 +13609,11 @@ function assignableTo(t: ResolvedType, colTy: ScalarType): boolean {
     // A range source never assigns to a scalar column (a range column is not storable yet — R2).
     case "range":
       return false;
+    // A json/jsonb source never assigns to a scalar column (a json/jsonb column is not storable yet —
+    // J1; declaring one is 0A000 this slice, so this is unreachable).
+    case "json":
+    case "jsonb":
+      return false;
   }
 }
 
@@ -13593,6 +13650,10 @@ function rtName(t: ResolvedType): string {
       return "date";
     case "interval":
       return "interval";
+    case "json":
+      return "json";
+    case "jsonb":
+      return "jsonb";
     case "composite":
       // A named composite is its type name; an anonymous ROW(...) is `record` (PG).
       return t.name ?? "record";
@@ -14077,6 +14138,10 @@ function typeFromResolved(rt: ResolvedType): Type {
       return scalarT("date");
     case "interval":
       return scalarT("interval");
+    case "json":
+      return scalarT("json");
+    case "jsonb":
+      return scalarT("jsonb");
     case "composite":
       if (rt.name !== null) return compositeT(rt.name);
       throw engineError(
@@ -15360,6 +15425,19 @@ function resolve(
               type: { kind: "interval" },
             };
           }
+          if (ctx !== null && isJson(ctx)) {
+            // A string adapts to a JSON context (validate, store verbatim — spec/design/json.md §4);
+            // malformed → 22P02.
+            validateJson(e.literal.text);
+            return { node: { kind: "constJson", value: e.literal.text }, type: { kind: "json" } };
+          }
+          if (ctx !== null && isJsonb(ctx)) {
+            // A string adapts to a JSONB context (parse + canonicalize — §2); malformed → 22P02.
+            return {
+              node: { kind: "constJsonb", value: jsonbIn(e.literal.text) },
+              type: { kind: "jsonb" },
+            };
+          }
           return {
             node: { kind: "constText", value: e.literal.text },
             type: { kind: "text" },
@@ -15703,6 +15781,12 @@ function resolve(
           "casting to an interval type is not supported yet",
         );
       }
+      // Casting TO json/jsonb on a NON-literal operand (json↔jsonb, text→json[b]) lands in J3
+      // (spec/design/json.md §6); deferred this slice. A string LITERAL target was already handled
+      // above via coerceStringLiteral ('…'::jsonb), so only a non-literal reaches here.
+      if (isJson(target) || isJsonb(target)) {
+        throw engineError("feature_not_supported", "casting a json value is not supported yet");
+      }
       // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
       // `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
       // (spec/design/api.md §5, grammar.md §37). Every other operand resolves with NO literal
@@ -15776,6 +15860,11 @@ function resolve(
       // Casting FROM an array (array→text, element-wise array→array) is deferred (array.md §7/§12).
       if (inner.type.kind === "array") {
         throw engineError("feature_not_supported", "casting an array value is not supported yet");
+      }
+      // Casting FROM json/jsonb (json↔jsonb, json[b]→text) lands in J3 (spec/design/json.md §6);
+      // deferred this slice.
+      if (inner.type.kind === "json" || inner.type.kind === "jsonb") {
+        throw engineError("feature_not_supported", "casting a json value is not supported yet");
       }
       // int→int (range check), int→decimal (widen), decimal→int (explicit, round),
       // decimal→decimal (re-scale), the float casts (int↔float, decimal↔float, float↔float — all
@@ -16817,6 +16906,9 @@ function ctxOf(t: ResolvedType): ScalarType | null {
   if (t.kind === "timestamptz") return "timestamptz";
   if (t.kind === "interval") return "interval";
   if (t.kind === "date") return "date";
+  // A json/jsonb sibling offers its type so a string literal parses as that type.
+  if (t.kind === "json") return "json";
+  if (t.kind === "jsonb") return "jsonb";
   return null;
 }
 
@@ -16951,6 +17043,15 @@ function coerceStringLiteral(
         node: { kind: "constInterval", value: parseInterval(s) },
         type: { kind: "interval" },
       };
+    case "json":
+      // `json '…'` / CAST('…' AS json) — validate well-formedness, store the bytes verbatim
+      // (spec/design/json.md §4); malformed → 22P02.
+      validateJson(s);
+      return { node: { kind: "constJson", value: s }, type: { kind: "json" } };
+    case "jsonb":
+      // `jsonb '…'` / CAST('…' AS jsonb) — parse + canonicalize (numbers→decimal, keys deduped +
+      // sorted — §2); malformed → 22P02.
+      return { node: { kind: "constJsonb", value: jsonbIn(s) }, type: { kind: "jsonb" } };
     case "text":
       // text 'x' is identity — the string IS the value.
       return { node: { kind: "constText", value: s }, type: { kind: "text" } };
@@ -17260,6 +17361,8 @@ function requireNumericOperand(t: ResolvedType): void {
     t.kind === "timestamptz" ||
     t.kind === "interval" ||
     t.kind === "date" ||
+    t.kind === "json" ||
+    t.kind === "jsonb" ||
     // A range/composite/array operand is non-numeric (range arithmetic + * - lands in RF4).
     t.kind === "range" ||
     t.kind === "composite" ||
@@ -17338,6 +17441,8 @@ function requireBool(t: ResolvedType, msg: string): void {
     t.kind === "timestamptz" ||
     t.kind === "interval" ||
     t.kind === "date" ||
+    t.kind === "json" ||
+    t.kind === "jsonb" ||
     t.kind === "range"
   ) {
     throw typeError(msg);
@@ -18040,6 +18145,10 @@ function scalarForParamHint(rt: ResolvedType): ScalarType | null {
       return "date";
     case "interval":
       return "interval";
+    case "json":
+      return "json";
+    case "jsonb":
+      return "jsonb";
     default:
       return null;
   }
@@ -18322,6 +18431,13 @@ function storeValue(
       if (isDate(colTy)) return dateValue(parseDate(v.text));
       // ... or to an interval column (spec/design/interval.md); bad input traps 22007/22008.
       if (isInterval(colTy)) return intervalValue(parseInterval(v.text));
+      // ... or to a json column (spec/design/json.md §4): validate, store verbatim; malformed → 22P02.
+      if (isJson(colTy)) {
+        validateJson(v.text);
+        return jsonValue(v.text);
+      }
+      // ... or to a jsonb column (§2): parse + canonicalize; malformed → 22P02.
+      if (isJsonb(colTy)) return jsonbValue(jsonbIn(v.text));
       throw typeError(
         "cannot store a text value in " + canonicalName(colTy) + " column " + colName,
       );
@@ -18354,6 +18470,18 @@ function storeValue(
       if (isInterval(colTy)) return v;
       throw typeError(
         "cannot store an interval value in " + canonicalName(colTy) + " column " + colName,
+      );
+    // A json/jsonb value stores into a json/jsonb column verbatim (J1); any other target is a 42804
+    // type mismatch. In J0 no json/jsonb column exists, so this always errors.
+    case "json":
+      if (isJson(colTy)) return v;
+      throw typeError(
+        "cannot store a json value in " + canonicalName(colTy) + " column " + colName,
+      );
+    case "jsonb":
+      if (isJsonb(colTy)) return v;
+      throw typeError(
+        "cannot store a jsonb value in " + canonicalName(colTy) + " column " + colName,
       );
     default: // bool
       if (isBool(colTy)) return v;
@@ -18689,6 +18817,10 @@ function rexprConstToValue(e: RExpr): Value {
       return dateValue(e.value);
     case "constInterval":
       return intervalValue(e.value);
+    case "constJson":
+      return jsonValue(e.value);
+    case "constJsonb":
+      return jsonbValue(e.value);
     case "constFloat":
       return e.ty === "f32" ? float32Value(e.value) : float64Value(e.value);
     default:
@@ -18829,6 +18961,10 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return dateValue(e.value);
     case "constInterval":
       return intervalValue(e.value);
+    case "constJson":
+      return jsonValue(e.value);
+    case "constJsonb":
+      return jsonbValue(e.value);
     case "constNull":
       return nullValue();
     case "row": {
@@ -20964,6 +21100,10 @@ function valueCmp(a: Value, b: Value): number {
   // non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity). Kept
   // identical to value's lt3/gt3 range arm so `<` and ORDER BY never disagree.
   if (a.kind === "range" && b.kind === "range") return rangeTotalCmp(a, b);
+  // jsonb sorts by PG's total btree order (spec/design/json.md §5); kept identical to value's
+  // lt3/gt3 jsonb arm so `<` and ORDER BY never disagree. (json never sorts — the resolver rejects
+  // it 42883.)
+  if (a.kind === "jsonb" && b.kind === "jsonb") return jsonNodeCmp(a.node, b.node);
   // Cross-family arms exist only for totality — ORDER BY is over a single typed column, so a
   // mixed pair is unreachable. A fixed family order keeps the comparator total.
   const fr = familyRank(a) - familyRank(b);
@@ -21004,6 +21144,12 @@ function familyRank(v: Value): number {
     // cross-family rank is only for totality; it sits after the scalar families.
     case "composite":
       return 12;
+    // json never sorts (42883 at resolve); jsonb sorts only against jsonb. Cross-family ranks for
+    // totality only — they sit after the scalar/container families.
+    case "json":
+      return 15;
+    case "jsonb":
+      return 16;
     default:
       return 13;
   }

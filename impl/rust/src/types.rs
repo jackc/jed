@@ -52,6 +52,14 @@ pub enum ScalarType {
     /// Reuses timestamp's calendar core; stored as a 4-byte order-preserving i32 body (type
     /// code 16). A key this slice (the i32 key encoding is exercised, like timestamp).
     Date,
+    /// JSON text stored VERBATIM (spec/design/json.md §4): validated well-formed, the original
+    /// bytes preserved (whitespace, key order, duplicate keys). On-disk type code 18. Variable-
+    /// width, NOT comparable (PG ships no btree/hash opclass — §5), never a key.
+    Json,
+    /// Canonicalized binary JSON (spec/design/json.md §2): parsed to a tagged-node tree (numbers
+    /// exact `Decimal`, object keys deduped last-wins + sorted), stored compactly. On-disk type
+    /// code 19. Variable-width; comparable by PG's total btree order (§5); not a key this slice.
+    Jsonb,
 }
 
 impl ScalarType {
@@ -72,6 +80,8 @@ impl ScalarType {
             ScalarType::Float32 => "f32",
             ScalarType::Float64 => "f64",
             ScalarType::Date => "date",
+            ScalarType::Json => "json",
+            ScalarType::Jsonb => "jsonb",
         }
     }
 
@@ -105,6 +115,8 @@ impl ScalarType {
             "f32" | "real" | "float4" => Some(ScalarType::Float32),
             "f64" | "double precision" | "float" | "float8" => Some(ScalarType::Float64),
             "date" => Some(ScalarType::Date),
+            "json" => Some(ScalarType::Json),
+            "jsonb" => Some(ScalarType::Jsonb),
             _ => None,
         }
     }
@@ -154,6 +166,16 @@ impl ScalarType {
         matches!(self, ScalarType::Date)
     }
 
+    /// Whether this is the verbatim-text `json` type.
+    pub fn is_json(self) -> bool {
+        matches!(self, ScalarType::Json)
+    }
+
+    /// Whether this is the canonicalized-binary `jsonb` type.
+    pub fn is_jsonb(self) -> bool {
+        matches!(self, ScalarType::Jsonb)
+    }
+
     /// Whether this is the `f32` (binary32) type.
     pub fn is_float32(self) -> bool {
         matches!(self, ScalarType::Float32)
@@ -201,9 +223,14 @@ impl ScalarType {
             // codec writes the IEEE bytes big-endian, no length prefix (spec/fileformat/format.md).
             ScalarType::Float32 => 4,
             ScalarType::Float64 => 8,
-            ScalarType::Text | ScalarType::Decimal | ScalarType::Bytea | ScalarType::Interval => {
+            ScalarType::Text
+            | ScalarType::Decimal
+            | ScalarType::Bytea
+            | ScalarType::Interval
+            | ScalarType::Json
+            | ScalarType::Jsonb => {
                 unreachable!(
-                    "text/decimal/bytea/interval are not serialized through the fixed-width codec; width_bytes covers integers + uuid + boolean + timestamps + floats"
+                    "text/decimal/bytea/interval/json/jsonb are not serialized through the fixed-width codec; width_bytes covers integers + uuid + boolean + timestamps + floats"
                 )
             }
         }
@@ -217,7 +244,12 @@ impl ScalarType {
     pub fn is_fixed_width(self) -> bool {
         !matches!(
             self,
-            ScalarType::Text | ScalarType::Decimal | ScalarType::Bytea | ScalarType::Interval
+            ScalarType::Text
+                | ScalarType::Decimal
+                | ScalarType::Bytea
+                | ScalarType::Interval
+                | ScalarType::Json
+                | ScalarType::Jsonb
         )
     }
 
@@ -237,9 +269,11 @@ impl ScalarType {
             | ScalarType::Interval
             | ScalarType::Float32
             | ScalarType::Float64
-            | ScalarType::Date => {
+            | ScalarType::Date
+            | ScalarType::Json
+            | ScalarType::Jsonb => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/uuid/timestamp/interval/float/date have no integer range"
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval/float/date/json/jsonb have no integer range"
                 )
             }
         }
@@ -261,9 +295,11 @@ impl ScalarType {
             | ScalarType::Interval
             | ScalarType::Float32
             | ScalarType::Float64
-            | ScalarType::Date => {
+            | ScalarType::Date
+            | ScalarType::Json
+            | ScalarType::Jsonb => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/uuid/timestamp/interval/float/date have no integer range"
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval/float/date/json/jsonb have no integer range"
                 )
             }
         }
@@ -290,9 +326,11 @@ impl ScalarType {
             | ScalarType::Timestamp
             | ScalarType::Timestamptz
             | ScalarType::Interval
-            | ScalarType::Date => {
+            | ScalarType::Date
+            | ScalarType::Json
+            | ScalarType::Jsonb => {
                 unreachable!(
-                    "text/boolean/decimal/bytea/uuid/timestamp/interval/date have no promotion rank"
+                    "text/boolean/decimal/bytea/uuid/timestamp/interval/date/json/jsonb have no promotion rank"
                 )
             }
         }
@@ -304,7 +342,7 @@ impl ScalarType {
     }
 
     /// All types, for exhaustive iteration in tests.
-    pub fn all() -> [ScalarType; 14] {
+    pub fn all() -> [ScalarType; 16] {
         [
             ScalarType::Int16,
             ScalarType::Int32,
@@ -320,6 +358,8 @@ impl ScalarType {
             ScalarType::Float32,
             ScalarType::Float64,
             ScalarType::Date,
+            ScalarType::Json,
+            ScalarType::Jsonb,
         ]
     }
 }
@@ -491,5 +531,11 @@ impl Type {
     }
     pub fn is_interval(&self) -> bool {
         matches!(self, Type::Scalar(s) if s.is_interval())
+    }
+    pub fn is_json(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_json())
+    }
+    pub fn is_jsonb(&self) -> bool {
+        matches!(self, Type::Scalar(s) if s.is_jsonb())
     }
 }

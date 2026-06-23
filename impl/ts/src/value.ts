@@ -13,6 +13,7 @@ import { type Interval, intervalCmp, renderInterval } from "./interval.ts";
 import { renderTimestamp, renderTimestamptz } from "./timestamp.ts";
 import { renderDate } from "./date.ts";
 import { rangeOut, rangeTotalCmp } from "./range.ts";
+import { type JsonNode, jsonNodeCmp, jsonbOut } from "./json.ts";
 
 export type Value =
   | { kind: "null" }
@@ -82,6 +83,16 @@ export type Value =
       lowerInc: boolean;
       upperInc: boolean;
     }
+  // A `json` value (spec/design/json.md §4) — JSON text stored VERBATIM (the original UTF-8 text,
+  // preserving whitespace, key order, and duplicate keys), held in `text`. NOT comparable (PG ships
+  // no btree/hash opclass — §5); the resolver maps any comparison attempt to 42883. Rendered verbatim
+  // (json_out).
+  | { kind: "json"; text: string }
+  // A `jsonb` value (spec/design/json.md §2) — the canonical tagged-node tree (JsonNode): numbers
+  // exact Decimal, object keys deduped + sorted. Comparable by PG's total btree order (§5);
+  // equality/ordering go through eq3/lt3/gt3 / the value-key (jsonNodeCmp == 0 IS value equality —
+  // the canonical form makes structural equality the value equality). Rendered canonically (jsonb_out).
+  | { kind: "jsonb"; node: JsonNode }
   // An UNFETCHED large-value reference (spec/design/large-values.md §14): a stored
   // external/compressed value loaded as its on-disk pointer instead of being materialized.
   // Internal to the storage/scan layers — the scan layer resolves every column a query
@@ -196,6 +207,16 @@ export function intervalValue(iv: Interval): Value {
 // dateValue builds a non-null date from its i32 day count since 1970-01-01 (as a bigint).
 export function dateValue(days: bigint): Value {
   return { kind: "date", days };
+}
+
+// jsonValue builds a non-null json value from its verbatim UTF-8 text (spec/design/json.md §4).
+export function jsonValue(text: string): Value {
+  return { kind: "json", text };
+}
+
+// jsonbValue builds a non-null jsonb value from its canonical node tree (spec/design/json.md §2).
+export function jsonbValue(node: JsonNode): Value {
+  return { kind: "jsonb", node };
 }
 
 // compositeValue builds a composite (row) value from its ordered field values (spec/design/composite.md §2).
@@ -443,6 +464,12 @@ export function render(v: Value): string {
       // bound for infinite, and per-bound quoting where the element text has special chars (e.g. a
       // tsrange bound's space — spec/design/ranges.md §5).
       return rangeOut(v);
+    case "json":
+      // json renders its stored bytes verbatim (json_out — the identity, §4).
+      return v.text;
+    case "jsonb":
+      // jsonb renders the canonical PG text (jsonb_out — §6.2).
+      return jsonbOut(v.node);
     case "unfetched":
       throw new Error("BUG: unfetched large value escaped the storage layer");
     default:
@@ -943,6 +970,10 @@ export function eq3(a: Value, b: Value): ThreeValued {
   // are equal iff rangeTotalCmp is 0, always definite (spec/design/ranges.md §6). NULLs propagate
   // only at the whole-value level (handled above), never per-bound.
   if (a.kind === "range" && b.kind === "range") return bool3(rangeTotalCmp(a, b) === 0);
+  // jsonb `=` is structural over the canonical tree — always definite (PG btree, not 3VL; no SQL
+  // NULLs inside a document, §5). Consistent with jsonNodeCmp == 0. (json never reaches here — the
+  // resolver maps any json comparison to 42883; jsonb comparison resolves in J2.)
+  if (a.kind === "jsonb" && b.kind === "jsonb") return bool3(jsonNodeCmp(a.node, b.node) === 0);
   return "unknown";
 }
 
@@ -1068,6 +1099,9 @@ export function lt3(a: Value, b: Value): ThreeValued {
   // Range `<` uses the PG range_cmp total order (spec/design/ranges.md §6): `empty` below every
   // non-empty range, then by lower bound, then by upper bound. Always definite.
   if (a.kind === "range" && b.kind === "range") return bool3(rangeTotalCmp(a, b) < 0);
+  // jsonb `<` uses PG's total btree order (spec/design/json.md §5): type rank, then per-kind ordering
+  // (containers by count first). Always definite, never UNKNOWN.
+  if (a.kind === "jsonb" && b.kind === "jsonb") return bool3(jsonNodeCmp(a.node, b.node) < 0);
   return "unknown";
 }
 
@@ -1099,6 +1133,8 @@ export function gt3(a: Value, b: Value): ThreeValued {
   if (a.kind === "array" && b.kind === "array") return bool3(arrayTotalCmp(a, b) > 0);
   // Range `>` — the total-order mirror of `<` (spec/design/ranges.md §6).
   if (a.kind === "range" && b.kind === "range") return bool3(rangeTotalCmp(a, b) > 0);
+  // jsonb `>` — the total-order mirror of `<` (spec/design/json.md §5).
+  if (a.kind === "jsonb" && b.kind === "jsonb") return bool3(jsonNodeCmp(a.node, b.node) > 0);
   return "unknown";
 }
 

@@ -393,3 +393,40 @@ aliases = []
 family = "date"
 storable = true
 encoding = { method = "int-be-signflip", width_bytes = 4 }
+
+# --- json: JSON text stored VERBATIM (../design/json.md §4) --------------------
+# PostgreSQL's `json` type: `json_in` validates RFC-8259 well-formedness and stores the
+# original UTF-8 bytes VERBATIM — insignificant whitespace, original object key order, and
+# DUPLICATE keys all preserved (the deliberate contrast with `jsonb`). The cheap, lossless-
+# round-trip document type. On-disk type code 18. `json_out` returns the stored bytes verbatim.
+# NOT comparable: PostgreSQL ships no btree/hash operator class for `json`, so jed matches it —
+# `=`/`<`/`ORDER BY`/`DISTINCT`/`GROUP BY` on json raise 42883 and a json PRIMARY KEY / index /
+# UNIQUE is 0A000 (json joins `float` as a non-comparable scalar; it is NOT in compare.toml).
+# Variable-width (no width_bytes); no collation; no bits/min/max/overflow/rank (integer-family
+# fields). NO `encoding` — non-keyable, like float. A storable json COLUMN lands in J1; J0 is the
+# literal-only surface ('…'::json + the `json '…'` typed literal). Malformed input traps 22P02.
+[[type]]
+id = "json"
+aliases = []
+family = "json"
+storable = true
+
+# --- jsonb: canonicalized binary JSON (../design/json.md §2) -------------------
+# PostgreSQL's `jsonb` type: `jsonb_in` parses the text to a tagged-node tree and stores a compact
+# decomposed binary form (on-disk type code 19) — insignificant whitespace dropped, object keys
+# DEDUPED last-wins then SORTED length-then-bytewise (PG's canonical jsonb key order), numbers held
+# EXACTLY as `decimal` (PG numeric, never binary float — CLAUDE.md §8). The type you query and index.
+# `jsonb_out` renders the canonical PG style (one space after each ':' and ','). COMPARABLE: jsonb
+# has PostgreSQL's total btree order (../design/json.md §5 — type rank Object>Array>Boolean>Number>
+# String>Null, then per-kind; a hand-written recursive comparator like array/range/composite, NOT
+# codegen'd), so =/<>/</<=/>/>=/ORDER BY/DISTINCT/GROUP BY all work — a DEFINITE boolean (btree, not
+# 3VL: no SQL NULLs inside a document). jsonb compares only with jsonb. Variable-width (no
+# width_bytes); no collation; no bits/min/max/overflow/rank. The order-preserving `jsonb` KEY encoding
+# (encoding.md §2.13) is AUTHORED but UNEXERCISED — a jsonb PRIMARY KEY / index / UNIQUE is 0A000 until
+# the key follow-on slice (the staged-key narrowing text/decimal/bytea/array carried). A storable jsonb
+# COLUMN lands in J1 (the one format_version bump); J0 is the literal-only surface. Malformed → 22P02.
+[[type]]
+id = "jsonb"
+aliases = []
+family = "jsonb"
+storable = true

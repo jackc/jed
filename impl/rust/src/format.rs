@@ -133,6 +133,9 @@ fn type_code_for_scalar(ty: ScalarType) -> u8 {
         ScalarType::Float64 => 12,
         ScalarType::Float32 => 13,
         ScalarType::Date => 16,
+        // 14 (composite) / 15 (array) / 17 (range) are container element-type codes, not scalars.
+        ScalarType::Json => 18,
+        ScalarType::Jsonb => 19,
     }
 }
 
@@ -211,6 +214,8 @@ fn scalar_for_type_code(code: u8) -> Option<ScalarType> {
         12 => Some(ScalarType::Float64),
         13 => Some(ScalarType::Float32),
         16 => Some(ScalarType::Date),
+        18 => Some(ScalarType::Json),
+        19 => Some(ScalarType::Jsonb),
         _ => None,
     }
 }
@@ -486,6 +491,13 @@ fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
         Value::Array(_) => panic!("BUG: an array value reached the scalar codec"),
         // A range value is not storable yet (R2 adds the range codec); it never reaches here.
         Value::Range(_) => panic!("BUG: a range value reached the scalar codec (R2)"),
+        // json/jsonb columns are not storable until J1 (gated 0A000 at CREATE TABLE in J0), so a
+        // json/jsonb value never reaches the codec this slice; J1 adds the §2/§4 bodies here.
+        Value::Json(_) | Value::Jsonb(_) => {
+            panic!(
+                "BUG: a json/jsonb value reached the scalar codec (J0 has no json/jsonb columns)"
+            )
+        }
     }
 }
 

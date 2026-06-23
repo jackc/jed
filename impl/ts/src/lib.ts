@@ -69,6 +69,10 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // range_out, discrete canonicalization, empty normalization, IS NULL. Comparison + the
   // constructor/operator surface land in R3 / RF1–RF4.
   "types.range",
+  // json/jsonb literal-only surface (J0, spec/design/json.md §12): json_in/out + jsonb_in/out +
+  // the '…'::json / '…'::jsonb literal cast + jsonb_out canonicalization. No storable column yet
+  // (a json/jsonb column is 0A000 until J1).
+  "types.jsonb_literal",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
   // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
   "func.range_accessors",

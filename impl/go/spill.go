@@ -440,6 +440,17 @@ func spillWriteValue(w *bufio.Writer, v Value) {
 				spillWriteValue(w, *rv.Upper)
 			}
 		}
+	case ValJson:
+		// json — tag 19: the verbatim text (spec/design/json.md). Internal merge-sort scratch format
+		// only; a json/jsonb column can ride a spilling sort as a carried column, so it must spill
+		// faithfully.
+		_ = w.WriteByte(19)
+		spillWriteBytes(w, []byte(v.Str))
+	case ValJsonb:
+		// jsonb — tag 20: the canonical text (jsonbOut → jsonbIn round-trips exactly, since the
+		// output is canonical), spec/design/json.md.
+		_ = w.WriteByte(20)
+		spillWriteBytes(w, []byte(jsonbOut(v.Json)))
 	case ValUnfetched:
 		// An untouched large-value reference rides along to the output unread (spill.md §4); spill
 		// it opaquely so it round-trips, never resolving it.
@@ -672,6 +683,22 @@ func spillReadValue(r *bufio.Reader) (Value, error) {
 			LowerInc: flags&0x08 != 0,
 			UpperInc: flags&0x10 != 0,
 		}), nil
+	case 19:
+		b, err := spillReadBytes(r)
+		if err != nil {
+			return Value{}, err
+		}
+		return JsonValue(string(b)), nil
+	case 20:
+		b, err := spillReadBytes(r)
+		if err != nil {
+			return Value{}, err
+		}
+		node, err := jsonbIn(string(b))
+		if err != nil {
+			return Value{}, io.ErrUnexpectedEOF
+		}
+		return JsonbValue(node), nil
 	default:
 		return Value{}, io.ErrUnexpectedEOF
 	}

@@ -83,6 +83,11 @@ func typeCodeForScalar(ty ScalarType) byte {
 		return 13
 	case Date:
 		return 16
+	// 14 (composite) / 15 (array) / 17 (range) are container element-type codes, not scalars.
+	case Json:
+		return 18
+	case Jsonb:
+		return 19
 	default:
 		return 0
 	}
@@ -190,6 +195,10 @@ func scalarForTypeCode(code byte) (ScalarType, bool) {
 		return Float32, true
 	case 16:
 		return Date, true
+	case 18:
+		return Json, true
+	case 19:
+		return Jsonb, true
 	default:
 		return 0, false
 	}
@@ -388,6 +397,10 @@ func encodeScalar(ty ScalarType, v Value) []byte {
 	case ValRange:
 		// A range value is encoded by encodeValue's range arm, never here.
 		panic("BUG: a range value reached the scalar codec")
+	case ValJson, ValJsonb:
+		// json/jsonb columns are not storable until J1 (gated 0A000 at CREATE TABLE in J0), so a
+		// json/jsonb value never reaches the codec this slice; J1 adds the §2/§4 bodies here.
+		panic("BUG: a json/jsonb value reached the scalar codec (J0 has no json/jsonb columns)")
 	case ValText, ValBytea:
 		// text (UTF-8) and bytea (raw bytes) share the compact length-prefixed body; both
 		// hold their bytes in Str, so the on-disk form is identical.

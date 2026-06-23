@@ -305,8 +305,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       implementation is sliced. Stable type codes 18/19/20; one `format_version` bump (v18→v19) at
       the first storable slice. Critical path **J0 → {J1,J2,J3} → C0 → P1 → {P2,S2} → {R1,T1}**;
       B-series runs parallel off J0/C0. _(size: XL)_
-  - [ ] **J0** — `json`/`jsonb` scalar arms + `json_in`/`out` + `jsonb_in`/`out` + `'…'::jsonb`
-        literal cast; no columns yet; reserves the string-dictionary door (zero bytes). → json.md §12
+  - [x] **J0** — ✅ `json`/`jsonb` scalar arms + `json_in`/`out` + `jsonb_in`/`out` + the
+        `'…'::json`/`'…'::jsonb` literal cast (+ the `json '…'`/`jsonb '…'` typed-literal form); no
+        columns yet (a json/jsonb column is `0A000`); stable type codes 18/19; dictionary door
+        reserved (zero bytes). `jsonb` canonicalizes (numbers→exact `decimal`, keys deduped last-wins
+        then sorted length-then-bytewise, one space after `:`/`,`); `json` stores verbatim. Comparator
+        + render front-loaded for J2. All three cores, capability `types.jsonb_literal`, oracle-clean,
+        NO format bump (v18). → json.md §12
   - [ ] **J1 / J1b** — storable `jsonb` column (tagged-node value codec, format bump, spill/compress,
         golden `jsonb_table.jed`); then storable `json` (verbatim text body, golden `json_table.jed`).
   - [ ] **J2** — `jsonb` comparison/ordering (PG btree order; `ORDER BY`/`DISTINCT`/`GROUP BY`);

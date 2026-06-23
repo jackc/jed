@@ -3406,6 +3406,13 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		} else {
 			return Outcome{}, NewError(UndefinedObject, "type does not exist: "+def.TypeName)
 		}
+		// J0: the json/jsonb types exist for literals/casts but a storable COLUMN is deferred to J1
+		// (the format bump + value codec) — spec/design/json.md §12. Mirrors the array S0→S2 and
+		// composite S2→column staging.
+		if colType.IsJson() || colType.IsJsonb() {
+			return Outcome{}, NewError(FeatureNotSupported,
+				"a "+colType.CanonicalName()+" column is not yet supported (json/jsonb is literal-only this slice)")
+		}
 		if def.PrimaryKey {
 			// The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
 			// boolean (bool-byte §2.9), uuid (uuid-raw16 §2.7), timestamp/timestamptz (i64
@@ -9026,6 +9033,12 @@ func scalarForParamHint(rt resolvedType) *ScalarType {
 	case rtInterval:
 		t := IntervalType
 		return &t
+	case rtJson:
+		t := Json
+		return &t
+	case rtJsonb:
+		t := Jsonb
+		return &t
 	default:
 		return nil
 	}
@@ -12651,6 +12664,10 @@ func valueToRExpr(v Value) *rExpr {
 	case ValRange:
 		// A folded range constant (already canonical).
 		return &rExpr{kind: reConstRange, cRange: v.Range}
+	case ValJson:
+		return &rExpr{kind: reConstJson, cText: v.Str}
+	case ValJsonb:
+		return &rExpr{kind: reConstJsonb, cJsonb: v.Json}
 	default: // ValNull
 		return &rExpr{kind: reConstNull}
 	}
@@ -12775,6 +12792,23 @@ func distinctRowKey(row []Value) string {
 			b.WriteByte('n') // non-empty marker
 			writeRangeBoundKey(&b, rv.Lower, rv.LowerInc)
 			writeRangeBoundKey(&b, rv.Upper, rv.UpperInc)
+		case ValJson:
+			// json keys on its verbatim text under a distinct 'J' tag (the value-level equality,
+			// consistent with the structural derive). Length-prefixed (arbitrary UTF-8 content).
+			// Never reached through SQL in J0 (json is non-comparable — 42883).
+			b.WriteByte('J')
+			b.WriteString(strconv.Itoa(len(v.Str)))
+			b.WriteByte(':')
+			b.WriteString(v.Str)
+		case ValJsonb:
+			// jsonb keys on its CANONICAL text under a distinct 'B' tag (the canonical form makes
+			// structural equality the value equality, §5; jsonbOut is byte-identical for equal trees,
+			// so equal jsonb values share a DISTINCT/GROUP BY bucket). Length-prefixed.
+			s := jsonbOut(v.Json)
+			b.WriteByte('B')
+			b.WriteString(strconv.Itoa(len(s)))
+			b.WriteByte(':')
+			b.WriteString(s)
 		}
 	}
 	return b.String()
@@ -12842,6 +12876,12 @@ const (
 	// (subtype) type. Two ranges are comparable iff their elements are equal; the element is one of
 	// the six scalar subtypes that have a range.
 	rtRange
+	// rtJson is the json family (verbatim text — spec/design/json.md §4). NOT comparable (PG ships no
+	// btree/hash opclass — §5): a comparison/ORDER BY/DISTINCT on json resolves to 42883.
+	rtJson
+	// rtJsonb is the jsonb family (canonical binary — spec/design/json.md §2). Comparable with itself
+	// by PG's total btree order (§5).
+	rtJsonb
 )
 
 // isFloatKind reports whether a resolvedType is one of the two float kinds.
@@ -13003,6 +13043,10 @@ func rtName(t resolvedType) string {
 		return "f32"
 	case rtFloat64:
 		return "f64"
+	case rtJson:
+		return "json"
+	case rtJsonb:
+		return "jsonb"
 	case rtComposite:
 		// A named composite is its type name; an anonymous ROW(...) is "record" (PG).
 		if t.comp != nil && t.comp.named {
@@ -13093,6 +13137,13 @@ func ctxOf(t resolvedType) *ScalarType {
 	case rtFloat64:
 		ty := Float64
 		return &ty
+	case rtJson:
+		// A json/jsonb sibling offers its type so a string literal parses as that type.
+		ty := Json
+		return &ty
+	case rtJsonb:
+		ty := Jsonb
+		return &ty
 	default:
 		return nil
 	}
@@ -13119,6 +13170,12 @@ const (
 	reConstInterval
 	reConstFloat32
 	reConstFloat64
+	// reConstJson is a json constant — JSON text stored VERBATIM (spec/design/json.md §4), validated
+	// well-formed at resolve. Held in cText (the verbatim text).
+	reConstJson
+	// reConstJsonb is a jsonb constant — the canonical tagged-node tree (spec/design/json.md §2),
+	// parsed + canonicalized at resolve. Held in cJsonb.
+	reConstJsonb
 	reConstNull
 	reCast
 	reNeg
@@ -13487,6 +13544,9 @@ type rExpr struct {
 	cArray *ArrayVal
 	// reConstRange: a folded range constant (already canonicalized).
 	cRange *RangeVal
+	// reConstJsonb: a folded jsonb constant — the canonical node tree (parsed + canonicalized at
+	// resolve). A reConstJson holds its verbatim text in cText (no extra field).
+	cJsonb *JsonNode
 
 	// reQuantified: `lhs` is the scalar, `rhs` the array node, `op` the comparison, `quantAll`
 	// selects ALL (true) vs ANY/SOME (false) (spec/design/array-functions.md §11).
@@ -15807,6 +15867,10 @@ func argFamily(t resolvedType) string {
 		return "date"
 	case rtInterval:
 		return "interval"
+	case rtJson:
+		return "json"
+	case rtJsonb:
+		return "jsonb"
 	default: // rtNull
 		return ""
 	}
@@ -16206,6 +16270,10 @@ func elemScalarHint(t resolvedType) (ScalarType, bool) {
 		return Date, true
 	case rtInterval:
 		return IntervalType, true
+	case rtJson:
+		return Json, true
+	case rtJsonb:
+		return Jsonb, true
 	default:
 		return 0, false
 	}
@@ -17887,6 +17955,10 @@ func resolvedTypeOf(ty ScalarType) resolvedType {
 		return resolvedType{kind: rtFloat32}
 	case ty.IsFloat64():
 		return resolvedType{kind: rtFloat64}
+	case ty.IsJson():
+		return resolvedType{kind: rtJson}
+	case ty.IsJsonb():
+		return resolvedType{kind: rtJsonb}
 	default:
 		return resolvedType{kind: rtInt, intTy: ty}
 	}
@@ -18692,6 +18764,11 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if ity.kind == rtArray {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting an array value is not supported yet")
 		}
+		// Casting FROM json/jsonb (json↔jsonb, json[b]→text, text→json[b]) lands in J3
+		// (spec/design/json.md §6); deferred this slice.
+		if ity.kind == rtJson || ity.kind == rtJsonb {
+			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting a json value is not supported yet")
+		}
 		// int→int (range check), int→decimal (widen), decimal→int (explicit, round),
 		// decimal→decimal (re-scale), and NULL are all castable.
 		// resolvedTypeOf maps the target to the right kind (incl. rtFloat32/rtFloat64). A float
@@ -19234,6 +19311,7 @@ func requireNumericOperand(t resolvedType) error {
 	if t.kind == rtBool || t.kind == rtText || t.kind == rtBytea || t.kind == rtUuid ||
 		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval || t.kind == rtDate ||
 		t.kind == rtRange || t.kind == rtComposite || t.kind == rtArray ||
+		t.kind == rtJson || t.kind == rtJsonb ||
 		isFloatKind(t.kind) {
 		// float is handled by the dedicated float branch in resolveBinary BEFORE this is reached;
 		// reject here too so any other caller treats it as a non-(int/decimal) operand. A range/
@@ -19625,6 +19703,21 @@ func coerceStringLiteral(s string, target ScalarType, typmod *DecimalTypmod) (*r
 			return nil, resolvedType{}, err
 		}
 		return &rExpr{kind: reConstDate, cInt: int64(d)}, resolvedType{kind: rtDate}, nil
+	case Json:
+		// `json '…'` / CAST('…' AS json) — validate well-formedness, store the bytes verbatim
+		// (spec/design/json.md §4); malformed → 22P02.
+		if err := validateJSON(s); err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstJson, cText: s}, resolvedType{kind: rtJson}, nil
+	case Jsonb:
+		// `jsonb '…'` / CAST('…' AS jsonb) — parse + canonicalize (numbers→decimal, keys deduped +
+		// sorted — §2); malformed → 22P02.
+		node, err := jsonbIn(s)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		return &rExpr{kind: reConstJsonb, cJsonb: &node}, resolvedType{kind: rtJsonb}, nil
 	case Text:
 		// text 'x' is identity — the string IS the value.
 		return &rExpr{kind: reConstText, cText: s}, resolvedType{kind: rtText}, nil
@@ -19915,7 +20008,7 @@ func promote(a, b resolvedType) ScalarType {
 func requireBool(t resolvedType, msg string) error {
 	if t.kind == rtInt || t.kind == rtText || t.kind == rtDecimal || t.kind == rtBytea || t.kind == rtUuid ||
 		t.kind == rtTimestamp || t.kind == rtTimestamptz || t.kind == rtInterval || t.kind == rtDate ||
-		t.kind == rtRange {
+		t.kind == rtRange || t.kind == rtJson || t.kind == rtJsonb {
 		return typeError(msg)
 	}
 	return nil
@@ -21038,6 +21131,12 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		return Float32Value(float32(e.cFloat)), nil
 	case reConstFloat64:
 		return Float64Value(e.cFloat), nil
+	case reConstJson:
+		// A json constant — its verbatim text (validated at resolve).
+		return JsonValue(e.cText), nil
+	case reConstJsonb:
+		// A jsonb constant — its canonical node tree (parsed + canonicalized at resolve).
+		return JsonbValue(*e.cJsonb), nil
 	case reConstNull:
 		return NullValue(), nil
 	case reCast:
@@ -23513,6 +23612,11 @@ func valueCmp(a, b Value) int {
 		// non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity). Kept
 		// identical to value.Lt3/Gt3's range arm so `<` and ORDER BY never disagree.
 		return rangeTotalCmp(a.Range, b.Range)
+	case a.Kind == ValJsonb && b.Kind == ValJsonb:
+		// jsonb sorts by PG's total btree order (spec/design/json.md §5); kept identical to
+		// value.Lt3/Gt3's jsonb arm so `<` and ORDER BY never disagree. (json never sorts — the
+		// resolver rejects it 42883.)
+		return a.Json.Cmp(b.Json)
 	default:
 		// Cross-family arms exist only for totality — ORDER BY is over a single typed column,
 		// so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -23571,6 +23675,12 @@ func familyRank(v Value) int {
 		return 11
 	case ValDate:
 		return 13
+	case ValJson:
+		// json never sorts (42883 at resolve); jsonb sorts only against jsonb. Cross-family ranks for
+		// totality only — they sit after the scalar/container families.
+		return 15
+	case ValJsonb:
+		return 16
 	default:
 		return 12
 	}
@@ -23729,6 +23839,22 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			}
 			return IntervalValue(iv), nil
 		}
+		if colTy.IsJson() {
+			// A string literal adapts to a json column (spec/design/json.md §4): validate,
+			// store verbatim; malformed → 22P02.
+			if err := validateJSON(v.Str); err != nil {
+				return Value{}, err
+			}
+			return JsonValue(v.Str), nil
+		}
+		if colTy.IsJsonb() {
+			// A string literal adapts to a jsonb column (§2): parse + canonicalize; → 22P02.
+			node, err := jsonbIn(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return JsonbValue(node), nil
+		}
 		return Value{}, typeError("cannot store a text value in " + colTy.CanonicalName() + " column " + colName)
 	case ValBytea:
 		if colTy.IsBytea() {
@@ -23774,6 +23900,18 @@ func storeValue(v Value, colTy ScalarType, typmod *DecimalTypmod, notNull bool, 
 			return v, nil
 		}
 		return Value{}, typeError("cannot store a f64 value in " + colTy.CanonicalName() + " column " + colName)
+	case ValJson:
+		// A json value stores into a json column verbatim (J1); any other target is a 42804. In J0
+		// no json column exists, so this always errors.
+		if colTy.IsJson() {
+			return v, nil
+		}
+		return Value{}, typeError("cannot store a json value in " + colTy.CanonicalName() + " column " + colName)
+	case ValJsonb:
+		if colTy.IsJsonb() {
+			return v, nil
+		}
+		return Value{}, typeError("cannot store a jsonb value in " + colTy.CanonicalName() + " column " + colName)
 	default: // ValBool
 		if colTy.IsBool() {
 			return BoolValue(v.Bool), nil

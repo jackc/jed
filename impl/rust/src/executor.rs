@@ -25,6 +25,7 @@ use crate::decimal::{self, Decimal, MAX_PRECISION, MAX_SCALE};
 use crate::encoding::{encode_bool, encode_int, encode_terminated};
 use crate::error::{EngineError, Result, SqlState};
 use crate::interval::{self, Interval, parse_interval};
+use crate::json::{self, JsonNode};
 use crate::operators::{AGGREGATES, AggregateDesc, OPERATORS, OperatorDesc, WINDOWS};
 use crate::pmap::KeyBound;
 use crate::privileges::{Privilege, PrivilegeSet};
@@ -3049,6 +3050,18 @@ impl Database {
                     format!("type does not exist: {}", def.type_name),
                 ));
             };
+            // J0: the `json`/`jsonb` types exist for literals/casts but a storable COLUMN is
+            // deferred to J1 (the format bump + value codec) — spec/design/json.md §12. Mirrors the
+            // array S0→S2 and composite S2→column staging.
+            if ty.is_json() || ty.is_jsonb() {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "a {} column is not yet supported (json/jsonb is literal-only this slice)",
+                        ty.canonical_name()
+                    ),
+                ));
+            }
             if def.primary_key {
                 // The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
                 // boolean (`bool-byte` §2.9), uuid (`uuid-raw16` §2.7), timestamp/timestamptz (i64
@@ -3432,6 +3445,8 @@ impl Database {
                 | ResolvedType::Date
                 | ResolvedType::Interval
                 | ResolvedType::Float(_)
+                | ResolvedType::Json
+                | ResolvedType::Jsonb
                 | ResolvedType::Composite(_)
                 | ResolvedType::Array(_)
                 | ResolvedType::Range(_) => {
@@ -9929,6 +9944,8 @@ impl Database {
             | RExpr::ConstFloat64(_)
             | RExpr::ConstBytea(_)
             | RExpr::ConstUuid(_)
+            | RExpr::ConstJson(_)
+            | RExpr::ConstJsonb(_)
             | RExpr::ConstTimestamp(_)
             | RExpr::ConstTimestamptz(_)
             | RExpr::ConstDate(_)
@@ -10778,6 +10795,12 @@ enum ResolvedType {
     /// of the same element. The element is always one of the six scalar subtypes. Boxed to keep the
     /// scalar `ResolvedType` small.
     Range(Box<ResolvedType>),
+    /// The `json` family (verbatim text — spec/design/json.md §4). NOT comparable (PG ships no
+    /// btree/hash opclass — §5): a comparison/ORDER BY/DISTINCT on json resolves to 42883.
+    Json,
+    /// The `jsonb` family (canonical binary — spec/design/json.md §2). Comparable with itself by
+    /// PG's total btree order (§5).
+    Jsonb,
 }
 
 /// The resolved shape of a composite type — its (optional) name and resolved field list. The
@@ -10807,6 +10830,8 @@ impl ResolvedType {
             ResolvedType::Null => "unknown".to_string(),
             ResolvedType::Composite(c) => c.name.clone().unwrap_or_else(|| "record".to_string()),
             ResolvedType::Array(elem) => format!("{}[]", elem.type_name()),
+            ResolvedType::Json => "json".to_string(),
+            ResolvedType::Jsonb => "jsonb".to_string(),
             // A range names itself by its element subtype (i32 → i32range — spec/design/ranges.md).
             ResolvedType::Range(elem) => resolved_range_element_scalar(elem)
                 .and_then(crate::range::range_name_for_element)
@@ -10852,6 +10877,8 @@ impl ResolvedType {
             }
             ResolvedType::Bytea => col_ty.is_bytea(),
             ResolvedType::Uuid => col_ty.is_uuid(),
+            ResolvedType::Json => col_ty.is_json(),
+            ResolvedType::Jsonb => col_ty.is_jsonb(),
             ResolvedType::Timestamp => col_ty.is_timestamp(),
             ResolvedType::Timestamptz => col_ty.is_timestamptz(),
             ResolvedType::Interval => col_ty.is_interval(),
@@ -11116,6 +11143,12 @@ enum RExpr {
     ConstFloat64(f64),
     ConstBytea(Vec<u8>),
     ConstUuid([u8; 16]),
+    /// A `json` constant — JSON text stored VERBATIM (spec/design/json.md §4), validated
+    /// well-formed at resolve.
+    ConstJson(String),
+    /// A `jsonb` constant — the canonical tagged-node tree (spec/design/json.md §2), parsed +
+    /// canonicalized at resolve. Boxed to keep `RExpr` small (a `JsonNode` is a recursive tree).
+    ConstJsonb(Box<JsonNode>),
     /// A parsed `timestamp` / `timestamptz` literal: the i64 microsecond instant.
     ConstTimestamp(i64),
     ConstTimestamptz(i64),
@@ -12046,6 +12079,8 @@ fn type_from_resolved(rt: &ResolvedType) -> Result<Type> {
         ResolvedType::Decimal => Type::Scalar(ScalarType::Decimal),
         ResolvedType::Bytea => Type::Scalar(ScalarType::Bytea),
         ResolvedType::Uuid => Type::Scalar(ScalarType::Uuid),
+        ResolvedType::Json => Type::Scalar(ScalarType::Json),
+        ResolvedType::Jsonb => Type::Scalar(ScalarType::Jsonb),
         ResolvedType::Timestamp => Type::Scalar(ScalarType::Timestamp),
         ResolvedType::Timestamptz => Type::Scalar(ScalarType::Timestamptz),
         ResolvedType::Date => Type::Scalar(ScalarType::Date),
@@ -12723,6 +12758,8 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::ConstFloat64(_)
         | RExpr::ConstBytea(_)
         | RExpr::ConstUuid(_)
+        | RExpr::ConstJson(_)
+        | RExpr::ConstJsonb(_)
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
         | RExpr::ConstDate(_)
@@ -14533,6 +14570,8 @@ fn value_to_rexpr(v: &Value) -> RExpr {
         // A folded array constant — preserve its full shape (dims/lbounds) in a const node.
         Value::Array(arr) => RExpr::ConstArray(Box::new(arr.clone())),
         Value::Range(r) => RExpr::ConstRange(Box::new(r.clone())),
+        Value::Json(s) => RExpr::ConstJson(s.clone()),
+        Value::Jsonb(n) => RExpr::ConstJsonb(Box::new(n.clone())),
         // Poisoned (large-values.md §14): a folded subquery's projections are resolved values.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
@@ -14678,6 +14717,8 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::ConstFloat64(_)
         | RExpr::ConstBytea(_)
         | RExpr::ConstUuid(_)
+        | RExpr::ConstJson(_)
+        | RExpr::ConstJsonb(_)
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
         | RExpr::ConstDate(_)
@@ -14806,6 +14847,8 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::ConstFloat64(_)
         | RExpr::ConstBytea(_)
         | RExpr::ConstUuid(_)
+        | RExpr::ConstJson(_)
+        | RExpr::ConstJsonb(_)
         | RExpr::ConstTimestamp(_)
         | RExpr::ConstTimestamptz(_)
         | RExpr::ConstDate(_)
@@ -15135,6 +15178,8 @@ fn arg_family(t: &ResolvedType) -> Option<&'static str> {
         ResolvedType::Timestamptz => Some("timestamptz"),
         ResolvedType::Date => Some("date"),
         ResolvedType::Interval => Some("interval"),
+        ResolvedType::Json => Some("json"),
+        ResolvedType::Jsonb => Some("jsonb"),
         ResolvedType::Null => None,
         // A composite/array/range is no concrete built-in argument family this slice. (A range's
         // polymorphic `anyrange` family is matched separately by the range resolver — RF1.)
@@ -15421,6 +15466,8 @@ fn elem_scalar_hint(t: &ResolvedType) -> Option<ScalarType> {
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
         ResolvedType::Date => Some(ScalarType::Date),
         ResolvedType::Interval => Some(ScalarType::Interval),
+        ResolvedType::Json => Some(ScalarType::Json),
+        ResolvedType::Jsonb => Some(ScalarType::Jsonb),
         ResolvedType::Null
         | ResolvedType::Composite(_)
         | ResolvedType::Array(_)
@@ -17216,6 +17263,8 @@ fn resolve_boolean_filter(scope: &Scope, e: &Expr, params: &mut ParamTypes) -> R
         | ResolvedType::Date
         | ResolvedType::Interval
         | ResolvedType::Float(_)
+        | ResolvedType::Json
+        | ResolvedType::Jsonb
         | ResolvedType::Composite(_)
         | ResolvedType::Array(_)
         | ResolvedType::Range(_) => Err(type_error("argument of WHERE must be boolean")),
@@ -19043,6 +19092,14 @@ fn resolve(
                         "casting a range value is not supported yet",
                     ));
                 }
+                // Casting FROM json/jsonb (json↔jsonb, json[b]→text, text→json[b]) lands in J3
+                // (spec/design/json.md §6); deferred this slice.
+                ResolvedType::Json | ResolvedType::Jsonb => {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting a json value is not supported yet",
+                    ));
+                }
             }
             let result_ty = if target.is_decimal() {
                 ResolvedType::Decimal
@@ -19080,6 +19137,8 @@ fn resolve(
                 | ResolvedType::Timestamp
                 | ResolvedType::Timestamptz
                 | ResolvedType::Date
+                | ResolvedType::Json
+                | ResolvedType::Jsonb
                 | ResolvedType::Composite(_)
                 | ResolvedType::Array(_)
                 | ResolvedType::Range(_) => {
@@ -20162,6 +20221,9 @@ fn ctx_of(ty: &ResolvedType) -> Option<ScalarType> {
         ResolvedType::Text => Some(ScalarType::Text),
         ResolvedType::Bool => Some(ScalarType::Bool),
         ResolvedType::Decimal => Some(ScalarType::Decimal),
+        // A json/jsonb sibling offers its type so a string literal parses as that type.
+        ResolvedType::Json => Some(ScalarType::Json),
+        ResolvedType::Jsonb => Some(ScalarType::Jsonb),
         ResolvedType::Null => None,
         // A composite/array/range sibling offers no scalar adaptation context.
         ResolvedType::Composite(_) | ResolvedType::Array(_) | ResolvedType::Range(_) => None,
@@ -20270,6 +20332,8 @@ fn require_numeric_operand(ty: &ResolvedType) -> Result<()> {
         | ResolvedType::Date
         | ResolvedType::Interval
         | ResolvedType::Float(_)
+        | ResolvedType::Json
+        | ResolvedType::Jsonb
         | ResolvedType::Composite(_)
         | ResolvedType::Array(_)
         | ResolvedType::Range(_) => {
@@ -21336,6 +21400,8 @@ fn scalar_for_param_hint(rt: &ResolvedType) -> Option<ScalarType> {
         ResolvedType::Timestamptz => Some(ScalarType::Timestamptz),
         ResolvedType::Date => Some(ScalarType::Date),
         ResolvedType::Interval => Some(ScalarType::Interval),
+        ResolvedType::Json => Some(ScalarType::Json),
+        ResolvedType::Jsonb => Some(ScalarType::Jsonb),
         ResolvedType::Null
         | ResolvedType::Composite(_)
         | ResolvedType::Array(_)
@@ -21511,6 +21577,8 @@ fn require_bool(ty: &ResolvedType, msg: &str) -> Result<()> {
         | ResolvedType::Date
         | ResolvedType::Interval
         | ResolvedType::Float(_)
+        | ResolvedType::Json
+        | ResolvedType::Jsonb
         | ResolvedType::Composite(_)
         | ResolvedType::Array(_)
         | ResolvedType::Range(_) => Err(type_error(msg)),
@@ -21834,6 +21902,18 @@ fn coerce_string_literal(
             ResolvedType::Interval,
         ),
         ScalarType::Date => (RExpr::ConstDate(parse_date(s)?), ResolvedType::Date),
+        // `json '…'` / CAST('…' AS json) — validate well-formedness, store the bytes verbatim
+        // (spec/design/json.md §4); malformed → 22P02.
+        ScalarType::Json => {
+            json::validate_json(s)?;
+            (RExpr::ConstJson(s.to_string()), ResolvedType::Json)
+        }
+        // `jsonb '…'` / CAST('…' AS jsonb) — parse + canonicalize (numbers→decimal, keys deduped +
+        // sorted — §2); malformed → 22P02.
+        ScalarType::Jsonb => (
+            RExpr::ConstJsonb(Box::new(json::jsonb_in(s)?)),
+            ResolvedType::Jsonb,
+        ),
         // `text 'x'` is identity — the string IS the value.
         ScalarType::Text => (RExpr::ConstText(s.to_string()), ResolvedType::Text),
         ScalarType::Bool => (RExpr::ConstBool(parse_bool_literal(s)?), ResolvedType::Bool),
@@ -22261,6 +22341,14 @@ fn store_value(
                 // A string literal adapts to a date column (spec/design/date.md); malformed
                 // input traps 22007, an out-of-range field 22008.
                 Ok(Value::Date(parse_date(&s)?))
+            } else if col_ty.is_json() {
+                // A string literal adapts to a json column (spec/design/json.md §4): validate,
+                // store verbatim; malformed → 22P02.
+                json::validate_json(&s)?;
+                Ok(Value::Json(s))
+            } else if col_ty.is_jsonb() {
+                // A string literal adapts to a jsonb column (§2): parse + canonicalize; → 22P02.
+                Ok(Value::Jsonb(json::jsonb_in(&s)?))
             } else {
                 Err(type_error(format!(
                     "cannot store a text value in {} column {col_name}",
@@ -22380,6 +22468,28 @@ fn store_value(
             "cannot store a range value in {} column {col_name}",
             col_ty.canonical_name()
         ))),
+        // A json/jsonb value stores into a json/jsonb column verbatim (J1); any other target is a
+        // 42804 type mismatch. In J0 no json/jsonb column exists, so this always errors.
+        Value::Json(s) => {
+            if col_ty.is_json() {
+                Ok(Value::Json(s))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a json value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
+        Value::Jsonb(n) => {
+            if col_ty.is_jsonb() {
+                Ok(Value::Jsonb(n))
+            } else {
+                Err(type_error(format!(
+                    "cannot store a jsonb value in {} column {col_name}",
+                    col_ty.canonical_name()
+                )))
+            }
+        }
         // Poisoned (large-values.md §14): a stored value is an evaluated expression result.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
     }
@@ -22795,6 +22905,8 @@ fn rexpr_const_to_value(node: &RExpr) -> Result<Value> {
         RExpr::ConstTimestamptz(m) => Value::Timestamptz(*m),
         RExpr::ConstDate(d) => Value::Date(*d),
         RExpr::ConstInterval(iv) => Value::Interval(*iv),
+        RExpr::ConstJson(s) => Value::Json(s.clone()),
+        RExpr::ConstJsonb(n) => Value::Jsonb((**n).clone()),
         _ => return Err(type_error("non-constant array element literal".to_string())),
     })
 }
@@ -22979,6 +23091,8 @@ impl RExpr {
             RExpr::ConstTimestamptz(m) => Ok(Value::Timestamptz(*m)),
             RExpr::ConstDate(d) => Ok(Value::Date(*d)),
             RExpr::ConstInterval(iv) => Ok(Value::Interval(*iv)),
+            RExpr::ConstJson(s) => Ok(Value::Json(s.clone())),
+            RExpr::ConstJsonb(n) => Ok(Value::Jsonb((**n).clone())),
             RExpr::ConstNull => Ok(Value::Null),
             RExpr::Cast {
                 inner,
@@ -23059,6 +23173,9 @@ impl RExpr {
                     Value::Range(_) => {
                         unreachable!("resolver rejects a range cast operand this slice")
                     }
+                    Value::Json(_) | Value::Jsonb(_) => {
+                        unreachable!("resolver rejects a json cast operand this slice (J3)")
+                    }
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
                     }
@@ -23102,6 +23219,9 @@ impl RExpr {
                     }
                     Value::Range(_) => {
                         unreachable!("resolver rejects a range unary minus")
+                    }
+                    Value::Json(_) | Value::Jsonb(_) => {
+                        unreachable!("resolver rejects a json unary minus")
                     }
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")
@@ -25746,6 +25866,10 @@ fn value_cmp(a: &Value, b: &Value) -> std::cmp::Ordering {
         // every non-empty, then lower bound, then upper bound (accounting for infinity/inclusivity).
         // Kept identical to `value::lt3`/`gt3`'s range arm so `<` and `ORDER BY` never disagree.
         (Value::Range(x), Value::Range(y)) => crate::range::range_total_cmp(x, y),
+        // jsonb sorts by PG's total btree order (spec/design/json.md §5); kept identical to
+        // `value::lt3`/`gt3`'s jsonb arm so `<` and `ORDER BY` never disagree. (json never sorts —
+        // the resolver rejects it 42883.)
+        (Value::Jsonb(x), Value::Jsonb(y)) => x.cmp(y),
         (Value::Null, Value::Null) => Ordering::Equal,
         // Cross-family arms exist only for totality — ORDER BY is over a single typed column,
         // so a mixed pair is unreachable. A fixed family order keeps the comparator total.
@@ -25779,6 +25903,10 @@ fn family_rank(v: &Value) -> u8 {
         // A range sorts only against ranges of its own element type (ORDER BY is single-typed), so
         // this cross-family rank is only for totality; it sits after array.
         Value::Range(_) => 14,
+        // json never sorts (42883 at resolve); jsonb sorts only against jsonb. Cross-family ranks
+        // for totality only — they sit after the scalar/container families.
+        Value::Json(_) => 15,
+        Value::Jsonb(_) => 16,
         // Poisoned (large-values.md §14): ORDER BY slots are in the touched set, so a sort
         // key is always resolved before it reaches the comparator.
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),

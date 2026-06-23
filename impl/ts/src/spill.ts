@@ -10,8 +10,17 @@
 // only (no dependency — CLAUDE.md §14).
 
 import { Decimal } from "./decimal.ts";
+import { jsonbIn, jsonbOut } from "./json.ts";
 import type { Row } from "./storage.ts";
-import { type Value, emptyRangeValue, float32Value, float64Value, rangeValue } from "./value.ts";
+import {
+  type Value,
+  emptyRangeValue,
+  float32Value,
+  float64Value,
+  jsonValue,
+  jsonbValue,
+  rangeValue,
+} from "./value.ts";
 
 // SpillSink is the host backing for spilled runs — the Node `fs` implementation is FileSpillSink
 // (spillfile.ts), injected on the Database handle by a durable host that can spill to disk. null for an
@@ -457,6 +466,19 @@ function writeValue(w: ByteWriter, v: Value): void {
       }
       break;
     }
+    case "json":
+      // json — tag 19: the verbatim text. Internal merge-sort scratch format only
+      // (spec/design/json.md); a json column can ride a spilling sort as a carried column.
+      w.u8(19);
+      w.bytesField(new TextEncoder().encode(v.text));
+      break;
+    case "jsonb":
+      // jsonb — tag 20: the canonical text (jsonbOut → jsonbIn round-trips exactly, since the output
+      // is canonical). Internal merge-sort scratch format only; a jsonb column can ride a spilling
+      // sort as a carried (jsonb also a key) column, so it must spill faithfully.
+      w.u8(20);
+      w.bytesField(new TextEncoder().encode(jsonbOut(v.node)));
+      break;
     case "unfetched":
       // An untouched large-value reference rides along to the output unread (spill.md §4); spill it
       // opaquely so it round-trips, never resolving it.
@@ -593,6 +615,10 @@ function readValue(r: SpillByteReader): Value {
       const upper = ubInf ? null : readValue(r);
       return rangeValue(lower, upper, (flags & 0x08) !== 0, (flags & 0x10) !== 0);
     }
+    case 19:
+      return jsonValue(new TextDecoder().decode(r.bytes(readU32(r))));
+    case 20:
+      return jsonbValue(jsonbIn(new TextDecoder().decode(r.bytes(readU32(r)))));
     default:
       throw new Error("bad spill value tag");
   }

@@ -56,6 +56,8 @@ class OracleImport
     # i64range are aliases of int4range/int8range, so both spellings tag T (spec/design/ranges.md §5).
     "int4range" => "T", "int8range" => "T", "numrange" => "T",
     "tsrange" => "T", "tstzrange" => "T", "daterange" => "T",
+    # json/jsonb render as text (json_out / jsonb_out canonical form — spec/design/json.md §6.2).
+    "json" => "T", "jsonb" => "T",
   }.freeze
 
   def initialize(path)

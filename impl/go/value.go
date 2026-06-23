@@ -73,6 +73,17 @@ const (
 	// struct stays ==-comparable (like Comp/Array); range equality/hashing/comparison go through
 	// Eq3 / the structural value-key path, never raw ==. Discrete ranges are stored canonical (`[)`).
 	ValRange
+	// ValJson is a json value (spec/design/json.md §4) — JSON text stored VERBATIM (the original
+	// UTF-8 text, preserving whitespace, key order, and duplicate keys), held in Str. NOT comparable
+	// (PG ships no btree/hash opclass — §5); the resolver maps any comparison attempt to 42883.
+	// Rendered verbatim (json_out).
+	ValJson
+	// ValJsonb is a jsonb value (spec/design/json.md §2) — the canonical tagged-node tree, held in
+	// Json (a *JsonNode POINTER so the flat Value struct stays ==-comparable, like Comp/Array;
+	// equality/hashing/comparison go through Eq3 / the value-key, never raw ==). Numbers exact
+	// Decimal, object keys deduped + sorted. Comparable by PG's total btree order (§5). Rendered
+	// canonically (jsonb_out).
+	ValJsonb
 )
 
 // Unfetched is the on-disk form of a lazily-loaded large value (spec/design/large-values.md §14;
@@ -130,6 +141,11 @@ type Value struct {
 	// (*RangeVal) so the flat Value struct stays ==-comparable — like Array; range equality/hashing
 	// go through Eq3 / the structural value-key path, never raw `==`.
 	Range *RangeVal
+	// Json holds the canonical jsonb tree when Kind == ValJsonb (spec/design/json.md §2). A POINTER
+	// (*JsonNode) so the flat Value struct stays ==-comparable — like Comp/Array; jsonb
+	// equality/hashing/comparison go through Eq3 / the value-key, never raw `==`. (A ValJson value's
+	// verbatim text lives in Str, like text/bytea.)
+	Json *JsonNode
 }
 
 // RangeVal is a range value (spec/design/ranges.md §4). Either the distinguished Empty range
@@ -216,6 +232,13 @@ func IntervalValue(iv Interval) Value { return Value{Kind: ValInterval, Iv: iv} 
 
 // DateValue builds a non-null date from its i32 day count since 1970-01-01.
 func DateValue(d int32) Value { return Value{Kind: ValDate, Int: int64(d)} }
+
+// JsonValue builds a non-null json value from its verbatim UTF-8 text (spec/design/json.md §4).
+func JsonValue(s string) Value { return Value{Kind: ValJson, Str: s} }
+
+// JsonbValue builds a non-null jsonb value from its canonical node tree (spec/design/json.md §2).
+// The node is held by pointer so Value stays ==-comparable; equality/ordering go through Eq3/Cmp.
+func JsonbValue(n JsonNode) Value { return Value{Kind: ValJsonb, Json: &n} }
 
 // CompositeValue builds a non-null composite (row) value from its field values
 // (spec/design/composite.md §2). The slice is held by pointer so Value stays ==-comparable;
@@ -468,6 +491,12 @@ func (v Value) Render() string {
 		// omitted bound for infinite, and per-bound quoting where the element text has special
 		// chars (e.g. a tsrange bound's space — spec/design/ranges.md §5).
 		return rangeOut(v.Range)
+	case ValJson:
+		// json renders its stored bytes verbatim (json_out — the identity, §4).
+		return v.Str
+	case ValJsonb:
+		// jsonb renders the canonical PG text (jsonb_out — §6.2).
+		return jsonbOut(v.Json)
 	case ValUnfetched:
 		panic("BUG: unfetched large value escaped the storage layer")
 	default:
@@ -591,6 +620,12 @@ func (v Value) Eq3(o Value) ThreeValued {
 	if v.Kind == ValRange && o.Kind == ValRange {
 		return bool3(rangeTotalCmp(v.Range, o.Range) == 0)
 	}
+	// jsonb `=` is structural over the canonical tree — always definite (PG btree, not 3VL; no SQL
+	// NULLs inside a document, §5). Consistent with JsonNode.Cmp == 0. (json never reaches here — the
+	// resolver maps any json comparison to 42883; jsonb comparison resolves in J2.)
+	if v.Kind == ValJsonb && o.Kind == ValJsonb {
+		return bool3(jsonbValueEqual(v.Json, o.Json))
+	}
 	return Unknown
 }
 
@@ -696,6 +731,11 @@ func (v Value) Lt3(o Value) ThreeValued {
 	if v.Kind == ValRange && o.Kind == ValRange {
 		return bool3(rangeTotalCmp(v.Range, o.Range) < 0)
 	}
+	// jsonb `<` uses PG's total btree order (spec/design/json.md §5): type rank, then per-kind
+	// ordering (containers by count first). Always definite, never UNKNOWN.
+	if v.Kind == ValJsonb && o.Kind == ValJsonb {
+		return bool3(v.Json.Cmp(o.Json) < 0)
+	}
 	return Unknown
 }
 
@@ -751,6 +791,10 @@ func (v Value) Gt3(o Value) ThreeValued {
 	// Range `>` — the total-order mirror of `<` (spec/design/ranges.md §6).
 	if v.Kind == ValRange && o.Kind == ValRange {
 		return bool3(rangeTotalCmp(v.Range, o.Range) > 0)
+	}
+	// jsonb `>` — the total-order mirror of `<` (spec/design/json.md §5).
+	if v.Kind == ValJsonb && o.Kind == ValJsonb {
+		return bool3(v.Json.Cmp(o.Json) > 0)
 	}
 	return Unknown
 }
