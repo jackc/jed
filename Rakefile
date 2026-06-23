@@ -174,6 +174,8 @@ end
 # cargo/go/biome/npm needed).
 RUST_MANIFEST = File.join(__dir__, "impl/rust/Cargo.toml")
 CLI_MANIFEST  = File.join(__dir__, "cli/Cargo.toml")
+RUBY_GEM_DIR  = File.join(__dir__, "impl/ruby")               # the jed Ruby gem (host artifact; spec/design/ruby.md)
+RUBY_EXT_MANIFEST = File.join(RUBY_GEM_DIR, "ext/Cargo.toml") # its native-extension cdylib crate
 GO_DIR        = File.join(__dir__, "impl/go")
 TS_DIR        = File.join(__dir__, "impl/ts")
 TS_CORE_DIRS  = %w[impl/ts bench/ts] # biome (mise-pinned); biome.json scopes paths + excludes generated
@@ -217,6 +219,11 @@ namespace :fmt do
       failures << "cli"
     end
 
+    puts "ruby-ext: cargo fmt --check (the gem's native extension)"
+    unless system("cargo", "fmt", "--check", "--manifest-path", RUBY_EXT_MANIFEST)
+      failures << "ruby-ext"
+    end
+
     puts "go:   gofumpt -l impl/go"
     unformatted = gofumpt_unformatted
     unless unformatted.empty?
@@ -239,6 +246,7 @@ namespace :fmt do
   task :fix do
     sh "cargo", "fmt", "--manifest-path", RUST_MANIFEST
     sh "cargo", "fmt", "--manifest-path", CLI_MANIFEST
+    sh "cargo", "fmt", "--manifest-path", RUBY_EXT_MANIFEST
     sh "gofumpt", "-w", GO_DIR
     sh "biome", "format", "--write", *TS_CORE_DIRS
     npm_ci_if_stale(WEB_DIR)
@@ -341,6 +349,37 @@ namespace :cli do
   desc "Run the jed CLI's unit + end-to-end golden tests"
   task :test do
     sh "cargo", "test", "--manifest-path", CLI_MANIFEST
+  end
+end
+
+# ruby — the jed Ruby GEM (spec/design/ruby.md), a HOST ARTIFACT at impl/ruby that WRAPS the safe
+# Rust core (CLAUDE.md §2/§13), NOT a core. A standalone cdylib crate (impl/ruby/ext, the cli/
+# precedent — its FFI concerns never enter the hermetic engine crate) plus a pure-Ruby gem that
+# loads it through stdlib `fiddle`. Its minitest suite tests the BINDING SEAM only (marshalling,
+# lifecycle); SQL semantics are inherited from Rust by construction (cores.md §1), so they stay in
+# the shared corpus. Like cli:test, ruby:test runs as part of `rake test` (and so `rake ci`).
+# RUBY_GEM_DIR / RUBY_EXT_MANIFEST are defined up top (beside RUST_MANIFEST) so the fmt gate reaches
+# the ext crate too.
+namespace :ruby do
+  desc "Build the Ruby gem's native extension cdylib (release) to impl/ruby/ext/target/release"
+  task :build do
+    sh "cargo", "build", "--release", "--manifest-path", RUBY_EXT_MANIFEST
+  end
+
+  desc "Build the cdylib, then run the Ruby gem's minitest seam tests"
+  task test: :build do
+    # The Rakefile loads `bundler/setup` (line ~24), which injects bundler's env into child
+    # processes — restricting them to the repo Gemfile's gems (rake, toml-rb). minitest is a Ruby
+    # bundled gem NOT in that Gemfile, so a plain spawn can't load it. `with_unbundled_env` reverts
+    # bundler's env for the spawn, so the test ruby resolves minitest from the mise install — no
+    # Gemfile entry, no new dependency (CLAUDE.md §14). The gem uses only stdlib `fiddle` at
+    # runtime; minitest is test-only tooling, exactly like rake/toml-rb.
+    tests = FileList[File.join(RUBY_GEM_DIR, "test/**/*_test.rb")]
+    Bundler.with_unbundled_env do
+      sh RbConfig.ruby,
+        "-I#{File.join(RUBY_GEM_DIR, 'lib')}", "-I#{File.join(RUBY_GEM_DIR, 'test')}",
+        "-e", "ARGV.each { |f| require f }", "--", *tests
+    end
   end
 end
 
@@ -552,8 +591,8 @@ task unit: %w[unit:rust unit:go unit:ts]
 # conformance corpus on all three cores + each core's unit suite + the CLI golden tests. This is
 # the inner dev loop; `rake ci` is the SUPERSET that wraps it with the static/spec/metamorphic
 # gates below.
-desc "Engine test suites: conformance corpus (×3 cores) + per-core unit tests + CLI tests"
-task test: %w[conformance unit cli:test]
+desc "Engine test suites: conformance corpus (×3 cores) + per-core unit tests + CLI + Ruby-gem tests"
+task test: %w[conformance unit cli:test ruby:test]
 
 # ci — the full merge gate, a SUPERSET of `rake test`. Adds the checks that aren't example-based
 # tests: spec-data + byte-fixture verification + codegen-drift (`verify`), the formatter gate

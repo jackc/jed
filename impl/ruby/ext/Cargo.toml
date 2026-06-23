@@ -1,0 +1,25 @@
+# The jed Ruby gem's native extension — the FFI BOUNDARY, a HOST ARTIFACT, not a core
+# (CLAUDE.md §2; spec/design/ruby.md). A standalone `cdylib` crate, deliberately NOT in a
+# Cargo workspace with impl/rust (the `cli/` precedent): the engine crate stays hermetic and
+# zero-dependency, and this crate's FFI concerns never leak into it.
+#
+# This crate WRAPS the safe Rust core (CLAUDE.md §2/§13 — "wrap the safe Rust core"): every
+# `unsafe` in the whole project's product path is confined here, at the C-ABI marshalling seam,
+# and is justified against memory safety in spec/design/ruby.md §4. It pulls in NO third-party
+# dependency (the Ruby side loads it through stdlib `fiddle`), so CLAUDE.md §14 needs no new
+# dependency approval — the path-dep on the core is the only edge.
+
+[package]
+name = "jed-ruby-ext"
+version = "0.1.0"
+edition = "2024"
+publish = false
+description = "C ABI over the safe Rust core for the jed Ruby gem (spec/design/ruby.md)."
+
+[lib]
+name = "jed_ruby"
+crate-type = ["cdylib"]
+path = "src/lib.rs"
+
+[dependencies]
+jed = { path = "../../rust" }

@@ -703,26 +703,40 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       hurt a native core), native for clean pure-JAR packaging + in-process host functions
       (no JNI/upcall tax). Decide at scheduling time; Valhalla shifts it toward native.
       _(size: XL native / L wrap; §2)_
-- [ ] **Ruby** gem — **wrap** the Rust core, shipped as a packaged gem. This is the clear-cut
-      reach call, already blessed in [cores.md](spec/design/cores.md) §6 item 4 ("ship Ruby …
-      as a wrapper, gem → Rust") and §3 (Ruby's GC'd, dynamic runtime surfaces **no** new
-      divergence axis Go doesn't already cover, so a native core is unjustified — Ruby "is not
-      the interesting case"). Wrap the **safe Rust** core (§2/§13) so memory-safety **and** the
-      untrusted-query guarantee carry through unchanged, and a Ruby host gets Rayon-grade
-      intra-query parallelism for free (the §2.2 pivot). The gem conforms **by construction**
-      (inherits Rust's corpus pass + byte-exact on-disk round-trip) and is a distribution
-      artifact, **not** an independent conformance voice — it echoes Rust, surfacing zero new
-      semantic divergence (§2; cores.md §1). Build it as a native Rust extension via
-      **`magnus` + `rb-sys`** (precompiled per-platform gem, the cleanest idiomatic packaging;
-      an `ffi`-gem-over-`cdylib` path is the fallback) — both are wrapper-module deps that never
-      touch a core manifest (the `bench/`/`web/` precedent, §14), and still need the §14
-      explicit confirmation before adding. In-process Ruby host functions pay the FFI upcall tax
-      (the §2.1 hotness pivot), so they ride on the **vectorized/batched host-function API**
-      below. **Not** the existing **Ruby file-format reference**
-      ([spec/fileformat/verify.rb](spec/fileformat/verify.rb) — the independent fourth
-      encoder/decoder behind the golden tests, `rust == go == ts == ruby`), which stays a
-      hand-written reference reader/writer; this is a separate shippable gem over the whole
-      engine. _(size: L wrap; §2/§13)_
+- [ ] **Ruby** gem — **wrap** the Rust core, shipped as a gem. The clear-cut reach call, blessed
+      in [cores.md](spec/design/cores.md) §6 item 4 ("ship Ruby … as a wrapper, gem → Rust") and
+      §3 (Ruby's GC'd, dynamic runtime surfaces **no** new divergence axis Go doesn't already
+      cover — a native core is unjustified; "Ruby is not the interesting case"). Wraps the **safe
+      Rust** core (§2/§13), so memory-safety, the pure built-in surface, and the cost meter carry
+      through unchanged — a wrap can't weaken them because it *is* the engine. Conforms **by
+      construction** (inherits Rust's corpus pass + byte-exact round-trip), a distribution
+      artifact, **not** an independent conformance voice (echoes Rust, zero new divergence — §2;
+      cores.md §1). **Not** the existing **Ruby file-format reference**
+      ([spec/fileformat/verify.rb](spec/fileformat/verify.rb), the independent fourth
+      encoder/decoder behind the golden tests, `rust == go == ts == ruby`) — that stays a
+      reference reader/writer; this is a shippable gem over the whole engine.
+  - [x] **Slice 1 — the gem + the FFI seam.** A standalone `cdylib` crate (`impl/ruby/ext`, the
+        `cli/` precedent — path-dep on the core, FFI concerns confined, core stays hermetic)
+        exposing an 8-function C ABI (`open_memory`/`create`/`open`/`execute`/`commit`/`close`/
+        `free`/`abi_version`) with a single self-describing little-endian result buffer; the
+        **only `unsafe` in the product path**, `catch_unwind`-guarded at every entry. A pure-Ruby
+        gem (`impl/ruby/lib`) loads it through stdlib **`fiddle`** (no third-party dep — §14):
+        idiomatic `Jed::Database`/`Result`/`Row`/`Error` (sqlstate-bearing), autocommit + explicit
+        `BEGIN`/`ROLLBACK` through one handle, cells rendered via `Value::render()` (the corpus
+        text contract) with NULL→`nil` and native coercion for `i16`/`i32`/`i64`/`f32`/`f64`/
+        `boolean`. `rake ruby:build`/`ruby:test` (minitest **seam** tests — marshalling/lifecycle/
+        coercion/errors/persistence, what the corpus can't express §10), folded into `rake test`.
+        → [ruby.md](spec/design/ruby.md)
+  - [ ] _follow-on (each its own slice):_ **bind params `$N`** (typed `Value` marshalling — the
+        core's `execute(sql, params)` already supports it); **richer typed values** (opt-in
+        `BigDecimal`/`Time`/`Date` for the String-today types); **host-loaded bundles**
+        (`load_unicode_data`/`load_time_zone_data` for collation/tz); **distributable packaging**
+        — a `gem install`-able native gem via **`rb-sys` + precompiled platform gems** (or
+        `magnus` for richer Rust ergonomics), replacing the in-repo `rake ruby:build` step (a
+        wrapper-module dep, the `bench/`/`web/` precedent §14, needs the §14 confirmation before
+        adding); an optional **Ruby conformance runner**. In-process Ruby host functions pay the
+        FFI upcall tax (the §2.1 hotness pivot), so they ride on the **vectorized/batched
+        host-function API** below. _(size: L wrap; §2/§13)_
 - [x] **Runtime function registry — the §5 dispatch foundation** — resolution for built-in named
       scalar functions + aggregates is now data-driven over the generated catalog tables (one
       `(name, arg_families)` lookup); the per-row kernel still reached by id, hand-written per core.

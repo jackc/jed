@@ -7,6 +7,10 @@
 # Rust build artifacts (Cargo.lock IS committed — jed is an app, not a library).
 /impl/rust/target/
 /cli/target/
+# Ruby gem's native-extension (cdylib) build artifacts; ext/Cargo.lock IS committed.
+/impl/ruby/ext/target/
+# Built gem packages.
+/impl/ruby/*.gem
 
 # Go build artifacts. NOTE: do not ignore "*.test" — the conformance corpus files
 # use that extension (spec/conformance/suites/**/*.test).

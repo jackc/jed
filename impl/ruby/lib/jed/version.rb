@@ -1,0 +1,9 @@
+# frozen_string_literal: true
+
+module Jed
+  VERSION = "0.1.0"
+
+  # The native C-ABI version this gem speaks. Must equal `jed_abi_version()` in the loaded
+  # cdylib; the FFI loader refuses a mismatch (spec/design/ruby.md §5).
+  ABI_VERSION = 1
+end

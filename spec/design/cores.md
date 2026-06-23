@@ -343,7 +343,9 @@ The live question is now **goal 2 — language reach**, governed by §2, not §1
    spec-completeness proof. Wraps can ship earlier (they conform by construction, §2); for more
    hardening *meanwhile*, build the Phase 8 generative harness, not a 4th core.
 4. **Ship Ruby / browser-JS as wrappers** (gem → Rust, package → Rust-WASM) when the
-   ecosystem is wanted; the native TS core already covers the JS *conformance* voice (§5).
+   ecosystem is wanted; the native TS core already covers the JS *conformance* voice (§5). The
+   **Ruby gem** has begun on this path — slice 1 (the gem + the C-ABI/`fiddle` FFI seam over the
+   safe Rust core) is built; see [ruby.md](ruby.md) and TODO.md Phase 9.
 5. **Browser build** remains the §5 split: native-TS-for-conformance *and*
    Rust-WASM-for-shipping.
 
