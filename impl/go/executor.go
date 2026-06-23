@@ -873,6 +873,11 @@ type SessionOptions struct {
 	// (spec/design/temp-tables.md §7); 0 ⇒ unlimited; nil ⇒ the engine default (DefaultTempBuffers).
 	// Bounds the RETAINED temp storage neither cost ceiling covers — an over-budget temp write aborts 54P03.
 	TempBuffers *int
+	// TimeZone is the session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone a
+	// timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts. "" ⇒ UTC. Accepts
+	// UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ bundle provides; an invalid value
+	// here falls back to UTC at mint (the validated setter is Session.SetTimeZone — 22023).
+	TimeZone string
 }
 
 // TxStatus is the session transaction status (spec/design/session.md §2.2) — PostgreSQL's three
@@ -996,6 +1001,11 @@ type Session struct {
 	// it does NOT roll back with a transaction (PG SET SESSION). The map is a reference type, so the
 	// activate() value swap keeps each session's own map (like the privilege envelope).
 	vars map[string]string
+	// timeZone is the resolved session time zone (spec/design/session.md §6.2, timezones.md §9.4): the
+	// zone a timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts. Resolved
+	// once (from SessionOptions.TimeZone at mint, or SetTimeZone) to a cheap ZoneRef (UTC = Fixed 0);
+	// the evaluator reads it via the active session. SESSION state (no storage effect).
+	timeZone ZoneRef
 	// readPin is the read pin for a data-modifying WITH statement (spec/design/writable-cte.md §2):
 	// the single pre-statement snapshot every sub-statement reads, so the data-modifying CTEs and the
 	// primary cannot observe each other's table writes (their writes still accumulate into the
@@ -1063,7 +1073,30 @@ func newSessionWithOptions(opts SessionOptions) Session {
 	if opts.TempBuffers != nil {
 		s.tempBuffers = *opts.TempBuffers
 	}
+	// Resolve the configured zone once; an invalid value falls back to UTC at mint (the validated
+	// path is SetTimeZone, which surfaces 22023). timezones.md §9.4.
+	tzName := opts.TimeZone
+	if tzName == "" {
+		tzName = "UTC"
+	}
+	if zr, ok := ResolveZone(tzName); ok {
+		s.timeZone = zr
+	} else {
+		s.timeZone = ZoneRef{Fixed: true, Off: 0}
+	}
 	return s
+}
+
+// SetTimeZone sets the session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone a
+// timestamptz is decomposed in. Accepts UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ
+// bundle provides; a name no bundle provides (and not a built-in) is 22023, the value unchanged.
+func (s *Session) SetTimeZone(zone string) error {
+	zr, ok := ResolveZone(zone)
+	if !ok {
+		return NewError(InvalidParameterValue, fmt.Sprintf("time zone %q not recognized", zone))
+	}
+	s.timeZone = zr
+	return nil
 }
 
 // activeTx is an open transaction (spec/design/transactions.md §4.2). writable is the access mode
@@ -1559,6 +1592,11 @@ func (db *Database) Var(name string) (string, bool) { return db.session.Var(name
 // ResetVars clears every session variable on the default session (§6.1) — PostgreSQL's RESET ALL for
 // the variable map (also the conformance harness # set: reset hook).
 func (db *Database) ResetVars() { db.session.ResetVars() }
+
+// SetTimeZone sets the time zone on the default session (spec/design/session.md §6.2, timezones.md
+// §9.4): the zone a timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts.
+// Accepts UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ bundle provides; else 22023.
+func (db *Database) SetTimeZone(zone string) error { return db.session.SetTimeZone(zone) }
 
 // SetMaxSQLLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
 // §13; spec/design/api.md §8). A statement whose text exceeds bytes is rejected with 54000 at
@@ -2550,6 +2588,8 @@ func exprCallsSeqMutator(e *Expr) bool {
 		return false
 	case ExprCast:
 		return exprCallsSeqMutator(&e.Cast.Inner)
+	case ExprExtract:
+		return exprCallsSeqMutator(&e.Extract.Source)
 	case ExprCollate:
 		return exprCallsSeqMutator(&e.Collate.Inner)
 	case ExprUnary:
@@ -2979,6 +3019,8 @@ func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
 		}
 	case ExprCast:
 		collectExprPrivs(&e.Cast.Inner, req, locals)
+	case ExprExtract:
+		collectExprPrivs(&e.Extract.Source, req, locals)
 	case ExprCollate:
 		collectExprPrivs(&e.Collate.Inner, req, locals)
 	case ExprUnary:
@@ -3070,6 +3112,8 @@ func exprReadsColumns(e *Expr) bool {
 		return false
 	case ExprCast:
 		return exprReadsColumns(&e.Cast.Inner)
+	case ExprExtract:
+		return exprReadsColumns(&e.Extract.Source)
 	case ExprCollate:
 		return exprReadsColumns(&e.Collate.Inner)
 	case ExprUnary:
@@ -8017,6 +8061,8 @@ func countSelfRefsExpr(e Expr, name string) int {
 		return countSelfRefsExpr(e.QuantifiedSubquery.Lhs, name) + countSelfRefsQuery(e.QuantifiedSubquery.Query, name)
 	case ExprCast:
 		return countSelfRefsExpr(e.Cast.Inner, name)
+	case ExprExtract:
+		return countSelfRefsExpr(e.Extract.Source, name)
 	case ExprCollate:
 		return countSelfRefsExpr(e.Collate.Inner, name)
 	case ExprUnary:
@@ -12502,6 +12548,18 @@ const (
 	// timestamptz). Reads the engine-global loaded zone set; unknown zone 22023, NULL propagates,
 	// ±infinity passes through.
 	reAtTimeZone
+	// reDateTrunc is date_trunc(unit, value[, zone]) (timezones.md §9.1). sargs is [unit, value] or
+	// [unit, value, zone]; for a timestamptz value the truncation is in zone (3-arg) or the session
+	// zone (2-arg), charging the timezone unit. The result family is the value family.
+	reDateTrunc
+	// reExtract is EXTRACT(field FROM value) (timezones.md §9.2). cText is the lowercased field
+	// (validated at resolve); operand is the value. For a timestamptz value every field but `epoch` is
+	// computed in the session zone (charging timezone).
+	reExtract
+	// reDateConvert is a cross-family datetime cast (timezones.md §9.3): operand cast to `result`
+	// (timestamp/timestamptz/date) from another datetime family. The casts crossing the timestamptz
+	// boundary consult the session zone (charging timezone); ±infinity and NULL pass through.
+	reDateConvert
 	reCase
 	// reScalarFunc is a scalar-function call (abs/round, spec/design/functions.md §9),
 	// evaluated per row in any context.
@@ -13418,6 +13476,8 @@ func exprHasAggregate(e Expr) bool {
 		return false
 	case ExprCast:
 		return exprHasAggregate(e.Cast.Inner)
+	case ExprExtract:
+		return exprHasAggregate(e.Extract.Source)
 	case ExprCollate:
 		return exprHasAggregate(e.Collate.Inner)
 	case ExprUnary:
@@ -13511,6 +13571,8 @@ func rejectCheckStructure(e Expr) error {
 		return nil
 	case ExprCast:
 		return rejectCheckStructure(e.Cast.Inner)
+	case ExprExtract:
+		return rejectCheckStructure(e.Extract.Source)
 	case ExprCollate:
 		return rejectCheckStructure(e.Collate.Inner)
 	case ExprUnary:
@@ -13627,6 +13689,8 @@ func rejectDefaultStructure(e Expr) error {
 		return nil
 	case ExprCast:
 		return rejectDefaultStructure(e.Cast.Inner)
+	case ExprExtract:
+		return rejectDefaultStructure(e.Extract.Source)
 	case ExprCollate:
 		return rejectDefaultStructure(e.Collate.Inner)
 	case ExprUnary:
@@ -13739,6 +13803,8 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 			note(e.Column)
 		case ExprCast:
 			walk(e.Cast.Inner)
+		case ExprExtract:
+			walk(e.Extract.Source)
 		case ExprCollate:
 			walk(e.Collate.Inner)
 		case ExprUnary:
@@ -14545,6 +14611,51 @@ func resolveTimezone(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 	return &rExpr{kind: reAtTimeZone, lhs: zoneR, rhs: valueR, atTzToTimestamptz: toTimestamptz}, result, nil
 }
 
+// resolveDateTrunc resolves date_trunc(unit, value[, zone]) (timezones.md §9.1). unit is text (a
+// runtime value, validated at eval); value is timestamp / timestamptz / interval; the optional zone
+// (text) is the 3-arg form, valid only for a timestamptz value. The result family is the value
+// family. A non-text unit/zone, a non-datetime value, or the 3-arg form on a non-timestamptz value is
+// 42883 (a date value also has no overload — jed has no implicit date->timestamp cast).
+func resolveDateTrunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if len(fc.Args) != 2 && len(fc.Args) != 3 {
+		return nil, resolvedType{}, noFuncOverload("date_trunc")
+	}
+	textHint := Text
+	unitR, unitT, err := resolve(s, *fc.Args[0], &textHint, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	valueR, valueT, err := resolve(s, *fc.Args[1], nil, ag, params)
+	if err != nil {
+		return nil, resolvedType{}, err
+	}
+	if unitT.kind != rtText && unitT.kind != rtNull {
+		return nil, resolvedType{}, noFuncOverload("date_trunc")
+	}
+	var result resolvedType
+	switch valueT.kind {
+	case rtTimestamp, rtTimestamptz, rtInterval:
+		result = valueT
+	default:
+		return nil, resolvedType{}, noFuncOverload("date_trunc")
+	}
+	sargs := []*rExpr{unitR, valueR}
+	if len(fc.Args) == 3 {
+		if result.kind != rtTimestamptz {
+			return nil, resolvedType{}, noFuncOverload("date_trunc")
+		}
+		zoneR, zoneT, err := resolve(s, *fc.Args[2], &textHint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if zoneT.kind != rtText && zoneT.kind != rtNull {
+			return nil, resolvedType{}, noFuncOverload("date_trunc")
+		}
+		sargs = append(sargs, zoneR)
+	}
+	return &rExpr{kind: reDateTrunc, sargs: sargs}, result, nil
+}
+
 // resolveRangeFunc resolves a polymorphic range accessor over the anyrange pseudo-family
 // (range-functions.md §1). Simpler than resolveArrayFunc — the accessors take a single anyrange arg
 // with no anyelement arg, so there is no element-hint literal adaptation. lower/upper resolve to ELEM
@@ -15212,6 +15323,18 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
 		}
 		return resolveTimezone(s, fc, ag, params)
+	}
+	// date_trunc(unit, value[, zone]) (timezones.md §9.1) — polymorphic on the value family (the
+	// result type is the value type) + an optional 3rd zone arg only on a timestamptz, so it resolves
+	// before the generic by-name dispatch (which has no such polymorphism).
+	if name == "date_trunc" {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		return resolveDateTrunc(s, fc, ag, params)
 	}
 	// Otherwise the registry (the catalog descriptor tables) decides whether the name is an
 	// aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -16429,6 +16552,37 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			return nil, resolvedType{}, err
 		}
 		return inner, ty, nil
+	case ExprExtract:
+		// EXTRACT(field FROM source) (timezones.md §9.2, grammar.md §50). The field is SYNTACTIC and
+		// validated at RESOLVE (not per row): an unsupported field for the source type is 0A000, an
+		// unrecognized field is 22023 — surfaced by probing the kernel with a zero value of the source's
+		// family. The source must be a datetime type (else 42883); the result is numeric.
+		srcR, srcT, err := resolve(s, e.Extract.Source, nil, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		// A NULL source has no resolvable family; the value propagates to NULL at eval (the field is
+		// not validated — a documented narrow edge vs. PG).
+		if srcT.kind != rtNull {
+			var probe extractSrc
+			switch srcT.kind {
+			case rtTimestamp:
+				probe = extractSrc{kind: srcTs}
+			case rtTimestamptz:
+				probe = extractSrc{kind: srcTstz}
+			case rtDate:
+				probe = extractSrc{kind: srcDate}
+			case rtInterval:
+				probe = extractSrc{kind: srcIv}
+			default:
+				return nil, resolvedType{}, NewError(UndefinedFunction,
+					"function extract(text, "+rtName(srcT)+") does not exist")
+			}
+			if _, err := extractField(e.Extract.Field, probe); err != nil {
+				return nil, resolvedType{}, err
+			}
+		}
+		return &rExpr{kind: reExtract, cText: e.Extract.Field, operand: srcR}, resolvedType{kind: rtDecimal}, nil
 	case ExprCast:
 		// An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the
 		// string-literal form `'{…}'::T[]` and a bare NULL; every other array cast (runtime
@@ -16538,17 +16692,42 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if target.IsUuid() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to uuid is not supported yet")
 		}
-		// timestamp casts are deferred (spec/design/timestamp.md §6): casting TO a datetime is 0A000.
-		if target.IsTimestamp() || target.IsTimestamptz() {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to a timestamp type is not supported yet")
+		// Cross-family datetime casts (timezones.md §9.3): a timestamp/timestamptz/date TARGET from
+		// another datetime family. A same-family cast is the identity; a cross-family cast becomes a
+		// reDateConvert node (the zone-crossing ones read the session zone at eval); any non-datetime
+		// source is the deferred 0A000. A NULL operand adapts to the target. text↔datetime casts stay
+		// deferred and fall through (a non-datetime source is rejected here).
+		if target.IsTimestamp() || target.IsTimestamptz() || target.IsDate() {
+			if e.Cast.Inner.Kind == ExprParam {
+				t := target
+				pinner, _, err := resolve(s, e.Cast.Inner, &t, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return pinner, resolvedTypeOf(target), nil
+			}
+			inner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			toRt := resolvedTypeOf(target)
+			switch {
+			case ity.kind == rtNull:
+				return inner, toRt, nil
+			case ity.kind == rtTimestamp && target.IsTimestamp(),
+				ity.kind == rtTimestamptz && target.IsTimestamptz(),
+				ity.kind == rtDate && target.IsDate():
+				return inner, ity, nil
+			case ity.kind == rtTimestamp || ity.kind == rtTimestamptz || ity.kind == rtDate:
+				return &rExpr{kind: reDateConvert, operand: inner, result: target}, toRt, nil
+			default:
+				return nil, resolvedType{}, NewError(FeatureNotSupported,
+					"cannot cast "+rtName(ity)+" to "+target.CanonicalName())
+			}
 		}
 		// interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000.
 		if target.IsInterval() {
 			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to an interval type is not supported yet")
-		}
-		// date casts are deferred (spec/design/date.md §5/§6): casting TO date is 0A000.
-		if target.IsDate() {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to a date type is not supported yet")
 		}
 		// A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
 		// `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
@@ -18785,6 +18964,88 @@ func typeError(msg string) error { return NewError(DatatypeMismatch, msg) }
 // operands LHS-before-RHS); leaf nodes (column/constants) charge nothing. Both operands
 // are always evaluated — there is no short-circuit, so the count never depends on operand
 // values (spec/design/cost.md §3).
+// evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) of the non-NULL value v
+// to `to` (Timestamp/Timestamptz/Date). The casts crossing the timestamptz boundary consult the
+// session zone (charging timezone); the others are zone-free. ±infinity maps to the target's own
+// sentinel. The (source family, to) pair is guaranteed cross-family by the resolver.
+func evalDateConvert(v Value, to ScalarType, env *evalEnv, m *Meter) (Value, error) {
+	const microsPerDay int64 = 86_400 * 1_000_000
+	microsToDate := func(mc int64) Value {
+		switch mc {
+		case PosInfinity:
+			return DateValue(DatePosInfinity)
+		case NegInfinity:
+			return DateValue(DateNegInfinity)
+		default:
+			return DateValue(int32(floorDiv(mc, microsPerDay)))
+		}
+	}
+	dateToMicros := func(d int32) int64 {
+		switch d {
+		case DatePosInfinity:
+			return PosInfinity
+		case DateNegInfinity:
+			return NegInfinity
+		default:
+			return int64(d) * microsPerDay
+		}
+	}
+	isInf := func(mc int64) bool { return mc == PosInfinity || mc == NegInfinity }
+	zoneCharge := func() (ZoneRef, error) {
+		zr := env.exec.session.timeZone
+		m.Charge(Costs.Timezone)
+		if err := m.Guard(); err != nil {
+			return ZoneRef{}, err
+		}
+		return zr, nil
+	}
+	switch {
+	case v.Kind == ValTimestamp && to == Date:
+		return microsToDate(v.Int), nil
+	case v.Kind == ValDate && to == Timestamp:
+		return TimestampValue(dateToMicros(int32(v.Int))), nil
+	case v.Kind == ValTimestamptz && to == Timestamp:
+		if isInf(v.Int) {
+			return TimestampValue(v.Int), nil
+		}
+		zr, err := zoneCharge()
+		if err != nil {
+			return Value{}, err
+		}
+		return TimestampValue(InstantToLocalMicros(zr, v.Int)), nil
+	case v.Kind == ValTimestamp && to == Timestamptz:
+		if isInf(v.Int) {
+			return TimestamptzValue(v.Int), nil
+		}
+		zr, err := zoneCharge()
+		if err != nil {
+			return Value{}, err
+		}
+		return TimestamptzValue(LocalToInstantMicros(zr, v.Int)), nil
+	case v.Kind == ValTimestamptz && to == Date:
+		if isInf(v.Int) {
+			return microsToDate(v.Int), nil
+		}
+		zr, err := zoneCharge()
+		if err != nil {
+			return Value{}, err
+		}
+		return microsToDate(InstantToLocalMicros(zr, v.Int)), nil
+	case v.Kind == ValDate && to == Timestamptz:
+		mid := dateToMicros(int32(v.Int))
+		if isInf(mid) {
+			return TimestamptzValue(mid), nil
+		}
+		zr, err := zoneCharge()
+		if err != nil {
+			return Value{}, err
+		}
+		return TimestamptzValue(LocalToInstantMicros(zr, mid)), nil
+	default:
+		panic("resolver restricts DateConvert to cross-family datetime casts")
+	}
+}
+
 func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 	// Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). eval recurses once
 	// per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot;
@@ -19352,6 +19613,124 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			return TimestamptzValue(LocalToInstantMicros(zr, micros)), nil
 		}
 		return TimestampValue(InstantToLocalMicros(zr, micros)), nil
+	case reDateTrunc:
+		m.Charge(Costs.OperatorEval)
+		uv, err := e.sargs[0].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		vv, err := e.sargs[1].eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		var zv *Value
+		if len(e.sargs) == 3 {
+			z, err := e.sargs[2].eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			zv = &z
+		}
+		if uv.Kind == ValNull || vv.Kind == ValNull || (zv != nil && zv.Kind == ValNull) {
+			return NullValue(), nil
+		}
+		unitS := uv.Str
+		switch vv.Kind {
+		case ValTimestamp:
+			r, err := dateTruncMicros(unitS, vv.Int)
+			if err != nil {
+				return Value{}, err
+			}
+			return TimestampValue(r), nil
+		case ValInterval:
+			r, err := dateTruncInterval(unitS, vv.Iv)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntervalValue(r), nil
+		case ValTimestamptz:
+			mc := vv.Int
+			if mc == PosInfinity || mc == NegInfinity {
+				if _, err := dateTruncMicros(unitS, mc); err != nil { // still validate the unit
+					return Value{}, err
+				}
+				return TimestamptzValue(mc), nil
+			}
+			var zr ZoneRef
+			if zv != nil {
+				z, ok := ResolveZone(zv.Str)
+				if !ok {
+					return Value{}, NewError(InvalidParameterValue,
+						fmt.Sprintf("time zone %q not recognized", zv.Str))
+				}
+				zr = z
+			} else {
+				zr = env.exec.session.timeZone
+			}
+			m.Charge(Costs.Timezone)
+			if err := m.Guard(); err != nil {
+				return Value{}, err
+			}
+			local := InstantToLocalMicros(zr, mc)
+			trunc, err := dateTruncMicros(unitS, local)
+			if err != nil {
+				return Value{}, err
+			}
+			return TimestamptzValue(LocalToInstantMicros(zr, trunc)), nil
+		default:
+			panic("resolver restricts date_trunc to ts/tstz/interval")
+		}
+	case reExtract:
+		m.Charge(Costs.OperatorEval)
+		vv, err := e.operand.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		field := e.cText
+		var src extractSrc
+		switch vv.Kind {
+		case ValNull:
+			return NullValue(), nil
+		case ValTimestamp:
+			src = extractSrc{kind: srcTs, local: vv.Int}
+		case ValDate:
+			src = extractSrc{kind: srcDate, days: int32(vv.Int)}
+		case ValInterval:
+			src = extractSrc{kind: srcIv, iv: vv.Iv}
+		case ValTimestamptz:
+			mc := vv.Int
+			// `epoch` is zone-independent (the instant); every other field decomposes in the session
+			// zone — so only the zone-consulting fields charge `timezone`.
+			if field == "epoch" || mc == PosInfinity || mc == NegInfinity {
+				src = extractSrc{kind: srcTstz, instant: mc, local: mc, offsetSecs: 0}
+			} else {
+				zr := env.exec.session.timeZone
+				m.Charge(Costs.Timezone)
+				if err := m.Guard(); err != nil {
+					return Value{}, err
+				}
+				local := InstantToLocalMicros(zr, mc)
+				off := int64(OffsetAtRef(zr, floorDiv(mc, 1_000_000)).Utoff)
+				src = extractSrc{kind: srcTstz, instant: mc, local: local, offsetSecs: off}
+			}
+		default:
+			panic("resolver restricts EXTRACT to ts/tstz/date/interval")
+		}
+		d, err := extractField(field, src)
+		if err != nil {
+			return Value{}, err
+		}
+		return DecimalValue(d), nil
+	case reDateConvert:
+		m.Charge(Costs.OperatorEval)
+		v, err := e.operand.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		if v.Kind == ValNull {
+			return NullValue(), nil
+		}
+		return evalDateConvert(v, e.result, env, m)
 	case reCase:
 		// CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are
 		// evaluated in order and evaluation STOPS at the first TRUE — a FALSE or NULL/UNKNOWN

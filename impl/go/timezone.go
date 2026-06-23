@@ -781,13 +781,58 @@ func InstantToLocalMicros(zr ZoneRef, instantMicros int64) int64 {
 	return instantMicros + int64(off.Utoff)*1_000_000
 }
 
-// LocalToInstantMicros is timestamp AT TIME ZONE zone (§4): instant = wall − utoff. Two-probe
-// resolution; at a DST gap/overlap the branch matches PostgreSQL (oracle-pinned, timezones.md §6).
+// LocalToInstantMicros is timestamp AT TIME ZONE zone (§4): instant = wall − utoff. The offset is
+// chosen by determineLocalOffset, matching PostgreSQL's DetermineTimeZoneOffset at a DST gap/overlap
+// (oracle-pinned, timezones.md §6).
 func LocalToInstantMicros(zr ZoneRef, wallMicros int64) int64 {
 	wallSecs := floorDiv(wallMicros, 1_000_000)
-	off1 := int64(OffsetAtRef(zr, wallSecs).Utoff)
-	off2 := int64(OffsetAtRef(zr, wallSecs-off1).Utoff)
-	return wallMicros - off2*1_000_000
+	chosen := determineLocalOffset(zr, wallSecs)
+	return wallMicros - chosen*1_000_000
+}
+
+// determineLocalOffset chooses the UT offset (seconds) to interpret a wall-clock wallSecs reading
+// with, matching PostgreSQL's DetermineTimeZoneOffset (src/timezone/pgtz.c) at a DST boundary. For a
+// normal time both candidate offsets agree; for a spring-forward GAP (a nonexistent wall clock) PG
+// uses the *before* (earlier) offset; for a fall-back OVERLAP (a doubled wall clock) PG uses the
+// *after* (later) offset. A fixed-offset zone has no boundary, so the single offset is returned.
+func determineLocalOffset(zr ZoneRef, wallSecs int64) int64 {
+	const day int64 = 86_400
+	// The offsets a day before / after wallSecs (taken as if UTC). A DST transition is never less
+	// than a day apart, so at most one boundary lies in this 2-day window; if both ends agree there
+	// is no boundary near wallSecs and the time is unambiguous.
+	offLo := int64(OffsetAtRef(zr, wallSecs-day).Utoff)
+	offHi := int64(OffsetAtRef(zr, wallSecs+day).Utoff)
+	if offLo == offHi {
+		return offLo
+	}
+	// Binary-search the boundary: the smallest instant in (wall-day, wall+day] whose offset is no
+	// longer offLo (i.e. has become offHi).
+	lo, hi := wallSecs-day, wallSecs+day
+	for lo < hi {
+		mid := lo + (hi-lo)/2
+		if int64(OffsetAtRef(zr, mid).Utoff) == offLo {
+			lo = mid + 1
+		} else {
+			hi = mid
+		}
+	}
+	boundary := lo
+	beforeTime := wallSecs - offLo
+	afterTime := wallSecs - offHi
+	beforeSide := beforeTime < boundary
+	afterSide := afterTime < boundary
+	switch {
+	case beforeSide == afterSide:
+		// Both candidate instants fall on the same side of the boundary — an ordinary time.
+		if beforeSide {
+			return offLo
+		}
+		return offHi
+	case beforeTime > afterTime:
+		return offLo // gap: the before (earlier) offset
+	default:
+		return offHi // overlap: the after (later) offset
+	}
 }
 
 // parseFixedOffset parses [+|-]HH[:MM[:SS]] (the WHOLE string). Requires a leading sign. POSIX sign

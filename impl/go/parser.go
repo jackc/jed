@@ -3476,6 +3476,36 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		}
 		return Expr{Kind: ExprCast, Cast: &CastExpr{Inner: inner, TypeName: typeName, TypeMod: typeMod}}, nil
 	}
+	// EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
+	// is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
+	// (the one-token lookahead, §8). The field is an identifier or a string literal (lowercased).
+	if p.peekKeyword() == "extract" && p.peekKindAt(1) == TokLParen {
+		p.advance() // EXTRACT
+		if err := p.expect(TokLParen); err != nil {
+			return Expr{}, err
+		}
+		var field string
+		if p.peekKindAt(0) == TokStr {
+			field = p.advance().Word
+		} else {
+			id, err := p.expectIdentifier()
+			if err != nil {
+				return Expr{}, err
+			}
+			field = id
+		}
+		if err := p.expectKeyword("from"); err != nil {
+			return Expr{}, err
+		}
+		source, err := p.parseExpr()
+		if err != nil {
+			return Expr{}, err
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprExtract, Extract: &ExtractExpr{Field: strings.ToLower(field), Source: source}}, nil
+	}
 	// A typed string literal `type '...'` (grammar.md §36) — PostgreSQL's `type 'string'`, equal to
 	// CAST('string' AS type) over a string-literal operand: ANY type-naming word immediately followed
 	// by a string (`INTERVAL '1 day'`, `TIMESTAMP '...'`, `INTEGER '42'`, `BYTEA '\xDE'`, …).

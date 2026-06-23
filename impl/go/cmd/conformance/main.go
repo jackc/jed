@@ -199,6 +199,17 @@ func loadTimezone(name string) error {
 	return nil
 }
 
+// parseTimezoneDirective parses a `# timezone: <zone>` line (spec/design/session.md §6.2, timezones.md
+// §9.4): the SESSION time zone for the next record (the zone a timestamptz decomposes in). Per-record
+// (reset to UTC after, like `# set:`). Distinct from `# load-timezone:` (which loads the bundle).
+func parseTimezoneDirective(line string) (string, bool) {
+	body, ok := strings.CutPrefix(strings.TrimSpace(strings.TrimPrefix(line, "#")), "timezone:")
+	if !ok {
+		return "", false
+	}
+	return strings.TrimSpace(body), true
+}
+
 // parseFixtureDirective parses a file-level `# fixture: <spec-relative-path>` line — the corpus's way
 // to run a file against a PRE-BUILT database image instead of a fresh database, so a test can exercise
 // on-disk state SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded index — the
@@ -657,6 +668,7 @@ func runFile(text string) error {
 	var pendingTempBuffers *int
 	var pendingSharedTempMem *int
 	var pendingVars []varPair
+	var pendingTimezone *string
 	for i < len(lines) {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
@@ -736,6 +748,8 @@ func runFile(text string) error {
 				pendingTempBuffers = &n
 			} else if vars, ok := parseSetDirective(line); ok {
 				pendingVars = append(pendingVars, vars...)
+			} else if z, ok := parseTimezoneDirective(line); ok {
+				pendingTimezone = &z
 			} else if s, ok := parseSeedDirective(line); ok {
 				pendingSeed = &s
 			} else if c, ok := parseClockDirective(line); ok {
@@ -845,6 +859,17 @@ func runFile(text string) error {
 			}
 		}
 		pendingVars = nil
+		// Apply the per-record session time zone (spec/design/session.md §6.2, timezones.md §9.4):
+		// reset to UTC, then set the pending # timezone:, so a directive decorates only its record and
+		// never leaks forward. A named zone must already be loaded (# load-timezone:).
+		tz := "UTC"
+		if pendingTimezone != nil {
+			tz = *pendingTimezone
+		}
+		if err := db.SetTimeZone(tz); err != nil {
+			return fmt.Errorf("# timezone: %w", err)
+		}
+		pendingTimezone = nil
 		fields := strings.Fields(line)
 		switch fields[0] {
 		case "statement":

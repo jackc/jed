@@ -671,6 +671,9 @@ const (
 	ExprParam
 	// ExprCast is CAST(inner AS type).
 	ExprCast
+	// ExprExtract is EXTRACT(field FROM source) — the datetime field special form (timezones.md §9.2,
+	// grammar.md §50). The field is syntactic; resolves to a numeric.
+	ExprExtract
 	// ExprCollate is `expr COLLATE "name"` — the postfix collation operator
 	// (spec/design/collation.md §1).
 	ExprCollate
@@ -831,6 +834,7 @@ type Expr struct {
 	TypeLitName string       // ExprTypedLiteral (the named type, e.g. "integer", "interval")
 	TypeLitText string       // ExprTypedLiteral (the literal's string, coerced to the type at resolve)
 	Cast        *CastExpr    // ExprCast
+	Extract     *ExtractExpr // ExprExtract
 	Collate     *CollateExpr // ExprCollate
 	Unary       *UnaryExpr   // ExprUnary
 	Binary      *BinaryExpr
@@ -894,6 +898,14 @@ type CastExpr struct {
 	Inner    Expr
 	TypeName string
 	TypeMod  *TypeMod
+}
+
+// ExtractExpr is EXTRACT(Field FROM Source) (spec/design/timezones.md §9.2, grammar.md §50) — the
+// datetime field special form. Field is the syntactic field name (identifier or string literal,
+// lowercased at parse); Source is the datetime expression. Resolves to a numeric.
+type ExtractExpr struct {
+	Field  string
+	Source Expr
 }
 
 // CollateExpr is `Inner COLLATE "Collation"` — the postfix collation operator
