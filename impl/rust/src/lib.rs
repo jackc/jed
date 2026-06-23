@@ -281,6 +281,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // DISTINCT inside an aggregate — COUNT(DISTINCT x), SUM/AVG/MIN/MAX(DISTINCT x): fold only the
     // distinct non-NULL argument values, value-canonically deduped (spec/design/aggregates.md §5).
     "query.aggregate_distinct",
+    // FILTER (WHERE cond) on an aggregate — agg(x) FILTER (WHERE cond): fold only the input rows for
+    // which cond is TRUE (spec/design/aggregates.md §11). 42809 on a non-aggregate, 0A000 on a window.
+    "query.aggregate_filter",
     // GROUP BY: one row per grouping-key combination + the grouping-error rule + ORDER BY over
     // grouping keys (spec/design/aggregates.md §5-6, grammar.md §18).
     "query.group_by",

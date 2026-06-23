@@ -9395,6 +9395,17 @@ impl Database {
                     }
                 };
                 for (si, spec) in plan.agg_specs.iter().enumerate() {
+                    // FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL)
+                    // contributes nothing to THIS aggregate — its operand is not evaluated and it is
+                    // not accumulated (aggregates.md §11). The filter's own operator_evals are charged
+                    // (it is evaluated per row, like the operand); aggregate_accumulate is charged only
+                    // for a row that passes. The pass/fold decision is deterministic (scan order is
+                    // cross-core identical), so the metered cost is identical across cores.
+                    if let Some(f) = &spec.filter
+                        && !f.eval(row, &env, &mut meter)?.is_true()
+                    {
+                        continue;
+                    }
                     meter.charge(COSTS.aggregate_accumulate);
                     let v = match &spec.operand {
                         Some(op) => op.eval(row, &env, &mut meter)?,
@@ -13448,12 +13459,16 @@ enum AggPlan {
 /// One resolved aggregate: its plan and its resolved argument expression (evaluated per
 /// input row against the real row). `operand` is `None` for COUNT(*). `distinct` (`COUNT(DISTINCT
 /// x)`, aggregates.md §5) folds only the distinct non-NULL argument values — the fold loop keeps a
-/// per-group value-canonical set and skips a value already seen. Only set in the aggregation stage;
-/// a window aggregate is never DISTINCT (0A000, rejected at resolve).
+/// per-group value-canonical set and skips a value already seen. `filter` (`SUM(x) FILTER (WHERE
+/// cond)`, aggregates.md §11) is a resolved boolean predicate evaluated per input row; only rows
+/// for which it is TRUE are folded (so the filter applies before the DISTINCT dedup). Both are
+/// only set in the aggregation stage; a window aggregate is never DISTINCT or FILTERed (0A000,
+/// rejected at resolve).
 struct AggSpec {
     plan: AggPlan,
     operand: Option<RExpr>,
     distinct: bool,
+    filter: Option<RExpr>,
 }
 
 /// A running aggregate accumulator (one per AggSpec), folded per input row then finalized.
@@ -15553,6 +15568,7 @@ fn resolve_aggregate(
     args: &[Expr],
     star: bool,
     distinct: bool,
+    filter: Option<&Expr>,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
@@ -15596,6 +15612,26 @@ fn resolve_aggregate(
         let (plan, result) = aggregate_plan(name, desc.result, &t);
         (plan, Some(r), result)
     };
+    // FILTER (WHERE cond): resolve the per-row predicate against the input row with aggregates
+    // FORBIDDEN — an aggregate inside FILTER is 42803, matching PG (aggregates.md §11). A
+    // non-boolean condition (or an untyped NULL, always unknown → folds no row) is 42804. The
+    // fold loop evaluates this per row and folds only the rows for which it is TRUE.
+    let rfilter = match filter {
+        Some(f) => {
+            let mut fsub = AggCtx::Forbidden;
+            let (rf, ft) = resolve(scope, f, None, &mut fsub, params)?;
+            match ft {
+                ResolvedType::Bool | ResolvedType::Null => Some(rf),
+                _ => {
+                    return Err(EngineError::new(
+                        SqlState::DatatypeMismatch,
+                        "argument of FILTER must be type boolean",
+                    ));
+                }
+            }
+        }
+        None => None,
+    };
     // Aggregate results follow the group-key values in the synthetic row. A grouped+window query
     // (`GroupedWindow`) collects into the SAME `agg_specs` (its window results are slotted after
     // every aggregate — spec/design/window.md §5.1).
@@ -15606,6 +15642,7 @@ fn resolve_aggregate(
                 plan,
                 operand,
                 distinct,
+                filter: rfilter,
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -15619,6 +15656,7 @@ fn resolve_aggregate(
                 plan,
                 operand,
                 distinct,
+                filter: rfilter,
             });
             Ok((RExpr::Column(slot), result))
         }
@@ -16184,6 +16222,7 @@ fn resolve_func_call(
     arg_names: Option<&[Option<String>]>,
     star: bool,
     distinct: bool,
+    filter: Option<&Expr>,
     variadic: bool,
     agg: &mut AggCtx,
     params: &mut ParamTypes,
@@ -16196,6 +16235,15 @@ fn resolve_func_call(
         return Err(EngineError::new(
             SqlState::WrongObjectType,
             format!("DISTINCT specified, but {lname} is not an aggregate function"),
+        ));
+    }
+    // FILTER is likewise aggregate-only: `abs(x) FILTER (WHERE …)` is 42809 (PG's wrong_object_type,
+    // "FILTER specified, but <fn> is not an aggregate function" — aggregates.md §11). Same placement
+    // as DISTINCT, so it covers every non-aggregate path before the per-kind dispatch.
+    if filter.is_some() && !is_aggregate_name(&lname) {
+        return Err(EngineError::new(
+            SqlState::WrongObjectType,
+            format!("FILTER specified, but {lname} is not an aggregate function"),
         ));
     }
     // The VARIADIC keyword is only valid on a VARIADIC function (array-functions.md §12). It
@@ -16258,7 +16306,7 @@ fn resolve_func_call(
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
     if is_aggregate_name(&lname) {
         reject_named(&lname, arg_names)?;
-        return resolve_aggregate(scope, &lname, args, star, distinct, agg, params);
+        return resolve_aggregate(scope, &lname, args, star, distinct, filter, agg, params);
     }
     // The polymorphic array functions (array-functions.md §2) are also kind="function", so they
     // must be intercepted BEFORE the generic scalar path — their `anyarray`/`anyelement` slots need
@@ -18044,6 +18092,7 @@ fn resolve(
             arg_names,
             star,
             distinct,
+            filter,
             variadic,
             over,
             over_name: _, // desugared to `over` before resolution (window.md §5)
@@ -18056,6 +18105,20 @@ fn resolve(
                     return Err(EngineError::new(
                         SqlState::FeatureNotSupported,
                         "DISTINCT is not implemented for window functions",
+                    ));
+                }
+                // FILTER over a window function is deferred (aggregates.md §11). A pure (non-aggregate)
+                // window function with FILTER is PG's own 0A000 ("FILTER is not implemented for
+                // non-aggregate window functions"); a window AGGREGATE with FILTER is allowed by PG but
+                // deferred here to a follow-on (a documented jed divergence) — both 0A000.
+                if filter.is_some() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        if is_aggregate_name(name) {
+                            "FILTER is not yet supported for window aggregate functions"
+                        } else {
+                            "FILTER is not implemented for non-aggregate window functions"
+                        },
                     ));
                 }
                 return resolve_window_call(scope, name, args, *star, wd, agg, params);
@@ -18074,7 +18137,16 @@ fn resolve(
             }
             let names = arg_names.as_deref().map(Vec::as_slice);
             resolve_func_call(
-                scope, name, args, names, *star, *distinct, *variadic, agg, params,
+                scope,
+                name,
+                args,
+                names,
+                *star,
+                *distinct,
+                filter.as_deref(),
+                *variadic,
+                agg,
+                params,
             )
         }
         Expr::Literal(Literal::Null) => Ok((RExpr::ConstNull, ResolvedType::Null)),

@@ -160,6 +160,11 @@ export type Expr =
       // it — DISTINCT on a scalar function is 42809, on a window function 0A000, and
       // f(DISTINCT *) / f(DISTINCT) is a 42601 syntax error.
       distinct: boolean;
+      // The FILTER (WHERE cond) condition when present (SUM(x) FILTER (WHERE y > 0) —
+      // aggregates.md §11): the aggregate folds only the input rows for which cond is TRUE.
+      // null/undefined for a plain call. Only an aggregate accepts it — FILTER on a scalar function
+      // is 42809, on a window function 0A000; an aggregate inside cond is 42803, a non-boolean 42804.
+      filter?: Expr | null;
       variadic: boolean;
       // Set when the call carries a trailing `OVER (...)` window clause (a WINDOW-function call —
       // spec/design/window.md). null/undefined for an ordinary scalar/aggregate/SRF call. A

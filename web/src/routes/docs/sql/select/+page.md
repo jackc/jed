@@ -151,7 +151,8 @@ ORDER BY on_day;`;
 `SELECT` supports the usual shape: `WHERE`, `ORDER BY`, `LIMIT` / `OFFSET`, `DISTINCT`, joins,
 `GROUP BY` with `HAVING`, set operations, subqueries, and `WITH` (common table expressions).
 Aggregates use PostgreSQL-style widening
-(for example, `sum` over `numeric` returns `numeric`, exact).
+(for example, `sum` over `numeric` returns `numeric`, exact), and accept a leading `DISTINCT`
+(`count(DISTINCT x)`) and a trailing `FILTER (WHERE …)` (`count(*) FILTER (WHERE x > 0)`).
 
 Grouping and aggregation:
 

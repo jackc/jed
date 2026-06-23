@@ -1,0 +1,118 @@
+# FILTER (WHERE cond) on an aggregate — agg(args) FILTER (WHERE cond)
+# (spec/design/aggregates.md §11). The aggregate folds only the input rows for which cond is
+# TRUE: a FALSE or NULL cond excludes the row (it contributes nothing), so a group whose every
+# row is filtered out is COUNT 0 and SUM/AVG/MIN/MAX NULL, exactly like an empty group. FILTER
+# works whole-table and per GROUP, in HAVING, and composes with DISTINCT (the filter applies
+# first, then the dedup). cond is an ordinary boolean expression over the input row: a non-boolean
+# cond is 42804, an aggregate inside it is 42803. FILTER on a scalar function is 42809; on a window
+# function 0A000.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.aggregates, query.group_by, query.having, query.aggregate_distinct, query.aggregate_filter, query.window, types.i32, types.decimal, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, a i32, b i32)
+
+statement ok
+INSERT INTO t VALUES (1,1,10),(2,1,20),(3,2,30),(4,2,NULL),(5,3,5),(6,3,5)
+
+# Basic FILTER: count only the rows where a = 1 -> 2 of the 6 rows.
+# Metered: storage_row_read (6) + the filter `a = 1` operator_eval per row (6) + aggregate_accumulate
+# only for the 2 rows that pass + row_produced (1) + the whole-table aggregate-query constant (1)
+# = 16. A bare-column COUNT(*) has no operand eval, and the filtered-out rows charge no accumulate
+# (aggregates.md §11) — a plain COUNT(*) over these 6 rows would accumulate all 6 (= 2N+2 = 14).
+# names: count
+# cost: 16
+query I nosort
+SELECT COUNT(*) FILTER (WHERE a = 1) FROM t
+----
+2
+
+# TRUE / FALSE constant filters: every row / no row.
+# names: count, count
+query II nosort
+SELECT COUNT(*) FILTER (WHERE true), COUNT(*) FILTER (WHERE false) FROM t
+----
+6
+0
+
+# All five aggregates with a FILTER in one whole-table query. b = {10,20,30,NULL,5,5}:
+#   count(*) FILTER (a=1) -> rows a=1 -> 2;     count(*) FILTER (a=99) -> 0 (empty match);
+#   sum(b)   FILTER (b>10) -> 20+30 = 50;       sum(b)   FILTER (a=99) -> NULL (empty match);
+#   avg(b)   FILTER (a=2) -> {30,NULL} skip NULL -> 30 at scale 16; count(b) FILTER (a=2) -> 1;
+#   min(b)   FILTER (a=3) -> 5;                 max(b)   FILTER (b>10) -> 30.
+# A NULL cond (b>10 with NULL b) excludes the row exactly like FALSE.
+# names: count, count, sum, sum, avg, count, min, max
+query IIIIDIII nosort
+SELECT COUNT(*) FILTER (WHERE a = 1), COUNT(*) FILTER (WHERE a = 99),
+       SUM(b) FILTER (WHERE b > 10), SUM(b) FILTER (WHERE a = 99),
+       AVG(b) FILTER (WHERE a = 2), COUNT(b) FILTER (WHERE a = 2),
+       MIN(b) FILTER (WHERE a = 3), MAX(b) FILTER (WHERE b > 10) FROM t
+----
+2
+0
+50
+NULL
+30.0000000000000000
+1
+5
+30
+
+# FILTER composes with DISTINCT — the filter restricts the rows, then DISTINCT dedups:
+#   count(DISTINCT b) FILTER (a>=1) -> rows all pass; distinct non-NULL b = {10,20,30,5} -> 4;
+#   sum(DISTINCT b)   FILTER (b<30) -> rows with b in {10,20,5,5} (NULL/30 excluded); {10,20,5} -> 35.
+# names: count, sum
+query II nosort
+SELECT COUNT(DISTINCT b) FILTER (WHERE a >= 1), SUM(DISTINCT b) FILTER (WHERE b < 30) FROM t
+----
+4
+35
+
+# FILTER per GROUP: the filter is applied within each group.
+#   a=1: rows b={10,20}; b>10 -> {20}: count 1, sum 20.  a=2: b={30,NULL}; b>10 -> {30}: count 1,
+#   sum 30.  a=3: b={5,5}; b>10 -> {}: count 0, sum NULL. count(*) (unfiltered) is 2 for each.
+# names: a, count, count, sum
+query IIII nosort
+SELECT a, COUNT(*) FILTER (WHERE b > 10), COUNT(*), SUM(b) FILTER (WHERE b > 10)
+FROM t GROUP BY a ORDER BY a
+----
+1
+1
+2
+20
+2
+1
+2
+30
+3
+0
+2
+NULL
+
+# FILTER in HAVING: keep groups with at least one b>10 row -> a=1 (one) and a=2 (one); a=3 (none) drops.
+# names: a
+query I nosort
+SELECT a FROM t GROUP BY a HAVING COUNT(*) FILTER (WHERE b > 10) >= 1 ORDER BY a
+----
+1
+2
+
+# --- error cases ----------------------------------------------------------------------------
+
+# A non-boolean FILTER condition is 42804 (argument of FILTER must be boolean). `b` is i32.
+statement error 42804
+SELECT COUNT(*) FILTER (WHERE b) FROM t
+
+# An aggregate inside FILTER is 42803 (aggregate functions are not allowed in FILTER).
+statement error 42803
+SELECT COUNT(*) FILTER (WHERE SUM(b) > 0) FROM t
+
+# FILTER on a non-aggregate (scalar) function is 42809 (FILTER specified, but abs is not an aggregate).
+statement error 42809
+SELECT abs(b) FILTER (WHERE a = 1) FROM t
+
+# FILTER on a pure (non-aggregate) window function is 0A000 (PG's own — not implemented).
+statement error 0A000
+SELECT row_number() FILTER (WHERE a = 1) OVER () FROM t
+
+# FILTER on a window aggregate is 0A000 here (PG allows it; deferred to a follow-on — aggregates.md §11).
+statement error 0A000
+SELECT SUM(b) FILTER (WHERE a = 1) OVER () FROM t

@@ -127,8 +127,16 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         order; composes with GROUP BY. `DISTINCT` on a window function is `0A000`, on a scalar
         function `42809`; `agg(DISTINCT *)` / `agg(DISTINCT)` are `42601`. New capability
         `query.aggregate_distinct`; cost unchanged (dedup is unmetered). → aggregates.md §5
+  - [x] **`FILTER (WHERE cond)`** — `agg(args) FILTER (WHERE cond)` folds only the input rows for
+        which `cond` is TRUE (FALSE/NULL excludes), per aggregate; composes with GROUP BY, HAVING,
+        and DISTINCT (filter first, then dedup). A non-boolean cond is `42804`, an aggregate inside
+        it `42803`, `FILTER` on a scalar function `42809`, on a window function `0A000` (the pure
+        non-aggregate case matches PG; window-aggregate FILTER is a deferred follow-on). New
+        capability `query.aggregate_filter`; the filter is metered per row, accumulate only for
+        passing rows. → aggregates.md §11
   - [ ] _follow-on:_ `SELECT DISTINCT` in an aggregate query, GROUP BY by
-        expression/ordinal/alias, functional-dependency grouping, `GROUPING SETS`/`FILTER`/ordered-set.
+        expression/ordinal/alias, functional-dependency grouping, `GROUPING SETS`/ordered-set, and
+        `FILTER` on a **window** aggregate.
 - [x] **Window functions (`OVER`)** — ✅ **COMPLETE (S0–S10, all three cores) + the sliding/sharing
       optimization.** Per-row values folded over a related row set in a dedicated **window stage**
       (after `GROUP BY`/`HAVING`, before `ORDER BY`/`LIMIT`). row_number/rank/dense_rank/percent_rank/

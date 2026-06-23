@@ -132,9 +132,11 @@ tracked in [../../TODO.md](../../TODO.md), not an oversight:
   PostgreSQL named-notation (`name(arg, name => expr)`) and `DEFAULT` arguments (§17). It
   resolves the five aggregates (`COUNT`/`SUM`/`MIN`/`MAX`/`AVG`; [aggregates.md](aggregates.md))
   **and** scalar functions (`abs`, `round`, `make_interval`, the uuid/clock functions;
-  [functions.md](functions.md) §9–§12). Still deferred: `COUNT(DISTINCT x)` and further scalar
-  functions (`length`, `lower`, …); an unknown function name is `42883`, and `DISTINCT` inside a
-  call is `42601`.
+  [functions.md](functions.md) §9–§12). An aggregate may carry a leading `DISTINCT`
+  (`COUNT(DISTINCT x)`, [aggregates.md](aggregates.md) §5) and/or a trailing `FILTER (WHERE cond)`
+  ([aggregates.md](aggregates.md) §11); both are aggregate-only (`42809` on a scalar function), an
+  empty/`*` `DISTINCT` argument is `42601`, and a non-boolean / aggregate-bearing `FILTER` cond is
+  `42804`/`42803`. An unknown function name is `42883`.
 - **No `;` statement terminator** — one statement per `execute` (SQL comment syntax, by
   contrast, *has* landed — `--` line and nesting `/* */` block comments, §33).
 - **Parameter placeholders (`$N`) are parsed, but bound by the host API, not the corpus.**

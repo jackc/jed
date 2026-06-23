@@ -2751,6 +2751,7 @@ impl Parser {
                 arg_names: None,
                 star: false,
                 distinct: false,
+                filter: None,
                 variadic: false,
                 over: None,
                 over_name: None,
@@ -3161,6 +3162,7 @@ impl Parser {
                     arg_names: None,
                     star: false,
                     distinct: false,
+                    filter: None,
                     variadic: false,
                     over: None,
                     over_name: None,
@@ -3289,6 +3291,26 @@ impl Parser {
         } else {
             None
         };
+        // A trailing `FILTER (WHERE cond)` restricts which input rows feed THIS aggregate
+        // (aggregates.md §11). PG syntax: `agg(args) FILTER (WHERE cond) [OVER (...)]` — FILTER binds
+        // to the aggregate and precedes any OVER. FILTER is not a reserved word, but right after the
+        // call's `)` it is always the modifier (PG: `count(*) filter` with no `(` is a syntax error,
+        // not an alias). The condition is an ordinary boolean expression; the resolver rejects FILTER
+        // on a non-aggregate (42809) or a window function (0A000), an aggregate inside cond (42803),
+        // and a non-boolean cond (42804).
+        let filter = if self.peek_keyword().as_deref() == Some("filter") {
+            self.advance();
+            self.expect(&Token::LParen)?;
+            if self.peek_keyword().as_deref() != Some("where") {
+                return Err(syntax("FILTER requires a WHERE clause"));
+            }
+            self.advance();
+            let cond = self.parse_expr()?;
+            self.expect(&Token::RParen)?;
+            Some(Box::new(cond))
+        } else {
+            None
+        };
         // A trailing `OVER (...)` turns the call into a window-function call (spec/design/window.md,
         // grammar.ebnf `over_clause`). S0 parses only the inline `OVER ( [PARTITION BY cols]
         // [ORDER BY ...] )` form; a named window `OVER name` (the WINDOW clause) is deferred to S5.
@@ -3305,6 +3327,7 @@ impl Parser {
                     arg_names,
                     star,
                     distinct,
+                    filter,
                     variadic,
                     over: None,
                     over_name,
@@ -3325,6 +3348,7 @@ impl Parser {
             arg_names,
             star,
             distinct,
+            filter,
             variadic,
             over,
             over_name,

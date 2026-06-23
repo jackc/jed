@@ -240,7 +240,8 @@ takes no expression** (`arg = "star"`), and there is no infix symbol, precedence
 `AGGREGATES` descriptor table. The full semantics — the widening table, the empty-set
 rules, the `GROUP BY` / `HAVING` rules, the cost accrual — live in
 [aggregates.md](aggregates.md). DISTINCT inside an aggregate (`COUNT(DISTINCT x)`) folds only the
-distinct argument values ([aggregates.md](aggregates.md) §5).
+distinct argument values ([aggregates.md](aggregates.md) §5); `FILTER (WHERE cond)` folds only the
+rows for which `cond` is TRUE ([aggregates.md](aggregates.md) §11).
 
 The `null_safe` discipline is now **authored**: `IS [NOT] DISTINCT FROM` (`kind =
 "comparison"`, `null = "null_safe"`) landed once the `boolean` type gave the result a

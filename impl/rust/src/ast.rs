@@ -878,6 +878,13 @@ pub enum Expr {
         /// Only an aggregate accepts it — `DISTINCT` on a scalar function is 42809, on a window
         /// function 0A000, and `f(DISTINCT *)` / `f(DISTINCT)` is a 42601 syntax error.
         distinct: bool,
+        /// `Some(cond)` when the call carries a trailing `FILTER (WHERE cond)` clause
+        /// (`SUM(x) FILTER (WHERE y > 0)` — aggregates.md §11): the aggregate folds only the input
+        /// rows for which `cond` is TRUE (NULL/FALSE rows contribute nothing). Only an aggregate
+        /// accepts it — `FILTER` on a scalar function is 42809, on a window function 0A000; an
+        /// aggregate inside `cond` is 42803 and a non-boolean `cond` is 42804. Boxed so a plain
+        /// call does not grow `Expr`.
+        filter: Option<Box<Expr>>,
         /// `true` when the final argument was prefixed with the `VARIADIC` keyword
         /// (`num_nulls(VARIADIC arr)`, array-functions.md §12 / grammar.md §17): the array is
         /// passed directly to a variadic parameter rather than spreading individual arguments.

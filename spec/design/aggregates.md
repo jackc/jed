@@ -29,7 +29,8 @@ vertical slices** (CLAUDE.md §10/§11), each a commit across all three cores �
 
 Locked scope decisions: **PostgreSQL widening** for `SUM`/`AVG` (§3); **`DISTINCT` inside an
 aggregate** (`COUNT(DISTINCT x)`) has **landed** (§5) — the aggregate folds only the distinct
-non-NULL argument values.
+non-NULL argument values; **`FILTER (WHERE cond)`** has **landed** (§11) — the aggregate folds
+only the input rows for which `cond` is TRUE.
 
 ## 2. What an aggregate computes
 
@@ -228,8 +229,47 @@ So whole-table `SELECT COUNT(*) FROM t` over `N` rows is `N` (`storage_row_read`
   collect into the same synthetic row) and grouping keys; a non-grouped column is `42803`,
   non-boolean is `42804`. Allowed with no `GROUP BY` (filters the single whole-table group),
   and HAVING alone makes a query an aggregate query ([grammar.md](grammar.md) §19).
+- **`FILTER (WHERE cond)`** (landed) — restricts which input rows feed an aggregate (§11). On a
+  **window** aggregate it is deferred (`0A000`): a pure non-aggregate window function with `FILTER`
+  matches PG's own `0A000`, and a window aggregate with `FILTER` (which PG allows) is deferred here
+  to a follow-on, a documented divergence.
 - **Deferred / out of scope**: `GROUP BY` by expression / ordinal / output alias; the PG
   **functional-dependency**
   relaxation of the grouping rule (a column functionally dependent on a grouped PK); and
-  `GROUPING SETS`/`ROLLUP`/`CUBE`, `FILTER (WHERE …)`, and ordered-set aggregates
+  `GROUPING SETS`/`ROLLUP`/`CUBE`, **`FILTER` on a window aggregate**, and ordered-set aggregates
   (`percentile_cont`). Each is an additive later feature ([../../TODO.md](../../TODO.md)).
+
+## 11. `FILTER (WHERE cond)` — restricting an aggregate's input rows
+
+`agg(args) FILTER (WHERE cond)` folds **only the input rows for which `cond` is TRUE** into that
+aggregate (PostgreSQL / SQL-standard). It is a per-aggregate restriction: each aggregate in the
+select list (and `HAVING`) carries its own optional filter, applied independently within each
+group. `cond` is an ordinary boolean expression over the **input** row (the same scope an aggregate
+argument resolves in), evaluated **per row**; a `FALSE` **or `NULL`** result excludes the row (only
+`TRUE` keeps it — the WHERE-clause rule, §6 of [grammar.md](grammar.md)). A group whose every row is
+filtered out is therefore `COUNT` `0` and `SUM`/`AVG`/`MIN`/`MAX` `NULL`, exactly like an empty
+group (§4).
+
+`FILTER` composes with everything aggregation already does: it works whole-table and per `GROUP BY`
+group, inside `HAVING` (`HAVING count(*) FILTER (WHERE …) > 1`), and with `DISTINCT` — the **filter
+applies first** (restricting the rows), **then** the `DISTINCT` de-duplication (§5), then the fold.
+
+The restrictions, all matching PostgreSQL (oracle-verified):
+
+- **A non-boolean `cond`** is **`42804`** (`datatype_mismatch`, "argument of FILTER must be type
+  boolean") — like a non-boolean `WHERE`.
+- **An aggregate inside `cond`** is **`42803`** (`grouping_error`, "aggregate functions are not
+  allowed in FILTER") — `cond` is a per-input-row predicate, evaluated before aggregation, so the
+  filter resolves with aggregates **forbidden**.
+- **`FILTER` on a non-aggregate (scalar) function** is **`42809`** (`wrong_object_type`, "FILTER
+  specified, but *f* is not an aggregate function").
+- **`FILTER` on a window function** is **`0A000`**: a pure non-aggregate window function matches PG's
+  own "FILTER is not implemented for non-aggregate window functions"; a window **aggregate** with
+  `FILTER` is allowed by PostgreSQL but deferred here (a documented divergence — §10).
+
+**Cost** (the cross-core contract, §8): the filter is evaluated **per input row** (like the
+operand), so its own `operator_eval`s are charged per row; `aggregate_accumulate` **and** the
+operand's own evaluation are charged **only for a row that passes** the filter (a filtered-out row
+contributes nothing, so it accrues no accumulate — contrast `DISTINCT`, where every row accumulates
+and only duplicates skip the fold, §5). Because the pass/fold decision is deterministic (scan order
+is cross-core identical), the metered cost is deterministic and identical across cores.

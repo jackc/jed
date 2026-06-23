@@ -7863,6 +7863,14 @@ export class Database {
         const accs = groups[gi]!.accs;
         const seen = groups[gi]!.seen;
         plan.aggSpecs.forEach((spec, i) => {
+          // FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL) contributes
+          // nothing to THIS aggregate — its operand is not evaluated and it is not accumulated
+          // (aggregates.md §11). The filter's own operatorEvals are charged (it is evaluated per row,
+          // like the operand); aggregateAccumulate is charged only for a row that passes. The
+          // pass/fold decision is deterministic (scan order is cross-core identical).
+          if (spec.filter !== undefined && spec.filter !== null) {
+            if (!isTrue(evalExpr(spec.filter, row, env, meter))) return;
+          }
           meter.charge(COSTS.aggregateAccumulate);
           const v = spec.operand === null ? nullValue() : evalExpr(spec.operand, row, env, meter);
           // DISTINCT: skip a NULL (never folded by any aggregate) and any value already folded into
@@ -10559,6 +10567,10 @@ type AggSpec = {
   operand: RExpr | null;
   floatWidth?: ScalarType;
   distinct?: boolean;
+  // The resolved FILTER (WHERE cond) boolean predicate (SUM(x) FILTER (WHERE cond) —
+  // aggregates.md §11); null/undefined for an unfiltered aggregate. The fold loop evaluates it per
+  // input row and folds only the rows for which it is TRUE (so the filter applies before DISTINCT).
+  filter?: RExpr | null;
 };
 
 // AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
@@ -11429,7 +11441,7 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
 // resolve against the real row). The result type follows the PG widening (aggregates.md §3).
 function resolveAggregate(
   scope: Scope,
-  e: { name: string; args: Expr[]; star: boolean; distinct: boolean },
+  e: { name: string; args: Expr[]; star: boolean; distinct: boolean; filter?: Expr | null },
   ag: AggCtx,
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
@@ -11474,9 +11486,22 @@ function resolveAggregate(
     if (!desc) throw noAggOverload(name);
     [plan, result, floatWidth] = aggregatePlan(name, desc.result, r.type);
   }
+  // FILTER (WHERE cond): resolve the per-row predicate against the input row with aggregates
+  // FORBIDDEN — an aggregate inside FILTER is 42803, matching PG (aggregates.md §11). A non-boolean
+  // condition (or an untyped NULL, always unknown → folds no row) is 42804. The fold loop evaluates
+  // this per row and folds only the rows for which it is TRUE.
+  let filter: RExpr | null = null;
+  if (e.filter !== undefined && e.filter !== null) {
+    const fsub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const rf = resolve(scope, e.filter, null, fsub, params);
+    if (rf.type.kind !== "bool" && rf.type.kind !== "null") {
+      throw typeError("argument of FILTER must be type boolean");
+    }
+    filter = rf.node;
+  }
   // Aggregate results follow the group-key values in the synthetic row.
   const slot = ag.groupKeys.length + ag.specs.length;
-  ag.specs.push({ plan, operand, floatWidth, distinct: e.distinct });
+  ag.specs.push({ plan, operand, floatWidth, distinct: e.distinct, filter });
   return { node: { kind: "column", index: slot }, type: result };
 }
 
@@ -12103,6 +12128,7 @@ function resolveFuncCall(
     argNames: (string | null)[];
     star: boolean;
     distinct: boolean;
+    filter?: Expr | null;
     variadic: boolean;
   },
   ag: AggCtx,
@@ -12116,6 +12142,15 @@ function resolveFuncCall(
     throw engineError(
       "wrong_object_type",
       `DISTINCT specified, but ${lname} is not an aggregate function`,
+    );
+  }
+  // FILTER is likewise aggregate-only: `abs(x) FILTER (WHERE …)` is 42809 (PG's wrong_object_type,
+  // "FILTER specified, but <fn> is not an aggregate function" — aggregates.md §11). Same placement
+  // as DISTINCT, so it covers every non-aggregate path before the per-kind dispatch.
+  if (e.filter !== undefined && e.filter !== null && !isAggregateName(lname)) {
+    throw engineError(
+      "wrong_object_type",
+      `FILTER specified, but ${lname} is not an aggregate function`,
     );
   }
   // The VARIADIC keyword is valid only on a VARIADIC function (array-functions.md §12); on any
@@ -14936,6 +14971,17 @@ function resolve(
           throw engineError(
             "feature_not_supported",
             "DISTINCT is not implemented for window functions",
+          );
+        }
+        // FILTER over a window function is deferred (aggregates.md §11). A pure (non-aggregate)
+        // window function with FILTER is PG's own 0A000; a window AGGREGATE with FILTER is allowed by
+        // PG but deferred here to a follow-on (a documented jed divergence) — both 0A000.
+        if (e.filter !== undefined && e.filter !== null) {
+          throw engineError(
+            "feature_not_supported",
+            isAggregateName(e.name)
+              ? "FILTER is not yet supported for window aggregate functions"
+              : "FILTER is not implemented for non-aggregate window functions",
           );
         }
         return resolveWindowCall(

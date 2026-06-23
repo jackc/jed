@@ -2898,6 +2898,23 @@ class Parser {
     this.expect("rparen");
     // Keep argNames empty unless a name appeared (the all-positional sentinel — §8).
     const argNames = anyNamed ? names : [];
+    // A trailing `FILTER (WHERE cond)` restricts which input rows feed THIS aggregate
+    // (aggregates.md §11). PG syntax: `agg(args) FILTER (WHERE cond) [OVER (...)]` — FILTER binds to
+    // the aggregate and precedes any OVER. FILTER is not reserved, but right after the call's `)` it
+    // is always the modifier (PG: `count(*) filter` with no `(` is a syntax error, not an alias). The
+    // resolver rejects FILTER on a non-aggregate (42809) or a window function (0A000), an aggregate
+    // inside cond (42803), and a non-boolean cond (42804).
+    let filter: Expr | null = null;
+    if (this.peekKeyword() === "filter") {
+      this.advance();
+      this.expect("lparen");
+      if (this.peekKeyword() !== "where") {
+        throw engineError("syntax_error", "FILTER requires a WHERE clause");
+      }
+      this.advance();
+      filter = this.parseExpr();
+      this.expect("rparen");
+    }
     // A trailing `OVER (...)` turns the call into a window-function call (spec/design/window.md,
     // grammar.ebnf `over_clause`). The inline `OVER ( [PARTITION BY cols] [ORDER BY ...] )` form
     // carries an inline definition; a named window `OVER name` (the WINDOW clause — window.md §5)
@@ -2917,6 +2934,7 @@ class Parser {
           argNames,
           star,
           distinct,
+          filter,
           variadic,
           over: null,
           overName,
@@ -2928,7 +2946,18 @@ class Parser {
       over = this.parseWindowDefinition();
       this.expect("rparen");
     }
-    return { kind: "funcCall", name, args, argNames, star, distinct, variadic, over, overName };
+    return {
+      kind: "funcCall",
+      name,
+      args,
+      argNames,
+      star,
+      distinct,
+      filter,
+      variadic,
+      over,
+      overName,
+    };
   }
 
   // parseWindowFrame parses an optional window frame clause

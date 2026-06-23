@@ -931,10 +931,16 @@ extract_expr   ::= "EXTRACT" "(" ( identifier | string ) "FROM" expr ")"
  * A leading DISTINCT (COUNT(DISTINCT x), ../design/aggregates.md §5) folds only the distinct
  * argument values; it requires an argument (DISTINCT ")" is 42601) and may NOT combine with "*"
  * (DISTINCT "*" is 42601). DISTINCT on a non-aggregate is 42809, on a window function 0A000
- * (parser admits it; the resolver rejects). */
-function_call  ::= identifier "(" "DISTINCT"? ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? | variadic_arg )? ")" over_clause?
+ * (parser admits it; the resolver rejects).
+ * A trailing FILTER (WHERE cond) clause (../design/aggregates.md §11) restricts an aggregate to
+ * the input rows for which cond is TRUE; it binds to the aggregate and precedes any OVER. FILTER is
+ * not reserved but is always the modifier right after the call's ")". FILTER on a non-aggregate is
+ * 42809, on a window function 0A000, an aggregate inside cond is 42803, a non-boolean cond 42804
+ * (the resolver rejects). */
+function_call  ::= identifier "(" "DISTINCT"? ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? | variadic_arg )? ")" filter_clause? over_clause?
 function_arg   ::= ( identifier "=>" )? expr
 variadic_arg   ::= "VARIADIC" expr
+filter_clause  ::= "FILTER" "(" "WHERE" expr ")"
 
 /* A trailing OVER clause turns a call into a WINDOW-function call (../design/window.md). The
  * window-ONLY functions (row_number/rank/dense_rank/percent_rank/cume_dist/ntile/lag/lead/

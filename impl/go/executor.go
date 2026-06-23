@@ -11620,6 +11620,21 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 				groups = append(groups, group{keys: keys, accs: newAccs(), seen: newSeen()})
 			}
 			for i, spec := range plan.aggSpecs {
+				// FILTER (WHERE cond): a row for which the filter is not TRUE (FALSE or NULL)
+				// contributes nothing to THIS aggregate — its operand is not evaluated and it is not
+				// accumulated (aggregates.md §11). The filter's own operator_evals are charged (it is
+				// evaluated per row, like the operand); aggregate_accumulate is charged only for a row
+				// that passes. The pass/fold decision is deterministic (scan order is cross-core
+				// identical), so the metered cost is identical across cores.
+				if spec.filter != nil {
+					fv, ferr := spec.filter.eval(row, env, meter)
+					if ferr != nil {
+						return selectResult{}, ferr
+					}
+					if !fv.IsTrue() {
+						continue
+					}
+				}
 				meter.Charge(Costs.AggregateAccumulate)
 				v := NullValue() // COUNT(*) ignores the value
 				if spec.operand != nil {
@@ -13701,6 +13716,10 @@ type aggSpec struct {
 	plan     aggPlan
 	operand  *rExpr
 	distinct bool
+	// filter is the resolved FILTER (WHERE cond) boolean predicate (SUM(x) FILTER (WHERE cond) —
+	// aggregates.md §11); nil for an unfiltered aggregate. The fold loop evaluates it per input row
+	// and folds only the rows for which it is TRUE (so the filter applies before the DISTINCT dedup).
+	filter *rExpr
 }
 
 // acc is a running aggregate accumulator (one per aggSpec), folded per input row then finalized.
@@ -14896,9 +14915,25 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		plan, result = aggregatePlan(name, desc.Result, t)
 		operand = r
 	}
+	// FILTER (WHERE cond): resolve the per-row predicate against the input row with aggregates
+	// FORBIDDEN — an aggregate inside FILTER is 42803, matching PG (aggregates.md §11). A non-boolean
+	// condition (or an untyped NULL, always unknown → folds no row) is 42804. The fold loop evaluates
+	// this per row and folds only the rows for which it is TRUE.
+	var filter *rExpr
+	if fc.Filter != nil {
+		fsub := &aggCtx{collecting: false}
+		rf, ft, err := resolve(s, *fc.Filter, nil, fsub, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		if ft.kind != rtBool && ft.kind != rtNull {
+			return nil, resolvedType{}, typeError("argument of FILTER must be type boolean")
+		}
+		filter = rf
+	}
 	// Aggregate results follow the group-key values in the synthetic row.
 	slot := len(ag.groupKeys) + len(ag.specs)
-	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct})
+	ag.specs = append(ag.specs, aggSpec{plan: plan, operand: operand, distinct: fc.Distinct, filter: filter})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 
@@ -16763,6 +16798,13 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 		return nil, resolvedType{}, NewError(WrongObjectType,
 			fmt.Sprintf("DISTINCT specified, but %s is not an aggregate function", name))
 	}
+	// FILTER is likewise aggregate-only: `abs(x) FILTER (WHERE …)` is 42809 (PG's wrong_object_type,
+	// "FILTER specified, but <fn> is not an aggregate function" — aggregates.md §11). Same placement
+	// as DISTINCT, so it covers every non-aggregate path before the per-kind dispatch.
+	if fc.Filter != nil && !isAggregateName(name) {
+		return nil, resolvedType{}, NewError(WrongObjectType,
+			fmt.Sprintf("FILTER specified, but %s is not an aggregate function", name))
+	}
 	// The VARIADIC keyword is valid only on a VARIADIC function (array-functions.md §12); on any
 	// other (non-variadic) name it is 42883 (no such overload). Caught before the per-kind dispatch.
 	if fc.Variadic && !isVariadicFuncName(name) {
@@ -17864,6 +17906,17 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 			if e.FuncCall.Distinct {
 				return nil, resolvedType{}, NewError(FeatureNotSupported,
 					"DISTINCT is not implemented for window functions")
+			}
+			// FILTER over a window function is deferred (aggregates.md §11). A pure (non-aggregate)
+			// window function with FILTER is PG's own 0A000; a window AGGREGATE with FILTER is allowed
+			// by PG but deferred here to a follow-on (a documented jed divergence) — both 0A000.
+			if e.FuncCall.Filter != nil {
+				if isAggregateName(e.FuncCall.Name) {
+					return nil, resolvedType{}, NewError(FeatureNotSupported,
+						"FILTER is not yet supported for window aggregate functions")
+				}
+				return nil, resolvedType{}, NewError(FeatureNotSupported,
+					"FILTER is not implemented for non-aggregate window functions")
 			}
 			return resolveWindowCall(s, e.FuncCall, ag, params)
 		}
