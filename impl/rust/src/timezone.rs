@@ -571,11 +571,7 @@ pub fn save_bundle(b: &TzBundle) -> Vec<u8> {
 
     // Per zone entry: name(2+len) + hash(4) + raw_len(4) + comp_len(4) + offset(4).
     let zone_manifest_len: usize = packed.iter().map(|p| 2 + p.name.len() + 16).sum();
-    let link_len: usize = b
-        .links
-        .iter()
-        .map(|(a, t)| 2 + a.len() + 2 + t.len())
-        .sum();
+    let link_len: usize = b.links.iter().map(|(a, t)| 2 + a.len() + 2 + t.len()).sum();
     let body_start = header.len() + zone_manifest_len + link_len;
 
     let mut manifest = Vec::with_capacity(zone_manifest_len + link_len);
@@ -622,7 +618,9 @@ pub fn open_bundle(bytes: &[u8]) -> Result<TzBundle> {
     }
     let fmt = r.u16()?;
     if fmt != 1 {
-        return Err(corrupt(format!("tz bundle: unsupported format_version {fmt}")));
+        return Err(corrupt(format!(
+            "tz bundle: unsupported format_version {fmt}"
+        )));
     }
     let tzdata_version = r.str()?;
     let description = r.str()?;

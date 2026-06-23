@@ -286,6 +286,12 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // ordering comparisons (< <= > >=) and ORDER BY; explicit-conflict 42P21, unknown 42704, non-text
   // COLLATE 42804; the `collate` cost unit.
   "expr.collate",
+  // The AT TIME ZONE operator (and the timezone(zone, value) function it desugars to) + host-loaded
+  // IANA time-zone data (spec/design/timezones.md §6, grammar.md §49): convert timestamptz↔timestamp
+  // through a named zone or fixed offset. A zone is provided by a host-loaded JTZ bundle (the
+  // `# load-timezone:` directive loads spec/tz/fixtures/tzdata.jtz); UTC and fixed offsets are built
+  // in. Unknown zone 22023, non-text zone 42804; the `timezone` cost unit.
+  "expr.at_time_zone",
   // Per-column COLLATE in CREATE TABLE (collation slice 1d, spec/design/collation.md §1/§5): a
   // column's effective collation is frozen at create (text-only 42804, vendored-or-C name 42704) and
   // is its IMPLICIT collation — ORDER BY / comparisons use it with no explicit COLLATE; two different

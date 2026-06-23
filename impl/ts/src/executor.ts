@@ -83,6 +83,14 @@ import {
   versionSkew,
 } from "./collation.ts";
 import { COSTS } from "./costs.ts";
+import {
+  instantToLocalMicros,
+  loadTimeZoneData as loadTimeZoneDataGlobal,
+  loadedTimeZones as loadedTimeZonesGlobal,
+  localToInstantMicros,
+  resolveZone,
+  type TimeZoneInfo,
+} from "./timezone.ts";
 import { crc32Ieee } from "./format.ts";
 import {
   Decimal,
@@ -147,7 +155,7 @@ import {
   widthBytes,
   isFixedWidth,
 } from "./types.ts";
-import { parseTimestamp, parseTimestamptz } from "./timestamp.ts";
+import { NEG_INFINITY, parseTimestamp, parseTimestamptz, POS_INFINITY } from "./timestamp.ts";
 import { parseDate } from "./date.ts";
 import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
 import { type ClockFunc, type RandomFill, Seam, StmtRng } from "./seam.ts";
@@ -2049,6 +2057,23 @@ export class Database {
   // (Mirrors the free loadUnicodeData, which the host may call before opening any file.)
   loadUnicodeData(data: Uint8Array): void {
     loadUnicodeDataGlobal(data);
+  }
+
+  // loadTimeZoneData loads a JTZ time-zone bundle into the engine-global loaded set
+  // (db.loadTimeZoneData, spec/design/timezones.md §3.3). The bytes are jed's own pinned TZif (RFC
+  // 8536) wrapped in a manifest; the loaded zones become usable by AT TIME ZONE. Like the collation
+  // seam, this is a privileged host op (not SQL-reachable, no path, no engine I/O — §10), additive and
+  // idempotent, engine-global so it may be called before open. Browser-safe. A malformed bundle is
+  // XX001. (UTC and fixed offsets are built in and need no load.)
+  loadTimeZoneData(data: Uint8Array): void {
+    loadTimeZoneDataGlobal(data);
+  }
+
+  // loadedTimeZones introspects the engine-global loaded zone set (db.loadedTimeZones, timezones.md
+  // §3.3) — every named zone (and alias) a loaded bundle provides, ascending by name. A property of
+  // the running engine, not of this database. UTC and fixed offsets are built in and not listed.
+  loadedTimeZones(): TimeZoneInfo[] {
+    return loadedTimeZonesGlobal();
   }
 
   // loadedCollations introspects the engine-global LOADED collation set (db.loadedCollations,
@@ -7769,6 +7794,10 @@ export class Database {
       case "casing":
         e.arg = this.foldUncorrelatedInRExpr(e.arg, bound, ctes, cost);
         return e;
+      case "atTimeZone":
+        e.zone = this.foldUncorrelatedInRExpr(e.zone, bound, ctes, cost);
+        e.value = this.foldUncorrelatedInRExpr(e.value, bound, ctes, cost);
+        return e;
       case "case":
         e.arms = e.arms.map((arm) => ({
           cond: this.foldUncorrelatedInRExpr(arm.cond, bound, ctes, cost),
@@ -8115,6 +8144,8 @@ function rexprIsConstant(e: RExpr): boolean {
       return rexprIsConstant(e.lhs) && rexprIsConstant(e.rhs);
     case "casing":
       return rexprIsConstant(e.arg);
+    case "atTimeZone":
+      return rexprIsConstant(e.zone) && rexprIsConstant(e.value);
     case "case":
       return (
         e.arms.every((a) => rexprIsConstant(a.cond) && rexprIsConstant(a.result)) &&
@@ -9073,6 +9104,8 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       return rexprReferencesOuter(e.lhs, depth) || rexprReferencesOuter(e.rhs, depth);
     case "casing":
       return rexprReferencesOuter(e.arg, depth);
+    case "atTimeZone":
+      return rexprReferencesOuter(e.zone, depth) || rexprReferencesOuter(e.value, depth);
     case "case":
       return (
         e.arms.some(
@@ -9160,6 +9193,10 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
       return;
     case "casing":
       collectTouched(e.arg, depth, touched);
+      return;
+    case "atTimeZone":
+      collectTouched(e.zone, depth, touched);
+      collectTouched(e.value, depth, touched);
       return;
     case "case":
       for (const arm of e.arms) {
@@ -9484,6 +9521,7 @@ type RExpr =
   // upper(text)/lower(text) — Unicode case folding (collation.md §16). upper selects the direction;
   // folds via the engine-global property table or the ASCII baseline. A NULL operand propagates.
   | { kind: "casing"; upper: boolean; arg: RExpr }
+  | { kind: "atTimeZone"; zone: RExpr; value: RExpr; toTimestamptz: boolean }
   | {
       kind: "case";
       arms: { cond: RExpr; result: RExpr }[];
@@ -10749,6 +10787,14 @@ function resolveFuncCall(
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     return resolveLowerUpper(scope, lname, e, ag, params);
   }
+  // timezone(zone, value) is the desugar of `value AT TIME ZONE zone` (grammar.md §49, timezones.md
+  // §6) and a callable function. Overloaded on the value's family (timestamptz → timestamp, timestamp
+  // → timestamptz), so it resolves before the generic by-name dispatch. functions.md §9
+  if (lname === "timezone") {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    return resolveTimezone(scope, e, ag, params);
+  }
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
   // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
   if (isAggregateName(lname)) {
@@ -11293,6 +11339,38 @@ function resolveLowerUpper(
     };
   }
   throw noFuncOverload(name);
+}
+
+// resolveTimezone resolves timezone(zone, value) — the desugar of `value AT TIME ZONE zone`
+// (timezones.md §6). zone must be text (else 42804); the result family is the OTHER timestamp family
+// of value: timestamptz → timestamp (render the instant locally) and timestamp → timestamptz
+// (interpret the wall clock in the zone). Any other value family — or an untyped/NULL value, which
+// cannot pick an overload — is 42883.
+function resolveTimezone(
+  scope: Scope,
+  e: { name: string; args: Expr[] },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.args.length !== 2) throw noFuncOverload("timezone");
+  const zone = resolve(scope, e.args[0], "text", ag, params);
+  if (zone.type.kind !== "text" && zone.type.kind !== "null") {
+    throw engineError("datatype_mismatch", "AT TIME ZONE zone must be text");
+  }
+  const value = resolve(scope, e.args[1], null, ag, params);
+  if (value.type.kind === "timestamptz") {
+    return {
+      node: { kind: "atTimeZone", zone: zone.node, value: value.node, toTimestamptz: false },
+      type: { kind: "timestamp" },
+    };
+  }
+  if (value.type.kind === "timestamp") {
+    return {
+      node: { kind: "atTimeZone", zone: zone.node, value: value.node, toTimestamptz: true },
+      type: { kind: "timestamptz" },
+    };
+  }
+  throw noFuncOverload("timezone");
 }
 
 // resolveRangeFunc resolves a polymorphic range accessor over the anyrange pseudo-family
@@ -17082,6 +17160,30 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         throw new Error("unreachable: resolver requires text upper/lower operand");
       }
       return textValue(foldCase(v.text, e.upper, loadedProperty()));
+    }
+    case "atTimeZone": {
+      m.charge(COSTS.operatorEval);
+      const zv = evalExpr(e.zone, row, env, m);
+      const vv = evalExpr(e.value, row, env, m);
+      if (zv.kind === "null" || vv.kind === "null") return nullValue();
+      if (zv.kind !== "text") throw new Error("unreachable: resolver requires a text zone");
+      if (vv.kind !== "timestamp" && vv.kind !== "timestamptz") {
+        throw new Error("unreachable: resolver requires a timestamp/timestamptz value");
+      }
+      m.charge(COSTS.timezone);
+      m.guard();
+      const micros = vv.micros;
+      // ±infinity passes through unchanged (PG): no zone offset applies, zone not validated.
+      if (micros === POS_INFINITY || micros === NEG_INFINITY) {
+        return e.toTimestamptz ? timestamptzValue(micros) : timestampValue(micros);
+      }
+      const zr = resolveZone(zv.text);
+      if (zr === undefined) {
+        throw engineError("invalid_parameter_value", `time zone "${zv.text}" not recognized`);
+      }
+      return e.toTimestamptz
+        ? timestamptzValue(localToInstantMicros(zr, micros))
+        : timestampValue(instantToLocalMicros(zr, micros));
     }
     case "case": {
       // CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are

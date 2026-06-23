@@ -29,7 +29,8 @@ fn collect_zones(root: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
         if path.is_dir() {
             collect_zones(&path, &rel, out);
         } else {
-            let bytes = std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+            let bytes =
+                std::fs::read(&path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
             out.push((rel, bytes));
         }
     }
@@ -45,8 +46,8 @@ fn main() {
     collect_zones(&tz_dir().join(format!("{version}/zones")), "", &mut zones);
     zones.sort_by(|a, b| a.0.cmp(&b.0));
 
-    let links_raw = std::fs::read_to_string(tz_dir().join(format!("{version}/links.tsv")))
-        .unwrap_or_default();
+    let links_raw =
+        std::fs::read_to_string(tz_dir().join(format!("{version}/links.tsv"))).unwrap_or_default();
     let mut links: Vec<(String, String)> = links_raw
         .lines()
         .filter(|l| !l.trim().is_empty())

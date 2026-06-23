@@ -35,8 +35,16 @@ fn reader_matches_the_pinned_vectors() {
             c["utoff_secs"].as_integer().unwrap(),
             "{zone} @ {inst}: utoff"
         );
-        assert_eq!(off.abbrev, c["abbrev"].as_str().unwrap(), "{zone} @ {inst}: abbrev");
-        assert_eq!(off.is_dst, c["is_dst"].as_bool().unwrap(), "{zone} @ {inst}: is_dst");
+        assert_eq!(
+            off.abbrev,
+            c["abbrev"].as_str().unwrap(),
+            "{zone} @ {inst}: abbrev"
+        );
+        assert_eq!(
+            off.is_dst,
+            c["is_dst"].as_bool().unwrap(),
+            "{zone} @ {inst}: is_dst"
+        );
     }
 }
 

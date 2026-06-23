@@ -8,6 +8,7 @@ import { existsSync, readdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import process from "node:process";
 import { loadedCollation, loadUnicodeData } from "../collation.ts";
+import { loadTimeZoneData, resolveZone } from "../timezone.ts";
 import {
   advancingClock,
   Database,
@@ -74,6 +75,26 @@ function loadCollation(name: string): void {
   loadUnicodeData(readFileSync(path));
   if (loadedCollation(name) !== undefined) return;
   throw new Error(`load-collation: collation "${name}" is not provided by the loaded bundle`);
+}
+
+// parseLoadTimezoneDirective parses a `# load-timezone: [<zone>]` line — the corpus's host-free way
+// to make the IANA time-zone data available before the records that use AT TIME ZONE (timezones.md
+// §11). Returns the (possibly empty) zone name, or null if not this directive.
+function parseLoadTimezoneDirective(line: string): string | null {
+  const rest = line.replace(/^#/, "").trim();
+  if (!rest.startsWith("load-timezone:")) return null;
+  return rest.slice("load-timezone:".length).trim();
+}
+
+// loadTimezone makes the IANA time zones available to the records that follow (timezones.md §3.3/§11).
+// The harness acts as the HOST: it loads jed's pinned production JTZ bundle (spec/tz/fixtures/tzdata.jtz)
+// into the engine-global set via db.loadTimeZoneData (idempotent — the set is global), then, if a zone
+// name was given, asserts it now resolves. A named zone no loaded bundle provides throws.
+function loadTimezone(name: string): void {
+  const path = join(repoRoot(), "spec", "tz", "fixtures", "tzdata.jtz");
+  loadTimeZoneData(readFileSync(path));
+  if (name === "" || resolveZone(name) !== undefined) return;
+  throw new Error(`load-timezone: zone "${name}" is not provided by the loaded bundle`);
 }
 
 // parseFixtureDirective parses a file-level `# fixture: <spec-relative-path>` line — the corpus's way
@@ -549,6 +570,15 @@ function runFile(text: string): void {
       const lc = parseLoadCollationDirective(line);
       if (lc !== null) {
         loadCollation(lc[0]);
+        c.i++;
+        continue;
+      }
+      // `# load-timezone: [<zone>]` is an ACTION: load jed's pinned JTZ bundle into the engine-global
+      // set (and optionally assert a zone resolves) before the records that use AT TIME ZONE
+      // (timezones.md §11).
+      const ltz = parseLoadTimezoneDirective(line);
+      if (ltz !== null) {
+        loadTimezone(ltz);
         c.i++;
         continue;
       }

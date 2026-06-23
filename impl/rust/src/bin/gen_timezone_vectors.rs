@@ -30,7 +30,8 @@ fn micros(y: i64, mo: i64, d: i64, h: i64, mi: i64, s: i64) -> i64 {
 }
 
 fn main() {
-    let bundle_bytes = std::fs::read(tz_dir().join("fixtures/tzdata.jtz")).expect("read tzdata.jtz");
+    let bundle_bytes =
+        std::fs::read(tz_dir().join("fixtures/tzdata.jtz")).expect("read tzdata.jtz");
     load_time_zone_data(&bundle_bytes).expect("load bundle");
 
     // (zone, y, mo, d, H, M, S, note) — the §6 corner cases. Instants are UTC.
@@ -38,17 +39,107 @@ fn main() {
         ("Etc/UTC", 2024, 1, 15, 12, 0, 0, "fixed UTC"),
         ("America/New_York", 2024, 1, 15, 12, 0, 0, "EST (standard)"),
         ("America/New_York", 2024, 7, 15, 12, 0, 0, "EDT (daylight)"),
-        ("America/New_York", 2024, 3, 10, 6, 59, 59, "1s before spring-forward → EST"),
-        ("America/New_York", 2024, 3, 10, 7, 0, 0, "spring-forward boundary → EDT"),
-        ("America/New_York", 1800, 1, 1, 0, 0, 0, "before first transition (LMT)"),
-        ("America/New_York", 2099, 7, 1, 12, 0, 0, "past last transition → footer EDT"),
-        ("America/New_York", 2099, 1, 1, 12, 0, 0, "past last transition → footer EST"),
-        ("Asia/Kolkata", 2024, 1, 15, 12, 0, 0, "IST +05:30 (non-hour, no DST)"),
+        (
+            "America/New_York",
+            2024,
+            3,
+            10,
+            6,
+            59,
+            59,
+            "1s before spring-forward → EST",
+        ),
+        (
+            "America/New_York",
+            2024,
+            3,
+            10,
+            7,
+            0,
+            0,
+            "spring-forward boundary → EDT",
+        ),
+        (
+            "America/New_York",
+            1800,
+            1,
+            1,
+            0,
+            0,
+            0,
+            "before first transition (LMT)",
+        ),
+        (
+            "America/New_York",
+            2099,
+            7,
+            1,
+            12,
+            0,
+            0,
+            "past last transition → footer EDT",
+        ),
+        (
+            "America/New_York",
+            2099,
+            1,
+            1,
+            12,
+            0,
+            0,
+            "past last transition → footer EST",
+        ),
+        (
+            "Asia/Kolkata",
+            2024,
+            1,
+            15,
+            12,
+            0,
+            0,
+            "IST +05:30 (non-hour, no DST)",
+        ),
         ("Asia/Kolkata", 2099, 1, 15, 12, 0, 0, "IST +05:30 footer"),
-        ("Australia/Lord_Howe", 2024, 1, 15, 12, 0, 0, "southern summer → +11:00 DST"),
-        ("Australia/Lord_Howe", 2024, 7, 15, 12, 0, 0, "southern winter → +10:30 std"),
-        ("Australia/Lord_Howe", 2099, 1, 15, 12, 0, 0, "footer southern summer (start>end)"),
-        ("US/Eastern", 2024, 1, 15, 12, 0, 0, "alias → America/New_York EST"),
+        (
+            "Australia/Lord_Howe",
+            2024,
+            1,
+            15,
+            12,
+            0,
+            0,
+            "southern summer → +11:00 DST",
+        ),
+        (
+            "Australia/Lord_Howe",
+            2024,
+            7,
+            15,
+            12,
+            0,
+            0,
+            "southern winter → +10:30 std",
+        ),
+        (
+            "Australia/Lord_Howe",
+            2099,
+            1,
+            15,
+            12,
+            0,
+            0,
+            "footer southern summer (start>end)",
+        ),
+        (
+            "US/Eastern",
+            2024,
+            1,
+            15,
+            12,
+            0,
+            0,
+            "alias → America/New_York EST",
+        ),
         ("+05:30", 2024, 1, 15, 12, 0, 0, "fixed offset +05:30"),
         ("-08:00", 2024, 1, 15, 12, 0, 0, "fixed offset -08:00"),
     ];
@@ -102,5 +193,8 @@ fn main() {
     write!(b, "links = [{}]\n", links.join(", ")).unwrap();
     std::fs::write(tz_dir().join("vectors/bundle.toml"), &b).expect("write bundle.toml");
 
-    eprintln!("wrote spec/tz/vectors/{{tzif,bundle}}.toml ({} cases)", cases.len());
+    eprintln!(
+        "wrote spec/tz/vectors/{{tzif,bundle}}.toml ({} cases)",
+        cases.len()
+    );
 }

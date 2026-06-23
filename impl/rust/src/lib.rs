@@ -49,7 +49,6 @@ pub mod value;
 
 pub use api::{PreparedStatement, Rows, Transaction};
 pub use collation::load_unicode_data;
-pub use timezone::load_time_zone_data;
 pub use cost::Meter;
 pub use error::{EngineError, Result, SqlState};
 pub use executor::{
@@ -62,6 +61,7 @@ pub use privileges::{Privilege, PrivilegeSet, Privileges};
 pub use shared::{ReadHandle, SharedDb, WriteHandle};
 pub use spill::DEFAULT_WORK_MEM;
 pub use split::{SplitStatements, StatementSpan, split_statements};
+pub use timezone::load_time_zone_data;
 pub use value::Value;
 
 /// The capabilities this implementation currently supports (spec/conformance:

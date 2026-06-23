@@ -12071,7 +12071,9 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         RExpr::Neg { operand, .. } => rexpr_is_constant(operand),
         RExpr::Not(x) => rexpr_is_constant(x),
         RExpr::Casing { arg, .. } => rexpr_is_constant(arg),
-        RExpr::AtTimeZone { zone, value, .. } => rexpr_is_constant(zone) && rexpr_is_constant(value),
+        RExpr::AtTimeZone { zone, value, .. } => {
+            rexpr_is_constant(zone) && rexpr_is_constant(value)
+        }
         RExpr::Arith { lhs, rhs, .. }
         | RExpr::Compare { lhs, rhs, .. }
         | RExpr::Distinct { lhs, rhs, .. }
@@ -20959,7 +20961,8 @@ impl RExpr {
                 m.charge(COSTS.timezone);
                 m.guard()?;
                 // ±infinity passes through unchanged (PG): no zone offset applies.
-                if micros == crate::timestamp::POS_INFINITY || micros == crate::timestamp::NEG_INFINITY
+                if micros == crate::timestamp::POS_INFINITY
+                    || micros == crate::timestamp::NEG_INFINITY
                 {
                     return Ok(if *to_timestamptz {
                         Value::Timestamptz(micros)

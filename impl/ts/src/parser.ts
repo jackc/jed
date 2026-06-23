@@ -2305,7 +2305,7 @@ class Parser {
 
   private parseMultiplicative(): Expr {
     const base = this.depth;
-    let lhs = this.parseUnary();
+    let lhs = this.parseAtTimeZone();
     for (;;) {
       let op: BinaryOp;
       if (this.peek().kind === "star") op = "mul";
@@ -2317,8 +2317,40 @@ class Parser {
       }
       this.deepen(); // each chained * / % is one more AST level
       this.advance();
-      lhs = binaryExpr(op, lhs, this.parseUnary());
+      lhs = binaryExpr(op, lhs, this.parseAtTimeZone());
     }
+  }
+
+  // parseAtTimeZone parses the `AT TIME ZONE` rung (grammar.md §49, timezones.md §6): a
+  // left-associative infix operator binding tighter than `* / %`, additive, and the comparisons,
+  // looser than COLLATE / `::` / unary minus (PostgreSQL's %left AT). `value AT TIME ZONE zone`
+  // desugars to the function call timezone(zone, value) — PostgreSQL's own implementation — so the
+  // resolver/evaluator/cost have one path for the operator and the bare call. AT/TIME/ZONE are
+  // non-reserved (matched as a three-token sequence), so a bare column named at/time/zone is unaffected.
+  private parseAtTimeZone(): Expr {
+    const base = this.depth;
+    let lhs = this.parseUnary();
+    while (
+      this.peekKeyword() === "at" &&
+      this.peekKeywordAt(1) === "time" &&
+      this.peekKeywordAt(2) === "zone"
+    ) {
+      this.deepen(); // each chained AT TIME ZONE is one more AST level
+      this.advance(); // AT
+      this.advance(); // TIME
+      this.advance(); // ZONE
+      const zone = this.parseUnary();
+      lhs = {
+        kind: "funcCall",
+        name: "timezone",
+        args: [zone, lhs],
+        argNames: [],
+        star: false,
+        variadic: false,
+      };
+    }
+    this.depth = base;
+    return lhs;
   }
 
   private parseUnary(): Expr {

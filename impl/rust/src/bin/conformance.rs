@@ -159,8 +159,8 @@ fn parse_load_timezone_directive(rest: &str) -> Option<String> {
 /// zone name was given, asserts it now resolves. A named zone no loaded bundle provides fails the file.
 fn load_timezone(name: &str) -> std::result::Result<(), String> {
     let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../spec/tz/fixtures/tzdata.jtz");
-    let bytes = std::fs::read(&path)
-        .map_err(|e| format!("load-timezone: read {}: {e}", path.display()))?;
+    let bytes =
+        std::fs::read(&path).map_err(|e| format!("load-timezone: read {}: {e}", path.display()))?;
     jed::load_time_zone_data(&bytes)
         .map_err(|e| format!("load-timezone: load tzdata.jtz: {}", e.message))?;
     if name.is_empty() || jed::timezone::resolve_zone(name).is_some() {
