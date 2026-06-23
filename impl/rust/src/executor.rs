@@ -8030,8 +8030,20 @@ impl Database {
         } else {
             AggCtx::Forbidden
         };
+        // Desugar `OVER name` references to their WINDOW-clause definitions before resolution
+        // (window.md §5). The projection resolves against the desugared items; a reference to an
+        // undefined window is 42704. A plain query with no window clause/refs clones nothing extra.
+        let desugared_items;
+        let items_ref = if has_window_syntax {
+            let mut it = sel.items.clone();
+            desugar_items(&mut it, &sel.windows)?;
+            desugared_items = it;
+            &desugared_items
+        } else {
+            &sel.items
+        };
         let (projections, column_names, column_types) =
-            resolve_projections(&scope, &sel.items, &mut agg_ctx, ptypes)?;
+            resolve_projections(&scope, items_ref, &mut agg_ctx, ptypes)?;
         // HAVING resolves against the same grouped scope (Collect) — it may reference aggregates
         // (collected into the SAME specs, so their slots follow the projection's) and grouping
         // keys; a non-grouped column is 42803. It must be boolean (42804). Resolved after the
@@ -13402,11 +13414,17 @@ fn subscript_spec_exprs(s: &SubscriptSpec) -> Vec<&Expr> {
 fn expr_has_aggregate(e: &Expr) -> bool {
     match e {
         Expr::FuncCall {
-            name, args, over, ..
+            name,
+            args,
+            over,
+            over_name,
+            ..
         } => {
-            // An aggregate name carrying OVER is a WINDOW function, not a bare aggregate (S3,
-            // spec/design/window.md §5.1) — so it does not make the query an aggregate query.
-            (over.is_none() && is_aggregate_name(name)) || args.iter().any(expr_has_aggregate)
+            // An aggregate name carrying OVER (inline or a named-window reference) is a WINDOW
+            // function, not a bare aggregate (S3/S5, spec/design/window.md §5.1) — so it does not
+            // make the query an aggregate query. (Detection runs before the OVER-name desugar.)
+            (over.is_none() && over_name.is_none() && is_aggregate_name(name))
+                || args.iter().any(expr_has_aggregate)
         }
         Expr::Column(_)
         | Expr::QualifiedColumn { .. }
@@ -13474,7 +13492,12 @@ fn items_have_window(items: &SelectItems) -> bool {
 /// function (that is rejected at resolve, 42P20), so they are not walked here.
 fn expr_has_window(e: &Expr) -> bool {
     match e {
-        Expr::FuncCall { over, args, .. } => over.is_some() || args.iter().any(expr_has_window),
+        Expr::FuncCall {
+            over,
+            over_name,
+            args,
+            ..
+        } => over.is_some() || over_name.is_some() || args.iter().any(expr_has_window),
         Expr::Column(_)
         | Expr::QualifiedColumn { .. }
         | Expr::Literal(_)
@@ -13521,6 +13544,105 @@ fn expr_has_window(e: &Expr) -> bool {
         | Expr::InSubquery { .. }
         | Expr::QuantifiedSubquery { .. } => false,
     }
+}
+
+/// Desugar `OVER name` references in a select list to their WINDOW-clause definitions before
+/// resolution (spec/design/window.md §5): each window call carrying `over_name` gets the named
+/// definition copied into `over`; an undefined name is 42704. After this every window call carries
+/// an inline `over`, so resolution (S0–S4) handles named and inline windows uniformly.
+fn desugar_items(items: &mut SelectItems, windows: &[(String, WindowDef)]) -> Result<()> {
+    if let SelectItems::Items(v) = items {
+        for it in v.iter_mut() {
+            desugar_named_windows(&mut it.expr, windows)?;
+        }
+    }
+    Ok(())
+}
+
+fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)]) -> Result<()> {
+    match e {
+        Expr::FuncCall {
+            over,
+            over_name,
+            args,
+            ..
+        } => {
+            if let Some(name) = over_name.take() {
+                let def = windows
+                    .iter()
+                    .find(|(n, _)| n.eq_ignore_ascii_case(&name))
+                    .map(|(_, d)| d.clone())
+                    .ok_or_else(|| {
+                        EngineError::new(
+                            SqlState::UndefinedObject,
+                            format!("window \"{name}\" does not exist"),
+                        )
+                    })?;
+                *over = Some(Box::new(def));
+            }
+            for a in args.iter_mut() {
+                desugar_named_windows(a, windows)?;
+            }
+        }
+        Expr::Cast { inner, .. }
+        | Expr::Extract { source: inner, .. }
+        | Expr::Collate { inner, .. } => {
+            desugar_named_windows(inner, windows)?;
+        }
+        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
+            desugar_named_windows(operand, windows)?;
+        }
+        Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
+            desugar_named_windows(lhs, windows)?;
+            desugar_named_windows(rhs, windows)?;
+        }
+        Expr::In { lhs, list, .. } => {
+            desugar_named_windows(lhs, windows)?;
+            for x in list.iter_mut() {
+                desugar_named_windows(x, windows)?;
+            }
+        }
+        Expr::Quantified { lhs, array, .. } => {
+            desugar_named_windows(lhs, windows)?;
+            desugar_named_windows(array, windows)?;
+        }
+        Expr::Between { lhs, lo, hi, .. } => {
+            desugar_named_windows(lhs, windows)?;
+            desugar_named_windows(lo, windows)?;
+            desugar_named_windows(hi, windows)?;
+        }
+        Expr::Like { lhs, rhs, .. } | Expr::Regex { lhs, rhs, .. } => {
+            desugar_named_windows(lhs, windows)?;
+            desugar_named_windows(rhs, windows)?;
+        }
+        Expr::Row(items) | Expr::Array(items) => {
+            for x in items.iter_mut() {
+                desugar_named_windows(x, windows)?;
+            }
+        }
+        Expr::FieldAccess { base, .. } | Expr::FieldStar { base } => {
+            desugar_named_windows(base, windows)?;
+        }
+        Expr::Case {
+            operand,
+            whens,
+            els,
+        } => {
+            if let Some(o) = operand.as_deref_mut() {
+                desugar_named_windows(o, windows)?;
+            }
+            for (c, r) in whens.iter_mut() {
+                desugar_named_windows(c, windows)?;
+                desugar_named_windows(r, windows)?;
+            }
+            if let Some(x) = els.as_deref_mut() {
+                desugar_named_windows(x, windows)?;
+            }
+        }
+        // Leaves, subscripts, and subqueries (independent) carry no top-level window ref to rewrite.
+        _ => {}
+    }
+    Ok(())
 }
 
 /// The structural CHECK-expression rejections (spec/design/constraints.md §4.1), applied in
@@ -17198,6 +17320,7 @@ fn resolve(
             star,
             variadic,
             over,
+            over_name: _, // desugared to `over` before resolution (window.md §5)
         } => {
             // A trailing OVER makes this a window-function call (spec/design/window.md §5.1).
             if let Some(wd) = over {

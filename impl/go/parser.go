@@ -2146,7 +2146,78 @@ func (p *Parser) parseSelectCore() (*Select, error) {
 		return nil, err
 	}
 
+	// WINDOW name AS ( definition ) (, …) — named windows referenced by OVER name (window.md §5).
+	if err := p.parseWindowClause(sel); err != nil {
+		return nil, err
+	}
+
 	return sel, nil
+}
+
+// parseWindowClause parses `window_clause ::= "WINDOW" identifier "AS" "(" window_definition ")"
+// ("," …)*` (window.md §5) into sel.Windows. Each entry is a full inline window definition (a
+// base-window reference inside the definition is deferred). Empty when no WINDOW keyword is present.
+// WINDOW is non-reserved. Each definition reuses the same partition/order/frame parsing as the
+// inline OVER.
+func (p *Parser) parseWindowClause(sel *Select) error {
+	if p.peekKeyword() != "window" {
+		return nil
+	}
+	p.advance()
+	for {
+		name, err := p.expectIdentifier()
+		if err != nil {
+			return err
+		}
+		if err := p.expectKeyword("as"); err != nil {
+			return err
+		}
+		if err := p.expect(TokLParen); err != nil {
+			return err
+		}
+		var partition []Expr
+		if p.peekKeyword() == "partition" {
+			p.advance()
+			if err := p.expectKeyword("by"); err != nil {
+				return err
+			}
+			for {
+				qualifier, col, err := p.parseColumnRef()
+				if err != nil {
+					return err
+				}
+				if qualifier != "" {
+					partition = append(partition, Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: col})
+				} else {
+					partition = append(partition, Expr{Kind: ExprColumn, Column: col})
+				}
+				if p.peek().Kind != TokComma {
+					break
+				}
+				p.advance()
+			}
+		}
+		order, err := p.parseWindowOrderBy()
+		if err != nil {
+			return err
+		}
+		frame, err := p.parseWindowFrame()
+		if err != nil {
+			return err
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return err
+		}
+		sel.Windows = append(sel.Windows, NamedWindow{
+			Name: name,
+			Def:  WindowDef{Partition: partition, Order: order, Frame: frame},
+		})
+		if p.peek().Kind != TokComma {
+			break
+		}
+		p.advance()
+	}
+	return nil
 }
 
 // parseFromClause parses `from_clause ::= table_ref join_clause*` (grammar.md §15): the first
@@ -2443,7 +2514,10 @@ func isTableRefStopKeyword(kw string) bool {
 		// RETURNING ends an INSERT ... SELECT source — it must not be swallowed as the
 		// source's implicit table alias (`... SELECT v FROM t RETURNING v` is the INSERT's
 		// clause). §32; PostgreSQL fully reserves the word.
-		"returning":
+		"returning",
+		// WINDOW ends a SELECT core's FROM — it introduces the named-window clause and must
+		// not be swallowed as an implicit table alias (`FROM t WINDOW w AS …`). window.md §5.
+		"window":
 		return true
 	default:
 		return false
@@ -3708,12 +3782,20 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 		return Expr{}, err
 	}
 	// A trailing OVER (...) turns the call into a window-function call (spec/design/window.md,
-	// grammar.ebnf `over_clause`). S0 parses only the inline OVER ( [PARTITION BY cols]
-	// [ORDER BY ...] ) form; a named window OVER name (the WINDOW clause) is deferred to S5.
+	// grammar.ebnf `over_clause`). The inline OVER ( [PARTITION BY cols] [ORDER BY ...] ) form is
+	// parsed here; a named window `OVER name` (the WINDOW clause — window.md §5) sets OverName and
+	// returns early, desugared to its definition (into Over) before resolution.
 	if p.peekKeyword() == "over" {
 		p.advance()
+		// `OVER name` references a named window (the WINDOW clause — window.md §5); `OVER (...)`
+		// is an inline definition. A named reference is desugared to its definition at resolve.
 		if p.peek().Kind != TokLParen {
-			return Expr{}, NewError(FeatureNotSupported, "named windows (OVER name) are not supported yet")
+			oname, err := p.expectIdentifier()
+			if err != nil {
+				return Expr{}, err
+			}
+			fc.OverName = oname
+			return Expr{Kind: ExprFuncCall, FuncCall: fc}, nil
 		}
 		if err := p.expect(TokLParen); err != nil {
 			return Expr{}, err

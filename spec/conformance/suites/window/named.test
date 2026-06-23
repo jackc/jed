@@ -1,0 +1,77 @@
+# Window functions S5 — named windows: the WINDOW clause + OVER name (spec/design/window.md §5).
+#
+# A `WINDOW name AS (definition)` clause names a window definition that `OVER name` references; it is
+# exactly equivalent to inlining the definition. Multiple functions can share one named window, and
+# one clause can define several. A reference to an undefined window is 42704 (PG). (The shared
+# partition/sort OPTIMIZATION is a deferred follow-on; this slice is the naming surface.)
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_named, query.window_ranking, query.window_aggregate, query.order_by, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 2, 50)
+
+# OVER w referencing a WINDOW clause — equivalent to OVER (PARTITION BY g ORDER BY id). Two
+# functions share the one named window.
+# names: id, rn, rnk
+# cost: 21
+query III nosort
+SELECT id, row_number() OVER w AS rn, rank() OVER w AS rnk FROM t WINDOW w AS (PARTITION BY g ORDER BY id) ORDER BY id
+----
+1
+1
+1
+2
+2
+2
+3
+1
+1
+4
+2
+2
+5
+3
+3
+
+# A named window driving a running aggregate — same as OVER (ORDER BY id).
+# names: id, rs
+query II nosort
+SELECT id, sum(v) OVER win AS rs FROM t WINDOW win AS (ORDER BY id) ORDER BY id
+----
+1
+10
+2
+30
+3
+60
+4
+100
+5
+150
+
+# Two named windows in one clause, used by different functions.
+# names: id, rn_g, rs_all
+query III nosort
+SELECT id, row_number() OVER pg AS rn_g, sum(v) OVER allrows AS rs_all FROM t WINDOW pg AS (PARTITION BY g ORDER BY id), allrows AS (ORDER BY id) ORDER BY id
+----
+1
+1
+10
+2
+2
+30
+3
+1
+60
+4
+2
+100
+5
+3
+150
+
+# A reference to a window name not defined by any WINDOW clause is 42704.
+statement error 42704
+SELECT id, row_number() OVER nope FROM t

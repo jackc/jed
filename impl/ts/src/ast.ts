@@ -160,6 +160,11 @@ export type Expr =
       // window-only function (row_number/…) with no `over` is 42809; an aggregate with `over` set
       // is a window aggregate (S3).
       over?: WindowDef | null;
+      // Set (to the window name) when the call is `f(...) OVER name` referencing a named window (the
+      // WINDOW clause — spec/design/window.md §5). A desugaring pass replaces it with the named
+      // definition (into `over`) before resolution; exactly one of `over`/`overName` is set on a
+      // window call. null/undefined for an inline `OVER (...)` or a non-window call.
+      overName?: string | null;
     }
   // A scalar subquery `( query_expr )` in expression position (spec/design/grammar.md §26). resolve
   // plans it once against the scope chain; an uncorrelated one is then folded to a constant, a
@@ -671,6 +676,10 @@ export type Select = {
   orderBy: OrderKey[];
   limit: bigint | null;
   offset: bigint | null;
+  // Named windows from a `WINDOW name AS (definition)` clause (spec/design/window.md §5,
+  // grammar.ebnf `window_clause`), referenced by `OVER name`. Empty when absent. Resolved by a
+  // desugaring pass that rewrites each `OVER name` to its definition before resolution.
+  windows: [string, WindowDef][];
 };
 
 // Update is `UPDATE <table> SET ... [WHERE ...]`. Assigning a PRIMARY KEY column is

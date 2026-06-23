@@ -534,6 +534,17 @@ type Select struct {
 	// nil pointer means the clause is absent.
 	Limit  *int64
 	Offset *int64
+	// Windows holds the named windows from a `WINDOW name AS (definition)` clause
+	// (spec/design/window.md §5, grammar.ebnf window_clause), referenced by `OVER name`. Empty when
+	// absent. Resolved by a desugaring pass that rewrites each `OVER name` to its definition (into
+	// the call's Over) before resolution.
+	Windows []NamedWindow
+}
+
+// NamedWindow is one `name AS (definition)` entry of a WINDOW clause (spec/design/window.md §5).
+type NamedWindow struct {
+	Name string
+	Def  WindowDef
 }
 
 // QueryExpr is the operand of a set operation (spec/design/grammar.md §25): a single SELECT core, a
@@ -976,6 +987,11 @@ type FuncCallExpr struct {
 	// function (row_number/…) with Over == nil is 42809; an aggregate with Over set is a window
 	// aggregate (S3, deferred).
 	Over *WindowDef
+	// OverName is the referenced named window when the call is `f(...) OVER name` (the WINDOW
+	// clause — spec/design/window.md §5); "" for an inline `OVER (...)` or a non-window call. A
+	// desugaring pass replaces it with the named definition (into Over) before resolution; exactly
+	// one of Over/OverName is set on a window call.
+	OverName string
 }
 
 // InExpr is `Lhs IN (List)` / `Lhs NOT IN (List)` — membership over a non-empty value list

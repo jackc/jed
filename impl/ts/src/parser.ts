@@ -88,6 +88,9 @@ function isTableRefStopKeyword(kw: string): boolean {
     // implicit table alias (`... SELECT v FROM t RETURNING v` is the INSERT's clause). §32;
     // PostgreSQL fully reserves the word.
     case "returning":
+    // WINDOW ends a SELECT core's FROM — it introduces the named-window clause and must not be
+    // swallowed as an implicit table alias (`FROM t WINDOW w AS …`). window.md §5.
+    case "window":
       return true;
     default:
       return false;
@@ -1663,6 +1666,9 @@ class Parser {
 
     const having = this.parseHaving();
 
+    // WINDOW name AS ( definition ) (, …) — named windows referenced by OVER name (window.md §5).
+    const windows = this.parseWindowClause();
+
     return {
       kind: "select",
       distinct,
@@ -1675,7 +1681,51 @@ class Parser {
       orderBy: [],
       limit: null,
       offset: null,
+      windows,
     };
+  }
+
+  // parseWindowClause parses `window_clause ::= "WINDOW" identifier "AS" "(" window_definition ")"
+  // ("," …)*` (window.md §5). Each entry is a full inline window definition (a base-window reference
+  // inside the definition is deferred). Empty when no WINDOW keyword is present. WINDOW is
+  // non-reserved.
+  private parseWindowClause(): [string, WindowDef][] {
+    if (this.peekKeyword() !== "window") return [];
+    this.advance();
+    const windows: [string, WindowDef][] = [];
+    for (;;) {
+      const name = this.expectIdentifier();
+      this.expectKeyword("as");
+      this.expect("lparen");
+      const partition: Expr[] = [];
+      if (this.peekKeyword() === "partition") {
+        this.advance();
+        this.expectKeyword("by");
+        for (;;) {
+          const [qualifier, col] = this.parseColumnRef();
+          partition.push(
+            qualifier !== null
+              ? { kind: "qualifiedColumn", qualifier, name: col }
+              : { kind: "column", name: col },
+          );
+          if (this.peek().kind === "comma") {
+            this.advance();
+          } else {
+            break;
+          }
+        }
+      }
+      const order = this.parseOrderBy();
+      const frame = this.parseWindowFrame();
+      this.expect("rparen");
+      windows.push([name, { partition, order, frame }]);
+      if (this.peek().kind === "comma") {
+        this.advance();
+      } else {
+        break;
+      }
+    }
+    return windows;
   }
 
   // parseHaving parses `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and
@@ -2771,16 +2821,18 @@ class Parser {
     // Keep argNames empty unless a name appeared (the all-positional sentinel — §8).
     const argNames = anyNamed ? names : [];
     // A trailing `OVER (...)` turns the call into a window-function call (spec/design/window.md,
-    // grammar.ebnf `over_clause`). S0 parses only the inline `OVER ( [PARTITION BY cols]
-    // [ORDER BY ...] )` form; a named window `OVER name` (the WINDOW clause) is deferred to S5.
+    // grammar.ebnf `over_clause`). The inline `OVER ( [PARTITION BY cols] [ORDER BY ...] )` form
+    // carries an inline definition; a named window `OVER name` (the WINDOW clause — window.md §5)
+    // sets `overName` and is desugared to its definition at resolve.
     let over: WindowDef | null = null;
+    let overName: string | null = null;
     if (this.peekKeyword() === "over") {
       this.advance();
+      // `OVER name` references a named window (the WINDOW clause — window.md §5); `OVER (...)` is an
+      // inline definition. A named reference is desugared to its definition at resolve.
       if (this.peek().kind !== "lparen") {
-        throw engineError(
-          "feature_not_supported",
-          "named windows (OVER name) are not supported yet",
-        );
+        overName = this.expectIdentifier();
+        return { kind: "funcCall", name, args, argNames, star, variadic, over: null, overName };
       }
       this.expect("lparen");
       // PARTITION BY <col> (, <col>)* — columns only in S0 (window.md §3).
@@ -2809,7 +2861,7 @@ class Parser {
       this.expect("rparen");
       over = { partition, order, frame };
     }
-    return { kind: "funcCall", name, args, argNames, star, variadic, over };
+    return { kind: "funcCall", name, args, argNames, star, variadic, over, overName };
   }
 
   // parseWindowFrame parses an optional window frame clause

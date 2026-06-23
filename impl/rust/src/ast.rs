@@ -545,6 +545,10 @@ pub struct Select {
     pub limit: Option<i64>,
     /// `OFFSET m` — skip the first `m` rows of the result (a non-negative count).
     pub offset: Option<i64>,
+    /// Named windows from a `WINDOW name AS (definition)` clause (spec/design/window.md §5,
+    /// grammar.ebnf `window_clause`), referenced by `OVER name`. Empty when absent. Resolved by a
+    /// desugaring pass that rewrites each `OVER name` to its definition before resolution.
+    pub windows: Vec<(String, WindowDef)>,
 }
 
 /// A query expression — the operand of a set operation (spec/design/grammar.md §25). Either a
@@ -878,6 +882,11 @@ pub enum Expr {
         /// window-only function (row_number/…) with `over = None` is 42P20; an aggregate with
         /// `over = Some` is a window aggregate (S3).
         over: Option<Box<WindowDef>>,
+        /// `Some(name)` when the call is `f(...) OVER name` referencing a named window (the WINDOW
+        /// clause — spec/design/window.md §5). A desugaring pass replaces it with the named
+        /// definition (into `over`) before resolution; exactly one of `over`/`over_name` is set on
+        /// a window call. `None` for an inline `OVER (...)` or a non-window call.
+        over_name: Option<String>,
     },
     /// A scalar subquery `( query_expr )` in expression position (grammar.md §26). `resolve`
     /// plans it once against the scope chain; an uncorrelated one is then folded to a constant,

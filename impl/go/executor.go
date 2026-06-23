@@ -9245,7 +9245,17 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 		projAgg.windowing = true
 		projAgg.windowBase = width
 	}
-	projections, columnNames, columnTypes, err := resolveProjections(s, sel.Items, projAgg, ptypes)
+	// Desugar `OVER name` references to their WINDOW-clause definitions before resolution
+	// (window.md §5). The projection resolves against the desugared items; a reference to an
+	// undefined window is 42704. A plain query with no window clause/refs uses sel.Items unchanged.
+	items := sel.Items
+	if hasWindowSyntax {
+		items, err = desugarItems(sel.Items, sel.Windows)
+		if err != nil {
+			return nil, err
+		}
+	}
+	projections, columnNames, columnTypes, err := resolveProjections(s, items, projAgg, ptypes)
 	if err != nil {
 		return nil, err
 	}
@@ -13648,10 +13658,12 @@ func subscriptSpecExprs(s SubscriptSpec) []*Expr {
 func exprHasAggregate(e Expr) bool {
 	switch e.Kind {
 	case ExprFuncCall:
-		// An aggregate name carrying OVER is a WINDOW function, not a bare aggregate (so a
-		// `sum(x) OVER ()` query is a window query, not an aggregate query). Mirrors Rust:
-		// (over.is_none() && is_aggregate_name(name)) || any arg has an aggregate.
-		if e.FuncCall.Over == nil && isAggregateName(e.FuncCall.Name) {
+		// An aggregate name carrying OVER (inline or a named-window reference) is a WINDOW
+		// function, not a bare aggregate (so a `sum(x) OVER ()` / `sum(x) OVER w` query is a window
+		// query, not an aggregate query). Mirrors Rust: (over.is_none() && over_name.is_none() &&
+		// is_aggregate_name(name)) || any arg has an aggregate. (Detection runs before the
+		// OVER-name desugar.)
+		if e.FuncCall.Over == nil && e.FuncCall.OverName == "" && isAggregateName(e.FuncCall.Name) {
 			return true
 		}
 		for _, a := range e.FuncCall.Args {
@@ -13754,7 +13766,7 @@ func itemsHaveWindow(items SelectItems) bool {
 func exprHasWindow(e Expr) bool {
 	switch e.Kind {
 	case ExprFuncCall:
-		if e.FuncCall.Over != nil {
+		if e.FuncCall.Over != nil || e.FuncCall.OverName != "" {
 			return true
 		}
 		for _, a := range e.FuncCall.Args {
@@ -13828,6 +13840,289 @@ func exprHasWindow(e Expr) bool {
 		return exprHasWindow(e.Quantified.Lhs) || exprHasWindow(e.Quantified.Array)
 	default:
 		return false
+	}
+}
+
+// desugarItems desugars `OVER name` references in a select list to their WINDOW-clause definitions
+// before resolution (spec/design/window.md §5): each window call carrying OverName gets the named
+// definition copied into Over; an undefined name is 42704. After this every window call carries an
+// inline Over, so resolution (S0–S4) handles named and inline windows uniformly. Returns a fresh
+// SelectItems (the original AST is not mutated — the FuncCall pointers along each rewritten path are
+// freshly allocated).
+func desugarItems(items SelectItems, windows []NamedWindow) (SelectItems, error) {
+	if items.All {
+		return items, nil
+	}
+	out := SelectItems{Items: make([]SelectItem, len(items.Items))}
+	for i, it := range items.Items {
+		e, err := desugarNamedWindows(it.Expr, windows)
+		if err != nil {
+			return SelectItems{}, err
+		}
+		out.Items[i] = SelectItem{Expr: e, Alias: it.Alias}
+	}
+	return out, nil
+}
+
+// desugarNamedWindows recursively rewrites every `OVER name` (OverName set) in e to its definition
+// from windows (copied into Over), erroring 42704 if the name is absent. Mirrors Rust's
+// desugar_named_windows: the FuncCall arm rewrites the reference and recurses into the arguments;
+// the other arms recurse into their sub-expressions; leaves, subscripts, and subqueries (independent)
+// carry no top-level window ref to rewrite. The walk returns a fresh Expr so the original AST stays
+// unmutated.
+func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
+	switch e.Kind {
+	case ExprFuncCall:
+		fc := *e.FuncCall // shallow copy; we replace Args/Over/OverName below
+		if fc.OverName != "" {
+			name := fc.OverName
+			var def *WindowDef
+			for i := range windows {
+				if strings.EqualFold(windows[i].Name, name) {
+					d := windows[i].Def
+					def = &d
+					break
+				}
+			}
+			if def == nil {
+				return Expr{}, NewError(UndefinedObject, fmt.Sprintf("window %q does not exist", name))
+			}
+			fc.Over = def
+			fc.OverName = ""
+		}
+		if len(fc.Args) > 0 {
+			args := make([]*Expr, len(fc.Args))
+			for i, a := range fc.Args {
+				na, err := desugarNamedWindows(*a, windows)
+				if err != nil {
+					return Expr{}, err
+				}
+				args[i] = &na
+			}
+			fc.Args = args
+		}
+		ne := e
+		ne.FuncCall = &fc
+		return ne, nil
+	case ExprCast:
+		inner, err := desugarNamedWindows(e.Cast.Inner, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nc := *e.Cast
+		nc.Inner = inner
+		ne := e
+		ne.Cast = &nc
+		return ne, nil
+	case ExprExtract:
+		src, err := desugarNamedWindows(e.Extract.Source, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nx := *e.Extract
+		nx.Source = src
+		ne := e
+		ne.Extract = &nx
+		return ne, nil
+	case ExprCollate:
+		inner, err := desugarNamedWindows(e.Collate.Inner, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nc := *e.Collate
+		nc.Inner = inner
+		ne := e
+		ne.Collate = &nc
+		return ne, nil
+	case ExprUnary:
+		op, err := desugarNamedWindows(e.Unary.Operand, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nu := *e.Unary
+		nu.Operand = op
+		ne := e
+		ne.Unary = &nu
+		return ne, nil
+	case ExprIsNull:
+		op, err := desugarNamedWindows(e.IsNullOf.Operand, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		ni := *e.IsNullOf
+		ni.Operand = op
+		ne := e
+		ne.IsNullOf = &ni
+		return ne, nil
+	case ExprBinary:
+		lhs, err := desugarNamedWindows(e.Binary.Lhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		rhs, err := desugarNamedWindows(e.Binary.Rhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nb := *e.Binary
+		nb.Lhs = lhs
+		nb.Rhs = rhs
+		ne := e
+		ne.Binary = &nb
+		return ne, nil
+	case ExprIsDistinct:
+		lhs, err := desugarNamedWindows(e.IsDistinct.Lhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		rhs, err := desugarNamedWindows(e.IsDistinct.Rhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nd := *e.IsDistinct
+		nd.Lhs = lhs
+		nd.Rhs = rhs
+		ne := e
+		ne.IsDistinct = &nd
+		return ne, nil
+	case ExprIn:
+		lhs, err := desugarNamedWindows(e.In.Lhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		list := make([]Expr, len(e.In.List))
+		for i, x := range e.In.List {
+			nx, err := desugarNamedWindows(x, windows)
+			if err != nil {
+				return Expr{}, err
+			}
+			list[i] = nx
+		}
+		nin := *e.In
+		nin.Lhs = lhs
+		nin.List = list
+		ne := e
+		ne.In = &nin
+		return ne, nil
+	case ExprQuantified:
+		lhs, err := desugarNamedWindows(e.Quantified.Lhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		arr, err := desugarNamedWindows(e.Quantified.Array, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nq := *e.Quantified
+		nq.Lhs = lhs
+		nq.Array = arr
+		ne := e
+		ne.Quantified = &nq
+		return ne, nil
+	case ExprBetween:
+		lhs, err := desugarNamedWindows(e.Between.Lhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		lo, err := desugarNamedWindows(e.Between.Lo, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		hi, err := desugarNamedWindows(e.Between.Hi, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nbt := *e.Between
+		nbt.Lhs = lhs
+		nbt.Lo = lo
+		nbt.Hi = hi
+		ne := e
+		ne.Between = &nbt
+		return ne, nil
+	case ExprLike:
+		lhs, err := desugarNamedWindows(e.Like.Lhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		rhs, err := desugarNamedWindows(e.Like.Rhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nl := *e.Like
+		nl.Lhs = lhs
+		nl.Rhs = rhs
+		ne := e
+		ne.Like = &nl
+		return ne, nil
+	case ExprRegex:
+		lhs, err := desugarNamedWindows(e.Regex.Lhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		rhs, err := desugarNamedWindows(e.Regex.Rhs, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		nr := *e.Regex
+		nr.Lhs = lhs
+		nr.Rhs = rhs
+		ne := e
+		ne.Regex = &nr
+		return ne, nil
+	case ExprRow, ExprArray:
+		items := make([]Expr, len(e.RowItems))
+		for i, x := range e.RowItems {
+			nx, err := desugarNamedWindows(x, windows)
+			if err != nil {
+				return Expr{}, err
+			}
+			items[i] = nx
+		}
+		ne := e
+		ne.RowItems = items
+		return ne, nil
+	case ExprFieldAccess, ExprFieldStar:
+		base, err := desugarNamedWindows(*e.Base, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		ne := e
+		ne.Base = &base
+		return ne, nil
+	case ExprCase:
+		nc := *e.Case
+		if e.Case.Operand != nil {
+			op, err := desugarNamedWindows(*e.Case.Operand, windows)
+			if err != nil {
+				return Expr{}, err
+			}
+			nc.Operand = &op
+		}
+		whens := make([]CaseWhen, len(e.Case.Whens))
+		for i, w := range e.Case.Whens {
+			cond, err := desugarNamedWindows(w.Cond, windows)
+			if err != nil {
+				return Expr{}, err
+			}
+			res, err := desugarNamedWindows(w.Result, windows)
+			if err != nil {
+				return Expr{}, err
+			}
+			whens[i] = CaseWhen{Cond: cond, Result: res}
+		}
+		nc.Whens = whens
+		if e.Case.Els != nil {
+			els, err := desugarNamedWindows(*e.Case.Els, windows)
+			if err != nil {
+				return Expr{}, err
+			}
+			nc.Els = &els
+		}
+		ne := e
+		ne.Case = &nc
+		return ne, nil
+	default:
+		// Leaves, subscripts, and subqueries (independent) carry no top-level window ref to rewrite.
+		return e, nil
 	}
 }
 

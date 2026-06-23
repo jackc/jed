@@ -1784,6 +1784,9 @@ impl Parser {
 
         let having = self.parse_having()?;
 
+        // WINDOW name AS ( definition ) (, …) — named windows referenced by OVER name (window.md §5).
+        let windows = self.parse_window_clause()?;
+
         Ok(Select {
             distinct,
             items,
@@ -1795,7 +1798,61 @@ impl Parser {
             order_by: Vec::new(),
             limit: None,
             offset: None,
+            windows,
         })
+    }
+
+    /// `window_clause ::= "WINDOW" identifier "AS" "(" window_definition ")" ("," …)*` (window.md
+    /// §5). Each entry is a full inline window definition (a base-window reference inside the
+    /// definition is deferred). Empty when no WINDOW keyword is present. WINDOW is non-reserved.
+    fn parse_window_clause(&mut self) -> Result<Vec<(String, WindowDef)>> {
+        if self.peek_keyword().as_deref() != Some("window") {
+            return Ok(Vec::new());
+        }
+        self.advance();
+        let mut windows = Vec::new();
+        loop {
+            let name = self.expect_identifier()?;
+            self.expect_keyword("as")?;
+            self.expect(&Token::LParen)?;
+            let mut partition = Vec::new();
+            if self.peek_keyword().as_deref() == Some("partition") {
+                self.advance();
+                self.expect_keyword("by")?;
+                loop {
+                    let (q, c) = self.parse_column_ref()?;
+                    partition.push(match q {
+                        Some(q) => Expr::QualifiedColumn {
+                            qualifier: q,
+                            name: c,
+                        },
+                        None => Expr::Column(c),
+                    });
+                    if matches!(self.peek(), Token::Comma) {
+                        self.advance();
+                    } else {
+                        break;
+                    }
+                }
+            }
+            let order = self.parse_order_by()?;
+            let frame = self.parse_window_frame()?;
+            self.expect(&Token::RParen)?;
+            windows.push((
+                name,
+                WindowDef {
+                    partition,
+                    order,
+                    frame,
+                },
+            ));
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+            } else {
+                break;
+            }
+        }
+        Ok(windows)
     }
 
     /// `having_clause ::= "HAVING" expr` (grammar.md §19), after GROUP BY and before ORDER BY.
@@ -2630,6 +2687,7 @@ impl Parser {
                 star: false,
                 variadic: false,
                 over: None,
+                over_name: None,
             };
         }
         self.depth = base;
@@ -3038,6 +3096,7 @@ impl Parser {
                     star: false,
                     variadic: false,
                     over: None,
+                    over_name: None,
                 })
             }
             Token::Str(_) => {
@@ -3153,13 +3212,22 @@ impl Parser {
         // A trailing `OVER (...)` turns the call into a window-function call (spec/design/window.md,
         // grammar.ebnf `over_clause`). S0 parses only the inline `OVER ( [PARTITION BY cols]
         // [ORDER BY ...] )` form; a named window `OVER name` (the WINDOW clause) is deferred to S5.
+        let mut over_name: Option<String> = None;
         let over = if self.peek_keyword().as_deref() == Some("over") {
             self.advance();
+            // `OVER name` references a named window (the WINDOW clause — window.md §5); `OVER (...)`
+            // is an inline definition. A named reference is desugared to its definition at resolve.
             if !matches!(self.peek(), Token::LParen) {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "named windows (OVER name) are not supported yet",
-                ));
+                over_name = Some(self.expect_identifier()?);
+                return Ok(Expr::FuncCall {
+                    name,
+                    args,
+                    arg_names,
+                    star,
+                    variadic,
+                    over: None,
+                    over_name,
+                });
             }
             self.expect(&Token::LParen)?;
             // PARTITION BY <col> (, <col>)* — columns only in S0 (window.md §3).
@@ -3203,6 +3271,7 @@ impl Parser {
             star,
             variadic,
             over,
+            over_name,
         })
     }
 
@@ -3492,6 +3561,9 @@ fn is_table_ref_stop_keyword(kw: &str) -> bool {
             // source's implicit table alias (`... SELECT v FROM t RETURNING v` is the INSERT's
             // clause). §32; PostgreSQL fully reserves the word.
             | "returning"
+            // WINDOW ends a SELECT core's FROM — it introduces the named-window clause and must
+            // not be swallowed as an implicit table alias (`FROM t WINDOW w AS …`). window.md §5.
+            | "window"
     )
 }
 

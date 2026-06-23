@@ -144,6 +144,6 @@ SELECT id FROM t GROUP BY id HAVING row_number() OVER () > 0
 statement error 0A000
 SELECT g, row_number() OVER (ORDER BY g), SUM(v) FROM t GROUP BY g
 
-# A named window (OVER name) is deferred to S5 — 0A000.
-statement error 0A000
+# OVER a named window that is not defined by any WINDOW clause is 42704 (PG-matching, S5).
+statement error 42704
 SELECT id, row_number() OVER w FROM t

@@ -6817,11 +6817,20 @@ export class Database {
           window: { base: scope.width(), windowSpecs: [] },
         }
       : { collecting: isAgg, groupKeys, specs: [] };
+    // Desugar `OVER name` references to their WINDOW-clause definitions before resolution
+    // (window.md §5). The projection resolves against the desugared items; a reference to an
+    // undefined window is 42704. A plain query with no window clause/refs clones nothing extra.
+    let itemsRef = sel.items;
+    if (hasWindowSyntax) {
+      const cloned = structuredClone(sel.items);
+      desugarItems(cloned, sel.windows);
+      itemsRef = cloned;
+    }
     const {
       nodes: projections,
       names: columnNames,
       types: columnTypes,
-    } = resolveProjections(scope, sel.items, projAgg, ptypes);
+    } = resolveProjections(scope, itemsRef, projAgg, ptypes);
     // HAVING resolves against the same grouped scope (collect) — it may reference aggregates
     // (collected into the SAME specs, so their slots follow the projection's) and grouping keys;
     // a non-grouped column is 42803. It must be boolean (42804). Resolved after the projection so
@@ -10580,9 +10589,13 @@ function astSubscriptExprs(subs: SubscriptSpec[]): Expr[] {
 function exprHasAggregate(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall":
-      // An aggregate name carrying OVER is a WINDOW function, not a bare aggregate (window.md §5.1),
-      // so it does not mark the query as aggregate; its arguments are still walked for nested aggregates.
-      return (e.over == null && isAggregateName(e.name)) || e.args.some(exprHasAggregate);
+      // An aggregate name carrying OVER (inline or a named-window reference) is a WINDOW function,
+      // not a bare aggregate (window.md §5.1) — so it does not mark the query as aggregate; its
+      // arguments are still walked for nested aggregates. (Detection runs before the OVER-name desugar.)
+      return (
+        (e.over == null && e.overName == null && isAggregateName(e.name)) ||
+        e.args.some(exprHasAggregate)
+      );
     case "cast":
       return exprHasAggregate(e.inner);
     case "extract":
@@ -10640,7 +10653,7 @@ function itemsHaveWindow(items: SelectItems): boolean {
 function exprHasWindow(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall":
-      return (e.over !== undefined && e.over !== null) || e.args.some(exprHasWindow);
+      return e.over != null || e.overName != null || e.args.some(exprHasWindow);
     case "cast":
       return exprHasWindow(e.inner);
     case "extract":
@@ -10680,6 +10693,95 @@ function exprHasWindow(e: Expr): boolean {
       return exprHasWindow(e.lhs) || exprHasWindow(e.array);
     default:
       return false;
+  }
+}
+
+// desugarItems rewrites `OVER name` references in a select list to their WINDOW-clause definitions
+// before resolution (spec/design/window.md §5): each window call carrying `overName` gets the named
+// definition copied into `over`; an undefined name is 42704. After this every window call carries an
+// inline `over`, so resolution (S0–S4) handles named and inline windows uniformly. Mutates `items`.
+function desugarItems(items: SelectItems, windows: [string, WindowDef][]): void {
+  if (items.kind === "all") return;
+  for (const it of items.items) {
+    desugarNamedWindows(it.expr, windows);
+  }
+}
+
+// desugarNamedWindows is the recursive Expr walk behind desugarItems: it replaces a funcCall's
+// `overName` with the matching WINDOW-clause definition (case-insensitively), throwing 42704 for an
+// undefined name. Mirrors Rust's desugar_named_windows exactly (leaves, subscripts, and subqueries
+// carry no top-level window ref to rewrite).
+function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): void {
+  switch (e.kind) {
+    case "funcCall":
+      if (e.overName != null) {
+        const name = e.overName;
+        const found = windows.find(([n]) => n.toLowerCase() === name.toLowerCase());
+        if (found === undefined) {
+          throw engineError("undefined_object", `window "${name}" does not exist`);
+        }
+        e.over = structuredClone(found[1]);
+        e.overName = null;
+      }
+      for (const a of e.args) desugarNamedWindows(a, windows);
+      return;
+    case "cast":
+      desugarNamedWindows(e.inner, windows);
+      return;
+    case "extract":
+      desugarNamedWindows(e.source, windows);
+      return;
+    case "collate":
+      desugarNamedWindows(e.inner, windows);
+      return;
+    case "unary":
+    case "isNull":
+      desugarNamedWindows(e.operand, windows);
+      return;
+    case "binary":
+    case "isDistinct":
+      desugarNamedWindows(e.lhs, windows);
+      desugarNamedWindows(e.rhs, windows);
+      return;
+    case "in":
+      desugarNamedWindows(e.lhs, windows);
+      for (const x of e.list) desugarNamedWindows(x, windows);
+      return;
+    case "quantified":
+      desugarNamedWindows(e.lhs, windows);
+      desugarNamedWindows(e.array, windows);
+      return;
+    case "between":
+      desugarNamedWindows(e.lhs, windows);
+      desugarNamedWindows(e.lo, windows);
+      desugarNamedWindows(e.hi, windows);
+      return;
+    case "like":
+    case "regex":
+      desugarNamedWindows(e.lhs, windows);
+      desugarNamedWindows(e.rhs, windows);
+      return;
+    case "row":
+      for (const x of e.fields) desugarNamedWindows(x, windows);
+      return;
+    case "array":
+      for (const x of e.elements) desugarNamedWindows(x, windows);
+      return;
+    case "fieldAccess":
+    case "fieldStar":
+      desugarNamedWindows(e.base, windows);
+      return;
+    case "case":
+      if (e.operand !== null) desugarNamedWindows(e.operand, windows);
+      for (const w of e.whens) {
+        desugarNamedWindows(w.cond, windows);
+        desugarNamedWindows(w.result, windows);
+      }
+      if (e.els !== null) desugarNamedWindows(e.els, windows);
+      return;
+    // Leaves, subscripts, and subqueries (independent) carry no top-level window ref to rewrite.
+    default:
+      return;
   }
 }
 
