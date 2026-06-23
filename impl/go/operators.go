@@ -3790,6 +3790,42 @@ var Aggregates = []AggregateDesc{
 		Null:        "aggregate",
 		Errors:      []string{},
 	},
+	{
+		Name:        "jsonb_agg",
+		Surface:     "jsonb_agg",
+		Arg:         "expr",
+		ArgFamilies: []string{"any"},
+		Result:      "jsonb",
+		Null:        "aggregate",
+		Errors:      []string{"0A000"},
+	},
+	{
+		Name:        "json_agg",
+		Surface:     "json_agg",
+		Arg:         "expr",
+		ArgFamilies: []string{"any"},
+		Result:      "json",
+		Null:        "aggregate",
+		Errors:      []string{"0A000"},
+	},
+	{
+		Name:        "jsonb_agg_strict",
+		Surface:     "jsonb_agg_strict",
+		Arg:         "expr",
+		ArgFamilies: []string{"any"},
+		Result:      "jsonb",
+		Null:        "aggregate",
+		Errors:      []string{"0A000"},
+	},
+	{
+		Name:        "json_agg_strict",
+		Surface:     "json_agg_strict",
+		Arg:         "expr",
+		ArgFamilies: []string{"any"},
+		Result:      "json",
+		Null:        "aggregate",
+		Errors:      []string{"0A000"},
+	},
 }
 
 // SetReturningDesc is one set-returning function's metadata, mirroring a [[set_returning]]

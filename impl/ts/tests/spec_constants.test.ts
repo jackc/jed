@@ -293,7 +293,15 @@ test("function registry covers the catalog (extensibility.md §5)", () => {
       scalarTypeFromName(o.result) !== undefined;
     assert.ok(ok, `function ${o.name} has unhandled result code ${o.result}`);
   }
-  const AGG_RESULT_CODES = new Set(["i64", "decimal", "sum_widen", "same_as_input"]);
+  const AGG_RESULT_CODES = new Set([
+    "i64",
+    "decimal",
+    "sum_widen",
+    "same_as_input",
+    // json[b]_agg / json[b]_agg_strict (B4) — aggregatePlan maps (surface, "jsonb"|"json") → jsonAgg.
+    "jsonb",
+    "json",
+  ]);
   for (const a of AGGREGATES) {
     assert.ok(
       AGG_RESULT_CODES.has(a.result),

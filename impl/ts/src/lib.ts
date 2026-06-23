@@ -98,6 +98,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "func.json_srf",
   // to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2).
   "func.to_jsonb",
+  // json[b]_agg / json[b]_agg_strict (B4) — the JSON-array aggregate builders (json-sql-functions.md
+  // §4). Aggregate a group's values into one JSON array via the to_jsonb element kernel.
+  "func.json_agg",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
   // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
   "func.range_accessors",

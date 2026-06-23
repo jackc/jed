@@ -3676,6 +3676,42 @@ export const AGGREGATES: readonly AggregateDesc[] = [
     null: "aggregate",
     errors: [],
   },
+  {
+    name: "jsonb_agg",
+    surface: "jsonb_agg",
+    arg: "expr",
+    argFamilies: ["any"],
+    result: "jsonb",
+    null: "aggregate",
+    errors: ["0A000"],
+  },
+  {
+    name: "json_agg",
+    surface: "json_agg",
+    arg: "expr",
+    argFamilies: ["any"],
+    result: "json",
+    null: "aggregate",
+    errors: ["0A000"],
+  },
+  {
+    name: "jsonb_agg_strict",
+    surface: "jsonb_agg_strict",
+    arg: "expr",
+    argFamilies: ["any"],
+    result: "jsonb",
+    null: "aggregate",
+    errors: ["0A000"],
+  },
+  {
+    name: "json_agg_strict",
+    surface: "json_agg_strict",
+    arg: "expr",
+    argFamilies: ["any"],
+    result: "json",
+    null: "aggregate",
+    errors: ["0A000"],
+  },
 ];
 
 // One set-returning function's metadata, mirroring a [[set_returning]] entry in

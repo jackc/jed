@@ -250,3 +250,35 @@ func TestToJsonbUnsupportedSourcesAreDeferred(t *testing.T) {
 		t.Errorf("to_jsonb(multidim array): got %s, want 0A000", got)
 	}
 }
+
+// TestJsonAggDeferredElementSourceIs0A000: json[b]_agg over a deferred-source value (float, like
+// to_jsonb) is 0A000 — the aggregate reuses the to_jsonb element kernel (valueToNode), so the same
+// float/datetime/composite/uuid/bytea/interval sources propagate the deferral
+// (json-sql-functions.md §4). The supported element types are oracle-clean in
+// suites/json/json_agg.test. Mirrors impl/rust/tests/json.rs json_agg_deferred_element_source_is_0a000.
+func TestJsonAggDeferredElementSourceIs0A000(t *testing.T) {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE f (id i32 PRIMARY KEY, x f64)")
+	run(t, db, "INSERT INTO f VALUES (1, 1.5)")
+	if got := errJSON(t, db, "SELECT jsonb_agg(x) FROM f"); got != "0A000" {
+		t.Errorf("jsonb_agg(f64): got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT json_agg(x) FROM f"); got != "0A000" {
+		t.Errorf("json_agg(f64): got %s, want 0A000", got)
+	}
+}
+
+// TestJsonAggCanonicalizesJsonElements: json_agg over a `json` element CANONICALIZES it (the element
+// conversion runs through the jsonb node tree via valueToNode), dropping the input whitespace — a
+// documented divergence from PostgreSQL, which preserves the verbatim sub-text (`[{ "a" : 1 }]`).
+// This is the same verbatim divergence the json SRFs / accessor operators carry (json.md §4); it
+// can't live in the PG-clean corpus. Mirrors impl/rust/tests/json.rs json_agg_canonicalizes_json_elements.
+func TestJsonAggCanonicalizesJsonElements(t *testing.T) {
+	db := NewDatabase()
+	run(t, db, "CREATE TABLE j (id i32 PRIMARY KEY, doc json)")
+	run(t, db, "INSERT INTO j VALUES (1, '{ \"a\" : 1 }')")
+	// jed canonicalizes the element; PG would render the verbatim `[{ "a" : 1 }]`.
+	if got, want := queryRendered(t, db, "SELECT json_agg(doc) FROM j")[0][0], "[{\"a\": 1}]"; got != want {
+		t.Errorf("json_agg(json) = %q, want %q", got, want)
+	}
+}

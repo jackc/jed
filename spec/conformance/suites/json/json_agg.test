@@ -1,0 +1,101 @@
+# json[b]_agg / json[b]_agg_strict — the JSON-array aggregate builders (B4,
+# spec/design/json-sql-functions.md §4). Aggregate a group's values into one JSON array, one element
+# per input row in the group's row order (deterministic under an ORDER BY of the source / a GROUP BY).
+# The strict variants skip NULL-valued rows; the non-strict ones keep them as JSON null. An empty
+# group → SQL NULL. Both render the spaced canonical array; the json variant is typed json. The
+# element conversion reuses the to_jsonb kernel. Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.group_by, query.order_by, types.jsonb, types.json, func.json_agg, func.to_jsonb
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, grp i32, v i32, name text)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 30, 'a'), (2, 1, 10, NULL), (3, 2, 20, 'c'), (4, 2, 40, 'd')
+
+# Whole-table aggregate: the array follows the scan (PK) order, deterministic here.
+query T nosort
+SELECT jsonb_agg(v) FROM t
+----
+[30, 10, 20, 40]
+
+# json_agg of text — NULL rows kept as JSON null; the json variant renders the same spaced array.
+query T nosort
+SELECT json_agg(name) FROM t
+----
+["a", null, "c", "d"]
+
+# Grouped: one array per group, in group-key order, elements in row order within the group.
+query IT nosort
+SELECT grp, jsonb_agg(v) FROM t GROUP BY grp ORDER BY grp
+----
+1
+[30, 10]
+2
+[20, 40]
+
+# Grouped json_agg over a column with a NULL — the NULL is kept as JSON null.
+query IT nosort
+SELECT grp, json_agg(name) FROM t GROUP BY grp ORDER BY grp
+----
+1
+["a", null]
+2
+["c", "d"]
+
+# The strict variants SKIP a NULL-valued row (group 1 drops the NULL name).
+query IT nosort
+SELECT grp, jsonb_agg_strict(name) FROM t GROUP BY grp ORDER BY grp
+----
+1
+["a"]
+2
+["c", "d"]
+
+query IT nosort
+SELECT grp, json_agg_strict(name) FROM t GROUP BY grp ORDER BY grp
+----
+1
+["a"]
+2
+["c", "d"]
+
+# A single NULL row: non-strict keeps it as a one-element [null]; strict drops it but the group still
+# has a row, so the result is an EMPTY array [] — NOT NULL (PG reserves NULL for a zero-row group).
+query T nosort
+SELECT jsonb_agg(name) FROM t WHERE id = 2
+----
+[null]
+
+query T nosort
+SELECT jsonb_agg_strict(name) FROM t WHERE id = 2
+----
+[]
+
+# An empty group (no matching rows) → SQL NULL, not an empty array.
+query T nosort
+SELECT jsonb_agg(v) FROM t WHERE v > 100
+----
+NULL
+
+# The aggregate result is a first-class jsonb — it composes with the scalar functions.
+query T nosort
+SELECT jsonb_typeof(jsonb_agg(v)) FROM t
+----
+array
+
+query I nosort
+SELECT jsonb_array_length(jsonb_agg(v)) FROM t
+----
+4
+
+# Aggregating a jsonb expression (to_jsonb) and an array column — the element conversion recurses.
+query T nosort
+SELECT jsonb_agg(to_jsonb(v)) FROM t
+----
+[30, 10, 20, 40]
+
+query T nosort
+SELECT jsonb_agg(ARRAY[v, v]) FROM t WHERE grp = 1
+----
+[[30, 30], [10, 10]]

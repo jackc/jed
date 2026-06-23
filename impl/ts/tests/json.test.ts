@@ -126,3 +126,37 @@ test("to_jsonb unsupported sources are deferred", () => {
     "0A000",
   );
 });
+
+// `json[b]_agg` over a deferred-source value (float, like to_jsonb) is `0A000` — the aggregate
+// reuses the `to_jsonb` element kernel, so the same float/datetime/composite/uuid/bytea/interval
+// sources propagate the deferral (json-sql-functions.md §4, B4). The supported element types are
+// oracle-clean in suites/json/json_agg.test. Mirrors impl/rust/tests/json.rs
+// json_agg_deferred_element_source_is_0a000 and impl/go/json_test.go.
+test("json_agg deferred element source is 0A000", () => {
+  const db = dbWith([
+    "CREATE TABLE f (id i32 PRIMARY KEY, x f64)",
+    "INSERT INTO f VALUES (1, 1.5)",
+  ]);
+  assert.equal(
+    errCode(() => execute(db, "SELECT jsonb_agg(x) FROM f")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT json_agg(x) FROM f")),
+    "0A000",
+  );
+});
+
+// `json_agg` over a `json` element CANONICALIZES it (the element conversion runs through the jsonb
+// node tree), dropping the input whitespace — a documented divergence from PostgreSQL, which
+// preserves the verbatim sub-text (`[{ "a" : 1 }]`). This is the same verbatim divergence the json
+// SRFs / accessor operators carry (json.md §4); it can't live in the PG-clean corpus. Mirrors
+// impl/rust/tests/json.rs json_agg_canonicalizes_json_elements and impl/go/json_test.go.
+test("json_agg canonicalizes json elements", () => {
+  const db = dbWith([
+    "CREATE TABLE j (id i32 PRIMARY KEY, doc json)",
+    `INSERT INTO j VALUES (1, '{ "a" : 1 }')`,
+  ]);
+  // jed canonicalizes the element; PG would render the verbatim `[{ "a" : 1 }]`.
+  assert.deepEqual(query(db, "SELECT json_agg(doc) FROM j"), [['[{"a": 1}]']]);
+});

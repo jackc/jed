@@ -3790,6 +3790,42 @@ pub const AGGREGATES: &[AggregateDesc] = &[
         null: "aggregate",
         errors: &[],
     },
+    AggregateDesc {
+        name: "jsonb_agg",
+        surface: "jsonb_agg",
+        arg: "expr",
+        arg_families: &["any"],
+        result: "jsonb",
+        null: "aggregate",
+        errors: &["0A000"],
+    },
+    AggregateDesc {
+        name: "json_agg",
+        surface: "json_agg",
+        arg: "expr",
+        arg_families: &["any"],
+        result: "json",
+        null: "aggregate",
+        errors: &["0A000"],
+    },
+    AggregateDesc {
+        name: "jsonb_agg_strict",
+        surface: "jsonb_agg_strict",
+        arg: "expr",
+        arg_families: &["any"],
+        result: "jsonb",
+        null: "aggregate",
+        errors: &["0A000"],
+    },
+    AggregateDesc {
+        name: "json_agg_strict",
+        surface: "json_agg_strict",
+        arg: "expr",
+        arg_families: &["any"],
+        result: "json",
+        null: "aggregate",
+        errors: &["0A000"],
+    },
 ];
 
 /// One set-returning function's metadata, mirroring a `[[set_returning]]` entry in

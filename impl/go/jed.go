@@ -521,6 +521,8 @@ var SupportedCapabilities = []string{
 	"func.json_srf",
 	// to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2).
 	"func.to_jsonb",
+	// json/jsonb array aggregates (B4) — json[b]_agg / json[b]_agg_strict (json-sql-functions.md §2).
+	"func.json_agg",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

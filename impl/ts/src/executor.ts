@@ -8080,7 +8080,10 @@ export class Database {
       // emits ONE row even over zero input; GROUP BY over an empty table creates no groups ->
       // zero rows. Each (row × aggregate) charges aggregateAccumulate; the bucketing/finalize is
       // unmetered (cost.md §3).
-      const newAccs = (): Acc[] => plan.aggSpecs.map((s) => newAcc(s.plan, s.floatWidth ?? "f64"));
+      const newAccs = (): Acc[] =>
+        plan.aggSpecs.map((s) =>
+          newAcc(s.plan, s.floatWidth ?? "f64", s.jsonAsJson ?? false, s.jsonStrict ?? false),
+        );
       // One DISTINCT dedup set per DISTINCT aggregate (null for a plain aggregate — COUNT(DISTINCT
       // x), aggregates.md §5). Keyed on distinctRowKey, the same value-canonical form as the
       // group-key bucketing (so 1.5 == 1.50 and -0.0 == 0.0).
@@ -11071,7 +11074,15 @@ type AggPlan =
   | "sumFloat"
   | "avgFloat"
   | "min"
-  | "max";
+  | "max"
+  // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (json-sql-functions.md, B4): aggregate
+  // a group's values into one JSON array, one element per input row in scan order. The element image
+  // is the to_jsonb kernel (valueToNode), so deferred sources (float/datetime/composite/…) propagate
+  // 0A000. `asJson` selects the json result type (vs jsonb) — BOTH render via the spaced jsonb_out;
+  // `strict` skips a NULL-valued row (the non-strict variants keep it as JSON null). An empty/zero-row
+  // group → SQL NULL, but a group whose rows were all dropped by the strict filter → an empty array []
+  // (the `seen` flag distinguishes the two).
+  | "jsonAgg";
 
 // AggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
 // row against the real row). operand is null for COUNT(*). distinct (COUNT(DISTINCT x),
@@ -11087,6 +11098,10 @@ type AggSpec = {
   // aggregates.md §11); null/undefined for an unfiltered aggregate. The fold loop evaluates it per
   // input row and folds only the rows for which it is TRUE (so the filter applies before DISTINCT).
   filter?: RExpr | null;
+  // For the "jsonAgg" plan (B4): asJson selects the json result type (vs jsonb); strict skips a
+  // NULL-valued row. Both ride on the Acc, fixed at resolve.
+  jsonAsJson?: boolean;
+  jsonStrict?: boolean;
 };
 
 // AggCtx threads the aggregate-resolution mode through resolve. collecting === false is the
@@ -11134,6 +11149,10 @@ type WindowSpec = {
   // float width (riding on the Acc), fixed at resolve from the function + operand type.
   aggPlan?: AggPlan;
   aggFloatWidth?: ScalarType;
+  // For a json[b]_agg window aggregate (B4 plan "jsonAgg"): the asJson / strict flags fixed at
+  // resolve, threaded into newAcc by applyWindowStage.
+  aggJsonAsJson?: boolean;
+  aggJsonStrict?: boolean;
   // The resolved explicit frame (S4, ROWS mode); undefined/null is the default frame (RANGE
   // UNBOUNDED PRECEDING TO CURRENT ROW with an ORDER BY, the whole partition without — window.md §6).
   frame?: ResolvedFrame | null;
@@ -11204,9 +11223,19 @@ type Acc = {
   cur: Value | null;
   floats: number[];
   floatWidth: ScalarType;
+  // For the "jsonAgg" plan (B4): the accumulated element nodes (the array body, in scan order) and
+  // the two flags fixed at resolve (asJson → json result; strict → skip a NULL-valued row).
+  jsonNodes: JsonNode[];
+  jsonAsJson: boolean;
+  jsonStrict: boolean;
 };
 
-function newAcc(plan: AggPlan, floatWidth: ScalarType = "f64"): Acc {
+function newAcc(
+  plan: AggPlan,
+  floatWidth: ScalarType = "f64",
+  jsonAsJson = false,
+  jsonStrict = false,
+): Acc {
   return {
     plan,
     count: 0n,
@@ -11216,6 +11245,9 @@ function newAcc(plan: AggPlan, floatWidth: ScalarType = "f64"): Acc {
     cur: null,
     floats: [],
     floatWidth,
+    jsonNodes: [],
+    jsonAsJson,
+    jsonStrict,
   };
 }
 
@@ -11224,7 +11256,7 @@ function newAcc(plan: AggPlan, floatWidth: ScalarType = "f64"): Acc {
 // the Rust `Acc: Clone`). Decimals are immutable (Decimal ops return fresh values), so only the
 // float-fold buffer needs a real copy; `cur` is a Value (treated immutably by foldAcc/finalizeAcc).
 function cloneAcc(a: Acc): Acc {
-  return { ...a, floats: a.floats.slice() };
+  return { ...a, floats: a.floats.slice(), jsonNodes: a.jsonNodes.slice() };
 }
 
 // foldAcc folds one input value into the accumulator. NULL arguments are skipped (COUNT(*)
@@ -11293,6 +11325,18 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
         }
       }
       break;
+    case "jsonAgg":
+      // Called once per group row, NULL-valued rows INCLUDED. `seen` marks the group non-empty even
+      // when the strict filter drops this row (so a one-NULL-row strict group finalizes to [] not
+      // NULL). A kept element charges one generatedRow (the per-appended-element cost), then its JSON
+      // image is the to_jsonb kernel (valueToNode) — deferred sources propagate 0A000.
+      a.seen = true;
+      if (!(a.jsonStrict && v.kind === "null")) {
+        m.charge(COSTS.generatedRow);
+        m.guard();
+        a.jsonNodes.push(valueToNode(v));
+      }
+      break;
   }
 }
 
@@ -11348,6 +11392,16 @@ function finalizeAcc(a: Acc): Value {
     case "min":
     case "max":
       return a.cur ?? nullValue();
+    case "jsonAgg": {
+      // Zero-row group → SQL NULL; a group that saw rows (even all-dropped by strict) → an array.
+      // Both result types render via the SAME spaced jsonb_out: jsonb carries the array node, json
+      // carries that same canonical text (json_agg canonicalizes a json element — a documented
+      // PG divergence, B4).
+      if (!a.seen) return nullValue();
+      const arr: JsonNode = { kind: "array", elements: a.jsonNodes };
+      if (a.jsonAsJson) return jsonValue(jsonbOut(arr));
+      return jsonbValue(arr);
+    }
   }
 }
 
@@ -11976,6 +12030,8 @@ function resolveAggregate(
   let result: ResolvedType;
   // The input float width for a float SUM/AVG (so the canonical fold rounds at the right width).
   let floatWidth: ScalarType | undefined;
+  // The B4 json[b]_agg flags (asJson / strict), set for the "jsonAgg" plan only.
+  let jsonFlags: JsonAggFlags | undefined;
   if (e.star) {
     // Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
     if (!aggregateHasStar(name))
@@ -12005,7 +12061,7 @@ function resolveAggregate(
     operand = r.node;
     const desc = lookupAggregateOverload(name, r.type);
     if (!desc) throw noAggOverload(name);
-    [plan, result, floatWidth] = aggregatePlan(name, desc.result, r.type);
+    [plan, result, floatWidth, jsonFlags] = aggregatePlan(name, desc.result, r.type);
   }
   // FILTER (WHERE cond): resolve the per-row predicate against the input row with aggregates
   // FORBIDDEN — an aggregate inside FILTER is 42803, matching PG (aggregates.md §11). A non-boolean
@@ -12022,7 +12078,15 @@ function resolveAggregate(
   }
   // Aggregate results follow the group-key values in the synthetic row.
   const slot = ag.groupKeys.length + ag.specs.length;
-  ag.specs.push({ plan, operand, floatWidth, distinct: e.distinct, filter });
+  ag.specs.push({
+    plan,
+    operand,
+    floatWidth,
+    distinct: e.distinct,
+    filter,
+    jsonAsJson: jsonFlags?.asJson,
+    jsonStrict: jsonFlags?.strict,
+  });
   return { node: { kind: "column", index: slot }, type: result };
 }
 
@@ -12209,6 +12273,7 @@ function resolveWindowCall(
     // ORDER BY, whole-partition without — spec/design/window.md §6). The operand → args[0].
     let aggPlan: AggPlan;
     let aggFloatWidth: ScalarType | undefined;
+    let aggJsonFlags: JsonAggFlags | undefined;
     if (e.star) {
       // Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
       if (!aggregateHasStar(lname))
@@ -12227,7 +12292,7 @@ function resolveWindowCall(
       const r = resolve(scope, e.args[0]!, null, sub, params);
       const desc = lookupAggregateOverload(lname, r.type);
       if (!desc) throw noAggOverload(lname);
-      [aggPlan, result, aggFloatWidth] = aggregatePlan(lname, desc.result, r.type);
+      [aggPlan, result, aggFloatWidth, aggJsonFlags] = aggregatePlan(lname, desc.result, r.type);
       wargs.push(r.node); // the aggregate operand → args[0]
     }
     plan = "agg";
@@ -12251,6 +12316,8 @@ function resolveWindowCall(
       args: wargs,
       aggPlan,
       aggFloatWidth,
+      aggJsonAsJson: aggJsonFlags?.asJson,
+      aggJsonStrict: aggJsonFlags?.strict,
       frame,
     });
     return { node: { kind: "column", index: slot }, type: result };
@@ -12663,7 +12730,7 @@ function aggregatePlan(
   surface: string,
   code: string,
   t: ResolvedType,
-): [AggPlan, ResolvedType, ScalarType | undefined] {
+): [AggPlan, ResolvedType, ScalarType | undefined, JsonAggFlags?] {
   if (surface === "count") return ["count", { kind: "int", ty: "i64" }, undefined];
   if (surface === "sum" && code === "sum_widen") {
     // SUM(i16|i32) → i64; SUM(i64) → decimal (PG widening).
@@ -12682,8 +12749,23 @@ function aggregatePlan(
   }
   if (surface === "min" && code === "same_as_input") return ["min", t, undefined];
   if (surface === "max" && code === "same_as_input") return ["max", t, undefined];
+  // jsonb_agg / json_agg / jsonb_agg_strict / json_agg_strict (B4). The (surface, result-code) pair
+  // selects the result type + the two flags; the result code is "jsonb" or "json". asJson = the json
+  // result type; strict = the _strict variant (skip a NULL-valued row).
+  if (surface === "jsonb_agg" && code === "jsonb")
+    return ["jsonAgg", { kind: "jsonb" }, undefined, { asJson: false, strict: false }];
+  if (surface === "json_agg" && code === "json")
+    return ["jsonAgg", { kind: "json" }, undefined, { asJson: true, strict: false }];
+  if (surface === "jsonb_agg_strict" && code === "jsonb")
+    return ["jsonAgg", { kind: "jsonb" }, undefined, { asJson: false, strict: true }];
+  if (surface === "json_agg_strict" && code === "json")
+    return ["jsonAgg", { kind: "json" }, undefined, { asJson: true, strict: true }];
   throw new Error(`aggregatePlan: unhandled (${surface}, ${code})`);
 }
+
+// JsonAggFlags carries the two B4 flags fixed at resolve (asJson → json result type; strict → skip a
+// NULL-valued row), threaded onto the AggSpec / WindowSpec so newAcc can build the matching Acc.
+type JsonAggFlags = { asJson: boolean; strict: boolean };
 
 // resolveFuncCall resolves a function call: an aggregate (COUNT/SUM/MIN/MAX/AVG), a scalar
 // function (abs/round/…, spec/design/functions.md §9), the named/defaulted make_interval (§11), or
@@ -21651,7 +21733,12 @@ function applyWindowStage(
               }
             }
             if (np > 0) groups.push([s, np]);
-            const acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
+            const acc = newAcc(
+              spec.aggPlan!,
+              spec.aggFloatWidth ?? "f64",
+              spec.aggJsonAsJson ?? false,
+              spec.aggJsonStrict ?? false,
+            );
             for (const [start, end] of groups) {
               for (let k = start; k < end; k++) {
                 // The frame fold work (window.md §8) — metered so a running aggregate over a large
@@ -21702,7 +21789,12 @@ function applyWindowStage(
               // neither metered nor counted), over the cached operand.
               for (let pos = 0; pos < np; pos++) {
                 const [lo, hi] = ctx.bounds(pos, spec.frame);
-                const acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
+                const acc = newAcc(
+                  spec.aggPlan!,
+                  spec.aggFloatWidth ?? "f64",
+                  spec.aggJsonAsJson ?? false,
+                  spec.aggJsonStrict ?? false,
+                );
                 for (let k = lo; k < hi; k++) {
                   if (ctx.isExcluded(pos, k, exclude)) continue;
                   meter.charge(COSTS.windowFrameStep);
@@ -21716,14 +21808,24 @@ function applyWindowStage(
               // SLIDING (monotone carry). removable aggregates un-fold the left edge; the rest
               // rebuild when lo advances (an expanding frame never advances lo, so it only adds).
               const removable = spec.aggPlan === "countStar" || spec.aggPlan === "count";
-              let acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
+              let acc = newAcc(
+                spec.aggPlan!,
+                spec.aggFloatWidth ?? "f64",
+                spec.aggJsonAsJson ?? false,
+                spec.aggJsonStrict ?? false,
+              );
               let curLo = 0;
               let curHi = 0;
               for (let pos = 0; pos < np; pos++) {
                 const [lo, hi] = ctx.bounds(pos, spec.frame);
                 if (!removable && lo > curLo) {
                   // Left edge advanced over a non-invertible aggregate ⇒ rebuild over [lo, hi).
-                  acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
+                  acc = newAcc(
+                    spec.aggPlan!,
+                    spec.aggFloatWidth ?? "f64",
+                    spec.aggJsonAsJson ?? false,
+                    spec.aggJsonStrict ?? false,
+                  );
                   for (let k = lo; k < hi; k++) {
                     meter.charge(COSTS.windowFrameStep);
                     foldAcc(acc, evalAt(k), meter);

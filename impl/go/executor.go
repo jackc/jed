@@ -14238,6 +14238,10 @@ const (
 	planAvgFloat64                // AVG(f64) — fold sum / count, result f64
 	planMin
 	planMax
+	planJsonbAgg       // jsonb_agg(x) — aggregate the JSON images into a jsonb array
+	planJsonAgg        // json_agg(x) — same array, typed json (spaced canonical render)
+	planJsonbAggStrict // jsonb_agg_strict(x) — skip NULL-valued rows; jsonb array
+	planJsonAggStrict  // json_agg_strict(x) — skip NULL-valued rows; json array
 )
 
 // aggSpec is one resolved aggregate: its plan and its resolved argument (evaluated per input
@@ -14265,6 +14269,13 @@ type acc struct {
 	cur      Value
 	hasCur   bool
 	floatSum *floatSumAcc // non-nil for the float SUM/AVG plans (the canonical-order fold — float.md §7)
+	// json_agg / jsonb_agg accumulator (B4): the inputs' JSON-image nodes in row order. jsonAsJSON
+	// selects the `json` result type (vs jsonb); jsonStrict skips a NULL-valued row. `seen` is reused
+	// to mark the group non-empty even when the strict filter drops every row (empty group → NULL,
+	// all-skipped group → `[]`).
+	jsonNodes  []JsonNode
+	jsonAsJSON bool
+	jsonStrict bool
 }
 
 func newAcc(plan aggPlan) *acc {
@@ -14277,6 +14288,13 @@ func newAcc(plan aggPlan) *acc {
 		a.floatSum = newFloatSumAcc(true)
 	case planSumFloat64, planAvgFloat64:
 		a.floatSum = newFloatSumAcc(false)
+	case planJsonbAgg:
+	case planJsonAgg:
+		a.jsonAsJSON = true
+	case planJsonbAggStrict:
+		a.jsonStrict = true
+	case planJsonAggStrict:
+		a.jsonAsJSON, a.jsonStrict = true, true
 	}
 	return a
 }
@@ -14293,6 +14311,11 @@ func (a *acc) clone() *acc {
 		fs := *a.floatSum
 		fs.finite = append([]float64(nil), a.floatSum.finite...)
 		c.floatSum = &fs
+	}
+	if a.jsonNodes != nil {
+		// Deep-copy the node slice so a window peer-group's finalize doesn't consume the running
+		// acc's nodes (mirrors the floatSum slice clone above).
+		c.jsonNodes = append([]JsonNode(nil), a.jsonNodes...)
 	}
 	return &c
 }
@@ -14362,6 +14385,24 @@ func (a *acc) fold(v Value, m *Meter) error {
 					a.cur = v
 				}
 			}
+		}
+	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
+		// Mark the group non-empty even when the strict filter drops this row (an all-skipped group
+		// still finalizes to `[]`, not NULL — only a zero-row group is NULL).
+		a.seen = true
+		// Non-strict: a NULL input contributes a JSON null; `_strict` skips it. Each input's JSON
+		// image is the to_jsonb kernel (deferred 0A000 sources propagate here). One generated_row
+		// per appended element.
+		if !(a.jsonStrict && v.IsNull()) {
+			m.Charge(Costs.GeneratedRow)
+			if err := m.Guard(); err != nil {
+				return err
+			}
+			node, err := valueToNode(v)
+			if err != nil {
+				return err
+			}
+			a.jsonNodes = append(a.jsonNodes, node)
 		}
 	}
 	return nil
@@ -14442,6 +14483,20 @@ func (a *acc) finalize() (Value, error) {
 			return NullValue(), err
 		}
 		return Float64Value(f), nil
+	case planJsonbAgg, planJsonAgg, planJsonbAggStrict, planJsonAggStrict:
+		// json_agg/jsonb_agg: NULL over an empty (zero-row) group; else the JSON array. A non-empty
+		// group the strict filter emptied still finalizes to `[]` (seen is true, jsonNodes empty).
+		if !a.seen {
+			return NullValue(), nil
+		}
+		arr := JsonNode{Kind: JArray, Arr: a.jsonNodes}
+		// Both json_agg and jsonb_agg render the SPACED canonical form (PG joins the element texts
+		// with ", "); the json variant is just typed `json` carrying that same text. (A json input
+		// element is canonicalized by valueToNode — a documented divergence from PG's verbatim.)
+		if a.jsonAsJSON {
+			return JsonValue(jsonbOut(&arr)), nil
+		}
+		return JsonbValue(arr), nil
 	default: // planMin, planMax
 		if a.hasCur {
 			return a.cur, nil
@@ -17793,6 +17848,14 @@ func aggregatePlan(surface, result string, t resolvedType) (aggPlan, resolvedTyp
 		return planMin, t
 	case surface == "max" && result == "same_as_input":
 		return planMax, t
+	case surface == "jsonb_agg" && result == "jsonb":
+		return planJsonbAgg, resolvedType{kind: rtJsonb}
+	case surface == "json_agg" && result == "json":
+		return planJsonAgg, resolvedType{kind: rtJson}
+	case surface == "jsonb_agg_strict" && result == "jsonb":
+		return planJsonbAggStrict, resolvedType{kind: rtJsonb}
+	case surface == "json_agg_strict" && result == "json":
+		return planJsonAggStrict, resolvedType{kind: rtJson}
 	default:
 		panic("aggregatePlan: unhandled (" + surface + ", " + result + ")")
 	}

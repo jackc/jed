@@ -13917,6 +13917,13 @@ enum AggPlan {
     AvgFloat(ScalarType),
     Min,
     Max,
+    /// json_agg / jsonb_agg (and the `_strict` variants) — aggregate the inputs' JSON images into a
+    /// JSON array (json-sql-functions.md §4). `compact` selects the `json` (compact) vs `jsonb`
+    /// (canonical) result render; `strict` skips a NULL input (else a NULL → JSON null).
+    JsonAgg {
+        compact: bool,
+        strict: bool,
+    },
 }
 
 /// One resolved aggregate: its plan and its resolved argument expression (evaluated per
@@ -13969,6 +13976,16 @@ enum Acc {
         cur: Option<Value>,
         is_min: bool,
     },
+    /// json_agg / jsonb_agg accumulator (B4): the inputs' JSON-image nodes in row order. `compact`
+    /// selects the json vs jsonb finalize type; `strict` skips NULL inputs. `seen` records whether the
+    /// group had ANY input row: a zero-row group → SQL NULL, but a non-empty group all of whose rows
+    /// the strict filter dropped → an empty array `[]` (PG distinguishes the two).
+    JsonAgg {
+        nodes: Vec<JsonNode>,
+        compact: bool,
+        strict: bool,
+        seen: bool,
+    },
 }
 
 impl Acc {
@@ -14013,6 +14030,12 @@ impl Acc {
             AggPlan::Max => Acc::MinMax {
                 cur: None,
                 is_min: false,
+            },
+            AggPlan::JsonAgg { compact, strict } => Acc::JsonAgg {
+                nodes: Vec::new(),
+                compact,
+                strict,
+                seen: false,
             },
         }
     }
@@ -14108,6 +14131,23 @@ impl Acc {
                     *cur = Some(next);
                 }
             }
+            Acc::JsonAgg {
+                nodes,
+                strict,
+                seen,
+                ..
+            } => {
+                // Mark the group non-empty even when the strict filter drops this row (an all-skipped
+                // group still finalizes to `[]`, not NULL — only a zero-row group is NULL).
+                *seen = true;
+                // Non-strict: a NULL input contributes a JSON null; `_strict` skips it. Each input's
+                // JSON image is the `to_jsonb` kernel (deferred 0A000 sources propagate here).
+                if !(*strict && matches!(value, Value::Null)) {
+                    m.charge(COSTS.generated_row);
+                    m.guard()?;
+                    nodes.push(value_to_node(&value)?);
+                }
+            }
         }
         Ok(())
     }
@@ -14173,6 +14213,32 @@ impl Acc {
                 neg_inf,
             } => finalize_float_fold(width, is_avg, finite, count, any_nan, pos_inf, neg_inf)?,
             Acc::MinMax { cur, .. } => cur.unwrap_or(Value::Null),
+            // json_agg/jsonb_agg: NULL over an empty group; else the JSON array (json compact /
+            // jsonb canonical).
+            Acc::JsonAgg {
+                nodes,
+                compact,
+                strict: _,
+                seen,
+            } => {
+                if !seen {
+                    // A zero-row group → SQL NULL. (A non-empty group the strict filter emptied still
+                    // finalizes to `[]` below — `seen` is true, `nodes` is empty.)
+                    Value::Null
+                } else {
+                    let arr = JsonNode::Array(nodes);
+                    // Both json_agg and jsonb_agg render the spaced canonical form (PG joins the
+                    // element texts with ", "); the json variant is just typed `json`. (A json input
+                    // element is canonicalized by `value_to_node`, a documented divergence from PG's
+                    // verbatim — the json_array_elements precedent.) `compact` = the json result.
+                    let text = json::jsonb_out(&arr);
+                    if compact {
+                        Value::Json(text)
+                    } else {
+                        Value::Jsonb(arr)
+                    }
+                }
+            }
         })
     }
 }
@@ -16144,6 +16210,36 @@ fn aggregate_plan(surface: &str, result: &str, t: &ResolvedType) -> (AggPlan, Re
         // MIN/MAX accept any ordered scalar; the result is the argument's own type.
         ("min", "same_as_input") => (AggPlan::Min, t.clone()),
         ("max", "same_as_input") => (AggPlan::Max, t.clone()),
+        // json/jsonb array aggregates (B4). `compact` is the json (vs jsonb) render; `_strict`
+        // skips a NULL input. The result type is json/jsonb (the catalog `result` code).
+        ("jsonb_agg", "jsonb") => (
+            AggPlan::JsonAgg {
+                compact: false,
+                strict: false,
+            },
+            ResolvedType::Jsonb,
+        ),
+        ("json_agg", "json") => (
+            AggPlan::JsonAgg {
+                compact: true,
+                strict: false,
+            },
+            ResolvedType::Json,
+        ),
+        ("jsonb_agg_strict", "jsonb") => (
+            AggPlan::JsonAgg {
+                compact: false,
+                strict: true,
+            },
+            ResolvedType::Jsonb,
+        ),
+        ("json_agg_strict", "json") => (
+            AggPlan::JsonAgg {
+                compact: true,
+                strict: true,
+            },
+            ResolvedType::Json,
+        ),
         _ => unreachable!("aggregate_plan: unhandled ({surface}, {result})"),
     }
 }
@@ -27094,7 +27190,10 @@ mod registry_tests {
         }
         for a in AGGREGATES.iter() {
             assert!(
-                matches!(a.result, "i64" | "decimal" | "sum_widen" | "same_as_input"),
+                matches!(
+                    a.result,
+                    "i64" | "decimal" | "sum_widen" | "same_as_input" | "jsonb" | "json"
+                ),
                 "aggregate {} has unhandled result code {}",
                 a.name,
                 a.result

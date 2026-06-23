@@ -3292,6 +3292,51 @@ result       = "same_as_input"
 null         = "aggregate"
 errors       = []
 
+# json/jsonb array aggregates (B4, json-sql-functions.md §4): aggregate the input values into a JSON
+# array, in the group's row order (jed has no in-aggregate ORDER BY yet). json_agg/jsonb_agg INCLUDE
+# a NULL input (as JSON null); the _strict variants SKIP a NULL input. Result NULL over an empty
+# group. Each input's JSON image is the to_jsonb kernel (so the same deferred 0A000 sources apply).
+# The object_agg variants (2-arg key/value) + the _unique dup-key variants are a follow-on slice.
+[[aggregate]]
+name         = "jsonb_agg"
+kind         = "aggregate"
+surface      = "jsonb_agg"
+arg          = "expr"
+arg_families = ["any"]
+result       = "jsonb"
+null         = "aggregate"
+errors       = ["0A000"]
+
+[[aggregate]]
+name         = "json_agg"
+kind         = "aggregate"
+surface      = "json_agg"
+arg          = "expr"
+arg_families = ["any"]
+result       = "json"
+null         = "aggregate"
+errors       = ["0A000"]
+
+[[aggregate]]
+name         = "jsonb_agg_strict"
+kind         = "aggregate"
+surface      = "jsonb_agg_strict"
+arg          = "expr"
+arg_families = ["any"]
+result       = "jsonb"
+null         = "aggregate"
+errors       = ["0A000"]
+
+[[aggregate]]
+name         = "json_agg_strict"
+kind         = "aggregate"
+surface      = "json_agg_strict"
+arg          = "expr"
+arg_families = ["any"]
+result       = "json"
+null         = "aggregate"
+errors       = ["0A000"]
+
 # === window functions ========================================================
 # A WINDOW function computes a per-row value over a related set of rows (its frame) WITHOUT
 # collapsing them (../design/window.md). It is neither an operator (one value from infix
