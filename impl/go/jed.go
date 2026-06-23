@@ -534,6 +534,9 @@ var SupportedCapabilities = []string{
 	"func.json_object",
 	// json/jsonb array aggregates (B4) — json[b]_agg / json[b]_agg_strict (json-sql-functions.md §2).
 	"func.json_agg",
+	// IS JSON predicate (S1) — expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT)
+	// UNIQUE [KEYS]] well-formedness test over a string/json/jsonb operand (json-sql-functions.md §5).
+	"expr.is_json",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

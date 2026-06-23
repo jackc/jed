@@ -3085,6 +3085,39 @@ func (p *Parser) parseComparison() (Expr, error) {
 			}
 			return Expr{Kind: ExprIsDistinct, IsDistinct: &IsDistinctExpr{Lhs: lhs, Rhs: rhs, Negated: negated}}, nil
 		}
+		// IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
+		// well-formedness predicate (json-sql-functions.md §5).
+		if p.peekKeyword() == "json" {
+			p.advance()
+			kind := JPKValue
+			switch p.peekKeyword() {
+			case "value":
+				p.advance()
+				kind = JPKValue
+			case "scalar":
+				p.advance()
+				kind = JPKScalar
+			case "array":
+				p.advance()
+				kind = JPKArray
+			case "object":
+				p.advance()
+				kind = JPKObject
+			}
+			// The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT` only
+			// when `UNIQUE` follows (a two-token lookahead — `WITH` otherwise starts no
+			// expression-level clause here). `KEYS` is optional.
+			uniqueKeys := false
+			if w := p.peekKeyword(); (w == "with" || w == "without") && p.peekKeywordAt(1) == "unique" {
+				p.advance() // WITH / WITHOUT
+				p.advance() // UNIQUE
+				if p.peekKeyword() == "keys" {
+					p.advance()
+				}
+				uniqueKeys = w == "with"
+			}
+			return Expr{Kind: ExprIsJson, IsJsonOf: &IsJsonExpr{Operand: lhs, Negated: negated, Kind: kind, UniqueKeys: uniqueKeys}}, nil
+		}
 		if err := p.expectKeyword("null"); err != nil {
 			return Expr{}, err
 		}

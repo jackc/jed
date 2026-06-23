@@ -500,6 +500,27 @@ export function makeObject(members: JsonMember[]): JsonNode {
   return { kind: "object", members: canonicalizeObject(members) };
 }
 
+// hasDuplicateKeys detects a duplicate object key anywhere in the tree — for `IS JSON WITH UNIQUE
+// KEYS` (json-sql-functions.md §5). The node must be parsed with `parsePreservingJson` (which keeps
+// duplicate keys); this walks every object (and recurses into member values and array elements).
+export function hasDuplicateKeys(node: JsonNode): boolean {
+  switch (node.kind) {
+    case "object": {
+      const members = node.members;
+      for (let i = 0; i < members.length; i++) {
+        for (let j = i + 1; j < members.length; j++) {
+          if (members[i]!.key === members[j]!.key) return true;
+        }
+      }
+      return members.some((m) => hasDuplicateKeys(m.value));
+    }
+    case "array":
+      return node.elements.some(hasDuplicateKeys);
+    default:
+      return false;
+  }
+}
+
 // canonicalizeObject canonicalizes object members (spec/design/json.md §2.3): drop duplicate keys
 // keeping the LAST occurrence (PG jsonb last-wins), then sort the survivors length-then-bytewise.
 // Done before sorting so the stored object has unique keys in canonical order — a pure function of

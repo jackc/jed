@@ -2602,6 +2602,8 @@ func exprCallsSeqMutator(e *Expr) bool {
 		return exprCallsSeqMutator(&e.Unary.Operand)
 	case ExprIsNull:
 		return exprCallsSeqMutator(&e.IsNullOf.Operand)
+	case ExprIsJson:
+		return exprCallsSeqMutator(&e.IsJsonOf.Operand)
 	case ExprBinary:
 		return exprCallsSeqMutator(&e.Binary.Lhs) || exprCallsSeqMutator(&e.Binary.Rhs)
 	case ExprIsDistinct:
@@ -3035,6 +3037,8 @@ func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
 		collectExprPrivs(&e.Unary.Operand, req, locals)
 	case ExprIsNull:
 		collectExprPrivs(&e.IsNullOf.Operand, req, locals)
+	case ExprIsJson:
+		collectExprPrivs(&e.IsJsonOf.Operand, req, locals)
 	case ExprBinary:
 		collectExprPrivs(&e.Binary.Lhs, req, locals)
 		collectExprPrivs(&e.Binary.Rhs, req, locals)
@@ -3128,6 +3132,8 @@ func exprReadsColumns(e *Expr) bool {
 		return exprReadsColumns(&e.Unary.Operand)
 	case ExprIsNull:
 		return exprReadsColumns(&e.IsNullOf.Operand)
+	case ExprIsJson:
+		return exprReadsColumns(&e.IsJsonOf.Operand)
 	case ExprFuncCall:
 		for _, a := range e.FuncCall.Args {
 			if exprReadsColumns(a) {
@@ -8188,6 +8194,8 @@ func countSelfRefsExpr(e Expr, name string) int {
 		return countSelfRefsExpr(e.Unary.Operand, name)
 	case ExprIsNull:
 		return countSelfRefsExpr(e.IsNullOf.Operand, name)
+	case ExprIsJson:
+		return countSelfRefsExpr(e.IsJsonOf.Operand, name)
 	case ExprBinary:
 		return countSelfRefsExpr(e.Binary.Lhs, name) + countSelfRefsExpr(e.Binary.Rhs, name)
 	case ExprIsDistinct:
@@ -13384,6 +13392,11 @@ const (
 	reAnd
 	reOr
 	reIsNull
+	// reIsJson is `operand IS [NOT] JSON …` (json-sql-functions.md §5): well-formedness + optional
+	// kind / unique-keys test over a string / json / jsonb operand. A NULL operand → NULL; else a
+	// definite boolean (NOT-negated when `negated`). `jpKind` selects the kind word; `jpUnique`
+	// selects WITH UNIQUE KEYS.
+	reIsJson
 	reDistinct
 	reLike
 	// reRegex is `lhs ~ rhs` / `~*` / `!~` / `!~*` — a regular-expression match (regex.md). Matched
@@ -13857,6 +13870,11 @@ type rExpr struct {
 	// reConstJsonb: a folded jsonb constant — the canonical node tree (parsed + canonicalized at
 	// resolve). A reConstJson holds its verbatim text in cText (no extra field).
 	cJsonb *JsonNode
+
+	// reIsJson: the optional kind word (json-sql-functions.md §5) and the WITH UNIQUE KEYS flag. The
+	// operand reuses `operand`; `negated` carries IS NOT JSON.
+	jpKind   JsonPredicateKind
+	jpUnique bool
 
 	// reJsonGet: the jsonb accessor operator (`-> ->> #> #>>`). `lhs` is the jsonb base, `rhs` the
 	// key/index/path argument (spec/design/json-sql-functions.md §1).
@@ -14766,6 +14784,8 @@ func exprHasAggregate(e Expr) bool {
 		return exprHasAggregate(e.Unary.Operand)
 	case ExprIsNull:
 		return exprHasAggregate(e.IsNullOf.Operand)
+	case ExprIsJson:
+		return exprHasAggregate(e.IsJsonOf.Operand)
 	case ExprBinary:
 		return exprHasAggregate(e.Binary.Lhs) || exprHasAggregate(e.Binary.Rhs)
 	case ExprIsDistinct:
@@ -14869,6 +14889,8 @@ func exprHasWindow(e Expr) bool {
 		return exprHasWindow(e.Unary.Operand)
 	case ExprIsNull:
 		return exprHasWindow(e.IsNullOf.Operand)
+	case ExprIsJson:
+		return exprHasWindow(e.IsJsonOf.Operand)
 	case ExprBinary:
 		return exprHasWindow(e.Binary.Lhs) || exprHasWindow(e.Binary.Rhs)
 	case ExprIsDistinct:
@@ -15103,6 +15125,16 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.IsNullOf = &ni
 		return ne, nil
+	case ExprIsJson:
+		op, err := desugarNamedWindows(e.IsJsonOf.Operand, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		ni := *e.IsJsonOf
+		ni.Operand = op
+		ne := e
+		ne.IsJsonOf = &ni
+		return ne, nil
 	case ExprBinary:
 		lhs, err := desugarNamedWindows(e.Binary.Lhs, windows)
 		if err != nil {
@@ -15308,6 +15340,8 @@ func rejectCheckStructure(e Expr) error {
 		return rejectCheckStructure(e.Unary.Operand)
 	case ExprIsNull:
 		return rejectCheckStructure(e.IsNullOf.Operand)
+	case ExprIsJson:
+		return rejectCheckStructure(e.IsJsonOf.Operand)
 	case ExprBinary:
 		if err := rejectCheckStructure(e.Binary.Lhs); err != nil {
 			return err
@@ -15426,6 +15460,8 @@ func rejectDefaultStructure(e Expr) error {
 		return rejectDefaultStructure(e.Unary.Operand)
 	case ExprIsNull:
 		return rejectDefaultStructure(e.IsNullOf.Operand)
+	case ExprIsJson:
+		return rejectDefaultStructure(e.IsJsonOf.Operand)
 	case ExprBinary:
 		if err := rejectDefaultStructure(e.Binary.Lhs); err != nil {
 			return err
@@ -15540,6 +15576,8 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 			walk(e.Unary.Operand)
 		case ExprIsNull:
 			walk(e.IsNullOf.Operand)
+		case ExprIsJson:
+			walk(e.IsJsonOf.Operand)
 		case ExprBinary:
 			walk(e.Binary.Lhs)
 			walk(e.Binary.Rhs)
@@ -19900,6 +19938,25 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		}
 		return &rExpr{kind: reIsNull, operand: rop, negated: e.IsNullOf.Negated},
 			resolvedType{kind: rtBool}, nil
+	case ExprIsJson:
+		// The operand must be a character string / json / jsonb (else 42804); a bare string literal
+		// resolves as text. The predicate is always a definite boolean (NULL operand → NULL at eval).
+		rop, ty, err := resolve(s, e.IsJsonOf.Operand, nil, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		switch ty.kind {
+		case rtText, rtJson, rtJsonb, rtNull:
+			// ok
+		default:
+			return nil, resolvedType{}, NewError(DatatypeMismatch,
+				fmt.Sprintf("cannot use type %s in IS JSON predicate", rtName(ty)))
+		}
+		return &rExpr{
+				kind: reIsJson, operand: rop, negated: e.IsJsonOf.Negated,
+				jpKind: e.IsJsonOf.Kind, jpUnique: e.IsJsonOf.UniqueKeys,
+			},
+			resolvedType{kind: rtBool}, nil
 	case ExprIsDistinct:
 		// NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a
 		// literal adapts to its sibling; a text literal stays text), then require the
@@ -22735,6 +22792,30 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 		// Composite IS NULL / IS NOT NULL is PG's all-fields rule, NON-recursive (composite.md §5);
 		// a scalar follows the ordinary rule. IsNullTest folds both.
 		return BoolValue(v.IsNullTest(e.negated)), nil
+	case reIsJson:
+		m.Charge(Costs.OperatorEval)
+		v, err := e.operand.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		var ok bool
+		switch v.Kind {
+		case ValNull:
+			return NullValue(), nil // a NULL operand → NULL (never raises)
+		case ValJsonb:
+			// jsonb is always well-formed with unique keys; only the kind can fail.
+			ok = jsonPredKindMatches(v.Json, e.jpKind)
+		case ValJson, ValText:
+			// A string / json operand: parse (preserving duplicate keys); malformed → false.
+			node, perr := parsePreservingJSON(v.Str)
+			if perr != nil {
+				ok = false
+			} else {
+				ok = jsonPredKindMatches(&node, e.jpKind) &&
+					!(e.jpUnique && hasDuplicateKeys(&node))
+			}
+		}
+		return BoolValue(ok != e.negated), nil
 	case reLike:
 		m.Charge(Costs.OperatorEval)
 		subject, err := e.lhs.eval(row, env, m)

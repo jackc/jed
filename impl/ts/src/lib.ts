@@ -113,6 +113,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // json[b]_agg / json[b]_agg_strict (B4) — the JSON-array aggregate builders (json-sql-functions.md
   // §4). Aggregate a group's values into one JSON array via the to_jsonb element kernel.
   "func.json_agg",
+  // The IS JSON predicate (S1) — expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT)
+  // UNIQUE [KEYS]], the SQL/JSON well-formedness test (json-sql-functions.md §5).
+  "expr.is_json",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
   // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
   "func.range_accessors",

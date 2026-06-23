@@ -8,10 +8,10 @@ use crate::ast::{
     AlterSeqAction, AlterSequence, Assignment, BinaryOp, CheckDef, ColumnDef, ConflictAction,
     ConflictTarget, CreateIndex, CreateSequence, CreateTable, CreateType, Cte, CteBody, DefaultDef,
     Delete, DropIndex, DropSequence, DropTable, DropType, Expr, ForeignKeyDef, GroupItem,
-    IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind, Literal, OnConflict,
-    OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem, SelectItems, SeqOptions, SetOp,
-    SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
-    Update, WindowDef, WithExpr, WithQuery,
+    IdentitySpec, Insert, InsertSource, InsertValue, JoinClause, JoinKind, JsonPredicateKind,
+    Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItem,
+    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef,
+    TypeMod, UnaryOp, UniqueDef, Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
@@ -2588,6 +2588,52 @@ impl Parser {
                     lhs: Box::new(lhs),
                     rhs: Box::new(rhs),
                     negated,
+                });
+            }
+            // IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
+            // well-formedness predicate (json-sql-functions.md §5).
+            if self.peek_keyword().as_deref() == Some("json") {
+                self.advance();
+                let kind = match self.peek_keyword().as_deref() {
+                    Some("value") => {
+                        self.advance();
+                        JsonPredicateKind::Value
+                    }
+                    Some("scalar") => {
+                        self.advance();
+                        JsonPredicateKind::Scalar
+                    }
+                    Some("array") => {
+                        self.advance();
+                        JsonPredicateKind::Array
+                    }
+                    Some("object") => {
+                        self.advance();
+                        JsonPredicateKind::Object
+                    }
+                    _ => JsonPredicateKind::Value,
+                };
+                // The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT`
+                // only when `UNIQUE` follows (a two-token lookahead — `WITH` otherwise starts no
+                // expression-level clause here). `KEYS` is optional.
+                let unique_keys = match self.peek_keyword().as_deref() {
+                    Some(w @ ("with" | "without"))
+                        if self.peek_keyword_at(1).as_deref() == Some("unique") =>
+                    {
+                        self.advance(); // WITH / WITHOUT
+                        self.advance(); // UNIQUE
+                        if self.peek_keyword().as_deref() == Some("keys") {
+                            self.advance();
+                        }
+                        w == "with"
+                    }
+                    _ => false,
+                };
+                return Ok(Expr::IsJson {
+                    operand: Box::new(lhs),
+                    negated,
+                    kind,
+                    unique_keys,
                 });
             }
             self.expect_keyword("null")?;

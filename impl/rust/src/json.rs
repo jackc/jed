@@ -495,6 +495,26 @@ pub fn make_object(members: Vec<(String, JsonNode)>) -> JsonNode {
     JsonNode::Object(canonicalize_object(members))
 }
 
+/// Detect a duplicate object key anywhere in the tree — for `IS JSON WITH UNIQUE KEYS`
+/// (json-sql-functions.md §5). The node must be parsed with [`parse_preserving`] (which keeps
+/// duplicate keys); this walks every object (and recurses into member values and array elements).
+pub fn has_duplicate_keys(node: &JsonNode) -> bool {
+    match node {
+        JsonNode::Object(members) => {
+            for i in 0..members.len() {
+                for j in (i + 1)..members.len() {
+                    if members[i].0 == members[j].0 {
+                        return true;
+                    }
+                }
+            }
+            members.iter().any(|(_, v)| has_duplicate_keys(v))
+        }
+        JsonNode::Array(elems) => elems.iter().any(has_duplicate_keys),
+        _ => false,
+    }
+}
+
 // ---------------------------------------------------------------------------------------------
 // Output (`jsonb_out` — the canonical PG render). `json_out` is the stored verbatim text.
 // ---------------------------------------------------------------------------------------------

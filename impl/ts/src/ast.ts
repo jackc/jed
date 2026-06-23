@@ -29,6 +29,12 @@ export type TypeMod = { precision: bigint; scale: bigint | null };
 // UnaryOp: arithmetic negation `-x` or logical negation `NOT x`.
 export type UnaryOp = "neg" | "not";
 
+// JsonPredicateKind: the optional kind word of an `IS JSON` predicate
+// (spec/design/json-sql-functions.md §5). "value" (or absent) = any well-formed JSON; "scalar" = a
+// JSON scalar (string/number/boolean/null, not an object/array); "array" = a JSON array; "object" =
+// a JSON object.
+export type JsonPredicateKind = "value" | "scalar" | "array" | "object";
+
 // BinaryOp: arithmetic (integer→promoted), comparison (integer→boolean), or logical
 // (boolean→boolean, Kleene).
 export type BinaryOp =
@@ -116,6 +122,18 @@ export type Expr =
   | { kind: "unary"; op: UnaryOp; operand: Expr }
   | { kind: "binary"; op: BinaryOp; lhs: Expr; rhs: Expr }
   | { kind: "isNull"; operand: Expr; negated: boolean }
+  // `operand IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]]` — the SQL/JSON
+  // well-formedness predicate (spec/design/json-sql-functions.md §5): is `operand` (a character
+  // string / json / jsonb) well-formed JSON of the optional `kind`, with optionally unique object
+  // keys. A non-string/json operand → 42804; a NULL operand → NULL; never raises. `kind` defaults to
+  // "value" (any well-formed JSON); `uniqueKeys` carries `WITH UNIQUE KEYS` (recursive dup-key check).
+  | {
+      kind: "isJson";
+      operand: Expr;
+      negated: boolean;
+      jsonKind: JsonPredicateKind;
+      uniqueKeys: boolean;
+    }
   // `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
   // keyword: true is `IS NOT DISTINCT FROM` (NULL-safe `=`), false is `IS DISTINCT FROM`
   // (its negation). Always boolean-valued, never unknown (spec/design/functions.md §3).

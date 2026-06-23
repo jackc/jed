@@ -7,10 +7,10 @@
 use crate::ast::{
     AlterSeqAction, AlterSequence, BinaryOp, ConflictAction, ConflictTarget, CreateIndex,
     CreateSequence, CreateTable, CreateType, Cte, CteBody, Delete, DropIndex, DropSequence,
-    DropTable, DropType, Expr, GroupItem, Insert, InsertSource, InsertValue, JoinKind, Literal,
-    OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select, SelectItems, SeqOptions, SetOp,
-    SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp, Update, WindowDef, WithExpr,
-    WithQuery,
+    DropTable, DropType, Expr, GroupItem, Insert, InsertSource, InsertValue, JoinKind,
+    JsonPredicateKind, Literal, OnConflict, OrderKey, Overriding, QueryExpr, RefAction, Select,
+    SelectItems, SeqOptions, SetOp, SetOpKind, Statement, SubscriptSpec, TableRef, TypeMod, UnaryOp,
+    Update, WindowDef, WithExpr, WithQuery,
 };
 use crate::catalog::{
     CheckConstraint, ColField, ColType, Column, CompositeField, CompositeType, DefaultExpr,
@@ -10129,7 +10129,7 @@ impl Database {
                 self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(b, bound, ctes, cost)
             }
-            RExpr::IsNull { operand, .. } => {
+            RExpr::IsNull { operand, .. } | RExpr::IsJson { operand, .. } => {
                 self.fold_uncorrelated_in_rexpr(operand, bound, ctes, cost)
             }
             RExpr::Case { arms, els, .. } => {
@@ -11613,6 +11613,15 @@ enum RExpr {
         operand: Box<RExpr>,
         negated: bool,
     },
+    /// `operand IS [NOT] JSON …` (json-sql-functions.md §5): well-formedness + optional kind /
+    /// unique-keys test over a string / json / jsonb operand. A NULL operand → NULL; else a definite
+    /// boolean (NOT-negated when `negated`).
+    IsJson {
+        operand: Box<RExpr>,
+        negated: bool,
+        kind: JsonPredicateKind,
+        unique_keys: bool,
+    },
     /// `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated = true` is the
     /// `IS NOT DISTINCT FROM` ("are they the same?") form; `false` is `IS DISTINCT FROM`.
     /// Always evaluates to a definite boolean.
@@ -12181,7 +12190,9 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
         Expr::Cast { inner, .. }
         | Expr::Collate { inner, .. }
         | Expr::Extract { source: inner, .. } => sub(inner),
-        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => sub(operand),
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::IsJson { operand, .. } => sub(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -13245,7 +13256,7 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         RExpr::JsonContains { a, b } | RExpr::JsonConcat { a, b } => {
             rexpr_is_constant(a) && rexpr_is_constant(b)
         }
-        RExpr::IsNull { operand, .. } => rexpr_is_constant(operand),
+        RExpr::IsNull { operand, .. } | RExpr::IsJson { operand, .. } => rexpr_is_constant(operand),
         RExpr::Case { arms, els, .. } => {
             arms.iter()
                 .all(|(c, r)| rexpr_is_constant(c) && rexpr_is_constant(r))
@@ -14491,7 +14502,7 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => expr_has_aggregate(inner),
         Expr::Collate { inner, .. } => expr_has_aggregate(inner),
         Expr::Unary { operand, .. } => expr_has_aggregate(operand),
-        Expr::IsNull { operand, .. } => expr_has_aggregate(operand),
+        Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => expr_has_aggregate(operand),
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             expr_has_aggregate(lhs) || expr_has_aggregate(rhs)
         }
@@ -14563,7 +14574,7 @@ fn expr_has_window(e: &Expr) -> bool {
         Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => expr_has_window(inner),
         Expr::Collate { inner, .. } => expr_has_window(inner),
         Expr::Unary { operand, .. } => expr_has_window(operand),
-        Expr::IsNull { operand, .. } => expr_has_window(operand),
+        Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => expr_has_window(operand),
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             expr_has_window(lhs) || expr_has_window(rhs)
         }
@@ -14717,7 +14728,9 @@ fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)]) -> Resul
         | Expr::Collate { inner, .. } => {
             desugar_named_windows(inner, windows)?;
         }
-        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::IsJson { operand, .. } => {
             desugar_named_windows(operand, windows)?;
         }
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
@@ -14807,9 +14820,9 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
             reject_check_structure(inner)
         }
         Expr::Collate { inner, .. } => reject_check_structure(inner),
-        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
-            reject_check_structure(operand)
-        }
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::IsJson { operand, .. } => reject_check_structure(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -14896,9 +14909,9 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
             reject_default_structure(inner)
         }
         Expr::Collate { inner, .. } => reject_default_structure(inner),
-        Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
-            reject_default_structure(operand)
-        }
+        Expr::Unary { operand, .. }
+        | Expr::IsNull { operand, .. }
+        | Expr::IsJson { operand, .. } => reject_default_structure(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -14972,9 +14985,9 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
             Expr::Cast { inner, .. }
             | Expr::Collate { inner, .. }
             | Expr::Extract { source: inner, .. } => walk(inner, columns, out),
-            Expr::Unary { operand, .. } | Expr::IsNull { operand, .. } => {
-                walk(operand, columns, out)
-            }
+            Expr::Unary { operand, .. }
+            | Expr::IsNull { operand, .. }
+            | Expr::IsJson { operand, .. } => walk(operand, columns, out),
             Expr::Binary { lhs, rhs, .. }
             | Expr::IsDistinctFrom { lhs, rhs, .. }
             | Expr::Like { lhs, rhs, .. }
@@ -15202,7 +15215,9 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         RExpr::And(l, r) | RExpr::Or(l, r) => {
             rexpr_references_outer(l, depth) || rexpr_references_outer(r, depth)
         }
-        RExpr::IsNull { operand, .. } => rexpr_references_outer(operand, depth),
+        RExpr::IsNull { operand, .. } | RExpr::IsJson { operand, .. } => {
+            rexpr_references_outer(operand, depth)
+        }
         RExpr::Case { arms, els, .. } => {
             arms.iter()
                 .any(|(c, r)| rexpr_references_outer(c, depth) || rexpr_references_outer(r, depth))
@@ -15341,7 +15356,9 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             collect_touched(l, depth, touched);
             collect_touched(r, depth, touched);
         }
-        RExpr::IsNull { operand, .. } => collect_touched(operand, depth, touched),
+        RExpr::IsNull { operand, .. } | RExpr::IsJson { operand, .. } => {
+            collect_touched(operand, depth, touched)
+        }
         RExpr::Case { arms, els, .. } => {
             for (c, r) in arms {
                 collect_touched(c, depth, touched);
@@ -18382,7 +18399,9 @@ fn expr_calls_seq_mutator(e: &Expr) -> bool {
         | Expr::Collate { inner, .. }
         | Expr::Extract { source: inner, .. }
         | Expr::Unary { operand: inner, .. } => expr_calls_seq_mutator(inner),
-        Expr::IsNull { operand, .. } => expr_calls_seq_mutator(operand),
+        Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => {
+            expr_calls_seq_mutator(operand)
+        }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -18677,7 +18696,9 @@ fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<String>) {
         | Expr::Unary { operand: inner, .. }
         | Expr::Collate { inner, .. }
         | Expr::Extract { source: inner, .. } => collect_expr_privs(inner, req, locals),
-        Expr::IsNull { operand, .. } => collect_expr_privs(operand, req, locals),
+        Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => {
+            collect_expr_privs(operand, req, locals)
+        }
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -18749,7 +18770,7 @@ fn expr_reads_columns(e: &Expr) -> bool {
         | Expr::Unary { operand: inner, .. }
         | Expr::Collate { inner, .. }
         | Expr::Extract { source: inner, .. } => expr_reads_columns(inner),
-        Expr::IsNull { operand, .. } => expr_reads_columns(operand),
+        Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => expr_reads_columns(operand),
         Expr::FuncCall { args, .. } => args.iter().any(expr_reads_columns),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -19890,6 +19911,38 @@ fn resolve(
                 ResolvedType::Bool,
             ))
         }
+        Expr::IsJson {
+            operand,
+            negated,
+            kind,
+            unique_keys,
+        } => {
+            // The operand must be a character string / json / jsonb (else 42804); a bare string
+            // literal resolves as text. The predicate is always a definite boolean (NULL operand →
+            // NULL at eval).
+            let (rop, ty) = resolve(scope, operand, None, agg, params)?;
+            match ty {
+                ResolvedType::Text
+                | ResolvedType::Json
+                | ResolvedType::Jsonb
+                | ResolvedType::Null => {}
+                _ => {
+                    return Err(EngineError::new(
+                        SqlState::DatatypeMismatch,
+                        format!("cannot use type {} in IS JSON predicate", ty.type_name()),
+                    ));
+                }
+            }
+            Ok((
+                RExpr::IsJson {
+                    operand: Box::new(rop),
+                    negated: *negated,
+                    kind: *kind,
+                    unique_keys: *unique_keys,
+                },
+                ResolvedType::Bool,
+            ))
+        }
         Expr::IsDistinctFrom { lhs, rhs, negated } => {
             // NULL-safe equality: the SAME operand contract as `=` — resolve the pair
             // (a literal adapts to its sibling; a text literal stays text), then require
@@ -20589,6 +20642,16 @@ fn json_arg_node(v: &Value) -> Result<JsonNode> {
         Value::Jsonb(n) => Ok(n.clone()),
         Value::Json(s) => json::parse_preserving(s),
         _ => unreachable!("resolver restricts a json/jsonb function argument to json/jsonb"),
+    }
+}
+
+/// Whether a parsed JSON node matches an `IS JSON [kind]` predicate's kind (json-sql-functions.md §5).
+fn json_pred_kind_matches(node: &JsonNode, kind: JsonPredicateKind) -> bool {
+    match kind {
+        JsonPredicateKind::Value => true,
+        JsonPredicateKind::Scalar => !matches!(node, JsonNode::Object(_) | JsonNode::Array(_)),
+        JsonPredicateKind::Array => matches!(node, JsonNode::Array(_)),
+        JsonPredicateKind::Object => matches!(node, JsonNode::Object(_)),
     }
 }
 
@@ -25057,6 +25120,32 @@ impl RExpr {
                 // unifies both.
                 let v = operand.eval(row, env, m)?;
                 Ok(Value::Bool(v.is_null_test(*negated)))
+            }
+            RExpr::IsJson {
+                operand,
+                negated,
+                kind,
+                unique_keys,
+            } => {
+                m.charge(COSTS.operator_eval);
+                let v = operand.eval(row, env, m)?;
+                let ok = match v {
+                    Value::Null => return Ok(Value::Null), // a NULL operand → NULL (never raises)
+                    // jsonb is always well-formed with unique keys; only the kind can fail.
+                    Value::Jsonb(node) => json_pred_kind_matches(&node, *kind),
+                    // A string / json operand: parse (preserving duplicate keys); malformed → false.
+                    Value::Json(s) | Value::Text(s) => match json::parse_preserving(&s) {
+                        Err(_) => false,
+                        Ok(node) => {
+                            json_pred_kind_matches(&node, *kind)
+                                && !(*unique_keys && json::has_duplicate_keys(&node))
+                        }
+                    },
+                    _ => unreachable!(
+                        "resolver restricts IS JSON to a string / json / jsonb operand"
+                    ),
+                };
+                Ok(Value::Bool(ok ^ *negated))
             }
             RExpr::Distinct { lhs, rhs, negated } => {
                 m.charge(COSTS.operator_eval);

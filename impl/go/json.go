@@ -620,6 +620,52 @@ func makeObject(members []JsonMember) JsonNode {
 	return JsonNode{Kind: JObject, Obj: canonicalizeObject(members)}
 }
 
+// hasDuplicateKeys detects a duplicate object key anywhere in the tree — for `IS JSON WITH UNIQUE
+// KEYS` (json-sql-functions.md §5). The node must be parsed with parsePreservingJSON (which keeps
+// duplicate keys); this walks every object (and recurses into member values and array elements).
+func hasDuplicateKeys(node *JsonNode) bool {
+	switch node.Kind {
+	case JObject:
+		for i := range node.Obj {
+			for j := i + 1; j < len(node.Obj); j++ {
+				if node.Obj[i].Key == node.Obj[j].Key {
+					return true
+				}
+			}
+		}
+		for i := range node.Obj {
+			if hasDuplicateKeys(&node.Obj[i].Val) {
+				return true
+			}
+		}
+		return false
+	case JArray:
+		for i := range node.Arr {
+			if hasDuplicateKeys(&node.Arr[i]) {
+				return true
+			}
+		}
+		return false
+	default:
+		return false
+	}
+}
+
+// jsonPredKindMatches reports whether a parsed JSON node matches an `IS JSON [kind]` predicate's
+// kind (json-sql-functions.md §5).
+func jsonPredKindMatches(node *JsonNode, kind JsonPredicateKind) bool {
+	switch kind {
+	case JPKScalar:
+		return node.Kind != JObject && node.Kind != JArray
+	case JPKArray:
+		return node.Kind == JArray
+	case JPKObject:
+		return node.Kind == JObject
+	default: // JPKValue
+		return true
+	}
+}
+
 // ---------------------------------------------------------------------------------------------
 // Output (`jsonbOut` — the canonical PG render). `json_out` is the stored verbatim text.
 // ---------------------------------------------------------------------------------------------

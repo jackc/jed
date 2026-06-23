@@ -24,6 +24,7 @@ import type {
   Insert,
   InsertValue,
   JoinKind,
+  JsonPredicateKind,
   Literal,
   OnConflict,
   OrderKey,
@@ -266,6 +267,7 @@ import {
   getField,
   getIndex,
   getPath,
+  hasDuplicateKeys as jsonHasDuplicateKeys,
   hasKey as jsonHasKeyKernel,
   insertPath as jsonInsertPathKernel,
   jsonCompactOut,
@@ -8427,6 +8429,7 @@ export class Database {
       case "neg":
       case "not":
       case "isNull":
+      case "isJson":
         e.operand = this.foldUncorrelatedInRExpr(e.operand, bound, ctes, cost);
         return e;
       case "arith":
@@ -8845,6 +8848,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "neg":
     case "not":
     case "isNull":
+    case "isJson":
       return rexprIsConstant(e.operand);
     case "arith":
     case "compare":
@@ -9827,6 +9831,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "neg":
     case "not":
     case "isNull":
+    case "isJson":
       return rexprReferencesOuter(e.operand, depth);
     case "arith":
     case "compare":
@@ -9938,6 +9943,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "neg":
     case "not":
     case "isNull":
+    case "isJson":
       collectTouched(e.operand, depth, touched);
       return;
     case "arith":
@@ -10570,6 +10576,16 @@ type RExpr =
   // scalar (or an integer index into an object) is `22023`.
   | { kind: "jsonDelete"; deleteKind: DeleteKind; base: RExpr; arg: RExpr }
   | { kind: "isNull"; operand: RExpr; negated: boolean }
+  // `operand IS [NOT] JSON …` (json-sql-functions.md §5): well-formedness + optional kind /
+  // unique-keys test over a string / json / jsonb operand. A NULL operand → NULL; else a definite
+  // boolean (NOT-negated when `negated`).
+  | {
+      kind: "isJson";
+      operand: RExpr;
+      negated: boolean;
+      jsonKind: JsonPredicateKind;
+      uniqueKeys: boolean;
+    }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
   | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean; insensitive: boolean }
   // `lhs ~ rhs` / `~*` / `!~` / `!~*` — regex match (regex.md), matched by the hand-written Pike VM
@@ -11675,6 +11691,7 @@ function exprHasAggregate(e: Expr): boolean {
     case "unary":
       return exprHasAggregate(e.operand);
     case "isNull":
+    case "isJson":
       return exprHasAggregate(e.operand);
     case "binary":
     case "isDistinct":
@@ -11733,6 +11750,7 @@ function exprHasWindow(e: Expr): boolean {
     case "unary":
       return exprHasWindow(e.operand);
     case "isNull":
+    case "isJson":
       return exprHasWindow(e.operand);
     case "binary":
     case "isDistinct":
@@ -11869,6 +11887,7 @@ function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): void {
       return;
     case "unary":
     case "isNull":
+    case "isJson":
       desugarNamedWindows(e.operand, windows);
       return;
     case "binary":
@@ -11974,6 +11993,7 @@ function rejectCheckStructure(e: Expr): void {
       return rejectCheckStructure(e.inner);
     case "unary":
     case "isNull":
+    case "isJson":
       return rejectCheckStructure(e.operand);
     case "binary":
     case "isDistinct":
@@ -12056,6 +12076,7 @@ function rejectDefaultStructure(e: Expr): void {
       return rejectDefaultStructure(e.inner);
     case "unary":
     case "isNull":
+    case "isJson":
       return rejectDefaultStructure(e.operand);
     case "binary":
     case "isDistinct":
@@ -12126,6 +12147,7 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
         return walk(e.inner);
       case "unary":
       case "isNull":
+      case "isJson":
         return walk(e.operand);
       case "binary":
       case "isDistinct":
@@ -14476,6 +14498,7 @@ function countSelfRefsExpr(e: Expr, name: string): number {
       return countSelfRefsExpr(e.source, name);
     case "unary":
     case "isNull":
+    case "isJson":
       return countSelfRefsExpr(e.operand, name);
     case "binary":
     case "isDistinct":
@@ -15125,6 +15148,7 @@ function exprCallsSeqMutator(e: Expr): boolean {
       return exprCallsSeqMutator(e.inner);
     case "unary":
     case "isNull":
+    case "isJson":
       return exprCallsSeqMutator(e.operand);
     case "binary":
     case "isDistinct":
@@ -15376,6 +15400,7 @@ function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
       break;
     case "unary":
     case "isNull":
+    case "isJson":
       collectExprPrivs(e.operand, req, locals);
       break;
     case "binary":
@@ -15459,6 +15484,7 @@ function exprReadsColumns(e: Expr): boolean {
       return exprReadsColumns(e.source);
     case "unary":
     case "isNull":
+    case "isJson":
       return exprReadsColumns(e.operand);
     case "funcCall":
       return e.args.some(exprReadsColumns);
@@ -16528,6 +16554,33 @@ function resolve(
         type: { kind: "bool" },
       };
     }
+    case "isJson": {
+      // The operand must be a character string / json / jsonb (else 42804); a bare string literal
+      // resolves as text. The predicate is always a definite boolean (a NULL operand → NULL at eval).
+      const { node, type } = resolve(scope, e.operand, null, ag, params);
+      switch (type.kind) {
+        case "text":
+        case "json":
+        case "jsonb":
+        case "null":
+          break;
+        default:
+          throw engineError(
+            "datatype_mismatch",
+            "cannot use type " + rtName(type) + " in IS JSON predicate",
+          );
+      }
+      return {
+        node: {
+          kind: "isJson",
+          operand: node,
+          negated: e.negated,
+          jsonKind: e.jsonKind,
+          uniqueKeys: e.uniqueKeys,
+        },
+        type: { kind: "bool" },
+      };
+    }
     case "isDistinct": {
       // NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a literal
       // adapts to its sibling; a text literal stays text), then require the operands be
@@ -17213,6 +17266,21 @@ function jsonArgNode(v: Value): JsonNode {
   if (v.kind === "jsonb") return v.node;
   if (v.kind === "json") return parsePreservingJson(v.text);
   throw new Error("jsonArgNode: a json/jsonb function argument must be json/jsonb");
+}
+
+// jsonPredKindMatches reports whether a parsed JSON node matches an `IS JSON [kind]` predicate's kind
+// (json-sql-functions.md §5).
+function jsonPredKindMatches(node: JsonNode, kind: JsonPredicateKind): boolean {
+  switch (kind) {
+    case "value":
+      return true;
+    case "scalar":
+      return node.kind !== "object" && node.kind !== "array";
+    case "array":
+      return node.kind === "array";
+    case "object":
+      return node.kind === "object";
+  }
 }
 
 // valueToNode is the JSON image of any value — the to_jsonb kernel (json-sql-functions.md §2), also
@@ -20476,6 +20544,38 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       // ordinary rule. isNullTest folds both cases. Replaces the old `(v is null) !== negated`.
       const operand = evalExpr(e.operand, row, env, m);
       return { kind: "bool", value: isNullTest(operand, e.negated) };
+    }
+    case "isJson": {
+      m.charge(COSTS.operatorEval);
+      const v = evalExpr(e.operand, row, env, m);
+      let ok: boolean;
+      switch (v.kind) {
+        case "null":
+          return nullValue(); // a NULL operand → NULL (never raises)
+        // jsonb is always well-formed with unique keys; only the kind can fail.
+        case "jsonb":
+          ok = jsonPredKindMatches(v.node, e.jsonKind);
+          break;
+        // A string / json operand: parse (preserving duplicate keys); malformed → false.
+        case "json":
+        case "text": {
+          let node: JsonNode;
+          try {
+            node = parsePreservingJson(v.text);
+          } catch {
+            ok = false;
+            break;
+          }
+          ok =
+            jsonPredKindMatches(node, e.jsonKind) && !(e.uniqueKeys && jsonHasDuplicateKeys(node));
+          break;
+        }
+        default:
+          throw new Error(
+            "IS JSON: resolver restricts the operand to a string / json / jsonb value",
+          );
+      }
+      return { kind: "bool", value: ok !== e.negated };
     }
     case "distinct": {
       m.charge(COSTS.operatorEval);

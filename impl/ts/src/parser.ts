@@ -22,6 +22,7 @@ import type {
   InsertValue,
   JoinClause,
   JoinKind,
+  JsonPredicateKind,
   Literal,
   OnConflict,
   OrderKey,
@@ -2354,6 +2355,42 @@ class Parser {
         this.advance();
         this.expectKeyword("from");
         return { kind: "isDistinct", lhs, rhs: this.parseConcat(), negated };
+      }
+      // IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]] — the SQL/JSON
+      // well-formedness predicate (json-sql-functions.md §5).
+      if (this.peekKeyword() === "json") {
+        this.advance();
+        let jsonKind: JsonPredicateKind = "value";
+        switch (this.peekKeyword()) {
+          case "value":
+            this.advance();
+            jsonKind = "value";
+            break;
+          case "scalar":
+            this.advance();
+            jsonKind = "scalar";
+            break;
+          case "array":
+            this.advance();
+            jsonKind = "array";
+            break;
+          case "object":
+            this.advance();
+            jsonKind = "object";
+            break;
+        }
+        // The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT` only when
+        // `UNIQUE` follows (a two-token lookahead — `WITH` otherwise starts no expression-level
+        // clause here). `KEYS` is optional.
+        let uniqueKeys = false;
+        const w = this.peekKeyword();
+        if ((w === "with" || w === "without") && this.peekKeywordAt(1) === "unique") {
+          this.advance(); // WITH / WITHOUT
+          this.advance(); // UNIQUE
+          if (this.peekKeyword() === "keys") this.advance();
+          uniqueKeys = w === "with";
+        }
+        return { kind: "isJson", operand: lhs, negated, jsonKind, uniqueKeys };
       }
       this.expectKeyword("null");
       return { kind: "isNull", operand: lhs, negated };

@@ -743,6 +743,11 @@ const (
 	ExprBinary
 	// ExprIsNull is a postfix IS [NOT] NULL test.
 	ExprIsNull
+	// ExprIsJson is `operand IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]]`
+	// — the SQL/JSON well-formedness predicate (spec/design/json-sql-functions.md §5): is operand (a
+	// character string / json / jsonb) well-formed JSON of the optional kind, with optionally unique
+	// object keys. A non-string/json operand → 42804; a NULL operand → NULL; never raises.
+	ExprIsJson
 	// ExprIsDistinct is `lhs IS [NOT] DISTINCT FROM rhs` (NULL-safe equality).
 	ExprIsDistinct
 	// ExprFuncCall is a function call — the shared aggregate/scalar call syntax
@@ -917,6 +922,7 @@ type Expr struct {
 	Unary       *UnaryExpr   // ExprUnary
 	Binary      *BinaryExpr
 	IsNullOf    *IsNullExpr     // ExprIsNull
+	IsJsonOf    *IsJsonExpr     // ExprIsJson
 	IsDistinct  *IsDistinctExpr // ExprIsDistinct
 	FuncCall    *FuncCallExpr   // ExprFuncCall
 	In          *InExpr         // ExprIn
@@ -1014,6 +1020,32 @@ type BinaryExpr struct {
 type IsNullExpr struct {
 	Operand Expr
 	Negated bool
+}
+
+// JsonPredicateKind is the optional kind word of an IS JSON predicate
+// (spec/design/json-sql-functions.md §5).
+type JsonPredicateKind int
+
+const (
+	// JPKValue is `IS JSON` / `IS JSON VALUE` — any well-formed JSON.
+	JPKValue JsonPredicateKind = iota
+	// JPKScalar is `IS JSON SCALAR` — a JSON scalar (string/number/boolean/null), not an object/array.
+	JPKScalar
+	// JPKArray is `IS JSON ARRAY` — a JSON array.
+	JPKArray
+	// JPKObject is `IS JSON OBJECT` — a JSON object.
+	JPKObject
+)
+
+// IsJsonExpr is `Operand IS [NOT] JSON [Kind] [(WITH|WITHOUT) UNIQUE [KEYS]]` — the SQL/JSON
+// well-formedness predicate (spec/design/json-sql-functions.md §5). Negated carries the NOT keyword;
+// Kind is the optional kind word (default JPKValue); UniqueKeys is true for `WITH UNIQUE [KEYS]`
+// (the default `WITHOUT` is false). A non-string/json operand → 42804; a NULL operand → NULL.
+type IsJsonExpr struct {
+	Operand    Expr
+	Negated    bool
+	Kind       JsonPredicateKind
+	UniqueKeys bool
 }
 
 // IsDistinctExpr is `Lhs IS [NOT] DISTINCT FROM Rhs` — NULL-safe equality. Negated

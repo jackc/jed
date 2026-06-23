@@ -359,8 +359,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `like_regex`→Pike-VM (`i`/`q` flags; `s`/`m`/`x`→`0A000`) + the `2203x` error class. → jsonpath.md
   - [ ] **P2 / P3** — path query fns (`jsonb_path_exists`/`_match`/`_query`(SRF)/`_query_array`/`_query_first`)
         + `@?`/`@@` + `vars`/`silent`; then the `_tz` variants. → jsonpath.md §5
-  - [ ] **S1 / S2** — `IS JSON` + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` (+ dup-key kernel); then
+  - [~] **S1 / S2** — `IS JSON` ✅ + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` (+ dup-key kernel); then
         `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` (constant ON ERROR/EMPTY). → json-sql-functions.md §5
+    - [x] **S1a — the `IS JSON` predicate** — ✅ `expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT]
+          [(WITH|WITHOUT) UNIQUE [KEYS]]`: well-formedness + kind + recursive unique-keys over a
+          string/json/jsonb operand; malformed → false; NULL → NULL; non-string/json operand → `42804`;
+          never raises. Extends the IS-predicate dispatch; `Expr::IsJson` + `JsonPredicateKind` +
+          `json::has_duplicate_keys`. All 3 cores, cap `expr.is_json`, oracle-clean. _S1b follow-on:_
+          `JSON()` / `JSON_SCALAR` / `JSON_SERIALIZE` constructors (grammar primaries + RETURNING).
   - [~] **B1–B4** — scalar processing + builders / single-column SRFs / two-column SRFs (`json[b]_each`,
         needs C0) / aggregates (`json[b]_agg`, `object_agg` + strict/unique). → json-sql-functions.md §2–§4
     - [x] **B1 (processing subset)** — ✅ `json[b]_typeof` / `json[b]_array_length` (22023 non-array) /

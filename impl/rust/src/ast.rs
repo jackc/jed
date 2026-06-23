@@ -827,6 +827,16 @@ pub enum Expr {
         operand: Box<Expr>,
         negated: bool,
     },
+    /// `operand IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT) UNIQUE [KEYS]]` — the
+    /// SQL/JSON well-formedness predicate (spec/design/json-sql-functions.md §5): is `operand` (a
+    /// character string / json / jsonb) well-formed JSON of the optional `kind`, with optionally
+    /// unique object keys. A non-string/json operand → 42804; a NULL operand → NULL; never raises.
+    IsJson {
+        operand: Box<Expr>,
+        negated: bool,
+        kind: JsonPredicateKind,
+        unique_keys: bool,
+    },
     /// `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
     /// keyword: `negated = true` is `IS NOT DISTINCT FROM` (NULL-safe `=`); `false` is
     /// `IS DISTINCT FROM` (its negation). Always boolean-valued, never unknown
@@ -972,6 +982,19 @@ pub enum Expr {
         lhs: Box<Expr>,
         query: Box<QueryExpr>,
     },
+}
+
+/// The optional kind word of an `IS JSON` predicate (spec/design/json-sql-functions.md §5).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum JsonPredicateKind {
+    /// `IS JSON` / `IS JSON VALUE` — any well-formed JSON.
+    Value,
+    /// `IS JSON SCALAR` — a JSON scalar (string/number/boolean/null), not an object or array.
+    Scalar,
+    /// `IS JSON ARRAY` — a JSON array.
+    Array,
+    /// `IS JSON OBJECT` — a JSON object.
+    Object,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
