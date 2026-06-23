@@ -995,3 +995,11 @@ reason = "jed: percent_rank()/cume_dist() return decimal (divergence D2, window.
 file = "window/ratio.test"
 sql = "SELECT id, percent_rank() OVER () AS pr, cume_dist() OVER () AS cd FROM t ORDER BY id"
 reason = "jed: percent_rank()/cume_dist() return decimal not float8 (divergence D2, window.md §10). With no window ORDER BY every row is one peer group, so percent_rank = 0 and cume_dist = 1 for all rows; jed renders them as decimals (0.000…/1.000…). PostgreSQL returns float8. jed's decimal rows are kept."
+
+# --- Explicit RANGE value-offset frames over a FLOAT ordering key (window.md §10, divergence D3):
+# jed refuses them 0A000 to keep binary floats out of the comparison/ordering path; PostgreSQL has
+# in_range support for float8 and the query SUCCEEDS. jed's 0A000 is kept.
+[[override]]
+file = "window/frame_range.test"
+sql = "SELECT sum(x) OVER (ORDER BY f RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) FROM tf"
+reason = "jed: a RANGE value offset over a float ordering key is 0A000 (divergence D3, window.md §10 — key ± offset over a float re-imports float ordering into a comparison path, which jed keeps floats out of, CLAUDE.md §8). PostgreSQL supports float8 RANGE offsets and the query succeeds. A deliberate, documented refusal; jed's 0A000 is kept."

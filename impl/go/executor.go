@@ -13432,15 +13432,16 @@ type windowSpec struct {
 	// OVER (...)). Go's windowPlan is an int enum and cannot carry a payload like Rust's
 	// WindowPlan::Agg(AggPlan) tuple variant, so the aggregate plan rides alongside here.
 	aggPlan aggPlan
-	// frame is the resolved explicit frame (S4, ROWS mode), or nil for the default frame (RANGE
-	// UNBOUNDED PRECEDING TO CURRENT ROW with an ORDER BY, the whole partition without — window.md
-	// §6). Mirrors Rust's WindowSpec.frame.
+	// frame is the resolved explicit frame, or nil for the default frame (RANGE UNBOUNDED PRECEDING
+	// TO CURRENT ROW with an ORDER BY, the whole partition without — window.md §6). Mirrors Rust's
+	// WindowSpec.frame.
 	frame *resolvedFrame
 }
 
-// resolvedFrame is a resolved window frame (spec/design/window.md §6). S4: ROWS mode,
-// integer-constant offsets.
+// resolvedFrame is a resolved window frame (spec/design/window.md §6). ROWS physical offsets,
+// GROUPS peer-group offsets (both integer counts), and RANGE value offsets over the ordering key.
 type resolvedFrame struct {
+	mode  FrameMode
 	start resolvedBound
 	end   resolvedBound
 }
@@ -13450,17 +13451,18 @@ type resolvedBoundKind int
 
 const (
 	boundUnboundedPreceding resolvedBoundKind = iota
-	boundPreceding                            // offset rows before the current row; off carries the count
+	boundPreceding                            // offset before the current row; offVal carries it
 	boundCurrentRow
-	boundFollowing // offset rows after the current row; off carries the count
+	boundFollowing // offset after the current row; offVal carries it
 	boundUnboundedFollowing
 )
 
-// resolvedBound is one resolved frame boundary; off carries the non-negative integer offset for
-// boundPreceding / boundFollowing (unused otherwise).
+// resolvedBound is one resolved frame boundary; offVal carries the non-negative offset for
+// boundPreceding / boundFollowing (unused otherwise) — a ValInt row/group count for ROWS/GROUPS,
+// or the numeric Value (Int over an integer key, Decimal over a decimal key) for RANGE.
 type resolvedBound struct {
-	kind resolvedBoundKind
-	off  int64
+	kind   resolvedBoundKind
+	offVal Value
 }
 
 // windowPlan is the runtime plan for one window function (spec/design/window.md §4). S0:
@@ -14829,6 +14831,9 @@ func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, *resolvedFra
 		partition = append(partition, r.index)
 	}
 	order := make([]orderSlot, 0, len(wd.Order))
+	// The ORDER BY key column types, captured in lockstep with order — a RANGE value-offset frame
+	// folds key ± offset over the single ordering key, so it needs the key's type (§6).
+	orderTypes := make([]Type, 0, len(wd.Order))
 	for _, key := range wd.Order {
 		var (
 			r   resolved
@@ -14866,41 +14871,99 @@ func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, *resolvedFra
 			return nil, nil, nil, NewError(FeatureNotSupported, "collated window ORDER BY is not supported yet")
 		}
 		order = append(order, orderSlot{idx: r.index, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
+		orderTypes = append(orderTypes, s.columnOf(r).Type)
 	}
-	// The explicit frame (S4): ROWS mode only, with non-negative integer-literal offsets. Explicit
-	// RANGE/GROUPS and value/expression offsets are deferred 0A000 (window.md §6/§11) — the default
-	// RANGE frame stays implicit (no clause).
+	// The explicit frame (window.md §6): ROWS / GROUPS integer-count offsets, RANGE value offsets.
 	var frame *resolvedFrame
 	if wd.Frame != nil {
-		if wd.Frame.Mode != FrameRows {
-			return nil, nil, nil, NewError(FeatureNotSupported, "only ROWS-mode window frames are supported yet")
-		}
-		start, err := resolveFrameBound(wd.Frame.Start)
+		f, err := resolveFrame(wd.Frame, order, orderTypes)
 		if err != nil {
 			return nil, nil, nil, err
 		}
-		end, err := resolveFrameBound(wd.Frame.End)
-		if err != nil {
-			return nil, nil, nil, err
-		}
-		frame = &resolvedFrame{start: start, end: end}
+		frame = f
 	}
 	return partition, order, frame, nil
 }
 
-// resolveFrameBound resolves one frame bound (S4): the offset of `n PRECEDING`/`n FOLLOWING` must
-// be a non-negative integer literal (22013 if negative; a non-literal/non-integer offset is
-// 0A000). spec/design/window.md §6.
-func resolveFrameBound(b FrameBound) (resolvedBound, error) {
-	offset := func(e Expr) (int64, error) {
+// resolveFrame resolves an explicit frame clause (spec/design/window.md §6). GROUPS requires an
+// ORDER BY (42P20); a RANGE value offset requires exactly one ORDER BY column (42P20) of an integer
+// or decimal type (else 0A000 — float is divergence D3, timestamp/date are deferred follow-ons). A
+// negative offset is 22013; EXCLUDE was already rejected at parse. Mirrors Rust's resolve_frame.
+func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolvedFrame, error) {
+	isOffset := func(b FrameBound) bool { return b.Kind == FramePreceding || b.Kind == FrameFollowing }
+	hasOffset := isOffset(f.Start) || isOffset(f.End)
+	switch f.Mode {
+	case FrameRows:
+		start, err := resolveIntBound(f.Start)
+		if err != nil {
+			return nil, err
+		}
+		end, err := resolveIntBound(f.End)
+		if err != nil {
+			return nil, err
+		}
+		return &resolvedFrame{mode: FrameRows, start: start, end: end}, nil
+	case FrameGroups:
+		if len(order) == 0 {
+			return nil, NewError(WindowingError, "GROUPS mode requires an ORDER BY clause")
+		}
+		start, err := resolveIntBound(f.Start)
+		if err != nil {
+			return nil, err
+		}
+		end, err := resolveIntBound(f.End)
+		if err != nil {
+			return nil, err
+		}
+		return &resolvedFrame{mode: FrameGroups, start: start, end: end}, nil
+	default: // FrameRange
+		if hasOffset {
+			if len(order) != 1 {
+				return nil, NewError(WindowingError,
+					"RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column")
+			}
+			kt := orderTypes[0]
+			if !(kt.IsInteger() || kt.IsDecimal()) {
+				return nil, NewError(FeatureNotSupported, fmt.Sprintf(
+					"RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s", kt.CanonicalName(),
+				))
+			}
+			start, err := resolveRangeBound(f.Start, kt)
+			if err != nil {
+				return nil, err
+			}
+			end, err := resolveRangeBound(f.End, kt)
+			if err != nil {
+				return nil, err
+			}
+			return &resolvedFrame{mode: FrameRange, start: start, end: end}, nil
+		}
+		// RANGE with only UNBOUNDED / CURRENT ROW bounds — peer/edge based, any number of ORDER BY
+		// keys (or none); no key arithmetic, so it reuses the plain bound resolution.
+		start, err := resolveIntBound(f.Start)
+		if err != nil {
+			return nil, err
+		}
+		end, err := resolveIntBound(f.End)
+		if err != nil {
+			return nil, err
+		}
+		return &resolvedFrame{mode: FrameRange, start: start, end: end}, nil
+	}
+}
+
+// resolveIntBound resolves a ROWS/GROUPS frame bound: the offset of `n PRECEDING`/`n FOLLOWING` must
+// be a non-negative integer literal (22013 if negative; a non-literal/non-integer offset is 0A000).
+func resolveIntBound(b FrameBound) (resolvedBound, error) {
+	offset := func(e Expr) (Value, error) {
 		if e.Kind == ExprLiteral && e.Literal != nil && e.Literal.Kind == LiteralInt {
 			if e.Literal.Int >= 0 {
-				return e.Literal.Int, nil
+				return IntValue(e.Literal.Int), nil
 			}
-			return 0, NewError(InvalidPrecedingOrFollowingSize,
+			return Value{}, NewError(InvalidPrecedingOrFollowingSize,
 				"frame starting or ending offset must not be negative")
 		}
-		return 0, NewError(FeatureNotSupported, "frame offset must be a non-negative integer literal")
+		return Value{}, NewError(FeatureNotSupported, "frame offset must be a non-negative integer literal")
 	}
 	switch b.Kind {
 	case FrameUnboundedPreceding:
@@ -14910,17 +14973,75 @@ func resolveFrameBound(b FrameBound) (resolvedBound, error) {
 	case FrameUnboundedFollowing:
 		return resolvedBound{kind: boundUnboundedFollowing}, nil
 	case FramePreceding:
-		n, err := offset(b.Offset)
+		v, err := offset(b.Offset)
 		if err != nil {
 			return resolvedBound{}, err
 		}
-		return resolvedBound{kind: boundPreceding, off: n}, nil
+		return resolvedBound{kind: boundPreceding, offVal: v}, nil
 	case FrameFollowing:
-		n, err := offset(b.Offset)
+		v, err := offset(b.Offset)
 		if err != nil {
 			return resolvedBound{}, err
 		}
-		return resolvedBound{kind: boundFollowing, off: n}, nil
+		return resolvedBound{kind: boundFollowing, offVal: v}, nil
+	default:
+		return resolvedBound{}, NewError(FeatureNotSupported, "unsupported frame bound")
+	}
+}
+
+// resolveRangeBound resolves a RANGE value-offset bound (window.md §6). The offset literal must be a
+// non-negative numeric matching the ordering key type: an integer key takes an integer offset (a
+// decimal offset is 0A000, matching PG); a decimal key takes an integer (widened) or decimal offset.
+func resolveRangeBound(b FrameBound, kt Type) (resolvedBound, error) {
+	offset := func(e Expr) (Value, error) {
+		if e.Kind != ExprLiteral || e.Literal == nil {
+			return Value{}, NewError(FeatureNotSupported, "frame offset must be a non-negative numeric literal")
+		}
+		switch e.Literal.Kind {
+		case LiteralInt:
+			if e.Literal.Int < 0 {
+				return Value{}, NewError(InvalidPrecedingOrFollowingSize,
+					"frame starting or ending offset must not be negative")
+			}
+			if kt.IsDecimal() {
+				return DecimalValue(DecimalFromInt64(e.Literal.Int)), nil
+			}
+			return IntValue(e.Literal.Int), nil
+		case LiteralDecimal:
+			if !kt.IsDecimal() {
+				return Value{}, NewError(FeatureNotSupported, fmt.Sprintf(
+					"RANGE with offset PRECEDING/FOLLOWING is not supported for column type %s and offset type decimal",
+					kt.CanonicalName(),
+				))
+			}
+			if e.Literal.Dec.Neg && !e.Literal.Dec.IsZero() {
+				return Value{}, NewError(InvalidPrecedingOrFollowingSize,
+					"frame starting or ending offset must not be negative")
+			}
+			return DecimalValue(e.Literal.Dec), nil
+		default:
+			return Value{}, NewError(FeatureNotSupported, "frame offset must be a non-negative numeric literal")
+		}
+	}
+	switch b.Kind {
+	case FrameUnboundedPreceding:
+		return resolvedBound{kind: boundUnboundedPreceding}, nil
+	case FrameCurrentRow:
+		return resolvedBound{kind: boundCurrentRow}, nil
+	case FrameUnboundedFollowing:
+		return resolvedBound{kind: boundUnboundedFollowing}, nil
+	case FramePreceding:
+		v, err := offset(b.Offset)
+		if err != nil {
+			return resolvedBound{}, err
+		}
+		return resolvedBound{kind: boundPreceding, offVal: v}, nil
+	case FrameFollowing:
+		v, err := offset(b.Offset)
+		if err != nil {
+			return resolvedBound{}, err
+		}
+		return resolvedBound{kind: boundFollowing, offVal: v}, nil
 	default:
 		return resolvedBound{}, NewError(FeatureNotSupported, "unsupported frame bound")
 	}
@@ -21429,78 +21550,342 @@ func sortRows[R ~[]Value](rows []R, order []orderSlot) error {
 	return nil
 }
 
-// peerEnds returns the exclusive peer-group end per sorted position over a partition (the default
-// frame's RANGE CURRENT ROW boundary — window.md §6): for a row at sorted position p, the rows in
-// [p, peerEnds[p]) are its peers (equal on the window ORDER BY). Mirrors Rust's peer_ends.
-func peerEnds(ordered []int, rows []Row, order []orderSlot) []int {
-	np := len(ordered)
-	ends := make([]int, np)
-	for i := range ends {
-		ends[i] = np
+// offsetCount is the integer count of a ROWS/GROUPS offset bound (ValInt by construction). It is
+// clamped to [0, np] before index arithmetic so a huge literal offset cannot overflow int — any
+// offset >= np already saturates the bound to the partition edge. Mirrors Rust's i128 widening.
+func offsetCount(v Value, np int) int {
+	if v.Int > int64(np) {
+		return np
 	}
+	return int(v.Int)
+}
+
+// rangeVVsBound returns the sign of v - (cur ∓ off) for a RANGE value offset (window.md §6),
+// computed exactly: integer keys use math/big so the bound never overflows int64 (matching Rust's
+// i128 / TS's bigint); decimal keys use exact decimal arithmetic. subtract chooses cur - off vs
+// cur + off. Mirrors Rust's range_v_vs_bound.
+func rangeVVsBound(v, cur, off Value, subtract bool) (int, error) {
+	if cur.Kind == ValInt {
+		b := big.NewInt(cur.Int)
+		if subtract {
+			b.Sub(b, big.NewInt(off.Int))
+		} else {
+			b.Add(b, big.NewInt(off.Int))
+		}
+		return big.NewInt(v.Int).Cmp(b), nil
+	}
+	var (
+		b   Decimal
+		err error
+	)
+	if subtract {
+		b, err = cur.Dec.Sub(*off.Dec)
+	} else {
+		b, err = cur.Dec.Add(*off.Dec)
+	}
+	if err != nil {
+		return 0, err
+	}
+	return v.Dec.CmpValue(b), nil
+}
+
+// frameCtx holds one partition's peer-group structure (window.md §3/§6), shared across every row's
+// frame lookup. Peers are rows equal on the window ORDER BY keys; peerStart/peerEnd bracket each
+// row's peer group, groupOf is its peer-group ordinal, and groupSpans lists every group's [start,
+// end). Mirrors Rust's FrameCtx.
+type frameCtx struct {
+	ordered    []int
+	rows       []Row
+	order      []orderSlot
+	np         int
+	peerStart  []int
+	peerEnd    []int
+	groupOf    []int
+	groupSpans [][2]int
+}
+
+func newFrameCtx(ordered []int, rows []Row, order []orderSlot) *frameCtx {
+	np := len(ordered)
+	var groupSpans [][2]int
 	s := 0
 	for pos := 1; pos < np; pos++ {
 		if cmpRowsByOrder(rows[ordered[pos]], rows[ordered[s]], order) != 0 {
-			for e := s; e < pos; e++ {
-				ends[e] = pos
-			}
+			groupSpans = append(groupSpans, [2]int{s, pos})
 			s = pos
 		}
 	}
-	for e := s; e < np; e++ {
-		ends[e] = np
+	if np > 0 {
+		groupSpans = append(groupSpans, [2]int{s, np})
 	}
-	return ends
+	peerStart := make([]int, np)
+	peerEnd := make([]int, np)
+	groupOf := make([]int, np)
+	for gi, span := range groupSpans {
+		for p := span[0]; p < span[1]; p++ {
+			peerStart[p] = span[0]
+			peerEnd[p] = span[1]
+			groupOf[p] = gi
+		}
+	}
+	return &frameCtx{ordered, rows, order, np, peerStart, peerEnd, groupOf, groupSpans}
 }
 
-// frameBounds returns the [lo, hi) frame for a row at sorted position pos (window.md §6). A nil
-// frame ⇒ the default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = [0, peerEnd)). An explicit
-// ROWS frame maps each bound to an index; bounds clamp to [0, np] and an inverted frame is empty.
-// Mirrors Rust's frame_bounds.
-func frameBounds(pos, np, peerEnd int, frame *resolvedFrame) (int, int) {
+// bounds returns the [lo, hi) frame for the row at sorted position pos (window.md §6). A nil frame
+// ⇒ the default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = [0, peerEnd)).
+func (c *frameCtx) bounds(pos int, frame *resolvedFrame) (int, int, error) {
 	if frame == nil {
-		return 0, peerEnd
+		return 0, c.peerEnd[pos], nil
 	}
-	p := int64(pos)
-	n := int64(np)
-	boundIdx := func(b resolvedBound, end bool) int64 {
-		switch b.kind {
-		case boundUnboundedPreceding:
-			return 0
-		case boundPreceding:
-			if end {
-				return p - b.off + 1
-			}
-			return p - b.off
-		case boundCurrentRow:
-			if end {
-				return p + 1
-			}
-			return p
-		case boundFollowing:
-			if end {
-				return p + b.off + 1
-			}
-			return p + b.off
-		default: // boundUnboundedFollowing
-			return n
-		}
+	switch frame.mode {
+	case FrameRows:
+		lo, hi := c.rowsBounds(pos, frame)
+		return lo, hi, nil
+	case FrameGroups:
+		lo, hi := c.groupsBounds(pos, frame)
+		return lo, hi, nil
+	default: // FrameRange
+		return c.rangeBounds(pos, frame)
 	}
-	clamp := func(x int64) int64 {
-		if x < 0 {
-			return 0
-		}
-		if x > n {
-			return n
-		}
-		return x
+}
+
+// rowsBounds: physical row offsets in the partition sequence; bounds clamp to [0, np].
+func (c *frameCtx) rowsBounds(pos int, f *resolvedFrame) (int, int) {
+	np := c.np
+	lo := 0
+	switch f.start.kind {
+	case boundUnboundedPreceding:
+		lo = 0
+	case boundPreceding:
+		lo = pos - offsetCount(f.start.offVal, np)
+	case boundCurrentRow:
+		lo = pos
+	case boundFollowing:
+		lo = pos + offsetCount(f.start.offVal, np)
+	case boundUnboundedFollowing:
+		lo = np
 	}
-	lo := clamp(boundIdx(frame.start, false))
-	hi := clamp(boundIdx(frame.end, true))
+	hi := 0
+	switch f.end.kind {
+	case boundUnboundedPreceding:
+		hi = 0
+	case boundPreceding:
+		hi = pos - offsetCount(f.end.offVal, np) + 1
+	case boundCurrentRow:
+		hi = pos + 1
+	case boundFollowing:
+		hi = pos + offsetCount(f.end.offVal, np) + 1
+	case boundUnboundedFollowing:
+		hi = np
+	}
+	lo = clampIdx(lo, np)
+	hi = clampIdx(hi, np)
 	if hi < lo {
 		hi = lo
 	}
-	return int(lo), int(hi)
+	return lo, hi
+}
+
+// groupsBounds: peer-group offsets — a bound g PRECEDING/FOLLOWING lands on the cg ∓ g-th peer
+// group's start (a start bound) or end (an end bound); a group index below 0 clamps to the
+// partition start, at or above the group count to the partition end.
+func (c *frameCtx) groupsBounds(pos int, f *resolvedFrame) (int, int) {
+	np := c.np
+	cg := c.groupOf[pos]
+	g := len(c.groupSpans)
+	startAt := func(j int) int {
+		if j < 0 {
+			return 0
+		}
+		if j >= g {
+			return np
+		}
+		return c.groupSpans[j][0]
+	}
+	endAt := func(j int) int {
+		if j < 0 {
+			return 0
+		}
+		if j >= g {
+			return np
+		}
+		return c.groupSpans[j][1]
+	}
+	lo := 0
+	switch f.start.kind {
+	case boundUnboundedPreceding:
+		lo = 0
+	case boundPreceding:
+		lo = startAt(cg - offsetCount(f.start.offVal, np))
+	case boundCurrentRow:
+		lo = startAt(cg)
+	case boundFollowing:
+		lo = startAt(cg + offsetCount(f.start.offVal, np))
+	case boundUnboundedFollowing:
+		lo = np
+	}
+	hi := 0
+	switch f.end.kind {
+	case boundUnboundedPreceding:
+		hi = 0
+	case boundPreceding:
+		hi = endAt(cg - offsetCount(f.end.offVal, np))
+	case boundCurrentRow:
+		hi = endAt(cg)
+	case boundFollowing:
+		hi = endAt(cg + offsetCount(f.end.offVal, np))
+	case boundUnboundedFollowing:
+		hi = np
+	}
+	if hi < lo {
+		hi = lo
+	}
+	return lo, hi
+}
+
+// rangeBounds: logical offsets on the single ordering-key value (window.md §6). A bound with no
+// offset (UNBOUNDED / CURRENT ROW) is peer/edge based and needs no key arithmetic. With a value
+// offset, the frame spans the rows whose key is within the offset of the current key; a NULL
+// current key has only its NULL peers (offset/CURRENT bounds collapse to the peer group, the PG
+// rule), while UNBOUNDED bounds still reach the partition edge.
+func (c *frameCtx) rangeBounds(pos int, f *resolvedFrame) (int, int, error) {
+	np := c.np
+	startOff := f.start.kind == boundPreceding || f.start.kind == boundFollowing
+	endOff := f.end.kind == boundPreceding || f.end.kind == boundFollowing
+	if !startOff && !endOff {
+		lo := 0
+		if f.start.kind != boundUnboundedPreceding { // CurrentRow
+			lo = c.peerStart[pos]
+		}
+		hi := np
+		if f.end.kind != boundUnboundedFollowing { // CurrentRow
+			hi = c.peerEnd[pos]
+		}
+		if hi < lo {
+			hi = lo
+		}
+		return lo, hi, nil
+	}
+	// Offset present ⇒ exactly one ORDER BY key (validated at resolve).
+	col := c.order[0].idx
+	desc := c.order[0].descending
+	cur := c.rows[c.ordered[pos]][col]
+	if cur.IsNull() {
+		lo := 0
+		if f.start.kind != boundUnboundedPreceding {
+			lo = c.peerStart[pos]
+		}
+		hi := np
+		if f.end.kind != boundUnboundedFollowing {
+			hi = c.peerEnd[pos]
+		}
+		if hi < lo {
+			hi = lo
+		}
+		return lo, hi, nil
+	}
+	var (
+		lo  int
+		err error
+	)
+	switch f.start.kind {
+	case boundUnboundedPreceding:
+		lo = 0
+	case boundCurrentRow:
+		lo = c.peerStart[pos]
+	case boundPreceding:
+		lo, err = c.rangeStart(col, cur, f.start.offVal, true, desc)
+	case boundFollowing:
+		lo, err = c.rangeStart(col, cur, f.start.offVal, false, desc)
+	case boundUnboundedFollowing:
+		lo = np
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	hi := np
+	switch f.end.kind {
+	case boundUnboundedFollowing:
+		hi = np
+	case boundCurrentRow:
+		hi = c.peerEnd[pos]
+	case boundPreceding:
+		hi, err = c.rangeEnd(col, cur, f.end.offVal, true, desc, lo)
+	case boundFollowing:
+		hi, err = c.rangeEnd(col, cur, f.end.offVal, false, desc, lo)
+	case boundUnboundedPreceding:
+		hi = 0
+	}
+	if err != nil {
+		return 0, 0, err
+	}
+	if hi < lo {
+		hi = lo
+	}
+	return lo, hi, nil
+}
+
+// rangeStart is the first sorted position whose key satisfies a RANGE start bound (NULL keys never
+// qualify for a non-NULL current row). subtract = isPreceding XOR descending chooses the bound side.
+func (c *frameCtx) rangeStart(col int, cur, off Value, isPreceding, desc bool) (int, error) {
+	subtract := isPreceding != desc
+	for i := 0; i < c.np; i++ {
+		v := c.rows[c.ordered[i]][col]
+		if v.IsNull() {
+			continue
+		}
+		ord, err := rangeVVsBound(v, cur, off, subtract)
+		if err != nil {
+			return 0, err
+		}
+		// ascending frame: v >= bound; descending frame: v <= bound.
+		include := ord >= 0
+		if desc {
+			include = ord <= 0
+		}
+		if include {
+			return i, nil
+		}
+	}
+	return c.np, nil
+}
+
+// rangeEnd is the exclusive end of a RANGE end bound, scanning forward from lo while the key stays
+// in frame (the in-frame keys form a contiguous run over the sorted partition).
+func (c *frameCtx) rangeEnd(col int, cur, off Value, isPreceding, desc bool, lo int) (int, error) {
+	subtract := isPreceding != desc
+	hi := lo
+	for i := lo; i < c.np; i++ {
+		v := c.rows[c.ordered[i]][col]
+		if v.IsNull() {
+			break
+		}
+		ord, err := rangeVVsBound(v, cur, off, subtract)
+		if err != nil {
+			return 0, err
+		}
+		// ascending frame: v <= bound; descending frame: v >= bound.
+		include := ord <= 0
+		if desc {
+			include = ord >= 0
+		}
+		if include {
+			hi = i + 1
+		} else {
+			break
+		}
+	}
+	return hi, nil
+}
+
+// clampIdx clamps an index into [0, np].
+func clampIdx(x, np int) int {
+	if x < 0 {
+		return 0
+	}
+	if x > np {
+		return np
+	}
+	return x
 }
 
 // applyWindowStage runs the WINDOW stage (spec/design/window.md §5.2): for each window function,
@@ -21511,8 +21896,8 @@ func frameBounds(pos, np, peerEnd int, frame *resolvedFrame) (int, int) {
 // the ceiling. S0: row_number() only; partitions bucket value-canonically via an insertion-ordered
 // list, so no map iteration order leaks (CLAUDE.md §8/§10).
 //
-// The frame-sensitive plans (aggregate windows, first/last/nth_value) use frameBounds (the per-row
-// [lo, hi) over the sorted partition) and peerEnds (the default frame's peer-group boundary).
+// The frame-sensitive plans (aggregate windows, first/last/nth_value) use a frameCtx, which
+// precomputes the partition's peer-group structure once and maps each row to its [lo, hi) frame.
 // spec/design/window.md §6.
 func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter) error {
 	n := len(rows)
@@ -21774,10 +22159,14 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 						}
 					}
 				} else {
-					// EXPLICIT frame (S4, ROWS): fold each row's [lo, hi) fresh (window.md §6).
-					pe := peerEnds(ordered, rows, spec.order)
+					// EXPLICIT frame (window.md §6): fold each row's [lo, hi) fresh — naive
+					// O(partition²), the metered window_frame_step bounding it.
+					ctx := newFrameCtx(ordered, rows, spec.order)
 					for pos := 0; pos < np; pos++ {
-						lo, hi := frameBounds(pos, np, pe[pos], spec.frame)
+						lo, hi, err := ctx.bounds(pos, spec.frame)
+						if err != nil {
+							return err
+						}
 						a := newAcc(spec.aggPlan)
 						for k := lo; k < hi; k++ {
 							meter.Charge(Costs.WindowFrameStep)
@@ -21828,13 +22217,16 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 						return NewError(InvalidArgumentForNthValue, "argument of nth_value must be greater than zero")
 					}
 				}
-				pe := peerEnds(ordered, rows, spec.order)
+				ctx := newFrameCtx(ordered, rows, spec.order)
 				for pos := 0; pos < np; pos++ {
 					if err := meter.Guard(); err != nil {
 						return err
 					}
 					meter.Charge(Costs.WindowResult)
-					lo, hi := frameBounds(pos, np, pe[pos], spec.frame)
+					lo, hi, err := ctx.bounds(pos, spec.frame)
+					if err != nil {
+						return err
+					}
 					switch spec.plan {
 					case planFirstValue:
 						if hi > lo {

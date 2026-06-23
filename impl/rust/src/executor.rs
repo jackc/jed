@@ -13196,22 +13196,27 @@ struct WindowSpec {
     /// count; lag/lead's value/offset/default; the aggregate operand; first/last/nth_value's value
     /// + nth_value's position).
     args: Vec<RExpr>,
-    /// The resolved explicit frame (S4, ROWS mode); `None` is the default frame (RANGE UNBOUNDED
-    /// PRECEDING TO CURRENT ROW with an ORDER BY, the whole partition without — window.md §6).
+    /// The resolved explicit frame; `None` is the default frame (RANGE UNBOUNDED PRECEDING TO
+    /// CURRENT ROW with an ORDER BY, the whole partition without — window.md §6).
     frame: Option<ResolvedFrame>,
 }
 
-/// A resolved window frame (spec/design/window.md §6). S4: ROWS mode, integer-constant offsets.
+/// A resolved window frame (spec/design/window.md §6). `ROWS` physical offsets, `GROUPS` peer-group
+/// offsets (both integer counts), and `RANGE` value offsets over the single ordering key.
 struct ResolvedFrame {
+    mode: crate::ast::FrameMode,
     start: ResolvedBound,
     end: ResolvedBound,
 }
 
+/// A resolved frame boundary. `Preceding`/`Following` carry the offset as a value: `Value::Int(n)`
+/// (the row/group count) for `ROWS`/`GROUPS`, and the numeric `Value` (`Int` over an integer key,
+/// `Decimal` over a decimal key) added to / subtracted from the ordering key for `RANGE`.
 enum ResolvedBound {
     UnboundedPreceding,
-    Preceding(i64),
+    Preceding(Value),
     CurrentRow,
-    Following(i64),
+    Following(Value),
     UnboundedFollowing,
 }
 
@@ -15470,6 +15475,9 @@ fn resolve_window_def(
         }
     }
     let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(wd.order.len());
+    // The ORDER BY key column types, captured in lockstep with `order` — a `RANGE` value-offset
+    // frame folds `key ± offset` over the single ordering key, so it needs the key's type (§6).
+    let mut order_types: Vec<Type> = Vec::with_capacity(wd.order.len());
     for key in &wd.order {
         let r = match &key.qualifier {
             Some(q) => scope.resolve_qualified(q, &key.column)?,
@@ -15508,35 +15516,88 @@ fn resolve_window_def(
             ));
         }
         order.push((idx, key.descending, key.nulls_first, coll));
+        order_types.push(scope.column_of(r).ty.clone());
     }
-    // The explicit frame (S4): ROWS mode only, with non-negative integer-literal offsets. Explicit
-    // RANGE/GROUPS and value/expression offsets are deferred 0A000 (window.md §6/§11) — the default
-    // RANGE frame stays implicit (no clause).
+    // The explicit frame (window.md §6): ROWS / GROUPS integer-count offsets, RANGE value offsets.
     let frame = match &wd.frame {
         None => None,
-        Some(f) => {
-            if f.mode != crate::ast::FrameMode::Rows {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "only ROWS-mode window frames are supported yet",
-                ));
-            }
-            Some(ResolvedFrame {
-                start: resolve_frame_bound(&f.start)?,
-                end: resolve_frame_bound(&f.end)?,
-            })
-        }
+        Some(f) => Some(resolve_frame(f, &order, &order_types)?),
     };
     Ok((partition, order, frame))
 }
 
-/// Resolve one frame bound (S4): the offset of `n PRECEDING`/`n FOLLOWING` must be a non-negative
-/// integer literal (22013 if negative; a non-literal/non-integer offset is 0A000). window.md §6.
-fn resolve_frame_bound(b: &crate::ast::FrameBound) -> Result<ResolvedBound> {
+/// Resolve an explicit frame clause (spec/design/window.md §6). `GROUPS` requires an ORDER BY
+/// (`42P20`); a `RANGE` value offset requires exactly one ORDER BY column (`42P20`) of an integer or
+/// decimal type (else `0A000` — float is divergence D3, timestamp/date are deferred follow-ons). A
+/// negative offset is `22013`; `EXCLUDE` was already rejected at parse.
+fn resolve_frame(
+    f: &crate::ast::WindowFrame,
+    order: &[crate::spill::SortKey],
+    order_types: &[Type],
+) -> Result<ResolvedFrame> {
+    use crate::ast::{FrameBound, FrameMode};
+    let is_offset =
+        |b: &FrameBound| matches!(b, FrameBound::Preceding(_) | FrameBound::Following(_));
+    let has_offset = is_offset(&f.start) || is_offset(&f.end);
+    match f.mode {
+        FrameMode::Rows => Ok(ResolvedFrame {
+            mode: FrameMode::Rows,
+            start: resolve_int_bound(&f.start)?,
+            end: resolve_int_bound(&f.end)?,
+        }),
+        FrameMode::Groups => {
+            if order.is_empty() {
+                return Err(EngineError::new(
+                    SqlState::WindowingError,
+                    "GROUPS mode requires an ORDER BY clause",
+                ));
+            }
+            Ok(ResolvedFrame {
+                mode: FrameMode::Groups,
+                start: resolve_int_bound(&f.start)?,
+                end: resolve_int_bound(&f.end)?,
+            })
+        }
+        FrameMode::Range if has_offset => {
+            if order.len() != 1 {
+                return Err(EngineError::new(
+                    SqlState::WindowingError,
+                    "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column",
+                ));
+            }
+            let kt = &order_types[0];
+            if !(kt.is_integer() || kt.is_decimal()) {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!(
+                        "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {}",
+                        kt.canonical_name()
+                    ),
+                ));
+            }
+            Ok(ResolvedFrame {
+                mode: FrameMode::Range,
+                start: resolve_range_bound(&f.start, kt)?,
+                end: resolve_range_bound(&f.end, kt)?,
+            })
+        }
+        // RANGE with only UNBOUNDED / CURRENT ROW bounds — peer/edge based, any number of ORDER BY
+        // keys (or none); no key arithmetic, so it reuses the plain bound resolution.
+        FrameMode::Range => Ok(ResolvedFrame {
+            mode: FrameMode::Range,
+            start: resolve_int_bound(&f.start)?,
+            end: resolve_int_bound(&f.end)?,
+        }),
+    }
+}
+
+/// Resolve a ROWS/GROUPS frame bound: the offset of `n PRECEDING`/`n FOLLOWING` must be a
+/// non-negative integer literal (`22013` if negative; a non-literal/non-integer offset is `0A000`).
+fn resolve_int_bound(b: &crate::ast::FrameBound) -> Result<ResolvedBound> {
     use crate::ast::FrameBound;
-    let offset = |e: &Expr| -> Result<i64> {
+    let offset = |e: &Expr| -> Result<Value> {
         match e {
-            Expr::Literal(Literal::Int(n)) if *n >= 0 => Ok(*n),
+            Expr::Literal(Literal::Int(n)) if *n >= 0 => Ok(Value::Int(*n)),
             Expr::Literal(Literal::Int(_)) => Err(EngineError::new(
                 SqlState::InvalidPrecedingOrFollowingSize,
                 "frame starting or ending offset must not be negative",
@@ -15544,6 +15605,59 @@ fn resolve_frame_bound(b: &crate::ast::FrameBound) -> Result<ResolvedBound> {
             _ => Err(EngineError::new(
                 SqlState::FeatureNotSupported,
                 "frame offset must be a non-negative integer literal",
+            )),
+        }
+    };
+    Ok(match b {
+        FrameBound::UnboundedPreceding => ResolvedBound::UnboundedPreceding,
+        FrameBound::CurrentRow => ResolvedBound::CurrentRow,
+        FrameBound::UnboundedFollowing => ResolvedBound::UnboundedFollowing,
+        FrameBound::Preceding(e) => ResolvedBound::Preceding(offset(e)?),
+        FrameBound::Following(e) => ResolvedBound::Following(offset(e)?),
+    })
+}
+
+/// Resolve a RANGE value-offset bound (window.md §6). The offset literal must be a non-negative
+/// numeric matching the ordering key type: an integer key takes an integer offset (a decimal offset
+/// is `0A000`, matching PG); a decimal key takes an integer (widened) or decimal offset.
+fn resolve_range_bound(b: &crate::ast::FrameBound, kt: &Type) -> Result<ResolvedBound> {
+    use crate::ast::FrameBound;
+    let offset = |e: &Expr| -> Result<Value> {
+        match e {
+            Expr::Literal(Literal::Int(n)) => {
+                if *n < 0 {
+                    return Err(EngineError::new(
+                        SqlState::InvalidPrecedingOrFollowingSize,
+                        "frame starting or ending offset must not be negative",
+                    ));
+                }
+                if kt.is_decimal() {
+                    Ok(Value::Decimal(Decimal::from_i64(*n)))
+                } else {
+                    Ok(Value::Int(*n))
+                }
+            }
+            Expr::Literal(Literal::Decimal(d)) => {
+                if !kt.is_decimal() {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        format!(
+                            "RANGE with offset PRECEDING/FOLLOWING is not supported for column type {} and offset type decimal",
+                            kt.canonical_name()
+                        ),
+                    ));
+                }
+                if d.is_negative() {
+                    return Err(EngineError::new(
+                        SqlState::InvalidPrecedingOrFollowingSize,
+                        "frame starting or ending offset must not be negative",
+                    ));
+                }
+                Ok(Value::Decimal(d.clone()))
+            }
+            _ => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "frame offset must be a non-negative numeric literal",
             )),
         }
     };
@@ -23645,61 +23759,300 @@ fn sort_rows(rows: &mut Vec<Row>, order: &[crate::spill::SortKey]) -> Result<()>
 /// S0: `row_number()` only; partitions bucket value-canonically via an insertion-ordered list, so
 /// no hash-map iteration order leaks (CLAUDE.md §8/§10).
 ///
-/// The frame-sensitive plans (aggregate windows, first/last/nth_value) use `frame_bounds` (the
-/// per-row `[lo, hi)` over the sorted partition) and `peer_ends` (the default frame's peer-group
-/// boundary). spec/design/window.md §6.
-fn peer_ends(ordered: &[usize], rows: &[Row], order: &[crate::spill::SortKey]) -> Vec<usize> {
-    let np = ordered.len();
-    let mut ends = vec![np; np];
-    let mut s = 0usize;
-    for pos in 1..np {
-        if cmp_rows_by_order(&rows[ordered[pos]], &rows[ordered[s]], order)
-            != std::cmp::Ordering::Equal
-        {
-            for e in ends.iter_mut().take(pos).skip(s) {
-                *e = pos;
-            }
-            s = pos;
-        }
+/// The frame-sensitive plans (aggregate windows, first/last/nth_value) use a `FrameCtx`, which
+/// precomputes the partition's peer-group structure once and maps each row to its `[lo, hi)` frame.
+/// spec/design/window.md §6.
+
+/// The integer count of a `ROWS`/`GROUPS` offset bound (widened to `i128` so the index arithmetic
+/// cannot overflow). The offset is `Value::Int` by construction (resolve_int_bound).
+fn offset_count(v: &Value) -> i128 {
+    match v {
+        Value::Int(k) => *k as i128,
+        _ => unreachable!("ROWS/GROUPS offset is an integer count"),
     }
-    for e in ends.iter_mut().take(np).skip(s) {
-        *e = np;
-    }
-    ends
 }
 
-/// The `[lo, hi)` frame for a row at sorted position `pos` (window.md §6). `None` ⇒ the default
-/// frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = `[0, peer_end)`). An explicit ROWS frame maps
-/// each bound to an index; bounds clamp to `[0, np]` and an inverted frame is empty.
-fn frame_bounds(
-    pos: usize,
+/// The sign of `v − (cur ∓ off)` for a `RANGE` value offset (window.md §6), computed in a wide
+/// enough type to avoid overflow: integer keys compute the bound in `i128`; decimal keys use exact
+/// decimal arithmetic. `subtract` chooses `cur − off` vs `cur + off`.
+fn range_v_vs_bound(
+    v: &Value,
+    cur: &Value,
+    off: &Value,
+    subtract: bool,
+) -> Result<std::cmp::Ordering> {
+    match (cur, off) {
+        (Value::Int(c), Value::Int(o)) => {
+            let b = if subtract {
+                *c as i128 - *o as i128
+            } else {
+                *c as i128 + *o as i128
+            };
+            let x = match v {
+                Value::Int(x) => *x as i128,
+                _ => unreachable!("RANGE integer-key value is Int"),
+            };
+            Ok(x.cmp(&b))
+        }
+        (Value::Decimal(c), Value::Decimal(o)) => {
+            let b = if subtract { c.sub(o)? } else { c.add(o)? };
+            Ok(value_cmp(v, &Value::Decimal(b)))
+        }
+        _ => unreachable!("RANGE offset resolved to a matching numeric type"),
+    }
+}
+
+/// One partition's peer-group structure (window.md §3/§6), shared across every row's frame lookup.
+/// Peers are rows equal on the window ORDER BY keys; `peer_start`/`peer_end` bracket each row's peer
+/// group, `group_of` is its peer-group ordinal, and `group_spans` lists every group's `[start, end)`.
+struct FrameCtx<'a> {
+    ordered: &'a [usize],
+    rows: &'a [Row],
+    order: &'a [crate::spill::SortKey],
     np: usize,
-    peer_end: usize,
-    frame: &Option<ResolvedFrame>,
-) -> (usize, usize) {
-    match frame {
-        None => (0, peer_end),
-        Some(f) => {
-            let p = pos as i64;
-            let n = np as i64;
+    peer_start: Vec<usize>,
+    peer_end: Vec<usize>,
+    group_of: Vec<usize>,
+    group_spans: Vec<(usize, usize)>,
+}
+
+impl<'a> FrameCtx<'a> {
+    fn new(ordered: &'a [usize], rows: &'a [Row], order: &'a [crate::spill::SortKey]) -> Self {
+        let np = ordered.len();
+        let mut group_spans: Vec<(usize, usize)> = Vec::new();
+        let mut s = 0usize;
+        for pos in 1..np {
+            if cmp_rows_by_order(&rows[ordered[pos]], &rows[ordered[s]], order)
+                != std::cmp::Ordering::Equal
+            {
+                group_spans.push((s, pos));
+                s = pos;
+            }
+        }
+        if np > 0 {
+            group_spans.push((s, np));
+        }
+        let mut peer_start = vec![0usize; np];
+        let mut peer_end = vec![0usize; np];
+        let mut group_of = vec![0usize; np];
+        for (gi, &(a, b)) in group_spans.iter().enumerate() {
+            for p in a..b {
+                peer_start[p] = a;
+                peer_end[p] = b;
+                group_of[p] = gi;
+            }
+        }
+        FrameCtx {
+            ordered,
+            rows,
+            order,
+            np,
+            peer_start,
+            peer_end,
+            group_of,
+            group_spans,
+        }
+    }
+
+    /// The `[lo, hi)` frame for the row at sorted position `pos` (window.md §6). `None` ⇒ the
+    /// default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = `[0, peer_end)`).
+    fn bounds(&self, pos: usize, frame: &Option<ResolvedFrame>) -> Result<(usize, usize)> {
+        use crate::ast::FrameMode;
+        match frame {
+            None => Ok((0, self.peer_end[pos])),
+            Some(f) => match f.mode {
+                FrameMode::Rows => Ok(self.rows_bounds(pos, f)),
+                FrameMode::Groups => Ok(self.groups_bounds(pos, f)),
+                FrameMode::Range => self.range_bounds(pos, f),
+            },
+        }
+    }
+
+    /// ROWS: physical row offsets in the partition sequence; bounds clamp to `[0, np]`.
+    fn rows_bounds(&self, pos: usize, f: &ResolvedFrame) -> (usize, usize) {
+        let p = pos as i128;
+        let n = self.np as i128;
+        let lo = match &f.start {
+            ResolvedBound::UnboundedPreceding => 0,
+            ResolvedBound::Preceding(k) => p - offset_count(k),
+            ResolvedBound::CurrentRow => p,
+            ResolvedBound::Following(k) => p + offset_count(k),
+            ResolvedBound::UnboundedFollowing => n,
+        };
+        let hi = match &f.end {
+            ResolvedBound::UnboundedPreceding => 0,
+            ResolvedBound::Preceding(k) => p - offset_count(k) + 1,
+            ResolvedBound::CurrentRow => p + 1,
+            ResolvedBound::Following(k) => p + offset_count(k) + 1,
+            ResolvedBound::UnboundedFollowing => n,
+        };
+        let lo = lo.clamp(0, n) as usize;
+        let hi = hi.clamp(0, n) as usize;
+        (lo, hi.max(lo))
+    }
+
+    /// GROUPS: peer-group offsets — a bound `g PRECEDING`/`FOLLOWING` lands on the `cg ∓ g`-th peer
+    /// group's start (a start bound) or end (an end bound); a group index below 0 clamps to the
+    /// partition start, at or above the group count to the partition end.
+    fn groups_bounds(&self, pos: usize, f: &ResolvedFrame) -> (usize, usize) {
+        let cg = self.group_of[pos] as i128;
+        let g = self.group_spans.len() as i128;
+        let np = self.np;
+        let start_at = |j: i128| -> usize {
+            if j < 0 {
+                0
+            } else if j >= g {
+                np
+            } else {
+                self.group_spans[j as usize].0
+            }
+        };
+        let end_at = |j: i128| -> usize {
+            if j < 0 {
+                0
+            } else if j >= g {
+                np
+            } else {
+                self.group_spans[j as usize].1
+            }
+        };
+        let lo = match &f.start {
+            ResolvedBound::UnboundedPreceding => 0,
+            ResolvedBound::Preceding(k) => start_at(cg - offset_count(k)),
+            ResolvedBound::CurrentRow => start_at(cg),
+            ResolvedBound::Following(k) => start_at(cg + offset_count(k)),
+            ResolvedBound::UnboundedFollowing => np,
+        };
+        let hi = match &f.end {
+            ResolvedBound::UnboundedPreceding => 0,
+            ResolvedBound::Preceding(k) => end_at(cg - offset_count(k)),
+            ResolvedBound::CurrentRow => end_at(cg),
+            ResolvedBound::Following(k) => end_at(cg + offset_count(k)),
+            ResolvedBound::UnboundedFollowing => np,
+        };
+        (lo, hi.max(lo))
+    }
+
+    /// RANGE: logical offsets on the single ordering-key value (window.md §6). A bound with no
+    /// offset (UNBOUNDED / CURRENT ROW) is peer/edge based and needs no key arithmetic. With a
+    /// value offset, the frame spans the rows whose key is within the offset of the current key;
+    /// a NULL current key has only its NULL peers (offset bounds collapse to the peer group, the
+    /// PG rule), while UNBOUNDED bounds still reach the partition edge.
+    fn range_bounds(&self, pos: usize, f: &ResolvedFrame) -> Result<(usize, usize)> {
+        let np = self.np;
+        let start_off = matches!(
+            f.start,
+            ResolvedBound::Preceding(_) | ResolvedBound::Following(_)
+        );
+        let end_off = matches!(
+            f.end,
+            ResolvedBound::Preceding(_) | ResolvedBound::Following(_)
+        );
+        if !start_off && !end_off {
+            // Only UNBOUNDED / CURRENT ROW — peer/edge based (any number of ORDER BY keys).
             let lo = match &f.start {
                 ResolvedBound::UnboundedPreceding => 0,
-                ResolvedBound::Preceding(k) => p - k,
-                ResolvedBound::CurrentRow => p,
-                ResolvedBound::Following(k) => p + k,
-                ResolvedBound::UnboundedFollowing => n,
+                _ => self.peer_start[pos], // CurrentRow
             };
             let hi = match &f.end {
-                ResolvedBound::UnboundedPreceding => 0,
-                ResolvedBound::Preceding(k) => p - k + 1,
-                ResolvedBound::CurrentRow => p + 1,
-                ResolvedBound::Following(k) => p + k + 1,
-                ResolvedBound::UnboundedFollowing => n,
+                ResolvedBound::UnboundedFollowing => np,
+                _ => self.peer_end[pos], // CurrentRow
             };
-            let lo = lo.clamp(0, n) as usize;
-            let hi = hi.clamp(0, n) as usize;
-            (lo, hi.max(lo))
+            return Ok((lo, hi.max(lo)));
         }
+        // Offset present ⇒ exactly one ORDER BY key (validated at resolve).
+        let (col, desc, _, _) = self.order[0];
+        let cur = &self.rows[self.ordered[pos]][col];
+        if matches!(cur, Value::Null) {
+            let lo = match &f.start {
+                ResolvedBound::UnboundedPreceding => 0,
+                _ => self.peer_start[pos],
+            };
+            let hi = match &f.end {
+                ResolvedBound::UnboundedFollowing => np,
+                _ => self.peer_end[pos],
+            };
+            return Ok((lo, hi.max(lo)));
+        }
+        let lo = match &f.start {
+            ResolvedBound::UnboundedPreceding => 0,
+            ResolvedBound::CurrentRow => self.peer_start[pos],
+            ResolvedBound::Preceding(off) => self.range_start(col, cur, off, true, desc)?,
+            ResolvedBound::Following(off) => self.range_start(col, cur, off, false, desc)?,
+            ResolvedBound::UnboundedFollowing => np,
+        };
+        let hi = match &f.end {
+            ResolvedBound::UnboundedFollowing => np,
+            ResolvedBound::CurrentRow => self.peer_end[pos],
+            ResolvedBound::Preceding(off) => self.range_end(col, cur, off, true, desc, lo)?,
+            ResolvedBound::Following(off) => self.range_end(col, cur, off, false, desc, lo)?,
+            ResolvedBound::UnboundedPreceding => 0,
+        };
+        Ok((lo, hi.max(lo)))
+    }
+
+    /// The first sorted position whose key satisfies a RANGE start bound (NULL keys never qualify
+    /// for a non-NULL current row). `subtract = is_preceding XOR descending` chooses the bound side.
+    fn range_start(
+        &self,
+        col: usize,
+        cur: &Value,
+        off: &Value,
+        is_preceding: bool,
+        desc: bool,
+    ) -> Result<usize> {
+        let subtract = is_preceding != desc;
+        for i in 0..self.np {
+            let v = &self.rows[self.ordered[i]][col];
+            if matches!(v, Value::Null) {
+                continue;
+            }
+            let ord = range_v_vs_bound(v, cur, off, subtract)?;
+            // ascending frame: v ≥ bound; descending frame: v ≤ bound.
+            let include = if desc {
+                ord != std::cmp::Ordering::Greater
+            } else {
+                ord != std::cmp::Ordering::Less
+            };
+            if include {
+                return Ok(i);
+            }
+        }
+        Ok(self.np)
+    }
+
+    /// The exclusive end of a RANGE end bound, scanning forward from `lo` while the key stays in
+    /// frame (the in-frame keys form a contiguous run over the sorted partition).
+    fn range_end(
+        &self,
+        col: usize,
+        cur: &Value,
+        off: &Value,
+        is_preceding: bool,
+        desc: bool,
+        lo: usize,
+    ) -> Result<usize> {
+        let subtract = is_preceding != desc;
+        let mut hi = lo;
+        for i in lo..self.np {
+            let v = &self.rows[self.ordered[i]][col];
+            if matches!(v, Value::Null) {
+                break;
+            }
+            let ord = range_v_vs_bound(v, cur, off, subtract)?;
+            // ascending frame: v ≤ bound; descending frame: v ≥ bound.
+            let include = if desc {
+                ord != std::cmp::Ordering::Less
+            } else {
+                ord != std::cmp::Ordering::Greater
+            };
+            if include {
+                hi = i + 1;
+            } else {
+                break;
+            }
+        }
+        Ok(hi)
     }
 }
 
@@ -23931,10 +24284,11 @@ fn apply_window_stage(
                             }
                         }
                     } else {
-                        // EXPLICIT frame (S4, ROWS): fold each row's frame fresh (window.md §6).
-                        let pe = peer_ends(&ordered, rows, &spec.order);
+                        // EXPLICIT frame (window.md §6): fold each row's frame fresh — naive
+                        // O(partition²), the metered `window_frame_step` bounding it.
+                        let ctx = FrameCtx::new(&ordered, rows, &spec.order);
                         for pos in 0..np {
-                            let (lo, hi) = frame_bounds(pos, np, pe[pos], &spec.frame);
+                            let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
                             let mut acc = Acc::new(aggplan);
                             for k in lo..hi {
                                 meter.charge(COSTS.window_frame_step);
@@ -23971,11 +24325,11 @@ fn apply_window_stage(
                     } else {
                         Some(0) // unused for first/last
                     };
-                    let pe = peer_ends(&ordered, rows, &spec.order);
+                    let ctx = FrameCtx::new(&ordered, rows, &spec.order);
                     for pos in 0..np {
                         meter.guard()?;
                         meter.charge(COSTS.window_result);
-                        let (lo, hi) = frame_bounds(pos, np, pe[pos], &spec.frame);
+                        let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
                         results[ordered[pos]] = match spec.plan {
                             WindowPlan::FirstValue if hi > lo => vals[lo].clone(),
                             WindowPlan::LastValue if hi > lo => vals[hi - 1].clone(),

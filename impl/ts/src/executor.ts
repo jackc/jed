@@ -40,6 +40,8 @@ import type {
   TypeMod,
   Update,
   WindowDef,
+  WindowFrame,
+  FrameMode,
   FrameBound,
   WithExpr,
   WithQuery,
@@ -10413,18 +10415,22 @@ type WindowSpec = {
   frame?: ResolvedFrame | null;
 };
 
-// ResolvedFrame is a resolved window frame (spec/design/window.md §6). S4: ROWS mode, integer-
-// constant offsets.
+// ResolvedFrame is a resolved window frame (spec/design/window.md §6): ROWS physical offsets,
+// GROUPS peer-group offsets (both integer counts), and RANGE value offsets over the ordering key.
 type ResolvedFrame = {
+  mode: FrameMode;
   start: ResolvedBound;
   end: ResolvedBound;
 };
 
+// A resolved frame boundary. preceding/following carry the offset as a Value: an int Value (the
+// row/group count) for ROWS/GROUPS, or the numeric Value (int over an integer key, decimal over a
+// decimal key) added to / subtracted from the ordering key for RANGE.
 type ResolvedBound =
   | { kind: "unboundedPreceding" }
-  | { kind: "preceding"; offset: number }
+  | { kind: "preceding"; offset: Value }
   | { kind: "currentRow" }
-  | { kind: "following"; offset: number }
+  | { kind: "following"; offset: Value }
   | { kind: "unboundedFollowing" };
 
 // WindowPlan is the runtime plan for one window function (spec/design/window.md §4). S0:
@@ -11413,6 +11419,9 @@ function resolveWindowDef(
     partition.push(r.index);
   }
   const order: OrderSlot[] = [];
+  // The ORDER BY key column types, captured in lockstep with order — a RANGE value-offset frame
+  // folds key ± offset over the single ordering key, so it needs the key's type (§6).
+  const orderTypes: Type[] = [];
   for (const key of wd.order) {
     const r =
       key.qualifier !== null
@@ -11443,31 +11452,65 @@ function resolveWindowDef(
       throw engineError("feature_not_supported", "collated window ORDER BY is not supported yet");
     }
     order.push({ idx, descending: key.descending, nullsFirst: key.nullsFirst, collation });
+    orderTypes.push(scope.columnAt(idx).type);
   }
-  // The explicit frame (S4): ROWS mode only, with non-negative integer-literal offsets. Explicit
-  // RANGE/GROUPS and value/expression offsets are deferred 0A000 (window.md §6/§11) — the default
-  // RANGE frame stays implicit (no clause).
+  // The explicit frame (window.md §6): ROWS / GROUPS integer-count offsets, RANGE value offsets.
   let frame: ResolvedFrame | null = null;
   if (wd.frame !== undefined && wd.frame !== null) {
-    if (wd.frame.mode !== "rows") {
-      throw engineError("feature_not_supported", "only ROWS-mode window frames are supported yet");
-    }
-    frame = {
-      start: resolveFrameBound(wd.frame.start),
-      end: resolveFrameBound(wd.frame.end),
-    };
+    frame = resolveFrame(wd.frame, order, orderTypes);
   }
   return [partition, order, frame];
 }
 
-// resolveFrameBound resolves one frame bound (S4): the offset of `n PRECEDING`/`n FOLLOWING` must
+// resolveFrame resolves an explicit frame clause (spec/design/window.md §6). GROUPS requires an
+// ORDER BY (42P20); a RANGE value offset requires exactly one ORDER BY column (42P20) of an integer
+// or decimal type (else 0A000 — float is divergence D3, timestamp/date are deferred follow-ons). A
+// negative offset is 22013; EXCLUDE was already rejected at parse. Mirrors Rust's resolve_frame.
+function resolveFrame(f: WindowFrame, order: OrderSlot[], orderTypes: Type[]): ResolvedFrame {
+  const isOffset = (b: FrameBound): boolean => b.kind === "preceding" || b.kind === "following";
+  const hasOffset = isOffset(f.start) || isOffset(f.end);
+  switch (f.mode) {
+    case "rows":
+      return { mode: "rows", start: resolveIntBound(f.start), end: resolveIntBound(f.end) };
+    case "groups":
+      if (order.length === 0) {
+        throw engineError("windowing_error", "GROUPS mode requires an ORDER BY clause");
+      }
+      return { mode: "groups", start: resolveIntBound(f.start), end: resolveIntBound(f.end) };
+    default: // "range"
+      if (hasOffset) {
+        if (order.length !== 1) {
+          throw engineError(
+            "windowing_error",
+            "RANGE with offset PRECEDING/FOLLOWING requires exactly one ORDER BY column",
+          );
+        }
+        const kt = orderTypes[0]!;
+        if (!(typeIsInteger(kt) || typeIsDecimal(kt))) {
+          throw engineError(
+            "feature_not_supported",
+            `RANGE with offset PRECEDING/FOLLOWING is not supported for column type ${typeCanonicalName(kt)}`,
+          );
+        }
+        return {
+          mode: "range",
+          start: resolveRangeBound(f.start, kt),
+          end: resolveRangeBound(f.end, kt),
+        };
+      }
+      // RANGE with only UNBOUNDED / CURRENT ROW bounds — peer/edge based, any number of ORDER BY
+      // keys (or none); no key arithmetic, so it reuses the plain bound resolution.
+      return { mode: "range", start: resolveIntBound(f.start), end: resolveIntBound(f.end) };
+  }
+}
+
+// resolveIntBound resolves a ROWS/GROUPS frame bound: the offset of `n PRECEDING`/`n FOLLOWING` must
 // be a non-negative integer literal (22013 if negative; a non-literal/non-integer offset is 0A000).
-// window.md §6.
-function resolveFrameBound(b: FrameBound): ResolvedBound {
-  const offsetOf = (e: Expr): number => {
+function resolveIntBound(b: FrameBound): ResolvedBound {
+  const offsetOf = (e: Expr): Value => {
     if (e.kind === "literal" && e.literal.kind === "int") {
       const n = e.literal.int;
-      if (n >= 0n) return Number(n);
+      if (n >= 0n) return intValue(n);
       throw engineError(
         "invalid_preceding_or_following_size",
         "frame starting or ending offset must not be negative",
@@ -11476,6 +11519,59 @@ function resolveFrameBound(b: FrameBound): ResolvedBound {
     throw engineError(
       "feature_not_supported",
       "frame offset must be a non-negative integer literal",
+    );
+  };
+  switch (b.kind) {
+    case "unboundedPreceding":
+      return { kind: "unboundedPreceding" };
+    case "currentRow":
+      return { kind: "currentRow" };
+    case "unboundedFollowing":
+      return { kind: "unboundedFollowing" };
+    case "preceding":
+      return { kind: "preceding", offset: offsetOf(b.offset) };
+    case "following":
+      return { kind: "following", offset: offsetOf(b.offset) };
+  }
+}
+
+// resolveRangeBound resolves a RANGE value-offset bound (window.md §6). The offset literal must be a
+// non-negative numeric matching the ordering key type: an integer key takes an integer offset (a
+// decimal offset is 0A000, matching PG); a decimal key takes an integer (widened) or decimal offset.
+function resolveRangeBound(b: FrameBound, kt: Type): ResolvedBound {
+  const offsetOf = (e: Expr): Value => {
+    if (e.kind === "literal" && e.literal.kind === "int") {
+      const n = e.literal.int;
+      if (n < 0n) {
+        throw engineError(
+          "invalid_preceding_or_following_size",
+          "frame starting or ending offset must not be negative",
+        );
+      }
+      return typeIsDecimal(kt) ? decimalValue(Decimal.fromBigInt(n)) : intValue(n);
+    }
+    if (e.kind === "literal" && e.literal.kind === "decimal") {
+      if (!typeIsDecimal(kt)) {
+        throw engineError(
+          "feature_not_supported",
+          `RANGE with offset PRECEDING/FOLLOWING is not supported for column type ${typeCanonicalName(kt)} and offset type decimal`,
+        );
+      }
+      // The select items (and so this frame offset) are structuredClone'd during window desugaring,
+      // which strips the Decimal prototype — rebuild a real Decimal from its parts.
+      const lit = e.literal.dec;
+      const d = Decimal.fromParts(lit.neg, lit.scale, lit.limbs);
+      if (d.neg && !d.isZero()) {
+        throw engineError(
+          "invalid_preceding_or_following_size",
+          "frame starting or ending offset must not be negative",
+        );
+      }
+      return decimalValue(d);
+    }
+    throw engineError(
+      "feature_not_supported",
+      "frame offset must be a non-negative numeric literal",
     );
   };
   switch (b.kind) {
@@ -19239,52 +19335,261 @@ function not3(a: ThreeValued): ThreeValued {
   return "unknown";
 }
 
-// peerEnds computes, for each sorted position, the exclusive END of its peer group (rows EQUAL on
-// the window ORDER BY keys). The default frame's CURRENT ROW spans the whole peer group, so the
-// default frame is [0, peerEnd) (spec/design/window.md §6). An empty ORDER BY → one peer group → np.
-function peerEnds(ordered: number[], rows: Row[], order: OrderSlot[]): number[] {
-  const np = ordered.length;
-  const ends = new Array<number>(np).fill(np);
-  let s = 0;
-  for (let pos = 1; pos < np; pos++) {
-    if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[ordered[s]!]!, order) !== 0) {
-      for (let e = s; e < pos; e++) ends[e] = pos;
-      s = pos;
-    }
-  }
-  for (let e = s; e < np; e++) ends[e] = np;
-  return ends;
+// offsetCount is the integer count of a ROWS/GROUPS offset bound (an int Value by construction),
+// clamped to [0, np] so a huge literal offset cannot overflow — any offset >= np already saturates
+// the bound to the partition edge. Mirrors Rust's i128 widening.
+function offsetCount(v: Value, np: number): number {
+  if (v.kind === "int") return v.int > BigInt(np) ? np : Number(v.int);
+  return 0;
 }
 
-// frameBounds returns the [lo, hi) frame for a row at sorted position `pos` (window.md §6). A
-// null/undefined frame ⇒ the default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = [0, peerEnd)).
-// An explicit ROWS frame maps each bound to an index; bounds clamp to [0, np] and an inverted frame
-// is empty.
-function frameBounds(
-  pos: number,
-  np: number,
-  peerEnd: number,
-  frame: ResolvedFrame | null | undefined,
-): [number, number] {
-  if (frame === null || frame === undefined) return [0, peerEnd];
-  const boundIdx = (b: ResolvedBound, isEnd: boolean): number => {
-    switch (b.kind) {
-      case "unboundedPreceding":
-        return 0;
-      case "preceding":
-        return pos - b.offset + (isEnd ? 1 : 0);
-      case "currentRow":
-        return pos + (isEnd ? 1 : 0);
-      case "following":
-        return pos + b.offset + (isEnd ? 1 : 0);
-      case "unboundedFollowing":
-        return np;
+// rangeVVsBound returns the sign of v - (cur ∓ off) for a RANGE value offset (window.md §6),
+// computed exactly: integer keys use bigint so the bound cannot overflow (matching Rust's i128);
+// decimal keys use exact decimal arithmetic. subtract chooses cur - off vs cur + off. Mirrors Rust's
+// range_v_vs_bound.
+function rangeVVsBound(v: Value, cur: Value, off: Value, subtract: boolean): number {
+  if (cur.kind === "int" && off.kind === "int" && v.kind === "int") {
+    const b = subtract ? cur.int - off.int : cur.int + off.int;
+    return v.int < b ? -1 : v.int > b ? 1 : 0;
+  }
+  if (cur.kind === "decimal" && off.kind === "decimal" && v.kind === "decimal") {
+    const b = subtract ? cur.dec.sub(off.dec) : cur.dec.add(off.dec);
+    return v.dec.cmpValue(b);
+  }
+  throw new Error("range offset resolved to a matching numeric type");
+}
+
+// FrameCtx holds one partition's peer-group structure (window.md §3/§6), shared across every row's
+// frame lookup. Peers are rows equal on the window ORDER BY keys; peerStart/peerEnd bracket each
+// row's peer group, groupOf is its peer-group ordinal, and groupSpans lists every group's [start,
+// end). Mirrors Rust's FrameCtx.
+class FrameCtx {
+  readonly np: number;
+  private readonly ordered: number[];
+  private readonly rows: Row[];
+  private readonly order: OrderSlot[];
+  private readonly peerStart: number[];
+  private readonly peerEnd: number[];
+  private readonly groupOf: number[];
+  private readonly groupSpans: Array<[number, number]>;
+
+  constructor(ordered: number[], rows: Row[], order: OrderSlot[]) {
+    this.ordered = ordered;
+    this.rows = rows;
+    this.order = order;
+    const np = ordered.length;
+    this.np = np;
+    const groupSpans: Array<[number, number]> = [];
+    let s = 0;
+    for (let pos = 1; pos < np; pos++) {
+      if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[ordered[s]!]!, order) !== 0) {
+        groupSpans.push([s, pos]);
+        s = pos;
+      }
     }
-  };
-  const clamp = (x: number): number => (x < 0 ? 0 : x > np ? np : x);
-  const lo = clamp(boundIdx(frame.start, false));
-  const hi = clamp(boundIdx(frame.end, true));
-  return [lo, Math.max(hi, lo)];
+    if (np > 0) groupSpans.push([s, np]);
+    const peerStart = new Array<number>(np).fill(0);
+    const peerEnd = new Array<number>(np).fill(0);
+    const groupOf = new Array<number>(np).fill(0);
+    for (let gi = 0; gi < groupSpans.length; gi++) {
+      const [a, b] = groupSpans[gi]!;
+      for (let p = a; p < b; p++) {
+        peerStart[p] = a;
+        peerEnd[p] = b;
+        groupOf[p] = gi;
+      }
+    }
+    this.peerStart = peerStart;
+    this.peerEnd = peerEnd;
+    this.groupOf = groupOf;
+    this.groupSpans = groupSpans;
+  }
+
+  // bounds returns the [lo, hi) frame for the row at sorted position pos (window.md §6). A
+  // null/undefined frame ⇒ the default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = [0, peerEnd)).
+  bounds(pos: number, frame: ResolvedFrame | null | undefined): [number, number] {
+    if (frame === null || frame === undefined) return [0, this.peerEnd[pos]!];
+    switch (frame.mode) {
+      case "rows":
+        return this.rowsBounds(pos, frame);
+      case "groups":
+        return this.groupsBounds(pos, frame);
+      default: // "range"
+        return this.rangeBounds(pos, frame);
+    }
+  }
+
+  // ROWS: physical row offsets in the partition sequence; bounds clamp to [0, np].
+  private rowsBounds(pos: number, f: ResolvedFrame): [number, number] {
+    const np = this.np;
+    const idx = (b: ResolvedBound, isEnd: boolean): number => {
+      switch (b.kind) {
+        case "unboundedPreceding":
+          return 0;
+        case "preceding":
+          return pos - offsetCount(b.offset, np) + (isEnd ? 1 : 0);
+        case "currentRow":
+          return pos + (isEnd ? 1 : 0);
+        case "following":
+          return pos + offsetCount(b.offset, np) + (isEnd ? 1 : 0);
+        case "unboundedFollowing":
+          return np;
+      }
+    };
+    const clamp = (x: number): number => (x < 0 ? 0 : x > np ? np : x);
+    const lo = clamp(idx(f.start, false));
+    const hi = clamp(idx(f.end, true));
+    return [lo, Math.max(hi, lo)];
+  }
+
+  // GROUPS: peer-group offsets — a bound g PRECEDING/FOLLOWING lands on the cg ∓ g-th peer group's
+  // start (a start bound) or end (an end bound); a group index below 0 clamps to the partition
+  // start, at or above the group count to the partition end.
+  private groupsBounds(pos: number, f: ResolvedFrame): [number, number] {
+    const np = this.np;
+    const cg = this.groupOf[pos]!;
+    const g = this.groupSpans.length;
+    const startAt = (j: number): number => (j < 0 ? 0 : j >= g ? np : this.groupSpans[j]![0]);
+    const endAt = (j: number): number => (j < 0 ? 0 : j >= g ? np : this.groupSpans[j]![1]);
+    const loFor = (b: ResolvedBound): number => {
+      switch (b.kind) {
+        case "unboundedPreceding":
+          return 0;
+        case "preceding":
+          return startAt(cg - offsetCount(b.offset, np));
+        case "currentRow":
+          return startAt(cg);
+        case "following":
+          return startAt(cg + offsetCount(b.offset, np));
+        case "unboundedFollowing":
+          return np;
+      }
+    };
+    const hiFor = (b: ResolvedBound): number => {
+      switch (b.kind) {
+        case "unboundedPreceding":
+          return 0;
+        case "preceding":
+          return endAt(cg - offsetCount(b.offset, np));
+        case "currentRow":
+          return endAt(cg);
+        case "following":
+          return endAt(cg + offsetCount(b.offset, np));
+        case "unboundedFollowing":
+          return np;
+      }
+    };
+    const lo = loFor(f.start);
+    const hi = hiFor(f.end);
+    return [lo, Math.max(hi, lo)];
+  }
+
+  // RANGE: logical offsets on the single ordering-key value (window.md §6). A bound with no offset
+  // (UNBOUNDED / CURRENT ROW) is peer/edge based and needs no key arithmetic. With a value offset,
+  // the frame spans the rows whose key is within the offset of the current key; a NULL current key
+  // has only its NULL peers (offset/CURRENT bounds collapse to the peer group, the PG rule), while
+  // UNBOUNDED bounds still reach the partition edge.
+  private rangeBounds(pos: number, f: ResolvedFrame): [number, number] {
+    const np = this.np;
+    const startOff = f.start.kind === "preceding" || f.start.kind === "following";
+    const endOff = f.end.kind === "preceding" || f.end.kind === "following";
+    if (!startOff && !endOff) {
+      const lo = f.start.kind === "unboundedPreceding" ? 0 : this.peerStart[pos]!;
+      const hi = f.end.kind === "unboundedFollowing" ? np : this.peerEnd[pos]!;
+      return [lo, Math.max(hi, lo)];
+    }
+    // Offset present ⇒ exactly one ORDER BY key (validated at resolve).
+    const col = this.order[0]!.idx;
+    const desc = this.order[0]!.descending;
+    const cur = this.rows[this.ordered[pos]!]![col]!;
+    if (cur.kind === "null") {
+      const lo = f.start.kind === "unboundedPreceding" ? 0 : this.peerStart[pos]!;
+      const hi = f.end.kind === "unboundedFollowing" ? np : this.peerEnd[pos]!;
+      return [lo, Math.max(hi, lo)];
+    }
+    let lo: number;
+    switch (f.start.kind) {
+      case "unboundedPreceding":
+        lo = 0;
+        break;
+      case "currentRow":
+        lo = this.peerStart[pos]!;
+        break;
+      case "preceding":
+        lo = this.rangeStart(col, cur, f.start.offset, true, desc);
+        break;
+      case "following":
+        lo = this.rangeStart(col, cur, f.start.offset, false, desc);
+        break;
+      case "unboundedFollowing":
+        lo = np;
+        break;
+    }
+    let hi: number;
+    switch (f.end.kind) {
+      case "unboundedFollowing":
+        hi = np;
+        break;
+      case "currentRow":
+        hi = this.peerEnd[pos]!;
+        break;
+      case "preceding":
+        hi = this.rangeEnd(col, cur, f.end.offset, true, desc, lo);
+        break;
+      case "following":
+        hi = this.rangeEnd(col, cur, f.end.offset, false, desc, lo);
+        break;
+      case "unboundedPreceding":
+        hi = 0;
+        break;
+    }
+    return [lo, Math.max(hi, lo)];
+  }
+
+  // The first sorted position whose key satisfies a RANGE start bound (NULL keys never qualify for a
+  // non-NULL current row). subtract = isPreceding XOR descending chooses the bound side.
+  private rangeStart(
+    col: number,
+    cur: Value,
+    off: Value,
+    isPreceding: boolean,
+    desc: boolean,
+  ): number {
+    const subtract = isPreceding !== desc;
+    for (let i = 0; i < this.np; i++) {
+      const v = this.rows[this.ordered[i]!]![col]!;
+      if (v.kind === "null") continue;
+      const ord = rangeVVsBound(v, cur, off, subtract);
+      // ascending frame: v >= bound; descending frame: v <= bound.
+      const include = desc ? ord <= 0 : ord >= 0;
+      if (include) return i;
+    }
+    return this.np;
+  }
+
+  // The exclusive end of a RANGE end bound, scanning forward from lo while the key stays in frame
+  // (the in-frame keys form a contiguous run over the sorted partition).
+  private rangeEnd(
+    col: number,
+    cur: Value,
+    off: Value,
+    isPreceding: boolean,
+    desc: boolean,
+    lo: number,
+  ): number {
+    const subtract = isPreceding !== desc;
+    let hi = lo;
+    for (let i = lo; i < this.np; i++) {
+      const v = this.rows[this.ordered[i]!]![col]!;
+      if (v.kind === "null") break;
+      const ord = rangeVVsBound(v, cur, off, subtract);
+      // ascending frame: v <= bound; descending frame: v >= bound.
+      const include = desc ? ord >= 0 : ord <= 0;
+      if (include) hi = i + 1;
+      else break;
+    }
+    return hi;
+  }
 }
 
 // applyWindowStage is the WINDOW stage (spec/design/window.md §5.2): for each window function,
@@ -19296,8 +19601,8 @@ function frameBounds(
 // list keyed by the value-canonical distinctRowKey (the aggregate-grouping discipline), so no
 // hash-map iteration order leaks (CLAUDE.md §8/§10).
 //
-// The frame-sensitive plans (aggregate windows, first/last/nth_value) use frameBounds (the per-row
-// [lo, hi) over the sorted partition) and peerEnds (the default frame's peer-group boundary).
+// The frame-sensitive plans (aggregate windows, first/last/nth_value) use a FrameCtx, which
+// precomputes the partition's peer-group structure once and maps each row to its [lo, hi) frame.
 // spec/design/window.md §6.
 function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter: Meter): void {
   const n = rows.length;
@@ -19510,10 +19815,11 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
               }
             }
           } else {
-            // EXPLICIT frame (S4, ROWS): fold each row's frame fresh (window.md §6).
-            const pe = peerEnds(ordered, rows, spec.order);
+            // EXPLICIT frame (window.md §6): fold each row's frame fresh — naive O(partition²),
+            // the metered windowFrameStep bounding it.
+            const ctx = new FrameCtx(ordered, rows, spec.order);
             for (let pos = 0; pos < np; pos++) {
-              const [lo, hi] = frameBounds(pos, np, pe[pos]!, spec.frame);
+              const [lo, hi] = ctx.bounds(pos, spec.frame);
               const acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
               for (let k = lo; k < hi; k++) {
                 meter.charge(COSTS.windowFrameStep);
@@ -19556,11 +19862,11 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
               }
             }
           }
-          const pe = peerEnds(ordered, rows, spec.order);
+          const ctx = new FrameCtx(ordered, rows, spec.order);
           for (let pos = 0; pos < np; pos++) {
             meter.guard();
             meter.charge(COSTS.windowResult);
-            const [lo, hi] = frameBounds(pos, np, pe[pos]!, spec.frame);
+            const [lo, hi] = ctx.bounds(pos, spec.frame);
             let out: Value;
             if (spec.plan === "firstValue") {
               out = hi > lo ? vals[lo]! : nullValue();

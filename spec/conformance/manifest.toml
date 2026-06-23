@@ -294,7 +294,11 @@ description = "Aggregates as window functions (window.md §6, S3): sum/count/min
 
 [[capability]]
 id = "query.window_frame"
-description = "Explicit window frames + frame-sensitive value functions (window.md §6, S4): the ROWS BETWEEN frame_start AND frame_end clause (UNBOUNDED PRECEDING/FOLLOWING, CURRENT ROW, n PRECEDING/FOLLOWING with non-negative integer offsets) restricting the rows an aggregate window or first_value/last_value/nth_value sees; nth_value(e,n) n<1 is 22016, a negative frame offset 22013. Explicit RANGE/GROUPS frames + EXCLUDE are deferred 0A000. Builds on query.window_aggregate"
+description = "Explicit window frames + frame-sensitive value functions (window.md §6, S4): the ROWS BETWEEN frame_start AND frame_end clause (UNBOUNDED PRECEDING/FOLLOWING, CURRENT ROW, n PRECEDING/FOLLOWING with non-negative integer offsets) restricting the rows an aggregate window or first_value/last_value/nth_value sees; nth_value(e,n) n<1 is 22016, a negative frame offset 22013. Explicit RANGE/GROUPS frames are query.window_frame_range; EXCLUDE stays deferred 0A000. Builds on query.window_aggregate"
+
+[[capability]]
+id = "query.window_frame_range"
+description = "Explicit RANGE and GROUPS window frames + value-based RANGE offsets (window.md §6). GROUPS counts peer groups (g PRECEDING/FOLLOWING land on the g-th peer group's start/end) and requires an ORDER BY (42P20 otherwise). RANGE with only UNBOUNDED/CURRENT ROW bounds is peer/edge based over any number of ORDER BY keys (CURRENT ROW spans the current peer group). A RANGE value offset (n PRECEDING/FOLLOWING) frames the rows whose ordering key is within n of the current key; it requires exactly one ORDER BY column (42P20 otherwise) of an integer (integer offset) or decimal (integer/decimal offset) type — an integer key with a decimal offset, or any other key type (text/uuid/etc., and the deliberate divergence D3 over a float key, plus the deferred timestamp/date families) is 0A000. A negative offset is 22013. A NULL current key frames only its NULL peers for offset/CURRENT-ROW bounds while UNBOUNDED bounds still reach the partition edge (PG). Frame folds are naive O(partition^2), bounded by the metered window_frame_step. Builds on query.window_frame"
 
 [[capability]]
 id = "query.window_named"

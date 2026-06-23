@@ -10,10 +10,12 @@
 > change the data/grammar and here in the same edit. PostgreSQL is the behavioral default
 > (CLAUDE.md §1); the deliberate divergences are the ledger in §10.
 
-> **Status: COMPLETE (S0–S5, all three cores).** Every function below is landed — row_number,
+> **Status: COMPLETE (S0–S6, all three cores).** Every function below is landed — row_number,
 > rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, the aggregates as window functions
-> (running + explicit ROWS frames), first_value/last_value/nth_value, and named windows. The
-> remaining `0A000` items (§11 + the per-slice notes) are deferred follow-ons, not gaps in the core.
+> (running + explicit `ROWS`/`RANGE`/`GROUPS` frames, including value-based `RANGE` offsets over an
+> integer or decimal ordering key), first_value/last_value/nth_value, and named windows. The
+> remaining `0A000` items — `EXCLUDE`, and `RANGE` offsets over a float (divergence D3) / timestamp /
+> date ordering key (§6/§11 + the per-slice notes) — are deferred follow-ons, not gaps in the core.
 
 A **window function** computes a value for **each row** from a *set* of related rows — its
 **window frame** — without collapsing the rows the way an aggregate does. `row_number() OVER
@@ -44,18 +46,27 @@ cores in lockstep** (Rust + Go + TS), spec-first, with corpus entries + a capabi
    `avg` with an `OVER` clause, under the **implicit default frame only** (running aggregate),
    reusing the existing `Acc` kernels; plus `first_value()`. Explicit frame syntax is still
    `0A000`. Capability `query.window_aggregate`.
-4. **S4 — explicit frames.** `{ROWS | RANGE | GROUPS} BETWEEN frame_start AND frame_end
-   [EXCLUDE …]`, generalizing the frame; `last_value()`, `nth_value(expr, n)` (genuinely
-   frame-sensitive). Capability `query.window_frame`.
+4. **S4 — explicit `ROWS` frames.** `ROWS BETWEEN frame_start AND frame_end` (physical row
+   offsets, non-negative integer literals), generalizing the frame; `last_value()`,
+   `nth_value(expr, n)` (genuinely frame-sensitive). `RANGE`/`GROUPS` and `EXCLUDE` parse but are
+   `0A000` at resolve. Capability `query.window_frame`.
 5. **S5 — named windows + sharing** *(follow-on)*. The `WINDOW w AS (…)` clause + `OVER w`
    reuse/extension, and the shared partition/sort pass (multiple windows, one sort — a
    cost-relevant optimization, so it carries a NoREC relation + a benchmark). Capability
    `query.window_named`.
+6. **S6 — explicit `RANGE`/`GROUPS` frames + value offsets.** `GROUPS BETWEEN …` (peer-group
+   integer offsets, requires an `ORDER BY` → `42P20`); `RANGE BETWEEN …` with `UNBOUNDED`/`CURRENT
+   ROW` bounds over any ordering (peer/edge based), and value-based `n PRECEDING`/`FOLLOWING`
+   offsets over a **single** integer or decimal ordering key (else `42P20`/`0A000`). `CURRENT ROW`
+   spans the current peer group in both modes; a NULL ordering key frames only its NULL peers for
+   offset/CURRENT bounds. `EXCLUDE`, and `RANGE` offsets over a float (D3) / timestamp / date key,
+   stay `0A000`. Capability `query.window_frame_range`.
 
 Locked scope decisions: **the within-partition order is always fully resolved** (§3,
 deterministic — a divergence-adjacent strictness, §10); **`percent_rank`/`cume_dist` →
 `decimal`**, not PG's `float8` (§10, the `AVG`→`decimal` precedent); **`PARTITION BY` columns
-only** in S0; **explicit frames deferred to S4** (S0–S3 use the implicit default frame, §6).
+only** in S0; **explicit `ROWS` frames in S4, `RANGE`/`GROUPS` + value offsets in S6** (S0–S3 use
+the implicit default frame, §6).
 
 ## 2. Pipeline position — where the window stage runs
 
@@ -238,16 +249,26 @@ folds over, *per current row*. The frame is `{ROWS | RANGE | GROUPS} frame_exten
   partition total.
 - **`ROWS`** — physical row offsets in the partition sequence (`ROWS BETWEEN 2 PRECEDING AND
   CURRENT ROW` is a 3-row sliding window).
-- **`RANGE`** — logical offsets on the *single* `ORDER BY` key value (`RANGE BETWEEN '1 day'
-  PRECEDING AND CURRENT ROW`). `CURRENT ROW` in `RANGE` means the current row's **peer group**.
-  A `RANGE` offset requires exactly one `ORDER BY` key whose type supports `key ± offset`; over a
-  **`float`** ordering key it is **`0A000`** (keep floats out of ordering, §8, ledger D3).
-- **`GROUPS`** — peer-group offsets (`GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW`).
-- **`EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS`** — frame exclusion (S4).
+- **`RANGE`** — logical offsets on the *single* `ORDER BY` key value (`RANGE BETWEEN 5
+  PRECEDING AND 5 FOLLOWING`). `CURRENT ROW` in `RANGE` means the current row's **peer group**;
+  with only `UNBOUNDED`/`CURRENT ROW` bounds (no value offset) it is peer/edge based and works over
+  **any** number of `ORDER BY` keys (or none → one peer group). A value offset (`n PRECEDING`/
+  `FOLLOWING`) frames the rows whose key is within `n` of the current key and requires **exactly
+  one** `ORDER BY` key (else `42P20`) of an **integer** (integer offset) or **decimal** (integer/
+  decimal offset) type; an integer key with a decimal offset, a float key (divergence D3), a
+  timestamp/date key (deferred), or any other type is **`0A000`**. A **NULL** current key frames
+  only its NULL peers for offset/`CURRENT ROW` bounds, while `UNBOUNDED` bounds still reach the
+  partition edge (matching PG). Integer bound arithmetic is exact (i128 / bigint, so it never
+  overflows — matching PG's saturating frame edge).
+- **`GROUPS`** — peer-group offsets (`GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW`). A bound `g
+  PRECEDING`/`FOLLOWING` lands on the `cg ∓ g`-th peer group's start/end. `GROUPS` requires an
+  `ORDER BY` (else `42P20`).
+- **`EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS`** — frame exclusion, **deferred `0A000`**.
 
-S4 ships `ROWS`/`RANGE`/`GROUPS BETWEEN frame_start AND frame_end` with `EXCLUDE`; `float`-keyed
-`RANGE` offsets stay `0A000`. A frame bound that contains a window function, an aggregate, a
-column reference, or a negative offset is rejected (`42P20`/`42803`/`0A000`/`22023` as
+S4 shipped explicit `ROWS BETWEEN frame_start AND frame_end`; **S6** added `RANGE`/`GROUPS` and
+value-based `RANGE` offsets (integer/decimal keys). `EXCLUDE`, and `RANGE` offsets over a float
+(D3) / timestamp / date key, stay `0A000`. A frame bound that contains a window function, an
+aggregate, a column reference, or a negative offset is rejected (`42P20`/`42803`/`0A000`/`22013` as
 appropriate, matching PG).
 
 Frame evaluation is naive (re-fold per row, O(partition²) worst case) until the S5 sliding-window
@@ -316,7 +337,7 @@ directive. A `sum(x) OVER (ORDER BY t)` running total over `N` rows adds the fra
 
 ## 10. Divergence ledger (CLAUDE.md §1/§8 — recorded, oracle-overridden)
 
-Three deliberate divergences from PostgreSQL, each registered in
+Deliberate divergences from PostgreSQL, each registered in
 [../conformance/oracle_overrides.toml](../conformance/oracle_overrides.toml):
 
 - **D1 — within-partition order is pinned, not unspecified.** Absent a window `ORDER BY`, jed
@@ -329,7 +350,13 @@ Three deliberate divergences from PostgreSQL, each registered in
 - **D3 — `float`-keyed `RANGE`-offset frames are `0A000`.** A `RANGE BETWEEN n PRECEDING` needs
   `order_key ± n` over the single ordering key; over `float` that re-imports float ordering into a
   comparison path, so it is refused (matching the float-PK `0A000` and the date strict-island
-  precedents). `ROWS`/`GROUPS` frames over a float key are fine (no key arithmetic).
+  precedents). PG supports `float8` RANGE offsets; jed's `0A000` is oracle-overridden.
+  `ROWS`/`GROUPS` frames over a float key are fine (no key arithmetic).
+- **D4 — `timestamp`/`timestamptz`/`date`-keyed `RANGE`-offset frames are `0A000` (deferred).** PG
+  supports an `interval` offset over a timestamp key (and the standard's `'1 day' PRECEDING`); jed
+  defers the timestamp/date families (only integer/decimal ordering keys take a value offset this
+  slice), so they are `0A000` — a deferred follow-on, not a permanent refusal like D3. (A `date`
+  key with an *integer* offset is `0A000` in PG too, so only the interval-offset shapes diverge.)
 
 ## 11. Deferred / out of scope
 
@@ -338,6 +365,11 @@ Three deliberate divergences from PostgreSQL, each registered in
   aggregate `FILTER` follow-on, [aggregates.md](aggregates.md) §10).
 - **General-expression `PARTITION BY`/`ORDER BY`** (`PARTITION BY a + b`) — lifted with the
   `GROUP BY`/`ORDER BY` expression-key follow-on (§1 S0 narrowing).
+- **`EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS`** — frame exclusion, parsed but `0A000` (§6).
+- **`RANGE` value offsets over a timestamp/timestamptz/date key** (an `interval`/integer offset, D4)
+  — deferred; only integer/decimal ordering keys take a value offset this slice. A float key stays
+  `0A000` permanently (D3). Non-literal/expression frame offsets are also out (literals only, like
+  the `ROWS` narrowing).
 - **`float8` results** for `percent_rank`/`cume_dist` (D2) — out unless a future need overrides.
 - **The shared partition/sort pass** across distinct-but-compatible window definitions, and frame
   sliding-window optimizations — S5 and beyond (cost-lowering only, never correctness).

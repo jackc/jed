@@ -3,7 +3,8 @@
 # An explicit ROWS frame restricts the rows a frame-sensitive function sees. first_value/last_value/
 # nth_value pick the first/last/n-th row of the frame; an aggregate folds over it. With the DEFAULT
 # frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW) last_value is the current row (the PG gotcha); an
-# explicit ROWS frame widens it. Explicit RANGE/GROUPS frames + EXCLUDE are deferred (0A000).
+# explicit ROWS frame widens it. Explicit RANGE/GROUPS frames + value offsets are frame_range.test;
+# EXCLUDE stays deferred (0A000).
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_frame, query.order_by, types.i32, resource.cost_metering
 
 statement ok
