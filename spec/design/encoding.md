@@ -538,6 +538,29 @@ text *values* are unaffected — they still use the compact length-prefixed valu
 ([../fileformat/format.md](../fileformat/format.md)); only the *key* takes the collated form, the §3
 key/value seam diverging exactly as it does for `decimal` (§2.5) and `interval` (§2.10).
 
+### 2.13 `jsonb` — `jsonb-order-preserving` (authored; unexercised — deferred follow-on)
+
+`jsonb` has a total btree order ([json.md §5](json.md)) but is **not** a key type in the first
+JSON slices (`0A000`, the staged-key narrowing text/decimal/bytea/array all carried). The
+order-preserving encoding is authored here ahead of use — the float-§2.8 precedent — and a
+follow-on slice exercises it ([json.md §12](json.md)). The rule recurses over the node tree,
+mirroring the §2.11 range-bounds container recursion:
+
+1. A leading **type-rank discriminator byte** encoding the §5 order `Null < String < Number <
+   Boolean < Array < Object` (one byte, ascending, so the rank dominates the sort exactly as the
+   range empty/±∞ markers dominate §2.11).
+2. Then the per-kind body, each in its **own order-preserving, self-delimiting** form:
+   `null`/`false`/`true` carry no body (the rank byte suffices, with `false`/`true` split into
+   two rank values); a **string** uses the `text-terminated-escape` rule (§2.4); a **number**
+   uses `decimal-order-preserving` (§2.5); an **array** frames its element count then each
+   element body recursively; an **object** frames its member count then, in canonical key order
+   ([json.md §2.3](json.md)), each key (`text-terminated-escape`) then value body recursively.
+   Count-first framing reproduces the §5 "fewer elements/members sort first" rule.
+
+This composes with the §2.2 nullable slot and §2.3 descending inversion unchanged. **Status —
+AUTHORED, UNEXERCISED.** Like float (§2.8) it is written but not yet a live key; `json` (never
+comparable) and `jsonpath` get no key rule at all.
+
 ## 3. Where this is used today
 
 The bare integer rule is exercised by every stored key. The on-disk **value codec**

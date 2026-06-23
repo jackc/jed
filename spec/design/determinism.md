@@ -97,7 +97,14 @@ deliberately keeps **inside** the deterministic contract by paying for it elsewh
 - **Hash / iteration order.** This is **never** sanctioned — it is a *forbidden leak*
   (CLAUDE.md §8). The distinction from class **U** is sharp: no-`ORDER BY` leaves the row
   *sequence* unasserted while the *multiset* stays exact; an iteration-order leak would
-  corrupt the multiset / values / types / errors / cost, which is always a bug.
+  corrupt the multiset / values / types / errors / cost, which is always a bug. The
+  forthcoming `jsonb` type ([json.md](json.md)) is the model for paying the cost: object
+  members are stored in a **canonical key order** (length-then-bytewise, dedup last-wins,
+  [json.md §2.3](json.md)) so the bytes and every key-enumerating render are a pure function
+  of the value, never of hashmap order — and JSON numbers are exact **`decimal`**, never
+  binary float ([json.md §8](json.md)), so JSON introduces **no new** sanctioned relaxation
+  (its only seam-reads are the existing clock/entropy ones, the `.datetime()`/`_tz` path
+  surface — [jsonpath.md §5.1](jsonpath.md), class **B** below).
 
 ---
 

@@ -169,8 +169,19 @@ everything else tests against, not a detail discovered during implementation.
 - **A deliberate scalar set**, starting small and growing on demand. Eventual intent:
   fixed-width integers (with *defined* overflow behavior), an **exact `decimal`**,
   `text` (one defined collation/encoding to start), `boolean`, `timestamp` /
-  `timestamptz`, `bytea`, **`uuid`** (a fixed 16-byte value), and `json`/`jsonb` if we
-  want a headline feature.
+  `timestamptz`, `bytea`, **`uuid`** (a fixed 16-byte value), and **`json`/`jsonb`** —
+  the committed XL headline feature, now **designed spec-first** (the implementation is the
+  remaining work): the type pair + the `jsonb` binary value format (with a reserved
+  column-level **string-dictionary** door) in [spec/design/json.md](spec/design/json.md),
+  the first-class **`jsonpath`** type + the SQL/JSON path language in
+  [spec/design/jsonpath.md](spec/design/jsonpath.md), the ~100-function/operator surface +
+  the SQL/JSON standard syntax (`JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY`, `IS JSON`) in
+  [spec/design/json-sql-functions.md](spec/design/json-sql-functions.md), and `JSON_TABLE`
+  + the record-returning functions in [spec/design/json-table.md](spec/design/json-table.md);
+  PG-faithful (numbers are exact `decimal`, never float; `jsonb` keys canonical so no
+  iteration-order leak), with the divergences deliberate and ledgered (the `like_regex`
+  flag subset, `jsonb`-as-key and the dictionary builder deferred). Stable type codes 18
+  (`json`), 19 (`jsonb`), 20 (`jsonpath`); the slice ladder is in [TODO.md](TODO.md).
   - **First implemented step — signed integers only:** `i16` / `smallint` (16-bit),
     `i32` / `int` / `integer` (32-bit), `i64` / `bigint` (64-bit). Canonical names state
     width in **bits** under the **`i`/`f` prefix** (`i16`/`i32`/`i64`, `f32`/`f64` — the

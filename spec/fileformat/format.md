@@ -594,6 +594,17 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 15 | array (a structural `T[]` — followed by the element type descriptor, **not** a fixed body; v10) |
 | 16 | `date` (a calendar date — i32 days since the Unix epoch, fixed 4-byte body; v12) |
 | 17 | range (a structural range over a scalar element — followed by the element type descriptor, **not** a fixed body; v16 — [../design/ranges.md](../design/ranges.md)) |
+| 18 | `json` (**RESERVED, not yet landed** — validated text stored verbatim, a `text`-shaped variable-length body; [../design/json.md §4](../design/json.md)) |
+| 19 | `jsonb` (**RESERVED, not yet landed** — a self-describing tagged-node tree body, **not** a fixed body; [../design/json.md §2](../design/json.md)) |
+| 20 | `jsonpath` (**RESERVED, not yet landed** — a compiled-path type stored as normalized source text, a `text`-shaped body; [../design/jsonpath.md §1](../design/jsonpath.md)) |
+
+> **Codes 18–20 are allocations reserved by the JSON design** ([../design/json.md](../design/json.md),
+> [../design/jsonpath.md](../design/jsonpath.md)) to prevent collisions with concurrent work; their
+> value layouts are specified in those docs and become normative here when the first storable JSON
+> slice lands (the `format_version` bumps `v18 → v19` then). A `json`/`jsonpath` value rides the
+> `text` value codec; a `jsonb` value is the tagged-node body of [../design/json.md §2](../design/json.md),
+> which reserves a `has_jsonb_dict` column-entry flag bit (clear today, the string-dictionary door)
+> exactly as `has_collation` (below) reserves text's.
 
 A **`f64`** value (`type_code == 12`) is the **8 IEEE 754 bytes, big-endian**, and a
 **`f32`** value (`type_code == 13`) is the **4 IEEE 754 bytes, big-endian** — both behind the

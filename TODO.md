@@ -299,7 +299,38 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       canonicalized on store. On-disk type code 12. → [float.md](spec/design/float.md),
       [determinism.md](spec/design/determinism.md)
   - [ ] _follow-on:_ float in a PRIMARY KEY/index (`0A000`); key rule authored, unexercised.
-- [ ] **`json` / `jsonb`** — optional headline feature (§1). Large surface. _(size: XL; §4)_
+- [ ] **`json` / `jsonb` + SQL/JSON** — the committed XL headline feature (§1, §4). **Designed
+      spec-first** across four docs ([json.md](spec/design/json.md), [jsonpath.md](spec/design/jsonpath.md),
+      [json-sql-functions.md](spec/design/json-sql-functions.md), [json-table.md](spec/design/json-table.md));
+      implementation is sliced. Stable type codes 18/19/20; one `format_version` bump (v18→v19) at
+      the first storable slice. Critical path **J0 → {J1,J2,J3} → C0 → P1 → {P2,S2} → {R1,T1}**;
+      B-series runs parallel off J0/C0. _(size: XL)_
+  - [ ] **J0** — `json`/`jsonb` scalar arms + `json_in`/`out` + `jsonb_in`/`out` + `'…'::jsonb`
+        literal cast; no columns yet; reserves the string-dictionary door (zero bytes). → json.md §12
+  - [ ] **J1 / J1b** — storable `jsonb` column (tagged-node value codec, format bump, spill/compress,
+        golden `jsonb_table.jed`); then storable `json` (verbatim text body, golden `json_table.jed`).
+  - [ ] **J2** — `jsonb` comparison/ordering (PG btree order; `ORDER BY`/`DISTINCT`/`GROUP BY`);
+        `json` non-comparable (`42883`). → json.md §5
+  - [ ] **J3** — casts (`json↔jsonb`, `json`/`jsonb`→`text`, runtime `text`→`json`/`jsonb`). → json.md §6
+  - [ ] **J4 / J5 / J6** — operators: accessors `-> ->> #> #>>` / containment `@> <@ ? ?| ?&` /
+        mutation `|| - #-`. → json-sql-functions.md §1
+  - [ ] **C0** — shared FROM-clause **column-definition-list** facility + multi-column synthetic
+        table (the keystone for record functions, `json[b]_each`, and `JSON_TABLE`). → json-table.md §1
+  - [ ] **P1** — the first-class `jsonpath` type + compiler + lax/strict eval engine +
+        `like_regex`→Pike-VM (`i`/`q` flags; `s`/`m`/`x`→`0A000`) + the `2203x` error class. → jsonpath.md
+  - [ ] **P2 / P3** — path query fns (`jsonb_path_exists`/`_match`/`_query`(SRF)/`_query_array`/`_query_first`)
+        + `@?`/`@@` + `vars`/`silent`; then the `_tz` variants. → jsonpath.md §5
+  - [ ] **S1 / S2** — `IS JSON` + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` (+ dup-key kernel); then
+        `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` (constant ON ERROR/EMPTY). → json-sql-functions.md §5
+  - [ ] **B1–B4** — scalar processing + builders / single-column SRFs / two-column SRFs (`json[b]_each`,
+        needs C0) / aggregates (`json[b]_agg`, `object_agg` + strict/unique). → json-sql-functions.md §2–§4
+  - [ ] **R1 / R2** — `json[b]_to_record(set)` (needs C0) / `json[b]_populate_record(set)`. → json-table.md §2
+  - [ ] **T1** — `JSON_TABLE` (default plan: nested-path LEFT-OUTER/UNION expansion); explicit `PLAN`
+        → `0A000`. The highest-risk slice. → json-table.md §3
+  - [ ] _follow-ons (deferred `0A000`):_ the string-**dictionary builder** (opens the json.md §3 door);
+        `jsonb`-as-PK/index (exercise [encoding.md §2.13](spec/design/encoding.md)); GIN **`jsonb_ops`**
+        opclass for `@>`/`?` (the [gin.md](spec/design/gin.md) seam already seats it); `JSON_TABLE`
+        explicit `PLAN` (T2); `ON ERROR/EMPTY DEFAULT <expr>` (S3, the guarded sub-evaluation).
 - [ ] **`array` type** — the **second container axis** (sibling to composite, sharing ~80% of its
       foundation): a **structural** `Type::Array(Box<Type>)` over any element type, with array
       *shape* a property of the value (PG-faithful), the compact null-bitmap value codec,
