@@ -3149,6 +3149,74 @@ result         = "jsonb"
 null           = "propagates"
 errors         = ["0A000"]
 
+# to_json(anyelement) → the JSON image as `json` — the to_jsonb kernel rendered COMPACT (PG's json
+# output style: no space after ':'/','). STRICT. Same deferred 0A000 sources as to_jsonb. (json-sql-
+# functions.md §2.) A `json` input is canonicalized (a documented divergence — PG keeps it verbatim).
+[[operator]]
+name           = "to_json"
+kind           = "function"
+arity          = 1
+arg_families   = ["any"]
+arg_resolution = "none"
+result         = "json"
+null           = "propagates"
+errors         = ["0A000"]
+
+# json[b]_build_array(VARIADIC "any") → a JSON array built from the (heterogeneous) arguments, one
+# element each, NULLs INCLUDED (as JSON null) — NOT strict. jsonb canonicalizes / spaced; json renders
+# PG's idiosyncratic builder spacing (", " between elements, an element's own json image inside: a
+# scalar/array compact, a jsonb canonical-spaced, a json verbatim). Same deferred 0A000 element sources
+# as to_jsonb. The VARIADIC array form (json_build_array(VARIADIC arr)) spreads. (json-sql-functions.md §2.)
+[[operator]]
+name           = "jsonb_build_array"
+kind           = "function"
+arity          = 1
+arg_families   = ["any"]
+variadic       = true
+arg_resolution = "none"
+result         = "jsonb"
+null           = "none"
+errors         = ["0A000"]
+
+[[operator]]
+name           = "json_build_array"
+kind           = "function"
+arity          = 1
+arg_families   = ["any"]
+variadic       = true
+arg_resolution = "none"
+result         = "json"
+null           = "none"
+errors         = ["0A000"]
+
+# json[b]_build_object(VARIADIC "any") → a JSON object from alternating key/value arguments. An ODD
+# argument count → 22023; a NULL key → 22023 ("argument N: key must not be null"). A key is coerced to
+# text (text/integer/decimal/boolean — e.g. 1 → "1", true → "true"); a non-scalar key type is a deferred
+# 0A000. The value is the to_jsonb image (NULL value → JSON null). jsonb canonicalizes (last-wins dedup,
+# canonical key order); json preserves argument order + duplicate keys and uses PG's " : " / ", "
+# builder spacing. (json-sql-functions.md §2.)
+[[operator]]
+name           = "jsonb_build_object"
+kind           = "function"
+arity          = 1
+arg_families   = ["any"]
+variadic       = true
+arg_resolution = "none"
+result         = "jsonb"
+null           = "none"
+errors         = ["22023", "0A000"]
+
+[[operator]]
+name           = "json_build_object"
+kind           = "function"
+arity          = 1
+arg_families   = ["any"]
+variadic       = true
+arg_resolution = "none"
+result         = "json"
+null           = "none"
+errors         = ["22023", "0A000"]
+
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
 # SINGLE value. They are NOT operators — no infix symbol, no precedence, no

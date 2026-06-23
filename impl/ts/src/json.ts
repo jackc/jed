@@ -492,6 +492,14 @@ class JsonParser {
   }
 }
 
+// makeObject builds a canonical `jsonb` object node from (key, value) members — last-wins dedup then
+// the canonical key sort (json.md §2.3). The constructor for `jsonb_build_object` (B1) and the future
+// `jsonb_object`, reusing the parser's canonicalizer so a built object is byte-identical to a parsed
+// one.
+export function makeObject(members: JsonMember[]): JsonNode {
+  return { kind: "object", members: canonicalizeObject(members) };
+}
+
 // canonicalizeObject canonicalizes object members (spec/design/json.md §2.3): drop duplicate keys
 // keeping the LAST occurrence (PG jsonb last-wins), then sort the survivors length-then-bytewise.
 // Done before sorting so the stored object has unique keys in canonical order — a pure function of

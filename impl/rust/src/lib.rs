@@ -610,6 +610,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_srf",
     // to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2).
     "func.to_jsonb",
+    // json/jsonb construction builders (B1) — to_json / json[b]_build_array / _object (§2).
+    "func.json_builders",
     // json/jsonb aggregate builders (B4) — json[b]_agg / json[b]_agg_strict (json-sql-functions.md §4).
     "func.json_agg",
 ];

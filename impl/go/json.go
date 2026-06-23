@@ -614,6 +614,12 @@ func canonicalizeObject(members []JsonMember) []JsonMember {
 	return out
 }
 
+// makeObject builds a canonical `jsonb` object node from (key, value) members — last-wins dedup then
+// the canonical key sort (json.md §2.3). The constructor for jsonb_build_object (the Rust json::make_object).
+func makeObject(members []JsonMember) JsonNode {
+	return JsonNode{Kind: JObject, Obj: canonicalizeObject(members)}
+}
+
 // ---------------------------------------------------------------------------------------------
 // Output (`jsonbOut` — the canonical PG render). `json_out` is the stored verbatim text.
 // ---------------------------------------------------------------------------------------------

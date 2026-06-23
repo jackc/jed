@@ -127,6 +127,44 @@ test("to_jsonb unsupported sources are deferred", () => {
   );
 });
 
+// The json/jsonb construction builders (to_json / json[b]_build_array / _object) reuse the `to_jsonb`
+// element kernel (valueToNode), so a deferred-source element (float, like to_jsonb) is `0A000`. PG
+// supports these sources, so this is a documented divergence; the supported set is oracle-clean in
+// suites/json/json_builders.test. Mirrors impl/rust/tests/json.rs
+// json_builder_deferred_element_source_is_0a000 and impl/go/json_test.go.
+test("json builder deferred element source is 0A000", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => execute(db, "SELECT to_json(1.5::f64)")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT jsonb_build_array(1.5::f64)")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT json_build_array(1.5::f64)")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT jsonb_build_object('k', 1.5::f64)")),
+    "0A000",
+  );
+});
+
+// A non-scalar `json[b]_build_object` KEY (e.g. a date) is a deferred `0A000` — only text / integer /
+// decimal / boolean keys coerce to text this slice. PostgreSQL renders any type's text output as the
+// key, so this is a documented divergence (the text/int/bool key coercions are oracle-clean in the
+// suite). Mirrors impl/rust/tests/json.rs json_build_object_non_scalar_key_is_0a000 and
+// impl/go/json_test.go.
+test("json_build_object non-scalar key is 0A000", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => execute(db, "SELECT jsonb_build_object('2020-01-01'::date, 1)")),
+    "0A000",
+  );
+});
+
 // `json[b]_agg` over a deferred-source value (float, like to_jsonb) is `0A000` — the aggregate
 // reuses the `to_jsonb` element kernel, so the same float/datetime/composite/uuid/bytea/interval
 // sources propagate the deferral (json-sql-functions.md §4, B4). The supported element types are

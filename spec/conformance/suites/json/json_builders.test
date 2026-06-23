@@ -1,0 +1,112 @@
+# json/jsonb construction builders (B1 builders, spec/design/json-sql-functions.md §2): to_json,
+# json[b]_build_array, json[b]_build_object. to_json renders the to_jsonb image COMPACT as json; the
+# jsonb builders canonicalize (last-wins dedup, canonical key order, spaced); the json builders keep
+# argument order + duplicate keys and use PG's idiosyncratic builder spacing (", " between elements,
+# " : " in objects). A zero-arg build is valid ([] / {}); build_object odd count / NULL key → 22023;
+# a key coerces to text (1 → "1", true → "true"). Output matches the postgres:18 oracle.
+# Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, types.json, types.array, func.json_builders
+
+# to_json: a number stays exact, text → string, the compact json render of an array, NULL → NULL.
+query TTTT nosort
+SELECT to_json(5), to_json(5.50::numeric), to_json('hi'::text), to_json(true)
+----
+5
+5.50
+"hi"
+true
+
+query TT nosort
+SELECT to_json(ARRAY[1,2,3]), to_json(NULL::i32)
+----
+[1,2,3]
+NULL
+
+# A jsonb input renders its canonical SPACED text (PG's to_json(jsonb) keeps the jsonb output form);
+# a non-jsonb scalar/array renders compact (above).
+query T nosort
+SELECT to_json('{ "b":2, "a":1 }'::jsonb)
+----
+{"a": 1, "b": 2}
+
+# json[b]_build_array: one element per argument, NULLs INCLUDED as JSON null (non-strict). The jsonb
+# variant canonicalizes a nested jsonb element (spaced); the json variant embeds each element's json
+# image (a nested array compact, a jsonb element canonical-spaced) joined with ", ".
+query TT nosort
+SELECT jsonb_build_array(1, 'a', true, NULL), json_build_array(1, 'a', true, NULL)
+----
+[1, "a", true, null]
+[1, "a", true, null]
+
+query T nosort
+SELECT jsonb_build_array(1, ARRAY[2,3], '{"x":1}'::jsonb)
+----
+[1, [2, 3], {"x": 1}]
+
+# A zero-argument build is valid: an empty array / object.
+query TTTT nosort
+SELECT jsonb_build_array(), json_build_array(), jsonb_build_object(), json_build_object()
+----
+[]
+[]
+{}
+{}
+
+# The VARIADIC-array form spreads its lone array; a NULL whole-array operand → NULL.
+query TT nosort
+SELECT jsonb_build_array(VARIADIC ARRAY[1,2,3]), json_build_array(VARIADIC ARRAY['a','b'])
+----
+[1, 2, 3]
+["a", "b"]
+
+# json[b]_build_object: alternating key/value. jsonb canonicalizes + last-wins dedup; json keeps
+# argument order + duplicate keys and uses the " : " / ", " builder spacing.
+query TT nosort
+SELECT jsonb_build_object('a', 1, 'b', 2), json_build_object('a', 1, 'b', 2)
+----
+{"a": 1, "b": 2}
+{"a" : 1, "b" : 2}
+
+query TT nosort
+SELECT jsonb_build_object('a', 1, 'a', 2), json_build_object('b', 2, 'a', 1, 'a', 3)
+----
+{"a": 2}
+{"b" : 2, "a" : 1, "a" : 3}
+
+# A non-text key coerces to text (integer → "1", boolean → "true").
+query TT nosort
+SELECT jsonb_build_object(1, 'x'), jsonb_build_object(true, 'y')
+----
+{"1": "x"}
+{"true": "y"}
+
+# An odd argument count is 22023.
+statement error 22023
+SELECT jsonb_build_object('a')
+
+# A NULL key is 22023.
+statement error 22023
+SELECT jsonb_build_object(NULL, 1)
+
+# Over stored columns: build an object/array per row from scalar columns.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, name text, score i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'a', 10), (2, 'b', NULL)
+
+query IT nosort
+SELECT id, jsonb_build_object('name', name, 'score', score) FROM t ORDER BY id
+----
+1
+{"name": "a", "score": 10}
+2
+{"name": "b", "score": null}
+
+query IT nosort
+SELECT id, jsonb_build_array(id, name, score) FROM t ORDER BY id
+----
+1
+[1, "a", 10]
+2
+[2, "b", null]

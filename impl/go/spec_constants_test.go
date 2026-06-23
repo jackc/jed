@@ -479,8 +479,15 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			continue
 		}
 		if isVariadicFuncName(o.Name) {
-			// A VARIADIC function (array-functions.md §12): its kernel id comes from variadicFuncID
-			// and its result is a concrete scalar id.
+			// A VARIADIC function (array-functions.md §12 / json-sql-functions.md §2): the json/jsonb
+			// builders route to jsonBuildClassify + an reJsonBuild node (json/jsonb result); the count
+			// functions (num_nulls/num_nonnulls) keep variadicFuncID + reVariadic (a concrete scalar id).
+			if _, _, isBuild := jsonBuildClassify(o.Name); isBuild {
+				if _, ok := ScalarTypeFromName(o.Result); !ok {
+					t.Fatalf("json builder %s has unhandled result code %s", o.Name, o.Result)
+				}
+				continue
+			}
 			_ = variadicFuncID(o.Name) // panics if the name has no kernel id
 			if _, ok := ScalarTypeFromName(o.Result); !ok {
 				t.Fatalf("variadic function %s has unhandled result code %s", o.Name, o.Result)

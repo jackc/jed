@@ -10051,7 +10051,8 @@ impl Database {
             | RExpr::RangeCtor { args, .. }
             | RExpr::RangeOp { args, .. }
             | RExpr::RangeSetOp { args, .. }
-            | RExpr::Variadic { args, .. } => {
+            | RExpr::Variadic { args, .. }
+            | RExpr::JsonBuild { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
                 }
@@ -11148,6 +11149,8 @@ enum ScalarFunc {
     JsonbPretty,
     /// to_jsonb(anyelement) → the JSON image of any value (the `value_to_node` kernel). STRICT.
     ToJsonb,
+    /// to_json(anyelement) → the JSON image as `json` (the `value_to_node` kernel, rendered compact).
+    ToJson,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -11291,6 +11294,15 @@ enum VariadicFunc {
     NumNulls,
     /// num_nonnulls(VARIADIC "any") → i32 — the mirror: the count of non-NULL arguments/elements.
     NumNonnulls,
+}
+
+/// Which json/jsonb builder an [`RExpr::JsonBuild`] node is (json-sql-functions.md §2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum JsonBuildKind {
+    /// json[b]_build_array — every argument is one array element (NULL → JSON null).
+    Array,
+    /// json[b]_build_object — alternating key/value arguments (odd count / NULL key → 22023).
+    Object,
 }
 
 /// One resolved subscript spec in an [`RExpr::Subscript`] (spec/design/array.md §6): a single
@@ -11650,6 +11662,16 @@ enum RExpr {
     /// is always i32.
     Variadic {
         func: VariadicFunc,
+        args: Vec<RExpr>,
+        array_form: bool,
+    },
+    /// A VARIADIC json/jsonb builder (json-sql-functions.md §2 — json[b]_build_array / _object).
+    /// Non-strict: a NULL argument is included as JSON null (array) or a value (object). `json`
+    /// selects the json (compact / PG builder-spacing) vs jsonb (canonical) render; `array_form`
+    /// records the VARIADIC-array call shape (the lone array operand is spread; a NULL array → NULL).
+    JsonBuild {
+        kind: JsonBuildKind,
+        json: bool,
         args: Vec<RExpr>,
         array_form: bool,
     },
@@ -13076,7 +13098,8 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::RangeCtor { args, .. }
         | RExpr::RangeOp { args, .. }
         | RExpr::RangeSetOp { args, .. }
-        | RExpr::Variadic { args, .. } => args.iter().all(rexpr_is_constant),
+        | RExpr::Variadic { args, .. }
+        | RExpr::JsonBuild { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
     }
@@ -15030,7 +15053,8 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::RangeCtor { args, .. }
         | RExpr::RangeOp { args, .. }
         | RExpr::RangeSetOp { args, .. }
-        | RExpr::Variadic { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
+        | RExpr::Variadic { args, .. }
+        | RExpr::JsonBuild { args, .. } => args.iter().any(|a| rexpr_references_outer(a, depth)),
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
             fields.iter().any(|f| rexpr_references_outer(f, depth))
         }
@@ -15166,7 +15190,8 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::RangeCtor { args, .. }
         | RExpr::RangeOp { args, .. }
         | RExpr::RangeSetOp { args, .. }
-        | RExpr::Variadic { args, .. } => {
+        | RExpr::Variadic { args, .. }
+        | RExpr::JsonBuild { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);
             }
@@ -15615,6 +15640,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "json_strip_nulls" => ScalarFunc::JsonStripNulls,
         "jsonb_pretty" => ScalarFunc::JsonbPretty,
         "to_jsonb" => ScalarFunc::ToJsonb,
+        "to_json" => ScalarFunc::ToJson,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -17448,7 +17474,6 @@ fn resolve_variadic_func(
     let desc = scalar_func_desc(name).expect("a variadic function is in the catalog");
     let k = desc.arity as usize; // declared parameter count (the last is variadic)
     let var_family = desc.arg_families[k - 1]; // the variadic element family (last slot)
-    let func = variadic_func_id(name);
 
     let mut rargs = Vec::with_capacity(args.len());
     if variadic {
@@ -17478,9 +17503,16 @@ fn resolve_variadic_func(
         }
     } else {
         // Spread form: at least `k` args (so a variadic function needs ≥1 variadic arg —
-        // num_nulls() is 42883). The fixed params match their concrete families; every argument
-        // from the variadic slot onward matches the variadic element family ("any" ⇒ all).
-        if args.len() < k {
+        // num_nulls() is 42883). The json builders are the exception: a ZERO-arg spread is valid
+        // (json_build_array() → [], json_build_object() → {}), so their floor is the fixed-param
+        // count (k-1 = 0). The fixed params match their concrete families; every argument from the
+        // variadic slot onward matches the variadic element family ("any" ⇒ all).
+        let min_args = if json_build_classify(name).is_some() {
+            k - 1
+        } else {
+            k
+        };
+        if args.len() < min_args {
             return Err(no_func_overload(name));
         }
         for (i, a) in args.iter().enumerate() {
@@ -17498,14 +17530,38 @@ fn resolve_variadic_func(
     }
 
     let result = scalar_result_type(desc.result, &[]);
+    // The json/jsonb builders share the spread/array-form validation above but their own eval node
+    // and a json/jsonb result; the count functions (num_nulls/num_nonnulls) keep RExpr::Variadic.
+    if let Some((kind, json)) = json_build_classify(name) {
+        return Ok((
+            RExpr::JsonBuild {
+                kind,
+                json,
+                args: rargs,
+                array_form: variadic,
+            },
+            resolved_type_of(result),
+        ));
+    }
     Ok((
         RExpr::Variadic {
-            func,
+            func: variadic_func_id(name),
             args: rargs,
             array_form: variadic,
         },
         resolved_type_of(result),
     ))
+}
+
+/// Classify a VARIADIC json/jsonb builder name → (kind, is-json). `None` for the count functions.
+fn json_build_classify(name: &str) -> Option<(JsonBuildKind, bool)> {
+    match name {
+        "jsonb_build_array" => Some((JsonBuildKind::Array, false)),
+        "json_build_array" => Some((JsonBuildKind::Array, true)),
+        "jsonb_build_object" => Some((JsonBuildKind::Object, false)),
+        "json_build_object" => Some((JsonBuildKind::Object, true)),
+        _ => None,
+    }
 }
 
 /// The 42803 raised for a non-aggregated column outside an aggregate with no GROUP BY.
@@ -20393,6 +20449,47 @@ fn value_to_node(v: &Value) -> Result<JsonNode> {
             ));
         }
         Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
+    })
+}
+
+/// One element's `json`-builder text image (json-sql-functions.md §2): a `json` value embeds VERBATIM,
+/// a `jsonb` value its canonical (spaced) render, everything else the compact `to_jsonb` image. This
+/// is how PG's `json_build_array`/`json_build_object` embed an argument's own json form.
+fn elem_json_text(v: &Value) -> Result<String> {
+    Ok(match v {
+        Value::Json(s) => s.clone(),
+        Value::Jsonb(n) => json::jsonb_out(n),
+        _ => json::json_compact_out(&value_to_node(v)?),
+    })
+}
+
+/// The text form of a `json[b]_build_object` KEY argument (1-based `pos` for the error message). PG
+/// coerces a key to text via the type's output: text as-is, integer/decimal/boolean rendered. A NULL
+/// key is `22023`; a non-scalar key type is a deferred `0A000` follow-on.
+fn object_key_text(v: &Value, pos: usize) -> Result<String> {
+    Ok(match v {
+        Value::Null => {
+            return Err(EngineError::new(
+                SqlState::InvalidParameterValue,
+                format!("argument {pos}: key must not be null"),
+            ));
+        }
+        Value::Text(s) => s.clone(),
+        Value::Int(n) => n.to_string(),
+        Value::Decimal(d) => d.render(),
+        Value::Bool(b) => {
+            if *b {
+                "true".to_string()
+            } else {
+                "false".to_string()
+            }
+        }
+        _ => {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "a json_build_object key of this type is not supported yet",
+            ));
+        }
     })
 }
 
@@ -25195,6 +25292,10 @@ impl RExpr {
                         Ok(Value::Text(json::pretty(&node)))
                     }
                     ScalarFunc::ToJsonb => Ok(Value::Jsonb(value_to_node(&vals[0])?)),
+                    // to_json → the value's `json` image: a jsonb input renders canonical-spaced, a
+                    // json input verbatim, everything else the compact to_jsonb render (PG's
+                    // datum_to_json). This is the same per-type rule the json builders embed.
+                    ScalarFunc::ToJson => Ok(Value::Json(elem_json_text(&vals[0])?)),
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -25273,6 +25374,76 @@ impl RExpr {
                     count_nulls(vals.iter(), want_nulls)
                 };
                 Ok(Value::Int(count as i64))
+            }
+            // A VARIADIC json/jsonb builder (json-sql-functions.md §2). Gather the argument values
+            // (the spread form directly; the VARIADIC-array form spreads the lone array — a NULL
+            // array → NULL), then build an array / object node.
+            RExpr::JsonBuild {
+                kind,
+                json,
+                args,
+                array_form,
+            } => {
+                m.charge(COSTS.operator_eval);
+                let vals: Vec<Value> = if *array_form {
+                    match args[0].eval(row, env, m)? {
+                        Value::Null => return Ok(Value::Null),
+                        Value::Array(a) => a.elements.clone(),
+                        _ => unreachable!("resolver restricts a VARIADIC operand to an array"),
+                    }
+                } else {
+                    let mut vs = Vec::with_capacity(args.len());
+                    for a in args {
+                        vs.push(a.eval(row, env, m)?);
+                    }
+                    vs
+                };
+                m.charge(COSTS.operator_eval * vals.len() as i64);
+                m.guard()?;
+                match kind {
+                    JsonBuildKind::Array => {
+                        if *json {
+                            let mut parts = Vec::with_capacity(vals.len());
+                            for v in &vals {
+                                parts.push(elem_json_text(v)?);
+                            }
+                            Ok(Value::Json(format!("[{}]", parts.join(", "))))
+                        } else {
+                            let mut nodes = Vec::with_capacity(vals.len());
+                            for v in &vals {
+                                nodes.push(value_to_node(v)?);
+                            }
+                            Ok(Value::Jsonb(JsonNode::Array(nodes)))
+                        }
+                    }
+                    JsonBuildKind::Object => {
+                        if vals.len() % 2 != 0 {
+                            return Err(EngineError::new(
+                                SqlState::InvalidParameterValue,
+                                "argument list must have even number of elements",
+                            ));
+                        }
+                        if *json {
+                            let mut parts = Vec::with_capacity(vals.len() / 2);
+                            for (i, pair) in vals.chunks_exact(2).enumerate() {
+                                let key = object_key_text(&pair[0], 2 * i + 1)?;
+                                parts.push(format!(
+                                    "{} : {}",
+                                    json::json_compact_out(&JsonNode::String(key)),
+                                    elem_json_text(&pair[1])?
+                                ));
+                            }
+                            Ok(Value::Json(format!("{{{}}}", parts.join(", "))))
+                        } else {
+                            let mut members = Vec::with_capacity(vals.len() / 2);
+                            for (i, pair) in vals.chunks_exact(2).enumerate() {
+                                let key = object_key_text(&pair[0], 2 * i + 1)?;
+                                members.push((key, value_to_node(&pair[1])?));
+                            }
+                            Ok(Value::Jsonb(json::make_object(members)))
+                        }
+                    }
+                }
             }
             // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
             // Push the current row onto the outer-row stack, run the inner plan against it, fold
@@ -25911,7 +26082,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::JsonbStripNulls
         | ScalarFunc::JsonStripNulls
         | ScalarFunc::JsonbPretty
-        | ScalarFunc::ToJsonb => {
+        | ScalarFunc::ToJsonb
+        | ScalarFunc::ToJson => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json fns are handled before eval_float_func"
             )
@@ -27150,9 +27322,13 @@ mod registry_tests {
                 continue;
             }
             if is_variadic_func_name(o.name) {
-                // A VARIADIC function (array-functions.md §12): its kernel id comes from
-                // `variadic_func_id` and its result is a concrete scalar id.
-                let _ = variadic_func_id(o.name);
+                // A VARIADIC function (array-functions.md §12): the count functions (num_nulls/
+                // num_nonnulls) reach their kernel via `variadic_func_id`; the json builders
+                // (json[b]_build_array/_object) reach theirs via `json_build_classify`. Either way
+                // the result is a concrete scalar id (i32 / json / jsonb).
+                if json_build_classify(o.name).is_none() {
+                    let _ = variadic_func_id(o.name);
+                }
                 assert!(
                     ScalarType::from_name(o.result).is_some(),
                     "variadic function {} has unhandled result code {}",

@@ -13368,6 +13368,13 @@ const (
 	// counting sargs' null-ness directly; true = the VARIADIC-array form, one sargs operand whose
 	// flattened elements are counted, a NULL whole-array → NULL). Result is always i32.
 	reVariadic
+	// reJsonBuild is a VARIADIC json/jsonb builder (json-sql-functions.md §2 — json[b]_build_array /
+	// _object). Non-strict: a NULL argument is included as JSON null (array) or a value (object).
+	// `jbKind` selects array vs object; `jbJson` selects the json (compact / PG builder-spacing) vs
+	// jsonb (canonical) render; `variadicArray` records the VARIADIC-array call shape (the lone array
+	// operand is spread; a NULL whole-array → NULL). Argument nodes reuse `sargs`. The result type
+	// (json/jsonb) is fixed at resolve from the catalog.
+	reJsonBuild
 	// reOuterColumn is a correlated column reference (spec/design/grammar.md §26): the column
 	// `index` of the enclosing row `level` hops out (1 = immediate parent). A leaf.
 	reOuterColumn
@@ -13546,6 +13553,9 @@ const (
 	sfJsonbPretty
 	// to_jsonb(anyelement) → the JSON image of any value (the valueToNode kernel). STRICT.
 	sfToJsonb
+	// to_json(anyelement) → the JSON image as `json` (the valueToNode kernel rendered per elemJsonText:
+	// a jsonb input canonical-spaced, a json input verbatim, everything else compact). STRICT.
+	sfToJson
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -13636,6 +13646,15 @@ const (
 	vfNumNonnulls                     // num_nonnulls(VARIADIC "any") → i32 — count of non-NULL args/elements
 )
 
+// jsonBuildKind selects which VARIADIC json/jsonb builder an reJsonBuild node is
+// (json-sql-functions.md §2). The `json` flag (on the node) selects the json vs jsonb render.
+type jsonBuildKind int
+
+const (
+	jbArray  jsonBuildKind = iota // json[b]_build_array — every argument is one array element (NULL → JSON null)
+	jbObject                      // json[b]_build_object — alternating key/value args (odd count / NULL key → 22023)
+)
+
 // rExpr is a resolved expression over fixed column indices, ready to evaluate against a
 // row. Arithmetic/neg nodes carry their (promotion-tower) result type in `result` so the
 // computed value can be range-checked against it.
@@ -13711,6 +13730,11 @@ type rExpr struct {
 	// `variadicArray` true ⇒ the VARIADIC-array form (one array operand), false ⇒ the spread form.
 	vfunc         variadicFunc
 	variadicArray bool
+	// reJsonBuild: which json/jsonb builder + render. `jbKind` selects array vs object; `jbJson` true ⇒
+	// the `json` (compact / builder-spacing) render, false ⇒ the `jsonb` (canonical) render. Argument
+	// nodes reuse `sargs`; `variadicArray` (above) records the VARIADIC-array call shape.
+	jbKind jsonBuildKind
+	jbJson bool
 
 	// reArray: `nested` marks a multidim-stacking constructor (its element nodes evaluate to
 	// arrays, stacked into one higher dimension — spec/design/array.md §4).
@@ -16283,6 +16307,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfJsonbPretty
 	case "to_jsonb":
 		return sfToJsonb
+	case "to_json":
+		return sfToJson
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -17518,6 +17544,50 @@ func valueToNode(v Value) (JsonNode, error) {
 	}
 }
 
+// elemJsonText is one element's `json`-builder text image (json-sql-functions.md §2): a `json` value
+// embeds VERBATIM, a `jsonb` value its canonical (spaced) render, everything else the compact
+// to_jsonb image. This is how PG's json_build_array / json_build_object (and to_json) embed an
+// argument's own json form.
+func elemJsonText(v Value) (string, error) {
+	switch v.Kind {
+	case ValJson:
+		return v.Str, nil
+	case ValJsonb:
+		return jsonbOut(v.Json), nil
+	default:
+		node, err := valueToNode(v)
+		if err != nil {
+			return "", err
+		}
+		return jsonCompactOut(&node), nil
+	}
+}
+
+// objectKeyText is the text form of a json[b]_build_object KEY argument (1-based `pos` for the error
+// message). PG coerces a key to text via the type's output: text as-is, integer/decimal/boolean
+// rendered. A NULL key is 22023; a non-scalar key type is a deferred 0A000 follow-on.
+func objectKeyText(v Value, pos int) (string, error) {
+	switch v.Kind {
+	case ValNull:
+		return "", NewError(InvalidParameterValue,
+			"argument "+strconv.Itoa(pos)+": key must not be null")
+	case ValText:
+		return v.Str, nil
+	case ValInt:
+		return strconv.FormatInt(v.Int, 10), nil
+	case ValDecimal:
+		return v.Dec.Render(), nil
+	case ValBool:
+		if v.Bool {
+			return "true", nil
+		}
+		return "false", nil
+	default:
+		return "", NewError(FeatureNotSupported,
+			"a json_build_object key of this type is not supported yet")
+	}
+}
+
 // resolveJSONbContains resolves a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1,
 // J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
 // has no @> operator class (42883). `<@` resolves to `reJsonContains` with the operands swapped
@@ -18202,7 +18272,6 @@ func resolveVariadicFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTy
 	desc := scalarFuncDesc(name)
 	k := desc.Arity                    // declared parameter count (the last is variadic)
 	varFamily := desc.ArgFamilies[k-1] // the variadic element family (last slot)
-	fn := variadicFuncID(name)
 	rargs := make([]*rExpr, 0, len(fc.Args))
 
 	if fc.Variadic {
@@ -18233,9 +18302,15 @@ func resolveVariadicFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTy
 		}
 	} else {
 		// Spread form: at least k args (so a variadic function needs ≥1 variadic arg — num_nulls()
-		// is 42883). The fixed params match their concrete families; every argument from the
+		// is 42883). The json builders are the exception: a ZERO-arg spread is valid
+		// (json_build_array() → [], json_build_object() → {}), so their floor is the fixed-param
+		// count (k-1 = 0). The fixed params match their concrete families; every argument from the
 		// variadic slot onward matches the variadic element family ("any" ⇒ all).
-		if len(fc.Args) < k {
+		minArgs := k
+		if _, _, ok := jsonBuildClassify(name); ok {
+			minArgs = k - 1
+		}
+		if len(fc.Args) < minArgs {
 			return nil, resolvedType{}, noFuncOverload(name)
 		}
 		for i, a := range fc.Args {
@@ -18255,7 +18330,29 @@ func resolveVariadicFunc(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTy
 	}
 
 	result := scalarResultType(desc.Result, nil)
-	return &rExpr{kind: reVariadic, vfunc: fn, sargs: rargs, variadicArray: fc.Variadic}, resolvedTypeOf(result), nil
+	// The json/jsonb builders share the spread/array-form validation above but their own eval node
+	// and a json/jsonb result; the count functions (num_nulls/num_nonnulls) keep reVariadic.
+	if kind, isJSON, ok := jsonBuildClassify(name); ok {
+		return &rExpr{kind: reJsonBuild, jbKind: kind, jbJson: isJSON, sargs: rargs, variadicArray: fc.Variadic}, resolvedTypeOf(result), nil
+	}
+	return &rExpr{kind: reVariadic, vfunc: variadicFuncID(name), sargs: rargs, variadicArray: fc.Variadic}, resolvedTypeOf(result), nil
+}
+
+// jsonBuildClassify classifies a VARIADIC json/jsonb builder name → (kind, is-json, ok). ok is false
+// for the count functions (num_nulls/num_nonnulls), which keep the reVariadic node.
+func jsonBuildClassify(name string) (jsonBuildKind, bool, bool) {
+	switch name {
+	case "jsonb_build_array":
+		return jbArray, false, true
+	case "json_build_array":
+		return jbArray, true, true
+	case "jsonb_build_object":
+		return jbObject, false, true
+	case "json_build_object":
+		return jbObject, true, true
+	default:
+		return 0, false, false
+	}
 }
 
 // groupingErrorColumn is the 42803 for a non-aggregated column not in GROUP BY.
@@ -22963,6 +23060,16 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return JsonbValue(node), nil
+		case sfToJson:
+			// to_json(anyelement) → the value's `json` image (json-sql-functions.md §2): a jsonb input
+			// renders canonical-spaced, a json input verbatim, everything else the compact to_jsonb
+			// render. The same per-type rule the json builders embed (elemJsonText). STRICT: the
+			// NULL-input case is handled by the blanket propagation above.
+			s, err := elemJsonText(vals[0])
+			if err != nil {
+				return Value{}, err
+			}
+			return JsonValue(s), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).
@@ -23063,6 +23170,93 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			vals[i] = v
 		}
 		return IntValue(int64(countNulls(vals, wantNulls))), nil
+	case reJsonBuild:
+		// A VARIADIC json/jsonb builder (json-sql-functions.md §2). Gather the argument values (the
+		// spread form directly; the VARIADIC-array form spreads the lone array — a NULL array → NULL),
+		// then build an array / object node. Non-strict — a NULL argument is a JSON null (array) or a
+		// value (object), so there is no blanket NULL short-circuit.
+		m.Charge(Costs.OperatorEval)
+		var vals []Value
+		if e.variadicArray {
+			v, err := e.sargs[0].eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			if v.IsNull() {
+				return NullValue(), nil
+			}
+			vals = make([]Value, len(v.Array.Elements))
+			copy(vals, v.Array.Elements)
+		} else {
+			vals = make([]Value, len(e.sargs))
+			for i, a := range e.sargs {
+				v, err := a.eval(row, env, m)
+				if err != nil {
+					return Value{}, err
+				}
+				vals[i] = v
+			}
+		}
+		m.Charge(Costs.OperatorEval * int64(len(vals)))
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		switch e.jbKind {
+		case jbArray:
+			if e.jbJson {
+				parts := make([]string, len(vals))
+				for i := range vals {
+					s, err := elemJsonText(vals[i])
+					if err != nil {
+						return Value{}, err
+					}
+					parts[i] = s
+				}
+				return JsonValue("[" + strings.Join(parts, ", ") + "]"), nil
+			}
+			nodes := make([]JsonNode, len(vals))
+			for i := range vals {
+				node, err := valueToNode(vals[i])
+				if err != nil {
+					return Value{}, err
+				}
+				nodes[i] = node
+			}
+			return JsonbValue(JsonNode{Kind: JArray, Arr: nodes}), nil
+		default: // jbObject
+			if len(vals)%2 != 0 {
+				return Value{}, NewError(InvalidParameterValue,
+					"argument list must have even number of elements")
+			}
+			if e.jbJson {
+				parts := make([]string, 0, len(vals)/2)
+				for i := 0; i < len(vals); i += 2 {
+					key, err := objectKeyText(vals[i], i+1)
+					if err != nil {
+						return Value{}, err
+					}
+					valText, err := elemJsonText(vals[i+1])
+					if err != nil {
+						return Value{}, err
+					}
+					parts = append(parts, jsonCompactOut(&JsonNode{Kind: JString, S: key})+" : "+valText)
+				}
+				return JsonValue("{" + strings.Join(parts, ", ") + "}"), nil
+			}
+			members := make([]JsonMember, 0, len(vals)/2)
+			for i := 0; i < len(vals); i += 2 {
+				key, err := objectKeyText(vals[i], i+1)
+				if err != nil {
+					return Value{}, err
+				}
+				node, err := valueToNode(vals[i+1])
+				if err != nil {
+					return Value{}, err
+				}
+				members = append(members, JsonMember{Key: key, Val: node})
+			}
+			return JsonbValue(makeObject(members)), nil
+		}
 	case reSubquery:
 		// A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row.
 		// Push the current row onto the outer-row stack, run the inner plan, fold its accrued

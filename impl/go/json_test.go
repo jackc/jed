@@ -268,6 +268,38 @@ func TestJsonAggDeferredElementSourceIs0A000(t *testing.T) {
 	}
 }
 
+// TestJsonBuildersDeferredElementSourceIs0A000: the json/jsonb construction builders (to_json,
+// json[b]_build_array, json[b]_build_object) reuse the to_jsonb element kernel (valueToNode /
+// elemJsonText), so a deferred element source (float, like to_jsonb) propagates the 0A000 deferral
+// (json-sql-functions.md §2). The supported element types are oracle-clean in
+// suites/json/json_builders.test. Mirrors impl/rust/tests/json.rs.
+func TestJsonBuildersDeferredElementSourceIs0A000(t *testing.T) {
+	db := NewDatabase()
+	if got := errJSON(t, db, "SELECT to_json(1.5::f64)"); got != "0A000" {
+		t.Errorf("to_json(float): got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT jsonb_build_array(1.5::f64)"); got != "0A000" {
+		t.Errorf("jsonb_build_array(float): got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT json_build_array(1.5::f64)"); got != "0A000" {
+		t.Errorf("json_build_array(float): got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT jsonb_build_object('k', 1.5::f64)"); got != "0A000" {
+		t.Errorf("jsonb_build_object value float: got %s, want 0A000", got)
+	}
+}
+
+// TestJsonBuildObjectNonScalarKeyIs0A000: a json[b]_build_object KEY of a non-scalar type (a date,
+// which objectKeyText does not coerce) is a deferred 0A000 follow-on (json-sql-functions.md §2). A
+// NULL key (22023) and the supported key coercions (text/int/decimal/bool) live in the PG-clean
+// suites/json/json_builders.test. Mirrors impl/rust/tests/json.rs.
+func TestJsonBuildObjectNonScalarKeyIs0A000(t *testing.T) {
+	db := NewDatabase()
+	if got := errJSON(t, db, "SELECT jsonb_build_object('2020-01-01'::date, 1)"); got != "0A000" {
+		t.Errorf("jsonb_build_object(date key): got %s, want 0A000", got)
+	}
+}
+
 // TestJsonAggCanonicalizesJsonElements: json_agg over a `json` element CANONICALIZES it (the element
 // conversion runs through the jsonb node tree via valueToNode), dropping the input whitespace — a
 // documented divergence from PostgreSQL, which preserves the verbatim sub-text (`[{ "a" : 1 }]`).

@@ -253,6 +253,7 @@ import {
   jsonbValue,
 } from "./value.ts";
 import {
+  type JsonMember,
   type JsonNode,
   arrayLength as jsonArrayLength,
   concat as jsonConcatKernel,
@@ -269,6 +270,7 @@ import {
   jsonNodeCmp,
   jsonbIn,
   jsonbOut,
+  makeObject as jsonMakeObject,
   nodeToText,
   parsePreservingJson,
   pretty as jsonPretty,
@@ -8398,6 +8400,7 @@ export class Database {
       case "rangeOp":
       case "rangeSetOp":
       case "variadic":
+      case "jsonBuild":
         e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
         return e;
       case "row":
@@ -8800,6 +8803,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "rangeOp":
     case "rangeSetOp":
     case "variadic":
+    case "jsonBuild":
       return e.args.every(rexprIsConstant);
     case "inValues":
       return rexprIsConstant(e.lhs);
@@ -9780,6 +9784,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "rangeOp":
     case "rangeSetOp":
     case "variadic":
+    case "jsonBuild":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
       return e.fields.some((f) => rexprReferencesOuter(f, depth));
@@ -9900,6 +9905,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "rangeOp":
     case "rangeSetOp":
     case "variadic":
+    case "jsonBuild":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
     case "row":
@@ -10576,6 +10582,18 @@ type RExpr =
       args: RExpr[];
       arrayForm: boolean;
     }
+  // A VARIADIC json/jsonb builder (json-sql-functions.md §2 — json[b]_build_array / _object).
+  // Non-strict: a NULL argument is included as JSON null (array) or a value (object). `json` selects
+  // the json (compact / PG builder-spacing) vs jsonb (canonical) render; `arrayForm` records the
+  // VARIADIC-array call shape (the lone array operand is spread; a NULL array → SQL NULL). The result
+  // type (json/jsonb) lives in the surrounding ResolvedType (carried out of resolve), not on the node.
+  | {
+      kind: "jsonBuild";
+      buildKind: JsonBuildKind;
+      json: boolean;
+      args: RExpr[];
+      arrayForm: boolean;
+    }
   // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
   // row `level` hops out (1 = immediate parent). A leaf — reads from the outer-row environment.
   | { kind: "outerColumn"; level: number; index: number }
@@ -10689,7 +10707,10 @@ type ScalarFuncName =
   // jsonb_pretty → an indented multi-line render.
   | "jsonb_pretty"
   // to_jsonb(anyelement) → the JSON image of any value (the valueToNode kernel). STRICT.
-  | "to_jsonb";
+  | "to_jsonb"
+  // to_json(anyelement) → the value's JSON image as `json` (the same kernel, per-type rendered:
+  // a jsonb input spaced-canonical, a json input verbatim, else compact). STRICT.
+  | "to_json";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -10758,6 +10779,11 @@ type RangeSetOpName =
 // VariadicFuncName is the internal identity of a VARIADIC counting-function node
 // (spec/design/array-functions.md §12). Both return i32; the call form lives on the node.
 type VariadicFuncName = "num_nulls" | "num_nonnulls";
+
+// JsonBuildKind selects which json/jsonb builder a "jsonBuild" RExpr node is (json-sql-functions.md
+// §2): "array" — json[b]_build_array, every argument is one array element (NULL → JSON null);
+// "object" — json[b]_build_object, alternating key/value arguments (odd count / NULL key → 22023).
+type JsonBuildKind = "array" | "object";
 
 // ============================================================================
 // Query plans — the resolved, owned form of a query, executable repeatedly (a correlated
@@ -13124,10 +13150,13 @@ function resolveVariadicFunc(
   params: ParamTypes,
 ): { node: RExpr; type: ResolvedType } {
   if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
-  const name = e.name.toLowerCase() as VariadicFuncName;
+  const name = e.name.toLowerCase();
   const desc = scalarFuncDesc(name)!;
   const k = desc.arity; // declared parameter count (the last is variadic)
   const varFamily = desc.argFamilies[k - 1]!; // the variadic element family (last slot)
+  // The json/jsonb builders share the spread/array-form validation below but emit their own eval node
+  // and a json/jsonb result; the count functions (num_nulls/num_nonnulls) keep RExpr "variadic".
+  const jsonBuild = jsonBuildClassify(name);
   const rargs: RExpr[] = [];
 
   if (e.variadic) {
@@ -13151,10 +13180,13 @@ function resolveVariadicFunc(
       rargs.push(r.node);
     }
   } else {
-    // Spread form: at least k args (so a variadic function needs ≥1 variadic arg — num_nulls() is
-    // 42883). The fixed params match their concrete families; every argument from the variadic slot
-    // onward matches the variadic element family ("any" ⇒ all).
-    if (e.args.length < k) throw noFuncOverload(name);
+    // Spread form: at least `k` args (so a variadic function needs ≥1 variadic arg — num_nulls() is
+    // 42883). The json builders are the exception: a ZERO-arg spread is valid (json_build_array() →
+    // [], json_build_object() → {}), so their floor is the fixed-param count (k-1 = 0). The fixed
+    // params match their concrete families; every argument from the variadic slot onward matches the
+    // variadic element family ("any" ⇒ all).
+    const minArgs = jsonBuild !== null ? k - 1 : k;
+    if (e.args.length < minArgs) throw noFuncOverload(name);
     for (let i = 0; i < e.args.length; i++) {
       const r = resolve(scope, e.args[i]!, null, ag, params);
       const slot = i < k - 1 ? desc.argFamilies[i]! : varFamily;
@@ -13164,10 +13196,39 @@ function resolveVariadicFunc(
   }
 
   const result = scalarResultType(desc.result, []);
+  if (jsonBuild !== null) {
+    return {
+      node: {
+        kind: "jsonBuild",
+        buildKind: jsonBuild.buildKind,
+        json: jsonBuild.json,
+        args: rargs,
+        arrayForm: e.variadic,
+      },
+      type: resolvedTypeOf(result),
+    };
+  }
   return {
-    node: { kind: "variadic", func: name, args: rargs, arrayForm: e.variadic },
+    node: { kind: "variadic", func: name as VariadicFuncName, args: rargs, arrayForm: e.variadic },
     type: resolvedTypeOf(result),
   };
+}
+
+// jsonBuildClassify classifies a VARIADIC json/jsonb builder name → { buildKind, json }, or null for
+// the count functions (num_nulls/num_nonnulls keep RExpr "variadic"). json-sql-functions.md §2.
+function jsonBuildClassify(name: string): { buildKind: JsonBuildKind; json: boolean } | null {
+  switch (name) {
+    case "jsonb_build_array":
+      return { buildKind: "array", json: false };
+    case "json_build_array":
+      return { buildKind: "array", json: true };
+    case "jsonb_build_object":
+      return { buildKind: "object", json: false };
+    case "json_build_object":
+      return { buildKind: "object", json: true };
+    default:
+      return null;
+  }
 }
 
 // === Polymorphic array-function resolution (spec/design/array-functions.md §2) ======
@@ -17050,6 +17111,40 @@ function valueToNode(v: Value): JsonNode {
   }
 }
 
+// elemJsonText is one element's `json`-builder text image (json-sql-functions.md §2): a `json` value
+// embeds VERBATIM, a `jsonb` value its canonical (spaced) render, everything else the compact
+// to_jsonb image (valueToNode → jsonCompactOut). This is how PG's json_build_array/json_build_object
+// (and to_json) embed an argument's own json form.
+function elemJsonText(v: Value): string {
+  if (v.kind === "json") return v.text;
+  if (v.kind === "jsonb") return jsonbOut(v.node);
+  return jsonCompactOut(valueToNode(v));
+}
+
+// objectKeyText is the text form of a `json[b]_build_object` KEY argument (1-based `pos` for the
+// error message). PG coerces a key to text via the type's output: text as-is, integer/decimal/boolean
+// rendered. A NULL key is `22023`; a non-scalar key type is a deferred `0A000` follow-on. jed integers
+// are bigint, rendered via toString (never a float path — CLAUDE.md §2).
+function objectKeyText(v: Value, pos: number): string {
+  switch (v.kind) {
+    case "null":
+      throw engineError("invalid_parameter_value", `argument ${pos}: key must not be null`);
+    case "text":
+      return v.text;
+    case "int":
+      return v.int.toString();
+    case "decimal":
+      return v.dec.render();
+    case "bool":
+      return v.value ? "true" : "false";
+    default:
+      throw engineError(
+        "feature_not_supported",
+        "a json_build_object key of this type is not supported yet",
+      );
+  }
+}
+
 // resolveJsonbContains resolves a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1,
 // J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
 // has no @> operator class (42883). `<@` resolves to a "jsonContains" node with the operands swapped
@@ -20521,6 +20616,12 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // the NULL-input case is handled by the blanket propagation above.
         return jsonbValue(valueToNode(vals[0]!));
       }
+      if (e.func === "to_json") {
+        // to_json(anyelement) → the value's `json` image: a jsonb input renders canonical-spaced, a
+        // json input verbatim, everything else the compact to_jsonb render (PG's datum_to_json) —
+        // the same per-type rule the json builders embed. STRICT (NULL handled above).
+        return jsonValue(elemJsonText(vals[0]!));
+      }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the
       // catalog, only abs is operand-typed (result "promoted"); every other float func returns
@@ -20613,6 +20714,63 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       const vals: Value[] = [];
       for (const a of e.args) vals.push(evalExpr(a, row, env, m));
       return intValue(BigInt(countNulls(vals, wantNulls)));
+    }
+    case "jsonBuild": {
+      // A VARIADIC json/jsonb builder (json-sql-functions.md §2). Gather the argument values (the
+      // spread form directly; the VARIADIC-array form spreads the lone array — a NULL whole-array →
+      // SQL NULL), then build an array / object node. Non-strict — a NULL argument is JSON null
+      // (array) or a value (object), so no blanket NULL short-circuit.
+      m.charge(COSTS.operatorEval);
+      let vals: Value[];
+      if (e.arrayForm) {
+        const v = evalExpr(e.args[0]!, row, env, m);
+        if (v.kind === "null") return nullValue();
+        if (v.kind !== "array")
+          throw new Error("resolver restricts a VARIADIC operand to an array");
+        vals = v.elements;
+      } else {
+        vals = [];
+        for (const a of e.args) vals.push(evalExpr(a, row, env, m));
+      }
+      m.charge(COSTS.operatorEval * BigInt(vals.length));
+      m.guard();
+      if (e.buildKind === "array") {
+        if (e.json) {
+          // json_build_array → a `json` value: each element's own json text image (a json arg
+          // verbatim, a jsonb arg spaced, else compact), joined `, ` inside `[...]`.
+          return jsonValue(`[${vals.map(elemJsonText).join(", ")}]`);
+        }
+        // jsonb_build_array → a jsonb value: each argument's valueToNode image, canonical render.
+        return jsonbValue({ kind: "array", elements: vals.map(valueToNode) });
+      }
+      // object
+      if (vals.length % 2 !== 0) {
+        throw engineError(
+          "invalid_parameter_value",
+          "argument list must have even number of elements",
+        );
+      }
+      if (e.json) {
+        // json_build_object → a `json` value keeping argument order + duplicate keys: the key as a
+        // JSON string, `" : "` (space-colon-space) before the value's element json text, members
+        // joined `, ` inside `{...}`.
+        const parts: string[] = [];
+        for (let i = 0; i < vals.length; i += 2) {
+          const key = objectKeyText(vals[i]!, i + 1);
+          parts.push(
+            `${jsonCompactOut({ kind: "string", value: key })} : ${elemJsonText(vals[i + 1]!)}`,
+          );
+        }
+        return jsonValue(`{${parts.join(", ")}}`);
+      }
+      // jsonb_build_object → a jsonb object: (key, valueToNode) members, last-wins dedup + canonical
+      // key sort via makeObject.
+      const members: JsonMember[] = [];
+      for (let i = 0; i < vals.length; i += 2) {
+        const key = objectKeyText(vals[i]!, i + 1);
+        members.push({ key, value: valueToNode(vals[i + 1]!) });
+      }
+      return jsonbValue(jsonMakeObject(members));
     }
     case "subquery": {
       // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row. Push

@@ -367,14 +367,28 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           exact, text/bool, json/jsonb canonicalize, 1-D array recursive incl. NULL→json null); STRICT;
           `value_to_node` kernel (reused by B4). Float / composite / datetime / uuid / bytea / interval /
           multidim-array sources deferred `0A000`. All 3 cores, cap `func.to_jsonb`, oracle-clean.
-          _follow-on:_ `to_json` / `json[b]_build_array`/`_object` / `json[b]_object` / `jsonb_set`/`_insert` /
-          `row_to_json` / `array_to_json` (cap `func.json_builders`).
+    - [x] **B1 builders — construction subset** — ✅ `to_json(anyelement)` (the to_jsonb image as
+          `json`: jsonb input → canonical-spaced, json input → verbatim, else compact) + `json[b]_build_array`
+          / `json[b]_build_object` (VARIADIC "any"): zero-arg `[]`/`{}`, VARIADIC-array spread (NULL array →
+          NULL), non-strict (NULL element → JSON null), build_object odd-count / NULL-key `22023`, key coerced
+          to text (text/int/decimal/bool; non-scalar key `0A000`). jsonb canonicalizes (dedup + key sort);
+          json keeps argument order + dup keys and PG's `", "`/`" : "` builder spacing. New `RExpr::JsonBuild`
+          over the variadic facility + `elem_json_text`/`object_key_text` helpers. All 3 cores, cap
+          `func.json_builders`, oracle-clean. _follow-on:_ `array_to_json` (anyarray path) + the `pretty` arg /
+          `json[b]_object` (text-array forms) / `jsonb_set`/`_insert`/`_set_lax` / `row_to_json` (composite).
     - [x] **B2 (jsonb subset)** — ✅ `jsonb_array_elements` / `jsonb_array_elements_text` /
           `jsonb_object_keys` (canonical order) / `json_object_keys` (input order, dups); FROM-clause
           SRFs, implicitly lateral; non-array/non-object `22023`; NULL → 0 rows. All 3 cores, cap
           `func.json_srf`, oracle-clean. _follow-on:_ `json_array_elements[_text]` (verbatim sub-text,
-          deferred `0A000` like the json accessors). B3 (two-col SRFs `json[b]_each`) needs C0; B4
-          (aggregates) is open.
+          deferred `0A000` like the json accessors). B3 (two-col SRFs `json[b]_each`) needs C0.
+    - [x] **B4 (array-aggregate subset)** — ✅ `jsonb_agg` / `json_agg` / `jsonb_agg_strict` /
+          `json_agg_strict`: aggregate a group into a JSON array (scan/GROUP-BY order); both render the
+          spaced canonical form (json variant typed `json`); `_strict` skips NULL inputs (kept as JSON
+          null otherwise). Zero-row group → SQL NULL, but an all-strict-skipped non-empty group → `[]`
+          (an Acc `seen` flag distinguishes them). Reuses the `value_to_node` (to_jsonb) element kernel
+          (same deferred `0A000` sources); a `json` element canonicalizes (per-core divergence test).
+          All 3 cores, cap `func.json_agg`, oracle-clean. _follow-on:_ in-aggregate `ORDER BY`, and the
+          two-operand `json[b]_object_agg` / `_unique` (dup-key `22030`/`22037`).
   - [ ] **T1** — `JSON_TABLE` (default plan: nested-path LEFT-OUTER/UNION expansion); explicit `PLAN`
         → `0A000`. The highest-risk slice. → json-table.md §3
   - [ ] _follow-ons (deferred `0A000`):_ the string-**dictionary builder** (opens the json.md §3 door);

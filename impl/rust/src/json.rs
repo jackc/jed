@@ -489,6 +489,12 @@ fn canonicalize_object(members: Vec<(String, JsonNode)>) -> Vec<(String, JsonNod
     out
 }
 
+/// Build a canonical `jsonb` object node from (key, value) members — last-wins dedup then the
+/// canonical key sort (json.md §2.3). The constructor for `jsonb_build_object` / `jsonb_object`.
+pub fn make_object(members: Vec<(String, JsonNode)>) -> JsonNode {
+    JsonNode::Object(canonicalize_object(members))
+}
+
 // ---------------------------------------------------------------------------------------------
 // Output (`jsonb_out` — the canonical PG render). `json_out` is the stored verbatim text.
 // ---------------------------------------------------------------------------------------------
