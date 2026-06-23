@@ -13072,9 +13072,26 @@ struct WindowSpec {
     partition: Vec<usize>,
     order: Vec<crate::spill::SortKey>,
     /// Resolved function arguments (empty for the no-argument ranking functions; `ntile`'s bucket
-    /// count is one integer argument, evaluated once per partition). Future offset/value functions
-    /// (lag/lead/nth_value, S2+) carry their value/offset/default here.
+    /// count; lag/lead's value/offset/default; the aggregate operand; first/last/nth_value's value
+    /// + nth_value's position).
     args: Vec<RExpr>,
+    /// The resolved explicit frame (S4, ROWS mode); `None` is the default frame (RANGE UNBOUNDED
+    /// PRECEDING TO CURRENT ROW with an ORDER BY, the whole partition without — window.md §6).
+    frame: Option<ResolvedFrame>,
+}
+
+/// A resolved window frame (spec/design/window.md §6). S4: ROWS mode, integer-constant offsets.
+struct ResolvedFrame {
+    start: ResolvedBound,
+    end: ResolvedBound,
+}
+
+enum ResolvedBound {
+    UnboundedPreceding,
+    Preceding(i64),
+    CurrentRow,
+    Following(i64),
+    UnboundedFollowing,
 }
 
 /// The runtime plan for one window function (spec/design/window.md §4). S0: `row_number` only;
@@ -13099,9 +13116,16 @@ enum WindowPlan {
     Lag,
     Lead,
     /// An aggregate used as a window function (S3): `sum/count/min/max/avg(...) OVER (...)`, folded
-    /// over the row's default frame (running with a window ORDER BY, whole-partition without).
-    /// Reuses the aggregate `Acc` kernels; the operand (if any) is `args[0]`.
+    /// over the row's default frame (running with a window ORDER BY, whole-partition without) or an
+    /// explicit frame (S4). Reuses the aggregate `Acc` kernels; the operand (if any) is `args[0]`.
     Agg(AggPlan),
+    /// `FIRST_VALUE(v)` / `LAST_VALUE(v)` — the value of the frame's first / last row (S4). `args[0]`
+    /// is the value expression; frame-sensitive.
+    FirstValue,
+    LastValue,
+    /// `NTH_VALUE(v, n)` — the value of the frame's n-th row, NULL if the frame has < n rows (S4).
+    /// `args[0]` is the value, `args[1]` the position; frame-sensitive.
+    NthValue,
 }
 
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
@@ -15114,15 +15138,47 @@ fn resolve_window_call(
             (plan, result)
         };
         (WindowPlan::Agg(aggplan), result)
+    } else if lname == "first_value" || lname == "last_value" || lname == "nth_value" {
+        // Frame-sensitive value pickers (S4, window.md §4). first/last_value take one value
+        // expression (→ result type); nth_value takes the value + an integer position.
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        let want = if lname == "nth_value" { 2 } else { 1 };
+        if args.len() != want {
+            return Err(EngineError::new(
+                SqlState::UndefinedFunction,
+                format!("{lname} takes {want} argument(s)"),
+            ));
+        }
+        let mut sub = AggCtx::Forbidden;
+        let (vnode, vty) = resolve(scope, &args[0], None, &mut sub, params)?;
+        wargs.push(vnode);
+        let plan = if lname == "first_value" {
+            WindowPlan::FirstValue
+        } else if lname == "last_value" {
+            WindowPlan::LastValue
+        } else {
+            let (nnode, nty) = resolve(scope, &args[1], None, &mut sub, params)?;
+            if !matches!(nty, ResolvedType::Int(_) | ResolvedType::Null) {
+                return Err(type_error("position of nth_value must be integer"));
+            }
+            wargs.push(nnode);
+            WindowPlan::NthValue
+        };
+        (plan, vty)
     } else {
         return Err(EngineError::new(
             SqlState::UndefinedFunction,
             format!("{lname} is not a window function"),
         ));
     };
-    // Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys) — all
-    // against the input scope, never recursing into `agg`. Done before borrowing `specs`.
-    let (partition, order) = resolve_window_def(scope, wd, params)?;
+    // Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys,
+    // explicit frame) — all against the input scope, never recursing into `agg`. Before `specs`.
+    let (partition, order, frame) = resolve_window_def(scope, wd, params)?;
     // A window function is allowed only in a window query's projection. In WHERE / a JOIN ON /
     // HAVING / an aggregate query the context is Forbidden or Collect → 42P20 (window.md §7).
     let (base, specs) = match agg {
@@ -15140,6 +15196,7 @@ fn resolve_window_call(
         partition,
         order,
         args: wargs,
+        frame,
     });
     Ok((RExpr::Column(slot), result))
 }
@@ -15152,7 +15209,11 @@ fn resolve_window_def(
     scope: &Scope,
     wd: &WindowDef,
     _params: &mut ParamTypes,
-) -> Result<(Vec<usize>, Vec<crate::spill::SortKey>)> {
+) -> Result<(
+    Vec<usize>,
+    Vec<crate::spill::SortKey>,
+    Option<ResolvedFrame>,
+)> {
     let mut partition = Vec::with_capacity(wd.partition.len());
     for key in &wd.partition {
         let r = match key {
@@ -15217,7 +15278,51 @@ fn resolve_window_def(
         }
         order.push((idx, key.descending, key.nulls_first, coll));
     }
-    Ok((partition, order))
+    // The explicit frame (S4): ROWS mode only, with non-negative integer-literal offsets. Explicit
+    // RANGE/GROUPS and value/expression offsets are deferred 0A000 (window.md §6/§11) — the default
+    // RANGE frame stays implicit (no clause).
+    let frame = match &wd.frame {
+        None => None,
+        Some(f) => {
+            if f.mode != crate::ast::FrameMode::Rows {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "only ROWS-mode window frames are supported yet",
+                ));
+            }
+            Some(ResolvedFrame {
+                start: resolve_frame_bound(&f.start)?,
+                end: resolve_frame_bound(&f.end)?,
+            })
+        }
+    };
+    Ok((partition, order, frame))
+}
+
+/// Resolve one frame bound (S4): the offset of `n PRECEDING`/`n FOLLOWING` must be a non-negative
+/// integer literal (22013 if negative; a non-literal/non-integer offset is 0A000). window.md §6.
+fn resolve_frame_bound(b: &crate::ast::FrameBound) -> Result<ResolvedBound> {
+    use crate::ast::FrameBound;
+    let offset = |e: &Expr| -> Result<i64> {
+        match e {
+            Expr::Literal(Literal::Int(n)) if *n >= 0 => Ok(*n),
+            Expr::Literal(Literal::Int(_)) => Err(EngineError::new(
+                SqlState::InvalidPrecedingOrFollowingSize,
+                "frame starting or ending offset must not be negative",
+            )),
+            _ => Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "frame offset must be a non-negative integer literal",
+            )),
+        }
+    };
+    Ok(match b {
+        FrameBound::UnboundedPreceding => ResolvedBound::UnboundedPreceding,
+        FrameBound::CurrentRow => ResolvedBound::CurrentRow,
+        FrameBound::UnboundedFollowing => ResolvedBound::UnboundedFollowing,
+        FrameBound::Preceding(e) => ResolvedBound::Preceding(offset(e)?),
+        FrameBound::Following(e) => ResolvedBound::Following(offset(e)?),
+    })
 }
 
 /// A scalar function over argument types it has no overload for (e.g. abs(text), round(int,
@@ -23307,6 +23412,65 @@ fn sort_rows(rows: &mut Vec<Row>, order: &[crate::spill::SortKey]) -> Result<()>
 /// (like ORDER BY / GROUP BY); each computed result charges `window_result` and guards the ceiling.
 /// S0: `row_number()` only; partitions bucket value-canonically via an insertion-ordered list, so
 /// no hash-map iteration order leaks (CLAUDE.md §8/§10).
+///
+/// The frame-sensitive plans (aggregate windows, first/last/nth_value) use `frame_bounds` (the
+/// per-row `[lo, hi)` over the sorted partition) and `peer_ends` (the default frame's peer-group
+/// boundary). spec/design/window.md §6.
+fn peer_ends(ordered: &[usize], rows: &[Row], order: &[crate::spill::SortKey]) -> Vec<usize> {
+    let np = ordered.len();
+    let mut ends = vec![np; np];
+    let mut s = 0usize;
+    for pos in 1..np {
+        if cmp_rows_by_order(&rows[ordered[pos]], &rows[ordered[s]], order)
+            != std::cmp::Ordering::Equal
+        {
+            for e in ends.iter_mut().take(pos).skip(s) {
+                *e = pos;
+            }
+            s = pos;
+        }
+    }
+    for e in ends.iter_mut().take(np).skip(s) {
+        *e = np;
+    }
+    ends
+}
+
+/// The `[lo, hi)` frame for a row at sorted position `pos` (window.md §6). `None` ⇒ the default
+/// frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = `[0, peer_end)`). An explicit ROWS frame maps
+/// each bound to an index; bounds clamp to `[0, np]` and an inverted frame is empty.
+fn frame_bounds(
+    pos: usize,
+    np: usize,
+    peer_end: usize,
+    frame: &Option<ResolvedFrame>,
+) -> (usize, usize) {
+    match frame {
+        None => (0, peer_end),
+        Some(f) => {
+            let p = pos as i64;
+            let n = np as i64;
+            let lo = match &f.start {
+                ResolvedBound::UnboundedPreceding => 0,
+                ResolvedBound::Preceding(k) => p - k,
+                ResolvedBound::CurrentRow => p,
+                ResolvedBound::Following(k) => p + k,
+                ResolvedBound::UnboundedFollowing => n,
+            };
+            let hi = match &f.end {
+                ResolvedBound::UnboundedPreceding => 0,
+                ResolvedBound::Preceding(k) => p - k + 1,
+                ResolvedBound::CurrentRow => p + 1,
+                ResolvedBound::Following(k) => p + k + 1,
+                ResolvedBound::UnboundedFollowing => n,
+            };
+            let lo = lo.clamp(0, n) as usize;
+            let hi = hi.clamp(0, n) as usize;
+            (lo, hi.max(lo))
+        }
+    }
+}
+
 fn apply_window_stage(
     rows: &mut [Row],
     specs: &[WindowSpec],
@@ -23494,39 +23658,101 @@ fn apply_window_stage(
                 WindowPlan::Agg(aggplan) => {
                     let np = ordered.len();
                     let has_operand = !spec.args.is_empty(); // COUNT(*) has no operand
-                    let mut groups: Vec<(usize, usize)> = Vec::new();
-                    let mut s = 0usize;
-                    for pos in 1..np {
-                        if cmp_rows_by_order(&rows[ordered[pos]], &rows[ordered[s]], &spec.order)
-                            != std::cmp::Ordering::Equal
-                        {
-                            groups.push((s, pos));
-                            s = pos;
+                    let opval = |k: usize, m: &mut Meter| -> Result<Value> {
+                        if has_operand {
+                            spec.args[0].eval(&rows[ordered[k]], env, m)
+                        } else {
+                            Ok(Value::Null)
                         }
-                    }
-                    if np > 0 {
-                        groups.push((s, np));
-                    }
-                    let mut acc = Acc::new(aggplan);
-                    for &(start, end) in &groups {
-                        for k in start..end {
-                            // The frame fold work (window.md §8) — metered so a running aggregate
-                            // over a large partition stays cost-bounded.
-                            meter.charge(COSTS.window_frame_step);
-                            let v = if has_operand {
-                                spec.args[0].eval(&rows[ordered[k]], env, meter)?
-                            } else {
-                                Value::Null
-                            };
-                            acc.fold(v, meter)?;
+                    };
+                    if spec.frame.is_none() {
+                        // DEFAULT frame: a single running pass, snapshotting the accumulator at each
+                        // peer-group boundary (window.md §6) — O(n).
+                        let mut groups: Vec<(usize, usize)> = Vec::new();
+                        let mut s = 0usize;
+                        for pos in 1..np {
+                            if cmp_rows_by_order(
+                                &rows[ordered[pos]],
+                                &rows[ordered[s]],
+                                &spec.order,
+                            ) != std::cmp::Ordering::Equal
+                            {
+                                groups.push((s, pos));
+                                s = pos;
+                            }
                         }
-                        // Snapshot the running accumulator for this peer group's frame [0, end).
-                        let out = acc.clone().finalize()?;
-                        for &ri in &ordered[start..end] {
+                        if np > 0 {
+                            groups.push((s, np));
+                        }
+                        let mut acc = Acc::new(aggplan);
+                        for &(start, end) in &groups {
+                            for k in start..end {
+                                meter.charge(COSTS.window_frame_step);
+                                let v = opval(k, meter)?;
+                                acc.fold(v, meter)?;
+                            }
+                            let out = acc.clone().finalize()?;
+                            for &ri in &ordered[start..end] {
+                                meter.guard()?;
+                                meter.charge(COSTS.window_result);
+                                results[ri] = out.clone();
+                            }
+                        }
+                    } else {
+                        // EXPLICIT frame (S4, ROWS): fold each row's frame fresh (window.md §6).
+                        let pe = peer_ends(&ordered, rows, &spec.order);
+                        for pos in 0..np {
+                            let (lo, hi) = frame_bounds(pos, np, pe[pos], &spec.frame);
+                            let mut acc = Acc::new(aggplan);
+                            for k in lo..hi {
+                                meter.charge(COSTS.window_frame_step);
+                                let v = opval(k, meter)?;
+                                acc.fold(v, meter)?;
+                            }
                             meter.guard()?;
                             meter.charge(COSTS.window_result);
-                            results[ri] = out.clone();
+                            results[ordered[pos]] = acc.finalize()?;
                         }
+                    }
+                }
+                // Frame-sensitive value pickers (S4, window.md §4): first/last/nth row of the frame.
+                WindowPlan::FirstValue | WindowPlan::LastValue | WindowPlan::NthValue => {
+                    let np = ordered.len();
+                    // The value expression, evaluated once per row (sorted order).
+                    let mut vals: Vec<Value> = Vec::with_capacity(np);
+                    for &ri in &ordered {
+                        vals.push(spec.args[0].eval(&rows[ri], env, meter)?);
+                    }
+                    // nth_value's position — evaluated once; NULL → NULL for all; < 1 → 22016.
+                    let nth = if matches!(spec.plan, WindowPlan::NthValue) {
+                        match spec.args[1].eval(&rows[ordered[0]], env, meter)? {
+                            Value::Null => None,
+                            Value::Int(n) if n >= 1 => Some(n as usize),
+                            Value::Int(_) => {
+                                return Err(EngineError::new(
+                                    SqlState::InvalidArgumentForNthValue,
+                                    "argument of nth_value must be greater than zero",
+                                ));
+                            }
+                            _ => unreachable!("nth_value position resolved to integer"),
+                        }
+                    } else {
+                        Some(0) // unused for first/last
+                    };
+                    let pe = peer_ends(&ordered, rows, &spec.order);
+                    for pos in 0..np {
+                        meter.guard()?;
+                        meter.charge(COSTS.window_result);
+                        let (lo, hi) = frame_bounds(pos, np, pe[pos], &spec.frame);
+                        results[ordered[pos]] = match spec.plan {
+                            WindowPlan::FirstValue if hi > lo => vals[lo].clone(),
+                            WindowPlan::LastValue if hi > lo => vals[hi - 1].clone(),
+                            WindowPlan::NthValue => match nth {
+                                Some(n) if lo + n - 1 < hi => vals[lo + n - 1].clone(),
+                                _ => Value::Null, // empty frame, < n rows, or NULL n
+                            },
+                            _ => Value::Null, // empty frame (first/last)
+                        };
                     }
                 }
             }

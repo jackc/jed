@@ -1,0 +1,86 @@
+# Window functions S4 — explicit ROWS frames + first/last/nth_value (spec/design/window.md §6).
+#
+# An explicit ROWS frame restricts the rows a frame-sensitive function sees. first_value/last_value/
+# nth_value pick the first/last/n-th row of the frame; an aggregate folds over it. With the DEFAULT
+# frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW) last_value is the current row (the PG gotcha); an
+# explicit ROWS frame widens it. Explicit RANGE/GROUPS frames + EXCLUDE are deferred (0A000).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_frame, query.order_by, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40)
+
+# Default frame: first_value is the partition's first row (10 for all); last_value is the CURRENT
+# row (10,20,30,40 — the classic last_value-with-default-frame gotcha).
+# names: id, fv, lv
+# cost: 17
+query III nosort
+SELECT id, first_value(v) OVER (ORDER BY id) AS fv, last_value(v) OVER (ORDER BY id) AS lv FROM t ORDER BY id
+----
+1
+10
+10
+2
+10
+20
+3
+10
+30
+4
+10
+40
+
+# Whole-partition ROWS frame: last_value is now the partition's last row (40), nth_value(v,2) the
+# 2nd row (20) — both constant across the partition.
+# names: id, lv, nv
+query III nosort
+SELECT id, last_value(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS lv, nth_value(v, 2) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS nv FROM t ORDER BY id
+----
+1
+40
+20
+2
+40
+20
+3
+40
+20
+4
+40
+20
+
+# Sliding ROWS frame: sum over [1 PRECEDING, 1 FOLLOWING] — a 3-row moving sum (clamped at edges).
+# id1: 10+20=30, id2: 10+20+30=60, id3: 20+30+40=90, id4: 30+40=70.
+# names: id, ms
+query II nosort
+SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS ms FROM t ORDER BY id
+----
+1
+30
+2
+60
+3
+90
+4
+70
+
+# nth_value past the frame end yields NULL: nth_value(v, 3) over a 2-row trailing frame.
+# id1 frame=[id1] -> NULL, id2 frame=[id1,id2] -> NULL, id3 frame=[id2,id3] -> NULL, id4 -> NULL
+# (each frame has < 3 rows). names: id, n3
+query II nosort
+SELECT id, nth_value(v, 3) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS n3 FROM t ORDER BY id
+----
+1
+NULL
+2
+NULL
+3
+NULL
+4
+NULL
+
+# nth_value position must be > 0 — 22016.
+statement error 22016
+SELECT nth_value(v, 0) OVER (ORDER BY id) FROM t

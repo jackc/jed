@@ -74,6 +74,20 @@ name = "invalid_argument_for_ntile"
 class = "data exception"
 template = "argument of ntile must be greater than zero"
 
+# The position argument of nth_value() must be > 0 (spec/design/window.md §4). PostgreSQL's code.
+[[error]]
+code = "22016"
+name = "invalid_argument_for_nth_value"
+class = "data exception"
+template = "argument of nth_value must be greater than zero"
+
+# A window frame PRECEDING/FOLLOWING offset must not be negative (spec/design/window.md §6). PG's code.
+[[error]]
+code = "22013"
+name = "invalid_preceding_or_following_size"
+class = "data exception"
+template = "frame starting or ending offset must not be negative"
+
 # nextval past a sequence bound without CYCLE (../design/sequences.md §4/§9).
 [[error]]
 code = "2200H"

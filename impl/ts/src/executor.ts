@@ -40,6 +40,7 @@ import type {
   TypeMod,
   Update,
   WindowDef,
+  FrameBound,
   WithExpr,
   WithQuery,
 } from "./ast.ts";
@@ -10318,7 +10319,24 @@ type WindowSpec = {
   // float width (riding on the Acc), fixed at resolve from the function + operand type.
   aggPlan?: AggPlan;
   aggFloatWidth?: ScalarType;
+  // The resolved explicit frame (S4, ROWS mode); undefined/null is the default frame (RANGE
+  // UNBOUNDED PRECEDING TO CURRENT ROW with an ORDER BY, the whole partition without — window.md §6).
+  frame?: ResolvedFrame | null;
 };
+
+// ResolvedFrame is a resolved window frame (spec/design/window.md §6). S4: ROWS mode, integer-
+// constant offsets.
+type ResolvedFrame = {
+  start: ResolvedBound;
+  end: ResolvedBound;
+};
+
+type ResolvedBound =
+  | { kind: "unboundedPreceding" }
+  | { kind: "preceding"; offset: number }
+  | { kind: "currentRow" }
+  | { kind: "following"; offset: number }
+  | { kind: "unboundedFollowing" };
 
 // WindowPlan is the runtime plan for one window function (spec/design/window.md §4). S0:
 // row_number only; ranking / offset / aggregate-window / frame plans land in S1–S4.
@@ -10344,7 +10362,14 @@ type WindowPlan =
   // the row's default frame (running with a window ORDER BY, whole-partition without — window.md §6).
   // Reuses the aggregate Acc kernels; the resolved AggPlan rides on the spec's aggPlan field, the
   // operand (if any) on args[0] (empty for COUNT(*)).
-  | "agg";
+  | "agg"
+  // FIRST_VALUE(v) / LAST_VALUE(v) — the value of the frame's first / last row (S4). args[0] is the
+  // value expression; frame-sensitive.
+  | "firstValue"
+  | "lastValue"
+  // NTH_VALUE(v, n) — the value of the frame's n-th row, NULL if the frame has < n rows (S4).
+  // args[0] is the value, args[1] the position; frame-sensitive.
+  | "nthValue";
 
 // Acc is a running aggregate accumulator (one per AggSpec), folded per input row then finalized.
 // For float SUM/AVG the inputs are COLLECTED in `floats` (the canonical fold needs all values up
@@ -11120,26 +11145,60 @@ function resolveWindowCall(
     plan = "agg";
     // Resolve the window definition + collect the spec here (it carries the extra aggPlan fields),
     // returning early so the shared collection below (which omits them) is not also run.
-    const [partition, order] = resolveWindowDef(scope, e.over, params);
+    const [partition, order, frame] = resolveWindowDef(scope, e.over, params);
     if (ag.window === undefined) {
       throw engineError("windowing_error", "window functions are not allowed here");
     }
     const slot = ag.window.base + ag.window.windowSpecs.length;
-    ag.window.windowSpecs.push({ plan, partition, order, args: wargs, aggPlan, aggFloatWidth });
+    ag.window.windowSpecs.push({
+      plan,
+      partition,
+      order,
+      args: wargs,
+      aggPlan,
+      aggFloatWidth,
+      frame,
+    });
     return { node: { kind: "column", index: slot }, type: result };
+  } else if (lname === "first_value" || lname === "last_value" || lname === "nth_value") {
+    // Frame-sensitive value pickers (S4, window.md §4). first/last_value take one value
+    // expression (→ result type); nth_value takes the value + an integer position.
+    if (e.star) {
+      throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    }
+    const want = lname === "nth_value" ? 2 : 1;
+    if (e.args.length !== want) {
+      throw engineError("undefined_function", `${lname} takes ${want} argument(s)`);
+    }
+    const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const vr = resolve(scope, e.args[0]!, null, sub, params);
+    wargs.push(vr.node);
+    if (lname === "first_value") {
+      plan = "firstValue";
+    } else if (lname === "last_value") {
+      plan = "lastValue";
+    } else {
+      const nr = resolve(scope, e.args[1]!, null, sub, params);
+      if (nr.type.kind !== "int" && nr.type.kind !== "null") {
+        throw typeError("position of nth_value must be integer");
+      }
+      wargs.push(nr.node);
+      plan = "nthValue";
+    }
+    result = vr.type;
   } else {
     throw engineError("undefined_function", `${lname} is not a window function`);
   }
-  // Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys) — all
-  // against the input scope, never recursing into `ag`. Done before collecting the spec.
-  const [partition, order] = resolveWindowDef(scope, e.over, params);
+  // Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys,
+  // explicit frame) — all against the input scope, never recursing into `ag`. Before collecting.
+  const [partition, order, frame] = resolveWindowDef(scope, e.over, params);
   // A window function is allowed only in a window query's projection. In WHERE / a JOIN ON /
   // HAVING / an aggregate query `ag.window` is unset → 42P20 (window.md §7).
   if (ag.window === undefined) {
     throw engineError("windowing_error", "window functions are not allowed here");
   }
   const slot = ag.window.base + ag.window.windowSpecs.length;
-  ag.window.windowSpecs.push({ plan, partition, order, args: wargs });
+  ag.window.windowSpecs.push({ plan, partition, order, args: wargs, frame });
   return { node: { kind: "column", index: slot }, type: result };
 }
 
@@ -11152,7 +11211,7 @@ function resolveWindowDef(
   scope: Scope,
   wd: WindowDef,
   _params: ParamTypes,
-): [number[], OrderSlot[]] {
+): [number[], OrderSlot[], ResolvedFrame | null] {
   const partition: number[] = [];
   for (const key of wd.partition) {
     let r: Resolved;
@@ -11203,7 +11262,52 @@ function resolveWindowDef(
     }
     order.push({ idx, descending: key.descending, nullsFirst: key.nullsFirst, collation });
   }
-  return [partition, order];
+  // The explicit frame (S4): ROWS mode only, with non-negative integer-literal offsets. Explicit
+  // RANGE/GROUPS and value/expression offsets are deferred 0A000 (window.md §6/§11) — the default
+  // RANGE frame stays implicit (no clause).
+  let frame: ResolvedFrame | null = null;
+  if (wd.frame !== undefined && wd.frame !== null) {
+    if (wd.frame.mode !== "rows") {
+      throw engineError("feature_not_supported", "only ROWS-mode window frames are supported yet");
+    }
+    frame = {
+      start: resolveFrameBound(wd.frame.start),
+      end: resolveFrameBound(wd.frame.end),
+    };
+  }
+  return [partition, order, frame];
+}
+
+// resolveFrameBound resolves one frame bound (S4): the offset of `n PRECEDING`/`n FOLLOWING` must
+// be a non-negative integer literal (22013 if negative; a non-literal/non-integer offset is 0A000).
+// window.md §6.
+function resolveFrameBound(b: FrameBound): ResolvedBound {
+  const offsetOf = (e: Expr): number => {
+    if (e.kind === "literal" && e.literal.kind === "int") {
+      const n = e.literal.int;
+      if (n >= 0n) return Number(n);
+      throw engineError(
+        "invalid_preceding_or_following_size",
+        "frame starting or ending offset must not be negative",
+      );
+    }
+    throw engineError(
+      "feature_not_supported",
+      "frame offset must be a non-negative integer literal",
+    );
+  };
+  switch (b.kind) {
+    case "unboundedPreceding":
+      return { kind: "unboundedPreceding" };
+    case "currentRow":
+      return { kind: "currentRow" };
+    case "unboundedFollowing":
+      return { kind: "unboundedFollowing" };
+    case "preceding":
+      return { kind: "preceding", offset: offsetOf(b.offset) };
+    case "following":
+      return { kind: "following", offset: offsetOf(b.offset) };
+  }
 }
 
 // === Function registry (spec/design/extensibility.md §5) ============================
@@ -18953,6 +19057,54 @@ function not3(a: ThreeValued): ThreeValued {
   return "unknown";
 }
 
+// peerEnds computes, for each sorted position, the exclusive END of its peer group (rows EQUAL on
+// the window ORDER BY keys). The default frame's CURRENT ROW spans the whole peer group, so the
+// default frame is [0, peerEnd) (spec/design/window.md §6). An empty ORDER BY → one peer group → np.
+function peerEnds(ordered: number[], rows: Row[], order: OrderSlot[]): number[] {
+  const np = ordered.length;
+  const ends = new Array<number>(np).fill(np);
+  let s = 0;
+  for (let pos = 1; pos < np; pos++) {
+    if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[ordered[s]!]!, order) !== 0) {
+      for (let e = s; e < pos; e++) ends[e] = pos;
+      s = pos;
+    }
+  }
+  for (let e = s; e < np; e++) ends[e] = np;
+  return ends;
+}
+
+// frameBounds returns the [lo, hi) frame for a row at sorted position `pos` (window.md §6). A
+// null/undefined frame ⇒ the default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = [0, peerEnd)).
+// An explicit ROWS frame maps each bound to an index; bounds clamp to [0, np] and an inverted frame
+// is empty.
+function frameBounds(
+  pos: number,
+  np: number,
+  peerEnd: number,
+  frame: ResolvedFrame | null | undefined,
+): [number, number] {
+  if (frame === null || frame === undefined) return [0, peerEnd];
+  const boundIdx = (b: ResolvedBound, isEnd: boolean): number => {
+    switch (b.kind) {
+      case "unboundedPreceding":
+        return 0;
+      case "preceding":
+        return pos - b.offset + (isEnd ? 1 : 0);
+      case "currentRow":
+        return pos + (isEnd ? 1 : 0);
+      case "following":
+        return pos + b.offset + (isEnd ? 1 : 0);
+      case "unboundedFollowing":
+        return np;
+    }
+  };
+  const clamp = (x: number): number => (x < 0 ? 0 : x > np ? np : x);
+  const lo = clamp(boundIdx(frame.start, false));
+  const hi = clamp(boundIdx(frame.end, true));
+  return [lo, Math.max(hi, lo)];
+}
+
 // applyWindowStage is the WINDOW stage (spec/design/window.md §5.2): for each window function,
 // partition the rows, sort each partition by the window ORDER BY (stable → PK tie-break, as `rows`
 // arrives in PK scan order), compute the per-row result, and APPEND it to every row (so window
@@ -18961,6 +19113,10 @@ function not3(a: ThreeValued): ThreeValued {
 // the ceiling. S0: row_number() only; partitions bucket value-canonically via an insertion-ordered
 // list keyed by the value-canonical distinctRowKey (the aggregate-grouping discipline), so no
 // hash-map iteration order leaks (CLAUDE.md §8/§10).
+//
+// The frame-sensitive plans (aggregate windows, first/last/nth_value) use frameBounds (the per-row
+// [lo, hi) over the sorted partition) and peerEnds (the default frame's peer-group boundary).
+// spec/design/window.md §6.
 function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter: Meter): void {
   const n = rows.length;
   if (n === 0) return;
@@ -19139,34 +19295,100 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
         case "agg": {
           const np = ordered.length;
           const hasOperand = spec.args.length > 0; // COUNT(*) has no operand
-          const groups: Array<[number, number]> = []; // peer-group spans [start, end)
-          let s = 0;
-          for (let pos = 1; pos < np; pos++) {
-            if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[ordered[s]!]!, spec.order) !== 0) {
-              groups.push([s, pos]);
-              s = pos;
+          if (spec.frame === null || spec.frame === undefined) {
+            // DEFAULT frame: a single running pass, snapshotting the accumulator at each peer-group
+            // boundary (window.md §6) — O(n).
+            const groups: Array<[number, number]> = []; // peer-group spans [start, end)
+            let s = 0;
+            for (let pos = 1; pos < np; pos++) {
+              if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[ordered[s]!]!, spec.order) !== 0) {
+                groups.push([s, pos]);
+                s = pos;
+              }
             }
-          }
-          if (np > 0) groups.push([s, np]);
-          const acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
-          for (const [start, end] of groups) {
-            for (let k = start; k < end; k++) {
-              // The frame fold work (window.md §8) — metered so a running aggregate over a large
-              // partition stays cost-bounded.
-              meter.charge(COSTS.windowFrameStep);
-              const v = hasOperand
-                ? evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter)
-                : nullValue();
-              foldAcc(acc, v, meter);
+            if (np > 0) groups.push([s, np]);
+            const acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
+            for (const [start, end] of groups) {
+              for (let k = start; k < end; k++) {
+                // The frame fold work (window.md §8) — metered so a running aggregate over a large
+                // partition stays cost-bounded.
+                meter.charge(COSTS.windowFrameStep);
+                const v = hasOperand
+                  ? evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter)
+                  : nullValue();
+                foldAcc(acc, v, meter);
+              }
+              // Snapshot the running accumulator for this peer group's frame [0, end).
+              const out = finalizeAcc(cloneAcc(acc));
+              for (let k = start; k < end; k++) {
+                const ri = ordered[k]!;
+                meter.guard();
+                meter.charge(COSTS.windowResult);
+                results[ri] = out;
+              }
             }
-            // Snapshot the running accumulator for this peer group's frame [0, end).
-            const out = finalizeAcc(cloneAcc(acc));
-            for (let k = start; k < end; k++) {
-              const ri = ordered[k]!;
+          } else {
+            // EXPLICIT frame (S4, ROWS): fold each row's frame fresh (window.md §6).
+            const pe = peerEnds(ordered, rows, spec.order);
+            for (let pos = 0; pos < np; pos++) {
+              const [lo, hi] = frameBounds(pos, np, pe[pos]!, spec.frame);
+              const acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
+              for (let k = lo; k < hi; k++) {
+                meter.charge(COSTS.windowFrameStep);
+                const v = hasOperand
+                  ? evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter)
+                  : nullValue();
+                foldAcc(acc, v, meter);
+              }
               meter.guard();
               meter.charge(COSTS.windowResult);
-              results[ri] = out;
+              results[ordered[pos]!] = finalizeAcc(acc);
             }
+          }
+          break;
+        }
+        // Frame-sensitive value pickers (S4, window.md §4): first/last/nth row of the frame.
+        case "firstValue":
+        case "lastValue":
+        case "nthValue": {
+          const np = ordered.length;
+          // The value expression, evaluated once per row (sorted order).
+          const vals: Value[] = new Array(np);
+          for (let i = 0; i < np; i++) {
+            vals[i] = evalExpr(spec.args[0]!, rows[ordered[i]!]!, env, meter);
+          }
+          // nth_value's position — evaluated once; NULL → NULL for all; < 1 → 22016.
+          let nth: number | null = 0; // unused for first/last
+          if (spec.plan === "nthValue") {
+            const nv = evalExpr(spec.args[1]!, rows[ordered[0]!]!, env, meter);
+            if (nv.kind === "null") {
+              nth = null;
+            } else if (nv.kind === "int") {
+              if (nv.int >= 1n) {
+                nth = Number(nv.int);
+              } else {
+                throw engineError(
+                  "invalid_argument_for_nth_value",
+                  "argument of nth_value must be greater than zero",
+                );
+              }
+            }
+          }
+          const pe = peerEnds(ordered, rows, spec.order);
+          for (let pos = 0; pos < np; pos++) {
+            meter.guard();
+            meter.charge(COSTS.windowResult);
+            const [lo, hi] = frameBounds(pos, np, pe[pos]!, spec.frame);
+            let out: Value;
+            if (spec.plan === "firstValue") {
+              out = hi > lo ? vals[lo]! : nullValue();
+            } else if (spec.plan === "lastValue") {
+              out = hi > lo ? vals[hi - 1]! : nullValue();
+            } else {
+              // nth_value: empty frame, < n rows, or NULL n → NULL.
+              out = nth !== null && lo + nth - 1 < hi ? vals[lo + nth - 1]! : nullValue();
+            }
+            results[ordered[pos]!] = out;
           }
           break;
         }

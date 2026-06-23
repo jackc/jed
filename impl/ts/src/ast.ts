@@ -254,7 +254,29 @@ export type OrderKey = {
 export type WindowDef = {
   partition: Expr[];
   order: OrderKey[];
+  // An explicit frame clause (`ROWS BETWEEN … AND …`), else null for the default frame
+  // (spec/design/window.md §6). S4 supports `ROWS` mode; explicit `RANGE`/`GROUPS` and `EXCLUDE`
+  // are parsed but rejected `0A000` at resolve.
+  frame?: WindowFrame | null;
 };
+
+// A window frame clause (spec/design/window.md §6).
+export type WindowFrame = {
+  mode: FrameMode;
+  start: FrameBound;
+  end: FrameBound;
+};
+
+export type FrameMode = "rows" | "range" | "groups";
+
+// A frame boundary. Preceding/Following carry the offset expression (a non-negative integer
+// in ROWS/GROUPS; a value offset in RANGE).
+export type FrameBound =
+  | { kind: "unboundedPreceding" }
+  | { kind: "preceding"; offset: Expr }
+  | { kind: "currentRow" }
+  | { kind: "following"; offset: Expr }
+  | { kind: "unboundedFollowing" };
 
 // ColumnDef is a column definition in a CREATE TABLE. typeName is kept as written and
 // resolved during analysis (the catalog owns the type lattice). notNull is an explicit

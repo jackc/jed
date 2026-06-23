@@ -293,6 +293,10 @@ id = "query.window_aggregate"
 description = "Aggregates as window functions (window.md §6, S3): sum/count/min/max/avg carrying OVER are folded over the DEFAULT frame — a RUNNING aggregate with a window ORDER BY (RANGE UNBOUNDED PRECEDING TO CURRENT ROW, peer-aware) or the WHOLE partition without. Reuses the aggregate Acc kernels + widening (sum int->i64, avg->decimal). Explicit frame clauses are deferred to S4. Builds on query.window"
 
 [[capability]]
+id = "query.window_frame"
+description = "Explicit window frames + frame-sensitive value functions (window.md §6, S4): the ROWS BETWEEN frame_start AND frame_end clause (UNBOUNDED PRECEDING/FOLLOWING, CURRENT ROW, n PRECEDING/FOLLOWING with non-negative integer offsets) restricting the rows an aggregate window or first_value/last_value/nth_value sees; nth_value(e,n) n<1 is 22016, a negative frame offset 22013. Explicit RANGE/GROUPS frames + EXCLUDE are deferred 0A000. Builds on query.window_aggregate"
+
+[[capability]]
 id = "query.union"
 description = "UNION / UNION ALL — combine two SELECTs' result rows; the bare form deduplicates (NULL-safe, value-canonical), ALL keeps multiplicities; output column count + names come from the left operand; per-column type unification (integer max-rank, integer<->decimal, all-NULL->text); arity mismatch 42601, type mismatch 42804; INTERSECT binds tighter; optional trailing ORDER BY/LIMIT/OFFSET resolves by output column name (spec/design/grammar.md §25)"
 

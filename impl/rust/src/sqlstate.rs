@@ -28,6 +28,10 @@ pub enum SqlState {
     DivisionByZero,
     /// 22014 — argument of ntile must be greater than zero
     InvalidArgumentForNtile,
+    /// 22016 — argument of nth_value must be greater than zero
+    InvalidArgumentForNthValue,
+    /// 22013 — frame starting or ending offset must not be negative
+    InvalidPrecedingOrFollowingSize,
     /// 2200H — nextval: reached {bound} value of sequence {sequence}
     SequenceGeneratorLimitExceeded,
     /// 2201W — LIMIT must not be negative
@@ -148,6 +152,8 @@ impl SqlState {
             SqlState::DatetimeFieldOverflow => "22008",
             SqlState::DivisionByZero => "22012",
             SqlState::InvalidArgumentForNtile => "22014",
+            SqlState::InvalidArgumentForNthValue => "22016",
+            SqlState::InvalidPrecedingOrFollowingSize => "22013",
             SqlState::SequenceGeneratorLimitExceeded => "2200H",
             SqlState::InvalidRowCountInLimitClause => "2201W",
             SqlState::InvalidRowCountInOffsetClause => "2201X",
@@ -225,6 +231,8 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "22008", name: "datetime_field_overflow", class: "data exception" },
     ErrorDesc { code: "22012", name: "division_by_zero", class: "data exception" },
     ErrorDesc { code: "22014", name: "invalid_argument_for_ntile", class: "data exception" },
+    ErrorDesc { code: "22016", name: "invalid_argument_for_nth_value", class: "data exception" },
+    ErrorDesc { code: "22013", name: "invalid_preceding_or_following_size", class: "data exception" },
     ErrorDesc { code: "2200H", name: "sequence_generator_limit_exceeded", class: "data exception" },
     ErrorDesc { code: "2201W", name: "invalid_row_count_in_limit_clause", class: "data exception" },
     ErrorDesc { code: "2201X", name: "invalid_row_count_in_offset_clause", class: "data exception" },

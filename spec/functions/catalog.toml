@@ -3351,6 +3351,47 @@ requires_order = false
 null           = "offset"
 errors         = []
 
+# first_value / last_value / nth_value — FRAME-SENSITIVE value pickers (window.md §4/§6). first_value
+# is the value of the frame's first row; last_value its last row; nth_value(e, n) its n-th row (NULL
+# if the frame has fewer than n rows, n < 1 → 22016). With the default frame (RANGE UNBOUNDED
+# PRECEDING TO CURRENT ROW) last_value is the current row's value (a classic PG gotcha) — an explicit
+# frame (S4 ROWS) widens it. Result = the value expression's type (same_as_input). (S4)
+[[window]]
+name           = "first_value"
+kind           = "window"
+surface        = "FIRST_VALUE"
+args           = "one"
+arg_families   = ["any"]
+result         = "same_as_input"
+frame_sensitive = true
+requires_order = false
+null           = "frame"
+errors         = []
+
+[[window]]
+name           = "last_value"
+kind           = "window"
+surface        = "LAST_VALUE"
+args           = "one"
+arg_families   = ["any"]
+result         = "same_as_input"
+frame_sensitive = true
+requires_order = false
+null           = "frame"
+errors         = []
+
+[[window]]
+name           = "nth_value"
+kind           = "window"
+surface        = "NTH_VALUE"
+args           = "value_n"
+arg_families   = ["any"]
+result         = "same_as_input"
+frame_sensitive = true
+requires_order = false
+null           = "frame"
+errors         = ["22016"]
+
 # === set-returning functions =================================================
 # A set-returning function (SRF) EXPANDS its arguments into a ROW SET — it fits neither the
 # operator mold (one value from infix operands) nor the aggregate mold (one value from a group):

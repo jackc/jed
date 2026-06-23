@@ -13311,6 +13311,35 @@ type windowSpec struct {
 	// OVER (...)). Go's windowPlan is an int enum and cannot carry a payload like Rust's
 	// WindowPlan::Agg(AggPlan) tuple variant, so the aggregate plan rides alongside here.
 	aggPlan aggPlan
+	// frame is the resolved explicit frame (S4, ROWS mode), or nil for the default frame (RANGE
+	// UNBOUNDED PRECEDING TO CURRENT ROW with an ORDER BY, the whole partition without — window.md
+	// §6). Mirrors Rust's WindowSpec.frame.
+	frame *resolvedFrame
+}
+
+// resolvedFrame is a resolved window frame (spec/design/window.md §6). S4: ROWS mode,
+// integer-constant offsets.
+type resolvedFrame struct {
+	start resolvedBound
+	end   resolvedBound
+}
+
+// resolvedBoundKind distinguishes the five resolved frame-boundary forms.
+type resolvedBoundKind int
+
+const (
+	boundUnboundedPreceding resolvedBoundKind = iota
+	boundPreceding                            // offset rows before the current row; off carries the count
+	boundCurrentRow
+	boundFollowing // offset rows after the current row; off carries the count
+	boundUnboundedFollowing
+)
+
+// resolvedBound is one resolved frame boundary; off carries the non-negative integer offset for
+// boundPreceding / boundFollowing (unused otherwise).
+type resolvedBound struct {
+	kind resolvedBoundKind
+	off  int64
 }
 
 // windowPlan is the runtime plan for one window function (spec/design/window.md §4). S0:
@@ -13338,10 +13367,21 @@ const (
 	// otherwise identical to LAG (the offset direction flips).
 	planLead
 	// planAgg — an aggregate used as a window function (S3): sum/count/min/max/avg(...) OVER (...),
-	// folded over the row's default frame (running with a window ORDER BY, whole-partition without
-	// — spec/design/window.md §6). Reuses the aggregate `acc` kernels; the aggregate plan is held
-	// in windowSpec.aggPlan and the operand (if any) is args[0]. Mirrors Rust's WindowPlan::Agg.
+	// folded over the row's default frame (running with a window ORDER BY, whole-partition without)
+	// or an explicit frame (S4 — spec/design/window.md §6). Reuses the aggregate `acc` kernels; the
+	// aggregate plan is held in windowSpec.aggPlan and the operand (if any) is args[0]. Mirrors
+	// Rust's WindowPlan::Agg.
 	planAgg
+	// planFirstValue — FIRST_VALUE(v): the value of the frame's first row (S4). args[0] is the
+	// value expression; frame-sensitive. Mirrors Rust's WindowPlan::FirstValue.
+	planFirstValue
+	// planLastValue — LAST_VALUE(v): the value of the frame's last row (S4). args[0] is the value
+	// expression; frame-sensitive. Mirrors Rust's WindowPlan::LastValue.
+	planLastValue
+	// planNthValue — NTH_VALUE(v, n): the value of the frame's n-th row, NULL if the frame has < n
+	// rows (S4). args[0] is the value, args[1] the position; frame-sensitive. Mirrors Rust's
+	// WindowPlan::NthValue.
+	planNthValue
 )
 
 // aggPlan is the runtime plan for one aggregate, fixed at resolve from the function + operand
@@ -14298,12 +14338,49 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 			wargs = append(wargs, r) // the aggregate operand → args[0]
 		}
 		plan = planAgg
+	case name == "first_value" || name == "last_value" || name == "nth_value":
+		// Frame-sensitive value pickers (S4, window.md §4). first/last_value take one value
+		// expression (→ result type); nth_value takes the value + an integer position. Args
+		// resolved in a fresh Forbidden sub-context (no aggregate/window nesting).
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		want := 1
+		if name == "nth_value" {
+			want = 2
+		}
+		if len(fc.Args) != want {
+			return nil, resolvedType{}, NewError(UndefinedFunction,
+				fmt.Sprintf("%s takes %d argument(s)", name, want))
+		}
+		sub := &aggCtx{}
+		vnode, vty, err := resolve(s, *fc.Args[0], nil, sub, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		wargs = append(wargs, vnode)
+		if name == "first_value" {
+			plan = planFirstValue
+		} else if name == "last_value" {
+			plan = planLastValue
+		} else {
+			nnode, nty, err := resolve(s, *fc.Args[1], nil, sub, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			if nty.kind != rtInt && nty.kind != rtNull {
+				return nil, resolvedType{}, typeError("position of nth_value must be integer")
+			}
+			wargs = append(wargs, nnode)
+			plan = planNthValue
+		}
+		result = vty
 	default:
 		return nil, resolvedType{}, NewError(UndefinedFunction, name+" is not a window function")
 	}
-	// Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys) — all
-	// against the input scope, never recursing into ag. Done before collecting the spec.
-	partition, order, err := resolveWindowDef(s, fc.Over)
+	// Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys,
+	// explicit frame) — all against the input scope, never recursing into ag. Before the spec.
+	partition, order, frame, err := resolveWindowDef(s, fc.Over)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
@@ -14313,7 +14390,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		return nil, resolvedType{}, NewError(WindowingError, "window functions are not allowed here")
 	}
 	slot := ag.windowBase + len(ag.windowSpecs)
-	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg})
+	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg, frame: frame})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 
@@ -14322,7 +14399,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 // input scope. Mirrors the query ORDER BY resolution (the collation / direction / NULLS handling).
 // S0: partition keys are columns only. A window function in a partition/order key, or an outer
 // reference, is rejected.
-func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, error) {
+func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, *resolvedFrame, error) {
 	partition := make([]int, 0, len(wd.Partition))
 	for _, key := range wd.Partition {
 		var (
@@ -14335,13 +14412,13 @@ func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, error) {
 		case ExprQualifiedColumn:
 			r, err = s.resolveQualified(key.Qualifier, key.Column)
 		default:
-			return nil, nil, NewError(FeatureNotSupported, "PARTITION BY supports only column references")
+			return nil, nil, nil, NewError(FeatureNotSupported, "PARTITION BY supports only column references")
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if r.level != 0 {
-			return nil, nil, NewError(FeatureNotSupported, "PARTITION BY may not reference an outer query column")
+			return nil, nil, nil, NewError(FeatureNotSupported, "PARTITION BY may not reference an outer query column")
 		}
 		partition = append(partition, r.index)
 	}
@@ -14357,34 +14434,90 @@ func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, error) {
 			r, err = s.resolveBare(key.Column)
 		}
 		if err != nil {
-			return nil, nil, err
+			return nil, nil, nil, err
 		}
 		if r.level != 0 {
-			return nil, nil, NewError(FeatureNotSupported, "window ORDER BY may not reference an outer query column")
+			return nil, nil, nil, NewError(FeatureNotSupported, "window ORDER BY may not reference an outer query column")
 		}
 		var coll *Collation
 		if key.Collation != "" {
 			if !s.columnOf(r).Type.IsText() {
-				return nil, nil, typeError(fmt.Sprintf(
+				return nil, nil, nil, typeError(fmt.Sprintf(
 					"collations are not supported by type %s", s.columnOf(r).Type.CanonicalName(),
 				))
 			}
 			if coll, err = resolveCollationName(s.catalog, key.Collation); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		} else if cn := s.columnOf(r).Collation; cn != "" {
 			if coll, err = resolveCollationName(s.catalog, cn); err != nil {
-				return nil, nil, err
+				return nil, nil, nil, err
 			}
 		}
 		// A non-C collated window ORDER BY is deferred in S0 (the window stage's per-partition sort
 		// is the plain comparator) — 0A000, a documented narrowing (spec/design/window.md §11).
 		if coll != nil {
-			return nil, nil, NewError(FeatureNotSupported, "collated window ORDER BY is not supported yet")
+			return nil, nil, nil, NewError(FeatureNotSupported, "collated window ORDER BY is not supported yet")
 		}
 		order = append(order, orderSlot{idx: r.index, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
 	}
-	return partition, order, nil
+	// The explicit frame (S4): ROWS mode only, with non-negative integer-literal offsets. Explicit
+	// RANGE/GROUPS and value/expression offsets are deferred 0A000 (window.md §6/§11) — the default
+	// RANGE frame stays implicit (no clause).
+	var frame *resolvedFrame
+	if wd.Frame != nil {
+		if wd.Frame.Mode != FrameRows {
+			return nil, nil, nil, NewError(FeatureNotSupported, "only ROWS-mode window frames are supported yet")
+		}
+		start, err := resolveFrameBound(wd.Frame.Start)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		end, err := resolveFrameBound(wd.Frame.End)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		frame = &resolvedFrame{start: start, end: end}
+	}
+	return partition, order, frame, nil
+}
+
+// resolveFrameBound resolves one frame bound (S4): the offset of `n PRECEDING`/`n FOLLOWING` must
+// be a non-negative integer literal (22013 if negative; a non-literal/non-integer offset is
+// 0A000). spec/design/window.md §6.
+func resolveFrameBound(b FrameBound) (resolvedBound, error) {
+	offset := func(e Expr) (int64, error) {
+		if e.Kind == ExprLiteral && e.Literal != nil && e.Literal.Kind == LiteralInt {
+			if e.Literal.Int >= 0 {
+				return e.Literal.Int, nil
+			}
+			return 0, NewError(InvalidPrecedingOrFollowingSize,
+				"frame starting or ending offset must not be negative")
+		}
+		return 0, NewError(FeatureNotSupported, "frame offset must be a non-negative integer literal")
+	}
+	switch b.Kind {
+	case FrameUnboundedPreceding:
+		return resolvedBound{kind: boundUnboundedPreceding}, nil
+	case FrameCurrentRow:
+		return resolvedBound{kind: boundCurrentRow}, nil
+	case FrameUnboundedFollowing:
+		return resolvedBound{kind: boundUnboundedFollowing}, nil
+	case FramePreceding:
+		n, err := offset(b.Offset)
+		if err != nil {
+			return resolvedBound{}, err
+		}
+		return resolvedBound{kind: boundPreceding, off: n}, nil
+	case FrameFollowing:
+		n, err := offset(b.Offset)
+		if err != nil {
+			return resolvedBound{}, err
+		}
+		return resolvedBound{kind: boundFollowing, off: n}, nil
+	default:
+		return resolvedBound{}, NewError(FeatureNotSupported, "unsupported frame bound")
+	}
 }
 
 // aggArg returns the single argument of a non-star aggregate call. Each aggregate takes
@@ -20890,6 +21023,80 @@ func sortRows[R ~[]Value](rows []R, order []orderSlot) error {
 	return nil
 }
 
+// peerEnds returns the exclusive peer-group end per sorted position over a partition (the default
+// frame's RANGE CURRENT ROW boundary — window.md §6): for a row at sorted position p, the rows in
+// [p, peerEnds[p]) are its peers (equal on the window ORDER BY). Mirrors Rust's peer_ends.
+func peerEnds(ordered []int, rows []Row, order []orderSlot) []int {
+	np := len(ordered)
+	ends := make([]int, np)
+	for i := range ends {
+		ends[i] = np
+	}
+	s := 0
+	for pos := 1; pos < np; pos++ {
+		if cmpRowsByOrder(rows[ordered[pos]], rows[ordered[s]], order) != 0 {
+			for e := s; e < pos; e++ {
+				ends[e] = pos
+			}
+			s = pos
+		}
+	}
+	for e := s; e < np; e++ {
+		ends[e] = np
+	}
+	return ends
+}
+
+// frameBounds returns the [lo, hi) frame for a row at sorted position pos (window.md §6). A nil
+// frame ⇒ the default frame (RANGE UNBOUNDED PRECEDING TO CURRENT ROW = [0, peerEnd)). An explicit
+// ROWS frame maps each bound to an index; bounds clamp to [0, np] and an inverted frame is empty.
+// Mirrors Rust's frame_bounds.
+func frameBounds(pos, np, peerEnd int, frame *resolvedFrame) (int, int) {
+	if frame == nil {
+		return 0, peerEnd
+	}
+	p := int64(pos)
+	n := int64(np)
+	boundIdx := func(b resolvedBound, end bool) int64 {
+		switch b.kind {
+		case boundUnboundedPreceding:
+			return 0
+		case boundPreceding:
+			if end {
+				return p - b.off + 1
+			}
+			return p - b.off
+		case boundCurrentRow:
+			if end {
+				return p + 1
+			}
+			return p
+		case boundFollowing:
+			if end {
+				return p + b.off + 1
+			}
+			return p + b.off
+		default: // boundUnboundedFollowing
+			return n
+		}
+	}
+	clamp := func(x int64) int64 {
+		if x < 0 {
+			return 0
+		}
+		if x > n {
+			return n
+		}
+		return x
+	}
+	lo := clamp(boundIdx(frame.start, false))
+	hi := clamp(boundIdx(frame.end, true))
+	if hi < lo {
+		hi = lo
+	}
+	return int(lo), int(hi)
+}
+
 // applyWindowStage runs the WINDOW stage (spec/design/window.md §5.2): for each window function,
 // partition the rows, sort each partition by the window ORDER BY (stable → PK tie-break, as rows
 // arrive in PK scan order), compute the per-row result, and APPEND it to every row (so window
@@ -20897,6 +21104,10 @@ func sortRows[R ~[]Value](rows []R, order []orderSlot) error {
 // are unmetered (like ORDER BY / GROUP BY); each computed result charges window_result and guards
 // the ceiling. S0: row_number() only; partitions bucket value-canonically via an insertion-ordered
 // list, so no map iteration order leaks (CLAUDE.md §8/§10).
+//
+// The frame-sensitive plans (aggregate windows, first/last/nth_value) use frameBounds (the per-row
+// [lo, hi) over the sorted partition) and peerEnds (the default frame's peer-group boundary).
+// spec/design/window.md §6.
 func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter) error {
 	n := len(rows)
 	if n == 0 {
@@ -21101,55 +21312,142 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 					}
 				}
 			case planAgg:
-				// An aggregate over the default frame (window.md §6): RANGE UNBOUNDED PRECEDING TO
-				// CURRENT ROW with a window ORDER BY (a RUNNING aggregate — CURRENT ROW spans the
-				// current peer group), or the WHOLE partition with no ORDER BY. Both reduce to the
-				// same shape: fold rows in sorted order, snapshotting the running acc at each
-				// peer-group boundary (no ORDER BY → one peer group → one whole-partition value).
 				np := len(ordered)
 				hasOperand := len(spec.args) > 0 // COUNT(*) has no operand
-				type span struct{ start, end int }
-				var groups []span
-				s := 0
-				for pos := 1; pos < np; pos++ {
-					if cmpRowsByOrder(rows[ordered[pos]], rows[ordered[s]], spec.order) != 0 {
-						groups = append(groups, span{s, pos})
-						s = pos
+				// opval evaluates the aggregate operand at sorted position k (NULL for COUNT(*)).
+				opval := func(k int) (Value, error) {
+					if hasOperand {
+						return spec.args[0].eval(rows[ordered[k]], env, meter)
 					}
+					return NullValue(), nil
 				}
-				if np > 0 {
-					groups = append(groups, span{s, np})
-				}
-				a := newAcc(spec.aggPlan)
-				for _, g := range groups {
-					for k := g.start; k < g.end; k++ {
-						// The frame fold work (window.md §8) — metered so a running aggregate over a
-						// large partition stays cost-bounded.
-						meter.Charge(Costs.WindowFrameStep)
-						v := NullValue()
-						if hasOperand {
-							var err error
-							v, err = spec.args[0].eval(rows[ordered[k]], env, meter)
+				if spec.frame == nil {
+					// DEFAULT frame (window.md §6): RANGE UNBOUNDED PRECEDING TO CURRENT ROW with a
+					// window ORDER BY (a RUNNING aggregate — CURRENT ROW spans the current peer
+					// group), or the WHOLE partition with no ORDER BY. Both reduce to the same shape:
+					// a single running pass, snapshotting the running acc at each peer-group boundary
+					// (no ORDER BY → one peer group → one whole-partition value) — O(n).
+					type span struct{ start, end int }
+					var groups []span
+					s := 0
+					for pos := 1; pos < np; pos++ {
+						if cmpRowsByOrder(rows[ordered[pos]], rows[ordered[s]], spec.order) != 0 {
+							groups = append(groups, span{s, pos})
+							s = pos
+						}
+					}
+					if np > 0 {
+						groups = append(groups, span{s, np})
+					}
+					a := newAcc(spec.aggPlan)
+					for _, g := range groups {
+						for k := g.start; k < g.end; k++ {
+							// The frame fold work (window.md §8) — metered so a running aggregate over
+							// a large partition stays cost-bounded.
+							meter.Charge(Costs.WindowFrameStep)
+							v, err := opval(k)
 							if err != nil {
 								return err
 							}
+							if err := a.fold(v, meter); err != nil {
+								return err
+							}
 						}
-						if err := a.fold(v, meter); err != nil {
+						// Snapshot the running accumulator for this peer group's frame [0, end) — the
+						// clone keeps the running acc going (deep-copied float buffer).
+						out, err := a.clone().finalize()
+						if err != nil {
 							return err
 						}
+						for _, ri := range ordered[g.start:g.end] {
+							if err := meter.Guard(); err != nil {
+								return err
+							}
+							meter.Charge(Costs.WindowResult)
+							results[ri] = out
+						}
 					}
-					// Snapshot the running accumulator for this peer group's frame [0, end) — the
-					// clone keeps the running acc going (deep-copied float buffer).
-					out, err := a.clone().finalize()
-					if err != nil {
-						return err
-					}
-					for _, ri := range ordered[g.start:g.end] {
+				} else {
+					// EXPLICIT frame (S4, ROWS): fold each row's [lo, hi) fresh (window.md §6).
+					pe := peerEnds(ordered, rows, spec.order)
+					for pos := 0; pos < np; pos++ {
+						lo, hi := frameBounds(pos, np, pe[pos], spec.frame)
+						a := newAcc(spec.aggPlan)
+						for k := lo; k < hi; k++ {
+							meter.Charge(Costs.WindowFrameStep)
+							v, err := opval(k)
+							if err != nil {
+								return err
+							}
+							if err := a.fold(v, meter); err != nil {
+								return err
+							}
+						}
 						if err := meter.Guard(); err != nil {
 							return err
 						}
 						meter.Charge(Costs.WindowResult)
-						results[ri] = out
+						out, err := a.finalize()
+						if err != nil {
+							return err
+						}
+						results[ordered[pos]] = out
+					}
+				}
+			case planFirstValue, planLastValue, planNthValue:
+				// Frame-sensitive value pickers (S4, window.md §4): first/last/nth row of the frame.
+				np := len(ordered)
+				// The value expression, evaluated once per row (sorted order).
+				vals := make([]Value, np)
+				for pos, ri := range ordered {
+					v, err := spec.args[0].eval(rows[ri], env, meter)
+					if err != nil {
+						return err
+					}
+					vals[pos] = v
+				}
+				// nth_value's position — evaluated once; NULL → NULL for all; < 1 → 22016.
+				var nth int // the 1-based position (0 unused for first/last)
+				nthNull := false
+				if spec.plan == planNthValue {
+					nv, err := spec.args[1].eval(rows[ordered[0]], env, meter)
+					if err != nil {
+						return err
+					}
+					if nv.IsNull() {
+						nthNull = true
+					} else if nv.Int >= 1 {
+						nth = int(nv.Int)
+					} else {
+						return NewError(InvalidArgumentForNthValue, "argument of nth_value must be greater than zero")
+					}
+				}
+				pe := peerEnds(ordered, rows, spec.order)
+				for pos := 0; pos < np; pos++ {
+					if err := meter.Guard(); err != nil {
+						return err
+					}
+					meter.Charge(Costs.WindowResult)
+					lo, hi := frameBounds(pos, np, pe[pos], spec.frame)
+					switch spec.plan {
+					case planFirstValue:
+						if hi > lo {
+							results[ordered[pos]] = vals[lo]
+						} else {
+							results[ordered[pos]] = NullValue() // empty frame
+						}
+					case planLastValue:
+						if hi > lo {
+							results[ordered[pos]] = vals[hi-1]
+						} else {
+							results[ordered[pos]] = NullValue() // empty frame
+						}
+					default: // planNthValue
+						if !nthNull && lo+nth-1 < hi {
+							results[ordered[pos]] = vals[lo+nth-1]
+						} else {
+							results[ordered[pos]] = NullValue() // empty frame, < n rows, or NULL n
+						}
 					}
 				}
 			}

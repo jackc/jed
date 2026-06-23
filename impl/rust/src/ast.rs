@@ -992,6 +992,36 @@ pub struct OrderKey {
 pub struct WindowDef {
     pub partition: Vec<Expr>,
     pub order: Vec<OrderKey>,
+    /// An explicit frame clause (`ROWS BETWEEN … AND …`), else `None` for the default frame
+    /// (spec/design/window.md §6). S4 supports `ROWS` mode; explicit `RANGE`/`GROUPS` and `EXCLUDE`
+    /// are parsed but rejected `0A000` at resolve.
+    pub frame: Option<WindowFrame>,
+}
+
+/// A window frame clause (spec/design/window.md §6).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct WindowFrame {
+    pub mode: FrameMode,
+    pub start: FrameBound,
+    pub end: FrameBound,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameMode {
+    Rows,
+    Range,
+    Groups,
+}
+
+/// A frame boundary. `Preceding`/`Following` carry the offset expression (a non-negative integer
+/// in `ROWS`/`GROUPS`; a value offset in `RANGE`).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum FrameBound {
+    UnboundedPreceding,
+    Preceding(Box<Expr>),
+    CurrentRow,
+    Following(Box<Expr>),
+    UnboundedFollowing,
 }
 
 /// A literal value as written in SQL.

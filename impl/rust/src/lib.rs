@@ -297,6 +297,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.window_offset",
     // Aggregates as window functions (S3, default frame — window.md §6).
     "query.window_aggregate",
+    // Explicit ROWS frames + first/last/nth_value (S4, window.md §6).
+    "query.window_frame",
     // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
     "query.union",
     "query.intersect",

@@ -13,6 +13,7 @@ use crate::ast::{
     SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
     Update, WindowDef, WithExpr, WithQuery,
 };
+use crate::ast::{FrameBound, FrameMode, WindowFrame};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
@@ -3184,8 +3185,14 @@ impl Parser {
             }
             // ORDER BY <sort_key> (, ...) — self-guards (empty if absent), consumes ORDER BY.
             let order = self.parse_order_by()?;
+            // An optional frame clause (ROWS/RANGE/GROUPS …), else the default frame.
+            let frame = self.parse_window_frame()?;
             self.expect(&Token::RParen)?;
-            Some(Box::new(WindowDef { partition, order }))
+            Some(Box::new(WindowDef {
+                partition,
+                order,
+                frame,
+            }))
         } else {
             None
         };
@@ -3197,6 +3204,77 @@ impl Parser {
             variadic,
             over,
         })
+    }
+
+    /// Parse an optional window frame clause `{ROWS|RANGE|GROUPS} frame_extent [EXCLUDE …]`
+    /// (spec/design/window.md §6, grammar.ebnf `frame_clause`). A single bound is the START
+    /// (END = CURRENT ROW). `EXCLUDE` is rejected `0A000` in S4. Returns `None` when no frame
+    /// keyword is present (the default frame).
+    fn parse_window_frame(&mut self) -> Result<Option<WindowFrame>> {
+        let mode = match self.peek_keyword().as_deref() {
+            Some("rows") => FrameMode::Rows,
+            Some("range") => FrameMode::Range,
+            Some("groups") => FrameMode::Groups,
+            _ => return Ok(None),
+        };
+        self.advance();
+        let (start, end) = if self.peek_keyword().as_deref() == Some("between") {
+            self.advance();
+            let s = self.parse_frame_bound()?;
+            self.expect_keyword("and")?;
+            let e = self.parse_frame_bound()?;
+            (s, e)
+        } else {
+            // A single bound is the frame START; the END defaults to CURRENT ROW.
+            (self.parse_frame_bound()?, FrameBound::CurrentRow)
+        };
+        if self.peek_keyword().as_deref() == Some("exclude") {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "frame EXCLUDE is not supported yet",
+            ));
+        }
+        Ok(Some(WindowFrame { mode, start, end }))
+    }
+
+    /// Parse one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`, `CURRENT ROW`, or `expr
+    /// PRECEDING|FOLLOWING` (spec/design/window.md §6).
+    fn parse_frame_bound(&mut self) -> Result<FrameBound> {
+        match self.peek_keyword().as_deref() {
+            Some("unbounded") => {
+                self.advance();
+                match self.peek_keyword().as_deref() {
+                    Some("preceding") => {
+                        self.advance();
+                        Ok(FrameBound::UnboundedPreceding)
+                    }
+                    Some("following") => {
+                        self.advance();
+                        Ok(FrameBound::UnboundedFollowing)
+                    }
+                    _ => Err(syntax("expected PRECEDING or FOLLOWING after UNBOUNDED")),
+                }
+            }
+            Some("current") => {
+                self.advance();
+                self.expect_keyword("row")?;
+                Ok(FrameBound::CurrentRow)
+            }
+            _ => {
+                let e = self.parse_expr()?;
+                match self.peek_keyword().as_deref() {
+                    Some("preceding") => {
+                        self.advance();
+                        Ok(FrameBound::Preceding(Box::new(e)))
+                    }
+                    Some("following") => {
+                        self.advance();
+                        Ok(FrameBound::Following(Box::new(e)))
+                    }
+                    _ => Err(syntax("expected PRECEDING or FOLLOWING in frame bound")),
+                }
+            }
+        }
     }
 
     /// `column_ref ::= identifier ("." identifier)?` — a bare column name, or a qualified

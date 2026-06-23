@@ -40,6 +40,9 @@ import type {
   TypeMod,
   Update,
   WindowDef,
+  WindowFrame,
+  FrameBound,
+  FrameMode,
 } from "./ast.ts";
 import { emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
 import { Decimal } from "./decimal.ts";
@@ -2801,10 +2804,88 @@ class Parser {
       }
       // ORDER BY <sort_key> (, ...) — self-guards (empty if absent), consumes ORDER BY.
       const order = this.parseOrderBy();
+      // An optional frame clause (ROWS/RANGE/GROUPS …), else the default frame.
+      const frame = this.parseWindowFrame();
       this.expect("rparen");
-      over = { partition, order };
+      over = { partition, order, frame };
     }
     return { kind: "funcCall", name, args, argNames, star, variadic, over };
+  }
+
+  // parseWindowFrame parses an optional window frame clause
+  // `{ROWS|RANGE|GROUPS} frame_extent [EXCLUDE …]` (spec/design/window.md §6, grammar.ebnf
+  // `frame_clause`). A single bound is the START (END = CURRENT ROW). `EXCLUDE` is rejected
+  // `0A000` in S4. Returns null when no frame keyword is present (the default frame).
+  private parseWindowFrame(): WindowFrame | null {
+    let mode: FrameMode;
+    switch (this.peekKeyword()) {
+      case "rows":
+        mode = "rows";
+        break;
+      case "range":
+        mode = "range";
+        break;
+      case "groups":
+        mode = "groups";
+        break;
+      default:
+        return null;
+    }
+    this.advance();
+    let start: FrameBound;
+    let end: FrameBound;
+    if (this.peekKeyword() === "between") {
+      this.advance();
+      start = this.parseFrameBound();
+      this.expectKeyword("and");
+      end = this.parseFrameBound();
+    } else {
+      // A single bound is the frame START; the END defaults to CURRENT ROW.
+      start = this.parseFrameBound();
+      end = { kind: "currentRow" };
+    }
+    if (this.peekKeyword() === "exclude") {
+      throw engineError("feature_not_supported", "frame EXCLUDE is not supported yet");
+    }
+    return { mode, start, end };
+  }
+
+  // parseFrameBound parses one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`, `CURRENT ROW`, or
+  // `expr PRECEDING|FOLLOWING` (spec/design/window.md §6).
+  private parseFrameBound(): FrameBound {
+    switch (this.peekKeyword()) {
+      case "unbounded": {
+        this.advance();
+        const k = this.peekKeyword();
+        if (k === "preceding") {
+          this.advance();
+          return { kind: "unboundedPreceding" };
+        }
+        if (k === "following") {
+          this.advance();
+          return { kind: "unboundedFollowing" };
+        }
+        throw engineError("syntax_error", "expected PRECEDING or FOLLOWING after UNBOUNDED");
+      }
+      case "current": {
+        this.advance();
+        this.expectKeyword("row");
+        return { kind: "currentRow" };
+      }
+      default: {
+        const offset = this.parseExpr();
+        const k = this.peekKeyword();
+        if (k === "preceding") {
+          this.advance();
+          return { kind: "preceding", offset };
+        }
+        if (k === "following") {
+          this.advance();
+          return { kind: "following", offset };
+        }
+        throw engineError("syntax_error", "expected PRECEDING or FOLLOWING in frame bound");
+      }
+    }
   }
 
   // --- cursor helpers ---

@@ -218,6 +218,7 @@ var SupportedCapabilities = []string{
 	"query.window_ntile",
 	"query.window_offset",
 	"query.window_aggregate",
+	"query.window_frame",
 	// Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
 	"query.union",
 	"query.intersect",

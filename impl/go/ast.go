@@ -1061,12 +1061,57 @@ type OrderKey struct {
 }
 
 // WindowDef is a window definition — the body of an OVER (...) clause (spec/design/window.md §3).
-// S0 carries PARTITION BY columns and an ORDER BY; the frame clause and a base-window name are
-// deferred (S4/S5). Partition is narrowed to columns in S0 (the GROUP BY/ORDER BY narrowing —
-// general expressions are a follow-on); Order reuses the query ORDER BY sort keys.
+// S0 carries PARTITION BY columns and an ORDER BY; a base-window name is deferred (S5). Partition
+// is narrowed to columns in S0 (the GROUP BY/ORDER BY narrowing — general expressions are a
+// follow-on); Order reuses the query ORDER BY sort keys. Frame carries an explicit frame clause
+// (`ROWS BETWEEN … AND …`), or nil for the default frame (spec/design/window.md §6). S4 supports
+// ROWS mode; explicit RANGE/GROUPS and EXCLUDE are parsed but rejected 0A000 at resolve.
 type WindowDef struct {
 	Partition []Expr
 	Order     []OrderKey
+	Frame     *WindowFrame
+}
+
+// WindowFrame is a window frame clause (spec/design/window.md §6).
+type WindowFrame struct {
+	Mode  FrameMode
+	Start FrameBound
+	End   FrameBound
+}
+
+// FrameMode is the frame unit: ROWS, RANGE, or GROUPS. S4 supports ROWS only.
+type FrameMode int
+
+const (
+	// FrameRows is a physical-row frame (ROWS).
+	FrameRows FrameMode = iota
+	// FrameRange is a value-range frame (RANGE) — parsed, deferred 0A000.
+	FrameRange
+	// FrameGroups is a peer-group frame (GROUPS) — parsed, deferred 0A000.
+	FrameGroups
+)
+
+// FrameBoundKind distinguishes the five frame-boundary forms.
+type FrameBoundKind int
+
+const (
+	// FrameUnboundedPreceding is UNBOUNDED PRECEDING.
+	FrameUnboundedPreceding FrameBoundKind = iota
+	// FramePreceding is `expr PRECEDING`; Offset carries the offset expression.
+	FramePreceding
+	// FrameCurrentRow is CURRENT ROW.
+	FrameCurrentRow
+	// FrameFollowing is `expr FOLLOWING`; Offset carries the offset expression.
+	FrameFollowing
+	// FrameUnboundedFollowing is UNBOUNDED FOLLOWING.
+	FrameUnboundedFollowing
+)
+
+// FrameBound is one frame boundary. Offset carries the offset expression for FramePreceding /
+// FrameFollowing (a non-negative integer in ROWS/GROUPS; a value offset in RANGE), nil otherwise.
+type FrameBound struct {
+	Kind   FrameBoundKind
+	Offset Expr
 }
 
 // LiteralKind distinguishes the literal forms.

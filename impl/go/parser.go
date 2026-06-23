@@ -3746,12 +3746,103 @@ func (p *Parser) parseFunctionCall() (Expr, error) {
 		if err != nil {
 			return Expr{}, err
 		}
+		// An optional frame clause (ROWS/RANGE/GROUPS …), else the default frame.
+		frame, err := p.parseWindowFrame()
+		if err != nil {
+			return Expr{}, err
+		}
 		if err := p.expect(TokRParen); err != nil {
 			return Expr{}, err
 		}
-		fc.Over = &WindowDef{Partition: partition, Order: order}
+		fc.Over = &WindowDef{Partition: partition, Order: order, Frame: frame}
 	}
 	return Expr{Kind: ExprFuncCall, FuncCall: fc}, nil
+}
+
+// parseWindowFrame parses an optional window frame clause `{ROWS|RANGE|GROUPS} frame_extent
+// [EXCLUDE …]` (spec/design/window.md §6, grammar.ebnf `frame_clause`). A single bound is the
+// START (END = CURRENT ROW). EXCLUDE is rejected 0A000 in S4. Returns nil when no frame keyword
+// is present (the default frame).
+func (p *Parser) parseWindowFrame() (*WindowFrame, error) {
+	var mode FrameMode
+	switch p.peekKeyword() {
+	case "rows":
+		mode = FrameRows
+	case "range":
+		mode = FrameRange
+	case "groups":
+		mode = FrameGroups
+	default:
+		return nil, nil
+	}
+	p.advance()
+	var start, end FrameBound
+	if p.peekKeyword() == "between" {
+		p.advance()
+		s, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		if err := p.expectKeyword("and"); err != nil {
+			return nil, err
+		}
+		e, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		start, end = s, e
+	} else {
+		// A single bound is the frame START; the END defaults to CURRENT ROW.
+		s, err := p.parseFrameBound()
+		if err != nil {
+			return nil, err
+		}
+		start, end = s, FrameBound{Kind: FrameCurrentRow}
+	}
+	if p.peekKeyword() == "exclude" {
+		return nil, NewError(FeatureNotSupported, "frame EXCLUDE is not supported yet")
+	}
+	return &WindowFrame{Mode: mode, Start: start, End: end}, nil
+}
+
+// parseFrameBound parses one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`, `CURRENT ROW`, or
+// `expr PRECEDING|FOLLOWING` (spec/design/window.md §6).
+func (p *Parser) parseFrameBound() (FrameBound, error) {
+	switch p.peekKeyword() {
+	case "unbounded":
+		p.advance()
+		switch p.peekKeyword() {
+		case "preceding":
+			p.advance()
+			return FrameBound{Kind: FrameUnboundedPreceding}, nil
+		case "following":
+			p.advance()
+			return FrameBound{Kind: FrameUnboundedFollowing}, nil
+		default:
+			return FrameBound{}, NewError(SyntaxError, "expected PRECEDING or FOLLOWING after UNBOUNDED")
+		}
+	case "current":
+		p.advance()
+		if err := p.expectKeyword("row"); err != nil {
+			return FrameBound{}, err
+		}
+		return FrameBound{Kind: FrameCurrentRow}, nil
+	default:
+		e, err := p.parseExpr()
+		if err != nil {
+			return FrameBound{}, err
+		}
+		switch p.peekKeyword() {
+		case "preceding":
+			p.advance()
+			return FrameBound{Kind: FramePreceding, Offset: e}, nil
+		case "following":
+			p.advance()
+			return FrameBound{Kind: FrameFollowing, Offset: e}, nil
+		default:
+			return FrameBound{}, NewError(SyntaxError, "expected PRECEDING or FOLLOWING in frame bound")
+		}
+	}
 }
 
 // parseWindowOrderBy parses an OVER clause's optional `ORDER BY <key> ("," <key>)*` and returns
