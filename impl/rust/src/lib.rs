@@ -356,7 +356,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // host-loaded IANA time-zone data (spec/design/timezones.md §6, grammar.md §49): convert
     // timestamptz↔timestamp through a named zone or fixed offset. A zone is provided by a host-loaded
     // `JTZ` bundle (the `# load-timezone:` directive loads jed's pinned spec/tz/fixtures/tzdata.jtz);
-    // `UTC` and fixed offsets are built in. Unknown zone 22023, non-text zone 42804; the `timezone`
+    // `UTC` and fixed offsets are built in. Unknown zone 22023, non-text zone 42883; the `timezone`
     // cost unit. No on-disk change (timestamptz is UTC — §2).
     "expr.at_time_zone",
     // Per-column COLLATE in CREATE TABLE (collation slice 1d, spec/design/collation.md §1/§5): a

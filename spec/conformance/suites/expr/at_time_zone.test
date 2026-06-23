@@ -124,8 +124,9 @@ SELECT timestamptz '-infinity' AT TIME ZONE 'UTC'
 statement error 22023
 SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'Mars/Phobos'
 
-# A non-text zone is 42804 (datatype_mismatch)
-statement error 42804
+# A non-text zone is 42883 — PG resolves AT TIME ZONE via function overload (timezone(text, …)), so
+# a non-text first argument is "no such function", not a datatype_mismatch (oracle-pinned).
+statement error 42883
 SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 12345
 
 # ============================================================================================

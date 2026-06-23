@@ -2250,8 +2250,10 @@ SELECT now() AT TIME ZONE 'UTC'                  -- UTC and fixed ±HH:MM offset
 ```
 
 - **Result type.** `timestamptz AT TIME ZONE zone → timestamp` (the zone-less local reading);
-  `timestamp AT TIME ZONE zone → timestamptz` (the UTC instant). Any other left operand type is
-  `42883` (no such operator). The `zone` operand is a **text** expression evaluated per row.
+  `timestamp AT TIME ZONE zone → timestamptz` (the UTC instant). Any other left operand type — **or
+  a non-text `zone`** — is `42883` (PG resolves `AT TIME ZONE` via the `timezone(zone, value)`
+  function overload, so a wrong-typed argument is "no such function", oracle-pinned). The `zone`
+  operand is a **text** expression evaluated per row.
 - **Precedence.** `AT TIME ZONE` binds **tighter than the comparison operators and `||`, looser than
   the additive/`::`/postfix operators** ([grammar.ebnf](../grammar/grammar.ebnf), matching PG): it is
   parsed as a left-associative infix operator at PG's `AT` precedence rung, above `BETWEEN`/`IN` and

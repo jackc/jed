@@ -691,7 +691,7 @@ where_clause   ::= "WHERE" expr
  * ../functions/catalog.toml (the `precedence` field) — the hand-written parsers
  * and that table must agree (see ../design/functions.md). Levels:
  *   OR  <  AND  <  NOT  <  comparison/IS NULL  <  concat (|| @> <@ &&)  <  additive  <  multiplicative
- *       <  unary minus  <  postfix (`::` cast, `.field`/`.*` field selection)  <  primary
+ *       <  AT TIME ZONE  <  unary minus  <  postfix (`::` cast, `.field`/`.*` field selection)  <  primary
  */
 expr           ::= or_expr
 
@@ -757,7 +757,14 @@ concat         ::= additive ( ( "||" | "@>" | "<@" | "&&" ) additive )*
 
 additive       ::= multiplicative ( ("+" | "-") multiplicative )*
 
-multiplicative ::= unary ( ("*" | "/" | "%") unary )*
+multiplicative ::= at_time_zone ( ("*" | "/" | "%") at_time_zone )*
+
+/* The AT TIME ZONE operator (../design/grammar.md §49, ../design/timezones.md §6): a
+ * left-associative infix operator binding tighter than `* / %` / additive / comparisons,
+ * looser than COLLATE / `::` / unary minus (PostgreSQL's %left AT). `value AT TIME ZONE zone`
+ * desugars to the function call `timezone(zone, value)`. AT/TIME/ZONE are non-reserved words
+ * matched as a three-token sequence, so a column named at/time/zone is unaffected. */
+at_time_zone   ::= unary ( "AT" "TIME" "ZONE" unary )*
 
 unary          ::= "-" unary
                  | postfix

@@ -11354,17 +11354,19 @@ function resolveTimezone(
 ): { node: RExpr; type: ResolvedType } {
   if (e.args.length !== 2) throw noFuncOverload("timezone");
   const zone = resolve(scope, e.args[0], "text", ag, params);
-  if (zone.type.kind !== "text" && zone.type.kind !== "null") {
-    throw engineError("datatype_mismatch", "AT TIME ZONE zone must be text");
-  }
   const value = resolve(scope, e.args[1], null, ag, params);
-  if (value.type.kind === "timestamptz") {
+  // A non-text zone, or a non-timestamp value, is 42883 — PG resolves AT TIME ZONE via function
+  // overload (timezone(text, timestamptz) / timezone(text, timestamp)), so any other arg pair is "no
+  // such function" (PG-matching, oracle-pinned), not a datatype_mismatch. A NULL zone is allowed (it
+  // propagates to NULL at eval).
+  const zoneOk = zone.type.kind === "text" || zone.type.kind === "null";
+  if (zoneOk && value.type.kind === "timestamptz") {
     return {
       node: { kind: "atTimeZone", zone: zone.node, value: value.node, toTimestamptz: false },
       type: { kind: "timestamp" },
     };
   }
-  if (value.type.kind === "timestamp") {
+  if (zoneOk && value.type.kind === "timestamp") {
     return {
       node: { kind: "atTimeZone", zone: zone.node, value: value.node, toTimestamptz: true },
       type: { kind: "timestamptz" },

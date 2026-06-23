@@ -14252,19 +14252,15 @@ fn resolve_timezone(
     // args[0] = zone (text), args[1] = value (timestamp/timestamptz). The AT TIME ZONE desugar puts
     // the zone first, matching PostgreSQL's `timezone(text, timestamptz)` signature.
     let (zone_r, zone_t) = resolve(scope, &args[0], Some(ScalarType::Text), agg, params)?;
-    match zone_t {
-        ResolvedType::Text | ResolvedType::Null => {}
-        _ => {
-            return Err(EngineError::new(
-                SqlState::DatatypeMismatch,
-                "AT TIME ZONE zone must be text",
-            ));
-        }
-    }
     let (value_r, value_t) = resolve(scope, &args[1], None, agg, params)?;
-    let (to_timestamptz, result) = match value_t {
-        ResolvedType::Timestamptz => (false, ResolvedType::Timestamp),
-        ResolvedType::Timestamp => (true, ResolvedType::Timestamptz),
+    // A non-text zone, or a non-timestamp value, is `42883` — PG resolves AT TIME ZONE via function
+    // overload (`timezone(text, timestamptz)` / `timezone(text, timestamp)`), so any other arg pair
+    // is "no such function" (PG-matching, oracle-pinned), not a datatype_mismatch. A NULL zone is
+    // allowed (it propagates to NULL at eval).
+    let zone_ok = matches!(zone_t, ResolvedType::Text | ResolvedType::Null);
+    let (to_timestamptz, result) = match (zone_ok, value_t) {
+        (true, ResolvedType::Timestamptz) => (false, ResolvedType::Timestamp),
+        (true, ResolvedType::Timestamp) => (true, ResolvedType::Timestamptz),
         _ => return Err(no_func_overload("timezone")),
     };
     Ok((

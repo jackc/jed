@@ -11,6 +11,17 @@
 #   sql     the record's SQL, matched after whitespace-normalization
 #   reason  why jed departs from PostgreSQL here
 
+# --- AT TIME ZONE over a legacy alias: jed's starter JTZ bundle (spec/tz/2026a) ships the link
+# US/Eastern -> America/New_York, so a query resolves it. The live postgres:18 oracle in this
+# devcontainer is built against a tzdata set WITHOUT the legacy `US/*` backward-compatibility names
+# (pg_timezone_names has 0 rows for it), so PG raises "time zone not recognized". This is an
+# environment/data difference (which zones each side loaded), not a jed semantic divergence — jed's
+# link resolution is independently pinned cross-core by spec/tz/vectors/tzif.toml. Keep jed's answer.
+[[override]]
+file = "expr/at_time_zone.test"
+sql = "SELECT timestamptz '2024-01-15 12:00:00+00' AT TIME ZONE 'US/Eastern'"
+reason = "jed's starter JTZ bundle ships the IANA link US/Eastern -> America/New_York (timezones.md §4, spec/tz/2026a/links.tsv), so jed resolves it to EST (2024-01-15 07:00:00). The live oracle's PG was built without the legacy US/* alias names (0 rows in pg_timezone_names), so it raises 22023. A data-availability difference between the two tz sets, not a semantic divergence; jed's link resolution is pinned cross-core by spec/tz/vectors/tzif.toml."
+
 # --- make_interval named notation: jed accepts only the `=>` spelling. PostgreSQL also accepts
 # the legacy `:=`, so this call SUCCEEDS in PG (returns 00:00:01) but jed rejects it 42601.
 [[override]]

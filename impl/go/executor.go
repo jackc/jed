@@ -14330,19 +14330,21 @@ func resolveTimezone(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
-	if zoneT.kind != rtText && zoneT.kind != rtNull {
-		return nil, resolvedType{}, NewError(DatatypeMismatch, "AT TIME ZONE zone must be text")
-	}
 	valueR, valueT, err := resolve(s, *fc.Args[1], nil, ag, params)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
+	// A non-text zone, or a non-timestamp value, is 42883 — PG resolves AT TIME ZONE via function
+	// overload (timezone(text, timestamptz) / timezone(text, timestamp)), so any other arg pair is
+	// "no such function" (PG-matching, oracle-pinned), not a datatype_mismatch. A NULL zone is allowed
+	// (it propagates to NULL at eval).
+	zoneOK := zoneT.kind == rtText || zoneT.kind == rtNull
 	var toTimestamptz bool
 	var result resolvedType
-	switch valueT.kind {
-	case rtTimestamptz:
+	switch {
+	case zoneOK && valueT.kind == rtTimestamptz:
 		toTimestamptz, result = false, resolvedType{kind: rtTimestamp}
-	case rtTimestamp:
+	case zoneOK && valueT.kind == rtTimestamp:
 		toTimestamptz, result = true, resolvedType{kind: rtTimestamptz}
 	default:
 		return nil, resolvedType{}, noFuncOverload("timezone")
