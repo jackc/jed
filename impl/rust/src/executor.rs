@@ -13530,6 +13530,27 @@ impl Acc {
         Ok(())
     }
 
+    /// Un-fold one input value — the inverse of `fold` — used ONLY by the sliding-window
+    /// optimization (window.md §5.2/§8) for the exactly-invertible COUNT / COUNT(*) (integer
+    /// counters: add-then-remove is exact and order-independent). Every other accumulator is
+    /// never un-folded — a moving frame over SUM/AVG/MIN/MAX/float re-folds from scratch instead
+    /// (decimal scale, intermediate-overflow trap order, and float non-associativity make them
+    /// unsafe to invert). Charges nothing (a count step is unmetered like its fold).
+    fn unfold(&mut self, value: Value, _m: &mut Meter) -> Result<()> {
+        match self {
+            Acc::CountStar(n) => *n -= 1,
+            Acc::Count(n) => {
+                if !matches!(value, Value::Null) {
+                    *n -= 1;
+                }
+            }
+            _ => {
+                unreachable!("only COUNT/COUNT(*) are un-folded by the sliding-window optimization")
+            }
+        }
+        Ok(())
+    }
+
     /// Produce the aggregate's final value over the group. COUNT → its count (0 over empty);
     /// SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
     fn finalize(self) -> Result<Value> {
@@ -24412,6 +24433,54 @@ impl<'a> FrameCtx<'a> {
     }
 }
 
+/// Group window specs that share an identical PARTITION BY + ORDER BY (column slots + direction /
+/// NULLS / collation), returning the spec indices per group. One partition + per-partition sort
+/// then serves every spec in a group (window.md §5.2 — the shared partition/sort pass). Grouping is
+/// stable and the per-spec slot mapping is preserved (each spec still writes its result column in
+/// spec order), so the optimization is purely a wall-clock win — the cost is unchanged (§8).
+fn group_window_specs(specs: &[WindowSpec]) -> Vec<Vec<usize>> {
+    let mut groups: Vec<Vec<usize>> = Vec::new();
+    'spec: for (i, spec) in specs.iter().enumerate() {
+        for g in groups.iter_mut() {
+            let rep = &specs[g[0]];
+            if rep.partition == spec.partition && rep.order == spec.order {
+                g.push(i);
+                continue 'spec;
+            }
+        }
+        groups.push(vec![i]);
+    }
+    groups
+}
+
+/// Precompute each row's collated UCA sort-key bytes for `order`'s collated slots (window.md §3/§5),
+/// indexed in parallel with `rows`, so the partition sort AND peer determination (ranking, frame
+/// peer groups) honor the collation identically. Built once per group (the decorate pattern); an
+/// unmapped code point fails 0A000 at this deterministic per-row point. Empty when no key is
+/// collated, and the comparator stays on raw bytes.
+fn window_coll_keys(
+    rows: &[Row],
+    order: &[crate::spill::SortKey],
+) -> Result<Vec<Vec<Option<Vec<u8>>>>> {
+    if !order.iter().any(|(_, _, _, c)| c.is_some()) {
+        return Ok(Vec::new());
+    }
+    let mut all = Vec::with_capacity(rows.len());
+    for row in rows.iter() {
+        let mut keys = Vec::new();
+        for (idx, _, _, coll) in order {
+            if let Some(c) = coll {
+                keys.push(match &row[*idx] {
+                    Value::Text(s) => Some(collation::sort_key(c, s)?),
+                    _ => None, // NULL (a collated slot is text) — handled by NULL placement
+                });
+            }
+        }
+        all.push(keys);
+    }
+    Ok(all)
+}
+
 fn apply_window_stage(
     rows: &mut [Row],
     specs: &[WindowSpec],
@@ -24422,13 +24491,25 @@ fn apply_window_stage(
     if n == 0 {
         return Ok(());
     }
-    for spec in specs {
+    // The shared partition/sort pass (window.md §5.2): specs that share an identical PARTITION BY +
+    // ORDER BY are partitioned and sorted ONCE (the expensive step), then each computes its own
+    // results over the shared sorted partitions. The partition + sort are unmetered (§8), so this is
+    // purely a wall-clock win — the per-spec result/frame metering, and thus the cost, are unchanged.
+    let groups = group_window_specs(specs);
+    let mut spec_group = vec![0usize; specs.len()];
+    let mut group_cache: Vec<(Vec<Vec<usize>>, Vec<Vec<Option<Vec<u8>>>>)> =
+        Vec::with_capacity(groups.len());
+    for (gi, group) in groups.iter().enumerate() {
+        let rep = &specs[group[0]];
+        for &si in group {
+            spec_group[si] = gi;
+        }
         // Partition the row indices by the partition-key values. The map is an index only (never
         // iterated); output comes from the insertion-ordered `partitions` (no hash-order leak).
         let mut index: HashMap<Vec<Value>, usize> = HashMap::new();
         let mut partitions: Vec<Vec<usize>> = Vec::new();
         for (i, row) in rows.iter().enumerate() {
-            let key: Vec<Value> = spec.partition.iter().map(|&p| row[p].clone()).collect();
+            let key: Vec<Value> = rep.partition.iter().map(|&p| row[p].clone()).collect();
             let pi = match index.get(&key) {
                 Some(&p) => p,
                 None => {
@@ -24440,39 +24521,26 @@ fn apply_window_stage(
             };
             partitions[pi].push(i);
         }
-        // Precompute each row's collated UCA sort-key bytes for the spec's collated ORDER BY slots
-        // (if any), indexed in parallel with `rows`, so the partition sort AND peer determination
-        // (ranking, frame peer groups) honor the collation identically (window.md §3/§5). Built once
-        // per spec (the decorate pattern); an unmapped code point fails 0A000 at this deterministic
-        // per-row point. With no collated key this is empty and the comparator stays on raw bytes.
-        let coll_keys: Vec<Vec<Option<Vec<u8>>>> =
-            if spec.order.iter().any(|(_, _, _, c)| c.is_some()) {
-                let mut all = Vec::with_capacity(n);
-                for row in rows.iter() {
-                    let mut keys = Vec::new();
-                    for (idx, _, _, coll) in &spec.order {
-                        if let Some(c) = coll {
-                            keys.push(match &row[*idx] {
-                                Value::Text(s) => Some(collation::sort_key(c, s)?),
-                                _ => None, // NULL (a collated slot is text) — handled by placement
-                            });
-                        }
-                    }
-                    all.push(keys);
-                }
-                all
-            } else {
-                Vec::new()
-            };
-        // Compute each row's result into a per-row slot, then append in input order.
-        let mut results: Vec<Value> = vec![Value::Null; n];
-        for part in &partitions {
-            // Sort the partition's row indices by the window ORDER BY. `slice::sort_by` is stable,
-            // so a full tie keeps ascending original index = PK scan order (the §3 PK tie-break).
-            let mut ordered = part.clone();
-            if !spec.order.is_empty() {
-                ordered.sort_by(|&a, &b| cmp_window_rows(a, b, rows, &spec.order, &coll_keys));
+        // Collated UCA sort-key bytes for the shared order's collated slots (window.md §3/§5), built
+        // once per group; an unmapped code point fails 0A000 here. Empty when no key is collated.
+        let coll_keys = window_coll_keys(rows, &rep.order)?;
+        // Sort each partition by the shared window ORDER BY. `slice::sort_by` is stable, so a full
+        // tie keeps ascending original index = PK scan order (the §3 PK tie-break).
+        for part in &mut partitions {
+            if !rep.order.is_empty() {
+                part.sort_by(|&a, &b| cmp_window_rows(a, b, rows, &rep.order, &coll_keys));
             }
+        }
+        group_cache.push((partitions, coll_keys));
+    }
+    for (si, spec) in specs.iter().enumerate() {
+        // Reuse this spec's group's shared sorted partitions + collation keys (computed once above).
+        // `ordered` is cloned per partition (a cheap index vector; the costly sort is shared) and
+        // `coll_keys` per spec, so the per-plan computation below reads them by value, unchanged.
+        let (sorted_partitions, coll_keys) = &group_cache[spec_group[si]];
+        let coll_keys = coll_keys.clone();
+        let mut results: Vec<Value> = vec![Value::Null; n];
+        for ordered in sorted_partitions.iter().cloned() {
             match spec.plan {
                 WindowPlan::RowNumber => {
                     for (pos, &ri) in ordered.iter().enumerate() {
@@ -24666,28 +24734,99 @@ fn apply_window_stage(
                             }
                         }
                     } else {
-                        // EXPLICIT frame (window.md §6): fold each row's frame fresh — naive
-                        // O(partition²), the metered `window_frame_step` bounding it. `EXCLUDE`
-                        // rows are dropped before folding (so they are neither metered nor counted).
+                        // EXPLICIT frame (window.md §5.2/§6). The sorted partition makes the frame
+                        // bounds [lo, hi) monotonic non-decreasing in `pos`, so a NO-EXCLUDE
+                        // aggregate CARRIES one accumulator across rows rather than re-folding each
+                        // frame from scratch (the sliding-window optimization):
+                        //   • an EXPANDING frame (start UNBOUNDED PRECEDING ⇒ lo ≡ 0) folds each
+                        //     entering row once as `hi` advances — byte-identical for EVERY
+                        //     aggregate, since the fold order is the sorted-prefix order the naive
+                        //     path uses (overflow traps / canonical float fold / decimal scale all
+                        //     match) — O(n);
+                        //   • a MOVING frame additionally UN-folds the rows leaving on the left, but
+                        //     only for the exactly-invertible COUNT / COUNT(*) — O(n);
+                        //   • a MOVING frame over SUM/AVG/MIN/MAX/float (not safely invertible) and
+                        //     ANY frame with EXCLUDE re-fold from scratch (the naive O(partition²)).
+                        // `window_frame_step` is charged per folded AND per un-folded row, so it only
+                        // LOWERS; each row's operand is evaluated at most once (cached in `vals`), so
+                        // `operator_eval` never rises.
                         let ctx = FrameCtx::new(&ordered, rows, &spec.order, &coll_keys);
                         let exclude = spec
                             .frame
                             .as_ref()
                             .map_or(crate::ast::FrameExclusion::NoOthers, |f| f.exclude);
-                        for pos in 0..np {
-                            let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
-                            let mut acc = Acc::new(aggplan);
-                            for k in lo..hi {
-                                if ctx.is_excluded(pos, k, exclude) {
-                                    continue;
-                                }
-                                meter.charge(COSTS.window_frame_step);
-                                let v = opval(k, meter)?;
-                                acc.fold(v, meter)?;
+                        let mut vals: Vec<Option<Value>> = vec![None; np];
+                        let eval_at = |k: usize,
+                                       m: &mut Meter,
+                                       vals: &mut Vec<Option<Value>>|
+                         -> Result<Value> {
+                            if !has_operand {
+                                return Ok(Value::Null);
                             }
-                            meter.guard()?;
-                            meter.charge(COSTS.window_result);
-                            results[ordered[pos]] = acc.finalize()?;
+                            if vals[k].is_none() {
+                                vals[k] = Some(spec.args[0].eval(&rows[ordered[k]], env, m)?);
+                            }
+                            Ok(vals[k].as_ref().unwrap().clone())
+                        };
+                        if exclude != crate::ast::FrameExclusion::NoOthers {
+                            // EXCLUDE breaks the clean add/remove model → naive per-row re-fold (the
+                            // dropped rows are neither metered nor counted), over the cached operand.
+                            for pos in 0..np {
+                                let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
+                                let mut acc = Acc::new(aggplan);
+                                for k in lo..hi {
+                                    if ctx.is_excluded(pos, k, exclude) {
+                                        continue;
+                                    }
+                                    meter.charge(COSTS.window_frame_step);
+                                    let v = eval_at(k, meter, &mut vals)?;
+                                    acc.fold(v, meter)?;
+                                }
+                                meter.guard()?;
+                                meter.charge(COSTS.window_result);
+                                results[ordered[pos]] = acc.finalize()?;
+                            }
+                        } else {
+                            // SLIDING (monotone carry). `removable` aggregates un-fold the left edge;
+                            // the rest rebuild when `lo` advances (an expanding frame never advances
+                            // `lo`, so it only ever adds — the universal byte-identical case).
+                            let removable = matches!(aggplan, AggPlan::CountStar | AggPlan::Count);
+                            let mut acc = Acc::new(aggplan);
+                            let mut cur_lo = 0usize;
+                            let mut cur_hi = 0usize;
+                            for pos in 0..np {
+                                let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
+                                if !removable && lo > cur_lo {
+                                    // Left edge advanced over a non-invertible aggregate ⇒ rebuild.
+                                    acc = Acc::new(aggplan);
+                                    for k in lo..hi {
+                                        meter.charge(COSTS.window_frame_step);
+                                        let v = eval_at(k, meter, &mut vals)?;
+                                        acc.fold(v, meter)?;
+                                    }
+                                } else {
+                                    // Un-fold rows leaving on the left (invertible only; empty when
+                                    // `lo == cur_lo`) …
+                                    let rem_hi = lo.min(cur_hi);
+                                    for k in cur_lo..rem_hi {
+                                        meter.charge(COSTS.window_frame_step);
+                                        let v = eval_at(k, meter, &mut vals)?;
+                                        acc.unfold(v, meter)?;
+                                    }
+                                    // … and fold rows entering on the right.
+                                    let add_lo = cur_hi.max(lo);
+                                    for k in add_lo..hi {
+                                        meter.charge(COSTS.window_frame_step);
+                                        let v = eval_at(k, meter, &mut vals)?;
+                                        acc.fold(v, meter)?;
+                                    }
+                                }
+                                cur_lo = lo;
+                                cur_hi = hi;
+                                meter.guard()?;
+                                meter.charge(COSTS.window_result);
+                                results[ordered[pos]] = acc.clone().finalize()?;
+                            }
                         }
                     }
                 }

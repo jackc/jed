@@ -123,17 +123,23 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       AVG→decimal), grouping-error `42803`. → [aggregates.md](spec/design/aggregates.md)
   - [ ] _follow-on:_ `COUNT(DISTINCT x)`, `SELECT DISTINCT` in an aggregate query, GROUP BY by
         expression/ordinal/alias, functional-dependency grouping, `GROUPING SETS`/`FILTER`/ordered-set.
-- [x] **Window functions (`OVER`)** — ✅ **COMPLETE (S0–S5, all three cores).** Per-row values folded
-      over a related row set in a dedicated **window stage** (after `GROUP BY`/`HAVING`, before
-      `ORDER BY`/`LIMIT`). row_number/rank/dense_rank/percent_rank/cume_dist/ntile, lag/lead, the
-      aggregates as window functions (running + explicit ROWS frames), first_value/last_value/
-      nth_value, and the `WINDOW` named-window clause + `OVER name`. New codes 42P20/22013/22014/22016;
-      cost units `window_result`/`window_frame_step`; the `[[window]]` catalog array. Divergences:
-      within-partition order fully resolved (D1), percent_rank/cume_dist → decimal not float8 (D2),
-      float-keyed RANGE frames 0A000 (D3). Deferred follow-ons (each 0A000/own slice): explicit
-      RANGE/GROUPS frames + value offsets, frame EXCLUDE, window + GROUP BY/aggregate combined, a
-      base-window-extending definition, collated window ORDER BY, and the shared partition/sort
-      optimization. → [window.md](spec/design/window.md)
+- [x] **Window functions (`OVER`)** — ✅ **COMPLETE (S0–S10, all three cores) + the sliding/sharing
+      optimization.** Per-row values folded over a related row set in a dedicated **window stage**
+      (after `GROUP BY`/`HAVING`, before `ORDER BY`/`LIMIT`). row_number/rank/dense_rank/percent_rank/
+      cume_dist/ntile, lag/lead, the aggregates as window functions (running + explicit
+      ROWS/RANGE/GROUPS frames + value offsets + EXCLUDE), first_value/last_value/nth_value, the
+      `WINDOW` named-window clause + `OVER name` + base-window extension, combination with GROUP
+      BY/aggregates, and a collation-honoring `ORDER BY`. The window stage **shares one partition/sort
+      pass** across specs with an identical definition and **slides** a no-EXCLUDE aggregate's frame
+      accumulator (expanding = fold-once for every aggregate; moving `count` = un-fold the left edge) —
+      cost-lowering only, lowering `window_frame_step`/`operator_eval` cross-core-identically (a NoREC
+      `window` relation + the `window_running_sum`/`window_moving_count` benchmarks guard it). New codes
+      42P20/22013/22014/22016; cost units `window_result`/`window_frame_step`; the `[[window]]` catalog
+      array. Divergences: within-partition order fully resolved (D1), percent_rank/cume_dist → decimal
+      not float8 (D2), float-keyed RANGE frames 0A000 (D3). Deferred follow-ons: prefix-compatible
+      (not just identical) sort sharing, a safely-invertible moving `sum`/`avg`/`min`/`max`/float
+      slide, RANGE offsets over a float (D3) / timestamp / date key, general-expression window keys,
+      `FILTER`/`WITHIN GROUP`, `IGNORE NULLS`. → [window.md](spec/design/window.md)
 - [x] **Scalar functions `abs` / `round`** — first named per-row functions (`kind = "function"`).
       → [functions.md §9](spec/design/functions.md)
   - [ ] _follow-on:_ `ceil`/`floor`/`mod`/`sign`, text `length`/`lower`/`upper`, a general implicit

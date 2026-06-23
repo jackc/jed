@@ -13735,6 +13735,24 @@ func (a *acc) fold(v Value, m *Meter) error {
 	return nil
 }
 
+// unfold removes one input value — the inverse of fold — used ONLY by the sliding-window
+// optimization (window.md §5.2/§8) for the exactly-invertible COUNT / COUNT(*) (integer counters:
+// add-then-remove is exact and order-independent). Every other accumulator is never un-folded — a
+// moving frame over SUM/AVG/MIN/MAX/float re-folds from scratch instead (decimal scale,
+// intermediate-overflow trap order, and float non-associativity make them unsafe to invert).
+func (a *acc) unfold(v Value, _ *Meter) {
+	switch a.plan {
+	case planCountStar:
+		a.count--
+	case planCount:
+		if !v.IsNull() {
+			a.count--
+		}
+	default:
+		panic("only COUNT/COUNT(*) are un-folded by the sliding-window optimization")
+	}
+}
+
 // finalize produces the aggregate's final value over the group. COUNT → its count (0 over
 // empty); SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
 func (a *acc) finalize() (Value, error) {
@@ -22130,15 +22148,30 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 	if n == 0 {
 		return nil
 	}
-	for _, spec := range specs {
+	// The shared partition/sort pass (window.md §5.2): specs that share an identical PARTITION BY +
+	// ORDER BY are partitioned and sorted ONCE (the expensive step), then each computes its own
+	// results over the shared sorted partitions. The partition + sort are unmetered (§8), so this is
+	// purely a wall-clock win — the per-spec result/frame metering, and thus the cost, are unchanged.
+	groups := groupWindowSpecs(specs)
+	specGroup := make([]int, len(specs))
+	type groupShared struct {
+		partitions [][]int
+		collKeys   [][][]byte
+	}
+	cache := make([]groupShared, len(groups))
+	for gi, group := range groups {
+		rep := specs[group[0]]
+		for _, si := range group {
+			specGroup[si] = gi
+		}
 		// Partition the row indices by the partition-key values. The map is an index only (never
 		// iterated); output comes from the insertion-ordered `partitions` (no map-order leak). The
 		// key is the value-canonical distinctRowKey (collapses 1.5/1.50, groups NULL with NULL).
 		index := make(map[string]int)
 		var partitions [][]int
 		for i := range rows {
-			key := make([]Value, len(spec.partition))
-			for j, p := range spec.partition {
+			key := make([]Value, len(rep.partition))
+			for j, p := range rep.partition {
 				key[j] = rows[i][p]
 			}
 			k := distinctRowKey(key)
@@ -22150,28 +22183,33 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 			}
 			partitions[pi] = append(partitions[pi], i)
 		}
-		// Precompute each row's collated UCA sort-key bytes for the spec's collated ORDER BY slots (if
-		// any), so the partition sort AND peer determination honor the collation identically (window.md
-		// §3/§5). nil when no key is collated; an unmapped code point fails 0A000 here.
-		collKeys, err := windowCollKeys(rows, spec.order)
+		// Collated UCA sort-key bytes for the shared order's collated slots (window.md §3/§5); nil
+		// when no key is collated, an unmapped code point fails 0A000 here.
+		collKeys, err := windowCollKeys(rows, rep.order)
 		if err != nil {
 			return err
 		}
+		// Sort each partition by the shared window ORDER BY. SliceStable keeps a full tie at
+		// ascending original index = PK scan order (the §3 PK tie-break).
+		if len(rep.order) > 0 {
+			for _, part := range partitions {
+				sort.SliceStable(part, func(a, b int) bool {
+					return cmpWindowRows(part[a], part[b], rows, rep.order, collKeys) < 0
+				})
+			}
+		}
+		cache[gi] = groupShared{partitions: partitions, collKeys: collKeys}
+	}
+	for si := range specs {
+		spec := specs[si]
+		shared := cache[specGroup[si]]
+		collKeys := shared.collKeys
 		// Compute each row's result into a per-row slot, then append in input order.
 		results := make([]Value, n)
 		for i := range results {
 			results[i] = NullValue()
 		}
-		for _, part := range partitions {
-			// Sort the partition's row indices by the window ORDER BY. SliceStable keeps a full tie
-			// at ascending original index = PK scan order (the §3 PK tie-break).
-			ordered := part
-			if len(spec.order) > 0 {
-				ordered = append([]int(nil), part...)
-				sort.SliceStable(ordered, func(a, b int) bool {
-					return cmpWindowRows(ordered[a], ordered[b], rows, spec.order, collKeys) < 0
-				})
-			}
+		for _, ordered := range shared.partitions {
 			switch spec.plan {
 			case planRowNumber:
 				for pos, ri := range ordered {
@@ -22392,39 +22430,134 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 						}
 					}
 				} else {
-					// EXPLICIT frame (window.md §6): fold each row's [lo, hi) fresh — naive
-					// O(partition²), the metered window_frame_step bounding it. EXCLUDE rows are
-					// dropped before folding (so they are neither metered nor counted).
+					// EXPLICIT frame (window.md §5.2/§6). The sorted partition makes the frame bounds
+					// [lo, hi) monotonic non-decreasing in pos, so a NO-EXCLUDE aggregate CARRIES one
+					// accumulator across rows rather than re-folding each frame from scratch (the
+					// sliding-window optimization):
+					//   • an EXPANDING frame (start UNBOUNDED PRECEDING ⇒ lo ≡ 0) folds each entering
+					//     row once as hi advances — byte-identical for EVERY aggregate (fold order is
+					//     the sorted-prefix order the naive path uses) — O(n);
+					//   • a MOVING frame additionally UN-folds the rows leaving on the left, but only
+					//     for the exactly-invertible COUNT / COUNT(*) — O(n);
+					//   • a MOVING frame over SUM/AVG/MIN/MAX/float (not safely invertible) and ANY
+					//     frame with EXCLUDE re-fold from scratch (the naive O(partition²)).
+					// window_frame_step is charged per folded AND per un-folded row, so it only LOWERS;
+					// each row's operand is evaluated at most once (cached in vals), so operator_eval
+					// never rises.
 					ctx := newFrameCtx(ordered, rows, spec.order, collKeys)
 					exclude := frameExclusion(spec.frame)
-					for pos := 0; pos < np; pos++ {
-						lo, hi, err := ctx.bounds(pos, spec.frame)
-						if err != nil {
-							return err
+					vals := make([]Value, np)
+					valSet := make([]bool, np)
+					evalAt := func(k int) (Value, error) {
+						if !hasOperand {
+							return NullValue(), nil
 						}
-						a := newAcc(spec.aggPlan)
-						for k := lo; k < hi; k++ {
-							if ctx.isExcluded(pos, k, exclude) {
-								continue
+						if !valSet[k] {
+							v, err := spec.args[0].eval(rows[ordered[k]], env, meter)
+							if err != nil {
+								return NullValue(), err
 							}
-							meter.Charge(Costs.WindowFrameStep)
-							v, err := opval(k)
+							vals[k], valSet[k] = v, true
+						}
+						return vals[k], nil
+					}
+					if exclude != FrameExcludeNoOthers {
+						// EXCLUDE breaks the clean add/remove model → naive per-row re-fold (dropped
+						// rows are neither metered nor counted), over the cached operand.
+						for pos := 0; pos < np; pos++ {
+							lo, hi, err := ctx.bounds(pos, spec.frame)
 							if err != nil {
 								return err
 							}
-							if err := a.fold(v, meter); err != nil {
+							a := newAcc(spec.aggPlan)
+							for k := lo; k < hi; k++ {
+								if ctx.isExcluded(pos, k, exclude) {
+									continue
+								}
+								meter.Charge(Costs.WindowFrameStep)
+								v, err := evalAt(k)
+								if err != nil {
+									return err
+								}
+								if err := a.fold(v, meter); err != nil {
+									return err
+								}
+							}
+							if err := meter.Guard(); err != nil {
 								return err
 							}
+							meter.Charge(Costs.WindowResult)
+							out, err := a.finalize()
+							if err != nil {
+								return err
+							}
+							results[ordered[pos]] = out
 						}
-						if err := meter.Guard(); err != nil {
-							return err
+					} else {
+						// SLIDING (monotone carry). removable aggregates un-fold the left edge; the rest
+						// rebuild when lo advances (an expanding frame never advances lo, so it only adds).
+						removable := spec.aggPlan == planCountStar || spec.aggPlan == planCount
+						a := newAcc(spec.aggPlan)
+						curLo, curHi := 0, 0
+						for pos := 0; pos < np; pos++ {
+							lo, hi, err := ctx.bounds(pos, spec.frame)
+							if err != nil {
+								return err
+							}
+							if !removable && lo > curLo {
+								// Left edge advanced over a non-invertible aggregate ⇒ rebuild over [lo, hi).
+								a = newAcc(spec.aggPlan)
+								for k := lo; k < hi; k++ {
+									meter.Charge(Costs.WindowFrameStep)
+									v, err := evalAt(k)
+									if err != nil {
+										return err
+									}
+									if err := a.fold(v, meter); err != nil {
+										return err
+									}
+								}
+							} else {
+								// Un-fold rows leaving on the left (invertible only; empty when lo == curLo) …
+								remHi := lo
+								if curHi < remHi {
+									remHi = curHi
+								}
+								for k := curLo; k < remHi; k++ {
+									meter.Charge(Costs.WindowFrameStep)
+									v, err := evalAt(k)
+									if err != nil {
+										return err
+									}
+									a.unfold(v, meter)
+								}
+								// … and fold rows entering on the right.
+								addLo := curHi
+								if lo > addLo {
+									addLo = lo
+								}
+								for k := addLo; k < hi; k++ {
+									meter.Charge(Costs.WindowFrameStep)
+									v, err := evalAt(k)
+									if err != nil {
+										return err
+									}
+									if err := a.fold(v, meter); err != nil {
+										return err
+									}
+								}
+							}
+							curLo, curHi = lo, hi
+							if err := meter.Guard(); err != nil {
+								return err
+							}
+							meter.Charge(Costs.WindowResult)
+							out, err := a.clone().finalize()
+							if err != nil {
+								return err
+							}
+							results[ordered[pos]] = out
 						}
-						meter.Charge(Costs.WindowResult)
-						out, err := a.finalize()
-						if err != nil {
-							return err
-						}
-						results[ordered[pos]] = out
 					}
 				}
 			case planFirstValue, planLastValue, planNthValue:
@@ -22508,6 +22641,31 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 		}
 	}
 	return nil
+}
+
+// groupWindowSpecs groups window specs that share an identical PARTITION BY + ORDER BY (column
+// slots + direction / NULLS / collation; orderSlot is comparable, collations are interned so the
+// pointer compares equal), returning the spec indices per group. One partition + per-partition sort
+// then serves every spec in a group (window.md §5.2 — the shared partition/sort pass). Grouping is
+// stable and the per-spec slot mapping is preserved (each spec still writes its result column in
+// spec order), so the optimization is purely a wall-clock win — the cost is unchanged (§8).
+func groupWindowSpecs(specs []windowSpec) [][]int {
+	var groups [][]int
+	for i := range specs {
+		placed := false
+		for gi := range groups {
+			rep := specs[groups[gi][0]]
+			if slices.Equal(rep.partition, specs[i].partition) && slices.Equal(rep.order, specs[i].order) {
+				groups[gi] = append(groups[gi], i)
+				placed = true
+				break
+			}
+		}
+		if !placed {
+			groups = append(groups, []int{i})
+		}
+	}
+	return groups
 }
 
 // cmpRowsByOrder compares two rows by the (all-C) ORDER BY keys — the first non-equal key decides; a

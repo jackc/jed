@@ -21,7 +21,11 @@
 > and `WINDOW w2 AS (w …)` inherit the base's `PARTITION BY` (and its `ORDER BY` if any) and supply
 > their own frame (§5) — and a window `ORDER BY` **honors collation** (S10): a per-key `COLLATE` and a
 > text column's frozen implicit collation order text by the collation's UCA sort key, driving both the
-> per-partition sort and peer determination (§3/§5). The remaining `0A000` items — `RANGE` offsets over a float (divergence D3) /
+> per-partition sort and peer determination (§3/§5). The window stage is also **optimized**
+> (cost-lowering only, never correctness — §5.2/§8): specs sharing an identical `PARTITION BY` +
+> `ORDER BY` are partitioned and sorted **once**, and a no-`EXCLUDE` aggregate **slides** its frame
+> accumulator (an expanding frame folds each row once for every aggregate; a moving `count` un-folds
+> the left edge) instead of re-folding each frame. The remaining `0A000` items — `RANGE` offsets over a float (divergence D3) /
 > timestamp / date ordering key (§6/§11), and **general-expression window keys** (an aggregate or
 > expression as a `PARTITION BY`/`ORDER BY` key, e.g. `ORDER BY sum(x)` — §11) — are deferred
 > follow-ons, not gaps.
@@ -266,8 +270,12 @@ A blocking stage between projection/aggregation and `DISTINCT`/`ORDER BY`:
    ([spill.md](spill.md)).
 2. For each **distinct window definition** (`partition_keys` + `order_keys` + frame): **partition**
    the buffer (value-canonical keys, an insertion-ordered partition list — §3), and **sort** each
-   partition by `order_keys` with the PK tie-break. In S0–S4 each `WindowSpec` may do its own
-   pass; S5 shares one pass across specs with an identical definition (the optimization).
+   partition by `order_keys` with the PK tie-break. **Specs that share an identical `partition_keys`
+   + `order_keys` are partitioned and sorted ONCE** (`group_window_specs` — the shared partition/sort
+   pass), and each then computes its own results over the shared sorted partitions; the partition +
+   sort are the expensive, **unmetered** step (§8), so sharing them lowers wall-clock without changing
+   the cost or the rows (`group_window_specs` is conservative — identical, not yet PostgreSQL's
+   prefix-compatible, definitions; §11).
    When an `order_key` is **collated** (S10), the spec's collated UCA sort-key bytes are decorated
    **once per row up front** (the query `ORDER BY`'s decorate-sort pattern; an unmapped code point is
    `0A000` at that deterministic per-row point), and one collation-aware comparator drives the sort
@@ -284,8 +292,11 @@ A blocking stage between projection/aggregation and `DISTINCT`/`ORDER BY`:
    - **`Lag`/`Lead`** → the value-expression of the row `offset` positions back/forward in the
      partition sequence, else the `default` (or `NULL`).
    - **`Agg(plan)`** → reuse the existing `Acc` ([executor.rs `Acc`]) folded over the row's
-     **frame** (§6) rather than the whole group. S3: the implicit default frame; S4: the explicit
-     frame.
+     **frame** (§6) rather than the whole group. S3: the implicit default frame; S4+ the explicit
+     frame. For a no-`EXCLUDE` explicit frame the accumulator is **carried** across rows (the
+     sliding-window optimization, §6/§8) — an expanding frame folds each row once, a moving
+     `count`/`count(*)` additionally un-folds the left edge (`Acc::unfold`) — instead of re-folding
+     each frame; a moving `sum`/`avg`/`min`/`max`/float and any `EXCLUDE` frame re-fold from scratch.
    - **`FirstValue`/`LastValue`/`NthValue`** → the value-expression of the first/last/nth row of
      the **frame**.
 4. The per-spec **finalize** (the `percent_rank`/`cume_dist`/`avg` division, the `Acc` finalize)
@@ -365,9 +376,15 @@ float (D3) / timestamp / date key stay `0A000`. A frame bound that contains a wi
 aggregate, a column reference, or a negative offset is rejected (`42P20`/`42803`/`0A000`/`22013` as
 appropriate, matching PG); a malformed `EXCLUDE` is `42601`.
 
-Frame evaluation is naive (re-fold per row, O(partition²) worst case) until the S5 sliding-window
-optimization; the cost meter (§8) bounds it so an untrusted running-window query still aborts on
-`max_cost`.
+Frame evaluation **slides** for a no-`EXCLUDE` aggregate (§5.2/§8): the sorted partition makes the
+frame bounds `[lo, hi)` monotonic non-decreasing, so the accumulator is carried across rows — an
+**expanding** frame (start `UNBOUNDED PRECEDING`) folds each row once (every aggregate, byte-identical
+because the fold order is the sorted-prefix order the naive path uses), a **moving** frame additionally
+un-folds the left edge for the invertible `count`/`count(*)`; a moving `sum`/`avg`/`min`/`max`/float
+re-folds from scratch when `lo` advances (the naive O(partition²) — decimal scale, the
+intermediate-overflow trap order, and float non-associativity make them unsafe to invert), as does
+any frame with `EXCLUDE`. The cost meter (§8) still bounds the work so an untrusted running-window
+query aborts on `max_cost`.
 
 ## 7. Where a window function may not appear (`42P20`)
 
@@ -397,11 +414,18 @@ precedent — their input cardinality is already bounded by upstream `storage_ro
 
 - **`window_result`** (weight 1) — once per `(input row × window function)` result materialized
   into the synthetic row; the window-stage analog of `aggregate_accumulate`.
-- **`window_frame_step`** (weight 1) — once per frame row folded into a frame-sensitive function's
-  accumulator. Bounds the per-frame work a naive O(partition²) frame scan can drive, so a
-  `max_cost` ceiling aborts an untrusted running-window query deterministically (`54P01`, §13).
-  The S5 sliding-window optimization only **lowers** this count; it never changes correctness or
-  the result.
+- **`window_frame_step`** (weight 1) — once per frame row folded **or un-folded** in a
+  frame-sensitive function's accumulator. The **sliding-window optimization** (§5.2/§6) lowers it:
+  a no-`EXCLUDE` aggregate carries one accumulator across the sorted partition, charging one step
+  per row **entering** the frame on the right (`fold`) plus, for the invertible `count`/`count(*)`,
+  one per row **leaving** on the left (`unfold`) — so an expanding frame is O(n) (each row folded
+  once) and a moving `count` is O(n) (each row folded + un-folded once). A moving
+  `sum`/`avg`/`min`/`max`/float (re-fold from scratch when `lo` advances) and any frame with
+  `EXCLUDE` keep the naive per-row re-fold (O(partition²) worst case). The optimization only
+  **lowers** this count — and the operand's `operator_eval`, since each folded row's operand is
+  evaluated once and cached — never raising either and never changing the result. Charged at the
+  identical per-fold/un-fold point in every core, so the count stays cross-core identical (§8/§13)
+  and a `max_cost` ceiling still aborts an untrusted running-window query deterministically (`54P01`).
 - **Reused unchanged**: `storage_row_read` per scanned input row; the window arguments' and
   partition/order keys' `operator_eval`s per input row; `row_produced` per emitted row; the
   projection's `operator_eval`s per emitted row.
@@ -466,6 +490,11 @@ Deliberate divergences from PostgreSQL, each registered in
   `0A000` permanently (D3). Non-literal/expression frame offsets are also out (literals only, like
   the `ROWS` narrowing).
 - **`float8` results** for `percent_rank`/`cume_dist` (D2) — out unless a future need overrides.
-- **The shared partition/sort pass** across distinct-but-compatible window definitions, and frame
-  sliding-window optimizations — S5 and beyond (cost-lowering only, never correctness).
+- **Wider sharing / sliding** — *cost-lowering only, never correctness; the landed core is §5.2/§8.*
+  The shared partition/sort pass groups specs with an **identical** partition+order; PostgreSQL's
+  prefix-**compatible** sharing (a shorter `ORDER BY` reusing a longer one's sort) is not yet done.
+  The frame slide carries the accumulator for an expanding frame (every aggregate) and a moving
+  `count`/`count(*)` (the invertible un-fold); a **moving `sum`/`avg`/`min`/`max`/float still re-folds
+  from scratch** — a safely-invertible decimal/float sum (guarding the result scale, the
+  intermediate-overflow trap order, and float associativity) is the open follow-on.
 - **`IGNORE NULLS`** on `lag`/`lead`/`first_value`/… (SQL:2011, PG does not support it) — out.

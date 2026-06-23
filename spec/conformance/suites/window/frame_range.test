@@ -40,7 +40,7 @@ SELECT id, sum(x) OVER (PARTITION BY g ORDER BY x RANGE BETWEEN 1 PRECEDING AND 
 # peer of the current key is included. Keys sorted 1,1,1,2,3,4,4,6; id4/id5 (x=4) accumulate through
 # the x=4 peer group: 1+1+1+2+3+4+4 = 16.
 # names: id, s
-# cost: 65
+# cost: 33
 query II nosort
 SELECT id, sum(x) OVER (ORDER BY x RANGE BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM t ORDER BY id
 ----

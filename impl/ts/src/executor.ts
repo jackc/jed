@@ -10700,6 +10700,24 @@ function foldAcc(a: Acc, v: Value, m: Meter): void {
   }
 }
 
+// unfoldAcc removes one input value — the inverse of foldAcc — used ONLY by the sliding-window
+// optimization (window.md §5.2/§8) for the exactly-invertible COUNT / COUNT(*) (integer counters:
+// add-then-remove is exact and order-independent). Every other accumulator is never un-folded — a
+// moving frame over SUM/AVG/MIN/MAX/float re-folds from scratch instead (decimal scale,
+// intermediate-overflow trap order, and float non-associativity make them unsafe to invert).
+function unfoldAcc(a: Acc, v: Value, _m: Meter): void {
+  switch (a.plan) {
+    case "countStar":
+      a.count -= 1n;
+      break;
+    case "count":
+      if (v.kind !== "null") a.count -= 1n;
+      break;
+    default:
+      throw new Error("only COUNT/COUNT(*) are un-folded by the sliding-window optimization");
+  }
+}
+
 // finalizeAcc produces the aggregate's final value over the group. COUNT → its count (0 over
 // empty); SUM/MIN/MAX → NULL over an empty/all-NULL group; AVG → sum/count (NULL if count 0).
 function finalizeAcc(a: Acc): Value {
@@ -19875,6 +19893,39 @@ class FrameCtx {
 // The frame-sensitive plans (aggregate windows, first/last/nth_value) use a FrameCtx, which
 // precomputes the partition's peer-group structure once and maps each row to its [lo, hi) frame.
 // spec/design/window.md §6.
+
+// groupWindowSpecs groups window specs that share an identical PARTITION BY + ORDER BY (column
+// slots + direction / NULLS / collation; collations are interned so the reference compares equal),
+// returning the spec indices per group. One partition + per-partition sort then serves every spec in
+// a group (window.md §5.2 — the shared partition/sort pass). Grouping is stable and the per-spec slot
+// mapping is preserved (each spec still writes its result column in spec order), so the optimization
+// is purely a wall-clock win — the cost is unchanged (§8).
+function groupWindowSpecs(specs: WindowSpec[]): number[][] {
+  const groups: number[][] = [];
+  const orderEq = (a: OrderSlot[], b: OrderSlot[]): boolean =>
+    a.length === b.length &&
+    a.every(
+      (s, i) =>
+        s.idx === b[i]!.idx &&
+        s.descending === b[i]!.descending &&
+        s.nullsFirst === b[i]!.nullsFirst &&
+        s.collation === b[i]!.collation,
+    );
+  const partEq = (a: number[], b: number[]): boolean =>
+    a.length === b.length && a.every((p, i) => p === b[i]);
+  outer: for (let i = 0; i < specs.length; i++) {
+    for (const g of groups) {
+      const rep = specs[g[0]!]!;
+      if (partEq(rep.partition, specs[i]!.partition) && orderEq(rep.order, specs[i]!.order)) {
+        g.push(i);
+        continue outer;
+      }
+    }
+    groups.push([i]);
+  }
+  return groups;
+}
+
 function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter: Meter): void {
   const n = rows.length;
   if (n === 0) return;
@@ -19883,13 +19934,23 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
   // statements. The window stage owns its row buffer (Rust holds owned Rows; the TS scan shares
   // them), so detach here, then push the per-row results onto these private copies.
   for (let i = 0; i < n; i++) rows[i] = rows[i]!.slice();
-  for (const spec of specs) {
+  // The shared partition/sort pass (window.md §5.2): specs that share an identical PARTITION BY +
+  // ORDER BY are partitioned and sorted ONCE (the expensive step), then each computes its own
+  // results over the shared sorted partitions. The partition + sort are unmetered (§8), so this is
+  // purely a wall-clock win — the per-spec result/frame metering, and thus the cost, are unchanged.
+  const groups = groupWindowSpecs(specs);
+  const specGroup = new Array<number>(specs.length).fill(0);
+  const cache: Array<{ partitions: number[][]; collKeys: (Uint8Array | null)[][] | null }> = [];
+  for (let gi = 0; gi < groups.length; gi++) {
+    const group = groups[gi]!;
+    const rep = specs[group[0]!]!;
+    for (const si of group) specGroup[si] = gi;
     // Partition the row indices by the partition-key values. The Map is an index only (never
     // iterated); output comes from the insertion-ordered `partitions` (no hash-order leak).
     const index = new Map<string, number>();
     const partitions: number[][] = [];
     for (let i = 0; i < n; i++) {
-      const keyVals = spec.partition.map((p) => rows[i]![p]!);
+      const keyVals = rep.partition.map((p) => rows[i]![p]!);
       const k = distinctRowKey(keyVals);
       let pi = index.get(k);
       if (pi === undefined) {
@@ -19899,19 +19960,25 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
       }
       partitions[pi]!.push(i);
     }
-    // Precompute each row's collated UCA sort-key bytes for the spec's collated ORDER BY slots (if
-    // any), so the partition sort AND peer determination honor the collation identically (window.md
-    // §3/§5). null when no key is collated; an unmapped code point throws 0A000 here.
-    const collKeys = windowCollKeys(rows, spec.order);
+    // Collated UCA sort-key bytes for the shared order's collated slots (window.md §3/§5); null
+    // when no key is collated, an unmapped code point throws 0A000 here.
+    const collKeys = windowCollKeys(rows, rep.order);
+    // Sort each partition by the shared window ORDER BY. Array#sort is stable, so a full tie keeps
+    // ascending original index = PK scan order (the §3 PK tie-break).
+    if (rep.order.length > 0) {
+      for (const part of partitions) {
+        part.sort((a, b) => cmpWindowRows(a, b, rows, rep.order, collKeys));
+      }
+    }
+    cache.push({ partitions, collKeys });
+  }
+  for (let si = 0; si < specs.length; si++) {
+    const spec = specs[si]!;
+    const shared = cache[specGroup[si]!]!;
+    const collKeys = shared.collKeys;
     // Compute each row's result into a per-row slot, then append in input order.
     const results: Value[] = new Array(n).fill(nullValue());
-    for (const part of partitions) {
-      // Sort the partition's row indices by the window ORDER BY. Array#sort is stable, so a full
-      // tie keeps ascending original index = PK scan order (the §3 PK tie-break).
-      const ordered = part.slice();
-      if (spec.order.length > 0) {
-        ordered.sort((a, b) => cmpWindowRows(a, b, rows, spec.order, collKeys));
-      }
+    for (const ordered of shared.partitions) {
       switch (spec.plan) {
         case "rowNumber":
           for (let pos = 0; pos < ordered.length; pos++) {
@@ -20090,25 +20157,82 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
               }
             }
           } else {
-            // EXPLICIT frame (window.md §6): fold each row's frame fresh — naive O(partition²),
-            // the metered windowFrameStep bounding it. EXCLUDE rows are dropped before folding
-            // (so they are neither metered nor counted).
+            // EXPLICIT frame (window.md §5.2/§6). The sorted partition makes the frame bounds
+            // [lo, hi) monotonic non-decreasing in pos, so a NO-EXCLUDE aggregate CARRIES one
+            // accumulator across rows rather than re-folding each frame from scratch (the
+            // sliding-window optimization):
+            //   • an EXPANDING frame (start UNBOUNDED PRECEDING ⇒ lo ≡ 0) folds each entering row
+            //     once as hi advances — byte-identical for EVERY aggregate (fold order is the
+            //     sorted-prefix order the naive path uses) — O(n);
+            //   • a MOVING frame additionally UN-folds the rows leaving on the left, but only for
+            //     the exactly-invertible COUNT / COUNT(*) — O(n);
+            //   • a MOVING frame over SUM/AVG/MIN/MAX/float (not safely invertible) and ANY frame
+            //     with EXCLUDE re-fold from scratch (the naive O(partition²)).
+            // windowFrameStep is charged per folded AND per un-folded row, so it only LOWERS; each
+            // row's operand is evaluated at most once (cached in vals), so operator_eval never rises.
             const ctx = new FrameCtx(ordered, rows, spec.order, collKeys);
             const exclude = spec.frame?.exclude ?? "noOthers";
-            for (let pos = 0; pos < np; pos++) {
-              const [lo, hi] = ctx.bounds(pos, spec.frame);
-              const acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
-              for (let k = lo; k < hi; k++) {
-                if (ctx.isExcluded(pos, k, exclude)) continue;
-                meter.charge(COSTS.windowFrameStep);
-                const v = hasOperand
-                  ? evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter)
-                  : nullValue();
-                foldAcc(acc, v, meter);
+            const vals: Value[] = new Array(np);
+            const valSet: boolean[] = new Array(np).fill(false);
+            const evalAt = (k: number): Value => {
+              if (!hasOperand) return nullValue();
+              if (!valSet[k]) {
+                vals[k] = evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter);
+                valSet[k] = true;
               }
-              meter.guard();
-              meter.charge(COSTS.windowResult);
-              results[ordered[pos]!] = finalizeAcc(acc);
+              return vals[k]!;
+            };
+            if (exclude !== "noOthers") {
+              // EXCLUDE breaks the clean add/remove model → naive per-row re-fold (dropped rows are
+              // neither metered nor counted), over the cached operand.
+              for (let pos = 0; pos < np; pos++) {
+                const [lo, hi] = ctx.bounds(pos, spec.frame);
+                const acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
+                for (let k = lo; k < hi; k++) {
+                  if (ctx.isExcluded(pos, k, exclude)) continue;
+                  meter.charge(COSTS.windowFrameStep);
+                  foldAcc(acc, evalAt(k), meter);
+                }
+                meter.guard();
+                meter.charge(COSTS.windowResult);
+                results[ordered[pos]!] = finalizeAcc(acc);
+              }
+            } else {
+              // SLIDING (monotone carry). removable aggregates un-fold the left edge; the rest
+              // rebuild when lo advances (an expanding frame never advances lo, so it only adds).
+              const removable = spec.aggPlan === "countStar" || spec.aggPlan === "count";
+              let acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
+              let curLo = 0;
+              let curHi = 0;
+              for (let pos = 0; pos < np; pos++) {
+                const [lo, hi] = ctx.bounds(pos, spec.frame);
+                if (!removable && lo > curLo) {
+                  // Left edge advanced over a non-invertible aggregate ⇒ rebuild over [lo, hi).
+                  acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
+                  for (let k = lo; k < hi; k++) {
+                    meter.charge(COSTS.windowFrameStep);
+                    foldAcc(acc, evalAt(k), meter);
+                  }
+                } else {
+                  // Un-fold rows leaving on the left (invertible only; empty when lo === curLo) …
+                  const remHi = Math.min(lo, curHi);
+                  for (let k = curLo; k < remHi; k++) {
+                    meter.charge(COSTS.windowFrameStep);
+                    unfoldAcc(acc, evalAt(k), meter);
+                  }
+                  // … and fold rows entering on the right.
+                  const addLo = Math.max(curHi, lo);
+                  for (let k = addLo; k < hi; k++) {
+                    meter.charge(COSTS.windowFrameStep);
+                    foldAcc(acc, evalAt(k), meter);
+                  }
+                }
+                curLo = lo;
+                curHi = hi;
+                meter.guard();
+                meter.charge(COSTS.windowResult);
+                results[ordered[pos]!] = finalizeAcc(cloneAcc(acc));
+              }
             }
           }
           break;

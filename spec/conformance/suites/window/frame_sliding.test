@@ -1,0 +1,144 @@
+# Window frame sliding-window optimization + the shared partition/sort pass (spec/design/window.md
+# §5.2/§8). Both are COST-LOWERING ONLY — the rows are identical to the naive per-row fold and to
+# separate per-spec passes; only the metered cost (window_frame_step here) drops, and it drops
+# IDENTICALLY across every core (the cross-core cost contract, CLAUDE.md §8/§13). So these queries
+# stay oracle-clean (PG agrees on the rows); the `# cost:` directives pin the lowered cost.
+#
+# The sliding optimization: because the sorted partition makes the frame bounds [lo, hi) monotonic
+# non-decreasing, a NO-EXCLUDE aggregate carries one accumulator across rows instead of re-folding
+# each frame. An EXPANDING frame (start UNBOUNDED PRECEDING) folds each row once (every aggregate);
+# a MOVING frame additionally un-folds the left edge for the invertible count/count(*); a moving
+# sum/avg/min/max/float re-folds from scratch when the left edge advances (the naive path, unchanged
+# correctness, only partially lowered where the left edge stalls at the clamped partition start).
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.window, query.window_ranking, query.window_aggregate, query.window_frame, resource.cost_metering, types.i32
+
+statement ok
+CREATE TABLE ts (id i32 PRIMARY KEY, g i32, x i32)
+
+statement ok
+INSERT INTO ts VALUES (1,1,10),(2,1,20),(3,1,30),(4,2,40),(5,2,50),(6,2,60)
+
+# ============================================================================================
+# EXPANDING frame (start UNBOUNDED PRECEDING ⇒ lo ≡ 0). A running SUM folds each row exactly once
+# as the right edge advances — O(n), not the O(n²) re-fold. 6 rows ⇒ 6 window_frame_step. Result
+# is the running total, byte-identical to the naive fold.
+# names: id, s
+# cost: 25
+query II nosort
+SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM ts ORDER BY id
+----
+1
+10
+2
+30
+3
+60
+4
+100
+5
+150
+6
+210
+
+# An expanding MAX is lowered the same way (min/max benefit from the expanding case even though they
+# are not invertible — the left edge never advances, so the accumulator only ever folds new rows).
+# names: id, mx
+# cost: 25
+query II nosort
+SELECT id, max(x) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS mx FROM ts ORDER BY id
+----
+1
+10
+2
+20
+3
+30
+4
+40
+5
+50
+6
+60
+
+# ============================================================================================
+# MOVING frame over the invertible count(*): each row is folded once on entry and un-folded once on
+# exit as the 3-row window slides — O(n). 6 rows: the interior windows are full (3), the two edge
+# windows clamp to 2.
+# names: id, c
+# cost: 29
+query II nosort
+SELECT id, count(*) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c FROM ts ORDER BY id
+----
+1
+2
+2
+3
+3
+3
+4
+3
+5
+3
+6
+2
+
+# A MOVING SUM over the same frame is NOT invertible (decimal scale / overflow-trap order / float
+# non-associativity), so it re-folds from scratch each time the left edge advances — the naive path,
+# byte-identical rows. (It is still partially lowered where the left edge stalls at the clamped
+# partition start, never raised.)
+# names: id, ms
+# cost: 33
+query II nosort
+SELECT id, sum(x) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS ms FROM ts ORDER BY id
+----
+1
+30
+2
+60
+3
+90
+4
+120
+5
+150
+6
+110
+
+# ============================================================================================
+# THE SHARED PARTITION/SORT PASS. Three window functions share one PARTITION BY g ORDER BY id, so the
+# partition + sort run ONCE and serve all three (the partition/sort are unmetered, so the cost is the
+# same as three independent passes — cost-neutral — while the rows are unchanged). row_number and
+# rank restart per partition; the running sum is per partition.
+# names: id, rn, rk, rs
+# cost: 37
+query IIII nosort
+SELECT id,
+       row_number() OVER (PARTITION BY g ORDER BY id) AS rn,
+       rank() OVER (PARTITION BY g ORDER BY id) AS rk,
+       sum(x) OVER (PARTITION BY g ORDER BY id) AS rs
+FROM ts ORDER BY id
+----
+1
+1
+1
+10
+2
+2
+2
+30
+3
+3
+3
+60
+4
+1
+1
+40
+5
+2
+2
+90
+6
+3
+3
+150

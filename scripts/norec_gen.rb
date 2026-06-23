@@ -46,6 +46,12 @@
 #              / `'{c}' <@ tags` are NOT GIN-accelerated (full scan). Applied to two identically-seeded
 #              tables (one bounded, one not), both reach the SAME by-construction end state (the bound
 #              is transparent under mutation).
+#   window   — the window frame sliding-window optimization (window.md §5.2): an explicit expanding
+#              `ROWS UNBOUNDED PRECEDING..CURRENT ROW` aggregate (the sliding path) must equal the
+#              DEFAULT-frame aggregate (the separate running-pass path) — distinct ids ⇒ no peers ⇒
+#              the two frames coincide; the moving COUNT(*)/SUM forms (the un-fold / partial-rebuild
+#              paths) must match the by-construction rows. An independent oracle for a bug all three
+#              cores might share.
 #
 # Determinism (CLAUDE.md §10): generation is SEEDED, so a discovered failure reduces to this exact
 # deterministic .test, which then joins the corpus. The fuzzer is dev-time discovery; the emitted
@@ -97,6 +103,8 @@ TLP_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row qu
 CTE_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
              query.where_eq query.comparison_order query.order_by query.cte expr.arithmetic
              expr.between expr.comparison_value types.i32].freeze
+WINDOW_REQ = %w[ddl.create_table ddl.primary_key dml.insert dml.insert_multi_row query.select
+                query.order_by query.window query.window_aggregate query.window_frame types.i32].freeze
 GIN_REQ = %w[ddl.create_table ddl.primary_key ddl.gin_index query.gin_scan dml.insert
              dml.insert_multi_row query.select query.order_by types.i32 types.array
              func.array_containment].freeze
@@ -717,6 +725,69 @@ def gen_cte(seed)
   out.join("\n") + "\n"
 end
 
+# --- scenario: window frame sliding-window optimization (sliding path vs an equivalent form) -----
+# The sliding-window optimization (window.md §5.2) carries ONE accumulator across rows instead of
+# re-folding each frame: an EXPANDING frame (UNBOUNDED PRECEDING) folds each row once, a MOVING
+# count un-folds the rows leaving on the left. A bug shared by all three cores would survive the
+# differential check, so this is an independent oracle: the explicit expanding-ROWS form (the
+# sliding path) must equal the DEFAULT-frame form (the separate running-pass path) — distinct ids
+# ⇒ no peers ⇒ the two frames coincide — and the moving forms must match the by-construction rows.
+def gen_window_frame(seed)
+  rng = Random.new(seed)
+  ids = (1..40).to_a.sample(rng.rand(8..12), random: rng).sort
+  vals = ids.map { rng.rand(-50..50) }
+  n = ids.length
+
+  out = header(seed, WINDOW_REQ, "window frame sliding optimization (sliding path vs running-pass / construction)")
+  stmt(out, "CREATE TABLE t (id i32 PRIMARY KEY, v i32)")
+  stmt(out, "INSERT INTO t VALUES #{ids.each_index.map { |i| "(#{ids[i]}, #{vals[i]})" }.join(', ')}")
+
+  # Running prefix aggregates (distinct ids ⇒ each row is its own peer ⇒ explicit ROWS ... CURRENT
+  # ROW == the default RANGE frame), as the by-construction oracle for both forms of the pair.
+  psum = []
+  pmax = []
+  s = 0
+  mx = nil
+  vals.each do |v|
+    s += v
+    mx = mx.nil? ? v : [mx, v].max
+    psum << s
+    pmax << mx
+  end
+  exp_sum = ids.each_index.flat_map { |i| [ids[i].to_s, psum[i].to_s] }
+  exp_max = ids.each_index.flat_map { |i| [ids[i].to_s, pmax[i].to_s] }
+
+  out << "# expanding SUM: explicit ROWS UNBOUNDED PRECEDING..CURRENT ROW (the sliding path)"
+  q(out, "II", "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s FROM t ORDER BY id", exp_sum)
+  out << "# default frame (the separate running-pass path) — MUST match"
+  q(out, "II", "SELECT id, sum(v) OVER (ORDER BY id) AS s FROM t ORDER BY id", exp_sum)
+
+  out << "# expanding MAX: explicit ROWS (the sliding path — min/max benefit from the expanding case)"
+  q(out, "II", "SELECT id, max(v) OVER (ORDER BY id ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS mx FROM t ORDER BY id", exp_max)
+  out << "# default frame — MUST match"
+  q(out, "II", "SELECT id, max(v) OVER (ORDER BY id) AS mx FROM t ORDER BY id", exp_max)
+
+  # Moving 3-row window (positional ROWS): count exercises the removable un-fold path, sum the
+  # partial-rebuild path. Expected rows are known by construction over the sorted positions.
+  mcount = []
+  msum = []
+  (0...n).each do |i|
+    lo = [0, i - 1].max
+    hi = [n - 1, i + 1].min
+    mcount << (hi - lo + 1)
+    msum << (lo..hi).sum { |k| vals[k] }
+  end
+  exp_mc = ids.each_index.flat_map { |i| [ids[i].to_s, mcount[i].to_s] }
+  exp_ms = ids.each_index.flat_map { |i| [ids[i].to_s, msum[i].to_s] }
+
+  out << "# moving COUNT(*) ROWS 1 PRECEDING..1 FOLLOWING (the sliding un-fold path) — by construction"
+  q(out, "II", "SELECT id, count(*) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS c FROM t ORDER BY id", exp_mc)
+  out << "# moving SUM over the same frame (the partial-rebuild path) — by construction"
+  q(out, "II", "SELECT id, sum(v) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS ms FROM t ORDER BY id", exp_ms)
+
+  out.join("\n") + "\n"
+end
+
 SCENARIOS = {
   "pushdown" => method(:gen_pushdown),
   "limit" => method(:gen_limit),
@@ -729,6 +800,7 @@ SCENARIOS = {
   "gin_mut" => method(:gen_gin_mutation),
   "tlp" => method(:gen_tlp),
   "cte" => method(:gen_cte),
+  "window" => method(:gen_window_frame),
 }.freeze
 
 # Run one core's harness once; return {basename => "PASS"/"FAIL"/"SKIP"} and the detail line per
