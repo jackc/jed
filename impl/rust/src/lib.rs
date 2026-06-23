@@ -295,6 +295,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.window_ntile",
     // Window offset functions lag() / lead() (S2, window.md §4).
     "query.window_offset",
+    // Aggregates as window functions (S3, default frame — window.md §6).
+    "query.window_aggregate",
     // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
     "query.union",
     "query.intersect",

@@ -13304,7 +13304,13 @@ type windowSpec struct {
 	// args holds the resolved function arguments (empty for the no-argument ranking functions;
 	// ntile's bucket count is one integer argument, evaluated once per partition). Future
 	// offset/value functions (lag/lead/nth_value, S2+) carry their value/offset/default here.
+	// For an aggregate window (plan == planAgg) the aggregate operand (if any) is args[0];
+	// COUNT(*) has empty args.
 	args []*rExpr
+	// aggPlan is the aggregate runtime plan when plan == planAgg (S3 — sum/count/min/max/avg
+	// OVER (...)). Go's windowPlan is an int enum and cannot carry a payload like Rust's
+	// WindowPlan::Agg(AggPlan) tuple variant, so the aggregate plan rides alongside here.
+	aggPlan aggPlan
 }
 
 // windowPlan is the runtime plan for one window function (spec/design/window.md §4). S0:
@@ -13331,6 +13337,11 @@ const (
 	// planLead — LEAD(value [, offset [, default]]): value `offset` rows LATER in the partition;
 	// otherwise identical to LAG (the offset direction flips).
 	planLead
+	// planAgg — an aggregate used as a window function (S3): sum/count/min/max/avg(...) OVER (...),
+	// folded over the row's default frame (running with a window ORDER BY, whole-partition without
+	// — spec/design/window.md §6). Reuses the aggregate `acc` kernels; the aggregate plan is held
+	// in windowSpec.aggPlan and the operand (if any) is args[0]. Mirrors Rust's WindowPlan::Agg.
+	planAgg
 )
 
 // aggPlan is the runtime plan for one aggregate, fixed at resolve from the function + operand
@@ -13382,6 +13393,22 @@ func newAcc(plan aggPlan) *acc {
 		a.floatSum = newFloatSumAcc(false)
 	}
 	return a
+}
+
+// clone returns an independent snapshot of the running accumulator, so the window stage can
+// finalize a peer-group's cumulative value without consuming the still-running acc (Rust's
+// `acc.clone().finalize()`). The acc struct copies by value, but floatSum is a POINTER whose
+// `finite` slice would otherwise alias the original — deep-copy it (the only shared-reference
+// field; `cur` holds a Value finalize only reads, never mutates). Mirrors Rust's #[derive(Clone)]
+// on Acc with its deep slice clone.
+func (a *acc) clone() *acc {
+	c := *a // value copy (count/sumInt/sumDec/seen/cur/hasCur are independent)
+	if a.floatSum != nil {
+		fs := *a.floatSum
+		fs.finite = append([]float64(nil), a.floatSum.finite...)
+		c.floatSum = &fs
+	}
+	return &c
 }
 
 // fold folds one input value into the accumulator. NULL arguments are skipped (COUNT(*)
@@ -13581,7 +13608,10 @@ func subscriptSpecExprs(s SubscriptSpec) []*Expr {
 func exprHasAggregate(e Expr) bool {
 	switch e.Kind {
 	case ExprFuncCall:
-		if isAggregateName(e.FuncCall.Name) {
+		// An aggregate name carrying OVER is a WINDOW function, not a bare aggregate (so a
+		// `sum(x) OVER ()` query is a window query, not an aggregate query). Mirrors Rust:
+		// (over.is_none() && is_aggregate_name(name)) || any arg has an aggregate.
+		if e.FuncCall.Over == nil && isAggregateName(e.FuncCall.Name) {
 			return true
 		}
 		for _, a := range e.FuncCall.Args {
@@ -14135,10 +14165,12 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
 	name := toLowerASCII(fc.Name)
 	// The plan + result type from the function name. S0: only row_number(); an aggregate name with
-	// OVER (a window aggregate) is deferred to S3; any other name is 42883.
+	// OVER (a window aggregate, S3) resolves to planAgg carrying the aggregate plan in wagg; any
+	// other name is 42883.
 	var (
 		plan   windowPlan
 		result resolvedType
+		wagg   aggPlan // the aggregate plan, valid only when plan == planAgg
 	)
 	// The frame-insensitive no-argument ranking functions (S0/S1): row_number/rank/dense_rank → i64.
 	noArgI64, isNoArg := map[string]windowPlan{
@@ -14236,7 +14268,36 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		}
 		result = vty
 	case isAggregateName(name):
-		return nil, resolvedType{}, NewError(FeatureNotSupported, "aggregate window functions are not supported yet")
+		// An aggregate used as a window function (S3): reuse the aggregate overload resolution to
+		// get the plan + result type; applyWindowStage folds it over the default frame (running
+		// with a window ORDER BY, whole-partition without — spec/design/window.md §6).
+		if fc.Star {
+			// Only COUNT has a star overload; SUM(*) OVER () etc. is a syntax error.
+			if !aggregateHasStar(name) {
+				return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+			}
+			wagg = planCountStar
+			result = resolvedType{kind: rtInt, intTy: Int64}
+		} else {
+			// One operand, resolved in a fresh Forbidden sub-context (no aggregate/window nesting
+			// in a window aggregate's argument). The registry validates the (surface, operand-family)
+			// overload exists (else 42883); the plan + result type follow the PG widening.
+			arg, err := aggArg(fc)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			r, t, err := resolve(s, arg, nil, &aggCtx{}, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			desc := lookupAggregateOverload(name, t)
+			if desc == nil {
+				return nil, resolvedType{}, noAggOverload(name)
+			}
+			wagg, result = aggregatePlan(name, desc.Result, t)
+			wargs = append(wargs, r) // the aggregate operand → args[0]
+		}
+		plan = planAgg
 	default:
 		return nil, resolvedType{}, NewError(UndefinedFunction, name+" is not a window function")
 	}
@@ -14252,7 +14313,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		return nil, resolvedType{}, NewError(WindowingError, "window functions are not allowed here")
 	}
 	slot := ag.windowBase + len(ag.windowSpecs)
-	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs})
+	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 
@@ -21037,6 +21098,58 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 						} else {
 							results[ri] = NullValue()
 						}
+					}
+				}
+			case planAgg:
+				// An aggregate over the default frame (window.md §6): RANGE UNBOUNDED PRECEDING TO
+				// CURRENT ROW with a window ORDER BY (a RUNNING aggregate — CURRENT ROW spans the
+				// current peer group), or the WHOLE partition with no ORDER BY. Both reduce to the
+				// same shape: fold rows in sorted order, snapshotting the running acc at each
+				// peer-group boundary (no ORDER BY → one peer group → one whole-partition value).
+				np := len(ordered)
+				hasOperand := len(spec.args) > 0 // COUNT(*) has no operand
+				type span struct{ start, end int }
+				var groups []span
+				s := 0
+				for pos := 1; pos < np; pos++ {
+					if cmpRowsByOrder(rows[ordered[pos]], rows[ordered[s]], spec.order) != 0 {
+						groups = append(groups, span{s, pos})
+						s = pos
+					}
+				}
+				if np > 0 {
+					groups = append(groups, span{s, np})
+				}
+				a := newAcc(spec.aggPlan)
+				for _, g := range groups {
+					for k := g.start; k < g.end; k++ {
+						// The frame fold work (window.md §8) — metered so a running aggregate over a
+						// large partition stays cost-bounded.
+						meter.Charge(Costs.WindowFrameStep)
+						v := NullValue()
+						if hasOperand {
+							var err error
+							v, err = spec.args[0].eval(rows[ordered[k]], env, meter)
+							if err != nil {
+								return err
+							}
+						}
+						if err := a.fold(v, meter); err != nil {
+							return err
+						}
+					}
+					// Snapshot the running accumulator for this peer group's frame [0, end) — the
+					// clone keeps the running acc going (deep-copied float buffer).
+					out, err := a.clone().finalize()
+					if err != nil {
+						return err
+					}
+					for _, ri := range ordered[g.start:g.end] {
+						if err := meter.Guard(); err != nil {
+							return err
+						}
+						meter.Charge(Costs.WindowResult)
+						results[ri] = out
 					}
 				}
 			}

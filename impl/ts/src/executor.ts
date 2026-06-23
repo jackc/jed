@@ -10312,7 +10312,12 @@ type WindowSpec = {
   order: OrderSlot[];
   // Resolved function arguments (empty for the no-argument ranking functions; ntile's bucket-count
   // argument is the one entry). Evaluated against the partition's first sorted row (window.md §4).
+  // For an aggregate window (plan "agg") the aggregate operand is args[0] (empty for COUNT(*)).
   args: RExpr[];
+  // For an aggregate window (plan "agg", spec/design/window.md §6): the resolved aggregate plan +
+  // float width (riding on the Acc), fixed at resolve from the function + operand type.
+  aggPlan?: AggPlan;
+  aggFloatWidth?: ScalarType;
 };
 
 // WindowPlan is the runtime plan for one window function (spec/design/window.md §4). S0:
@@ -10334,7 +10339,12 @@ type WindowPlan =
   // position); the result type is the value expression's type.
   | "lag"
   // LEAD(value [, offset [, default]]) — the value `offset` rows AFTER the current row.
-  | "lead";
+  | "lead"
+  // An aggregate used as a window function (S3): sum/count/min/max/avg(...) OVER (...), folded over
+  // the row's default frame (running with a window ORDER BY, whole-partition without — window.md §6).
+  // Reuses the aggregate Acc kernels; the resolved AggPlan rides on the spec's aggPlan field, the
+  // operand (if any) on args[0] (empty for COUNT(*)).
+  | "agg";
 
 // Acc is a running aggregate accumulator (one per AggSpec), folded per input row then finalized.
 // For float SUM/AVG the inputs are COLLECTED in `floats` (the canonical fold needs all values up
@@ -10361,6 +10371,14 @@ function newAcc(plan: AggPlan, floatWidth: ScalarType = "f64"): Acc {
     floats: [],
     floatWidth,
   };
+}
+
+// cloneAcc deep-copies a running accumulator so the window stage can SNAPSHOT it at each peer-group
+// boundary and finalize the snapshot without consuming the running fold (spec/design/window.md §6;
+// the Rust `Acc: Clone`). Decimals are immutable (Decimal ops return fresh values), so only the
+// float-fold buffer needs a real copy; `cur` is a Value (treated immutably by foldAcc/finalizeAcc).
+function cloneAcc(a: Acc): Acc {
+  return { ...a, floats: a.floats.slice() };
 }
 
 // foldAcc folds one input value into the accumulator. NULL arguments are skipped (COUNT(*)
@@ -10537,7 +10555,9 @@ function astSubscriptExprs(subs: SubscriptSpec[]): Expr[] {
 function exprHasAggregate(e: Expr): boolean {
   switch (e.kind) {
     case "funcCall":
-      return isAggregateName(e.name) || e.args.some(exprHasAggregate);
+      // An aggregate name carrying OVER is a WINDOW function, not a bare aggregate (window.md §5.1),
+      // so it does not mark the query as aggregate; its arguments are still walked for nested aggregates.
+      return (e.over == null && isAggregateName(e.name)) || e.args.some(exprHasAggregate);
     case "cast":
       return exprHasAggregate(e.inner);
     case "extract":
@@ -11070,7 +11090,43 @@ function resolveWindowCall(
     plan = lname === "lag" ? "lag" : "lead";
     result = vty;
   } else if (isAggregateName(lname)) {
-    throw engineError("feature_not_supported", "aggregate window functions are not supported yet");
+    // An aggregate used as a window function (S3): reuse the aggregate overload resolution to get the
+    // plan + result type; applyWindowStage folds it over the default frame (running with a window
+    // ORDER BY, whole-partition without — spec/design/window.md §6). The operand → args[0].
+    let aggPlan: AggPlan;
+    let aggFloatWidth: ScalarType | undefined;
+    if (e.star) {
+      // Only COUNT has a star overload (aggregates.md §3); SUM(*) etc. is a syntax error.
+      if (!aggregateHasStar(lname))
+        throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+      aggPlan = "countStar";
+      result = { kind: "int", ty: "i64" };
+    } else {
+      // One operand, resolved in a fresh Forbidden sub-context (no aggregate/window nesting in a
+      // window argument). The registry validates the (surface, operand-family) overload (else 42883).
+      if (e.args.length !== 1) {
+        throw engineError(
+          "undefined_function",
+          "no aggregate function matches the given argument count",
+        );
+      }
+      const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+      const r = resolve(scope, e.args[0]!, null, sub, params);
+      const desc = lookupAggregateOverload(lname, r.type);
+      if (!desc) throw noAggOverload(lname);
+      [aggPlan, result, aggFloatWidth] = aggregatePlan(lname, desc.result, r.type);
+      wargs.push(r.node); // the aggregate operand → args[0]
+    }
+    plan = "agg";
+    // Resolve the window definition + collect the spec here (it carries the extra aggPlan fields),
+    // returning early so the shared collection below (which omits them) is not also run.
+    const [partition, order] = resolveWindowDef(scope, e.over, params);
+    if (ag.window === undefined) {
+      throw engineError("windowing_error", "window functions are not allowed here");
+    }
+    const slot = ag.window.base + ag.window.windowSpecs.length;
+    ag.window.windowSpecs.push({ plan, partition, order, args: wargs, aggPlan, aggFloatWidth });
+    return { node: { kind: "column", index: slot }, type: result };
   } else {
     throw engineError("undefined_function", `${lname} is not a window function`);
   }
@@ -19071,6 +19127,45 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
               } else {
                 results[ri] = nullValue();
               }
+            }
+          }
+          break;
+        }
+        // An aggregate over the default frame (window.md §6): RANGE UNBOUNDED PRECEDING TO CURRENT
+        // ROW with a window ORDER BY (a RUNNING aggregate — CURRENT ROW spans the current peer
+        // group), or the WHOLE partition with no ORDER BY. Both reduce to the same shape: fold rows
+        // in sorted order, snapshotting the running Acc at each peer-group boundary (no ORDER BY →
+        // one peer group → one whole-partition value).
+        case "agg": {
+          const np = ordered.length;
+          const hasOperand = spec.args.length > 0; // COUNT(*) has no operand
+          const groups: Array<[number, number]> = []; // peer-group spans [start, end)
+          let s = 0;
+          for (let pos = 1; pos < np; pos++) {
+            if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[ordered[s]!]!, spec.order) !== 0) {
+              groups.push([s, pos]);
+              s = pos;
+            }
+          }
+          if (np > 0) groups.push([s, np]);
+          const acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
+          for (const [start, end] of groups) {
+            for (let k = start; k < end; k++) {
+              // The frame fold work (window.md §8) — metered so a running aggregate over a large
+              // partition stays cost-bounded.
+              meter.charge(COSTS.windowFrameStep);
+              const v = hasOperand
+                ? evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter)
+                : nullValue();
+              foldAcc(acc, v, meter);
+            }
+            // Snapshot the running accumulator for this peer group's frame [0, end).
+            const out = finalizeAcc(cloneAcc(acc));
+            for (let k = start; k < end; k++) {
+              const ri = ordered[k]!;
+              meter.guard();
+              meter.charge(COSTS.windowResult);
+              results[ri] = out;
             }
           }
           break;

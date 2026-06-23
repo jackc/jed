@@ -13098,6 +13098,10 @@ enum WindowPlan {
     /// partition; `def` (or NULL) when the offset leaves the partition. Frame-insensitive.
     Lag,
     Lead,
+    /// An aggregate used as a window function (S3): `sum/count/min/max/avg(...) OVER (...)`, folded
+    /// over the row's default frame (running with a window ORDER BY, whole-partition without).
+    /// Reuses the aggregate `Acc` kernels; the operand (if any) is `args[0]`.
+    Agg(AggPlan),
 }
 
 /// The runtime plan for one aggregate, fixed at resolve from the function + operand type
@@ -13131,6 +13135,9 @@ struct AggSpec {
 }
 
 /// A running aggregate accumulator (one per AggSpec), folded per input row then finalized.
+/// `Clone` so the window stage can snapshot a running accumulator at each peer-group boundary
+/// (a running aggregate window's default frame — spec/design/window.md §6) without consuming it.
+#[derive(Clone)]
 enum Acc {
     CountStar(i64),
     Count(i64),
@@ -13370,8 +13377,12 @@ fn subscript_spec_exprs(s: &SubscriptSpec) -> Vec<&Expr> {
 /// not itself an aggregate, but may CONTAIN one (`abs(sum(x))`), so its arguments are walked.
 fn expr_has_aggregate(e: &Expr) -> bool {
     match e {
-        Expr::FuncCall { name, args, .. } => {
-            is_aggregate_name(name) || args.iter().any(expr_has_aggregate)
+        Expr::FuncCall {
+            name, args, over, ..
+        } => {
+            // An aggregate name carrying OVER is a WINDOW function, not a bare aggregate (S3,
+            // spec/design/window.md §5.1) — so it does not make the query an aggregate query.
+            (over.is_none() && is_aggregate_name(name)) || args.iter().any(expr_has_aggregate)
         }
         Expr::Column(_)
         | Expr::QualifiedColumn { .. }
@@ -15082,10 +15093,27 @@ fn resolve_window_call(
         };
         (plan, vty)
     } else if is_aggregate_name(&lname) {
-        return Err(EngineError::new(
-            SqlState::FeatureNotSupported,
-            "aggregate window functions are not supported yet",
-        ));
+        // An aggregate used as a window function (S3): reuse the aggregate overload resolution to
+        // get the plan + result type; apply_window_stage folds it over the default frame (running
+        // with a window ORDER BY, whole-partition without — spec/design/window.md §6).
+        let (aggplan, result) = if star {
+            if !aggregate_has_star(&lname) {
+                return Err(EngineError::new(
+                    SqlState::SyntaxError,
+                    "* is only valid as the argument of COUNT",
+                ));
+            }
+            (AggPlan::CountStar, ResolvedType::Int(ScalarType::Int64))
+        } else {
+            let mut sub = AggCtx::Forbidden;
+            let (r, t) = resolve(scope, expect_arg(args)?, None, &mut sub, params)?;
+            let desc =
+                lookup_aggregate_overload(&lname, &t).ok_or_else(|| no_agg_overload(&lname))?;
+            let (plan, result) = aggregate_plan(&lname, desc.result, &t);
+            wargs.push(r); // the aggregate operand → args[0]
+            (plan, result)
+        };
+        (WindowPlan::Agg(aggplan), result)
     } else {
         return Err(EngineError::new(
             SqlState::UndefinedFunction,
@@ -23456,6 +23484,49 @@ fn apply_window_stage(
                                 }
                             }
                         };
+                    }
+                }
+                // An aggregate over the default frame (window.md §6): RANGE UNBOUNDED PRECEDING TO
+                // CURRENT ROW with a window ORDER BY (a RUNNING aggregate — CURRENT ROW spans the
+                // current peer group), or the WHOLE partition with no ORDER BY. Both reduce to the
+                // same shape: fold rows in sorted order, snapshotting the running `Acc` at each
+                // peer-group boundary (no ORDER BY → one peer group → one whole-partition value).
+                WindowPlan::Agg(aggplan) => {
+                    let np = ordered.len();
+                    let has_operand = !spec.args.is_empty(); // COUNT(*) has no operand
+                    let mut groups: Vec<(usize, usize)> = Vec::new();
+                    let mut s = 0usize;
+                    for pos in 1..np {
+                        if cmp_rows_by_order(&rows[ordered[pos]], &rows[ordered[s]], &spec.order)
+                            != std::cmp::Ordering::Equal
+                        {
+                            groups.push((s, pos));
+                            s = pos;
+                        }
+                    }
+                    if np > 0 {
+                        groups.push((s, np));
+                    }
+                    let mut acc = Acc::new(aggplan);
+                    for &(start, end) in &groups {
+                        for k in start..end {
+                            // The frame fold work (window.md §8) — metered so a running aggregate
+                            // over a large partition stays cost-bounded.
+                            meter.charge(COSTS.window_frame_step);
+                            let v = if has_operand {
+                                spec.args[0].eval(&rows[ordered[k]], env, meter)?
+                            } else {
+                                Value::Null
+                            };
+                            acc.fold(v, meter)?;
+                        }
+                        // Snapshot the running accumulator for this peer group's frame [0, end).
+                        let out = acc.clone().finalize()?;
+                        for &ri in &ordered[start..end] {
+                            meter.guard()?;
+                            meter.charge(COSTS.window_result);
+                            results[ri] = out.clone();
+                        }
                     }
                 }
             }

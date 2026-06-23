@@ -1,0 +1,116 @@
+# Window functions S3 — aggregates as window functions over the default frame (window.md §6).
+#
+# An aggregate carrying OVER (sum/count/min/max/avg) is folded over the row's DEFAULT frame: with a
+# window ORDER BY it is a RUNNING aggregate (RANGE UNBOUNDED PRECEDING TO CURRENT ROW — CURRENT ROW
+# spans the current peer group, so tied rows share the cumulative value); with no ORDER BY it is the
+# WHOLE partition. sum(int)->i64, count->i64, min/max->input type — all match PostgreSQL. (Explicit
+# frame clauses are S4; this slice is the implicit default frame only.)
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.window_aggregate, query.order_by, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, g i32, v i32)
+
+statement ok
+INSERT INTO t VALUES (1, 1, 10), (2, 1, 20), (3, 2, 30), (4, 2, 40), (5, 2, 50)
+
+# Running sum + running count ordered by the (unique) PK — each row its own peer group.
+# names: id, rs, rc
+# cost: 31
+query III nosort
+SELECT id, sum(v) OVER (ORDER BY id) AS rs, count(*) OVER (ORDER BY id) AS rc FROM t ORDER BY id
+----
+1
+10
+1
+2
+30
+2
+3
+60
+3
+4
+100
+4
+5
+150
+5
+
+# No window ORDER BY — the whole partition: sum = 150, max = 50 for every row.
+# names: id, s, m
+query III nosort
+SELECT id, sum(v) OVER () AS s, max(v) OVER () AS m FROM t ORDER BY id
+----
+1
+150
+50
+2
+150
+50
+3
+150
+50
+4
+150
+50
+5
+150
+50
+
+# PARTITION BY g, running sum — restarts per partition. g=1 {id1,id2}, g=2 {id3,id4,id5}.
+# names: id, g, rs
+query III nosort
+SELECT id, g, sum(v) OVER (PARTITION BY g ORDER BY id) AS rs FROM t ORDER BY id
+----
+1
+1
+10
+2
+1
+30
+3
+2
+30
+4
+2
+70
+5
+2
+120
+
+# min() over the whole partition (no ORDER BY). g=1 min=10, g=2 min=30.
+# names: id, g, mn
+query III nosort
+SELECT id, g, min(v) OVER (PARTITION BY g) AS mn FROM t ORDER BY id
+----
+1
+1
+10
+2
+1
+10
+3
+2
+30
+4
+2
+30
+5
+2
+30
+
+# RANGE default-frame peer semantics: ORDER BY g (non-unique) — all rows of a peer group share the
+# cumulative sum THROUGH that peer group. g=1 peer {id1,id2} -> 30; g=2 peer {id3,id4,id5} -> 150.
+# names: id, s
+query II nosort
+SELECT id, sum(v) OVER (ORDER BY g) AS s FROM t ORDER BY id
+----
+1
+30
+2
+30
+3
+150
+4
+150
+5
+150

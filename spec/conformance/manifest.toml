@@ -289,6 +289,10 @@ id = "query.window_offset"
 description = "Window offset functions lag() and lead() (window.md §4, S2): the value `offset` rows before (lag) / after (lead) the current row within the partition (window ORDER BY order); offset defaults to 1, a negative offset flips direction; out-of-partition yields the default argument else NULL; NULL offset yields NULL for all rows. Result = the value expression type (same_as_input). Frame-insensitive, matching PostgreSQL. Builds on query.window"
 
 [[capability]]
+id = "query.window_aggregate"
+description = "Aggregates as window functions (window.md §6, S3): sum/count/min/max/avg carrying OVER are folded over the DEFAULT frame — a RUNNING aggregate with a window ORDER BY (RANGE UNBOUNDED PRECEDING TO CURRENT ROW, peer-aware) or the WHOLE partition without. Reuses the aggregate Acc kernels + widening (sum int->i64, avg->decimal). Explicit frame clauses are deferred to S4. Builds on query.window"
+
+[[capability]]
 id = "query.union"
 description = "UNION / UNION ALL — combine two SELECTs' result rows; the bare form deduplicates (NULL-safe, value-canonical), ALL keeps multiplicities; output column count + names come from the left operand; per-column type unification (integer max-rank, integer<->decimal, all-NULL->text); arity mismatch 42601, type mismatch 42804; INTERSECT binds tighter; optional trailing ORDER BY/LIMIT/OFFSET resolves by output column name (spec/design/grammar.md §25)"
 
