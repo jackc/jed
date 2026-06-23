@@ -988,18 +988,10 @@ file = "window/row_number.test"
 sql = "SELECT g, row_number() OVER (ORDER BY g), SUM(v) FROM t GROUP BY g"
 reason = "jed: a window function combined with aggregates / GROUP BY is 0A000 this slice (window.md §1 — the S0 narrowing; the window stage layers over the aggregate synthetic row in S3). PostgreSQL evaluates the window over the grouped rows and the query succeeds. A deliberate, documented narrowing, lifted in S3."
 
-# --- Window ratio functions (window.md §10, divergence D2): percent_rank()/cume_dist() return
-# DECIMAL in jed (the exact division — select_div_scale + half-away, the AVG path), NOT PG's float8.
-# The ratios are identical; only the type + rendering differ, so jed's committed rows are kept.
-[[override]]
-file = "window/ratio.test"
-sql = "SELECT id, percent_rank() OVER (ORDER BY v) AS pr, cume_dist() OVER (ORDER BY v) AS cd FROM t ORDER BY id"
-reason = "jed: percent_rank()/cume_dist() return decimal (divergence D2, window.md §10 — the exact decimal division keeps binary floats out of the value path, CLAUDE.md §8). PostgreSQL returns float8 (0.6666666666666666 etc.). The ratio values are identical; only the type + textual rendering differ. jed's decimal rows are kept."
-
-[[override]]
-file = "window/ratio.test"
-sql = "SELECT id, percent_rank() OVER () AS pr, cume_dist() OVER () AS cd FROM t ORDER BY id"
-reason = "jed: percent_rank()/cume_dist() return decimal not float8 (divergence D2, window.md §10). With no window ORDER BY every row is one peer group, so percent_rank = 0 and cume_dist = 1 for all rows; jed renders them as decimals (0.000…/1.000…). PostgreSQL returns float8. jed's decimal rows are kept."
+# NOTE: the former divergence D2 (percent_rank()/cume_dist() returning DECIMAL, not PG's float8) is
+# GONE — they now return f64, the ratio computed as one IEEE correctly-rounded division of small
+# integers that convert exactly to binary64, so jed's value is bit-identical to PostgreSQL's float8
+# (window.md §4, float.md §5). window/ratio.test is now oracle-clean, needing no override here.
 
 # --- Explicit RANGE value-offset frames over a FLOAT ordering key (window.md §10, divergence D3):
 # jed refuses them 0A000 to keep binary floats out of the comparison/ordering path; PostgreSQL has

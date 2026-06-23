@@ -13615,9 +13615,9 @@ const (
 	planRank
 	// planDenseRank — DENSE_RANK(): 1 + the number of earlier peer groups (ties share, no gap).
 	planDenseRank
-	// planPercentRank — PERCENT_RANK(): (rank-1)/(N-1), 0 when N=1; decimal (divergence D2).
+	// planPercentRank — PERCENT_RANK(): (rank-1)/(N-1), 0 when N=1; f64 (PG's float8, window.md §4).
 	planPercentRank
-	// planCumeDist — CUME_DIST(): (rows through the current peer group)/N; decimal (divergence D2).
+	// planCumeDist — CUME_DIST(): (rows through the current peer group)/N; f64 (PG's float8).
 	planCumeDist
 	// planNtile — NTILE(n): distribute the partition into n ranked buckets (larger first),
 	// numbered 1..n. Position-based (not peer-based); n <= 0 → 22014; NULL n → NULL for every row.
@@ -14900,9 +14900,9 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		"rank":       planRank,
 		"dense_rank": planDenseRank,
 	}[name]
-	// The frame-insensitive no-argument ratio functions (S1): percent_rank/cume_dist → decimal
-	// (divergence D2 — PG's float8; jed uses the exact decimal division, window.md §10).
-	noArgDec, isNoArgDec := map[string]windowPlan{
+	// The frame-insensitive no-argument ratio functions (S1): percent_rank/cume_dist → f64
+	// (PG's float8 — the ratio is the IEEE correctly-rounded f64 division, window.md §4).
+	noArgRatio, isNoArgRatio := map[string]windowPlan{
 		"percent_rank": planPercentRank,
 		"cume_dist":    planCumeDist,
 	}[name]
@@ -14914,12 +14914,12 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		}
 		plan = noArgI64
 		result = resolvedType{kind: rtInt, intTy: Int64}
-	case isNoArgDec:
+	case isNoArgRatio:
 		if fc.Star || len(fc.Args) != 0 {
 			return nil, resolvedType{}, NewError(UndefinedFunction, name+" takes no arguments")
 		}
-		plan = noArgDec
-		result = resolvedType{kind: rtDecimal}
+		plan = noArgRatio
+		result = resolvedType{kind: rtFloat64}
 	case name == "ntile":
 		// ntile(n) — one integer bucket-count argument (window.md §4), resolved in a fresh
 		// Forbidden sub-context (no aggregate/window nesting in a window argument).
@@ -22318,7 +22318,9 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 				// keys only. A single pass identifies peer-group spans [start, end) over the sorted
 				// partition; an empty ORDER BY makes the whole partition one peer group. rank =
 				// start+1, dense_rank = group ordinal, percent_rank = start/(N-1) (0 if N=1),
-				// cume_dist = end/N (the ratios are decimal — divergence D2, window.md §10).
+				// cume_dist = end/N. The ratios are f64 (PG's float8, window.md §4): one IEEE
+				// correctly-rounded division of small integers that convert exactly to binary64, so
+				// the value is bit-identical across cores and to PG (the in-contract kernel, float.md §5).
 				np := len(ordered)
 				type span struct{ start, end int }
 				var groups []span
@@ -22345,20 +22347,12 @@ func applyWindowStage(rows []Row, specs []windowSpec, windowKeys []*rExpr, env *
 							results[ri] = IntValue(int64(gi) + 1)
 						case planPercentRank:
 							if np <= 1 {
-								results[ri] = DecimalValue(DecimalFromInt64(0))
+								results[ri] = Float64Value(0.0)
 							} else {
-								d, err := DecimalFromInt64(int64(g.start)).Div(DecimalFromInt64(int64(np) - 1))
-								if err != nil {
-									return err
-								}
-								results[ri] = DecimalValue(d)
+								results[ri] = Float64Value(float64(g.start) / float64(np-1))
 							}
 						default: // planCumeDist
-							d, err := DecimalFromInt64(int64(g.end)).Div(DecimalFromInt64(int64(np)))
-							if err != nil {
-								return err
-							}
-							results[ri] = DecimalValue(d)
+							results[ri] = Float64Value(float64(g.end) / float64(np))
 						}
 					}
 				}

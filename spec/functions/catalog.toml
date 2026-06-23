@@ -3226,10 +3226,10 @@ errors       = []
 # arg_families   required family of the constrained argument(s), by position; "any" =
 #                unconstrained. Omitted for args = "none". ntile's n is "integer"; the
 #                value-expression of lag/lead/first_value/… is "any".
-# result         a scalar id (i64, decimal) OR the reserved "same_as_input" id (the value
+# result         a scalar id (i64, f64) OR the reserved "same_as_input" id (the value
 #                functions return their value-expression's type, like MIN/MAX). Ranking counters
-#                → i64; percent_rank/cume_dist → decimal (NOT PG's float8 — divergence D2,
-#                ../design/window.md §10).
+#                → i64; percent_rank/cume_dist → f64 (PG's float8 — the ratio division is the
+#                IEEE correctly-rounded f64 kernel, ../design/window.md §4).
 # frame_sensitive whether the function reads the per-row FRAME (true) or ignores it and sees the
 #                whole partition / a positional offset (false). row_number/rank/dense_rank/
 #                percent_rank/cume_dist/ntile/lag/lead are frame-INSENSITIVE; the aggregate
@@ -3281,15 +3281,16 @@ null           = "never"
 errors         = []
 
 # percent_rank / cume_dist — relative ranking ratios, peer-aware. percent_rank = (rank-1)/(N-1)
-# (0 when N=1); cume_dist = (# rows through the current peer group)/N. Result DECIMAL (the exact
-# division via select_div_scale + half-away, the AVG path), NOT PG's float8 — a documented
-# divergence D2 (window.md §10) keeping binary floats out of the value path (CLAUDE.md §8).
+# (0 when N=1); cume_dist = (# rows through the current peer group)/N. Result f64 — PG's float8
+# (window.md §4). The ratio is one IEEE correctly-rounded f64 division of small integers that
+# convert exactly to binary64, so the result is bit-identical across cores AND to PG (the
+# in-contract float kernel, float.md §5) — no longer the old decimal divergence.
 [[window]]
 name           = "percent_rank"
 kind           = "window"
 surface        = "PERCENT_RANK"
 args           = "none"
-result         = "decimal"
+result         = "f64"
 frame_sensitive = false
 requires_order = false
 null           = "never"
@@ -3300,7 +3301,7 @@ name           = "cume_dist"
 kind           = "window"
 surface        = "CUME_DIST"
 args           = "none"
-result         = "decimal"
+result         = "f64"
 frame_sensitive = false
 requires_order = false
 null           = "never"

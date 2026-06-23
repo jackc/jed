@@ -278,7 +278,7 @@ description = "Window ranking functions (spec/design/window.md §4, S1): rank() 
 
 [[capability]]
 id = "query.window_ratio"
-description = "Window ratio functions percent_rank() and cume_dist() (window.md §4, S1): peer-aware relative ranks. percent_rank = (rank-1)/(N-1), 0 when N=1; cume_dist = (rows through the current peer group)/N. Result DECIMAL via the exact division (select_div_scale + half-away, the AVG path), NOT PG float8 — divergence D2. Builds on query.window_ranking"
+description = "Window ratio functions percent_rank() and cume_dist() (window.md §4, S1): peer-aware relative ranks. percent_rank = (rank-1)/(N-1), 0 when N=1; cume_dist = (rows through the current peer group)/N. Result f64 (PG's float8) — one IEEE correctly-rounded division of small exactly-representable integer counts, so bit-identical across cores and to PostgreSQL (the in-contract float kernel, float.md §5). Builds on query.window_ranking"
 
 [[capability]]
 id = "query.window_ntile"

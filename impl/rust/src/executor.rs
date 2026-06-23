@@ -15710,9 +15710,9 @@ fn resolve_window_call(
         "dense_rank" => Some(WindowPlan::DenseRank),
         _ => None,
     };
-    // The frame-insensitive no-argument ratio functions (S1): percent_rank/cume_dist → decimal
-    // (divergence D2 — PG's float8; jed uses the exact decimal division, window.md §10).
-    let no_arg_decimal = match lname.as_str() {
+    // The frame-insensitive no-argument ratio functions (S1): percent_rank/cume_dist → f64
+    // (PG's float8 — the ratio is the IEEE correctly-rounded f64 division, window.md §4).
+    let no_arg_ratio = match lname.as_str() {
         "percent_rank" => Some(WindowPlan::PercentRank),
         "cume_dist" => Some(WindowPlan::CumeDist),
         _ => None,
@@ -15726,14 +15726,14 @@ fn resolve_window_call(
             ));
         }
         (p, ResolvedType::Int(ScalarType::Int64))
-    } else if let Some(p) = no_arg_decimal {
+    } else if let Some(p) = no_arg_ratio {
         if star || !args.is_empty() {
             return Err(EngineError::new(
                 SqlState::UndefinedFunction,
                 format!("{lname} takes no arguments"),
             ));
         }
-        (p, ResolvedType::Decimal)
+        (p, ResolvedType::Float(ScalarType::Float64))
     } else if lname == "ntile" {
         // ntile(n) — one integer bucket-count argument (window.md §4), resolved in a fresh
         // Forbidden sub-context (no aggregate/window nesting in a window argument).
@@ -24668,7 +24668,9 @@ fn apply_window_stage(
                 // single pass identifies peer-group spans [start, end) over the sorted partition; an
                 // empty ORDER BY makes the whole partition one peer group. From each row's span:
                 // rank = start+1, dense_rank = group ordinal, percent_rank = start/(N-1) (0 if N=1),
-                // cume_dist = end/N (the ratios are decimal — divergence D2, window.md §10).
+                // cume_dist = end/N. The ratios are f64 (PG's float8, window.md §4): one IEEE
+                // correctly-rounded division of small integers that convert exactly to binary64, so
+                // the value is bit-identical across cores and to PG (the in-contract kernel, float.md §5).
                 WindowPlan::Rank
                 | WindowPlan::DenseRank
                 | WindowPlan::PercentRank
@@ -24696,19 +24698,13 @@ fn apply_window_stage(
                                 WindowPlan::DenseRank => Value::Int(gi as i64 + 1),
                                 WindowPlan::PercentRank => {
                                     if np <= 1 {
-                                        Value::Decimal(Decimal::from_i64(0))
+                                        Value::Float64(0.0)
                                     } else {
-                                        Value::Decimal(
-                                            Decimal::from_i64(start as i64)
-                                                .div(&Decimal::from_i64(np as i64 - 1))?,
-                                        )
+                                        Value::Float64(start as f64 / (np - 1) as f64)
                                     }
                                 }
                                 // cume_dist: rows through the current peer group / N.
-                                _ => Value::Decimal(
-                                    Decimal::from_i64(end as i64)
-                                        .div(&Decimal::from_i64(np as i64))?,
-                                ),
+                                _ => Value::Float64(end as f64 / np as f64),
                             };
                         }
                     }

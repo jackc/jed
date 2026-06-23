@@ -289,7 +289,7 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.window",
     // Window ranking functions rank() / dense_rank() (S1, peer-aware — spec/design/window.md §4).
     "query.window_ranking",
-    // Window ratio functions percent_rank() / cume_dist() (S1, decimal — divergence D2, window.md §4).
+    // Window ratio functions percent_rank() / cume_dist() (S1, f64 — PG's float8, window.md §4).
     "query.window_ratio",
     // Window ntile(n) (S1, window.md §4).
     "query.window_ntile",

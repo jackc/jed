@@ -11517,9 +11517,9 @@ function resolveWindowCall(
     rank: "rank",
     dense_rank: "denseRank",
   };
-  // The frame-insensitive no-argument ratio functions (S1): percent_rank/cume_dist → decimal
-  // (divergence D2 — PG's float8; jed uses the exact decimal division, window.md §10).
-  const noArgDecimal: Record<string, WindowPlan> = {
+  // The frame-insensitive no-argument ratio functions (S1): percent_rank/cume_dist → f64
+  // (PG's float8 — the ratio is the IEEE correctly-rounded f64 division, window.md §4).
+  const noArgRatio: Record<string, WindowPlan> = {
     percent_rank: "percentRank",
     cume_dist: "cumeDist",
   };
@@ -11542,12 +11542,12 @@ function resolveWindowCall(
     }
     plan = noArgI64[lname]!;
     result = { kind: "int", ty: "i64" };
-  } else if (lname in noArgDecimal) {
+  } else if (lname in noArgRatio) {
     if (e.star || e.args.length !== 0) {
       throw engineError("undefined_function", `${lname} takes no arguments`);
     }
-    plan = noArgDecimal[lname]!;
-    result = { kind: "decimal" };
+    plan = noArgRatio[lname]!;
+    result = { kind: "float", ty: "f64" };
   } else if (lname === "ntile") {
     // ntile(n) — one integer bucket-count argument (window.md §4), resolved in a fresh Forbidden
     // sub-context (no aggregate/window nesting in a window argument). The argument must be int or
@@ -20061,8 +20061,10 @@ function applyWindowStage(
           // Peer-aware ranking (window.md §3/§4): peers are rows EQUAL on the window ORDER BY keys
           // only. A single pass identifies peer-group spans [start, end) over the sorted partition;
           // an empty ORDER BY makes the whole partition one peer group. rank = start+1, dense_rank =
-          // group ordinal, percent_rank = start/(N-1) (0 if N=1), cume_dist = end/N (the ratios are
-          // decimal — divergence D2, window.md §10).
+          // group ordinal, percent_rank = start/(N-1) (0 if N=1), cume_dist = end/N. The ratios are
+          // f64 (PG's float8, window.md §4): one IEEE correctly-rounded division of small integers
+          // that convert exactly to binary64, so the value is bit-identical across cores and to PG
+          // (the in-contract kernel, float.md §5).
           const np = ordered.length;
           const groups: Array<[number, number]> = []; // peer-group spans [start, end)
           let s = 0;
@@ -20084,16 +20086,9 @@ function applyWindowStage(
               } else if (spec.plan === "denseRank") {
                 results[ri] = intValue(BigInt(gi + 1));
               } else if (spec.plan === "percentRank") {
-                results[ri] =
-                  np <= 1
-                    ? decimalValue(Decimal.fromBigInt(0n))
-                    : decimalValue(
-                        Decimal.fromBigInt(BigInt(start)).div(Decimal.fromBigInt(BigInt(np - 1))),
-                      );
+                results[ri] = np <= 1 ? float64Value(0.0) : float64Value(start / (np - 1));
               } else {
-                results[ri] = decimalValue(
-                  Decimal.fromBigInt(BigInt(end)).div(Decimal.fromBigInt(BigInt(np))),
-                );
+                results[ri] = float64Value(end / np);
               }
             }
           }

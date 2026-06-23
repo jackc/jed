@@ -128,7 +128,7 @@ cores in lockstep** (Rust + Go + TS), spec-first, with corpus entries + a capabi
 
 Locked scope decisions: **the within-partition order is always fully resolved** (§3,
 deterministic — a divergence-adjacent strictness, §10); **`percent_rank`/`cume_dist` →
-`decimal`**, not PG's `float8` (§10, the `AVG`→`decimal` precedent); **`PARTITION BY` columns
+`f64`** (PG's `float8`, §4 — the in-contract correctly-rounded division); **`PARTITION BY` columns
 only** in S0; **explicit `ROWS` frames in S4, `RANGE`/`GROUPS` + value offsets in S6** (S0–S3 use
 the implicit default frame, §6).
 
@@ -216,8 +216,8 @@ catalog array (S0+) and reused `[[aggregate]]` rows (S3):
 | `row_number()` | — | `i64` | no | no | never | S0 |
 | `rank()` | — | `i64` | no | no | never | S1 |
 | `dense_rank()` | — | `i64` | no | no | never | S1 |
-| `percent_rank()` | — | `decimal` | no | no | never | S1 |
-| `cume_dist()` | — | `decimal` | no | no | never | S1 |
+| `percent_rank()` | — | `f64` | no | no | never | S1 |
+| `cume_dist()` | — | `f64` | no | no | never | S1 |
 | `ntile(n)` | `n int` | `i64` | no | no | never (`n ≤ 0` → `22003`†) | S1 |
 | `lag(e [,off [,def]])` | any | input type | no | no | NULL if offset leaves partition (no default) | S2 |
 | `lead(e [,off [,def]])` | any | input type | no | no | NULL if offset leaves partition (no default) | S2 |
@@ -233,12 +233,15 @@ catalog array (S0+) and reused `[[aggregate]]` rows (S3):
 
 - **Ranking counters** (`row_number`/`rank`/`dense_rank`/`ntile`) → `i64`, exact, matching PG's
   `bigint`/`int4` (jed widens `ntile` to `i64` — its own integer narrowing rule).
-- **`percent_rank`/`cume_dist` → `decimal`**, *not* PG's `float8` (ledger D2, §10). They are
-  ratios — `percent_rank = (rank − 1) / (N − 1)` (1.0 when `N = 1`… actually `0` when `N = 1`,
-  per PG: a lone row has `percent_rank` `0`), `cume_dist = (# rows ≤ current peer) / N` — computed
-  through the **exact decimal division** `select_div_scale` + half-away rounding, the *same*
-  machinery as `AVG` ([decimal.md](decimal.md) §4), the engine's hardest cross-core path. This
-  keeps binary floats out of the value/output path (§8) and is consistent with `AVG`/`SUM`→`decimal`.
+- **`percent_rank`/`cume_dist` → `f64`** (PG's `float8`). They are ratios —
+  `percent_rank = (rank − 1) / (N − 1)` (`0` when `N = 1`, per PG: a lone row has `percent_rank`
+  `0`), `cume_dist = (# rows ≤ current peer) / N` — computed as **one IEEE correctly-rounded `f64`
+  division**. The numerator and denominator are small partition counts that convert *exactly* to
+  binary64 (≤ 2^53), and binary64 `/` is IEEE-mandated correctly-rounded, so the result is
+  **bit-identical across cores and to PostgreSQL** — the in-contract float kernel
+  ([float.md](float.md) §5), no exemption and no oracle override. (This formerly returned `decimal`
+  via the exact division — divergence D2 — kept solely to keep binary floats out of the value path;
+  with the `f64` type landed, returning `float8` removes the divergence at no determinism cost.)
 - **Value functions** (`lag`/`lead`/`first_value`/`last_value`/`nth_value`) → **the value
   expression's type** (the `same_as_input` reserved id, [functions.md](functions.md) §8). `lag`'s
   `default` argument, if present, must be assignable to that type (`42804` otherwise).
@@ -323,8 +326,8 @@ A blocking stage between projection/aggregation and `DISTINCT`/`ORDER BY`:
    - **`RowNumber`** → 1-based sequence position.
    - **`Rank`** → 1 + (# rows in earlier peer groups); **`DenseRank`** → 1 + (# earlier peer
      groups). Peers per §3 (`order_keys` equality only).
-   - **`PercentRank`/`CumeDist`** → the exact-decimal ratios (§4); `Ntile(n)` → the bucket index
-     by the PG distribution rule (larger buckets first).
+   - **`PercentRank`/`CumeDist`** → the `f64` ratios (§4, the in-contract correctly-rounded
+     division); `Ntile(n)` → the bucket index by the PG distribution rule (larger buckets first).
    - **`Lag`/`Lead`** → the value-expression of the row `offset` positions back/forward in the
      partition sequence, else the `default` (or `NULL`).
    - **`Agg(plan)`** → reuse the existing `Acc` ([executor.rs `Acc`]) folded over the row's
@@ -487,9 +490,10 @@ directive. A `sum(x) OVER (ORDER BY t)` running total over `N` rows adds the fra
   together or the per-partition results — every core iterates an explicit insertion-ordered list
   (the aggregate-grouping discipline). Emission order with no query `ORDER BY` stays unspecified
   (the corpus compares `rowsort` or adds an `ORDER BY`); the *values* are deterministic.
-- **The decimal ratios** (`percent_rank`/`cume_dist`) flow through `select_div_scale` + half-away
-  rounding ([decimal.md](decimal.md) §4) — pinned with exact rendered strings, the highest
-  cross-core risk after `AVG`.
+- **The `f64` ratios** (`percent_rank`/`cume_dist`) are one IEEE correctly-rounded division of
+  small exactly-representable integer counts ([float.md](float.md) §5), so the value is
+  bit-identical across cores and to PostgreSQL — in-contract, no exemption; the `R` render tag
+  ([conformance.md](conformance.md) §1) absorbs any cross-core layout difference.
 - **Aggregate-window reuse** inherits the aggregate determinism contract unchanged (the
   order-independent float fold, the widening overflow boundaries).
 
@@ -502,9 +506,13 @@ Deliberate divergences from PostgreSQL, each registered in
   orders a partition by primary-key/scan order (§3); PG leaves it unspecified. jed is deliberately
   stricter on determinism (the §8 no-iteration-leak rule). Observable only for functions sensitive
   to peer/row sequence with no `ORDER BY` (e.g. `row_number() OVER (PARTITION BY g)`).
-- **D2 — `percent_rank`/`cume_dist` → `decimal`, not `float8`.** jed keeps binary floats out of
-  the value/output path (§8) and reuses the exact decimal division (the `AVG`→`decimal`/`SUM`→
-  `decimal` family). Rendered as exact decimals; the oracle override records the type + rendering.
+- **~~D2 — `percent_rank`/`cume_dist` → `decimal`, not `float8`~~ (RESOLVED — no longer a
+  divergence).** These now return `f64`, matching PG's `float8` exactly (§4): the ratio is one IEEE
+  correctly-rounded division of small exactly-representable integer counts, so jed's value is
+  bit-identical to PostgreSQL's and `window/ratio.test` is oracle-clean (no override). The original
+  divergence existed only to keep binary floats out of the value path before the `f64` type landed;
+  with `f64` available, removing the divergence costs no determinism (D-numbering kept stable —
+  D1/D3/D4 unchanged).
 - **D3 — `float`-keyed `RANGE`-offset frames are `0A000`.** A `RANGE BETWEEN n PRECEDING` needs
   `order_key ± n` over the single ordering key; over `float` that re-imports float ordering into a
   comparison path, so it is refused (matching the float-PK `0A000` and the date strict-island
@@ -532,7 +540,6 @@ Deliberate divergences from PostgreSQL, each registered in
   — deferred; only integer/decimal ordering keys take a value offset this slice. A float key stays
   `0A000` permanently (D3). Non-literal/expression frame offsets are also out (literals only, like
   the `ROWS` narrowing).
-- **`float8` results** for `percent_rank`/`cume_dist` (D2) — out unless a future need overrides.
 - **Wider sharing / sliding** — *cost-lowering only, never correctness; the landed core is §5.2/§8.*
   The shared partition/sort pass groups specs with an **identical** partition+order; PostgreSQL's
   prefix-**compatible** sharing (a shorter `ORDER BY` reusing a longer one's sort) is not yet done.
