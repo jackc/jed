@@ -13,7 +13,7 @@ use crate::ast::{
     SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
     Update, WindowDef, WithExpr, WithQuery,
 };
-use crate::ast::{FrameBound, FrameMode, WindowFrame};
+use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
@@ -3297,13 +3297,45 @@ impl Parser {
             // A single bound is the frame START; the END defaults to CURRENT ROW.
             (self.parse_frame_bound()?, FrameBound::CurrentRow)
         };
-        if self.peek_keyword().as_deref() == Some("exclude") {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "frame EXCLUDE is not supported yet",
-            ));
+        let exclude = self.parse_frame_exclusion()?;
+        Ok(Some(WindowFrame {
+            mode,
+            start,
+            end,
+            exclude,
+        }))
+    }
+
+    /// Parse an optional `EXCLUDE { CURRENT ROW | GROUP | TIES | NO OTHERS }` clause
+    /// (spec/design/window.md §6); absent → `NoOthers` (drop nothing).
+    fn parse_frame_exclusion(&mut self) -> Result<FrameExclusion> {
+        if self.peek_keyword().as_deref() != Some("exclude") {
+            return Ok(FrameExclusion::NoOthers);
         }
-        Ok(Some(WindowFrame { mode, start, end }))
+        self.advance();
+        match self.peek_keyword().as_deref() {
+            Some("current") => {
+                self.advance();
+                self.expect_keyword("row")?;
+                Ok(FrameExclusion::CurrentRow)
+            }
+            Some("group") => {
+                self.advance();
+                Ok(FrameExclusion::Group)
+            }
+            Some("ties") => {
+                self.advance();
+                Ok(FrameExclusion::Ties)
+            }
+            Some("no") => {
+                self.advance();
+                self.expect_keyword("others")?;
+                Ok(FrameExclusion::NoOthers)
+            }
+            _ => Err(syntax(
+                "expected CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE",
+            )),
+        }
     }
 
     /// Parse one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`, `CURRENT ROW`, or `expr

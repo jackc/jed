@@ -3881,10 +3881,42 @@ func (p *Parser) parseWindowFrame() (*WindowFrame, error) {
 		}
 		start, end = s, FrameBound{Kind: FrameCurrentRow}
 	}
-	if p.peekKeyword() == "exclude" {
-		return nil, NewError(FeatureNotSupported, "frame EXCLUDE is not supported yet")
+	exclude, err := p.parseFrameExclusion()
+	if err != nil {
+		return nil, err
 	}
-	return &WindowFrame{Mode: mode, Start: start, End: end}, nil
+	return &WindowFrame{Mode: mode, Start: start, End: end, Exclude: exclude}, nil
+}
+
+// parseFrameExclusion parses an optional `EXCLUDE { CURRENT ROW | GROUP | TIES | NO OTHERS }` clause
+// (spec/design/window.md §6); absent → FrameExcludeNoOthers (drop nothing).
+func (p *Parser) parseFrameExclusion() (FrameExclusion, error) {
+	if p.peekKeyword() != "exclude" {
+		return FrameExcludeNoOthers, nil
+	}
+	p.advance()
+	switch p.peekKeyword() {
+	case "current":
+		p.advance()
+		if err := p.expectKeyword("row"); err != nil {
+			return 0, err
+		}
+		return FrameExcludeCurrentRow, nil
+	case "group":
+		p.advance()
+		return FrameExcludeGroup, nil
+	case "ties":
+		p.advance()
+		return FrameExcludeTies, nil
+	case "no":
+		p.advance()
+		if err := p.expectKeyword("others"); err != nil {
+			return 0, err
+		}
+		return FrameExcludeNoOthers, nil
+	default:
+		return 0, NewError(SyntaxError, "expected CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE")
+	}
 }
 
 // parseFrameBound parses one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`, `CURRENT ROW`, or

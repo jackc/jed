@@ -10,12 +10,13 @@
 > change the data/grammar and here in the same edit. PostgreSQL is the behavioral default
 > (CLAUDE.md §1); the deliberate divergences are the ledger in §10.
 
-> **Status: COMPLETE (S0–S6, all three cores).** Every function below is landed — row_number,
+> **Status: COMPLETE (S0–S7, all three cores).** Every function below is landed — row_number,
 > rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, the aggregates as window functions
 > (running + explicit `ROWS`/`RANGE`/`GROUPS` frames, including value-based `RANGE` offsets over an
-> integer or decimal ordering key), first_value/last_value/nth_value, and named windows. The
-> remaining `0A000` items — `EXCLUDE`, and `RANGE` offsets over a float (divergence D3) / timestamp /
-> date ordering key (§6/§11 + the per-slice notes) — are deferred follow-ons, not gaps in the core.
+> integer or decimal ordering key, with `EXCLUDE CURRENT ROW`/`GROUP`/`TIES`/`NO OTHERS`),
+> first_value/last_value/nth_value, and named windows. The only remaining `0A000` items — `RANGE`
+> offsets over a float (divergence D3) / timestamp / date ordering key (§6/§11 + the per-slice
+> notes) — are deferred follow-ons, not gaps in the core.
 
 A **window function** computes a value for **each row** from a *set* of related rows — its
 **window frame** — without collapsing the rows the way an aggregate does. `row_number() OVER
@@ -59,8 +60,13 @@ cores in lockstep** (Rust + Go + TS), spec-first, with corpus entries + a capabi
    ROW` bounds over any ordering (peer/edge based), and value-based `n PRECEDING`/`FOLLOWING`
    offsets over a **single** integer or decimal ordering key (else `42P20`/`0A000`). `CURRENT ROW`
    spans the current peer group in both modes; a NULL ordering key frames only its NULL peers for
-   offset/CURRENT bounds. `EXCLUDE`, and `RANGE` offsets over a float (D3) / timestamp / date key,
-   stay `0A000`. Capability `query.window_frame_range`.
+   offset/CURRENT bounds. `RANGE` offsets over a float (D3) / timestamp / date key stay `0A000`.
+   Capability `query.window_frame_range`.
+7. **S7 — frame `EXCLUDE`.** `EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS` on any explicit frame:
+   after the `[lo, hi)` frame is computed, drop the current row (`CURRENT ROW`), its whole peer
+   group (`GROUP`), its peers but not itself (`TIES`), or nothing (`NO OTHERS`, the default). Only
+   rows already in the frame are dropped; `first/last/nth_value` pick over the survivors; an
+   empty-after-exclusion frame is `NULL` (count `0`). Capability `query.window_frame_exclude`.
 
 Locked scope decisions: **the within-partition order is always fully resolved** (§3,
 deterministic — a divergence-adjacent strictness, §10); **`percent_rank`/`cume_dist` →
@@ -263,13 +269,19 @@ folds over, *per current row*. The frame is `{ROWS | RANGE | GROUPS} frame_exten
 - **`GROUPS`** — peer-group offsets (`GROUPS BETWEEN 1 PRECEDING AND CURRENT ROW`). A bound `g
   PRECEDING`/`FOLLOWING` lands on the `cg ∓ g`-th peer group's start/end. `GROUPS` requires an
   `ORDER BY` (else `42P20`).
-- **`EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS`** — frame exclusion, **deferred `0A000`**.
+- **`EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS`** — frame exclusion (S7). Computed *after*
+  `[lo, hi)`: it drops the current row, its whole peer group, its peers but not itself, or nothing
+  (the default). It removes only rows already inside the frame, so `EXCLUDE CURRENT ROW` on a frame
+  the current row is not part of is a no-op. `first/last/nth_value` pick over the survivors;
+  an empty-after-exclusion frame is `NULL` (count `0`). The metered `window_frame_step` is charged
+  only for surviving folded rows. Works with every frame mode and the default (`None`) frame is
+  always `NO OTHERS` (no clause ⇒ no exclusion).
 
 S4 shipped explicit `ROWS BETWEEN frame_start AND frame_end`; **S6** added `RANGE`/`GROUPS` and
-value-based `RANGE` offsets (integer/decimal keys). `EXCLUDE`, and `RANGE` offsets over a float
-(D3) / timestamp / date key, stay `0A000`. A frame bound that contains a window function, an
+value-based `RANGE` offsets (integer/decimal keys); **S7** added `EXCLUDE`. `RANGE` offsets over a
+float (D3) / timestamp / date key stay `0A000`. A frame bound that contains a window function, an
 aggregate, a column reference, or a negative offset is rejected (`42P20`/`42803`/`0A000`/`22013` as
-appropriate, matching PG).
+appropriate, matching PG); a malformed `EXCLUDE` is `42601`.
 
 Frame evaluation is naive (re-fold per row, O(partition²) worst case) until the S5 sliding-window
 optimization; the cost meter (§8) bounds it so an untrusted running-window query still aborts on
@@ -365,7 +377,6 @@ Deliberate divergences from PostgreSQL, each registered in
   aggregate `FILTER` follow-on, [aggregates.md](aggregates.md) §10).
 - **General-expression `PARTITION BY`/`ORDER BY`** (`PARTITION BY a + b`) — lifted with the
   `GROUP BY`/`ORDER BY` expression-key follow-on (§1 S0 narrowing).
-- **`EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS`** — frame exclusion, parsed but `0A000` (§6).
 - **`RANGE` value offsets over a timestamp/timestamptz/date key** (an `interval`/integer offset, D4)
   — deferred; only integer/decimal ordering keys take a value offset this slice. A float key stays
   `0A000` permanently (D3). Non-literal/expression frame offsets are also out (literals only, like

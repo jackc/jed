@@ -1090,10 +1090,27 @@ type WindowDef struct {
 
 // WindowFrame is a window frame clause (spec/design/window.md §6).
 type WindowFrame struct {
-	Mode  FrameMode
-	Start FrameBound
-	End   FrameBound
+	Mode    FrameMode
+	Start   FrameBound
+	End     FrameBound
+	Exclude FrameExclusion
 }
+
+// FrameExclusion is the EXCLUDE clause (spec/design/window.md §6): which rows to drop from the
+// computed [lo, hi) frame, per current row. FrameExcludeNoOthers (the default / no EXCLUDE) drops
+// nothing.
+type FrameExclusion int
+
+const (
+	// FrameExcludeNoOthers drops nothing (EXCLUDE NO OTHERS / no clause).
+	FrameExcludeNoOthers FrameExclusion = iota
+	// FrameExcludeCurrentRow drops the current row.
+	FrameExcludeCurrentRow
+	// FrameExcludeGroup drops the current row's whole peer group.
+	FrameExcludeGroup
+	// FrameExcludeTies drops the current row's peers but not the row itself.
+	FrameExcludeTies
+)
 
 // FrameMode is the frame unit: ROWS, RANGE, or GROUPS. S4 supports ROWS only.
 type FrameMode int

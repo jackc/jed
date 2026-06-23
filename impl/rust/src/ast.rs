@@ -1013,6 +1013,7 @@ pub struct WindowFrame {
     pub mode: FrameMode,
     pub start: FrameBound,
     pub end: FrameBound,
+    pub exclude: FrameExclusion,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -1020,6 +1021,16 @@ pub enum FrameMode {
     Rows,
     Range,
     Groups,
+}
+
+/// Frame exclusion (`EXCLUDE …` — spec/design/window.md §6): which rows to drop from the computed
+/// `[lo, hi)` frame, per current row. `NoOthers` (the default / no `EXCLUDE`) drops nothing.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameExclusion {
+    NoOthers,
+    CurrentRow,
+    Group,
+    Ties,
 }
 
 /// A frame boundary. `Preceding`/`Following` carry the offset expression (a non-negative integer

@@ -13441,9 +13441,10 @@ type windowSpec struct {
 // resolvedFrame is a resolved window frame (spec/design/window.md §6). ROWS physical offsets,
 // GROUPS peer-group offsets (both integer counts), and RANGE value offsets over the ordering key.
 type resolvedFrame struct {
-	mode  FrameMode
-	start resolvedBound
-	end   resolvedBound
+	mode    FrameMode
+	start   resolvedBound
+	end     resolvedBound
+	exclude FrameExclusion // EXCLUDE … — rows dropped from [lo, hi) per current row (window.md §6)
 }
 
 // resolvedBoundKind distinguishes the five resolved frame-boundary forms.
@@ -14888,7 +14889,7 @@ func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, *resolvedFra
 // resolveFrame resolves an explicit frame clause (spec/design/window.md §6). GROUPS requires an
 // ORDER BY (42P20); a RANGE value offset requires exactly one ORDER BY column (42P20) of an integer
 // or decimal type (else 0A000 — float is divergence D3, timestamp/date are deferred follow-ons). A
-// negative offset is 22013; EXCLUDE was already rejected at parse. Mirrors Rust's resolve_frame.
+// negative offset is 22013. Mirrors Rust's resolve_frame.
 func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolvedFrame, error) {
 	isOffset := func(b FrameBound) bool { return b.Kind == FramePreceding || b.Kind == FrameFollowing }
 	hasOffset := isOffset(f.Start) || isOffset(f.End)
@@ -14902,7 +14903,7 @@ func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolv
 		if err != nil {
 			return nil, err
 		}
-		return &resolvedFrame{mode: FrameRows, start: start, end: end}, nil
+		return &resolvedFrame{mode: FrameRows, start: start, end: end, exclude: f.Exclude}, nil
 	case FrameGroups:
 		if len(order) == 0 {
 			return nil, NewError(WindowingError, "GROUPS mode requires an ORDER BY clause")
@@ -14915,7 +14916,7 @@ func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolv
 		if err != nil {
 			return nil, err
 		}
-		return &resolvedFrame{mode: FrameGroups, start: start, end: end}, nil
+		return &resolvedFrame{mode: FrameGroups, start: start, end: end, exclude: f.Exclude}, nil
 	default: // FrameRange
 		if hasOffset {
 			if len(order) != 1 {
@@ -14936,7 +14937,7 @@ func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolv
 			if err != nil {
 				return nil, err
 			}
-			return &resolvedFrame{mode: FrameRange, start: start, end: end}, nil
+			return &resolvedFrame{mode: FrameRange, start: start, end: end, exclude: f.Exclude}, nil
 		}
 		// RANGE with only UNBOUNDED / CURRENT ROW bounds — peer/edge based, any number of ORDER BY
 		// keys (or none); no key arithmetic, so it reuses the plain bound resolution.
@@ -14948,7 +14949,7 @@ func resolveFrame(f *WindowFrame, order []orderSlot, orderTypes []Type) (*resolv
 		if err != nil {
 			return nil, err
 		}
-		return &resolvedFrame{mode: FrameRange, start: start, end: end}, nil
+		return &resolvedFrame{mode: FrameRange, start: start, end: end, exclude: f.Exclude}, nil
 	}
 }
 
@@ -21648,6 +21649,31 @@ func (c *frameCtx) bounds(pos int, frame *resolvedFrame) (int, int, error) {
 	}
 }
 
+// isExcluded reports whether sorted position k is dropped from the current row pos's frame by
+// EXCLUDE (window.md §6): CURRENT ROW drops the row itself, GROUP its whole peer group, TIES the
+// peers but not the row, NO OTHERS nothing. Exclusion removes only rows already in [lo, hi).
+// Mirrors Rust's FrameCtx::is_excluded.
+func (c *frameCtx) isExcluded(pos, k int, exclude FrameExclusion) bool {
+	switch exclude {
+	case FrameExcludeCurrentRow:
+		return k == pos
+	case FrameExcludeGroup:
+		return c.peerStart[pos] <= k && k < c.peerEnd[pos]
+	case FrameExcludeTies:
+		return k != pos && c.peerStart[pos] <= k && k < c.peerEnd[pos]
+	default: // FrameExcludeNoOthers
+		return false
+	}
+}
+
+// frameExclusion returns a resolved frame's exclusion, or NoOthers for the default (nil) frame.
+func frameExclusion(frame *resolvedFrame) FrameExclusion {
+	if frame == nil {
+		return FrameExcludeNoOthers
+	}
+	return frame.exclude
+}
+
 // rowsBounds: physical row offsets in the partition sequence; bounds clamp to [0, np].
 func (c *frameCtx) rowsBounds(pos int, f *resolvedFrame) (int, int) {
 	np := c.np
@@ -22160,8 +22186,10 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 					}
 				} else {
 					// EXPLICIT frame (window.md §6): fold each row's [lo, hi) fresh — naive
-					// O(partition²), the metered window_frame_step bounding it.
+					// O(partition²), the metered window_frame_step bounding it. EXCLUDE rows are
+					// dropped before folding (so they are neither metered nor counted).
 					ctx := newFrameCtx(ordered, rows, spec.order)
+					exclude := frameExclusion(spec.frame)
 					for pos := 0; pos < np; pos++ {
 						lo, hi, err := ctx.bounds(pos, spec.frame)
 						if err != nil {
@@ -22169,6 +22197,9 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 						}
 						a := newAcc(spec.aggPlan)
 						for k := lo; k < hi; k++ {
+							if ctx.isExcluded(pos, k, exclude) {
+								continue
+							}
 							meter.Charge(Costs.WindowFrameStep)
 							v, err := opval(k)
 							if err != nil {
@@ -22218,6 +22249,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 					}
 				}
 				ctx := newFrameCtx(ordered, rows, spec.order)
+				exclude := frameExclusion(spec.frame)
 				for pos := 0; pos < np; pos++ {
 					if err := meter.Guard(); err != nil {
 						return err
@@ -22227,26 +22259,40 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 					if err != nil {
 						return err
 					}
+					// first/last/nth pick over the frame's NON-excluded rows (window.md §6); the
+					// NoOthers fast path breaks on the first row, so it stays O(1).
+					out := NullValue()
 					switch spec.plan {
 					case planFirstValue:
-						if hi > lo {
-							results[ordered[pos]] = vals[lo]
-						} else {
-							results[ordered[pos]] = NullValue() // empty frame
+						for k := lo; k < hi; k++ {
+							if !ctx.isExcluded(pos, k, exclude) {
+								out = vals[k]
+								break
+							}
 						}
 					case planLastValue:
-						if hi > lo {
-							results[ordered[pos]] = vals[hi-1]
-						} else {
-							results[ordered[pos]] = NullValue() // empty frame
+						for k := hi - 1; k >= lo; k-- {
+							if !ctx.isExcluded(pos, k, exclude) {
+								out = vals[k]
+								break
+							}
 						}
 					default: // planNthValue
-						if !nthNull && lo+nth-1 < hi {
-							results[ordered[pos]] = vals[lo+nth-1]
-						} else {
-							results[ordered[pos]] = NullValue() // empty frame, < n rows, or NULL n
+						if !nthNull {
+							count := 0
+							for k := lo; k < hi; k++ {
+								if ctx.isExcluded(pos, k, exclude) {
+									continue
+								}
+								count++
+								if count == nth {
+									out = vals[k]
+									break
+								}
+							}
 						}
 					}
+					results[ordered[pos]] = out
 				}
 			}
 		}

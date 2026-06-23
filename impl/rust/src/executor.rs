@@ -13207,6 +13207,8 @@ struct ResolvedFrame {
     mode: crate::ast::FrameMode,
     start: ResolvedBound,
     end: ResolvedBound,
+    /// Frame exclusion (`EXCLUDE …` — window.md §6): rows dropped from `[lo, hi)` per current row.
+    exclude: crate::ast::FrameExclusion,
 }
 
 /// A resolved frame boundary. `Preceding`/`Following` carry the offset as a value: `Value::Int(n)`
@@ -15544,6 +15546,7 @@ fn resolve_frame(
             mode: FrameMode::Rows,
             start: resolve_int_bound(&f.start)?,
             end: resolve_int_bound(&f.end)?,
+            exclude: f.exclude,
         }),
         FrameMode::Groups => {
             if order.is_empty() {
@@ -15556,6 +15559,7 @@ fn resolve_frame(
                 mode: FrameMode::Groups,
                 start: resolve_int_bound(&f.start)?,
                 end: resolve_int_bound(&f.end)?,
+                exclude: f.exclude,
             })
         }
         FrameMode::Range if has_offset => {
@@ -15579,6 +15583,7 @@ fn resolve_frame(
                 mode: FrameMode::Range,
                 start: resolve_range_bound(&f.start, kt)?,
                 end: resolve_range_bound(&f.end, kt)?,
+                exclude: f.exclude,
             })
         }
         // RANGE with only UNBOUNDED / CURRENT ROW bounds — peer/edge based, any number of ORDER BY
@@ -15587,6 +15592,7 @@ fn resolve_frame(
             mode: FrameMode::Range,
             start: resolve_int_bound(&f.start)?,
             end: resolve_int_bound(&f.end)?,
+            exclude: f.exclude,
         }),
     }
 }
@@ -23868,6 +23874,19 @@ impl<'a> FrameCtx<'a> {
         }
     }
 
+    /// Whether sorted position `k` is dropped from the current row `pos`'s frame by `EXCLUDE`
+    /// (window.md §6): `CURRENT ROW` drops the row itself, `GROUP` its whole peer group, `TIES` the
+    /// peers but not the row, `NO OTHERS` nothing. Exclusion removes only rows already in `[lo, hi)`.
+    fn is_excluded(&self, pos: usize, k: usize, exclude: crate::ast::FrameExclusion) -> bool {
+        use crate::ast::FrameExclusion;
+        match exclude {
+            FrameExclusion::NoOthers => false,
+            FrameExclusion::CurrentRow => k == pos,
+            FrameExclusion::Group => self.peer_start[pos] <= k && k < self.peer_end[pos],
+            FrameExclusion::Ties => k != pos && self.peer_start[pos] <= k && k < self.peer_end[pos],
+        }
+    }
+
     /// ROWS: physical row offsets in the partition sequence; bounds clamp to `[0, np]`.
     fn rows_bounds(&self, pos: usize, f: &ResolvedFrame) -> (usize, usize) {
         let p = pos as i128;
@@ -24285,12 +24304,20 @@ fn apply_window_stage(
                         }
                     } else {
                         // EXPLICIT frame (window.md §6): fold each row's frame fresh — naive
-                        // O(partition²), the metered `window_frame_step` bounding it.
+                        // O(partition²), the metered `window_frame_step` bounding it. `EXCLUDE`
+                        // rows are dropped before folding (so they are neither metered nor counted).
                         let ctx = FrameCtx::new(&ordered, rows, &spec.order);
+                        let exclude = spec
+                            .frame
+                            .as_ref()
+                            .map_or(crate::ast::FrameExclusion::NoOthers, |f| f.exclude);
                         for pos in 0..np {
                             let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
                             let mut acc = Acc::new(aggplan);
                             for k in lo..hi {
+                                if ctx.is_excluded(pos, k, exclude) {
+                                    continue;
+                                }
                                 meter.charge(COSTS.window_frame_step);
                                 let v = opval(k, meter)?;
                                 acc.fold(v, meter)?;
@@ -24326,18 +24353,32 @@ fn apply_window_stage(
                         Some(0) // unused for first/last
                     };
                     let ctx = FrameCtx::new(&ordered, rows, &spec.order);
+                    let exclude = spec
+                        .frame
+                        .as_ref()
+                        .map_or(crate::ast::FrameExclusion::NoOthers, |f| f.exclude);
                     for pos in 0..np {
                         meter.guard()?;
                         meter.charge(COSTS.window_result);
                         let (lo, hi) = ctx.bounds(pos, &spec.frame)?;
+                        // first/last/nth pick over the frame's NON-excluded rows (window.md §6); the
+                        // `NoOthers` fast path breaks on the first row, so it stays O(1).
                         results[ordered[pos]] = match spec.plan {
-                            WindowPlan::FirstValue if hi > lo => vals[lo].clone(),
-                            WindowPlan::LastValue if hi > lo => vals[hi - 1].clone(),
+                            WindowPlan::FirstValue => (lo..hi)
+                                .find(|&k| !ctx.is_excluded(pos, k, exclude))
+                                .map_or(Value::Null, |k| vals[k].clone()),
+                            WindowPlan::LastValue => (lo..hi)
+                                .rev()
+                                .find(|&k| !ctx.is_excluded(pos, k, exclude))
+                                .map_or(Value::Null, |k| vals[k].clone()),
                             WindowPlan::NthValue => match nth {
-                                Some(n) if lo + n - 1 < hi => vals[lo + n - 1].clone(),
-                                _ => Value::Null, // empty frame, < n rows, or NULL n
+                                Some(n) => (lo..hi)
+                                    .filter(|&k| !ctx.is_excluded(pos, k, exclude))
+                                    .nth(n - 1)
+                                    .map_or(Value::Null, |k| vals[k].clone()),
+                                None => Value::Null, // NULL n
                             },
-                            _ => Value::Null, // empty frame (first/last)
+                            _ => Value::Null,
                         };
                     }
                 }

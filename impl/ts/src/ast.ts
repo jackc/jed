@@ -270,9 +270,14 @@ export type WindowFrame = {
   mode: FrameMode;
   start: FrameBound;
   end: FrameBound;
+  exclude: FrameExclusion;
 };
 
 export type FrameMode = "rows" | "range" | "groups";
+
+// Frame exclusion (EXCLUDE … — spec/design/window.md §6): which rows to drop from the computed
+// [lo, hi) frame, per current row. "noOthers" (the default / no EXCLUDE) drops nothing.
+export type FrameExclusion = "noOthers" | "currentRow" | "group" | "ties";
 
 // A frame boundary. Preceding/Following carry the offset expression (a non-negative integer
 // in ROWS/GROUPS; a value offset in RANGE).

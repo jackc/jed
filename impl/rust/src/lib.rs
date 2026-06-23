@@ -301,6 +301,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.window_frame",
     // Explicit RANGE / GROUPS frames + value-based RANGE offsets (window.md §6).
     "query.window_frame_range",
+    // Frame EXCLUDE CURRENT ROW / GROUP / TIES / NO OTHERS (window.md §6).
+    "query.window_frame_exclude",
     // Named windows: WINDOW clause + OVER name (S5, window.md §5).
     "query.window_named",
     // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.

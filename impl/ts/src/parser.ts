@@ -43,6 +43,7 @@ import type {
   WindowFrame,
   FrameBound,
   FrameMode,
+  FrameExclusion,
 } from "./ast.ts";
 import { emptySeqOptions, seqOptionsHasAny } from "./ast.ts";
 import { Decimal } from "./decimal.ts";
@@ -2896,10 +2897,36 @@ class Parser {
       start = this.parseFrameBound();
       end = { kind: "currentRow" };
     }
-    if (this.peekKeyword() === "exclude") {
-      throw engineError("feature_not_supported", "frame EXCLUDE is not supported yet");
+    const exclude = this.parseFrameExclusion();
+    return { mode, start, end, exclude };
+  }
+
+  // parseFrameExclusion parses an optional `EXCLUDE { CURRENT ROW | GROUP | TIES | NO OTHERS }`
+  // clause (spec/design/window.md §6); absent → "noOthers" (drop nothing).
+  private parseFrameExclusion(): FrameExclusion {
+    if (this.peekKeyword() !== "exclude") return "noOthers";
+    this.advance();
+    switch (this.peekKeyword()) {
+      case "current":
+        this.advance();
+        this.expectKeyword("row");
+        return "currentRow";
+      case "group":
+        this.advance();
+        return "group";
+      case "ties":
+        this.advance();
+        return "ties";
+      case "no":
+        this.advance();
+        this.expectKeyword("others");
+        return "noOthers";
+      default:
+        throw engineError(
+          "syntax_error",
+          "expected CURRENT ROW, GROUP, TIES, or NO OTHERS after EXCLUDE",
+        );
     }
-    return { mode, start, end };
   }
 
   // parseFrameBound parses one frame bound: `UNBOUNDED PRECEDING|FOLLOWING`, `CURRENT ROW`, or

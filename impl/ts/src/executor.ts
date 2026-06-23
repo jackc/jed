@@ -42,6 +42,7 @@ import type {
   WindowDef,
   WindowFrame,
   FrameMode,
+  FrameExclusion,
   FrameBound,
   WithExpr,
   WithQuery,
@@ -10421,6 +10422,8 @@ type ResolvedFrame = {
   mode: FrameMode;
   start: ResolvedBound;
   end: ResolvedBound;
+  // EXCLUDE … — rows dropped from [lo, hi) per current row (window.md §6).
+  exclude: FrameExclusion;
 };
 
 // A resolved frame boundary. preceding/following carry the offset as a Value: an int Value (the
@@ -11465,18 +11468,28 @@ function resolveWindowDef(
 // resolveFrame resolves an explicit frame clause (spec/design/window.md §6). GROUPS requires an
 // ORDER BY (42P20); a RANGE value offset requires exactly one ORDER BY column (42P20) of an integer
 // or decimal type (else 0A000 — float is divergence D3, timestamp/date are deferred follow-ons). A
-// negative offset is 22013; EXCLUDE was already rejected at parse. Mirrors Rust's resolve_frame.
+// negative offset is 22013. Mirrors Rust's resolve_frame.
 function resolveFrame(f: WindowFrame, order: OrderSlot[], orderTypes: Type[]): ResolvedFrame {
   const isOffset = (b: FrameBound): boolean => b.kind === "preceding" || b.kind === "following";
   const hasOffset = isOffset(f.start) || isOffset(f.end);
   switch (f.mode) {
     case "rows":
-      return { mode: "rows", start: resolveIntBound(f.start), end: resolveIntBound(f.end) };
+      return {
+        mode: "rows",
+        start: resolveIntBound(f.start),
+        end: resolveIntBound(f.end),
+        exclude: f.exclude,
+      };
     case "groups":
       if (order.length === 0) {
         throw engineError("windowing_error", "GROUPS mode requires an ORDER BY clause");
       }
-      return { mode: "groups", start: resolveIntBound(f.start), end: resolveIntBound(f.end) };
+      return {
+        mode: "groups",
+        start: resolveIntBound(f.start),
+        end: resolveIntBound(f.end),
+        exclude: f.exclude,
+      };
     default: // "range"
       if (hasOffset) {
         if (order.length !== 1) {
@@ -11496,11 +11509,17 @@ function resolveFrame(f: WindowFrame, order: OrderSlot[], orderTypes: Type[]): R
           mode: "range",
           start: resolveRangeBound(f.start, kt),
           end: resolveRangeBound(f.end, kt),
+          exclude: f.exclude,
         };
       }
       // RANGE with only UNBOUNDED / CURRENT ROW bounds — peer/edge based, any number of ORDER BY
       // keys (or none); no key arithmetic, so it reuses the plain bound resolution.
-      return { mode: "range", start: resolveIntBound(f.start), end: resolveIntBound(f.end) };
+      return {
+        mode: "range",
+        start: resolveIntBound(f.start),
+        end: resolveIntBound(f.end),
+        exclude: f.exclude,
+      };
   }
 }
 
@@ -19419,6 +19438,22 @@ class FrameCtx {
     }
   }
 
+  // isExcluded reports whether sorted position k is dropped from the current row pos's frame by
+  // EXCLUDE (window.md §6): currentRow drops the row itself, group its whole peer group, ties the
+  // peers but not the row, noOthers nothing. Exclusion removes only rows already in [lo, hi).
+  isExcluded(pos: number, k: number, exclude: FrameExclusion): boolean {
+    switch (exclude) {
+      case "currentRow":
+        return k === pos;
+      case "group":
+        return this.peerStart[pos]! <= k && k < this.peerEnd[pos]!;
+      case "ties":
+        return k !== pos && this.peerStart[pos]! <= k && k < this.peerEnd[pos]!;
+      default: // "noOthers"
+        return false;
+    }
+  }
+
   // ROWS: physical row offsets in the partition sequence; bounds clamp to [0, np].
   private rowsBounds(pos: number, f: ResolvedFrame): [number, number] {
     const np = this.np;
@@ -19816,12 +19851,15 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
             }
           } else {
             // EXPLICIT frame (window.md §6): fold each row's frame fresh — naive O(partition²),
-            // the metered windowFrameStep bounding it.
+            // the metered windowFrameStep bounding it. EXCLUDE rows are dropped before folding
+            // (so they are neither metered nor counted).
             const ctx = new FrameCtx(ordered, rows, spec.order);
+            const exclude = spec.frame?.exclude ?? "noOthers";
             for (let pos = 0; pos < np; pos++) {
               const [lo, hi] = ctx.bounds(pos, spec.frame);
               const acc = newAcc(spec.aggPlan!, spec.aggFloatWidth ?? "f64");
               for (let k = lo; k < hi; k++) {
+                if (ctx.isExcluded(pos, k, exclude)) continue;
                 meter.charge(COSTS.windowFrameStep);
                 const v = hasOperand
                   ? evalExpr(spec.args[0]!, rows[ordered[k]!]!, env, meter)
@@ -19863,18 +19901,39 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
             }
           }
           const ctx = new FrameCtx(ordered, rows, spec.order);
+          const exclude = spec.frame?.exclude ?? "noOthers";
           for (let pos = 0; pos < np; pos++) {
             meter.guard();
             meter.charge(COSTS.windowResult);
             const [lo, hi] = ctx.bounds(pos, spec.frame);
-            let out: Value;
+            // first/last/nth pick over the frame's NON-excluded rows (window.md §6); the noOthers
+            // fast path breaks on the first row, so it stays O(1).
+            let out: Value = nullValue();
             if (spec.plan === "firstValue") {
-              out = hi > lo ? vals[lo]! : nullValue();
+              for (let k = lo; k < hi; k++) {
+                if (!ctx.isExcluded(pos, k, exclude)) {
+                  out = vals[k]!;
+                  break;
+                }
+              }
             } else if (spec.plan === "lastValue") {
-              out = hi > lo ? vals[hi - 1]! : nullValue();
-            } else {
-              // nth_value: empty frame, < n rows, or NULL n → NULL.
-              out = nth !== null && lo + nth - 1 < hi ? vals[lo + nth - 1]! : nullValue();
+              for (let k = hi - 1; k >= lo; k--) {
+                if (!ctx.isExcluded(pos, k, exclude)) {
+                  out = vals[k]!;
+                  break;
+                }
+              }
+            } else if (nth !== null) {
+              // nth_value: the nth survivor; NULL if fewer than n survive (or NULL n).
+              let count = 0;
+              for (let k = lo; k < hi; k++) {
+                if (ctx.isExcluded(pos, k, exclude)) continue;
+                count++;
+                if (count === nth) {
+                  out = vals[k]!;
+                  break;
+                }
+              }
             }
             results[ordered[pos]!] = out;
           }
