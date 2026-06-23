@@ -29,7 +29,8 @@ export const DOCS_NAV: readonly DocSection[] = [
       { title: 'Tables & constraints', href: '/docs/sql/tables/' },
       { title: 'Temporary tables', href: '/docs/sql/temp-tables/' },
       { title: 'Indexes', href: '/docs/sql/indexes/' },
-      { title: 'Querying', href: '/docs/sql/select/' }
+      { title: 'Querying', href: '/docs/sql/select/' },
+      { title: 'Pattern matching', href: '/docs/sql/pattern-matching/' }
     ]
   },
   {
