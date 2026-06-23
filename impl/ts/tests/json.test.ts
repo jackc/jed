@@ -238,3 +238,31 @@ test("array_to_json multidim is 0A000", () => {
     "0A000",
   );
 });
+
+// JSON_SERIALIZE over a `jsonb` value renders its canonical text — a documented divergence from
+// PostgreSQL 18, which returns SQL NULL for a jsonb input (a PG quirk; only `json` input serializes).
+// The json-input behavior is oracle-clean in suites/json/json_ctor.test. Mirrors
+// impl/rust/tests/json.rs json_serialize_jsonb_diverges_from_pg and impl/go/json_test.go.
+test("JSON_SERIALIZE of jsonb diverges from pg", () => {
+  const db = dbWith([]);
+  // jed: the jsonb canonical (spaced, key-sorted) text; PG 18: NULL.
+  assert.deepEqual(query(db, `SELECT JSON_SERIALIZE('{"b":2,"a":1}'::jsonb)`), [
+    ['{"a": 1, "b": 2}'],
+  ]);
+});
+
+// JSON_SCALAR over a non-basic scalar (date / float / uuid / …) is a deferred 0A000 — only
+// integer/decimal/boolean/text coerce this slice. PostgreSQL renders any scalar's text as a JSON
+// string, so this is a documented divergence (the basic scalars are oracle-clean in the suite).
+// Mirrors impl/rust/tests/json.rs json_scalar_deferred_types_are_0a000 and impl/go/json_test.go.
+test("JSON_SCALAR of deferred types is 0A000", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => execute(db, "SELECT JSON_SCALAR('2020-01-01'::date)")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT JSON_SCALAR(1.5::f64)")),
+    "0A000",
+  );
+});

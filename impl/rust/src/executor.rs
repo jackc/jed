@@ -10129,7 +10129,9 @@ impl Database {
                 self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
                 self.fold_uncorrelated_in_rexpr(b, bound, ctes, cost)
             }
-            RExpr::IsNull { operand, .. } | RExpr::IsJson { operand, .. } => {
+            RExpr::IsNull { operand, .. }
+            | RExpr::IsJson { operand, .. }
+            | RExpr::JsonCtor { operand, .. } => {
                 self.fold_uncorrelated_in_rexpr(operand, bound, ctes, cost)
             }
             RExpr::Case { arms, els, .. } => {
@@ -11248,6 +11250,10 @@ enum ScalarFunc {
     ToJsonb,
     /// to_json(anyelement) → the JSON image as `json` (the `value_to_node` kernel, rendered compact).
     ToJson,
+    /// JSON_SCALAR(anyelement) → the value's JSON scalar as `json` (number/boolean/string). STRICT.
+    JsonScalar,
+    /// JSON_SERIALIZE(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
+    JsonSerialize,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -11620,6 +11626,13 @@ enum RExpr {
         operand: Box<RExpr>,
         negated: bool,
         kind: JsonPredicateKind,
+        unique_keys: bool,
+    },
+    /// `JSON(text [(WITH|WITHOUT) UNIQUE [KEYS]])` (json-sql-functions.md §5): validate a string as a
+    /// `json` value (verbatim). Malformed → 22P02; `WITH UNIQUE KEYS` on a duplicate key → 22030.
+    /// STRICT (a NULL operand → SQL NULL).
+    JsonCtor {
+        operand: Box<RExpr>,
         unique_keys: bool,
     },
     /// `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated = true` is the
@@ -12192,7 +12205,8 @@ fn count_self_refs_expr(e: &Expr, name: &str) -> usize {
         | Expr::Extract { source: inner, .. } => sub(inner),
         Expr::Unary { operand, .. }
         | Expr::IsNull { operand, .. }
-        | Expr::IsJson { operand, .. } => sub(operand),
+        | Expr::IsJson { operand, .. }
+        | Expr::JsonCtor { operand, .. } => sub(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -13256,7 +13270,9 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         RExpr::JsonContains { a, b } | RExpr::JsonConcat { a, b } => {
             rexpr_is_constant(a) && rexpr_is_constant(b)
         }
-        RExpr::IsNull { operand, .. } | RExpr::IsJson { operand, .. } => rexpr_is_constant(operand),
+        RExpr::IsNull { operand, .. }
+        | RExpr::IsJson { operand, .. }
+        | RExpr::JsonCtor { operand, .. } => rexpr_is_constant(operand),
         RExpr::Case { arms, els, .. } => {
             arms.iter()
                 .all(|(c, r)| rexpr_is_constant(c) && rexpr_is_constant(r))
@@ -14502,7 +14518,9 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => expr_has_aggregate(inner),
         Expr::Collate { inner, .. } => expr_has_aggregate(inner),
         Expr::Unary { operand, .. } => expr_has_aggregate(operand),
-        Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => expr_has_aggregate(operand),
+        Expr::IsNull { operand, .. }
+        | Expr::IsJson { operand, .. }
+        | Expr::JsonCtor { operand, .. } => expr_has_aggregate(operand),
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             expr_has_aggregate(lhs) || expr_has_aggregate(rhs)
         }
@@ -14574,7 +14592,9 @@ fn expr_has_window(e: &Expr) -> bool {
         Expr::Cast { inner, .. } | Expr::Extract { source: inner, .. } => expr_has_window(inner),
         Expr::Collate { inner, .. } => expr_has_window(inner),
         Expr::Unary { operand, .. } => expr_has_window(operand),
-        Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => expr_has_window(operand),
+        Expr::IsNull { operand, .. }
+        | Expr::IsJson { operand, .. }
+        | Expr::JsonCtor { operand, .. } => expr_has_window(operand),
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
             expr_has_window(lhs) || expr_has_window(rhs)
         }
@@ -14730,7 +14750,8 @@ fn desugar_named_windows(e: &mut Expr, windows: &[(String, WindowDef)]) -> Resul
         }
         Expr::Unary { operand, .. }
         | Expr::IsNull { operand, .. }
-        | Expr::IsJson { operand, .. } => {
+        | Expr::IsJson { operand, .. }
+        | Expr::JsonCtor { operand, .. } => {
             desugar_named_windows(operand, windows)?;
         }
         Expr::Binary { lhs, rhs, .. } | Expr::IsDistinctFrom { lhs, rhs, .. } => {
@@ -14822,7 +14843,8 @@ fn reject_check_structure(e: &Expr) -> Result<()> {
         Expr::Collate { inner, .. } => reject_check_structure(inner),
         Expr::Unary { operand, .. }
         | Expr::IsNull { operand, .. }
-        | Expr::IsJson { operand, .. } => reject_check_structure(operand),
+        | Expr::IsJson { operand, .. }
+        | Expr::JsonCtor { operand, .. } => reject_check_structure(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -14911,7 +14933,8 @@ fn reject_default_structure(e: &Expr) -> Result<()> {
         Expr::Collate { inner, .. } => reject_default_structure(inner),
         Expr::Unary { operand, .. }
         | Expr::IsNull { operand, .. }
-        | Expr::IsJson { operand, .. } => reject_default_structure(operand),
+        | Expr::IsJson { operand, .. }
+        | Expr::JsonCtor { operand, .. } => reject_default_structure(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -14987,7 +15010,8 @@ fn check_referenced_columns(e: &Expr, columns: &[Column]) -> Vec<usize> {
             | Expr::Extract { source: inner, .. } => walk(inner, columns, out),
             Expr::Unary { operand, .. }
             | Expr::IsNull { operand, .. }
-            | Expr::IsJson { operand, .. } => walk(operand, columns, out),
+            | Expr::IsJson { operand, .. }
+            | Expr::JsonCtor { operand, .. } => walk(operand, columns, out),
             Expr::Binary { lhs, rhs, .. }
             | Expr::IsDistinctFrom { lhs, rhs, .. }
             | Expr::Like { lhs, rhs, .. }
@@ -15215,9 +15239,9 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         RExpr::And(l, r) | RExpr::Or(l, r) => {
             rexpr_references_outer(l, depth) || rexpr_references_outer(r, depth)
         }
-        RExpr::IsNull { operand, .. } | RExpr::IsJson { operand, .. } => {
-            rexpr_references_outer(operand, depth)
-        }
+        RExpr::IsNull { operand, .. }
+        | RExpr::IsJson { operand, .. }
+        | RExpr::JsonCtor { operand, .. } => rexpr_references_outer(operand, depth),
         RExpr::Case { arms, els, .. } => {
             arms.iter()
                 .any(|(c, r)| rexpr_references_outer(c, depth) || rexpr_references_outer(r, depth))
@@ -15356,9 +15380,9 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
             collect_touched(l, depth, touched);
             collect_touched(r, depth, touched);
         }
-        RExpr::IsNull { operand, .. } | RExpr::IsJson { operand, .. } => {
-            collect_touched(operand, depth, touched)
-        }
+        RExpr::IsNull { operand, .. }
+        | RExpr::IsJson { operand, .. }
+        | RExpr::JsonCtor { operand, .. } => collect_touched(operand, depth, touched),
         RExpr::Case { arms, els, .. } => {
             for (c, r) in arms {
                 collect_touched(c, depth, touched);
@@ -15826,6 +15850,8 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "jsonb_pretty" => ScalarFunc::JsonbPretty,
         "to_jsonb" => ScalarFunc::ToJsonb,
         "to_json" => ScalarFunc::ToJson,
+        "json_scalar" => ScalarFunc::JsonScalar,
+        "json_serialize" => ScalarFunc::JsonSerialize,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -18399,9 +18425,9 @@ fn expr_calls_seq_mutator(e: &Expr) -> bool {
         | Expr::Collate { inner, .. }
         | Expr::Extract { source: inner, .. }
         | Expr::Unary { operand: inner, .. } => expr_calls_seq_mutator(inner),
-        Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => {
-            expr_calls_seq_mutator(operand)
-        }
+        Expr::IsNull { operand, .. }
+        | Expr::IsJson { operand, .. }
+        | Expr::JsonCtor { operand, .. } => expr_calls_seq_mutator(operand),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -18696,9 +18722,9 @@ fn collect_expr_privs(e: &Expr, req: &mut PrivReq, locals: &HashSet<String>) {
         | Expr::Unary { operand: inner, .. }
         | Expr::Collate { inner, .. }
         | Expr::Extract { source: inner, .. } => collect_expr_privs(inner, req, locals),
-        Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => {
-            collect_expr_privs(operand, req, locals)
-        }
+        Expr::IsNull { operand, .. }
+        | Expr::IsJson { operand, .. }
+        | Expr::JsonCtor { operand, .. } => collect_expr_privs(operand, req, locals),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
         | Expr::Like { lhs, rhs, .. }
@@ -18770,7 +18796,9 @@ fn expr_reads_columns(e: &Expr) -> bool {
         | Expr::Unary { operand: inner, .. }
         | Expr::Collate { inner, .. }
         | Expr::Extract { source: inner, .. } => expr_reads_columns(inner),
-        Expr::IsNull { operand, .. } | Expr::IsJson { operand, .. } => expr_reads_columns(operand),
+        Expr::IsNull { operand, .. }
+        | Expr::IsJson { operand, .. }
+        | Expr::JsonCtor { operand, .. } => expr_reads_columns(operand),
         Expr::FuncCall { args, .. } => args.iter().any(expr_reads_columns),
         Expr::Binary { lhs, rhs, .. }
         | Expr::IsDistinctFrom { lhs, rhs, .. }
@@ -19941,6 +19969,30 @@ fn resolve(
                     unique_keys: *unique_keys,
                 },
                 ResolvedType::Bool,
+            ))
+        }
+        Expr::JsonCtor {
+            operand,
+            unique_keys,
+        } => {
+            // JSON(text) parses a character string to a `json` value (verbatim). The operand must be
+            // text (a bare string literal stays text); a non-text operand → 42804.
+            let (rop, ty) = resolve(scope, operand, Some(ScalarType::Text), agg, params)?;
+            match ty {
+                ResolvedType::Text | ResolvedType::Null => {}
+                _ => {
+                    return Err(EngineError::new(
+                        SqlState::DatatypeMismatch,
+                        format!("cannot use type {} as JSON() input", ty.type_name()),
+                    ));
+                }
+            }
+            Ok((
+                RExpr::JsonCtor {
+                    operand: Box::new(rop),
+                    unique_keys: *unique_keys,
+                },
+                ResolvedType::Json,
             ))
         }
         Expr::IsDistinctFrom { lhs, rhs, negated } => {
@@ -25147,6 +25199,30 @@ impl RExpr {
                 };
                 Ok(Value::Bool(ok ^ *negated))
             }
+            RExpr::JsonCtor {
+                operand,
+                unique_keys,
+            } => {
+                m.charge(COSTS.operator_eval);
+                let v = operand.eval(row, env, m)?;
+                match v {
+                    Value::Null => Ok(Value::Null),
+                    Value::Text(s) => {
+                        // Validate the string is well-formed JSON (22P02 on malformed), preserving
+                        // duplicate keys so the optional UNIQUE KEYS check (22030) can see them.
+                        let node = json::parse_preserving(&s)?;
+                        if *unique_keys && json::has_duplicate_keys(&node) {
+                            return Err(EngineError::new(
+                                SqlState::DuplicateJsonObjectKeyValue,
+                                "duplicate JSON object key value",
+                            ));
+                        }
+                        // The result is the verbatim input text as a `json` value (PG).
+                        Ok(Value::Json(s))
+                    }
+                    _ => unreachable!("resolver restricts JSON() to a text operand"),
+                }
+            }
             RExpr::Distinct { lhs, rhs, negated } => {
                 m.charge(COSTS.operator_eval);
                 let lv = lhs.eval(row, env, m)?;
@@ -25802,6 +25878,29 @@ impl RExpr {
                         Ok(Value::Text(json::pretty(&node)))
                     }
                     ScalarFunc::ToJsonb => Ok(Value::Jsonb(value_to_node(&vals[0])?)),
+                    // JSON_SCALAR(v) → the value's JSON scalar as `json` (number/boolean/string). The
+                    // datetime/uuid/bytea/interval/float sources are a deferred 0A000 follow-on.
+                    ScalarFunc::JsonScalar => {
+                        let node = match &vals[0] {
+                            Value::Int(n) => JsonNode::Number(Decimal::from_i64(*n)),
+                            Value::Decimal(d) => JsonNode::Number(d.clone()),
+                            Value::Bool(b) => JsonNode::Bool(*b),
+                            Value::Text(s) => JsonNode::String(s.clone()),
+                            _ => {
+                                return Err(EngineError::new(
+                                    SqlState::FeatureNotSupported,
+                                    "JSON_SCALAR of this type is not supported yet",
+                                ));
+                            }
+                        };
+                        Ok(Value::Json(json::json_compact_out(&node)))
+                    }
+                    // JSON_SERIALIZE(v) → the value's text serialization: json verbatim, jsonb canonical.
+                    ScalarFunc::JsonSerialize => Ok(Value::Text(match &vals[0] {
+                        Value::Json(s) => s.clone(),
+                        Value::Jsonb(n) => json::jsonb_out(n),
+                        _ => unreachable!("resolver restricts JSON_SERIALIZE to json/jsonb"),
+                    })),
                     // to_json → the value's `json` image: a jsonb input renders canonical-spaced, a
                     // json input verbatim, everything else the compact to_jsonb render (PG's
                     // datum_to_json). This is the same per-type rule the json builders embed.
@@ -26593,7 +26692,9 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::JsonStripNulls
         | ScalarFunc::JsonbPretty
         | ScalarFunc::ToJsonb
-        | ScalarFunc::ToJson => {
+        | ScalarFunc::ToJson
+        | ScalarFunc::JsonScalar
+        | ScalarFunc::JsonSerialize => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json fns are handled before eval_float_func"
             )

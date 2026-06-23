@@ -116,6 +116,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // The IS JSON predicate (S1) — expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT)
   // UNIQUE [KEYS]], the SQL/JSON well-formedness test (json-sql-functions.md §5).
   "expr.is_json",
+  // The SQL/JSON constructors (S1) — JSON(text [(WITH|WITHOUT) UNIQUE [KEYS]]), JSON_SCALAR(v),
+  // JSON_SERIALIZE(json|jsonb) (json-sql-functions.md §5).
+  "func.json_ctor",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
   // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
   "func.range_accessors",

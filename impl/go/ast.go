@@ -748,6 +748,10 @@ const (
 	// character string / json / jsonb) well-formed JSON of the optional kind, with optionally unique
 	// object keys. A non-string/json operand → 42804; a NULL operand → NULL; never raises.
 	ExprIsJson
+	// ExprJsonCtor is `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
+	// (spec/design/json-sql-functions.md §5): parse a character string to a `json` value (verbatim).
+	// Malformed → 22P02; `WITH UNIQUE KEYS` on a duplicate object key → 22030. STRICT (NULL → NULL).
+	ExprJsonCtor
 	// ExprIsDistinct is `lhs IS [NOT] DISTINCT FROM rhs` (NULL-safe equality).
 	ExprIsDistinct
 	// ExprFuncCall is a function call — the shared aggregate/scalar call syntax
@@ -923,6 +927,7 @@ type Expr struct {
 	Binary      *BinaryExpr
 	IsNullOf    *IsNullExpr     // ExprIsNull
 	IsJsonOf    *IsJsonExpr     // ExprIsJson
+	JsonCtorOf  *JsonCtorExpr   // ExprJsonCtor
 	IsDistinct  *IsDistinctExpr // ExprIsDistinct
 	FuncCall    *FuncCallExpr   // ExprFuncCall
 	In          *InExpr         // ExprIn
@@ -1045,6 +1050,16 @@ type IsJsonExpr struct {
 	Operand    Expr
 	Negated    bool
 	Kind       JsonPredicateKind
+	UniqueKeys bool
+}
+
+// JsonCtorExpr is `JSON(Operand [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
+// (spec/design/json-sql-functions.md §5): validate a character string as JSON and return it verbatim
+// as a `json` value. UniqueKeys is true for `WITH UNIQUE [KEYS]` (the default `WITHOUT` is false). A
+// malformed string → 22P02; a duplicate object key under UniqueKeys → 22030; a non-text operand →
+// 42804; a NULL operand → SQL NULL.
+type JsonCtorExpr struct {
+	Operand    Expr
 	UniqueKeys bool
 }
 

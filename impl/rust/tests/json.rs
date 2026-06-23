@@ -269,6 +269,31 @@ fn json_builder_deferred_element_source_is_0a000() {
     );
 }
 
+/// `JSON_SERIALIZE` over a `jsonb` value renders its canonical text — a documented divergence from
+/// PostgreSQL 18, which returns SQL NULL for a jsonb input (a PG quirk; only `json` input serializes).
+/// The json-input behavior is oracle-clean in suites/json/json_ctor.test.
+#[test]
+fn json_serialize_jsonb_diverges_from_pg() {
+    let mut db = Database::new();
+    assert_eq!(
+        query(&mut db, "SELECT JSON_SERIALIZE('{\"b\":2,\"a\":1}'::jsonb)")[0][0],
+        "{\"a\": 1, \"b\": 2}" // jed: the jsonb canonical text; PG 18: NULL
+    );
+}
+
+/// `JSON_SCALAR` over a non-basic scalar (date / float / uuid / …) is a deferred `0A000` — only
+/// integer/decimal/boolean/text coerce this slice. PostgreSQL renders any scalar's text as a JSON
+/// string, so this is a documented divergence (the basic scalars are oracle-clean in the suite).
+#[test]
+fn json_scalar_deferred_types_are_0a000() {
+    let mut db = Database::new();
+    assert_eq!(
+        err(&mut db, "SELECT JSON_SCALAR('2020-01-01'::date)"),
+        "0A000"
+    );
+    assert_eq!(err(&mut db, "SELECT JSON_SCALAR(1.5::f64)"), "0A000");
+}
+
 /// `array_to_json` of a MULTIDIMENSIONAL array is a deferred `0A000` (the to_jsonb multidim
 /// deferral) — a documented divergence from PostgreSQL, which renders nested arrays. The 1-D case is
 /// oracle-clean in suites/json/json_builders.test.

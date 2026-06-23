@@ -353,3 +353,30 @@ func TestArrayToJsonMultidimIs0A000(t *testing.T) {
 		t.Errorf("array_to_json(multidim): got %s, want 0A000", got)
 	}
 }
+
+// TestJsonSerializeJsonbDivergesFromPG: JSON_SERIALIZE over a jsonb value renders its canonical text
+// — a documented divergence from PostgreSQL 18, which returns SQL NULL for a jsonb input (a PG quirk;
+// only json input serializes). The json-input behavior is oracle-clean in suites/json/json_ctor.test.
+// Mirrors impl/rust/tests/json.rs json_serialize_jsonb_diverges_from_pg.
+func TestJsonSerializeJsonbDivergesFromPG(t *testing.T) {
+	db := NewDatabase()
+	if got, want := queryRendered(t, db, `SELECT JSON_SERIALIZE('{"b":2,"a":1}'::jsonb)`)[0][0],
+		`{"a": 1, "b": 2}`; got != want { // jed: the jsonb canonical text; PG 18: NULL
+		t.Errorf("JSON_SERIALIZE(jsonb) = %q, want %q", got, want)
+	}
+}
+
+// TestJsonScalarDeferredTypesAre0A000: JSON_SCALAR over a non-basic scalar (date / float / uuid / …)
+// is a deferred 0A000 — only integer/decimal/boolean/text coerce this slice. PostgreSQL renders any
+// scalar's text as a JSON string, so this is a documented divergence (the basic scalars are
+// oracle-clean in suites/json/json_ctor.test). Mirrors impl/rust/tests/json.rs
+// json_scalar_deferred_types_are_0a000.
+func TestJsonScalarDeferredTypesAre0A000(t *testing.T) {
+	db := NewDatabase()
+	if got := errJSON(t, db, "SELECT JSON_SCALAR('2020-01-01'::date)"); got != "0A000" {
+		t.Errorf("JSON_SCALAR(date): got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT JSON_SCALAR(1.5::f64)"); got != "0A000" {
+		t.Errorf("JSON_SCALAR(f64): got %s, want 0A000", got)
+	}
+}

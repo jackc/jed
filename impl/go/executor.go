@@ -2604,6 +2604,8 @@ func exprCallsSeqMutator(e *Expr) bool {
 		return exprCallsSeqMutator(&e.IsNullOf.Operand)
 	case ExprIsJson:
 		return exprCallsSeqMutator(&e.IsJsonOf.Operand)
+	case ExprJsonCtor:
+		return exprCallsSeqMutator(&e.JsonCtorOf.Operand)
 	case ExprBinary:
 		return exprCallsSeqMutator(&e.Binary.Lhs) || exprCallsSeqMutator(&e.Binary.Rhs)
 	case ExprIsDistinct:
@@ -3039,6 +3041,8 @@ func collectExprPrivs(e *Expr, req *privReq, locals map[string]bool) {
 		collectExprPrivs(&e.IsNullOf.Operand, req, locals)
 	case ExprIsJson:
 		collectExprPrivs(&e.IsJsonOf.Operand, req, locals)
+	case ExprJsonCtor:
+		collectExprPrivs(&e.JsonCtorOf.Operand, req, locals)
 	case ExprBinary:
 		collectExprPrivs(&e.Binary.Lhs, req, locals)
 		collectExprPrivs(&e.Binary.Rhs, req, locals)
@@ -3134,6 +3138,8 @@ func exprReadsColumns(e *Expr) bool {
 		return exprReadsColumns(&e.IsNullOf.Operand)
 	case ExprIsJson:
 		return exprReadsColumns(&e.IsJsonOf.Operand)
+	case ExprJsonCtor:
+		return exprReadsColumns(&e.JsonCtorOf.Operand)
 	case ExprFuncCall:
 		for _, a := range e.FuncCall.Args {
 			if exprReadsColumns(a) {
@@ -8196,6 +8202,8 @@ func countSelfRefsExpr(e Expr, name string) int {
 		return countSelfRefsExpr(e.IsNullOf.Operand, name)
 	case ExprIsJson:
 		return countSelfRefsExpr(e.IsJsonOf.Operand, name)
+	case ExprJsonCtor:
+		return countSelfRefsExpr(e.JsonCtorOf.Operand, name)
 	case ExprBinary:
 		return countSelfRefsExpr(e.Binary.Lhs, name) + countSelfRefsExpr(e.Binary.Rhs, name)
 	case ExprIsDistinct:
@@ -13397,6 +13405,10 @@ const (
 	// definite boolean (NOT-negated when `negated`). `jpKind` selects the kind word; `jpUnique`
 	// selects WITH UNIQUE KEYS.
 	reIsJson
+	// reJsonCtor is `JSON(text [(WITH|WITHOUT) UNIQUE [KEYS]])` (json-sql-functions.md §5): validate a
+	// string as a `json` value (verbatim). The operand reuses `operand`; `jpUnique` carries WITH UNIQUE
+	// KEYS. A NULL operand → NULL; a malformed string → 22P02; a duplicate key under jpUnique → 22030.
+	reJsonCtor
 	reDistinct
 	reLike
 	// reRegex is `lhs ~ rhs` / `~*` / `!~` / `!~*` — a regular-expression match (regex.md). Matched
@@ -13671,6 +13683,11 @@ const (
 	// to_json(anyelement) → the JSON image as `json` (the valueToNode kernel rendered per elemJsonText:
 	// a jsonb input canonical-spaced, a json input verbatim, everything else compact). STRICT.
 	sfToJson
+	// json_scalar(anyelement) → the value's JSON scalar as `json` (number/boolean/string). STRICT.
+	// Other source types (date/timestamp/uuid/bytea/interval/float) are a deferred 0A000.
+	sfJsonScalar
+	// json_serialize(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
+	sfJsonSerialize
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -14786,6 +14803,8 @@ func exprHasAggregate(e Expr) bool {
 		return exprHasAggregate(e.IsNullOf.Operand)
 	case ExprIsJson:
 		return exprHasAggregate(e.IsJsonOf.Operand)
+	case ExprJsonCtor:
+		return exprHasAggregate(e.JsonCtorOf.Operand)
 	case ExprBinary:
 		return exprHasAggregate(e.Binary.Lhs) || exprHasAggregate(e.Binary.Rhs)
 	case ExprIsDistinct:
@@ -14891,6 +14910,8 @@ func exprHasWindow(e Expr) bool {
 		return exprHasWindow(e.IsNullOf.Operand)
 	case ExprIsJson:
 		return exprHasWindow(e.IsJsonOf.Operand)
+	case ExprJsonCtor:
+		return exprHasWindow(e.JsonCtorOf.Operand)
 	case ExprBinary:
 		return exprHasWindow(e.Binary.Lhs) || exprHasWindow(e.Binary.Rhs)
 	case ExprIsDistinct:
@@ -15135,6 +15156,16 @@ func desugarNamedWindows(e Expr, windows []NamedWindow) (Expr, error) {
 		ne := e
 		ne.IsJsonOf = &ni
 		return ne, nil
+	case ExprJsonCtor:
+		op, err := desugarNamedWindows(e.JsonCtorOf.Operand, windows)
+		if err != nil {
+			return Expr{}, err
+		}
+		ni := *e.JsonCtorOf
+		ni.Operand = op
+		ne := e
+		ne.JsonCtorOf = &ni
+		return ne, nil
 	case ExprBinary:
 		lhs, err := desugarNamedWindows(e.Binary.Lhs, windows)
 		if err != nil {
@@ -15342,6 +15373,8 @@ func rejectCheckStructure(e Expr) error {
 		return rejectCheckStructure(e.IsNullOf.Operand)
 	case ExprIsJson:
 		return rejectCheckStructure(e.IsJsonOf.Operand)
+	case ExprJsonCtor:
+		return rejectCheckStructure(e.JsonCtorOf.Operand)
 	case ExprBinary:
 		if err := rejectCheckStructure(e.Binary.Lhs); err != nil {
 			return err
@@ -15462,6 +15495,8 @@ func rejectDefaultStructure(e Expr) error {
 		return rejectDefaultStructure(e.IsNullOf.Operand)
 	case ExprIsJson:
 		return rejectDefaultStructure(e.IsJsonOf.Operand)
+	case ExprJsonCtor:
+		return rejectDefaultStructure(e.JsonCtorOf.Operand)
 	case ExprBinary:
 		if err := rejectDefaultStructure(e.Binary.Lhs); err != nil {
 			return err
@@ -15578,6 +15613,8 @@ func checkReferencedColumns(e Expr, columns []Column) []int {
 			walk(e.IsNullOf.Operand)
 		case ExprIsJson:
 			walk(e.IsJsonOf.Operand)
+		case ExprJsonCtor:
+			walk(e.JsonCtorOf.Operand)
 		case ExprBinary:
 			walk(e.Binary.Lhs)
 			walk(e.Binary.Rhs)
@@ -16461,6 +16498,10 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfToJsonb
 	case "to_json":
 		return sfToJson
+	case "json_scalar":
+		return sfJsonScalar
+	case "json_serialize":
+		return sfJsonSerialize
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -19957,6 +19998,25 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 				jpKind: e.IsJsonOf.Kind, jpUnique: e.IsJsonOf.UniqueKeys,
 			},
 			resolvedType{kind: rtBool}, nil
+	case ExprJsonCtor:
+		// JSON(text) parses a character string to a `json` value (verbatim). The operand must be text
+		// (a bare string literal stays text); a non-text operand → 42804. The result is `json`.
+		textHint := Text
+		rop, ty, err := resolve(s, e.JsonCtorOf.Operand, &textHint, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		switch ty.kind {
+		case rtText, rtNull:
+			// ok
+		default:
+			return nil, resolvedType{}, NewError(DatatypeMismatch,
+				fmt.Sprintf("cannot use type %s as JSON() input", rtName(ty)))
+		}
+		return &rExpr{
+				kind: reJsonCtor, operand: rop, jpUnique: e.JsonCtorOf.UniqueKeys,
+			},
+			resolvedType{kind: rtJson}, nil
 	case ExprIsDistinct:
 		// NULL-safe equality: the SAME operand contract as `=` — resolve the pair (a
 		// literal adapts to its sibling; a text literal stays text), then require the
@@ -22816,6 +22876,31 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 		}
 		return BoolValue(ok != e.negated), nil
+	case reJsonCtor:
+		// JSON(text) → the verbatim input text as a `json` value (json-sql-functions.md §5). STRICT.
+		m.Charge(Costs.OperatorEval)
+		v, err := e.operand.eval(row, env, m)
+		if err != nil {
+			return Value{}, err
+		}
+		switch v.Kind {
+		case ValNull:
+			return NullValue(), nil // a NULL operand → SQL NULL
+		case ValText:
+			// Validate the string is well-formed JSON (22P02 on malformed), preserving duplicate keys
+			// so the optional UNIQUE KEYS check (22030) can see them.
+			node, perr := parsePreservingJSON(v.Str)
+			if perr != nil {
+				return Value{}, perr
+			}
+			if e.jpUnique && hasDuplicateKeys(&node) {
+				return Value{}, NewError(DuplicateJsonObjectKeyValue, "duplicate JSON object key value")
+			}
+			// The result is the verbatim input text as a `json` value (PG).
+			return JsonValue(v.Str), nil
+		default:
+			panic("BUG: resolver restricts JSON() to a text operand")
+		}
 	case reLike:
 		m.Charge(Costs.OperatorEval)
 		subject, err := e.lhs.eval(row, env, m)
@@ -23399,6 +23484,37 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return JsonValue(s), nil
+		case sfJsonScalar:
+			// JSON_SCALAR(v) → the value's JSON scalar as `json`, rendered compact (json-sql-functions.md
+			// §5): an integer/decimal → a JSON number, a boolean → a JSON boolean, text → a JSON string.
+			// The datetime/uuid/bytea/interval/float sources are a deferred 0A000 follow-on. STRICT: the
+			// NULL-input case is handled by the blanket propagation above.
+			var node JsonNode
+			switch vals[0].Kind {
+			case ValInt:
+				node = JsonNode{Kind: JNumber, Num: DecimalFromInt64(vals[0].Int)}
+			case ValDecimal:
+				node = JsonNode{Kind: JNumber, Num: *vals[0].Dec}
+			case ValBool:
+				node = JsonNode{Kind: JBool, B: vals[0].Bool}
+			case ValText:
+				node = JsonNode{Kind: JString, S: vals[0].Str}
+			default:
+				return Value{}, NewError(FeatureNotSupported, "JSON_SCALAR of this type is not supported yet")
+			}
+			return JsonValue(jsonCompactOut(&node)), nil
+		case sfJsonSerialize:
+			// JSON_SERIALIZE(v) → the value's text serialization (json-sql-functions.md §5): a json input
+			// is its verbatim text, a jsonb input its canonical render (jsonbOut). STRICT: the NULL-input
+			// case is handled by the blanket propagation above.
+			switch vals[0].Kind {
+			case ValJson:
+				return TextValue(vals[0].Str), nil
+			case ValJsonb:
+				return TextValue(jsonbOut(vals[0].Json)), nil
+			default:
+				panic("BUG: resolver restricts JSON_SERIALIZE to json/jsonb")
+			}
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).

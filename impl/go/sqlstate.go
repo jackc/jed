@@ -49,6 +49,8 @@ const (
 	InvalidRegularExpression
 	// ArraySubscriptError is 2202E — {detail}.
 	ArraySubscriptError
+	// DuplicateJsonObjectKeyValue is 22030 — duplicate JSON object key value.
+	DuplicateJsonObjectKeyValue
 	// InvalidTextRepresentation is 22P02 — invalid input syntax for type {type}: {detail}.
 	InvalidTextRepresentation
 	// NotNullViolation is 23502 — null value in column {name} violates not-null constraint.
@@ -180,6 +182,8 @@ func (s SqlState) Code() string {
 		return "2201B"
 	case ArraySubscriptError:
 		return "2202E"
+	case DuplicateJsonObjectKeyValue:
+		return "22030"
 	case InvalidTextRepresentation:
 		return "22P02"
 	case NotNullViolation:
@@ -305,6 +309,7 @@ var Errors = []ErrorDesc{
 	{Code: "22025", Name: "invalid_escape_sequence", Class: "data exception"},
 	{Code: "2201B", Name: "invalid_regular_expression", Class: "data exception"},
 	{Code: "2202E", Name: "array_subscript_error", Class: "data exception"},
+	{Code: "22030", Name: "duplicate_json_object_key_value", Class: "data exception"},
 	{Code: "22P02", Name: "invalid_text_representation", Class: "data exception"},
 	{Code: "23502", Name: "not_null_violation", Class: "integrity constraint violation"},
 	{Code: "23505", Name: "unique_violation", Class: "integrity constraint violation"},

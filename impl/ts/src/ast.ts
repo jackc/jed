@@ -134,6 +134,10 @@ export type Expr =
       jsonKind: JsonPredicateKind;
       uniqueKeys: boolean;
     }
+  // `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON `JSON()` constructor
+  // (spec/design/json-sql-functions.md §5): parse a character string to a `json` value (verbatim).
+  // Malformed → 22P02; `WITH UNIQUE KEYS` on a duplicate object key → 22030. STRICT.
+  | { kind: "jsonCtor"; operand: Expr; uniqueKeys: boolean }
   // `lhs IS [NOT] DISTINCT FROM rhs` — NULL-safe equality. `negated` carries the NOT
   // keyword: true is `IS NOT DISTINCT FROM` (NULL-safe `=`), false is `IS DISTINCT FROM`
   // (its negation). Always boolean-valued, never unknown (spec/design/functions.md §3).

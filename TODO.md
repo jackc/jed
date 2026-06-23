@@ -359,14 +359,20 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `like_regex`→Pike-VM (`i`/`q` flags; `s`/`m`/`x`→`0A000`) + the `2203x` error class. → jsonpath.md
   - [ ] **P2 / P3** — path query fns (`jsonb_path_exists`/`_match`/`_query`(SRF)/`_query_array`/`_query_first`)
         + `@?`/`@@` + `vars`/`silent`; then the `_tz` variants. → jsonpath.md §5
-  - [~] **S1 / S2** — `IS JSON` ✅ + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` (+ dup-key kernel); then
-        `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` (constant ON ERROR/EMPTY). → json-sql-functions.md §5
+  - [~] **S1 ✅ / S2** — `IS JSON` ✅ + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` ✅; then S2
+        `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` (constant ON ERROR/EMPTY, needs P1). → json-sql-functions.md §5
     - [x] **S1a — the `IS JSON` predicate** — ✅ `expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT]
           [(WITH|WITHOUT) UNIQUE [KEYS]]`: well-formedness + kind + recursive unique-keys over a
           string/json/jsonb operand; malformed → false; NULL → NULL; non-string/json operand → `42804`;
           never raises. Extends the IS-predicate dispatch; `Expr::IsJson` + `JsonPredicateKind` +
-          `json::has_duplicate_keys`. All 3 cores, cap `expr.is_json`, oracle-clean. _S1b follow-on:_
-          `JSON()` / `JSON_SCALAR` / `JSON_SERIALIZE` constructors (grammar primaries + RETURNING).
+          `json::has_duplicate_keys`. All 3 cores, cap `expr.is_json`, oracle-clean.
+    - [x] **S1b — the JSON()/JSON_SCALAR/JSON_SERIALIZE constructors** — ✅ `JSON(text [(WITH|WITHOUT)
+          UNIQUE [KEYS]])` → a verbatim json value (malformed `22P02`, dup-under-UNIQUE `22030` [NEW error
+          code], non-text `42804`), a grammar primary (`Expr::JsonCtor`); `JSON_SCALAR(anyelement)` →
+          json scalar (int/decimal/bool/text; others `0A000`) and `JSON_SERIALIZE(json|jsonb)` → text,
+          both plain catalog ScalarFuncs. STRICT. Divergence: PG 18 returns NULL for JSON_SERIALIZE of a
+          jsonb (a PG quirk; jed renders canonical text — per-core test). All 3 cores, cap
+          `func.json_ctor`, oracle-clean. PG 18 has no RETURNING clause on these.
   - [~] **B1–B4** — scalar processing + builders / single-column SRFs / two-column SRFs (`json[b]_each`,
         needs C0) / aggregates (`json[b]_agg`, `object_agg` + strict/unique). → json-sql-functions.md §2–§4
     - [x] **B1 (processing subset)** — ✅ `json[b]_typeof` / `json[b]_array_length` (22023 non-array) /

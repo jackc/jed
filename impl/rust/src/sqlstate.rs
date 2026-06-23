@@ -46,6 +46,8 @@ pub enum SqlState {
     InvalidRegularExpression,
     /// 2202E — {detail}
     ArraySubscriptError,
+    /// 22030 — duplicate JSON object key value
+    DuplicateJsonObjectKeyValue,
     /// 22P02 — invalid input syntax for type {type}: {detail}
     InvalidTextRepresentation,
     /// 23502 — null value in column {name} violates not-null constraint
@@ -161,6 +163,7 @@ impl SqlState {
             SqlState::InvalidEscapeSequence => "22025",
             SqlState::InvalidRegularExpression => "2201B",
             SqlState::ArraySubscriptError => "2202E",
+            SqlState::DuplicateJsonObjectKeyValue => "22030",
             SqlState::InvalidTextRepresentation => "22P02",
             SqlState::NotNullViolation => "23502",
             SqlState::UniqueViolation => "23505",
@@ -240,6 +243,7 @@ pub const ERRORS: &[ErrorDesc] = &[
     ErrorDesc { code: "22025", name: "invalid_escape_sequence", class: "data exception" },
     ErrorDesc { code: "2201B", name: "invalid_regular_expression", class: "data exception" },
     ErrorDesc { code: "2202E", name: "array_subscript_error", class: "data exception" },
+    ErrorDesc { code: "22030", name: "duplicate_json_object_key_value", class: "data exception" },
     ErrorDesc { code: "22P02", name: "invalid_text_representation", class: "data exception" },
     ErrorDesc { code: "23502", name: "not_null_violation", class: "integrity constraint violation" },
     ErrorDesc { code: "23505", name: "unique_violation", class: "integrity constraint violation" },

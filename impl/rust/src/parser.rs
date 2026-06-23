@@ -3213,6 +3213,34 @@ impl Parser {
             }
             unreachable!("peeked a string literal after the type name");
         }
+        // `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
+        // (json-sql-functions.md §5). Distinguished from the `json '...'` typed literal (handled
+        // above, a string follows) and a generic call by being the JSON keyword followed by `(`.
+        if self.peek_keyword().as_deref() == Some("json")
+            && matches!(self.peek_at(1), Token::LParen)
+        {
+            self.advance(); // JSON
+            self.advance(); // (
+            let operand = self.parse_expr()?;
+            let unique_keys = match self.peek_keyword().as_deref() {
+                Some(w @ ("with" | "without"))
+                    if self.peek_keyword_at(1).as_deref() == Some("unique") =>
+                {
+                    self.advance(); // WITH / WITHOUT
+                    self.advance(); // UNIQUE
+                    if self.peek_keyword().as_deref() == Some("keys") {
+                        self.advance();
+                    }
+                    w == "with"
+                }
+                _ => false,
+            };
+            self.expect(&Token::RParen)?;
+            return Ok(Expr::JsonCtor {
+                operand: Box::new(operand),
+                unique_keys,
+            });
+        }
         if self.peek_keyword().as_deref() == Some("case") {
             self.advance();
             // Simple form has an operand between CASE and the first WHEN; the searched form

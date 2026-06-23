@@ -537,6 +537,9 @@ var SupportedCapabilities = []string{
 	// IS JSON predicate (S1) — expr IS [NOT] JSON [VALUE|SCALAR|ARRAY|OBJECT] [(WITH|WITHOUT)
 	// UNIQUE [KEYS]] well-formedness test over a string/json/jsonb operand (json-sql-functions.md §5).
 	"expr.is_json",
+	// SQL/JSON constructors (S1) — JSON(text) / JSON_SCALAR(anyelement) / JSON_SERIALIZE(json|jsonb)
+	// (json-sql-functions.md §5).
+	"func.json_ctor",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

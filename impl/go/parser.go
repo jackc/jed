@@ -3785,6 +3785,30 @@ func (p *Parser) parsePrimary() (Expr, error) {
 		t := p.advance()
 		return Expr{Kind: ExprTypedLiteral, TypeLitName: name, TypeLitText: t.Word}, nil
 	}
+	// `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
+	// (json-sql-functions.md §5). Distinguished from the `json '...'` typed literal (handled above, a
+	// string follows) and a generic call by being the JSON keyword immediately followed by `(`.
+	if p.peekKeyword() == "json" && p.peekKindAt(1) == TokLParen {
+		p.advance() // JSON
+		p.advance() // (
+		operand, err := p.parseExpr()
+		if err != nil {
+			return Expr{}, err
+		}
+		uniqueKeys := false
+		if kw := p.peekKeyword(); (kw == "with" || kw == "without") && p.peekKeywordAt(1) == "unique" {
+			p.advance() // WITH / WITHOUT
+			p.advance() // UNIQUE
+			if p.peekKeyword() == "keys" {
+				p.advance() // KEYS (optional)
+			}
+			uniqueKeys = kw == "with"
+		}
+		if err := p.expect(TokRParen); err != nil {
+			return Expr{}, err
+		}
+		return Expr{Kind: ExprJsonCtor, JsonCtorOf: &JsonCtorExpr{Operand: operand, UniqueKeys: uniqueKeys}}, nil
+	}
 	if p.peekKeyword() == "case" {
 		p.advance()
 		// Simple form has an operand between CASE and the first WHEN; the searched form starts

@@ -8430,6 +8430,7 @@ export class Database {
       case "not":
       case "isNull":
       case "isJson":
+      case "jsonCtor":
         e.operand = this.foldUncorrelatedInRExpr(e.operand, bound, ctes, cost);
         return e;
       case "arith":
@@ -8849,6 +8850,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "not":
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       return rexprIsConstant(e.operand);
     case "arith":
     case "compare":
@@ -9832,6 +9834,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "not":
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       return rexprReferencesOuter(e.operand, depth);
     case "arith":
     case "compare":
@@ -9944,6 +9947,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "not":
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       collectTouched(e.operand, depth, touched);
       return;
     case "arith":
@@ -10586,6 +10590,10 @@ type RExpr =
       jsonKind: JsonPredicateKind;
       uniqueKeys: boolean;
     }
+  // `JSON(text [(WITH|WITHOUT) UNIQUE [KEYS]])` (json-sql-functions.md §5): validate a string as a
+  // `json` value (verbatim). Malformed → 22P02; `WITH UNIQUE KEYS` on a duplicate key → 22030.
+  // STRICT (a NULL operand → SQL NULL).
+  | { kind: "jsonCtor"; operand: RExpr; uniqueKeys: boolean }
   | { kind: "distinct"; lhs: RExpr; rhs: RExpr; negated: boolean }
   | { kind: "like"; lhs: RExpr; rhs: RExpr; negated: boolean; insensitive: boolean }
   // `lhs ~ rhs` / `~*` / `!~` / `!~*` — regex match (regex.md), matched by the hand-written Pike VM
@@ -10836,7 +10844,11 @@ type ScalarFuncName =
   | "to_jsonb"
   // to_json(anyelement) → the value's JSON image as `json` (the same kernel, per-type rendered:
   // a jsonb input spaced-canonical, a json input verbatim, else compact). STRICT.
-  | "to_json";
+  | "to_json"
+  // JSON_SCALAR(anyelement) → the value's JSON scalar as `json` (number/boolean/string). STRICT.
+  | "json_scalar"
+  // JSON_SERIALIZE(json|jsonb) → the value's text serialization (json verbatim, jsonb canonical).
+  | "json_serialize";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -11692,6 +11704,7 @@ function exprHasAggregate(e: Expr): boolean {
       return exprHasAggregate(e.operand);
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       return exprHasAggregate(e.operand);
     case "binary":
     case "isDistinct":
@@ -11751,6 +11764,7 @@ function exprHasWindow(e: Expr): boolean {
       return exprHasWindow(e.operand);
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       return exprHasWindow(e.operand);
     case "binary":
     case "isDistinct":
@@ -11888,6 +11902,7 @@ function desugarNamedWindows(e: Expr, windows: [string, WindowDef][]): void {
     case "unary":
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       desugarNamedWindows(e.operand, windows);
       return;
     case "binary":
@@ -11994,6 +12009,7 @@ function rejectCheckStructure(e: Expr): void {
     case "unary":
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       return rejectCheckStructure(e.operand);
     case "binary":
     case "isDistinct":
@@ -12077,6 +12093,7 @@ function rejectDefaultStructure(e: Expr): void {
     case "unary":
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       return rejectDefaultStructure(e.operand);
     case "binary":
     case "isDistinct":
@@ -12148,6 +12165,7 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
       case "unary":
       case "isNull":
       case "isJson":
+      case "jsonCtor":
         return walk(e.operand);
       case "binary":
       case "isDistinct":
@@ -14499,6 +14517,7 @@ function countSelfRefsExpr(e: Expr, name: string): number {
     case "unary":
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       return countSelfRefsExpr(e.operand, name);
     case "binary":
     case "isDistinct":
@@ -15149,6 +15168,7 @@ function exprCallsSeqMutator(e: Expr): boolean {
     case "unary":
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       return exprCallsSeqMutator(e.operand);
     case "binary":
     case "isDistinct":
@@ -15401,6 +15421,7 @@ function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
     case "unary":
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       collectExprPrivs(e.operand, req, locals);
       break;
     case "binary":
@@ -15485,6 +15506,7 @@ function exprReadsColumns(e: Expr): boolean {
     case "unary":
     case "isNull":
     case "isJson":
+    case "jsonCtor":
       return exprReadsColumns(e.operand);
     case "funcCall":
       return e.args.some(exprReadsColumns);
@@ -16579,6 +16601,25 @@ function resolve(
           uniqueKeys: e.uniqueKeys,
         },
         type: { kind: "bool" },
+      };
+    }
+    case "jsonCtor": {
+      // JSON(text) parses a character string to a `json` value (verbatim). The operand must be text
+      // (a bare string literal stays text under the Text context hint); a non-text operand → 42804.
+      const { node, type } = resolve(scope, e.operand, "text", ag, params);
+      switch (type.kind) {
+        case "text":
+        case "null":
+          break;
+        default:
+          throw engineError(
+            "datatype_mismatch",
+            "cannot use type " + rtName(type) + " as JSON() input",
+          );
+      }
+      return {
+        node: { kind: "jsonCtor", operand: node, uniqueKeys: e.uniqueKeys },
+        type: { kind: "json" },
       };
     }
     case "isDistinct": {
@@ -20577,6 +20618,22 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       return { kind: "bool", value: ok !== e.negated };
     }
+    case "jsonCtor": {
+      m.charge(COSTS.operatorEval);
+      const v = evalExpr(e.operand, row, env, m);
+      if (v.kind === "null") return nullValue(); // STRICT
+      if (v.kind !== "text") {
+        throw new Error("BUG: resolver restricts JSON() to a text operand");
+      }
+      // Validate the string is well-formed JSON (22P02 on malformed — propagated), preserving
+      // duplicate keys so the optional UNIQUE KEYS check (22030) can see them.
+      const node = parsePreservingJson(v.text);
+      if (e.uniqueKeys && jsonHasDuplicateKeys(node)) {
+        throw engineError("duplicate_json_object_key_value", "duplicate JSON object key value");
+      }
+      // The result is the verbatim input text as a `json` value (PG).
+      return jsonValue(v.text);
+    }
     case "distinct": {
       m.charge(COSTS.operatorEval);
       const dl = evalExpr(e.lhs, row, env, m);
@@ -20953,6 +21010,42 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
         // json input verbatim, everything else the compact to_jsonb render (PG's datum_to_json) —
         // the same per-type rule the json builders embed. STRICT (NULL handled above).
         return jsonValue(elemJsonText(vals[0]!));
+      }
+      if (e.func === "json_scalar") {
+        // JSON_SCALAR(v) → the value's JSON scalar as `json` (number/boolean/string), rendered
+        // compact (json-sql-functions.md §5). STRICT (NULL handled above). The datetime/uuid/bytea/
+        // interval/float sources are a deferred 0A000 follow-on.
+        const v0 = vals[0]!;
+        let node: JsonNode;
+        switch (v0.kind) {
+          case "int":
+            // JSON_SCALAR of an integer wraps the bigint via the Decimal-from-i64 path (to_jsonb's Int).
+            node = { kind: "number", dec: Decimal.fromBigInt(v0.int) };
+            break;
+          case "decimal":
+            node = { kind: "number", dec: v0.dec };
+            break;
+          case "bool":
+            node = { kind: "bool", value: v0.value };
+            break;
+          case "text":
+            node = { kind: "string", value: v0.text };
+            break;
+          default:
+            throw engineError(
+              "feature_not_supported",
+              "JSON_SCALAR of this type is not supported yet",
+            );
+        }
+        return jsonValue(jsonCompactOut(node));
+      }
+      if (e.func === "json_serialize") {
+        // JSON_SERIALIZE(v) → the value's text serialization: a json value verbatim, a jsonb value its
+        // canonical (jsonbOut) render (json-sql-functions.md §5). STRICT (NULL handled above).
+        const v0 = vals[0]!;
+        if (v0.kind === "json") return textValue(v0.text);
+        if (v0.kind === "jsonb") return textValue(jsonbOut(v0.node));
+        throw new Error("BUG: resolver restricts JSON_SERIALIZE to json/jsonb");
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

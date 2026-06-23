@@ -621,6 +621,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_object",
     // the IS JSON predicate (S1) — well-formedness + kind + unique-keys (json-sql-functions.md §5).
     "expr.is_json",
+    // the SQL/JSON constructors (S1) — JSON() / JSON_SCALAR / JSON_SERIALIZE (json-sql-functions.md §5).
+    "func.json_ctor",
     // json/jsonb aggregate builders (B4) — json[b]_agg / json[b]_agg_strict (json-sql-functions.md §4).
     "func.json_agg",
 ];

@@ -1,0 +1,74 @@
+# The SQL/JSON constructor functions (S1, spec/design/json-sql-functions.md §5): JSON(text [WITH
+# UNIQUE KEYS]) → a json value (verbatim, validated); JSON_SCALAR(anyelement) → the value's JSON
+# scalar; JSON_SERIALIZE(json|jsonb) → its text serialization. All STRICT. Output matches the
+# postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, types.json, func.json_ctor
+
+# JSON(text) → a json value, VERBATIM (duplicate keys kept without UNIQUE).
+query TT nosort
+SELECT JSON('{"a": 1}'), JSON('{"a":1,"a":2}')
+----
+{"a": 1}
+{"a":1,"a":2}
+
+# A NULL operand → SQL NULL (STRICT).
+query T nosort
+SELECT JSON(NULL::text)
+----
+NULL
+
+# A malformed string → 22P02; a duplicate key under WITH UNIQUE KEYS → 22030.
+statement error 22P02
+SELECT JSON('not json')
+
+statement error 22030
+SELECT JSON('{"a":1,"a":2}' WITH UNIQUE KEYS)
+
+# WITHOUT UNIQUE KEYS (the default) keeps duplicates.
+query T nosort
+SELECT JSON('{"a":1,"a":2}' WITHOUT UNIQUE KEYS)
+----
+{"a":1,"a":2}
+
+# JSON_SCALAR: a number stays a number, text → a string, a boolean → a boolean.
+query TTTT nosort
+SELECT JSON_SCALAR(5), JSON_SCALAR('hi'), JSON_SCALAR(true), JSON_SCALAR(1.50::numeric)
+----
+5
+"hi"
+true
+1.50
+
+query T nosort
+SELECT JSON_SCALAR(NULL::i32)
+----
+NULL
+
+# JSON_SERIALIZE over a json value renders it VERBATIM. (Over a jsonb value PG 18 returns NULL — a PG
+# quirk — so jed's sensible canonical-text result is a documented divergence, tested per-core.)
+query TT nosort
+SELECT JSON_SERIALIZE(JSON('{ "a" :1}')), JSON_SERIALIZE('[1, 2,3]'::json)
+----
+{ "a" :1}
+[1, 2,3]
+
+# The constructors compose with IS JSON.
+query B nosort
+SELECT JSON_SCALAR(5) IS JSON SCALAR
+----
+true
+
+# Over a stored text column: validate + serialize per row.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, doc text)
+
+statement ok
+INSERT INTO t VALUES (1, '{"k": 1}'), (2, '[1, 2]')
+
+query IT nosort
+SELECT id, JSON_SERIALIZE(JSON(doc)) FROM t ORDER BY id
+----
+1
+{"k": 1}
+2
+[1, 2]

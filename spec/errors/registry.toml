@@ -139,6 +139,12 @@ class = "data exception"
 template = "{detail}"
 
 [[error]]
+code = "22030"
+name = "duplicate_json_object_key_value"
+class = "data exception"
+template = "duplicate JSON object key value"
+
+[[error]]
 code = "22P02"
 name = "invalid_text_representation"
 class = "data exception"

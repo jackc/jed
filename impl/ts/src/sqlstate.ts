@@ -27,6 +27,7 @@ export type SqlState =
   | "invalid_escape_sequence" // 22025 — LIKE pattern must not end with escape character
   | "invalid_regular_expression" // 2201B — invalid regular expression: {detail}
   | "array_subscript_error" // 2202E — {detail}
+  | "duplicate_json_object_key_value" // 22030 — duplicate JSON object key value
   | "invalid_text_representation" // 22P02 — invalid input syntax for type {type}: {detail}
   | "not_null_violation" // 23502 — null value in column {name} violates not-null constraint
   | "unique_violation" // 23505 — duplicate key value violates unique constraint: {name}
@@ -92,6 +93,7 @@ const CODES: Record<SqlState, string> = {
   invalid_escape_sequence: "22025",
   invalid_regular_expression: "2201B",
   array_subscript_error: "2202E",
+  duplicate_json_object_key_value: "22030",
   invalid_text_representation: "22P02",
   not_null_violation: "23502",
   unique_violation: "23505",
@@ -173,6 +175,7 @@ export const ERRORS: readonly ErrorDesc[] = [
   { code: "22025", name: "invalid_escape_sequence", class: "data exception" },
   { code: "2201B", name: "invalid_regular_expression", class: "data exception" },
   { code: "2202E", name: "array_subscript_error", class: "data exception" },
+  { code: "22030", name: "duplicate_json_object_key_value", class: "data exception" },
   { code: "22P02", name: "invalid_text_representation", class: "data exception" },
   { code: "23502", name: "not_null_violation", class: "integrity constraint violation" },
   { code: "23505", name: "unique_violation", class: "integrity constraint violation" },

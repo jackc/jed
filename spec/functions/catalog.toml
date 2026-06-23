@@ -3175,6 +3175,44 @@ result         = "json"
 null           = "propagates"
 errors         = ["0A000"]
 
+# JSON_SCALAR(anyelement) → the value's JSON scalar as `json` (S1, json-sql-functions.md §5): an
+# integer/decimal → a JSON number, a boolean → a JSON boolean, text → a JSON string. STRICT. The
+# datetime/uuid/bytea/interval/float sources (which PG renders as a JSON string of their text) are a
+# deferred 0A000 follow-on. Reachable as the JSON_SCALAR(expr) standard syntax (a plain function call).
+[[operator]]
+name           = "json_scalar"
+kind           = "function"
+arity          = 1
+arg_families   = ["any"]
+arg_resolution = "none"
+result         = "json"
+null           = "propagates"
+errors         = ["0A000"]
+
+# JSON_SERIALIZE(json|jsonb) → the value's text serialization (S1, json-sql-functions.md §5): a json
+# value renders VERBATIM, a jsonb value its canonical text. STRICT. Reachable as the
+# JSON_SERIALIZE(expr) standard syntax (a plain function call); RETURNING text is the only (default)
+# form (PG 18 has no RETURNING clause here).
+[[operator]]
+name           = "json_serialize"
+kind           = "function"
+arity          = 1
+arg_families   = ["json"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "json_serialize"
+kind           = "function"
+arity          = 1
+arg_families   = ["jsonb"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
 # json[b]_build_array(VARIADIC "any") → a JSON array built from the (heterogeneous) arguments, one
 # element each, NULLs INCLUDED (as JSON null) — NOT strict. jsonb canonicalizes / spaced; json renders
 # PG's idiosyncratic builder spacing (", " between elements, an element's own json image inside: a

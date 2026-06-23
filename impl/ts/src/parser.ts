@@ -2832,6 +2832,26 @@ class Parser {
       const t = this.advance();
       return { kind: "typedLiteral", typeName: nameTok.word!, text: t.str! };
     }
+    // `JSON(expr [(WITH|WITHOUT) UNIQUE [KEYS]])` — the SQL/JSON JSON() constructor
+    // (json-sql-functions.md §5). Distinguished from the `json '...'` typed literal (handled above, a
+    // string follows) and a generic call by being the JSON keyword immediately followed by `(`.
+    if (this.peekKeyword() === "json" && this.peekKindAt(1) === "lparen") {
+      this.advance(); // JSON
+      this.advance(); // (
+      const operand = this.parseExpr();
+      // The unique-keys clause: `(WITH|WITHOUT) UNIQUE [KEYS]`. Consume `WITH`/`WITHOUT` only when
+      // `UNIQUE` follows (a two-token lookahead); `KEYS` is optional.
+      let uniqueKeys = false;
+      const w = this.peekKeyword();
+      if ((w === "with" || w === "without") && this.peekKeywordAt(1) === "unique") {
+        this.advance(); // WITH / WITHOUT
+        this.advance(); // UNIQUE
+        if (this.peekKeyword() === "keys") this.advance();
+        uniqueKeys = w === "with";
+      }
+      this.expect("rparen");
+      return { kind: "jsonCtor", operand, uniqueKeys };
+    }
     if (this.peekKeyword() === "cast") {
       this.advance();
       this.expect("lparen");
