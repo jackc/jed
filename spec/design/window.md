@@ -10,6 +10,11 @@
 > change the data/grammar and here in the same edit. PostgreSQL is the behavioral default
 > (CLAUDE.md §1); the deliberate divergences are the ledger in §10.
 
+> **Status: COMPLETE (S0–S5, all three cores).** Every function below is landed — row_number,
+> rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, the aggregates as window functions
+> (running + explicit ROWS frames), first_value/last_value/nth_value, and named windows. The
+> remaining `0A000` items (§11 + the per-slice notes) are deferred follow-ons, not gaps in the core.
+
 A **window function** computes a value for **each row** from a *set* of related rows — its
 **window frame** — without collapsing the rows the way an aggregate does. `row_number() OVER
 (ORDER BY x)` numbers rows 1, 2, 3…; `sum(x) OVER (ORDER BY t)` is a running total; `rank()
