@@ -96,6 +96,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // json/jsonb single-column SRFs (B2) — jsonb_array_elements[_text] / json[b]_object_keys
   // (json-sql-functions.md §3).
   "func.json_srf",
+  // to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2).
+  "func.to_jsonb",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
   // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
   "func.range_accessors",

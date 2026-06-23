@@ -3665,6 +3665,22 @@ pub const OPERATORS: &[OperatorDesc] = &[
         volatility: "immutable",
         variadic: false,
     },
+    OperatorDesc {
+        name: "to_jsonb",
+        symbol: None,
+        kind: "function",
+        arity: 1,
+        arg_families: &["any"],
+        arg_resolution: "none",
+        result: "jsonb",
+        null: "propagates",
+        precedence: 0,
+        errors: &["0A000"],
+        arg_names: &[],
+        arg_defaults: &[],
+        volatility: "immutable",
+        variadic: false,
+    },
 ];
 
 /// One aggregate function's metadata, mirroring an `[[aggregate]]` entry in

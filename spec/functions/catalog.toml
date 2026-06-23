@@ -3133,6 +3133,22 @@ result         = "text"
 null           = "propagates"
 errors         = []
 
+# to_jsonb(anyelement) → the JSON image of any value (a number stays exact, text → string, bool →
+# bool, a json/jsonb value canonicalizes, a 1-D array → a JSON array recursively). STRICT (a
+# top-level NULL → SQL NULL; a NULL array element → JSON null). The "any" arg family accepts every
+# type; the type-info-dependent / float-divergent sources (composite, float, datetime, uuid, bytea,
+# interval, multidim array) are a deferred 0A000 follow-on (json-sql-functions.md §2). to_json + the
+# json[b]_build_* builders + jsonb_set/insert are a follow-on slice.
+[[operator]]
+name           = "to_jsonb"
+kind           = "function"
+arity          = 1
+arg_families   = ["any"]
+arg_resolution = "none"
+result         = "jsonb"
+null           = "propagates"
+errors         = ["0A000"]
+
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
 # SINGLE value. They are NOT operators — no infix symbol, no precedence, no

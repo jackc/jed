@@ -11146,6 +11146,8 @@ enum ScalarFunc {
     JsonStripNulls,
     /// jsonb_pretty → an indented multi-line render.
     JsonbPretty,
+    /// to_jsonb(anyelement) → the JSON image of any value (the `value_to_node` kernel). STRICT.
+    ToJsonb,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -15546,6 +15548,7 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "jsonb_strip_nulls" => ScalarFunc::JsonbStripNulls,
         "json_strip_nulls" => ScalarFunc::JsonStripNulls,
         "jsonb_pretty" => ScalarFunc::JsonbPretty,
+        "to_jsonb" => ScalarFunc::ToJsonb,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -20234,6 +20237,67 @@ fn json_arg_node(v: &Value) -> Result<JsonNode> {
         Value::Json(s) => json::parse_preserving(s),
         _ => unreachable!("resolver restricts a json/jsonb function argument to json/jsonb"),
     }
+}
+
+/// The JSON image of any value — the `to_jsonb` kernel (json-sql-functions.md §2), also reused by
+/// the json aggregates (B4). Numbers stay exact (`decimal`, never float); a `json`/`jsonb` value
+/// canonicalizes; a 1-D array maps to a JSON array recursively (a NULL element → JSON null). The
+/// type-info-dependent / float-divergent sources — composite (needs field names), float (the
+/// binary→decimal divergence), datetime/uuid/bytea/interval (string-render divergences), and a
+/// multidimensional array — are a deferred `0A000` follow-on.
+fn value_to_node(v: &Value) -> Result<JsonNode> {
+    Ok(match v {
+        Value::Null => JsonNode::Null, // an array element (a top-level NULL is strict-propagated)
+        Value::Bool(b) => JsonNode::Bool(*b),
+        Value::Int(n) => JsonNode::Number(Decimal::from_i64(*n)),
+        Value::Decimal(d) => JsonNode::Number(d.clone()),
+        Value::Text(s) => JsonNode::String(s.clone()),
+        Value::Jsonb(n) => n.clone(),
+        Value::Json(s) => json::jsonb_in(s)?,
+        Value::Array(arr) => {
+            if arr.ndim() > 1 {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    "to_jsonb of a multidimensional array is not supported yet",
+                ));
+            }
+            let mut elems = Vec::with_capacity(arr.elements.len());
+            for e in &arr.elements {
+                elems.push(value_to_node(e)?);
+            }
+            JsonNode::Array(elems)
+        }
+        Value::Float32(_) | Value::Float64(_) => {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "to_jsonb of a float value is not supported yet",
+            ));
+        }
+        Value::Composite(_) => {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "to_jsonb of a composite value is not supported yet",
+            ));
+        }
+        Value::Uuid(_)
+        | Value::Date(_)
+        | Value::Timestamp(_)
+        | Value::Timestamptz(_)
+        | Value::Interval(_)
+        | Value::Bytea(_) => {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "to_jsonb of this type is not supported yet",
+            ));
+        }
+        Value::Range(_) => {
+            return Err(EngineError::new(
+                SqlState::FeatureNotSupported,
+                "to_jsonb of a range value is not supported yet",
+            ));
+        }
+        Value::Unfetched(_) => panic!("BUG: unfetched large value escaped the storage layer"),
+    })
 }
 
 /// The display symbol for a jsonb accessor operator, for error messages.
@@ -25034,6 +25098,7 @@ impl RExpr {
                         let node = json_arg_node(&vals[0])?;
                         Ok(Value::Text(json::pretty(&node)))
                     }
+                    ScalarFunc::ToJsonb => Ok(Value::Jsonb(value_to_node(&vals[0])?)),
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -25749,7 +25814,8 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::JsonArrayLength
         | ScalarFunc::JsonbStripNulls
         | ScalarFunc::JsonStripNulls
-        | ScalarFunc::JsonbPretty => {
+        | ScalarFunc::JsonbPretty
+        | ScalarFunc::ToJsonb => {
             unreachable!(
                 "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json fns are handled before eval_float_func"
             )

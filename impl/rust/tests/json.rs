@@ -126,6 +126,20 @@ fn json_array_elements_srf_is_deferred() {
     );
 }
 
+/// `to_jsonb` over the type-info-dependent / float-divergent sources (float, composite, datetime,
+/// uuid, bytea, interval, multidim array) is a deferred `0A000` follow-on; the supported set
+/// (scalars/jsonb/json/1-D arrays) is oracle-clean in suites/json/json_to_jsonb.test.
+#[test]
+fn to_jsonb_unsupported_sources_are_deferred() {
+    let mut db = Database::new();
+    assert_eq!(err(&mut db, "SELECT to_jsonb(1.5::f64)"), "0A000");
+    assert_eq!(err(&mut db, "SELECT to_jsonb('2020-01-01'::date)"), "0A000");
+    assert_eq!(
+        err(&mut db, "SELECT to_jsonb(ARRAY[ARRAY[1,2],ARRAY[3,4]])"),
+        "0A000"
+    );
+}
+
 /// `jsonb_pretty` renders the PG indented multi-line form (4-space indent, one space after `:`, a
 /// container ALWAYS multi-lines — an empty `{}` is `{` newline `}`). Pinned against the postgres:18
 /// oracle; the multi-line output can't live in the line-based corpus.

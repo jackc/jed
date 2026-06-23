@@ -362,9 +362,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
     - [x] **B1 (processing subset)** — ✅ `json[b]_typeof` / `json[b]_array_length` (22023 non-array) /
           `json[b]_strip_nulls` (json compact, jsonb spaced) / `jsonb_pretty` (4-space multi-line).
           Catalog rows + codegen + `ScalarFunc` kernels; json overloads parse-on-demand; all 3 cores,
-          cap `func.json_processing`, oracle-clean. _follow-on:_ builders `to_json[b]` /
-          `json[b]_build_array`/`_object` / `json[b]_object` / `jsonb_set`/`_insert` / `row_to_json` /
-          `array_to_json` (cap `func.json_builders`).
+          cap `func.json_processing`, oracle-clean.
+    - [x] **B1 builders — `to_jsonb` subset** — ✅ `to_jsonb(anyelement)` value→JSON image (number
+          exact, text/bool, json/jsonb canonicalize, 1-D array recursive incl. NULL→json null); STRICT;
+          `value_to_node` kernel (reused by B4). Float / composite / datetime / uuid / bytea / interval /
+          multidim-array sources deferred `0A000`. All 3 cores, cap `func.to_jsonb`, oracle-clean.
+          _follow-on:_ `to_json` / `json[b]_build_array`/`_object` / `json[b]_object` / `jsonb_set`/`_insert` /
+          `row_to_json` / `array_to_json` (cap `func.json_builders`).
     - [x] **B2 (jsonb subset)** — ✅ `jsonb_array_elements` / `jsonb_array_elements_text` /
           `jsonb_object_keys` (canonical order) / `json_object_keys` (input order, dups); FROM-clause
           SRFs, implicitly lateral; non-array/non-object `22023`; NULL → 0 rows. All 3 cores, cap

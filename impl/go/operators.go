@@ -3666,6 +3666,22 @@ var Operators = []OperatorDesc{
 		Volatility:    "immutable",
 		Variadic:      false,
 	},
+	{
+		Name:          "to_jsonb",
+		Symbol:        "",
+		Kind:          "function",
+		Arity:         1,
+		ArgFamilies:   []string{"any"},
+		ArgResolution: "none",
+		Result:        "jsonb",
+		Null:          "propagates",
+		Precedence:    0,
+		Errors:        []string{"0A000"},
+		ArgNames:      []string{},
+		ArgDefaults:   []string{},
+		Volatility:    "immutable",
+		Variadic:      false,
+	},
 }
 
 // AggregateDesc is one aggregate function's metadata, mirroring an [[aggregate]] entry

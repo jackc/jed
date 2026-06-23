@@ -13544,6 +13544,8 @@ const (
 	sfJsonStripNulls
 	// jsonb_pretty → an indented multi-line render.
 	sfJsonbPretty
+	// to_jsonb(anyelement) → the JSON image of any value (the valueToNode kernel). STRICT.
+	sfToJsonb
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -16224,6 +16226,8 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 		return sfJsonStripNulls
 	case "jsonb_pretty":
 		return sfJsonbPretty
+	case "to_jsonb":
+		return sfToJsonb
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -17402,6 +17406,60 @@ func jsonArgNode(v Value) (JsonNode, error) {
 		return parsePreservingJSON(v.Str)
 	default:
 		panic("jsonArgNode: a json/jsonb function argument must be json/jsonb")
+	}
+}
+
+// valueToNode is the JSON image of any value — the to_jsonb kernel (json-sql-functions.md §2), also
+// reused by the json aggregates (B4). Numbers stay exact (decimal, never float); a json/jsonb value
+// canonicalizes; a 1-D array maps to a JSON array recursively (a NULL element → JSON null). The
+// type-info-dependent / float-divergent sources — composite (needs field names), float (the
+// binary→decimal divergence), datetime/uuid/bytea/interval (string-render divergences), and a
+// multidimensional array — are a deferred 0A000 follow-on.
+func valueToNode(v Value) (JsonNode, error) {
+	switch v.Kind {
+	case ValNull: // an array element (a top-level NULL is strict-propagated)
+		return JsonNode{Kind: JNull}, nil
+	case ValBool:
+		return JsonNode{Kind: JBool, B: v.Bool}, nil
+	case ValInt:
+		return JsonNode{Kind: JNumber, Num: DecimalFromInt64(v.Int)}, nil
+	case ValDecimal:
+		return JsonNode{Kind: JNumber, Num: *v.Dec}, nil
+	case ValText:
+		return JsonNode{Kind: JString, S: v.Str}, nil
+	case ValJsonb:
+		return *v.Json, nil
+	case ValJson:
+		return jsonbIn(v.Str)
+	case ValArray:
+		arr := v.Array
+		if arr.Ndim() > 1 {
+			return JsonNode{}, NewError(FeatureNotSupported,
+				"to_jsonb of a multidimensional array is not supported yet")
+		}
+		elems := make([]JsonNode, 0, len(arr.Elements))
+		for i := range arr.Elements {
+			node, err := valueToNode(arr.Elements[i])
+			if err != nil {
+				return JsonNode{}, err
+			}
+			elems = append(elems, node)
+		}
+		return JsonNode{Kind: JArray, Arr: elems}, nil
+	case ValFloat32, ValFloat64:
+		return JsonNode{}, NewError(FeatureNotSupported,
+			"to_jsonb of a float value is not supported yet")
+	case ValComposite:
+		return JsonNode{}, NewError(FeatureNotSupported,
+			"to_jsonb of a composite value is not supported yet")
+	case ValUuid, ValDate, ValTimestamp, ValTimestamptz, ValInterval, ValBytea:
+		return JsonNode{}, NewError(FeatureNotSupported,
+			"to_jsonb of this type is not supported yet")
+	case ValRange:
+		return JsonNode{}, NewError(FeatureNotSupported,
+			"to_jsonb of a range value is not supported yet")
+	default: // ValUnfetched
+		panic("BUG: unfetched large value escaped the storage layer")
 	}
 }
 
@@ -22834,6 +22892,14 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return Value{}, err
 			}
 			return TextValue(jsonPretty(&node)), nil
+		case sfToJsonb:
+			// to_jsonb(anyelement) → the JSON image of the value (json-sql-functions.md §2). STRICT:
+			// the NULL-input case is handled by the blanket propagation above.
+			node, err := valueToNode(vals[0])
+			if err != nil {
+				return Value{}, err
+			}
+			return JsonbValue(node), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).

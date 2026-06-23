@@ -10684,7 +10684,9 @@ type ScalarFuncName =
   | "jsonb_strip_nulls"
   | "json_strip_nulls"
   // jsonb_pretty → an indented multi-line render.
-  | "jsonb_pretty";
+  | "jsonb_pretty"
+  // to_jsonb(anyelement) → the JSON image of any value (the valueToNode kernel). STRICT.
+  | "to_jsonb";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -16912,6 +16914,60 @@ function jsonArgNode(v: Value): JsonNode {
   throw new Error("jsonArgNode: a json/jsonb function argument must be json/jsonb");
 }
 
+// valueToNode is the JSON image of any value — the to_jsonb kernel (json-sql-functions.md §2), also
+// reused by the json aggregates (B4). Numbers stay exact (decimal, never float); a json/jsonb value
+// canonicalizes; a 1-D array maps to a JSON array recursively (a NULL element → JSON null). The
+// type-info-dependent / float-divergent sources — composite (needs field names), float (the
+// binary→decimal divergence), datetime/uuid/bytea/interval (string-render divergences), and a
+// multidimensional array — are a deferred 0A000 follow-on.
+function valueToNode(v: Value): JsonNode {
+  switch (v.kind) {
+    case "null": // an array element (a top-level NULL is strict-propagated)
+      return { kind: "null" };
+    case "bool":
+      return { kind: "bool", value: v.value };
+    case "int":
+      return { kind: "number", dec: Decimal.fromBigInt(v.int) };
+    case "decimal":
+      return { kind: "number", dec: v.dec };
+    case "text":
+      return { kind: "string", value: v.text };
+    case "jsonb":
+      return v.node;
+    case "json":
+      return jsonbIn(v.text);
+    case "array": {
+      if (v.dims.length > 1) {
+        throw engineError(
+          "feature_not_supported",
+          "to_jsonb of a multidimensional array is not supported yet",
+        );
+      }
+      const elements = v.elements.map((e) => valueToNode(e));
+      return { kind: "array", elements };
+    }
+    case "f32":
+    case "f64":
+      throw engineError("feature_not_supported", "to_jsonb of a float value is not supported yet");
+    case "composite":
+      throw engineError(
+        "feature_not_supported",
+        "to_jsonb of a composite value is not supported yet",
+      );
+    case "uuid":
+    case "date":
+    case "timestamp":
+    case "timestamptz":
+    case "interval":
+    case "bytea":
+      throw engineError("feature_not_supported", "to_jsonb of this type is not supported yet");
+    case "range":
+      throw engineError("feature_not_supported", "to_jsonb of a range value is not supported yet");
+    default: // unfetched
+      throw new Error("BUG: unfetched large value escaped the storage layer");
+  }
+}
+
 // resolveJsonbContains resolves a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1,
 // J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
 // has no @> operator class (42883). `<@` resolves to a "jsonContains" node with the operands swapped
@@ -20377,6 +20433,11 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       }
       if (e.func === "jsonb_pretty") {
         return textValue(jsonPretty(jsonArgNode(vals[0]!)));
+      }
+      if (e.func === "to_jsonb") {
+        // to_jsonb(anyelement) → the JSON image of the value (json-sql-functions.md §2). STRICT:
+        // the NULL-input case is handled by the blanket propagation above.
+        return jsonbValue(valueToNode(vals[0]!));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

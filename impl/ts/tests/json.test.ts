@@ -105,3 +105,24 @@ test("json_array_elements SRF is deferred", () => {
     "0A000",
   );
 });
+
+// `to_jsonb` over the type-info-dependent / float-divergent sources (float, composite, datetime,
+// uuid, bytea, interval, multidim array) is a deferred 0A000 follow-on; the supported set
+// (scalars/jsonb/json/1-D arrays) is oracle-clean in suites/json/json_to_jsonb.test. Mirrors
+// impl/rust/tests/json.rs to_jsonb_unsupported_sources_are_deferred and impl/go/json_test.go
+// TestToJsonbUnsupportedSourcesAreDeferred.
+test("to_jsonb unsupported sources are deferred", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => execute(db, "SELECT to_jsonb(1.5::f64)")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT to_jsonb('2020-01-01'::date)")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT to_jsonb(ARRAY[ARRAY[1,2],ARRAY[3,4]])")),
+    "0A000",
+  );
+});

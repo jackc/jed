@@ -1,0 +1,59 @@
+# to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2): a
+# number stays exact, text → a JSON string, boolean → a JSON boolean, a json/jsonb value
+# canonicalizes, a 1-D array → a JSON array recursively (a NULL element → JSON null). STRICT — a
+# top-level NULL → SQL NULL. The float / datetime / composite sources are a deferred 0A000 follow-on
+# (a per-core test). Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, types.jsonb, types.json, func.to_jsonb
+
+# Scalars: number stays exact (scale preserved), text → string, boolean → boolean.
+query TTTT nosort
+SELECT to_jsonb(5), to_jsonb(5.50::numeric), to_jsonb('hi'::text), to_jsonb(true)
+----
+5
+5.50
+"hi"
+true
+
+# STRICT: a top-level NULL argument → SQL NULL.
+query T nosort
+SELECT to_jsonb(NULL::i32)
+----
+NULL
+
+# A jsonb value is the identity; a json value canonicalizes (drops the input whitespace).
+query TT nosort
+SELECT to_jsonb('{ "a" : 1 }'::jsonb), to_jsonb('[1,  2]'::json)
+----
+{"a": 1}
+[1, 2]
+
+# A 1-D array → a JSON array recursively; a NULL element becomes JSON null.
+query TTT nosort
+SELECT to_jsonb(ARRAY[1,2,3]), to_jsonb(ARRAY['a','b']), to_jsonb(ARRAY[1,NULL,3])
+----
+[1, 2, 3]
+["a", "b"]
+[1, null, 3]
+
+# Over a stored column (the common shape): wrap a scalar column into jsonb.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, name text, score i32)
+
+statement ok
+INSERT INTO t VALUES (1, 'a', 10), (2, 'b', NULL)
+
+query IT nosort
+SELECT id, to_jsonb(score) FROM t ORDER BY id
+----
+1
+10
+2
+NULL
+
+query IT nosort
+SELECT id, to_jsonb(name) FROM t ORDER BY id
+----
+1
+"a"
+2
+"b"

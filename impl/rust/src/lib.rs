@@ -608,6 +608,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // json/jsonb single-column SRFs (B2) — jsonb_array_elements[_text] / json[b]_object_keys
     // (json-sql-functions.md §3).
     "func.json_srf",
+    // to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2).
+    "func.to_jsonb",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

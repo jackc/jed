@@ -233,3 +233,20 @@ func TestJSONArrayElementsSrfIsDeferred(t *testing.T) {
 		t.Errorf("json_array_elements_text: got %s, want 0A000", got)
 	}
 }
+
+// TestToJsonbUnsupportedSourcesAreDeferred: `to_jsonb` over the type-info-dependent / float-divergent
+// sources (float, composite, datetime, uuid, bytea, interval, multidim array) is a deferred 0A000
+// follow-on; the supported set (scalars/jsonb/json/1-D arrays) is oracle-clean in
+// suites/json/json_to_jsonb.test. Mirrors impl/rust/tests/json.rs.
+func TestToJsonbUnsupportedSourcesAreDeferred(t *testing.T) {
+	db := NewDatabase()
+	if got := errJSON(t, db, "SELECT to_jsonb(1.5::f64)"); got != "0A000" {
+		t.Errorf("to_jsonb(float): got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT to_jsonb('2020-01-01'::date)"); got != "0A000" {
+		t.Errorf("to_jsonb(date): got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT to_jsonb(ARRAY[ARRAY[1,2],ARRAY[3,4]])"); got != "0A000" {
+		t.Errorf("to_jsonb(multidim array): got %s, want 0A000", got)
+	}
+}

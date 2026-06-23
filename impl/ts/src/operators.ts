@@ -3553,6 +3553,21 @@ export const OPERATORS: readonly OperatorDesc[] = [
     volatility: "immutable",
     variadic: false,
   },
+  {
+    name: "to_jsonb",
+    kind: "function",
+    arity: 1,
+    argFamilies: ["any"],
+    argResolution: "none",
+    result: "jsonb",
+    null: "propagates",
+    precedence: 0,
+    errors: ["0A000"],
+    argNames: [],
+    argDefaults: [],
+    volatility: "immutable",
+    variadic: false,
+  },
 ];
 
 // One aggregate function's metadata, mirroring an [[aggregate]] entry in catalog.toml.
