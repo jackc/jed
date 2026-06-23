@@ -267,3 +267,20 @@ max = 500
 gen = "int_uniform"
 min = 1
 max = 500
+
+# Regex `~` filter over the 1M-row `note` text column (spec/design/regex.md). The hand-written
+# linear-time Pike VM, scanned over every row — the perf-relevant regex path. jed + PostgreSQL only:
+# SQLite has no `~` operator (its regex is an optional extension with a different flavor). The
+# pattern is a basic class+quantifier both engines match identically (the oracle-agreeing subset), so
+# the cross-engine answer checksum (the matching row count) holds. No new data — reuses `large`.
+[[bench]]
+name = "regex_filter_scan"
+description = "Full-scan regex `~` filter over the 1M-row note text column (the linear-time Pike VM)"
+dataset = "large"
+kind = "query"
+engines = ["jed", "postgres"]
+sql = "SELECT count(*) FROM orders WHERE note ~ '[aeiou]{2}'"
+warmup = 3
+iterations = 20
+seed = 4220
+expect_rows_per_iter = 1

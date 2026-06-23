@@ -97,7 +97,17 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
 - [x] **Predicate forms — `IN (list)`, `BETWEEN`, `LIKE`, `CASE`** — IN/BETWEEN desugar to
       `=`/`OR`/`AND`/`NOT`; LIKE is a code-point matcher (`%`/`_`, `\` escape, `22025`); CASE is
       the engine's first lazy expression. → grammar.md §20–§23
-  - [ ] _follow-on:_ LIKE `ESCAPE 'c'`, `ILIKE`, `SIMILAR TO`.
+  - [x] **`ILIKE`** — case-insensitive `LIKE` (landed with collation Slice 3e).
+  - [x] **Regular expressions** — `~` `~*` `!~` `!~*` operators + `regexp_replace` / `regexp_match`
+        functions, jed's own RE2-able flavor (a hand-written linear-time **Pike VM**, ReDoS-immune,
+        NOT PostgreSQL-flavor-compatible). Code-point matching; `2201B` malformed / `54001`
+        over-large program (`MAX_REGEX_PROGRAM`); `regex_compile`/`regex_step` cost units; cross-core
+        program/match-vector fixtures. All three cores byte-identical, oracle-clean on the PG-agreeing
+        subset. → [regex.md](spec/design/regex.md)
+  - [ ] _follow-on:_ LIKE `ESCAPE 'c'`; `SIMILAR TO` (deliberately excluded — the SQL-standard
+        surface); set-returning `regexp_matches` / `regexp_split_to_table`; the Oracle-compat
+        `regexp_count`/`instr`/`substr`/`like`; Unicode-property char classes (`\p{…}`),
+        backreferences + lookaround (permanently out — they would break the linear-time guarantee).
 - [x] **Aggregates `COUNT`/`SUM`/`MIN`/`MAX`/`AVG` + `GROUP BY` + `HAVING`** — first
       function-call syntax, whole-table + grouped aggregation, PG widening (SUM int→i64/decimal,
       AVG→decimal), grouping-error `42803`. → [aggregates.md](spec/design/aggregates.md)
