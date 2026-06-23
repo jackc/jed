@@ -23,7 +23,7 @@ import (
 var magic = [4]byte{'J', 'E', 'D', 'B'}
 
 const (
-	formatVersion   uint16 = 18    // on-disk format version (18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+	formatVersion   uint16 = 19    // on-disk format version (19 = storable json/jsonb columns (spec/design/json.md, J1/J1b): a column type can be json (type_code 18) or jsonb (type_code 19) — plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column still moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicode_version + cldr_version + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: type_code 17 + an inline element-type descriptor in the catalog — one scalar code, spec/design/ranges.md §3 — and the compact range value body, a flags byte EMPTY/LB_INF/UB_INF/LB_INC/UB_INC + present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: an entry_kind = 2 catalog entry — name + six i64 fields + a flags byte — emitted after composite-type entries and before table entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4. 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 	pageHeader             = 16    // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 	interiorReserve        = 12    // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of pageHeader (format.md "Why the record cap")
 	pageCatalog     byte   = 1     // page_type for a catalog page
@@ -380,6 +380,229 @@ func encodeCompositeBody(fields []ColField, vals []Value) []byte {
 // caught by the oversized-item rule in pack (0A000), so the cast here is sound for every supported
 // page size (spec/fileformat/format.md). boolean is a single bool-byte body — 0x00 false, 0x01 true
 // (types.md §9).
+// --- jsonb value codec (the tagged-node tree, spec/design/json.md §2) -------------------------
+//
+// A jsonb value's BODY (after the 0x00 present tag) is a self-delimiting depth-first serialization
+// of the canonical node tree: every node leads with a one-byte tag (low nibble = kind, high nibble
+// = flags, reserved 0). Like array/range, there is NO outer length prefix — the tree walks itself,
+// so a large jsonb body rides the large-value overflow + LZ4 path opaquely (§2). Counts / string
+// lengths are an unsigned LEB128 varint (§2.1). A json value's body is the text VERBATIM,
+// length-prefixed exactly like text (§4).
+const (
+	ntagNull       byte = 0x0
+	ntagFalse      byte = 0x1
+	ntagTrue       byte = 0x2
+	ntagNumber     byte = 0x3
+	ntagString     byte = 0x4
+	ntagStringDict byte = 0x5 // reserved — the dictionary door (§3); a reader rejects it XX001
+	ntagArray      byte = 0x6
+	ntagObject     byte = 0x7
+)
+
+// writeUvarint appends an unsigned LEB128 varint (7 bits/byte, high bit = continuation) — the
+// count/length codec for the jsonb node bodies (spec/design/json.md §2.1).
+func writeUvarint(out []byte, v uint64) []byte {
+	for {
+		b := byte(v & 0x7f)
+		v >>= 7
+		if v == 0 {
+			return append(out, b)
+		}
+		out = append(out, b|0x80)
+	}
+}
+
+// readUvarint reads an unsigned LEB128 varint (inverse of writeUvarint). XX001 on a truncated or
+// over-64-bit value.
+func readUvarint(buf []byte, pos *int) (uint64, error) {
+	var result uint64
+	var shift uint32
+	for {
+		b, err := readU8(buf, pos)
+		if err != nil {
+			return 0, err
+		}
+		if shift >= 64 || (shift == 63 && b > 1) {
+			return 0, NewError(DataCorrupted, "jsonb varint overflows u64")
+		}
+		result |= uint64(b&0x7f) << shift
+		if b&0x80 == 0 {
+			return result, nil
+		}
+		shift += 7
+	}
+}
+
+// encodeDecimalBody appends a decimal value's BODY (no presence tag): flags(sign) ‖ u16 scale ‖
+// u16 ndigits ‖ groups (base-10^4, MS-first) — the ntagNumber payload and the inverse of
+// decodeDecimalBody.
+func encodeDecimalBody(d Decimal, out []byte) []byte {
+	neg, scale, groups := d.ToCodec()
+	var flags byte
+	if neg {
+		flags = 1 // bit0 = sign
+	}
+	out = append(out, flags)
+	out = appendU16(out, uint16(scale))
+	out = appendU16(out, uint16(len(groups)))
+	for _, g := range groups {
+		out = appendU16(out, g)
+	}
+	return out
+}
+
+// encodeJsonbBody serializes a jsonb node tree into out (the body bytes — spec/design/json.md §2.1).
+// Object members are already in canonical key order (the canonicalizer's invariant); each member's
+// key is itself a string node (ntagString), so the dictionary door covers keys and values uniformly.
+func encodeJsonbBody(node *JsonNode, out []byte) []byte {
+	switch node.Kind {
+	case JNull:
+		return append(out, ntagNull)
+	case JBool:
+		if node.B {
+			return append(out, ntagTrue)
+		}
+		return append(out, ntagFalse)
+	case JNumber:
+		out = append(out, ntagNumber)
+		return encodeDecimalBody(node.Num, out)
+	case JString:
+		out = append(out, ntagString)
+		out = writeUvarint(out, uint64(len(node.S)))
+		return append(out, node.S...)
+	case JArray:
+		out = append(out, ntagArray)
+		out = writeUvarint(out, uint64(len(node.Arr)))
+		for i := range node.Arr {
+			out = encodeJsonbBody(&node.Arr[i], out)
+		}
+		return out
+	case JObject:
+		out = append(out, ntagObject)
+		out = writeUvarint(out, uint64(len(node.Obj)))
+		for i := range node.Obj {
+			out = append(out, ntagString)
+			out = writeUvarint(out, uint64(len(node.Obj[i].Key)))
+			out = append(out, node.Obj[i].Key...)
+			out = encodeJsonbBody(&node.Obj[i].Val, out)
+		}
+		return out
+	default:
+		panic("BUG: unknown jsonb node kind in encodeJsonbBody")
+	}
+}
+
+// decodeJsonbBody deserializes a jsonb node from buf at pos (inverse of encodeJsonbBody). A nonzero
+// flag nibble, the reserved ntagStringDict (no dictionary slice yet), or an unknown kind is XX001
+// data_corrupted (spec/design/json.md §3.1/§6.3).
+func decodeJsonbBody(buf []byte, pos *int) (JsonNode, error) {
+	tag, err := readU8(buf, pos)
+	if err != nil {
+		return JsonNode{}, err
+	}
+	if tag&0xf0 != 0 {
+		return JsonNode{}, NewError(DataCorrupted, "jsonb node tag has a reserved flag bit set")
+	}
+	switch tag & 0x0f {
+	case ntagNull:
+		return JsonNode{Kind: JNull}, nil
+	case ntagFalse:
+		return JsonNode{Kind: JBool, B: false}, nil
+	case ntagTrue:
+		return JsonNode{Kind: JBool, B: true}, nil
+	case ntagNumber:
+		dv, err := decodeDecimalBody(buf, pos)
+		if err != nil {
+			return JsonNode{}, err
+		}
+		return JsonNode{Kind: JNumber, Num: *dv.Dec}, nil
+	case ntagString:
+		s, err := decodeJsonbString(buf, pos)
+		if err != nil {
+			return JsonNode{}, err
+		}
+		return JsonNode{Kind: JString, S: s}, nil
+	case ntagStringDict:
+		return JsonNode{}, NewError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
+	case ntagArray:
+		count, err := readUvarint(buf, pos)
+		if err != nil {
+			return JsonNode{}, err
+		}
+		elems := make([]JsonNode, 0, minCap(count))
+		for i := uint64(0); i < count; i++ {
+			child, err := decodeJsonbBody(buf, pos)
+			if err != nil {
+				return JsonNode{}, err
+			}
+			elems = append(elems, child)
+		}
+		return JsonNode{Kind: JArray, Arr: elems}, nil
+	case ntagObject:
+		count, err := readUvarint(buf, pos)
+		if err != nil {
+			return JsonNode{}, err
+		}
+		members := make([]JsonMember, 0, minCap(count))
+		for i := uint64(0); i < count; i++ {
+			// Each member's key is a string node (ntagString / reserved ntagStringDict).
+			ktag, err := readU8(buf, pos)
+			if err != nil {
+				return JsonNode{}, err
+			}
+			if ktag&0xf0 != 0 {
+				return JsonNode{}, NewError(DataCorrupted, "jsonb object key tag has a reserved flag bit set")
+			}
+			switch ktag & 0x0f {
+			case ntagString:
+				// fall through to read the key payload below
+			case ntagStringDict:
+				return JsonNode{}, NewError(DataCorrupted, "jsonb string-dictionary reference before the dictionary slice")
+			default:
+				return JsonNode{}, NewError(DataCorrupted, "jsonb object key is not a string node")
+			}
+			key, err := decodeJsonbString(buf, pos)
+			if err != nil {
+				return JsonNode{}, err
+			}
+			val, err := decodeJsonbBody(buf, pos)
+			if err != nil {
+				return JsonNode{}, err
+			}
+			members = append(members, JsonMember{Key: key, Val: val})
+		}
+		return JsonNode{Kind: JObject, Obj: members}, nil
+	default:
+		return JsonNode{}, NewError(DataCorrupted, "unknown jsonb node tag")
+	}
+}
+
+// minCap bounds a decoded count's preallocation (the Rust .min(1024) guard) so a corrupt huge count
+// cannot force a giant allocation before the bytes are read.
+func minCap(count uint64) int {
+	if count > 1024 {
+		return 1024
+	}
+	return int(count)
+}
+
+// decodeJsonbString reads a ntagString payload (varint len ‖ UTF-8 bytes) after its tag has been
+// consumed.
+func decodeJsonbString(buf []byte, pos *int) (string, error) {
+	n, err := readUvarint(buf, pos)
+	if err != nil {
+		return "", err
+	}
+	sb, err := take(buf, pos, int(n))
+	if err != nil {
+		return "", err
+	}
+	if !utf8.Valid(sb) {
+		return "", NewError(DataCorrupted, "non-UTF-8 jsonb string")
+	}
+	return string(sb), nil
+}
+
 func encodeScalar(ty ScalarType, v Value) []byte {
 	switch v.Kind {
 	case ValNull:
@@ -397,10 +620,16 @@ func encodeScalar(ty ScalarType, v Value) []byte {
 	case ValRange:
 		// A range value is encoded by encodeValue's range arm, never here.
 		panic("BUG: a range value reached the scalar codec")
-	case ValJson, ValJsonb:
-		// json/jsonb columns are not storable until J1 (gated 0A000 at CREATE TABLE in J0), so a
-		// json/jsonb value never reaches the codec this slice; J1 adds the §2/§4 bodies here.
-		panic("BUG: a json/jsonb value reached the scalar codec (J0 has no json/jsonb columns)")
+	case ValJson:
+		// json: the verbatim text body, length-prefixed exactly like text (spec/design/json.md §4).
+		out := make([]byte, 0, 3+len(v.Str))
+		out = append(out, 0x00) // present
+		out = appendU16(out, uint16(len(v.Str)))
+		return append(out, v.Str...)
+	case ValJsonb:
+		// jsonb: present tag, then the self-delimiting tagged-node tree (spec/design/json.md §2).
+		out := []byte{0x00} // present
+		return encodeJsonbBody(v.Json, out)
 	case ValText, ValBytea:
 		// text (UTF-8) and bytea (raw bytes) share the compact length-prefixed body; both
 		// hold their bytes in Str, so the on-disk form is identical.
@@ -1467,7 +1696,10 @@ func isSpillable(ty ColType) bool {
 		// the plan, spec/design/ranges.md §4).
 		return true
 	}
-	return ty.Scalar.IsText() || ty.Scalar.IsBytea() || ty.Scalar.IsDecimal()
+	// json/jsonb are variable-length document bodies that ride the same overflow + LZ4 path as
+	// text/bytea when a record exceeds RECORD_MAX (spec/design/json.md §2/§4).
+	return ty.Scalar.IsText() || ty.Scalar.IsBytea() || ty.Scalar.IsDecimal() ||
+		ty.Scalar.IsJson() || ty.Scalar.IsJsonb()
 }
 
 // recordMaxFor is the largest a single record may serialize to and still satisfy the B-tree split
@@ -1681,6 +1913,12 @@ func valuePayload(ty ColType, v Value) []byte {
 	switch {
 	case ty.Scalar.IsText(), ty.Scalar.IsBytea():
 		return []byte(v.Str)
+	// json's payload is the verbatim UTF-8 (no length prefix — the chain tracks its own length,
+	// exactly like text); jsonb's payload is the tagged-node tree body (spec/design/json.md §4/§2).
+	case ty.Scalar.IsJson():
+		return []byte(v.Str)
+	case ty.Scalar.IsJsonb():
+		return encodeJsonbBody(v.Json, nil)
 	case ty.Scalar.IsDecimal():
 		return encodeScalar(ty.Scalar, v)[1:] // strip the leading presence tag
 	default:
@@ -1715,6 +1953,18 @@ func valueFromPayload(ty ColType, payload []byte) (Value, error) {
 		return TextValue(string(payload)), nil
 	case ty.Scalar.IsBytea():
 		return ByteaValue(payload), nil
+	case ty.Scalar.IsJson():
+		if !utf8.Valid(payload) {
+			return Value{}, NewError(DataCorrupted, "non-UTF-8 json value")
+		}
+		return JsonValue(string(payload)), nil
+	case ty.Scalar.IsJsonb():
+		pos := 0
+		n, err := decodeJsonbBody(payload, &pos)
+		if err != nil {
+			return Value{}, err
+		}
+		return JsonbValue(n), nil
 	case ty.Scalar.IsDecimal():
 		pos := 0
 		return decodeDecimalBody(payload, &pos)
@@ -3338,6 +3588,27 @@ func readInlineScalar(ty ScalarType, buf []byte, pos *int) (Value, error) {
 		}
 		// ByteaValue copies the bytes into a string, so the value owns its content.
 		return ByteaValue(bb), nil
+	case ty.IsJson():
+		// json: verbatim text, length-prefixed exactly like text (spec/design/json.md §4).
+		n, err := readU16(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		sb, err := take(buf, pos, int(n))
+		if err != nil {
+			return Value{}, err
+		}
+		if !utf8.Valid(sb) {
+			return Value{}, NewError(DataCorrupted, "non-UTF-8 json value")
+		}
+		return JsonValue(string(sb)), nil
+	case ty.IsJsonb():
+		// jsonb: the self-delimiting tagged-node tree (spec/design/json.md §2).
+		node, err := decodeJsonbBody(buf, pos)
+		if err != nil {
+			return Value{}, err
+		}
+		return JsonbValue(node), nil
 	case ty.IsUuid():
 		// Fixed 16 raw bytes, no length prefix. Must branch before the integer path —
 		// DecodeInt would sign-flip and WidthBytes is 16 there too.

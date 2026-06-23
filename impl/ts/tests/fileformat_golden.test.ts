@@ -726,6 +726,33 @@ function collationPKTableDB(): Database {
   return db;
 }
 
+// jsonTableDB has a json column (verbatim text body, type_code 18 — spec/design/json.md §4). The
+// stored bytes are the input text exactly (whitespace/key-order preserved), so this pins the
+// length-prefixed text-shaped json body. Pins json_table.jed cross-core.
+function jsonTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)");
+  run(db, `INSERT INTO t VALUES (1, '{"a": 1}')`);
+  run(db, `INSERT INTO t VALUES (2, '[1, 2, 3]')`);
+  run(db, "INSERT INTO t VALUES (3, NULL)");
+  return db;
+}
+
+// jsonbTableDB has a jsonb column (the canonical tagged-node tree, type_code 19 —
+// spec/design/json.md §2). The rows exercise every node tag: an object (NTAG_OBJECT, canonical key
+// order a,b) with a number (NTAG_NUMBER), a nested array (NTAG_ARRAY) of a boolean TRUE (NTAG_TRUE)
+// and JSON null (NTAG_NULL); a bare string (NTAG_STRING); a bare number; and a SQL NULL (the lone
+// 0x01 presence tag, distinct from a JSON null node). Pins jsonb_table.jed.
+function jsonbTableDB(): Database {
+  const db = goldenDb();
+  run(db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)");
+  run(db, `INSERT INTO t VALUES (1, '{"a": 1, "b": [true, null]}')`);
+  run(db, `INSERT INTO t VALUES (2, '"hello"')`);
+  run(db, "INSERT INTO t VALUES (3, '42')");
+  run(db, "INSERT INTO t VALUES (4, NULL)");
+  return db;
+}
+
 // WRITE side: serializing the in-memory database reproduces the golden byte-exactly.
 test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
   loadUnicode(); // the unicode-collated goldens need the bundle loaded (collation.md §4)
@@ -773,6 +800,8 @@ test("write matches goldens (byte-identical to Rust/Go/Ruby)", () => {
     { name: "range_pk_table.jed", build: rangePkTableDB },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB },
+    { name: "json_table.jed", build: jsonTableDB },
+    { name: "jsonb_table.jed", build: jsonbTableDB },
     { name: "tall_tree.jed", build: tallTreeDB },
   ];
   for (const c of cases) {
@@ -832,6 +861,8 @@ test("read goldens reproduces rows", () => {
     { name: "range_pk_table.jed", build: rangePkTableDB, table: "t" },
     { name: "array_composite_table.jed", build: arrayCompositeTableDB, table: "t" },
     { name: "composite_array_field_table.jed", build: compositeArrayFieldTableDB, table: "t" },
+    { name: "json_table.jed", build: jsonTableDB, table: "t" },
+    { name: "jsonb_table.jed", build: jsonbTableDB, table: "t" },
     { name: "tall_tree.jed", build: tallTreeDB, table: "t" },
     { name: "torn_meta_slot0.jed", build: pkTableDB, table: "t" },
     { name: "torn_meta_slot1.jed", build: pkTableDB, table: "t" },

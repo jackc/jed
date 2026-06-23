@@ -242,6 +242,35 @@ fn range_pk_table_db() -> Database {
     db
 }
 
+/// A table with a `json` column (verbatim text body, type_code 18 — spec/design/json.md §4). The
+/// stored bytes are the input text exactly (whitespace/key-order preserved), so this pins the
+/// length-prefixed text-shaped json body. Pins json_table.jed cross-core.
+fn json_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)");
+    run(&mut db, "INSERT INTO t VALUES (1, '{\"a\": 1}')");
+    run(&mut db, "INSERT INTO t VALUES (2, '[1, 2, 3]')");
+    run(&mut db, "INSERT INTO t VALUES (3, NULL)");
+    db
+}
+
+/// A table with a `jsonb` column (the canonical tagged-node tree, type_code 19 —
+/// spec/design/json.md §2). The rows exercise every node tag: an object (NTAG_OBJECT) with a
+/// number (NTAG_NUMBER), a nested array (NTAG_ARRAY) of a boolean (NTAG_TRUE) and JSON null
+/// (NTAG_NULL); a bare string (NTAG_STRING); a bare number; and a SQL NULL. Pins jsonb_table.jed.
+fn jsonb_table_db() -> Database {
+    let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
+    run(&mut db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)");
+    run(
+        &mut db,
+        "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, null]}')",
+    );
+    run(&mut db, "INSERT INTO t VALUES (2, '\"hello\"')");
+    run(&mut db, "INSERT INTO t VALUES (3, '42')");
+    run(&mut db, "INSERT INTO t VALUES (4, NULL)");
+    db
+}
+
 fn gin_array_table_db() -> Database {
     let mut db = Database::with_page_size(GOLDEN_PAGE_SIZE);
     run(
@@ -915,6 +944,8 @@ fn write_matches_goldens() {
         ),
         ("collation_table.jed", collation_table_db),
         ("collation_pk_table.jed", collation_pk_table_db),
+        ("json_table.jed", json_table_db),
+        ("jsonb_table.jed", jsonb_table_db),
         ("tall_tree.jed", tall_tree_db),
     ];
     for (name, build) in cases {
@@ -972,6 +1003,8 @@ fn read_goldens_reproduces_rows() {
         ),
         ("collation_table.jed", collation_table_db, "t"),
         ("collation_pk_table.jed", collation_pk_table_db, "t"),
+        ("json_table.jed", json_table_db, "t"),
+        ("jsonb_table.jed", jsonb_table_db, "t"),
         ("serial_table.jed", serial_table_db, "t"),
         ("identity_table.jed", identity_table_db, "t"),
         ("tall_tree.jed", tall_tree_db, "t"),

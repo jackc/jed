@@ -3050,18 +3050,6 @@ impl Database {
                     format!("type does not exist: {}", def.type_name),
                 ));
             };
-            // J0: the `json`/`jsonb` types exist for literals/casts but a storable COLUMN is
-            // deferred to J1 (the format bump + value codec) — spec/design/json.md §12. Mirrors the
-            // array S0→S2 and composite S2→column staging.
-            if ty.is_json() || ty.is_jsonb() {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    format!(
-                        "a {} column is not yet supported (json/jsonb is literal-only this slice)",
-                        ty.canonical_name()
-                    ),
-                ));
-            }
             if def.primary_key {
                 // The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
                 // boolean (`bool-byte` §2.9), uuid (`uuid-raw16` §2.7), timestamp/timestamptz (i64

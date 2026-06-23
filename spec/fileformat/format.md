@@ -15,9 +15,30 @@ and (b) write the same logical database to bytes that equal the golden *exactly*
 other's output. A fourth independent encoder/decoder (the Ruby reference in
 [verify.rb](verify.rb)) pins the goldens so they are not merely self-certified.
 
-## Version scope (`format_version` 18)
+## Version scope (`format_version` 19)
 
-The current on-disk version is **`format_version` 18** — **reference-only collations** (the
+The current on-disk version is **`format_version` 19** — **storable `json` / `jsonb` columns**
+([../design/json.md](../design/json.md), slices J1/J1b). A column type can now be **`json`**
+(`type_code` 18) or **`jsonb`** (`type_code` 19) — both **plain scalar** catalog entries with **no
+extra descriptor** (like `text`/`uuid`; the reserved `has_jsonb_dict` door — json.md §3.2 — stays
+clear, zero bytes), so a table with no json/jsonb column is byte-unchanged but for the version byte +
+meta CRC. A **`json` value** stores the input text **VERBATIM**, length-prefixed exactly like `text`
+(`0x00` present ‖ `u16` byte length ‖ UTF-8). A **`jsonb` value** stores the canonical decomposed
+binary form: the `0x00` present tag, then a **self-delimiting tagged-node tree** serialized
+depth-first (no outer length prefix — it walks itself, like array/range). Every node leads with a
+**one-byte tag** (low nibble = kind, high nibble = flags, reserved `0`): `0x0` null, `0x1` false,
+`0x2` true, `0x3` number (the **decimal value body** — `flags ‖ u16 scale ‖ u16 ndigits ‖ groups`),
+`0x4` string (an **unsigned LEB128 varint** byte-length ‖ UTF-8), `0x5` **`STRING_DICT`**
+(*reserved* — the dictionary door §3; a reader before the dictionary slice rejects it `XX001`), `0x6`
+array (varint count ‖ child bodies), `0x7` object (varint count ‖ members — each a string-node key
+‖ value node, in canonical key order: length-then-bytewise). A nonzero flag nibble or `STRING_DICT`
+is `XX001` data_corrupted. Numbers are exact `decimal` (never binary float); object keys are deduped
+last-wins then sorted at parse time, so the bytes are a pure function of the value. Both bodies are
+variable-length and ride the **large-value overflow + LZ4 path** like `text`/`bytea`. The goldens
+`json_table.jed` / `jsonb_table.jed` pin the bytes `rust == go == ts == ruby`. A reader accepts
+**only** version 19.
+
+`format_version` 18 was **reference-only collations** (the
 reference-only pivot, [../design/collation.md §2/§5/§9](../design/collation.md)). A referenced
 collation is a **kind-tagged catalog entry** (`entry_kind` 3 — the *Catalog* section below), emitted
 **after sequences and before tables** (*composites → sequences → collations → tables*), and it is now
@@ -30,8 +51,8 @@ collation** is the `is_default`-flagged entry (no separate header/meta field —
 **per-column collation** rides the column-entry **flags byte bit 6 `has_collation`**; when set, a
 trailing name (`u16` length + UTF-8) follows the default. A `C` (byte-order) column leaves the bit
 clear and writes nothing, so a non-collated table is byte-unchanged but for the version byte + meta
-CRC. A collation entry owns no B-tree. Each version is a **clean break** — older versions are **not read** (we are pre-1.0 and owe no
-on-disk compatibility; CLAUDE.md §1, "we own our surface"), so a reader accepts **only** version 17.
+CRC. A collation entry owns no B-tree. Each version is a **clean break** — older versions are **not read**
+(we are pre-1.0 and owe no on-disk compatibility; CLAUDE.md §1, "we own our surface").
 
 `format_version` 16 was **range columns**
 ([../design/ranges.md](../design/ranges.md)). A column type can be a **range** (`type_code` 17 —
@@ -594,8 +615,8 @@ Independent of any in-memory enum discriminant (which may be reordered):
 | 15 | array (a structural `T[]` — followed by the element type descriptor, **not** a fixed body; v10) |
 | 16 | `date` (a calendar date — i32 days since the Unix epoch, fixed 4-byte body; v12) |
 | 17 | range (a structural range over a scalar element — followed by the element type descriptor, **not** a fixed body; v16 — [../design/ranges.md](../design/ranges.md)) |
-| 18 | `json` (**RESERVED, not yet landed** — validated text stored verbatim, a `text`-shaped variable-length body; [../design/json.md §4](../design/json.md)) |
-| 19 | `jsonb` (**RESERVED, not yet landed** — a self-describing tagged-node tree body, **not** a fixed body; [../design/json.md §2](../design/json.md)) |
+| 18 | `json` (validated text stored verbatim, a `text`-shaped variable-length body; v19 — [../design/json.md §4](../design/json.md)) |
+| 19 | `jsonb` (a self-describing tagged-node tree body, **not** a fixed body; v19 — [../design/json.md §2](../design/json.md)) |
 | 20 | `jsonpath` (**RESERVED, not yet landed** — a compiled-path type stored as normalized source text, a `text`-shaped body; [../design/jsonpath.md §1](../design/jsonpath.md)) |
 
 > **Codes 18–20 are allocations reserved by the JSON design** ([../design/json.md](../design/json.md),

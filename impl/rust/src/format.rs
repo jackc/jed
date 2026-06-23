@@ -26,6 +26,7 @@ use crate::encoding::{decode_int, encode_nullable};
 use crate::error::{EngineError, Result, SqlState};
 use crate::executor::{Database, Snapshot};
 use crate::interval::Interval;
+use crate::json::JsonNode;
 use crate::pager::Pager;
 use crate::paging::SharedPaging;
 use crate::pmap::{Child, Node};
@@ -57,7 +58,15 @@ const MAGIC: [u8; 4] = *b"JEDB";
 /// expression-default flag; v7 added a per-page CRC-32 (header grew 12→16 bytes). Each bump is atomic
 /// across the Rust/Go/TS cores + the Ruby golden reference (every `.jed` golden's version byte + CRC
 /// changed together).
-const FORMAT_VERSION: u16 = 18;
+///
+/// v19 = **storable `json` / `jsonb` columns** (spec/design/json.md, slice J1/J1b): a column type
+/// can be `json` (type_code 18) or `jsonb` (type_code 19) — plain scalar catalog entries with no
+/// extra descriptor (the `has_jsonb_dict` door §3.2 stays clear, zero bytes). A `json` value's body
+/// is the verbatim text, length-prefixed like `text` (§4); a `jsonb` value's body is the
+/// self-delimiting tagged-node tree (§2 — node tags + LEB128 varint counts, numbers as the decimal
+/// body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no
+/// json/jsonb column still moves to v19 only by its version byte.
+const FORMAT_VERSION: u16 = 19;
 /// Bytes of the page header on catalog / B-tree / overflow pages (v7): the 12-byte v6 header
 /// (`page_type`, `item_count`, `next_page`) plus a 4-byte per-page `crc32` (offset 12).
 const PAGE_HEADER: usize = 16;
@@ -390,6 +399,168 @@ fn encode_composite_body(fields: &[ColField], vals: &[Value]) -> Vec<u8> {
     bitmap
 }
 
+// --- jsonb value codec (the tagged-node tree, spec/design/json.md §2) -------------------------
+//
+// A `jsonb` value's BODY (after the `0x00` present tag) is a self-delimiting depth-first
+// serialization of the canonical node tree: every node leads with a one-byte tag (low nibble =
+// kind, high nibble = flags, reserved 0). Like array/range, there is NO outer length prefix — the
+// tree walks itself, so a large `jsonb` body rides the large-value overflow + LZ4 path opaquely
+// (§2). The node tags are NTAG_* below; counts/string lengths are an unsigned LEB128 varint
+// (§2.2's single-byte examples). A `json` value's body is the text VERBATIM, length-prefixed
+// exactly like `text` (§4).
+
+const NTAG_NULL: u8 = 0x0;
+const NTAG_FALSE: u8 = 0x1;
+const NTAG_TRUE: u8 = 0x2;
+const NTAG_NUMBER: u8 = 0x3;
+const NTAG_STRING: u8 = 0x4;
+const NTAG_STRING_DICT: u8 = 0x5; // reserved — the dictionary door (§3); a reader rejects it XX001
+const NTAG_ARRAY: u8 = 0x6;
+const NTAG_OBJECT: u8 = 0x7;
+
+/// Append an unsigned LEB128 varint (7 bits/byte, high bit = continuation) — the count/length codec
+/// for the `jsonb` node bodies (spec/design/json.md §2.1).
+fn write_uvarint(out: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            out.push(byte);
+            return;
+        }
+        out.push(byte | 0x80);
+    }
+}
+
+/// Read an unsigned LEB128 varint (inverse of [`write_uvarint`]). `XX001` on a truncated or
+/// over-64-bit value.
+fn read_uvarint(buf: &[u8], pos: &mut usize) -> Result<u64> {
+    let mut result: u64 = 0;
+    let mut shift = 0u32;
+    loop {
+        let byte = read_u8(buf, pos)?;
+        if shift >= 64 || (shift == 63 && byte > 1) {
+            return Err(corrupt("jsonb varint overflows u64"));
+        }
+        result |= ((byte & 0x7f) as u64) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(result);
+        }
+        shift += 7;
+    }
+}
+
+/// A decimal value's BODY (no presence tag): `flags(sign) ‖ u16 scale ‖ u16 ndigits ‖ groups`
+/// (base-10⁴, MS-first) — the `NTAG_NUMBER` payload and the inverse of [`decode_decimal_body`].
+fn encode_decimal_body(d: &Decimal, out: &mut Vec<u8>) {
+    let (neg, scale, groups) = d.to_codec();
+    out.push(if neg { 1 } else { 0 });
+    out.extend_from_slice(&(scale as u16).to_be_bytes());
+    out.extend_from_slice(&(groups.len() as u16).to_be_bytes());
+    for g in groups {
+        out.extend_from_slice(&g.to_be_bytes());
+    }
+}
+
+/// Serialize a `jsonb` node tree into `out` (the body bytes — spec/design/json.md §2.1). Object
+/// members are already in canonical key order (the canonicalizer's invariant); each member's key is
+/// itself a string node (`NTAG_STRING`), so the dictionary door covers keys and values uniformly.
+fn encode_jsonb_body(node: &JsonNode, out: &mut Vec<u8>) {
+    match node {
+        JsonNode::Null => out.push(NTAG_NULL),
+        JsonNode::Bool(false) => out.push(NTAG_FALSE),
+        JsonNode::Bool(true) => out.push(NTAG_TRUE),
+        JsonNode::Number(d) => {
+            out.push(NTAG_NUMBER);
+            encode_decimal_body(d, out);
+        }
+        JsonNode::String(s) => {
+            out.push(NTAG_STRING);
+            write_uvarint(out, s.len() as u64);
+            out.extend_from_slice(s.as_bytes());
+        }
+        JsonNode::Array(elems) => {
+            out.push(NTAG_ARRAY);
+            write_uvarint(out, elems.len() as u64);
+            for e in elems {
+                encode_jsonb_body(e, out);
+            }
+        }
+        JsonNode::Object(members) => {
+            out.push(NTAG_OBJECT);
+            write_uvarint(out, members.len() as u64);
+            for (k, v) in members {
+                out.push(NTAG_STRING);
+                write_uvarint(out, k.len() as u64);
+                out.extend_from_slice(k.as_bytes());
+                encode_jsonb_body(v, out);
+            }
+        }
+    }
+}
+
+/// Deserialize a `jsonb` node from `buf` at `pos` (inverse of [`encode_jsonb_body`]). A nonzero
+/// flag nibble, the reserved `NTAG_STRING_DICT` (no dictionary slice yet), or an unknown kind is
+/// `XX001` data_corrupted (spec/design/json.md §3.1/§6.3).
+fn decode_jsonb_body(buf: &[u8], pos: &mut usize) -> Result<JsonNode> {
+    let tag = read_u8(buf, pos)?;
+    if tag & 0xf0 != 0 {
+        return Err(corrupt("jsonb node tag has a reserved flag bit set"));
+    }
+    match tag & 0x0f {
+        x if x == NTAG_NULL => Ok(JsonNode::Null),
+        x if x == NTAG_FALSE => Ok(JsonNode::Bool(false)),
+        x if x == NTAG_TRUE => Ok(JsonNode::Bool(true)),
+        x if x == NTAG_NUMBER => match decode_decimal_body(buf, pos)? {
+            Value::Decimal(d) => Ok(JsonNode::Number(d)),
+            _ => unreachable!("decode_decimal_body returns a decimal"),
+        },
+        x if x == NTAG_STRING => Ok(JsonNode::String(decode_jsonb_string(buf, pos)?)),
+        x if x == NTAG_STRING_DICT => Err(corrupt(
+            "jsonb string-dictionary reference before the dictionary slice",
+        )),
+        x if x == NTAG_ARRAY => {
+            let count = read_uvarint(buf, pos)? as usize;
+            let mut elems = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                elems.push(decode_jsonb_body(buf, pos)?);
+            }
+            Ok(JsonNode::Array(elems))
+        }
+        x if x == NTAG_OBJECT => {
+            let count = read_uvarint(buf, pos)? as usize;
+            let mut members = Vec::with_capacity(count.min(1024));
+            for _ in 0..count {
+                // Each member's key is a string node (NTAG_STRING / reserved NTAG_STRING_DICT).
+                let ktag = read_u8(buf, pos)?;
+                if ktag & 0xf0 != 0 {
+                    return Err(corrupt("jsonb object key tag has a reserved flag bit set"));
+                }
+                let key = match ktag & 0x0f {
+                    x if x == NTAG_STRING => decode_jsonb_string(buf, pos)?,
+                    x if x == NTAG_STRING_DICT => {
+                        return Err(corrupt(
+                            "jsonb string-dictionary reference before the dictionary slice",
+                        ));
+                    }
+                    _ => return Err(corrupt("jsonb object key is not a string node")),
+                };
+                let val = decode_jsonb_body(buf, pos)?;
+                members.push((key, val));
+            }
+            Ok(JsonNode::Object(members))
+        }
+        _ => Err(corrupt("unknown jsonb node tag")),
+    }
+}
+
+/// Read a `NTAG_STRING` payload (`varint len ‖ UTF-8 bytes`) after its tag has been consumed.
+fn decode_jsonb_string(buf: &[u8], pos: &mut usize) -> Result<String> {
+    let len = read_uvarint(buf, pos)? as usize;
+    let bytes = take(buf, pos, len)?.to_vec();
+    String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 jsonb string"))
+}
+
 /// The scalar value codec (the body of [`encode_value`] for a `ColType::Scalar`).
 fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
     match v {
@@ -491,12 +662,20 @@ fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
         Value::Array(_) => panic!("BUG: an array value reached the scalar codec"),
         // A range value is not storable yet (R2 adds the range codec); it never reaches here.
         Value::Range(_) => panic!("BUG: a range value reached the scalar codec (R2)"),
-        // json/jsonb columns are not storable until J1 (gated 0A000 at CREATE TABLE in J0), so a
-        // json/jsonb value never reaches the codec this slice; J1 adds the §2/§4 bodies here.
-        Value::Json(_) | Value::Jsonb(_) => {
-            panic!(
-                "BUG: a json/jsonb value reached the scalar codec (J0 has no json/jsonb columns)"
-            )
+        // json: the verbatim text body, length-prefixed exactly like `text` (spec/design/json.md §4).
+        Value::Json(s) => {
+            let bytes = s.as_bytes();
+            let mut out = Vec::with_capacity(3 + bytes.len());
+            out.push(0x00); // present
+            out.extend_from_slice(&(bytes.len() as u16).to_be_bytes());
+            out.extend_from_slice(bytes);
+            out
+        }
+        // jsonb: present tag, then the self-delimiting tagged-node tree (spec/design/json.md §2).
+        Value::Jsonb(n) => {
+            let mut out = vec![0x00]; // present
+            encode_jsonb_body(n, &mut out);
+            out
         }
     }
 }
@@ -508,7 +687,11 @@ fn encode_scalar(ty: ScalarType, v: &Value) -> Vec<u8> {
 /// (spec/design/composite.md §4); a small composite is never actually chosen by the plan.
 fn is_spillable(ty: &ColType) -> bool {
     match ty {
-        ColType::Scalar(s) => s.is_text() || s.is_bytea() || s.is_decimal(),
+        // json/jsonb are variable-length document bodies that ride the same overflow + LZ4 path
+        // as text/bytea when a record exceeds RECORD_MAX (spec/design/json.md §2/§4).
+        ColType::Scalar(s) => {
+            s.is_text() || s.is_bytea() || s.is_decimal() || s.is_json() || s.is_jsonb()
+        }
         ColType::Composite { .. } => true,
         // An array's opaque inline body spills via the same overflow + LZ4 path
         // (spec/design/array.md §4); a small array is never actually chosen by the plan.
@@ -754,6 +937,14 @@ fn value_payload(ty: &ColType, v: &Value) -> Vec<u8> {
     match (ty, v) {
         (ColType::Scalar(_), Value::Text(s)) => s.as_bytes().to_vec(),
         (ColType::Scalar(_), Value::Bytea(b)) => b.clone(),
+        // json's payload is the verbatim UTF-8 (no length prefix — the chain tracks its own length,
+        // exactly like text); jsonb's payload is the tagged-node tree body (spec/design/json.md §4/§2).
+        (ColType::Scalar(_), Value::Json(s)) => s.as_bytes().to_vec(),
+        (ColType::Scalar(_), Value::Jsonb(n)) => {
+            let mut out = Vec::new();
+            encode_jsonb_body(n, &mut out);
+            out
+        }
         // The decimal inline body is the encoding minus its leading presence tag.
         (ColType::Scalar(s), Value::Decimal(_)) => encode_scalar(*s, v)[1..].to_vec(),
         // A composite's payload is its body — the encoding minus the leading presence tag, i.e.
@@ -780,6 +971,15 @@ fn value_from_payload(ty: &ColType, payload: &[u8]) -> Result<Value> {
             Ok(Value::Text(str))
         }
         ColType::Scalar(s) if s.is_bytea() => Ok(Value::Bytea(payload.to_vec())),
+        ColType::Scalar(s) if s.is_json() => {
+            let str =
+                String::from_utf8(payload.to_vec()).map_err(|_| corrupt("non-UTF-8 json value"))?;
+            Ok(Value::Json(str))
+        }
+        ColType::Scalar(s) if s.is_jsonb() => {
+            let mut pos = 0usize;
+            Ok(Value::Jsonb(decode_jsonb_body(payload, &mut pos)?))
+        }
         ColType::Scalar(s) if s.is_decimal() => {
             let mut pos = 0usize;
             decode_decimal_body(payload, &mut pos)
@@ -2923,6 +3123,15 @@ fn read_inline_scalar(ty: ScalarType, buf: &[u8], pos: &mut usize) -> Result<Val
         let len = read_u16(buf, pos)? as usize;
         let bytes = take(buf, pos, len)?.to_vec();
         Ok(Value::Bytea(bytes))
+    } else if ty.is_json() {
+        // json: verbatim text, length-prefixed exactly like text (spec/design/json.md §4).
+        let len = read_u16(buf, pos)? as usize;
+        let bytes = take(buf, pos, len)?.to_vec();
+        let s = String::from_utf8(bytes).map_err(|_| corrupt("non-UTF-8 json value"))?;
+        Ok(Value::Json(s))
+    } else if ty.is_jsonb() {
+        // jsonb: the self-delimiting tagged-node tree (spec/design/json.md §2).
+        Ok(Value::Jsonb(decode_jsonb_body(buf, pos)?))
     } else if ty.is_uuid() {
         // Fixed 16 raw bytes, no length prefix (must branch before the integer path —
         // decode_int would sign-flip and width_bytes is 16 there too).

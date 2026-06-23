@@ -496,6 +496,11 @@ var SupportedCapabilities = []string{
 	// the '…'::json / '…'::jsonb literal cast + jsonb_out canonicalization. No storable column yet
 	// (a json/jsonb column is 0A000 until J1).
 	"types.jsonb_literal",
+	// Storable jsonb column (J1) — canonical tagged-node value body (type_code 19), format_version
+	// 19, golden jsonb_table.jed; a bare string literal adapts; spills via the large-value path.
+	"types.jsonb",
+	// Storable json column (J1b) — verbatim text value body (type_code 18), golden json_table.jed.
+	"types.json",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

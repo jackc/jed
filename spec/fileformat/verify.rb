@@ -14,7 +14,13 @@
 # Exit 0 = all fixtures conform; nonzero = mismatch (prints the offending case).
 
 MAGIC = "JEDB".b
-VERSION = 18 # format_version 18: reference-only collations — the catalog entry_kind 3 collation
+VERSION = 19 # format_version 19: storable json/jsonb columns (spec/design/json.md, J1/J1b) — a
+# column type can be json (type_code 18) or jsonb (type_code 19), both plain scalar catalog entries
+# with NO extra descriptor (like text/uuid). A json value's body is the verbatim text, length-prefixed
+# like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + LEB128
+# varint counts, a number is the decimal body), riding the large-value overflow + LZ4 path. No catalog
+# shape change, so a file with no json/jsonb column moves to v19 only by its version byte.
+# format_version 18: reference-only collations — the catalog entry_kind 3 collation
 # entry is now METADATA ONLY (a flags byte bit0 is_default; then name + unicode_version +
 # cldr_version + description, each u16-len + UTF-8), emitted after sequences and before tables. The
 # compiled table is NOT in the file — it is vendored into the binary and resolved by name on open
@@ -81,7 +87,7 @@ WIDTH = { "i16" => 2, "i32" => 4, "i64" => 8, "timestamp" => 8, "timestamptz" =>
           "date" => 4 }.freeze
 TYPECODE = { "i16" => 1, "i32" => 2, "i64" => 3, "text" => 4, "boolean" => 5, "decimal" => 6,
              "bytea" => 7, "uuid" => 8, "timestamp" => 9, "timestamptz" => 10, "interval" => 11,
-             "f64" => 12, "f32" => 13, "date" => 16 }.freeze
+             "f64" => 12, "f32" => 13, "date" => 16, "json" => 18, "jsonb" => 19 }.freeze
 CODETYPE = TYPECODE.invert.freeze
 
 # An array (T[]) column type is the element type's string with a trailing "[]" (spec/design/array.md
@@ -636,6 +642,37 @@ RANGE_PK_TABLE = {
          [{ lower: 2, upper: nil, lower_inc: true, upper_inc: false }, 5]]    # [2,)
 }.freeze
 
+# A table with a json column (v19 — spec/design/json.md §4): pins the catalog json-column entry
+# (type_code 18, a plain scalar — no extra descriptor) and the VERBATIM text body, length-prefixed
+# exactly like text. The stored bytes are the input text exactly (whitespace + key order preserved).
+# The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, j json)
+#   INSERT (1, '{"a": 1}'); (2, '[1, 2, 3]'); (3, NULL)
+JSON_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("j", "json")],
+  rows: [[1, '{"a": 1}'],
+         [2, "[1, 2, 3]"],
+         [3, nil]]
+}.freeze
+
+# A table with a jsonb column (v19 — spec/design/json.md §2): pins the catalog jsonb-column entry
+# (type_code 19, a plain scalar — no extra descriptor) and the self-delimiting tagged-node value
+# body. The rows exercise every node tag: row 1 an OBJECT (canonical key order a,b) with a NUMBER and
+# a nested ARRAY of a boolean TRUE + JSON NULL; row 2 a bare STRING; row 3 a bare NUMBER; row 4 a SQL
+# NULL (the lone 0x01 tag, distinct from a JSON null node). The fixture jsonb value is the
+# pre-canonicalized tagged node tree. The cores build this via
+#   CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)
+#   INSERT (1, '{"a": 1, "b": [true, null]}'); (2, '"hello"'); (3, '42'); (4, NULL)
+JSONB_TABLE = {
+  name: "t",
+  columns: [col("id", "i32", pk: true), col("j", "jsonb")],
+  rows: [[1, [:obj, [["a", [:num, "1"]], ["b", [:arr, [[:bool, true], [:null]]]]]]],
+         [2, [:str, "hello"]],
+         [3, [:num, "42"]],
+         [4, nil]]
+}.freeze
+
 # A table with a GIN inverted index (v13 — spec/design/gin.md): pins the per-index index_kind byte
 # (0 = ordered B-tree, 1 = GIN) and a GIN index tree (entries are encode(element)‖storage-key, empty
 # payload — §4). `i_nums_gin` is a USING gin index over an i32[] column; `i_n` is an ordinary
@@ -940,6 +977,8 @@ FIXTURES = [
   { file: "array_table.jed", page_size: 256, tables: [ARRAY_TABLE] },
   { file: "range_table.jed", page_size: 256, tables: [RANGE_TABLE] },
   { file: "range_pk_table.jed", page_size: 256, tables: [RANGE_PK_TABLE] },
+  { file: "json_table.jed", page_size: 256, tables: [JSON_TABLE] },
+  { file: "jsonb_table.jed", page_size: 256, tables: [JSONB_TABLE] },
   { file: "composite_type_table.jed", page_size: 256,
     types: COMPOSITE_TYPE_TABLE[:types], tables: COMPOSITE_TYPE_TABLE[:tables] },
   { file: "array_composite_table.jed", page_size: 256,
@@ -1167,9 +1206,14 @@ def encode_value(type, v)
   end
 
   case type
-  when "text", "bytea"
+  when "text", "bytea", "json"
+    # json stores the verbatim text body, length-prefixed exactly like text (spec/design/json.md §4).
     bytes = v.b
     "\x00".b + u16(bytes.bytesize) + bytes
+  when "jsonb"
+    # jsonb stores the present tag then the self-delimiting tagged-node tree (§2). The fixture value
+    # is a pre-canonicalized node (tagged Ruby form — see encode_jsonb_body).
+    "\x00".b + encode_jsonb_body(v)
   when "boolean"
     "\x00".b + (v ? "\x01".b : "\x00".b)
   when "decimal"
@@ -1246,6 +1290,54 @@ def encode_range_body(elem_type, val)
   out << encode_value(elem_type, val[:lower]).byteslice(1..) unless val[:lower].nil?
   out << encode_value(elem_type, val[:upper]).byteslice(1..) unless val[:upper].nil?
   out
+end
+
+# An unsigned LEB128 varint (7 bits/byte, high bit = continuation) — the jsonb count/length codec
+# (spec/design/json.md §2.1).
+def write_uvarint(v)
+  out = +"".b
+  loop do
+    byte = v & 0x7f
+    v >>= 7
+    if v.zero?
+      out << [byte].pack("C")
+      return out
+    end
+    out << [byte | 0x80].pack("C")
+  end
+end
+
+# A jsonb value's BODY (after the 0x00 present tag, spec/design/json.md §2.1): a self-delimiting
+# depth-first tagged-node tree. The fixture node is a tagged Ruby form: [:null], [:bool, b],
+# [:num, "canonical-decimal-string"], [:str, s], [:arr, [node, …]], [:obj, [[key, node], …]]
+# (members ALREADY in canonical key order). Node tags (low nibble): 0 null, 1 false, 2 true,
+# 3 number (the decimal body), 4 string (varint len ‖ utf8), 6 array (varint count ‖ children),
+# 7 object (varint count ‖ members, each a string-node key ‖ value node).
+def encode_jsonb_body(node)
+  case node[0]
+  when :null then "\x00".b
+  when :bool then (node[1] ? "\x02".b : "\x01".b)
+  when :num then "\x03".b + encode_decimal(node[1])
+  when :str
+    s = node[1].b
+    "\x04".b + write_uvarint(s.bytesize) + s
+  when :arr
+    out = +"\x06".b
+    out << write_uvarint(node[1].size)
+    node[1].each { |child| out << encode_jsonb_body(child) }
+    out
+  when :obj
+    out = +"\x07".b
+    out << write_uvarint(node[1].size)
+    node[1].each do |key, child|
+      kb = key.b
+      out << "\x04".b << write_uvarint(kb.bytesize) << kb
+      out << encode_jsonb_body(child)
+    end
+    out
+  else
+    raise "bad jsonb node #{node.inspect}"
+  end
 end
 
 # An array column's ELEMENT-TYPE descriptor (spec/design/array.md §3): the element's type code,
@@ -2232,6 +2324,8 @@ def value_from_payload(type, payload)
   case type
   when "text" then payload.dup.force_encoding("UTF-8")
   when "bytea" then payload.dup.force_encoding("ASCII-8BIT")
+  when "json" then payload.dup.force_encoding("UTF-8")
+  when "jsonb" then decode_jsonb_body(payload, 0).first
   when "decimal" then decode_decimal_body(payload, 0).first
   else raise "a non-spillable type was stored external"
   end
@@ -2321,6 +2415,12 @@ def decode_value(type, buf, pos, fetch = nil)
   when "uuid"
     ub, pos = take(buf, pos, 16) # fixed 16 bytes, no length prefix
     [uuid_from_bytes(ub), pos]
+  when "json"
+    len, pos = take(buf, pos, 2) # verbatim text, length-prefixed like text (spec/design/json.md §4)
+    sb, pos = take(buf, pos, len.unpack1("n"))
+    [sb.dup.force_encoding("UTF-8"), pos]
+  when "jsonb"
+    decode_jsonb_body(buf, pos) # the self-delimiting tagged-node tree (§2)
   when "interval"
     mb, pos = take(buf, pos, 4)
     db, pos = take(buf, pos, 4)
@@ -2336,6 +2436,72 @@ def decode_value(type, buf, pos, fetch = nil)
     vb, pos = take(buf, pos, WIDTH.fetch(type))
     [decode_int(WIDTH.fetch(type), vb), pos]
   end
+end
+
+# Read an unsigned LEB128 varint (inverse of write_uvarint, spec/design/json.md §2.1) -> [value, pos].
+def read_uvarint(buf, pos)
+  result = 0
+  shift = 0
+  loop do
+    b, pos = take(buf, pos, 1)
+    byte = b.getbyte(0)
+    result |= (byte & 0x7f) << shift
+    return [result, pos] if (byte & 0x80).zero?
+
+    shift += 7
+    raise "jsonb varint overflows u64" if shift >= 64
+  end
+end
+
+# Decode a jsonb node body (inverse of encode_jsonb_body, spec/design/json.md §2.1) into the tagged
+# Ruby form -> [node, pos]. A nonzero flag nibble or the reserved NTAG_STRING_DICT (0x5) is data
+# corruption (XX001 in the cores). Numbers decode to [:num, rendered-decimal-string].
+def decode_jsonb_body(buf, pos)
+  tb, pos = take(buf, pos, 1)
+  tag = tb.getbyte(0)
+  raise "jsonb node tag has a reserved flag bit set" if (tag & 0xf0) != 0
+
+  case tag & 0x0f
+  when 0x0 then [[:null], pos]
+  when 0x1 then [[:bool, false], pos]
+  when 0x2 then [[:bool, true], pos]
+  when 0x3
+    dec, pos = decode_decimal_body(buf, pos)
+    [[:num, dec], pos]
+  when 0x4
+    s, pos = read_jsonb_string(buf, pos)
+    [[:str, s], pos]
+  when 0x5 then raise "jsonb string-dictionary reference before the dictionary slice"
+  when 0x6
+    count, pos = read_uvarint(buf, pos)
+    elems = []
+    count.times do
+      node, pos = decode_jsonb_body(buf, pos)
+      elems << node
+    end
+    [[:arr, elems], pos]
+  when 0x7
+    count, pos = read_uvarint(buf, pos)
+    members = []
+    count.times do
+      ktb, pos = take(buf, pos, 1)
+      ktag = ktb.getbyte(0)
+      raise "jsonb object key is not a string node" unless (ktag & 0x0f) == 0x4 && (ktag & 0xf0).zero?
+
+      key, pos = read_jsonb_string(buf, pos)
+      val, pos = decode_jsonb_body(buf, pos)
+      members << [key, val]
+    end
+    [[:obj, members], pos]
+  else raise "unknown jsonb node tag"
+  end
+end
+
+# Read a NTAG_STRING payload (varint len ‖ utf8) after its tag -> [string, pos].
+def read_jsonb_string(buf, pos)
+  len, pos = read_uvarint(buf, pos)
+  sb, pos = take(buf, pos, len)
+  [sb.dup.force_encoding("UTF-8"), pos]
 end
 
 # Decode an array value body (inverse of encode_array_body, spec/design/array.md §4): ndim u8 ‖

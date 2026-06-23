@@ -54,6 +54,8 @@ import {
   isInterval,
   isDate,
   isUuid,
+  isJson,
+  isJsonb,
   rangeT,
   scalarT,
   typeScalar,
@@ -79,9 +81,12 @@ import {
   timestampValue,
   timestamptzValue,
   uuidValue,
+  jsonValue,
+  jsonbValue,
 } from "./value.ts";
+import type { JsonNode } from "./json.ts";
 
-const FORMAT_VERSION = 18; // on-disk format version (18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
+const FORMAT_VERSION = 19; // on-disk format version (19 = storable json/jsonb columns — spec/design/json.md, slice J1/J1b: a column type can be json (type_code 18) or jsonb (type_code 19), plain scalar catalog entries with no extra descriptor (the has_jsonb_dict door §3.2 stays clear, zero bytes). A json value's body is the verbatim text, length-prefixed like text (§4); a jsonb value's body is the self-delimiting tagged-node tree (§2 — node tags + unsigned LEB128 varint counts, numbers as the decimal body), riding the large-value overflow + LZ4 path. No catalog-shape change, so a file with no json/jsonb column moves to v19 only by its version byte. 18 = reference-only collations: the catalog entry_kind 3 collation entry is metadata ONLY — a flags byte bit0 is_default, then name + unicodeVersion + cldrVersion + description (each u16-len + UTF-8) — emitted after sequences and before tables; the compiled table is NOT in the file, it is vendored into the binary and resolved by name on open, spec/design/collation.md §2/§5/§9. This supersedes v17's baked snapshot (the LZ4-compressed .coll artifact is gone). The per-column collation is unchanged (column flags byte bit6 has_collation + a trailing name). 17 = baked collations (superseded). 16 = range columns: a column type can be a range — type_code 17 + an inline element-type descriptor, one scalar code, spec/design/ranges.md §3 — and a range value is a flags byte (EMPTY/LB_INF/UB_INF/LB_INC/UB_INC) followed by the present bound bodies, §4). 15 = IDENTITY columns: the column-entry flags byte gains bit4 is_identity + bit5 identity_always; an identity column desugars like serial plus those two bits, spec/design/sequences.md §13. 14 = the serial owned-sequence link: the sequence-entry flags byte gains a has_owner bit + a trailing owner table-name/column-ordinal, spec/design/sequences.md §12. 13 = GIN inverted indexes: each catalog index entry gains a one-byte index_kind (0 = ordered B-tree, 1 = GIN) between index_flags and index_root_page, spec/design/gin.md. 12 = sequences: a kind-2 catalog entry — name + six big-endian i64 fields + a flags byte — emitted after composite-type (kind 1) entries and before table (kind 0) entries, spec/design/sequences.md §3, plus the date scalar. 11 = FOREIGN KEY constraints: a per-table catalog foreign-key list after the index list, spec/design/constraints.md §6. 10 = array (T[]) columns: type_code 15 + an element-type descriptor in the catalog, spec/design/array.md §3, and the compact array value body, §4; 9 = composite (row) types; 8 = per-column expression-default flag; 7 = per-page crc32. Each bump is atomic across Rust/Go/TS + the Ruby golden reference (every .jed golden's version byte + CRC changed together).
 const PAGE_HEADER = 16; // bytes of the catalog/B-tree/overflow page header (v7: 12-byte v6 header + a 4-byte per-page crc32 at offset 12)
 const INTERIOR_RESERVE = 12; // bytes reserved inside RECORD_MAX for a two-key interior node's 3 child pointers (4·3) — independent of PAGE_HEADER (format.md "Why the record cap")
 const PAGE_CATALOG = 1; // page_type for a catalog page
@@ -402,6 +407,198 @@ function encodeCompositeBody(fields: ColField[], vals: Value[]): Uint8Array {
   return concat([bitmap, ...bodies]);
 }
 
+// --- jsonb value codec (the tagged-node tree, spec/design/json.md §2) -------------------------
+//
+// A `jsonb` value's BODY (after the 0x00 present tag) is a self-delimiting depth-first
+// serialization of the canonical node tree: every node leads with a one-byte tag (low nibble =
+// kind, high nibble = flags, reserved 0). Like array/range, there is NO outer length prefix — the
+// tree walks itself, so a large `jsonb` body rides the large-value overflow + LZ4 path opaquely
+// (§2). The node tags are NTAG_* below; counts/string lengths are an unsigned LEB128 varint
+// (§2.2). A `json` value's body is the text VERBATIM, length-prefixed exactly like `text` (§4).
+//
+// TS hazards (CLAUDE.md §2): string lengths in the varint are UTF-8 BYTE lengths (a JS string is
+// UTF-16), so a string node measures + writes its TextEncoder bytes and reads UTF-8 back; JSON
+// numbers are the exact Decimal (the decimal body), never a JS number.
+
+const NTAG_NULL = 0x0;
+const NTAG_FALSE = 0x1;
+const NTAG_TRUE = 0x2;
+const NTAG_NUMBER = 0x3;
+const NTAG_STRING = 0x4;
+const NTAG_STRING_DICT = 0x5; // reserved — the dictionary door (§3); a reader rejects it XX001
+const NTAG_ARRAY = 0x6;
+const NTAG_OBJECT = 0x7;
+
+// writeUvarint appends an unsigned LEB128 varint (7 bits/byte, high bit = continuation) — the
+// count/length codec for the jsonb node bodies (spec/design/json.md §2.1). `v` is a non-negative
+// safe integer (a byte count within a page-bounded record); the loop shifts by /128 (not >>>, which
+// is 32-bit in JS) so it stays exact for the whole safe-integer range.
+function writeUvarint(out: number[], v: number): void {
+  for (;;) {
+    const byte = v % 0x80;
+    v = Math.floor(v / 0x80);
+    if (v === 0) {
+      out.push(byte);
+      return;
+    }
+    out.push(byte | 0x80);
+  }
+}
+
+// readUvarint reads an unsigned LEB128 varint (inverse of writeUvarint). XX001 on a truncated or
+// over-53-bit value (a jsonb count this large cannot fit a page-bounded record). Accumulates with
+// `+ byte*mul` (mul = 128^shift) so it stays exact past 32 bits.
+function readUvarint(buf: Uint8Array, cur: Cursor): number {
+  let result = 0;
+  let mul = 1;
+  for (;;) {
+    const byte = readU8(buf, cur);
+    result += (byte & 0x7f) * mul;
+    if (!Number.isSafeInteger(result)) {
+      throw engineError("data_corrupted", "jsonb varint overflows a safe integer");
+    }
+    if ((byte & 0x80) === 0) return result;
+    mul *= 0x80;
+  }
+}
+
+// encodeDecimalBody appends a decimal value's BODY (no presence tag): flags(sign) ‖ u16 scale ‖ u16
+// ndigits ‖ groups (base-10⁴, MS-first) — the NTAG_NUMBER payload and the inverse of
+// decodeDecimalBody. Byte-identical to encodeScalar's decimal arm minus the leading present tag.
+function encodeDecimalBody(d: Decimal, out: number[]): void {
+  const [neg, scale, groups] = d.toCodec();
+  out.push(neg ? 1 : 0);
+  out.push((scale >>> 8) & 0xff, scale & 0xff);
+  out.push((groups.length >>> 8) & 0xff, groups.length & 0xff);
+  for (const g of groups) out.push((g >>> 8) & 0xff, g & 0xff);
+}
+
+// encodeJsonbBody serializes a jsonb node tree into `out` (the body bytes — spec/design/json.md
+// §2.1). Object members are already in canonical key order (the canonicalizer's invariant); each
+// member's key is itself a string node (NTAG_STRING), so the dictionary door covers keys and values
+// uniformly. String lengths are UTF-8 byte lengths (the TS hazard).
+function encodeJsonbBody(node: JsonNode, out: number[]): void {
+  switch (node.kind) {
+    case "null":
+      out.push(NTAG_NULL);
+      return;
+    case "bool":
+      out.push(node.value ? NTAG_TRUE : NTAG_FALSE);
+      return;
+    case "number":
+      out.push(NTAG_NUMBER);
+      encodeDecimalBody(node.dec, out);
+      return;
+    case "string": {
+      out.push(NTAG_STRING);
+      const bytes = UTF8.encode(node.value);
+      writeUvarint(out, bytes.length);
+      for (const b of bytes) out.push(b);
+      return;
+    }
+    case "array":
+      out.push(NTAG_ARRAY);
+      writeUvarint(out, node.elements.length);
+      for (const e of node.elements) encodeJsonbBody(e, out);
+      return;
+    case "object":
+      out.push(NTAG_OBJECT);
+      writeUvarint(out, node.members.length);
+      for (const m of node.members) {
+        out.push(NTAG_STRING);
+        const kbytes = UTF8.encode(m.key);
+        writeUvarint(out, kbytes.length);
+        for (const b of kbytes) out.push(b);
+        encodeJsonbBody(m.value, out);
+      }
+      return;
+  }
+}
+
+// jsonbBodyBytes returns the encoded body of a jsonb node as a Uint8Array (encodeJsonbBody over a
+// fresh accumulator).
+function jsonbBodyBytes(node: JsonNode): Uint8Array {
+  const out: number[] = [];
+  encodeJsonbBody(node, out);
+  return Uint8Array.from(out);
+}
+
+// decodeJsonbBody deserializes a jsonb node from `buf` at `cur` (inverse of encodeJsonbBody). A
+// nonzero flag nibble, the reserved NTAG_STRING_DICT (no dictionary slice yet), or an unknown kind
+// is XX001 data_corrupted (spec/design/json.md §3.1/§6.3).
+function decodeJsonbBody(buf: Uint8Array, cur: Cursor): JsonNode {
+  const tag = readU8(buf, cur);
+  if ((tag & 0xf0) !== 0) {
+    throw engineError("data_corrupted", "jsonb node tag has a reserved flag bit set");
+  }
+  switch (tag & 0x0f) {
+    case NTAG_NULL:
+      return { kind: "null" };
+    case NTAG_FALSE:
+      return { kind: "bool", value: false };
+    case NTAG_TRUE:
+      return { kind: "bool", value: true };
+    case NTAG_NUMBER: {
+      const v = decodeDecimalBody(buf, cur);
+      if (v.kind !== "decimal")
+        throw engineError("data_corrupted", "jsonb number is not a decimal");
+      return { kind: "number", dec: v.dec };
+    }
+    case NTAG_STRING:
+      return { kind: "string", value: decodeJsonbString(buf, cur) };
+    case NTAG_STRING_DICT:
+      throw engineError(
+        "data_corrupted",
+        "jsonb string-dictionary reference before the dictionary slice",
+      );
+    case NTAG_ARRAY: {
+      const count = readUvarint(buf, cur);
+      const elements: JsonNode[] = [];
+      for (let i = 0; i < count; i++) elements.push(decodeJsonbBody(buf, cur));
+      return { kind: "array", elements };
+    }
+    case NTAG_OBJECT: {
+      const count = readUvarint(buf, cur);
+      const members: { key: string; value: JsonNode }[] = [];
+      for (let i = 0; i < count; i++) {
+        // Each member's key is a string node (NTAG_STRING / reserved NTAG_STRING_DICT).
+        const ktag = readU8(buf, cur);
+        if ((ktag & 0xf0) !== 0) {
+          throw engineError("data_corrupted", "jsonb object key tag has a reserved flag bit set");
+        }
+        const k = ktag & 0x0f;
+        if (k === NTAG_STRING_DICT) {
+          throw engineError(
+            "data_corrupted",
+            "jsonb string-dictionary reference before the dictionary slice",
+          );
+        }
+        if (k !== NTAG_STRING) {
+          throw engineError("data_corrupted", "jsonb object key is not a string node");
+        }
+        const key = decodeJsonbString(buf, cur);
+        const value = decodeJsonbBody(buf, cur);
+        members.push({ key, value });
+      }
+      return { kind: "object", members };
+    }
+    default:
+      throw engineError("data_corrupted", "unknown jsonb node tag");
+  }
+}
+
+// decodeJsonbString reads a NTAG_STRING payload (varint len ‖ UTF-8 bytes) after its tag has been
+// consumed. Decodes UTF-8 BYTES (not UTF-16 units) back to a JS string; non-UTF-8 is XX001.
+function decodeJsonbString(buf: Uint8Array, cur: Cursor): string {
+  const len = readUvarint(buf, cur);
+  const bytes = take(buf, cur, len);
+  try {
+    return UTF8_DECODE.decode(bytes);
+  } catch {
+    throw engineError("data_corrupted", "non-UTF-8 jsonb string");
+  }
+}
+
 // encodeScalar is the scalar value codec (the body of encodeValue for a scalar ColType). A 1-byte
 // presence tag (0x01 = NULL), then the type's present-value body. Integers reuse the order-preserving
 // key encoding; text is where the seam diverges — a stored text value needs no ordering, so it is a
@@ -508,12 +705,23 @@ function encodeScalar(ty: ScalarType, v: Value): Uint8Array {
     else dv.setFloat32(1, v.value, false); // big-endian
     return out;
   }
-  if (v.kind === "json" || v.kind === "jsonb") {
-    // json/jsonb columns are not storable until J1 (gated 0A000 at CREATE TABLE in J0), so a
-    // json/jsonb value never reaches the codec this slice; J1 adds the §2/§4 bodies here.
-    throw new Error(
-      "BUG: a json/jsonb value reached the scalar codec (J0 has no json/jsonb columns)",
-    );
+  if (v.kind === "json") {
+    // json: the verbatim text body, length-prefixed exactly like text (spec/design/json.md §4).
+    const bytes = UTF8.encode(v.text);
+    const out = new Uint8Array(3 + bytes.length);
+    out[0] = 0x00; // present
+    out[1] = (bytes.length >>> 8) & 0xff;
+    out[2] = bytes.length & 0xff;
+    out.set(bytes, 3);
+    return out;
+  }
+  if (v.kind === "jsonb") {
+    // jsonb: present tag, then the self-delimiting tagged-node tree (spec/design/json.md §2).
+    const body = jsonbBodyBytes(v.node);
+    const out = new Uint8Array(1 + body.length);
+    out[0] = 0x00; // present
+    out.set(body, 1);
+    return out;
   }
   if (v.kind !== "int") throw engineError("data_corrupted", "cannot store a non-integer value");
   return encodeNullable(ty, v.int);
@@ -572,7 +780,9 @@ function isSpillable(ty: ColType): boolean {
   // bounds) is never actually chosen by the plan (spec/design/ranges.md §4).
   if (ty.kind === "range") return true;
   const s = ty.scalar;
-  return isText(s) || isBytea(s) || s === "decimal";
+  // json/jsonb are variable-length document bodies that ride the same overflow + LZ4 path as
+  // text/bytea when a record exceeds RECORD_MAX (spec/design/json.md §2/§4).
+  return isText(s) || isBytea(s) || s === "decimal" || isJson(s) || isJsonb(s);
 }
 
 // recordMaxFor is the largest a single record may serialize to and still satisfy the B-tree split
@@ -771,6 +981,10 @@ function valuePayload(ty: ColType, v: Value): Uint8Array {
   if (ty.kind === "range" && v.kind === "range") return encodeRangeBody(ty.elem, v);
   if (v.kind === "text") return UTF8.encode(v.text);
   if (v.kind === "bytea") return v.bytes;
+  // json's payload is the verbatim UTF-8 (no length prefix — the chain tracks its own length,
+  // exactly like text); jsonb's payload is the tagged-node tree body (spec/design/json.md §4/§2).
+  if (v.kind === "json") return UTF8.encode(v.text);
+  if (v.kind === "jsonb") return jsonbBodyBytes(v.node);
   if (v.kind === "decimal" && ty.kind === "scalar") return encodeScalar(ty.scalar, v).subarray(1); // strip the presence tag
   throw engineError("data_corrupted", "only spillable values are externalized");
 }
@@ -800,6 +1014,14 @@ function valueFromPayload(ty: ColType, payload: Uint8Array): Value {
     }
   }
   if (isBytea(s)) return byteaValue(payload.slice());
+  if (isJson(s)) {
+    try {
+      return jsonValue(UTF8_DECODE.decode(payload));
+    } catch {
+      throw engineError("data_corrupted", "non-UTF-8 json value");
+    }
+  }
+  if (isJsonb(s)) return jsonbValue(decodeJsonbBody(payload, { pos: 0 }));
   if (s === "decimal") return decodeDecimalBody(payload, { pos: 0 });
   throw engineError("data_corrupted", "a non-spillable type was stored external");
 }
@@ -2800,6 +3022,20 @@ function readInlineScalar(ty: ScalarType, buf: Uint8Array, cur: Cursor): Value {
     const n = readU16(buf, cur);
     // .slice() copies out of the page buffer so the value owns its bytes (no UTF-8 check).
     return byteaValue(take(buf, cur, n).slice());
+  }
+  if (isJson(ty)) {
+    // json: verbatim text, length-prefixed exactly like text (spec/design/json.md §4).
+    const n = readU16(buf, cur);
+    const bytes = take(buf, cur, n);
+    try {
+      return jsonValue(UTF8_DECODE.decode(bytes));
+    } catch {
+      throw engineError("data_corrupted", "non-UTF-8 json value");
+    }
+  }
+  if (isJsonb(ty)) {
+    // jsonb: the self-delimiting tagged-node tree (spec/design/json.md §2).
+    return jsonbValue(decodeJsonbBody(buf, cur));
   }
   if (isUuid(ty)) {
     // Fixed 16 raw bytes, no length prefix. Must branch before the integer path —

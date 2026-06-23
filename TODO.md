@@ -312,8 +312,13 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         then sorted length-then-bytewise, one space after `:`/`,`); `json` stores verbatim. Comparator
         + render front-loaded for J2. All three cores, capability `types.jsonb_literal`, oracle-clean,
         NO format bump (v18). → json.md §12
-  - [ ] **J1 / J1b** — storable `jsonb` column (tagged-node value codec, format bump, spill/compress,
-        golden `jsonb_table.jed`); then storable `json` (verbatim text body, golden `json_table.jed`).
+  - [x] **J1 / J1b** — ✅ storable `jsonb` column (the §2 tagged-node value codec — node tags + LEB128
+        varint counts + the decimal number body, `type_code` 19) and storable `json` (verbatim text body,
+        `type_code` 18), at **`format_version` 18→19** (the one JSON format bump). Both ride the large-value
+        overflow + LZ4 spill path; a bare string literal adapts to the column. Goldens `jsonb_table.jed` /
+        `json_table.jed` byte-identical `rust == go == ts == ruby`. A jsonb/json `PRIMARY KEY`/index/`UNIQUE`
+        is `0A000` (the order-preserving jsonb key authored but unexercised — encoding.md §2.13; per-core
+        divergence tests). All three cores, capabilities `types.jsonb` / `types.json`, oracle-clean. → json.md §2/§4/§11
   - [ ] **J2** — `jsonb` comparison/ordering (PG btree order; `ORDER BY`/`DISTINCT`/`GROUP BY`);
         `json` non-comparable (`42883`). → json.md §5
   - [ ] **J3** — casts (`json↔jsonb`, `json`/`jsonb`→`text`, runtime `text`→`json`/`jsonb`). → json.md §6

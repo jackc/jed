@@ -171,8 +171,6 @@ import {
   typeIsDate,
   typeIsInterval,
   typeIsRange,
-  typeIsJson,
-  typeIsJsonb,
   typeIsUuid,
   typeAsScalar,
   typeScalar,
@@ -2739,17 +2737,9 @@ export class Database {
       } else {
         throw engineError("undefined_object", "type does not exist: " + def.typeName);
       }
-      // J0: the json/jsonb types exist for literals/casts but a storable COLUMN is deferred to J1
-      // (the format bump + value codec) — spec/design/json.md §12. Mirrors the array S0→S2 and
-      // composite S2→column staging.
-      if (typeIsJson(colType) || typeIsJsonb(colType)) {
-        throw engineError(
-          "feature_not_supported",
-          "a " +
-            typeCanonicalName(colType) +
-            " column is not yet supported (json/jsonb is literal-only this slice)",
-        );
-      }
+      // J1: json/jsonb columns are storable (the format-v19 value codec — spec/design/json.md §2/§4).
+      // A json/jsonb PRIMARY KEY is still rejected 0A000 by the key-encodability gate below (PG ships
+      // no json btree opclass; jsonb-as-key is a deferred §11 follow-on).
       if (def.primaryKey) {
         // Integers, boolean, and uuid may be a key. uuid is the first non-integer key type (fixed
         // uuid-raw16, spec/design/encoding.md §2.7) and boolean the second (fixed 1-byte bool-byte,

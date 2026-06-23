@@ -197,6 +197,32 @@ func rangePKTableDB(t *testing.T) *Database {
 	return db
 }
 
+// jsonTableDB has a json column (verbatim text body, type_code 18 — spec/design/json.md §4). The
+// stored bytes are the input text exactly (whitespace/key-order preserved), so this pins the
+// length-prefixed text-shaped json body. Pins json_table.jed cross-core.
+func jsonTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j json)")
+	run(t, db, "INSERT INTO t VALUES (1, '{\"a\": 1}')")
+	run(t, db, "INSERT INTO t VALUES (2, '[1, 2, 3]')")
+	run(t, db, "INSERT INTO t VALUES (3, NULL)")
+	return db
+}
+
+// jsonbTableDB has a jsonb column (the canonical tagged-node tree, type_code 19 —
+// spec/design/json.md §2). The rows exercise every node tag: an object (ntagObject) with a number
+// (ntagNumber), a nested array (ntagArray) of a boolean (ntagTrue) and JSON null (ntagNull); a bare
+// string (ntagString); a bare number; and a SQL NULL. Pins jsonb_table.jed.
+func jsonbTableDB(t *testing.T) *Database {
+	db := WithPageSize(goldenPageSize)
+	run(t, db, "CREATE TABLE t (id i32 PRIMARY KEY, j jsonb)")
+	run(t, db, "INSERT INTO t VALUES (1, '{\"a\": 1, \"b\": [true, null]}')")
+	run(t, db, "INSERT INTO t VALUES (2, '\"hello\"')")
+	run(t, db, "INSERT INTO t VALUES (3, '42')")
+	run(t, db, "INSERT INTO t VALUES (4, NULL)")
+	return db
+}
+
 // ginArrayTableDB has a GIN inverted index (v13 — the per-index index_kind byte, spec/design/gin.md):
 // i_nums_gin over an i32[] column (kind 1) beside an ordinary ordered index i_n over a scalar
 // column (kind 0 — a btree index cannot sit on the array column). Rows exercise term dedup (row 2's
@@ -775,6 +801,8 @@ func TestWriteMatchesGoldens(t *testing.T) {
 		{"identity_table.jed", identityTableDB},
 		{"collation_table.jed", collationTableDB},
 		{"collation_pk_table.jed", collationPKTableDB},
+		{"json_table.jed", jsonTableDB},
+		{"jsonb_table.jed", jsonbTableDB},
 		{"tall_tree.jed", tallTreeDB},
 	}
 	for _, c := range cases {
@@ -839,6 +867,8 @@ func TestReadGoldensReproducesRows(t *testing.T) {
 		{"identity_table.jed", identityTableDB, "t"},
 		{"collation_table.jed", collationTableDB, "t"},
 		{"collation_pk_table.jed", collationPKTableDB, "t"},
+		{"json_table.jed", jsonTableDB, "t"},
+		{"jsonb_table.jed", jsonbTableDB, "t"},
 		{"tall_tree.jed", tallTreeDB, "t"},
 		{"torn_meta_slot0.jed", pkTableDB, "t"},
 		{"torn_meta_slot1.jed", pkTableDB, "t"},

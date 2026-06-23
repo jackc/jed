@@ -3406,13 +3406,6 @@ func (db *Database) executeCreateTable(ct *CreateTable) (Outcome, error) {
 		} else {
 			return Outcome{}, NewError(UndefinedObject, "type does not exist: "+def.TypeName)
 		}
-		// J0: the json/jsonb types exist for literals/casts but a storable COLUMN is deferred to J1
-		// (the format bump + value codec) — spec/design/json.md §12. Mirrors the array S0→S2 and
-		// composite S2→column staging.
-		if colType.IsJson() || colType.IsJsonb() {
-			return Outcome{}, NewError(FeatureNotSupported,
-				"a "+colType.CanonicalName()+" column is not yet supported (json/jsonb is literal-only this slice)")
-		}
 		if def.PrimaryKey {
 			// The key-encodable scalars may be a PRIMARY KEY. The fixed-width ones — integers,
 			// boolean (bool-byte §2.9), uuid (uuid-raw16 §2.7), timestamp/timestamptz (i64
