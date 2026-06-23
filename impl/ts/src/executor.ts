@@ -11680,11 +11680,10 @@ function resolveWindowDef(
       const cn = scope.columnAt(idx).collation;
       if (cn !== null) collation = resolveCollationName(scope.catalog, cn);
     }
-    // A non-C collated window ORDER BY is deferred in S0 (the window stage's per-partition sort is
-    // the plain comparator) — 0A000, a documented narrowing (spec/design/window.md §11).
-    if (collation !== null) {
-      throw engineError("feature_not_supported", "collated window ORDER BY is not supported yet");
-    }
+    // A collated window ORDER BY honors the collation both in the per-partition sort and in peer
+    // determination (ranking, RANGE/GROUPS frames) — the window stage decorates each row's collated
+    // keys once and compares those everywhere (window.md §3/§5). COLLATE "C" resolves to null and
+    // stays on the raw-byte fast path.
     const slot = groupedWindowSlot(idx, grouped, groupKeys, key.column);
     order.push({ idx: slot, descending: key.descending, nullsFirst: key.nullsFirst, collation });
     orderTypes.push(scope.columnAt(idx).type);
@@ -19624,7 +19623,12 @@ class FrameCtx {
   private readonly groupOf: number[];
   private readonly groupSpans: Array<[number, number]>;
 
-  constructor(ordered: number[], rows: Row[], order: OrderSlot[]) {
+  constructor(
+    ordered: number[],
+    rows: Row[],
+    order: OrderSlot[],
+    collKeys: (Uint8Array | null)[][] | null,
+  ) {
     this.ordered = ordered;
     this.rows = rows;
     this.order = order;
@@ -19633,7 +19637,7 @@ class FrameCtx {
     const groupSpans: Array<[number, number]> = [];
     let s = 0;
     for (let pos = 1; pos < np; pos++) {
-      if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[ordered[s]!]!, order) !== 0) {
+      if (cmpWindowRows(ordered[pos]!, ordered[s]!, rows, order, collKeys) !== 0) {
         groupSpans.push([s, pos]);
         s = pos;
       }
@@ -19895,6 +19899,10 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
       }
       partitions[pi]!.push(i);
     }
+    // Precompute each row's collated UCA sort-key bytes for the spec's collated ORDER BY slots (if
+    // any), so the partition sort AND peer determination honor the collation identically (window.md
+    // §3/§5). null when no key is collated; an unmapped code point throws 0A000 here.
+    const collKeys = windowCollKeys(rows, spec.order);
     // Compute each row's result into a per-row slot, then append in input order.
     const results: Value[] = new Array(n).fill(nullValue());
     for (const part of partitions) {
@@ -19902,7 +19910,7 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
       // tie keeps ascending original index = PK scan order (the §3 PK tie-break).
       const ordered = part.slice();
       if (spec.order.length > 0) {
-        ordered.sort((a, b) => cmpRowsByOrder(rows[a]!, rows[b]!, spec.order));
+        ordered.sort((a, b) => cmpWindowRows(a, b, rows, spec.order, collKeys));
       }
       switch (spec.plan) {
         case "rowNumber":
@@ -19925,7 +19933,7 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
           const groups: Array<[number, number]> = []; // peer-group spans [start, end)
           let s = 0;
           for (let pos = 1; pos < np; pos++) {
-            if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[ordered[s]!]!, spec.order) !== 0) {
+            if (cmpWindowRows(ordered[pos]!, ordered[s]!, rows, spec.order, collKeys) !== 0) {
               groups.push([s, pos]);
               s = pos;
             }
@@ -20055,7 +20063,7 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
             const groups: Array<[number, number]> = []; // peer-group spans [start, end)
             let s = 0;
             for (let pos = 1; pos < np; pos++) {
-              if (cmpRowsByOrder(rows[ordered[pos]!]!, rows[ordered[s]!]!, spec.order) !== 0) {
+              if (cmpWindowRows(ordered[pos]!, ordered[s]!, rows, spec.order, collKeys) !== 0) {
                 groups.push([s, pos]);
                 s = pos;
               }
@@ -20085,7 +20093,7 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
             // EXPLICIT frame (window.md §6): fold each row's frame fresh — naive O(partition²),
             // the metered windowFrameStep bounding it. EXCLUDE rows are dropped before folding
             // (so they are neither metered nor counted).
-            const ctx = new FrameCtx(ordered, rows, spec.order);
+            const ctx = new FrameCtx(ordered, rows, spec.order, collKeys);
             const exclude = spec.frame?.exclude ?? "noOthers";
             for (let pos = 0; pos < np; pos++) {
               const [lo, hi] = ctx.bounds(pos, spec.frame);
@@ -20132,7 +20140,7 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
               }
             }
           }
-          const ctx = new FrameCtx(ordered, rows, spec.order);
+          const ctx = new FrameCtx(ordered, rows, spec.order, collKeys);
           const exclude = spec.frame?.exclude ?? "noOthers";
           for (let pos = 0; pos < np; pos++) {
             meter.guard();
@@ -20194,6 +20202,60 @@ function sortRows(rows: Row[], order: OrderSlot[]): void {
 function cmpRowsByOrder(a: Row, b: Row, order: OrderSlot[]): number {
   for (const k of order) {
     const c = keyCmp(a[k.idx]!, b[k.idx]!, k.descending, k.nullsFirst);
+    if (c !== 0) return c;
+  }
+  return 0;
+}
+
+// windowCollKeys precomputes each row's collated UCA sort-key bytes for the spec's collated ORDER BY
+// slots (if any), indexed in parallel with rows, so the partition sort AND peer determination
+// (ranking, frame peer groups) honor the collation identically (window.md §3/§5). Returns null when no
+// key is collated. An unmapped code point throws 0A000 here, at this deterministic per-row point.
+function windowCollKeys(rows: Row[], order: OrderSlot[]): (Uint8Array | null)[][] | null {
+  if (!order.some((k) => k.collation !== null)) return null;
+  return rows.map((row) => {
+    const keys: (Uint8Array | null)[] = [];
+    for (const k of order) {
+      if (k.collation === null) continue;
+      const v = row[k.idx]!;
+      keys.push(v.kind === "text" ? collationSortKey(k.collation, v.text) : null);
+    }
+    return keys;
+  });
+}
+
+// cmpWindowRows compares two rows of the window buffer (by their index a/b into the full row array) by
+// the window ORDER BY keys, honoring collation. A collated slot compares the precomputed UCA sort-key
+// bytes in collKeys (indexed in parallel with the rows; a null entry ⇒ a NULL value, NULL placement +
+// the descending flip applied here, mirroring cmpDecorated); a non-collated slot compares the row
+// values via keyCmp. This one comparator drives the partition sort AND every peer determination
+// (ranking, the aggregate default frame, FrameCtx's peer groups), so a collated window orders, ranks,
+// and frames identically (window.md §3/§5). With no collated key, collKeys is null and this is
+// cmpRowsByOrder by index.
+function cmpWindowRows(
+  a: number,
+  b: number,
+  rows: Row[],
+  order: OrderSlot[],
+  collKeys: (Uint8Array | null)[][] | null,
+): number {
+  let ci = 0; // advances once per collated slot (keys stored in slot order)
+  for (const k of order) {
+    let c: number;
+    if (k.collation !== null) {
+      const ak = collKeys![a]![ci] ?? null;
+      const bk = collKeys![b]![ci] ?? null;
+      ci++;
+      if (ak === null && bk === null) c = 0;
+      else if (ak === null) c = k.nullsFirst ? -1 : 1;
+      else if (bk === null) c = k.nullsFirst ? 1 : -1;
+      else {
+        c = cmpBytes(ak, bk);
+        if (k.descending) c = -c;
+      }
+    } else {
+      c = keyCmp(rows[a]![k.idx]!, rows[b]![k.idx]!, k.descending, k.nullsFirst);
+    }
     if (c !== 0) return c;
   }
   return 0;

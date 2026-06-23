@@ -10,7 +10,7 @@
 > change the data/grammar and here in the same edit. PostgreSQL is the behavioral default
 > (CLAUDE.md §1); the deliberate divergences are the ledger in §10.
 
-> **Status: COMPLETE (S0–S9, all three cores).** Every function below is landed — row_number,
+> **Status: COMPLETE (S0–S10, all three cores).** Every function below is landed — row_number,
 > rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, the aggregates as window functions
 > (running + explicit `ROWS`/`RANGE`/`GROUPS` frames, including value-based `RANGE` offsets over an
 > integer or decimal ordering key, with `EXCLUDE CURRENT ROW`/`GROUP`/`TIES`/`NO OTHERS`),
@@ -19,7 +19,9 @@
 > inside a window argument (`sum(sum(x)) OVER ()`), and a window's column keys must be grouping
 > columns — and a window definition may **extend a named base window** (S9): `OVER (w ORDER BY …)`
 > and `WINDOW w2 AS (w …)` inherit the base's `PARTITION BY` (and its `ORDER BY` if any) and supply
-> their own frame (§5). The remaining `0A000` items — `RANGE` offsets over a float (divergence D3) /
+> their own frame (§5) — and a window `ORDER BY` **honors collation** (S10): a per-key `COLLATE` and a
+> text column's frozen implicit collation order text by the collation's UCA sort key, driving both the
+> per-partition sort and peer determination (§3/§5). The remaining `0A000` items — `RANGE` offsets over a float (divergence D3) /
 > timestamp / date ordering key (§6/§11), and **general-expression window keys** (an aggregate or
 > expression as a `PARTITION BY`/`ORDER BY` key, e.g. `ORDER BY sum(x)` — §11) — are deferred
 > follow-ons, not gaps.
@@ -89,6 +91,16 @@ cores in lockstep** (Rust + Go + TS), spec-first, with corpus entries + a capabi
    if the base has none, and the base must not carry a frame. A base that does not exist — including
    a self- or forward-reference within the `WINDOW` clause — is `42704`. Capability
    `query.window_base_extend`. (See §5 for the full merge contract.)
+10. **S10 — collated window `ORDER BY`.** A window `ORDER BY` key honors a per-key `COLLATE` and a
+   text column's **frozen implicit collation** (the same `sort_key` production and vendored collations
+   as the query `ORDER BY`), ordering text by the collation's UCA sort key; `COLLATE "C"` and an
+   uncollated key keep raw-byte / code-point order. The collation drives **both** the per-partition
+   sort **and** peer determination — ranking peer groups, the running aggregate default frame, and
+   `RANGE`/`GROUPS` frame peer groups (§3/§5) — so a collated window orders, ranks, and frames
+   identically cross-core. Because the vendored collations are **deterministic** (collated-equality is
+   byte-identity, [collation.md](collation.md) §7), collated peer groups coincide with byte-equal
+   groups; only the order changes. `COLLATE` on a non-text key is `42804` (the query `ORDER BY` rule).
+   Capability `query.window_collation`.
 
 Locked scope decisions: **the within-partition order is always fully resolved** (§3,
 deterministic — a divergence-adjacent strictness, §10); **`percent_rank`/`cume_dist` →
@@ -143,7 +155,9 @@ A `window_definition` is `[name] [PARTITION BY …] [ORDER BY …] [frame]`
   whole (post-group) result is one partition.
 - **`ORDER BY`** orders rows *within* each partition. It is the same `sort_key` production as the
   query `ORDER BY` (per-key `ASC`/`DESC`, `NULLS FIRST|LAST`, `COLLATE`), narrowed in S0 to
-  columns.
+  columns. A `COLLATE` and a text column's frozen implicit collation are **honored** (S10): text
+  orders by the collation's UCA sort key, both in the sort and in peer determination (§5.2);
+  `COLLATE "C"` / an uncollated key keep raw-byte order, and `COLLATE` on a non-text key is `42804`.
 - **The frame** (§6) — deferred to S4; S0–S3 use the implicit default.
 
 **The resolved within-partition order (the determinism rule).** A window function's per-row
@@ -254,6 +268,12 @@ A blocking stage between projection/aggregation and `DISTINCT`/`ORDER BY`:
    the buffer (value-canonical keys, an insertion-ordered partition list — §3), and **sort** each
    partition by `order_keys` with the PK tie-break. In S0–S4 each `WindowSpec` may do its own
    pass; S5 shares one pass across specs with an identical definition (the optimization).
+   When an `order_key` is **collated** (S10), the spec's collated UCA sort-key bytes are decorated
+   **once per row up front** (the query `ORDER BY`'s decorate-sort pattern; an unmapped code point is
+   `0A000` at that deterministic per-row point), and one collation-aware comparator drives the sort
+   **and** every peer determination below — ranking peer groups, the running aggregate default frame,
+   and `RANGE`/`GROUPS` frame peer groups — so the collation never diverges between ordering and
+   peering. The sort and partition stay **unmetered** (§8); collation adds no cost unit here.
 3. For each spec, walk each partition in resolved order and write the per-row result into the
    spec's synthetic slot:
    - **`RowNumber`** → 1-based sequence position.

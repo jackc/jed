@@ -15844,14 +15844,10 @@ fn resolve_window_def(
                 None => None,
             },
         };
-        // A non-`C` collated window ORDER BY is deferred in S0 (the window stage's per-partition
-        // sort is the plain comparator) — 0A000, a documented narrowing (spec/design/window.md §11).
-        if coll.is_some() {
-            return Err(EngineError::new(
-                SqlState::FeatureNotSupported,
-                "collated window ORDER BY is not supported yet",
-            ));
-        }
+        // A collated window ORDER BY honors the collation both in the per-partition sort and in
+        // peer determination (ranking, RANGE/GROUPS frames) — the window stage decorates each row's
+        // collated keys once and compares those everywhere (window.md §3/§5). `COLLATE "C"` resolves
+        // to `None` and stays on the raw-byte fast path.
         let slot = grouped_window_slot(idx, group_keys, &key.column)?;
         order.push((slot, key.descending, key.nulls_first, coll));
         order_types.push(scope.column_of(r).ty.clone());
@@ -24159,12 +24155,17 @@ struct FrameCtx<'a> {
 }
 
 impl<'a> FrameCtx<'a> {
-    fn new(ordered: &'a [usize], rows: &'a [Row], order: &'a [crate::spill::SortKey]) -> Self {
+    fn new(
+        ordered: &'a [usize],
+        rows: &'a [Row],
+        order: &'a [crate::spill::SortKey],
+        coll_keys: &'a [Vec<Option<Vec<u8>>>],
+    ) -> Self {
         let np = ordered.len();
         let mut group_spans: Vec<(usize, usize)> = Vec::new();
         let mut s = 0usize;
         for pos in 1..np {
-            if cmp_rows_by_order(&rows[ordered[pos]], &rows[ordered[s]], order)
+            if cmp_window_rows(ordered[pos], ordered[s], rows, order, coll_keys)
                 != std::cmp::Ordering::Equal
             {
                 group_spans.push((s, pos));
@@ -24439,6 +24440,30 @@ fn apply_window_stage(
             };
             partitions[pi].push(i);
         }
+        // Precompute each row's collated UCA sort-key bytes for the spec's collated ORDER BY slots
+        // (if any), indexed in parallel with `rows`, so the partition sort AND peer determination
+        // (ranking, frame peer groups) honor the collation identically (window.md §3/§5). Built once
+        // per spec (the decorate pattern); an unmapped code point fails 0A000 at this deterministic
+        // per-row point. With no collated key this is empty and the comparator stays on raw bytes.
+        let coll_keys: Vec<Vec<Option<Vec<u8>>>> =
+            if spec.order.iter().any(|(_, _, _, c)| c.is_some()) {
+                let mut all = Vec::with_capacity(n);
+                for row in rows.iter() {
+                    let mut keys = Vec::new();
+                    for (idx, _, _, coll) in &spec.order {
+                        if let Some(c) = coll {
+                            keys.push(match &row[*idx] {
+                                Value::Text(s) => Some(collation::sort_key(c, s)?),
+                                _ => None, // NULL (a collated slot is text) — handled by placement
+                            });
+                        }
+                    }
+                    all.push(keys);
+                }
+                all
+            } else {
+                Vec::new()
+            };
         // Compute each row's result into a per-row slot, then append in input order.
         let mut results: Vec<Value> = vec![Value::Null; n];
         for part in &partitions {
@@ -24446,7 +24471,7 @@ fn apply_window_stage(
             // so a full tie keeps ascending original index = PK scan order (the §3 PK tie-break).
             let mut ordered = part.clone();
             if !spec.order.is_empty() {
-                ordered.sort_by(|&a, &b| cmp_rows_by_order(&rows[a], &rows[b], &spec.order));
+                ordered.sort_by(|&a, &b| cmp_window_rows(a, b, rows, &spec.order, &coll_keys));
             }
             match spec.plan {
                 WindowPlan::RowNumber => {
@@ -24470,7 +24495,7 @@ fn apply_window_stage(
                     let mut groups: Vec<(usize, usize)> = Vec::new(); // peer-group spans [start, end)
                     let mut s = 0usize;
                     for pos in 1..np {
-                        if cmp_rows_by_order(&rows[ordered[pos]], &rows[ordered[s]], &spec.order)
+                        if cmp_window_rows(ordered[pos], ordered[s], rows, &spec.order, &coll_keys)
                             != std::cmp::Ordering::Equal
                         {
                             groups.push((s, pos));
@@ -24611,10 +24636,12 @@ fn apply_window_stage(
                         let mut groups: Vec<(usize, usize)> = Vec::new();
                         let mut s = 0usize;
                         for pos in 1..np {
-                            if cmp_rows_by_order(
-                                &rows[ordered[pos]],
-                                &rows[ordered[s]],
+                            if cmp_window_rows(
+                                ordered[pos],
+                                ordered[s],
+                                rows,
                                 &spec.order,
+                                &coll_keys,
                             ) != std::cmp::Ordering::Equal
                             {
                                 groups.push((s, pos));
@@ -24642,7 +24669,7 @@ fn apply_window_stage(
                         // EXPLICIT frame (window.md §6): fold each row's frame fresh — naive
                         // O(partition²), the metered `window_frame_step` bounding it. `EXCLUDE`
                         // rows are dropped before folding (so they are neither metered nor counted).
-                        let ctx = FrameCtx::new(&ordered, rows, &spec.order);
+                        let ctx = FrameCtx::new(&ordered, rows, &spec.order, &coll_keys);
                         let exclude = spec
                             .frame
                             .as_ref()
@@ -24688,7 +24715,7 @@ fn apply_window_stage(
                     } else {
                         Some(0) // unused for first/last
                     };
-                    let ctx = FrameCtx::new(&ordered, rows, &spec.order);
+                    let ctx = FrameCtx::new(&ordered, rows, &spec.order, &coll_keys);
                     let exclude = spec
                         .frame
                         .as_ref()
@@ -24737,6 +24764,59 @@ fn cmp_rows_by_order(a: &Row, b: &Row, order: &[crate::spill::SortKey]) -> std::
         }
     }
     std::cmp::Ordering::Equal
+}
+
+/// Compare two rows of the window buffer (by their index `a`/`b` into the full row slice) by the
+/// window ORDER BY keys, honoring collation. A collated slot compares the precomputed UCA sort-key
+/// bytes in `coll_keys` (indexed in parallel with the rows; NULL placement + the descending flip
+/// applied here, mirroring `cmp_decorated`); a non-collated slot compares the row values via
+/// `key_cmp`. This one comparator drives the partition sort AND every peer determination (ranking,
+/// the aggregate default frame, `FrameCtx`'s peer groups), so a collated window orders, ranks, and
+/// frames identically (window.md §3/§5). With no collated key, `coll_keys` is unused and this is
+/// `cmp_rows_by_order` by index.
+fn cmp_window_rows(
+    a: usize,
+    b: usize,
+    rows: &[Row],
+    order: &[crate::spill::SortKey],
+    coll_keys: &[Vec<Option<Vec<u8>>>],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    let mut ci = 0usize; // advances once per collated slot (keys stored in slot order)
+    for (idx, descending, nulls_first, coll) in order {
+        let ord = if coll.is_some() {
+            let ak = &coll_keys[a][ci];
+            let bk = &coll_keys[b][ci];
+            ci += 1;
+            match (ak, bk) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => {
+                    if *nulls_first {
+                        Ordering::Less
+                    } else {
+                        Ordering::Greater
+                    }
+                }
+                (Some(_), None) => {
+                    if *nulls_first {
+                        Ordering::Greater
+                    } else {
+                        Ordering::Less
+                    }
+                }
+                (Some(x), Some(y)) => {
+                    let base = x.cmp(y);
+                    if *descending { base.reverse() } else { base }
+                }
+            }
+        } else {
+            key_cmp(&rows[a][*idx], &rows[b][*idx], *descending, *nulls_first)
+        };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 /// Sort `rows` when at least one ORDER BY key is collated (spec/design/collation.md §6/§8).

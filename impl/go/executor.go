@@ -15063,11 +15063,10 @@ func resolveWindowDef(s *scope, wd *WindowDef, grouped bool, groupKeys []int) ([
 				return nil, nil, nil, err
 			}
 		}
-		// A non-C collated window ORDER BY is deferred in S0 (the window stage's per-partition sort
-		// is the plain comparator) — 0A000, a documented narrowing (spec/design/window.md §11).
-		if coll != nil {
-			return nil, nil, nil, NewError(FeatureNotSupported, "collated window ORDER BY is not supported yet")
-		}
+		// A collated window ORDER BY honors the collation both in the per-partition sort and in peer
+		// determination (ranking, RANGE/GROUPS frames) — the window stage decorates each row's
+		// collated keys once and compares those everywhere (window.md §3/§5). COLLATE "C" resolves to
+		// nil and stays on the raw-byte fast path.
 		slot, err := groupedWindowSlot(r.index, grouped, groupKeys, key.Column)
 		if err != nil {
 			return nil, nil, nil, err
@@ -21806,12 +21805,12 @@ type frameCtx struct {
 	groupSpans [][2]int
 }
 
-func newFrameCtx(ordered []int, rows []Row, order []orderSlot) *frameCtx {
+func newFrameCtx(ordered []int, rows []Row, order []orderSlot, collKeys [][][]byte) *frameCtx {
 	np := len(ordered)
 	var groupSpans [][2]int
 	s := 0
 	for pos := 1; pos < np; pos++ {
-		if cmpRowsByOrder(rows[ordered[pos]], rows[ordered[s]], order) != 0 {
+		if cmpWindowRows(ordered[pos], ordered[s], rows, order, collKeys) != 0 {
 			groupSpans = append(groupSpans, [2]int{s, pos})
 			s = pos
 		}
@@ -22151,6 +22150,13 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 			}
 			partitions[pi] = append(partitions[pi], i)
 		}
+		// Precompute each row's collated UCA sort-key bytes for the spec's collated ORDER BY slots (if
+		// any), so the partition sort AND peer determination honor the collation identically (window.md
+		// §3/§5). nil when no key is collated; an unmapped code point fails 0A000 here.
+		collKeys, err := windowCollKeys(rows, spec.order)
+		if err != nil {
+			return err
+		}
 		// Compute each row's result into a per-row slot, then append in input order.
 		results := make([]Value, n)
 		for i := range results {
@@ -22163,7 +22169,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 			if len(spec.order) > 0 {
 				ordered = append([]int(nil), part...)
 				sort.SliceStable(ordered, func(a, b int) bool {
-					return cmpRowsByOrder(rows[ordered[a]], rows[ordered[b]], spec.order) < 0
+					return cmpWindowRows(ordered[a], ordered[b], rows, spec.order, collKeys) < 0
 				})
 			}
 			switch spec.plan {
@@ -22186,7 +22192,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 				var groups []span
 				s := 0
 				for pos := 1; pos < np; pos++ {
-					if cmpRowsByOrder(rows[ordered[pos]], rows[ordered[s]], spec.order) != 0 {
+					if cmpWindowRows(ordered[pos], ordered[s], rows, spec.order, collKeys) != 0 {
 						groups = append(groups, span{s, pos})
 						s = pos
 					}
@@ -22349,7 +22355,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 					var groups []span
 					s := 0
 					for pos := 1; pos < np; pos++ {
-						if cmpRowsByOrder(rows[ordered[pos]], rows[ordered[s]], spec.order) != 0 {
+						if cmpWindowRows(ordered[pos], ordered[s], rows, spec.order, collKeys) != 0 {
 							groups = append(groups, span{s, pos})
 							s = pos
 						}
@@ -22389,7 +22395,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 					// EXPLICIT frame (window.md §6): fold each row's [lo, hi) fresh — naive
 					// O(partition²), the metered window_frame_step bounding it. EXCLUDE rows are
 					// dropped before folding (so they are neither metered nor counted).
-					ctx := newFrameCtx(ordered, rows, spec.order)
+					ctx := newFrameCtx(ordered, rows, spec.order, collKeys)
 					exclude := frameExclusion(spec.frame)
 					for pos := 0; pos < np; pos++ {
 						lo, hi, err := ctx.bounds(pos, spec.frame)
@@ -22449,7 +22455,7 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 						return NewError(InvalidArgumentForNthValue, "argument of nth_value must be greater than zero")
 					}
 				}
-				ctx := newFrameCtx(ordered, rows, spec.order)
+				ctx := newFrameCtx(ordered, rows, spec.order, collKeys)
 				exclude := frameExclusion(spec.frame)
 				for pos := 0; pos < np; pos++ {
 					if err := meter.Guard(); err != nil {
@@ -22509,6 +22515,89 @@ func applyWindowStage(rows []Row, specs []windowSpec, env *evalEnv, meter *Meter
 func cmpRowsByOrder[R ~[]Value](a, b R, order []orderSlot) int {
 	for _, k := range order {
 		if c := keyCmp(a[k.idx], b[k.idx], k.descending, k.nullsFirst); c != 0 {
+			return c
+		}
+	}
+	return 0
+}
+
+// windowCollKeys precomputes each row's collated UCA sort-key bytes for the spec's collated ORDER BY
+// slots (if any), indexed in parallel with rows, so the partition sort AND peer determination
+// (ranking, frame peer groups) honor the collation identically (window.md §3/§5). Returns nil when no
+// key is collated. An unmapped code point fails 0A000 here, at this deterministic per-row point.
+func windowCollKeys(rows []Row, order []orderSlot) ([][][]byte, error) {
+	collated := false
+	for _, k := range order {
+		if k.collation != nil {
+			collated = true
+			break
+		}
+	}
+	if !collated {
+		return nil, nil
+	}
+	all := make([][][]byte, len(rows))
+	for i, row := range rows {
+		var keys [][]byte
+		for _, k := range order {
+			if k.collation == nil {
+				continue
+			}
+			if row[k.idx].Kind == ValText {
+				sk, err := SortKey(k.collation, row[k.idx].Str)
+				if err != nil {
+					return nil, err
+				}
+				keys = append(keys, sk)
+			} else {
+				keys = append(keys, nil) // NULL (a collated slot is text) — handled by NULL placement
+			}
+		}
+		all[i] = keys
+	}
+	return all, nil
+}
+
+// cmpWindowRows compares two rows of the window buffer (by their index a/b into the full row slice) by
+// the window ORDER BY keys, honoring collation. A collated slot compares the precomputed UCA sort-key
+// bytes in collKeys (indexed in parallel with the rows; a nil entry ⇒ a NULL value, NULL placement +
+// the descending flip applied here, mirroring cmpDecorated); a non-collated slot compares the row
+// values via keyCmp. This one comparator drives the partition sort AND every peer determination
+// (ranking, the aggregate default frame, frameCtx's peer groups), so a collated window orders, ranks,
+// and frames identically (window.md §3/§5). With no collated key, collKeys is unused and this is
+// cmpRowsByOrder by index.
+func cmpWindowRows(a, b int, rows []Row, order []orderSlot, collKeys [][][]byte) int {
+	ci := 0 // advances once per collated slot (keys stored in slot order)
+	for _, k := range order {
+		var c int
+		if k.collation != nil {
+			ak, bk := collKeys[a][ci], collKeys[b][ci]
+			ci++
+			switch {
+			case ak == nil && bk == nil:
+				c = 0
+			case ak == nil:
+				if k.nullsFirst {
+					c = -1
+				} else {
+					c = 1
+				}
+			case bk == nil:
+				if k.nullsFirst {
+					c = 1
+				} else {
+					c = -1
+				}
+			default:
+				c = bytes.Compare(ak, bk)
+				if k.descending {
+					c = -c
+				}
+			}
+		} else {
+			c = keyCmp(rows[a][k.idx], rows[b][k.idx], k.descending, k.nullsFirst)
+		}
+		if c != 0 {
 			return c
 		}
 	}
