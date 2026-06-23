@@ -443,19 +443,18 @@ are follow-ons (§10/§11).
 
 ### 6.2 Session time zone
 
-The time zone is the one **built-in** session variable, `TimeZone` (`SET TIME ZONE …` /
-`time_zone` in `current_setting`), defaulting to **`UTC`**. The default is deliberately UTC, **not
-the host's local zone** — a fixed deterministic value (§6 above).
+The time zone is the one **built-in** session variable, `TimeZone`, defaulting to **`UTC`**. The
+default is deliberately UTC, **not the host's local zone** — a fixed deterministic value (§6 above).
 
-It is **forward-looking infrastructure.** The cast that consumes it — `timestamptz → date` /
-`timestamptz → text`, and `AT TIME ZONE` — is a deferred timestamp follow-on
-([TODO.md Phase 3](../../TODO.md); the `date`/`timestamp` slices left it explicit), and jed has no
-tz database yet. So v1 lands the **setting slot** (default `UTC`; accepting `UTC` and fixed
-numeric offsets like `+05:00`, rejecting named zones `0A000` until a tz database lands), exactly as
-the cost seam landed before its ceiling — and the type-cast slices consume it when they land. The
-`timestamptz→date` example in the original request is therefore *unblocked by* this slot but
-*delivered by* that later cast slice. Capability: `session.timezone`; corpus directive
-`# timezone: <zone>`.
+**Implemented** with the tz conversion slice ([timezones.md §9](timezones.md)): the slot is the zone a
+`timestamptz` is **decomposed in** by `date_trunc` / `EXTRACT` / the cross-family datetime casts. It is
+set through the **host API** (`set_time_zone` / `SessionOptions::time_zone` — Rust
+`Session::set_time_zone`, Go `SetTimeZone`, TS `setTimeZone`), **validated against the loaded zone set**
+(`UTC` and fixed numeric offsets like `+05:00` always; a **named** IANA zone now accepted when a loaded
+`JTZ` bundle provides it — else **`22023`**, lifting the earlier `0A000`-on-named narrowing), and stored
+as a resolved `ZoneRef`. There is **no SQL `SET TIME ZONE`** grammar yet (a follow-on), and the slot
+drives *computation*, not yet `timestamptz`-*rendering* (timezones.md §9.5). Capability:
+`session.timezone`; corpus directive `# timezone: <zone>`.
 
 ## 7. Errors
 
@@ -586,9 +585,10 @@ Not one slice — a sequence of vertical slices (CLAUDE.md §10), each independe
    `42704`-on-non-dotted, additional-session isolation, the no-rollback) is **per-core unit tested**.
    Reuses `42704` (no new error code); no on-disk format change (session state, never persisted). No
    grammar change (the SQL `SET`/`SHOW` surface is a §11 follow-on). Capability `session.variables`.
-6. **Session time zone slot** (§6.2) — the `time_zone` built-in (default `UTC`, offsets only),
-   the `# timezone:` directive. Capability `session.timezone`. (The consuming `timestamptz→date`
-   cast is a separate later type slice.)
+6. **Session time zone slot** (§6.2) — the `time_zone` built-in (default `UTC`; `UTC` + fixed offsets
+   + **named loaded zones**, `22023` otherwise), the `# timezone:` directive. Capability
+   `session.timezone`. The consumers (`date_trunc` / `EXTRACT` / cross-family casts) landed with the tz
+   conversion slice ([timezones.md §9](timezones.md)): the slot is the zone a `timestamptz` decomposes in.
 
 ## 11. Open / deferred (none foreclosed)
 

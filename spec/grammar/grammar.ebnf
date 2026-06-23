@@ -831,6 +831,7 @@ primary        ::= number
                  | parameter
                  | typed_literal
                  | "CAST" "(" expr "AS" type_name ")"
+                 | extract_expr
                  | case_expr
                  | function_call
                  | "EXISTS" "(" subquery_expr ")"
@@ -879,6 +880,19 @@ parameter      ::= "$" digit+
  * (../design/cost.md §3). CASE/WHEN/THEN/ELSE/END are not reserved (§3), disambiguated
  * positionally. */
 case_expr      ::= "CASE" expr? ( "WHEN" expr "THEN" expr )+ ( "ELSE" expr )? "END"
+
+/* EXTRACT(field FROM source) (../design/timezones.md §9.2, ../design/grammar.md §50) — the SQL
+ * special form for a single datetime field, equal to PostgreSQL's `extract(text, value)` but with
+ * the `field FROM source` syntax. The FIELD is SYNTACTIC — a bare identifier (`hour`) or a string
+ * literal (`'hour'`), case-insensitive — so it is validated at RESOLVE time (not per row): an
+ * unsupported field FOR THE SOURCE TYPE is 0A000 (e.g. `EXTRACT(hour FROM date)`), an unrecognized
+ * field is 22023. The SOURCE is any timestamp / timestamptz / date / interval expression; any other
+ * source type is 42883. The result is `numeric` (PG 14+). For a `timestamptz` source the field is
+ * computed in the SESSION zone (except `epoch`). `date_part('field', src)` (the function spelling)
+ * is DEFERRED — it returns `double precision` and jed has no `float` type (timezones.md §9.2).
+ * "EXTRACT" is recognized only when immediately followed by "(" (a one-token lookahead, §8), so it
+ * stays usable as a column / function name otherwise — like the typed_literal lookahead. */
+extract_expr   ::= "EXTRACT" "(" ( identifier | string ) "FROM" expr ")"
 
 /* The shared function-call syntax. A name resolves to an AGGREGATE function
  * (../functions/catalog.toml, kind = "aggregate" — COUNT/SUM/MIN/MAX/AVG) or a SCALAR

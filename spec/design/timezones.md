@@ -59,10 +59,16 @@ Time-zone support adds three things on top of the already-settled `timestamptz` 
    explicit zone argument, so this first slice does **not** depend on the session slot; the session-zone
    uses (rendering `timestamptz` as `text`, the bare `::date` cast) are part of the deferred surface (§9).
 
-What it deliberately does **not** add: any change to how `timestamptz` is *stored* or *compared* (§2),
-and the broader conversion surface — `date_trunc(unit, ts, zone)`, `timestamptz`↔`date`/`text` casts in
-a zone, `EXTRACT`, `make_timestamptz`, `to_char` (§9). Those land later, each oracle-checked against
-PostgreSQL.
+**Slice 2 adds the conversion surface** — `date_trunc` (incl. the 3-arg `date_trunc(unit, ts, zone)`),
+`EXTRACT`, and the cross-family `timestamp`/`timestamptz`/`date` casts in a zone (§9) — and with it makes
+the session `TimeZone` slot ([session.md §6.2](session.md)) observable: it is the zone a `timestamptz` is
+decomposed *in*. Each is oracle-checked against PostgreSQL.
+
+What it deliberately does **not** add: any change to how `timestamptz` is *stored* or *compared* (§2);
+the `text`↔datetime casts, `make_timestamptz`, `to_char`/`to_timestamp`, and `date_part` (§9, the
+deferred remainder); and the **session-zone rendering** of a `timestamptz` to text — the session zone
+drives *computation* this slice, not *output formatting* (§9.5). Those land later, each oracle-checked
+against PostgreSQL.
 
 ## 2. The representation — `timestamptz` is UTC, and that buys structural immunity
 
@@ -324,18 +330,119 @@ the silence — but only when there is something to track.
 
 ## 9. Function / operator surface
 
-**This slice (the single consumer):** `AT TIME ZONE` (both directions, §6).
+**Slice 1 (the first consumer):** `AT TIME ZONE` (both directions, §6).
+
+**Slice 2 — the conversion surface (LANDED, this revision):** `date_trunc`, `EXTRACT`, and the
+cross-family datetime casts, all consuming the session zone (§9.1–§9.4). This is the slice that turns
+the session `TimeZone` slot ([session.md §6.2](session.md)) from a stored string into observable
+behavior: a `timestamptz` decomposed into wall-clock components is decomposed **in the session zone**,
+exactly as PostgreSQL does. Each is oracle-checked against `postgres:18` (CLAUDE.md §7).
 
 **Already built** (clock seam, [entropy.md §5](entropy.md)): `now()` / `current_timestamp` (STABLE),
 `clock_timestamp()` (VOLATILE) → `timestamptz`.
 
-**Deferred, to land with later conversion slices** (each oracle-checked against PG, CLAUDE.md §7):
-`timestamptz`↔`timestamp`/`date`/`text` casts in a zone, `date_trunc(unit, ts[, zone])`,
-`EXTRACT`/`date_part`, `make_timestamptz`, `to_char`/`to_timestamp` (a larger, later surface), and the
-session-zone-driven rendering of `timestamptz` → `text`. All are **pure given the tz seam** (CLAUDE.md
-§13) — they read only the loaded tz data + the instant, never host state — so they stay inside the
-untrusted-query safety guarantee. The IMMUTABLE-vs-STABLE label of each is the §8 indexability decision,
-made when expression indexes land.
+**Still deferred** (each oracle-checked against PG when it lands, CLAUDE.md §7): the `text`↔datetime
+casts and `to_char` / `to_timestamp` (a parsing/formatting surface, a different axis from "in a zone"),
+`make_timestamptz`, `date_part` (it returns `double precision`, and jed has no binary `float` type —
+§9.2), `age`, and the **session-zone-driven rendering of `timestamptz` → `text`** (§9.5). All remain
+**pure given the tz seam** (CLAUDE.md §13) — they read only the loaded tz data + the instant, never host
+state — so they stay inside the untrusted-query safety guarantee. The IMMUTABLE-vs-STABLE label of each
+is the §8 indexability decision, made when expression indexes land.
+
+### 9.1 `date_trunc`
+
+`date_trunc(unit, source)` rounds a value **down** to the start of `unit`. `unit` is a `text` value
+(evaluated per row, case-insensitive); an unrecognized unit is **`22023`** (`invalid_parameter_value`),
+raised **at evaluation** like PG (so `date_trunc('nope', ts)` over zero rows raises nothing). Overloads:
+
+| Form | Returns | Zone |
+|---|---|---|
+| `date_trunc(unit, timestamp)` | `timestamp` | none — truncates the stored wall clock |
+| `date_trunc(unit, timestamptz)` | `timestamptz` | **the session zone** — truncates in it, returns the instant of that local boundary |
+| `date_trunc(unit, interval)` | `interval` | none |
+| `date_trunc(unit, timestamptz, zone)` | `timestamptz` | the **explicit** `zone` argument (3-arg form; an unknown zone is `22023`) |
+
+Units for `timestamp`/`timestamptz`: `microseconds`, `milliseconds`, `second`, `minute`, `hour`, `day`,
+`week` (back to Monday), `month`, `quarter`, `year`, `decade`, `century`, `millennium`. For `interval`
+the same units **except `week`** (`0A000`, matching PG); the year-group units (`decade`/`century`/
+`millennium`) truncate the months field to a multiple of 10/100/1000 years. A `date` argument is
+**`42883`** (no overload) — jed has no implicit `date`→`timestamp` cast (PG accepts it via that implicit
+cast; a documented divergence, cast explicitly with `::timestamp`). The session-zone form charges the
+`timezone` cost unit (§10); the zone-free forms do not.
+
+### 9.2 `EXTRACT`
+
+`EXTRACT(field FROM source)` returns the requested `field` of `source` as **`numeric`** (PG 14+ —
+matchable exactly; jed has exact `decimal`). The `field` is **syntactic** (an identifier or a string
+literal, case-insensitive — [grammar.md §50](grammar.md)), so it is validated at **resolve** time, not
+per row. `date_part('field', source)` is **deferred**: PG defines it to return `double precision`, and
+jed has no binary `float` type — supporting it would force a divergent return type.
+
+`source` may be `timestamp`, `timestamptz`, `date`, or `interval`. For `timestamptz` every field is
+computed **in the session zone** (so `hour`/`day`/… shift with it) **except `epoch`** (zone-independent
+— the instant itself) and the `timezone*` fields (the session zone's offset at that instant). The
+field-validity matrix matches PG exactly (`EXTRACT(hour FROM date)` → `0A000`, `EXTRACT(dow FROM
+interval)` → `0A000`, etc.):
+
+| field | timestamp / timestamptz | date | interval |
+|---|---|---|---|
+| `microseconds` `milliseconds` `second` `minute` `hour` | ✓ | `0A000` | ✓ |
+| `day` `month` `quarter` `year` `decade` `century` `millennium` `week` | ✓ | ✓ | ✓ |
+| `dow` `isodow` `doy` `isoyear` | ✓ | ✓ | `0A000` |
+| `epoch` | ✓ | ✓ | ✓ |
+| `timezone` `timezone_hour` `timezone_minute` | tstz ✓ / ts `0A000` | `0A000` | `0A000` |
+| `julian` | **`0A000` (deferred)** | **`0A000` (deferred)** | `0A000` |
+
+An unsupported field-for-type is **`0A000`** (`feature_not_supported`, PG's "unit X not supported for
+type Y"); an **unrecognized** field name is **`22023`** ("unit X not recognized"). `julian` is a
+**deferred** field on all types (PG supports it on date/timestamp; for timestamp it is a non-terminating
+decimal whose exact scale is PG-internal — a documented divergence, revisit if needed). Field formulas:
+`second`/`milliseconds`/`microseconds` carry the fractional seconds (exact decimal); `epoch` of an
+`interval` is `(months/12)·31557600 + (months%12)·2592000 + days·86400 + time` (PG's `365.25`-day year,
+`30`-day month — exact, since `365.25·86400 = 31557600` is integral); `century = (year−1)/100 + 1`,
+`decade = ⌊year/10⌋`, ISO `week`/`isoyear`/`isodow` per ISO-8601.
+
+### 9.3 Cross-family datetime casts
+
+The `timestamp`/`timestamptz`/`date` cross-family cast matrix (`spec/types/casts.toml`), the **"casts in
+a zone"** of CLAUDE.md §1. Every cast that crosses the `timestamptz` boundary consults the session zone;
+the others are zone-free:
+
+| Cast | Behavior |
+|---|---|
+| `timestamptz` → `timestamp` | render the instant as the local wall clock **in the session zone** (= `AT TIME ZONE session`) |
+| `timestamptz` → `date` | the date of that local wall clock (session zone) |
+| `timestamp` → `timestamptz` | interpret the wall clock **in the session zone** → the instant (= `AT TIME ZONE session`; DST gap/overlap resolved as PG, §6) |
+| `timestamp` → `date` | the date part (zone-free) |
+| `date` → `timestamp` | midnight (zone-free) |
+| `date` → `timestamptz` | midnight **in the session zone** → the instant |
+
+These reuse the §5 reader kernels (`instant_to_local_micros` / `local_to_instant_micros`) with the
+session zone, so they inherit `AT TIME ZONE`'s oracle-clean DST behavior. A session-zone-consulting cast
+charges the `timezone` unit. The **`text`↔datetime** casts stay deferred (§9, above). A string *literal*
+still adapts to a datetime context (`'2024-01-01'::timestamp`) by literal adaptation, unchanged.
+
+### 9.4 Where the session zone is read — eval, not render
+
+The session zone reaches evaluation through the active session (it is **session state**, swapped into
+the executing handle for the statement's duration), so `date_trunc(unit, timestamptz)`, `EXTRACT` of a
+`timestamptz`, and the `timestamptz`-crossing casts read it at their evaluation site (the deterministic,
+cross-core metering point — like `AT TIME ZONE`). They are never folded at resolve time (no constant
+folding evaluates them), so the zone is always the one in effect when the row is processed.
+
+### 9.5 Narrowing: the session zone drives *computation*, not yet *rendering*
+
+A deliberate, documented narrowing this slice (the deferred-rendering item above): the session zone
+governs how a `timestamptz` is **decomposed** (`date_trunc`/`EXTRACT`/casts), but a `timestamptz` **text
+output still renders in UTC** (the `+00` suffix), regardless of the session zone. PostgreSQL renders a
+`timestamptz` in the session zone; jed's value→text rendering is context-free today
+([value rendering](../../impl/rust/src/value.rs)) and threading the zone into it (recursively, through
+array/record output) is the separate **session-zone-rendering** follow-on. The exposure is contained:
+there is **no SQL `SET TIME ZONE`** yet (the slot is host-API-only — [session.md §6.2](session.md)), so
+only a host that deliberately calls `set_time_zone` sees it, and the value is the same instant either
+way. Tests exercise a `timestamptz`-producing operation under a non-UTC session by rendering it through
+`AT TIME ZONE 'UTC'` (a zone-free `timestamp`) or by checking a zone-free output type. (When rendering
+lands, this narrowing is lifted and the §9 text-cast surface comes with it.)
 
 ## 10. Untrusted-query safety, cost, and the determinism ledger
 
@@ -348,14 +455,16 @@ Identical posture to collation ([collation.md §11](collation.md)):
   jed's own pinned TZif bytes). So an untrusted query can only ever *use* an already-loaded zone by
   name, or get `22023` (§6). Using a zone is **pure** — an instant and loaded TZif bytes in, an
   `(offset, abbrev, dst)` out; no host reach, no I/O, no nondeterminism.
-- **Bounded cost.** `AT TIME ZONE` evaluation is metered by a new **`timezone`** cost unit (the
-  `collate` analogue, [collation.md §8](collation.md)), charged **per conversion** at the operator's
-  evaluation site — the deterministic, cross-core-identical metering point. A TZif lookup is a bounded
-  binary search (+ a bounded footer evaluation), so a query converting a large input is cost-ceilinged
-  like any other work ([cost.md](cost.md)). The unit is registered in
-  [../cost/schedule.toml](../cost/schedule.toml) when the slice's accrual site lands (kept in lockstep
-  with the hand-written accrual site, like every cost unit — CLAUDE.md §5); this doc specifies it, the
-  implementation slice adds the data row.
+- **Bounded cost.** A zone consultation is metered by the **`timezone`** cost unit (the `collate`
+  analogue, [collation.md §8](collation.md)), charged **once per zone lookup** at the evaluation site —
+  the deterministic, cross-core-identical metering point. `AT TIME ZONE` charges it per conversion; the
+  Slice-2 consumers charge it exactly when they consult a zone (`date_trunc(timestamptz)` / its 3-arg
+  form, an `EXTRACT` of a `timestamptz` that decomposes it in the session zone, and a `timestamptz`-
+  crossing cast) and **not** for the zone-free forms (`date_trunc(timestamp)`, `EXTRACT(epoch FROM
+  timestamptz)`, `EXTRACT` of a `timestamp`/`date`/`interval`, the zone-free casts). A TZif lookup is a
+  bounded binary search (+ a bounded footer evaluation), so a query converting a large input is cost-
+  ceilinged like any other work ([cost.md](cost.md)). The unit is registered in
+  [../cost/schedule.toml](../cost/schedule.toml) (`timezone`, landed with Slice 1).
 - **tz *use* stays OUT of the determinism ledger.** A query runs over **loaded** TZif bytes with a
   jed-owned reader, so it is a deterministic function of its inputs — precisely what
   [determinism.md §3](determinism.md) demands. *Which* zones are loaded is a host/configuration boundary
@@ -416,10 +525,11 @@ a builder **preset**, a follow-on, not a code change (§12).
 
 ## 14. Status & open decisions
 
-**Status: design decided (the three foundational choices below), awaiting review before implementation;
-nothing built.** The settled ground it builds on (UTC-`i64` `timestamptz`, the clock seam, the
-`TimeZone` slot) is real and in-tree; the tz database, the load seam, the TZif reader, and `AT TIME ZONE`
-are not yet built.
+**Status: BUILT.** Slice 1 (the data path + `AT TIME ZONE`) and **Slice 2 (the conversion surface —
+`date_trunc`, `EXTRACT`, the cross-family datetime casts, and the now-observable session `TimeZone`
+slot — §9)** are landed across all three cores in lockstep, oracle-checked against `postgres:18`. The
+settled ground it builds on (UTC-`i64` `timestamptz`, the clock seam, the `TimeZone` slot) is in-tree;
+the tz database, the load seam, the TZif reader, `AT TIME ZONE`, and the conversion surface are built.
 
 **Decided (this revision):**
 
@@ -429,20 +539,32 @@ are not yet built.
 - **`JTZ` bundle wrapping standard TZif** ([../tz/README.md §3](../tz/README.md)) — a manifest +
   per-zone RFC 8536 TZif sections + links, parallel to `JUCD`, no custom compiled-table payload and no
   merge step (§4).
-- **Plumbing + one consumer.** The first slice ships the data path + `AT TIME ZONE` (both directions,
-  §6); the broader conversion surface (§9) is deferred.
+- **Plumbing + consumers.** Slice 1 shipped `AT TIME ZONE` (both directions, §6); Slice 2 shipped
+  `date_trunc` / `EXTRACT` / the cross-family casts (§9). Still deferred: `text`↔datetime casts,
+  `make_timestamptz`, `to_char`, `date_part` (float8), and session-zone rendering (§9, §9.5).
 - **No on-disk change.** No `format_version` bump, no reference entry, no skew verdict (§2); the
   collation-style version-skew machinery is latent until tz-derived stored keys exist (§8).
+- **Session zone drives computation, not rendering (Slice 2).** The session `TimeZone` is the zone a
+  `timestamptz` is decomposed *in* (§9.4); a `timestamptz` still *renders* in UTC (§9.5) — the
+  rendering follow-on lifts that.
+- **`date_part` and `julian` excluded by jed's type system.** `date_part` returns `double precision` and
+  jed has no `float` type (§9.2); `EXTRACT(julian …)` on a timestamp is a non-terminating PG-internal
+  decimal (§9.2) — both deferred, documented divergences (a `date` argument to `date_trunc`/an implicit
+  `date`→`timestamp` cast is `42883`, §9.1).
 
-**Open — need a deliberate call before/at implementation:**
+**Resolved at implementation (Slice 1/2):**
 
-1. **POSIX-footer form coverage** (§5) — first cut supports the near-universal `Mm.w.d` transition rule;
-   the rare `Jn` / `n` julian-day forms are a proposed follow-on. Confirm the narrowing.
-2. **The `timestamp AT TIME ZONE zone` DST-ambiguity branch** (§6) — pin jed's gap/overlap resolution to
-   PG's via the oracle, and record it as a divergence only if jed deliberately differs.
-3. **Starter zone set & presets** (§13) — confirm the curated first set and that the full IANA set is a
-   builder preset, not a separate mechanism.
-4. **Abbreviation input** (§15 below) — defer (accept IANA names + fixed `±HH:MM` only); decide later
+1. **POSIX-footer form coverage** (§5) — RESOLVED: ship the near-universal `Mm.w.d` transition rule; the
+   rare `Jn` / `n` julian-day forms are a documented follow-on.
+2. **The `timestamp AT TIME ZONE zone` DST-ambiguity branch** (§6) — RESOLVED: pinned to PG's gap/overlap
+   resolution via the oracle (no deliberate divergence); the Slice-2 `timestamp`→`timestamptz` cast
+   inherits it.
+3. **Starter zone set & presets** (§13) — RESOLVED: the curated first set shipped; the full IANA set is a
+   builder preset (not a separate mechanism).
+
+**Still open (later follow-ons):**
+
+4. **Abbreviation input** (§15 below) — deferred (accept IANA names + fixed `±HH:MM` only); decide later
    whether to load a curated abbreviation table.
 5. **When the latent skew machinery lands** (§8) — it activates with functional indexes / STORED
    generated columns; confirm tz reuses [compatibility.md](compatibility.md)'s manifest then, not a
@@ -450,12 +572,15 @@ are not yet built.
 
 ## 15. Session zone and abbreviations
 
-- **`TimeZone` / `time_zone`** already exists ([session.md §6.2](session.md)): default `UTC`, capability
-  `session.timezone`, corpus directive `# timezone: <zone>`. It selects the zone for the deferred
-  rendering / bare-cast surface (§9); this slice's `AT TIME ZONE` takes an explicit zone, so it is
-  independent of the slot. Setting it is pure session state — no storage effect, fully deterministic
-  given the directive. *(Today the slot accepts `UTC` + fixed offsets; once the bundle loads, a named
-  zone becomes settable too — gated on a loaded bundle providing it, else `22023`.)*
+- **`TimeZone` / `time_zone`** ([session.md §6.2](session.md)): default `UTC`, capability
+  `session.timezone`, corpus directive `# timezone: <zone>`. **Implemented with Slice 2** — it is the
+  zone a `timestamptz` is decomposed *in* by `date_trunc` / `EXTRACT` / the cross-family casts (§9.4).
+  It is set through the host API (`set_time_zone` / `SessionOptions::time_zone`), validated against the
+  loaded set (`UTC` + fixed offsets always; a named zone gated on a loaded bundle providing it, else
+  `22023`) and stored as a resolved `ZoneRef`; there is **no SQL `SET TIME ZONE`** yet. Setting it is
+  pure session state — no storage effect, fully deterministic given the directive — and it drives
+  *computation*, not yet *rendering* (§9.5). `AT TIME ZONE` (Slice 1) takes an explicit zone, so it is
+  independent of the slot.
 - **Abbreviations** (`EST`, `CST`, …) are ambiguous and PG keeps a separate curated table
   (`pg_timezone_abbrevs`). Proposal: **defer** abbreviation *input* (accept only IANA zone names + fixed
   `±HH:MM` offsets initially), decide later whether to load a curated abbreviation section in the bundle.

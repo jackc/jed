@@ -26,27 +26,23 @@
 # (PostgreSQL has text<->uuid etc., authored deliberately later rather than falling out of
 # making the types storable).
 #
-# timestamp / timestamptz (scalars.toml) are likewise STORABLE but have NO cast rules here:
-# they are NEITHER a cast source NOR a cast target this slice. A single-quoted string lands
-# in a timestamp column by LITERAL ADAPTATION (parsed to the i64 instant in a timestamp
-# context — like bytea), which is the executor's resolve-time coercion, NOT a (text,
-# timestamp) cast pair. `CAST(x AS timestamp)`, text<->timestamp, and the zone-requiring
-# timestamp<->timestamptz conversion are all DEFERRED to a later cast slice (and the latter
-# needs a zone, so timestamp and timestamptz never reconcile — see compare.toml).
+# timestamp / timestamptz / date (scalars.toml) — the CROSS-FAMILY datetime cast matrix LANDED with
+# the tz conversion slice (../design/timezones.md §9.3): the six explicit (timestamp, timestamptz,
+# date) pairs below. Every pair that crosses the `timestamptz` boundary consults the SESSION zone
+# (timestamp<->timestamptz, date->timestamptz, timestamptz->date) — the cast's value transform is
+# zone-dependent, so it is hand-written over the tz reader (timezones.md §5), not expressible as a
+# plain (from,to) value map here; the entries record the matrix + mode. The zone-free pairs
+# (timestamp<->date) are pure calendar arithmetic. All are EXPLICIT (PG makes the lossy/zone ones
+# explicit). A single-quoted string still lands in a timestamp/timestamptz/date column by LITERAL
+# ADAPTATION (the `TIMESTAMP '…'` / `DATE '…'` keyword literal / resolve-time coercion), NOT a (text,
+# T) cast pair. STILL DEFERRED: text<->{timestamp,timestamptz,date} (a formatting surface — to_char),
+# and timestamp/timestamptz/date <-> interval (interval is a span, not an instant).
 #
 # interval (scalars.toml) is likewise STORABLE with NO cast rules here. A single-quoted string
 # lands in an interval column by LITERAL ADAPTATION (parsed in an interval context), and the
 # `INTERVAL '...'` keyword literal names the type directly — neither is a (text, interval) CAST.
 # `CAST(x AS interval)` and casting FROM an interval are DEFERRED to a later cast slice (0A000 /
-# 42804), exactly like timestamp (../design/interval.md §6).
-#
-# date (scalars.toml) is likewise STORABLE with NO cast rules here. A single-quoted string lands
-# in a date column by LITERAL ADAPTATION (parsed in a date context — only the date portion kept),
-# and the `DATE '...'` keyword literal names the type directly — neither is a (text, date) CAST.
-# `CAST(x AS date)`, text<->date, and the date<->timestamp/timestamptz conversions are all
-# DEFERRED to a later cast slice (the date<->timestamp pair unblocks the cross-family date <
-# timestamp comparison — compare.toml has no date cross rule this slice), exactly like timestamp
-# (../design/date.md §5/§6).
+# 42804), exactly like the deferred text casts (../design/interval.md §6).
 #
 # STRING-LITERAL coercion is the one (text -> T) cast admitted ahead of the general cast slice,
 # and it is NOT a (from, to) pair in this matrix because its source is a string LITERAL, not the
@@ -316,4 +312,45 @@ mode = "explicit"
 [[cast]]
 from = "i32"
 to = "boolean"
+mode = "explicit"
+
+# --- cross-family datetime casts (timestamp / timestamptz / date) -----------------------------
+# The tz conversion slice (../design/timezones.md §9.3). All EXPLICIT. The pairs that cross the
+# `timestamptz` boundary consult the SESSION zone (a hand-written transform over the tz reader —
+# timezones.md §5); the timestamp<->date pairs are zone-free calendar arithmetic. None overflow
+# (every reachable instant/date fits its i64/i32 domain). NULL -> NULL throughout.
+#   timestamptz -> timestamp : render the instant in the session zone (= AT TIME ZONE session)
+#   timestamp   -> timestamptz: interpret the wall clock in the session zone (DST gap/overlap as PG)
+#   timestamptz -> date       : the date of the session-zone wall clock
+#   date        -> timestamptz: midnight in the session zone -> the instant
+#   timestamp   -> date       : the date part (zone-free)
+#   date        -> timestamp  : midnight (zone-free)
+[[cast]]
+from = "timestamptz"
+to = "timestamp"
+mode = "explicit"
+
+[[cast]]
+from = "timestamp"
+to = "timestamptz"
+mode = "explicit"
+
+[[cast]]
+from = "timestamptz"
+to = "date"
+mode = "explicit"
+
+[[cast]]
+from = "date"
+to = "timestamptz"
+mode = "explicit"
+
+[[cast]]
+from = "timestamp"
+to = "date"
+mode = "explicit"
+
+[[cast]]
+from = "date"
+to = "timestamp"
 mode = "explicit"

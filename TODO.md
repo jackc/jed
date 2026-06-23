@@ -193,21 +193,25 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] _follow-on:_ negative / `s>p` scale typmods; `round(x,n)` and other decimal functions.
 - [x] **`timestamp` / `timestamptz`** — PG instant model, i64 µs, no tz database, `±infinity`
       first-class, timestamp PK supported. → [timestamp.md](spec/design/timestamp.md)
-  - [ ] **time-zone database + `AT TIME ZONE` (host-loaded `JTZ` bundle)** — design decided in
-        timezones.md, **not yet built** (copies collation's host-load model): a host loads IANA tzdata
-        as a **`JTZ` bundle** (manifest + per-zone **RFC 8536 TZif** sections + alias links) via a
-        privileged bytes/reader **`db.LoadTimeZoneData`**; the bare binary carries no tz data (`UTC` +
-        fixed `±HH:MM` offsets are built-in, the `C` analogue). Each core gets a small TZif reader
-        (`(zone, instant) → (offset, abbrev, dst)`, incl. the POSIX footer). Ships the **data plumbing +
-        the single `AT TIME ZONE` consumer** (both directions; unknown zone `22023`). **No
-        `format_version` bump** — `timestamptz` is UTC, so plain indexes are tz-immune; the
-        collation-style version-skew machinery stays **latent** until tz-derived stored keys (functional
-        indexes / STORED generated columns) exist (timezones.md §8 → compatibility.md then). New cost
-        unit `timezone`, new corpus directive `# load-timezone:`. → [timezones.md](spec/design/timezones.md),
-        [tz/README.md](spec/tz/README.md) (the JTZ + TZif byte formats).
-  - [ ] _further follow-on:_ `EXTRACT`/`date_trunc`/`age`; separate `time` type; timestamp⇄text/date
-        casts (and session-zone rendering); `timestamp(p)` precision typmods; the full conversion
-        surface (timezones.md §9). (`date` ✅ landed below.)
+  - [x] **time-zone database + `AT TIME ZONE` (host-loaded `JTZ` bundle)** — ✅ LANDED (Slice 1; copies
+        collation's host-load model): a host loads IANA tzdata as a **`JTZ` bundle** (manifest + per-zone
+        **RFC 8536 TZif** sections + alias links) via a privileged bytes/reader **`db.LoadTimeZoneData`**;
+        the bare binary carries no tz data (`UTC` + fixed `±HH:MM` offsets built-in, the `C` analogue).
+        Each core has a TZif reader (`(zone, instant) → (offset, abbrev, dst)`, incl. the POSIX footer);
+        the **`AT TIME ZONE` consumer** (both directions; unknown zone `22023`, non-text zone `42883`).
+        **No `format_version` bump** — `timestamptz` is UTC, so plain indexes are tz-immune; the
+        collation-style version-skew machinery stays **latent** until tz-derived stored keys exist
+        (timezones.md §8 → compatibility.md then). Cost unit `timezone`, corpus directive
+        `# load-timezone:`. → [timezones.md](spec/design/timezones.md), [tz/README.md](spec/tz/README.md).
+  - [x] **the tz conversion surface (Slice 2)** — ✅ LANDED: `date_trunc(unit, src)` (2-arg ts/tstz/
+        interval + 3-arg `date_trunc(unit, tstz, zone)`), `EXTRACT(field FROM src)` → `numeric` (ts/tstz/
+        date/interval; field-validity matrix matches PG, `0A000`/`22023`), the cross-family `timestamp`/
+        `timestamptz`/`date` **casts in a zone**, and the now-observable **session `TimeZone` slot** (the
+        zone a `timestamptz` decomposes in). Session zone drives *computation*, not yet *rendering*
+        (timezones.md §9.5). → [timezones.md §9](spec/design/timezones.md), [grammar.md §50](spec/design/grammar.md).
+  - [ ] _further follow-on:_ `date_part` (float8 — needs `float`), `make_timestamptz`, `to_char`/
+        `to_timestamp`, `age`, `EXTRACT(julian …)`; separate `time` type; **text⇄datetime casts** + the
+        **session-zone rendering** of `timestamptz`; `timestamp(p)` precision typmods (timezones.md §9).
 - [x] **`date`** — a calendar date (i32 days since 1970-01-01, reusing timestamp's calendar core):
       strict ISO `YYYY-MM-DD` literals (string-adapt + `DATE '…'`) with BC era + `±infinity`, a date
       `PRIMARY KEY` (key encoding = i32; on-disk type code 16, no format bump); a **strict island** —
@@ -580,10 +584,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
   - [ ] **S5 — session variables (v1)** — a string→string GUC map, host get/set + `current_setting()`
         read; namespaced custom vars; `# set:` directive. (`SET LOCAL` / full SQL `SET`/`SHOW` /
         `set_config()` deferred.) Capability `session.variables`. _(size: M; §6.1)_
-  - [ ] **S6 — session time zone slot** — the built-in `time_zone` var (default **`UTC`**, fixed
-        offsets only, named zones `0A000`), injected not OS-read (determinism, §6); the
-        `# timezone:` directive. Forward-looking infra — the consuming `timestamptz→date`/`AT TIME
-        ZONE` cast is a separate Phase-3 type slice. Capability `session.timezone`. _(size: S; §6.2)_
+  - [x] **S6 — session time zone slot** — ✅ LANDED with the tz conversion slice: the built-in
+        `time_zone` var (default **`UTC`**; `UTC` + fixed offsets + **named loaded zones**, else `22023`),
+        injected not OS-read (determinism, §6); the `# timezone:` directive; host-API set/validate. The
+        consumers (`date_trunc`/`EXTRACT`/cross-family casts) landed too (timezones.md §9). Capability
+        `session.timezone`. _(§6.2)_
 - [ ] **(Open question, not scheduled)** low-level direct access API beneath SQL
       (`getValue("table", key)`) — keep the seam open, don't build yet (§9). _(size: —)_
 

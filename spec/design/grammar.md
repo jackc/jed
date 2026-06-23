@@ -2321,3 +2321,40 @@ SELECT now() AT TIME ZONE 'UTC'                  -- UTC and fixed ±HH:MM offset
   recognized") — never a silent substitution. The `timestamp → timestamptz` direction at a DST gap /
   overlap resolves the ambiguous wall clock to PostgreSQL's branch (oracle-pinned), never an error. The
   operator is metered by the `timezone` cost unit ([timezones.md §10](timezones.md)).
+
+## 50. `EXTRACT` and the conversion surface ([timezones.md §9](timezones.md))
+
+`EXTRACT(field FROM source)` is the SQL special form for a single datetime field; the second tz slice
+also ships `date_trunc` and the cross-family datetime casts ([timezones.md §9](timezones.md)).
+
+```sql
+SELECT EXTRACT(hour FROM timestamp '2024-03-15 13:47:23')   -- 13   (numeric)
+SELECT EXTRACT('dow' FROM date '2024-03-15')                -- 5    (field as a string literal)
+SELECT EXTRACT(hour FROM tstz)                              -- in the SESSION zone, for a timestamptz
+SELECT date_trunc('day', timestamptz '…', 'America/New_York')  -- truncate in an explicit zone
+SELECT (tstz)::date                                          -- cross-family cast (session zone)
+```
+
+- **Grammar.** `EXTRACT "(" ( identifier | string ) "FROM" expr ")"` ([grammar.ebnf](../grammar/grammar.ebnf)).
+  The **field is syntactic** — a bare identifier or a single-quoted string, case-insensitive — recognized
+  only when `EXTRACT` is immediately followed by `(` (a one-token lookahead, §8; `EXTRACT` stays usable as
+  a column / function name otherwise). It is validated at **resolve** time.
+- **Result type.** `EXTRACT` → `numeric` (PG 14+, matchable exactly; jed has exact `decimal`). The
+  function spelling `date_part('field', src)` is **deferred** — PG defines it to return `double
+  precision`, and jed has no `float` type ([timezones.md §9.2](timezones.md)).
+- **Source types & field validity.** `source` is `timestamp` / `timestamptz` / `date` / `interval` (any
+  other → `42883`). The field-validity matrix matches PG ([timezones.md §9.2](timezones.md)): an
+  unsupported field for the source type is **`0A000`** (e.g. `EXTRACT(hour FROM date)`), an unrecognized
+  field is **`22023`**. `julian` is a documented deferred field (`0A000`). For a `timestamptz` source
+  every field is computed **in the session zone** except `epoch` (the instant).
+- **`date_trunc`.** `date_trunc(unit, source)` (2-arg) over `timestamp` / `timestamptz` / `interval`,
+  plus `date_trunc(unit, timestamptz, zone)` (3-arg) — `unit` is a runtime `text` value (case-
+  insensitive; an unrecognized unit is `22023` **at evaluation**). A `timestamptz` is truncated in the
+  session zone (2-arg) or the explicit zone (3-arg); a `date` argument is `42883` (no implicit
+  `date`→`timestamp` cast — [timezones.md §9.1](timezones.md)).
+- **Cross-family casts.** The `timestamp` / `timestamptz` / `date` cast matrix
+  ([spec/types/casts.toml](../types/casts.toml), [timezones.md §9.3](timezones.md)); every cast crossing
+  the `timestamptz` boundary consults the session zone. The `text`↔datetime casts stay deferred.
+- **Session zone & cost.** The session zone drives *computation*, not yet *rendering*
+  ([timezones.md §9.5](timezones.md)). A zone consultation charges the `timezone` cost unit; the
+  zone-free forms charge only `operator_eval`.
