@@ -81,6 +81,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // jsonb comparison/ordering (J2) — PG total btree order driving =/<>/</<=/>/>=/ORDER BY/
   // DISTINCT/GROUP BY; json non-comparable → 42883 (spec/design/json.md §5).
   "types.jsonb_compare",
+  // The JSON cast matrix (J3) — runtime json↔jsonb, json/jsonb→text, text→json/jsonb
+  // (spec/design/json.md §6.1).
+  "types.json_casts",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
   // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
   "func.range_accessors",

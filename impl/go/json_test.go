@@ -78,6 +78,24 @@ func TestJsonbCrossFamilyComparisonIs42804(t *testing.T) {
 	}
 }
 
+// TestInvalidJSONCastSourceIs42804: casting a non-text/json/jsonb source to json/jsonb is 42804
+// (jed's invalid-cast convention, like "cannot cast boolean to X") — a documented divergence from
+// PostgreSQL, which reports 42846 (cannot_coerce: cannot cast type integer to jsonb). The supported
+// JSON cast matrix (json↔jsonb, json/jsonb→text, text→json/jsonb) is oracle-clean in
+// suites/json/json_casts.test.
+func TestInvalidJSONCastSourceIs42804(t *testing.T) {
+	db := NewDatabase()
+	if got := errJSON(t, db, "SELECT 5::jsonb"); got != "42804" {
+		t.Errorf("5::jsonb: got %s, want 42804", got)
+	}
+	if got := errJSON(t, db, "SELECT (1.5)::json"); got != "42804" {
+		t.Errorf("(1.5)::json: got %s, want 42804", got)
+	}
+	if got := errJSON(t, db, "SELECT true::jsonb"); got != "42804" {
+		t.Errorf("true::jsonb: got %s, want 42804", got)
+	}
+}
+
 // TestLargeJsonbSpillsAndRoundTrips: a large jsonb document (a long string node well past
 // RECORD_MAX) spills onto an overflow chain and round-trips through a whole-image serialize + reload
 // — exercising the jsonb body's spill/value_payload/value_from_payload (the tree decoded from a

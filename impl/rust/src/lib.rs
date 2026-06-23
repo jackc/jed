@@ -593,6 +593,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // jsonb comparison/ordering (J2) — PG total btree order driving =/<>/</<=/>/>=/ORDER BY/
     // DISTINCT/GROUP BY; json non-comparable → 42883 (spec/design/json.md §5).
     "types.jsonb_compare",
+    // The JSON cast matrix (J3) — runtime json↔jsonb, json/jsonb→text, text→json/jsonb
+    // (spec/design/json.md §6.1).
+    "types.json_casts",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

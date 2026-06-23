@@ -18944,13 +18944,64 @@ fn resolve(
                     )),
                 };
             }
-            // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
-            // casting TO text is a 0A000 this slice.
+            // The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
+            // text/json/jsonb expression (a string LITERAL operand was already coerced above by
+            // `coerce_string_literal`). text → json validates + stores verbatim; text → jsonb parses
+            // + canonicalizes; json → jsonb re-parses + canonicalizes; jsonb → json renders the
+            // canonical text; same-type is the identity. Any other source is a 42846 cast error.
+            if target.is_json() || target.is_jsonb() {
+                if matches!(inner.as_ref(), Expr::Param(_)) {
+                    let (rinner, _) = resolve(scope, inner, Some(target), agg, params)?;
+                    return Ok((rinner, resolved_type_of(target)));
+                }
+                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                let to_rt = resolved_type_of(target);
+                return match ity {
+                    ResolvedType::Null => Ok((rinner, to_rt)),
+                    ResolvedType::Text | ResolvedType::Json | ResolvedType::Jsonb => Ok((
+                        RExpr::Cast {
+                            inner: Box::new(rinner),
+                            target,
+                            typmod: None,
+                        },
+                        to_rt,
+                    )),
+                    _ => Err(type_error(format!(
+                        "cannot cast type {} to {}",
+                        ity.type_name(),
+                        target.canonical_name()
+                    ))),
+                };
+            }
+            // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11), EXCEPT
+            // json/jsonb → text (the JSON cast matrix, json.md §6.1): json → text is the identity on
+            // the verbatim bytes, jsonb → text renders the canonical form. A NULL adapts. Every other
+            // text cast target is still a 0A000 this slice — including `$1::text` (declaring a bind
+            // param as text via a cast stays deferred, the params.rs contract — guarded first so it
+            // does not resolve to an untyped-NULL text node and trip 42P18).
             if target.is_text() {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "casting to text is not supported yet",
-                ));
+                if matches!(inner.as_ref(), Expr::Param(_)) {
+                    return Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting to text is not supported yet",
+                    ));
+                }
+                let (rinner, ity) = resolve(scope, inner, None, agg, params)?;
+                return match ity {
+                    ResolvedType::Null | ResolvedType::Text => Ok((rinner, ResolvedType::Text)),
+                    ResolvedType::Json | ResolvedType::Jsonb => Ok((
+                        RExpr::Cast {
+                            inner: Box::new(rinner),
+                            target,
+                            typmod: None,
+                        },
+                        ResolvedType::Text,
+                    )),
+                    _ => Err(EngineError::new(
+                        SqlState::FeatureNotSupported,
+                        "casting to text is not supported yet",
+                    )),
+                };
             }
             // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
             // (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32
@@ -23199,6 +23250,14 @@ impl RExpr {
                             Ok(Value::Int(i64::from(b)))
                         }
                     }
+                    // text → json/jsonb is the only runtime text cast (spec/design/json.md §6.1):
+                    // json validates + stores verbatim (22P02 on malformed); jsonb parses +
+                    // canonicalizes. Every other text cast target is still resolver-rejected.
+                    Value::Text(s) if target.is_json() => {
+                        json::validate_json(&s)?;
+                        Ok(Value::Json(s))
+                    }
+                    Value::Text(s) if target.is_jsonb() => Ok(Value::Jsonb(json::jsonb_in(&s)?)),
                     Value::Text(_) => unreachable!("resolver rejects a text cast operand"),
                     Value::Bytea(_) => unreachable!("resolver rejects a bytea cast operand"),
                     Value::Uuid(_) => unreachable!("resolver rejects a uuid cast operand"),
@@ -23216,8 +23275,34 @@ impl RExpr {
                     Value::Range(_) => {
                         unreachable!("resolver rejects a range cast operand this slice")
                     }
-                    Value::Json(_) | Value::Jsonb(_) => {
-                        unreachable!("resolver rejects a json cast operand this slice (J3)")
+                    // The JSON cast matrix (spec/design/json.md §6.1). json → text is the identity
+                    // on the verbatim bytes; json → jsonb re-parses + canonicalizes; json → json is
+                    // the identity.
+                    Value::Json(s) => {
+                        if target.is_text() || target.is_json() {
+                            Ok(if target.is_text() {
+                                Value::Text(s)
+                            } else {
+                                Value::Json(s)
+                            })
+                        } else if target.is_jsonb() {
+                            Ok(Value::Jsonb(json::jsonb_in(&s)?))
+                        } else {
+                            unreachable!("resolver rejects this json cast target")
+                        }
+                    }
+                    // jsonb → text / json renders the canonical form (jsonb_out); jsonb → jsonb is
+                    // the identity.
+                    Value::Jsonb(n) => {
+                        if target.is_text() {
+                            Ok(Value::Text(json::jsonb_out(&n)))
+                        } else if target.is_json() {
+                            Ok(Value::Json(json::jsonb_out(&n)))
+                        } else if target.is_jsonb() {
+                            Ok(Value::Jsonb(n))
+                        } else {
+                            unreachable!("resolver rejects this jsonb cast target")
+                        }
                     }
                     Value::Unfetched(_) => {
                         panic!("BUG: unfetched large value escaped the storage layer")

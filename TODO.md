@@ -327,7 +327,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         PG's code). Resolver-only (the recursive comparator was front-loaded in J0/J1); also fixed a
         latent `resolved_type_of` gap (a jsonb column had resolved to `Int`). All three cores,
         capability `types.jsonb_compare`, oracle-clean. → json.md §5
-  - [ ] **J3** — casts (`json↔jsonb`, `json`/`jsonb`→`text`, runtime `text`→`json`/`jsonb`). → json.md §6
+  - [x] **J3** — ✅ the JSON cast matrix (spec/design/json.md §6.1): runtime `json↔jsonb` (json→jsonb
+        re-parses+canonicalizes, jsonb→json renders canonical), `json`/`jsonb`→`text` (json verbatim,
+        jsonb canonical), and runtime `text`→`json`/`jsonb` (validate/parse; malformed 22P02) — on a
+        non-literal expression (a string literal still coerces at resolve via J0). Same-type identity;
+        NULL adapts. A non-text/json/jsonb source → json/jsonb is `42804` (per-core test — PG's 42846
+        cannot_coerce isn't registered). All three cores, capability `types.json_casts`, oracle-clean.
   - [ ] **J4 / J5 / J6** — operators: accessors `-> ->> #> #>>` / containment `@> <@ ? ?| ?&` /
         mutation `|| - #-`. → json-sql-functions.md §1
   - [ ] **C0** — shared FROM-clause **column-definition-list** facility + multi-column synthetic

@@ -25,3 +25,23 @@ test("jsonb cross-family comparison is 42804", () => {
     "42804",
   );
 });
+
+// Casting a non-text/json/jsonb source to json/jsonb is 42804 (jed's invalid-cast convention, like
+// "cannot cast boolean to X") — a documented divergence from PostgreSQL, which reports 42846
+// (cannot_coerce: cannot cast type integer to jsonb). The supported JSON cast matrix (json↔jsonb,
+// json/jsonb→text, text→json/jsonb) is oracle-clean in suites/json/json_casts.test.
+test("invalid json cast source is 42804", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => execute(db, "SELECT 5::jsonb")),
+    "42804",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT (1.5)::json")),
+    "42804",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT true::jsonb")),
+    "42804",
+  );
+});

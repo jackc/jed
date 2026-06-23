@@ -18671,10 +18671,60 @@ func resolve(s *scope, e Expr, ctx *ScalarType, ag *aggCtx, params *paramTypes) 
 		if in := e.Cast.Inner; in.Kind == ExprLiteral && in.Literal != nil && in.Literal.Kind == LiteralText {
 			return coerceStringLiteral(in.Literal.Str, target, typmod)
 		}
-		// Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
-		// casting TO text is a 0A000 this slice.
+		// The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
+		// text/json/jsonb expression (a string LITERAL operand was already coerced above by
+		// coerceStringLiteral). text → json validates + stores verbatim; text → jsonb parses +
+		// canonicalizes; json → jsonb re-parses + canonicalizes; jsonb → json renders the canonical
+		// text; same-type is the identity. Any other source is a 42804 cast error (jed's invalid-cast
+		// convention; PG reports 42846 — a documented divergence).
+		if target.IsJson() || target.IsJsonb() {
+			if e.Cast.Inner.Kind == ExprParam {
+				t := target
+				pinner, _, err := resolve(s, e.Cast.Inner, &t, ag, params)
+				if err != nil {
+					return nil, resolvedType{}, err
+				}
+				return pinner, resolvedTypeOf(target), nil
+			}
+			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			toRt := resolvedTypeOf(target)
+			switch ity.kind {
+			case rtNull:
+				return rinner, toRt, nil
+			case rtText, rtJson, rtJsonb:
+				return &rExpr{kind: reCast, operand: rinner, result: target}, toRt, nil
+			default:
+				return nil, resolvedType{}, typeError(
+					"cannot cast type " + rtName(ity) + " to " + target.CanonicalName(),
+				)
+			}
+		}
+		// Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11), EXCEPT
+		// json/jsonb → text (the JSON cast matrix, json.md §6.1): json → text is the identity on the
+		// verbatim bytes, jsonb → text renders the canonical form. A NULL adapts. Every other text
+		// cast target is still a 0A000 this slice.
 		if target.IsText() {
-			return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to text is not supported yet")
+			// A bare parameter has no inferable source type for a text target (text is not a
+			// json/jsonb-target case that declares it), so `$1::text` stays the deferred 0A000 it
+			// was before J3 rather than resolving to an untyped-NULL text node.
+			if e.Cast.Inner.Kind == ExprParam {
+				return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to text is not supported yet")
+			}
+			rinner, ity, err := resolve(s, e.Cast.Inner, nil, ag, params)
+			if err != nil {
+				return nil, resolvedType{}, err
+			}
+			switch ity.kind {
+			case rtNull, rtText:
+				return rinner, resolvedType{kind: rtText}, nil
+			case rtJson, rtJsonb:
+				return &rExpr{kind: reCast, operand: rinner, result: target}, resolvedType{kind: rtText}, nil
+			default:
+				return nil, resolvedType{}, NewError(FeatureNotSupported, "casting to text is not supported yet")
+			}
 		}
 		// A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
 		// (spec/types/casts.toml, types.md §9). It needs the inner type to decide (only an i32 /
@@ -22249,6 +22299,56 @@ func evalArith(op BinaryOp, x, y int64, result ScalarType) (Value, error) {
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
 func evalCast(v Value, target ScalarType, typmod *DecimalTypmod) (Value, error) {
+	// The JSON cast matrix (spec/design/json.md §6.1). text → json/jsonb is the only runtime text
+	// cast (every other text cast target is resolver-rejected): json validates + stores verbatim
+	// (22P02 on malformed); jsonb parses + canonicalizes.
+	if v.Kind == ValText {
+		if target.IsJson() {
+			if err := validateJSON(v.Str); err != nil {
+				return Value{}, err
+			}
+			return JsonValue(v.Str), nil
+		}
+		if target.IsJsonb() {
+			n, err := jsonbIn(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return JsonbValue(n), nil
+		}
+		panic("BUG: resolver rejects this text cast target")
+	}
+	// json → text is the identity on the verbatim bytes; json → jsonb re-parses + canonicalizes;
+	// json → json is the identity.
+	if v.Kind == ValJson {
+		switch {
+		case target.IsText():
+			return TextValue(v.Str), nil
+		case target.IsJson():
+			return JsonValue(v.Str), nil
+		case target.IsJsonb():
+			n, err := jsonbIn(v.Str)
+			if err != nil {
+				return Value{}, err
+			}
+			return JsonbValue(n), nil
+		default:
+			panic("BUG: resolver rejects this json cast target")
+		}
+	}
+	// jsonb → text / json renders the canonical form (jsonb_out); jsonb → jsonb is the identity.
+	if v.Kind == ValJsonb {
+		switch {
+		case target.IsText():
+			return TextValue(jsonbOut(v.Json)), nil
+		case target.IsJson():
+			return JsonValue(jsonbOut(v.Json)), nil
+		case target.IsJsonb():
+			return v, nil
+		default:
+			panic("BUG: resolver rejects this jsonb cast target")
+		}
+	}
 	if v.Kind == ValBool {
 		// boolean → boolean is the identity cast (`x::boolean` on a boolean).
 		if target.IsBool() {

@@ -15745,9 +15745,27 @@ function resolve(
       if (e.inner.kind === "literal" && e.inner.literal.kind === "text") {
         return coerceStringLiteral(e.inner.literal.text, target, typmod);
       }
-      // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11):
-      // casting TO text is a 0A000 this slice.
+      // Text casts are deferred (not in the cast matrix — spec/design/types.md §5/§11), EXCEPT
+      // json/jsonb → text (the JSON cast matrix, json.md §6.1): json → text is the identity on the
+      // verbatim bytes, jsonb → text renders the canonical form. A NULL adapts. Every other text
+      // cast target is still a 0A000 this slice — including `$1::text` (declaring a bind param as
+      // text via a cast stays deferred, the params contract — guarded FIRST so it does not resolve
+      // to an untyped-NULL text node and trip 42P18).
       if (isText(target)) {
+        if (e.inner.kind === "param") {
+          throw engineError("feature_not_supported", "casting to text is not supported yet");
+        }
+        const inner = resolve(scope, e.inner, null, ag, params);
+        const ik = inner.type.kind;
+        if (ik === "null" || ik === "text") {
+          return { node: inner.node, type: { kind: "text" } };
+        }
+        if (ik === "json" || ik === "jsonb") {
+          return {
+            node: { kind: "cast", target, typmod, operand: inner.node },
+            type: { kind: "text" },
+          };
+        }
         throw engineError("feature_not_supported", "casting to text is not supported yet");
       }
       // A boolean target (`CAST(x AS boolean)`, `x::boolean`) is the boolean cast slice
@@ -15797,11 +15815,25 @@ function resolve(
           "casting to an interval type is not supported yet",
         );
       }
-      // Casting TO json/jsonb on a NON-literal operand (json↔jsonb, text→json[b]) lands in J3
-      // (spec/design/json.md §6); deferred this slice. A string LITERAL target was already handled
-      // above via coerceStringLiteral ('…'::jsonb), so only a non-literal reaches here.
+      // The JSON cast matrix (spec/design/json.md §6.1): casting TO json/jsonb from a runtime
+      // text/json/jsonb expression (a string LITERAL operand was already coerced above by
+      // coerceStringLiteral). text → json validates + stores verbatim; text → jsonb parses +
+      // canonicalizes; json → jsonb re-parses + canonicalizes; jsonb → json renders the canonical
+      // text; same-type is the identity. Any other source is a 42804 cast error (jed's invalid-cast
+      // convention; PG reports 42846 — a documented divergence).
       if (isJson(target) || isJsonb(target)) {
-        throw engineError("feature_not_supported", "casting a json value is not supported yet");
+        if (e.inner.kind === "param") {
+          const pinner = resolve(scope, e.inner, target, ag, params);
+          return { node: pinner.node, type: resolvedTypeOf(target) };
+        }
+        const inner = resolve(scope, e.inner, null, ag, params);
+        const toRt = resolvedTypeOf(target);
+        const ik = inner.type.kind;
+        if (ik === "null") return { node: inner.node, type: toRt };
+        if (ik === "text" || ik === "json" || ik === "jsonb") {
+          return { node: { kind: "cast", target, typmod, operand: inner.node }, type: toRt };
+        }
+        throw typeError("cannot cast type " + rtName(inner.type) + " to " + canonicalName(target));
       }
       // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
       // `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
@@ -20027,6 +20059,32 @@ function roundFloatHalfAway(x: number, places: number): number {
 // widens then coerces to the typmod; decimal→int rounds half-away to scale 0 then range-checks
 // (22003); decimal→decimal re-scales to the typmod (spec/design/decimal.md §6).
 function evalCast(v: Value, target: ScalarType, typmod: DecimalTypmod | null): Value {
+  // The JSON cast matrix (spec/design/json.md §6.1). text → json/jsonb is the only runtime text
+  // cast (every other text cast target is resolver-rejected): json validates + stores verbatim
+  // (22P02 on malformed); jsonb parses + canonicalizes.
+  if (v.kind === "text") {
+    if (isJson(target)) {
+      validateJson(v.text);
+      return jsonValue(v.text);
+    }
+    if (isJsonb(target)) return jsonbValue(jsonbIn(v.text));
+    throw new Error("BUG: resolver rejects this text cast target");
+  }
+  // json → text is the identity on the verbatim bytes; json → jsonb re-parses + canonicalizes;
+  // json → json is the identity.
+  if (v.kind === "json") {
+    if (isText(target)) return textValue(v.text);
+    if (isJson(target)) return jsonValue(v.text);
+    if (isJsonb(target)) return jsonbValue(jsonbIn(v.text));
+    throw new Error("BUG: resolver rejects this json cast target");
+  }
+  // jsonb → text / json renders the canonical form (jsonb_out); jsonb → jsonb is the identity.
+  if (v.kind === "jsonb") {
+    if (isText(target)) return textValue(jsonbOut(v.node));
+    if (isJson(target)) return jsonValue(jsonbOut(v.node));
+    if (isJsonb(target)) return v;
+    throw new Error("BUG: resolver rejects this jsonb cast target");
+  }
   if (v.kind === "bool") {
     // boolean → boolean is the identity cast (`x::boolean` on a boolean). boolean → i32 (the
     // boolean cast slice, casts.toml): true → 1, false → 0. The resolver guarantees the only

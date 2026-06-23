@@ -81,6 +81,18 @@ fn jsonb_cross_family_comparison_is_42804() {
     );
 }
 
+/// Casting a non-text/json/jsonb source to json/jsonb is `42804` (jed's invalid-cast convention,
+/// like "cannot cast boolean to X") — a documented divergence from PostgreSQL, which reports
+/// `42846` (cannot_coerce: cannot cast type integer to jsonb). The supported JSON cast matrix
+/// (json↔jsonb, json/jsonb→text, text→json/jsonb) is oracle-clean in suites/json/json_casts.test.
+#[test]
+fn invalid_json_cast_source_is_42804() {
+    let mut db = Database::new();
+    assert_eq!(err(&mut db, "SELECT 5::jsonb"), "42804");
+    assert_eq!(err(&mut db, "SELECT (1.5)::json"), "42804");
+    assert_eq!(err(&mut db, "SELECT true::jsonb"), "42804");
+}
+
 /// A large `jsonb` document (a long string node well past `RECORD_MAX`) spills onto an overflow
 /// chain and round-trips through a whole-image serialize + reload — exercising `is_spillable`,
 /// `value_payload`, and `value_from_payload` for the jsonb body (the tree decoded from a fresh
