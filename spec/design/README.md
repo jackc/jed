@@ -90,6 +90,9 @@ Each doc explains *why* a decision was made and points at the **data** that enco
   index lists), index B-trees, the unique flag, and the planner's first-column pushdown.
 - [aggregates.md](aggregates.md) — `COUNT`/`SUM`/`MIN`/`MAX`/`AVG`, `GROUP BY`, and `HAVING`: PG
   widening, the grouping-error rule, NULL handling, and determinism.
+- [window.md](window.md) — window functions (`OVER`): the post-aggregation window stage, partition/
+  order/peer determinism, ranking/offset/aggregate-window/frame functions, `42P20`, and the
+  six-slice ladder (S0 `row_number` → ranking → offset → aggregate-windows → frames → named windows).
 - [pager.md](pager.md) — the per-core buffer pool / demand paging (P6.4): a bounded page cache
   with eviction above the block seam, the `cache_bytes` budget, and logical-cost invisibility.
 - [spill.md](spill.md) — streaming + spill-to-disk operators: the `ORDER BY` external merge sort

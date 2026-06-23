@@ -123,6 +123,22 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       AVG→decimal), grouping-error `42803`. → [aggregates.md](spec/design/aggregates.md)
   - [ ] _follow-on:_ `COUNT(DISTINCT x)`, `SELECT DISTINCT` in an aggregate query, GROUP BY by
         expression/ordinal/alias, functional-dependency grouping, `GROUPING SETS`/`FILTER`/ordered-set.
+- [ ] **Window functions (`OVER`)** — per-row values folded over a related row set, in a dedicated
+      **window stage** AFTER `GROUP BY`/`HAVING`, BEFORE `ORDER BY`/`LIMIT` (the PG pipeline). Reuses
+      the aggregate resolver's synthetic-row split (`AggCtx::Collect` → `WindowCtx::Collect`), adds no
+      `format_version` change. New code **`42P20` windowing_error**, cost units `window_result` /
+      `window_frame_step` (partition+sort unmetered, the ORDER BY precedent), a `[[window]]` catalog
+      array (+ aggregates reusable as window functions), `query.window*` capabilities. Determinism:
+      within-partition order is **fully resolved** (window `ORDER BY`, then PK) — a documented PG
+      divergence (PG leaves it unspecified); `percent_rank`/`cume_dist` → **`decimal`** not `float8`
+      (the `AVG`→decimal precedent); `float`-keyed `RANGE`-offset frames `0A000`. Spec-first artifacts
+      (design doc + grammar) **landed**; the data tables (catalog/errors/costs/manifest) + codegen
+      transcribe with S0. Six slices: **S0** `OVER ([PARTITION BY cols] [ORDER BY])` + the window stage
+      + `row_number()` _(size: L)_ → **S1** ranking `rank`/`dense_rank`/`percent_rank`/`cume_dist`/
+      `ntile` _(M)_ → **S2** offset `lag`/`lead` _(M)_ → **S3** aggregate-windows (default frame, reuse
+      `Acc`) + `first_value` _(M–L)_ → **S4** explicit `ROWS`/`RANGE`/`GROUPS` frames + `last_value`/
+      `nth_value` _(L)_ → **S5** _follow-on:_ `WINDOW` named-window clause + shared partition/sort pass
+      (its own NoREC relation + benchmark) _(M)_. → [window.md](spec/design/window.md), [grammar.ebnf](spec/grammar/grammar.ebnf)
 - [x] **Scalar functions `abs` / `round`** — first named per-row functions (`kind = "function"`).
       → [functions.md §9](spec/design/functions.md)
   - [ ] _follow-on:_ `ceil`/`floor`/`mod`/`sign`, text `length`/`lower`/`upper`, a general implicit

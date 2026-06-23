@@ -504,6 +504,14 @@ select_core    ::= "SELECT" "DISTINCT"? select_items ("FROM" from_clause)?
                    where_clause?
                    group_by?
                    having_clause?
+                   window_clause?
+
+/* The WINDOW clause names reusable window definitions referenced by "OVER name" or extended by
+ * another definition's leading name (../design/window.md §5). It runs in the window stage with
+ * the inline OVER definitions. DEFERRED to S5 — a window_clause is not parsed in S0–S4 (an
+ * inline "OVER ( … )" is the only spelling until then). WINDOW is non-reserved (§3). */
+window_clause  ::= "WINDOW" window_named ("," window_named)*
+window_named   ::= identifier "AS" "(" window_definition ")"
 
 /* A SELECT with its own optional trailing ORDER BY / LIMIT / OFFSET — behaviorally identical to
  * the pre-set-operations `select`. This is the form an INSERT ... SELECT source takes; a set
@@ -920,9 +928,44 @@ extract_expr   ::= "EXTRACT" "(" ( identifier | string ) "FROM" expr ")"
  * final argument may be prefixed with the VARIADIC keyword (passing an array directly to a
  * variadic parameter — num_nulls(VARIADIC arr), ../design/array-functions.md §12); VARIADIC may
  * mark ONLY the last argument and does not combine with a name (parser-enforced, 42601). */
-function_call  ::= identifier "(" ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? | variadic_arg )? ")"
+function_call  ::= identifier "(" ( "*" | function_arg ( "," function_arg )* ( "," variadic_arg )? | variadic_arg )? ")" over_clause?
 function_arg   ::= ( identifier "=>" )? expr
 variadic_arg   ::= "VARIADIC" expr
+
+/* A trailing OVER clause turns a call into a WINDOW-function call (../design/window.md). The
+ * window-ONLY functions (row_number/rank/dense_rank/percent_rank/cume_dist/ntile/lag/lead/
+ * first_value/last_value/nth_value) REQUIRE an OVER — without one they are 42P20; an AGGREGATE
+ * (count/sum/min/max/avg) is an ordinary aggregate without OVER and a window aggregate with it.
+ * A window function is allowed only in the SELECT list / ORDER BY of its query — in WHERE, a
+ * JOIN ON, GROUP BY, HAVING, a frame bound, or nested in another window function it is 42P20
+ * (it runs in the dedicated window stage, AFTER GROUP BY/HAVING, BEFORE ORDER BY/LIMIT). OVER,
+ * PARTITION, WINDOW, PRECEDING, FOLLOWING, UNBOUNDED, GROUPS, EXCLUDE, TIES are NOT reserved
+ * (§3) — disambiguated positionally. The argument is EITHER a named window (an identifier
+ * naming a WINDOW-clause entry — 42704 if absent) OR an inline "( window_definition )". */
+over_clause    ::= "OVER" ( identifier | "(" window_definition ")" )
+
+/* A window definition is an optional base-window name to copy/extend (§5), then any of
+ * PARTITION BY / ORDER BY / a frame — every part optional. An empty "OVER ()" is the single
+ * whole-result partition with no ordering. PARTITION BY is narrowed to columns in S0 (the
+ * GROUP BY / ORDER BY narrowing — general expressions are a follow-on); order_by is the same
+ * sort_key production the query ORDER BY uses (per-key ASC/DESC, NULLS FIRST|LAST, COLLATE).
+ * The frame_clause is parsed but is 0A000 in S0–S3 (the implicit default frame only); S4
+ * enables it. The base-window name (a leading identifier) lands in S5 with window_clause. */
+window_definition ::= identifier? partition_by? order_by? frame_clause?
+
+partition_by   ::= "PARTITION" "BY" column_ref ("," column_ref)*
+
+/* A frame restricts the rows a frame-sensitive window function folds over, per current row
+ * (../design/window.md §6). ROWS = physical row offsets; RANGE = logical offsets on the single
+ * ORDER BY key (a float key offset is 0A000, ledger D3); GROUPS = peer-group offsets. A bare
+ * frame_bound is "BETWEEN UNBOUNDED PRECEDING AND <bound>". The offset in "expr PRECEDING|
+ * FOLLOWING" is a non-negative constant (a negative offset is 22023; a column/aggregate/window
+ * function there is 42P20). DEFERRED to S4 — a frame_clause is 0A000 in S0–S3. */
+frame_clause   ::= ("ROWS" | "RANGE" | "GROUPS") frame_extent frame_exclusion?
+frame_extent   ::= frame_bound | "BETWEEN" frame_bound "AND" frame_bound
+frame_bound    ::= "UNBOUNDED" "PRECEDING" | "UNBOUNDED" "FOLLOWING"
+                 | "CURRENT" "ROW" | expr ("PRECEDING" | "FOLLOWING")
+frame_exclusion ::= "EXCLUDE" ("CURRENT" "ROW" | "GROUP" | "TIES" | "NO" "OTHERS")
 
 /* A column reference is a bare column ("col") or a qualified column ("rel.col") where
  * `rel` is a relation's LABEL in the FROM clause (its alias, else its table name). A bare
