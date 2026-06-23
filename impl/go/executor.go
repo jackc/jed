@@ -9826,9 +9826,47 @@ func (db *Database) resolveSRF(name string, args []*Expr, alias *string, parent 
 		return db.resolveGenerateSeries(args, alias, argScope, ptypes)
 	case strings.EqualFold(name, "unnest"):
 		return db.resolveUnnest(args, alias, argScope, ptypes)
-	default:
-		return nil, nil, NewError(UndefinedFunction, "function does not exist: "+name)
 	}
+	// json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
+	// variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on, like
+	// the json accessor operators; the jsonb variants + `json_object_keys` ship here.
+	lname := strings.ToLower(name)
+	switch lname {
+	case "jsonb_array_elements":
+		return db.resolveJSONSrf(lname, srfJsonbArrayElements, ScalarT(Jsonb), true, args, alias, argScope, ptypes)
+	case "jsonb_array_elements_text":
+		return db.resolveJSONSrf(lname, srfJsonbArrayElementsText, ScalarT(Text), true, args, alias, argScope, ptypes)
+	case "jsonb_object_keys":
+		return db.resolveJSONSrf(lname, srfJsonbObjectKeys, ScalarT(Text), true, args, alias, argScope, ptypes)
+	case "json_object_keys":
+		return db.resolveJSONSrf(lname, srfJsonObjectKeys, ScalarT(Text), false, args, alias, argScope, ptypes)
+	case "json_array_elements", "json_array_elements_text":
+		return nil, nil, NewError(FeatureNotSupported, lname+" is not supported yet; use the jsonb variant")
+	}
+	return nil, nil, NewError(UndefinedFunction, "function does not exist: "+name)
+}
+
+// resolveJSONSrf resolves a json/jsonb single-column SRF (B2, json-sql-functions.md §3): the one
+// argument is a json/jsonb value (a bare string literal adapts to the expected document type). The
+// synthetic column's type is fixed (`jsonb`/`text`). A NULL argument yields zero rows at exec.
+func (db *Database) resolveJSONSrf(name string, kind srfKind, colTy Type, jsonb bool, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+	if len(args) != 1 {
+		return nil, nil, noFuncOverload(name)
+	}
+	want := Json
+	if jsonb {
+		want = Jsonb
+	}
+	forbidden := &aggCtx{}
+	r, t, err := resolve(argScope, *args[0], &want, forbidden, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	ok := t.kind == rtNull || (jsonb && t.kind == rtJsonb) || (!jsonb && t.kind == rtJson)
+	if !ok {
+		return nil, nil, noFuncOverload(name)
+	}
+	return srfTable(name, alias, colTy), &srfPlan{kind: kind, args: []*rExpr{r}}, nil
 }
 
 // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
@@ -9982,6 +10020,62 @@ func (db *Database) generateSeriesRows(sp *srfPlan, env *evalEnv, m *Meter) ([]R
 			break
 		}
 		cur = next
+	}
+	return out, nil
+}
+
+// jsonSrfRows generates the rows of a json/jsonb single-column SRF (B2, json-sql-functions.md §3). A
+// NULL argument yields zero rows (empty_on_null). array_elements[_text] over a non-array, or
+// object_keys over a non-object, is 22023. Each produced row charges one generated_row.
+func (db *Database) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, error) {
+	arg, err := sp.args[0].eval(nil, env, m)
+	if err != nil {
+		return nil, err
+	}
+	if arg.Kind == ValNull {
+		return nil, nil
+	}
+	node, err := jsonArgNode(arg)
+	if err != nil {
+		return nil, err
+	}
+	var out []Row
+	switch sp.kind {
+	case srfJsonbArrayElements, srfJsonbArrayElementsText:
+		if node.Kind != JArray {
+			return nil, NewError(InvalidParameterValue, "cannot extract elements from a scalar")
+		}
+		for i := range node.Arr {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(Costs.GeneratedRow)
+			e := node.Arr[i]
+			var v Value
+			if sp.kind == srfJsonbArrayElementsText {
+				if s, ok := jsonNodeToText(&e); ok {
+					v = TextValue(s)
+				} else {
+					v = NullValue()
+				}
+			} else {
+				v = JsonbValue(e)
+			}
+			out = append(out, Row{v})
+		}
+	case srfJsonbObjectKeys, srfJsonObjectKeys:
+		if node.Kind != JObject {
+			return nil, NewError(InvalidParameterValue, "cannot call jsonb_object_keys on a non-object")
+		}
+		for i := range node.Obj {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(Costs.GeneratedRow)
+			out = append(out, Row{TextValue(node.Obj[i].Key)})
+		}
+	default:
+		panic("jsonSrfRows only handles the json SRF kinds")
 	}
 	return out, nil
 }
@@ -11317,6 +11411,8 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 			return db.generateSeriesRows(rel.srf, env, meter)
 		case srfUnnest:
 			return db.unnestRows(rel.srf, env, meter)
+		case srfJsonbArrayElements, srfJsonbArrayElementsText, srfJsonbObjectKeys, srfJsonObjectKeys:
+			return db.jsonSrfRows(rel.srf, env, meter)
 		}
 		return nil, nil
 	}
@@ -13846,6 +13942,17 @@ const (
 	srfGenerateSeries srfKind = iota
 	// srfUnnest is unnest(anyarray) — one row per array element, flattened row-major (array-functions.md §9).
 	srfUnnest
+	// srfJsonbArrayElements is jsonb_array_elements(jsonb) — one `jsonb` row per array element
+	// (json-sql-functions.md §3).
+	srfJsonbArrayElements
+	// srfJsonbArrayElementsText is jsonb_array_elements_text(jsonb) — one `text` row per array element
+	// (the `->>`-style render).
+	srfJsonbArrayElementsText
+	// srfJsonbObjectKeys is jsonb_object_keys(jsonb) — one `text` row per object key, in canonical key order.
+	srfJsonbObjectKeys
+	// srfJsonObjectKeys is json_object_keys(json) — one `text` row per object key, in INPUT order
+	// (duplicates kept).
+	srfJsonObjectKeys
 )
 
 // srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,

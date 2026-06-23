@@ -365,7 +365,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           cap `func.json_processing`, oracle-clean. _follow-on:_ builders `to_json[b]` /
           `json[b]_build_array`/`_object` / `json[b]_object` / `jsonb_set`/`_insert` / `row_to_json` /
           `array_to_json` (cap `func.json_builders`).
-  - [ ] **R1 / R2** — `json[b]_to_record(set)` (needs C0) / `json[b]_populate_record(set)`. → json-table.md §2
+    - [x] **B2 (jsonb subset)** — ✅ `jsonb_array_elements` / `jsonb_array_elements_text` /
+          `jsonb_object_keys` (canonical order) / `json_object_keys` (input order, dups); FROM-clause
+          SRFs, implicitly lateral; non-array/non-object `22023`; NULL → 0 rows. All 3 cores, cap
+          `func.json_srf`, oracle-clean. _follow-on:_ `json_array_elements[_text]` (verbatim sub-text,
+          deferred `0A000` like the json accessors). B3 (two-col SRFs `json[b]_each`) needs C0; B4
+          (aggregates) is open.
   - [ ] **T1** — `JSON_TABLE` (default plan: nested-path LEFT-OUTER/UNION expansion); explicit `PLAN`
         → `0A000`. The highest-risk slice. → json-table.md §3
   - [ ] _follow-ons (deferred `0A000`):_ the string-**dictionary builder** (opens the json.md §3 door);

@@ -3558,3 +3558,59 @@ result         = "set_of_element"
 column         = "unnest"
 null           = "empty_on_null"
 errors         = []
+
+# json/jsonb single-column SRFs (B2, json-sql-functions.md §3). Each expands a document into a
+# one-column relation: jsonb_array_elements → one jsonb row per array element; _text → one text row
+# per element (the ->>-style render: a string element's raw content, a JSON null → SQL NULL, else
+# canonical); jsonb_object_keys → one text row per object key in canonical key order; json_object_keys
+# → one text row per key in INPUT order (duplicates kept). A non-array (array_elements) / non-object
+# (object_keys) is 22023; a NULL argument yields zero rows ("empty_on_null"); each produced row charges
+# one generated_row. The json `array_elements[_text]` variants (which preserve the verbatim sub-text,
+# json.md §4) are a deferred 0A000 follow-on, like the json accessor operators. FROM-clause only.
+[[set_returning]]
+name           = "jsonb_array_elements"
+kind           = "set_returning"
+surface        = "jsonb_array_elements"
+arity          = 1
+arg_families   = ["jsonb"]
+arg_resolution = "none"
+result         = "jsonb"
+column         = "value"
+null           = "empty_on_null"
+errors         = ["22023"]
+
+[[set_returning]]
+name           = "jsonb_array_elements_text"
+kind           = "set_returning"
+surface        = "jsonb_array_elements_text"
+arity          = 1
+arg_families   = ["jsonb"]
+arg_resolution = "none"
+result         = "text"
+column         = "value"
+null           = "empty_on_null"
+errors         = ["22023"]
+
+[[set_returning]]
+name           = "jsonb_object_keys"
+kind           = "set_returning"
+surface        = "jsonb_object_keys"
+arity          = 1
+arg_families   = ["jsonb"]
+arg_resolution = "none"
+result         = "text"
+column         = "jsonb_object_keys"
+null           = "empty_on_null"
+errors         = ["22023"]
+
+[[set_returning]]
+name           = "json_object_keys"
+kind           = "set_returning"
+surface        = "json_object_keys"
+arity          = 1
+arg_families   = ["json"]
+arg_resolution = "none"
+result         = "text"
+column         = "json_object_keys"
+null           = "empty_on_null"
+errors         = ["22023"]

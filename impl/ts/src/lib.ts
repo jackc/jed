@@ -93,6 +93,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // json/jsonb introspection + processing functions (B1) — json[b]_typeof / _array_length /
   // _strip_nulls / jsonb_pretty (json-sql-functions.md §2).
   "func.json_processing",
+  // json/jsonb single-column SRFs (B2) — jsonb_array_elements[_text] / json[b]_object_keys
+  // (json-sql-functions.md §3).
+  "func.json_srf",
   // Range accessor functions RF1 (range-functions.md §1): the polymorphic anyrange resolution +
   // the seven STRICT readers lower/upper/isempty/lower_inc/upper_inc/lower_inf/upper_inf.
   "func.range_accessors",

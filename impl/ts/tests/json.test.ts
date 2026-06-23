@@ -88,3 +88,20 @@ test("jsonb_pretty matches PG", () => {
     '{\n    "a": {\n    },\n    "b": [\n    ]\n}',
   );
 });
+
+// The `json` set-returning variants `json_array_elements` / `json_array_elements_text` are a
+// deferred 0A000 follow-on (they would have to preserve the verbatim element sub-text — json.md §4);
+// the jsonb variants + `json_object_keys` are oracle-clean in suites/json/json_srf.test. Mirrors
+// impl/rust/tests/json.rs json_array_elements_srf_is_deferred and impl/go/json_test.go
+// TestJSONArrayElementsSrfIsDeferred.
+test("json_array_elements SRF is deferred", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => execute(db, "SELECT * FROM json_array_elements('[1,2]'::json)")),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, "SELECT * FROM json_array_elements_text('[1,2]'::json)")),
+    "0A000",
+  );
+});

@@ -107,6 +107,25 @@ fn json_accessor_operators_are_deferred() {
     assert_eq!(err(&mut db, "SELECT j #> '{a}' FROM t"), "0A000");
 }
 
+/// The `json` set-returning variants `json_array_elements` / `json_array_elements_text` are a
+/// deferred `0A000` follow-on (they would have to preserve the verbatim element sub-text — json.md
+/// §4); the jsonb variants + `json_object_keys` are oracle-clean in suites/json/json_srf.test.
+#[test]
+fn json_array_elements_srf_is_deferred() {
+    let mut db = Database::new();
+    assert_eq!(
+        err(&mut db, "SELECT * FROM json_array_elements('[1,2]'::json)"),
+        "0A000"
+    );
+    assert_eq!(
+        err(
+            &mut db,
+            "SELECT * FROM json_array_elements_text('[1,2]'::json)"
+        ),
+        "0A000"
+    );
+}
+
 /// `jsonb_pretty` renders the PG indented multi-line form (4-space indent, one space after `:`, a
 /// container ALWAYS multi-lines — an empty `{}` is `{` newline `}`). Pinned against the postgres:18
 /// oracle; the multi-line output can't live in the line-based corpus.

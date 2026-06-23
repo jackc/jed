@@ -1,0 +1,82 @@
+# json/jsonb single-column set-returning functions (B2, spec/design/json-sql-functions.md §3) in
+# FROM position: jsonb_array_elements → setof jsonb (one row per array element), _text → setof text
+# (the ->>-style render — a string element's raw content, a JSON null → SQL NULL, else canonical),
+# jsonb_object_keys → setof text in canonical key order, json_object_keys → setof text in INPUT order
+# (duplicate keys kept). A non-array (array_elements) / non-object (object_keys) is 22023; a NULL
+# argument yields zero rows. Implicitly lateral (an SRF). The json array_elements[_text] variants
+# (verbatim sub-text, json.md §4) are deferred (a per-core test). Output matches the postgres:18
+# oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, types.json, func.json_srf
+
+# jsonb_array_elements — one jsonb row per element (a JSON null element is the `null` node).
+query T nosort
+SELECT * FROM jsonb_array_elements('[1, "a", {"x":1}, null]'::jsonb)
+----
+1
+"a"
+{"x": 1}
+null
+
+# jsonb_array_elements_text — each element as text (string → raw content, JSON null → SQL NULL).
+query T nosort
+SELECT * FROM jsonb_array_elements_text('[1, "a", {"x":1}, null]'::jsonb)
+----
+1
+a
+{"x": 1}
+NULL
+
+# jsonb_object_keys — keys in canonical order (b, c length 1 before aa length 2).
+query T nosort
+SELECT * FROM jsonb_object_keys('{"b":1,"aa":2,"c":3}'::jsonb)
+----
+b
+c
+aa
+
+# json_object_keys — keys in INPUT order, duplicates preserved.
+query T nosort
+SELECT * FROM json_object_keys('{"b":1,"a":2,"b":3}'::json)
+----
+b
+a
+b
+
+# A NULL argument yields zero rows.
+query T nosort
+SELECT * FROM jsonb_array_elements(NULL::jsonb)
+----
+
+# An empty array / empty object yields zero rows.
+query T nosort
+SELECT * FROM jsonb_object_keys('{}'::jsonb)
+----
+
+# A non-array array_elements / a non-object object_keys is 22023.
+statement error 22023
+SELECT * FROM jsonb_array_elements('5'::jsonb)
+
+statement error 22023
+SELECT * FROM jsonb_object_keys('[1,2]'::jsonb)
+
+# Implicitly lateral over a column (a correlated SRF via CROSS JOIN — an SRF is implicitly lateral):
+# the total element count across all rows (2 + 1 + 0 = 3; the empty array contributes zero rows).
+statement ok
+CREATE TABLE docs (id i32 PRIMARY KEY, tags jsonb)
+
+statement ok
+INSERT INTO docs VALUES (1, '["x","y"]'), (2, '["z"]'), (3, '[]')
+
+query I nosort
+SELECT count(*) FROM docs d CROSS JOIN jsonb_array_elements_text(d.tags)
+----
+3
+
+# Each produced element's row id (the lateral correlation visible) — doc 1 twice, doc 2 once, doc 3
+# (empty) zero times.
+query I rowsort
+SELECT d.id FROM docs d CROSS JOIN jsonb_array_elements(d.tags)
+----
+1
+1
+2

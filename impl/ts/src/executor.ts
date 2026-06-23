@@ -7297,7 +7297,85 @@ export class Database {
     if (lname === "generate_series")
       return this.resolveGenerateSeries(args, alias, argScope, ptypes);
     if (lname === "unnest") return this.resolveUnnest(args, alias, argScope, ptypes);
+    // json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
+    // variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on, like
+    // the json accessor operators; the jsonb variants + `json_object_keys` ship here.
+    switch (lname) {
+      case "jsonb_array_elements":
+        return this.resolveJsonSrf(
+          lname,
+          "jsonb_array_elements",
+          scalarT("jsonb"),
+          true,
+          args,
+          alias,
+          argScope,
+          ptypes,
+        );
+      case "jsonb_array_elements_text":
+        return this.resolveJsonSrf(
+          lname,
+          "jsonb_array_elements_text",
+          scalarT("text"),
+          true,
+          args,
+          alias,
+          argScope,
+          ptypes,
+        );
+      case "jsonb_object_keys":
+        return this.resolveJsonSrf(
+          lname,
+          "jsonb_object_keys",
+          scalarT("text"),
+          true,
+          args,
+          alias,
+          argScope,
+          ptypes,
+        );
+      case "json_object_keys":
+        return this.resolveJsonSrf(
+          lname,
+          "json_object_keys",
+          scalarT("text"),
+          false,
+          args,
+          alias,
+          argScope,
+          ptypes,
+        );
+      case "json_array_elements":
+      case "json_array_elements_text":
+        throw engineError(
+          "feature_not_supported",
+          lname + " is not supported yet; use the jsonb variant",
+        );
+    }
     throw engineError("undefined_function", "function does not exist: " + name);
+  }
+
+  // resolveJsonSrf resolves a json/jsonb single-column SRF (B2, json-sql-functions.md §3): the one
+  // argument is a json/jsonb value (a bare string literal adapts to the expected document type). The
+  // synthetic column's type is fixed (`jsonb`/`text`). A NULL argument yields zero rows at exec.
+  private resolveJsonSrf(
+    name: string,
+    kind: SrfKind,
+    colTy: Type,
+    jsonb: boolean,
+    args: Expr[],
+    alias: string | null,
+    argScope: Scope,
+    ptypes: ParamTypes,
+  ): { table: Table; srf: SrfPlan } {
+    if (args.length !== 1) throw noFuncOverload(name);
+    const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const { node, type } = resolve(argScope, args[0]!, jsonb ? "jsonb" : "json", forbidden, ptypes);
+    const ok =
+      type.kind === "null" || (jsonb && type.kind === "jsonb") || (!jsonb && type.kind === "json");
+    if (!ok) throw noFuncOverload(name);
+    const table = srfTable(name, alias, colTy);
+    return { table, srf: { kind, args: [node] } };
   }
 
   // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
@@ -7410,6 +7488,51 @@ export class Database {
       meter.guard();
       meter.charge(COSTS.generatedRow);
       out.push([e]);
+    }
+    return out;
+  }
+
+  // jsonSrfRows generates the rows of a json/jsonb single-column SRF (B2, json-sql-functions.md §3). A
+  // NULL argument yields zero rows (empty_on_null). array_elements[_text] over a non-array, or
+  // object_keys over a non-object, is 22023. Each produced row charges one generatedRow.
+  private jsonSrfRows(srf: SrfPlan, env: EvalEnv, meter: Meter): Row[] {
+    const arg = evalExpr(srf.args[0]!, [], env, meter);
+    // A NULL argument → zero rows (PG; the empty_on_null discipline).
+    if (arg.kind === "null") return [];
+    const node = jsonArgNode(arg);
+    const out: Row[] = [];
+    switch (srf.kind) {
+      case "jsonb_array_elements":
+      case "jsonb_array_elements_text": {
+        if (node.kind !== "array")
+          throw engineError("invalid_parameter_value", "cannot extract elements from a scalar");
+        for (const e of node.elements) {
+          meter.guard();
+          meter.charge(COSTS.generatedRow);
+          const v =
+            srf.kind === "jsonb_array_elements_text"
+              ? ((t) => (t === null ? nullValue() : textValue(t)))(nodeToText(e))
+              : jsonbValue(e);
+          out.push([v]);
+        }
+        break;
+      }
+      case "jsonb_object_keys":
+      case "json_object_keys": {
+        if (node.kind !== "object")
+          throw engineError(
+            "invalid_parameter_value",
+            "cannot call jsonb_object_keys on a non-object",
+          );
+        for (const m of node.members) {
+          meter.guard();
+          meter.charge(COSTS.generatedRow);
+          out.push([textValue(m.key)]);
+        }
+        break;
+      }
+      default:
+        throw new Error("jsonSrfRows only handles the json SRF kinds");
     }
     return out;
   }
@@ -7646,9 +7769,17 @@ export class Database {
     // A set-returning relation is generated, not scanned (functions.md §10): produce its rows,
     // charging generated_row per element (its args read outer — implicitly lateral, §44).
     if (rel.srf !== undefined) {
-      return rel.srf.kind === "unnest"
-        ? this.unnestRows(rel.srf, env, meter)
-        : this.generateSeriesRows(rel.srf, env, meter);
+      switch (rel.srf.kind) {
+        case "unnest":
+          return this.unnestRows(rel.srf, env, meter);
+        case "generate_series":
+          return this.generateSeriesRows(rel.srf, env, meter);
+        case "jsonb_array_elements":
+        case "jsonb_array_elements_text":
+        case "jsonb_object_keys":
+        case "json_object_keys":
+          return this.jsonSrfRows(rel.srf, env, meter);
+      }
     }
     // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a MATERIALIZED
     // CTE reads its buffer (charging cte_scan_row, guarded so a runaway scan aborts 54P01); an INLINE
@@ -10664,7 +10795,17 @@ type PlanRel = {
 // (spec/design/functions.md §10, array-functions.md §9). The dispatch is hand-written per core.
 //   "generate_series" — generate_series(start, stop[, step]), an integer series (functions.md §10).
 //   "unnest"          — unnest(anyarray), one row per array element, flattened (array-functions.md §9).
-type SrfKind = "generate_series" | "unnest";
+//   "jsonb_array_elements"      — one `jsonb` row per array element (json-sql-functions.md §3).
+//   "jsonb_array_elements_text" — one `text` row per array element (the `->>`-style render).
+//   "jsonb_object_keys"         — one `text` row per object key, in canonical key order.
+//   "json_object_keys"          — one `text` row per object key, in INPUT order (duplicates kept).
+type SrfKind =
+  | "generate_series"
+  | "unnest"
+  | "jsonb_array_elements"
+  | "jsonb_array_elements_text"
+  | "jsonb_object_keys"
+  | "json_object_keys";
 
 // SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =

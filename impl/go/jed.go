@@ -516,6 +516,9 @@ var SupportedCapabilities = []string{
 	// json/jsonb introspection + processing functions (B1) — json[b]_typeof / _array_length /
 	// _strip_nulls / jsonb_pretty (json-sql-functions.md §2).
 	"func.json_processing",
+	// json/jsonb single-column SRFs (B2) — jsonb_array_elements[_text] / json[b]_object_keys
+	// (json-sql-functions.md §3).
+	"func.json_srf",
 }
 
 // Execute parses and executes one SQL statement against db (no bind parameters).

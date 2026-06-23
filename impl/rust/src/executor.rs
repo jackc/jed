@@ -8662,10 +8662,89 @@ impl Database {
         if name.eq_ignore_ascii_case("unnest") {
             return self.resolve_unnest(args, alias, &arg_scope, ptypes);
         }
+        // json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
+        // variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on,
+        // like the json accessor operators; the jsonb variants + `json_object_keys` ship here.
+        let lname = name.to_ascii_lowercase();
+        if let Some((kind, col_ty, jsonb)) = match lname.as_str() {
+            "jsonb_array_elements" => Some((
+                SrfKind::JsonbArrayElements,
+                Type::Scalar(ScalarType::Jsonb),
+                true,
+            )),
+            "jsonb_array_elements_text" => Some((
+                SrfKind::JsonbArrayElementsText,
+                Type::Scalar(ScalarType::Text),
+                true,
+            )),
+            "jsonb_object_keys" => Some((
+                SrfKind::JsonbObjectKeys,
+                Type::Scalar(ScalarType::Text),
+                true,
+            )),
+            "json_object_keys" => Some((
+                SrfKind::JsonObjectKeys,
+                Type::Scalar(ScalarType::Text),
+                false,
+            )),
+            "json_array_elements" | "json_array_elements_text" => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!("{lname} is not supported yet; use the jsonb variant"),
+                ));
+            }
+            _ => None,
+        } {
+            return self
+                .resolve_json_srf(&lname, kind, col_ty, jsonb, args, alias, &arg_scope, ptypes);
+        }
         Err(EngineError::new(
             SqlState::UndefinedFunction,
             format!("function does not exist: {name}"),
         ))
+    }
+
+    /// Resolve a json/jsonb single-column SRF (B2, json-sql-functions.md §3): the one argument is a
+    /// json/jsonb value (a bare string literal adapts to the expected document type). The synthetic
+    /// column's type is fixed (`jsonb`/`text`). A NULL argument yields zero rows at exec.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_json_srf(
+        &self,
+        name: &str,
+        kind: SrfKind,
+        col_ty: Type,
+        jsonb: bool,
+        args: &[Expr],
+        alias: Option<&str>,
+        arg_scope: &Scope,
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
+        if args.len() != 1 {
+            return Err(no_func_overload(name));
+        }
+        let want = if jsonb {
+            ScalarType::Jsonb
+        } else {
+            ScalarType::Json
+        };
+        let (rarg, t) = resolve(
+            arg_scope,
+            &args[0],
+            Some(want),
+            &mut AggCtx::Forbidden,
+            ptypes,
+        )?;
+        let ok = match (&t, jsonb) {
+            (ResolvedType::Jsonb, true) | (ResolvedType::Json, false) | (ResolvedType::Null, _) => {
+                true
+            }
+            _ => false,
+        };
+        if !ok {
+            return Err(no_func_overload(name));
+        }
+        let table = srf_table(name, alias, col_ty);
+        Ok((table, vec![rarg], kind))
     }
 
     /// Resolve `generate_series(start, stop[, step])` (spec/design/functions.md §10): 2 or 3
@@ -8802,6 +8881,59 @@ impl Database {
     /// is produced as a NULL row). Each produced element charges one `generated_row` AT THE SOURCE,
     /// guarded so a `max_cost` ceiling aborts a runaway unnest (54P01) mid-generation, exactly like
     /// `generate_series` (CLAUDE.md §13).
+    /// Generate the rows of a json/jsonb single-column SRF (B2, json-sql-functions.md §3). A NULL
+    /// argument yields zero rows (`empty_on_null`). `array_elements[_text]` over a non-array, or
+    /// `object_keys` over a non-object, is `22023`. Each produced row charges one `generated_row`.
+    fn json_srf_rows(&self, srf: &SrfPlan, env: &EvalEnv, meter: &mut Meter) -> Result<Vec<Row>> {
+        let arg = srf.args[0].eval(&[], env, meter)?;
+        if matches!(arg, Value::Null) {
+            return Ok(Vec::new());
+        }
+        let node = json_arg_node(&arg)?;
+        let mut out: Vec<Row> = Vec::new();
+        match srf.kind {
+            SrfKind::JsonbArrayElements | SrfKind::JsonbArrayElementsText => {
+                let elems = match &node {
+                    JsonNode::Array(e) => e,
+                    _ => {
+                        return Err(EngineError::new(
+                            SqlState::InvalidParameterValue,
+                            "cannot extract elements from a scalar",
+                        ));
+                    }
+                };
+                for e in elems {
+                    meter.guard()?;
+                    meter.charge(COSTS.generated_row);
+                    let v = if matches!(srf.kind, SrfKind::JsonbArrayElementsText) {
+                        json::node_to_text(e).map_or(Value::Null, Value::Text)
+                    } else {
+                        Value::Jsonb(e.clone())
+                    };
+                    out.push(vec![v]);
+                }
+            }
+            SrfKind::JsonbObjectKeys | SrfKind::JsonObjectKeys => {
+                let members = match &node {
+                    JsonNode::Object(m) => m,
+                    _ => {
+                        return Err(EngineError::new(
+                            SqlState::InvalidParameterValue,
+                            "cannot call jsonb_object_keys on a non-object",
+                        ));
+                    }
+                };
+                for (k, _) in members {
+                    meter.guard()?;
+                    meter.charge(COSTS.generated_row);
+                    out.push(vec![Value::Text(k.clone())]);
+                }
+            }
+            _ => unreachable!("json_srf_rows only handles the json SRF kinds"),
+        }
+        Ok(out)
+    }
+
     fn unnest_rows(&self, srf: &SrfPlan, env: &EvalEnv, meter: &mut Meter) -> Result<Vec<Row>> {
         let arr = match srf.args[0].eval(&[], env, meter)? {
             // A NULL array → zero rows (PG; the `empty_on_null` discipline).
@@ -9118,6 +9250,10 @@ impl Database {
             return match srf.kind {
                 SrfKind::GenerateSeries => self.generate_series_rows(srf, &env, meter),
                 SrfKind::Unnest => self.unnest_rows(srf, &env, meter),
+                SrfKind::JsonbArrayElements
+                | SrfKind::JsonbArrayElementsText
+                | SrfKind::JsonbObjectKeys
+                | SrfKind::JsonObjectKeys => self.json_srf_rows(srf, &env, meter),
             };
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
@@ -12307,6 +12443,14 @@ enum SrfKind {
     GenerateSeries,
     /// `unnest(anyarray)` — one row per array element, flattened row-major (array-functions.md §9).
     Unnest,
+    /// `jsonb_array_elements(jsonb)` — one `jsonb` row per array element (json-sql-functions.md §3).
+    JsonbArrayElements,
+    /// `jsonb_array_elements_text(jsonb)` — one `text` row per array element (the `->>`-style render).
+    JsonbArrayElementsText,
+    /// `jsonb_object_keys(jsonb)` — one `text` row per object key, in canonical key order.
+    JsonbObjectKeys,
+    /// `json_object_keys(json)` — one `text` row per object key, in INPUT order (duplicates kept).
+    JsonObjectKeys,
 }
 
 /// A resolved set-returning-function row source (spec/design/functions.md §10, array-functions.md

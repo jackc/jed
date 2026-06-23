@@ -219,3 +219,17 @@ func TestJsonbPrettyMatchesPG(t *testing.T) {
 		t.Errorf("jsonb_pretty nested empties = %q, want %q", got, want)
 	}
 }
+
+// TestJSONArrayElementsSrfIsDeferred: the `json` set-returning variants `json_array_elements` /
+// `json_array_elements_text` are a deferred 0A000 follow-on (they would have to preserve the verbatim
+// element sub-text — json.md §4); the jsonb variants + `json_object_keys` are oracle-clean in
+// suites/json/json_srf.test. Mirrors impl/rust/tests/json.rs.
+func TestJSONArrayElementsSrfIsDeferred(t *testing.T) {
+	db := NewDatabase()
+	if got := errJSON(t, db, "SELECT * FROM json_array_elements('[1,2]'::json)"); got != "0A000" {
+		t.Errorf("json_array_elements: got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, "SELECT * FROM json_array_elements_text('[1,2]'::json)"); got != "0A000" {
+		t.Errorf("json_array_elements_text: got %s, want 0A000", got)
+	}
+}
