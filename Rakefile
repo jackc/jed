@@ -114,9 +114,11 @@ def for_each_repo
   abort "references: failed for #{failures.join(', ')}" unless failures.empty?
 end
 
-# Bare `rake` is read-only on purpose — provisioning (multi-GB clones) must be
-# explicit via `rake references:setup`.
-task default: "references:status"
+# Bare `rake` runs the engine test suites (the conventional default — `rake test`: the
+# conformance corpus on all three cores + per-core unit tests + the CLI tests). It never
+# provisions references — those multi-GB clones stay explicit via `rake references:setup`,
+# and `rake references:status` remains available by name.
+task default: :test
 
 # verify — run the spec's data-table checkers (no engine required). Each checker is
 # an independent reference implementation that recomputes values from the rules and
@@ -173,6 +175,7 @@ end
 RUST_MANIFEST = File.join(__dir__, "impl/rust/Cargo.toml")
 CLI_MANIFEST  = File.join(__dir__, "cli/Cargo.toml")
 GO_DIR        = File.join(__dir__, "impl/go")
+TS_DIR        = File.join(__dir__, "impl/ts")
 TS_CORE_DIRS  = %w[impl/ts bench/ts] # biome (mise-pinned); biome.json scopes paths + excludes generated
 WEB_DIR       = "web"                # prettier (npm-pinned); reuses web's format / format:check scripts
 
@@ -327,8 +330,8 @@ end
 
 # cli — the `jed` terminal client (spec/design/cli.md), a HOST PROGRAM at /cli: a
 # standalone crate so its TUI dependencies never enter the zero-dep engine cores. Its
-# tests run in `rake ci` (its only gate); the engine cores' unit suites run per-core as
-# usual, outside Rake.
+# tests run as part of `rake test` (and so `rake ci`), alongside the engine cores'
+# conformance corpus (`rake conformance`) and per-core unit suites (`rake unit`).
 namespace :cli do
   desc "Build the jed CLI (release) to cli/target/release/jed"
   task :build do
@@ -490,11 +493,76 @@ task :stress, [:filter] do |_, args|
   aggregate_stress(dir)
 end
 
-# ci — the aggregate gate. Chains the toolchain-light spec checks, the formatter gate, the TS
-# linter, the CLI's tests, and the metamorphic sweep, so one command reproduces what CI enforces.
-# Each is `sh`/task-failure propagating, so `rake ci` exits non-zero on the first failure.
-desc "CI gate: spec data checks + core formatting + TS lint + CLI tests + the NoREC/TLP sweep + reducer self-test"
-task ci: %w[verify fmt lint cli:test] do
+# conformance — the §7 contract: every core walks the hand-authored corpus
+# (spec/conformance/suites) and must produce identical pass/fail. This is the spine of the
+# project (CLAUDE.md §7/§10) — the example-based truth `rake test`/`rake ci` rest on. Each
+# core's harness locates the corpus by walking up to spec/conformance/suites, so cwd only has
+# to be inside the repo (Go needs impl/go for `./cmd/conformance`, Node the impl/ts scripts).
+# Rust runs RELEASE: the debug evaluator's giant frames overflow the native stack on
+# resource/depth_limit.test's deep nesting (the 256-depth limit is budgeted for the release stack).
+namespace :conformance do
+  desc "Walk the conformance corpus on the Rust core (release — debug overflows depth_limit)"
+  task :rust do
+    puts "conformance: rust"
+    sh "cargo", "run", "--release", "--quiet", "--bin", "conformance", "--manifest-path", RUST_MANIFEST
+  end
+
+  desc "Walk the conformance corpus on the Go core"
+  task :go do
+    puts "conformance: go"
+    Dir.chdir(GO_DIR) { sh "go", "run", "./cmd/conformance" }
+  end
+
+  desc "Walk the conformance corpus on the TS core"
+  task :ts do
+    puts "conformance: ts"
+    Dir.chdir(TS_DIR) { sh "npm", "run", "--silent", "conformance" }
+  end
+end
+desc "Walk the conformance corpus on all three cores (the §7 cross-core contract)"
+task conformance: %w[conformance:rust conformance:go conformance:ts]
+
+# unit — each core's per-language unit + integration suite: the checks the corpus CANNOT
+# express (CLAUDE.md §10) — deliberate PG divergences, catalog/byte-level/cost introspection,
+# host-API surface, internal invariants. Rust runs RELEASE for the same depth_limit.rs
+# native-stack reason as conformance above.
+namespace :unit do
+  desc "Run the Rust core's unit + integration tests (release — depth_limit.rs)"
+  task :rust do
+    puts "unit: rust"
+    sh "cargo", "test", "--release", "--manifest-path", RUST_MANIFEST
+  end
+
+  desc "Run the Go core's unit tests"
+  task :go do
+    puts "unit: go"
+    Dir.chdir(GO_DIR) { sh "go", "test", "./..." }
+  end
+
+  desc "Run the TS core's unit tests"
+  task :ts do
+    puts "unit: ts"
+    Dir.chdir(TS_DIR) { sh "npm", "run", "--silent", "test" }
+  end
+end
+desc "Run every core's per-language unit + integration suite"
+task unit: %w[unit:rust unit:go unit:ts]
+
+# test — the engine test suites: example-based correctness against authored expectations. The
+# conformance corpus on all three cores + each core's unit suite + the CLI golden tests. This is
+# the inner dev loop; `rake ci` is the SUPERSET that wraps it with the static/spec/metamorphic
+# gates below.
+desc "Engine test suites: conformance corpus (×3 cores) + per-core unit tests + CLI tests"
+task test: %w[conformance unit cli:test]
+
+# ci — the full merge gate, a SUPERSET of `rake test`. Adds the checks that aren't example-based
+# tests: spec-data + byte-fixture verification + codegen-drift (`verify`), the formatter gate
+# (`fmt`), the TS linter (`lint`), and generative differential testing — the NoREC/TLP metamorphic
+# sweep + the reducer self-test. So `test` is example-based truth (corpus ×3 + unit + CLI); `ci`
+# wraps it with static hygiene, spec integrity, and property/metamorphic fuzzing. Each step is
+# `sh`/task-failure propagating, so `rake ci` exits non-zero on the first failure.
+desc "Full merge gate: rake test (corpus ×3 + unit + CLI) + spec verify + fmt + lint + NoREC/TLP sweep + reducer self-test"
+task ci: %w[verify fmt lint test] do
   Rake::Task["corpus:norec_sweep"].invoke
   Rake::Task["corpus:reduce_selftest"].invoke
 end
