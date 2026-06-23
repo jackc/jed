@@ -129,17 +129,21 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
       cume_dist/ntile, lag/lead, the aggregates as window functions (running + explicit
       ROWS/RANGE/GROUPS frames + value offsets + EXCLUDE), first_value/last_value/nth_value, the
       `WINDOW` named-window clause + `OVER name` + base-window extension, combination with GROUP
-      BY/aggregates, and a collation-honoring `ORDER BY`. The window stage **shares one partition/sort
-      pass** across specs with an identical definition and **slides** a no-EXCLUDE aggregate's frame
-      accumulator (expanding = fold-once for every aggregate; moving `count` = un-fold the left edge) —
-      cost-lowering only, lowering `window_frame_step`/`operator_eval` cross-core-identically (a NoREC
-      `window` relation + the `window_running_sum`/`window_moving_count` benchmarks guard it). New codes
-      42P20/22013/22014/22016; cost units `window_result`/`window_frame_step`; the `[[window]]` catalog
-      array. Divergences: within-partition order fully resolved (D1), percent_rank/cume_dist → decimal
-      not float8 (D2), float-keyed RANGE frames 0A000 (D3). Deferred follow-ons: prefix-compatible
-      (not just identical) sort sharing, a safely-invertible moving `sum`/`avg`/`min`/`max`/float
-      slide, RANGE offsets over a float (D3) / timestamp / date key, general-expression window keys,
-      `FILTER`/`WITHIN GROUP`, `IGNORE NULLS`. → [window.md](spec/design/window.md)
+      BY/aggregates, a collation-honoring `ORDER BY`, and **general-expression `PARTITION BY`/`ORDER BY`
+      keys** (`PARTITION BY a + b`, `ORDER BY a % 2`, and an aggregate as a key `ORDER BY sum(x)` in a
+      grouped query — resolved against the grouped row like a projection, a non-grouping column 42803;
+      a compound key is materialized into a synthetic window-key column before the window stage). The
+      window stage **shares one partition/sort pass** across specs with an identical definition and
+      **slides** a no-EXCLUDE aggregate's frame accumulator (expanding = fold-once for every aggregate;
+      moving `count` = un-fold the left edge) — cost-lowering only, lowering
+      `window_frame_step`/`operator_eval` cross-core-identically (a NoREC `window` relation + the
+      `window_running_sum`/`window_moving_count` benchmarks guard it). New codes 42P20/22013/22014/22016;
+      cost units `window_result`/`window_frame_step`; the `[[window]]` catalog array. Divergences:
+      within-partition order fully resolved (D1), percent_rank/cume_dist → decimal not float8 (D2),
+      float-keyed RANGE frames 0A000 (D3), correlated window keys 0A000. Deferred follow-ons:
+      prefix-compatible (not just identical) sort sharing, a safely-invertible moving
+      `sum`/`avg`/`min`/`max`/float slide, RANGE offsets over a float (D3) / timestamp / date key, a
+      correlated window key, `FILTER`/`WITHIN GROUP`, `IGNORE NULLS`. → [window.md](spec/design/window.md)
 - [x] **Scalar functions `abs` / `round`** — first named per-row functions (`kind = "function"`).
       → [functions.md §9](spec/design/functions.md)
   - [ ] _follow-on:_ `ceil`/`floor`/`mod`/`sign`, text `length`/`lower`/`upper`, a general implicit

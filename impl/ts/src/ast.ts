@@ -252,10 +252,26 @@ export type OrderKey = {
   nullsFirst: boolean;
 };
 
-// WindowDef is the body of an `OVER (...)` clause (spec/design/window.md §3). S0 carries
-// `PARTITION BY` columns and an `ORDER BY`. `partition` is narrowed to columns in S0 (the GROUP
-// BY/ORDER BY narrowing — general expressions are a follow-on); `order` reuses the query ORDER BY
-// sort keys.
+// WindowOrderKey is one window ORDER BY sort key (spec/design/window.md §3/§5.1). Unlike the query
+// OrderKey (column references only), a window sort key is a general expression (`ORDER BY a + b`,
+// `ORDER BY sum(x)` in a grouped query) — the deferred general-expression-key follow-on. A bare
+// column resolves to its row slot directly (unchanged); a compound expression is materialized into a
+// synthetic window-key column before the window stage. collation / descending / nullsFirst carry the
+// same meaning as OrderKey (the latter resolved at parse).
+export type WindowOrderKey = {
+  expr: Expr;
+  // An explicit `COLLATE "name"` on this key; null means the key expression's (text) collation. A
+  // COLLATE on a non-text key is 42804; an unknown name is 42704.
+  collation: string | null;
+  descending: boolean;
+  nullsFirst: boolean;
+};
+
+// WindowDef is the body of an `OVER (...)` clause (spec/design/window.md §3). Carries an optional
+// base-window name, `PARTITION BY`, `ORDER BY`, and a frame clause. Both `partition` and `order` are
+// general expressions (`PARTITION BY a + b`, `ORDER BY a % 2`, `ORDER BY sum(x)` in a grouped query —
+// spec/design/window.md §5.1); a bare column resolves to its row slot directly, a compound expression
+// is materialized into a synthetic window-key column before the window stage.
 export type WindowDef = {
   // An optional leading base-window name (`OVER (w ORDER BY …)`, `WINDOW w2 AS (w …)` — §5): the
   // definition extends the named base, inheriting its `PARTITION BY` (and its `ORDER BY` if any) and
@@ -264,7 +280,7 @@ export type WindowDef = {
   // window stage.
   base?: string | null;
   partition: Expr[];
-  order: OrderKey[];
+  order: WindowOrderKey[];
   // An explicit frame clause (`ROWS BETWEEN … AND …`), else null for the default frame
   // (spec/design/window.md §6). S4 supports `ROWS` mode; explicit `RANGE`/`GROUPS` and `EXCLUDE`
   // are parsed but rejected `0A000` at resolve.

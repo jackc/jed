@@ -310,6 +310,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // Base-window-extending definitions: OVER (w ORDER BY …) / WINDOW w2 AS (w …) (S9, window.md §5).
     "query.window_base_extend",
     "query.window_collation",
+    // General-expression window PARTITION BY / ORDER BY keys (window.md §5.1).
+    "query.window_expr_keys",
     // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
     "query.union",
     "query.intersect",

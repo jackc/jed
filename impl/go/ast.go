@@ -1076,12 +1076,26 @@ type OrderKey struct {
 	NullsFirst bool
 }
 
+// WindowOrderKey is one window ORDER BY sort key (spec/design/window.md §3/§5.1). Unlike the query
+// OrderKey (column references only), a window sort key is a general expression (`ORDER BY a + b`,
+// `ORDER BY sum(x)` in a grouped query) — the deferred general-expression-key follow-on. A bare
+// column is resolved to its row slot directly (unchanged); a compound expression is materialized
+// into a synthetic window-key column before the window stage. Collation / Descending / NullsFirst
+// carry the same meaning as OrderKey (the latter resolved at parse).
+type WindowOrderKey struct {
+	Expr Expr
+	// Collation is an explicit `COLLATE "name"` on this key; "" means the key expression's (text)
+	// collation. A COLLATE on a non-text key is 42804; an unknown name is 42704.
+	Collation  string
+	Descending bool
+	NullsFirst bool
+}
+
 // WindowDef is a window definition — the body of an OVER (...) clause (spec/design/window.md §3).
-// S0 carries PARTITION BY columns and an ORDER BY. Partition is narrowed to columns in S0 (the
-// GROUP BY/ORDER BY narrowing — general expressions are a follow-on); Order reuses the query ORDER
-// BY sort keys. Frame carries an explicit frame clause (`ROWS BETWEEN … AND …`), or nil for the
-// default frame (spec/design/window.md §6). S4 supports ROWS mode; explicit RANGE/GROUPS and
-// EXCLUDE are parsed but rejected 0A000 at resolve.
+// Carries an optional base-window name, PARTITION BY, ORDER BY, and a frame clause. Both Partition
+// and Order are general expressions (`PARTITION BY a + b`, `ORDER BY a % 2`, `ORDER BY sum(x)` in a
+// grouped query — spec/design/window.md §5.1); a bare column resolves to its row slot directly, a
+// compound expression is materialized into a synthetic window-key column before the window stage.
 //
 // Base is an optional leading base-window name (`OVER (w ORDER BY …)`, `WINDOW w2 AS (w …)` — §5):
 // the definition extends the named base, inheriting its PARTITION BY (and its ORDER BY if any) and
@@ -1090,7 +1104,7 @@ type OrderKey struct {
 type WindowDef struct {
 	Base      string
 	Partition []Expr
-	Order     []OrderKey
+	Order     []WindowOrderKey
 	Frame     *WindowFrame
 }
 

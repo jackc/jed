@@ -48,6 +48,11 @@ sql = "SELECT numeric 'NaN'"
 reason = "jed: jed's decimal is ALWAYS finite (decimal.md §2 — no NaN/±Infinity), so `numeric 'NaN'` traps 22P02. PostgreSQL's numeric has a NaN value and accepts it. A standing, documented decimal divergence (grammar.md §36, decimal.md §2)."
 
 [[override]]
+file = "window/expr_keys.test"
+sql = "SELECT k, (SELECT row_number() OVER (PARTITION BY we.a + outert.k) FROM we LIMIT 1) FROM outert"
+reason = "jed: a window PARTITION BY / ORDER BY key may not reference an enclosing-query column (a CORRELATED window) — the deferred general-expression-key follow-on stops at the current query level, so it is 0A000 (window.md §5.1/§11). PostgreSQL supports a correlated window inside a subquery and returns rows (k=1->1, k=2->1). A documented narrowing, not a semantic disagreement on the supported surface."
+
+[[override]]
 file = "types/decimal.test"
 sql = "SELECT id FROM c WHERE d = '2.5'"
 reason = "jed: decimal vs text is not comparable (42804). PG implicitly coerces the text literal to numeric and returns a row. The strict type system (§4) rejects the cross-family comparison."

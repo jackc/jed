@@ -1,0 +1,153 @@
+# General-expression window PARTITION BY / ORDER BY keys (spec/design/window.md §5.1). A window
+# definition's PARTITION BY and ORDER BY are general expressions, not just column references
+# (`PARTITION BY a + b`, `ORDER BY a % 2`) — the deferred S0 general-expression-key narrowing, lifted.
+# A bare column resolves to its row slot directly (byte-identical to before); a compound expression is
+# materialized into a synthetic window-key column before the window stage, then partition / sort /
+# frame run over it unchanged. In a grouped query the keys resolve against the GROUPED row exactly as
+# a projection does: a bare grouping column or an aggregate (`ORDER BY sum(x)`) is valid, a
+# non-grouping column is 42803 — the tie to the GROUP BY expression-key.
+#
+# These are oracle-clean: PostgreSQL agrees on every row (the expression is evaluated identically),
+# so the rows below come straight from the oracle.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, dml.insert_multi_row, query.select, query.order_by, query.aggregates, query.group_by, query.window, query.window_ranking, query.window_aggregate, query.window_frame, query.window_grouped, query.window_expr_keys, resource.cost_metering, types.i32
+
+statement ok
+CREATE TABLE we (id i32 PRIMARY KEY, a i32, b i32, g i32)
+
+statement ok
+INSERT INTO we VALUES (1,1,1,1),(2,1,2,1),(3,2,1,2),(4,2,2,2),(5,3,0,1),(6,0,3,2)
+
+# ============================================================================================
+# Plain PARTITION BY a + b: the rows with a+b = 3 (ids 2, 3, 5, 6) form one partition; row_number
+# and the running sum are computed within each a+b partition (ordered by id). The `a + b` key
+# expression is materialized per row (one operator_eval each), so the cost includes that work — and
+# it is identical across every core (the cross-core cost contract, CLAUDE.md §8/§13).
+# names: id, rn, s
+# cost: 43
+query III nosort
+SELECT id, row_number() OVER (PARTITION BY a + b ORDER BY id) AS rn,
+       sum(id) OVER (PARTITION BY a + b ORDER BY id) AS s
+FROM we ORDER BY id
+----
+1
+1
+1
+2
+1
+2
+3
+2
+5
+4
+1
+4
+5
+3
+10
+6
+4
+16
+
+# Plain ORDER BY a % 2: ranks over the 0/1 buckets (a%2=0 → ids 3,4,6 rank 1; a%2=1 → ids 1,2,5
+# rank 4). The ORDER BY key is a general expression evaluated per row.
+# names: id, a, rk
+query III nosort
+SELECT id, a, rank() OVER (ORDER BY a % 2) AS rk FROM we ORDER BY id
+----
+1
+1
+4
+2
+1
+4
+3
+2
+1
+4
+2
+1
+5
+3
+4
+6
+0
+1
+
+# Plain PARTITION BY a + b ORDER BY (b - a) with an expanding frame: BOTH keys are expressions and
+# the partition sorts by the ORDER BY expression (b-a), so the running sum follows that order.
+# names: id, s
+query II nosort
+SELECT id, sum(id) OVER (PARTITION BY a + b ORDER BY b - a
+                         ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS s
+FROM we ORDER BY id
+----
+1
+1
+2
+10
+3
+8
+4
+4
+5
+5
+6
+16
+
+# ============================================================================================
+# Grouped query — the keys resolve against the grouped row. ORDER BY sum(a) (an aggregate AS a
+# window key, resolved to its agg slot, NOT materialized) and PARTITION BY g % 2 (an expression
+# over the grouping column g, materialized) are both valid.
+# names: g, sa, rk, rn
+# cost: 33
+query IIII nosort
+SELECT g, sum(a) AS sa,
+       rank() OVER (ORDER BY sum(a)) AS rk,
+       row_number() OVER (PARTITION BY g % 2 ORDER BY sum(a) DESC) AS rn
+FROM we GROUP BY g ORDER BY g
+----
+1
+5
+2
+1
+2
+4
+1
+1
+
+# Grouped PARTITION BY g + 10 (expression over a grouping column) ORDER BY count(*) (aggregate key).
+# names: g, c, dr
+query III nosort
+SELECT g, count(*) AS c, dense_rank() OVER (PARTITION BY g + 10 ORDER BY count(*)) AS dr
+FROM we GROUP BY g ORDER BY g
+----
+1
+3
+1
+2
+3
+1
+
+# An aggregate inside a window key makes the query a whole-table aggregate even with NO GROUP BY
+# (PostgreSQL semantics): one group, so rank() OVER (ORDER BY sum(a)) is 1.
+# names: rk
+query I nosort
+SELECT rank() OVER (ORDER BY sum(a)) AS rk FROM we
+----
+1
+
+# ============================================================================================
+# A non-grouping column in a window key of a grouped query is 42803 — the same grouping rule that
+# binds a projection / ORDER BY, applied to the window key expression.
+statement error 42803
+SELECT g, rank() OVER (PARTITION BY a + 1) FROM we GROUP BY g
+
+# A window key may not reference an enclosing-query column (a correlated window) — deferred, 0A000.
+statement ok
+CREATE TABLE outert (k i32 PRIMARY KEY)
+
+statement ok
+INSERT INTO outert VALUES (1), (2)
+
+statement error 0A000
+SELECT k, (SELECT row_number() OVER (PARTITION BY we.a + outert.k) FROM we LIMIT 1) FROM outert

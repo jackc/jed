@@ -21,14 +21,18 @@
 > and `WINDOW w2 AS (w …)` inherit the base's `PARTITION BY` (and its `ORDER BY` if any) and supply
 > their own frame (§5) — and a window `ORDER BY` **honors collation** (S10): a per-key `COLLATE` and a
 > text column's frozen implicit collation order text by the collation's UCA sort key, driving both the
-> per-partition sort and peer determination (§3/§5). The window stage is also **optimized**
-> (cost-lowering only, never correctness — §5.2/§8): specs sharing an identical `PARTITION BY` +
-> `ORDER BY` are partitioned and sorted **once**, and a no-`EXCLUDE` aggregate **slides** its frame
-> accumulator (an expanding frame folds each row once for every aggregate; a moving `count` un-folds
-> the left edge) instead of re-folding each frame. The remaining `0A000` items — `RANGE` offsets over a float (divergence D3) /
-> timestamp / date ordering key (§6/§11), and **general-expression window keys** (an aggregate or
-> expression as a `PARTITION BY`/`ORDER BY` key, e.g. `ORDER BY sum(x)` — §11) — are deferred
-> follow-ons, not gaps.
+> per-partition sort and peer determination (§3/§5) — and a window's `PARTITION BY` / `ORDER BY` keys
+> are **general expressions** (S11): `PARTITION BY a + b`, `ORDER BY a % 2`, and — in a grouped query —
+> an aggregate *as* a key (`ORDER BY sum(x)`), resolved against the grouped row exactly as a
+> projection (a non-grouping column is `42803`); a compound key is materialized into a synthetic
+> window-key column before the window stage, so the slot-based machinery is unchanged (§5.1). The
+> window stage is also **optimized** (cost-lowering only, never correctness — §5.2/§8): specs sharing
+> an identical `PARTITION BY` + `ORDER BY` are partitioned and sorted **once**, and a no-`EXCLUDE`
+> aggregate **slides** its frame accumulator (an expanding frame folds each row once for every
+> aggregate; a moving `count` un-folds the left edge) instead of re-folding each frame. The remaining
+> `0A000` items — `RANGE` offsets over a float (divergence D3) / timestamp / date ordering key
+> (§6/§11), and a **correlated** window key (an enclosing-query column in a `PARTITION BY` / `ORDER BY`
+> — §11) — are deferred follow-ons, not gaps.
 
 A **window function** computes a value for **each row** from a *set* of related rows — its
 **window frame** — without collapsing the rows the way an aggregate does. `row_number() OVER
@@ -105,6 +109,22 @@ cores in lockstep** (Rust + Go + TS), spec-first, with corpus entries + a capabi
    byte-identity, [collation.md](collation.md) §7), collated peer groups coincide with byte-equal
    groups; only the order changes. `COLLATE` on a non-text key is `42804` (the query `ORDER BY` rule).
    Capability `query.window_collation`.
+11. **S11 — general-expression `PARTITION BY` / `ORDER BY` keys.** A window key is a general
+   expression, not just a column reference: `PARTITION BY a + b`, `ORDER BY a % 2`, and — in a grouped
+   query — an aggregate *as* a key (`ORDER BY sum(x)`, `PARTITION BY g % 2` over a grouping column).
+   The keys resolve against the grouped row **exactly as a projection does** (the tie to the GROUP BY
+   expression-key): in a plain window query against the input row (`Forbidden`), in a grouped one
+   against the grouped row (`Collect`, sharing the query's aggregate specs) — a bare grouping column
+   or aggregate is valid, a **non-grouping column is `42803`**; an aggregate inside a window key makes
+   the query a whole-table aggregate even with no `GROUP BY` (so `SELECT rank() OVER (ORDER BY sum(x))
+   FROM t` is one group, rank 1). A **bare column / aggregate** key keeps its real row slot (so a
+   column-only window is byte-identical to before); a **compound** key is materialized into a
+   synthetic window-key column evaluated per row before the window stage (`WINDOW_KEY_BASE` placeholder
+   → `input_width + k` after rebase), leaving the slot-based partition / sort / frame machinery
+   unchanged (§5.1). The materialized key expression is metered like any expression (`operator_eval`
+   per node) — new, deterministic, cross-core-identical work that exists only for an expression key.
+   A key referencing an **enclosing-query column** (a correlated window) is `0A000` (§11). Capability
+   `query.window_expr_keys`.
 
 Locked scope decisions: **the within-partition order is always fully resolved** (§3,
 deterministic — a divergence-adjacent strictness, §10); **`percent_rank`/`cume_dist` →
@@ -250,16 +270,30 @@ synthetic row  =  [ group_keys… , agg_results… , window_results… ]
   `FirstValue`/`LastValue`/`NthValue`), the resolved `partition_keys`, the resolved `order_keys`
   (with the PK tie-break appended, §3), the resolved frame (§6), and the resolved argument
   `RExpr`s.
-- **Argument resolution scope** (S8). In a non-grouped query, a window function's arguments and keys
-  resolve against the raw scan row. In a grouped query the **arguments** resolve against the grouped
-  synthetic row `[group_keys…, agg_results…]` — an aggregate nested in an argument collects into the
-  query's shared agg specs (`sum(sum(x)) OVER ()`), and a bare non-grouping column is `42803` — while
-  the `PARTITION BY`/`ORDER BY` **column** keys map to their grouping-column slot (`42803` if not a
-  grouping column). A window function in `WHERE`/`HAVING`/`GROUP BY`/another window's key, or nested
-  in another window function, is `42P20`; a window function nested in an *aggregate's* argument is
-  `42803`. Because the real window-result slot (`group_keys.len() + agg_specs.len() + w`) is not known
-  until every aggregate is collected (one may sit in a later window argument or in `HAVING`), a window
-  result is resolved to a placeholder slot and rebased to its real slot after resolution finishes.
+- **Argument *and key* resolution scope** (S8 / S11). A window function's arguments **and its
+  `PARTITION BY` / `ORDER BY` keys** resolve in the *same* sub-context: against the raw scan row
+  (`Forbidden`) in a non-grouped query, or against the grouped synthetic row `[group_keys…,
+  agg_results…]` (`Collect`, sharing the query's agg specs) in a grouped one. So an aggregate nested in
+  an argument collects (`sum(sum(x)) OVER ()`), a bare non-grouping column is `42803`, and — S11 — a
+  **key is a general expression** resolved the same way: `PARTITION BY a + b`, `ORDER BY a % 2`, and an
+  aggregate *as* a key (`ORDER BY sum(x)`, collected like any aggregate → its agg slot). A window
+  function in `WHERE`/`HAVING`/`GROUP BY`/another window's key, or nested in another window function,
+  is `42P20`; a window function nested in an *aggregate's* argument is `42803`; a key referencing an
+  enclosing-query column (a correlated window) is `0A000`.
+- **Window-key materialization** (S11). Each resolved key is mapped to a window-stage slot: a **bare
+  column / aggregate** (an `RExpr::Column`) keeps its real row slot — so a column-keyed window is
+  byte-identical to before, no extra column, no extra cost; a **compound** key (`a + b`, `a % 2`,
+  `sum(x) + 1`) is collected into a query-global `window_keys` list at a `WINDOW_KEY_BASE`
+  placeholder slot. Before the window stage each row evaluates the `window_keys` and **appends** the
+  values, so a materialized key reads slot `input_width + k` and the slot-based partition / sort /
+  frame machinery is unchanged; the key evaluation is metered like any expression (`operator_eval` per
+  node). The synthetic row therefore grows to `[group_keys… , agg_results… , window_keys… ,
+  window_results…]`.
+- Because neither the materialized-key count nor (in a grouped query) the final aggregate count is
+  known until resolution finishes, both a window result and a materialized window key are resolved to
+  a **placeholder slot** (`WINDOW_RESULT_BASE + w` / `WINDOW_KEY_BASE + k`) and rebased once the row
+  layout is final — results to `input_width + window_keys.len() + w`, keys to `input_width + k`. With
+  no compound keys `window_keys` is empty and a result lands at `input_width + w`, exactly as before.
 
 ### 5.2 The window operator
 
@@ -267,7 +301,9 @@ A blocking stage between projection/aggregation and `DISTINCT`/`ORDER BY`:
 
 1. **Materialize** the input rows (post-WHERE/GROUP-BY/HAVING) into a buffer — the stage is
    blocking by nature; under the spill follow-on it becomes a spilling sort
-   ([spill.md](spill.md)).
+   ([spill.md](spill.md)). Then **materialize the compound window keys** (S11): for each buffered row,
+   evaluate every `window_keys` expression and append the values, so a materialized key reads slot
+   `input_width + k`. Empty (a no-op) for a column-only window.
 2. For each **distinct window definition** (`partition_keys` + `order_keys` + frame): **partition**
    the buffer (value-canonical keys, an insertion-ordered partition list — §3), and **sort** each
    partition by `order_keys` with the PK tie-break. **Specs that share an identical `partition_keys`
@@ -426,9 +462,13 @@ precedent — their input cardinality is already bounded by upstream `storage_ro
   evaluated once and cached — never raising either and never changing the result. Charged at the
   identical per-fold/un-fold point in every core, so the count stays cross-core identical (§8/§13)
   and a `max_cost` ceiling still aborts an untrusted running-window query deterministically (`54P01`).
-- **Reused unchanged**: `storage_row_read` per scanned input row; the window arguments' and
-  partition/order keys' `operator_eval`s per input row; `row_produced` per emitted row; the
-  projection's `operator_eval`s per emitted row.
+- **Reused unchanged**: `storage_row_read` per scanned input row; the window arguments' `operator_eval`s
+  per input row; `row_produced` per emitted row; the projection's `operator_eval`s per emitted row.
+- **Window-key materialization** (S11, §5.1): a **compound** `PARTITION BY`/`ORDER BY` key
+  (`a + b`, `a % 2`) is evaluated once per input row and charges `operator_eval` per node, like any
+  expression — so an expression key adds metered work that a bare-column key does not. Deterministic
+  and cross-core identical (the same `RExpr` evaluated the same way in every core); a bare-column key
+  materializes nothing and is byte-identical to before.
 - **Unmetered**: the partition bucketing, the per-partition sort, and each spec's finalize (the
   ratio/`avg` division) — like the `ORDER BY` sort and the `DISTINCT` dedup.
 
@@ -481,10 +521,13 @@ Deliberate divergences from PostgreSQL, each registered in
 - **`FILTER (WHERE …)`** on an aggregate window, and `WITHIN GROUP` ordered-set/hypothetical-set
   window functions (`rank() WITHIN GROUP`, `percentile_cont`) — additive later features (the
   aggregate `FILTER` follow-on, [aggregates.md](aggregates.md) §10).
-- **General-expression `PARTITION BY`/`ORDER BY`** (`PARTITION BY a + b`, and — in a grouped query
-  (S8) — an aggregate *as* a window key, `ORDER BY sum(x)`) — window keys are column references only
-  (the `sort_key` grammar), so an aggregate/expression key does not parse; lifted with the
-  `GROUP BY`/`ORDER BY` expression-key follow-on (§1 S0 narrowing).
+- **General-expression `PARTITION BY`/`ORDER BY`** — ✅ **landed (S11).** `PARTITION BY a + b`,
+  `ORDER BY a % 2`, and — in a grouped query — an aggregate *as* a window key (`ORDER BY sum(x)`),
+  resolved against the grouped row like a projection (§5.1). The one remaining piece is a **correlated**
+  window key — an enclosing-query column in a `PARTITION BY`/`ORDER BY` (`(SELECT … OVER (PARTITION BY
+  outer.k) …)`) — which stays `0A000` (the general-expression-key follow-on stops at the current query
+  level; PG supports a correlated window inside a subquery, an oracle-overridden divergence in
+  `window/expr_keys.test`).
 - **`RANGE` value offsets over a timestamp/timestamptz/date key** (an `interval`/integer offset, D4)
   — deferred; only integer/decimal ordering keys take a value offset this slice. A float key stays
   `0A000` permanently (D3). Non-literal/expression frame offsets are also out (literals only, like

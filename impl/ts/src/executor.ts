@@ -6880,30 +6880,31 @@ export class Database {
     // mode (columns normal). Output names per grammar.md §8.
     // GROUP BY, an aggregate in the select list, OR a HAVING clause all make this an aggregate
     // query (HAVING alone groups the whole table — grammar.md §19).
-    const isAgg = groupKeys.length > 0 || itemsHaveAggregate(sel.items) || sel.having !== null;
+    // An aggregate inside a window definition's keys also makes the query an aggregate query —
+    // inline (`OVER (ORDER BY sum(x))`, caught by itemsHaveAggregate) or in a WINDOW-clause entry
+    // (`WINDOW w AS (ORDER BY sum(x))`, scanned here before the desugar). spec/design/window.md §5.1.
+    const isAgg =
+      groupKeys.length > 0 ||
+      itemsHaveAggregate(sel.items) ||
+      sel.having !== null ||
+      windowsHaveAggregate(sel.windows);
     // A window query (a select-list OVER call) resolves its projection in a window-aware mode, where
     // bare columns read the input/grouped row and window calls collect into synthetic slots
     // (spec/design/window.md §5.1). A grouped query that ALSO windows is both collecting AND windowing
     // (the window stage runs over the grouped rows — §2); a plain window query is only windowing.
     const hasWindowSyntax = itemsHaveWindow(sel.items);
+    // Window results land AFTER the materialized window keys, and (for a grouped query) after every
+    // aggregate — neither final count is known until resolution finishes (an aggregate may be nested
+    // in a later window argument or HAVING). So a window result carries the PLACEHOLDER base
+    // WINDOW_RESULT_BASE, rebased afterwards to inputWidth+windowKeys.length+w (window.md §5.1); a
+    // materialized window key carries WINDOW_KEY_BASE+k, rebased to inputWidth+k.
     const projAgg: AggCtx = hasWindowSyntax
-      ? isAgg
-        ? {
-            // Grouped+window: collect aggregates AND window functions. Window results carry the
-            // PLACEHOLDER base WINDOW_RESULT_BASE — their real slot groupKeys.length+specs.length+w
-            // is unknown until every aggregate is collected (one may be nested in a later window
-            // argument or HAVING), so they are rebased afterwards (window.md §5.1).
-            collecting: true,
-            groupKeys,
-            specs: [],
-            window: { base: WINDOW_RESULT_BASE, windowSpecs: [] },
-          }
-        : {
-            collecting: false,
-            groupKeys,
-            specs: [],
-            window: { base: scope.width(), windowSpecs: [] },
-          }
+      ? {
+          collecting: isAgg,
+          groupKeys,
+          specs: [],
+          window: { base: WINDOW_RESULT_BASE, windowSpecs: [], windowKeys: [] },
+        }
       : { collecting: isAgg, groupKeys, specs: [] };
     // Resolve the WINDOW clause: an entry may extend an earlier entry (`w2 AS (w ORDER BY …)` —
     // window.md §5), so each is merged against the already-resolved earlier entries (a missing/
@@ -6926,8 +6927,10 @@ export class Database {
       types: columnTypes,
     } = resolveProjections(scope, itemsRef, projAgg, ptypes);
     let aggSpecs = projAgg.specs;
-    // The collected window specs (empty unless a window query). spec/design/window.md §5.1.
+    // The collected window specs + materialized window-key expressions (empty unless a window query).
+    // spec/design/window.md §5.1.
     const windowSpecs: WindowSpec[] = projAgg.window?.windowSpecs ?? [];
+    const windowKeys: RExpr[] = projAgg.window?.windowKeys ?? [];
     const hasWindow = windowSpecs.length > 0;
     // HAVING resolves in collect mode with window functions FORBIDDEN (42P20 — HAVING runs BEFORE the
     // window stage, window.md §7), continuing the aggregate specs so its aggregates slot after the
@@ -6943,12 +6946,28 @@ export class Database {
       having = node;
       aggSpecs = hctx.specs;
     }
-    // Rewrite each grouped+window projection's window-result placeholder to its real grouped-row slot
-    // now that every aggregate (projection + HAVING + nested in a window argument) is collected
-    // (window.md §5.1). Window results appear only in the projection (42P20 elsewhere).
-    if (hasWindow && isAgg) {
-      const wbase = groupKeys.length + aggSpecs.length;
-      for (const p of projections) rebaseWindowResults(p, wbase);
+    // Rebase the window placeholder slots now that the row layout is final (window.md §5.1). The
+    // window stage's row is [input… , materialized window keys… , window results…], where inputWidth
+    // is the grouped row's width (group keys + every aggregate) for a grouped+window query, else the
+    // FROM scope width. A materialized window-key slot WINDOW_KEY_BASE+k rewrites to inputWidth+k (in
+    // each spec's PARTITION BY / ORDER BY); a window-result slot WINDOW_RESULT_BASE+w rewrites to
+    // inputWidth+windowKeys.length+w (in the projection only — 42P20 elsewhere). With no expression
+    // keys windowKeys is empty, so a plain query's results land at inputWidth+w exactly as before.
+    if (hasWindow) {
+      const inputWidth = isAgg ? groupKeys.length + aggSpecs.length : scope.width();
+      const keyBase = inputWidth;
+      const resultBase = inputWidth + windowKeys.length;
+      for (const spec of windowSpecs) {
+        for (let j = 0; j < spec.partition.length; j++) {
+          if (spec.partition[j] >= WINDOW_KEY_BASE) {
+            spec.partition[j] = keyBase + (spec.partition[j] - WINDOW_KEY_BASE);
+          }
+        }
+        for (const o of spec.order) {
+          if (o.idx >= WINDOW_KEY_BASE) o.idx = keyBase + (o.idx - WINDOW_KEY_BASE);
+        }
+      }
+      for (const p of projections) rebaseWindowResults(p, resultBase);
     }
     // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
     if (isAgg && sel.distinct) {
@@ -7090,12 +7109,17 @@ export class Database {
     } else {
       for (const p of projections) collectTouched(p, 0, touched);
       for (const o of order) touched[o.idx] = true;
-      // A window query also reads each window function's PARTITION BY + ORDER BY key columns (real
-      // input columns), beyond what the projection's window-result slots reference.
+      // A window query also reads each window function's PARTITION BY + ORDER BY keys, beyond what
+      // the projection's window-result slots reference. A bare-column key is a real input slot
+      // (< totalCols) — mark it; a materialized expression key is a synthetic slot (>= totalCols,
+      // after rebase) whose input columns are reached through its windowKeys expression (below).
       for (const spec of windowSpecs) {
-        for (const pk of spec.partition) touched[pk] = true;
-        for (const o of spec.order) touched[o.idx] = true;
+        for (const pk of spec.partition) if (pk < totalCols) touched[pk] = true;
+        for (const o of spec.order) if (o.idx < totalCols) touched[o.idx] = true;
       }
+      // Each materialized window-key expression reads real input columns (a plain window query
+      // resolves its keys against the FROM scope).
+      for (const ke of windowKeys) collectTouched(ke, 0, touched);
     }
     const relMasks = planRels.map((r) => touched.slice(r.offset, r.offset + r.colCount));
     // ORDER BY satisfied by primary-key scan order (spec/design/cost.md §3): a single base table,
@@ -7122,6 +7146,7 @@ export class Database {
       aggSpecs,
       hasWindow,
       windowSpecs,
+      windowKeys,
       having,
       order,
       projections,
@@ -7775,7 +7800,7 @@ export class Database {
     // over the GROUPED rows instead, inside the aggregate branch below — so it is gated to plain
     // (non-aggregate) windows here.
     if (plan.hasWindow && !plan.isAgg) {
-      applyWindowStage(rows, plan.windowSpecs, env, meter);
+      applyWindowStage(rows, plan.windowSpecs, plan.windowKeys, env, meter);
     }
 
     // ORDER BY: stable sort applying each key left to right — the first non-equal key decides,
@@ -7850,7 +7875,7 @@ export class Database {
       // rebased slot — §5.1). The group-key slots the ORDER BY below sorts on are unchanged (they
       // precede the appended results).
       if (plan.hasWindow) {
-        applyWindowStage(groupRows, plan.windowSpecs, env, meter);
+        applyWindowStage(groupRows, plan.windowSpecs, plan.windowKeys, env, meter);
       }
       // ORDER BY over the grouped output (keys are synthetic group-key slots).
       if (plan.order.length > 0) {
@@ -9594,6 +9619,13 @@ function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]):
 // (Written as 2**40, not 1<<40 — JS bitwise operators are 32-bit and would wrap.)
 const WINDOW_RESULT_BASE = 2 ** 40;
 
+// WINDOW_KEY_BASE is the placeholder base a materialized window-key expression (a non-column
+// PARTITION BY / ORDER BY key — `PARTITION BY a + b`) carries until the rebase pass rewrites it to
+// its real synthetic slot inputWidth+k (spec/design/window.md §5.1). Disjoint from
+// WINDOW_RESULT_BASE's range, below 2**53 for exactness. A bare-column key is NOT materialized — it
+// keeps its real row slot. (2 ** 41, NOT 1 << 41 — JS bitwise is 32-bit.)
+const WINDOW_KEY_BASE = 2 ** 41;
+
 // rebaseWindowResults rewrites a grouped+window projection's window-result placeholder slots to their
 // real grouped-row slot (spec/design/window.md §5.1). During resolution a window result of index w is
 // assigned the placeholder WINDOW_RESULT_BASE+w, because its real slot
@@ -10308,9 +10340,15 @@ type SelectPlan = {
   // Mutually exclusive with isAgg in S0 (spec/design/window.md §5.2).
   hasWindow: boolean;
   // windowSpecs holds one resolved window function per select-list OVER call (empty unless
-  // hasWindow). The window stage appends each spec's per-row result after the input columns, so the
-  // projection references result i as flat slot inputWidth + i (spec/design/window.md §5.1).
+  // hasWindow). The window stage appends each spec's per-row result after the input columns and the
+  // materialized window keys, so the projection references result i as flat slot
+  // inputWidth + windowKeys.length + i (spec/design/window.md §5.1).
   windowSpecs: WindowSpec[];
+  // windowKeys is the materialized window-key expressions (a non-column PARTITION BY / ORDER BY key —
+  // `PARTITION BY a + b`, `ORDER BY a % 2`), in synthetic-slot order. Before the window stage each row
+  // evaluates these and appends the values at flat slots inputWidth + k, so the slot-based partition /
+  // sort / frame machinery is unchanged. Empty when every window key is a bare column.
+  windowKeys: RExpr[];
   having: RExpr | null;
   order: OrderSlot[];
   projections: RExpr[];
@@ -10519,7 +10557,11 @@ type AggCtx = {
   collecting: boolean;
   groupKeys: number[];
   specs: AggSpec[];
-  window?: { base: number; windowSpecs: WindowSpec[] };
+  // window collects window functions (windowSpecs) and the materialized window-key expressions
+  // (windowKeys — a non-column PARTITION BY / ORDER BY key, `PARTITION BY a + b`). A window result
+  // carries the placeholder slot base WINDOW_RESULT_BASE+w; a materialized window key carries
+  // WINDOW_KEY_BASE+k — both rebased once the row layout is final (spec/design/window.md §5.1).
+  window?: { base: number; windowSpecs: WindowSpec[]; windowKeys: RExpr[] };
 };
 
 // WindowSpec is one resolved window function (spec/design/window.md §5.1): its plan, the resolved
@@ -10797,6 +10839,23 @@ function itemsHaveAggregate(items: SelectItems): boolean {
   return items.items.some((it) => exprHasAggregate(it.expr));
 }
 
+// windowDefHasAggregate reports whether a window definition's PARTITION BY / ORDER BY keys contain an
+// aggregate (`OVER (ORDER BY sum(x))` — spec/design/window.md §5.1). Such an aggregate makes the query
+// an aggregate query (a whole-table aggregate if there is no GROUP BY), exactly as a top-level
+// aggregate would, so the window keys resolve against the grouped row. Used by both the inline-over
+// walk in exprHasAggregate and the WINDOW-clause scan that computes isAgg.
+function windowDefHasAggregate(wd: WindowDef): boolean {
+  return wd.partition.some(exprHasAggregate) || wd.order.some((k) => exprHasAggregate(k.expr));
+}
+
+// windowsHaveAggregate reports whether any WINDOW-clause entry's keys contain an aggregate (`WINDOW w
+// AS (ORDER BY sum(x))`), which — like a top-level aggregate — makes the query an aggregate query
+// (spec/design/window.md §5.1). The entries are still named references at this point (the OVER-name
+// desugar runs later), so the WINDOW clause is scanned directly.
+function windowsHaveAggregate(windows: [string, WindowDef][]): boolean {
+  return windows.some(([, wd]) => windowDefHasAggregate(wd));
+}
+
 // isAggregateName reports whether name (case-insensitive) is one of the five aggregates.
 function isAggregateName(name: string): boolean {
   const lname = name.toLowerCase();
@@ -10826,9 +10885,12 @@ function exprHasAggregate(e: Expr): boolean {
       // An aggregate name carrying OVER (inline or a named-window reference) is a WINDOW function,
       // not a bare aggregate (window.md §5.1) — so it does not mark the query as aggregate; its
       // arguments are still walked for nested aggregates. (Detection runs before the OVER-name desugar.)
+      // An aggregate INSIDE the inline window definition's keys (`rank() OVER (ORDER BY sum(x))`)
+      // also makes the query an aggregate query — those keys resolve against the grouped row (§5.1).
       return (
         (e.over == null && e.overName == null && isAggregateName(e.name)) ||
-        e.args.some(exprHasAggregate)
+        e.args.some(exprHasAggregate) ||
+        (e.over != null && windowDefHasAggregate(e.over))
       );
     case "cast":
       return exprHasAggregate(e.inner);
@@ -11562,8 +11624,8 @@ function resolveWindowCall(
     const [partition, order, frame] = resolveWindowDef(
       scope,
       e.over,
-      grouped,
-      ag.groupKeys,
+      sub,
+      ag.window?.windowKeys ?? [],
       params,
     );
     if (ag.window === undefined) {
@@ -11608,9 +11670,16 @@ function resolveWindowCall(
   } else {
     throw engineError("undefined_function", `${lname} is not a window function`);
   }
-  // Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys,
-  // explicit frame) — all against the input scope, never recursing into `ag`. Before collecting.
-  const [partition, order, frame] = resolveWindowDef(scope, e.over, grouped, ag.groupKeys, params);
+  // Resolve the window definition (PARTITION BY / ORDER BY expressions → slots, explicit frame).
+  // Keys resolve in `sub` (the grouped collecting ctx sharing ag.specs, or plain Forbidden); a
+  // non-column key materializes into windowKeys at a WINDOW_KEY_BASE+k placeholder. Before collecting.
+  const [partition, order, frame] = resolveWindowDef(
+    scope,
+    e.over,
+    sub,
+    ag.window?.windowKeys ?? [],
+    params,
+  );
   // A window function is allowed only in a window query's projection. In WHERE / a JOIN ON /
   // HAVING / an aggregate query `ag.window` is unset → 42P20 (window.md §7).
   if (ag.window === undefined) {
@@ -11621,90 +11690,66 @@ function resolveWindowCall(
   return { node: { kind: "column", index: slot }, type: result };
 }
 
-// resolveWindowDef resolves the PARTITION BY column list (→ flat input-row slots) and the
-// within-partition ORDER BY (→ sort keys) of an OVER (...) clause, against the (non-aggregate)
-// input scope. Mirrors the query ORDER BY resolution (the collation / direction / NULLS handling).
-// S0: partition keys are columns only. A window function in a partition/order key, or an outer
-// reference, is rejected.
-// groupedWindowSlot maps a window PARTITION BY / ORDER BY key's resolved input-row index to the slot
-// the window stage indexes (spec/design/window.md §5.1). In a grouped query (grouped) the key must be
-// a GROUPING column — mapped to its grouped-row slot, else 42803; in a plain window query the flat
-// input index is used directly.
-function groupedWindowSlot(
-  idx: number,
-  grouped: boolean,
-  groupKeys: number[],
-  name: string,
-): number {
-  if (!grouped) return idx;
-  const pos = groupKeys.indexOf(idx);
-  if (pos < 0) throw groupingErrorColumn(name);
-  return pos;
+// windowKeySlot maps a resolved window-key expression to the slot the window stage indexes
+// (spec/design/window.md §5.1). A bare column / aggregate (a "column" RExpr) keeps its real row slot —
+// the input slot for a plain query, the grouped-row slot for a grouped one — so a column-only window
+// is byte-identical to before. Any compound expression is materialized into windowKeys at the
+// placeholder slot WINDOW_KEY_BASE+k (rebased once the row layout is final). A key referencing an
+// enclosing query (a correlated window — clause names it) is the deferred follow-on (0A000).
+function windowKeySlot(rexpr: RExpr, clause: string, windowKeys: RExpr[]): number {
+  if (rexprReferencesOuter(rexpr, 0)) {
+    throw engineError("feature_not_supported", `${clause} may not reference an outer query column`);
+  }
+  if (rexpr.kind === "column") return rexpr.index;
+  const k = windowKeys.length;
+  windowKeys.push(rexpr);
+  return WINDOW_KEY_BASE + k;
 }
 
+// resolveWindowDef resolves the PARTITION BY and within-partition ORDER BY (→ sort keys) of an
+// OVER (...) clause. Each key is a general expression (spec/design/window.md §5.1) resolved against
+// keyCtx: a plain window query passes a Forbidden ctx (columns → real input slots, an aggregate is
+// 42803), a grouped one passes a collecting ctx sharing the query's aggregate specs (a bare column →
+// its grouping-column slot or 42803, an aggregate sum(x) collects → its agg slot). A bare-column /
+// aggregate key keeps its real slot; any compound key is materialized into windowKeys at a
+// WINDOW_KEY_BASE+k placeholder. A key referencing an enclosing-query column (a correlated window) is
+// 0A000; a window function inside a key is rejected by keyCtx (42P20).
 function resolveWindowDef(
   scope: Scope,
   wd: WindowDef,
-  grouped: boolean,
-  groupKeys: number[],
-  _params: ParamTypes,
+  keyCtx: AggCtx,
+  windowKeys: RExpr[],
+  params: ParamTypes,
 ): [number[], OrderSlot[], ResolvedFrame | null] {
   const partition: number[] = [];
   for (const key of wd.partition) {
-    let r: Resolved;
-    let name: string;
-    if (key.kind === "column") {
-      r = scope.resolveBare(key.name);
-      name = key.name;
-    } else if (key.kind === "qualifiedColumn") {
-      r = scope.resolveQualified(key.qualifier, key.name);
-      name = key.name;
-    } else {
-      throw engineError("feature_not_supported", "PARTITION BY supports only column references");
-    }
-    if (r.level !== 0) {
-      throw engineError(
-        "feature_not_supported",
-        "PARTITION BY may not reference an outer query column",
-      );
-    }
-    partition.push(groupedWindowSlot(r.index, grouped, groupKeys, name));
+    const { node } = resolve(scope, key, null, keyCtx, params);
+    partition.push(windowKeySlot(node, "PARTITION BY", windowKeys));
   }
   const order: OrderSlot[] = [];
-  // The ORDER BY key column types, captured in lockstep with order — a RANGE value-offset frame
-  // folds key ± offset over the single ordering key, so it needs the key's type (§6).
+  // The ORDER BY key types, captured in lockstep with order — a RANGE value-offset frame folds
+  // key ± offset over the single ordering key, so it needs the key's type (§6).
   const orderTypes: Type[] = [];
   for (const key of wd.order) {
-    const r =
-      key.qualifier !== null
-        ? scope.resolveQualified(key.qualifier, key.column)
-        : scope.resolveBare(key.column);
-    if (r.level !== 0) {
-      throw engineError(
-        "feature_not_supported",
-        "window ORDER BY may not reference an outer query column",
-      );
-    }
-    const idx = r.index;
+    const { node, type } = resolve(scope, key.expr, null, keyCtx, params);
+    // The sort-key collation. An explicit trailing COLLATE (rare — parseExpr usually absorbs a
+    // COLLATE into the key expression) must be on a text key (42804); otherwise the collation is
+    // DERIVED from the key expression (collation.md §1) — a COLLATE inside it is explicit, a bare
+    // text column is its frozen implicit collation, every other shape resets to none (C). A collated
+    // window ORDER BY honors the collation in both the per-partition sort and peer determination
+    // (window.md §3/§5); COLLATE "C" resolves to null (the raw-byte fast path).
     let collation: Collation | null = null;
     if (key.collation !== null) {
-      if (!typeIsText(scope.columnAt(idx).type)) {
-        throw typeError(
-          `collations are not supported by type ${typeCanonicalName(scope.columnAt(idx).type)}`,
-        );
+      if (type.kind !== "text" && type.kind !== "null") {
+        throw typeError(`collations are not supported by type ${rtName(type)}`);
       }
       collation = resolveCollationName(scope.catalog, key.collation);
     } else {
-      const cn = scope.columnAt(idx).collation;
-      if (cn !== null) collation = resolveCollationName(scope.catalog, cn);
+      collation = resolveDeriv(scope.catalog, deriveCollation(scope, key.expr));
     }
-    // A collated window ORDER BY honors the collation both in the per-partition sort and in peer
-    // determination (ranking, RANGE/GROUPS frames) — the window stage decorates each row's collated
-    // keys once and compares those everywhere (window.md §3/§5). COLLATE "C" resolves to null and
-    // stays on the raw-byte fast path.
-    const slot = groupedWindowSlot(idx, grouped, groupKeys, key.column);
+    const slot = windowKeySlot(node, "window ORDER BY", windowKeys);
     order.push({ idx: slot, descending: key.descending, nullsFirst: key.nullsFirst, collation });
-    orderTypes.push(scope.columnAt(idx).type);
+    orderTypes.push(typeFromResolved(type));
   }
   // The explicit frame (window.md §6): ROWS / GROUPS integer-count offsets, RANGE value offsets.
   let frame: ResolvedFrame | null = null;
@@ -19926,7 +19971,13 @@ function groupWindowSpecs(specs: WindowSpec[]): number[][] {
   return groups;
 }
 
-function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter: Meter): void {
+function applyWindowStage(
+  rows: Row[],
+  specs: WindowSpec[],
+  windowKeys: RExpr[],
+  env: EvalEnv,
+  meter: Meter,
+): void {
   const n = rows.length;
   if (n === 0) return;
   // Copy each input row to a fresh array BEFORE appending: the scan yields references to the stored
@@ -19934,6 +19985,22 @@ function applyWindowStage(rows: Row[], specs: WindowSpec[], env: EvalEnv, meter:
   // statements. The window stage owns its row buffer (Rust holds owned Rows; the TS scan shares
   // them), so detach here, then push the per-row results onto these private copies.
   for (let i = 0; i < n; i++) rows[i] = rows[i]!.slice();
+  // Materialize the non-column PARTITION BY / ORDER BY key expressions (window.md §5.1): evaluate
+  // each against the row and append it, so a materialized key's slot inputWidth+k reads the appended
+  // column and the partition / sort / frame machinery below (all slot-based) is unchanged. The window
+  // results are appended AFTER these, so a result slot is inputWidth+windowKeys.length+w (the rebased
+  // projection slot). Empty for a column-only window — no appended columns, the result slot stays
+  // inputWidth+w, byte-identical to before. The key evaluation is metered like any expression
+  // (operator_eval per node): new, deterministic, cross-core-identical work that exists only for an
+  // expression key (a bare-column key is not in windowKeys).
+  if (windowKeys.length > 0) {
+    for (let i = 0; i < n; i++) {
+      const row = rows[i]!;
+      const kv: Value[] = [];
+      for (const ke of windowKeys) kv.push(evalExpr(ke, row, env, meter));
+      for (const v of kv) row.push(v);
+    }
+  }
   // The shared partition/sort pass (window.md §5.2): specs that share an identical PARTITION BY +
   // ORDER BY are partitioned and sorted ONCE (the expensive step), then each computes its own
   // results over the shared sorted partitions. The partition + sort are unmetered (§8), so this is

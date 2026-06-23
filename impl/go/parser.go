@@ -2203,16 +2203,15 @@ func (p *Parser) parseWindowDefinition() (WindowDef, error) {
 		if err := p.expectKeyword("by"); err != nil {
 			return WindowDef{}, err
 		}
+		// A PARTITION BY key is a general expression (`PARTITION BY a + b`), not just a column
+		// (spec/design/window.md §5.1). A bare column resolves to its slot directly; a compound
+		// expression is materialized into a synthetic window-key column before the window stage.
 		for {
-			qualifier, col, err := p.parseColumnRef()
+			expr, err := p.parseExpr()
 			if err != nil {
 				return WindowDef{}, err
 			}
-			if qualifier != "" {
-				partition = append(partition, Expr{Kind: ExprQualifiedColumn, Qualifier: qualifier, Column: col})
-			} else {
-				partition = append(partition, Expr{Kind: ExprColumn, Column: col})
-			}
+			partition = append(partition, expr)
 			if p.peek().Kind != TokComma {
 				break
 			}
@@ -2619,39 +2618,9 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 		if err != nil {
 			return err
 		}
-		// Optional `COLLATE "name"` on the sort key (spec/design/collation.md §1), between the
-		// column and the ASC/DESC direction (PG order).
-		collation := ""
-		if p.peekKeyword() == "collate" {
-			p.advance()
-			collation, err = p.expectCollationName()
-			if err != nil {
-				return err
-			}
-		}
-		descending := false
-		switch p.peekKeyword() {
-		case "asc":
-			p.advance()
-		case "desc":
-			p.advance()
-			descending = true
-		}
-		// Default follows direction (grammar.md §10): NULL is the largest value
-		// (PostgreSQL model), so ASC → NULLS LAST, DESC → NULLS FIRST.
-		nullsFirst := descending
-		if p.peekKeyword() == "nulls" {
-			p.advance()
-			switch p.peekKeyword() {
-			case "first":
-				p.advance()
-				nullsFirst = true
-			case "last":
-				p.advance()
-				nullsFirst = false
-			default:
-				return NewError(SyntaxError, "NULLS must be followed by FIRST or LAST")
-			}
+		collation, descending, nullsFirst, err := p.parseSortSuffix()
+		if err != nil {
+			return err
 		}
 		sel.OrderBy = append(sel.OrderBy, OrderKey{Qualifier: qualifier, Column: col, Collation: collation, Descending: descending, NullsFirst: nullsFirst})
 		if p.peek().Kind == TokComma {
@@ -2661,6 +2630,47 @@ func (p *Parser) parseOrderBy(sel *Select) error {
 		break
 	}
 	return nil
+}
+
+// parseSortSuffix parses the trailing modifiers shared by every sort key: an optional `COLLATE
+// "name"`, an optional `ASC`/`DESC` direction, and an optional `NULLS FIRST|LAST`. It returns
+// (collation, descending, nullsFirst); nullsFirst is resolved here — explicit if given, else the
+// direction default (ASC → NULLS LAST, DESC → NULLS FIRST: NULL is the largest value, the PostgreSQL
+// model, grammar.md §10). A bare `NULLS` not followed by FIRST/LAST is 42601. Used by both the query
+// ORDER BY (after a column ref) and the window ORDER BY (after a general expression).
+func (p *Parser) parseSortSuffix() (string, bool, bool, error) {
+	collation := ""
+	if p.peekKeyword() == "collate" {
+		p.advance()
+		c, err := p.expectCollationName()
+		if err != nil {
+			return "", false, false, err
+		}
+		collation = c
+	}
+	descending := false
+	switch p.peekKeyword() {
+	case "asc":
+		p.advance()
+	case "desc":
+		p.advance()
+		descending = true
+	}
+	nullsFirst := descending
+	if p.peekKeyword() == "nulls" {
+		p.advance()
+		switch p.peekKeyword() {
+		case "first":
+			p.advance()
+			nullsFirst = true
+		case "last":
+			p.advance()
+			nullsFirst = false
+		default:
+			return "", false, false, NewError(SyntaxError, "NULLS must be followed by FIRST or LAST")
+		}
+	}
+	return collation, descending, nullsFirst, nil
 }
 
 // parseLimitOffset parses an optional trailing `LIMIT <count>` and/or `OFFSET <count>`
@@ -3960,11 +3970,13 @@ func (p *Parser) parseFrameBound() (FrameBound, error) {
 	}
 }
 
-// parseWindowOrderBy parses an OVER clause's optional `ORDER BY <key> ("," <key>)*` and returns
-// the keys (nil when absent). It mirrors parseOrderBy's per-key handling (COLLATE, ASC/DESC,
-// NULLS FIRST|LAST resolution) but returns the keys directly rather than writing them onto a
-// *Select (the query ORDER BY's container). spec/design/window.md §3.
-func (p *Parser) parseWindowOrderBy() ([]OrderKey, error) {
+// parseWindowOrderBy parses an OVER clause's optional `ORDER BY <key> ("," <key>)*` and returns the
+// keys (nil when absent). Unlike the query parseOrderBy (column references only), each key is a
+// general expression (`ORDER BY a + b`, `ORDER BY sum(x)`) followed by the shared sort suffix. A
+// COLLATE binds tighter than the comparison/arithmetic that could appear in a key, so parseExpr
+// already absorbs an inline `expr COLLATE "x"`; the trailing COLLATE here is the sort-key collation
+// (the same two-level reading the query ORDER BY uses on a bare column). spec/design/window.md §5.1.
+func (p *Parser) parseWindowOrderBy() ([]WindowOrderKey, error) {
 	if p.peekKeyword() != "order" {
 		return nil, nil
 	}
@@ -3972,45 +3984,17 @@ func (p *Parser) parseWindowOrderBy() ([]OrderKey, error) {
 	if err := p.expectKeyword("by"); err != nil {
 		return nil, err
 	}
-	var order []OrderKey
+	var order []WindowOrderKey
 	for {
-		qualifier, col, err := p.parseColumnRef()
+		expr, err := p.parseExpr()
 		if err != nil {
 			return nil, err
 		}
-		collation := ""
-		if p.peekKeyword() == "collate" {
-			p.advance()
-			collation, err = p.expectCollationName()
-			if err != nil {
-				return nil, err
-			}
+		collation, descending, nullsFirst, err := p.parseSortSuffix()
+		if err != nil {
+			return nil, err
 		}
-		descending := false
-		switch p.peekKeyword() {
-		case "asc":
-			p.advance()
-		case "desc":
-			p.advance()
-			descending = true
-		}
-		// Default follows direction (grammar.md §10): NULL is the largest value (PostgreSQL model),
-		// so ASC → NULLS LAST, DESC → NULLS FIRST.
-		nullsFirst := descending
-		if p.peekKeyword() == "nulls" {
-			p.advance()
-			switch p.peekKeyword() {
-			case "first":
-				p.advance()
-				nullsFirst = true
-			case "last":
-				p.advance()
-				nullsFirst = false
-			default:
-				return nil, NewError(SyntaxError, "NULLS must be followed by FIRST or LAST")
-			}
-		}
-		order = append(order, OrderKey{Qualifier: qualifier, Column: col, Collation: collation, Descending: descending, NullsFirst: nullsFirst})
+		order = append(order, WindowOrderKey{Expr: expr, Collation: collation, Descending: descending, NullsFirst: nullsFirst})
 		if p.peek().Kind != TokComma {
 			break
 		}

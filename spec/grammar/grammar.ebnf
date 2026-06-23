@@ -946,14 +946,21 @@ over_clause    ::= "OVER" ( identifier | "(" window_definition ")" )
 
 /* A window definition is an optional base-window name to copy/extend (§5), then any of
  * PARTITION BY / ORDER BY / a frame — every part optional. An empty "OVER ()" is the single
- * whole-result partition with no ordering. PARTITION BY is narrowed to columns in S0 (the
- * GROUP BY / ORDER BY narrowing — general expressions are a follow-on); order_by is the same
- * sort_key production the query ORDER BY uses (per-key ASC/DESC, NULLS FIRST|LAST, COLLATE).
- * The frame_clause is parsed but is 0A000 in S0–S3 (the implicit default frame only); S4
- * enables it. The base-window name (a leading identifier) lands in S5 with window_clause. */
-window_definition ::= identifier? partition_by? order_by? frame_clause?
+ * whole-result partition with no ordering. PARTITION BY and the window ORDER BY are GENERAL
+ * EXPRESSIONS (S11 — "PARTITION BY a + b", "ORDER BY a % 2", and an aggregate as a key in a grouped
+ * query "ORDER BY sum(x)"; ../design/window.md §5.1), unlike the query order_by which is column-only;
+ * a bare column resolves to its slot directly, a compound key is materialized before the window
+ * stage. The window_sort_key suffix (per-key ASC/DESC, NULLS FIRST|LAST) matches the query sort_key;
+ * a COLLATE is absorbed into the key expression by expr. The frame_clause is parsed but is 0A000 in
+ * S0–S3 (the implicit default frame only); S4 enables it. The base-window name (a leading identifier)
+ * lands in S5 with window_clause. */
+window_definition ::= identifier? partition_by? window_order_by? frame_clause?
 
-partition_by   ::= "PARTITION" "BY" column_ref ("," column_ref)*
+partition_by   ::= "PARTITION" "BY" expr ("," expr)*
+
+window_order_by ::= "ORDER" "BY" window_sort_key ("," window_sort_key)*
+
+window_sort_key ::= expr collate_clause? ("ASC" | "DESC")? ("NULLS" ("FIRST" | "LAST"))?
 
 /* A frame restricts the rows a frame-sensitive window function folds over, per current row
  * (../design/window.md §6). ROWS = physical row offsets; RANGE = logical offsets on the single

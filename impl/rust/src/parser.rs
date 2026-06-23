@@ -13,7 +13,7 @@ use crate::ast::{
     SetOpKind, Statement, SubscriptSpec, TableRef, TypeFieldDef, TypeMod, UnaryOp, UniqueDef,
     Update, WindowDef, WithExpr, WithQuery,
 };
-use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame};
+use crate::ast::{FrameBound, FrameExclusion, FrameMode, WindowFrame, WindowOrderKey};
 use crate::decimal::Decimal;
 use crate::error::{EngineError, Result, SqlState};
 use crate::lexer::lex;
@@ -1838,15 +1838,11 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("partition") {
             self.advance();
             self.expect_keyword("by")?;
+            // A PARTITION BY key is a general expression (`PARTITION BY a + b`), not just a column
+            // (spec/design/window.md §5.1). A bare column resolves to its slot directly; a compound
+            // expression is materialized into a synthetic window-key column before the window stage.
             loop {
-                let (q, c) = self.parse_column_ref()?;
-                partition.push(match q {
-                    Some(q) => Expr::QualifiedColumn {
-                        qualifier: q,
-                        name: c,
-                    },
-                    None => Expr::Column(c),
-                });
+                partition.push(self.parse_expr()?);
                 if matches!(self.peek(), Token::Comma) {
                     self.advance();
                 } else {
@@ -1854,7 +1850,7 @@ impl Parser {
                 }
             }
         }
-        let order = self.parse_order_by()?;
+        let order = self.parse_window_order_by()?;
         let frame = self.parse_window_frame()?;
         Ok(WindowDef {
             base,
@@ -2178,51 +2174,90 @@ impl Parser {
         self.expect_keyword("by")?;
         loop {
             let (qualifier, column) = self.parse_column_ref()?;
-            // Optional `COLLATE "name"` on the sort key (`ORDER BY name COLLATE "en-US"`,
-            // spec/design/collation.md §1), between the column and the ASC/DESC direction (PG order).
-            let collation = if self.peek_keyword().as_deref() == Some("collate") {
-                self.advance();
-                Some(self.expect_collation_name()?)
-            } else {
-                None
-            };
-            let descending = match self.peek_keyword().as_deref() {
-                Some("asc") => {
-                    self.advance();
-                    false
-                }
-                Some("desc") => {
-                    self.advance();
-                    true
-                }
-                _ => false,
-            };
-            let nulls_first = if self.peek_keyword().as_deref() == Some("nulls") {
-                self.advance();
-                match self.peek_keyword().as_deref() {
-                    Some("first") => {
-                        self.advance();
-                        true
-                    }
-                    Some("last") => {
-                        self.advance();
-                        false
-                    }
-                    other => {
-                        return Err(syntax(format!(
-                            "NULLS must be followed by FIRST or LAST, found {other:?}"
-                        )));
-                    }
-                }
-            } else {
-                // No explicit clause: default follows direction (grammar.md §10).
-                // NULL is the largest value (PostgreSQL model), so ASC → NULLS LAST,
-                // DESC → NULLS FIRST.
-                descending
-            };
+            let (collation, descending, nulls_first) = self.parse_sort_suffix()?;
             keys.push(OrderKey {
                 qualifier,
                 column,
+                collation,
+                descending,
+                nulls_first,
+            });
+            if matches!(self.peek(), Token::Comma) {
+                self.advance();
+                continue;
+            }
+            break;
+        }
+        Ok(keys)
+    }
+
+    /// The trailing modifiers shared by every sort key: an optional `COLLATE "name"`, an optional
+    /// `ASC`/`DESC` direction, and an optional `NULLS FIRST|LAST`. Returns `(collation, descending,
+    /// nulls_first)`; `nulls_first` is resolved here — explicit if given, else the direction default
+    /// (ASC → NULLS LAST, DESC → NULLS FIRST: NULL is the largest value, the PostgreSQL model,
+    /// grammar.md §10). A bare `NULLS` not followed by `FIRST`/`LAST` is 42601. Used by both the query
+    /// `ORDER BY` (after a column ref) and the window `ORDER BY` (after a general expression).
+    fn parse_sort_suffix(&mut self) -> Result<(Option<String>, bool, bool)> {
+        // Optional `COLLATE "name"` on the sort key (spec/design/collation.md §1), between the key
+        // and the ASC/DESC direction (PG order).
+        let collation = if self.peek_keyword().as_deref() == Some("collate") {
+            self.advance();
+            Some(self.expect_collation_name()?)
+        } else {
+            None
+        };
+        let descending = match self.peek_keyword().as_deref() {
+            Some("asc") => {
+                self.advance();
+                false
+            }
+            Some("desc") => {
+                self.advance();
+                true
+            }
+            _ => false,
+        };
+        let nulls_first = if self.peek_keyword().as_deref() == Some("nulls") {
+            self.advance();
+            match self.peek_keyword().as_deref() {
+                Some("first") => {
+                    self.advance();
+                    true
+                }
+                Some("last") => {
+                    self.advance();
+                    false
+                }
+                other => {
+                    return Err(syntax(format!(
+                        "NULLS must be followed by FIRST or LAST, found {other:?}"
+                    )));
+                }
+            }
+        } else {
+            descending
+        };
+        Ok((collation, descending, nulls_first))
+    }
+
+    /// Parse a window `ORDER BY` (spec/design/window.md §5.1). Unlike the query `parse_order_by`
+    /// (column references only), each key is a **general expression** (`ORDER BY a + b`,
+    /// `ORDER BY sum(x)`) followed by the shared sort suffix. Returns an empty vec when absent. A
+    /// `COLLATE` clause binds tighter than the comparison/arithmetic that could appear in a key, so
+    /// `parse_expr` already absorbs an inline `expr COLLATE "x"`; the trailing `COLLATE` here is the
+    /// sort-key collation (the same two-level reading the query ORDER BY uses on a bare column).
+    fn parse_window_order_by(&mut self) -> Result<Vec<WindowOrderKey>> {
+        let mut keys = Vec::new();
+        if self.peek_keyword().as_deref() != Some("order") {
+            return Ok(keys);
+        }
+        self.advance();
+        self.expect_keyword("by")?;
+        loop {
+            let expr = self.parse_expr()?;
+            let (collation, descending, nulls_first) = self.parse_sort_suffix()?;
+            keys.push(WindowOrderKey {
+                expr,
                 collation,
                 descending,
                 nulls_first,

@@ -8113,8 +8113,13 @@ impl Database {
         // mode (columns normal; a stray aggregate would be 42803). Output names per grammar.md §8.
         // GROUP BY, an aggregate in the select list, OR a HAVING clause all make this an
         // aggregate query (HAVING alone groups the whole table — grammar.md §19).
-        let is_agg =
-            !group_keys.is_empty() || items_have_aggregate(&sel.items) || sel.having.is_some();
+        // An aggregate also makes the query an aggregate query when it appears inside a window
+        // definition's keys — inline (`OVER (ORDER BY sum(x))`, caught by `items_have_aggregate`) or in
+        // a WINDOW-clause entry (`WINDOW w AS (ORDER BY sum(x))`, scanned here before the desugar).
+        let is_agg = !group_keys.is_empty()
+            || items_have_aggregate(&sel.items)
+            || sel.having.is_some()
+            || windows_have_aggregate(&sel.windows);
         // A window query (a select-list `OVER` call) resolves its projection in a window-aware mode,
         // where bare columns read the input/grouped row and window calls collect into synthetic slots
         // (spec/design/window.md §5.1). A grouped query that ALSO windows uses `GroupedWindow` (the
@@ -8125,6 +8130,7 @@ impl Database {
                 group_keys: group_keys.clone(),
                 agg_specs: Vec::new(),
                 window_specs: Vec::new(),
+                window_keys: Vec::new(),
             }
         } else if is_agg {
             AggCtx::Collect {
@@ -8133,8 +8139,8 @@ impl Database {
             }
         } else if has_window_syntax {
             AggCtx::Window {
-                base: scope.width(),
                 specs: Vec::new(),
+                window_keys: Vec::new(),
             }
         } else {
             AggCtx::Forbidden
@@ -8165,18 +8171,25 @@ impl Database {
         };
         let (mut projections, column_names, column_types) =
             resolve_projections(&scope, items_ref, &mut agg_ctx, ptypes)?;
-        // Pull the collected aggregate + window specs out of the projection context. A grouped+window
-        // query (`GroupedWindow`) carries both; a plain aggregate/window query carries one (the other
-        // is empty). spec/design/window.md §5.1.
-        let (mut agg_specs, window_specs): (Vec<AggSpec>, Vec<WindowSpec>) = match agg_ctx {
-            AggCtx::Collect { specs, .. } => (specs, Vec::new()),
-            AggCtx::Window { specs, .. } => (Vec::new(), specs),
+        // Pull the collected aggregate + window specs (and materialized window-key expressions) out of
+        // the projection context. A grouped+window query (`GroupedWindow`) carries all; a plain
+        // aggregate/window query carries one (the rest empty). spec/design/window.md §5.1.
+        let (mut agg_specs, mut window_specs, window_keys): (
+            Vec<AggSpec>,
+            Vec<WindowSpec>,
+            Vec<RExpr>,
+        ) = match agg_ctx {
+            AggCtx::Collect { specs, .. } => (specs, Vec::new(), Vec::new()),
+            AggCtx::Window {
+                specs, window_keys, ..
+            } => (Vec::new(), specs, window_keys),
             AggCtx::GroupedWindow {
                 agg_specs,
                 window_specs,
+                window_keys,
                 ..
-            } => (agg_specs, window_specs),
-            AggCtx::Forbidden => (Vec::new(), Vec::new()),
+            } => (agg_specs, window_specs, window_keys),
+            AggCtx::Forbidden => (Vec::new(), Vec::new(), Vec::new()),
         };
         let has_window = !window_specs.is_empty();
         // HAVING resolves in `Collect` mode — it may reference aggregates (collected into the SAME
@@ -8201,14 +8214,37 @@ impl Database {
             }
             None => None,
         };
-        // Rewrite each grouped+window projection's window-result placeholder to its real grouped-row
-        // slot, now that every aggregate (projection + HAVING + nested in a window argument) has been
-        // collected (spec/design/window.md §5.1). Window results appear only in the projection — a
-        // window function is 42P20 in WHERE / GROUP BY / HAVING (§7) — so only `projections` is walked.
-        if has_window && is_agg {
-            let wbase = group_keys.len() + agg_specs.len();
+        // Rebase the window placeholder slots now that the row layout is final (spec/design/window.md
+        // §5.1). The window stage's row is `[input… , materialized window keys… , window results…]`,
+        // where `input_width` is the grouped row's width (group keys + every aggregate, collected from
+        // the projection + HAVING + window arguments) for a grouped+window query, else the FROM scope
+        // width. A materialized window-key slot `WINDOW_KEY_BASE + k` rewrites to `input_width + k`
+        // (in each spec's PARTITION BY / ORDER BY); a window-result slot `WINDOW_RESULT_BASE + w`
+        // rewrites to `input_width + window_keys.len() + w` (in the projection only — a window function
+        // is 42P20 in WHERE / GROUP BY / HAVING, §7). With no expression keys `window_keys` is empty, so
+        // a plain query's results land at `input_width + w` exactly as before (byte-identical).
+        if has_window {
+            let input_width = if is_agg {
+                group_keys.len() + agg_specs.len()
+            } else {
+                scope.width()
+            };
+            let key_base = input_width;
+            let result_base = input_width + window_keys.len();
+            for spec in &mut window_specs {
+                for pk in &mut spec.partition {
+                    if *pk >= WINDOW_KEY_BASE {
+                        *pk = key_base + (*pk - WINDOW_KEY_BASE);
+                    }
+                }
+                for (slot, ..) in &mut spec.order {
+                    if *slot >= WINDOW_KEY_BASE {
+                        *slot = key_base + (*slot - WINDOW_KEY_BASE);
+                    }
+                }
+            }
             for p in &mut projections {
-                rebase_window_results(p, wbase);
+                rebase_window_results(p, result_base);
             }
         }
         // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
@@ -8410,15 +8446,27 @@ impl Database {
             for (slot, ..) in &order {
                 touched[*slot] = true;
             }
-            // A window query also reads each window function's PARTITION BY + ORDER BY key columns
-            // (real input columns), beyond what the projection's window-result slots reference.
+            // A window query also reads each window function's PARTITION BY + ORDER BY keys, beyond
+            // what the projection's window-result slots reference. A bare-column key is a real input
+            // slot (`< total_cols`) — mark it; a materialized expression key is a synthetic slot
+            // (`>= total_cols`, after rebase) whose input columns are reached through its `window_keys`
+            // expression instead (collected below).
             for spec in &window_specs {
                 for &pk in &spec.partition {
-                    touched[pk] = true;
+                    if pk < total_cols {
+                        touched[pk] = true;
+                    }
                 }
                 for (slot, ..) in &spec.order {
-                    touched[*slot] = true;
+                    if *slot < total_cols {
+                        touched[*slot] = true;
+                    }
                 }
+            }
+            // Each materialized window-key expression reads real input columns (a plain window query
+            // resolves its keys against the FROM scope).
+            for ke in &window_keys {
+                collect_touched(ke, 0, &mut touched);
             }
         }
         let rel_masks: Vec<Vec<bool>> = rels
@@ -8449,6 +8497,7 @@ impl Database {
             agg_specs,
             has_window,
             window_specs,
+            window_keys,
             having,
             order,
             projections,
@@ -9265,7 +9314,13 @@ impl Database {
         // window query (§2) runs the window stage over the GROUPED rows instead, inside the aggregate
         // branch below (after GROUP BY/HAVING) — so it is gated to plain (non-aggregate) windows here.
         if plan.has_window && !plan.is_agg {
-            apply_window_stage(&mut rows, &plan.window_specs, &env, &mut meter)?;
+            apply_window_stage(
+                &mut rows,
+                &plan.window_specs,
+                &plan.window_keys,
+                &env,
+                &mut meter,
+            )?;
         }
 
         // ORDER BY: a stable sort applying each key left to right — the first non-equal key
@@ -9370,7 +9425,13 @@ impl Database {
             // group_keys.len()+agg_specs.len()+w (the rebased slot — §5.1). The group-key slots the
             // ORDER BY below sorts on are unchanged (they precede the appended results).
             if plan.has_window {
-                apply_window_stage(&mut group_rows, &plan.window_specs, &env, &mut meter)?;
+                apply_window_stage(
+                    &mut group_rows,
+                    &plan.window_specs,
+                    &plan.window_keys,
+                    &env,
+                    &mut meter,
+                )?;
             }
             // ORDER BY over the grouped output (keys are synthetic group-key slots).
             if !plan.order.is_empty() {
@@ -12046,9 +12107,16 @@ struct SelectPlan {
     /// Mutually exclusive with `is_agg` in S0 (spec/design/window.md §5.2).
     has_window: bool,
     /// One resolved window function per select-list `OVER` call (empty unless `has_window`). The
-    /// window stage appends each spec's per-row result after the input columns, so the projection
-    /// references result `i` as flat slot `input_width + i` (spec/design/window.md §5.1).
+    /// window stage appends each spec's per-row result after the input columns and the materialized
+    /// window keys, so the projection references result `i` as flat slot
+    /// `input_width + window_keys.len() + i` (spec/design/window.md §5.1).
     window_specs: Vec<WindowSpec>,
+    /// The materialized window-key expressions (a non-column PARTITION BY / ORDER BY key —
+    /// `PARTITION BY a + b`, `ORDER BY a % 2`), in synthetic-slot order. Before the window stage each
+    /// row evaluates these and appends the values at flat slots `input_width + k`, so the partition /
+    /// sort / frame machinery (which is slot-based) is unchanged (spec/design/window.md §5.1). Empty
+    /// when every window key is a bare column (the common case, byte-identical to before).
+    window_keys: Vec<RExpr>,
     having: Option<RExpr>,
     /// (flat slot, descending, nulls_first) per ORDER BY key.
     order: Vec<crate::spill::SortKey>,
@@ -13225,9 +13293,15 @@ enum AggCtx {
     /// A non-aggregate WINDOW query's projection (spec/design/window.md §5.1). Bare columns
     /// resolve to the real input row (like Forbidden); a `FuncCall` carrying an `OVER` clause
     /// collects into `specs` and resolves to the synthetic slot `base + window_index`, where
-    /// `base` is the input row's flat width — the window stage appends each function's result
-    /// after the input columns.
-    Window { base: usize, specs: Vec<WindowSpec> },
+    /// A window function carrying an `OVER` clause collects into `specs` and resolves to the
+    /// placeholder slot `WINDOW_RESULT_BASE + w` (rebased to `input_width + window_keys.len() + w`
+    /// after resolution, once the row layout is final — like `GroupedWindow`). A non-column PARTITION
+    /// BY / ORDER BY key (`PARTITION BY a + b`) is collected into `window_keys` and resolved to the
+    /// placeholder slot `WINDOW_KEY_BASE + k`, rebased the same way.
+    Window {
+        specs: Vec<WindowSpec>,
+        window_keys: Vec<RExpr>,
+    },
     /// A GROUPED query that ALSO has window functions (spec/design/window.md §2/§5.1). The
     /// projection resolves against the grouped synthetic row `[group_keys…, agg_results…,
     /// window_results…]`: a bare column → its group-key slot (`42803` otherwise), a bare aggregate
@@ -13243,13 +13317,24 @@ enum AggCtx {
         group_keys: Vec<usize>,
         agg_specs: Vec<AggSpec>,
         window_specs: Vec<WindowSpec>,
+        /// Materialized window-key expressions (a non-column PARTITION BY / ORDER BY key —
+        /// `PARTITION BY g + 1`, or `ORDER BY sum(x) + 1`), resolved against the grouped row and
+        /// collected at the placeholder slot `WINDOW_KEY_BASE + k`. A bare grouping column or a bare
+        /// aggregate (`ORDER BY sum(x)`) resolves to its real grouped-row slot and is NOT materialized.
+        window_keys: Vec<RExpr>,
     },
 }
 
-/// The placeholder base a grouped+window query's window results carry until `rebase_window_results`
-/// rewrites them to `group_keys.len() + agg_specs.len() + w` (spec/design/window.md §5.1). Far above
-/// any real column/synthetic-slot count, and below 2⁵³ so it is exact in the TS core's `number`.
+/// The placeholder base a window query's window results carry until `rebase_window_results` rewrites
+/// them to `input_width + window_keys.len() + w` (spec/design/window.md §5.1). Far above any real
+/// column/synthetic-slot count, and below 2⁵³ so it is exact in the TS core's `number`.
 const WINDOW_RESULT_BASE: usize = 1 << 40;
+
+/// The placeholder base a materialized window-key expression (a non-column PARTITION BY / ORDER BY
+/// key — `PARTITION BY a + b`) carries until the rebase pass rewrites it to its real synthetic slot
+/// `input_width + k` (spec/design/window.md §5.1). Disjoint from `WINDOW_RESULT_BASE`'s range, and
+/// below 2⁵³ for the TS core. A bare-column key is NOT materialized — it keeps its real row slot.
+const WINDOW_KEY_BASE: usize = 1 << 41;
 
 /// One resolved window function (spec/design/window.md §5.1): its plan, the resolved PARTITION BY
 /// key column slots (flat input-row indices), and the resolved within-partition ORDER BY (sort
@@ -13603,6 +13688,24 @@ fn items_have_aggregate(items: &SelectItems) -> bool {
     }
 }
 
+/// Whether a window definition's PARTITION BY / ORDER BY keys contain an aggregate (`OVER (ORDER BY
+/// sum(x))` — spec/design/window.md §5.1). Such an aggregate makes the query an aggregate query (a
+/// whole-table aggregate if there is no GROUP BY), exactly as a top-level aggregate would, so the
+/// window keys resolve against the grouped row. Used by both the inline-`over` walk in
+/// `expr_has_aggregate` and the WINDOW-clause scan that computes `is_agg`.
+fn window_def_has_aggregate(wd: &WindowDef) -> bool {
+    wd.partition.iter().any(expr_has_aggregate)
+        || wd.order.iter().any(|k| expr_has_aggregate(&k.expr))
+}
+
+/// Whether any WINDOW-clause entry's keys contain an aggregate (`WINDOW w AS (ORDER BY sum(x))`),
+/// which — like a top-level aggregate — makes the query an aggregate query (spec/design/window.md
+/// §5.1). The entries are still named references at this point (the OVER-name desugar runs later), so
+/// the WINDOW clause is scanned directly.
+fn windows_have_aggregate(windows: &[(String, WindowDef)]) -> bool {
+    windows.iter().any(|(_, wd)| window_def_has_aggregate(wd))
+}
+
 /// The sub-expressions of one AST subscript spec (an index, or a slice's present bounds) — for the
 /// `Expr` tree walkers.
 fn subscript_spec_exprs(s: &SubscriptSpec) -> Vec<&Expr> {
@@ -13625,9 +13728,12 @@ fn expr_has_aggregate(e: &Expr) -> bool {
         } => {
             // An aggregate name carrying OVER (inline or a named-window reference) is a WINDOW
             // function, not a bare aggregate (S3/S5, spec/design/window.md §5.1) — so it does not
-            // make the query an aggregate query. (Detection runs before the OVER-name desugar.)
+            // make the query an aggregate query. (Detection runs before the OVER-name desugar.) But an
+            // aggregate INSIDE its inline window definition's keys (`rank() OVER (ORDER BY sum(x))`)
+            // does — those keys resolve against the grouped row (§5.1).
             (over.is_none() && over_name.is_none() && is_aggregate_name(name))
                 || args.iter().any(expr_has_aggregate)
+                || over.as_deref().is_some_and(window_def_has_aggregate)
         }
         Expr::Column(_)
         | Expr::QualifiedColumn { .. }
@@ -15566,27 +15672,28 @@ fn resolve_window_call(
     params: &mut ParamTypes,
 ) -> Result<(RExpr, ResolvedType)> {
     let lname = name.to_ascii_lowercase();
-    // Validate the context and build the sub-context window ARGUMENTS resolve in
-    // (spec/design/window.md §5.1). In a grouped query (`GroupedWindow`) arguments resolve against
-    // the grouped row — a nested aggregate collects into the query's SHARED `agg_specs` and a bare
-    // column must be a grouping key (else 42803) — so we resolve them under a `Collect` borrowing
-    // those specs; a nested window is then 42P20 (a `Collect` cannot collect a window). In a plain
-    // window query arguments resolve under `Forbidden` (no aggregate/window nesting). `grouped_keys`,
-    // when set, maps the window's PARTITION BY / ORDER BY columns to grouped-row slots. The window
-    // result's slot + the spec push happen at the end, once `partition`/`order`/`frame` are resolved.
-    let (grouped_keys, mut sub): (Option<Vec<usize>>, AggCtx) = match agg {
+    // Validate the context and build the sub-context window ARGUMENTS *and keys* resolve in
+    // (spec/design/window.md §5.1). In a grouped query (`GroupedWindow`) they resolve against the
+    // grouped row — a nested aggregate collects into the query's SHARED `agg_specs` and a bare column
+    // must be a grouping key (else 42803) — so we resolve them under a `Collect` borrowing those
+    // specs; a nested window is then 42P20 (a `Collect` cannot collect a window). In a plain window
+    // query they resolve under `Forbidden` (no aggregate/window nesting). A non-column PARTITION BY /
+    // ORDER BY key is materialized into the query-global `window_keys` (taken out here, restored at the
+    // end). The window result's slot + the spec push happen at the end, once the def is resolved.
+    let (mut sub, mut window_keys): (AggCtx, Vec<RExpr>) = match agg {
         AggCtx::GroupedWindow {
             group_keys,
             agg_specs,
+            window_keys,
             ..
         } => (
-            Some(group_keys.clone()),
             AggCtx::Collect {
                 group_keys: group_keys.clone(),
                 specs: std::mem::take(agg_specs),
             },
+            std::mem::take(window_keys),
         ),
-        AggCtx::Window { .. } => (None, AggCtx::Forbidden),
+        AggCtx::Window { window_keys, .. } => (AggCtx::Forbidden, std::mem::take(window_keys)),
         _ => {
             return Err(EngineError::new(
                 SqlState::WindowingError,
@@ -15738,10 +15845,13 @@ fn resolve_window_call(
             format!("{lname} is not a window function"),
         ));
     };
-    // Resolve the window definition (PARTITION BY / ORDER BY columns → slots, explicit frame). In a
-    // grouped query the keys must be GROUPING columns, mapped to their grouped-row slot (`42803`
-    // otherwise) — window.md §5.1. Resolved against the input scope, never recursing into `agg`.
-    let (partition, order, frame) = resolve_window_def(scope, wd, grouped_keys.as_deref(), params)?;
+    // Resolve the window definition (PARTITION BY / ORDER BY expressions → slots, explicit frame).
+    // Keys resolve in `sub` (the grouped Collect, so a bare grouping column → its grouped-row slot
+    // and an aggregate → an agg slot, else 42803; or plain Forbidden, columns → real input slots); a
+    // non-column key materializes into `window_keys` at a `WINDOW_KEY_BASE + k` placeholder. window.md
+    // §5.1.
+    let (partition, order, frame) =
+        resolve_window_def(scope, wd, &mut sub, &mut window_keys, params)?;
     let spec = WindowSpec {
         plan,
         partition,
@@ -15749,25 +15859,32 @@ fn resolve_window_call(
         args: wargs,
         frame,
     };
-    // Append the spec and resolve the result slot. A grouped window result carries the PLACEHOLDER
-    // slot `WINDOW_RESULT_BASE + w` (rebased to its real grouped-row slot after every aggregate is
-    // collected — window.md §5.1); a plain window result is `base + w`. Restore the borrowed
-    // `agg_specs` (any aggregate nested in an argument was collected into `sub`).
+    // Append the spec and resolve the result slot (the PLACEHOLDER `WINDOW_RESULT_BASE + w`, rebased to
+    // its real slot after the row layout is final — window.md §5.1). Restore the borrowed `agg_specs`
+    // (any aggregate nested in an argument or a window key was collected into `sub`) and the
+    // materialized `window_keys`.
     match agg {
         AggCtx::GroupedWindow {
             agg_specs,
             window_specs,
+            window_keys: wk,
             ..
         } => {
             if let AggCtx::Collect { specs, .. } = sub {
                 *agg_specs = specs;
             }
+            *wk = window_keys;
             let slot = WINDOW_RESULT_BASE + window_specs.len();
             window_specs.push(spec);
             Ok((RExpr::Column(slot), result))
         }
-        AggCtx::Window { base, specs } => {
-            let slot = *base + specs.len();
+        AggCtx::Window {
+            specs,
+            window_keys: wk,
+            ..
+        } => {
+            *wk = window_keys;
+            let slot = WINDOW_RESULT_BASE + specs.len();
             specs.push(spec);
             Ok((RExpr::Column(slot), result))
         }
@@ -15776,31 +15893,21 @@ fn resolve_window_call(
     }
 }
 
-/// Map a window PARTITION BY / ORDER BY key's resolved input-row index to the slot the window stage
-/// indexes (spec/design/window.md §5.1). In a grouped query (`Some(group_keys)`) the key must be a
-/// GROUPING column — mapped to its grouped-row slot, else `42803`; in a plain window query (`None`)
-/// the flat input index is used directly.
-fn grouped_window_slot(idx: usize, group_keys: Option<&[usize]>, name: &str) -> Result<usize> {
-    match group_keys {
-        Some(gk) => gk
-            .iter()
-            .position(|&g| g == idx)
-            .ok_or_else(|| grouping_error_column(name)),
-        None => Ok(idx),
-    }
-}
-
-/// Resolve the PARTITION BY column list and the within-partition ORDER BY (→ sort keys) of an
-/// `OVER (...)` clause, against the input scope (mirrors the query ORDER BY resolution — collation /
-/// direction / NULLS handling). Keys are columns only (general-expression keys are deferred — §11);
-/// in a grouped query (`group_keys = Some`) they must be GROUPING columns, mapped to their
-/// grouped-row slot (`42803` otherwise). A window function in a key, or an outer reference, is
-/// rejected.
+/// Resolve the PARTITION BY and within-partition ORDER BY (→ sort keys) of an `OVER (...)` clause.
+/// Each key is a **general expression** (spec/design/window.md §5.1) resolved against `key_ctx`: a
+/// plain window query passes `Forbidden` (columns → real input slots, an aggregate is 42803), a
+/// grouped one passes a `Collect` borrowing the query's aggregate specs (a bare column → its
+/// grouping-column slot or 42803, an aggregate `sum(x)` collects → its agg slot). A bare-column /
+/// aggregate key (`RExpr::Column`) keeps its real slot; any compound key is materialized into
+/// `window_keys` at a `WINDOW_KEY_BASE + k` placeholder, evaluated per row before the window stage.
+/// A key referencing an enclosing-query column (a correlated window) is rejected (`0A000`); a window
+/// function inside a key is rejected by the `Forbidden`/`Collect` sub-context (`42P20`).
 fn resolve_window_def(
     scope: &Scope,
     wd: &WindowDef,
-    group_keys: Option<&[usize]>,
-    _params: &mut ParamTypes,
+    key_ctx: &mut AggCtx,
+    window_keys: &mut Vec<RExpr>,
+    params: &mut ParamTypes,
 ) -> Result<(
     Vec<usize>,
     Vec<crate::spill::SortKey>,
@@ -15808,70 +15915,36 @@ fn resolve_window_def(
 )> {
     let mut partition = Vec::with_capacity(wd.partition.len());
     for key in &wd.partition {
-        let (r, name) = match key {
-            Expr::Column(name) => (scope.resolve_bare(name.as_str())?, name.as_str()),
-            Expr::QualifiedColumn { qualifier, name } => (
-                scope.resolve_qualified(qualifier.as_str(), name.as_str())?,
-                name.as_str(),
-            ),
-            _ => {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "PARTITION BY supports only column references",
-                ));
-            }
-        };
-        let idx = match r {
-            Resolved::Local(i) => i,
-            Resolved::Outer { .. } => {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "PARTITION BY may not reference an outer query column",
-                ));
-            }
-        };
-        partition.push(grouped_window_slot(idx, group_keys, name)?);
+        let (rexpr, _ty) = resolve(scope, key, None, key_ctx, params)?;
+        partition.push(window_key_slot(rexpr, "PARTITION BY", window_keys)?);
     }
     let mut order: Vec<crate::spill::SortKey> = Vec::with_capacity(wd.order.len());
-    // The ORDER BY key column types, captured in lockstep with `order` — a `RANGE` value-offset
-    // frame folds `key ± offset` over the single ordering key, so it needs the key's type (§6).
+    // The ORDER BY key types, captured in lockstep with `order` — a `RANGE` value-offset frame folds
+    // `key ± offset` over the single ordering key, so it needs the key's type (§6).
     let mut order_types: Vec<Type> = Vec::with_capacity(wd.order.len());
     for key in &wd.order {
-        let r = match &key.qualifier {
-            Some(q) => scope.resolve_qualified(q, &key.column)?,
-            None => scope.resolve_bare(&key.column)?,
-        };
-        let idx = match r {
-            Resolved::Local(i) => i,
-            Resolved::Outer { .. } => {
-                return Err(EngineError::new(
-                    SqlState::FeatureNotSupported,
-                    "window ORDER BY may not reference an outer query column",
-                ));
-            }
-        };
+        let (rexpr, ty) = resolve(scope, &key.expr, None, key_ctx, params)?;
+        // The sort-key collation. An explicit trailing `COLLATE` (rare — `parse_expr` usually absorbs
+        // a `COLLATE` into the key expression) must be on a text key (42804); otherwise the collation
+        // is DERIVED from the key expression (collation.md §1) — a `COLLATE` inside it is explicit, a
+        // bare text column is its frozen implicit collation, every other shape resets to none (C). A
+        // collated window ORDER BY honors the collation in both the per-partition sort and peer
+        // determination (window.md §3/§5); `COLLATE "C"` resolves to `None` (the raw-byte fast path).
         let coll = match &key.collation {
             Some(cn) => {
-                if !scope.column_of(r).ty.is_text() {
+                if !matches!(ty, ResolvedType::Text | ResolvedType::Null) {
                     return Err(type_error(format!(
                         "collations are not supported by type {}",
-                        scope.column_of(r).ty.canonical_name()
+                        ty.type_name()
                     )));
                 }
                 resolve_collation_name(scope.catalog, cn)?
             }
-            None => match &scope.column_of(r).collation {
-                Some(cn) => resolve_collation_name(scope.catalog, cn)?,
-                None => None,
-            },
+            None => resolve_deriv(scope.catalog, derive_collation(scope, &key.expr)?)?,
         };
-        // A collated window ORDER BY honors the collation both in the per-partition sort and in
-        // peer determination (ranking, RANGE/GROUPS frames) — the window stage decorates each row's
-        // collated keys once and compares those everywhere (window.md §3/§5). `COLLATE "C"` resolves
-        // to `None` and stays on the raw-byte fast path.
-        let slot = grouped_window_slot(idx, group_keys, &key.column)?;
+        let slot = window_key_slot(rexpr, "window ORDER BY", window_keys)?;
         order.push((slot, key.descending, key.nulls_first, coll));
-        order_types.push(scope.column_of(r).ty.clone());
+        order_types.push(type_from_resolved(&ty)?);
     }
     // The explicit frame (window.md §6): ROWS / GROUPS integer-count offsets, RANGE value offsets.
     let frame = match &wd.frame {
@@ -15879,6 +15952,29 @@ fn resolve_window_def(
         Some(f) => Some(resolve_frame(f, &order, &order_types)?),
     };
     Ok((partition, order, frame))
+}
+
+/// Map a resolved window-key expression to the slot the window stage indexes (spec/design/window.md
+/// §5.1). A bare column / aggregate (`RExpr::Column`) keeps its real row slot — the input slot for a
+/// plain query, the grouped-row slot for a grouped one — so a column-only window is byte-identical to
+/// before. Any compound expression is materialized into `window_keys` at the placeholder slot
+/// `WINDOW_KEY_BASE + k` (rebased once the row layout is final). A key referencing an enclosing query
+/// (a correlated window — `where` names the clause) is the deferred follow-on (`0A000`).
+fn window_key_slot(rexpr: RExpr, clause: &str, window_keys: &mut Vec<RExpr>) -> Result<usize> {
+    if rexpr_references_outer(&rexpr, 0) {
+        return Err(EngineError::new(
+            SqlState::FeatureNotSupported,
+            format!("{clause} may not reference an outer query column"),
+        ));
+    }
+    Ok(match rexpr {
+        RExpr::Column(i) => i,
+        other => {
+            let k = window_keys.len();
+            window_keys.push(other);
+            WINDOW_KEY_BASE + k
+        }
+    })
 }
 
 /// Resolve an explicit frame clause (spec/design/window.md §6). `GROUPS` requires an ORDER BY
@@ -24484,12 +24580,30 @@ fn window_coll_keys(
 fn apply_window_stage(
     rows: &mut [Row],
     specs: &[WindowSpec],
+    window_keys: &[RExpr],
     env: &EvalEnv,
     meter: &mut Meter,
 ) -> Result<()> {
     let n = rows.len();
     if n == 0 {
         return Ok(());
+    }
+    // Materialize the non-column PARTITION BY / ORDER BY key expressions (window.md §5.1): evaluate
+    // each against the row and append it, so a materialized key's slot `input_width + k` reads the
+    // appended column and the partition / sort / frame machinery below (all slot-based) is unchanged.
+    // The window results are appended AFTER these, so a result slot is `input_width + window_keys.len()
+    // + w` (the rebased projection slot). Empty for a column-only window — no appended columns, the
+    // result slot stays `input_width + w`, byte-identical to before. The key evaluation is metered
+    // like any expression (operator_eval per node): new, deterministic, cross-core-identical work that
+    // exists only for an expression key (a bare-column key is not in `window_keys`).
+    if !window_keys.is_empty() {
+        for row in rows.iter_mut() {
+            let mut kv = Vec::with_capacity(window_keys.len());
+            for ke in window_keys {
+                kv.push(ke.eval(row, env, meter)?);
+            }
+            row.extend(kv);
+        }
     }
     // The shared partition/sort pass (window.md §5.2): specs that share an identical PARTITION BY +
     // ORDER BY are partitioned and sorted ONCE (the expensive step), then each computes its own

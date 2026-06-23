@@ -993,10 +993,27 @@ pub struct OrderKey {
     pub nulls_first: bool,
 }
 
-/// A window definition — the body of an `OVER (...)` clause (spec/design/window.md §3). S0 carries
-/// `PARTITION BY` columns and an `ORDER BY`; the frame clause and a base-window name are deferred
-/// (S4/S5). `partition` is narrowed to columns in S0 (the GROUP BY/ORDER BY narrowing — general
-/// expressions are a follow-on); `order` reuses the query ORDER BY sort keys.
+/// One window `ORDER BY` sort key (spec/design/window.md §3/§5.1). Unlike the query `OrderKey`
+/// (column references only), a window sort key is a **general expression** (`ORDER BY a + b`,
+/// `ORDER BY sum(x)` in a grouped query) — the deferred general-expression-key follow-on. A bare
+/// column expression is resolved to its row slot directly (unchanged); a compound expression is
+/// materialized into a synthetic window-key column before the window stage. `collation` /
+/// `descending` / `nulls_first` carry the same meaning as `OrderKey` (the latter resolved at parse).
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct WindowOrderKey {
+    pub expr: Expr,
+    /// An explicit `COLLATE "name"` on this key; `None` ⇒ the key expression's (text) collation. A
+    /// COLLATE on a non-text key is 42804; an unknown name is 42704 (spec/design/window.md §5.1).
+    pub collation: Option<String>,
+    pub descending: bool,
+    pub nulls_first: bool,
+}
+
+/// A window definition — the body of an `OVER (...)` clause (spec/design/window.md §3). Carries an
+/// optional base-window name, `PARTITION BY`, `ORDER BY`, and a frame clause. Both `partition` and
+/// `order` are **general expressions** (`PARTITION BY a + b`, `ORDER BY a % 2`, `ORDER BY sum(x)` in
+/// a grouped query — spec/design/window.md §5.1); a bare column resolves to its row slot directly, a
+/// compound expression is materialized into a synthetic window-key column before the window stage.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct WindowDef {
     /// An optional leading base-window name (`OVER (w ORDER BY …)`, `WINDOW w2 AS (w …)` —
@@ -1006,7 +1023,7 @@ pub struct WindowDef {
     /// `None`, so every definition is inline (`base = None`) by the time the window stage runs.
     pub base: Option<String>,
     pub partition: Vec<Expr>,
-    pub order: Vec<OrderKey>,
+    pub order: Vec<WindowOrderKey>,
     /// An explicit frame clause (`ROWS BETWEEN … AND …`), else `None` for the default frame
     /// (spec/design/window.md §6). S4 supports `ROWS` mode; explicit `RANGE`/`GROUPS` and `EXCLUDE`
     /// are parsed but rejected `0A000` at resolve.

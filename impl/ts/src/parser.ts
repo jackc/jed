@@ -40,6 +40,7 @@ import type {
   TypeMod,
   Update,
   WindowDef,
+  WindowOrderKey,
   WindowFrame,
   FrameBound,
   FrameMode,
@@ -1721,13 +1722,11 @@ class Parser {
     if (this.peekKeyword() === "partition") {
       this.advance();
       this.expectKeyword("by");
+      // A PARTITION BY key is a general expression (`PARTITION BY a + b`), not just a column
+      // (spec/design/window.md §5.1). A bare column resolves to its slot directly; a compound
+      // expression is materialized into a synthetic window-key column before the window stage.
       for (;;) {
-        const [qualifier, col] = this.parseColumnRef();
-        partition.push(
-          qualifier !== null
-            ? { kind: "qualifiedColumn", qualifier, name: col }
-            : { kind: "column", name: col },
-        );
+        partition.push(this.parseExpr());
         if (this.peek().kind === "comma") {
           this.advance();
         } else {
@@ -1735,7 +1734,7 @@ class Parser {
         }
       }
     }
-    const order = this.parseOrderBy();
+    const order = this.parseWindowOrderBy();
     const frame = this.parseWindowFrame();
     return { base, partition, order, frame };
   }
@@ -2024,36 +2023,70 @@ class Parser {
     this.expectKeyword("by");
     for (;;) {
       const [qualifier, column] = this.parseColumnRef();
-      // Optional `COLLATE "name"` on the sort key (spec/design/collation.md §1), between the column
-      // and the ASC/DESC direction (PG order).
-      let collation: string | null = null;
-      if (this.peekKeyword() === "collate") {
-        this.advance();
-        collation = this.expectCollationName();
-      }
-      let descending = false;
-      if (this.peekKeyword() === "asc") {
-        this.advance();
-      } else if (this.peekKeyword() === "desc") {
-        this.advance();
-        descending = true;
-      }
-      // Default follows direction (grammar.md §10): NULL is the largest value
-      // (PostgreSQL model), so ASC → NULLS LAST, DESC → NULLS FIRST.
-      let nullsFirst = descending;
-      if (this.peekKeyword() === "nulls") {
-        this.advance();
-        if (this.peekKeyword() === "first") {
-          this.advance();
-          nullsFirst = true;
-        } else if (this.peekKeyword() === "last") {
-          this.advance();
-          nullsFirst = false;
-        } else {
-          throw engineError("syntax_error", "NULLS must be followed by FIRST or LAST");
-        }
-      }
+      const { collation, descending, nullsFirst } = this.parseSortSuffix();
       keys.push({ qualifier, column, collation, descending, nullsFirst });
+      if (this.peek().kind === "comma") {
+        this.advance();
+        continue;
+      }
+      break;
+    }
+    return keys;
+  }
+
+  // parseSortSuffix parses the trailing modifiers shared by every sort key: an optional `COLLATE
+  // "name"`, an optional `ASC`/`DESC` direction, and an optional `NULLS FIRST|LAST`. nullsFirst is
+  // resolved here — explicit if given, else the direction default (ASC → NULLS LAST, DESC → NULLS
+  // FIRST: NULL is the largest value, the PostgreSQL model, grammar.md §10). A bare `NULLS` not
+  // followed by FIRST/LAST is 42601. Used by both the query ORDER BY (after a column ref) and the
+  // window ORDER BY (after a general expression).
+  private parseSortSuffix(): {
+    collation: string | null;
+    descending: boolean;
+    nullsFirst: boolean;
+  } {
+    let collation: string | null = null;
+    if (this.peekKeyword() === "collate") {
+      this.advance();
+      collation = this.expectCollationName();
+    }
+    let descending = false;
+    if (this.peekKeyword() === "asc") {
+      this.advance();
+    } else if (this.peekKeyword() === "desc") {
+      this.advance();
+      descending = true;
+    }
+    let nullsFirst = descending;
+    if (this.peekKeyword() === "nulls") {
+      this.advance();
+      if (this.peekKeyword() === "first") {
+        this.advance();
+        nullsFirst = true;
+      } else if (this.peekKeyword() === "last") {
+        this.advance();
+        nullsFirst = false;
+      } else {
+        throw engineError("syntax_error", "NULLS must be followed by FIRST or LAST");
+      }
+    }
+    return { collation, descending, nullsFirst };
+  }
+
+  // parseWindowOrderBy parses an OVER clause's optional `ORDER BY <key> ("," <key>)*` (nil when
+  // absent). Unlike the query parseOrderBy (column references only), each key is a general expression
+  // (`ORDER BY a + b`, `ORDER BY sum(x)`) followed by the shared sort suffix. A COLLATE binds tighter
+  // than the comparison/arithmetic that could appear in a key, so parseExpr already absorbs an inline
+  // `expr COLLATE "x"`; the trailing COLLATE here is the sort-key collation. spec/design/window.md §5.1.
+  private parseWindowOrderBy(): WindowOrderKey[] {
+    const keys: WindowOrderKey[] = [];
+    if (this.peekKeyword() !== "order") return keys;
+    this.advance();
+    this.expectKeyword("by");
+    for (;;) {
+      const expr = this.parseExpr();
+      const { collation, descending, nullsFirst } = this.parseSortSuffix();
+      keys.push({ expr, collation, descending, nullsFirst });
       if (this.peek().kind === "comma") {
         this.advance();
         continue;
