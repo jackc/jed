@@ -1,0 +1,170 @@
+# Window functions combined with GROUP BY / aggregates in one query (spec/design/window.md §2/§5.1).
+#
+# The window stage runs over the GROUPED rows (PostgreSQL's pipeline order: GROUP BY/HAVING → WINDOW
+# → ORDER BY), so a window function's arguments resolve against the grouped row [group_keys…,
+# agg_results…]: an aggregate INSIDE a window argument is legal (sum(sum(x)) OVER ()), and a window's
+# PARTITION BY / ORDER BY keys must be GROUPING columns. A non-grouping column anywhere in a window
+# construct is 42803; a window function in HAVING is 42P20.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.group_by, query.aggregates, query.having, query.window, query.window_ranking, query.window_offset, query.window_aggregate, query.window_frame, query.window_grouped, query.order_by, types.i32, resource.cost_metering
+
+statement ok
+CREATE TABLE we (id i32 PRIMARY KEY, g i32, x i32)
+
+statement ok
+INSERT INTO we VALUES (1, 10, 5), (2, 10, 3), (3, 20, 7), (4, 20, 1), (5, 20, 4), (6, 30, 9)
+
+# A window aggregate folds over an AGGREGATE result: sum(sum(x)) OVER () is the grand total of every
+# group's sum (29), constant across the grouped rows. The inner sum(x) is the per-group sum.
+# names: g, s, tot
+# cost: 28
+query IID nosort
+SELECT g, sum(x) AS s, sum(sum(x)) OVER () AS tot FROM we GROUP BY g ORDER BY g
+----
+10
+8
+29
+20
+12
+29
+30
+9
+29
+
+# sum(count(*)) OVER () — the total row count (6) spread over the grouped rows.
+# names: g, c, tc
+query IID nosort
+SELECT g, count(*) AS c, sum(count(*)) OVER () AS tc FROM we GROUP BY g ORDER BY g
+----
+10
+2
+6
+20
+3
+6
+30
+1
+6
+
+# Ranking over the grouped rows, ordered by a GROUPING column: each distinct g is its own peer, so
+# row_number and rank both number the groups 1..3.
+# names: g, s, rn, rk
+query IIII nosort
+SELECT g, sum(x) AS s, row_number() OVER (ORDER BY g) AS rn, rank() OVER (ORDER BY g) AS rk FROM we GROUP BY g ORDER BY g
+----
+10
+8
+1
+1
+20
+12
+2
+2
+30
+9
+3
+3
+
+# lag() over an aggregate: the previous group's sum (NULL for the first group).
+# names: g, s, prev
+query III nosort
+SELECT g, sum(x) AS s, lag(sum(x)) OVER (ORDER BY g) AS prev FROM we GROUP BY g ORDER BY g
+----
+10
+8
+NULL
+20
+12
+8
+30
+9
+12
+
+# A running window aggregate over the group sums (default frame, window ORDER BY a grouping column):
+# the cumulative total of every group's sum through the current group.
+# names: g, s, run
+query IID nosort
+SELECT g, sum(x) AS s, sum(sum(x)) OVER (ORDER BY g) AS run FROM we GROUP BY g ORDER BY g
+----
+10
+8
+8
+20
+12
+20
+30
+9
+29
+
+# PARTITION BY a grouping column: each group is its own partition, so the partition total is the
+# group's own sum.
+# names: g, s, p
+query IID nosort
+SELECT g, sum(x) AS s, sum(sum(x)) OVER (PARTITION BY g) AS p FROM we GROUP BY g ORDER BY g
+----
+10
+8
+8
+20
+12
+12
+30
+9
+9
+
+# An explicit ROWS frame over the grouped rows: a 2-row running window of the group sums.
+# names: g, s, r2
+query IID nosort
+SELECT g, sum(x) AS s, sum(sum(x)) OVER (ORDER BY g ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) AS r2 FROM we GROUP BY g ORDER BY g
+----
+10
+8
+8
+20
+12
+20
+30
+9
+21
+
+# HAVING runs BEFORE the window stage, so the window sees only the surviving groups: row_number
+# numbers the two groups that pass HAVING sum(x) > 8.
+# names: g, s, rn
+query III nosort
+SELECT g, sum(x) AS s, row_number() OVER (ORDER BY g) AS rn FROM we GROUP BY g HAVING sum(x) > 8 ORDER BY g
+----
+20
+12
+1
+30
+9
+2
+
+# Whole-table aggregation (no GROUP BY) + a window over the single aggregate row.
+# names: s, c, r
+query III nosort
+SELECT sum(x) AS s, count(*) AS c, rank() OVER () AS r FROM we
+----
+29
+6
+1
+
+# A non-grouping column inside a window ARGUMENT is a grouping error (the window sees grouped rows).
+statement error 42803
+SELECT g, sum(x), first_value(x) OVER (ORDER BY g) FROM we GROUP BY g
+
+# A non-grouping column in a window ORDER BY key is a grouping error.
+statement error 42803
+SELECT g, sum(x), rank() OVER (ORDER BY x) FROM we GROUP BY g
+
+# A non-grouping column in a window PARTITION BY key is a grouping error.
+statement error 42803
+SELECT g, sum(x), rank() OVER (PARTITION BY x) FROM we GROUP BY g
+
+# A window function in HAVING is a windowing error (HAVING runs before the window stage).
+statement error 42P20
+SELECT g, sum(x) FROM we GROUP BY g HAVING rank() OVER (ORDER BY g) = 1
+
+# A window function nested in an aggregate's argument is a grouping error (an aggregate cannot fold a
+# window result — the window stage runs after aggregation).
+statement error 42803
+SELECT g, sum(rank() OVER ()) FROM we GROUP BY g

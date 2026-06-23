@@ -227,6 +227,8 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   "query.window_frame_range",
   "query.window_frame_exclude",
   "query.window_named",
+  // Window functions combined with GROUP BY / aggregates in one query (window.md §2/§5.1).
+  "query.window_grouped",
   // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
   "query.union",
   "query.intersect",

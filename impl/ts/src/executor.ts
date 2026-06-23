@@ -6881,24 +6881,29 @@ export class Database {
     // GROUP BY, an aggregate in the select list, OR a HAVING clause all make this an aggregate
     // query (HAVING alone groups the whole table — grammar.md §19).
     const isAgg = groupKeys.length > 0 || itemsHaveAggregate(sel.items) || sel.having !== null;
-    // A window query (a select-list OVER call) resolves its projection in window mode, where bare
-    // columns read the real row and window calls collect into synthetic slots
-    // (spec/design/window.md §5.1). S0 narrows a window function combined with a GROUP BY /
-    // aggregate to 0A000 (lifted in S3), so the two modes are mutually exclusive here.
+    // A window query (a select-list OVER call) resolves its projection in a window-aware mode, where
+    // bare columns read the input/grouped row and window calls collect into synthetic slots
+    // (spec/design/window.md §5.1). A grouped query that ALSO windows is both collecting AND windowing
+    // (the window stage runs over the grouped rows — §2); a plain window query is only windowing.
     const hasWindowSyntax = itemsHaveWindow(sel.items);
-    if (hasWindowSyntax && isAgg) {
-      throw engineError(
-        "feature_not_supported",
-        "window functions with aggregates or GROUP BY are not supported yet",
-      );
-    }
     const projAgg: AggCtx = hasWindowSyntax
-      ? {
-          collecting: false,
-          groupKeys,
-          specs: [],
-          window: { base: scope.width(), windowSpecs: [] },
-        }
+      ? isAgg
+        ? {
+            // Grouped+window: collect aggregates AND window functions. Window results carry the
+            // PLACEHOLDER base WINDOW_RESULT_BASE — their real slot groupKeys.length+specs.length+w
+            // is unknown until every aggregate is collected (one may be nested in a later window
+            // argument or HAVING), so they are rebased afterwards (window.md §5.1).
+            collecting: true,
+            groupKeys,
+            specs: [],
+            window: { base: WINDOW_RESULT_BASE, windowSpecs: [] },
+          }
+        : {
+            collecting: false,
+            groupKeys,
+            specs: [],
+            window: { base: scope.width(), windowSpecs: [] },
+          }
       : { collecting: isAgg, groupKeys, specs: [] };
     // Desugar `OVER name` references to their WINDOW-clause definitions before resolution
     // (window.md §5). The projection resolves against the desugared items; a reference to an
@@ -6914,23 +6919,31 @@ export class Database {
       names: columnNames,
       types: columnTypes,
     } = resolveProjections(scope, itemsRef, projAgg, ptypes);
-    // HAVING resolves against the same grouped scope (collect) — it may reference aggregates
-    // (collected into the SAME specs, so their slots follow the projection's) and grouping keys;
-    // a non-grouped column is 42803. It must be boolean (42804). Resolved after the projection so
-    // the synthetic row is [group_keys..., projection aggs..., HAVING aggs...].
+    let aggSpecs = projAgg.specs;
+    // The collected window specs (empty unless a window query). spec/design/window.md §5.1.
+    const windowSpecs: WindowSpec[] = projAgg.window?.windowSpecs ?? [];
+    const hasWindow = windowSpecs.length > 0;
+    // HAVING resolves in collect mode with window functions FORBIDDEN (42P20 — HAVING runs BEFORE the
+    // window stage, window.md §7), continuing the aggregate specs so its aggregates slot after the
+    // projection's. It must be boolean (42804). A HAVING aggregate, like a projection one, is part of
+    // the grouped row, so the window slots that follow are rebased over the final aggregate count.
     let having: RExpr | null = null;
     if (sel.having !== null) {
-      const { node, type } = resolve(scope, sel.having, null, projAgg, ptypes);
+      const hctx: AggCtx = { collecting: true, groupKeys, specs: aggSpecs };
+      const { node, type } = resolve(scope, sel.having, null, hctx, ptypes);
       if (type.kind !== "bool" && type.kind !== "null") {
         throw typeError("argument of HAVING must be boolean");
       }
       having = node;
+      aggSpecs = hctx.specs;
     }
-    const aggSpecs = projAgg.specs;
-    // The collected window specs (empty unless a window query — a query is aggregate XOR window in
-    // S0). spec/design/window.md §5.1.
-    const windowSpecs: WindowSpec[] = projAgg.window?.windowSpecs ?? [];
-    const hasWindow = windowSpecs.length > 0;
+    // Rewrite each grouped+window projection's window-result placeholder to its real grouped-row slot
+    // now that every aggregate (projection + HAVING + nested in a window argument) is collected
+    // (window.md §5.1). Window results appear only in the projection (42P20 elsewhere).
+    if (hasWindow && isAgg) {
+      const wbase = groupKeys.length + aggSpecs.length;
+      for (const p of projections) rebaseWindowResults(p, wbase);
+    }
     // SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
     if (isAgg && sel.distinct) {
       throw engineError(
@@ -7752,8 +7765,10 @@ export class Database {
     // running BEFORE the query ORDER BY / DISTINCT / LIMIT. Each window function's per-row result is
     // APPENDED to its row (so the projection reads result i at flat slot inputWidth + i), the rows
     // keep their scan order, and the query ORDER BY below re-sorts the extended rows. A window query
-    // never enters the streaming fast-paths above.
-    if (plan.hasWindow) {
+    // never enters the streaming fast-paths above. A GROUPED window query (§2) runs the window stage
+    // over the GROUPED rows instead, inside the aggregate branch below — so it is gated to plain
+    // (non-aggregate) windows here.
+    if (plan.hasWindow && !plan.isAgg) {
       applyWindowStage(rows, plan.windowSpecs, env, meter);
     }
 
@@ -7822,6 +7837,14 @@ export class Database {
       // only a TRUE result keeps the group. A dropped group charges no rowProduced (§8).
       if (plan.having !== null) {
         groupRows = groupRows.filter((srow) => isTrue(evalExpr(plan.having!, srow, env, meter)));
+      }
+      // WINDOW stage over the grouped rows (spec/design/window.md §2): runs AFTER GROUP BY/HAVING and
+      // BEFORE the query ORDER BY. It appends each window result to the grouped row [group_keys…,
+      // agg_results…], so the projection reads window result w at slot groupKeys+aggSpecs+w (the
+      // rebased slot — §5.1). The group-key slots the ORDER BY below sorts on are unchanged (they
+      // precede the appended results).
+      if (plan.hasWindow) {
+        applyWindowStage(groupRows, plan.windowSpecs, env, meter);
       }
       // ORDER BY over the grouped output (keys are synthetic group-key slots).
       if (plan.order.length > 0) {
@@ -9559,6 +9582,104 @@ function collectTouchedPlan(plan: QueryPlan, depth: number, touched: boolean[]):
   }
 }
 
+// WINDOW_RESULT_BASE is the placeholder base a grouped+window query's window results carry until
+// rebaseWindowResults rewrites them to groupKeys.length+aggSpecs.length+w (spec/design/window.md
+// §5.1). Far above any real column/synthetic-slot count, and below 2^53 so it stays an exact number.
+// (Written as 2**40, not 1<<40 — JS bitwise operators are 32-bit and would wrap.)
+const WINDOW_RESULT_BASE = 2 ** 40;
+
+// rebaseWindowResults rewrites a grouped+window projection's window-result placeholder slots to their
+// real grouped-row slot (spec/design/window.md §5.1). During resolution a window result of index w is
+// assigned the placeholder WINDOW_RESULT_BASE+w, because its real slot
+// groupKeys.length+aggSpecs.length+w is unknown until every aggregate (including any nested in a later
+// window argument or HAVING) has been collected. It descends into a subquery's lhs (current row space)
+// but NOT its plan (those columns index the subquery's own rows; a nested grouped+window plan was
+// already rebased when it was built). Mirrors collectTouched's variant coverage.
+function rebaseWindowResults(e: RExpr, wbase: number): void {
+  switch (e.kind) {
+    case "column":
+      if (e.index >= WINDOW_RESULT_BASE) e.index = wbase + (e.index - WINDOW_RESULT_BASE);
+      return;
+    case "outerColumn":
+      return;
+    case "subquery":
+      if (e.lhs !== null) rebaseWindowResults(e.lhs, wbase); // current row space only; not the plan
+      return;
+    case "inValues":
+      rebaseWindowResults(e.lhs, wbase);
+      return;
+    case "quantified":
+      rebaseWindowResults(e.lhs, wbase);
+      rebaseWindowResults(e.array, wbase);
+      return;
+    case "cast":
+    case "neg":
+    case "not":
+    case "isNull":
+      rebaseWindowResults(e.operand, wbase);
+      return;
+    case "arith":
+    case "compare":
+    case "and":
+    case "or":
+    case "distinct":
+    case "like":
+    case "regex":
+      rebaseWindowResults(e.lhs, wbase);
+      rebaseWindowResults(e.rhs, wbase);
+      return;
+    case "casing":
+      rebaseWindowResults(e.arg, wbase);
+      return;
+    case "atTimeZone":
+      rebaseWindowResults(e.zone, wbase);
+      rebaseWindowResults(e.value, wbase);
+      return;
+    case "dateTrunc":
+      rebaseWindowResults(e.unit, wbase);
+      rebaseWindowResults(e.value, wbase);
+      if (e.zone !== null) rebaseWindowResults(e.zone, wbase);
+      return;
+    case "extract":
+      rebaseWindowResults(e.value, wbase);
+      return;
+    case "dateConvert":
+      rebaseWindowResults(e.inner, wbase);
+      return;
+    case "case":
+      for (const arm of e.arms) {
+        rebaseWindowResults(arm.cond, wbase);
+        rebaseWindowResults(arm.result, wbase);
+      }
+      rebaseWindowResults(e.els, wbase);
+      return;
+    case "scalarFunc":
+    case "arrayFunc":
+    case "regexFunc":
+    case "rangeFunc":
+    case "rangeCtor":
+    case "rangeOp":
+    case "rangeSetOp":
+    case "variadic":
+      for (const a of e.args) rebaseWindowResults(a, wbase);
+      return;
+    case "row":
+      for (const f of e.fields) rebaseWindowResults(f, wbase);
+      return;
+    case "array":
+      for (const el of e.elements) rebaseWindowResults(el, wbase);
+      return;
+    case "field":
+      rebaseWindowResults(e.base, wbase);
+      return;
+    case "subscript":
+      rebaseWindowResults(e.base, wbase);
+      for (const b of rSubscriptBounds(e.subscripts)) rebaseWindowResults(b, wbase);
+      return;
+    default: // leaves: param, const*
+  }
+}
+
 // valueToRExpr builds the constant rExpr for a folded subquery value (§26). The static type is
 // carried separately (the node's type), so a NULL value here is just constNull.
 function valueToRExpr(v: Value): RExpr {
@@ -11169,6 +11290,14 @@ function resolveAggregate(
         "no aggregate function matches the given argument count",
       );
     }
+    // An aggregate's argument may not contain a window function (PG 42803 — window.md §7): the window
+    // stage runs AFTER aggregation, so a window result cannot be folded into an aggregate.
+    if (exprHasWindow(e.args[0])) {
+      throw engineError(
+        "grouping_error",
+        "aggregate function calls cannot contain window function calls",
+      );
+    }
     const r = resolve(scope, e.args[0], null, sub, params);
     operand = r.node;
     const desc = lookupAggregateOverload(name, r.type);
@@ -11248,6 +11377,16 @@ function resolveWindowCall(
   // Resolved function arguments (empty for the no-argument ranking functions; ntile's bucket-count
   // argument is the one entry — window.md §4).
   const wargs: RExpr[] = [];
+  // The sub-context window ARGUMENTS resolve in (spec/design/window.md §5.1). In a grouped query
+  // (ag.collecting) they resolve against the grouped row — a nested aggregate collects into the
+  // query's SHARED specs (JS arrays are by-reference, so pushes are visible to ag) and a bare column
+  // must be a grouping key (else 42803) — while a nested window is 42P20 (`sub` has no `window`). In
+  // a plain window query `sub` is Forbidden (no aggregate/window nesting). `grouped`/`ag.groupKeys`
+  // also map the window's PARTITION BY / ORDER BY columns to grouped-row slots.
+  const grouped = ag.collecting;
+  const sub: AggCtx = grouped
+    ? { collecting: true, groupKeys: ag.groupKeys, specs: ag.specs }
+    : { collecting: false, groupKeys: [], specs: [] };
   if (lname in noArgI64) {
     if (e.star || e.args.length !== 0) {
       throw engineError("undefined_function", `${lname} takes no arguments`);
@@ -11267,7 +11406,6 @@ function resolveWindowCall(
     if (e.star || e.args.length !== 1) {
       throw engineError("undefined_function", "ntile takes exactly one argument");
     }
-    const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const r = resolve(scope, e.args[0]!, null, sub, params);
     if (r.type.kind !== "int" && r.type.kind !== "null") {
       throw typeError("argument of ntile must be integer");
@@ -11282,7 +11420,6 @@ function resolveWindowCall(
     if (e.star || e.args.length === 0 || e.args.length > 3) {
       throw engineError("undefined_function", `${lname} takes 1 to 3 arguments`);
     }
-    const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const vr = resolve(scope, e.args[0]!, null, sub, params);
     const vty = vr.type;
     // A scalar hint for the default argument: an int(s)/float(s) value type carries its width down
@@ -11326,7 +11463,6 @@ function resolveWindowCall(
           "no aggregate function matches the given argument count",
         );
       }
-      const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
       const r = resolve(scope, e.args[0]!, null, sub, params);
       const desc = lookupAggregateOverload(lname, r.type);
       if (!desc) throw noAggOverload(lname);
@@ -11336,7 +11472,13 @@ function resolveWindowCall(
     plan = "agg";
     // Resolve the window definition + collect the spec here (it carries the extra aggPlan fields),
     // returning early so the shared collection below (which omits them) is not also run.
-    const [partition, order, frame] = resolveWindowDef(scope, e.over, params);
+    const [partition, order, frame] = resolveWindowDef(
+      scope,
+      e.over,
+      grouped,
+      ag.groupKeys,
+      params,
+    );
     if (ag.window === undefined) {
       throw engineError("windowing_error", "window functions are not allowed here");
     }
@@ -11361,7 +11503,6 @@ function resolveWindowCall(
     if (e.args.length !== want) {
       throw engineError("undefined_function", `${lname} takes ${want} argument(s)`);
     }
-    const sub: AggCtx = { collecting: false, groupKeys: [], specs: [] };
     const vr = resolve(scope, e.args[0]!, null, sub, params);
     wargs.push(vr.node);
     if (lname === "first_value") {
@@ -11382,7 +11523,7 @@ function resolveWindowCall(
   }
   // Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys,
   // explicit frame) — all against the input scope, never recursing into `ag`. Before collecting.
-  const [partition, order, frame] = resolveWindowDef(scope, e.over, params);
+  const [partition, order, frame] = resolveWindowDef(scope, e.over, grouped, ag.groupKeys, params);
   // A window function is allowed only in a window query's projection. In WHERE / a JOIN ON /
   // HAVING / an aggregate query `ag.window` is unset → 42P20 (window.md §7).
   if (ag.window === undefined) {
@@ -11398,18 +11539,39 @@ function resolveWindowCall(
 // input scope. Mirrors the query ORDER BY resolution (the collation / direction / NULLS handling).
 // S0: partition keys are columns only. A window function in a partition/order key, or an outer
 // reference, is rejected.
+// groupedWindowSlot maps a window PARTITION BY / ORDER BY key's resolved input-row index to the slot
+// the window stage indexes (spec/design/window.md §5.1). In a grouped query (grouped) the key must be
+// a GROUPING column — mapped to its grouped-row slot, else 42803; in a plain window query the flat
+// input index is used directly.
+function groupedWindowSlot(
+  idx: number,
+  grouped: boolean,
+  groupKeys: number[],
+  name: string,
+): number {
+  if (!grouped) return idx;
+  const pos = groupKeys.indexOf(idx);
+  if (pos < 0) throw groupingErrorColumn(name);
+  return pos;
+}
+
 function resolveWindowDef(
   scope: Scope,
   wd: WindowDef,
+  grouped: boolean,
+  groupKeys: number[],
   _params: ParamTypes,
 ): [number[], OrderSlot[], ResolvedFrame | null] {
   const partition: number[] = [];
   for (const key of wd.partition) {
     let r: Resolved;
+    let name: string;
     if (key.kind === "column") {
       r = scope.resolveBare(key.name);
+      name = key.name;
     } else if (key.kind === "qualifiedColumn") {
       r = scope.resolveQualified(key.qualifier, key.name);
+      name = key.name;
     } else {
       throw engineError("feature_not_supported", "PARTITION BY supports only column references");
     }
@@ -11419,7 +11581,7 @@ function resolveWindowDef(
         "PARTITION BY may not reference an outer query column",
       );
     }
-    partition.push(r.index);
+    partition.push(groupedWindowSlot(r.index, grouped, groupKeys, name));
   }
   const order: OrderSlot[] = [];
   // The ORDER BY key column types, captured in lockstep with order — a RANGE value-offset frame
@@ -11454,7 +11616,8 @@ function resolveWindowDef(
     if (collation !== null) {
       throw engineError("feature_not_supported", "collated window ORDER BY is not supported yet");
     }
-    order.push({ idx, descending: key.descending, nullsFirst: key.nullsFirst, collation });
+    const slot = groupedWindowSlot(idx, grouped, groupKeys, key.column);
+    order.push({ idx: slot, descending: key.descending, nullsFirst: key.nullsFirst, collation });
     orderTypes.push(scope.columnAt(idx).type);
   }
   // The explicit frame (window.md §6): ROWS / GROUPS integer-count offsets, RANGE value offsets.

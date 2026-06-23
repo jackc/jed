@@ -5,8 +5,8 @@
 # so with a distinct ORDER BY key the result matches PostgreSQL exactly, and with NO window ORDER
 # BY it is primary-key order (a documented PG divergence, D1, that PG leaves unspecified). A window
 # stage runs after WHERE/GROUP BY and before the query ORDER BY/LIMIT/DISTINCT. A window-only
-# function without OVER, or a window function in WHERE, is 42P20; a window function combined with
-# aggregates is 0A000 (S0 narrowing).
+# function without OVER, or a window function in WHERE, is 42P20; window functions combined with
+# aggregates / GROUP BY run over the grouped rows (window/group_by.test).
 # requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.window, query.order_by, types.i32, resource.cost_metering
 
 statement ok
@@ -140,9 +140,18 @@ SELECT id FROM t WHERE row_number() OVER (ORDER BY v) > 1
 statement error 42P20
 SELECT id FROM t GROUP BY id HAVING row_number() OVER () > 0
 
-# A window function combined with an aggregate / GROUP BY is deferred in S0 — 0A000 (lifted in S3).
-statement error 0A000
-SELECT g, row_number() OVER (ORDER BY g), SUM(v) FROM t GROUP BY g
+# A window function combined with an aggregate / GROUP BY runs over the grouped rows: row_number
+# numbers the groups in window-ORDER-BY order (the full combined surface is window/group_by.test).
+# names: g, rn, s
+query III nosort
+SELECT g, row_number() OVER (ORDER BY g) AS rn, SUM(v) AS s FROM t GROUP BY g ORDER BY g
+----
+1
+1
+100
+2
+2
+65
 
 # OVER a named window that is not defined by any WINDOW clause is 42704 (PG-matching, S5).
 statement error 42704

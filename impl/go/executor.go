@@ -9338,23 +9338,29 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	// query (HAVING alone groups the whole table — grammar.md §19).
 	isAgg := len(groupKeys) > 0 || itemsHaveAggregate(sel.Items) || sel.Having != nil
 	// A window query (a select-list OVER call) resolves its projection in window mode, where bare
-	// columns read the real row and window calls collect into synthetic slots (spec/design/window.md
-	// §5.1). S0 narrows a window function combined with a GROUP BY / aggregate to 0A000 (lifted in
-	// S3), so the two modes are mutually exclusive here.
+	// columns read the input/grouped row and window calls collect into synthetic slots
+	// (spec/design/window.md §5.1). A grouped query that ALSO windows is both collecting and
+	// windowing (the window stage runs over the grouped rows — §2); a plain window query is only
+	// windowing.
 	hasWindowSyntax := itemsHaveWindow(sel.Items)
-	if hasWindowSyntax && isAgg {
-		return nil, NewError(FeatureNotSupported, "window functions with aggregates or GROUP BY are not supported yet")
-	}
 	projAgg := &aggCtx{collecting: isAgg, groupKeys: groupKeys}
 	if hasWindowSyntax {
-		// scope width = the input row's flat column count; the window stage appends each function's
-		// result after the input columns, so window slot = width + window_index (window.md §5.1).
-		width := 0
-		for _, rel := range s.rels {
-			width += len(rel.table.Columns)
-		}
 		projAgg.windowing = true
-		projAgg.windowBase = width
+		if isAgg {
+			// Grouped+window: window results land AFTER every aggregate, whose final count is not
+			// known until resolution finishes (one may be nested in a later window argument or in
+			// HAVING). They carry the PLACEHOLDER base windowResultBase and are rebased afterwards
+			// to len(groupKeys)+len(aggSpecs)+w (window.md §5.1).
+			projAgg.windowBase = windowResultBase
+		} else {
+			// Plain window: scope width = the input row's flat column count; the window stage appends
+			// each result after the input columns, so window slot = width + window_index.
+			width := 0
+			for _, rel := range s.rels {
+				width += len(rel.table.Columns)
+			}
+			projAgg.windowBase = width
+		}
 	}
 	// Desugar `OVER name` references to their WINDOW-clause definitions before resolution
 	// (window.md §5). The projection resolves against the desugared items; a reference to an
@@ -9370,13 +9376,17 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 	if err != nil {
 		return nil, err
 	}
-	// HAVING resolves against the same grouped scope (collect) — it may reference aggregates
-	// (collected into the SAME specs, so their slots follow the projection's) and grouping keys;
-	// a non-grouped column is 42803. It must be boolean (42804). Resolved after the projection so
-	// the synthetic row is [group_keys..., projection aggs..., HAVING aggs...].
+	aggSpecs := projAgg.specs
+	windowSpecs := projAgg.windowSpecs
+	hasWindow := len(windowSpecs) > 0
+	// HAVING resolves in collect mode with window functions FORBIDDEN (42P20 — HAVING runs BEFORE the
+	// window stage, window.md §7), continuing the aggregate specs so its aggregates slot after the
+	// projection's. It must be boolean (42804). A HAVING aggregate, like a projection one, is part of
+	// the grouped row, so the window slots that follow are rebased over the final aggregate count.
 	var having *rExpr
 	if sel.Having != nil {
-		node, ty, herr := resolve(s, *sel.Having, nil, projAgg, ptypes)
+		hctx := &aggCtx{collecting: true, groupKeys: groupKeys, specs: aggSpecs}
+		node, ty, herr := resolve(s, *sel.Having, nil, hctx, ptypes)
 		if herr != nil {
 			return nil, herr
 		}
@@ -9384,10 +9394,17 @@ func (db *Database) planSelect(sel *Select, parent *scope, ctes []*cteBinding, p
 			return nil, typeError("argument of HAVING must be boolean")
 		}
 		having = node
+		aggSpecs = hctx.specs
 	}
-	aggSpecs := projAgg.specs
-	windowSpecs := projAgg.windowSpecs
-	hasWindow := len(windowSpecs) > 0
+	// Rewrite each grouped+window projection's window-result placeholder to its real grouped-row slot
+	// now that every aggregate (projection + HAVING + nested in a window argument) is collected
+	// (window.md §5.1). Window results appear only in the projection (42P20 elsewhere).
+	if hasWindow && isAgg {
+		wbase := len(groupKeys) + len(aggSpecs)
+		for _, p := range projections {
+			rebaseWindowResults(p, wbase)
+		}
+	}
 	// SELECT DISTINCT over an aggregate query's output (output-row dedup) is deferred (0A000).
 	if isAgg && sel.Distinct {
 		return nil, NewError(FeatureNotSupported, "SELECT DISTINCT with aggregates is not supported yet")
@@ -11461,8 +11478,10 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 	// running BEFORE the query ORDER BY / DISTINCT / LIMIT. Each window function's per-row result is
 	// APPENDED to its row (so the projection reads result i at flat slot input_width+i); the rows
 	// keep their scan order, and the query ORDER BY below re-sorts the extended rows. A window query
-	// never enters the streaming fast-paths above.
-	if plan.hasWindow {
+	// never enters the streaming fast-paths above. A GROUPED window query (§2) runs the window stage
+	// over the GROUPED rows instead, inside the aggregate branch below — so it is gated to plain
+	// (non-aggregate) windows here.
+	if plan.hasWindow && !plan.isAgg {
 		if err := applyWindowStage(rows, plan.windowSpecs, env, meter); err != nil {
 			return selectResult{}, err
 		}
@@ -11558,7 +11577,7 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 			}
 		}
 		// Build one synthetic row per group: [group_key_values..., aggregate_results...].
-		groupRows := make([][]Value, 0, len(groups))
+		groupRows := make([]Row, 0, len(groups))
 		for _, g := range groups {
 			srow := make([]Value, 0, len(g.keys)+len(g.accs))
 			srow = append(srow, g.keys...)
@@ -11586,6 +11605,16 @@ func (db *Database) execSelectPlan(plan *selectPlan, outer []Row, params []Value
 				}
 			}
 			groupRows = kept
+		}
+		// WINDOW stage over the grouped rows (spec/design/window.md §2): runs AFTER GROUP BY/HAVING
+		// and BEFORE the query ORDER BY. It appends each window result to the grouped row
+		// [group_keys…, agg_results…], so the projection reads window result w at slot
+		// len(groupKeys)+len(aggSpecs)+w (the rebased slot — §5.1). The group-key slots the ORDER BY
+		// below sorts on are unchanged (they precede the appended results).
+		if plan.hasWindow {
+			if err := applyWindowStage(groupRows, plan.windowSpecs, env, meter); err != nil {
+				return selectResult{}, err
+			}
 		}
 		// ORDER BY over the grouped output (keys are synthetic group-key slots).
 		if len(plan.order) > 0 {
@@ -12001,6 +12030,55 @@ func collectTouched(e *rExpr, depth int, touched []bool) {
 	collectTouched(e.caseEls, depth, touched)
 	for _, a := range e.sargs {
 		collectTouched(a, depth, touched)
+	}
+}
+
+// windowResultBase is the placeholder base a grouped+window query's window results carry until
+// rebaseWindowResults rewrites them to len(groupKeys)+len(aggSpecs)+w (spec/design/window.md §5.1).
+// Far above any real column/synthetic-slot count, and below 2^53 so it is exact in the TS core's
+// number.
+const windowResultBase = 1 << 40
+
+// rebaseWindowResults rewrites a grouped+window projection's window-result placeholder slots to their
+// real grouped-row slot (spec/design/window.md §5.1). During resolution a window result of index w is
+// assigned the placeholder windowResultBase+w, because its real slot len(groupKeys)+len(aggSpecs)+w is
+// unknown until every aggregate (including any nested in a later window argument or HAVING) has been
+// collected. It descends into a subquery's lhs (current row space) but NOT its plan (those columns
+// index the subquery's own rows; a nested grouped+window plan was already rebased when it was built).
+func rebaseWindowResults(e *rExpr, wbase int) {
+	if e == nil {
+		return
+	}
+	switch e.kind {
+	case reColumn:
+		if e.index >= windowResultBase {
+			e.index = wbase + (e.index - windowResultBase)
+		}
+		return
+	case reOuterColumn:
+		return
+	case reSubquery:
+		rebaseWindowResults(e.lhs, wbase) // current row space only; not subPlan
+		return
+	case reInValues:
+		rebaseWindowResults(e.lhs, wbase)
+		return
+	}
+	rebaseWindowResults(e.operand, wbase)
+	rebaseWindowResults(e.lhs, wbase)
+	rebaseWindowResults(e.rhs, wbase)
+	for _, arm := range e.caseArms {
+		rebaseWindowResults(arm.cond, wbase)
+		rebaseWindowResults(arm.result, wbase)
+	}
+	rebaseWindowResults(e.caseEls, wbase)
+	for _, a := range e.sargs {
+		rebaseWindowResults(a, wbase)
+	}
+	for _, sub := range e.subs {
+		rebaseWindowResults(sub.index, wbase)
+		rebaseWindowResults(sub.lower, wbase)
+		rebaseWindowResults(sub.upper, wbase)
 	}
 }
 
@@ -14590,6 +14668,11 @@ func resolveAggregate(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
+		// An aggregate's argument may not contain a window function (PG 42803 — window.md §7): the
+		// window stage runs AFTER aggregation, so a window result cannot be folded into an aggregate.
+		if exprHasWindow(arg) {
+			return nil, resolvedType{}, NewError(GroupingError, "aggregate function calls cannot contain window function calls")
+		}
 		r, t, err := resolve(s, arg, nil, sub, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -14621,6 +14704,16 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		result resolvedType
 		wagg   aggPlan // the aggregate plan, valid only when plan == planAgg
 	)
+	// The sub-context window ARGUMENTS resolve in (spec/design/window.md §5.1). In a grouped query
+	// (ag.collecting) they resolve against the grouped row — a nested aggregate collects into the
+	// query's SHARED specs and a bare column must be a grouping key (else 42803) — so `sub` is a
+	// collecting context seeded with the running specs; a nested window is then 42P20 (sub is not
+	// windowing). In a plain window query `sub` is Forbidden (no aggregate/window nesting). The grown
+	// specs are written back into ag at the end so the next window's nested aggregates keep numbering.
+	sub := &aggCtx{}
+	if ag.collecting {
+		sub = &aggCtx{collecting: true, groupKeys: ag.groupKeys, specs: ag.specs}
+	}
 	// The frame-insensitive no-argument ranking functions (S0/S1): row_number/rank/dense_rank → i64.
 	noArgI64, isNoArg := map[string]windowPlan{
 		"row_number": planRowNumber,
@@ -14653,7 +14746,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		if fc.Star || len(fc.Args) != 1 {
 			return nil, resolvedType{}, NewError(UndefinedFunction, "ntile takes exactly one argument")
 		}
-		anode, aty, err := resolve(s, *fc.Args[0], nil, &aggCtx{}, params)
+		anode, aty, err := resolve(s, *fc.Args[0], nil, sub, params)
 		if err != nil {
 			return nil, resolvedType{}, err
 		}
@@ -14670,7 +14763,6 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 		if fc.Star || len(fc.Args) == 0 || len(fc.Args) > 3 {
 			return nil, resolvedType{}, NewError(UndefinedFunction, name+" takes 1 to 3 arguments")
 		}
-		sub := &aggCtx{}
 		vnode, vty, err := resolve(s, *fc.Args[0], nil, sub, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -14735,7 +14827,7 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
-			r, t, err := resolve(s, arg, nil, &aggCtx{}, params)
+			r, t, err := resolve(s, arg, nil, sub, params)
 			if err != nil {
 				return nil, resolvedType{}, err
 			}
@@ -14762,7 +14854,6 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 			return nil, resolvedType{}, NewError(UndefinedFunction,
 				fmt.Sprintf("%s takes %d argument(s)", name, want))
 		}
-		sub := &aggCtx{}
 		vnode, vty, err := resolve(s, *fc.Args[0], nil, sub, params)
 		if err != nil {
 			return nil, resolvedType{}, err
@@ -14787,39 +14878,64 @@ func resolveWindowCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramType
 	default:
 		return nil, resolvedType{}, NewError(UndefinedFunction, name+" is not a window function")
 	}
-	// Resolve the window definition (PARTITION BY columns → flat slots, ORDER BY → sort keys,
-	// explicit frame) — all against the input scope, never recursing into ag. Before the spec.
-	partition, order, frame, err := resolveWindowDef(s, fc.Over)
+	// Resolve the window definition (PARTITION BY / ORDER BY columns → slots, explicit frame). In a
+	// grouped query the keys must be GROUPING columns, mapped to their grouped-row slot (42803
+	// otherwise — window.md §5.1). Resolved against the input scope, never recursing into ag.
+	partition, order, frame, err := resolveWindowDef(s, fc.Over, ag.collecting, ag.groupKeys)
 	if err != nil {
 		return nil, resolvedType{}, err
 	}
 	// A window function is allowed only in a window query's projection. In WHERE / a JOIN ON /
-	// HAVING / an aggregate query ag is not windowing → 42P20 (window.md §7).
+	// HAVING / an aggregate-only query ag is not windowing → 42P20 (window.md §7).
 	if !ag.windowing {
 		return nil, resolvedType{}, NewError(WindowingError, "window functions are not allowed here")
+	}
+	// Write back the (possibly grown) aggregate specs collected from this call's arguments so the
+	// next window's nested aggregates continue the numbering (grouped query only — window.md §5.1).
+	if ag.collecting {
+		ag.specs = sub.specs
 	}
 	slot := ag.windowBase + len(ag.windowSpecs)
 	ag.windowSpecs = append(ag.windowSpecs, windowSpec{plan: plan, partition: partition, order: order, args: wargs, aggPlan: wagg, frame: frame})
 	return &rExpr{kind: reColumn, index: slot}, result, nil
 }
 
-// resolveWindowDef resolves the PARTITION BY column list (→ flat input-row slots) and the
-// within-partition ORDER BY (→ sort keys) of an OVER (...) clause, against the (non-aggregate)
-// input scope. Mirrors the query ORDER BY resolution (the collation / direction / NULLS handling).
-// S0: partition keys are columns only. A window function in a partition/order key, or an outer
-// reference, is rejected.
-func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, *resolvedFrame, error) {
+// groupedWindowSlot maps a window PARTITION BY / ORDER BY key's resolved input-row index to the slot
+// the window stage indexes (spec/design/window.md §5.1). In a grouped query (grouped) the key must be
+// a GROUPING column — mapped to its grouped-row slot, else 42803; in a plain window query the flat
+// input index is used directly.
+func groupedWindowSlot(idx int, grouped bool, groupKeys []int, name string) (int, error) {
+	if !grouped {
+		return idx, nil
+	}
+	for pos, gk := range groupKeys {
+		if gk == idx {
+			return pos, nil
+		}
+	}
+	return 0, groupingErrorColumn(name)
+}
+
+// resolveWindowDef resolves the PARTITION BY column list and the within-partition ORDER BY (→ sort
+// keys) of an OVER (...) clause, against the input scope (mirrors the query ORDER BY resolution —
+// collation / direction / NULLS handling). Keys are columns only (general-expression keys are
+// deferred — §11); in a grouped query (grouped) they must be GROUPING columns, mapped to their
+// grouped-row slot (42803 otherwise). A window function in a key, or an outer reference, is rejected.
+func resolveWindowDef(s *scope, wd *WindowDef, grouped bool, groupKeys []int) ([]int, []orderSlot, *resolvedFrame, error) {
 	partition := make([]int, 0, len(wd.Partition))
 	for _, key := range wd.Partition {
 		var (
 			r   resolved
 			err error
 		)
+		var name string
 		switch key.Kind {
 		case ExprColumn:
 			r, err = s.resolveBare(key.Column)
+			name = key.Column
 		case ExprQualifiedColumn:
 			r, err = s.resolveQualified(key.Qualifier, key.Column)
+			name = key.Column
 		default:
 			return nil, nil, nil, NewError(FeatureNotSupported, "PARTITION BY supports only column references")
 		}
@@ -14829,7 +14945,11 @@ func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, *resolvedFra
 		if r.level != 0 {
 			return nil, nil, nil, NewError(FeatureNotSupported, "PARTITION BY may not reference an outer query column")
 		}
-		partition = append(partition, r.index)
+		slot, err := groupedWindowSlot(r.index, grouped, groupKeys, name)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		partition = append(partition, slot)
 	}
 	order := make([]orderSlot, 0, len(wd.Order))
 	// The ORDER BY key column types, captured in lockstep with order — a RANGE value-offset frame
@@ -14871,7 +14991,11 @@ func resolveWindowDef(s *scope, wd *WindowDef) ([]int, []orderSlot, *resolvedFra
 		if coll != nil {
 			return nil, nil, nil, NewError(FeatureNotSupported, "collated window ORDER BY is not supported yet")
 		}
-		order = append(order, orderSlot{idx: r.index, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
+		slot, err := groupedWindowSlot(r.index, grouped, groupKeys, key.Column)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		order = append(order, orderSlot{idx: slot, descending: key.Descending, nullsFirst: key.NullsFirst, collation: coll})
 		orderTypes = append(orderTypes, s.columnOf(r).Type)
 	}
 	// The explicit frame (window.md §6): ROWS / GROUPS integer-count offsets, RANGE value offsets.

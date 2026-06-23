@@ -10,13 +10,16 @@
 > change the data/grammar and here in the same edit. PostgreSQL is the behavioral default
 > (CLAUDE.md §1); the deliberate divergences are the ledger in §10.
 
-> **Status: COMPLETE (S0–S7, all three cores).** Every function below is landed — row_number,
+> **Status: COMPLETE (S0–S8, all three cores).** Every function below is landed — row_number,
 > rank, dense_rank, percent_rank, cume_dist, ntile, lag, lead, the aggregates as window functions
 > (running + explicit `ROWS`/`RANGE`/`GROUPS` frames, including value-based `RANGE` offsets over an
 > integer or decimal ordering key, with `EXCLUDE CURRENT ROW`/`GROUP`/`TIES`/`NO OTHERS`),
-> first_value/last_value/nth_value, and named windows. The only remaining `0A000` items — `RANGE`
-> offsets over a float (divergence D3) / timestamp / date ordering key (§6/§11 + the per-slice
-> notes) — are deferred follow-ons, not gaps in the core.
+> first_value/last_value/nth_value, and named windows — and **window functions combine with GROUP BY
+> / aggregates in one query** (S8): the window stage runs over the grouped rows, an aggregate may sit
+> inside a window argument (`sum(sum(x)) OVER ()`), and a window's column keys must be grouping
+> columns. The remaining `0A000` items — `RANGE` offsets over a float (divergence D3) / timestamp /
+> date ordering key (§6/§11), and **general-expression window keys** (an aggregate or expression as a
+> `PARTITION BY`/`ORDER BY` key, e.g. `ORDER BY sum(x)` — §11) — are deferred follow-ons, not gaps.
 
 A **window function** computes a value for **each row** from a *set* of related rows — its
 **window frame** — without collapsing the rows the way an aggregate does. `row_number() OVER
@@ -67,6 +70,14 @@ cores in lockstep** (Rust + Go + TS), spec-first, with corpus entries + a capabi
    group (`GROUP`), its peers but not itself (`TIES`), or nothing (`NO OTHERS`, the default). Only
    rows already in the frame are dropped; `first/last/nth_value` pick over the survivors; an
    empty-after-exclusion frame is `NULL` (count `0`). Capability `query.window_frame_exclude`.
+8. **S8 — combined with `GROUP BY` / aggregates.** A window function in the SELECT list of a grouped
+   (or whole-table aggregate) query: the window stage runs over the *grouped* rows (§2). A window
+   function's **arguments** resolve against the grouped row, so a nested aggregate is legal
+   (`sum(sum(x)) OVER ()`, `sum(count(*)) OVER ()`); its **`PARTITION BY`/`ORDER BY` column keys must
+   be grouping columns** (`42803` otherwise). `HAVING` runs *before* the window stage (a window
+   function there is `42P20`); a window function nested in an aggregate argument is `42803`.
+   General-expression window keys (an aggregate/expression as a key, `ORDER BY sum(x)`) stay deferred
+   (§11). Capability `query.window_grouped`.
 
 Locked scope decisions: **the within-partition order is always fully resolved** (§3,
 deterministic — a divergence-adjacent strictness, §10); **`percent_rank`/`cume_dist` →
@@ -85,13 +96,17 @@ scan → WHERE → GROUP BY / HAVING → ★ WINDOW ★ → DISTINCT → ORDER B
 
 Two consequences are load-bearing:
 
-- **Window functions see post-aggregation rows.** In a grouped query, a window function runs
-  over the grouped synthetic rows, so its arguments and its `PARTITION BY`/`ORDER BY` keys
-  resolve against `[group_keys…, agg_results…]` — `rank() OVER (ORDER BY sum(x))` and
-  `sum(count(*)) OVER ()` are legal (an aggregate *inside* a window argument). A window function
-  may **not** appear in `WHERE`, a `JOIN ON`, `GROUP BY`, `HAVING`, or another window function's
-  `PARTITION BY`/`ORDER BY`/frame bound (those run *before* the window stage) — that is `42P20`
-  (§7), the windowing analog of the aggregate's `42803` ([aggregates.md](aggregates.md) §6).
+- **Window functions see post-aggregation rows** (S8). In a grouped query, a window function runs
+  over the grouped synthetic rows, so its arguments resolve against `[group_keys…, agg_results…]` —
+  an aggregate *inside* a window argument is legal (`sum(sum(x)) OVER ()`, `sum(count(*)) OVER ()`),
+  and its `PARTITION BY`/`ORDER BY` **column** keys must be **grouping columns** (a non-grouping
+  column anywhere in a window construct is `42803`). An aggregate or general expression *as* a window
+  key (`rank() OVER (ORDER BY sum(x))`) is the deferred general-expression-key follow-on (§11). A
+  window function may **not** appear in `WHERE`, a `JOIN ON`, `GROUP BY`, `HAVING`, or another window
+  function's `PARTITION BY`/`ORDER BY`/frame bound (those run *before* the window stage) — that is
+  `42P20` (§7), the windowing analog of the aggregate's `42803` ([aggregates.md](aggregates.md) §6);
+  a window function nested in an *aggregate's* argument is `42803` (an aggregate cannot fold a window
+  result, since the window stage runs after aggregation).
 - **`DISTINCT`/`ORDER BY`/`LIMIT` see post-window rows**, so a query may `ORDER BY` or filter on
   a `row_number()` (via a wrapping subquery; a window function in the *same* query's `WHERE` is
   still `42P20` — push it down a level, exactly as PostgreSQL requires).
@@ -206,12 +221,16 @@ synthetic row  =  [ group_keys… , agg_results… , window_results… ]
   `FirstValue`/`LastValue`/`NthValue`), the resolved `partition_keys`, the resolved `order_keys`
   (with the PK tie-break appended, §3), the resolved frame (§6), and the resolved argument
   `RExpr`s.
-- **Argument resolution scope.** In a non-grouped query, a window function's arguments and keys
-  resolve against the raw scan row. In a grouped query they resolve against the grouped synthetic
-  row `[group_keys…, agg_results…]` (so the window orders by an aggregate result). A window
-  function in `WHERE`/`HAVING`/`GROUP BY`/a partition/order key, or nested in another window
-  function, is `42P20`; a bare non-grouping column used as a partition key in a grouped query
-  flows through the same `42803` grouping check.
+- **Argument resolution scope** (S8). In a non-grouped query, a window function's arguments and keys
+  resolve against the raw scan row. In a grouped query the **arguments** resolve against the grouped
+  synthetic row `[group_keys…, agg_results…]` — an aggregate nested in an argument collects into the
+  query's shared agg specs (`sum(sum(x)) OVER ()`), and a bare non-grouping column is `42803` — while
+  the `PARTITION BY`/`ORDER BY` **column** keys map to their grouping-column slot (`42803` if not a
+  grouping column). A window function in `WHERE`/`HAVING`/`GROUP BY`/another window's key, or nested
+  in another window function, is `42P20`; a window function nested in an *aggregate's* argument is
+  `42803`. Because the real window-result slot (`group_keys.len() + agg_specs.len() + w`) is not known
+  until every aggregate is collected (one may sit in a later window argument or in `HAVING`), a window
+  result is resolved to a placeholder slot and rebased to its real slot after resolution finishes.
 
 ### 5.2 The window operator
 
@@ -375,7 +394,9 @@ Deliberate divergences from PostgreSQL, each registered in
 - **`FILTER (WHERE …)`** on an aggregate window, and `WITHIN GROUP` ordered-set/hypothetical-set
   window functions (`rank() WITHIN GROUP`, `percentile_cont`) — additive later features (the
   aggregate `FILTER` follow-on, [aggregates.md](aggregates.md) §10).
-- **General-expression `PARTITION BY`/`ORDER BY`** (`PARTITION BY a + b`) — lifted with the
+- **General-expression `PARTITION BY`/`ORDER BY`** (`PARTITION BY a + b`, and — in a grouped query
+  (S8) — an aggregate *as* a window key, `ORDER BY sum(x)`) — window keys are column references only
+  (the `sort_key` grammar), so an aggregate/expression key does not parse; lifted with the
   `GROUP BY`/`ORDER BY` expression-key follow-on (§1 S0 narrowing).
 - **`RANGE` value offsets over a timestamp/timestamptz/date key** (an `interval`/integer offset, D4)
   — deferred; only integer/decimal ordering keys take a value offset this slice. A float key stays

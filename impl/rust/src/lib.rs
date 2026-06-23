@@ -305,6 +305,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "query.window_frame_exclude",
     // Named windows: WINDOW clause + OVER name (S5, window.md §5).
     "query.window_named",
+    // Window functions combined with GROUP BY / aggregates in one query (window.md §2/§5.1).
+    "query.window_grouped",
     // Set operations UNION / INTERSECT / EXCEPT (each [ALL]) — spec/design/grammar.md §25.
     "query.union",
     "query.intersect",

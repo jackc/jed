@@ -309,6 +309,10 @@ id = "query.window_named"
 description = "Named windows (window.md §5, S5): the WINDOW name AS (definition) clause + OVER name reference, equivalent to inlining the definition (multiple functions may share a named window; one clause may define several). A reference to an undefined window name is 42704. The shared partition/sort optimization is a deferred follow-on. Builds on query.window"
 
 [[capability]]
+id = "query.window_grouped"
+description = "Window functions combined with GROUP BY / aggregates in one query (window.md §2/§5.1): the window stage runs over the GROUPED rows (PostgreSQL pipeline order GROUP BY/HAVING -> WINDOW -> ORDER BY), so a window function's arguments resolve against the grouped row [group_keys..., agg_results...] (an aggregate inside a window argument is legal, e.g. sum(sum(x)) OVER ()) and its PARTITION BY / ORDER BY column keys must be grouping columns (42803 otherwise). HAVING runs before the window stage (a window function there is 42P20); a window function nested in an aggregate argument is 42803. Builds on query.window + query.aggregates"
+
+[[capability]]
 id = "query.union"
 description = "UNION / UNION ALL — combine two SELECTs' result rows; the bare form deduplicates (NULL-safe, value-canonical), ALL keeps multiplicities; output column count + names come from the left operand; per-column type unification (integer max-rank, integer<->decimal, all-NULL->text); arity mismatch 42601, type mismatch 42804; INTERSECT binds tighter; optional trailing ORDER BY/LIMIT/OFFSET resolves by output column name (spec/design/grammar.md §25)"
 
