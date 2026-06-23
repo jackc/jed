@@ -13470,6 +13470,13 @@ const (
 	// NULL → SQL NULL, including a NULL path element). `psMode` selects replace-or-create (Set) vs
 	// insert (Insert); the boolean flag is create_if_missing (Set) / insert_after (Insert).
 	reJsonSetInsert
+	// reJsonObject is `json_object` / `jsonb_object` (json-sql-functions.md §2): build an object from
+	// text array(s). `sargs` is one `text[]` of alternating keys/values, or two `text[]` (keys,
+	// values). Every VALUE becomes a JSON string (a NULL value → JSON null); a NULL key → 22004; an
+	// odd one-array / mismatched two-array length → 2202E. STRICT in the whole array argument(s) (a
+	// NULL array → SQL NULL). `jbJson` true ⇒ the json result (insertion order + dups + " : "
+	// spacing); false ⇒ the jsonb result (canonical: last-wins dedup + sorted keys).
+	reJsonObject
 	// reOuterColumn is a correlated column reference (spec/design/grammar.md §26): the column
 	// `index` of the enclosing row `level` hops out (1 = immediate parent). A leaf.
 	reOuterColumn
@@ -17694,6 +17701,11 @@ func objectKeyText(v Value, pos int) (string, error) {
 	}
 }
 
+// objectKeyNull is the 22004 raised when a json_object / jsonb_object key element is NULL.
+func objectKeyNull() error {
+	return NewError(NullValueNotAllowed, "null value not allowed for object key")
+}
+
 // resolveJSONbContains resolves a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1,
 // J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
 // has no @> operator class (42883). `<@` resolves to `reJsonContains` with the operands swapped
@@ -17946,6 +17958,46 @@ func resolveJSONSetInsert(s *scope, name string, mode pathSetMode, fc *FuncCallE
 		resolvedType{kind: rtJsonb}, nil
 }
 
+// resolveJSONObject resolves json_object / jsonb_object (json-sql-functions.md §2): one `text[]` of
+// alternating keys/values, or two `text[]` (keys, values). A bare `'{…}'` literal adapts to text[].
+// STRICT (the eval propagates a NULL whole-array argument). `jsonResult` selects the json (insertion
+// order + dups + " : " spacing) vs jsonb (canonical) result.
+func resolveJSONObject(s *scope, name string, jsonResult bool, fc *FuncCallExpr, ag *aggCtx, params *paramTypes) (*rExpr, resolvedType, error) {
+	if len(fc.Args) == 0 || len(fc.Args) > 2 {
+		return nil, resolvedType{}, noFuncOverload(name)
+	}
+	rargs := make([]*rExpr, 0, len(fc.Args))
+	for _, a := range fc.Args {
+		r, err := resolveTextArrayArg(s, *a, name, ag, params)
+		if err != nil {
+			return nil, resolvedType{}, err
+		}
+		rargs = append(rargs, r)
+	}
+	result := rtJsonb
+	if jsonResult {
+		result = rtJson
+	}
+	return &rExpr{kind: reJsonObject, jbJson: jsonResult, sargs: rargs}, resolvedType{kind: result}, nil
+}
+
+// valueToOptTextArray extracts a `text[]` value into a []*string, preserving NULL elements (a nil
+// pointer) — nil if the value is not an array. Used by json_object (a NULL value → JSON null; a NULL
+// key → 22004).
+func valueToOptTextArray(v Value) []*string {
+	if v.Kind != ValArray || v.Array == nil {
+		return nil
+	}
+	out := make([]*string, len(v.Array.Elements))
+	for i, e := range v.Array.Elements {
+		if e.Kind == ValText {
+			s := e.Str
+			out[i] = &s
+		}
+	}
+	return out
+}
+
 // binaryOpSymbol is the infix symbol of a comparison/arithmetic operator, for an
 // `operator does not exist` message (only the comparison operators reach resolveQuantified).
 func binaryOpSymbol(op BinaryOp) string {
@@ -18181,6 +18233,18 @@ func resolveFuncCall(s *scope, fc *FuncCallExpr, ag *aggCtx, params *paramTypes)
 			mode = psInsert
 		}
 		return resolveJSONSetInsert(s, name, mode, fc, ag, params)
+	}
+	// json_object / jsonb_object (json-sql-functions.md §2) build an object from one text[] of
+	// alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting
+	// literal are outside the catalog family mold), like jsonb_set.
+	if name == "json_object" || name == "jsonb_object" {
+		if err := rejectNamed(name, fc.ArgNames); err != nil {
+			return nil, resolvedType{}, err
+		}
+		if fc.Star {
+			return nil, resolvedType{}, NewError(SyntaxError, "* is only valid as the argument of COUNT")
+		}
+		return resolveJSONObject(s, name, name == "json_object", fc, ag, params)
 	}
 	// Otherwise the registry (the catalog descriptor tables) decides whether the name is an
 	// aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -23427,6 +23491,73 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 			}
 			return JsonbValue(makeObject(members)), nil
 		}
+	case reJsonObject:
+		// json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
+		m.Charge(Costs.OperatorEval)
+		// STRICT: a NULL whole-array argument → SQL NULL.
+		arrays := make([][]*string, 0, len(e.sargs))
+		for _, a := range e.sargs {
+			v, err := a.eval(row, env, m)
+			if err != nil {
+				return Value{}, err
+			}
+			if v.IsNull() {
+				return NullValue(), nil
+			}
+			arrays = append(arrays, valueToOptTextArray(v))
+		}
+		// Pair up keys/values: one array of alternating k/v (even length), or two arrays.
+		type kvPair struct{ key, val *string }
+		var pairs []kvPair
+		if len(arrays) == 1 {
+			flat := arrays[0]
+			if len(flat)%2 != 0 {
+				return Value{}, NewError(ArraySubscriptError, "array must have even number of elements")
+			}
+			pairs = make([]kvPair, 0, len(flat)/2)
+			for i := 0; i < len(flat); i += 2 {
+				pairs = append(pairs, kvPair{flat[i], flat[i+1]})
+			}
+		} else {
+			if len(arrays[0]) != len(arrays[1]) {
+				return Value{}, NewError(ArraySubscriptError, "mismatched array dimensions")
+			}
+			pairs = make([]kvPair, 0, len(arrays[0]))
+			for i := range arrays[0] {
+				pairs = append(pairs, kvPair{arrays[0][i], arrays[1][i]})
+			}
+		}
+		m.Charge(Costs.OperatorEval * int64(len(pairs)))
+		if err := m.Guard(); err != nil {
+			return Value{}, err
+		}
+		// A NULL key → 22004; a NULL value → JSON null, else a JSON string of its text.
+		if e.jbJson {
+			parts := make([]string, 0, len(pairs))
+			for _, p := range pairs {
+				if p.key == nil {
+					return Value{}, objectKeyNull()
+				}
+				val := "null"
+				if p.val != nil {
+					val = jsonCompactOut(&JsonNode{Kind: JString, S: *p.val})
+				}
+				parts = append(parts, jsonCompactOut(&JsonNode{Kind: JString, S: *p.key})+" : "+val)
+			}
+			return JsonValue("{" + strings.Join(parts, ", ") + "}"), nil
+		}
+		members := make([]JsonMember, 0, len(pairs))
+		for _, p := range pairs {
+			if p.key == nil {
+				return Value{}, objectKeyNull()
+			}
+			node := JsonNode{Kind: JNull}
+			if p.val != nil {
+				node = JsonNode{Kind: JString, S: *p.val}
+			}
+			members = append(members, JsonMember{Key: *p.key, Val: node})
+		}
+		return JsonbValue(makeObject(members)), nil
 	case reJsonSetInsert:
 		// jsonb_set / jsonb_insert (json-sql-functions.md §2): STRICT path mutation. Any NULL argument
 		// (or a NULL path element) → SQL NULL. One operator_eval; the args charge their own.

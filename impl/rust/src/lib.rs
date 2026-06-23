@@ -617,6 +617,8 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.json_builders",
     // jsonb path-mutation builders (B1) — jsonb_set / jsonb_insert (json-sql-functions.md §2).
     "func.json_set",
+    // json/jsonb object-from-text-array builders (B1) — json[b]_object (json-sql-functions.md §2).
+    "func.json_object",
     // json/jsonb aggregate builders (B4) — json[b]_agg / json[b]_agg_strict (json-sql-functions.md §4).
     "func.json_agg",
 ];

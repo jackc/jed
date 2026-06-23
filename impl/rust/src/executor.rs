@@ -10148,7 +10148,8 @@ impl Database {
             | RExpr::RangeSetOp { args, .. }
             | RExpr::Variadic { args, .. }
             | RExpr::JsonBuild { args, .. }
-            | RExpr::JsonSetInsert { args, .. } => {
+            | RExpr::JsonSetInsert { args, .. }
+            | RExpr::JsonObjectFromArrays { args, .. } => {
                 for a in args {
                     self.fold_uncorrelated_in_rexpr(a, bound, ctes, cost)?;
                 }
@@ -11593,6 +11594,15 @@ enum RExpr {
     /// create_if_missing (Set) / insert_after (Insert), defaulting to true / false respectively.
     JsonSetInsert {
         mode: json::PathSetMode,
+        args: Vec<RExpr>,
+    },
+    /// `json_object` / `jsonb_object` (json-sql-functions.md §2): build an object from text array(s).
+    /// `args` is one `text[]` of alternating keys/values, or two `text[]` (keys, values). The VALUES
+    /// are always JSON strings (a NULL value → JSON null); a NULL key → 22004. STRICT in the whole
+    /// array argument(s). `json` selects the json (insertion order + dups + " : " spacing) vs jsonb
+    /// (canonical) result.
+    JsonObjectFromArrays {
+        json: bool,
         args: Vec<RExpr>,
     },
     IsNull {
@@ -13246,7 +13256,8 @@ fn rexpr_is_constant(e: &RExpr) -> bool {
         | RExpr::RangeSetOp { args, .. }
         | RExpr::Variadic { args, .. }
         | RExpr::JsonBuild { args, .. }
-        | RExpr::JsonSetInsert { args, .. } => args.iter().all(rexpr_is_constant),
+        | RExpr::JsonSetInsert { args, .. }
+        | RExpr::JsonObjectFromArrays { args, .. } => args.iter().all(rexpr_is_constant),
         RExpr::InValues { lhs, .. } => rexpr_is_constant(lhs),
         RExpr::Quantified { lhs, array, .. } => rexpr_is_constant(lhs) && rexpr_is_constant(array),
     }
@@ -15202,7 +15213,8 @@ fn rexpr_references_outer(e: &RExpr, depth: usize) -> bool {
         | RExpr::RangeSetOp { args, .. }
         | RExpr::Variadic { args, .. }
         | RExpr::JsonBuild { args, .. }
-        | RExpr::JsonSetInsert { args, .. } => {
+        | RExpr::JsonSetInsert { args, .. }
+        | RExpr::JsonObjectFromArrays { args, .. } => {
             args.iter().any(|a| rexpr_references_outer(a, depth))
         }
         RExpr::Row(fields) | RExpr::Array { elems: fields, .. } => {
@@ -15342,7 +15354,8 @@ fn collect_touched(e: &RExpr, depth: usize, touched: &mut [bool]) {
         | RExpr::RangeSetOp { args, .. }
         | RExpr::Variadic { args, .. }
         | RExpr::JsonBuild { args, .. }
-        | RExpr::JsonSetInsert { args, .. } => {
+        | RExpr::JsonSetInsert { args, .. }
+        | RExpr::JsonObjectFromArrays { args, .. } => {
             for a in args {
                 collect_touched(a, depth, touched);
             }
@@ -17263,6 +17276,19 @@ fn resolve_func_call(
             json::PathSetMode::Insert
         };
         return resolve_jsonb_set_insert(scope, &lname, mode, args, agg, params);
+    }
+    // `json_object` / `jsonb_object` (json-sql-functions.md §2) build an object from one text[] of
+    // alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting
+    // literal are outside the catalog family mold), like jsonb_set.
+    if lname == "json_object" || lname == "jsonb_object" {
+        reject_named(&lname, arg_names)?;
+        if star {
+            return Err(EngineError::new(
+                SqlState::SyntaxError,
+                "* is only valid as the argument of COUNT",
+            ));
+        }
+        return resolve_json_object(scope, &lname, lname == "json_object", args, agg, params);
     }
     // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
     // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -20663,6 +20689,14 @@ fn object_key_text(v: &Value, pos: usize) -> Result<String> {
     })
 }
 
+/// The `22004` raised when a `json_object` / `jsonb_object` key element is NULL.
+fn object_key_null() -> EngineError {
+    EngineError::new(
+        SqlState::NullValueNotAllowed,
+        "null value not allowed for object key",
+    )
+}
+
 /// The display symbol for a jsonb accessor operator, for error messages.
 fn json_op_symbol(op: BinaryOp) -> &'static str {
     match op {
@@ -21027,6 +21061,49 @@ fn resolve_jsonb_set_insert(
         },
         ResolvedType::Jsonb,
     ))
+}
+
+/// Resolve `json_object` / `jsonb_object` (json-sql-functions.md §2): one `text[]` of alternating
+/// keys/values, or two `text[]` (keys, values). A bare `'{…}'` literal adapts to text[]. STRICT (the
+/// eval propagates a NULL whole-array argument).
+fn resolve_json_object(
+    scope: &Scope,
+    name: &str,
+    json: bool,
+    args: &[Expr],
+    agg: &mut AggCtx,
+    params: &mut ParamTypes,
+) -> Result<(RExpr, ResolvedType)> {
+    if args.is_empty() || args.len() > 2 {
+        return Err(no_func_overload(name));
+    }
+    let mut rargs = Vec::with_capacity(args.len());
+    for a in args {
+        rargs.push(resolve_text_array_arg(scope, a, name, agg, params)?);
+    }
+    let result = if json {
+        ResolvedType::Json
+    } else {
+        ResolvedType::Jsonb
+    };
+    Ok((RExpr::JsonObjectFromArrays { json, args: rargs }, result))
+}
+
+/// Extract a `text[]` value into `Vec<Option<String>>`, preserving NULL elements — `None` if the
+/// value is not an array. Used by `json_object` (a NULL value → JSON null; a NULL key → 22004).
+fn value_to_opt_text_array(v: &Value) -> Option<Vec<Option<String>>> {
+    match v {
+        Value::Array(arr) => Some(
+            arr.elements
+                .iter()
+                .map(|e| match e {
+                    Value::Text(s) => Some(s.clone()),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// Extract a `text[]` value into a path of strings — `None` if it is not an array or has a NULL
@@ -24876,6 +24953,76 @@ impl RExpr {
                     }
                 };
                 Ok(Value::Jsonb(out))
+            }
+            // json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
+            RExpr::JsonObjectFromArrays { json, args } => {
+                m.charge(COSTS.operator_eval);
+                // STRICT: a NULL whole-array argument → SQL NULL.
+                let mut arrays = Vec::with_capacity(args.len());
+                for a in args {
+                    let v = a.eval(row, env, m)?;
+                    if matches!(v, Value::Null) {
+                        return Ok(Value::Null);
+                    }
+                    arrays.push(
+                        value_to_opt_text_array(&v).expect("resolver guarantees a text[] arg"),
+                    );
+                }
+                // Pair up keys/values: one array of alternating k/v (even length), or two arrays.
+                let pairs: Vec<(Option<String>, Option<String>)> = if arrays.len() == 1 {
+                    let flat = &arrays[0];
+                    if flat.len() % 2 != 0 {
+                        return Err(EngineError::new(
+                            SqlState::ArraySubscriptError,
+                            "array must have even number of elements",
+                        ));
+                    }
+                    flat.chunks_exact(2)
+                        .map(|c| (c[0].clone(), c[1].clone()))
+                        .collect()
+                } else {
+                    if arrays[0].len() != arrays[1].len() {
+                        return Err(EngineError::new(
+                            SqlState::ArraySubscriptError,
+                            "mismatched array dimensions",
+                        ));
+                    }
+                    arrays[0]
+                        .iter()
+                        .cloned()
+                        .zip(arrays[1].iter().cloned())
+                        .collect()
+                };
+                m.charge(COSTS.operator_eval * pairs.len() as i64);
+                m.guard()?;
+                // A NULL key → 22004; a NULL value → JSON null, else a JSON string of its text.
+                if *json {
+                    let mut parts = Vec::with_capacity(pairs.len());
+                    for (k, v) in &pairs {
+                        let key = k.as_ref().ok_or_else(object_key_null)?;
+                        let val = match v {
+                            Some(s) => json::json_compact_out(&JsonNode::String(s.clone())),
+                            None => "null".to_string(),
+                        };
+                        parts.push(format!(
+                            "{} : {}",
+                            json::json_compact_out(&JsonNode::String(key.clone())),
+                            val
+                        ));
+                    }
+                    Ok(Value::Json(format!("{{{}}}", parts.join(", "))))
+                } else {
+                    let mut members = Vec::with_capacity(pairs.len());
+                    for (k, v) in pairs {
+                        let key = k.ok_or_else(object_key_null)?;
+                        let node = match v {
+                            Some(s) => JsonNode::String(s),
+                            None => JsonNode::Null,
+                        };
+                        members.push((key, node));
+                    }
+                    Ok(Value::Jsonb(json::make_object(members)))
+                }
             }
             RExpr::And(l, r) => {
                 m.charge(COSTS.operator_eval);

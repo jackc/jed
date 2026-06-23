@@ -371,6 +371,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           exact, text/bool, json/jsonb canonicalize, 1-D array recursive incl. NULL→json null); STRICT;
           `value_to_node` kernel (reused by B4). Float / composite / datetime / uuid / bytea / interval /
           multidim-array sources deferred `0A000`. All 3 cores, cap `func.to_jsonb`, oracle-clean.
+    - [x] **B1 builders — object-from-array subset** — ✅ `json_object(text[])` / `json_object(text[],
+          text[])` and the `jsonb_object` variants: build an object from one array of alternating
+          keys/values or two equal-length key/value arrays. Every value → a JSON string (a NULL value →
+          JSON null); a NULL key → `22004`; odd / mismatched length → `2202E`. jsonb canonicalizes; json
+          keeps order + dups + `" : "` spacing. STRICT; bare `'{…}'` adapts to text[]; hand-resolved
+          (`RExpr::JsonObjectFromArrays`). All 3 cores, cap `func.json_object`, oracle-clean.
     - [x] **B1 builders — path-mutation subset** — ✅ `jsonb_set(target, path text[], new_value [,
           create_if_missing])` / `jsonb_insert(target, path, new_value [, insert_after])`. Path walk over
           object keys / array indices (negative-from-end); non-final missing key/index + empty path →

@@ -1,0 +1,60 @@
+# json_object / jsonb_object — build an object from text array(s) (B1 builders,
+# spec/design/json-sql-functions.md §2). One array of alternating keys/values, or two equal-length
+# arrays (keys, values). Every VALUE is a JSON string (a NULL value → JSON null); a NULL key → 22004;
+# an odd / mismatched length → 2202E. jsonb canonicalizes; json keeps order + dups + " : " spacing.
+# Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, types.jsonb, types.json, func.json_object
+
+# One-array (alternating k,v) and two-array (keys, values) forms — every value is a JSON string.
+query TT nosort
+SELECT json_object('{a, 1, b, 2}'), json_object('{a, b}', '{1, 2}')
+----
+{"a" : "1", "b" : "2"}
+{"a" : "1", "b" : "2"}
+
+# jsonb canonicalizes (last-wins dedup, canonical key order, spaced).
+query TT nosort
+SELECT jsonb_object('{a, 1, b, 2}'), jsonb_object('{b, 1, a, 2, a, 3}')
+----
+{"a": "1", "b": "2"}
+{"a": "3", "b": "1"}
+
+# An empty array → an empty object; a NULL value element → JSON null.
+query TT nosort
+SELECT json_object('{}'), json_object('{a, NULL}')
+----
+{}
+{"a" : null}
+
+# STRICT: a NULL array argument → SQL NULL.
+query T nosort
+SELECT jsonb_object(NULL::text[])
+----
+NULL
+
+# An odd one-array length → 2202E.
+statement error 2202E
+SELECT json_object('{a, 1, b}')
+
+# A two-array length mismatch → 2202E.
+statement error 2202E
+SELECT json_object('{a, b}', '{1}')
+
+# A NULL key → 22004.
+statement error 22004
+SELECT json_object('{NULL, 1}')
+
+# Over stored text[] columns: build an object per row.
+statement ok
+CREATE TABLE t (id i32 PRIMARY KEY, ks text[], vs text[])
+
+statement ok
+INSERT INTO t VALUES (1, '{x, y}', '{10, 20}'), (2, '{z}', '{30}')
+
+query IT nosort
+SELECT id, jsonb_object(ks, vs) FROM t ORDER BY id
+----
+1
+{"x": "10", "y": "20"}
+2
+{"z": "30"}

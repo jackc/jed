@@ -107,6 +107,9 @@ export const SUPPORTED_CAPABILITIES: readonly string[] = [
   // jsonb_set / jsonb_insert (json-sql-functions.md §2) — the jsonb path-mutation builders, resolved
   // by name (not in the catalog): a text[] path of object keys / array indices, STRICT.
   "func.json_set",
+  // json_object / jsonb_object (json-sql-functions.md §2) — object builders from text array(s),
+  // resolved by name (not in the catalog): one text[] of alternating keys/values, or two text[].
+  "func.json_object",
   // json[b]_agg / json[b]_agg_strict (B4) — the JSON-array aggregate builders (json-sql-functions.md
   // §4). Aggregate a group's values into one JSON array via the to_jsonb element kernel.
   "func.json_agg",

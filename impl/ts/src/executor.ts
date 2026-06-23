@@ -8485,6 +8485,7 @@ export class Database {
       case "variadic":
       case "jsonBuild":
       case "jsonSetInsert":
+      case "jsonObjectFromArrays":
         e.args = e.args.map((a) => this.foldUncorrelatedInRExpr(a, bound, ctes, cost));
         return e;
       case "row":
@@ -8889,6 +8890,7 @@ function rexprIsConstant(e: RExpr): boolean {
     case "variadic":
     case "jsonBuild":
     case "jsonSetInsert":
+    case "jsonObjectFromArrays":
       return e.args.every(rexprIsConstant);
     case "inValues":
       return rexprIsConstant(e.lhs);
@@ -9871,6 +9873,7 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
     case "variadic":
     case "jsonBuild":
     case "jsonSetInsert":
+    case "jsonObjectFromArrays":
       return e.args.some((a) => rexprReferencesOuter(a, depth));
     case "row":
       return e.fields.some((f) => rexprReferencesOuter(f, depth));
@@ -9993,6 +9996,7 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "variadic":
     case "jsonBuild":
     case "jsonSetInsert":
+    case "jsonObjectFromArrays":
       for (const a of e.args) collectTouched(a, depth, touched);
       return;
     case "row":
@@ -10688,6 +10692,16 @@ type RExpr =
   | {
       kind: "jsonSetInsert";
       mode: PathSetMode;
+      args: RExpr[];
+    }
+  // `json_object` / `jsonb_object` (json-sql-functions.md §2): build an object from text array(s).
+  // `args` is one `text[]` of alternating keys/values, or two `text[]` (keys, values). The VALUES are
+  // always JSON strings (a NULL value → JSON null); a NULL key → 22004. STRICT in the whole array
+  // argument(s). `json` selects the json (insertion order + dups + " : " spacing) vs jsonb (canonical)
+  // result.
+  | {
+      kind: "jsonObjectFromArrays";
+      json: boolean;
       args: RExpr[];
     }
   // A correlated column reference (spec/design/grammar.md §26): column `index` of the enclosing
@@ -13005,6 +13019,14 @@ function resolveFuncCall(
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     const mode: PathSetMode = lname === "jsonb_set" ? "set" : "insert";
     return resolveJsonbSetInsert(scope, lname, mode, e.args, ag, params);
+  }
+  // `json_object` / `jsonb_object` (json-sql-functions.md §2) build an object from one text[] of
+  // alternating keys/values, or two text[] (keys, values). Hand-resolved (the text[] arg + adapting
+  // literal are outside the catalog family mold), like jsonb_set.
+  if (lname === "json_object" || lname === "jsonb_object") {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    return resolveJsonObject(scope, lname, lname === "json_object", e.args, ag, params);
   }
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
   // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -17280,6 +17302,19 @@ function objectKeyText(v: Value, pos: number): string {
   }
 }
 
+// objectKeyNull is the `22004` raised when a `json_object` / `jsonb_object` key element is NULL.
+function objectKeyNull(): EngineError {
+  return engineError("null_value_not_allowed", "null value not allowed for object key");
+}
+
+// valueToOptTextArray extracts a `text[]` value into a list of (string | null), preserving NULL
+// elements (null for a NULL element). Used by `json_object` (a NULL value → JSON null; a NULL key →
+// 22004). The resolver guarantees a `text[]` argument, so non-text elements cannot occur.
+function valueToOptTextArray(v: Value): (string | null)[] {
+  if (v.kind !== "array") throw new Error("resolver guarantees a text[] arg");
+  return v.elements.map((e) => (e.kind === "text" ? e.text : null));
+}
+
 // resolveJsonbContains resolves a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1,
 // J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
 // has no @> operator class (42883). `<@` resolves to a "jsonContains" node with the operands swapped
@@ -17489,6 +17524,26 @@ function resolveJsonbSetInsert(
   return {
     node: { kind: "jsonSetInsert", mode, args: [target.node, path, value.node, flag] },
     type: { kind: "jsonb" },
+  };
+}
+
+// resolveJsonObject resolves `json_object` / `jsonb_object` (json-sql-functions.md §2): one `text[]`
+// of alternating keys/values, or two `text[]` (keys, values). A bare `'{…}'` literal adapts to text[].
+// STRICT (the eval propagates a NULL whole-array argument). Wrong arity (not 1 or 2 args) → 42883.
+function resolveJsonObject(
+  scope: Scope,
+  name: string,
+  json: boolean,
+  args: Expr[],
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (args.length === 0 || args.length > 2) throw noFuncOverload(name);
+  const rargs: RExpr[] = [];
+  for (const a of args) rargs.push(resolveTextArrayArg(scope, a, name, ag, params));
+  return {
+    node: { kind: "jsonObjectFromArrays", json, args: rargs },
+    type: { kind: json ? "json" : "jsonb" },
   };
 }
 
@@ -20973,6 +21028,52 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           ? jsonSetPathKernel(node, path, valueNode, flag)
           : jsonInsertPathKernel(node, path, valueNode, flag);
       return jsonbValue(out);
+    }
+    case "jsonObjectFromArrays": {
+      // json_object / jsonb_object (json-sql-functions.md §2): build an object from text array(s).
+      m.charge(COSTS.operatorEval);
+      // STRICT: a NULL whole-array argument → SQL NULL.
+      const arrays: (string | null)[][] = [];
+      for (const a of e.args) {
+        const v = evalExpr(a, row, env, m);
+        if (v.kind === "null") return nullValue();
+        arrays.push(valueToOptTextArray(v));
+      }
+      // Pair up keys/values: one array of alternating k/v (even length), or two equal-length arrays.
+      const pairs: [string | null, string | null][] = [];
+      if (arrays.length === 1) {
+        const flat = arrays[0]!;
+        if (flat.length % 2 !== 0) {
+          throw engineError("array_subscript_error", "array must have even number of elements");
+        }
+        for (let i = 0; i < flat.length; i += 2) pairs.push([flat[i]!, flat[i + 1]!]);
+      } else {
+        if (arrays[0]!.length !== arrays[1]!.length) {
+          throw engineError("array_subscript_error", "mismatched array dimensions");
+        }
+        for (let i = 0; i < arrays[0]!.length; i++) pairs.push([arrays[0]![i]!, arrays[1]![i]!]);
+      }
+      m.charge(COSTS.operatorEval * BigInt(pairs.length));
+      m.guard();
+      // A NULL key → 22004; a NULL value → JSON null, else a JSON string of its text.
+      if (e.json) {
+        const parts: string[] = [];
+        for (const [k, v] of pairs) {
+          if (k === null) throw objectKeyNull();
+          const val = v === null ? "null" : jsonCompactOut({ kind: "string", value: v });
+          parts.push(`${jsonCompactOut({ kind: "string", value: k })} : ${val}`);
+        }
+        return jsonValue(`{${parts.join(", ")}}`);
+      }
+      const members: JsonMember[] = [];
+      for (const [k, v] of pairs) {
+        if (k === null) throw objectKeyNull();
+        members.push({
+          key: k,
+          value: v === null ? { kind: "null" } : { kind: "string", value: v },
+        });
+      }
+      return jsonbValue(jsonMakeObject(members));
     }
     case "subquery": {
       // A correlated subquery (spec/design/grammar.md §26): re-executed once per outer row. Push
