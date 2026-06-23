@@ -234,6 +234,19 @@ func TestJSONArrayElementsSrfIsDeferred(t *testing.T) {
 	}
 }
 
+// TestJSONEachSrfIsDeferred: the `json` two-column variants `json_each` / `json_each_text` are a
+// deferred 0A000 follow-on (verbatim sub-text — json.md §4); the jsonb variants jsonb_each /
+// jsonb_each_text are oracle-clean in suites/json/json_each.test. Mirrors impl/rust/tests/json.rs.
+func TestJSONEachSrfIsDeferred(t *testing.T) {
+	db := NewDatabase()
+	if got := errJSON(t, db, `SELECT * FROM json_each('{"a":1}'::json)`); got != "0A000" {
+		t.Errorf("json_each: got %s, want 0A000", got)
+	}
+	if got := errJSON(t, db, `SELECT * FROM json_each_text('{"a":1}'::json)`); got != "0A000" {
+		t.Errorf("json_each_text: got %s, want 0A000", got)
+	}
+}
+
 // TestToJsonbUnsupportedSourcesAreDeferred: `to_jsonb` over the type-info-dependent / float-divergent
 // sources (float, composite, datetime, uuid, bytea, interval, multidim array) is a deferred 0A000
 // follow-on; the supported set (scalars/jsonb/json/1-D arrays) is oracle-clean in

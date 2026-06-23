@@ -3743,3 +3743,35 @@ result         = "text"
 column         = "json_object_keys"
 null           = "empty_on_null"
 errors         = ["22023"]
+
+# json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → one row per top-level
+# object member as (key text, value jsonb) in canonical key order; jsonb_each_text → (key text, value
+# text) where the value is the ->>-style render (a string member's raw content, a JSON null → SQL NULL,
+# else canonical). A non-object → 22023; a NULL argument → zero rows. These produce TWO columns; the
+# single-column catalog descriptor records the VALUE column (the leading `key text` column is added by
+# the hand-written multi-column synthetic table in the resolver, where every SRF relation is built — a
+# faithful multi-column catalog schema is a follow-on). The json_each[_text] verbatim variants are a
+# deferred 0A000 follow-on (json.md §4), like json_array_elements.
+[[set_returning]]
+name           = "jsonb_each"
+kind           = "set_returning"
+surface        = "jsonb_each"
+arity          = 1
+arg_families   = ["jsonb"]
+arg_resolution = "none"
+result         = "jsonb"
+column         = "value"
+null           = "empty_on_null"
+errors         = ["22023"]
+
+[[set_returning]]
+name           = "jsonb_each_text"
+kind           = "set_returning"
+surface        = "jsonb_each_text"
+arity          = 1
+arg_families   = ["jsonb"]
+arg_resolution = "none"
+result         = "text"
+column         = "value"
+null           = "empty_on_null"
+errors         = ["22023"]

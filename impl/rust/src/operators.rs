@@ -4005,6 +4005,28 @@ pub const SET_RETURNING: &[SetReturningDesc] = &[
         null: "empty_on_null",
         errors: &["22023"],
     },
+    SetReturningDesc {
+        name: "jsonb_each",
+        surface: "jsonb_each",
+        arity: 1,
+        arg_families: &["jsonb"],
+        arg_resolution: "none",
+        result: "jsonb",
+        column: "value",
+        null: "empty_on_null",
+        errors: &["22023"],
+    },
+    SetReturningDesc {
+        name: "jsonb_each_text",
+        surface: "jsonb_each_text",
+        arity: 1,
+        arg_families: &["jsonb"],
+        arg_resolution: "none",
+        result: "text",
+        column: "value",
+        null: "empty_on_null",
+        errors: &["22023"],
+    },
 ];
 
 /// One window function's metadata, mirroring a `[[window]]` entry in catalog.toml. A window

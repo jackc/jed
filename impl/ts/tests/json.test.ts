@@ -106,6 +106,23 @@ test("json_array_elements SRF is deferred", () => {
   );
 });
 
+// The `json` two-column SRFs `json_each` / `json_each_text` are a deferred 0A000 follow-on (they
+// would have to preserve the verbatim member sub-text — json.md §4); the jsonb variants are
+// oracle-clean in suites/json/json_each.test. PostgreSQL supports the json variants, so this is a
+// documented divergence (the json_array_elements precedent). Mirrors impl/rust/tests/json.rs
+// json_each_srf_is_deferred and impl/go/json_test.go TestJSONEachSrfIsDeferred.
+test("json_each SRF is deferred", () => {
+  const db = dbWith([]);
+  assert.equal(
+    errCode(() => execute(db, `SELECT * FROM json_each('{"a":1}'::json)`)),
+    "0A000",
+  );
+  assert.equal(
+    errCode(() => execute(db, `SELECT * FROM json_each_text('{"a":1}'::json)`)),
+    "0A000",
+  );
+});
+
 // `to_jsonb` over the type-info-dependent / float-divergent sources (float, composite, datetime,
 // uuid, bytea, interval, multidim array) is a deferred 0A000 follow-on; the supported set
 // (scalars/jsonb/json/1-D arrays) is oracle-clean in suites/json/json_to_jsonb.test. Mirrors

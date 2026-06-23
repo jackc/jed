@@ -349,8 +349,12 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         `#-` a new token. A bare `'{a,c}'` is a single text KEY for `-` (verbatim, like PG) but a
         text[] PATH for `#-`. New `RExpr::JsonConcat`/`JsonDelete`. Cap `func.jsonb_mutate`.
         → json-sql-functions.md §1
-  - [ ] **C0** — shared FROM-clause **column-definition-list** facility + multi-column synthetic
-        table (the keystone for record functions, `json[b]_each`, and `JSON_TABLE`). → json-table.md §1
+  - [~] **C0** — shared FROM-clause facility for record-shaped SRFs (json-table.md §1). The
+        **multi-column synthetic table** half has ✅ landed (with B3 below — `srf_table_cols`, an
+        N-named/typed-column synthetic relation; the FROM alias renames the relation, the columns keep
+        their fixed names). The **column-definition-list** half (`AS t(col type, …)` grammar +
+        resolution) is the remaining piece, landing with the R-series record functions. Cap
+        `func.coldeflist` (pending).
   - [ ] **P1** — the first-class `jsonpath` type + compiler + lax/strict eval engine +
         `like_regex`→Pike-VM (`i`/`q` flags; `s`/`m`/`x`→`0A000`) + the `2203x` error class. → jsonpath.md
   - [ ] **P2 / P3** — path query fns (`jsonb_path_exists`/`_match`/`_query`(SRF)/`_query_array`/`_query_first`)
@@ -381,6 +385,11 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
           SRFs, implicitly lateral; non-array/non-object `22023`; NULL → 0 rows. All 3 cores, cap
           `func.json_srf`, oracle-clean. _follow-on:_ `json_array_elements[_text]` (verbatim sub-text,
           deferred `0A000` like the json accessors). B3 (two-col SRFs `json[b]_each`) needs C0.
+    - [x] **B3 (two-column SRFs)** — ✅ `jsonb_each` → setof (key text, value jsonb) in canonical key
+          order / `jsonb_each_text` → (key text, value text, the `->>`-style render). Non-object `22023`;
+          NULL → 0 rows; FROM-clause only, implicitly lateral (CROSS JOIN over a stored column). The
+          first consumer of the C0 multi-column synthetic table (`srf_table_cols`). The json_each[_text]
+          verbatim variants are a deferred `0A000`. All 3 cores, cap `func.json_each`, oracle-clean.
     - [x] **B4 (array-aggregate subset)** — ✅ `jsonb_agg` / `json_agg` / `jsonb_agg_strict` /
           `json_agg_strict`: aggregate a group into a JSON array (scan/GROUP-BY order); both render the
           spaced canonical form (json variant typed `json`); `_strict` skips NULL inputs (kept as JSON

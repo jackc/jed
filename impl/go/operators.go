@@ -4004,6 +4004,28 @@ var SetReturning = []SetReturningDesc{
 		Null:          "empty_on_null",
 		Errors:        []string{"22023"},
 	},
+	{
+		Name:          "jsonb_each",
+		Surface:       "jsonb_each",
+		Arity:         1,
+		ArgFamilies:   []string{"jsonb"},
+		ArgResolution: "none",
+		Result:        "jsonb",
+		Column:        "value",
+		Null:          "empty_on_null",
+		Errors:        []string{"22023"},
+	},
+	{
+		Name:          "jsonb_each_text",
+		Surface:       "jsonb_each_text",
+		Arity:         1,
+		ArgFamilies:   []string{"jsonb"},
+		ArgResolution: "none",
+		Result:        "text",
+		Column:        "value",
+		Null:          "empty_on_null",
+		Errors:        []string{"22023"},
+	},
 }
 
 // WindowDesc is one window function's metadata, mirroring a [[window]] entry in catalog.toml.

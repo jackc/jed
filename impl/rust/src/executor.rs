@@ -8662,10 +8662,44 @@ impl Database {
         if name.eq_ignore_ascii_case("unnest") {
             return self.resolve_unnest(args, alias, &arg_scope, ptypes);
         }
+        // json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
+        // jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
+        // json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
+        let lname = name.to_ascii_lowercase();
+        match lname.as_str() {
+            "jsonb_each" => {
+                return self.resolve_json_each(
+                    &lname,
+                    SrfKind::JsonbEach,
+                    Type::Scalar(ScalarType::Jsonb),
+                    args,
+                    alias,
+                    &arg_scope,
+                    ptypes,
+                );
+            }
+            "jsonb_each_text" => {
+                return self.resolve_json_each(
+                    &lname,
+                    SrfKind::JsonbEachText,
+                    Type::Scalar(ScalarType::Text),
+                    args,
+                    alias,
+                    &arg_scope,
+                    ptypes,
+                );
+            }
+            "json_each" | "json_each_text" => {
+                return Err(EngineError::new(
+                    SqlState::FeatureNotSupported,
+                    format!("{lname} is not supported yet; use the jsonb variant"),
+                ));
+            }
+            _ => {}
+        }
         // json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
         // variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on,
         // like the json accessor operators; the jsonb variants + `json_object_keys` ship here.
-        let lname = name.to_ascii_lowercase();
         if let Some((kind, col_ty, jsonb)) = match lname.as_str() {
             "jsonb_array_elements" => Some((
                 SrfKind::JsonbArrayElements,
@@ -8744,6 +8778,42 @@ impl Database {
             return Err(no_func_overload(name));
         }
         let table = srf_table(name, alias, col_ty);
+        Ok((table, vec![rarg], kind))
+    }
+
+    /// Resolve a json/jsonb TWO-column SRF (B3 — `jsonb_each` / `jsonb_each_text`,
+    /// json-sql-functions.md §3): the one argument is a jsonb value (a bare string literal adapts).
+    /// The synthetic relation has the fixed columns `key text` and `value <value_ty>` (the C0
+    /// multi-column synthetic table). A non-object argument → `22023` at exec; a NULL → zero rows.
+    #[allow(clippy::too_many_arguments)]
+    fn resolve_json_each(
+        &self,
+        name: &str,
+        kind: SrfKind,
+        value_ty: Type,
+        args: &[Expr],
+        alias: Option<&str>,
+        arg_scope: &Scope,
+        ptypes: &mut ParamTypes,
+    ) -> Result<(Box<Table>, Vec<RExpr>, SrfKind)> {
+        if args.len() != 1 {
+            return Err(no_func_overload(name));
+        }
+        let (rarg, t) = resolve(
+            arg_scope,
+            &args[0],
+            Some(ScalarType::Jsonb),
+            &mut AggCtx::Forbidden,
+            ptypes,
+        )?;
+        if !matches!(t, ResolvedType::Jsonb | ResolvedType::Null) {
+            return Err(no_func_overload(name));
+        }
+        let table = srf_table_cols(
+            name,
+            alias,
+            vec![("key", Type::Scalar(ScalarType::Text)), ("value", value_ty)],
+        );
         Ok((table, vec![rarg], kind))
     }
 
@@ -8927,6 +8997,29 @@ impl Database {
                     meter.guard()?;
                     meter.charge(COSTS.generated_row);
                     out.push(vec![Value::Text(k.clone())]);
+                }
+            }
+            SrfKind::JsonbEach | SrfKind::JsonbEachText => {
+                let members = match &node {
+                    JsonNode::Object(m) => m,
+                    _ => {
+                        return Err(EngineError::new(
+                            SqlState::InvalidParameterValue,
+                            format!("cannot call {} on a non-object", srf_kind_name(srf.kind)),
+                        ));
+                    }
+                };
+                for (k, v) in members {
+                    meter.guard()?;
+                    meter.charge(COSTS.generated_row);
+                    // (key text, value): jsonb_each keeps the value node; _text renders ->>-style
+                    // (a string member's raw content, a JSON null → SQL NULL, else canonical).
+                    let value = if matches!(srf.kind, SrfKind::JsonbEachText) {
+                        json::node_to_text(v).map_or(Value::Null, Value::Text)
+                    } else {
+                        Value::Jsonb(v.clone())
+                    };
+                    out.push(vec![Value::Text(k.clone()), value]);
                 }
             }
             _ => unreachable!("json_srf_rows only handles the json SRF kinds"),
@@ -9253,7 +9346,9 @@ impl Database {
                 SrfKind::JsonbArrayElements
                 | SrfKind::JsonbArrayElementsText
                 | SrfKind::JsonbObjectKeys
-                | SrfKind::JsonObjectKeys => self.json_srf_rows(srf, &env, meter),
+                | SrfKind::JsonObjectKeys
+                | SrfKind::JsonbEach
+                | SrfKind::JsonbEachText => self.json_srf_rows(srf, &env, meter),
             };
         }
         // A CTE reference delivers its rows from the per-statement context (cte.md §3/§5): a
@@ -12475,6 +12570,11 @@ enum SrfKind {
     JsonbObjectKeys,
     /// `json_object_keys(json)` — one `text` row per object key, in INPUT order (duplicates kept).
     JsonObjectKeys,
+    /// `jsonb_each(jsonb)` — one `(key text, value jsonb)` row per top-level object member, canonical
+    /// key order (json-sql-functions.md §3). A two-column SRF (the C0 multi-column synthetic table).
+    JsonbEach,
+    /// `jsonb_each_text(jsonb)` — one `(key text, value text)` row per member (the `->>`-style value).
+    JsonbEachText,
 }
 
 /// A resolved set-returning-function row source (spec/design/functions.md §10, array-functions.md
@@ -12538,6 +12638,43 @@ fn srf_table(func_name: &str, alias: Option<&str>, col_ty: Type) -> Box<Table> {
             identity: None,
             collation: None,
         }],
+        pk: Vec::new(),
+        checks: Vec::new(),
+        indexes: Vec::new(),
+        foreign_keys: Vec::new(),
+    })
+}
+
+/// The catalog name of a json two-column SRF, for its non-object error message.
+fn srf_kind_name(kind: SrfKind) -> &'static str {
+    match kind {
+        SrfKind::JsonbEach => "jsonb_each",
+        SrfKind::JsonbEachText => "jsonb_each_text",
+        _ => unreachable!("srf_kind_name is only for the json two-column SRFs"),
+    }
+}
+
+/// A MULTI-COLUMN synthetic table for a set-returning function (C0, json-table.md §1) — the
+/// generalization of [`srf_table`] to N named/typed columns. The column NAMES are fixed by the
+/// function (e.g. `jsonb_each` → `key`, `value`); the FROM alias renames the relation, not its
+/// columns. Used by `json[b]_each[_text]` (and, with a col-def list, the record functions).
+fn srf_table_cols(func_name: &str, alias: Option<&str>, cols: Vec<(&str, Type)>) -> Box<Table> {
+    Box::new(Table {
+        name: alias.unwrap_or(func_name).to_string(),
+        columns: cols
+            .into_iter()
+            .map(|(name, ty)| Column {
+                name: name.to_string(),
+                ty,
+                decimal: None,
+                primary_key: false,
+                not_null: false,
+                default: None,
+                default_expr: None,
+                identity: None,
+                collation: None,
+            })
+            .collect(),
         pk: Vec::new(),
         checks: Vec::new(),
         indexes: Vec::new(),

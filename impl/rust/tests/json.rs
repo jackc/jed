@@ -213,6 +213,23 @@ fn large_json_spills_verbatim() {
     assert_eq!(rows[0][0], verbatim); // verbatim bytes, whitespace preserved
 }
 
+/// The `json` two-column SRFs `json_each` / `json_each_text` are a deferred `0A000` follow-on (they
+/// would have to preserve the verbatim member sub-text — json.md §4); the jsonb variants are
+/// oracle-clean in suites/json/json_each.test. PostgreSQL supports the json variants, so this is a
+/// documented divergence (the json_array_elements precedent).
+#[test]
+fn json_each_srf_is_deferred() {
+    let mut db = Database::new();
+    assert_eq!(
+        err(&mut db, "SELECT * FROM json_each('{\"a\":1}'::json)"),
+        "0A000"
+    );
+    assert_eq!(
+        err(&mut db, "SELECT * FROM json_each_text('{\"a\":1}'::json)"),
+        "0A000"
+    );
+}
+
 /// The json/jsonb construction builders (to_json / json[b]_build_array / _object) reuse the
 /// `to_jsonb` element kernel, so a deferred-source element (float, like to_jsonb) is `0A000`. PG
 /// supports these sources, so this is a documented divergence; the supported set is oracle-clean in

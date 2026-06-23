@@ -1,0 +1,88 @@
+# jsonb_each / jsonb_each_text — the two-column json SRFs (B3, spec/design/json-sql-functions.md §3)
+# over the C0 multi-column synthetic table. jsonb_each → one (key text, value jsonb) row per top-level
+# object member in canonical key order; jsonb_each_text → (key text, value text) where the value is
+# the ->>-style render. A non-object → 22023; a NULL → zero rows. FROM-clause only, implicitly lateral.
+# Output matches the postgres:18 oracle. Format: ../../../design/conformance.md.
+# requires: ddl.create_table, ddl.primary_key, dml.insert, query.select, query.order_by, query.aggregates, query.cross_join, types.jsonb, func.json_each
+
+# jsonb_each expands an object into (key, value jsonb) rows, in canonical key order (a, b, c).
+query TT nosort
+SELECT key, value FROM jsonb_each('{"b": 2, "a": 1, "c": "x"}')
+----
+a
+1
+b
+2
+c
+"x"
+
+# SELECT * expands to both columns in order.
+query TT nosort
+SELECT * FROM jsonb_each('{"z": [1,2], "y": {"k": 3}}')
+----
+y
+{"k": 3}
+z
+[1, 2]
+
+# jsonb_each_text: the value is the ->>-style text — a string member's raw content (x, not "x"), a
+# number "1", a container its canonical text, a JSON null → SQL NULL.
+query TT nosort
+SELECT key, value FROM jsonb_each_text('{"a": 1, "b": "x", "c": [1,2], "d": null}')
+----
+a
+1
+b
+x
+c
+[1, 2]
+d
+NULL
+
+# An empty object yields zero rows; a NULL argument yields zero rows.
+query I nosort
+SELECT count(*)::i32 FROM jsonb_each('{}'::jsonb)
+----
+0
+
+query I nosort
+SELECT count(*)::i32 FROM jsonb_each(NULL::jsonb)
+----
+0
+
+# A non-object argument is 22023.
+statement error 22023
+SELECT * FROM jsonb_each('[1,2]'::jsonb)
+
+statement error 22023
+SELECT * FROM jsonb_each_text('5'::jsonb)
+
+# A FROM alias renames the relation; the columns stay key/value (qualified access).
+query TT nosort
+SELECT t.key, t.value FROM jsonb_each('{"a": 1, "b": 2}') AS t ORDER BY t.key
+----
+a
+1
+b
+2
+
+# Lateral over a stored column: expand each row's jsonb document (implicitly lateral SRF). jed spells
+# the lateral join with CROSS JOIN (a comma-FROM with an SRF is a separate parser limitation).
+statement ok
+CREATE TABLE docs (id i32 PRIMARY KEY, j jsonb)
+
+statement ok
+INSERT INTO docs VALUES (1, '{"x": 10, "y": 20}'), (2, '{"z": 30}')
+
+query ITT nosort
+SELECT d.id, e.key, e.value FROM docs d CROSS JOIN jsonb_each(d.j) AS e ORDER BY d.id, e.key
+----
+1
+x
+10
+1
+y
+20
+2
+z
+30

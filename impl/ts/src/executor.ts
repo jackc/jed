@@ -7299,6 +7299,37 @@ export class Database {
     if (lname === "generate_series")
       return this.resolveGenerateSeries(args, alias, argScope, ptypes);
     if (lname === "unnest") return this.resolveUnnest(args, alias, argScope, ptypes);
+    // json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
+    // jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
+    // json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
+    switch (lname) {
+      case "jsonb_each":
+        return this.resolveJsonEach(
+          lname,
+          "jsonb_each",
+          scalarT("jsonb"),
+          args,
+          alias,
+          argScope,
+          ptypes,
+        );
+      case "jsonb_each_text":
+        return this.resolveJsonEach(
+          lname,
+          "jsonb_each_text",
+          scalarT("text"),
+          args,
+          alias,
+          argScope,
+          ptypes,
+        );
+      case "json_each":
+      case "json_each_text":
+        throw engineError(
+          "feature_not_supported",
+          lname + " is not supported yet; use the jsonb variant",
+        );
+    }
     // json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
     // variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on, like
     // the json accessor operators; the jsonb variants + `json_object_keys` ship here.
@@ -7377,6 +7408,30 @@ export class Database {
       type.kind === "null" || (jsonb && type.kind === "jsonb") || (!jsonb && type.kind === "json");
     if (!ok) throw noFuncOverload(name);
     const table = srfTable(name, alias, colTy);
+    return { table, srf: { kind, args: [node] } };
+  }
+
+  // resolveJsonEach resolves a json/jsonb TWO-column SRF (B3 — jsonb_each / jsonb_each_text,
+  // json-sql-functions.md §3): the one argument is a jsonb value (a bare string literal adapts). The
+  // synthetic relation has the fixed columns `key text` and `value <valueTy>` (the C0 multi-column
+  // synthetic table). A non-object argument → 22023 at exec; a NULL → zero rows.
+  private resolveJsonEach(
+    name: string,
+    kind: SrfKind,
+    valueTy: Type,
+    args: Expr[],
+    alias: string | null,
+    argScope: Scope,
+    ptypes: ParamTypes,
+  ): { table: Table; srf: SrfPlan } {
+    if (args.length !== 1) throw noFuncOverload(name);
+    const forbidden: AggCtx = { collecting: false, groupKeys: [], specs: [] };
+    const { node, type } = resolve(argScope, args[0]!, "jsonb", forbidden, ptypes);
+    if (type.kind !== "jsonb" && type.kind !== "null") throw noFuncOverload(name);
+    const table = srfTableCols(name, alias, [
+      ["key", scalarT("text")],
+      ["value", valueTy],
+    ]);
     return { table, srf: { kind, args: [node] } };
   }
 
@@ -7530,6 +7585,29 @@ export class Database {
           meter.guard();
           meter.charge(COSTS.generatedRow);
           out.push([textValue(m.key)]);
+        }
+        break;
+      }
+      case "jsonb_each":
+      case "jsonb_each_text": {
+        if (node.kind !== "object")
+          throw engineError(
+            "invalid_parameter_value",
+            "cannot call " + srf.kind + " on a non-object",
+          );
+        for (const m of node.members) {
+          meter.guard();
+          meter.charge(COSTS.generatedRow);
+          // (key text, value): jsonb_each keeps the value node; _text renders ->>-style (a string
+          // member's raw content, a JSON null → SQL NULL, else canonical).
+          let value: Value;
+          if (srf.kind === "jsonb_each_text") {
+            const t = nodeToText(m.value);
+            value = t === null ? nullValue() : textValue(t);
+          } else {
+            value = jsonbValue(m.value);
+          }
+          out.push([textValue(m.key), value]);
         }
         break;
       }
@@ -7780,6 +7858,8 @@ export class Database {
         case "jsonb_array_elements_text":
         case "jsonb_object_keys":
         case "json_object_keys":
+        case "jsonb_each":
+        case "jsonb_each_text":
           return this.jsonSrfRows(rel.srf, env, meter);
       }
     }
@@ -10830,13 +10910,17 @@ type PlanRel = {
 //   "jsonb_array_elements_text" — one `text` row per array element (the `->>`-style render).
 //   "jsonb_object_keys"         — one `text` row per object key, in canonical key order.
 //   "json_object_keys"          — one `text` row per object key, in INPUT order (duplicates kept).
+//   "jsonb_each"                — one `(key text, value jsonb)` row per object member, canonical order.
+//   "jsonb_each_text"           — one `(key text, value text)` row per member (the `->>`-style value).
 type SrfKind =
   | "generate_series"
   | "unnest"
   | "jsonb_array_elements"
   | "jsonb_array_elements_text"
   | "jsonb_object_keys"
-  | "json_object_keys";
+  | "json_object_keys"
+  | "jsonb_each"
+  | "jsonb_each_text";
 
 // SrfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,
 // array-functions.md §9). kind selects the generator: generate_series(start, stop[, step]) (args =
@@ -10866,6 +10950,31 @@ function srfTable(funcName: string, alias: string | null, colTy: Type): Table {
         collation: null,
       },
     ],
+    pk: [],
+    checks: [],
+    indexes: [],
+    fks: [],
+  };
+}
+
+// srfTableCols builds a MULTI-COLUMN synthetic table for a set-returning function (C0,
+// json-table.md §1) — the generalization of srfTable to N named/typed columns. The column NAMES are
+// fixed by the function (e.g. jsonb_each → key, value); the FROM alias renames the RELATION, not its
+// columns. Used by json[b]_each[_text] (and, with a col-def list, the record functions).
+function srfTableCols(funcName: string, alias: string | null, cols: [string, Type][]): Table {
+  return {
+    name: alias ?? funcName,
+    columns: cols.map(([name, type]) => ({
+      name,
+      type,
+      decimal: null,
+      primaryKey: false,
+      notNull: false,
+      default: null,
+      defaultExpr: null,
+      identity: null,
+      collation: null,
+    })),
     pk: [],
     checks: [],
     indexes: [],

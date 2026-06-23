@@ -9827,10 +9827,21 @@ func (db *Database) resolveSRF(name string, args []*Expr, alias *string, parent 
 	case strings.EqualFold(name, "unnest"):
 		return db.resolveUnnest(args, alias, argScope, ptypes)
 	}
+	lname := strings.ToLower(name)
+	// json/jsonb two-column SRFs (B3, json-sql-functions.md §3): jsonb_each → (key text, value
+	// jsonb), jsonb_each_text → (key text, value text). The json variants (verbatim sub-text,
+	// json.md §4) are a deferred 0A000 follow-on. Built on the C0 multi-column synthetic table.
+	switch lname {
+	case "jsonb_each":
+		return db.resolveJSONEach(lname, srfJsonbEach, ScalarT(Jsonb), args, alias, argScope, ptypes)
+	case "jsonb_each_text":
+		return db.resolveJSONEach(lname, srfJsonbEachText, ScalarT(Text), args, alias, argScope, ptypes)
+	case "json_each", "json_each_text":
+		return nil, nil, NewError(FeatureNotSupported, lname+" is not supported yet; use the jsonb variant")
+	}
 	// json/jsonb single-column SRFs (B2, json-sql-functions.md §3). The json `array_elements`
 	// variants preserve the verbatim sub-text (json.md §4) and are a deferred 0A000 follow-on, like
 	// the json accessor operators; the jsonb variants + `json_object_keys` ship here.
-	lname := strings.ToLower(name)
 	switch lname {
 	case "jsonb_array_elements":
 		return db.resolveJSONSrf(lname, srfJsonbArrayElements, ScalarT(Jsonb), true, args, alias, argScope, ptypes)
@@ -9867,6 +9878,27 @@ func (db *Database) resolveJSONSrf(name string, kind srfKind, colTy Type, jsonb 
 		return nil, nil, noFuncOverload(name)
 	}
 	return srfTable(name, alias, colTy), &srfPlan{kind: kind, args: []*rExpr{r}}, nil
+}
+
+// resolveJSONEach resolves a json/jsonb TWO-column SRF (B3 — jsonb_each / jsonb_each_text,
+// json-sql-functions.md §3): the one argument is a jsonb value (a bare string literal adapts). The
+// synthetic relation has the fixed columns `key text` and `value <valueTy>` (the C0 multi-column
+// synthetic table). A non-object argument → 22023 at exec; a NULL → zero rows.
+func (db *Database) resolveJSONEach(name string, kind srfKind, valueTy Type, args []*Expr, alias *string, argScope *scope, ptypes *paramTypes) (*Table, *srfPlan, error) {
+	if len(args) != 1 {
+		return nil, nil, noFuncOverload(name)
+	}
+	want := Jsonb
+	forbidden := &aggCtx{}
+	r, t, err := resolve(argScope, *args[0], &want, forbidden, ptypes)
+	if err != nil {
+		return nil, nil, err
+	}
+	if t.kind != rtJsonb && t.kind != rtNull {
+		return nil, nil, noFuncOverload(name)
+	}
+	table := srfTableCols(name, alias, []srfCol{{"key", ScalarT(Text)}, {"value", valueTy}})
+	return table, &srfPlan{kind: kind, args: []*rExpr{r}}, nil
 }
 
 // resolveGenerateSeries resolves generate_series(start, stop[, step]) (spec/design/functions.md
@@ -9950,6 +9982,41 @@ func srfTable(funcName string, alias *string, colTy Type) *Table {
 	return &Table{
 		Name:    funcName,
 		Columns: []Column{{Name: colName, Type: colTy}},
+	}
+}
+
+// srfCol is one fixed column of a multi-column SRF synthetic table (its name + type).
+type srfCol struct {
+	name string
+	ty   Type
+}
+
+// srfTableCols builds a MULTI-COLUMN synthetic table for a set-returning function (C0,
+// json-table.md §1) — the generalization of srfTable to N named/typed columns. The column NAMES are
+// fixed by the function (e.g. jsonb_each → key, value); the FROM alias renames the RELATION (the
+// table Name), not its columns. Used by json[b]_each[_text] (and, with a col-def list, the record
+// functions).
+func srfTableCols(funcName string, alias *string, cols []srfCol) *Table {
+	name := funcName
+	if alias != nil {
+		name = *alias
+	}
+	columns := make([]Column, len(cols))
+	for i, c := range cols {
+		columns[i] = Column{Name: c.name, Type: c.ty}
+	}
+	return &Table{Name: name, Columns: columns}
+}
+
+// srfKindName is the catalog name of a json two-column SRF, for its non-object error message.
+func srfKindName(kind srfKind) string {
+	switch kind {
+	case srfJsonbEach:
+		return "jsonb_each"
+	case srfJsonbEachText:
+		return "jsonb_each_text"
+	default:
+		panic("srfKindName is only for the json two-column SRFs")
 	}
 }
 
@@ -10073,6 +10140,29 @@ func (db *Database) jsonSrfRows(sp *srfPlan, env *evalEnv, m *Meter) ([]Row, err
 			}
 			m.Charge(Costs.GeneratedRow)
 			out = append(out, Row{TextValue(node.Obj[i].Key)})
+		}
+	case srfJsonbEach, srfJsonbEachText:
+		if node.Kind != JObject {
+			return nil, NewError(InvalidParameterValue, "cannot call "+srfKindName(sp.kind)+" on a non-object")
+		}
+		for i := range node.Obj {
+			if err := m.Guard(); err != nil {
+				return nil, err
+			}
+			m.Charge(Costs.GeneratedRow)
+			// (key text, value): jsonb_each keeps the value node; _text renders ->>-style
+			// (a string member's raw content, a JSON null → SQL NULL, else canonical).
+			var value Value
+			if sp.kind == srfJsonbEachText {
+				if s, ok := jsonNodeToText(&node.Obj[i].Val); ok {
+					value = TextValue(s)
+				} else {
+					value = NullValue()
+				}
+			} else {
+				value = JsonbValue(node.Obj[i].Val)
+			}
+			out = append(out, Row{TextValue(node.Obj[i].Key), value})
 		}
 	default:
 		panic("jsonSrfRows only handles the json SRF kinds")
@@ -11411,7 +11501,7 @@ func (db *Database) materializeRel(plan *selectPlan, ri int, params []Value, out
 			return db.generateSeriesRows(rel.srf, env, meter)
 		case srfUnnest:
 			return db.unnestRows(rel.srf, env, meter)
-		case srfJsonbArrayElements, srfJsonbArrayElementsText, srfJsonbObjectKeys, srfJsonObjectKeys:
+		case srfJsonbArrayElements, srfJsonbArrayElementsText, srfJsonbObjectKeys, srfJsonObjectKeys, srfJsonbEach, srfJsonbEachText:
 			return db.jsonSrfRows(rel.srf, env, meter)
 		}
 		return nil, nil
@@ -13979,6 +14069,13 @@ const (
 	// srfJsonObjectKeys is json_object_keys(json) — one `text` row per object key, in INPUT order
 	// (duplicates kept).
 	srfJsonObjectKeys
+	// srfJsonbEach is jsonb_each(jsonb) — one `(key text, value jsonb)` row per top-level object
+	// member, canonical key order (json-sql-functions.md §3). A two-column SRF (the C0 multi-column
+	// synthetic table).
+	srfJsonbEach
+	// srfJsonbEachText is jsonb_each_text(jsonb) — one `(key text, value text)` row per member (the
+	// `->>`-style value).
+	srfJsonbEachText
 )
 
 // srfPlan is a resolved set-returning-function row source (spec/design/functions.md §10,

@@ -608,6 +608,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     // json/jsonb single-column SRFs (B2) — jsonb_array_elements[_text] / json[b]_object_keys
     // (json-sql-functions.md §3).
     "func.json_srf",
+    // json/jsonb two-column SRFs (B3) — jsonb_each / jsonb_each_text (json-sql-functions.md §3),
+    // the first consumer of the C0 multi-column synthetic table.
+    "func.json_each",
     // to_jsonb(anyelement) — the JSON image of a value (B1 builder subset, json-sql-functions.md §2).
     "func.to_jsonb",
     // json/jsonb construction builders (B1) — to_json / json[b]_build_array / _object (§2).
