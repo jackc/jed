@@ -86,6 +86,9 @@ export type Expr =
   // context at resolve; the host binds a value at execute (spec/design/api.md §5).
   | { kind: "param"; index: number }
   | { kind: "cast"; inner: Expr; typeName: string; typeMod: TypeMod | null }
+  // EXTRACT(field FROM source) — the datetime field special form (timezones.md §9.2, grammar.md §50).
+  // The field is syntactic (identifier or string literal, lowercased at parse); resolves to numeric.
+  | { kind: "extract"; field: string; source: Expr }
   // expr COLLATE "name" — the postfix collation operator (spec/design/collation.md §1). Sets an
   // EXPLICIT collation on a text expression for the surrounding comparison / ORDER BY; binds at the
   // postfix/typecast level (tighter than || and the comparisons — PG precedence). `collation` is a

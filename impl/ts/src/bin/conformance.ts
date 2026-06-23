@@ -97,6 +97,15 @@ function loadTimezone(name: string): void {
   throw new Error(`load-timezone: zone "${name}" is not provided by the loaded bundle`);
 }
 
+// parseTimezoneDirective parses a `# timezone: <zone>` line (spec/design/session.md §6.2, timezones.md
+// §9.4): the SESSION time zone for the next record (the zone a timestamptz decomposes in). Per-record
+// (reset to UTC after, like `# set:`). Distinct from `# load-timezone:` (which loads the bundle).
+function parseTimezoneDirective(line: string): string | null {
+  const rest = line.replace(/^#/, "").trim();
+  if (!rest.startsWith("timezone:")) return null;
+  return rest.slice("timezone:".length).trim();
+}
+
 // parseFixtureDirective parses a file-level `# fixture: <spec-relative-path>` line — the corpus's way
 // to run a file against a PRE-BUILT database image instead of a fresh database, so a test can exercise
 // on-disk state SQL cannot construct (a version-skewed collation pin + a wrong-for-loaded index — the
@@ -557,6 +566,7 @@ function runFile(text: string): void {
   let pendingTempBuffers: number | null = null;
   let pendingSharedTempMem: number | null = null;
   const pendingVars: Array<[string, string]> = [];
+  let pendingTimezone: string | null = null;
   while (c.i < lines.length) {
     const line = lines[c.i]!.trim();
     if (line === "") {
@@ -613,6 +623,7 @@ function runFile(text: string): void {
       const tb = parseTempBuffersDirective(line);
       const stm = parseSharedTempMemDirective(line);
       const sv = parseSetDirective(line);
+      const tz = parseTimezoneDirective(line);
       const sd = parseSeedDirective(line);
       const ck = parseClockDirective(line);
       const ca = parseClockAdvanceDirective(line);
@@ -645,6 +656,8 @@ function runFile(text: string): void {
         pendingSharedTempMem = stm;
       } else if (sv !== null) {
         pendingVars.push(...sv);
+      } else if (tz !== null) {
+        pendingTimezone = tz;
       } else if (sd !== null) {
         pendingSeed = sd;
       } else if (ck !== null) {
@@ -723,6 +736,11 @@ function runFile(text: string): void {
     db.resetVars();
     for (const [name, value] of pendingVars) db.setVar(name, value);
     pendingVars.length = 0;
+    // Apply the per-record session time zone (spec/design/session.md §6.2, timezones.md §9.4): reset
+    // to UTC, then set the pending # timezone:, so a directive decorates only its record and never
+    // leaks forward. A named zone must already be loaded (# load-timezone:).
+    db.setTimeZone(pendingTimezone ?? "UTC");
+    pendingTimezone = null;
     const fields = line.split(/\s+/);
     if (fields[0] === "statement") {
       // `# names:` / `# types:` assert result columns, which a statement lacks.

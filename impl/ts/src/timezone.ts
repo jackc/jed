@@ -620,13 +620,51 @@ export function instantToLocalMicros(zr: ZoneRef, instantMicros: bigint): bigint
   return instantMicros + BigInt(off.utoff) * 1_000_000n;
 }
 
-// localToInstantMicros is timestamp AT TIME ZONE zone (§4): instant = wall − utoff. Two-probe
-// resolution; at a DST gap/overlap the branch matches PostgreSQL (oracle-pinned, timezones.md §6).
+// localToInstantMicros is timestamp AT TIME ZONE zone (§4): instant = wall − utoff. The offset is
+// chosen by determineLocalOffset, matching PostgreSQL's DetermineTimeZoneOffset at a DST gap/overlap
+// (oracle-pinned, timezones.md §6).
 export function localToInstantMicros(zr: ZoneRef, wallMicros: bigint): bigint {
   const wallSecs = floorDivBig(wallMicros, 1_000_000n);
-  const off1 = BigInt(offsetAtRef(zr, wallSecs).utoff);
-  const off2 = BigInt(offsetAtRef(zr, wallSecs - off1).utoff);
-  return wallMicros - off2 * 1_000_000n;
+  const chosen = determineLocalOffset(zr, wallSecs);
+  return wallMicros - chosen * 1_000_000n;
+}
+
+// determineLocalOffset chooses the UT offset (seconds) to interpret a wall-clock wallSecs reading
+// with, matching PostgreSQL's DetermineTimeZoneOffset (src/timezone/pgtz.c) at a DST boundary. For a
+// normal time both candidate offsets agree; for a spring-forward GAP (a nonexistent wall clock) PG
+// uses the *before* (earlier) offset; for a fall-back OVERLAP (a doubled wall clock) PG uses the
+// *after* (later) offset. A fixed-offset zone has no boundary, so the single offset is returned.
+function determineLocalOffset(zr: ZoneRef, wallSecs: bigint): bigint {
+  const DAY = 86_400n;
+  // The offsets a day before / after wallSecs (taken as if UTC). A DST transition is never less than
+  // a day apart, so at most one boundary lies in this 2-day window; if both ends agree there is no
+  // boundary near wallSecs and the time is unambiguous.
+  const offLo = BigInt(offsetAtRef(zr, wallSecs - DAY).utoff);
+  const offHi = BigInt(offsetAtRef(zr, wallSecs + DAY).utoff);
+  if (offLo === offHi) return offLo;
+  // Binary-search the boundary: the smallest instant in (wall-DAY, wall+DAY] whose offset is no
+  // longer offLo (i.e. has become offHi).
+  let lo = wallSecs - DAY;
+  let hi = wallSecs + DAY;
+  while (lo < hi) {
+    const mid = lo + (hi - lo) / 2n;
+    if (BigInt(offsetAtRef(zr, mid).utoff) === offLo) {
+      lo = mid + 1n;
+    } else {
+      hi = mid;
+    }
+  }
+  const boundary = lo;
+  const beforeTime = wallSecs - offLo;
+  const afterTime = wallSecs - offHi;
+  const beforeSide = beforeTime < boundary;
+  const afterSide = afterTime < boundary;
+  if (beforeSide === afterSide) {
+    // Both candidate instants fall on the same side of the boundary — an ordinary time.
+    return beforeSide ? offLo : offHi;
+  }
+  if (beforeTime > afterTime) return offLo; // gap: the before (earlier) offset
+  return offHi; // overlap: the after (later) offset
 }
 
 // parseFixedOffset parses [+|-]HH[:MM[:SS]] (the WHOLE string). Requires a leading sign. POSIX sign

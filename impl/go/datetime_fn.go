@@ -94,12 +94,14 @@ func extractDecade(pgYear int64) int64 {
 	}
 	return -((8 - pgYear) / 10)
 }
+
 func extractCentury(pgYear int64) int64 {
 	if pgYear >= 0 {
 		return (pgYear + 99) / 100
 	}
 	return -((99 - pgYear) / 100)
 }
+
 func extractMillennium(pgYear int64) int64 {
 	if pgYear >= 0 {
 		return (pgYear + 999) / 1000

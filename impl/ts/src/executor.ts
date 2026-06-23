@@ -88,9 +88,17 @@ import {
   loadTimeZoneData as loadTimeZoneDataGlobal,
   loadedTimeZones as loadedTimeZonesGlobal,
   localToInstantMicros,
+  offsetAtRef,
   resolveZone,
   type TimeZoneInfo,
+  type ZoneRef,
 } from "./timezone.ts";
+import {
+  dateTruncInterval,
+  dateTruncMicros,
+  type ExtractSrc,
+  extractField,
+} from "./datetime_fn.ts";
 import { crc32Ieee } from "./format.ts";
 import {
   Decimal,
@@ -156,7 +164,7 @@ import {
   isFixedWidth,
 } from "./types.ts";
 import { NEG_INFINITY, parseTimestamp, parseTimestamptz, POS_INFINITY } from "./timestamp.ts";
-import { parseDate } from "./date.ts";
+import { DATE_NEG_INFINITY, DATE_POS_INFINITY, parseDate } from "./date.ts";
 import { uuidExtractTimestampMicros, uuidExtractVersion } from "./uuid.ts";
 import { type ClockFunc, type RandomFill, Seam, StmtRng } from "./seam.ts";
 import {
@@ -955,6 +963,11 @@ export type SessionOptions = {
   // §7); 0 ⇒ unlimited; absent ⇒ the engine default (DEFAULT_TEMP_BUFFERS). An over-budget temp write
   // aborts 54P03.
   tempBuffers?: number;
+  // The session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone a timestamptz is
+  // decomposed in by date_trunc / EXTRACT / the cross-family casts. Absent ⇒ UTC. Accepts UTC, a fixed
+  // ±HH:MM offset, or a named IANA zone a loaded JTZ bundle provides; an invalid value falls back to
+  // UTC at construction (the validated setter is Session.setTimeZone — 22023).
+  timeZone?: string;
 };
 
 // TxStatus is the session transaction status (spec/design/session.md §2.2) — PostgreSQL's three
@@ -1056,6 +1069,11 @@ export class Session {
   // roll back with a transaction (PG SET SESSION), and each session keeps its own map across the
   // by-reference swap (like the privilege envelope).
   vars: Map<string, string>;
+  // The resolved session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone a
+  // timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts. Resolved once
+  // (from opts.timeZone at construction, or setTimeZone) to a cheap ZoneRef (UTC = fixed 0); the
+  // evaluator reads it via the active session. SESSION state (no storage effect).
+  timeZone: ZoneRef;
   // The read pin for a data-modifying WITH statement (spec/design/writable-cte.md §2): the single
   // pre-statement snapshot every sub-statement reads, so the data-modifying CTEs and the primary
   // cannot observe each other's table writes (their writes still accumulate into the transaction's
@@ -1088,7 +1106,21 @@ export class Session {
     this.tempBuffers = opts.tempBuffers ?? DEFAULT_TEMP_BUFFERS;
     this.tempCommitted = new Snapshot();
     this.vars = new Map();
+    // Resolve the configured zone once; an invalid value falls back to UTC at construction (the
+    // validated path is setTimeZone, which surfaces 22023). timezones.md §9.4.
+    this.timeZone = resolveZone(opts.timeZone ?? "UTC") ?? { fixed: true, off: 0 };
     this.readPin = null;
+  }
+
+  // setTimeZone sets the session time zone (spec/design/session.md §6.2, timezones.md §9.4): the zone
+  // a timestamptz is decomposed in. Accepts UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded
+  // JTZ bundle provides; a name no bundle provides (and not a built-in) is 22023, the value unchanged.
+  setTimeZone(zone: string): void {
+    const zr = resolveZone(zone);
+    if (zr === undefined) {
+      throw engineError("invalid_parameter_value", `time zone "${zone}" not recognized`);
+    }
+    this.timeZone = zr;
   }
 
   // run installs this session as db's active session, runs fn, and restores the default — the swap
@@ -1440,6 +1472,13 @@ export class Database {
   // the variable map (also the conformance harness # set: reset hook).
   resetVars(): void {
     this.session.resetVars();
+  }
+
+  // setTimeZone sets the time zone on the default session (spec/design/session.md §6.2, timezones.md
+  // §9.4): the zone a timestamptz is decomposed in by date_trunc / EXTRACT / the cross-family casts.
+  // Accepts UTC, a fixed ±HH:MM offset, or a named IANA zone a loaded JTZ bundle provides; else 22023.
+  setTimeZone(zone: string): void {
+    this.session.setTimeZone(zone);
   }
 
   // setMaxSqlLength sets the maximum input SQL length, in bytes, accepted on this handle (CLAUDE.md
@@ -7834,6 +7873,17 @@ export class Database {
         e.zone = this.foldUncorrelatedInRExpr(e.zone, bound, ctes, cost);
         e.value = this.foldUncorrelatedInRExpr(e.value, bound, ctes, cost);
         return e;
+      case "dateTrunc":
+        e.unit = this.foldUncorrelatedInRExpr(e.unit, bound, ctes, cost);
+        e.value = this.foldUncorrelatedInRExpr(e.value, bound, ctes, cost);
+        if (e.zone) e.zone = this.foldUncorrelatedInRExpr(e.zone, bound, ctes, cost);
+        return e;
+      case "extract":
+        e.value = this.foldUncorrelatedInRExpr(e.value, bound, ctes, cost);
+        return e;
+      case "dateConvert":
+        e.inner = this.foldUncorrelatedInRExpr(e.inner, bound, ctes, cost);
+        return e;
       case "case":
         e.arms = e.arms.map((arm) => ({
           cond: this.foldUncorrelatedInRExpr(arm.cond, bound, ctes, cost),
@@ -8221,6 +8271,16 @@ function rexprIsConstant(e: RExpr): boolean {
       return rexprIsConstant(e.arg);
     case "atTimeZone":
       return rexprIsConstant(e.zone) && rexprIsConstant(e.value);
+    case "dateTrunc":
+      return (
+        rexprIsConstant(e.unit) &&
+        rexprIsConstant(e.value) &&
+        (e.zone === null || rexprIsConstant(e.zone))
+      );
+    case "extract":
+      return rexprIsConstant(e.value);
+    case "dateConvert":
+      return rexprIsConstant(e.inner);
     case "case":
       return (
         e.arms.every((a) => rexprIsConstant(a.cond) && rexprIsConstant(a.result)) &&
@@ -9183,6 +9243,16 @@ function rexprReferencesOuter(e: RExpr, depth: number): boolean {
       return rexprReferencesOuter(e.arg, depth);
     case "atTimeZone":
       return rexprReferencesOuter(e.zone, depth) || rexprReferencesOuter(e.value, depth);
+    case "dateTrunc":
+      return (
+        rexprReferencesOuter(e.unit, depth) ||
+        rexprReferencesOuter(e.value, depth) ||
+        (e.zone !== null && rexprReferencesOuter(e.zone, depth))
+      );
+    case "extract":
+      return rexprReferencesOuter(e.value, depth);
+    case "dateConvert":
+      return rexprReferencesOuter(e.inner, depth);
     case "case":
       return (
         e.arms.some(
@@ -9276,6 +9346,17 @@ function collectTouched(e: RExpr, depth: number, touched: boolean[]): void {
     case "atTimeZone":
       collectTouched(e.zone, depth, touched);
       collectTouched(e.value, depth, touched);
+      return;
+    case "dateTrunc":
+      collectTouched(e.unit, depth, touched);
+      collectTouched(e.value, depth, touched);
+      if (e.zone !== null) collectTouched(e.zone, depth, touched);
+      return;
+    case "extract":
+      collectTouched(e.value, depth, touched);
+      return;
+    case "dateConvert":
+      collectTouched(e.inner, depth, touched);
       return;
     case "case":
       for (const arm of e.arms) {
@@ -9616,6 +9697,16 @@ type RExpr =
   // folds via the engine-global property table or the ASCII baseline. A NULL operand propagates.
   | { kind: "casing"; upper: boolean; arg: RExpr }
   | { kind: "atTimeZone"; zone: RExpr; value: RExpr; toTimestamptz: boolean }
+  // date_trunc(unit, value[, zone]) (timezones.md §9.1): truncate value down to unit. For a
+  // timestamptz value the truncation is in zone (3-arg) or the session zone (2-arg). The result
+  // family is the value family.
+  | { kind: "dateTrunc"; unit: RExpr; value: RExpr; zone: RExpr | null }
+  // EXTRACT(field FROM value) (timezones.md §9.2): the numeric value of field (lowercased, validated
+  // at resolve). For a timestamptz value every field but `epoch` is computed in the session zone.
+  | { kind: "extract"; field: string; value: RExpr }
+  // A cross-family datetime cast (timezones.md §9.3) to `to` (timestamp/timestamptz/date) from
+  // another datetime family. The casts crossing the timestamptz boundary consult the session zone.
+  | { kind: "dateConvert"; inner: RExpr; to: ScalarType }
   | {
       kind: "case";
       arms: { cond: RExpr; result: RExpr }[];
@@ -10344,6 +10435,8 @@ function exprHasAggregate(e: Expr): boolean {
       return isAggregateName(e.name) || e.args.some(exprHasAggregate);
     case "cast":
       return exprHasAggregate(e.inner);
+    case "extract":
+      return exprHasAggregate(e.source);
     case "collate":
       return exprHasAggregate(e.inner);
     case "unary":
@@ -10432,6 +10525,8 @@ function rejectCheckStructure(e: Expr): void {
       return;
     case "cast":
       return rejectCheckStructure(e.inner);
+    case "extract":
+      return rejectCheckStructure(e.source);
     case "collate":
       return rejectCheckStructure(e.inner);
     case "unary":
@@ -10512,6 +10607,8 @@ function rejectDefaultStructure(e: Expr): void {
       return;
     case "cast":
       return rejectDefaultStructure(e.inner);
+    case "extract":
+      return rejectDefaultStructure(e.source);
     case "collate":
       return rejectDefaultStructure(e.inner);
     case "unary":
@@ -10580,6 +10677,8 @@ function checkReferencedColumns(e: Expr, columns: Column[]): number[] {
         return;
       case "cast":
         return walk(e.inner);
+      case "extract":
+        return walk(e.source);
       case "collate":
         return walk(e.inner);
       case "unary":
@@ -10910,6 +11009,14 @@ function resolveFuncCall(
     rejectNamed(lname, e.argNames);
     if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
     return resolveTimezone(scope, e, ag, params);
+  }
+  // date_trunc(unit, value[, zone]) (timezones.md §9.1) — polymorphic on the value family (the result
+  // type is the value type) + an optional 3rd zone arg only on a timestamptz, so it resolves before
+  // the generic by-name dispatch (which has no such polymorphism).
+  if (lname === "date_trunc") {
+    rejectNamed(lname, e.argNames);
+    if (e.star) throw engineError("syntax_error", "* is only valid as the argument of COUNT");
+    return resolveDateTrunc(scope, e, ag, params);
   }
   // Otherwise the registry (the catalog descriptor tables) decides whether the name is an
   // aggregate, a scalar function, or undefined — no hand-written name lists (extensibility.md §5).
@@ -11541,6 +11648,38 @@ function resolveTimezone(
     };
   }
   throw noFuncOverload("timezone");
+}
+
+// resolveDateTrunc resolves date_trunc(unit, value[, zone]) (timezones.md §9.1). unit is text (a
+// runtime value, validated at eval); value is timestamp / timestamptz / interval; the optional zone
+// (text) is the 3-arg form, valid only for a timestamptz value. The result family is the value
+// family. A non-text unit/zone, a non-datetime value, or the 3-arg form on a non-timestamptz value is
+// 42883 (a date value also has no overload — jed has no implicit date->timestamp cast).
+function resolveDateTrunc(
+  scope: Scope,
+  e: { name: string; args: Expr[] },
+  ag: AggCtx,
+  params: ParamTypes,
+): { node: RExpr; type: ResolvedType } {
+  if (e.args.length !== 2 && e.args.length !== 3) throw noFuncOverload("date_trunc");
+  const unit = resolve(scope, e.args[0], "text", ag, params);
+  const value = resolve(scope, e.args[1], null, ag, params);
+  if (unit.type.kind !== "text" && unit.type.kind !== "null") throw noFuncOverload("date_trunc");
+  const vk = value.type.kind;
+  if (vk !== "timestamp" && vk !== "timestamptz" && vk !== "interval") {
+    throw noFuncOverload("date_trunc");
+  }
+  let zone: RExpr | null = null;
+  if (e.args.length === 3) {
+    if (vk !== "timestamptz") throw noFuncOverload("date_trunc");
+    const z = resolve(scope, e.args[2], "text", ag, params);
+    if (z.type.kind !== "text" && z.type.kind !== "null") throw noFuncOverload("date_trunc");
+    zone = z.node;
+  }
+  return {
+    node: { kind: "dateTrunc", unit: unit.node, value: value.node, zone },
+    type: value.type,
+  };
 }
 
 // resolveRangeFunc resolves a polymorphic range accessor over the anyrange pseudo-family
@@ -12265,6 +12404,8 @@ function countSelfRefsExpr(e: Expr, name: string): number {
     case "cast":
     case "collate":
       return countSelfRefsExpr(e.inner, name);
+    case "extract":
+      return countSelfRefsExpr(e.source, name);
     case "unary":
     case "isNull":
       return countSelfRefsExpr(e.operand, name);
@@ -12900,6 +13041,8 @@ function exprCallsSeqMutator(e: Expr): boolean {
       );
     case "cast":
       return exprCallsSeqMutator(e.inner);
+    case "extract":
+      return exprCallsSeqMutator(e.source);
     case "collate":
       return exprCallsSeqMutator(e.inner);
     case "unary":
@@ -13150,6 +13293,9 @@ function collectExprPrivs(e: Expr, req: PrivReq, locals: Set<string>): void {
     case "collate":
       collectExprPrivs(e.inner, req, locals);
       break;
+    case "extract":
+      collectExprPrivs(e.source, req, locals);
+      break;
     case "unary":
     case "isNull":
       collectExprPrivs(e.operand, req, locals);
@@ -13231,6 +13377,8 @@ function exprReadsColumns(e: Expr): boolean {
     case "cast":
     case "collate":
       return exprReadsColumns(e.inner);
+    case "extract":
+      return exprReadsColumns(e.source);
     case "unary":
     case "isNull":
       return exprReadsColumns(e.operand);
@@ -13866,6 +14014,42 @@ function resolve(
       resolveCollationName(scope.catalog, e.collation); // surfaces 42704 for an unknown name
       return r;
     }
+    case "extract": {
+      // EXTRACT(field FROM source) (timezones.md §9.2, grammar.md §50). The field is SYNTACTIC and
+      // validated at RESOLVE (not per row): an unsupported field for the source type is 0A000, an
+      // unrecognized field is 22023 — surfaced by probing the kernel with a zero value of the source's
+      // family. The source must be a datetime type (else 42883); the result is numeric.
+      const src = resolve(scope, e.source, null, ag, params);
+      // A NULL source has no resolvable family; the value propagates to NULL at eval (the field is
+      // not validated — a documented narrow edge vs. PG).
+      if (src.type.kind !== "null") {
+        let probe: ExtractSrc;
+        switch (src.type.kind) {
+          case "timestamp":
+            probe = { kind: "ts", micros: 0n };
+            break;
+          case "timestamptz":
+            probe = { kind: "tstz", instant: 0n, local: 0n, offsetSecs: 0n };
+            break;
+          case "date":
+            probe = { kind: "date", days: 0n };
+            break;
+          case "interval":
+            probe = { kind: "interval", iv: { months: 0, days: 0, micros: 0n } };
+            break;
+          default:
+            throw engineError(
+              "undefined_function",
+              `function extract(text, ${rtName(src.type)}) does not exist`,
+            );
+        }
+        extractField(e.field, probe); // validate field-for-type (0A000 / 22023); value discarded
+      }
+      return {
+        node: { kind: "extract", field: e.field, value: src.node },
+        type: { kind: "decimal" },
+      };
+    }
     case "cast": {
       // An array cast target `…::T[]` (spec/design/array.md §7). v1 supports only the string-literal
       // form `'{…}'::T[]` and a bare NULL; every other array cast (runtime text→array, array→text,
@@ -13998,11 +14182,33 @@ function resolve(
       if (isUuid(target)) {
         throw engineError("feature_not_supported", "casting to uuid is not supported yet");
       }
-      // timestamp casts are deferred (spec/design/timestamp.md §6): casting TO a datetime is 0A000.
-      if (isTimestamp(target) || isTimestamptz(target)) {
+      // Cross-family datetime casts (timezones.md §9.3): a timestamp/timestamptz/date TARGET from
+      // another datetime family. A same-family cast is the identity; a cross-family cast becomes a
+      // dateConvert node (the zone-crossing ones read the session zone at eval); any non-datetime
+      // source is the deferred 0A000. A NULL operand adapts to the target. text↔datetime casts stay
+      // deferred and fall through (a non-datetime source is rejected here).
+      if (isTimestamp(target) || isTimestamptz(target) || isDate(target)) {
+        if (e.inner.kind === "param") {
+          const pinner = resolve(scope, e.inner, target, ag, params);
+          return { node: pinner.node, type: resolvedTypeOf(target) };
+        }
+        const inner = resolve(scope, e.inner, null, ag, params);
+        const toRt = resolvedTypeOf(target);
+        const ik = inner.type.kind;
+        if (ik === "null") return { node: inner.node, type: toRt };
+        if (
+          (ik === "timestamp" && isTimestamp(target)) ||
+          (ik === "timestamptz" && isTimestamptz(target)) ||
+          (ik === "date" && isDate(target))
+        ) {
+          return { node: inner.node, type: inner.type };
+        }
+        if (ik === "timestamp" || ik === "timestamptz" || ik === "date") {
+          return { node: { kind: "dateConvert", inner: inner.node, to: target }, type: toRt };
+        }
         throw engineError(
           "feature_not_supported",
-          "casting to a timestamp type is not supported yet",
+          `cannot cast ${rtName(inner.type)} to ${canonicalName(target)}`,
         );
       }
       // interval casts are deferred (spec/design/interval.md): casting TO interval is 0A000.
@@ -14011,10 +14217,6 @@ function resolve(
           "feature_not_supported",
           "casting to an interval type is not supported yet",
         );
-      }
-      // date casts are deferred (spec/design/date.md §5/§6): casting TO date is 0A000.
-      if (isDate(target)) {
-        throw engineError("feature_not_supported", "casting to a date type is not supported yet");
       }
       // A bind-parameter operand takes the cast TARGET as its inferred type — `$1::int` (and
       // `CAST($1 AS int)`) declares `$1` as int, the cast-target parameter-typing case
@@ -17058,6 +17260,52 @@ function inMembership(lv: Value, list: Value[], negated: boolean, m: Meter): Val
   return negated ? boolNot(inVal) : inVal;
 }
 
+// evalDateConvert evaluates a cross-family datetime cast (timezones.md §9.3) of the non-NULL value v
+// to `to` (timestamp/timestamptz/date). The casts crossing the timestamptz boundary consult the
+// session zone (charging timezone); the others are zone-free. ±infinity maps to the target's own
+// sentinel. The (source family, to) pair is guaranteed cross-family by the resolver.
+function evalDateConvert(v: Value, to: ScalarType, env: EvalEnv, m: Meter): Value {
+  const MICROS_PER_DAY = 86_400n * 1_000_000n;
+  const microsToDate = (mc: bigint): Value => {
+    if (mc === POS_INFINITY) return dateValue(DATE_POS_INFINITY);
+    if (mc === NEG_INFINITY) return dateValue(DATE_NEG_INFINITY);
+    const days = mc >= 0n ? mc / MICROS_PER_DAY : -((-mc + (MICROS_PER_DAY - 1n)) / MICROS_PER_DAY);
+    return dateValue(days);
+  };
+  const dateToMicros = (d: bigint): bigint => {
+    if (d === DATE_POS_INFINITY) return POS_INFINITY;
+    if (d === DATE_NEG_INFINITY) return NEG_INFINITY;
+    return d * MICROS_PER_DAY;
+  };
+  const isInf = (mc: bigint): boolean => mc === POS_INFINITY || mc === NEG_INFINITY;
+  const zoneCharge = (): ZoneRef => {
+    const zr = env.exec.session.timeZone;
+    m.charge(COSTS.timezone);
+    m.guard();
+    return zr;
+  };
+  if (v.kind === "timestamp" && to === "date") return microsToDate(v.micros);
+  if (v.kind === "date" && to === "timestamp") return timestampValue(dateToMicros(v.days));
+  if (v.kind === "timestamptz" && to === "timestamp") {
+    if (isInf(v.micros)) return timestampValue(v.micros);
+    return timestampValue(instantToLocalMicros(zoneCharge(), v.micros));
+  }
+  if (v.kind === "timestamp" && to === "timestamptz") {
+    if (isInf(v.micros)) return timestamptzValue(v.micros);
+    return timestamptzValue(localToInstantMicros(zoneCharge(), v.micros));
+  }
+  if (v.kind === "timestamptz" && to === "date") {
+    if (isInf(v.micros)) return microsToDate(v.micros);
+    return microsToDate(instantToLocalMicros(zoneCharge(), v.micros));
+  }
+  if (v.kind === "date" && to === "timestamptz") {
+    const mid = dateToMicros(v.days);
+    if (isInf(mid)) return timestamptzValue(mid);
+    return timestamptzValue(localToInstantMicros(zoneCharge(), mid));
+  }
+  throw new Error("unreachable: resolver restricts dateConvert to cross-family datetime casts");
+}
+
 function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
   // Enforce the cost ceiling before evaluating this node (CLAUDE.md §13). evalExpr recurses once
   // per expression node, so guarding here bounds a pathological expression to ~O(1) overshoot; it
@@ -17480,6 +17728,77 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
       return e.toTimestamptz
         ? timestamptzValue(localToInstantMicros(zr, micros))
         : timestampValue(instantToLocalMicros(zr, micros));
+    }
+    case "dateTrunc": {
+      m.charge(COSTS.operatorEval);
+      const uv = evalExpr(e.unit, row, env, m);
+      const vv = evalExpr(e.value, row, env, m);
+      const zv = e.zone !== null ? evalExpr(e.zone, row, env, m) : null;
+      if (uv.kind === "null" || vv.kind === "null" || (zv !== null && zv.kind === "null")) {
+        return nullValue();
+      }
+      if (uv.kind !== "text") throw new Error("unreachable: resolver requires a text unit");
+      const unitS = uv.text;
+      if (vv.kind === "timestamp") return timestampValue(dateTruncMicros(unitS, vv.micros));
+      if (vv.kind === "interval") return intervalValue(dateTruncInterval(unitS, vv.iv));
+      if (vv.kind === "timestamptz") {
+        const mc = vv.micros;
+        if (mc === POS_INFINITY || mc === NEG_INFINITY) {
+          dateTruncMicros(unitS, mc); // still validate the unit
+          return timestamptzValue(mc);
+        }
+        let zr: ZoneRef;
+        if (zv !== null) {
+          if (zv.kind !== "text") throw new Error("unreachable: resolver requires a text zone");
+          const r = resolveZone(zv.text);
+          if (r === undefined) {
+            throw engineError("invalid_parameter_value", `time zone "${zv.text}" not recognized`);
+          }
+          zr = r;
+        } else {
+          zr = env.exec.session.timeZone;
+        }
+        m.charge(COSTS.timezone);
+        m.guard();
+        const local = instantToLocalMicros(zr, mc);
+        const trunc = dateTruncMicros(unitS, local);
+        return timestamptzValue(localToInstantMicros(zr, trunc));
+      }
+      throw new Error("unreachable: resolver restricts date_trunc to ts/tstz/interval");
+    }
+    case "extract": {
+      m.charge(COSTS.operatorEval);
+      const vv = evalExpr(e.value, row, env, m);
+      if (vv.kind === "null") return nullValue();
+      let src: ExtractSrc;
+      if (vv.kind === "timestamp") src = { kind: "ts", micros: vv.micros };
+      else if (vv.kind === "date") src = { kind: "date", days: vv.days };
+      else if (vv.kind === "interval") src = { kind: "interval", iv: vv.iv };
+      else if (vv.kind === "timestamptz") {
+        const mc = vv.micros;
+        // `epoch` is zone-independent (the instant); every other field decomposes in the session zone
+        // — so only the zone-consulting fields charge `timezone`.
+        if (e.field === "epoch" || mc === POS_INFINITY || mc === NEG_INFINITY) {
+          src = { kind: "tstz", instant: mc, local: mc, offsetSecs: 0n };
+        } else {
+          const zr = env.exec.session.timeZone;
+          m.charge(COSTS.timezone);
+          m.guard();
+          const local = instantToLocalMicros(zr, mc);
+          const secs = mc >= 0n ? mc / 1_000_000n : -((-mc + 999_999n) / 1_000_000n);
+          const off = BigInt(offsetAtRef(zr, secs).utoff);
+          src = { kind: "tstz", instant: mc, local, offsetSecs: off };
+        }
+      } else {
+        throw new Error("unreachable: resolver restricts EXTRACT to ts/tstz/date/interval");
+      }
+      return decimalValue(extractField(e.field, src));
+    }
+    case "dateConvert": {
+      m.charge(COSTS.operatorEval);
+      const v = evalExpr(e.inner, row, env, m);
+      if (v.kind === "null") return nullValue();
+      return evalDateConvert(v, e.to, env, m);
     }
     case "case": {
       // CASE is the ONE deliberate exception to "no short-circuit" (cost.md §3): conditions are

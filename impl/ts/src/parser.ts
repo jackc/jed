@@ -2596,6 +2596,23 @@ class Parser {
       this.expect("rparen");
       return { kind: "cast", inner, typeName, typeMod };
     }
+    // EXTRACT(field FROM source) (grammar.md §50, timezones.md §9.2). Recognized only when `extract`
+    // is immediately followed by `(`, so `extract` stays usable as a column / function name otherwise
+    // (the one-token lookahead, §8). The field is an identifier or a string literal (lowercased).
+    if (this.peekKeyword() === "extract" && this.peekKindAt(1) === "lparen") {
+      this.advance(); // EXTRACT
+      this.expect("lparen");
+      let field: string;
+      if (this.peekKindAt(0) === "str") {
+        field = this.advance().str!;
+      } else {
+        field = this.expectIdentifier();
+      }
+      this.expectKeyword("from");
+      const source = this.parseExpr();
+      this.expect("rparen");
+      return { kind: "extract", field: field.toLowerCase(), source };
+    }
     if (this.peekKeyword() === "case") {
       this.advance();
       // Simple form has an operand between CASE and the first WHEN; the searched form starts
