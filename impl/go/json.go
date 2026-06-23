@@ -664,6 +664,53 @@ func writeJSONNode(node *JsonNode, out *strings.Builder) {
 	}
 }
 
+// jsonCompactOut renders a node tree to COMPACT JSON text — no space after `:` or `,` — the form
+// PG's `json` processing functions (`json_strip_nulls`, `to_json`, the json builders) emit (a `json`
+// value's output style, distinct from `jsonb`'s spaced canonical form). Members render in their node
+// order (the caller controls canonicalization; a `json`-on-demand parse keeps input order).
+func jsonCompactOut(node *JsonNode) string {
+	var b strings.Builder
+	writeCompactJSON(node, &b)
+	return b.String()
+}
+
+func writeCompactJSON(node *JsonNode, out *strings.Builder) {
+	switch node.Kind {
+	case JNull:
+		out.WriteString("null")
+	case JBool:
+		if node.B {
+			out.WriteString("true")
+		} else {
+			out.WriteString("false")
+		}
+	case JNumber:
+		out.WriteString(node.Num.Render())
+	case JString:
+		writeJSONString(node.S, out)
+	case JArray:
+		out.WriteByte('[')
+		for i := range node.Arr {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			writeCompactJSON(&node.Arr[i], out)
+		}
+		out.WriteByte(']')
+	default: // JObject
+		out.WriteByte('{')
+		for i := range node.Obj {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			writeJSONString(node.Obj[i].Key, out)
+			out.WriteByte(':')
+			writeCompactJSON(&node.Obj[i].Val, out)
+		}
+		out.WriteByte('}')
+	}
+}
+
 // writeJSONString JSON-escapes a string the way PG escape_json does: quote, escape `"` and `\`, the
 // short escapes for `\b \f \n \r \t`, other control chars (< 0x20) as `\u00XX`; `/` is NOT escaped
 // and non-ASCII is emitted as raw UTF-8. Iterates by code point (the escape decision is per-rune)
@@ -1068,5 +1115,112 @@ func jsonDeletePath(node *JsonNode, path []string) (JsonNode, error) {
 		return JsonNode{Kind: JArray, Arr: out}, nil
 	default:
 		return JsonNode{}, cannotDelete("cannot delete path in scalar")
+	}
+}
+
+// ---------------------------------------------------------------------------------------------
+// Processing / introspection functions (B1, spec/design/json-sql-functions.md §2).
+// ---------------------------------------------------------------------------------------------
+
+// jsonTypeofName is `json[b]_typeof` — the JSON type name of a node (PG): `object`/`array`/`string`/
+// `number`/`boolean`/`null`.
+func jsonTypeofName(node *JsonNode) string {
+	switch node.Kind {
+	case JNull:
+		return "null"
+	case JBool:
+		return "boolean"
+	case JNumber:
+		return "number"
+	case JString:
+		return "string"
+	case JArray:
+		return "array"
+	default: // JObject
+		return "object"
+	}
+}
+
+// jsonArrayLength is `json[b]_array_length` — the element count of an array node; a non-array is
+// `22023`.
+func jsonArrayLength(node *JsonNode) (int64, error) {
+	if node.Kind != JArray {
+		return 0, NewError(InvalidParameterValue, "cannot get array length of a scalar")
+	}
+	return int64(len(node.Arr)), nil
+}
+
+// jsonStripNulls is `json[b]_strip_nulls` — recursively remove object members whose value is JSON
+// `null` (array nulls are kept, PG). Objects re-canonicalize (the surviving members stay in canonical
+// order; the input is already canonical for jsonb, and for json the on-demand parse order is kept).
+func jsonStripNulls(node *JsonNode) JsonNode {
+	switch node.Kind {
+	case JObject:
+		out := make([]JsonMember, 0, len(node.Obj))
+		for i := range node.Obj {
+			if node.Obj[i].Val.Kind == JNull {
+				continue
+			}
+			out = append(out, JsonMember{Key: node.Obj[i].Key, Val: jsonStripNulls(&node.Obj[i].Val)})
+		}
+		return JsonNode{Kind: JObject, Obj: out}
+	case JArray:
+		out := make([]JsonNode, len(node.Arr))
+		for i := range node.Arr {
+			out[i] = jsonStripNulls(&node.Arr[i])
+		}
+		return JsonNode{Kind: JArray, Arr: out}
+	default:
+		return *node
+	}
+}
+
+// jsonPretty is `jsonb_pretty` — an indented multi-line render (PG: 4-space indent, one space after
+// `:`). A container ALWAYS multi-lines (even an empty one: `{` newline, then the close at the
+// container's own indent → `{\n}` / `{\n    }`); scalars render inline.
+func jsonPretty(node *JsonNode) string {
+	var b strings.Builder
+	writePrettyJSON(node, 0, &b)
+	return b.String()
+}
+
+func writePrettyJSON(node *JsonNode, indent int, out *strings.Builder) {
+	switch node.Kind {
+	case JObject:
+		out.WriteByte('{')
+		for i := range node.Obj {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			out.WriteByte('\n')
+			pushJSONIndent(indent+1, out)
+			writeJSONString(node.Obj[i].Key, out)
+			out.WriteString(": ")
+			writePrettyJSON(&node.Obj[i].Val, indent+1, out)
+		}
+		out.WriteByte('\n')
+		pushJSONIndent(indent, out)
+		out.WriteByte('}')
+	case JArray:
+		out.WriteByte('[')
+		for i := range node.Arr {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			out.WriteByte('\n')
+			pushJSONIndent(indent+1, out)
+			writePrettyJSON(&node.Arr[i], indent+1, out)
+		}
+		out.WriteByte('\n')
+		pushJSONIndent(indent, out)
+		out.WriteByte(']')
+	default:
+		writeJSONNode(node, out)
+	}
+}
+
+func pushJSONIndent(level int, out *strings.Builder) {
+	for i := 0; i < level; i++ {
+		out.WriteString("    ")
 	}
 }

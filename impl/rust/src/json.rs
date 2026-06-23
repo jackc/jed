@@ -502,6 +502,48 @@ pub fn jsonb_out(node: &JsonNode) -> String {
     s
 }
 
+/// Render a node tree to COMPACT JSON text — no space after `:` or `,` — the form PG's `json`
+/// processing functions (`json_strip_nulls`, `to_json`, the json builders) emit (a `json` value's
+/// output style, distinct from `jsonb`'s spaced canonical form). Members render in their node order
+/// (the caller controls canonicalization; a `json`-on-demand parse keeps input order).
+pub fn json_compact_out(node: &JsonNode) -> String {
+    let mut s = String::new();
+    write_compact(node, &mut s);
+    s
+}
+
+fn write_compact(node: &JsonNode, out: &mut String) {
+    match node {
+        JsonNode::Null => out.push_str("null"),
+        JsonNode::Bool(true) => out.push_str("true"),
+        JsonNode::Bool(false) => out.push_str("false"),
+        JsonNode::Number(d) => out.push_str(&d.render()),
+        JsonNode::String(s) => write_json_string(s, out),
+        JsonNode::Array(elems) => {
+            out.push('[');
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_compact(e, out);
+            }
+            out.push(']');
+        }
+        JsonNode::Object(members) => {
+            out.push('{');
+            for (i, (k, v)) in members.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                write_json_string(k, out);
+                out.push(':');
+                write_compact(v, out);
+            }
+            out.push('}');
+        }
+    }
+}
+
 fn write_node(node: &JsonNode, out: &mut String) {
     match node {
         JsonNode::Null => out.push_str("null"),
@@ -795,6 +837,102 @@ pub fn delete_path(node: &JsonNode, path: &[String]) -> Result<JsonNode> {
             Ok(JsonNode::Array(out))
         }
         _ => Err(cannot_delete("cannot delete path in scalar")),
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Processing / introspection functions (B1, spec/design/json-sql-functions.md §2).
+// ---------------------------------------------------------------------------------------------
+
+/// `json[b]_typeof` — the JSON type name of a node (PG): `object`/`array`/`string`/`number`/
+/// `boolean`/`null`.
+pub fn typeof_name(node: &JsonNode) -> &'static str {
+    match node {
+        JsonNode::Null => "null",
+        JsonNode::Bool(_) => "boolean",
+        JsonNode::Number(_) => "number",
+        JsonNode::String(_) => "string",
+        JsonNode::Array(_) => "array",
+        JsonNode::Object(_) => "object",
+    }
+}
+
+/// `json[b]_array_length` — the element count of an array node; a non-array is `22023`.
+pub fn array_length(node: &JsonNode) -> Result<i64> {
+    match node {
+        JsonNode::Array(e) => Ok(e.len() as i64),
+        _ => Err(EngineError::new(
+            SqlState::InvalidParameterValue,
+            "cannot get array length of a scalar",
+        )),
+    }
+}
+
+/// `json[b]_strip_nulls` — recursively remove object members whose value is JSON `null` (array
+/// nulls are kept, PG). Objects re-canonicalize (the surviving members stay in canonical order).
+pub fn strip_nulls(node: &JsonNode) -> JsonNode {
+    match node {
+        JsonNode::Object(members) => JsonNode::Object(
+            members
+                .iter()
+                .filter(|(_, v)| !matches!(v, JsonNode::Null))
+                .map(|(k, v)| (k.clone(), strip_nulls(v)))
+                .collect(),
+        ),
+        JsonNode::Array(elems) => JsonNode::Array(elems.iter().map(strip_nulls).collect()),
+        other => other.clone(),
+    }
+}
+
+/// `jsonb_pretty` — an indented multi-line render (PG: 4-space indent, one space after `:`, no
+/// trailing whitespace; an empty object/array renders inline as `{}`/`[]`).
+pub fn pretty(node: &JsonNode) -> String {
+    let mut s = String::new();
+    write_pretty(node, 0, &mut s);
+    s
+}
+
+fn write_pretty(node: &JsonNode, indent: usize, out: &mut String) {
+    // PG `jsonb_pretty` ALWAYS multi-lines a container (even an empty one: `{` newline, then the
+    // close at the container's own indent → `{\n}` / `{\n    }`), and renders scalars inline.
+    match node {
+        JsonNode::Object(members) => {
+            out.push('{');
+            for (i, (k, v)) in members.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('\n');
+                push_indent(indent + 1, out);
+                write_json_string(k, out);
+                out.push_str(": ");
+                write_pretty(v, indent + 1, out);
+            }
+            out.push('\n');
+            push_indent(indent, out);
+            out.push('}');
+        }
+        JsonNode::Array(elems) => {
+            out.push('[');
+            for (i, e) in elems.iter().enumerate() {
+                if i > 0 {
+                    out.push(',');
+                }
+                out.push('\n');
+                push_indent(indent + 1, out);
+                write_pretty(e, indent + 1, out);
+            }
+            out.push('\n');
+            push_indent(indent, out);
+            out.push(']');
+        }
+        scalar => write_node(scalar, out),
+    }
+}
+
+fn push_indent(level: usize, out: &mut String) {
+    for _ in 0..level {
+        out.push_str("    ");
     }
 }
 

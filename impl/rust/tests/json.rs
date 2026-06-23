@@ -107,6 +107,33 @@ fn json_accessor_operators_are_deferred() {
     assert_eq!(err(&mut db, "SELECT j #> '{a}' FROM t"), "0A000");
 }
 
+/// `jsonb_pretty` renders the PG indented multi-line form (4-space indent, one space after `:`, a
+/// container ALWAYS multi-lines — an empty `{}` is `{` newline `}`). Pinned against the postgres:18
+/// oracle; the multi-line output can't live in the line-based corpus.
+#[test]
+fn jsonb_pretty_matches_pg() {
+    let mut db = Database::new();
+    let q = |db: &mut Database, sql: &str| -> String {
+        match execute(db, sql).unwrap() {
+            Outcome::Query { rows, .. } => rows[0][0].render(),
+            other => panic!("{other:?}"),
+        }
+    };
+    assert_eq!(
+        q(
+            &mut db,
+            "SELECT jsonb_pretty('{\"a\":1,\"b\":[1,2]}'::jsonb)"
+        ),
+        "{\n    \"a\": 1,\n    \"b\": [\n        1,\n        2\n    ]\n}"
+    );
+    // An empty object/array still multi-lines (PG): `{` newline (indent) `}`.
+    assert_eq!(q(&mut db, "SELECT jsonb_pretty('{}'::jsonb)"), "{\n}");
+    assert_eq!(
+        q(&mut db, "SELECT jsonb_pretty('{\"a\":{},\"b\":[]}'::jsonb)"),
+        "{\n    \"a\": {\n    },\n    \"b\": [\n    ]\n}"
+    );
+}
+
 /// A large `jsonb` document (a long string node well past `RECORD_MAX`) spills onto an overflow
 /// chain and round-trips through a whole-image serialize + reload — exercising `is_spillable`,
 /// `value_payload`, and `value_from_payload` for the jsonb body (the tree decoded from a fresh

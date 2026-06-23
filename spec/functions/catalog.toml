@@ -3055,6 +3055,84 @@ result         = "anyrange"
 null           = "propagates"
 errors         = []
 
+# === json / jsonb processing functions (B1, json-sql-functions.md §2) =========
+# Introspection + processing over a json/jsonb document. The json overloads parse the verbatim text
+# on demand and dispatch to the same kernel (json.md §4). All propagate a SQL NULL input to NULL.
+# jsonb_typeof / json_typeof → the JSON type name (object/array/string/number/boolean/null).
+[[operator]]
+name           = "jsonb_typeof"
+kind           = "function"
+arity          = 1
+arg_families   = ["jsonb"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "json_typeof"
+kind           = "function"
+arity          = 1
+arg_families   = ["json"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
+# jsonb_array_length / json_array_length → the element count of an array; 22023 on a non-array.
+[[operator]]
+name           = "jsonb_array_length"
+kind           = "function"
+arity          = 1
+arg_families   = ["jsonb"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["22023"]
+
+[[operator]]
+name           = "json_array_length"
+kind           = "function"
+arity          = 1
+arg_families   = ["json"]
+arg_resolution = "none"
+result         = "i32"
+null           = "propagates"
+errors         = ["22023"]
+
+# jsonb_strip_nulls / json_strip_nulls → remove object members whose value is JSON null (recursive;
+# array nulls are kept).
+[[operator]]
+name           = "jsonb_strip_nulls"
+kind           = "function"
+arity          = 1
+arg_families   = ["jsonb"]
+arg_resolution = "none"
+result         = "jsonb"
+null           = "propagates"
+errors         = []
+
+[[operator]]
+name           = "json_strip_nulls"
+kind           = "function"
+arity          = 1
+arg_families   = ["json"]
+arg_resolution = "none"
+result         = "json"
+null           = "propagates"
+errors         = []
+
+# jsonb_pretty → an indented (4-space) multi-line render. (PG ships no json_pretty.)
+[[operator]]
+name           = "jsonb_pretty"
+kind           = "function"
+arity          = 1
+arg_families   = ["jsonb"]
+arg_resolution = "none"
+result         = "text"
+null           = "propagates"
+errors         = []
+
 # === aggregate functions =====================================================
 # Aggregates collapse the rows of a group (or, with no GROUP BY, the whole table) into a
 # SINGLE value. They are NOT operators — no infix symbol, no precedence, no

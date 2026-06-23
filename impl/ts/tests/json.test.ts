@@ -7,7 +7,7 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { execute } from "../src/lib.ts";
-import { dbWith, errCode } from "./util.ts";
+import { dbWith, errCode, query } from "./util.ts";
 
 // A `jsonb` comparison with a NON-jsonb family is 42804 (jed's cross-family convention, like
 // uuid/bytea/range) — a documented divergence from PostgreSQL, which reports 42883 (operator does
@@ -67,5 +67,24 @@ test("json accessor operators are deferred", () => {
   assert.equal(
     errCode(() => execute(db, "SELECT j #> '{a}' FROM t")),
     "0A000",
+  );
+});
+
+// jsonb_pretty renders the PG indented multi-line form (4-space indent, one space after `:`, a
+// container ALWAYS multi-lines — an empty `{}` is `{` newline `}`). Pinned against the postgres:18
+// oracle; the multi-line output can't live in the line-based corpus. Mirrors impl/rust/tests/json.rs
+// jsonb_pretty_matches_pg and impl/go/json_test.go TestJsonbPrettyMatchesPG.
+test("jsonb_pretty matches PG", () => {
+  const db = dbWith([]);
+  const pretty = (sql: string): string => query(db, sql)[0]![0]!;
+  assert.equal(
+    pretty(`SELECT jsonb_pretty('{"a":1,"b":[1,2]}'::jsonb)`),
+    '{\n    "a": 1,\n    "b": [\n        1,\n        2\n    ]\n}',
+  );
+  // An empty object/array still multi-lines (PG): `{` newline (indent) `}`.
+  assert.equal(pretty(`SELECT jsonb_pretty('{}'::jsonb)`), "{\n}");
+  assert.equal(
+    pretty(`SELECT jsonb_pretty('{"a":{},"b":[]}'::jsonb)`),
+    '{\n    "a": {\n    },\n    "b": [\n    ]\n}',
   );
 });

@@ -357,8 +357,14 @@ Difficulty key: **S** ≈ hours · **M** ≈ a day · **L** ≈ multi-day · **X
         + `@?`/`@@` + `vars`/`silent`; then the `_tz` variants. → jsonpath.md §5
   - [ ] **S1 / S2** — `IS JSON` + `JSON()`/`JSON_SCALAR`/`JSON_SERIALIZE` (+ dup-key kernel); then
         `JSON_EXISTS`/`JSON_VALUE`/`JSON_QUERY` (constant ON ERROR/EMPTY). → json-sql-functions.md §5
-  - [ ] **B1–B4** — scalar processing + builders / single-column SRFs / two-column SRFs (`json[b]_each`,
+  - [~] **B1–B4** — scalar processing + builders / single-column SRFs / two-column SRFs (`json[b]_each`,
         needs C0) / aggregates (`json[b]_agg`, `object_agg` + strict/unique). → json-sql-functions.md §2–§4
+    - [x] **B1 (processing subset)** — ✅ `json[b]_typeof` / `json[b]_array_length` (22023 non-array) /
+          `json[b]_strip_nulls` (json compact, jsonb spaced) / `jsonb_pretty` (4-space multi-line).
+          Catalog rows + codegen + `ScalarFunc` kernels; json overloads parse-on-demand; all 3 cores,
+          cap `func.json_processing`, oracle-clean. _follow-on:_ builders `to_json[b]` /
+          `json[b]_build_array`/`_object` / `json[b]_object` / `jsonb_set`/`_insert` / `row_to_json` /
+          `array_to_json` (cap `func.json_builders`).
   - [ ] **R1 / R2** — `json[b]_to_record(set)` (needs C0) / `json[b]_populate_record(set)`. → json-table.md §2
   - [ ] **T1** — `JSON_TABLE` (default plan: nested-path LEFT-OUTER/UNION expansion); explicit `PLAN`
         → `0A000`. The highest-risk slice. → json-table.md §3

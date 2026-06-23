@@ -571,6 +571,51 @@ function writeNode(node: JsonNode, out: string[]): void {
   }
 }
 
+// jsonCompactOut renders a node tree to COMPACT JSON text — no space after `:` or `,` — the form
+// PG's `json` processing functions (`json_strip_nulls`, `to_json`, the json builders) emit (a `json`
+// value's output style, distinct from `jsonb`'s spaced canonical form). Members render in their node
+// order (the caller controls canonicalization; a `json`-on-demand parse keeps input order).
+export function jsonCompactOut(node: JsonNode): string {
+  const parts: string[] = [];
+  writeCompact(node, parts);
+  return parts.join("");
+}
+
+function writeCompact(node: JsonNode, out: string[]): void {
+  switch (node.kind) {
+    case "null":
+      out.push("null");
+      break;
+    case "bool":
+      out.push(node.value ? "true" : "false");
+      break;
+    case "number":
+      out.push(node.dec.render());
+      break;
+    case "string":
+      writeJsonString(node.value, out);
+      break;
+    case "array":
+      out.push("[");
+      for (let i = 0; i < node.elements.length; i++) {
+        if (i > 0) out.push(",");
+        writeCompact(node.elements[i]!, out);
+      }
+      out.push("]");
+      break;
+    case "object":
+      out.push("{");
+      for (let i = 0; i < node.members.length; i++) {
+        if (i > 0) out.push(",");
+        writeJsonString(node.members[i]!.key, out);
+        out.push(":");
+        writeCompact(node.members[i]!.value, out);
+      }
+      out.push("}");
+      break;
+  }
+}
+
 // writeJsonString JSON-escapes a string the way PG escape_json does: quote, escape `"` and `\`, the
 // short escapes for `\b \f \n \r \t`, other control chars (< 0x20) as `\u00XX` (lowercase hex); `/`
 // is NOT escaped and non-ASCII is emitted as raw UTF-8. Iterates by code point (the escape decision
@@ -895,4 +940,102 @@ export function deletePath(node: JsonNode, path: string[]): JsonNode {
     default:
       throw cannotDelete("cannot delete path in scalar");
   }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Processing / introspection functions (B1, spec/design/json-sql-functions.md §2).
+// ---------------------------------------------------------------------------------------------
+
+// typeofName is `json[b]_typeof` — the JSON type name of a node (PG): `object`/`array`/`string`/
+// `number`/`boolean`/`null`.
+export function typeofName(node: JsonNode): string {
+  switch (node.kind) {
+    case "null":
+      return "null";
+    case "bool":
+      return "boolean";
+    case "number":
+      return "number";
+    case "string":
+      return "string";
+    case "array":
+      return "array";
+    case "object":
+      return "object";
+  }
+}
+
+// arrayLength is `json[b]_array_length` — the element count of an array node; a non-array is `22023`.
+export function arrayLength(node: JsonNode): bigint {
+  if (node.kind !== "array") {
+    throw engineError("invalid_parameter_value", "cannot get array length of a scalar");
+  }
+  return BigInt(node.elements.length);
+}
+
+// stripNulls is `json[b]_strip_nulls` — recursively remove object members whose value is JSON `null`
+// (array nulls are kept, PG). Objects re-canonicalize (the surviving members stay in canonical order;
+// the input is already canonical for jsonb, and for json the on-demand parse order is kept).
+export function stripNulls(node: JsonNode): JsonNode {
+  switch (node.kind) {
+    case "object": {
+      const members: JsonMember[] = [];
+      for (const m of node.members) {
+        if (m.value.kind === "null") continue;
+        members.push({ key: m.key, value: stripNulls(m.value) });
+      }
+      return { kind: "object", members };
+    }
+    case "array":
+      return { kind: "array", elements: node.elements.map(stripNulls) };
+    default:
+      return node;
+  }
+}
+
+// pretty is `jsonb_pretty` — an indented multi-line render (PG: 4-space indent, one space after `:`).
+// A container ALWAYS multi-lines (even an empty one: `{` newline, then the close at the container's
+// own indent → `{\n}` / `{\n    }`); scalars render inline.
+export function pretty(node: JsonNode): string {
+  const parts: string[] = [];
+  writePretty(node, 0, parts);
+  return parts.join("");
+}
+
+function writePretty(node: JsonNode, indent: number, out: string[]): void {
+  switch (node.kind) {
+    case "object":
+      out.push("{");
+      for (let i = 0; i < node.members.length; i++) {
+        if (i > 0) out.push(",");
+        out.push("\n");
+        pushIndent(indent + 1, out);
+        writeJsonString(node.members[i]!.key, out);
+        out.push(": ");
+        writePretty(node.members[i]!.value, indent + 1, out);
+      }
+      out.push("\n");
+      pushIndent(indent, out);
+      out.push("}");
+      break;
+    case "array":
+      out.push("[");
+      for (let i = 0; i < node.elements.length; i++) {
+        if (i > 0) out.push(",");
+        out.push("\n");
+        pushIndent(indent + 1, out);
+        writePretty(node.elements[i]!, indent + 1, out);
+      }
+      out.push("\n");
+      pushIndent(indent, out);
+      out.push("]");
+      break;
+    default:
+      writeNode(node, out);
+      break;
+  }
+}
+
+function pushIndent(level: number, out: string[]): void {
+  for (let i = 0; i < level; i++) out.push("    ");
 }

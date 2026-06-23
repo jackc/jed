@@ -13434,6 +13434,20 @@ const (
 	// the named session variable from the session's variable map. STABLE; 42704 on an unset name unless
 	// the two-arg missing_ok is true (→ NULL).
 	sfCurrentSetting
+	// json/jsonb processing functions (B1, spec/design/json-sql-functions.md §2). The json* and
+	// jsonb* variants share a kernel; the only difference is the json overload parses the verbatim
+	// text first. All propagate a SQL NULL input.
+	// json[b]_typeof → the JSON type name (object/array/string/number/boolean/null).
+	sfJsonbTypeof
+	sfJsonTypeof
+	// json[b]_array_length → the array element count; a non-array is 22023.
+	sfJsonbArrayLength
+	sfJsonArrayLength
+	// json[b]_strip_nulls → recursively remove object members whose value is JSON null.
+	sfJsonbStripNulls
+	sfJsonStripNulls
+	// jsonb_pretty → an indented multi-line render.
+	sfJsonbPretty
 )
 
 // arrayFunc selects a polymorphic array function (spec/design/array-functions.md §3). Each name is
@@ -16088,6 +16102,21 @@ func scalarFuncID(name string, tys []resolvedType) scalarFunc {
 	// Session-variable read (spec/design/session.md §6.1): reads the session's variable map.
 	case "current_setting":
 		return sfCurrentSetting
+	// json/jsonb processing functions (B1, json-sql-functions.md §2).
+	case "jsonb_typeof":
+		return sfJsonbTypeof
+	case "json_typeof":
+		return sfJsonTypeof
+	case "jsonb_array_length":
+		return sfJsonbArrayLength
+	case "json_array_length":
+		return sfJsonArrayLength
+	case "jsonb_strip_nulls":
+		return sfJsonbStripNulls
+	case "json_strip_nulls":
+		return sfJsonStripNulls
+	case "jsonb_pretty":
+		return sfJsonbPretty
 	default:
 		panic("scalarFuncID: " + name + " is not a catalog function")
 	}
@@ -17252,6 +17281,20 @@ func jsonOpSymbol(op BinaryOp) string {
 		return "#>>"
 	default:
 		return "?"
+	}
+}
+
+// jsonArgNode is the node tree of a json/jsonb function argument: a jsonb value IS the canonical
+// node; a json value is parsed from its verbatim text on demand, preserving key order + duplicates
+// (json.md §4). The resolver restricts a json/jsonb function argument to json/jsonb.
+func jsonArgNode(v Value) (JsonNode, error) {
+	switch v.Kind {
+	case ValJsonb:
+		return *v.Json, nil
+	case ValJson:
+		return parsePreservingJSON(v.Str)
+	default:
+		panic("jsonArgNode: a json/jsonb function argument must be json/jsonb")
 	}
 }
 
@@ -22643,6 +22686,47 @@ func (e *rExpr) eval(row Row, env *evalEnv, m *Meter) (Value, error) {
 				return NullValue(), nil
 			}
 			return Value{}, NewError(UndefinedObject, "unrecognized configuration parameter: "+name)
+		case sfJsonbTypeof, sfJsonTypeof:
+			// json/jsonb processing functions (B1, json-sql-functions.md §2). A jsonb arg is the node
+			// directly; a json arg is parsed from its verbatim text on demand (json.md §4), then
+			// dispatched to the same kernel. The NULL-input case is handled by the blanket
+			// propagation above.
+			node, err := jsonArgNode(vals[0])
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(jsonTypeofName(&node)), nil
+		case sfJsonbArrayLength, sfJsonArrayLength:
+			node, err := jsonArgNode(vals[0])
+			if err != nil {
+				return Value{}, err
+			}
+			n, err := jsonArrayLength(&node)
+			if err != nil {
+				return Value{}, err
+			}
+			return IntValue(n), nil
+		case sfJsonbStripNulls:
+			node, err := jsonArgNode(vals[0])
+			if err != nil {
+				return Value{}, err
+			}
+			return JsonbValue(jsonStripNulls(&node)), nil
+		case sfJsonStripNulls:
+			// json_strip_nulls returns json — render the stripped tree COMPACTLY (PG's json output
+			// style), preserving the on-demand parse's key order.
+			node, err := jsonArgNode(vals[0])
+			if err != nil {
+				return Value{}, err
+			}
+			stripped := jsonStripNulls(&node)
+			return JsonValue(jsonCompactOut(&stripped)), nil
+		case sfJsonbPretty:
+			node, err := jsonArgNode(vals[0])
+			if err != nil {
+				return Value{}, err
+			}
+			return TextValue(jsonPretty(&node)), nil
 		default:
 			// Float scalar functions (spec/design/float.md §8). `result` is the call's width
 			// (Float32 only for abs; f64 for the rest, per the catalog).

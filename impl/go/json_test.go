@@ -195,3 +195,27 @@ func TestJsonbAllNodeKindsRoundTrip(t *testing.T) {
 		t.Errorf("all-node-kinds render = %q, want %q", rows[0][0], want)
 	}
 }
+
+// TestJsonbPrettyMatchesPG: jsonb_pretty renders the PG indented multi-line form (4-space indent,
+// one space after `:`, a container ALWAYS multi-lines — an empty `{}` is `{` newline `}`). Pinned
+// against the postgres:18 oracle; the multi-line output can't live in the line-based corpus.
+// Mirrors impl/rust/tests/json.rs jsonb_pretty_matches_pg.
+func TestJsonbPrettyMatchesPG(t *testing.T) {
+	db := NewDatabase()
+	q := func(sql string) string {
+		t.Helper()
+		return queryRendered(t, db, sql)[0][0]
+	}
+	if got, want := q("SELECT jsonb_pretty('{\"a\":1,\"b\":[1,2]}'::jsonb)"),
+		"{\n    \"a\": 1,\n    \"b\": [\n        1,\n        2\n    ]\n}"; got != want {
+		t.Errorf("jsonb_pretty nested = %q, want %q", got, want)
+	}
+	// An empty object/array still multi-lines (PG): `{` newline (indent) `}`.
+	if got, want := q("SELECT jsonb_pretty('{}'::jsonb)"), "{\n}"; got != want {
+		t.Errorf("jsonb_pretty empty object = %q, want %q", got, want)
+	}
+	if got, want := q("SELECT jsonb_pretty('{\"a\":{},\"b\":[]}'::jsonb)"),
+		"{\n    \"a\": {\n    },\n    \"b\": [\n    ]\n}"; got != want {
+		t.Errorf("jsonb_pretty nested empties = %q, want %q", got, want)
+	}
+}

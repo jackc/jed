@@ -10996,6 +10996,20 @@ enum ScalarFunc {
     /// §6.1). STABLE; reads per-session state (the variable map). An unset name is `42704` unless the
     /// two-arg `missing_ok` is true (→ NULL). Arity 1 or 2.
     CurrentSetting,
+    // json/jsonb processing functions (B1, spec/design/json-sql-functions.md §2). The `Json*` and
+    // `Jsonb*` variants share a kernel; the only difference is the json overload parses the verbatim
+    // text first. All propagate a SQL NULL input.
+    /// json[b]_typeof → the JSON type name (object/array/string/number/boolean/null).
+    JsonbTypeof,
+    JsonTypeof,
+    /// json[b]_array_length → the array element count; a non-array is 22023.
+    JsonbArrayLength,
+    JsonArrayLength,
+    /// json[b]_strip_nulls → recursively remove object members whose value is JSON null.
+    JsonbStripNulls,
+    JsonStripNulls,
+    /// jsonb_pretty → an indented multi-line render.
+    JsonbPretty,
 }
 
 /// The polymorphic array functions (spec/design/array-functions.md). Distinct from
@@ -15380,6 +15394,14 @@ fn scalar_func_id(name: &str) -> ScalarFunc {
         "lastval" => ScalarFunc::Lastval,
         // Session-variable read (spec/design/session.md §6.1): reads the session's variable map.
         "current_setting" => ScalarFunc::CurrentSetting,
+        // json/jsonb processing functions (B1, json-sql-functions.md §2).
+        "jsonb_typeof" => ScalarFunc::JsonbTypeof,
+        "json_typeof" => ScalarFunc::JsonTypeof,
+        "jsonb_array_length" => ScalarFunc::JsonbArrayLength,
+        "json_array_length" => ScalarFunc::JsonArrayLength,
+        "jsonb_strip_nulls" => ScalarFunc::JsonbStripNulls,
+        "json_strip_nulls" => ScalarFunc::JsonStripNulls,
+        "jsonb_pretty" => ScalarFunc::JsonbPretty,
         _ => unreachable!("scalar_func_id: {name} is not a catalog function"),
     }
 }
@@ -20058,6 +20080,16 @@ fn resolve_json_access(
         },
         result,
     ))
+}
+
+/// The node tree of a json/jsonb function argument: a `jsonb` value IS the canonical node; a `json`
+/// value is parsed from its verbatim text on demand, preserving key order + duplicates (json.md §4).
+fn json_arg_node(v: &Value) -> Result<JsonNode> {
+    match v {
+        Value::Jsonb(n) => Ok(n.clone()),
+        Value::Json(s) => json::parse_preserving(s),
+        _ => unreachable!("resolver restricts a json/jsonb function argument to json/jsonb"),
+    }
 }
 
 /// The display symbol for a jsonb accessor operator, for error messages.
@@ -24831,6 +24863,33 @@ impl RExpr {
                             )),
                         }
                     }
+                    // json/jsonb processing functions (B1). A jsonb arg is the node directly; a json
+                    // arg is parsed from its verbatim text on demand (json.md §4), then dispatched to
+                    // the same kernel.
+                    ScalarFunc::JsonbTypeof | ScalarFunc::JsonTypeof => {
+                        let node = json_arg_node(&vals[0])?;
+                        Ok(Value::Text(json::typeof_name(&node).to_string()))
+                    }
+                    ScalarFunc::JsonbArrayLength | ScalarFunc::JsonArrayLength => {
+                        let node = json_arg_node(&vals[0])?;
+                        Ok(Value::Int(json::array_length(&node)?))
+                    }
+                    ScalarFunc::JsonbStripNulls => {
+                        let node = json_arg_node(&vals[0])?;
+                        Ok(Value::Jsonb(json::strip_nulls(&node)))
+                    }
+                    ScalarFunc::JsonStripNulls => {
+                        // json_strip_nulls returns json — render the stripped tree COMPACTLY (PG's
+                        // json output style), preserving the on-demand parse's key order.
+                        let node = json_arg_node(&vals[0])?;
+                        Ok(Value::Json(json::json_compact_out(&json::strip_nulls(
+                            &node,
+                        ))))
+                    }
+                    ScalarFunc::JsonbPretty => {
+                        let node = json_arg_node(&vals[0])?;
+                        Ok(Value::Text(json::pretty(&node)))
+                    }
                 }
             }
             // A polymorphic array function (spec/design/array-functions.md §3). One operator_eval
@@ -25539,9 +25598,16 @@ fn eval_float_func(func: ScalarFunc, x: f64, arg2: Option<&Value>) -> Result<Val
         | ScalarFunc::Currval
         | ScalarFunc::Setval
         | ScalarFunc::Lastval
-        | ScalarFunc::CurrentSetting => {
+        | ScalarFunc::CurrentSetting
+        | ScalarFunc::JsonbTypeof
+        | ScalarFunc::JsonTypeof
+        | ScalarFunc::JsonbArrayLength
+        | ScalarFunc::JsonArrayLength
+        | ScalarFunc::JsonbStripNulls
+        | ScalarFunc::JsonStripNulls
+        | ScalarFunc::JsonbPretty => {
             unreachable!(
-                "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting fns are handled before eval_float_func"
+                "abs/round/make_interval/uuid_*/now/clock_timestamp/sequence/current_setting/json fns are handled before eval_float_func"
             )
         }
     };

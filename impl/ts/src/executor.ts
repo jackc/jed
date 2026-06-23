@@ -254,6 +254,7 @@ import {
 } from "./value.ts";
 import {
   type JsonNode,
+  arrayLength as jsonArrayLength,
   concat as jsonConcatKernel,
   contains as jsonContainsKernel,
   deleteIndex as jsonDeleteIndex,
@@ -264,10 +265,15 @@ import {
   getIndex,
   getPath,
   hasKey as jsonHasKeyKernel,
+  jsonCompactOut,
   jsonNodeCmp,
   jsonbIn,
   jsonbOut,
   nodeToText,
+  parsePreservingJson,
+  pretty as jsonPretty,
+  stripNulls as jsonStripNulls,
+  typeofName as jsonTypeofName,
   validateJson,
 } from "./json.ts";
 import {
@@ -10533,7 +10539,21 @@ type ScalarFuncName =
   // Session-variable read (spec/design/session.md §6.1): current_setting(text[, bool]) → text reads
   // the named session variable from the session's variable map. STABLE; 42704 on an unset name unless
   // the two-arg missing_ok is true (→ NULL).
-  | "current_setting";
+  | "current_setting"
+  // json/jsonb processing functions (B1, spec/design/json-sql-functions.md §2). The json* and jsonb*
+  // variants share a kernel; the only difference is the json overload parses the verbatim text first.
+  // All propagate a SQL NULL input.
+  // json[b]_typeof → the JSON type name (object/array/string/number/boolean/null).
+  | "jsonb_typeof"
+  | "json_typeof"
+  // json[b]_array_length → the array element count; a non-array is 22023.
+  | "jsonb_array_length"
+  | "json_array_length"
+  // json[b]_strip_nulls → recursively remove object members whose value is JSON null.
+  | "jsonb_strip_nulls"
+  | "json_strip_nulls"
+  // jsonb_pretty → an indented multi-line render.
+  | "jsonb_pretty";
 
 // ArrayFuncName is the internal identity of a polymorphic array-function node
 // (spec/design/array-functions.md §3). Each name is single-arity; the kernel recovers everything
@@ -16742,6 +16762,15 @@ function jsonOpSymbol(op: BinaryOp): string {
   }
 }
 
+// jsonArgNode is the node tree of a json/jsonb function argument: a jsonb value IS the canonical
+// node; a json value is parsed from its verbatim text on demand, preserving key order + duplicates
+// (json.md §4). The resolver restricts a json/jsonb function argument to json/jsonb.
+function jsonArgNode(v: Value): JsonNode {
+  if (v.kind === "jsonb") return v.node;
+  if (v.kind === "json") return parsePreservingJson(v.text);
+  throw new Error("jsonArgNode: a json/jsonb function argument must be json/jsonb");
+}
+
 // resolveJsonbContains resolves a jsonb containment operator `@>` / `<@` (json-sql-functions.md §1,
 // J5). Both operands must be `jsonb` (a bare string literal adapts via `jsonbIn`); a `json` operand
 // has no @> operator class (42883). `<@` resolves to a "jsonContains" node with the operands swapped
@@ -20187,6 +20216,26 @@ function evalExpr(e: RExpr, row: Row, env: EvalEnv, m: Meter): Value {
           return nullValue();
         }
         throw engineError("undefined_object", "unrecognized configuration parameter: " + name);
+      }
+      // json/jsonb processing functions (B1, json-sql-functions.md §2). A jsonb arg is the node
+      // directly; a json arg is parsed from its verbatim text on demand (json.md §4), then dispatched
+      // to the same kernel. The NULL-input case was already handled by the blanket propagation above.
+      if (e.func === "jsonb_typeof" || e.func === "json_typeof") {
+        return textValue(jsonTypeofName(jsonArgNode(vals[0]!)));
+      }
+      if (e.func === "jsonb_array_length" || e.func === "json_array_length") {
+        return intValue(jsonArrayLength(jsonArgNode(vals[0]!)));
+      }
+      if (e.func === "jsonb_strip_nulls") {
+        return jsonbValue(jsonStripNulls(jsonArgNode(vals[0]!)));
+      }
+      if (e.func === "json_strip_nulls") {
+        // json_strip_nulls returns json — render the stripped tree COMPACTLY (PG's json output
+        // style), preserving the on-demand parse's key order.
+        return jsonValue(jsonCompactOut(jsonStripNulls(jsonArgNode(vals[0]!))));
+      }
+      if (e.func === "jsonb_pretty") {
+        return textValue(jsonPretty(jsonArgNode(vals[0]!)));
       }
       const v0 = vals[0];
       // Float scalar functions (float.md §8): dispatch on the operand being a float value. Per the

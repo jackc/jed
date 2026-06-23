@@ -602,6 +602,9 @@ pub const SUPPORTED_CAPABILITIES: &[&str] = &[
     "func.jsonb_contains",
     // jsonb mutation operators (J6) — `||` `-` `#-` (json-sql-functions.md §1).
     "func.jsonb_mutate",
+    // json/jsonb introspection + processing functions (B1) — json[b]_typeof / _array_length /
+    // _strip_nulls / jsonb_pretty (json-sql-functions.md §2).
+    "func.json_processing",
 ];
 
 /// Parse and execute one SQL statement against `db` (no bind parameters).

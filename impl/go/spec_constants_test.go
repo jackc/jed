@@ -451,6 +451,10 @@ func TestRegistryCoversCatalog(t *testing.T) {
 			return resolvedType{kind: rtText}
 		case "boolean":
 			return resolvedType{kind: rtBool}
+		case "json":
+			return resolvedType{kind: rtJson}
+		case "jsonb":
+			return resolvedType{kind: rtJsonb}
 		default: // "integer" or "any"
 			return resolvedType{kind: rtInt, intTy: Int32}
 		}
